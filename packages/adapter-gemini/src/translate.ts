@@ -34,15 +34,17 @@
  *   and a non-empty `req.tools` raises a `ConfigError`.
  */
 
-import type {
-  CanonicalMessage,
-  CanonicalTextBlockParam,
-  CanonicalTool,
-  CanonicalToolResultContent,
-  ProviderRequest,
-  ToolChoice,
+import {
+  type CanonicalMessage,
+  type CanonicalTextBlockParam,
+  type CanonicalTool,
+  type CanonicalToolResultContent,
+  EFFORT_THINKING_BUDGET_TOKENS,
+  type ProviderRequest,
+  type ToolChoice,
 } from "@crewhaus/adapter-anthropic";
 import { ConfigError } from "@crewhaus/errors";
+import { sanitizeGeminiSchema } from "@crewhaus/tool-schema-sanitizer";
 import {
   type Content,
   FunctionCallingConfigMode,
@@ -83,6 +85,15 @@ export function toGeminiParams(req: ProviderRequest): GenerateContentParameters 
       thinkingBudget: req.thinking.budgetTokens,
       includeThoughts: true,
     };
+  } else if (req.reasoningEffort !== undefined) {
+    // Loop contract 0.4 (Batch A) — the portable effort preset converts
+    // to Gemini's token-budget control via the shared preset table. Only
+    // consulted when `thinking` is not explicitly set: an explicit
+    // budget always wins over the preset.
+    config.thinkingConfig = {
+      thinkingBudget: EFFORT_THINKING_BUDGET_TOKENS[req.reasoningEffort],
+      includeThoughts: true,
+    };
   }
 
   if (req.signal !== undefined) {
@@ -117,7 +128,11 @@ function toGeminiFunctionDecl(
   return {
     name: t.name,
     description: t.description,
-    parameters: t.input_schema as NonNullable<
+    // Project the tool schema onto Gemini's OpenAPI-3.0 Schema subset —
+    // inline $refs, drop keywords Gemini rejects (additionalProperties,
+    // unsupported formats, …), flatten unions. An unsanitised MCP schema
+    // with `$ref`/`$defs` reaches the API as an unknown node and 400s.
+    parameters: sanitizeGeminiSchema(t.input_schema) as NonNullable<
       GeminiTool["functionDeclarations"]
     >[number]["parameters"],
   };

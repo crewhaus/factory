@@ -7,6 +7,442 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Loop contract 0.4, Batch A — the agent-loop knobs your spec always
+  implied are now real spec keys, wired end to end.** One coordinated batch
+  lands the spec grammar, the IR, every emitter, the `crewhaus run`
+  interpreter, and the runtime enforcement for the loop-shaped controls:
+
+  - **`limits:` — hard runtime ceilings for one agent loop**, accepted on
+    cli/channel/managed/workflow/graph/crew/research/batch/browser:
+    `max_tool_iterations` (now optimizer-reachable via `OPTIMIZABLE_PATHS`),
+    `max_concurrent_tools`, `context_limit`, plus the new wall-clock timers
+    `deadline_ms` (whole run), `turn_timeout_ms` (one turn) and
+    `model_call_timeout_ms` (hung-stream watchdog). A tripped timer ends the
+    run with the classified failure machinery: `run_failed` class
+    `"timeout"`, exit code 34 (CrewHaus's own configured ceiling, beside the
+    budget cap's 33). On the workflow shape `deadline_ms` binds the WHOLE
+    run — each step both guards on the shared deadline stamp and arms the
+    runtime timer with the *remaining* budget, so N steps can't each claim
+    the full ceiling. The crew shape adds `limits.crew`
+    (`max_activations` / `refusal_depth` / `max_a2a_depth`) orchestration
+    ceilings.
+  - **`limits.loop_detection` — the runaway-tool-loop escalation ladder**:
+    tune `window`/`threshold` and pick `escalation: warn` (trace event only,
+    the pre-0.4 behaviour and still the default), `justify` (the repeated
+    call must pass the intent gate's justification check) or `abort` (end
+    the run).
+  - **`agent.thinking` — extended thinking as a portable spec key**: exactly
+    one of `budget_tokens` (explicit, >= 1024) or `effort: low|medium|high`;
+    also declarable per workflow step, per graph node and per crew role. The
+    adapter layer translates per provider: Anthropic/Bedrock-Anthropic map
+    `effort` through the shared `EFFORT_THINKING_BUDGET_TOKENS` presets,
+    Gemini maps it onto `thinkingConfig`, and OpenAI reasoning models
+    (o-series / gpt-5) get native `reasoning_effort` (an explicit budget
+    picks the nearest effort bucket; non-reasoning models ignore the knob
+    silently).
+  - **`agent.rate_limits` — per-tool rate limits** on cli/channel/managed:
+    tool name (or `"*"` catch-all) → `{ rpm, burst }`, enforced in the
+    runtime tool dispatcher.
+  - **`hooks:` — spec-declared lifecycle hooks**, the in-spec equivalent of
+    `.crewhaus/settings.json` entries (same ten events; a cross-check test
+    pins the spec's event list to hooks-engine's `HOOK_EVENTS` so they
+    cannot drift). On every shape spec hooks layer BELOW the settings.json
+    layers — spec first, then user → project, so the later-wins mutate
+    merge keeps the user's/project's overrides authoritative, mirroring the
+    permission RuleSet's settings-over-yaml precedence (all hooks still run;
+    any deny wins regardless of layer).
+  - **Graph control flow**: `edges[].when` declarative predicates over the
+    shared state (`key` + `equals` value test or `exists: true`, evaluated
+    in declaration order) and `parallel:` barrier groups lowered onto
+    graph-engine's `addParallel`. The engine gains an optional
+    `ParallelMergeReducer` for custom merges, and the default merge now
+    detects same-key write collisions across branches and fails classified
+    (`run_failed`, class `"config"`, exit 21) instead of silently
+    last-write-wins.
+  - **More shapes, fewer dead keys**: `mcp_servers` now boots a real
+    wire-once MCP host on workflow/research/batch bundles (secret refs stay
+    unresolved in the artifact, `disconnectAll()` on every exit path); graph
+    node `tools:` registers the builtin catalog; crew gains
+    `routing.kind: "llm"` (model-driven role handoffs with a deterministic
+    parse ladder and entry-role fallback) and per-role `sub_agents`; batch
+    queue adapters construct their backend from env at boot (`sqs` /
+    `redis-streams` / `postgres`, each failing loudly with the missing
+    variable's name) and durable backends keep the worker alive instead of
+    fast-exiting on an empty queue; `agent.streaming`, compaction tuning
+    (`threshold` / `snip_keep_head` / `snip_keep_tail`), `memory.embedder`
+    and run-level `budget:` thread through everywhere the schema accepts
+    them.
+  - **`compile()` now returns warnings** (additive `CompileResult`; every
+    existing `Bundle` consumer keeps compiling): declaring a key a shape
+    accepts but whose emitter still drops it — e.g. `thredz` on
+    channel/managed/research/crew, `continuity` on workflow/batch, voice
+    `tools`/`mcp_servers` — emits an `accepted-but-unwired` diagnostic
+    instead of shipping dead YAML silently. The validating ir-passes (graph
+    edge/`when`/`parallel` referential integrity + reachability through
+    parallel barriers, chain integrity) now run unconditionally inside
+    `compile()`; they rewrite nothing, so bundle bytes are unchanged.
+
+- **Loop contract 0.4, Batch B — the evaluate half of the loop: in-loop
+  evaluation, judge gates, and the builder-facing contract surfaces.** One
+  coordinated batch lands the spec grammar, the IR, the runtime seam, the
+  affected emitters, the eval stack, the compiler-worker endpoints, and the
+  CLI:
+
+  - **`evaluation:` — in-loop output evaluation on cli/channel/managed**:
+    `grader` (`llm_judge` with `criteria` + optional `model`, or the
+    deterministic `contains`/`regex`), `threshold` (llm_judge only, default
+    0.7), `on_fail: retry|halt|note` (default `retry`) and `max_retries`
+    (default 1). Defaults resolve AT LOWER TIME into the IR; bundles
+    construct a `RunEvaluation` and the runtime loop scores every completed
+    assistant turn, publishing the new `eval_graded` trace event and
+    retrying/halting/noting per spec. A below-threshold `halt` ends the run
+    with the classified failure machinery: `run_failed` class
+    `"evaluation"`, exit code 35 (CrewHaus's own configured quality floor,
+    beside the budget cap's 33 and the timers' 34).
+    `evaluation.threshold`/`evaluation.max_retries` join `OPTIMIZABLE_PATHS`
+    on all three shapes (subset-guard test updated); the grader itself is
+    deliberately NOT optimizer-reachable.
+  - **`kind: "judge"` workflow steps + graph judge nodes** — LLM judge
+    gates over upstream output: the gate scores the nearest earlier
+    non-judge step's (or gated node's) output in [0,1] against `criteria`
+    via `@crewhaus/eval-judge` on the step's resolved model (aux-model
+    `cheapest` supported), with `threshold` / `on_fail`
+    (`retry_previous` re-runs the gated step with the verdict's rationale
+    as feedback) / `max_retries` resolved at lower time. Every scoring
+    pass publishes the new `judge_verdict` trace event (both kinds ship
+    pretty renderers in the structured event printer).
+  - **Builder-facing contract surfaces (compiler-worker + spec)**:
+    `GET /schema` serves the whole 14-target spec grammar as a JSON-Schema
+    document (`specJsonSchema()` via zod-to-json-schema, ETag-cached) —
+    per-target definitions carry the new `evaluation`/`limits` keys;
+    `POST /loop` serves `projectLoop(ir)` (`@crewhaus/ir`), the canonical
+    ring/canvas loop projection matching the studio's `LoopProjection`
+    wire contract (goldens pin every IR variant byte-for-byte; canvas
+    node kinds pin to the studio's `step|node|role|doc` union);
+    `parseSpecIssues()` returns path-bearing structured diagnostics
+    (including YAML syntax line/col) and backs the worker's
+    /validate + /compile error payloads; `applySpecEdits()` in
+    `@crewhaus/spec-patch` gives the builder an atomic, comment-preserving
+    multi-edit author surface (one CST mutation batch, one `parseSpec`
+    re-validation, all-or-nothing).
+  - **The eval stack learns the loop**: `crewhaus eval --repeats K` runs k
+    seed-offset trials per sample and reports `pass@k` / `pass^k` beside
+    the canonical verdict (per-trial grades recorded; regression gating
+    and report flips compare per-sample pass-RATES, so flakiness
+    surfaces even when the canonical verdict is unchanged); per-sample
+    loop metrics (tool-call accuracy, interventions, safety-violation
+    counts by deny/egress/justify, model-call latency p50/p95) aggregate
+    into the run summary, the CLI's `[eval] loop:` line and the report
+    renderer; per-sample `failureClass` tallies print as
+    `[eval] failure classes:`; `llm_judge` graders take their min-score
+    cut from `.crewhaus/judge-calibration.json` when present (applied
+    calibrations echoed per run); graders files may declare
+    `type: registry` — the default grader registry (the six specialty
+    grader packs) is constructed once and shared across single runs,
+    matrix cells, `optimize` and the flywheel.
+  - **CLI**: `crewhaus compile --emit-loop` prints the same loop
+    projection the worker serves (`--json` for the raw wire shape,
+    `--out` writes `loop.json` beside the bundle);
+    `crewhaus sessions export --format trajectories` exports logged
+    sessions as JSONL trajectory tuples for offline analysis and
+    fine-tune-style pipelines.
+
+- **Loop contract 0.4, Batch C — the observe-and-govern half of the loop:
+  headless human-in-the-loop approvals, agent identity, the observability
+  control surface, live run streaming, and failure triage.** One coordinated
+  batch lands the spec grammar, the IR, the runtime seam, the affected
+  emitters, the gateway protocol, the OTel exporter, and the CLI:
+
+  - **`permissions.ask_mode: pause|deny` — what an `ask` does where no human
+    is watching (G11).** On a non-interactive surface (single-turn / daemon /
+    gateway) a tool permission that resolves to `ask` no longer silently
+    collapses to a denial. `pause` (the DEFAULT, the safe direction) parks the
+    turn: the runtime persists a `PendingApproval`, publishes the new
+    `approval_requested` trace event, and ends the run with the classified
+    failure machinery — `run_failed` class `"approval_pending"`, exit code 36
+    (beside the budget cap's 33, the timers' 34 and the quality floor's 35) —
+    plus a resume token, so a later `grant`/`deny` re-drives the parked tool
+    call pre-resolved (publishing `approval_resolved`). `deny` restores the
+    pre-0.4 collapse. `crewhaus approvals list|show|grant|deny <id>` resolves
+    parked approvals over the session store
+    (`.crewhaus/sessions/approvals.jsonl`; `--by` records the deciding
+    identity); on the channel shape the daemon constructs a shared approval
+    store, the gateway gains a `/<adapter>/actions` route
+    (verify → resolve → ack → resume) and Slack posts an interactive
+    Approve/Deny Block Kit message a click resolves in-thread. `ask_mode` is
+    deliberately OUT of `OPTIMIZABLE_PATHS` — a safety / human-in-the-loop
+    posture, not a quality knob.
+
+  - **Agent identity — a stable, verifiable fingerprint (item 4).** An
+    Ed25519 keypair auto-generated at first boot into `.crewhaus/identity.json`
+    (private key mode 0600); its `agentId` — the SHA-256 fingerprint of the
+    public key — is stamped onto every `TraceEvent` envelope and appended to
+    audit records, so a trace event and its audit trail attribute to one
+    agent. `loadOrCreateAgentIdentity` is idempotent and create-exclusive
+    (concurrent first-boots can't clobber each other; first writer wins).
+    `crewhaus doctor` prints the resolved identity line.
+
+  - **`observability:` control surface (G26) — which subscribers a bundle
+    wires, and how.** New `trace` (`off|ring|pretty|json`), `metrics`, `cost`,
+    `alerts`, `incidents` and `otel.endpoint` sub-blocks join the existing
+    `slo` (now carried on crew too). DEFAULTS SEMANTICS: spec ABSENCE is NOT
+    `off` — cost accrual and the low-overhead trace ring are default-ON; the
+    pretty/json printer, metrics, alerts, incidents and OTel export stay
+    opt-in; an explicit `cost: { enabled: false }` / `trace: { level: off }`
+    wins. The serving emitters stamp the env the runtime's subscriber layer
+    reads (`CREWHAUS_COST_TRACKING ??= "1"`; `CREWHAUS_TRACE ??=` only for
+    pretty/json, since the ring is bus-internal); `crewhaus run --trace
+    <level>` overrides per run — the flag wins over the spec block and ambient
+    env — keeping `crewhaus run` byte-consistent with the compiled bundles.
+
+  - **Per-response cost, attributed per tool (item 7) + a labeled cost
+    counter (G57).** A priceable response's cost is split evenly across the
+    tool calls it authorized and stamped as `attributedCostUsdMicros` on each
+    `tool_use`; the metrics-collector gains a labeled cost counter fed by
+    `cost_accrual` events (microdollars by model/provider, `unpriced` accruals
+    counted at zero).
+
+  - **Live run streaming — `runs.subscribe` over SSE (item 3).** The gateway
+    protocol adds the one streaming method: `runs.subscribe` upgrades to a
+    long-lived `text/event-stream` (one trace event per `data:` frame,
+    heartbeat/open marker as SSE comment frames) instead of a JSON envelope;
+    the gateway server serves it — same admission + tenant fencing as every
+    RPC, idle heartbeats, disconnect teardown — from an injected per-run event
+    source. The managed daemon wires it end to end: a bounded, tenant-fenced
+    per-run trace-bus registry whose resolver atomically replays the ring and
+    live-subscribes the bus, so a client replays THIS run and streams it live
+    with no gap. The cf-worker `/chat` streams now interleave the same
+    TraceEvent vocabulary — each workflow step brackets a `step_start`/
+    `step_end` pair with its real token usage + cost — all gated on
+    `observability.trace` (an explicit `off` suppresses every frame; text and
+    `done` still flow).
+
+  - **OpenTelemetry gen-ai spans (G58).** The OTel exporter maps the trace
+    vocabulary onto OpenTelemetry gen-ai semantic-convention spans (model
+    calls, tool use, cost accrual, approval requested/resolved, alerts,
+    circuit-state changes, A2A messages, coverage reports, …) for export to
+    `observability.otel.endpoint` when set.
+
+  - **`program_output` tool events (G59) + failure triage (G63).** The bash
+    and code-execution tools publish one `program_output` trace event per
+    invocation carrying the captured program output; `crewhaus failures report
+    [--propose-taxonomy]` clusters `run_failed` + incident records by failure
+    class and message so a run's failure modes read at a glance.
+
+- **Loop contract 0.4, Batch E — richer memory recall, agent-shape RAG, and
+  the active-context curator wired end to end.** One coordinated batch lands
+  the spec grammar, the IR, the lowering, the runtime seams, the affected
+  emitters and the trace/printer surface:
+
+  - **`knowledge:` — agent-shape RAG on cli/channel/managed (G22).** A new
+    optional block registers the existing `@crewhaus/tool-retrieve` (chunker →
+    embedder → vector-store) as a citation-bearing `Retrieve` tool, ingesting
+    `sources: [{ path | glob | url }]` at build/boot: `embedder?`,
+    `vector_backend?` (the same backend enum as pipeline `retrieve`), `chunk?:
+    { size?, overlap? }` and `default_k?` (1..50). It reuses target-pipeline's
+    retrieve engine, so the backend/`default_k`/chunk knobs resolve to the same
+    defaults (`in-memory` / 5 / 400 / 0). `knowledge.default_k` +
+    `knowledge.chunk.size` + `knowledge.chunk.overlap` join `OPTIMIZABLE_PATHS`
+    (the `sources` corpus stays human-owned).
+
+  - **`memory.autoRecall` gains a cadence + `refreshEvery` (G21).**
+    `autoRecall` now accepts `boolean | "session-start" | "per-turn"`;
+    `"per-turn"` (or declaring `refreshEvery: <int>`) re-runs the recall
+    closure against the latest user message every turn (or every N turns) and
+    swaps the volatile recalled tail block WITHOUT re-injecting into the frozen
+    cache prefix. `memory.refreshEvery` joins `OPTIMIZABLE_PATHS`; declaring it
+    alongside `autoRecall: false` is a loud compile error.
+
+  - **`memory.sessionRecall` (G77).** Opting in folds session summaries in as a
+    third RRF ranker in the recall fusion (default false).
+
+  - **Default change — recall + capture ON when `memory:` is present (G46,
+    mildly breaking).** With the `memory:` block declared, `autoRecall` now
+    defaults to `true` (`"session-start"`) and `autoCapture` to `true` (behind
+    the existing `autoCaptureThreshold` gate) — both previously defaulted to
+    `false`. The resolved booleans are stamped into the IR at lower time. **Opt
+    back out with `autoRecall: false` / `autoCapture: false`.**
+
+  - **Active-context curator wired (G19).** The pre-declared `compaction.curate`
+    / `dedupeThreshold` / `relevanceTopK` keys now drive an actual pre-compaction
+    pass (`@crewhaus/compaction-curator`) inside runtime-core's `maybeCompact`,
+    threading the embedder from `memory.embedder ?? memory.wiki.embedder` (BM25
+    lexical dedupe when none resolves). Every pass publishes the new `curate`
+    trace event (`before`/`after`/`dropped`/`bytesSaved`/`embedded`), rendered
+    by the structured event printer.
+
+  - **Thredz emit-wired on channel + managed (G23).** The one-knob `thredz:`
+    block, previously carried-with-note off the cli shape, now synthesizes the
+    thredz backend and boots `connectThredz` on the channel + managed daemons
+    (research + crew stay carried-with-note this batch). `compile()` no longer
+    warns `accepted-but-unwired` for `thredz` on channel/managed.
+
+  - **Embedder resolution order (G76), documented and coherent:** fact-store
+    recall + the curator resolve `memory.embedder → memory.wiki.embedder →
+    BM25-only`; the wiki tier resolves `memory.wiki.embedder → memory.embedder
+    → BM25-only`; agent-shape RAG resolves `knowledge.embedder →
+    memory.embedder → memory.wiki.embedder → the target's default embedder
+    model`.
+
+  - **Prompt-cache rotation now survives a restart (G78).** The §2.5
+    cross-run seam runtime-core always exposed
+    (`promptCacheLastRotatedAt` in, `onPromptCacheRotated` out) finally has
+    its promised persistence: `@crewhaus/prompt-cache-manager`'s
+    `createPromptCacheRotationStore` writes the last rotation timestamp to a
+    per-spec JSON record (`.crewhaus/prompt-cache/<spec>.json`, atomic, mode
+    0600, path-safe spec name). A long-running channel/managed daemon reads
+    it at boot and threads it back, so `manage()` REUSES the still-warm
+    cached prefix across restarts instead of force-rotating (and cold-starting
+    the cache) on every boot; a missing or corrupt record safely force-
+    refreshes rather than bricking boot.
+
+- **Loop contract 0.4, Batch F — the deploy half of the loop: a
+  platform-neutral loop core, real tools on the edge, the temporal
+  (`schedule:`) contract, exactly-once resume, and the develop/deploy/observe
+  CLI verbs.** One coordinated batch lands the runtime extraction, the spec
+  grammar, the affected emitters, the durable-execution surface, and the CLI:
+
+  - **G12 — the agent loop is now a platform-neutral core,
+    `@crewhaus/worker-runtime`.** The pure loop (turn FSM, model-stream
+    orchestration, tool dispatch + validation + permission gating,
+    budget/limit enforcement, loop detection, trace emission) is extracted
+    behind an injected `WorkerPlatform` (clock, unique-id, `fetch`, optional
+    KV). The package imports **no** `node:*` builtin and calls neither
+    `Date.now()` nor `Math.random()` (a source-grep AND a bundled-import-graph
+    test enforce both), so it runs on a Cloudflare Worker. `runtime-core`
+    CONSUMES it — re-exporting its contract as the single source of truth and
+    supplying the Node `WorkerPlatform` (`createNodeWorkerPlatform`) — while
+    `runChatLoop`'s node-coupled services (event-log, session-store,
+    compaction, recovery, audit sinks) wrap the shared engine; the three
+    `target-cf-worker-*` emitters call `runWorkerLoop` directly with a
+    stateless platform. The re-exports are purely additive — every existing
+    `runChatLoop` / `RunChatLoopOptions` consumer compiles unchanged. v1 scope
+    is tools + budget + limits + trace; compaction/recovery stay Node-only and
+    a context overflow ends an edge run with a classified `context_overflow`
+    frame rather than compacting.
+  - **cf-worker targets run real tools now (G12/G83).** The old blanket
+    "cf-worker does not support tools" rejection is replaced by a precise
+    edge-safety gate — `@crewhaus/worker-runtime/tool-policy` (the single
+    source of truth the compiler imports via a subpath so its offline gate
+    never drags the loop into the compiler-worker's own bundle) plus
+    `assertCfWorkerToolsEdgeSafe`. Edge-safe builtins
+    (`fetch`/`webFetch`/`webSearch`/`sendMessage`/`imageGenerate`/`todoWrite`)
+    and any `mcp__*` tool compile and run on the edge; host tools
+    (`bash`/`read`/`python`/filesystem/device/…) fail the compile with a
+    category-specific reason; an unrecognised custom tool is permitted with an
+    `edge-unsafe-tool` warning. The emitted worker streams the same `/chat`
+    SSE trace vocabulary (`turn_start`/`model_request`/`model_response`/
+    `cost_accrual`/`tool_call_start`/`tool_call_end`/`turn_end`) the Node loop
+    does.
+  - **`schedule:` — the temporal contract (G84)** on the daemon-able shapes
+    (channel / managed / batch): `kind: cron` (5-/6-field, timezone-aware,
+    Quartz-tolerant) or `kind: interval` (`every`), plus per-wake `jitter` and
+    an optional wake `instructions` prompt — all durations normalized to ms at
+    lower time into `IrSchedule`. `@crewhaus/durable-execution`'s `armSchedule`
+    (cron arithmetic + jitter + self-rescheduling, injectable timing seams)
+    is the one tested home the channel and batch daemons arm; the managed
+    daemon arms a per-tenant `setInterval`/cron wake. `CREWHAUS_SCHEDULE=0`
+    disarms the loop.
+  - **Exactly-once resume (G61, item 7).** `@crewhaus/durable-execution` gains
+    `withIdempotency` (dedups a node/step attempt by `(runId, name,
+    attempt)`), `resumeFrom` (the checkpoint-chain resume hint), and a durable
+    `FileIdempotencyStore` + env-driven `createIdempotencyStore`
+    (`CREWHAUS_IDEMPOTENCY_STORE=memory|file[:<dir>]`) so a restart of the same
+    run finds the prior attempt's cached result instead of re-running its side
+    effects. The managed daemon's `runs.continue`-with-sessionId resume path
+    and the browser driver's `--resume`/`--continue` wrap the turn in
+    `withIdempotency`, so a duplicate resume (client retry / visibility-lease
+    double-pull) returns the cached reply instead of re-driving the turn
+    (best-effort exactly-once; a crash between the external effect and the
+    store write still re-runs at-least-once).
+  - **CLI develop / deploy / observe verbs**: `crewhaus dev <spec>` (compile
+    in memory, run the emitted bundle as a supervised child, recompile +
+    relaunch on every spec/authoring-dir change, trace streaming, `--once` for
+    a credential-free CI boot check); `crewhaus sessions tail [<session>]` (a
+    `tail -f` over a session's append-only event log); `crewhaus compile
+    --emit-as cf-worker` (emit the Cloudflare-Worker bundle locally for
+    cli|workflow|graph — the same bundle the compiler-worker's remote
+    `POST /compile { emitAs }` serves); `crewhaus deploy <fly|render|railway|
+    heroku> <spec>` (scaffold PaaS deploy manifests for a daemon shape, with a
+    provider-token-gated `--live`); and `crewhaus runs resume <session>` (the
+    dedicated verb for re-driving a session parked on a pending approval).
+  - **managed `agent.tools` + `tool_config` (G81)** lower onto the managed IR,
+    and every emitted cf-worker bundle now ships a generated `README.md`
+    (item 42).
+
+- **Loop contract 0.4, Batch G — the interoperate half of the loop: the agent
+  as an MCP server, an A2A federation peer, a plugin host, a Claude-Code plugin,
+  and portable tool/model routing.** One coordinated batch lands the spec
+  grammar, the IR, the affected emitters, the runtime seams, the gateway
+  protocol, two new packages, and the CLI:
+
+  - **`expose:` — project a compiled agent AS an MCP server (Item 1 / G30).**
+    The new `@crewhaus/mcp-server` registers a bundle's turn function as a
+    `chat` tool (one per sub-agent under `tools: per-subagent`) over `stdio`
+    or Web-Standard SSE. `crewhaus serve --mcp <spec> [--sse] [--port]`
+    projects a `target: cli` agent so Claude Code / an IDE / another CrewHaus
+    runtime calls it as a tool (each call runs one interpreter turn); the
+    `expose.mcp` block (`transport: stdio|sse`, `tools: chat|per-subagent`)
+    lowers onto cli/channel/managed IR, and the channel/managed daemons
+    self-expose from their gateway's `fetch` path. Absent `expose:` → the
+    bundle is byte-identical to pre-Batch-G.
+
+  - **A2A federation — an agent as a peer (Item 2 / G31).** The new
+    `@crewhaus/federation-protocol` builds a real A2A **Agent Card**; a
+    federation-configured gateway serves `GET /.well-known/agent-card.json`,
+    the `GET /.well-known/crewhaus.json` discovery alias (carrying the
+    cert-pin fingerprint the card omits), and the inbound `POST /federation`
+    handler (decode → app-level `authorize` → Pillar-3 classify at origin
+    `"federation"` → `dispatch` → A2A reply). The managed daemon always emits
+    the peer surface, env-gated at RUNTIME (`CREWHAUS_FEDERATION_*`; unset ⇒
+    the routes answer 404, an empty allowlist DENIES every inbound call), so
+    any deployment becomes a peer by setting env — no recompile. A
+    `sub_agents.<name>.federation.url` routes that helper's `Task` call
+    through `@crewhaus/federation-router` to the remote peer. mTLS is the
+    operator's transport floor; authentication ≠ authorization ≠
+    classification.
+
+  - **Plugins — the zero-caller load path, wired (Item 3 / G32).** A
+    `plugins:` list on cli/channel activates installed plugins through
+    `@crewhaus/plugin-loader`'s `activatePlugins`, which re-verifies each
+    manifest's Ed25519 signature + entrypoint digest against the trust
+    anchors and buckets the imported module's contributions. `runChatLoop`
+    gains a `plugins: { tools }` option: plugin-contributed tools are
+    normalised through `buildTool` and APPENDED to the advertised catalog,
+    with first-party tools winning any name collision (a plugin augments but
+    cannot silently shadow a built-in). Absent the option → the run is
+    byte-identical to a pre-G32 runtime (same `tools` reference). Item 10
+    (G89) pins the canonical default module-registry index URL the
+    marketplace clients resolve against.
+
+  - **`crewhaus export claude-plugin <spec> [--out <dir>]` (Item 4 / §59).**
+    The new `@crewhaus/target-claude-plugin` emits an Anthropic-compatible
+    Claude Code plugin directory from any shape: `.claude-plugin/plugin.json`
+    (author-stamped), a `.mcp.json` when the IR carries `mcp_servers`, and
+    per-shape skill/agent files. A `smokeCheckClaudePluginBundle` pass
+    validates the emitted `plugin.json`/`.mcp.json` before write.
+
+  - **Portable tool schemas + per-role model routing (Item 9 / G37).** The
+    new `@crewhaus/tool-schema-sanitizer` inlines every `$ref`/`$defs` and
+    projects a tool's `input_schema` onto each provider's accepted subset —
+    `sanitizeGeminiSchema` (Gemini's OpenAPI-3.0 `Schema`: `nullable`,
+    `oneOf`→`anyOf`, unsupported `format`s dropped) and `sanitizeBedrockSchema`
+    (Converse's `toolSpec.inputSchema.json`) — so a `$ref`-heavy MCP tool
+    schema no longer 400s the request; `adapter-gemini` and `adapter-bedrock`
+    now sanitize each tool at translate time. `model_pool` / `model_tiers` /
+    `model_fallbacks` / `circuit_breaker` land on workflow steps and per crew
+    role, emitting onto the `RoleDefinition`; the crew orchestrator forwards a
+    role's routing into its `runChatLoop` turns so each role's `PolicyRouter`
+    decision shares the `@crewhaus/routing-store` scoreboard. A role/step
+    without routing stays byte-identical.
+
+  - **Smaller surfaces**: `thredz.messaging` (Item 5 / G44, object-form,
+    default-off) lowers onto `IrThredz.messaging`; the voice shape now
+    ACCEPTS `tools:` and carries it with the 0.2.3-convention ignored-note
+    (G33, short-term) instead of rejecting the key.
+
 ## [0.3.2] - 2026-07-16
 
 ### Fixed

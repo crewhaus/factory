@@ -49,6 +49,16 @@ export type TraceEventBusOptions = {
    * Override `process.env` (for tests).
    */
   readonly env?: NodeJS.ProcessEnv;
+  /**
+   * Loop contract 0.4 (Batch C, item 4) — the publishing agent's identity: the
+   * fingerprint of the Ed25519 public key at `.crewhaus/identity.json`
+   * (generated at first boot by the runtime). When set, `envelope()` stamps it
+   * onto every envelope's `agentId`, and publishers that build envelopes by
+   * hand can read it from the `agentId` property. A child bus (sub-agent)
+   * should be constructed with the parent's `agentId` so the whole trace
+   * attributes to one agent. Absent when no identity is available.
+   */
+  readonly agentId?: string;
 };
 
 type PendingSubscriberPromise = Promise<void>;
@@ -59,6 +69,9 @@ export class TraceEventBus {
   readonly traceId: string;
   readonly rootSpanId: string;
   readonly rootParentSpanId: string | undefined;
+  /** Loop contract 0.4 (Batch C, item 4) — the publishing agent's identity
+   *  fingerprint, stamped onto every `envelope()`. Undefined when unset. */
+  readonly agentId: string | undefined;
 
   private readonly subscribers = new Set<Subscriber>();
   private readonly buffer: RingBuffer;
@@ -73,6 +86,7 @@ export class TraceEventBus {
     this.runId = opts.runId;
     this.sessionId = opts.sessionId;
     this.logger = opts.logger;
+    this.agentId = opts.agentId;
     this.buffer = new RingBuffer(opts.ringSize ?? DEFAULT_RING_SIZE);
     const inheritTrace =
       opts.inheritTraceId && isValidTraceId(opts.inheritTraceId) ? opts.inheritTraceId : undefined;
@@ -136,6 +150,8 @@ export class TraceEventBus {
       spanId,
       parentSpanId: this._currentSpanId,
       timestamp: now.toISOString(),
+      // Loop contract 0.4 (Batch C, item 4) — stamp agent identity when set.
+      ...(this.agentId !== undefined ? { agentId: this.agentId } : {}),
     };
   }
 

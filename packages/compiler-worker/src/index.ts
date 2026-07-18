@@ -6,6 +6,8 @@ import {
   lower,
   parseSpec,
 } from "@crewhaus/compiler";
+import { projectLoop } from "@crewhaus/ir";
+import { type SpecIssue, parseSpecIssues, specJsonSchema } from "@crewhaus/spec";
 import { emitCfWorkerCli } from "@crewhaus/target-cf-worker-cli";
 import { emitCfWorkerGraph } from "@crewhaus/target-cf-worker-graph";
 import { emitCfWorkerWorkflow } from "@crewhaus/target-cf-worker-workflow";
@@ -19,15 +21,33 @@ import { handleProviderProxy } from "./proxy";
  * Surface:
  *   POST /compile  { yaml: string, applyIrPasses?: boolean }
  *      → 200 { bundle: Bundle }
- *      → 400 { error: { code: "PARSE" | "COMPILE", message, path? } }
- *      The compile path is scope-gated server-side (FR-002, Pillar 3): a spec
- *      reaching an outward sink (a `mcp__*` tool, or a built-in like Fetch /
- *      WebFetch / SendMessage) whose `scope: "external"` cannot be verified
- *      offline is refused with code "COMPILE" — mirroring `compile --strict`.
+ *      → 400 { error: { code: "PARSE" | "COMPILE", message, path? }, issues }
+ *      `issues` (loop contract 0.4, item 7) is the structured
+ *      `parseSpecIssues()` list riding alongside the legacy flattened error
+ *      — `[{ path, message, code }]` for PARSE failures, `[]` when the spec
+ *      parsed but compilation failed. The compile path is scope-gated
+ *      server-side (FR-002, Pillar 3): a spec reaching an outward sink (a
+ *      `mcp__*` tool, or a built-in like Fetch / WebFetch / SendMessage)
+ *      whose `scope: "external"` cannot be verified offline is refused with
+ *      code "COMPILE" — mirroring `compile --strict`.
  *
  *   POST /validate { yaml: string }
  *      → 200 { ok: true }
- *      → 200 { ok: false, errors: [{ message, path? }] }
+ *      → 200 { ok: false, errors: [{ message, path? }], issues }
+ *
+ *   POST /loop     { yaml: string }
+ *      → 200 { ok: true, loop: LoopProjection, issues: [] }
+ *      → 200 { ok: false, issues }
+ *      `loop` is `projectLoop(lower(parseSpec(yaml)))` — the same projection
+ *      the compiler goldens pin (packages/compiler/src/__fixtures__/
+ *      loop-projections.golden.json) — so the studio can render the
+ *      agent-loop ring/canvas without a local compiler.
+ *
+ *   GET  /schema   → 200 { version, schema } where schema is
+ *      `specJsonSchema()` (root $ref → #/definitions/CrewhausSpec plus one
+ *      named definition per target shape). The document is a pure function
+ *      of the deployed spec package, so it is served with a long
+ *      Cache-Control and a content-hash ETag (If-None-Match → 304).
  *
  *   GET  /health   → 200 { ok: true, version }
  *
@@ -68,11 +88,17 @@ export default {
       if (request.method === "GET" && url.pathname === "/health") {
         return jsonResponse({ ok: true, version: VERSION }, 200, cors);
       }
+      if (request.method === "GET" && url.pathname === "/schema") {
+        return handleSchema(request, cors);
+      }
       if (request.method === "POST" && url.pathname === "/compile") {
         return await handleCompile(request, env, cors);
       }
       if (request.method === "POST" && url.pathname === "/validate") {
         return await handleValidate(request, env, cors);
+      }
+      if (request.method === "POST" && url.pathname === "/loop") {
+        return await handleLoop(request, env, cors);
       }
       if (url.pathname === "/cf" || url.pathname.startsWith("/cf/")) {
         return await handleCfProxy(request, cors, url);
@@ -146,6 +172,7 @@ async function handleCompile(request: Request, env: Env, cors: HeadersInit): Pro
                 code: "UNSUPPORTED_TARGET",
                 message: `cf-worker emit supports target=cli|workflow|graph, got ${ir.target}`,
               },
+              issues: [],
             },
             400,
             cors,
@@ -161,15 +188,26 @@ async function handleCompile(request: Request, env: Env, cors: HeadersInit): Pro
     }
     return jsonResponse({ bundle }, 200, cors);
   } catch (err) {
+    // Loop contract 0.4 (item 7): every /compile 400 carries the structured
+    // `parseSpecIssues()` list alongside the legacy flattened error. PARSE
+    // failures get the full issue list; post-parse (COMPILE) failures get []
+    // — the spec itself was valid, so there are no spec issues to report.
     if (err instanceof SpecParseError) {
       return jsonResponse(
-        { error: { code: "PARSE", message: redactSecrets(err.message) } },
+        {
+          error: { code: "PARSE", message: redactSecrets(err.message) },
+          issues: specIssuesFor(body.yaml, err),
+        },
         400,
         cors,
       );
     }
     const message = err instanceof Error ? err.message : String(err);
-    return jsonResponse({ error: { code: "COMPILE", message: redactSecrets(message) } }, 400, cors);
+    return jsonResponse(
+      { error: { code: "COMPILE", message: redactSecrets(message) }, issues: [] },
+      400,
+      cors,
+    );
   }
 }
 
@@ -225,8 +263,99 @@ async function handleValidate(request: Request, env: Env, cors: HeadersInit): Pr
     return jsonResponse({ ok: true }, 200, cors);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return jsonResponse({ ok: false, errors: [{ message: redactSecrets(message) }] }, 200, cors);
+    // Legacy flattened `errors` kept verbatim for existing studio callers;
+    // `issues` (loop contract 0.4, item 7) is the structured list.
+    return jsonResponse(
+      {
+        ok: false,
+        errors: [{ message: redactSecrets(message) }],
+        issues: specIssuesFor(body.yaml, err),
+      },
+      200,
+      cors,
+    );
   }
+}
+
+type LoopBody = { readonly yaml?: unknown };
+
+/**
+ * Loop contract 0.4 (item 7) — project a spec onto the agent-loop diagram
+ * (ring for the loop-running shapes, canvas for the step/node shapes) so the
+ * studio can render it without a local compiler. `projectLoop` is total over
+ * all 14 IR variants and never throws; the only failure modes are parse
+ * (structured issues) and lowering errors (flattened into one issue).
+ */
+async function handleLoop(request: Request, env: Env, cors: HeadersInit): Promise<Response> {
+  const body = await readJsonBody<LoopBody>(request, env);
+  if (typeof body.yaml !== "string") {
+    return jsonResponse(
+      { error: { code: "BAD_REQUEST", message: "body.yaml must be a string" } },
+      400,
+      cors,
+    );
+  }
+  try {
+    const loop = projectLoop(lower(parseSpec(body.yaml)));
+    return jsonResponse({ ok: true, loop, issues: [] }, 200, cors);
+  } catch (err) {
+    return jsonResponse({ ok: false, issues: specIssuesFor(body.yaml, err) }, 200, cors);
+  }
+}
+
+/**
+ * The structured issue list reflected to the client for a failed parse /
+ * lower of `yaml`. SpecParseError → the full `parseSpecIssues()` list (the
+ * structured counterpart of the thrown message); anything else (a lowering
+ * error on a spec that parsed fine) → one synthetic root-path issue. Issue
+ * messages pass through redactSecrets like every other reflected error.
+ */
+function specIssuesFor(yaml: string, err: unknown): SpecIssue[] {
+  const issues = err instanceof SpecParseError ? parseSpecIssues(yaml) : [];
+  if (issues.length === 0) {
+    const message = err instanceof Error ? err.message : String(err);
+    issues.push({ path: [], code: err instanceof SpecParseError ? "parse" : "compile", message });
+  }
+  return issues.map((issue) => ({ ...issue, message: redactSecrets(issue.message) }));
+}
+
+/**
+ * GET /schema — the whole spec grammar as a JSON-Schema document (root $ref
+ * → #/definitions/CrewhausSpec, one named definition per target shape).
+ * `specJsonSchema()` is deterministic and depends only on the deployed spec
+ * package, so the serialized body is computed once per isolate and served
+ * with a long Cache-Control plus a content-hash ETag; a matching
+ * If-None-Match short-circuits to 304.
+ */
+let schemaCache: { readonly body: string; readonly etag: string } | undefined;
+
+function handleSchema(request: Request, cors: HeadersInit): Response {
+  if (schemaCache === undefined) {
+    const body = JSON.stringify({ version: VERSION, schema: specJsonSchema() });
+    schemaCache = { body, etag: `"${fnv1a(body)}"` };
+  }
+  const cacheHeaders = {
+    ETag: schemaCache.etag,
+    "Cache-Control": "public, max-age=86400",
+    ...cors,
+  };
+  if (request.headers.get("If-None-Match") === schemaCache.etag) {
+    return new Response(null, { status: 304, headers: cacheHeaders });
+  }
+  return new Response(schemaCache.body, {
+    status: 200,
+    headers: { "Content-Type": "application/json; charset=utf-8", ...cacheHeaders },
+  });
+}
+
+/** 32-bit FNV-1a over the serialized schema — a stable content hash for the ETag. */
+function fnv1a(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 async function readJsonBody<T>(request: Request, env: Env): Promise<T> {

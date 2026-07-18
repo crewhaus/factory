@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { McpError } from "@crewhaus/errors";
-import type { McpHost, McpToolDefinition } from "@crewhaus/mcp-host";
+import type { McpClient, McpHost, McpToolDefinition } from "@crewhaus/mcp-host";
 import { type RunContext, tagContent } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolCatalog, ToolExecuteContext } from "@crewhaus/tool-catalog";
@@ -180,6 +181,225 @@ export async function registerMcpServer(
     catalog.register(tool);
     opts.onRegister?.({ fullName: tool.name, remoteName: remote.name });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Loop contract 0.4 (Batch G, G74) — live tools/list_changed re-diff.
+//
+// mcp-host now surfaces a server's `notifications/tools/list_changed` via
+// `McpClient.onToolsChanged`. This section closes the loop: on a change we
+// re-`listTools()`, DIFF it against the last snapshot (stable schema hashing,
+// mirroring the `mcp-doctor` drift watch so a mere key reorder is NOT drift),
+// and apply the delta to the shared catalog — unregister removed + schema-
+// changed tools, (re)register added + schema-changed ones. Steady-state
+// registration (`registerMcpServer`) is unchanged; `watchMcpServer` layers the
+// subscription on top so the boot path opts in with one call.
+// ---------------------------------------------------------------------------
+
+/**
+ * A server's advertised tools captured for drift diffing: remote tool name →
+ * stable schema hash. Built by {@link snapshotTools}; threaded across
+ * `tools/list_changed` reconciles by {@link watchMcpServer}.
+ */
+export type McpToolSnapshot = ReadonlyMap<string, string>;
+
+/**
+ * The delta between two {@link McpToolSnapshot}s. `added`/`removed`/
+ * `schemaChanged` hold REMOTE tool names (not the `<server>__` namespaced
+ * form); `driftIsEmpty` is the fast steady-state check.
+ */
+export type McpToolDrift = {
+  readonly added: readonly string[];
+  readonly removed: readonly string[];
+  readonly schemaChanged: readonly string[];
+};
+
+export function driftIsEmpty(drift: McpToolDrift): boolean {
+  return drift.added.length === 0 && drift.removed.length === 0 && drift.schemaChanged.length === 0;
+}
+
+/**
+ * Order-insensitive canonical JSON: recursively sort object keys so a server
+ * that reorders its schema keys between advertisements hashes identically
+ * (that is not drift), while any real member add/remove/retype IS. Mirrors
+ * `mcp-doctor`'s `canonicalJson`.
+ */
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+    a < b ? -1 : a > b ? 1 : 0,
+  );
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
+}
+
+/** Stable 16-hex-char sha256 of a tool's JSON-schema. Mirrors `mcp-doctor`. */
+export function hashToolSchema(schema: unknown): string {
+  return createHash("sha256").update(canonicalJson(schema)).digest("hex").slice(0, 16);
+}
+
+/** Build a drift snapshot (remote name → schema hash) from a live tool list. */
+export function snapshotTools(tools: ReadonlyArray<McpToolDefinition>): McpToolSnapshot {
+  const map = new Map<string, string>();
+  for (const t of tools) map.set(t.name, hashToolSchema(t.inputSchema));
+  return map;
+}
+
+/**
+ * Diff two snapshots. `added` = in `next` not `prev`; `removed` = in `prev`
+ * not `next`; `schemaChanged` = in both, different hash. An absent `prev`
+ * (first observation) yields all-added, matching `mcp-doctor`'s baseline rule.
+ */
+export function diffToolSnapshots(
+  prev: McpToolSnapshot | undefined,
+  next: McpToolSnapshot,
+): McpToolDrift {
+  const added: string[] = [];
+  const removed: string[] = [];
+  const schemaChanged: string[] = [];
+  const before = prev ?? new Map<string, string>();
+  for (const [name, hash] of next) {
+    const prevHash = before.get(name);
+    if (prevHash === undefined) added.push(name);
+    else if (prevHash !== hash) schemaChanged.push(name);
+  }
+  for (const name of before.keys()) {
+    if (!next.has(name)) removed.push(name);
+  }
+  return { added, removed, schemaChanged };
+}
+
+/** Result of one {@link reconcileMcpServer} pass. */
+export type McpReconcileResult = {
+  readonly drift: McpToolDrift;
+  /** The fresh snapshot — feed it back as `previous` on the next reconcile. */
+  readonly snapshot: McpToolSnapshot;
+};
+
+/**
+ * Re-diff a server's catalog against `previous` and apply the delta to
+ * `catalog`. Forces a fresh `tools/list` (bypassing the boot cache), diffs,
+ * then: unregisters removed AND schema-changed tools, and (re)registers added
+ * AND schema-changed tools with the same wiring as {@link registerMcpServer}
+ * (namespaced name, boundary classification, lineage tagging, resolved
+ * flags). Returns the drift plus the new snapshot to thread forward. Safe when
+ * nothing changed — an empty drift touches the catalog not at all. Used by
+ * {@link watchMcpServer}; also callable directly (e.g. a manual re-probe).
+ */
+export async function reconcileMcpServer(
+  host: McpHost,
+  serverName: string,
+  catalog: ToolCatalog,
+  previous: McpToolSnapshot | undefined,
+  opts: RegisterMcpServerOptions = {},
+): Promise<McpReconcileResult> {
+  const client = host.getClient(serverName);
+  await client.connect();
+  const remoteTools = await client.refreshTools();
+  const byName = new Map(remoteTools.map((t) => [t.name, t] as const));
+  const snapshot = snapshotTools(remoteTools);
+  const drift = diffToolSnapshots(previous, snapshot);
+
+  // Removed + schema-changed leave the catalog first, so a schema-changed
+  // tool can be re-registered under its (unchanged) name without tripping the
+  // "already registered" guard.
+  for (const remoteName of [...drift.removed, ...drift.schemaChanged]) {
+    const fullName = namespacedToolName(serverName, remoteName);
+    if (catalog.has(fullName)) catalog.unregister(fullName);
+  }
+  for (const remoteName of [...drift.added, ...drift.schemaChanged]) {
+    const remote = byName.get(remoteName);
+    if (remote === undefined) continue;
+    const tool = buildMcpRegisteredTool(host, serverName, remote, resolveFlags(opts, remoteName));
+    catalog.register(tool);
+    opts.onRegister?.({ fullName: tool.name, remoteName });
+  }
+  return { drift, snapshot };
+}
+
+/** A handle from {@link watchMcpServer}: `stop()` unsubscribes from the
+ *  server's `tools/list_changed` notifications (the registered tools remain). */
+export type McpServerWatch = {
+  readonly stop: () => void;
+};
+
+export type WatchMcpServerOptions = RegisterMcpServerOptions & {
+  /** Fired after each reconcile with a NON-empty drift (diagnostics/banners). */
+  readonly onDrift?: (info: { server: string; drift: McpToolDrift }) => void;
+  /** Sink for a reconcile that throws (a mid-run server hiccup). Default: swallow. */
+  readonly onError?: (err: unknown) => void;
+};
+
+/**
+ * Register a server's tools AND keep the catalog live: subscribe to the
+ * client's `tools/list_changed` and reconcile the catalog on each change. The
+ * initial pass is a reconcile against an empty snapshot (registers every
+ * advertised tool), so this fully replaces a bare {@link registerMcpServer}
+ * call for a boot that wants drift tracking. `stop()` unsubscribes.
+ *
+ * A change notification's handler is synchronous (mcp-host's contract), so the
+ * async reconcile is fired-and-forwarded; overlapping notifications are
+ * serialised through a single in-flight chain so the snapshot never races.
+ */
+export async function watchMcpServer(
+  host: McpHost,
+  serverName: string,
+  catalog: ToolCatalog,
+  opts: WatchMcpServerOptions = {},
+): Promise<McpServerWatch> {
+  let snapshot: McpToolSnapshot | undefined;
+  // Serialise reconciles: a burst of notifications chains onto the prior
+  // pass rather than interleaving snapshot reads/writes.
+  let chain: Promise<void> = Promise.resolve();
+  const runReconcile = (): Promise<void> => {
+    chain = chain.then(async () => {
+      try {
+        const result = await reconcileMcpServer(host, serverName, catalog, snapshot, opts);
+        snapshot = result.snapshot;
+        if (!driftIsEmpty(result.drift))
+          opts.onDrift?.({ server: serverName, drift: result.drift });
+      } catch (err) {
+        opts.onError?.(err);
+      }
+    });
+    return chain;
+  };
+
+  await runReconcile();
+  const client: McpClient = host.getClient(serverName);
+  const unsubscribe = client.onToolsChanged(() => {
+    void runReconcile();
+  });
+  return { stop: unsubscribe };
+}
+
+// ---------------------------------------------------------------------------
+// Loop contract 0.4 (Batch G, G74) — SkillRef.tools enforcement.
+//
+// A skill may declare a `tools` allow-list (skills-registry's `SkillRef.tools`,
+// historically parsed-but-unenforced). While that skill is ACTIVE, the model
+// should see ONLY those tools. This is a pure catalog-narrowing primitive the
+// runtime consumes at turn-composition time; keeping it here (next to the MCP
+// registration surface) means the same narrowing covers built-ins and remote
+// MCP tools alike — the model-facing name (`<server>__<tool>` for MCP) is what
+// the allow-list matches.
+// ---------------------------------------------------------------------------
+
+/**
+ * Narrow a tool list to a skill's `tools` allow-list. When `allow` is
+ * `undefined` the skill imposes NO restriction and the list passes through
+ * unchanged (an empty array, by contrast, means "no tools"). Matching is by
+ * the model-facing `RegisteredTool.name`, so an MCP tool is referenced by its
+ * namespaced `<server>__<tool>` name. Pure and allocation-cheap — safe to call
+ * per turn.
+ */
+export function narrowToolsForActiveSkill(
+  tools: ReadonlyArray<RegisteredTool>,
+  allow: ReadonlyArray<string> | undefined,
+): ReadonlyArray<RegisteredTool> {
+  if (allow === undefined) return tools;
+  const allowed = new Set(allow);
+  return tools.filter((t) => allowed.has(t.name));
 }
 
 /** Fold `defaults` + `perTool` overrides into one resolved flag set. */

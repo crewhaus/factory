@@ -254,6 +254,143 @@ describe("emitChannelBot — daemon.ts wiring", () => {
   });
 });
 
+describe("emitChannelBot — thredz emit-wired (Loop contract 0.4, Batch E, G23)", () => {
+  // The compiler's lowerThredzWired synthesizes the mcp_servers.thredz entry
+  // and flips memory.backend to "thredz"; this fixture mirrors that lowered IR.
+  const THREDZ_IR: IrChannelV0 = {
+    ...MIN_IR,
+    memory: { enabled: true, backend: "thredz", autoRecall: true, autoCapture: true },
+    continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "session" },
+    thredz: {
+      apiKey: { kind: "env", name: "THREDZ_API_KEY" },
+      visibility: "private",
+      goals: true,
+      agentName: "demo-bot",
+    },
+    mcp_servers: {
+      thredz: {
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "thredz-mcp@0.2.0"],
+        env: {
+          THREDZ_API_KEY: { kind: "env", name: "THREDZ_API_KEY" },
+          THREDZ_DEFAULT_VISIBILITY: { kind: "literal", value: "private" },
+        },
+      },
+    },
+  };
+
+  test("the daemon boots connectThredz on the mcp host and drops the ignored-note", () => {
+    const c = fileMap(THREDZ_IR).get("daemon.ts") ?? "";
+    expect(c).toContain('import { connectThredz } from "@crewhaus/memory-service";');
+    expect(c).toContain("const __thredz = await connectThredz(mcpHost, defaultCatalog");
+    expect(c).toContain('agentName: "demo-bot"');
+    // The synthesized thredz addServer is config-error guarded (exit 21).
+    expect(c).toContain("const __report = toFailureReport(__err);");
+    // The live connection threads into createAgent.
+    expect(c).toContain("thredz: __thredz,");
+    // No 0.2.3-style ignored-note comment survives.
+    expect(c).not.toContain("thredz configured but ignored");
+  });
+
+  test("agent.ts threads the live connection into the per-turn wireMemory call", () => {
+    const c = fileMap(THREDZ_IR).get("agent.ts") ?? "";
+    expect(c).toContain("type ThredzConnection");
+    expect(c).toContain("thredz: ThredzConnection | null;");
+    expect(c).toContain("thredz: config.thredz,");
+    // The fragment carries the thredz block so wireMemory flips the backend.
+    expect(c).toContain('"thredz":{');
+  });
+
+  test("a namespaced (non-thredz) server still registers the normal way alongside thredz", () => {
+    const c =
+      fileMap({
+        ...THREDZ_IR,
+        mcp_servers: {
+          ...THREDZ_IR.mcp_servers,
+          fs: { transport: "stdio", command: "npx", args: ["-y", "fs-server"] },
+        },
+      }).get("daemon.ts") ?? "";
+    expect(c).toContain("const __thredz = await connectThredz(mcpHost, defaultCatalog");
+    expect(c).toContain("await Promise.all([");
+    expect(c).toContain('registerMcpServer(mcpHost, "fs"');
+  });
+
+  test("no thredz block → no connectThredz, config.thredz field, or ThredzConnection import", () => {
+    const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    const agent = fileMap(MIN_IR).get("agent.ts") ?? "";
+    expect(daemon).not.toContain("connectThredz");
+    expect(agent).not.toContain("ThredzConnection");
+    expect(agent).not.toContain("thredz: config.thredz");
+  });
+});
+
+describe("emitChannelBot — knowledge RAG block (Loop contract 0.4, Batch E, G22)", () => {
+  const KNOWLEDGE_IR: IrChannelV0 = {
+    ...MIN_IR,
+    knowledge: {
+      embedder: "openai/text-embedding-3-large",
+      vectorBackend: "in-memory",
+      defaultK: 8,
+      chunkSize: 400,
+      chunkOverlap: 0,
+      sources: [
+        { kind: "glob", glob: "kb/**/*.md" },
+        { kind: "url", url: "https://example.com/faq" },
+      ],
+    },
+    memory: { enabled: true, embedder: "mock/deterministic" },
+  };
+
+  test("the daemon ingests the corpus and registers the Retrieve tool before createAgent", () => {
+    const c = fileMap(KNOWLEDGE_IR).get("daemon.ts") ?? "";
+    expect(c).toContain(
+      'import { knowledgeRetrieve, resolveKnowledgeEmbedder } from "@crewhaus/tool-retrieve";',
+    );
+    expect(c).toContain("const __knowledgeTool = await knowledgeRetrieve({");
+    expect(c).toContain('{"kind":"glob","glob":"kb/**/*.md"}');
+    expect(c).toContain("defaultK: 8");
+    expect(c).toContain("defaultCatalog.register(__knowledgeTool);");
+    // G76 order deferred to the helper, with the declared inputs.
+    expect(c).toContain(
+      'resolveKnowledgeEmbedder({ knowledgeEmbedder: "openai/text-embedding-3-large", memoryEmbedder: "mock/deterministic" })',
+    );
+    // Registered before the agent snapshots the catalog.
+    expect(c.indexOf("defaultCatalog.register(__knowledgeTool);")).toBeLessThan(
+      c.indexOf("const agent = createAgent("),
+    );
+  });
+
+  test("no knowledge block → no RAG wiring (byte-stable)", () => {
+    const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(c).not.toContain("knowledgeRetrieve");
+    expect(c).not.toContain("__knowledgeTool");
+  });
+});
+
+describe("emitChannelBot — prompt-cache rotation persistence (Loop contract 0.4, Batch E, G78)", () => {
+  test("the daemon constructs a per-spec rotation store and hands it to the agent", () => {
+    const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(c).toContain(
+      'import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";',
+    );
+    expect(c).toContain('createPromptCacheRotationStore({ specName: "demo" })');
+    expect(c).toContain("promptCacheStore: __promptCacheStore,");
+  });
+
+  test("agent.ts reads the stamp before each turn and persists on rotation", () => {
+    const c = fileMap(MIN_IR).get("agent.ts") ?? "";
+    expect(c).toContain(
+      'import type { PromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";',
+    );
+    expect(c).toContain("promptCacheStore: PromptCacheRotationStore;");
+    expect(c).toContain("promptCacheLastRotatedAt: await config.promptCacheStore.read(),");
+    expect(c).toContain(
+      "onPromptCacheRotated: (rotatedAt) => config.promptCacheStore.write(rotatedAt),",
+    );
+  });
+});
+
 describe("emitChannelBot — session-router.ts", () => {
   test("derives sess_<16hex> ids via sha256 of the routing key", () => {
     const c = fileMap(MIN_IR).get("session-router.ts") ?? "";
@@ -1064,5 +1201,534 @@ describe("emitChannelBot — learning (v0.3.0 §3.3, PR 17)", () => {
     const c = fileMap(ir).get("agent.ts") ?? "";
     const dreamFragment = c.split("__DREAM_FRAGMENT: MemoryWiringFragment = ")[1] ?? "";
     expect(dreamFragment).toContain('"learning":{"domain":"specialty coffee extraction science"');
+  });
+});
+
+describe("emitChannelBot — agent tuning knobs (loop contract 0.4, Batch A)", () => {
+  test("agent.ts threads max_tokens/thinking/rate_limits into runChatLoop when set", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      agent: {
+        ...MIN_IR.agent,
+        maxTokens: 16_384,
+        thinking: { budgetTokens: 8192 },
+        rateLimits: { "*": { rpm: 30 }, bash: { rpm: 5, burst: 2 } },
+      },
+    };
+    const c = fileMap(ir).get("agent.ts") ?? "";
+    expect(c).toContain("maxTokens: 16384,");
+    expect(c).toContain('thinking: {"budgetTokens":8192},');
+    expect(c).toContain('rateLimits: {"*":{"rpm":30},"bash":{"rpm":5,"burst":2}},');
+  });
+
+  test("the effort form of thinking is carried verbatim (adapter converts it)", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      agent: { ...MIN_IR.agent, thinking: { effort: "high" } },
+    };
+    const c = fileMap(ir).get("agent.ts") ?? "";
+    expect(c).toContain('thinking: {"effort":"high"},');
+  });
+
+  test("agent.ts omits all three when the IR leaves them unset (byte-identity guard)", () => {
+    const c = fileMap(MIN_IR).get("agent.ts") ?? "";
+    expect(c).not.toContain("maxTokens:");
+    expect(c).not.toContain("thinking:");
+    expect(c).not.toContain("rateLimits:");
+  });
+});
+
+describe("emitChannelBot — limits ceilings (loop contract 0.4, Batch A)", () => {
+  test("agent.ts threads every declared limits knob as its runtime option", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      limits: {
+        maxToolIterations: 40,
+        maxConcurrentTools: 4,
+        contextLimit: 120_000,
+        deadlineMs: 600_000,
+        turnTimeoutMs: 120_000,
+        modelCallTimeoutMs: 60_000,
+        loopDetection: { window: 6, threshold: 3, escalation: "justify" },
+      },
+    };
+    const c = fileMap(ir).get("agent.ts") ?? "";
+    expect(c).toContain("maxToolIterations: 40,");
+    expect(c).toContain("maxConcurrentTools: 4,");
+    expect(c).toContain("contextLimit: 120000,");
+    expect(c).toContain("deadlineMs: 600000,");
+    expect(c).toContain("turnTimeoutMs: 120000,");
+    expect(c).toContain("modelCallTimeoutMs: 60000,");
+    expect(c).toContain('loopDetection: {"window":6,"threshold":3,"escalation":"justify"},');
+  });
+
+  test("partial limits emits only the declared knobs (runtime owns the defaults)", () => {
+    const ir: IrChannelV0 = { ...MIN_IR, limits: { maxToolIterations: 25 } };
+    const c = fileMap(ir).get("agent.ts") ?? "";
+    expect(c).toContain("maxToolIterations: 25,");
+    expect(c).not.toContain("maxConcurrentTools:");
+    expect(c).not.toContain("contextLimit:");
+    expect(c).not.toContain("deadlineMs:");
+    expect(c).not.toContain("turnTimeoutMs:");
+    expect(c).not.toContain("modelCallTimeoutMs:");
+    expect(c).not.toContain("loopDetection:");
+  });
+
+  test("no limits block → zero limits codegen (byte-identity guard)", () => {
+    const c = fileMap(MIN_IR).get("agent.ts") ?? "";
+    expect(c).not.toContain("maxToolIterations:");
+    expect(c).not.toContain("loopDetection:");
+  });
+
+  test("the dream path keeps its own bounded maxToolIterations regardless of limits", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      memory: { dream: { everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 } },
+      limits: { maxToolIterations: 40 },
+    };
+    const c = fileMap(ir).get("agent.ts") ?? "";
+    // The interactive turn carries the spec ceiling…
+    expect(c).toContain("maxToolIterations: 40,");
+    // …while the dream's bounded fresh session stays on the memory-service
+    // seam input (DREAM_MAX_TOOL_ITERATIONS).
+    expect(c).toContain("maxToolIterations: input.maxToolIterations");
+    // Exactly one interactive-call occurrence — the ceiling never leaks into
+    // the dream session.
+    expect(c.split("maxToolIterations: 40,").length - 1).toBe(1);
+  });
+});
+
+describe("emitChannelBot — compaction tuning knobs (loop contract 0.4, Batch A)", () => {
+  test("agent.ts threads threshold/snip_keep_head/snip_keep_tail alongside model", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      compaction: {
+        model: "claude-haiku-4-5-20251001",
+        threshold: 0.75,
+        snipKeepHead: 3,
+        snipKeepTail: 12,
+      },
+    };
+    const c = fileMap(ir).get("agent.ts") ?? "";
+    expect(c).toContain('compactionModel: "claude-haiku-4-5-20251001"');
+    expect(c).toContain("compactionThreshold: 0.75,");
+    expect(c).toContain("snipKeepHead: 3,");
+    expect(c).toContain("snipKeepTail: 12,");
+  });
+
+  test("knobs emit without model, and an empty compaction block emits nothing", () => {
+    const withKnobs = fileMap({ ...MIN_IR, compaction: { threshold: 0.9 } }).get("agent.ts") ?? "";
+    expect(withKnobs).toContain("compactionThreshold: 0.9,");
+    expect(withKnobs).not.toContain("compactionModel:");
+    const without = fileMap(MIN_IR).get("agent.ts") ?? "";
+    expect(without).not.toContain("compactionThreshold:");
+    expect(without).not.toContain("snipKeepHead:");
+    expect(without).not.toContain("snipKeepTail:");
+  });
+});
+
+describe("emitChannelBot — spec-declared hooks (loop contract 0.4, Batch A)", () => {
+  const HOOKS_IR: IrChannelV0 = {
+    ...MIN_IR,
+    hooks: [
+      { event: "pre-tool", matcher: "bash", command: "./guard.sh", timeoutMs: 5000 },
+      { event: "stop", command: "./notify.sh" },
+    ],
+  };
+
+  test("daemon.ts embeds the hooks literal layered below the discovered ones", () => {
+    const c = fileMap(HOOKS_IR).get("daemon.ts") ?? "";
+    expect(c).toContain('import { loadHooks, type HookDef } from "@crewhaus/hooks-engine";');
+    expect(c).toContain(
+      'const __specHooks: ReadonlyArray<HookDef> = [{"event":"pre-tool","matcher":"bash","command":"./guard.sh","timeoutMs":5000},{"event":"stop","command":"./notify.sh"}];',
+    );
+    // Spec first, then user → project — later-wins keeps the settings
+    // layers authoritative (the permission RuleSet's settings-over-yaml
+    // precedence; same ordering as target-cli and the run interpreter).
+    expect(c).toContain("hooks: [...__specHooks, ...__hooks],");
+    expect(c).not.toContain("hooks: __hooks,");
+  });
+
+  test("spec hooks coexist with the continuity extension-boot branch", () => {
+    const ir: IrChannelV0 = {
+      ...HOOKS_IR,
+      continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "session" },
+    };
+    const c = fileMap(ir).get("daemon.ts") ?? "";
+    expect(c).toContain('import { loadHooks, type HookDef } from "@crewhaus/hooks-engine";');
+    expect(c).toContain("hooks: [...__specHooks, ...__hooks],");
+  });
+
+  test("no hooks block → byte-identical daemon (plain loadHooks import, plain field)", () => {
+    const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(c).toContain('import { loadHooks } from "@crewhaus/hooks-engine";');
+    expect(c).toContain("hooks: __hooks,");
+    expect(c).not.toContain("__specHooks");
+    expect(c).not.toContain("HookDef");
+  });
+});
+
+describe("emitChannelBot — memory.embedder (loop contract 0.4, Batch A)", () => {
+  const EMBEDDER_IR: IrChannelV0 = {
+    ...MIN_IR,
+    memory: { embedder: "mock/deterministic", wiki: { enabled: true } },
+  };
+
+  test("agent.ts resolves the embedder once at boot and threads it into wireMemory deps", () => {
+    const c = fileMap(EMBEDDER_IR).get("agent.ts") ?? "";
+    expect(c).toContain('import { createEmbedder } from "@crewhaus/embedder";');
+    expect(c).toContain('const __memEmbedder = createEmbedder({ model: "mock/deterministic" });');
+    // The structural deps.embedder beats the fragment's wiki.embedder factory
+    // string — the documented fallback order embedder → wiki.embedder.
+    expect(c).toContain("embedder: __memEmbedder,");
+  });
+
+  test("the dream path carries the same embedder (janitor deps + model-phase wiring)", () => {
+    const ir: IrChannelV0 = {
+      ...EMBEDDER_IR,
+      memory: {
+        ...EMBEDDER_IR.memory,
+        dream: { everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 },
+      },
+    };
+    const c = fileMap(ir).get("agent.ts") ?? "";
+    // Once in the interactive turn, once in createDreamJanitorStep deps, once
+    // in the dream model-phase's own wireMemory.
+    expect(c.split("embedder: __memEmbedder,").length - 1).toBe(3);
+  });
+
+  test("no embedder (or memory disabled) → zero embedder codegen", () => {
+    const plain = fileMap({ ...MIN_IR, memory: { wiki: { enabled: true } } }).get("agent.ts") ?? "";
+    expect(plain).not.toContain("createEmbedder");
+    expect(plain).not.toContain("__memEmbedder");
+    const disabled =
+      fileMap({
+        ...MIN_IR,
+        memory: { enabled: false, embedder: "mock/deterministic" },
+        continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "session" },
+      }).get("agent.ts") ?? "";
+    expect(disabled).not.toContain("createEmbedder");
+  });
+});
+
+describe("emitChannelBot — evaluation block (loop contract 0.4, Batch B, G02)", () => {
+  test("llm_judge: agent.ts carries the eval-judge wiring threaded into the interactive turn", () => {
+    const agent =
+      fileMap({
+        ...MIN_IR,
+        evaluation: {
+          grader: {
+            type: "llm_judge",
+            criteria: "answers cite a source",
+            model: "claude-haiku-4-5",
+          },
+          threshold: 0.8,
+          onFail: "retry",
+          maxRetries: 2,
+        },
+      }).get("agent.ts") ?? "";
+    expect(agent).toContain('import type { RunEvaluation } from "@crewhaus/runtime-core";');
+    expect(agent).toContain('import { judge } from "@crewhaus/eval-judge";');
+    expect(agent).toContain("const __evaluation: RunEvaluation = {");
+    expect(agent).toContain('graderType: "llm_judge",');
+    expect(agent).toContain('model: "claude-haiku-4-5",');
+    expect(agent).toContain('description: "answers cite a source",');
+    expect(agent).toContain("threshold: 0.8,");
+    expect(agent).toContain('onFail: "retry",');
+    expect(agent).toContain("maxRetries: 2,");
+    expect(agent).toContain("evaluate: async ({ finalText }) => {");
+    expect(agent).toContain("agentOutput: finalText,");
+    expect(agent).toContain("(__verdict.score - 1) / 4");
+    expect(agent).toContain("evaluation: __evaluation,");
+  });
+
+  test("llm_judge: the judge model defaults to the shape's primary model and the resolved default threshold is honored", () => {
+    const agent =
+      fileMap({
+        ...MIN_IR,
+        evaluation: {
+          grader: { type: "llm_judge", criteria: "be kind" },
+          onFail: "retry",
+          maxRetries: 1,
+        },
+      }).get("agent.ts") ?? "";
+    expect(agent).toContain('model: "claude-sonnet-4-6",');
+    expect(agent).toContain('description: "be kind",');
+    expect(agent).toContain("threshold: 0.7,");
+  });
+
+  test("contains: emits a pure fn (no eval-judge import; documented threshold 1)", () => {
+    const agent =
+      fileMap({
+        ...MIN_IR,
+        evaluation: {
+          grader: { type: "contains", value: "DONE" },
+          onFail: "halt",
+          maxRetries: 3,
+        },
+      }).get("agent.ts") ?? "";
+    expect(agent).not.toContain("@crewhaus/eval-judge");
+    expect(agent).toContain('graderType: "contains",');
+    expect(agent).toContain("threshold: 1,");
+    expect(agent).toContain('finalText.includes("DONE")');
+    expect(agent).toContain('onFail: "halt",');
+    expect(agent).toContain("evaluation: __evaluation,");
+  });
+
+  test("regex: emits a pure fn with a per-call lastIndex reset", () => {
+    const agent =
+      fileMap({
+        ...MIN_IR,
+        evaluation: {
+          grader: { type: "regex", value: "\\d+ items" },
+          onFail: "note",
+          maxRetries: 1,
+        },
+      }).get("agent.ts") ?? "";
+    expect(agent).toContain('const __evalRegex = new RegExp("\\\\d+ items");');
+    expect(agent).toContain('graderType: "regex",');
+    expect(agent).toContain("threshold: 1,");
+    expect(agent).toContain("__evalRegex.lastIndex = 0;");
+    expect(agent).toContain("__evalRegex.test(finalText)");
+    expect(agent).toContain('onFail: "note",');
+    expect(agent).toContain("evaluation: __evaluation,");
+  });
+
+  test("no evaluation block → no evaluation wiring in any emitted file (byte-identity guard)", () => {
+    for (const [, content] of fileMap(MIN_IR)) {
+      expect(content).not.toContain("evaluation:");
+      expect(content).not.toContain("__evaluation");
+      expect(content).not.toContain("@crewhaus/eval-judge");
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Loop contract 0.4 (Batch C) — G26 observability env stamps, G48 audit sinks,
+// G11 pending-approval channel surface.
+// ---------------------------------------------------------------------------
+
+describe("emitChannelBot — G26 observability env stamps", () => {
+  test("default (no observability block): cost tracking on, trace ring (no printer)", () => {
+    const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(daemon).toContain('process.env["CREWHAUS_COST_TRACKING"] ??= "1";');
+    // ring is the default: no printer env, and no metrics/alerts/incidents/otel.
+    expect(daemon).not.toContain("CREWHAUS_TRACE");
+    expect(daemon).not.toContain("CREWHAUS_METRICS");
+    expect(daemon).not.toContain("CREWHAUS_ALERTS");
+    expect(daemon).not.toContain("CREWHAUS_INCIDENTS");
+    expect(daemon).not.toContain("OTEL_EXPORTER_OTLP_ENDPOINT");
+  });
+
+  test("trace pretty/json stamp the printer; metrics/alerts/incidents opt-in on", () => {
+    const daemon =
+      fileMap({
+        ...MIN_IR,
+        observability: {
+          trace: { level: "pretty" },
+          metrics: { enabled: true },
+          alerts: { enabled: true },
+          incidents: { enabled: true },
+        },
+      }).get("daemon.ts") ?? "";
+    expect(daemon).toContain('process.env["CREWHAUS_TRACE"] ??= "pretty";');
+    expect(daemon).toContain('process.env["CREWHAUS_METRICS"] ??= "stdout";');
+    expect(daemon).toContain('process.env["CREWHAUS_ALERTS"] ??= "1";');
+    expect(daemon).toContain('process.env["CREWHAUS_INCIDENTS"] ??= "1";');
+  });
+
+  test("explicit cost:false suppresses the cost stamp; trace off ⇒ no printer", () => {
+    const daemon =
+      fileMap({
+        ...MIN_IR,
+        observability: { cost: { enabled: false }, trace: { level: "off" } },
+      }).get("daemon.ts") ?? "";
+    expect(daemon).not.toContain("CREWHAUS_COST_TRACKING");
+    expect(daemon).not.toContain("CREWHAUS_TRACE");
+  });
+
+  test("otel endpoint: a literal stamps verbatim; a $VAR resolves to that env", () => {
+    const literal =
+      fileMap({ ...MIN_IR, observability: { otel: { endpoint: "https://otlp.example/v1" } } }).get(
+        "daemon.ts",
+      ) ?? "";
+    expect(literal).toContain(
+      'process.env["OTEL_EXPORTER_OTLP_ENDPOINT"] ??= "https://otlp.example/v1";',
+    );
+    const fromVar =
+      fileMap({ ...MIN_IR, observability: { otel: { endpoint: "$OTLP_URL" } } }).get("daemon.ts") ??
+      "";
+    expect(fromVar).toContain(
+      'process.env["OTEL_EXPORTER_OTLP_ENDPOINT"] ??= process.env["OTLP_URL"];',
+    );
+  });
+});
+
+describe("emitChannelBot — G48 durable security audit sink", () => {
+  test("daemon opens one audit-log rooted at .crewhaus/audit (env opt-out)", () => {
+    const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(daemon).toContain('import { openAuditLog } from "@crewhaus/audit-log";');
+    expect(daemon).toContain('import { join } from "node:path";');
+    expect(daemon).toContain('process.env["CREWHAUS_SECURITY_AUDIT"] === "0"');
+    expect(daemon).toContain('await openAuditLog({ rootDir: join(__cwd, ".crewhaus", "audit") })');
+  });
+
+  test("the sink threads into createAgent and the runChatLoop turn (both gates)", () => {
+    const files = fileMap(MIN_IR);
+    const daemon = files.get("daemon.ts") ?? "";
+    expect(daemon).toContain(
+      "{ justificationAuditSink: __securityAudit, egressAuditSink: __securityAudit }",
+    );
+    const agent = files.get("agent.ts") ?? "";
+    expect(agent).toContain("justificationAuditSink?: JustificationAuditSink;");
+    expect(agent).toContain("egressAuditSink?: EgressAuditSink;");
+    expect(agent).toContain("...(config.justificationAuditSink !== undefined");
+    expect(agent).toContain("...(config.egressAuditSink !== undefined");
+  });
+});
+
+describe("emitChannelBot — G11 pending-approval channel surface (ask_mode pause)", () => {
+  test("daemon constructs the shared approval store and wires it into gateway + router", () => {
+    const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(daemon).toContain(
+      'import { InMemoryApprovalStore } from "@crewhaus/channel-adapter-base";',
+    );
+    expect(daemon).toContain("const __approvals = new InMemoryApprovalStore();");
+    expect(daemon).toContain("createSessionRouter({ agent, approvals: __approvals })");
+    expect(daemon).toContain("approvals: __approvals,");
+    expect(daemon).toContain("auditSink: __securityAudit,");
+  });
+
+  test("gateway adds the /<adapter>/actions route: verify → resolve → ack → resume", () => {
+    const gateway = fileMap(MIN_IR).get("gateway.ts") ?? "";
+    expect(gateway).toContain('import { resolveApproval } from "@crewhaus/channel-adapter-base";');
+    expect(gateway).toContain("url.pathname.match(/^\\/([^/]+)\\/actions$/)");
+    expect(gateway).toContain("actionAdapter.parseInteraction(actionReq)");
+    // Same signing machinery as an events webhook.
+    expect(gateway).toContain("actionAdapter.verify(actionReq)");
+    expect(gateway).toContain("await resolveApproval({");
+    expect(gateway).toContain("await ackApproval({ interaction, decision: interaction.decision");
+    expect(gateway).toContain("config.sessionRouter.resumeApproval(resolved, actionAdapter)");
+    expect(gateway).toContain("approvals?: ApprovalStore;");
+    expect(gateway).toContain("auditSink?: ApprovalAuditSink;");
+  });
+
+  test("session-router parks on approval_pending and re-drives on resume", () => {
+    const router = fileMap(MIN_IR).get("session-router.ts") ?? "";
+    expect(router).toContain(
+      'import { postApprovalPrompt } from "@crewhaus/channel-adapter-base";',
+    );
+    expect(router).toContain('import { isRunFailedError } from "@crewhaus/errors";');
+    expect(router).toContain('err.report.class === "approval_pending"');
+    expect(router).toContain("await postApprovalPrompt({");
+    expect(router).toContain("sendText: (text) => adapter.sendReply({ event, text })");
+    expect(router).toContain("postInteractive: (approval) => __postApproval({ event, approval })");
+    expect(router).toContain("resumeApproval(approval: PendingApproval, adapter: ChannelAdapter)");
+    expect(router).toContain("const __resumeContexts = new Map<string, InboundEvent>();");
+    expect(router).toContain('if (approval.status !== "grant" || event === undefined) return;');
+  });
+});
+
+describe("emitChannelBot — permissions.ask_mode: deny opts out of the approval surface", () => {
+  const DENY_IR: IrChannelV0 = { ...MIN_IR, permissions: { rules: [], askMode: "deny" } };
+
+  test("no approval store, no actions route, no park/resume wiring", () => {
+    const files = fileMap(DENY_IR);
+    const daemon = files.get("daemon.ts") ?? "";
+    const gateway = files.get("gateway.ts") ?? "";
+    const router = files.get("session-router.ts") ?? "";
+    expect(daemon).not.toContain("InMemoryApprovalStore");
+    expect(daemon).not.toContain("approvals: __approvals");
+    expect(gateway).not.toContain("/actions");
+    expect(gateway).not.toContain("resolveApproval");
+    expect(router).not.toContain("resumeApproval");
+    expect(router).not.toContain("postApprovalPrompt");
+    expect(router).not.toContain("approval_pending");
+  });
+
+  test("G48 audit + G26 observability stay wired regardless of ask_mode", () => {
+    const daemon = fileMap(DENY_IR).get("daemon.ts") ?? "";
+    expect(daemon).toContain('await openAuditLog({ rootDir: join(__cwd, ".crewhaus", "audit") })');
+    expect(daemon).toContain('process.env["CREWHAUS_COST_TRACKING"] ??= "1";');
+  });
+});
+
+describe("emitChannelBot — schedule: wake loop (Batch F, temporal contract)", () => {
+  const withCron = (): IrChannelV0 => ({
+    ...MIN_IR,
+    schedule: {
+      kind: "cron",
+      cron: "0 */6 * * *",
+      timezone: "America/New_York",
+      jitterMs: 30_000,
+      instructions: "Post the six-hour digest.",
+    },
+  });
+  const withInterval = (): IrChannelV0 => ({
+    ...MIN_IR,
+    schedule: { kind: "interval", everyMs: 21_600_000 },
+  });
+
+  test("no schedule → daemon stays byte-identical (no schedule plumbing)", () => {
+    const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(daemon).not.toContain("armSchedule");
+    expect(daemon).not.toContain("[schedule]");
+    expect(daemon).not.toContain("@crewhaus/durable-execution");
+    expect(daemon).not.toContain("__schedRandomBytes");
+  });
+
+  test("cron schedule arms armSchedule with the WakeSchedule literal (no instructions)", () => {
+    const daemon = fileMap(withCron()).get("daemon.ts") ?? "";
+    expect(daemon).toContain('import { armSchedule } from "@crewhaus/durable-execution";');
+    expect(daemon).toContain(
+      'armSchedule({"kind":"cron","cron":"0 */6 * * *","timezone":"America/New_York","jitterMs":30000}',
+    );
+    // instructions ride in onWake, never in the schedule literal.
+    expect(daemon).toContain("Post the six-hour digest.");
+    expect(daemon).not.toContain('"instructions":"Post the six-hour digest."');
+    expect(daemon).toContain("__schedule.cancel();");
+  });
+
+  test("cron wake runs a fresh-session turn with the synthetic prompt", () => {
+    const daemon = fileMap(withCron()).get("daemon.ts") ?? "";
+    expect(daemon).toContain("onWake: async () => {");
+    expect(daemon).toContain("isNew: true,");
+    expect(daemon).toContain("message: __scheduleInstructions,");
+    expect(daemon).toContain(
+      '[schedule] armed (cron \\"0 */6 * * *\\" America/New_York +/-30000ms jitter)',
+    );
+  });
+
+  test("interval schedule with no instructions falls back to the default wake prompt", () => {
+    const daemon = fileMap(withInterval()).get("daemon.ts") ?? "";
+    expect(daemon).toContain('armSchedule({"kind":"interval","everyMs":21600000}');
+    expect(daemon).toContain("[scheduled wake] proceed with your standing instructions.");
+    expect(daemon).toContain("[schedule] armed (every 21600000ms)");
+  });
+
+  test("cancel is wired into the shutdown path", () => {
+    const daemon = fileMap(withCron()).get("daemon.ts") ?? "";
+    const shutdownIdx = daemon.indexOf("const shutdown = async");
+    expect(shutdownIdx).toBeGreaterThan(-1);
+    expect(daemon.indexOf("__schedule.cancel();", shutdownIdx)).toBeGreaterThan(shutdownIdx);
+  });
+});
+
+describe("emitChannelBot — emitted scheduled daemon is syntactically valid TS", () => {
+  test("Bun.Transpiler parses the scheduled daemon.ts", () => {
+    const t = new Bun.Transpiler({ loader: "ts" });
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      schedule: {
+        kind: "cron",
+        cron: "0 */6 * * *",
+        timezone: "America/New_York",
+        jitterMs: 30_000,
+        instructions: "digest",
+      },
+    };
+    const daemon =
+      new Map(emitChannelBot(ir).files.map((f) => [f.path, f.content])).get("daemon.ts") ?? "";
+    expect(() => t.transformSync(daemon)).not.toThrow();
   });
 });

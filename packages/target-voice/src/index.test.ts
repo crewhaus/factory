@@ -131,3 +131,26 @@ describe("emitVoice — failure_taxonomy ignored-note (item 23)", () => {
     expect(loop?.content ?? "").not.toContain("failure_taxonomy configured");
   });
 });
+
+describe("emitVoice — tools ignored-note (G33 short-term)", () => {
+  test("voice-loop.ts carries the ignored-tools note when the spec declares tools", () => {
+    const ir: IrVoiceV0 = { ...baseIr, tools: ["webSearch", "fetch"] };
+    const loop = emitVoice(ir).files.find((f) => f.path === "voice-loop.ts");
+    expect(loop?.content ?? "").toContain(
+      "tools configured but target-voice does not yet bridge them into the realtime session",
+    );
+  });
+
+  test("no note when the spec declares no tools (bundle bytes unchanged)", () => {
+    const loop = emitVoice(baseIr).files.find((f) => f.path === "voice-loop.ts");
+    expect(loop?.content ?? "").not.toContain("tools configured");
+  });
+
+  test("declared tools are NOT registered anywhere in the emitted bundle (note, not wiring)", () => {
+    const ir: IrVoiceV0 = { ...baseIr, tools: ["webSearch"] };
+    for (const f of emitVoice(ir).files.filter((f) => f.path.endsWith(".ts"))) {
+      expect(f.content).not.toContain("defaultCatalog");
+      expect(f.content).not.toContain("@crewhaus/tool-web");
+    }
+  });
+});

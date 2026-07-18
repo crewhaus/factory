@@ -223,3 +223,75 @@ describe("TraceEventBus traceparent / span helpers", () => {
     expect(parseTraceparent(`00-${"0".repeat(32)}-00f067aa0ba902b7-01`)).toBeUndefined();
   });
 });
+
+describe("TraceEventBus agentId (Batch C, item 4)", () => {
+  test("envelope() stamps agentId when the bus carries one", () => {
+    const bus = new TraceEventBus({
+      runId: "run_a",
+      sessionId: "sess_1",
+      agentId: "ed25519:abc123",
+      env: {},
+    });
+    expect(bus.agentId).toBe("ed25519:abc123");
+    const env = bus.envelope();
+    expect(env.agentId).toBe("ed25519:abc123");
+  });
+
+  test("envelope() omits agentId entirely when the bus has none", () => {
+    const bus = new TraceEventBus({ runId: "run_a", sessionId: "sess_1", env: {} });
+    expect(bus.agentId).toBeUndefined();
+    const env = bus.envelope();
+    expect(env.agentId).toBeUndefined();
+    expect("agentId" in env).toBe(false);
+  });
+
+  test("a child bus can inherit the parent's agentId so the whole trace attributes to one agent", () => {
+    const parent = new TraceEventBus({
+      runId: "run_a",
+      sessionId: "sess_1",
+      agentId: "ed25519:parent",
+      env: {},
+    });
+    const child = new TraceEventBus({
+      runId: "run_child",
+      sessionId: "sess_child",
+      inheritTraceId: parent.traceId,
+      inheritParentSpanId: parent.currentSpanId,
+      agentId: parent.agentId,
+      env: {},
+    });
+    expect(child.envelope().agentId).toBe("ed25519:parent");
+    expect(child.traceId).toBe(parent.traceId);
+  });
+});
+
+describe("TraceEventBus — Batch C approval events round-trip the ring", () => {
+  test("approval_requested + approval_resolved publish, store, and query by kind", () => {
+    const bus = new TraceEventBus({ runId: "run_a", sessionId: "sess_1", env: {} });
+    const requested: TraceEvent = {
+      ...baseEnvelope(bus),
+      kind: "approval_requested",
+      approvalId: "appr_1",
+      toolName: "Bash",
+      surface: "single-turn",
+    };
+    const resolved: TraceEvent = {
+      ...baseEnvelope(bus),
+      kind: "approval_resolved",
+      approvalId: "appr_1",
+      decision: "grant",
+      by: "cli",
+    };
+    const seen: TraceEvent[] = [];
+    bus.subscribe((e) => {
+      seen.push(e);
+    });
+    bus.publish(requested);
+    bus.publish(resolved);
+    expect(seen.map((e) => e.kind)).toEqual(["approval_requested", "approval_resolved"]);
+    const parked = bus.recent({ kinds: ["approval_requested"] });
+    expect(parked).toHaveLength(1);
+    const only = parked[0];
+    expect(only?.kind === "approval_requested" && only.approvalId).toBe("appr_1");
+  });
+});

@@ -6,8 +6,12 @@ import {
   PROTOCOL_VERSION,
   RequestEnvelope,
   ResponseEnvelope,
+  RunsSubscribeParams,
+  SSE_CONTENT_TYPE,
   decodeRequest,
   encodeError,
+  encodeSseComment,
+  encodeSseEvent,
   encodeSuccess,
 } from "./index";
 
@@ -237,6 +241,62 @@ describe("RequestEnvelope is the exported request schema", () => {
       params: 42,
     });
     expect(parsed.success).toBe(true);
+  });
+});
+
+describe("runs.subscribe params", () => {
+  test("requires a non-empty runId (.strict, min 1)", () => {
+    expect(RunsSubscribeParams.safeParse({ runId: "run_1" }).success).toBe(true);
+    expect(RunsSubscribeParams.safeParse({ runId: "" }).success).toBe(false);
+    expect(RunsSubscribeParams.safeParse({}).success).toBe(false);
+    // Extra fields are rejected — the subscribe params are a closed shape.
+    expect(RunsSubscribeParams.safeParse({ runId: "run_1", extra: 1 }).success).toBe(false);
+  });
+
+  test("decodeRequest routes runs.subscribe and validates its runId", () => {
+    const r = decodeRequest({
+      protocol: "crewhaus.v1",
+      id: "id",
+      method: "runs.subscribe",
+      params: { runId: "run_abc" },
+    });
+    expect(r.method).toBe("runs.subscribe");
+    expect((r.params as { runId: string }).runId).toBe("run_abc");
+    expect(() =>
+      decodeRequest({
+        protocol: "crewhaus.v1",
+        id: "id",
+        method: "runs.subscribe",
+        params: { runId: "" },
+      }),
+    ).toThrow(/invalid params for runs.subscribe/);
+  });
+});
+
+describe("SSE framing (runs.subscribe wire format)", () => {
+  test("SSE_CONTENT_TYPE is the event-stream MIME", () => {
+    expect(SSE_CONTENT_TYPE).toBe("text/event-stream");
+  });
+
+  test("encodeSseEvent is a single data: frame ended by a blank line", () => {
+    const frame = encodeSseEvent({ kind: "turn_start", turn: 1 });
+    expect(frame).toBe('data: {"kind":"turn_start","turn":1}\n\n');
+    // Exactly one data: line — the JSON body carries no literal newline.
+    expect(frame.split("\n").filter((l) => l.startsWith("data:")).length).toBe(1);
+  });
+
+  test("encodeSseEvent escapes embedded newlines inside the JSON (stays one line)", () => {
+    // A string field with a newline must not break the single-line data: frame.
+    const frame = encodeSseEvent({ kind: "run_failed", message: "line1\nline2" });
+    const body = frame.slice("data: ".length, -2); // strip "data: " and trailing \n\n
+    expect(body).not.toContain("\n"); // JSON.stringify escaped it to \\n
+    expect(JSON.parse(body)).toEqual({ kind: "run_failed", message: "line1\nline2" });
+  });
+
+  test("encodeSseComment is a :-prefixed frame with newlines collapsed", () => {
+    expect(encodeSseComment("heartbeat")).toBe(": heartbeat\n\n");
+    // An injected newline can't split one comment into two frames.
+    expect(encodeSseComment("a\nb")).toBe(": a b\n\n");
   });
 });
 

@@ -1,0 +1,1504 @@
+{
+  "cli": {
+    "kind": "ring",
+    "target": "cli",
+    "ring": {
+      "segments": [
+        {
+          "id": "perceive",
+          "active": true,
+          "keys": ["tools[webFetch]"],
+          "summary": "web tools: webFetch"
+        },
+        {
+          "id": "reason",
+          "active": true,
+          "keys": ["agent.thinking"],
+          "summary": "extended thinking on claude-opus-4-7"
+        },
+        {
+          "id": "act",
+          "active": true,
+          "keys": ["tools"],
+          "summary": "2 tools (webFetch, read)"
+        },
+        {
+          "id": "evaluate",
+          "active": true,
+          "keys": ["evaluation"],
+          "summary": "in-loop evaluation (llm_judge, threshold 0.8, on fail: retry, ≤ 2 retries)"
+        },
+        {
+          "id": "update",
+          "active": false,
+          "keys": [],
+          "summary": "continuity explicitly disabled — nothing durable persists between sessions"
+        },
+        {
+          "id": "stop",
+          "active": true,
+          "keys": ["budget", "limits"],
+          "summary": "budget $2.5 (on exceed: stop) · limits (max_tool_iterations, deadline_ms)"
+        },
+        {
+          "id": "safety",
+          "active": true,
+          "keys": ["permissions"],
+          "summary": "permissions (mode: default, 1 rule)"
+        }
+      ]
+    },
+    "warnings": []
+  },
+  "workflow": {
+    "kind": "canvas",
+    "target": "workflow",
+    "canvas": {
+      "nodes": [
+        {
+          "id": "draft",
+          "label": "1. draft",
+          "kind": "step",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": true,
+              "keys": ["tools[webSearch]"],
+              "summary": "web tools: webSearch"
+            },
+            {
+              "id": "reason",
+              "active": true,
+              "keys": ["model"],
+              "summary": "model: claude-opus-4-7"
+            },
+            {
+              "id": "act",
+              "active": true,
+              "keys": ["tools"],
+              "summary": "1 tool (webSearch)"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        },
+        {
+          "id": "gate",
+          "label": "2. gate",
+          "kind": "step",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": false,
+              "keys": [],
+              "summary": "sees only upstream state and its instructions"
+            },
+            {
+              "id": "reason",
+              "active": true,
+              "keys": ["model"],
+              "summary": "model: claude-opus-4-7"
+            },
+            {
+              "id": "act",
+              "active": false,
+              "keys": [],
+              "summary": "no tools — replies in text only"
+            },
+            {
+              "id": "evaluate",
+              "active": true,
+              "keys": ["judge"],
+              "summary": "judge gate (threshold 0.9, on fail: retry_previous)"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        },
+        {
+          "id": "publish",
+          "label": "3. publish",
+          "kind": "step",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": false,
+              "keys": [],
+              "summary": "sees only upstream state and its instructions"
+            },
+            {
+              "id": "reason",
+              "active": true,
+              "keys": ["model"],
+              "summary": "model: claude-opus-4-7"
+            },
+            {
+              "id": "act",
+              "active": false,
+              "keys": [],
+              "summary": "no tools — replies in text only"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        }
+      ],
+      "edges": [
+        {
+          "from": "draft",
+          "to": "gate"
+        },
+        {
+          "from": "gate",
+          "to": "publish",
+          "label": "pass",
+          "conditional": true
+        },
+        {
+          "from": "gate",
+          "to": "draft",
+          "label": "retry ≤ 2",
+          "conditional": true
+        }
+      ]
+    },
+    "warnings": []
+  },
+  "graph": {
+    "kind": "canvas",
+    "target": "graph",
+    "canvas": {
+      "nodes": [
+        {
+          "id": "classify",
+          "label": "classify (entry)",
+          "kind": "node",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": false,
+              "keys": [],
+              "summary": "sees only upstream state and its instructions"
+            },
+            {
+              "id": "reason",
+              "active": true,
+              "keys": ["model"],
+              "summary": "model: claude-opus-4-7"
+            },
+            {
+              "id": "act",
+              "active": false,
+              "keys": [],
+              "summary": "no tools — replies in text only"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        },
+        {
+          "id": "billing",
+          "label": "billing",
+          "kind": "node",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": false,
+              "keys": [],
+              "summary": "sees only upstream state and its instructions"
+            },
+            {
+              "id": "reason",
+              "active": true,
+              "keys": ["model"],
+              "summary": "model: claude-opus-4-7"
+            },
+            {
+              "id": "act",
+              "active": false,
+              "keys": [],
+              "summary": "no tools — replies in text only"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        },
+        {
+          "id": "tech",
+          "label": "tech",
+          "kind": "node",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": false,
+              "keys": [],
+              "summary": "sees only upstream state and its instructions"
+            },
+            {
+              "id": "reason",
+              "active": true,
+              "keys": ["model"],
+              "summary": "model: claude-opus-4-7"
+            },
+            {
+              "id": "act",
+              "active": false,
+              "keys": [],
+              "summary": "no tools — replies in text only"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        },
+        {
+          "id": "gate",
+          "label": "gate",
+          "kind": "node",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": false,
+              "keys": [],
+              "summary": "sees only upstream state and its instructions"
+            },
+            {
+              "id": "reason",
+              "active": true,
+              "keys": ["model"],
+              "summary": "model: claude-opus-4-7"
+            },
+            {
+              "id": "act",
+              "active": false,
+              "keys": [],
+              "summary": "no tools — replies in text only"
+            },
+            {
+              "id": "evaluate",
+              "active": true,
+              "keys": ["judge"],
+              "summary": "judge gate (threshold 0.7, on fail: halt)"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        },
+        {
+          "id": "review",
+          "label": "review",
+          "kind": "node",
+          "hitl": true,
+          "mini": [
+            {
+              "id": "perceive",
+              "active": false,
+              "keys": [],
+              "summary": "sees only upstream state and its instructions"
+            },
+            {
+              "id": "reason",
+              "active": true,
+              "keys": ["model"],
+              "summary": "model: claude-opus-4-7"
+            },
+            {
+              "id": "act",
+              "active": false,
+              "keys": [],
+              "summary": "no tools — replies in text only"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": true,
+              "keys": ["hitl"],
+              "summary": "human approval gate: \"Approve the reply?\""
+            }
+          ]
+        }
+      ],
+      "edges": [
+        {
+          "from": "classify",
+          "to": "billing",
+          "label": "classify == billing",
+          "conditional": true
+        },
+        {
+          "from": "classify",
+          "to": "tech"
+        },
+        {
+          "from": "billing",
+          "to": "gate"
+        },
+        {
+          "from": "tech",
+          "to": "gate"
+        },
+        {
+          "from": "gate",
+          "to": "review"
+        }
+      ]
+    },
+    "warnings": ["parallel group: billing, tech run concurrently (barrier)"]
+  },
+  "crew": {
+    "kind": "canvas",
+    "target": "crew",
+    "canvas": {
+      "nodes": [
+        {
+          "id": "editor",
+          "label": "editor (entry)",
+          "kind": "role",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": false,
+              "keys": [],
+              "summary": "sees only upstream state and its instructions"
+            },
+            {
+              "id": "reason",
+              "active": true,
+              "keys": ["model"],
+              "summary": "model: claude-opus-4-7"
+            },
+            {
+              "id": "act",
+              "active": false,
+              "keys": [],
+              "summary": "no tools — replies in text only"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        },
+        {
+          "id": "writer",
+          "label": "writer",
+          "kind": "role",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": true,
+              "keys": ["tools[webSearch]"],
+              "summary": "web tools: webSearch"
+            },
+            {
+              "id": "reason",
+              "active": true,
+              "keys": ["model"],
+              "summary": "model: claude-opus-4-7"
+            },
+            {
+              "id": "act",
+              "active": true,
+              "keys": ["tools"],
+              "summary": "1 tool (webSearch)"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        }
+      ],
+      "edges": [
+        {
+          "from": "editor",
+          "to": "writer",
+          "label": "contains \"DRAFT\"",
+          "conditional": true
+        },
+        {
+          "from": "writer",
+          "to": "editor",
+          "label": "contains \"READY\"",
+          "conditional": true
+        }
+      ]
+    },
+    "warnings": []
+  },
+  "channel": {
+    "kind": "ring",
+    "target": "channel",
+    "ring": {
+      "segments": [
+        {
+          "id": "perceive",
+          "active": true,
+          "keys": ["channels.slack", "heartbeat"],
+          "summary": "channel ingress: slack · heartbeat timer"
+        },
+        {
+          "id": "reason",
+          "active": false,
+          "keys": [],
+          "summary": "single fixed model (claude-opus-4-7) — no thinking, tiers, or pool"
+        },
+        {
+          "id": "act",
+          "active": false,
+          "keys": [],
+          "summary": "no tools, MCP servers, or sub-agents — replies in text only"
+        },
+        {
+          "id": "evaluate",
+          "active": true,
+          "keys": ["evaluation"],
+          "summary": "in-loop evaluation (contains, on fail: note)"
+        },
+        {
+          "id": "update",
+          "active": false,
+          "keys": [],
+          "summary": "continuity explicitly disabled — nothing durable persists between sessions"
+        },
+        {
+          "id": "stop",
+          "active": false,
+          "keys": [],
+          "summary": "defaults only — stops at the 500-iteration cap"
+        },
+        {
+          "id": "safety",
+          "active": false,
+          "keys": [],
+          "summary": "no permissions, security, or transaction policy — runtime defaults only"
+        }
+      ]
+    },
+    "warnings": ["no budget: — stops only at the 500-iteration default"]
+  },
+  "managed": {
+    "kind": "ring",
+    "target": "managed",
+    "ring": {
+      "segments": [
+        {
+          "id": "perceive",
+          "active": false,
+          "keys": [],
+          "summary": "input arrives only from the incoming message — no browse/fetch/web tools or channel ingress"
+        },
+        {
+          "id": "reason",
+          "active": false,
+          "keys": [],
+          "summary": "single fixed model (claude-opus-4-7) — no thinking, tiers, or pool"
+        },
+        {
+          "id": "act",
+          "active": false,
+          "keys": [],
+          "summary": "no tools, MCP servers, or sub-agents — replies in text only"
+        },
+        {
+          "id": "evaluate",
+          "active": false,
+          "keys": [],
+          "summary": "no in-loop evaluation — output is never checked before it ships"
+        },
+        {
+          "id": "update",
+          "active": false,
+          "keys": [],
+          "summary": "continuity explicitly disabled — nothing durable persists between sessions"
+        },
+        {
+          "id": "stop",
+          "active": false,
+          "keys": [],
+          "summary": "defaults only — stops at the 500-iteration cap"
+        },
+        {
+          "id": "safety",
+          "active": false,
+          "keys": [],
+          "summary": "no permissions, security, or transaction policy — runtime defaults only"
+        }
+      ]
+    },
+    "warnings": ["no budget: — stops only at the 500-iteration default"]
+  },
+  "pipeline": {
+    "kind": "canvas",
+    "target": "pipeline",
+    "canvas": {
+      "nodes": [
+        {
+          "id": "doc:handbook",
+          "label": "handbook",
+          "kind": "doc",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": false,
+              "keys": [],
+              "summary": "sees only upstream state and its instructions"
+            },
+            {
+              "id": "reason",
+              "active": false,
+              "keys": [],
+              "summary": "inherits the spec-level model"
+            },
+            {
+              "id": "act",
+              "active": false,
+              "keys": [],
+              "summary": "no tools — replies in text only"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        },
+        {
+          "id": "index",
+          "label": "index (fixed)",
+          "kind": "node",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": false,
+              "keys": [],
+              "summary": "sees only upstream state and its instructions"
+            },
+            {
+              "id": "reason",
+              "active": false,
+              "keys": [],
+              "summary": "inherits the spec-level model"
+            },
+            {
+              "id": "act",
+              "active": false,
+              "keys": [],
+              "summary": "no tools — replies in text only"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        },
+        {
+          "id": "agent",
+          "label": "chat agent",
+          "kind": "node",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": false,
+              "keys": [],
+              "summary": "sees only upstream state and its instructions"
+            },
+            {
+              "id": "reason",
+              "active": true,
+              "keys": ["model"],
+              "summary": "model: claude-opus-4-7"
+            },
+            {
+              "id": "act",
+              "active": false,
+              "keys": [],
+              "summary": "no tools — replies in text only"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        }
+      ],
+      "edges": [
+        {
+          "from": "doc:handbook",
+          "to": "index"
+        },
+        {
+          "from": "index",
+          "to": "agent",
+          "label": "retrieve (k=3, in-memory)"
+        }
+      ]
+    },
+    "warnings": []
+  },
+  "research": {
+    "kind": "canvas",
+    "target": "research",
+    "canvas": {
+      "nodes": [
+        {
+          "id": "goal",
+          "label": "goal: Map the field",
+          "kind": "node",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": true,
+              "keys": ["tools[webFetch]"],
+              "summary": "web tools: webFetch"
+            },
+            {
+              "id": "reason",
+              "active": true,
+              "keys": ["model"],
+              "summary": "model: claude-opus-4-7"
+            },
+            {
+              "id": "act",
+              "active": true,
+              "keys": ["tools"],
+              "summary": "1 tool (webFetch)"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        },
+        {
+          "id": "branch-1",
+          "label": "branch 1",
+          "kind": "node",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": true,
+              "keys": ["tools[webFetch]"],
+              "summary": "web tools: webFetch"
+            },
+            {
+              "id": "reason",
+              "active": true,
+              "keys": ["model"],
+              "summary": "model: claude-opus-4-7"
+            },
+            {
+              "id": "act",
+              "active": true,
+              "keys": ["tools"],
+              "summary": "1 tool (webFetch)"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        },
+        {
+          "id": "branch-2",
+          "label": "branch 2",
+          "kind": "node",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": true,
+              "keys": ["tools[webFetch]"],
+              "summary": "web tools: webFetch"
+            },
+            {
+              "id": "reason",
+              "active": true,
+              "keys": ["model"],
+              "summary": "model: claude-opus-4-7"
+            },
+            {
+              "id": "act",
+              "active": true,
+              "keys": ["tools"],
+              "summary": "1 tool (webFetch)"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        },
+        {
+          "id": "report",
+          "label": "report",
+          "kind": "doc",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": false,
+              "keys": [],
+              "summary": "sees only upstream state and its instructions"
+            },
+            {
+              "id": "reason",
+              "active": false,
+              "keys": [],
+              "summary": "inherits the spec-level model"
+            },
+            {
+              "id": "act",
+              "active": false,
+              "keys": [],
+              "summary": "no tools — replies in text only"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        }
+      ],
+      "edges": [
+        {
+          "from": "goal",
+          "to": "branch-1"
+        },
+        {
+          "from": "branch-1",
+          "to": "report"
+        },
+        {
+          "from": "goal",
+          "to": "branch-2"
+        },
+        {
+          "from": "branch-2",
+          "to": "report"
+        }
+      ]
+    },
+    "warnings": []
+  },
+  "batch": {
+    "kind": "canvas",
+    "target": "batch",
+    "canvas": {
+      "nodes": [
+        {
+          "id": "queue",
+          "label": "queue (in-memory)",
+          "kind": "node",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": false,
+              "keys": [],
+              "summary": "sees only upstream state and its instructions"
+            },
+            {
+              "id": "reason",
+              "active": false,
+              "keys": [],
+              "summary": "inherits the spec-level model"
+            },
+            {
+              "id": "act",
+              "active": false,
+              "keys": [],
+              "summary": "no tools — replies in text only"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        },
+        {
+          "id": "agent",
+          "label": "worker × 2",
+          "kind": "node",
+          "mini": [
+            {
+              "id": "perceive",
+              "active": false,
+              "keys": [],
+              "summary": "sees only upstream state and its instructions"
+            },
+            {
+              "id": "reason",
+              "active": true,
+              "keys": ["model"],
+              "summary": "model: claude-opus-4-7"
+            },
+            {
+              "id": "act",
+              "active": false,
+              "keys": [],
+              "summary": "no tools — replies in text only"
+            },
+            {
+              "id": "evaluate",
+              "active": false,
+              "keys": [],
+              "summary": "no in-loop evaluation"
+            },
+            {
+              "id": "update",
+              "active": false,
+              "keys": [],
+              "summary": "no node-level memory — shares the spec's stores"
+            },
+            {
+              "id": "stop",
+              "active": false,
+              "keys": [],
+              "summary": "bounded by the surrounding orchestration"
+            },
+            {
+              "id": "safety",
+              "active": false,
+              "keys": [],
+              "summary": "no approval gate on this node"
+            }
+          ]
+        }
+      ],
+      "edges": [
+        {
+          "from": "queue",
+          "to": "agent",
+          "label": "jobs"
+        },
+        {
+          "from": "agent",
+          "to": "queue",
+          "label": "retries (≤ 3)",
+          "conditional": true
+        }
+      ]
+    },
+    "warnings": []
+  },
+  "voice": {
+    "kind": "ring",
+    "target": "voice",
+    "ring": {
+      "segments": [
+        {
+          "id": "perceive",
+          "active": false,
+          "keys": [],
+          "summary": "input arrives only from the incoming message — no browse/fetch/web tools or channel ingress"
+        },
+        {
+          "id": "reason",
+          "active": false,
+          "keys": [],
+          "summary": "single fixed model (claude-opus-4-7) — no thinking, tiers, or pool"
+        },
+        {
+          "id": "act",
+          "active": false,
+          "keys": [],
+          "summary": "no tools, MCP servers, or sub-agents — replies in text only"
+        },
+        {
+          "id": "evaluate",
+          "active": false,
+          "keys": [],
+          "summary": "no in-loop evaluation — output is never checked before it ships"
+        },
+        {
+          "id": "update",
+          "active": false,
+          "keys": [],
+          "summary": "no memory/continuity/thredz configured — facts are not persisted between sessions"
+        },
+        {
+          "id": "stop",
+          "active": false,
+          "keys": [],
+          "summary": "defaults only — stops at the 500-iteration cap"
+        },
+        {
+          "id": "safety",
+          "active": false,
+          "keys": [],
+          "summary": "no permissions, security, or transaction policy — runtime defaults only"
+        }
+      ]
+    },
+    "warnings": [
+      "target \"voice\" has no dedicated loop projection yet — showing the generic single-agent ring"
+    ]
+  },
+  "browser": {
+    "kind": "ring",
+    "target": "browser",
+    "ring": {
+      "segments": [
+        {
+          "id": "perceive",
+          "active": false,
+          "keys": [],
+          "summary": "input arrives only from the incoming message — no browse/fetch/web tools or channel ingress"
+        },
+        {
+          "id": "reason",
+          "active": false,
+          "keys": [],
+          "summary": "single fixed model (claude-opus-4-7) — no thinking, tiers, or pool"
+        },
+        {
+          "id": "act",
+          "active": false,
+          "keys": [],
+          "summary": "no tools, MCP servers, or sub-agents — replies in text only"
+        },
+        {
+          "id": "evaluate",
+          "active": false,
+          "keys": [],
+          "summary": "no in-loop evaluation — output is never checked before it ships"
+        },
+        {
+          "id": "update",
+          "active": false,
+          "keys": [],
+          "summary": "no memory/continuity/thredz configured — facts are not persisted between sessions"
+        },
+        {
+          "id": "stop",
+          "active": true,
+          "keys": ["limits"],
+          "summary": "limits (turn_timeout_ms)"
+        },
+        {
+          "id": "safety",
+          "active": false,
+          "keys": [],
+          "summary": "no permissions, security, or transaction policy — runtime defaults only"
+        }
+      ]
+    },
+    "warnings": [
+      "target \"browser\" has no dedicated loop projection yet — showing the generic single-agent ring"
+    ]
+  },
+  "eval": {
+    "kind": "ring",
+    "target": "eval",
+    "ring": {
+      "segments": [
+        {
+          "id": "perceive",
+          "active": false,
+          "keys": [],
+          "summary": "input arrives only from the incoming message — no browse/fetch/web tools or channel ingress"
+        },
+        {
+          "id": "reason",
+          "active": false,
+          "keys": [],
+          "summary": "single fixed model (claude-opus-4-7) — no thinking, tiers, or pool"
+        },
+        {
+          "id": "act",
+          "active": false,
+          "keys": [],
+          "summary": "no tools, MCP servers, or sub-agents — replies in text only"
+        },
+        {
+          "id": "evaluate",
+          "active": false,
+          "keys": [],
+          "summary": "no in-loop evaluation — output is never checked before it ships"
+        },
+        {
+          "id": "update",
+          "active": false,
+          "keys": [],
+          "summary": "no memory/continuity/thredz configured — facts are not persisted between sessions"
+        },
+        {
+          "id": "stop",
+          "active": false,
+          "keys": [],
+          "summary": "defaults only — stops at the 500-iteration cap"
+        },
+        {
+          "id": "safety",
+          "active": false,
+          "keys": [],
+          "summary": "no permissions, security, or transaction policy — runtime defaults only"
+        }
+      ]
+    },
+    "warnings": [
+      "target \"eval\" has no dedicated loop projection yet — showing the generic single-agent ring"
+    ]
+  },
+  "onchain": {
+    "kind": "ring",
+    "target": "onchain",
+    "ring": {
+      "segments": [
+        {
+          "id": "perceive",
+          "active": false,
+          "keys": [],
+          "summary": "input arrives only from the incoming message — no browse/fetch/web tools or channel ingress"
+        },
+        {
+          "id": "reason",
+          "active": false,
+          "keys": [],
+          "summary": "single fixed model (claude-opus-4-7) — no thinking, tiers, or pool"
+        },
+        {
+          "id": "act",
+          "active": false,
+          "keys": [],
+          "summary": "no tools, MCP servers, or sub-agents — replies in text only"
+        },
+        {
+          "id": "evaluate",
+          "active": false,
+          "keys": [],
+          "summary": "no in-loop evaluation — output is never checked before it ships"
+        },
+        {
+          "id": "update",
+          "active": false,
+          "keys": [],
+          "summary": "no memory/continuity/thredz configured — facts are not persisted between sessions"
+        },
+        {
+          "id": "stop",
+          "active": false,
+          "keys": [],
+          "summary": "defaults only — stops at the 500-iteration cap"
+        },
+        {
+          "id": "safety",
+          "active": true,
+          "keys": ["transaction_policy"],
+          "summary": "transaction policy"
+        }
+      ]
+    },
+    "warnings": [
+      "target \"onchain\" has no dedicated loop projection yet — showing the generic single-agent ring"
+    ]
+  },
+  "onchain-game": {
+    "kind": "ring",
+    "target": "onchain-game",
+    "ring": {
+      "segments": [
+        {
+          "id": "perceive",
+          "active": false,
+          "keys": [],
+          "summary": "input arrives only from the incoming message — no browse/fetch/web tools or channel ingress"
+        },
+        {
+          "id": "reason",
+          "active": false,
+          "keys": [],
+          "summary": "single fixed model (claude-opus-4-7) — no thinking, tiers, or pool"
+        },
+        {
+          "id": "act",
+          "active": false,
+          "keys": [],
+          "summary": "no tools, MCP servers, or sub-agents — replies in text only"
+        },
+        {
+          "id": "evaluate",
+          "active": false,
+          "keys": [],
+          "summary": "no in-loop evaluation — output is never checked before it ships"
+        },
+        {
+          "id": "update",
+          "active": false,
+          "keys": [],
+          "summary": "no memory/continuity/thredz configured — facts are not persisted between sessions"
+        },
+        {
+          "id": "stop",
+          "active": false,
+          "keys": [],
+          "summary": "defaults only — stops at the 500-iteration cap"
+        },
+        {
+          "id": "safety",
+          "active": true,
+          "keys": ["transaction_policy"],
+          "summary": "transaction policy"
+        }
+      ]
+    },
+    "warnings": [
+      "target \"onchain-game\" has no dedicated loop projection yet — showing the generic single-agent ring"
+    ]
+  }
+}

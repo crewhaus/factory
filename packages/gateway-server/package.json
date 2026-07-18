@@ -14,7 +14,9 @@
   "dependencies": {
     "@crewhaus/durable-state": "workspace:*",
     "@crewhaus/audit-log": "workspace:*",
+    "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/errors": "workspace:*",
+    "@crewhaus/federation-protocol": "workspace:*",
     "@crewhaus/gateway-protocol": "workspace:*",
     "@crewhaus/tenancy": "workspace:*"
   },

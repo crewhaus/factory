@@ -20,6 +20,7 @@
     "@crewhaus/mcp-host": "workspace:*",
     "@crewhaus/memory-store": "workspace:*",
     "@crewhaus/pii-redactor": "workspace:*",
+    "@crewhaus/session-store": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*",
     "@crewhaus/tenancy": "workspace:*",

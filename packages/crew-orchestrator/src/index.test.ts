@@ -4,13 +4,25 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
-import type { CrewMailbox, RuntimeBridge } from "@crewhaus/agent-context-isolation";
+import type {
+  CrewMailbox,
+  RuntimeBridge,
+  SpawnSubAgentFn,
+  SubAgentDefinition,
+} from "@crewhaus/agent-context-isolation";
 import { BUILTIN_DEFAULT_RULES, type RuleSet, emptyRuleSet } from "@crewhaus/permission-engine";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { isValidSpanId, isValidTraceId, parseTraceparent } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
-import { Crew, type CrewEvent, HandoffRefusedError } from "./index.js";
+import {
+  Crew,
+  type CrewEvent,
+  HandoffRefusedError,
+  type RoleDefinition,
+  type RunOptions,
+  composeLoopTuning,
+} from "./index.js";
 
 function newTempRoot(): string {
   return mkdtempSync(join(tmpdir(), "crew-orchestrator-"));
@@ -896,6 +908,172 @@ describe("mailbox surface exposed to in-crew tools", () => {
       expect(roleSeen).toBe("solo");
       // knownRoles is the crew's role roster.
       expect(knownRolesSeen).toEqual(["solo"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("async router + RouterArgs passthroughs (loop contract 0.4, G08)", () => {
+  test("a Promise-returning router moves the crew and receives _adapter + sessionRootDir", async () => {
+    const root = newTempRoot();
+    try {
+      const adapter = makeProgrammableAdapter(({ seed }) => {
+        if (seed.includes("hello")) return [{ type: "text", text: "researcher output" }];
+        return [{ type: "text", text: "writer output" }];
+      });
+      let adapterSeen: ProviderAdapter | undefined;
+      let rootSeen: string | undefined;
+      const crew = Crew()
+        .setName("async-router-test")
+        .addRole("researcher", { model: "stub", instructions: "R." })
+        .addRole("writer", { model: "stub", instructions: "W." })
+        .setEntry("researcher")
+        .setRouting(async ({ lastRole, _adapter, sessionRootDir }) => {
+          // A model-backed router awaits its classify turn; the scripted
+          // seam + session root arrive through the same RouterArgs.
+          adapterSeen = _adapter;
+          rootSeen = sessionRootDir;
+          await Promise.resolve();
+          return lastRole === "researcher" ? "writer" : "writer";
+        })
+        .compile();
+
+      const events = await collect(
+        crew.run("hello", { sessionRootDir: root, _adapter: adapter, maxActivations: 4 }),
+      );
+      const order = events
+        .filter((e) => e.kind === "role_start")
+        .map((e) => (e.kind === "role_start" ? e.role : ""));
+      expect(order).toEqual(["researcher", "writer"]);
+      expect(events[events.length - 1]?.kind).toBe("crew_done");
+      expect(adapterSeen).toBe(adapter);
+      expect(rootSeen).toBe(root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("composeLoopTuning (loop contract 0.4)", () => {
+  const spawnStub: SpawnSubAgentFn = async () => {
+    throw new Error("not dispatched in this test");
+  };
+  const subAgents: ReadonlyMap<string, SubAgentDefinition> = new Map([
+    ["digger", { name: "digger", description: "d", instructions: "dig" }],
+  ]);
+
+  test("maps every declared run-level ceiling and role-level selector 1:1", () => {
+    const def: RoleDefinition = {
+      model: "m",
+      instructions: "i",
+      thinking: { effort: "low" },
+      subAgents,
+    };
+    const opts: RunOptions = {
+      limits: {
+        maxToolIterations: 12,
+        maxConcurrentTools: 2,
+        contextLimit: 100000,
+        deadlineMs: 600000,
+        turnTimeoutMs: 120000,
+        modelCallTimeoutMs: 60000,
+        loopDetection: { window: 6, threshold: 3, escalation: "abort" },
+      },
+      budget: { usdMicros: 5000000, onExceed: { kind: "stop" } },
+      hooks: [{ event: "session-start", command: "echo hi" }],
+      spawnSubAgent: spawnStub,
+    };
+    expect(composeLoopTuning(def, opts)).toEqual({
+      maxToolIterations: 12,
+      maxConcurrentTools: 2,
+      contextLimit: 100000,
+      deadlineMs: 600000,
+      turnTimeoutMs: 120000,
+      modelCallTimeoutMs: 60000,
+      loopDetection: { window: 6, threshold: 3, escalation: "abort" },
+      budget: { usdMicros: 5000000, onExceed: { kind: "stop" } },
+      hooks: [{ event: "session-start", command: "echo hi" }],
+      thinking: { effort: "low" },
+      subAgents,
+      spawnSubAgent: spawnStub,
+    });
+  });
+
+  test("declares nothing when the run + role declare nothing (runtime owns defaults)", () => {
+    expect(composeLoopTuning({ model: "m", instructions: "i" }, {})).toEqual({});
+  });
+
+  test("crew-level caps never leak into the per-turn fragment", () => {
+    const tuned = composeLoopTuning(
+      { model: "m", instructions: "i" },
+      { maxActivations: 5, refusalDepth: 1, maxA2ADepth: 2, limits: { maxToolIterations: 3 } },
+    );
+    expect(tuned).toEqual({ maxToolIterations: 3 });
+  });
+});
+
+describe("sub-agent forwarding to the role bridge (Section 13, G34)", () => {
+  // RoleDefinition.subAgents + RunOptions.spawnSubAgent must land on the
+  // role's RuntimeBridge (that is the whole G34 contract: the Task tool
+  // dispatches via bridge.spawnSubAgent and resolves via its captured
+  // defs). A probe tool reads both off ctx.bridge mid-turn. Because the
+  // pair rides the same composeLoopTuning fragment as limits/budget/hooks,
+  // this also pins that the fragment reaches runChatLoop at the primary
+  // call site.
+  test("RoleDefinition.subAgents and opts.spawnSubAgent arrive on ctx.bridge", async () => {
+    const root = newTempRoot();
+    let subAgentsSeen: ReadonlyMap<string, SubAgentDefinition> | undefined;
+    let spawnerSeen: SpawnSubAgentFn | undefined;
+    try {
+      const spawnStub: SpawnSubAgentFn = async () => {
+        throw new Error("not dispatched in this test");
+      };
+      const subAgents: ReadonlyMap<string, SubAgentDefinition> = new Map([
+        ["digger", { name: "digger", description: "d", instructions: "dig" }],
+      ]);
+      const probe = buildTool({
+        name: "ProbeBridge",
+        description: "Record the bridge's sub-agent surface.",
+        inputSchema: z.object({}).strict(),
+        readOnly: true,
+        execute: async (_input: unknown, ctx?: ToolExecuteContext) => {
+          const bridge = ctx?.bridge as RuntimeBridge | undefined;
+          subAgentsSeen = bridge?.subAgents;
+          spawnerSeen = bridge?.spawnSubAgent;
+          return "probed";
+        },
+      });
+      // Same explicit grant pattern as the StampTrace mailbox test.
+      const permissionRules: RuleSet = {
+        ...emptyRuleSet,
+        builtin: BUILTIN_DEFAULT_RULES,
+        flag: [{ type: "alwaysAllow", pattern: "ProbeBridge", source: "flag" }],
+      };
+      const adapter = makeProgrammableAdapter(({ previousToolResults }) => {
+        if (previousToolResults.length > 0) return [{ type: "text", text: "probed ok" }];
+        return [{ type: "tool_use", id: "tu_probe", name: "ProbeBridge", input: {} }];
+      });
+
+      const crew = Crew()
+        .setName("bridge-probe")
+        .addRole("solo", { model: "stub", instructions: "Solo.", tools: [probe], subAgents })
+        .setEntry("solo")
+        .compile();
+
+      const events = await collect(
+        crew.run("go", {
+          sessionRootDir: root,
+          _adapter: adapter,
+          permissionRules,
+          spawnSubAgent: spawnStub,
+          maxActivations: 4,
+        }),
+      );
+
+      expect(events[events.length - 1]?.kind).toBe("crew_done");
+      expect(subAgentsSeen).toBe(subAgents);
+      expect(spawnerSeen).toBe(spawnStub);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -13,13 +13,14 @@
 
 import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_CODE_SYSTEM_PREFIX } from "./client.js";
-import type {
-  CanonicalContentBlock,
-  CanonicalContentDelta,
-  CanonicalMessage,
-  CanonicalTextBlockParam,
-  ProviderRequest,
-  StreamEvent,
+import {
+  type CanonicalContentBlock,
+  type CanonicalContentDelta,
+  type CanonicalMessage,
+  type CanonicalTextBlockParam,
+  EFFORT_THINKING_BUDGET_TOKENS,
+  type ProviderRequest,
+  type StreamEvent,
 } from "./types.js";
 
 /**
@@ -67,6 +68,15 @@ export function toAnthropicParams(
     params.thinking = {
       type: "enabled",
       budget_tokens: req.thinking.budgetTokens,
+    };
+  } else if (req.reasoningEffort !== undefined) {
+    // Loop contract 0.4 (Batch A) — the portable effort preset converts to
+    // Anthropic's budget-token control via the shared preset table. Only
+    // consulted when `thinking` is not explicitly set: an explicit budget
+    // always wins over the preset.
+    params.thinking = {
+      type: "enabled",
+      budget_tokens: EFFORT_THINKING_BUDGET_TOKENS[req.reasoningEffort],
     };
   }
 

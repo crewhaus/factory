@@ -1,6 +1,7 @@
 import { SpecParseError } from "@crewhaus/errors";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { zodToJsonSchema } from "zod-to-json-schema";
 
 // SECURITY (codegen-injection backstop, #147/#148): spec/role/node/step names
 // flow verbatim into generated source across ~14 emitters — `//` and `/* */`
@@ -65,6 +66,26 @@ const permissionsBlock = z
   .object({
     mode: z.enum(["default", "plan", "auto"]).optional(),
     rules: z.array(permissionRuleSchema).optional(),
+    /**
+     * Loop contract 0.4 (Batch C, G11) — what a tool permission that resolves
+     * to `ask` does on a NON-interactive surface (single-turn / daemon /
+     * gateway, anywhere without a synchronous human prompt). `"pause"`
+     * (DEFAULT — the safe direction) parks the turn: the runtime persists a
+     * `PendingApproval`, publishes an `approval_requested` trace event, and
+     * ends the turn with the `approval_pending` failure class + resume token
+     * so a later `grant`/`deny` decision re-runs the tool call pre-resolved.
+     * `"deny"` is the pre-0.4 collapse behaviour — an ask on a non-interactive
+     * surface becomes a denial in place. The REPL always keeps its
+     * synchronous prompt regardless of this key.
+     *
+     * Deliberately OMITTED from `OPTIMIZABLE_PATHS`: this is a safety /
+     * human-in-the-loop control, not a quality knob. Letting an optimizer
+     * flip a pending-approval `pause` to `deny` (or vice-versa) would let the
+     * search loop silently rewrite the approval posture of a deployment — the
+     * same reason the intent-gate grader and other safety surfaces stay out
+     * of the optimizer's reach.
+     */
+    ask_mode: z.enum(["pause", "deny"]).optional(),
   })
   .strict()
   .optional();
@@ -115,6 +136,17 @@ const subAgentDefinitionSchema = z
       ])
       .optional(),
     inherit_bypass: z.boolean().optional(),
+    /**
+     * Item 2 (G31 — A2A federation) — wire this sub-agent to a REMOTE peer
+     * instead of spawning it locally. `url` is the peer deployment's base
+     * URL; the spawner routes the Task call through `@crewhaus/federation-
+     * router` to the peer's inbound A2A handler (whose Agent Card lives at
+     * `<url>/.well-known/agent-card.json`), mapping the federation envelope
+     * onto A2A message/task semantics. Present ⇒ the entry is a federated
+     * peer reference; `description`/`instructions` still describe it to the
+     * parent's Task tool (the remote peer owns its own prompt).
+     */
+    federation: z.object({ url: z.string().url() }).strict().optional(),
   })
   .strict();
 
@@ -396,6 +428,21 @@ function refineModelSelection(
 const compactionBlock = z
   .object({
     model: z.string().min(1).optional(),
+    /** Loop contract 0.4 (Batch A) — context-window fill fraction that
+     *  triggers autocompaction (e.g. 0.85 = compact at 85% full). Bounded
+     *  to 0.5–0.99: below half the window a compaction pass costs more
+     *  than it saves, and 1.0 would only ever fire after an overflow.
+     *  OPTIMIZABLE (`["compaction","threshold"]` in spec-patch). When
+     *  omitted the runtime default applies. */
+    threshold: z.number().gte(0.5).lte(0.99).optional(),
+    /** Loop contract 0.4 (Batch A) — messages preserved verbatim at the
+     *  HEAD of the transcript by `compaction-snip` before summarising the
+     *  middle. When omitted the snip package's default applies. */
+    snip_keep_head: z.number().int().positive().optional(),
+    /** Loop contract 0.4 (Batch A) — messages preserved verbatim at the
+     *  TAIL of the transcript by `compaction-snip`. When omitted the snip
+     *  package's default applies. */
+    snip_keep_tail: z.number().int().positive().optional(),
     /** Pillar 2 — opt in to the pre-compaction curator pass. Defaults
      *  to `false` when omitted; the IR carries the user's choice
      *  verbatim so target emitters can wire `@crewhaus/compaction-curator`
@@ -529,6 +576,322 @@ const budgetBlock = z
   .optional();
 
 /**
+ * Loop contract 0.4 (Batch B, G02) — the top-level `evaluation:` block:
+ * in-loop output evaluation on the interactive shapes (cli, channel,
+ * managed). After each completed assistant turn the runtime scores the
+ * final text with `grader`; a score below `threshold` triggers the
+ * `on_fail` behaviour:
+ *
+ *   - `retry` (default) — re-prompt the model with the judge's rationale
+ *     appended as a system nudge, at most `max_retries` times.
+ *   - `halt`  — abort the turn with a classified `evaluation` failure.
+ *   - `note`  — emit an `eval_graded` trace event only.
+ *
+ * Graders:
+ *   - `{ type: llm_judge, criteria, model? }` — a model scores the reply
+ *     in [0,1] against `criteria`; `model` defaults to the shape's primary
+ *     model (the `cheapest` sentinel resolves like `compaction.model`).
+ *     Judge calls are METERED into the run budget.
+ *   - `{ type: contains, value }` / `{ type: regex, value }` —
+ *     deterministic pass/fail text checks (no threshold; no model spend).
+ *
+ * `threshold` (0..1, default 0.7) applies to `llm_judge` only — declaring
+ * it with a deterministic grader is a parse error. `.strict()` throughout
+ * so a typo'd sub-key fails the build.
+ */
+const evaluationGraderSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("llm_judge"),
+      model: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "judge model id; defaults to the shape's primary model (the cheapest sentinel resolves at compile time)",
+        ),
+      criteria: z
+        .string()
+        .min(1)
+        .describe(
+          "what a passing reply must satisfy — the judge scores the final text against this",
+        ),
+    })
+    .strict()
+    .describe("model-scored grader: an LLM judges the final text in [0,1] against criteria"),
+  z
+    .object({
+      type: z.literal("contains"),
+      value: z.string().min(1).describe("substring the final text must contain (case-sensitive)"),
+    })
+    .strict()
+    .describe("deterministic grader: pass iff the final text contains value"),
+  z
+    .object({
+      type: z.literal("regex"),
+      value: z.string().min(1).describe("JavaScript regular expression the final text must match"),
+    })
+    .strict()
+    .describe("deterministic grader: pass iff the final text matches the regex"),
+]);
+
+const evaluationBlock = z
+  .object({
+    grader: evaluationGraderSchema,
+    threshold: z
+      .number()
+      .min(0)
+      .max(1)
+      .optional()
+      .describe("passing score in 0..1 (default 0.7); llm_judge grader only"),
+    on_fail: z
+      .enum(["retry", "halt", "note"])
+      .optional()
+      .describe(
+        "below-threshold behaviour: retry re-prompts with the judge rationale (default), halt aborts the turn classified, note emits a trace event only",
+      ),
+    max_retries: z
+      .number()
+      .int()
+      .min(1)
+      .max(5)
+      .optional()
+      .describe("hard cap on evaluation-triggered retries per turn (default 1)"),
+  })
+  .strict()
+  .superRefine((e, ctx) => {
+    if (e.threshold !== undefined && e.grader.type !== "llm_judge") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["threshold"],
+        message: `evaluation.threshold applies to the llm_judge grader only — the "${e.grader.type}" grader is deterministic pass/fail`,
+      });
+    }
+    if (e.grader.type === "regex") {
+      try {
+        new RegExp(e.grader.value);
+      } catch (err) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["grader", "value"],
+          message: `evaluation.grader.value is not a valid regular expression: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    }
+  })
+  .describe(
+    "in-loop output evaluation: score each completed assistant turn and retry/halt/note below threshold",
+  )
+  .optional();
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — the `judge:` gate declared by
+ * `kind: "judge"` workflow steps and graph nodes. A judge step/node runs no
+ * agent turn of its own: it scores the PREVIOUS step's (workflow) /
+ * upstream node's (graph) final output in [0,1] against `criteria` and,
+ * below `threshold` (default 0.7), applies `on_fail`:
+ *
+ *   - `retry_previous` (default) — re-run the gated step/node with the
+ *     judge rationale appended as a system nudge, at most `max_retries`
+ *     times.
+ *   - `halt`     — abort the run with a classified `evaluation` failure.
+ *   - `continue` — record the `judge_verdict` trace event and proceed.
+ *
+ * `model` defaults to the shape's top-level `model` (the `cheapest`
+ * sentinel resolves like `compaction.model`). Judge calls are METERED into
+ * the run budget.
+ */
+const judgeGateBlock = z
+  .object({
+    criteria: z
+      .string()
+      .min(1)
+      .describe("what a passing upstream output must satisfy — the judge scores against this"),
+    model: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("judge model id; defaults to the shape's top-level model"),
+    threshold: z.number().min(0).max(1).optional().describe("passing score in 0..1 (default 0.7)"),
+    on_fail: z
+      .enum(["retry_previous", "halt", "continue"])
+      .optional()
+      .describe(
+        "below-threshold behaviour: retry_previous re-runs the gated step/node (default), halt aborts classified, continue records the verdict and proceeds",
+      ),
+    max_retries: z
+      .number()
+      .int()
+      .min(1)
+      .max(5)
+      .optional()
+      .describe("hard cap on judge-triggered re-runs of the gated step/node (default 1)"),
+  })
+  .strict()
+  .describe("judge gate config for kind: judge workflow steps and graph nodes");
+
+/**
+ * Loop contract 0.4 (Batch A) — extended-thinking selector, carried on the
+ * agent blocks of the interactive shapes (cli, channel, managed) and at
+ * step/node/role granularity on workflow steps, graph nodes, and crew roles.
+ * Exactly ONE of the two forms must be declared (enforced by superRefine):
+ *
+ *   - `{ budget_tokens: n }` — an explicit thinking-token budget (>= 1024,
+ *     the provider floor), passed through to the provider verbatim.
+ *   - `{ effort: low|medium|high }` — a portable effort preset the adapter
+ *     layer converts to a provider-appropriate budget
+ *     (`EFFORT_THINKING_BUDGET_TOKENS` in `@crewhaus/adapter-anthropic`).
+ *
+ * `.strict()` so a typo'd sub-key fails the build.
+ */
+const thinkingBlock = z
+  .object({
+    budget_tokens: z.number().int().min(1024).optional(),
+    effort: z.enum(["low", "medium", "high"]).optional(),
+  })
+  .strict()
+  .superRefine((t, ctx) => {
+    const forms = (t.budget_tokens !== undefined ? 1 : 0) + (t.effort !== undefined ? 1 : 0);
+    if (forms !== 1) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "thinking requires exactly one of budget_tokens (explicit token budget >= 1024) or effort (low|medium|high preset)",
+      });
+    }
+  })
+  .optional();
+
+/**
+ * Loop contract 0.4 (Batch A) — runaway-loop detection tuning inside the
+ * `limits:` block. `window` is the trailing tool-call window inspected;
+ * `threshold` (>1 — a single repeat is normal) is how many identical calls
+ * inside the window count as a loop; `escalation` picks the response:
+ * `warn` (trace event only), `justify` (demand a justification string via
+ * the intent gate), `abort` (end the run). Runtime owns per-knob defaults.
+ */
+const loopDetectionBlock = z
+  .object({
+    window: z.number().int().positive().optional(),
+    threshold: z.number().int().min(2).optional(),
+    escalation: z.enum(["warn", "justify", "abort"]).optional(),
+  })
+  .strict();
+
+/**
+ * Loop contract 0.4 (Batch A) — the top-level `limits:` block: hard runtime
+ * ceilings for one agent loop. Carried on the loop-running shapes (cli,
+ * channel, managed, workflow, graph, crew, research, batch, browser); the
+ * strict union rejects it loudly elsewhere. Every field optional — declare
+ * only the ceilings you want; the runtime owns per-knob defaults.
+ *
+ *   - `max_tool_iterations` — cap on tool-use round-trips per turn
+ *     (OPTIMIZABLE, `["limits","max_tool_iterations"]` in spec-patch).
+ *   - `max_concurrent_tools` — parallel tool-execution ceiling per block.
+ *   - `context_limit` — hard context-token ceiling (overrides the model's).
+ *   - `deadline_ms` — wall-clock ceiling for the whole run.
+ *   - `turn_timeout_ms` — wall-clock ceiling for one turn.
+ *   - `model_call_timeout_ms` — wall-clock ceiling for one model call.
+ *   - `loop_detection` — see {@link loopDetectionBlock}.
+ *
+ * The crew shape additionally accepts a `crew:` sub-block (see
+ * {@link crewLimitsBlock}) for orchestration-level ceilings.
+ */
+const limitsObject = z
+  .object({
+    max_tool_iterations: z.number().int().positive().optional(),
+    max_concurrent_tools: z.number().int().positive().optional(),
+    context_limit: z.number().int().positive().optional(),
+    deadline_ms: z.number().int().positive().optional(),
+    turn_timeout_ms: z.number().int().positive().optional(),
+    model_call_timeout_ms: z.number().int().positive().optional(),
+    loop_detection: loopDetectionBlock.optional(),
+  })
+  .strict();
+
+const limitsBlock = limitsObject.optional();
+
+/**
+ * Loop contract 0.4 (Batch A) — crew-only orchestration ceilings nested
+ * under `limits.crew`. `max_activations` caps total role activations per
+ * run; `refusal_depth` (>= 0 — 0 means "never refuse") caps how many times
+ * a role may bounce a handoff back; `max_a2a_depth` caps agent-to-agent
+ * delegation depth. Accepted ONLY on the crew shape — the base
+ * {@link limitsObject} everywhere else rejects the `crew` key.
+ */
+const crewLimitsBlock = limitsObject
+  .extend({
+    crew: z
+      .object({
+        max_activations: z.number().int().positive().optional(),
+        refusal_depth: z.number().int().nonnegative().optional(),
+        max_a2a_depth: z.number().int().positive().optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .optional();
+
+/**
+ * Loop contract 0.4 (Batch A) — the hook-event names accepted in a spec's
+ * `hooks:` block. DUPLICATED from `HOOK_EVENTS` in `@crewhaus/hooks-engine`
+ * (the runtime source of truth) because the spec package stays
+ * dependency-light — it must not import runtime packages. A cross-check
+ * test in `packages/hooks-engine` imports this const and asserts equality
+ * with `HOOK_EVENTS`, so the two lists cannot drift silently. Keep in sync.
+ */
+export const SPEC_HOOK_EVENTS = [
+  "session-start",
+  "stop",
+  "pre-tool",
+  "post-tool",
+  "pre-model",
+  "post-model",
+  "pre-compact",
+  "post-compact",
+  "pre-slash",
+  "alert",
+] as const;
+
+/**
+ * Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks, the in-spec
+ * equivalent of `.crewhaus/settings.json` `hooks` entries (same shape as
+ * hooks-engine's `HookDef`, snake_case per spec convention: `timeout_ms` ↔
+ * `timeoutMs`). Carried on the same shapes as `limits:`. Each entry spawns
+ * `command` at the named lifecycle `event` (optionally filtered by the
+ * `matcher` glob against the payload's `name`).
+ */
+const hookSchema = z
+  .object({
+    event: z.enum(SPEC_HOOK_EVENTS),
+    matcher: z.string().min(1).optional(),
+    command: z.string().min(1),
+    timeout_ms: z.number().int().positive().optional(),
+  })
+  .strict();
+
+const hooksBlock = z.array(hookSchema).optional();
+
+/**
+ * Loop contract 0.4 (Batch A) — per-tool rate limits on the agent blocks of
+ * the interactive shapes (cli, channel, managed). Keys are tool names (or
+ * `"*"` for the catch-all bucket); `rpm` is the sustained requests-per-
+ * minute ceiling, `burst` the optional short-burst allowance on top.
+ */
+const rateLimitsBlock = z
+  .record(
+    z.string().min(1),
+    z
+      .object({
+        rpm: z.number().int().positive(),
+        burst: z.number().int().positive().optional(),
+      })
+      .strict(),
+  )
+  .optional();
+
+/**
  * Response-feedback block — declares that a harness collects human ratings on
  * agent responses (thumbs/stars/scale/comment) which `crewhaus distill` turns
  * into eval datasets + graders. Cross-cutting like security: carried on the
@@ -624,6 +987,26 @@ const memoryDreamBlock = z
  * prompt at session start (mirrors project-memory auto-load). Carried on the
  * agent-loop shapes (cli, channel, managed, research, crew).
  *
+ * Loop contract 0.4 (Batch E, G46) — DEFAULT CHANGE (mildly breaking): when
+ * the `memory:` block is PRESENT, `autoRecall` now defaults to `true`
+ * (`"session-start"`) and `autoCapture` defaults to `true` (behind the
+ * existing `autoCaptureThreshold` gate) — both previously defaulted to
+ * `false`. The resolved booleans are stamped into the IR at lower time, so
+ * declaring `memory:` at all opts into recall+capture. Opt back out with
+ * `autoRecall: false` / `autoCapture: false`.
+ *
+ * EMBEDDER RESOLUTION ORDER (Batch E, G76) — coherent across the three
+ * embedder knobs, applied by the runtime/emitters (the IR carries the raw
+ * declared strings):
+ *   - fact-store recall + the compaction curator: `memory.embedder` →
+ *     `memory.wiki.embedder` → (none ⇒ BM25-only lexical);
+ *   - the wiki semantic tier: `memory.wiki.embedder` → `memory.embedder` →
+ *     (none ⇒ BM25-only);
+ *   - agent-shape RAG (the `knowledge:` block): `knowledge.embedder` →
+ *     `memory.embedder` → `memory.wiki.embedder` (a vector store needs
+ *     embeddings, so with all three absent the target falls back to its
+ *     default embedder model rather than BM25).
+ *
  * v0.3.0 (§9) extensions — all optional so pre-0.3.0 specs parse (and lower)
  * unchanged:
  *   - `backend`: `file` (the default when absent) | `thredz` (reserved — the
@@ -641,6 +1024,12 @@ const memoryBlock = z
   .object({
     enabled: z.boolean().optional(),
     backend: z.enum(["file", "thredz"]).optional(),
+    /** Loop contract 0.4 (Batch A) — top-level embedder for the FACT store
+     *  (same `@crewhaus/embedder` factory grammar as `wiki.embedder`).
+     *  Runtime fallback order: `embedder` → `wiki.embedder` — declaring
+     *  only the wiki one keeps prior behaviour; the top-level knob lets a
+     *  spec enable hybrid fact recall without enabling the wiki tier. */
+    embedder: z.string().min(1).optional(),
     ttl: z
       .string()
       .regex(
@@ -650,10 +1039,107 @@ const memoryBlock = z
       .optional(),
     autoCapture: z.boolean().optional(),
     autoCaptureThreshold: z.number().int().positive().optional(),
-    autoRecall: z.boolean().optional(),
+    /** Loop contract 0.4 (Batch E, G21) — WHEN auto-recall runs. The boolean
+     *  form is the pre-0.4 on/off switch (`true` ≡ `"session-start"`); the
+     *  string form picks the cadence: `"session-start"` injects the recalled
+     *  block ONCE at boot (the default when memory is present, G46), while
+     *  `"per-turn"` re-runs the recall closure against the latest user message
+     *  every turn (or every `refreshEvery` turns) and swaps the volatile
+     *  recalled tail block WITHOUT re-injecting into the frozen cache prefix. */
+    autoRecall: z.union([z.boolean(), z.enum(["session-start", "per-turn"])]).optional(),
+    /** Loop contract 0.4 (Batch E, G21) — turns between per-turn recall
+     *  refreshes (int > 0). Declaring it implies `autoRecall: "per-turn"`
+     *  (it IS the "every N turns" cadence knob); `"per-turn"` without it
+     *  refreshes every turn. OPTIMIZABLE (`["memory","refreshEvery"]`). It is
+     *  a contradiction alongside `autoRecall: false` (rejected at lower time).*/
+    refreshEvery: z.number().int().positive().optional(),
     recallK: z.number().int().positive().max(50).optional(),
+    /** Loop contract 0.4 (Batch E, G77) — fold session summaries in as a
+     *  third RRF ranker in the recall fusion (over the existing
+     *  sessions-index), beside the fact-store and wiki rankers. Default
+     *  false; opting in surfaces "what we concluded last time" without a
+     *  dedicated tool call. */
+    sessionRecall: z.boolean().optional(),
     wiki: memoryWikiBlock.optional(),
     dream: memoryDreamBlock.optional(),
+  })
+  .strict()
+  .optional();
+
+// Vector-store backend ids accepted in specs. Mirrors `VectorBackendId`
+// from @crewhaus/vector-store (and `IrVectorBackend`) — the canonical set
+// of implemented backends — kept inline so the spec stays dependency-light.
+// Keep in sync when a backend is added or removed. (Declared here, above the
+// first consumer — the `knowledge:` block — so the cli/channel/managed
+// schemas can reference it; the pipeline/research retrieve blocks below reuse
+// the same const.)
+const VECTOR_BACKENDS = ["in-memory", "lance", "qdrant", "pinecone", "weaviate"] as const;
+
+// The HTTP backends construct only with a `url` + `collection` (the
+// vector-store factory throws otherwise); parseSpec requires both so a
+// spec that selects one without them fails at compile, not at runtime.
+const HTTP_VECTOR_BACKENDS = new Set(["qdrant", "pinecone", "weaviate"]);
+
+/**
+ * Loop contract 0.4 (Batch E, G22) — a single knowledge source: exactly ONE
+ * of `path` (a file/dir on disk), `glob` (a shell glob) or `url` (a remote
+ * document) per entry. The exactly-one rule is a self-contained superRefine
+ * so the error is path-bearing at the offending source.
+ */
+const knowledgeSourceSchema = z
+  .object({
+    path: z.string().min(1).optional(),
+    glob: z.string().min(1).optional(),
+    url: z.string().min(1).optional(),
+  })
+  .strict()
+  .superRefine((s, ctx) => {
+    const set = [s.path, s.glob, s.url].filter((v) => v !== undefined).length;
+    if (set !== 1) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "each knowledge source needs exactly one of path/glob/url",
+        path: [],
+      });
+    }
+  });
+
+/**
+ * Loop contract 0.4 (Batch E, G22) — the agent-shape RAG block. Presence
+ * registers the EXISTING `@crewhaus/tool-retrieve` (chunker → embedder →
+ * vector-store) as a `Retrieve` tool with citations, ingesting `sources` at
+ * build/boot. It REUSES target-pipeline's retrieve lowering + engine (not a
+ * fork), so the sub-keys mirror the pipeline shape:
+ *   - `embedder`: the `@crewhaus/embedder` factory grammar for the retrieve
+ *     tier. Optional; resolution order `knowledge.embedder → memory.embedder
+ *     → memory.wiki.embedder → the target's default embedder model` (a vector
+ *     store needs embeddings — see the memory block's EMBEDDER RESOLUTION
+ *     ORDER note).
+ *   - `vector_backend`: the SAME enum as pipeline `retrieve.vectorBackend`
+ *     (default `in-memory`).
+ *   - `sources` (required, >= 1): the corpus to ingest (see
+ *     {@link knowledgeSourceSchema}).
+ *   - `chunk.size` / `chunk.overlap`: chunker tuning (OPTIMIZABLE); default
+ *     to pipeline's 400 / 0 at lower time.
+ *   - `default_k`: hits returned per Retrieve call (int 1..50, default 5,
+ *     OPTIMIZABLE).
+ * `.strict()` so a typo'd sub-key fails the build. Carried on cli/channel/
+ * managed (the interactive agent-loop shapes); the pipeline shape keeps its
+ * dedicated first-class `retrieve:`/`indexing:` blocks.
+ */
+const knowledgeBlock = z
+  .object({
+    embedder: z.string().min(1).optional(),
+    vector_backend: z.enum(VECTOR_BACKENDS).optional(),
+    sources: z.array(knowledgeSourceSchema).min(1),
+    chunk: z
+      .object({
+        size: z.number().int().positive().optional(),
+        overlap: z.number().int().nonnegative().optional(),
+      })
+      .strict()
+      .optional(),
+    default_k: z.number().int().positive().max(50).optional(),
   })
   .strict()
   .optional();
@@ -751,6 +1237,14 @@ const thredzObject = z
           ),
       ])
       .optional(),
+    /**
+     * Item 5 (G44) — enable the nine Thredz messaging tools (`message_send`
+     * / `inbox_poll` / `message_ack` / `thread_get` / `agent_*`). DEFAULT
+     * false: the send-side tools are destructive + justification-gated, so
+     * they stay off unless the author asks. The Thredz server side is already
+     * live (thredz-api) — this flips their registration on.
+     */
+    messaging: z.boolean().optional(),
   })
   .strict();
 
@@ -876,9 +1370,55 @@ const sloBlock = z
     { message: "observability.slo must declare at least one target threshold" },
   );
 
+/**
+ * Loop contract 0.4 (Batch C, G26) — the observability control sub-blocks.
+ * These declare which of the runtime's observability subscribers the emitted
+ * bundle wires and how it stamps their env / subscriber options.
+ *
+ * DEFAULTS SEMANTICS (critical — mirrored in `@crewhaus/ir` + the lowering):
+ * cost tracking and the trace ring buffer are DEFAULT ON even when the whole
+ * `observability:` block is absent — spec ABSENCE is NOT `off`. An EXPLICIT
+ * opt-out (`cost: { enabled: false }` / `trace: { level: off }`) wins. So the
+ * lowering carries only what the spec declares (absent sub-block ⇒ absent IR
+ * key ⇒ the emitter applies the default), and the presence of an explicit
+ * `enabled: false` / `level: off` is what turns a subscriber off.
+ *
+ *   - `trace.level`: `off` (no ring buffer, no printer) | `ring` (ring buffer
+ *     only, the DEFAULT) | `pretty` (ring + colorised stderr printer) | `json`
+ *     (ring + JSON-Lines printer). Absent ⇒ `ring`.
+ *   - `metrics.enabled`: attach the metrics-collector subscriber. Opt-IN —
+ *     absent ⇒ off.
+ *   - `cost.enabled`: attach the cost-tracker subscriber. DEFAULT ON — absent
+ *     ⇒ on; set `false` to suppress cost accrual entirely.
+ *   - `alerts.enabled`: arm the alert watchdog. Opt-IN — absent ⇒ off.
+ *   - `incidents.enabled`: arm incident capture. Opt-IN — absent ⇒ off.
+ *   - `otel.endpoint`: OTLP exporter endpoint (e.g. `http://localhost:4318`).
+ *     Absent ⇒ no OTel export. Carried verbatim (a `$VAR` value is the
+ *     emitter's to resolve).
+ *
+ * Every feature toggle carries a `.default(true)` on `enabled` so a bare
+ * `metrics: {}` reads as "on"; the ABSENT-block default (opt-in features off,
+ * cost/ring on) is applied downstream, not here. `.strict()` so a typo'd
+ * sub-key fails the build.
+ */
+const observabilityToggle = z.object({ enabled: z.boolean().default(true) }).strict();
+
+const observabilityTraceBlock = z
+  .object({ level: z.enum(["off", "ring", "pretty", "json"]).default("ring") })
+  .strict();
+
+const observabilityOtelBlock = z.object({ endpoint: z.string().min(1).optional() }).strict();
+
 const observabilityBlock = z
   .object({
     slo: sloBlock.optional(),
+    // Loop contract 0.4 (Batch C, G26) — subscriber/exporter controls.
+    trace: observabilityTraceBlock.optional(),
+    metrics: observabilityToggle.optional(),
+    cost: observabilityToggle.optional(),
+    alerts: observabilityToggle.optional(),
+    incidents: observabilityToggle.optional(),
+    otel: observabilityOtelBlock.optional(),
   })
   .strict()
   .optional();
@@ -980,12 +1520,21 @@ const cliOptionsBlock = z
   .object({
     banner: cliBannerBlock,
     /**
-     * Phase 2 M2.2 — TUI polish gate. "basic" is the current readline-
-     * driven REPL; "rich" is reserved for future Ink-based output
-     * (status line, multi-line input, ESC interrupt). Today both modes
-     * compile identically; the field is forward-compatible.
+     * Phase 2 M2.2 — TUI mode. `"basic"` is the readline-driven REPL and the
+     * only mode. Loop contract 0.4 (Batch F, G81) DROPS the never-implemented
+     * `"rich"` (Ink-based) placeholder: it compiled identically to `"basic"`,
+     * so it only ever advertised a capability that did not exist. Declaring
+     * it now fails the compile with a migration note; a future rich TUI would
+     * reintroduce the value when it actually ships.
      */
-    tui: z.enum(["basic", "rich"]).default("basic"),
+    tui: z
+      .literal("basic", {
+        errorMap: () => ({
+          message:
+            'cli.tui "rich" was never implemented and is dropped in loop-contract 0.4 — remove the `tui:` key (the basic readline REPL is the only mode).',
+        }),
+      })
+      .default("basic"),
   })
   .strict()
   .optional();
@@ -1013,6 +1562,60 @@ const heartbeatBlock = z
   .optional();
 
 /**
+ * Loop contract 0.4 (Batch F, temporal contract / G84 schedule half) — a
+ * `schedule:` block on the daemon-able shapes (channel / managed / batch): a
+ * cron OR interval wake trigger, lowered into the emitted daemon's wake loop
+ * by the temporal downstream. `jitter` (a duration) spreads a random +/- delay
+ * across the trigger so a fleet of identical daemons doesn't stampede on the
+ * boundary; `instructions` is the synthetic prompt each wake runs (the
+ * heartbeat contract, generalised past the fixed interval to a cron). Exactly
+ * one of the two `kind`s — the discriminated union makes the required field
+ * per kind (`cron` vs `every`) a type error to omit.
+ *
+ * Unlike `heartbeat` (channel-only, interval-only), `schedule` is the general
+ * temporal surface: it accepts a cron expression AND rides the `runs resume`
+ * rehydration path, so an interrupted scheduled run resumes exactly-once.
+ */
+// A 5- or 6-field cron expression (minute-granularity, optional seconds/year).
+// Field validity beyond the char class is the daemon's cron parser's job.
+const CRON_REGEX = /^[0-9*\/,\-?LW#]+(?:\s+[0-9*\/,\-?LW#]+){4,5}$/;
+
+const scheduleJitter = z
+  .string()
+  .regex(DURATION_REGEX, 'schedule.jitter must be a duration like "30s", "5m", or "500ms"');
+
+const scheduleCronBlock = z
+  .object({
+    kind: z.literal("cron"),
+    cron: z
+      .string()
+      .regex(
+        CRON_REGEX,
+        'schedule.cron must be a 5- or 6-field cron expression, e.g. "0 */6 * * *"',
+      ),
+    /** IANA tz name the cron is evaluated in (e.g. "America/New_York"). */
+    timezone: z.string().min(1).optional(),
+    jitter: scheduleJitter.optional(),
+    instructions: z.string().min(1).optional(),
+  })
+  .strict();
+
+const scheduleIntervalBlock = z
+  .object({
+    kind: z.literal("interval"),
+    every: z
+      .string()
+      .regex(DURATION_REGEX, 'schedule.every must be a duration like "6h", "30m", or "60s"'),
+    jitter: scheduleJitter.optional(),
+    instructions: z.string().min(1).optional(),
+  })
+  .strict();
+
+const scheduleBlock = z
+  .discriminatedUnion("kind", [scheduleCronBlock, scheduleIntervalBlock])
+  .optional();
+
+/**
  * Phase 3 §3.4 — channel daemon control-UI gateway. When set, the
  * compiled daemon spawns a second HTTP listener on `port` that serves
  * a status endpoint (and, when `ui: true`, a minimal dashboard).
@@ -1027,6 +1630,48 @@ const channelGatewayBlock = z
   .strict()
   .optional();
 
+/**
+ * Item 1 (G30) — the `expose:` block: project THIS compiled bundle's turn
+ * function as an MCP server so Claude Code / IDEs / other CrewHaus runtimes
+ * can call the whole agent as a tool. Carried on the serving shapes
+ * (cli/channel/managed).
+ *
+ *   - `mcp.transport`: `stdio` (a spawned stdio MCP server — the
+ *     `crewhaus serve --mcp` path) or `sse` (an HTTP+SSE endpoint; SSE-backed
+ *     exposure rides the gateway-server tenancy/budgets where the shape has
+ *     them).
+ *   - `mcp.tools`: `chat` (DEFAULT — one primary invoke tool taking
+ *     `{ message }` and returning the final assistant text) or `per-subagent`
+ *     (that primary tool PLUS one tool per declared sub-agent). `per-subagent`
+ *     needs sub-agents to project — enforced cross-field in `parseSpec`.
+ *
+ * Omitted entirely → the bundle is not exposed as an MCP server (the default).
+ */
+const exposeBlock = z
+  .object({
+    mcp: z
+      .object({
+        transport: z.enum(["stdio", "sse"]),
+        tools: z.enum(["chat", "per-subagent"]).optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .optional();
+
+/**
+ * Item 3 (G32) — the `plugins:` list: names of installed marketplace plugins
+ * whose contributions (tools / channels / models / graders / emitters, plus
+ * skill dirs) this bundle loads at boot. Each entry is a plugin NAME resolved
+ * against the pinned `plugin-registry` (the Ed25519 supply chain guards
+ * install; this wires the previously-missing load path). Order is honoured
+ * (load order). The `crewhaus run --plugins` flag overrides the list. Carried
+ * on the codegen-serving shapes whose boot path reads the registry (cli +
+ * channel).
+ */
+const pluginsBlock = z.array(z.string().min(1)).optional();
+
 const cliSchema = z
   .object({
     name: safeName,
@@ -1040,6 +1685,13 @@ const cliSchema = z
         // runtime default applies. Raise it for turns that emit large
         // multi-file edits so the model isn't cut off mid-`tool_use`.
         max_tokens: z.number().int().positive().optional(),
+        // Loop contract 0.4 (Batch A) — extended-thinking selector.
+        thinking: thinkingBlock,
+        // Loop contract 0.4 (Batch A) — stream partial output tokens.
+        // Optional; absent means false (the cli-shape default).
+        streaming: z.boolean().optional(),
+        // Loop contract 0.4 (Batch A) — per-tool rate limits.
+        rate_limits: rateLimitsBlock,
         // Item 22 — provider failover chain (see modelFallbacksBlock docs).
         model_fallbacks: modelFallbacksBlock,
         circuit_breaker: circuitBreakerBlock,
@@ -1059,8 +1711,18 @@ const cliSchema = z
     security: securityBlock,
     failure_taxonomy: failureTaxonomyBlock,
     budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
+    // Batch G — expose the bundle as an MCP server (G30) + load marketplace
+    // plugins at boot (G32).
+    expose: exposeBlock,
+    plugins: pluginsBlock,
+    // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
+    evaluation: evaluationBlock,
     feedback: feedbackBlock,
     memory: memoryBlock,
+    // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
+    knowledge: knowledgeBlock,
     continuity: continuityBlock,
     thredz: thredzBlock,
     learning: learningBlock,
@@ -1078,10 +1740,45 @@ const workflowStepSchema = z
     name: safeName,
     instructions: z.string().min(1),
     model: z.string().min(1).optional(),
+    // Model max OUTPUT tokens for this step's turn (mirrors cli
+    // `agent.max_tokens`). Optional; runtime default when omitted.
+    max_tokens: z.number().int().positive().optional(),
+    // Loop contract 0.4 (Batch A) — per-step extended-thinking selector.
+    thinking: thinkingBlock,
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
+    // Item 9 (G37) — per-step model routing, adopting the cli agent block's
+    // pooled pattern verbatim: ordered failover + breaker tuning + two-tier
+    // router + N-candidate pool, sharing the one mutual-exclusion rule via
+    // `refineModelSelection`. A PolicyRouter decides per step against the
+    // shared routing-store scoreboard. Omitted → the step's single
+    // (`step.model ?? workflow.model`) model, byte-identical bundles.
+    model_fallbacks: modelFallbacksBlock,
+    circuit_breaker: circuitBreakerBlock,
+    model_tiers: modelTiersBlock,
+    model_pool: modelPoolBlock,
   })
-  .strict();
+  .strict()
+  .superRefine(refineModelSelection);
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — the `kind: "judge"` workflow-step
+ * variant: a gate over the PREVIOUS step's output (see
+ * {@link judgeGateBlock}). Judge steps run no agent turn of their own, so
+ * they carry no instructions/tools — only the gate config. A judge step
+ * cannot be the first step (there is no previous output to gate; enforced
+ * in `parseSpec`). Regular steps stay exactly as before (no `kind` key).
+ */
+const workflowJudgeStepSchema = z
+  .object({
+    name: safeName,
+    kind: z.literal("judge"),
+    judge: judgeGateBlock,
+  })
+  .strict()
+  .describe("judge gate step: scores the previous step's output instead of running an agent turn");
+
+const workflowAnyStepSchema = z.union([workflowStepSchema, workflowJudgeStepSchema]);
 
 const workflowSchema = z
   .object({
@@ -1089,11 +1786,14 @@ const workflowSchema = z
     version: versionField,
     target: z.literal("workflow"),
     model: z.string().min(1),
-    steps: z.array(workflowStepSchema).min(1),
+    steps: z.array(workflowAnyStepSchema).min(1),
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
     // v0.3.0 — carried but not emit-wired in 0.3.0 (ignored-note comment in
     // the generated bundle; NOT default-on here).
     continuity: continuityBlock,
@@ -1187,6 +1887,13 @@ const channelAgentSchema = z
   .object({
     model: z.string().min(1),
     instructions: z.string().min(1),
+    // Model max OUTPUT tokens for one turn (mirrors cli `agent.max_tokens`).
+    // Optional; runtime default when omitted.
+    max_tokens: z.number().int().positive().optional(),
+    // Loop contract 0.4 (Batch A) — extended-thinking selector.
+    thinking: thinkingBlock,
+    // Loop contract 0.4 (Batch A) — per-tool rate limits.
+    rate_limits: rateLimitsBlock,
     // Item 22 — provider failover chain (see modelFallbacksBlock docs).
     model_fallbacks: modelFallbacksBlock,
     circuit_breaker: circuitBreakerBlock,
@@ -1214,13 +1921,26 @@ const channelSchema = z
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
     budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
+    // Batch G — expose the daemon's turn as an MCP server (G30) + load
+    // marketplace plugins at boot (G32).
+    expose: exposeBlock,
+    plugins: pluginsBlock,
+    // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
+    evaluation: evaluationBlock,
     feedback: feedbackBlock,
     memory: memoryBlock,
+    // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
+    knowledge: knowledgeBlock,
     continuity: continuityBlock,
     thredz: thredzBlock,
     learning: learningBlock,
     observability: observabilityBlock,
     heartbeat: heartbeatBlock,
+    // Loop contract 0.4 (Batch F) — cron/interval wake trigger (the general
+    // temporal surface beside the interval-only `heartbeat`).
+    schedule: scheduleBlock,
     gateway: channelGatewayBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
@@ -1236,6 +1956,11 @@ const graphNodeSchema = z
   .object({
     instructions: z.string().min(1),
     model: z.string().min(1).optional(),
+    // Model max OUTPUT tokens for this node's turn (mirrors cli
+    // `agent.max_tokens`). Optional; runtime default when omitted.
+    max_tokens: z.number().int().positive().optional(),
+    // Loop contract 0.4 (Batch A) — per-node extended-thinking selector.
+    thinking: thinkingBlock,
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
     /**
@@ -1252,10 +1977,65 @@ const graphNodeSchema = z
   })
   .strict();
 
+/**
+ * Loop contract 0.4 (Batch B, G02) — the `kind: "judge"` graph-node
+ * variant: a gate over the node's UPSTREAM output (see
+ * {@link judgeGateBlock}). Judge nodes run no agent turn of their own, so
+ * they carry no instructions/tools — only the gate config. The graph entry
+ * cannot be a judge node (there is no upstream output to gate; enforced in
+ * `parseSpec`). Regular nodes stay exactly as before (no `kind` key).
+ */
+const graphJudgeNodeSchema = z
+  .object({
+    kind: z.literal("judge"),
+    judge: judgeGateBlock,
+  })
+  .strict()
+  .describe("judge gate node: scores the upstream node's output instead of running an agent turn");
+
+const graphAnyNodeSchema = z.union([graphNodeSchema, graphJudgeNodeSchema]);
+
+/**
+ * Loop contract 0.4 (Batch A) — declarative edge predicate over the graph's
+ * shared state. The generated graph state is a plain record where each node
+ * writes its reply under its own name (`state["<nodeName>"]`), so `key`
+ * names the upstream NODE whose recorded output the predicate reads
+ * (cross-validated against `nodes` in `parseSpec`). Exactly ONE test form
+ * must be declared (enforced by superRefine):
+ *
+ *   - `equals` — take the edge when `state[key] === equals` (string/number/
+ *     boolean strict equality).
+ *   - `exists: true` — take the edge when `state[key] !== undefined` (the
+ *     node has produced output; pairs with hitl `_decision` gating in a
+ *     follow-up).
+ *
+ * Lowered to `IrGraphEdge.when` and emitted as a graph-engine
+ * `EdgeCondition` (`(state) => state[key] === equals` / `!== undefined`).
+ * The engine evaluates edges in declaration order and takes the first
+ * match; an edge without `when` matches unconditionally.
+ */
+const graphEdgeWhenSchema = z
+  .object({
+    key: z.string().min(1),
+    equals: z.union([z.string(), z.number(), z.boolean()]).optional(),
+    exists: z.literal(true).optional(),
+  })
+  .strict()
+  .superRefine((w, ctx) => {
+    const forms = (w.equals !== undefined ? 1 : 0) + (w.exists !== undefined ? 1 : 0);
+    if (forms !== 1) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "edge when requires exactly one of equals (value test) or exists: true",
+      });
+    }
+  });
+
 const graphEdgeSchema = z
   .object({
     from: z.string().min(1),
     to: z.string().min(1),
+    when: graphEdgeWhenSchema.optional(),
   })
   .strict();
 
@@ -1266,11 +2046,23 @@ const graphSchema = z
     target: z.literal("graph"),
     model: z.string().min(1),
     entry: z.string().min(1),
-    nodes: z.record(safeName, graphNodeSchema),
+    nodes: z.record(safeName, graphAnyNodeSchema),
     edges: z.array(graphEdgeSchema).default([]),
+    /**
+     * Loop contract 0.4 (Batch A) — parallel barrier groups, lowered onto
+     * graph-engine's `addParallel`. Each group is >= 2 node names (the
+     * engine rejects smaller groups) that execute concurrently when the
+     * cursor reaches the group's FIRST member; execution continues from the
+     * LAST member's outgoing edge. Node names are cross-validated against
+     * `nodes` in `parseSpec`.
+     */
+    parallel: z.array(z.array(z.string().min(1)).min(2)).optional(),
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -1298,6 +2090,13 @@ const managedAgentSchema = z
   .object({
     model: z.string().min(1),
     instructions: z.string().min(1),
+    // Model max OUTPUT tokens for one turn (mirrors cli `agent.max_tokens`).
+    // Optional; runtime default when omitted.
+    max_tokens: z.number().int().positive().optional(),
+    // Loop contract 0.4 (Batch A) — extended-thinking selector.
+    thinking: thinkingBlock,
+    // Loop contract 0.4 (Batch A) — per-tool rate limits.
+    rate_limits: rateLimitsBlock,
     // Item 22 — provider failover chain (see modelFallbacksBlock docs).
     model_fallbacks: modelFallbacksBlock,
     circuit_breaker: circuitBreakerBlock,
@@ -1305,6 +2104,11 @@ const managedAgentSchema = z
     model_tiers: modelTiersBlock,
     // Adaptive model routing — N-candidate pool with a selection policy.
     model_pool: modelPoolBlock,
+    // Loop contract 0.4 (Batch F, G81) — the managed daemon gets a tool
+    // catalog + per-tenant tool_config overlays (applied at runtime through
+    // the policy-engine's tenant context). Mirrors the channel agent block.
+    tools: z.array(z.string().min(1)).optional(),
+    tool_config: toolConfigBlock,
   })
   .strict()
   .superRefine(refineModelSelection);
@@ -1320,27 +2124,31 @@ const managedSchema = z
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
     budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
+    // Batch G — expose the managed daemon as an MCP server (G30). SSE-backed
+    // exposure rides this shape's gateway-server tenancy/budgets. No
+    // `plugins:` here: item 3's boot-path wiring covers cli + channel-bot
+    // codegen, not the managed daemon.
+    expose: exposeBlock,
+    // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
+    evaluation: evaluationBlock,
     memory: memoryBlock,
+    // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
+    knowledge: knowledgeBlock,
     continuity: continuityBlock,
     thredz: thredzBlock,
     learning: learningBlock,
     observability: observabilityBlock,
+    // Loop contract 0.4 (Batch F) — cron/interval wake trigger.
+    schedule: scheduleBlock,
   })
   .strict();
 
-// Vector-store backend ids accepted in specs. Mirrors `VectorBackendId`
-// from @crewhaus/vector-store (and `IrVectorBackend`) — the canonical set
-// of implemented backends — kept inline so the spec stays dependency-light.
-// Keep in sync when a backend is added or removed.
-const VECTOR_BACKENDS = ["in-memory", "lance", "qdrant", "pinecone", "weaviate"] as const;
-
-// The HTTP backends construct only with a `url` + `collection` (the
-// vector-store factory throws otherwise); parseSpec requires both so a
-// spec that selects one without them fails at compile, not at runtime.
-const HTTP_VECTOR_BACKENDS = new Set(["qdrant", "pinecone", "weaviate"]);
-
 // Pipeline / RAG target (Section 21). Carries the embedder + vector-store
 // config, an indexing pipeline, and a chat agent that uses Retrieve.
+// (`VECTOR_BACKENDS` / `HTTP_VECTOR_BACKENDS` are declared above, beside the
+// `knowledge:` block that first consumes them.)
 const pipelineDocumentSchema = z
   .object({
     id: z.string().min(1),
@@ -1350,23 +2158,38 @@ const pipelineDocumentSchema = z
   .strict();
 
 /**
- * Adaptive model routing — the minimal single-agent block shared by the
- * pipeline/research/batch/browser shapes, now carrying the opt-in
- * `model_pool`. Their emitted runtimes each call `runChatLoop` with a single
- * primary (exactly the cli shape's execution model), so the pool routes there
- * with zero runtime changes. The superRefine is trivially satisfied today
- * (these shapes carry no `model_tiers`/`model_fallbacks`) but keeps the
- * mutual-exclusion rule uniform if they ever gain them. NOT used by
- * onchain/onchain-game: their emitted bundles are callable modules whose
- * agent-loop wiring is still deferred (see target-onchain slice-2 notes), so
- * a `model_pool` there would be an inert spec field.
+ * Adaptive model routing — the minimal single-agent block on the pipeline
+ * shape, carrying the opt-in `model_pool`. Its emitted runtime calls
+ * `runChatLoop` with a single primary (exactly the cli shape's execution
+ * model), so the pool routes there with zero runtime changes. The
+ * superRefine is trivially satisfied today (the shape carries no
+ * `model_tiers`/`model_fallbacks`) but keeps the mutual-exclusion rule
+ * uniform if it ever gains them. NOT used by onchain/onchain-game: their
+ * emitted bundles are callable modules whose agent-loop wiring is still
+ * deferred (see target-onchain slice-2 notes), so a `model_pool` there
+ * would be an inert spec field.
  */
-const pooledSingleAgentSchema = z
+const pooledSingleAgentObject = z
   .object({
     model: z.string().min(1),
     instructions: z.string().min(1),
     // Adaptive model routing — N-candidate pool with a selection policy.
     model_pool: modelPoolBlock,
+  })
+  .strict();
+
+const pooledSingleAgentSchema = pooledSingleAgentObject.superRefine(refineModelSelection);
+
+/**
+ * Loop contract 0.4 (Batch A) — the research/batch/browser variant of the
+ * pooled single-agent block: pipeline's shape plus `max_tokens` (model max
+ * OUTPUT tokens for one turn, mirroring the cli docblock — optional; when
+ * omitted the runtime default applies; raise it for turns that emit large
+ * outputs so the model isn't cut off mid-`tool_use`).
+ */
+const pooledSingleAgentWithMaxTokensSchema = pooledSingleAgentObject
+  .extend({
+    max_tokens: z.number().int().positive().optional(),
   })
   .strict()
   .superRefine(refineModelSelection);
@@ -1416,11 +2239,27 @@ const crewRoleSchema = z
   .object({
     instructions: z.string().min(1),
     model: z.string().min(1).optional(),
+    // Model max OUTPUT tokens for this role's turns (mirrors cli
+    // `agent.max_tokens`). Optional; runtime default when omitted.
+    max_tokens: z.number().int().positive().optional(),
+    // Loop contract 0.4 (Batch A) — per-role extended-thinking selector.
+    thinking: thinkingBlock,
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
     sub_agents: subAgentsBlock,
+    // Item 9 (G37) — per-role model routing, adopting the cli agent block's
+    // pooled pattern verbatim: ordered failover + breaker tuning + two-tier
+    // router + N-candidate pool, sharing the one mutual-exclusion rule via
+    // `refineModelSelection`. A PolicyRouter decides per role against the
+    // shared routing-store scoreboard. Omitted → the role's single
+    // (`role.model ?? crew.model`) model, byte-identical bundles.
+    model_fallbacks: modelFallbacksBlock,
+    circuit_breaker: circuitBreakerBlock,
+    model_tiers: modelTiersBlock,
+    model_pool: modelPoolBlock,
   })
-  .strict();
+  .strict()
+  .superRefine(refineModelSelection);
 
 const crewRoutingMatchEntrySchema = z
   .object({
@@ -1450,6 +2289,11 @@ const crewSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
+    // Loop contract 0.4 (Batch A) — crew is the ONE shape whose limits block
+    // additionally accepts the `crew:` orchestration sub-block.
+    limits: crewLimitsBlock,
+    hooks: hooksBlock,
     // v0.3.0 — crew joins the memory-carrying shapes (§9: emit-wired; the
     // roles share the spec-scoped stores — the plan IS the coordination
     // surface, §2.7).
@@ -1457,6 +2301,11 @@ const crewSchema = z
     continuity: continuityBlock,
     thredz: thredzBlock,
     learning: learningBlock,
+    // Loop contract 0.4 (Batch C, G26) — crew joins the observability-carrying
+    // shapes (cli/channel/managed): the orchestrator's cost/trace/metrics/
+    // alert/incident/otel subscribers are spec-controllable per the shared
+    // block's defaults semantics.
+    observability: observabilityBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -1485,7 +2334,7 @@ const researchSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("research"),
-    agent: pooledSingleAgentSchema,
+    agent: pooledSingleAgentWithMaxTokensSchema,
     goal: z.string().min(1),
     branchingFactor: z.number().int().min(1).max(8).default(3),
     maxDurationMs: z.number().int().positive().default(300_000),
@@ -1496,6 +2345,9 @@ const researchSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
     thredz: thredzBlock,
@@ -1526,7 +2378,7 @@ const batchSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("batch"),
-    agent: pooledSingleAgentSchema,
+    agent: pooledSingleAgentWithMaxTokensSchema,
     queue: batchQueueSchema,
     concurrency: z.number().int().min(1).max(64).default(4),
     idempotencyWindowMs: z.number().int().positive().default(60_000),
@@ -1536,9 +2388,15 @@ const batchSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
     // v0.3.0 — carried but not emit-wired in 0.3.0 (ignored-note comment in
     // the generated bundle; NOT default-on here).
     continuity: continuityBlock,
+    // Loop contract 0.4 (Batch F) — cron/interval wake trigger for the queue
+    // worker daemon.
+    schedule: scheduleBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -1608,7 +2466,7 @@ const browserSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("browser"),
-    agent: pooledSingleAgentSchema,
+    agent: pooledSingleAgentWithMaxTokensSchema,
     driver: browserDriverSchema.default({}),
     /** Vision-grounding model. Defaults to the agent's primary model. */
     groundingModel: z.string().min(1).optional(),
@@ -1618,6 +2476,9 @@ const browserSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
     // v0.3.0 — carried but not emit-wired in 0.3.0 (ignored-note comment in
     // the generated bundle; NOT default-on here).
     continuity: continuityBlock,
@@ -1832,11 +2693,24 @@ export type SpecModelFallbacks = z.infer<typeof modelFallbacksBlock>;
 export type SpecCircuitBreakerBlock = z.infer<typeof circuitBreakerBlock>;
 export type SpecModelTiersBlock = z.infer<typeof modelTiersBlock>;
 export type SpecModelPoolBlock = z.infer<typeof modelPoolBlock>;
+/** Item 1 (G30) — the `expose:` block (MCP-server projection of the bundle). */
+export type SpecExposeBlock = z.infer<typeof exposeBlock>;
+/** Item 3 (G32) — the `plugins:` list (marketplace plugin names loaded at boot). */
+export type SpecPluginsBlock = z.infer<typeof pluginsBlock>;
 export type SpecBudgetBlock = z.infer<typeof budgetBlock>;
+/** Ops item 37 + Loop contract 0.4 (Batch C, G26) — the cross-cutting
+ *  `observability:` block (slo + trace/metrics/cost/alerts/incidents/otel). */
+export type SpecObservabilityBlock = z.infer<typeof observabilityBlock>;
 export type SpecSecurityBlock = z.infer<typeof securityBlock>;
 export type SpecFeedbackBlock = z.infer<typeof feedbackBlock>;
 export type SpecMemoryBlock = z.infer<typeof memoryBlock>;
 export type SpecMemoryWikiBlock = z.infer<typeof memoryWikiBlock>;
+/** Loop contract 0.4 (Batch E, G22) — the agent-shape RAG (`knowledge:`)
+ *  block, carried on cli/channel/managed. */
+export type SpecKnowledgeBlock = z.infer<typeof knowledgeBlock>;
+/** Loop contract 0.4 (Batch E, G22) — one `knowledge.sources[]` entry
+ *  (exactly one of path/glob/url). */
+export type SpecKnowledgeSource = z.infer<typeof knowledgeSourceSchema>;
 /** The `memory.dream` scheduled-consolidation sub-block (v0.3.0 §6). */
 export type SpecMemoryDreamBlock = z.infer<typeof memoryDreamBlock>;
 /** The `continuity:` object form (v0.3.0 §2.1). */
@@ -1851,8 +2725,218 @@ export type SpecThredzBlock = z.infer<typeof thredzBlock>;
 export type SpecLearningBlock = z.infer<typeof learningBlock>;
 export type SpecFailureTaxonomyEntry = z.infer<typeof failureTaxonomyEntrySchema>;
 export type SpecFailureTaxonomy = z.infer<typeof failureTaxonomyBlock>;
+/** Loop contract 0.4 (Batch A) — the extended-thinking selector (exactly one
+ *  of `budget_tokens` / `effort`). */
+export type SpecThinkingBlock = z.infer<typeof thinkingBlock>;
+/** Loop contract 0.4 (Batch A) — the base `limits:` block (non-crew shapes). */
+export type SpecLimitsBlock = z.infer<typeof limitsBlock>;
+/** Loop contract 0.4 (Batch A) — the crew `limits:` block (base + `crew:`). */
+export type SpecCrewLimitsBlock = z.infer<typeof crewLimitsBlock>;
+/** Loop contract 0.4 (Batch A) — one spec-declared lifecycle hook. */
+export type SpecHook = z.infer<typeof hookSchema>;
+/** Loop contract 0.4 (Batch A) — the hook-event name union (see
+ *  {@link SPEC_HOOK_EVENTS}). */
+export type SpecHookEvent = (typeof SPEC_HOOK_EVENTS)[number];
+/** Loop contract 0.4 (Batch A) — the per-tool rate-limits map. */
+export type SpecRateLimitsBlock = z.infer<typeof rateLimitsBlock>;
+/** Loop contract 0.4 (Batch A) — the declarative graph-edge predicate. */
+export type SpecGraphEdgeWhen = z.infer<typeof graphEdgeWhenSchema>;
+/** Loop contract 0.4 (Batch B, G02) — the `evaluation:` block
+ *  (cli/channel/managed in-loop output evaluation). */
+export type SpecEvaluationBlock = z.infer<typeof evaluationBlock>;
+/** Loop contract 0.4 (Batch B, G02) — the evaluation grader union
+ *  (llm_judge | contains | regex). */
+export type SpecEvaluationGrader = z.infer<typeof evaluationGraderSchema>;
+/** Loop contract 0.4 (Batch B, G02) — the judge gate config shared by
+ *  `kind: "judge"` workflow steps and graph nodes. */
+export type SpecJudgeGate = z.infer<typeof judgeGateBlock>;
+/** Loop contract 0.4 (Batch B, G02) — a `kind: "judge"` workflow step. */
+export type SpecWorkflowJudgeStep = z.infer<typeof workflowJudgeStepSchema>;
+/** Loop contract 0.4 (Batch B, G02) — one workflow step: a regular agent
+ *  step ({@link SpecWorkflowStep}) or a judge gate. */
+export type SpecWorkflowAnyStep = z.infer<typeof workflowAnyStepSchema>;
+/** Loop contract 0.4 (Batch B, G02) — a `kind: "judge"` graph node. */
+export type SpecGraphJudgeNode = z.infer<typeof graphJudgeNodeSchema>;
+/** Loop contract 0.4 (Batch B, G02) — one graph node: a regular LLM node
+ *  ({@link SpecGraphNode}) or a judge gate. */
+export type SpecGraphAnyNode = z.infer<typeof graphAnyNodeSchema>;
 
 export { SpecParseError };
+
+/**
+ * Loop contract 0.4 (Batch B, G04) — one structured spec diagnostic.
+ * `path` locates the problem in the parsed document (`[]` for
+ * whole-document problems such as YAML syntax errors); `code` is a stable
+ * machine key — zod's issue codes (`"invalid_type"`, `"unrecognized_keys"`,
+ * `"custom"`, …) for schema failures, `"yaml_syntax"` for YAML parse
+ * failures (line/column ride in the message), and `"custom"` for the
+ * cross-field invariants enforced beyond the schema.
+ */
+export type SpecIssue = {
+  path: (string | number)[];
+  message: string;
+  code: string;
+};
+
+/**
+ * Friendly early-rejection for `permissions.mode: bypass` so the error
+ * names the actual security policy rather than a Zod enum mismatch. The
+ * Zod schema also excludes "bypass" from its enum (defense in depth).
+ */
+function bypassModeIssue(raw: unknown): SpecIssue | undefined {
+  if (typeof raw === "object" && raw !== null && "permissions" in raw) {
+    const perms = (raw as { permissions?: unknown }).permissions;
+    if (typeof perms === "object" && perms !== null && "mode" in perms) {
+      const mode = (perms as { mode?: unknown }).mode;
+      if (mode === "bypass") {
+        return {
+          path: ["permissions", "mode"],
+          code: "custom",
+          message:
+            "permissions.mode: bypass is rejected — bypass mode is only available via the --permission-mode CLI flag, never from a spec file",
+        };
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The cross-field invariants `parseSpec` enforces beyond the zod schema,
+ * as a structured issue list (empty = all invariants hold). Kept as data
+ * checks rather than `.refine()`s so every discriminated-union member
+ * stays a plain ZodObject (Zod's discriminatedUnion rejects ZodEffects).
+ * `parseSpec` throws the FIRST issue's message (its historical behaviour);
+ * `parseSpecIssues` returns them all. Check order is load-bearing for
+ * `parseSpec`'s error messages — append, don't reorder.
+ */
+function crossFieldIssues(data: Spec): SpecIssue[] {
+  const issues: SpecIssue[] = [];
+  const custom = (path: (string | number)[], message: string): void => {
+    issues.push({ path, message, code: "custom" });
+  };
+  // Section 22 — crew cross-field invariants.
+  if (data.target === "crew") {
+    const roleNames = Object.keys(data.roles);
+    if (roleNames.length === 0) {
+      custom(["roles"], "crew target requires at least one role");
+    }
+    if (roleNames.length > 0 && !roleNames.includes(data.entry)) {
+      custom(
+        ["entry"],
+        `crew.entry "${data.entry}" must name one of crew.roles (got: ${roleNames.join(", ")})`,
+      );
+    }
+    if (data.routing !== undefined && data.routing.kind === "match" && data.routing.match) {
+      for (const [from, rules] of Object.entries(data.routing.match)) {
+        if (!roleNames.includes(from)) {
+          custom(
+            ["routing", "match", from],
+            `crew.routing.match["${from}"]: source role not in crew.roles`,
+          );
+        }
+        for (const [ri, rule] of rules.entries()) {
+          if (!roleNames.includes(rule.to)) {
+            custom(
+              ["routing", "match", from, ri, "to"],
+              `crew.routing.match["${from}"].to = "${rule.to}" — target role not in crew.roles`,
+            );
+          }
+        }
+      }
+    }
+  }
+  // Loop contract 0.4 (Batch B, G02) — a judge step gates the PREVIOUS
+  // step's output, so the first step can never be one.
+  if (data.target === "workflow") {
+    const first = data.steps[0];
+    if (first !== undefined && "kind" in first && first.kind === "judge") {
+      custom(
+        ["steps", 0],
+        `workflow steps[0] "${first.name}" cannot be a judge step — a judge gates the previous step's output and no step precedes it`,
+      );
+    }
+  }
+  // Loop contract 0.4 (Batch A) — graph cross-field invariants:
+  //   - every `edges[].when.key` must name a declared node — the generated
+  //     graph state records each node's reply under its own name, so a key
+  //     that names nothing can never match;
+  //   - every `parallel` group member must name a declared node (mirrors
+  //     graph-engine's own compile-time check, surfaced at parse time);
+  //   - (Batch B) the entry cannot be a judge node — a judge gates its
+  //     upstream node's output and the entry has none.
+  if (data.target === "graph") {
+    const nodeNames = Object.keys(data.nodes);
+    for (const [i, edge] of data.edges.entries()) {
+      if (edge.when !== undefined && !nodeNames.includes(edge.when.key)) {
+        custom(
+          ["edges", i, "when", "key"],
+          `graph.edges[${i}].when.key "${edge.when.key}" must name a declared node — the shared state records each node's output under its name (nodes: ${nodeNames.join(", ")})`,
+        );
+      }
+    }
+    if (data.parallel !== undefined) {
+      for (const [gi, group] of data.parallel.entries()) {
+        for (const nodeName of group) {
+          if (!nodeNames.includes(nodeName)) {
+            custom(
+              ["parallel", gi],
+              `graph.parallel[${gi}] references "${nodeName}" which is not a declared node (nodes: ${nodeNames.join(", ")})`,
+            );
+          }
+        }
+      }
+    }
+    const entryNode = data.nodes[data.entry];
+    if (entryNode !== undefined && "kind" in entryNode && entryNode.kind === "judge") {
+      custom(
+        ["entry"],
+        `graph entry "${data.entry}" cannot be a judge node — a judge gates its upstream node's output and the entry has none`,
+      );
+    }
+  }
+  // Item 1 (G30) — `expose.mcp.tools: "per-subagent"` projects EACH declared
+  // sub-agent as its own MCP tool, so it needs sub-agents to project. cli and
+  // channel carry `agent.sub_agents`; the managed shape has none at all, so
+  // per-subagent is always a mistake there. Load-bearing: no ir-pass mirrors
+  // this, and the emitter would otherwise ship an MCP server exposing only the
+  // primary tool while the author expected per-sub-agent ones.
+  if (data.target === "cli" || data.target === "channel" || data.target === "managed") {
+    const exposeTools = data.expose?.mcp?.tools;
+    if (exposeTools === "per-subagent") {
+      const subAgents =
+        data.target === "managed"
+          ? undefined
+          : (data.agent as { sub_agents?: Record<string, unknown> }).sub_agents;
+      const count = subAgents === undefined ? 0 : Object.keys(subAgents).length;
+      if (count === 0) {
+        custom(
+          ["expose", "mcp", "tools"],
+          `expose.mcp.tools: "per-subagent" projects each sub-agent as its own MCP tool, but the ${data.target} shape declares no sub_agents — use tools: "chat" (the default), or add sub_agents`,
+        );
+      }
+    }
+  }
+  // Section 21 — pipeline HTTP-backend invariants. qdrant/pinecone/weaviate
+  // throw at construction without a url + collection, so selecting one
+  // without both would emit an unrunnable bundle.
+  if (data.target === "pipeline" && HTTP_VECTOR_BACKENDS.has(data.retrieve.vectorBackend)) {
+    const { vectorBackend, url, collection } = data.retrieve;
+    if (!url) {
+      custom(
+        ["retrieve", "url"],
+        `pipeline retrieve.vectorBackend "${vectorBackend}" requires retrieve.url (the remote service base URL)`,
+      );
+    }
+    if (!collection) {
+      custom(
+        ["retrieve", "collection"],
+        `pipeline retrieve.vectorBackend "${vectorBackend}" requires retrieve.collection`,
+      );
+    }
+  }
+  return issues;
+}
 
 export function parseSpec(yamlText: string): Spec {
   let raw: unknown;
@@ -1862,19 +2946,9 @@ export function parseSpec(yamlText: string): Spec {
     throw new SpecParseError("invalid YAML", err);
   }
 
-  // Friendly early-rejection for `permissions.mode: bypass` so the error
-  // message names the actual security policy rather than a Zod enum mismatch.
-  // The Zod schema also excludes "bypass" from its enum (defense in depth).
-  if (typeof raw === "object" && raw !== null && "permissions" in raw) {
-    const perms = (raw as { permissions?: unknown }).permissions;
-    if (typeof perms === "object" && perms !== null && "mode" in perms) {
-      const mode = (perms as { mode?: unknown }).mode;
-      if (mode === "bypass") {
-        throw new SpecParseError(
-          "permissions.mode: bypass is rejected — bypass mode is only available via the --permission-mode CLI flag, never from a spec file",
-        );
-      }
-    }
+  const bypass = bypassModeIssue(raw);
+  if (bypass !== undefined) {
+    throw new SpecParseError(bypass.message);
   }
 
   const result = Spec.safeParse(raw);
@@ -1886,52 +2960,120 @@ export function parseSpec(yamlText: string): Spec {
       result.error,
     );
   }
-  // Section 22 — crew cross-field invariants. Kept here rather than as
-  // `.refine()`s on the schema so the discriminated-union member stays
-  // a plain ZodObject (Zod's discriminatedUnion rejects ZodEffects).
-  const data = result.data;
-  if (data.target === "crew") {
-    const roleNames = Object.keys(data.roles);
-    if (roleNames.length === 0) {
-      throw new SpecParseError("crew target requires at least one role");
-    }
-    if (!roleNames.includes(data.entry)) {
-      throw new SpecParseError(
-        `crew.entry "${data.entry}" must name one of crew.roles (got: ${roleNames.join(", ")})`,
-      );
-    }
-    if (data.routing !== undefined && data.routing.kind === "match" && data.routing.match) {
-      for (const [from, rules] of Object.entries(data.routing.match)) {
-        if (!roleNames.includes(from)) {
-          throw new SpecParseError(`crew.routing.match["${from}"]: source role not in crew.roles`);
-        }
-        for (const rule of rules) {
-          if (!roleNames.includes(rule.to)) {
-            throw new SpecParseError(
-              `crew.routing.match["${from}"].to = "${rule.to}" — target role not in crew.roles`,
-            );
-          }
-        }
+  const issues = crossFieldIssues(result.data);
+  const firstIssue = issues[0];
+  if (firstIssue !== undefined) {
+    throw new SpecParseError(firstIssue.message);
+  }
+  return result.data;
+}
+
+/** yaml's parse errors carry 1-indexed line/column in `linePos`. */
+function yamlSyntaxIssue(err: unknown): SpecIssue {
+  const linePos = (err as { linePos?: ReadonlyArray<{ line: number; col: number }> }).linePos;
+  const pos = Array.isArray(linePos) && linePos[0] !== undefined ? linePos[0] : undefined;
+  const raw = err instanceof Error ? err.message : String(err);
+  // yaml's message embeds a multi-line code frame; keep the first line and
+  // move its trailing position marker into a uniform suffix.
+  const firstLine = (raw.split("\n")[0] ?? raw).trim();
+  const cleaned =
+    pos !== undefined ? firstLine.replace(/ at line \d+, column \d+:?$/, "") : firstLine;
+  const where = pos !== undefined ? ` (line ${pos.line}, column ${pos.col})` : "";
+  return { path: [], code: "yaml_syntax", message: `invalid YAML: ${cleaned}${where}` };
+}
+
+/**
+ * Flatten zod issues to `SpecIssue`s. `invalid_union` issues (the workflow
+ * step / graph node / continuity / thredz unions) are replaced by the most
+ * plausible branch's issues — the branch that failed with the FEWEST
+ * problems, ties broken by the fewest unrecognized KEYS (so a step that
+ * declares `kind: judge` with a typo inside `judge:` reports the judge
+ * branch's problem, not the regular branch's "unrecognized 'kind'") — so a
+ * malformed union member reports its actual problem instead of an opaque
+ * "Invalid input". Union sub-issues carry document-absolute paths in zod
+ * v3, so no re-prefixing is needed.
+ */
+function unrecognizedKeyCount(err: z.ZodError): number {
+  let count = 0;
+  for (const issue of err.issues) {
+    if (issue.code === z.ZodIssueCode.unrecognized_keys) count += issue.keys.length;
+  }
+  return count;
+}
+
+function zodIssuesToSpecIssues(zodIssues: ReadonlyArray<z.ZodIssue>): SpecIssue[] {
+  const out: SpecIssue[] = [];
+  for (const issue of zodIssues) {
+    if (issue.code === z.ZodIssueCode.invalid_union && issue.unionErrors.length > 0) {
+      const best = [...issue.unionErrors].sort(
+        (a, b) =>
+          a.issues.length - b.issues.length || unrecognizedKeyCount(a) - unrecognizedKeyCount(b),
+      )[0];
+      if (best !== undefined && best.issues.length > 0) {
+        out.push(...zodIssuesToSpecIssues(best.issues));
+        continue;
       }
     }
+    out.push({ path: [...issue.path], message: issue.message, code: issue.code });
   }
-  // Section 21 — pipeline HTTP-backend invariants. qdrant/pinecone/weaviate
-  // throw at construction without a url + collection, so selecting one
-  // without both would emit an unrunnable bundle. Reject at parse time with
-  // a message naming the missing field (kept here, not as a `.refine()`, so
-  // the discriminated-union member stays a plain ZodObject).
-  if (data.target === "pipeline" && HTTP_VECTOR_BACKENDS.has(data.retrieve.vectorBackend)) {
-    const { vectorBackend, url, collection } = data.retrieve;
-    if (!url) {
-      throw new SpecParseError(
-        `pipeline retrieve.vectorBackend "${vectorBackend}" requires retrieve.url (the remote service base URL)`,
-      );
-    }
-    if (!collection) {
-      throw new SpecParseError(
-        `pipeline retrieve.vectorBackend "${vectorBackend}" requires retrieve.collection`,
-      );
-    }
+  return out;
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G04) — the non-throwing sibling of
+ * {@link parseSpec}: parse `yamlText` and return EVERY diagnostic as a
+ * structured issue list (`[]` when the spec is valid). Built on the same
+ * internals as `parseSpec` — which keeps its throw behaviour — so the two
+ * can never disagree about validity:
+ *
+ *   - YAML syntax errors → one issue, `path: []`, `code: "yaml_syntax"`,
+ *     line/column in the message.
+ *   - schema failures    → one issue per zod issue (zod's own `code`s),
+ *     with `invalid_union` flattened to the most plausible branch.
+ *   - cross-field checks → `code: "custom"` with a best-effort path.
+ */
+export function parseSpecIssues(yamlText: string): SpecIssue[] {
+  let raw: unknown;
+  try {
+    raw = parseYaml(yamlText);
+  } catch (err) {
+    return [yamlSyntaxIssue(err)];
   }
-  return data;
+  const bypass = bypassModeIssue(raw);
+  if (bypass !== undefined) return [bypass];
+  const result = Spec.safeParse(raw);
+  if (!result.success) return zodIssuesToSpecIssues(result.error.issues);
+  return crossFieldIssues(result.data);
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G03) — the whole Spec union as a JSON-Schema
+ * document. The document root is a `$ref` to `#/definitions/CrewhausSpec`
+ * (the target-discriminated union); every target shape additionally gets
+ * its own named definition (`#/definitions/cli`, `#/definitions/workflow`,
+ * …) so tooling (editors, the compiler-worker `GET /schema` endpoint, the
+ * studio) can link straight to one shape. Zod `.describe()` annotations
+ * surface as JSON-Schema `description` keys. Pure function of this module
+ * — no I/O, deterministic output.
+ */
+export function specJsonSchema(): Record<string, unknown> {
+  return zodToJsonSchema(Spec, {
+    name: "CrewhausSpec",
+    definitions: {
+      cli: cliSchema,
+      workflow: workflowSchema,
+      channel: channelSchema,
+      graph: graphSchema,
+      managed: managedSchema,
+      pipeline: pipelineSchema,
+      crew: crewSchema,
+      research: researchSchema,
+      batch: batchSchema,
+      voice: voiceSchema,
+      browser: browserSchema,
+      eval: evalSchema,
+      onchain: onchainSchema,
+      "onchain-game": onchainGameSchema,
+    },
+  }) as Record<string, unknown>;
 }

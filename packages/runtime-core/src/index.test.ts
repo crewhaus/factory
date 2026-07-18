@@ -3014,3 +3014,91 @@ describe("memory auto-recall + auto-capture (#53)", () => {
     await expect(run).resolves.toBeDefined();
   });
 });
+
+describe("runChatLoop plugins option (Item 3 / G32)", () => {
+  const textDone: Anthropic.ContentBlock[] = [
+    { type: "text", text: "done", citations: null } as Anthropic.TextBlock,
+  ];
+
+  test("plugin-contributed tools are advertised after opts.tools", async () => {
+    const firstParty = buildTool({
+      name: "first-party",
+      description: "built-in",
+      inputSchema: z.object({}),
+      execute: async () => "ok",
+    });
+    const pluginTool = buildTool({
+      name: "plugin-tool",
+      description: "from a plugin",
+      inputSchema: z.object({}),
+      execute: async () => "ok",
+    });
+    const { adapter, capturedTools } = makeScriptedClient([textDone]);
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      _adapter: adapter,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "hi" }],
+      tools: [firstParty],
+      plugins: { tools: [pluginTool] },
+      permissionMode: "bypass",
+    });
+
+    expect(capturedTools()[0]?.map((t) => t.name)).toEqual(["first-party", "plugin-tool"]);
+  });
+
+  test("a plugin tool cannot shadow a first-party tool of the same name", async () => {
+    const firstParty = buildTool({
+      name: "dup",
+      description: "FIRST PARTY",
+      inputSchema: z.object({}),
+      execute: async () => "first",
+    });
+    const pluginDup = buildTool({
+      name: "dup",
+      description: "PLUGIN SHADOW",
+      inputSchema: z.object({}),
+      execute: async () => "plugin",
+    });
+    const { adapter, capturedTools } = makeScriptedClient([textDone]);
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      _adapter: adapter,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "hi" }],
+      tools: [firstParty],
+      plugins: { tools: [pluginDup] },
+      permissionMode: "bypass",
+    });
+
+    const advertised = capturedTools()[0] ?? [];
+    expect(advertised.map((t) => t.name)).toEqual(["dup"]);
+    expect(advertised[0]?.description).toBe("FIRST PARTY");
+  });
+
+  test("absent plugins option → advertised tools are exactly opts.tools", async () => {
+    const only = buildTool({
+      name: "only",
+      description: "only",
+      inputSchema: z.object({}),
+      execute: async () => "ok",
+    });
+    const { adapter, capturedTools } = makeScriptedClient([textDone]);
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      _adapter: adapter,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "hi" }],
+      tools: [only],
+      permissionMode: "bypass",
+    });
+
+    expect(capturedTools()[0]?.map((t) => t.name)).toEqual(["only"]);
+  });
+});

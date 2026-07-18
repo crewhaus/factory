@@ -18,11 +18,15 @@
     "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/event-log": "workspace:*",
+    "@crewhaus/federation-router": "workspace:*",
     "@crewhaus/recovery-engine": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*"
   },
   "devDependencies": {
+    "@crewhaus/federation-discovery": "workspace:*",
+    "@crewhaus/federation-protocol": "workspace:*",
+    "@crewhaus/gateway-server": "workspace:*",
     "@crewhaus/memory-service": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",

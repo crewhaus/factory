@@ -26,15 +26,32 @@
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { type AppendInput, type AuditLog, openAuditLog } from "@crewhaus/audit-log";
+import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { type BudgetStore, InMemoryBudgetStore } from "@crewhaus/durable-state";
 import { CrewhausError } from "@crewhaus/errors";
+import {
+  type A2AAgentCard,
+  type A2AAgentProvider,
+  type A2AAgentSkill,
+  FEDERATION_VERSION,
+  type FederationEnvelope,
+  type FederationWellKnown,
+  buildAgentCard,
+  buildInboundResponse,
+  buildWellKnown,
+  decodeFederationEnvelope,
+} from "@crewhaus/federation-protocol";
 import {
   ErrorCode,
   GatewayProtocolError,
   type MethodT,
   PROTOCOL_VERSION,
+  type ResponseEnvelopeT,
+  SSE_CONTENT_TYPE,
   decodeRequest,
   encodeError,
+  encodeSseComment,
+  encodeSseEvent,
   encodeSuccess,
 } from "@crewhaus/gateway-protocol";
 import { type Tenant, buildTenant, validateTenantId, withTenant } from "@crewhaus/tenancy";
@@ -173,6 +190,102 @@ export type RunHandler = (args: {
   readonly tenant: Tenant;
 }) => Promise<unknown>;
 
+/**
+ * A resolved run's live trace-event source, handed to the SSE writer for a
+ * `runs.subscribe` stream. The single `open` call MUST atomically (a) snapshot
+ * the buffered events to replay and (b) register a listener for subsequent live
+ * events — with NO yield between the two — so the replay→live handoff neither
+ * drops nor duplicates an event across the boundary (the daemon backs this with
+ * `bus.recent()` immediately followed by `bus.subscribe()`, which run
+ * synchronously on the single JS thread and so cannot interleave a publish).
+ * `open` returns the replay snapshot plus a `close` that detaches the listener
+ * (invoked when the SSE client disconnects). Events are opaque JSON
+ * (`TraceEvent`) to this package.
+ */
+export type RunEventSource = {
+  open(listener: (event: unknown) => void): {
+    readonly replay: ReadonlyArray<unknown>;
+    close(): void;
+  };
+};
+
+/**
+ * Resolve the {@link RunEventSource} for a `runs.subscribe` request, or
+ * `undefined` when the run is unknown to this server OR not owned by `tenant`.
+ * The two cases are DELIBERATELY indistinguishable to the caller (both answer
+ * `404`), so a run's existence never leaks across tenants. The generated
+ * managed daemon backs this with its per-run trace-bus registry, fenced by
+ * `tenant.id`. May be async (a future daemon might resolve a persisted run).
+ */
+export type ResolveRunEvents = (args: {
+  readonly runId: string;
+  readonly tenant: Tenant;
+}) => RunEventSource | undefined | Promise<RunEventSource | undefined>;
+
+/** Default idle-heartbeat cadence for a `runs.subscribe` SSE stream. */
+const DEFAULT_SSE_HEARTBEAT_MS = 15_000;
+
+// ---------------------------------------------------------------------------
+// Federation surface (Item 2 / G31) — this deployment as an A2A peer.
+//
+// A federation-enabled server serves three routes OUTSIDE the JWT-authed
+// JSON-RPC plane:
+//   GET  /.well-known/agent-card.json  — a real A2A Agent Card (metadata).
+//   GET  /.well-known/crewhaus.json    — the namespaced discovery alias
+//                                        carrying the cert-pin fingerprint.
+//   POST /federation                   — the inbound federated-call handler.
+//
+// Peers authenticate via mTLS at the TLS layer (the transport floor), NOT the
+// gateway's tenant JWT. `authorize` is the app-level allowlist; `dispatch`
+// runs the local agent and returns its reply.
+// ---------------------------------------------------------------------------
+
+/** Context handed to the inbound `dispatch`/`authorize` hooks. */
+export type FederationInboundContext = {
+  readonly envelope: FederationEnvelope;
+  /**
+   * The peer's presented TLS client-cert subject, when the TLS terminator
+   * exposed it. Undefined under the in-process `handleFederation` path and
+   * whenever TLS termination happens ahead of the daemon (reverse proxy).
+   */
+  readonly peerCertSubject?: string;
+};
+
+/** Runs the local agent for an authorized inbound call; returns its reply. */
+export type FederationInboundDispatch = (
+  ctx: FederationInboundContext,
+) => Promise<{ readonly reply: string }>;
+
+export type FederationAuthorizeResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * App-level peer gate, consulted AFTER envelope validation and BEFORE the
+ * inbound-payload classifier + dispatch. Default (omitted): accept any
+ * well-formed envelope — production wires an allowlist by
+ * `envelope.federation.from.deployment` and/or a `peerCertSubject` match.
+ */
+export type FederationAuthorize = (ctx: FederationInboundContext) => FederationAuthorizeResult;
+
+export type GatewayFederationConfig = {
+  /** This deployment's advertised identity — the Agent Card + crewhaus.json. */
+  readonly identity: {
+    readonly name: string;
+    readonly description: string;
+    /** Public base URL (e.g. `https://dep.example`); the inbound endpoint is `<base>/federation`. */
+    readonly endpoint: string;
+    readonly version?: string;
+    readonly supportedShapes?: readonly string[];
+    /** SHA256 fingerprint (64-char hex) of this deployment's leaf cert. */
+    readonly publicKeyFingerprint: string;
+    readonly skills?: readonly A2AAgentSkill[];
+    readonly provider?: A2AAgentProvider;
+  };
+  readonly dispatch: FederationInboundDispatch;
+  readonly authorize?: FederationAuthorize;
+};
+
 export type CreateGatewayServerOptions = {
   readonly jwtSecret: string;
   readonly tenantsRoot?: string;
@@ -221,6 +334,30 @@ export type CreateGatewayServerOptions = {
    * hot.
    */
   readonly intakeGate?: () => { readonly paused: boolean; readonly reason?: string };
+  /**
+   * Contract item 3 — resolver for `runs.subscribe` SSE streams. When set, a
+   * `runs.subscribe` request (authenticated + tenant-scoped exactly like every
+   * other method) resolves the run's per-run trace bus through this seam and
+   * the daemon streams its buffered-then-live trace events as
+   * `text/event-stream`. Omitted ⇒ `runs.subscribe` answers `404` (the server
+   * exposes no run event streams — behaviour-preserving for gateways that only
+   * do request/reply).
+   */
+  readonly resolveRunEvents?: ResolveRunEvents;
+  /**
+   * Idle-heartbeat cadence (ms) for an open `runs.subscribe` stream; a `:`
+   * comment frame is written this often so proxies don't reap an idle
+   * connection. Defaults to {@link DEFAULT_SSE_HEARTBEAT_MS}.
+   */
+  readonly sseHeartbeatMs?: number;
+  /**
+   * Item 2 (G31) — enable this deployment as an A2A federation peer. When set,
+   * the server serves `/.well-known/agent-card.json`, `/.well-known/crewhaus.json`
+   * and `POST /federation` (all OUTSIDE the JWT plane — see
+   * {@link GatewayFederationConfig}). Omitted ⇒ those routes answer `404`
+   * (behaviour-preserving for a non-federated gateway).
+   */
+  readonly federation?: GatewayFederationConfig;
 };
 
 export type UsageDelta = {
@@ -241,6 +378,21 @@ export interface GatewayServer {
    */
   handle(request: { readonly bearer?: string; readonly body: unknown }): Promise<unknown>;
   /**
+   * Contract item 3 — open a `runs.subscribe` SSE stream. Verifies `bearer`
+   * and resolves the tenant exactly as {@link handle} does, then returns a
+   * `text/event-stream` Response that replays the run's buffered trace events
+   * and live-streams new ones — or a JSON error Response (401/404/…) with the
+   * mapped status. `signal` (the request's AbortSignal under `listen()`) tears
+   * the stream down, unsubscribes, and clears the heartbeat on client
+   * disconnect. Used directly by tests; the HTTP layer routes `runs.subscribe`
+   * POSTs here automatically.
+   */
+  subscribe(request: {
+    readonly bearer?: string;
+    readonly body: unknown;
+    readonly signal?: AbortSignal;
+  }): Promise<Response>;
+  /**
    * Record token usage against a tenant's running total. Async since the
    * budget store may be durable (audit R3); await it so usage is committed
    * before the response is considered complete.
@@ -250,6 +402,25 @@ export interface GatewayServer {
   usage(tenantId: string): Promise<{ input: number; output: number }>;
   /** Get or build the audit log for a tenant. Memoised. */
   getAuditLog(tenant: Tenant): Promise<AuditLog>;
+  /**
+   * Item 2 (G31) — the A2A Agent Card served at `/.well-known/agent-card.json`,
+   * or `undefined` when federation is not configured. Exposed so tests + the
+   * generated daemon can inspect the exact card without an HTTP round-trip.
+   */
+  federationAgentCard(): A2AAgentCard | undefined;
+  /** The `/.well-known/crewhaus.json` discovery alias, or `undefined` when federation is off. */
+  federationWellKnown(): FederationWellKnown | undefined;
+  /**
+   * Item 2 (G31) — drive one inbound federated call exactly as the HTTP
+   * `POST /federation` route does (decode → authorize → classify → dispatch →
+   * map to A2A message), returning the raw `{status, body}` the peer receives.
+   * Used by tests + any embedder that terminates TLS itself. Answers `404`
+   * when federation is not configured.
+   */
+  handleFederation(request: {
+    readonly body: unknown;
+    readonly peerCertSubject?: string;
+  }): Promise<{ status: number; body: string }>;
 }
 
 const ZERO_USAGE: UsageDelta = { input: 0, output: 0 };
@@ -261,6 +432,100 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
   const budget = opts.budgetStore ?? new InMemoryBudgetStore();
   const auditLogByTenant = new Map<string, AuditLog>();
   const now = opts.now ?? Date.now;
+
+  // Item 2 (G31) — precompute the federation identity documents once. The
+  // Agent Card's `url` is the concrete inbound endpoint (`<base>/federation`);
+  // the crewhaus.json alias carries the base `endpoint` the router appends
+  // `/federation` to (kept in lock-step with `@crewhaus/federation-router`) plus
+  // the cert-pin fingerprint the A2A card omits.
+  const fed = opts.federation;
+  const fedBase = fed !== undefined ? fed.identity.endpoint.replace(/\/+$/, "") : "";
+  const fedAgentCard: A2AAgentCard | undefined =
+    fed !== undefined
+      ? buildAgentCard({
+          name: fed.identity.name,
+          description: fed.identity.description,
+          url: `${fedBase}/federation`,
+          ...(fed.identity.version !== undefined ? { version: fed.identity.version } : {}),
+          ...(fed.identity.skills !== undefined ? { skills: fed.identity.skills } : {}),
+          ...(fed.identity.provider !== undefined ? { provider: fed.identity.provider } : {}),
+        })
+      : undefined;
+  const fedWellKnown: FederationWellKnown | undefined =
+    fed !== undefined
+      ? buildWellKnown({
+          endpoint: fedBase,
+          publicKeyFingerprint: fed.identity.publicKeyFingerprint,
+          version: FEDERATION_VERSION,
+          ...(fed.identity.supportedShapes !== undefined
+            ? { supportedShapes: fed.identity.supportedShapes }
+            : {}),
+        })
+      : undefined;
+
+  /**
+   * Handle one inbound `POST /federation` call. Pipeline: decode + strict
+   * version-check the envelope → app-level `authorize` → Pillar 3 classify the
+   * payload at origin "federation" (a malicious verdict REFUSES rather than
+   * running the local agent on an injection) → `dispatch` to the local run →
+   * map the reply onto A2A message semantics. Returns the raw `{status, body}`
+   * so both the HTTP route and the in-process `handleFederation` method share
+   * one implementation.
+   */
+  async function handleFederationInbound(
+    body: unknown,
+    peerCertSubject: string | undefined,
+  ): Promise<{ status: number; body: string }> {
+    if (fed === undefined) {
+      return { status: 404, body: JSON.stringify({ error: "federation is not enabled" }) };
+    }
+    let envelope: FederationEnvelope;
+    try {
+      envelope = decodeFederationEnvelope(typeof body === "string" ? body : JSON.stringify(body));
+    } catch (err) {
+      return { status: 400, body: JSON.stringify({ error: (err as Error).message }) };
+    }
+    const ctx: FederationInboundContext = {
+      envelope,
+      ...(peerCertSubject !== undefined ? { peerCertSubject } : {}),
+    };
+    // App-level authorization. mTLS at the TLS layer authenticated *who* the
+    // peer is; this gate decides *whether* the peer is allowed (allowlist /
+    // cert-subject match). Authentication ≠ authorization ≠ classification.
+    const auth = fed.authorize ? fed.authorize(ctx) : { ok: true as const };
+    if (!auth.ok) {
+      return { status: 403, body: JSON.stringify({ error: `federation denied: ${auth.reason}` }) };
+    }
+    // Pillar 3 boundary site — the inbound payload is untrusted external
+    // content (origin "federation"). Classify BEFORE it reaches the local run;
+    // a malicious verdict refuses the call outright instead of dispatching an
+    // injection into the agent. (Symmetric to the router's client-side reply
+    // classification — the source side of the same boundary.)
+    const boundary = await classifyBoundary(envelope.payload, { origin: "federation" });
+    if (boundary.action === "redact") {
+      return {
+        status: 200,
+        body: JSON.stringify(
+          buildInboundResponse(
+            "[federation] request refused: inbound payload failed the safety classifier.",
+            { contextId: envelope.traceparent },
+          ),
+        ),
+      };
+    }
+    let reply: string;
+    try {
+      reply = (await fed.dispatch(ctx)).reply;
+    } catch (err) {
+      return { status: 500, body: JSON.stringify({ error: (err as Error).message }) };
+    }
+    // Map the completed local run's reply onto A2A message semantics (role
+    // "agent", one text part) beside the router-compatible `reply` string.
+    return {
+      status: 200,
+      body: JSON.stringify(buildInboundResponse(reply, { contextId: envelope.traceparent })),
+    };
+  }
 
   function tenantFor(claims: JwtClaims): Tenant {
     const override = opts.tenantOverrides?.[claims.tenant_id];
@@ -334,29 +599,67 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
         await budget.release(tenant.id, estimate);
       }
     } catch (err) {
-      if (err instanceof GatewayProtocolError) {
-        return encodeError(id, ErrorCode.BadRequest, err.message);
+      return errorEnvelopeFor(err, id);
+    }
+  }
+
+  /**
+   * Open a `runs.subscribe` SSE stream. Runs the SAME admission as
+   * `handleEnvelope` (bearer → `verifyJwt` → `tenantFor` → `decodeRequest`) but
+   * DEVIATES after admission: no budget reservation (a long-lived read-only
+   * stream carries no token cost and must not pin a reservation for its whole
+   * lifetime) and no intake-gate shedding (observability must stay reachable
+   * during a load-shed). On success it returns the streaming Response; every
+   * failure maps through the same {@link errorEnvelopeFor} table as the JSON
+   * path, rendered as a JSON error Response with the mapped HTTP status.
+   */
+  async function handleSubscribe(
+    envelope: unknown,
+    bearer: string | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<Response> {
+    let id = "?";
+    try {
+      if (typeof bearer !== "string" || bearer === "") {
+        return errorResponse(encodeError("?", ErrorCode.Unauthorized, "missing bearer token"));
       }
-      if (err instanceof GatewayServerError) {
-        if (err.message.startsWith("budget exceeded")) {
-          return encodeError(id, ErrorCode.BudgetExceeded, err.message);
-        }
-        // JWT failures and tenant-id failures both map to 401.
-        if (
-          err.message.startsWith("JWT ") ||
-          err.message.startsWith("malformed JWT") ||
-          err.message.startsWith("invalid tenantId")
-        ) {
-          return encodeError(id, ErrorCode.Unauthorized, err.message);
-        }
-        return encodeError(id, ErrorCode.BadRequest, err.message);
+      const claims = verifyJwt(bearer, opts.jwtSecret, now);
+      const tenant = tenantFor(claims);
+      const decoded = decodeRequest(envelope);
+      id = decoded.id;
+      if (decoded.method !== "runs.subscribe") {
+        return errorResponse(
+          encodeError(id, ErrorCode.BadRequest, "subscribe() requires runs.subscribe"),
+        );
       }
-      // Tenancy validateTenantId throws TenancyError; map to 401.
-      if (err instanceof Error && err.name === "TenancyError") {
-        return encodeError(id, ErrorCode.Unauthorized, err.message);
+      if (opts.resolveRunEvents === undefined) {
+        return errorResponse(
+          encodeError(id, ErrorCode.NotFound, "runs.subscribe is not supported by this server"),
+        );
       }
-      const msg = err instanceof Error ? err.message : String(err);
-      return encodeError(id, ErrorCode.InternalError, msg);
+      const runId = (decoded.params as { runId: string }).runId;
+      // Audit the subscription (who streamed which run) — best-effort so an
+      // audit-write failure never denies a read-only stream.
+      try {
+        const log = await getAuditLog(tenant);
+        await log.append({
+          kind: "gateway_request",
+          payload: { method: "runs.subscribe", tenantId: tenant.id, runId, sub: claims.sub },
+        });
+      } catch {
+        /* best-effort audit — streaming proceeds regardless */
+      }
+      // Tenant scoping is enforced INSIDE the resolver (the daemon fences its
+      // per-run bus registry by tenant); an unknown OR cross-tenant runId
+      // returns undefined and is answered 404 — indistinguishable, so a run's
+      // existence never leaks across tenants.
+      const source = await opts.resolveRunEvents({ runId, tenant });
+      if (source === undefined) {
+        return errorResponse(encodeError(id, ErrorCode.NotFound, `no such run: ${runId}`));
+      }
+      return sseResponse(source, signal, opts.sseHeartbeatMs ?? DEFAULT_SSE_HEARTBEAT_MS);
+    } catch (err) {
+      return errorResponse(errorEnvelopeFor(err, id));
     }
   }
 
@@ -366,6 +669,36 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
         port,
         hostname: host,
         fetch: async (req): Promise<Response> => {
+          // Item 2 (G31) — the federation surface is served OUTSIDE the JWT
+          // plane (peers authenticate via mTLS, not the tenant bearer). Route
+          // it first so a federation request never hits the JSON-RPC decoder.
+          const pathname = new URL(req.url).pathname;
+          if (req.method === "GET" && pathname === "/.well-known/agent-card.json") {
+            return fedAgentCard !== undefined
+              ? Response.json(fedAgentCard)
+              : Response.json({ error: "federation is not enabled" }, { status: 404 });
+          }
+          if (req.method === "GET" && pathname === "/.well-known/crewhaus.json") {
+            return fedWellKnown !== undefined
+              ? Response.json(fedWellKnown)
+              : Response.json({ error: "federation is not enabled" }, { status: 404 });
+          }
+          if (req.method === "POST" && pathname === "/federation") {
+            let fbody: unknown;
+            try {
+              fbody = await req.json();
+            } catch {
+              return Response.json({ error: "request body must be JSON" }, { status: 400 });
+            }
+            // The presented TLS client-cert subject is not surfaced by Bun's
+            // fetch handler; a TLS terminator ahead of the daemon supplies it
+            // (follow-up). Undefined here ⇒ `authorize` gates on the envelope.
+            const out = await handleFederationInbound(fbody, undefined);
+            return new Response(out.body, {
+              status: out.status,
+              headers: { "content-type": "application/json" },
+            });
+          }
           const auth = req.headers.get("authorization") ?? "";
           const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : undefined;
           let body: unknown;
@@ -376,6 +709,12 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
               encodeError("?", ErrorCode.BadRequest, "request body must be JSON"),
               { status: 400 },
             );
+          }
+          // `runs.subscribe` upgrades to a `text/event-stream`; divert it
+          // BEFORE the JSON handler so it never gets wrapped in an envelope.
+          // `req.signal` aborts on client disconnect → the stream tears down.
+          if (isSubscribeBody(body)) {
+            return handleSubscribe(body, bearer, req.signal);
           }
           const out = await handleEnvelope(body, bearer);
           // Map error codes back to HTTP status for ergonomics.
@@ -396,6 +735,9 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
     handle(req): Promise<unknown> {
       return handleEnvelope(req.body, req.bearer);
     },
+    subscribe(req): Promise<Response> {
+      return handleSubscribe(req.body, req.bearer, req.signal);
+    },
     recordUsage(tenantId, delta): Promise<void> {
       return budget.recordUsage(tenantId, delta);
     },
@@ -403,6 +745,15 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
       return budget.usage(tenantId);
     },
     getAuditLog,
+    federationAgentCard(): A2AAgentCard | undefined {
+      return fedAgentCard;
+    },
+    federationWellKnown(): FederationWellKnown | undefined {
+      return fedWellKnown;
+    },
+    handleFederation(req): Promise<{ status: number; body: string }> {
+      return handleFederationInbound(req.body, req.peerCertSubject);
+    },
   };
 }
 
@@ -428,6 +779,161 @@ export function statusFor(code: string): number {
     default:
       return 200;
   }
+}
+
+/**
+ * Map a thrown admission/handler error to its wire `ResponseEnvelope`. Shared
+ * by the JSON request/reply path ({@link handleEnvelope}) and the
+ * `runs.subscribe` SSE path so both classify identically:
+ *   - `GatewayProtocolError` (decode failures) → `bad_request`
+ *   - `GatewayServerError` starting `budget exceeded` → `budget_exceeded`
+ *   - `GatewayServerError`/tenancy auth failures (`JWT …`, `malformed JWT …`,
+ *     `invalid tenantId`, `TenancyError`) → `unauthorized`
+ *   - any other `GatewayServerError` → `bad_request`
+ *   - anything else → `internal_error`
+ */
+function errorEnvelopeFor(err: unknown, id: string): ResponseEnvelopeT {
+  if (err instanceof GatewayProtocolError) {
+    return encodeError(id, ErrorCode.BadRequest, err.message);
+  }
+  if (err instanceof GatewayServerError) {
+    if (err.message.startsWith("budget exceeded")) {
+      return encodeError(id, ErrorCode.BudgetExceeded, err.message);
+    }
+    // JWT failures and tenant-id failures both map to 401.
+    if (
+      err.message.startsWith("JWT ") ||
+      err.message.startsWith("malformed JWT") ||
+      err.message.startsWith("invalid tenantId")
+    ) {
+      return encodeError(id, ErrorCode.Unauthorized, err.message);
+    }
+    return encodeError(id, ErrorCode.BadRequest, err.message);
+  }
+  // Tenancy validateTenantId throws TenancyError; map to 401.
+  if (err instanceof Error && err.name === "TenancyError") {
+    return encodeError(id, ErrorCode.Unauthorized, err.message);
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return encodeError(id, ErrorCode.InternalError, msg);
+}
+
+/** Render an error `ResponseEnvelope` as a JSON Response with the mapped status. */
+function errorResponse(envelope: ResponseEnvelopeT): Response {
+  const code = "error" in envelope ? envelope.error.code : "";
+  return Response.json(envelope, { status: statusFor(code) });
+}
+
+/** True when a parsed request body is a `runs.subscribe` call (peeked before
+ *  full decode so the HTTP layer can divert it to the SSE writer). */
+function isSubscribeBody(body: unknown): boolean {
+  return (
+    typeof body === "object" &&
+    body !== null &&
+    (body as { method?: unknown }).method === "runs.subscribe"
+  );
+}
+
+/**
+ * Build the `runs.subscribe` `text/event-stream` Response from a resolved
+ * {@link RunEventSource}. Lifecycle:
+ *   1. write a `: open` comment so proxies flush headers immediately;
+ *   2. `source.open()` — atomically snapshot the ring buffer AND attach the
+ *      live listener (gap-free / dup-free across the replay→live boundary);
+ *   3. replay the snapshot as `data:` frames, then live events as they arrive;
+ *   4. write a `: heartbeat` comment every `heartbeatMs` so an idle stream is
+ *      not reaped by intermediaries;
+ *   5. on client disconnect (`signal` abort), stream cancel, or an enqueue
+ *      into an already-closed controller, run teardown ONCE (idempotent via
+ *      `torn`): clear the heartbeat, unsubscribe the listener, drop the abort
+ *      handler, and close the controller.
+ */
+function sseResponse(
+  source: RunEventSource,
+  signal: AbortSignal | undefined,
+  heartbeatMs: number,
+): Response {
+  const encoder = new TextEncoder();
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let subscription: { readonly replay: ReadonlyArray<unknown>; close(): void } | undefined;
+  let onAbort: (() => void) | undefined;
+  let torn = false;
+
+  const teardown = (): void => {
+    if (torn) return;
+    torn = true;
+    if (heartbeat !== undefined) clearInterval(heartbeat);
+    subscription?.close();
+    if (signal !== undefined && onAbort !== undefined) {
+      signal.removeEventListener("abort", onAbort);
+    }
+  };
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const enqueue = (chunk: string): void => {
+        if (torn) return;
+        try {
+          controller.enqueue(encoder.encode(chunk));
+        } catch {
+          // Controller already closed (client vanished mid-write): tear down.
+          teardown();
+        }
+      };
+      const closeStream = (): void => {
+        teardown();
+        try {
+          controller.close();
+        } catch {
+          /* already closed */
+        }
+      };
+
+      enqueue(encodeSseComment("open"));
+
+      // Atomic snapshot + live-subscribe (see RunEventSource.open): no event is
+      // lost or double-delivered across the replay/live boundary.
+      try {
+        subscription = source.open((event) => enqueue(encodeSseEvent(event)));
+      } catch (err) {
+        enqueue(encodeSseComment(`error: ${err instanceof Error ? err.message : String(err)}`));
+        closeStream();
+        return;
+      }
+      for (const event of subscription.replay) enqueue(encodeSseEvent(event));
+
+      // Heartbeat comments keep intermediaries from timing the idle stream out.
+      // `unref` (when available) keeps the interval from, by itself, holding a
+      // daemon's event loop open.
+      heartbeat = setInterval(() => enqueue(encodeSseComment("heartbeat")), heartbeatMs);
+      (heartbeat as { unref?: () => void }).unref?.();
+
+      // Client disconnect aborts the request signal → tear the stream down.
+      if (signal !== undefined) {
+        if (signal.aborted) {
+          closeStream();
+          return;
+        }
+        onAbort = closeStream;
+        signal.addEventListener("abort", onAbort);
+      }
+    },
+    cancel() {
+      // The consumer released the stream (e.g. reader.cancel()).
+      teardown();
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "content-type": SSE_CONTENT_TYPE,
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      // Defeat proxy buffering (nginx) so events flush as they're written.
+      "x-accel-buffering": "no",
+    },
+  });
 }
 
 export { PROTOCOL_VERSION };

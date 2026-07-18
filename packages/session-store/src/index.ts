@@ -22,9 +22,18 @@
  *
  * References: `claude-code/utils/sessionStorage.ts`, `agent-framework/_sessions.py`.
  */
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { RuntimeError } from "@crewhaus/errors";
 import { assertSamePath, currentTenantContext, requireTenant } from "@crewhaus/tenancy";
@@ -517,4 +526,257 @@ function isSessionShape(value: unknown): value is Session {
     typeof v["model"] === "string" &&
     typeof v["lastTurnIndex"] === "number"
   );
+}
+
+// ===========================================================================
+// Loop contract 0.4 (Batch C, G11) — pending-approval persistence.
+//
+// When a tool permission resolves to `ask` on a NON-interactive surface and
+// `permissions.ask_mode` is `"pause"`, runtime-core persists a
+// `PendingApproval` here, parks the run, and re-reads on the next execution to
+// re-resolve the call. The record lives in ONE append-only JSONL file beside
+// the session `.json`/`.jsonl` files (`<rootDir>/approvals.jsonl`), folded
+// last-wins per `id` on read. Keyed on `(toolName, inputHash)` — NOT on
+// session — so a grant persisted by one run is found by the next run that
+// re-issues the same call. TTL'd on the same mtime-independent clock as
+// sessions: a record whose `createdAt` is older than `ttlDays` is treated as
+// absent (and compacted away by `list()`).
+// ===========================================================================
+
+/** The out-of-band decision recorded on a parked approval. */
+export type ApprovalDecision = "grant" | "deny";
+
+/**
+ * One parked tool-approval request. `id` (`appr_<16 hex>`) is the stable key
+ * the `approval_requested`/`approval_resolved` trace events and the CLI/Slack
+ * approval verbs reference. `inputHash` is `hashApprovalInput(toolName, input)`
+ * — the cross-session key a grant/deny is matched on. `decision` is unset
+ * while pending and set once resolved out of band; `consumedAt` is stamped
+ * when a one-shot grant is spent so a later identical call re-asks.
+ */
+export type PendingApproval = {
+  readonly id: string;
+  readonly toolName: string;
+  readonly inputHash: string;
+  /** The tool input verbatim, so an approver can inspect what they're granting. */
+  readonly input?: unknown;
+  readonly runId: string;
+  readonly sessionId: string;
+  /** Free-form non-interactive surface classifier (`"single-turn"`, `"daemon"`, …). */
+  readonly surface: string;
+  readonly createdAt: string;
+  decision?: ApprovalDecision;
+  decidedBy?: string;
+  decidedAt?: string;
+  /** Set when a one-shot `grant` has been spent by a run (re-ask on next call). */
+  consumedAt?: string;
+};
+
+/**
+ * The persistence seam runtime-core's `approvals` option consumes. The
+ * concrete `createPendingApprovalStore` implements this over a JSONL file;
+ * tests may inject an in-memory twin. `persist` is an upsert (last-wins by
+ * `id`), so a one-shot grant is consumed by re-persisting the record with
+ * `consumedAt` set.
+ */
+export interface PendingApprovalStore {
+  /** Append (upsert) a `PendingApproval`. */
+  persist(approval: PendingApproval): Promise<void>;
+  /**
+   * The current record for `(toolName, inputHash)`: the newest non-consumed,
+   * non-expired match (pending or resolved), or `null`. The runtime branches
+   * on the returned `decision`.
+   */
+  get(toolName: string, inputHash: string): Promise<PendingApproval | null>;
+  /**
+   * Record an out-of-band decision on the approval `id` (the CLI/Slack verb
+   * path). Returns the updated record, or `null` when no such id exists.
+   */
+  resolve(id: string, decision: ApprovalDecision, by: string): Promise<PendingApproval | null>;
+  /**
+   * Every live (non-expired) approval, newest-first. Compacts the backing
+   * file as a side-effect (drops expired + superseded lines), mirroring
+   * `SessionStore.list()`'s TTL eviction.
+   */
+  list(): Promise<PendingApproval[]>;
+}
+
+export const DEFAULT_APPROVALS_FILENAME = "approvals.jsonl";
+const APPROVAL_ID_REGEX = /^appr_[0-9a-f]{16}$/;
+
+/**
+ * Stable canonical JSON — object keys sorted recursively — so a tool input
+ * hashes identically regardless of key insertion order. Used only to derive
+ * the approval key; not a general serializer.
+ */
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const entries = Object.keys(value as Record<string, unknown>)
+    .sort()
+    .map((k) => `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k])}`);
+  return `{${entries.join(",")}}`;
+}
+
+/**
+ * The cross-session key a grant/deny is matched on: a SHA-256 hex digest of
+ * the canonical `(toolName, input)` pair. Exported so runtime-core (which
+ * parks and re-resolves) and any approval surface (CLI/Slack, which resolve)
+ * compute the identical key.
+ */
+export function hashApprovalInput(toolName: string, input: unknown): string {
+  return createHash("sha256").update(stableStringify({ toolName, input })).digest("hex");
+}
+
+export type PendingApprovalStoreOptions = {
+  readonly rootDir?: string;
+  readonly ttlDays?: number;
+  readonly now?: () => Date;
+};
+
+function isPendingApprovalShape(value: unknown): value is PendingApproval {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v["id"] === "string" &&
+    typeof v["toolName"] === "string" &&
+    typeof v["inputHash"] === "string" &&
+    typeof v["runId"] === "string" &&
+    typeof v["sessionId"] === "string" &&
+    typeof v["surface"] === "string" &&
+    typeof v["createdAt"] === "string"
+  );
+}
+
+/**
+ * A file-backed {@link PendingApprovalStore}: one append-only JSONL beside the
+ * session files. Reads fold the log last-wins per `id`; `list()` additionally
+ * compacts (atomic tmp+rename) and evicts records older than `ttlDays`. The
+ * path-traversal fence + tenant fence from the session store apply — the file
+ * always resolves inside `rootDir`.
+ */
+export function createPendingApprovalStore(
+  opts: PendingApprovalStoreOptions = {},
+): PendingApprovalStore {
+  const rootDir = opts.rootDir ?? DEFAULT_ROOT_DIR;
+  const ttlDays = opts.ttlDays ?? DEFAULT_TTL_DAYS;
+  const now = opts.now ?? (() => new Date());
+  const filePath = (): string => fencePath(resolve(rootDir, DEFAULT_APPROVALS_FILENAME));
+
+  function validateId(id: string): void {
+    if (!APPROVAL_ID_REGEX.test(id)) {
+      throw new RuntimeError(`session-store: invalid approvalId "${id}" — expected appr_<16 hex>`);
+    }
+  }
+
+  // Fold the append-only log into the latest record per id. A malformed line
+  // never aborts the fold (best-effort, like session `list()`).
+  async function foldAll(): Promise<Map<string, PendingApproval>> {
+    let raw: string;
+    try {
+      raw = await readFile(filePath(), "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return new Map();
+      throw err;
+    }
+    const byId = new Map<string, PendingApproval>();
+    for (const line of raw.split("\n")) {
+      if (line.trim() === "") continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (isPendingApprovalShape(parsed)) byId.set(parsed.id, parsed);
+    }
+    return byId;
+  }
+
+  function isExpired(approval: PendingApproval, cutoffMs: number): boolean {
+    const created = Date.parse(approval.createdAt);
+    return Number.isFinite(created) && created < cutoffMs;
+  }
+
+  async function append(approval: PendingApproval): Promise<void> {
+    await mkdir(rootDir, { recursive: true });
+    await appendFile(filePath(), `${JSON.stringify(approval)}\n`, { mode: 0o600 });
+  }
+
+  return {
+    async persist(approval: PendingApproval): Promise<void> {
+      validateId(approval.id);
+      await append(approval);
+    },
+
+    async get(toolName: string, inputHash: string): Promise<PendingApproval | null> {
+      const cutoffMs = now().getTime() - ttlDays * MS_PER_DAY;
+      const folded = await foldAll();
+      let best: PendingApproval | null = null;
+      let bestAt = -1;
+      for (const approval of folded.values()) {
+        if (approval.toolName !== toolName || approval.inputHash !== inputHash) continue;
+        if (approval.consumedAt !== undefined) continue;
+        if (isExpired(approval, cutoffMs)) continue;
+        // Newest-touched wins: a fresh decision supersedes an older pending.
+        const touchedAt = Date.parse(approval.decidedAt ?? approval.createdAt);
+        const at = Number.isFinite(touchedAt) ? touchedAt : 0;
+        if (at >= bestAt) {
+          bestAt = at;
+          best = approval;
+        }
+      }
+      return best;
+    },
+
+    async resolve(
+      id: string,
+      decision: ApprovalDecision,
+      by: string,
+    ): Promise<PendingApproval | null> {
+      validateId(id);
+      const folded = await foldAll();
+      const current = folded.get(id);
+      if (current === undefined) return null;
+      const updated: PendingApproval = {
+        ...current,
+        decision,
+        decidedBy: by,
+        decidedAt: now().toISOString(),
+      };
+      await append(updated);
+      return updated;
+    },
+
+    async list(): Promise<PendingApproval[]> {
+      const cutoffMs = now().getTime() - ttlDays * MS_PER_DAY;
+      const folded = await foldAll();
+      const live = [...folded.values()].filter((a) => !isExpired(a, cutoffMs));
+      // Compact: rewrite the log with only the live, latest-per-id records so
+      // it can't grow without bound. Atomic (tmp+rename); a concurrent append
+      // racing the rewrite is the only loss window and approvals are low-rate.
+      try {
+        await mkdir(rootDir, { recursive: true });
+        const finalPath = filePath();
+        const tmpPath = `${finalPath}.tmp`;
+        const body = live.map((a) => JSON.stringify(a)).join("\n");
+        await writeFile(tmpPath, body.length > 0 ? `${body}\n` : "", { mode: 0o600 });
+        await rename(tmpPath, finalPath);
+      } catch (err) {
+        // Best-effort compaction — a rewrite failure must not break listing.
+        console.error("session-store: approvals compaction failed", err);
+      }
+      live.sort((a, b) => {
+        const at = Date.parse(a.decidedAt ?? a.createdAt);
+        const bt = Date.parse(b.decidedAt ?? b.createdAt);
+        return bt - at;
+      });
+      return live;
+    },
+  };
+}
+
+/** Mint a fresh approval id in the `appr_<16 hex>` format the store validates. */
+export function generateApprovalId(): string {
+  return `appr_${randomBytes(8).toString("hex")}`;
 }

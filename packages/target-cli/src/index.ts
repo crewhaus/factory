@@ -3,6 +3,7 @@ import { escapeJsonString } from "@crewhaus/infra-utils";
 import {
   type Bundle,
   type EmitReadmeOptions,
+  type IrKnowledge,
   type IrSubAgentDefinition,
   type IrV0,
   renderBundleReadme,
@@ -381,6 +382,116 @@ function renderEgressMatcher(ir: IrV0): {
   return { imports, bootBlock, field: "\n  egressMatcher: __egressMatcher," };
 }
 
+/**
+ * Loop contract 0.4 (Batch B, G02) — render the in-loop `evaluation:` wiring.
+ * The bundle constructs the evaluate fn from the RESOLVED IR grader and
+ * threads it — together with the resolved gate knobs — into runChatLoop's
+ * `evaluation` option; the runtime scores each completed assistant turn,
+ * compares against `threshold`, applies `onFail` (retry ≤ `maxRetries` with
+ * the rationale appended as a system nudge / halt as a classified
+ * `evaluation` failure / note as an `eval_graded` trace event only) and
+ * emits one `eval_graded` event per grading pass.
+ *
+ *   - `llm_judge` rides `@crewhaus/eval-judge`'s `judge()` (the offline
+ *     eval-judge scoring path: single-criterion rubric from `criteria`,
+ *     1–5 score mapped to [0,1] via (n-1)/4, prompt-injection-hardened
+ *     sentinels). The judge model resolves through the SAME model-router
+ *     adapter wiring the bundle's primary model uses (env credentials,
+ *     any provider), so judge spend is metered exactly like every other
+ *     model call; the model defaults to the shape's primary model when the
+ *     spec omitted `grader.model` (`cheapest` already resolved at lower
+ *     time). `threshold` was resolved at lower time (default 0.7) — the
+ *     `?? 0.7` is a defensive floor for hand-built IR.
+ *   - `contains` / `regex` are emitted as pure fns (score 1 on pass, 0 on
+ *     fail; no model spend, no import). The regex was validated compilable
+ *     at parse time; `lastIndex` is reset per call so a global/sticky flag
+ *     can never flip-flop verdicts across turns.
+ *
+ * The emitted literal is annotated `RunEvaluation` (runtime-core's seam
+ * type), so a compiled bundle typechecks against the exact runtime
+ * contract: `graderType`/`threshold` are stamped verbatim onto every
+ * `eval_graded` event (deterministic graders carry the documented
+ * threshold 1 — score is 0|1 and `score >= threshold` is the pass rule).
+ * Empty pieces when the spec omits the block, keeping pre-existing bundles
+ * byte-identical. Mirror: target-channel-bot + target-managed render the
+ * same wiring — keep the three in sync.
+ */
+function renderEvaluation(ir: IrV0): { imports: string[]; bootBlock: string; field: string } {
+  const ev = ir.evaluation;
+  if (ev === undefined) return { imports: [], bootBlock: "", field: "" };
+  const field = "\n  evaluation: __evaluation,";
+  const typeImport = `import type { RunEvaluation } from "@crewhaus/runtime-core";`;
+  const onFail = escapeJsonString(ev.onFail);
+  if (ev.grader.type === "llm_judge") {
+    const criteria = escapeJsonString(ev.grader.criteria);
+    const model = escapeJsonString(ev.grader.model ?? ir.agent.model);
+    const bootBlock = `const __evaluation: RunEvaluation = {
+  graderType: "llm_judge",
+  threshold: ${ev.threshold ?? 0.7},
+  onFail: ${onFail},
+  maxRetries: ${ev.maxRetries},
+  evaluate: async ({ finalText }) => {
+    const __verdict = await judge({
+      rubric: {
+        criteria: [
+          {
+            name: "criteria",
+            description: ${criteria},
+            anchors: {
+              "1": "fails the criteria entirely",
+              "2": "mostly fails the criteria",
+              "3": "partially meets the criteria",
+              "4": "meets the criteria with minor gaps",
+              "5": "fully meets the criteria",
+            },
+          },
+        ],
+        passing_score: 3,
+      },
+      sample: { id: "in-loop-evaluation", input: "" },
+      agentOutput: finalText,
+      model: ${model},
+    });
+    return { score: (__verdict.score - 1) / 4, rationale: __verdict.rationale };
+  },
+};`;
+    return {
+      imports: [typeImport, `import { judge } from "@crewhaus/eval-judge";`],
+      bootBlock,
+      field,
+    };
+  }
+  const value = ev.grader.value;
+  const valueLit = escapeJsonString(value);
+  if (ev.grader.type === "contains") {
+    const bootBlock = `const __evaluation: RunEvaluation = {
+  graderType: "contains",
+  threshold: 1,
+  onFail: ${onFail},
+  maxRetries: ${ev.maxRetries},
+  evaluate: async ({ finalText }) =>
+    finalText.includes(${valueLit})
+      ? { score: 1, rationale: ${escapeJsonString(`output contains "${value}"`)} }
+      : { score: 0, rationale: ${escapeJsonString(`output missing "${value}"`)} },
+};`;
+    return { imports: [typeImport], bootBlock, field };
+  }
+  const bootBlock = `const __evalRegex = new RegExp(${valueLit});
+const __evaluation: RunEvaluation = {
+  graderType: "regex",
+  threshold: 1,
+  onFail: ${onFail},
+  maxRetries: ${ev.maxRetries},
+  evaluate: async ({ finalText }) => {
+    __evalRegex.lastIndex = 0;
+    return __evalRegex.test(finalText)
+      ? { score: 1, rationale: ${escapeJsonString(`output matches /${value}/`)} }
+      : { score: 0, rationale: ${escapeJsonString(`output does not match /${value}/`)} };
+  },
+};`;
+  return { imports: [typeImport], bootBlock, field };
+}
+
 /** Render one IrSubAgentDefinition as a TypeScript object literal. */
 function renderSubAgentDef(d: IrSubAgentDefinition): string {
   const lines: string[] = [];
@@ -400,6 +511,56 @@ function renderSubAgentDef(d: IrSubAgentDefinition): string {
   return `{ ${lines.join(", ")} }`;
 }
 
+/**
+ * Item 3 (G32) — plugin activation boot. When the spec declares `plugins:`, the
+ * bundle activates the named plugins at boot via `@crewhaus/plugin-loader`
+ * (which reads the installed-plugin registry, verifies each pinned entry's
+ * Ed25519 signature + entrypoint digest, and imports it), then registers the
+ * contributed tools on the shared `defaultCatalog` so they ride
+ * `defaultCatalog.list()` into runChatLoop exactly like built-in / skill tools.
+ *
+ * The boot is split so ordering is safe:
+ *   - `activateBoot` runs EARLY (before skill discovery) so `__plugins.skillDirs`
+ *     can feed `discoverSkills({ pluginDirs })`.
+ *   - `registerBoot` runs LATE (after the built-in and skill tools are on the
+ *     catalog) and skips any name already registered — first-party wins the
+ *     collision, and a plugin tool named after a built-in never throws
+ *     `defaultCatalog.register`'s duplicate-name error and bricks boot.
+ *
+ * Trust: `createDefaultPluginRuntime` builds the loader against
+ * `~/.crewhaus/plugins` with fail-closed signature verification;
+ * `CREWHAUS_PLUGIN_ALLOW_UNSIGNED=1` downgrades to dev (unsigned) mode. Empty
+ * pieces when the spec omits `plugins:`, keeping bundles byte-identical.
+ */
+function renderPlugins(ir: IrV0): {
+  imports: string[];
+  activateBoot: string;
+  registerBoot: string;
+  hasAny: boolean;
+} {
+  const names = ir.plugins ?? [];
+  if (names.length === 0) {
+    return { imports: [], activateBoot: "", registerBoot: "", hasAny: false };
+  }
+  return {
+    hasAny: true,
+    imports: [
+      `import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";`,
+    ],
+    activateBoot: `const __plugins = await activatePlugins({
+  names: ${JSON.stringify(names)},
+  ...createDefaultPluginRuntime({ allowUnsigned: process.env.CREWHAUS_PLUGIN_ALLOW_UNSIGNED === "1" }),
+});`,
+    registerBoot: `for (const __t of __plugins.tools) {
+  if (defaultCatalog.get(__t.name) !== undefined) {
+    process.stderr.write(\`[plugins] tool "\${__t.name}" already registered — plugin contribution skipped\\n\`);
+    continue;
+  }
+  defaultCatalog.register(__t);
+}`,
+  };
+}
+
 function renderAgent(ir: IrV0): string {
   const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
   const mcp = renderMcpServers(ir);
@@ -409,6 +570,12 @@ function renderAgent(ir: IrV0): string {
   // for "semantic" it constructs `@crewhaus/egress-matcher-semantic` with an
   // injected embedder, mirroring the `crewhaus run` path.
   const egress = renderEgressMatcher(ir);
+  // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation. Empty
+  // pieces when the spec omits the block.
+  const evaluation = renderEvaluation(ir);
+  // Item 3 (G32) — plugin activation. Empty pieces when the spec omits
+  // `plugins:`, keeping bundles byte-identical.
+  const plugins = renderPlugins(ir);
   // The catalog import is needed when either built-in tools OR MCP servers
   // are in play. resolveTools() already prepends it for the built-in case;
   // we add it explicitly when MCP is the only consumer.
@@ -461,13 +628,19 @@ function renderAgent(ir: IrV0): string {
         `import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";`,
         `import { loadCommands } from "@crewhaus/slash-commands";`,
       ].join("\n");
+  // Item 3 (G32) — feed the activated plugins' `<plugin>/skills` dirs into the
+  // bundle's own `discoverSkills` (the non-continuity path). Empty otherwise;
+  // in the continuity path skills come from `wireMemory`, which does not yet
+  // take plugin dirs (memory-service follow-up), so plugin tools still bind but
+  // plugin skills are not auto-discovered there.
+  const pluginSkillDirsArg = plugins.hasAny ? ", pluginDirs: __plugins.skillDirs" : "";
   const extensionBoot = continuityOn
     ? `const __cwd = process.cwd();
 const __hooks = await loadHooks({ cwd: __cwd });`
     : `const __cwd = process.cwd();
 const [__hooks, __skills, __slashCommands] = await Promise.all([
   loadHooks({ cwd: __cwd }),
-  discoverSkills({ cwd: __cwd }),
+  discoverSkills({ cwd: __cwd${pluginSkillDirsArg} }),
   loadCommands({ cwd: __cwd }),
 ]);
 if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
@@ -476,6 +649,9 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   // blocks, wired through the ONE stable composition-root call. Mirrors
   // apps/cli's runRunCli.
   const memory = renderMemory(ir);
+  // Loop contract 0.4 (Batch E, G22) — agent-shape RAG (`knowledge:`). Empty
+  // pieces when the spec omits the block, keeping bundles byte-identical.
+  const knowledge = renderKnowledge(ir);
 
   const mcpBoot = mcp.hasAny ? `${mcp.bootBlock}\n\n` : "";
   const subAgentsBoot = subAgents.registryBlock
@@ -516,6 +692,26 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
     : "";
   const maxTokensField =
     ir.agent.maxTokens !== undefined ? `\n  maxTokens: ${ir.agent.maxTokens},` : "";
+  // Loop contract 0.4 (Batch A) — extended-thinking selector. The IR carries
+  // exactly one form ({budgetTokens} XOR {effort}); both are numbers/closed
+  // literal unions, so JSON.stringify is safe. Runtime-core threads it to the
+  // provider request (`thinking` verbatim, `effort` via the adapter preset
+  // table `EFFORT_THINKING_BUDGET_TOKENS`). Empty when unset.
+  const thinkingField =
+    ir.agent.thinking !== undefined ? `\n  thinking: ${JSON.stringify(ir.agent.thinking)},` : "";
+  // Loop contract 0.4 (Batch A) — stream partial output tokens (cli-only spec
+  // key). Carried verbatim only when declared, so unset specs keep their
+  // pinned bundle bytes and the runtime default (false) stays authoritative.
+  const streamingField =
+    ir.agent.streaming !== undefined ? `\n  streaming: ${ir.agent.streaming},` : "";
+  // Loop contract 0.4 (Batch A) — per-tool rate limits (keys are tool names
+  // or "*"). Keys are user-controlled spec strings landing in a plain object
+  // literal, so JSON.stringify's quoting is the escaping (same posture as
+  // toolConfigs inits). Empty when unset.
+  const rateLimitsField =
+    ir.agent.rateLimits !== undefined && Object.keys(ir.agent.rateLimits).length > 0
+      ? `\n  rateLimits: ${JSON.stringify(ir.agent.rateLimits)},`
+      : "";
   // Thread `compaction.model` so the compiled bundle's auto-compaction
   // summarizes on the spec's chosen model. The compiler already resolved the
   // `cheapest` sentinel to a concrete id, so this is a raw model string
@@ -525,6 +721,18 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
     ir.compaction.model !== undefined
       ? `\n  compactionModel: ${escapeJsonString(ir.compaction.model)},`
       : "";
+  // Loop contract 0.4 (Batch A) — compaction tuning knobs, mapped onto the
+  // runtime's existing options (`compactionThreshold` + the snip window).
+  // Numbers only; each key absent when the spec omits it so the runtime's
+  // own defaults (0.85 / 4 / 20) stay authoritative and pre-existing bundles
+  // stay byte-identical.
+  const compactionTuningFields = renderCompactionTuningFields(ir);
+  // Loop contract 0.4 (Batch A) — hard runtime ceilings from the `limits:`
+  // block. Empty when the spec omits it.
+  const limitsFields = renderLimitsFields(ir);
+  // Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks, layered
+  // BELOW the settings.json layers. Empty pieces when the spec has none.
+  const specHooks = renderSpecHooks(ir);
   // Item 22 — provider failover chain: thread `agent.model_fallbacks` +
   // `agent.circuit_breaker` into the runtime, which constructs the
   // breaker-driven meta-adapter (see @crewhaus/model-router). Emitted only
@@ -545,8 +753,8 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   model: ${escapeJsonString(ir.agent.model)},
   instructions: ${escapeJsonString(ir.agent.instructions)},
   sessionName: ${escapeJsonString(ir.name)},
-  sessionTarget: "cli",${maxTokensField}${compactionModelField}${failoverFields}${failureTaxonomyField}${budgetField}${sloField}${toolsField}${permField}${sandboxField}
-  hooks: __hooks,
+  sessionTarget: "cli",${maxTokensField}${thinkingField}${streamingField}${rateLimitsField}${compactionModelField}${compactionTuningFields}${limitsFields}${failoverFields}${failureTaxonomyField}${budgetField}${evaluation.field}${sloField}${toolsField}${permField}${sandboxField}
+  hooks: ${specHooks.hooksExpr},
   skills: __skills,
   slashCommands: __slashCommands,${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}${memory.field}
 });`;
@@ -574,8 +782,27 @@ ${catchBlock}${finallyBlock}`;
   const subAgentImportBlock =
     subAgents.imports.length > 0 ? `${subAgents.imports.join("\n")}\n` : "";
   const egressImportBlock = egress.imports.length > 0 ? `${egress.imports.join("\n")}\n` : "";
+  const evaluationImportBlock =
+    evaluation.imports.length > 0 ? `${evaluation.imports.join("\n")}\n` : "";
+  const evaluationBoot = evaluation.bootBlock ? `${evaluation.bootBlock}\n\n` : "";
   const memoryImportBlock = memory.imports.length > 0 ? `${memory.imports.join("\n")}\n` : "";
   const memoryBoot = memory.bootBlock ? `${memory.bootBlock}\n\n` : "";
+  const knowledgeImportBlock =
+    knowledge.imports.length > 0 ? `${knowledge.imports.join("\n")}\n` : "";
+  // The RAG corpus ingests at boot (async) and registers the Retrieve tool on
+  // the catalog before runChatLoop advertises `defaultCatalog.list()`.
+  const knowledgeBoot = knowledge.bootBlock ? `${knowledge.bootBlock}\n\n` : "";
+  // Item 3 (G32) — plugin activation. `activateBoot` runs BEFORE `extensionBoot`
+  // so `__plugins.skillDirs` feeds `discoverSkills`; `registerBoot` runs AFTER
+  // it so the plugin-tool registration's collision check sees the built-in and
+  // skill tools already on `defaultCatalog` (first-party wins), all before
+  // runChatLoop snapshots `defaultCatalog.list()`.
+  const pluginsImportBlock = plugins.imports.length > 0 ? `${plugins.imports.join("\n")}\n` : "";
+  // activateBoot precedes extensionBoot (trailing newline); registerBoot follows
+  // it (leading newline). Both empty when the spec omits `plugins:`, so the
+  // surrounding bytes are unchanged.
+  const pluginsActivateBoot = plugins.activateBoot ? `${plugins.activateBoot}\n` : "";
+  const pluginsRegisterBoot = plugins.registerBoot ? `\n${plugins.registerBoot}` : "";
 
   // v0.3.0 Goal 3 — with thredz on, the MCP host boots FIRST so wireMemory
   // receives the live connection (`__thredz`) the backend flip needs; every
@@ -588,11 +815,11 @@ ${catchBlock}${finallyBlock}`;
 // Source spec: ${escapeJsonString(ir.name)} (target: cli, ir version: ${ir.version})
 import { formatRunFailure, toFailureReport } from "@crewhaus/errors";
 import { runChatLoop } from "@crewhaus/runtime-core";
-${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${memoryImportBlock}${extensionImport}
+${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${evaluationImportBlock}${memoryImportBlock}${knowledgeImportBlock}${pluginsImportBlock}${extensionImport}
 ${registerBlock}
-${extensionBoot}
+${pluginsActivateBoot}${extensionBoot}${pluginsRegisterBoot}${specHooks.bootBlock}
 
-${bannerBoot}${subAgentsBoot}${egressBoot}${bootBlocks}${wrapped}
+${bannerBoot}${subAgentsBoot}${egressBoot}${evaluationBoot}${bootBlocks}${knowledgeBoot}${wrapped}
 `;
 }
 
@@ -670,6 +897,98 @@ function renderBudgetField(ir: IrV0): string {
 }
 
 /**
+ * Loop contract 0.4 (Batch A) — render the `limits:` ceilings into
+ * runChatLoop options, 1:1 onto the runtime knobs of the same names:
+ * `maxToolIterations` / `maxConcurrentTools` / `contextLimit` (pre-existing)
+ * and `deadlineMs` / `turnTimeoutMs` / `modelCallTimeoutMs` / `loopDetection`
+ * (the 0.4 enforcement timers + detection tuning/escalation ladder).
+ * Every value is a spec-validated positive int or a closed literal union
+ * (`loopDetection.escalation`), so `JSON.stringify` needs no escaping.
+ * Empty when the spec omits the block, keeping pre-existing bundles
+ * byte-identical. `limits.crew` never appears on IrV0 (crew-shape only).
+ * Mirror: the `crewhaus run` interpreter threads the same fields via
+ * apps/cli's loop-contract helper — keep the two in sync.
+ */
+function renderLimitsFields(ir: IrV0): string {
+  const limits = ir.limits;
+  if (limits === undefined) return "";
+  const pieces: string[] = [];
+  if (limits.maxToolIterations !== undefined) {
+    pieces.push(`\n  maxToolIterations: ${limits.maxToolIterations},`);
+  }
+  if (limits.maxConcurrentTools !== undefined) {
+    pieces.push(`\n  maxConcurrentTools: ${limits.maxConcurrentTools},`);
+  }
+  if (limits.contextLimit !== undefined) {
+    pieces.push(`\n  contextLimit: ${limits.contextLimit},`);
+  }
+  if (limits.deadlineMs !== undefined) {
+    pieces.push(`\n  deadlineMs: ${limits.deadlineMs},`);
+  }
+  if (limits.turnTimeoutMs !== undefined) {
+    pieces.push(`\n  turnTimeoutMs: ${limits.turnTimeoutMs},`);
+  }
+  if (limits.modelCallTimeoutMs !== undefined) {
+    pieces.push(`\n  modelCallTimeoutMs: ${limits.modelCallTimeoutMs},`);
+  }
+  if (limits.loopDetection !== undefined) {
+    pieces.push(`\n  loopDetection: ${JSON.stringify(limits.loopDetection)},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — render the compaction tuning knobs onto the
+ * runtime's EXISTING options: `compaction.threshold` → `compactionThreshold`,
+ * `compaction.snip_keep_head`/`snip_keep_tail` → `snipKeepHead`/`snipKeepTail`.
+ * Numbers only. Each key is emitted only when the spec declared it so the
+ * runtime defaults (0.85 / 4 / 20) stay authoritative and pre-existing
+ * bundles stay byte-identical.
+ */
+function renderCompactionTuningFields(ir: IrV0): string {
+  const pieces: string[] = [];
+  if (ir.compaction.threshold !== undefined) {
+    pieces.push(`\n  compactionThreshold: ${ir.compaction.threshold},`);
+  }
+  if (ir.compaction.snipKeepHead !== undefined) {
+    pieces.push(`\n  snipKeepHead: ${ir.compaction.snipKeepHead},`);
+  }
+  if (ir.compaction.snipKeepTail !== undefined) {
+    pieces.push(`\n  snipKeepTail: ${ir.compaction.snipKeepTail},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — render the spec-declared `hooks:` array and
+ * the runChatLoop `hooks:` expression. Spec hooks are LAYERED BELOW the
+ * settings.json layers: the generated bundle concatenates
+ * `[...__specHooks, ...__hooks]` (spec first, then loadHooks()' user →
+ * project entries), mirroring the permission RuleSet's settings-over-yaml
+ * precedence — hooks-engine's `aggregateDecisions` shallow-merges `mutate`
+ * later-wins, so a settings.json hook overrides a spec hook's mutate keys,
+ * and result ordering keeps the more-local layers last. All hooks still RUN
+ * (any deny wins regardless of layer).
+ *
+ * IrHook is field-compatible with hooks-engine's `HookDef` (camelCase
+ * `timeoutMs`), and `event` values are the closed HookEvent union, so the
+ * JSON literal + `as const` type-checks against `runChatLoop({ hooks })`.
+ * `matcher`/`command` are user-controlled spec strings — JSON.stringify's
+ * quoting is the escaping (same posture as toolConfigs inits). Returns the
+ * plain `__hooks` expression and no boot line when the spec declares none,
+ * keeping pre-existing bundles byte-identical.
+ */
+function renderSpecHooks(ir: IrV0): { bootBlock: string; hooksExpr: string } {
+  if (ir.hooks === undefined || ir.hooks.length === 0) {
+    return { bootBlock: "", hooksExpr: "__hooks" };
+  }
+  return {
+    bootBlock: `\nconst __specHooks = ${JSON.stringify(ir.hooks)} as const;`,
+    hooksExpr: "[...__specHooks, ...__hooks]",
+  };
+}
+
+/**
  * Ops item 37 — render the `sloTargets` runChatLoop field from
  * `observability.slo`. The IR carries a numbers + literal-union object (no
  * user-controlled strings — mitigation is a closed `alert|pause-intake|rollback`
@@ -730,7 +1049,23 @@ function renderMemory(ir: IrV0): { imports: string[]; bootBlock: string; field: 
   // the compiled bundle sits its exam in-process, same as the interpreter.
   const learningOn = ir.learning !== undefined;
   const examOn = learningOn && ir.learning?.exam !== undefined;
+  // Loop contract 0.4 (Batch A) — top-level fact-store embedder (spec
+  // `memory.embedder`). The bundle constructs it and hands it to wireMemory
+  // as `deps.embedder`, which memory-service's `resolveEmbedder` prefers
+  // over the fragment's `wiki.embedder` — exactly the documented runtime
+  // fallback order (`embedder` → `wiki.embedder`), with zero fragment-shape
+  // change. The import is skipped when the FR-006 semantic egress matcher
+  // already imported `createEmbedder` (renderEgressMatcher emits the same
+  // binding, and its import block precedes this one in the bundle).
+  const memEmbedder = memoryOn ? mem?.embedder : undefined;
+  const embedderDep =
+    memEmbedder !== undefined
+      ? `, embedder: createEmbedder({ model: ${escapeJsonString(memEmbedder)} })`
+      : "";
   const imports = [
+    ...(memEmbedder !== undefined && ir.security?.egressMatcher !== "semantic"
+      ? [`import { createEmbedder } from "@crewhaus/embedder";`]
+      : []),
     `import { wireMemory${dreamOn ? ", runDreamBootCatchUp" : ""} } from "@crewhaus/memory-service";`,
     ...(examOn ? [`import { createExamRunner } from "@crewhaus/eval-runner";`] : []),
   ];
@@ -763,16 +1098,66 @@ if (__dreamNote !== null) process.stdout.write(\`\${__dreamNote}\\n\`);`
       : "";
   if (!continuityOn && !learningOn) {
     // PR 10-pinned bytes: the `continuity: false` opt-out path.
-    const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: process.cwd()${thredzDep}${examDep("process.cwd()")} });${dreamBoot("process.cwd()")}`;
+    const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: process.cwd()${embedderDep}${thredzDep}${examDep("process.cwd()")} });${dreamBoot("process.cwd()")}`;
     const field = "\n  ...__memWired.options,";
     return { imports, bootBlock, field };
   }
-  const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: __cwd${thredzDep}${examDep("__cwd")} });
+  const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: __cwd${embedderDep}${thredzDep}${examDep("__cwd")} });
 const __skills = __memWired.options.skills ?? [];
 const __slashCommands = __memWired.options.slashCommands ?? new Map();
 if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));${dreamBoot("__cwd")}`;
   const field = "\n  ...__memWired.options,";
   return { imports, bootBlock, field };
+}
+
+/**
+ * Loop contract 0.4 (Batch E, G22) — render the agent-shape RAG (`knowledge:`)
+ * wiring. When the IR carries a `knowledge` block the bundle ingests the
+ * declared `sources` (path/glob/url) at boot through `@crewhaus/tool-retrieve`'s
+ * `knowledgeRetrieve` — the SAME chunk → embed → vector-store engine the
+ * pipeline shape uses — and registers the returned citation-bearing `Retrieve`
+ * tool on the catalog. The G76 embedder order (`knowledge.embedder →
+ * memory.embedder → memory.wiki.embedder → target default`) is deferred to
+ * `resolveKnowledgeEmbedder` — the ONE place that order is enforced, so the
+ * cli/channel/managed emitters cannot drift. Empty when the spec omits the
+ * block, keeping non-knowledge bundles byte-identical. Mirror:
+ * target-channel-bot + target-managed render the same wiring — keep in sync.
+ */
+function renderKnowledge(ir: {
+  readonly knowledge?: IrKnowledge;
+  readonly memory?: {
+    readonly enabled?: boolean;
+    readonly embedder?: string;
+    readonly wiki?: { readonly embedder?: string };
+  };
+}): { imports: string[]; bootBlock: string } {
+  const k = ir.knowledge;
+  if (k === undefined) return { imports: [], bootBlock: "" };
+  const memOn = ir.memory !== undefined && ir.memory.enabled !== false;
+  const embInputs: string[] = [];
+  if (k.embedder !== undefined)
+    embInputs.push(`knowledgeEmbedder: ${escapeJsonString(k.embedder)}`);
+  const memEmb = memOn ? ir.memory?.embedder : undefined;
+  if (memEmb !== undefined) embInputs.push(`memoryEmbedder: ${escapeJsonString(memEmb)}`);
+  const wikiEmb = memOn ? ir.memory?.wiki?.embedder : undefined;
+  if (wikiEmb !== undefined) embInputs.push(`wikiEmbedder: ${escapeJsonString(wikiEmb)}`);
+  const embedderExpr = `resolveKnowledgeEmbedder({ ${embInputs.join(", ")} })`;
+  const bootBlock = `const __knowledgeTool = await knowledgeRetrieve({
+  sources: ${JSON.stringify(k.sources)},
+  embedderModel: ${embedderExpr},
+  vectorBackend: ${escapeJsonString(k.vectorBackend)},
+  defaultK: ${k.defaultK},
+  chunkSize: ${k.chunkSize},
+  chunkOverlap: ${k.chunkOverlap},
+  log: (line) => process.stdout.write(line),
+});
+defaultCatalog.register(__knowledgeTool);`;
+  return {
+    imports: [
+      `import { knowledgeRetrieve, resolveKnowledgeEmbedder } from "@crewhaus/tool-retrieve";`,
+    ],
+    bootBlock,
+  };
 }
 
 /**

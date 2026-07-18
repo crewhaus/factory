@@ -131,6 +131,67 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  // Loop contract 0.4 (Batch B, G42) — `--emit-loop`: projectLoop() of the
+  // lowered IR, the wire contract shared with the studio /builder and the
+  // compiler-worker's POST /loop.
+  test("--emit-loop with -o writes loop.json byte-matching the keystone projection golden (G42)", async () => {
+    const fixturesDir = join(REPO_ROOT, "packages/compiler/src/__fixtures__");
+    const golden = JSON.parse(
+      readFileSync(join(fixturesDir, "loop-projections.golden.json"), "utf-8"),
+    ) as Record<string, unknown>;
+    const { LOOP_PROJECTION_SPECS } = (await import(
+      join(fixturesDir, "loop-projection-specs.ts")
+    )) as { LOOP_PROJECTION_SPECS: Record<string, string> };
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, LOOP_PROJECTION_SPECS["cli"] as string);
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--emit-loop", "-o", outDir]);
+    expect(result.exitCode).toBe(0);
+    const loopPath = join(outDir, "loop.json");
+    expect(existsSync(loopPath)).toBe(true);
+    // A print mode like --emit-ir: no codegen.
+    expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
+    expect(result.stdout).toContain(`wrote ${loopPath}`);
+    // Byte-parity with the golden the compiler + compiler-worker pin — the
+    // CLI, the worker endpoint, and the studio must render the same object.
+    const projection = JSON.parse(readFileSync(loopPath, "utf-8"));
+    expect(JSON.stringify(projection)).toBe(JSON.stringify(golden["cli"]));
+  });
+
+  test("--emit-loop without -o exits 0 (human render; stdout capture is racy — see --emit-ir note)", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "--emit-loop"]);
+    expect(result.exitCode).toBe(0);
+  });
+
+  test("--emit-loop --json without -o exits 0", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "--emit-loop", "--json"]);
+    expect(result.exitCode).toBe(0);
+  });
+
+  test("--emit-loop is a read-only view: the FR-002 scope gate does NOT run (POST /loop parity)", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: evil\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: |\n    do a thing\ntools:\n  - mcp__evil__exfiltrate\n",
+    );
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--emit-loop", "-o", outDir]);
+    // The same spec FAILS `compile`/`--emit-ir` by default (gate tests
+    // below); the projection is not an artifact, so it renders.
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain("[strict]");
+    expect(existsSync(join(outDir, "loop.json"))).toBe(true);
+  });
+
+  test("--emit-loop rejects --check and --emit-ir combinations", async () => {
+    const withCheck = await runCli(["compile", HELLO_SPEC, "--emit-loop", "--check"]);
+    expect(withCheck.exitCode).toBe(1);
+    expect(withCheck.stderr).toContain("--emit-loop");
+    const withEmitIr = await runCli(["compile", HELLO_SPEC, "--emit-loop", "--emit-ir"]);
+    expect(withEmitIr.exitCode).toBe(1);
+    expect(withEmitIr.stderr).toContain("mutually exclusive");
+  });
+
   // FR-002 — compile-time external-sink scope gate, now DEFAULT-ON.
   const MCP_SINK_SPEC =
     "name: evil\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: |\n    do a thing\ntools:\n  - mcp__evil__exfiltrate\n";
@@ -361,6 +422,69 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
     expect(result.stderr).not.toContain("[strict]");
+  });
+
+  // Loop contract 0.4 (Batch A) — compile warnings (accepted-but-unwired
+  // spec keys) always print, one line per warning, code + path + message;
+  // `--strict` escalates them to a failed build that emits nothing. A
+  // workflow spec declaring `continuity:` is the canonical warning case
+  // (its emitter prints the ignored-note comment instead of wiring it).
+  const WARNING_SPEC =
+    "name: warnful\ntarget: workflow\nmodel: claude-sonnet-4-6\nsteps:\n  - name: step1\n    instructions: do the thing\ncontinuity: true\n";
+
+  test("compile prints accepted-but-unwired warnings (code+path+message, one per line) and still emits", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, WARNING_SPEC);
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--no-register", "-o", outDir], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    // One line, carrying the code, the spec path, and the message.
+    expect(result.stderr).toContain("crewhaus: warning[accepted-but-unwired] continuity:");
+    expect(result.stderr).toContain("accepted on the workflow shape");
+    const warningLines = result.stderr.split("\n").filter((l) => l.includes("warning["));
+    expect(warningLines.length).toBe(1);
+    // Warnings do not fail the build without --strict.
+    expect(result.stdout).toContain("compiled bundle");
+    expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
+  });
+
+  test("compile --strict escalates warnings to errors and writes NOTHING", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, WARNING_SPEC);
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--strict", "--no-register", "-o", outDir], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(1);
+    // The warning itself still prints (with its path), then the escalation.
+    expect(result.stderr).toContain("crewhaus: warning[accepted-but-unwired] continuity:");
+    expect(result.stderr).toContain("--strict: 1 compile warning(s) escalated to errors");
+    // A strict-failed build must not emit — the out dir is never created.
+    expect(existsSync(outDir)).toBe(false);
+  });
+
+  test("compile --strict passes a warning-free spec (and prints no warning lines)", async () => {
+    const outDir = join(tmp, "out");
+    const result = await runCli(
+      ["compile", HELLO_SPEC, "--strict", "--no-register", "-o", outDir],
+      {
+        cwd: tmp,
+      },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain("warning[");
+    expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
+  });
+
+  test("compile --help documents the warning line shape and --strict escalation", async () => {
+    const result = await runCli(["compile", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("accepted-but-unwired");
+    expect(result.stdout).toContain("warning[<code>] <path>: <message>");
+    expect(result.stdout).toContain("--strict");
+    expect(result.stdout).toContain("Escalate compile warnings to errors");
   });
 });
 
@@ -594,6 +718,131 @@ describe("crewhaus run", () => {
     const result = await runCli(["run", "--help"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("--justification-judge");
+  });
+
+  // Loop contract 0.4 (Batch A) — --streaming flag / spec agent.streaming,
+  // spec-declared hooks layered below settings.json, and the full
+  // loop-contract spec key set threading through runChatLoop boot.
+  test("run --streaming forces streaming on and prints the diagnostic", async () => {
+    const result = await runCli(["run", HELLO_SPEC, "--streaming"], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("[streaming] mid-stream tool dispatch enabled");
+    expect(result.stdout).toContain("agent ready");
+  });
+
+  test("spec agent.streaming: true enables streaming without the flag", async () => {
+    writeFileSync(
+      join(tmp, "crewhaus.yaml"),
+      "name: streamy\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: hi\n  streaming: true\n",
+    );
+    const result = await runCli(["run", join(tmp, "crewhaus.yaml")], {
+      cwd: tmp,
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("[streaming] mid-stream tool dispatch enabled");
+  });
+
+  test("no flag + no spec streaming → no [streaming] diagnostic (runtime default keeps governing)", async () => {
+    const result = await runCli(["run", HELLO_SPEC], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("[streaming]");
+  });
+
+  test("spec hooks merge below settings.json hooks — the [hooks] line counts both layers", async () => {
+    writeFileSync(
+      join(tmp, "crewhaus.yaml"),
+      "name: hooked\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: hi\nhooks:\n  - event: stop\n    command: 'true'\n",
+    );
+    mkdirSync(join(tmp, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(tmp, ".crewhaus", "settings.json"),
+      '{ "hooks": [ { "event": "stop", "command": "true" } ] }\n',
+    );
+    const result = await runCli(["run", join(tmp, "crewhaus.yaml")], {
+      cwd: tmp,
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("[hooks] 2 loaded (1 from spec)");
+  });
+
+  test("spec hooks alone (no settings.json) still load, marked as spec-sourced", async () => {
+    writeFileSync(
+      join(tmp, "crewhaus.yaml"),
+      "name: hooked\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: hi\nhooks:\n  - event: pre-tool\n    matcher: Bash\n    command: 'true'\n    timeout_ms: 3000\n",
+    );
+    const result = await runCli(["run", join(tmp, "crewhaus.yaml")], {
+      cwd: tmp,
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("[hooks] 1 loaded (1 from spec)");
+  });
+
+  test("the full loop-contract key set (limits/thinking/rate_limits/compaction tuning) boots cleanly", async () => {
+    writeFileSync(
+      join(tmp, "crewhaus.yaml"),
+      [
+        "name: loopy",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: be helpful",
+        "  thinking:",
+        "    effort: low",
+        "  rate_limits:",
+        '    "*":',
+        "      rpm: 120",
+        "limits:",
+        "  max_tool_iterations: 25",
+        "  max_concurrent_tools: 2",
+        "  context_limit: 120000",
+        "  deadline_ms: 600000",
+        "  turn_timeout_ms: 120000",
+        "  model_call_timeout_ms: 60000",
+        "  loop_detection:",
+        "    window: 12",
+        "    threshold: 3",
+        "    escalation: warn",
+        "compaction:",
+        "  threshold: 0.8",
+        "  snip_keep_head: 6",
+        "  snip_keep_tail: 30",
+        "",
+      ].join("\n"),
+    );
+    const result = await runCli(["run", join(tmp, "crewhaus.yaml")], {
+      cwd: tmp,
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    // Boots and exits cleanly with every loop-contract option threaded into
+    // runChatLoop (the runtime enforcement itself is covered by
+    // runtime-core's own tests; the option-name mapping by loop-contract.test.ts).
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("agent ready");
+  });
+
+  test("run --help documents --streaming and the --budget-usd ↔ limits interplay", async () => {
+    const result = await runCli(["run", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--streaming");
+    expect(result.stdout).toContain("--budget-usd");
+    // The interplay contract: independent bounds, first to trip governs,
+    // budget gates the NEXT turn while limits bound the current one.
+    expect(result.stdout).toContain("limits:");
+    expect(result.stdout).toContain("INDEPENDENTLY");
+    expect(result.stdout).toContain("NEXT turn");
   });
 });
 
@@ -926,7 +1175,19 @@ describe("crewhaus optimize --budget-usd", () => {
         "-o",
         out,
       ],
-      { env: { ANTHROPIC_API_KEY: process.env["ANTHROPIC_API_KEY"] ?? "" } },
+      {
+        env: {
+          ANTHROPIC_API_KEY: process.env["ANTHROPIC_API_KEY"] ?? "",
+          // Hermetic dataset registry: optimize PINS recovered dev samples
+          // into `<specName>-regressions` by default (item 9); with
+          // cwd=REPO_ROOT that would write the shared checkout's
+          // `.crewhaus/datasets/hello-regressions`, which every later
+          // `crewhaus eval` on the hello fixture then unions into ITS
+          // dataset (observed: eval.test.ts graded 3 samples out of a
+          // 2-sample dataset). Point the registry at this test's tmp dir.
+          CREWHAUS_DATASETS_DIR: join(tmp, "datasets"),
+        },
+      },
     );
     expect(result.exitCode).toBe(0);
     // Assert on the persisted report (robust artifact, not stdout).
@@ -2265,5 +2526,218 @@ triggers:
         rationale: patch.rationale,
       }),
     ).not.toThrow();
+  });
+});
+
+// ---- Loop contract 0.4 (Batch F) — the new CLI slice ----
+
+describe("crewhaus compile --emit-as cf-worker (item 6)", () => {
+  test("emits the Cloudflare-Worker bundle for a cli spec", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp, "--emit-as", "cf-worker"]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(tmp, "worker.js"))).toBe(true);
+    expect(existsSync(join(tmp, "wrangler.toml"))).toBe(true);
+    // The default local bundle's agent.ts is NOT produced.
+    expect(existsSync(join(tmp, "agent.ts"))).toBe(false);
+    expect(result.stdout).toContain("compiled cf-worker bundle");
+  });
+
+  test("rejects an unsupported target with a clear message", async () => {
+    const result = await runCli(["compile", CHANNEL_SPEC, "-o", tmp, "--emit-as", "cf-worker"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("cf-worker emit supports target=cli|workflow|graph");
+    expect(result.stderr).toContain("got channel");
+  });
+
+  test("rejects an unknown --emit-as value", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp, "--emit-as", "wasm"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('--emit-as must be "local" or "cf-worker"');
+  });
+
+  test("--emit-as cf-worker cannot combine with --check", async () => {
+    const result = await runCli([
+      "compile",
+      HELLO_SPEC,
+      "-o",
+      tmp,
+      "--emit-as",
+      "cf-worker",
+      "--check",
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("cannot combine with --check");
+  });
+
+  test("--emit-as local is the default bundle (byte path unchanged)", async () => {
+    const result = await runCli([
+      "compile",
+      HELLO_SPEC,
+      "-o",
+      tmp,
+      "--emit-as",
+      "local",
+      "--no-register",
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
+    expect(existsSync(join(tmp, "worker.js"))).toBe(false);
+  });
+});
+
+describe("crewhaus deploy <fly|render|railway|heroku> (item 5)", () => {
+  test("scaffolds Fly manifests for a daemon shape (no token → scaffold only)", async () => {
+    const out = join(tmp, "fly");
+    const result = await runCli(["deploy", "fly", CHANNEL_SPEC, "-o", out]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(out, "fly.toml"))).toBe(true);
+    expect(existsSync(join(out, "Dockerfile.fly"))).toBe(true);
+    expect(result.stdout).toContain("set FLY_API_TOKEN and re-run with --live");
+  });
+
+  test("scaffolds Heroku manifests (heroku.yml + app.json + Dockerfile)", async () => {
+    const out = join(tmp, "heroku");
+    const result = await runCli(["deploy", "heroku", CHANNEL_SPEC, "-o", out]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(out, "heroku.yml"))).toBe(true);
+    expect(existsSync(join(out, "app.json"))).toBe(true);
+    expect(existsSync(join(out, "Dockerfile.heroku"))).toBe(true);
+  });
+
+  test("rejects a non-daemon (cli) shape", async () => {
+    const result = await runCli(["deploy", "fly", HELLO_SPEC, "-o", join(tmp, "x")]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("not a deployable daemon shape");
+  });
+
+  test("--live without the provider token fails, naming the env var", async () => {
+    const result = await runCli(["deploy", "render", CHANNEL_SPEC, "-o", join(tmp, "r"), "--live"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("RENDER_API_KEY");
+    expect(result.stderr).toContain("--live");
+  });
+
+  test("an unknown deploy action is rejected", async () => {
+    const result = await runCli(["deploy", "gcp", CHANNEL_SPEC]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("deploy action must be one of");
+  });
+});
+
+describe("crewhaus runs resume (item 7)", () => {
+  test("rejects a malformed session id", async () => {
+    const result = await runCli(["runs", "resume", "not-a-session"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("expected sess_<16 hex>");
+  });
+
+  test("reports when no spec can be resolved", async () => {
+    const result = await runCli(["runs", "resume", "sess_0123456789abcdef"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("no --spec given and no crewhaus.yaml");
+  });
+
+  test("reports when the session is not found (spec resolves)", async () => {
+    writeFileSync(join(tmp, "crewhaus.yaml"), readFileSync(HELLO_SPEC, "utf-8"));
+    const result = await runCli(["runs", "resume", "sess_0123456789abcdef"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('no session "sess_0123456789abcdef"');
+  });
+
+  test("an unknown runs action is rejected", async () => {
+    const result = await runCli(["runs", "subscribe"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('runs action must be "resume"');
+  });
+
+  test("runs resume --help prints usage", async () => {
+    const result = await runCli(["runs", "resume", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Re-drives a persisted cli session");
+  });
+});
+
+describe("crewhaus sessions tail (item 2)", () => {
+  function seedSession(dir: string, id: string): void {
+    mkdirSync(dir, { recursive: true });
+    const lines = [
+      {
+        ts: Date.UTC(2026, 6, 17, 12, 0, 0),
+        version: 1,
+        kind: "user_message",
+        payload: { content: "hi there" },
+      },
+      {
+        ts: Date.UTC(2026, 6, 17, 12, 0, 1),
+        version: 1,
+        kind: "model_route",
+        payload: { model: "x" },
+      },
+      {
+        ts: Date.UTC(2026, 6, 17, 12, 0, 2),
+        version: 1,
+        kind: "assistant_message",
+        payload: { content: [{ type: "text", text: "hello back" }] },
+      },
+    ];
+    writeFileSync(join(dir, `${id}.jsonl`), `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
+  }
+
+  test("--no-follow dumps a session transcript (skipping side-channel events)", async () => {
+    const dir = join(tmp, ".crewhaus", "sessions");
+    seedSession(dir, "sess_00000000000000aa");
+    const result = await runCli(["sessions", "tail", "sess_00000000000000aa", "--no-follow"], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("user> hi there");
+    expect(result.stdout).toContain("asst> hello back");
+    // The model_route side-channel event renders nothing.
+    expect(result.stdout).not.toContain("model_route");
+  });
+
+  test("with no id, tails the newest session", async () => {
+    const dir = join(tmp, ".crewhaus", "sessions");
+    seedSession(dir, "sess_00000000000000aa");
+    const result = await runCli(["sessions", "tail", "--no-follow"], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("user> hi there");
+  });
+
+  test("errors when the session store is absent", async () => {
+    const result = await runCli(["sessions", "tail", "--no-follow"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("no session store");
+  });
+
+  test("rejects a malformed session id", async () => {
+    const dir = join(tmp, ".crewhaus", "sessions");
+    seedSession(dir, "sess_00000000000000aa");
+    const result = await runCli(["sessions", "tail", "bogus", "--no-follow"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("expected sess_<16 hex>");
+  });
+});
+
+describe("crewhaus dev (item 2)", () => {
+  test("--help prints usage", async () => {
+    const result = await runCli(["dev", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("supervised");
+    expect(result.stdout).toContain("--once");
+  });
+
+  test("fails fast on a missing spec", async () => {
+    const result = await runCli(["dev", join(tmp, "nope.yaml")]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("dev:");
+  });
+
+  test("fails fast on a broken spec (no child launched)", async () => {
+    const broken = join(tmp, "broken.yaml");
+    writeFileSync(broken, "name: x\ntarget: cli\nagent: [unclosed\n");
+    const result = await runCli(["dev", broken]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("dev:");
   });
 });

@@ -99,14 +99,14 @@ describe("emitBatchWorker", () => {
     expect(code).toContain("janitor session eviction disabled");
   });
 
-  test("non-in-memory adapter compiles, but boot throws (clean diagnostic)", () => {
-    const ir: IrBatchV0 = {
-      ...baseIr,
-      queue: { ...baseIr.queue, adapter: "sqs" },
-    };
-    const code = emitBatchWorker(ir).files[0]?.content ?? "";
-    expect(code).toContain('"in-memory"');
+  test("the in-memory buildQueue text is byte-stable (pre-continuity pin guard)", () => {
+    // The compiler's pre-continuity byte-restore fixtures pin the in-memory
+    // batch bundle EXACTLY — including this historical (now unreachable)
+    // throw arm. G06 must not disturb it.
+    const code = emitBatchWorker(baseIr).files[0]?.content ?? "";
+    expect(code).toContain('if (SPEC_QUEUE_ADAPTER === "in-memory") {');
     expect(code).toContain("not implemented in v0");
+    expect(code).not.toContain("requireQueueEnv");
   });
 
   test("rejects unknown spec-side tool names at compile time", () => {
@@ -132,6 +132,214 @@ describe("emitBatchWorker", () => {
   });
 });
 
+describe("emitBatchWorker — env-driven queue adapters (G06, Batch A)", () => {
+  const withAdapter = (adapter: IrBatchV0["queue"]["adapter"]): IrBatchV0 => ({
+    ...baseIr,
+    queue: { adapter, visibilityTimeoutMs: 30_000, maxRetries: 3 },
+  });
+
+  test("sqs: buildQueue resolves SQS_QUEUE_URL + region from env and fails fast when missing", () => {
+    const c = emitBatchWorker(withAdapter("sqs")).files[0]?.content ?? "";
+    expect(c).toContain(
+      'import { createSqsAdapter, type QueueAdapter } from "@crewhaus/queue-protocol";',
+    );
+    expect(c).toContain('requireQueueEnv("SQS_QUEUE_URL"');
+    expect(c).toContain('process.env["AWS_REGION"]');
+    expect(c).toContain('process.env["AWS_DEFAULT_REGION"]');
+    expect(c).toContain("createSqsAdapter<string>({");
+    // Credentials stay optional — the SDK's own chain is the fallback.
+    expect(c).toContain('process.env["AWS_ACCESS_KEY_ID"]');
+    expect(c).not.toContain('requireQueueEnv("AWS_ACCESS_KEY_ID"');
+    // The env gate names the adapter, the variable, and its shape.
+    expect(c).toContain(
+      "requires the ${name} environment variable (${hint}) — set it and restart the worker.",
+    );
+    // No in-memory plumbing leaks into an sqs bundle.
+    expect(c).not.toContain("createInMemoryQueue");
+    expect(c).not.toContain("SPEC_SEED_JOBS");
+    expect(c).not.toContain("not implemented in v0");
+  });
+
+  test("redis-streams: buildQueue gates on REDIS_URL and derives stream identifiers from the spec name (env-overridable)", () => {
+    const c = emitBatchWorker(withAdapter("redis-streams")).files[0]?.content ?? "";
+    expect(c).toContain(
+      'import { createRedisStreamsAdapter, type QueueAdapter } from "@crewhaus/queue-protocol";',
+    );
+    expect(c).toContain('requireQueueEnv("REDIS_URL"');
+    expect(c).toContain(
+      'streamKey: process.env["REDIS_STREAM_KEY"] ?? `crewhaus:${SPEC_NAME}:jobs`,',
+    );
+    expect(c).toContain(
+      'consumerGroup: process.env["REDIS_CONSUMER_GROUP"] ?? `crewhaus:${SPEC_NAME}:workers`,',
+    );
+    expect(c).toContain(
+      'consumerName: process.env["REDIS_CONSUMER_NAME"] ?? `worker-${process.pid}`,',
+    );
+    expect(c).not.toContain("createInMemoryQueue");
+  });
+
+  test("postgres: buildQueue gates on DATABASE_URL with env-overridable table names", () => {
+    const c = emitBatchWorker(withAdapter("postgres")).files[0]?.content ?? "";
+    expect(c).toContain(
+      'import { createPostgresAdapter, type QueueAdapter } from "@crewhaus/queue-protocol";',
+    );
+    expect(c).toContain('requireQueueEnv("DATABASE_URL"');
+    expect(c).toContain('tableName: process.env["CREWHAUS_JOBS_TABLE"] ?? "crewhaus_jobs",');
+    expect(c).toContain('process.env["CREWHAUS_JOBS_DLQ_TABLE"]');
+    expect(c).not.toContain("createInMemoryQueue");
+  });
+
+  test("non-in-memory workers run until signaled — no queue_idle fast-exit", () => {
+    const c = emitBatchWorker(withAdapter("sqs")).files[0]?.content ?? "";
+    expect(c).not.toContain('"queue_idle"');
+    expect(c).toContain("const keepAliveMs = 200;");
+    // Only the signal path stops the janitor now.
+    expect(c.split("janitor.stop();").length - 1).toBe(1);
+  });
+
+  test("the in-memory queue_idle fast-exit is untouched (byte-identity guard)", () => {
+    const c = emitBatchWorker(baseIr).files[0]?.content ?? "";
+    expect(c).toContain('"queue_idle"');
+    expect(c).not.toContain("keepAliveMs");
+  });
+});
+
+describe("emitBatchWorker — mcp_servers wiring (G05, Batch A)", () => {
+  const irMcp: IrBatchV0 = {
+    ...baseIr,
+    mcp_servers: {
+      fs: { transport: "stdio", command: "npx", args: ["-y", "fs-server"] },
+    },
+  };
+
+  test("boots the McpHost ONCE before the consumer and registers onto defaultCatalog (wire-once)", () => {
+    const c = emitBatchWorker(irMcp).files[0]?.content ?? "";
+    expect(c).toContain('import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";');
+    expect(c).toContain('import { registerMcpServer } from "@crewhaus/tool-mcp";');
+    expect(c).toContain("new McpHost();");
+    expect(c).toContain('mcpHost.addServer("fs"');
+    expect(c).toContain('registerMcpServer(mcpHost, "fs", defaultCatalog');
+    // Wired before the queue/consumer boot so the first pulled job already
+    // sees the namespaced tools on defaultCatalog.
+    expect(c.indexOf("new McpHost();")).toBeLessThan(c.indexOf("const queue = buildQueue();"));
+    expect(c.indexOf("new McpHost();")).toBeLessThan(c.indexOf("const consumer = startConsumer"));
+  });
+
+  test("secret-ref env values are embedded UNRESOLVED and resolved at boot", () => {
+    const ir: IrBatchV0 = {
+      ...baseIr,
+      mcp_servers: {
+        api: {
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "api-server"],
+          env: { API_KEY: { kind: "env", name: "API_KEY" } },
+        },
+      },
+    };
+    const c = emitBatchWorker(ir).files[0]?.content ?? "";
+    expect(c).toContain('resolveMcpServerConfig({"transport":"stdio"');
+    expect(c).toContain('{"kind":"env","name":"API_KEY"}');
+  });
+
+  test("disconnects on BOTH exit paths: signal shutdown and queue_idle", () => {
+    const c = emitBatchWorker(irMcp).files[0]?.content ?? "";
+    expect(c.split("await mcpHost.disconnectAll();").length - 1).toBe(2);
+  });
+
+  test("empty mcp_servers emits zero MCP plumbing (byte-identity guard)", () => {
+    const c = emitBatchWorker(baseIr).files[0]?.content ?? "";
+    expect(c).not.toContain("McpHost");
+    expect(c).not.toContain("registerMcpServer");
+  });
+});
+
+describe("emitBatchWorker — loop contract 0.4 threading (Batch A)", () => {
+  test("agent.max_tokens replaces the 1024 default in the per-job runChatLoop", () => {
+    const ir: IrBatchV0 = { ...baseIr, agent: { ...baseIr.agent, maxTokens: 7000 } };
+    const c = emitBatchWorker(ir).files[0]?.content ?? "";
+    expect(c).toContain("maxTokens: 7000,");
+    expect(c).not.toContain("maxTokens: 1024,");
+  });
+
+  test("an omitted max_tokens keeps the shape's 1024 default (byte-identity guard)", () => {
+    const c = emitBatchWorker(baseIr).files[0]?.content ?? "";
+    expect(c).toContain("maxTokens: 1024,");
+  });
+
+  test("budget threads into the per-job loop (item 27 — per-job ceiling)", () => {
+    const ir: IrBatchV0 = {
+      ...baseIr,
+      budget: { usdMicros: 5_000_000, onExceed: { kind: "degrade", model: "cheap-model" } },
+    };
+    const c = emitBatchWorker(ir).files[0]?.content ?? "";
+    expect(c).toContain(
+      'budget: {"usdMicros":5000000,"onExceed":{"kind":"degrade","model":"cheap-model"}},',
+    );
+  });
+
+  test("every declared limits knob threads as its runtime option", () => {
+    const ir: IrBatchV0 = {
+      ...baseIr,
+      limits: {
+        maxToolIterations: 12,
+        maxConcurrentTools: 2,
+        contextLimit: 100_000,
+        deadlineMs: 25_000,
+        turnTimeoutMs: 20_000,
+        modelCallTimeoutMs: 15_000,
+        loopDetection: { window: 4, threshold: 2, escalation: "warn" },
+      },
+    };
+    const c = emitBatchWorker(ir).files[0]?.content ?? "";
+    expect(c).toContain("maxToolIterations: 12,");
+    expect(c).toContain("maxConcurrentTools: 2,");
+    expect(c).toContain("contextLimit: 100000,");
+    expect(c).toContain("deadlineMs: 25000,");
+    expect(c).toContain("turnTimeoutMs: 20000,");
+    expect(c).toContain("modelCallTimeoutMs: 15000,");
+    expect(c).toContain('loopDetection: {"window":4,"threshold":2,"escalation":"warn"},');
+  });
+
+  test("partial limits emits only the declared knobs (runtime owns the defaults)", () => {
+    const ir: IrBatchV0 = { ...baseIr, limits: { maxConcurrentTools: 2 } };
+    const c = emitBatchWorker(ir).files[0]?.content ?? "";
+    expect(c).toContain("maxConcurrentTools: 2,");
+    expect(c).not.toContain("maxToolIterations:");
+    expect(c).not.toContain("loopDetection:");
+  });
+
+  test("no limits block → zero limits codegen (byte-identity guard)", () => {
+    const c = emitBatchWorker(baseIr).files[0]?.content ?? "";
+    expect(c).not.toContain("maxToolIterations:");
+    expect(c).not.toContain("deadlineMs:");
+  });
+
+  test("spec hooks land as a SPEC_HOOKS const threaded into the per-job loop", () => {
+    const ir: IrBatchV0 = {
+      ...baseIr,
+      hooks: [
+        { event: "pre-tool", matcher: "Bash", command: "guard.sh", timeoutMs: 3000 },
+        { event: "stop", command: "notify.sh" },
+      ],
+    };
+    const c = emitBatchWorker(ir).files[0]?.content ?? "";
+    expect(c).toContain('import type { HookDef } from "@crewhaus/hooks-engine";');
+    expect(c).toContain("const SPEC_HOOKS: ReadonlyArray<HookDef> = ");
+    // Declaration order preserved — hooks run in registration order.
+    expect(c).toContain(
+      '[{"event":"pre-tool","matcher":"Bash","command":"guard.sh","timeoutMs":3000},{"event":"stop","command":"notify.sh"}]',
+    );
+    expect(c).toContain("hooks: SPEC_HOOKS,");
+  });
+
+  test("absent/empty hooks emit nothing (byte-identity guard)", () => {
+    expect(emitBatchWorker(baseIr).files[0]?.content ?? "").not.toContain("SPEC_HOOKS");
+    const empty: IrBatchV0 = { ...baseIr, hooks: [] };
+    expect(emitBatchWorker(empty).files[0]?.content ?? "").not.toContain("SPEC_HOOKS");
+  });
+});
+
 describe("emitBatchWorker — failureTaxonomy field (item 23)", () => {
   test("threads failureTaxonomy into the per-job runChatLoop call", () => {
     const ir: IrBatchV0 = {
@@ -151,5 +359,70 @@ describe("emitBatchWorker — failureTaxonomy field (item 23)", () => {
     expect(emitBatchWorker(baseIr).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
     const empty: IrBatchV0 = { ...baseIr, failureTaxonomy: [] };
     expect(emitBatchWorker(empty).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
+  });
+});
+
+describe("emitBatchWorker — schedule: wake loop (Batch F, temporal contract)", () => {
+  const withInterval: IrBatchV0 = {
+    ...baseIr,
+    schedule: { kind: "interval", everyMs: 3_600_000, instructions: "Reconcile ledgers." },
+  };
+  const withCron: IrBatchV0 = {
+    ...baseIr,
+    schedule: { kind: "cron", cron: "*/15 * * * *", jitterMs: 500 },
+  };
+
+  test("no schedule → agent.ts stays byte-identical (no schedule plumbing)", () => {
+    const code = emitBatchWorker(baseIr).files[0]?.content ?? "";
+    expect(code).not.toContain("armSchedule");
+    expect(code).not.toContain("@crewhaus/durable-execution");
+    expect(code).not.toContain("scheduled_wake");
+    // unscheduled in-memory worker keeps the idle fast-exit path.
+    expect(code).toContain("queue_idle");
+  });
+
+  test("interval schedule arms armSchedule and enqueues the wake prompt as a job", () => {
+    const code = emitBatchWorker(withInterval).files[0]?.content ?? "";
+    expect(code).toContain('import { armSchedule } from "@crewhaus/durable-execution";');
+    expect(code).toContain('armSchedule({"kind":"interval","everyMs":3600000}');
+    expect(code).toContain("const jobId = await queue.enqueue(__scheduleInstructions);");
+    expect(code).toContain('emit({ kind: "scheduled_wake", tick: __scheduleTick, jobId });');
+    expect(code).toContain("Reconcile ledgers.");
+    expect(code).toContain("__schedule.cancel();");
+  });
+
+  test("a scheduled in-memory worker drops the idle fast-exit for the keep-alive loop", () => {
+    const code = emitBatchWorker(withInterval).files[0]?.content ?? "";
+    // No queue_idle fast-exit — the scheduler is a long-running cron daemon.
+    expect(code).not.toContain('emit({ kind: "queue_idle"');
+    expect(code).toContain("const keepAliveMs = 200;");
+  });
+
+  test("cron schedule carries the verbatim cron + jitter (no instructions in the literal)", () => {
+    const code = emitBatchWorker(withCron).files[0]?.content ?? "";
+    expect(code).toContain('armSchedule({"kind":"cron","cron":"*/15 * * * *","jitterMs":500}');
+    expect(code).toContain('"[scheduled wake]"'); // default prompt when instructions absent
+    expect(code).toContain('kind: "schedule_armed"');
+  });
+
+  test("cancel runs before drain in the shutdown path", () => {
+    const code = emitBatchWorker(withInterval).files[0]?.content ?? "";
+    const shutdownIdx = code.indexOf("const shutdown = async");
+    const cancelIdx = code.indexOf("__schedule.cancel();", shutdownIdx);
+    const drainIdx = code.indexOf("await consumer.drain();", shutdownIdx);
+    expect(cancelIdx).toBeGreaterThan(shutdownIdx);
+    expect(cancelIdx).toBeLessThan(drainIdx);
+  });
+});
+
+describe("emitBatchWorker — emitted scheduled bundle is syntactically valid TS", () => {
+  test("Bun.Transpiler parses the scheduled agent.ts", () => {
+    const t = new Bun.Transpiler({ loader: "ts" });
+    const ir: IrBatchV0 = {
+      ...baseIr,
+      schedule: { kind: "interval", everyMs: 3_600_000, instructions: "tick" },
+    };
+    const code = emitBatchWorker(ir, { readme: false }).files[0]?.content ?? "";
+    expect(() => t.transformSync(code)).not.toThrow();
   });
 });

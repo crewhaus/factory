@@ -9,6 +9,7 @@ import type { IrNode, IrV0 } from "@crewhaus/ir";
 import {
   DEFAULT_PIPELINE,
   IrPassError,
+  VALIDATING_PASSES,
   applyPasses,
   deadToolElimination,
   memoryIntegrityPass,
@@ -16,6 +17,7 @@ import {
   promptCachePrefixSort,
   redundantMcpServerCollapse,
   transactionPolicyEnforcement,
+  wellFormednessCheck,
 } from "./index";
 
 function makeCli(overrides: Partial<IrV0> = {}): IrV0 {
@@ -332,6 +334,26 @@ describe("ir-passes — applyPasses + idempotence (T9)", () => {
 
   test("DEFAULT_PIPELINE has 7 passes (+ memoryIntegrityPass from v0.3.0 PR 11)", () => {
     expect(DEFAULT_PIPELINE.length).toBe(7);
+  });
+
+  // G45 (loop contract 0.4) — the validating/rewriting split. The compiler
+  // runs VALIDATING_PASSES unconditionally inside compile(); this pin keeps
+  // the exported marker honest: exactly the three validation-only passes,
+  // in the DEFAULT_PIPELINE's relative order, embedded contiguously so the
+  // full pipeline and the standalone validating run cannot disagree.
+  test("VALIDATING_PASSES is the ordered validation-only subset of DEFAULT_PIPELINE", () => {
+    expect(VALIDATING_PASSES).toEqual([
+      transactionPolicyEnforcement,
+      wellFormednessCheck,
+      memoryIntegrityPass,
+    ]);
+    const start = DEFAULT_PIPELINE.indexOf(
+      VALIDATING_PASSES[0] as (typeof DEFAULT_PIPELINE)[number],
+    );
+    expect(start).toBeGreaterThan(-1);
+    expect(DEFAULT_PIPELINE.slice(start, start + VALIDATING_PASSES.length)).toEqual([
+      ...VALIDATING_PASSES,
+    ]);
   });
 });
 

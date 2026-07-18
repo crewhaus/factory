@@ -16,7 +16,11 @@
     "@crewhaus/sandbox": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*",
     "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@crewhaus/run-context": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

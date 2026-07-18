@@ -122,3 +122,157 @@ describe("crewhaus sessions summarize (#57)", () => {
     expect(existsSync(join(root, ".crewhaus", "sessions-index", `${S}.json`))).toBe(false);
   });
 });
+
+// Loop contract 0.4 (Batch B, G53) — `sessions export --format trajectories`.
+describe("crewhaus sessions export --format trajectories (G53)", () => {
+  /** A session with a full tool round, a rating, and (optionally) a sibling
+   *  trace-events file carrying the eval_graded reward signal. */
+  function writeTrajectorySession(
+    root: string,
+    id: string,
+    opts: { thumbs?: "up" | "down"; evalGradedScore?: number } = {},
+  ): void {
+    const sessionsDir = join(root, ".crewhaus", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    const events: unknown[] = [
+      { kind: "user_message", payload: { content: "list the files" } },
+      {
+        kind: "assistant_message",
+        payload: {
+          content: [
+            { type: "text", text: "Let me look." },
+            { type: "tool_use", id: "tu_1", name: "bash", input: { command: "ls" } },
+          ],
+        },
+      },
+      { kind: "tool_use", payload: { id: "tu_1", name: "bash", input: { command: "ls" } } },
+      { kind: "tool_result", payload: { toolUseId: "tu_1", content: "a.txt", isError: false } },
+      { kind: "assistant_message", payload: { content: [{ type: "text", text: "One file." }] } },
+    ];
+    if (opts.thumbs !== undefined) {
+      events.push({
+        kind: "user_feedback",
+        payload: {
+          schemaVersion: 1,
+          id: "fb_1",
+          sessionId: id,
+          turnNumber: 1,
+          modality: "binary",
+          rating: { thumbs: opts.thumbs },
+          source: "cli",
+          ts: "2026-01-01T00:00:10.000Z",
+        },
+      });
+    }
+    writeFileSync(
+      join(sessionsDir, `${id}.jsonl`),
+      `${events.map((e) => JSON.stringify(e)).join("\n")}\n`,
+    );
+    if (opts.evalGradedScore !== undefined) {
+      writeFileSync(
+        join(sessionsDir, `${id}.events.jsonl`),
+        `${JSON.stringify({
+          kind: "eval_graded",
+          score: opts.evalGradedScore,
+          threshold: 0.7,
+          verdict: opts.evalGradedScore >= 0.7 ? "pass" : "fail",
+          graderType: "llm_judge",
+          retryIndex: 0,
+        })}\n`,
+      );
+    }
+  }
+
+  const A = "sess_00000000000000aa";
+  const B = "sess_00000000000000bb";
+
+  test("--out writes (state, action, observation, reward) JSONL with the reward ladder applied", async () => {
+    const root = newTempRoot();
+    // A: eval_graded (via sibling trace events) outranks the thumbs-down.
+    writeTrajectorySession(root, A, { thumbs: "down", evalGradedScore: 0.9 });
+    // B: rating only.
+    writeTrajectorySession(root, B, { thumbs: "up" });
+    const outFile = join(root, "trajectories.jsonl");
+    const result = await runCli(
+      ["sessions", "export", "--format", "trajectories", "--out", outFile],
+      root,
+    );
+    expect(result.exitCode).toBe(0);
+    const lines = readFileSync(outFile, "utf-8")
+      .split("\n")
+      .filter((l) => l !== "")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    // Two sessions × two assistant actions each.
+    expect(lines).toHaveLength(4);
+
+    const aSteps = lines.filter((l) => l["sessionId"] === A);
+    const bSteps = lines.filter((l) => l["sessionId"] === B);
+    expect(aSteps).toHaveLength(2);
+    expect(bSteps).toHaveLength(2);
+
+    // Tuple shape: step 0 acts on the user prompt, observes the tool result.
+    const a0 = aSteps[0] as {
+      step: number;
+      state: Array<Record<string, unknown>>;
+      action: { text?: string; toolCalls?: Array<{ tool: string }> };
+      observation: { results: Array<{ tool?: string; text: string; isError: boolean }> };
+      reward: number | null;
+    };
+    expect(a0.step).toBe(0);
+    expect(a0.state).toEqual([{ role: "user", text: "list the files" }]);
+    expect(a0.action.toolCalls?.[0]?.tool).toBe("bash");
+    expect(a0.observation.results[0]).toEqual({ tool: "bash", text: "a.txt", isError: false });
+    expect(a0.reward).toBeNull();
+
+    // Terminal rewards: eval_graded beats the rating on A; rating rung on B.
+    const aLast = aSteps[1] as Record<string, unknown>;
+    expect(aLast["reward"]).toBe(0.9);
+    expect(aLast["rewardSource"]).toBe("eval_graded");
+    const bLast = bSteps[1] as Record<string, unknown>;
+    expect(bLast["reward"]).toBe(1); // thumbs up → 1 (distill convention)
+    expect(bLast["rewardSource"]).toBe("user_rating");
+  });
+
+  test("a session with no reward signal exports reward: null on its terminal step", async () => {
+    const root = newTempRoot();
+    writeTrajectorySession(root, A);
+    const outFile = join(root, "t.jsonl");
+    const result = await runCli(
+      ["sessions", "export", "--format", "trajectories", "--out", outFile],
+      root,
+    );
+    expect(result.exitCode).toBe(0);
+    const lines = readFileSync(outFile, "utf-8")
+      .split("\n")
+      .filter((l) => l !== "")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(lines).toHaveLength(2);
+    expect(lines[1]?.["reward"]).toBeNull();
+    expect("rewardSource" in (lines[1] as object)).toBe(false);
+  });
+
+  test("rejects an unsupported --format and a missing one", async () => {
+    const root = newTempRoot();
+    writeTrajectorySession(root, A);
+    expect((await runCli(["sessions", "export", "--format", "parquet"], root)).exitCode).toBe(1);
+    expect((await runCli(["sessions", "export"], root)).exitCode).toBe(1);
+  });
+
+  test("fails loudly when there are no sessions to export", async () => {
+    const root = newTempRoot();
+    const result = await runCli(["sessions", "export", "--format", "trajectories"], root);
+    expect(result.exitCode).toBe(1);
+  });
+
+  test("unknown sessions action names both supported ones", async () => {
+    const root = newTempRoot();
+    const result = await runCli(["sessions", "purge"], root);
+    expect(result.exitCode).toBe(1);
+  });
+
+  test("sessions --help exits 0 (documents the G53 posture)", async () => {
+    const root = newTempRoot();
+    const result = await runCli(["sessions", "--help"], root);
+    expect(result.exitCode).toBe(0);
+  });
+});

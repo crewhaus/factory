@@ -9,6 +9,7 @@ import { type Tenant, buildTenant } from "@crewhaus/tenancy";
 import {
   GatewayServerError,
   PROTOCOL_VERSION,
+  type RunEventSource,
   createGatewayServer,
   signJwt,
   statusFor,
@@ -728,6 +729,397 @@ describe("statusFor — exhaustive wire code → HTTP status map", () => {
     // Unknown / empty codes fall through to the 200 default.
     expect(statusFor("totally_unknown_code")).toBe(200);
     expect(statusFor("")).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runs.subscribe — SSE streaming (contract item 3).
+// ---------------------------------------------------------------------------
+
+/**
+ * A scripted trace bus: a minimal `RunEventSource` whose `open` mirrors the
+ * daemon's real seam (snapshot the buffer, then attach the live listener with
+ * no gap). Tests script events onto it via `publish` and assert the SSE writer
+ * replays the buffer then live-streams the rest; `subscriberCount` proves the
+ * listener is detached on disconnect.
+ */
+function scriptedBus(): {
+  publish: (event: unknown) => void;
+  subscriberCount: () => number;
+  source: RunEventSource;
+} {
+  const buffered: unknown[] = [];
+  const listeners = new Set<(event: unknown) => void>();
+  return {
+    publish(event: unknown): void {
+      buffered.push(event);
+      for (const l of listeners) l(event);
+    },
+    subscriberCount: () => listeners.size,
+    source: {
+      open(listener: (event: unknown) => void) {
+        const replay = [...buffered]; // snapshot…
+        listeners.add(listener); // …then subscribe, synchronously (no gap).
+        return { replay, close: (): void => void listeners.delete(listener) };
+      },
+    },
+  };
+}
+
+type SseState = { comments: string[]; data: string[] };
+
+/**
+ * A STATEFUL SSE body reader: `until()` keeps accumulating comments/data across
+ * successive calls on the same underlying reader (so "replay then a later live
+ * event" is expressed as two cumulative `until` calls), and `cancel()` releases
+ * the stream (client disconnect).
+ */
+function sseReader(res: Response): {
+  until: (p: (s: SseState) => boolean, timeoutMs?: number) => Promise<SseState>;
+  cancel: () => Promise<void>;
+} {
+  const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  const comments: string[] = [];
+  const data: string[] = [];
+  const drain = (): void => {
+    let i: number;
+    // biome-ignore lint/suspicious/noAssignInExpressions: frame-splitting loop
+    while ((i = buf.indexOf("\n\n")) !== -1) {
+      const frame = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      if (frame.startsWith("data:")) data.push(frame.slice(5).trim());
+      else if (frame.startsWith(":")) comments.push(frame.slice(1).trim());
+    }
+  };
+  return {
+    async until(predicate, timeoutMs = 2000): Promise<SseState> {
+      const start = Date.now();
+      for (;;) {
+        drain();
+        if (predicate({ comments, data })) return { comments, data };
+        const remaining = timeoutMs - (Date.now() - start);
+        if (remaining <= 0) throw new Error(`sse timeout: data=${JSON.stringify(data)}`);
+        let r: ReadableStreamReadResult<Uint8Array>;
+        try {
+          r = await Promise.race([
+            reader.read(),
+            new Promise<never>((_, rej) => {
+              const t = setTimeout(() => rej(new Error("sse-timeout")), remaining);
+              (t as { unref?: () => void }).unref?.();
+            }),
+          ]);
+        } catch {
+          throw new Error(`sse timeout: data=${JSON.stringify(data)}`);
+        }
+        if (r.done) {
+          drain();
+          if (predicate({ comments, data })) return { comments, data };
+          throw new Error(`sse stream ended early: data=${JSON.stringify(data)}`);
+        }
+        buf += decoder.decode(r.value, { stream: true });
+      }
+    },
+    async cancel(): Promise<void> {
+      await reader.cancel();
+    },
+  };
+}
+
+const subscribeBody = (runId: string) => ({
+  protocol: PROTOCOL_VERSION,
+  id: "sub-1",
+  method: "runs.subscribe",
+  params: { runId },
+});
+
+describe("runs.subscribe — SSE stream (contract item 3)", () => {
+  function subServer(
+    resolveRunEvents: Parameters<typeof createGatewayServer>[0]["resolveRunEvents"],
+    extra: Partial<Parameters<typeof createGatewayServer>[0]> = {},
+  ): ReturnType<typeof createGatewayServer> {
+    const tenantA = buildTenant("tenant-a", { tenantsRoot: tmp });
+    const tenantB = buildTenant("tenant-b", { tenantsRoot: tmp });
+    return createGatewayServer({
+      jwtSecret: SECRET,
+      tenantsRoot: tmp,
+      handler: async () => ({ ok: true }),
+      tenantOverrides: { "tenant-a": tenantA, "tenant-b": tenantB },
+      resolveRunEvents,
+      sseHeartbeatMs: 60_000, // no heartbeat interference unless a test wants it
+      ...extra,
+    });
+  }
+
+  test("replays the buffered events then live-streams new ones (scripted bus)", async () => {
+    const bus = scriptedBus();
+    bus.publish({ kind: "turn_start", turn: 1 });
+    bus.publish({ kind: "model_request", model: "m", messageCount: 1 });
+    const server = subServer(() => bus.source);
+    const res = await server.subscribe({
+      bearer: signJwt({ tenant_id: "tenant-a" }, SECRET),
+      body: subscribeBody("run_x"),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+    const r = sseReader(res);
+    try {
+      // Replay: the two buffered events arrive after the `: open` comment.
+      const replayed = await r.until((s) => s.data.length >= 2);
+      expect(replayed.comments).toContain("open");
+      expect(JSON.parse(replayed.data[0] ?? "{}")).toEqual({ kind: "turn_start", turn: 1 });
+      expect(JSON.parse(replayed.data[1] ?? "{}")).toMatchObject({ kind: "model_request" });
+      // Live: an event published AFTER the subscribe streams straight through.
+      bus.publish({ kind: "turn_end", turn: 1, durationMs: 5 });
+      const live = await r.until((s) => s.data.length >= 3);
+      expect(JSON.parse(live.data[2] ?? "{}")).toEqual({
+        kind: "turn_end",
+        turn: 1,
+        durationMs: 5,
+      });
+    } finally {
+      await r.cancel();
+    }
+  });
+
+  test("no event is dropped or duplicated across the replay→live boundary", async () => {
+    const bus = scriptedBus();
+    bus.publish({ n: 0 });
+    const server = subServer(() => bus.source);
+    const res = await server.subscribe({
+      bearer: signJwt({ tenant_id: "tenant-a" }, SECRET),
+      body: subscribeBody("run_x"),
+    });
+    const r = sseReader(res);
+    try {
+      bus.publish({ n: 1 });
+      bus.publish({ n: 2 });
+      const got = await r.until((s) => s.data.length >= 3);
+      expect(got.data.map((d) => (JSON.parse(d) as { n: number }).n)).toEqual([0, 1, 2]);
+    } finally {
+      await r.cancel();
+    }
+  });
+
+  test("client disconnect (signal abort) unsubscribes the listener and clears the stream", async () => {
+    const bus = scriptedBus();
+    const server = subServer(() => bus.source);
+    const ac = new AbortController();
+    const res = await server.subscribe({
+      bearer: signJwt({ tenant_id: "tenant-a" }, SECRET),
+      body: subscribeBody("run_x"),
+      signal: ac.signal,
+    });
+    // The stream's start() ran during construction → the listener is attached.
+    expect(bus.subscriberCount()).toBe(1);
+    ac.abort(); // client vanished
+    expect(bus.subscriberCount()).toBe(0); // teardown detached it synchronously
+    // Draining the (now closing) body must not throw.
+    await (res.body as ReadableStream<Uint8Array>).getReader().cancel();
+  });
+
+  test("reader.cancel() also tears the subscription down", async () => {
+    const bus = scriptedBus();
+    const server = subServer(() => bus.source);
+    const res = await server.subscribe({
+      bearer: signJwt({ tenant_id: "tenant-a" }, SECRET),
+      body: subscribeBody("run_x"),
+    });
+    expect(bus.subscriberCount()).toBe(1);
+    await (res.body as ReadableStream<Uint8Array>).getReader().cancel();
+    expect(bus.subscriberCount()).toBe(0);
+  });
+
+  test("emits heartbeat comment frames on the configured cadence", async () => {
+    const bus = scriptedBus();
+    const server = subServer(() => bus.source, { sseHeartbeatMs: 25 });
+    const res = await server.subscribe({
+      bearer: signJwt({ tenant_id: "tenant-a" }, SECRET),
+      body: subscribeBody("run_x"),
+    });
+    const r = sseReader(res);
+    try {
+      const got = await r.until((s) => s.comments.includes("heartbeat"), 2000);
+      expect(got.comments).toContain("heartbeat");
+    } finally {
+      await r.cancel();
+    }
+  });
+
+  test("missing bearer → 401 JSON error (no stream)", async () => {
+    const bus = scriptedBus();
+    const server = subServer(() => bus.source);
+    const res = await server.subscribe({ body: subscribeBody("run_x") });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    expect(await res.json()).toMatchObject({ error: { code: "unauthorized" } });
+    expect(bus.subscriberCount()).toBe(0); // never opened a subscription
+  });
+
+  test("expired token → 401 JSON error", async () => {
+    const bus = scriptedBus();
+    const server = subServer(() => bus.source);
+    const exp = Math.floor((Date.now() - 60_000) / 1000);
+    const res = await server.subscribe({
+      bearer: signJwt({ tenant_id: "tenant-a", exp }, SECRET),
+      body: subscribeBody("run_x"),
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({
+      error: { code: "unauthorized", message: expect.stringMatching(/expired/) },
+    });
+  });
+
+  test("invalid subscribe params (empty runId) → 400 JSON error", async () => {
+    const bus = scriptedBus();
+    const server = subServer(() => bus.source);
+    const res = await server.subscribe({
+      bearer: signJwt({ tenant_id: "tenant-a" }, SECRET),
+      body: {
+        protocol: PROTOCOL_VERSION,
+        id: "sub-1",
+        method: "runs.subscribe",
+        params: { runId: "" },
+      },
+    });
+    expect(res.status).toBe(400);
+    // The envelope id is unrecoverable when decode itself fails (matches the
+    // JSON request/reply path) → it stays "?".
+    expect(await res.json()).toMatchObject({
+      id: "?",
+      error: {
+        code: "bad_request",
+        message: expect.stringMatching(/invalid params for runs.subscribe/),
+      },
+    });
+  });
+
+  test("server with no resolver → 404 (streaming unsupported)", async () => {
+    const tenantA = buildTenant("tenant-a", { tenantsRoot: tmp });
+    const server = createGatewayServer({
+      jwtSecret: SECRET,
+      tenantsRoot: tmp,
+      handler: async () => ({ ok: true }),
+      tenantOverrides: { "tenant-a": tenantA },
+    });
+    const res = await server.subscribe({
+      bearer: signJwt({ tenant_id: "tenant-a" }, SECRET),
+      body: subscribeBody("run_x"),
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ error: { code: "not_found" } });
+  });
+
+  test("unknown runId → 404 (resolver returns undefined)", async () => {
+    const server = subServer(() => undefined);
+    const res = await server.subscribe({
+      bearer: signJwt({ tenant_id: "tenant-a" }, SECRET),
+      body: subscribeBody("run_missing"),
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({
+      error: { code: "not_found", message: expect.stringMatching(/no such run: run_missing/) },
+    });
+  });
+
+  test("tenant fence: tenant-b cannot stream tenant-a's run (404), tenant-a can (200)", async () => {
+    const bus = scriptedBus();
+    // The resolver models the daemon's tenant-fenced registry: run_a belongs to
+    // tenant-a only.
+    const owners: Record<string, string> = { run_a: "tenant-a" };
+    const server = subServer(({ runId, tenant }) =>
+      owners[runId] === tenant.id ? bus.source : undefined,
+    );
+    const asB = await server.subscribe({
+      bearer: signJwt({ tenant_id: "tenant-b" }, SECRET),
+      body: subscribeBody("run_a"),
+    });
+    expect(asB.status).toBe(404); // cross-tenant is indistinguishable from unknown
+    const asA = await server.subscribe({
+      bearer: signJwt({ tenant_id: "tenant-a" }, SECRET),
+      body: subscribeBody("run_a"),
+    });
+    expect(asA.status).toBe(200);
+    await (asA.body as ReadableStream<Uint8Array>).getReader().cancel();
+  });
+
+  test("the subscribe request writes a best-effort audit row", async () => {
+    const bus = scriptedBus();
+    const tenantA = buildTenant("tenant-a", { tenantsRoot: tmp });
+    const server = createGatewayServer({
+      jwtSecret: SECRET,
+      tenantsRoot: tmp,
+      handler: async () => ({ ok: true }),
+      tenantOverrides: { "tenant-a": tenantA },
+      resolveRunEvents: () => bus.source,
+      sseHeartbeatMs: 60_000,
+    });
+    const res = await server.subscribe({
+      bearer: signJwt({ tenant_id: "tenant-a", sub: "user-9" }, SECRET),
+      body: subscribeBody("run_audited"),
+    });
+    await (res.body as ReadableStream<Uint8Array>).getReader().cancel();
+    const log = await server.getAuditLog(tenantA);
+    const rows: Array<{ kind: string; payload: { method: string; runId: string; sub?: string } }> =
+      [];
+    for await (const r of log.read())
+      rows.push(r as { kind: string; payload: { method: string; runId: string; sub?: string } });
+    const sub = rows.find((r) => r.payload.method === "runs.subscribe");
+    expect(sub?.payload).toMatchObject({
+      method: "runs.subscribe",
+      runId: "run_audited",
+      sub: "user-9",
+    });
+  });
+
+  test("end-to-end over real HTTP: POST runs.subscribe streams text/event-stream", async () => {
+    const bus = scriptedBus();
+    bus.publish({ kind: "turn_start", turn: 1 });
+    const server = subServer(() => bus.source);
+    const { port, close } = await server.listen(0);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${signJwt({ tenant_id: "tenant-a" }, SECRET)}`,
+        },
+        body: JSON.stringify(subscribeBody("run_http")),
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("text/event-stream");
+      const r = sseReader(res);
+      try {
+        const replayed = await r.until((s) => s.data.length >= 1);
+        expect(JSON.parse(replayed.data[0] ?? "{}")).toEqual({ kind: "turn_start", turn: 1 });
+        bus.publish({ kind: "turn_end", turn: 1, durationMs: 3 });
+        const live = await r.until((s) => s.data.length >= 2);
+        expect(JSON.parse(live.data[1] ?? "{}")).toMatchObject({ kind: "turn_end" });
+      } finally {
+        await r.cancel();
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  test("real HTTP: a runs.subscribe with a bad token returns 401 (not a stream)", async () => {
+    const bus = scriptedBus();
+    const server = subServer(() => bus.source);
+    const { port, close } = await server.listen(0);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" }, // no Authorization
+        body: JSON.stringify(subscribeBody("run_http")),
+      });
+      expect(res.status).toBe(401);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await res.json()).toMatchObject({ error: { code: "unauthorized" } });
+    } finally {
+      await close();
+    }
   });
 });
 

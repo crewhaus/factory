@@ -14,8 +14,8 @@ export type ReportDiff = {
 
 export type DiffEntry = {
   readonly sampleId: string;
-  readonly prev: { passed: boolean; score: number; rationale: string };
-  readonly next: { passed: boolean; score: number; rationale: string };
+  readonly prev: { passed: boolean; score: number; rationale: string; passRate?: number };
+  readonly next: { passed: boolean; score: number; rationale: string; passRate?: number };
 };
 
 const SCORE_EPSILON = 0.1;
@@ -23,6 +23,11 @@ const SCORE_EPSILON = 0.1;
 /**
  * Compare two eval runs by `sampleId`. Throws if the keysets don't match
  * (no silent alignment by index — that would mask schema drift).
+ *
+ * G15 — flips compare per-sample pass-RATES when either run carried repeat
+ * trials (`SampleResult.trialPassRate`), mirroring regression-runner: a
+ * 4/4 → 1/4 reliability drop is a regression even though the canonical
+ * verdict still passes. Single-trial runs reduce to the boolean semantics.
  */
 export function diffReports(
   prev: LoadedRun,
@@ -50,21 +55,26 @@ export function diffReports(
   for (const sampleId of prevKeys) {
     const p = prevById.get(sampleId) as SampleResult;
     const n = nextById.get(sampleId) as SampleResult;
+    const hasTrialData = p.trialPassRate !== undefined || n.trialPassRate !== undefined;
+    const prevRate = p.trialPassRate ?? (p.grades.overall.passed ? 1 : 0);
+    const nextRate = n.trialPassRate ?? (n.grades.overall.passed ? 1 : 0);
     const entry: DiffEntry = {
       sampleId,
       prev: {
         passed: p.grades.overall.passed,
         score: p.grades.overall.score,
         rationale: p.grades.overall.rationale,
+        ...(hasTrialData ? { passRate: prevRate } : {}),
       },
       next: {
         passed: n.grades.overall.passed,
         score: n.grades.overall.score,
         rationale: n.grades.overall.rationale,
+        ...(hasTrialData ? { passRate: nextRate } : {}),
       },
     };
-    if (p.grades.overall.passed && !n.grades.overall.passed) regressions.push(entry);
-    else if (!p.grades.overall.passed && n.grades.overall.passed) recoveries.push(entry);
+    if (nextRate < prevRate) regressions.push(entry);
+    else if (nextRate > prevRate) recoveries.push(entry);
     else if (Math.abs(n.grades.overall.score - p.grades.overall.score) > SCORE_EPSILON)
       scoreShifts.push(entry);
     else unchanged += 1;

@@ -2,17 +2,20 @@
 import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
+import { Writable } from "node:stream";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 // Type-only — the concrete factories are dynamically imported inside the
 // deploy/propose handlers (lazy boot); the approval gate helper needs the
@@ -36,6 +39,11 @@ import {
   createFileBackedRegistry,
   latestVersion,
 } from "@crewhaus/dataset-registry";
+// Loop contract 0.4 (Batch A) — `memory.embedder`: the run path constructs
+// the fact-store embedder and hands it to wireMemory as `deps.embedder`,
+// which memory-service prefers over the fragment's `wiki.embedder` (the
+// documented fallback order `embedder` → `wiki.embedder`).
+import { createEmbedder } from "@crewhaus/embedder";
 import { CrewhausError, RunFailedError } from "@crewhaus/errors";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
 import { type CompiledGrader, type GradersConfig, parseGradersConfig } from "@crewhaus/eval-grader";
@@ -58,6 +66,7 @@ import {
 } from "@crewhaus/eval-report";
 import {
   type EvalRunSummary,
+  type GraderLookup,
   createExamRunner,
   runEval as runEvalLib,
 } from "@crewhaus/eval-runner";
@@ -67,11 +76,15 @@ import {
   ArgParseError,
   type ParseArgsSchema,
   type ParsedArgs,
+  assertNever,
   parseArgs,
 } from "@crewhaus/infra-utils";
-import { GENERATED_README_MARKER, type IrBudget } from "@crewhaus/ir";
+import { GENERATED_README_MARKER, type IrBudget, projectLoop } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
+// Item 1 (G30) — the MCP-server projection runtime. `crewhaus serve --mcp`
+// builds `invoke` from the run interpreter's turn function and hands it here.
+import { type McpInvoke, type McpServerHandle, createMcpServer } from "@crewhaus/mcp-server";
 // PR 10 — the memory fabric's composition root: `crewhaus run` makes the
 // same one stable wireMemory call compiled bundles emit. PR 16 adds
 // connectThredz (the §4.3 backend flip's boot helper — bare-name MCP tool
@@ -84,6 +97,9 @@ import {
   wireMemory,
 } from "@crewhaus/memory-service";
 import { createMemoryStore } from "@crewhaus/memory-store";
+// Item 10 (G89) — the default public plugin registry (registry.crewhaus.ai)
+// `crewhaus plugins list/search` fall back to when no --registry / env is set.
+import { DEFAULT_MODULE_REGISTRY_URL } from "@crewhaus/module-marketplace-client";
 import {
   BUILTIN_DEFAULT_RULES,
   type JustificationJudge,
@@ -93,18 +109,33 @@ import {
   parsePermissionsConfig,
   tagRules,
 } from "@crewhaus/permission-engine";
+// Item 3 (G32) — plugin activation. `crewhaus run` activates the spec's
+// `plugins:` (and the `--plugins` override) in-process exactly like a compiled
+// bundle's boot (`renderPlugins` in @crewhaus/target-cli).
+import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";
 // Adaptive model routing — `crewhaus route status|reset` inspects/clears the
 // per-(routeKey, model) reward scoreboard behind `agent.model_pool`; advise
 // mines the same scoreboard into pool-policy suggestions.
 import { openScoreboard } from "@crewhaus/routing-store";
-import { runChatLoop } from "@crewhaus/runtime-core";
-import { createSessionStore, evictExpiredSessions } from "@crewhaus/session-store";
+import { type AgentIdentityFile, runChatLoop } from "@crewhaus/runtime-core";
+import {
+  type PendingApproval,
+  createPendingApprovalStore,
+  createSessionStore,
+  evictExpiredSessions,
+} from "@crewhaus/session-store";
 import { type SkillRef, createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { type SlashCommand, loadCommands } from "@crewhaus/slash-commands";
 import { type Spec, parseSpec } from "@crewhaus/spec";
 import { specHasPath } from "@crewhaus/spec-patch";
 import type { RegistryAdapter } from "@crewhaus/spec-registry";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
+// Item 4 (§59) — `crewhaus export claude-plugin` emits an Anthropic-compatible
+// plugin directory from any IR variant.
+import { TargetClaudePluginError, emitClaudePlugin } from "@crewhaus/target-claude-plugin";
+// Item 10 (G89) — the default public template registry (registry.crewhaus.ai)
+// `crewhaus templates list/search` fall back to when no --registry / env is set.
+import { DEFAULT_TEMPLATE_REGISTRY_URL } from "@crewhaus/template-marketplace-client";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
@@ -163,6 +194,9 @@ import {
   readApprovals,
   rollupConclusion,
 } from "./approval-gate";
+// Loop contract 0.4 (Batch C, G11) — the `crewhaus approvals` verbs' pure
+// rendering layer (the file-backed store wiring lives in the handler below).
+import { formatApprovalDetail, formatApprovalsTable } from "./approvals-cli";
 // Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
 // summary + doctor mapping), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -186,6 +220,10 @@ import {
   parseExitRatingKey,
   shouldPromptExitRating,
 } from "./autodistill";
+// Loop contract 0.4 (Batch F, item 6) — the cf-worker emit switch shared with
+// the compiler-worker's remote `POST /compile { emitAs: "cf-worker" }`, so
+// `crewhaus compile --emit-as cf-worker` emits the same Worker bundle locally.
+import { emitCfWorkerBundle } from "./cf-worker-emit";
 // Item 61 — `crewhaus channel provision|verify` core (adapter-derived Slack
 // manifest, Telegram setWebhook, Discord interactions-endpoint registration,
 // doctor-style scope/webhook probes), in a side-effect-free module so it is
@@ -222,6 +260,21 @@ import {
   buildEvalCiWorkflowYaml,
   buildSentinelDriftWorkflowYaml,
 } from "./ci-scaffold";
+// Loop contract 0.4 (Batch F, item 5) — the engine-free half of
+// `crewhaus deploy <fly|render|railway|heroku>` (provider registry, shape/token
+// gates, app-name + summary helpers). The handler dynamic-imports the matching
+// @crewhaus/cloud-adapter-* engine.
+import {
+  CLOUD_DEPLOY_PROVIDERS,
+  CLOUD_DEPLOY_TARGET_SHAPES,
+  type CloudDeployProviderName,
+  cloudDeployTokenPresent,
+  defaultCloudDeployBaseImage,
+  formatCloudDeployNextSteps,
+  isCloudDeployProvider,
+  isCloudDeployTargetShape,
+  resolveCloudDeployAppName,
+} from "./cloud-deploy";
 // Item 34 — scheduling ergonomics for `compliance evidence` (--period current
 // resolution + the empty-evidence gate), side-effect-free for the same reason.
 import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
@@ -276,6 +329,15 @@ import {
   makeCanaryEvalGate,
   parseTrafficSteps,
 } from "./deploy-canary";
+// Loop contract 0.4 (Batch F, item 2) — `crewhaus dev`: the supervised-child
+// state machine + trace-line scanner + entry-point map (unit-tested); the CLI
+// wraps them with real Bun.spawn + fs.watch below.
+import {
+  type DevChildHandle,
+  createDevSupervisor,
+  devEntrypointFor,
+  isDevDaemonTarget,
+} from "./dev";
 // Model-aware doctor credential checks (provider parsed from the cwd spec's
 // agent.model via the model-router grammar), in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
@@ -373,10 +435,27 @@ import {
   parseModelsFlag,
   runMatrixCells,
 } from "./eval-matrix";
+// Loop contract 0.4 (Batch B) — shared eval-loop CLI helpers: the G14
+// default-registry construction rule, the G56 partial-credit fitness figure
+// the optimize/flywheel search ranks by, and the `[eval]` stdout block
+// (partial_score / loop metrics / pass@k–pass^k / failure classes / judge
+// calibration notes), in a side-effect-free module so all of it is
+// unit-testable (this entry file runs an argv switch on import).
+import { evalRunOutputLines, fitnessScore, graderRegistryForCompiled } from "./eval-output";
 // Item 30 — model-drift sentinel comparison logic, in a side-effect-free
 // module so it is unit-testable (this entry file runs an argv switch on
 // import). The fresh run + baseline load happen in index.ts; this decides drift.
 import { evaluateSentinel } from "./eval-sentinel";
+// G63 — `crewhaus failures report`: cluster run_failed + incident records and
+// (optionally) draft failure_taxonomy entries. Pure transform (FS reads live
+// in the handler below).
+import {
+  type FailureRecord,
+  clusterFailures as clusterFailureRecords,
+  proposeTaxonomy,
+  renderFailuresTable,
+  renderTaxonomyYaml,
+} from "./failures";
 // Item #55 — distill recurring user questions into an auto-discovered FAQ skill.
 import { buildFaqSkill, distillFaq } from "./faq";
 // Response-feedback core — pure, side-effect-free so it is unit-testable
@@ -545,6 +624,11 @@ import {
   openSecurityAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
+// Loop contract 0.4 (Batch E, G22) — `knowledge:` RAG ingestion for the
+// interpreter path: load sources, chunk/embed/index, and register the shared
+// `Retrieve` tool. Side-effect-free module (embedder/fetch/glob seams injected)
+// so the ingest flow is unit-testable without a provider key or the network.
+import { ingestKnowledge } from "./knowledge-ingest";
 // Item 63 — cross-harness knowledge sync: shared memories / graders / prompt
 // fragments moved between a harness and a fleet-level store, dedupe-by-hash,
 // provenance-tagged, PII/token-redacted on push. Side-effect-free module so
@@ -606,6 +690,23 @@ import {
   renderLoadtestText,
   runLoadtest,
 } from "./loadtest";
+// Loop contract 0.4 (Batch A) — interpreter-side threading of the
+// loop-contract spec keys (limits / thinking / streaming / rate_limits /
+// spec hooks / compaction tuning) + the compile-warning formatter, in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import). Mirror: @crewhaus/target-cli codegen threads the
+// same fields into compiled bundles — keep the two in sync.
+import {
+  formatCompileWarning,
+  loopContractRunOptions,
+  mergeSpecHooks,
+  resolveStreaming,
+} from "./loop-contract";
+// Loop contract 0.4 (Batch B, G42) — the human-readable `compile
+// --emit-loop` rendering of `projectLoop`'s wire-contract projection, in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import).
+import { formatLoopProjection } from "./loop-view";
 // Item 60 — the marketplace CLI core: registry-source resolution, the
 // outdated freshness compare, list/outdated formatters, and the publish PR
 // plan, in a side-effect-free module so it is unit-testable (this entry file
@@ -707,6 +808,18 @@ import {
   findFalsePositives,
   renderPiiTuneLines,
 } from "./pii-tune";
+// Item 3 (G32) — `plugins:` activation resolution for `run`/`dev` + the
+// `--plugins` override. Pure name resolution (unit-testable); the real
+// `activatePlugins` / dev spec-override wiring is below in this entry file.
+import { parsePluginsFlag, resolvePluginNames } from "./plugin-activation";
+// Item 4 (§59) — `crewhaus export claude-plugin` helpers: author / out-dir
+// resolution + the post-emit smoke check (the emitted plugin.json / .mcp.json
+// parse). Pure; the disk write + `emitClaudePlugin` call live below.
+import {
+  resolveClaudePluginAuthor,
+  resolveExportOutDir,
+  smokeCheckClaudePluginBundle,
+} from "./plugin-export";
 // Item 59 — PR-based optimize/advise proposals. `crewhaus propose` packages a
 // spec change into a review artifact + opens a PR (never auto-merges), in a
 // side-effect-free module so it is unit-testable (this entry file runs an argv
@@ -781,6 +894,17 @@ import { runRoute } from "./route";
 // RunFailedError prints its structured report + coded exit while every
 // other fatal keeps the classic `crewhaus: <message>` one-liner + exit 1.
 import { CONTINUE_NOTE, renderCliFailure } from "./run-failure";
+// Loop contract 0.4 (Batch C, G26) — pure resolution of `run --trace` + the
+// cost-on-by-default env, applied by `applyRunObservabilityEnv` below.
+import {
+  TRACE_LEVELS,
+  isValidTraceLevel,
+  resolveCostEnv,
+  resolveTraceEnv,
+} from "./run-observability";
+// Loop contract 0.4 (Batch F, item 7, CLI half) — `crewhaus runs resume`
+// spec-resolution + session-id helpers (engine-free, unit-tested).
+import { RunsError, isRunsSessionId, resolveRunsResumeSpecPath } from "./runs";
 // Item 13 — `crewhaus scaffold-evals` + `init --with-evals`: day-one eval
 // assets generated from the spec (deterministic template / one-shot model
 // sample stubs + a single spec-goal llm_judge or floor grader), in a
@@ -855,8 +979,43 @@ import {
   renderSecurityDigestHtml,
   renderSecurityDigestText,
 } from "./security-digest";
+// Item 1 (G30) — `crewhaus serve --mcp` projection helpers: transport / tools-
+// mode / port / sub-agent-descriptor resolution + the target guard. Pure; the
+// runtime wiring (build `invoke` from the run interpreter, bind the transport)
+// lives below in this entry file.
+import {
+  SERVE_MCP_DEFAULT_PORT,
+  SERVE_MCP_USAGE,
+  ServeMcpError,
+  assertServeTargetSupported,
+  assertToolsModeSatisfiable,
+  buildMcpSubAgentDescriptors,
+  filterChildTools,
+  resolveMcpToolsMode,
+  resolveMcpTransport,
+  resolveServePort,
+} from "./serve-mcp";
+// Loop contract 0.4 (Batch B, G53) — `sessions export --format trajectories`
+// assembly ((state, action, observation, reward) tuples from session event
+// logs + trace events, terminal-sparse reward ladder), in a side-effect-free
+// module so it is unit-testable (this entry file runs an argv switch on
+// import).
+import {
+  type TrajectoryStep,
+  assembleTrajectory,
+  parseJsonlLoose,
+  trajectoryStepsToJsonl,
+} from "./sessions-export";
 // Item #57 — summarize sessions into a durable index before TTL eviction.
-import { SESSIONS_INDEX_DIRNAME, summarizeSessionIntoIndex } from "./sessions-index";
+import {
+  SESSIONS_INDEX_DIRNAME,
+  parseSessionLog,
+  summarizeSessionIntoIndex,
+} from "./sessions-index";
+// Loop contract 0.4 (Batch F, item 2) — `sessions tail`: pure event formatting,
+// follow-cursor diffing, and newest-session selection (unit-tested); the CLI
+// wraps them with the fs read + poll loop.
+import { type SessionTailCursor, advanceSessionTail, pickSessionToTail } from "./sessions-tail";
 // Item 37 — SLO/TTFT doctor probe + mitigation-ladder sink, in side-effect-free
 // modules (this entry file runs an argv switch on import) mirroring
 // doctor-checks.ts / alert-sink.ts.
@@ -957,11 +1116,23 @@ const COMPILE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "out", short: "o", takesValue: true },
     { name: "emit-ir", takesValue: false },
-    // FR-002 — the strict scope gate (fail the build when an outward-reaching
-    // tool is left at a non-"external" scope) now runs by DEFAULT on every
-    // compile. `--strict` is retained as an accepted no-op so existing
-    // invocations and CI scripts keep working; the gate fires with or without
-    // it (see whitepaper §6).
+    // Loop contract 0.4 (Batch B, G42) — print projectLoop() of the lowered
+    // IR (the studio /builder + compiler-worker POST /loop wire contract)
+    // instead of emitting code. Human-readable by default; --json prints the
+    // raw LoopProjection; with -o writes <out-dir>/loop.json.
+    { name: "emit-loop", takesValue: false },
+    { name: "json", takesValue: false },
+    // Loop contract 0.4 (Batch F, item 6) — `--emit-as cf-worker` emits the
+    // Cloudflare-Worker bundle (the same one the compiler-worker's remote
+    // POST /compile { emitAs } serves) instead of the default `local` bundle.
+    // Supported for target=cli|workflow|graph; see cf-worker-emit.ts.
+    { name: "emit-as", takesValue: true },
+    // FR-002 made the strict scope gate DEFAULT-ON, which left `--strict` an
+    // accepted no-op. Loop contract 0.4 (Batch A) gives it real meaning
+    // again: escalate compile WARNINGS (accepted-but-unwired spec keys) to
+    // errors — warnings always print (code + path + message, one per line);
+    // with --strict any warning fails the compile before files are written.
+    // The scope gate itself stays default-on regardless (opt out below).
     { name: "strict", takesValue: false },
     // FR-002 — explicit opt-out for users who knowingly bypass the gate (e.g.
     // an outward sink whose external scope is verified out of band). Either
@@ -1041,6 +1212,17 @@ const RUN_SCHEMA: ParseArgsSchema = {
     // `stop`). On reaching the cap the run stops (or degrades) before the
     // next turn.
     { name: "budget-usd", takesValue: true },
+    // Loop contract 0.4 (Batch A) — force streaming tool dispatch on for
+    // this run (runChatLoop's `streaming` option: tools execute as each
+    // tool_use block completes mid-stream). The spec's `agent.streaming`
+    // sets the default; the flag wins.
+    { name: "streaming", takesValue: false },
+    // Loop contract 0.4 (Batch C, G26) — override the spec's
+    // `observability.trace.level` for this run: off | ring | pretty | json.
+    // pretty/json attach the structured-event-printer; ring keeps only the
+    // bus ring buffer (default); off suppresses the printer. The flag wins
+    // absolutely over the spec block AND the ambient CREWHAUS_TRACE env.
+    { name: "trace", takesValue: true },
     // Item #56 — identify the current user so their
     // `.crewhaus/preferences/<user>.md` is injected at run start (alongside
     // the auto-loaded LESSONS.md). Flag > CREWHAUS_USER env.
@@ -1049,6 +1231,93 @@ const RUN_SCHEMA: ParseArgsSchema = {
     // servers `crewhaus mcp doctor` marked chronically failing in
     // `.crewhaus/mcp/quarantine.json` (default: withdraw them + inject a notice).
     { name: "no-mcp-quarantine", takesValue: false },
+    // Item 3 (G32) — override the spec's `plugins:` list for this run: a
+    // comma-separated set of installed plugin names to activate at boot
+    // instead of the spec's. `--plugins ""` activates none.
+    { name: "plugins", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Loop contract 0.4 (Batch F, item 7, CLI half) — `crewhaus runs resume
+// <session>`. The `resume` is the positional <session>, so it is NOT a flag
+// here; `--spec` names the backing spec. The rest mirror the run flags a
+// resumed continuation honours (they are threaded verbatim into the shared
+// resumed run path).
+const RUNS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "spec", takesValue: true },
+    { name: "model", takesValue: true },
+    { name: "permission-mode", takesValue: true },
+    { name: "prompt", takesValue: true },
+    { name: "justification-judge", takesValue: true },
+    { name: "no-justification-audit", takesValue: false },
+    { name: "egress-matcher", takesValue: true },
+    { name: "egress-embedder", takesValue: true },
+    { name: "budget-usd", takesValue: true },
+    { name: "streaming", takesValue: false },
+    { name: "trace", takesValue: true },
+    { name: "user", takesValue: true },
+    { name: "no-mcp-quarantine", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Loop contract 0.4 (Batch F, item 2) — `crewhaus dev <spec>`: compile in
+// memory, run the bundle as a supervised child, relaunch on change.
+const DEV_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Compile + launch once, wait for the child, exit with its code (no watch
+    // loop) — the scriptable/CI boot check.
+    { name: "once", takesValue: false },
+    // Debounce window (ms) for coalescing a burst of fs changes. Default 150.
+    { name: "debounce", takesValue: true },
+    // Item 3 (G32) — override the spec's `plugins:` list for the launched
+    // child: a comma-separated set of installed plugin names compiled into the
+    // bundle in place of the spec's. `--plugins ""` activates none. Absent →
+    // the spec list is compiled unchanged (a byte-identical bundle).
+    { name: "plugins", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 1 (G30) — `crewhaus serve --mcp <spec> [--sse]`: project the spec's
+// agent as an MCP server (stdio or HTTP+SSE) so it becomes a tool inside
+// Claude Code / an IDE / another CrewHaus runtime.
+const SERVE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Required — the projection kind. `serve` reserves room for other exposure
+    // kinds; `--mcp` is the only one today.
+    { name: "mcp", takesValue: false },
+    // Serve over HTTP+SSE (a `fetch` server) instead of stdio; overrides the
+    // spec's `expose.mcp.transport`.
+    { name: "sse", takesValue: false },
+    // SSE listen port (default 8000, or CREWHAUS_MCP_PORT). Ignored for stdio.
+    { name: "port", takesValue: true },
+    // Threaded into the projected agent's turn exactly as on `crewhaus run`.
+    { name: "model", takesValue: true },
+    { name: "permission-mode", takesValue: true },
+    { name: "plugins", takesValue: true },
+    { name: "no-mcp-quarantine", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 4 (§59) — `crewhaus export claude-plugin <spec> [--out <dir>]`: emit an
+// Anthropic-compatible Claude Code plugin directory from any target shape.
+const EXPORT_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Output directory (default: <cwd>/<pluginName>). Refuses to overwrite a
+    // non-empty dir without --force.
+    { name: "out", short: "o", takesValue: true },
+    { name: "force", takesValue: false },
+    // Plugin author name/email stamped into .claude-plugin/plugin.json
+    // (Anthropic's schema requires a non-empty author; name defaults to
+    // "CrewHaus").
+    { name: "author", takesValue: true },
+    { name: "author-email", takesValue: true },
+    // Override the plugin description (default: the IR's name + target).
+    { name: "description", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -1420,6 +1689,10 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     { name: "judge-model", takesValue: true },
     { name: "concurrency", takesValue: true },
     { name: "seed", takesValue: true },
+    // Loop contract 0.4 (Batch B, G15) — trials per sample: run every sample
+    // K times (seed-offset when --seed is set); aggregates gain pass@K /
+    // pass^K and the per-sample results carry per-trial grades.
+    { name: "repeats", takesValue: true },
     // Item 11 — benchmark matrix: run the same dataset+graders once per
     // model; each cell writes to <out>/<model-slug>/. Incompatible with
     // --gate/--no-promote (cells skip the run-history lineage entirely).
@@ -1544,6 +1817,39 @@ const FEEDBACK_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Loop contract 0.4 (Batch C, G11) — `crewhaus approvals list|show|grant|deny`
+// over the session-store approvals store (`.crewhaus/sessions/approvals.jsonl`).
+const APPROVALS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Harness root that owns `.crewhaus/` (mirrors `security digest --dir`).
+    { name: "dir", takesValue: true },
+    // The deciding identity recorded on grant/deny (flag > CREWHAUS_USER > "cli").
+    { name: "by", takesValue: true },
+    // grant only — the grant applies to the next matching tool call only
+    // (default; the runtime consumes a grant on use). Explicit for scripting.
+    { name: "once", takesValue: false },
+    { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// G63 — `crewhaus failures report`: cluster run_failed + incident records.
+const FAILURES_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Harness root that owns `.crewhaus/` (mirrors `security digest --dir`).
+    { name: "dir", takesValue: true },
+    // How many recent sessions to scan (default all); `all` is explicit.
+    { name: "sessions", takesValue: true },
+    // Draft failure_taxonomy entries from the clusters (reuses the advise
+    // drafting machinery + specificity floor).
+    { name: "propose-taxonomy", takesValue: false },
+    // Write the drafted failure_taxonomy YAML to a file (else printed to stdout).
+    { name: "out", short: "o", takesValue: true },
+    { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
 const DISTILL_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "session", takesValue: true },
@@ -1616,6 +1922,16 @@ const SESSIONS_SCHEMA: ParseArgsSchema = {
     { name: "evicted", takesValue: false },
     // TTL for the --evicted eviction pass (days). Default: session-store's 30.
     { name: "ttl-days", takesValue: true },
+    // Loop contract 0.4 (Batch B, G53) — `sessions export`: the export shape
+    // (only "trajectories" today) and where the JSONL lands (default stdout).
+    { name: "format", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    // Loop contract 0.4 (Batch F, item 2) — `sessions tail`: which session dir
+    // to read (default cwd/.crewhaus/sessions), the follow-poll interval, and
+    // --no-follow to dump-and-exit (the scriptable/CI mode).
+    { name: "dir", takesValue: true },
+    { name: "interval", takesValue: true },
+    { name: "no-follow", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -1979,6 +2295,26 @@ const DEPLOY_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Loop contract 0.4 (Batch F, item 5) — `crewhaus deploy <fly|render|railway|
+// heroku> <spec>`. Scaffolds provider manifests; `--live` (token-gated) drives
+// the cloud-adapter-* engine's API deploy.
+const CLOUD_DEPLOY_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "out", short: "o", takesValue: true },
+    { name: "app", takesValue: true },
+    { name: "image", takesValue: true },
+    { name: "region", takesValue: true },
+    // Perform the API deploy (gated on the provider token); default is
+    // scaffold-only.
+    { name: "live", takesValue: false },
+    // Provider-specific live-deploy inputs.
+    { name: "project", takesValue: true }, // railway projectId
+    { name: "org", takesValue: true }, // fly org slug
+    { name: "owner", takesValue: true }, // render ownerId
+    { name: "help", short: "h" },
+  ],
+};
+
 // Item 59 — `crewhaus propose <proposed-spec.yaml>`: package a spec change
 // into a review artifact + open a PR (the governance wrapper around
 // optimize/advise write-back). Never auto-merges.
@@ -2086,7 +2422,10 @@ function usageText(): string {
     "                  [--allow-unmarked-sinks]  opt out of the external-sink scope gate",
     "                  [--check]            verify the emitted bundle (shape assertion + install + liveness boot)",
     "  compile <spec.yaml> --emit-ir        print the lowered IR as JSON (debug)",
+    "  compile <spec.yaml> --emit-as cf-worker  emit the Cloudflare-Worker bundle (cli|workflow|graph)",
     "  compile <spec.yaml> --watch          re-run parse→lint→compile on every change (item 41)",
+    "  export claude-plugin <spec.yaml>     emit an Anthropic Claude Code plugin dir from the spec",
+    "                  [--out <dir>] [--force] [--author <name>]  (item 4)",
     "  lint [spec.yaml] [--fix]             check-only: parse + ir-passes (§47 chain / graph-crew",
     "       [--format text|json]            well-formedness the CLI compile path skips) + scope audit,",
     "                                       WITHOUT emitting; --fix does nearest-match/typo repairs (item 41)",
@@ -2095,9 +2434,18 @@ function usageText(): string {
     "                  [--resume <id>]      resume a specific session (cli targets only)",
     "                  [--continue]         resume the most-recent session (cli targets only)",
     "                  [--prompt <text>]    run one turn and exit, printing the reply (cli: no REPL; browser: the single-turn input, else stdin)",
+    "                  [--plugins <a,b>]    override the spec's plugins: list for this run (item 3)",
     "                  [--justification-judge rule-based|claude]  Pillar 3 intent-gate judge (FR-004)",
     "                  [--egress-matcher substring|semantic]  Pillar 3 sink-side matcher (FR-006)",
     "                  [--egress-embedder <model>]  embedder for --egress-matcher semantic",
+    "  serve --mcp <spec.yaml> [--sse]      project the cli agent as an MCP server (stdio or HTTP+SSE)",
+    "                  [--port <n>] [--plugins <a,b>]  so it is a tool in Claude Code / an IDE (item 1)",
+    "  dev <spec.yaml> [--once]             compile in memory + run the bundle as a supervised child,",
+    "                  [--debounce <ms>]    relaunching on every spec/commands/skills change",
+    "                  [--plugins <a,b>]    (CREWHAUS_TRACE=pretty by default; per-turn summaries)",
+    "  runs resume <session>                re-drive a persisted cli session (e.g. one PARKED on a",
+    "                  [--spec <path>]      pending approval, resolved via `approvals grant`); resolves",
+    "                  [--prompt <text>]    the spec from --spec or cwd/crewhaus.yaml",
     "  eval <spec.yaml> --dataset <data>    run the agent against a dataset and grade",
     "       --graders <graders.yaml>       (deterministic graders + LLM-as-judge)",
     "       [--judge-model <model>] [--concurrency N] [--seed N] [-o <out-dir>]",
@@ -2175,6 +2523,8 @@ function usageText(): string {
     "       (--thumbs up|down | --stars 1-5 | --score 0-1) [--comment <t>]",
     "  feedback --session <id> --text <msg> attach a comment/correction to a turn",
     "       [--turn N] [--correction <better answer>]",
+    "  approvals list|show|grant|deny <id>  resolve tool-permission approvals a headless run parked",
+    "       [--dir <root>] [--by <who>]      (permissions.ask_mode: pause); grant is one-shot (--once)",
     "  distill --session <id> -o <ds.jsonl> turn ratings into an eval dataset + graders",
     "       [--all-sessions] [--graders-out <g.yaml>] [--min-score F]",
     "       [--register <name>]            also promote a new dataset version into the registry",
@@ -2186,6 +2536,7 @@ function usageText(): string {
     "  lessons update [--sessions N|all]    mine corrections + failures into an auto-loaded LESSONS.md (#56)",
     "       [--low-score F] [-o <LESSONS.md>]  + per-user prefs under .crewhaus/preferences/",
     "  sessions summarize [--before <date>] summarize sessions into a durable index before TTL eviction (#57)",
+    "  sessions tail [<session>]            follow a session's transcript live (per-turn view; --no-follow to dump)",
     "  memory list [--spec <name>]          inspect the per-spec fact stores: id/age/tags/provenance/status",
     "  memory show <mem_id>                 full detail for one memory (provenance, expiry, supersededBy)",
     "  memory forget <mem_id>|--query <q>   explicitly forget memories (append-only supersede tombstones;",
@@ -2234,12 +2585,16 @@ function usageText(): string {
     "  spec put|list|get|pin|alias|log ...  versioned spec storage + changelog (Section 28 spec-registry)",
     "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
     "       promote --require-approval      gate a protected env on an approval quorum (item 59)",
+    "  deploy fly|render|railway|heroku <spec>  scaffold PaaS deploy manifests for a daemon shape;",
+    "       [-o <dir>] [--app <n>] [--image <ref>] [--live]  --live (token-gated) deploys via the API",
     "  propose <proposed.yaml> ...          package a spec change + open a review PR (item 59)",
     "  deploy canary <spec> <version> ...   eval-gated ramp with auto-rollback (item 29):",
     "       --traffic 5,25,50,100 --dataset <d> --graders <g>  eval both versions per step,",
     "                                       gate on regression-runner, auto-promote/rollback",
     "  incident collect --session <id>      assemble an incident bundle from a session's",
     "                                       traces + audit + cost + doctor (item 32)",
+    "  failures report [--propose-taxonomy] cluster run_failed + incidents by class + message",
+    "       [--sessions N|all] [--dir <r>]   similarity; --propose-taxonomy drafts failure_taxonomy (G63)",
     "  migrate-all --from N --to N          batch-migrate every spec in the registry",
     "  upgrade [spec.yaml] [--write]        detect the cwd spec's version drift + run the migration",
     "                                       chain (validated); --dry-run diff by default (item 43)",
@@ -2333,10 +2688,25 @@ function parseFor(rest: ReadonlyArray<string>, schema: ParseArgsSchema): ParsedA
 async function runCompile(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir] [--check]\n" +
-        "                        [--allow-unmarked-sinks] [--no-readme] [--no-register]\n" +
+      "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir] [--emit-loop [--json]] [--check]\n" +
+        "                        [--emit-as local|cf-worker] [--allow-unmarked-sinks] [--no-readme] [--no-register]\n" +
+        "  --emit-as  local (default) emits the standalone Bun bundle; cf-worker\n" +
+        "             emits the Cloudflare-Worker bundle (worker.js + wrangler.toml\n" +
+        "             + package.json) — the SAME bundle the studio's remote compiler\n" +
+        "             (compiler-worker POST /compile) serves. Supported for\n" +
+        "             target=cli|workflow|graph; other shapes are rejected. Incompatible\n" +
+        "             with --emit-ir/--emit-loop/--check/--with-eval-harness.\n" +
         "  --emit-ir  Skip code emission; print the lowered IR as JSON to\n" +
         "             stdout (or to <out-dir>/ir.json when -o is set).\n" +
+        "  --emit-loop  Skip code emission; print the canonical agent-loop\n" +
+        "             projection (projectLoop of the lowered IR) — the exact\n" +
+        "             wire shape the studio /builder renders and the\n" +
+        "             compiler-worker's POST /loop returns. Human-readable by\n" +
+        "             default; --json prints the raw LoopProjection JSON; with\n" +
+        "             -o it writes <out-dir>/loop.json instead. A read-only\n" +
+        "             view: nothing is emitted, and (matching POST /loop) the\n" +
+        "             FR-002 scope gate does not run, so you can inspect the\n" +
+        "             loop of a spec whose tool scopes still need fixing.\n" +
         "  --check    After emitting, verify the bundle: run the target shape's\n" +
         "             smoke assertion, `bun install` its deps in the out-dir, and\n" +
         "             boot it once credential-free (liveness only — shapes whose\n" +
@@ -2383,15 +2753,57 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "\n" +
         "  --allow-unmarked-sinks   Opt out of the gate for this compile (alias:\n" +
         "             --no-strict-scope). Use only when you knowingly bypass it.\n" +
-        "  --strict   Accepted no-op — the gate is already on by default.\n",
+        "\n" +
+        "  Compile warnings: a spec key a shape ACCEPTS but whose emitter does\n" +
+        "  not wire yet (accepted-but-unwired — legal-but-inert config) always\n" +
+        "  prints as one line per warning:\n" +
+        "    crewhaus: warning[<code>] <path>: <message>\n" +
+        "  --strict   Escalate compile warnings to errors: any warning fails\n" +
+        "             the compile (exit 1) before files are written. (The\n" +
+        "             FR-002 scope gate is on by default regardless of this\n" +
+        "             flag; --allow-unmarked-sinks is its only opt-out.)\n",
     );
     return;
   }
   const specPath = args.positional[0];
   const outDir = args.flags["out"];
   const emitIr = args.flags["emit-ir"] === true;
+  // Loop contract 0.4 (Batch B, G42) — `--emit-loop` is a print mode like
+  // --emit-ir: exactly one of them may own stdout, and neither emits files
+  // for --check to verify.
+  const emitLoop = args.flags["emit-loop"] === true;
   const check = args.flags["check"] === true;
   if (check && emitIr) die("--check verifies emitted files — it cannot combine with --emit-ir");
+  if (check && emitLoop) die("--check verifies emitted files — it cannot combine with --emit-loop");
+  if (emitIr && emitLoop) {
+    die("--emit-ir and --emit-loop are mutually exclusive (each owns stdout)");
+  }
+  // Loop contract 0.4 (Batch F, item 6) — `--emit-as <local|cf-worker>` picks
+  // the bundle flavour. `local` (default) is the standalone bundle every prior
+  // release emitted; `cf-worker` emits the Cloudflare-Worker bundle — the same
+  // one the compiler-worker's remote POST /compile { emitAs } serves — for
+  // target=cli|workflow|graph. The two print-only modes and the shape-boot
+  // --check assume the local bundle, so cf-worker is incompatible with them.
+  const emitAsFlag = args.flags["emit-as"];
+  const emitAs = typeof emitAsFlag === "string" ? emitAsFlag : "local";
+  if (emitAs !== "local" && emitAs !== "cf-worker") {
+    die(`--emit-as must be "local" or "cf-worker" (got "${emitAs}")`);
+  }
+  const emitCfWorker = emitAs === "cf-worker";
+  if (emitCfWorker) {
+    if (emitIr) die("--emit-as cf-worker cannot combine with --emit-ir (each owns the output)");
+    if (emitLoop) die("--emit-as cf-worker cannot combine with --emit-loop (each owns the output)");
+    if (check) {
+      die(
+        "--emit-as cf-worker cannot combine with --check (the smoke boot assumes a local Bun bundle, not a Worker)",
+      );
+    }
+    if (args.flags["with-eval-harness"] === true) {
+      die(
+        "--emit-as cf-worker cannot combine with --with-eval-harness (the eval bridge projects a local bundle)",
+      );
+    }
+  }
   // FR-002 — the strict scope gate is DEFAULT-ON. It runs unless the user
   // explicitly opts out with --allow-unmarked-sinks (or its alias
   // --no-strict-scope). `--strict` is now a no-op kept for back-compat.
@@ -2403,7 +2815,13 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // Item 46 — registry auto-put + changelog, DEFAULT-ON; --no-register opts out.
   const register = args.flags["no-register"] !== true;
   if (typeof specPath !== "string") die("missing <spec.yaml>");
-  if (!emitIr && typeof outDir !== "string") die("missing -o <out-dir>");
+  if (!emitIr && !emitLoop && typeof outDir !== "string") die("missing -o <out-dir>");
+
+  // Loop contract 0.4 (Batch A) — `--strict` escalates compile warnings
+  // (accepted-but-unwired spec keys) to errors. Distinct from the FR-002
+  // scope gate above, which is default-on and governed solely by
+  // --allow-unmarked-sinks.
+  const strictWarnings = args.flags["strict"] === true;
 
   // Item 41 — `--watch`: re-run parse→lint→compile on every change. Delegates
   // to the watch controller, which drives one `compileOnceForWatch` cycle per
@@ -2431,6 +2849,41 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // it into the bundle's `runChatLoop({ egressMatcher })`), so a compiled
   // artifact honours the selection WITHOUT the `run` path. No compile-time
   // warning is needed anymore — emission replaced the warn-only shim.
+
+  // Loop contract 0.4 (Batch B, G42) — `--emit-loop`: parse → lower →
+  // projectLoop, print, done. Deliberately runs BEFORE the FR-002 scope gate
+  // below: the projection is a read-only VIEW (no artifact is produced, so
+  // there is nothing whose egress scopes need gating), and it must return
+  // exactly what the compiler-worker's POST /loop endpoint (which runs no
+  // gate) returns for the same YAML — including specs the gate would refuse,
+  // so an operator can SEE the loop before fixing scopes.
+  if (emitLoop) {
+    let ir: ReturnType<typeof lower>;
+    try {
+      ir = lower(parseSpec(yamlText));
+    } catch (err) {
+      // parseSpec throws SpecParseError; lower() can throw CompilerError.
+      // Both extend CrewhausError — clean one-liner instead of a stack trace.
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    const projection = projectLoop(ir);
+    if (typeof outDir === "string") {
+      const absOut = resolve(outDir);
+      mkdirSync(absOut, { recursive: true });
+      const loopPath = join(absOut, "loop.json");
+      writeFileSync(loopPath, `${JSON.stringify(projection, null, 2)}\n`);
+      process.stdout.write(`wrote ${loopPath}\n`);
+    } else if (args.flags["json"] === true) {
+      process.stdout.write(`${JSON.stringify(projection, null, 2)}\n`);
+    } else {
+      for (const line of formatLoopProjection(projection)) {
+        process.stdout.write(`${line}\n`);
+      }
+    }
+    logger.debug("compile.emit-loop.success", { out: outDir ?? "stdout" });
+    return;
+  }
 
   // FR-002 — strict scope gate, now DEFAULT-ON. Lower the spec (pure), resolve
   // every referenced built-in tool name to its RegisteredTool, and audit scopes
@@ -2471,21 +2924,50 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   const absOut = resolve(outDir as string);
 
   let bundle: ReturnType<typeof compile>;
-  try {
-    bundle = compile(yamlText, { readme });
-  } catch (err) {
-    // compile() runs parse → lower → emit. parseSpec throws SpecParseError;
-    // each target emitter throws its own TargetEmitError (e.g. an unresolvable
-    // tool name once the default-on scope gate has been bypassed with
-    // --allow-unmarked-sinks). Both — like every structured failure in this
-    // pipeline — extend CrewhausError, so route the whole family through die()
-    // for a clean one-line error + exit 1 instead of letting the emitter crash
-    // escape as an uncaught stack trace. A non-CrewhausError (a genuine bug)
-    // still propagates with its full stack for debugging.
-    if (err instanceof CrewhausError) {
-      die(err.message);
+  if (emitCfWorker) {
+    // Loop contract 0.4 (Batch F, item 6) — the cf-worker emit path drives
+    // lower() + the target-cf-worker-* emitters directly (mirroring the
+    // compiler-worker's remote arm), not the local compile(). The offline
+    // scope gate runs inside emitCfWorkerBundle (the same assertToolScopesStrict
+    // the Worker applies), and any emitter refusal (an unsupported target, a
+    // tool the edge doesn't yet run) is a CompilerError → clean one-liner.
+    try {
+      const cfIr = lower(parseSpec(yamlText));
+      bundle = { files: emitCfWorkerBundle(cfIr, { readme }).files, warnings: [] };
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
     }
-    throw err;
+  } else {
+    try {
+      bundle = compile(yamlText, { readme });
+    } catch (err) {
+      // compile() runs parse → lower → emit. parseSpec throws SpecParseError;
+      // each target emitter throws its own TargetEmitError (e.g. an unresolvable
+      // tool name once the default-on scope gate has been bypassed with
+      // --allow-unmarked-sinks). Both — like every structured failure in this
+      // pipeline — extend CrewhausError, so route the whole family through die()
+      // for a clean one-line error + exit 1 instead of letting the emitter crash
+      // escape as an uncaught stack trace. A non-CrewhausError (a genuine bug)
+      // still propagates with its full stack for debugging.
+      if (err instanceof CrewhausError) {
+        die(err.message);
+      }
+      throw err;
+    }
+  }
+
+  // Loop contract 0.4 (Batch A) — compile warnings ALWAYS print, one line
+  // per warning (code + path + message; stderr so stdout stays the clean
+  // `wrote …` stream). With --strict any warning fails the compile HERE —
+  // before any file is written, so a strict-failed build emits nothing.
+  for (const warning of bundle.warnings) {
+    process.stderr.write(`crewhaus: ${formatCompileWarning(warning)}\n`);
+  }
+  if (strictWarnings && bundle.warnings.length > 0) {
+    die(
+      `--strict: ${bundle.warnings.length} compile warning(s) escalated to errors (see lines above)`,
+    );
   }
 
   mkdirSync(absOut, { recursive: true });
@@ -2513,7 +2995,9 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     writeFileSync(fullPath, file.content);
     process.stdout.write(`wrote ${fullPath}\n`);
   }
-  process.stdout.write(`compiled bundle (${bundle.files.length} file(s)) → ${absOut}\n`);
+  process.stdout.write(
+    `compiled ${emitCfWorker ? "cf-worker " : ""}bundle (${bundle.files.length} file(s)) → ${absOut}\n`,
+  );
   // Item 46 — auto-register the just-compiled spec in the local registry so
   // registry state tracks working files without a manual `crewhaus spec put`.
   // Bundle mode only: --emit-ir streams JSON to stdout, which a status line
@@ -3829,9 +4313,17 @@ async function resolveEgressMatcher(
 async function runRun(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--justification-judge rule-based|claude] [--egress-matcher substring|semantic] [--egress-embedder <model>]\n" +
+      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--streaming] [--trace off|ring|pretty|json] [--budget-usd <n>] [--justification-judge rule-based|claude] [--egress-matcher substring|semantic] [--egress-embedder <model>]\n" +
         "  --prompt <text> runs a single turn non-interactively and prints the reply, then exits (no REPL) — for scripting/CI; composes with --resume/--continue\n" +
         "  --model accepts the full router grammar: claude-* (Anthropic), openai/<m>, gemini/<m>, bedrock/<id> (geo prefixes tolerated), local/<m>@<url>\n" +
+        '  --plugins <a,b,c> overrides the spec\'s plugins: list for this run (installed plugin names, comma-separated; --plugins "" activates none)\n' +
+        "  --streaming dispatches tools mid-stream (as each tool_use block completes) instead of after the full response; the spec's agent.streaming sets the default, the flag forces it on\n" +
+        "  --trace <level> overrides the spec's observability.trace.level for this run: pretty/json attach the structured-event-printer, ring keeps only the bus ring buffer (default), off suppresses the printer; the flag wins over the spec block and CREWHAUS_TRACE\n" +
+        "  Cost tracking is ON by default (accrues per-call spend; set observability.cost.enabled: false to disable, CREWHAUS_COST_INLINE=1 to print a per-call line, `crewhaus cost-summary --session <id>` to total it after the run)\n" +
+        "  --budget-usd <n> caps this run's model spend in dollars: it sets/overrides the spec budget.usd ceiling and keeps the spec's on_exceed ladder (stop when the spec has none).\n" +
+        "    Interplay with the spec's limits: block — the budget cap and the limits ceilings (max_tool_iterations, max_concurrent_tools, context_limit, deadline_ms, turn_timeout_ms,\n" +
+        "    model_call_timeout_ms, loop_detection) are enforced INDEPENDENTLY; whichever bound trips first governs. The budget check gates the NEXT turn (an in-flight turn is never\n" +
+        "    severed mid-tool-call), while the limits ceilings bound the CURRENT turn/run. --budget-usd never widens a limit and limits: never raises the spend cap.\n" +
         "  A spec with a feedback: block asks `rate this session? [g]ood / [b]ad / [enter] skip`\n" +
         "  on clean REPL exit (one keystroke, 10s timeout, TTY only — never when piped). Opt out\n" +
         "  with CREWHAUS_NO_EXIT_RATING=1 or feedback.exitPrompt: false. With feedback.autoDistill\n" +
@@ -3869,11 +4361,151 @@ async function runRun(args: ParsedArgs): Promise<void> {
     throw err;
   }
 
+  // Loop contract 0.4 (Batch C, G26) — apply the run's observability toggles to
+  // the env the runtime's subscriber layer reads, mirroring what a compiled
+  // bundle stamps at boot (cost-on-by-default; trace printer for pretty/json).
+  applyRunObservabilityEnv(args, ir);
+
   if (ir.target === "cli") return runRunCli(args, ir, specPath);
   if (ir.target === "browser") return runRunBrowser(args, ir);
   die(
     `crewhaus run supports target: cli or browser (got "${ir.target}"). Other target shapes are compile-only — see PACKAGES.md.`,
   );
+}
+
+/**
+ * Loop contract 0.4 (Batch C, G26) — apply this run's observability env, so
+ * `crewhaus run` honours the spec's `observability` block exactly like a
+ * compiled bundle (which stamps the same env at boot). The precedence rules
+ * live in the pure `run-observability` module (unit-tested); this only
+ * validates the flag and mutates `process.env` before the runtime's env-driven
+ * subscriber layer attaches.
+ *
+ * - trace: `--trace` flag > `observability.trace.level` > `"ring"`. `pretty`/
+ *   `json` attach the structured-event-printer; `ring`/`off` attach no printer.
+ *   The FLAG wins absolutely over the spec block and ambient `CREWHAUS_TRACE`.
+ * - cost: ON by default unless the spec sets `observability.cost.enabled:
+ *   false` (it prints nothing on its own; `CREWHAUS_COST_INLINE=1` surfaces a
+ *   per-call line, `cost-summary` totals it after the run).
+ */
+function applyRunObservabilityEnv(args: ParsedArgs, ir: ReturnType<typeof lower>): void {
+  const obs = (
+    ir as {
+      observability?: {
+        trace?: { level?: string };
+        cost?: { enabled?: boolean };
+      };
+    }
+  ).observability;
+
+  const traceFlag = args.flags["trace"];
+  if (typeof traceFlag === "string" && !isValidTraceLevel(traceFlag)) {
+    die(`--trace must be one of: ${TRACE_LEVELS.join(", ")} (got "${traceFlag}")`);
+  }
+  const trace = resolveTraceEnv(
+    typeof traceFlag === "string" ? traceFlag : undefined,
+    obs?.trace?.level,
+    process.env["CREWHAUS_TRACE"],
+  );
+  if (trace !== undefined) process.env["CREWHAUS_TRACE"] = trace;
+
+  const cost = resolveCostEnv(obs?.cost?.enabled, process.env["CREWHAUS_COST_TRACKING"]);
+  if (cost !== undefined) process.env["CREWHAUS_COST_TRACKING"] = cost;
+}
+
+/**
+ * Loop contract 0.4 (Batch F, item 7, CLI half) — `crewhaus runs resume
+ * <session> [--spec <path>] [--prompt <text>] [--model <m>] …`.
+ *
+ * Re-drives a persisted cli session: resolves the spec backing it (`--spec`, or
+ * `crewhaus.yaml` in the cwd), confirms the session exists AND belongs to that
+ * spec, then hands off to the SAME resumed run path `run --resume` uses
+ * (`runRunCli` → `runChatLoop({ resume: { sessionId } })`, which replays the
+ * transcript and continues). The dedicated verb is the natural home for
+ * re-driving a run a headless session PARKED (`permissions.ask_mode: pause`,
+ * exit 36) after `crewhaus approvals grant/deny` resolved the park — the
+ * recorded decision is consumed as the loop continues. Passes `--prompt`
+ * through for a one-shot continuation, or resumes the interactive REPL.
+ */
+async function runRunsResume(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"] === true) {
+    process.stdout.write(
+      "usage: crewhaus runs resume <session> [--spec <path>] [--prompt <text>] [--model <m>]\n" +
+        "                        [--trace off|ring|pretty|json] [--budget-usd <n>] [--streaming]\n" +
+        "  Re-drives a persisted cli session (a sess_<16 hex> id) — replaying its\n" +
+        "  transcript and continuing the loop. The session store keeps only\n" +
+        "  name/target/model, so the spec is resolved from --spec, else\n" +
+        "  crewhaus.yaml in the cwd (sessions live under the dir you run from).\n" +
+        "  Typical use: after a headless run PARKED on a pending approval\n" +
+        "  (permissions.ask_mode: pause, exit 36) and `crewhaus approvals grant`\n" +
+        "  resolved it — `runs resume` re-issues the parked call pre-approved.\n" +
+        "  --prompt <text> runs one more turn non-interactively and exits.\n",
+    );
+    return;
+  }
+  const sessionId = args.positional[0];
+  if (typeof sessionId !== "string") {
+    die(
+      "missing <session> — a sess_<16 hex> id (list live sessions with `crewhaus sessions tail`)",
+    );
+  }
+  if (!isRunsSessionId(sessionId)) {
+    die(`invalid <session> "${sessionId}" — expected sess_<16 hex>`);
+  }
+
+  // Resolve the spec backing the resume (--spec, else cwd/crewhaus.yaml).
+  let specPath: string;
+  try {
+    specPath = resolveRunsResumeSpecPath(strFlag(args, "spec"), process.cwd());
+  } catch (err) {
+    if (err instanceof RunsError) die(err.message);
+    throw err;
+  }
+
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(specPath, "utf-8");
+  } catch (err) {
+    die(`could not read ${specPath}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+  if (ir.target !== "cli") {
+    die(
+      `runs resume supports target: cli (got "${ir.target}") — only the cli loop persists a resumable session transcript.`,
+    );
+  }
+
+  // Confirm the session exists AND belongs to this spec before re-driving — a
+  // mismatched name means the wrong spec was resolved, which would replay one
+  // agent's transcript into another's instructions.
+  const store = createSessionStore();
+  const session = await store.get(sessionId);
+  if (session === null) {
+    die(
+      `no session "${sessionId}" under ${join(process.cwd(), SESSIONS_SUBDIR)}. Run from the harness directory that owns it, or check the id with \`crewhaus sessions tail\`.`,
+    );
+  }
+  if (session.name !== ir.name) {
+    die(
+      `session "${sessionId}" belongs to spec "${session.name}", but ${specPath} is "${ir.name}". Pass --spec for the session's own spec.`,
+    );
+  }
+
+  applyRunObservabilityEnv(args, ir);
+  // Hand off to the shared resumed run path with the resume flag synthesized —
+  // the exact machinery `run --resume` drives, so a resumed session behaves
+  // identically whichever verb reached it.
+  const resumeArgs: ParsedArgs = {
+    positional: [specPath],
+    flags: { ...args.flags, resume: sessionId },
+  };
+  await runRunCli(resumeArgs, ir, specPath);
 }
 
 /**
@@ -4026,8 +4658,33 @@ async function runRunCli(
     }
   }
 
+  // Loop contract 0.4 (Batch E, G22) — `knowledge:` RAG. When the spec
+  // declares a knowledge block, ingest every source at boot and register the
+  // shared `Retrieve` tool alongside the built-ins/MCP tools, mirroring the
+  // cli/channel/managed emitters. The embedder model resolves per G76
+  // (`knowledge.embedder → memory.embedder → memory.wiki.embedder → default`);
+  // the store never degrades to BM25, so a missing provider key fails loudly.
+  if (ir.knowledge !== undefined) {
+    const retrieveTool = await ingestKnowledge(ir.knowledge, {
+      cwd: process.cwd(),
+      ...(ir.memory?.embedder !== undefined ? { memoryEmbedder: ir.memory.embedder } : {}),
+      ...(ir.memory?.wiki?.embedder !== undefined ? { wikiEmbedder: ir.memory.wiki.embedder } : {}),
+      log: (line) => process.stdout.write(line),
+    });
+    tools.push(retrieveTool);
+  }
+
   const modelOverride = args.flags["model"];
   const model = typeof modelOverride === "string" ? modelOverride : ir.agent.model;
+
+  // Loop contract 0.4 (Batch A) — streaming tool dispatch: `--streaming`
+  // forces it on; otherwise the spec's `agent.streaming` is carried
+  // verbatim; neither → absent (runtime default false). One diagnostic
+  // line so the mode is observable (mirrors the [sandbox] convention).
+  const streaming = resolveStreaming(args.flags["streaming"] === true, ir.agent.streaming);
+  if (streaming === true) {
+    process.stdout.write("[streaming] mid-stream tool dispatch enabled\n");
+  }
 
   // Item 27 — run-level spend cap: `--budget-usd <n>` (flag) > spec `budget`.
   // The flag sets/overrides the dollar ceiling and keeps the spec's on_exceed
@@ -4093,18 +4750,51 @@ async function runRunCli(
   // unchanged — only *how* lineage matches are detected.
   const egressMatcher = await resolveEgressMatcher(args, ir.security?.egressMatcher);
 
+  // Item 3 (G32) — plugin activation, the same split boot a compiled bundle
+  // runs (renderPlugins in @crewhaus/target-cli): activate EARLY so the plugins'
+  // `<plugin>/skills` dirs feed skill discovery below, and register their tools
+  // LATE (after built-in/skill/memory/sub-agent tools) so a first-party name
+  // wins the collision. `--plugins <a,b>` overrides the spec's `plugins:` list
+  // (an empty override activates none); absent → the spec list, so a spec with
+  // no `plugins:` and no flag activates nothing (the pre-Batch-G path).
+  const pluginNames = resolvePluginNames(ir.plugins, strFlag(args, "plugins"));
+  let pluginSkillDirs: readonly string[] = [];
+  let pluginTools: readonly RegisteredTool[] = [];
+  if (pluginNames.length > 0) {
+    const activated = await activatePlugins({
+      names: pluginNames,
+      ...createDefaultPluginRuntime({
+        allowUnsigned: process.env["CREWHAUS_PLUGIN_ALLOW_UNSIGNED"] === "1",
+      }),
+    });
+    pluginSkillDirs = activated.skillDirs;
+    pluginTools = activated.tools;
+    process.stdout.write(
+      `[plugins] ${activated.loaded.length} activated: ${pluginNames.join(", ")}\n`,
+    );
+    for (const warning of activated.warnings) process.stdout.write(`[plugins] ${warning}\n`);
+  }
+
   // Section 11 — discover hooks, skills, and slash commands from the user's
   // workspace. Hooks come from `~/.crewhaus/settings.json` + `<cwd>/.crewhaus/settings.json`;
-  // skills from `~/.crewhaus/skills/*/SKILL.md` + project-equivalent; slash
-  // commands from `<cwd>/.crewhaus/commands/*.md`. When skills are present,
-  // a synthetic `Skill(name)` tool is appended to the tool list so the
-  // model can lazily fetch each skill's body.
+  // skills from `~/.crewhaus/skills/*/SKILL.md` + project-equivalent (plus the
+  // activated plugins' skill dirs); slash commands from `<cwd>/.crewhaus/commands/*.md`.
+  // When skills are present, a synthetic `Skill(name)` tool is appended to the
+  // tool list so the model can lazily fetch each skill's body.
   const cwd = process.cwd();
-  const [hooks, discoveredSkills, discoveredCommands] = await Promise.all([
+  const [settingsHooks, discoveredSkills, discoveredCommands] = await Promise.all([
     loadHooks({ cwd }),
-    discoverSkills({ cwd }),
+    discoverSkills({ cwd, ...(pluginSkillDirs.length > 0 ? { pluginDirs: pluginSkillDirs } : {}) }),
     loadCommands({ cwd }),
   ]);
+  // Loop contract 0.4 (Batch A) — spec-declared `hooks:` layer BELOW the
+  // settings.json layers: spec entries first, then loadHooks()' user →
+  // project entries (aggregateDecisions' later-wins mutate merge keeps the
+  // user's/project's overrides authoritative — the permission RuleSet's
+  // settings-over-yaml precedence). Everything downstream (the alert/SLO
+  // sinks' event filters AND runChatLoop) reads the MERGED list, so a spec
+  // hook is a full citizen of every hook surface.
+  const hooks = mergeSpecHooks(ir.hooks, settingsHooks);
 
   // Feature #53 / v0.3.0 PR 11 — memory + continuity, wired through the
   // composition root. The SAME `wireMemory(fragment, deps)` call a compiled
@@ -4136,6 +4826,14 @@ async function runRunCli(
       },
       cwd: process.cwd(),
       log: (line) => process.stdout.write(line),
+      // Loop contract 0.4 (Batch A) — top-level fact-store embedder (spec
+      // `memory.embedder`): constructed here and handed to wireMemory as
+      // `deps.embedder`, which memory-service's resolveEmbedder prefers
+      // over the fragment's `wiki.embedder` — the documented fallback
+      // order (`embedder` → `wiki.embedder`). Mirrors target-cli codegen.
+      ...(ir.memory !== undefined && ir.memory.enabled !== false && ir.memory.embedder !== undefined
+        ? { embedder: createEmbedder({ model: ir.memory.embedder }) }
+        : {}),
       // v0.3.0 Goal 3 — the live connection (or null after a boot failure,
       // which wireMemory degrades from). Absent when thredz is off.
       ...(ir.thredz !== undefined ? { thredz: thredzConn } : {}),
@@ -4179,7 +4877,12 @@ async function runRunCli(
       `[skills] ${skills.length} available: ${skills.map((s) => s.name).join(", ")}\n`,
     );
   }
-  if (hooks.length > 0) process.stdout.write(`[hooks] ${hooks.length} loaded\n`);
+  if (hooks.length > 0) {
+    const specHookCount = ir.hooks?.length ?? 0;
+    process.stdout.write(
+      `[hooks] ${hooks.length} loaded${specHookCount > 0 ? ` (${specHookCount} from spec)` : ""}\n`,
+    );
+  }
   if (slashCommands.size > 0) {
     process.stdout.write(
       `[slash] ${slashCommands.size} commands: ${[...slashCommands.keys()].join(", ")}\n`,
@@ -4396,6 +5099,20 @@ async function runRunCli(
     );
   }
 
+  // Item 3 (G32) — register the activated plugins' tools LAST so a plugin tool
+  // named after a built-in / skill / memory / MCP / sub-agent tool is skipped
+  // (first-party wins the collision), mirroring the compiled bundle's
+  // register-late boot.
+  for (const t of pluginTools) {
+    if (tools.some((existing) => existing.name === t.name)) {
+      process.stdout.write(
+        `[plugins] tool "${t.name}" already registered — plugin contribution skipped\n`,
+      );
+      continue;
+    }
+    tools.push(t);
+  }
+
   // Section 18 — wire the sandbox floor for code-execution tools. #18 made
   // python/javascript/shell RESOLVABLE at run time, but the run path never set
   // `sandboxAvailable`, so permission-engine's `requiresSandbox` floor denied
@@ -4462,6 +5179,15 @@ async function runRunCli(
       ...(ir.target === "cli" && ir.compaction.model !== undefined
         ? { compactionModel: ir.compaction.model }
         : {}),
+      // Loop contract 0.4 (Batch A) — limits ceilings (incl. loop_detection),
+      // agent.thinking, agent.rate_limits, and the compaction tuning knobs
+      // (threshold / snip_keep_head / snip_keep_tail → compactionThreshold /
+      // snipKeepHead / snipKeepTail), mirrored 1:1 from the target-cli
+      // codegen (see loop-contract.ts for the option-name contract).
+      ...loopContractRunOptions(ir),
+      // Loop contract 0.4 (Batch A) — streaming tool dispatch
+      // (--streaming flag > spec agent.streaming > absent).
+      ...(streaming !== undefined ? { streaming } : {}),
       // Item 22 — provider failover chain: thread `agent.model_fallbacks` +
       // `agent.circuit_breaker` through to the runtime, mirroring the
       // target-cli codegen path. Skipped when `--model` overrides the
@@ -4808,6 +5534,777 @@ function runContext(args: ParsedArgs): void {
   process.stdout.write(bundle.markdown);
 }
 
+/**
+ * Loop contract 0.4 (Batch C, item 4) — read-only render of this project's
+ * agent identity fingerprint for `crewhaus doctor`. Reads
+ * `.crewhaus/identity.json` (the Ed25519 keypair minted on a run's first boot)
+ * and returns the `agentId` line; deliberately never mints one — doctor must
+ * not write during a read-only probe (a run mints it). An absent file is
+ * informational; a corrupt file is flagged.
+ */
+function describeAgentIdentityLine(cwd: string): string {
+  const path = join(cwd, ".crewhaus", "identity.json");
+  if (!existsSync(path)) {
+    return "~ agent identity: not yet minted (created on first `crewhaus run`)";
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as Partial<AgentIdentityFile>;
+    if (typeof parsed.agentId === "string" && parsed.agentId.length > 0) {
+      const algo = typeof parsed.algorithm === "string" ? parsed.algorithm : "ed25519";
+      return `✓ agent identity: ${parsed.agentId} (${algo}; stamped on every trace + audit record)`;
+    }
+  } catch {
+    // fall through to the corrupt-file note
+  }
+  return `✗ agent identity: ${path} is unreadable or malformed (delete it to re-mint on next run)`;
+}
+
+/**
+ * Loop contract 0.4 (Batch F, item 2) — compile a spec IN MEMORY and emit it to
+ * a fresh temp dir, returning that dir (the child's cwd) + the target shape, or
+ * a structured error (a broken edit). No README, no registry side effects — a
+ * throwaway build for the dev child.
+ */
+function devCompileAndEmit(
+  absSpec: string,
+  pluginsOverride?: readonly string[],
+):
+  | { readonly ok: true; readonly cwd: string; readonly target: string }
+  | { readonly ok: false; readonly error: string } {
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    return { ok: false, error: `read failed: ${(err as Error).message}` };
+  }
+  // Item 3 (G32) — `dev --plugins` overrides the spec's `plugins:` list for the
+  // launched child. The compiled bundle activates `ir.plugins` at boot (there
+  // is no runtime override), so rewrite the key in the YAML doc before compile;
+  // an empty override serializes `plugins: []`, which lowers to "activate none".
+  if (pluginsOverride !== undefined) {
+    try {
+      const doc = parseDocument(yamlText);
+      doc.set("plugins", [...pluginsOverride]);
+      yamlText = doc.toString();
+    } catch (err) {
+      return { ok: false, error: `--plugins override failed: ${(err as Error).message}` };
+    }
+  }
+  let bundle: ReturnType<typeof compile>;
+  let target: string;
+  try {
+    bundle = compile(yamlText, { readme: false });
+    target = lower(parseSpec(yamlText)).target;
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof CrewhausError ? err.message : (err as Error).message,
+    };
+  }
+  const cwd = mkdtempSync(join(tmpdir(), "crewhaus-dev-"));
+  for (const file of bundle.files) {
+    const full = join(cwd, file.path);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, file.content);
+  }
+  return { ok: true, cwd, target };
+}
+
+/**
+ * The env a dev child boots with: the parent env plus `CREWHAUS_TRACE=pretty`
+ * (item 2) when the user has not set it, so each turn streams as a pretty trace
+ * — the live per-turn view — out of the box.
+ */
+function devChildEnv(): Record<string, string | undefined> {
+  return { ...process.env, CREWHAUS_TRACE: process.env["CREWHAUS_TRACE"] ?? "pretty" };
+}
+
+/**
+ * Forward a child stream to `out` byte-for-byte (no latency) AND surface each
+ * COMPLETE line to `onLine` (for turn scanning). A trailing partial line is
+ * flushed when the stream ends.
+ */
+async function devForwardAndScan(
+  stream: ReadableStream<Uint8Array>,
+  out: NodeJS.WriteStream,
+  onLine: (line: string) => void,
+): Promise<void> {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  // Bun's ReadableStream is async-iterable.
+  for await (const chunk of stream) {
+    out.write(chunk as Uint8Array);
+    buffer += decoder.decode(chunk as Uint8Array, { stream: true });
+    let nl = buffer.indexOf("\n");
+    while (nl >= 0) {
+      onLine(buffer.slice(0, nl));
+      buffer = buffer.slice(nl + 1);
+      nl = buffer.indexOf("\n");
+    }
+  }
+  if (buffer.length > 0) onLine(buffer);
+}
+
+/**
+ * Loop contract 0.4 (Batch F, item 2) — `crewhaus dev <spec> [--once]
+ * [--debounce <ms>]`.
+ *
+ * Compiles the spec in memory, emits it to a temp dir, and runs the bundle's
+ * entrypoint (`agent.ts` / `daemon.ts` per shape) as a SUPERVISED child with
+ * `CREWHAUS_TRACE=pretty` on by default. Every change to the spec (or the
+ * sibling `.crewhaus/commands` / `skills` dirs) recompiles in memory and — on a
+ * clean build — relaunches the child; a broken edit keeps the running child and
+ * prints the error. A daemon-shape crash restarts (bounded). Each completed
+ * turn prints a `[dev]` summary line. Ctrl-C tears the child down. `--once`
+ * runs one launch to completion (the scriptable boot check) and exits with the
+ * child's code.
+ */
+async function runDev(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"] === true) {
+    process.stdout.write(
+      "usage: crewhaus dev <spec.yaml> [--once] [--debounce <ms>] [--plugins <a,b>]\n" +
+        "  Compiles the spec in memory, runs the emitted bundle as a supervised\n" +
+        "  child (CREWHAUS_TRACE=pretty by default — turns stream live), and\n" +
+        "  recompiles + relaunches it on every spec / .crewhaus/commands / skills\n" +
+        "  change. A broken edit keeps the running child; a crashed daemon shape\n" +
+        "  restarts (bounded). Each completed turn prints a [dev] summary. Ctrl-C\n" +
+        "  stops. --once launches one run to completion and exits with its code\n" +
+        "  (a credential-free boot check for CI). --debounce sets the change-\n" +
+        "  coalescing window in ms (default 150). --plugins <a,b,c> overrides the\n" +
+        '  spec\'s plugins: list compiled into the child (--plugins "" activates none).\n',
+    );
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+
+  // Item 3 (G32) — a present `--plugins` overrides the spec's `plugins:` list in
+  // every compile of the child (initial + each recompile); absent → the spec's
+  // list compiles unchanged, keeping the emitted bundle byte-identical.
+  const pluginsFlag = strFlag(args, "plugins");
+  const pluginsOverride = pluginsFlag !== undefined ? parsePluginsFlag(pluginsFlag) : undefined;
+
+  // Initial in-memory compile + emit. A broken spec fails fast here (exit 1);
+  // nothing is launched.
+  const initial = devCompileAndEmit(absSpec, pluginsOverride);
+  if (!initial.ok) die(`dev: ${initial.error}`);
+  const target = initial.target;
+  const entry = devEntrypointFor(target);
+  const childEnv = devChildEnv();
+
+  // The real spawn seam: run `bun <entry>` in the emitted dir, forwarding stdio
+  // and surfacing complete output lines for turn scanning.
+  const spawnChild = (opts: {
+    readonly entry: string;
+    readonly cwd: string;
+    readonly onLine: (line: string) => void;
+    readonly onExit: (code: number | null) => void;
+  }): DevChildHandle => {
+    const proc = Bun.spawn(["bun", opts.entry], {
+      cwd: opts.cwd,
+      env: childEnv,
+      stdin: "inherit",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    // Forward + scan both streams (detached — they resolve when the child's
+    // streams close). Best-effort: a forwarding error must not crash the dev
+    // loop, so swallow it (the exit code is the source of truth).
+    void devForwardAndScan(proc.stdout, process.stdout, opts.onLine).catch(() => {});
+    void devForwardAndScan(proc.stderr, process.stderr, opts.onLine).catch(() => {});
+    void proc.exited.then((code) => opts.onExit(code));
+    return {
+      pid: proc.pid,
+      kill: () => {
+        try {
+          proc.kill();
+        } catch {
+          // Already gone.
+        }
+      },
+    };
+  };
+
+  // --once: launch one run to completion (stdio inherited) and exit with its
+  // code — no watch loop, no scanning. The CI/boot-check path.
+  if (args.flags["once"] === true) {
+    process.stderr.write(`[dev] launching ${entry} once (${target}) in ${initial.cwd}\n`);
+    const proc = Bun.spawn(["bun", entry], {
+      cwd: initial.cwd,
+      env: childEnv,
+      stdin: "inherit",
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    const code = await proc.exited;
+    process.stderr.write(`[dev] child exited (code ${code})\n`);
+    process.exit(code);
+  }
+
+  // Watch the spec + the sibling authoring dirs, mirroring `compile --watch`.
+  const specDir = dirname(absSpec);
+  const watchPaths = [absSpec, join(specDir, ".crewhaus", "commands"), join(specDir, "skills")];
+  const { watch } = await import("node:fs");
+  const handles: Array<{ close(): void }> = [];
+  const subscribers: Array<() => void> = [];
+  const watcher: Watcher = {
+    subscribe: (cb) => subscribers.push(cb),
+    close: () => {
+      for (const h of handles) {
+        try {
+          h.close();
+        } catch {
+          // A path that vanished mid-watch closes with an error; ignore.
+        }
+      }
+    },
+  };
+  for (const p of watchPaths) {
+    if (!existsSync(p)) continue;
+    try {
+      handles.push(
+        watch(p, { recursive: true }, () => {
+          for (const cb of subscribers) cb();
+        }),
+      );
+    } catch {
+      // Non-fatal: an unwatchable path just isn't watched.
+    }
+  }
+
+  const debounceMs = intFlag(args, "debounce") ?? 150;
+  process.stderr.write(
+    `[dev] watching ${basename(absSpec)} (+ .crewhaus/commands, skills) — Ctrl-C to stop\n`,
+  );
+  const supervisor = createDevSupervisor({
+    entry,
+    isDaemon: isDevDaemonTarget(target),
+    initialCwd: initial.cwd,
+    spawn: spawnChild,
+    recompile: () => devCompileAndEmit(absSpec, pluginsOverride),
+    watcher,
+    timer: {
+      set: (fn, ms) => setTimeout(fn, ms),
+      clear: (h) => clearTimeout(h as NodeJS.Timeout),
+    },
+    debounceMs,
+    print: (line) => process.stderr.write(`${line}\n`),
+  });
+
+  await new Promise<void>((resolveDev) => {
+    const onSigint = (): void => {
+      supervisor.stop();
+      process.off("SIGINT", onSigint);
+      process.stderr.write("\n[dev] stopped.\n");
+      resolveDev();
+    };
+    process.on("SIGINT", onSigint);
+  });
+}
+
+/**
+ * Item 4 (§59) — `crewhaus export claude-plugin <spec> [--out <dir>]`. Emits an
+ * Anthropic-compatible Claude Code plugin directory from any target shape via
+ * the pure `emitClaudePlugin`, SMOKE-TESTS the projection (the required
+ * plugin.json + any .mcp.json parse and carry their keys) BEFORE writing, then
+ * writes the files under the chosen out dir. Structured failures
+ * (SpecParseError / TargetClaudePluginError) route through die() upstream.
+ */
+async function runExportClaudePlugin(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"] === true) {
+    process.stdout.write(
+      "usage: crewhaus export claude-plugin <spec.yaml> [--out <dir>] [--force]\n" +
+        "                       [--author <name>] [--author-email <email>] [--description <text>]\n" +
+        "  Emits an Anthropic-compatible Claude Code plugin directory from the spec:\n" +
+        "  .claude-plugin/plugin.json, README.md, skills/<name>/SKILL.md, one\n" +
+        "  agents/<name>.md per sub-agent, and .mcp.json when the spec declares\n" +
+        "  mcp_servers. Drop the emitted dir under ~/.claude/plugins/ (or a project\n" +
+        "  .claude/plugins/) to load the agent's skills inside Claude Code. Default\n" +
+        "  output dir is ./<plugin-name>; --force overwrites a non-empty dir. The\n" +
+        "  emitted plugin.json / .mcp.json are smoke-checked before anything is written.\n",
+    );
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof SpecParseError) die(err.message);
+    throw err;
+  }
+
+  const descriptionFlag = strFlag(args, "description");
+  const bundle = emitClaudePlugin(ir, {
+    author: resolveClaudePluginAuthor(strFlag(args, "author"), strFlag(args, "author-email")),
+    ...(descriptionFlag !== undefined && descriptionFlag.trim() !== ""
+      ? { description: descriptionFlag.trim() }
+      : {}),
+  });
+
+  // Smoke-test the projection BEFORE writing — a malformed plugin.json /
+  // .mcp.json fails loudly instead of leaving a broken plugin dir on disk. The
+  // target-claude-plugin package tests content shape; this asserts the emitted
+  // DIRECTORY is loadable (the required files parse + carry their keys).
+  const issues = smokeCheckClaudePluginBundle(bundle.files);
+  if (issues.length > 0) {
+    die(
+      `export claude-plugin: emitted bundle failed the smoke check:\n  - ${issues.join("\n  - ")}`,
+    );
+  }
+
+  const outDir = resolveExportOutDir(strFlag(args, "out"), process.cwd(), ir.name);
+  if (existsSync(outDir) && readdirSync(outDir).length > 0 && args.flags["force"] !== true) {
+    die(`refusing to overwrite non-empty ${outDir} — pass --force to overwrite`);
+  }
+  mkdirSync(outDir, { recursive: true });
+  for (const file of bundle.files) {
+    const full = join(outDir, file.path);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, file.content);
+  }
+  const hasMcp = bundle.files.some((f) => f.path === ".mcp.json");
+  process.stdout.write(
+    `exported ${ir.name} (${ir.target}) → ${outDir} — ${bundle.files.length} files${hasMcp ? ", incl. .mcp.json" : ""}, smoke check ✓\n`,
+  );
+}
+
+/**
+ * Item 1 (G30) — `crewhaus serve --mcp <spec> [--sse]`. Compiles the spec in
+ * memory, builds the projected agent's `invoke` from the SAME interpreter turn
+ * function `crewhaus run` drives (see {@link buildServeRuntime}), and binds it
+ * to the requested transport via `@crewhaus/mcp-server` so the agent becomes a
+ * tool inside Claude Code / an IDE / another CrewHaus runtime.
+ *
+ * The transport/tools-mode resolve from the spec's `expose.mcp` block and the
+ * `--sse`/`--port` flags (`./serve-mcp`). stdio OWNS stdout (the JSON-RPC
+ * channel), so for stdio every other stdout write — the agent's own
+ * diagnostics AND runtime-core status lines — is redirected to stderr for the
+ * whole serve and the transport is handed a PRIVATE writable bound to the
+ * original stdout; a `[memory]`/`[mcp]` notice can never corrupt the protocol.
+ */
+async function runServeMcp(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"] === true) {
+    process.stdout.write(SERVE_MCP_USAGE);
+    return;
+  }
+  if (args.flags["mcp"] !== true) {
+    die(
+      "crewhaus serve requires --mcp (the only projection kind today) — see `crewhaus serve --help`",
+    );
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof SpecParseError) die(err.message);
+    throw err;
+  }
+  assertServeTargetSupported(ir.target);
+  const cliIr = ir as Extract<ReturnType<typeof lower>, { target: "cli" }>;
+
+  const expose = cliIr.expose?.mcp;
+  const transport = resolveMcpTransport(args.flags["sse"] === true, expose?.transport);
+  const toolsMode = resolveMcpToolsMode(expose?.tools);
+  assertToolsModeSatisfiable(toolsMode, cliIr.subAgents.length);
+  const port =
+    transport === "sse"
+      ? resolveServePort(strFlag(args, "port"), process.env["CREWHAUS_MCP_PORT"])
+      : SERVE_MCP_DEFAULT_PORT;
+
+  // stdio → keep the agent's stdout off the JSON-RPC channel (see the docblock).
+  let protocolStdout: Writable | undefined;
+  let restoreStdout: (() => void) | undefined;
+  if (transport === "stdio") {
+    const originalWrite = process.stdout.write;
+    const boundOriginal = originalWrite.bind(process.stdout);
+    protocolStdout = new Writable({
+      write(chunk, _enc, cb): void {
+        boundOriginal(chunk as string | Uint8Array);
+        cb();
+      },
+    });
+    (process.stdout as { write: typeof process.stdout.write }).write = ((
+      chunk: string | Uint8Array,
+      ...rest: unknown[]
+    ) =>
+      (process.stderr.write as (c: string | Uint8Array, ...a: unknown[]) => boolean)(
+        chunk,
+        ...rest,
+      )) as typeof process.stdout.write;
+    restoreStdout = () => {
+      (process.stdout as { write: typeof process.stdout.write }).write = originalWrite;
+    };
+  }
+
+  const runtime = await buildServeRuntime(args, cliIr);
+  const version = cliVersion();
+  const handle = createMcpServer({
+    invoke: runtime.invoke,
+    transport,
+    tools: toolsMode,
+    ...(toolsMode === "per-subagent"
+      ? { subAgents: buildMcpSubAgentDescriptors(cliIr.subAgents) }
+      : {}),
+    name: cliIr.name,
+    ...(version !== undefined ? { version } : {}),
+    instructions: `Calls the "${cliIr.name}" CrewHaus agent. Each tool call runs one agent turn and returns its final reply.`,
+    chatToolDescription: `Send a message to the "${cliIr.name}" agent and get its reply.`,
+  });
+
+  let sseServer: ReturnType<typeof Bun.serve> | undefined;
+  if (handle.transport === "stdio") {
+    await handle.listen(protocolStdout !== undefined ? { stdout: protocolStdout } : undefined);
+    process.stdout.write(
+      `[serve] MCP stdio server for "${cliIr.name}" ready (tools: ${toolsMode}) — add it to your MCP client's config\n`,
+    );
+  } else {
+    sseServer = Bun.serve({ port, fetch: (req) => handle.fetch(req) });
+    process.stdout.write(
+      `[serve] MCP SSE server for "${cliIr.name}" on http://localhost:${port} (tools: ${toolsMode}) — POST MCP requests to /\n`,
+    );
+  }
+
+  const shutdown = async (): Promise<void> => {
+    await handle.close().catch(() => {});
+    if (sseServer !== undefined) sseServer.stop();
+    await runtime.cleanup();
+    protocolStdout?.end();
+    restoreStdout?.();
+  };
+
+  // The transport (stdio reader / Bun.serve) keeps the loop alive; SIGINT — or,
+  // for stdio, the parent closing our stdin — tears everything down and exits.
+  await new Promise<void>((resolveServe) => {
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      void shutdown().then(() => {
+        process.stderr.write("\n[serve] stopped.\n");
+        resolveServe();
+      });
+    };
+    process.on("SIGINT", finish);
+    if (handle.transport === "stdio") {
+      process.stdin.once("end", finish);
+      process.stdin.once("close", finish);
+    }
+  });
+}
+
+/**
+ * Item 1 (G30) — build the projected agent's `invoke` (+ a `cleanup`) from the
+ * SAME interpreter wiring `crewhaus run` uses (`runRunCli`): resolve the model,
+ * load the built-in / knowledge / memory / sub-agent / plugin / MCP tools,
+ * compile the permission rules, and assemble the `runChatLoop` options. Each
+ * MCP tool call runs ONE turn (`singleTurn`) from the caller's message and
+ * resolves with the final assistant text. Turns are serialized — one agent
+ * instance, one turn at a time (which also keeps the stdio stdout redirect
+ * single-flight safe).
+ *
+ * Under `tools: "per-subagent"` a call carrying `context.subAgent` runs THAT
+ * sub-agent's turn instead: its own instructions + model and its `tools:`
+ * allowlist (a v0 simplification — the parent permission rules still apply; the
+ * sub-agent's `permissions:` scoping is not yet remapped here, see the batch-G
+ * CLI report).
+ *
+ * Deliberately a FOCUSED mirror of `runRunCli` (like `runRunBrowser`): the
+ * REPL-only surfaces — session store / resume, the exit-rating teardown, the
+ * alert & SLO sinks, incident capture, the budget cap, the MCP quarantine
+ * notice — are omitted; a served projection is stateless per call. Keep the
+ * tool / permission / model wiring in step with `runRunCli` when either moves.
+ */
+async function buildServeRuntime(
+  args: ParsedArgs,
+  ir: Extract<ReturnType<typeof lower>, { target: "cli" }>,
+): Promise<{ invoke: McpInvoke; cleanup: () => Promise<void> }> {
+  // Built-in tools (Section 14 per-tool config applied first).
+  let tools: RegisteredTool[] = [];
+  if (ir.tools.length > 0) {
+    await applyToolConfigs(ir.tools, ir.toolConfigs);
+    const toolMap = await loadToolMap();
+    tools = ir.tools.map((name) => {
+      const tool = toolMap[name];
+      if (!tool) {
+        const known = Object.keys(toolMap).sort().join(", ");
+        die(`unknown tool "${name}" — known tools: ${known}`);
+      }
+      return tool;
+    });
+  }
+
+  // Item 3 (G32) — activate plugins EARLY so their skill dirs feed discovery;
+  // their tools register LATE (first-party wins a name collision), mirroring
+  // the compiled bundle's split boot. Honours the spec `plugins:` + `--plugins`.
+  const pluginNames = resolvePluginNames(ir.plugins, strFlag(args, "plugins"));
+  let pluginSkillDirs: readonly string[] = [];
+  let pluginTools: readonly RegisteredTool[] = [];
+  if (pluginNames.length > 0) {
+    const activated = await activatePlugins({
+      names: pluginNames,
+      ...createDefaultPluginRuntime({
+        allowUnsigned: process.env["CREWHAUS_PLUGIN_ALLOW_UNSIGNED"] === "1",
+      }),
+    });
+    pluginSkillDirs = activated.skillDirs;
+    pluginTools = activated.tools;
+    process.stdout.write(
+      `[plugins] ${activated.loaded.length} activated: ${pluginNames.join(", ")}\n`,
+    );
+    for (const warning of activated.warnings) process.stdout.write(`[plugins] ${warning}\n`);
+  }
+
+  // MCP servers — connect + register remote tools (thredz through connectThredz,
+  // degrade-on-failure). Mirror of runRunCli / the target-cli codegen.
+  let mcpHost: McpHost | undefined;
+  let thredzConn: ThredzConnection | null = null;
+  const thredzWired = ir.thredz !== undefined && ir.mcp_servers["thredz"] !== undefined;
+  if (Object.keys(ir.mcp_servers).length > 0) {
+    const host = new McpHost({ logger });
+    mcpHost = host;
+    for (const [name, cfg] of Object.entries(ir.mcp_servers)) {
+      host.addServer(name, resolveMcpServerConfig(cfg, { name }));
+    }
+    const tempCatalog = new ToolCatalog();
+    for (const t of tools) tempCatalog.register(t);
+    if (thredzWired) {
+      thredzConn = await connectThredz(host, tempCatalog, {
+        log: (line) => process.stdout.write(line),
+        ...(ir.thredz?.agentName !== undefined ? { agentName: ir.thredz.agentName } : {}),
+      });
+    }
+    await Promise.all(
+      Object.keys(ir.mcp_servers)
+        .filter((name) => !(thredzWired && name === "thredz"))
+        .map((name) =>
+          registerMcpServer(host, name, tempCatalog, {
+            onRegister: ({ fullName }) => process.stdout.write(`[mcp] registered ${fullName}\n`),
+          }),
+        ),
+    );
+    tools = tempCatalog.list().slice();
+  }
+
+  // Knowledge RAG — ingest sources + register the shared Retrieve tool.
+  if (ir.knowledge !== undefined) {
+    const retrieveTool = await ingestKnowledge(ir.knowledge, {
+      cwd: process.cwd(),
+      ...(ir.memory?.embedder !== undefined ? { memoryEmbedder: ir.memory.embedder } : {}),
+      ...(ir.memory?.wiki?.embedder !== undefined ? { wikiEmbedder: ir.memory.wiki.embedder } : {}),
+      log: (line) => process.stdout.write(line),
+    });
+    tools.push(retrieveTool);
+  }
+
+  const modelOverride = args.flags["model"];
+  const model = typeof modelOverride === "string" ? modelOverride : ir.agent.model;
+  const streaming = resolveStreaming(args.flags["streaming"] === true, ir.agent.streaming);
+
+  const flagMode = args.flags["permission-mode"];
+  let permissionMode: PermissionMode;
+  if (typeof flagMode === "string") {
+    if (!isValidPermissionMode(flagMode)) {
+      die(
+        `invalid --permission-mode "${flagMode}" — allowed: ${VALID_PERMISSION_MODES.join(", ")}`,
+      );
+    }
+    permissionMode = flagMode;
+  } else {
+    permissionMode = ir.permissions.mode ?? "default";
+  }
+  const permissionRules = buildRuleSet(ir.permissions.rules, process.cwd());
+  const justificationJudge = await resolveJustificationJudge(args, ir.security?.justification);
+  const egressMatcher = await resolveEgressMatcher(args, ir.security?.egressMatcher);
+
+  // Skills / hooks / slash commands — plugin skill dirs feed skill discovery.
+  const cwd = process.cwd();
+  const [settingsHooks, discoveredSkills, discoveredCommands] = await Promise.all([
+    loadHooks({ cwd }),
+    discoverSkills({ cwd, ...(pluginSkillDirs.length > 0 ? { pluginDirs: pluginSkillDirs } : {}) }),
+    loadCommands({ cwd }),
+  ]);
+  const hooks = mergeSpecHooks(ir.hooks, settingsHooks);
+
+  // Memory + continuity + thredz (the same wireMemory a compiled bundle emits;
+  // the REPL-only exam/dream boot niceties are omitted for a served projection).
+  let skills: ReadonlyArray<SkillRef> = discoveredSkills;
+  let slashCommands: ReadonlyMap<string, SlashCommand> = discoveredCommands;
+  let memoryRunOpt: Parameters<typeof runChatLoop>[0]["memory"];
+  let continuityRunOpt: Parameters<typeof runChatLoop>[0]["continuity"];
+  if (
+    (ir.memory !== undefined && ir.memory.enabled !== false) ||
+    ir.continuity !== undefined ||
+    ir.thredz !== undefined
+  ) {
+    const wiredMemory = await wireMemory(memoryFragmentFromIr(ir), {
+      catalog: {
+        register: (tool) => {
+          tools.push(tool);
+        },
+      },
+      cwd,
+      log: (line) => process.stdout.write(line),
+      ...(ir.memory !== undefined && ir.memory.enabled !== false && ir.memory.embedder !== undefined
+        ? { embedder: createEmbedder({ model: ir.memory.embedder }) }
+        : {}),
+      ...(ir.thredz !== undefined ? { thredz: thredzConn } : {}),
+    });
+    memoryRunOpt = wiredMemory.options.memory;
+    continuityRunOpt = wiredMemory.options.continuity;
+    if (wiredMemory.options.skills !== undefined) skills = wiredMemory.options.skills;
+    if (wiredMemory.options.slashCommands !== undefined) {
+      slashCommands = wiredMemory.options.slashCommands;
+    }
+  }
+
+  if (skills.length > 0) tools.push(createSkillTool(skills));
+
+  // Sub-agents — the Task tool (chat mode) + the routing map (per-subagent).
+  let subAgents: ReadonlyMap<string, SubAgentDefinition> | undefined;
+  if (ir.subAgents.length > 0) {
+    subAgents = new Map(
+      ir.subAgents.map((d) => [
+        d.name,
+        {
+          name: d.name,
+          description: d.description,
+          instructions: d.instructions,
+          tools: d.tools,
+          ...(d.model !== undefined ? { model: d.model } : {}),
+          permissions: d.permissions,
+          inherit_bypass: d.inheritBypass,
+        } satisfies SubAgentDefinition,
+      ]),
+    );
+    tools.push(createTaskTool({ subAgents }));
+  }
+
+  // Plugin tools register LAST — a plugin tool named after a built-in / skill /
+  // MCP tool is skipped so first-party wins the collision.
+  for (const t of pluginTools) {
+    if (tools.some((existing) => existing.name === t.name)) {
+      process.stdout.write(
+        `[plugins] tool "${t.name}" already registered — plugin contribution skipped\n`,
+      );
+      continue;
+    }
+    tools.push(t);
+  }
+
+  const hasCodeExecTools = ir.tools.some(
+    (t) => t === "python" || t === "javascript" || t === "shell",
+  );
+  const sandboxAvailable = resolveSandboxAvailable();
+
+  // The loop options shared by every turn (primary agent OR a routed sub-agent).
+  const commonOptions = {
+    permissionMode,
+    permissionRules,
+    sessionName: ir.name,
+    sessionTarget: ir.target,
+    hooks,
+    skills,
+    slashCommands,
+    singleTurn: true as const,
+    ...(hasCodeExecTools ? { sandboxAvailable } : {}),
+    ...(ir.agent.maxTokens !== undefined ? { maxTokens: ir.agent.maxTokens } : {}),
+    ...(ir.compaction.model !== undefined ? { compactionModel: ir.compaction.model } : {}),
+    ...loopContractRunOptions(ir),
+    ...(streaming !== undefined ? { streaming } : {}),
+    ...(ir.failureTaxonomy !== undefined && ir.failureTaxonomy.length > 0
+      ? { failureTaxonomy: ir.failureTaxonomy }
+      : {}),
+    ...(justificationJudge !== undefined ? { justificationJudge } : {}),
+    ...(egressMatcher !== undefined ? { egressMatcher } : {}),
+  };
+
+  // Primary-agent model routing (failover / tiers / pool) — only without a
+  // `--model` override, exactly as runRunCli threads it.
+  const primaryModelRouting =
+    typeof modelOverride === "string"
+      ? {}
+      : {
+          ...(ir.agent.modelFallbacks !== undefined && ir.agent.modelFallbacks.length > 0
+            ? { modelFallbacks: ir.agent.modelFallbacks }
+            : {}),
+          ...(ir.agent.circuitBreaker !== undefined
+            ? { circuitBreaker: ir.agent.circuitBreaker }
+            : {}),
+          ...(ir.agent.modelTiers !== undefined ? { modelTiers: ir.agent.modelTiers } : {}),
+          ...(ir.agent.modelPool !== undefined ? { modelPool: ir.agent.modelPool } : {}),
+        };
+
+  const primaryOptions = {
+    ...commonOptions,
+    model,
+    instructions: ir.agent.instructions,
+    tools,
+    ...primaryModelRouting,
+    ...(subAgents !== undefined ? { subAgents, spawnSubAgent } : {}),
+    ...(memoryRunOpt !== undefined ? { memory: memoryRunOpt } : {}),
+    ...(continuityRunOpt !== undefined ? { continuity: continuityRunOpt } : {}),
+  };
+
+  // One agent, one turn at a time.
+  let queue: Promise<unknown> = Promise.resolve();
+  const serialize = <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = queue.then(fn, fn);
+    queue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+
+  const invoke: McpInvoke = (message, context) =>
+    serialize(() => {
+      if (context.subAgent !== undefined) {
+        const def = subAgents?.get(context.subAgent);
+        if (def === undefined) {
+          throw new ServeMcpError(`unknown sub-agent "${context.subAgent}"`);
+        }
+        return runChatLoop({
+          ...commonOptions,
+          model: def.model ?? model,
+          instructions: def.instructions,
+          // `def.tools` is the sub-agent's resolved allowlist (always concrete
+          // from the IR; `?? []` only satisfies the optional runtime type).
+          tools: filterChildTools(tools, def.tools ?? []),
+          seedMessages: [{ role: "user" as const, content: message }],
+        });
+      }
+      return runChatLoop({
+        ...primaryOptions,
+        seedMessages: [{ role: "user" as const, content: message }],
+      });
+    });
+
+  const cleanup = async (): Promise<void> => {
+    if (mcpHost !== undefined) await mcpHost.disconnectAll();
+  };
+
+  return { invoke, cleanup };
+}
+
 async function runDoctor(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -4966,6 +6463,13 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
     const { verify: verifyAuditLog } = await import("@crewhaus/audit-log");
     checks.push(buildAuditIntegrityCheck(await verifyAuditLog(auditDir)));
   }
+
+  // Loop contract 0.4 (Batch C, item 4) — surface this project's agent
+  // identity fingerprint (the `agentId` stamped onto every trace envelope +
+  // audit record) so an operator can correlate traces/audits to this agent.
+  // Read-only: doctor never mints one (a run does, on first boot) — an absent
+  // file is reported informationally, not created.
+  process.stdout.write(`${describeAgentIdentityLine(process.cwd())}\n`);
 
   for (const c of checks) {
     if (c.warn && c.pass) {
@@ -5827,6 +7331,11 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     gradersYaml = (ratingsDistill as { gradersYaml: string }).gradersYaml;
   }
   const { compiled } = parseGradersConfig(gradersYaml);
+  // G14 — same registry-construction rule as `crewhaus eval`: `type:
+  // registry` graders get the default registry, built ONCE here and reused
+  // by every fitness eval the search runs (N candidate evals must not
+  // re-discover plugins per pass).
+  const graderRegistry = await graderRegistryForCompiled(compiled);
 
   // Materialize the training set once — we'll re-iterate per fitness call. It
   // is the union of the file dataset (if any) and the distilled ratings (if
@@ -5938,6 +7447,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       runId,
       outDir,
       compiled,
+      ...(graderRegistry !== undefined ? { graderRegistry } : {}),
       devSet,
       datasetName,
       concurrency,
@@ -6024,6 +7534,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         concurrency,
         seed,
         retryErrors,
+        ...(graderRegistry !== undefined ? { graderRegistry } : {}),
       },
     });
     // Item 7 — failure-arbiter pre-filter: classify this candidate's failing
@@ -6067,7 +7578,12 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       });
     // Item 9 — report where this measurement's eval run was persisted so
     // the optimizer can surface the baseline/winner dirs for pinning.
-    return { score: summary.aggregates.passRate, grades, runDir: summary.outDir };
+    // G56 — the search ranks candidates by PARTIAL CREDIT when the runner
+    // emitted it (partialScoreMean: mean overall score over ALL samples,
+    // errored ones scoring 0), falling back to passRate on older summaries —
+    // a candidate that moves failing answers closer to the bar now measures
+    // as progress even before whole samples flip.
+    return { score: fitnessScore(summary.aggregates), grades, runDir: summary.outDir };
   };
 
   const mutator = args.flags["mutator"];
@@ -6213,6 +7729,8 @@ async function runOptimizeFromAdvice(opts: {
   readonly runId: string;
   readonly outDir: string;
   readonly compiled: ReadonlyArray<CompiledGrader>;
+  /** G14 — the shared default registry (when the graders opt into one). */
+  readonly graderRegistry?: GraderLookup;
   readonly devSet: ReadonlyArray<{ id: string; input: string; expected_output?: string }>;
   readonly datasetName: string;
   readonly concurrency: number;
@@ -6274,6 +7792,7 @@ async function runOptimizeFromAdvice(opts: {
         concurrency: opts.concurrency,
         seed: opts.seed,
         retryErrors: opts.retryErrors,
+        ...(opts.graderRegistry !== undefined ? { graderRegistry: opts.graderRegistry } : {}),
       },
     });
     process.stdout.write(
@@ -6620,6 +8139,10 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
     die(`could not read ${data.graders}: ${(err as Error).message}`);
   }
   const { compiled } = parseGradersConfig(gradersYaml);
+  // G14 — same registry-construction rule as `eval`/`optimize`: built ONCE
+  // and shared by the before/after acceptance evals and every per-iteration
+  // fitness eval.
+  const graderRegistry = await graderRegistryForCompiled(compiled);
 
   // Materialize the dataset once (file path or registry: ref) — the same
   // sample set feeds the before eval, the optimizer's dev evals, and the
@@ -6752,6 +8275,7 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
         seed: knobs.seed,
         datasetHash,
         retryErrors: true,
+        ...(graderRegistry !== undefined ? { graderRegistry } : {}),
       },
     });
     process.stdout.write(
@@ -6805,6 +8329,7 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
         concurrency: knobs.concurrency,
         seed: knobs.seed,
         retryErrors: true,
+        ...(graderRegistry !== undefined ? { graderRegistry } : {}),
       },
     });
     let excludedFromSignal: ReadonlySet<string> = new Set<string>();
@@ -6837,7 +8362,10 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
           rationale: r.grades.overall.rationale,
         };
       });
-    return { score: summary.aggregates.passRate, grades, runDir: summary.outDir };
+    // G56 — partial credit when the runner emitted it (see the optimize
+    // fitness fn): the acceptance GATE still compares pass rates, only the
+    // search's candidate ranking gains the gradient.
+    return { score: fitnessScore(summary.aggregates), grades, runDir: summary.outDir };
   };
 
   let optimizeResult: Awaited<ReturnType<typeof optimizeSpec>> | undefined;
@@ -7185,7 +8713,7 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus eval <spec.yaml> --dataset <data> --graders <graders.yaml> " +
-        "[--judge-model <model>] [--concurrency N] [--seed N] [-o <out-dir>] " +
+        "[--judge-model <model>] [--concurrency N] [--seed N] [--repeats K] [-o <out-dir>] " +
         "[--gate] [--no-promote] [--no-regressions] [--no-retry] [--models <m1,m2,...>]\n" +
         "  --dataset takes a file path (jsonl/csv/yaml/http) or registry:<name>[@version][#split]\n" +
         "  — a Section 29 dataset-registry ref (.crewhaus/datasets, or CREWHAUS_DATASETS_DIR).\n" +
@@ -7208,6 +8736,25 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  noise, not a graded failure) are retried once by default; the retried outcome\n" +
         "  replaces the errored one and is tagged retried:true in results.json (the summary\n" +
         "  line and run index report the retried count). --no-retry disables the retry.\n" +
+        "  When the spec declares a failure_taxonomy, a sample's final error is classified\n" +
+        "  against it (results.json failureClass + a `failure classes:` output tally), and\n" +
+        "  a matched class declaring `recovery: fail` SUPPRESSES the noise auto-retry —\n" +
+        "  the user declared that error terminal, so re-running it is futile.\n" +
+        "  --repeats K runs every sample K times (trial t gets seed+t-1 when --seed is\n" +
+        "  set; i.i.d. draws otherwise). Trial 1 is the canonical result; per-trial grades\n" +
+        "  land on the sample (results.json trials[]) and the aggregates gain pass@K (at\n" +
+        "  least one trial passed — the optimistic capability metric) and pass^K (ALL K\n" +
+        "  passed — tau-bench's reliability metric: a flaky 60%-reliable agent scores\n" +
+        "  0.6^K). Trials run sequentially inside each sample's concurrency slot, so a\n" +
+        "  K-repeat run costs ~K× the wall clock and spend; the summary's\n" +
+        "  tokens_all_trials makes the real spend visible.\n" +
+        "  Graders with `type: registry` resolve against the default grader registry:\n" +
+        "  the six specialty packs (continuity.*, twelve.*, nlg.*, semantic.similarity,\n" +
+        "  multimodal.*, safety.*) plus .crewhaus/graders plugins, which win on name\n" +
+        "  collisions. Constructed once per run and shared with every matrix cell.\n" +
+        "  llm_judge rubrics that declare no passing_score gate on the calibrated cut\n" +
+        "  from .crewhaus/judge-calibration.json when present (`crewhaus judge calibrate\n" +
+        "  --apply`); the run output and run.json note every grader gated this way.\n" +
         "  After the run, every failing sample is triaged by the failure arbiter into\n" +
         "  bug / spec-gap / noise / contract-ambiguity: verdicts land in <out>/verdicts.json\n" +
         "  + a report section + a one-line `triage:` summary. Triage never pins samples the\n" +
@@ -7308,6 +8855,17 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (seed !== undefined && Number.isNaN(seed)) {
     die(`invalid --seed "${seedFlag}" — must be integer`);
   }
+  // G15 — trials per sample. Validated strictly here ("3.5"/"3x" die rather
+  // than silently truncate) so a bad value is loud BEFORE any dataset load or
+  // spend, mirroring the runner's own integer>=1 guard.
+  const repeatsFlag = args.flags["repeats"];
+  const repeats = typeof repeatsFlag === "string" ? Number.parseInt(repeatsFlag, 10) : undefined;
+  if (
+    repeats !== undefined &&
+    (Number.isNaN(repeats) || repeats < 1 || String(repeats) !== (repeatsFlag as string).trim())
+  ) {
+    die(`invalid --repeats "${repeatsFlag}" — must be a positive integer`);
+  }
 
   const absSpec = resolve(specPath);
   let yamlText: string;
@@ -7338,6 +8896,11 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   // results.json so `--sentinel` can assert a fresh run graded with the same
   // rubric/thresholds as the baseline (see hashGradersConfig doc comment).
   const gradersHash = hashGradersConfig(gradersConfig);
+  // G14 — graders that resolve by registry name get the default registry
+  // (six specialty packs + .crewhaus/graders plugins), constructed ONCE here
+  // and shared with every matrix cell; `runEval` has the identical fallback,
+  // so the vocabulary cannot differ between the CLI and library paths.
+  const graderRegistry = await graderRegistryForCompiled(compiled);
 
   // Item 12 — `--dataset registry:<name>[@version][#split]` resolves via the
   // Section 29 dataset registry instead of loadDataset. datasetName becomes
@@ -7429,6 +8992,8 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
       ...(typeof outDirArg === "string" ? { outDirArg } : {}),
       ...(concurrency !== undefined ? { concurrency } : {}),
       ...(seed !== undefined ? { seed } : {}),
+      ...(repeats !== undefined ? { repeats } : {}),
+      ...(graderRegistry !== undefined ? { graderRegistry } : {}),
       ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
     });
   }
@@ -7454,6 +9019,8 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
       retryErrors,
       ...(concurrency !== undefined ? { concurrency } : {}),
       ...(seed !== undefined ? { seed } : {}),
+      ...(repeats !== undefined ? { repeats } : {}),
+      ...(graderRegistry !== undefined ? { graderRegistry } : {}),
       ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
     },
   });
@@ -7492,10 +9059,13 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
       baselineDatasetHash,
       currentDatasetHash: datasetHash,
     });
-    process.stdout.write(
-      `[eval] runId=${summary.runId} pass_rate=${(summary.aggregates.passRate * 100).toFixed(1)}% ` +
-        `mean_score=${summary.aggregates.meanScore.toFixed(3)}\n`,
-    );
+    // Same output block as a normal run (Batch B: partial_score / loop
+    // metrics / repeats / failure classes / calibration notes) — a sentinel
+    // is still a run someone reads.
+    const sentinelRetried = summary.samples.filter((s) => s.retried === true).length;
+    for (const line of evalRunOutputLines(summary, { retriedCount: sentinelRetried })) {
+      process.stdout.write(`${line}\n`);
+    }
     process.stdout.write(`[eval] report: ${join(absOut, "index.html")}\n`);
     process.stdout.write(`[sentinel] ${result.verdict}: ${result.reason}\n`);
     if (result.alert) {
@@ -7538,14 +9108,13 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
 
   // Item 7/F12 — surface retry activity: how many recorded outcomes replaced
   // an errored first attempt (also recorded in the run index as retriedCount).
+  // Batch B: the classic summary line plus the presence-gated partial_score /
+  // loop-metrics / pass@k–pass^k / failure-class / judge-calibration lines
+  // (see eval-output.ts — each prints only when the run carries the data).
   const retriedCount = summary.samples.filter((s) => s.retried === true).length;
-  process.stdout.write(
-    `[eval] runId=${summary.runId} pass_rate=${(summary.aggregates.passRate * 100).toFixed(1)}% ` +
-      `mean_score=${summary.aggregates.meanScore.toFixed(3)} ` +
-      `errors=${summary.aggregates.errorCount} ` +
-      `tokens=${summary.aggregates.totalTokens.input}/${summary.aggregates.totalTokens.output}` +
-      `${retriedCount > 0 ? ` (${retriedCount} retried)` : ""}\n`,
-  );
+  for (const line of evalRunOutputLines(summary, { retriedCount })) {
+    process.stdout.write(`${line}\n`);
+  }
   process.stdout.write(`[eval] report: ${join(absOut, "index.html")}\n`);
 
   // Run-history: append to the index, diff/gate against the pinned baseline,
@@ -7590,6 +9159,10 @@ async function runEvalMatrixCommand(opts: {
   readonly outDirArg?: string;
   readonly concurrency?: number;
   readonly seed?: number;
+  /** G15 — `--repeats`, threaded into every cell (per-cell pass@k/pass^k). */
+  readonly repeats?: number;
+  /** G14 — the shared default registry, constructed once for all cells. */
+  readonly graderRegistry?: GraderLookup;
   readonly judgeModel?: string;
 }): Promise<void> {
   const rootDir =
@@ -7617,6 +9190,8 @@ async function runEvalMatrixCommand(opts: {
           retryErrors: opts.retryErrors,
           ...(opts.concurrency !== undefined ? { concurrency: opts.concurrency } : {}),
           ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
+          ...(opts.repeats !== undefined ? { repeats: opts.repeats } : {}),
+          ...(opts.graderRegistry !== undefined ? { graderRegistry: opts.graderRegistry } : {}),
           ...(opts.judgeModel !== undefined ? { judgeModel: opts.judgeModel } : {}),
         },
       });
@@ -9791,7 +11366,56 @@ async function captureFeedback(
 
   const log = await openEventLog(session, { rootDir: join(process.cwd(), SESSIONS_SUBDIR) });
   await log.append({ kind: FEEDBACK_EVENT_KIND, payload: record });
+  // G59 — also mirror a `response_rated` TraceEvent onto the session trace so
+  // the human rating is present in the session's durable trace vocabulary
+  // (the sibling of the rich `user_feedback` record `distill` reads), the
+  // offline analogue of an in-session capture surface publishing it live.
+  mirrorResponseRated(session, record);
   process.stdout.write(`recorded ${record.modality} feedback on ${session} turn ${turnNumber}\n`);
+}
+
+/**
+ * G59 — append a `response_rated` TraceEvent to the session JSONL (the durable
+ * trace mirror). Emitted only when the record carries a numeric/thumbs rating
+ * (a comment/correction-only record has no `rating`, and `ResponseRatedEvent`
+ * requires one). Written in the event-log wire shape (`{ ts, version, kind,
+ * payload }`) directly rather than via `EventLog.append` — `response_rated` is
+ * a trace-bus kind, not a conversational `EventKind`, and every session-log
+ * reader branches on the kinds it knows and skips the rest, so this stays
+ * additive-safe (resume/replay/distill ignore it).
+ */
+function mirrorResponseRated(session: string, record: FeedbackRecord): void {
+  const rating: "up" | "down" | number | undefined =
+    record.rating.thumbs !== undefined ? record.rating.thumbs : normalizeRating(record);
+  if (rating === undefined) return; // comment/correction-only — no rating to mirror
+  const payload: {
+    rating: "up" | "down" | number;
+    turnNumber: number;
+    source: FeedbackSource;
+    comment?: string;
+    targetSpanId?: string;
+  } = {
+    rating,
+    turnNumber: record.turnNumber,
+    source: record.source,
+    ...(record.comment !== undefined ? { comment: record.comment } : {}),
+    ...(record.targetSpanId !== undefined ? { targetSpanId: record.targetSpanId } : {}),
+  };
+  const wire = {
+    ts: Date.parse(record.ts) || Date.now(),
+    version: 1,
+    kind: "response_rated",
+    payload,
+  };
+  try {
+    appendFileSync(sessionJsonlPath(session), `${JSON.stringify(wire)}\n`, { mode: 0o600 });
+  } catch (err) {
+    // The durable user_feedback record already landed; a mirror failure must
+    // never fail the capture command.
+    logger.debug("response_rated.mirror_failed", {
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 async function runRate(args: ParsedArgs): Promise<void> {
@@ -9840,6 +11464,84 @@ async function runFeedbackCmd(args: ParsedArgs): Promise<void> {
     ...(correction !== undefined ? { correction } : {}),
     ...(strFlag(args, "rater") !== undefined ? { rater: strFlag(args, "rater") } : {}),
   });
+}
+
+/**
+ * Loop contract 0.4 (Batch C, G11) — `crewhaus approvals list|show|grant|deny`.
+ * Reads/writes the file-backed `PendingApprovalStore` under the harness's
+ * `.crewhaus/sessions/` (the same store the runtime parks against and re-reads
+ * to resume a paused run). `--dir` overrides the harness root; `--json` prints
+ * the raw store records; grant/deny record an out-of-band decision keyed on the
+ * approval id.
+ */
+async function runApprovals(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"] || action === "") {
+    process.stdout.write(
+      "usage: crewhaus approvals list|show|grant|deny <id> [--dir <root>] [--by <who>] [--json]\n" +
+        "  list                 all parked approvals under .crewhaus/sessions/, newest first\n" +
+        "  show <id>            full detail for one approval (incl. the verbatim tool input)\n" +
+        "  grant <id> [--once]  record a GRANT — the next run re-issuing the same tool call\n" +
+        "                       proceeds pre-approved. --once (default) is one-shot: the\n" +
+        "                       runtime consumes the grant on use, so a later identical call\n" +
+        "                       re-asks. --by <who> records the deciding identity (> CREWHAUS_USER > cli).\n" +
+        "  deny <id>            record a DENY — the parked call is refused with a note on resume.\n" +
+        "  These resolve the parks a headless run creates when a tool permission asks and\n" +
+        "  `permissions.ask_mode: pause` (the default) is set.\n",
+    );
+    return;
+  }
+  const dirFlag = args.flags["dir"];
+  const harnessRoot = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const rootDir = join(harnessRoot, SESSIONS_SUBDIR);
+  const store = createPendingApprovalStore({ rootDir });
+  const json = args.flags["json"] === true;
+
+  if (action === "list") {
+    const list = await store.list();
+    if (json) {
+      process.stdout.write(`${JSON.stringify(list, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(formatApprovalsTable(list));
+    return;
+  }
+
+  const id = args.positional[0];
+  if (typeof id !== "string" || id === "") die("missing <id> — see `crewhaus approvals`");
+
+  if (action === "show") {
+    const found = (await store.list()).find((a: PendingApproval) => a.id === id);
+    if (found === undefined) die(`no approval "${id}" under ${rootDir}`);
+    if (json) {
+      process.stdout.write(`${JSON.stringify(found, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(formatApprovalDetail(found));
+    return;
+  }
+
+  // grant | deny — record an out-of-band decision.
+  const by = strFlag(args, "by") ?? process.env["CREWHAUS_USER"] ?? "cli";
+  const decision: "grant" | "deny" = action === "grant" ? "grant" : "deny";
+  let updated: PendingApproval | null;
+  try {
+    updated = await store.resolve(id, decision, by);
+  } catch (err) {
+    // resolve() throws on a malformed id (not appr_<16 hex>).
+    die(err instanceof Error ? err.message : String(err));
+  }
+  if (updated === null) die(`no approval "${id}" under ${rootDir}`);
+  if (json) {
+    process.stdout.write(`${JSON.stringify(updated, null, 2)}\n`);
+    return;
+  }
+  const note =
+    decision === "grant"
+      ? " (one-shot — the runtime consumes it on the next matching tool call)"
+      : "";
+  process.stdout.write(
+    `${decision === "grant" ? "granted" : "denied"} ${id} — ${updated.toolName}${note}\n`,
+  );
 }
 
 /** List `sess_*` ids that have a transcript under `.crewhaus/sessions`. */
@@ -10321,20 +12023,108 @@ async function runLessons(args: ParsedArgs): Promise<void> {
  */
 async function runSessions(args: ParsedArgs): Promise<void> {
   const action = args.positional[0];
-  if (args.flags["help"] === true && action === undefined) {
+  if (args.flags["help"] === true) {
     process.stdout.write(
       "usage: crewhaus sessions summarize [--before <date>] [--evicted] [--ttl-days N]\n" +
-        "  Summarize sessions (outcome, tools, ratings, key facts) into the durable\n" +
+        "       crewhaus sessions export --format trajectories [--out <file.jsonl>]\n" +
+        "       crewhaus sessions tail [<session>] [--dir <root>] [--no-follow] [--interval <ms>]\n" +
+        "  summarize: fold sessions (outcome, tools, ratings, key facts) into the durable\n" +
         "  .crewhaus/sessions-index/ before their transcripts expire (30-day TTL).\n" +
-        "  --evicted runs a TTL eviction pass and indexes each session just before it is deleted.\n",
+        "  --evicted runs a TTL eviction pass and indexes each session just before it is deleted.\n" +
+        "\n" +
+        "  tail: follow a session's transcript live (a `tail -f` for a running agent —\n" +
+        "  the per-turn view `crewhaus dev` points at). With no <session>, tails the\n" +
+        "  most-recently-updated one under .crewhaus/sessions. Each user/assistant turn,\n" +
+        "  tool call + result, and failure prints one line as it lands. --no-follow dumps\n" +
+        "  the current transcript and exits (scriptable/CI); --interval sets the poll ms\n" +
+        "  (default 500). --dir points at a session store other than cwd/.crewhaus/sessions.\n" +
+        "\n" +
+        "  export --format trajectories: one JSONL line per agent step — a\n" +
+        "  (state, action, observation, reward) tuple — assembled from every session\n" +
+        "  event log under .crewhaus/sessions (plus a session's trace events when a\n" +
+        "  sibling <id>.events.jsonl exists). state is the full verbatim message prefix\n" +
+        "  before the action (so lines are independently consumable, at O(n²) size for\n" +
+        "  long sessions); action is the assistant's text and/or tool calls (one model\n" +
+        "  response = one action); observation is the tool results the environment\n" +
+        "  returned (null for a plain text turn). reward is terminal-sparse — null on\n" +
+        "  every step except the session's last, which carries: the last eval_graded\n" +
+        "  score when the session has one, else the latest user rating normalized to\n" +
+        "  [0,1] (thumbs up→1/down→0, stars (n-1)/4 — the distill convention), else\n" +
+        "  null. rewardSource says which rung fired. --out writes the JSONL to a file;\n" +
+        "  omitted, it streams to stdout (the summary line then goes to stderr).\n" +
+        "\n" +
+        "  G53 posture — trajectory RL is EXPERIMENTAL: inference-time scaffolding\n" +
+        "  (eval → optimize → flywheel) is the mature improvement lane, and published\n" +
+        "  results still show trajectory-level RL on agent scaffolds collapsing. This\n" +
+        "  export exists so an external trainer can consume real sessions; the\n" +
+        "  meta-harness optimizer stays an opt-in experiment and is deliberately NOT\n" +
+        "  wired into `crewhaus optimize` in this batch (there is no --mutator\n" +
+        "  meta-harness).\n",
     );
     return;
   }
-  if (action !== "summarize") {
-    die(`sessions: unknown action "${action ?? ""}" — supported: summarize`);
+  // Loop contract 0.4 (Batch F, item 2) — `sessions tail` follows a live
+  // transcript; it owns its own dir resolution + follow loop, so branch before
+  // the summarize/export dir setup below.
+  if (action === "tail") {
+    await runSessionsTail(args);
+    return;
+  }
+  if (action !== "summarize" && action !== "export") {
+    die(`sessions: unknown action "${action ?? ""}" — supported: summarize, export, tail`);
   }
   const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
   const indexDir = join(process.cwd(), ".crewhaus", SESSIONS_INDEX_DIRNAME);
+
+  // Loop contract 0.4 (Batch B, G53) — `sessions export --format trajectories`.
+  if (action === "export") {
+    const format = strFlag(args, "format");
+    if (format !== "trajectories") {
+      die(
+        `sessions export: unsupported --format "${format ?? ""}" — supported: trajectories (see \`crewhaus sessions --help\` for the tuple shape and the G53 posture)`,
+      );
+    }
+    const ids = listSessionIds(sessionsDir).sort();
+    if (ids.length === 0) die(`no sessions found under ${sessionsDir}`);
+    const steps: TrajectoryStep[] = [];
+    let sessionsWithSteps = 0;
+    for (const id of ids) {
+      let text: string;
+      try {
+        text = readFileSync(join(sessionsDir, `${id}.jsonl`), "utf-8");
+      } catch {
+        continue; // evicted between listing and read — skip, never abort
+      }
+      const events = parseSessionLog(text);
+      // A session's persisted trace events, when present (the eval
+      // per-sample artifact convention, `<id>.events.jsonl` here) — the
+      // carrier of `eval_graded` reward signal.
+      const tracePath = join(sessionsDir, `${id}.events.jsonl`);
+      const traceEvents = existsSync(tracePath)
+        ? parseJsonlLoose(readFileSync(tracePath, "utf-8"))
+        : [];
+      const sessionSteps = assembleTrajectory(id, events, traceEvents);
+      if (sessionSteps.length > 0) sessionsWithSteps += 1;
+      steps.push(...sessionSteps);
+    }
+    const jsonl = trajectoryStepsToJsonl(steps);
+    const summaryLine =
+      `[sessions] exported ${steps.length} trajectory step(s) from ` +
+      `${sessionsWithSteps}/${ids.length} session(s)`;
+    const outFlag = strFlag(args, "out");
+    if (outFlag !== undefined) {
+      const outPath = resolve(outFlag);
+      mkdirSync(dirname(outPath), { recursive: true });
+      writeFileSync(outPath, jsonl);
+      process.stdout.write(`${summaryLine} → ${outPath}\n`);
+    } else {
+      // JSONL owns stdout so the export is pipeable; the human line goes to
+      // stderr.
+      process.stdout.write(jsonl);
+      process.stderr.write(`${summaryLine}\n`);
+    }
+    return;
+  }
 
   if (args.flags["evicted"] === true) {
     // Summarize-before-evict: wire the session-store hook so each expiring
@@ -10380,6 +12170,93 @@ async function runSessions(args: ParsedArgs): Promise<void> {
     if (summarizeSessionIntoIndex(id, logPath, indexDir) !== undefined) indexed += 1;
   }
   process.stdout.write(`[sessions] summarized ${indexed} session(s) into ${indexDir}\n`);
+}
+
+/**
+ * Loop contract 0.4 (Batch F, item 2) — `crewhaus sessions tail [<session>]`.
+ * Follows a session's append-only event log and pretty-prints each turn as it
+ * lands. With no id, selects the most-recently-updated session. `--no-follow`
+ * dumps the current transcript and exits (scriptable/CI); otherwise polls the
+ * log every `--interval` ms until Ctrl-C. Transcript lines go to STDOUT (so a
+ * `--no-follow` dump is pipeable); status chrome goes to stderr.
+ */
+async function runSessionsTail(args: ParsedArgs): Promise<void> {
+  const dirFlag = strFlag(args, "dir");
+  const sessionsDir =
+    dirFlag !== undefined ? resolve(dirFlag) : join(process.cwd(), SESSIONS_SUBDIR);
+  const explicitId = args.positional[1];
+  if (typeof explicitId === "string" && !SESSION_ID_REGEX.test(explicitId)) {
+    die(`invalid <session> "${explicitId}" — expected sess_<16 hex>`);
+  }
+  if (!existsSync(sessionsDir)) {
+    die(`no session store at ${sessionsDir} — run an agent first, or pass --dir <root>.`);
+  }
+  const sessionId = pickSessionToTail(explicitId, {
+    list: () => readdirSync(sessionsDir),
+    mtimeMs: (f) => {
+      try {
+        return statSync(join(sessionsDir, f)).mtimeMs;
+      } catch {
+        return 0;
+      }
+    },
+  });
+  if (sessionId === undefined) {
+    die(`no sessions found under ${sessionsDir}. Start one with \`crewhaus run <spec>\`.`);
+  }
+  const logPath = join(sessionsDir, `${sessionId}.jsonl`);
+  const readLog = (): string => {
+    try {
+      return readFileSync(logPath, "utf-8");
+    } catch {
+      return "";
+    }
+  };
+
+  const follow = args.flags["no-follow"] !== true;
+  let intervalMs = 500;
+  const intervalFlag = intFlag(args, "interval");
+  if (intervalFlag !== undefined) {
+    if (intervalFlag < 50) die("--interval must be >= 50 (ms)");
+    intervalMs = intervalFlag;
+  }
+
+  // Initial dump (also seeds the follow cursor so live updates don't re-print
+  // the backlog). `advanceSessionTail` counts source lines, so it stays correct
+  // even across the side-channel events that render to nothing.
+  let cursor: SessionTailCursor = { lineCount: 0 };
+  {
+    const initial = advanceSessionTail(readLog(), cursor);
+    for (const line of initial.lines) process.stdout.write(`${line}\n`);
+    cursor = initial.cursor;
+  }
+
+  if (!follow) {
+    // A no-follow dump renders the current transcript (every newline-terminated
+    // event — event-log always terminates each line) and exits.
+    process.stderr.write(`[sessions] tailed ${sessionId} (${logPath})\n`);
+    return;
+  }
+
+  process.stderr.write(`tailing ${sessionId} (${logPath}) — Ctrl-C to stop\n`);
+  await new Promise<void>((resolveTail) => {
+    let stopped = false;
+    const tick = (): void => {
+      if (stopped) return;
+      const advanced = advanceSessionTail(readLog(), cursor);
+      for (const line of advanced.lines) process.stdout.write(`${line}\n`);
+      cursor = advanced.cursor;
+    };
+    const handle = setInterval(tick, intervalMs);
+    const onSigint = (): void => {
+      stopped = true;
+      clearInterval(handle);
+      process.off("SIGINT", onSigint);
+      process.stderr.write("\ntail stopped.\n");
+      resolveTail();
+    };
+    process.on("SIGINT", onSigint);
+  });
 }
 
 // -------- 0.3.0 memory release: crewhaus memory + migrate memories --------
@@ -11804,9 +13681,10 @@ async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
         "       [--registry <ref>] [--dry-run]\n" +
         "\n" +
         "  The registry backend is a directory of manifest JSONs (or file:<dir>) or an\n" +
-        "  http(s):// index; falls back to CREWHAUS_PLUGIN_REGISTRY. Install respects\n" +
-        "  plugin-registry's fail-closed signature verification; --allow-unsigned opts\n" +
-        "  out for local development.\n",
+        "  http(s):// index; falls back to CREWHAUS_PLUGIN_REGISTRY, then the default\n" +
+        "  public registry (registry.crewhaus.ai/plugins). Install respects plugin-\n" +
+        "  registry's fail-closed signature verification; --allow-unsigned opts out for\n" +
+        "  local development.\n",
     );
     return;
   }
@@ -11817,10 +13695,13 @@ async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
   const registryPath =
     typeof registryFileFlag === "string" ? registryFileFlag : defaultPluginRegistryPath();
   const allowUnsigned = args.flags["allow-unsigned"] === true;
+  // Item 10 (G89) — registry resolution: --registry > CREWHAUS_PLUGIN_REGISTRY >
+  // the default public registry (registry.crewhaus.ai/plugins), so `plugins
+  // list`/`search` work out of the box with no configuration.
   const registryRef =
     typeof args.flags["registry"] === "string"
       ? args.flags["registry"]
-      : process.env["CREWHAUS_PLUGIN_REGISTRY"];
+      : (process.env["CREWHAUS_PLUGIN_REGISTRY"] ?? DEFAULT_MODULE_REGISTRY_URL);
 
   const { createPluginRegistry } = await import("@crewhaus/plugin-registry");
   const pluginRegistry = createPluginRegistry({ registryPath, allowUnsigned });
@@ -12015,14 +13896,18 @@ async function runTemplates(args: ParsedArgs, action: string): Promise<void> {
         "       [--subdir <dir>] [--registry <ref>]\n" +
         "\n" +
         "  The registry backend is a directory of manifest JSONs (or file:<dir>) or an\n" +
-        "  http(s):// index; falls back to CREWHAUS_TEMPLATE_REGISTRY.\n",
+        "  http(s):// index; falls back to CREWHAUS_TEMPLATE_REGISTRY, then the default\n" +
+        "  public registry (registry.crewhaus.ai/templates).\n",
     );
     return;
   }
+  // Item 10 (G89) — registry resolution: --registry > CREWHAUS_TEMPLATE_REGISTRY
+  // > the default public registry (registry.crewhaus.ai/templates), so
+  // `templates list`/`search` work out of the box with no configuration.
   const registryRef =
     typeof args.flags["registry"] === "string"
       ? args.flags["registry"]
-      : process.env["CREWHAUS_TEMPLATE_REGISTRY"];
+      : (process.env["CREWHAUS_TEMPLATE_REGISTRY"] ?? DEFAULT_TEMPLATE_REGISTRY_URL);
   const resolved = resolveMarketplaceRegistryRef(registryRef, "template");
 
   const { LocalRegistrySource, HttpRegistrySource } = await import("@crewhaus/template-registry");
@@ -13066,6 +14951,135 @@ async function runMigrateAll(args: ParsedArgs): Promise<void> {
  * `incident.json`+`events.jsonl` for this session (CREWHAUS_INCIDENTS), those
  * ring events are folded in and the kind/reason default from it.
  */
+/**
+ * G63 — `crewhaus failures report`. Reads run_failed events across the
+ * harness's session logs + incident bundle manifests, clusters them by
+ * FailureClass + message similarity (see `./failures`), and prints a table.
+ * `--propose-taxonomy` additionally drafts paste-ready failure_taxonomy
+ * entries. Read-only; a report, never a gate (always exits 0).
+ */
+async function runFailuresReport(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus failures report [--sessions N|all] [--propose-taxonomy] [-o <taxonomy.yaml>]\n" +
+        "                                [--dir <root>] [--json]\n" +
+        "  Aggregate run_failed events (across .crewhaus/sessions) + incident bundles\n" +
+        "  (.crewhaus/incidents/*/bundle.json), cluster them by FailureClass + message\n" +
+        "  similarity (normalized-token, offline), and print a table ranked by frequency.\n" +
+        "  --propose-taxonomy   draft failure_taxonomy entries from the clusters (paste-ready\n" +
+        "                       YAML; -o writes them to a file). Each pattern is matched as a\n" +
+        "                       case-insensitive substring of error.message — review before adopting.\n" +
+        "  --sessions N|all     limit the scan to the N most-recent sessions (default: all).\n" +
+        "  approval_pending parks are excluded — resolve those with `crewhaus approvals`.\n",
+    );
+    return;
+  }
+  const dirFlag = args.flags["dir"];
+  const harnessRoot = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const sessionsDir = join(harnessRoot, SESSIONS_SUBDIR);
+  const incidentsDir = join(harnessRoot, ".crewhaus", "incidents");
+
+  // Session scope: all (default) or the N most-recent.
+  let sessionIds = sessionIdsByRecency(sessionsDir);
+  const sessionsFlag = args.flags["sessions"];
+  if (typeof sessionsFlag === "string" && sessionsFlag !== "all") {
+    const n = Number.parseInt(sessionsFlag, 10);
+    if (Number.isNaN(n) || n < 1) {
+      die(`invalid --sessions "${sessionsFlag}" — a positive integer or "all"`);
+    }
+    sessionIds = sessionIds.slice(0, n);
+  }
+
+  const records: FailureRecord[] = [];
+
+  // 1) run_failed events from the session logs (the ONE failure each run died
+  //    with — payload `{ class, message, remediation?, exitCode }`).
+  for (const id of sessionIds) {
+    let events: unknown[];
+    try {
+      events = parseJsonlObjects(readFileSync(join(sessionsDir, `${id}.jsonl`), "utf-8"));
+    } catch {
+      continue; // a vanished/unreadable log is skipped, not fatal
+    }
+    for (const ev of events) {
+      if (ev === null || typeof ev !== "object") continue;
+      const e = ev as { kind?: unknown; ts?: unknown; payload?: unknown };
+      if (e.kind !== "run_failed") continue;
+      const p = (e.payload ?? {}) as { class?: unknown; message?: unknown; exitCode?: unknown };
+      records.push({
+        source: "run_failed",
+        class: typeof p.class === "string" ? p.class : "unknown",
+        message: typeof p.message === "string" ? p.message : "",
+        sessionId: id,
+        ...(typeof e.ts === "number" ? { ts: e.ts } : {}),
+        ...(typeof p.exitCode === "number" ? { exitCode: p.exitCode } : {}),
+      });
+    }
+  }
+
+  // 2) incident bundle manifests (auto-assembled on a failure trigger).
+  if (existsSync(incidentsDir)) {
+    for (const name of readdirSync(incidentsDir)) {
+      const manifestPath = join(incidentsDir, name, "bundle.json");
+      if (!existsSync(manifestPath)) continue;
+      let manifest: {
+        kind?: unknown;
+        sessionId?: unknown;
+        reason?: unknown;
+        incidentTs?: unknown;
+      };
+      try {
+        manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+      } catch {
+        continue;
+      }
+      const kind = typeof manifest.kind === "string" ? manifest.kind : "incident";
+      const ts =
+        typeof manifest.incidentTs === "string" ? Date.parse(manifest.incidentTs) : Number.NaN;
+      records.push({
+        source: "incident",
+        class: `incident:${kind}`,
+        message: typeof manifest.reason === "string" ? manifest.reason : "",
+        sessionId: typeof manifest.sessionId === "string" ? manifest.sessionId : name,
+        ...(Number.isFinite(ts) ? { ts } : {}),
+      });
+    }
+  }
+
+  const clusters = clusterFailureRecords(records);
+  const proposeTax = args.flags["propose-taxonomy"] === true;
+
+  if (args.flags["json"] === true) {
+    const proposal = proposeTax ? proposeTaxonomy(clusters) : undefined;
+    process.stdout.write(
+      `${JSON.stringify(
+        { clusters, ...(proposal !== undefined ? { taxonomy: proposal } : {}) },
+        null,
+        2,
+      )}\n`,
+    );
+    return;
+  }
+
+  process.stdout.write(renderFailuresTable(clusters));
+
+  if (proposeTax) {
+    const proposal = proposeTaxonomy(clusters);
+    const yaml = renderTaxonomyYaml(proposal);
+    const outFlag = args.flags["out"];
+    if (typeof outFlag === "string") {
+      writeFileSync(resolve(outFlag), yaml);
+      process.stdout.write(
+        `\n[failures] drafted ${proposal.drafts.length} failure_taxonomy entr${
+          proposal.drafts.length === 1 ? "y" : "ies"
+        } → ${resolve(outFlag)}\n`,
+      );
+    } else {
+      process.stdout.write(`\n${yaml}`);
+    }
+  }
+}
+
 async function runIncidentCollect(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -13372,6 +15386,259 @@ async function runCloud(args: ParsedArgs, action: string): Promise<void> {
     return;
   }
   die(`unknown cloud action "${action}" (expected: deploy | teardown)`);
+}
+
+/** Write a provider's scaffolded manifests under `outDir`, returning the
+ *  relative file names (for the summary). Shared by every `deploy <provider>`
+ *  arm. */
+function writeDeployFiles(
+  outDir: string,
+  files: ReadonlyArray<{ readonly path: string; readonly content: string }>,
+): string[] {
+  mkdirSync(outDir, { recursive: true });
+  const written: string[] = [];
+  for (const file of files) {
+    const full = join(outDir, file.path);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, file.content);
+    written.push(file.path);
+  }
+  return written;
+}
+
+/**
+ * Loop contract 0.4 (Batch F, item 5) — `crewhaus deploy <fly|render|railway|
+ * heroku> <spec> [-o <dir>] [--app <name>] [--image <ref>] [--region <r>]
+ * [--live]`.
+ *
+ * Scaffolds the provider's deploy manifests (a Dockerfile wrapper + the
+ * provider's IaC descriptor) from the spec's target shape, then — gated on the
+ * provider API token — optionally performs the LIVE deploy through the matching
+ * `@crewhaus/cloud-adapter-*` engine (dynamic-imported, lazy-booted exactly
+ * like `crewhaus cloud`). Default is scaffold-only: the live deploy needs BOTH
+ * `--live` AND the provider token, so a token-less run (CI, a first look) never
+ * touches a real API. Only daemon shapes (channel/managed/batch/voice/browser)
+ * deploy — a single-shot shape has nothing to keep running.
+ */
+async function runCloudDeploy(
+  args: ParsedArgs,
+  providerName: CloudDeployProviderName,
+): Promise<void> {
+  const provider = CLOUD_DEPLOY_PROVIDERS[providerName];
+  if (args.flags["help"] === true) {
+    const providerFlag =
+      providerName === "railway"
+        ? " [--project <projectId>]"
+        : providerName === "fly"
+          ? " [--org <slug>]"
+          : providerName === "render"
+            ? " [--owner <ownerId>]"
+            : "";
+    const lines = [
+      `usage: crewhaus deploy ${providerName} <spec.yaml> [-o <dir>] [--app <name>] [--image <ref>] [--region <r>] [--live]${providerFlag}`,
+      `  Scaffolds ${provider.label} deploy manifests (a Dockerfile + the provider's IaC`,
+      `  descriptor) for a daemon-shape spec (${CLOUD_DEPLOY_TARGET_SHAPES.join("/")}), under`,
+      "  <dir> (default ./deploy/<provider>).",
+      `  --live   also deploy to ${provider.label} via its API — GATED on ${provider.tokenEnv}`,
+      "           (absent → scaffold and stop). The deploy never runs without --live.",
+      "  --app    app/service name (default: the spec name, sanitized to the provider grammar).",
+      "  --image  base image the generated Dockerfile wraps (default crewhaus/<target>:latest).",
+    ];
+    if (providerName === "fly") {
+      lines.push(
+        "  --image is ALSO the machine image --live launches (build+push it first with",
+        "           `crewhaus build-image <target> --push`).",
+      );
+    }
+    if (providerName === "railway") {
+      lines.push(
+        "  --project <id> is required for --live (Railway attaches the service to a project).",
+      );
+    }
+    process.stdout.write(`${lines.join("\n")}\n`);
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+  const target = ir.target;
+  if (!isCloudDeployTargetShape(target)) {
+    die(
+      `deploy ${providerName}: target "${target}" is not a deployable daemon shape — ${provider.label} runs the long-lived shapes ${CLOUD_DEPLOY_TARGET_SHAPES.join("/")}. A single-shot shape (cli/workflow/graph/…) has nothing to keep running: compile + run it directly, or \`compile --emit-as cf-worker\` for the edge.`,
+    );
+  }
+  const appName = resolveCloudDeployAppName(ir.name, strFlag(args, "app"));
+  const baseImage = strFlag(args, "image") ?? defaultCloudDeployBaseImage(target);
+  const region = strFlag(args, "region");
+  const outFlag = strFlag(args, "out");
+  const outDir =
+    outFlag !== undefined ? resolve(outFlag) : resolve(join(process.cwd(), "deploy", providerName));
+  const live = args.flags["live"] === true;
+  const tokenPresent = cloudDeployTokenPresent(provider);
+  // --live must clear the token gate BEFORE any manifest is written or any API
+  // is touched, naming the exact env var the engine also resolves.
+  if (live && !tokenPresent) {
+    die(
+      `deploy ${providerName} --live needs ${provider.tokenEnv} (unset) — set it, or drop --live to scaffold the manifests only.`,
+    );
+  }
+
+  try {
+    switch (providerName) {
+      case "fly": {
+        const fly = await import("@crewhaus/cloud-adapter-flyio");
+        const files = [
+          {
+            path: "fly.toml",
+            content: fly.flyTomlFor({
+              target,
+              appName,
+              ...(region !== undefined ? { primaryRegion: region } : {}),
+            }),
+          },
+          { path: "Dockerfile.fly", content: fly.flyDockerfileFor({ target, baseImage }) },
+        ];
+        const written = writeDeployFiles(outDir, files);
+        if (!live) {
+          process.stdout.write(
+            formatCloudDeployNextSteps({ provider, outDir, tokenPresent, files: written }),
+          );
+          return;
+        }
+        const imageRef = strFlag(args, "image");
+        if (imageRef === undefined) {
+          die(
+            "deploy fly --live needs --image <pushed-image-ref>: Fly launches a machine from a registry image. Build + push first with `crewhaus build-image <target> --push`, then pass its ref.",
+          );
+        }
+        const org = strFlag(args, "org");
+        const rec = await fly.deployToFly({
+          appName,
+          imageRef,
+          target,
+          ...(region !== undefined ? { region } : {}),
+          ...(org !== undefined ? { orgSlug: org } : {}),
+        });
+        process.stdout.write(
+          `deployed to ${provider.label}: app ${rec.appName} machine ${rec.machineId} (${rec.status}) in ${rec.region}\n`,
+        );
+        return;
+      }
+      case "render": {
+        const render = await import("@crewhaus/cloud-adapter-render");
+        // `region` is the free-form CLI flag; the blueprint types it as the
+        // RenderRegion union but only interpolates it (defaulting "oregon"), so
+        // cast through the function's own parameter type — no static engine
+        // import — and let the adapter own any validation.
+        type RenderRegionArg = NonNullable<
+          Parameters<typeof render.renderBlueprintFor>[0]["region"]
+        >;
+        const blueprintYaml = render.renderBlueprintFor({
+          target,
+          serviceName: appName,
+          ...(region !== undefined ? { region: region as RenderRegionArg } : {}),
+        });
+        const files = [
+          { path: "render.yaml", content: blueprintYaml },
+          { path: "Dockerfile.render", content: render.renderDockerfileFor({ target, baseImage }) },
+        ];
+        const written = writeDeployFiles(outDir, files);
+        if (!live) {
+          process.stdout.write(
+            formatCloudDeployNextSteps({ provider, outDir, tokenPresent, files: written }),
+          );
+          return;
+        }
+        const owner = strFlag(args, "owner");
+        const rec = await render.deployToRender({
+          blueprintYaml,
+          serviceName: appName,
+          ...(owner !== undefined ? { ownerId: owner } : {}),
+        });
+        process.stdout.write(
+          `deployed to ${provider.label}: service ${rec.serviceId} deploy ${rec.deployId} (${rec.status})${rec.url !== undefined ? ` → ${rec.url}` : ""}\n`,
+        );
+        return;
+      }
+      case "railway": {
+        const railway = await import("@crewhaus/cloud-adapter-railway");
+        const files = [
+          { path: "railway.json", content: railway.railwayConfigFor({ target }) },
+          {
+            path: "Dockerfile.railway",
+            content: railway.railwayDockerfileFor({ target, baseImage }),
+          },
+        ];
+        const written = writeDeployFiles(outDir, files);
+        if (!live) {
+          process.stdout.write(
+            formatCloudDeployNextSteps({ provider, outDir, tokenPresent, files: written }),
+          );
+          return;
+        }
+        const projectId = strFlag(args, "project");
+        if (projectId === undefined) {
+          die(
+            "deploy railway --live needs --project <projectId>: Railway attaches the service to an existing project. Create one in the Railway dashboard and pass its id.",
+          );
+        }
+        const rec = await railway.deployToRailway({ projectId, serviceName: appName });
+        process.stdout.write(
+          `deployed to ${provider.label}: service ${rec.serviceName} (${rec.serviceId}) in project ${rec.projectId}\n`,
+        );
+        return;
+      }
+      case "heroku": {
+        const heroku = await import("@crewhaus/cloud-adapter-heroku");
+        const files = [
+          { path: "heroku.yml", content: heroku.herokuYmlFor({ target }) },
+          { path: "app.json", content: heroku.appJsonFor({ target, name: appName }) },
+          { path: "Dockerfile.heroku", content: heroku.herokuDockerfileFor({ target, baseImage }) },
+        ];
+        const written = writeDeployFiles(outDir, files);
+        if (!live) {
+          process.stdout.write(
+            formatCloudDeployNextSteps({ provider, outDir, tokenPresent, files: written }),
+          );
+          return;
+        }
+        // Heroku accepts only the two macro-regions.
+        let herokuRegion: "us" | "eu" | undefined;
+        if (region !== undefined) {
+          if (region !== "us" && region !== "eu") {
+            die(`deploy heroku --region must be "us" or "eu" (got "${region}")`);
+          }
+          herokuRegion = region;
+        }
+        const rec = await heroku.deployToHeroku({
+          appName,
+          ...(herokuRegion !== undefined ? { region: herokuRegion } : {}),
+        });
+        process.stdout.write(
+          `deployed to ${provider.label}: app ${rec.appName} (${rec.appId}) → ${rec.webUrl}\n`,
+        );
+        return;
+      }
+      default:
+        assertNever(providerName);
+    }
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    die(`deploy ${providerName}: ${(err as Error).message}`);
+  }
 }
 
 /**
@@ -15304,6 +17571,64 @@ switch (subcommand) {
       throw err;
     }
     break;
+  case "runs": {
+    // Loop contract 0.4 (Batch F, item 7, CLI half) — `runs resume <session>`
+    // re-drives a persisted session (the runtime half is runChatLoop's resume
+    // seam). `runs` is the run-lifecycle namespace (cf. the gateway's
+    // `runs.subscribe`); only `resume` is a CLI verb today.
+    const first = rest[0] ?? "";
+    const isHelp = first === "--help" || first === "-h";
+    if (!isHelp && first !== "resume") {
+      die(`runs action must be "resume" (got "${first}")`);
+    }
+    try {
+      await runRunsResume(parseFor(isHelp ? rest : rest.slice(1), RUNS_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err);
+      throw err;
+    }
+    break;
+  }
+  case "dev":
+    // Loop contract 0.4 (Batch F, item 2) — compile in memory + supervised
+    // child + watch-relaunch. Structured failures (spec parse / lower) route
+    // through die() for a clean one-liner.
+    try {
+      await runDev(parseFor(rest, DEV_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err);
+      throw err;
+    }
+    break;
+  case "serve":
+    // Item 1 (G30) — project the spec's agent as an MCP server (stdio/SSE).
+    // Structured failures (spec parse/lower, ServeMcpError for a misconfigured
+    // projection) route through die() for a clean one-liner.
+    try {
+      await runServeMcp(parseFor(rest, SERVE_SCHEMA));
+    } catch (err) {
+      if (err instanceof ServeMcpError) die(err.message);
+      if (err instanceof CrewhausError) die(err);
+      throw err;
+    }
+    break;
+  case "export": {
+    // Item 4 (§59) — `export claude-plugin <spec>`. Only the claude-plugin
+    // target exists today; a leading -h/--help routes to the handler's help.
+    const first = rest[0] ?? "";
+    const isHelp = first === "--help" || first === "-h";
+    if (!isHelp && first !== "claude-plugin") {
+      die(`export target must be "claude-plugin" (got "${first}")`);
+    }
+    try {
+      await runExportClaudePlugin(parseFor(isHelp ? rest : rest.slice(1), EXPORT_SCHEMA));
+    } catch (err) {
+      if (err instanceof TargetClaudePluginError) die(err.message);
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "eval":
     // Item 6 — `eval coverage` is a distinct read-side report with its own
     // flags; every other `eval …` invocation is the run path.
@@ -15442,6 +17767,39 @@ switch (subcommand) {
   case "feedback":
     await runFeedbackCmd(parseFor(rest, FEEDBACK_SCHEMA));
     break;
+  case "approvals": {
+    // Loop contract 0.4 (Batch C, G11) — list | show | grant | deny <id>.
+    // A leading -h/--help (help flag in the action slot) routes to the
+    // handler's own help, not the invalid-action error.
+    const first = rest[0] ?? "";
+    const isHelp = first === "--help" || first === "-h";
+    const action = isHelp ? "" : first;
+    if (!isHelp && !["", "list", "show", "grant", "deny"].includes(action)) {
+      die(`approvals action must be one of: list, show, grant, deny (got "${action}")`);
+    }
+    try {
+      await runApprovals(parseFor(isHelp ? rest : rest.slice(1), APPROVALS_SCHEMA), action);
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "failures": {
+    // G63 — `failures report`: aggregate/cluster run_failed + incidents.
+    const first = rest[0] ?? "";
+    const isHelp = first === "--help" || first === "-h";
+    if (!isHelp && first !== "report") {
+      die(`failures action must be "report" (got "${first}")`);
+    }
+    try {
+      await runFailuresReport(parseFor(isHelp ? rest : rest.slice(1), FAILURES_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "distill":
     await runDistill(parseFor(rest, DISTILL_SCHEMA));
     break;
@@ -15612,8 +17970,24 @@ switch (subcommand) {
   }
   case "deploy": {
     const action = rest[0] ?? "";
+    // Loop contract 0.4 (Batch F, item 5) — the cloud-provider arms
+    // (fly/render/railway/heroku) scaffold + token-gated live-deploy through a
+    // cloud-adapter-* engine; the registry ones (promote/rollback/canary) flip
+    // a spec-registry env pin. They share the `deploy` verb but nothing else,
+    // so route by action to keep each schema/handler focused.
+    if (isCloudDeployProvider(action)) {
+      try {
+        await runCloudDeploy(parseFor(rest.slice(1), CLOUD_DEPLOY_SCHEMA), action);
+      } catch (err) {
+        if (err instanceof CrewhausError) die(err.message);
+        throw err;
+      }
+      break;
+    }
     if (action !== "promote" && action !== "rollback" && action !== "canary") {
-      die(`deploy action must be "promote", "rollback", or "canary" (got "${action}")`);
+      die(
+        `deploy action must be one of: fly, render, railway, heroku, promote, rollback, canary (got "${action}")`,
+      );
     }
     try {
       await runDeploy(parseFor(rest.slice(1), DEPLOY_SCHEMA), action);

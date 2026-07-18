@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import type { ProviderRequest } from "@crewhaus/adapter-anthropic";
+import {
+  EFFORT_THINKING_BUDGET_TOKENS,
+  type ProviderRequest,
+  type ReasoningEffort,
+} from "@crewhaus/adapter-anthropic";
 import { toOpenAIChatParams } from "./translate.js";
 
 const baseReq: ProviderRequest = {
@@ -8,6 +12,19 @@ const baseReq: ProviderRequest = {
   messages: [{ role: "user", content: "hi" }],
   maxTokens: 1024,
 };
+
+/** Recursively collect every key name appearing anywhere in a value. */
+function allKeys(node: unknown, into: Set<string> = new Set()): Set<string> {
+  if (Array.isArray(node)) {
+    for (const item of node) allKeys(item, into);
+  } else if (node !== null && typeof node === "object") {
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      into.add(key);
+      allKeys(value, into);
+    }
+  }
+  return into;
+}
 
 describe("toOpenAIChatParams", () => {
   test("non-reasoning models keep max_tokens (compat servers only understand it)", () => {
@@ -73,13 +90,22 @@ describe("toOpenAIChatParams", () => {
       ],
       toolChoice: { type: "tool", name: "Read" },
     });
+    // A plain object schema qualifies for Structured-Outputs strict mode:
+    // `additionalProperties: false`, every property in `required`, and the
+    // (originally optional) `path` made nullable so omission is expressible.
     expect(params.tools).toEqual([
       {
         type: "function",
         function: {
           name: "Read",
           description: "Read a file",
-          parameters: { type: "object", properties: { path: { type: "string" } } },
+          parameters: {
+            type: "object",
+            properties: { path: { type: ["string", "null"] } },
+            required: ["path"],
+            additionalProperties: false,
+          },
+          strict: true,
         },
       },
     ]);
@@ -89,6 +115,73 @@ describe("toOpenAIChatParams", () => {
   test("toolChoice 'any' → 'required'", () => {
     const params = toOpenAIChatParams({ ...baseReq, toolChoice: { type: "any" } });
     expect(params.tool_choice).toBe("required");
+  });
+
+  test("a $ref-heavy but strict-expressible schema is upgraded to strict:true", () => {
+    const params = toOpenAIChatParams({
+      ...baseReq,
+      tools: [
+        {
+          name: "connect",
+          description: "open a connection",
+          input_schema: {
+            type: "object",
+            properties: {
+              target: { $ref: "#/$defs/Endpoint" },
+              retries: { type: "integer" },
+            },
+            required: ["target"],
+            $defs: {
+              Endpoint: {
+                type: "object",
+                properties: { url: { type: "string" } },
+                required: ["url"],
+              },
+            },
+          },
+        },
+      ],
+    });
+    const fn = params.tools?.[0]?.function as {
+      strict?: boolean;
+      parameters?: Record<string, unknown>;
+    };
+    expect(fn.strict).toBe(true);
+    const p = fn.parameters as Record<string, unknown>;
+    expect(p["additionalProperties"]).toBe(false);
+    // both properties required under strict; the optional one made nullable
+    expect(new Set(p["required"] as string[])).toEqual(new Set(["target", "retries"]));
+    const props = p["properties"] as Record<string, Record<string, unknown>>;
+    expect(props["retries"]?.["type"]).toEqual(["integer", "null"]);
+    // ref inlined + nested object also locked down
+    const target = props["target"] as Record<string, unknown>;
+    expect(target["additionalProperties"]).toBe(false);
+    expect(allKeys(p).has("$ref")).toBe(false);
+  });
+
+  test("a schema outside the strict subset stays non-strict (no strict flag)", () => {
+    const params = toOpenAIChatParams({
+      ...baseReq,
+      tools: [
+        {
+          name: "search",
+          description: "search",
+          input_schema: {
+            type: "object",
+            properties: { q: { type: "string", pattern: "^.+$" } },
+            required: ["q"],
+          },
+        },
+      ],
+    });
+    const fn = params.tools?.[0]?.function as { strict?: boolean; parameters?: unknown };
+    expect(fn.strict).toBeUndefined();
+    // Original schema rides through untouched (constraints preserved).
+    expect(fn.parameters).toEqual({
+      type: "object",
+      properties: { q: { type: "string", pattern: "^.+$" } },
+      required: ["q"],
+    });
   });
 
   test("assistant tool_use block → tool_calls on the assistant message", () => {
@@ -425,5 +518,94 @@ describe("toOpenAIChatParams", () => {
     });
     const assistant = params.messages[2] as { tool_calls?: { function: { arguments: string } }[] };
     expect(assistant.tool_calls?.[0]?.function.arguments).toBe("{}");
+  });
+});
+
+describe("toOpenAIChatParams — reasoning effort", () => {
+  test("reasoningEffort passes through verbatim on reasoning models", () => {
+    for (const model of ["o1", "o3", "o4-mini", "gpt-5", "gpt-5-mini"]) {
+      const params = toOpenAIChatParams({ ...baseReq, model, reasoningEffort: "high" });
+      expect(params.reasoning_effort).toBe("high");
+    }
+  });
+
+  test("reasoningEffort is silently ignored on non-reasoning models", () => {
+    for (const model of ["gpt-4o", "gpt-4o-mini", "llama3.1:8b", "deepseek-chat"]) {
+      const params = toOpenAIChatParams({ ...baseReq, model, reasoningEffort: "high" });
+      expect(params.reasoning_effort).toBeUndefined();
+    }
+  });
+
+  test("neither reasoningEffort nor thinking → no reasoning_effort, even on reasoning models", () => {
+    const params = toOpenAIChatParams({ ...baseReq, model: "o3" });
+    expect(params.reasoning_effort).toBeUndefined();
+  });
+
+  test("thinking.budgetTokens alone derives the exact preset buckets", () => {
+    for (const [effort, budgetTokens] of Object.entries(EFFORT_THINKING_BUDGET_TOKENS)) {
+      const params = toOpenAIChatParams({
+        ...baseReq,
+        model: "o3",
+        thinking: { type: "enabled", budgetTokens },
+      });
+      expect(params.reasoning_effort).toBe(effort as ReasoningEffort);
+    }
+  });
+
+  test("thinking.budgetTokens derives the NEAREST bucket for off-preset budgets", () => {
+    const cases: ReadonlyArray<[number, ReasoningEffort]> = [
+      [1024, "low"], // below the low preset
+      [3000, "low"], // nearer 2048 than 8192
+      [6000, "medium"], // nearer 8192 than 2048
+      [20000, "high"], // nearer 24576 than 8192
+      [100000, "high"], // above the high preset
+    ];
+    for (const [budgetTokens, expected] of cases) {
+      const params = toOpenAIChatParams({
+        ...baseReq,
+        model: "o3",
+        thinking: { type: "enabled", budgetTokens },
+      });
+      expect(params.reasoning_effort).toBe(expected);
+    }
+  });
+
+  test("bucket ties resolve to the lower effort", () => {
+    // 5120 is equidistant from low (2048) and medium (8192); 16384 from
+    // medium (8192) and high (24576).
+    const ties: ReadonlyArray<[number, ReasoningEffort]> = [
+      [5120, "low"],
+      [16384, "medium"],
+    ];
+    for (const [budgetTokens, expected] of ties) {
+      const params = toOpenAIChatParams({
+        ...baseReq,
+        model: "o3",
+        thinking: { type: "enabled", budgetTokens },
+      });
+      expect(params.reasoning_effort).toBe(expected);
+    }
+  });
+
+  test("explicit reasoningEffort wins over thinking.budgetTokens (native effort control)", () => {
+    // Inverted precedence vs the budget-token providers: OpenAI's native
+    // knob IS the effort string, so the preset passes through and the
+    // budget is not consulted.
+    const params = toOpenAIChatParams({
+      ...baseReq,
+      model: "gpt-5",
+      reasoningEffort: "low",
+      thinking: { type: "enabled", budgetTokens: 24576 },
+    });
+    expect(params.reasoning_effort).toBe("low");
+  });
+
+  test("thinking-derived effort is also ignored on non-reasoning models", () => {
+    const params = toOpenAIChatParams({
+      ...baseReq,
+      model: "gpt-4o",
+      thinking: { type: "enabled", budgetTokens: 8192 },
+    });
+    expect(params.reasoning_effort).toBeUndefined();
   });
 });

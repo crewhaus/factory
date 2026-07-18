@@ -15,7 +15,10 @@
  * rather than throw: URL-sourced images (Converse only takes bytes),
  * images with media types outside Converse's gif/jpeg/png/webp set, and
  * request-side thinking blocks (providers on Converse don't require
- * reasoning passback) are dropped.
+ * reasoning passback) are dropped. The reasoning controls
+ * (`req.thinking` / `req.reasoningEffort`) are likewise ignored —
+ * Converse has no cross-vendor field for a thinking budget or effort
+ * preset (the Anthropic family honours both on its native path).
  */
 
 import type {
@@ -42,6 +45,7 @@ import type {
   TokenUsage,
   ToolChoice,
 } from "@crewhaus/adapter-anthropic";
+import { sanitizeBedrockSchema } from "@crewhaus/tool-schema-sanitizer";
 
 /** The Smithy JSON-document type, recovered without a @smithy/types dep. */
 type ConverseDocument = NonNullable<ToolUseBlock["input"]>;
@@ -78,7 +82,10 @@ export function buildConverseRequest(req: ProviderRequest): ConverseStreamComman
       toolSpec: {
         name: t.name,
         description: t.description,
-        inputSchema: { json: t.input_schema as ConverseDocument },
+        // Inline $refs and strip the structural metadata Converse models
+        // reject (additionalProperties, $schema/$id, …) before handing
+        // the schema to the model-agnostic tool spec.
+        inputSchema: { json: sanitizeBedrockSchema(t.input_schema) as ConverseDocument },
       },
     }));
     input.toolConfig =

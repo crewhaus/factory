@@ -36,6 +36,17 @@ describe("buildConverseRequest — request marshalling", () => {
     ).toBeUndefined();
   });
 
+  test("reasoning controls (thinking / reasoningEffort) are silently ignored", () => {
+    // Converse has no cross-vendor thinking-budget or effort field — the
+    // request must be byte-identical to one without reasoning controls.
+    const input = buildConverseRequest({
+      ...baseReq,
+      thinking: { type: "enabled", budgetTokens: 8192 },
+      reasoningEffort: "high",
+    });
+    expect(input).toEqual(buildConverseRequest(baseReq));
+  });
+
   test("omits toolConfig entirely when the request is toolless", () => {
     expect(buildConverseRequest(baseReq).toolConfig).toBeUndefined();
     // An empty tools array is toolless too — Converse rejects an empty
@@ -63,6 +74,62 @@ describe("buildConverseRequest — request marshalling", () => {
         },
       ],
     });
+  });
+
+  test("a $ref-heavy MCP schema is sanitised for the Converse tool spec", () => {
+    // Unresolved `$ref` + `additionalProperties` + `oneOf` previously
+    // reached Converse and 400'd on models without a JSON-Schema resolver.
+    const input = buildConverseRequest({
+      ...baseReq,
+      tools: [
+        {
+          name: "connect",
+          description: "open a connection",
+          input_schema: {
+            $schema: "https://json-schema.org/draft/2020-12/schema",
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              target: { $ref: "#/$defs/Endpoint" },
+              mode: { oneOf: [{ const: "sync" }, { const: "async" }] },
+            },
+            required: ["target"],
+            $defs: {
+              Endpoint: {
+                type: "object",
+                additionalProperties: false,
+                properties: { url: { type: "string" } },
+                required: ["url"],
+              },
+            },
+          },
+        },
+      ],
+    });
+    const json = input.toolConfig?.tools?.[0]?.toolSpec?.inputSchema?.json as Record<
+      string,
+      unknown
+    >;
+    const keys = new Set<string>();
+    const walk = (n: unknown): void => {
+      if (Array.isArray(n)) for (const i of n) walk(i);
+      else if (n !== null && typeof n === "object") {
+        for (const [k, v] of Object.entries(n)) {
+          keys.add(k);
+          walk(v);
+        }
+      }
+    };
+    walk(json);
+    for (const banned of ["$ref", "$defs", "$schema", "additionalProperties", "oneOf"]) {
+      expect(keys.has(banned)).toBe(false);
+    }
+    // ref inlined into the object graph
+    const props = json["properties"] as Record<string, Record<string, unknown>>;
+    const target = props["target"] as Record<string, unknown>;
+    expect((target["properties"] as Record<string, unknown>)["url"]).toBeDefined();
+    // oneOf renamed to anyOf (Converse accepts anyOf)
+    expect(Array.isArray(props["mode"]?.["anyOf"])).toBe(true);
   });
 
   test("maps toolChoice auto/any/tool onto the Converse member shapes", () => {

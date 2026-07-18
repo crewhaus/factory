@@ -19,12 +19,14 @@
     "@crewhaus/model-router": "workspace:*"
   },
   "peerDependencies": {
+    "@crewhaus/audit-log": "workspace:*",
     "@crewhaus/channel-adapter-base": "workspace:*",
     "@crewhaus/channel-adapter-discord": "workspace:*",
     "@crewhaus/channel-adapter-imessage": "workspace:*",
     "@crewhaus/channel-adapter-slack": "workspace:*",
     "@crewhaus/channel-adapter-telegram": "workspace:*",
     "@crewhaus/channel-adapter-whatsapp": "workspace:*",
+    "@crewhaus/eval-judge": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
     "@crewhaus/mcp-host": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",

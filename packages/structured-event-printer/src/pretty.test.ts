@@ -248,6 +248,36 @@ describe("formatBody — every kind + optional-field branches", () => {
     );
   });
 
+  test("curate — embedder-backed pass", () => {
+    const ev = {
+      ...envelope,
+      kind: "curate",
+      before: 42,
+      after: 30,
+      dropped: 12,
+      bytesSaved: 8192,
+      embedded: true,
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("curate")}before=42 after=30 dropped=12 bytesSaved=8192 embedded`,
+    );
+  });
+
+  test("curate — BM25-only fallback labels bm25", () => {
+    const ev = {
+      ...envelope,
+      kind: "curate",
+      before: 10,
+      after: 9,
+      dropped: 1,
+      bytesSaved: 128,
+      embedded: false,
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("curate")}before=10 after=9 dropped=1 bytesSaved=128 bm25`,
+    );
+  });
+
   test("permission_decision WITH outcome + reason includes both", () => {
     const ev = {
       ...envelope,
@@ -620,6 +650,33 @@ describe("formatBody — every kind + optional-field branches", () => {
     expect(formatLine(ev)).toBe(`${prefix("response_rated")}rating=0.50`);
   });
 
+  // Loop contract 0.4 (Batch C, G11) — pending-approval lifecycle.
+  test("approval_requested renders tool/approval/surface", () => {
+    const ev = {
+      ...envelope,
+      kind: "approval_requested",
+      approvalId: "appr_1",
+      toolName: "Bash",
+      surface: "single-turn",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("approval_requested")}tool=Bash approval=appr_1 surface=single-turn`,
+    );
+  });
+
+  test("approval_resolved renders approval/decision/by", () => {
+    const ev = {
+      ...envelope,
+      kind: "approval_resolved",
+      approvalId: "appr_1",
+      decision: "grant",
+      by: "slack:U0123",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("approval_resolved")}approval=appr_1 decision=grant by=slack:U0123`,
+    );
+  });
+
   test("program_output", () => {
     const ev = {
       ...envelope,
@@ -675,6 +732,62 @@ describe("formatBody — every kind + optional-field branches", () => {
     } satisfies TraceEvent;
     expect(formatLine(ev)).toBe(`${prefix("sanitizer_report")}program=p-2 sanitizer=ubsan clean`);
   });
+
+  // Loop contract 0.4 (Batch B, G62) — in-loop evaluation verdicts.
+  test("eval_graded renders grader/score/threshold/verdict/retry", () => {
+    const ev = {
+      ...envelope,
+      kind: "eval_graded",
+      score: 0.8,
+      threshold: 0.7,
+      verdict: "pass",
+      graderType: "llm_judge",
+      retryIndex: 0,
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("eval_graded")}grader=llm_judge score=0.80 threshold=0.70 verdict=pass retry=0`,
+    );
+  });
+
+  test("eval_graded fail on a retry renders the retry index", () => {
+    const ev = {
+      ...envelope,
+      kind: "eval_graded",
+      score: 0,
+      threshold: 1,
+      verdict: "fail",
+      graderType: "contains",
+      retryIndex: 1,
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("eval_graded")}grader=contains score=0.00 threshold=1.00 verdict=fail retry=1`,
+    );
+  });
+
+  test("judge_verdict WITH rationale includes it", () => {
+    const ev = {
+      ...envelope,
+      kind: "judge_verdict",
+      stepOrNode: "gate",
+      verdict: "fail",
+      score: 0.4,
+      rationale: "missing second source",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("judge_verdict")}at=gate verdict=fail score=0.40 rationale=missing second source`,
+    );
+  });
+
+  test("judge_verdict WITHOUT rationale omits the suffix", () => {
+    const ev = {
+      ...envelope,
+      kind: "judge_verdict",
+      stepOrNode: "gate",
+      verdict: "pass",
+      score: 0.95,
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(`${prefix("judge_verdict")}at=gate verdict=pass score=0.95`);
+  });
 });
 
 describe("formatJsonLine — JSON Lines", () => {
@@ -686,5 +799,16 @@ describe("formatJsonLine — JSON Lines", () => {
     expect(parsed.kind).toBe("turn_start");
     expect(parsed.turn).toBe(1);
     expect(parsed.runId).toBe("run_a");
+  });
+
+  test("carries the Batch-C agentId envelope field onto the JSON wire when stamped", () => {
+    const ev = {
+      ...env({ agentId: "ed25519:abc123" }),
+      kind: "turn_start",
+      turn: 1,
+      messageCount: 0,
+    } satisfies TraceEvent;
+    const parsed = JSON.parse(formatJsonLine(ev).trimEnd());
+    expect(parsed.agentId).toBe("ed25519:abc123");
   });
 });

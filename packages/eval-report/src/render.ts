@@ -93,18 +93,62 @@ ${body}
 }
 
 function aggregateCards(s: EvalRunSummary): string {
+  const a = s.aggregates;
   const cards = [
-    { label: "Pass rate", value: `${(s.aggregates.passRate * 100).toFixed(1)}%` },
-    { label: "Mean score", value: s.aggregates.meanScore.toFixed(3) },
+    { label: "Pass rate", value: `${(a.passRate * 100).toFixed(1)}%` },
+    { label: "Mean score", value: a.meanScore.toFixed(3) },
     { label: "Samples", value: String(s.samples.length) },
-    { label: "Errors", value: String(s.aggregates.errorCount) },
-    { label: "p50 turns", value: s.aggregates.p50Turns.toFixed(1) },
-    { label: "p95 turns", value: s.aggregates.p95Turns.toFixed(1) },
-    { label: "p50 latency", value: `${Math.round(s.aggregates.p50LatencyMs)}ms` },
-    { label: "p95 latency", value: `${Math.round(s.aggregates.p95LatencyMs)}ms` },
-    { label: "Tokens in", value: String(s.aggregates.totalTokens.input) },
-    { label: "Tokens out", value: String(s.aggregates.totalTokens.output) },
+    { label: "Errors", value: String(a.errorCount) },
+    { label: "p50 turns", value: a.p50Turns.toFixed(1) },
+    { label: "p95 turns", value: a.p95Turns.toFixed(1) },
+    { label: "p50 latency", value: `${Math.round(a.p50LatencyMs)}ms` },
+    { label: "p95 latency", value: `${Math.round(a.p95LatencyMs)}ms` },
+    { label: "Tokens in", value: String(a.totalTokens.input) },
+    { label: "Tokens out", value: String(a.totalTokens.output) },
   ];
+  // Loop contract 0.4 (Batch B) — G15 pass@k / pass^k and G56 loop-quality
+  // aggregates. All guarded: results.json written by older CLIs lacks them
+  // and must keep rendering card-for-card as before.
+  const k = s.config.repeats;
+  if (a.passAtK !== undefined) {
+    cards.push({
+      label: k !== undefined ? `pass@${k}` : "pass@k",
+      value: `${(a.passAtK * 100).toFixed(1)}%`,
+    });
+  }
+  if (a.passHatK !== undefined) {
+    cards.push({
+      label: k !== undefined ? `pass^${k}` : "pass^k",
+      value: `${(a.passHatK * 100).toFixed(1)}%`,
+    });
+  }
+  if (a.totalTokensAllTrials !== undefined) {
+    cards.push({
+      label: "Tokens (all trials)",
+      value: `${a.totalTokensAllTrials.input}/${a.totalTokensAllTrials.output}`,
+    });
+  }
+  if (a.partialScoreMean !== undefined) {
+    cards.push({ label: "Partial score", value: a.partialScoreMean.toFixed(3) });
+  }
+  if (a.toolCallAccuracy !== undefined) {
+    cards.push({ label: "Tool accuracy", value: `${(a.toolCallAccuracy * 100).toFixed(1)}%` });
+  }
+  if (a.interventionRate !== undefined) {
+    cards.push({
+      label: "Intervention rate",
+      value: `${(a.interventionRate * 100).toFixed(1)}%`,
+    });
+  }
+  if (a.safetyViolations !== undefined) {
+    cards.push({ label: "Safety violations", value: String(a.safetyViolations.total) });
+  }
+  if (a.p50ModelCallMs !== undefined) {
+    cards.push({ label: "p50 model call", value: `${Math.round(a.p50ModelCallMs)}ms` });
+  }
+  if (a.p95ModelCallMs !== undefined) {
+    cards.push({ label: "p95 model call", value: `${Math.round(a.p95ModelCallMs)}ms` });
+  }
   return `<section class="aggregate">${cards
     .map(
       (c) =>
@@ -113,15 +157,54 @@ function aggregateCards(s: EvalRunSummary): string {
     .join("")}</section>`;
 }
 
-function sampleRow(s: SampleResult, perSample?: LoadedRun["perSample"][string]): string {
+/** Which of the additive per-sample columns this run actually carries —
+ *  header and rows must agree, so this is computed once per report. */
+type SampleColumnFlags = {
+  readonly trials: boolean;
+  readonly toolAccuracy: boolean;
+  readonly interventions: boolean;
+  readonly safety: boolean;
+};
+
+function sampleColumnFlags(samples: ReadonlyArray<SampleResult>): SampleColumnFlags {
+  return {
+    trials: samples.some((s) => s.trials !== undefined && s.trials.length > 0),
+    toolAccuracy: samples.some((s) => s.metrics?.toolCallAccuracy !== undefined),
+    interventions: samples.some((s) => (s.metrics?.interventions ?? 0) > 0),
+    safety: samples.some((s) => (s.metrics?.safetyViolations?.total ?? 0) > 0),
+  };
+}
+
+function sampleRow(s: SampleResult, cols: SampleColumnFlags): string {
   const status = s.error ? "fail" : s.grades.overall.passed ? "pass" : "fail";
   const scoreBar = `<span class="score-bar"><span style="width:${(s.grades.overall.score * 100).toFixed(0)}%"></span></span>`;
   const drillId = `drill-${escapeHtml(s.sampleId)}`;
+  const trialsCell = (): string => {
+    if (s.trials === undefined || s.trials.length === 0) {
+      return `<td class="na" data-sort="-1">n/a</td>`;
+    }
+    const passes = s.trials.filter((t) => t.passed).length;
+    const rate = s.trialPassRate ?? passes / s.trials.length;
+    const cls = passes === s.trials.length ? "pass" : passes === 0 ? "fail" : "";
+    return `<td${cls ? ` class="${cls}"` : ""} data-sort="${rate}">${passes}/${s.trials.length}</td>`;
+  };
+  const toolAccCell = (): string =>
+    s.metrics?.toolCallAccuracy !== undefined
+      ? `<td data-sort="${s.metrics.toolCallAccuracy}">${(s.metrics.toolCallAccuracy * 100).toFixed(0)}%</td>`
+      : `<td class="na" data-sort="-1">n/a</td>`;
+  const interventionsCell = (): string => {
+    const n = s.metrics?.interventions ?? 0;
+    return `<td data-sort="${n}">${n}</td>`;
+  };
+  const safetyCell = (): string => {
+    const n = s.metrics?.safetyViolations?.total ?? 0;
+    return `<td${n > 0 ? ' class="fail"' : ""} data-sort="${n}">${n}</td>`;
+  };
   return `
 <tr>
   <td>${escapeHtml(s.sampleId)}</td>
   <td class="${status}" data-sort="${status === "pass" ? 1 : 0}">${status.toUpperCase()}</td>
-  <td data-sort="${s.grades.overall.score}">${scoreBar}${s.grades.overall.score.toFixed(2)}</td>
+  <td data-sort="${s.grades.overall.score}">${scoreBar}${s.grades.overall.score.toFixed(2)}</td>${cols.trials ? trialsCell() : ""}${cols.toolAccuracy ? toolAccCell() : ""}${cols.interventions ? interventionsCell() : ""}${cols.safety ? safetyCell() : ""}
   <td data-sort="${s.turns}">${s.turns}</td>
   <td data-sort="${s.latencyMs}">${s.latencyMs}ms</td>
   <td data-sort="${s.tokens.input + s.tokens.output}">${s.tokens.input}/${s.tokens.output}</td>
@@ -129,13 +212,53 @@ function sampleRow(s: SampleResult, perSample?: LoadedRun["perSample"][string]):
 </tr>`;
 }
 
+function trialsTable(s: SampleResult): string {
+  if (s.trials === undefined || s.trials.length === 0) return "";
+  const rows = s.trials
+    .map(
+      (t) => `
+<tr>
+  <td>${t.trial}</td>
+  <td class="${t.passed ? "pass" : "fail"}">${t.passed ? "PASS" : "FAIL"}</td>
+  <td>${t.score.toFixed(2)}</td>
+  <td>${t.latencyMs}ms</td>
+  <td>${t.tokens.input}/${t.tokens.output}</td>
+  <td>${t.error !== undefined ? `<span class="fail">${escapeHtml(t.error)}</span>` : t.graderError !== undefined ? `<span class="fail">${escapeHtml(t.graderError)}</span>` : ""}${t.retried === true ? ' <span class="na">(retried)</span>' : ""}</td>
+</tr>`,
+    )
+    .join("");
+  return `
+    <h3>Trials (${s.trials.filter((t) => t.passed).length}/${s.trials.length} passed)</h3>
+    <table>
+      <thead><tr><th>#</th><th>Verdict</th><th>Score</th><th>Latency</th><th>Tokens</th><th>Error</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function metricsLine(s: SampleResult): string {
+  const m = s.metrics;
+  if (m === undefined) return "";
+  const parts: string[] = [];
+  if (m.toolCallAccuracy !== undefined) {
+    parts.push(`tool accuracy ${(m.toolCallAccuracy * 100).toFixed(0)}%`);
+  }
+  parts.push(`interventions ${m.interventions}`);
+  const v = m.safetyViolations;
+  parts.push(
+    `safety violations ${v.total} (deny ${v.permissionDenials} · egress ${v.egressBlocks} · justification ${v.justificationRejections})`,
+  );
+  parts.push(`model calls ${m.modelCallLatenciesMs.length}`);
+  return `<p class="meta">${escapeHtml(parts.join(" · "))}</p>`;
+}
+
 function sampleDrill(s: SampleResult, perSample?: LoadedRun["perSample"][string]): string {
   const transcript = perSample?.transcript ?? "";
   const events = perSample?.events ?? "";
   return `
 <details id="drill-${escapeHtml(s.sampleId)}">
-  <summary><strong>${escapeHtml(s.sampleId)}</strong> — ${s.grades.overall.passed ? '<span class="pass">PASS</span>' : '<span class="fail">FAIL</span>'} · score ${s.grades.overall.score.toFixed(2)}${s.error ? ` · <span class="fail">${escapeHtml(s.error)}</span>` : ""}</summary>
+  <summary><strong>${escapeHtml(s.sampleId)}</strong> — ${s.grades.overall.passed ? '<span class="pass">PASS</span>' : '<span class="fail">FAIL</span>'} · score ${s.grades.overall.score.toFixed(2)}${s.error ? ` · <span class="fail">${escapeHtml(s.error)}</span>` : ""}${s.failureClass !== undefined ? ` · <span class="na">class: ${escapeHtml(s.failureClass)}</span>` : ""}</summary>
   <div class="drill">
+    ${metricsLine(s)}${trialsTable(s)}
     <h3>Agent output</h3>
     <pre>${escapeHtml(s.agentOutput || "(empty)")}</pre>
     <h3>Graders</h3>
@@ -217,16 +340,28 @@ export function renderReport(
   opts: { readonly verdicts?: ReportVerdicts } = {},
 ): { html: string; json: string } {
   const s = run.summary;
+  const cols = sampleColumnFlags(s.samples);
+  const extraHeaders = `${cols.trials ? "<th>Trials</th>" : ""}${cols.toolAccuracy ? "<th>Tool acc</th>" : ""}${cols.interventions ? "<th>Interv.</th>" : ""}${cols.safety ? "<th>Safety</th>" : ""}`;
+  const calibration = s.config.judgeCalibration;
+  const calibrationNote =
+    calibration !== undefined
+      ? `<p class="meta">Judge calibration applied from ${escapeHtml(calibration.path)}: ${calibration.applied
+          .map(
+            (a) =>
+              `${escapeHtml(a.grader)} gated at min-score ${a.minScore} (${escapeHtml(a.specKey)})`,
+          )
+          .join(" · ")}</p>`
+      : "";
   const body = `
 <h1>Eval run ${escapeHtml(s.runId)}</h1>
-<p class="meta">Started ${escapeHtml(s.startedAt)} · ended ${escapeHtml(s.endedAt)} · model ${escapeHtml(s.config.model)} · concurrency ${s.config.concurrency}${s.config.judgeModel ? ` · judge ${escapeHtml(s.config.judgeModel)}` : ""}</p>
-${aggregateCards(s)}${opts.verdicts !== undefined ? triageSection(opts.verdicts) : ""}
+<p class="meta">Started ${escapeHtml(s.startedAt)} · ended ${escapeHtml(s.endedAt)} · model ${escapeHtml(s.config.model)} · concurrency ${s.config.concurrency}${s.config.judgeModel ? ` · judge ${escapeHtml(s.config.judgeModel)}` : ""}${s.config.repeats !== undefined ? ` · repeats ${s.config.repeats}` : ""}</p>
+${calibrationNote}${aggregateCards(s)}${opts.verdicts !== undefined ? triageSection(opts.verdicts) : ""}
 <table data-sortable>
   <thead><tr>
-    <th>Sample</th><th>Status</th><th>Score</th><th>Turns</th><th>Latency</th><th>Tokens (in/out)</th><th>Drill</th>
+    <th>Sample</th><th>Status</th><th>Score</th>${extraHeaders}<th>Turns</th><th>Latency</th><th>Tokens (in/out)</th><th>Drill</th>
   </tr></thead>
   <tbody>
-    ${s.samples.map((sm) => sampleRow(sm, run.perSample[sm.sampleId])).join("")}
+    ${s.samples.map((sm) => sampleRow(sm, cols)).join("")}
   </tbody>
 </table>
 ${s.samples.map((sm) => sampleDrill(sm, run.perSample[sm.sampleId])).join("")}
@@ -242,12 +377,16 @@ export function renderDiffHtml(
   prev: EvalRunSummary,
   next: EvalRunSummary,
 ): string {
+  // G15 — when a side carried repeat trials, show its per-sample pass-rate
+  // beside the canonical verdict (the flip may be a pure reliability move).
+  const side = (v: { passed: boolean; score: number; passRate?: number }): string =>
+    `${v.passed ? '<span class="pass">PASS</span>' : '<span class="fail">FAIL</span>'} (${v.score.toFixed(2)})${v.passRate !== undefined ? ` · ${(v.passRate * 100).toFixed(0)}% of trials` : ""}`;
   const flipRow = (e: ReportDiff["regressions"][number], cls: string): string => `
 <tr class="${cls}">
   <td>${escapeHtml(e.sampleId)}</td>
-  <td>${e.prev.passed ? '<span class="pass">PASS</span>' : '<span class="fail">FAIL</span>'} (${e.prev.score.toFixed(2)})</td>
+  <td>${side(e.prev)}</td>
   <td>→</td>
-  <td>${e.next.passed ? '<span class="pass">PASS</span>' : '<span class="fail">FAIL</span>'} (${e.next.score.toFixed(2)})</td>
+  <td>${side(e.next)}</td>
   <td>${escapeHtml(e.next.rationale.slice(0, 200))}</td>
 </tr>`;
 
@@ -271,8 +410,8 @@ export function renderDiffHtml(
   const body = `
 <h1>Diff: ${escapeHtml(diff.prevRunId)} → ${escapeHtml(diff.newRunId)}</h1>
 <p class="meta">Prev pass rate: ${(prev.aggregates.passRate * 100).toFixed(1)}% · New pass rate: ${(next.aggregates.passRate * 100).toFixed(1)}% · Unchanged: ${diff.unchanged}</p>
-${section("Regressions (PASS → FAIL)", diff.regressions, "regression-row")}
-${section("Recoveries (FAIL → PASS)", diff.recoveries, "recovery-row")}
+${section("Regressions (pass-rate dropped)", diff.regressions, "regression-row")}
+${section("Recoveries (pass-rate rose)", diff.recoveries, "recovery-row")}
 ${section("Score shifts (|Δ| > 0.1)", diff.scoreShifts, "")}
 `;
   return shell(`Diff ${diff.prevRunId} → ${diff.newRunId}`, body);

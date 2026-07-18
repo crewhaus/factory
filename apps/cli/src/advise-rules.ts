@@ -548,16 +548,15 @@ export const ruleTruncationPressure: AdviceRule = (ctx, opts) => {
 
 /**
  * Compaction thrash: any single session compacting ≥ threshold times.
- * ADVICE-ONLY — no auto-applicable SpecPatch. `compaction.curate` is listed
- * in OPTIMIZABLE_PATHS and lowers to IR (`packages/ir/src/index.ts`,
- * `IrCompaction.curate`), but no target emitter or runtime-core path
- * actually consumes it yet (see the IR field's doc comment). A patch that
- * flips a runtime no-op would pass the `optimize --from-advice` eval gate
- * trivially (inert change → equal pass rate) and get written into the
- * user's spec while changing nothing, so this rule surfaces the finding as
- * a warning with concrete alternatives instead of proposing `curate: true`.
- * `compaction.threshold` is ALSO whitelisted, but the strict spec schema
- * carries no such key today, so a threshold patch could never apply either.
+ * Loop contract 0.4 (Batch E, G19) — `compaction.curate` is now WIRED at
+ * runtime: runtime-core's `maybeCompact` runs the `@crewhaus/compaction-curator`
+ * pass (semantic dedupe + relevance trim) before each compaction when the flag
+ * is set. It is listed in OPTIMIZABLE_PATHS and lowers to IR
+ * (`packages/ir/src/index.ts`, `IrCompaction.curate`), so enabling it has a
+ * real effect the `optimize --from-advice` eval gate can measure — the rule
+ * therefore PROPOSES `compaction.curate: true` (through `patchOrAdvice`, so the
+ * OPTIMIZABLE_PATHS whitelist stays the floor) when curation is off, and stays
+ * advice-only (with the remaining structural remedies) once it is already on.
  */
 export const ruleCompactionThrash: AdviceRule = (ctx, opts) => {
   const t = resolveThresholds(opts);
@@ -573,19 +572,31 @@ export const ruleCompactionThrash: AdviceRule = (ctx, opts) => {
   const spec = opts?.spec;
   const compaction = specField<Record<string, unknown>>(spec, "compaction");
   const curateOn = compaction?.["curate"] === true;
-  const suggestion: AdviceSuggestion = {
-    kind: "advice",
-    text: curateOn
-      ? "compaction.curate is already set but sessions still thrash — that flag is not yet wired at runtime " +
-        "(reserved for a future compaction-curator pass), so it will not help. Reduce compaction thrash by " +
-        "widening the compaction window, trimming which tools are available (fewer tools per turn means less " +
-        "context to summarize), or splitting the work across a sub-agent so each session carries less history."
-      : "Sessions are compacting repeatedly, which burns tokens on re-summarization and loses context each " +
-        "pass. `compaction.curate` is not yet wired at runtime, so enabling it would not help today. Reduce " +
-        "thrash by widening the compaction window, trimming which tools are available (fewer tools per turn " +
-        "means less context to summarize), or splitting the work across a sub-agent so each session carries " +
-        "less history.",
-  };
+  const suggestion: AdviceSuggestion = curateOn
+    ? {
+        kind: "advice",
+        text:
+          "compaction.curate is already enabled and sessions still thrash. The curator trims duplicate and " +
+          "low-relevance context before each compaction, but it cannot prevent compaction on a genuinely large " +
+          "history — widen the compaction window, trim which tools are available (fewer tools per turn means " +
+          "less context to summarize), or split the work across a sub-agent so each session carries less history.",
+      }
+    : patchOrAdvice(
+        spec,
+        {
+          target: spec?.target ?? "cli",
+          // `add` the leaf when absent; `replace` when a `compaction.curate:
+          // false` is present (the `curateOn` branch above already handled the
+          // already-true case). `applySpecPatch` creates the `compaction` parent.
+          op: compaction?.["curate"] !== undefined ? "replace" : "add",
+          path: ["compaction", "curate"],
+          value: true,
+        },
+        "Sessions are compacting repeatedly, which burns tokens on re-summarization and loses context each " +
+          "pass. Enable `compaction.curate` to run the active-context curator (semantic dedupe + relevance " +
+          "trim) before each compaction, so less context needs summarizing. You can also widen the compaction " +
+          "window, trim which tools are available, or split the work across a sub-agent.",
+      );
   return [
     {
       id: "compaction-thrash",

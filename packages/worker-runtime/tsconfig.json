@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*"],
+  "references": [
+    { "path": "../adapter-anthropic" },
+    { "path": "../errors" },
+    { "path": "../token-budget" },
+    { "path": "../tool-catalog" },
+    { "path": "../tool-executor" },
+    { "path": "../tool-loop-detection" },
+    { "path": "../trace-event-bus" },
+    { "path": "../turn-state-machine" }
+  ]
+}

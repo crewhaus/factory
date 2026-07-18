@@ -15,7 +15,8 @@
     "@aws-sdk/client-bedrock-runtime": "^3.842.0",
     "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/errors": "workspace:*",
-    "@crewhaus/token-budget": "workspace:*"
+    "@crewhaus/token-budget": "workspace:*",
+    "@crewhaus/tool-schema-sanitizer": "workspace:*"
   },
   "devDependencies": {
     "@crewhaus/recovery-engine": "workspace:*"

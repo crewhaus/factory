@@ -114,4 +114,54 @@ export async function resumeFrom(
   return { checkpointId: head.id, nextNode: head.nodeName };
 }
 
+/**
+ * Loop contract 0.4 (Batch F, temporal contract / G61) — the linear-resume
+ * counterpart to {@link withIdempotency} for shapes that run steps
+ * sequentially in one process (the workflow target) rather than through the
+ * graph engine's `NodeContext`. `runId` is a plain string (the workflow's
+ * `CREWHAUS_RUN_ID` or a fresh id), not a branded `GraphRunId`.
+ *
+ * The first call for `(runId, name, attempt)` runs `fn` and records its
+ * result; a restart of the SAME `runId` against a durable store finds the
+ * record and skips straight to the cached value — so a crashed multi-step
+ * workflow resumes at the first not-yet-completed step instead of re-running
+ * the ones that already finished (and their side effects). With the default
+ * in-memory store it is transparent (each step runs once, keys are unique).
+ */
+export async function runOnce<T>(
+  store: IdempotencyStore,
+  runId: string,
+  name: string,
+  fn: () => Promise<T>,
+  attempt = 0,
+): Promise<T> {
+  const key = idempotencyKey(runId as GraphRunId, name, attempt);
+  const cached = await store.get(key);
+  if (cached !== undefined) return cached.result as T;
+  const result = await fn();
+  await store.put({
+    key,
+    graphRunId: runId as GraphRunId,
+    nodeName: name,
+    attempt,
+    result,
+    completedAt: new Date().toISOString(),
+  });
+  return result;
+}
+
 export { InMemoryIdempotencyStore };
+
+// Loop contract 0.4 (Batch F, temporal contract) — the schedule wake-loop
+// runtime the channel/batch daemons arm their `schedule:` block with, and the
+// durable idempotency store + env factory the graph/workflow bundles select
+// for crash-resume exactly-once.
+export {
+  type ArmedSchedule,
+  type ArmScheduleHandlers,
+  type WakeSchedule,
+  armSchedule,
+  nextCronMatch,
+  nextWakeDelayMs,
+} from "./schedule";
+export { FileIdempotencyStore, createIdempotencyStore } from "./idempotency-store";

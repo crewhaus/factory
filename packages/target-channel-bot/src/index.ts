@@ -4,6 +4,8 @@ import {
   type Bundle,
   type EmitReadmeOptions,
   type IrChannelV0,
+  type IrKnowledge,
+  type IrSchedule,
   type IrSecretRef,
   type IrSubAgentDefinition,
   renderBundleReadme,
@@ -269,12 +271,214 @@ function renderBudgetField(ir: IrChannelV0): string {
 /**
  * Thread `compaction.model` so a channel bot's auto-compaction summarizes on
  * the spec's chosen model instead of the primary. The compiler already
- * resolved the `cheapest` sentinel to a concrete id. Empty when omitted.
- * Mirror: target-cli renders the same field.
+ * resolved the `cheapest` sentinel to a concrete id. Loop contract 0.4
+ * (Batch A) adds the tuning knobs alongside it: `compaction.threshold` →
+ * `compactionThreshold` (context-fill fraction that triggers autocompact)
+ * and `snip_keep_head`/`snip_keep_tail` → `snipKeepHead`/`snipKeepTail`
+ * (messages preserved verbatim by `compaction-snip`). Each field is emitted
+ * only when the spec declared it — the runtime owns every default — so
+ * existing bundles stay byte-identical. Mirror: target-cli renders the same
+ * fields.
  */
-function renderCompactionModelField(ir: IrChannelV0): string {
-  if (ir.compaction.model === undefined) return "";
-  return `\n        compactionModel: ${escapeJsonString(ir.compaction.model)},`;
+function renderCompactionFields(ir: IrChannelV0): string {
+  const pieces: string[] = [];
+  if (ir.compaction.model !== undefined) {
+    pieces.push(`\n        compactionModel: ${escapeJsonString(ir.compaction.model)},`);
+  }
+  if (ir.compaction.threshold !== undefined) {
+    pieces.push(`\n        compactionThreshold: ${ir.compaction.threshold},`);
+  }
+  if (ir.compaction.snipKeepHead !== undefined) {
+    pieces.push(`\n        snipKeepHead: ${ir.compaction.snipKeepHead},`);
+  }
+  if (ir.compaction.snipKeepTail !== undefined) {
+    pieces.push(`\n        snipKeepTail: ${ir.compaction.snipKeepTail},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — thread the agent-level tuning knobs into the
+ * generated interactive `runChatLoop` call, camelCase-mirroring the IR 1:1:
+ * `agent.max_tokens` → `maxTokens` (model max OUTPUT tokens per turn),
+ * `agent.thinking` → `thinking` (extended-thinking selector; exactly one of
+ * `{ budgetTokens }` / `{ effort }` by spec construction), and
+ * `agent.rate_limits` → `rateLimits` (per-tool rpm/burst buckets, `"*"` the
+ * catch-all). Each field is emitted only when the spec declared it so
+ * existing bundles stay byte-identical. The dream path is deliberately NOT
+ * tuned by these — its bounded fresh session keeps memory-service's own
+ * DREAM_MAX_TOOL_ITERATIONS / budget seam inputs. Mirror: target-cli +
+ * target-managed render the same fields.
+ */
+function renderAgentTuningFields(ir: IrChannelV0): string {
+  const pieces: string[] = [];
+  if (ir.agent.maxTokens !== undefined) {
+    pieces.push(`\n        maxTokens: ${ir.agent.maxTokens},`);
+  }
+  if (ir.agent.thinking !== undefined) {
+    pieces.push(`\n        thinking: ${JSON.stringify(ir.agent.thinking)},`);
+  }
+  if (ir.agent.rateLimits !== undefined) {
+    pieces.push(`\n        rateLimits: ${JSON.stringify(ir.agent.rateLimits)},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — thread the top-level `limits:` ceilings into
+ * the generated interactive `runChatLoop` call as the runtime's individual
+ * top-level knobs (`maxToolIterations` / `maxConcurrentTools` /
+ * `contextLimit` are pre-existing options; `deadlineMs` / `turnTimeoutMs` /
+ * `modelCallTimeoutMs` / `loopDetection` are the 0.4 additions, camelCase-
+ * mirroring the IR 1:1). Every knob is emitted only when declared — the
+ * runtime owns every default — so existing bundles stay byte-identical.
+ * `limits.crew` never reaches this shape (crew-only; the spec rejects it
+ * everywhere else). The daemon's dream path keeps its own bounded
+ * `input.maxToolIterations` (DREAM_MAX_TOOL_ITERATIONS) regardless of these.
+ * Mirror: target-cli + target-managed render the same fields.
+ */
+function renderLimitsFields(ir: IrChannelV0): string {
+  const limits = ir.limits;
+  if (limits === undefined) return "";
+  const pieces: string[] = [];
+  if (limits.maxToolIterations !== undefined) {
+    pieces.push(`\n        maxToolIterations: ${limits.maxToolIterations},`);
+  }
+  if (limits.maxConcurrentTools !== undefined) {
+    pieces.push(`\n        maxConcurrentTools: ${limits.maxConcurrentTools},`);
+  }
+  if (limits.contextLimit !== undefined) {
+    pieces.push(`\n        contextLimit: ${limits.contextLimit},`);
+  }
+  if (limits.deadlineMs !== undefined) {
+    pieces.push(`\n        deadlineMs: ${limits.deadlineMs},`);
+  }
+  if (limits.turnTimeoutMs !== undefined) {
+    pieces.push(`\n        turnTimeoutMs: ${limits.turnTimeoutMs},`);
+  }
+  if (limits.modelCallTimeoutMs !== undefined) {
+    pieces.push(`\n        modelCallTimeoutMs: ${limits.modelCallTimeoutMs},`);
+  }
+  if (limits.loopDetection !== undefined) {
+    pieces.push(`\n        loopDetection: ${JSON.stringify(limits.loopDetection)},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — render the in-loop `evaluation:` wiring
+ * for the interactive turn. The bundle constructs the evaluate fn from the
+ * RESOLVED IR grader at module scope in agent.ts and threads it — together
+ * with the resolved gate knobs — into the interactive `runChatLoop` call's
+ * `evaluation` option; the runtime scores each completed assistant turn,
+ * compares against `threshold`, applies `onFail` (retry ≤ `maxRetries` with
+ * the rationale appended as a system nudge / halt as a classified
+ * `evaluation` failure / note as an `eval_graded` trace event only) and
+ * emits one `eval_graded` event per grading pass.
+ *
+ *   - `llm_judge` rides `@crewhaus/eval-judge`'s `judge()` (the offline
+ *     eval-judge scoring path: single-criterion rubric from `criteria`, 1–5
+ *     score mapped to [0,1] via (n-1)/4, prompt-injection-hardened
+ *     sentinels). The judge model resolves through the SAME model-router
+ *     adapter wiring the bundle's primary model uses, so judge spend is
+ *     metered exactly like every other model call; the model defaults to
+ *     the shape's primary model when the spec omitted `grader.model`
+ *     (`cheapest` already resolved at lower time). `threshold` was resolved
+ *     at lower time (default 0.7) — the `?? 0.7` is a defensive floor for
+ *     hand-built IR.
+ *   - `contains` / `regex` are emitted as pure fns (score 1 on pass, 0 on
+ *     fail; no model spend, no import). `lastIndex` is reset per call so a
+ *     global/sticky flag can never flip-flop verdicts across turns.
+ *
+ * The dream path deliberately carries NO evaluation — its bounded fresh
+ * session is a consolidation pass, not a served answer. The emitted literal
+ * is annotated `RunEvaluation` (runtime-core's seam type), so a compiled
+ * bundle typechecks against the exact runtime contract:
+ * `graderType`/`threshold` are stamped verbatim onto every `eval_graded`
+ * event (deterministic graders carry the documented threshold 1 — score is
+ * 0|1 and `score >= threshold` is the pass rule). Empty pieces when the
+ * spec omits the block, keeping pre-existing bundles byte-identical.
+ * Mirror: target-cli + target-managed render the same wiring — keep the
+ * three in sync.
+ */
+function renderEvaluation(ir: IrChannelV0): {
+  imports: string[];
+  bootBlock: string;
+  field: string;
+} {
+  const ev = ir.evaluation;
+  if (ev === undefined) return { imports: [], bootBlock: "", field: "" };
+  const field = "\n        evaluation: __evaluation,";
+  const typeImport = `import type { RunEvaluation } from "@crewhaus/runtime-core";`;
+  const onFail = escapeJsonString(ev.onFail);
+  if (ev.grader.type === "llm_judge") {
+    const criteria = escapeJsonString(ev.grader.criteria);
+    const model = escapeJsonString(ev.grader.model ?? ir.agent.model);
+    const bootBlock = `const __evaluation: RunEvaluation = {
+  graderType: "llm_judge",
+  threshold: ${ev.threshold ?? 0.7},
+  onFail: ${onFail},
+  maxRetries: ${ev.maxRetries},
+  evaluate: async ({ finalText }) => {
+    const __verdict = await judge({
+      rubric: {
+        criteria: [
+          {
+            name: "criteria",
+            description: ${criteria},
+            anchors: {
+              "1": "fails the criteria entirely",
+              "2": "mostly fails the criteria",
+              "3": "partially meets the criteria",
+              "4": "meets the criteria with minor gaps",
+              "5": "fully meets the criteria",
+            },
+          },
+        ],
+        passing_score: 3,
+      },
+      sample: { id: "in-loop-evaluation", input: "" },
+      agentOutput: finalText,
+      model: ${model},
+    });
+    return { score: (__verdict.score - 1) / 4, rationale: __verdict.rationale };
+  },
+};`;
+    return {
+      imports: [typeImport, `import { judge } from "@crewhaus/eval-judge";`],
+      bootBlock,
+      field,
+    };
+  }
+  const value = ev.grader.value;
+  const valueLit = escapeJsonString(value);
+  if (ev.grader.type === "contains") {
+    const bootBlock = `const __evaluation: RunEvaluation = {
+  graderType: "contains",
+  threshold: 1,
+  onFail: ${onFail},
+  maxRetries: ${ev.maxRetries},
+  evaluate: async ({ finalText }) =>
+    finalText.includes(${valueLit})
+      ? { score: 1, rationale: ${escapeJsonString(`output contains "${value}"`)} }
+      : { score: 0, rationale: ${escapeJsonString(`output missing "${value}"`)} },
+};`;
+    return { imports: [typeImport], bootBlock, field };
+  }
+  const bootBlock = `const __evalRegex = new RegExp(${valueLit});
+const __evaluation: RunEvaluation = {
+  graderType: "regex",
+  threshold: 1,
+  onFail: ${onFail},
+  maxRetries: ${ev.maxRetries},
+  evaluate: async ({ finalText }) => {
+    __evalRegex.lastIndex = 0;
+    return __evalRegex.test(finalText)
+      ? { score: 1, rationale: ${escapeJsonString(`output matches /${value}/`)} }
+      : { score: 0, rationale: ${escapeJsonString(`output does not match /${value}/`)} };
+  },
+};`;
+  return { imports: [typeImport], bootBlock, field };
 }
 
 function renderPermissionsField(ir: IrChannelV0): string {
@@ -349,6 +553,91 @@ function renderSubAgents(ir: IrChannelV0): {
   return { imports, registryBlock, registerBlock, hasAny: true };
 }
 
+/**
+ * Loop contract 0.4 (Batch E, G22) — agent-shape RAG (`knowledge:`). Mirror of
+ * target-cli's renderKnowledge (keep in sync): the daemon ingests the declared
+ * sources at boot through `@crewhaus/tool-retrieve`'s `knowledgeRetrieve` and
+ * registers the returned `Retrieve` tool on defaultCatalog, so it rides
+ * `defaultCatalog.list()` into createAgent. The G76 embedder order is deferred
+ * to `resolveKnowledgeEmbedder`. Empty when the spec omits the block.
+ */
+function renderKnowledge(ir: IrChannelV0): { imports: string[]; bootBlock: string } {
+  const k = ir.knowledge;
+  if (k === undefined) return { imports: [], bootBlock: "" };
+  const memOn = ir.memory !== undefined && ir.memory.enabled !== false;
+  const embInputs: string[] = [];
+  if (k.embedder !== undefined)
+    embInputs.push(`knowledgeEmbedder: ${escapeJsonString(k.embedder)}`);
+  const memEmb = memOn ? ir.memory?.embedder : undefined;
+  if (memEmb !== undefined) embInputs.push(`memoryEmbedder: ${escapeJsonString(memEmb)}`);
+  const wikiEmb = memOn ? ir.memory?.wiki?.embedder : undefined;
+  if (wikiEmb !== undefined) embInputs.push(`wikiEmbedder: ${escapeJsonString(wikiEmb)}`);
+  const embedderExpr = `resolveKnowledgeEmbedder({ ${embInputs.join(", ")} })`;
+  const bootBlock = `const __knowledgeTool = await knowledgeRetrieve({
+  sources: ${JSON.stringify(k.sources)},
+  embedderModel: ${embedderExpr},
+  vectorBackend: ${escapeJsonString(k.vectorBackend)},
+  defaultK: ${k.defaultK},
+  chunkSize: ${k.chunkSize},
+  chunkOverlap: ${k.chunkOverlap},
+  log: (line) => process.stdout.write(line),
+});
+defaultCatalog.register(__knowledgeTool);`;
+  return {
+    imports: [
+      `import { knowledgeRetrieve, resolveKnowledgeEmbedder } from "@crewhaus/tool-retrieve";`,
+    ],
+    bootBlock,
+  };
+}
+
+/**
+ * Item 3 (G32) — plugin activation for the channel daemon. Mirror of target-cli's
+ * renderPlugins (keep in sync): when the spec declares `plugins:`, `daemon.ts`
+ * activates the named plugins at boot via `@crewhaus/plugin-loader` (registry
+ * read → Ed25519 signature + entrypoint-digest verify → import) and registers
+ * the contributed tools on the shared `defaultCatalog`, so they ride
+ * `defaultCatalog.list()` into `createAgent`.
+ *
+ * Split so ordering is safe inside `main()`:
+ *   - `activateBoot` runs EARLY (before skill discovery) so `__plugins.skillDirs`
+ *     feeds `discoverSkills({ pluginDirs })`.
+ *   - `registerBoot` runs AFTER the built-in + skill tools are on the catalog and
+ *     skips any name already registered — first-party wins, and a plugin tool
+ *     named after a built-in never trips `defaultCatalog.register`'s
+ *     duplicate-name throw and bricks the daemon.
+ * Both blocks are indented two spaces for the `main()` body. Empty when the spec
+ * omits `plugins:`, keeping bundles byte-identical.
+ */
+function renderPlugins(ir: IrChannelV0): {
+  imports: string[];
+  activateBoot: string;
+  registerBoot: string;
+  hasAny: boolean;
+} {
+  const names = ir.plugins ?? [];
+  if (names.length === 0) {
+    return { imports: [], activateBoot: "", registerBoot: "", hasAny: false };
+  }
+  return {
+    hasAny: true,
+    imports: [
+      `import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";`,
+    ],
+    activateBoot: `  const __plugins = await activatePlugins({
+    names: ${JSON.stringify(names)},
+    ...createDefaultPluginRuntime({ allowUnsigned: process.env.CREWHAUS_PLUGIN_ALLOW_UNSIGNED === "1" }),
+  });`,
+    registerBoot: `  for (const __t of __plugins.tools) {
+    if (defaultCatalog.get(__t.name) !== undefined) {
+      process.stderr.write(\`[plugins] tool "\${__t.name}" already registered — plugin contribution skipped\\n\`);
+      continue;
+    }
+    defaultCatalog.register(__t);
+  }`,
+  };
+}
+
 function renderMcpServers(ir: IrChannelV0): {
   imports: string[];
   bootBlock: string;
@@ -359,30 +648,58 @@ function renderMcpServers(ir: IrChannelV0): {
   if (entries.length === 0) {
     return { imports: [], bootBlock: "", cleanupBlock: "", hasAny: false };
   }
+  // Loop contract 0.4 (Batch E, G23) — the synthesized `thredz` server (from
+  // the compiler's `lowerThredzWired`, or the user's own vendored entry) boots
+  // through `connectThredz` (ported from the cli emitter): its wiki+goals
+  // tools land on the catalog under BARE names (one vocabulary across
+  // backends) and a boot failure DEGRADES (`__thredz` = null → wireMemory
+  // falls back to local files with a warning) instead of failing the daemon.
+  // Mirror of target-cli's renderMcpServers; keep the two in sync.
+  const thredzOn = ir.thredz !== undefined;
   const imports = [
     `import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";`,
-    `import { registerMcpServer } from "@crewhaus/tool-mcp";`,
+    ...(thredzOn ? [`import { connectThredz } from "@crewhaus/memory-service";`] : []),
+    ...(entries.some(([name]) => !(thredzOn && name === "thredz"))
+      ? [`import { registerMcpServer } from "@crewhaus/tool-mcp";`]
+      : []),
   ];
   // 0.3.0 — embed the UNRESOLVED IrSecretRef-valued config and resolve at
   // daemon boot (mirror of target-cli's renderMcpServers; keep in sync).
   const addLines = entries
-    .map(
-      ([name, cfg]) =>
-        `mcpHost.addServer(${escapeJsonString(name)}, resolveMcpServerConfig(${JSON.stringify(cfg)}, { name: ${escapeJsonString(name)} }));`,
-    )
+    .map(([name, cfg]) => {
+      const add = `mcpHost.addServer(${escapeJsonString(name)}, resolveMcpServerConfig(${JSON.stringify(cfg)}, { name: ${escapeJsonString(name)} }));`;
+      // §4.4 — a missing THREDZ_API_KEY is a CONFIG failure: render the one
+      // structured report and exit with the config code (21) instead of an
+      // unhandled ConfigError stack (this add runs before the daemon's own
+      // main().catch wrapper).
+      if (thredzOn && name === "thredz") {
+        return `try {\n  ${add}\n} catch (__err) {\n  const __report = toFailureReport(__err);\n  process.stderr.write(\`\${formatRunFailure(__report, { prefix: "[daemon]" })}\\n\`);\n  process.exit(__report.exitCode);\n}`;
+      }
+      return add;
+    })
     .join("\n");
-  const registerLines = entries
+  const namespacedEntries = entries.filter(([name]) => !(thredzOn && name === "thredz"));
+  const registerLines = namespacedEntries
     .map(
       ([name]) =>
         `  registerMcpServer(mcpHost, ${escapeJsonString(name)}, defaultCatalog, { onRegister: ({ fullName }) => process.stdout.write(\`[mcp] registered \${fullName}\\n\`) }),`,
     )
     .join("\n");
+  // The thredz alias vocabulary must land on the catalog BEFORE any namespaced
+  // MCP server registers (the collision guard wants an empty slot), so
+  // connectThredz runs between the addServer calls and the Promise.all.
+  const thredzBoot = thredzOn
+    ? `const __thredz = await connectThredz(mcpHost, defaultCatalog, { log: (line) => process.stdout.write(line)${
+        ir.thredz?.agentName !== undefined
+          ? `, agentName: ${escapeJsonString(ir.thredz.agentName)}`
+          : ""
+      } });`
+    : undefined;
   const bootBlock = [
     "const mcpHost = new McpHost();",
     addLines,
-    "await Promise.all([",
-    registerLines,
-    "]);",
+    ...(thredzBoot !== undefined ? [thredzBoot] : []),
+    ...(namespacedEntries.length > 0 ? ["await Promise.all([", registerLines, "]);"] : []),
   ].join("\n");
   return {
     imports,
@@ -423,6 +740,11 @@ function memoryFabric(ir: IrChannelV0): {
           // /study /reflect. The exam runner is cli-shape wiring in this
           // release (no examRunner dep here), so /exam stays gated out.
           ...(learningOn ? { learning: ir.learning } : {}),
+          // Loop contract 0.4 (Batch E, G23) — thredz rides the fragment so
+          // wireMemory flips the wiki backend; the LIVE connection (`__thredz`
+          // from the daemon's connectThredz boot) is threaded separately as
+          // the `thredz` dep on the per-turn wireMemory call.
+          ...(ir.thredz !== undefined ? { thredz: ir.thredz } : {}),
         }),
       )
     : "";
@@ -456,6 +778,11 @@ function dreamFragmentJson(ir: IrChannelV0): string {
 }
 
 function renderAgent(ir: IrChannelV0): string {
+  // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation for the
+  // interactive turn. Empty pieces when the spec omits the block.
+  const evaluation = renderEvaluation(ir);
+  const evalImport = evaluation.imports.length > 0 ? `${evaluation.imports.join("\n")}\n` : "";
+  const evaluationBlock = evaluation.bootBlock ? `\n${evaluation.bootBlock}\n` : "";
   const hasRules = ir.permissions.rules.length > 0;
   const permImport = hasRules
     ? `import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";\n`
@@ -479,9 +806,33 @@ function renderAgent(ir: IrChannelV0): string {
   const fabric = memoryFabric(ir);
   const hbScopeOverride = fabric.continuityOn && ir.heartbeat !== undefined;
   const dreamOn = dreamConfigured(ir);
+  // Loop contract 0.4 (Batch E, G23) — the live Thredz connection threads from
+  // the daemon's connectThredz boot into every per-turn wireMemory call as the
+  // `thredz` dep (the wiki-backend flip needs the live client). Only relevant
+  // when the memory fabric actually wires (wireMemory is the sole consumer).
+  const thredzOn = ir.thredz !== undefined && fabric.wired;
+  // Loop contract 0.4 (Batch A) — top-level `memory.embedder`. Only
+  // meaningful when the fact store actually wires (an enabled memory block);
+  // threaded as the structural `deps.embedder` on every wireMemory /
+  // dream-janitor call so it beats the fragment's `wiki.embedder` factory
+  // string — the documented fallback order `embedder` → `wiki.embedder`.
+  const memEmbedderModel =
+    ir.memory !== undefined && ir.memory.enabled !== false ? ir.memory.embedder : undefined;
   const memImport = fabric.wired
-    ? `import { wireMemory${fabric.continuityOn || dreamOn ? ", type MemoryWiringFragment" : ""}${dreamOn ? ", createDreamJanitorStep, type DreamJanitorStep" : ""} } from "@crewhaus/memory-service";\n${fabric.continuityOn ? `import { createSkillTool } from "@crewhaus/skills-registry";\n` : ""}${dreamOn ? `import { createCostTracker } from "@crewhaus/cost-tracker";\n` : ""}`
+    ? `${memEmbedderModel !== undefined ? `import { createEmbedder } from "@crewhaus/embedder";\n` : ""}import { wireMemory${fabric.continuityOn || dreamOn ? ", type MemoryWiringFragment" : ""}${dreamOn ? ", createDreamJanitorStep, type DreamJanitorStep" : ""}${thredzOn ? ", type ThredzConnection" : ""} } from "@crewhaus/memory-service";\n${fabric.continuityOn ? `import { createSkillTool } from "@crewhaus/skills-registry";\n` : ""}${dreamOn ? `import { createCostTracker } from "@crewhaus/cost-tracker";\n` : ""}`
     : "";
+  const memEmbedderBlock =
+    memEmbedderModel === undefined
+      ? ""
+      : `
+/** Loop contract 0.4 (Batch A) — top-level \`memory.embedder\`: hybrid recall
+ *  on the fact store (and the wiki), resolved ONCE at boot from the
+ *  \`@crewhaus/embedder\` factory grammar. Threaded as the structural
+ *  \`deps.embedder\`, which beats the fragment's \`wiki.embedder\` factory
+ *  string (fallback order \`embedder\` → \`wiki.embedder\`). */
+const __memEmbedder = createEmbedder({ model: ${escapeJsonString(memEmbedderModel)} });
+`;
+  const memEmbedderDep = memEmbedderModel !== undefined ? "\n        embedder: __memEmbedder," : "";
   const fragmentBlock = !fabric.wired
     ? ""
     : fabric.continuityOn
@@ -520,7 +871,7 @@ function __memFragment(scope?: "spec" | "session"): MemoryWiringFragment {
       const __memTools: RegisteredTool[] = [];
       const __memWired = await wireMemory(${fragmentExpr}, {
         catalog: { register: (t: RegisteredTool) => { __memTools.push(t); } },
-        cwd: process.cwd(),
+        cwd: process.cwd(),${memEmbedderDep}${thredzOn ? "\n        thredz: config.thredz," : ""}
         sessionScope: args.sessionId,
       });${
         fabric.continuityOn
@@ -560,7 +911,7 @@ const __DREAM_FRAGMENT: MemoryWiringFragment = ${dreamFragmentJson(ir)};
 
 export function createDreamStep(): DreamJanitorStep | null {
   return createDreamJanitorStep(__DREAM_FRAGMENT, {
-    cwd: process.cwd(),
+    cwd: process.cwd(),${memEmbedderModel !== undefined ? "\n    embedder: __memEmbedder," : ""}
     modelPhase: {
       model: ${escapeJsonString(ir.agent.model)},
       run: async (input) => {
@@ -569,7 +920,7 @@ export function createDreamStep(): DreamJanitorStep | null {
         const __tools: RegisteredTool[] = [];
         await wireMemory(__DREAM_FRAGMENT, {
           catalog: { register: (t: RegisteredTool) => { __tools.push(t); } },
-          cwd: process.cwd(),
+          cwd: process.cwd(),${memEmbedderModel !== undefined ? "\n          embedder: __memEmbedder," : ""}
         });
         const runContext = createRunContext();
         const tracker = createCostTracker(runContext.eventBus, { suppressEvents: true });
@@ -608,20 +959,33 @@ export function createDreamStep(): DreamJanitorStep | null {
   return `// Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: channel, ir version: ${ir.version}, file: agent.ts)
 import { runChatLoop } from "@crewhaus/runtime-core";
+import type { EgressAuditSink, JustificationAuditSink } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { classifyInbound } from "@crewhaus/channel-adapter-base";
-${permImport}${subAgentTypeImport}${memImport}import type { HookDef } from "@crewhaus/hooks-engine";
+${permImport}${subAgentTypeImport}${memImport}${evalImport}import type { HookDef } from "@crewhaus/hooks-engine";
 import type { SkillRef } from "@crewhaus/skills-registry";
 import type { SlashCommand } from "@crewhaus/slash-commands";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-${fragmentBlock}
+import type { PromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
+${fragmentBlock}${memEmbedderBlock}${evaluationBlock}
 export type AgentConfig = {
   hooks: ReadonlyArray<HookDef>;
   skills: ReadonlyArray<SkillRef>;
   slashCommands: ReadonlyMap<string, SlashCommand>;
   tools: ReadonlyArray<RegisteredTool>;
   sessionRootDir?: string;
-${subAgentConfigFields}};
+  // Loop contract 0.4 (Batch E, G78) — cross-run prompt-cache rotation
+  // persistence (§2.5): a long-running channel daemon reads the last rotation
+  // stamp before each turn (so a still-fresh cache prefix is REUSED instead of
+  // cold-started) and persists a fresh stamp when the runtime rotates.
+  promptCacheStore: PromptCacheRotationStore;
+  // G48 — durable, hash-chained security audit sink (the Pillar 3 justification
+  // + egress gates append here). The daemon opens one @crewhaus/audit-log
+  // instance rooted at <cwd>/.crewhaus/audit and passes it to BOTH fields, so
+  // the intent-gate + egress records land on one gapless chain.
+  justificationAuditSink?: JustificationAuditSink;
+  egressAuditSink?: EgressAuditSink;
+${thredzOn ? "  // Loop contract 0.4 (Batch E, G23) — the live Thredz connection from the\n  // daemon's connectThredz boot (null when the backend degraded to local\n  // files), threaded into every per-turn wireMemory call as the backend flip.\n  thredz: ThredzConnection | null;\n" : ""}${subAgentConfigFields}};
 
 export type RunTurnArgs = {
   sessionId: string;
@@ -646,10 +1010,15 @@ export function createAgent(config: AgentConfig): Agent {
       const __inbound = await classifyInbound(args.message, runContext, { origin: "channel" });${memTurnBlock}
       return await runChatLoop({
         model: ${escapeJsonString(ir.agent.model)},
-        instructions: ${escapeJsonString(ir.agent.instructions)},${renderModelFailoverFields(ir)}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${renderCompactionModelField(ir)}
+        instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentTuningFields(ir)}${renderModelFailoverFields(ir)}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderCompactionFields(ir)}
         sessionName: ${escapeJsonString(ir.name)},
         sessionTarget: "channel",
         ...(config.sessionRootDir !== undefined ? { sessionRootDir: config.sessionRootDir } : {}),
+        // Loop contract 0.4 (Batch E, G78) — thread the persisted rotation
+        // stamp in (undefined force-refreshes, the safe direction) and persist
+        // a fresh stamp out when the runtime rotates the cache markers (§2.5).
+        promptCacheLastRotatedAt: await config.promptCacheStore.read(),
+        onPromptCacheRotated: (rotatedAt) => config.promptCacheStore.write(rotatedAt),
         runContext,
         singleTurn: true,
         seedMessages: [{ role: "user", content: __inbound }],
@@ -658,6 +1027,12 @@ export function createAgent(config: AgentConfig): Agent {
         hooks: config.hooks,
         skills: ${skillsExpr},
         slashCommands: ${slashCommandsExpr},${permField}${subAgentRunFields}${memRunField}
+        ...(config.justificationAuditSink !== undefined
+          ? { justificationAuditSink: config.justificationAuditSink }
+          : {}),
+        ...(config.egressAuditSink !== undefined
+          ? { egressAuditSink: config.egressAuditSink }
+          : {}),
       });
     },
   };
@@ -730,20 +1105,102 @@ function renderSessionRouter(ir: IrChannelV0): string {
       });
     },`;
 
+  // G11 — when `permissions.ask_mode` is "pause" (the default; only "deny"
+  // opts out) a tool ask on this non-interactive surface PARKS a pending
+  // approval instead of collapsing to a deny. The session-router surfaces the
+  // Approve/Deny prompt on park and re-drives the turn on grant.
+  const approvalsOn = ir.permissions.askMode !== "deny";
+  const approvalsImports = approvalsOn
+    ? '\nimport { postApprovalPrompt } from "@crewhaus/channel-adapter-base";\nimport type { ApprovalStore, PendingApproval } from "@crewhaus/channel-adapter-base";\nimport { isRunFailedError } from "@crewhaus/errors";'
+    : "";
+  const approvalsConfigField = approvalsOn ? "\n  approvals?: ApprovalStore;" : "";
+  const approvalsResumeTypeMember = approvalsOn
+    ? "\n  resumeApproval(approval: PendingApproval, adapter: ChannelAdapter): Promise<void>;"
+    : "";
+  const approvalsResumeState = approvalsOn
+    ? "\n  // G11 — approvalId → the inbound event that parked it, so a granted\n  // approval re-drives that turn and replies in the right thread.\n  const __resumeContexts = new Map<string, InboundEvent>();"
+    : "";
+  const approvalsCatch = approvalsOn
+    ? `      } catch (err) {
+        if (
+          config.approvals !== undefined &&
+          isRunFailedError(err) &&
+          err.report.class === "approval_pending"
+        ) {
+          // G11 — the run parked a pending approval instead of failing. Surface
+          // the Approve/Deny prompt (Slack buttons, or a text fallback for
+          // adapters without interactive buttons) and return; the turn resumes
+          // out-of-band once the approval is granted (or is dropped on deny).
+          const __pending = await config.approvals.list({ status: "pending", sessionId });
+          const __postApproval = adapter.postApproval;
+          for (const __appr of __pending) {
+            __resumeContexts.set(__appr.id, event);
+            await postApprovalPrompt({
+              pending: __appr,
+              sendText: (text) => adapter.sendReply({ event, text }),
+              ...(__postApproval !== undefined
+                ? { postInteractive: (approval) => __postApproval({ event, approval }) }
+                : {}),
+            });
+          }
+          await tryReact("warning");
+          return;
+        }
+        await tryReact("warning");
+        throw err;
+      }`
+    : `      } catch (err) {
+        await tryReact("warning");
+        throw err;
+      }`;
+  const approvalsResumeMethod = approvalsOn
+    ? `
+    async resumeApproval(approval: PendingApproval, adapter: ChannelAdapter): Promise<void> {
+      const event = __resumeContexts.get(approval.id);
+      __resumeContexts.delete(approval.id);
+      // Only a granted approval re-drives the turn; a denial's in-thread ACK
+      // already recorded the outcome, and a resume with no captured event
+      // (resolved by the CLI verb, or after a restart) waits for the next
+      // inbound message.
+      if (approval.status !== "grant" || event === undefined) return;
+      try {
+        const reply = await config.agent.runTurn({
+          sessionId: approval.sessionId,
+          isNew: false,
+          message: event.text,
+        });
+        if (reply.length > 0) {
+          await adapter.sendReply({ event, text: reply });
+        }
+        if (adapter.react) {
+          try {
+            await adapter.react({ event, emoji: "white_check_mark" });
+          } catch {
+            // non-fatal
+          }
+        }
+      } catch (err) {
+        process.stderr.write(
+          "[session-router] approval resume error (" + approval.id + "): " + (err as Error).message + "\\n",
+        );
+      }
+    },`
+    : "";
+
   return `// Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: channel, ir version: ${ir.version}, file: session-router.ts)
 import { createHash } from "node:crypto";
 import { createSessionStore } from "@crewhaus/session-store";
-import type { ChannelAdapter, InboundEvent } from "@crewhaus/channel-adapter-slack";${reactionImports}
+import type { ChannelAdapter, InboundEvent } from "@crewhaus/channel-adapter-slack";${reactionImports}${approvalsImports}
 import type { Agent } from "./agent.js";
 
 export type SessionRouterConfig = {
   agent: Agent;
-  sessionRootDir?: string;
+  sessionRootDir?: string;${approvalsConfigField}
 };
 
 export type SessionRouter = {
-  handle(event: InboundEvent, adapter: ChannelAdapter): Promise<void>;${reactionTypeMember}
+  handle(event: InboundEvent, adapter: ChannelAdapter): Promise<void>;${reactionTypeMember}${approvalsResumeTypeMember}
 };
 
 /**
@@ -758,7 +1215,7 @@ function deriveSessionId(routingKey: string): string {
 export function createSessionRouter(config: SessionRouterConfig): SessionRouter {
   const sessionStore = createSessionStore(
     config.sessionRootDir !== undefined ? { rootDir: config.sessionRootDir } : {},
-  );
+  );${approvalsResumeState}
   return {
     async handle(event: InboundEvent, adapter: ChannelAdapter): Promise<void> {
       const routingKey = ${routingKeyExpr};
@@ -793,11 +1250,8 @@ export function createSessionRouter(config: SessionRouterConfig): SessionRouter 
           await adapter.sendReply({ event, text: reply });
         }
         await tryReact("white_check_mark");
-      } catch (err) {
-        await tryReact("warning");
-        throw err;
-      }
-    },${reactionMethod}
+${approvalsCatch}
+    },${reactionMethod}${approvalsResumeMethod}
   };
 }
 `;
@@ -831,15 +1285,82 @@ function renderGateway(ir: IrChannelV0): string {
         '        return new Response("ok", { status: 200 });',
         "      }",
       ].join("\n");
+
+  // G11 — the interactivity (button-click) route + shared approval store, wired
+  // whenever `permissions.ask_mode` is not "deny".
+  const approvalsOn = ir.permissions.askMode !== "deny";
+  const gatewayApprovalImports = approvalsOn
+    ? '\nimport { resolveApproval } from "@crewhaus/channel-adapter-base";\nimport type { ApprovalStore, ApprovalAuditSink } from "@crewhaus/channel-adapter-base";'
+    : "";
+  const gatewayApprovalConfig = approvalsOn
+    ? `
+  /**
+   * G11 — the shared pending-approval store. The \`/<adapter>/actions\` route
+   * resolves a parked approval here on a button click; the parked turn (in the
+   * session-router) awaits the same store. Absent ⇒ the actions route ACKs and
+   * ignores (no approval surface).
+   */
+  approvals?: ApprovalStore;
+  /** G48 — durable audit sink; an approval resolution appends one record. */
+  auditSink?: ApprovalAuditSink;`
+    : "";
+  const gatewayActionsBlock = approvalsOn
+    ? `      // G11 — interactivity webhook (an Approve/Deny button click), verified
+      // with the SAME signing machinery as an events webhook and resolved via
+      // the shared store. Path: /<adapter>/actions.
+      const actionMatch = url.pathname.match(/^\\/([^/]+)\\/actions$/);
+      if (actionMatch && actionMatch[1] !== undefined) {
+        const actionAdapter = config.adapters.get(actionMatch[1]);
+        if (!actionAdapter || !actionAdapter.parseInteraction) {
+          return new Response("unknown channel", { status: 404 });
+        }
+        const actionBody = await req.text();
+        const actionReq = { headers: req.headers, body: actionBody };
+        if (!actionAdapter.verify(actionReq)) {
+          return new Response("invalid signature", { status: 401 });
+        }
+        const interaction = actionAdapter.parseInteraction(actionReq);
+        if (interaction.kind !== "approval_action" || config.approvals === undefined) {
+          return new Response("ok", { status: 200 });
+        }
+        const by = actionAdapter.id + ":" + interaction.userId;
+        const resolved = await resolveApproval({
+          store: config.approvals,
+          approvalId: interaction.approvalId,
+          decision: interaction.decision,
+          by,
+          ...(config.auditSink !== undefined ? { auditSink: config.auditSink } : {}),
+        });
+        if (resolved === null) return new Response("unknown approval", { status: 200 });
+        const ackApproval = actionAdapter.ackApproval;
+        if (ackApproval !== undefined) {
+          try {
+            await ackApproval({ interaction, decision: interaction.decision, by, toolName: resolved.toolName });
+          } catch (err) {
+            process.stderr.write("[gateway] approval ack error: " + (err as Error).message + "\\n");
+          }
+        }
+        // Resume runs off the ACK path so a slow re-drive can't stall the 3s
+        // interactivity response; the parked turn re-executes pre-resolved.
+        queueMicrotask(() => {
+          config.sessionRouter.resumeApproval(resolved, actionAdapter).catch((err) => {
+            process.stderr.write("[gateway] approval resume error: " + (err as Error).message + "\\n");
+          });
+        });
+        return new Response("ok", { status: 200 });
+      }
+`
+    : "";
+
   return `// Generated by crewhaus. DO NOT EDIT.
 // Channel-generic gateway: dispatches signed webhooks to the matching adapter.
 import { InMemoryDedupStore, type DedupStore } from "@crewhaus/durable-state";
-import type { ChannelAdapter } from "@crewhaus/channel-adapter-slack";
+import type { ChannelAdapter } from "@crewhaus/channel-adapter-slack";${gatewayApprovalImports}
 import type { SessionRouter } from "./session-router.js";
 
 export type GatewayConfig = {
   adapters: ReadonlyMap<string, ChannelAdapter>;
-  sessionRouter: SessionRouter;
+  sessionRouter: SessionRouter;${gatewayApprovalConfig}
   /** Maximum number of inbound idempotency keys remembered before LRU eviction (in-memory store only). */
   dedupCapacity?: number;
   /**
@@ -865,7 +1386,7 @@ export function createGateway(config: GatewayConfig): Gateway {
   return {
     async handle(req: Request): Promise<Response> {
       const url = new URL(req.url);
-      // Match adapter by path prefix: /slack/events → "slack".
+${gatewayActionsBlock}      // Match adapter by path prefix: /slack/events → "slack".
       const match = url.pathname.match(/^\\/([^/]+)\\/events$/);
       if (!match || match[1] === undefined) return new Response("not found", { status: 404 });
       const adapter = config.adapters.get(match[1]);
@@ -913,9 +1434,90 @@ ${reactionBranch}
 `;
 }
 
+/**
+ * Loop contract 0.4 (Batch C, G26) — lower the `observability` block to the
+ * env stamps the runtime's env-gated subscribers read (`attachDefaultSubscribers`
+ * takes only `process.env`). Emitted at daemon module scope with `??=` so an
+ * operator's own deploy-time env always wins. DEFAULTS (spec absence != off):
+ * cost tracking + the low-overhead trace ring are default-ON; the pretty/json
+ * printer, metrics, alerts, incidents, and OTel export stay opt-in. An explicit
+ * `cost: { enabled: false }` / `metrics: { enabled: true }` reaches the IR
+ * verbatim and is honoured.
+ */
+function renderObservabilityEnvStamp(ir: IrChannelV0): string {
+  const obs = ir.observability;
+  const lines: string[] = [];
+  // cost — default ON: low-overhead microdollar accrual (cost_accrual events).
+  if ((obs?.cost?.enabled ?? true) === true) {
+    lines.push('process.env["CREWHAUS_COST_TRACKING"] ??= "1";');
+  }
+  // trace — default "ring" (bus ring buffer only, no printer). pretty/json
+  // attach the structured-event-printer; "off" and "ring" attach no printer
+  // (the ring buffer is bus-internal and not env-disable-able here).
+  const traceLevel = obs?.trace?.level ?? "ring";
+  if (traceLevel === "pretty" || traceLevel === "json") {
+    lines.push(`process.env["CREWHAUS_TRACE"] ??= ${escapeJsonString(traceLevel)};`);
+  }
+  // metrics / alerts / incidents — opt-in OFF; stamp only when enabled.
+  if (obs?.metrics?.enabled === true) {
+    lines.push('process.env["CREWHAUS_METRICS"] ??= "stdout";');
+  }
+  if (obs?.alerts?.enabled === true) {
+    lines.push('process.env["CREWHAUS_ALERTS"] ??= "1";');
+  }
+  if (obs?.incidents?.enabled === true) {
+    lines.push('process.env["CREWHAUS_INCIDENTS"] ??= "1";');
+  }
+  // otel — keyed on an endpoint; a `$VAR` value resolves to that env var.
+  const endpoint = obs?.otel?.endpoint;
+  if (endpoint !== undefined && endpoint.length > 0) {
+    const expr = endpoint.startsWith("$")
+      ? `process.env[${escapeJsonString(endpoint.slice(1))}]`
+      : escapeJsonString(endpoint);
+    lines.push(`process.env["OTEL_EXPORTER_OTLP_ENDPOINT"] ??= ${expr};`);
+  }
+  if (lines.length === 0) return "";
+  return `\n// G26 — observability lowered to env stamps (\`??=\` so an operator's own env\n// still wins). cost tracking + the trace ring are default-on; printers,\n// metrics, alerts, incidents, and OTel export stay opt-in.\n${lines.join("\n")}\n`;
+}
+
 // ---------------------------------------------------------------------------
 // File 4: daemon.ts — entrypoint. Boots everything and serves HTTP.
 // ---------------------------------------------------------------------------
+
+/**
+ * Loop contract 0.4 (Batch F) — render the `IrSchedule` as a
+ * durable-execution `WakeSchedule` object literal (the IR MINUS
+ * `instructions`, which the daemon threads into `onWake` separately). Numeric
+ * fields are already ms-normalized at lower time, so JSON.stringify yields
+ * valid, byte-stable JS. Shared verbatim with target-batch-worker — keep in
+ * sync.
+ */
+function wakeScheduleLiteral(schedule: IrSchedule): string {
+  const literal =
+    schedule.kind === "cron"
+      ? {
+          kind: "cron" as const,
+          cron: schedule.cron,
+          ...(schedule.timezone !== undefined ? { timezone: schedule.timezone } : {}),
+          ...(schedule.jitterMs !== undefined ? { jitterMs: schedule.jitterMs } : {}),
+        }
+      : {
+          kind: "interval" as const,
+          everyMs: schedule.everyMs,
+          ...(schedule.jitterMs !== undefined ? { jitterMs: schedule.jitterMs } : {}),
+        };
+  return JSON.stringify(literal);
+}
+
+/** A one-line human description of a schedule for the daemon's [schedule]
+ *  boot log. Shared verbatim with target-batch-worker — keep in sync. */
+function describeSchedule(schedule: IrSchedule): string {
+  const base =
+    schedule.kind === "cron"
+      ? `cron "${schedule.cron}"${schedule.timezone !== undefined ? ` ${schedule.timezone}` : " UTC"}`
+      : `every ${schedule.everyMs}ms`;
+  return schedule.jitterMs !== undefined ? `${base} +/-${schedule.jitterMs}ms jitter` : base;
+}
 
 function renderDaemon(ir: IrChannelV0): string {
   const slack = ir.channels.slack;
@@ -934,6 +1536,7 @@ function renderDaemon(ir: IrChannelV0): string {
   }
   const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
   const mcp = renderMcpServers(ir);
+  const knowledge = renderKnowledge(ir);
   const subAgents = renderSubAgents(ir);
   const envNames = requiredEnvNames(ir);
   // Provider credential groups (either-or) derived from agent.model at
@@ -1070,6 +1673,15 @@ registerChannelAdapter("imessage", imessageAdapter);`);
     : "";
   const mcpCleanup = mcp.hasAny ? `\n    ${mcp.cleanupBlock}` : "";
 
+  // Loop contract 0.4 (Batch E, G22) — the RAG corpus ingests at daemon boot
+  // (async) and registers the Retrieve tool on defaultCatalog before
+  // createAgent snapshots `defaultCatalog.list()`.
+  const knowledgeImportBlock =
+    knowledge.imports.length > 0 ? `${knowledge.imports.join("\n")}\n` : "";
+  const knowledgeBoot = knowledge.bootBlock
+    ? `\n  // Knowledge RAG (Batch E)\n  ${knowledge.bootBlock.split("\n").join("\n  ")}\n`
+    : "";
+
   const subAgentImportBlock =
     subAgents.imports.length > 0 ? `${subAgents.imports.join("\n")}\n` : "";
   const subAgentBoot = subAgents.hasAny
@@ -1136,6 +1748,52 @@ registerChannelAdapter("imessage", imessageAdapter);`);
 `
     : "";
   const heartbeatShutdown = ir.heartbeat ? "\n      clearInterval(__heartbeatTimer);" : "";
+
+  // Loop contract 0.4 (Batch F, temporal contract / G84) — the `schedule:`
+  // wake loop. When the IR carries a schedule, the daemon arms
+  // durable-execution's `armSchedule` (all cron/interval + jitter arithmetic
+  // lives there — one tested place). Each wake runs a fresh-session turn with
+  // the synthetic wake prompt, exactly like the heartbeat's "wake, decide,
+  // act, sleep" pattern; a failed wake is classified and logged but never
+  // crashes the daemon. Absent `schedule:` emits NOTHING, so unscheduled
+  // channel bundles stay byte-identical.
+  const scheduleImport = ir.schedule
+    ? `import { armSchedule } from "@crewhaus/durable-execution";\nimport { randomBytes as __schedRandomBytes } from "node:crypto";\n`
+    : "";
+  const schedScopeField =
+    ir.schedule && ir.continuity !== undefined ? `\n          continuityScope: "spec",` : "";
+  const scheduleBoot = ir.schedule
+    ? `
+  // Loop contract 0.4 (Batch F) — schedule: wake loop (cron|interval + jitter)
+  const __scheduleInstructions = ${escapeJsonString(ir.schedule.instructions ?? "[scheduled wake] proceed with your standing instructions.")};
+  let __scheduleTick = 0;
+  const __schedule = armSchedule(${wakeScheduleLiteral(ir.schedule)}, {
+    onWake: async () => {
+      __scheduleTick++;
+      const __sessionId = \`sess_\${__schedRandomBytes(8).toString("hex")}\`;
+      process.stdout.write(\`[schedule] wake #\${__scheduleTick} (session \${__sessionId})\\n\`);
+      const __out = await agent.runTurn({
+        sessionId: __sessionId,
+        isNew: true,
+        message: __scheduleInstructions,${schedScopeField}
+      });
+      const __preview = __out.length > 200 ? __out.slice(0, 200) + "…" : __out;
+      process.stdout.write(\`[schedule] → \${__preview}\\n\`);
+    },
+    onError: (__err) => {
+      // A classified terminal failure renders its full report; anything else
+      // keeps the bare line. Either way the daemon keeps serving.
+      if (isRunFailedError(__err)) {
+        process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[schedule]" })}\\n\`);
+      } else {
+        process.stderr.write(\`[schedule] error: \${(__err as Error).message}\\n\`);
+      }
+    },
+  });
+  process.stdout.write(${escapeJsonString(`[schedule] armed (${describeSchedule(ir.schedule)})\n`)});
+`
+    : "";
+  const scheduleShutdown = ir.schedule ? "\n      __schedule.cancel();" : "";
 
   // Phase 3 §3.4 — gateway control-UI. When set, spawn a second
   // Bun.serve on the configured port serving a minimal status JSON
@@ -1204,10 +1862,28 @@ registerChannelAdapter("imessage", imessageAdapter);`);
 `
     : "";
   const dreamStepsField = dreamOn ? "\n    steps: __dreamStep !== null ? [__dreamStep] : []," : "";
+  // Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks (`hooks:`).
+  // IrHook is HookDef-shaped by contract (the spec ↔ hooks-engine
+  // cross-check test pins the event list), so codegen embeds them as a
+  // literal LAYERED BELOW the settings.json-discovered ones — spec entries
+  // first, then loadHooks()' user → project entries (aggregateDecisions'
+  // later-wins mutate merge keeps the settings layers authoritative — the
+  // permission RuleSet's settings-over-yaml precedence; mirror: target-cli
+  // and the `crewhaus run` interpreter). Declaration order within the
+  // spec is preserved (hooks run in registration order) and all hooks
+  // still RUN (any deny wins regardless of layer). Absent/empty leaves
+  // bundles byte-identical.
+  const specHooks = ir.hooks !== undefined && ir.hooks.length > 0 ? ir.hooks : undefined;
+  const hooksEngineImport = `import { loadHooks${specHooks !== undefined ? ", type HookDef" : ""} } from "@crewhaus/hooks-engine";`;
+  const specHooksBoot =
+    specHooks !== undefined
+      ? `\n  // Loop contract 0.4 — spec-declared lifecycle hooks, layered below the\n  // settings.json-discovered ones (spec first; user → project later-wins).\n  const __specHooks: ReadonlyArray<HookDef> = ${JSON.stringify(specHooks)};`
+      : "";
+  const agentHooksExpr = specHooks !== undefined ? "[...__specHooks, ...__hooks]" : "__hooks";
   const extensionImports = continuityOn
-    ? `import { loadHooks } from "@crewhaus/hooks-engine";
+    ? `${hooksEngineImport}
 import { defaultCatalog } from "@crewhaus/tool-catalog";`
-    : `import { loadHooks } from "@crewhaus/hooks-engine";
+    : `${hooksEngineImport}
 import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
 import { defaultCatalog } from "@crewhaus/tool-catalog";`;
@@ -1227,46 +1903,83 @@ import { defaultCatalog } from "@crewhaus/tool-catalog";`;
     : `    skills: __skills,
     slashCommands: __slashCommands,`;
 
-  // v0.3.0 Goal 3 — thredz is spec-carried on this shape but not emit-wired
-  // in this release (the one-knob backend flip ships on cli). Surface it,
-  // 0.2.3-style, so nobody wonders why their wiki stayed local.
-  const thredzWarning =
-    ir.thredz !== undefined
-      ? "// note: thredz configured but ignored on channel in 0.3.0 — the Thredz backend flip is wired on the cli shape (design §4)\n"
-      : "";
+  // Loop contract 0.4 (Batch E, G23) — thredz is now emit-WIRED on channel:
+  // the daemon's connectThredz boot flips the wiki backend, so the live
+  // connection threads into createAgent as the `thredz` config field (only
+  // meaningful when the memory fabric wires — wireMemory is the sole
+  // consumer of the live connection).
+  const thredzOn = ir.thredz !== undefined && memoryFabric(ir).wired;
+  const thredzCreateAgentField = thredzOn ? "\n    thredz: __thredz," : "";
+
+  // Loop contract 0.4 (Batch C) — observability env stamps (G26), the durable
+  // security audit sink (G48), and the pending-approval surface (G11).
+  const observabilityEnvStamp = renderObservabilityEnvStamp(ir);
+  const approvalsOn = ir.permissions.askMode !== "deny";
+  const approvalsImport = approvalsOn
+    ? 'import { InMemoryApprovalStore } from "@crewhaus/channel-adapter-base";\n'
+    : "";
+  const auditApprovalsBoot = `
+  // G48 — durable, hash-chained security audit sink rooted at
+  // <cwd>/.crewhaus/audit. The Pillar 3 justification + egress gates append
+  // here so an unattended daemon's security decisions are tamper-evidenced.
+  // Opt out with CREWHAUS_SECURITY_AUDIT=0.
+  const __securityAudit =
+    process.env["CREWHAUS_SECURITY_AUDIT"] === "0"
+      ? undefined
+      : await openAuditLog({ rootDir: join(__cwd, ".crewhaus", "audit") });
+${
+  approvalsOn
+    ? "  // G11 — the shared pending-approval store: the parked turn (session-router)\n  // and the /<adapter>/actions webhook rendezvous here. In-memory default —\n  // volatile, so a restart forgets parked approvals; a durable/cross-process\n  // backend (shared with the `crewhaus approvals` CLI verbs) is a follow-up.\n  const __approvals = new InMemoryApprovalStore();\n"
+    : ""
+}`;
+  const agentAuditFields =
+    "\n    ...(__securityAudit !== undefined\n      ? { justificationAuditSink: __securityAudit, egressAuditSink: __securityAudit }\n      : {}),";
+  const sessionRouterApprovalsField = approvalsOn ? ", approvals: __approvals" : "";
+  const gatewayApprovalsFields = approvalsOn
+    ? "\n    approvals: __approvals,\n    auditSink: __securityAudit,"
+    : "";
   return `#!/usr/bin/env bun
 // Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: channel, ir version: ${ir.version}, file: daemon.ts)
-${thredzWarning}import { formatRunFailure, ${ir.heartbeat ? "isRunFailedError, " : ""}toFailureReport } from "@crewhaus/errors";
+import { formatRunFailure, ${ir.heartbeat || ir.schedule ? "isRunFailedError, " : ""}toFailureReport } from "@crewhaus/errors";
 ${extensionImports}
 ${adapterImports.join("\n")}
 import { registerChannelAdapter } from "@crewhaus/tool-message-channel";
-${heartbeatImport}${builtinImportBlock}${mcpImportBlock}${subAgentImportBlock}import { createAgent${dreamOn ? ", createDreamStep" : ""} } from "./agent.js";
+${heartbeatImport}${scheduleImport}${builtinImportBlock}${mcpImportBlock}${knowledgeImportBlock}${subAgentImportBlock}import { createAgent${dreamOn ? ", createDreamStep" : ""} } from "./agent.js";
 import { createSessionRouter } from "./session-router.js";
 import { createGateway } from "./gateway.js";
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createDedupStore } from "@crewhaus/durable-state";
 import { createJanitor } from "@crewhaus/runtime-core";
+import { openAuditLog } from "@crewhaus/audit-log";
+import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
+${approvalsImport}import { join } from "node:path";
 
-${startupEnvCheck}
+${startupEnvCheck}${observabilityEnvStamp}
 ${adapterConstructBlock}
 
 async function main(): Promise<void> {
-${extensionBoot}
-${registerBlock}${mcpBoot}${subAgentBoot}
+${extensionBoot}${specHooksBoot}${auditApprovalsBoot}
+${registerBlock}${mcpBoot}${subAgentBoot}${knowledgeBoot}
+  // Loop contract 0.4 (Batch E, G78) — per-spec cross-run prompt-cache
+  // rotation store (§2.5). One small JSON record under
+  // .crewhaus/prompt-cache/<spec>.json survives restarts so the daemon reuses
+  // a still-fresh cache prefix instead of cold-starting it every boot.
+  const __promptCacheStore = createPromptCacheRotationStore({ specName: ${escapeJsonString(ir.name)} });
   const agent = createAgent({
-    hooks: __hooks,
+    hooks: ${agentHooksExpr},
 ${agentSkillsFields}
-    tools: defaultCatalog.list(),${subAgentCreateAgentFields}
+    tools: defaultCatalog.list(),${subAgentCreateAgentFields}${agentAuditFields}${thredzCreateAgentField}
+    promptCacheStore: __promptCacheStore,
   });
-  const sessionRouter = createSessionRouter({ agent });
+  const sessionRouter = createSessionRouter({ agent${sessionRouterApprovalsField} });
   // SECURITY (audit R3) — replay-dedup backend. Default in-memory; set
   // CREWHAUS_DEDUP_STORE=sqlite:<path> so seen webhook ids survive restarts
   // and are shared by every daemon process on this host.
   const __dedupStore = createDedupStore(process.env["CREWHAUS_DEDUP_STORE"] ?? "memory");
   const gateway = createGateway({
     adapters: ${adapterMapLiteral},
-    sessionRouter,
+    sessionRouter,${gatewayApprovalsFields}
     dedupStore: __dedupStore,
   });
 
@@ -1305,7 +2018,7 @@ ${dreamBoot}  const __janitor = createJanitor({
   const port = Number(process.env["PORT"] ?? 3000);
   const server = Bun.serve({ port, fetch: (req) => gateway.handle(req) });
   process.stdout.write(\`[daemon] listening on http://localhost:\${server.port}\\n\`);
-${gatewayBoot}${heartbeatBoot}
+${gatewayBoot}${heartbeatBoot}${scheduleBoot}
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
@@ -1313,7 +2026,7 @@ ${gatewayBoot}${heartbeatBoot}
     process.stdout.write(\`[daemon] received \${signal}, shutting down...\\n\`);
     __janitor.stop();
     try {
-      await server.stop(true);${gatewayShutdown}${heartbeatShutdown}${mcpCleanup}
+      await server.stop(true);${gatewayShutdown}${heartbeatShutdown}${scheduleShutdown}${mcpCleanup}
     } catch (err) {
       process.stderr.write(\`[daemon] shutdown error: \${(err as Error).message}\\n\`);
     }

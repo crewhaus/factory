@@ -37,6 +37,14 @@ async function runCli(
     cwd,
     env: {
       PATH: process.env["PATH"] ?? "",
+      // Hermetic dataset registry per invocation: `crewhaus eval` unions the
+      // per-spec `<specName>-regressions` suite (item 9) from the registry
+      // under the cwd by default, and `optimize` PINS into it — running with
+      // cwd=REPO_ROOT would read/write the shared checkout's
+      // `.crewhaus/datasets`, so a suite pinned by any earlier live run
+      // would silently grow this test's sample set (observed: a stale
+      // `hello-regressions` made the 2-sample dataset grade 3 samples).
+      CREWHAUS_DATASETS_DIR: join(newTempRoot(), "datasets"),
       // CREWHAUS_EVAL_STUB short-circuits the runner to use a deterministic
       // stub model — set in the spawned process via env. The runner picks
       // this up in a future iteration; for now we use the invoker injection
@@ -119,6 +127,16 @@ describe("crewhaus eval CLI integration (T3)", () => {
   test("eval rejects missing --dataset", async () => {
     const result = await runCli(["eval", HELLO_SPEC]);
     expect(result.exitCode).toBe(1);
+  });
+
+  // Loop contract 0.4 (Batch B, G15) — `--repeats` is validated strictly and
+  // BEFORE any dataset load or model spend, so these need no credentials.
+  test("eval rejects a non-positive, fractional, or non-numeric --repeats", async () => {
+    const base = ["eval", HELLO_SPEC, "--dataset", "d.jsonl", "--graders", "g.yaml"];
+    for (const bad of ["0", "-2", "3.5", "two", "3x"]) {
+      const result = await runCli([...base, "--repeats", bad]);
+      expect(result.exitCode).toBe(1);
+    }
   });
 
   test("eval-report --help exits 0", async () => {

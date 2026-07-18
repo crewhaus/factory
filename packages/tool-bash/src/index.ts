@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import type { TraceEventBus } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
 
 /**
@@ -126,6 +127,44 @@ type BashOutputResult = {
   readonly timeoutMs: number;
 };
 
+/**
+ * Section 57 / loop contract 0.4 (Batch C, G59) — resolve the run's
+ * `TraceEventBus` from a tool-execute context. The runtime threads the
+ * `RunContext` on EVERY tool execute via `ctx.bridge.runContext` (and, where
+ * available, the first-class `ctx.runContext`), mirroring tool-mcp /
+ * skills-registry. Returns undefined when neither is present (bare unit
+ * calls) so publishing is a strict no-op off the loop.
+ */
+function resolveEventBus(ctx?: ToolExecuteContext): TraceEventBus | undefined {
+  const rc =
+    ctx?.runContext ??
+    (ctx?.bridge as { runContext?: { eventBus?: TraceEventBus } } | undefined)?.runContext;
+  return rc?.eventBus;
+}
+
+/**
+ * Section 57 / loop contract 0.4 (Batch C, G59) — publish ONE `program_output`
+ * summary at a foreground command's exit (per-chunk stdout/stderr is the
+ * separate `tool_stream_chunk` stream). The event carries only byte COUNTS +
+ * the exit code + duration — never the raw stdout/stderr — so it is inherently
+ * size-capped. Fire-and-forget: a missing bus skips silently.
+ */
+function publishProgramOutput(
+  bus: TraceEventBus | undefined,
+  summary: { stdout: string; stderr: string; exitCode: number; durationMs: number },
+): void {
+  if (bus === undefined) return;
+  bus.publish({
+    ...bus.envelope(),
+    kind: "program_output",
+    programId: `prog_${randomBytes(6).toString("hex")}`,
+    exitCode: summary.exitCode,
+    stdoutBytes: Buffer.byteLength(summary.stdout, "utf8"),
+    stderrBytes: Buffer.byteLength(summary.stderr, "utf8"),
+    durationMs: Math.round(summary.durationMs),
+  });
+}
+
 function formatResult(out: BashOutputResult): string {
   const parts: string[] = [];
   if (out.stdout.length > 0) parts.push(out.stdout.replace(/\n+$/, ""));
@@ -202,6 +241,7 @@ export const bash: RegisteredTool = buildTool({
       return startBackground(input.command);
     }
     const timeoutMs = input.timeout ?? DEFAULT_TIMEOUT_MS;
+    const t0 = performance.now();
     const proc = Bun.spawn(["sh", "-c", input.command], {
       stdout: "pipe",
       stderr: "pipe",
@@ -228,6 +268,14 @@ export const bash: RegisteredTool = buildTool({
         Promise.race([stdoutText, drainFallback()]),
         Promise.race([stderrText, drainFallback()]),
       ]);
+      // G59 — publish the per-process summary at exit (byte counts + exit code
+      // + duration only) for the runtime feedback channel.
+      publishProgramOutput(resolveEventBus(ctx), {
+        stdout,
+        stderr,
+        exitCode,
+        durationMs: performance.now() - t0,
+      });
       return formatResult({ stdout, stderr, exitCode, timedOut, timeoutMs });
     } finally {
       clearTimeout(timer);

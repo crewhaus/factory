@@ -19,6 +19,48 @@ appended (and, for the daemon shapes, the `memory:` block stripped — memory
 became emit-wired on channel/managed/research/crew in 0.3.0, a separate
 documented delta) and asserts byte equality with the pins.
 
+**0.4 Batch E (G78) delta — channel + managed only.** The long-running
+channel/managed daemon bundles gained the §2.5 cross-run prompt-cache rotation
+persistence seam (a per-spec `createPromptCacheRotationStore` threaded into the
+`promptCacheLastRotatedAt`/`onPromptCacheRotated` options). Prompt caching is
+gated in the runtime on the provider's caching capability
+(`adapter.features.caching === "explicit"`), NOT on memory/continuity, so the
+seam is emitted unconditionally and rides even a memory-free `continuity: false`
+bundle. The `channel.*` and `managed.agent.ts` pins were regenerated to
+pre-PR-11 **plus** that orthogonal seam; the continuity opt-out contract itself
+is unchanged (no `wireMemory`/continuity wiring appears). `research`/`crew` and
+the single-shot `cli` shape did not gain the seam this batch, so their pins are
+untouched.
+
+**0.4 Batch F (ITEM 7) delta — managed daemon + browser driver only.** The
+resumable long-running shapes gained an at-least-once resume path: a
+`runs.continue` (managed daemon) / `--resume`/`--continue` (browser driver)
+that reseats a prior session's history is now wrapped in
+`@crewhaus/idempotency-keys`' `withIdempotency`, keyed on
+`(tenant/spec, session, input)`, so a duplicate resume (client retry or a
+visibility-lease double-pull) returns the cached reply instead of re-executing
+the turn. That seam is emitted unconditionally on these two shapes (it rides
+session resumption, NOT memory/continuity), so it appears on a memory-free
+`continuity: false` bundle too — the `managed.daemon.ts` and `browser.agent.ts`
+pins were regenerated to pre-PR-11 **plus** that seam. The continuity opt-out
+contract is unchanged (no `wireMemory`/continuity wiring appears); the
+`managed.agent.ts` pin (no resume path of its own) and the channel/research/crew
+and single-shot cli pins are untouched.
+
+**0.4 Batch G (item 2 / G31) delta — managed daemon only.** The managed daemon
+gained the A2A federation peer surface: the `federation` config it hands to
+`createGatewayServer` (the `/.well-known/agent-card.json` + `/.well-known/
+crewhaus.json` + inbound `POST /federation` routes). The whole block is emitted
+unconditionally and env-gated at RUNTIME — unset federation env ⇒ `federation`
+resolves to `undefined` ⇒ those routes answer 404 — so any managed deployment
+becomes a peer purely by setting env, no recompile. Because it rides the
+already-present gateway server (NOT memory/continuity), it appears on a
+memory-free `continuity: false` bundle too, so the `managed.daemon.ts` pin was
+regenerated to pre-PR-11 **plus** that seam. The continuity opt-out contract is
+unchanged (no `wireMemory`/continuity wiring appears); every other pin —
+including `managed.agent.ts` (no gateway of its own) and the channel/research/
+crew shapes (federation is managed-only this batch) — is untouched.
+
 ## Regenerating
 
 Only regenerate when a LATER release deliberately changes emitted bundles;

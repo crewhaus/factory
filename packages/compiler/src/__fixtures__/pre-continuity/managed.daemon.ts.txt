@@ -4,10 +4,16 @@
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createBudgetStore } from "@crewhaus/durable-state";
 import { formatRunFailure, isRunFailedError } from "@crewhaus/errors";
-import { createGatewayServer } from "@crewhaus/gateway-server";
+import { createGatewayServer, type GatewayFederationConfig } from "@crewhaus/gateway-server";
+import {
+  createInMemoryIdempotencyStore,
+  idempotencyKey,
+  withIdempotency,
+} from "@crewhaus/idempotency-keys";
 import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
+import { createRunContext, type RunContext } from "@crewhaus/run-context";
 import { createJanitor } from "@crewhaus/runtime-core";
-import { buildTenant, type Tenant } from "@crewhaus/tenancy";
+import { buildTenant, withTenant, type Tenant } from "@crewhaus/tenancy";
 import { runOneTurn } from "./agent.ts";
 
 import { randomBytes } from "node:crypto";
@@ -124,16 +130,124 @@ function readIntakeGate(): { paused: boolean; reason?: string } {
   return __intakeCache;
 }
 
+// Contract item 3 — the per-run trace-bus registry that backs runs.subscribe.
+// Every run's TraceEventBus is registered under its runId, TENANT-FENCED:
+// resolveRunEvents only streams to the tenant that started the run (a
+// cross-tenant — or unknown — runId resolves to undefined → 404, so a run's
+// existence never leaks across tenants). Bounded so completed runs' ring
+// buffers don't accumulate unboundedly; the oldest entry is evicted past the
+// cap.
+const RUN_BUS_CAP = 256;
+const RUN_BUSES = new Map<string, { tenantId: string; bus: RunContext["eventBus"] }>();
+function registerRunBus(runId: string, tenantId: string, bus: RunContext["eventBus"]): void {
+  RUN_BUSES.set(runId, { tenantId, bus });
+  while (RUN_BUSES.size > RUN_BUS_CAP) {
+    const oldest = RUN_BUSES.keys().next().value;
+    if (oldest === undefined) break;
+    RUN_BUSES.delete(oldest);
+  }
+}
+
+// Loop contract 0.4 (Batch F, ITEM 7) — the resume path's idempotency store.
+// runs.continue with a prior sessionId reseats that session's history and is
+// wrapped in withIdempotency keyed on (tenant, session, input), so a duplicate
+// resume (client retry / a visibility-lease double-pull) returns the cached
+// reply instead of re-executing the turn. TTL bounds the dedupe window
+// (CREWHAUS_RESUME_IDEM_TTL_MS, default 5 min).
+const RESUME_IDEM_STORE = createInMemoryIdempotencyStore<string>();
+const RESUME_IDEM_TTL_MS = Number(process.env.CREWHAUS_RESUME_IDEM_TTL_MS ?? 300_000);
+
+// Item 2 (G31) — A2A federation peer surface. This deployment serves
+// GET /.well-known/agent-card.json (a real A2A Agent Card), GET
+// /.well-known/crewhaus.json (the namespaced discovery alias carrying the
+// cert-pin fingerprint) and POST /federation (the inbound handler) WHEN it is
+// configured as a peer: set CREWHAUS_FEDERATION_DEPLOYMENT_ID (its id),
+// CREWHAUS_FEDERATION_ENDPOINT (public base URL) and
+// CREWHAUS_FEDERATION_FINGERPRINT (64-hex sha256 of its leaf cert). Any unset ⇒
+// the federation routes answer 404. Inbound calls are gated by
+// CREWHAUS_FEDERATION_ALLOWED_PEERS (comma-separated peer deployment ids); an
+// empty/unset allowlist DENIES every inbound call — an explicit allowlist is
+// required to accept a remote peer. mTLS termination (the transport-level
+// authentication floor) is the operator's responsibility (Bun tls / a proxy).
+const FED_DEPLOYMENT_ID = process.env.CREWHAUS_FEDERATION_DEPLOYMENT_ID;
+const FED_ENDPOINT = process.env.CREWHAUS_FEDERATION_ENDPOINT;
+const FED_FINGERPRINT = process.env.CREWHAUS_FEDERATION_FINGERPRINT;
+const FED_ALLOWED_PEERS = (process.env.CREWHAUS_FEDERATION_ALLOWED_PEERS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter((s) => s.length > 0);
+const federation: GatewayFederationConfig | undefined =
+  FED_DEPLOYMENT_ID && FED_ENDPOINT && FED_FINGERPRINT
+    ? {
+        identity: {
+          name: "pin-managed",
+          description: "Byte-restore pin fixture for the managed-daemon shape.",
+          endpoint: FED_ENDPOINT,
+          publicKeyFingerprint: FED_FINGERPRINT,
+          supportedShapes: ["managed"],
+        },
+        // App-level peer gate. mTLS authenticated *who*; this decides *whether*
+        // the peer is allowlisted. Authentication ≠ authorization.
+        authorize: (ctx) => {
+          const from = ctx.envelope.federation.from.deployment;
+          return FED_ALLOWED_PEERS.includes(from)
+            ? { ok: true }
+            : { ok: false, reason: `peer "${from}" not in CREWHAUS_FEDERATION_ALLOWED_PEERS` };
+        },
+        // Dispatch an authorized inbound call onto a local run under the first
+        // declared tenant (a real deployment maps peers→tenants). The
+        // gateway-server has already validated + classified the payload.
+        dispatch: async (ctx) => {
+          const fedTenant =
+            Object.values(tenantOverrides)[0] ??
+            buildTenant(FED_DEPLOYMENT_ID, { tenantsRoot: TENANTS_ROOT });
+          const fedRunContext = createRunContext({
+            runId: `fedrun_${randomBytes(4).toString("hex")}`,
+            sessionId: `fedsess_${randomBytes(6).toString("hex")}`,
+          });
+          const reply = await withTenant(fedTenant, () =>
+            runOneTurn({
+              tenantId: fedTenant.id,
+              sessionId: fedRunContext.sessionId,
+              input: ctx.envelope.payload,
+              extraOptions: { runContext: fedRunContext },
+            }),
+          );
+          return { reply };
+        },
+      }
+    : undefined;
+
 const gateway = createGatewayServer({
   jwtSecret: JWT_SECRET,
   tenantsRoot: TENANTS_ROOT,
   tenantOverrides,
   budgetStore: BUDGET_STORE,
   intakeGate: readIntakeGate,
+  federation,
+  // Contract item 3 — resolve a run's live trace stream for runs.subscribe from
+  // the per-run bus registry, fenced to the owning tenant. Returning undefined
+  // (unknown OR cross-tenant runId) makes the gateway answer 404.
+  resolveRunEvents: ({ runId, tenant }) => {
+    const entry = RUN_BUSES.get(runId);
+    if (entry === undefined || entry.tenantId !== tenant.id) return undefined;
+    const bus = entry.bus;
+    return {
+      // Atomic snapshot + live-subscribe: the ring-buffer replay and the live
+      // listener attach with no yield between (both synchronous), so no event
+      // is dropped or duplicated across the replay→live boundary.
+      open: (listener: (event: unknown) => void) => {
+        const replay = bus.recent();
+        const close = bus.subscribe(listener);
+        return { replay, close };
+      },
+    };
+  },
   handler: async ({ method, params, tenant }) => {
     if (method === "runs.create" || method === "runs.continue") {
       const p = params as { input: string; sessionId?: string };
       const sessionId = p.sessionId ?? `sess_${Math.random().toString(36).slice(2, 18).padEnd(16, "0")}`;
+      const runId = `run_${Math.random().toString(36).slice(2, 10)}`;
       const log = await gateway.getAuditLog(tenant);
       const policy = evaluatePolicy(
         { toolName: "runChatLoop", sideEffect: "external", input: p.input, tenantId: tenant.id },
@@ -142,9 +256,45 @@ const gateway = createGatewayServer({
       if (policy.decision === "deny") {
         throw new Error(`policy denied: ${policy.reason ?? "no reason"}`);
       }
+      // Contract item 3 — mint the run's trace bus up front and register it
+      // (tenant-fenced) so runs.subscribe can replay + live-stream THIS run;
+      // the SAME context is threaded into runOneTurn so every trace event the
+      // run publishes lands on the registered bus, and the response runId is
+      // the bus's runId (the id a client subsequently subscribes with).
+      // G48 — the per-tenant hash-chained audit log is wired as BOTH the
+      // justification and egress durable sinks, so intent-gate and egress
+      // verdicts are tamper-evidenced per tenant inside the managed daemon.
+      const runContext = createRunContext({ runId, sessionId });
+      registerRunBus(runId, tenant.id, runContext.eventBus);
+      // Loop contract 0.4 (Batch F, ITEM 7) — runs.continue with a prior
+      // sessionId is the RESUME path: reseat that session's history (`resume`)
+      // and dedupe a duplicate resume via withIdempotency. runs.create (and a
+      // continue with no sessionId) always runs a fresh turn.
+      const isResume = method === "runs.continue" && p.sessionId !== undefined;
+      const executeTurn = async (): Promise<string> =>
+        await runOneTurn({
+          tenantId: tenant.id,
+          sessionId,
+          input: p.input,
+          extraOptions: {
+            runContext,
+            justificationAuditSink: log,
+            egressAuditSink: log,
+            ...(isResume ? { resume: { sessionId } } : {}),
+          },
+        });
       let reply: string;
       try {
-        reply = await runOneTurn({ tenantId: tenant.id, sessionId, input: p.input });
+        if (isResume) {
+          const guarded = withIdempotency<undefined, string>(() => executeTurn(), {
+            store: RESUME_IDEM_STORE,
+            ttlMs: RESUME_IDEM_TTL_MS,
+          });
+          const key = idempotencyKey(`${tenant.id}:${sessionId}:${p.input}`, 0);
+          reply = (await guarded(undefined, key)).value;
+        } else {
+          reply = await executeTurn();
+        }
       } catch (err) {
         // v0.3.0 Goal 6 — a classified terminal failure (billing/auth/…)
         // renders its structured report on the daemon's stderr, then
@@ -163,7 +313,7 @@ const gateway = createGatewayServer({
         kind: "model_call",
         payload: { tenantId: tenant.id, sessionId, inputTokens, outputTokens },
       });
-      return { runId: `run_${Math.random().toString(36).slice(2, 10)}`, sessionId, tenantId: tenant.id, reply };
+      return { runId, sessionId, tenantId: tenant.id, reply };
     }
     if (method === "runs.cancel") {
       return { ok: true };

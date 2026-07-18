@@ -17,6 +17,18 @@ export type TraceEventEnvelope = {
   readonly parentSpanId?: string;
   /** ISO 8601 timestamp when the event was published. */
   readonly timestamp: string;
+  /**
+   * Loop contract 0.4 (Batch C, item 4) — the publishing agent's identity: the
+   * fingerprint of the Ed25519 public key auto-generated at first boot into
+   * `.crewhaus/identity.json`. Stamped by `TraceEventBus.envelope()` when the
+   * runtime supplies an `agentId` on the bus (and read by publishers that build
+   * envelopes by hand via `bus.agentId`). The same fingerprint is appended to
+   * audit-log records so a trace event and its audit trail attribute to one
+   * agent. Optional: absent when no identity is available (e.g. an isolated
+   * unit test, or a subscriber replaying events published before this field
+   * existed).
+   */
+  readonly agentId?: string;
 };
 
 export type TurnStartEvent = TraceEventEnvelope & {
@@ -151,6 +163,28 @@ export type CompactionFiredEvent = TraceEventEnvelope & {
   before: number;
   after: number;
   phase: "pre-turn" | "reactive";
+};
+
+/**
+ * Loop contract 0.4 (Batch E, G19) — published by runtime-core's
+ * `maybeCompact` when the active-context curator (`@crewhaus/compaction-
+ * curator`) runs its pre-compaction pass (gated on `compaction.curate`).
+ * `before`/`after` are the item counts entering and surviving the pass;
+ * `dropped` is `before - after` (semantic-dedupe + relevance top-K trim);
+ * `bytesSaved` is the text bytes removed (`CurationResult.bytesSaved`).
+ * `embedded` records whether an embedder was threaded (cosine dedupe) or the
+ * pass fell back to BM25-only lexical dedupe (no embedder resolved — see the
+ * memory block's embedder resolution order). Distinct from
+ * `compaction_fired`: curation is the RELEVANCE reorder + dedupe that runs
+ * BEFORE any snip/summarise, so it gets its own kind rather than a subKind.
+ */
+export type CurateEvent = TraceEventEnvelope & {
+  kind: "curate";
+  before: number;
+  after: number;
+  dropped: number;
+  bytesSaved: number;
+  embedded: boolean;
 };
 
 /**
@@ -476,6 +510,41 @@ export type ResponseRatedEvent = TraceEventEnvelope & {
 };
 
 /**
+ * Loop contract 0.4 (Batch C, G11) — published by the runtime when a tool
+ * permission resolves to `ask` on a NON-interactive surface and
+ * `permissions.ask_mode` is `"pause"` (the default): the runtime persists a
+ * `PendingApproval` via the injected approvals store, publishes THIS event,
+ * and parks the turn (the `approval_pending` failure class + a resume token).
+ * `approvalId` is the persisted `PendingApproval.id` — the same id the later
+ * `approval_resolved` event and the CLI/Slack approval verbs key on;
+ * `toolName` is the parked tool call; `surface` is the non-interactive surface
+ * the ask arose on (e.g. `"single-turn"`, `"daemon"`, `"gateway"`), a
+ * free-form classifier so new surfaces don't need a schema bump.
+ */
+export type ApprovalRequestedEvent = TraceEventEnvelope & {
+  kind: "approval_requested";
+  approvalId: string;
+  toolName: string;
+  surface: string;
+};
+
+/**
+ * Loop contract 0.4 (Batch C, G11) — published when a parked approval is
+ * resolved (by a CLI verb, a Slack button, or any downstream approval surface)
+ * and the decision is recorded in the approvals store, so the next run/turn
+ * re-executes the tool call pre-resolved (`grant`) or denies it with a note
+ * (`deny`). `approvalId` matches the originating `approval_requested.approvalId`;
+ * `decision` is the recorded verdict; `by` is the deciding identity (free-form
+ * — e.g. a username, `"cli"`, or `"slack:U0123"`).
+ */
+export type ApprovalResolvedEvent = TraceEventEnvelope & {
+  kind: "approval_resolved";
+  approvalId: string;
+  decision: "grant" | "deny";
+  by: string;
+};
+
+/**
  * Ops item 36 — emitted by `runtime-core`'s boot-time self-heal janitor,
  * once per maintenance step per run (daemon shapes run it at boot and on an
  * hourly interval). Steps: crash-leaked durable-state reservation cleanup,
@@ -622,6 +691,50 @@ export type ModelRouteEvent = TraceEventEnvelope & {
   policyVersion?: string;
 };
 
+/**
+ * Loop contract 0.4 (Batch B, G62) — published by the in-loop `evaluation:`
+ * machinery each time a completed assistant turn's final text is scored
+ * (cli/channel/managed shapes). One event per grading pass, INCLUDING the
+ * re-grades of evaluation-triggered retries: `retryIndex` is 0 for the
+ * original attempt, 1 for the first retry, … up to the block's
+ * `max_retries`. `verdict` is `"pass"` when `score >= threshold` (for the
+ * deterministic `contains`/`regex` graders score is 1 or 0 against a
+ * threshold of 1). Judge/model grading calls are metered into the run
+ * budget as ordinary `cost_accrual` events — this event carries only the
+ * verdict.
+ */
+export type EvalGradedEvent = TraceEventEnvelope & {
+  kind: "eval_graded";
+  /** The grader's score in [0,1] (deterministic graders emit 1 or 0). */
+  score: number;
+  /** The passing bar the score was compared against. */
+  threshold: number;
+  verdict: "pass" | "fail";
+  /** Which `evaluation.grader.type` produced the score. */
+  graderType: "llm_judge" | "contains" | "regex";
+  /** 0 = the original turn, n = the n-th evaluation-triggered retry. */
+  retryIndex: number;
+};
+
+/**
+ * Loop contract 0.4 (Batch B, G62) — published by a `kind: "judge"`
+ * workflow step / graph node when it scores its gated (previous/upstream)
+ * output. `stepOrNode` is the judge step's/node's name; `verdict` is
+ * `"pass"` when `score >= threshold`; `rationale` is the judge model's
+ * explanation when it supplied one (also what `on_fail: retry_previous`
+ * appends to the re-run as a system nudge).
+ */
+export type JudgeVerdictEvent = TraceEventEnvelope & {
+  kind: "judge_verdict";
+  /** Name of the judge step (workflow) or judge node (graph). */
+  stepOrNode: string;
+  verdict: "pass" | "fail";
+  /** The judge's score in [0,1]. */
+  score: number;
+  /** Judge-model explanation, when it supplied one. */
+  rationale?: string;
+};
+
 export type TraceEvent =
   | TurnStartEvent
   | TurnEndEvent
@@ -635,6 +748,7 @@ export type TraceEvent =
   | McpCallEndEvent
   | HookFiredEvent
   | CompactionFiredEvent
+  | CurateEvent
   | CacheRotationEvent
   | PermissionDecisionEvent
   | ErrorRecoveredEvent
@@ -653,11 +767,15 @@ export type TraceEvent =
   | ModelRouteEvent
   | JanitorActionEvent
   | ResponseRatedEvent
+  | ApprovalRequestedEvent
+  | ApprovalResolvedEvent
   | TestVerdictEvent
   | ProgramOutputEvent
   | CoverageReportEvent
   | SanitizerReportEvent
-  | AlertRaisedEvent;
+  | AlertRaisedEvent
+  | EvalGradedEvent
+  | JudgeVerdictEvent;
 
 export type TraceEventKind = TraceEvent["kind"];
 

@@ -13,7 +13,7 @@
     },
     "apps/cli": {
       "name": "crewhaus",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "bin": {
         "crewhaus": "src/index.ts",
       },
@@ -22,6 +22,11 @@
         "@crewhaus/agent-context-isolation": "workspace:*",
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/canary-controller": "workspace:*",
+        "@crewhaus/chunker": "workspace:*",
+        "@crewhaus/cloud-adapter-flyio": "workspace:*",
+        "@crewhaus/cloud-adapter-heroku": "workspace:*",
+        "@crewhaus/cloud-adapter-railway": "workspace:*",
+        "@crewhaus/cloud-adapter-render": "workspace:*",
         "@crewhaus/compiler": "workspace:*",
         "@crewhaus/compliance-controls": "workspace:*",
         "@crewhaus/computer-use-driver": "workspace:*",
@@ -53,6 +58,7 @@
         "@crewhaus/justification-judge-claude": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
+        "@crewhaus/mcp-server": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/migration-engine": "workspace:*",
@@ -61,6 +67,7 @@
         "@crewhaus/module-marketplace-client": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/pii-redactor": "workspace:*",
+        "@crewhaus/plugin-loader": "workspace:*",
         "@crewhaus/plugin-registry": "workspace:*",
         "@crewhaus/plugin-sdk": "workspace:*",
         "@crewhaus/prompt-injection-detector": "workspace:*",
@@ -82,6 +89,10 @@
         "@crewhaus/spec-patch": "workspace:*",
         "@crewhaus/spec-registry": "workspace:*",
         "@crewhaus/sub-agent-spawner": "workspace:*",
+        "@crewhaus/target-cf-worker-cli": "workspace:*",
+        "@crewhaus/target-cf-worker-graph": "workspace:*",
+        "@crewhaus/target-cf-worker-workflow": "workspace:*",
+        "@crewhaus/target-claude-plugin": "workspace:*",
         "@crewhaus/target-cli": "workspace:*",
         "@crewhaus/target-eval-bundle": "workspace:*",
         "@crewhaus/template-marketplace-client": "workspace:*",
@@ -102,12 +113,14 @@
         "@crewhaus/tool-mouse-keyboard": "workspace:*",
         "@crewhaus/tool-navigate": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
+        "@crewhaus/tool-retrieve": "workspace:*",
         "@crewhaus/tool-screen-capture": "workspace:*",
         "@crewhaus/tool-task": "workspace:*",
         "@crewhaus/tool-todo": "workspace:*",
         "@crewhaus/tool-vision-grounding": "workspace:*",
         "@crewhaus/tool-web": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
+        "@crewhaus/vector-store": "workspace:*",
         "@crewhaus/wiki-store": "workspace:*",
         "yaml": "^2.6.0",
       },
@@ -117,7 +130,7 @@
     },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/agent-context-isolation": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -128,11 +141,11 @@
     },
     "packages/abort-controller": {
       "name": "@crewhaus/abort-controller",
-      "version": "0.3.1",
+      "version": "0.3.2",
     },
     "packages/adapter-anthropic": {
       "name": "@crewhaus/adapter-anthropic",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/errors": "workspace:*",
@@ -147,12 +160,13 @@
     },
     "packages/adapter-bedrock": {
       "name": "@crewhaus/adapter-bedrock",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@aws-sdk/client-bedrock-runtime": "^3.842.0",
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
+        "@crewhaus/tool-schema-sanitizer": "workspace:*",
       },
       "devDependencies": {
         "@crewhaus/recovery-engine": "workspace:*",
@@ -160,11 +174,12 @@
     },
     "packages/adapter-gemini": {
       "name": "@crewhaus/adapter-gemini",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
+        "@crewhaus/tool-schema-sanitizer": "workspace:*",
         "@google/genai": "^1.6.0",
       },
       "devDependencies": {
@@ -173,11 +188,12 @@
     },
     "packages/adapter-openai": {
       "name": "@crewhaus/adapter-openai",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
+        "@crewhaus/tool-schema-sanitizer": "workspace:*",
         "openai": "^4.65.0",
       },
       "devDependencies": {
@@ -186,7 +202,7 @@
     },
     "packages/agent-context-isolation": {
       "name": "@crewhaus/agent-context-isolation",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/abort-controller": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -203,7 +219,7 @@
     },
     "packages/agent-handoff": {
       "name": "@crewhaus/agent-handoff",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/agent-context-isolation": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -213,7 +229,7 @@
     },
     "packages/audit-encryption": {
       "name": "@crewhaus/audit-encryption",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -222,14 +238,14 @@
     },
     "packages/audit-log": {
       "name": "@crewhaus/audit-log",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/barge-in-controller": {
       "name": "@crewhaus/barge-in-controller",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/vad-engine": "workspace:*",
         "@crewhaus/voice-runtime": "workspace:*",
@@ -237,7 +253,7 @@
     },
     "packages/boundary-classifier": {
       "name": "@crewhaus/boundary-classifier",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/prompt-injection-detector": "workspace:*",
@@ -245,7 +261,7 @@
     },
     "packages/branch-history": {
       "name": "@crewhaus/branch-history",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/checkpoint-store": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -253,14 +269,14 @@
     },
     "packages/call-session": {
       "name": "@crewhaus/call-session",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/canary-controller": {
       "name": "@crewhaus/canary-controller",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/deployment-controller": "workspace:*",
@@ -270,7 +286,7 @@
     },
     "packages/chain-adapter-base": {
       "name": "@crewhaus/chain-adapter-base",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -278,7 +294,7 @@
     },
     "packages/chain-adapter-evm": {
       "name": "@crewhaus/chain-adapter-evm",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/chain-adapter-base": "workspace:*",
@@ -287,7 +303,7 @@
     },
     "packages/channel-adapter-base": {
       "name": "@crewhaus/channel-adapter-base",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -296,42 +312,42 @@
     },
     "packages/channel-adapter-discord": {
       "name": "@crewhaus/channel-adapter-discord",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/channel-adapter-imessage": {
       "name": "@crewhaus/channel-adapter-imessage",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/channel-adapter-slack": {
       "name": "@crewhaus/channel-adapter-slack",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/channel-adapter-telegram": {
       "name": "@crewhaus/channel-adapter-telegram",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/channel-adapter-whatsapp": {
       "name": "@crewhaus/channel-adapter-whatsapp",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/checkpoint-store": {
       "name": "@crewhaus/checkpoint-store",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
@@ -339,14 +355,14 @@
     },
     "packages/chunker": {
       "name": "@crewhaus/chunker",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/circuit-breaker": {
       "name": "@crewhaus/circuit-breaker",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -355,14 +371,14 @@
     },
     "packages/citation-tracker": {
       "name": "@crewhaus/citation-tracker",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/cloud-adapter-flyio": {
       "name": "@crewhaus/cloud-adapter-flyio",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/docker-images": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -370,7 +386,7 @@
     },
     "packages/cloud-adapter-heroku": {
       "name": "@crewhaus/cloud-adapter-heroku",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/docker-images": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -378,7 +394,7 @@
     },
     "packages/cloud-adapter-railway": {
       "name": "@crewhaus/cloud-adapter-railway",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/docker-images": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -386,7 +402,7 @@
     },
     "packages/cloud-adapter-render": {
       "name": "@crewhaus/cloud-adapter-render",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/docker-images": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -394,7 +410,7 @@
     },
     "packages/compaction-autocompact": {
       "name": "@crewhaus/compaction-autocompact",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/adapter-anthropic": "workspace:*",
@@ -404,21 +420,21 @@
     },
     "packages/compaction-curator": {
       "name": "@crewhaus/compaction-curator",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/compaction-snip": {
       "name": "@crewhaus/compaction-snip",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.96.0",
       },
     },
     "packages/compiler": {
       "name": "@crewhaus/compiler",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -441,11 +457,12 @@
         "@crewhaus/target-voice": "workspace:*",
         "@crewhaus/target-workflow": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/worker-runtime": "workspace:*",
       },
     },
     "packages/compiler-worker": {
       "name": "@crewhaus/compiler-worker",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/compiler": "workspace:*",
         "@crewhaus/ir": "workspace:*",
@@ -460,7 +477,7 @@
     },
     "packages/compliance-controls": {
       "name": "@crewhaus/compliance-controls",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -468,7 +485,7 @@
     },
     "packages/computer-use-driver": {
       "name": "@crewhaus/computer-use-driver",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
@@ -481,11 +498,11 @@
     },
     "packages/context-bundle": {
       "name": "@crewhaus/context-bundle",
-      "version": "0.3.1",
+      "version": "0.3.2",
     },
     "packages/continuity-store": {
       "name": "@crewhaus/continuity-store",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
@@ -496,7 +513,7 @@
     },
     "packages/contract-compiler": {
       "name": "@crewhaus/contract-compiler",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/specialization-registry": "workspace:*",
@@ -504,7 +521,7 @@
     },
     "packages/cost-tracker": {
       "name": "@crewhaus/cost-tracker",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
@@ -512,7 +529,7 @@
     },
     "packages/crawler": {
       "name": "@crewhaus/crawler",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/citation-tracker": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -523,7 +540,7 @@
     },
     "packages/crew-orchestrator": {
       "name": "@crewhaus/crew-orchestrator",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/a2a-protocol": "workspace:*",
         "@crewhaus/agent-context-isolation": "workspace:*",
@@ -547,7 +564,7 @@
     },
     "packages/crewhaus-cloud": {
       "name": "@crewhaus/crewhaus-cloud",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/docker-images": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -556,14 +573,14 @@
     },
     "packages/data-retention-engine": {
       "name": "@crewhaus/data-retention-engine",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/dataset-registry": {
       "name": "@crewhaus/dataset-registry",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
@@ -571,7 +588,7 @@
     },
     "packages/default-skills": {
       "name": "@crewhaus/default-skills",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
@@ -586,7 +603,7 @@
     },
     "packages/deployment-controller": {
       "name": "@crewhaus/deployment-controller",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -595,14 +612,14 @@
     },
     "packages/docker-images": {
       "name": "@crewhaus/docker-images",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/dream-engine": {
       "name": "@crewhaus/dream-engine",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/continuity-store": "workspace:*",
         "@crewhaus/cost-tracker": "workspace:*",
@@ -616,7 +633,7 @@
     },
     "packages/durable-execution": {
       "name": "@crewhaus/durable-execution",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/checkpoint-store": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -624,14 +641,14 @@
     },
     "packages/durable-state": {
       "name": "@crewhaus/durable-state",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/egress-classifier": {
       "name": "@crewhaus/egress-classifier",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
@@ -639,7 +656,7 @@
     },
     "packages/egress-matcher-semantic": {
       "name": "@crewhaus/egress-matcher-semantic",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/egress-classifier": "workspace:*",
         "@crewhaus/embedder": "workspace:*",
@@ -649,18 +666,18 @@
     },
     "packages/embedder": {
       "name": "@crewhaus/embedder",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/errors": {
       "name": "@crewhaus/errors",
-      "version": "0.3.1",
+      "version": "0.3.2",
     },
     "packages/eval-dataset": {
       "name": "@crewhaus/eval-dataset",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "yaml": "^2.6.0",
@@ -669,7 +686,7 @@
     },
     "packages/eval-grader": {
       "name": "@crewhaus/eval-grader",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
@@ -681,7 +698,7 @@
     },
     "packages/eval-judge": {
       "name": "@crewhaus/eval-judge",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -696,7 +713,7 @@
     },
     "packages/eval-optimizer-orchestrator": {
       "name": "@crewhaus/eval-optimizer-orchestrator",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -711,7 +728,7 @@
     },
     "packages/eval-report": {
       "name": "@crewhaus/eval-report",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-runner": "workspace:*",
@@ -719,21 +736,30 @@
     },
     "packages/eval-runner": {
       "name": "@crewhaus/eval-runner",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/agent-context-isolation": "workspace:*",
         "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/embedder": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
         "@crewhaus/eval-judge": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/grader-12-metric-rubric": "workspace:*",
+        "@crewhaus/grader-continuity": "workspace:*",
+        "@crewhaus/grader-multimodal": "workspace:*",
+        "@crewhaus/grader-nlg-metrics": "workspace:*",
+        "@crewhaus/grader-registry": "workspace:*",
+        "@crewhaus/grader-safety-classifiers": "workspace:*",
+        "@crewhaus/grader-semantic-similarity": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
@@ -754,14 +780,10 @@
         "@crewhaus/wiki-store": "workspace:*",
         "zod": "^3.23.8",
       },
-      "devDependencies": {
-        "@crewhaus/grader-continuity": "workspace:*",
-        "@crewhaus/grader-registry": "workspace:*",
-      },
     },
     "packages/event-log": {
       "name": "@crewhaus/event-log",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
@@ -769,7 +791,7 @@
     },
     "packages/exporter-datadog": {
       "name": "@crewhaus/exporter-datadog",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/otel-exporter": "workspace:*",
@@ -778,7 +800,7 @@
     },
     "packages/exporter-honeycomb": {
       "name": "@crewhaus/exporter-honeycomb",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/otel-exporter": "workspace:*",
@@ -787,7 +809,7 @@
     },
     "packages/exporter-newrelic": {
       "name": "@crewhaus/exporter-newrelic",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/otel-exporter": "workspace:*",
@@ -796,7 +818,7 @@
     },
     "packages/exporter-splunk": {
       "name": "@crewhaus/exporter-splunk",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/otel-exporter": "workspace:*",
@@ -805,21 +827,21 @@
     },
     "packages/federation-discovery": {
       "name": "@crewhaus/federation-discovery",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/federation-protocol": {
       "name": "@crewhaus/federation-protocol",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/federation-router": {
       "name": "@crewhaus/federation-router",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -830,7 +852,7 @@
     },
     "packages/gateway-protocol": {
       "name": "@crewhaus/gateway-protocol",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "zod": "^3.23.8",
@@ -838,18 +860,20 @@
     },
     "packages/gateway-server": {
       "name": "@crewhaus/gateway-server",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/durable-state": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/federation-protocol": "workspace:*",
         "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
       },
     },
     "packages/grader-12-metric-rubric": {
       "name": "@crewhaus/grader-12-metric-rubric",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
@@ -859,7 +883,7 @@
     },
     "packages/grader-continuity": {
       "name": "@crewhaus/grader-continuity",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/continuity-store": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -872,7 +896,7 @@
     },
     "packages/grader-multimodal": {
       "name": "@crewhaus/grader-multimodal",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
@@ -880,7 +904,7 @@
     },
     "packages/grader-nlg-metrics": {
       "name": "@crewhaus/grader-nlg-metrics",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
@@ -888,7 +912,7 @@
     },
     "packages/grader-registry": {
       "name": "@crewhaus/grader-registry",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
@@ -896,7 +920,7 @@
     },
     "packages/grader-safety-classifiers": {
       "name": "@crewhaus/grader-safety-classifiers",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
@@ -904,7 +928,7 @@
     },
     "packages/grader-semantic-similarity": {
       "name": "@crewhaus/grader-semantic-similarity",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/embedder": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -914,7 +938,7 @@
     },
     "packages/graph-engine": {
       "name": "@crewhaus/graph-engine",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/checkpoint-store": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -924,7 +948,7 @@
     },
     "packages/helm-chart": {
       "name": "@crewhaus/helm-chart",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/docker-images": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -932,31 +956,34 @@
     },
     "packages/hooks-engine": {
       "name": "@crewhaus/hooks-engine",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
       },
+      "devDependencies": {
+        "@crewhaus/spec": "workspace:*",
+      },
     },
     "packages/idempotency-keys": {
       "name": "@crewhaus/idempotency-keys",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/infra-utils": {
       "name": "@crewhaus/infra-utils",
-      "version": "0.3.1",
+      "version": "0.3.2",
     },
     "packages/ir": {
       "name": "@crewhaus/ir",
-      "version": "0.3.1",
+      "version": "0.3.2",
     },
     "packages/ir-passes": {
       "name": "@crewhaus/ir-passes",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/ir": "workspace:*",
@@ -964,7 +991,7 @@
     },
     "packages/justification-judge-claude": {
       "name": "@crewhaus/justification-judge-claude",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/adapter-anthropic": "workspace:*",
@@ -975,11 +1002,11 @@
     },
     "packages/logging": {
       "name": "@crewhaus/logging",
-      "version": "0.3.1",
+      "version": "0.3.2",
     },
     "packages/mcp-host": {
       "name": "@crewhaus/mcp-host",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/logging": "workspace:*",
@@ -988,9 +1015,18 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/mcp-server": {
+      "name": "@crewhaus/mcp-server",
+      "version": "0.3.2",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@modelcontextprotocol/sdk": "^1.29.0",
+        "zod": "^3.23.8",
+      },
+    },
     "packages/memory-service": {
       "name": "@crewhaus/memory-service",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/continuity-store": "workspace:*",
         "@crewhaus/default-skills": "workspace:*",
@@ -1000,6 +1036,7 @@
         "@crewhaus/mcp-host": "workspace:*",
         "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/pii-redactor": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
@@ -1018,7 +1055,7 @@
     },
     "packages/memory-store": {
       "name": "@crewhaus/memory-store",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
@@ -1028,7 +1065,7 @@
     },
     "packages/meta-harness-optimizer": {
       "name": "@crewhaus/meta-harness-optimizer",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/prompt-optimizer": "workspace:*",
@@ -1036,21 +1073,21 @@
     },
     "packages/metrics-collector": {
       "name": "@crewhaus/metrics-collector",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
     "packages/migration-engine": {
       "name": "@crewhaus/migration-engine",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/migration-runner": {
       "name": "@crewhaus/migration-runner",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/migration-engine": "workspace:*",
@@ -1060,7 +1097,7 @@
     },
     "packages/model-router": {
       "name": "@crewhaus/model-router",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/circuit-breaker": "workspace:*",
@@ -1075,7 +1112,7 @@
     },
     "packages/module-marketplace-client": {
       "name": "@crewhaus/module-marketplace-client",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/plugin-registry": "workspace:*",
@@ -1084,14 +1121,14 @@
     },
     "packages/otel-exporter": {
       "name": "@crewhaus/otel-exporter",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
     "packages/permission-engine": {
       "name": "@crewhaus/permission-engine",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
@@ -1100,7 +1137,7 @@
     },
     "packages/permission-tokengated": {
       "name": "@crewhaus/permission-tokengated",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/chain-adapter-base": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -1109,7 +1146,7 @@
     },
     "packages/pii-redactor": {
       "name": "@crewhaus/pii-redactor",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/grader-safety-classifiers": "workspace:*",
@@ -1117,14 +1154,14 @@
     },
     "packages/pipeline-engine": {
       "name": "@crewhaus/pipeline-engine",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/planner": {
       "name": "@crewhaus/planner",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -1133,15 +1170,20 @@
     },
     "packages/plugin-loader": {
       "name": "@crewhaus/plugin-loader",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/plugin-registry": "workspace:*",
         "@crewhaus/plugin-sdk": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+      },
+      "devDependencies": {
+        "zod": "^3.23.8",
       },
     },
     "packages/plugin-registry": {
       "name": "@crewhaus/plugin-registry",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/plugin-sdk": "workspace:*",
@@ -1150,7 +1192,7 @@
     },
     "packages/plugin-sdk": {
       "name": "@crewhaus/plugin-sdk",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
@@ -1158,7 +1200,7 @@
     },
     "packages/policy-engine": {
       "name": "@crewhaus/policy-engine",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -1166,21 +1208,22 @@
     },
     "packages/prompt-cache-manager": {
       "name": "@crewhaus/prompt-cache-manager",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/prompt-injection-detector": {
       "name": "@crewhaus/prompt-injection-detector",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/prompt-optimizer": {
       "name": "@crewhaus/prompt-optimizer",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/dataset-registry": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -1191,7 +1234,7 @@
     },
     "packages/prompt-optimizer-claude": {
       "name": "@crewhaus/prompt-optimizer-claude",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/adapter-anthropic": "workspace:*",
@@ -1205,7 +1248,7 @@
     },
     "packages/queue-consumer": {
       "name": "@crewhaus/queue-consumer",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/idempotency-keys": "workspace:*",
@@ -1214,28 +1257,28 @@
     },
     "packages/queue-protocol": {
       "name": "@crewhaus/queue-protocol",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/rate-limiter": {
       "name": "@crewhaus/rate-limiter",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/recovery-engine": {
       "name": "@crewhaus/recovery-engine",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/regression-runner": {
       "name": "@crewhaus/regression-runner",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-runner": "workspace:*",
@@ -1243,7 +1286,7 @@
     },
     "packages/report-writer": {
       "name": "@crewhaus/report-writer",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/citation-tracker": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -1251,18 +1294,18 @@
     },
     "packages/routing-store": {
       "name": "@crewhaus/routing-store",
-      "version": "0.3.1",
+      "version": "0.3.2",
     },
     "packages/rules-engine": {
       "name": "@crewhaus/rules-engine",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/run-context": {
       "name": "@crewhaus/run-context",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
@@ -1270,7 +1313,7 @@
     },
     "packages/runtime-core": {
       "name": "@crewhaus/runtime-core",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/abort-controller": "workspace:*",
@@ -1279,6 +1322,7 @@
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/circuit-breaker": "workspace:*",
         "@crewhaus/compaction-autocompact": "workspace:*",
+        "@crewhaus/compaction-curator": "workspace:*",
         "@crewhaus/compaction-snip": "workspace:*",
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/egress-classifier": "workspace:*",
@@ -1310,6 +1354,7 @@
         "@crewhaus/tool-result-store": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
         "@crewhaus/turn-state-machine": "workspace:*",
+        "@crewhaus/worker-runtime": "workspace:*",
         "zod-to-json-schema": "^3.23.5",
       },
       "devDependencies": {
@@ -1321,14 +1366,14 @@
     },
     "packages/sandbox": {
       "name": "@crewhaus/sandbox",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/sandbox-image-dotnet": {
       "name": "@crewhaus/sandbox-image-dotnet",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/sandbox": "workspace:*",
@@ -1337,7 +1382,7 @@
     },
     "packages/sandbox-image-go": {
       "name": "@crewhaus/sandbox-image-go",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/sandbox": "workspace:*",
@@ -1346,7 +1391,7 @@
     },
     "packages/sandbox-image-java": {
       "name": "@crewhaus/sandbox-image-java",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/sandbox": "workspace:*",
@@ -1355,7 +1400,7 @@
     },
     "packages/sandbox-image-php": {
       "name": "@crewhaus/sandbox-image-php",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/sandbox": "workspace:*",
@@ -1364,7 +1409,7 @@
     },
     "packages/sandbox-image-r": {
       "name": "@crewhaus/sandbox-image-r",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/sandbox": "workspace:*",
@@ -1373,7 +1418,7 @@
     },
     "packages/sandbox-image-registry": {
       "name": "@crewhaus/sandbox-image-registry",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/sandbox": "workspace:*",
@@ -1381,7 +1426,7 @@
     },
     "packages/sandbox-image-ruby": {
       "name": "@crewhaus/sandbox-image-ruby",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/sandbox": "workspace:*",
@@ -1390,7 +1435,7 @@
     },
     "packages/sandbox-image-rust": {
       "name": "@crewhaus/sandbox-image-rust",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/sandbox": "workspace:*",
@@ -1399,7 +1444,7 @@
     },
     "packages/secrets-manager": {
       "name": "@crewhaus/secrets-manager",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -1408,7 +1453,7 @@
     },
     "packages/session-store": {
       "name": "@crewhaus/session-store",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
@@ -1416,14 +1461,14 @@
     },
     "packages/single-binary-cli": {
       "name": "@crewhaus/single-binary-cli",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/skills-registry": {
       "name": "@crewhaus/skills-registry",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -1435,7 +1480,7 @@
     },
     "packages/slash-commands": {
       "name": "@crewhaus/slash-commands",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "yaml": "^2.6.0",
@@ -1443,7 +1488,7 @@
     },
     "packages/smoke-harness": {
       "name": "@crewhaus/smoke-harness",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/compiler": "workspace:*",
         "@crewhaus/ir": "workspace:*",
@@ -1452,16 +1497,17 @@
     },
     "packages/spec": {
       "name": "@crewhaus/spec",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
+        "zod-to-json-schema": "^3.23.5",
       },
     },
     "packages/spec-patch": {
       "name": "@crewhaus/spec-patch",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/spec": "workspace:*",
@@ -1471,7 +1517,7 @@
     },
     "packages/spec-registry": {
       "name": "@crewhaus/spec-registry",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/spec": "workspace:*",
@@ -1479,18 +1525,18 @@
     },
     "packages/specialization-registry": {
       "name": "@crewhaus/specialization-registry",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/state-store": {
       "name": "@crewhaus/state-store",
-      "version": "0.3.1",
+      "version": "0.3.2",
     },
     "packages/streaming-tool-executor": {
       "name": "@crewhaus/streaming-tool-executor",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/adapter-anthropic": "workspace:*",
@@ -1504,7 +1550,7 @@
     },
     "packages/structured-event-printer": {
       "name": "@crewhaus/structured-event-printer",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
@@ -1512,7 +1558,7 @@
     },
     "packages/sub-agent-permission-inheritance": {
       "name": "@crewhaus/sub-agent-permission-inheritance",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/agent-context-isolation": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
@@ -1521,7 +1567,7 @@
     },
     "packages/sub-agent-spawner": {
       "name": "@crewhaus/sub-agent-spawner",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/adapter-anthropic": "workspace:*",
@@ -1529,11 +1575,15 @@
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/federation-router": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
       },
       "devDependencies": {
+        "@crewhaus/federation-discovery": "workspace:*",
+        "@crewhaus/federation-protocol": "workspace:*",
+        "@crewhaus/gateway-server": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -1544,7 +1594,7 @@
     },
     "packages/target-batch-worker": {
       "name": "@crewhaus/target-batch-worker",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -1553,7 +1603,7 @@
     },
     "packages/target-browser-driver": {
       "name": "@crewhaus/target-browser-driver",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -1562,37 +1612,49 @@
     },
     "packages/target-cf-worker-cli": {
       "name": "@crewhaus/target-cf-worker-cli",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
+        "@crewhaus/worker-runtime": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-todo": "workspace:*",
       },
     },
     "packages/target-cf-worker-graph": {
       "name": "@crewhaus/target-cf-worker-graph",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
+        "@crewhaus/worker-runtime": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-todo": "workspace:*",
       },
     },
     "packages/target-cf-worker-workflow": {
       "name": "@crewhaus/target-cf-worker-workflow",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
+        "@crewhaus/worker-runtime": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-todo": "workspace:*",
       },
     },
     "packages/target-channel-bot": {
       "name": "@crewhaus/target-channel-bot",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -1601,12 +1663,14 @@
         "@crewhaus/model-router": "workspace:*",
       },
       "peerDependencies": {
+        "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/channel-adapter-base": "workspace:*",
         "@crewhaus/channel-adapter-discord": "workspace:*",
         "@crewhaus/channel-adapter-imessage": "workspace:*",
         "@crewhaus/channel-adapter-slack": "workspace:*",
         "@crewhaus/channel-adapter-telegram": "workspace:*",
         "@crewhaus/channel-adapter-whatsapp": "workspace:*",
+        "@crewhaus/eval-judge": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
@@ -1622,7 +1686,7 @@
     },
     "packages/target-claude-plugin": {
       "name": "@crewhaus/target-claude-plugin",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/ir": "workspace:*",
@@ -1630,7 +1694,7 @@
     },
     "packages/target-cli": {
       "name": "@crewhaus/target-cli",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -1640,6 +1704,7 @@
       "peerDependencies": {
         "@crewhaus/egress-matcher-semantic": "workspace:*",
         "@crewhaus/embedder": "workspace:*",
+        "@crewhaus/eval-judge": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",
@@ -1647,11 +1712,12 @@
       "optionalPeers": [
         "@crewhaus/egress-matcher-semantic",
         "@crewhaus/embedder",
+        "@crewhaus/eval-judge",
       ],
     },
     "packages/target-crew": {
       "name": "@crewhaus/target-crew",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -1661,7 +1727,7 @@
     },
     "packages/target-eval-bundle": {
       "name": "@crewhaus/target-eval-bundle",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
@@ -1669,7 +1735,7 @@
     },
     "packages/target-graph": {
       "name": "@crewhaus/target-graph",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -1678,7 +1744,7 @@
     },
     "packages/target-managed": {
       "name": "@crewhaus/target-managed",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -1688,7 +1754,7 @@
     },
     "packages/target-onchain": {
       "name": "@crewhaus/target-onchain",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -1697,7 +1763,7 @@
     },
     "packages/target-onchain-game": {
       "name": "@crewhaus/target-onchain-game",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -1706,7 +1772,7 @@
     },
     "packages/target-pipeline": {
       "name": "@crewhaus/target-pipeline",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -1715,7 +1781,7 @@
     },
     "packages/target-research-bundle": {
       "name": "@crewhaus/target-research-bundle",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -1725,7 +1791,7 @@
     },
     "packages/target-voice": {
       "name": "@crewhaus/target-voice",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -1734,7 +1800,7 @@
     },
     "packages/target-workflow": {
       "name": "@crewhaus/target-workflow",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -1748,7 +1814,7 @@
     },
     "packages/template-marketplace-client": {
       "name": "@crewhaus/template-marketplace-client",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/template-registry": "workspace:*",
@@ -1756,35 +1822,37 @@
     },
     "packages/template-registry": {
       "name": "@crewhaus/template-registry",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/tenancy": {
       "name": "@crewhaus/tenancy",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/token-budget": {
       "name": "@crewhaus/token-budget",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.96.0",
       },
     },
     "packages/tool-bash": {
       "name": "@crewhaus/tool-bash",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
+        "@crewhaus/run-context": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
         "@crewhaus/tool-validate": "workspace:*",
@@ -1792,7 +1860,7 @@
     },
     "packages/tool-builder": {
       "name": "@crewhaus/tool-builder",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
@@ -1800,7 +1868,7 @@
     },
     "packages/tool-catalog": {
       "name": "@crewhaus/tool-catalog",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
@@ -1809,18 +1877,22 @@
     },
     "packages/tool-code-execution": {
       "name": "@crewhaus/tool-code-execution",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/sandbox": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
         "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/run-context": "workspace:*",
       },
     },
     "packages/tool-codegraph": {
       "name": "@crewhaus/tool-codegraph",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -1836,7 +1908,7 @@
     },
     "packages/tool-contract-gateway": {
       "name": "@crewhaus/tool-contract-gateway",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -1846,7 +1918,7 @@
     },
     "packages/tool-document-ingest": {
       "name": "@crewhaus/tool-document-ingest",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -1856,7 +1928,7 @@
     },
     "packages/tool-evm": {
       "name": "@crewhaus/tool-evm",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/chain-adapter-base": "workspace:*",
         "@crewhaus/chain-adapter-evm": "workspace:*",
@@ -1868,7 +1940,7 @@
     },
     "packages/tool-evm-tx": {
       "name": "@crewhaus/tool-evm-tx",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/chain-adapter-base": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -1880,7 +1952,7 @@
     },
     "packages/tool-executor": {
       "name": "@crewhaus/tool-executor",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -1892,7 +1964,7 @@
     },
     "packages/tool-fetch": {
       "name": "@crewhaus/tool-fetch",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -1907,7 +1979,7 @@
     },
     "packages/tool-fs": {
       "name": "@crewhaus/tool-fs",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -1922,7 +1994,7 @@
     },
     "packages/tool-harness-synthesizer": {
       "name": "@crewhaus/tool-harness-synthesizer",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/prompt-optimizer": "workspace:*",
@@ -1931,7 +2003,7 @@
     },
     "packages/tool-image": {
       "name": "@crewhaus/tool-image",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -1946,7 +2018,7 @@
     },
     "packages/tool-image-generation": {
       "name": "@crewhaus/tool-image-generation",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -1956,14 +2028,14 @@
     },
     "packages/tool-loop-detection": {
       "name": "@crewhaus/tool-loop-detection",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/turn-state-machine": "workspace:*",
       },
     },
     "packages/tool-mcp": {
       "name": "@crewhaus/tool-mcp",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -1976,7 +2048,7 @@
     },
     "packages/tool-memory": {
       "name": "@crewhaus/tool-memory",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -1986,7 +2058,7 @@
     },
     "packages/tool-message-channel": {
       "name": "@crewhaus/tool-message-channel",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/channel-adapter-slack": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -2003,7 +2075,7 @@
     },
     "packages/tool-mouse-keyboard": {
       "name": "@crewhaus/tool-mouse-keyboard",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/computer-use-driver": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -2014,7 +2086,7 @@
     },
     "packages/tool-navigate": {
       "name": "@crewhaus/tool-navigate",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/computer-use-driver": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -2025,7 +2097,7 @@
     },
     "packages/tool-orchestrator": {
       "name": "@crewhaus/tool-orchestrator",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
@@ -2034,14 +2106,14 @@
     },
     "packages/tool-permission-matcher": {
       "name": "@crewhaus/tool-permission-matcher",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/tool-plan": {
       "name": "@crewhaus/tool-plan",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/continuity-store": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
@@ -2053,7 +2125,7 @@
     },
     "packages/tool-result-store": {
       "name": "@crewhaus/tool-result-store",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
@@ -2063,8 +2135,9 @@
     },
     "packages/tool-retrieve": {
       "name": "@crewhaus/tool-retrieve",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
+        "@crewhaus/chunker": "workspace:*",
         "@crewhaus/embedder": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -2073,9 +2146,13 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/tool-schema-sanitizer": {
+      "name": "@crewhaus/tool-schema-sanitizer",
+      "version": "0.3.2",
+    },
     "packages/tool-screen-capture": {
       "name": "@crewhaus/tool-screen-capture",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/computer-use-driver": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -2086,7 +2163,7 @@
     },
     "packages/tool-task": {
       "name": "@crewhaus/tool-task",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/agent-context-isolation": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -2104,7 +2181,7 @@
     },
     "packages/tool-todo": {
       "name": "@crewhaus/tool-todo",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
@@ -2118,7 +2195,7 @@
     },
     "packages/tool-validate": {
       "name": "@crewhaus/tool-validate",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
@@ -2127,7 +2204,7 @@
     },
     "packages/tool-vision-grounding": {
       "name": "@crewhaus/tool-vision-grounding",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/computer-use-driver": "workspace:*",
@@ -2140,7 +2217,7 @@
     },
     "packages/tool-web": {
       "name": "@crewhaus/tool-web",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -2158,7 +2235,7 @@
     },
     "packages/tool-wiki": {
       "name": "@crewhaus/tool-wiki",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
@@ -2174,7 +2251,7 @@
     },
     "packages/trace-event-bus": {
       "name": "@crewhaus/trace-event-bus",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/logging": "workspace:*",
@@ -2182,32 +2259,32 @@
     },
     "packages/turn-state-machine": {
       "name": "@crewhaus/turn-state-machine",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/vad-engine": {
       "name": "@crewhaus/vad-engine",
-      "version": "0.3.1",
+      "version": "0.3.2",
     },
     "packages/vector-store": {
       "name": "@crewhaus/vector-store",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/voice-runtime": {
       "name": "@crewhaus/voice-runtime",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/wallet-engine": {
       "name": "@crewhaus/wallet-engine",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/chain-adapter-base": "workspace:*",
@@ -2216,7 +2293,7 @@
     },
     "packages/wiki-store": {
       "name": "@crewhaus/wiki-store",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -2226,6 +2303,25 @@
       "devDependencies": {
         "@crewhaus/embedder": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
+      },
+    },
+    "packages/worker-runtime": {
+      "name": "@crewhaus/worker-runtime",
+      "version": "0.3.2",
+      "dependencies": {
+        "@anthropic-ai/sdk": "^0.96.0",
+        "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/token-budget": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-executor": "workspace:*",
+        "@crewhaus/tool-loop-detection": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
+        "@crewhaus/turn-state-machine": "workspace:*",
+        "zod-to-json-schema": "^3.23.5",
+      },
+      "devDependencies": {
+        "zod": "^3.23.8",
       },
     },
   },
@@ -2474,6 +2570,8 @@
 
     "@crewhaus/mcp-host": ["@crewhaus/mcp-host@workspace:packages/mcp-host"],
 
+    "@crewhaus/mcp-server": ["@crewhaus/mcp-server@workspace:packages/mcp-server"],
+
     "@crewhaus/memory-service": ["@crewhaus/memory-service@workspace:packages/memory-service"],
 
     "@crewhaus/memory-store": ["@crewhaus/memory-store@workspace:packages/memory-store"],
@@ -2682,6 +2780,8 @@
 
     "@crewhaus/tool-retrieve": ["@crewhaus/tool-retrieve@workspace:packages/tool-retrieve"],
 
+    "@crewhaus/tool-schema-sanitizer": ["@crewhaus/tool-schema-sanitizer@workspace:packages/tool-schema-sanitizer"],
+
     "@crewhaus/tool-screen-capture": ["@crewhaus/tool-screen-capture@workspace:packages/tool-screen-capture"],
 
     "@crewhaus/tool-task": ["@crewhaus/tool-task@workspace:packages/tool-task"],
@@ -2709,6 +2809,8 @@
     "@crewhaus/wallet-engine": ["@crewhaus/wallet-engine@workspace:packages/wallet-engine"],
 
     "@crewhaus/wiki-store": ["@crewhaus/wiki-store@workspace:packages/wiki-store"],
+
+    "@crewhaus/worker-runtime": ["@crewhaus/worker-runtime@workspace:packages/worker-runtime"],
 
     "@google/genai": ["@google/genai@1.52.0", "", { "dependencies": { "google-auth-library": "^10.3.0", "p-retry": "^4.6.2", "protobufjs": "^7.5.4", "ws": "^8.18.0" }, "peerDependencies": { "@modelcontextprotocol/sdk": "^1.25.2" }, "optionalPeers": ["@modelcontextprotocol/sdk"] }, "sha512-gwSvbpiN/17O9TbsqSsE/OzZcpv5Fo4RQjdngGgogtuB9RsyJ8ZHhX5KjHj1bp5N9snN2eK8LDGXSaWW2hof8Q=="],
 

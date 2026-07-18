@@ -147,6 +147,20 @@ export type FailureClass =
   | "auth"
   | "rate_limit"
   | "crewhaus_budget"
+  | "timeout"
+  /** Loop contract 0.4 (G02) — the spec's in-loop `evaluation:` gate scored
+   *  the run's final answer below threshold with `on_fail: halt`. Like
+   *  `crewhaus_budget`/`timeout`, this is CrewHaus's OWN configured ceiling
+   *  ending the run, not a provider failure. */
+  | "evaluation"
+  /** Loop contract 0.4 (G11) — a tool permission resolved to `ask` on a
+   *  NON-interactive surface with `permissions.ask_mode: "pause"` (the
+   *  default) and no prior grant/deny for the call: the runtime persisted a
+   *  `PendingApproval`, published `approval_requested`, and PARKED the run
+   *  to await an out-of-band decision. Unlike the other 3x-band classes this
+   *  is not a hard error — it is a resumable pause; the run re-executes
+   *  pre-resolved once the approval is granted (one-shot) or denied. */
+  | "approval_pending"
   | "mcp_boot"
   | "context_overflow"
   | "spec"
@@ -191,6 +205,22 @@ export const EXIT_CODES = {
   rate_limit: 32,
   /** CrewHaus's own configured budget cap ended the run. */
   crewhaus_budget: 33,
+  /** Loop contract 0.4 (G10) — a configured wall-clock limit
+   *  (`limits.deadline_ms` / `turn_timeout_ms` / `model_call_timeout_ms`)
+   *  ended the run. Sits in the 3x band beside `crewhaus_budget`: like the
+   *  spend cap, it is CrewHaus's OWN configured ceiling, not a provider
+   *  failure. */
+  timeout: 34,
+  /** Loop contract 0.4 (G02) — the spec's in-loop `evaluation:` gate failed
+   *  the final answer with `on_fail: halt`. Same 3x band rationale: a
+   *  CrewHaus-configured quality floor, not a provider failure. */
+  evaluation: 35,
+  /** Loop contract 0.4 (G11) — the run PARKED on a headless tool-approval
+   *  ask (`permissions.ask_mode: "pause"`). Sits in the 3x band beside the
+   *  other CrewHaus-configured stops: a resumable pause awaiting an
+   *  out-of-band grant/deny, distinguishable from a hard failure so `fleet`
+   *  / the UI host can surface "needs approval" and resume rather than alert. */
+  approval_pending: 36,
   /** Tool or MCP failure (including MCP boot). */
   tool: 40,
 } as const;

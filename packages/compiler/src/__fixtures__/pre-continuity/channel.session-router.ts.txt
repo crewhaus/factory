@@ -3,15 +3,20 @@
 import { createHash } from "node:crypto";
 import { createSessionStore } from "@crewhaus/session-store";
 import type { ChannelAdapter, InboundEvent } from "@crewhaus/channel-adapter-slack";
+import { postApprovalPrompt } from "@crewhaus/channel-adapter-base";
+import type { ApprovalStore, PendingApproval } from "@crewhaus/channel-adapter-base";
+import { isRunFailedError } from "@crewhaus/errors";
 import type { Agent } from "./agent.js";
 
 export type SessionRouterConfig = {
   agent: Agent;
   sessionRootDir?: string;
+  approvals?: ApprovalStore;
 };
 
 export type SessionRouter = {
   handle(event: InboundEvent, adapter: ChannelAdapter): Promise<void>;
+  resumeApproval(approval: PendingApproval, adapter: ChannelAdapter): Promise<void>;
 };
 
 /**
@@ -27,6 +32,9 @@ export function createSessionRouter(config: SessionRouterConfig): SessionRouter 
   const sessionStore = createSessionStore(
     config.sessionRootDir !== undefined ? { rootDir: config.sessionRootDir } : {},
   );
+  // G11 — approvalId → the inbound event that parked it, so a granted
+  // approval re-drives that turn and replies in the right thread.
+  const __resumeContexts = new Map<string, InboundEvent>();
   return {
     async handle(event: InboundEvent, adapter: ChannelAdapter): Promise<void> {
       const routingKey = `${adapter.id}:${event.workspaceId}:${event.channelId}:${event.threadTs ?? event.ts}`;
@@ -62,8 +70,62 @@ export function createSessionRouter(config: SessionRouterConfig): SessionRouter 
         }
         await tryReact("white_check_mark");
       } catch (err) {
+        if (
+          config.approvals !== undefined &&
+          isRunFailedError(err) &&
+          err.report.class === "approval_pending"
+        ) {
+          // G11 — the run parked a pending approval instead of failing. Surface
+          // the Approve/Deny prompt (Slack buttons, or a text fallback for
+          // adapters without interactive buttons) and return; the turn resumes
+          // out-of-band once the approval is granted (or is dropped on deny).
+          const __pending = await config.approvals.list({ status: "pending", sessionId });
+          const __postApproval = adapter.postApproval;
+          for (const __appr of __pending) {
+            __resumeContexts.set(__appr.id, event);
+            await postApprovalPrompt({
+              pending: __appr,
+              sendText: (text) => adapter.sendReply({ event, text }),
+              ...(__postApproval !== undefined
+                ? { postInteractive: (approval) => __postApproval({ event, approval }) }
+                : {}),
+            });
+          }
+          await tryReact("warning");
+          return;
+        }
         await tryReact("warning");
         throw err;
+      }
+    },
+    async resumeApproval(approval: PendingApproval, adapter: ChannelAdapter): Promise<void> {
+      const event = __resumeContexts.get(approval.id);
+      __resumeContexts.delete(approval.id);
+      // Only a granted approval re-drives the turn; a denial's in-thread ACK
+      // already recorded the outcome, and a resume with no captured event
+      // (resolved by the CLI verb, or after a restart) waits for the next
+      // inbound message.
+      if (approval.status !== "grant" || event === undefined) return;
+      try {
+        const reply = await config.agent.runTurn({
+          sessionId: approval.sessionId,
+          isNew: false,
+          message: event.text,
+        });
+        if (reply.length > 0) {
+          await adapter.sendReply({ event, text: reply });
+        }
+        if (adapter.react) {
+          try {
+            await adapter.react({ event, emoji: "white_check_mark" });
+          } catch {
+            // non-fatal
+          }
+        }
+      } catch (err) {
+        process.stderr.write(
+          "[session-router] approval resume error (" + approval.id + "): " + (err as Error).message + "\n",
+        );
       }
     },
   };

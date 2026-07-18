@@ -19,15 +19,20 @@
  * returns the input unchanged.
  *
  * The runtime-core integration calls `manage()` once before the model
- * stream starts and writes the timestamp back to state-store. Tests cover
- * the rotation triggers, the no-op skip, and the marker-stripping
- * invariants.
+ * stream starts and writes the timestamp back through the
+ * {@link PromptCacheRotationStore} — the cross-run persistence, keyed by
+ * spec name, that closes the §2.5 seam (Batch E item 9/G78). Tests cover the
+ * rotation triggers, the no-op skip, the marker-stripping invariants, and the
+ * store's read/write round-trip.
  */
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type {
   CanonicalCacheControl,
   CanonicalTextBlockParam,
   ProviderFeatures,
 } from "@crewhaus/adapter-anthropic";
+import { CrewhausError } from "@crewhaus/errors";
 
 /** Default rotation period: 7 days. Anthropic's hard TTL is 30 days. */
 export const DEFAULT_ROTATE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
@@ -157,4 +162,138 @@ export function countCacheMarkers(blocks: ReadonlyArray<CanonicalTextBlockParam>
     if (b.cache_control && b.cache_control.type === "ephemeral") n++;
   }
   return n;
+}
+
+// ===========================================================================
+// Cross-run rotation persistence (Batch E item 9, G78) — the promised seam
+// ===========================================================================
+//
+// runtime-core threads `promptCacheLastRotatedAt` IN (so a valid recent
+// timestamp makes `manage()` skip and REUSE the existing cached prefix rather
+// than cold-starting on every boot) and calls `onPromptCacheRotated(rotatedAt)`
+// OUT when it injected a fresh marker. Long-running daemons (channel/managed)
+// need that timestamp to survive a restart, so it persists to disk keyed by
+// spec name — one small JSON file per spec, exactly the state-store seam the
+// v0.3.0 §2.5 comment promised would "land with memory-service/threading".
+// The serving emitters read() at boot for the `promptCacheLastRotatedAt` field
+// and pass `onPromptCacheRotated: (t) => store.write(t)`.
+
+/** Default root for per-spec rotation state, a sibling of `.crewhaus/memories`
+ *  and `.crewhaus/sessions`. */
+export const DEFAULT_PROMPT_CACHE_ROOT_DIR = ".crewhaus/prompt-cache";
+
+/** Schema marker stamped on every persisted record (forward-compat read). */
+export const PROMPT_CACHE_ROTATION_SCHEMA_VERSION = 1 as const;
+
+export class PromptCacheStoreError extends CrewhausError {
+  override readonly name = "PromptCacheStoreError";
+  constructor(message: string, cause?: unknown) {
+    super("config", message, cause);
+  }
+}
+
+/** The persisted on-disk shape. `lastRotatedAt` is the ms-epoch timestamp of
+ *  the most recent marker rotation for this spec. */
+export type PromptCacheRotationRecord = {
+  readonly schemaVersion: typeof PROMPT_CACHE_ROTATION_SCHEMA_VERSION;
+  readonly specName: string;
+  readonly lastRotatedAt: number;
+};
+
+export type PromptCacheRotationStoreOptions = {
+  /** Scopes the file path; one record per spec. Validated path-safe. */
+  readonly specName: string;
+  /** Root dir for the `<specName>.json` record. Default
+   *  {@link DEFAULT_PROMPT_CACHE_ROOT_DIR}. A tenant re-roots by passing its
+   *  own `.crewhaus` dir here. */
+  readonly rootDir?: string;
+};
+
+export interface PromptCacheRotationStore {
+  /**
+   * The persisted `lastRotatedAt` for this spec, or `undefined` when no record
+   * exists yet (first boot) or the record is unreadable/corrupt. A caller
+   * threads the result straight into `runChatLoop`'s
+   * `promptCacheLastRotatedAt` (an `undefined` there force-refreshes on the
+   * first turn — the safe direction).
+   */
+  read(): Promise<number | undefined>;
+  /**
+   * Persist a fresh rotation timestamp (the `onPromptCacheRotated` payload).
+   * Atomic (tmp + rename, mode 0600); creates the root dir on first write.
+   */
+  write(rotatedAt: number): Promise<void>;
+  /** Diagnostic: the file this store reads/writes. */
+  path(): string;
+}
+
+/** Same path-safe floor the fact store enforces — the spec name becomes a file
+ *  name, so a traversal-shaped name must never reach the filesystem. */
+const SAFE_SPEC_NAME_RE = /^[a-zA-Z0-9_\-.]+$/;
+
+function isRotationRecord(value: unknown): value is PromptCacheRotationRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return typeof v["lastRotatedAt"] === "number" && Number.isFinite(v["lastRotatedAt"]);
+}
+
+/**
+ * Construct a per-spec rotation store. The file is lazy — no directory is
+ * touched until the first `write()`; a `read()` before any write returns
+ * `undefined`.
+ */
+export function createPromptCacheRotationStore(
+  opts: PromptCacheRotationStoreOptions,
+): PromptCacheRotationStore {
+  if (!opts.specName) {
+    throw new PromptCacheStoreError("specName is required");
+  }
+  if (!SAFE_SPEC_NAME_RE.test(opts.specName)) {
+    throw new PromptCacheStoreError(
+      `invalid specName "${opts.specName}" — must match [a-zA-Z0-9_\\-.]+`,
+    );
+  }
+  const rootDir = opts.rootDir ?? DEFAULT_PROMPT_CACHE_ROOT_DIR;
+  const filePath = join(rootDir, `${opts.specName}.json`);
+
+  return {
+    async read(): Promise<number | undefined> {
+      let raw: string;
+      try {
+        raw = await readFile(filePath, "utf-8");
+      } catch {
+        // Missing file (first boot) or unreadable — treat as "no record".
+        return undefined;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        // A corrupt record must not brick boot — force a fresh rotation.
+        return undefined;
+      }
+      return isRotationRecord(parsed) ? parsed.lastRotatedAt : undefined;
+    },
+
+    async write(rotatedAt: number): Promise<void> {
+      if (typeof rotatedAt !== "number" || !Number.isFinite(rotatedAt) || rotatedAt < 0) {
+        throw new PromptCacheStoreError(
+          `write(): rotatedAt must be a non-negative finite number (got ${rotatedAt})`,
+        );
+      }
+      const record: PromptCacheRotationRecord = {
+        schemaVersion: PROMPT_CACHE_ROTATION_SCHEMA_VERSION,
+        specName: opts.specName,
+        lastRotatedAt: rotatedAt,
+      };
+      await mkdir(rootDir, { recursive: true });
+      const tmpPath = `${filePath}.tmp`;
+      await writeFile(tmpPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+      await rename(tmpPath, filePath);
+    },
+
+    path(): string {
+      return filePath;
+    },
+  };
 }

@@ -1,0 +1,33 @@
+{
+  "name": "@crewhaus/tool-schema-sanitizer",
+  "version": "0.3.2",
+  "type": "module",
+  "description": "Provider-neutral JSON-Schema sanitizer for tool input schemas (inline $refs, project onto Gemini/Bedrock subsets, OpenAI strict-mode upgrade)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/tool-schema-sanitizer"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-schema-sanitizer#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

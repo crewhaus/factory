@@ -10,6 +10,8 @@
 
 export type {
   A2AMessageEvent,
+  ApprovalRequestedEvent,
+  ApprovalResolvedEvent,
   CacheRotationEvent,
   CircuitStateChangedEvent,
   CompactionFiredEvent,
@@ -17,9 +19,11 @@ export type {
   CoverageReportEvent,
   CrewDoneEvent,
   ErrorRecoveredEvent,
+  EvalGradedEvent,
   HandoffEvent,
   HookFiredEvent,
   JanitorActionEvent,
+  JudgeVerdictEvent,
   McpCallEndEvent,
   McpCallStartEvent,
   ModelFailoverEvent,

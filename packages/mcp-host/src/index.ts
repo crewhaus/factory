@@ -9,12 +9,16 @@
  *   - reduced `callTool` result (text/image/audio/resource → string).
  *   - typed errors (`McpError` / `McpConnectionError` / `McpProtocolError`).
  *   - boot-time secret-ref resolution (`resolveSecretRef` /
- *     `resolveMcpServerConfig`) for compiler-lowered env/header refs, and a
- *     stdio child env that merges `getDefaultEnvironment()` under explicit
- *     keys so configured secrets survive the SDK's inherit allowlist.
- *
- * Limitation in v0: notifications/tools/list_changed is ignored — the
- * catalog is built once at boot. A future section can add a watcher.
+ *     `resolveMcpServerConfig`, plus the G75 async twins
+ *     `resolveSecretRefAsync` / `resolveMcpServerConfigAsync` that route
+ *     through a secrets backend before the env fallback) for compiler-lowered
+ *     env/header refs, and a stdio child env that merges
+ *     `getDefaultEnvironment()` under explicit keys so configured secrets
+ *     survive the SDK's inherit allowlist.
+ *   - Loop contract 0.4 (Batch G, G74): live `notifications/tools/list_changed`
+ *     subscription — `McpClient.onToolsChanged` fires when a server re-advertises
+ *     its catalog (the cache is invalidated first), which the tool-mcp re-diff
+ *     path uses to re-register drifted tools without a reconnect.
  */
 
 export { McpClient } from "./client.js";
@@ -22,7 +26,12 @@ export type { McpClientOptions, McpClientLikeTransport } from "./client.js";
 export { McpHost } from "./host.js";
 export type { McpHostOptions } from "./host.js";
 export { nextBackoffMs } from "./backoff.js";
-export { resolveSecretRef, resolveMcpServerConfig } from "./resolve.js";
+export {
+  resolveSecretRef,
+  resolveMcpServerConfig,
+  resolveSecretRefAsync,
+  resolveMcpServerConfigAsync,
+} from "./resolve.js";
 export type {
   McpSecretRef,
   McpSecretLike,
@@ -31,6 +40,9 @@ export type {
   UnresolvedMcpServerConfig,
   ResolveSecretRefOptions,
   ResolveMcpServerConfigOptions,
+  SecretsResolver,
+  ResolveSecretRefAsyncOptions,
+  ResolveMcpServerConfigAsyncOptions,
 } from "./resolve.js";
 export type {
   McpServerConfig,

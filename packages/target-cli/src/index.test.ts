@@ -805,6 +805,300 @@ describe("emitCli — memory block (#53, rewired onto the PR 10 composition root
   });
 });
 
+describe("emitCli — limits block (loop contract 0.4, Batch A)", () => {
+  test("emits every declared limits field into the runChatLoop call", () => {
+    const content =
+      emitCli(
+        baseIr({
+          limits: {
+            maxToolIterations: 25,
+            maxConcurrentTools: 2,
+            contextLimit: 120_000,
+            deadlineMs: 600_000,
+            turnTimeoutMs: 120_000,
+            modelCallTimeoutMs: 60_000,
+            loopDetection: { window: 12, threshold: 3, escalation: "abort" },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain("maxToolIterations: 25,");
+    expect(content).toContain("maxConcurrentTools: 2,");
+    expect(content).toContain("contextLimit: 120000,");
+    expect(content).toContain("deadlineMs: 600000,");
+    expect(content).toContain("turnTimeoutMs: 120000,");
+    expect(content).toContain("modelCallTimeoutMs: 60000,");
+    expect(content).toContain('loopDetection: {"window":12,"threshold":3,"escalation":"abort"},');
+  });
+
+  test("a partial limits block emits only the declared fields", () => {
+    const content = emitCli(baseIr({ limits: { maxToolIterations: 40 } })).files[0]?.content ?? "";
+    expect(content).toContain("maxToolIterations: 40,");
+    expect(content).not.toContain("maxConcurrentTools:");
+    expect(content).not.toContain("contextLimit:");
+    expect(content).not.toContain("deadlineMs:");
+    expect(content).not.toContain("turnTimeoutMs:");
+    expect(content).not.toContain("modelCallTimeoutMs:");
+    expect(content).not.toContain("loopDetection:");
+  });
+
+  test("loopDetection carries only the declared knobs", () => {
+    const content =
+      emitCli(baseIr({ limits: { loopDetection: { escalation: "justify" } } })).files[0]?.content ??
+      "";
+    expect(content).toContain('loopDetection: {"escalation":"justify"},');
+  });
+
+  test("no limits block → none of the limit fields are emitted (byte-identity guard)", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("maxToolIterations:");
+    expect(content).not.toContain("maxConcurrentTools:");
+    expect(content).not.toContain("contextLimit:");
+    expect(content).not.toContain("deadlineMs:");
+    expect(content).not.toContain("turnTimeoutMs:");
+    expect(content).not.toContain("modelCallTimeoutMs:");
+    expect(content).not.toContain("loopDetection:");
+  });
+});
+
+describe("emitCli — agent.thinking (loop contract 0.4, Batch A)", () => {
+  test("emits the explicit budget form verbatim", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: {
+            model: "claude-sonnet-4-6",
+            instructions: "be helpful",
+            thinking: { budgetTokens: 2048 },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('thinking: {"budgetTokens":2048},');
+  });
+
+  test("emits the portable effort form verbatim", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: {
+            model: "claude-sonnet-4-6",
+            instructions: "be helpful",
+            thinking: { effort: "high" },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('thinking: {"effort":"high"},');
+  });
+
+  test("omits thinking when the IR leaves it unset", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("thinking:");
+  });
+});
+
+describe("emitCli — agent.streaming (loop contract 0.4, Batch A)", () => {
+  test("emits streaming: true when declared", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: { model: "claude-sonnet-4-6", instructions: "be helpful", streaming: true },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain("streaming: true,");
+  });
+
+  test("a declared streaming: false is carried verbatim (declared ≠ absent)", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: { model: "claude-sonnet-4-6", instructions: "be helpful", streaming: false },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain("streaming: false,");
+  });
+
+  test("omits streaming when the IR leaves it unset", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("streaming:");
+  });
+});
+
+describe("emitCli — agent.rateLimits (loop contract 0.4, Batch A)", () => {
+  test("emits the per-tool record (incl. the * bucket) as a JSON literal", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: {
+            model: "claude-sonnet-4-6",
+            instructions: "be helpful",
+            rateLimits: { bash: { rpm: 30, burst: 5 }, "*": { rpm: 120 } },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('rateLimits: {"bash":{"rpm":30,"burst":5},"*":{"rpm":120}},');
+  });
+
+  test("a hostile tool-name key cannot escape the JSON literal", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: {
+            model: "claude-sonnet-4-6",
+            instructions: "be helpful",
+            rateLimits: { 'evil"},pwn:{"': { rpm: 1 } },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    // JSON.stringify escapes the embedded quote so the key stays inert data.
+    expect(content).toContain('rateLimits: {"evil\\"},pwn:{\\"":{"rpm":1}},');
+  });
+
+  test("omits rateLimits when the IR leaves it unset", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("rateLimits:");
+  });
+});
+
+describe("emitCli — compaction tuning knobs (loop contract 0.4, Batch A)", () => {
+  test("threshold + snip knobs land on the runtime option names", () => {
+    const content =
+      emitCli(
+        baseIr({
+          compaction: { threshold: 0.8, snipKeepHead: 6, snipKeepTail: 30 },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain("compactionThreshold: 0.8,");
+    expect(content).toContain("snipKeepHead: 6,");
+    expect(content).toContain("snipKeepTail: 30,");
+  });
+
+  test("each knob is independent (threshold alone)", () => {
+    const content = emitCli(baseIr({ compaction: { threshold: 0.75 } })).files[0]?.content ?? "";
+    expect(content).toContain("compactionThreshold: 0.75,");
+    expect(content).not.toContain("snipKeepHead:");
+    expect(content).not.toContain("snipKeepTail:");
+  });
+
+  test("composes with compaction.model (both emitted)", () => {
+    const content =
+      emitCli(baseIr({ compaction: { model: "claude-haiku-4-5-20251001", threshold: 0.9 } }))
+        .files[0]?.content ?? "";
+    expect(content).toContain('compactionModel: "claude-haiku-4-5-20251001",');
+    expect(content).toContain("compactionThreshold: 0.9,");
+  });
+
+  test("no tuning knobs → none of the fields are emitted (runtime defaults stay authoritative)", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("compactionThreshold:");
+    expect(content).not.toContain("snipKeepHead:");
+    expect(content).not.toContain("snipKeepTail:");
+  });
+});
+
+describe("emitCli — spec-declared hooks (loop contract 0.4, Batch A)", () => {
+  test("emits the spec-hooks literal and concatenates it BELOW the settings.json layers", () => {
+    const content =
+      emitCli(
+        baseIr({
+          hooks: [
+            { event: "pre-tool", matcher: "Bash", command: "./gate.sh", timeoutMs: 3000 },
+            { event: "stop", command: "./notify.sh" },
+          ],
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain(
+      'const __specHooks = [{"event":"pre-tool","matcher":"Bash","command":"./gate.sh","timeoutMs":3000},{"event":"stop","command":"./notify.sh"}] as const;',
+    );
+    // Spec hooks come FIRST in the concat — the lowest layer, mirroring the
+    // permission RuleSet's settings-over-yaml precedence (aggregateDecisions'
+    // mutate shallow-merge is later-wins, so settings.json entries override).
+    expect(content).toContain("hooks: [...__specHooks, ...__hooks],");
+    expect(content).not.toContain("hooks: __hooks,");
+    // Declaration order is preserved (hooks fire in declaration order).
+    const preToolIdx = content.indexOf('"event":"pre-tool"');
+    const stopIdx = content.indexOf('"event":"stop"');
+    expect(preToolIdx).toBeGreaterThanOrEqual(0);
+    expect(stopIdx).toBeGreaterThan(preToolIdx);
+  });
+
+  test("the spec-hooks literal is declared before the runChatLoop call", () => {
+    const content =
+      emitCli(baseIr({ hooks: [{ event: "session-start", command: "echo hi" }] })).files[0]
+        ?.content ?? "";
+    const declIdx = content.indexOf("const __specHooks =");
+    const callIdx = content.indexOf("await runChatLoop({");
+    expect(declIdx).toBeGreaterThanOrEqual(0);
+    expect(callIdx).toBeGreaterThan(declIdx);
+  });
+
+  test("a hostile hook command cannot escape the JSON literal", () => {
+    const content =
+      emitCli(
+        baseIr({
+          hooks: [{ event: "stop", command: 'x"; process.exit(1); //' }],
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('"command":"x\\"; process.exit(1); //"');
+    expect(content).not.toContain('"x"; process.exit(1);');
+  });
+
+  test("no spec hooks → the plain settings.json wiring is unchanged (byte-identity guard)", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).toContain("hooks: __hooks,");
+    expect(content).not.toContain("__specHooks");
+  });
+});
+
+describe("emitCli — memory.embedder fallback (loop contract 0.4, Batch A)", () => {
+  test("memory.embedder constructs deps.embedder for wireMemory (wins over wiki.embedder)", () => {
+    const content =
+      emitCli(
+        baseIr({
+          memory: { embedder: "openai/text-embedding-3-small", wiki: { enabled: true } },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('import { createEmbedder } from "@crewhaus/embedder";');
+    // deps.embedder beats the fragment's wiki.embedder inside memory-service's
+    // resolveEmbedder — the documented fallback order (embedder → wiki.embedder).
+    expect(content).toContain(
+      'embedder: createEmbedder({ model: "openai/text-embedding-3-small" })',
+    );
+  });
+
+  test("without memory.embedder the wiki.embedder fallback rides the fragment only", () => {
+    const content =
+      emitCli(baseIr({ memory: { wiki: { enabled: true, embedder: "mock/deterministic" } } }))
+        .files[0]?.content ?? "";
+    // The fragment carries wiki.embedder; no deps-level construction.
+    expect(content).toContain('"embedder":"mock/deterministic"');
+    expect(content).not.toContain("embedder: createEmbedder(");
+    expect(content).not.toContain('import { createEmbedder } from "@crewhaus/embedder";');
+  });
+
+  test("with the semantic egress matcher also on, createEmbedder is imported exactly once", () => {
+    const content =
+      emitCli(
+        baseIr({
+          security: { egressMatcher: "semantic" },
+          memory: { embedder: "openai/text-embedding-3-small" },
+        }),
+      ).files[0]?.content ?? "";
+    const matches = content.match(/import \{ createEmbedder \} from "@crewhaus\/embedder";/g);
+    expect(matches?.length).toBe(1);
+    // Both consumers still reference the binding.
+    expect(content).toContain("createEmbedder({\n  model: process.env.CREWHAUS_EGRESS_EMBEDDER");
+    expect(content).toContain(
+      'embedder: createEmbedder({ model: "openai/text-embedding-3-small" })',
+    );
+  });
+
+  test("the embedder model string is escaped (hostile spec value stays inert)", () => {
+    const content =
+      emitCli(baseIr({ memory: { embedder: 'x" }); process.exit(1); //' } })).files[0]?.content ??
+      "";
+    expect(content).toContain('createEmbedder({ model: "x\\" }); process.exit(1); //" })');
+  });
+});
+
 describe("emitCli — observability.slo → sloTargets (item 37, F4 codegen parity)", () => {
   test("a compiled bundle threads sloTargets into runChatLoop so the monitor attaches", () => {
     const content =
@@ -920,5 +1214,253 @@ describe("emitCli — learning block (v0.3.0 §3.3, PR 17)", () => {
     expect(content).not.toContain("learning");
     expect(content).not.toContain("run_exam");
     expect(content).not.toContain("createExamRunner");
+  });
+});
+
+describe("emitCli — evaluation block (loop contract 0.4, Batch B, G02)", () => {
+  test("llm_judge: emits the eval-judge wiring with the explicit judge model", () => {
+    const content =
+      emitCli(
+        baseIr({
+          evaluation: {
+            grader: {
+              type: "llm_judge",
+              criteria: "answers cite a source",
+              model: "claude-haiku-4-5",
+            },
+            threshold: 0.8,
+            onFail: "retry",
+            maxRetries: 2,
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('import type { RunEvaluation } from "@crewhaus/runtime-core";');
+    expect(content).toContain('import { judge } from "@crewhaus/eval-judge";');
+    expect(content).toContain("const __evaluation: RunEvaluation = {");
+    expect(content).toContain('graderType: "llm_judge",');
+    expect(content).toContain("threshold: 0.8,");
+    expect(content).toContain('onFail: "retry",');
+    expect(content).toContain("maxRetries: 2,");
+    // the evaluate fn scores through judge() on the resolved judge model
+    expect(content).toContain('model: "claude-haiku-4-5",');
+    expect(content).toContain('description: "answers cite a source",');
+    expect(content).toContain("evaluate: async ({ finalText }) => {");
+    expect(content).toContain("agentOutput: finalText,");
+    expect(content).toContain("(__verdict.score - 1) / 4");
+    // and the option is threaded into runChatLoop
+    expect(content).toContain("evaluation: __evaluation,");
+  });
+
+  test("llm_judge: the judge model defaults to the shape's primary model", () => {
+    const content =
+      emitCli(
+        baseIr({
+          evaluation: {
+            grader: { type: "llm_judge", criteria: "be kind" },
+            threshold: 0.7,
+            onFail: "retry",
+            maxRetries: 1,
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('model: "claude-sonnet-4-6",');
+    expect(content).toContain('description: "be kind",');
+  });
+
+  test("llm_judge: the default threshold 0.7 is honored when the IR omits it", () => {
+    const content =
+      emitCli(
+        baseIr({
+          evaluation: {
+            grader: { type: "llm_judge", criteria: "be kind" },
+            onFail: "retry",
+            maxRetries: 1,
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain("threshold: 0.7,");
+  });
+
+  test("contains: emits a pure fn (no eval-judge import; documented threshold 1)", () => {
+    const content =
+      emitCli(
+        baseIr({
+          evaluation: {
+            grader: { type: "contains", value: "DONE" },
+            onFail: "halt",
+            maxRetries: 3,
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).not.toContain("@crewhaus/eval-judge");
+    expect(content).toContain('graderType: "contains",');
+    expect(content).toContain("threshold: 1,");
+    expect(content).toContain('finalText.includes("DONE")');
+    expect(content).toContain('{ score: 1, rationale: "output contains \\"DONE\\"" }');
+    expect(content).toContain('{ score: 0, rationale: "output missing \\"DONE\\"" }');
+    expect(content).toContain('onFail: "halt",');
+    expect(content).toContain("maxRetries: 3,");
+    expect(content).toContain("evaluation: __evaluation,");
+  });
+
+  test("regex: emits a pure fn with a per-call lastIndex reset", () => {
+    const content =
+      emitCli(
+        baseIr({
+          evaluation: {
+            grader: { type: "regex", value: "\\d{3}-\\d{4}" },
+            onFail: "note",
+            maxRetries: 1,
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).not.toContain("@crewhaus/eval-judge");
+    expect(content).toContain('const __evalRegex = new RegExp("\\\\d{3}-\\\\d{4}");');
+    expect(content).toContain('graderType: "regex",');
+    expect(content).toContain("threshold: 1,");
+    expect(content).toContain("__evalRegex.lastIndex = 0;");
+    expect(content).toContain("__evalRegex.test(finalText)");
+    expect(content).toContain('onFail: "note",');
+    expect(content).toContain("evaluation: __evaluation,");
+  });
+
+  test("criteria with quotes/newlines are escaped into the generated source", () => {
+    const content =
+      emitCli(
+        baseIr({
+          evaluation: {
+            grader: { type: "llm_judge", criteria: 'say "yes"\nthen stop' },
+            threshold: 0.7,
+            onFail: "retry",
+            maxRetries: 1,
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('description: "say \\"yes\\"\\nthen stop"');
+    expect(content).not.toContain('\nthen stop"');
+  });
+
+  test("no evaluation block → no evaluation wiring anywhere (byte-identity guard)", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("evaluation:");
+    expect(content).not.toContain("__evaluation");
+    expect(content).not.toContain("@crewhaus/eval-judge");
+    expect(content).not.toContain("__evalRegex");
+  });
+});
+
+describe("emitCli — knowledge RAG block (Loop contract 0.4, Batch E, G22)", () => {
+  const KNOWLEDGE_IR = (): IrV0 =>
+    baseIr({
+      knowledge: {
+        vectorBackend: "in-memory",
+        defaultK: 5,
+        chunkSize: 400,
+        chunkOverlap: 0,
+        sources: [
+          { kind: "path", path: "docs/manual.md" },
+          { kind: "glob", glob: "kb/**/*.md" },
+          { kind: "url", url: "https://example.com/faq" },
+        ],
+      },
+    });
+
+  test("ingests the declared sources through knowledgeRetrieve and registers the tool", () => {
+    const c = emitCli(KNOWLEDGE_IR()).files[0]?.content ?? "";
+    expect(c).toContain(
+      'import { knowledgeRetrieve, resolveKnowledgeEmbedder } from "@crewhaus/tool-retrieve";',
+    );
+    expect(c).toContain("const __knowledgeTool = await knowledgeRetrieve({");
+    expect(c).toContain('{"kind":"path","path":"docs/manual.md"}');
+    expect(c).toContain('{"kind":"glob","glob":"kb/**/*.md"}');
+    expect(c).toContain('{"kind":"url","url":"https://example.com/faq"}');
+    expect(c).toContain('vectorBackend: "in-memory"');
+    expect(c).toContain("defaultK: 5");
+    expect(c).toContain("chunkSize: 400");
+    expect(c).toContain("defaultCatalog.register(__knowledgeTool);");
+  });
+
+  test("the G76 embedder order is deferred to resolveKnowledgeEmbedder with the declared inputs", () => {
+    const c =
+      emitCli(
+        baseIr({
+          knowledge: {
+            embedder: "openai/text-embedding-3-large",
+            vectorBackend: "in-memory",
+            defaultK: 5,
+            chunkSize: 400,
+            chunkOverlap: 0,
+            sources: [{ kind: "path", path: "kb.md" }],
+          },
+          memory: {
+            enabled: true,
+            embedder: "mock/deterministic",
+            wiki: { embedder: "mock/wiki" },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(c).toContain(
+      'resolveKnowledgeEmbedder({ knowledgeEmbedder: "openai/text-embedding-3-large", memoryEmbedder: "mock/deterministic", wikiEmbedder: "mock/wiki" })',
+    );
+  });
+
+  test("no knowledge block → no RAG wiring (byte-stable)", () => {
+    const c = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(c).not.toContain("knowledgeRetrieve");
+    expect(c).not.toContain("resolveKnowledgeEmbedder");
+    expect(c).not.toContain("__knowledgeTool");
+  });
+});
+
+describe("emitCli — plugin activation (Item 3 / G32)", () => {
+  test("no plugins → no plugin activation artifacts (bundles stay byte-identical)", () => {
+    const c = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(c).not.toContain("@crewhaus/plugin-loader");
+    expect(c).not.toContain("activatePlugins");
+    expect(c).not.toContain("__plugins");
+    expect(c).not.toContain("pluginDirs");
+  });
+
+  test("plugins: list → activates them and registers contributed tools on the catalog", () => {
+    const c = emitCli(baseIr({ plugins: ["acme-tools", "beta-pack"] })).files[0]?.content ?? "";
+    expect(c).toContain(
+      'import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";',
+    );
+    // Names are emitted verbatim, in load order.
+    expect(c).toContain('names: ["acme-tools","beta-pack"]');
+    // Fail-closed loader, dev opt-out via env.
+    expect(c).toContain('allowUnsigned: process.env.CREWHAUS_PLUGIN_ALLOW_UNSIGNED === "1"');
+    // Contributed tools land on the shared catalog, first-party wins collisions.
+    expect(c).toContain("for (const __t of __plugins.tools)");
+    expect(c).toContain("defaultCatalog.register(__t);");
+    expect(c).toContain("if (defaultCatalog.get(__t.name) !== undefined)");
+  });
+
+  test("plugins feed their skill dirs into discoverSkills (non-continuity path)", () => {
+    const c = emitCli(baseIr({ plugins: ["acme-tools"] })).files[0]?.content ?? "";
+    expect(c).toContain("discoverSkills({ cwd: __cwd, pluginDirs: __plugins.skillDirs })");
+  });
+
+  test("the plugin boot runs before the extension boot that reads __plugins.skillDirs", () => {
+    const c = emitCli(baseIr({ plugins: ["acme-tools"] })).files[0]?.content ?? "";
+    expect(c.indexOf("const __plugins = await activatePlugins(")).toBeGreaterThan(-1);
+    expect(c.indexOf("const __plugins = await activatePlugins(")).toBeLessThan(
+      c.indexOf("discoverSkills({ cwd: __cwd, pluginDirs: __plugins.skillDirs })"),
+    );
+  });
+
+  test("continuity on: plugin tools still bind, but discoverSkills is not the skill source", () => {
+    // With continuity on the bundle has no direct discoverSkills call (skills
+    // come from wireMemory); plugin TOOLS still register on the catalog.
+    const c =
+      emitCli(
+        baseIr({
+          plugins: ["acme-tools"],
+          continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "spec" },
+        }),
+      ).files[0]?.content ?? "";
+    expect(c).toContain("const __plugins = await activatePlugins(");
+    expect(c).toContain("defaultCatalog.register(__t);");
+    expect(c).not.toContain("pluginDirs: __plugins.skillDirs");
   });
 });

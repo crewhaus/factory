@@ -15,9 +15,11 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@crewhaus/run-context": "workspace:*",
     "@crewhaus/tool-executor": "workspace:*",
     "@crewhaus/tool-permission-matcher": "workspace:*",
     "@crewhaus/tool-validate": "workspace:*"

@@ -147,6 +147,170 @@ describe("emitManaged", () => {
   });
 });
 
+describe("emitManaged — builtin tools + tool_config (loop contract 0.4, Batch F, G81)", () => {
+  const agentOf = (i: IrManagedV0): string =>
+    emitManaged(i).files.find((f) => f.path === "agent.ts")?.content ?? "";
+
+  test("registers spec tools on defaultCatalog at module load and unions them per turn", () => {
+    const c = agentOf({ ...ir, tools: ["webSearch", "read"] });
+    expect(c).toContain('import { defaultCatalog } from "@crewhaus/tool-catalog";');
+    expect(c).toContain('import { read } from "@crewhaus/tool-fs";');
+    expect(c).toContain('import { webSearch } from "@crewhaus/tool-web";');
+    expect(c).toContain("defaultCatalog.register(webSearch);");
+    expect(c).toContain("defaultCatalog.register(read);");
+    // No memory fabric on this fixture → the per-turn tool set IS the catalog.
+    expect(c).toContain("tools: defaultCatalog.list(),");
+  });
+
+  test("applies tool_config inits before the register call (fetch)", () => {
+    const c = agentOf({
+      ...ir,
+      tools: ["fetch"],
+      toolConfigs: { fetch: { allowedHosts: ["api.example.com"] } },
+    });
+    expect(c).toMatch(/import \{ fetch, registerFetchConfig \} from "@crewhaus\/tool-fetch";/);
+    expect(c).toContain('registerFetchConfig({"allowedHosts":["api.example.com"]});');
+    const initIdx = c.indexOf("registerFetchConfig(");
+    const regIdx = c.indexOf("defaultCatalog.register(fetch);");
+    expect(initIdx).toBeGreaterThan(-1);
+    expect(regIdx).toBeGreaterThan(initIdx);
+  });
+
+  test("a shared initSymbol (python/javascript/shell) is emitted exactly once", () => {
+    const c = agentOf({
+      ...ir,
+      tools: ["python", "javascript", "shell"],
+      toolConfigs: { codeExecution: { image: "python:3.12" } },
+    });
+    // The config registrar is CALLED exactly once even though three tools share it.
+    expect(c.split("registerCodeExecutionConfig(").length - 1).toBe(1);
+    expect(c).toContain('registerCodeExecutionConfig({"image":"python:3.12"});');
+    // …and all three tool exports register.
+    expect(c).toContain("defaultCatalog.register(python);");
+    expect(c).toContain("defaultCatalog.register(javascript);");
+    expect(c).toContain("defaultCatalog.register(shell);");
+  });
+
+  test("tools union with the per-turn memory tools when the memory fabric is on", () => {
+    const c = agentOf({
+      ...ir,
+      tools: ["webSearch"],
+      memory: { enabled: true, wiki: { enabled: true } },
+    });
+    expect(c).toContain("defaultCatalog.register(webSearch);");
+    expect(c).toContain("tools: [...__memTools, ...defaultCatalog.list()],");
+  });
+
+  test("an unknown tool throws TargetEmitError naming the offender", () => {
+    expect(() => emitManaged({ ...ir, tools: ["nopeTool"] })).toThrow(TargetEmitError);
+    try {
+      emitManaged({ ...ir, tools: ["nopeTool"] });
+    } catch (e) {
+      expect((e as Error).message).toContain('unknown tool "nopeTool"');
+      expect((e as Error).message).toContain("known tools:");
+    }
+  });
+
+  test("no tools block → no catalog wiring beyond thredz/knowledge (byte-stable)", () => {
+    const c = agentOf(ir);
+    expect(c).not.toContain("defaultCatalog.register(");
+    expect(c).not.toContain("@crewhaus/tool-fs");
+    expect(c).not.toContain("@crewhaus/tool-web");
+  });
+});
+
+describe("emitManaged — schedule wake loop (loop contract 0.4, Batch F, ITEM 7)", () => {
+  const daemonOf = (i: IrManagedV0): string =>
+    emitManaged(i).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+
+  test("interval schedule arms a setInterval wake per declared tenant", () => {
+    const daemon = daemonOf({ ...ir, schedule: { kind: "interval", everyMs: 3_600_000 } });
+    expect(daemon).toContain("async function __fireScheduledWake()");
+    expect(daemon).toContain("for (const __tenantId of Object.keys(TENANT_OVERRIDES))");
+    expect(daemon).toContain("__scheduleTimer = setInterval(async () => {");
+    expect(daemon).toContain("}, 3600000);");
+    expect(daemon).toContain('if (process.env.CREWHAUS_SCHEDULE !== "0")');
+    // Fresh session per tick + classified error handling keeps the daemon up.
+    expect(daemon).toContain('const __sessionId = `sess_${randomBytes(8).toString("hex")}`;');
+    expect(daemon).toContain("if (isRunFailedError(__err)) {");
+    // The timer is cleared on shutdown (both signals).
+    expect(daemon.split("clearInterval(__scheduleTimer)").length - 1).toBe(2);
+  });
+
+  test("interval jitter adds a randomized pre-tick delay", () => {
+    const daemon = daemonOf({
+      ...ir,
+      schedule: { kind: "interval", everyMs: 6_000, jitterMs: 500 },
+    });
+    expect(daemon).toContain("const __jitterMs = Math.floor(Math.random() * 500);");
+  });
+
+  test("cron schedule emits the minute-ticker + matcher and carries the expression verbatim", () => {
+    const daemon = daemonOf({
+      ...ir,
+      schedule: { kind: "cron", cron: "0 */6 * * *", timezone: "America/New_York" },
+    });
+    expect(daemon).toContain("function __cronMatches(expr: string, date: Date): boolean");
+    expect(daemon).toContain("function __cronFieldMatches(field: string, value: number): boolean");
+    expect(daemon).toContain('const __cronExpr = "0 */6 * * *";');
+    expect(daemon).toContain("if (!__cronMatches(__cronExpr, __now)) return;");
+    // 30s ticker, deduped to one fire per matching minute.
+    expect(daemon).toContain("}, 30_000);");
+    expect(daemon).toContain("if (__minuteKey === __lastCronMinute) return;");
+  });
+
+  test("the schedule instructions default when the spec omits them, else ride verbatim", () => {
+    const dflt = daemonOf({ ...ir, schedule: { kind: "interval", everyMs: 1000 } });
+    expect(dflt).toContain("Scheduled wake tick — check for due work and act on it.");
+    const custom = daemonOf({
+      ...ir,
+      schedule: { kind: "interval", everyMs: 1000, instructions: "sweep the outbox" },
+    });
+    expect(custom).toContain('const __SCHEDULE_INSTRUCTIONS = "sweep the outbox";');
+  });
+
+  test("no schedule block → no wake-loop codegen (byte-stable)", () => {
+    const daemon = daemonOf(ir);
+    expect(daemon).not.toContain("__fireScheduledWake");
+    expect(daemon).not.toContain("__scheduleTimer");
+    expect(daemon).not.toContain("CREWHAUS_SCHEDULE");
+    expect(daemon).not.toContain("__cronMatches");
+  });
+});
+
+describe("emitManaged — resume-path idempotency (loop contract 0.4, Batch F, ITEM 7)", () => {
+  const daemonOf = (i: IrManagedV0): string =>
+    emitManaged(i).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+
+  test("runs.continue with a prior sessionId reseats history and dedupes via withIdempotency", () => {
+    const daemon = daemonOf(ir);
+    expect(daemon).toContain(
+      'import {\n  createInMemoryIdempotencyStore,\n  idempotencyKey,\n  withIdempotency,\n} from "@crewhaus/idempotency-keys";',
+    );
+    expect(daemon).toContain("const RESUME_IDEM_STORE = createInMemoryIdempotencyStore<string>();");
+    expect(daemon).toContain(
+      'const isResume = method === "runs.continue" && p.sessionId !== undefined;',
+    );
+    // The resume path passes `resume` into runOneTurn's extraOptions…
+    expect(daemon).toContain("...(isResume ? { resume: { sessionId } } : {}),");
+    // …and wraps execution in withIdempotency keyed on (tenant, session, input).
+    expect(daemon).toContain(
+      "const guarded = withIdempotency<undefined, string>(() => executeTurn(), {",
+    );
+    expect(daemon).toContain("idempotencyKey(`${tenant.id}:${sessionId}:${p.input}`, 0)");
+    // runs.create still runs a fresh turn (no idempotency wrap).
+    expect(daemon).toContain("reply = await executeTurn();");
+  });
+
+  test("the audit sinks + runContext still ride the resume-aware extraOptions", () => {
+    const daemon = daemonOf(ir);
+    const optIdx = daemon.indexOf("extraOptions: {");
+    expect(optIdx).toBeGreaterThan(-1);
+    expect(daemon.indexOf("justificationAuditSink: log,")).toBeGreaterThan(optIdx);
+    expect(daemon.indexOf("egressAuditSink: log,")).toBeGreaterThan(optIdx);
+  });
+});
+
 describe("TargetEmitError", () => {
   test("is a compiler-coded CrewhausError carrying message and cause", () => {
     const cause = new Error("underlying");
@@ -265,6 +429,142 @@ describe("emitManaged — terminal-failure reporting (0.3.0 Goal 6)", () => {
   });
 });
 
+describe("emitManaged — agent loop knobs (loop contract 0.4, Batch A)", () => {
+  test("agent.ts threads maxTokens into runChatLoop when set", () => {
+    const irMax: IrManagedV0 = { ...ir, agent: { ...ir.agent, maxTokens: 4096 } };
+    const agentTs = emitManaged(irMax).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain("maxTokens: 4096,");
+  });
+
+  test("agent.ts threads the budget-tokens thinking form verbatim", () => {
+    const irThink: IrManagedV0 = {
+      ...ir,
+      agent: { ...ir.agent, thinking: { budgetTokens: 8192 } },
+    };
+    const agentTs = emitManaged(irThink).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('thinking: {"budgetTokens":8192},');
+  });
+
+  test("agent.ts threads the effort thinking form verbatim", () => {
+    const irThink: IrManagedV0 = { ...ir, agent: { ...ir.agent, thinking: { effort: "high" } } };
+    const agentTs = emitManaged(irThink).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('thinking: {"effort":"high"},');
+  });
+
+  test("agent.ts threads per-tool rateLimits including the catch-all bucket", () => {
+    const irRate: IrManagedV0 = {
+      ...ir,
+      agent: {
+        ...ir.agent,
+        rateLimits: { web_search: { rpm: 30, burst: 5 }, "*": { rpm: 120 } },
+      },
+    };
+    const agentTs = emitManaged(irRate).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('rateLimits: {"web_search":{"rpm":30,"burst":5},"*":{"rpm":120}},');
+  });
+
+  test("agent.ts omits all three knobs when the IR leaves them unset", () => {
+    const agentTs = emitManaged(ir).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).not.toContain("maxTokens:");
+    expect(agentTs).not.toContain("thinking:");
+    expect(agentTs).not.toContain("rateLimits:");
+  });
+});
+
+describe("emitManaged — hard runtime ceilings (limits, loop contract 0.4)", () => {
+  const limitsIr: IrManagedV0 = {
+    ...ir,
+    limits: {
+      maxToolIterations: 40,
+      maxConcurrentTools: 4,
+      contextLimit: 150_000,
+      deadlineMs: 600_000,
+      turnTimeoutMs: 120_000,
+      modelCallTimeoutMs: 90_000,
+      loopDetection: { window: 6, threshold: 3, escalation: "justify" },
+    },
+  };
+
+  test("agent.ts threads every declared ceiling as a flat runChatLoop field", () => {
+    const agentTs = emitManaged(limitsIr).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain("maxToolIterations: 40,");
+    expect(agentTs).toContain("maxConcurrentTools: 4,");
+    expect(agentTs).toContain("contextLimit: 150000,");
+    expect(agentTs).toContain("deadlineMs: 600000,");
+    expect(agentTs).toContain("turnTimeoutMs: 120000,");
+    expect(agentTs).toContain("modelCallTimeoutMs: 90000,");
+    expect(agentTs).toContain('loopDetection: {"window":6,"threshold":3,"escalation":"justify"},');
+  });
+
+  test("a partial limits block emits ONLY the declared knobs — the runtime owns defaults", () => {
+    const partialIr: IrManagedV0 = { ...ir, limits: { maxToolIterations: 25 } };
+    const agentTs = emitManaged(partialIr).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain("maxToolIterations: 25,");
+    expect(agentTs).not.toContain("maxConcurrentTools:");
+    expect(agentTs).not.toContain("contextLimit:");
+    expect(agentTs).not.toContain("deadlineMs:");
+    expect(agentTs).not.toContain("turnTimeoutMs:");
+    expect(agentTs).not.toContain("modelCallTimeoutMs:");
+    expect(agentTs).not.toContain("loopDetection:");
+  });
+
+  test("agent.ts omits every ceiling when the IR has no limits block", () => {
+    const agentTs = emitManaged(ir).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).not.toContain("maxToolIterations:");
+    expect(agentTs).not.toContain("maxConcurrentTools:");
+    expect(agentTs).not.toContain("contextLimit:");
+    expect(agentTs).not.toContain("deadlineMs:");
+    expect(agentTs).not.toContain("turnTimeoutMs:");
+    expect(agentTs).not.toContain("modelCallTimeoutMs:");
+    expect(agentTs).not.toContain("loopDetection:");
+  });
+});
+
+describe("emitManaged — spec-declared lifecycle hooks (loop contract 0.4)", () => {
+  test("agent.ts threads hooks as a HookDef[] literal in declaration order", () => {
+    const hooksIr: IrManagedV0 = {
+      ...ir,
+      hooks: [
+        { event: "pre-tool", matcher: "bash", command: "./guard.sh", timeoutMs: 5000 },
+        { event: "stop", command: "./notify.sh" },
+      ],
+    };
+    const agentTs = emitManaged(hooksIr).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain(
+      'hooks: [{"event":"pre-tool","matcher":"bash","command":"./guard.sh","timeoutMs":5000},{"event":"stop","command":"./notify.sh"}],',
+    );
+    // Declaration order is semantics — pre-tool must precede stop.
+    expect(agentTs.indexOf('"event":"pre-tool"')).toBeLessThan(agentTs.indexOf('"event":"stop"'));
+  });
+
+  test("agent.ts omits the hooks field when the IR carries none (absent or empty)", () => {
+    const agentTs = emitManaged(ir).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).not.toContain("hooks:");
+    const emptyIr: IrManagedV0 = { ...ir, hooks: [] };
+    const emptyAgent = emitManaged(emptyIr).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(emptyAgent).not.toContain("hooks:");
+  });
+});
+
+describe("emitManaged — run budget vs per-tenant budgets (loop contract 0.4)", () => {
+  test("top-level budget threads into runChatLoop while per-tenant gateway budgets keep overriding", () => {
+    const irBoth: IrManagedV0 = {
+      ...ir,
+      budget: { usdMicros: 2_500_000, onExceed: { kind: "abort" } },
+    };
+    const bundle = emitManaged(irBoth);
+    const agentTs = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    // Run-level spend cap rides runChatLoop in agent.ts…
+    expect(agentTs).toContain('budget: {"usdMicros":2500000');
+    // …while the per-tenant token budgets stay in the daemon's TENANT_OVERRIDES
+    // and continue to gate admission at the gateway, unchanged.
+    expect(daemon).toContain("budget: { maxInputTokens: 100000, maxOutputTokens: 20000 }");
+    expect(daemon).toContain("budget: { maxInputTokens: 50000, maxOutputTokens: 10000 }");
+    expect(daemon).toContain("budgetStore: BUDGET_STORE");
+  });
+});
+
 describe("emitManaged — dream janitor step (v0.3.0 PR 14, §6.3)", () => {
   const dreamIr: IrManagedV0 = {
     ...ir,
@@ -296,5 +596,414 @@ describe("emitManaged — dream janitor step (v0.3.0 PR 14, §6.3)", () => {
     const daemon = emitManaged(ir).files.find((f) => f.path === "daemon.ts")?.content ?? "";
     expect(daemon).not.toContain("createDreamJanitorStep");
     expect(daemon).not.toContain("DREAM_STEP");
+  });
+});
+
+describe("emitManaged — evaluation block (loop contract 0.4, Batch B, G02)", () => {
+  const agentContent = (overrides: Partial<IrManagedV0>): string =>
+    emitManaged({ ...ir, ...overrides }).files.find((f) => f.path === "agent.ts")?.content ?? "";
+
+  test("llm_judge: agent.ts carries the eval-judge wiring threaded into runOneTurn", () => {
+    const agent = agentContent({
+      evaluation: {
+        grader: {
+          type: "llm_judge",
+          criteria: "answers cite a source",
+          model: "claude-haiku-4-5",
+        },
+        threshold: 0.8,
+        onFail: "retry",
+        maxRetries: 2,
+      },
+    });
+    expect(agent).toContain('import type { RunEvaluation } from "@crewhaus/runtime-core";');
+    expect(agent).toContain('import { judge } from "@crewhaus/eval-judge";');
+    expect(agent).toContain("const __evaluation: RunEvaluation = {");
+    expect(agent).toContain('graderType: "llm_judge",');
+    expect(agent).toContain('model: "claude-haiku-4-5",');
+    expect(agent).toContain('description: "answers cite a source",');
+    expect(agent).toContain("threshold: 0.8,");
+    expect(agent).toContain('onFail: "retry",');
+    expect(agent).toContain("maxRetries: 2,");
+    expect(agent).toContain("evaluate: async ({ finalText }) => {");
+    expect(agent).toContain("agentOutput: finalText,");
+    expect(agent).toContain("(__verdict.score - 1) / 4");
+    expect(agent).toContain("evaluation: __evaluation,");
+  });
+
+  test("llm_judge: the judge model defaults to the shape's primary model and the resolved default threshold is honored", () => {
+    const agent = agentContent({
+      evaluation: {
+        grader: { type: "llm_judge", criteria: "be kind" },
+        onFail: "retry",
+        maxRetries: 1,
+      },
+    });
+    expect(agent).toContain('model: "claude-sonnet-4-6",');
+    expect(agent).toContain('description: "be kind",');
+    expect(agent).toContain("threshold: 0.7,");
+  });
+
+  test("contains: emits a pure fn (no eval-judge import; documented threshold 1)", () => {
+    const agent = agentContent({
+      evaluation: {
+        grader: { type: "contains", value: "DONE" },
+        onFail: "halt",
+        maxRetries: 3,
+      },
+    });
+    expect(agent).not.toContain("@crewhaus/eval-judge");
+    expect(agent).toContain('graderType: "contains",');
+    expect(agent).toContain("threshold: 1,");
+    expect(agent).toContain('finalText.includes("DONE")');
+    expect(agent).toContain('onFail: "halt",');
+    expect(agent).toContain("evaluation: __evaluation,");
+  });
+
+  test("regex: emits a pure fn with a per-call lastIndex reset", () => {
+    const agent = agentContent({
+      evaluation: {
+        grader: { type: "regex", value: "\\d+ items" },
+        onFail: "note",
+        maxRetries: 1,
+      },
+    });
+    expect(agent).toContain('const __evalRegex = new RegExp("\\\\d+ items");');
+    expect(agent).toContain('graderType: "regex",');
+    expect(agent).toContain("threshold: 1,");
+    expect(agent).toContain("__evalRegex.lastIndex = 0;");
+    expect(agent).toContain("__evalRegex.test(finalText)");
+    expect(agent).toContain('onFail: "note",');
+    expect(agent).toContain("evaluation: __evaluation,");
+  });
+
+  test("no evaluation block → no evaluation wiring in any emitted file (byte-identity guard)", () => {
+    for (const f of emitManaged(ir).files) {
+      expect(f.content).not.toContain("evaluation:");
+      expect(f.content).not.toContain("__evaluation");
+      expect(f.content).not.toContain("@crewhaus/eval-judge");
+    }
+  });
+});
+
+describe("emitManaged — runs.subscribe per-run bus registry (contract item 3)", () => {
+  const daemonOf = (over: Partial<IrManagedV0> = {}): string =>
+    emitManaged({ ...ir, ...over }).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+
+  test("daemon imports run-context and holds a tenant-fenced per-run bus registry", () => {
+    const daemon = daemonOf();
+    expect(daemon).toContain(
+      'import { createRunContext, type RunContext } from "@crewhaus/run-context";',
+    );
+    expect(daemon).toContain(
+      'const RUN_BUSES = new Map<string, { tenantId: string; bus: RunContext["eventBus"] }>();',
+    );
+    expect(daemon).toContain("function registerRunBus(runId: string, tenantId: string,");
+    // Bounded so completed runs' buffers don't accumulate forever.
+    expect(daemon).toContain("RUN_BUSES.size > RUN_BUS_CAP");
+  });
+
+  test("resolveRunEvents fences by tenant and replays-then-live-streams the bus atomically", () => {
+    const daemon = daemonOf();
+    expect(daemon).toContain("resolveRunEvents: ({ runId, tenant }) => {");
+    // Tenant fence: unknown OR cross-tenant runId → undefined → 404.
+    expect(daemon).toContain(
+      "if (entry === undefined || entry.tenantId !== tenant.id) return undefined;",
+    );
+    // Atomic snapshot (ring buffer) + live subscribe (no gap between).
+    expect(daemon).toContain("const replay = bus.recent();");
+    expect(daemon).toContain("const close = bus.subscribe(listener);");
+    expect(daemon).toContain("return { replay, close };");
+  });
+
+  test("each run mints + registers its bus up front and returns that runId", () => {
+    const daemon = daemonOf();
+    expect(daemon).toContain("const runId = `run_${Math.random().toString(36).slice(2, 10)}`;");
+    expect(daemon).toContain("const runContext = createRunContext({ runId, sessionId });");
+    expect(daemon).toContain("registerRunBus(runId, tenant.id, runContext.eventBus);");
+    // The response runId is the registered bus's runId (the id a client
+    // subscribes with) — not a second, throwaway id.
+    expect(daemon).toContain("return { runId, sessionId, tenantId: tenant.id, reply };");
+    expect(daemon).not.toContain(
+      "return { runId: `run_${Math.random().toString(36).slice(2, 10)}`,",
+    );
+    // runId is minted BEFORE the run is registered and executed (match the
+    // CALL site, not the `function registerRunBus(runId…)` definition).
+    const callIdx = daemon.indexOf("registerRunBus(runId, tenant.id,");
+    expect(callIdx).toBeGreaterThan(-1);
+    expect(daemon.indexOf("const runId = ")).toBeLessThan(callIdx);
+    expect(callIdx).toBeLessThan(daemon.indexOf("await runOneTurn("));
+  });
+
+  test("the run's trace context is threaded into runOneTurn via extraOptions", () => {
+    const daemon = daemonOf();
+    expect(daemon).toContain("extraOptions: {");
+    expect(daemon).toContain("runContext,");
+  });
+});
+
+describe("emitManaged — G48 durable justification/egress audit sinks (managed slice)", () => {
+  test("the per-tenant hash-chained audit log is wired as both durable sinks", () => {
+    const daemon = emitManaged(ir).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    // The SAME `log` used for policy audit is threaded as both sinks, so
+    // intent-gate + egress verdicts are tamper-evidenced per tenant.
+    expect(daemon).toContain("justificationAuditSink: log,");
+    expect(daemon).toContain("egressAuditSink: log,");
+    // Both ride the runOneTurn extraOptions (the audit log lives in the daemon,
+    // not agent.ts).
+    const optIdx = daemon.indexOf("extraOptions: {");
+    expect(optIdx).toBeGreaterThan(-1);
+    expect(daemon.indexOf("justificationAuditSink: log,")).toBeGreaterThan(optIdx);
+    expect(daemon.indexOf("egressAuditSink: log,")).toBeGreaterThan(optIdx);
+  });
+});
+
+describe("emitManaged — observability block threading (loop contract 0.4, Batch C, G26)", () => {
+  const daemonOf = (observability?: IrManagedV0["observability"]): string =>
+    emitManaged(observability === undefined ? ir : { ...ir, observability }).files.find(
+      (f) => f.path === "daemon.ts",
+    )?.content ?? "";
+
+  test("a spec with no observability block gets NO observability env stamping (behavior-stable)", () => {
+    const daemon = daemonOf();
+    // Threading is gated on a declared block — an observability-silent spec is
+    // left byte/behavior-stable (no forced fleet-wide cost tracking).
+    expect(daemon).not.toContain("CREWHAUS_COST_TRACKING");
+    expect(daemon).not.toContain("apply the spec's `observability` block");
+    expect(daemon).not.toContain("CREWHAUS_TRACE");
+    expect(daemon).not.toContain("CREWHAUS_METRICS");
+    expect(daemon).not.toContain("CREWHAUS_ALERTS");
+    expect(daemon).not.toContain("CREWHAUS_INCIDENTS");
+    expect(daemon).not.toContain("OTEL_EXPORTER_OTLP_ENDPOINT");
+  });
+
+  test("any declared observability block defaults cost tracking ON (keystone `?? true`)", () => {
+    // Even a slo-only or metrics-only block turns cost ON by default…
+    for (const obs of [
+      { slo: { ttftMs: 1400, mitigation: ["alert"] as const } },
+      { metrics: { enabled: true } },
+    ] satisfies IrManagedV0["observability"][]) {
+      const daemon = daemonOf(obs);
+      expect(daemon).toContain('process.env["CREWHAUS_COST_TRACKING"] ??= "1";');
+      // …stamped before the gateway is constructed (match the construction, not
+      // the `import { createGatewayServer }` line).
+      expect(daemon.indexOf("CREWHAUS_COST_TRACKING")).toBeLessThan(
+        daemon.indexOf("const gateway = createGatewayServer("),
+      );
+    }
+  });
+
+  test("explicit cost:{enabled:false} in a declared block opts out (explicit off wins)", () => {
+    // The block is present (metrics on) so threading runs, but cost is off.
+    const daemon = daemonOf({ cost: { enabled: false }, metrics: { enabled: true } });
+    expect(daemon).not.toContain("CREWHAUS_COST_TRACKING");
+    expect(daemon).toContain('process.env["CREWHAUS_METRICS"] ??= "stdout";');
+  });
+
+  test("trace pretty/json attach the printer; ring/off attach none (buffer retained)", () => {
+    expect(daemonOf({ trace: { level: "pretty" } })).toContain(
+      'process.env["CREWHAUS_TRACE"] ??= "pretty";',
+    );
+    expect(daemonOf({ trace: { level: "json" } })).toContain(
+      'process.env["CREWHAUS_TRACE"] ??= "json";',
+    );
+    // ring is the default (buffer only, needed for runs.subscribe replay) — no
+    // printer env; off degrades to the same (a true buffer-off would break SSE).
+    expect(daemonOf({ trace: { level: "ring" } })).not.toContain("CREWHAUS_TRACE");
+    expect(daemonOf({ trace: { level: "off" } })).not.toContain("CREWHAUS_TRACE");
+  });
+
+  test("metrics / alerts / incidents are opt-in ON when declared", () => {
+    expect(daemonOf({ metrics: { enabled: true } })).toContain(
+      'process.env["CREWHAUS_METRICS"] ??= "stdout";',
+    );
+    expect(daemonOf({ alerts: { enabled: true } })).toContain(
+      'process.env["CREWHAUS_ALERTS"] ??= "1";',
+    );
+    expect(daemonOf({ incidents: { enabled: true } })).toContain(
+      'process.env["CREWHAUS_INCIDENTS"] ??= "1";',
+    );
+    // …and stay off when explicitly disabled.
+    expect(daemonOf({ metrics: { enabled: false } })).not.toContain("CREWHAUS_METRICS");
+  });
+
+  test("otel endpoint is stamped literally, and a $VAR is resolved from env at boot", () => {
+    expect(daemonOf({ otel: { endpoint: "http://localhost:4318" } })).toContain(
+      'process.env["OTEL_EXPORTER_OTLP_ENDPOINT"] ??= "http://localhost:4318";',
+    );
+    const varDaemon = daemonOf({ otel: { endpoint: "$OTLP_URL" } });
+    expect(varDaemon).toContain('const __otel = process.env["OTLP_URL"];');
+    expect(varDaemon).toContain('process.env["OTEL_EXPORTER_OTLP_ENDPOINT"] ??= __otel;');
+    // A bare `otel: {}` (no endpoint) stamps nothing.
+    expect(daemonOf({ otel: {} })).not.toContain("OTEL_EXPORTER_OTLP_ENDPOINT");
+  });
+
+  test("declaring an SLO block activates the monitor env gate (targets ride agent.ts)", () => {
+    const bundle = emitManaged({
+      ...ir,
+      observability: { slo: { ttftMs: 1400, windowMs: 300_000, mitigation: ["alert"] } },
+    });
+    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    const agent = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(daemon).toContain('process.env["CREWHAUS_SLO"] ??= "1";');
+    // The targets themselves still ride agent.ts's runChatLoop call (unchanged).
+    expect(agent).toContain("sloTargets:");
+    expect(agent).toContain('"ttftMs":1400');
+  });
+});
+
+describe("emitManaged — thredz emit-wired (Loop contract 0.4, Batch E, G23)", () => {
+  // The managed shape has NO mcp_servers field; the compiler's
+  // lowerThredzWiredNoMcp resolves ir.thredz + flips memory.backend but
+  // synthesizes no server — this emitter synthesizes the stdio server itself.
+  const thredzIr: IrManagedV0 = {
+    ...ir,
+    memory: { enabled: true, backend: "thredz", autoRecall: true, autoCapture: true },
+    continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "spec" },
+    thredz: {
+      apiKey: { kind: "env", name: "THREDZ_API_KEY" },
+      visibility: "private",
+      goals: true,
+      agentName: "managed-bot",
+    },
+  };
+  const agentOf = (i: IrManagedV0): string =>
+    emitManaged(i).files.find((f) => f.path === "agent.ts")?.content ?? "";
+
+  test("agent.ts synthesizes the thredz stdio server and boots connectThredz once at module load", () => {
+    const c = agentOf(thredzIr);
+    expect(c).toContain('import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";');
+    expect(c).toContain('import { connectThredz } from "@crewhaus/memory-service";');
+    expect(c).toContain('import { defaultCatalog } from "@crewhaus/tool-catalog";');
+    // The synthesized server: version-pinned npx, secret-ref API key, resolved
+    // visibility (never left to the server default).
+    expect(c).toContain('"args":["-y","thredz-mcp@0.2.0"]');
+    expect(c).toContain('"THREDZ_API_KEY":{"kind":"env","name":"THREDZ_API_KEY"}');
+    expect(c).toContain('"THREDZ_DEFAULT_VISIBILITY":{"kind":"literal","value":"private"}');
+    expect(c).toContain("const __thredzHost = new McpHost();");
+    expect(c).toContain("const __thredz = await connectThredz(__thredzHost, defaultCatalog");
+    expect(c).toContain('agentName: "managed-bot"');
+    // A missing key is a config failure (structured report + coded exit).
+    expect(c).toContain("const __report = toFailureReport(__err);");
+    // No 0.2.3-style ignored-note comment survives.
+    expect(c).not.toContain("thredz configured but ignored");
+  });
+
+  test("agent.ts threads the live connection into the per-turn wireMemory call and unions the catalog aliases", () => {
+    const c = agentOf(thredzIr);
+    expect(c).toContain("thredz: __thredz,");
+    // The thredz-backed wiki path returns no local tools; the agent reaches the
+    // hosted vocabulary through the bare-name aliases on defaultCatalog.
+    expect(c).toContain("tools: [...__memTools, ...defaultCatalog.list()],");
+    // The fragment carries the thredz block for the backend flip.
+    expect(c).toContain('"thredz":{');
+  });
+
+  test("a self-hosted baseUrl rides THREDZ_API_BASE as a literal", () => {
+    const c = agentOf({
+      ...thredzIr,
+      thredz: {
+        apiKey: { kind: "env", name: "THREDZ_API_KEY" },
+        visibility: "private",
+        goals: true,
+        agentName: "managed-bot",
+        baseUrl: "https://thredz.internal",
+      },
+    });
+    expect(c).toContain('"THREDZ_API_BASE":{"kind":"literal","value":"https://thredz.internal"}');
+  });
+
+  test("no thredz block → no McpHost, connectThredz, or defaultCatalog union (byte-stable)", () => {
+    const c = agentOf(ir);
+    expect(c).not.toContain("connectThredz");
+    expect(c).not.toContain("McpHost");
+    expect(c).not.toContain("defaultCatalog.list()");
+  });
+});
+
+describe("emitManaged — memory.embedder curator/fact-store dep (Loop contract 0.4, Batch E)", () => {
+  test("memory.embedder constructs the embedder once and threads it as deps.embedder", () => {
+    const c =
+      emitManaged({
+        ...ir,
+        memory: { enabled: true, embedder: "mock/deterministic", wiki: { enabled: true } },
+      }).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(c).toContain('import { createEmbedder } from "@crewhaus/embedder";');
+    expect(c).toContain('const __memEmbedder = createEmbedder({ model: "mock/deterministic" });');
+    expect(c).toContain("embedder: __memEmbedder,");
+  });
+
+  test("no memory.embedder → no createEmbedder import (byte-stable)", () => {
+    const c =
+      emitManaged({
+        ...ir,
+        memory: { enabled: true, wiki: { enabled: true } },
+      }).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(c).not.toContain("createEmbedder");
+    expect(c).not.toContain("__memEmbedder");
+  });
+});
+
+describe("emitManaged — knowledge RAG block (Loop contract 0.4, Batch E, G22)", () => {
+  const agentOf = (i: IrManagedV0): string =>
+    emitManaged(i).files.find((f) => f.path === "agent.ts")?.content ?? "";
+  const knowledgeIr: IrManagedV0 = {
+    ...ir,
+    knowledge: {
+      vectorBackend: "in-memory",
+      defaultK: 5,
+      chunkSize: 400,
+      chunkOverlap: 0,
+      sources: [{ kind: "path", path: "docs/manual.md" }],
+    },
+  };
+
+  test("ingests the corpus at module load, registers the tool, and unions defaultCatalog.list()", () => {
+    const c = agentOf(knowledgeIr);
+    expect(c).toContain(
+      'import { knowledgeRetrieve, resolveKnowledgeEmbedder } from "@crewhaus/tool-retrieve";',
+    );
+    expect(c).toContain('import { defaultCatalog } from "@crewhaus/tool-catalog";');
+    expect(c).toContain("const __knowledgeTool = await knowledgeRetrieve({");
+    expect(c).toContain('{"kind":"path","path":"docs/manual.md"}');
+    expect(c).toContain("defaultCatalog.register(__knowledgeTool);");
+    // With no memory fabric on this fixture, tools resolves to the catalog.
+    expect(c).toContain("tools: defaultCatalog.list(),");
+  });
+
+  test("knowledge + memory fabric unions the per-turn memory tools with the catalog", () => {
+    const c = agentOf({
+      ...knowledgeIr,
+      memory: { enabled: true, embedder: "mock/deterministic" },
+    });
+    expect(c).toContain("tools: [...__memTools, ...defaultCatalog.list()],");
+    // memory.embedder still threads as the fact-store/curator embedder.
+    expect(c).toContain('const __memEmbedder = createEmbedder({ model: "mock/deterministic" });');
+    expect(c).toContain("embedder: __memEmbedder,");
+  });
+
+  test("no knowledge block → no RAG wiring (byte-stable)", () => {
+    const c = agentOf(ir);
+    expect(c).not.toContain("knowledgeRetrieve");
+    expect(c).not.toContain("__knowledgeTool");
+  });
+});
+
+describe("emitManaged — prompt-cache rotation persistence (Loop contract 0.4, Batch E, G78)", () => {
+  const agentOf = (i: IrManagedV0): string =>
+    emitManaged(i).files.find((f) => f.path === "agent.ts")?.content ?? "";
+
+  test("constructs a per-spec rotation store and threads the §2.5 read/persist seam", () => {
+    const c = agentOf(ir);
+    expect(c).toContain(
+      'import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";',
+    );
+    expect(c).toContain(
+      'const __promptCacheStore = createPromptCacheRotationStore({ specName: "hello-managed" });',
+    );
+    expect(c).toContain("promptCacheLastRotatedAt: await __promptCacheStore.read(),");
+    expect(c).toContain(
+      "onPromptCacheRotated: (rotatedAt) => __promptCacheStore.write(rotatedAt),",
+    );
   });
 });

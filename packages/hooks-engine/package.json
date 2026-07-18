@@ -16,6 +16,9 @@
     "@crewhaus/logging": "workspace:*",
     "@crewhaus/trace-event-bus": "workspace:*"
   },
+  "devDependencies": {
+    "@crewhaus/spec": "workspace:*"
+  },
   "license": "Apache-2.0",
   "author": {
     "name": "Max Meier",

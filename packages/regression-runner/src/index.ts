@@ -1,8 +1,14 @@
 /**
  * Section 29 — `regression-runner`. Computes a diff between two
  * `eval-runner` outputs (`EvalRunSummary` shapes), surfacing pass-rate
- * delta, latency delta, sample-level pass→fail flips and fail→pass
- * recoveries, and a configurable score-shift threshold.
+ * delta, latency delta, sample-level flips (regressions / recoveries), and
+ * a configurable score-shift threshold.
+ *
+ * Loop contract 0.4 (Batch B, G15): flip detection compares per-sample
+ * pass-RATES (`SampleResult.trialPassRate` from repeat trials, else the
+ * 0/1 verdict — see {@link samplePassRate}), so a reliability drop between
+ * repeated runs registers even when the canonical verdict is unchanged.
+ * Single-trial runs keep the original boolean pass→fail semantics exactly.
  *
  * `gate(prev, new, thresholds)` returns `"pass"` or `"fail"` — the
  * function `canary-controller` calls. Exits non-zero on regression so CI
@@ -20,9 +26,21 @@ export class RegressionError extends CrewhausError {
 
 export type SampleFlip = {
   readonly sampleId: string;
-  readonly prev: { readonly passed: boolean; readonly score: number };
-  readonly next: { readonly passed: boolean; readonly score: number };
+  readonly prev: { readonly passed: boolean; readonly score: number; readonly passRate?: number };
+  readonly next: { readonly passed: boolean; readonly score: number; readonly passRate?: number };
 };
+
+/**
+ * G15 — a sample's pass-RATE: its per-trial pass fraction when the run
+ * carried repeat trials (`RunEvalOptions.repeats` > 1), else its single
+ * verdict as 0/1. Flip detection compares THESE, not the booleans, so a
+ * reliability drop (4/4 trials → 1/4 trials) registers as a regression
+ * even though the canonical trial still passes. Single-trial runs reduce
+ * to exactly the old boolean semantics.
+ */
+export function samplePassRate(s: SampleResult): number {
+  return s.trialPassRate ?? (s.grades.overall.passed ? 1 : 0);
+}
 
 export type ScoreShift = {
   readonly sampleId: string;
@@ -75,18 +93,33 @@ export function regress(
   for (const cur of next.samples) {
     const before = prevById.get(cur.sampleId);
     if (!before) continue;
-    if (before.grades.overall.passed && !cur.grades.overall.passed) {
-      flipsRegress.push({
-        sampleId: cur.sampleId,
-        prev: { passed: true, score: before.grades.overall.score },
-        next: { passed: false, score: cur.grades.overall.score },
-      });
-    } else if (!before.grades.overall.passed && cur.grades.overall.passed) {
-      flipsRecover.push({
-        sampleId: cur.sampleId,
-        prev: { passed: false, score: before.grades.overall.score },
-        next: { passed: true, score: cur.grades.overall.score },
-      });
+    // G15 — flips compare per-sample pass-RATES, not single booleans: with
+    // repeat trials on either side, any rate drop is a regression and any
+    // rise a recovery (1.0 → 0.75 is a reliability regression the boolean
+    // view can't see). Without trials the rates are exactly the 0/1
+    // verdicts, so single-trial runs keep the pre-G15 flip semantics
+    // byte-for-byte. The rate fields are attached only when a side actually
+    // carried trial data, keeping single-trial reports unchanged.
+    const hasTrialData = before.trialPassRate !== undefined || cur.trialPassRate !== undefined;
+    const prevRate = samplePassRate(before);
+    const nextRate = samplePassRate(cur);
+    const flip = (): SampleFlip => ({
+      sampleId: cur.sampleId,
+      prev: {
+        passed: before.grades.overall.passed,
+        score: before.grades.overall.score,
+        ...(hasTrialData ? { passRate: prevRate } : {}),
+      },
+      next: {
+        passed: cur.grades.overall.passed,
+        score: cur.grades.overall.score,
+        ...(hasTrialData ? { passRate: nextRate } : {}),
+      },
+    });
+    if (nextRate < prevRate) {
+      flipsRegress.push(flip());
+    } else if (nextRate > prevRate) {
+      flipsRecover.push(flip());
     } else {
       unchanged++;
     }

@@ -1,7 +1,8 @@
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import { type Bundle, type IrV0, renderBundleReadme } from "@crewhaus/ir";
+import { type Bundle, type IrLimits, type IrV0, renderBundleReadme } from "@crewhaus/ir";
 import { parseModelString } from "@crewhaus/model-router";
+import { partitionEdgeTools } from "@crewhaus/worker-runtime/tool-policy";
 
 export type EmitOptions = {
   /**
@@ -19,42 +20,49 @@ const DEFAULT_ALLOWED_ORIGINS = ["https://studio.crewhaus.ai", "http://localhost
 
 /**
  * Emit a Cloudflare Worker bundle for a CLI-target IR. Sibling of
- * `@crewhaus/target-cli`'s `emitCli`: same IR shape in, different
- * generated artifacts out. The emitted worker is fully self-contained —
- * it inlines a minimal Anthropic streaming-SSE client so the studio PWA
- * can upload the bundle directly via the Cloudflare API without a build
- * step on the user's device.
+ * `@crewhaus/target-cli`'s `emitCli`: same IR shape in, different generated
+ * artifacts out.
+ *
+ * Loop contract 0.4 (Batch F, G12/G83) — the emitted worker no longer inlines
+ * a bespoke Anthropic SSE client. It imports `@crewhaus/worker-runtime` and
+ * runs the SHARED `runWorkerLoop` over a stateless {@link WorkerPlatform}
+ * (injected clock, `crypto.randomUUID`, the platform `fetch`; storage absent),
+ * so the deployed worker gains REAL tools (the edge-safe set), budget, limits,
+ * and the Batch C trace frames THROUGH the shared runtime — the payoff of the
+ * G12 node-free guarantee. Host tools are rejected at compile time; a run that
+ * outgrows its context window ends with a classified error frame (no
+ * compaction on the edge). The `/chat` `text`/`done`/`error` SSE vocabulary is
+ * byte-compatible with the inlined client it replaces.
  *
  * Bundle contents:
- *   - `worker.js`        — entrypoint, runs as an ES module Worker
- *   - `wrangler.toml`    — deploy descriptor for users who do prefer CLI
- *   - `package.json`     — declares the runtime version stamp
- *
- * M0 emits a tools-free Worker. Tools, sub-agents, MCP, hooks, and the
- * security fabric port over in M2+ when we point the emitter at a shared
- * worker runtime instead of inlining the minimal client.
+ *   - `worker.js`        — entrypoint (ES module Worker) that imports the
+ *                          shared runtime + edge-safe tool factories; deploy
+ *                          bundles it (`wrangler deploy` / studio server-side)
+ *   - `wrangler.toml`    — deploy descriptor
+ *   - `package.json`     — declares the runtime + tool dependencies
  */
 export function emitCfWorkerCli(ir: IrV0, opts: EmitOptions = {}): Bundle {
   if (ir.target !== "cli") {
     throw new TargetEmitError(`emitCfWorkerCli requires target "cli", got "${ir.target}"`);
   }
-  // Provider gate — the emitted worker inlines an api.anthropic.com client
-  // and POSTs CONFIG.model verbatim, so a non-Anthropic model string would
-  // compile cleanly and 502 at runtime. Fail at compile time instead.
+  // Provider gate — the shared runtime's edge adapter POSTs CONFIG.model to
+  // api.anthropic.com verbatim, so a non-Anthropic model string would compile
+  // cleanly and 502 at runtime. Fail at compile time instead.
   assertAnthropicModel(ir.agent.model, "agent");
-  if (ir.tools.length > 0) {
-    throw new TargetEmitError(
-      `cf-worker-cli target does not yet support tools (got: ${ir.tools.join(", ")}). Use the local cli target until M2.`,
-    );
-  }
+  // Loop contract 0.4 (Batch F, G12/G83) — the cf-worker edge-safety tool
+  // gate replaces the old blanket "does not support tools" rejection. Host
+  // tools (bash/fs/code-exec/device) hard-fail; unrecognised custom tools are
+  // permitted with a warning surfaced in the generated worker.
+  const wiring = resolveEdgeTools(ir.tools, ir.toolConfigs);
+
   const allowedOrigins =
     opts.allowedOrigins && opts.allowedOrigins.length > 0
       ? [...opts.allowedOrigins]
       : DEFAULT_ALLOWED_ORIGINS;
   const files = [
-    { path: "worker.js", content: renderWorker(ir, allowedOrigins) },
+    { path: "worker.js", content: renderWorker(ir, wiring, allowedOrigins) },
     { path: "wrangler.toml", content: renderWrangler(ir) },
-    { path: "package.json", content: renderPackageJson(ir) },
+    { path: "package.json", content: renderPackageJson(ir, wiring) },
   ];
   // Item 42 — generated bundle README; default ON. The default per-target
   // run snippet keys on ir.target ("cli" → `bun agent.ts`), which is wrong
@@ -70,8 +78,9 @@ const CF_WORKER_README_OPTS = {
     heading: "Deploy",
     body: [
       "```sh",
-      "wrangler secret put ANTHROPIC_API_KEY   # one-time Worker secret",
-      "wrangler deploy",
+      "npm install                              # resolve the crewhaus runtime + tools",
+      "wrangler secret put ANTHROPIC_API_KEY    # one-time Worker secret",
+      "wrangler deploy                          # bundles worker.js + its imports",
       "```",
     ].join("\n"),
   },
@@ -88,8 +97,8 @@ export class TargetEmitError extends CrewhausError {
 
 /**
  * Reject any model string the router would dispatch to a non-Anthropic
- * provider (openai/, gemini/, bedrock/, local/…) — the inlined worker
- * client only speaks the Anthropic Messages API.
+ * provider (openai/, gemini/, bedrock/, local/…) — the edge adapter only
+ * speaks the Anthropic Messages API.
  */
 function assertAnthropicModel(model: string, where: string): void {
   let providerId: string;
@@ -105,35 +114,202 @@ function assertAnthropicModel(model: string, where: string): void {
   }
 }
 
-function renderWorker(ir: IrV0, allowedOrigins: readonly string[]): string {
-  // escapeJsonString === JSON.stringify: each of these is a COMPLETE,
-  // quoted JS/JSON string literal already. Do NOT wrap them in extra quotes
-  // in the template below, or the output becomes `name: ""hello-cli""` — a
-  // syntax error Cloudflare rejects at upload time.
+// --------------------------------------------------------------------------
+// Edge-safe tool wiring (Batch F, G12/G83)
+// --------------------------------------------------------------------------
+
+/** Edge-safe builtin tool name → its package + export + optional config init.
+ *  A subset of `@crewhaus/target-cli`'s `BUILTIN_TOOL_MAP` restricted to the
+ *  tools that run on a stateless Worker (`fetch`/KV only). MCP (`mcp__*`) tools
+ *  arrive from `mcp_servers`, not `tools:`, and are wired elsewhere. */
+type EdgeToolImport = {
+  readonly package: string;
+  readonly export: string;
+  readonly initSymbol?: string;
+};
+const EDGE_TOOL_IMPORTS: Readonly<Record<string, EdgeToolImport>> = {
+  fetch: { package: "@crewhaus/tool-fetch", export: "fetch", initSymbol: "registerFetchConfig" },
+  webFetch: {
+    package: "@crewhaus/tool-web",
+    export: "webFetch",
+    initSymbol: "registerWebFetchConfig",
+  },
+  webSearch: { package: "@crewhaus/tool-web", export: "webSearch" },
+  sendMessage: { package: "@crewhaus/tool-message-channel", export: "sendMessage" },
+  imageGenerate: {
+    package: "@crewhaus/tool-image-generation",
+    export: "imageGenerate",
+    initSymbol: "registerImageGenerationConfig",
+  },
+  todoWrite: { package: "@crewhaus/tool-todo", export: "todoWrite" },
+};
+
+/** The generated tool wiring for one IR: the import block, per-tool init
+ *  calls, the `TOOLS` array expression, the npm packages to declare, and the
+ *  names permitted-but-not-wired (warned custom + MCP) for the note comment. */
+export type EdgeToolWiring = {
+  readonly imports: string;
+  readonly inits: string;
+  readonly toolsExpr: string;
+  readonly packages: readonly string[];
+  readonly unwired: readonly string[];
+};
+
+/**
+ * Partition a tool list through the single-source-of-truth edge policy
+ * (`partitionEdgeTools`), THROW on any host tool (the old blanket rejection is
+ * gone), and render the import/registration wiring for the edge-safe builtins.
+ * Unrecognised custom tools and `mcp__*` tools are permitted but not wired
+ * (the generated worker notes them); a host tool hard-fails the compile.
+ */
+export function resolveEdgeTools(
+  names: readonly string[],
+  toolConfigs: Readonly<Record<string, unknown>>,
+): EdgeToolWiring {
+  const { rejected, warned, allowed } = partitionEdgeTools(names);
+  if (rejected.length > 0) {
+    const detail = rejected.map((r) => r.reason).join("; ");
+    throw new TargetEmitError(
+      `cf-worker target cannot run ${rejected.length} host tool(s): ${detail}. These need a host (process/filesystem/sandbox/device) the edge does not provide — use the cli target for them, or remove them.`,
+    );
+  }
+
+  // Wire the edge-safe builtins we have a factory for, preserving order and
+  // collapsing duplicates. `allowed` also contains `mcp__*` names (no builtin
+  // factory) which fall through to `unwired` alongside the warned customs.
+  const seen = new Set<string>();
+  const wired: string[] = [];
+  for (const name of names) {
+    if (seen.has(name)) continue;
+    seen.add(name);
+    if (EDGE_TOOL_IMPORTS[name] !== undefined) wired.push(name);
+  }
+  const unwired = [
+    ...allowed.filter((n) => EDGE_TOOL_IMPORTS[n] === undefined),
+    ...warned.map((w) => w.name),
+  ];
+
+  if (wired.length === 0) {
+    return { imports: "", inits: "", toolsExpr: "[]", packages: [], unwired };
+  }
+
+  // Group exports + init symbols by package for one import per package. Each
+  // tool export is aliased `__t_<name>` so it never collides with a global
+  // (`fetch`!) or another package's export.
+  const byPackage = new Map<string, { specs: string[]; extras: Set<string> }>();
+  const inits: string[] = [];
+  for (const name of wired) {
+    const entry = EDGE_TOOL_IMPORTS[name];
+    if (entry === undefined) continue;
+    const group = byPackage.get(entry.package) ?? { specs: [], extras: new Set<string>() };
+    group.specs.push(`${entry.export} as __t_${name}`);
+    if (entry.initSymbol !== undefined) {
+      const cfg = toolConfigs[name];
+      if (cfg !== undefined) {
+        group.extras.add(entry.initSymbol);
+        inits.push(`${entry.initSymbol}(${JSON.stringify(cfg)});`);
+      }
+    }
+    byPackage.set(entry.package, group);
+  }
+
+  const importLines: string[] = [];
+  for (const pkg of [...byPackage.keys()].sort()) {
+    const group = byPackage.get(pkg);
+    if (group === undefined) continue;
+    const symbols = [...group.specs, ...[...group.extras].sort()].join(", ");
+    importLines.push(`import { ${symbols} } from "${pkg}";`);
+  }
+
+  return {
+    imports: importLines.join("\n"),
+    inits: inits.join("\n"),
+    toolsExpr: `[${wired.map((n) => `__t_${n}`).join(", ")}]`,
+    packages: [...byPackage.keys()].sort(),
+    unwired,
+  };
+}
+
+/** Render the worker's `limits` argument to `runWorkerLoop` from the IR's
+ *  `limits:` block — the v1 subset the edge honours. `justify` escalation (a
+ *  Node-only intent gate) degrades to the safe `warn`. */
+function renderLimits(limits: IrLimits | undefined): string {
+  if (limits === undefined) return "undefined";
+  const out: Record<string, unknown> = {};
+  if (limits.maxToolIterations !== undefined) out["maxToolIterations"] = limits.maxToolIterations;
+  if (limits.contextLimit !== undefined) out["contextLimit"] = limits.contextLimit;
+  if (limits.deadlineMs !== undefined) out["deadlineMs"] = limits.deadlineMs;
+  if (limits.loopDetection !== undefined) {
+    const ld: Record<string, unknown> = {};
+    if (limits.loopDetection.window !== undefined) ld["window"] = limits.loopDetection.window;
+    if (limits.loopDetection.threshold !== undefined) {
+      ld["threshold"] = limits.loopDetection.threshold;
+    }
+    if (limits.loopDetection.escalation !== undefined) {
+      ld["escalation"] =
+        limits.loopDetection.escalation === "justify" ? "warn" : limits.loopDetection.escalation;
+    }
+    if (Object.keys(ld).length > 0) out["loopDetection"] = ld;
+  }
+  return Object.keys(out).length > 0 ? JSON.stringify(out) : "undefined";
+}
+
+/** The generated `edge-unsafe-tool` note comment for permitted-but-unwired
+ *  tools (custom + MCP), mirroring the failure_taxonomy ignored-note pattern. */
+function edgeToolNote(unwired: readonly string[]): string {
+  if (unwired.length === 0) return "";
+  return `// note: ${unwired.length} tool(s) permitted but not wired on this edge worker (${unwired.join(", ")}) — custom tools cannot be verified fetch/KV-only offline, and mcp__* tools arrive from mcp_servers (unwired on cf-worker); they are omitted from the model's tool set\n`;
+}
+
+// --------------------------------------------------------------------------
+// worker.js
+// --------------------------------------------------------------------------
+
+function renderWorker(ir: IrV0, wiring: EdgeToolWiring, allowedOrigins: readonly string[]): string {
+  // escapeJsonString === JSON.stringify: each of these is a COMPLETE, quoted
+  // JS/JSON string literal already. Do NOT wrap them in extra quotes below.
   const name = escapeJsonString(ir.name);
   const model = escapeJsonString(ir.agent.model);
   const instructions = escapeJsonString(ir.agent.instructions);
   const allowed = JSON.stringify(allowedOrigins);
+  const maxTokens = ir.agent.maxTokens ?? 4096;
+  const thinking =
+    ir.agent.thinking !== undefined ? JSON.stringify(ir.agent.thinking) : "undefined";
+  const limits = renderLimits(ir.limits);
+  // Loop contract 0.4 (Batch C, item 3) — the /chat SSE carries `trace` events
+  // in the TraceEvent vocabulary. `observability.trace: off` suppresses them;
+  // every other level (default "ring", "pretty", "json") emits. Baked as a
+  // literal boolean so the generated worker carries no config parse.
+  const traceEnabled = (ir.observability?.trace?.level ?? "ring") !== "off";
 
-  // Item 23 — surface the ignored failure_taxonomy as a generated comment
-  // (mirror of target-workflow's mcp_servers note); the Worker calls the
-  // Anthropic API with raw fetch, so the recovery engine never runs here.
+  // Item 23 — failure_taxonomy is a Node-recovery-engine concern the edge loop
+  // does not run; surface the ignored config as a generated comment.
   const taxonomyWarning =
     ir.failureTaxonomy !== undefined && ir.failureTaxonomy.length > 0
-      ? "// note: failure_taxonomy configured but target-cf-worker-cli does not yet wire it up — it is ignored\n"
+      ? "// note: failure_taxonomy configured but target-cf-worker-cli does not wire it up on the edge — it is ignored\n"
       : "";
+  const toolNote = edgeToolNote(wiring.unwired);
+  const toolImports = wiring.imports.length > 0 ? `${wiring.imports}\n` : "";
+  const toolInits = wiring.inits.length > 0 ? `\n${wiring.inits}\n` : "";
+
   return `// Generated by @crewhaus/target-cf-worker-cli. Do not edit by hand.
 // Regenerate via the studio PWA or \`crewhaus compile --target cf-worker-cli\`.
-${taxonomyWarning}
+${taxonomyWarning}${toolNote}import { runWorkerLoop, createEdgeAnthropicAdapter } from "@crewhaus/worker-runtime";
+${toolImports}${toolInits}
 const CONFIG = {
   name: ${name},
   model: ${model},
   instructions: ${instructions},
   allowedOrigins: ${allowed},
+  trace: ${traceEnabled},
+  maxTokens: ${maxTokens},
+  thinking: ${thinking},
+  limits: ${limits},
 };
 
-const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION = "2023-06-01";
+// The edge-safe tool set the shared loop runs (empty when the spec declares no
+// wireable tools). Each entry is a real RegisteredTool executed by the runtime.
+const TOOLS = ${wiring.toolsExpr};
 
 export default {
   async fetch(request, env) {
@@ -167,68 +343,72 @@ async function handleChat(request, env, cors) {
     return json({ error: { code: "BAD_REQUEST", message: "messages must be an array of {role,content}" } }, 400, cors);
   }
 
-  const upstream = await fetch(ANTHROPIC_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": ANTHROPIC_VERSION,
-    },
-    body: JSON.stringify({
-      model: CONFIG.model,
-      max_tokens: 4096,
-      system: CONFIG.instructions,
-      stream: true,
-      messages: messages.map((m) => ({ role: m.role, content: m.content })),
-    }),
-  });
+  // A stateless WorkerPlatform: the clock + id generator are resolved here at
+  // the request boundary (never inside the loop), fetch is the platform fetch,
+  // and there is no KV binding (no parking / idempotency on the edge).
+  const platform = {
+    now: () => Date.now(),
+    randomId: () => crypto.randomUUID(),
+    fetch: (input, init) => fetch(input, init),
+  };
 
-  if (!upstream.ok || !upstream.body) {
-    const text = await upstream.text().catch(() => "");
-    return json({ error: { code: "UPSTREAM", status: upstream.status, message: text.slice(0, 500) } }, 502, cors);
-  }
-
-  // Translate Anthropic's SSE stream into the studio's simpler
-  // {text, done, error} event vocabulary. Buffers across chunks because
-  // events can split mid-line.
   const stream = new ReadableStream({
     async start(controller) {
       const enc = new TextEncoder();
-      const dec = new TextDecoder();
       const emit = (event, data) => {
         controller.enqueue(enc.encode(\`event: \${event}\\ndata: \${JSON.stringify(data)}\\n\\n\`));
       };
-      const reader = upstream.body.getReader();
-      let buffer = "";
+      // Loop contract 0.4 (Batch C, item 3) — trace frames gated on CONFIG.trace.
+      const emitTrace = (event) => { if (CONFIG.trace) emit("trace", event); };
+
+      // Live token streaming: wrap the edge adapter so text deltas fan out as
+      // \`text\` frames (byte-compatible with the inlined client) while the loop
+      // still collects the full message. \`acc\` is what the client rendered;
+      // \`lastStop\` tracks the Anthropic stop_reason for the terminal \`done\`.
       let acc = "";
-      let stopReason = "end_turn";
-      try {
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buffer += dec.decode(value, { stream: true });
-          let sep;
-          while ((sep = buffer.indexOf("\\n\\n")) !== -1) {
-            const raw = buffer.slice(0, sep);
-            buffer = buffer.slice(sep + 2);
-            let eventName = "message";
-            let data = "";
-            for (const line of raw.split("\\n")) {
-              if (line.startsWith("event: ")) eventName = line.slice(7);
-              else if (line.startsWith("data: ")) data += line.slice(6);
+      let lastStop = "end_turn";
+      const base = createEdgeAnthropicAdapter(platform, { apiKey: env.ANTHROPIC_API_KEY });
+      const adapter = {
+        ...base,
+        async *stream(req) {
+          for await (const ev of base.stream(req)) {
+            if (ev.kind === "content_block_delta" && ev.delta && ev.delta.type === "text_delta") {
+              acc += ev.delta.text;
+              emit("text", { text: ev.delta.text });
             }
-            if (!data || data === "[DONE]") continue;
-            let payload;
-            try { payload = JSON.parse(data); } catch { continue; }
-            if (eventName === "content_block_delta" && payload.delta && payload.delta.type === "text_delta") {
-              acc += payload.delta.text;
-              emit("text", { text: payload.delta.text });
-            } else if (eventName === "message_delta" && payload.delta && payload.delta.stop_reason) {
-              stopReason = payload.delta.stop_reason;
-            }
+            yield ev;
           }
+        },
+      };
+      const trace = (event) => {
+        if (event.kind === "model_response" && typeof event.stopReason === "string") {
+          lastStop = event.stopReason;
         }
-        emit("done", { text: acc, stopReason });
+        emitTrace(event);
+      };
+
+      try {
+        const result = await runWorkerLoop({
+          platform,
+          adapter,
+          model: CONFIG.model,
+          instructions: CONFIG.instructions,
+          messages,
+          tools: TOOLS,
+          maxTokens: CONFIG.maxTokens,
+          ...(CONFIG.thinking ? { thinking: CONFIG.thinking } : {}),
+          ...(CONFIG.limits ? { limits: CONFIG.limits } : {}),
+          emitTrace: trace,
+        });
+        // A failing stop (context_overflow / timeout / provider error) resolves
+        // a classified failure rather than throwing — surface it as a terminal
+        // \`error\` frame (no compaction/recovery on the edge). Bounded stops
+        // (done / max_iterations) keep their terminal text.
+        if (result.failure) {
+          emit("error", { message: \`\${result.failure.title}: \${result.failure.detail}\` });
+        } else {
+          emit("done", { text: acc || result.text, stopReason: lastStop });
+        }
       } catch (err) {
         emit("error", { message: err && err.message ? err.message : String(err) });
       } finally {
@@ -286,7 +466,9 @@ main = "worker.js"
 compatibility_date = "2026-05-01"
 compatibility_flags = ["nodejs_compat"]
 
-# ANTHROPIC_API_KEY is set as a Worker Secret (never committed):
+# worker.js imports @crewhaus/worker-runtime and the edge-safe tool packages;
+# \`wrangler deploy\` bundles them (run \`npm install\` first). ANTHROPIC_API_KEY
+# is a Worker Secret (never committed):
 #   wrangler secret put ANTHROPIC_API_KEY
 # The studio PWA sets this automatically via the Deploy flow.
 
@@ -295,20 +477,28 @@ enabled = true
 `;
 }
 
-function renderPackageJson(ir: IrV0): string {
+/** The crewhaus runtime + tool packages the generated worker imports. Pinned
+ *  to the current 0.3.x line; the studio deploy flow bundles worker.js against
+ *  these. */
+const RUNTIME_DEP_RANGE = "^0.3.0";
+
+function renderPackageJson(ir: IrV0, wiring: EdgeToolWiring): string {
   // Sanitize like the wrangler name. A raw ir.name breaks out of the JSON
   // string (this manifest is reachable from the hosted compiler-worker HTTP
   // endpoint), allowing dependency/script injection into package.json (#148).
   const safeName = ir.name.replace(/[^a-z0-9-]/gi, "-").toLowerCase();
-  return `{
-  "name": "${safeName}",
-  "version": "0.0.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev --local"
-  }
-}
-`;
+  const deps: Record<string, string> = { "@crewhaus/worker-runtime": RUNTIME_DEP_RANGE };
+  for (const pkg of wiring.packages) deps[pkg] = RUNTIME_DEP_RANGE;
+  return `${JSON.stringify(
+    {
+      name: safeName,
+      version: "0.0.0",
+      private: true,
+      type: "module",
+      scripts: { deploy: "wrangler deploy", dev: "wrangler dev --local" },
+      dependencies: deps,
+    },
+    null,
+    2,
+  )}\n`;
 }

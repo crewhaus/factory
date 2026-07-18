@@ -32,7 +32,8 @@
     "@crewhaus/target-pipeline": "workspace:*",
     "@crewhaus/target-research-bundle": "workspace:*",
     "@crewhaus/target-voice": "workspace:*",
-    "@crewhaus/target-workflow": "workspace:*"
+    "@crewhaus/target-workflow": "workspace:*",
+    "@crewhaus/worker-runtime": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

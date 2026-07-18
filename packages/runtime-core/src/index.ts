@@ -1,10 +1,13 @@
+import { randomUUID } from "node:crypto";
 import { dirname as pathDirname } from "node:path";
 import * as readline from "node:readline/promises";
 import type Anthropic from "@anthropic-ai/sdk";
 import { type AbortTree, createAbortTree } from "@crewhaus/abort-controller";
 import {
+  EFFORT_THINKING_BUDGET_TOKENS,
   type ProviderAdapter,
   type ProviderId,
+  type ReasoningEffort,
   collectFinalMessage,
   consumeStream,
 } from "@crewhaus/adapter-anthropic";
@@ -17,6 +20,12 @@ import type {
 import { classifyBoundary, setDefaultBoundaryLlmClassifier } from "@crewhaus/boundary-classifier";
 import { type WrappedAdapter, wrap as wrapWithCircuitBreaker } from "@crewhaus/circuit-breaker";
 import { autoCompact } from "@crewhaus/compaction-autocompact";
+import {
+  type Item as CuratorItem,
+  DEFAULT_DEDUPE_THRESHOLD,
+  type EmbedderFn,
+  curate as curateItems,
+} from "@crewhaus/compaction-curator";
 import { snip } from "@crewhaus/compaction-snip";
 import {
   DEFAULT_PRICING,
@@ -69,7 +78,7 @@ import {
   classifyText,
   llmClassifierEnabled,
 } from "@crewhaus/prompt-injection-detector";
-import type { RateLimiter } from "@crewhaus/rate-limiter";
+import { type BucketConfig, type RateLimiter, createRateLimiter } from "@crewhaus/rate-limiter";
 import {
   type NamedFailureClass,
   type RecoveryState,
@@ -84,7 +93,14 @@ import {
   openScoreboard,
 } from "@crewhaus/routing-store";
 import { type RunContext, createRunContext, tagContent } from "@crewhaus/run-context";
-import { type SessionStore, createSessionStore } from "@crewhaus/session-store";
+import {
+  type PendingApproval,
+  type PendingApprovalStore,
+  type SessionStore,
+  createSessionStore,
+  generateApprovalId,
+  hashApprovalInput,
+} from "@crewhaus/session-store";
 import { type SkillRef, formatSkillsForPrompt } from "@crewhaus/skills-registry";
 import { type SlashCommand, expand as expandSlash } from "@crewhaus/slash-commands";
 import { type Store, createStore } from "@crewhaus/state-store";
@@ -96,7 +112,12 @@ import { executeTool } from "@crewhaus/tool-executor";
 import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
 import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
 import { storeAndPreview } from "@crewhaus/tool-result-store";
-import { type CostAccrualEvent, TraceEventBus, type Unsubscribe } from "@crewhaus/trace-event-bus";
+import {
+  type CostAccrualEvent,
+  type ModelUsage,
+  TraceEventBus,
+  type Unsubscribe,
+} from "@crewhaus/trace-event-bus";
 import {
   type ToolUseBlock as TsmToolUseBlock,
   type TurnState,
@@ -514,6 +535,38 @@ export {
 } from "@crewhaus/adapter-anthropic";
 export type { ResolvedAuth } from "@crewhaus/adapter-anthropic";
 
+// G12 — the platform-neutral loop core lives in `@crewhaus/worker-runtime`
+// (imports no `node:*`); runtime-core CONSUMES it, re-exports its contract as
+// the single source of truth, and supplies the NODE `WorkerPlatform` impl
+// (`./worker-platform`). `runChatLoop`'s own node-coupled services
+// (event-log, session-store, compaction, recovery, audit sinks) wrap this
+// shared core; the three cf-worker emitters call `runWorkerLoop` directly
+// with a stateless platform. These re-exports are purely additive — every
+// existing `runChatLoop` / `RunChatLoopOptions` consumer is unchanged.
+export { createInMemoryKV, createNodeWorkerPlatform } from "./worker-platform";
+export {
+  createEdgeAnthropicAdapter,
+  classifyEdgeTool,
+  EDGE_SAFE_TOOLS,
+  HOST_ONLY_TOOLS,
+  isEdgeSafeTool,
+  partitionEdgeTools,
+  runWorkerLoop,
+} from "@crewhaus/worker-runtime";
+export type {
+  EdgeToolPartition,
+  EdgeToolVerdict,
+  KVLike,
+  RunWorkerLoopOptions,
+  TraceSink as WorkerTraceSink,
+  WorkerLimits,
+  WorkerLoopResult,
+  WorkerPlatform,
+  WorkerStopReason,
+  WorkerThinking,
+  WorkerTraceEvent,
+} from "@crewhaus/worker-runtime";
+
 // Ops item 36 — boot-time self-heal janitor for daemon shapes. Lives in its
 // own module (`./janitor`) but is re-exported here because emitted bundles
 // only import the package root.
@@ -531,6 +584,34 @@ export type {
   JanitorStepResult,
   JanitorStepStatus,
 } from "./janitor";
+
+// Loop contract 0.4 (Batch C, item 4) — agent identity generation. Lives in
+// its own module (`./identity`) but is re-exported here because emitted
+// bundles and the CLI only import the package root. The CLI calls
+// `loadOrCreateAgentIdentity()` at boot and threads the resulting `agentId`
+// into `RunChatLoopOptions.agentId` (and onto any bus it constructs itself).
+export {
+  AGENT_IDENTITY_SCHEMA_VERSION,
+  DEFAULT_IDENTITY_DIR,
+  IDENTITY_FILENAME,
+  agentFingerprint,
+  loadOrCreateAgentIdentity,
+} from "./identity";
+export type { AgentIdentityFile } from "./identity";
+
+// Loop contract 0.4 (Batch C, G11) — the pending-approval persistence seam is
+// owned by `@crewhaus/session-store`; re-exported here so the CLI/codegen can
+// build the store + input hash it passes as `RunChatLoopOptions.approvals`
+// without depending on session-store directly.
+export {
+  type ApprovalDecision,
+  type PendingApproval,
+  type PendingApprovalStore,
+  type PendingApprovalStoreOptions,
+  createPendingApprovalStore,
+  generateApprovalId,
+  hashApprovalInput,
+} from "@crewhaus/session-store";
 
 // Ops item 31 — alert watchdog seams re-exported so the CLI/codegen can build
 // the durable + off-box alert sink (audit append + settings.json alert hook /
@@ -721,6 +802,74 @@ export type EgressAuditSink = {
   }): Promise<unknown>;
 };
 
+/**
+ * Loop contract 0.4 (G02) — the observable output of ONE completed
+ * user→assistant turn, handed to the injected in-loop evaluator. A "turn"
+ * here is the whole tool inner-loop until the state machine reaches Done —
+ * the evaluator NEVER sees tool-only intermediate iterations.
+ */
+export type EvaluationTurn = {
+  /**
+   * Concatenated text of the terminal assistant message (`""` when the
+   * turn produced no text blocks). This is exactly the string a
+   * `singleTurn` run returns to its caller.
+   */
+  readonly finalText: string;
+  /**
+   * The full conversation history as of turn completion (read-only view —
+   * evaluators must not mutate it; the runtime owns the array).
+   */
+  readonly messages: ReadonlyArray<Anthropic.MessageParam>;
+  /**
+   * Aggregate token usage across every MAIN-turn model call this attempt
+   * made (all tool iterations included; compaction/judge side-calls are
+   * not main-turn calls and are excluded). On an evaluation-triggered
+   * retry the re-run attempt gets a fresh accumulator, so each `evaluate`
+   * invocation sees the usage of exactly the attempt it is grading.
+   */
+  readonly usage: ModelUsage;
+};
+
+/** The injected grader's verdict for one graded attempt. */
+export type EvaluationResult = {
+  /** Score in [0,1]; compared against `threshold` (>= passes). A non-finite
+   *  score is treated as 0 (fail) defensively. */
+  readonly score: number;
+  /** Grader explanation; appended to the retry nudge when `onFail: "retry"`. */
+  readonly rationale?: string;
+};
+
+/**
+ * Loop contract 0.4 (G02) — the in-loop evaluation seam (spec
+ * `evaluation:` on cli/channel/managed). See
+ * {@link RunChatLoopOptions.evaluation} for semantics.
+ */
+export type RunEvaluation = {
+  /**
+   * The grader, INJECTED by the caller (target emitters construct it from
+   * the IR's `evaluation.grader` — an llm_judge side-call or a
+   * deterministic contains/regex check). runtime-core never constructs a
+   * judge itself, so it gains no eval dependency. A grader that throws is
+   * treated as grading INFRASTRUCTURE failure, not a verdict: the error is
+   * logged (`error` event) and the turn stands un-gated (fail-open) — a
+   * flaky judge model must not kill an otherwise healthy run.
+   */
+  readonly evaluate: (turn: EvaluationTurn) => Promise<EvaluationResult>;
+  /** Passing bar: `score >= threshold` passes. (The compiler resolves the
+   *  spec default: 0.7 for llm_judge; deterministic graders use 1.) */
+  readonly threshold: number;
+  /** What a failing verdict does — see the option docblock. */
+  readonly onFail: "retry" | "halt" | "note";
+  /** Hard cap on evaluation-triggered re-runs (>= 0; resolved default 1). */
+  readonly maxRetries: number;
+  /**
+   * Which grader kind produced the score — stamped verbatim onto every
+   * `eval_graded` trace event (the event field is required, and only the
+   * caller knows what it built `evaluate` from).
+   */
+  readonly graderType: "llm_judge" | "contains" | "regex";
+};
+
 export type RunChatLoopOptions = {
   model: string;
   instructions: string;
@@ -769,6 +918,23 @@ export type RunChatLoopOptions = {
   input?: NodeJS.ReadableStream;
   /** Tools the model may invoke. When empty/undefined, tools are not advertised. */
   tools?: ReadonlyArray<RegisteredTool>;
+  /**
+   * Item 3 (G32) — plugin-contributed pieces to fold into this run. The caller
+   * activates the spec's `plugins:` list (or the `--plugins` override) via
+   * `@crewhaus/plugin-loader`'s `activatePlugins` and passes the result here.
+   *
+   * Only `tools` are the chat loop's to bind: they are APPENDED to `opts.tools`
+   * and advertised to the model, with first-party tools winning any name
+   * collision (a plugin can augment the catalog but not silently shadow a
+   * built-in). The other contribution kinds bind at their own hosts — channels
+   * at the channel daemon, models at the model-router, graders at the eval
+   * stack, target emitters at the compiler — so they are deliberately not
+   * accepted here. A compiled bundle instead registers plugin tools directly on
+   * its `defaultCatalog`; this option is the interpreter path's equivalent so a
+   * `runChatLoop` caller need not mutate a global catalog. Absent → the run is
+   * byte-identical to a pre-G32 runtime.
+   */
+  plugins?: { readonly tools?: ReadonlyArray<RegisteredTool> };
   /** Per-run identity, abort signal, and logger. Defaults to a fresh `createRunContext()`. */
   runContext?: RunContext;
   /** Context-window limit in tokens. Defaults to 200_000 (Claude opus/sonnet 4.x). */
@@ -893,6 +1059,49 @@ export type RunChatLoopOptions = {
     /** Invoked at teardown with the completed user-text turn count and the
      *  run's session id (so the callback can read the transcript to summarize). */
     readonly onCapture?: (completedTurns: number, sessionId: string) => Promise<void>;
+    /**
+     * Loop contract 0.4 (Batch E, G21) — WHEN auto-recall runs, lowered from
+     * `IrMemory.recallMode`. `"session-start"` (the implicit default) recalls
+     * ONCE at boot into the frozen, cache-marked system prefix — the pre-0.4
+     * behaviour. `"per-turn"` instead re-runs `recall` against the LATEST user
+     * message every `refreshEvery` turns and swaps a VOLATILE recalled block
+     * that sits in the mutable tail region (alongside the continuity tail),
+     * NEVER re-injecting into the frozen cache prefix — so a long daemon's
+     * recalled evidence tracks the conversation instead of drifting from a
+     * stale boot-time snapshot. Requires `recall` + `autoRecall: true`.
+     */
+    readonly recallMode?: "session-start" | "per-turn";
+    /**
+     * Loop contract 0.4 (Batch E, G21) — turns between per-turn recall
+     * refreshes (`IrMemory.refreshEvery`, int > 0; runtime clamps to >= 1 and
+     * defaults to 1). Only meaningful when `recallMode` is `"per-turn"`.
+     */
+    readonly refreshEvery?: number;
+  };
+  /**
+   * Loop contract 0.4 (Batch E, G19) — the active-context curation pre-pass
+   * (spec `compaction.curate`, lowered from `IrCompaction`; presence GATES the
+   * pass). Once the pre-turn compaction ladder decides the context is already
+   * approaching the limit, the runtime runs `@crewhaus/compaction-curator`
+   * BEFORE snip→autocompact: it drops semantically-duplicate transcript
+   * messages (embedding cosine when an `embedder` is injected, a BM25-family
+   * lexical fallback when not) and — when `relevanceTopK` is set — keeps only
+   * the top-K most relevant to the latest user message, re-sorted back into
+   * transcript order (the curator's relevance ranking SELECTS survivors; it
+   * never scrambles the conversation, and messages carrying tool_use/tool_result
+   * pairs or inside the snip-protected head/tail are never touched). When the
+   * pass frees enough headroom the expensive summarizer call is skipped
+   * entirely. Every pass publishes a `curate` trace event
+   * (`before`/`after`/`dropped`/`bytesSaved`/`embedded`). The embedder is
+   * INJECTED (runtime-core carries no embedder dependency): callers resolve it
+   * from `memory.embedder ?? memory.wiki.embedder`; absent → lexical dedupe
+   * (`embedded: false`). Absent block → no curation, byte-identical to a
+   * pre-0.4 runtime.
+   */
+  curate?: {
+    readonly embedder?: EmbedderFn;
+    readonly dedupeThreshold?: number;
+    readonly relevanceTopK?: number;
   };
   /**
    * v0.3.0 Goal 1 — the continuity seam (§2.3 requirements ledger, §2.5
@@ -1274,6 +1483,187 @@ export type RunChatLoopOptions = {
       | { readonly kind: "stop" }
       | { readonly kind: "degrade"; readonly model: string };
   };
+  /**
+   * Loop contract 0.4 (G10) — whole-run wall-clock ceiling in ms (spec
+   * `limits.deadline_ms`). Armed once at loop start; on fire it aborts the
+   * ROOT of the abort tree (`runAbort`) with a branded reason, the in-flight
+   * turn winds down through the normal cancellation paths, and the run ends
+   * with a classified `run_failed` (class `"timeout"`, exit
+   * `EXIT_CODES.timeout`) + `RunFailedError` throw — in REPL mode too (a
+   * deadline is terminal everywhere, including while idle at the prompt).
+   * Absent → no timer (zero behaviour change).
+   */
+  deadlineMs?: number;
+  /**
+   * Loop contract 0.4 (G10) — per-turn wall-clock ceiling in ms (spec
+   * `limits.turn_timeout_ms`). Armed when a user→assistant turn starts and
+   * cleared when it ends; on fire it aborts the TURN (`turnAbort`) with a
+   * branded reason, cancelling the in-flight model call / tool children.
+   * In `singleTurn` mode the turn IS the run, so the stop is terminal:
+   * classified `run_failed` (class `"timeout"`) + `RunFailedError`. In REPL
+   * mode it mirrors the first-SIGINT semantics — the turn aborts with a
+   * printed notice and an `error` event (name `"TurnTimeout"`), and the
+   * session continues at the prompt (no `run_failed`: the run didn't end).
+   */
+  turnTimeoutMs?: number;
+  /**
+   * Loop contract 0.4 (G10) — per-model-call wall-clock ceiling in ms (spec
+   * `limits.model_call_timeout_ms`), the hung-stream watchdog. Re-armed
+   * before EVERY main-turn stream and cleared when the stream drains; on
+   * fire it aborts the turn (`turnAbort` — the turn cannot proceed without
+   * its model call) with a branded reason. Terminal/REPL posture identical
+   * to `turnTimeoutMs` (error-event name `"ModelCallTimeout"`). Note: under
+   * `streaming: true` the drain overlaps mid-stream tool dispatch, so the
+   * window covers those tools too — use `turnTimeoutMs` for tool-inclusive
+   * bounds and keep this one comfortably above normal stream latency.
+   */
+  modelCallTimeoutMs?: number;
+  /**
+   * Loop contract 0.4 (G27) — tool-loop detection tuning + escalation
+   * ladder (spec `limits.loop_detection`). `window`/`threshold` thread to
+   * `@crewhaus/tool-loop-detection.detectLoop` (defaults 10 / 3). The
+   * detector now has a NEAR-DUPLICATE tier — same tool, inputs identical
+   * after volatile-substring stripping (numbers/UUIDs/hashes/whitespace),
+   * counted at reduced weight — so trivial argument churn no longer defeats
+   * it. `escalation` picks what happens when a signature trips detection
+   * AGAIN after its one-time warning was ignored:
+   *   - `"warn"` (default) — nothing further; byte-identical to the pre-0.4
+   *     warn-once behaviour.
+   *   - `"justify"` — inject a requireJustification-STYLE demand as a
+   *     synthetic user message: the model must state a one-sentence
+   *     justification tied to the session goal before repeating the call.
+   *     (Deliberately NOT the permission-engine justification gate: that
+   *     gate is a per-tool-descriptor compile-time contract whose schema
+   *     advertises a `justification` input field — retrofitting descriptors
+   *     mid-run would change the advertised tool schema under the model.
+   *     The synthetic nudge is the proportionate in-band mechanism.)
+   *   - `"abort"` — abort the TURN, ToolLoopLimit-style: an `error` event
+   *     (name `"ToolLoopAbort"`) is logged and the state machine takes the
+   *     Aborted transition, exactly like the `maxToolIterations` cap.
+   */
+  loopDetection?: {
+    readonly window?: number;
+    readonly threshold?: number;
+    readonly escalation?: "warn" | "justify" | "abort";
+  };
+  /**
+   * Loop contract 0.4 (G17) — per-tool rate limits (spec
+   * `agent.rate_limits`): tool name (or `"*"` for the every-tool default)
+   * → sustained `rpm` + optional short-burst allowance. At loop start the
+   * runtime builds a `@crewhaus/rate-limiter` with one token bucket per
+   * entry (`refillPerSec = rpm/60`, `capacity = burst ?? rpm`) and every
+   * tool execution acquires `tool:<name>` BEFORE dispatch (after the
+   * permission/justification/egress gates, so denied calls never consume
+   * tokens). Tools with neither a named bucket nor a `"*"` default are not
+   * gated. An acquire that exhausts the limiter's wait budget fails just
+   * that call with an `is_error` tool_result (`[rate-limited] …`) so the
+   * model can adapt — it never kills the run. Independent of the
+   * model-call `rateLimiter`/`rateLimitKeys` pair above.
+   */
+  rateLimits?: Readonly<Record<string, { readonly rpm: number; readonly burst?: number }>>;
+  /**
+   * Loop contract 0.4 (G01) — extended thinking for every MAIN-TURN model
+   * stream (spec `thinking`; same two forms as `IrThinking`). Compaction
+   * and judge side-calls are deliberately untouched — they build their own
+   * `ProviderRequest`s and summarization/grading gains nothing from
+   * spending thinking tokens.
+   *   - `{ budgetTokens }` → `ProviderRequest.thinking =
+   *     { type: "enabled", budget_tokens }` verbatim.
+   *   - `{ effort }` → BOTH fields are set: `thinking` converted through
+   *     `EFFORT_THINKING_BUDGET_TOKENS` (for budget-style providers:
+   *     anthropic/bedrock/gemini) AND `reasoningEffort` passed through (for
+   *     native-effort providers: openai). Adapters ignore the field they
+   *     don't support; anthropic's translate gives an explicit `thinking`
+   *     precedence, so setting both is convergent.
+   * When the resolved budget crowds out the output budget (Anthropic
+   * requires `max_tokens > thinking.budget_tokens`), the per-request token
+   * ceiling is lifted to `budget + maxTokens` so the declared output budget
+   * survives intact (logged once at boot).
+   */
+  thinking?: { readonly budgetTokens: number } | { readonly effort: "low" | "medium" | "high" };
+  /**
+   * Loop contract 0.4 (G02) — in-loop evaluation of every COMPLETED turn
+   * (spec `evaluation:` on cli/channel/managed; both `singleTurn` and REPL
+   * paths). After the turn's tool inner-loop reaches Done — never on a
+   * tool-only intermediate iteration — the injected `evaluate` grades the
+   * terminal assistant text and one `eval_graded` trace event is published
+   * per grading pass (`retryIndex` 0 for the original attempt, n for the
+   * n-th evaluation-triggered retry). On `score < threshold`:
+   *
+   *  - `onFail: "retry"` — the grader rationale is appended to history as a
+   *    synthetic corrective user message (event-logged `synthetic: true`,
+   *    like the recovery/loop nudges) and the turn re-runs, up to
+   *    `maxRetries` times. Each re-run makes REAL model calls, so its spend
+   *    accrues through the existing cost path (`model_response` → budget
+   *    meter) and counts against `budget:` exactly like any other call.
+   *    Retries exhausted → the last attempt stands and the run continues
+   *    (the failing verdict trail is on the trace bus).
+   *  - `onFail: "halt"` — classified terminal stop: `run_failed` (class
+   *    `"evaluation"`, exit {@link EXIT_CODES.evaluation}) is published +
+   *    event-logged and the matching `RunFailedError` is thrown, in REPL
+   *    mode too (a quality-floor halt is terminal everywhere).
+   *  - `onFail: "note"` — the failing `eval_graded` event is the whole
+   *    story; the turn stands and the run continues.
+   *
+   * A turn that ABORTED (SIGINT / wall-clock timer) never completed, so it
+   * is not evaluated. Absent → zero behaviour change for existing callers.
+   */
+  evaluation?: RunEvaluation;
+  /**
+   * Loop contract 0.4 (Batch C, item 4) — the publishing agent's identity
+   * fingerprint (the `agentId` from `loadOrCreateAgentIdentity`). When set AND
+   * runChatLoop constructs the run context itself (no `opts.runContext`), the
+   * run's `TraceEventBus` is built with this `agentId` so every trace envelope
+   * carries it and audit sinks can attribute the run to one agent. When the
+   * caller supplies `opts.runContext`, they own `agentId` on its bus (a
+   * sub-agent spawner threads the parent's `agentId` into the child bus) and
+   * this field is ignored — matching how `runContext` overrides the other
+   * per-run construction inputs. Absent → no stamping (byte-identical to a
+   * pre-0.4 runtime).
+   */
+  agentId?: string;
+  /**
+   * Loop contract 0.4 (Batch C, G11) — how a tool permission that resolves to
+   * `ask` behaves on a NON-interactive surface (`permissions.ask_mode`,
+   * lowered from the IR; absent ⇒ `"pause"`):
+   *   - `"pause"` (default) — WITH an `approvals` store, PARK the run: persist
+   *     a `PendingApproval`, publish `approval_requested`, and end with the
+   *     `approval_pending` failure class so the call can be granted/denied out
+   *     of band and re-resolved on the next execution. WITHOUT an `approvals`
+   *     store there is nowhere to park, so it collapses to the pre-0.4 deny.
+   *   - `"deny"` — the pre-0.4 collapse-in-place: the ask denies immediately
+   *     with a note (never parks), regardless of any `approvals` store.
+   * The interactive REPL path is unaffected either way — an `ask` there always
+   * prompts on stdin.
+   */
+  askMode?: "pause" | "deny";
+  /**
+   * Loop contract 0.4 (Batch C, G11) — the pending-approval seam. When
+   * supplied AND `askMode` is `"pause"` (the default), a headless `ask`
+   * consults `store.get(toolName, inputHash)`:
+   *   - a `"grant"` → allow this ONE call (the grant is one-shot: consumed via
+   *     `store.persist`, so a later identical call re-asks);
+   *   - a `"deny"` → deny with a note;
+   *   - nothing yet → persist a fresh `PendingApproval`, fire `notify` (if
+   *     given), publish `approval_requested`, and PARK the run.
+   * The store is injected (the CLI builds `createPendingApprovalStore`); the
+   * `surface` classifier stamps the `approval_requested` event (defaults to
+   * `"single-turn"` under `singleTurn`, else `"headless"`). Omitted → no
+   * parking (headless `ask` collapses to the pre-0.4 deny).
+   */
+  approvals?: {
+    /**
+     * The persistence seam. Only `{ persist, get, resolve }` are contracted;
+     * the runtime calls `get` (look up a prior decision) and `persist` (park a
+     * fresh request / consume a one-shot grant), while `resolve` is the
+     * out-of-band CLI/Slack surface's entry point on the SAME store. Narrowed
+     * from the full `PendingApprovalStore` so a caller may inject a minimal
+     * store; the concrete `createPendingApprovalStore` satisfies it.
+     */
+    readonly store: Pick<PendingApprovalStore, "persist" | "get" | "resolve">;
+    readonly notify?: (approval: PendingApproval) => Promise<void>;
+    readonly surface?: string;
+  };
 };
 
 /**
@@ -1409,7 +1799,102 @@ function poolFingerprint(pool: {
   return `pool-${hash.toString(36)}`;
 }
 
+// ---------------------------------------------------------------------------
+// Loop contract 0.4 (G10) — wall-clock stops. Three configurable timers
+// (`deadlineMs` / `turnTimeoutMs` / `modelCallTimeoutMs`) fire through the
+// EXISTING abort tree (`runAbort` for the deadline, `turnAbort` for the two
+// turn-scoped limits) with a BRANDED abort reason, so the run winds down
+// through the same cancellation paths a SIGINT uses — in-flight model
+// streams reject on their `signal`, tool children cascade — and the loop can
+// afterwards tell a timeout stop from a user abort and classify it.
+// ---------------------------------------------------------------------------
+
+/** Which configured limit fired. `run` = `limits.deadline_ms`,
+ *  `turn` = `limits.turn_timeout_ms`, `model_call` = `limits.model_call_timeout_ms`. */
+export type TimeoutScope = "run" | "turn" | "model_call";
+
+/** The branded abort reason a G10 timer aborts with. Carried on
+ *  `AbortSignal.reason` (the abort tree propagates reasons parent→child, so
+ *  a run-deadline reason is visible on the turn signal too). */
+export type TimeoutAbortReason = {
+  readonly crewhausTimeout: TimeoutScope;
+  readonly limitMs: number;
+};
+
+/** Read the branded timeout reason off an aborted signal, or undefined when
+ *  the signal is not aborted / was aborted for another cause (SIGINT, EOF). */
+export function timeoutAbortReason(signal: AbortSignal): TimeoutAbortReason | undefined {
+  if (!signal.aborted) return undefined;
+  const reason = signal.reason as { crewhausTimeout?: unknown; limitMs?: unknown } | null;
+  if (reason === null || typeof reason !== "object") return undefined;
+  const scope = reason.crewhausTimeout;
+  if (scope !== "run" && scope !== "turn" && scope !== "model_call") return undefined;
+  return {
+    crewhausTimeout: scope,
+    limitMs: typeof reason.limitMs === "number" ? reason.limitMs : 0,
+  };
+}
+
+/** Spec key each scope lowers from — used in detail/remediation copy. */
+const TIMEOUT_SPEC_KEYS: Readonly<Record<TimeoutScope, string>> = {
+  run: "limits.deadline_ms",
+  turn: "limits.turn_timeout_ms",
+  model_call: "limits.model_call_timeout_ms",
+};
+
+const TIMEOUT_TITLES: Readonly<Record<TimeoutScope, string>> = {
+  run: "run deadline exceeded",
+  turn: "turn wall-clock limit exceeded",
+  model_call: "model call wall-clock limit exceeded",
+};
+
+/**
+ * G10 — build the classified terminal report for a fired wall-clock limit.
+ * `class: "timeout"` / exit {@link EXIT_CODES.timeout} joins the failure
+ * taxonomy beside `crewhaus_budget`: like the spend cap, the stop was
+ * CrewHaus's OWN configured ceiling, not a provider failure. Exported for
+ * emitters/tests that render or assert on the report.
+ */
+export function buildTimeoutFailureReport(timeout: TimeoutAbortReason): FailureReport {
+  const scope = timeout.crewhausTimeout;
+  return {
+    class: "timeout",
+    title: TIMEOUT_TITLES[scope],
+    detail: `the configured ${TIMEOUT_SPEC_KEYS[scope]} (${timeout.limitMs}ms) elapsed before the ${
+      scope === "run" ? "run" : scope === "turn" ? "turn" : "model call"
+    } completed`,
+    remediation: `raise ${TIMEOUT_SPEC_KEYS[scope]} in the spec's limits block (or remove it), then rerun.`,
+    exitCode: EXIT_CODES.timeout,
+  };
+}
+
+/**
+ * Item 3 (G32) — merge plugin-contributed tools into the run's advertised tool
+ * set. First-party `base` tools WIN any name collision, so an activated plugin
+ * can augment the catalog but never silently shadow a built-in. Returns the
+ * `base` array unchanged (same reference) when there are no plugin tools, so a
+ * run without the `plugins` option is byte-identical to a pre-G32 runtime.
+ */
+function mergeEffectiveTools(
+  base: ReadonlyArray<RegisteredTool>,
+  pluginTools: ReadonlyArray<RegisteredTool> | undefined,
+): ReadonlyArray<RegisteredTool> {
+  if (pluginTools === undefined || pluginTools.length === 0) return base;
+  const byName = new Set(base.map((t) => t.name));
+  const merged: RegisteredTool[] = [...base];
+  for (const tool of pluginTools) {
+    if (byName.has(tool.name)) continue; // first-party wins the collision
+    byName.add(tool.name);
+    merged.push(tool);
+  }
+  return merged;
+}
+
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
+  // Item 3 (G32) — resolve the advertised tool set ONCE, up front, folding in
+  // any plugin-contributed tools so the tool-capable-model feature gate and the
+  // per-turn advertisement below read the same list.
+  const effectiveTools = mergeEffectiveTools(opts.tools ?? [], opts.plugins?.tools);
   // Pillar 3 — make the model-backed Layer-3 classifier reachable at EVERY
   // trust boundary (MCP / sub-agent / channel / federation / skill /
   // compaction / chain / orchestrator). Boundary call sites don't thread an
@@ -1500,7 +1985,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // adapter that doesn't speak tool use (e.g. Bedrock Llama/Mistral
   // families). Fail with a clear ConfigError naming the model instead of
   // letting the provider 400 (or silently drop the tools) mid-run.
-  if ((opts.tools ?? []).length > 0 && adapter.features.tool_use === false) {
+  if (effectiveTools.length > 0 && adapter.features.tool_use === false) {
     throw new ConfigError(
       `model "${opts.model}" (provider ${providerId}) does not support tool use — remove tools or pick a tool-capable model`,
     );
@@ -1552,6 +2037,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // signal). Persists across `runOneTurn` calls; 0 on the first turn.
   let priorTurnToolUseCount = 0;
 
+  // Item 4 / G28 — the provider's ACTUAL input_tokens (input + cache read +
+  // cache create) from the MOST RECENT `model_response`. Updated after every
+  // main-turn model call; feeds the pre-turn compaction trigger and the
+  // tier/pool routing `contextTokens` signal a real count instead of the
+  // chars/4 heuristic. `undefined` before the first response — the heuristic
+  // is used only pre-first-call.
+  let lastModelInputTokens: number | undefined;
+  /** The context-size signal for routing/compaction: the provider's real
+   *  last-call input_tokens once available, else the chars/4 estimate. */
+  const contextTokenSignal = (msgs: ReadonlyArray<Anthropic.MessageParam>): number =>
+    lastModelInputTokens ?? estimateTokens(msgs);
+
   // Default model max OUTPUT tokens for one turn. Callers thread the spec's
   // `agent.max_tokens` here when set (the CLI target's codegen + apps/cli);
   // this fallback applies when the spec is silent. Kept comfortably above the
@@ -1561,6 +2058,42 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // `max_tokens` recovery + `sanitizeOrphanToolUses`), but a higher ceiling
   // avoids the churn. Raise it per spec with `agent.max_tokens`.
   const maxTokens = opts.maxTokens ?? 8192;
+
+  // G01 — resolve the extended-thinking request fields ONCE at boot. The
+  // budget form maps verbatim; the effort form sets BOTH `thinking`
+  // (converted through the shared preset table for budget-style providers)
+  // and `reasoningEffort` (passed through for native-effort providers) —
+  // adapters ignore whichever field they don't support, and anthropic's
+  // translate gives the explicit `thinking` precedence, so the two agree.
+  const thinkingRequest:
+    | {
+        readonly thinking: { readonly type: "enabled"; readonly budgetTokens: number };
+        readonly reasoningEffort?: ReasoningEffort;
+      }
+    | undefined =
+    opts.thinking === undefined
+      ? undefined
+      : "budgetTokens" in opts.thinking
+        ? { thinking: { type: "enabled", budgetTokens: opts.thinking.budgetTokens } }
+        : {
+            thinking: {
+              type: "enabled",
+              budgetTokens: EFFORT_THINKING_BUDGET_TOKENS[opts.thinking.effort],
+            },
+            reasoningEffort: opts.thinking.effort,
+          };
+  // Anthropic (and the other budget-style providers) require
+  // `max_tokens > thinking.budget_tokens` — thinking tokens spend from the
+  // same output ceiling. When the configured budget crowds the ceiling out,
+  // lift the per-request ceiling to `budget + maxTokens` so the declared
+  // output budget survives intact instead of 400-ing every call (e.g.
+  // `effort: high` = 24576 over the 8192 default). The spec-declared
+  // `maxTokens` stays the bridge/sub-agent value — only main-turn requests
+  // (the only ones that carry `thinking`) use the lifted ceiling.
+  const effectiveMaxTokens =
+    thinkingRequest !== undefined && thinkingRequest.thinking.budgetTokens >= maxTokens
+      ? thinkingRequest.thinking.budgetTokens + maxTokens
+      : maxTokens;
 
   // Mutual exclusion: resume takes priority and replaces any seedMessages
   // in REPL mode (the resume payload becomes the seed). Section 12 carves
@@ -1740,7 +2273,31 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // sessionId; otherwise build a fresh context bound to that sessionId.
   // Tests that pass their own runContext rely on observing turnNumber on
   // it after the loop returns, so we never silently swap it out.
-  const runContext: RunContext = opts.runContext ?? createRunContext({ sessionId });
+  //
+  // Loop contract 0.4 (Batch C, item 4) — when the caller supplies an
+  // `agentId` and lets runChatLoop own the context, build the bus with that
+  // identity so `envelope()` stamps every trace event with it. runId is minted
+  // here (matching run-context's `run_<8 hex>` shape) and threaded into BOTH
+  // the bus and the context so their ids stay coherent. When `opts.runContext`
+  // is supplied the caller owns `agentId` on its bus, so this is skipped.
+  const runContext: RunContext =
+    opts.runContext ??
+    (opts.agentId !== undefined
+      ? (() => {
+          const runId = `run_${randomUUID().slice(0, 8)}`;
+          const eventBus = new TraceEventBus({ runId, sessionId, agentId: opts.agentId });
+          return createRunContext({ runId, sessionId, eventBus });
+        })()
+      : createRunContext({ sessionId }));
+
+  // G01 — surface the max-tokens lift once, at boot (see `effectiveMaxTokens`).
+  if (effectiveMaxTokens !== maxTokens) {
+    runContext.logger.info("thinking budget >= max_tokens — lifting the per-request ceiling", {
+      thinkingBudgetTokens: thinkingRequest?.thinking.budgetTokens,
+      maxTokens,
+      effectiveMaxTokens,
+    });
+  }
 
   // Adaptive model routing — ε-greedy exploration seed. A spec-fixed
   // `learning.seed` reproduces exploration across runs (tests); otherwise the
@@ -1754,7 +2311,6 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // mints a no-subscriber bus; here we attach the env-gated set so a fresh
   // run with `OTEL_EXPORTER_OTLP_ENDPOINT` set automatically exports.
   const bus: TraceEventBus = runContext.eventBus;
-  void TraceEventBus; // keep type import alive for future direct constructions
   // Item 22 — re-point the failover chain's late-bound bus getter at the
   // run's real bus (see the chain construction above): the chain and its
   // per-candidate breakers publish model_failover / circuit_state_changed
@@ -2172,6 +2728,29 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const compactionThreshold = opts.compactionThreshold ?? DEFAULT_COMPACTION_THRESHOLD;
   const snipKeepHead = opts.snipKeepHead ?? DEFAULT_SNIP_KEEP_HEAD;
   const snipKeepTail = opts.snipKeepTail ?? DEFAULT_SNIP_KEEP_TAIL;
+
+  // Item 1 / G19 — active-context curation config (present ⇒ the pre-pass
+  // runs, gated by the emitter on `ir.compaction.curate`) and the shared
+  // extra `maybeCompact` args threaded at both call sites: the injected
+  // curate config, the `curate`-event publisher, and the real-token trigger.
+  const curateConfig: CurateConfig | undefined = opts.curate;
+  const publishCurate = async (info: CurateInfo): Promise<void> => {
+    bus.publish({
+      ...bus.envelope(),
+      kind: "curate",
+      before: info.before,
+      after: info.after,
+      dropped: info.dropped,
+      bytesSaved: info.bytesSaved,
+      embedded: info.embedded,
+    });
+  };
+  /** The extra `maybeCompact` args (Item 1 curation + Item 4 real tokens),
+   *  recomputed per call so `realInputTokens` reflects the newest response. */
+  const compactionExtras = (): Pick<CompactArgs, "realInputTokens" | "curate" | "onCurate"> => ({
+    ...(lastModelInputTokens !== undefined ? { realInputTokens: lastModelInputTokens } : {}),
+    ...(curateConfig !== undefined ? { curate: curateConfig, onCurate: publishCurate } : {}),
+  });
   const permissionMode: PermissionMode = opts.permissionMode ?? "default";
   const permissionRules: RuleSet = opts.permissionRules ?? {
     ...emptyRuleSet,
@@ -2242,35 +2821,31 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         .join(", ")}\n`,
     );
   }
-  // Feature #53 — auto-recall: at session start, pull the top-K relevant
-  // cross-session memories and inject them as a system block, mirroring the
-  // project-memory auto-load above. The caller supplies the `recall` seam
-  // (runtime-core stays independent of memory-store). Best-effort: a recall
-  // failure never aborts the run.
+  // Feature #53 / Item 2 (G21) — cross-session auto-recall. `recallMode`
+  // decides WHERE the recalled evidence lives:
+  //   - "session-start" (default): pull the top-K relevant memories ONCE at
+  //     boot and inject them into the frozen, cache-marked system prefix
+  //     below — the pre-0.4 behaviour.
+  //   - "per-turn": leave the frozen prefix empty and instead refresh a
+  //     VOLATILE recalled block every `refreshEvery` turns (see
+  //     `maybePerTurnRecall`), so a long daemon's evidence tracks the
+  //     conversation instead of drifting from a stale boot-time snapshot.
+  // The caller supplies the `recall` seam (runtime-core stays independent of
+  // memory-store). Best-effort: a recall failure never aborts the run.
+  const recallMode = opts.memory?.recallMode ?? "session-start";
+  const autoRecallOn = opts.memory?.autoRecall === true && opts.memory?.recall !== undefined;
   let memoryRecallBlock: Anthropic.TextBlockParam[] = [];
-  if (opts.memory?.autoRecall === true && opts.memory.recall !== undefined) {
+  if (autoRecallOn && recallMode !== "per-turn" && opts.memory?.recall !== undefined) {
     try {
       const seed = opts.memory.recallSeed ?? opts.instructions;
       const k = opts.memory.recallK ?? 5;
+      // Pillar 3 — a recalled memory can embed content shaped by untrusted
+      // tool output from an earlier session; `renderRecalledMemory` applies
+      // the same delimiter-safety + boundary-classification defenses the
+      // security fabric uses for every other prompt-bound source (#53).
       const lines = await opts.memory.recall(seed, k);
-      if (lines.length > 0) {
-        // Pillar 3 — a recalled memory can embed content shaped by untrusted
-        // tool output from an earlier session, so it is NOT verbatim-safe like
-        // the developer's own repo files. Two defenses, mirroring how the rest
-        // of the security fabric treats injected content:
-        //   1. Delimiter safety — neutralize any `</recalled_memory>` closing
-        //      tag inside a recalled line so a poisoned memory can't break out
-        //      of its block and inject trailing instructions.
-        //   2. Classification — run the assembled block through the SAME
-        //      `classifyBoundary(text, { origin: "user" })` best-effort path
-        //      `loadProjectMemory()` uses (pass policy: classify + emit trace
-        //      events without mutating), so recalled content flows through the
-        //      boundary classifier exactly like every other prompt-bound source.
-        const body = lines
-          .map((l) => `- ${escapeBoundaryDelimiter(l, "recalled_memory")}`)
-          .join("\n");
-        const text = `<recalled_memory>\nRelevant facts remembered from earlier sessions:\n${body}\n</recalled_memory>`;
-        await classifyBoundary(text, { origin: "user" }).catch(() => undefined);
+      const text = await renderRecalledMemory(lines);
+      if (text !== undefined) {
         memoryRecallBlock = [{ type: "text", text, cache_control: { type: "ephemeral" } }];
         process.stdout.write(`[memory] recalled ${lines.length} memory(ies) into the prompt\n`);
       }
@@ -2278,6 +2853,44 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       runContext.logger.warn("memory auto-recall failed", { error: (err as Error).message });
     }
   }
+
+  // Item 2 (G21) — per-turn recall state. The volatile block sits in the
+  // mutable tail region (never the frozen prefix), so swapping it each turn
+  // re-tokenizes only the tail and never busts the cached system prefix. The
+  // refresh cadence counter starts "due" so the first applicable turn recalls.
+  const perTurnRecallEnabled = autoRecallOn && recallMode === "per-turn";
+  const perTurnRefreshEvery = Math.max(1, opts.memory?.refreshEvery ?? 1);
+  let volatileRecallBlocks: Anthropic.TextBlockParam[] = [];
+  let turnsSinceRecall = perTurnRefreshEvery;
+  const maybePerTurnRecall = async (msgs: ReadonlyArray<Anthropic.MessageParam>): Promise<void> => {
+    if (!perTurnRecallEnabled) return;
+    if (turnsSinceRecall < perTurnRefreshEvery) {
+      turnsSinceRecall++;
+      return;
+    }
+    turnsSinceRecall = 1;
+    const recall = opts.memory?.recall;
+    if (recall === undefined) return;
+    // Recall against the LATEST user message (the interactive cadence), falling
+    // back to the seed/instructions when the tail carries no human text.
+    const query = latestUserText(msgs) ?? opts.memory?.recallSeed ?? opts.instructions;
+    const k = opts.memory?.recallK ?? 5;
+    try {
+      const lines = await recall(query, k);
+      const text = await renderRecalledMemory(lines);
+      volatileRecallBlocks = text !== undefined ? [{ type: "text", text }] : [];
+      if (lines.length > 0) {
+        process.stdout.write(
+          `[memory] refreshed ${lines.length} recalled memory(ies) for this turn\n`,
+        );
+      }
+    } catch (err) {
+      // Keep the prior volatile block on a transient recall failure.
+      runContext.logger.warn("per-turn memory recall failed", {
+        error: (err as Error).message,
+      });
+    }
+  };
   // Section 17 — runtime-core no longer prepends the Claude Code OAuth
   // prefix; `adapter-anthropic` handles that internally so each adapter
   // owns its provider-specific auth-shape requirements.
@@ -2336,7 +2949,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     }
   }
 
-  const tools = opts.tools ?? [];
+  const tools = effectiveTools;
   const anthropicTools: Anthropic.Tool[] | undefined =
     tools.length > 0
       ? tools.map((t) => ({
@@ -2347,6 +2960,35 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       : undefined;
   const toolByName = new Map(tools.map((t) => [t.name, t]));
 
+  // G17 — per-tool rate limiter, built once at loop start from the lowered
+  // `agent.rate_limits` map. One token bucket per entry: `rpm` is the
+  // sustained refill (per-minute → per-second), `burst` the instantaneous
+  // capacity (defaults to `rpm`, the standard token-bucket parameterization
+  // where a full window's allowance may burst). The `"*"` key becomes the
+  // limiter's per-dimension `tool:*` default, which `acquire` falls back to
+  // for any tool without a named bucket — each such tool still gets its OWN
+  // bucket instance (state keys on the specific `tool:<name>`), so the
+  // default is a per-tool limit, not one shared pool. `hasToolRateBucket`
+  // gates the acquire call site: tools outside the map (no named entry, no
+  // `"*"`) are not rate-gated at all — the limiter itself is fail-closed on
+  // unknown keys, so the guard is what keeps unlisted tools ungated.
+  const rateLimitEntries = Object.entries(opts.rateLimits ?? {});
+  let toolRateLimiter: RateLimiter | undefined;
+  if (rateLimitEntries.length > 0) {
+    const buckets = new Map<string, BucketConfig>();
+    for (const [name, limit] of rateLimitEntries) {
+      buckets.set(`tool:${name}`, {
+        kind: "token-bucket",
+        capacity: limit.burst ?? limit.rpm,
+        refillPerSec: limit.rpm / 60,
+      });
+    }
+    toolRateLimiter = createRateLimiter({ buckets });
+  }
+  const hasToolRateBucket = (toolName: string): boolean =>
+    opts.rateLimits !== undefined &&
+    (opts.rateLimits[toolName] !== undefined || opts.rateLimits["*"] !== undefined);
+
   // Root abort tree for the whole run; each turn gets a child.
   const runAbort = createAbortTree(runContext.abortSignal);
   // Per-turn abort tree, replaced at the start of each turn so a SIGINT
@@ -2355,18 +2997,117 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Latest error captured from a model call, fed to recover() on entry to NeedRecovery.
   let lastErrorForRecovery: unknown = undefined;
 
+  // -------------------------------------------------------------------------
+  // G10 — wall-clock stop timers. All three fire through the abort tree with
+  // a branded {@link TimeoutAbortReason} so downstream code can tell a
+  // timeout from a SIGINT (`timeoutAbortReason(signal)`), and all three are
+  // torn down via `clearTimeout` on every exit path (per-turn finally + the
+  // mode-level finally) — plus `unref()` so a long pending deadline never
+  // pins the process by itself. The fire callback stops any live spinner
+  // and prints a one-line notice, mirroring the SIGINT handler.
+  // -------------------------------------------------------------------------
+  type Timer = ReturnType<typeof setTimeout>;
+  const fireTimeout = (tree: AbortTree, scope: TimeoutScope, limitMs: number): void => {
+    out.spinner.stop();
+    const noun =
+      scope === "run" ? "run deadline" : scope === "turn" ? "turn timeout" : "model call timeout";
+    out.write(`\n[${noun}: ${limitMs}ms elapsed — aborting]\n`);
+    runContext.logger.warn("wall-clock limit fired", { scope, limitMs });
+    tree.abort({ crewhausTimeout: scope, limitMs } satisfies TimeoutAbortReason);
+  };
+  const armTimer = (tree: AbortTree, scope: TimeoutScope, limitMs: number): Timer => {
+    const timer = setTimeout(() => fireTimeout(tree, scope, limitMs), limitMs);
+    timer.unref();
+    return timer;
+  };
+  let deadlineTimer: Timer | undefined;
+  if (opts.deadlineMs !== undefined && opts.deadlineMs > 0) {
+    deadlineTimer = armTimer(runAbort, "run", opts.deadlineMs);
+  }
+  let turnTimer: Timer | undefined;
+  const armTurnTimer = (): void => {
+    if (opts.turnTimeoutMs === undefined || opts.turnTimeoutMs <= 0) return;
+    turnTimer = armTimer(turnAbort, "turn", opts.turnTimeoutMs);
+  };
+  const clearTurnTimer = (): void => {
+    if (turnTimer !== undefined) clearTimeout(turnTimer);
+    turnTimer = undefined;
+  };
+  let modelCallTimer: Timer | undefined;
+  const armModelCallTimer = (): void => {
+    if (opts.modelCallTimeoutMs === undefined || opts.modelCallTimeoutMs <= 0) return;
+    modelCallTimer = armTimer(turnAbort, "model_call", opts.modelCallTimeoutMs);
+  };
+  const clearModelCallTimer = (): void => {
+    if (modelCallTimer !== undefined) clearTimeout(modelCallTimer);
+    modelCallTimer = undefined;
+  };
+  const clearAllTimers = (): void => {
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+    deadlineTimer = undefined;
+    clearTurnTimer();
+    clearModelCallTimer();
+  };
+
   // Permission-ask prompter. Set in REPL mode after the readline interface
   // exists; remains undefined in single-turn mode (where ask collapses to deny).
   // The initial assignment makes the second assignment legal under biome's
   // `useConst` rule (which fires on exactly-one-assignment lets).
   let askApproval: ((toolName: string, input: unknown) => Promise<boolean>) | undefined = undefined;
 
+  // Loop contract 0.4 (Batch C, G11) — headless ask-approval parking. `askMode`
+  // is the lowered `permissions.ask_mode` (absent ⇒ "pause"); `approvals` is
+  // the injected persistence seam. Parking is active only when BOTH a store is
+  // present AND the mode is "pause" — otherwise a headless `ask` collapses to
+  // the pre-0.4 deny. `approvalSurface` classifies the `approval_requested`
+  // event; it never affects the REPL path (which prompts on stdin).
+  const askMode = opts.askMode ?? "pause";
+  const approvals = opts.approvals;
+  const approvalSurface =
+    approvals?.surface ?? (opts.singleTurn === true ? "single-turn" : "headless");
+
   // Per-run state for tool-loop detection and warning de-dup. Both span
   // turns within a single `runChatLoop` invocation so cross-turn loops
   // (e.g. "keep running date") get caught and warned at most once per
   // signature.
+  //
+  // G27 — `loopSignatureStage` replaces the old warned-signature Set with a
+  // two-stage ladder per signature: first detection → `"warned"` (the
+  // pre-0.4 one-time warning, all escalation modes), a REPEAT detection of
+  // the same signature → the configured escalation (`justify` demand or
+  // turn `abort`), recorded as `"escalated"` so it fires at most once per
+  // signature too. In the default `"warn"` mode the second stage is a
+  // no-op — byte-identical behaviour to the pre-0.4 runtime.
   const toolUseHistory: TsmToolUseBlock[] = [];
-  const warnedLoopSignatures = new Set<string>();
+  const loopSignatureStage = new Map<string, "warned" | "escalated">();
+  const loopEscalation = opts.loopDetection?.escalation ?? "warn";
+
+  // Loop contract 0.4 (Batch C, item 7) — per-tool cost attribution. When a
+  // NON-streaming model response that emitted tool_use blocks is priceable, the
+  // response's cost is split evenly across those calls and stashed here by
+  // tool_use id, then stamped as `attributedCostUsdMicros` on each `tool_use`
+  // event-log record. Keyed by id (unique per call) and consumed (deleted) on
+  // read to bound growth. The streaming path dispatches tools BEFORE the
+  // response's usage is known, so it never populates this map — precisely the
+  // "where the model usage split is computable" boundary: absent ⇒ no field.
+  const toolCostAttribution = new Map<string, number>();
+  // Response cost in USD-micros, or undefined when the served model isn't on the
+  // pricing table (the split is then not computable — no attribution stamped).
+  const responseCostMicros = (
+    provider: ProviderId,
+    wireModelId: string,
+    usage: { input: number; output: number; cacheRead?: number; cacheCreate?: number },
+  ): number | undefined => {
+    const row = resolvePricing(DEFAULT_PRICING, provider, wireModelId);
+    if (row === undefined) return undefined;
+    return computeCostMicros(
+      row,
+      usage.input,
+      usage.output,
+      usage.cacheRead ?? 0,
+      usage.cacheCreate ?? 0,
+    );
+  };
 
   // Working-indicator bookkeeping for tool execution. A single shared spinner
   // serves the whole loop, so the set tracks which tools are mid-flight to
@@ -2407,7 +3148,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // `[tool: …]` line sits cleanly above any animation that follows.
     if (activeToolNames.length === 0) out.spinner.stop();
     out.write(`[tool: ${tu.name}]\n`);
-    await logEvent("tool_use", { id: tu.id, name: tu.name, input: tu.input });
+    // Item 7 — stamp the per-tool cost attribution when the producing response
+    // was priceable (non-streaming path only; see `toolCostAttribution`).
+    // Consume the entry so the map stays bounded across a long run.
+    const attributedCostUsdMicros = toolCostAttribution.get(tu.id);
+    if (attributedCostUsdMicros !== undefined) toolCostAttribution.delete(tu.id);
+    await logEvent("tool_use", {
+      id: tu.id,
+      name: tu.name,
+      input: tu.input,
+      ...(attributedCostUsdMicros !== undefined ? { attributedCostUsdMicros } : {}),
+    });
     const inputBytes = Buffer.byteLength(JSON.stringify(tu.input ?? null), "utf8");
     const toolStartEnvelope = bus.envelope();
     bus.publish({
@@ -2515,20 +3266,86 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       denialMessage = decisionDetails.reason ?? "tool denied by permission policy";
     } else if (decision === "ask") {
       if (askApproval !== undefined) {
+        // Interactive REPL path — unchanged: prompt on stdin.
         approved = await askApproval(tu.name, tu.input);
         if (!approved) denialMessage = "tool denied by user";
+      } else if (approvals !== undefined && askMode === "pause") {
+        // G11 headless parking/resume. Consult the store for a prior decision
+        // on this exact (toolName, inputHash).
+        const inputHash = hashApprovalInput(tu.name, tu.input);
+        const existing = await approvals.store.get(tu.name, inputHash);
+        if (existing?.decision === "grant") {
+          // One-shot allow: consume the grant so a later identical call re-asks.
+          approved = true;
+          await approvals.store.persist({ ...existing, consumedAt: new Date().toISOString() });
+        } else if (existing?.decision === "deny") {
+          approved = false;
+          denialMessage = `tool denied: \`${tu.name}\` approval was denied${
+            existing.decidedBy !== undefined ? ` by ${existing.decidedBy}` : ""
+          }.`;
+        } else {
+          // No decision yet. Reuse an existing pending record for this key
+          // (idempotent re-park across resumed runs) or persist a fresh one,
+          // fire the out-of-band notification, publish `approval_requested`,
+          // and PARK: throw the classified `approval_pending` report. The
+          // NeedTools catch (non-streaming) publishes `run_failed` + rethrows;
+          // the streaming path reaches the same halt through recovery's
+          // classified-report passthrough. On the next execution the store
+          // carries a grant/deny and the call re-resolves pre-decided.
+          const pending: PendingApproval = existing ?? {
+            id: generateApprovalId(),
+            toolName: tu.name,
+            inputHash,
+            input: tu.input,
+            runId: bus.runId,
+            sessionId,
+            surface: approvalSurface,
+            createdAt: new Date().toISOString(),
+          };
+          if (existing === null) await approvals.store.persist(pending);
+          if (approvals.notify !== undefined) {
+            await approvals.notify(pending).catch((err) => {
+              runContext.logger.warn("approvals.notify failed", {
+                approvalId: pending.id,
+                error: (err as Error).message,
+              });
+            });
+          }
+          bus.publish({
+            ...bus.envelope(),
+            kind: "approval_requested",
+            approvalId: pending.id,
+            toolName: tu.name,
+            surface: approvalSurface,
+          });
+          runContext.logger.info("tool approval parked", {
+            approvalId: pending.id,
+            toolName: tu.name,
+            surface: approvalSurface,
+          });
+          throw new RunFailedError({
+            class: "approval_pending",
+            title: "awaiting tool approval",
+            detail: `\`${tu.name}\` requires approval on a non-interactive surface (${approvalSurface}); the run is parked as approval ${pending.id}`,
+            remediation: `grant or deny approval ${pending.id} out of band (e.g. \`crewhaus approvals grant ${pending.id}\`), then rerun`,
+            exitCode: EXIT_CODES.approval_pending,
+          });
+        }
       } else {
+        // Pre-0.4 collapse-to-deny: no interactive surface, and either
+        // `ask_mode: "deny"` or no approvals store is wired to park against.
         denialMessage =
-          `tool denied: \`${tu.name}\` defaulted to "ask" and single-turn mode has no interactive surface to prompt on. ` +
-          `Add an explicit rule to permissions.rules in your spec, e.g. \`{ type: alwaysAllow, pattern: ${tu.name} }\`, or run in REPL mode where "ask" can prompt.`;
+          `tool denied: \`${tu.name}\` defaulted to "ask" and this non-interactive surface has no way to prompt` +
+          `${approvals === undefined ? " (no approvals store wired)" : ' (ask_mode: "deny")'}. ` +
+          `Add an explicit rule to permissions.rules in your spec, e.g. \`{ type: alwaysAllow, pattern: ${tu.name} }\`, run in REPL mode where "ask" can prompt, or set ask_mode: pause with an approvals store to park for out-of-band approval.`;
       }
       // Advisor groundwork (item 14) — event the ask RESOLUTION. The publish
-      // above fired BEFORE the approval prompt (decision "ask", no outcome);
-      // this one fires after `askApproval` resolves — or after the
-      // single-turn fallback collapses the ask to a deny — so offline advice
-      // mining can measure how each tool's prompts are actually answered.
-      // The advisor persistence subscriber (observability.ts) keys on
-      // `askOutcome` to persist exactly this resolved form.
+      // above fired BEFORE the approval resolved (decision "ask", no outcome);
+      // this one fires after the REPL prompt / store decision / collapse
+      // resolves — so offline advice mining can measure how each tool's prompts
+      // are actually answered. The advisor persistence subscriber
+      // (observability.ts) keys on `askOutcome` to persist exactly this resolved
+      // form. Unreached on the PARK path, which throws above.
       bus.publish({
         ...bus.envelope(),
         kind: "permission_decision",
@@ -2717,6 +3534,32 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           content:
             "[egress denied] outbound payload contains content tagged from a non-user origin under a strict-policy sink. " +
             "Inspect the prior tool/sub-agent results that fed this call's input; the egress classifier's `dataLineage` records which boundary site introduced the flagged substring.",
+          is_error: true,
+        });
+      }
+    }
+
+    // G17 — per-tool rate gate. Sits AFTER every deny-capable gate
+    // (permission / justification / egress) so a denied call never burns a
+    // token, and BEFORE dispatch so the pacing wait is what the model
+    // experiences as tool latency. Only tools with a named bucket or under
+    // a `"*"` default are gated (the limiter is fail-closed on unknown
+    // keys, so the guard is what keeps unlisted tools ungated). Exhausting
+    // the limiter's wait budget fails just THIS call with an `is_error`
+    // result the model can adapt to — never the run.
+    if (toolRateLimiter !== undefined && hasToolRateBucket(tu.name)) {
+      try {
+        await toolRateLimiter.acquire([{ dimension: "tool", id: tu.name }], 1);
+      } catch (err) {
+        runContext.logger.warn("tool rate limit exhausted", {
+          toolUseId: tu.id,
+          toolName: tu.name,
+          error: (err as Error).message,
+        });
+        return finish({
+          type: "tool_result",
+          tool_use_id: tu.id,
+          content: `[rate-limited] ${(err as Error).message}. Wait before retrying "${tu.name}", or proceed another way.`,
           is_error: true,
         });
       }
@@ -3010,25 +3853,105 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   }
 
   /**
-   * Convert a freshly-detected loop into a synthetic user message that
-   * nudges the model to break the cycle. Returns `null` if no loop is
-   * currently detected, or if this signature has already produced a
-   * warning earlier in the run.
+   * G27 — evaluate the per-run tool-use history against the loop detector
+   * and walk the escalation ladder. Outcomes:
+   *   - `none` — no loop, or this signature already exhausted its ladder.
+   *   - `message` — a synthetic user message to inject: the one-time
+   *     warning (`stage: "warn"`, all modes — the pre-0.4 behaviour), or
+   *     the justification demand (`stage: "justify"`) when a warned
+   *     signature trips again under `escalation: "justify"`.
+   *   - `abort` — a warned signature tripped again under
+   *     `escalation: "abort"`: the caller aborts the TURN,
+   *     ToolLoopLimit-style (error event + Aborted transition).
+   * The near-duplicate tier flows through the same ladder; its warning copy
+   * names the volatile-stripped grouping so the model understands why
+   * "different" inputs were counted together.
    */
-  function maybeBuildLoopWarning(): Anthropic.MessageParam | null {
-    const detection: LoopDetection | null = detectLoop(toolUseHistory);
-    if (detection === null) return null;
-    if (warnedLoopSignatures.has(detection.signature)) return null;
-    warnedLoopSignatures.add(detection.signature);
-    runContext.logger.warn("tool loop detected", {
-      signature: detection.signature,
-      toolName: detection.toolName,
-      count: detection.count,
+  type LoopOutcome =
+    | { readonly kind: "none" }
+    | {
+        readonly kind: "message";
+        readonly stage: "warn" | "justify";
+        readonly message: Anthropic.MessageParam;
+        readonly detection: LoopDetection;
+      }
+    | { readonly kind: "abort"; readonly detection: LoopDetection };
+
+  function evaluateToolLoop(): LoopOutcome {
+    const detection: LoopDetection | null = detectLoop(
+      toolUseHistory,
+      opts.loopDetection?.window,
+      opts.loopDetection?.threshold,
+    );
+    if (detection === null) return { kind: "none" };
+    const stage = loopSignatureStage.get(detection.signature);
+    if (stage === undefined) {
+      loopSignatureStage.set(detection.signature, "warned");
+      runContext.logger.warn("tool loop detected", {
+        signature: detection.signature,
+        toolName: detection.toolName,
+        count: detection.count,
+        tier: detection.tier,
+        escalation: loopEscalation,
+      });
+      const how =
+        detection.tier === "exact"
+          ? "with the same input"
+          : "with near-identical inputs (differing only in numbers/ids)";
+      return {
+        kind: "message",
+        stage: "warn",
+        detection,
+        message: {
+          role: "user",
+          content: `[runtime] possible loop detected: tool "${detection.toolName}" has been called ${detection.count} times ${how} within the last ${detection.windowSize} calls. Reconsider before repeating; respond with a different approach or final text.`,
+        },
+      };
+    }
+    if (stage !== "warned") return { kind: "none" };
+    if (loopEscalation === "justify") {
+      loopSignatureStage.set(detection.signature, "escalated");
+      runContext.logger.warn("tool loop persists — demanding justification", {
+        signature: detection.signature,
+        toolName: detection.toolName,
+        count: detection.count,
+        tier: detection.tier,
+      });
+      return {
+        kind: "message",
+        stage: "justify",
+        detection,
+        message: {
+          role: "user",
+          content: `[runtime] the loop on tool "${detection.toolName}" persists after a warning. Before calling "${detection.toolName}" again you MUST state, in one sentence, a justification tying the repeat to the session goal and the NEW outcome you expect (the same discipline requireJustification-gated tools demand). If you cannot, do not repeat the call — take a different approach or answer with final text.`,
+        },
+      };
+    }
+    if (loopEscalation === "abort") {
+      loopSignatureStage.set(detection.signature, "escalated");
+      return { kind: "abort", detection };
+    }
+    // escalation "warn" — the warning already fired once; stay quiet.
+    return { kind: "none" };
+  }
+
+  /**
+   * G27 `escalation: "abort"` bookkeeping — the ToolLoopLimit-style
+   * classified error record (named `error` event + logger line), shared by
+   * the streaming and non-streaming tool-batch call sites. The caller takes
+   * the `Aborted` state transition itself (the two sites sit at different
+   * points in the state machine).
+   */
+  async function recordLoopAbort(detection: LoopDetection): Promise<void> {
+    await logEvent("error", {
+      name: "ToolLoopAbort",
+      message: `aborting turn: tool "${detection.toolName}" still looping (${detection.count}x in the last ${detection.windowSize} calls) after a warning — limits.loop_detection.escalation is "abort"`,
     });
-    return {
-      role: "user",
-      content: `[runtime] possible loop detected: tool "${detection.toolName}" has been called ${detection.count} times with the same input within the last ${detection.windowSize} calls. Reconsider before repeating; respond with a different approach or final text.`,
-    };
+    runContext.logger.error("tool loop escalation — aborting turn", {
+      toolName: detection.toolName,
+      signature: detection.signature,
+      tier: detection.tier,
+    });
   }
 
   /**
@@ -3037,11 +3960,71 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    * Returns the final assistant content blocks so callers can extract
    * text. Closes over client/model/maxTokens/etc.
    */
+  // v0.3.0 Goal 6 — one structured report on every terminal path, published
+  // to the bus AND appended to the session event log BEFORE the throw (a
+  // throw is invisible to structured consumers; the event is what the UI
+  // host, printers, exporters, and incident capture render). Used by the
+  // recovery `halt`/`fail` arms, the §7.1 sub-agent escalation path in
+  // `NeedTools`, and (G10) the wall-clock timeout stops — including the REPL
+  // deadline-at-prompt path, which is why this lives at run scope rather
+  // than inside `runOneTurn`.
+  const publishRunFailed = async (report: FailureReport): Promise<void> => {
+    const failureMessage = `${report.title}: ${report.detail}`;
+    bus.publish({
+      ...bus.envelope(),
+      kind: "run_failed",
+      class: report.class,
+      message: failureMessage,
+      ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
+      exitCode: report.exitCode,
+    });
+    await logEvent("run_failed", {
+      class: report.class,
+      message: failureMessage,
+      ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
+      exitCode: report.exitCode,
+    });
+  };
+
+  /**
+   * G10 — convert a fired wall-clock limit into the classified terminal
+   * stop: publish + log the `run_failed` report (class `"timeout"`), then
+   * throw the matching `RunFailedError`. Callers invoke this only on the
+   * paths where a timeout IS terminal (any scope in `singleTurn` mode; the
+   * run deadline everywhere).
+   */
+  const throwTimeout = async (timeout: TimeoutAbortReason): Promise<never> => {
+    const report = buildTimeoutFailureReport(timeout);
+    await publishRunFailed(report);
+    throw new RunFailedError(report);
+  };
+
   async function runOneTurn(
     messages: Anthropic.MessageParam[],
-  ): Promise<{ terminalContent: Anthropic.ContentBlock[] }> {
+  ): Promise<{ terminalContent: Anthropic.ContentBlock[]; usage: ModelUsage }> {
     let state: TurnState = initialState;
     let terminalContent: Anthropic.ContentBlock[] = [];
+    // G02 — aggregate token usage across every MAIN-turn model call this
+    // turn makes (each tool iteration streams once). Handed to the in-loop
+    // evaluator so a judge can weigh cost/verbosity; side-calls (compaction,
+    // the injected judge itself) publish no accumulation here.
+    const turnUsage: { input: number; output: number; cacheRead: number; cacheCreate: number } = {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheCreate: 0,
+    };
+    const accrueTurnUsage = (u: {
+      readonly input: number;
+      readonly output: number;
+      readonly cacheRead?: number;
+      readonly cacheCreate?: number;
+    }): void => {
+      turnUsage.input += u.input;
+      turnUsage.output += u.output;
+      turnUsage.cacheRead += u.cacheRead ?? 0;
+      turnUsage.cacheCreate += u.cacheCreate ?? 0;
+    };
     let recovery: RecoveryState = initialRecoveryState;
     const maxToolIterations = opts.maxToolIterations ?? DEFAULT_MAX_TOOL_ITERATIONS;
     let toolIterations = 0;
@@ -3057,30 +4040,6 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // strongest candidate for the rest of the run (misroute recovery, mirroring
     // the tier router's fast→default escalation latch).
     let escalatePool = false;
-
-    // v0.3.0 Goal 6 — one structured report on every terminal path,
-    // published to the bus AND appended to the session event log BEFORE the
-    // throw (a throw is invisible to structured consumers; the event is what
-    // the UI host, printers, exporters, and incident capture render). Used
-    // by the recovery `halt`/`fail` arms below and by the §7.1 sub-agent
-    // escalation path in `NeedTools`.
-    const publishRunFailed = async (report: FailureReport): Promise<void> => {
-      const failureMessage = `${report.title}: ${report.detail}`;
-      bus.publish({
-        ...bus.envelope(),
-        kind: "run_failed",
-        class: report.class,
-        message: failureMessage,
-        ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
-        exitCode: report.exitCode,
-      });
-      await logEvent("run_failed", {
-        class: report.class,
-        message: failureMessage,
-        ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
-        exitCode: report.exitCode,
-      });
-    };
 
     while (state.kind !== "Done") {
       if (turnAbort.signal.aborted) {
@@ -3163,7 +4122,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             if (poolRouter !== undefined) {
               const base = poolRouter.route(
                 {
-                  contextTokens: estimateTokens(messages),
+                  contextTokens: contextTokenSignal(messages),
                   toolsInPlay: (anthropicTools?.length ?? 0) > 0,
                   turnIndex: Math.max(0, runContext.turnNumber - 1),
                   priorTurnToolUseCount,
@@ -3224,7 +4183,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               const decision = escalateTier
                 ? { tier: "default" as const, reason: "escalated after fast-tier failure" }
                 : tierRouter.route({
-                    contextTokens: estimateTokens(messages),
+                    contextTokens: contextTokenSignal(messages),
                     toolsInPlay: (anthropicTools?.length ?? 0) > 0,
                     // `turnNumber` is 1-based (incremented before the turn
                     // runs); the router wants a 0-based index so its
@@ -3284,6 +4243,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // `[]` when the seam is absent — the request payload is then
             // byte-identical to a pre-0.3.0 runtime.
             const continuityTail = await buildContinuityTail();
+            // G10 — arm the per-model-call watchdog for exactly the stream's
+            // lifetime: cleared right after each drain below and (throw
+            // paths) at the top of the catch. G01 — every MAIN-turn request
+            // (and only these: compaction/judge side-calls build their own
+            // requests) carries the resolved thinking fields, and the token
+            // ceiling is the thinking-aware `effectiveMaxTokens`.
+            armModelCallTimer();
+            // Item 9 / G79 — cache the settled transcript prefix when the
+            // serving adapter supports explicit caching. A request-local copy;
+            // the persisted `messages` array never carries the marker.
+            const reqMessages =
+              turnAdapter.features.caching === "explicit"
+                ? withMessageCacheBreakpoint(messages)
+                : messages;
             const reqStream = turnAdapter.stream({
               model: reqWireModelId,
               system: [
@@ -3292,9 +4265,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   text: b.text,
                   ...(b.cache_control !== undefined ? { cache_control: b.cache_control } : {}),
                 })),
+                // Item 2 / G21 — the volatile recalled-memory block: rebuilt
+                // per-turn in per-turn recall mode, NO cache marker, sits in
+                // the mutable tail so a swap never busts the frozen prefix.
+                ...volatileRecallBlocks.map((b) => ({ type: "text" as const, text: b.text })),
                 ...continuityTail.map((b) => ({ type: "text" as const, text: b.text })),
               ],
-              messages: messages as Parameters<ProviderAdapter["stream"]>[0]["messages"],
+              messages: reqMessages as Parameters<ProviderAdapter["stream"]>[0]["messages"],
               tools:
                 anthropicTools !== undefined
                   ? anthropicTools.map((t) => ({
@@ -3303,7 +4280,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                       input_schema: t.input_schema as Record<string, unknown>,
                     }))
                   : undefined,
-              maxTokens,
+              maxTokens: effectiveMaxTokens,
+              ...(thinkingRequest !== undefined ? thinkingRequest : {}),
               signal: turnAbort.signal,
             });
 
@@ -3345,7 +4323,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   },
                 },
               );
+              clearModelCallTimer();
               endTurn();
+              accrueTurnUsage(usage);
 
               // On `stop_reason: "max_tokens"` the model may have been cut off
               // mid-`tool_use`; the streaming executor only runs a call once its
@@ -3404,6 +4384,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 usage,
                 durationMs: performance.now() - t0Model,
               });
+              // Item 4 / G28 — record the provider's real input_tokens for the
+              // next pre-turn compaction trigger + routing signal. A response
+              // that reports NO usage (sum 0) means "unknown", not "empty":
+              // keep the last known count (undefined pre-first-call) so both the
+              // trigger and the router fall back to the chars/4 estimate instead
+              // of reading the context as empty and silently disabling compaction.
+              const reportedInputTokens = responseInputTokens(usage);
+              if (reportedInputTokens > 0) lastModelInputTokens = reportedInputTokens;
               // Adaptive model routing — fold this successful turn into the
               // reward scoreboard so the learned policy improves next run.
               if (poolTurn !== undefined) {
@@ -3434,22 +4422,32 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               }
               messages.push({ role: "user", content: [...toolResults] });
               await logEvent("user_message", { content: [...toolResults] });
-              const warning = maybeBuildLoopWarning();
-              if (warning !== null) {
-                messages.push(warning);
-                await logEvent("user_message", { content: warning.content, synthetic: true });
+              const loopOutcome = evaluateToolLoop();
+              if (loopOutcome.kind === "message") {
+                messages.push(loopOutcome.message);
+                await logEvent("user_message", {
+                  content: loopOutcome.message.content,
+                  synthetic: true,
+                });
               }
 
               // Synthesize the two transitions the state machine expects:
               // tools have already executed during the stream so we
               // collapse ModelReturnedToolUse → ToolsExecuted into a
-              // single hop back to NeedModel.
+              // single hop back to NeedModel. (G27: on an `abort` loop
+              // escalation the second hop is the Aborted transition — the
+              // NeedTools state accepts it — ending the turn instead.)
               const tsmBlocks: TsmToolUseBlock[] = toolUses.map((t) => ({
                 id: t.id,
                 name: t.name,
                 input: t.input,
               }));
               state = transition(state, { kind: "ModelReturnedToolUse", toolUses: tsmBlocks });
+              if (loopOutcome.kind === "abort") {
+                await recordLoopAbort(loopOutcome.detection);
+                state = transition(state, { kind: "Aborted" });
+                break;
+              }
               state = transition(state, { kind: "ToolsExecuted" });
               break;
             }
@@ -3470,7 +4468,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 );
               },
             });
+            clearModelCallTimer();
             endTurn();
+            accrueTurnUsage(final.usage);
 
             // Item 22 — lastServed() is exact: the candidate that actually
             // streamed this response. Cost-tracker prices off this pair.
@@ -3497,6 +4497,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               usage: final.usage,
               durationMs: performance.now() - t0Model,
             });
+            // Item 4 / G28 — record the provider's real input_tokens for the
+            // next pre-turn compaction trigger + routing signal. A response that
+            // reports NO usage (sum 0) means "unknown", not "empty": keep the
+            // last known count (undefined pre-first-call) so both the trigger and
+            // the router fall back to the chars/4 estimate instead of reading the
+            // context as empty and silently disabling compaction.
+            const reportedInputTokens = responseInputTokens(final.usage);
+            if (reportedInputTokens > 0) lastModelInputTokens = reportedInputTokens;
             // Adaptive model routing — fold this successful turn into the
             // reward scoreboard so the learned policy improves next run.
             if (poolTurn !== undefined) {
@@ -3568,9 +4576,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 input: t.input,
               }));
               for (const tu of tsmBlocks) toolUseHistory.push(tu);
+              // Item 7 — the response fully drained (usage known) before these
+              // calls dispatch in `NeedTools`, so the split IS computable here:
+              // split the priceable response cost evenly across its tool_use
+              // blocks, keyed by id for `executeOneToolUse` to stamp. Skipped
+              // (no attribution) when the model isn't on the pricing table.
+              const respCost = responseCostMicros(respProvider, respWireModelId, final.usage);
+              if (respCost !== undefined) {
+                const perTool = Math.round(respCost / toolUses.length);
+                for (const tu of tsmBlocks) toolCostAttribution.set(tu.id, perTool);
+              }
               state = transition(state, { kind: "ModelReturnedToolUse", toolUses: tsmBlocks });
             }
           } catch (err) {
+            // G10 — the watchdog must not outlive the call it watched.
+            clearModelCallTimer();
             // Tear down the "thinking" animation before any error/abort output.
             out.spinner.stop();
             if (isAbortError(err)) {
@@ -3650,10 +4670,19 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           }
           messages.push({ role: "user", content: toolResults });
           await logEvent("user_message", { content: toolResults });
-          const warning = maybeBuildLoopWarning();
-          if (warning !== null) {
-            messages.push(warning);
-            await logEvent("user_message", { content: warning.content, synthetic: true });
+          const loopOutcome = evaluateToolLoop();
+          if (loopOutcome.kind === "message") {
+            messages.push(loopOutcome.message);
+            await logEvent("user_message", {
+              content: loopOutcome.message.content,
+              synthetic: true,
+            });
+          } else if (loopOutcome.kind === "abort") {
+            // G27 escalation "abort" — the warned signature tripped again:
+            // end the TURN, ToolLoopLimit-style (see recordLoopAbort).
+            await recordLoopAbort(loopOutcome.detection);
+            state = transition(state, { kind: "Aborted" });
+            break;
           }
           state = transition(state, { kind: "ToolsExecuted" });
           break;
@@ -3851,7 +4880,134 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // Item 26 — hand this turn's tool_use count to the next turn's tier
     // decision (the prior-tool-density signal).
     priorTurnToolUseCount = thisTurnToolUseCount;
-    return { terminalContent };
+
+    // G10 — the turn wound down through the Aborted transition; if a
+    // wall-clock timer (not a SIGINT) is what aborted it, classify the stop.
+    // The abort tree propagates reasons parent→child, so a run-deadline
+    // reason is readable off the TURN signal too; checking both covers the
+    // window where the deadline fires between turns. Terminal when the
+    // deadline fired (any mode) or in `singleTurn` mode (the turn IS the
+    // run); in REPL mode a turn/model-call timeout already printed its
+    // notice at fire time — record the named error and hand control back to
+    // the prompt, mirroring the first-SIGINT semantics.
+    const timedOut = timeoutAbortReason(turnAbort.signal) ?? timeoutAbortReason(runAbort.signal);
+    if (timedOut !== undefined) {
+      if (timedOut.crewhausTimeout === "run" || opts.singleTurn === true) {
+        await throwTimeout(timedOut);
+      }
+      await logEvent("error", {
+        name: timedOut.crewhausTimeout === "turn" ? "TurnTimeout" : "ModelCallTimeout",
+        message: `turn aborted: the configured ${TIMEOUT_SPEC_KEYS[timedOut.crewhausTimeout]} (${timedOut.limitMs}ms) elapsed`,
+      });
+    }
+    return { terminalContent, usage: turnUsage };
+  }
+
+  /** Concatenated text of a terminal content-block array (the same
+   *  projection the `singleTurn` return value uses). */
+  const terminalText = (blocks: ReadonlyArray<Anthropic.ContentBlock>): string =>
+    blocks
+      .filter((b): b is Anthropic.TextBlock => b.type === "text")
+      .map((b) => b.text)
+      .join("");
+
+  /**
+   * G02 — one COMPLETED turn plus its in-loop evaluation gate. Wraps
+   * `runOneTurn` so evaluation fires only at turn completion (the tool
+   * inner-loop lives INSIDE `runOneTurn`, so tool-only intermediate
+   * iterations can never reach the grader by construction), on both the
+   * `singleTurn` and REPL paths. Without `opts.evaluation` this is exactly
+   * `runOneTurn` — zero behaviour change.
+   *
+   * The retry ladder: grade attempt 0 (`retryIndex` 0); a failing verdict
+   * with `onFail: "retry"` appends the grader rationale as a synthetic
+   * corrective user message and re-runs the turn, re-grading each re-run
+   * (`retryIndex` n) up to `maxRetries`. Every re-run streams real model
+   * calls through the normal `NeedModel` path, so its spend is metered by
+   * the always-on budget cost path exactly like any other call. `halt`
+   * publishes + logs the classified `run_failed` (class `"evaluation"`)
+   * and throws; `note` and an exhausted retry cap leave the last attempt
+   * standing. An ABORTED (SIGINT / wall-clock) attempt never completed —
+   * it is returned un-graded.
+   */
+  async function runEvaluatedTurn(
+    messages: Anthropic.MessageParam[],
+  ): Promise<{ terminalContent: Anthropic.ContentBlock[]; usage: ModelUsage }> {
+    const evaluation = opts.evaluation;
+    let attempt = await runOneTurn(messages);
+    if (evaluation === undefined) return attempt;
+    const maxRetries = Math.max(0, Math.floor(evaluation.maxRetries));
+    for (let retryIndex = 0; ; retryIndex += 1) {
+      // A turn the abort tree stopped (SIGINT, turn/model-call/run timer)
+      // did not COMPLETE — grading its partial output would be noise, and
+      // a retry would fight the very signal that stopped it.
+      if (turnAbort.signal.aborted || runAbort.signal.aborted) return attempt;
+      let graded: EvaluationResult;
+      out.spinner.start("evaluating");
+      try {
+        graded = await evaluation.evaluate({
+          finalText: terminalText(attempt.terminalContent),
+          messages,
+          usage: attempt.usage,
+        });
+      } catch (err) {
+        // Grading INFRASTRUCTURE failure (judge model down, evaluator bug)
+        // is not a verdict. Fail open: record it and let the turn stand —
+        // a flaky judge must not kill an otherwise healthy run.
+        const errObj = err as { name?: unknown; message?: unknown };
+        const name = typeof errObj.name === "string" ? errObj.name : "EvaluationError";
+        const message = typeof errObj.message === "string" ? errObj.message : String(err);
+        runContext.logger.warn("evaluation: grader threw — turn stands un-graded", {
+          name,
+          message,
+        });
+        await logEvent("error", { name, message: `evaluation grader failed: ${message}` });
+        return attempt;
+      } finally {
+        out.spinner.stop();
+      }
+      // A rogue evaluator returning NaN/±Infinity must not poison the
+      // trace surface; treat non-finite as 0 (an unambiguous fail).
+      const score = Number.isFinite(graded.score) ? graded.score : 0;
+      const rationale = graded.rationale;
+      const verdict: "pass" | "fail" = score >= evaluation.threshold ? "pass" : "fail";
+      bus.publish({
+        ...bus.envelope(),
+        kind: "eval_graded",
+        score,
+        threshold: evaluation.threshold,
+        verdict,
+        graderType: evaluation.graderType,
+        retryIndex,
+      });
+      if (verdict === "pass" || evaluation.onFail === "note") return attempt;
+      const rationaleNote =
+        rationale !== undefined && rationale.trim().length > 0 ? ` — ${rationale.trim()}` : "";
+      if (evaluation.onFail === "halt") {
+        const detail = `the ${evaluation.graderType} grader scored the final answer ${score.toFixed(2)}, below the required ${evaluation.threshold} threshold${rationaleNote}`;
+        const report: FailureReport = {
+          class: "evaluation",
+          title: "in-loop evaluation gate failed",
+          detail,
+          remediation:
+            "improve the agent (instructions/model), lower evaluation.threshold, or soften evaluation.on_fail to retry/note",
+          exitCode: EXIT_CODES.evaluation,
+        };
+        await publishRunFailed(report);
+        throw new RunFailedError(report);
+      }
+      // onFail: "retry" — bounded by the resolved cap; when spent, the last
+      // attempt stands (the failing eval_graded trail tells the story).
+      if (retryIndex >= maxRetries) return attempt;
+      const feedback =
+        rationale !== undefined && rationale.trim().length > 0
+          ? ` Grader feedback: ${rationale.trim()}`
+          : "";
+      const correction = `[evaluation failed: scored ${score.toFixed(2)}, threshold ${evaluation.threshold}]${feedback}\nPlease revise your previous answer to address the feedback, then give the corrected answer in full.`;
+      messages.push({ role: "user", content: correction });
+      await logEvent("user_message", { content: correction, synthetic: true });
+      attempt = await runOneTurn(messages);
+    }
   }
 
   // Single-shot path used by the workflow target and (Section 12) the
@@ -3906,6 +5062,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           logger: runContext.logger,
           onEvict: externalizeEvicted,
           getLedgerText: ledgerAnchorText,
+          ...compactionExtras(),
         },
         async (info) => {
           await logEvent("compaction", info);
@@ -3927,18 +5084,29 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         },
       );
 
-      const { terminalContent } = await runOneTurn(messages);
+      // Item 2 / G21 — refresh the volatile recalled block against this turn's
+      // latest user message (no-op unless per-turn recall is enabled + due).
+      await maybePerTurnRecall(messages);
+
+      // G10 — the single turn IS the run: arm the per-turn ceiling around
+      // it (the deadline timer is already live from boot). Fired timers
+      // surface as a classified RunFailedError out of runOneTurn; the
+      // finally below tears every timer down on all paths. (G02 — the
+      // evaluated wrapper re-runs the turn on a failing verdict, all
+      // attempts inside the same armed window: a retried turn is still ONE
+      // turn against `turn_timeout_ms`.)
+      armTurnTimer();
+      const { terminalContent } = await runEvaluatedTurn(messages);
+      clearTurnTimer();
       bus.publish({
         ...bus.envelope(),
         kind: "turn_end",
         turn: runContext.turnNumber,
         durationMs: performance.now() - t0SingleTurn,
       });
-      return terminalContent
-        .filter((b): b is Anthropic.TextBlock => b.type === "text")
-        .map((b) => b.text)
-        .join("");
+      return terminalText(terminalContent);
     } finally {
+      clearAllTimers();
       out.spinner.stop();
       await fireHook("stop", {
         sessionId,
@@ -3990,6 +5158,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const STDIN_CLOSED = Symbol("stdin-closed");
   const closedSignal = new Promise<typeof STDIN_CLOSED>((resolve) => {
     rl.once("close", () => resolve(STDIN_CLOSED));
+  });
+
+  // G10 — a fired run deadline must also interrupt an IDLE `rl.question`
+  // wait (the loop-top abort check only runs once input arrives), so each
+  // prompt races this alongside the stdin-close sentinel.
+  const RUN_ABORTED = Symbol("run-aborted");
+  const runAbortedSignal = new Promise<typeof RUN_ABORTED>((resolve) => {
+    if (runAbort.signal.aborted) {
+      resolve(RUN_ABORTED);
+    } else {
+      runAbort.signal.addEventListener("abort", () => resolve(RUN_ABORTED), { once: true });
+    }
   });
 
   // Wire the permission-ask prompter once the readline interface exists.
@@ -4064,8 +5244,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
       let userInput: string;
       try {
-        const result = await Promise.race([rl.question("\nyou> "), closedSignal]);
-        if (result === STDIN_CLOSED) break;
+        const result = await Promise.race([rl.question("\nyou> "), closedSignal, runAbortedSignal]);
+        if (result === STDIN_CLOSED || result === RUN_ABORTED) break;
         userInput = result.trim();
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ERR_USE_AFTER_CLOSE") break;
@@ -4123,7 +5303,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         messages: messages.length,
       });
 
-      // Pre-turn budget check: snip first (free), then autocompact if still over.
+      // Pre-turn budget check: (curate) → snip → autocompact if still over.
       messages = await maybeCompact(
         {
           messages,
@@ -4136,6 +5316,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           logger: runContext.logger,
           onEvict: externalizeEvicted,
           getLedgerText: ledgerAnchorText,
+          ...compactionExtras(),
         },
         async (info) => {
           await logEvent("compaction", info);
@@ -4152,8 +5333,19 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         },
       );
 
+      // Item 2 / G21 — refresh the volatile recalled block against this turn's
+      // latest user message (no-op unless per-turn recall is enabled + due).
+      await maybePerTurnRecall(messages);
+
+      // G10 — per-turn wall-clock ceiling: armed for exactly the
+      // `runOneTurn` window, torn down on every exit (finally). A fired
+      // turn/model-call timer aborts the turn and (REPL posture) control
+      // returns to the prompt below — mirroring the first-SIGINT semantics;
+      // a fired run deadline makes `runOneTurn` throw the classified
+      // RunFailedError, which the catch rethrows.
+      armTurnTimer();
       try {
-        await runOneTurn(messages);
+        await runEvaluatedTurn(messages);
       } catch (err) {
         // Defensive: tear down any animation a thrown turn left spinning.
         out.spinner.stop();
@@ -4163,6 +5355,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         } else {
           throw err;
         }
+      } finally {
+        clearTurnTimer();
       }
 
       bus.publish({
@@ -4175,7 +5369,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         turn: runContext.turnNumber,
       });
     }
+
+    // G10 — the loop exited on an aborted run root: when the RUN DEADLINE
+    // (not a SIGINT/EOF) is what aborted it, the stop is terminal and
+    // classified. Published here — still inside the try, BEFORE the finally
+    // tears the bus subscribers down — then thrown so `crewhaus run`/bundle
+    // wrappers render the report and exit with EXIT_CODES.timeout. (A
+    // deadline that fired MID-turn already threw from inside runOneTurn and
+    // never reaches this check.)
+    const runTimeout = timeoutAbortReason(runAbort.signal);
+    if (runTimeout !== undefined) {
+      await throwTimeout(runTimeout);
+    }
   } finally {
+    clearAllTimers();
     out.spinner.stop();
     await fireHook("stop", {
       sessionId,
@@ -4231,6 +5438,298 @@ function isAbortError(err: unknown): boolean {
   return typeof name === "string" && (name === "AbortError" || name === "APIUserAbortError");
 }
 
+// ---------------------------------------------------------------------------
+// Loop contract 0.4 (Batch E) — shared helpers for active-context curation
+// (Item 1 / G19), per-turn recall (Item 2 / G21) and message-level cache
+// breakpoints (Item 9 / G79).
+// ---------------------------------------------------------------------------
+
+/** Item 4 / G28 — the provider's real INPUT token count for one response:
+ *  fresh input + cache-read + cache-create (the whole prompt the provider
+ *  counted), the accurate context-size signal chars/4 approximates. */
+function responseInputTokens(u: ModelUsage): number {
+  return u.input + (u.cacheRead ?? 0) + (u.cacheCreate ?? 0);
+}
+
+/**
+ * The latest USER *text* message — the relevance query for the curator
+ * (Item 1) and the per-turn recall refresh (Item 2). Tool-result user
+ * messages carry no human words, so they're skipped: the query is what the
+ * person actually said, not a tool payload. Returns `undefined` when no
+ * text-bearing user message exists (a bare tool-result tail).
+ */
+function latestUserText(messages: ReadonlyArray<Anthropic.MessageParam>): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m === undefined || m.role !== "user") continue;
+    if (typeof m.content === "string") {
+      if (m.content.length > 0) return m.content;
+      continue;
+    }
+    const text = m.content
+      .filter((b): b is Anthropic.TextBlockParam => b.type === "text")
+      .map((b) => b.text)
+      .join("\n");
+    if (text.length > 0) return text;
+  }
+  return undefined;
+}
+
+/**
+ * Item 1 / G19 — a message is CURATABLE (safe for the curator to drop) only
+ * when it is pure conversational text: no `tool_use` / `tool_result` blocks,
+ * whose pairing the Anthropic API enforces (a dropped half orphans the other
+ * and 400s the request). Removing a pure-text message can never orphan a pair
+ * — consecutive same-role messages are merged server-side, exactly the
+ * tolerance the snip marker path already relies on.
+ */
+function isCuratableMessage(m: Anthropic.MessageParam): boolean {
+  const c = m.content;
+  if (typeof c === "string") return true;
+  for (const b of c) {
+    if (b.type === "tool_use" || b.type === "tool_result") return false;
+  }
+  return true;
+}
+
+/** Item 1 / G19 — flatten a message's text for curator similarity + the
+ *  `bytesSaved` accounting. Non-text blocks contribute nothing (they never
+ *  reach the curator — only pure-text messages are curatable). */
+function curatorItemText(m: Anthropic.MessageParam): string {
+  const c = m.content;
+  if (typeof c === "string") return c;
+  return c
+    .filter((b): b is Anthropic.TextBlockParam => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+}
+
+const LEXICAL_TOKEN_RE = /[a-z0-9]+/gi;
+
+/** Item 1 / G19 — token set for the BM25-family lexical fallback. */
+function lexicalTokens(text: string): Set<string> {
+  const out = new Set<string>();
+  const matches = text.toLowerCase().match(LEXICAL_TOKEN_RE);
+  if (matches !== null) for (const t of matches) out.add(t);
+  return out;
+}
+
+/** Jaccard overlap of two token sets (the lexical similarity used by the
+ *  no-embedder curation path). Two empty sets are identical (1). */
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 && b.size === 0) return 1;
+  if (a.size === 0 || b.size === 0) return 0;
+  const [small, large] = a.size <= b.size ? [a, b] : [b, a];
+  let inter = 0;
+  for (const t of small) if (large.has(t)) inter++;
+  const union = a.size + b.size - inter;
+  return union === 0 ? 0 : inter / union;
+}
+
+/**
+ * Item 1 / G19 — order-preserving lexical dedupe, the BM25-family fallback
+ * when no embedder resolves (a vector store is unavailable). Mirrors the
+ * curator's cosine `dedupeBySimilarity` structure but over token-set Jaccard:
+ * an item is dropped when a PRIOR kept item's Jaccard >= threshold, so the
+ * first occurrence (the head of the conversation, which carries goal-setting
+ * context) always wins.
+ */
+function lexicalDedupe(
+  texts: ReadonlyArray<string>,
+  threshold: number,
+): { kept: number[]; dropped: number[] } {
+  const tokenSets = texts.map(lexicalTokens);
+  const kept: number[] = [];
+  const dropped: number[] = [];
+  for (let i = 0; i < texts.length; i++) {
+    let isDuplicate = false;
+    const ti = tokenSets[i];
+    if (ti !== undefined) {
+      for (const k of kept) {
+        const tk = tokenSets[k];
+        if (tk !== undefined && jaccard(ti, tk) >= threshold) {
+          isDuplicate = true;
+          break;
+        }
+      }
+    }
+    (isDuplicate ? dropped : kept).push(i);
+  }
+  return { kept, dropped };
+}
+
+type CurateConfig = {
+  readonly embedder?: EmbedderFn;
+  readonly dedupeThreshold?: number;
+  readonly relevanceTopK?: number;
+};
+
+type CurateOutcome = {
+  readonly messages: Anthropic.MessageParam[];
+  readonly before: number;
+  readonly after: number;
+  readonly dropped: number;
+  readonly bytesSaved: number;
+  readonly embedded: boolean;
+};
+
+/**
+ * Item 1 / G19 — the active-context curation pass. Runs `curate()` (cosine,
+ * when an embedder is injected) or the lexical fallback over the CURATABLE
+ * middle messages (pure-text, outside the snip-protected head/tail), then
+ * REBUILDS the transcript keeping survivors in their original order. The
+ * curator's relevance ranking is used only to SELECT which messages survive a
+ * `relevanceTopK` trim — never to reorder the conversation, which would
+ * scramble role alternation and tool pairing. Returns `null` when nothing was
+ * eligible or nothing changed, so the caller skips the trace event. Best-
+ * effort at the call site: an embedder throw propagates and the caller
+ * degrades to the plain snip→autocompact ladder.
+ */
+async function curateActiveContext(
+  messages: ReadonlyArray<Anthropic.MessageParam>,
+  snipKeepHead: number,
+  snipKeepTail: number,
+  cfg: CurateConfig,
+): Promise<CurateOutcome | null> {
+  const firstCuratable = Math.max(0, snipKeepHead);
+  const lastCuratable = messages.length - Math.max(0, snipKeepTail);
+  const curatableIdx: number[] = [];
+  for (let i = firstCuratable; i < lastCuratable; i++) {
+    const m = messages[i];
+    if (m !== undefined && isCuratableMessage(m)) curatableIdx.push(i);
+  }
+  // Need at least two comparable items for a dedupe/relevance decision.
+  if (curatableIdx.length < 2) return null;
+
+  const texts = curatableIdx.map((i) => curatorItemText(messages[i] as Anthropic.MessageParam));
+  const threshold = cfg.dedupeThreshold ?? DEFAULT_DEDUPE_THRESHOLD;
+  const query = latestUserText(messages);
+  const embedded = cfg.embedder !== undefined;
+
+  // `keepLocal` — indices INTO `curatableIdx`/`texts` that survive, ascending
+  // (transcript order).
+  let keepLocal: number[];
+  if (embedded) {
+    const items: CuratorItem[] = texts.map((t) => ({ text: t }));
+    const result = await curateItems(items, {
+      dedupeThreshold: threshold,
+      embedder: cfg.embedder,
+      // A query only matters for the topK trim — the relevance re-order is
+      // undone by the re-sort below. Skip it (and its embedder call) unless a
+      // topK cap is actually set.
+      ...(cfg.relevanceTopK !== undefined && query !== undefined
+        ? { query, relevanceTopK: cfg.relevanceTopK }
+        : {}),
+    });
+    keepLocal = [...result.originalIndices].sort((a, b) => a - b);
+  } else {
+    const { kept } = lexicalDedupe(texts, threshold);
+    let survivors = kept;
+    if (
+      cfg.relevanceTopK !== undefined &&
+      query !== undefined &&
+      survivors.length > cfg.relevanceTopK
+    ) {
+      const q = lexicalTokens(query);
+      survivors = [...survivors]
+        .sort((a, b) => {
+          const sa = jaccard(q, lexicalTokens(texts[a] ?? ""));
+          const sb = jaccard(q, lexicalTokens(texts[b] ?? ""));
+          if (sa !== sb) return sb - sa;
+          return a - b;
+        })
+        .slice(0, cfg.relevanceTopK)
+        .sort((a, b) => a - b);
+    }
+    keepLocal = survivors;
+  }
+
+  const before = curatableIdx.length;
+  const after = keepLocal.length;
+  if (after >= before) return null; // dedupe + topK dropped nothing
+
+  const textByGlobal = new Map<number, string>();
+  curatableIdx.forEach((g, l) => textByGlobal.set(g, texts[l] as string));
+  const keepGlobal = new Set(keepLocal.map((l) => curatableIdx[l] as number));
+  const curatableSet = new Set(curatableIdx);
+
+  const out: Anthropic.MessageParam[] = [];
+  let bytesSaved = 0;
+  for (let i = 0; i < messages.length; i++) {
+    if (curatableSet.has(i) && !keepGlobal.has(i)) {
+      bytesSaved += Buffer.byteLength(textByGlobal.get(i) ?? "", "utf8");
+      continue; // curated away
+    }
+    out.push(messages[i] as Anthropic.MessageParam);
+  }
+  return { messages: out, before, after, dropped: before - after, bytesSaved, embedded };
+}
+
+/**
+ * Item 2 / G21 — render the recalled-memory system block body with the SAME
+ * two defenses the session-start recall uses (#53): neutralize any
+ * `</recalled_memory>` breakout delimiter inside a recalled line, and run the
+ * assembled block through `classifyBoundary` with origin `"user"` (recalled
+ * lines may embed content shaped by untrusted tool output in an earlier
+ * session). Returns `undefined` when there is nothing to recall.
+ */
+async function renderRecalledMemory(lines: readonly string[]): Promise<string | undefined> {
+  if (lines.length === 0) return undefined;
+  const body = lines.map((l) => `- ${escapeBoundaryDelimiter(l, "recalled_memory")}`).join("\n");
+  const text = `<recalled_memory>\nRelevant facts remembered from earlier sessions:\n${body}\n</recalled_memory>`;
+  await classifyBoundary(text, { origin: "user" }).catch(() => undefined);
+  return text;
+}
+
+/**
+ * Item 9 / G79 — stamp ONE message-level cache breakpoint so the settled
+ * transcript prefix is a cache read on the next call instead of full-price
+ * input every turn/tool-iteration. Marks the last message that carries
+ * ARRAY content (an assistant turn or a tool_result) — never a bare string,
+ * so the freshest user input stays OUTSIDE the cached prefix and a new turn
+ * EXTENDS the cache rather than rebuilding it (Anthropic's recommended
+ * incremental pattern), and string-content messages round-trip untouched.
+ * A request-local copy: the persisted `messages` array never carries a
+ * marker. One breakpoint here plus the single frozen system-prefix marker is
+ * two — well under Anthropic's four. Caller gates on
+ * `adapter.features.caching === "explicit"`.
+ */
+function withMessageCacheBreakpoint(
+  messages: ReadonlyArray<Anthropic.MessageParam>,
+): Anthropic.MessageParam[] {
+  let target = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const c = messages[i]?.content;
+    if (Array.isArray(c) && c.length > 0) {
+      target = i;
+      break;
+    }
+  }
+  if (target === -1) return [...messages];
+  return messages.map((m, i) => (i === target ? stampCacheControlTail(m) : m));
+}
+
+/** Add `cache_control: { type: "ephemeral" }` to the last cache-eligible block
+ *  of an ARRAY-content message. Walks back past `thinking`/`redacted_thinking`
+ *  blocks (which reject the marker). */
+function stampCacheControlTail(m: Anthropic.MessageParam): Anthropic.MessageParam {
+  const content = m.content;
+  if (typeof content === "string" || content.length === 0) return m;
+  let idx = -1;
+  for (let i = content.length - 1; i >= 0; i--) {
+    const t = content[i]?.type;
+    if (t !== "thinking" && t !== "redacted_thinking") {
+      idx = i;
+      break;
+    }
+  }
+  if (idx === -1) return m;
+  const next = content.map((b, i) =>
+    i === idx ? ({ ...b, cache_control: { type: "ephemeral" } } as typeof b) : b,
+  );
+  return { ...m, content: next as Anthropic.MessageParam["content"] };
+}
+
 type CompactionInfo = {
   readonly kind: "snip" | "autocompact";
   readonly before: number;
@@ -4240,6 +5739,16 @@ type CompactionInfo = {
    *  `compaction` event-log payload so post-mortems can check WHAT the
    *  summary claimed survived — counts alone said nothing. */
   readonly summary?: string;
+};
+
+/** Item 1 / G19 — one active-context curation pass, reported so the caller
+ *  publishes the `curate` trace event (mirrors {@link CompactionInfo}). */
+type CurateInfo = {
+  readonly before: number;
+  readonly after: number;
+  readonly dropped: number;
+  readonly bytesSaved: number;
+  readonly embedded: boolean;
 };
 
 type CompactArgs = {
@@ -4261,6 +5770,24 @@ type CompactArgs = {
    *  evictions, so the requirements at risk in THIS compaction anchor THIS
    *  summary. `undefined` keeps the summarizer prompt byte-identical. */
   getLedgerText?: () => string | undefined;
+  /**
+   * Item 4 / G28 — the provider's ACTUAL input_tokens from the last
+   * `model_response` (input + cache read + cache create). When set it is the
+   * trigger base (a real count, not the chars/4 heuristic) AND calibrates the
+   * heuristic for the post-stage rechecks (`realInputTokens` minus the
+   * ESTIMATED tokens each stage freed). Absent (pre-first-call, before any
+   * response is on the bus) → the pure chars/4 heuristic, unchanged.
+   */
+  realInputTokens?: number;
+  /**
+   * Item 1 / G19 — active-context curation config (opt-in; presence runs the
+   * pre-pass, gated by the caller on `ir.compaction.curate`). Embedder is
+   * injected by the caller; absent → the BM25-family lexical fallback.
+   */
+  curate?: CurateConfig;
+  /** Item 1 / G19 — reports one curation pass so the caller publishes the
+   *  `curate` trace event (mirrors `onCompaction`). */
+  onCurate?: (info: CurateInfo) => Promise<void>;
 };
 
 type OnCompaction = (info: CompactionInfo) => Promise<void>;
@@ -4283,11 +5810,21 @@ function summaryTextOf(tuple: ReadonlyArray<Anthropic.MessageParam>): string | u
 }
 
 /**
- * Pre-turn compaction ladder: estimate → snip → re-estimate → autocompact.
- * Returns the (possibly replaced) messages array. Pure with respect to
- * the input array; callers reassign. The optional `onCompaction` callback
- * fires once per applied step so the runtime can append a `compaction`
- * event to the session log without duplicating the cost-estimation logic.
+ * Pre-turn compaction ladder: (curate) → estimate → snip → re-estimate →
+ * autocompact. Returns the (possibly replaced) messages array. Pure with
+ * respect to the input array; callers reassign. The optional `onCompaction`
+ * callback fires once per applied step so the runtime can append a
+ * `compaction` event to the session log without duplicating the
+ * cost-estimation logic.
+ *
+ * Item 1 / G19 — when `args.curate` is set, the active-context curation pass
+ * runs FIRST (only once the context is already approaching the limit): it
+ * dedupes/relevance-trims the transcript, and when that alone frees enough
+ * headroom the snip→autocompact ladder is skipped entirely (the whole point —
+ * cheap dedupe before an expensive summarizer call). Item 4 / G28 — the
+ * trigger + every re-check use the provider's real `input_tokens`
+ * (`args.realInputTokens`) as the base, calibrating the chars/4 heuristic for
+ * the post-stage deltas; absent (pre-first-call) → the pure heuristic.
  */
 async function maybeCompact(
   args: CompactArgs,
@@ -4304,32 +5841,84 @@ async function maybeCompact(
     logger,
     onEvict,
     getLedgerText,
+    realInputTokens,
+    curate: curateCfg,
+    onCurate,
   } = args;
 
-  const initialBudget = new TokenBudget(contextLimit);
-  initialBudget.add(estimateTokens(messages), 0);
-  if (!initialBudget.isApproachingLimit(compactionThreshold)) {
+  // Item 4 / G28 — real-token calibration. The initial array's real size is
+  // `realInputTokens` (the provider's count); every later stage subtracts the
+  // ESTIMATED tokens it freed. Pre-first-call (`realInputTokens` undefined) →
+  // the pure chars/4 estimate, byte-identical to the pre-0.4 trigger.
+  const baseEstimate = estimateTokens(messages);
+  const effectiveTokens = (msgs: ReadonlyArray<Anthropic.MessageParam>): number => {
+    const est = estimateTokens(msgs);
+    if (realInputTokens === undefined) return est;
+    return Math.max(0, realInputTokens - (baseEstimate - est));
+  };
+  const approaching = (msgs: ReadonlyArray<Anthropic.MessageParam>): boolean => {
+    const budget = new TokenBudget(contextLimit);
+    budget.add(effectiveTokens(msgs), 0);
+    return budget.isApproachingLimit(compactionThreshold);
+  };
+
+  if (!approaching(messages)) {
     return messages;
   }
 
-  const snipped = snip(messages, snipKeepHead, snipKeepTail);
-  // §2.3 — externalize what snip is about to drop BEFORE the drop commits.
-  if (onEvict !== undefined) {
-    const evicted = snippedAway(messages, snipped);
-    if (evicted.length > 0) await onEvict(evicted);
-  }
-  logger.info("snip applied", { before: messages.length, after: snipped.length });
-  if (onCompaction !== undefined) {
-    await onCompaction({ kind: "snip", before: messages.length, after: snipped.length });
+  // Item 1 / G19 — active-context curation pre-pass. Dedupe + relevance-trim
+  // the transcript before the snip→autocompact ladder; if it frees enough,
+  // the ladder (and the summarizer model call) is skipped. Best-effort: an
+  // embedder/curator failure degrades to the plain ladder below.
+  let working = messages;
+  if (curateCfg !== undefined) {
+    try {
+      const outcome = await curateActiveContext(working, snipKeepHead, snipKeepTail, curateCfg);
+      if (outcome !== null) {
+        working = outcome.messages;
+        logger.info("active-context curation applied", {
+          before: outcome.before,
+          after: outcome.after,
+          dropped: outcome.dropped,
+          bytesSaved: outcome.bytesSaved,
+          embedded: outcome.embedded,
+        });
+        if (onCurate !== undefined) {
+          await onCurate({
+            before: outcome.before,
+            after: outcome.after,
+            dropped: outcome.dropped,
+            bytesSaved: outcome.bytesSaved,
+            embedded: outcome.embedded,
+          });
+        }
+        if (!approaching(working)) {
+          return working; // curation alone freed enough — no snip/autocompact
+        }
+      }
+    } catch (err) {
+      logger.warn("active-context curation failed; falling back to snip/autocompact", {
+        error: (err as Error).message,
+      });
+    }
   }
 
-  const postSnipBudget = new TokenBudget(contextLimit);
-  postSnipBudget.add(estimateTokens(snipped), 0);
-  if (!postSnipBudget.isApproachingLimit(compactionThreshold)) {
+  const snipped = snip(working, snipKeepHead, snipKeepTail);
+  // §2.3 — externalize what snip is about to drop BEFORE the drop commits.
+  if (onEvict !== undefined) {
+    const evicted = snippedAway(working, snipped);
+    if (evicted.length > 0) await onEvict(evicted);
+  }
+  logger.info("snip applied", { before: working.length, after: snipped.length });
+  if (onCompaction !== undefined) {
+    await onCompaction({ kind: "snip", before: working.length, after: snipped.length });
+  }
+
+  if (!approaching(snipped)) {
     return snipped;
   }
 
-  logger.info("autocompact triggered", { tokensAfterSnip: postSnipBudget.used });
+  logger.info("autocompact triggered", { tokensAfterSnip: effectiveTokens(snipped) });
   // §2.3 — autocompact replaces the ENTIRE history; externalize all of it
   // before the summarizer model call so the records survive even a
   // summarizer failure. The ledger anchor is read afterwards so this

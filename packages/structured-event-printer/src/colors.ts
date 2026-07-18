@@ -19,6 +19,9 @@ const PALETTE: Record<TraceEventKind, string> = {
   mcp_call_end: "\x1b[35m",
   hook_fired: "\x1b[35m",
   compaction_fired: "\x1b[32m", // green
+  // Loop contract 0.4 (Batch E, G19) — active-context curator pre-pass. Same
+  // green family as compaction_fired: it's a context-management event.
+  curate: "\x1b[32m", // green
   // v0.3.0 Goal 1 — boot-time prompt-cache marker rotation bookkeeping.
   cache_rotation: "\x1b[2m", // dim — routine housekeeping
   permission_decision: "\x1b[33m",
@@ -45,6 +48,10 @@ const PALETTE: Record<TraceEventKind, string> = {
   model_route: "\x1b[94m", // bright blue — a routing decision, in the model family
   // Human feedback channel — a user rating on an assistant turn.
   response_rated: "\x1b[92m", // bright green — a human signal worth spotting
+  // Loop contract 0.4 (Batch C, G11) — pending-approval lifecycle. A parked
+  // approval is a human-in-the-loop gate, in the permission/yellow family.
+  approval_requested: "\x1b[33m", // yellow — a turn is parked awaiting a human
+  approval_resolved: "\x1b[33m", // yellow — the gate cleared (grant or deny)
   // Ops item 36 — boot-time self-heal janitor maintenance actions.
   janitor_action: "\x1b[2m", // dim — routine housekeeping
   // Track F (§57) — AgentFlow-style runtime feedback channels
@@ -54,6 +61,10 @@ const PALETTE: Record<TraceEventKind, string> = {
   sanitizer_report: "\x1b[31m", // red — almost always a finding
   // Ops item 31 — alert watchdog breach against a baseline-derived threshold
   alert_raised: "\x1b[91m", // bright red — an alert is a headline
+  // Loop contract 0.4 (Batch B, G62) — in-loop evaluation verdicts sit
+  // beside test_verdict in the green verdict family.
+  eval_graded: "\x1b[32m", // green
+  judge_verdict: "\x1b[32m", // green
 };
 
 export function colorize(kind: TraceEventKind, text: string, useColor: boolean): string {

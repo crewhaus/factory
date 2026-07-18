@@ -1,0 +1,132 @@
+/**
+ * Loop contract 0.4 (Batch A) — the interpreter-side threading helpers for
+ * the new loop-contract spec keys (`limits:`, `agent.thinking`,
+ * `agent.streaming`, `agent.rate_limits`, top-level `hooks:`, the compaction
+ * tuning knobs) plus the compile-warning formatter. Side-effect-free so this
+ * is unit-testable (the entry file runs an argv switch on import). The
+ * codegen mirror lives in `@crewhaus/target-cli` (renderLimitsFields /
+ * renderCompactionTuningFields / renderSpecHooks and the thinking/streaming/
+ * rateLimits fields); keep the two in sync.
+ *
+ * Option-name contract (all real `RunChatLoopOptions` knobs — the return
+ * type is a `Pick` over runtime-core's own options so a rename there fails
+ * the build here): `limits.max_tool_iterations` → `maxToolIterations`,
+ * `limits.max_concurrent_tools` → `maxConcurrentTools`, `limits.context_limit`
+ * → `contextLimit`, `limits.deadline_ms` → `deadlineMs`, `limits.turn_timeout_ms`
+ * → `turnTimeoutMs`, `limits.model_call_timeout_ms` → `modelCallTimeoutMs`,
+ * `limits.loop_detection` → `loopDetection`, `agent.thinking` → `thinking`,
+ * `agent.rate_limits` → `rateLimits`, `compaction.threshold` →
+ * `compactionThreshold`, `compaction.snip_keep_head`/`snip_keep_tail` →
+ * `snipKeepHead`/`snipKeepTail`.
+ */
+import type { CompileWarning } from "@crewhaus/compiler";
+import type { HookDef } from "@crewhaus/hooks-engine";
+import type { IrCompaction, IrHook, IrLimits, IrRateLimits, IrThinking } from "@crewhaus/ir";
+import type { RunChatLoopOptions } from "@crewhaus/runtime-core";
+
+/**
+ * The loop-contract fragment spread into `runChatLoop(...)` — a `Pick` over
+ * runtime-core's own option names, so interpreter threading cannot drift
+ * from the runtime contract without a type error.
+ */
+export type LoopContractRunOptions = Pick<
+  RunChatLoopOptions,
+  | "maxToolIterations"
+  | "maxConcurrentTools"
+  | "contextLimit"
+  | "deadlineMs"
+  | "turnTimeoutMs"
+  | "modelCallTimeoutMs"
+  | "loopDetection"
+  | "thinking"
+  | "rateLimits"
+  | "compactionThreshold"
+  | "snipKeepHead"
+  | "snipKeepTail"
+>;
+
+/** The IR slice `loopContractRunOptions` reads — structural, so both the
+ *  cli variant and tests' hand-built fragments satisfy it. */
+export type LoopContractIrSlice = {
+  readonly limits?: IrLimits;
+  readonly agent?: {
+    readonly thinking?: IrThinking;
+    readonly rateLimits?: IrRateLimits;
+  };
+  readonly compaction?: Pick<IrCompaction, "threshold" | "snipKeepHead" | "snipKeepTail">;
+};
+
+/**
+ * Build the loop-contract options fragment from a lowered IR. Every key is
+ * absent-when-omitted (spread-return-{} discipline) so an empty spec spreads
+ * NOTHING into `runChatLoop` and the runtime defaults stay authoritative —
+ * exactly the byte-identity posture of the target-cli codegen mirror.
+ */
+export function loopContractRunOptions(ir: LoopContractIrSlice): LoopContractRunOptions {
+  const limits = ir.limits;
+  const compaction = ir.compaction;
+  const rateLimits = ir.agent?.rateLimits;
+  return {
+    ...(limits?.maxToolIterations !== undefined
+      ? { maxToolIterations: limits.maxToolIterations }
+      : {}),
+    ...(limits?.maxConcurrentTools !== undefined
+      ? { maxConcurrentTools: limits.maxConcurrentTools }
+      : {}),
+    ...(limits?.contextLimit !== undefined ? { contextLimit: limits.contextLimit } : {}),
+    ...(limits?.deadlineMs !== undefined ? { deadlineMs: limits.deadlineMs } : {}),
+    ...(limits?.turnTimeoutMs !== undefined ? { turnTimeoutMs: limits.turnTimeoutMs } : {}),
+    ...(limits?.modelCallTimeoutMs !== undefined
+      ? { modelCallTimeoutMs: limits.modelCallTimeoutMs }
+      : {}),
+    ...(limits?.loopDetection !== undefined ? { loopDetection: limits.loopDetection } : {}),
+    ...(ir.agent?.thinking !== undefined ? { thinking: ir.agent.thinking } : {}),
+    ...(rateLimits !== undefined && Object.keys(rateLimits).length > 0 ? { rateLimits } : {}),
+    ...(compaction?.threshold !== undefined ? { compactionThreshold: compaction.threshold } : {}),
+    ...(compaction?.snipKeepHead !== undefined ? { snipKeepHead: compaction.snipKeepHead } : {}),
+    ...(compaction?.snipKeepTail !== undefined ? { snipKeepTail: compaction.snipKeepTail } : {}),
+  };
+}
+
+/**
+ * Concatenate spec-declared hooks BELOW the settings.json layers: spec hooks
+ * first, then `loadHooks()`' user → project entries. Mirrors the permission
+ * RuleSet's settings-over-yaml precedence — hooks-engine's
+ * `aggregateDecisions` shallow-merges `mutate` later-wins, so a settings.json
+ * hook overrides a spec hook's mutate keys, and result ordering keeps the
+ * more-local layers last. All hooks still RUN (any deny wins regardless of
+ * layer). `IrHook` is field-compatible with `HookDef` (camelCase `timeoutMs`,
+ * the closed HookEvent union), so the concat is a plain spread. Returns the
+ * settings array UNCHANGED (same reference) when the spec declares none.
+ */
+export function mergeSpecHooks(
+  specHooks: ReadonlyArray<IrHook> | undefined,
+  settingsHooks: ReadonlyArray<HookDef>,
+): ReadonlyArray<HookDef> {
+  if (specHooks === undefined || specHooks.length === 0) return settingsHooks;
+  return [...specHooks, ...settingsHooks];
+}
+
+/**
+ * Resolve the run's `streaming` option: the `--streaming` flag forces it on;
+ * otherwise the spec's declared `agent.streaming` is carried verbatim
+ * (true OR false — declared ≠ absent); undefined means the spec omitted it
+ * and the caller spreads nothing, leaving the runtime default (false)
+ * authoritative.
+ */
+export function resolveStreaming(
+  flagOn: boolean,
+  specStreaming: boolean | undefined,
+): boolean | undefined {
+  if (flagOn) return true;
+  return specStreaming;
+}
+
+/**
+ * One compile warning as the one-line `code + path + message` form the
+ * compile command prints (and `--strict` escalates):
+ * `warning[<code>] <path>: <message>`.
+ */
+export function formatCompileWarning(w: CompileWarning): string {
+  return `warning[${w.code}] ${w.path}: ${w.message}`;
+}
