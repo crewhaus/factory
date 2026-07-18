@@ -15,6 +15,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
+import { Writable } from "node:stream";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 // Type-only — the concrete factories are dynamically imported inside the
 // deploy/propose handlers (lazy boot); the approval gate helper needs the
@@ -81,6 +82,9 @@ import {
 import { GENERATED_README_MARKER, type IrBudget, projectLoop } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
+// Item 1 (G30) — the MCP-server projection runtime. `crewhaus serve --mcp`
+// builds `invoke` from the run interpreter's turn function and hands it here.
+import { type McpInvoke, type McpServerHandle, createMcpServer } from "@crewhaus/mcp-server";
 // PR 10 — the memory fabric's composition root: `crewhaus run` makes the
 // same one stable wireMemory call compiled bundles emit. PR 16 adds
 // connectThredz (the §4.3 backend flip's boot helper — bare-name MCP tool
@@ -93,6 +97,9 @@ import {
   wireMemory,
 } from "@crewhaus/memory-service";
 import { createMemoryStore } from "@crewhaus/memory-store";
+// Item 10 (G89) — the default public plugin registry (registry.crewhaus.ai)
+// `crewhaus plugins list/search` fall back to when no --registry / env is set.
+import { DEFAULT_MODULE_REGISTRY_URL } from "@crewhaus/module-marketplace-client";
 import {
   BUILTIN_DEFAULT_RULES,
   type JustificationJudge,
@@ -102,6 +109,10 @@ import {
   parsePermissionsConfig,
   tagRules,
 } from "@crewhaus/permission-engine";
+// Item 3 (G32) — plugin activation. `crewhaus run` activates the spec's
+// `plugins:` (and the `--plugins` override) in-process exactly like a compiled
+// bundle's boot (`renderPlugins` in @crewhaus/target-cli).
+import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";
 // Adaptive model routing — `crewhaus route status|reset` inspects/clears the
 // per-(routeKey, model) reward scoreboard behind `agent.model_pool`; advise
 // mines the same scoreboard into pool-policy suggestions.
@@ -119,6 +130,12 @@ import { type Spec, parseSpec } from "@crewhaus/spec";
 import { specHasPath } from "@crewhaus/spec-patch";
 import type { RegistryAdapter } from "@crewhaus/spec-registry";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
+// Item 4 (§59) — `crewhaus export claude-plugin` emits an Anthropic-compatible
+// plugin directory from any IR variant.
+import { TargetClaudePluginError, emitClaudePlugin } from "@crewhaus/target-claude-plugin";
+// Item 10 (G89) — the default public template registry (registry.crewhaus.ai)
+// `crewhaus templates list/search` fall back to when no --registry / env is set.
+import { DEFAULT_TEMPLATE_REGISTRY_URL } from "@crewhaus/template-marketplace-client";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
@@ -791,6 +808,18 @@ import {
   findFalsePositives,
   renderPiiTuneLines,
 } from "./pii-tune";
+// Item 3 (G32) — `plugins:` activation resolution for `run`/`dev` + the
+// `--plugins` override. Pure name resolution (unit-testable); the real
+// `activatePlugins` / dev spec-override wiring is below in this entry file.
+import { parsePluginsFlag, resolvePluginNames } from "./plugin-activation";
+// Item 4 (§59) — `crewhaus export claude-plugin` helpers: author / out-dir
+// resolution + the post-emit smoke check (the emitted plugin.json / .mcp.json
+// parse). Pure; the disk write + `emitClaudePlugin` call live below.
+import {
+  resolveClaudePluginAuthor,
+  resolveExportOutDir,
+  smokeCheckClaudePluginBundle,
+} from "./plugin-export";
 // Item 59 — PR-based optimize/advise proposals. `crewhaus propose` packages a
 // spec change into a review artifact + opens a PR (never auto-merges), in a
 // side-effect-free module so it is unit-testable (this entry file runs an argv
@@ -950,6 +979,22 @@ import {
   renderSecurityDigestHtml,
   renderSecurityDigestText,
 } from "./security-digest";
+// Item 1 (G30) — `crewhaus serve --mcp` projection helpers: transport / tools-
+// mode / port / sub-agent-descriptor resolution + the target guard. Pure; the
+// runtime wiring (build `invoke` from the run interpreter, bind the transport)
+// lives below in this entry file.
+import {
+  SERVE_MCP_DEFAULT_PORT,
+  SERVE_MCP_USAGE,
+  ServeMcpError,
+  assertServeTargetSupported,
+  assertToolsModeSatisfiable,
+  buildMcpSubAgentDescriptors,
+  filterChildTools,
+  resolveMcpToolsMode,
+  resolveMcpTransport,
+  resolveServePort,
+} from "./serve-mcp";
 // Loop contract 0.4 (Batch B, G53) — `sessions export --format trajectories`
 // assembly ((state, action, observation, reward) tuples from session event
 // logs + trace events, terminal-sparse reward ladder), in a side-effect-free
@@ -1186,6 +1231,10 @@ const RUN_SCHEMA: ParseArgsSchema = {
     // servers `crewhaus mcp doctor` marked chronically failing in
     // `.crewhaus/mcp/quarantine.json` (default: withdraw them + inject a notice).
     { name: "no-mcp-quarantine", takesValue: false },
+    // Item 3 (G32) — override the spec's `plugins:` list for this run: a
+    // comma-separated set of installed plugin names to activate at boot
+    // instead of the spec's. `--plugins ""` activates none.
+    { name: "plugins", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -1223,6 +1272,52 @@ const DEV_SCHEMA: ParseArgsSchema = {
     { name: "once", takesValue: false },
     // Debounce window (ms) for coalescing a burst of fs changes. Default 150.
     { name: "debounce", takesValue: true },
+    // Item 3 (G32) — override the spec's `plugins:` list for the launched
+    // child: a comma-separated set of installed plugin names compiled into the
+    // bundle in place of the spec's. `--plugins ""` activates none. Absent →
+    // the spec list is compiled unchanged (a byte-identical bundle).
+    { name: "plugins", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 1 (G30) — `crewhaus serve --mcp <spec> [--sse]`: project the spec's
+// agent as an MCP server (stdio or HTTP+SSE) so it becomes a tool inside
+// Claude Code / an IDE / another CrewHaus runtime.
+const SERVE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Required — the projection kind. `serve` reserves room for other exposure
+    // kinds; `--mcp` is the only one today.
+    { name: "mcp", takesValue: false },
+    // Serve over HTTP+SSE (a `fetch` server) instead of stdio; overrides the
+    // spec's `expose.mcp.transport`.
+    { name: "sse", takesValue: false },
+    // SSE listen port (default 8000, or CREWHAUS_MCP_PORT). Ignored for stdio.
+    { name: "port", takesValue: true },
+    // Threaded into the projected agent's turn exactly as on `crewhaus run`.
+    { name: "model", takesValue: true },
+    { name: "permission-mode", takesValue: true },
+    { name: "plugins", takesValue: true },
+    { name: "no-mcp-quarantine", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 4 (§59) — `crewhaus export claude-plugin <spec> [--out <dir>]`: emit an
+// Anthropic-compatible Claude Code plugin directory from any target shape.
+const EXPORT_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Output directory (default: <cwd>/<pluginName>). Refuses to overwrite a
+    // non-empty dir without --force.
+    { name: "out", short: "o", takesValue: true },
+    { name: "force", takesValue: false },
+    // Plugin author name/email stamped into .claude-plugin/plugin.json
+    // (Anthropic's schema requires a non-empty author; name defaults to
+    // "CrewHaus").
+    { name: "author", takesValue: true },
+    { name: "author-email", takesValue: true },
+    // Override the plugin description (default: the IR's name + target).
+    { name: "description", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -2329,6 +2424,8 @@ function usageText(): string {
     "  compile <spec.yaml> --emit-ir        print the lowered IR as JSON (debug)",
     "  compile <spec.yaml> --emit-as cf-worker  emit the Cloudflare-Worker bundle (cli|workflow|graph)",
     "  compile <spec.yaml> --watch          re-run parse→lint→compile on every change (item 41)",
+    "  export claude-plugin <spec.yaml>     emit an Anthropic Claude Code plugin dir from the spec",
+    "                  [--out <dir>] [--force] [--author <name>]  (item 4)",
     "  lint [spec.yaml] [--fix]             check-only: parse + ir-passes (§47 chain / graph-crew",
     "       [--format text|json]            well-formedness the CLI compile path skips) + scope audit,",
     "                                       WITHOUT emitting; --fix does nearest-match/typo repairs (item 41)",
@@ -2337,12 +2434,15 @@ function usageText(): string {
     "                  [--resume <id>]      resume a specific session (cli targets only)",
     "                  [--continue]         resume the most-recent session (cli targets only)",
     "                  [--prompt <text>]    run one turn and exit, printing the reply (cli: no REPL; browser: the single-turn input, else stdin)",
+    "                  [--plugins <a,b>]    override the spec's plugins: list for this run (item 3)",
     "                  [--justification-judge rule-based|claude]  Pillar 3 intent-gate judge (FR-004)",
     "                  [--egress-matcher substring|semantic]  Pillar 3 sink-side matcher (FR-006)",
     "                  [--egress-embedder <model>]  embedder for --egress-matcher semantic",
+    "  serve --mcp <spec.yaml> [--sse]      project the cli agent as an MCP server (stdio or HTTP+SSE)",
+    "                  [--port <n>] [--plugins <a,b>]  so it is a tool in Claude Code / an IDE (item 1)",
     "  dev <spec.yaml> [--once]             compile in memory + run the bundle as a supervised child,",
     "                  [--debounce <ms>]    relaunching on every spec/commands/skills change",
-    "                                       (CREWHAUS_TRACE=pretty by default; per-turn summaries)",
+    "                  [--plugins <a,b>]    (CREWHAUS_TRACE=pretty by default; per-turn summaries)",
     "  runs resume <session>                re-drive a persisted cli session (e.g. one PARKED on a",
     "                  [--spec <path>]      pending approval, resolved via `approvals grant`); resolves",
     "                  [--prompt <text>]    the spec from --spec or cwd/crewhaus.yaml",
@@ -4216,6 +4316,7 @@ async function runRun(args: ParsedArgs): Promise<void> {
       "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--streaming] [--trace off|ring|pretty|json] [--budget-usd <n>] [--justification-judge rule-based|claude] [--egress-matcher substring|semantic] [--egress-embedder <model>]\n" +
         "  --prompt <text> runs a single turn non-interactively and prints the reply, then exits (no REPL) — for scripting/CI; composes with --resume/--continue\n" +
         "  --model accepts the full router grammar: claude-* (Anthropic), openai/<m>, gemini/<m>, bedrock/<id> (geo prefixes tolerated), local/<m>@<url>\n" +
+        '  --plugins <a,b,c> overrides the spec\'s plugins: list for this run (installed plugin names, comma-separated; --plugins "" activates none)\n' +
         "  --streaming dispatches tools mid-stream (as each tool_use block completes) instead of after the full response; the spec's agent.streaming sets the default, the flag forces it on\n" +
         "  --trace <level> overrides the spec's observability.trace.level for this run: pretty/json attach the structured-event-printer, ring keeps only the bus ring buffer (default), off suppresses the printer; the flag wins over the spec block and CREWHAUS_TRACE\n" +
         "  Cost tracking is ON by default (accrues per-call spend; set observability.cost.enabled: false to disable, CREWHAUS_COST_INLINE=1 to print a per-call line, `crewhaus cost-summary --session <id>` to total it after the run)\n" +
@@ -4649,16 +4750,41 @@ async function runRunCli(
   // unchanged — only *how* lineage matches are detected.
   const egressMatcher = await resolveEgressMatcher(args, ir.security?.egressMatcher);
 
+  // Item 3 (G32) — plugin activation, the same split boot a compiled bundle
+  // runs (renderPlugins in @crewhaus/target-cli): activate EARLY so the plugins'
+  // `<plugin>/skills` dirs feed skill discovery below, and register their tools
+  // LATE (after built-in/skill/memory/sub-agent tools) so a first-party name
+  // wins the collision. `--plugins <a,b>` overrides the spec's `plugins:` list
+  // (an empty override activates none); absent → the spec list, so a spec with
+  // no `plugins:` and no flag activates nothing (the pre-Batch-G path).
+  const pluginNames = resolvePluginNames(ir.plugins, strFlag(args, "plugins"));
+  let pluginSkillDirs: readonly string[] = [];
+  let pluginTools: readonly RegisteredTool[] = [];
+  if (pluginNames.length > 0) {
+    const activated = await activatePlugins({
+      names: pluginNames,
+      ...createDefaultPluginRuntime({
+        allowUnsigned: process.env["CREWHAUS_PLUGIN_ALLOW_UNSIGNED"] === "1",
+      }),
+    });
+    pluginSkillDirs = activated.skillDirs;
+    pluginTools = activated.tools;
+    process.stdout.write(
+      `[plugins] ${activated.loaded.length} activated: ${pluginNames.join(", ")}\n`,
+    );
+    for (const warning of activated.warnings) process.stdout.write(`[plugins] ${warning}\n`);
+  }
+
   // Section 11 — discover hooks, skills, and slash commands from the user's
   // workspace. Hooks come from `~/.crewhaus/settings.json` + `<cwd>/.crewhaus/settings.json`;
-  // skills from `~/.crewhaus/skills/*/SKILL.md` + project-equivalent; slash
-  // commands from `<cwd>/.crewhaus/commands/*.md`. When skills are present,
-  // a synthetic `Skill(name)` tool is appended to the tool list so the
-  // model can lazily fetch each skill's body.
+  // skills from `~/.crewhaus/skills/*/SKILL.md` + project-equivalent (plus the
+  // activated plugins' skill dirs); slash commands from `<cwd>/.crewhaus/commands/*.md`.
+  // When skills are present, a synthetic `Skill(name)` tool is appended to the
+  // tool list so the model can lazily fetch each skill's body.
   const cwd = process.cwd();
   const [settingsHooks, discoveredSkills, discoveredCommands] = await Promise.all([
     loadHooks({ cwd }),
-    discoverSkills({ cwd }),
+    discoverSkills({ cwd, ...(pluginSkillDirs.length > 0 ? { pluginDirs: pluginSkillDirs } : {}) }),
     loadCommands({ cwd }),
   ]);
   // Loop contract 0.4 (Batch A) — spec-declared `hooks:` layer BELOW the
@@ -4971,6 +5097,20 @@ async function runRunCli(
     process.stdout.write(
       `[sub-agents] ${subAgents.size} available: ${[...subAgents.keys()].join(", ")}\n`,
     );
+  }
+
+  // Item 3 (G32) — register the activated plugins' tools LAST so a plugin tool
+  // named after a built-in / skill / memory / MCP / sub-agent tool is skipped
+  // (first-party wins the collision), mirroring the compiled bundle's
+  // register-late boot.
+  for (const t of pluginTools) {
+    if (tools.some((existing) => existing.name === t.name)) {
+      process.stdout.write(
+        `[plugins] tool "${t.name}" already registered — plugin contribution skipped\n`,
+      );
+      continue;
+    }
+    tools.push(t);
   }
 
   // Section 18 — wire the sandbox floor for code-execution tools. #18 made
@@ -5427,6 +5567,7 @@ function describeAgentIdentityLine(cwd: string): string {
  */
 function devCompileAndEmit(
   absSpec: string,
+  pluginsOverride?: readonly string[],
 ):
   | { readonly ok: true; readonly cwd: string; readonly target: string }
   | { readonly ok: false; readonly error: string } {
@@ -5435,6 +5576,19 @@ function devCompileAndEmit(
     yamlText = readFileSync(absSpec, "utf-8");
   } catch (err) {
     return { ok: false, error: `read failed: ${(err as Error).message}` };
+  }
+  // Item 3 (G32) — `dev --plugins` overrides the spec's `plugins:` list for the
+  // launched child. The compiled bundle activates `ir.plugins` at boot (there
+  // is no runtime override), so rewrite the key in the YAML doc before compile;
+  // an empty override serializes `plugins: []`, which lowers to "activate none".
+  if (pluginsOverride !== undefined) {
+    try {
+      const doc = parseDocument(yamlText);
+      doc.set("plugins", [...pluginsOverride]);
+      yamlText = doc.toString();
+    } catch (err) {
+      return { ok: false, error: `--plugins override failed: ${(err as Error).message}` };
+    }
   }
   let bundle: ReturnType<typeof compile>;
   let target: string;
@@ -5508,7 +5662,7 @@ async function devForwardAndScan(
 async function runDev(args: ParsedArgs): Promise<void> {
   if (args.flags["help"] === true) {
     process.stdout.write(
-      "usage: crewhaus dev <spec.yaml> [--once] [--debounce <ms>]\n" +
+      "usage: crewhaus dev <spec.yaml> [--once] [--debounce <ms>] [--plugins <a,b>]\n" +
         "  Compiles the spec in memory, runs the emitted bundle as a supervised\n" +
         "  child (CREWHAUS_TRACE=pretty by default — turns stream live), and\n" +
         "  recompiles + relaunches it on every spec / .crewhaus/commands / skills\n" +
@@ -5516,7 +5670,8 @@ async function runDev(args: ParsedArgs): Promise<void> {
         "  restarts (bounded). Each completed turn prints a [dev] summary. Ctrl-C\n" +
         "  stops. --once launches one run to completion and exits with its code\n" +
         "  (a credential-free boot check for CI). --debounce sets the change-\n" +
-        "  coalescing window in ms (default 150).\n",
+        "  coalescing window in ms (default 150). --plugins <a,b,c> overrides the\n" +
+        '  spec\'s plugins: list compiled into the child (--plugins "" activates none).\n',
     );
     return;
   }
@@ -5524,9 +5679,15 @@ async function runDev(args: ParsedArgs): Promise<void> {
   if (typeof specPath !== "string") die("missing <spec.yaml>");
   const absSpec = resolve(specPath);
 
+  // Item 3 (G32) — a present `--plugins` overrides the spec's `plugins:` list in
+  // every compile of the child (initial + each recompile); absent → the spec's
+  // list compiles unchanged, keeping the emitted bundle byte-identical.
+  const pluginsFlag = strFlag(args, "plugins");
+  const pluginsOverride = pluginsFlag !== undefined ? parsePluginsFlag(pluginsFlag) : undefined;
+
   // Initial in-memory compile + emit. A broken spec fails fast here (exit 1);
   // nothing is launched.
-  const initial = devCompileAndEmit(absSpec);
+  const initial = devCompileAndEmit(absSpec, pluginsOverride);
   if (!initial.ok) die(`dev: ${initial.error}`);
   const target = initial.target;
   const entry = devEntrypointFor(target);
@@ -5621,7 +5782,7 @@ async function runDev(args: ParsedArgs): Promise<void> {
     isDaemon: isDevDaemonTarget(target),
     initialCwd: initial.cwd,
     spawn: spawnChild,
-    recompile: () => devCompileAndEmit(absSpec),
+    recompile: () => devCompileAndEmit(absSpec, pluginsOverride),
     watcher,
     timer: {
       set: (fn, ms) => setTimeout(fn, ms),
@@ -5640,6 +5801,508 @@ async function runDev(args: ParsedArgs): Promise<void> {
     };
     process.on("SIGINT", onSigint);
   });
+}
+
+/**
+ * Item 4 (§59) — `crewhaus export claude-plugin <spec> [--out <dir>]`. Emits an
+ * Anthropic-compatible Claude Code plugin directory from any target shape via
+ * the pure `emitClaudePlugin`, SMOKE-TESTS the projection (the required
+ * plugin.json + any .mcp.json parse and carry their keys) BEFORE writing, then
+ * writes the files under the chosen out dir. Structured failures
+ * (SpecParseError / TargetClaudePluginError) route through die() upstream.
+ */
+async function runExportClaudePlugin(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"] === true) {
+    process.stdout.write(
+      "usage: crewhaus export claude-plugin <spec.yaml> [--out <dir>] [--force]\n" +
+        "                       [--author <name>] [--author-email <email>] [--description <text>]\n" +
+        "  Emits an Anthropic-compatible Claude Code plugin directory from the spec:\n" +
+        "  .claude-plugin/plugin.json, README.md, skills/<name>/SKILL.md, one\n" +
+        "  agents/<name>.md per sub-agent, and .mcp.json when the spec declares\n" +
+        "  mcp_servers. Drop the emitted dir under ~/.claude/plugins/ (or a project\n" +
+        "  .claude/plugins/) to load the agent's skills inside Claude Code. Default\n" +
+        "  output dir is ./<plugin-name>; --force overwrites a non-empty dir. The\n" +
+        "  emitted plugin.json / .mcp.json are smoke-checked before anything is written.\n",
+    );
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof SpecParseError) die(err.message);
+    throw err;
+  }
+
+  const descriptionFlag = strFlag(args, "description");
+  const bundle = emitClaudePlugin(ir, {
+    author: resolveClaudePluginAuthor(strFlag(args, "author"), strFlag(args, "author-email")),
+    ...(descriptionFlag !== undefined && descriptionFlag.trim() !== ""
+      ? { description: descriptionFlag.trim() }
+      : {}),
+  });
+
+  // Smoke-test the projection BEFORE writing — a malformed plugin.json /
+  // .mcp.json fails loudly instead of leaving a broken plugin dir on disk. The
+  // target-claude-plugin package tests content shape; this asserts the emitted
+  // DIRECTORY is loadable (the required files parse + carry their keys).
+  const issues = smokeCheckClaudePluginBundle(bundle.files);
+  if (issues.length > 0) {
+    die(
+      `export claude-plugin: emitted bundle failed the smoke check:\n  - ${issues.join("\n  - ")}`,
+    );
+  }
+
+  const outDir = resolveExportOutDir(strFlag(args, "out"), process.cwd(), ir.name);
+  if (existsSync(outDir) && readdirSync(outDir).length > 0 && args.flags["force"] !== true) {
+    die(`refusing to overwrite non-empty ${outDir} — pass --force to overwrite`);
+  }
+  mkdirSync(outDir, { recursive: true });
+  for (const file of bundle.files) {
+    const full = join(outDir, file.path);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, file.content);
+  }
+  const hasMcp = bundle.files.some((f) => f.path === ".mcp.json");
+  process.stdout.write(
+    `exported ${ir.name} (${ir.target}) → ${outDir} — ${bundle.files.length} files${hasMcp ? ", incl. .mcp.json" : ""}, smoke check ✓\n`,
+  );
+}
+
+/**
+ * Item 1 (G30) — `crewhaus serve --mcp <spec> [--sse]`. Compiles the spec in
+ * memory, builds the projected agent's `invoke` from the SAME interpreter turn
+ * function `crewhaus run` drives (see {@link buildServeRuntime}), and binds it
+ * to the requested transport via `@crewhaus/mcp-server` so the agent becomes a
+ * tool inside Claude Code / an IDE / another CrewHaus runtime.
+ *
+ * The transport/tools-mode resolve from the spec's `expose.mcp` block and the
+ * `--sse`/`--port` flags (`./serve-mcp`). stdio OWNS stdout (the JSON-RPC
+ * channel), so for stdio every other stdout write — the agent's own
+ * diagnostics AND runtime-core status lines — is redirected to stderr for the
+ * whole serve and the transport is handed a PRIVATE writable bound to the
+ * original stdout; a `[memory]`/`[mcp]` notice can never corrupt the protocol.
+ */
+async function runServeMcp(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"] === true) {
+    process.stdout.write(SERVE_MCP_USAGE);
+    return;
+  }
+  if (args.flags["mcp"] !== true) {
+    die(
+      "crewhaus serve requires --mcp (the only projection kind today) — see `crewhaus serve --help`",
+    );
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof SpecParseError) die(err.message);
+    throw err;
+  }
+  assertServeTargetSupported(ir.target);
+  const cliIr = ir as Extract<ReturnType<typeof lower>, { target: "cli" }>;
+
+  const expose = cliIr.expose?.mcp;
+  const transport = resolveMcpTransport(args.flags["sse"] === true, expose?.transport);
+  const toolsMode = resolveMcpToolsMode(expose?.tools);
+  assertToolsModeSatisfiable(toolsMode, cliIr.subAgents.length);
+  const port =
+    transport === "sse"
+      ? resolveServePort(strFlag(args, "port"), process.env["CREWHAUS_MCP_PORT"])
+      : SERVE_MCP_DEFAULT_PORT;
+
+  // stdio → keep the agent's stdout off the JSON-RPC channel (see the docblock).
+  let protocolStdout: Writable | undefined;
+  let restoreStdout: (() => void) | undefined;
+  if (transport === "stdio") {
+    const originalWrite = process.stdout.write;
+    const boundOriginal = originalWrite.bind(process.stdout);
+    protocolStdout = new Writable({
+      write(chunk, _enc, cb): void {
+        boundOriginal(chunk as string | Uint8Array);
+        cb();
+      },
+    });
+    (process.stdout as { write: typeof process.stdout.write }).write = ((
+      chunk: string | Uint8Array,
+      ...rest: unknown[]
+    ) =>
+      (process.stderr.write as (c: string | Uint8Array, ...a: unknown[]) => boolean)(
+        chunk,
+        ...rest,
+      )) as typeof process.stdout.write;
+    restoreStdout = () => {
+      (process.stdout as { write: typeof process.stdout.write }).write = originalWrite;
+    };
+  }
+
+  const runtime = await buildServeRuntime(args, cliIr);
+  const version = cliVersion();
+  const handle = createMcpServer({
+    invoke: runtime.invoke,
+    transport,
+    tools: toolsMode,
+    ...(toolsMode === "per-subagent"
+      ? { subAgents: buildMcpSubAgentDescriptors(cliIr.subAgents) }
+      : {}),
+    name: cliIr.name,
+    ...(version !== undefined ? { version } : {}),
+    instructions: `Calls the "${cliIr.name}" CrewHaus agent. Each tool call runs one agent turn and returns its final reply.`,
+    chatToolDescription: `Send a message to the "${cliIr.name}" agent and get its reply.`,
+  });
+
+  let sseServer: ReturnType<typeof Bun.serve> | undefined;
+  if (handle.transport === "stdio") {
+    await handle.listen(protocolStdout !== undefined ? { stdout: protocolStdout } : undefined);
+    process.stdout.write(
+      `[serve] MCP stdio server for "${cliIr.name}" ready (tools: ${toolsMode}) — add it to your MCP client's config\n`,
+    );
+  } else {
+    sseServer = Bun.serve({ port, fetch: (req) => handle.fetch(req) });
+    process.stdout.write(
+      `[serve] MCP SSE server for "${cliIr.name}" on http://localhost:${port} (tools: ${toolsMode}) — POST MCP requests to /\n`,
+    );
+  }
+
+  const shutdown = async (): Promise<void> => {
+    await handle.close().catch(() => {});
+    if (sseServer !== undefined) sseServer.stop();
+    await runtime.cleanup();
+    protocolStdout?.end();
+    restoreStdout?.();
+  };
+
+  // The transport (stdio reader / Bun.serve) keeps the loop alive; SIGINT — or,
+  // for stdio, the parent closing our stdin — tears everything down and exits.
+  await new Promise<void>((resolveServe) => {
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      void shutdown().then(() => {
+        process.stderr.write("\n[serve] stopped.\n");
+        resolveServe();
+      });
+    };
+    process.on("SIGINT", finish);
+    if (handle.transport === "stdio") {
+      process.stdin.once("end", finish);
+      process.stdin.once("close", finish);
+    }
+  });
+}
+
+/**
+ * Item 1 (G30) — build the projected agent's `invoke` (+ a `cleanup`) from the
+ * SAME interpreter wiring `crewhaus run` uses (`runRunCli`): resolve the model,
+ * load the built-in / knowledge / memory / sub-agent / plugin / MCP tools,
+ * compile the permission rules, and assemble the `runChatLoop` options. Each
+ * MCP tool call runs ONE turn (`singleTurn`) from the caller's message and
+ * resolves with the final assistant text. Turns are serialized — one agent
+ * instance, one turn at a time (which also keeps the stdio stdout redirect
+ * single-flight safe).
+ *
+ * Under `tools: "per-subagent"` a call carrying `context.subAgent` runs THAT
+ * sub-agent's turn instead: its own instructions + model and its `tools:`
+ * allowlist (a v0 simplification — the parent permission rules still apply; the
+ * sub-agent's `permissions:` scoping is not yet remapped here, see the batch-G
+ * CLI report).
+ *
+ * Deliberately a FOCUSED mirror of `runRunCli` (like `runRunBrowser`): the
+ * REPL-only surfaces — session store / resume, the exit-rating teardown, the
+ * alert & SLO sinks, incident capture, the budget cap, the MCP quarantine
+ * notice — are omitted; a served projection is stateless per call. Keep the
+ * tool / permission / model wiring in step with `runRunCli` when either moves.
+ */
+async function buildServeRuntime(
+  args: ParsedArgs,
+  ir: Extract<ReturnType<typeof lower>, { target: "cli" }>,
+): Promise<{ invoke: McpInvoke; cleanup: () => Promise<void> }> {
+  // Built-in tools (Section 14 per-tool config applied first).
+  let tools: RegisteredTool[] = [];
+  if (ir.tools.length > 0) {
+    await applyToolConfigs(ir.tools, ir.toolConfigs);
+    const toolMap = await loadToolMap();
+    tools = ir.tools.map((name) => {
+      const tool = toolMap[name];
+      if (!tool) {
+        const known = Object.keys(toolMap).sort().join(", ");
+        die(`unknown tool "${name}" — known tools: ${known}`);
+      }
+      return tool;
+    });
+  }
+
+  // Item 3 (G32) — activate plugins EARLY so their skill dirs feed discovery;
+  // their tools register LATE (first-party wins a name collision), mirroring
+  // the compiled bundle's split boot. Honours the spec `plugins:` + `--plugins`.
+  const pluginNames = resolvePluginNames(ir.plugins, strFlag(args, "plugins"));
+  let pluginSkillDirs: readonly string[] = [];
+  let pluginTools: readonly RegisteredTool[] = [];
+  if (pluginNames.length > 0) {
+    const activated = await activatePlugins({
+      names: pluginNames,
+      ...createDefaultPluginRuntime({
+        allowUnsigned: process.env["CREWHAUS_PLUGIN_ALLOW_UNSIGNED"] === "1",
+      }),
+    });
+    pluginSkillDirs = activated.skillDirs;
+    pluginTools = activated.tools;
+    process.stdout.write(
+      `[plugins] ${activated.loaded.length} activated: ${pluginNames.join(", ")}\n`,
+    );
+    for (const warning of activated.warnings) process.stdout.write(`[plugins] ${warning}\n`);
+  }
+
+  // MCP servers — connect + register remote tools (thredz through connectThredz,
+  // degrade-on-failure). Mirror of runRunCli / the target-cli codegen.
+  let mcpHost: McpHost | undefined;
+  let thredzConn: ThredzConnection | null = null;
+  const thredzWired = ir.thredz !== undefined && ir.mcp_servers["thredz"] !== undefined;
+  if (Object.keys(ir.mcp_servers).length > 0) {
+    const host = new McpHost({ logger });
+    mcpHost = host;
+    for (const [name, cfg] of Object.entries(ir.mcp_servers)) {
+      host.addServer(name, resolveMcpServerConfig(cfg, { name }));
+    }
+    const tempCatalog = new ToolCatalog();
+    for (const t of tools) tempCatalog.register(t);
+    if (thredzWired) {
+      thredzConn = await connectThredz(host, tempCatalog, {
+        log: (line) => process.stdout.write(line),
+        ...(ir.thredz?.agentName !== undefined ? { agentName: ir.thredz.agentName } : {}),
+      });
+    }
+    await Promise.all(
+      Object.keys(ir.mcp_servers)
+        .filter((name) => !(thredzWired && name === "thredz"))
+        .map((name) =>
+          registerMcpServer(host, name, tempCatalog, {
+            onRegister: ({ fullName }) => process.stdout.write(`[mcp] registered ${fullName}\n`),
+          }),
+        ),
+    );
+    tools = tempCatalog.list().slice();
+  }
+
+  // Knowledge RAG — ingest sources + register the shared Retrieve tool.
+  if (ir.knowledge !== undefined) {
+    const retrieveTool = await ingestKnowledge(ir.knowledge, {
+      cwd: process.cwd(),
+      ...(ir.memory?.embedder !== undefined ? { memoryEmbedder: ir.memory.embedder } : {}),
+      ...(ir.memory?.wiki?.embedder !== undefined ? { wikiEmbedder: ir.memory.wiki.embedder } : {}),
+      log: (line) => process.stdout.write(line),
+    });
+    tools.push(retrieveTool);
+  }
+
+  const modelOverride = args.flags["model"];
+  const model = typeof modelOverride === "string" ? modelOverride : ir.agent.model;
+  const streaming = resolveStreaming(args.flags["streaming"] === true, ir.agent.streaming);
+
+  const flagMode = args.flags["permission-mode"];
+  let permissionMode: PermissionMode;
+  if (typeof flagMode === "string") {
+    if (!isValidPermissionMode(flagMode)) {
+      die(
+        `invalid --permission-mode "${flagMode}" — allowed: ${VALID_PERMISSION_MODES.join(", ")}`,
+      );
+    }
+    permissionMode = flagMode;
+  } else {
+    permissionMode = ir.permissions.mode ?? "default";
+  }
+  const permissionRules = buildRuleSet(ir.permissions.rules, process.cwd());
+  const justificationJudge = await resolveJustificationJudge(args, ir.security?.justification);
+  const egressMatcher = await resolveEgressMatcher(args, ir.security?.egressMatcher);
+
+  // Skills / hooks / slash commands — plugin skill dirs feed skill discovery.
+  const cwd = process.cwd();
+  const [settingsHooks, discoveredSkills, discoveredCommands] = await Promise.all([
+    loadHooks({ cwd }),
+    discoverSkills({ cwd, ...(pluginSkillDirs.length > 0 ? { pluginDirs: pluginSkillDirs } : {}) }),
+    loadCommands({ cwd }),
+  ]);
+  const hooks = mergeSpecHooks(ir.hooks, settingsHooks);
+
+  // Memory + continuity + thredz (the same wireMemory a compiled bundle emits;
+  // the REPL-only exam/dream boot niceties are omitted for a served projection).
+  let skills: ReadonlyArray<SkillRef> = discoveredSkills;
+  let slashCommands: ReadonlyMap<string, SlashCommand> = discoveredCommands;
+  let memoryRunOpt: Parameters<typeof runChatLoop>[0]["memory"];
+  let continuityRunOpt: Parameters<typeof runChatLoop>[0]["continuity"];
+  if (
+    (ir.memory !== undefined && ir.memory.enabled !== false) ||
+    ir.continuity !== undefined ||
+    ir.thredz !== undefined
+  ) {
+    const wiredMemory = await wireMemory(memoryFragmentFromIr(ir), {
+      catalog: {
+        register: (tool) => {
+          tools.push(tool);
+        },
+      },
+      cwd,
+      log: (line) => process.stdout.write(line),
+      ...(ir.memory !== undefined && ir.memory.enabled !== false && ir.memory.embedder !== undefined
+        ? { embedder: createEmbedder({ model: ir.memory.embedder }) }
+        : {}),
+      ...(ir.thredz !== undefined ? { thredz: thredzConn } : {}),
+    });
+    memoryRunOpt = wiredMemory.options.memory;
+    continuityRunOpt = wiredMemory.options.continuity;
+    if (wiredMemory.options.skills !== undefined) skills = wiredMemory.options.skills;
+    if (wiredMemory.options.slashCommands !== undefined) {
+      slashCommands = wiredMemory.options.slashCommands;
+    }
+  }
+
+  if (skills.length > 0) tools.push(createSkillTool(skills));
+
+  // Sub-agents — the Task tool (chat mode) + the routing map (per-subagent).
+  let subAgents: ReadonlyMap<string, SubAgentDefinition> | undefined;
+  if (ir.subAgents.length > 0) {
+    subAgents = new Map(
+      ir.subAgents.map((d) => [
+        d.name,
+        {
+          name: d.name,
+          description: d.description,
+          instructions: d.instructions,
+          tools: d.tools,
+          ...(d.model !== undefined ? { model: d.model } : {}),
+          permissions: d.permissions,
+          inherit_bypass: d.inheritBypass,
+        } satisfies SubAgentDefinition,
+      ]),
+    );
+    tools.push(createTaskTool({ subAgents }));
+  }
+
+  // Plugin tools register LAST — a plugin tool named after a built-in / skill /
+  // MCP tool is skipped so first-party wins the collision.
+  for (const t of pluginTools) {
+    if (tools.some((existing) => existing.name === t.name)) {
+      process.stdout.write(
+        `[plugins] tool "${t.name}" already registered — plugin contribution skipped\n`,
+      );
+      continue;
+    }
+    tools.push(t);
+  }
+
+  const hasCodeExecTools = ir.tools.some(
+    (t) => t === "python" || t === "javascript" || t === "shell",
+  );
+  const sandboxAvailable = resolveSandboxAvailable();
+
+  // The loop options shared by every turn (primary agent OR a routed sub-agent).
+  const commonOptions = {
+    permissionMode,
+    permissionRules,
+    sessionName: ir.name,
+    sessionTarget: ir.target,
+    hooks,
+    skills,
+    slashCommands,
+    singleTurn: true as const,
+    ...(hasCodeExecTools ? { sandboxAvailable } : {}),
+    ...(ir.agent.maxTokens !== undefined ? { maxTokens: ir.agent.maxTokens } : {}),
+    ...(ir.compaction.model !== undefined ? { compactionModel: ir.compaction.model } : {}),
+    ...loopContractRunOptions(ir),
+    ...(streaming !== undefined ? { streaming } : {}),
+    ...(ir.failureTaxonomy !== undefined && ir.failureTaxonomy.length > 0
+      ? { failureTaxonomy: ir.failureTaxonomy }
+      : {}),
+    ...(justificationJudge !== undefined ? { justificationJudge } : {}),
+    ...(egressMatcher !== undefined ? { egressMatcher } : {}),
+  };
+
+  // Primary-agent model routing (failover / tiers / pool) — only without a
+  // `--model` override, exactly as runRunCli threads it.
+  const primaryModelRouting =
+    typeof modelOverride === "string"
+      ? {}
+      : {
+          ...(ir.agent.modelFallbacks !== undefined && ir.agent.modelFallbacks.length > 0
+            ? { modelFallbacks: ir.agent.modelFallbacks }
+            : {}),
+          ...(ir.agent.circuitBreaker !== undefined
+            ? { circuitBreaker: ir.agent.circuitBreaker }
+            : {}),
+          ...(ir.agent.modelTiers !== undefined ? { modelTiers: ir.agent.modelTiers } : {}),
+          ...(ir.agent.modelPool !== undefined ? { modelPool: ir.agent.modelPool } : {}),
+        };
+
+  const primaryOptions = {
+    ...commonOptions,
+    model,
+    instructions: ir.agent.instructions,
+    tools,
+    ...primaryModelRouting,
+    ...(subAgents !== undefined ? { subAgents, spawnSubAgent } : {}),
+    ...(memoryRunOpt !== undefined ? { memory: memoryRunOpt } : {}),
+    ...(continuityRunOpt !== undefined ? { continuity: continuityRunOpt } : {}),
+  };
+
+  // One agent, one turn at a time.
+  let queue: Promise<unknown> = Promise.resolve();
+  const serialize = <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = queue.then(fn, fn);
+    queue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+
+  const invoke: McpInvoke = (message, context) =>
+    serialize(() => {
+      if (context.subAgent !== undefined) {
+        const def = subAgents?.get(context.subAgent);
+        if (def === undefined) {
+          throw new ServeMcpError(`unknown sub-agent "${context.subAgent}"`);
+        }
+        return runChatLoop({
+          ...commonOptions,
+          model: def.model ?? model,
+          instructions: def.instructions,
+          // `def.tools` is the sub-agent's resolved allowlist (always concrete
+          // from the IR; `?? []` only satisfies the optional runtime type).
+          tools: filterChildTools(tools, def.tools ?? []),
+          seedMessages: [{ role: "user" as const, content: message }],
+        });
+      }
+      return runChatLoop({
+        ...primaryOptions,
+        seedMessages: [{ role: "user" as const, content: message }],
+      });
+    });
+
+  const cleanup = async (): Promise<void> => {
+    if (mcpHost !== undefined) await mcpHost.disconnectAll();
+  };
+
+  return { invoke, cleanup };
 }
 
 async function runDoctor(args: ParsedArgs): Promise<void> {
@@ -13018,9 +13681,10 @@ async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
         "       [--registry <ref>] [--dry-run]\n" +
         "\n" +
         "  The registry backend is a directory of manifest JSONs (or file:<dir>) or an\n" +
-        "  http(s):// index; falls back to CREWHAUS_PLUGIN_REGISTRY. Install respects\n" +
-        "  plugin-registry's fail-closed signature verification; --allow-unsigned opts\n" +
-        "  out for local development.\n",
+        "  http(s):// index; falls back to CREWHAUS_PLUGIN_REGISTRY, then the default\n" +
+        "  public registry (registry.crewhaus.ai/plugins). Install respects plugin-\n" +
+        "  registry's fail-closed signature verification; --allow-unsigned opts out for\n" +
+        "  local development.\n",
     );
     return;
   }
@@ -13031,10 +13695,13 @@ async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
   const registryPath =
     typeof registryFileFlag === "string" ? registryFileFlag : defaultPluginRegistryPath();
   const allowUnsigned = args.flags["allow-unsigned"] === true;
+  // Item 10 (G89) — registry resolution: --registry > CREWHAUS_PLUGIN_REGISTRY >
+  // the default public registry (registry.crewhaus.ai/plugins), so `plugins
+  // list`/`search` work out of the box with no configuration.
   const registryRef =
     typeof args.flags["registry"] === "string"
       ? args.flags["registry"]
-      : process.env["CREWHAUS_PLUGIN_REGISTRY"];
+      : (process.env["CREWHAUS_PLUGIN_REGISTRY"] ?? DEFAULT_MODULE_REGISTRY_URL);
 
   const { createPluginRegistry } = await import("@crewhaus/plugin-registry");
   const pluginRegistry = createPluginRegistry({ registryPath, allowUnsigned });
@@ -13229,14 +13896,18 @@ async function runTemplates(args: ParsedArgs, action: string): Promise<void> {
         "       [--subdir <dir>] [--registry <ref>]\n" +
         "\n" +
         "  The registry backend is a directory of manifest JSONs (or file:<dir>) or an\n" +
-        "  http(s):// index; falls back to CREWHAUS_TEMPLATE_REGISTRY.\n",
+        "  http(s):// index; falls back to CREWHAUS_TEMPLATE_REGISTRY, then the default\n" +
+        "  public registry (registry.crewhaus.ai/templates).\n",
     );
     return;
   }
+  // Item 10 (G89) — registry resolution: --registry > CREWHAUS_TEMPLATE_REGISTRY
+  // > the default public registry (registry.crewhaus.ai/templates), so
+  // `templates list`/`search` work out of the box with no configuration.
   const registryRef =
     typeof args.flags["registry"] === "string"
       ? args.flags["registry"]
-      : process.env["CREWHAUS_TEMPLATE_REGISTRY"];
+      : (process.env["CREWHAUS_TEMPLATE_REGISTRY"] ?? DEFAULT_TEMPLATE_REGISTRY_URL);
   const resolved = resolveMarketplaceRegistryRef(registryRef, "template");
 
   const { LocalRegistrySource, HttpRegistrySource } = await import("@crewhaus/template-registry");
@@ -16929,6 +17600,35 @@ switch (subcommand) {
       throw err;
     }
     break;
+  case "serve":
+    // Item 1 (G30) — project the spec's agent as an MCP server (stdio/SSE).
+    // Structured failures (spec parse/lower, ServeMcpError for a misconfigured
+    // projection) route through die() for a clean one-liner.
+    try {
+      await runServeMcp(parseFor(rest, SERVE_SCHEMA));
+    } catch (err) {
+      if (err instanceof ServeMcpError) die(err.message);
+      if (err instanceof CrewhausError) die(err);
+      throw err;
+    }
+    break;
+  case "export": {
+    // Item 4 (§59) — `export claude-plugin <spec>`. Only the claude-plugin
+    // target exists today; a leading -h/--help routes to the handler's help.
+    const first = rest[0] ?? "";
+    const isHelp = first === "--help" || first === "-h";
+    if (!isHelp && first !== "claude-plugin") {
+      die(`export target must be "claude-plugin" (got "${first}")`);
+    }
+    try {
+      await runExportClaudePlugin(parseFor(isHelp ? rest : rest.slice(1), EXPORT_SCHEMA));
+    } catch (err) {
+      if (err instanceof TargetClaudePluginError) die(err.message);
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "eval":
     // Item 6 — `eval coverage` is a distinct read-side report with its own
     // flags; every other `eval …` invocation is the run path.

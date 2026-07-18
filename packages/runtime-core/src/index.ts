@@ -918,6 +918,23 @@ export type RunChatLoopOptions = {
   input?: NodeJS.ReadableStream;
   /** Tools the model may invoke. When empty/undefined, tools are not advertised. */
   tools?: ReadonlyArray<RegisteredTool>;
+  /**
+   * Item 3 (G32) — plugin-contributed pieces to fold into this run. The caller
+   * activates the spec's `plugins:` list (or the `--plugins` override) via
+   * `@crewhaus/plugin-loader`'s `activatePlugins` and passes the result here.
+   *
+   * Only `tools` are the chat loop's to bind: they are APPENDED to `opts.tools`
+   * and advertised to the model, with first-party tools winning any name
+   * collision (a plugin can augment the catalog but not silently shadow a
+   * built-in). The other contribution kinds bind at their own hosts — channels
+   * at the channel daemon, models at the model-router, graders at the eval
+   * stack, target emitters at the compiler — so they are deliberately not
+   * accepted here. A compiled bundle instead registers plugin tools directly on
+   * its `defaultCatalog`; this option is the interpreter path's equivalent so a
+   * `runChatLoop` caller need not mutate a global catalog. Absent → the run is
+   * byte-identical to a pre-G32 runtime.
+   */
+  plugins?: { readonly tools?: ReadonlyArray<RegisteredTool> };
   /** Per-run identity, abort signal, and logger. Defaults to a fresh `createRunContext()`. */
   runContext?: RunContext;
   /** Context-window limit in tokens. Defaults to 200_000 (Claude opus/sonnet 4.x). */
@@ -1851,7 +1868,33 @@ export function buildTimeoutFailureReport(timeout: TimeoutAbortReason): FailureR
   };
 }
 
+/**
+ * Item 3 (G32) — merge plugin-contributed tools into the run's advertised tool
+ * set. First-party `base` tools WIN any name collision, so an activated plugin
+ * can augment the catalog but never silently shadow a built-in. Returns the
+ * `base` array unchanged (same reference) when there are no plugin tools, so a
+ * run without the `plugins` option is byte-identical to a pre-G32 runtime.
+ */
+function mergeEffectiveTools(
+  base: ReadonlyArray<RegisteredTool>,
+  pluginTools: ReadonlyArray<RegisteredTool> | undefined,
+): ReadonlyArray<RegisteredTool> {
+  if (pluginTools === undefined || pluginTools.length === 0) return base;
+  const byName = new Set(base.map((t) => t.name));
+  const merged: RegisteredTool[] = [...base];
+  for (const tool of pluginTools) {
+    if (byName.has(tool.name)) continue; // first-party wins the collision
+    byName.add(tool.name);
+    merged.push(tool);
+  }
+  return merged;
+}
+
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
+  // Item 3 (G32) — resolve the advertised tool set ONCE, up front, folding in
+  // any plugin-contributed tools so the tool-capable-model feature gate and the
+  // per-turn advertisement below read the same list.
+  const effectiveTools = mergeEffectiveTools(opts.tools ?? [], opts.plugins?.tools);
   // Pillar 3 — make the model-backed Layer-3 classifier reachable at EVERY
   // trust boundary (MCP / sub-agent / channel / federation / skill /
   // compaction / chain / orchestrator). Boundary call sites don't thread an
@@ -1942,7 +1985,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // adapter that doesn't speak tool use (e.g. Bedrock Llama/Mistral
   // families). Fail with a clear ConfigError naming the model instead of
   // letting the provider 400 (or silently drop the tools) mid-run.
-  if ((opts.tools ?? []).length > 0 && adapter.features.tool_use === false) {
+  if (effectiveTools.length > 0 && adapter.features.tool_use === false) {
     throw new ConfigError(
       `model "${opts.model}" (provider ${providerId}) does not support tool use — remove tools or pick a tool-capable model`,
     );
@@ -2906,7 +2949,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     }
   }
 
-  const tools = opts.tools ?? [];
+  const tools = effectiveTools;
   const anthropicTools: Anthropic.Tool[] | undefined =
     tools.length > 0
       ? tools.map((t) => ({

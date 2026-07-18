@@ -13,6 +13,19 @@ const baseReq: ProviderRequest = {
   maxTokens: 1024,
 };
 
+/** Recursively collect every key name appearing anywhere in a value. */
+function allKeys(node: unknown, into: Set<string> = new Set()): Set<string> {
+  if (Array.isArray(node)) {
+    for (const item of node) allKeys(item, into);
+  } else if (node !== null && typeof node === "object") {
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      into.add(key);
+      allKeys(value, into);
+    }
+  }
+  return into;
+}
+
 describe("toOpenAIChatParams", () => {
   test("non-reasoning models keep max_tokens (compat servers only understand it)", () => {
     for (const model of ["gpt-4o", "gpt-4o-mini", "llama3.1:8b", "deepseek-chat"]) {
@@ -77,13 +90,22 @@ describe("toOpenAIChatParams", () => {
       ],
       toolChoice: { type: "tool", name: "Read" },
     });
+    // A plain object schema qualifies for Structured-Outputs strict mode:
+    // `additionalProperties: false`, every property in `required`, and the
+    // (originally optional) `path` made nullable so omission is expressible.
     expect(params.tools).toEqual([
       {
         type: "function",
         function: {
           name: "Read",
           description: "Read a file",
-          parameters: { type: "object", properties: { path: { type: "string" } } },
+          parameters: {
+            type: "object",
+            properties: { path: { type: ["string", "null"] } },
+            required: ["path"],
+            additionalProperties: false,
+          },
+          strict: true,
         },
       },
     ]);
@@ -93,6 +115,73 @@ describe("toOpenAIChatParams", () => {
   test("toolChoice 'any' → 'required'", () => {
     const params = toOpenAIChatParams({ ...baseReq, toolChoice: { type: "any" } });
     expect(params.tool_choice).toBe("required");
+  });
+
+  test("a $ref-heavy but strict-expressible schema is upgraded to strict:true", () => {
+    const params = toOpenAIChatParams({
+      ...baseReq,
+      tools: [
+        {
+          name: "connect",
+          description: "open a connection",
+          input_schema: {
+            type: "object",
+            properties: {
+              target: { $ref: "#/$defs/Endpoint" },
+              retries: { type: "integer" },
+            },
+            required: ["target"],
+            $defs: {
+              Endpoint: {
+                type: "object",
+                properties: { url: { type: "string" } },
+                required: ["url"],
+              },
+            },
+          },
+        },
+      ],
+    });
+    const fn = params.tools?.[0]?.function as {
+      strict?: boolean;
+      parameters?: Record<string, unknown>;
+    };
+    expect(fn.strict).toBe(true);
+    const p = fn.parameters as Record<string, unknown>;
+    expect(p["additionalProperties"]).toBe(false);
+    // both properties required under strict; the optional one made nullable
+    expect(new Set(p["required"] as string[])).toEqual(new Set(["target", "retries"]));
+    const props = p["properties"] as Record<string, Record<string, unknown>>;
+    expect(props["retries"]?.["type"]).toEqual(["integer", "null"]);
+    // ref inlined + nested object also locked down
+    const target = props["target"] as Record<string, unknown>;
+    expect(target["additionalProperties"]).toBe(false);
+    expect(allKeys(p).has("$ref")).toBe(false);
+  });
+
+  test("a schema outside the strict subset stays non-strict (no strict flag)", () => {
+    const params = toOpenAIChatParams({
+      ...baseReq,
+      tools: [
+        {
+          name: "search",
+          description: "search",
+          input_schema: {
+            type: "object",
+            properties: { q: { type: "string", pattern: "^.+$" } },
+            required: ["q"],
+          },
+        },
+      ],
+    });
+    const fn = params.tools?.[0]?.function as { strict?: boolean; parameters?: unknown };
+    expect(fn.strict).toBeUndefined();
+    // Original schema rides through untouched (constraints preserved).
+    expect(fn.parameters).toEqual({
+      type: "object",
+      properties: { q: { type: "string", pattern: "^.+$" } },
+      required: ["q"],
+    });
   });
 
   test("assistant tool_use block → tool_calls on the assistant message", () => {

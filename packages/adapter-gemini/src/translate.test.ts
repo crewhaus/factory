@@ -422,4 +422,71 @@ describe("toGeminiParams — Gemma models", () => {
     const params = toGeminiParams({ ...baseReq, model: "gemma-3-27b-it", tools: [] });
     expect(params.config?.tools).toBeUndefined();
   });
+
+  test("a $ref-heavy MCP schema is sanitised into Gemini's Schema subset", () => {
+    // This shape previously reached the API verbatim and 400'd: the
+    // `$ref`/`$defs` had no resolver, and `additionalProperties`/`oneOf`/
+    // the `uri` format sit outside Gemini's OpenAPI-3.0 subset.
+    const params = toGeminiParams({
+      ...baseReq,
+      tools: [
+        {
+          name: "connect",
+          description: "open a connection",
+          input_schema: {
+            $schema: "https://json-schema.org/draft/2020-12/schema",
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              target: { $ref: "#/$defs/Endpoint" },
+              mode: { oneOf: [{ const: "sync" }, { const: "async" }] },
+              note: { anyOf: [{ type: "string" }, { type: "null" }] },
+            },
+            required: ["target"],
+            $defs: {
+              Endpoint: {
+                type: "object",
+                additionalProperties: false,
+                properties: { url: { type: "string", format: "uri" } },
+                required: ["url"],
+              },
+            },
+          },
+        },
+      ],
+    });
+    const params0 = (
+      params.config?.tools as Array<{
+        functionDeclarations?: Array<{ parameters?: unknown }>;
+      }>
+    )?.[0]?.functionDeclarations?.[0]?.parameters;
+
+    // Collect every key the translated schema exposes to the API.
+    const keys = new Set<string>();
+    const walk = (n: unknown): void => {
+      if (Array.isArray(n)) for (const i of n) walk(i);
+      else if (n !== null && typeof n === "object") {
+        for (const [k, v] of Object.entries(n)) {
+          keys.add(k);
+          walk(v);
+        }
+      }
+    };
+    walk(params0);
+    for (const banned of ["$ref", "$defs", "$schema", "additionalProperties", "oneOf"]) {
+      expect(keys.has(banned)).toBe(false);
+    }
+
+    const schema = params0 as Record<string, unknown>;
+    const props = schema["properties"] as Record<string, Record<string, unknown>>;
+    // ref inlined
+    const target = props["target"] as Record<string, unknown>;
+    expect(target["type"]).toBe("object");
+    const url = (target["properties"] as Record<string, Record<string, unknown>>)["url"];
+    expect(url["type"]).toBe("string");
+    expect(url["format"]).toBeUndefined(); // `uri` is not a Gemini format
+    // nullable union flattened
+    expect(props["note"]?.["type"]).toBe("string");
+    expect(props["note"]?.["nullable"]).toBe(true);
+  });
 });

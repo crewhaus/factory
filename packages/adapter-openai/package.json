@@ -15,6 +15,7 @@
     "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/token-budget": "workspace:*",
+    "@crewhaus/tool-schema-sanitizer": "workspace:*",
     "openai": "^4.65.0"
   },
   "devDependencies": {

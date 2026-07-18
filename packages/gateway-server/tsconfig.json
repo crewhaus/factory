@@ -6,8 +6,10 @@
   },
   "references": [
     { "path": "../audit-log" },
+    { "path": "../boundary-classifier" },
     { "path": "../durable-state" },
     { "path": "../errors" },
+    { "path": "../federation-protocol" },
     { "path": "../gateway-protocol" },
     { "path": "../tenancy" }
   ],

@@ -372,6 +372,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and every emitted cf-worker bundle now ships a generated `README.md`
     (item 42).
 
+- **Loop contract 0.4, Batch G — the interoperate half of the loop: the agent
+  as an MCP server, an A2A federation peer, a plugin host, a Claude-Code plugin,
+  and portable tool/model routing.** One coordinated batch lands the spec
+  grammar, the IR, the affected emitters, the runtime seams, the gateway
+  protocol, two new packages, and the CLI:
+
+  - **`expose:` — project a compiled agent AS an MCP server (Item 1 / G30).**
+    The new `@crewhaus/mcp-server` registers a bundle's turn function as a
+    `chat` tool (one per sub-agent under `tools: per-subagent`) over `stdio`
+    or Web-Standard SSE. `crewhaus serve --mcp <spec> [--sse] [--port]`
+    projects a `target: cli` agent so Claude Code / an IDE / another CrewHaus
+    runtime calls it as a tool (each call runs one interpreter turn); the
+    `expose.mcp` block (`transport: stdio|sse`, `tools: chat|per-subagent`)
+    lowers onto cli/channel/managed IR, and the channel/managed daemons
+    self-expose from their gateway's `fetch` path. Absent `expose:` → the
+    bundle is byte-identical to pre-Batch-G.
+
+  - **A2A federation — an agent as a peer (Item 2 / G31).** The new
+    `@crewhaus/federation-protocol` builds a real A2A **Agent Card**; a
+    federation-configured gateway serves `GET /.well-known/agent-card.json`,
+    the `GET /.well-known/crewhaus.json` discovery alias (carrying the
+    cert-pin fingerprint the card omits), and the inbound `POST /federation`
+    handler (decode → app-level `authorize` → Pillar-3 classify at origin
+    `"federation"` → `dispatch` → A2A reply). The managed daemon always emits
+    the peer surface, env-gated at RUNTIME (`CREWHAUS_FEDERATION_*`; unset ⇒
+    the routes answer 404, an empty allowlist DENIES every inbound call), so
+    any deployment becomes a peer by setting env — no recompile. A
+    `sub_agents.<name>.federation.url` routes that helper's `Task` call
+    through `@crewhaus/federation-router` to the remote peer. mTLS is the
+    operator's transport floor; authentication ≠ authorization ≠
+    classification.
+
+  - **Plugins — the zero-caller load path, wired (Item 3 / G32).** A
+    `plugins:` list on cli/channel activates installed plugins through
+    `@crewhaus/plugin-loader`'s `activatePlugins`, which re-verifies each
+    manifest's Ed25519 signature + entrypoint digest against the trust
+    anchors and buckets the imported module's contributions. `runChatLoop`
+    gains a `plugins: { tools }` option: plugin-contributed tools are
+    normalised through `buildTool` and APPENDED to the advertised catalog,
+    with first-party tools winning any name collision (a plugin augments but
+    cannot silently shadow a built-in). Absent the option → the run is
+    byte-identical to a pre-G32 runtime (same `tools` reference). Item 10
+    (G89) pins the canonical default module-registry index URL the
+    marketplace clients resolve against.
+
+  - **`crewhaus export claude-plugin <spec> [--out <dir>]` (Item 4 / §59).**
+    The new `@crewhaus/target-claude-plugin` emits an Anthropic-compatible
+    Claude Code plugin directory from any shape: `.claude-plugin/plugin.json`
+    (author-stamped), a `.mcp.json` when the IR carries `mcp_servers`, and
+    per-shape skill/agent files. A `smokeCheckClaudePluginBundle` pass
+    validates the emitted `plugin.json`/`.mcp.json` before write.
+
+  - **Portable tool schemas + per-role model routing (Item 9 / G37).** The
+    new `@crewhaus/tool-schema-sanitizer` inlines every `$ref`/`$defs` and
+    projects a tool's `input_schema` onto each provider's accepted subset —
+    `sanitizeGeminiSchema` (Gemini's OpenAPI-3.0 `Schema`: `nullable`,
+    `oneOf`→`anyOf`, unsupported `format`s dropped) and `sanitizeBedrockSchema`
+    (Converse's `toolSpec.inputSchema.json`) — so a `$ref`-heavy MCP tool
+    schema no longer 400s the request; `adapter-gemini` and `adapter-bedrock`
+    now sanitize each tool at translate time. `model_pool` / `model_tiers` /
+    `model_fallbacks` / `circuit_breaker` land on workflow steps and per crew
+    role, emitting onto the `RoleDefinition`; the crew orchestrator forwards a
+    role's routing into its `runChatLoop` turns so each role's `PolicyRouter`
+    decision shares the `@crewhaus/routing-store` scoreboard. A role/step
+    without routing stays byte-identical.
+
+  - **Smaller surfaces**: `thredz.messaging` (Item 5 / G44, object-form,
+    default-off) lowers onto `IrThredz.messaging`; the voice shape now
+    ACCEPTS `tools:` and carries it with the 0.2.3-convention ignored-note
+    (G33, short-term) instead of rejecting the key.
+
 ## [0.3.2] - 2026-07-16
 
 ### Fixed

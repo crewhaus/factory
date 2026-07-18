@@ -36,6 +36,20 @@ export class MarketplaceClientError extends CrewhausError {
   }
 }
 
+/**
+ * Item 10 (G89) — the canonical default template registry index URL.
+ *
+ * A host with no `--registry` flag and no `CREWHAUS_TEMPLATE_REGISTRY` env var
+ * resolves the template marketplace against THIS index: `GET <url>` returns the
+ * catalog (`{ templates: TemplateMetadata[] }`), per-name manifests live at
+ * `<url>/<name>.json`. The sibling `@crewhaus/module-marketplace-client` carries
+ * the plugin equivalent (`DEFAULT_MODULE_REGISTRY_URL`); the two share one
+ * `registry.crewhaus.ai` host, differing only by path.
+ *
+ * Exported so the CLI and Studio's Marketplace tab share one source of truth.
+ */
+export const DEFAULT_TEMPLATE_REGISTRY_URL = "https://registry.crewhaus.ai/templates";
+
 export type SearchFilter = {
   /** Substring match on name + description (case-insensitive). */
   readonly query?: string;

@@ -22,6 +22,7 @@ import type {
   IrDiscordConfig,
   IrEvalV0,
   IrEvaluation,
+  IrExpose,
   IrFailureTaxonomyEntry,
   IrFeedback,
   IrGraphV0,
@@ -227,6 +228,17 @@ export function compile(yamlText: string, opts: CompileOptions = {}): CompileRes
  * the ACCEPTED_BUT_UNWIRED mechanism tracks top-level keys only, so there is
  * no nested-path row for it — its absent default (`"pause"`) is the safe
  * runtime behaviour on every shape regardless.
+ *
+ * Batch G: `expose:` (G30, the MCP-server projection) and `plugins:` (G32,
+ * the plugin loader) are WIRED-IN-BATCH on the shapes that carry them —
+ * expose on cli/channel/managed, plugins on cli/channel — so they are
+ * deliberately NOT listed (declaring them must not warn). `federation`
+ * (G31) is a sub-key of the universally-wired `sub_agents` block and
+ * `thredz.messaging` (G44) a sub-key of the `thredz` block; both are nested
+ * paths the top-level-only mechanism does not track, and both are wired this
+ * batch regardless. Item 9's per-role/step `model_pool`/`model_tiers`/
+ * `model_fallbacks` are nested under `roles`/`steps` and wired at lower time,
+ * so they carry no row either.
  */
 type UnwiredKey = {
   readonly path: string;
@@ -647,7 +659,43 @@ function lowerSubAgents(
     ...(def.model !== undefined ? { model: def.model } : {}),
     permissions: def.permissions ?? "inherit",
     inheritBypass: def.inherit_bypass ?? false,
+    // Item 2 (G31) — federated-peer reference. Carried only when declared; the
+    // spawner routes through the federation-router when present.
+    ...(def.federation !== undefined ? { federation: { url: def.federation.url } } : {}),
   }));
+}
+
+/**
+ * Item 1 (G30) — lower the `expose:` block to `IrExpose`, resolving the MCP
+ * tool-projection default (`tools: "chat"`). Present ONLY when the spec
+ * declares `expose.mcp`; returns `{}` otherwise so the field stays ABSENT
+ * (emitters gate on presence — an unexposed bundle is byte-identical to
+ * pre-Batch-G). Carried on the serving shapes (cli/channel/managed).
+ */
+function lowerExpose(spec: {
+  readonly expose?: {
+    readonly mcp?: {
+      readonly transport: "stdio" | "sse";
+      readonly tools?: "chat" | "per-subagent";
+    };
+  };
+}): { expose?: IrExpose } {
+  const mcp = spec.expose?.mcp;
+  if (mcp === undefined) return {};
+  return { expose: { mcp: { transport: mcp.transport, tools: mcp.tools ?? "chat" } } };
+}
+
+/**
+ * Item 3 (G32) — lower the `plugins:` list. Carried only when non-empty so an
+ * empty (or absent) declaration leaves bundles byte-identical; order is
+ * preserved (load order). Carried on the codegen-serving shapes (cli/channel).
+ */
+function lowerPlugins(spec: { readonly plugins?: readonly string[] }): {
+  plugins?: readonly string[];
+} {
+  return spec.plugins !== undefined && spec.plugins.length > 0
+    ? { plugins: [...spec.plugins] }
+    : {};
 }
 
 /**
@@ -1599,6 +1647,7 @@ type SpecThredz =
       readonly visibility?: "private" | "shared";
       readonly goals?: boolean;
       readonly agents?: boolean | string;
+      readonly messaging?: boolean;
     };
 
 type SpecWithThredz = {
@@ -1653,6 +1702,10 @@ function lowerThredzBlock(spec: SpecWithThredz, continuityGoalsOn: boolean): IrT
     visibility: obj.visibility ?? "private",
     goals: obj.goals ?? continuityGoalsOn,
     ...(agentName !== undefined ? { agentName } : {}),
+    // Item 5 (G44) — messaging tools stay OFF unless explicitly asked; carried
+    // only when true so the default-off posture leaves the IR (and bundles)
+    // byte-identical to pre-Batch-G.
+    ...(obj.messaging === true ? { messaging: true } : {}),
   };
 }
 
@@ -2114,6 +2167,9 @@ export function lower(spec: Spec): IrNode {
         ...(thredzLowered.thredz !== undefined ? { thredz: thredzLowered.thredz } : {}),
         ...learning,
         ...lowerObservability(spec),
+        // Batch G — MCP-server projection (G30) + plugin activation (G32).
+        ...lowerExpose(spec),
+        ...lowerPlugins(spec),
         // Phase 3 §3.3 — CLI banner config. Plus Phase 2 M2.2 TUI mode
         // gate. Only included when the spec author opted in (cli block
         // and its fields are optional).
@@ -2172,6 +2228,9 @@ export function lower(spec: Spec): IrNode {
             ...lowerThinking(s.thinking),
             tools: s.tools ?? [],
             toolConfigs: lowerToolConfigs(s.tool_config),
+            // Item 9 (G37) — per-step model routing (failover/tiers/pool),
+            // reusing the cli agent block's lowering verbatim.
+            ...lowerModelFailover(s),
           };
         }),
         mcp_servers: lowerMcpServers(spec.mcp_servers),
@@ -2243,6 +2302,9 @@ export function lower(spec: Spec): IrNode {
         ...(thredzLowered.thredz !== undefined ? { thredz: thredzLowered.thredz } : {}),
         ...learning,
         ...lowerObservability(spec),
+        // Batch G — MCP-server projection (G30) + plugin activation (G32).
+        ...lowerExpose(spec),
+        ...lowerPlugins(spec),
         // Phase 3 §3.1 — heartbeat. Duration string ("2h", "30m") is
         // parsed once at lower time so codegen emits a literal numeric
         // setInterval arg in ms.
@@ -2404,6 +2466,10 @@ export function lower(spec: Spec): IrNode {
         ...(thredzLowered.thredz !== undefined ? { thredz: thredzLowered.thredz } : {}),
         ...learning,
         ...lowerObservability(spec),
+        // Batch G — MCP-server projection (G30); SSE exposure rides this
+        // shape's gateway tenancy. No plugins on managed (item 3 boot paths
+        // cover cli + channel-bot codegen).
+        ...lowerExpose(spec),
       } satisfies IrManagedV0;
     }
     case "pipeline":
@@ -2769,6 +2835,9 @@ function lowerCrewRole(name: string, role: SpecCrewRole, fallbackModel: string):
     tools: role.tools ?? [],
     toolConfigs: lowerToolConfigs(role.tool_config),
     subAgents: lowerSubAgents(role.sub_agents),
+    // Item 9 (G37) — per-role model routing (failover/tiers/pool), reusing the
+    // cli agent block's lowering verbatim.
+    ...lowerModelFailover(role),
   };
 }
 

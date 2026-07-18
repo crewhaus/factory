@@ -43,6 +43,7 @@ import {
   type ReasoningEffort,
   type ToolChoice,
 } from "@crewhaus/adapter-anthropic";
+import { toOpenAIStrictSchema } from "@crewhaus/tool-schema-sanitizer";
 import type OpenAI from "openai";
 
 type ChatRole = "system" | "user" | "assistant" | "tool";
@@ -152,6 +153,24 @@ function collapseSystem(system: ReadonlyArray<CanonicalTextBlockParam>): string 
 }
 
 function toOpenAITool(t: CanonicalTool): OpenAI.Chat.Completions.ChatCompletionTool {
+  // Opt qualifying tools into Structured-Outputs strict mode: when the
+  // schema can be expressed in the strict subset, `toOpenAIStrictSchema`
+  // returns a strict-ready form ($refs inlined, `additionalProperties:
+  // false` on every object, all properties required) and we set
+  // `strict: true`. Otherwise the original schema rides the non-strict
+  // path — strict is best-effort, never worth a 400.
+  const strictSchema = toOpenAIStrictSchema(t.input_schema);
+  if (strictSchema !== null) {
+    return {
+      type: "function",
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: strictSchema,
+        strict: true,
+      },
+    };
+  }
   return {
     type: "function",
     function: {

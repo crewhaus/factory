@@ -471,11 +471,16 @@ export const OPTIMIZABLE_PATHS: Readonly<
     //                                the volatile tail block (token cost vs
     //                                plan/ledger completeness)
     // Deliberately EXCLUDED — the optimizer tunes quality, never semantics:
-    // thredz.* (credentials), memory.backend (store flip), memory.dream.every
-    // + .mode (side-effecting schedule / model-spend switch), continuity
+    // thredz.* (credentials; thredz.messaging = a destructive send-tool
+    // switch), memory.backend (store flip), memory.dream.every + .mode
+    // (side-effecting schedule / model-spend switch), continuity
     // .proof/.scope/.enabled (behavioral switches), compaction
     // .preserve_user_messages (safety), learning.sources (allowlist =
-    // security).
+    // security). Batch G adds more of the same category: expose.* (G30 — the
+    // deployment/exposure surface, not a quality knob), plugins (G32 — a
+    // capability allowlist = supply-chain security, human-owned like
+    // learning.sources / the model roster), and sub_agents.*.federation (G31
+    // — cross-deployment wiring / trust boundary). None are optimizer-reachable.
     Object.freeze(["memory", "recallK"]),
     Object.freeze(["memory", "autoCaptureThreshold"]),
     Object.freeze(["memory", "ttl"]),
@@ -506,6 +511,11 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["memory", "refreshEvery"]),
   ]),
   workflow: Object.freeze([
+    // Whole-step replacement — this ALSO reaches item 9's (G37) per-step
+    // model routing (model_pool policy/routing/learning, tiers, fallbacks):
+    // no narrower entry is possible (the roster/step index is positional) and
+    // whole-step replacement already spans model/instructions, so the policy
+    // knobs ride here rather than as standalone paths.
     Object.freeze(["steps"]),
     Object.freeze(["failure_taxonomy"]),
     Object.freeze(["chains"]),
@@ -583,6 +593,11 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["retrieve", "defaultK"]),
   ]),
   crew: Object.freeze([
+    // Whole-role replacement — this ALSO reaches item 9's (G37) per-role
+    // model routing (model_pool policy/routing/learning, tiers, fallbacks):
+    // the role name is a dynamic map key, so no static narrower path exists,
+    // and whole-role replacement already spans model/instructions, so the
+    // policy knobs ride here rather than as standalone paths.
     Object.freeze(["roles"]),
     Object.freeze(["failure_taxonomy"]),
     Object.freeze(["chains"]),

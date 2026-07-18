@@ -3,7 +3,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalRegistrySource, type TemplateManifest } from "@crewhaus/template-registry";
-import { MarketplaceClient, MarketplaceClientError, MarketplacePublisher } from "./index";
+import {
+  DEFAULT_TEMPLATE_REGISTRY_URL,
+  MarketplaceClient,
+  MarketplaceClientError,
+  MarketplacePublisher,
+} from "./index";
 
 const seed = (overrides: Partial<TemplateManifest> = {}): TemplateManifest => ({
   name: "hello-cli-template",
@@ -213,5 +218,13 @@ describe("MarketplacePublisher (T1 + T3)", () => {
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
+  });
+});
+
+describe("DEFAULT_TEMPLATE_REGISTRY_URL (G89)", () => {
+  test("is the canonical https registry index on the shared registry host", () => {
+    expect(DEFAULT_TEMPLATE_REGISTRY_URL).toBe("https://registry.crewhaus.ai/templates");
+    expect(DEFAULT_TEMPLATE_REGISTRY_URL.endsWith("/")).toBe(false);
+    expect(DEFAULT_TEMPLATE_REGISTRY_URL.startsWith("https://")).toBe(true);
   });
 });

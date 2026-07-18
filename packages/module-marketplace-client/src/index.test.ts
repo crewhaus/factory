@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { PluginRegistry, PluginRegistryEntry } from "@crewhaus/plugin-registry";
 import type { PluginManifest } from "@crewhaus/plugin-sdk";
 import {
+  DEFAULT_MODULE_REGISTRY_URL,
   ModuleMarketplaceError,
   type ModuleRegistrySource,
   type PluginMetadata,
@@ -366,5 +367,15 @@ describe("draftPublish", () => {
       writeFileImpl: recordWrite,
     });
     expect(() => c.draftPublish({ name: "BadCaps" as never, version: "1.0.0" } as never)).toThrow();
+  });
+});
+
+describe("DEFAULT_MODULE_REGISTRY_URL (G89)", () => {
+  test("is the canonical https registry index, no trailing slash", () => {
+    expect(DEFAULT_MODULE_REGISTRY_URL).toBe("https://registry.crewhaus.ai/plugins");
+    // The HTTP source appends `/<name>.json`, so a trailing slash would
+    // double it — the documented default must be slash-free.
+    expect(DEFAULT_MODULE_REGISTRY_URL.endsWith("/")).toBe(false);
+    expect(DEFAULT_MODULE_REGISTRY_URL.startsWith("https://")).toBe(true);
   });
 });

@@ -2,15 +2,20 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { generateKeyPairSync, sign } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
+import { createPluginRegistry } from "@crewhaus/plugin-registry";
 import {
   type PluginManifest,
   entrypointDigest,
   manifestPayloadForSigning,
 } from "@crewhaus/plugin-sdk";
+import { z } from "zod";
 import {
   PluginLoaderError,
+  activatePlugins,
+  createDefaultPluginRuntime,
   createPluginLoader,
+  defaultPluginPaths,
   isFsAllowed,
   isNetAllowed,
   matchesGlob,
@@ -390,5 +395,229 @@ describe("plugin-loader.load — security checks", () => {
     }
     expect(caught).toBeInstanceOf(PluginLoaderError);
     expect(imported).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// activatePlugins (Item 3 / G32) — the zero-caller load path, wired.
+// ---------------------------------------------------------------------------
+
+/** A live plugin module: `definePlugin({ … })`'s shape, contributing one tool
+ *  whose name embeds the plugin's so a test can tell contributions apart. The
+ *  tool object carries a real zod schema + execute fn — the executable form
+ *  that only ever exists in the imported module, never in the JSON manifest. */
+function pluginModule(name: string): { default: unknown } {
+  return {
+    default: {
+      name,
+      version: "1.0.0",
+      contributions: {
+        tools: [
+          {
+            name: `${name}-tool`,
+            description: `contributed by ${name}`,
+            inputSchema: z.object({ q: z.string() }),
+            execute: async () => `hello from ${name}`,
+          },
+        ],
+      },
+    },
+  };
+}
+
+/** Install a signed plugin: write its signed manifest under `pluginsRoot/<name>`
+ *  and register it in `registry` (sourcePath → that manifest). No index.js is
+ *  written — the loader's `importEntrypoint` seam returns the module instead. */
+function installSignedPlugin(args: {
+  name: string;
+  pluginsRoot: string;
+  privateKey: ReturnType<typeof generateKeyPairSync>["privateKey"];
+  registry: ReturnType<typeof createPluginRegistry>;
+}): Promise<void> {
+  const dir = join(args.pluginsRoot, args.name);
+  mkdirSync(dir, { recursive: true });
+  const signed = signManifest({ name: args.name, version: "1.0.0" }, args.privateKey);
+  const sourcePath = join(dir, "plugin.json");
+  writeFileSync(sourcePath, JSON.stringify(signed));
+  return args.registry.register({ manifest: signed, sourcePath }).then(() => undefined);
+}
+
+describe("defaultPluginPaths", () => {
+  test("resolves the canonical ~/.crewhaus locations", () => {
+    const paths = defaultPluginPaths("/home/alice");
+    expect(paths.pluginsDir).toBe(join("/home/alice", ".crewhaus", "plugins"));
+    expect(paths.registryPath).toBe(join("/home/alice", ".crewhaus", "plugin-registry.json"));
+  });
+});
+
+describe("createDefaultPluginRuntime", () => {
+  test("builds a registry + loader from the default paths", () => {
+    const runtime = createDefaultPluginRuntime({ homeDir: tmpRoot, allowUnsigned: true });
+    expect(typeof runtime.registry.get).toBe("function");
+    expect(typeof runtime.loader.load).toBe("function");
+  });
+
+  test("fails closed: no trust anchors + allowUnsigned false → no plugin could verify", () => {
+    // Mirrors createPluginLoader's own fail-closed construction guard.
+    expect(() => createDefaultPluginRuntime({ homeDir: tmpRoot })).toThrow(PluginLoaderError);
+  });
+});
+
+describe("activatePlugins", () => {
+  test("a signed plugin activates and contributes a tool", async () => {
+    const { publicKeyPem, privateKey } = makeKeypair();
+    const registry = createPluginRegistry({
+      registryPath: join(tmpRoot, "registry.json"),
+      allowUnsigned: true,
+    });
+    await installSignedPlugin({ name: "greeter", pluginsRoot: tmpRoot, privateKey, registry });
+    const loader = createPluginLoader({
+      trustedRoots: [tmpRoot],
+      trustAnchors: [{ name: "test", publicKeyPem }],
+      importEntrypoint: async () => pluginModule("greeter"),
+    });
+
+    const activated = await activatePlugins({ names: ["greeter"], registry, loader });
+
+    expect(activated.loaded.length).toBe(1);
+    expect(activated.loaded[0]?.signed).toBe(true);
+    expect(activated.tools.map((t) => t.name)).toEqual(["greeter-tool"]);
+    // The contributed tool is normalized (buildTool ran): the fail-closed
+    // scope/justification defaults are present on the returned RegisteredTool.
+    expect(activated.tools[0]?.scope).toBe("internal");
+    expect(activated.tools[0]?.requireJustification).toBe(false);
+    expect(activated.warnings).toEqual([]);
+  });
+
+  test("gating: only plugins named in `names` are loaded, in order", async () => {
+    const { publicKeyPem, privateKey } = makeKeypair();
+    const registry = createPluginRegistry({
+      registryPath: join(tmpRoot, "registry.json"),
+      allowUnsigned: true,
+    });
+    await installSignedPlugin({ name: "alpha", pluginsRoot: tmpRoot, privateKey, registry });
+    await installSignedPlugin({ name: "beta", pluginsRoot: tmpRoot, privateKey, registry });
+    const importedPaths: string[] = [];
+    const loader = createPluginLoader({
+      trustedRoots: [tmpRoot],
+      trustAnchors: [{ name: "test", publicKeyPem }],
+      importEntrypoint: async (absPath) => {
+        importedPaths.push(absPath);
+        return pluginModule(absPath.includes(`${sep}alpha${sep}`) ? "alpha" : "beta");
+      },
+    });
+
+    // Only "alpha" is named, even though "beta" is installed.
+    const activated = await activatePlugins({ names: ["alpha"], registry, loader });
+
+    expect(activated.tools.map((t) => t.name)).toEqual(["alpha-tool"]);
+    // "beta" was never loaded — the gate is the names list, not the registry.
+    expect(importedPaths.every((p) => p.includes(`${sep}alpha${sep}`))).toBe(true);
+    expect(importedPaths.some((p) => p.includes(`${sep}beta${sep}`))).toBe(false);
+  });
+
+  test("preserves load order and de-dupes repeated names", async () => {
+    const { publicKeyPem, privateKey } = makeKeypair();
+    const registry = createPluginRegistry({
+      registryPath: join(tmpRoot, "registry.json"),
+      allowUnsigned: true,
+    });
+    await installSignedPlugin({ name: "one", pluginsRoot: tmpRoot, privateKey, registry });
+    await installSignedPlugin({ name: "two", pluginsRoot: tmpRoot, privateKey, registry });
+    const loader = createPluginLoader({
+      trustedRoots: [tmpRoot],
+      trustAnchors: [{ name: "test", publicKeyPem }],
+      importEntrypoint: async (absPath) =>
+        pluginModule(absPath.includes(`${sep}two${sep}`) ? "two" : "one"),
+    });
+
+    const activated = await activatePlugins({
+      names: ["two", "one", "two"],
+      registry,
+      loader,
+    });
+
+    expect(activated.tools.map((t) => t.name)).toEqual(["two-tool", "one-tool"]);
+    expect(activated.loaded.length).toBe(2);
+  });
+
+  test("collects a plugin's <dir>/skills directory for skills-registry", async () => {
+    const { publicKeyPem, privateKey } = makeKeypair();
+    const registry = createPluginRegistry({
+      registryPath: join(tmpRoot, "registry.json"),
+      allowUnsigned: true,
+    });
+    await installSignedPlugin({ name: "skilled", pluginsRoot: tmpRoot, privateKey, registry });
+    await installSignedPlugin({ name: "plain", pluginsRoot: tmpRoot, privateKey, registry });
+    // Only "skilled" ships a skills/ bundle.
+    mkdirSync(join(tmpRoot, "skilled", "skills"), { recursive: true });
+    const loader = createPluginLoader({
+      trustedRoots: [tmpRoot],
+      trustAnchors: [{ name: "test", publicKeyPem }],
+      importEntrypoint: async (absPath) =>
+        pluginModule(absPath.includes(`${sep}skilled${sep}`) ? "skilled" : "plain"),
+    });
+
+    const activated = await activatePlugins({
+      names: ["skilled", "plain"],
+      registry,
+      loader,
+    });
+
+    // The loader realpath-resolves entrypoints (macOS /var → /private/var), so
+    // match on the suffix rather than the pre-realpath temp path. Only the
+    // plugin that actually ships a skills/ dir is collected.
+    expect(activated.skillDirs.length).toBe(1);
+    expect(activated.skillDirs[0]?.endsWith(join("skilled", "skills"))).toBe(true);
+  });
+
+  test("missing plugin throws by default, warns under onMissing: warn", async () => {
+    const { publicKeyPem } = makeKeypair();
+    const registry = createPluginRegistry({
+      registryPath: join(tmpRoot, "registry.json"),
+      allowUnsigned: true,
+    });
+    const loader = createPluginLoader({
+      trustedRoots: [tmpRoot],
+      trustAnchors: [{ name: "test", publicKeyPem }],
+    });
+
+    await expect(activatePlugins({ names: ["ghost"], registry, loader })).rejects.toThrow(
+      /not installed in the plugin registry/,
+    );
+
+    const activated = await activatePlugins({
+      names: ["ghost"],
+      registry,
+      loader,
+      onMissing: "warn",
+    });
+    expect(activated.loaded).toEqual([]);
+    expect(activated.warnings.length).toBe(1);
+    expect(activated.warnings[0]).toContain("ghost");
+  });
+
+  test("an unsigned-but-tampered plugin is refused at activation (loader re-verifies)", async () => {
+    const { publicKeyPem, privateKey } = makeKeypair();
+    const registry = createPluginRegistry({
+      registryPath: join(tmpRoot, "registry.json"),
+      allowUnsigned: true,
+    });
+    const dir = join(tmpRoot, "evil");
+    mkdirSync(dir, { recursive: true });
+    const signed = signManifest({ name: "evil", version: "1.0.0" }, privateKey);
+    // Tamper the on-disk manifest AFTER signing + registering.
+    const sourcePath = join(dir, "plugin.json");
+    writeFileSync(sourcePath, JSON.stringify({ ...signed, version: "9.9.9" }));
+    await registry.register({ manifest: signed, sourcePath });
+    const loader = createPluginLoader({
+      trustedRoots: [tmpRoot],
+      trustAnchors: [{ name: "test", publicKeyPem }],
+      importEntrypoint: async () => pluginModule("evil"),
+    });
+
+    await expect(activatePlugins({ names: ["evil"], registry, loader })).rejects.toThrow(
+      /does not verify/,
+    );
   });
 });

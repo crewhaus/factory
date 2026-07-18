@@ -8,7 +8,8 @@
     { "path": "../adapter-anthropic" },
     { "path": "../errors" },
     { "path": "../recovery-engine" },
-    { "path": "../token-budget" }
+    { "path": "../token-budget" },
+    { "path": "../tool-schema-sanitizer" }
   ],
   "include": ["src/**/*"]
 }

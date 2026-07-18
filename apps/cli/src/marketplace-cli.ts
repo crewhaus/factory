@@ -17,14 +17,18 @@
  *   - the publish loop drives `gh` behind an injected driver seam.
  *
  * REGISTRY RESOLUTION — a `--registry <ref>` flag, else
- * `CREWHAUS_PLUGIN_REGISTRY` / `CREWHAUS_TEMPLATE_REGISTRY`, selects the
- * backend:
+ * `CREWHAUS_PLUGIN_REGISTRY` / `CREWHAUS_TEMPLATE_REGISTRY`, else (item 10 / G89)
+ * the default PUBLIC registry (`DEFAULT_MODULE_REGISTRY_URL` /
+ * `DEFAULT_TEMPLATE_REGISTRY_URL` on `registry.crewhaus.ai`, wired at the
+ * `crewhaus plugins`/`templates` call sites), selects the backend:
  *   - a filesystem path (or `file:<path>`) → a LOCAL source (a directory of
  *     manifest JSONs — the same on-disk shape the registries write);
  *   - an `http(s)://` URL → an HTTP source (a `{plugins:[]}` / `{templates:[]}`
  *     JSON index at `<url>` + per-name manifests at `<url>/<name>.json`).
- * With nothing configured, the read verbs report "no registry configured"
- * rather than reaching for a hardcoded endpoint.
+ * {@link resolveRegistryRef} itself stays pure — it throws "no registry
+ * configured" for a truly-absent ref (the datasets registry path still relies
+ * on that); the default is a `?? DEFAULT_*_REGISTRY_URL` fallback the CLI
+ * applies before calling in for plugins/templates.
  *
  * SIGNING — install respects `plugin-registry`'s fail-closed verification:
  * when trust anchors are configured (via `--trust-anchor` / env), an unsigned

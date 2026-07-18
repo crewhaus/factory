@@ -4,6 +4,11 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }, { "path": "../plugin-sdk" }],
+  "references": [
+    { "path": "../errors" },
+    { "path": "../plugin-registry" },
+    { "path": "../plugin-sdk" },
+    { "path": "../tool-builder" }
+  ],
   "include": ["src/**/*"]
 }

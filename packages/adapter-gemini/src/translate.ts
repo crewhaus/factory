@@ -44,6 +44,7 @@ import {
   type ToolChoice,
 } from "@crewhaus/adapter-anthropic";
 import { ConfigError } from "@crewhaus/errors";
+import { sanitizeGeminiSchema } from "@crewhaus/tool-schema-sanitizer";
 import {
   type Content,
   FunctionCallingConfigMode,
@@ -127,7 +128,11 @@ function toGeminiFunctionDecl(
   return {
     name: t.name,
     description: t.description,
-    parameters: t.input_schema as NonNullable<
+    // Project the tool schema onto Gemini's OpenAPI-3.0 Schema subset —
+    // inline $refs, drop keywords Gemini rejects (additionalProperties,
+    // unsupported formats, …), flatten unions. An unsanitised MCP schema
+    // with `$ref`/`$defs` reaches the API as an unknown node and 400s.
+    parameters: sanitizeGeminiSchema(t.input_schema) as NonNullable<
       GeminiTool["functionDeclarations"]
     >[number]["parameters"],
   };

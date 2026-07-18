@@ -378,6 +378,43 @@ function renderRoleTuningFields(role: IrCrewRole): string {
   return pieces.join("");
 }
 
+/**
+ * Loop contract 0.4 (Batch G, item 9 / G37) — render the per-role model-
+ * routing fields onto the role's `RoleDefinition` literal. The pooled
+ * pattern is adopted verbatim from the cli agent block
+ * (`@crewhaus/target-cli`'s `renderModelFailoverFields`), so a PolicyRouter
+ * decision per role shares the same `@crewhaus/routing-store` scoreboard the
+ * cli/pipeline shapes use — runtime-core owns the router; the orchestrator
+ * forwards the RoleDefinition's config into this role's `runChatLoop` turns
+ * (primary activations AND inline A2A peer turns) exactly as it already
+ * forwards `maxTokens`/`thinking`. The four fields are mutually exclusive in
+ * the spec (`model_pool` ⊥ `model_tiers` ⊥ `model_fallbacks`, with
+ * `circuit_breaker` riding `model_fallbacks`), so at most one clause fires
+ * per role. Model strings pass through `escapeJsonString` (user-controlled
+ * spec values in generated source); the breaker/tiers/pool blocks are
+ * validated numbers/strings/closed-literal unions safe to `JSON.stringify`.
+ * Empty when the role declares none, keeping pre-existing bundles
+ * byte-identical. Mirror: target-cli + target-channel-bot + target-managed
+ * render the same fields on their agent blocks — keep the four in sync.
+ */
+function renderRoleModelFailoverFields(role: IrCrewRole): string {
+  const pieces: string[] = [];
+  const fallbacks = role.modelFallbacks;
+  if (fallbacks !== undefined && fallbacks.length > 0) {
+    pieces.push(`\n    modelFallbacks: [${fallbacks.map((m) => escapeJsonString(m)).join(", ")}],`);
+  }
+  if (role.circuitBreaker !== undefined) {
+    pieces.push(`\n    circuitBreaker: ${JSON.stringify(role.circuitBreaker)},`);
+  }
+  if (role.modelTiers !== undefined) {
+    pieces.push(`\n    modelTiers: ${JSON.stringify(role.modelTiers)},`);
+  }
+  if (role.modelPool !== undefined) {
+    pieces.push(`\n    modelPool: ${JSON.stringify(role.modelPool)},`);
+  }
+  return pieces.join("");
+}
+
 function renderRoleAgent(ir: IrCrewV0, role: IrCrewRole): string {
   const { imports, inits, registrations } = resolveTools(role.tools, role.toolConfigs);
   const hasSubAgents = role.subAgents.length > 0;
@@ -421,7 +458,7 @@ export const role: { name: string; def: RoleDefinition } = {
   name: ${escapeJsonString(role.name)},
   def: {
     model: ${escapeJsonString(role.model)},
-    instructions: ${escapeJsonString(role.instructions)},${renderRoleTuningFields(role)}
+    instructions: ${escapeJsonString(role.instructions)},${renderRoleTuningFields(role)}${renderRoleModelFailoverFields(role)}
     tools: ${toolsArrayLiteral},${subAgentsField}
   },
 };

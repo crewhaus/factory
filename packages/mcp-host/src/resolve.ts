@@ -100,6 +100,149 @@ export type ResolveMcpServerConfigOptions = {
 };
 
 /**
+ * Loop contract 0.4 (Batch G, G75) — the async secret backend an MCP boot
+ * routes through when one is configured. A structural `{ get(name):
+ * Promise<string> }` so `@crewhaus/mcp-host` stays free of a hard dependency
+ * on `@crewhaus/secrets-manager` (the same duplicate-the-shape stance the
+ * rest of this module takes); secrets-manager's `Secrets` satisfies it
+ * directly. Resolution order for a `{ kind: "env", name }` ref is
+ * secrets-backend FIRST, then the `process.env` (or injected `env`) fallback.
+ */
+export interface SecretsResolver {
+  get(name: string): Promise<string>;
+}
+
+/**
+ * A plain literal / hand-written string that STILL looks like an unexpanded
+ * shell variable (`$FOO` or `${FOO}`). The compiler lowers real `env` refs to
+ * `{ kind: "env" }`, so a surviving `$…` literal means the value was
+ * hand-authored and will be shipped VERBATIM — the transports never expand
+ * it. G75 warns rather than silently forwarding a broken credential.
+ */
+const UNPARSED_ENV_REF = /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/;
+
+export type ResolveSecretRefAsyncOptions = ResolveSecretRefOptions & {
+  /** Async secret backend consulted first for `{ kind: "env" }` refs. */
+  readonly secrets?: SecretsResolver;
+  /** Warning sink for unparsed `$…` literals. Default: a `[mcp]` stderr line. */
+  readonly onWarn?: (message: string) => void;
+};
+
+function warnIfUnparsedDollar(value: string, opts: ResolveSecretRefAsyncOptions): void {
+  if (!UNPARSED_ENV_REF.test(value.trim())) return;
+  const warn =
+    opts.onWarn ?? ((m: string): void => void process.stderr.write(`[mcp] warning: ${m}\n`));
+  const where = opts.what !== undefined ? `${opts.what} ` : "";
+  const literal = JSON.stringify(value);
+  warn(
+    `${where}is the literal ${literal} — a leading "$" is NOT expanded by the MCP transports; use an env-ref (the compiler lowers env-name values) or resolve it through a secrets backend`,
+  );
+}
+
+/**
+ * Loop contract 0.4 (Batch G, G75) — async twin of {@link resolveSecretRef}.
+ * A `{ kind: "env", name }` ref is resolved through the configured
+ * `secrets` backend first (its async `get`, e.g. vault/file-backed), then
+ * falls back to the synchronous `process.env`/`env` read (which throws,
+ * naming the variable, when the fallback is also unset — so a misconfigured
+ * boot still fails fast). `literal`/plain-string values pass through, but a
+ * value that still looks like an unexpanded `$FOO`/`${FOO}` triggers a G75
+ * warning. A secrets-backend miss (throw OR empty) is not fatal on its own —
+ * it degrades to the env fallback, matching the env-var backend's semantics.
+ */
+export async function resolveSecretRefAsync(
+  ref: McpSecretLike,
+  opts: ResolveSecretRefAsyncOptions = {},
+): Promise<string> {
+  if (typeof ref === "string") {
+    warnIfUnparsedDollar(ref, opts);
+    return ref;
+  }
+  if (ref.kind === "literal") {
+    warnIfUnparsedDollar(ref.value, opts);
+    return ref.value;
+  }
+  if (opts.secrets !== undefined) {
+    try {
+      const value = await opts.secrets.get(ref.name);
+      if (value !== "") return value;
+    } catch {
+      // Backend miss (missing/unavailable) — degrade to the env fallback
+      // below rather than failing the whole boot on the backend alone.
+    }
+  }
+  return resolveSecretRef(ref, opts);
+}
+
+export type ResolveMcpServerConfigAsyncOptions = ResolveMcpServerConfigOptions & {
+  /** See {@link ResolveSecretRefAsyncOptions.secrets}. */
+  readonly secrets?: SecretsResolver;
+  /** See {@link ResolveSecretRefAsyncOptions.onWarn}. */
+  readonly onWarn?: (message: string) => void;
+};
+
+/**
+ * Loop contract 0.4 (Batch G, G75) — async twin of
+ * {@link resolveMcpServerConfig}. Every env/header value resolves through
+ * {@link resolveSecretRefAsync}, so a configured `secrets` backend (async,
+ * pre-boot) takes precedence over `process.env`, with the env read as the
+ * fallback. Use this from a boot path that has a secrets backend wired; the
+ * sync `resolveMcpServerConfig` remains for the plain env-only path.
+ */
+export async function resolveMcpServerConfigAsync(
+  config: UnresolvedMcpServerConfig,
+  opts: ResolveMcpServerConfigAsyncOptions = {},
+): Promise<McpServerConfig> {
+  const serverLabel =
+    opts.name !== undefined ? `mcp server ${JSON.stringify(opts.name)}` : "mcp server";
+  const passthrough: Omit<ResolveSecretRefAsyncOptions, "what"> = {
+    ...(opts.env !== undefined ? { env: opts.env } : {}),
+    ...(opts.secrets !== undefined ? { secrets: opts.secrets } : {}),
+    ...(opts.onWarn !== undefined ? { onWarn: opts.onWarn } : {}),
+  };
+  if (config.transport === "stdio") {
+    const resolved: StdioServerConfig = {
+      transport: "stdio",
+      command: config.command,
+      ...(config.args !== undefined ? { args: config.args } : {}),
+      ...(config.env !== undefined
+        ? { env: await resolveSecretMapAsync(config.env, `${serverLabel} env`, passthrough) }
+        : {}),
+    };
+    return resolved;
+  }
+  const resolved: SseServerConfig = {
+    transport: "sse",
+    url: config.url,
+    ...(config.headers !== undefined
+      ? {
+          headers: await resolveSecretMapAsync(
+            config.headers,
+            `${serverLabel} header`,
+            passthrough,
+          ),
+        }
+      : {}),
+  };
+  return resolved;
+}
+
+async function resolveSecretMapAsync(
+  map: Readonly<Record<string, McpSecretLike>>,
+  labelPrefix: string,
+  passthrough: Omit<ResolveSecretRefAsyncOptions, "what">,
+): Promise<Readonly<Record<string, string>>> {
+  const out: Record<string, string> = {};
+  for (const [key, ref] of Object.entries(map)) {
+    out[key] = await resolveSecretRefAsync(ref, {
+      ...passthrough,
+      what: `${labelPrefix} ${key}`,
+    });
+  }
+  return out;
+}
+
+/**
  * Resolve every env/header value of an unresolved MCP server config into
  * the plain-string `McpServerConfig` the SDK transports consume. Throws
  * `ConfigError` (naming the variable AND the server/field) on the first

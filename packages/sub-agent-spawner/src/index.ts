@@ -34,6 +34,7 @@ import {
   type IsolatedContext,
   type ParentRunHandle,
   type SpawnSubAgentOptions,
+  type SubAgentDefinition,
   type SubAgentFailure,
   type SubAgentMessage,
   type SubAgentResult,
@@ -48,9 +49,35 @@ import {
   toFailureReport,
 } from "@crewhaus/errors";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
+import { type FederationRouter, classifyRouterError } from "@crewhaus/federation-router";
 import { buildFailureReport, classify } from "@crewhaus/recovery-engine";
 import { tagContent } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
+
+/**
+ * Item 2 (G31) — the federation extension to {@link SpawnSubAgentOptions}. A
+ * sub-agent whose runtime `def` carries `federation.url` (mirroring
+ * `IrSubAgentDefinition.federation`) is routed to a REMOTE peer through the
+ * injected `@crewhaus/federation-router` instead of being spawned in-process.
+ *
+ * The router is DEPLOY-scoped — built once with this deployment's mTLS
+ * credentials + peer discovery and injected by the runtime alongside
+ * `spawnSubAgent` — while `def.federation.url` selects the peer per call. All
+ * three fields are optional so existing (non-federated) callers pass plain
+ * `SpawnSubAgentOptions` unchanged; the function stays assignable to
+ * `SpawnSubAgentFn`.
+ */
+export type FederatedSpawnOptions = SpawnSubAgentOptions & {
+  /** Deploy-scoped router. REQUIRED whenever the spawned `def` is federated. */
+  readonly federationRouter?: FederationRouter;
+  /** This deployment's id — `federation.from.deployment`. Defaults to "local". */
+  readonly fromDeployment?: string;
+  /** The caller's role — `federation.from.role`. Defaults to "agent". */
+  readonly fromRole?: string;
+};
+
+/** Runtime `def` widened with the federated-peer reference (mirrors `IrSubAgentDefinition.federation`). */
+type MaybeFederatedDef = SubAgentDefinition & { readonly federation?: { readonly url: string } };
 
 /**
  * v0.3.0 §7.1 — classify a child terminal error at the spawner boundary.
@@ -98,8 +125,16 @@ function classifyChildFailure(err: unknown): SubAgentFailure {
  */
 export async function spawnSubAgent(
   parent: ParentRunHandle,
-  opts: SpawnSubAgentOptions,
+  opts: FederatedSpawnOptions,
 ): Promise<SubAgentResult> {
+  // Item 2 (G31) — a sub-agent wired to a remote peer
+  // (`sub_agents.<name>.federation.url`) is routed through the federation
+  // router, NOT spawned locally. Branch before minting a local
+  // IsolatedContext / child runChatLoop.
+  const federation = (opts.def as MaybeFederatedDef).federation;
+  if (federation !== undefined) {
+    return spawnFederatedSubAgent(parent, opts, federation);
+  }
   const sessionRootDir = opts.sessionRootDir ?? parent.sessionRootDir;
   const isoOpts: CreateIsolatedContextOptions = {
     name: opts.def.name,
@@ -317,6 +352,172 @@ export async function spawnSubAgent(
     usage: { input_tokens: childInputTokens, output_tokens: childOutputTokens },
     ...(childFailure !== undefined ? { failure: childFailure } : {}),
   };
+}
+
+/**
+ * Item 2 (G31) — route a federated sub-agent call to a REMOTE peer.
+ *
+ * Unlike a local spawn there is NO child IsolatedContext / runChatLoop: the
+ * peer owns its own run. We still bracket the call with `sub_agent_start` /
+ * `sub_agent_end` on the parent's log + bus (so capture/proof walkers and
+ * observability see a closed boundary), route the prompt through the injected
+ * router, and map the peer's `{ reply }` onto a `SubAgentResult`. The router
+ * has ALREADY boundary-classified the peer reply at origin "federation"
+ * (redacting a malicious verdict); we tag the safe reply into the PARENT's
+ * lineage here — the deploy-scoped router can't hold this per-spawn RunContext.
+ *
+ * Follow-up (noted in the batch return): the remote peer's token spend isn't
+ * locally metered (usage stays zero) and the remote transcript isn't visible
+ * across the federation boundary (transcript/toolCalls stay empty) — both
+ * await the deeper A2A task lifecycle (a pollable Task carrying usage +
+ * history).
+ */
+async function spawnFederatedSubAgent(
+  parent: ParentRunHandle,
+  opts: FederatedSpawnOptions,
+  federation: { readonly url: string },
+): Promise<SubAgentResult> {
+  const childRunId = `fedrun_${fedId()}`;
+  const childSessionId = `fedsess_${fedId()}`;
+
+  await parent.eventLog.append({
+    kind: "sub_agent_start",
+    payload: {
+      name: opts.def.name,
+      childSessionId,
+      childRunId,
+      prompt: opts.prompt,
+      toolCount: 0,
+      permissionMode: opts.permissionMode,
+      // Federation marker — the payload type is `unknown`, so this rides
+      // alongside the local-spawn fields and flags the boundary as remote.
+      federation: federation.url,
+    },
+  });
+
+  const parentBus = parent.runContext.eventBus;
+  const subAgentEnvelope = parentBus.envelope();
+  parentBus.publish({
+    ...subAgentEnvelope,
+    kind: "sub_agent_start",
+    name: opts.def.name,
+    childRunId,
+    childSessionId,
+    toolCount: 0,
+    promptBytes: Buffer.byteLength(opts.prompt, "utf8"),
+  });
+
+  const t0 = performance.now();
+  let finalMessage = "";
+  let isError = false;
+  let errorMessage: string | undefined;
+  let childFailure: SubAgentFailure | undefined;
+
+  const router = opts.federationRouter;
+  if (router === undefined) {
+    // A declared federated sub-agent with no injected router is a deploy
+    // misconfiguration. Fail it as a non-fatal classified error (the parent
+    // model sees an honest is_error and continues) rather than silently
+    // spawning the WRONG (local) agent.
+    isError = true;
+    const report = toFailureReport(
+      new Error(
+        `sub-agent "${opts.def.name}" declares federation.url ${federation.url} but no federation router was injected — the runtime must supply \`federationRouter\` in the spawn options`,
+      ),
+    );
+    childFailure = { failureClass: "config", report };
+    errorMessage = report.detail;
+    finalMessage = JSON.stringify({ isError: true, failureClass: "config", report });
+  } else {
+    try {
+      const { reply } = await router.call({
+        fromRole: opts.fromRole ?? "agent",
+        // `federation.url` is the peer's base URL; its hostname is the
+        // discovery `deployment` id (endpoint + cert-pin fingerprint come from
+        // the peer's `/.well-known/crewhaus.json`). The remote role addressed
+        // is the local sub-agent name.
+        to: { deployment: deploymentFromUrl(federation.url), role: opts.def.name },
+        payload: opts.prompt,
+        kind: "question",
+      });
+      finalMessage = reply;
+    } catch (err) {
+      isError = true;
+      errorMessage = (err as Error).message ?? String(err);
+      // Map the router/protocol error onto the recovery taxonomy for the
+      // parent-visible failureClass. Federation failures do NOT escalate the
+      // whole run (unlike a local child's billing/auth): a single unreachable
+      // or mis-pinned peer is a delegation the parent can route around.
+      const hint = classifyRouterError(err as Error);
+      const failureClass =
+        hint.kind === "retry" ? "network" : hint.kind === "tombstone" ? "auth" : "unknown";
+      const report = toFailureReport(err);
+      childFailure = { failureClass, report };
+      finalMessage = JSON.stringify({ isError: true, failureClass, report });
+    }
+  }
+
+  await parent.eventLog.append({
+    kind: "sub_agent_end",
+    payload: {
+      name: opts.def.name,
+      childSessionId,
+      isError,
+      ...(errorMessage !== undefined ? { errorMessage } : {}),
+      ...(childFailure !== undefined ? { failureClass: childFailure.failureClass } : {}),
+      finalMessageLength: finalMessage.length,
+      toolCallCount: 0,
+      federation: federation.url,
+    },
+  });
+
+  parentBus.publish({
+    ...parentBus.envelope(),
+    spanId: subAgentEnvelope.spanId,
+    kind: "sub_agent_end",
+    name: opts.def.name,
+    childRunId,
+    childSessionId,
+    isError,
+    ...(childFailure !== undefined ? { failureClass: childFailure.failureClass } : {}),
+    toolCallCount: 0,
+    finalMessageBytes: Buffer.byteLength(finalMessage, "utf8"),
+    durationMs: performance.now() - t0,
+  });
+
+  // Pillar 3 sink-side — the router already redacted a malicious peer reply at
+  // origin "federation"; tag the (safe) reply into the parent's data-lineage so
+  // a later external-scope tool call that smuggles it triggers the egress
+  // classifier. Skip on error (the JSON failure report isn't peer content).
+  if (!isError && finalMessage.length > 0) {
+    tagContent(parent.runContext, finalMessage, "federation");
+  }
+
+  return {
+    finalMessage,
+    transcript: [],
+    toolCalls: [],
+    usage: { input_tokens: 0, output_tokens: 0 },
+    ...(childFailure !== undefined ? { failure: childFailure } : {}),
+  };
+}
+
+/** Discovery `deployment` id for a peer base URL — the hostname (no port; the
+ *  discovery id charset forbids `:`, and the port rides in the well-known
+ *  `endpoint`). Falls back to the raw string when it isn't a parseable URL. */
+function deploymentFromUrl(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
+}
+
+let __fedSeq = 0;
+/** Short unique-ish id for a federated boundary's synthetic run/session ids. */
+function fedId(): string {
+  __fedSeq = (__fedSeq + 1) & 0xffff;
+  return `${Date.now().toString(36)}${__fedSeq.toString(36).padStart(3, "0")}`;
 }
 
 export { spawnSubAgent as default };

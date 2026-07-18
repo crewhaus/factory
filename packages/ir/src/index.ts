@@ -75,6 +75,14 @@ export type IrSubAgentDefinition = {
     | "scoped"
     | { readonly allow: readonly string[]; readonly deny: readonly string[] };
   readonly inheritBypass: boolean;
+  /**
+   * Item 2 (G31 — A2A federation) — present when the spec wires this
+   * sub-agent to a REMOTE peer (`sub_agents.<name>.federation.url`). The
+   * spawner routes the Task call through `@crewhaus/federation-router` to the
+   * peer's inbound A2A handler instead of spawning locally. Absent → the
+   * sub-agent is spawned in-process as before.
+   */
+  readonly federation?: { readonly url: string };
 };
 
 /**
@@ -686,6 +694,37 @@ export type IrThredz = {
   /** Register this addressable agent handle at boot (idempotent
    *  `agent_register`). Absent → no registration (the default). */
   readonly agentName?: string;
+  /** Item 5 (G44) — the nine Thredz messaging tools (`message_send` /
+   *  `inbox_poll` / `message_ack` / `thread_get` / `agent_*`) are registered.
+   *  Present and `true` ONLY when the spec opts in (`thredz.messaging: true`);
+   *  ABSENT means the default-off posture (the send-side tools are
+   *  destructive + justification-gated, so they never register unasked). */
+  readonly messaging?: boolean;
+};
+
+/**
+ * Item 1 (G30) — the MCP-server projection config inside {@link IrExpose}.
+ * `transport` is `stdio` (spawned stdio MCP server) or `sse` (HTTP+SSE
+ * endpoint, riding the gateway-server tenancy/budgets where the shape has
+ * them). `tools` is RESOLVED (default `"chat"`): `chat` projects one primary
+ * invoke tool (`{ message }` → final assistant text); `per-subagent` adds one
+ * tool per declared sub-agent (the spec's cross-field check guarantees at
+ * least one exists).
+ */
+export type IrExposeMcp = {
+  readonly transport: "stdio" | "sse";
+  readonly tools: "chat" | "per-subagent";
+};
+
+/**
+ * Item 1 (G30) — the `expose:` config, lowered from the top-level `expose:`
+ * block. Carried on the serving shapes (IrV0/cli, IrChannelV0, IrManagedV0).
+ * Present ONLY when the spec declares `expose.mcp`; ABSENT → the bundle is not
+ * exposed as an MCP server (byte-identical to pre-Batch-G). `mcp` is the one
+ * projection kind today; the object leaves room for future exposure targets.
+ */
+export type IrExpose = {
+  readonly mcp?: IrExposeMcp;
 };
 
 /** v0.3.0 Goal 2 (§3.3, PR 17) — the first-class competency exam: dataset +
@@ -923,6 +962,12 @@ export type IrV0 = {
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. */
   readonly observability?: IrObservability;
+  /** Item 1 (G30) — MCP-server projection config. Present when the spec
+   *  declares `expose.mcp`; absent otherwise. */
+  readonly expose?: IrExpose;
+  /** Item 3 (G32) — marketplace plugin names loaded at boot (`plugins:`).
+   *  Present (non-empty) only when the spec declares them; load order. */
+  readonly plugins?: readonly string[];
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -954,6 +999,18 @@ export type IrWorkflowStep = {
   readonly thinking?: IrThinking;
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
+  /** Item 9 (G37) — per-step ordered failover models (spec
+   *  `steps[].model_fallbacks`). Absent → single-model. */
+  readonly modelFallbacks?: readonly string[];
+  /** Item 9 (G37) — per-step breaker tuning (spec `steps[].circuit_breaker`). */
+  readonly circuitBreaker?: IrCircuitBreaker;
+  /** Item 9 (G37) — per-step two-tier turn-difficulty router. Absent →
+   *  single-model. */
+  readonly modelTiers?: IrModelTiers;
+  /** Item 9 (G37) — per-step N-candidate pool with a selection policy (a
+   *  PolicyRouter decides per step against the shared routing-store
+   *  scoreboard). Absent → single-model. */
+  readonly modelPool?: IrModelPool;
   /** Loop contract 0.4 (Batch B, G02) — `"judge"` marks a gate step over
    *  the previous step's output. ABSENT on regular agent steps. */
   readonly kind?: "judge";
@@ -1286,6 +1343,12 @@ export type IrChannelV0 = {
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. */
   readonly observability?: IrObservability;
+  /** Item 1 (G30) — MCP-server projection config. Present when the spec
+   *  declares `expose.mcp`; absent otherwise. */
+  readonly expose?: IrExpose;
+  /** Item 3 (G32) — marketplace plugin names loaded at boot (`plugins:`).
+   *  Present (non-empty) only when the spec declares them; load order. */
+  readonly plugins?: readonly string[];
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -1375,6 +1438,10 @@ export type IrManagedV0 = {
    *  spec omits the `observability` block. The managed daemon's `pause-intake`
    *  rung reuses its `budget_exceeded` 429 path. */
   readonly observability?: IrObservability;
+  /** Item 1 (G30) — MCP-server projection config. Present when the spec
+   *  declares `expose.mcp`; absent otherwise. SSE-backed exposure rides this
+   *  shape's gateway-server tenancy/budgets. */
+  readonly expose?: IrExpose;
 };
 
 /**
@@ -1553,6 +1620,18 @@ export type IrCrewRole = {
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
   readonly subAgents: readonly IrSubAgentDefinition[];
+  /** Item 9 (G37) — per-role ordered failover models (spec
+   *  `roles.<r>.model_fallbacks`). Absent → single-model. */
+  readonly modelFallbacks?: readonly string[];
+  /** Item 9 (G37) — per-role breaker tuning (spec `roles.<r>.circuit_breaker`). */
+  readonly circuitBreaker?: IrCircuitBreaker;
+  /** Item 9 (G37) — per-role two-tier turn-difficulty router. Absent →
+   *  single-model. */
+  readonly modelTiers?: IrModelTiers;
+  /** Item 9 (G37) — per-role N-candidate pool with a selection policy (a
+   *  PolicyRouter decides per role against the shared routing-store
+   *  scoreboard). Absent → single-model. */
+  readonly modelPool?: IrModelPool;
 };
 
 export type IrCrewRoutingKind = "match" | "llm";

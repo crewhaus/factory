@@ -511,6 +511,56 @@ function renderSubAgentDef(d: IrSubAgentDefinition): string {
   return `{ ${lines.join(", ")} }`;
 }
 
+/**
+ * Item 3 (G32) — plugin activation boot. When the spec declares `plugins:`, the
+ * bundle activates the named plugins at boot via `@crewhaus/plugin-loader`
+ * (which reads the installed-plugin registry, verifies each pinned entry's
+ * Ed25519 signature + entrypoint digest, and imports it), then registers the
+ * contributed tools on the shared `defaultCatalog` so they ride
+ * `defaultCatalog.list()` into runChatLoop exactly like built-in / skill tools.
+ *
+ * The boot is split so ordering is safe:
+ *   - `activateBoot` runs EARLY (before skill discovery) so `__plugins.skillDirs`
+ *     can feed `discoverSkills({ pluginDirs })`.
+ *   - `registerBoot` runs LATE (after the built-in and skill tools are on the
+ *     catalog) and skips any name already registered — first-party wins the
+ *     collision, and a plugin tool named after a built-in never throws
+ *     `defaultCatalog.register`'s duplicate-name error and bricks boot.
+ *
+ * Trust: `createDefaultPluginRuntime` builds the loader against
+ * `~/.crewhaus/plugins` with fail-closed signature verification;
+ * `CREWHAUS_PLUGIN_ALLOW_UNSIGNED=1` downgrades to dev (unsigned) mode. Empty
+ * pieces when the spec omits `plugins:`, keeping bundles byte-identical.
+ */
+function renderPlugins(ir: IrV0): {
+  imports: string[];
+  activateBoot: string;
+  registerBoot: string;
+  hasAny: boolean;
+} {
+  const names = ir.plugins ?? [];
+  if (names.length === 0) {
+    return { imports: [], activateBoot: "", registerBoot: "", hasAny: false };
+  }
+  return {
+    hasAny: true,
+    imports: [
+      `import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";`,
+    ],
+    activateBoot: `const __plugins = await activatePlugins({
+  names: ${JSON.stringify(names)},
+  ...createDefaultPluginRuntime({ allowUnsigned: process.env.CREWHAUS_PLUGIN_ALLOW_UNSIGNED === "1" }),
+});`,
+    registerBoot: `for (const __t of __plugins.tools) {
+  if (defaultCatalog.get(__t.name) !== undefined) {
+    process.stderr.write(\`[plugins] tool "\${__t.name}" already registered — plugin contribution skipped\\n\`);
+    continue;
+  }
+  defaultCatalog.register(__t);
+}`,
+  };
+}
+
 function renderAgent(ir: IrV0): string {
   const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
   const mcp = renderMcpServers(ir);
@@ -523,6 +573,9 @@ function renderAgent(ir: IrV0): string {
   // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation. Empty
   // pieces when the spec omits the block.
   const evaluation = renderEvaluation(ir);
+  // Item 3 (G32) — plugin activation. Empty pieces when the spec omits
+  // `plugins:`, keeping bundles byte-identical.
+  const plugins = renderPlugins(ir);
   // The catalog import is needed when either built-in tools OR MCP servers
   // are in play. resolveTools() already prepends it for the built-in case;
   // we add it explicitly when MCP is the only consumer.
@@ -575,13 +628,19 @@ function renderAgent(ir: IrV0): string {
         `import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";`,
         `import { loadCommands } from "@crewhaus/slash-commands";`,
       ].join("\n");
+  // Item 3 (G32) — feed the activated plugins' `<plugin>/skills` dirs into the
+  // bundle's own `discoverSkills` (the non-continuity path). Empty otherwise;
+  // in the continuity path skills come from `wireMemory`, which does not yet
+  // take plugin dirs (memory-service follow-up), so plugin tools still bind but
+  // plugin skills are not auto-discovered there.
+  const pluginSkillDirsArg = plugins.hasAny ? ", pluginDirs: __plugins.skillDirs" : "";
   const extensionBoot = continuityOn
     ? `const __cwd = process.cwd();
 const __hooks = await loadHooks({ cwd: __cwd });`
     : `const __cwd = process.cwd();
 const [__hooks, __skills, __slashCommands] = await Promise.all([
   loadHooks({ cwd: __cwd }),
-  discoverSkills({ cwd: __cwd }),
+  discoverSkills({ cwd: __cwd${pluginSkillDirsArg} }),
   loadCommands({ cwd: __cwd }),
 ]);
 if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
@@ -733,6 +792,17 @@ ${catchBlock}${finallyBlock}`;
   // The RAG corpus ingests at boot (async) and registers the Retrieve tool on
   // the catalog before runChatLoop advertises `defaultCatalog.list()`.
   const knowledgeBoot = knowledge.bootBlock ? `${knowledge.bootBlock}\n\n` : "";
+  // Item 3 (G32) — plugin activation. `activateBoot` runs BEFORE `extensionBoot`
+  // so `__plugins.skillDirs` feeds `discoverSkills`; `registerBoot` runs AFTER
+  // it so the plugin-tool registration's collision check sees the built-in and
+  // skill tools already on `defaultCatalog` (first-party wins), all before
+  // runChatLoop snapshots `defaultCatalog.list()`.
+  const pluginsImportBlock = plugins.imports.length > 0 ? `${plugins.imports.join("\n")}\n` : "";
+  // activateBoot precedes extensionBoot (trailing newline); registerBoot follows
+  // it (leading newline). Both empty when the spec omits `plugins:`, so the
+  // surrounding bytes are unchanged.
+  const pluginsActivateBoot = plugins.activateBoot ? `${plugins.activateBoot}\n` : "";
+  const pluginsRegisterBoot = plugins.registerBoot ? `\n${plugins.registerBoot}` : "";
 
   // v0.3.0 Goal 3 — with thredz on, the MCP host boots FIRST so wireMemory
   // receives the live connection (`__thredz`) the backend flip needs; every
@@ -745,9 +815,9 @@ ${catchBlock}${finallyBlock}`;
 // Source spec: ${escapeJsonString(ir.name)} (target: cli, ir version: ${ir.version})
 import { formatRunFailure, toFailureReport } from "@crewhaus/errors";
 import { runChatLoop } from "@crewhaus/runtime-core";
-${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${evaluationImportBlock}${memoryImportBlock}${knowledgeImportBlock}${extensionImport}
+${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${evaluationImportBlock}${memoryImportBlock}${knowledgeImportBlock}${pluginsImportBlock}${extensionImport}
 ${registerBlock}
-${extensionBoot}${specHooks.bootBlock}
+${pluginsActivateBoot}${extensionBoot}${pluginsRegisterBoot}${specHooks.bootBlock}
 
 ${bannerBoot}${subAgentsBoot}${egressBoot}${evaluationBoot}${bootBlocks}${knowledgeBoot}${wrapped}
 `;

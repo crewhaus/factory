@@ -26,8 +26,21 @@
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { type AppendInput, type AuditLog, openAuditLog } from "@crewhaus/audit-log";
+import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { type BudgetStore, InMemoryBudgetStore } from "@crewhaus/durable-state";
 import { CrewhausError } from "@crewhaus/errors";
+import {
+  type A2AAgentCard,
+  type A2AAgentProvider,
+  type A2AAgentSkill,
+  FEDERATION_VERSION,
+  type FederationEnvelope,
+  type FederationWellKnown,
+  buildAgentCard,
+  buildInboundResponse,
+  buildWellKnown,
+  decodeFederationEnvelope,
+} from "@crewhaus/federation-protocol";
 import {
   ErrorCode,
   GatewayProtocolError,
@@ -212,6 +225,67 @@ export type ResolveRunEvents = (args: {
 /** Default idle-heartbeat cadence for a `runs.subscribe` SSE stream. */
 const DEFAULT_SSE_HEARTBEAT_MS = 15_000;
 
+// ---------------------------------------------------------------------------
+// Federation surface (Item 2 / G31) — this deployment as an A2A peer.
+//
+// A federation-enabled server serves three routes OUTSIDE the JWT-authed
+// JSON-RPC plane:
+//   GET  /.well-known/agent-card.json  — a real A2A Agent Card (metadata).
+//   GET  /.well-known/crewhaus.json    — the namespaced discovery alias
+//                                        carrying the cert-pin fingerprint.
+//   POST /federation                   — the inbound federated-call handler.
+//
+// Peers authenticate via mTLS at the TLS layer (the transport floor), NOT the
+// gateway's tenant JWT. `authorize` is the app-level allowlist; `dispatch`
+// runs the local agent and returns its reply.
+// ---------------------------------------------------------------------------
+
+/** Context handed to the inbound `dispatch`/`authorize` hooks. */
+export type FederationInboundContext = {
+  readonly envelope: FederationEnvelope;
+  /**
+   * The peer's presented TLS client-cert subject, when the TLS terminator
+   * exposed it. Undefined under the in-process `handleFederation` path and
+   * whenever TLS termination happens ahead of the daemon (reverse proxy).
+   */
+  readonly peerCertSubject?: string;
+};
+
+/** Runs the local agent for an authorized inbound call; returns its reply. */
+export type FederationInboundDispatch = (
+  ctx: FederationInboundContext,
+) => Promise<{ readonly reply: string }>;
+
+export type FederationAuthorizeResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * App-level peer gate, consulted AFTER envelope validation and BEFORE the
+ * inbound-payload classifier + dispatch. Default (omitted): accept any
+ * well-formed envelope — production wires an allowlist by
+ * `envelope.federation.from.deployment` and/or a `peerCertSubject` match.
+ */
+export type FederationAuthorize = (ctx: FederationInboundContext) => FederationAuthorizeResult;
+
+export type GatewayFederationConfig = {
+  /** This deployment's advertised identity — the Agent Card + crewhaus.json. */
+  readonly identity: {
+    readonly name: string;
+    readonly description: string;
+    /** Public base URL (e.g. `https://dep.example`); the inbound endpoint is `<base>/federation`. */
+    readonly endpoint: string;
+    readonly version?: string;
+    readonly supportedShapes?: readonly string[];
+    /** SHA256 fingerprint (64-char hex) of this deployment's leaf cert. */
+    readonly publicKeyFingerprint: string;
+    readonly skills?: readonly A2AAgentSkill[];
+    readonly provider?: A2AAgentProvider;
+  };
+  readonly dispatch: FederationInboundDispatch;
+  readonly authorize?: FederationAuthorize;
+};
+
 export type CreateGatewayServerOptions = {
   readonly jwtSecret: string;
   readonly tenantsRoot?: string;
@@ -276,6 +350,14 @@ export type CreateGatewayServerOptions = {
    * connection. Defaults to {@link DEFAULT_SSE_HEARTBEAT_MS}.
    */
   readonly sseHeartbeatMs?: number;
+  /**
+   * Item 2 (G31) — enable this deployment as an A2A federation peer. When set,
+   * the server serves `/.well-known/agent-card.json`, `/.well-known/crewhaus.json`
+   * and `POST /federation` (all OUTSIDE the JWT plane — see
+   * {@link GatewayFederationConfig}). Omitted ⇒ those routes answer `404`
+   * (behaviour-preserving for a non-federated gateway).
+   */
+  readonly federation?: GatewayFederationConfig;
 };
 
 export type UsageDelta = {
@@ -320,6 +402,25 @@ export interface GatewayServer {
   usage(tenantId: string): Promise<{ input: number; output: number }>;
   /** Get or build the audit log for a tenant. Memoised. */
   getAuditLog(tenant: Tenant): Promise<AuditLog>;
+  /**
+   * Item 2 (G31) — the A2A Agent Card served at `/.well-known/agent-card.json`,
+   * or `undefined` when federation is not configured. Exposed so tests + the
+   * generated daemon can inspect the exact card without an HTTP round-trip.
+   */
+  federationAgentCard(): A2AAgentCard | undefined;
+  /** The `/.well-known/crewhaus.json` discovery alias, or `undefined` when federation is off. */
+  federationWellKnown(): FederationWellKnown | undefined;
+  /**
+   * Item 2 (G31) — drive one inbound federated call exactly as the HTTP
+   * `POST /federation` route does (decode → authorize → classify → dispatch →
+   * map to A2A message), returning the raw `{status, body}` the peer receives.
+   * Used by tests + any embedder that terminates TLS itself. Answers `404`
+   * when federation is not configured.
+   */
+  handleFederation(request: {
+    readonly body: unknown;
+    readonly peerCertSubject?: string;
+  }): Promise<{ status: number; body: string }>;
 }
 
 const ZERO_USAGE: UsageDelta = { input: 0, output: 0 };
@@ -331,6 +432,100 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
   const budget = opts.budgetStore ?? new InMemoryBudgetStore();
   const auditLogByTenant = new Map<string, AuditLog>();
   const now = opts.now ?? Date.now;
+
+  // Item 2 (G31) — precompute the federation identity documents once. The
+  // Agent Card's `url` is the concrete inbound endpoint (`<base>/federation`);
+  // the crewhaus.json alias carries the base `endpoint` the router appends
+  // `/federation` to (kept in lock-step with `@crewhaus/federation-router`) plus
+  // the cert-pin fingerprint the A2A card omits.
+  const fed = opts.federation;
+  const fedBase = fed !== undefined ? fed.identity.endpoint.replace(/\/+$/, "") : "";
+  const fedAgentCard: A2AAgentCard | undefined =
+    fed !== undefined
+      ? buildAgentCard({
+          name: fed.identity.name,
+          description: fed.identity.description,
+          url: `${fedBase}/federation`,
+          ...(fed.identity.version !== undefined ? { version: fed.identity.version } : {}),
+          ...(fed.identity.skills !== undefined ? { skills: fed.identity.skills } : {}),
+          ...(fed.identity.provider !== undefined ? { provider: fed.identity.provider } : {}),
+        })
+      : undefined;
+  const fedWellKnown: FederationWellKnown | undefined =
+    fed !== undefined
+      ? buildWellKnown({
+          endpoint: fedBase,
+          publicKeyFingerprint: fed.identity.publicKeyFingerprint,
+          version: FEDERATION_VERSION,
+          ...(fed.identity.supportedShapes !== undefined
+            ? { supportedShapes: fed.identity.supportedShapes }
+            : {}),
+        })
+      : undefined;
+
+  /**
+   * Handle one inbound `POST /federation` call. Pipeline: decode + strict
+   * version-check the envelope → app-level `authorize` → Pillar 3 classify the
+   * payload at origin "federation" (a malicious verdict REFUSES rather than
+   * running the local agent on an injection) → `dispatch` to the local run →
+   * map the reply onto A2A message semantics. Returns the raw `{status, body}`
+   * so both the HTTP route and the in-process `handleFederation` method share
+   * one implementation.
+   */
+  async function handleFederationInbound(
+    body: unknown,
+    peerCertSubject: string | undefined,
+  ): Promise<{ status: number; body: string }> {
+    if (fed === undefined) {
+      return { status: 404, body: JSON.stringify({ error: "federation is not enabled" }) };
+    }
+    let envelope: FederationEnvelope;
+    try {
+      envelope = decodeFederationEnvelope(typeof body === "string" ? body : JSON.stringify(body));
+    } catch (err) {
+      return { status: 400, body: JSON.stringify({ error: (err as Error).message }) };
+    }
+    const ctx: FederationInboundContext = {
+      envelope,
+      ...(peerCertSubject !== undefined ? { peerCertSubject } : {}),
+    };
+    // App-level authorization. mTLS at the TLS layer authenticated *who* the
+    // peer is; this gate decides *whether* the peer is allowed (allowlist /
+    // cert-subject match). Authentication ≠ authorization ≠ classification.
+    const auth = fed.authorize ? fed.authorize(ctx) : { ok: true as const };
+    if (!auth.ok) {
+      return { status: 403, body: JSON.stringify({ error: `federation denied: ${auth.reason}` }) };
+    }
+    // Pillar 3 boundary site — the inbound payload is untrusted external
+    // content (origin "federation"). Classify BEFORE it reaches the local run;
+    // a malicious verdict refuses the call outright instead of dispatching an
+    // injection into the agent. (Symmetric to the router's client-side reply
+    // classification — the source side of the same boundary.)
+    const boundary = await classifyBoundary(envelope.payload, { origin: "federation" });
+    if (boundary.action === "redact") {
+      return {
+        status: 200,
+        body: JSON.stringify(
+          buildInboundResponse(
+            "[federation] request refused: inbound payload failed the safety classifier.",
+            { contextId: envelope.traceparent },
+          ),
+        ),
+      };
+    }
+    let reply: string;
+    try {
+      reply = (await fed.dispatch(ctx)).reply;
+    } catch (err) {
+      return { status: 500, body: JSON.stringify({ error: (err as Error).message }) };
+    }
+    // Map the completed local run's reply onto A2A message semantics (role
+    // "agent", one text part) beside the router-compatible `reply` string.
+    return {
+      status: 200,
+      body: JSON.stringify(buildInboundResponse(reply, { contextId: envelope.traceparent })),
+    };
+  }
 
   function tenantFor(claims: JwtClaims): Tenant {
     const override = opts.tenantOverrides?.[claims.tenant_id];
@@ -474,6 +669,36 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
         port,
         hostname: host,
         fetch: async (req): Promise<Response> => {
+          // Item 2 (G31) — the federation surface is served OUTSIDE the JWT
+          // plane (peers authenticate via mTLS, not the tenant bearer). Route
+          // it first so a federation request never hits the JSON-RPC decoder.
+          const pathname = new URL(req.url).pathname;
+          if (req.method === "GET" && pathname === "/.well-known/agent-card.json") {
+            return fedAgentCard !== undefined
+              ? Response.json(fedAgentCard)
+              : Response.json({ error: "federation is not enabled" }, { status: 404 });
+          }
+          if (req.method === "GET" && pathname === "/.well-known/crewhaus.json") {
+            return fedWellKnown !== undefined
+              ? Response.json(fedWellKnown)
+              : Response.json({ error: "federation is not enabled" }, { status: 404 });
+          }
+          if (req.method === "POST" && pathname === "/federation") {
+            let fbody: unknown;
+            try {
+              fbody = await req.json();
+            } catch {
+              return Response.json({ error: "request body must be JSON" }, { status: 400 });
+            }
+            // The presented TLS client-cert subject is not surfaced by Bun's
+            // fetch handler; a TLS terminator ahead of the daemon supplies it
+            // (follow-up). Undefined here ⇒ `authorize` gates on the envelope.
+            const out = await handleFederationInbound(fbody, undefined);
+            return new Response(out.body, {
+              status: out.status,
+              headers: { "content-type": "application/json" },
+            });
+          }
           const auth = req.headers.get("authorization") ?? "";
           const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : undefined;
           let body: unknown;
@@ -520,6 +745,15 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
       return budget.usage(tenantId);
     },
     getAuditLog,
+    federationAgentCard(): A2AAgentCard | undefined {
+      return fedAgentCard;
+    },
+    federationWellKnown(): FederationWellKnown | undefined {
+      return fedWellKnown;
+    },
+    handleFederation(req): Promise<{ status: number; body: string }> {
+      return handleFederationInbound(req.body, req.peerCertSubject);
+    },
   };
 }
 

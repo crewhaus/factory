@@ -45,6 +45,7 @@ import type {
   TokenUsage,
   ToolChoice,
 } from "@crewhaus/adapter-anthropic";
+import { sanitizeBedrockSchema } from "@crewhaus/tool-schema-sanitizer";
 
 /** The Smithy JSON-document type, recovered without a @smithy/types dep. */
 type ConverseDocument = NonNullable<ToolUseBlock["input"]>;
@@ -81,7 +82,10 @@ export function buildConverseRequest(req: ProviderRequest): ConverseStreamComman
       toolSpec: {
         name: t.name,
         description: t.description,
-        inputSchema: { json: t.input_schema as ConverseDocument },
+        // Inline $refs and strip the structural metadata Converse models
+        // reject (additionalProperties, $schema/$id, …) before handing
+        // the schema to the model-agnostic tool spec.
+        inputSchema: { json: sanitizeBedrockSchema(t.input_schema) as ConverseDocument },
       },
     }));
     input.toolConfig =

@@ -30,11 +30,13 @@ import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Discovery, createDiscovery } from "@crewhaus/federation-discovery";
 import {
+  type A2AMessage,
   FEDERATION_VERSION,
   type FederationEnvelope,
   type FederationTransport,
   type MtlsCredentials,
   federationCall,
+  textFromA2AMessage,
 } from "@crewhaus/federation-protocol";
 import { type RunContext, tagContent } from "@crewhaus/run-context";
 
@@ -154,16 +156,26 @@ export function createFederationRouter(config: FederationRouterConfig): Federati
             `peer ${args.to.deployment} returned status ${result.status}`,
           );
         }
-        let parsed: { reply?: unknown };
+        let parsed: { reply?: unknown; message?: unknown };
         try {
-          parsed = JSON.parse(result.body) as { reply?: unknown };
+          parsed = JSON.parse(result.body) as { reply?: unknown; message?: unknown };
         } catch (cause) {
           throw new FederationRouterError(
             `peer ${args.to.deployment} returned non-JSON body`,
             cause,
           );
         }
-        if (typeof parsed.reply !== "string") {
+        // The peer's inbound handler answers with a `reply` string (the fast
+        // path) AND the same text mapped onto an A2A `message` (Item 2). Prefer
+        // `reply`; fall back to the A2A message's text parts so a pure-A2A peer
+        // (one that answers with only `message`) also decodes. Neither present
+        // ⇒ malformed.
+        let replyText: string | undefined =
+          typeof parsed.reply === "string" ? parsed.reply : undefined;
+        if (replyText === undefined && isA2AMessage(parsed.message)) {
+          replyText = textFromA2AMessage(parsed.message);
+        }
+        if (replyText === undefined) {
           throw new FederationRouterError(
             `peer ${args.to.deployment} response missing string 'reply' field`,
           );
@@ -178,7 +190,7 @@ export function createFederationRouter(config: FederationRouterConfig): Federati
         // caller's data-lineage (when a RunContext was supplied) so the
         // sink-side egress classifier sees the federation origin on a later
         // external-tool call. See recipe 41 (security fabric) / 27 (federation).
-        let reply = parsed.reply;
+        let reply = replyText;
         const fb = await classifyBoundary(reply, { origin: "federation" });
         if (fb.action === "redact" && fb.redacted !== undefined) {
           reply = fb.redacted;
@@ -207,6 +219,13 @@ export function createFederationRouter(config: FederationRouterConfig): Federati
       return () => subscribers.delete(listener);
     },
   };
+}
+
+/** Structural guard for the A2A `message` fallback in a peer's inbound reply. */
+function isA2AMessage(v: unknown): v is A2AMessage {
+  if (typeof v !== "object" || v === null) return false;
+  const m = v as { kind?: unknown; parts?: unknown };
+  return m.kind === "message" && Array.isArray(m.parts);
 }
 
 const PLACEHOLDER_TRACEPARENT = "00-00000000000000000000000000000000-0000000000000000-00";

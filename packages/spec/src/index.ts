@@ -136,6 +136,17 @@ const subAgentDefinitionSchema = z
       ])
       .optional(),
     inherit_bypass: z.boolean().optional(),
+    /**
+     * Item 2 (G31 — A2A federation) — wire this sub-agent to a REMOTE peer
+     * instead of spawning it locally. `url` is the peer deployment's base
+     * URL; the spawner routes the Task call through `@crewhaus/federation-
+     * router` to the peer's inbound A2A handler (whose Agent Card lives at
+     * `<url>/.well-known/agent-card.json`), mapping the federation envelope
+     * onto A2A message/task semantics. Present ⇒ the entry is a federated
+     * peer reference; `description`/`instructions` still describe it to the
+     * parent's Task tool (the remote peer owns its own prompt).
+     */
+    federation: z.object({ url: z.string().url() }).strict().optional(),
   })
   .strict();
 
@@ -1226,6 +1237,14 @@ const thredzObject = z
           ),
       ])
       .optional(),
+    /**
+     * Item 5 (G44) — enable the nine Thredz messaging tools (`message_send`
+     * / `inbox_poll` / `message_ack` / `thread_get` / `agent_*`). DEFAULT
+     * false: the send-side tools are destructive + justification-gated, so
+     * they stay off unless the author asks. The Thredz server side is already
+     * live (thredz-api) — this flips their registration on.
+     */
+    messaging: z.boolean().optional(),
   })
   .strict();
 
@@ -1611,6 +1630,48 @@ const channelGatewayBlock = z
   .strict()
   .optional();
 
+/**
+ * Item 1 (G30) — the `expose:` block: project THIS compiled bundle's turn
+ * function as an MCP server so Claude Code / IDEs / other CrewHaus runtimes
+ * can call the whole agent as a tool. Carried on the serving shapes
+ * (cli/channel/managed).
+ *
+ *   - `mcp.transport`: `stdio` (a spawned stdio MCP server — the
+ *     `crewhaus serve --mcp` path) or `sse` (an HTTP+SSE endpoint; SSE-backed
+ *     exposure rides the gateway-server tenancy/budgets where the shape has
+ *     them).
+ *   - `mcp.tools`: `chat` (DEFAULT — one primary invoke tool taking
+ *     `{ message }` and returning the final assistant text) or `per-subagent`
+ *     (that primary tool PLUS one tool per declared sub-agent). `per-subagent`
+ *     needs sub-agents to project — enforced cross-field in `parseSpec`.
+ *
+ * Omitted entirely → the bundle is not exposed as an MCP server (the default).
+ */
+const exposeBlock = z
+  .object({
+    mcp: z
+      .object({
+        transport: z.enum(["stdio", "sse"]),
+        tools: z.enum(["chat", "per-subagent"]).optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .optional();
+
+/**
+ * Item 3 (G32) — the `plugins:` list: names of installed marketplace plugins
+ * whose contributions (tools / channels / models / graders / emitters, plus
+ * skill dirs) this bundle loads at boot. Each entry is a plugin NAME resolved
+ * against the pinned `plugin-registry` (the Ed25519 supply chain guards
+ * install; this wires the previously-missing load path). Order is honoured
+ * (load order). The `crewhaus run --plugins` flag overrides the list. Carried
+ * on the codegen-serving shapes whose boot path reads the registry (cli +
+ * channel).
+ */
+const pluginsBlock = z.array(z.string().min(1)).optional();
+
 const cliSchema = z
   .object({
     name: safeName,
@@ -1652,6 +1713,10 @@ const cliSchema = z
     budget: budgetBlock,
     limits: limitsBlock,
     hooks: hooksBlock,
+    // Batch G — expose the bundle as an MCP server (G30) + load marketplace
+    // plugins at boot (G32).
+    expose: exposeBlock,
+    plugins: pluginsBlock,
     // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
     evaluation: evaluationBlock,
     feedback: feedbackBlock,
@@ -1682,8 +1747,19 @@ const workflowStepSchema = z
     thinking: thinkingBlock,
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
+    // Item 9 (G37) — per-step model routing, adopting the cli agent block's
+    // pooled pattern verbatim: ordered failover + breaker tuning + two-tier
+    // router + N-candidate pool, sharing the one mutual-exclusion rule via
+    // `refineModelSelection`. A PolicyRouter decides per step against the
+    // shared routing-store scoreboard. Omitted → the step's single
+    // (`step.model ?? workflow.model`) model, byte-identical bundles.
+    model_fallbacks: modelFallbacksBlock,
+    circuit_breaker: circuitBreakerBlock,
+    model_tiers: modelTiersBlock,
+    model_pool: modelPoolBlock,
   })
-  .strict();
+  .strict()
+  .superRefine(refineModelSelection);
 
 /**
  * Loop contract 0.4 (Batch B, G02) — the `kind: "judge"` workflow-step
@@ -1847,6 +1923,10 @@ const channelSchema = z
     budget: budgetBlock,
     limits: limitsBlock,
     hooks: hooksBlock,
+    // Batch G — expose the daemon's turn as an MCP server (G30) + load
+    // marketplace plugins at boot (G32).
+    expose: exposeBlock,
+    plugins: pluginsBlock,
     // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
     evaluation: evaluationBlock,
     feedback: feedbackBlock,
@@ -2046,6 +2126,11 @@ const managedSchema = z
     budget: budgetBlock,
     limits: limitsBlock,
     hooks: hooksBlock,
+    // Batch G — expose the managed daemon as an MCP server (G30). SSE-backed
+    // exposure rides this shape's gateway-server tenancy/budgets. No
+    // `plugins:` here: item 3's boot-path wiring covers cli + channel-bot
+    // codegen, not the managed daemon.
+    expose: exposeBlock,
     // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
     evaluation: evaluationBlock,
     memory: memoryBlock,
@@ -2162,8 +2247,19 @@ const crewRoleSchema = z
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
     sub_agents: subAgentsBlock,
+    // Item 9 (G37) — per-role model routing, adopting the cli agent block's
+    // pooled pattern verbatim: ordered failover + breaker tuning + two-tier
+    // router + N-candidate pool, sharing the one mutual-exclusion rule via
+    // `refineModelSelection`. A PolicyRouter decides per role against the
+    // shared routing-store scoreboard. Omitted → the role's single
+    // (`role.model ?? crew.model`) model, byte-identical bundles.
+    model_fallbacks: modelFallbacksBlock,
+    circuit_breaker: circuitBreakerBlock,
+    model_tiers: modelTiersBlock,
+    model_pool: modelPoolBlock,
   })
-  .strict();
+  .strict()
+  .superRefine(refineModelSelection);
 
 const crewRoutingMatchEntrySchema = z
   .object({
@@ -2597,6 +2693,10 @@ export type SpecModelFallbacks = z.infer<typeof modelFallbacksBlock>;
 export type SpecCircuitBreakerBlock = z.infer<typeof circuitBreakerBlock>;
 export type SpecModelTiersBlock = z.infer<typeof modelTiersBlock>;
 export type SpecModelPoolBlock = z.infer<typeof modelPoolBlock>;
+/** Item 1 (G30) — the `expose:` block (MCP-server projection of the bundle). */
+export type SpecExposeBlock = z.infer<typeof exposeBlock>;
+/** Item 3 (G32) — the `plugins:` list (marketplace plugin names loaded at boot). */
+export type SpecPluginsBlock = z.infer<typeof pluginsBlock>;
 export type SpecBudgetBlock = z.infer<typeof budgetBlock>;
 /** Ops item 37 + Loop contract 0.4 (Batch C, G26) — the cross-cutting
  *  `observability:` block (slo + trace/metrics/cost/alerts/incidents/otel). */
@@ -2793,6 +2893,28 @@ function crossFieldIssues(data: Spec): SpecIssue[] {
         ["entry"],
         `graph entry "${data.entry}" cannot be a judge node — a judge gates its upstream node's output and the entry has none`,
       );
+    }
+  }
+  // Item 1 (G30) — `expose.mcp.tools: "per-subagent"` projects EACH declared
+  // sub-agent as its own MCP tool, so it needs sub-agents to project. cli and
+  // channel carry `agent.sub_agents`; the managed shape has none at all, so
+  // per-subagent is always a mistake there. Load-bearing: no ir-pass mirrors
+  // this, and the emitter would otherwise ship an MCP server exposing only the
+  // primary tool while the author expected per-sub-agent ones.
+  if (data.target === "cli" || data.target === "channel" || data.target === "managed") {
+    const exposeTools = data.expose?.mcp?.tools;
+    if (exposeTools === "per-subagent") {
+      const subAgents =
+        data.target === "managed"
+          ? undefined
+          : (data.agent as { sub_agents?: Record<string, unknown> }).sub_agents;
+      const count = subAgents === undefined ? 0 : Object.keys(subAgents).length;
+      if (count === 0) {
+        custom(
+          ["expose", "mcp", "tools"],
+          `expose.mcp.tools: "per-subagent" projects each sub-agent as its own MCP tool, but the ${data.target} shape declares no sub_agents — use tools: "chat" (the default), or add sub_agents`,
+        );
+      }
     }
   }
   // Section 21 — pipeline HTTP-backend invariants. qdrant/pinecone/weaviate

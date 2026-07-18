@@ -58,6 +58,7 @@
         "@crewhaus/justification-judge-claude": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
+        "@crewhaus/mcp-server": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/migration-engine": "workspace:*",
@@ -66,6 +67,7 @@
         "@crewhaus/module-marketplace-client": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/pii-redactor": "workspace:*",
+        "@crewhaus/plugin-loader": "workspace:*",
         "@crewhaus/plugin-registry": "workspace:*",
         "@crewhaus/plugin-sdk": "workspace:*",
         "@crewhaus/prompt-injection-detector": "workspace:*",
@@ -90,6 +92,7 @@
         "@crewhaus/target-cf-worker-cli": "workspace:*",
         "@crewhaus/target-cf-worker-graph": "workspace:*",
         "@crewhaus/target-cf-worker-workflow": "workspace:*",
+        "@crewhaus/target-claude-plugin": "workspace:*",
         "@crewhaus/target-cli": "workspace:*",
         "@crewhaus/target-eval-bundle": "workspace:*",
         "@crewhaus/template-marketplace-client": "workspace:*",
@@ -163,6 +166,7 @@
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
+        "@crewhaus/tool-schema-sanitizer": "workspace:*",
       },
       "devDependencies": {
         "@crewhaus/recovery-engine": "workspace:*",
@@ -175,6 +179,7 @@
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
+        "@crewhaus/tool-schema-sanitizer": "workspace:*",
         "@google/genai": "^1.6.0",
       },
       "devDependencies": {
@@ -188,6 +193,7 @@
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
+        "@crewhaus/tool-schema-sanitizer": "workspace:*",
         "openai": "^4.65.0",
       },
       "devDependencies": {
@@ -857,8 +863,10 @@
       "version": "0.3.2",
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/durable-state": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/federation-protocol": "workspace:*",
         "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
       },
@@ -1003,6 +1011,15 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
+        "@modelcontextprotocol/sdk": "^1.29.0",
+        "zod": "^3.23.8",
+      },
+    },
+    "packages/mcp-server": {
+      "name": "@crewhaus/mcp-server",
+      "version": "0.3.2",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
         "@modelcontextprotocol/sdk": "^1.29.0",
         "zod": "^3.23.8",
       },
@@ -1156,7 +1173,12 @@
       "version": "0.3.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/plugin-registry": "workspace:*",
         "@crewhaus/plugin-sdk": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+      },
+      "devDependencies": {
+        "zod": "^3.23.8",
       },
     },
     "packages/plugin-registry": {
@@ -1553,11 +1575,15 @@
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/federation-router": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
       },
       "devDependencies": {
+        "@crewhaus/federation-discovery": "workspace:*",
+        "@crewhaus/federation-protocol": "workspace:*",
+        "@crewhaus/gateway-server": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -2120,6 +2146,10 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/tool-schema-sanitizer": {
+      "name": "@crewhaus/tool-schema-sanitizer",
+      "version": "0.3.2",
+    },
     "packages/tool-screen-capture": {
       "name": "@crewhaus/tool-screen-capture",
       "version": "0.3.2",
@@ -2540,6 +2570,8 @@
 
     "@crewhaus/mcp-host": ["@crewhaus/mcp-host@workspace:packages/mcp-host"],
 
+    "@crewhaus/mcp-server": ["@crewhaus/mcp-server@workspace:packages/mcp-server"],
+
     "@crewhaus/memory-service": ["@crewhaus/memory-service@workspace:packages/memory-service"],
 
     "@crewhaus/memory-store": ["@crewhaus/memory-store@workspace:packages/memory-store"],
@@ -2747,6 +2779,8 @@
     "@crewhaus/tool-result-store": ["@crewhaus/tool-result-store@workspace:packages/tool-result-store"],
 
     "@crewhaus/tool-retrieve": ["@crewhaus/tool-retrieve@workspace:packages/tool-retrieve"],
+
+    "@crewhaus/tool-schema-sanitizer": ["@crewhaus/tool-schema-sanitizer@workspace:packages/tool-schema-sanitizer"],
 
     "@crewhaus/tool-screen-capture": ["@crewhaus/tool-screen-capture@workspace:packages/tool-screen-capture"],
 

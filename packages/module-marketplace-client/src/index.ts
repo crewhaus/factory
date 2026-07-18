@@ -29,6 +29,20 @@ export class ModuleMarketplaceError extends CrewhausError {
 }
 
 /**
+ * Item 10 (G89) — the canonical default plugin (module) registry index URL.
+ *
+ * A host with no `--registry` flag and no `CREWHAUS_PLUGIN_REGISTRY` env var
+ * resolves the marketplace against THIS index. It follows the HTTP
+ * `ModuleRegistrySource` contract: `GET <url>` returns
+ * `{ plugins: PluginMetadata[] }`, and per-name manifests live at
+ * `<url>/<name>.json` (`<url>/<name>@<version>.json` for a pinned version).
+ *
+ * Exported (rather than inlined at the CLI) so the CLI, Studio's Plugins tab,
+ * and any other consumer share one source of truth for the default endpoint.
+ */
+export const DEFAULT_MODULE_REGISTRY_URL = "https://registry.crewhaus.ai/plugins";
+
+/**
  * Minimal metadata the marketplace surfaces in a search result. Full
  * `PluginManifest` is only fetched on `install` / `update`.
  */

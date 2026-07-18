@@ -1411,3 +1411,56 @@ describe("emitCli — knowledge RAG block (Loop contract 0.4, Batch E, G22)", ()
     expect(c).not.toContain("__knowledgeTool");
   });
 });
+
+describe("emitCli — plugin activation (Item 3 / G32)", () => {
+  test("no plugins → no plugin activation artifacts (bundles stay byte-identical)", () => {
+    const c = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(c).not.toContain("@crewhaus/plugin-loader");
+    expect(c).not.toContain("activatePlugins");
+    expect(c).not.toContain("__plugins");
+    expect(c).not.toContain("pluginDirs");
+  });
+
+  test("plugins: list → activates them and registers contributed tools on the catalog", () => {
+    const c = emitCli(baseIr({ plugins: ["acme-tools", "beta-pack"] })).files[0]?.content ?? "";
+    expect(c).toContain(
+      'import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";',
+    );
+    // Names are emitted verbatim, in load order.
+    expect(c).toContain('names: ["acme-tools","beta-pack"]');
+    // Fail-closed loader, dev opt-out via env.
+    expect(c).toContain('allowUnsigned: process.env.CREWHAUS_PLUGIN_ALLOW_UNSIGNED === "1"');
+    // Contributed tools land on the shared catalog, first-party wins collisions.
+    expect(c).toContain("for (const __t of __plugins.tools)");
+    expect(c).toContain("defaultCatalog.register(__t);");
+    expect(c).toContain("if (defaultCatalog.get(__t.name) !== undefined)");
+  });
+
+  test("plugins feed their skill dirs into discoverSkills (non-continuity path)", () => {
+    const c = emitCli(baseIr({ plugins: ["acme-tools"] })).files[0]?.content ?? "";
+    expect(c).toContain("discoverSkills({ cwd: __cwd, pluginDirs: __plugins.skillDirs })");
+  });
+
+  test("the plugin boot runs before the extension boot that reads __plugins.skillDirs", () => {
+    const c = emitCli(baseIr({ plugins: ["acme-tools"] })).files[0]?.content ?? "";
+    expect(c.indexOf("const __plugins = await activatePlugins(")).toBeGreaterThan(-1);
+    expect(c.indexOf("const __plugins = await activatePlugins(")).toBeLessThan(
+      c.indexOf("discoverSkills({ cwd: __cwd, pluginDirs: __plugins.skillDirs })"),
+    );
+  });
+
+  test("continuity on: plugin tools still bind, but discoverSkills is not the skill source", () => {
+    // With continuity on the bundle has no direct discoverSkills call (skills
+    // come from wireMemory); plugin TOOLS still register on the catalog.
+    const c =
+      emitCli(
+        baseIr({
+          plugins: ["acme-tools"],
+          continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "spec" },
+        }),
+      ).files[0]?.content ?? "";
+    expect(c).toContain("const __plugins = await activatePlugins(");
+    expect(c).toContain("defaultCatalog.register(__t);");
+    expect(c).not.toContain("pluginDirs: __plugins.skillDirs");
+  });
+});

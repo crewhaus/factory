@@ -405,3 +405,75 @@ describe("OPTIMIZABLE_PATHS × applySpecEdits (optimizer-surface round-trip)", (
     });
   }
 });
+
+/**
+ * Batch G, Item 9 (G37) — per-role / per-step model routing is optimizer-
+ * reachable via the WHOLE-BLOCK entries (`["roles"]` on crew, `["steps"]` on
+ * workflow) rather than standalone paths: the role name / step index is
+ * positional, so no static narrower path exists, and whole-block replacement
+ * already spans model/instructions. These tests pin that reachability so a
+ * future refactor that narrows the entries can't silently orphan the routing.
+ */
+describe("Item 9 (G37) — role/step model_pool rides the whole-block optimizable entry", () => {
+  test("crew: replacing [roles] with a model_pool-bearing role round-trips under restrictToOptimizable", () => {
+    const yaml = [
+      "name: cr",
+      "target: crew",
+      "model: base-model",
+      "entry: lead",
+      "roles:",
+      "  lead:",
+      "    instructions: lead it",
+    ].join("\n");
+    const nextRoles = {
+      lead: {
+        instructions: "lead it",
+        model_pool: {
+          candidates: [
+            { model: "claude-haiku-4-5", tags: ["cheap"] },
+            { model: "claude-opus-4-8", tags: ["strong"] },
+          ],
+          policy: "learned",
+        },
+      },
+    };
+    const result = applySpecEdits(yaml, [{ path: ["roles"], value: nextRoles }], {
+      restrictToOptimizable: true,
+    });
+    expect(result.applied).toBe(1);
+    if (result.spec.target !== "crew") throw new Error("unexpected target");
+    expect(result.spec.roles.lead?.model_pool?.policy).toBe("learned");
+  });
+
+  test("workflow: replacing [steps] with a model_pool-bearing step round-trips under restrictToOptimizable", () => {
+    const yaml = [
+      "name: w",
+      "target: workflow",
+      "model: base-model",
+      "steps:",
+      "  - name: route",
+      "    instructions: pick a path",
+    ].join("\n");
+    const nextSteps = [
+      {
+        name: "route",
+        instructions: "pick a path",
+        model_pool: {
+          candidates: [
+            { model: "claude-haiku-4-5", tags: ["cheap"] },
+            { model: "claude-opus-4-8", tags: ["strong"] },
+          ],
+          policy: "heuristic",
+        },
+      },
+    ];
+    const result = applySpecEdits(yaml, [{ path: ["steps"], value: nextSteps }], {
+      restrictToOptimizable: true,
+    });
+    expect(result.applied).toBe(1);
+    if (result.spec.target !== "workflow") throw new Error("unexpected target");
+    const step = result.spec.steps[0];
+    if (step === undefined || "kind" in step) throw new Error("expected a regular step");
+    expect(step.model_pool?.policy).toBe("heuristic");
+  });
+});

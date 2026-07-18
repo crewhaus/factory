@@ -8,7 +8,10 @@ import {
   getDefaultEnvironment,
 } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolResultSchema,
+  ToolListChangedNotificationSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { nextBackoffMs } from "./backoff.js";
 import type {
   McpCallOptions,
@@ -44,6 +47,16 @@ export type McpClientOptions = {
   readonly clearTimer?: (handle: unknown) => void;
   /** Optional Section 15 trace bus. When supplied, every callTool emits paired mcp_call_start/end events. */
   readonly eventBus?: TraceEventBus;
+  /**
+   * Loop contract 0.4 (Batch G, G74) — invoked whenever the server sends a
+   * `notifications/tools/list_changed`. The cached tool list is invalidated
+   * BEFORE the handler runs, so a handler that calls {@link
+   * McpClient.listTools} (or the tool-mcp re-diff/re-register path) sees the
+   * fresh catalog. Also registerable after construction via {@link
+   * McpClient.onToolsChanged}. Handler errors are logged and swallowed —
+   * a drifting server must never wedge the run loop.
+   */
+  readonly onToolsChanged?: (client: McpClient) => void;
 };
 
 /**
@@ -84,6 +97,7 @@ export class McpClient {
   private cachedTools: ReadonlyArray<McpToolDefinition> | null = null;
   private connectedDeferred: PromiseDeferred<void> = createDeferred();
   private queuedWaiters = 0;
+  private readonly toolsChangedHandlers = new Set<(client: McpClient) => void>();
 
   constructor(name: string, config: McpServerConfig, opts: McpClientOptions = {}) {
     this.name = name;
@@ -96,6 +110,7 @@ export class McpClient {
     this.setTimer = opts.setTimer ?? ((cb, ms) => setTimeout(cb, ms));
     this.clearTimer = opts.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
     this.eventBus = opts.eventBus;
+    if (opts.onToolsChanged !== undefined) this.toolsChangedHandlers.add(opts.onToolsChanged);
     // The initial connectedDeferred can sit unresolved indefinitely (until
     // first connect() or disconnect()). Attach a no-op catch so a later
     // disconnect-without-await doesn't surface as an unhandled rejection.
@@ -136,6 +151,20 @@ export class McpClient {
     transport.onclose = () => {
       this.handleTransportClose();
     };
+
+    // Loop contract 0.4 (Batch G, G74) — subscribe to the server's
+    // tools/list_changed notification BEFORE the handshake so a server that
+    // fires it immediately post-initialize is not missed. Re-set on every
+    // (re)connect because each attempt builds a fresh SDK Client. The handler
+    // invalidates the tool cache and fans out to registered listeners (the
+    // tool-mcp re-diff/re-register path), all guarded so a drifting server
+    // never wedges the loop. The `typeof` guard tolerates minimal SDK-client
+    // fakes (tests) that don't implement the Protocol notification surface.
+    if (typeof sdk.setNotificationHandler === "function") {
+      sdk.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+        this.handleToolsListChanged();
+      });
+    }
 
     try {
       // SDK's `connect()` calls transport.start() and runs the initialize
@@ -230,6 +259,52 @@ export class McpClient {
     }));
     this.cachedTools = Object.freeze(tools);
     return this.cachedTools;
+  }
+
+  /**
+   * Loop contract 0.4 (Batch G, G74) — force a fresh `tools/list` fetch,
+   * bypassing the boot-time cache. Called by the tool-mcp re-diff path after
+   * a `tools/list_changed` notification (the notification handler already
+   * cleared the cache, but an explicit caller may also invoke this).
+   */
+  async refreshTools(): Promise<ReadonlyArray<McpToolDefinition>> {
+    this.cachedTools = null;
+    return this.listTools();
+  }
+
+  /**
+   * Loop contract 0.4 (Batch G, G74) — register a handler fired on every
+   * `tools/list_changed`. Returns an unsubscribe function. The cache is
+   * already invalidated when the handler runs, so re-listing inside it sees
+   * the new catalog. Multiple handlers fan out in registration order.
+   */
+  onToolsChanged(handler: (client: McpClient) => void): () => void {
+    this.toolsChangedHandlers.add(handler);
+    return () => {
+      this.toolsChangedHandlers.delete(handler);
+    };
+  }
+
+  /**
+   * Handle a `tools/list_changed` notification: invalidate the tool cache so
+   * the next `listTools()` re-fetches, then fan out to registered handlers.
+   * A `closed` client ignores late notifications. Handler errors are logged
+   * and swallowed — best-effort, never fatal to the run loop.
+   */
+  private handleToolsListChanged(): void {
+    if (this.state.kind === "closed") return;
+    this.logger?.info("mcp.tools_list_changed", { server: this.name });
+    this.cachedTools = null;
+    for (const handler of this.toolsChangedHandlers) {
+      try {
+        handler(this);
+      } catch (err) {
+        this.logger?.warn("mcp.tools_changed_handler_error", {
+          server: this.name,
+          error: (err as Error).message,
+        });
+      }
+    }
   }
 
   /**

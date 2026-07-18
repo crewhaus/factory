@@ -591,6 +591,8 @@ function workflowCanvas(
         : {
             model: step.model,
             ...(step.thinking !== undefined ? { thinking: step.thinking } : {}),
+            // Item 9 (G37) — per-step model pool surfaces in the reason segment.
+            ...(step.modelPool !== undefined ? { modelPool: step.modelPool } : {}),
             tools: step.tools,
           },
     ),
@@ -690,6 +692,8 @@ function crewCanvas(ir: Extract<IrNode, { target: "crew" }>, warnings: string[])
     mini: miniSegments({
       model: role.model,
       ...(role.thinking !== undefined ? { thinking: role.thinking } : {}),
+      // Item 9 (G37) — per-role model pool surfaces in the reason segment.
+      ...(role.modelPool !== undefined ? { modelPool: role.modelPool } : {}),
       tools: role.tools,
       subAgents: role.subAgents,
     }),

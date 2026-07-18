@@ -591,6 +591,53 @@ defaultCatalog.register(__knowledgeTool);`;
   };
 }
 
+/**
+ * Item 3 (G32) — plugin activation for the channel daemon. Mirror of target-cli's
+ * renderPlugins (keep in sync): when the spec declares `plugins:`, `daemon.ts`
+ * activates the named plugins at boot via `@crewhaus/plugin-loader` (registry
+ * read → Ed25519 signature + entrypoint-digest verify → import) and registers
+ * the contributed tools on the shared `defaultCatalog`, so they ride
+ * `defaultCatalog.list()` into `createAgent`.
+ *
+ * Split so ordering is safe inside `main()`:
+ *   - `activateBoot` runs EARLY (before skill discovery) so `__plugins.skillDirs`
+ *     feeds `discoverSkills({ pluginDirs })`.
+ *   - `registerBoot` runs AFTER the built-in + skill tools are on the catalog and
+ *     skips any name already registered — first-party wins, and a plugin tool
+ *     named after a built-in never trips `defaultCatalog.register`'s
+ *     duplicate-name throw and bricks the daemon.
+ * Both blocks are indented two spaces for the `main()` body. Empty when the spec
+ * omits `plugins:`, keeping bundles byte-identical.
+ */
+function renderPlugins(ir: IrChannelV0): {
+  imports: string[];
+  activateBoot: string;
+  registerBoot: string;
+  hasAny: boolean;
+} {
+  const names = ir.plugins ?? [];
+  if (names.length === 0) {
+    return { imports: [], activateBoot: "", registerBoot: "", hasAny: false };
+  }
+  return {
+    hasAny: true,
+    imports: [
+      `import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";`,
+    ],
+    activateBoot: `  const __plugins = await activatePlugins({
+    names: ${JSON.stringify(names)},
+    ...createDefaultPluginRuntime({ allowUnsigned: process.env.CREWHAUS_PLUGIN_ALLOW_UNSIGNED === "1" }),
+  });`,
+    registerBoot: `  for (const __t of __plugins.tools) {
+    if (defaultCatalog.get(__t.name) !== undefined) {
+      process.stderr.write(\`[plugins] tool "\${__t.name}" already registered — plugin contribution skipped\\n\`);
+      continue;
+    }
+    defaultCatalog.register(__t);
+  }`,
+  };
+}
+
 function renderMcpServers(ir: IrChannelV0): {
   imports: string[];
   bootBlock: string;

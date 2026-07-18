@@ -929,6 +929,89 @@ if (process.env.CREWHAUS_SCHEDULE !== "0") {
   };
 }
 
+/**
+ * Item 2 (G31) — the A2A federation peer surface for the generated daemon.
+ * Emits the `federation` config the daemon hands to `createGatewayServer`,
+ * env-gated at RUNTIME (unset federation env ⇒ `undefined` ⇒ the well-known +
+ * inbound routes answer 404, behaviour-preserving). `tenantFieldFed` threads
+ * the memory-fabric tenant into the inbound dispatch's `runOneTurn` exactly as
+ * the gateway handler does. The whole block is always emitted so any managed
+ * deployment can be turned into a peer purely by setting env — no recompile.
+ */
+function renderFederation(ir: IrManagedV0): { block: string; field: string } {
+  const firstLine = ir.agent.instructions.split(/\r?\n/, 1)[0]?.trim() ?? "";
+  const description =
+    firstLine.length > 0
+      ? firstLine.length > 200
+        ? `${firstLine.slice(0, 197)}...`
+        : firstLine
+      : `${ir.name} — a managed CrewHaus agent.`;
+  const tenantFieldFed = memoryFabric(ir).wired ? ", tenant: fedTenant" : "";
+  const block = `
+// Item 2 (G31) — A2A federation peer surface. This deployment serves
+// GET /.well-known/agent-card.json (a real A2A Agent Card), GET
+// /.well-known/crewhaus.json (the namespaced discovery alias carrying the
+// cert-pin fingerprint) and POST /federation (the inbound handler) WHEN it is
+// configured as a peer: set CREWHAUS_FEDERATION_DEPLOYMENT_ID (its id),
+// CREWHAUS_FEDERATION_ENDPOINT (public base URL) and
+// CREWHAUS_FEDERATION_FINGERPRINT (64-hex sha256 of its leaf cert). Any unset ⇒
+// the federation routes answer 404. Inbound calls are gated by
+// CREWHAUS_FEDERATION_ALLOWED_PEERS (comma-separated peer deployment ids); an
+// empty/unset allowlist DENIES every inbound call — an explicit allowlist is
+// required to accept a remote peer. mTLS termination (the transport-level
+// authentication floor) is the operator's responsibility (Bun tls / a proxy).
+const FED_DEPLOYMENT_ID = process.env.CREWHAUS_FEDERATION_DEPLOYMENT_ID;
+const FED_ENDPOINT = process.env.CREWHAUS_FEDERATION_ENDPOINT;
+const FED_FINGERPRINT = process.env.CREWHAUS_FEDERATION_FINGERPRINT;
+const FED_ALLOWED_PEERS = (process.env.CREWHAUS_FEDERATION_ALLOWED_PEERS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter((s) => s.length > 0);
+const federation: GatewayFederationConfig | undefined =
+  FED_DEPLOYMENT_ID && FED_ENDPOINT && FED_FINGERPRINT
+    ? {
+        identity: {
+          name: ${escapeJsonString(ir.name)},
+          description: ${escapeJsonString(description)},
+          endpoint: FED_ENDPOINT,
+          publicKeyFingerprint: FED_FINGERPRINT,
+          supportedShapes: ["managed"],
+        },
+        // App-level peer gate. mTLS authenticated *who*; this decides *whether*
+        // the peer is allowlisted. Authentication ≠ authorization.
+        authorize: (ctx) => {
+          const from = ctx.envelope.federation.from.deployment;
+          return FED_ALLOWED_PEERS.includes(from)
+            ? { ok: true }
+            : { ok: false, reason: \`peer "\${from}" not in CREWHAUS_FEDERATION_ALLOWED_PEERS\` };
+        },
+        // Dispatch an authorized inbound call onto a local run under the first
+        // declared tenant (a real deployment maps peers→tenants). The
+        // gateway-server has already validated + classified the payload.
+        dispatch: async (ctx) => {
+          const fedTenant =
+            Object.values(tenantOverrides)[0] ??
+            buildTenant(FED_DEPLOYMENT_ID, { tenantsRoot: TENANTS_ROOT });
+          const fedRunContext = createRunContext({
+            runId: \`fedrun_\${randomBytes(4).toString("hex")}\`,
+            sessionId: \`fedsess_\${randomBytes(6).toString("hex")}\`,
+          });
+          const reply = await withTenant(fedTenant, () =>
+            runOneTurn({
+              tenantId: fedTenant.id,
+              sessionId: fedRunContext.sessionId,
+              input: ctx.envelope.payload${tenantFieldFed},
+              extraOptions: { runContext: fedRunContext },
+            }),
+          );
+          return { reply };
+        },
+      }
+    : undefined;
+`;
+  return { block, field: "\n  federation," };
+}
+
 function renderDaemon(ir: IrManagedV0): string {
   // v0.3.0 — thread the request's Tenant into runOneTurn so the memory
   // fabric's stores are tenant-fenced (§2.7).
@@ -936,6 +1019,8 @@ function renderDaemon(ir: IrManagedV0): string {
   // Loop contract 0.4 (Batch F, temporal contract / ITEM 7) — schedule: wake
   // loop pieces (empty when the spec omits `schedule:`).
   const scheduleWake = renderScheduleWake(ir);
+  // Item 2 (G31) — the A2A federation peer surface (env-gated at runtime).
+  const federationSurface = renderFederation(ir);
   // v0.3.0 PR 14 (§6.3) — the dream consolidation step, registered into the
   // existing boot+hourly janitor tick. Multi-tenant daemons run the
   // DETERMINISTIC phase per tenant (tenantsRootDir mode — re-enumerated
@@ -977,7 +1062,7 @@ const DREAM_STEP = createDreamJanitorStep(${memoryFabric(ir).fragmentJson}, {
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createBudgetStore } from "@crewhaus/durable-state";
 import { formatRunFailure, isRunFailedError } from "@crewhaus/errors";
-import { createGatewayServer } from "@crewhaus/gateway-server";
+import { createGatewayServer, type GatewayFederationConfig } from "@crewhaus/gateway-server";
 import {
   createInMemoryIdempotencyStore,
   idempotencyKey,
@@ -986,7 +1071,7 @@ import {
 import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
 import { createRunContext, type RunContext } from "@crewhaus/run-context";
 ${dreamImport}import { createJanitor } from "@crewhaus/runtime-core";
-import { buildTenant, type Tenant } from "@crewhaus/tenancy";
+import { buildTenant, withTenant, type Tenant } from "@crewhaus/tenancy";
 import { runOneTurn } from "./agent.ts";
 
 import { randomBytes } from "node:crypto";
@@ -1129,13 +1214,13 @@ function registerRunBus(runId: string, tenantId: string, bus: RunContext["eventB
 // (CREWHAUS_RESUME_IDEM_TTL_MS, default 5 min).
 const RESUME_IDEM_STORE = createInMemoryIdempotencyStore<string>();
 const RESUME_IDEM_TTL_MS = Number(process.env.CREWHAUS_RESUME_IDEM_TTL_MS ?? 300_000);
-
+${federationSurface.block}
 const gateway = createGatewayServer({
   jwtSecret: JWT_SECRET,
   tenantsRoot: TENANTS_ROOT,
   tenantOverrides,
   budgetStore: BUDGET_STORE,
-  intakeGate: readIntakeGate,
+  intakeGate: readIntakeGate,${federationSurface.field}
   // Contract item 3 — resolve a run's live trace stream for runs.subscribe from
   // the per-run bus registry, fenced to the owning tenant. Returning undefined
   // (unknown OR cross-tenant runId) makes the gateway answer 404.

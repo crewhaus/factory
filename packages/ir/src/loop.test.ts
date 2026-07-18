@@ -7,7 +7,7 @@
  * hand-built (non-parseSpec) IR can express.
  */
 import { describe, expect, test } from "bun:test";
-import type { IrGraphV0, IrNode, IrV0, IrVoiceV0, IrWorkflowV0 } from "./index";
+import type { IrCrewV0, IrGraphV0, IrNode, IrV0, IrVoiceV0, IrWorkflowV0 } from "./index";
 import { NO_BUDGET_WARNING, RING_TARGETS, SEGMENT_ORDER, projectLoop } from "./index";
 
 const minimalCli = (overrides: Partial<IrV0> = {}): IrV0 => ({
@@ -118,6 +118,84 @@ describe("projectLoop — workflow canvas", () => {
     const projection = projectLoop(wf([]));
     expect(projection.warnings).toEqual(["workflow has no steps — nothing to run"]);
     expect(projection.canvas?.nodes).toEqual([]);
+  });
+
+  test("item 9 (G37) — a step model_pool surfaces in the node's reason segment", () => {
+    const pooledStep = {
+      ...step("route"),
+      modelPool: {
+        candidates: [
+          { model: "claude-haiku-4-5", tags: ["cheap"] },
+          { model: "claude-opus-4-8", tags: ["strong"] },
+        ],
+        policy: "heuristic" as const,
+      },
+    };
+    const projection = projectLoop(wf([pooledStep]));
+    const reason = projection.canvas?.nodes[0]?.mini.find((s) => s.id === "reason");
+    expect(reason?.keys).toContain("model_pool");
+    expect(reason?.summary).toContain("adaptive model pool (2 candidates, policy: heuristic)");
+  });
+});
+
+describe("projectLoop — crew canvas (item 9 model_pool)", () => {
+  const crew = (roles: IrCrewV0["roles"], entry: string): IrCrewV0 => ({
+    version: 0,
+    name: "cr",
+    target: "crew",
+    entry,
+    roles,
+    mcp_servers: {},
+    permissions: { rules: [] },
+    compaction: {},
+  });
+
+  test("a role model_pool surfaces in the role node's reason segment", () => {
+    const projection = projectLoop(
+      crew(
+        [
+          {
+            name: "lead",
+            model: "base-model",
+            instructions: "lead it",
+            tools: [],
+            toolConfigs: {},
+            subAgents: [],
+            modelPool: {
+              candidates: [
+                { model: "claude-haiku-4-5", tags: ["cheap"] },
+                { model: "claude-opus-4-8", tags: ["strong"] },
+              ],
+              policy: "learned" as const,
+            },
+          },
+        ],
+        "lead",
+      ),
+    );
+    const reason = projection.canvas?.nodes[0]?.mini.find((s) => s.id === "reason");
+    expect(reason?.keys).toContain("model_pool");
+    expect(reason?.summary).toContain("adaptive model pool (2 candidates, policy: learned)");
+  });
+
+  test("a role WITHOUT model_pool leaves model_pool out of its reason keys", () => {
+    const projection = projectLoop(
+      crew(
+        [
+          {
+            name: "lead",
+            model: "base-model",
+            instructions: "lead it",
+            tools: [],
+            toolConfigs: {},
+            subAgents: [],
+          },
+        ],
+        "lead",
+      ),
+    );
+    const reason = projection.canvas?.nodes[0]?.mini.find((s) => s.id === "reason");
+    expect(reason?.keys).not.toContain("model_pool");
   });
 });
 

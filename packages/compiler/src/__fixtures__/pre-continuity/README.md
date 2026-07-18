@@ -47,6 +47,20 @@ contract is unchanged (no `wireMemory`/continuity wiring appears); the
 `managed.agent.ts` pin (no resume path of its own) and the channel/research/crew
 and single-shot cli pins are untouched.
 
+**0.4 Batch G (item 2 / G31) delta — managed daemon only.** The managed daemon
+gained the A2A federation peer surface: the `federation` config it hands to
+`createGatewayServer` (the `/.well-known/agent-card.json` + `/.well-known/
+crewhaus.json` + inbound `POST /federation` routes). The whole block is emitted
+unconditionally and env-gated at RUNTIME — unset federation env ⇒ `federation`
+resolves to `undefined` ⇒ those routes answer 404 — so any managed deployment
+becomes a peer purely by setting env, no recompile. Because it rides the
+already-present gateway server (NOT memory/continuity), it appears on a
+memory-free `continuity: false` bundle too, so the `managed.daemon.ts` pin was
+regenerated to pre-PR-11 **plus** that seam. The continuity opt-out contract is
+unchanged (no `wireMemory`/continuity wiring appears); every other pin —
+including `managed.agent.ts` (no gateway of its own) and the channel/research/
+crew shapes (federation is managed-only this batch) — is untouched.
+
 ## Regenerating
 
 Only regenerate when a LATER release deliberately changes emitted bundles;
