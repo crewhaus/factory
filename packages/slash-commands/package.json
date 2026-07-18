@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/slash-commands",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "type": "module",
   "description": "Markdown-templated slash commands with $ARGUMENTS substitution",
   "main": "src/index.ts",

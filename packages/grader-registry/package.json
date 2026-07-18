@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/grader-registry",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "type": "module",
   "description": "Pluggable grader registry: register/lookup, plugin discovery via §26 plugin-sdk",
   "main": "src/index.ts",
