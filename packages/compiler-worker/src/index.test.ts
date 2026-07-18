@@ -72,7 +72,8 @@ agent:
     };
     const file = body.bundle.files.find((f) => f.path === "worker.js");
     expect(file).toBeDefined();
-    expect(file?.content).toContain("api.anthropic.com");
+    expect(file?.content).toContain("@crewhaus/worker-runtime");
+    expect(file?.content).toContain("runWorkerLoop");
   });
 
   test("POST /compile emitAs:cf-worker with a workflow spec returns a worker.js bundle", async () => {
@@ -100,7 +101,8 @@ steps:
     };
     const file = body.bundle.files.find((f) => f.path === "worker.js");
     expect(file).toBeDefined();
-    expect(file?.content).toContain("api.anthropic.com");
+    expect(file?.content).toContain("@crewhaus/worker-runtime");
+    expect(file?.content).toContain("runWorkerLoop");
   });
 
   test("POST /compile emitAs:cf-worker with a graph spec returns a worker.js bundle", async () => {
@@ -136,7 +138,8 @@ edges:
     };
     const file = body.bundle.files.find((f) => f.path === "worker.js");
     expect(file).toBeDefined();
-    expect(file?.content).toContain("api.anthropic.com");
+    expect(file?.content).toContain("@crewhaus/worker-runtime");
+    expect(file?.content).toContain("runWorkerLoop");
   });
 
   test("POST /compile emitAs:cf-worker with an unsupported target returns 400 UNSUPPORTED_TARGET", async () => {
