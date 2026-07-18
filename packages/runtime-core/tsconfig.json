@@ -37,6 +37,7 @@
     { "path": "../streaming-tool-executor" },
     { "path": "../turn-state-machine" },
     { "path": "../trace-event-bus" },
+    { "path": "../worker-runtime" },
     { "path": "../structured-event-printer" },
     { "path": "../metrics-collector" },
     { "path": "../otel-exporter" },

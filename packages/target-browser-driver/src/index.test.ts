@@ -404,6 +404,79 @@ describe("emitBrowserDriver — limits ceilings (loop contract 0.4, Batch A)", (
   });
 });
 
+describe("emitBrowserDriver — REPL / --resume session mode (G51, ITEM 3)", () => {
+  test("parses --prompt, --resume and --continue", () => {
+    const code = emitBrowserDriver(baseIr).files[0]?.content ?? "";
+    expect(code).toContain('valueOf("--prompt")');
+    expect(code).toContain('valueOf("--resume")');
+    expect(code).toContain('args.includes("--continue")');
+  });
+
+  test("validates the --resume sessionId shape and rejects --resume + --continue together", () => {
+    const code = emitBrowserDriver(baseIr).files[0]?.content ?? "";
+    expect(code).toContain("const SESSION_ID_REGEX = /^sess_[0-9a-f]{16}$/;");
+    expect(code).toContain("SESSION_ID_REGEX.test(resumeId)");
+    expect(code).toContain("--resume and --continue are mutually exclusive");
+  });
+
+  test("--continue resolves the most-recent session for this spec name via the session store", () => {
+    const code = emitBrowserDriver(baseIr).files[0]?.content ?? "";
+    expect(code).toContain('import { createSessionStore } from "@crewhaus/session-store";');
+    expect(code).toContain("const sessionStore = createSessionStore();");
+    expect(code).toContain("await sessionStore.list()");
+    expect(code).toContain("sessions.find((s) => s.name === SPEC_NAME)");
+    expect(code).toContain("resume = { sessionId: match.id };");
+  });
+
+  test("an interactive TTY with no --prompt drops into the persistent driver REPL", () => {
+    const code = emitBrowserDriver(baseIr).files[0]?.content ?? "";
+    // REPL detection + the driver stays connected across turns (single
+    // runChatLoop call, no per-turn disconnect).
+    expect(code).toContain("const repl = argPrompt === undefined && process.stdin.isTTY === true;");
+    // REPL lets runChatLoop own stdin (singleTurn omitted); one-shot seeds it.
+    expect(code).toContain("installSigintHandler: true,");
+    expect(code).toContain("singleTurn: true,");
+    expect(code).toContain('seedMessages: [{ role: "user", content: oneShotPrompt }],');
+  });
+
+  test("the resume path threads resume into runChatLoop and reseats the run context", () => {
+    const code = emitBrowserDriver(baseIr).files[0]?.content ?? "";
+    expect(code).toContain(
+      "resume !== undefined ? createRunContext({ sessionId: resume.sessionId }) : createRunContext();",
+    );
+    expect(code).toContain("...(resume !== undefined ? { resume } : {}),");
+  });
+
+  test("ITEM 7 — the resumed run is wrapped in withIdempotency (at-least-once safety)", () => {
+    const code = emitBrowserDriver(baseIr).files[0]?.content ?? "";
+    expect(code).toContain(
+      'import { createInMemoryIdempotencyStore, idempotencyKey, withIdempotency } from "@crewhaus/idempotency-keys";',
+    );
+    expect(code).toContain("const guarded = withIdempotency<undefined, string>(() => drive(), {");
+    expect(code).toContain(
+      "idempotencyKey(`${SPEC_NAME}:${resume.sessionId}:${oneShotPrompt}`, 0)",
+    );
+    // A fresh (non-resumed) run bypasses the idempotency wrapper.
+    expect(code).toContain("finalText = await drive();");
+  });
+
+  test("limits + budget + max_tokens still ride each turn's runChatLoop options", () => {
+    const ir: IrBrowserV0 = {
+      ...baseIr,
+      agent: { ...baseIr.agent, maxTokens: 8192 },
+      budget: { usdMicros: 1_000_000, onExceed: { kind: "abort" } },
+      limits: { turnTimeoutMs: 60_000 },
+    };
+    const code = emitBrowserDriver(ir).files[0]?.content ?? "";
+    // The shared runOptions object carries them, so both REPL and one-shot turns
+    // inherit the ceilings.
+    expect(code).toContain("const runOptions = {");
+    expect(code).toContain("maxTokens: 8192,");
+    expect(code).toContain('"usdMicros":1000000');
+    expect(code).toContain("turnTimeoutMs: 60000,");
+  });
+});
+
 describe("emitBrowserDriver — spec hooks (loop contract 0.4, Batch A)", () => {
   test("declared hooks emit the HookDef import, SPEC_HOOKS const, and the runChatLoop field", () => {
     const ir: IrBrowserV0 = {

@@ -847,8 +847,6 @@ export type IrCliBanner = {
 
 export type IrCliOptions = {
   readonly banner?: IrCliBanner;
-  /** Phase 2 M2.2 — TUI mode gate. */
-  readonly tui?: "basic" | "rich";
 };
 
 export type IrV0 = {
@@ -1181,6 +1179,36 @@ export type IrHeartbeat = {
 };
 
 /**
+ * Loop contract 0.4 (Batch F, temporal contract / G84 schedule half) — a
+ * cron OR interval wake trigger carried into the IR for the daemon-able
+ * shapes (IrChannelV0, IrManagedV0, IrBatchV0). The temporal downstream
+ * lowers this into the emitted daemon's wake loop; `runs resume` rehydrates
+ * an interrupted scheduled run. Durations (`jitter`, interval `every`) are
+ * normalized to milliseconds at lower time so codegen reads literal numbers,
+ * while `cron` is carried verbatim for the daemon's cron parser. Exactly one
+ * `kind` — the discriminated union mirrors the spec's `schedule:` block.
+ */
+export type IrSchedule =
+  | {
+      readonly kind: "cron";
+      /** A 5- or 6-field cron expression, carried verbatim. */
+      readonly cron: string;
+      /** IANA tz the cron evaluates in; absent → the daemon's default (UTC). */
+      readonly timezone?: string;
+      /** Random +/- delay per wake, normalized to ms. Absent → no jitter. */
+      readonly jitterMs?: number;
+      /** Synthetic prompt each wake runs. Absent → the daemon's default tick. */
+      readonly instructions?: string;
+    }
+  | {
+      readonly kind: "interval";
+      /** Wake cadence in ms (spec `every` duration, normalized at lower time). */
+      readonly everyMs: number;
+      readonly jitterMs?: number;
+      readonly instructions?: string;
+    };
+
+/**
  * Phase 3 §3.4 — channel daemon control-UI gateway config.
  */
 export type IrChannelGateway = {
@@ -1222,6 +1250,9 @@ export type IrChannelV0 = {
   readonly subAgents: readonly IrSubAgentDefinition[];
   readonly compaction: IrCompaction;
   readonly heartbeat?: IrHeartbeat;
+  /** Loop contract 0.4 (Batch F) — cron/interval wake trigger. Optional;
+   *  absent when the spec omits `schedule:`. */
+  readonly schedule?: IrSchedule;
   readonly gateway?: IrChannelGateway;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
@@ -1302,6 +1333,14 @@ export type IrManagedV0 = {
     readonly modelPool?: IrModelPool;
   };
   readonly tenants: readonly IrManagedTenant[];
+  /** Loop contract 0.4 (Batch F, G81) — tool catalog for the managed daemon.
+   *  Optional (absent when the spec omits `agent.tools`); the emitter reads
+   *  `ir.tools ?? []`. Per-tenant tool_config overlays apply at runtime via the
+   *  policy-engine's tenant context. */
+  readonly tools?: readonly string[];
+  /** Loop contract 0.4 (Batch F, G81) — builtin tool config blobs (spec
+   *  `agent.tool_config`). Optional; absent when the spec omits it. */
+  readonly toolConfigs?: IrToolConfigs;
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
@@ -1312,6 +1351,8 @@ export type IrManagedV0 = {
   readonly limits?: IrLimits;
   /** Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks. Optional. */
   readonly hooks?: readonly IrHook[];
+  /** Loop contract 0.4 (Batch F) — cron/interval wake trigger. Optional. */
+  readonly schedule?: IrSchedule;
   /** Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
    *  Optional; absent when the spec omits the `evaluation` block. */
   readonly evaluation?: IrEvaluation;
@@ -1695,6 +1736,9 @@ export type IrBatchV0 = {
   /** v0.3.0 — carried when the spec declares `continuity:` (NOT default-on
    *  here); target-batch-worker prints the ignored-note comment. */
   readonly continuity?: IrContinuity;
+  /** Loop contract 0.4 (Batch F) — cron/interval wake trigger for the queue
+   *  worker daemon. Optional. */
+  readonly schedule?: IrSchedule;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];

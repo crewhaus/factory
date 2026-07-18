@@ -26,6 +26,7 @@
     { "path": "../target-pipeline" },
     { "path": "../target-research-bundle" },
     { "path": "../target-voice" },
-    { "path": "../target-workflow" }
+    { "path": "../target-workflow" },
+    { "path": "../worker-runtime" }
   ]
 }

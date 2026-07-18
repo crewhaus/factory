@@ -9,6 +9,7 @@
     { "path": "../errors" },
     { "path": "../infra-utils" },
     { "path": "../ir" },
-    { "path": "../model-router" }
+    { "path": "../model-router" },
+    { "path": "../worker-runtime" }
   ]
 }

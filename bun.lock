@@ -23,6 +23,10 @@
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/canary-controller": "workspace:*",
         "@crewhaus/chunker": "workspace:*",
+        "@crewhaus/cloud-adapter-flyio": "workspace:*",
+        "@crewhaus/cloud-adapter-heroku": "workspace:*",
+        "@crewhaus/cloud-adapter-railway": "workspace:*",
+        "@crewhaus/cloud-adapter-render": "workspace:*",
         "@crewhaus/compiler": "workspace:*",
         "@crewhaus/compliance-controls": "workspace:*",
         "@crewhaus/computer-use-driver": "workspace:*",
@@ -83,6 +87,9 @@
         "@crewhaus/spec-patch": "workspace:*",
         "@crewhaus/spec-registry": "workspace:*",
         "@crewhaus/sub-agent-spawner": "workspace:*",
+        "@crewhaus/target-cf-worker-cli": "workspace:*",
+        "@crewhaus/target-cf-worker-graph": "workspace:*",
+        "@crewhaus/target-cf-worker-workflow": "workspace:*",
         "@crewhaus/target-cli": "workspace:*",
         "@crewhaus/target-eval-bundle": "workspace:*",
         "@crewhaus/template-marketplace-client": "workspace:*",
@@ -444,6 +451,7 @@
         "@crewhaus/target-voice": "workspace:*",
         "@crewhaus/target-workflow": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/worker-runtime": "workspace:*",
       },
     },
     "packages/compiler-worker": {
@@ -1324,6 +1332,7 @@
         "@crewhaus/tool-result-store": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
         "@crewhaus/turn-state-machine": "workspace:*",
+        "@crewhaus/worker-runtime": "workspace:*",
         "zod-to-json-schema": "^3.23.5",
       },
       "devDependencies": {
@@ -1583,6 +1592,10 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
+        "@crewhaus/worker-runtime": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-todo": "workspace:*",
       },
     },
     "packages/target-cf-worker-graph": {
@@ -1593,6 +1606,10 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
+        "@crewhaus/worker-runtime": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-todo": "workspace:*",
       },
     },
     "packages/target-cf-worker-workflow": {
@@ -1603,6 +1620,10 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
+        "@crewhaus/worker-runtime": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-todo": "workspace:*",
       },
     },
     "packages/target-channel-bot": {
@@ -2254,6 +2275,25 @@
         "@crewhaus/memory-service": "workspace:*",
       },
     },
+    "packages/worker-runtime": {
+      "name": "@crewhaus/worker-runtime",
+      "version": "0.3.2",
+      "dependencies": {
+        "@anthropic-ai/sdk": "^0.96.0",
+        "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/token-budget": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-executor": "workspace:*",
+        "@crewhaus/tool-loop-detection": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
+        "@crewhaus/turn-state-machine": "workspace:*",
+        "zod-to-json-schema": "^3.23.5",
+      },
+      "devDependencies": {
+        "zod": "^3.23.8",
+      },
+    },
   },
   "packages": {
     "@anthropic-ai/sdk": ["@anthropic-ai/sdk@0.96.0", "", { "dependencies": { "json-schema-to-ts": "^3.1.1", "standardwebhooks": "^1.0.0" }, "peerDependencies": { "zod": "^3.25.0 || ^4.0.0" }, "optionalPeers": ["zod"], "bin": { "anthropic-ai-sdk": "bin/cli" } }, "sha512-KlCsODtTyb17bLUVCSDC2HtSvAbJf60sEiPEax9dInF+aDF92vS4TZJ5XD7YCQXNb1/5icYaw8Y7wMjPlIV9Zg=="],
@@ -2735,6 +2775,8 @@
     "@crewhaus/wallet-engine": ["@crewhaus/wallet-engine@workspace:packages/wallet-engine"],
 
     "@crewhaus/wiki-store": ["@crewhaus/wiki-store@workspace:packages/wiki-store"],
+
+    "@crewhaus/worker-runtime": ["@crewhaus/worker-runtime@workspace:packages/worker-runtime"],
 
     "@google/genai": ["@google/genai@1.52.0", "", { "dependencies": { "google-auth-library": "^10.3.0", "p-retry": "^4.6.2", "protobufjs": "^7.5.4", "ws": "^8.18.0" }, "peerDependencies": { "@modelcontextprotocol/sdk": "^1.25.2" }, "optionalPeers": ["@modelcontextprotocol/sdk"] }, "sha512-gwSvbpiN/17O9TbsqSsE/OzZcpv5Fo4RQjdngGgogtuB9RsyJ8ZHhX5KjHj1bp5N9snN2eK8LDGXSaWW2hof8Q=="],
 

@@ -147,6 +147,170 @@ describe("emitManaged", () => {
   });
 });
 
+describe("emitManaged — builtin tools + tool_config (loop contract 0.4, Batch F, G81)", () => {
+  const agentOf = (i: IrManagedV0): string =>
+    emitManaged(i).files.find((f) => f.path === "agent.ts")?.content ?? "";
+
+  test("registers spec tools on defaultCatalog at module load and unions them per turn", () => {
+    const c = agentOf({ ...ir, tools: ["webSearch", "read"] });
+    expect(c).toContain('import { defaultCatalog } from "@crewhaus/tool-catalog";');
+    expect(c).toContain('import { read } from "@crewhaus/tool-fs";');
+    expect(c).toContain('import { webSearch } from "@crewhaus/tool-web";');
+    expect(c).toContain("defaultCatalog.register(webSearch);");
+    expect(c).toContain("defaultCatalog.register(read);");
+    // No memory fabric on this fixture → the per-turn tool set IS the catalog.
+    expect(c).toContain("tools: defaultCatalog.list(),");
+  });
+
+  test("applies tool_config inits before the register call (fetch)", () => {
+    const c = agentOf({
+      ...ir,
+      tools: ["fetch"],
+      toolConfigs: { fetch: { allowedHosts: ["api.example.com"] } },
+    });
+    expect(c).toMatch(/import \{ fetch, registerFetchConfig \} from "@crewhaus\/tool-fetch";/);
+    expect(c).toContain('registerFetchConfig({"allowedHosts":["api.example.com"]});');
+    const initIdx = c.indexOf("registerFetchConfig(");
+    const regIdx = c.indexOf("defaultCatalog.register(fetch);");
+    expect(initIdx).toBeGreaterThan(-1);
+    expect(regIdx).toBeGreaterThan(initIdx);
+  });
+
+  test("a shared initSymbol (python/javascript/shell) is emitted exactly once", () => {
+    const c = agentOf({
+      ...ir,
+      tools: ["python", "javascript", "shell"],
+      toolConfigs: { codeExecution: { image: "python:3.12" } },
+    });
+    // The config registrar is CALLED exactly once even though three tools share it.
+    expect(c.split("registerCodeExecutionConfig(").length - 1).toBe(1);
+    expect(c).toContain('registerCodeExecutionConfig({"image":"python:3.12"});');
+    // …and all three tool exports register.
+    expect(c).toContain("defaultCatalog.register(python);");
+    expect(c).toContain("defaultCatalog.register(javascript);");
+    expect(c).toContain("defaultCatalog.register(shell);");
+  });
+
+  test("tools union with the per-turn memory tools when the memory fabric is on", () => {
+    const c = agentOf({
+      ...ir,
+      tools: ["webSearch"],
+      memory: { enabled: true, wiki: { enabled: true } },
+    });
+    expect(c).toContain("defaultCatalog.register(webSearch);");
+    expect(c).toContain("tools: [...__memTools, ...defaultCatalog.list()],");
+  });
+
+  test("an unknown tool throws TargetEmitError naming the offender", () => {
+    expect(() => emitManaged({ ...ir, tools: ["nopeTool"] })).toThrow(TargetEmitError);
+    try {
+      emitManaged({ ...ir, tools: ["nopeTool"] });
+    } catch (e) {
+      expect((e as Error).message).toContain('unknown tool "nopeTool"');
+      expect((e as Error).message).toContain("known tools:");
+    }
+  });
+
+  test("no tools block → no catalog wiring beyond thredz/knowledge (byte-stable)", () => {
+    const c = agentOf(ir);
+    expect(c).not.toContain("defaultCatalog.register(");
+    expect(c).not.toContain("@crewhaus/tool-fs");
+    expect(c).not.toContain("@crewhaus/tool-web");
+  });
+});
+
+describe("emitManaged — schedule wake loop (loop contract 0.4, Batch F, ITEM 7)", () => {
+  const daemonOf = (i: IrManagedV0): string =>
+    emitManaged(i).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+
+  test("interval schedule arms a setInterval wake per declared tenant", () => {
+    const daemon = daemonOf({ ...ir, schedule: { kind: "interval", everyMs: 3_600_000 } });
+    expect(daemon).toContain("async function __fireScheduledWake()");
+    expect(daemon).toContain("for (const __tenantId of Object.keys(TENANT_OVERRIDES))");
+    expect(daemon).toContain("__scheduleTimer = setInterval(async () => {");
+    expect(daemon).toContain("}, 3600000);");
+    expect(daemon).toContain('if (process.env.CREWHAUS_SCHEDULE !== "0")');
+    // Fresh session per tick + classified error handling keeps the daemon up.
+    expect(daemon).toContain('const __sessionId = `sess_${randomBytes(8).toString("hex")}`;');
+    expect(daemon).toContain("if (isRunFailedError(__err)) {");
+    // The timer is cleared on shutdown (both signals).
+    expect(daemon.split("clearInterval(__scheduleTimer)").length - 1).toBe(2);
+  });
+
+  test("interval jitter adds a randomized pre-tick delay", () => {
+    const daemon = daemonOf({
+      ...ir,
+      schedule: { kind: "interval", everyMs: 6_000, jitterMs: 500 },
+    });
+    expect(daemon).toContain("const __jitterMs = Math.floor(Math.random() * 500);");
+  });
+
+  test("cron schedule emits the minute-ticker + matcher and carries the expression verbatim", () => {
+    const daemon = daemonOf({
+      ...ir,
+      schedule: { kind: "cron", cron: "0 */6 * * *", timezone: "America/New_York" },
+    });
+    expect(daemon).toContain("function __cronMatches(expr: string, date: Date): boolean");
+    expect(daemon).toContain("function __cronFieldMatches(field: string, value: number): boolean");
+    expect(daemon).toContain('const __cronExpr = "0 */6 * * *";');
+    expect(daemon).toContain("if (!__cronMatches(__cronExpr, __now)) return;");
+    // 30s ticker, deduped to one fire per matching minute.
+    expect(daemon).toContain("}, 30_000);");
+    expect(daemon).toContain("if (__minuteKey === __lastCronMinute) return;");
+  });
+
+  test("the schedule instructions default when the spec omits them, else ride verbatim", () => {
+    const dflt = daemonOf({ ...ir, schedule: { kind: "interval", everyMs: 1000 } });
+    expect(dflt).toContain("Scheduled wake tick — check for due work and act on it.");
+    const custom = daemonOf({
+      ...ir,
+      schedule: { kind: "interval", everyMs: 1000, instructions: "sweep the outbox" },
+    });
+    expect(custom).toContain('const __SCHEDULE_INSTRUCTIONS = "sweep the outbox";');
+  });
+
+  test("no schedule block → no wake-loop codegen (byte-stable)", () => {
+    const daemon = daemonOf(ir);
+    expect(daemon).not.toContain("__fireScheduledWake");
+    expect(daemon).not.toContain("__scheduleTimer");
+    expect(daemon).not.toContain("CREWHAUS_SCHEDULE");
+    expect(daemon).not.toContain("__cronMatches");
+  });
+});
+
+describe("emitManaged — resume-path idempotency (loop contract 0.4, Batch F, ITEM 7)", () => {
+  const daemonOf = (i: IrManagedV0): string =>
+    emitManaged(i).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+
+  test("runs.continue with a prior sessionId reseats history and dedupes via withIdempotency", () => {
+    const daemon = daemonOf(ir);
+    expect(daemon).toContain(
+      'import {\n  createInMemoryIdempotencyStore,\n  idempotencyKey,\n  withIdempotency,\n} from "@crewhaus/idempotency-keys";',
+    );
+    expect(daemon).toContain("const RESUME_IDEM_STORE = createInMemoryIdempotencyStore<string>();");
+    expect(daemon).toContain(
+      'const isResume = method === "runs.continue" && p.sessionId !== undefined;',
+    );
+    // The resume path passes `resume` into runOneTurn's extraOptions…
+    expect(daemon).toContain("...(isResume ? { resume: { sessionId } } : {}),");
+    // …and wraps execution in withIdempotency keyed on (tenant, session, input).
+    expect(daemon).toContain(
+      "const guarded = withIdempotency<undefined, string>(() => executeTurn(), {",
+    );
+    expect(daemon).toContain("idempotencyKey(`${tenant.id}:${sessionId}:${p.input}`, 0)");
+    // runs.create still runs a fresh turn (no idempotency wrap).
+    expect(daemon).toContain("reply = await executeTurn();");
+  });
+
+  test("the audit sinks + runContext still ride the resume-aware extraOptions", () => {
+    const daemon = daemonOf(ir);
+    const optIdx = daemon.indexOf("extraOptions: {");
+    expect(optIdx).toBeGreaterThan(-1);
+    expect(daemon.indexOf("justificationAuditSink: log,")).toBeGreaterThan(optIdx);
+    expect(daemon.indexOf("egressAuditSink: log,")).toBeGreaterThan(optIdx);
+  });
+});
+
 describe("TargetEmitError", () => {
   test("is a compiler-coded CrewhausError carrying message and cause", () => {
     const cause = new Error("underlying");

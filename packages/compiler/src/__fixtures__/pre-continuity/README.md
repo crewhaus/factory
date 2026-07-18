@@ -32,6 +32,21 @@ is unchanged (no `wireMemory`/continuity wiring appears). `research`/`crew` and
 the single-shot `cli` shape did not gain the seam this batch, so their pins are
 untouched.
 
+**0.4 Batch F (ITEM 7) delta — managed daemon + browser driver only.** The
+resumable long-running shapes gained an at-least-once resume path: a
+`runs.continue` (managed daemon) / `--resume`/`--continue` (browser driver)
+that reseats a prior session's history is now wrapped in
+`@crewhaus/idempotency-keys`' `withIdempotency`, keyed on
+`(tenant/spec, session, input)`, so a duplicate resume (client retry or a
+visibility-lease double-pull) returns the cached reply instead of re-executing
+the turn. That seam is emitted unconditionally on these two shapes (it rides
+session resumption, NOT memory/continuity), so it appears on a memory-free
+`continuity: false` bundle too — the `managed.daemon.ts` and `browser.agent.ts`
+pins were regenerated to pre-PR-11 **plus** that seam. The continuity opt-out
+contract is unchanged (no `wireMemory`/continuity wiring appears); the
+`managed.agent.ts` pin (no resume path of its own) and the channel/research/crew
+and single-shot cli pins are untouched.
+
 ## Regenerating
 
 Only regenerate when a LATER release deliberately changes emitted bundles;

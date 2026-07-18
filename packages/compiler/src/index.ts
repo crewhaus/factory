@@ -42,6 +42,7 @@ import type {
   IrPermissions,
   IrPipelineV0,
   IrResearchV0,
+  IrSchedule,
   IrSecretRef,
   IrSecurity,
   IrSlackConfig,
@@ -87,6 +88,11 @@ import { emitResearchBundle } from "@crewhaus/target-research-bundle";
 import { emitVoice } from "@crewhaus/target-voice";
 import { emitWorkflow } from "@crewhaus/target-workflow";
 import { type ScopeFinding, isOutwardName } from "@crewhaus/tool-builder";
+// Loop contract 0.4 (Batch F, G12/G83) — the cf-worker edge-safety tool policy
+// lives in `@crewhaus/worker-runtime` (the runtime that would execute the
+// tools on the edge). Imported via the `/tool-policy` SUBPATH so this offline
+// gate never drags the loop into the compiler-worker's CF bundle.
+import { partitionEdgeTools } from "@crewhaus/worker-runtime/tool-policy";
 
 /**
  * Compile a YAML spec text into a deployable bundle.
@@ -241,6 +247,16 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
   // rows are gone; research + crew stay carried-with-note this batch.
   research: [unwired("thredz", "research", "the generated daemon prints the ignored-note comment")],
   crew: [unwired("thredz", "crew", "the generated bundle prints the ignored-note comment")],
+  // Loop contract 0.4 (Batch F) — the `schedule:` block is now emit-WIRED on
+  // channel/managed/batch: each daemon arms its wake loop (channel + batch via
+  // durable-execution's `armSchedule`, managed via its per-tenant
+  // setInterval/cron wake in `renderScheduleWake`), so — per this table's
+  // delete-when-wired contract — schedule carries NO accepted-but-unwired row
+  // on any shape. channel + managed have no other unwired top-level keys, so
+  // they drop out of the table entirely; batch keeps only its continuity row.
+  // Managed `agent.tools`/`tool_config` are NESTED keys the top-level-only
+  // ACCEPTED_BUT_UNWIRED mechanism does not track, matching how the other
+  // shapes' nested `agent.tools` are handled.
   batch: [unwired("continuity", "batch", "the generated bundle prints the ignored-note comment")],
   voice: [
     unwired("mcp_servers", "voice", "no MCP host is booted in the voice daemon"),
@@ -343,6 +359,39 @@ export function assertToolScopesStrict(ir: IrNode): void {
       `[strict] ${findings.length} scope finding(s) — refusing to emit: ${detail}. Set scope: "external" on each tool, or compile without { strict: true } to bypass the gate.`,
     );
   }
+}
+
+/**
+ * Loop contract 0.4 (Batch F, G12/G83) — the cf-worker tool-allow gate.
+ *
+ * The cf-worker emitters USED to reject ANY tool at compile time ("does not
+ * yet support tools"). Now that the deployed path runs the real
+ * `@crewhaus/worker-runtime` loop, tools are ALLOWED — but only the edge-safe
+ * ones. This gate (the cf-worker analog of {@link assertToolScopesStrict})
+ * partitions a lowered IR's tool names through the single-source-of-truth
+ * `partitionEdgeTools` policy and:
+ *   - THROWS `CompilerError` when any HOST tool (bash/fs/code-execution/…)
+ *     is referenced — those cannot run on a stateless Worker, so a clear
+ *     compile error beats a bundle that 500s at runtime;
+ *   - RETURNS `CompileWarning`s (code `"edge-unsafe-tool"`) for unrecognised
+ *     CUSTOM tools whose edge-safety the compiler cannot verify offline —
+ *     permitted, but flagged so a host-reaching custom tool is not shipped
+ *     silently.
+ *
+ * Exported for the cf-worker emit paths (the three `target-cf-worker-*`
+ * emitters + the compiler-worker's `cf-worker` branch) to call in place of
+ * the old blanket rejection, over their already-lowered IR — so the
+ * edge-safety rule has one home and cannot drift per emitter.
+ */
+export function assertCfWorkerToolsEdgeSafe(ir: IrNode): ReadonlyArray<CompileWarning> {
+  const { rejected, warned } = partitionEdgeTools(collectToolNames(ir));
+  if (rejected.length > 0) {
+    const detail = rejected.map((r) => r.reason).join("; ");
+    throw new CompilerError(
+      `cf-worker target cannot run ${rejected.length} host tool(s): ${detail}. These need a host (process/filesystem/sandbox/device) the edge does not provide — use the cli target for them, or remove them.`,
+    );
+  }
+  return warned.map((w) => ({ code: "edge-unsafe-tool", path: "tools", message: w.warning }));
 }
 
 type SpecWithPermissions = Exclude<Spec, { target: "eval" }>;
@@ -978,6 +1027,55 @@ function lowerLimits(spec: SpecWithLimits): { limits?: IrLimits } {
             },
           }
         : {}),
+    },
+  };
+}
+
+/**
+ * Loop contract 0.4 (Batch F, temporal contract / G84 schedule half) — lower
+ * the `schedule:` block on the daemon-able shapes (channel/managed/batch).
+ * The discriminated union carries through 1:1; durations (`jitter`, interval
+ * `every`) normalize to ms at lower time (the daemon reads literal numbers)
+ * while `cron` is verbatim (the daemon's cron parser owns validity beyond the
+ * spec's field-count regex). Spread-return-{} discipline (Pillar 1): absent
+ * from the IR when the spec omits the block, so every existing daemon bundle
+ * stays byte-identical. The emitters wire it into the wake loop downstream
+ * (temporal item); until then it rides ACCEPTED_BUT_UNWIRED.
+ */
+type SpecSchedule =
+  | {
+      readonly kind: "cron";
+      readonly cron: string;
+      readonly timezone?: string;
+      readonly jitter?: string;
+      readonly instructions?: string;
+    }
+  | {
+      readonly kind: "interval";
+      readonly every: string;
+      readonly jitter?: string;
+      readonly instructions?: string;
+    };
+
+function lowerSchedule(schedule: SpecSchedule | undefined): { schedule?: IrSchedule } {
+  if (schedule === undefined) return {};
+  if (schedule.kind === "cron") {
+    return {
+      schedule: {
+        kind: "cron",
+        cron: schedule.cron,
+        ...(schedule.timezone !== undefined ? { timezone: schedule.timezone } : {}),
+        ...(schedule.jitter !== undefined ? { jitterMs: parseDurationToMs(schedule.jitter) } : {}),
+        ...(schedule.instructions !== undefined ? { instructions: schedule.instructions } : {}),
+      },
+    };
+  }
+  return {
+    schedule: {
+      kind: "interval",
+      everyMs: parseDurationToMs(schedule.every),
+      ...(schedule.jitter !== undefined ? { jitterMs: parseDurationToMs(schedule.jitter) } : {}),
+      ...(schedule.instructions !== undefined ? { instructions: schedule.instructions } : {}),
     },
   };
 }
@@ -2030,7 +2128,9 @@ export function lower(spec: Spec): IrNode {
                       },
                     }
                   : {}),
-                ...(spec.cli.tui !== "basic" ? { tui: spec.cli.tui } : {}),
+                // Loop contract 0.4 (Batch F, G81) — `cli.tui` is now a
+                // single-valued `"basic"` (the never-implemented `"rich"` is
+                // rejected at parse time), so there is nothing left to lower.
               },
             }
           : {}),
@@ -2154,6 +2254,8 @@ export function lower(spec: Spec): IrNode {
               },
             }
           : {}),
+        // Loop contract 0.4 (Batch F) — cron/interval wake trigger.
+        ...lowerSchedule(spec.schedule),
         // Phase 3 §3.4 — gateway control-UI config.
         ...(spec.gateway !== undefined
           ? {
@@ -2272,12 +2374,22 @@ export function lower(spec: Spec): IrNode {
             maxOutputTokens: t.budget.maxOutputTokens,
           },
         })),
+        // Loop contract 0.4 (Batch F, G81) — the managed daemon's tool catalog
+        // + tool_config overlays (per-tenant application is a runtime
+        // policy-engine concern). Spread-return-{} so a managed bundle without
+        // tools stays byte-identical; the emitter reads `ir.tools ?? []`.
+        ...(spec.agent.tools !== undefined ? { tools: [...spec.agent.tools] } : {}),
+        ...(spec.agent.tool_config !== undefined
+          ? { toolConfigs: lowerToolConfigs(spec.agent.tool_config) }
+          : {}),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
+        // Loop contract 0.4 (Batch F) — cron/interval wake trigger.
+        ...lowerSchedule(spec.schedule),
         // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
         ...lowerEvaluation(spec),
         ...memoryLowered,
@@ -2457,6 +2569,8 @@ export function lower(spec: Spec): IrNode {
         // v0.3.0 — carried only when declared (NOT default-on); the emitter
         // prints the ignored-note comment.
         ...lowerContinuity(spec, { defaultOn: false, autoScope: "spec" }),
+        // Loop contract 0.4 (Batch F) — cron/interval wake trigger.
+        ...lowerSchedule(spec.schedule),
         ...lowerChainSubsystem(spec),
       } satisfies IrBatchV0;
     case "voice":

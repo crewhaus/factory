@@ -10,6 +10,7 @@
     { "path": "./packages/target-cli" },
     { "path": "./packages/target-workflow" },
     { "path": "./packages/runtime-core" },
+    { "path": "./packages/worker-runtime" },
     { "path": "./packages/tool-catalog" },
     { "path": "./packages/tool-builder" },
     { "path": "./packages/tool-validate" },

@@ -15,7 +15,11 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*",
-    "@crewhaus/model-router": "workspace:*"
+    "@crewhaus/model-router": "workspace:*",
+    "@crewhaus/worker-runtime": "workspace:*"
+  },
+  "devDependencies": {
+    "@crewhaus/tool-todo": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

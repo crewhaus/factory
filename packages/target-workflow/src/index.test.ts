@@ -68,7 +68,10 @@ describe("emitWorkflow", () => {
 
   test("priorOutput is threaded between steps", () => {
     const c = emitWorkflow(TWO_STEP_IR).files[0]?.content ?? "";
-    expect(c).toContain("priorOutput = await runChatLoop");
+    // Multi-step plain workflows route each step's runChatLoop through the
+    // durable __durableStep wrapper (Batch F, G61).
+    expect(c).toContain("priorOutput = await __durableStep(");
+    expect(c).toContain("() => runChatLoop({");
     expect(c).toContain("Output of previous step");
   });
 
@@ -804,5 +807,85 @@ describe("emitWorkflow — judge gate steps (loop contract 0.4, G02)", () => {
       expect(c).not.toContain(s);
     }
     expect(c).toContain("\nawait main();");
+  });
+});
+
+describe("emitWorkflow — durable exactly-once step resume (Batch F, G61)", () => {
+  const SINGLE_STEP: IrWorkflowV0 = {
+    version: 0,
+    name: "solo",
+    target: "workflow",
+    steps: [{ name: "only", instructions: "do it", model: "m", tools: [], toolConfigs: {} }],
+    mcp_servers: {},
+    permissions: { rules: [] },
+    compaction: {},
+  };
+
+  test("single-step workflow gets NO durable plumbing (byte-restore contract)", () => {
+    const c = emitWorkflow(SINGLE_STEP).files[0]?.content ?? "";
+    expect(c).not.toContain("@crewhaus/durable-execution");
+    expect(c).not.toContain("__durableStep");
+    expect(c).not.toContain("CREWHAUS_RUN_ID");
+    // The lone step keeps the plain runChatLoop assignment.
+    expect(c).toContain("priorOutput = await runChatLoop({");
+  });
+
+  test("multi-step plain workflow arms the run id, store, and __durableStep wrapper", () => {
+    const c = emitWorkflow(TWO_STEP_IR).files[0]?.content ?? "";
+    expect(c).toContain(
+      'import { createIdempotencyStore, runOnce } from "@crewhaus/durable-execution";',
+    );
+    expect(c).toContain('import { randomUUID as __randomUUID } from "node:crypto";');
+    expect(c).toContain(
+      'const __runId = process.env["CREWHAUS_RUN_ID"] ?? `wf_${__randomUUID()}`;',
+    );
+    expect(c).toContain('const __idempotencyStore = createIdempotencyStore("demo");');
+    expect(c).toContain("runOnce(__idempotencyStore, __runId, name, fn);");
+    // both plain steps wrapped, keyed by their names
+    expect(c).toContain('await __durableStep("list", () => runChatLoop({');
+    expect(c).toContain('await __durableStep("summarize", () => runChatLoop({');
+  });
+
+  test("a workflow of only judge-gated steps stays byte-free of durable plumbing", () => {
+    // step 0 is gated by the downstream judge (step 1) → no plain step → no
+    // durable wrapping (a gated step's closure re-runs on retry by design).
+    const gatedOnly: IrWorkflowV0 = {
+      version: 0,
+      name: "gated",
+      target: "workflow",
+      steps: [
+        { name: "research", instructions: "research", model: "m", tools: [], toolConfigs: {} },
+        {
+          name: "check",
+          instructions: "",
+          model: "m",
+          tools: [],
+          toolConfigs: {},
+          kind: "judge",
+          judge: {
+            graderType: "llm_judge",
+            criteria: "good?",
+            threshold: 0.8,
+            model: "m",
+            onFail: "retry_previous",
+            maxRetries: 2,
+          },
+        },
+      ],
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    const c = emitWorkflow(gatedOnly).files[0]?.content ?? "";
+    expect(c).not.toContain("__durableStep");
+    expect(c).not.toContain("@crewhaus/durable-execution");
+  });
+});
+
+describe("emitWorkflow — emitted durable bundle is syntactically valid TS", () => {
+  test("Bun.Transpiler parses the __durableStep-wrapped agent.ts", () => {
+    const t = new Bun.Transpiler({ loader: "ts" });
+    const code = emitWorkflow(TWO_STEP_IR, { readme: false }).files[0]?.content ?? "";
+    expect(() => t.transformSync(code)).not.toThrow();
   });
 });

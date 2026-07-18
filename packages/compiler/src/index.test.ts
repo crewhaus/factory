@@ -1561,7 +1561,7 @@ describe("compile({ applyIrPasses: true }) — Section 28 ir-passes opt-in", () 
 });
 
 describe("lower — CLI banner + TUI block (Phase 3 §3.3 / Phase 2 M2.2)", () => {
-  test("lowers a random-mode banner with taglines and a non-basic tui", () => {
+  test("lowers a random-mode banner with taglines (tui dropped in 0.4)", () => {
     const ir = lower(
       parseSpec(`
 name: cl
@@ -1575,13 +1575,13 @@ cli:
     taglines:
       - hello
       - world
-  tui: rich
 `),
     );
     if (ir.target !== "cli") throw new Error("unexpected target");
+    // Loop contract 0.4 (Batch F, G81) — `tui` is gone from the IR; the banner
+    // is the only cli sub-block that lowers.
     expect(ir.cli).toEqual({
       banner: { taglineMode: "random", taglines: ["hello", "world"] },
-      tui: "rich",
     });
   });
 
@@ -1625,7 +1625,21 @@ cli:
     expect("tui" in (ir.cli ?? {})).toBe(false);
   });
 
-  test("compile() succeeds end-to-end with a banner + rich tui CLI spec", () => {
+  test("cli.tui: rich is rejected with a migration note (dropped in 0.4)", () => {
+    expect(() =>
+      compile(`
+name: cl
+target: cli
+agent:
+  model: m
+  instructions: i
+cli:
+  tui: rich
+`),
+    ).toThrow(/cli\.tui "rich" was never implemented and is dropped/);
+  });
+
+  test("compile() succeeds end-to-end with a banner-only CLI spec", () => {
     const bundle = compile(`
 name: cl
 target: cli
@@ -1637,7 +1651,6 @@ cli:
     taglineMode: static
     taglines:
       - ready
-  tui: rich
 `);
     expect(bundle.files).toHaveLength(2);
   });

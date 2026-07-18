@@ -5,6 +5,11 @@ import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createBudgetStore } from "@crewhaus/durable-state";
 import { formatRunFailure, isRunFailedError } from "@crewhaus/errors";
 import { createGatewayServer } from "@crewhaus/gateway-server";
+import {
+  createInMemoryIdempotencyStore,
+  idempotencyKey,
+  withIdempotency,
+} from "@crewhaus/idempotency-keys";
 import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
 import { createRunContext, type RunContext } from "@crewhaus/run-context";
 import { createJanitor } from "@crewhaus/runtime-core";
@@ -143,6 +148,15 @@ function registerRunBus(runId: string, tenantId: string, bus: RunContext["eventB
   }
 }
 
+// Loop contract 0.4 (Batch F, ITEM 7) — the resume path's idempotency store.
+// runs.continue with a prior sessionId reseats that session's history and is
+// wrapped in withIdempotency keyed on (tenant, session, input), so a duplicate
+// resume (client retry / a visibility-lease double-pull) returns the cached
+// reply instead of re-executing the turn. TTL bounds the dedupe window
+// (CREWHAUS_RESUME_IDEM_TTL_MS, default 5 min).
+const RESUME_IDEM_STORE = createInMemoryIdempotencyStore<string>();
+const RESUME_IDEM_TTL_MS = Number(process.env.CREWHAUS_RESUME_IDEM_TTL_MS ?? 300_000);
+
 const gateway = createGatewayServer({
   jwtSecret: JWT_SECRET,
   tenantsRoot: TENANTS_ROOT,
@@ -190,9 +204,13 @@ const gateway = createGatewayServer({
       // verdicts are tamper-evidenced per tenant inside the managed daemon.
       const runContext = createRunContext({ runId, sessionId });
       registerRunBus(runId, tenant.id, runContext.eventBus);
-      let reply: string;
-      try {
-        reply = await runOneTurn({
+      // Loop contract 0.4 (Batch F, ITEM 7) — runs.continue with a prior
+      // sessionId is the RESUME path: reseat that session's history (`resume`)
+      // and dedupe a duplicate resume via withIdempotency. runs.create (and a
+      // continue with no sessionId) always runs a fresh turn.
+      const isResume = method === "runs.continue" && p.sessionId !== undefined;
+      const executeTurn = async (): Promise<string> =>
+        await runOneTurn({
           tenantId: tenant.id,
           sessionId,
           input: p.input,
@@ -200,8 +218,21 @@ const gateway = createGatewayServer({
             runContext,
             justificationAuditSink: log,
             egressAuditSink: log,
+            ...(isResume ? { resume: { sessionId } } : {}),
           },
         });
+      let reply: string;
+      try {
+        if (isResume) {
+          const guarded = withIdempotency<undefined, string>(() => executeTurn(), {
+            store: RESUME_IDEM_STORE,
+            ttlMs: RESUME_IDEM_TTL_MS,
+          });
+          const key = idempotencyKey(`${tenant.id}:${sessionId}:${p.input}`, 0);
+          reply = (await guarded(undefined, key)).value;
+        } else {
+          reply = await executeTurn();
+        }
       } catch (err) {
         // v0.3.0 Goal 6 — a classified terminal failure (billing/auth/…)
         // renders its structured report on the daemon's stderr, then

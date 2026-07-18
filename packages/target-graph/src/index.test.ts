@@ -964,3 +964,89 @@ describe("emitGraph — judge gate nodes (loop contract 0.4, G02)", () => {
     expect(c).toContain('import { formatRunFailure, toFailureReport } from "@crewhaus/errors";');
   });
 });
+
+describe("emitGraph — durable exactly-once node wrapping (Batch F, G61)", () => {
+  test("acyclic (DAG) nodes are wrapped in __durableNode; plumbing is emitted", () => {
+    const code = emitGraph(baseIr).files[0]?.content ?? "";
+    expect(code).toContain('import { createGraph, type NodeFn } from "@crewhaus/graph-engine";');
+    expect(code).toContain(
+      'import { createIdempotencyStore, withIdempotency } from "@crewhaus/durable-execution";',
+    );
+    expect(code).toContain('const __idempotencyStore = createIdempotencyStore("hello-graph");');
+    expect(code).toContain(
+      "function __durableNode(name: string, fn: NodeFn<unknown>): NodeFn<unknown>",
+    );
+    // All three linear nodes are wrapped.
+    expect(code).toContain('.addNode("plan", __durableNode("plan",');
+    expect(code).toContain('.addNode("execute", __durableNode("execute",');
+    expect(code).toContain('.addNode("summarise", __durableNode("summarise",');
+  });
+
+  test("a judge-retry loop leaves the gated node UNWRAPPED (re-runs by design)", () => {
+    const withJudge: IrGraphV0 = {
+      ...baseIr,
+      nodes: [
+        ...baseIr.nodes,
+        {
+          name: "gate",
+          instructions: "",
+          model: "claude-sonnet-4-6",
+          tools: [],
+          toolConfigs: {},
+          kind: "judge",
+          judge: {
+            graderType: "llm_judge",
+            criteria: "is the summary good?",
+            threshold: 0.8,
+            model: "claude-sonnet-4-6",
+            onFail: "retry_previous",
+            maxRetries: 2,
+          },
+        },
+      ],
+      edges: [
+        { from: "plan", to: "execute" },
+        { from: "execute", to: "summarise" },
+        { from: "summarise", to: "gate" },
+      ],
+    };
+    const code = emitGraph(withJudge).files[0]?.content ?? "";
+    // summarise is the gated node (judge retries back to it) → NOT wrapped.
+    expect(code).toContain('.addNode("summarise", async (ctx, prev)');
+    expect(code).not.toContain('.addNode("summarise", __durableNode');
+    // plan/execute are still acyclic → wrapped.
+    expect(code).toContain('.addNode("plan", __durableNode("plan",');
+    // judge node itself is never wrapped.
+    expect(code).not.toContain('.addNode("gate", __durableNode');
+  });
+
+  test("an author `when` cycle leaves both cyclic nodes unwrapped", () => {
+    const cyclic: IrGraphV0 = {
+      ...baseIr,
+      entry: "a",
+      nodes: [
+        { name: "a", instructions: "a", model: "m", tools: [], toolConfigs: {} },
+        { name: "b", instructions: "b", model: "m", tools: [], toolConfigs: {} },
+        { name: "done", instructions: "done", model: "m", tools: [], toolConfigs: {} },
+      ],
+      edges: [
+        { from: "a", to: "b" },
+        { from: "b", to: "a", when: { key: "b", equals: "again" } },
+        { from: "b", to: "done" },
+      ],
+    };
+    const code = emitGraph(cyclic).files[0]?.content ?? "";
+    // a and b are on the cycle → unwrapped; only `done` is wrapped.
+    expect(code).not.toContain('.addNode("a", __durableNode');
+    expect(code).not.toContain('.addNode("b", __durableNode');
+    expect(code).toContain('.addNode("done", __durableNode("done",');
+  });
+});
+
+describe("emitGraph — emitted durable bundle is syntactically valid TS", () => {
+  test("Bun.Transpiler parses the wrapped graph agent.ts", () => {
+    const t = new Bun.Transpiler({ loader: "ts" });
+    const code = emitGraph(baseIr, { readme: false }).files[0]?.content ?? "";
+    expect(() => t.transformSync(code)).not.toThrow();
+  });
+});

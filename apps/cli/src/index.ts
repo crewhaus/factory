@@ -5,13 +5,14 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
@@ -74,6 +75,7 @@ import {
   ArgParseError,
   type ParseArgsSchema,
   type ParsedArgs,
+  assertNever,
   parseArgs,
 } from "@crewhaus/infra-utils";
 import { GENERATED_README_MARKER, type IrBudget, projectLoop } from "@crewhaus/ir";
@@ -201,6 +203,10 @@ import {
   parseExitRatingKey,
   shouldPromptExitRating,
 } from "./autodistill";
+// Loop contract 0.4 (Batch F, item 6) — the cf-worker emit switch shared with
+// the compiler-worker's remote `POST /compile { emitAs: "cf-worker" }`, so
+// `crewhaus compile --emit-as cf-worker` emits the same Worker bundle locally.
+import { emitCfWorkerBundle } from "./cf-worker-emit";
 // Item 61 — `crewhaus channel provision|verify` core (adapter-derived Slack
 // manifest, Telegram setWebhook, Discord interactions-endpoint registration,
 // doctor-style scope/webhook probes), in a side-effect-free module so it is
@@ -237,6 +243,21 @@ import {
   buildEvalCiWorkflowYaml,
   buildSentinelDriftWorkflowYaml,
 } from "./ci-scaffold";
+// Loop contract 0.4 (Batch F, item 5) — the engine-free half of
+// `crewhaus deploy <fly|render|railway|heroku>` (provider registry, shape/token
+// gates, app-name + summary helpers). The handler dynamic-imports the matching
+// @crewhaus/cloud-adapter-* engine.
+import {
+  CLOUD_DEPLOY_PROVIDERS,
+  CLOUD_DEPLOY_TARGET_SHAPES,
+  type CloudDeployProviderName,
+  cloudDeployTokenPresent,
+  defaultCloudDeployBaseImage,
+  formatCloudDeployNextSteps,
+  isCloudDeployProvider,
+  isCloudDeployTargetShape,
+  resolveCloudDeployAppName,
+} from "./cloud-deploy";
 // Item 34 — scheduling ergonomics for `compliance evidence` (--period current
 // resolution + the empty-evidence gate), side-effect-free for the same reason.
 import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
@@ -291,6 +312,15 @@ import {
   makeCanaryEvalGate,
   parseTrafficSteps,
 } from "./deploy-canary";
+// Loop contract 0.4 (Batch F, item 2) — `crewhaus dev`: the supervised-child
+// state machine + trace-line scanner + entry-point map (unit-tested); the CLI
+// wraps them with real Bun.spawn + fs.watch below.
+import {
+  type DevChildHandle,
+  createDevSupervisor,
+  devEntrypointFor,
+  isDevDaemonTarget,
+} from "./dev";
 // Model-aware doctor credential checks (provider parsed from the cwd spec's
 // agent.model via the model-router grammar), in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
@@ -843,6 +873,9 @@ import {
   resolveCostEnv,
   resolveTraceEnv,
 } from "./run-observability";
+// Loop contract 0.4 (Batch F, item 7, CLI half) — `crewhaus runs resume`
+// spec-resolution + session-id helpers (engine-free, unit-tested).
+import { RunsError, isRunsSessionId, resolveRunsResumeSpecPath } from "./runs";
 // Item 13 — `crewhaus scaffold-evals` + `init --with-evals`: day-one eval
 // assets generated from the spec (deterministic template / one-shot model
 // sample stubs + a single spec-goal llm_judge or floor grader), in a
@@ -934,6 +967,10 @@ import {
   parseSessionLog,
   summarizeSessionIntoIndex,
 } from "./sessions-index";
+// Loop contract 0.4 (Batch F, item 2) — `sessions tail`: pure event formatting,
+// follow-cursor diffing, and newest-session selection (unit-tested); the CLI
+// wraps them with the fs read + poll loop.
+import { type SessionTailCursor, advanceSessionTail, pickSessionToTail } from "./sessions-tail";
 // Item 37 — SLO/TTFT doctor probe + mitigation-ladder sink, in side-effect-free
 // modules (this entry file runs an argv switch on import) mirroring
 // doctor-checks.ts / alert-sink.ts.
@@ -1040,6 +1077,11 @@ const COMPILE_SCHEMA: ParseArgsSchema = {
     // raw LoopProjection; with -o writes <out-dir>/loop.json.
     { name: "emit-loop", takesValue: false },
     { name: "json", takesValue: false },
+    // Loop contract 0.4 (Batch F, item 6) — `--emit-as cf-worker` emits the
+    // Cloudflare-Worker bundle (the same one the compiler-worker's remote
+    // POST /compile { emitAs } serves) instead of the default `local` bundle.
+    // Supported for target=cli|workflow|graph; see cf-worker-emit.ts.
+    { name: "emit-as", takesValue: true },
     // FR-002 made the strict scope gate DEFAULT-ON, which left `--strict` an
     // accepted no-op. Loop contract 0.4 (Batch A) gives it real meaning
     // again: escalate compile WARNINGS (accepted-but-unwired spec keys) to
@@ -1144,6 +1186,43 @@ const RUN_SCHEMA: ParseArgsSchema = {
     // servers `crewhaus mcp doctor` marked chronically failing in
     // `.crewhaus/mcp/quarantine.json` (default: withdraw them + inject a notice).
     { name: "no-mcp-quarantine", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Loop contract 0.4 (Batch F, item 7, CLI half) — `crewhaus runs resume
+// <session>`. The `resume` is the positional <session>, so it is NOT a flag
+// here; `--spec` names the backing spec. The rest mirror the run flags a
+// resumed continuation honours (they are threaded verbatim into the shared
+// resumed run path).
+const RUNS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "spec", takesValue: true },
+    { name: "model", takesValue: true },
+    { name: "permission-mode", takesValue: true },
+    { name: "prompt", takesValue: true },
+    { name: "justification-judge", takesValue: true },
+    { name: "no-justification-audit", takesValue: false },
+    { name: "egress-matcher", takesValue: true },
+    { name: "egress-embedder", takesValue: true },
+    { name: "budget-usd", takesValue: true },
+    { name: "streaming", takesValue: false },
+    { name: "trace", takesValue: true },
+    { name: "user", takesValue: true },
+    { name: "no-mcp-quarantine", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Loop contract 0.4 (Batch F, item 2) — `crewhaus dev <spec>`: compile in
+// memory, run the bundle as a supervised child, relaunch on change.
+const DEV_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Compile + launch once, wait for the child, exit with its code (no watch
+    // loop) — the scriptable/CI boot check.
+    { name: "once", takesValue: false },
+    // Debounce window (ms) for coalescing a burst of fs changes. Default 150.
+    { name: "debounce", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -1752,6 +1831,12 @@ const SESSIONS_SCHEMA: ParseArgsSchema = {
     // (only "trajectories" today) and where the JSONL lands (default stdout).
     { name: "format", takesValue: true },
     { name: "out", short: "o", takesValue: true },
+    // Loop contract 0.4 (Batch F, item 2) — `sessions tail`: which session dir
+    // to read (default cwd/.crewhaus/sessions), the follow-poll interval, and
+    // --no-follow to dump-and-exit (the scriptable/CI mode).
+    { name: "dir", takesValue: true },
+    { name: "interval", takesValue: true },
+    { name: "no-follow", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -2115,6 +2200,26 @@ const DEPLOY_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Loop contract 0.4 (Batch F, item 5) — `crewhaus deploy <fly|render|railway|
+// heroku> <spec>`. Scaffolds provider manifests; `--live` (token-gated) drives
+// the cloud-adapter-* engine's API deploy.
+const CLOUD_DEPLOY_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "out", short: "o", takesValue: true },
+    { name: "app", takesValue: true },
+    { name: "image", takesValue: true },
+    { name: "region", takesValue: true },
+    // Perform the API deploy (gated on the provider token); default is
+    // scaffold-only.
+    { name: "live", takesValue: false },
+    // Provider-specific live-deploy inputs.
+    { name: "project", takesValue: true }, // railway projectId
+    { name: "org", takesValue: true }, // fly org slug
+    { name: "owner", takesValue: true }, // render ownerId
+    { name: "help", short: "h" },
+  ],
+};
+
 // Item 59 — `crewhaus propose <proposed-spec.yaml>`: package a spec change
 // into a review artifact + open a PR (the governance wrapper around
 // optimize/advise write-back). Never auto-merges.
@@ -2222,6 +2327,7 @@ function usageText(): string {
     "                  [--allow-unmarked-sinks]  opt out of the external-sink scope gate",
     "                  [--check]            verify the emitted bundle (shape assertion + install + liveness boot)",
     "  compile <spec.yaml> --emit-ir        print the lowered IR as JSON (debug)",
+    "  compile <spec.yaml> --emit-as cf-worker  emit the Cloudflare-Worker bundle (cli|workflow|graph)",
     "  compile <spec.yaml> --watch          re-run parse→lint→compile on every change (item 41)",
     "  lint [spec.yaml] [--fix]             check-only: parse + ir-passes (§47 chain / graph-crew",
     "       [--format text|json]            well-formedness the CLI compile path skips) + scope audit,",
@@ -2234,6 +2340,12 @@ function usageText(): string {
     "                  [--justification-judge rule-based|claude]  Pillar 3 intent-gate judge (FR-004)",
     "                  [--egress-matcher substring|semantic]  Pillar 3 sink-side matcher (FR-006)",
     "                  [--egress-embedder <model>]  embedder for --egress-matcher semantic",
+    "  dev <spec.yaml> [--once]             compile in memory + run the bundle as a supervised child,",
+    "                  [--debounce <ms>]    relaunching on every spec/commands/skills change",
+    "                                       (CREWHAUS_TRACE=pretty by default; per-turn summaries)",
+    "  runs resume <session>                re-drive a persisted cli session (e.g. one PARKED on a",
+    "                  [--spec <path>]      pending approval, resolved via `approvals grant`); resolves",
+    "                  [--prompt <text>]    the spec from --spec or cwd/crewhaus.yaml",
     "  eval <spec.yaml> --dataset <data>    run the agent against a dataset and grade",
     "       --graders <graders.yaml>       (deterministic graders + LLM-as-judge)",
     "       [--judge-model <model>] [--concurrency N] [--seed N] [-o <out-dir>]",
@@ -2324,6 +2436,7 @@ function usageText(): string {
     "  lessons update [--sessions N|all]    mine corrections + failures into an auto-loaded LESSONS.md (#56)",
     "       [--low-score F] [-o <LESSONS.md>]  + per-user prefs under .crewhaus/preferences/",
     "  sessions summarize [--before <date>] summarize sessions into a durable index before TTL eviction (#57)",
+    "  sessions tail [<session>]            follow a session's transcript live (per-turn view; --no-follow to dump)",
     "  memory list [--spec <name>]          inspect the per-spec fact stores: id/age/tags/provenance/status",
     "  memory show <mem_id>                 full detail for one memory (provenance, expiry, supersededBy)",
     "  memory forget <mem_id>|--query <q>   explicitly forget memories (append-only supersede tombstones;",
@@ -2372,6 +2485,8 @@ function usageText(): string {
     "  spec put|list|get|pin|alias|log ...  versioned spec storage + changelog (Section 28 spec-registry)",
     "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
     "       promote --require-approval      gate a protected env on an approval quorum (item 59)",
+    "  deploy fly|render|railway|heroku <spec>  scaffold PaaS deploy manifests for a daemon shape;",
+    "       [-o <dir>] [--app <n>] [--image <ref>] [--live]  --live (token-gated) deploys via the API",
     "  propose <proposed.yaml> ...          package a spec change + open a review PR (item 59)",
     "  deploy canary <spec> <version> ...   eval-gated ramp with auto-rollback (item 29):",
     "       --traffic 5,25,50,100 --dataset <d> --graders <g>  eval both versions per step,",
@@ -2474,7 +2589,13 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir] [--emit-loop [--json]] [--check]\n" +
-        "                        [--allow-unmarked-sinks] [--no-readme] [--no-register]\n" +
+        "                        [--emit-as local|cf-worker] [--allow-unmarked-sinks] [--no-readme] [--no-register]\n" +
+        "  --emit-as  local (default) emits the standalone Bun bundle; cf-worker\n" +
+        "             emits the Cloudflare-Worker bundle (worker.js + wrangler.toml\n" +
+        "             + package.json) — the SAME bundle the studio's remote compiler\n" +
+        "             (compiler-worker POST /compile) serves. Supported for\n" +
+        "             target=cli|workflow|graph; other shapes are rejected. Incompatible\n" +
+        "             with --emit-ir/--emit-loop/--check/--with-eval-harness.\n" +
         "  --emit-ir  Skip code emission; print the lowered IR as JSON to\n" +
         "             stdout (or to <out-dir>/ir.json when -o is set).\n" +
         "  --emit-loop  Skip code emission; print the canonical agent-loop\n" +
@@ -2556,6 +2677,32 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   if (check && emitLoop) die("--check verifies emitted files — it cannot combine with --emit-loop");
   if (emitIr && emitLoop) {
     die("--emit-ir and --emit-loop are mutually exclusive (each owns stdout)");
+  }
+  // Loop contract 0.4 (Batch F, item 6) — `--emit-as <local|cf-worker>` picks
+  // the bundle flavour. `local` (default) is the standalone bundle every prior
+  // release emitted; `cf-worker` emits the Cloudflare-Worker bundle — the same
+  // one the compiler-worker's remote POST /compile { emitAs } serves — for
+  // target=cli|workflow|graph. The two print-only modes and the shape-boot
+  // --check assume the local bundle, so cf-worker is incompatible with them.
+  const emitAsFlag = args.flags["emit-as"];
+  const emitAs = typeof emitAsFlag === "string" ? emitAsFlag : "local";
+  if (emitAs !== "local" && emitAs !== "cf-worker") {
+    die(`--emit-as must be "local" or "cf-worker" (got "${emitAs}")`);
+  }
+  const emitCfWorker = emitAs === "cf-worker";
+  if (emitCfWorker) {
+    if (emitIr) die("--emit-as cf-worker cannot combine with --emit-ir (each owns the output)");
+    if (emitLoop) die("--emit-as cf-worker cannot combine with --emit-loop (each owns the output)");
+    if (check) {
+      die(
+        "--emit-as cf-worker cannot combine with --check (the smoke boot assumes a local Bun bundle, not a Worker)",
+      );
+    }
+    if (args.flags["with-eval-harness"] === true) {
+      die(
+        "--emit-as cf-worker cannot combine with --with-eval-harness (the eval bridge projects a local bundle)",
+      );
+    }
   }
   // FR-002 — the strict scope gate is DEFAULT-ON. It runs unless the user
   // explicitly opts out with --allow-unmarked-sinks (or its alias
@@ -2677,21 +2824,37 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   const absOut = resolve(outDir as string);
 
   let bundle: ReturnType<typeof compile>;
-  try {
-    bundle = compile(yamlText, { readme });
-  } catch (err) {
-    // compile() runs parse → lower → emit. parseSpec throws SpecParseError;
-    // each target emitter throws its own TargetEmitError (e.g. an unresolvable
-    // tool name once the default-on scope gate has been bypassed with
-    // --allow-unmarked-sinks). Both — like every structured failure in this
-    // pipeline — extend CrewhausError, so route the whole family through die()
-    // for a clean one-line error + exit 1 instead of letting the emitter crash
-    // escape as an uncaught stack trace. A non-CrewhausError (a genuine bug)
-    // still propagates with its full stack for debugging.
-    if (err instanceof CrewhausError) {
-      die(err.message);
+  if (emitCfWorker) {
+    // Loop contract 0.4 (Batch F, item 6) — the cf-worker emit path drives
+    // lower() + the target-cf-worker-* emitters directly (mirroring the
+    // compiler-worker's remote arm), not the local compile(). The offline
+    // scope gate runs inside emitCfWorkerBundle (the same assertToolScopesStrict
+    // the Worker applies), and any emitter refusal (an unsupported target, a
+    // tool the edge doesn't yet run) is a CompilerError → clean one-liner.
+    try {
+      const cfIr = lower(parseSpec(yamlText));
+      bundle = { files: emitCfWorkerBundle(cfIr, { readme }).files, warnings: [] };
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
     }
-    throw err;
+  } else {
+    try {
+      bundle = compile(yamlText, { readme });
+    } catch (err) {
+      // compile() runs parse → lower → emit. parseSpec throws SpecParseError;
+      // each target emitter throws its own TargetEmitError (e.g. an unresolvable
+      // tool name once the default-on scope gate has been bypassed with
+      // --allow-unmarked-sinks). Both — like every structured failure in this
+      // pipeline — extend CrewhausError, so route the whole family through die()
+      // for a clean one-line error + exit 1 instead of letting the emitter crash
+      // escape as an uncaught stack trace. A non-CrewhausError (a genuine bug)
+      // still propagates with its full stack for debugging.
+      if (err instanceof CrewhausError) {
+        die(err.message);
+      }
+      throw err;
+    }
   }
 
   // Loop contract 0.4 (Batch A) — compile warnings ALWAYS print, one line
@@ -2732,7 +2895,9 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     writeFileSync(fullPath, file.content);
     process.stdout.write(`wrote ${fullPath}\n`);
   }
-  process.stdout.write(`compiled bundle (${bundle.files.length} file(s)) → ${absOut}\n`);
+  process.stdout.write(
+    `compiled ${emitCfWorker ? "cf-worker " : ""}bundle (${bundle.files.length} file(s)) → ${absOut}\n`,
+  );
   // Item 46 — auto-register the just-compiled spec in the local registry so
   // registry state tracks working files without a manual `crewhaus spec put`.
   // Bundle mode only: --emit-ir streams JSON to stdout, which a status line
@@ -4148,6 +4313,101 @@ function applyRunObservabilityEnv(args: ParsedArgs, ir: ReturnType<typeof lower>
 }
 
 /**
+ * Loop contract 0.4 (Batch F, item 7, CLI half) — `crewhaus runs resume
+ * <session> [--spec <path>] [--prompt <text>] [--model <m>] …`.
+ *
+ * Re-drives a persisted cli session: resolves the spec backing it (`--spec`, or
+ * `crewhaus.yaml` in the cwd), confirms the session exists AND belongs to that
+ * spec, then hands off to the SAME resumed run path `run --resume` uses
+ * (`runRunCli` → `runChatLoop({ resume: { sessionId } })`, which replays the
+ * transcript and continues). The dedicated verb is the natural home for
+ * re-driving a run a headless session PARKED (`permissions.ask_mode: pause`,
+ * exit 36) after `crewhaus approvals grant/deny` resolved the park — the
+ * recorded decision is consumed as the loop continues. Passes `--prompt`
+ * through for a one-shot continuation, or resumes the interactive REPL.
+ */
+async function runRunsResume(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"] === true) {
+    process.stdout.write(
+      "usage: crewhaus runs resume <session> [--spec <path>] [--prompt <text>] [--model <m>]\n" +
+        "                        [--trace off|ring|pretty|json] [--budget-usd <n>] [--streaming]\n" +
+        "  Re-drives a persisted cli session (a sess_<16 hex> id) — replaying its\n" +
+        "  transcript and continuing the loop. The session store keeps only\n" +
+        "  name/target/model, so the spec is resolved from --spec, else\n" +
+        "  crewhaus.yaml in the cwd (sessions live under the dir you run from).\n" +
+        "  Typical use: after a headless run PARKED on a pending approval\n" +
+        "  (permissions.ask_mode: pause, exit 36) and `crewhaus approvals grant`\n" +
+        "  resolved it — `runs resume` re-issues the parked call pre-approved.\n" +
+        "  --prompt <text> runs one more turn non-interactively and exits.\n",
+    );
+    return;
+  }
+  const sessionId = args.positional[0];
+  if (typeof sessionId !== "string") {
+    die(
+      "missing <session> — a sess_<16 hex> id (list live sessions with `crewhaus sessions tail`)",
+    );
+  }
+  if (!isRunsSessionId(sessionId)) {
+    die(`invalid <session> "${sessionId}" — expected sess_<16 hex>`);
+  }
+
+  // Resolve the spec backing the resume (--spec, else cwd/crewhaus.yaml).
+  let specPath: string;
+  try {
+    specPath = resolveRunsResumeSpecPath(strFlag(args, "spec"), process.cwd());
+  } catch (err) {
+    if (err instanceof RunsError) die(err.message);
+    throw err;
+  }
+
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(specPath, "utf-8");
+  } catch (err) {
+    die(`could not read ${specPath}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+  if (ir.target !== "cli") {
+    die(
+      `runs resume supports target: cli (got "${ir.target}") — only the cli loop persists a resumable session transcript.`,
+    );
+  }
+
+  // Confirm the session exists AND belongs to this spec before re-driving — a
+  // mismatched name means the wrong spec was resolved, which would replay one
+  // agent's transcript into another's instructions.
+  const store = createSessionStore();
+  const session = await store.get(sessionId);
+  if (session === null) {
+    die(
+      `no session "${sessionId}" under ${join(process.cwd(), SESSIONS_SUBDIR)}. Run from the harness directory that owns it, or check the id with \`crewhaus sessions tail\`.`,
+    );
+  }
+  if (session.name !== ir.name) {
+    die(
+      `session "${sessionId}" belongs to spec "${session.name}", but ${specPath} is "${ir.name}". Pass --spec for the session's own spec.`,
+    );
+  }
+
+  applyRunObservabilityEnv(args, ir);
+  // Hand off to the shared resumed run path with the resume flag synthesized —
+  // the exact machinery `run --resume` drives, so a resumed session behaves
+  // identically whichever verb reached it.
+  const resumeArgs: ParsedArgs = {
+    positional: [specPath],
+    flags: { ...args.flags, resume: sessionId },
+  };
+  await runRunCli(resumeArgs, ir, specPath);
+}
+
+/**
  * cli-target run path. Multi-turn interactive REPL, session-store backed,
  * loads hooks/skills/slash-commands/sub-agents from the user's workspace,
  * and wires every spec-declared MCP server.
@@ -5157,6 +5417,229 @@ function describeAgentIdentityLine(cwd: string): string {
     // fall through to the corrupt-file note
   }
   return `✗ agent identity: ${path} is unreadable or malformed (delete it to re-mint on next run)`;
+}
+
+/**
+ * Loop contract 0.4 (Batch F, item 2) — compile a spec IN MEMORY and emit it to
+ * a fresh temp dir, returning that dir (the child's cwd) + the target shape, or
+ * a structured error (a broken edit). No README, no registry side effects — a
+ * throwaway build for the dev child.
+ */
+function devCompileAndEmit(
+  absSpec: string,
+):
+  | { readonly ok: true; readonly cwd: string; readonly target: string }
+  | { readonly ok: false; readonly error: string } {
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    return { ok: false, error: `read failed: ${(err as Error).message}` };
+  }
+  let bundle: ReturnType<typeof compile>;
+  let target: string;
+  try {
+    bundle = compile(yamlText, { readme: false });
+    target = lower(parseSpec(yamlText)).target;
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof CrewhausError ? err.message : (err as Error).message,
+    };
+  }
+  const cwd = mkdtempSync(join(tmpdir(), "crewhaus-dev-"));
+  for (const file of bundle.files) {
+    const full = join(cwd, file.path);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, file.content);
+  }
+  return { ok: true, cwd, target };
+}
+
+/**
+ * The env a dev child boots with: the parent env plus `CREWHAUS_TRACE=pretty`
+ * (item 2) when the user has not set it, so each turn streams as a pretty trace
+ * — the live per-turn view — out of the box.
+ */
+function devChildEnv(): Record<string, string | undefined> {
+  return { ...process.env, CREWHAUS_TRACE: process.env["CREWHAUS_TRACE"] ?? "pretty" };
+}
+
+/**
+ * Forward a child stream to `out` byte-for-byte (no latency) AND surface each
+ * COMPLETE line to `onLine` (for turn scanning). A trailing partial line is
+ * flushed when the stream ends.
+ */
+async function devForwardAndScan(
+  stream: ReadableStream<Uint8Array>,
+  out: NodeJS.WriteStream,
+  onLine: (line: string) => void,
+): Promise<void> {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  // Bun's ReadableStream is async-iterable.
+  for await (const chunk of stream) {
+    out.write(chunk as Uint8Array);
+    buffer += decoder.decode(chunk as Uint8Array, { stream: true });
+    let nl = buffer.indexOf("\n");
+    while (nl >= 0) {
+      onLine(buffer.slice(0, nl));
+      buffer = buffer.slice(nl + 1);
+      nl = buffer.indexOf("\n");
+    }
+  }
+  if (buffer.length > 0) onLine(buffer);
+}
+
+/**
+ * Loop contract 0.4 (Batch F, item 2) — `crewhaus dev <spec> [--once]
+ * [--debounce <ms>]`.
+ *
+ * Compiles the spec in memory, emits it to a temp dir, and runs the bundle's
+ * entrypoint (`agent.ts` / `daemon.ts` per shape) as a SUPERVISED child with
+ * `CREWHAUS_TRACE=pretty` on by default. Every change to the spec (or the
+ * sibling `.crewhaus/commands` / `skills` dirs) recompiles in memory and — on a
+ * clean build — relaunches the child; a broken edit keeps the running child and
+ * prints the error. A daemon-shape crash restarts (bounded). Each completed
+ * turn prints a `[dev]` summary line. Ctrl-C tears the child down. `--once`
+ * runs one launch to completion (the scriptable boot check) and exits with the
+ * child's code.
+ */
+async function runDev(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"] === true) {
+    process.stdout.write(
+      "usage: crewhaus dev <spec.yaml> [--once] [--debounce <ms>]\n" +
+        "  Compiles the spec in memory, runs the emitted bundle as a supervised\n" +
+        "  child (CREWHAUS_TRACE=pretty by default — turns stream live), and\n" +
+        "  recompiles + relaunches it on every spec / .crewhaus/commands / skills\n" +
+        "  change. A broken edit keeps the running child; a crashed daemon shape\n" +
+        "  restarts (bounded). Each completed turn prints a [dev] summary. Ctrl-C\n" +
+        "  stops. --once launches one run to completion and exits with its code\n" +
+        "  (a credential-free boot check for CI). --debounce sets the change-\n" +
+        "  coalescing window in ms (default 150).\n",
+    );
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+
+  // Initial in-memory compile + emit. A broken spec fails fast here (exit 1);
+  // nothing is launched.
+  const initial = devCompileAndEmit(absSpec);
+  if (!initial.ok) die(`dev: ${initial.error}`);
+  const target = initial.target;
+  const entry = devEntrypointFor(target);
+  const childEnv = devChildEnv();
+
+  // The real spawn seam: run `bun <entry>` in the emitted dir, forwarding stdio
+  // and surfacing complete output lines for turn scanning.
+  const spawnChild = (opts: {
+    readonly entry: string;
+    readonly cwd: string;
+    readonly onLine: (line: string) => void;
+    readonly onExit: (code: number | null) => void;
+  }): DevChildHandle => {
+    const proc = Bun.spawn(["bun", opts.entry], {
+      cwd: opts.cwd,
+      env: childEnv,
+      stdin: "inherit",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    // Forward + scan both streams (detached — they resolve when the child's
+    // streams close). Best-effort: a forwarding error must not crash the dev
+    // loop, so swallow it (the exit code is the source of truth).
+    void devForwardAndScan(proc.stdout, process.stdout, opts.onLine).catch(() => {});
+    void devForwardAndScan(proc.stderr, process.stderr, opts.onLine).catch(() => {});
+    void proc.exited.then((code) => opts.onExit(code));
+    return {
+      pid: proc.pid,
+      kill: () => {
+        try {
+          proc.kill();
+        } catch {
+          // Already gone.
+        }
+      },
+    };
+  };
+
+  // --once: launch one run to completion (stdio inherited) and exit with its
+  // code — no watch loop, no scanning. The CI/boot-check path.
+  if (args.flags["once"] === true) {
+    process.stderr.write(`[dev] launching ${entry} once (${target}) in ${initial.cwd}\n`);
+    const proc = Bun.spawn(["bun", entry], {
+      cwd: initial.cwd,
+      env: childEnv,
+      stdin: "inherit",
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    const code = await proc.exited;
+    process.stderr.write(`[dev] child exited (code ${code})\n`);
+    process.exit(code);
+  }
+
+  // Watch the spec + the sibling authoring dirs, mirroring `compile --watch`.
+  const specDir = dirname(absSpec);
+  const watchPaths = [absSpec, join(specDir, ".crewhaus", "commands"), join(specDir, "skills")];
+  const { watch } = await import("node:fs");
+  const handles: Array<{ close(): void }> = [];
+  const subscribers: Array<() => void> = [];
+  const watcher: Watcher = {
+    subscribe: (cb) => subscribers.push(cb),
+    close: () => {
+      for (const h of handles) {
+        try {
+          h.close();
+        } catch {
+          // A path that vanished mid-watch closes with an error; ignore.
+        }
+      }
+    },
+  };
+  for (const p of watchPaths) {
+    if (!existsSync(p)) continue;
+    try {
+      handles.push(
+        watch(p, { recursive: true }, () => {
+          for (const cb of subscribers) cb();
+        }),
+      );
+    } catch {
+      // Non-fatal: an unwatchable path just isn't watched.
+    }
+  }
+
+  const debounceMs = intFlag(args, "debounce") ?? 150;
+  process.stderr.write(
+    `[dev] watching ${basename(absSpec)} (+ .crewhaus/commands, skills) — Ctrl-C to stop\n`,
+  );
+  const supervisor = createDevSupervisor({
+    entry,
+    isDaemon: isDevDaemonTarget(target),
+    initialCwd: initial.cwd,
+    spawn: spawnChild,
+    recompile: () => devCompileAndEmit(absSpec),
+    watcher,
+    timer: {
+      set: (fn, ms) => setTimeout(fn, ms),
+      clear: (h) => clearTimeout(h as NodeJS.Timeout),
+    },
+    debounceMs,
+    print: (line) => process.stderr.write(`${line}\n`),
+  });
+
+  await new Promise<void>((resolveDev) => {
+    const onSigint = (): void => {
+      supervisor.stop();
+      process.off("SIGINT", onSigint);
+      process.stderr.write("\n[dev] stopped.\n");
+      resolveDev();
+    };
+    process.on("SIGINT", onSigint);
+  });
 }
 
 async function runDoctor(args: ParsedArgs): Promise<void> {
@@ -10881,9 +11364,17 @@ async function runSessions(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus sessions summarize [--before <date>] [--evicted] [--ttl-days N]\n" +
         "       crewhaus sessions export --format trajectories [--out <file.jsonl>]\n" +
+        "       crewhaus sessions tail [<session>] [--dir <root>] [--no-follow] [--interval <ms>]\n" +
         "  summarize: fold sessions (outcome, tools, ratings, key facts) into the durable\n" +
         "  .crewhaus/sessions-index/ before their transcripts expire (30-day TTL).\n" +
         "  --evicted runs a TTL eviction pass and indexes each session just before it is deleted.\n" +
+        "\n" +
+        "  tail: follow a session's transcript live (a `tail -f` for a running agent —\n" +
+        "  the per-turn view `crewhaus dev` points at). With no <session>, tails the\n" +
+        "  most-recently-updated one under .crewhaus/sessions. Each user/assistant turn,\n" +
+        "  tool call + result, and failure prints one line as it lands. --no-follow dumps\n" +
+        "  the current transcript and exits (scriptable/CI); --interval sets the poll ms\n" +
+        "  (default 500). --dir points at a session store other than cwd/.crewhaus/sessions.\n" +
         "\n" +
         "  export --format trajectories: one JSONL line per agent step — a\n" +
         "  (state, action, observation, reward) tuple — assembled from every session\n" +
@@ -10909,8 +11400,15 @@ async function runSessions(args: ParsedArgs): Promise<void> {
     );
     return;
   }
+  // Loop contract 0.4 (Batch F, item 2) — `sessions tail` follows a live
+  // transcript; it owns its own dir resolution + follow loop, so branch before
+  // the summarize/export dir setup below.
+  if (action === "tail") {
+    await runSessionsTail(args);
+    return;
+  }
   if (action !== "summarize" && action !== "export") {
-    die(`sessions: unknown action "${action ?? ""}" — supported: summarize, export`);
+    die(`sessions: unknown action "${action ?? ""}" — supported: summarize, export, tail`);
   }
   const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
   const indexDir = join(process.cwd(), ".crewhaus", SESSIONS_INDEX_DIRNAME);
@@ -11009,6 +11507,93 @@ async function runSessions(args: ParsedArgs): Promise<void> {
     if (summarizeSessionIntoIndex(id, logPath, indexDir) !== undefined) indexed += 1;
   }
   process.stdout.write(`[sessions] summarized ${indexed} session(s) into ${indexDir}\n`);
+}
+
+/**
+ * Loop contract 0.4 (Batch F, item 2) — `crewhaus sessions tail [<session>]`.
+ * Follows a session's append-only event log and pretty-prints each turn as it
+ * lands. With no id, selects the most-recently-updated session. `--no-follow`
+ * dumps the current transcript and exits (scriptable/CI); otherwise polls the
+ * log every `--interval` ms until Ctrl-C. Transcript lines go to STDOUT (so a
+ * `--no-follow` dump is pipeable); status chrome goes to stderr.
+ */
+async function runSessionsTail(args: ParsedArgs): Promise<void> {
+  const dirFlag = strFlag(args, "dir");
+  const sessionsDir =
+    dirFlag !== undefined ? resolve(dirFlag) : join(process.cwd(), SESSIONS_SUBDIR);
+  const explicitId = args.positional[1];
+  if (typeof explicitId === "string" && !SESSION_ID_REGEX.test(explicitId)) {
+    die(`invalid <session> "${explicitId}" — expected sess_<16 hex>`);
+  }
+  if (!existsSync(sessionsDir)) {
+    die(`no session store at ${sessionsDir} — run an agent first, or pass --dir <root>.`);
+  }
+  const sessionId = pickSessionToTail(explicitId, {
+    list: () => readdirSync(sessionsDir),
+    mtimeMs: (f) => {
+      try {
+        return statSync(join(sessionsDir, f)).mtimeMs;
+      } catch {
+        return 0;
+      }
+    },
+  });
+  if (sessionId === undefined) {
+    die(`no sessions found under ${sessionsDir}. Start one with \`crewhaus run <spec>\`.`);
+  }
+  const logPath = join(sessionsDir, `${sessionId}.jsonl`);
+  const readLog = (): string => {
+    try {
+      return readFileSync(logPath, "utf-8");
+    } catch {
+      return "";
+    }
+  };
+
+  const follow = args.flags["no-follow"] !== true;
+  let intervalMs = 500;
+  const intervalFlag = intFlag(args, "interval");
+  if (intervalFlag !== undefined) {
+    if (intervalFlag < 50) die("--interval must be >= 50 (ms)");
+    intervalMs = intervalFlag;
+  }
+
+  // Initial dump (also seeds the follow cursor so live updates don't re-print
+  // the backlog). `advanceSessionTail` counts source lines, so it stays correct
+  // even across the side-channel events that render to nothing.
+  let cursor: SessionTailCursor = { lineCount: 0 };
+  {
+    const initial = advanceSessionTail(readLog(), cursor);
+    for (const line of initial.lines) process.stdout.write(`${line}\n`);
+    cursor = initial.cursor;
+  }
+
+  if (!follow) {
+    // A no-follow dump renders the current transcript (every newline-terminated
+    // event — event-log always terminates each line) and exits.
+    process.stderr.write(`[sessions] tailed ${sessionId} (${logPath})\n`);
+    return;
+  }
+
+  process.stderr.write(`tailing ${sessionId} (${logPath}) — Ctrl-C to stop\n`);
+  await new Promise<void>((resolveTail) => {
+    let stopped = false;
+    const tick = (): void => {
+      if (stopped) return;
+      const advanced = advanceSessionTail(readLog(), cursor);
+      for (const line of advanced.lines) process.stdout.write(`${line}\n`);
+      cursor = advanced.cursor;
+    };
+    const handle = setInterval(tick, intervalMs);
+    const onSigint = (): void => {
+      stopped = true;
+      clearInterval(handle);
+      process.off("SIGINT", onSigint);
+      process.stderr.write("\ntail stopped.\n");
+      resolveTail();
+    };
+    process.on("SIGINT", onSigint);
+  });
 }
 
 // -------- 0.3.0 memory release: crewhaus memory + migrate memories --------
@@ -14132,6 +14717,259 @@ async function runCloud(args: ParsedArgs, action: string): Promise<void> {
   die(`unknown cloud action "${action}" (expected: deploy | teardown)`);
 }
 
+/** Write a provider's scaffolded manifests under `outDir`, returning the
+ *  relative file names (for the summary). Shared by every `deploy <provider>`
+ *  arm. */
+function writeDeployFiles(
+  outDir: string,
+  files: ReadonlyArray<{ readonly path: string; readonly content: string }>,
+): string[] {
+  mkdirSync(outDir, { recursive: true });
+  const written: string[] = [];
+  for (const file of files) {
+    const full = join(outDir, file.path);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, file.content);
+    written.push(file.path);
+  }
+  return written;
+}
+
+/**
+ * Loop contract 0.4 (Batch F, item 5) — `crewhaus deploy <fly|render|railway|
+ * heroku> <spec> [-o <dir>] [--app <name>] [--image <ref>] [--region <r>]
+ * [--live]`.
+ *
+ * Scaffolds the provider's deploy manifests (a Dockerfile wrapper + the
+ * provider's IaC descriptor) from the spec's target shape, then — gated on the
+ * provider API token — optionally performs the LIVE deploy through the matching
+ * `@crewhaus/cloud-adapter-*` engine (dynamic-imported, lazy-booted exactly
+ * like `crewhaus cloud`). Default is scaffold-only: the live deploy needs BOTH
+ * `--live` AND the provider token, so a token-less run (CI, a first look) never
+ * touches a real API. Only daemon shapes (channel/managed/batch/voice/browser)
+ * deploy — a single-shot shape has nothing to keep running.
+ */
+async function runCloudDeploy(
+  args: ParsedArgs,
+  providerName: CloudDeployProviderName,
+): Promise<void> {
+  const provider = CLOUD_DEPLOY_PROVIDERS[providerName];
+  if (args.flags["help"] === true) {
+    const providerFlag =
+      providerName === "railway"
+        ? " [--project <projectId>]"
+        : providerName === "fly"
+          ? " [--org <slug>]"
+          : providerName === "render"
+            ? " [--owner <ownerId>]"
+            : "";
+    const lines = [
+      `usage: crewhaus deploy ${providerName} <spec.yaml> [-o <dir>] [--app <name>] [--image <ref>] [--region <r>] [--live]${providerFlag}`,
+      `  Scaffolds ${provider.label} deploy manifests (a Dockerfile + the provider's IaC`,
+      `  descriptor) for a daemon-shape spec (${CLOUD_DEPLOY_TARGET_SHAPES.join("/")}), under`,
+      "  <dir> (default ./deploy/<provider>).",
+      `  --live   also deploy to ${provider.label} via its API — GATED on ${provider.tokenEnv}`,
+      "           (absent → scaffold and stop). The deploy never runs without --live.",
+      "  --app    app/service name (default: the spec name, sanitized to the provider grammar).",
+      "  --image  base image the generated Dockerfile wraps (default crewhaus/<target>:latest).",
+    ];
+    if (providerName === "fly") {
+      lines.push(
+        "  --image is ALSO the machine image --live launches (build+push it first with",
+        "           `crewhaus build-image <target> --push`).",
+      );
+    }
+    if (providerName === "railway") {
+      lines.push(
+        "  --project <id> is required for --live (Railway attaches the service to a project).",
+      );
+    }
+    process.stdout.write(`${lines.join("\n")}\n`);
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+  const target = ir.target;
+  if (!isCloudDeployTargetShape(target)) {
+    die(
+      `deploy ${providerName}: target "${target}" is not a deployable daemon shape — ${provider.label} runs the long-lived shapes ${CLOUD_DEPLOY_TARGET_SHAPES.join("/")}. A single-shot shape (cli/workflow/graph/…) has nothing to keep running: compile + run it directly, or \`compile --emit-as cf-worker\` for the edge.`,
+    );
+  }
+  const appName = resolveCloudDeployAppName(ir.name, strFlag(args, "app"));
+  const baseImage = strFlag(args, "image") ?? defaultCloudDeployBaseImage(target);
+  const region = strFlag(args, "region");
+  const outFlag = strFlag(args, "out");
+  const outDir =
+    outFlag !== undefined ? resolve(outFlag) : resolve(join(process.cwd(), "deploy", providerName));
+  const live = args.flags["live"] === true;
+  const tokenPresent = cloudDeployTokenPresent(provider);
+  // --live must clear the token gate BEFORE any manifest is written or any API
+  // is touched, naming the exact env var the engine also resolves.
+  if (live && !tokenPresent) {
+    die(
+      `deploy ${providerName} --live needs ${provider.tokenEnv} (unset) — set it, or drop --live to scaffold the manifests only.`,
+    );
+  }
+
+  try {
+    switch (providerName) {
+      case "fly": {
+        const fly = await import("@crewhaus/cloud-adapter-flyio");
+        const files = [
+          {
+            path: "fly.toml",
+            content: fly.flyTomlFor({
+              target,
+              appName,
+              ...(region !== undefined ? { primaryRegion: region } : {}),
+            }),
+          },
+          { path: "Dockerfile.fly", content: fly.flyDockerfileFor({ target, baseImage }) },
+        ];
+        const written = writeDeployFiles(outDir, files);
+        if (!live) {
+          process.stdout.write(
+            formatCloudDeployNextSteps({ provider, outDir, tokenPresent, files: written }),
+          );
+          return;
+        }
+        const imageRef = strFlag(args, "image");
+        if (imageRef === undefined) {
+          die(
+            "deploy fly --live needs --image <pushed-image-ref>: Fly launches a machine from a registry image. Build + push first with `crewhaus build-image <target> --push`, then pass its ref.",
+          );
+        }
+        const org = strFlag(args, "org");
+        const rec = await fly.deployToFly({
+          appName,
+          imageRef,
+          target,
+          ...(region !== undefined ? { region } : {}),
+          ...(org !== undefined ? { orgSlug: org } : {}),
+        });
+        process.stdout.write(
+          `deployed to ${provider.label}: app ${rec.appName} machine ${rec.machineId} (${rec.status}) in ${rec.region}\n`,
+        );
+        return;
+      }
+      case "render": {
+        const render = await import("@crewhaus/cloud-adapter-render");
+        // `region` is the free-form CLI flag; the blueprint types it as the
+        // RenderRegion union but only interpolates it (defaulting "oregon"), so
+        // cast through the function's own parameter type — no static engine
+        // import — and let the adapter own any validation.
+        type RenderRegionArg = NonNullable<
+          Parameters<typeof render.renderBlueprintFor>[0]["region"]
+        >;
+        const blueprintYaml = render.renderBlueprintFor({
+          target,
+          serviceName: appName,
+          ...(region !== undefined ? { region: region as RenderRegionArg } : {}),
+        });
+        const files = [
+          { path: "render.yaml", content: blueprintYaml },
+          { path: "Dockerfile.render", content: render.renderDockerfileFor({ target, baseImage }) },
+        ];
+        const written = writeDeployFiles(outDir, files);
+        if (!live) {
+          process.stdout.write(
+            formatCloudDeployNextSteps({ provider, outDir, tokenPresent, files: written }),
+          );
+          return;
+        }
+        const owner = strFlag(args, "owner");
+        const rec = await render.deployToRender({
+          blueprintYaml,
+          serviceName: appName,
+          ...(owner !== undefined ? { ownerId: owner } : {}),
+        });
+        process.stdout.write(
+          `deployed to ${provider.label}: service ${rec.serviceId} deploy ${rec.deployId} (${rec.status})${rec.url !== undefined ? ` → ${rec.url}` : ""}\n`,
+        );
+        return;
+      }
+      case "railway": {
+        const railway = await import("@crewhaus/cloud-adapter-railway");
+        const files = [
+          { path: "railway.json", content: railway.railwayConfigFor({ target }) },
+          {
+            path: "Dockerfile.railway",
+            content: railway.railwayDockerfileFor({ target, baseImage }),
+          },
+        ];
+        const written = writeDeployFiles(outDir, files);
+        if (!live) {
+          process.stdout.write(
+            formatCloudDeployNextSteps({ provider, outDir, tokenPresent, files: written }),
+          );
+          return;
+        }
+        const projectId = strFlag(args, "project");
+        if (projectId === undefined) {
+          die(
+            "deploy railway --live needs --project <projectId>: Railway attaches the service to an existing project. Create one in the Railway dashboard and pass its id.",
+          );
+        }
+        const rec = await railway.deployToRailway({ projectId, serviceName: appName });
+        process.stdout.write(
+          `deployed to ${provider.label}: service ${rec.serviceName} (${rec.serviceId}) in project ${rec.projectId}\n`,
+        );
+        return;
+      }
+      case "heroku": {
+        const heroku = await import("@crewhaus/cloud-adapter-heroku");
+        const files = [
+          { path: "heroku.yml", content: heroku.herokuYmlFor({ target }) },
+          { path: "app.json", content: heroku.appJsonFor({ target, name: appName }) },
+          { path: "Dockerfile.heroku", content: heroku.herokuDockerfileFor({ target, baseImage }) },
+        ];
+        const written = writeDeployFiles(outDir, files);
+        if (!live) {
+          process.stdout.write(
+            formatCloudDeployNextSteps({ provider, outDir, tokenPresent, files: written }),
+          );
+          return;
+        }
+        // Heroku accepts only the two macro-regions.
+        let herokuRegion: "us" | "eu" | undefined;
+        if (region !== undefined) {
+          if (region !== "us" && region !== "eu") {
+            die(`deploy heroku --region must be "us" or "eu" (got "${region}")`);
+          }
+          herokuRegion = region;
+        }
+        const rec = await heroku.deployToHeroku({
+          appName,
+          ...(herokuRegion !== undefined ? { region: herokuRegion } : {}),
+        });
+        process.stdout.write(
+          `deployed to ${provider.label}: app ${rec.appName} (${rec.appId}) → ${rec.webUrl}\n`,
+        );
+        return;
+      }
+      default:
+        assertNever(providerName);
+    }
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    die(`deploy ${providerName}: ${(err as Error).message}`);
+  }
+}
+
 /**
  * Section 34 — `crewhaus federation discover <deployment> [--srv-domain <d>] [--format json|yaml]`.
  * Resolves a peer's endpoint + supportedShapes + publicKeyFingerprint via
@@ -16062,6 +16900,35 @@ switch (subcommand) {
       throw err;
     }
     break;
+  case "runs": {
+    // Loop contract 0.4 (Batch F, item 7, CLI half) — `runs resume <session>`
+    // re-drives a persisted session (the runtime half is runChatLoop's resume
+    // seam). `runs` is the run-lifecycle namespace (cf. the gateway's
+    // `runs.subscribe`); only `resume` is a CLI verb today.
+    const first = rest[0] ?? "";
+    const isHelp = first === "--help" || first === "-h";
+    if (!isHelp && first !== "resume") {
+      die(`runs action must be "resume" (got "${first}")`);
+    }
+    try {
+      await runRunsResume(parseFor(isHelp ? rest : rest.slice(1), RUNS_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err);
+      throw err;
+    }
+    break;
+  }
+  case "dev":
+    // Loop contract 0.4 (Batch F, item 2) — compile in memory + supervised
+    // child + watch-relaunch. Structured failures (spec parse / lower) route
+    // through die() for a clean one-liner.
+    try {
+      await runDev(parseFor(rest, DEV_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err);
+      throw err;
+    }
+    break;
   case "eval":
     // Item 6 — `eval coverage` is a distinct read-side report with its own
     // flags; every other `eval …` invocation is the run path.
@@ -16403,8 +17270,24 @@ switch (subcommand) {
   }
   case "deploy": {
     const action = rest[0] ?? "";
+    // Loop contract 0.4 (Batch F, item 5) — the cloud-provider arms
+    // (fly/render/railway/heroku) scaffold + token-gated live-deploy through a
+    // cloud-adapter-* engine; the registry ones (promote/rollback/canary) flip
+    // a spec-registry env pin. They share the `deploy` verb but nothing else,
+    // so route by action to keep each schema/handler focused.
+    if (isCloudDeployProvider(action)) {
+      try {
+        await runCloudDeploy(parseFor(rest.slice(1), CLOUD_DEPLOY_SCHEMA), action);
+      } catch (err) {
+        if (err instanceof CrewhausError) die(err.message);
+        throw err;
+      }
+      break;
+    }
     if (action !== "promote" && action !== "rollback" && action !== "canary") {
-      die(`deploy action must be "promote", "rollback", or "canary" (got "${action}")`);
+      die(
+        `deploy action must be one of: fly, render, railway, heroku, promote, rollback, canary (got "${action}")`,
+      );
     }
     try {
       await runDeploy(parseFor(rest.slice(1), DEPLOY_SCHEMA), action);

@@ -57,6 +57,124 @@ export class TargetEmitError extends CrewhausError {
 }
 
 /**
+ * Loop contract 0.4 (Batch F, G81) — built-in tool name → package + export.
+ * The managed daemon runs on node, so it carries the FULL builtin surface
+ * (mirror of `BUILTIN_TOOL_MAP` in target-cli + apps/cli's `loadToolMap()` —
+ * keep the three in sync). `initSymbol` names the per-tool config registrar
+ * emitted (with the matching `tool_config[name]` blob) before the tool is
+ * registered on defaultCatalog.
+ */
+type BuiltinToolEntry = {
+  readonly package: string;
+  readonly export: string;
+  readonly initSymbol?: string;
+};
+
+const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
+  read: { package: "@crewhaus/tool-fs", export: "read" },
+  write: { package: "@crewhaus/tool-fs", export: "write" },
+  edit: { package: "@crewhaus/tool-fs", export: "edit" },
+  glob: { package: "@crewhaus/tool-fs", export: "glob" },
+  grep: { package: "@crewhaus/tool-fs", export: "grep" },
+  bash: { package: "@crewhaus/tool-bash", export: "bash" },
+  bashOutput: { package: "@crewhaus/tool-bash", export: "bashOutput" },
+  killShell: { package: "@crewhaus/tool-bash", export: "killShell" },
+  todoWrite: { package: "@crewhaus/tool-todo", export: "todoWrite" },
+  webFetch: {
+    package: "@crewhaus/tool-web",
+    export: "webFetch",
+    initSymbol: "registerWebFetchConfig",
+  },
+  webSearch: { package: "@crewhaus/tool-web", export: "webSearch" },
+  readImage: { package: "@crewhaus/tool-image", export: "readImage" },
+  fetch: {
+    package: "@crewhaus/tool-fetch",
+    export: "fetch",
+    initSymbol: "registerFetchConfig",
+  },
+  python: {
+    package: "@crewhaus/tool-code-execution",
+    export: "python",
+    initSymbol: "registerCodeExecutionConfig",
+  },
+  javascript: {
+    package: "@crewhaus/tool-code-execution",
+    export: "javascript",
+    initSymbol: "registerCodeExecutionConfig",
+  },
+  shell: {
+    package: "@crewhaus/tool-code-execution",
+    export: "shell",
+    initSymbol: "registerCodeExecutionConfig",
+  },
+  imageGenerate: {
+    package: "@crewhaus/tool-image-generation",
+    export: "imageGenerate",
+    initSymbol: "registerImageGenerationConfig",
+  },
+  ingestDocument: {
+    package: "@crewhaus/tool-document-ingest",
+    export: "ingestDocument",
+  },
+  codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },
+  codegraphCallers: { package: "@crewhaus/tool-codegraph", export: "codegraphCallers" },
+  codegraphCallees: { package: "@crewhaus/tool-codegraph", export: "codegraphCallees" },
+  codegraphImpact: { package: "@crewhaus/tool-codegraph", export: "codegraphImpact" },
+};
+
+/**
+ * Loop contract 0.4 (Batch F, G81) — resolve the managed spec's `agent.tools`
+ * into grouped imports + per-tool config inits + defaultCatalog registrations.
+ * Mirror of target-cli's `resolveTools`: a shared `initSymbol` (python/
+ * javascript/shell → `registerCodeExecutionConfig`) is emitted exactly once,
+ * honoring `tool_config[name]` (or the `codeExecution`/`code_execution`
+ * aliases). The `@crewhaus/tool-catalog` import is supplied by the caller's
+ * `catalogImport` (defaultCatalog is shared with thredz/knowledge), so it is
+ * NOT prepended here. Empty when the spec declares no tools, keeping bundles
+ * byte-identical. Per-tenant `tool_config` overlays are a runtime policy-engine
+ * concern (the daemon evaluates policy per request with the tenant id); this
+ * emit registers the base catalog every tenant draws from.
+ */
+function resolveManagedTools(
+  toolNames: readonly string[],
+  toolConfigs: Readonly<Record<string, unknown>>,
+): { imports: string[]; inits: string[]; registrations: string[] } {
+  if (toolNames.length === 0) return { imports: [], inits: [], registrations: [] };
+  const byPackage = new Map<string, Set<string>>();
+  const registrations: string[] = [];
+  const inits: string[] = [];
+  const initEmitted = new Set<string>();
+  for (const name of toolNames) {
+    const entry = BUILTIN_TOOL_MAP[name];
+    if (!entry) {
+      const known = Object.keys(BUILTIN_TOOL_MAP).sort().join(", ");
+      throw new TargetEmitError(`unknown tool "${name}" — known tools: ${known}`);
+    }
+    const set = byPackage.get(entry.package) ?? new Set<string>();
+    set.add(entry.export);
+    byPackage.set(entry.package, set);
+    if (entry.initSymbol !== undefined) {
+      const cfg =
+        toolConfigs[name] ?? toolConfigs["codeExecution"] ?? toolConfigs["code_execution"];
+      if (cfg !== undefined && !initEmitted.has(entry.initSymbol)) {
+        set.add(entry.initSymbol);
+        inits.push(`${entry.initSymbol}(${JSON.stringify(cfg)});`);
+        initEmitted.add(entry.initSymbol);
+      } else if (cfg !== undefined) {
+        set.add(entry.initSymbol);
+      }
+    }
+    registrations.push(`defaultCatalog.register(${entry.export});`);
+  }
+  const imports: string[] = [];
+  for (const pkg of [...byPackage.keys()].sort()) {
+    const symbols = [...(byPackage.get(pkg) ?? new Set<string>())].sort();
+    imports.push(`import { ${symbols.join(", ")} } from "${pkg}";`);
+  }
+  return { imports, inits, registrations };
+}
+
+/**
  * Item 22 — render the failover-chain runChatLoop fields from the IR agent
  * block, indented for the generated `runOneTurn` body. Empty when the spec
  * declared neither field so existing bundles stay byte-identical. Mirror:
@@ -496,16 +614,40 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";`
   // load (top-level await ingest) and unions defaultCatalog.list() into the
   // per-turn tool set. Mirror of target-cli's renderKnowledge (keep in sync).
   const knowledgeOn = ir.knowledge !== undefined;
+  // Loop contract 0.4 (Batch F, G81) — spec-declared builtin tools
+  // (`agent.tools` + `agent.tool_config`). Registered on defaultCatalog at
+  // module load and unioned into the per-turn tool set, exactly like the
+  // thredz aliases and the knowledge Retrieve tool. Per-tenant tool_config
+  // overlays apply at runtime through the daemon's policy-engine tenant
+  // context; this registers the shared base catalog.
+  const toolsOn = ir.tools !== undefined && ir.tools.length > 0;
+  const resolvedTools = toolsOn
+    ? resolveManagedTools(ir.tools ?? [], ir.toolConfigs ?? {})
+    : { imports: [], inits: [], registrations: [] };
   const thredzImports = thredzOn
     ? `
 import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
 import { connectThredz } from "@crewhaus/memory-service";
 import { formatRunFailure, toFailureReport } from "@crewhaus/errors";`
     : "";
-  // defaultCatalog is the shared registration surface for BOTH thredz aliases
-  // and the knowledge Retrieve tool — imported once when either is on.
+  // defaultCatalog is the shared registration surface for thredz aliases, the
+  // knowledge Retrieve tool, AND the spec's builtin tools — imported once when
+  // any of them is on.
   const catalogImport =
-    thredzOn || knowledgeOn ? `\nimport { defaultCatalog } from "@crewhaus/tool-catalog";` : "";
+    thredzOn || knowledgeOn || toolsOn
+      ? `\nimport { defaultCatalog } from "@crewhaus/tool-catalog";`
+      : "";
+  const toolImportBlock =
+    resolvedTools.imports.length > 0 ? `\n${resolvedTools.imports.join("\n")}` : "";
+  // Registered at module load (mirror of target-browser-driver): per-tool
+  // config inits run before the register calls so first execution sees them.
+  const toolBootBlock =
+    resolvedTools.registrations.length > 0
+      ? `
+// Loop contract 0.4 (Batch F, G81) — register the spec's builtin tools on
+// defaultCatalog at module load; the per-turn tool set unions the catalog.
+${resolvedTools.inits.length > 0 ? `${resolvedTools.inits.join("\n")}\n` : ""}${resolvedTools.registrations.join("\n")}`
+      : "";
   const knowledgeImports = knowledgeOn
     ? `\nimport { knowledgeRetrieve, resolveKnowledgeEmbedder } from "@crewhaus/tool-retrieve";`
     : "";
@@ -601,7 +743,7 @@ const __memEmbedder = createEmbedder({ model: ${escapeJsonString(memEmbedderMode
   // the knowledge Retrieve tool (G22) register on defaultCatalog at module
   // load, so whenever either is on the per-turn tool set unions
   // `defaultCatalog.list()` with the per-turn memory tools.
-  const catalogUnion = thredzOn || knowledgeOn;
+  const catalogUnion = thredzOn || knowledgeOn || toolsOn;
   const toolsExpr = catalogUnion
     ? fabric.wired
       ? "[...__memTools, ...defaultCatalog.list()]"
@@ -619,7 +761,7 @@ const __memEmbedder = createEmbedder({ model: ${escapeJsonString(memEmbedderMode
 // Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: managed, ir version: ${ir.version})
 import { runChatLoop } from "@crewhaus/runtime-core";
-import type { RunChatLoopOptions } from "@crewhaus/runtime-core";${pcImport}${memImports}${thredzImports}${catalogImport}${knowledgeImports}${embedderImport}${evalImport}${evaluationBlock}${thredzBootBlock}${embedderBootBlock}${knowledgeBootBlock}${pcBootBlock}
+import type { RunChatLoopOptions } from "@crewhaus/runtime-core";${pcImport}${memImports}${thredzImports}${catalogImport}${toolImportBlock}${knowledgeImports}${embedderImport}${evalImport}${evaluationBlock}${toolBootBlock}${thredzBootBlock}${embedderBootBlock}${knowledgeBootBlock}${pcBootBlock}
 
 export type ManagedAgentArgs = {
   readonly tenantId: string;
@@ -642,10 +784,158 @@ ${memBlock}  return await runChatLoop({
 `;
 }
 
+/**
+ * Loop contract 0.4 (Batch F, temporal contract / ITEM 7) — lower `ir.schedule`
+ * into the managed daemon's wake loop. Each tick runs a synthetic agent turn
+ * per DECLARED tenant (deterministic, mirroring the janitor's per-tenant sweep)
+ * in a FRESH session — the "wake, decide, act, sleep" pattern; cross-tick memory
+ * is a `continuity:` concern, not the scheduler's. A failed tick is classified
+ * and logged; the daemon keeps serving. `CREWHAUS_SCHEDULE=0` disarms it.
+ *
+ * Interval arms a `setInterval(everyMs)`; cron arms a 30s minute-ticker that
+ * fires on the first second a minute matches (deduped per minute). The cron
+ * matcher supports `*`, `*​/n`, `a-b`, `a,b` and plain fields over 5- or 6-field
+ * expressions, evaluated in the daemon's LOCAL clock; a declared `timezone`
+ * and the advanced tokens `L`/`W`/`#` are best-effort (unmatched tokens simply
+ * do not fire). Returns empty pieces when the spec omits `schedule:`, keeping
+ * pre-existing bundles byte-identical.
+ */
+function renderScheduleWake(ir: IrManagedV0): { helpers: string; block: string; shutdown: string } {
+  const schedule = ir.schedule;
+  if (schedule === undefined) return { helpers: "", block: "", shutdown: "" };
+  const wakeTenant = memoryFabric(ir).wired ? "\n        tenant: __tenant," : "";
+  const instructions = escapeJsonString(
+    schedule.instructions ?? "Scheduled wake tick — check for due work and act on it.",
+  );
+  const jitterExpr =
+    schedule.jitterMs !== undefined && schedule.jitterMs > 0
+      ? `Math.floor(Math.random() * ${schedule.jitterMs})`
+      : "0";
+  const fireFn = `
+// Loop contract 0.4 (Batch F, temporal contract) — schedule: wake loop.
+const __SCHEDULE_INSTRUCTIONS = ${instructions};
+let __scheduleTick = 0;
+let __scheduleTimer: ReturnType<typeof setInterval> | undefined;
+async function __fireScheduledWake(): Promise<void> {
+  const __tick = __scheduleTick++;
+  for (const __tenantId of Object.keys(TENANT_OVERRIDES)) {
+    const __tenant = tenantOverrides[__tenantId];
+    if (__tenant === undefined) continue;
+    const __sessionId = \`sess_\${randomBytes(8).toString("hex")}\`;
+    try {
+      const __reply = await runOneTurn({
+        tenantId: __tenantId,
+        sessionId: __sessionId,
+        input: __SCHEDULE_INSTRUCTIONS,${wakeTenant}
+      });
+      const __preview = __reply.length > 200 ? \`\${__reply.slice(0, 200)}…\` : __reply;
+      console.error(\`[schedule] tenant \${__tenantId} tick #\${__tick} → \${__preview}\`);
+    } catch (__err) {
+      // A dead provider account / classified failure for one tenant must not
+      // stop the scheduler; render its report and keep ticking.
+      if (isRunFailedError(__err)) {
+        process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[schedule]" })}\\n\`);
+      } else {
+        process.stderr.write(
+          \`[schedule] tenant \${__tenantId} tick #\${__tick} error: \${(__err as Error).message}\\n\`,
+        );
+      }
+    }
+  }
+}`;
+
+  if (schedule.kind === "interval") {
+    const block = `${fireFn}
+if (process.env.CREWHAUS_SCHEDULE !== "0") {
+  __scheduleTimer = setInterval(async () => {
+    const __jitterMs = ${jitterExpr};
+    if (__jitterMs > 0) await new Promise((__r) => setTimeout(__r, __jitterMs));
+    await __fireScheduledWake();
+  }, ${schedule.everyMs});
+  console.error(\`[schedule] interval wake armed every ${schedule.everyMs}ms\`);
+}
+`;
+    return {
+      helpers: "",
+      block,
+      shutdown: "\n  if (__scheduleTimer !== undefined) clearInterval(__scheduleTimer);",
+    };
+  }
+
+  // cron arm
+  const helpers = `
+// Loop contract 0.4 (Batch F) — minute-granularity cron matcher for the
+// schedule: wake loop (supports *, *​/n, a-b, a,b over 5/6-field expressions).
+function __cronFieldMatches(field: string, value: number): boolean {
+  if (field === "*" || field === "?") return true;
+  for (const part of field.split(",")) {
+    if (part.startsWith("*/")) {
+      const step = Number(part.slice(2));
+      if (Number.isFinite(step) && step > 0 && value % step === 0) return true;
+      continue;
+    }
+    const dash = part.indexOf("-");
+    if (dash > 0) {
+      const lo = Number(part.slice(0, dash));
+      const hi = Number(part.slice(dash + 1));
+      if (Number.isFinite(lo) && Number.isFinite(hi) && value >= lo && value <= hi) return true;
+      continue;
+    }
+    if (Number(part) === value) return true;
+  }
+  return false;
+}
+function __cronMatches(expr: string, date: Date): boolean {
+  const fields = expr.trim().split(/\\s+/);
+  // 6-field expressions lead with seconds (ignored at minute granularity).
+  const off = fields.length === 6 ? 1 : 0;
+  const min = fields[off];
+  const hr = fields[off + 1];
+  const dom = fields[off + 2];
+  const mon = fields[off + 3];
+  const dow = fields[off + 4];
+  if (min === undefined || hr === undefined || dom === undefined || mon === undefined || dow === undefined) {
+    return false;
+  }
+  return (
+    __cronFieldMatches(min, date.getMinutes()) &&
+    __cronFieldMatches(hr, date.getHours()) &&
+    __cronFieldMatches(dom, date.getDate()) &&
+    __cronFieldMatches(mon, date.getMonth() + 1) &&
+    __cronFieldMatches(dow, date.getDay())
+  );
+}`;
+  const block = `${fireFn}
+if (process.env.CREWHAUS_SCHEDULE !== "0") {
+  const __cronExpr = ${escapeJsonString(schedule.cron)};
+  let __lastCronMinute = "";
+  __scheduleTimer = setInterval(async () => {
+    const __now = new Date();
+    const __minuteKey = \`\${__now.getFullYear()}-\${__now.getMonth()}-\${__now.getDate()}-\${__now.getHours()}-\${__now.getMinutes()}\`;
+    if (__minuteKey === __lastCronMinute) return; // one fire per matching minute
+    if (!__cronMatches(__cronExpr, __now)) return;
+    __lastCronMinute = __minuteKey;
+    const __jitterMs = ${jitterExpr};
+    if (__jitterMs > 0) await new Promise((__r) => setTimeout(__r, __jitterMs));
+    await __fireScheduledWake();
+  }, 30_000);
+  console.error(\`[schedule] cron ${escapeJsonString(schedule.cron)} wake armed\`);
+}
+`;
+  return {
+    helpers,
+    block,
+    shutdown: "\n  if (__scheduleTimer !== undefined) clearInterval(__scheduleTimer);",
+  };
+}
+
 function renderDaemon(ir: IrManagedV0): string {
   // v0.3.0 — thread the request's Tenant into runOneTurn so the memory
   // fabric's stores are tenant-fenced (§2.7).
   const tenantField = memoryFabric(ir).wired ? ", tenant" : "";
+  // Loop contract 0.4 (Batch F, temporal contract / ITEM 7) — schedule: wake
+  // loop pieces (empty when the spec omits `schedule:`).
+  const scheduleWake = renderScheduleWake(ir);
   // v0.3.0 PR 14 (§6.3) — the dream consolidation step, registered into the
   // existing boot+hourly janitor tick. Multi-tenant daemons run the
   // DETERMINISTIC phase per tenant (tenantsRootDir mode — re-enumerated
@@ -688,6 +978,11 @@ import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createBudgetStore } from "@crewhaus/durable-state";
 import { formatRunFailure, isRunFailedError } from "@crewhaus/errors";
 import { createGatewayServer } from "@crewhaus/gateway-server";
+import {
+  createInMemoryIdempotencyStore,
+  idempotencyKey,
+  withIdempotency,
+} from "@crewhaus/idempotency-keys";
 import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
 import { createRunContext, type RunContext } from "@crewhaus/run-context";
 ${dreamImport}import { createJanitor } from "@crewhaus/runtime-core";
@@ -826,6 +1121,15 @@ function registerRunBus(runId: string, tenantId: string, bus: RunContext["eventB
   }
 }
 
+// Loop contract 0.4 (Batch F, ITEM 7) — the resume path's idempotency store.
+// runs.continue with a prior sessionId reseats that session's history and is
+// wrapped in withIdempotency keyed on (tenant, session, input), so a duplicate
+// resume (client retry / a visibility-lease double-pull) returns the cached
+// reply instead of re-executing the turn. TTL bounds the dedupe window
+// (CREWHAUS_RESUME_IDEM_TTL_MS, default 5 min).
+const RESUME_IDEM_STORE = createInMemoryIdempotencyStore<string>();
+const RESUME_IDEM_TTL_MS = Number(process.env.CREWHAUS_RESUME_IDEM_TTL_MS ?? 300_000);
+
 const gateway = createGatewayServer({
   jwtSecret: JWT_SECRET,
   tenantsRoot: TENANTS_ROOT,
@@ -873,9 +1177,13 @@ const gateway = createGatewayServer({
       // verdicts are tamper-evidenced per tenant inside the managed daemon.
       const runContext = createRunContext({ runId, sessionId });
       registerRunBus(runId, tenant.id, runContext.eventBus);
-      let reply: string;
-      try {
-        reply = await runOneTurn({
+      // Loop contract 0.4 (Batch F, ITEM 7) — runs.continue with a prior
+      // sessionId is the RESUME path: reseat that session's history (\`resume\`)
+      // and dedupe a duplicate resume via withIdempotency. runs.create (and a
+      // continue with no sessionId) always runs a fresh turn.
+      const isResume = method === "runs.continue" && p.sessionId !== undefined;
+      const executeTurn = async (): Promise<string> =>
+        await runOneTurn({
           tenantId: tenant.id,
           sessionId,
           input: p.input${tenantField},
@@ -883,8 +1191,21 @@ const gateway = createGatewayServer({
             runContext,
             justificationAuditSink: log,
             egressAuditSink: log,
+            ...(isResume ? { resume: { sessionId } } : {}),
           },
         });
+      let reply: string;
+      try {
+        if (isResume) {
+          const guarded = withIdempotency<undefined, string>(() => executeTurn(), {
+            store: RESUME_IDEM_STORE,
+            ttlMs: RESUME_IDEM_TTL_MS,
+          });
+          const key = idempotencyKey(\`\${tenant.id}:\${sessionId}:\${p.input}\`, 0);
+          reply = (await guarded(undefined, key)).value;
+        } else {
+          reply = await executeTurn();
+        }
       } catch (err) {
         // v0.3.0 Goal 6 — a classified terminal failure (billing/auth/…)
         // renders its structured report on the daemon's stderr, then
@@ -920,16 +1241,16 @@ const gateway = createGatewayServer({
 
 const handle = await gateway.listen(PORT);
 console.error(\`[managed] gateway listening on :\${handle.port}\`);
-
+${scheduleWake.helpers}${scheduleWake.block}
 process.on("SIGTERM", async () => {
   console.error("[managed] SIGTERM — closing gateway");
-  janitor.stop();
+  janitor.stop();${scheduleWake.shutdown}
   await handle.close();
   process.exit(0);
 });
 process.on("SIGINT", async () => {
   console.error("[managed] SIGINT — closing gateway");
-  janitor.stop();
+  janitor.stop();${scheduleWake.shutdown}
   await handle.close();
   process.exit(0);
 });

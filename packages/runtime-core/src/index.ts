@@ -535,6 +535,38 @@ export {
 } from "@crewhaus/adapter-anthropic";
 export type { ResolvedAuth } from "@crewhaus/adapter-anthropic";
 
+// G12 — the platform-neutral loop core lives in `@crewhaus/worker-runtime`
+// (imports no `node:*`); runtime-core CONSUMES it, re-exports its contract as
+// the single source of truth, and supplies the NODE `WorkerPlatform` impl
+// (`./worker-platform`). `runChatLoop`'s own node-coupled services
+// (event-log, session-store, compaction, recovery, audit sinks) wrap this
+// shared core; the three cf-worker emitters call `runWorkerLoop` directly
+// with a stateless platform. These re-exports are purely additive — every
+// existing `runChatLoop` / `RunChatLoopOptions` consumer is unchanged.
+export { createInMemoryKV, createNodeWorkerPlatform } from "./worker-platform";
+export {
+  createEdgeAnthropicAdapter,
+  classifyEdgeTool,
+  EDGE_SAFE_TOOLS,
+  HOST_ONLY_TOOLS,
+  isEdgeSafeTool,
+  partitionEdgeTools,
+  runWorkerLoop,
+} from "@crewhaus/worker-runtime";
+export type {
+  EdgeToolPartition,
+  EdgeToolVerdict,
+  KVLike,
+  RunWorkerLoopOptions,
+  TraceSink as WorkerTraceSink,
+  WorkerLimits,
+  WorkerLoopResult,
+  WorkerPlatform,
+  WorkerStopReason,
+  WorkerThinking,
+  WorkerTraceEvent,
+} from "@crewhaus/worker-runtime";
+
 // Ops item 36 — boot-time self-heal janitor for daemon shapes. Lives in its
 // own module (`./janitor`) but is re-exported here because emitted bundles
 // only import the package root.

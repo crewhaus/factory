@@ -20,12 +20,23 @@
  *      `webFetch`). The interpreter path (`crewhaus run` →
  *      `runRunBrowser` in apps/cli) mirrors this same set — keep them
  *      in sync.
- *   5. Reads a single user prompt from `--prompt <text>` or stdin and
- *      runs `runChatLoop` in single-turn mode. Loop contract 0.4 (Batch A)
- *      threads `agent.max_tokens` (spec value, else the pinned 4096),
- *      `budget:`, the `limits:` ceilings (`deadlineMs`/`turnTimeoutMs`
- *      both bound the one turn; `modelCallTimeoutMs` is the hung-stream
- *      watchdog) and spec `hooks:` into that call.
+ *   5. Reads user input and runs `runChatLoop`. Two modes (G51):
+ *        - ONE-SHOT: a `--prompt <text>` value or piped stdin runs a single
+ *          turn and exits (the pre-0.4 behaviour, for CI/scripting).
+ *        - REPL: an interactive TTY with no `--prompt` drops into the
+ *          persistent driver REPL — the chromium context stays connected for
+ *          the whole `runChatLoop` call, so the agent observes → acts →
+ *          re-observes across turns against ONE session (mirror of
+ *          `runRunCli`'s session mode).
+ *      `--resume <sess_…>` reseats a specific prior session; `--continue`
+ *      resolves the most-recently-updated session for this spec's name from
+ *      the cwd session store. The resumed run is wrapped in `withIdempotency`
+ *      (ITEM 7) so a duplicate re-invocation of an interrupted resumed run
+ *      returns the cached reply instead of re-driving the browser. Loop
+ *      contract 0.4 (Batch A) threads `agent.max_tokens` (spec value, else the
+ *      pinned 4096), `budget:`, the `limits:` ceilings (`deadlineMs`/
+ *      `turnTimeoutMs` bound each turn; `modelCallTimeoutMs` is the
+ *      hung-stream watchdog) and spec `hooks:` into that call.
  *   6. On exit, calls driver.disconnect() so chromium doesn't leak.
  *
  * `ir.mcp_servers` and `ir.compaction` are intentionally not wired here:
@@ -274,7 +285,12 @@ import { createFindElementTool } from "@crewhaus/tool-vision-grounding";
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { defaultCatalog } from "@crewhaus/tool-catalog";
+import { createSessionStore } from "@crewhaus/session-store";
+import { createInMemoryIdempotencyStore, idempotencyKey, withIdempotency } from "@crewhaus/idempotency-keys";
 ${toolImportBlock}${hooksImport}${permImport}${toolBootBlock}
+// Session ids round-trip through @crewhaus/session-store's path-traversal
+// guard, so --resume ids must match its \`sess_<16 hex>\` shape.
+const SESSION_ID_REGEX = /^sess_[0-9a-f]{16}$/;
 const SPEC_NAME = ${escapeJsonString(ir.name)};
 const SPEC_MODEL = ${escapeJsonString(ir.agent.model)};
 const SPEC_INSTRUCTIONS = ${escapeJsonString(ir.agent.instructions)};
@@ -287,11 +303,21 @@ function emit(event: Record<string, unknown>): void {
   process.stdout.write(\`\${JSON.stringify(event)}\\n\`);
 }
 
-function parseArgs(): { prompt: string | undefined } {
+function parseArgs(): {
+  prompt: string | undefined;
+  resumeId: string | undefined;
+  continueSession: boolean;
+} {
   const args = process.argv.slice(2);
-  const i = args.indexOf("--prompt");
-  if (i !== -1 && i + 1 < args.length) return { prompt: String(args[i + 1]) };
-  return { prompt: undefined };
+  const valueOf = (name: string): string | undefined => {
+    const i = args.indexOf(name);
+    return i !== -1 && i + 1 < args.length ? String(args[i + 1]) : undefined;
+  };
+  return {
+    prompt: valueOf("--prompt"),
+    resumeId: valueOf("--resume"),
+    continueSession: args.includes("--continue"),
+  };
 }
 
 async function readStdin(): Promise<string> {
@@ -302,9 +328,44 @@ async function readStdin(): Promise<string> {
 }
 
 async function main(): Promise<void> {
-  const { prompt: argPrompt } = parseArgs();
-  const stdinPrompt = argPrompt ?? (await readStdin());
-  if (stdinPrompt.length === 0) {
+  const { prompt: argPrompt, resumeId, continueSession } = parseArgs();
+  if (resumeId !== undefined && continueSession) {
+    process.stderr.write("[browser-driver] --resume and --continue are mutually exclusive\\n");
+    process.exit(2);
+  }
+  if (resumeId !== undefined && !SESSION_ID_REGEX.test(resumeId)) {
+    process.stderr.write(
+      \`[browser-driver] invalid --resume sessionId "\${resumeId}" — expected sess_<16 hex>\\n\`,
+    );
+    process.exit(2);
+  }
+
+  // Resolve the session to resume: an explicit --resume id, or --continue → the
+  // most-recently-updated session for this spec name in the cwd session store
+  // (mirror of runRunCli's --continue). Absent → a fresh session.
+  const sessionStore = createSessionStore();
+  let resume: { sessionId: string } | undefined;
+  if (resumeId !== undefined) {
+    resume = { sessionId: resumeId };
+  } else if (continueSession) {
+    const sessions = await sessionStore.list();
+    const match = sessions.find((s) => s.name === SPEC_NAME);
+    if (match === undefined) {
+      process.stderr.write(
+        \`[browser-driver] no prior session for "\${SPEC_NAME}" to --continue in \${process.cwd()}/.crewhaus/sessions/\\n\`,
+      );
+      process.exit(2);
+    }
+    resume = { sessionId: match.id };
+    process.stdout.write(\`[browser-driver] resuming session \${match.id}\\n\`);
+  }
+
+  // ONE-SHOT when a --prompt is supplied or stdin is piped (CI/scripting); an
+  // interactive TTY with no --prompt drops into the persistent driver REPL, so
+  // the agent observes → acts → re-observes across turns against one session.
+  const repl = argPrompt === undefined && process.stdin.isTTY === true;
+  const oneShotPrompt = repl ? "" : (argPrompt ?? (await readStdin()));
+  if (!repl && oneShotPrompt.length === 0) {
     process.stderr.write("[browser-driver] no prompt (pass --prompt <text> or pipe stdin)\\n");
     process.exit(2);
   }
@@ -323,21 +384,60 @@ async function main(): Promise<void> {
   const findElement = createFindElementTool({ driver, model: SPEC_GROUNDING_MODEL });
   const tools = [navigateTool, screenshotTool, mk.click, mk.type, mk.key, mk.scroll, findElement, ...defaultCatalog.list()];
 
-  const runContext = createRunContext();
+  // On resume the run context must carry the resumed sessionId (runtime-core
+  // asserts they match); a fresh run mints its own.
+  const runContext =
+    resume !== undefined ? createRunContext({ sessionId: resume.sessionId }) : createRunContext();
+  // Session-persist driver state across turns: the driver stays connected for
+  // the whole runChatLoop call, so every REPL turn shares one live browser
+  // context. limits/budget/max_tokens (Batch A) apply to each turn.
+  const runOptions = {
+    model: SPEC_MODEL,
+    instructions: SPEC_INSTRUCTIONS,${poolField(ir, "    ")}${taxonomyField(ir, "    ")}
+    runContext,
+    sessionName: SPEC_NAME,
+    sessionTarget: "browser" as const,
+    tools,
+    maxTokens: ${ir.agent.maxTokens ?? 4096},${budgetField(ir, "    ")}${limitsFields(ir, "    ")}${hooksField}${permField}
+  };
+
+  // The REPL lets runChatLoop drive stdin turn-by-turn (singleTurn omitted);
+  // one-shot seeds the single inbound message. \`resume\` + \`seedMessages\` is
+  // legal ONLY under singleTurn (the seed is the new inbound, the replayed
+  // history is the prefix), so REPL resume passes no seed.
+  const drive = async (): Promise<string> => {
+    if (repl) {
+      return await runChatLoop({
+        ...runOptions,
+        installSigintHandler: true,
+        ...(resume !== undefined ? { resume } : {}),
+      });
+    }
+    return await runChatLoop({
+      ...runOptions,
+      singleTurn: true,
+      installSigintHandler: false,
+      seedMessages: [{ role: "user", content: oneShotPrompt }],
+      ...(resume !== undefined ? { resume } : {}),
+    });
+  };
+
   let finalText = "";
   try {
-    finalText = await runChatLoop({
-      model: SPEC_MODEL,
-      instructions: SPEC_INSTRUCTIONS,${poolField(ir, "      ")}${taxonomyField(ir, "      ")}
-      runContext,
-      sessionName: SPEC_NAME,
-      sessionTarget: "browser",
-      singleTurn: true,
-      seedMessages: [{ role: "user", content: stdinPrompt }],
-      tools,
-      installSigintHandler: false,
-      maxTokens: ${ir.agent.maxTokens ?? 4096},${budgetField(ir, "      ")}${limitsFields(ir, "      ")}${hooksField}${permField}
-    });
+    if (resume !== undefined) {
+      // ITEM 7 — wrap the resume path in withIdempotency so a duplicate
+      // re-invocation of an interrupted resumed run returns the cached reply
+      // instead of re-driving the browser (at-least-once safety).
+      const idemStore = createInMemoryIdempotencyStore<string>();
+      const guarded = withIdempotency<undefined, string>(() => drive(), {
+        store: idemStore,
+        ttlMs: 3_600_000,
+      });
+      const key = idempotencyKey(\`\${SPEC_NAME}:\${resume.sessionId}:\${oneShotPrompt}\`, 0);
+      finalText = (await guarded(undefined, key)).value;
+    } else {
+      finalText = await drive();
+    }
   } finally {
     await driver.disconnect();
   }

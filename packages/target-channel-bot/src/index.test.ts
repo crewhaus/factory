@@ -1652,3 +1652,83 @@ describe("emitChannelBot — permissions.ask_mode: deny opts out of the approval
     expect(daemon).toContain('process.env["CREWHAUS_COST_TRACKING"] ??= "1";');
   });
 });
+
+describe("emitChannelBot — schedule: wake loop (Batch F, temporal contract)", () => {
+  const withCron = (): IrChannelV0 => ({
+    ...MIN_IR,
+    schedule: {
+      kind: "cron",
+      cron: "0 */6 * * *",
+      timezone: "America/New_York",
+      jitterMs: 30_000,
+      instructions: "Post the six-hour digest.",
+    },
+  });
+  const withInterval = (): IrChannelV0 => ({
+    ...MIN_IR,
+    schedule: { kind: "interval", everyMs: 21_600_000 },
+  });
+
+  test("no schedule → daemon stays byte-identical (no schedule plumbing)", () => {
+    const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(daemon).not.toContain("armSchedule");
+    expect(daemon).not.toContain("[schedule]");
+    expect(daemon).not.toContain("@crewhaus/durable-execution");
+    expect(daemon).not.toContain("__schedRandomBytes");
+  });
+
+  test("cron schedule arms armSchedule with the WakeSchedule literal (no instructions)", () => {
+    const daemon = fileMap(withCron()).get("daemon.ts") ?? "";
+    expect(daemon).toContain('import { armSchedule } from "@crewhaus/durable-execution";');
+    expect(daemon).toContain(
+      'armSchedule({"kind":"cron","cron":"0 */6 * * *","timezone":"America/New_York","jitterMs":30000}',
+    );
+    // instructions ride in onWake, never in the schedule literal.
+    expect(daemon).toContain("Post the six-hour digest.");
+    expect(daemon).not.toContain('"instructions":"Post the six-hour digest."');
+    expect(daemon).toContain("__schedule.cancel();");
+  });
+
+  test("cron wake runs a fresh-session turn with the synthetic prompt", () => {
+    const daemon = fileMap(withCron()).get("daemon.ts") ?? "";
+    expect(daemon).toContain("onWake: async () => {");
+    expect(daemon).toContain("isNew: true,");
+    expect(daemon).toContain("message: __scheduleInstructions,");
+    expect(daemon).toContain(
+      '[schedule] armed (cron \\"0 */6 * * *\\" America/New_York +/-30000ms jitter)',
+    );
+  });
+
+  test("interval schedule with no instructions falls back to the default wake prompt", () => {
+    const daemon = fileMap(withInterval()).get("daemon.ts") ?? "";
+    expect(daemon).toContain('armSchedule({"kind":"interval","everyMs":21600000}');
+    expect(daemon).toContain("[scheduled wake] proceed with your standing instructions.");
+    expect(daemon).toContain("[schedule] armed (every 21600000ms)");
+  });
+
+  test("cancel is wired into the shutdown path", () => {
+    const daemon = fileMap(withCron()).get("daemon.ts") ?? "";
+    const shutdownIdx = daemon.indexOf("const shutdown = async");
+    expect(shutdownIdx).toBeGreaterThan(-1);
+    expect(daemon.indexOf("__schedule.cancel();", shutdownIdx)).toBeGreaterThan(shutdownIdx);
+  });
+});
+
+describe("emitChannelBot — emitted scheduled daemon is syntactically valid TS", () => {
+  test("Bun.Transpiler parses the scheduled daemon.ts", () => {
+    const t = new Bun.Transpiler({ loader: "ts" });
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      schedule: {
+        kind: "cron",
+        cron: "0 */6 * * *",
+        timezone: "America/New_York",
+        jitterMs: 30_000,
+        instructions: "digest",
+      },
+    };
+    const daemon =
+      new Map(emitChannelBot(ir).files.map((f) => [f.path, f.content])).get("daemon.ts") ?? "";
+    expect(() => t.transformSync(daemon)).not.toThrow();
+  });
+});

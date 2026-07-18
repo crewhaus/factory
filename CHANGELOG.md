@@ -298,6 +298,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the cache) on every boot; a missing or corrupt record safely force-
     refreshes rather than bricking boot.
 
+- **Loop contract 0.4, Batch F — the deploy half of the loop: a
+  platform-neutral loop core, real tools on the edge, the temporal
+  (`schedule:`) contract, exactly-once resume, and the develop/deploy/observe
+  CLI verbs.** One coordinated batch lands the runtime extraction, the spec
+  grammar, the affected emitters, the durable-execution surface, and the CLI:
+
+  - **G12 — the agent loop is now a platform-neutral core,
+    `@crewhaus/worker-runtime`.** The pure loop (turn FSM, model-stream
+    orchestration, tool dispatch + validation + permission gating,
+    budget/limit enforcement, loop detection, trace emission) is extracted
+    behind an injected `WorkerPlatform` (clock, unique-id, `fetch`, optional
+    KV). The package imports **no** `node:*` builtin and calls neither
+    `Date.now()` nor `Math.random()` (a source-grep AND a bundled-import-graph
+    test enforce both), so it runs on a Cloudflare Worker. `runtime-core`
+    CONSUMES it — re-exporting its contract as the single source of truth and
+    supplying the Node `WorkerPlatform` (`createNodeWorkerPlatform`) — while
+    `runChatLoop`'s node-coupled services (event-log, session-store,
+    compaction, recovery, audit sinks) wrap the shared engine; the three
+    `target-cf-worker-*` emitters call `runWorkerLoop` directly with a
+    stateless platform. The re-exports are purely additive — every existing
+    `runChatLoop` / `RunChatLoopOptions` consumer compiles unchanged. v1 scope
+    is tools + budget + limits + trace; compaction/recovery stay Node-only and
+    a context overflow ends an edge run with a classified `context_overflow`
+    frame rather than compacting.
+  - **cf-worker targets run real tools now (G12/G83).** The old blanket
+    "cf-worker does not support tools" rejection is replaced by a precise
+    edge-safety gate — `@crewhaus/worker-runtime/tool-policy` (the single
+    source of truth the compiler imports via a subpath so its offline gate
+    never drags the loop into the compiler-worker's own bundle) plus
+    `assertCfWorkerToolsEdgeSafe`. Edge-safe builtins
+    (`fetch`/`webFetch`/`webSearch`/`sendMessage`/`imageGenerate`/`todoWrite`)
+    and any `mcp__*` tool compile and run on the edge; host tools
+    (`bash`/`read`/`python`/filesystem/device/…) fail the compile with a
+    category-specific reason; an unrecognised custom tool is permitted with an
+    `edge-unsafe-tool` warning. The emitted worker streams the same `/chat`
+    SSE trace vocabulary (`turn_start`/`model_request`/`model_response`/
+    `cost_accrual`/`tool_call_start`/`tool_call_end`/`turn_end`) the Node loop
+    does.
+  - **`schedule:` — the temporal contract (G84)** on the daemon-able shapes
+    (channel / managed / batch): `kind: cron` (5-/6-field, timezone-aware,
+    Quartz-tolerant) or `kind: interval` (`every`), plus per-wake `jitter` and
+    an optional wake `instructions` prompt — all durations normalized to ms at
+    lower time into `IrSchedule`. `@crewhaus/durable-execution`'s `armSchedule`
+    (cron arithmetic + jitter + self-rescheduling, injectable timing seams)
+    is the one tested home the channel and batch daemons arm; the managed
+    daemon arms a per-tenant `setInterval`/cron wake. `CREWHAUS_SCHEDULE=0`
+    disarms the loop.
+  - **Exactly-once resume (G61, item 7).** `@crewhaus/durable-execution` gains
+    `withIdempotency` (dedups a node/step attempt by `(runId, name,
+    attempt)`), `resumeFrom` (the checkpoint-chain resume hint), and a durable
+    `FileIdempotencyStore` + env-driven `createIdempotencyStore`
+    (`CREWHAUS_IDEMPOTENCY_STORE=memory|file[:<dir>]`) so a restart of the same
+    run finds the prior attempt's cached result instead of re-running its side
+    effects. The managed daemon's `runs.continue`-with-sessionId resume path
+    and the browser driver's `--resume`/`--continue` wrap the turn in
+    `withIdempotency`, so a duplicate resume (client retry / visibility-lease
+    double-pull) returns the cached reply instead of re-driving the turn
+    (best-effort exactly-once; a crash between the external effect and the
+    store write still re-runs at-least-once).
+  - **CLI develop / deploy / observe verbs**: `crewhaus dev <spec>` (compile
+    in memory, run the emitted bundle as a supervised child, recompile +
+    relaunch on every spec/authoring-dir change, trace streaming, `--once` for
+    a credential-free CI boot check); `crewhaus sessions tail [<session>]` (a
+    `tail -f` over a session's append-only event log); `crewhaus compile
+    --emit-as cf-worker` (emit the Cloudflare-Worker bundle locally for
+    cli|workflow|graph — the same bundle the compiler-worker's remote
+    `POST /compile { emitAs }` serves); `crewhaus deploy <fly|render|railway|
+    heroku> <spec>` (scaffold PaaS deploy manifests for a daemon shape, with a
+    provider-token-gated `--live`); and `crewhaus runs resume <session>` (the
+    dedicated verb for re-driving a session parked on a pending approval).
+  - **managed `agent.tools` + `tool_config` (G81)** lower onto the managed IR,
+    and every emitted cf-worker bundle now ships a generated `README.md`
+    (item 42).
+
 ## [0.3.2] - 2026-07-16
 
 ### Fixed

@@ -361,3 +361,68 @@ describe("emitBatchWorker — failureTaxonomy field (item 23)", () => {
     expect(emitBatchWorker(empty).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
   });
 });
+
+describe("emitBatchWorker — schedule: wake loop (Batch F, temporal contract)", () => {
+  const withInterval: IrBatchV0 = {
+    ...baseIr,
+    schedule: { kind: "interval", everyMs: 3_600_000, instructions: "Reconcile ledgers." },
+  };
+  const withCron: IrBatchV0 = {
+    ...baseIr,
+    schedule: { kind: "cron", cron: "*/15 * * * *", jitterMs: 500 },
+  };
+
+  test("no schedule → agent.ts stays byte-identical (no schedule plumbing)", () => {
+    const code = emitBatchWorker(baseIr).files[0]?.content ?? "";
+    expect(code).not.toContain("armSchedule");
+    expect(code).not.toContain("@crewhaus/durable-execution");
+    expect(code).not.toContain("scheduled_wake");
+    // unscheduled in-memory worker keeps the idle fast-exit path.
+    expect(code).toContain("queue_idle");
+  });
+
+  test("interval schedule arms armSchedule and enqueues the wake prompt as a job", () => {
+    const code = emitBatchWorker(withInterval).files[0]?.content ?? "";
+    expect(code).toContain('import { armSchedule } from "@crewhaus/durable-execution";');
+    expect(code).toContain('armSchedule({"kind":"interval","everyMs":3600000}');
+    expect(code).toContain("const jobId = await queue.enqueue(__scheduleInstructions);");
+    expect(code).toContain('emit({ kind: "scheduled_wake", tick: __scheduleTick, jobId });');
+    expect(code).toContain("Reconcile ledgers.");
+    expect(code).toContain("__schedule.cancel();");
+  });
+
+  test("a scheduled in-memory worker drops the idle fast-exit for the keep-alive loop", () => {
+    const code = emitBatchWorker(withInterval).files[0]?.content ?? "";
+    // No queue_idle fast-exit — the scheduler is a long-running cron daemon.
+    expect(code).not.toContain('emit({ kind: "queue_idle"');
+    expect(code).toContain("const keepAliveMs = 200;");
+  });
+
+  test("cron schedule carries the verbatim cron + jitter (no instructions in the literal)", () => {
+    const code = emitBatchWorker(withCron).files[0]?.content ?? "";
+    expect(code).toContain('armSchedule({"kind":"cron","cron":"*/15 * * * *","jitterMs":500}');
+    expect(code).toContain('"[scheduled wake]"'); // default prompt when instructions absent
+    expect(code).toContain('kind: "schedule_armed"');
+  });
+
+  test("cancel runs before drain in the shutdown path", () => {
+    const code = emitBatchWorker(withInterval).files[0]?.content ?? "";
+    const shutdownIdx = code.indexOf("const shutdown = async");
+    const cancelIdx = code.indexOf("__schedule.cancel();", shutdownIdx);
+    const drainIdx = code.indexOf("await consumer.drain();", shutdownIdx);
+    expect(cancelIdx).toBeGreaterThan(shutdownIdx);
+    expect(cancelIdx).toBeLessThan(drainIdx);
+  });
+});
+
+describe("emitBatchWorker — emitted scheduled bundle is syntactically valid TS", () => {
+  test("Bun.Transpiler parses the scheduled agent.ts", () => {
+    const t = new Bun.Transpiler({ loader: "ts" });
+    const ir: IrBatchV0 = {
+      ...baseIr,
+      schedule: { kind: "interval", everyMs: 3_600_000, instructions: "tick" },
+    };
+    const code = emitBatchWorker(ir, { readme: false }).files[0]?.content ?? "";
+    expect(() => t.transformSync(code)).not.toThrow();
+  });
+});

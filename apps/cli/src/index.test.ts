@@ -2528,3 +2528,216 @@ triggers:
     ).not.toThrow();
   });
 });
+
+// ---- Loop contract 0.4 (Batch F) — the new CLI slice ----
+
+describe("crewhaus compile --emit-as cf-worker (item 6)", () => {
+  test("emits the Cloudflare-Worker bundle for a cli spec", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp, "--emit-as", "cf-worker"]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(tmp, "worker.js"))).toBe(true);
+    expect(existsSync(join(tmp, "wrangler.toml"))).toBe(true);
+    // The default local bundle's agent.ts is NOT produced.
+    expect(existsSync(join(tmp, "agent.ts"))).toBe(false);
+    expect(result.stdout).toContain("compiled cf-worker bundle");
+  });
+
+  test("rejects an unsupported target with a clear message", async () => {
+    const result = await runCli(["compile", CHANNEL_SPEC, "-o", tmp, "--emit-as", "cf-worker"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("cf-worker emit supports target=cli|workflow|graph");
+    expect(result.stderr).toContain("got channel");
+  });
+
+  test("rejects an unknown --emit-as value", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp, "--emit-as", "wasm"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('--emit-as must be "local" or "cf-worker"');
+  });
+
+  test("--emit-as cf-worker cannot combine with --check", async () => {
+    const result = await runCli([
+      "compile",
+      HELLO_SPEC,
+      "-o",
+      tmp,
+      "--emit-as",
+      "cf-worker",
+      "--check",
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("cannot combine with --check");
+  });
+
+  test("--emit-as local is the default bundle (byte path unchanged)", async () => {
+    const result = await runCli([
+      "compile",
+      HELLO_SPEC,
+      "-o",
+      tmp,
+      "--emit-as",
+      "local",
+      "--no-register",
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
+    expect(existsSync(join(tmp, "worker.js"))).toBe(false);
+  });
+});
+
+describe("crewhaus deploy <fly|render|railway|heroku> (item 5)", () => {
+  test("scaffolds Fly manifests for a daemon shape (no token → scaffold only)", async () => {
+    const out = join(tmp, "fly");
+    const result = await runCli(["deploy", "fly", CHANNEL_SPEC, "-o", out]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(out, "fly.toml"))).toBe(true);
+    expect(existsSync(join(out, "Dockerfile.fly"))).toBe(true);
+    expect(result.stdout).toContain("set FLY_API_TOKEN and re-run with --live");
+  });
+
+  test("scaffolds Heroku manifests (heroku.yml + app.json + Dockerfile)", async () => {
+    const out = join(tmp, "heroku");
+    const result = await runCli(["deploy", "heroku", CHANNEL_SPEC, "-o", out]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(out, "heroku.yml"))).toBe(true);
+    expect(existsSync(join(out, "app.json"))).toBe(true);
+    expect(existsSync(join(out, "Dockerfile.heroku"))).toBe(true);
+  });
+
+  test("rejects a non-daemon (cli) shape", async () => {
+    const result = await runCli(["deploy", "fly", HELLO_SPEC, "-o", join(tmp, "x")]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("not a deployable daemon shape");
+  });
+
+  test("--live without the provider token fails, naming the env var", async () => {
+    const result = await runCli(["deploy", "render", CHANNEL_SPEC, "-o", join(tmp, "r"), "--live"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("RENDER_API_KEY");
+    expect(result.stderr).toContain("--live");
+  });
+
+  test("an unknown deploy action is rejected", async () => {
+    const result = await runCli(["deploy", "gcp", CHANNEL_SPEC]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("deploy action must be one of");
+  });
+});
+
+describe("crewhaus runs resume (item 7)", () => {
+  test("rejects a malformed session id", async () => {
+    const result = await runCli(["runs", "resume", "not-a-session"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("expected sess_<16 hex>");
+  });
+
+  test("reports when no spec can be resolved", async () => {
+    const result = await runCli(["runs", "resume", "sess_0123456789abcdef"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("no --spec given and no crewhaus.yaml");
+  });
+
+  test("reports when the session is not found (spec resolves)", async () => {
+    writeFileSync(join(tmp, "crewhaus.yaml"), readFileSync(HELLO_SPEC, "utf-8"));
+    const result = await runCli(["runs", "resume", "sess_0123456789abcdef"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('no session "sess_0123456789abcdef"');
+  });
+
+  test("an unknown runs action is rejected", async () => {
+    const result = await runCli(["runs", "subscribe"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('runs action must be "resume"');
+  });
+
+  test("runs resume --help prints usage", async () => {
+    const result = await runCli(["runs", "resume", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Re-drives a persisted cli session");
+  });
+});
+
+describe("crewhaus sessions tail (item 2)", () => {
+  function seedSession(dir: string, id: string): void {
+    mkdirSync(dir, { recursive: true });
+    const lines = [
+      {
+        ts: Date.UTC(2026, 6, 17, 12, 0, 0),
+        version: 1,
+        kind: "user_message",
+        payload: { content: "hi there" },
+      },
+      {
+        ts: Date.UTC(2026, 6, 17, 12, 0, 1),
+        version: 1,
+        kind: "model_route",
+        payload: { model: "x" },
+      },
+      {
+        ts: Date.UTC(2026, 6, 17, 12, 0, 2),
+        version: 1,
+        kind: "assistant_message",
+        payload: { content: [{ type: "text", text: "hello back" }] },
+      },
+    ];
+    writeFileSync(join(dir, `${id}.jsonl`), `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
+  }
+
+  test("--no-follow dumps a session transcript (skipping side-channel events)", async () => {
+    const dir = join(tmp, ".crewhaus", "sessions");
+    seedSession(dir, "sess_00000000000000aa");
+    const result = await runCli(["sessions", "tail", "sess_00000000000000aa", "--no-follow"], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("user> hi there");
+    expect(result.stdout).toContain("asst> hello back");
+    // The model_route side-channel event renders nothing.
+    expect(result.stdout).not.toContain("model_route");
+  });
+
+  test("with no id, tails the newest session", async () => {
+    const dir = join(tmp, ".crewhaus", "sessions");
+    seedSession(dir, "sess_00000000000000aa");
+    const result = await runCli(["sessions", "tail", "--no-follow"], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("user> hi there");
+  });
+
+  test("errors when the session store is absent", async () => {
+    const result = await runCli(["sessions", "tail", "--no-follow"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("no session store");
+  });
+
+  test("rejects a malformed session id", async () => {
+    const dir = join(tmp, ".crewhaus", "sessions");
+    seedSession(dir, "sess_00000000000000aa");
+    const result = await runCli(["sessions", "tail", "bogus", "--no-follow"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("expected sess_<16 hex>");
+  });
+});
+
+describe("crewhaus dev (item 2)", () => {
+  test("--help prints usage", async () => {
+    const result = await runCli(["dev", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("supervised");
+    expect(result.stdout).toContain("--once");
+  });
+
+  test("fails fast on a missing spec", async () => {
+    const result = await runCli(["dev", join(tmp, "nope.yaml")]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("dev:");
+  });
+
+  test("fails fast on a broken spec (no child launched)", async () => {
+    const broken = join(tmp, "broken.yaml");
+    writeFileSync(broken, "name: x\ntarget: cli\nagent: [unclosed\n");
+    const result = await runCli(["dev", broken]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("dev:");
+  });
+});

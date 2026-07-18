@@ -1501,12 +1501,21 @@ const cliOptionsBlock = z
   .object({
     banner: cliBannerBlock,
     /**
-     * Phase 2 M2.2 — TUI polish gate. "basic" is the current readline-
-     * driven REPL; "rich" is reserved for future Ink-based output
-     * (status line, multi-line input, ESC interrupt). Today both modes
-     * compile identically; the field is forward-compatible.
+     * Phase 2 M2.2 — TUI mode. `"basic"` is the readline-driven REPL and the
+     * only mode. Loop contract 0.4 (Batch F, G81) DROPS the never-implemented
+     * `"rich"` (Ink-based) placeholder: it compiled identically to `"basic"`,
+     * so it only ever advertised a capability that did not exist. Declaring
+     * it now fails the compile with a migration note; a future rich TUI would
+     * reintroduce the value when it actually ships.
      */
-    tui: z.enum(["basic", "rich"]).default("basic"),
+    tui: z
+      .literal("basic", {
+        errorMap: () => ({
+          message:
+            'cli.tui "rich" was never implemented and is dropped in loop-contract 0.4 — remove the `tui:` key (the basic readline REPL is the only mode).',
+        }),
+      })
+      .default("basic"),
   })
   .strict()
   .optional();
@@ -1531,6 +1540,60 @@ const heartbeatBlock = z
     instructions: z.string().min(1),
   })
   .strict()
+  .optional();
+
+/**
+ * Loop contract 0.4 (Batch F, temporal contract / G84 schedule half) — a
+ * `schedule:` block on the daemon-able shapes (channel / managed / batch): a
+ * cron OR interval wake trigger, lowered into the emitted daemon's wake loop
+ * by the temporal downstream. `jitter` (a duration) spreads a random +/- delay
+ * across the trigger so a fleet of identical daemons doesn't stampede on the
+ * boundary; `instructions` is the synthetic prompt each wake runs (the
+ * heartbeat contract, generalised past the fixed interval to a cron). Exactly
+ * one of the two `kind`s — the discriminated union makes the required field
+ * per kind (`cron` vs `every`) a type error to omit.
+ *
+ * Unlike `heartbeat` (channel-only, interval-only), `schedule` is the general
+ * temporal surface: it accepts a cron expression AND rides the `runs resume`
+ * rehydration path, so an interrupted scheduled run resumes exactly-once.
+ */
+// A 5- or 6-field cron expression (minute-granularity, optional seconds/year).
+// Field validity beyond the char class is the daemon's cron parser's job.
+const CRON_REGEX = /^[0-9*\/,\-?LW#]+(?:\s+[0-9*\/,\-?LW#]+){4,5}$/;
+
+const scheduleJitter = z
+  .string()
+  .regex(DURATION_REGEX, 'schedule.jitter must be a duration like "30s", "5m", or "500ms"');
+
+const scheduleCronBlock = z
+  .object({
+    kind: z.literal("cron"),
+    cron: z
+      .string()
+      .regex(
+        CRON_REGEX,
+        'schedule.cron must be a 5- or 6-field cron expression, e.g. "0 */6 * * *"',
+      ),
+    /** IANA tz name the cron is evaluated in (e.g. "America/New_York"). */
+    timezone: z.string().min(1).optional(),
+    jitter: scheduleJitter.optional(),
+    instructions: z.string().min(1).optional(),
+  })
+  .strict();
+
+const scheduleIntervalBlock = z
+  .object({
+    kind: z.literal("interval"),
+    every: z
+      .string()
+      .regex(DURATION_REGEX, 'schedule.every must be a duration like "6h", "30m", or "60s"'),
+    jitter: scheduleJitter.optional(),
+    instructions: z.string().min(1).optional(),
+  })
+  .strict();
+
+const scheduleBlock = z
+  .discriminatedUnion("kind", [scheduleCronBlock, scheduleIntervalBlock])
   .optional();
 
 /**
@@ -1795,6 +1858,9 @@ const channelSchema = z
     learning: learningBlock,
     observability: observabilityBlock,
     heartbeat: heartbeatBlock,
+    // Loop contract 0.4 (Batch F) — cron/interval wake trigger (the general
+    // temporal surface beside the interval-only `heartbeat`).
+    schedule: scheduleBlock,
     gateway: channelGatewayBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
@@ -1958,6 +2024,11 @@ const managedAgentSchema = z
     model_tiers: modelTiersBlock,
     // Adaptive model routing — N-candidate pool with a selection policy.
     model_pool: modelPoolBlock,
+    // Loop contract 0.4 (Batch F, G81) — the managed daemon gets a tool
+    // catalog + per-tenant tool_config overlays (applied at runtime through
+    // the policy-engine's tenant context). Mirrors the channel agent block.
+    tools: z.array(z.string().min(1)).optional(),
+    tool_config: toolConfigBlock,
   })
   .strict()
   .superRefine(refineModelSelection);
@@ -1984,6 +2055,8 @@ const managedSchema = z
     thredz: thredzBlock,
     learning: learningBlock,
     observability: observabilityBlock,
+    // Loop contract 0.4 (Batch F) — cron/interval wake trigger.
+    schedule: scheduleBlock,
   })
   .strict();
 
@@ -2225,6 +2298,9 @@ const batchSchema = z
     // v0.3.0 — carried but not emit-wired in 0.3.0 (ignored-note comment in
     // the generated bundle; NOT default-on here).
     continuity: continuityBlock,
+    // Loop contract 0.4 (Batch F) — cron/interval wake trigger for the queue
+    // worker daemon.
+    schedule: scheduleBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
