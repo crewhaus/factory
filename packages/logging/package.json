@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/logging",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "type": "module",
   "description": "Structured logger shared across factory layers",
   "main": "src/index.ts",
