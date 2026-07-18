@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/agent-handoff",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "type": "module",
   "description": "Handoff(targetRole, reason, context?) tool — explicit baton-pass between roles in a crew (Section 22)",
   "main": "src/index.ts",

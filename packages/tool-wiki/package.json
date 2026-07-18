@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-wiki",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "type": "module",
   "description": "0.3.0 memory release §3.2 — the thredz-identical wiki tool vocabulary (wiki_recall … log_knowledge_gap) over @crewhaus/wiki-store, with memory-origin boundary classification on every recalled body.",
   "main": "src/index.ts",
