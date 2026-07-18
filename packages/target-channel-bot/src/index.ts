@@ -1397,7 +1397,7 @@ ${gatewayActionsBlock}      // Match adapter by path prefix: /slack/events → "
       if (!adapter.verify(rawReq)) {
         return new Response("invalid signature", { status: 401 });
       }
-      const parsed = adapter.parseInbound({ body });
+      const parsed = adapter.parseInbound(rawReq);
       if (parsed.kind === "challenge") {
         return new Response(parsed.challenge, {
           status: 200,

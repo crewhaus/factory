@@ -194,7 +194,7 @@ function secretMapSignature(map: Readonly<Record<string, IrSecretRef>> | undefin
       const ref = map[k] as IrSecretRef;
       return ref.kind === "env" ? `${k}=env:${ref.name}` : `${k}=lit:${ref.value}`;
     })
-    .join(" ");
+    .join("\0");
 }
 
 /**
