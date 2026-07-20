@@ -11,11 +11,11 @@
  *      skipped). Offline + deterministic; skipped only when the target
  *      ships no assertion.
  *   2. install — `bun install` in the out-dir (bounded by a 120s timeout so
- *      a hung registry cannot hang the compile forever). When the emitter
- *      didn't produce a package.json (only the cf-worker shapes do), a
- *      minimal one is synthesized from the bundle's @crewhaus imports,
- *      pinned to this CLI's own version (the packages publish in lockstep,
- *      so that is exactly the contract this CLI's bundles run against).
+ *      a hung registry cannot hang the compile forever). The compile path
+ *      already wrote the synthesized pin-to-CLI-version manifest beside the
+ *      bundle (see bundle-manifest.ts); this step re-ensures it — covering
+ *      direct runCompileCheck callers — and then installs against whatever
+ *      package.json is on disk (a user-authored one is never clobbered).
  *   3. boot — spawn the bundle's entrypoint once, CREDENTIAL-FREE (env
  *      scrubbed to PATH/HOME + the credential-free proxy/CA vars), with
  *      `doctor --liveness` semantics: booting far enough to reach the
@@ -41,7 +41,7 @@ import {
   assertBundleAgainstShape,
   assertionForTarget,
 } from "@crewhaus/smoke-harness";
-import { cliVersion } from "./version";
+import { ensureBundleManifest } from "./bundle-manifest";
 
 export type CheckStepName = "assertion" | "install" | "boot";
 export type CheckStepStatus = "ok" | "gated" | "skipped" | "failed";
@@ -125,42 +125,10 @@ export function bootArgvFor(entry: string): readonly string[] {
   return ["bun", `--env-file=${emptyEnvFile()}`, entry];
 }
 
-/** Collect the @crewhaus/* packages the emitted bundle imports (sorted, deduped). */
-export function collectCrewhausDeps(files: Bundle["files"]): readonly string[] {
-  const deps = new Set<string>();
-  const re = /["'](@crewhaus\/[a-z0-9-]+)["']/g;
-  for (const file of files) {
-    if (!file.path.endsWith(".ts") && !file.path.endsWith(".js")) continue;
-    for (const m of file.content.matchAll(re)) {
-      const dep = m[1];
-      if (dep !== undefined) deps.add(dep);
-    }
-  }
-  return [...deps].sort();
-}
-
-/**
- * Minimal manifest for bundles whose emitter ships no package.json.
- * Versions pin to the CLI's OWN version: the @crewhaus/* packages publish in
- * lockstep (scripts/publish-workspace.ts stamps them all with one version),
- * so `<cliVersion>` is exactly the published contract this CLI's emitters
- * were released against — where "latest" would silently verify against
- * whatever shipped since, making the check's verdict depend on the day it
- * runs. "latest" remains only as the fallback when no version is resolvable
- * (a broken installation). (In a dev checkout the pinned publish can lag
- * unreleased emitter features; the boot step then reports the mismatch,
- * which is a real signal, not a false positive.)
- */
-export function buildBundlePackageJson(deps: readonly string[], version?: string): string {
-  const pin = version ?? "latest";
-  const dependencies: Record<string, string> = {};
-  for (const dep of deps) dependencies[dep] = pin;
-  return `${JSON.stringify(
-    { name: "crewhaus-compiled-bundle", private: true, type: "module", dependencies },
-    null,
-    2,
-  )}\n`;
-}
+// The manifest helpers moved to ./bundle-manifest (the compile path now
+// writes the same synthesized package.json this check installs against);
+// re-exported here so existing importers keep working.
+export { buildBundlePackageJson, collectCrewhausDeps } from "./bundle-manifest";
 
 /** daemon.ts (daemon shapes) beats agent.ts; undefined = nothing bootable here. */
 export function resolveBootEntry(files: Bundle["files"]): string | undefined {
@@ -305,12 +273,10 @@ export async function runCompileCheck(opts: CompileCheckOptions): Promise<Compil
   // a hung registry cannot hang the compile forever.
   const baseEnv = opts.env ?? process.env;
   const childEnv = scrubbedEnv(baseEnv);
-  if (!opts.bundle.files.some((f) => f.path === "package.json")) {
-    writeFileSync(
-      join(opts.outDir, "package.json"),
-      buildBundlePackageJson(collectCrewhausDeps(opts.bundle.files), cliVersion()),
-    );
-  }
+  // The compile path already ensured a manifest; this re-ensure covers direct
+  // runCompileCheck callers and — unlike the old unconditional write — never
+  // clobbers a user-authored package.json in the out-dir.
+  ensureBundleManifest(opts.bundle.files, opts.outDir);
   const installTimeoutMs = opts.installTimeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS;
   const install = await runner({
     argv: ["bun", "install"],

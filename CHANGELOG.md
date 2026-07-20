@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`crewhaus compile` now emits a `package.json` beside the bundle, so the
+  documented standalone flow actually runs.** A local bundle's emitted
+  entrypoint imports a dozen `@crewhaus/*` runtime packages, but nothing
+  declared them: outside a checkout that already had the packages installed,
+  `bun agent.ts` died on the first import (`Cannot find module
+  '@crewhaus/queue-protocol'`) — and for the compile-only shapes (batch,
+  channel, crew, …), which `crewhaus run` refuses, that made the ONLY
+  documented run path unrunnable in a standalone harness. The compile now
+  writes the same manifest `--check` always synthesized for its install step:
+  every `@crewhaus/*` package the bundle imports, pinned to the CLI's own
+  lockstep-published version. `bun install` in the out-dir, then the README's
+  launch line, is the whole flow — and the generated bundle README now says
+  so. A user-authored `package.json` in the out-dir is never clobbered
+  (mirroring the generated-README keep semantics), the cf-worker flavour
+  keeps shipping its emitter's own manifest, and the `--with-eval-harness`
+  bridge bundle in `<out-dir>/eval/` gets its own manifest too. `compile
+  --check` also no longer overwrites a user-authored `package.json` when
+  verifying.
+
 ## [0.4.0] - 2026-07-18
 
 ### Added

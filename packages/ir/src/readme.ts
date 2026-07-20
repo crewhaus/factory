@@ -419,7 +419,12 @@ function renderEnvSection(ir: IrNode): string {
 function defaultUsageSection(ir: IrNode): BundleReadmeSection {
   return {
     heading: "Run",
-    body: ["```sh", RUN_COMMANDS[ir.target], "```"].join("\n"),
+    body: [
+      "```sh",
+      "bun install   # first run only — installs the bundle's dependencies",
+      RUN_COMMANDS[ir.target],
+      "```",
+    ].join("\n"),
   };
 }
 
