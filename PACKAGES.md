@@ -45,7 +45,7 @@ crewhaus compile && crewhaus run
 
 `crewhaus --version` prints the build, e.g. `0.3.0`.
 
-The `crewhaus` package transitively pulls in everything else via versioned npm deps (the workspace `workspace:*` references resolve to concrete versions at publish time), so users don't install the rest individually. A generated bundle additionally imports `@crewhaus/runtime-core` directly — that is the one other package consumers see on the receiving end.
+The `crewhaus` package transitively pulls in everything else via versioned npm deps (the workspace `workspace:*` references resolve to concrete versions at publish time), so users don't install the rest individually. A generated bundle imports a shape-dependent set of `@crewhaus/*` runtime packages directly (`runtime-core`, the tool packages, queue/mcp/memory modules, …) — `crewhaus compile` writes a `package.json` beside the bundle pinning exactly that set to the CLI's own version, so `bun install` in the out-dir is all a standalone consumer runs.
 
 > **The scope is public** (since the 0.1.x go-public cut, 2026-06-10): installing `crewhaus` and any `@crewhaus/*` library needs no auth.
 

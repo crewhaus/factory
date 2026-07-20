@@ -307,6 +307,25 @@ describe("runCompileCheck", () => {
     expect(result.steps[2]?.detail).toContain("no agent.ts/daemon.ts");
   });
 
+  test("a user-authored package.json in the out-dir is kept, not clobbered", async () => {
+    const { runner } = scriptedRunner({
+      boot: run({ exitCode: 1, stderr: "no Anthropic credentials found: set ..." }),
+    });
+    const foreign = '{ "name": "my-harness", "dependencies": { "left-pad": "1.0.0" } }\n';
+    writeFileSync(join(tmp, "package.json"), foreign);
+    const result = await runCompileCheck({
+      target: "cli",
+      bundle: CLI_BUNDLE,
+      outDir: tmp,
+      assertions: [CLI_ASSERTION],
+      runner,
+    });
+    // The check still runs (install verifies against the user's manifest),
+    // but the synthesizer never overwrites a file it did not generate.
+    expect(result.green).toBe(true);
+    expect(readFileSync(join(tmp, "package.json"), "utf-8")).toBe(foreign);
+  });
+
   test("daemon bundles boot daemon.ts and an alive daemon is ok", async () => {
     const { runner, calls } = scriptedRunner({
       boot: run({ exitCode: 137, timedOut: true }),

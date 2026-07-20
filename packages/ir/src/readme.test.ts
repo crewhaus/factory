@@ -380,6 +380,16 @@ describe("renderBundleReadme — per-target run snippet (item 42)", () => {
     expect(renderBundleReadme(channelIr())).toContain("bun daemon.ts");
   });
 
+  test("the default Run section documents the bun install step (manifest flow)", () => {
+    // `crewhaus compile` writes a package.json pinning the bundle's
+    // @crewhaus deps; the README must tell the reader to install it before
+    // the launch line, or a standalone out-dir dies on the first import.
+    const md = renderBundleReadme(baseCliIr());
+    const run = md.slice(md.indexOf("## Run"));
+    expect(run.indexOf("bun install")).toBeGreaterThan(-1);
+    expect(run.indexOf("bun install")).toBeLessThan(run.indexOf("bun agent.ts"));
+  });
+
   test("every IR target has a run command (table is total over the union)", () => {
     // Cheap exhaustiveness probe: a minimal duck-typed IR per target must
     // render without throwing and include a Run section. Targets whose

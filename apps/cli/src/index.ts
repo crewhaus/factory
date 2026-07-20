@@ -220,6 +220,11 @@ import {
   parseExitRatingKey,
   shouldPromptExitRating,
 } from "./autodistill";
+// Local-bundle dependency manifest: `compile` writes the same synthesized
+// pin-to-CLI-version package.json that `--check` installs against, so the
+// documented standalone flow (`bun install` + `bun agent.ts` in the out-dir)
+// resolves the emitted `@crewhaus/*` imports.
+import { ensureBundleManifest } from "./bundle-manifest";
 // Loop contract 0.4 (Batch F, item 6) — the cf-worker emit switch shared with
 // the compiler-worker's remote `POST /compile { emitAs: "cf-worker" }`, so
 // `crewhaus compile --emit-as cf-worker` emits the same Worker bundle locally.
@@ -1066,7 +1071,7 @@ import {
 // testable.
 import { formatUpgradePlan, makeSpecValidator, planUpgrade } from "./upgrade";
 // CLI version resolution (embedded --define constant → package.json), shared
-// with compile-check.ts's dependency pinning.
+// with bundle-manifest.ts's dependency pinning.
 import { cliVersion } from "./version";
 // Item 65 — `crewhaus eval --voice`: replay recorded call-session logs through
 // the voice grader pack (latency / barge-in / transcript). Side-effect-free
@@ -2713,6 +2718,12 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "             boot needs live credentials/servers degrade to a reported\n" +
         "             gate). One green/red verdict line; red exits 1.\n" +
         "\n" +
+        "  Every local bundle is emitted with a package.json declaring the\n" +
+        "  @crewhaus/* packages its entrypoint imports, pinned to this CLI's\n" +
+        "  version — `bun install` in the out-dir, then the README's launch\n" +
+        "  line, runs the bundle standalone. A package.json already in the\n" +
+        "  out-dir that crewhaus did not write is kept, not overwritten.\n" +
+        "\n" +
         "  Every emitted bundle includes a generated README.md documenting\n" +
         "  the harness (name/target/model), its tools and MCP servers, the\n" +
         "  env vars it needs, and how to launch it. A previously generated\n" +
@@ -2995,6 +3006,18 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     writeFileSync(fullPath, file.content);
     process.stdout.write(`wrote ${fullPath}\n`);
   }
+  // Local bundles carry bare `@crewhaus/*` imports and nothing declaring
+  // them — synthesize the pinned manifest so `bun install` in the out-dir
+  // makes the emitted entrypoint runnable standalone. (The cf-worker
+  // emitters ship their own package.json; a user-authored one is kept.)
+  const manifest = ensureBundleManifest(bundle.files, absOut);
+  if (manifest.action === "wrote") {
+    process.stdout.write(`wrote ${manifest.path}\n`);
+  } else if (manifest.action === "kept") {
+    process.stdout.write(
+      `kept ${manifest.path} (pre-existing — the pinned @crewhaus manifest was NOT written; delete it and recompile, or declare the bundle's @crewhaus deps there yourself)\n`,
+    );
+  }
   process.stdout.write(
     `compiled ${emitCfWorker ? "cf-worker " : ""}bundle (${bundle.files.length} file(s)) → ${absOut}\n`,
   );
@@ -3048,6 +3071,16 @@ async function runCompile(args: ParsedArgs): Promise<void> {
       mkdirSync(dirname(fullPath), { recursive: true });
       writeFileSync(fullPath, file.content);
       process.stdout.write(`wrote ${fullPath}\n`);
+    }
+    // The eval bridge is its own local bundle in <out-dir>/eval/ — it needs
+    // its own manifest for the same standalone-run reason as the primary.
+    const evalManifest = ensureBundleManifest(evalBundle.files, evalOut);
+    if (evalManifest.action === "wrote") {
+      process.stdout.write(`wrote ${evalManifest.path}\n`);
+    } else if (evalManifest.action === "kept") {
+      process.stdout.write(
+        `kept ${evalManifest.path} (pre-existing — the pinned @crewhaus manifest was NOT written; delete it and recompile, or declare the bundle's @crewhaus deps there yourself)\n`,
+      );
     }
     process.stdout.write(`${describeBridge(projected, strategy)}\n`);
   }

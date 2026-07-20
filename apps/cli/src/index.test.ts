@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AuditKind, FileAnchorStore, openAuditLog } from "@crewhaus/audit-log";
 import { parseSpec } from "@crewhaus/spec";
+import { cliVersion } from "./version";
 
 // `tsc -b` also compiles this file into `dist/`; resolve the CLI entrypoint
 // from the source tree so the dist test copy can still spawn it.
@@ -74,6 +75,53 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
     expect(result.stdout).toContain("compiled bundle");
+  });
+
+  test("emits a pinned package.json so the bundle runs standalone", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    const manifestPath = join(tmp, "package.json");
+    expect(result.stdout).toContain(`wrote ${manifestPath}`);
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    expect(manifest.name).toBe("crewhaus-compiled-bundle");
+    // Every @crewhaus import in the emitted entrypoint is declared, all
+    // pinned to the CLI's own version — never the "latest" fallback, which
+    // would make the bundle's behavior depend on the day it first ran.
+    const agent = readFileSync(join(tmp, "agent.ts"), "utf-8");
+    const imports = [...agent.matchAll(/from "(@crewhaus\/[a-z0-9-]+)"/g)].map(
+      (m) => m[1] as string,
+    );
+    expect(imports.length).toBeGreaterThan(0); // guard: emitter import style changed → loop vacuous
+    for (const dep of imports) expect(manifest.dependencies[dep]).toBeDefined();
+    expect(cliVersion()).toBeDefined();
+    for (const pin of Object.values(manifest.dependencies)) expect(pin).toBe(cliVersion());
+  });
+
+  test("a user-authored package.json in the out-dir is kept on plain compile", async () => {
+    const manifestPath = join(tmp, "package.json");
+    const foreign = '{ "name": "my-harness", "dependencies": { "left-pad": "1.0.0" } }\n';
+    writeFileSync(manifestPath, foreign);
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(readFileSync(manifestPath, "utf-8")).toBe(foreign);
+    // The message must warn that the pinned manifest was NOT written — a
+    // silent keep would reintroduce the unresolvable-imports failure with
+    // no signal (e.g. after an --emit-as cf-worker compile into this dir).
+    expect(result.stdout).toContain(`kept ${manifestPath}`);
+    expect(result.stdout).toContain("pinned @crewhaus manifest was NOT written");
+  });
+
+  test("--with-eval-harness emits a pinned manifest for the eval bridge too", async () => {
+    const result = await runCli(["compile", CHANNEL_SPEC, "--with-eval-harness", "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    // Primary (channel) bundle and the projected eval bridge each carry
+    // their own manifest — each is its own standalone local bundle.
+    for (const dir of [tmp, join(tmp, "eval")]) {
+      const manifest = JSON.parse(readFileSync(join(dir, "package.json"), "utf-8"));
+      expect(manifest.name).toBe("crewhaus-compiled-bundle");
+      expect(Object.keys(manifest.dependencies).length).toBeGreaterThan(0);
+      for (const pin of Object.values(manifest.dependencies)) expect(pin).toBe(cliVersion());
+    }
   });
 
   // Item 42 — generated bundle README, DEFAULT-ON.
@@ -2040,11 +2088,13 @@ describe("crewhaus compile --check — flag surface (item 33)", () => {
     expect(result.stdout).toContain("liveness");
   });
 
-  test("plain compile is unaffected — no verdict line without --check", async () => {
+  test("plain compile runs no verification — no verdict line without --check", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).not.toContain("compile --check:");
-    expect(existsSync(join(tmp, "package.json"))).toBe(false);
+    // The dependency manifest is now part of the plain compile's emission
+    // (the standalone-run fix) — only the verify steps stay --check-gated.
+    expect(existsSync(join(tmp, "package.json"))).toBe(true);
   });
 });
 

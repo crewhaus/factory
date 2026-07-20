@@ -1,8 +1,8 @@
 /**
  * CLI version resolution, shared by `crewhaus version` (index.ts) and the
- * `compile --check` dependency pinning (compile-check.ts). Side-effect-free
- * so it is importable from unit-testable modules (the CLI entry file runs an
- * argv switch on import).
+ * bundle-manifest dependency pinning every compile emits (bundle-manifest.ts,
+ * re-ensured by `--check`). Side-effect-free so it is importable from
+ * unit-testable modules (the CLI entry file runs an argv switch on import).
  */
 import { readFileSync } from "node:fs";
 
