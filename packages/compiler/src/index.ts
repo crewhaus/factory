@@ -56,6 +56,7 @@ import type {
   IrVectorBackend,
   IrVoiceV0,
   IrWalletBinding,
+  IrWatchme,
   IrWhatsAppConfig,
   IrWorkflowV0,
 } from "@crewhaus/ir";
@@ -71,6 +72,7 @@ import {
   type SpecSlackChannel,
   type SpecSubAgentDefinition,
   type SpecTelegramChannel,
+  type SpecWatchmeBlock,
   type SpecWhatsAppChannel,
   parseSpec,
 } from "@crewhaus/spec";
@@ -270,6 +272,19 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
   // ACCEPTED_BUT_UNWIRED mechanism does not track, matching how the other
   // shapes' nested `agent.tools` are handled.
   batch: [unwired("continuity", "batch", "the generated bundle prints the ignored-note comment")],
+  // "Watch me" (design/watch-me.md §6.3) — the `watchme:` block is WIRED on
+  // cli (interpreter env stamp + target-cli bundle preamble) and channel
+  // (target-channel-bot's existing G26 env-stamp emitter), so neither shape
+  // lists it. managed carries the block parse+lower ONLY: its daemon has no
+  // watchme env stamp yet, so managed rejoins the table with the honest row
+  // below (delete it when target-managed's one-line `??=` stamp lands).
+  managed: [
+    unwired(
+      "watchme",
+      "managed",
+      "the managed daemon does not stamp CREWHAUS_WATCHME, so capture stays off until its loop wiring lands (design/watch-me.md §6.3)",
+    ),
+  ],
   voice: [
     unwired("mcp_servers", "voice", "no MCP host is booted in the voice daemon"),
     unwired("tools", "voice", "the realtime voice loop does not register a tool catalog"),
@@ -1981,6 +1996,35 @@ function lowerObservability(spec: SpecWithObservability): { observability?: IrOb
   return { observability };
 }
 
+type SpecWithWatchme = { readonly watchme?: SpecWatchmeBlock };
+
+/**
+ * "Watch me" (design/watch-me.md §4.6) — lower the `watchme:` block on its
+ * three carrier shapes (cli/channel/managed), with the spread-return-{}
+ * discipline: an absent block spreads NOTHING, so watchme-less specs compile
+ * byte-identically. Unlike lowerObservability's declare-only carriage, the
+ * IR block is fully populated here: zod has already materialised the
+ * top-level defaults, and the OPTIONAL `judge:` sub-block's defaults resolve
+ * now (`claude-haiku-4-5` / 0.15 / 0 — matching the spec schema's own
+ * defaults when `judge: {}` is declared), so emitters/runtimes never
+ * re-derive them.
+ */
+function lowerWatchme(spec: SpecWithWatchme): { watchme?: IrWatchme } {
+  const w = spec.watchme;
+  if (w === undefined) return {};
+  return {
+    watchme: {
+      enabled: w.enabled,
+      capture: w.capture,
+      judgeModel: w.judge?.model ?? "claude-haiku-4-5",
+      judgeSampleRate: w.judge?.sample_rate ?? 0.15,
+      judgeBudgetUsd: w.judge?.budget_usd ?? 0,
+      scope: w.scope,
+      share: w.share,
+    },
+  };
+}
+
 /**
  * Section 47 — normalise the cross-cutting blockchain subsystem blocks
  * (chains / wallets / contracts / transaction_policy). Each block is
@@ -2167,6 +2211,8 @@ export function lower(spec: Spec): IrNode {
         ...(thredzLowered.thredz !== undefined ? { thredz: thredzLowered.thredz } : {}),
         ...learning,
         ...lowerObservability(spec),
+        // "Watch me" — observe-and-learn (sibling of observability, §4.6).
+        ...lowerWatchme(spec),
         // Batch G — MCP-server projection (G30) + plugin activation (G32).
         ...lowerExpose(spec),
         ...lowerPlugins(spec),
@@ -2302,6 +2348,8 @@ export function lower(spec: Spec): IrNode {
         ...(thredzLowered.thredz !== undefined ? { thredz: thredzLowered.thredz } : {}),
         ...learning,
         ...lowerObservability(spec),
+        // "Watch me" — observe-and-learn (sibling of observability, §4.6).
+        ...lowerWatchme(spec),
         // Batch G — MCP-server projection (G30) + plugin activation (G32).
         ...lowerExpose(spec),
         ...lowerPlugins(spec),
@@ -2466,6 +2514,9 @@ export function lower(spec: Spec): IrNode {
         ...(thredzLowered.thredz !== undefined ? { thredz: thredzLowered.thredz } : {}),
         ...learning,
         ...lowerObservability(spec),
+        // "Watch me" — observe-and-learn, lowered but NOT runtime-wired on
+        // managed in v1 (compile() emits the accepted-but-unwired warning).
+        ...lowerWatchme(spec),
         // Batch G — MCP-server projection (G30); SSE exposure rides this
         // shape's gateway tenancy. No plugins on managed (item 3 boot paths
         // cover cli + channel-bot codegen).

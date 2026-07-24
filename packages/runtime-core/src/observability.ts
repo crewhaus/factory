@@ -1,5 +1,7 @@
+import { appendFileSync } from "node:fs";
+import { join } from "node:path";
 import { type CostTracker, createCostTracker, formatUsdMicros } from "@crewhaus/cost-tracker";
-import type { EventLog } from "@crewhaus/event-log";
+import type { EventKind, EventLog } from "@crewhaus/event-log";
 import {
   type AttachedMetrics,
   attachIfEnvSet as attachMetricsIfEnvSet,
@@ -27,6 +29,7 @@ import type { RunContext } from "@crewhaus/run-context";
 import {
   type AttachedPrinter,
   attachIfEnvSet as attachPrinterIfEnvSet,
+  formatJsonLine,
 } from "@crewhaus/structured-event-printer";
 import type {
   CostAccrualEvent,
@@ -699,6 +702,114 @@ export function attachMcpStatsPersistence(
           message: err instanceof Error ? err.message : String(err),
         });
       });
+  });
+
+  return { unsubscribe };
+}
+
+// -------- "watch me" live capture tap (design/watch-me.md §6.1) --------
+
+/**
+ * Reconciliation with the SHIPPED G26 `observability:` block (watch-me §4.5 —
+ * decided, superseding all "when G26 lands" language): `watchme:` is a SIBLING
+ * spec block, not an `observability:` sub-key. `observability.trace.level`
+ * controls the ring buffer + printers ONLY; the bus always exists, so this
+ * capture subscriber attaches independently of that knob, gated solely on
+ * CREWHAUS_WATCHME. The env itself is stamped at the same junctions the G26
+ * stamps already use (`applyRunObservabilityEnv` on the interpreter path, the
+ * target bundles' boot-stamp emitters), so precedence semantics stay in one
+ * place per path.
+ */
+
+/** Stream kinds published per token/chunk — pure progress signal, never captured. */
+const WATCHME_EPHEMERAL_KINDS: ReadonlySet<string> = new Set([
+  "model_stream_token",
+  "tool_stream_chunk",
+]);
+
+/**
+ * The session `.jsonl` mirror vocabulary — every kind the event log persists
+ * durably: the transcript kinds the runtime writes itself plus the mirrored
+ * kinds emitted by the cost/advisor/mcp-stats subscribers in this file. The
+ * capture tap skips these, which keeps the `.events.jsonl` sibling
+ * metadata-grade BY CONSTRUCTION (all content-carrying kinds are durable ones)
+ * and makes the two files' kind sets disjoint — a pinned invariant. Typed as
+ * an exhaustive Record over event-log's `EventKind` so a new durable kind
+ * cannot land without this set learning about it.
+ */
+const WATCHME_MIRRORED_KIND_RECORD: Readonly<Record<EventKind, true>> = {
+  user_message: true,
+  assistant_message: true,
+  tool_use: true,
+  tool_result: true,
+  error: true,
+  run_failed: true,
+  context_evicted: true,
+  compaction: true,
+  sub_agent_start: true,
+  sub_agent_end: true,
+  role_start: true,
+  role_end: true,
+  handoff: true,
+  a2a_message: true,
+  a2a_turn_start: true,
+  a2a_turn_end: true,
+  crew_done: true,
+  cost_accrual: true,
+  user_feedback: true,
+  recovery: true,
+  tool_stats: true,
+  permission: true,
+  model_meta: true,
+  mcp_stats: true,
+  model_route: true,
+  wiki_write: true,
+  plan_update: true,
+  goal_update: true,
+  action_proof: true,
+  dream_run: true,
+};
+export const WATCHME_MIRRORED_KINDS: ReadonlySet<string> = new Set(
+  Object.keys(WATCHME_MIRRORED_KIND_RECORD),
+);
+
+export type AttachedWatchmeCapture = {
+  unsubscribe(): void;
+};
+
+/**
+ * "Watch me" (§6.1) — the live capture tap behind `crewhaus watchme`. Appends
+ * every BUS-ONLY TraceEvent (envelope included — `formatJsonLine` shape) as
+ * one JSON line to `<sessionsDir>/<sessionId>.events.jsonl`, the sibling
+ * `sessions export` already reads. Skipped: the ephemeral stream kinds and
+ * every durably mirrored kind ({@link WATCHME_MIRRORED_KINDS}), so content
+ * stays solely in the session `.jsonl` while the sibling carries exact
+ * per-turn model attribution via the envelope `turnNumber` on
+ * `model_response`.
+ *
+ * Gated on CREWHAUS_WATCHME=1|true (stamped by `crewhaus run` /
+ * the compiled-bundle preambles); returns undefined otherwise. Appends are
+ * synchronous (`appendFileSync`, mode 0600, one line < PIPE_BUF ⇒ atomic) and
+ * every failure is swallowed — capture can never crash a run.
+ */
+export function attachWatchmeCapture(
+  bus: TraceEventBus,
+  sessionsDir: string,
+  sessionId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): AttachedWatchmeCapture | undefined {
+  const gate = env["CREWHAUS_WATCHME"];
+  if (gate !== "1" && gate !== "true") return undefined;
+
+  const path = join(sessionsDir, `${sessionId}.events.jsonl`);
+  const unsubscribe = bus.subscribe((event: TraceEvent): void => {
+    if (WATCHME_EPHEMERAL_KINDS.has(event.kind)) return;
+    if (WATCHME_MIRRORED_KINDS.has(event.kind)) return;
+    try {
+      appendFileSync(path, formatJsonLine(event), { mode: 0o600 });
+    } catch {
+      // Swallowed by design — a capture hiccup must never abort a turn.
+    }
   });
 
   return { unsubscribe };

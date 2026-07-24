@@ -9,6 +9,7 @@ import {
   isValidTraceLevel,
   resolveCostEnv,
   resolveTraceEnv,
+  resolveWatchmeEnv,
 } from "./run-observability";
 
 describe("isValidTraceLevel", () => {
@@ -65,5 +66,26 @@ describe("resolveCostEnv — cost on by default", () => {
   test("ambient env wins (already set)", () => {
     expect(resolveCostEnv(undefined, "1")).toBeUndefined();
     expect(resolveCostEnv(true, "0")).toBeUndefined();
+  });
+});
+
+describe('resolveWatchmeEnv — "watch me" capture off by default, opt-in with env-wins', () => {
+  test("spec enabled+full capture → '1' when the env is unset", () => {
+    expect(resolveWatchmeEnv(true, false, undefined)).toBe("1");
+  });
+
+  test("state watching turns capture on without a spec block", () => {
+    expect(resolveWatchmeEnv(undefined, true, undefined)).toBe("1");
+    expect(resolveWatchmeEnv(false, true, undefined)).toBe("1");
+  });
+
+  test("neither spec nor state → leave the env untouched (off by default)", () => {
+    expect(resolveWatchmeEnv(undefined, false, undefined)).toBeUndefined();
+    expect(resolveWatchmeEnv(false, false, undefined)).toBeUndefined();
+  });
+
+  test("ambient env wins over both spec and state (even an explicit off)", () => {
+    expect(resolveWatchmeEnv(true, true, "1")).toBeUndefined();
+    expect(resolveWatchmeEnv(true, true, "0")).toBeUndefined();
   });
 });

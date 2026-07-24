@@ -1640,6 +1640,27 @@ describe("emitChannelBot — G26 observability env stamps", () => {
       'process.env["OTEL_EXPORTER_OTLP_ENDPOINT"] ??= process.env["OTLP_URL"];',
     );
   });
+
+  test('watchme enabled + capture full stamps CREWHAUS_WATCHME ("watch me" §6.3)', () => {
+    const watchmeIr = (enabled: boolean, capture: "full" | "mirrors"): IrChannelV0 => ({
+      ...MIN_IR,
+      watchme: {
+        enabled,
+        capture,
+        judgeModel: "claude-haiku-4-5",
+        judgeSampleRate: 0.15,
+        judgeBudgetUsd: 0,
+        scope: "harness",
+        share: false,
+      },
+    });
+    const daemon = fileMap(watchmeIr(true, "full")).get("daemon.ts") ?? "";
+    expect(daemon).toContain('process.env["CREWHAUS_WATCHME"] ??= "1";');
+    // mirrors capture / disabled / absent block ⇒ no stamp.
+    for (const ir of [watchmeIr(true, "mirrors"), watchmeIr(false, "full"), MIN_IR]) {
+      expect(fileMap(ir).get("daemon.ts") ?? "").not.toContain("CREWHAUS_WATCHME");
+    }
+  });
 });
 
 describe("emitChannelBot — G48 durable security audit sink", () => {

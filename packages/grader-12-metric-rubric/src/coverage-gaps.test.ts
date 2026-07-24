@@ -1,9 +1,9 @@
 /**
  * Branch-coverage closure for index.ts — exercises the failure/edge paths the
  * happy-path suite in index.test.ts doesn't reach: missing-tool-call branches,
- * empty-chunk-set branches, the LLM-judge stubs, the registry skip-when-present
- * branch, and the empty-input aggregator path (percentile of [] and the
- * count===0 ternaries in summarize12MetricRubric).
+ * empty-chunk-set branches, the factuality graders' empty-run paths, the
+ * registry skip-when-present branch, and the empty-input aggregator path
+ * (percentile of [] and the count===0 ternaries in summarize12MetricRubric).
  *
  * Same conventions as index.test.ts: bun:test, a local emptyRun() builder, and
  * Sample literals cast through `as Sample` for the opt-in expectation fields.
@@ -92,21 +92,26 @@ describe("contextPrecision — no ground-truth chunk in retrieved list", () => {
   });
 });
 
-describe("LLM-judge stubs fail loudly with wiring guidance", () => {
-  const cases: ReadonlyArray<readonly [string, Grader]> = [
-    ["twelve.answerFaithfulness", answerFaithfulness],
-    ["twelve.answerRelevance", answerRelevance],
-    ["twelve.hallucinationRate", hallucinationRate],
-  ];
-  for (const [name, grader] of cases) {
-    test(`${name} returns passed:false with an LLM-judge rationale`, async () => {
-      const r = await grader(sample, emptyRun());
-      expect(r.passed).toBe(false);
-      expect(r.score).toBe(0);
-      expect(r.rationale).toContain(name);
-      expect(r.rationale).toContain("LLM-judge grader");
-    });
-  }
+describe("factuality graders on an empty run", () => {
+  test("answerFaithfulness: zero claims + zero evidence is a vacuous pass", async () => {
+    const r = await answerFaithfulness(sample, emptyRun());
+    expect(r.passed).toBe(true);
+    expect(r.score).toBe(1);
+    expect(r.rationale).toContain("vacuous");
+  });
+
+  test("hallucinationRate: zero claims + zero evidence is a vacuous pass at rate 0", async () => {
+    const r = await hallucinationRate(sample, emptyRun());
+    expect(r.passed).toBe(true);
+    expect(r.score).toBe(0);
+    expect(r.rationale).toContain("vacuous");
+  });
+
+  test("answerRelevance: an empty answer covers none of the question", async () => {
+    const r = await answerRelevance(sample, emptyRun());
+    expect(r.passed).toBe(false);
+    expect(r.score).toBe(0);
+  });
 });
 
 describe("register12MetricRubric — skips already-registered names", () => {

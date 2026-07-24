@@ -4,9 +4,9 @@ The publish-surface view of the factory workspace — what's on npm, how it's ve
 
 ## Status
 
-**0.3.0 — the memory release (current factory cut 0.3.0).** Every `@crewhaus/*` library package in `packages/` is published to the npm registry under the **public** `@crewhaus` scope, and the flagship CLI ships as the bare, unscoped [`crewhaus`](https://www.npmjs.com/package/crewhaus) package (the old `@crewhaus/cli` name is deprecated and now just points at `crewhaus`). The root `factory` workspace is intentionally private and stays that way (`"private": true`); only the inner packages are publishable.
+**0.4.0 — the loop-contract release (current factory cut 0.4.0).** Every `@crewhaus/*` library package in `packages/` is published to the npm registry under the **public** `@crewhaus` scope, and the flagship CLI ships as the bare, unscoped [`crewhaus`](https://www.npmjs.com/package/crewhaus) package (the old `@crewhaus/cli` name is deprecated and now just points at `crewhaus`). The root `factory` workspace is intentionally private and stays that way (`"private": true`); only the inner packages are publishable.
 
-The sibling [crewhaus/utilities](https://github.com/crewhaus/utilities) workspace (12 packages — Studio, IDE extensions, the browser playground, trace-viewer, graph-visualizer, wizard, scaffold-templates, studio-plugin-sdk) versions in its own lockstep, currently at 0.1.5. The factory workspace itself publishes **209 packages** (208 `@crewhaus/*` libraries under `packages/` plus the unscoped `crewhaus` CLI); together, **221 packages** on the public registry.
+The sibling [crewhaus/utilities](https://github.com/crewhaus/utilities) workspace (13 packages — Studio, IDE extensions, the browser playground, trace-viewer, graph-visualizer, wizard, scaffold-templates, spec-forms, studio-plugin-sdk) versions in its own lockstep, currently at 0.1.5. The factory workspace itself publishes **213 packages** (212 `@crewhaus/*` libraries under `packages/` plus the unscoped `crewhaus` CLI); together, **226 packages** on the public registry.
 
 > **Why we skipped v0.1.0.** A first publish at v0.1.0 went out with broken inter-package dependency ranges — `bun publish` resolved `workspace:*` against a stale `bun.lock` that still recorded the pre-release `0.0.0` versions, leaving every published package pointing at non-existent `@crewhaus/<dep>@0.0.0`. v0.1.1 regenerates `bun.lock` after the version bump so workspace:* resolves to the actual `0.1.1` cut. If you're authoring a new release on this workspace, delete `bun.lock` before `bun install` after a version bump — the `scripts/publish-workspace.ts` flow does this automatically.
 
@@ -43,7 +43,7 @@ cd my-agent
 crewhaus compile && crewhaus run
 ```
 
-`crewhaus --version` prints the build, e.g. `0.3.0`.
+`crewhaus --version` prints the build, e.g. `0.4.0`.
 
 The `crewhaus` package transitively pulls in everything else via versioned npm deps (the workspace `workspace:*` references resolve to concrete versions at publish time), so users don't install the rest individually. A generated bundle imports a shape-dependent set of `@crewhaus/*` runtime packages directly (`runtime-core`, the tool packages, queue/mcp/memory modules, …) — `crewhaus compile` writes a `package.json` beside the bundle pinning exactly that set to the CLI's own version, so `bun install` in the out-dir is all a standalone consumer runs.
 
@@ -100,16 +100,17 @@ crewhaus init my-agent
 - **Persistence & state** — `@crewhaus/session-store`, `@crewhaus/checkpoint-store`, `@crewhaus/state-store`, `@crewhaus/vector-store`
 - **Memory & continuity (v0.3.0)** — `@crewhaus/memory-service` (the composition root every emitter calls), `@crewhaus/continuity-store`, `@crewhaus/tool-plan`, `@crewhaus/wiki-store`, `@crewhaus/tool-wiki`, `@crewhaus/dream-engine`, `@crewhaus/default-skills`, `@crewhaus/grader-continuity`
 - **Observability** — `@crewhaus/exporter-datadog`, `@crewhaus/exporter-newrelic`, `@crewhaus/exporter-honeycomb`, `@crewhaus/exporter-splunk`, `@crewhaus/otel-exporter`, `@crewhaus/cost-tracker`, `@crewhaus/run-context`, `@crewhaus/logging`
+- **Observation & learning** — `@crewhaus/watchme-store` (the durable observation/judgment store and cross-harness registry behind `crewhaus watchme`)
 - **Utilities (factory-side)** — `@crewhaus/errors`, `@crewhaus/rate-limiter`, `@crewhaus/circuit-breaker`, `@crewhaus/token-budget`, `@crewhaus/idempotency-keys`, `@crewhaus/template-registry`, `@crewhaus/dataset-registry`
 - **Sandbox images** — `@crewhaus/sandbox-image-*`, one per language for `tool-code-execution`. These may ship as container images in addition to npm packages.
 
 The sibling [crewhaus/utilities](https://github.com/crewhaus/utilities) workspace contributes the **Studio + IDE surface**:
 
-- `@crewhaus/studio-server`, `@crewhaus/studio-ui`, `@crewhaus/studio-plugin-sdk`, `@crewhaus/scaffold-templates`, `@crewhaus/wizard`, `@crewhaus/trace-viewer`, `@crewhaus/graph-visualizer`, `@crewhaus/dataset-builder`, `@crewhaus/grader-builder`
+- `@crewhaus/studio-server`, `@crewhaus/studio-ui`, `@crewhaus/studio-plugin-sdk`, `@crewhaus/scaffold-templates`, `@crewhaus/wizard`, `@crewhaus/trace-viewer`, `@crewhaus/graph-visualizer`, `@crewhaus/dataset-builder`, `@crewhaus/grader-builder`, `@crewhaus/spec-forms`
 - `@crewhaus/vscode-extension`, `@crewhaus/jetbrains-plugin`
 - `@crewhaus/crewhaus-playground` (browser REPL)
 
-All twelve publish in their own lockstep (currently 0.1.5), independent of the factory cut.
+All thirteen publish in their own lockstep (currently 0.1.5), independent of the factory cut.
 
 ## Intentionally NOT published
 

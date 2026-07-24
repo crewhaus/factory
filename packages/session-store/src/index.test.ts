@@ -152,15 +152,20 @@ describe("session-store — update / delete", () => {
     );
   });
 
-  test("delete unlinks both the session file and a sibling event log", async () => {
+  test("delete unlinks the session file, the event log, and the watchme trace sibling", async () => {
     const rootDir = newTempRoot();
     const store = createSessionStore({ rootDir });
     const created = await store.create({ name: "x", target: "cli", model: "m" });
     const log = join(rootDir, `${created.id}.jsonl`);
+    const events = join(rootDir, `${created.id}.events.jsonl`);
     writeFileSync(log, '{"kind":"user_message","payload":{}}\n');
+    writeFileSync(events, '{"kind":"model_request"}\n');
     await store.delete(created.id);
     expect(existsSync(join(rootDir, `${created.id}.json`))).toBe(false);
     expect(existsSync(log)).toBe(false);
+    // Without the .json the sweep can never re-match this id, so delete() is
+    // the only reclaim path for the trace sibling — it must remove it too.
+    expect(existsSync(events)).toBe(false);
   });
 
   test("delete on a missing session is a no-op", async () => {
@@ -217,6 +222,24 @@ describe("session-store — list and TTL eviction", () => {
     expect(existsSync(join(rootDir, `${a.id}.json`))).toBe(false);
     expect(existsSync(aLog)).toBe(false);
     expect(existsSync(join(rootDir, `${b.id}.json`))).toBe(true);
+  });
+
+  test("list()-time eviction also unlinks the .events.jsonl watchme trace sibling", async () => {
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const a = await store.create({ name: "a", target: "cli", model: "m" });
+    const aLog = join(rootDir, `${a.id}.jsonl`);
+    const aEvents = join(rootDir, `${a.id}.events.jsonl`);
+    writeFileSync(aLog, '{"kind":"user_message","payload":{}}\n');
+    writeFileSync(aEvents, '{"kind":"model_request","turnNumber":1}\n');
+
+    const old = new Date(Date.now() - 35 * 86_400_000);
+    utimesSync(join(rootDir, `${a.id}.json`), old, old);
+
+    expect(await store.list()).toEqual([]);
+    expect(existsSync(join(rootDir, `${a.id}.json`))).toBe(false);
+    expect(existsSync(aLog)).toBe(false);
+    expect(existsSync(aEvents)).toBe(false);
   });
 
   test("list returns [] when the root dir does not exist yet", async () => {
@@ -327,6 +350,26 @@ describe("session-store — evictExpiredSessions (standalone TTL pass)", () => {
     expect(existsSync(join(rootDir, `${pinned.id}.json`))).toBe(true);
     expect(existsSync(pinnedLog)).toBe(true);
     expect(existsSync(join(rootDir, `${doomed.id}.json`))).toBe(false);
+  });
+
+  test("evicts the .events.jsonl trace sibling; pinned sessions keep all three files", async () => {
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const pinned = await store.create({ name: "pinned", target: "cli", model: "m" });
+    const doomed = await store.create({ name: "doomed", target: "cli", model: "m" });
+    const filesOf = (id: string) =>
+      [`${id}.json`, `${id}.jsonl`, `${id}.events.jsonl`].map((f) => join(rootDir, f));
+    const backdated = new Date(Date.now() - 90 * 86_400_000);
+    for (const id of [pinned.id, doomed.id]) {
+      writeFileSync(join(rootDir, `${id}.jsonl`), '{"kind":"user_message","payload":{}}\n');
+      writeFileSync(join(rootDir, `${id}.events.jsonl`), '{"kind":"model_request"}\n');
+      utimesSync(join(rootDir, `${id}.json`), backdated, backdated);
+    }
+
+    const { evictedIds } = await evictExpiredSessions({ rootDir, pinnedIds: [pinned.id] });
+    expect(evictedIds).toEqual([doomed.id]);
+    for (const path of filesOf(doomed.id)) expect(existsSync(path)).toBe(false);
+    for (const path of filesOf(pinned.id)) expect(existsSync(path)).toBe(true);
   });
 
   test("missing root dir returns no evictions", async () => {

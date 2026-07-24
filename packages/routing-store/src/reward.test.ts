@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { computeReward } from "./reward";
+import type { RewardConfig, RouteObservation } from "./reward";
 
 describe("computeReward", () => {
   test("a perfect call (success, free, instant) scores 1", () => {
@@ -82,5 +83,59 @@ describe("computeReward", () => {
   test("negative latency/cost are clamped, not rewarded past 1", () => {
     const r = computeReward({ success: true, latencyMs: -5, costUsd: -1 });
     expect(r).toBe(1);
+  });
+});
+
+describe("computeReward — joined quality (RouteObservation.quality)", () => {
+  test("omitted quality is byte-identical to the pre-quality reward on existing fixtures", () => {
+    // Hand-computed values from the v1 quality=success proxy; adding the field
+    // must not move any of them when quality is omitted.
+    const table: Array<{ obs: RouteObservation; cfg?: RewardConfig; expected: number }> = [
+      { obs: { success: true, latencyMs: 0, costUsd: 0 }, expected: 1 },
+      { obs: { success: false, latencyMs: 0, costUsd: 0 }, expected: 0 },
+      // q 1 (w .7) + cost 0.5 (w .2) + latency 0.5 (w .1) → 0.85
+      { obs: { success: true, latencyMs: 5000, costUsd: 0.01 }, expected: 0.85 },
+      // cost absent → renormalise over quality+latency: (0.7 + 0.05) / 0.8
+      { obs: { success: true, latencyMs: 5000 }, expected: 0.9375 },
+      {
+        obs: { success: true, latencyMs: 5000, costUsd: 0.01 },
+        cfg: { objective: { quality: 0, cost: 1, latency: 0 } },
+        expected: 0.5,
+      },
+    ];
+    for (const { obs, cfg, expected } of table) {
+      const reward = computeReward(obs, cfg);
+      expect(reward).toBeCloseTo(expected, 12);
+      // Explicit quality: undefined and the success-proxy quality: 1 are both
+      // exactly the omitted-field reward.
+      expect(computeReward({ ...obs, quality: undefined }, cfg)).toBe(reward);
+      if (obs.success) expect(computeReward({ ...obs, quality: 1 }, cfg)).toBe(reward);
+    }
+  });
+
+  test("quality=0.4 on success scales the quality term (hand-computed)", () => {
+    // q 0.4 (w .7) + cost 0.5 (w .2) + latency 0.5 (w .1) → 0.28 + 0.1 + 0.05
+    const r = computeReward({ success: true, latencyMs: 5000, costUsd: 0.01, quality: 0.4 });
+    expect(r).toBeCloseTo(0.43, 6);
+    // Quality-only objective: the reward IS the joined quality.
+    expect(
+      computeReward(
+        { success: true, latencyMs: 0, quality: 0.4 },
+        { objective: { quality: 1, cost: 0, latency: 0 } },
+      ),
+    ).toBeCloseTo(0.4, 12);
+  });
+
+  test("out-of-range quality is clamped to [0, 1]", () => {
+    const qualityOnly: RewardConfig = { objective: { quality: 1, cost: 0, latency: 0 } };
+    expect(computeReward({ success: true, latencyMs: 0, quality: 2.5 }, qualityOnly)).toBe(1);
+    expect(computeReward({ success: true, latencyMs: 0, quality: -0.5 }, qualityOnly)).toBe(0);
+    // Clamping keeps the default-objective reward within [0, 1] as well.
+    expect(computeReward({ success: true, latencyMs: 0, costUsd: 0, quality: 99 })).toBe(1);
+  });
+
+  test("a failed turn still scores 0 even with a perfect joined quality", () => {
+    expect(computeReward({ success: false, latencyMs: 0, costUsd: 0, quality: 1 })).toBe(0);
+    expect(computeReward({ success: false, latencyMs: 100, quality: 0.9 })).toBe(0);
   });
 });

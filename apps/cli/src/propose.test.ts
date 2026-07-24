@@ -55,6 +55,19 @@ describe("assembleProposal", () => {
     expect(JSON.parse(a.patchJson).specName).toBe("concierge");
   });
 
+  test("carries watchme provenance (the `watchme synthesize --propose` handoff)", () => {
+    const a = assembleProposal({
+      specName: "concierge",
+      currentYaml: CURRENT,
+      proposedYaml: PROPOSED,
+      source: "watchme",
+      proposedVersion: "v2",
+      now: NOW,
+    });
+    expect(a.patch.provenance.source).toBe("watchme");
+    expect(a.prBody).toContain("`watchme`");
+  });
+
   test("throws when the proposed spec is byte-identical", () => {
     expect(() =>
       assembleProposal({

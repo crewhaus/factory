@@ -55,3 +55,25 @@ export function resolveCostEnv(
   if ((specCostEnabled ?? true) === true && currentCost === undefined) return "1";
   return undefined;
 }
+
+/**
+ * "Watch me" (watch-me §6.3) — the value to assign to `CREWHAUS_WATCHME`
+ * (the gate runtime-core's `attachWatchmeCapture` reads), or `undefined` to
+ * leave the env untouched. Unlike cost this is OFF by default: it turns on
+ * when the spec opted into full capture (`watchme.enabled` with
+ * `capture: "full"`, resolved by the caller into `specEnabled`) OR the
+ * harness state file says watching (`.crewhaus/watchme/state.json`, so
+ * `crewhaus watchme start` captures without a spec edit). An already-set
+ * ambient env always wins (`??=`), matching the compiled bundles' boot
+ * stamps — target-cli's preamble and target-channel-bot's G26 emitter stamp
+ * the same env; keep the three in sync.
+ */
+export function resolveWatchmeEnv(
+  specEnabled: boolean | undefined,
+  stateWatching: boolean,
+  current: string | undefined,
+): string | undefined {
+  if (current !== undefined) return undefined;
+  if (specEnabled === true || stateWatching) return "1";
+  return undefined;
+}

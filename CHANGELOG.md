@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **"Watch me": `crewhaus watchme` observes harness interactions and learns
+  from them.** A new `watchme:` spec block (cli/channel/managed) turns on a
+  live trace tap that finally writes the
+  `.crewhaus/sessions/<id>.events.jsonl` sibling `sessions export` already
+  reads; `watchme report` distills watched sessions into response-quality,
+  continuity, factuality, model-usage, and counterfactual cheaper-model
+  analysis (proposal-only — verify with `crewhaus model right-size`);
+  `watchme intents` mines recurring intents across one harness or every
+  registered one; `watchme synthesize` drafts a validated mimic agent-loop
+  spec (never auto-applied); `watchme publish` distills redacted findings
+  into the harness's local per-spec wiki, and `watchme report --all` recalls
+  those findings from opted-in (`watchme.share: true`) peers via the
+  same-machine harness registry — LOCAL co-learning in v1; cross-machine,
+  Thredz-backed publish/recall is a deferred seam (design/watch-me.md §10).
+  Judged quality can opt into the
+  routing scoreboard as shadow `q:*` arms (`--feed-routing`) via the new
+  `RouteObservation.quality` reward field, and into the feedback flywheel
+  via `--emit-feedback`. BEHAVIOR CHANGE: the reserved
+  `twelve.answerFaithfulness`, `twelve.answerRelevance`, and
+  `twelve.hallucinationRate` graders are now real deterministic
+  claim-vs-evidence checks instead of always-fail stubs — eval suites
+  referencing them will change verdicts and (name, dataset)-keyed baselines
+  will shift. [#341]
+
 ### Fixed
 
 - **`crewhaus compile` now emits a `package.json` beside the bundle, so the
@@ -27,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bridge bundle in `<out-dir>/eval/` gets its own manifest too. `compile
   --check` also no longer overwrites a user-authored `package.json` when
   verifying.
+
+[#341]: https://github.com/crewhaus/factory/pull/341
 
 ## [0.4.0] - 2026-07-18
 

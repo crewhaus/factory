@@ -117,6 +117,19 @@ describe("isFeedbackRecord", () => {
     expect(isFeedbackRecord({})).toBe(false);
   });
 
+  it("accepts a bare machine-judgment record with source watchme", () => {
+    // The `watchme report --emit-feedback` bridge writes bare records with
+    // source "watchme" to .crewhaus/feedback/watchme.jsonl — readers must
+    // accept them like any other source.
+    const r = record({
+      source: "watchme",
+      modality: "scale",
+      rating: { scale: { value: 0.7, min: 0, max: 1 } },
+    });
+    expect(isFeedbackRecord(r)).toBe(true);
+    expect(normalizeRating(r)).toBeCloseTo(0.7);
+  });
+
   it("rejects records with a malformed rating so no NaN/coerced score leaks", () => {
     expect(isFeedbackRecord({ ...record(), rating: { stars: "999" } })).toBe(false);
     expect(isFeedbackRecord({ ...record(), rating: { stars: 6 } })).toBe(false);

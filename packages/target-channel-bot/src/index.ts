@@ -1485,6 +1485,15 @@ function renderObservabilityEnvStamp(ir: IrChannelV0): string {
       : escapeJsonString(endpoint);
     lines.push(`process.env["OTEL_EXPORTER_OTLP_ENDPOINT"] ??= ${expr};`);
   }
+  // "Watch me" (watch-me §6.3) — the live-capture gate runtime-core's
+  // attachWatchmeCapture reads, stamped only when the spec opted into full
+  // capture. `watchme:` is a SIBLING of `observability:` but shares this
+  // emitter so `??=` precedence stays in one place per path. Mirror:
+  // `crewhaus run`'s applyRunObservabilityEnv (via resolveWatchmeEnv) and
+  // target-cli's bundle preamble stamp the same env — keep the three in sync.
+  if (ir.watchme?.enabled === true && ir.watchme.capture === "full") {
+    lines.push('process.env["CREWHAUS_WATCHME"] ??= "1";');
+  }
   if (lines.length === 0) return "";
   return `\n// G26 — observability lowered to env stamps (\`??=\` so an operator's own env\n// still wins). cost tracking + the trace ring are default-on; printers,\n// metrics, alerts, incidents, and OTel export stay opt-in.\n${lines.join("\n")}\n`;
 }
