@@ -45,7 +45,8 @@ export {
  *          `sess_<16 hex>.json`. `createdAt` is the file MTIME — the exact
  *          eviction key session-store's `list()` uses — and deletion goes
  *          through `sessionStore.delete()` so the sibling `<id>.jsonl` event
- *          log is unlinked too. The sweep therefore makes session TTL
+ *          log and `<id>.events.jsonl` trace file are unlinked too. The sweep
+ *          therefore makes session TTL
  *          eviction happen on a schedule instead of only as a `list()` side
  *          effect, under the same rules.
  *        - `.crewhaus/audit` (`@crewhaus/audit-log`): one record per UTC
@@ -220,9 +221,9 @@ export class HarnessRecordStore implements RecordStore {
     ];
     this.deletions.push({ id, paths });
     if (!this.dryRun) {
-      // Reuse session-store's own deletion (id validation + unlink of both
-      // the session file AND the sibling event log) instead of re-implementing
-      // its eviction rules.
+      // Reuse session-store's own deletion (id validation + unlink of the
+      // session file, the sibling event log, AND the watchme trace sibling)
+      // instead of re-implementing its eviction rules.
       await createSessionStore({ rootDir: this.sessionsDir }).delete(entry.sessionId);
     }
     return true;

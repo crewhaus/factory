@@ -12,7 +12,9 @@
  *     feedback channel).
  *   - `state.json` — {@link WatchmeState}, tmp+rename atomic.
  *   - `run.lock` — advisory single-writer lock in the dream-engine `run.lock`
- *     mold (O_EXCL create, stale-steal past 30 s).
+ *     mold (O_EXCL create). The holder is heartbeated while held and only a
+ *     lock idle past {@link LOCK_STALE_MS} (a model-phase-scale window) is
+ *     stolen, so a legitimately long report/judge pass is never evicted.
  *
  * Concurrency model is the scoreboard's: appends are atomic small-line
  * `O_APPEND` writes so concurrent harness processes never lose each other's
@@ -28,6 +30,7 @@ import {
   renameSync,
   statSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
@@ -71,13 +74,24 @@ export type WatchmeStore = {
    *  key (dream-engine window math: fixed epoch-anchored flooring). */
   windowKey(nowMs: number, everyMs: number): string;
   /** Try-once advisory `run.lock` acquire: a release fn on success,
-   *  `undefined` on contention. A lock older than 30 s (holder crashed) is
+   *  `undefined` on contention. The holder refreshes the lock mtime while it
+   *  works, so only a lock idle past {@link LOCK_STALE_MS} (holder crashed) is
    *  stolen and re-raced, per the §7.6 policy. */
   acquireLock(): (() => void) | undefined;
 };
 
-/** A lock whose file mtime is older than this is presumed abandoned (§7.6). */
-const LOCK_STALE_MS = 30_000;
+/**
+ * A lock whose file mtime is older than this is presumed abandoned (§7.6).
+ * A watchme report legitimately holds the lock across the whole phase-1 grader
+ * pass plus phase-2 judge model calls — minutes, not seconds — so the window
+ * is model-phase-scale, matching dream-engine's own `staleMs: 15 * 60_000`
+ * (packages/dream-engine/src/index.ts). The holder additionally heartbeats the
+ * lock mtime while it works, so even a run longer than this is never stolen.
+ */
+const LOCK_STALE_MS = 15 * 60_000;
+
+/** How often the holder refreshes the lock mtime (well under LOCK_STALE_MS). */
+const LOCK_HEARTBEAT_MS = 60_000;
 
 const DEFAULT_STATE: WatchmeState = {
   schemaVersion: 1,
@@ -367,7 +381,24 @@ export function openWatchmeStore(rootDir: string, opts: WatchmeStoreOptions = {}
         try {
           const payload = { pid: process.pid, acquiredAt: new Date().toISOString() };
           writeFileSync(lockPath, `${JSON.stringify(payload)}\n`, { flag: "wx", mode: 0o600 });
+          // Heartbeat the mtime so a live-but-slow holder is never presumed
+          // stale (unref'd: never keeps the process alive; fires during the
+          // judge phase's awaits). Best-effort — a torn touch just risks one
+          // early steal, which the stale window already tolerates.
+          const heartbeat = setInterval(() => {
+            try {
+              const now = new Date();
+              utimesSync(lockPath, now, now);
+            } catch {
+              // Lock vanished (released/stolen) — nothing to refresh.
+            }
+          }, LOCK_HEARTBEAT_MS);
+          (heartbeat as { unref?: () => void }).unref?.();
+          let released = false;
           return () => {
+            if (released) return; // Idempotent.
+            released = true;
+            clearInterval(heartbeat);
             try {
               unlinkSync(lockPath);
             } catch {
@@ -385,9 +416,15 @@ export function openWatchmeStore(rootDir: string, opts: WatchmeStoreOptions = {}
         }
         if (Date.now() - mtimeMs > LOCK_STALE_MS) {
           try {
-            unlinkSync(lockPath);
+            // Re-stat immediately before the destructive steal: only unlink if
+            // the lock is STILL the same stale instance we observed. This
+            // narrows the two-waiter race where both observe a dead lock and
+            // one unlinks the other's freshly-acquired lock.
+            if (statSync(lockPath).mtimeMs === mtimeMs) {
+              unlinkSync(lockPath);
+            }
           } catch {
-            // Another waiter stole it first.
+            // Another waiter stole it first, or the holder just released.
           }
           continue; // Re-race the create — another waiter may legitimately win.
         }

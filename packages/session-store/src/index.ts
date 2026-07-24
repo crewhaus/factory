@@ -333,6 +333,12 @@ export function createSessionStore(opts: SessionStoreOptions = {}): SessionStore
         if (err.code !== "ENOENT") throw err;
       });
       await unlink(logPathFor(id)).catch(() => undefined);
+      // Same sibling the TTL sweep unlinks (sweepExpired above): once the
+      // `.json` is gone the sweep's `sess_*.json` walk can never re-match this
+      // id, so an explicit delete() (retention sweep / janitor) is the only
+      // thing that can reclaim the watchme trace sibling — it must, or the file
+      // outlives the user's retention policy forever.
+      await unlink(sessionEventsPath(rootDir, id)).catch(() => undefined);
     },
   };
 }

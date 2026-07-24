@@ -249,15 +249,29 @@ describe("watchme store — run.lock", () => {
     again?.();
   });
 
-  test("a stale lock from a crashed holder is stolen", () => {
+  test("a lock idle past the model-phase stale window is stolen", () => {
     const store = openWatchmeStore(newRoot(), { specName: "helpdesk" });
     const held = store.acquireLock();
     expect(held).toBeDefined();
     const lockPath = join(store.dir, "run.lock");
-    const past = (Date.now() - 60_000) / 1000;
+    // Past the 15-minute stale window (the holder crashed without releasing).
+    const past = (Date.now() - 16 * 60_000) / 1000;
     utimesSync(lockPath, past, past);
     const stolen = store.acquireLock();
     expect(stolen).toBeDefined();
     stolen?.();
+  });
+
+  test("a lock held minutes (a long report) is NOT stolen", () => {
+    const store = openWatchmeStore(newRoot(), { specName: "helpdesk" });
+    const held = store.acquireLock();
+    expect(held).toBeDefined();
+    const lockPath = join(store.dir, "run.lock");
+    // A multi-minute-old lock is within the model-phase window: a concurrent
+    // acquire must lose, not steal (the confirmed double-judge-spend bug).
+    const recent = (Date.now() - 90_000) / 1000;
+    utimesSync(lockPath, recent, recent);
+    expect(store.acquireLock()).toBeUndefined();
+    held?.();
   });
 });

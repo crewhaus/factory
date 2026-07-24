@@ -152,15 +152,20 @@ describe("session-store — update / delete", () => {
     );
   });
 
-  test("delete unlinks both the session file and a sibling event log", async () => {
+  test("delete unlinks the session file, the event log, and the watchme trace sibling", async () => {
     const rootDir = newTempRoot();
     const store = createSessionStore({ rootDir });
     const created = await store.create({ name: "x", target: "cli", model: "m" });
     const log = join(rootDir, `${created.id}.jsonl`);
+    const events = join(rootDir, `${created.id}.events.jsonl`);
     writeFileSync(log, '{"kind":"user_message","payload":{}}\n');
+    writeFileSync(events, '{"kind":"model_request"}\n');
     await store.delete(created.id);
     expect(existsSync(join(rootDir, `${created.id}.json`))).toBe(false);
     expect(existsSync(log)).toBe(false);
+    // Without the .json the sweep can never re-match this id, so delete() is
+    // the only reclaim path for the trace sibling — it must remove it too.
+    expect(existsSync(events)).toBe(false);
   });
 
   test("delete on a missing session is a no-op", async () => {
