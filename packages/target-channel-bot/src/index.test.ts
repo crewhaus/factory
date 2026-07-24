@@ -941,6 +941,84 @@ describe("emitChannelBot — gateway control-UI (Phase 3 §3.4)", () => {
   });
 });
 
+describe("emitChannelBot — gateway status counters (turnCount / heartbeatCount)", () => {
+  const withGateway = (extra: Partial<IrChannelV0> = {}): IrChannelV0 => ({
+    ...MIN_IR,
+    gateway: { port: 19001, ui: false },
+    ...extra,
+  });
+
+  test("no gateway → counters are absent from daemon AND session-router (byte-clean)", () => {
+    const files = fileMap(MIN_IR);
+    const daemon = files.get("daemon.ts") ?? "";
+    const router = files.get("session-router.ts") ?? "";
+    expect(daemon).not.toContain("__turnCount");
+    expect(daemon).not.toContain("__heartbeatCount");
+    expect(daemon).not.toContain("onTurnComplete");
+    expect(router).not.toContain("onTurnComplete");
+  });
+
+  test("gateway → __turnCount is declared, wired into createSessionRouter, and read by /status", () => {
+    const daemon = fileMap(withGateway()).get("daemon.ts") ?? "";
+    expect(daemon).toContain("let __turnCount = 0;");
+    expect(daemon).toContain("let __heartbeatCount = 0;");
+    // The router bumps __turnCount via the onTurnComplete callback.
+    expect(daemon).toContain("onTurnComplete: () => { __turnCount++; }");
+    // /status reports both counters.
+    expect(daemon).toContain("turnCount: __turnCount,");
+    expect(daemon).toContain("heartbeatCount: __heartbeatCount,");
+  });
+
+  test("counters are declared BEFORE createSessionRouter so the callback can close over them", () => {
+    const daemon = fileMap(withGateway()).get("daemon.ts") ?? "";
+    const declIdx = daemon.indexOf("let __turnCount = 0;");
+    const routerIdx = daemon.indexOf("createSessionRouter({");
+    expect(declIdx).toBeGreaterThan(-1);
+    expect(routerIdx).toBeGreaterThan(-1);
+    expect(declIdx).toBeLessThan(routerIdx);
+  });
+
+  test("session-router carries the optional onTurnComplete field and calls it after each completed turn", () => {
+    const router = fileMap(withGateway()).get("session-router.ts") ?? "";
+    expect(router).toContain("onTurnComplete?: () => void;");
+    // Both success paths signal a completed turn: the inbound handle() and the
+    // granted-approval resume (approvals are on by default — askMode "pause").
+    const calls = router.split("config.onTurnComplete?.();").length - 1;
+    expect(calls).toBe(2);
+  });
+
+  test("heartbeat tick bumps __heartbeatCount when the gateway is on", () => {
+    const daemon =
+      fileMap(withGateway({ heartbeat: { everyMs: 60_000, instructions: "tick" } })).get(
+        "daemon.ts",
+      ) ?? "";
+    // The increment sits in the heartbeat interval body, alongside __heartbeatTick.
+    expect(daemon).toContain("__heartbeatTick++;");
+    expect(daemon).toContain("__heartbeatCount++;");
+  });
+
+  test("schedule wake bumps __heartbeatCount when the gateway is on", () => {
+    const daemon =
+      fileMap(
+        withGateway({
+          schedule: { kind: "interval", everyMs: 21_600_000, instructions: "wake" },
+        }),
+      ).get("daemon.ts") ?? "";
+    expect(daemon).toContain("onWake: async () => {");
+    expect(daemon).toContain("__scheduleTick++;");
+    expect(daemon).toContain("__heartbeatCount++;");
+  });
+
+  test("heartbeat/schedule WITHOUT a gateway do not reference the counter (no undefined ref)", () => {
+    const hb =
+      fileMap({ ...MIN_IR, heartbeat: { everyMs: 60_000, instructions: "tick" } }).get(
+        "daemon.ts",
+      ) ?? "";
+    expect(hb).toContain("__heartbeatTick++;");
+    expect(hb).not.toContain("__heartbeatCount");
+  });
+});
+
 describe("emitChannelBot — heartbeat (Phase 3 §3.1)", () => {
   test("omits heartbeat boot when ir.heartbeat is undefined", () => {
     const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
