@@ -70,6 +70,34 @@ describe("harness registry — register/list/deregister", () => {
     });
   });
 
+  test("the share opt-in flag round-trips; a legacy entry without it reads as not-shared", () => {
+    const root = newRoot();
+    const shared = newHarnessDir(root, "shared");
+    const priv = newHarnessDir(root, "private");
+    const legacy = newHarnessDir(root, "legacy");
+    const reg = openHarnessRegistry(join(root, "global"), { now: () => 1 });
+    reg.register({ dir: shared, specName: "shared", target: "cli", share: true });
+    reg.register({ dir: priv, specName: "private", target: "cli", share: false });
+    reg.register({ dir: legacy, specName: "legacy", target: "cli" }); // no share field
+
+    const byDir = new Map(reg.list().map((e) => [e.dir, e]));
+    expect(byDir.get(shared)?.share).toBe(true);
+    expect(byDir.get(priv)?.share).toBe(false);
+    // Backward-compat: an entry registered without `share` stays undefined
+    // (recall treats `share !== true` as not-shared).
+    expect(byDir.get(legacy)?.share).toBeUndefined();
+    expect(byDir.get(legacy)?.share !== true).toBe(true);
+
+    // Persisted to disk, survives reopen.
+    const reopened = new Map(
+      openHarnessRegistry(join(root, "global"))
+        .list()
+        .map((e) => [e.dir, e]),
+    );
+    expect(reopened.get(shared)?.share).toBe(true);
+    expect(reopened.get(priv)?.share).toBe(false);
+  });
+
   test("deregister removes the entry durably", () => {
     const root = newRoot();
     const a = newHarnessDir(root, "a");

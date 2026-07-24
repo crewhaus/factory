@@ -159,13 +159,23 @@ describe("watchme store — Welford compaction", () => {
   test("compact() folds raw digests into one aggregate per key with hand-computed stats", () => {
     const root = newRoot();
     const store = openWatchmeStore(root, { specName: "helpdesk" });
+    // Distinct sessionIds: readObservations/compact dedup by sessionId
+    // (last-wins), so the three folded digests must be distinct sessions.
     store.appendObservation(
-      obsFixture({ turnCount: 3, quality: { ratings: 2, meanRating: 0.5, judged: 0 } }),
+      obsFixture({
+        sessionId: "sess_a000000000000000",
+        turnCount: 3,
+        quality: { ratings: 2, meanRating: 0.5, judged: 0 },
+      }),
     );
     store.appendObservation(
-      obsFixture({ turnCount: 5, quality: { ratings: 0, judged: 2, meanJudge: 0.9 } }),
+      obsFixture({
+        sessionId: "sess_b000000000000000",
+        turnCount: 5,
+        quality: { ratings: 0, judged: 2, meanJudge: 0.9 },
+      }),
     );
-    store.appendObservation(obsFixture({ turnCount: 10 }));
+    store.appendObservation(obsFixture({ sessionId: "sess_c000000000000000", turnCount: 10 }));
     store.compact();
 
     expect(store.readObservations()).toEqual([]);
@@ -191,15 +201,27 @@ describe("watchme store — Welford compaction", () => {
     const root = newRoot();
     const store = openWatchmeStore(root, { specName: "helpdesk" });
     store.appendObservation(
-      obsFixture({ turnCount: 3, quality: { ratings: 2, meanRating: 0.5, judged: 0 } }),
+      obsFixture({
+        sessionId: "sess_a000000000000000",
+        turnCount: 3,
+        quality: { ratings: 2, meanRating: 0.5, judged: 0 },
+      }),
     );
     store.appendObservation(
-      obsFixture({ turnCount: 5, quality: { ratings: 0, judged: 2, meanJudge: 0.9 } }),
+      obsFixture({
+        sessionId: "sess_b000000000000000",
+        turnCount: 5,
+        quality: { ratings: 0, judged: 2, meanJudge: 0.9 },
+      }),
     );
-    store.appendObservation(obsFixture({ turnCount: 10 }));
+    store.appendObservation(obsFixture({ sessionId: "sess_c000000000000000", turnCount: 10 }));
     store.compact();
     store.appendObservation(
-      obsFixture({ turnCount: 2, quality: { ratings: 1, meanRating: 1.0, judged: 0 } }),
+      obsFixture({
+        sessionId: "sess_d000000000000000",
+        turnCount: 2,
+        quality: { ratings: 1, meanRating: 1.0, judged: 0 },
+      }),
     );
     store.compact();
 
@@ -214,10 +236,57 @@ describe("watchme store — Welford compaction", () => {
 
   test("distinct (specName, target) pairs compact to separate keys, sorted", () => {
     const store = openWatchmeStore(newRoot(), { specName: "helpdesk" });
-    store.appendObservation(obsFixture({ specName: "helpdesk", target: "cli" }));
-    store.appendObservation(obsFixture({ specName: "concierge", target: "channel" }));
+    store.appendObservation(
+      obsFixture({ sessionId: "sess_a000000000000000", specName: "helpdesk", target: "cli" }),
+    );
+    store.appendObservation(
+      obsFixture({
+        sessionId: "sess_b000000000000000",
+        specName: "concierge",
+        target: "channel",
+      }),
+    );
     store.compact();
     expect(store.readAggregates().map((a) => a.key)).toEqual(["concierge|channel", "helpdesk|cli"]);
+  });
+
+  test("readObservations dedups by sessionId — a re-digest keeps the LAST line", () => {
+    const root = newRoot();
+    const store = openWatchmeStore(root, { specName: "helpdesk" });
+    // Same session digested twice (e.g. it grew from 2 → 5 turns): the later
+    // line supersedes the earlier one so it is counted ONCE with turnCount 5.
+    store.appendObservation(obsFixture({ turnCount: 2 }));
+    store.appendObservation(obsFixture({ turnCount: 5 }));
+    const read = store.readObservations();
+    expect(read).toHaveLength(1);
+    expect(read[0]?.turnCount).toBe(5);
+  });
+
+  test("compact dedups raw lines by sessionId (last wins) before folding — no double-count", () => {
+    const root = newRoot();
+    const store = openWatchmeStore(root, { specName: "helpdesk" });
+    store.appendObservation(
+      obsFixture({
+        turnCount: 2,
+        models: [],
+        toolStats: [{ name: "fs_read", calls: 1, errors: 0 }],
+      }),
+    );
+    store.appendObservation(
+      obsFixture({
+        turnCount: 5,
+        models: [],
+        toolStats: [{ name: "fs_read", calls: 9, errors: 2 }],
+      }),
+    );
+    store.compact();
+    const aggs = store.readAggregates();
+    expect(aggs).toHaveLength(1);
+    // Distinct sessions folded = 1 (not 2), stats reflect the LATEST digest.
+    expect(aggs[0]?.n).toBe(1);
+    expect(aggs[0]?.meanTurns).toBe(5);
+    expect(aggs[0]?.toolCalls).toBe(9);
+    expect(aggs[0]?.toolErrors).toBe(2);
   });
 });
 

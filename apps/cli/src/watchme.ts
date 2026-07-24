@@ -70,6 +70,10 @@ export type WatchmeHarnessIdentity = {
   readonly specName: string;
   readonly target: string;
   readonly agentId?: string;
+  /** `watchme.share` from the spec — captured into the registry entry so
+   *  `report --all` can gate peer wiki recall on opt-in (design/watch-me.md
+   *  §2). Absent → not-shared. */
+  readonly share?: boolean;
 };
 
 export type WatchmeStartOptions<T> = {

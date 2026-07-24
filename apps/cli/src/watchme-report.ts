@@ -68,7 +68,6 @@ import type {
   WatchmeAggregate,
   WatchmeJudgment,
   WatchmeObservation,
-  WatchmeState,
   WatchmeStore,
 } from "@crewhaus/watchme-store";
 import type { AdviceFinding } from "./advise-rules";
@@ -99,6 +98,31 @@ export const WATCHME_JUDGE_WINDOW_MS = 6 * 60 * 60 * 1000;
 /** Raw observation lines at/above which the store is compacted after a report
  *  (the scoreboard-style bounded-file discipline). */
 export const WATCHME_COMPACT_THRESHOLD = 256;
+
+/** Cap on the durable per-session `observed` cursor and the `fedRoutingKeys`
+ *  list held in `state.json` (which `compact()` never rewrites). Keeps the
+ *  state document small on long-lived harnesses; the cursor evicts its oldest
+ *  entries by `mtimeMs`, the fed-key list evicts oldest-first. A session whose
+ *  cursor entry was evicted falls back to the scalar watermark pre-filter. */
+export const WATCHME_STATE_CURSOR_CAP = 5000;
+
+/** Keep only the most-recently-touched `observed` cursor entries (by mtimeMs). */
+function boundObserved(
+  observed: Record<string, { mtimeMs: number; turnCount: number }>,
+): Record<string, { mtimeMs: number; turnCount: number }> {
+  const entries = Object.entries(observed);
+  if (entries.length <= WATCHME_STATE_CURSOR_CAP) return observed;
+  return Object.fromEntries(
+    entries.sort((a, b) => b[1].mtimeMs - a[1].mtimeMs).slice(0, WATCHME_STATE_CURSOR_CAP),
+  );
+}
+
+/** Keep only the most-recent fed-routing keys (oldest-first eviction). */
+function boundFedKeys(keys: ReadonlyArray<string>): string[] {
+  return keys.length <= WATCHME_STATE_CURSOR_CAP
+    ? [...keys]
+    : keys.slice(keys.length - WATCHME_STATE_CURSOR_CAP);
+}
 
 /** The five report.md section headings, in render order — pinned by tests. */
 export const REPORT_SECTION_TITLES: ReadonlyArray<string> = [
@@ -1314,8 +1338,6 @@ function intentKeysBySession(
 // the report driver
 // ---------------------------------------------------------------------------
 
-type FedRoutingState = WatchmeState & { readonly fedRouting?: Readonly<Record<string, 1>> };
-
 function readFeedbackRecords(
   fs: WatchmeReportFs,
   crewhausDir: string,
@@ -1371,9 +1393,12 @@ async function runLocked(
   const state = deps.store.state();
   const priorRaw = deps.store.readObservations();
   const aggregates = deps.store.readAggregates();
-  const observedIds = new Set(priorRaw.map((o) => o.sessionId));
+  // The durable per-session cursor (survives compaction) is the authority for
+  // the skip/growth decision; the scalar watermark is only a fast pre-filter
+  // for sessions the cursor has never tracked.
+  const observedCursor = state.observed ?? {};
 
-  // -- step 1: enumerate sessions past the watermark --
+  // -- step 1: enumerate sessions past the durable cursor --
   const candidates: Array<{ sessionId: string; path: string; mtimeMs: number }> = [];
   const dirEntries = deps.fs.listDir(sessionsDir);
   for (const file of [...dirEntries].sort()) {
@@ -1384,8 +1409,20 @@ async function runLocked(
     const path = join(sessionsDir, file);
     const mtimeMs = deps.fs.statMtimeMs(path) ?? 0;
     if (opts.sessionId === undefined) {
-      if (mtimeMs <= state.watermark.lastMtimeMs) continue;
-      if (observedIds.has(sessionId)) continue;
+      const cursor = observedCursor[sessionId];
+      if (cursor !== undefined) {
+        // Seen before: skip only while UNCHANGED. A grown session (its file
+        // rewritten/appended, so mtime advanced past the digested mtime) is
+        // re-analyzed — the last-writer-wins observation log makes the
+        // re-digest idempotent (n still counts distinct sessions).
+        if (mtimeMs <= cursor.mtimeMs) continue;
+      } else if (mtimeMs <= state.watermark.lastMtimeMs) {
+        // Never cursor-tracked (a pre-cursor digest, or an entry the cursor
+        // cap evicted): the scalar watermark stands in as a cheap pre-filter.
+        // This is only consulted when the cursor has no entry, so a grown,
+        // cursor-tracked session is never permanently excluded by it.
+        continue;
+      }
     }
     candidates.push({ sessionId, path, mtimeMs });
   }
@@ -1438,7 +1475,11 @@ async function runLocked(
   const turnsBySession = new Map(analyses.map((a) => [a.sessionId, a.turns]));
   const keysBySession = intentKeysBySession(digest, turnsBySession, deps.redact);
 
-  // -- step 8: append redacted observations, advance watermark, compact --
+  // -- step 8: append redacted observations (last-writer-wins) --
+  // The durable cursor + scalar watermark are committed AFTER phase 2, so a
+  // transient judge failure can leave this window's sessions eligible for
+  // re-analysis + re-judging (the observation append is idempotent under the
+  // store's last-writer-wins dedup).
   const newObservations: WatchmeObservation[] = [];
   for (const a of analyses) {
     const observation: WatchmeObservation = {
@@ -1446,23 +1487,13 @@ async function runLocked(
       intentKeys: keysBySession.get(a.sessionId) ?? [],
     };
     newObservations.push(observation);
-    if (!observedIds.has(a.sessionId)) deps.store.appendObservation(observation);
+    deps.store.appendObservation(observation);
   }
-  if (opts.sessionId === undefined && analyses.length > 0) {
-    const maxMtime = Math.max(state.watermark.lastMtimeMs, ...analyses.map((a) => a.mtimeMs));
-    const last = analyses[analyses.length - 1] as SessionAnalysis;
-    deps.store.setState({
-      watermark: { lastMtimeMs: maxMtime, lastSessionId: last.sessionId },
-      lastReportAt: nowMs,
-    });
-  } else {
-    deps.store.setState({ lastReportAt: nowMs });
-  }
-  if (deps.store.readObservations().length >= WATCHME_COMPACT_THRESHOLD) deps.store.compact();
 
   // -- phase 2: the ONE budgeted judge pass --
   const windowMs = opts.windowMs ?? WATCHME_JUDGE_WINDOW_MS;
   const windowKey = deps.store.windowKey(nowMs, windowMs);
+  const judgeSessionsDir = join(opts.crewhausDir, "watchme", "judge-sessions");
   let judgeReport: WatchmeReportJson["judge"];
   if (opts.judge !== undefined && opts.judge.budgetUsd > 0 && opts.noModel !== true) {
     judgeReport = await runJudgePhase({
@@ -1471,7 +1502,7 @@ async function runLocked(
       analyses,
       feedback,
       windowKey,
-      sessionsDir,
+      judgeSessionsDir,
     });
   } else if (opts.judge !== undefined) {
     judgeReport = {
@@ -1485,6 +1516,31 @@ async function runLocked(
       spentUsd: 0,
     };
   }
+
+  // -- commit the durable cursor + scalar watermark (deferred until here) --
+  // A transient judge failure (`model_failed`) does NOT advance the cursor for
+  // this window's sessions: they stay eligible for re-enumeration so the next
+  // report re-analyzes AND re-judges them. A successful, refused, or
+  // deterministic-only window commits the cursor normally.
+  const judgeFailed = judgeReport?.outcome === "failed";
+  if (opts.sessionId === undefined && analyses.length > 0 && !judgeFailed) {
+    const maxMtime = Math.max(state.watermark.lastMtimeMs, ...analyses.map((a) => a.mtimeMs));
+    const last = analyses[analyses.length - 1] as SessionAnalysis;
+    const observed = boundObserved({
+      ...observedCursor,
+      ...Object.fromEntries(
+        analyses.map((a) => [a.sessionId, { mtimeMs: a.mtimeMs, turnCount: a.turns.length }]),
+      ),
+    });
+    deps.store.setState({
+      watermark: { lastMtimeMs: maxMtime, lastSessionId: last.sessionId },
+      observed,
+      lastReportAt: nowMs,
+    });
+  } else {
+    deps.store.setState({ lastReportAt: nowMs });
+  }
+  if (deps.store.readObservations().length >= WATCHME_COMPACT_THRESHOLD) deps.store.compact();
 
   const judgments = deps.store.readJudgments();
 
@@ -1532,8 +1588,14 @@ async function runLocked(
       turnModelByKey.set(`${a.sessionId}#${turnNumber}`, model);
     }
   }
+  // Per-turn quality → model attribution goes through the ordered-safe
+  // `turnModelByKey` (exact-confidence sessions only), symmetric for judgments
+  // and ratings: an ordered-confidence turn contributes NO per-turn model to
+  // the counterfactual evidence join, so a cheaper-model claim is never
+  // credited to a model the ordered attribution cannot pin per turn.
   for (const j of judgments) {
-    perTurnQuality.push({ model: j.model, score: clamp01(j.score) });
+    const model = turnModelByKey.get(`${j.sessionId}#${j.turnNumber}`);
+    if (model !== undefined) perTurnQuality.push({ model, score: clamp01(j.score) });
   }
   for (const fb of mergedFeedback) {
     const score = normalizeRating(fb);
@@ -1552,7 +1614,14 @@ async function runLocked(
   // -- §8: opt-in shadow routing feed --
   let feedRouting: WatchmeReportJson["feedRouting"];
   if (opts.feedRouting === true) {
-    feedRouting = feedRoutingArms({ analyses, judgments, mergedFeedback, deps, scoreboard });
+    feedRouting = feedRoutingArms({
+      analyses,
+      judgments,
+      mergedFeedback,
+      deps,
+      scoreboard,
+      sessionsDir,
+    });
   }
 
   // -- §9: opt-in machine→human feedback bridge --
@@ -1685,7 +1754,9 @@ async function runJudgePhase(input: {
   analyses: ReadonlyArray<SessionAnalysis>;
   feedback: ReadonlyArray<FeedbackRecord>;
   windowKey: string;
-  sessionsDir: string;
+  /** The judge phase's ISOLATED session root (never enumerated as harness
+   *  traffic) — the driver scans its JSONL for evidence, never model claims. */
+  judgeSessionsDir: string;
 }): Promise<NonNullable<WatchmeReportJson["judge"]>> {
   const { opts, deps, windowKey } = input;
   const judge = opts.judge as NonNullable<WatchmeReportOptions["judge"]>;
@@ -1708,17 +1779,25 @@ async function runJudgePhase(input: {
     return { ...base, outcome: "skipped", reason: "no judge phase wired" };
   }
 
-  // Sample: ungraded turns of the window, deterministic order.
+  // Sample: ungraded turns of the window, deterministic order. Skip both
+  // human-rated turns AND already-judged turns — the latter makes judging
+  // idempotent per (sessionId, turnNumber) across windows/re-runs, so a
+  // re-run never appends a duplicate judgment or double-spends the budget.
   const ratedKeys = new Set(
     mergeFeedback(input.feedback)
       .filter((fb) => normalizeRating(fb) !== undefined)
       .map((fb) => `${fb.sessionId}#${fb.turnNumber}`),
   );
+  const judgedKeys = new Set(
+    deps.store.readJudgments().map((j) => `${j.sessionId}#${j.turnNumber}`),
+  );
   const candidates: Array<{ turn: SessionTurn; model: string }> = [];
   for (const a of input.analyses) {
     for (const turn of a.turns) {
       if (turn.input.trim() === "" || turn.output.trim() === "") continue;
-      if (ratedKeys.has(`${turn.sessionId}#${turn.turnNumber}`)) continue;
+      const key = `${turn.sessionId}#${turn.turnNumber}`;
+      if (ratedKeys.has(key)) continue;
+      if (judgedKeys.has(key)) continue;
       candidates.push({ turn, model: modelForTurn(a, turn.turnNumber) });
     }
   }
@@ -1773,7 +1852,7 @@ async function runJudgePhase(input: {
   let evidence: NonNullable<NonNullable<WatchmeReportJson["judge"]>["evidence"]> | undefined;
   const judgeSessionId = deps.judgePhase.sessionId?.();
   if (judgeSessionId !== undefined) {
-    const text = deps.fs.readFile(join(input.sessionsDir, `${judgeSessionId}.jsonl`));
+    const text = deps.fs.readFile(join(input.judgeSessionsDir, `${judgeSessionId}.jsonl`));
     if (text !== undefined) {
       const events = parseSessionLog(text);
       const modelCalls = events.filter((e) => e.kind === "model_meta").length;
@@ -1799,9 +1878,12 @@ async function runJudgePhase(input: {
 }
 
 /** The turn's producing model (spec string): exact per-turn attribution when
- *  the sibling exists, else the durable per-turn `model_route` line, else the
- *  session's dominant model — never a per-turn claim at ordered confidence
- *  beyond what a turn-numbered durable line states. */
+ *  the sibling exists, else the durable per-turn `model_route` line (both are
+ *  turn-numbered, so legitimate per-turn claims). At ordered confidence with
+ *  no turn-numbered durable line the model is left UNATTRIBUTED (`"unknown"`)
+ *  rather than guessing the session's dominant model — the ordered⇒session-
+ *  level-only rule forbids inventing a per-turn model claim, which would
+ *  otherwise credit the wrong model in judgments and counterfactuals. */
 function modelForTurn(analysis: SessionAnalysis, turnNumber: number): string {
   const exact = analysis.attribution.perTurnModel?.get(turnNumber);
   if (exact !== undefined) return exact;
@@ -1812,8 +1894,7 @@ function modelForTurn(analysis: SessionAnalysis, turnNumber: number): string {
       return analysis.attribution.wireToSpec.get(p["model"]) ?? p["model"];
     }
   }
-  const dominant = [...analysis.attribution.models].sort((a, b) => b.turns - a.turns)[0];
-  return dominant !== undefined ? (dominant.spec ?? dominant.wire) : "unknown";
+  return "unknown";
 }
 
 // ---------------------------------------------------------------------------
@@ -1826,11 +1907,17 @@ function feedRoutingArms(input: {
   mergedFeedback: ReadonlyArray<FeedbackRecord>;
   deps: WatchmeReportDeps;
   scoreboard: Scoreboard;
+  /** The harness `sessions` directory — durable `model_route` recovery for
+   *  scored sessions that have already fallen past the analysis watermark. */
+  sessionsDir: string;
 }): NonNullable<WatchmeReportJson["feedRouting"]> {
-  const { deps } = input;
-  const state = deps.store.state() as FedRoutingState;
-  const fed: Record<string, 1> = { ...(state.fedRouting ?? {}) };
+  const { deps, sessionsDir } = input;
+  // Durable dedup set: `sessionId#turnNumber` keys already recorded as arms.
+  const fed = new Set<string>(deps.store.state().fedRoutingKeys ?? []);
 
+  // Delayed quality signal, sourced DURABLY (judgments + merged feedback), so
+  // a `--feed-routing` pass after a plain report still sees the scores of
+  // sessions already past the watermark.
   const quality: TurnQuality[] = [];
   for (const j of input.judgments) {
     quality.push({ sessionId: j.sessionId, turnNumber: j.turnNumber, score: clamp01(j.score) });
@@ -1843,42 +1930,69 @@ function feedRoutingArms(input: {
   }
   const scoredKeys = new Set(quality.map((q) => `${q.sessionId}#${q.turnNumber}`));
 
-  const decisions: RouteDecision[] = [];
-  let deduped = 0;
-  for (const a of input.analyses) {
-    const failed = a.events.some((e) => e.kind === "run_failed");
-    for (const ev of a.events) {
+  // Route decisions per (sessionId#turnNumber). Current-window analyses carry
+  // full per-turn attribution (latency/cost); scored sessions NOT re-analyzed
+  // this window are recovered from their durable session log.
+  const routeByKey = new Map<string, RouteDecision>();
+  const analyzed = new Set(input.analyses.map((a) => a.sessionId));
+  const addRoutes = (
+    sessionId: string,
+    events: ReadonlyArray<LoggedEvent>,
+    attribution?: ModelAttribution,
+  ): void => {
+    const failed = events.some((e) => e.kind === "run_failed");
+    for (const ev of events) {
       if (ev.kind !== "model_route") continue;
       const p = payloadOf(ev);
       if (typeof p["turnNumber"] !== "number") continue;
       if (typeof p["routeKey"] !== "string" || typeof p["model"] !== "string") continue;
       const turnNumber = p["turnNumber"];
-      const key = `${a.sessionId}#${turnNumber}`;
-      if (!scoredKeys.has(key)) continue;
-      if (fed[key] === 1) {
-        deduped += 1;
-        continue;
-      }
-      const latencyMs = a.attribution.perTurnLatencyMs?.get(turnNumber);
-      const costMicros = a.attribution.perTurnCostUsdMicros?.get(turnNumber);
-      decisions.push({
-        sessionId: a.sessionId,
+      const key = `${sessionId}#${turnNumber}`;
+      if (routeByKey.has(key)) continue;
+      const latencyMs = attribution?.perTurnLatencyMs?.get(turnNumber);
+      const costMicros = attribution?.perTurnCostUsdMicros?.get(turnNumber);
+      routeByKey.set(key, {
+        sessionId,
         turnNumber,
         routeKey: p["routeKey"],
-        model: a.attribution.wireToSpec.get(p["model"]) ?? p["model"],
+        model: attribution?.wireToSpec.get(p["model"]) ?? p["model"],
         success: !failed,
         ...(latencyMs !== undefined ? { latencyMs } : {}),
         ...(costMicros !== undefined ? { costUsd: costMicros / 1_000_000 } : {}),
       });
-      fed[key] = 1;
     }
+  };
+  for (const a of input.analyses) addRoutes(a.sessionId, a.events, a.attribution);
+  const durableSessions = new Set<string>();
+  for (const key of scoredKeys) {
+    const sid = key.slice(0, key.indexOf("#"));
+    if (!analyzed.has(sid)) durableSessions.add(sid);
+  }
+  for (const sid of durableSessions) {
+    const text = deps.fs.readFile(join(sessionsDir, `${sid}.jsonl`));
+    if (text === undefined) continue;
+    addRoutes(sid, parseSessionLog(text) as ReadonlyArray<LoggedEvent>);
+  }
+
+  // Record shadow arms for scored, unfed keys that carry a route decision.
+  const decisions: RouteDecision[] = [];
+  let deduped = 0;
+  for (const key of [...scoredKeys].sort()) {
+    const decision = routeByKey.get(key);
+    if (decision === undefined) continue; // scored turn with no route line
+    if (fed.has(key)) {
+      deduped += 1;
+      continue;
+    }
+    decisions.push(decision);
+    fed.add(key);
   }
 
   const rows = deps.joinQualityToArms(decisions, quality);
   for (const row of rows) {
     input.scoreboard.record(row.routeKey, row.model, computeReward(row.obs), row.obs);
   }
-  deps.store.setState({ fedRouting: fed } as Partial<WatchmeState>);
+  deps.store.setState({ fedRoutingKeys: boundFedKeys([...fed]) });
   return { recorded: rows.length, deduped };
 }
 

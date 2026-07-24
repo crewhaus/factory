@@ -116,8 +116,31 @@ export type WatchmeState = {
   readonly schemaVersion: 1;
   readonly watching: boolean;
   readonly startedAt?: number;
-  /** Analysis high-water mark over the sessions directory. */
+  /** Analysis high-water mark over the sessions directory — a cheap scalar
+   *  pre-filter only. The authority for the skip/growth decision is the
+   *  per-session `observed` cursor below; the watermark is consulted solely
+   *  for sessions the cursor has never tracked (pre-cursor digests or entries
+   *  the cursor cap evicted), so a grown session is never permanently skipped. */
   readonly watermark: { readonly lastMtimeMs: number; readonly lastSessionId?: string };
+  /**
+   * Durable per-session analysis cursor: the last-digested `mtimeMs` +
+   * `turnCount` for each sessionId. It lives in `state.json`, which
+   * `compact()` never rewrites, so it survives compaction — unlike the raw
+   * observation lines, which fold away into `{agg:1}` aggregates. Enumeration
+   * skips a session only while its on-disk state is unchanged relative to this
+   * cursor; a session whose file grew (mtime advanced ⇒ turnCount may have
+   * grown) is re-analyzed, and the last-writer-wins observation log makes the
+   * re-digest idempotent. Bounded to the most-recent entries by `mtimeMs`
+   * (oldest evicted, cap in watchme-report) so `state.json` stays small.
+   */
+  readonly observed?: Readonly<
+    Record<string, { readonly mtimeMs: number; readonly turnCount: number }>
+  >;
+  /** Durable `sessionId#turnNumber` keys already recorded as shadow routing
+   *  arms by `report --feed-routing`, so re-runs never double-record the same
+   *  arm even after the sessions fall past the analysis watermark. Bounded
+   *  (oldest-first eviction, cap in watchme-report). */
+  readonly fedRoutingKeys?: readonly string[];
   /** Consumed report windows by `windowKey` → outcome. `ok` and
    *  `model_refused_unpriced` consume the window; a transient `model_failed`
    *  is recorded but the next tick retries (dream-engine semantics). */
@@ -132,6 +155,15 @@ export type HarnessEntry = {
   readonly specName: string;
   readonly target: string;
   readonly agentId?: string;
+  /**
+   * Whether this harness opted into cross-harness co-learning (`watchme.share`
+   * from the spec), captured at registration time. `report --all` recalls a
+   * peer's local wiki articles ONLY when this is `true`. Absent on legacy
+   * entries → treated as not-shared (backward-compatible default). This is an
+   * intent flag on the same-machine registry, NOT a Thredz visibility signal
+   * (cross-machine sharing is a deferred seam — design/watch-me.md §10).
+   */
+  readonly share?: boolean;
   readonly registeredAt: number;
   readonly lastSeen: number;
 };

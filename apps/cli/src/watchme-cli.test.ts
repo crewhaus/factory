@@ -250,6 +250,141 @@ describe("crewhaus watchme (design/watch-me.md §11)", () => {
     expect(existsSync(join(harness, ".crewhaus", "wiki"))).toBe(false);
   }, 120_000);
 
+  test("budgeted judge sessions are isolated from .crewhaus/sessions and never re-ingested (design/watch-me.md §7)", async () => {
+    const harness = newTempDir("judge-isolation");
+    const home = newTempDir("home");
+    const globalRoot = newTempDir("root");
+    writeHarness(harness);
+    // Add a PRICED, budgeted judge. Offline its model call fails fast, but the
+    // judge SESSION must be created in the isolated judge-sessions root — never
+    // in .crewhaus/sessions, where the next report would re-ingest it as
+    // harness traffic (polluting model tables + leaking judged-turn text).
+    writeFileSync(
+      join(harness, "crewhaus.yaml"),
+      [
+        "name: watched",
+        "target: cli",
+        "watchme:",
+        "  enabled: true",
+        "  judge:",
+        "    model: claude-haiku-4-5",
+        "    sample_rate: 1",
+        "    budget_usd: 0.01",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: |",
+        "    You are a helpful assistant.",
+        "",
+      ].join("\n"),
+    );
+    const sessionsDir = join(harness, ".crewhaus", "sessions");
+    const sessionLogs = (): string[] =>
+      readdirSync(sessionsDir)
+        .filter((f) => /^sess_[0-9a-f]{16}\.jsonl$/.test(f))
+        .sort();
+    expect(sessionLogs()).toEqual([`${SESSION_ID}.jsonl`]);
+
+    const first = await runCli(
+      ["watchme", "report", "--root", globalRoot, "--json"],
+      harness,
+      home,
+    );
+    expect(first.exitCode).toBe(0);
+    const firstReport = JSON.parse(first.stdout);
+    // The judge was ENGAGED (priced model attempted, then failed offline), so a
+    // judge session was really created — not skipped/refused into a no-op.
+    expect(firstReport.judge?.model).toBe("claude-haiku-4-5");
+    expect(firstReport.judge?.outcome).toBe("failed");
+
+    // .crewhaus/sessions STILL holds only the original session — no judge
+    // sess_*.jsonl leaked in (the isolated root is the whole point).
+    expect(sessionLogs()).toEqual([`${SESSION_ID}.jsonl`]);
+    const judgeDir = join(harness, ".crewhaus", "watchme", "judge-sessions");
+    if (existsSync(judgeDir)) {
+      for (const f of readdirSync(judgeDir).filter((n) => n.endsWith(".jsonl"))) {
+        expect(sessionLogs()).not.toContain(f);
+      }
+    }
+
+    // A second report ingests ZERO judge sessions: the observation store
+    // references only the original harness session.
+    const second = await runCli(
+      ["watchme", "report", "--root", globalRoot, "--json"],
+      harness,
+      home,
+    );
+    expect(second.exitCode).toBe(0);
+    const obsIds = new Set(
+      readFileSync(join(harness, ".crewhaus", "watchme", "observations.jsonl"), "utf8")
+        .split("\n")
+        .filter((l) => l.trim() !== "")
+        .map((l) => (JSON.parse(l) as { sessionId: string }).sessionId),
+    );
+    expect([...obsIds]).toEqual([SESSION_ID]);
+  }, 120_000);
+
+  test("report --all recalls co-learning findings ONLY from peers that opted into sharing", async () => {
+    const alpha = newTempDir("alpha");
+    const beta = newTempDir("beta");
+    const consumer = newTempDir("consumer");
+    const home = newTempDir("home");
+    const globalRoot = newTempDir("root");
+    const writeSharingHarness = (dir: string, name: string, share: boolean): void => {
+      writeHarness(dir); // seeds crewhaus.yaml + one session
+      writeFileSync(
+        join(dir, "crewhaus.yaml"),
+        [
+          `name: ${name}`,
+          "target: cli",
+          "watchme:",
+          "  enabled: true",
+          `  share: ${share}`,
+          "agent:",
+          "  model: claude-sonnet-4-6",
+          "  instructions: |",
+          "    You are a helpful assistant.",
+          "",
+        ].join("\n"),
+      );
+    };
+    writeSharingHarness(alpha, "alpha", true);
+    writeSharingHarness(beta, "beta", false);
+
+    // start registers each harness (capturing watchme.share) + backfills
+    // observations; publish distills them into the LOCAL wiki.
+    expect((await runCli(["watchme", "start", "--root", globalRoot], alpha, home)).exitCode).toBe(
+      0,
+    );
+    const pubA = await runCli(["watchme", "publish"], alpha, home);
+    expect(pubA.stdout).toContain("published watchme-intents");
+    expect((await runCli(["watchme", "start", "--root", globalRoot], beta, home)).exitCode).toBe(0);
+    const pubB = await runCli(["watchme", "publish"], beta, home);
+    expect(pubB.stdout).toContain("published watchme-intents");
+
+    // Both registered; the share flag persisted per harness.
+    const registry = JSON.parse(readFileSync(join(globalRoot, "harnesses.json"), "utf-8")) as {
+      harnesses: Array<{ specName: string; share?: boolean }>;
+    };
+    const byName = new Map(registry.harnesses.map((h) => [h.specName, h]));
+    expect(byName.get("alpha")?.share).toBe(true);
+    expect(byName.get("beta")?.share).toBe(false);
+
+    // Cross-harness roll-up + recall from a third dir: only the opted-in peer's
+    // articles come back; the share:false peer is NOT recalled.
+    const all = await runCli(
+      ["watchme", "report", "--all", "--root", globalRoot, "--json"],
+      consumer,
+      home,
+    );
+    expect(all.exitCode).toBe(0);
+    const report = JSON.parse(all.stdout) as {
+      peers: Array<{ agentName: string }>;
+    };
+    expect(report.peers.length).toBeGreaterThan(0);
+    expect(report.peers.every((p) => p.agentName === "alpha")).toBe(true);
+    expect(report.peers.some((p) => p.agentName === "beta")).toBe(false);
+  }, 120_000);
+
   test("run with a watchme-enabled spec writes the .events.jsonl sibling", async () => {
     const harness = newTempDir("run");
     const home = newTempDir("home");

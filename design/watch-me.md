@@ -18,7 +18,7 @@ Three watching scopes, deliberately nested:
 
 - **(a) One harness.** Capture plus a per-harness report, entirely inside the harness's own `.crewhaus/` state dir (standalone-harness convention). This is the default and requires nothing global.
 - **(b) One user across agents.** `watchme.scope: user` (or `watchme start` on each harness) registers the harness in a global registry at `~/.crewhaus/watchme/harnesses.json`; `watchme report --all` and `watchme intents --all` roll up across every registered harness, harness-tagged.
-- **(c) Agents co-learning.** `watchme publish` (auto-invoked at report time when `watchme.share: true`) distills redacted findings into wiki articles under `watchme/*` slugs; when Thredz is configured with shared visibility, peers' articles are RECALLED by `report --all` — agentName-labeled, confidence-weighted, and classified under the `memory` TrustOrigin like every other recalled body.
+- **(c) Agents co-learning (LOCAL in v1).** `watchme publish` (auto-invoked at report time when `watchme.share: true`) distills redacted findings into the harness's LOCAL per-spec wiki (`.crewhaus/wiki`) under `watchme/*` slugs; `report --all` RECALLS those articles from peers that opted into sharing (`watchme.share: true` captured in the same-machine harness registry) by reading their local `.crewhaus/wiki` — agentName-labeled, confidence-weighted, and classified under the `memory` TrustOrigin like every other recalled body. Publish and recall are same-machine, filesystem-backed in v1; cross-machine, Thredz-backed publish/recall is a deferred seam (§10). There is no Thredz wire in this path yet.
 
 Analysis works **retroactively** on any harness with history: the default-on advisor mirrors are enough for `capture: "mirrors"`-grade reports, so `watchme start` runs an immediate deterministic backfill digest and delivers value on day one. The `.events.jsonl` sibling upgrades attribution from ordered to exact (§6) from that point forward.
 
@@ -96,7 +96,7 @@ Lowering: `IrWatchme` on the cli/channel/managed IR nodes beside `observability`
 - **`watchme.enabled` / `watchme.capture`** — the observer must not be tuned by the loop it observes. Letting the optimization loop toggle its own observation channel is self-referential optimization (an optimizer that learns to blind its own critic), and capture fidelity is additionally a consent/data-plane posture the human set deliberately.
 - **`watchme.judge.model`** — the model roster is never auto-patched. That is a repo-wide invariant (the same reason counterfactual analysis hands off to `model right-size` instead of editing the roster).
 - **`watchme.judge.sample_rate` / `watchme.judge.budget_usd`** — spend-class knobs, human-only. `sample_rate` multiplies judge calls, so an "optimization" that raises it directly raises the bill; two of three design judges independently rejected whitelisting even `sample_rate`.
-- **`watchme.scope` / `watchme.share`** — privacy/trust-boundary knobs. `share` crosses the harness boundary to Thredz; `scope` enrolls the harness in a global registry. Neither is a quality lever the optimizer has any business moving.
+- **`watchme.scope` / `watchme.share`** — privacy/trust-boundary knobs. `share` opts the harness into cross-harness co-learning (in v1: its findings become recallable from the LOCAL wiki by other same-machine registered harnesses; cross-machine Thredz sharing is a deferred seam, §10); `scope` enrolls the harness in the global registry. Neither is a quality lever the optimizer has any business moving.
 
 ### The paired advise rule (text-only, consistent with the exclusions)
 
@@ -192,6 +192,7 @@ Each deferral is a named seam — each one line to flip later — not an open qu
 6. **Eval-verified counterfactuals**: report rows carry `verify.argv`; a future `watchme verify` drives FlywheelHooks.evalRun.
 7. **G13 SSE/live dashboards**: `.events.jsonl` is poll-tailable with advanceSessionTail's cursor; no push channel built.
 8. **Thredz-shared scoreboard arms**: arms.jsonl's free-string routeKeys + the wiki articles carry model-fit findings in v1.
+8a. **Cross-machine Thredz-backed co-learning**: v1 `watchme publish`/`report --all` are SAME-MACHINE only — publish writes the harness's local `.crewhaus/wiki`, and recall reads opted-in peers' local wiki via the same-machine harness registry (`~/.crewhaus/watchme`). Making publish push to (and recall pull from) a Thredz-hosted shared wiki — honoring `thredz.visibility` for real cross-machine sharing — is the deferred flip; the `watchme.share` intent flag + the `memory`-TrustOrigin recall path are already in place for it.
 9. **`observability.trace.persist` aliasing**: if a future G26 revision wants to own trace persistence, `resolveWatchmeEnv` is the single junction to reconcile at (documented).
 10. **Docs-repo module brief (NNN-watchme-store.md) + demos walkthrough recipe**: separate follow-up PRs per the routing-store precedent — named in the factory PR body.
 

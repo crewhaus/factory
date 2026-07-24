@@ -298,8 +298,20 @@ export function openWatchmeStore(rootDir: string, opts: WatchmeStoreOptions = {}
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
   };
 
-  const readObservations = (): WatchmeObservation[] =>
-    readJsonl(observationsPath).filter(isObservation) as unknown as WatchmeObservation[];
+  const readObservations = (): WatchmeObservation[] => {
+    // Last-writer-wins per sessionId: when a session is re-analyzed after it
+    // grew, its later digest supersedes the earlier line, so a re-appended or
+    // grown session is counted ONCE with its latest turnCount/sums (no
+    // double-count). `n` therefore reflects DISTINCT sessions. The Map keeps
+    // each session at its first-seen position while carrying the last value,
+    // so append order over distinct sessions is preserved.
+    const all = readJsonl(observationsPath).filter(
+      isObservation,
+    ) as unknown as WatchmeObservation[];
+    const byId = new Map<string, WatchmeObservation>();
+    for (const obs of all) byId.set(obs.sessionId, obs);
+    return [...byId.values()];
+  };
 
   const readAggregates = (): WatchmeAggregate[] =>
     readJsonl(observationsPath).filter(isAggregate) as unknown as WatchmeAggregate[];
@@ -350,6 +362,10 @@ export function openWatchmeStore(rootDir: string, opts: WatchmeStoreOptions = {}
       };
       // Prior aggregates first, then raw deltas — parallel-combine is
       // order-insensitive, but this mirrors on-disk order for readability.
+      // `readObservations()` already dedups raw lines by sessionId (last
+      // wins), so a grown session's latest digest supersedes its earlier one
+      // BEFORE folding: `n` counts distinct sessions and the summed counters
+      // reflect the per-latest-digest values, never a double-count.
       for (const agg of readAggregates()) foldAggregate(foldFor(agg.key), agg);
       for (const obs of readObservations()) {
         foldObservation(foldFor(`${obs.specName}|${obs.target}`), obs);

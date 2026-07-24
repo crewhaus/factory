@@ -18,8 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   analysis (proposal-only — verify with `crewhaus model right-size`);
   `watchme intents` mines recurring intents across one harness or every
   registered one; `watchme synthesize` drafts a validated mimic agent-loop
-  spec (never auto-applied); `watchme publish` shares redacted findings via
-  Thredz for cross-agent co-learning. Judged quality can opt into the
+  spec (never auto-applied); `watchme publish` distills redacted findings
+  into the harness's local per-spec wiki, and `watchme report --all` recalls
+  those findings from opted-in (`watchme.share: true`) peers via the
+  same-machine harness registry — LOCAL co-learning in v1; cross-machine,
+  Thredz-backed publish/recall is a deferred seam (design/watch-me.md §10).
+  Judged quality can opt into the
   routing scoreboard as shadow `q:*` arms (`--feed-routing`) via the new
   `RouteObservation.quality` reward field, and into the feedback flywheel
   via `--emit-feedback`. BEHAVIOR CHANGE: the reserved

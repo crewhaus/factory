@@ -14,7 +14,14 @@
  * real routing-store scoreboard, and the real defaultGraderRegistry.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CapabilityTable, PricingTable } from "@crewhaus/cost-tracker";
@@ -251,6 +258,57 @@ function seedOrderedSession(harness: Harness): string {
   ];
   writeFileSync(join(harness.sessionsDir, `${id}.jsonl`), jsonl(events));
   return id;
+}
+
+/** Seed one 2-turn "ordered" session with TWO models (claude-small then
+ *  claude-big), durable mirrors only, no sibling and no `model_route` lines —
+ *  so per-turn model attribution is impossible and modelForTurn must leave the
+ *  turn UNATTRIBUTED (never the dominant model). */
+function seedOrderedTwoModelSession(harness: Harness): string {
+  const id = freshSessionId();
+  const events: unknown[] = [
+    userMsg("Draft the opening paragraph for the quarterly board update"),
+    assistantMsg("Revenue grew nine percent quarter over quarter."),
+    ev("cost_accrual", {
+      provider: "anthropic",
+      modelId: "claude-small",
+      inputTokens: 400,
+      outputTokens: 100,
+      cachedReadTokens: 0,
+      costUsdMicros: 600,
+    }),
+    ev("model_meta", { stopReason: "end_turn", model: "claude-small" }),
+    userMsg("Now expand it into three detailed paragraphs for the appendix"),
+    assistantMsg("The top cost drivers are compute, storage, and support."),
+    ev("cost_accrual", {
+      provider: "anthropic",
+      modelId: "claude-big",
+      inputTokens: 600,
+      outputTokens: 150,
+      cachedReadTokens: 0,
+      costUsdMicros: 900,
+    }),
+    ev("model_meta", { stopReason: "end_turn", model: "claude-big" }),
+  ];
+  writeFileSync(join(harness.sessionsDir, `${id}.jsonl`), jsonl(events));
+  return id;
+}
+
+/** Overwrite a session's `.jsonl` (+ exact sibling) with `turnCount` turns and
+ *  a strictly-later mtime, simulating a live session that grew since its last
+ *  digest. */
+function growExactSession(harness: Harness, id: string, turnCount: number): void {
+  const events: unknown[] = [];
+  const sibling: unknown[] = [];
+  for (let turn = 1; turn <= turnCount; turn += 1) {
+    events.push(userMsg(`Question number ${turn} about exporting session data please`));
+    events.push(assistantMsg(`Answer number ${turn} about the export flow.`));
+    sibling.push(siblingResponse(id, turn, "claude-big", { input: 100, output: 50 }));
+  }
+  writeFileSync(join(harness.sessionsDir, `${id}.jsonl`), jsonl(events));
+  writeFileSync(join(harness.sessionsDir, `${id}.events.jsonl`), jsonl(sibling));
+  const future = Date.now() / 1000 + 120; // strictly after the prior digest
+  utimesSync(join(harness.sessionsDir, `${id}.jsonl`), future, future);
 }
 
 // -- turnNumber PARITY property test ---------------------------------------
@@ -626,6 +684,36 @@ describe("runWatchmeReport", () => {
     expect(harness.store.readObservations()).toHaveLength(2);
   });
 
+  test("a grown session is re-analyzed via the durable cursor; the aggregate reflects the new turnCount, not double-counted", async () => {
+    const harness = makeHarness();
+    const id = seedExactSession(harness); // 1 turn
+    const deps = makeDeps(harness);
+
+    const first = await runWatchmeReport(baseOpts(harness), deps);
+    expect(first.report?.window.sessionsAnalyzed).toBe(1);
+    expect(harness.store.readObservations()).toHaveLength(1);
+    expect(harness.store.readObservations()[0]?.turnCount).toBe(1);
+    expect(harness.store.state().observed?.[id]?.turnCount).toBe(1);
+
+    // The session grows to 5 turns (file rewritten, mtime advanced).
+    growExactSession(harness, id, 5);
+    const second = await runWatchmeReport(baseOpts(harness), deps);
+    expect(second.report?.window.sessionsAnalyzed).toBe(1); // re-analyzed
+    // Last-writer-wins: ONE observation, reflecting 5 turns (not two lines).
+    const obs = harness.store.readObservations();
+    expect(obs).toHaveLength(1);
+    expect(obs[0]?.turnCount).toBe(5);
+    expect(harness.store.state().observed?.[id]?.turnCount).toBe(5);
+
+    // Compact folds the deduped raw line once, then an unchanged re-run does
+    // nothing (the durable cursor survives compaction).
+    harness.store.compact();
+    expect(harness.store.readAggregates()[0]?.n).toBe(1);
+    const third = await runWatchmeReport(baseOpts(harness), deps);
+    expect(third.report?.window.sessionsAnalyzed).toBe(0);
+    expect(harness.store.readAggregates()[0]?.n).toBe(1); // still one distinct session
+  });
+
   test("REDACTION: runtime-built secret never survives into any persisted artifact", async () => {
     const harness = makeHarness();
     seedExactSession(harness, { rateTurn1: "up", extraTurns: 1, withSecret: true });
@@ -734,8 +822,12 @@ describe("phase-2 judge windows", () => {
     const harness = makeHarness();
     const id = seedExactSession(harness, { extraTurns: 2 }); // 3 judgeable turns
     const judgeSessionId = freshSessionId();
+    // Judge sessions live in the ISOLATED judge-sessions root (FIX 1), never
+    // the harness sessions dir — that is where the driver scans for evidence.
+    const judgeSessionsDir = join(harness.crewhausDir, "watchme", "judge-sessions");
+    mkdirSync(judgeSessionsDir, { recursive: true });
     writeFileSync(
-      join(harness.sessionsDir, `${judgeSessionId}.jsonl`),
+      join(judgeSessionsDir, `${judgeSessionId}.jsonl`),
       jsonl([
         ev("model_meta", { stopReason: "end_turn", model: "claude-judge" }),
         ev("model_meta", { stopReason: "end_turn", model: "claude-judge" }),
@@ -778,6 +870,100 @@ describe("phase-2 judge windows", () => {
       costUsdMicros: 1_200_000,
     });
   });
+  test("a transient failure leaves the window's sessions eligible — a PLAIN retry re-enumerates AND re-judges (no --session)", async () => {
+    const harness = makeHarness();
+    const id = seedExactSession(harness);
+    let calls = 0;
+    const judgePhase: WatchmeJudgePhase = {
+      model: "claude-judge",
+      judgeTurn: async () => {
+        calls += 1;
+        if (calls === 1) throw new Error("connection reset");
+        return { score: 0.8, rationale: "solid", spentUsd: 0.01 };
+      },
+    };
+    const deps = makeDeps(harness, { judgePhase });
+    // No --session: enumeration is watermark/cursor-driven.
+    const opts = baseOpts(harness, {
+      judge: { model: "claude-judge", sampleRate: 1, budgetUsd: 1 },
+    });
+
+    const first = await runWatchmeReport(opts, deps);
+    expect(first.report?.judge?.outcome).toBe("failed");
+    expect(Object.values(harness.store.state().windows)).toContain("model_failed");
+    // The cursor was NOT advanced for this window's sessions.
+    expect(harness.store.state().observed?.[id]).toBeUndefined();
+    expect(harness.store.state().watermark.lastMtimeMs).toBe(0);
+
+    // A plain retry re-enumerates the same session and re-judges it.
+    const second = await runWatchmeReport(opts, deps);
+    expect(second.report?.window.sessionsAnalyzed).toBe(1);
+    expect(second.report?.judge?.outcome).toBe("ok");
+    expect(calls).toBe(2);
+    expect(harness.store.readJudgments()).toHaveLength(1);
+    // Now the window succeeded → the cursor is committed.
+    expect(harness.store.state().observed?.[id]?.turnCount).toBe(1);
+  });
+
+  test("already-judged turns are skipped on a later window — no duplicate judgment, no double-spend", async () => {
+    const harness = makeHarness();
+    const id = seedExactSession(harness);
+    let calls = 0;
+    const judgePhase: WatchmeJudgePhase = {
+      model: "claude-judge",
+      judgeTurn: async () => {
+        calls += 1;
+        return { score: 0.8, rationale: "ok", spentUsd: 0.02 };
+      },
+    };
+    const judge = { model: "claude-judge", sampleRate: 1, budgetUsd: 1 };
+    // Pass 1 (window A) judges turn 1.
+    const deps1 = makeDeps(harness, { judgePhase, now: () => 1_700_000_100_000 });
+    const first = await runWatchmeReport(baseOpts(harness, { sessionId: id, judge }), deps1);
+    expect(first.report?.judge?.judged).toBe(1);
+    expect(harness.store.readJudgments()).toHaveLength(1);
+
+    // Pass 2 in a LATER window (so window idempotency does not short-circuit)
+    // still re-analyzes the session (--session), but the already-judged turn is
+    // skipped: nothing sampled, nothing judged, nothing spent.
+    const deps2 = makeDeps(harness, {
+      judgePhase,
+      now: () => 1_700_000_100_000 + 7 * 60 * 60 * 1000,
+    });
+    const second = await runWatchmeReport(baseOpts(harness, { sessionId: id, judge }), deps2);
+    expect(second.report?.judge?.outcome).toBe("ok");
+    expect(second.report?.judge?.sampled).toBe(0);
+    expect(second.report?.judge?.judged).toBe(0);
+    expect(second.report?.judge?.spentUsd).toBe(0);
+    expect(harness.store.readJudgments()).toHaveLength(1); // still exactly one
+    expect(calls).toBe(1); // judged only once, budget spent once
+  });
+
+  test("ordered-confidence session: a per-turn judgment is NOT attributed to the dominant model", async () => {
+    const harness = makeHarness();
+    const id = seedOrderedTwoModelSession(harness);
+    const judgePhase: WatchmeJudgePhase = {
+      model: "claude-judge",
+      judgeTurn: async () => ({ score: 0.7, rationale: "reasonable", spentUsd: 0.01 }),
+    };
+    const deps = makeDeps(harness, { judgePhase });
+    const result = await runWatchmeReport(
+      baseOpts(harness, {
+        sessionId: id,
+        judge: { model: "claude-judge", sampleRate: 1, budgetUsd: 1 },
+      }),
+      deps,
+    );
+    expect(result.report?.window.orderedSessions).toBe(1);
+    const judgments = harness.store.readJudgments();
+    expect(judgments.length).toBeGreaterThan(0);
+    for (const j of judgments) {
+      // Unattributed sentinel — never the ordered session's dominant model.
+      expect(j.model).toBe("unknown");
+      expect(j.model).not.toBe("claude-big");
+      expect(j.model).not.toBe("claude-small");
+    }
+  });
 });
 
 // -- §8 feed-routing --------------------------------------------------------
@@ -814,6 +1000,54 @@ describe("--feed-routing", () => {
       .split("\n")
       .filter((l) => l.trim() !== "");
     expect(after).toHaveLength(lines.length);
+  });
+
+  test("durable sourcing: --feed-routing after a plain report records arms for sessions past the watermark; dedupes on rerun", async () => {
+    const harness = makeHarness();
+    const id = seedExactSession(harness); // carries model_route turn 1
+    // A durable judgment supplies the quality signal (survives the watermark,
+    // unlike an inline rating that is only read when the session is parsed).
+    harness.store.appendJudgment({
+      v: 1,
+      sessionId: id,
+      turnNumber: 1,
+      model: "claude-big",
+      judgeModel: "claude-judge",
+      score: 0.9,
+      rationale: "grounded",
+      ts: 1_700_000_050_000,
+    });
+    const deps = makeDeps(harness);
+
+    // Plain report advances the watermark past the session; records no arms.
+    const plain = await runWatchmeReport(baseOpts(harness), deps);
+    expect(plain.report?.feedRouting).toBeUndefined();
+    expect(existsSync(join(harness.crewhausDir, "routing", "arms.jsonl"))).toBe(false);
+
+    // --feed-routing with NO new sessions: durable route recovery kicks in.
+    const feed = await runWatchmeReport(baseOpts(harness, { feedRouting: true }), deps);
+    expect(feed.report?.window.sessionsAnalyzed).toBe(0); // nothing re-analyzed
+    expect(feed.report?.feedRouting?.recorded).toBe(1);
+    const armsPath = join(harness.crewhausDir, "routing", "arms.jsonl");
+    const lines = readFileSync(armsPath, "utf8")
+      .split("\n")
+      .filter((l) => l.trim() !== "")
+      .map((l) => JSON.parse(l) as { k: string; m: string; r: number });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.k).toBe("q:hard");
+    expect(lines[0]?.m).toBe("claude-big");
+    expect(lines[0]?.r).toBeGreaterThanOrEqual(0);
+    expect(lines[0]?.r).toBeLessThanOrEqual(1);
+
+    // A second --feed-routing run: the key is durably fed → no re-record.
+    const again = await runWatchmeReport(baseOpts(harness, { feedRouting: true }), deps);
+    expect(again.report?.feedRouting?.recorded).toBe(0);
+    expect(again.report?.feedRouting?.deduped).toBe(1);
+    expect(
+      readFileSync(armsPath, "utf8")
+        .split("\n")
+        .filter((l) => l.trim() !== ""),
+    ).toHaveLength(1);
   });
 
   test("without --feed-routing no arms are written", async () => {

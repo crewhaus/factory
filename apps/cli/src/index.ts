@@ -2636,7 +2636,7 @@ function usageText(): string {
     "  watchme report [--all]         quality/continuity/factuality/model-fit report from watched sessions",
     "  watchme intents [--all]        recurring-intent digest for this harness or all registered ones",
     "  watchme synthesize             draft an agent-loop spec that mimics observed usage (proposal only)",
-    "  watchme publish                share distilled findings via Thredz for co-learning",
+    "  watchme publish                distill findings into this harness's local wiki (report --all recalls opted-in peers)",
     "  datasets list                        all registered datasets + versions (Section 29)",
     "  datasets get <name>[@version]        print a dataset's samples as JSONL",
     "       [--split train|dev|test]",
@@ -12892,6 +12892,7 @@ async function runFeedbackTeardown(
         dir: process.cwd(),
         specName: ir.name,
         target: ir.target,
+        share: ir.watchme?.share === true,
       });
     } catch {
       // Best-effort — a registry hiccup must never fail a run's teardown.
@@ -17351,7 +17352,18 @@ const WATCHME_JUDGE_RUBRIC: Rubric = {
  * budget option. `sessionId()` exposes the last judge session so the report
  * driver can scan ITS OWN JSONL for evidence.
  */
-function buildWatchmeJudgePhase(model: string, specName: string): WatchmeJudgePhase {
+function buildWatchmeJudgePhase(
+  model: string,
+  specName: string,
+  crewhausDir: string,
+): WatchmeJudgePhase {
+  // Judge sessions live in an ISOLATED root the report NEVER enumerates
+  // (enumeration is scoped to `<crewhausDir>/sessions`). This keeps judged-turn
+  // text and the judge's own model calls out of the watched-harness traffic,
+  // so a later report can't re-ingest judge sessions as harness sessions,
+  // leak judged-turn input/output into observations, or recursively judge the
+  // judge. The report driver scans this same dir for judge-cost evidence.
+  const judgeSessionRootDir = join(crewhausDir, "watchme", "judge-sessions");
   let lastSessionId: string | undefined;
   return {
     model,
@@ -17391,6 +17403,7 @@ function buildWatchmeJudgePhase(model: string, specName: string): WatchmeJudgePh
           seedMessages: [{ role: "user", content: user }],
           sessionName: specName,
           sessionTarget: "watchme",
+          sessionRootDir: judgeSessionRootDir,
           tools: [submitScore],
           hooks: [],
           maxToolIterations: 3,
@@ -17491,7 +17504,7 @@ async function runWatchmeHarnessReport(opts: {
     capabilities: DEFAULT_CAPABILITIES,
     joinQualityToArms,
     ...(judge !== undefined && judge.budgetUsd > 0 && opts.noModel !== true
-      ? { judgePhase: buildWatchmeJudgePhase(judge.model, opts.ir.name) }
+      ? { judgePhase: buildWatchmeJudgePhase(judge.model, opts.ir.name, opts.crewhausDir) }
       : {}),
     warn: (message) => process.stderr.write(`[watchme] ${message}\n`),
   };
@@ -17644,11 +17657,13 @@ function buildWatchmeArticles(
 
 /**
  * `crewhaus watchme publish` — versioned upserts of the three articles into
- * the spec's wiki store (the same substrate the memory fabric writes;
- * Thredz-synced when the harness configures `thredz:`, local-only otherwise —
- * visibility follows that config). Degrade-never-halt: any store failure is
- * one warning, never a non-zero exit — the local digest store stays
- * authoritative.
+ * the harness's LOCAL per-spec wiki store (`.crewhaus/wiki`, the same substrate
+ * the memory fabric writes). This is LOCAL co-learning in v1: `report --all`
+ * recalls these articles from opted-in peers via the SAME-MACHINE harness
+ * registry (`~/.crewhaus/watchme`). Cross-machine, Thredz-backed publish/recall
+ * is a DEFERRED seam (design/watch-me.md §10) — no Thredz wire exists here yet.
+ * Degrade-never-halt: any store failure is one warning, never a non-zero exit —
+ * the local digest store stays authoritative.
  */
 async function publishWatchmeArticles(opts: {
   readonly specName: string;
@@ -17716,7 +17731,12 @@ async function runWatchme(args: ParsedArgs, action: string): Promise<void> {
       const result = await watchmeStart({
         store,
         registry,
-        harness: { dir: cwd, specName: ir.name, target: ir.target },
+        harness: {
+          dir: cwd,
+          specName: ir.name,
+          target: ir.target,
+          share: ir.watchme?.share === true,
+        },
         runBackfill: () => runWatchmeHarnessReport({ ir, crewhausDir, noModel: true }),
       });
       process.stdout.write(
@@ -17804,6 +17824,7 @@ async function runWatchme(args: ParsedArgs, action: string): Promise<void> {
           const findings: SharedWatchmeFinding[] = [];
           for (const entry of entries) {
             if (resolve(entry.dir) === cwd) continue; // peers only
+            if (entry.share !== true) continue; // opt-in only (watchme.share)
             const wikiRoot = join(entry.dir, WIKI_SUBDIR);
             if (!existsSync(wikiRoot)) continue;
             const wiki = createWikiStore({ specName: entry.specName, rootDir: wikiRoot });
