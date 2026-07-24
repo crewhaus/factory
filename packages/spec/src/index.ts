@@ -1424,6 +1424,59 @@ const observabilityBlock = z
   .optional();
 
 /**
+ * "Watch me" — the sampled phase-2 judge pass of `crewhaus watchme report`,
+ * the ONE model-spending analysis phase. Absent ⇒ deterministic-only reports
+ * (the field defaults below still resolve at lower time, so a budgeted judge
+ * always names a model).
+ */
+const watchmeJudgeBlock = z
+  .object({
+    /** Judge model for the sampled phase-2 quality pass. Refused at runtime
+     *  if unpriced (dream-engine pattern) — the budget cap must be
+     *  enforceable. */
+    model: z.string().min(1).default("claude-haiku-4-5"),
+    /** Fraction of ungraded turns escalated to the judge. */
+    sample_rate: z.number().min(0).max(1).default(0.15),
+    /** Per-report spend cap. 0 (default) = deterministic-only reports. */
+    budget_usd: z.number().min(0).default(0),
+  })
+  .strict();
+
+/**
+ * "Watch me" — observe this harness's interactions and learn from them
+ * (design/watch-me.md). Presence turns on the live capture tap; `crewhaus
+ * watchme report` distills the watched sessions post-hoc. Carried on the
+ * three interactive-loop shapes (cli, channel, managed); the strict unions
+ * reject the key loudly elsewhere (research/crew are a named deferral,
+ * design/watch-me.md §13.1).
+ *
+ * Deliberately a SIBLING of `observability:`, not a sub-key of it:
+ * observability controls the generic telemetry subscribers (ring buffer,
+ * printers, metrics, cost, alerts, otel) while watchme is a learning feature
+ * with its own durable store and spec-synthesis outputs. Capture is
+ * INDEPENDENT of `observability.trace.level` — that knob controls the ring
+ * buffer + printers only, never the watchme tap.
+ *
+ * Every knob defaults, so a bare `watchme: {}` is a complete declaration.
+ * NO `watchme.*` path is optimizer-tunable — see the exclusion note beside
+ * OPTIMIZABLE_PATHS in `@crewhaus/spec-patch`.
+ */
+const watchmeBlock = z
+  .object({
+    enabled: z.boolean().default(true),
+    /** "full" = write the .events.jsonl trace sibling; "mirrors" = rely on the
+     *  default-on advisor mirrors only (retro-analysis grade, no extra file). */
+    capture: z.enum(["full", "mirrors"]).default("full"),
+    judge: watchmeJudgeBlock.optional(),
+    /** "user" additionally registers this harness in the global registry at run time. */
+    scope: z.enum(["harness", "user"]).default("harness"),
+    /** Publish redacted distilled findings to the wiki/Thredz at report time. */
+    share: z.boolean().default(false),
+  })
+  .strict()
+  .optional();
+
+/**
  * Section 47 — blockchain subsystem blocks (cross-cutting). Any shape may
  * declare any subset of `chains` / `wallets` / `contracts` /
  * `transaction_policy`. Authoring rules:
@@ -1727,6 +1780,8 @@ const cliSchema = z
     thredz: thredzBlock,
     learning: learningBlock,
     observability: observabilityBlock,
+    // "Watch me" — observe-and-learn (sibling of observability, see watchmeBlock).
+    watchme: watchmeBlock,
     cli: cliOptionsBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
@@ -1937,6 +1992,8 @@ const channelSchema = z
     thredz: thredzBlock,
     learning: learningBlock,
     observability: observabilityBlock,
+    // "Watch me" — observe-and-learn (sibling of observability, see watchmeBlock).
+    watchme: watchmeBlock,
     heartbeat: heartbeatBlock,
     // Loop contract 0.4 (Batch F) — cron/interval wake trigger (the general
     // temporal surface beside the interval-only `heartbeat`).
@@ -2140,6 +2197,9 @@ const managedSchema = z
     thredz: thredzBlock,
     learning: learningBlock,
     observability: observabilityBlock,
+    // "Watch me" — observe-and-learn (sibling of observability, see watchmeBlock).
+    // Parse + lower ONLY on this shape in v1: compile() warns accepted-but-unwired.
+    watchme: watchmeBlock,
     // Loop contract 0.4 (Batch F) — cron/interval wake trigger.
     schedule: scheduleBlock,
   })
@@ -2701,6 +2761,9 @@ export type SpecBudgetBlock = z.infer<typeof budgetBlock>;
 /** Ops item 37 + Loop contract 0.4 (Batch C, G26) — the cross-cutting
  *  `observability:` block (slo + trace/metrics/cost/alerts/incidents/otel). */
 export type SpecObservabilityBlock = z.infer<typeof observabilityBlock>;
+/** "Watch me" — the observe-and-learn `watchme:` block, carried on
+ *  cli/channel/managed (design/watch-me.md §4.1). */
+export type SpecWatchmeBlock = z.infer<typeof watchmeBlock>;
 export type SpecSecurityBlock = z.infer<typeof securityBlock>;
 export type SpecFeedbackBlock = z.infer<typeof feedbackBlock>;
 export type SpecMemoryBlock = z.infer<typeof memoryBlock>;
@@ -2932,6 +2995,26 @@ function crossFieldIssues(data: Spec): SpecIssue[] {
       custom(
         ["retrieve", "collection"],
         `pipeline retrieve.vectorBackend "${vectorBackend}" requires retrieve.collection`,
+      );
+    }
+  }
+  // "Watch me" (design/watch-me.md §4.2) — `watchme.share: true` publishes
+  // co-learning articles, so it conflicts with a thredz OBJECT that declares
+  // an EXPLICIT `visibility: "private"`. The boolean/string shorthands
+  // (default-private) get NO issue in v1 — publishing then lands
+  // private-visibility articles, legal single-agent behaviour — and an
+  // absent `thredz:` block is fine (publish degrades to the local wiki
+  // store, a feature not an error).
+  if (data.target === "cli" || data.target === "channel" || data.target === "managed") {
+    const thredz = data.thredz;
+    if (
+      data.watchme?.share === true &&
+      typeof thredz === "object" &&
+      thredz.visibility === "private"
+    ) {
+      custom(
+        ["watchme", "share"],
+        "watchme.share publishes co-learning articles; thredz.visibility: private blocks cross-agent sharing — set visibility: shared or drop watchme.share",
       );
     }
   }

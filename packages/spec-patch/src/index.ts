@@ -402,6 +402,22 @@ function formatEditPath(path: ReadonlyArray<SpecEditPathSegment>): string {
  * only mutate prompts (the default), preserving the "spec safety floor"
  * that an optimizer can't accidentally rewrite security-critical fields
  * like `permissions.mode` or `model_router` rules.
+ *
+ * "Watch me" (`watchme:` on cli/channel/managed, design/watch-me.md §4.3) —
+ * EVERY `watchme.*` path is deliberately EXCLUDED; none may be whitelisted
+ * piecemeal later without revisiting that design section:
+ *   - `watchme.enabled` / `watchme.capture` — the observer must not be tuned
+ *     by the loop it observes (self-referential optimization), and capture
+ *     fidelity is a consent/data-plane posture, not a quality dial.
+ *   - `watchme.judge.model` — the model roster is never auto-patched (the
+ *     standing `agent.model` / model-roster exclusion).
+ *   - `watchme.judge.sample_rate` / `watchme.judge.budget_usd` — spend-class
+ *     knobs, human-only (sample_rate MULTIPLIES judge calls, so it is a
+ *     spend dial wearing a quality dial's clothes).
+ *   - `watchme.scope` / `watchme.share` — privacy/trust-boundary switches
+ *     (`share` crosses the harness boundary to Thredz).
+ * The paired `crewhaus advise` watchme rule is text-only for exactly this
+ * reason: there is no whitelisted path for it to patch.
  */
 export const OPTIMIZABLE_PATHS: Readonly<
   Record<Spec["target"], ReadonlyArray<ReadonlyArray<string>>>

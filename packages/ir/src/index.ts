@@ -846,6 +846,26 @@ export type IrObservability = {
 };
 
 /**
+ * "Watch me" (design/watch-me.md §4.6) — observe-and-learn config, lowered
+ * from `spec.watchme` on the three interactive-loop shapes (IrV0/cli,
+ * IrChannelV0, IrManagedV0), carried beside `observability` (a sibling
+ * feature, not a telemetry sub-key). Unlike IrObservability's declare-only
+ * carriage, every field here is REQUIRED: the lowering resolves all defaults
+ * (a bare `watchme: {}` arrives fully populated), so emitters/runtimes never
+ * re-derive them. Absent from the IR entirely when the spec omits the block.
+ */
+export type IrWatchme = {
+  readonly enabled: boolean;
+  readonly capture: "full" | "mirrors";
+  /** Phase-2 judge model — default resolved at lower time. */
+  readonly judgeModel: string;
+  readonly judgeSampleRate: number;
+  readonly judgeBudgetUsd: number;
+  readonly scope: "harness" | "user";
+  readonly share: boolean;
+};
+
+/**
  * Track F (Section 57) — typed message schemas (Σ) for multi-agent
  * communication. Source: AgentFlow (arxiv 2604.20801). A typed graph
  * DSL with well-formedness checking makes searching the full multi-
@@ -962,6 +982,10 @@ export type IrV0 = {
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. */
   readonly observability?: IrObservability;
+  /** "Watch me" — observe-and-learn config (design/watch-me.md §4.6).
+   *  Optional; absent when the spec omits the `watchme` block; all defaults
+   *  resolved at lower time when present. */
+  readonly watchme?: IrWatchme;
   /** Item 1 (G30) — MCP-server projection config. Present when the spec
    *  declares `expose.mcp`; absent otherwise. */
   readonly expose?: IrExpose;
@@ -1343,6 +1367,10 @@ export type IrChannelV0 = {
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. */
   readonly observability?: IrObservability;
+  /** "Watch me" — observe-and-learn config (design/watch-me.md §4.6).
+   *  Optional; absent when the spec omits the `watchme` block; all defaults
+   *  resolved at lower time when present. */
+  readonly watchme?: IrWatchme;
   /** Item 1 (G30) — MCP-server projection config. Present when the spec
    *  declares `expose.mcp`; absent otherwise. */
   readonly expose?: IrExpose;
@@ -1438,6 +1466,12 @@ export type IrManagedV0 = {
    *  spec omits the `observability` block. The managed daemon's `pause-intake`
    *  rung reuses its `budget_exceeded` 429 path. */
   readonly observability?: IrObservability;
+  /** "Watch me" — observe-and-learn config (design/watch-me.md §4.6).
+   *  Optional; absent when the spec omits the `watchme` block; all defaults
+   *  resolved at lower time when present. CARRIED but not runtime-wired on
+   *  this shape in v1 — `compile()` emits the accepted-but-unwired warning
+   *  (design/watch-me.md §6.3 names the target-managed stamp seam). */
+  readonly watchme?: IrWatchme;
   /** Item 1 (G30) — MCP-server projection config. Present when the spec
    *  declares `expose.mcp`; absent otherwise. SSE-backed exposure rides this
    *  shape's gateway-server tenancy/budgets. */

@@ -12,19 +12,21 @@
  * frequently-failing-but-quick model out-score a slower, reliable one, so the
  * reward must not reward failing quickly.
  *
- * On SUCCESS, two sub-scores combine (quality is implicitly 1), each in `[0,1]`:
+ * On SUCCESS, two sub-scores combine with the quality term (default 1), each
+ * in `[0,1]`:
  *   - cost     = costRef / (costRef + costUsd)      (0.5 at the reference cost)
  *   - latency  = latRef  / (latRef  + latencyMs)    (0.5 at the reference latency)
  *
  * The reward is the objective-weighted average over the AVAILABLE terms (with
- * quality fixed at 1). The cost term is dropped (and its weight redistributed)
- * when `costUsd` is unknown — a run without cost accounting still learns on
- * quality + latency rather than pinning every arm to the same cost score.
+ * quality = `obs.quality ?? 1`, clamped to `[0,1]`). The cost term is dropped
+ * (and its weight redistributed) when `costUsd` is unknown — a run without
+ * cost accounting still learns on quality + latency rather than pinning every
+ * arm to the same cost score.
  *
- * `quality = success` is a deliberate v1 proxy: the delayed grader/rating
- * signals the FR describes join later (they arrive asynchronously, keyed by
- * `(sessionId, turnNumber, model)`), at which point a graded observation can
- * carry a richer `quality` in `[0, 1]` instead of the binary success bit.
+ * `quality = success` is the default proxy: the delayed grader/rating signals
+ * are joined by `crewhaus watchme report --feed-routing` (asynchronously,
+ * keyed by `(sessionId, turnNumber, model)`), which records observations
+ * carrying the richer `quality` in `[0, 1]` instead of the binary success bit.
  */
 
 /** A single observed model call outcome. */
@@ -39,6 +41,13 @@ export type RouteObservation = {
    * folds the cost weight into the remaining terms.
    */
   readonly costUsd?: number;
+  /**
+   * Delayed graded/rating quality in `[0, 1]`, joined per
+   * `(sessionId, turnNumber, model)` — the richer signal the module header
+   * reserves. Omitted ⇒ the v1 binary proxy (success ⇒ quality 1) —
+   * byte-identical rewards to today.
+   */
+  readonly quality?: number;
 };
 
 /** Weights over the reward's component terms. Missing terms default sensibly. */
@@ -81,9 +90,10 @@ export function computeReward(obs: RouteObservation, config: RewardConfig = {}):
   const latRef = config.latencyRefMs ?? DEFAULT_LATENCY_REF_MS;
 
   const latencyScore = latRef / (latRef + Math.max(0, obs.latencyMs));
+  const qualityScore = Math.min(1, Math.max(0, obs.quality ?? 1));
 
   const terms: Array<{ readonly w: number; readonly s: number }> = [
-    { w: Math.max(0, obj.quality), s: 1 }, // quality is 1 on the success path
+    { w: Math.max(0, obj.quality), s: qualityScore },
     { w: Math.max(0, obj.latency), s: latencyScore },
   ];
   if (obs.costUsd !== undefined) {

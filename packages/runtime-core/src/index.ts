@@ -48,7 +48,7 @@ import {
   RuntimeError,
   isRunFailedError,
 } from "@crewhaus/errors";
-import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
+import { DEFAULT_ROOT_DIR, type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
 import {
   type FailoverChain,
@@ -138,6 +138,7 @@ import {
   attachAdvisorPersistence,
   attachDefaultSubscribers,
   attachMcpStatsPersistence,
+  attachWatchmeCapture,
 } from "./observability";
 import { loadProjectMemory } from "./project-memory";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
@@ -2521,6 +2522,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // score per-server MCP health offline. Shares the advisor's DEFAULT-ON gate
   // (CREWHAUS_ADVISOR_EVENTS=0 disables both). See observability.ts.
   const mcpStatsPersist = attachMcpStatsPersistence(bus, eventLog, runContext);
+
+  // "Watch me" — live capture tap (CREWHAUS_WATCHME-gated, off by default):
+  // append the bus-only TraceEvent kinds to the `sessions/<id>.events.jsonl`
+  // sibling that `sessions export` already reads. Mirrored/ephemeral kinds are
+  // skipped, so the sibling stays metadata-grade. See observability.ts.
+  const watchmeCapture = attachWatchmeCapture(bus, sessionRootDir ?? DEFAULT_ROOT_DIR, sessionId);
 
   // Per-run state container — coordination surface for hooks/skills/tools.
   // Shipped as plumbing in Section 10; v0.3.0 Goal 1 (§2.5) lands its first
@@ -5124,6 +5131,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       budgetMeter?.unsubscribe();
       advisorPersist?.unsubscribe();
       mcpStatsPersist?.unsubscribe();
+      watchmeCapture?.unsubscribe();
       printAdvisorDigest(advisorPersist);
       await sessionStore
         .update(sessionId, { lastTurnIndex: runContext.turnNumber })
@@ -5400,6 +5408,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     budgetMeter?.unsubscribe();
     advisorPersist?.unsubscribe();
     mcpStatsPersist?.unsubscribe();
+    watchmeCapture?.unsubscribe();
     printAdvisorDigest(advisorPersist);
     if (shouldInstallSigint) {
       process.removeListener("SIGINT", sigintHandler);

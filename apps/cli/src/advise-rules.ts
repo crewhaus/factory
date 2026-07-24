@@ -58,6 +58,26 @@ export type ErrorRecoveryStats = {
   actions: Map<string, number>;
 };
 
+/** "Watch me" — one recurring intent cluster aggregated from the watch-me
+ *  observation digests (`.crewhaus/watchme/observations.jsonl`). `key` is the
+ *  redacted `clusterIntents` cluster key; `meanSatisfaction` is the mean
+ *  normalized rating/judge score in [0,1] over the cluster's scored turns,
+ *  undefined when the cluster carries no quality signal at all. */
+export type WatchmeIntentStats = {
+  readonly key: string;
+  /** Distinct sessions the cluster appeared in. */
+  readonly sessions: number;
+  readonly meanSatisfaction?: number;
+};
+
+/** "Watch me" digest slice the CLI driver folds from `.crewhaus/watchme/`
+ *  (state.json watching flag + observation digests). */
+export type WatchmeAdviceSlice = {
+  /** Spec `watchme.enabled` or the state file's watching flag. */
+  readonly active: boolean;
+  readonly intents: ReadonlyArray<WatchmeIntentStats>;
+};
+
 /**
  * Session-derived aggregates the rules consume. Built by
  * `buildAdviceContext` from parsed session-JSONL objects (tolerant of
@@ -119,6 +139,13 @@ export type AdviceContext = {
    * candidate roster itself stays human-owned.
    */
   readonly routingArms: ReadonlyArray<ArmStats>;
+  /**
+   * "Watch me" — whether the harness is watched plus its recurring-intent
+   * aggregates. Undefined when no watch-me data exists (an unwatched harness,
+   * or an old-vintage fold) — the coverage rule then judges spec coverage
+   * only and the low-satisfaction rule stays silent.
+   */
+  readonly watchme?: WatchmeAdviceSlice;
 };
 
 export type SessionEvents = {
@@ -196,6 +223,7 @@ export function buildAdviceContext(
   sessions: ReadonlyArray<SessionEvents>,
   auditObjects: ReadonlyArray<unknown> = [],
   routingArms: ReadonlyArray<ArmStats> = [],
+  watchme?: WatchmeAdviceSlice,
 ): AdviceContext {
   const toolStats = new Map<string, ToolCallStats>();
   const recoveriesByAction = new Map<string, number>();
@@ -330,6 +358,7 @@ export function buildAdviceContext(
     totalToolBytes,
     auditKindCounts,
     routingArms,
+    ...(watchme !== undefined ? { watchme } : {}),
   };
 }
 
@@ -372,6 +401,15 @@ export type AdviceThresholds = {
   /** Adaptive routing — mean-reward gap below the band best at/above which a
    *  candidate is called consistently losing (demotion advice). */
   poolDemotionGap: number;
+  /** "Watch me" — sessions a harness must accumulate before an unwatched
+   *  spec (no `watchme:` block, no active watch) draws the coverage nudge. */
+  watchmeMinSessions: number;
+  /** "Watch me" — distinct sessions an intent cluster must recur across
+   *  before it counts as persistent. */
+  watchmeIntentMinSessions: number;
+  /** "Watch me" — mean normalized satisfaction at/below which a persistent
+   *  cluster is called low-satisfaction. */
+  watchmeLowSatisfaction: number;
 };
 
 /**
@@ -395,6 +433,9 @@ export const DEFAULT_ADVICE_THRESHOLDS: AdviceThresholds = {
   toolByteMinTotal: 50_000,
   poolMinSamples: 25,
   poolDemotionGap: 0.3,
+  watchmeMinSessions: 10,
+  watchmeIntentMinSessions: 3,
+  watchmeLowSatisfaction: 0.4,
 };
 
 /** Stop reasons that are part of healthy operation; everything else
@@ -1229,6 +1270,86 @@ export const rulePoolStaleExploitation: AdviceRule = (ctx, opts) => {
   ];
 };
 
+// -------- "watch me" coverage + low-satisfaction (text-only by design) --------
+
+/**
+ * "Watch me" coverage (design/watch-me.md §4.4). Two text-only nudges:
+ * a harness that has accumulated ≥ watchmeMinSessions sessions with no
+ * `watchme:` block in its spec and no active watch is pointed at
+ * `crewhaus watchme start`; a watched harness whose observation digest shows
+ * a persistent low-satisfaction intent cluster is pointed at
+ * `crewhaus watchme report`. NEVER a patch: every `watchme.*` path is
+ * excluded from OPTIMIZABLE_PATHS by design (the observer must not be tuned
+ * by the loop it observes; judge knobs are spend-class; scope/share are
+ * trust-boundary knobs). Degrades to zero findings when the digest slice is
+ * absent (an unwatched harness or an old-vintage fold).
+ */
+export const ruleWatchmeCoverage: AdviceRule = (ctx, opts) => {
+  const t = resolveThresholds(opts);
+  const findings: AdviceFinding[] = [];
+  const spec = opts?.spec;
+  const active = ctx.watchme?.active === true;
+
+  if (
+    !active &&
+    spec !== undefined &&
+    specField<unknown>(spec, "watchme") === undefined &&
+    ctx.sessionIds.length >= t.watchmeMinSessions
+  ) {
+    findings.push({
+      id: "watchme-coverage",
+      severity: "info",
+      summary: `${ctx.sessionIds.length} sessions accumulated and nothing is watching them`,
+      evidence: [
+        `${ctx.sessionIds.length} session(s) mined (threshold: ≥${t.watchmeMinSessions}) with no watchme: block in the spec and no active watch`,
+      ],
+      counts: { sessions: ctx.sessionIds.length },
+      suggestion: {
+        kind: "advice",
+        text: "This harness has enough history to learn from. Run `crewhaus watchme start` (or add a `watchme:` block to the spec to make it durable) so sessions are captured and `crewhaus watchme report` can distill quality, model-fit, and recurring-intent findings from them.",
+      },
+    });
+  }
+
+  if (active) {
+    const low = (ctx.watchme?.intents ?? [])
+      .filter(
+        (i) =>
+          i.sessions >= t.watchmeIntentMinSessions &&
+          i.meanSatisfaction !== undefined &&
+          i.meanSatisfaction <= t.watchmeLowSatisfaction,
+      )
+      .sort((a, b) => {
+        const gap = (a.meanSatisfaction ?? 0) - (b.meanSatisfaction ?? 0);
+        if (gap !== 0) return gap;
+        return a.key.localeCompare(b.key);
+      });
+    const worst = low[0];
+    if (worst !== undefined) {
+      const maxSessions = low.reduce((max, i) => Math.max(max, i.sessions), 0);
+      findings.push({
+        id: "watchme-low-satisfaction",
+        severity: "warn",
+        summary: `${low.length} persistent low-satisfaction intent cluster(s) (worst: ${worst.key})`,
+        evidence: [
+          ...low.map(
+            (i) =>
+              `${i.key}: mean satisfaction ${(i.meanSatisfaction ?? 0).toFixed(2)} across ${i.sessions} session(s)`,
+          ),
+          `threshold: ≥${t.watchmeIntentMinSessions} sessions per cluster at mean satisfaction ≤${t.watchmeLowSatisfaction}`,
+        ],
+        counts: { clusters: low.length, sessions: maxSessions },
+        suggestion: {
+          kind: "advice",
+          text: `Users keep coming back to the same intent(s) and keep scoring the answers poorly (worst: ${worst.key} at ${(worst.meanSatisfaction ?? 0).toFixed(2)}). Run \`crewhaus watchme report\` for the full quality/continuity/factuality digest on these clusters and its suggested follow-ups (fewshot candidates, spec suggestions).`,
+        },
+      });
+    }
+  }
+
+  return findings;
+};
+
 export const ADVICE_RULES: ReadonlyArray<AdviceRule> = [
   ruleRepeatedToolFailures,
   ruleTruncationPressure,
@@ -1241,6 +1362,7 @@ export const ADVICE_RULES: ReadonlyArray<AdviceRule> = [
   rulePoolPolicyUpgrade,
   rulePoolCandidateDemotion,
   rulePoolStaleExploitation,
+  ruleWatchmeCoverage,
 ];
 
 /**

@@ -30,7 +30,10 @@ export const FEEDBACK_EVENT_KIND = "user_feedback" as const;
 export const FEEDBACK_SCHEMA_VERSION = 1 as const;
 
 export type FeedbackModality = "binary" | "stars" | "scale" | "comment";
-export type FeedbackSource = "user" | "ui" | "channel" | "cli";
+/** "watchme" marks machine judge verdicts bridged from `.crewhaus/watchme/
+ *  judgments.jsonl` — written ONLY by the explicit `crewhaus watchme report
+ *  --emit-feedback` opt-in, never by the capture loop (human-signal purity). */
+export type FeedbackSource = "user" | "ui" | "channel" | "cli" | "watchme";
 
 export type FeedbackRating = {
   thumbs?: "up" | "down";

@@ -212,6 +212,7 @@
     { "path": "./packages/turn-state-machine" },
     { "path": "./packages/vad-engine" },
     { "path": "./packages/voice-runtime" },
+    { "path": "./packages/watchme-store" },
     { "path": "./apps/cli" }
   ]
 }

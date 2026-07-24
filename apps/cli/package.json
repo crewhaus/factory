@@ -126,6 +126,7 @@
     "@crewhaus/tool-vision-grounding": "workspace:*",
     "@crewhaus/tool-web": "workspace:*",
     "@crewhaus/vector-store": "workspace:*",
+    "@crewhaus/watchme-store": "workspace:*",
     "@crewhaus/docker-images": "workspace:*",
     "@crewhaus/crewhaus-cloud": "workspace:*",
     "@crewhaus/federation-discovery": "workspace:*",

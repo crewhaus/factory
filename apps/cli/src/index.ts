@@ -24,10 +24,12 @@ import type { AuditLog } from "@crewhaus/audit-log";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
 import {
+  DEFAULT_CAPABILITIES,
   DEFAULT_PRICING,
   type PricingTable,
   classifyPricingStaleness,
   computeCacheSavingsMicros,
+  createCostTracker,
   parsePricingFeed,
   pickNewestPricing,
   resolvePricing,
@@ -47,6 +49,9 @@ import { createEmbedder } from "@crewhaus/embedder";
 import { CrewhausError, RunFailedError } from "@crewhaus/errors";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
 import { type CompiledGrader, type GradersConfig, parseGradersConfig } from "@crewhaus/eval-grader";
+// "Watch me" (design/watch-me.md §7 phase 2) — the injection-hardened judge
+// prompt, reused verbatim for the watchme judge phase built on runChatLoop.
+import { type Rubric, buildJudgePrompt } from "@crewhaus/eval-judge";
 import {
   extractCurrentPrompt as extractInstructions,
   optimizeSpec,
@@ -68,6 +73,7 @@ import {
   type EvalRunSummary,
   type GraderLookup,
   createExamRunner,
+  defaultGraderRegistry,
   runEval as runEvalLib,
 } from "@crewhaus/eval-runner";
 import { openEventLog } from "@crewhaus/event-log";
@@ -117,6 +123,7 @@ import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-lo
 // per-(routeKey, model) reward scoreboard behind `agent.model_pool`; advise
 // mines the same scoreboard into pool-policy suggestions.
 import { openScoreboard } from "@crewhaus/routing-store";
+import { createRunContext } from "@crewhaus/run-context";
 import { type AgentIdentityFile, runChatLoop } from "@crewhaus/runtime-core";
 import {
   type PendingApproval,
@@ -136,14 +143,25 @@ import { TargetClaudePluginError, emitClaudePlugin } from "@crewhaus/target-clau
 // Item 10 (G89) — the default public template registry (registry.crewhaus.ai)
 // `crewhaus templates list/search` fall back to when no --registry / env is set.
 import { DEFAULT_TEMPLATE_REGISTRY_URL } from "@crewhaus/template-marketplace-client";
+import { buildTool } from "@crewhaus/tool-builder";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
+// "Watch me" (design/watch-me.md §2) — the durable per-harness digest store,
+// the global cross-harness registry, and the quality→shadow-arm join behind
+// `crewhaus watchme`.
+import {
+  type HarnessEntry,
+  joinQualityToArms,
+  openHarnessRegistry,
+  openWatchmeStore,
+} from "@crewhaus/watchme-store";
 // 0.3.0 memory release (design §3.1, PR 9) — the local wiki substrate behind
 // `crewhaus wiki list|show|search|stats`.
-import { createWikiStore } from "@crewhaus/wiki-store";
+import { WikiVersionConflictError, createWikiStore } from "@crewhaus/wiki-store";
 import { parseDocument } from "yaml";
+import { z } from "zod";
 // Item 15 — `optimize --from-advice` (eval-gated apply of the advisor's
 // SpecPatches: suggestions-file validation, the accept/reject/compose loop
 // with injected compile/eval hooks, decisions.json + write-back stamping),
@@ -906,6 +924,7 @@ import {
   isValidTraceLevel,
   resolveCostEnv,
   resolveTraceEnv,
+  resolveWatchmeEnv,
 } from "./run-observability";
 // Loop contract 0.4 (Batch F, item 7, CLI half) — `crewhaus runs resume`
 // spec-resolution + session-id helpers (engine-free, unit-tested).
@@ -1087,6 +1106,33 @@ import {
   renderVoiceReport,
 } from "./voice-eval";
 import { type Watcher, createWatchController, formatCycleLine } from "./watch";
+// "Watch me" (design/watch-me.md §11) — the observe-and-learn verbs behind
+// `crewhaus watchme`: lifecycle (start/stop/status) in ./watchme, the
+// phase-1/phase-2 report core in ./watchme-report, mimic-spec synthesis in
+// ./watchme-synthesize. All three are pure modules with injected seams; this
+// entry file wires the real ones (fs, pricing, graders, scoreboard, redactor,
+// wiki store, the runChatLoop judge phase).
+import {
+  WatchmeError,
+  formatWatchmeStatus,
+  resolveWatchmeSpecPath,
+  watchmeStart,
+  watchmeStatus,
+  watchmeStop,
+} from "./watchme";
+import {
+  type HarnessSlice,
+  type SharedWatchmeFinding,
+  type WatchmeJudgePhase,
+  type WatchmeReportDeps,
+  WatchmeReportError,
+  type WatchmeReportResult,
+  buildCounterfactuals,
+  nodeReportFs,
+  runWatchmeAllReport,
+  runWatchmeReport,
+} from "./watchme-report";
+import { WatchmeSynthesizeError, runWatchmeSynthesize } from "./watchme-synthesize";
 // 0.3.0 memory release (design §3.1/§3.2, PR 9) — `crewhaus wiki
 // list|show|search|stats` helpers over @crewhaus/wiki-store.
 import {
@@ -2237,6 +2283,33 @@ const INTENTS_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// "Watch me" (design/watch-me.md §11) — `crewhaus watchme
+// start|stop|status|report|intents|synthesize|publish`. EVERY flag any action
+// accepts is declared here (parseArgs throws ArgParseError on an undeclared
+// flag); per-action validation lives in the handler.
+const WATCHME_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "spec", takesValue: true },
+    // Global watchme root override (default ~/.crewhaus/watchme, or the
+    // CREWHAUS_WATCHME_ROOT env) — tests always pass it (CI sandboxes).
+    { name: "root", takesValue: true },
+    { name: "session", takesValue: true },
+    { name: "all" },
+    { name: "out", short: "o", takesValue: true },
+    { name: "json" },
+    { name: "name", takesValue: true },
+    { name: "force" },
+    { name: "interactive" },
+    { name: "propose" },
+    { name: "feed-routing" },
+    { name: "emit-feedback" },
+    { name: "no-model" },
+    { name: "dry-run" },
+    { name: "forget" },
+    { name: "help", short: "h" },
+  ],
+};
+
 // AUTOMATION-OPPORTUNITIES.md item 52 — `justification calibrate|preflight`.
 const JUSTIFICATION_SCHEMA: ParseArgsSchema = {
   flags: [
@@ -2559,6 +2632,11 @@ function usageText(): string {
     "  dream status <spec.yaml>             schedule state + next due (.crewhaus/dream/<spec>/state.json)",
     "  dream init <spec.yaml> [--force]     scaffold the nightly consolidation cron (crewhaus-dream.yml)",
     "       [--evicted] [--ttl-days N]        --evicted indexes each session just before it is deleted",
+    '  watchme start|stop|status      watch this harness\'s agent interactions ("watch me")',
+    "  watchme report [--all]         quality/continuity/factuality/model-fit report from watched sessions",
+    "  watchme intents [--all]        recurring-intent digest for this harness or all registered ones",
+    "  watchme synthesize             draft an agent-loop spec that mimics observed usage (proposal only)",
+    "  watchme publish                share distilled findings via Thredz for co-learning",
     "  datasets list                        all registered datasets + versions (Section 29)",
     "  datasets get <name>[@version]        print a dataset's samples as JSONL",
     "       [--split train|dev|test]",
@@ -4444,6 +4522,18 @@ function applyRunObservabilityEnv(args: ParsedArgs, ir: ReturnType<typeof lower>
 
   const cost = resolveCostEnv(obs?.cost?.enabled, process.env["CREWHAUS_COST_TRACKING"]);
   if (cost !== undefined) process.env["CREWHAUS_COST_TRACKING"] = cost;
+
+  // "Watch me" (design/watch-me.md §6.3) — same junction as the G26 stamps:
+  // spec-opted full capture OR a `crewhaus watchme start`ed harness turns the
+  // runtime capture tap's env on; an already-set ambient env wins (the `??=`
+  // semantics the compiled-bundle boot stamps share).
+  const irWatchme = (ir as { watchme?: { enabled: boolean; capture: string } }).watchme;
+  const watchme = resolveWatchmeEnv(
+    irWatchme !== undefined ? irWatchme.enabled && irWatchme.capture === "full" : undefined,
+    openWatchmeStore(join(process.cwd(), ".crewhaus")).state().watching,
+    process.env["CREWHAUS_WATCHME"],
+  );
+  if (watchme !== undefined) process.env["CREWHAUS_WATCHME"] = watchme;
 }
 
 /**
@@ -12793,6 +12883,21 @@ async function runFeedbackTeardown(
   ir: Extract<ReturnType<typeof lower>, { target: "cli" }>,
   resumeId: string | undefined,
 ): Promise<void> {
+  // "Watch me" (design/watch-me.md §11) — a user-scope watched harness
+  // self-registers in the global registry at run time, so `watchme report
+  // --all` discovers it without a manual `watchme start` on this machine.
+  if (ir.watchme?.scope === "user") {
+    try {
+      openHarnessRegistry(watchmeGlobalRoot(undefined)).register({
+        dir: process.cwd(),
+        specName: ir.name,
+        target: ir.target,
+      });
+    } catch {
+      // Best-effort — a registry hiccup must never fail a run's teardown.
+    }
+  }
+
   if (ir.feedback === undefined) return;
 
   // Resolve the session that just ran: the resumed id, else the most recent
@@ -17163,6 +17268,743 @@ async function runIntents(args: ParsedArgs): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// "Watch me" (design/watch-me.md §11) — `crewhaus watchme <action>` wiring
+// ---------------------------------------------------------------------------
+
+const WATCHME_USAGE =
+  "usage: crewhaus watchme start [--spec <path>] [--root <dir>]\n" +
+  "       crewhaus watchme stop [--forget] [--root <dir>]\n" +
+  "       crewhaus watchme status [--json] [--root <dir>]\n" +
+  "       crewhaus watchme report [--spec <path>] [--session <id>] [--all] [--json] [--out <dir>]\n" +
+  "                [--feed-routing] [--emit-feedback] [--no-model] [--root <dir>]\n" +
+  "       crewhaus watchme intents [--all] [--json] [--root <dir>]\n" +
+  "       crewhaus watchme synthesize [--spec <path>] [--out <file>] [--name <safeName>]\n" +
+  "                [--interactive] [--propose] [--force]\n" +
+  "       crewhaus watchme publish [--dry-run]\n" +
+  '  Observe this harness\'s agent interactions ("watch me") and learn from them:\n' +
+  "  start flips on live capture (+ an immediate deterministic backfill digest),\n" +
+  "  report distills watched sessions into quality/continuity/factuality/model-fit\n" +
+  "  + counterfactual analysis, intents mines recurring requests, synthesize drafts\n" +
+  "  a validated mimic spec (a NEW file — existing specs are never touched), and\n" +
+  "  publish shares redacted findings via the wiki/Thredz for co-learning.\n" +
+  "  All conclusions are advisory — nothing is ever auto-applied.\n";
+
+/** Global watchme root: `--root` > `CREWHAUS_WATCHME_ROOT` > `~/.crewhaus/watchme`
+ *  (the `~/.crewhaus/pricing` precedent). */
+function watchmeGlobalRoot(rootFlag: string | undefined): string {
+  if (rootFlag !== undefined) return resolve(rootFlag);
+  const env = process.env["CREWHAUS_WATCHME_ROOT"];
+  if (env !== undefined && env !== "") return resolve(env);
+  return join(homedir(), ".crewhaus", "watchme");
+}
+
+/**
+ * The report/synthesize modules take a SYNC redact seam; this applies the
+ * same regex detector set `createPiiRedactor({ regexDetectors:
+ * SYNTHESIZE_PII_DETECTORS })` matches (that redactor's API is async-only,
+ * which a per-append callback cannot await) with the redactor's
+ * `[REDACTED:<kind>]` replace marker.
+ */
+function watchmeSyncRedactor(): (text: string) => string {
+  const detectors = SYNTHESIZE_PII_DETECTORS.map((d) => ({
+    kind: d.kind,
+    regex: new RegExp(
+      d.regex.source,
+      d.regex.flags.includes("g") ? d.regex.flags : `${d.regex.flags}g`,
+    ),
+  }));
+  return (text: string): string => {
+    let out = text;
+    for (const d of detectors) out = out.replace(d.regex, `[REDACTED:${d.kind}]`);
+    return out;
+  };
+}
+
+/** The one-criterion turn-quality rubric the watchme judge phase scores
+ *  against (1–5, mapped to [0,1] via the createJudgeGrader convention). */
+const WATCHME_JUDGE_RUBRIC: Rubric = {
+  criteria: [
+    {
+      name: "response_quality",
+      description:
+        "Overall quality of the assistant's reply to the user's request: correct, complete, concise, and on-task.",
+      anchors: {
+        "1": "Wrong, harmful, or entirely off-task.",
+        "2": "Mostly unhelpful — major errors or the request is largely unaddressed.",
+        "3": "Adequate — addresses the request with notable gaps or verbosity.",
+        "4": "Good — correct and complete with only minor flaws.",
+        "5": "Excellent — correct, complete, and concise.",
+      },
+    },
+  ],
+  passing_score: 3,
+};
+
+/**
+ * The phase-2 judge seam (watch-me §7), built on `runChatLoop` exactly like
+ * `buildDreamModelPhase`: one bounded single-turn session per sampled turn,
+ * the injection-hardened `buildJudgePrompt` reused verbatim (untrusted turn
+ * text rides inside per-call sentinel blocks), structured output forced
+ * through a `submit_score` tool, spend observed by a cost tracker on the
+ * run's own bus (never trusted from model claims), capped by the item-27
+ * budget option. `sessionId()` exposes the last judge session so the report
+ * driver can scan ITS OWN JSONL for evidence.
+ */
+function buildWatchmeJudgePhase(model: string, specName: string): WatchmeJudgePhase {
+  let lastSessionId: string | undefined;
+  return {
+    model,
+    sessionId: () => lastSessionId,
+    judgeTurn: async (input) => {
+      const { system, user } = buildJudgePrompt({
+        rubric: WATCHME_JUDGE_RUBRIC,
+        input: input.input,
+        expectedOutput: undefined,
+        agentOutput: input.output,
+      });
+      let verdict: { score: number; rationale: string } | undefined;
+      const submitScore = buildTool({
+        name: "submit_score",
+        description: "Submit the structured judgment for this turn. Call exactly once.",
+        inputSchema: z.object({
+          score: z.number().int().min(1).max(5),
+          rationale: z.string().min(1),
+        }),
+        readOnly: true,
+        destructive: false,
+        concurrencySafe: false,
+        execute: async ({ score, rationale }) => {
+          verdict = { score: (score - 1) / 4, rationale };
+          return "Judgment recorded. Reply with a one-line confirmation.";
+        },
+      });
+      const runContext = createRunContext();
+      lastSessionId = runContext.sessionId;
+      const tracker = createCostTracker(runContext.eventBus, { suppressEvents: true });
+      try {
+        await runChatLoop({
+          model,
+          instructions: system,
+          runContext,
+          singleTurn: true,
+          seedMessages: [{ role: "user", content: user }],
+          sessionName: specName,
+          sessionTarget: "watchme",
+          tools: [submitScore],
+          hooks: [],
+          maxToolIterations: 3,
+          budget: {
+            usdMicros: Math.max(0, Math.round(input.budgetRemainingUsd * 1_000_000)),
+            onExceed: { kind: "stop" },
+          },
+          spinner: false,
+        });
+        if (verdict === undefined) {
+          throw new Error("watchme judge made no submit_score call");
+        }
+        return {
+          score: verdict.score,
+          rationale: verdict.rationale,
+          spentUsd: tracker.getRunCost(runContext.runId).totalUsdMicros / 1_000_000,
+        };
+      } finally {
+        tracker.unsubscribe();
+      }
+    },
+  };
+}
+
+/** The lowered-IR slice the watchme handlers read (every carrier shape —
+ *  cli/channel/managed — threads `watchme?: IrWatchme` beside observability). */
+type WatchmeIrView = {
+  readonly name: string;
+  readonly target: string;
+  readonly watchme?: {
+    readonly enabled: boolean;
+    readonly capture: "full" | "mirrors";
+    readonly judgeModel: string;
+    readonly judgeSampleRate: number;
+    readonly judgeBudgetUsd: number;
+    readonly scope: "harness" | "user";
+    readonly share: boolean;
+  };
+};
+
+function loadWatchmeIr(args: ParsedArgs): { specPath: string; spec: Spec; ir: WatchmeIrView } {
+  const specPath = resolveWatchmeSpecPath(strFlag(args, "spec"), process.cwd());
+  const spec = parseSpec(readFileSync(specPath, "utf-8"));
+  return { specPath, spec, ir: lower(spec) as unknown as WatchmeIrView };
+}
+
+/** Sessions of one harness dir, oldest→newest (the intents `order` contract),
+ *  as the `{ sessionId, events }` rows the intents/turn helpers take. */
+function watchmeSessionRows(
+  sessionsDir: string,
+): Array<{ sessionId: string; events: Array<{ kind?: string; payload?: unknown }> }> {
+  const rows: Array<{ sessionId: string; events: Array<{ kind?: string; payload?: unknown }> }> =
+    [];
+  for (const id of [...sessionIdsByRecency(sessionsDir)].reverse()) {
+    const file = join(sessionsDir, `${id}.jsonl`);
+    if (!existsSync(file)) continue;
+    rows.push({
+      sessionId: id,
+      events: parseJsonlObjects(readFileSync(file, "utf-8")) as Array<{
+        kind?: string;
+        payload?: unknown;
+      }>,
+    });
+  }
+  return rows;
+}
+
+/** One-harness phase-1(+2) report with the real seams wired (watch-me §11). */
+async function runWatchmeHarnessReport(opts: {
+  readonly ir: WatchmeIrView;
+  readonly crewhausDir: string;
+  readonly sessionId?: string;
+  readonly outDir?: string;
+  readonly feedRouting?: boolean;
+  readonly emitFeedback?: boolean;
+  readonly noModel?: boolean;
+}): Promise<WatchmeReportResult> {
+  const judge =
+    opts.ir.watchme !== undefined
+      ? {
+          model: opts.ir.watchme.judgeModel,
+          sampleRate: opts.ir.watchme.judgeSampleRate,
+          budgetUsd: opts.ir.watchme.judgeBudgetUsd,
+        }
+      : undefined;
+  const deps: WatchmeReportDeps = {
+    fs: nodeReportFs,
+    now: Date.now,
+    store: openWatchmeStore(opts.crewhausDir, { specName: opts.ir.name }),
+    deriveTurns,
+    clusterIntents,
+    orderedTurnsFromSessions,
+    redactDigest,
+    redact: watchmeSyncRedactor(),
+    graderRegistry: () => defaultGraderRegistry(),
+    openScoreboard,
+    pricing: loadUserPricing(),
+    capabilities: DEFAULT_CAPABILITIES,
+    joinQualityToArms,
+    ...(judge !== undefined && judge.budgetUsd > 0 && opts.noModel !== true
+      ? { judgePhase: buildWatchmeJudgePhase(judge.model, opts.ir.name) }
+      : {}),
+    warn: (message) => process.stderr.write(`[watchme] ${message}\n`),
+  };
+  return await runWatchmeReport(
+    {
+      crewhausDir: opts.crewhausDir,
+      specName: opts.ir.name,
+      target: opts.ir.target,
+      ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
+      ...(opts.outDir !== undefined ? { outDir: opts.outDir } : {}),
+      ...(opts.feedRouting === true ? { feedRouting: true } : {}),
+      ...(opts.emitFeedback === true ? { emitFeedback: true } : {}),
+      ...(opts.noModel === true ? { noModel: true } : {}),
+      ...(judge !== undefined ? { judge } : {}),
+    },
+    deps,
+  );
+}
+
+/** The co-learning article slugs `watchme publish` upserts and `report --all`
+ *  recalls from peers (watch-me §11). */
+const WATCHME_ARTICLE_SLUGS = ["watchme-intents", "watchme-model-fit", "watchme-pitfalls"] as const;
+
+type WatchmeArticle = {
+  readonly slug: (typeof WATCHME_ARTICLE_SLUGS)[number];
+  readonly title: string;
+  readonly body: string;
+  /** Evidence-count confidence signal (sessions observed, saturating at 25). */
+  readonly confidence: number;
+};
+
+/** Distill the long-horizon store into the three co-learning articles. All
+ *  text rides observation fields that were redacted BEFORE append; the sync
+ *  redactor runs over the rendered bodies again as belt-and-braces. Throws
+ *  {@link WatchmeError} when there is nothing to publish yet. */
+function buildWatchmeArticles(
+  store: ReturnType<typeof openWatchmeStore>,
+  specName: string,
+): WatchmeArticle[] {
+  const observations = store.readObservations();
+  const aggregates = store.readAggregates();
+  const sessions = observations.length + aggregates.reduce((acc, a) => acc + a.n, 0);
+  if (sessions === 0) {
+    throw new WatchmeError(
+      "no watchme observations to publish — run `crewhaus watchme report` first",
+    );
+  }
+  const redact = watchmeSyncRedactor();
+  const confidence = Math.min(1, sessions / 25);
+  const advisory = "\n\n_Advisory — distilled from watched sessions; never auto-applied._\n";
+
+  const intentCounts = new Map<string, number>();
+  for (const obs of observations) {
+    for (const key of obs.intentKeys) intentCounts.set(key, (intentCounts.get(key) ?? 0) + 1);
+  }
+  for (const agg of aggregates) {
+    for (const [key, n] of Object.entries(agg.intents)) {
+      intentCounts.set(key, (intentCounts.get(key) ?? 0) + n);
+    }
+  }
+  const topIntents = [...intentCounts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 10);
+
+  const modelFold = new Map<string, { turns: number; costUsdMicros: number; unpriced: boolean }>();
+  for (const obs of observations) {
+    for (const m of obs.models) {
+      const key = m.spec ?? m.wire;
+      const entry = modelFold.get(key) ?? { turns: 0, costUsdMicros: 0, unpriced: false };
+      entry.turns += m.turns;
+      entry.costUsdMicros += m.costUsdMicros ?? 0;
+      if (m.unpriced === true) entry.unpriced = true;
+      modelFold.set(key, entry);
+    }
+  }
+
+  let toolCalls = 0;
+  let toolErrors = 0;
+  let downs = 0;
+  let breachSessions = 0;
+  for (const obs of observations) {
+    for (const t of obs.toolStats) {
+      toolCalls += t.calls;
+      toolErrors += t.errors;
+    }
+    downs += obs.feedback?.down ?? 0;
+    if (
+      obs.continuity !== undefined &&
+      Object.values(obs.continuity).some((c) => c.passed === false)
+    ) {
+      breachSessions += 1;
+    }
+  }
+  for (const agg of aggregates) {
+    toolCalls += agg.toolCalls;
+    toolErrors += agg.toolErrors;
+    downs += agg.feedbackDown;
+  }
+
+  const intentsBody = [
+    `Recurring intents observed across ${sessions} session(s) of ${specName}:`,
+    "",
+    ...(topIntents.length > 0
+      ? topIntents.map(([key, n]) => `- ${key} — ${n}×`)
+      : ["- (no intent clusters yet)"]),
+  ].join("\n");
+  const modelFitBody = [
+    `Model usage observed across ${sessions} session(s) of ${specName}:`,
+    "",
+    ...[...modelFold.entries()]
+      .sort((a, b) => b[1].turns - a[1].turns || a[0].localeCompare(b[0]))
+      .map(
+        ([model, e]) =>
+          `- ${model}: ${e.turns} turn(s), cost ${
+            e.unpriced ? "UNKNOWN (unpriced)" : `$${(e.costUsdMicros / 1_000_000).toFixed(4)}`
+          }`,
+      ),
+    "",
+    "Verify any downshift with `crewhaus model right-size` — the roster is never patched automatically.",
+  ].join("\n");
+  const pitfallsBody = [
+    `Recurring failure patterns across ${sessions} session(s) of ${specName}:`,
+    "",
+    `- tool errors: ${toolErrors}/${toolCalls} call(s)`,
+    `- thumbs-down ratings: ${downs}`,
+    `- sessions with a continuity-metric breach: ${breachSessions}`,
+  ].join("\n");
+
+  return [
+    {
+      slug: "watchme-intents",
+      title: `watchme: recurring intents (${specName})`,
+      body: redact(`${intentsBody}${advisory}`),
+      confidence,
+    },
+    {
+      slug: "watchme-model-fit",
+      title: `watchme: model fit (${specName})`,
+      body: redact(`${modelFitBody}${advisory}`),
+      confidence,
+    },
+    {
+      slug: "watchme-pitfalls",
+      title: `watchme: pitfalls (${specName})`,
+      body: redact(`${pitfallsBody}${advisory}`),
+      confidence,
+    },
+  ];
+}
+
+/**
+ * `crewhaus watchme publish` — versioned upserts of the three articles into
+ * the spec's wiki store (the same substrate the memory fabric writes;
+ * Thredz-synced when the harness configures `thredz:`, local-only otherwise —
+ * visibility follows that config). Degrade-never-halt: any store failure is
+ * one warning, never a non-zero exit — the local digest store stays
+ * authoritative.
+ */
+async function publishWatchmeArticles(opts: {
+  readonly specName: string;
+  readonly crewhausDir: string;
+  readonly dryRun: boolean;
+}): Promise<void> {
+  const store = openWatchmeStore(opts.crewhausDir, { specName: opts.specName });
+  const articles = buildWatchmeArticles(store, opts.specName);
+  if (opts.dryRun) {
+    for (const a of articles) {
+      process.stdout.write(`[watchme] would publish ${a.slug} — ${a.title}\n${a.body}\n\n`);
+    }
+    return;
+  }
+  try {
+    const wiki = createWikiStore({
+      specName: opts.specName,
+      rootDir: join(process.cwd(), WIKI_SUBDIR),
+    });
+    for (const a of articles) {
+      const write = async (): Promise<void> => {
+        const existing = await wiki.get(a.slug);
+        await wiki.write({
+          slug: a.slug,
+          title: a.title,
+          body: a.body,
+          tags: ["watchme"],
+          ...(existing !== null ? { expectedVersion: existing.version } : {}),
+        });
+        await wiki.setSignals(a.slug, { confidence: a.confidence });
+      };
+      try {
+        await write();
+      } catch (err) {
+        // Concurrent writer bumped the version between read and write —
+        // re-read and reapply once (the wiki-store contract).
+        if (err instanceof WikiVersionConflictError) await write();
+        else throw err;
+      }
+      process.stdout.write(`[watchme] published ${a.slug}\n`);
+    }
+  } catch (err) {
+    process.stderr.write(
+      `[watchme] publish degraded: ${(err as Error).message} (local watchme store still authoritative)\n`,
+    );
+  }
+}
+
+/** `crewhaus watchme <action>` — dispatch behind the §11 action allowlist. */
+async function runWatchme(args: ParsedArgs, action: string): Promise<void> {
+  if (action === "" || args.flags["help"] === true) {
+    process.stdout.write(WATCHME_USAGE);
+    return;
+  }
+  const cwd = process.cwd();
+  const crewhausDir = join(cwd, ".crewhaus");
+  const globalRoot = watchmeGlobalRoot(strFlag(args, "root"));
+
+  switch (action) {
+    case "start": {
+      const { ir } = loadWatchmeIr(args);
+      const store = openWatchmeStore(crewhausDir, { specName: ir.name });
+      const registry = openHarnessRegistry(globalRoot);
+      const capture = ir.watchme?.capture ?? "full";
+      const result = await watchmeStart({
+        store,
+        registry,
+        harness: { dir: cwd, specName: ir.name, target: ir.target },
+        runBackfill: () => runWatchmeHarnessReport({ ir, crewhausDir, noModel: true }),
+      });
+      process.stdout.write(
+        `[watchme] ${result.alreadyWatching ? "already watching" : "watching"} ${ir.name} (capture: ${capture})\n`,
+      );
+      if (ir.watchme === undefined) {
+        process.stdout.write(
+          "[watchme] make it durable across machines — add to the spec: watchme: { enabled: true }\n",
+        );
+      }
+      const backfill = result.backfill;
+      if (backfill.outcome === "written" && backfill.outDir !== undefined) {
+        process.stdout.write(`[watchme] backfill report ${backfill.outDir}\n`);
+      } else if (backfill.outcome === "no-sessions") {
+        process.stdout.write(
+          "[watchme] backfill: no sessions yet — the next `crewhaus run` is captured live\n",
+        );
+      } else {
+        process.stdout.write("[watchme] backfill skipped: another report holds the lock\n");
+      }
+      return;
+    }
+    case "stop": {
+      const store = openWatchmeStore(crewhausDir);
+      const registry = openHarnessRegistry(globalRoot);
+      const result = watchmeStop({
+        store,
+        registry,
+        harnessDir: cwd,
+        ...(args.flags["forget"] === true ? { forget: true } : {}),
+      });
+      process.stdout.write(
+        `[watchme] ${result.wasWatching ? "stopped watching" : "was not watching"} (data kept${result.forgotten ? "; deregistered" : ""})\n`,
+      );
+      return;
+    }
+    case "status": {
+      const store = openWatchmeStore(crewhausDir);
+      const registry = openHarnessRegistry(globalRoot);
+      let sessionFiles: string[] = [];
+      try {
+        sessionFiles = readdirSync(join(cwd, SESSIONS_SUBDIR));
+      } catch {
+        sessionFiles = [];
+      }
+      const summary = watchmeStatus({ store, registry, sessionFiles });
+      process.stdout.write(
+        args.flags["json"] === true
+          ? `${JSON.stringify(summary, null, 2)}\n`
+          : `${formatWatchmeStatus(summary)}\n`,
+      );
+      return;
+    }
+    case "report": {
+      const outFlag = strFlag(args, "out");
+      if (args.flags["all"] === true) {
+        const registry = openHarnessRegistry(globalRoot);
+        const entries = registry.list();
+        if (entries.length === 0) {
+          die(
+            "no registered harnesses — run `crewhaus watchme start` in a harness first (or pass the --root that holds the registry)",
+          );
+        }
+        const outDir =
+          outFlag !== undefined
+            ? resolve(outFlag)
+            : join(
+                crewhausDir,
+                "watchme",
+                "reports",
+                new Date().toISOString().replace(/[:.]/g, "-"),
+              );
+        const readHarness = (entry: HarnessEntry): HarnessSlice | undefined => {
+          const dir = join(entry.dir, ".crewhaus");
+          if (!existsSync(dir)) return undefined;
+          const s = openWatchmeStore(dir, { specName: entry.specName });
+          return {
+            entry,
+            observations: s.readObservations(),
+            aggregates: s.readAggregates(),
+            judgments: s.readJudgments(),
+          };
+        };
+        const recallSharedFindings = async (): Promise<ReadonlyArray<SharedWatchmeFinding>> => {
+          const findings: SharedWatchmeFinding[] = [];
+          for (const entry of entries) {
+            if (resolve(entry.dir) === cwd) continue; // peers only
+            const wikiRoot = join(entry.dir, WIKI_SUBDIR);
+            if (!existsSync(wikiRoot)) continue;
+            const wiki = createWikiStore({ specName: entry.specName, rootDir: wikiRoot });
+            for (const slug of WATCHME_ARTICLE_SLUGS) {
+              const article = await wiki.get(slug);
+              if (article === null) continue;
+              findings.push({
+                agentName: entry.specName,
+                slug,
+                title: article.title,
+                excerpt: article.body.split("\n").find((l) => l.trim() !== "") ?? "",
+                confidence: article.confidence,
+              });
+            }
+          }
+          return findings;
+        };
+        const { report, files } = await runWatchmeAllReport(
+          { harnesses: entries, outDir },
+          {
+            fs: nodeReportFs,
+            now: Date.now,
+            redact: watchmeSyncRedactor(),
+            readHarness,
+            recallSharedFindings,
+            warn: (message) => process.stderr.write(`[watchme] ${message}\n`),
+          },
+        );
+        if (args.flags["json"] === true) {
+          process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+        } else {
+          for (const f of files) process.stdout.write(`[watchme] wrote ${f}\n`);
+        }
+        return;
+      }
+      const { ir } = loadWatchmeIr(args);
+      const sessionFlag = strFlag(args, "session");
+      const result = await runWatchmeHarnessReport({
+        ir,
+        crewhausDir,
+        ...(sessionFlag !== undefined ? { sessionId: sessionFlag } : {}),
+        ...(outFlag !== undefined ? { outDir: resolve(outFlag) } : {}),
+        ...(args.flags["feed-routing"] === true ? { feedRouting: true } : {}),
+        ...(args.flags["emit-feedback"] === true ? { emitFeedback: true } : {}),
+        ...(args.flags["no-model"] === true ? { noModel: true } : {}),
+      });
+      if (result.outcome === "no-sessions") {
+        die("no sessions to analyze — run the harness first");
+      }
+      if (result.outcome === "locked") {
+        die("another watchme report holds the run.lock — retry shortly");
+      }
+      if (ir.watchme?.share === true) {
+        // Spec-declared co-learning: publish the refreshed digest at report
+        // time (degrade-never-halt inside).
+        await publishWatchmeArticles({ specName: ir.name, crewhausDir, dryRun: false });
+      }
+      if (args.flags["json"] === true) {
+        process.stdout.write(`${JSON.stringify(result.report, null, 2)}\n`);
+      } else {
+        for (const f of result.files) process.stdout.write(`[watchme] wrote ${f}\n`);
+      }
+      return;
+    }
+    case "intents": {
+      const perSession: Array<{
+        sessionId: string;
+        events: Array<{ kind?: string; payload?: unknown }>;
+      }> = [];
+      if (args.flags["all"] === true) {
+        for (const entry of openHarnessRegistry(globalRoot).list()) {
+          perSession.push(...watchmeSessionRows(join(entry.dir, SESSIONS_SUBDIR)));
+        }
+      } else {
+        perSession.push(...watchmeSessionRows(join(cwd, SESSIONS_SUBDIR)));
+      }
+      if (perSession.length === 0) die("no sessions to analyze — run the harness first");
+      const turns = orderedTurnsFromSessions(perSession, deriveTurns);
+      if (turns.length === 0) die("scanned sessions have no user turns to analyze");
+      const feedback: FeedbackRecord[] = [];
+      const failedTurnKeys: TurnSignal[] = [];
+      for (const { sessionId, events } of perSession) {
+        feedback.push(...extractFeedbackRecords(events));
+        for (const c of mineSession(sessionId, events)) {
+          failedTurnKeys.push({ sessionId: c.sessionId, turnNumber: c.turnNumber });
+        }
+      }
+      const digest = redactDigest(
+        clusterIntents(turns, feedback, failedTurnKeys),
+        watchmeSyncRedactor(),
+      );
+      process.stdout.write(
+        args.flags["json"] === true ? renderIntentsJson(digest) : renderIntentsText(digest),
+      );
+      return;
+    }
+    case "synthesize": {
+      if (args.flags["interactive"] === true) {
+        // Reserved flag (watch-me §11 negative space): the digest-seeded
+        // interview needs an init-conversation seeding seam that has not
+        // landed; the flag dies loudly instead of silently not existing.
+        die("watchme synthesize --interactive is not yet implemented; see design/watch-me.md §7");
+      }
+      const { ir, spec } = loadWatchmeIr(args);
+      const store = openWatchmeStore(crewhausDir, { specName: ir.name });
+      const observations = store.readObservations();
+      if (observations.length === 0) {
+        die("no watchme observations to synthesize from — run `crewhaus watchme report` first");
+      }
+      const perSession = watchmeSessionRows(join(cwd, SESSIONS_SUBDIR));
+      const turns = orderedTurnsFromSessions(perSession, deriveTurns);
+      const feedback: FeedbackRecord[] = [];
+      const failedTurnKeys: TurnSignal[] = [];
+      for (const { sessionId, events } of perSession) {
+        feedback.push(...extractFeedbackRecords(events));
+        for (const c of mineSession(sessionId, events)) {
+          failedTurnKeys.push({ sessionId: c.sessionId, turnNumber: c.turnNumber });
+        }
+      }
+      const digest = clusterIntents(turns, feedback, failedTurnKeys);
+      const pricing = loadUserPricing();
+      const anyTools = observations.some((o) => o.toolStats.length > 0);
+      const counterfactualModels = buildCounterfactuals({
+        models: observations.flatMap((o) => o.models),
+        require: anyTools ? { tool_use: true } : {},
+        pricing,
+        capabilities: DEFAULT_CAPABILITIES,
+        arms: openScoreboard(crewhausDir).snapshot(),
+        turnQuality: [],
+      }).map((row) => ({
+        model: row.candidate,
+        estCostUsdMicrosPerTurn: row.effectiveTurnCostMicros,
+      }));
+      const name = strFlag(args, "name") ?? `${ir.name}-mimic`;
+      const mcpServers = (spec as { mcp_servers?: Record<string, unknown> }).mcp_servers;
+      const outFlag = strFlag(args, "out");
+      const outPath =
+        outFlag !== undefined
+          ? resolve(outFlag)
+          : join(crewhausDir, "watchme", "synthesized", `${name}.yaml`);
+      const result = await runWatchmeSynthesize(
+        {
+          name,
+          observations,
+          intents: digest,
+          counterfactualModels,
+          ...(mcpServers !== undefined ? { mcpServers } : {}),
+          redact: watchmeSyncRedactor(),
+        },
+        {
+          rootDir: cwd,
+          fs: {
+            exists: existsSync,
+            mkdirp: (dir) => mkdirSync(dir, { recursive: true, mode: 0o700 }),
+            write: (path, text) => writeFileSync(path, text, { mode: 0o600 }),
+          },
+          ...(outFlag !== undefined ? { outFile: outPath } : {}),
+          ...(args.flags["force"] === true ? { force: true } : {}),
+          ...(args.flags["propose"] === true
+            ? {
+                propose: (o: {
+                  specName: string;
+                  currentYaml: string;
+                  proposedYaml: string;
+                  source: "watchme";
+                }): void => {
+                  const assembled = assembleProposal({
+                    specName: o.specName,
+                    currentYaml: o.currentYaml,
+                    proposedYaml: o.proposedYaml,
+                    source: o.source,
+                    proposedVersion: "0.1.0",
+                  });
+                  const patchPath = `${outPath}.patch.json`;
+                  writeFileSync(patchPath, assembled.patchJson, { mode: 0o600 });
+                  process.stdout.write(
+                    `[watchme] proposal bundle ${patchPath} — open the review PR with \`crewhaus propose ${outPath}\`\n`,
+                  );
+                },
+              }
+            : {}),
+        },
+      );
+      process.stdout.write(result.summary);
+      return;
+    }
+    case "publish": {
+      const { ir } = loadWatchmeIr(args);
+      await publishWatchmeArticles({
+        specName: ir.name,
+        crewhausDir,
+        dryRun: args.flags["dry-run"] === true,
+      });
+      return;
+    }
+    default:
+      // Unreachable — the dispatch allowlist rejects unknown actions first.
+      die(`unknown watchme action "${action}"`);
+  }
+}
+
 /**
  * Item 66 — `crewhaus onchain tune|sentinel`. Reads the spec's current
  * transaction_policy from its lowered IR (for tune's baseline + whitelisting)
@@ -18232,6 +19074,34 @@ switch (subcommand) {
       throw err;
     }
     break;
+  case "watchme": {
+    // "Watch me" (design/watch-me.md §11) — observe-and-learn verbs. A leading
+    // -h/--help in the action slot routes to the command's own help (stdout,
+    // exit 0), not the invalid-action error; structured failures → die().
+    const first = rest[0] ?? "";
+    const isHelp = first === "--help" || first === "-h";
+    const action = isHelp ? "" : first;
+    const allowed = ["", "start", "stop", "status", "report", "intents", "synthesize", "publish"];
+    if (!isHelp && !allowed.includes(action)) {
+      die(
+        `watchme action must be one of: start, stop, status, report, intents, synthesize, publish (got "${action}")`,
+      );
+    }
+    try {
+      await runWatchme(parseFor(isHelp ? rest : rest.slice(1), WATCHME_SCHEMA), action);
+    } catch (err) {
+      if (
+        err instanceof CrewhausError ||
+        err instanceof WatchmeError ||
+        err instanceof WatchmeReportError ||
+        err instanceof WatchmeSynthesizeError
+      ) {
+        die(err.message);
+      }
+      throw err;
+    }
+    break;
+  }
   case "loadtest":
     // Item 68 — concurrency benchmark + deploy gate for daemon shapes.
     try {

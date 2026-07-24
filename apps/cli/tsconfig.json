@@ -79,6 +79,7 @@
     { "path": "../../packages/tool-todo" },
     { "path": "../../packages/tool-vision-grounding" },
     { "path": "../../packages/tool-web" },
+    { "path": "../../packages/watchme-store" },
     { "path": "../../packages/docker-images" },
     { "path": "../../packages/crewhaus-cloud" },
     { "path": "../../packages/federation-discovery" },

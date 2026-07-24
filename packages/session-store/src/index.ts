@@ -8,7 +8,8 @@
  *
  * `list()` performs TTL eviction as a side-effect: any `.json` file whose
  * filesystem `mtime` is older than `now - ttlDays * 86_400_000` ms is
- * `unlink`-ed (along with its sibling `<id>.jsonl` event log) before the
+ * `unlink`-ed (along with its sibling `<id>.jsonl` event log and
+ * `<id>.events.jsonl` watchme trace log) before the
  * surviving sessions are returned. Eviction key is mtime — not the in-file
  * `updatedAt` — so that `touch -t YYYYMMDD0000 <id>.json` is a sufficient
  * way to test or force expiry from the shell.
@@ -94,11 +95,16 @@ function sessionLogPath(rootDir: string, id: string): string {
   return fencePath(resolve(rootDir, `${id}.jsonl`));
 }
 
+function sessionEventsPath(rootDir: string, id: string): string {
+  return fencePath(resolve(rootDir, `${id}.events.jsonl`));
+}
+
 /**
  * The TTL-eviction pass shared by `list()` and `evictExpiredSessions()`.
  * Walks `rootDir` and unlinks every `sess_<16 hex>.json` whose filesystem
  * mtime is older than `cutoffMs` (along with its sibling `.jsonl` event
- * log). Ids in `pinnedIds` are never evicted (they count as survivors) —
+ * log and `.events.jsonl` watchme trace log). Ids in `pinnedIds` are never
+ * evicted (they count as survivors) —
  * the `.crewhaus/retention.json` pin contract threaded through by
  * `evictExpiredSessions`. Returns the evicted ids plus the ids that
  * survive, so `list()` can read the survivors without a second directory
@@ -158,9 +164,10 @@ async function sweepExpired(
       if (onBeforeEvict !== undefined) {
         await onBeforeEvict(id, rootDir).catch(() => undefined);
       }
-      // Evict: unlink both the session file and any sibling event log.
+      // Evict: unlink the session file and any sibling event/trace logs.
       await unlink(fullPath).catch(() => undefined);
       await unlink(sessionLogPath(rootDir, id)).catch(() => undefined);
+      await unlink(sessionEventsPath(rootDir, id)).catch(() => undefined);
       evictedIds.push(id);
       continue;
     }
@@ -189,7 +196,8 @@ export type EvictExpiredSessionsOptions = SessionStoreOptions & {
 
 /**
  * Run the TTL-eviction pass standalone — exactly `list()`'s eviction
- * side-effect (mtime-keyed, unlinks `.json` + sibling `.jsonl`) without
+ * side-effect (mtime-keyed, unlinks `.json` + sibling
+ * `.jsonl`/`.events.jsonl`) without
  * reading or parsing the surviving sessions. Daemon shapes that never call
  * `list()` (managed gateway, channel bots, batch workers) invoke this from
  * `runtime-core`'s boot-time janitor so idle transcripts still expire.

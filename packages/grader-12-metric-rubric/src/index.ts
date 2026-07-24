@@ -16,7 +16,10 @@
  * installs each metric under its canonical name (`twelve.contextRelevance`,
  * `twelve.toolExecutionSuccess`, etc.). Some metrics are directly
  * computable from `RunResult` (tool execution success, multi-step
- * coherence, p99 latency). Some require dataset extensions (context
+ * coherence, p99 latency). The three generation metrics (answer
+ * faithfulness, answer relevance, hallucination rate) are deterministic
+ * claim-vs-evidence token-coverage checks over the run's own transcript —
+ * see `faithfulness.ts`. Some require dataset extensions (context
  * relevance/recall/precision need ground-truth retrieved chunks; tool
  * selection accuracy needs an `expectedTool` field on the Sample). For
  * the latter, this package ships stubs that return `passed: false` with a
@@ -33,6 +36,7 @@
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { GradeResult, Grader, RunResult } from "@crewhaus/eval-grader";
 import type { GraderRegistry } from "@crewhaus/grader-registry";
+import { answerFaithfulness, answerRelevance, hallucinationRate } from "./faithfulness";
 
 /**
  * Industry-validated thresholds from the TDS paper. Exported so eval-judge
@@ -334,32 +338,16 @@ export const costPerQuery: Grader = async (sample, _run) => {
   };
 };
 
-// ─── LLM-judge-dependent stubs ────────────────────────────────────────────
+// ─── Deterministic factuality graders ─────────────────────────────────────
 
-/**
- * Answer Faithfulness, Answer Relevance, Hallucination Rate require an
- * LLM-as-judge to extract atomic claims (faithfulness) or paraphrased
- * questions (relevance) or fact-check against context (hallucination).
- *
- * The TDS paper's recommendation is GPT-4 for high-stakes, Claude Sonnet
- * for cost-sensitive, Llama 3 70B for self-hosted. CrewHaus's eval-judge
- * supplies the model via `eval-runner`'s judge-model config; this package
- * exposes the metric *names* and threshold constants, but the actual
- * judge implementations live in `grader-semantic-similarity` and
- * `grader-safety-classifiers` and get wired via `register12MetricRubric`
- * when those graders are available.
- */
-const llmJudgeStub =
-  (metric: string): Grader =>
-  async () => ({
-    passed: false,
-    score: 0,
-    rationale: `${metric} requires an LLM-judge grader; install grader-semantic-similarity + grader-safety-classifiers and pass --rubric=12-metric to wire them through eval-judge`,
-  });
-
-export const answerFaithfulness: Grader = llmJudgeStub("twelve.answerFaithfulness");
-export const answerRelevance: Grader = llmJudgeStub("twelve.answerRelevance");
-export const hallucinationRate: Grader = llmJudgeStub("twelve.hallucinationRate");
+export {
+  GROUNDING_COVERAGE,
+  MIN_CLAIM_TOKENS,
+  answerFaithfulness,
+  answerRelevance,
+  claimSentences,
+  hallucinationRate,
+} from "./faithfulness";
 
 // ─── Registry installer ───────────────────────────────────────────────────
 

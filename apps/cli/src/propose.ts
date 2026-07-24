@@ -44,7 +44,7 @@ export class ProposeError extends Error {
 /** Where a proposal's review bundle lands within the repo. */
 export const PROPOSALS_RELDIR = ".crewhaus/proposals";
 
-export type ProposeSource = "optimize" | "advise" | "model-scan" | "manual";
+export type ProposeSource = "optimize" | "advise" | "model-scan" | "manual" | "watchme";
 
 /** sha256 hex of a spec's bytes — the patch identity carried into provenance. */
 export function specContentHash(yaml: string): string {

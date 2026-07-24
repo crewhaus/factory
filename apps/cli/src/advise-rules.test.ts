@@ -5,12 +5,13 @@
  * pre-validation, and the report/suggestions artifacts.
  */
 import { describe, expect, it } from "bun:test";
-import { parseSpec } from "@crewhaus/spec";
+import { type Spec, parseSpec } from "@crewhaus/spec";
 import { validatePatch } from "@crewhaus/spec-patch";
 import {
   type AdviceFinding,
   LOOP_NUDGE_PREFIX,
   type SessionEvents,
+  type WatchmeAdviceSlice,
   buildAdviceContext,
   buildSuggestionsFile,
   formatFindingLines,
@@ -28,6 +29,7 @@ import {
   ruleStopReasonAnomalies,
   ruleSubAgentSplit,
   ruleTruncationPressure,
+  ruleWatchmeCoverage,
   runAdviceRules,
   subAgentFragment,
   taxonomyPatternTooBroad,
@@ -1065,5 +1067,103 @@ describe("rulePoolStaleExploitation", () => {
     expect(
       rulePoolStaleExploitation(buildAdviceContext([], [], arms), { spec: POOL_SPEC }),
     ).toEqual([]);
+  });
+});
+
+// -------- "watch me" coverage + low-satisfaction (design/watch-me.md §4.4) --------
+
+function emptySessions(count: number): SessionEvents[] {
+  return Array.from({ length: count }, (_, i) =>
+    session(`sess_${String(i).padStart(16, "0")}`, []),
+  );
+}
+
+describe("ruleWatchmeCoverage", () => {
+  // The watchme: spec block is read through the index-signature accessor, so
+  // the fixture only needs the key present — the parsed shape is irrelevant.
+  const WATCHED_SPEC = { ...CLI_SPEC, watchme: { enabled: true } } as unknown as Spec;
+  const lowSatSlice = (overrides: Partial<WatchmeAdviceSlice> = {}): WatchmeAdviceSlice => ({
+    active: true,
+    intents: [{ key: "refund-status", sessions: 4, meanSatisfaction: 0.2 }],
+    ...overrides,
+  });
+
+  it("nudges toward watchme start at ≥10 sessions with an unwatched spec", () => {
+    const findings = ruleWatchmeCoverage(buildAdviceContext(emptySessions(10)), {
+      spec: CLI_SPEC,
+    });
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.id).toBe("watchme-coverage");
+    expect(findings[0]?.severity).toBe("info");
+    const suggestion = findings[0]?.suggestion;
+    expect(suggestion?.kind).toBe("advice");
+    expect(suggestion?.kind === "advice" && suggestion.text).toContain("crewhaus watchme start");
+  });
+
+  it("stays silent below the session floor, without a spec, with a watchme: block, or when already watching", () => {
+    // 9 sessions — under the floor.
+    expect(ruleWatchmeCoverage(buildAdviceContext(emptySessions(9)), { spec: CLI_SPEC })).toEqual(
+      [],
+    );
+    // No spec — can't judge block coverage.
+    expect(ruleWatchmeCoverage(buildAdviceContext(emptySessions(10)))).toEqual([]);
+    // Spec already carries the block.
+    expect(
+      ruleWatchmeCoverage(buildAdviceContext(emptySessions(10)), { spec: WATCHED_SPEC }),
+    ).toEqual([]);
+    // State file says watching (spec block still absent) — no start nudge.
+    expect(
+      ruleWatchmeCoverage(
+        buildAdviceContext(emptySessions(10), [], [], { active: true, intents: [] }),
+        { spec: CLI_SPEC },
+      ),
+    ).toEqual([]);
+  });
+
+  it("points a watched harness with a persistent low-satisfaction cluster at watchme report", () => {
+    const ctx = buildAdviceContext(emptySessions(2), [], [], lowSatSlice());
+    const findings = ruleWatchmeCoverage(ctx, { spec: WATCHED_SPEC });
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.id).toBe("watchme-low-satisfaction");
+    expect(findings[0]?.severity).toBe("warn");
+    expect(findings[0]?.summary).toContain("refund-status");
+    const suggestion = findings[0]?.suggestion;
+    expect(suggestion?.kind).toBe("advice");
+    expect(suggestion?.kind === "advice" && suggestion.text).toContain("crewhaus watchme report");
+  });
+
+  it("ignores clusters that are short-lived, satisfied, or carry no quality signal", () => {
+    const slice = lowSatSlice({
+      intents: [
+        { key: "one-off", sessions: 2, meanSatisfaction: 0.1 }, // not persistent
+        { key: "happy-path", sessions: 6, meanSatisfaction: 0.9 }, // satisfied
+        { key: "unscored", sessions: 6 }, // no quality signal
+      ],
+    });
+    expect(
+      ruleWatchmeCoverage(buildAdviceContext(emptySessions(2), [], [], slice), {
+        spec: WATCHED_SPEC,
+      }),
+    ).toEqual([]);
+  });
+
+  it("never fires on an inactive slice's intents and degrades to zero findings on old-vintage folds", () => {
+    // Low-satisfaction data but active: false → no report nudge (and the
+    // coverage nudge needs ≥10 sessions).
+    expect(
+      ruleWatchmeCoverage(
+        buildAdviceContext(emptySessions(2), [], [], lowSatSlice({ active: false })),
+        { spec: CLI_SPEC },
+      ),
+    ).toEqual([]);
+    // Old-vintage fold — no slice at all, quiet context.
+    expect(
+      runAdviceRules(buildAdviceContext([session(SESSION_A, OLD_VINTAGE)]), { spec: CLI_SPEC }),
+    ).toEqual([]);
+  });
+
+  it("is appended to ADVICE_RULES and ranks through runAdviceRules", () => {
+    const findings = runAdviceRules(buildAdviceContext(emptySessions(10)), { spec: CLI_SPEC });
+    expect(findings.map((f) => f.id)).toEqual(["watchme-coverage"]);
   });
 });

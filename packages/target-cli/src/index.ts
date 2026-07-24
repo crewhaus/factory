@@ -749,6 +749,9 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   // attaches the SLO monitor (sensing + alert, gated by CREWHAUS_SLO). Empty
   // when the spec omits the block.
   const sloField = renderSloField(ir);
+  // "Watch me" (§6.3) — the live-capture env stamp. Empty when the spec did
+  // not opt into full capture, keeping pre-existing bundles byte-identical.
+  const watchmeEnvStamp = renderWatchmeEnvStamp(ir);
   const runChatLoopCall = `await runChatLoop({
   model: ${escapeJsonString(ir.agent.model)},
   instructions: ${escapeJsonString(ir.agent.instructions)},
@@ -816,7 +819,7 @@ ${catchBlock}${finallyBlock}`;
 import { formatRunFailure, toFailureReport } from "@crewhaus/errors";
 import { runChatLoop } from "@crewhaus/runtime-core";
 ${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${evaluationImportBlock}${memoryImportBlock}${knowledgeImportBlock}${pluginsImportBlock}${extensionImport}
-${registerBlock}
+${watchmeEnvStamp}${registerBlock}
 ${pluginsActivateBoot}${extensionBoot}${pluginsRegisterBoot}${specHooks.bootBlock}
 
 ${bannerBoot}${subAgentsBoot}${egressBoot}${evaluationBoot}${bootBlocks}${knowledgeBoot}${wrapped}
@@ -1005,6 +1008,26 @@ function renderSloField(ir: IrV0): string {
   const slo = ir.observability?.slo;
   if (slo === undefined) return "";
   return `\n  sloTargets: ${JSON.stringify(slo)},`;
+}
+
+/**
+ * "Watch me" (watch-me §6.3) — stamp the live-capture gate at bundle boot when
+ * the spec opted into full capture (`watchme.enabled` + `capture: "full"`).
+ * `??=` so an operator's own env always wins, matching the G26 stamp posture.
+ * Mirror: `crewhaus run` stamps the same env on the interpreter path via
+ * `resolveWatchmeEnv` inside `applyRunObservabilityEnv` (apps/cli), and
+ * target-channel-bot stamps it in its G26 env emitter — keep the three in
+ * sync. Structural param (renderModelFailoverFields precedent): only the two
+ * fields the stamp reads. Empty when unset, keeping bundles byte-identical.
+ */
+function renderWatchmeEnvStamp(ir: {
+  readonly watchme?: { readonly enabled: boolean; readonly capture: "full" | "mirrors" };
+}): string {
+  if (ir.watchme?.enabled !== true || ir.watchme.capture !== "full") return "";
+  return `\n// "Watch me" — live capture gate (\`??=\` so an operator's own env still wins);
+// runtime-core's attachWatchmeCapture writes the .events.jsonl trace sibling.
+process.env["CREWHAUS_WATCHME"] ??= "1";
+`;
 }
 
 /**

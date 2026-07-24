@@ -1120,6 +1120,33 @@ describe("emitCli — observability.slo → sloTargets (item 37, F4 codegen pari
   });
 });
 
+describe('emitCli — watchme env stamp ("watch me" §6.3)', () => {
+  const watchmeIr = (enabled: boolean, capture: "full" | "mirrors"): IrV0 =>
+    baseIr({
+      watchme: {
+        enabled,
+        capture,
+        judgeModel: "claude-haiku-4-5",
+        judgeSampleRate: 0.15,
+        judgeBudgetUsd: 0,
+        scope: "harness",
+        share: false,
+      },
+    });
+
+  test("enabled + capture full stamps CREWHAUS_WATCHME at bundle boot", () => {
+    const content = emitCli(watchmeIr(true, "full")).files[0]?.content ?? "";
+    expect(content).toContain('process.env["CREWHAUS_WATCHME"] ??= "1";');
+  });
+
+  test("mirrors capture / disabled / absent block ⇒ no stamp (byte-identity guard)", () => {
+    for (const ir of [watchmeIr(true, "mirrors"), watchmeIr(false, "full"), baseIr()]) {
+      const content = emitCli(ir).files[0]?.content ?? "";
+      expect(content).not.toContain("CREWHAUS_WATCHME");
+    }
+  });
+});
+
 describe("emitCli — learning block (v0.3.0 §3.3, PR 17)", () => {
   const LEARNING = {
     domain: "specialty coffee extraction science",
