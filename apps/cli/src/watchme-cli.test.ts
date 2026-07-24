@@ -139,7 +139,10 @@ describe("crewhaus watchme (design/watch-me.md §11)", () => {
     const result = await runCli(["watchme", "-h"], home, home);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("usage: crewhaus watchme start");
-    expect(result.stderr).toBe("");
+    // Help routes to stdout, not stderr. Don't assert stderr is empty — the
+    // anthropic adapter emits a benign fallback-version warning to stderr when
+    // no `claude` CLI is installed (e.g. on CI runners).
+    expect(result.stderr).not.toContain("usage:");
   });
 
   test("start flips state, registers the harness, and backfills a report", async () => {
