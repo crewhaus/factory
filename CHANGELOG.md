@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `twelve.hallucinationRate` graders are now real deterministic
   claim-vs-evidence checks instead of always-fail stubs — eval suites
   referencing them will change verdicts and (name, dataset)-keyed baselines
-  will shift. [#NNN]
+  will shift. [#341]
 
 ### Fixed
 
@@ -54,7 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   --check` also no longer overwrites a user-authored `package.json` when
   verifying.
 
-[#NNN]: https://github.com/crewhaus/factory/pull/NNN
+[#341]: https://github.com/crewhaus/factory/pull/341
 
 ## [0.4.0] - 2026-07-18
 
