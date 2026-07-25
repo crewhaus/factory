@@ -28,6 +28,33 @@ export type GradeResult = {
    * verdicts (their criterion scores are guesses), and pre-A12 records.
    */
   readonly detail?: Readonly<Record<string, number>>;
+  /**
+   * A2 — the sample deserves a HUMAN look even though the verdict is real:
+   * a judge panel's pass/fail vote split was high-entropy (normalized vote
+   * entropy > 0.8 — e.g. 2–1 or 3–2), so the recorded pass/fail is a
+   * coin-flip-grade signal. Unlike `abstained`, the verdict still COUNTS
+   * (pass-rate denominator unchanged); the runner only lists the sample in
+   * a separate needs-review bucket beside the abstained needs-human one.
+   * Absent on single-judge grades, unanimous-ish panels, and pre-A2 records.
+   */
+  readonly needsReview?: boolean;
+  /**
+   * A2 — the judge panel behind this verdict (`llm_judge` with `judges:`).
+   * `panelists` records each panel model's own outcome (raw 1–5 score —
+   * fractional when per-panelist `repeats` composed a median — absent when
+   * that panelist abstained); `voteEntropy` is the normalized Shannon
+   * entropy of the scored panelists' pass/fail votes (0 = unanimous,
+   * 1 = an even split). Absent on single-judge grades and pre-A2 records.
+   */
+  readonly panel?: {
+    readonly panelists: ReadonlyArray<{
+      readonly model: string;
+      readonly score?: number;
+      readonly passed: boolean;
+      readonly abstained?: boolean;
+    }>;
+    readonly voteEntropy: number;
+  };
 };
 
 /** Distilled tool-call shape, derived from trace events. */

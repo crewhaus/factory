@@ -23,6 +23,8 @@
  * filesystem access + the judge model call live in `apps/cli/src/index.ts`.
  */
 
+import type { Sample } from "@crewhaus/eval-dataset";
+
 /** Thrown on malformed flags / unusable inputs. The CLI entry file routes it
  *  through `die()`; tests assert on `.message`. */
 export class JudgeCalibrateError extends Error {
@@ -58,6 +60,110 @@ export function normalizeJudge(score: number): number {
 
 function clamp01(n: number): number {
   return n < 0 ? 0 : n > 1 ? 1 : n;
+}
+
+// -------- NEW-graders-1: dataset golden-verdict pairs --------
+
+/**
+ * A calibration pair candidate extracted from a `--dataset` sample — the
+ * judged answer text plus the human verdict, BEFORE the judge call (the
+ * judge scores `answer` in `index.ts`, exactly like a session turn).
+ */
+export type DatasetPairCandidate = {
+  /** `metadata.sessionId` when it is a string (distill records it), else
+   *  the sample id — the exemplar/dedupe key beside session pairs. */
+  readonly sessionId: string;
+  /** `metadata.turnNumber` when it is an integer (distill records it), else 0. */
+  readonly turnNumber: number;
+  readonly input: string;
+  /** The rated answer the judge scores (the sample's `expected_output`). */
+  readonly answer: string;
+  /** The human rating, normalized [0,1] (`metadata.user_rating`). */
+  readonly human: number;
+};
+
+export type DatasetPairExtraction = {
+  readonly candidates: DatasetPairCandidate[];
+  /** No numeric `metadata.user_rating` in [0,1] — nothing human to pair. */
+  readonly skippedNoRating: number;
+  /** Rated, but no non-empty `expected_output` to judge (distill records
+   *  no answer text for low-rated turns). */
+  readonly skippedNoAnswer: number;
+  /** `metadata.correction` / `metadata.gold_refreshed` present: the stored
+   *  gold is a human correction (or a later-refreshed gold), NOT the answer
+   *  the rating was placed on — pairing them would mis-attribute the
+   *  rating, so these are skipped and counted. */
+  readonly skippedMisPaired: number;
+};
+
+/**
+ * NEW-graders-1 — extract calibration pairs from the golden verdicts a
+ * dataset carries. The contract is exactly what `crewhaus distill` records:
+ * a sample pairs when `metadata.user_rating` is a number in [0,1] AND
+ * `expected_output` is the non-empty answer that rating was placed on
+ * (true for distilled positives; corrections and `dataset refresh-goldens`
+ * rewrites are skipped as mis-paired — see {@link DatasetPairExtraction}).
+ */
+export function extractDatasetCalibrationPairs(
+  samples: ReadonlyArray<Sample>,
+): DatasetPairExtraction {
+  const candidates: DatasetPairCandidate[] = [];
+  let skippedNoRating = 0;
+  let skippedNoAnswer = 0;
+  let skippedMisPaired = 0;
+  for (const s of samples) {
+    const meta = s.metadata ?? {};
+    const rating = meta["user_rating"];
+    if (typeof rating !== "number" || Number.isNaN(rating) || rating < 0 || rating > 1) {
+      skippedNoRating += 1;
+      continue;
+    }
+    if (meta["correction"] !== undefined || meta["gold_refreshed"] !== undefined) {
+      skippedMisPaired += 1;
+      continue;
+    }
+    const answer = s.expected_output;
+    if (answer === undefined || answer.trim() === "") {
+      skippedNoAnswer += 1;
+      continue;
+    }
+    const sessionId = typeof meta["sessionId"] === "string" ? meta["sessionId"] : s.id;
+    const turnNumber =
+      typeof meta["turnNumber"] === "number" && Number.isInteger(meta["turnNumber"])
+        ? meta["turnNumber"]
+        : 0;
+    candidates.push({ sessionId, turnNumber, input: s.input, answer, human: rating });
+  }
+  return { candidates, skippedNoRating, skippedNoAnswer, skippedMisPaired };
+}
+
+/**
+ * Drop dataset candidates whose `sessionId#turnNumber` ref is already
+ * covered by a session-ratings pair (the two sources COMBINE — a distilled
+ * dataset re-read beside the very sessions it came from must not
+ * double-count and double-judge the same turn). Session pairs win: they are
+ * re-derived from the live transcript, the dataset copy may be redacted.
+ * Duplicates WITHIN the dataset (the same turn under two sample ids, e.g.
+ * two distill outputs of overlapping sessions merged into one registry
+ * version) are dropped keep-first and counted into the same bucket.
+ */
+export function dropDuplicateCandidates(
+  candidates: ReadonlyArray<DatasetPairCandidate>,
+  takenRefs: ReadonlySet<string>,
+): { kept: DatasetPairCandidate[]; duplicates: number } {
+  const kept: DatasetPairCandidate[] = [];
+  const seen = new Set<string>();
+  let duplicates = 0;
+  for (const c of candidates) {
+    const ref = `${c.sessionId}#${c.turnNumber}`;
+    if (takenRefs.has(ref) || seen.has(ref)) {
+      duplicates += 1;
+    } else {
+      seen.add(ref);
+      kept.push(c);
+    }
+  }
+  return { kept, duplicates };
 }
 
 // -------- agreement stats --------

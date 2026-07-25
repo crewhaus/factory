@@ -35,6 +35,16 @@ export {
   type DiffEntrySide,
   type SliceDelta,
 } from "./diff";
+// A1 — pairwise-diff bookkeeping (the pure half; the judge calls live in
+// @crewhaus/eval-judge and the CLI composes the two behind `--pairwise`).
+export {
+  extractSampleInput,
+  formatPairwiseLines,
+  summarizePairwise,
+  type PairwiseDiff,
+  type PairwiseSampleVerdict,
+  type PairwiseWinner,
+} from "./pairwise";
 // C29 — paired significance on diffs: decision support beside the strict
 // gate (which is deliberately untouched by it).
 export {

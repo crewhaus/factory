@@ -870,6 +870,49 @@ describe("phase-2 judge windows", () => {
       costUsdMicros: 1_200_000,
     });
   });
+
+  test("A3 abstention: an abstained turn is never persisted as a judgment — routed to human review instead", async () => {
+    const harness = makeHarness();
+    const id = seedExactSession(harness, { extraTurns: 1 }); // 2 judgeable turns
+    const judgePhase: WatchmeJudgePhase = {
+      model: "claude-judge",
+      judgeTurn: async (input) =>
+        input.turnNumber === 1
+          ? {
+              score: 0.5,
+              rationale: "output truncated — cannot score honestly",
+              spentUsd: 0.01,
+              abstained: true,
+              confidence: 0.1,
+            }
+          : { score: 0.9, rationale: "solid", spentUsd: 0.01 },
+    };
+    const deps = makeDeps(harness, { judgePhase });
+    const result = await runWatchmeReport(
+      baseOpts(harness, {
+        sessionId: id,
+        judge: { model: "claude-judge", sampleRate: 1, budgetUsd: 1 },
+      }),
+      deps,
+    );
+    const judge = result.report?.judge;
+    expect(judge?.outcome).toBe("ok");
+    expect(judge?.sampled).toBe(2);
+    // Only the scored turn became an authoritative judgment.
+    expect(judge?.judged).toBe(1);
+    expect(judge?.abstained).toBe(1);
+    expect(judge?.abstainedTurns).toEqual([`${id}#1`]);
+    // The abstention's spend still counts against the budget.
+    expect(judge?.spentUsd).toBeCloseTo(0.02, 10);
+    const judgments = harness.store.readJudgments();
+    expect(judgments).toHaveLength(1);
+    expect(judgments[0]?.turnNumber).toBe(2);
+    // report.md routes the abstained turn to the `crewhaus rate` follow-up.
+    const md = readFileSync(join(result.outDir as string, "report.md"), "utf8");
+    expect(md).toContain("Judge abstained on 1 turn(s)");
+    expect(md).toContain("crewhaus rate");
+    expect(md).toContain(`${id}#1`);
+  });
   test("a transient failure leaves the window's sessions eligible — a PLAIN retry re-enumerates AND re-judges (no --session)", async () => {
     const harness = makeHarness();
     const id = seedExactSession(harness);

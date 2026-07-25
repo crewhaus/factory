@@ -788,6 +788,59 @@ describe("crewhaus run", () => {
     expect(result.stdout).toContain("Anthropic credentials");
   });
 
+  // E52 — `eval history|baseline(s)|diff` forward to the eval-report verbs
+  // with a one-line stderr notice; ONLY a spec FILE with the exact alias
+  // name suppresses the alias (design-pinned carve-out).
+  test("eval history aliases to eval-report history with the stderr notice", async () => {
+    const result = await runCli(["eval", "history"], { cwd: tmp, env: {} });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain(
+      "`crewhaus eval history` is an alias for the canonical `crewhaus eval-report history`",
+    );
+    expect(result.stdout).toContain("no recorded runs match");
+  });
+
+  test("eval baselines (plural guess) maps to the eval-report baseline verb", async () => {
+    const result = await runCli(["eval", "baselines", "show"], { cwd: tmp, env: {} });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain("`crewhaus eval-report baseline`");
+    expect(result.stdout).toContain("no baselines pinned");
+  });
+
+  test("a spec FILE literally named history suppresses the alias — the run path still owns it", async () => {
+    writeFileSync(
+      join(tmp, "history"),
+      "name: t\ntarget: cli\nagent:\n  model: claude-opus-4-7\n  instructions: hi\n",
+    );
+    const result = await runCli(["eval", "history"], { cwd: tmp, env: {} });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).not.toContain("is an alias");
+    expect(result.stderr).toContain("missing --dataset");
+  });
+
+  test("eval history.yaml is never an alias — whole-word matches only", async () => {
+    writeFileSync(
+      join(tmp, "history.yaml"),
+      "name: t\ntarget: cli\nagent:\n  model: claude-opus-4-7\n  instructions: hi\n",
+    );
+    const result = await runCli(["eval", "history.yaml"], { cwd: tmp, env: {} });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).not.toContain("is an alias");
+    expect(result.stderr).toContain("missing --dataset");
+  });
+
+  test("a DIRECTORY named diff does not suppress the alias (file carve-out only)", async () => {
+    // `eval-report diff -o diff` creates exactly this inhabitant; the alias
+    // must still fire instead of dying with the misleading run-path
+    // "missing --dataset".
+    mkdirSync(join(tmp, "diff"));
+    const result = await runCli(["eval", "diff", "runA", "runB"], { cwd: tmp, env: {} });
+    expect(result.stderr).toContain("`crewhaus eval-report diff`");
+    expect(result.stderr).not.toContain("missing --dataset");
+    expect(result.exitCode).toBe(1); // unknown run ids — the eval-report path's own error
+    expect(result.stderr).toContain("results.json not found");
+  });
+
   test("run --help lists the --justification-judge flag", async () => {
     const result = await runCli(["run", "--help"]);
     expect(result.exitCode).toBe(0);

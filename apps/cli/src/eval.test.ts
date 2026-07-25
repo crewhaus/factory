@@ -430,6 +430,35 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
     expect(bad.stderr).toContain("--seed must be an integer");
   });
 
+  test("--judge-model without --pairwise warns loudly and stays offline", async () => {
+    const root = newTempRoot();
+    const prev = writeRunDir(root, "prev", flipped(["s1", "s2"], 0));
+    const next = writeRunDir(root, "next", flipped(["s1", "s2"], 1));
+    const out = join(root, "out");
+    const result = await runCliStderr(
+      ["eval-report", "diff", prev, next, "--judge-model", "claude-opus-4-7", "-o", out],
+      root,
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain("--judge-model has no effect without --pairwise");
+    // The flag stayed inert: a fully offline diff, no pairwise block.
+    const diff = JSON.parse(readFileSync(join(out, "diff.json"), "utf-8"));
+    expect(diff.pairwise).toBeUndefined();
+  });
+
+  test("history/baseline warn when handed the pairwise-only flags", async () => {
+    const root = newTempRoot();
+    const history = await runCliStderr(["eval-report", "history", "--pairwise"], root);
+    expect(history.exitCode).toBe(0);
+    expect(history.stderr).toContain("--pairwise only applies to `eval-report diff`");
+    const baseline = await runCliStderr(
+      ["eval-report", "baseline", "show", "--judge-model", "m"],
+      root,
+    );
+    expect(baseline.exitCode).toBe(0);
+    expect(baseline.stderr).toContain("--judge-model only applies to `eval-report diff`");
+  });
+
   test("disjoint sample ids → clean mismatch message, not a stack trace", async () => {
     const root = newTempRoot();
     const prev = writeRunDir(root, "prev", flipped(["a1", "a2"], 0));

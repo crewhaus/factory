@@ -18,6 +18,9 @@ export function makeNaiveStubClient(
   scorer: (
     userText: string,
     systemText: string,
+    /** A2 — the wire model id of the request, so panel tests can hand each
+     *  panelist model a different verdict. Existing scorers ignore it. */
+    model: string,
   ) => {
     score: 1 | 2 | 3 | 4 | 5;
     rationale: string;
@@ -47,13 +50,127 @@ export function makeNaiveStubClient(
               .map((b) => b.text)
               .join("\n") ?? "");
       const systemText = req.system.map((b) => b.text).join("\n\n");
-      const verdict = scorer(userText, systemText);
+      const verdict = scorer(userText, systemText, req.model);
       return (async function* (): AsyncIterable<StreamEvent> {
         yield { kind: "message_start" };
         yield {
           kind: "content_block_start",
           index: 0,
           block: { type: "tool_use", id: "tu_stub", name: "submit_score", input: {} },
+        };
+        yield {
+          kind: "content_block_delta",
+          index: 0,
+          delta: { type: "input_json_delta", partial_json: JSON.stringify(verdict) },
+        };
+        yield { kind: "content_block_stop", index: 0 };
+        yield { kind: "message_delta", stopReason: "tool_use" };
+        yield { kind: "message_stop" };
+      })();
+    },
+  };
+}
+
+/**
+ * A1 — synthetic pairwise judge. The comparer receives the exact prompt
+ * text the adapter sees and returns a `submit_comparison` verdict; tests
+ * use it to drive order-swap bookkeeping (position-biased "always A",
+ * content-aware, always-tie, …) without a network. Pass a malformed
+ * verdict (`as never`) to exercise the strict-schema rejection.
+ */
+export function makePairwiseStubClient(
+  comparer: (
+    userText: string,
+    systemText: string,
+  ) => { winner: "a" | "b" | "tie"; rationale: string },
+): ProviderAdapter {
+  return {
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
+    },
+    estimateTokens: () => 0,
+    stream(req) {
+      const userMsg = req.messages.find((m) => m.role === "user");
+      const userText =
+        typeof userMsg?.content === "string"
+          ? userMsg.content
+          : (userMsg?.content
+              ?.filter((b): b is { type: "text"; text: string } => b.type === "text")
+              .map((b) => b.text)
+              .join("\n") ?? "");
+      const systemText = req.system.map((b) => b.text).join("\n\n");
+      const verdict = comparer(userText, systemText);
+      return (async function* (): AsyncIterable<StreamEvent> {
+        yield { kind: "message_start" };
+        yield {
+          kind: "content_block_start",
+          index: 0,
+          block: { type: "tool_use", id: "tu_pair", name: "submit_comparison", input: {} },
+        };
+        yield {
+          kind: "content_block_delta",
+          index: 0,
+          delta: { type: "input_json_delta", partial_json: JSON.stringify(verdict) },
+        };
+        yield { kind: "content_block_stop", index: 0 };
+        yield { kind: "message_delta", stopReason: "tool_use" };
+        yield { kind: "message_stop" };
+      })();
+    },
+  };
+}
+
+/**
+ * NEW-graders-2 — synthetic categorical judge. The labeler receives the
+ * exact prompt text the adapter sees and returns a `submit_label` verdict;
+ * tests use it to drive label→score/passed mapping, abstention, and the
+ * closed-enum schema rejection (return an undeclared label) without a
+ * network.
+ */
+export function makeLabelStubClient(
+  labeler: (
+    userText: string,
+    systemText: string,
+    model: string,
+  ) => {
+    label: string;
+    rationale: string;
+    abstain?: boolean;
+    confidence?: number;
+  },
+): ProviderAdapter {
+  return {
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
+    },
+    estimateTokens: () => 0,
+    stream(req) {
+      const userMsg = req.messages.find((m) => m.role === "user");
+      const userText =
+        typeof userMsg?.content === "string"
+          ? userMsg.content
+          : (userMsg?.content
+              ?.filter((b): b is { type: "text"; text: string } => b.type === "text")
+              .map((b) => b.text)
+              .join("\n") ?? "");
+      const systemText = req.system.map((b) => b.text).join("\n\n");
+      const verdict = labeler(userText, systemText, req.model);
+      return (async function* (): AsyncIterable<StreamEvent> {
+        yield { kind: "message_start" };
+        yield {
+          kind: "content_block_start",
+          index: 0,
+          block: { type: "tool_use", id: "tu_label", name: "submit_label", input: {} },
         };
         yield {
           kind: "content_block_delta",
