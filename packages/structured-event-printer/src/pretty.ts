@@ -57,9 +57,16 @@ function formatBody(ev: TraceEvent): string {
     case "cache_rotation":
       return `rotatedAt=${new Date(ev.rotatedAt).toISOString()}`;
     case "permission_decision":
+      // `askOutcome` and `outcome` are DIFFERENT fields and both belong on
+      // the line: `askOutcome` is the resolution of a `decision: "ask"`
+      // (runtime-core publishes the ask twice — once before the prompt, once
+      // after it resolves), while `outcome` is the injection/egress
+      // classifier verdict. Rendering only `outcome` made the two ask
+      // publishes byte-identical, so CREWHAUS_TRACE=pretty never showed
+      // whether an ask was approved or denied.
       return `tool=${ev.toolName} decision=${ev.decision} mode=${ev.mode}${
-        ev.outcome ? ` outcome=${ev.outcome}` : ""
-      }${ev.reason ? ` reason=${ev.reason}` : ""}`;
+        ev.askOutcome ? ` askOutcome=${ev.askOutcome}` : ""
+      }${ev.outcome ? ` outcome=${ev.outcome}` : ""}${ev.reason ? ` reason=${ev.reason}` : ""}`;
     case "error_recovered":
       return `action=${ev.action} error=${ev.errorName} depth=${ev.depth}`;
     case "run_failed":

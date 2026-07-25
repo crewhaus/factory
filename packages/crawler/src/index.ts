@@ -20,8 +20,10 @@
  * the daemon) and a `createSourceTool({crawler})` factory that builds
  * a model-facing `Source(uri)` tool. The agent calls `Source(uri)` to
  * load content; the agent's subsequent `CiteFact(uri, snippet)` calls
- * (provided by `citation-tracker`'s tool helpers) anchor specific
- * snippets back to the fetched content.
+ * anchor specific snippets back to the fetched content. `CiteFact`
+ * VERIFIES the snippet against the cached body before recording — an
+ * unverifiable quote is refused, never logged (see
+ * `snippetOccursInBody`).
  */
 import { lookup as nodeDnsLookup } from "node:dns/promises";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
@@ -572,10 +574,44 @@ export function createSourceTool(opts: {
 }
 
 /**
+ * Projection used to compare a cited snippet against the fetched body.
+ *
+ * "Verbatim" cannot mean byte-identical. A model quoting a hard-wrapped
+ * source re-flows it onto one line, so the newline in the body arrives as a
+ * space in the snippet — and the report renderer itself collapses newlines
+ * when it prints a snippet (`report-writer`). So both sides are compared
+ * after NFC normalization with every run of whitespace (newlines, tabs,
+ * NBSP, …) collapsed to a single space.
+ *
+ * Everything else stays significant: case, punctuation, word order, numbers.
+ * Those are exactly what a fabricated quote gets wrong.
+ */
+export function normalizeForVerbatimMatch(text: string): string {
+  return text.normalize("NFC").replace(/\s+/g, " ").trim();
+}
+
+/** True iff `snippet` occurs in `body` up to whitespace/line-wrapping. */
+export function snippetOccursInBody(body: string, snippet: string): boolean {
+  const needle = normalizeForVerbatimMatch(snippet);
+  // A whitespace-only snippet normalizes to "", which `includes` would accept
+  // against ANY body — that is the degenerate always-true citation.
+  if (needle === "") return false;
+  return normalizeForVerbatimMatch(body).includes(needle);
+}
+
+/**
  * Build a `CiteFact(uri, snippet, supportingClaim?)` tool the agent
  * calls to record a citation. Each call appends one citation row in
  * the run's tracker; report-writer numbers them by URL on first
  * appearance.
+ *
+ * The snippet is VERIFIED against the body the tracker cached for `uri`
+ * before anything is recorded. A citation is a claim about bytes the run
+ * actually holds: recording an unverified snippet would stamp a real URL and
+ * a real content sha256 next to text that never appeared at that URL, which
+ * is worse than no citation at all. A failed check returns a corrective tool
+ * result (same idiom as `Source`'s `[Source error] …`) rather than throwing,
+ * so the model can re-quote and try again inside the same turn.
  */
 export function createCiteFactTool(opts: {
   readonly tracker: CitationTracker;
@@ -584,14 +620,16 @@ export function createCiteFactTool(opts: {
   return buildTool({
     name: "CiteFact",
     description:
-      "Record a fact you want cited in the final report. Pass the source `uri` you fetched via Source, the verbatim `snippet` from that source, and optionally a one-line `supportingClaim` describing what the snippet supports. The orchestrator turns these into numbered citations [1], [2], … in the final report.",
+      "Record a fact you want cited in the final report. Pass the source `uri` you fetched via Source, the verbatim `snippet` from that source, and optionally a one-line `supportingClaim` describing what the snippet supports. The snippet is checked against the body Source loaded for that uri — a quote that does not appear there is REFUSED and nothing is recorded. The orchestrator turns accepted citations into numbered citations [1], [2], … in the final report.",
     inputSchema: z
       .object({
         uri: z.string().min(1).describe("Source URL or file:// path you previously loaded."),
         snippet: z
           .string()
           .min(1)
-          .describe("Verbatim quote from the source — keep it short, ideally one sentence."),
+          .describe(
+            "Verbatim quote copied from the source body — keep it short, ideally one sentence. Verified against the loaded body; only whitespace/line-wrapping may differ.",
+          ),
         supportingClaim: z
           .string()
           .optional()
@@ -603,6 +641,21 @@ export function createCiteFactTool(opts: {
     destructive: false,
     classifyOutput: false,
     execute: async (input) => {
+      const body = opts.tracker.getFetchedContent(input.uri);
+      if (body === undefined) {
+        // Two different failures land here. Usually the agent never loaded the
+        // uri at all (it invented one, or typed it differently than it fetched
+        // it). Rarely the run HAS a fetch record but the cached body is gone
+        // and the source has changed since, so there is nothing left to check
+        // the quote against — still a refusal, but say which one it is.
+        if (opts.tracker.getFetchRecord(input.uri) !== undefined) {
+          return `[CiteFact rejected] the body originally loaded from ${input.uri} is no longer available in this run's cache, so the snippet cannot be verified against the bytes that were recorded. Nothing was recorded.`;
+        }
+        return `[CiteFact rejected] nothing has been loaded for ${input.uri} in this run, so the snippet cannot be verified. Call Source("${input.uri}") first and cite from the body it returns. Nothing was recorded.`;
+      }
+      if (!snippetOccursInBody(body, input.snippet)) {
+        return `[CiteFact rejected] that snippet does not appear in the body loaded from ${input.uri}. Copy an exact span of text out of that body — only whitespace and line-wrapping may differ. Nothing was recorded.`;
+      }
       const branchId = opts.currentBranchId?.();
       const c = opts.tracker.recordCitation({
         url: input.uri,

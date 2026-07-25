@@ -5,6 +5,7 @@ import type {
   IrSlackConfig,
   IrTelegramConfig,
 } from "@crewhaus/ir";
+import { parseModelString } from "@crewhaus/model-router";
 
 /**
  * Item 61 — `crewhaus channel provision|verify`: one-command channel app
@@ -47,18 +48,50 @@ import type {
  *     credential-free, and every network-performing path has a dry-run
  *     counterpart (`display` plans / `describeVerifyProbes`) that renders
  *     env refs as `$NAME` and literals as `[redacted]` — never the value.
+ *   - `verify` splits into two phases: a BOOT-GATE phase (pure env-ref
+ *     presence, byte-identical to what the emitted daemon refuses to boot
+ *     without) and a PROBE phase (live platform calls). `--offline` runs
+ *     only the first, so the command is usable as a deterministic pre-flight
+ *     in CI/recordings; a failing boot-gate check short-circuits the probes
+ *     for that platform, since a daemon that cannot boot cannot be wired.
+ *     The boot-gate set is asserted against the emitter's own startup check
+ *     by a parity test — see channel-provision.test.ts ("boot-gate parity").
  */
 
 // ---------------------------------------------------------------------------
 // Shared plumbing
 // ---------------------------------------------------------------------------
 
-/** Platforms `channel provision|verify` supports. whatsapp (Meta app config
- *  lives in the Meta developer console) and imessage (host-local chat.db —
- *  there is no platform side to provision) are out of item-61 scope; when a
- *  spec configures them the CLI prints a note instead of failing. */
+/** Platforms with a PLATFORM-SIDE flow `channel provision|verify` drives.
+ *  whatsapp (Meta app config lives in the Meta developer console) and
+ *  imessage (host-local chat.db — there is no platform side to provision)
+ *  have no such flow; when a spec configures them the CLI prints a note
+ *  instead of failing. Their boot-gate env refs ARE still checked by
+ *  `verify` — see {@link CHANNEL_ENV_PLATFORMS}. */
 export const CHANNEL_PLATFORMS = ["slack", "telegram", "discord"] as const;
 export type ChannelPlatform = (typeof CHANNEL_PLATFORMS)[number];
+
+/** Channels with no platform-side provision/probe flow. */
+export const CHANNEL_UNPROBED_PLATFORMS = ["whatsapp", "imessage"] as const;
+export type ChannelUnprobedPlatform = (typeof CHANNEL_UNPROBED_PLATFORMS)[number];
+
+/**
+ * Every channel whose secret fields the compiled daemon gates its boot on
+ * (target-channel-bot's `requiredEnvNames` covers all five, not just the
+ * three with a platform API). `verify`'s boot-gate phase walks THIS list, so
+ * "verify is green" and "the daemon boots" cannot drift apart — the earlier
+ * split checked only what it could also probe, which left DISCORD_APP_ID and
+ * DISCORD_PUBLIC_KEY (and both no-probe channels) unchecked while the daemon
+ * exited 2 on them.
+ */
+export const CHANNEL_ENV_PLATFORMS = [
+  "slack",
+  "telegram",
+  "discord",
+  "whatsapp",
+  "imessage",
+] as const;
+export type ChannelEnvPlatform = (typeof CHANNEL_ENV_PLATFORMS)[number];
 
 export type FetchLike = typeof fetch;
 
@@ -116,10 +149,10 @@ export function resolvePlatformsFlag(
   channels: IrChannels,
 ): {
   readonly platforms: ReadonlyArray<ChannelPlatform>;
-  readonly unsupported: ReadonlyArray<string>;
+  readonly unsupported: ReadonlyArray<ChannelUnprobedPlatform>;
 } {
   const configured = CHANNEL_PLATFORMS.filter((p) => channels[p] !== undefined);
-  const unsupported = (["whatsapp", "imessage"] as const).filter((p) => channels[p] !== undefined);
+  const unsupported = CHANNEL_UNPROBED_PLATFORMS.filter((p) => channels[p] !== undefined);
   const value = flagValue ?? "all";
   if (value === "all") {
     if (configured.length === 0) {
@@ -209,40 +242,162 @@ function collectMissing(
   return missing;
 }
 
+/** One boot-gated secret field: its spec path (`label`), the human `title`
+ *  used as a check label, and the lowered ref. */
+export type ChannelSecretRefEntry = {
+  readonly label: string;
+  readonly title: string;
+  readonly ref: IrSecretRef;
+};
+
 /**
- * The secret fields a platform's daemon REQUIRES at boot, per
- * target-channel-bot's `requiredEnvNames`: slack botToken + signingSecret
- * (appToken is reserved for a future Socket-Mode path — parsed but unused,
- * so not required), telegram botToken + secretToken, discord applicationId +
- * botToken + publicKeyHex. Shared by the doctor channel check and `verify`.
+ * The secret fields a platform's daemon REQUIRES at boot — a mirror of
+ * target-channel-bot's `requiredEnvNames`, field for field:
+ *   slack     botToken + signingSecret (appToken is reserved for a future
+ *             Socket-Mode path — parsed but unused, so not required)
+ *   telegram  botToken + secretToken
+ *   discord   applicationId + botToken + publicKeyHex
+ *   whatsapp  phoneNumberId + accessToken + appSecret (+ verifyToken once
+ *             declared — Meta's callback handshake fails closed without it)
+ *   imessage  chatDbPath / cursorPath, ONLY when written as env refs (both
+ *             are optional paths, not secrets: a literal is a legitimate
+ *             spec value the daemon never gates on)
+ * Shared by the doctor channel check and `verify`'s boot-gate phase. A
+ * parity test compiles a five-channel spec and asserts this set equals the
+ * emitted daemon's `__requiredEnv`, so the mirror cannot silently drift.
  */
 export function platformSecretRefs(
-  platform: ChannelPlatform,
+  platform: ChannelEnvPlatform,
   channels: IrChannels,
-): ReadonlyArray<{ readonly label: string; readonly ref: IrSecretRef }> {
-  if (platform === "slack") {
-    const slack = channels.slack;
-    if (slack === undefined) return [];
-    return [
-      { label: "channels.slack.botToken", ref: slack.botToken },
-      { label: "channels.slack.signingSecret", ref: slack.signingSecret },
-    ];
+): ReadonlyArray<ChannelSecretRefEntry> {
+  switch (platform) {
+    case "slack": {
+      const slack = channels.slack;
+      if (slack === undefined) return [];
+      return [
+        { label: "channels.slack.botToken", title: "Slack bot token", ref: slack.botToken },
+        {
+          label: "channels.slack.signingSecret",
+          title: "Slack signing secret",
+          ref: slack.signingSecret,
+        },
+      ];
+    }
+    case "telegram": {
+      const telegram = channels.telegram;
+      if (telegram === undefined) return [];
+      return [
+        {
+          label: "channels.telegram.botToken",
+          title: "Telegram bot token",
+          ref: telegram.botToken,
+        },
+        {
+          label: "channels.telegram.secretToken",
+          title: "Telegram secret token (daemon side; Telegram never returns it)",
+          ref: telegram.secretToken,
+        },
+      ];
+    }
+    case "discord": {
+      const discord = channels.discord;
+      if (discord === undefined) return [];
+      return [
+        {
+          label: "channels.discord.applicationId",
+          title: "Discord application id",
+          ref: discord.applicationId,
+        },
+        { label: "channels.discord.botToken", title: "Discord bot token", ref: discord.botToken },
+        {
+          label: "channels.discord.publicKeyHex",
+          title: "Discord public key",
+          ref: discord.publicKeyHex,
+        },
+      ];
+    }
+    case "whatsapp": {
+      const whatsapp = channels.whatsapp;
+      if (whatsapp === undefined) return [];
+      const entries: ChannelSecretRefEntry[] = [
+        {
+          label: "channels.whatsapp.phoneNumberId",
+          title: "WhatsApp phone number id",
+          ref: whatsapp.phoneNumberId,
+        },
+        {
+          label: "channels.whatsapp.accessToken",
+          title: "WhatsApp access token",
+          ref: whatsapp.accessToken,
+        },
+        {
+          label: "channels.whatsapp.appSecret",
+          title: "WhatsApp app secret",
+          ref: whatsapp.appSecret,
+        },
+      ];
+      if (whatsapp.verifyToken !== undefined) {
+        entries.push({
+          label: "channels.whatsapp.verifyToken",
+          title: "WhatsApp verify token",
+          ref: whatsapp.verifyToken,
+        });
+      }
+      return entries;
+    }
+    case "imessage": {
+      const imessage = channels.imessage;
+      if (imessage === undefined) return [];
+      const entries: ChannelSecretRefEntry[] = [];
+      if (imessage.chatDbPath?.kind === "env") {
+        entries.push({
+          label: "channels.imessage.chatDbPath",
+          title: "iMessage chat.db path",
+          ref: imessage.chatDbPath,
+        });
+      }
+      if (imessage.cursorPath?.kind === "env") {
+        entries.push({
+          label: "channels.imessage.cursorPath",
+          title: "iMessage cursor path",
+          ref: imessage.cursorPath,
+        });
+      }
+      return entries;
+    }
   }
-  if (platform === "telegram") {
-    const telegram = channels.telegram;
-    if (telegram === undefined) return [];
-    return [
-      { label: "channels.telegram.botToken", ref: telegram.botToken },
-      { label: "channels.telegram.secretToken", ref: telegram.secretToken },
-    ];
+}
+
+/**
+ * The provider-credential EITHER-OR groups the compiled daemon gates its
+ * boot on — a mirror of target-channel-bot's `providerEnvGroups`, which
+ * derives them from `agent.model` at emit time. At least one name per group
+ * must be set or the daemon exits 2 before it ever serves a webhook, so a
+ * channel pre-flight that ignored them would still green-light a daemon
+ * that cannot start.
+ *
+ * bedrock (the AWS SDK's default credential chain is authoritative), local
+ * endpoints (URL baked into the model string), and model strings outside the
+ * router grammar contribute NO group — exactly like the emitter.
+ */
+export function modelCredentialGroups(model: string): ReadonlyArray<ReadonlyArray<string>> {
+  let parsed: ReturnType<typeof parseModelString>;
+  try {
+    parsed = parseModelString(model);
+  } catch {
+    return [];
   }
-  const discord = channels.discord;
-  if (discord === undefined) return [];
-  return [
-    { label: "channels.discord.applicationId", ref: discord.applicationId },
-    { label: "channels.discord.botToken", ref: discord.botToken },
-    { label: "channels.discord.publicKeyHex", ref: discord.publicKeyHex },
-  ];
+  switch (parsed.providerId) {
+    case "anthropic":
+      return [["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]];
+    case "openai":
+      // local/<m>@<url> parses to openai WITH a baked baseUrl — no creds.
+      return parsed.baseUrl !== undefined ? [] : [["OPENAI_API_KEY", "OPENAI_BASE_URL"]];
+    case "gemini":
+      return [["GEMINI_API_KEY", "GOOGLE_API_KEY"]];
+    default:
+      return [];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -726,7 +881,49 @@ export function discordNextSteps(inviteUrl: string): ReadonlyArray<string> {
 }
 
 // ---------------------------------------------------------------------------
-// Verify — doctor-style probes
+// Provision — cross-platform pre-flight
+// ---------------------------------------------------------------------------
+
+/** A missing env-ref attributed to the platform whose call needs it. */
+export type ProvisionMissingEnv = MissingEnvRef & { readonly platform: ChannelPlatform };
+
+/**
+ * Every env-ref a LIVE provision of `platforms` would need, collected BEFORE
+ * the first side effect. `provision` used to validate lazily, platform by
+ * platform, in the order it also performed them — so a multi-platform spec
+ * with only Slack credentials wrote `slack-app-manifest.yaml` into the cwd
+ * and only THEN died on Telegram's unset env, leaving a stray file behind
+ * (and, with a partially-credentialled spec, a half-provisioned bot). The
+ * CLI now runs this first and refuses without touching disk or the network.
+ *
+ * Slack contributes nothing by design: its manifest is what the operator
+ * pastes into api.slack.com to OBTAIN the bot token and signing secret, so
+ * requiring them up front would be a chicken-and-egg gate.
+ */
+export function collectProvisionMissingEnv(
+  platforms: ReadonlyArray<ChannelPlatform>,
+  channels: IrChannels,
+  baseUrl: string,
+  env: NodeJS.ProcessEnv,
+): ReadonlyArray<ProvisionMissingEnv> {
+  const missing: ProvisionMissingEnv[] = [];
+  for (const platform of platforms) {
+    if (platform === "telegram" && channels.telegram !== undefined) {
+      for (const m of buildTelegramProvision(channels.telegram, baseUrl, env).missingEnv) {
+        missing.push({ ...m, platform });
+      }
+    }
+    if (platform === "discord" && channels.discord !== undefined) {
+      for (const m of buildDiscordProvision(channels.discord, baseUrl, env).missingEnv) {
+        missing.push({ ...m, platform });
+      }
+    }
+  }
+  return missing;
+}
+
+// ---------------------------------------------------------------------------
+// Verify — boot-gate env refs (offline) + doctor-style live probes
 // ---------------------------------------------------------------------------
 
 /** Shape shared with `index.ts`'s DoctorCheck and audit-verify's
@@ -745,14 +942,15 @@ export type ChannelVerifyOptions = {
   /** When set, webhook/endpoint URLs are asserted against the daemon route
    *  under this origin; when absent those checks degrade to informational. */
   readonly baseUrl?: string;
+  /** Run ONLY the boot-gate env-ref checks — no platform call, so the exit
+   *  code depends on the environment alone (deterministic pre-flight for CI
+   *  and recordings, where a live `auth.test` made the verdict a function of
+   *  the network and of whose token happened to be exported). */
+  readonly offline?: boolean;
 };
 
-function envRefCheck(
-  label: string,
-  fieldLabel: string,
-  ref: IrSecretRef,
-  env: NodeJS.ProcessEnv,
-): ChannelCheck {
+function envRefCheck(entry: ChannelSecretRefEntry, env: NodeJS.ProcessEnv): ChannelCheck {
+  const { title: label, label: fieldLabel, ref } = entry;
   if (ref.kind === "literal") {
     return {
       label,
@@ -772,11 +970,45 @@ function envRefCheck(
 }
 
 /**
- * Slack probes: `auth.test` with the bot token (identity + reachability),
- * then the token's GRANTED scopes — Slack returns them on every Web API
- * response in the `x-oauth-scopes` header — diffed against the needed set
- * from {@link deriveSlackScopes}. The signing secret is only checked for
- * presence: Slack never exposes it back over the API.
+ * The boot-gate phase for one channel: a check per secret field the compiled
+ * daemon requires at boot. Pure (env only) and therefore deterministic —
+ * this is everything `--offline` runs, and the prefix every online run
+ * starts with.
+ */
+export function channelEnvChecks(
+  platform: ChannelEnvPlatform,
+  channels: IrChannels,
+  env: NodeJS.ProcessEnv,
+): ChannelCheck[] {
+  return platformSecretRefs(platform, channels).map((entry) => envRefCheck(entry, env));
+}
+
+/**
+ * The daemon's provider-credential gate as a check (see
+ * {@link modelCredentialGroups}). Returns [] when the model contributes no
+ * group, so bedrock/local specs gain no spurious failure.
+ */
+export function modelCredentialChecks(model: string, env: NodeJS.ProcessEnv): ChannelCheck[] {
+  return modelCredentialGroups(model).map((group) => {
+    const satisfied = group.some((name) => env[name] !== undefined && env[name] !== "");
+    const names = group.join(" or ");
+    return satisfied
+      ? { label: `Agent model credentials (${model}: ${names})`, pass: true }
+      : {
+          label: `Agent model credentials (${model})`,
+          pass: false,
+          reason: `none of ${names} is set — the daemon exits at boot before it serves any channel`,
+        };
+  });
+}
+
+/**
+ * Slack: the boot-gate env refs (bot token + signing secret), then — unless
+ * `offline`, or a boot-gate check already failed — `auth.test` with the bot
+ * token (identity + reachability) and the token's GRANTED scopes, which
+ * Slack returns on every Web API response in the `x-oauth-scopes` header,
+ * diffed against the needed set from {@link deriveSlackScopes}. The signing
+ * secret stays presence-only: Slack never exposes it back over the API.
  */
 export async function verifySlackChannel(
   cfg: IrSlackConfig,
@@ -785,24 +1017,11 @@ export async function verifySlackChannel(
 ): Promise<ChannelCheck[]> {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const apiBase = opts.env["SLACK_API_BASE_URL"] ?? DEFAULT_SLACK_API_BASE_URL;
-  const checks: ChannelCheck[] = [];
+  const checks: ChannelCheck[] = channelEnvChecks("slack", { slack: cfg }, opts.env);
+  if (opts.offline === true || checks.some((c) => !c.pass)) return checks;
 
-  checks.push(
-    envRefCheck(
-      "Slack signing secret",
-      "channels.slack.signingSecret",
-      cfg.signingSecret,
-      opts.env,
-    ),
-  );
-
-  let botToken: string;
-  try {
-    botToken = resolveSecretRef("channels.slack.botToken", cfg.botToken, opts.env);
-  } catch (err) {
-    checks.push({ label: "Slack bot token", pass: false, reason: (err as Error).message });
-    return checks;
-  }
+  // Every ref resolved above, so this cannot throw.
+  const botToken = resolveSecretRef("channels.slack.botToken", cfg.botToken, opts.env);
 
   let res: Response;
   try {
@@ -868,11 +1087,12 @@ export async function verifySlackChannel(
 }
 
 /**
- * Telegram probes: `getWebhookInfo`, compared against the daemon route.
- * Telegram never returns the configured secret_token (write-only by design),
- * so the secret is checked for presence on the daemon side — the adapter
- * rejects every inbound POST if the two ever diverge, which surfaces as
- * pending updates + a 401 last_error here.
+ * Telegram: the boot-gate env refs (bot token + secret token), then — unless
+ * `offline`, or a boot-gate check already failed — `getWebhookInfo`,
+ * compared against the daemon route. Telegram never returns the configured
+ * secret_token (write-only by design), so the secret stays presence-only on
+ * the daemon side — the adapter rejects every inbound POST if the two ever
+ * diverge, which surfaces as pending updates + a 401 last_error here.
  */
 export async function verifyTelegramChannel(
   cfg: IrTelegramConfig,
@@ -880,24 +1100,11 @@ export async function verifyTelegramChannel(
 ): Promise<ChannelCheck[]> {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const apiBase = opts.env["TELEGRAM_API_BASE_URL"] ?? DEFAULT_TELEGRAM_API_BASE_URL;
-  const checks: ChannelCheck[] = [];
+  const checks: ChannelCheck[] = channelEnvChecks("telegram", { telegram: cfg }, opts.env);
+  if (opts.offline === true || checks.some((c) => !c.pass)) return checks;
 
-  checks.push(
-    envRefCheck(
-      "Telegram secret token (daemon side; Telegram never returns it)",
-      "channels.telegram.secretToken",
-      cfg.secretToken,
-      opts.env,
-    ),
-  );
-
-  let botToken: string;
-  try {
-    botToken = resolveSecretRef("channels.telegram.botToken", cfg.botToken, opts.env);
-  } catch (err) {
-    checks.push({ label: "Telegram bot token", pass: false, reason: (err as Error).message });
-    return checks;
-  }
+  // Every ref resolved above, so this cannot throw.
+  const botToken = resolveSecretRef("channels.telegram.botToken", cfg.botToken, opts.env);
 
   const redactedEndpoint = `${apiBase}/bot${describeSecretRef(cfg.botToken)}/getWebhookInfo`;
   let res: Response;
@@ -1000,8 +1207,12 @@ export async function verifyTelegramChannel(
 }
 
 /**
- * Discord probes: `GET applications/@me` with the bot token, asserting the
- * three facts the adapter depends on — the token belongs to the declared
+ * Discord: the boot-gate env refs (application id + bot token + public key —
+ * all three kill the daemon at boot, and the earlier version checked only
+ * the bot token, so `verify` could name a strictly smaller fix list than the
+ * daemon's own refusal), then — unless `offline`, or a boot-gate check
+ * already failed — `GET applications/@me` with the bot token, asserting the
+ * three facts the adapter depends on: the token belongs to the declared
  * `applicationId`, the application's `verify_key` equals the spec's
  * `publicKeyHex` (a mismatch means every inbound webhook fails Ed25519
  * verification with a 401), and `interactions_endpoint_url` points at the
@@ -1013,15 +1224,17 @@ export async function verifyDiscordChannel(
 ): Promise<ChannelCheck[]> {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const apiBase = opts.env["DISCORD_API_BASE_URL"] ?? DEFAULT_DISCORD_API_BASE_URL;
-  const checks: ChannelCheck[] = [];
+  const checks: ChannelCheck[] = channelEnvChecks("discord", { discord: cfg }, opts.env);
+  if (opts.offline === true || checks.some((c) => !c.pass)) return checks;
 
-  let botToken: string;
-  try {
-    botToken = resolveSecretRef("channels.discord.botToken", cfg.botToken, opts.env);
-  } catch (err) {
-    checks.push({ label: "Discord bot token", pass: false, reason: (err as Error).message });
-    return checks;
-  }
+  // Every ref resolved above, so these cannot throw.
+  const botToken = resolveSecretRef("channels.discord.botToken", cfg.botToken, opts.env);
+  const declaredId = resolveSecretRef(
+    "channels.discord.applicationId",
+    cfg.applicationId,
+    opts.env,
+  );
+  const declaredKey = resolveSecretRef("channels.discord.publicKeyHex", cfg.publicKeyHex, opts.env);
 
   let res: Response;
   try {
@@ -1053,44 +1266,29 @@ export async function verifyDiscordChannel(
   };
   checks.push({ label: `Discord application fetch (${app.name ?? "?"})`, pass: true });
 
-  try {
-    const declaredId = resolveSecretRef(
-      "channels.discord.applicationId",
-      cfg.applicationId,
-      opts.env,
-    );
-    checks.push(
-      app.id === declaredId
-        ? { label: `Discord application id (${declaredId})`, pass: true }
-        : {
-            label: "Discord application id",
-            pass: false,
-            reason: `bot token belongs to application ${app.id ?? "?"} but the spec declares ${declaredId}`,
-          },
-    );
-  } catch (err) {
-    checks.push({ label: "Discord application id", pass: false, reason: (err as Error).message });
-  }
+  // Labels here are distinct from the boot-gate ones above ("Discord
+  // application id" / "Discord public key"): those assert the value EXISTS,
+  // these assert it MATCHES the live application.
+  checks.push(
+    app.id === declaredId
+      ? { label: `Discord application id matches the bot token (${declaredId})`, pass: true }
+      : {
+          label: "Discord application id match",
+          pass: false,
+          reason: `bot token belongs to application ${app.id ?? "?"} but the spec declares ${declaredId}`,
+        },
+  );
 
-  try {
-    const declaredKey = resolveSecretRef(
-      "channels.discord.publicKeyHex",
-      cfg.publicKeyHex,
-      opts.env,
-    );
-    checks.push(
-      app.verify_key === declaredKey
-        ? { label: "Discord public key matches verify_key", pass: true }
-        : {
-            label: "Discord public key",
-            pass: false,
-            reason:
-              "spec publicKeyHex differs from the application's verify_key — every inbound webhook will fail Ed25519 verification (401)",
-          },
-    );
-  } catch (err) {
-    checks.push({ label: "Discord public key", pass: false, reason: (err as Error).message });
-  }
+  checks.push(
+    app.verify_key === declaredKey
+      ? { label: "Discord public key matches verify_key", pass: true }
+      : {
+          label: "Discord public key match",
+          pass: false,
+          reason:
+            "spec publicKeyHex differs from the application's verify_key — every inbound webhook will fail Ed25519 verification (401)",
+        },
+  );
 
   const endpointUrl = app.interactions_endpoint_url ?? "";
   if (endpointUrl === "") {
@@ -1158,19 +1356,27 @@ export type ChannelVerifySummary = {
 
 /** Render checks as the doctor's ✓/~/✗ lines + the exit code — non-zero on
  *  any hard failure (missing scopes, mismatched webhook, bad credentials);
- *  warns are informational. Mirrors audit-verify's `summarizeVerifyResult`. */
-export function summarizeChannelChecks(checks: ReadonlyArray<ChannelCheck>): ChannelVerifySummary {
+ *  warns are informational. Mirrors audit-verify's `summarizeVerifyResult`.
+ *  An all-green OFFLINE run must not claim the wiring is healthy — no
+ *  platform was asked — so it reports what it actually proved. */
+export function summarizeChannelChecks(
+  checks: ReadonlyArray<ChannelCheck>,
+  opts: { readonly offline?: boolean } = {},
+): ChannelVerifySummary {
   const lines = checks.map((c) => {
     if (c.warn === true && c.pass) return `~ ${c.label}: ${c.reason ?? "informational"}`;
     if (c.pass) return `✓ ${c.label}`;
     return `✗ ${c.label}: ${c.reason ?? "failed"}`;
   });
   const failed = checks.filter((c) => !c.pass).length;
+  const verdict =
+    failed > 0
+      ? ""
+      : opts.offline === true
+        ? " — every env var the daemon boots on is set (offline: no platform probes ran)"
+        : " — channel wiring looks healthy";
   return {
-    lines: [
-      ...lines,
-      `${checks.length} check(s), ${failed} failed${failed > 0 ? "" : " — channel wiring looks healthy"}`,
-    ],
+    lines: [...lines, `${checks.length} check(s), ${failed} failed${verdict}`],
     exitCode: failed > 0 ? 1 : 0,
   };
 }

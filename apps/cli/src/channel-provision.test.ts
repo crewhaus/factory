@@ -9,10 +9,11 @@
  * sockets.
  */
 import { describe, expect, test } from "bun:test";
-import { lower } from "@crewhaus/compiler";
+import { compile, lower } from "@crewhaus/compiler";
 import type { IrChannelV0 } from "@crewhaus/ir";
 import { parseSpec } from "@crewhaus/spec";
 import {
+  CHANNEL_ENV_PLATFORMS,
   ChannelApiError,
   ChannelEnvRefError,
   DISCORD_PERMISSION_BITS,
@@ -23,12 +24,16 @@ import {
   buildDiscordProvision,
   buildSlackManifest,
   buildTelegramProvision,
+  channelEnvChecks,
   channelEventsPath,
+  collectProvisionMissingEnv,
   deriveSlackBotEvents,
   deriveSlackScopes,
   describeSecretRef,
   describeVerifyProbes,
   joinBaseUrl,
+  modelCredentialChecks,
+  modelCredentialGroups,
   performDiscordProvision,
   performTelegramSetWebhook,
   platformSecretRefs,
@@ -93,6 +98,37 @@ channels:
     phoneNumberId: $WA_PHONE_ID
     accessToken: $WA_ACCESS_TOKEN
     appSecret: $WA_APP_SECRET
+routing:
+  sessionKey: channel
+`;
+
+/** Every channel the daemon's boot gate covers, all as env refs — the
+ *  fixture for the boot-gate parity test below. */
+const ALL_CHANNELS_SPEC = `
+name: everywhere-bot
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: Answer briefly.
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+  telegram:
+    botToken: $TELEGRAM_BOT_TOKEN
+    secretToken: $TELEGRAM_SECRET_TOKEN
+  discord:
+    applicationId: $DISCORD_APPLICATION_ID
+    botToken: $DISCORD_BOT_TOKEN
+    publicKeyHex: $DISCORD_PUBLIC_KEY
+  whatsapp:
+    phoneNumberId: $WA_PHONE_ID
+    accessToken: $WA_ACCESS_TOKEN
+    appSecret: $WA_APP_SECRET
+    verifyToken: $WA_VERIFY_TOKEN
+  imessage:
+    chatDbPath: $IMESSAGE_CHAT_DB
+    cursorPath: $IMESSAGE_CURSOR
 routing:
   sessionKey: channel
 `;
@@ -737,7 +773,10 @@ describe("verifyDiscordChannel", () => {
       fetchImpl: impl,
       baseUrl: BASE_URL,
     });
-    const keyCheck = checks.find((c) => c.label === "Discord public key");
+    // The boot-gate check ("Discord public key") only asserts the value is
+    // present; the MATCH check is the one that fails here.
+    expect(checks.find((c) => c.label === "Discord public key")?.pass).toBe(true);
+    const keyCheck = checks.find((c) => c.label === "Discord public key match");
     expect(keyCheck?.pass).toBe(false);
     expect(keyCheck?.reason).toContain("Ed25519");
   });
@@ -749,7 +788,10 @@ describe("verifyDiscordChannel", () => {
       fetchImpl: impl,
       baseUrl: BASE_URL,
     });
-    const idCheck = checks.find((c) => c.label === "Discord application id");
+    // Same split: the boot-gate "Discord application id" check passes (the
+    // env var IS set); the ownership check is what catches the wrong app.
+    expect(checks.find((c) => c.label === "Discord application id")?.pass).toBe(true);
+    const idCheck = checks.find((c) => c.label === "Discord application id match");
     expect(idCheck?.pass).toBe(false);
     expect(idCheck?.reason).toContain("other-app");
   });
@@ -832,5 +874,207 @@ describe("supporting derivations", () => {
     expect(lines.join("\n")).toContain("bot$TELEGRAM_BOT_TOKEN/getWebhookInfo");
     expect(lines.join("\n")).not.toContain("real-tg-token");
     expect(lines.join("\n")).not.toContain("xoxb-real-slack-token");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Boot gate — `verify` must name every env var the compiled daemon refuses to
+// start without, and `--offline` must reach that verdict with no network.
+// Regression for the demo-driver audit: verify named 5 of the daemon's 8
+// required vars (DISCORD_APPLICATION_ID, DISCORD_PUBLIC_KEY and the provider
+// credential were never checked), so an operator who fixed exactly what
+// verify listed still got a daemon that exited 2 at boot.
+// ---------------------------------------------------------------------------
+
+/** A fetch that fails the test if anything calls it. */
+const forbiddenFetch = (async (input: RequestInfo | URL) => {
+  throw new Error(`network call attempted: ${String(input)}`);
+}) as unknown as typeof fetch;
+
+describe("verify boot gate", () => {
+  const cfgs = () => {
+    const { slack, telegram, discord } = channelIr().channels;
+    if (slack === undefined || telegram === undefined || discord === undefined) {
+      throw new Error("fixture channels missing");
+    }
+    return { slack, telegram, discord };
+  };
+
+  test("discord names ALL THREE boot-gated env refs when nothing is set (not just the bot token)", async () => {
+    const { impl, calls } = fakeFetch(() => ({ body: {} }));
+    const checks = await verifyDiscordChannel(cfgs().discord, { env: {}, fetchImpl: impl });
+    expect(calls).toHaveLength(0);
+    const reasons = checks.map((c) => c.reason ?? "").join("\n");
+    expect(reasons).toContain("$DISCORD_APPLICATION_ID");
+    expect(reasons).toContain("$DISCORD_BOT_TOKEN");
+    expect(reasons).toContain("$DISCORD_PUBLIC_KEY");
+    expect(checks.filter((c) => !c.pass)).toHaveLength(3);
+  });
+
+  test("a missing non-token ref still blocks the probe (the daemon could not boot anyway)", async () => {
+    const { impl, calls } = fakeFetch(() => ({ body: {} }));
+    const partial = { ...FULL_ENV, DISCORD_PUBLIC_KEY: "" };
+    const checks = await verifyDiscordChannel(cfgs().discord, { env: partial, fetchImpl: impl });
+    expect(calls).toHaveLength(0);
+    expect(checks.find((c) => c.label === "Discord public key")?.pass).toBe(false);
+  });
+
+  test("--offline runs the env checks for every platform and performs no call", async () => {
+    const slack = await verifySlackChannel(
+      cfgs().slack,
+      { channelReactions: true },
+      { env: FULL_ENV, fetchImpl: forbiddenFetch, offline: true },
+    );
+    const telegram = await verifyTelegramChannel(cfgs().telegram, {
+      env: FULL_ENV,
+      fetchImpl: forbiddenFetch,
+      offline: true,
+      baseUrl: BASE_URL,
+    });
+    const discord = await verifyDiscordChannel(cfgs().discord, {
+      env: FULL_ENV,
+      fetchImpl: forbiddenFetch,
+      offline: true,
+      baseUrl: BASE_URL,
+    });
+    const all = [...slack, ...telegram, ...discord];
+    // 2 slack + 2 telegram + 3 discord boot-gated refs, all green, no probes.
+    expect(all).toHaveLength(7);
+    expect(all.every((c) => c.pass)).toBe(true);
+    expect(all.map((c) => c.label)).not.toContain("Slack auth.test");
+    expect(summarizeChannelChecks(all, { offline: true }).exitCode).toBe(0);
+  });
+
+  test("--offline is deterministic: a rejecting platform API cannot change the verdict", async () => {
+    const rejecting = fakeFetch(() => ({ body: { ok: false, error: "invalid_auth" } }));
+    const online = await verifySlackChannel(
+      cfgs().slack,
+      { channelReactions: true },
+      { env: FULL_ENV, fetchImpl: rejecting.impl },
+    );
+    const offline = await verifySlackChannel(
+      cfgs().slack,
+      { channelReactions: true },
+      { env: FULL_ENV, fetchImpl: rejecting.impl, offline: true },
+    );
+    expect(summarizeChannelChecks(online).exitCode).toBe(1);
+    expect(summarizeChannelChecks(offline, { offline: true }).exitCode).toBe(0);
+    expect(rejecting.calls).toHaveLength(1); // only the online run called out
+  });
+
+  test("an all-green offline summary does not claim the wiring is healthy", () => {
+    const green = [{ label: "Slack bot token", pass: true }];
+    expect(summarizeChannelChecks(green, { offline: true }).lines.at(-1)).toContain(
+      "offline: no platform probes ran",
+    );
+    expect(summarizeChannelChecks(green).lines.at(-1)).toContain("channel wiring looks healthy");
+  });
+
+  test("channelEnvChecks covers the no-probe channels too (whatsapp/imessage)", () => {
+    const channels = channelIr(ALL_CHANNELS_SPEC).channels;
+    const wa = channelEnvChecks("whatsapp", channels, {});
+    expect(wa.map((c) => c.label)).toEqual([
+      "WhatsApp phone number id",
+      "WhatsApp access token",
+      "WhatsApp app secret",
+      "WhatsApp verify token",
+    ]);
+    expect(wa.every((c) => !c.pass)).toBe(true);
+    const im = channelEnvChecks("imessage", channels, { IMESSAGE_CHAT_DB: "/tmp/chat.db" });
+    expect(im.map((c) => c.pass)).toEqual([true, false]);
+  });
+
+  test("modelCredentialGroups mirrors the emitter: either-or per provider, none for bedrock/local/garbage", () => {
+    expect(modelCredentialGroups("claude-sonnet-4-6")).toEqual([
+      ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
+    ]);
+    expect(modelCredentialGroups("openai/gpt-4o")).toEqual([["OPENAI_API_KEY", "OPENAI_BASE_URL"]]);
+    expect(modelCredentialGroups("gemini/gemini-2.5-pro")).toEqual([
+      ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    ]);
+    expect(modelCredentialGroups("bedrock/anthropic.claude-3-5-sonnet")).toEqual([]);
+    expect(modelCredentialGroups("local/llama3@http://127.0.0.1:11434/v1")).toEqual([]);
+    expect(modelCredentialGroups("not a model string")).toEqual([]);
+  });
+
+  test("modelCredentialChecks passes on EITHER name and fails naming both", () => {
+    expect(modelCredentialChecks("claude-sonnet-4-6", { ANTHROPIC_AUTH_TOKEN: "t" })[0]?.pass).toBe(
+      true,
+    );
+    const failing = modelCredentialChecks("claude-sonnet-4-6", {})[0];
+    expect(failing?.pass).toBe(false);
+    expect(failing?.reason).toContain("ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY");
+    expect(modelCredentialChecks("bedrock/anthropic.claude-3-5-sonnet", {})).toEqual([]);
+  });
+
+  test("boot-gate parity: the CLI's env set equals the emitted daemon's own startup gate", () => {
+    const channels = channelIr(ALL_CHANNELS_SPEC).channels;
+    const cliNames = [
+      ...CHANNEL_ENV_PLATFORMS.flatMap((p) =>
+        platformSecretRefs(p, channels).flatMap((r) => (r.ref.kind === "env" ? [r.ref.name] : [])),
+      ),
+      ...modelCredentialGroups("claude-sonnet-4-6").map((g) => g.join(" or ")),
+    ].sort();
+
+    const daemon =
+      compile(ALL_CHANNELS_SPEC).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    const required = daemon.match(/const __requiredEnv = (\[[^\]]*\]);/)?.[1] ?? "[]";
+    const anyOf = daemon.match(/const __providerEnvAnyOf: string\[\]\[\] = (\[\[[^;]*\]\]);/)?.[1];
+    const daemonNames = [
+      ...(JSON.parse(required) as string[]),
+      ...((anyOf === undefined ? [] : (JSON.parse(anyOf) as string[][])).map((g) =>
+        g.join(" or "),
+      ) as string[]),
+    ].sort();
+
+    // Anchor the comparison to real content (an unmatched regex would
+    // otherwise compare two empty lists): the two vars the audit found
+    // unchecked, a no-probe channel's optional token, and the model group.
+    expect(daemonNames).toEqual(
+      expect.arrayContaining([
+        "DISCORD_APPLICATION_ID",
+        "DISCORD_PUBLIC_KEY",
+        "WA_VERIFY_TOKEN",
+        "IMESSAGE_CURSOR",
+        "ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY",
+      ]),
+    );
+    expect(cliNames).toEqual(daemonNames);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Provision pre-flight — every selected platform's env is validated BEFORE
+// the first side effect. Regression for the demo-driver audit: provision
+// wrote slack-app-manifest.yaml into the cwd and only then died on Telegram's
+// unset env, leaving a stray file in the operator's repo.
+// ---------------------------------------------------------------------------
+describe("collectProvisionMissingEnv", () => {
+  const channels = () => channelIr().channels;
+
+  test("reports every platform's unset refs in one pass", () => {
+    const missing = collectProvisionMissingEnv(
+      ["slack", "telegram", "discord"],
+      channels(),
+      BASE_URL,
+      {},
+    );
+    expect(missing.map((m) => `${m.platform}:${m.envName}`)).toEqual([
+      "telegram:TELEGRAM_BOT_TOKEN",
+      "telegram:TELEGRAM_SECRET_TOKEN",
+      "discord:DISCORD_APPLICATION_ID",
+      "discord:DISCORD_BOT_TOKEN",
+    ]);
+    expect(missing.map((m) => m.label)).toContain("channels.telegram.botToken");
+  });
+
+  test("slack contributes nothing — its manifest is how you OBTAIN the tokens", () => {
+    expect(collectProvisionMissingEnv(["slack"], channels(), BASE_URL, {})).toEqual([]);
+  });
+
+  test("nothing missing once the env is populated", () => {
+    expect(
+      collectProvisionMissingEnv(["slack", "telegram", "discord"], channels(), BASE_URL, FULL_ENV),
+    ).toEqual([]);
   });
 });

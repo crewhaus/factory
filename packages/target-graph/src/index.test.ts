@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import type { IrGraphV0 } from "@crewhaus/ir";
-import { TargetEmitError, emitGraph } from "./index";
+import { HITL_REJECTION_DECISIONS, TargetEmitError, emitGraph, isHitlRejection } from "./index";
 
 const baseIr: IrGraphV0 = {
   version: 0,
@@ -1048,5 +1048,122 @@ describe("emitGraph — emitted durable bundle is syntactically valid TS", () =>
     const t = new Bun.Transpiler({ loader: "ts" });
     const code = emitGraph(baseIr, { readme: false }).files[0]?.content ?? "";
     expect(() => t.transformSync(code)).not.toThrow();
+  });
+});
+
+/**
+ * Audit factory #4 — the HITL gate is a PRE-condition. It used to be emitted
+ * AFTER the gated node's runChatLoop call, which (a) showed the approver a
+ * prompt but never the work, (b) threw the node's reply away (the engine
+ * checkpoints the PRE-node state on a pause) and (c) re-ran — and re-paid
+ * for — the same model call on resume.
+ */
+describe("emitGraph — hitl gate is a pre-condition (audit factory #4)", () => {
+  const bodyOf = (code: string, node: string): string => {
+    const start = code.indexOf(`.addNode(${JSON.stringify(node)}`);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const rest = code.slice(start + 1);
+    const nextNode = rest.indexOf("  .addNode(");
+    const firstEdge = rest.indexOf("  .addEdge(");
+    const ends = [nextNode, firstEdge].filter((i) => i >= 0);
+    return ends.length === 0 ? rest : rest.slice(0, Math.min(...ends));
+  };
+
+  test("requestApproval is awaited BEFORE the gated node's runChatLoop call", () => {
+    const body = bodyOf(emitGraph(baseIr).files[0]?.content ?? "", "execute");
+    const ask = body.indexOf("ctx.requestApproval");
+    const turn = body.indexOf("await runChatLoop(");
+    expect(ask).toBeGreaterThanOrEqual(0);
+    expect(turn).toBeGreaterThanOrEqual(0);
+    expect(ask).toBeLessThan(turn);
+  });
+
+  test("a rejecting decision returns before the model turn", () => {
+    const body = bodyOf(emitGraph(baseIr).files[0]?.content ?? "", "execute");
+    const guard = body.indexOf("if (__hitlRejected(__decision))");
+    const turn = body.indexOf("await runChatLoop(");
+    expect(guard).toBeGreaterThanOrEqual(0);
+    expect(guard).toBeLessThan(turn);
+    // A cancelled node records ONLY its decision — no output key, which is
+    // what lets `when: { key: execute, exists: true }` route a rejection.
+    const rejectBranch = body.slice(guard, body.indexOf("const __seed"));
+    expect(rejectBranch).toContain('__rejected["execute" + "_decision"] = __decision;');
+    expect(rejectBranch).not.toContain('["execute"]: __reply');
+    expect(rejectBranch).toContain("return __rejected;");
+  });
+
+  test("the approved path still records <node>_decision alongside the output", () => {
+    const body = bodyOf(emitGraph(baseIr).files[0]?.content ?? "", "execute");
+    expect(body).toContain('const __next = { ...prev, ["execute"]: __reply };');
+    expect(body).toContain('__next["execute" + "_decision"] = __decision;');
+  });
+
+  test("the rejection early-return uses a computed key, not a bare identifier (CWE-94)", () => {
+    const name = 'x"] = 1; globalThis.__HITL_PWNED__ = 1; const __z = { ["y';
+    const ir: IrGraphV0 = {
+      ...baseIr,
+      entry: name,
+      nodes: [
+        {
+          name,
+          instructions: "x",
+          model: "claude-sonnet-4-6",
+          tools: [],
+          toolConfigs: {},
+          hitlPrompt: "ok?",
+        },
+      ] as IrGraphV0["nodes"],
+      edges: [],
+    };
+    const code = emitGraph(ir).files[0]?.content ?? "";
+    expect(code).toContain(`__rejected[${escapeJsonString(name)} + "_decision"]`);
+    expect(code).not.toContain('globalThis.__HITL_PWNED__ = 1; const __z = { ["y"');
+    expect(() => new Bun.Transpiler({ loader: "ts" }).transformSync(code)).not.toThrow();
+  });
+
+  test("isHitlRejection cancels only rejecting decisions; free text approves", () => {
+    for (const yes of ["reject", "REJECT", " no ", "deny", "declined", "abort", "cancel", "veto"]) {
+      expect(isHitlRejection(yes)).toBe(true);
+    }
+    // Free-text notes must reach the state rather than silently skip the work.
+    for (const no of ["approve", "yes", "ok", "approve, but keep it short", ""]) {
+      expect(isHitlRejection(no)).toBe(false);
+    }
+  });
+
+  test("the emitted __hitlRejected helper carries that same vocabulary", () => {
+    const code = emitGraph(baseIr).files[0]?.content ?? "";
+    expect(code).toContain(
+      `const __HITL_REJECTIONS: ReadonlySet<string> = new Set(${JSON.stringify(HITL_REJECTION_DECISIONS)});`,
+    );
+    expect(code).toContain("return __HITL_REJECTIONS.has(decision.trim().toLowerCase());");
+  });
+
+  test("gate-free graphs carry NO hitl machinery (byte-stability)", () => {
+    const ir: IrGraphV0 = {
+      ...baseIr,
+      nodes: baseIr.nodes.map((n) => {
+        const { hitlPrompt: _drop, ...rest } = n;
+        return rest;
+      }) as IrGraphV0["nodes"],
+    };
+    const code = emitGraph(ir).files[0]?.content ?? "";
+    for (const s of [
+      "__hitlRejected",
+      "__HITL_REJECTIONS",
+      "ctx.requestApproval",
+      "__rejected",
+      '"_decision"',
+    ]) {
+      expect(code).not.toContain(s);
+    }
+  });
+
+  test("the pause report prints the state the approver is deciding on", () => {
+    const code = emitGraph(baseIr).files[0]?.content ?? "";
+    expect(code).toContain("state under review");
+    expect(code).toContain("JSON.stringify(paused.state, null, 2)");
+    // …fed from the engine's hitl_pause event, not re-read from the store.
+    expect(code).toContain("prompt: ev.prompt, state: ev.state");
   });
 });

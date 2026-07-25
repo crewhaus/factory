@@ -61,6 +61,12 @@ describe("emitResearchBundle", () => {
     expect(code).toContain('"run_done"');
   });
 
+  test("warns on stderr when the run recorded zero citations", () => {
+    const code = emitResearchBundle(baseIr).files[0]?.content ?? "";
+    expect(code).toContain("report.json.citations.length === 0");
+    expect(code).toContain("WARNING: no citations were recorded");
+  });
+
   test("wires alwaysAllow rules for Source + CiteFact at the flag layer", () => {
     const code = emitResearchBundle(baseIr).files[0]?.content ?? "";
     expect(code).toContain('pattern: "Source"');

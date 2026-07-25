@@ -119,10 +119,44 @@ export type ParsedInbound =
   | { readonly kind: "challenge"; readonly challenge: string }
   | { readonly kind: "skip" };
 
+/**
+ * An UNSIGNED, GET-based subscription handshake — the shape Meta (WhatsApp)
+ * uses to verify a callback URL before it will deliver any webhook. There is
+ * no body and no HMAC header to check, so the gateway cannot route it through
+ * `verify()`/`parseInbound()`; instead the platform proves itself with a
+ * shared verify token carried in the query string.
+ *
+ * The gateway hands the parsed request URL (query string included) plus the
+ * headers; the adapter decides. Slack and Discord verify inside a signed POST
+ * body (`{kind:"challenge"}` from `parseInbound`) and leave `handshake`
+ * undefined — for them the gateway's behaviour is unchanged.
+ */
+export type HandshakeRequest = {
+  readonly headers: Headers;
+  readonly url: URL;
+};
+
+/**
+ * `{kind:"challenge"}` ⇒ the gateway echoes `challenge` back with 200; any
+ * other outcome ⇒ 403. An adapter that cannot authenticate the caller (bad
+ * token, missing params, or no verify token configured on this daemon) MUST
+ * return `{kind:"reject"}` — echoing an unauthenticated challenge would let
+ * anyone bind their own Meta app to this daemon's callback URL.
+ */
+export type HandshakeResult =
+  | { readonly kind: "challenge"; readonly challenge: string }
+  | { readonly kind: "reject" };
+
 export interface ChannelAdapter {
   readonly id: string;
   verify(req: RawRequest): boolean;
   parseInbound(req: RawRequest): ParsedInbound;
+  /**
+   * Answer an unsigned GET subscription handshake (Meta's `hub.challenge`
+   * flow). Optional — adapters whose platform has no such handshake leave it
+   * undefined and the gateway falls through to the normal signed path.
+   */
+  handshake?(req: HandshakeRequest): HandshakeResult;
   /**
    * D40 — post the reply; when the channel API returns a post receipt, the
    * adapter surfaces the posted message's ts as `{ messageTs }` so the

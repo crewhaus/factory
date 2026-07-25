@@ -246,7 +246,12 @@ const gateway = createGatewayServer({
   handler: async ({ method, params, tenant }) => {
     if (method === "runs.create" || method === "runs.continue") {
       const p = params as { input: string; sessionId?: string };
-      const sessionId = p.sessionId ?? `sess_${Math.random().toString(36).slice(2, 18).padEnd(16, "0")}`;
+      // The default session id MUST satisfy session-store's id contract
+      // (/^sess_[0-9a-f]{16}$/ — see packages/session-store generateId), or the
+      // very first store write of a runs.create that omitted sessionId throws
+      // and the caller sees internal_error. Mint it exactly the way the store
+      // itself does: 8 random bytes, hex-encoded.
+      const sessionId = p.sessionId ?? `sess_${randomBytes(8).toString("hex")}`;
       const runId = `run_${Math.random().toString(36).slice(2, 10)}`;
       const log = await gateway.getAuditLog(tenant);
       const policy = evaluatePolicy(

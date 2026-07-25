@@ -2268,6 +2268,30 @@ routing:
     expect(ir.channels.imessage?.cursorPath).toEqual({ kind: "env", name: "IM_CURSOR" });
   });
 
+  test("lowers a WhatsApp verifyToken when present, omits it when absent", () => {
+    const spec = (extra: string) => `
+name: ch
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  whatsapp:
+    phoneNumberId: $WA_PHONE
+    accessToken: $WA_TOKEN
+    appSecret: $WA_SECRET${extra}
+routing:
+  sessionKey: user
+`;
+    const withToken = lower(parseSpec(spec("\n    verifyToken: $WA_VERIFY")));
+    if (withToken.target !== "channel") throw new Error("unexpected target");
+    expect(withToken.channels.whatsapp?.verifyToken).toEqual({ kind: "env", name: "WA_VERIFY" });
+
+    const without = lower(parseSpec(spec("")));
+    if (without.target !== "channel") throw new Error("unexpected target");
+    expect(without.channels.whatsapp?.verifyToken).toBeUndefined();
+  });
+
   test("lowers a Slack appToken when present (optional third secret)", () => {
     const ir = lower(
       parseSpec(`

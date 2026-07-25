@@ -119,6 +119,49 @@ function rejectTraversalPattern(toolName: string, pattern: string): void {
   }
 }
 
+/**
+ * Directory names that hold vendored or generated files rather than the user's
+ * project. Compiling a bundle into the workspace (`crewhaus compile -o <dir>
+ * --check` runs `bun install`) drops thousands of dependency files next to a
+ * handful of real source files: without this list a `**\/*.ts` Glob returns
+ * mostly vendored code and Grep spends its byte/time budget on it before it
+ * ever reaches the project.
+ *
+ * Skipped by default, never forbidden: naming the directory in the Glob
+ * pattern — or pointing Grep's `path` at it — opts back in, the same way
+ * ripgrep still searches an explicitly-named ignored path.
+ */
+export const DEFAULT_IGNORED_DIRS: readonly string[] = ["node_modules", "__pycache__"];
+
+/** The default-ignored dirs the caller did NOT name, i.e. the ones to skip. */
+function activeIgnoredDirs(mentionedIn: string): readonly string[] {
+  return DEFAULT_IGNORED_DIRS.filter((dir) => !mentionedIn.includes(dir));
+}
+
+/**
+ * The first ignored directory name on `rel`'s path, or undefined when the
+ * entry is not under one. `rel` comes from Bun.Glob, which uses the platform
+ * separator, so split on both.
+ */
+function ignoredSegmentOf(rel: string, ignored: readonly string[]): string | undefined {
+  if (ignored.length === 0) return undefined;
+  for (const seg of rel.split(/[\\/]/)) {
+    if (ignored.includes(seg)) return seg;
+  }
+  return undefined;
+}
+
+/** "[Glob: 12 file(s) under node_modules/ hidden — …]", or "" when nothing was skipped. */
+function hiddenNote(toolName: string, skipped: number, dirs: ReadonlySet<string>): string {
+  if (skipped === 0) return "";
+  const names = [...dirs]
+    .sort()
+    .map((d) => `${d}/`)
+    .join(", ");
+  const how = toolName === "Glob" ? "name the directory in the pattern" : "pass it as `path`";
+  return `\n[${toolName}: ${skipped} file(s) under ${names} hidden — ${how} to include them]`;
+}
+
 const readSchema = z.object({ path: z.string() });
 export const read: RegisteredTool = buildTool({
   name: "Read",
@@ -203,20 +246,30 @@ const globSchema = z.object({ pattern: z.string() });
 export const glob: RegisteredTool = buildTool({
   name: "Glob",
   description:
-    "List files inside the workspace matching a glob pattern (e.g. **/*.ts). Returns newline-joined relative paths.",
+    "List files inside the workspace matching a glob pattern (e.g. **/*.ts). Vendored directories (node_modules, __pycache__) are skipped unless the pattern names them. Returns newline-joined relative paths.",
   inputSchema: globSchema,
   readOnly: true,
   concurrencySafe: true,
   execute: async (input) => {
     rejectTraversalPattern("Glob", input.pattern);
     const cwd = process.cwd();
+    const ignored = activeIgnoredDirs(input.pattern);
     const matcher = new Bun.Glob(input.pattern);
     const matches: string[] = [];
+    const hiddenDirs = new Set<string>();
+    let hidden = 0;
     for await (const rel of matcher.scan({ cwd, onlyFiles: true })) {
+      const skippedBy = ignoredSegmentOf(rel, ignored);
+      if (skippedBy !== undefined) {
+        hidden++;
+        hiddenDirs.add(skippedBy);
+        continue;
+      }
       matches.push(rel);
     }
     matches.sort();
-    return matches.length === 0 ? "no matches" : matches.join("\n");
+    const body = matches.length === 0 ? "no matches" : matches.join("\n");
+    return body + hiddenNote("Glob", hidden, hiddenDirs);
   },
 });
 
@@ -317,7 +370,7 @@ export function hasNestedQuantifier(pattern: string): boolean {
 export const grep: RegisteredTool = buildTool({
   name: "Grep",
   description:
-    "Search for a regex pattern across files in the workspace (or a subdirectory). Returns lines as path:lineNo:match.",
+    "Search for a regex pattern across files in the workspace (or a subdirectory). Vendored directories (node_modules, __pycache__) are skipped unless `path` points inside one. Returns lines as path:lineNo:match.",
   inputSchema: grepSchema,
   readOnly: true,
   concurrencySafe: true,
@@ -348,9 +401,20 @@ export const grep: RegisteredTool = buildTool({
     const deadline = Date.now() + GREP_DEADLINE_MS;
     let scannedBytes = 0;
     let truncated = false;
+    // Pointing `path` at (or inside) a vendored directory opts into searching
+    // it; otherwise its contents are skipped before they cost a read.
+    const ignored = activeIgnoredDirs(input.path ?? "");
     const matcher = new Bun.Glob("**/*");
     const hits: string[] = [];
+    const hiddenDirs = new Set<string>();
+    let hidden = 0;
     outer: for await (const rel of matcher.scan({ cwd: baseAbs, onlyFiles: true })) {
+      const skippedBy = ignoredSegmentOf(rel, ignored);
+      if (skippedBy !== undefined) {
+        hidden++;
+        hiddenDirs.add(skippedBy);
+        continue;
+      }
       const fileAbs = path.join(baseAbs, rel);
       const display = baseRel === "" ? rel : path.join(baseRel, rel);
       let text: string;
@@ -382,7 +446,11 @@ export const grep: RegisteredTool = buildTool({
       }
     }
     const note = truncated ? "\n[grep: scan stopped early — workspace too large or slow]" : "";
-    return (hits.length === 0 ? "no matches" : hits.join("\n")) + note;
+    return (
+      (hits.length === 0 ? "no matches" : hits.join("\n")) +
+      note +
+      hiddenNote("Grep", hidden, hiddenDirs)
+    );
   },
 });
 

@@ -405,6 +405,137 @@ describe("HITL pause + resume (T3)", () => {
     expect(resumed.state.approved).toBe("approve");
     expect(resumed.state.result).toBe("summary: moon-done");
   });
+
+  /**
+   * Audit factory #4 — the approver must be able to SEE what they are
+   * approving. `hitl_pause` carries the pre-node state (the same state the
+   * pause checkpoint persists), so a CLI/UI can render the upstream output
+   * without loading the checkpoint out of band.
+   */
+  test("hitl_pause carries the state the paused node was about to run on", async () => {
+    const g = createGraph<{ topic: string }, { topic: string; plan?: string }>({
+      checkpointStore: store,
+    })
+      .setInputAdapter((i) => ({ topic: i.topic }))
+      .addNode("plan", async (_c, s) => ({ ...s, plan: `plan for ${s.topic}` }))
+      .addNode("execute", async (ctx, s) => {
+        await ctx.requestApproval("run the plan?");
+        return s;
+      })
+      .addEdge("plan", "execute")
+      .setEntry("plan")
+      .compile();
+
+    const { events, pausedAt } = await collectLastCheckpoint(g.run({ topic: "moon" }));
+    const pauseEv = events.find((e) => e.kind === "hitl_pause");
+    if (pauseEv === undefined || pauseEv.kind !== "hitl_pause") {
+      throw new Error("missing hitl_pause event");
+    }
+    // The upstream node's output — what the human is deciding on.
+    expect(pauseEv.state).toEqual({ topic: "moon", plan: "plan for moon" });
+    expect(pausedAt?.state).toEqual(pauseEv.state);
+    // …and it is byte-identical to the persisted checkpoint's state.
+    const cp = await store.load(pauseEv.graphRunId, pauseEv.checkpointId);
+    expect(cp?.state).toEqual(pauseEv.state);
+  });
+
+  test("an unpersisted pause (no checkpoint store) still carries the state", async () => {
+    const g = createGraph<{ n: number }, { n: number }>()
+      .setInputAdapter((i) => ({ n: i.n }))
+      .addNode("gate", async (ctx, s) => {
+        await ctx.requestApproval("ok?");
+        return s;
+      })
+      .setEntry("gate")
+      .compile();
+    const { events } = await collectLastCheckpoint(g.run({ n: 7 }));
+    const pauseEv = events.find((e) => e.kind === "hitl_pause");
+    if (pauseEv === undefined || pauseEv.kind !== "hitl_pause") {
+      throw new Error("missing hitl_pause event");
+    }
+    expect(pauseEv.checkpointId).toBe("ckpt_unpersisted_0000");
+    expect(pauseEv.state).toEqual({ n: 7 });
+  });
+
+  /**
+   * Audit factory #4 — the contract the `target-graph` codegen relies on:
+   * ask BEFORE working. Work done ahead of `requestApproval` is discarded
+   * (the pause checkpoints the PRE-node state) and re-executed on resume;
+   * work done after it runs exactly once.
+   */
+  test("work after the ask runs exactly once across pause + resume", async () => {
+    let turns = 0;
+    const g = createGraph<{ topic: string }, { topic: string; result?: string }>({
+      checkpointStore: store,
+    })
+      .setInputAdapter((i) => ({ topic: i.topic }))
+      .addNode("execute", async (ctx, s) => {
+        const decision = await ctx.requestApproval("go?");
+        if (decision === "reject") return s;
+        turns += 1;
+        return { ...s, result: `did ${s.topic}` };
+      })
+      .setEntry("execute")
+      .compile();
+
+    const { events, pausedAt } = await collectLastCheckpoint(g.run({ topic: "moon" }));
+    const pauseEv = events.find((e) => e.kind === "hitl_pause");
+    if (pauseEv === undefined || pauseEv.kind !== "hitl_pause" || pausedAt === undefined) {
+      throw new Error("missing hitl_pause event");
+    }
+    expect(turns).toBe(0); // nothing spent while a human deliberates
+
+    const resumed = await collectTerminalState(
+      g.resume(pauseEv.graphRunId, pausedAt.checkpointId, "approve"),
+    );
+    expect(turns).toBe(1); // …and the resumed run makes the FIRST call, not a second
+    expect(resumed.state.result).toBe("did moon");
+
+    // A rejecting decision cancels the work outright (the codegen's
+    // `__hitlRejected` early return, expressed in the engine's terms).
+    const rejectedRun = await collectLastCheckpoint(g.run({ topic: "mars" }));
+    const rejectEv = rejectedRun.events.find((e) => e.kind === "hitl_pause");
+    if (rejectEv === undefined || rejectEv.kind !== "hitl_pause") {
+      throw new Error("missing hitl_pause event");
+    }
+    const rejected = await collectTerminalState(
+      g.resume(rejectEv.graphRunId, rejectEv.checkpointId, "reject"),
+    );
+    expect(turns).toBe(1);
+    expect(rejected.state.result).toBeUndefined();
+  });
+
+  test("work BEFORE the ask is discarded and re-executed on resume", async () => {
+    let turns = 0;
+    const g = createGraph<{ topic: string }, { topic: string; result?: string }>({
+      checkpointStore: store,
+    })
+      .setInputAdapter((i) => ({ topic: i.topic }))
+      .addNode("execute", async (ctx, s) => {
+        turns += 1;
+        const next = { ...s, result: `did ${s.topic}` };
+        await ctx.requestApproval("was that ok?");
+        return next;
+      })
+      .setEntry("execute")
+      .compile();
+
+    const { events, pausedAt } = await collectLastCheckpoint(g.run({ topic: "moon" }));
+    const pauseEv = events.find((e) => e.kind === "hitl_pause");
+    if (pauseEv === undefined || pauseEv.kind !== "hitl_pause" || pausedAt === undefined) {
+      throw new Error("missing hitl_pause event");
+    }
+    expect(turns).toBe(1);
+    // The work is NOT on the pause event or the checkpoint — the approver
+    // cannot see it …
+    expect(pauseEv.state).toEqual({ topic: "moon" });
+    // … and resuming runs the same work a SECOND time.
+    const resumed = await collectTerminalState(
+      g.resume(pauseEv.graphRunId, pausedAt.checkpointId, "approve"),
+    );
+    expect(turns).toBe(2);
+    expect(resumed.state.result).toBe("did moon");
+  });
 });
 
 describe("checkpoints (T1)", () => {

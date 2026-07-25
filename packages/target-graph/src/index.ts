@@ -64,8 +64,14 @@ import {
  * adapter directly).
  *
  * HITL: nodes whose IR carries `hitlPrompt` await `ctx.requestApproval`
- * after the LLM turn. The graph-engine's pause/resume flow handles the
- * checkpoint persistence; the bundle emits CLI argument parsing for
+ * BEFORE the LLM turn — the gate is a pre-condition, matching
+ * graph-engine's pause/resume contract (the pause checkpoints the PRE-node
+ * state and `resume()` replays the paused node from the top). So a pause
+ * has spent nothing, the `hitl_pause` event carries the state the approver
+ * is deciding on, and the resumed turn is the node's first, not its
+ * second. A rejecting decision (see HITL_HELPER) cancels the turn.
+ * The graph-engine's pause/resume flow handles the checkpoint
+ * persistence; the bundle emits CLI argument parsing for
  *
  *   bun agent.ts --resume <graphRunId> <decision>
  *   bun agent.ts --branch-from <graphRunId> <checkpointId>
@@ -392,6 +398,71 @@ function renderJudgePassCondition(judgeName: string, when: IrGraphEdgeWhen | und
 }
 
 /**
+ * The `hitl:` decision vocabulary that CANCELS a gated node's turn, compared
+ * trimmed + lower-cased. Any other decision — including free text — approves;
+ * the raw string is recorded at `state["<node>_decision"]` either way, so
+ * every downstream node reads it as part of the upstream state. (`when:`
+ * edges cannot name that key yet — `when.key` must name a declared node —
+ * but a rejection IS routable as `when: { key: <node>, exists: true }`,
+ * since a cancelled node records no output.)
+ *
+ * Unknown text approves rather than rejects: an operator's note ("approve,
+ * but keep it short") must reach the state instead of silently skipping the
+ * node's work. The single source of truth for {@link isHitlRejection} and
+ * for the `__hitlRejected` helper emitted into the bundle.
+ */
+export const HITL_REJECTION_DECISIONS: readonly string[] = [
+  "no",
+  "n",
+  "reject",
+  "rejected",
+  "deny",
+  "denied",
+  "decline",
+  "declined",
+  "abort",
+  "cancel",
+  "cancelled",
+  "canceled",
+  "stop",
+  "veto",
+];
+
+/** Does `decision` cancel a gated node's turn? Mirrors the emitted helper. */
+export function isHitlRejection(decision: string): boolean {
+  return HITL_REJECTION_DECISIONS.includes(decision.trim().toLowerCase());
+}
+
+/**
+ * Module-scope HITL machinery, emitted once when the graph carries a node
+ * with `hitl:` (so gate-free bundles stay byte-identical).
+ *
+ * The gate is a PRE-condition: the emitted node body awaits
+ * `ctx.requestApproval` BEFORE its model turn, which is the ordering
+ * graph-engine's pause/resume contract requires — the pause checkpoint
+ * holds the PRE-node state and `resume()` replays the paused node from the
+ * top. Asking after the turn (the pre-0.4.x emission) discarded the reply
+ * the approver never saw and re-ran — and re-paid for — the same model call
+ * on resume.
+ *
+ * `__hitlRejected` gives the freeform `--resume <run> <decision>` string its
+ * one piece of semantics — see {@link HITL_REJECTION_DECISIONS}.
+ */
+const HITL_HELPER = `
+/**
+ * Decisions that CANCEL a \`hitl:\` node's turn (compared trimmed +
+ * lower-cased). Any other decision — including free text — approves. The
+ * raw string is always recorded at \`state["<node>_decision"]\`; a CANCELLED
+ * node records nothing else, so \`when: { key: "<node>", exists: true }\`
+ * routes the run differently on a rejection.
+ */
+const __HITL_REJECTIONS: ReadonlySet<string> = new Set(${JSON.stringify(HITL_REJECTION_DECISIONS)});
+function __hitlRejected(decision: string): boolean {
+  return __HITL_REJECTIONS.has(decision.trim().toLowerCase());
+}
+`;
+
+/**
  * Loop contract 0.4 (Batch B, G02) — module-scope judge machinery, emitted
  * once when the graph carries judge nodes: the `__judgeGate` scorer
  * (eval-judge's forced-tool `judge()` over a synthesized single-criterion
@@ -456,7 +527,8 @@ const __EVAL_EXIT: number = (EXIT_CODES as Record<string, number>)["evaluation"]
  * with the node's instructions and the upstream state serialised as a
  * user message. Returns the assistant reply text under
  * `state["<nodeName>"]`. When `hitlPrompt` is set, the node calls
- * `ctx.requestApproval` after the LLM turn so the engine can pause.
+ * `ctx.requestApproval` BEFORE the LLM turn (see {@link HITL_HELPER}) so
+ * the engine pauses with nothing spent and nothing to discard.
  *
  * Loop contract 0.4 (Batch B, G02) — when this node is the retry target
  * of one or more `retry_previous` judges (`nudgeJudges`), the body reads
@@ -579,12 +651,24 @@ function renderNodeBody(
   // tool sets).
   const toolsField =
     toolsArrayLiteral !== undefined ? `\n        tools: ${toolsArrayLiteral},` : "";
-  const hitlBlock =
+  // HITL is a PRE-condition (see HITL_HELPER): the gate runs before the
+  // model turn, so a pause spends nothing, the engine's pre-node pause
+  // checkpoint is exactly the state the approver saw on `hitl_pause`, and
+  // the replay on resume is this node's FIRST turn rather than its second.
+  // A rejecting decision cancels the turn outright — the node records only
+  // its `_decision` and the declared edges route from there.
+  const hitlPreBlock =
     node.hitlPrompt !== undefined
       ? `
       const __decision = await ctx.requestApproval(${escapeJsonString(node.hitlPrompt)});
-      __next[${nameJs} + "_decision"] = __decision;`
+      if (__hitlRejected(__decision)) {
+        const __rejected: Record<string, unknown> = { ...(prev as Record<string, unknown>) };
+        __rejected[${nameJs} + "_decision"] = __decision;
+        return __rejected;
+      }`
       : "";
+  const hitlRecordBlock =
+    node.hitlPrompt !== undefined ? `\n      __next[${nameJs} + "_decision"] = __decision;` : "";
   // G02 — judge-retry nudge: read every currently-failing gating judge's
   // rationale out of the state and append it to the instructions.
   const nudgeBlock =
@@ -605,7 +689,7 @@ function renderNodeBody(
       : "";
   const instructionsExpr = nudgeJudges.length > 0 ? `${instructionsJs} + __nudge` : instructionsJs;
   return `
-    async (ctx, prev) => {${nudgeBlock}
+    async (ctx, prev) => {${hitlPreBlock}${nudgeBlock}
       const __seed = [
         { role: "user", content: \`Upstream state:\\n\\\`\\\`\\\`json\\n\${JSON.stringify(prev, null, 2)}\\n\\\`\\\`\\\`\` },
       ];
@@ -618,7 +702,7 @@ function renderNodeBody(
         singleTurn: true,${renderNodeLoopFields(node)}${toolsField}${graphLevelFields}
         runContext: ctx.runContext,
       });
-      const __next = { ...prev, [${nameJs}]: __reply };${hitlBlock}
+      const __next = { ...prev, [${nameJs}]: __reply };${hitlRecordBlock}
       return __next;
     }`;
 }
@@ -857,6 +941,11 @@ function renderAgent(ir: IrGraphV0): string {
     ? `${JUDGE_GATE_HELPER}${hasThrowingJudges ? EVAL_EXIT_CONST : ""}`
     : "";
 
+  // HITL machinery, emitted only when a node declares `hitl:` so gate-free
+  // bundles stay byte-identical (the judge-helper precedent).
+  const hasHitl = ir.nodes.some((n) => n.hitlPrompt !== undefined);
+  const hitlHelperBlock = hasHitl ? HITL_HELPER : "";
+
   // G61 — durable exactly-once wrapping. Emitted only when at least one node
   // is wrappable, so graphs with nothing to wrap stay free of the plumbing.
   const graphEngineImport = anyDurable
@@ -893,7 +982,7 @@ import { runChatLoop } from "@crewhaus/runtime-core";
 import { createCheckpointStore } from "@crewhaus/checkpoint-store";
 ${graphEngineImport}
 import { createRunContext } from "@crewhaus/run-context";${durableImport}
-${toolImportBlock}${toolInitBlock}${judgeHelperBlock}${durableHelperBlock}
+${toolImportBlock}${toolInitBlock}${hitlHelperBlock}${judgeHelperBlock}${durableHelperBlock}
 const __store = createCheckpointStore();
 const __runContext = createRunContext();
 const __graph = createGraph({ checkpointStore: __store })
@@ -937,6 +1026,27 @@ function parseArgs(argv: ReadonlyArray<string>): {
   return { mode: "fresh" };
 }
 
+type __Paused = {
+  checkpointId: string;
+  nodeName: string;
+  prompt: string;
+  /** The state the paused node is about to run on — what is being approved. */
+  state: unknown;
+};
+
+/**
+ * Report a HITL pause. The gate is a PRE-condition: nothing of the paused
+ * node has run, so the state printed here is the upstream output the
+ * decision is actually about — printing it is the difference between an
+ * approver reading the work and rubber-stamping a prompt.
+ */
+function __writePause(paused: __Paused, graphRunId: string): void {
+  process.stdout.write(\`paused at \${paused.nodeName}: "\${paused.prompt}" — checkpoint=\${paused.checkpointId} run=\${graphRunId}\\n\`);
+  process.stdout.write(\`state under review (\${paused.nodeName} has NOT run yet):\\n\${JSON.stringify(paused.state, null, 2)}\\n\`);
+  process.stdout.write(\`to resume: bun \${process.argv[1]} --resume \${graphRunId} <decision>\\n\`);
+  process.stdout.write(\`  <decision> is recorded at state["\${paused.nodeName}_decision"]; "reject"/"no"/"deny"/"cancel"/"abort" skips \${paused.nodeName}'s turn, anything else approves it.\\n\`);
+}
+
 async function main(): Promise<void> {
   const cli = parseArgs(process.argv);
 
@@ -949,18 +1059,18 @@ async function main(): Promise<void> {
       runContext: __runContext,
       resumeFrom: { checkpointId: head.id, nextNode: head.nodeName },
     });
-    let pausedAt: { checkpointId: string; nodeName: string; prompt: string } | undefined;
+    let pausedAt: __Paused | undefined;
     for await (const ev of stream) {
       process.stderr.write(\`[graph] \${JSON.stringify(ev)}\\n\`);
       if (ev.kind === "hitl_pause") {
-        pausedAt = { checkpointId: ev.checkpointId, nodeName: ev.nodeName, prompt: ev.prompt };
+        pausedAt = { checkpointId: ev.checkpointId, nodeName: ev.nodeName, prompt: ev.prompt, state: ev.state };
       }
       if (ev.kind === "run_done") {
         process.stdout.write(JSON.stringify(ev.state, null, 2) + "\\n");
       }
     }
     if (pausedAt !== undefined) {
-      process.stdout.write(\`paused at \${pausedAt.nodeName}: "\${pausedAt.prompt}" — checkpoint=\${pausedAt.checkpointId}\\n\`);
+      __writePause(pausedAt, newGraphRunId);
     }
     return;
   }
@@ -986,7 +1096,7 @@ async function main(): Promise<void> {
   // fresh run
   const stdin = await readStdinToEnd();
   const stream = __graph.run({ input: stdin }, { runContext: __runContext });
-  let pausedAt: { checkpointId: string; nodeName: string; prompt: string } | undefined;
+  let pausedAt: __Paused | undefined;
   let lastGraphRunId: string | undefined;
   for await (const ev of stream) {
     process.stderr.write(\`[graph] \${JSON.stringify(ev)}\\n\`);
@@ -994,15 +1104,14 @@ async function main(): Promise<void> {
       lastGraphRunId = ev.graphRunId;
     }
     if (ev.kind === "hitl_pause") {
-      pausedAt = { checkpointId: ev.checkpointId, nodeName: ev.nodeName, prompt: ev.prompt };
+      pausedAt = { checkpointId: ev.checkpointId, nodeName: ev.nodeName, prompt: ev.prompt, state: ev.state };
     }
     if (ev.kind === "run_done") {
       process.stdout.write(JSON.stringify(ev.state, null, 2) + "\\n");
     }
   }
   if (pausedAt !== undefined) {
-    process.stdout.write(\`paused at \${pausedAt.nodeName}: "\${pausedAt.prompt}" — checkpoint=\${pausedAt.checkpointId} run=\${lastGraphRunId ?? "?"}\\n\`);
-    process.stdout.write(\`to resume: bun \${process.argv[1]} --resume \${lastGraphRunId ?? "?"} <decision>\\n\`);
+    __writePause(pausedAt, lastGraphRunId ?? "?");
   }
 }
 

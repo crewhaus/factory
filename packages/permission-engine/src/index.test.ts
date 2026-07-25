@@ -157,6 +157,36 @@ describe("T9 — rule precedence", () => {
     expect(evaluate(bashLs, "default", rs)).toBe("allow");
   });
 
+  // Regression — issue #17. A catch-all `Bash(**)` compiled to a regex that
+  // only matched "" or a string starting with "/", so the rule never fired and
+  // the decision fell through to the mode default. In `auto` a non-destructive
+  // Bash call falls through to ALLOW, which makes the difference visible.
+  test("a catch-all alwaysAsk Bash(**) actually gates (#17)", () => {
+    const call: ToolCallContext = {
+      toolName: "Bash",
+      input: { command: "echo hi" },
+      readOnly: false,
+      destructive: false,
+    };
+    expect(evaluate(call, "auto", emptyRuleSet)).toBe("allow"); // no rule → fallback
+    const rs: RuleSet = { ...emptyRuleSet, yaml: [rule("alwaysAsk", "Bash(**)")] };
+    expect(evaluate(call, "auto", rs)).toBe("ask");
+    expect(evaluate(bashLs, "default", rs)).toBe("ask");
+  });
+
+  // Regression — the builtin floor is written with `**` precisely so it catches
+  // arguments containing "/". A newline must not slip past it either.
+  test("builtin Bash(rm**) floor fires on a multi-line command (#17)", () => {
+    const call: ToolCallContext = {
+      toolName: "Bash",
+      input: { command: "rm -rf /tmp/foo\necho done" },
+      readOnly: false,
+      destructive: false,
+    };
+    const rs: RuleSet = { ...emptyRuleSet, builtin: [...BUILTIN_DEFAULT_RULES] };
+    expect(evaluate(call, "auto", rs)).toBe("ask");
+  });
+
   test("property: random RuleSet — decision matches highest-priority matching source", () => {
     const tools = ["Read", "Bash", "Write"];
     const types: PermissionRule["type"][] = ["alwaysAllow", "alwaysDeny", "alwaysAsk"];

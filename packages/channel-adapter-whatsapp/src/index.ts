@@ -7,6 +7,11 @@
  * `messages[].id` (Meta's per-message identifier) as the gateway
  * dedup key so retries don't double-process.
  *
+ * `handshake` answers Meta's unsigned GET callback-URL verification
+ * (`hub.mode=subscribe`) by echoing `hub.challenge` once the presented
+ * `hub.verify_token` matches the configured one — without it Meta never
+ * activates the subscription and no webhook is ever delivered.
+ *
  * `parseInbound` handles text + image + audio + button-reply +
  * list-reply payloads from the v22.0 Cloud API. `sendReply` POSTs to
  * `/v22.0/{phoneNumberId}/messages` with the bot's access token.
@@ -18,9 +23,13 @@
  * keys sessions on the contact's phone number (`messages[].from`).
  */
 import { CrewhausError } from "@crewhaus/errors";
-import { verifyWhatsAppSignature } from "./verify.js";
+import { verifyWhatsAppSignature, verifyWhatsAppVerifyToken } from "./verify.js";
 
-export { signWhatsAppBody, verifyWhatsAppSignature } from "./verify.js";
+export {
+  signWhatsAppBody,
+  verifyWhatsAppSignature,
+  verifyWhatsAppVerifyToken,
+} from "./verify.js";
 
 export class WhatsAppAdapterError extends CrewhausError {
   override readonly name = "WhatsAppAdapterError";
@@ -46,21 +55,39 @@ export type InboundEvent = {
 };
 
 /**
- * Three result shapes:
+ * Two result shapes — `parseInbound` only ever sees a signed POST body:
  *   - `{kind:"event", event}` — a real inbound message to route
- *   - `{kind:"verification", challenge}` — Meta's GET-based verification
- *     handshake (the gateway echoes back `hub.challenge`)
  *   - `{kind:"skip"}` — known-but-uninteresting payload (status update,
  *     non-text non-interactive media, etc.)
+ *
+ * Meta's callback-URL verification is NOT a webhook body — it is an unsigned
+ * `GET ?hub.mode=subscribe&hub.verify_token=…&hub.challenge=…`, handled by
+ * `handshake` below, not here.
  */
 export type ParsedInbound =
   | { readonly kind: "event"; readonly event: InboundEvent }
   | { readonly kind: "skip" };
 
+/**
+ * Meta's unsigned GET subscription handshake (see `handshake` below).
+ * Structurally identical to the channel-generic type the emitted gateway
+ * uses — the adapter packages deliberately re-declare the shared shapes
+ * rather than depend on one another.
+ */
+export type HandshakeRequest = {
+  readonly headers: Headers;
+  readonly url: URL;
+};
+
+export type HandshakeResult =
+  | { readonly kind: "challenge"; readonly challenge: string }
+  | { readonly kind: "reject" };
+
 export interface ChannelAdapter {
   readonly id: string;
   verify(req: RawRequest): boolean;
   parseInbound(req: RawRequest): ParsedInbound;
+  handshake(req: HandshakeRequest): HandshakeResult;
   sendReply(args: { event: InboundEvent; text: string }): Promise<void>;
   setTyping(args: { event: InboundEvent }): Promise<void>;
   /**
@@ -79,6 +106,14 @@ export type WhatsAppAdapterConfig = {
   readonly accessToken: string;
   /** Meta app secret, used to verify X-Hub-Signature-256. */
   readonly appSecret: string;
+  /**
+   * The verify token configured on the Meta app's webhook callback. Required
+   * to complete the GET subscription handshake — Meta will not deliver any
+   * webhook to a callback URL that has never passed it. Absent ⇒ `handshake`
+   * rejects every attempt (fail closed), and the daemon can still receive
+   * webhooks on a subscription verified elsewhere.
+   */
+  readonly verifyToken?: string;
 };
 
 export type WhatsAppAdapterOptions = {
@@ -123,6 +158,29 @@ export function createWhatsAppAdapter(
         },
         opts.now !== undefined ? { now: opts.now } : {},
       );
+    },
+
+    /**
+     * Meta's callback-URL verification handshake:
+     *   `GET /whatsapp/events?hub.mode=subscribe
+     *        &hub.verify_token=<shared secret>&hub.challenge=<nonce>`
+     * On a token match the caller must echo `hub.challenge` verbatim with 200;
+     * anything else marks the callback URL unverified and Meta delivers no
+     * webhooks at all. The request is unsigned (no body, no
+     * X-Hub-Signature-256), so the verify token IS the authentication — which
+     * is why a mismatch, a missing parameter, or an unconfigured
+     * `verifyToken` all fail closed.
+     */
+    handshake(req: HandshakeRequest): HandshakeResult {
+      const params = req.url.searchParams;
+      if (params.get("hub.mode") !== "subscribe") return { kind: "reject" };
+      const challenge = params.get("hub.challenge");
+      const supplied = params.get("hub.verify_token");
+      if (challenge === null || supplied === null) return { kind: "reject" };
+      if (!verifyWhatsAppVerifyToken({ expected: config.verifyToken ?? "", supplied })) {
+        return { kind: "reject" };
+      }
+      return { kind: "challenge", challenge };
     },
 
     parseInbound(req: RawRequest): ParsedInbound {

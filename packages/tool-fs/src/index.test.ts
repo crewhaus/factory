@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import {
+  DEFAULT_IGNORED_DIRS,
   ToolPermissionError,
   allFsTools,
   edit,
@@ -227,6 +228,74 @@ describe("Grep tool", () => {
     await writeFile(path.join(tmp, "f.txt"), "alpha\nbeta\n");
     const result = await grep.execute({ pattern: "b.+a" });
     expect(result).toBe("f.txt:2:beta");
+  });
+});
+
+// A compiled bundle (`crewhaus compile -o <dir> --check`) installs thousands of
+// dependency files into the workspace. Before the default-ignore list, a single
+// `**/*.ts` Glob in a starter returned ~4,400 vendored files around 30 real
+// ones, and Grep burned its scan budget on them.
+describe("vendored-directory defaults (node_modules)", () => {
+  async function plantBundle(): Promise<void> {
+    await mkdir(path.join(tmp, "dist", "node_modules", "@crewhaus", "crawler"), {
+      recursive: true,
+    });
+    await writeFile(path.join(tmp, "agent.ts"), "project needle\n");
+    await writeFile(
+      path.join(tmp, "dist", "node_modules", "@crewhaus", "crawler", "index.ts"),
+      "vendored needle\n",
+    );
+  }
+
+  test("Glob skips node_modules and says how many it hid", async () => {
+    await plantBundle();
+    const result = await glob.execute({ pattern: "**/*.ts" });
+    if (typeof result !== "string") throw new Error("expected string result");
+    const lines = result.split("\n");
+    expect(lines[0]).toBe("agent.ts");
+    expect(lines.filter((l) => !l.startsWith("[")).join("\n")).not.toContain("node_modules");
+    expect(lines[1]).toMatch(/^\[Glob: 1 file\(s\) under node_modules\/ hidden/);
+  });
+
+  test("Glob includes node_modules when the pattern names it", async () => {
+    await plantBundle();
+    const result = await glob.execute({ pattern: "dist/node_modules/**/*.ts" });
+    expect(result).toBe("dist/node_modules/@crewhaus/crawler/index.ts");
+  });
+
+  test("Glob adds no note when nothing was hidden", async () => {
+    await writeFile(path.join(tmp, "only.ts"), "");
+    const result = await glob.execute({ pattern: "**/*.ts" });
+    expect(result).toBe("only.ts");
+  });
+
+  test("Grep skips node_modules by default", async () => {
+    await plantBundle();
+    const result = await grep.execute({ pattern: "needle" });
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result.split("\n")[0]).toBe("agent.ts:1:project needle");
+    expect(result).not.toContain("vendored needle");
+    expect(result).toMatch(/\[Grep: 1 file\(s\) under node_modules\/ hidden/);
+  });
+
+  test("Grep searches node_modules when path points inside it", async () => {
+    await plantBundle();
+    const result = await grep.execute({ pattern: "needle", path: "dist/node_modules" });
+    expect(result).toBe("dist/node_modules/@crewhaus/crawler/index.ts:1:vendored needle");
+  });
+
+  test("__pycache__ is skipped the same way", async () => {
+    await mkdir(path.join(tmp, "__pycache__"));
+    await writeFile(path.join(tmp, "__pycache__", "mod.cpython-312.pyc"), "needle\n");
+    await writeFile(path.join(tmp, "mod.py"), "needle\n");
+    const result = await grep.execute({ pattern: "needle" });
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result.split("\n")[0]).toBe("mod.py:1:needle");
+    expect(result).not.toContain(".pyc");
+  });
+
+  test("DEFAULT_IGNORED_DIRS is the documented list", () => {
+    expect([...DEFAULT_IGNORED_DIRS]).toEqual(["node_modules", "__pycache__"]);
   });
 });
 

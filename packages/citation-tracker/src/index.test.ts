@@ -35,6 +35,47 @@ describe("createCitationTracker", () => {
     }
   });
 
+  test("recordFetch restores a pruned cache file when the body still matches the recorded sha256", () => {
+    const root = newRoot();
+    const runId = newRunId();
+    try {
+      const t1 = createCitationTracker({ runId, rootDir: root });
+      const body = "alpha beta gamma";
+      const rec = t1.recordFetch({ url: "u", content: body });
+
+      // Content cache pruned (disk cleanup / a run dir copied without cache/),
+      // fetches.jsonl kept. Without repair the body is unrecoverable, and any
+      // consumer that verifies a citation snippet against it fails forever.
+      rmSync(join(root, runId, "cache"), { recursive: true, force: true });
+      const t2 = createCitationTracker({ runId, rootDir: root });
+      expect(t2.getFetchedContent("u")).toBeUndefined();
+
+      // A re-fetch of the same bytes puts the body back.
+      expect(t2.recordFetch({ url: "u", content: body })).toEqual(rec);
+      expect(t2.getFetchedContent("u")).toBe(body);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("recordFetch does NOT re-cache a mutated body under the original sha256", () => {
+    const root = newRoot();
+    const runId = newRunId();
+    try {
+      const t1 = createCitationTracker({ runId, rootDir: root });
+      t1.recordFetch({ url: "u", content: "original" });
+      rmSync(join(root, runId, "cache"), { recursive: true, force: true });
+
+      const t2 = createCitationTracker({ runId, rootDir: root });
+      t2.recordFetch({ url: "u", content: "mutated since the first fetch" });
+      // The record's sha256 describes "original"; caching other bytes under it
+      // would make the digest a lie. Stay empty instead.
+      expect(t2.getFetchedContent("u")).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("getFetchedContent returns the original body verbatim (T4 cache hit)", () => {
     const root = newRoot();
     try {

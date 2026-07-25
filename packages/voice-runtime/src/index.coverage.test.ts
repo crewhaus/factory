@@ -121,26 +121,33 @@ describe("createOpenAIRealtimeAdapter — default WebSocket factory (251-256)", 
       apiKey: "sk-test",
       url: "wss://example.test/rt",
     });
-    const cp = adapter.connect({ model: "gpt-4o-realtime-preview" });
+    const cp = adapter.connect({ model: "gpt-realtime" });
     expect(lastSocket).toBeDefined();
     lastSocket?.triggerOpen();
     await cp;
     expect(adapter.connected).toBe(true);
     expect(constructed?.url).toContain("wss://example.test/rt");
-    expect(constructed?.url).toContain("model=gpt-4o-realtime-preview");
-    // Auth + beta headers are threaded through `init`.
+    expect(constructed?.url).toContain("model=gpt-realtime");
+    // Auth is threaded through `init` — and NOTHING else. Issue #24: the
+    // retired `OpenAI-Beta: realtime=v1` upgrade header selects the beta
+    // wire shape, which the server now closes with code 4000.
     const init = constructed?.init as { headers?: Record<string, string> };
     expect(init.headers?.["Authorization"]).toBe("Bearer sk-test");
-    expect(init.headers?.["OpenAI-Beta"]).toBe("realtime=v1");
+    expect(init.headers?.["OpenAI-Beta"]).toBeUndefined();
+    expect(Object.keys(init.headers ?? {})).toEqual(["Authorization"]);
     await adapter.disconnect();
   });
 
-  test("falls back to the default model when an empty model string is passed", async () => {
+  test("falls back to the GA default model when an empty model string is passed", async () => {
     const adapter = createOpenAIRealtimeAdapter({ apiKey: "sk-test" });
     const cp = adapter.connect({ model: "" });
     lastSocket?.triggerOpen();
     await cp;
-    expect(constructed?.url).toContain("model=gpt-4o-realtime-preview");
+    expect(constructed?.url).toContain("model=gpt-realtime");
+    // …and the same default lands in session.update, not an empty string.
+    expect((lastSocket?.sent[0]?.["session"] as Record<string, unknown>)["model"]).toBe(
+      "gpt-realtime",
+    );
     await adapter.disconnect();
   });
 });
@@ -196,7 +203,8 @@ describe("createOpenAIRealtimeAdapter — tools in session.update (317-321)", ()
     socket.triggerOpen();
     await cp;
     const session = socket.sent[0]?.["session"] as Record<string, unknown>;
-    expect(session["turn_detection"]).toBeNull(); // vad: "none"
+    const audioIn = (session["audio"] as { input?: Record<string, unknown> }).input;
+    expect(audioIn?.["turn_detection"]).toBeNull(); // vad: "none"
     const tools = session["tools"] as Array<Record<string, unknown>>;
     expect(tools).toHaveLength(1);
     expect(tools[0]).toEqual({

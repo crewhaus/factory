@@ -269,6 +269,14 @@ async function main(): Promise<void> {
   const reportDir = join(RESEARCH_ROOT, runId);
   writeFileSync(join(reportDir, "report.md"), report.markdown, { mode: 0o600 });
   writeFileSync(join(reportDir, "report.json"), JSON.stringify(report.json, null, 2), { mode: 0o600 });
+  // A research run that cited nothing is not a success worth reporting
+  // silently: the report still ships (with its "no citations" notice), but the
+  // operator gets told on stderr, where a scripted caller will actually see it.
+  if (report.json.citations.length === 0) {
+    process.stderr.write(
+      "[research] WARNING: no citations were recorded — the report is not anchored to any fetched source.\n",
+    );
+  }
   emit({ kind: "run_done", runId, reportPath: join(reportDir, "report.md"), citations: report.json.citations.length });
 }
 

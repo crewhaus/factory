@@ -30,6 +30,13 @@
  *      credentials/servers therefore degrade to "gated" (green) and the
  *      verdict reports which step ran; a structural break (SyntaxError,
  *      unresolved import) matches no gate and stays red.
+ *
+ * Because the scrub is unconditional there is deliberately no `--allow-env`
+ * escape hatch: handing the boot real credentials is precisely what would
+ * let an autonomous shape execute a paid agent run from a verification flag.
+ * The contract is instead that EVERY declared-credential gate is a known
+ * gate — so a structurally-correct spec is green whatever it declares, and
+ * "gated" (exit 0) vs "failed" (exit 1) is the distinction a caller reads.
  */
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -144,24 +151,78 @@ export function resolveBootEntry(files: Bundle["files"]): string | undefined {
  * (`doctor --liveness` semantics — "booting far enough to parse argv IS the
  * signal"). Derived empirically from booting every fixture bundle with a
  * scrubbed env; keep patterns narrow so structural breakage stays red.
+ *
+ * Each entry carries TWO phrasings because the verdict line uses the gate in
+ * two grammatical positions (item 16): `gate` is a bare noun label that reads
+ * after a possessive ("its <gate> gate"), `needs` is the full noun phrase,
+ * article and all, that reads after "needs" ("full boot needs <needs>"). One
+ * shared string cannot be both — "its a registered eval dataset gate" was the
+ * on-camera symptom.
  */
 export const BOOT_GATE_PATTERNS: ReadonlyArray<{
   readonly pattern: RegExp;
+  /** Short label, no leading article — reads as "its <gate> gate". */
   readonly gate: string;
+  /** Full phrase with its article — reads as "full boot needs <needs>". */
+  readonly needs: string;
 }> = [
   // runtime-core resolveAuth / provider adapters (cli, workflow, graph, …).
-  { pattern: /no Anthropic credentials found|ProviderAuthError/, gate: "provider credentials" },
+  {
+    pattern: /no Anthropic credentials found|ProviderAuthError/,
+    gate: "provider credentials",
+    needs: "live provider credentials",
+  },
   // Env-ref rewriting: `process.env["X"] ?? throw` (channel secrets, onchain RPC).
-  { pattern: /missing required env var/, gate: "spec env refs" },
+  {
+    pattern: /missing required env var/,
+    gate: "spec env refs",
+    needs: "the env vars the spec declares",
+  },
+  // MCP secret refs: @crewhaus/mcp-host resolves every declared server
+  // secret at boot — BEFORE any transport connects — and throws a ConfigError
+  // naming the variable and the server when one is unset. The check boots
+  // credential-free BY DESIGN (see module doc), so a spec that declares an
+  // MCP env ref could otherwise never be green: this is a credential gate in
+  // exactly the sense provider credentials are, not a structural break.
+  {
+    pattern: /environment variable \S+ is not set/,
+    gate: "MCP server credentials",
+    needs: "the MCP server credentials the spec declares",
+  },
   // crew daemon reads its kickoff input from stdin.
-  { pattern: /no input on stdin/, gate: "stdin input" },
+  { pattern: /no input on stdin/, gate: "stdin input", needs: "input on stdin" },
   // voice daemon's v0 headless smoke path.
-  { pattern: /no --smoke/, gate: "a --smoke pcm fixture" },
+  { pattern: /no --smoke/, gate: "--smoke fixture", needs: "a --smoke pcm fixture" },
   // browser driver needs a prompt to open a session.
-  { pattern: /no prompt \(pass --prompt/, gate: "an initial --prompt" },
+  { pattern: /no prompt \(pass --prompt/, gate: "--prompt", needs: "an initial --prompt" },
   // eval bundle resolves its dataset from the local registry.
-  { pattern: /dataset "[^"]*" not found/, gate: "a registered eval dataset" },
+  {
+    pattern: /dataset "[^"]*" not found/,
+    gate: "eval dataset",
+    needs: "a registered eval dataset",
+  },
 ];
+
+/**
+ * The one line of a failed boot's stderr that actually NAMES the failure.
+ *
+ * Bun prints a thrown error as: source excerpt, then the `Name: message`
+ * header, then the stack, then its own version banner. A naive last-N-lines
+ * tail therefore reports "at agent.ts:22:28 | | Bun v1.3.14" and drops the
+ * message entirely — the exact reason a real boot break used to be
+ * unreadable. Prefer the error header when one is present; otherwise fall
+ * back to the tail (runtimes that print a bare message and exit).
+ */
+const ERROR_HEADER = /^(?:[A-Z][A-Za-z0-9_]*(?:Error|Exception)\b.*|error:.*)$/;
+
+export function describeBootFailure(stderr: string): string {
+  const lines = stderr
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l !== "");
+  const header = lines.find((l) => ERROR_HEADER.test(l));
+  return (header ?? lines.slice(-3).join(" | ")).slice(0, 400);
+}
 
 export function classifyBootOutcome(result: CheckRunResult): {
   status: "ok" | "gated" | "failed";
@@ -177,16 +238,18 @@ export function classifyBootOutcome(result: CheckRunResult): {
   // stderr, but nothing guarantees it — a stdout-printed gate must not be
   // misclassified as a structural failure.
   const output = `${result.stdout}\n${result.stderr}`;
-  for (const { pattern, gate } of BOOT_GATE_PATTERNS) {
+  for (const { pattern, gate, needs } of BOOT_GATE_PATTERNS) {
     if (pattern.test(output)) {
       return {
         status: "gated",
-        detail: `boot reached its ${gate} gate — full boot needs live ${gate}`,
+        detail: `boot reached its ${gate} gate — full boot needs ${needs}`,
       };
     }
   }
-  const tail = result.stderr.trim().split("\n").slice(-3).join(" | ").slice(0, 400);
-  return { status: "failed", detail: `boot exited ${result.exitCode}: ${tail}` };
+  return {
+    status: "failed",
+    detail: `boot exited ${result.exitCode}: ${describeBootFailure(result.stderr)}`,
+  };
 }
 
 /** Fold the steps into the single green/red verdict line. Only "failed" is red. */

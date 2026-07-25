@@ -8,9 +8,9 @@
  * ever running an agent turn.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
 const CLI_PATH = join(SRC_DIR, "index.ts");
@@ -100,6 +100,107 @@ describe("crewhaus export claude-plugin", () => {
     const r = await runCli(["export", "nonsense"]);
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr + r.stdout).toContain("claude-plugin");
+  });
+
+  /**
+   * Item 14 — a harness that ships hand-written skills + slash commands used to
+   * export a strictly SMALLER agent than itself: the only skill emitted was the
+   * one synthesized from `agent.instructions`, and no `commands/` dir existed.
+   * The assets are resolved beside the SPEC (the standalone-harness convention),
+   * not from the process cwd, which is why the CLI here still runs from REPO_ROOT.
+   */
+  describe("authored .crewhaus/ assets", () => {
+    const SKILL = "---\nname: research-topic\ndescription: corroborate claims\n---\n\nCite two.\n";
+    const COMMAND =
+      "---\ndescription: browse the web\nargument-hint: <topic>\n---\n/browse $ARGUMENTS\n";
+
+    /** A throwaway harness dir: spec + authored skills/commands beside it. */
+    function freshHarness(extra: Record<string, string> = {}): string {
+      const dir = join(freshTmp(), "harness");
+      const files: Record<string, string> = {
+        "crewhaus.yaml":
+          "name: hello\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: Be helpful.\n",
+        ".crewhaus/skills/research-topic/SKILL.md": SKILL,
+        ".crewhaus/skills/research-topic/references/checklist.md": "- [ ] two sources\n",
+        ".crewhaus/commands/browse.md": COMMAND,
+        ...extra,
+      };
+      for (const [rel, content] of Object.entries(files)) {
+        const abs = join(dir, rel);
+        mkdirSync(dirname(abs), { recursive: true });
+        writeFileSync(abs, content);
+      }
+      return dir;
+    }
+
+    test("authored skills and commands travel into the exported plugin", async () => {
+      const harness = freshHarness();
+      const out = join(tmp, "plugin");
+      try {
+        const r = await runCli([
+          "export",
+          "claude-plugin",
+          join(harness, "crewhaus.yaml"),
+          "-o",
+          out,
+        ]);
+        expect(r.exitCode).toBe(0);
+        // The projection of agent.instructions still ships…
+        expect(existsSync(join(out, "skills/hello/SKILL.md"))).toBe(true);
+        // …and so does everything the harness author wrote, byte-for-byte.
+        expect(readFileSync(join(out, "skills/research-topic/SKILL.md"), "utf-8")).toBe(SKILL);
+        expect(
+          readFileSync(join(out, "skills/research-topic/references/checklist.md"), "utf-8"),
+        ).toBe("- [ ] two sources\n");
+        expect(readFileSync(join(out, "commands/browse.md"), "utf-8")).toBe(COMMAND);
+        expect(r.stdout).toContain("1 authored skill + 1 authored command");
+        expect(readFileSync(join(out, "README.md"), "utf-8")).toContain("## Authored assets");
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    test("--no-assets emits the spec projection alone", async () => {
+      const harness = freshHarness();
+      const out = join(tmp, "plugin");
+      try {
+        const r = await runCli([
+          "export",
+          "claude-plugin",
+          join(harness, "crewhaus.yaml"),
+          "-o",
+          out,
+          "--no-assets",
+        ]);
+        expect(r.exitCode).toBe(0);
+        expect(existsSync(join(out, "skills/hello/SKILL.md"))).toBe(true);
+        expect(existsSync(join(out, "commands"))).toBe(false);
+        expect(existsSync(join(out, "skills/research-topic"))).toBe(false);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    test("an authored SKILL.md Claude Code could not load fails the export", async () => {
+      const harness = freshHarness({ ".crewhaus/skills/broken/SKILL.md": "no frontmatter here\n" });
+      const out = join(tmp, "plugin");
+      try {
+        const r = await runCli([
+          "export",
+          "claude-plugin",
+          join(harness, "crewhaus.yaml"),
+          "-o",
+          out,
+        ]);
+        expect(r.exitCode).not.toBe(0);
+        expect(r.stderr + r.stdout).toContain("unusable authored asset");
+        expect(r.stderr + r.stdout).toContain("--no-assets");
+        // Nothing is written when the export refuses.
+        expect(existsSync(out)).toBe(false);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
   });
 });
 

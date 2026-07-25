@@ -26,12 +26,10 @@
  *     run); a distill that matched zero turns advances it (those records
  *     are unmatchable — their sessions are gone — so retrying is noise).
  *
- *   - **Exit-rating prompt gating**: the pure decision function for the
- *     one-keystroke `rate this session? [g]ood / [b]ad / [enter] skip`
- *     prompt at clean REPL exit. NEVER prompts in non-TTY/piped mode; opt
- *     out with CREWHAUS_NO_EXIT_RATING=1 or spec `feedback.exitPrompt:
- *     false`. The raw-mode keystroke read stays in the entry file (thin
- *     IO); everything decidable is here so it is unit-testable.
+ * The block's OTHER consumer — the one-keystroke `rate this session? [g]ood /
+ * [b]ad / [enter] skip` prompt at clean REPL exit — moved to
+ * @crewhaus/runtime-core (`exit-rating.ts`) so a COMPILED bundle asks it too;
+ * see the note at the bottom of this file.
  *
  * Kept in a module with no import-time side effects (the CLI entry file
  * runs an argv switch on import), mirroring `eval-history.ts` /
@@ -44,7 +42,7 @@ import type { DatasetRecord } from "@crewhaus/dataset-registry";
 import type { IrFeedback } from "@crewhaus/ir";
 import { redactDatasetText } from "./dataset-audit";
 import { DEFAULT_SPLIT_SPEC, registerDataset } from "./datasets";
-import { type DerivedTurn, type FeedbackRecord, type SessionTurn, distill } from "./feedback";
+import { type FeedbackRecord, type SessionTurn, distill } from "./feedback";
 import { isRegistrySafeName } from "./regression-pin";
 
 /** Default "≥ N unprocessed ratings" trigger (the spec's `autoDistill` is a
@@ -53,9 +51,6 @@ export const DEFAULT_AUTODISTILL_THRESHOLD = 5;
 
 /** Env override for the trigger threshold. */
 export const AUTODISTILL_THRESHOLD_ENV = "CREWHAUS_AUTODISTILL_THRESHOLD";
-
-/** Opt-out env for the REPL exit rating prompt. */
-export const NO_EXIT_RATING_ENV = "CREWHAUS_NO_EXIT_RATING";
 
 /** The watermark file, relative to the harness cwd. */
 export const DISTILL_STATE_RELPATH = join(".crewhaus", "feedback", ".distill-state.json");
@@ -294,62 +289,13 @@ export async function maybeAutoDistill(
   };
 }
 
-// -------- REPL exit rating prompt (gating + key parsing) --------
-
-export const EXIT_RATING_PROMPT = "rate this session? [g]ood / [b]ad / [enter] skip: ";
-export const EXIT_RATING_TIMEOUT_MS = 10_000;
-
-/** Turns with a non-empty assistant answer — the "session actually said
- *  something worth rating" floor for the exit prompt. */
-export function countAssistantTurns(turns: ReadonlyArray<DerivedTurn>): number {
-  return turns.filter((t) => t.output.trim() !== "").length;
-}
-
-export type ExitRatingDecision = {
-  readonly prompt: boolean;
-  readonly reason: string;
-};
-
-/**
- * The pure gate for the exit prompt. Prompts only when ALL hold: the spec
- * has a feedback block (presence opts in), it isn't disabled
- * (`enabled: false`) or prompt-opted-out (`exitPrompt: false`), the
- * CREWHAUS_NO_EXIT_RATING env is not set, stdin is a real TTY (NEVER in
- * piped/CI mode), and the session produced at least one assistant answer.
- */
-export function shouldPromptExitRating(opts: {
-  readonly stdinIsTTY: boolean;
-  readonly env: Readonly<Record<string, string | undefined>>;
-  readonly feedback: IrFeedback | undefined;
-  readonly assistantTurns: number;
-}): ExitRatingDecision {
-  if (opts.feedback === undefined) return { prompt: false, reason: "spec has no feedback block" };
-  if (opts.feedback.enabled === false) {
-    return { prompt: false, reason: "feedback block is disabled (enabled: false)" };
-  }
-  if (opts.feedback.exitPrompt === false) {
-    return { prompt: false, reason: "feedback.exitPrompt is false" };
-  }
-  const optOut = opts.env[NO_EXIT_RATING_ENV];
-  if (optOut !== undefined && optOut !== "" && optOut !== "0") {
-    return { prompt: false, reason: `${NO_EXIT_RATING_ENV} is set` };
-  }
-  if (!opts.stdinIsTTY) return { prompt: false, reason: "stdin is not a TTY" };
-  if (opts.assistantTurns < 1) {
-    return { prompt: false, reason: "session has no assistant turns to rate" };
-  }
-  return { prompt: true, reason: "feedback block present, TTY, rated-able session" };
-}
-
-export type ExitRatingChoice = "up" | "down" | "skip";
-
-/** Map the raw keystroke to a rating: g/G → good (thumbs up), b/B → bad
- *  (thumbs down), anything else — enter, timeout (undefined), Ctrl-C/D —
- *  skips. One keystroke, no confirmation, zero-cost to ignore. */
-export function parseExitRatingKey(key: string | undefined): ExitRatingChoice {
-  if (key === undefined || key.length === 0) return "skip";
-  const first = key[0] as string;
-  if (first === "g" || first === "G") return "up";
-  if (first === "b" || first === "B") return "down";
-  return "skip";
-}
+// -------- REPL exit rating prompt --------
+//
+// MOVED to @crewhaus/runtime-core (`src/exit-rating.ts`). The prompt used to
+// be gated + read here and driven from the CLI's post-session teardown, which
+// is exactly why a COMPILED cli bundle had no rating capture: the cli emitter
+// dropped the `feedback:` block and only `crewhaus run` implemented it. The
+// prompt belongs to the REPL, and the REPL is `runChatLoop`, so both surfaces
+// now reach it by threading `feedback` into the loop. The opt-out env is
+// re-exported below so this module's autoDistill docs stay self-contained.
+export { NO_EXIT_RATING_ENV } from "@crewhaus/runtime-core";
