@@ -96,6 +96,12 @@ export function toGeminiParams(req: ProviderRequest): GenerateContentParameters 
     };
   }
 
+  // NEW-HUNT-2 — map the sampling temperature (the judge pin) onto
+  // Gemini's native generation-config control.
+  if (req.temperature !== undefined) {
+    config.temperature = req.temperature;
+  }
+
   if (req.signal !== undefined) {
     config.abortSignal = req.signal;
   }

@@ -7,6 +7,27 @@ export type GradeResult = {
   /** 0..1 normalized score; map an LLM-judge 1–5 score via (n-1)/4. */
   readonly score: number;
   readonly rationale: string;
+  /**
+   * A3 — the judge declined to score because the evidence was insufficient.
+   * Only judge-backed graders ever set this; when `true`, `passed: false` /
+   * `score: 0` are conservative placeholders and the runner should route
+   * the sample to human review (needs-human) instead of counting it as a
+   * fail. Absent (deterministic graders, pre-abstention records) = a
+   * normal verdict.
+   */
+  readonly abstained?: boolean;
+  /** Judge-reported confidence in the verdict, 0..1 (absent when the judge
+   *  did not report one — deterministic graders never do). */
+  readonly confidence?: number;
+  /**
+   * A12 — per-criterion score breakdown behind this verdict. Judge-backed
+   * graders set it to the rubric's `criterion_scores` (raw 1–5 per
+   * criterion, NOT normalized like `score`) so the decomposed signal the
+   * judge already paid for survives into grades.json/results.json instead
+   * of collapsing to one scalar. Absent on deterministic graders, abstained
+   * verdicts (their criterion scores are guesses), and pre-A12 records.
+   */
+  readonly detail?: Readonly<Record<string, number>>;
 };
 
 /** Distilled tool-call shape, derived from trace events. */

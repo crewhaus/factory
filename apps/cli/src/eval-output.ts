@@ -19,10 +19,12 @@
  *     that moves 0.4-scoring answers to 0.7 now measures as progress even
  *     while the pass gate still fails them.
  *
- *   - `evalRunOutputLines` (G15/G54/G56/G47): the `[eval]` stdout block —
- *     the classic summary line extended with `partial_score=`, plus the
- *     loop-quality metrics line, the pass@k/pass^k repeats line, the
- *     failure-taxonomy class tally, and one note per judge grader whose
+ *   - `evalRunOutputLines` (G15/G54/G56/G47 + Wave 1 B13/C27/A12/A3): the
+ *     `[eval]` stdout block — the classic summary line extended with
+ *     `partial_score=` and the C27 95% CIs, plus the loop-quality metrics
+ *     line, the pass@k/pass^k repeats line, the per-slice block (B13), one
+ *     per-criterion line per judge grader (A12), the needs_human line (A3),
+ *     the failure-taxonomy class tally, and one note per judge grader whose
  *     gate came from `.crewhaus/judge-calibration.json`. Every new segment
  *     is presence-gated, so a summary written by an older runner renders
  *     exactly the pre-0.4 block.
@@ -65,15 +67,25 @@ function pct(rate: number): string {
 /**
  * The classic `[eval] runId=…` summary line, extended with the G56
  * `partial_score=` column when present (mean overall score over ALL samples,
- * errored ones scoring 0 — the stable-denominator partial-credit figure).
+ * errored ones scoring 0 — the stable-denominator partial-credit figure)
+ * and the C27 closed-form 95% CIs (`pass_rate_ci95=[lo%,hi%]` /
+ * `mean_score_ci95=[lo,hi]`) when the runner emitted them.
  */
 export function formatEvalSummaryLine(summary: EvalRunSummary, retriedCount: number): string {
   const a = summary.aggregates;
   const partial =
     a.partialScoreMean !== undefined ? ` partial_score=${a.partialScoreMean.toFixed(3)}` : "";
+  const passCI =
+    a.passRateCI95 !== undefined
+      ? ` pass_rate_ci95=[${pct(a.passRateCI95[0])},${pct(a.passRateCI95[1])}]`
+      : "";
+  const scoreCI =
+    a.meanScoreCI95 !== undefined
+      ? ` mean_score_ci95=[${a.meanScoreCI95[0].toFixed(3)},${a.meanScoreCI95[1].toFixed(3)}]`
+      : "";
   return (
-    `[eval] runId=${summary.runId} pass_rate=${pct(a.passRate)} ` +
-    `mean_score=${a.meanScore.toFixed(3)}${partial} ` +
+    `[eval] runId=${summary.runId} pass_rate=${pct(a.passRate)}${passCI} ` +
+    `mean_score=${a.meanScore.toFixed(3)}${scoreCI}${partial} ` +
     `errors=${a.errorCount} ` +
     `tokens=${a.totalTokens.input}/${a.totalTokens.output}` +
     `${retriedCount > 0 ? ` (${retriedCount} retried)` : ""}`
@@ -127,6 +139,50 @@ export function formatRepeatsLine(summary: EvalRunSummary): string | undefined {
 }
 
 /**
+ * B13 — the compact per-slice block: one line per slice key, each value's
+ * pass rate + membership. Empty when the run sliced nothing (no metadata,
+ * or a results.json persisted by a pre-B13 CLI).
+ */
+export function formatSliceLines(summary: EvalRunSummary): string[] {
+  const slices = summary.slices;
+  if (slices === undefined) return [];
+  return Object.entries(slices).map(([key, byValue]) => {
+    const parts = Object.entries(byValue).map(
+      ([value, s]) => `${value} ${pct(s.passRate)} (n=${s.sampleCount})`,
+    );
+    return `[eval] slice ${key}: ${parts.join(" · ")}`;
+  });
+}
+
+/**
+ * A12 — one line per judge grader with per-criterion means (raw 1–5 scale),
+ * so "which criterion regressed" is answerable from the run output alone.
+ * Empty when no grade carried a criterion breakdown.
+ */
+export function formatCriterionLines(summary: EvalRunSummary): string[] {
+  const means = summary.aggregates.criterionMeans;
+  if (means === undefined) return [];
+  return Object.entries(means).map(([grader, byCriterion]) => {
+    const parts = Object.entries(byCriterion).map(
+      ([criterion, mean]) => `${criterion}=${Number.isInteger(mean) ? mean : mean.toFixed(2)}`,
+    );
+    return `[eval] judge criteria ${grader}: ${parts.join(" ")}`;
+  });
+}
+
+/**
+ * A3 — the needs-human line: abstained samples (judge declined, nothing
+ * else failed) are excluded from the pass-rate denominator and listed here
+ * for `crewhaus rate` follow-up. Undefined when nothing abstained.
+ */
+export function formatNeedsHumanLine(summary: EvalRunSummary): string | undefined {
+  const a = summary.aggregates;
+  if (a.needsHuman === undefined || a.needsHuman === 0) return undefined;
+  const ids = (a.needsHumanSampleIds ?? []).join(", ");
+  return `[eval] needs_human=${a.needsHuman}: ${ids} — judge abstained; review with \`crewhaus rate\``;
+}
+
+/**
  * G54 — tally of `SampleResult.failureClass` (the spec's `failure_taxonomy`
  * class the sample's final error matched), so a classified run says WHY its
  * errors errored without opening results.json. Undefined when no sample
@@ -171,6 +227,10 @@ export function evalRunOutputLines(
   if (loop !== undefined) lines.push(loop);
   const repeats = formatRepeatsLine(summary);
   if (repeats !== undefined) lines.push(repeats);
+  lines.push(...formatSliceLines(summary));
+  lines.push(...formatCriterionLines(summary));
+  const needsHuman = formatNeedsHumanLine(summary);
+  if (needsHuman !== undefined) lines.push(needsHuman);
   const failures = formatFailureClassesLine(summary.samples);
   if (failures !== undefined) lines.push(failures);
   lines.push(...formatJudgeCalibrationLines(summary.config));

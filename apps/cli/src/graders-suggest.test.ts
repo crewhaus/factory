@@ -74,9 +74,16 @@ type SeedSample = {
   readonly sampleId: string;
   readonly passed: boolean;
   readonly output: string;
-  readonly perGrader: Array<{ name: string; passed: boolean; rationale: string }>;
+  readonly perGrader: Array<{
+    name: string;
+    passed: boolean;
+    rationale: string;
+    abstained?: boolean;
+  }>;
   readonly toolNames?: string[];
   readonly error?: string;
+  /** A3 — the sample outcome was abstained (judge declined, nothing else failed). */
+  readonly abstained?: boolean;
 };
 
 function sampleResult(seed: SeedSample): SampleResult {
@@ -85,6 +92,7 @@ function sampleResult(seed: SeedSample): SampleResult {
     passed: g.passed,
     score: g.passed ? 1 : 0,
     rationale: g.rationale,
+    ...(g.abstained === true ? { abstained: true } : {}),
   }));
   return {
     sampleId: seed.sampleId,
@@ -103,6 +111,7 @@ function sampleResult(seed: SeedSample): SampleResult {
         rationale: perGrader
           .map((g) => `[${g.name}: ${g.passed ? "✓" : "✗"}] ${g.rationale}`)
           .join(" & "),
+        ...(seed.abstained === true ? { abstained: true } : {}),
       },
       perGrader,
     },
@@ -229,9 +238,26 @@ describe("cleanRationale", () => {
     );
   });
 
+  it("strips the NEW-HUNT-2 panel-median judge prefix", () => {
+    expect(
+      cleanRationale(
+        "judge=3.5 (median of 3 repeats [3, abstain, 4], agreement 1/2, need ≥4): missing citations",
+      ),
+    ).toBe("missing citations");
+  });
+
   it("drops infra noise entirely", () => {
     expect(cleanRationale("grader threw: judge 429")).toBe("");
     expect(cleanRationale("agent invocation error: provider timeout")).toBe("");
+  });
+
+  it("drops A3 abstained rationales entirely (needs-human, not a failure theme)", () => {
+    expect(cleanRationale("judge abstained (need ≥4): agent output is empty")).toBe("");
+    expect(
+      cleanRationale(
+        "judge abstained (2/3 repeats abstained [abstain, 3, abstain], need ≥4): input truncated",
+      ),
+    ).toBe("");
   });
 });
 
@@ -306,6 +332,51 @@ describe("evidenceFromRun (seeded run dir via loadRun)", () => {
     expect(passes).toHaveLength(1);
     expect(passes[0]?.sampleId).toBe("s4");
     expect(passes[0]?.toolNames).toEqual(["Read", "Grep"]);
+  });
+
+  it("A3: skips abstained samples wholesale and abstained perGrader placeholders", async () => {
+    const root = newTempRoot();
+    const dir = join(root, "run_b");
+    seedRunDir(dir, "run_000000000000000b", [
+      {
+        // Sample outcome abstained (judge declined, nothing else failed):
+        // the conservative passed:false placeholder is NOT failure evidence.
+        sampleId: "a1",
+        passed: false,
+        abstained: true,
+        output: "",
+        perGrader: [
+          {
+            name: "judge_q",
+            passed: false,
+            abstained: true,
+            rationale: "judge abstained (need ≥3): agent output is empty",
+          },
+        ],
+      },
+      {
+        // A real failure beside an abstaining judge: keep the real failing
+        // grader's rationale, drop the abstention placeholder.
+        sampleId: "a2",
+        passed: false,
+        output: "Wrong answer.",
+        perGrader: [
+          {
+            name: "judge_q",
+            passed: false,
+            abstained: true,
+            rationale: "judge abstained (need ≥3): missing context",
+          },
+          { name: "cited", passed: false, rationale: CITATION_FAIL },
+        ],
+      },
+    ]);
+    const loaded: LoadedRun = await loadRun(dir);
+    const { failures, passes } = evidenceFromRun(loaded);
+
+    expect(failures.map((f) => `${f.sampleId}:${f.source}`)).toEqual(["a2:cited"]);
+    expect(failures[0]?.text).toBe(CITATION_FAIL);
+    expect(passes).toHaveLength(0);
   });
 });
 

@@ -81,6 +81,149 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `eval-report baseline set` carries both fields forward onto manual pins.
   Fully additive: entries and baselines written before the fields existed
   gate and diff exactly as before.
+- **The LLM judge can now abstain instead of guessing, and its decoding is
+  pinned.** `submit_score` gains optional `abstain: boolean` and
+  `confidence: 0..1` fields (strict schema — old judges stay valid), and
+  the judge prompt instructs abstention when the evidence is insufficient
+  to score a criterion honestly. An abstaining judge yields an
+  `abstained: true` grade (`passed: false` / `score: 0` as conservative
+  placeholders) so eval runs can route the sample to human review instead
+  of counting a coin-flip verdict; reported `confidence` rides along on
+  every grade. `llm_judge` graders also accept rubric-level `temperature`
+  (0..1) and `repeats` (odd positive integer, default 1): `repeats: k`
+  fans out a k-judge panel, takes the MEDIAN score, records per-repeat
+  scores and modal agreement in the rationale, and treats a strict
+  majority of abstains as an abstained verdict (odd panels keep that vote
+  tie-proof). `ProviderRequest` gains an additive optional `temperature`
+  field, mapped by every adapter with a native control: Anthropic and
+  Anthropic-on-Bedrock (dropped when extended thinking is enabled, per
+  API constraint), OpenAI (dropped for o-series/gpt-5 reasoning models,
+  which reject a non-default temperature), Gemini
+  (`generationConfig.temperature`), and Bedrock Converse
+  (`inferenceConfig.temperature`). The resolved judge sampling params
+  (temperature + repeats per `llm_judge` grader) are recorded in
+  `run.json`/`results.json` under `config.judgeSampling` so the
+  reproducibility manifest shows exactly how verdicts were decoded;
+  judge-less runs keep their exact prior shape. In-loop `evaluation:`
+  bundles (cli/channel/managed) treat an abstaining judge as score 0
+  (`judge abstained: …` rationale), so a guessed best-estimate can never
+  pass the threshold, and `buildJudgePrompt` accepts
+  `allowAbstain: false` for callers whose `submit_score` schema cannot
+  record abstention. NOTE — `llm_judge` grader entries in graders.yaml
+  are now parsed strictly: a stray/typoed key (`temperture:`, `repeat:`)
+  that was previously silently stripped now fails the parse loudly.
+  BEHAVIOR CHANGE: judge calls now pin `temperature: 0` by default
+  (previously the provider default, ~1.0) — judge scores become more
+  deterministic, so `llm_judge` verdicts and (name, dataset)-keyed
+  baselines may shift on the first run after upgrading; override per
+  grader with `temperature:` if you want sampled judging back.
+- **An abstaining judge now routes samples to humans instead of polluting
+  the pass rate (the runner half of judge abstention).** An abstained
+  judge verdict makes the sample outcome `abstained` UNLESS another grader
+  failed (a deterministic fail is a real verdict and wins; an invoker
+  error always wins). Abstained samples leave the pass-rate denominator
+  and `meanScore` (their 0 score is a placeholder, not a measurement;
+  `partialScoreMean` and latency/token aggregates deliberately still count
+  them), land in `needsHuman`/`needsHumanSampleIds` in results.json, print
+  as `[eval] needs_human=N: <ids>` for `crewhaus rate` follow-up, and
+  render ABSTAINED (plus a needs-human section) in index.html and the diff
+  HTML. The (spec, dataset) baseline gate excludes samples abstained in
+  either run from the per-sample flip comparison — an unknown verdict is
+  not a regression — and says so (`[eval] gate: excluding N abstained
+  sample(s)…`); repeat trials surface per-trial abstention
+  (`trials[].abstained`, conservatively not-passed in `trialPassRate`).
+  Runs without abstention keep their exact pre-existing shape.
+- **Judge per-criterion scores are finally reported instead of being
+  computed and thrown away.** `llm_judge` grades now carry the rubric's
+  raw 1–5 `criterion_scores` as an additive `detail` field on the grade
+  (grades.json/results.json perGrader entries; panel repeats mean each
+  criterion over the scored repeats; abstained verdicts carry none — their
+  criterion scores are guesses), and `aggregate()` folds them into
+  per-criterion means per judge grader (`criterionMeans`) — one
+  `[eval] judge criteria <grader>:` stdout line each and a per-criterion
+  table in index.html, so "which criterion regressed" is answerable from
+  run artifacts.
+- **`crewhaus eval --slice <key,key,...>` — per-slice results over sample
+  metadata, because a macro pass rate can hold while the hard slice
+  collapses.** The runner (so matrix cells and target-eval bundles inherit
+  it) groups samples by each key's STRING metadata values — default keys
+  `family,difficulty,language,source`, applied only where present — and
+  emits per-slice sample count / pass rate / mean score into results.json
+  (`slices`), one compact `[eval] slice <key>:` stdout line per key, and a
+  sortable slice table in index.html. Sample metadata now rides into each
+  `SampleResult` (`metadata`, additive), and `eval-report diff` compares
+  the slice (key, value) pairs both runs share (`sliceDeltas` in diff.json
+  + a slice-deltas table in the diff HTML). Datasets without metadata
+  produce byte-identical results.json.
+- **Closed-form 95% confidence intervals on every eval summary — point
+  estimates at n=8 stop pretending to be measurements.** `aggregate()` now
+  emits `passRateCI95` (Wilson score interval — sane at small n where the
+  naive Wald interval degenerates) and `meanScoreCI95` (Student t; exact
+  table df ≤ 30, Fisher's expansion beyond), no RNG and no new deps. Both
+  print on the `[eval]` summary line (`pass_rate_ci95=[…]`,
+  `mean_score_ci95=[…]`), render as report cards, and are inherited by
+  `--models` matrix cells (matrix.json rows + CI-annotated pass-rate/mean-
+  score cells). Absent where the data cannot support them (0 graded
+  samples / fewer than 2 scored) instead of fabricated.
+- **`eval-report diff` now answers "could this delta be noise?" — paired
+  significance testing on run diffs, plus per-slice deltas in the stdout
+  summary.** The diff runs a sign-flip permutation test over the paired
+  per-sample pass-rate deltas (shared sample ids; abstained-on-either-side
+  pairs excluded, the same exclusion the gate applies): exact enumeration
+  when the paired n is ≤ 20, seeded Monte Carlo above it, with a fixed
+  default seed so unseeded diffs of the same runs are byte-identical —
+  `--seed N` on the diff subcommand overrides. All randomness flows
+  through a small deterministic PRNG (mulberry32), never `Math.random`.
+  The result — pass-rate delta with a seeded-bootstrap 95% CI, two-sided
+  p-value, paired n, and a plain-language "significant / not significant
+  at 0.05" verdict — prints in the stdout summary, lands additively in
+  diff.json (`significance`), and rides the HTML diff header. The stdout
+  tail also gains the per-slice delta table for the slice keys both runs
+  share (diff.json and the diff HTML already carry `sliceDeltas` — see
+  the slices entry above). The strict gate is UNCHANGED and never
+  consults significance: it is decision support beside the gate, not part
+  of it. Mismatched sample ids and unreadable run dirs now die with the
+  clean one-line error instead of an uncaught stack trace.
+- **`crewhaus eval` gates on pre-declared ops thresholds:
+  `--max-p95-latency-ms N` and `--max-cost-usd F`.** The baseline gate —
+  previously pass-rate/flip-only, with its latency criterion explicitly
+  disabled in-code — now fails the verdict (and exits non-zero under
+  `--gate`) when p95 per-sample latency rose more than N ms vs the pinned
+  baseline, or when the run's estimated cost exceeds $F. Cost is projected
+  from the run's agent-model token totals through the same pricing table as
+  the `--models` matrix `est_$` column (all trials under `--repeats`;
+  judge/grader calls are NOT metered — their token usage is not yet
+  captured), and an unpriced model leaves cost unknown, so the cost gate
+  warns instead of failing on a number nobody computed. Both criteria
+  compare like the regression gate does: against the pinned baseline, so
+  the first run for a (spec, dataset) pair pins and is not gated. Every
+  run's `index.jsonl` entry and baseline pin also record `p95LatencyMs` +
+  `costUsd` (additive fields — readers tolerate their absence on old
+  records). Absent flags keep the gate byte-identical to before; the flags
+  are rejected with `--sentinel`/`--models`, which skip the baseline gate.
+- **The spec's `limits:` and `budget:` blocks are honored by eval runs —
+  plus explicit `--sample-timeout-ms` / `--budget-usd` overrides.**
+  BEHAVIOR CHANGE for specs that declare either block (both were silently
+  dead inside `crewhaus eval`): `limits.deadline_ms` now bounds each
+  sample's agent invocation with a wall-clock watchdog (a timed-out sample
+  records an errored result with full artifacts instead of stalling a
+  concurrency slot forever), the remaining `limits:` ceilings
+  (`turn_timeout_ms`, `model_call_timeout_ms`, `max_tool_iterations`,
+  `max_concurrent_tools`, `context_limit`, `loop_detection`) thread into
+  each sample's chat loop exactly as `crewhaus run` threads them, and
+  `budget.usd` caps the RUN's accrued agent-model spend — once accrued cost
+  reaches the cap, in-flight samples finish, queued samples abort with a
+  clear `[eval] budget exhausted after k/N samples` error, and
+  `results.json` is marked `partial` (completed samples keep their grades).
+  Eval always STOPS at the cap: the block's `on_exceed: degrade` ladder
+  never applies to a measurement run, since swapping models mid-eval would
+  corrupt the measurement. The flags override the spec's values
+  (flag > spec, matching `run`); with `--models`, each cell meters its own
+  cap. Judge/grader spend is not metered, and a model without a pricing row
+  disables budget enforcement with a loud warning. The timeout/budget in
+  force are recorded on `run.json`/`results.json` (`sampleTimeoutMs`,
+  `budgetUsd`, additive). Specs without the blocks and runs without the
+  flags behave byte-identically to before.
 
 ### Fixed
 

@@ -609,3 +609,26 @@ describe("toOpenAIChatParams — reasoning effort", () => {
     expect(params.reasoning_effort).toBeUndefined();
   });
 });
+
+describe("toOpenAIChatParams — temperature (NEW-HUNT-2)", () => {
+  test("maps req.temperature on standard models", () => {
+    for (const model of ["gpt-4o", "gpt-4o-mini", "llama3.1:8b", "deepseek-chat"]) {
+      const params = toOpenAIChatParams({ ...baseReq, model, temperature: 0 });
+      expect(params.temperature).toBe(0);
+    }
+    const params = toOpenAIChatParams({ ...baseReq, model: "gpt-4o", temperature: 0.7 });
+    expect(params.temperature).toBe(0.7);
+  });
+
+  test("drops temperature on reasoning models (they 400 on a non-default value)", () => {
+    for (const model of ["o1", "o3", "o4-mini", "gpt-5", "gpt-5-mini"]) {
+      const params = toOpenAIChatParams({ ...baseReq, model, temperature: 0 });
+      expect(params.temperature).toBeUndefined();
+    }
+  });
+
+  test("omits temperature entirely when the request carries none", () => {
+    const params = toOpenAIChatParams(baseReq);
+    expect("temperature" in params).toBe(false);
+  });
+});

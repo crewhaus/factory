@@ -385,7 +385,10 @@ function renderLimitsFields(ir: IrChannelV0): string {
  *     the shape's primary model when the spec omitted `grader.model`
  *     (`cheapest` already resolved at lower time). `threshold` was resolved
  *     at lower time (default 0.7) — the `?? 0.7` is a defensive floor for
- *     hand-built IR.
+ *     hand-built IR. A3 — an abstaining judge scores 0 with a `judge
+ *     abstained: …` rationale (its nominal best-estimate score is a guess
+ *     and must never pass the threshold), so `onFail` applies exactly as
+ *     for a failed grade.
  *   - `contains` / `regex` are emitted as pure fns (score 1 on pass, 0 on
  *     fail; no model spend, no import). `lastIndex` is reset per call so a
  *     global/sticky flag can never flip-flop verdicts across turns.
@@ -441,6 +444,9 @@ function renderEvaluation(ir: IrChannelV0): {
       agentOutput: finalText,
       model: ${model},
     });
+    if (__verdict.abstain) {
+      return { score: 0, rationale: "judge abstained: " + __verdict.rationale };
+    }
     return { score: (__verdict.score - 1) / 4, rationale: __verdict.rationale };
   },
 };`;

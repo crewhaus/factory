@@ -92,3 +92,29 @@ describe("anthropic-on-bedrock body", () => {
     expect(decodeAnthropicBedrockChunk({ type: "ping" })).toBeNull();
   });
 });
+
+describe("anthropic-on-bedrock body — temperature (NEW-HUNT-2)", () => {
+  test("maps req.temperature when no thinking control is set", () => {
+    expect(buildAnthropicBedrockBody({ ...baseReq, temperature: 0 }).temperature).toBe(0);
+    expect(buildAnthropicBedrockBody({ ...baseReq, temperature: 0.7 }).temperature).toBe(0.7);
+  });
+
+  test("drops temperature alongside thinking / reasoningEffort (API rejects the combination)", () => {
+    const withThinking = buildAnthropicBedrockBody({
+      ...baseReq,
+      temperature: 0,
+      thinking: { type: "enabled", budgetTokens: 1024 },
+    });
+    expect(withThinking.temperature).toBeUndefined();
+    const withEffort = buildAnthropicBedrockBody({
+      ...baseReq,
+      temperature: 0,
+      reasoningEffort: "low",
+    });
+    expect(withEffort.temperature).toBeUndefined();
+  });
+
+  test("omits temperature entirely when the request carries none", () => {
+    expect("temperature" in buildAnthropicBedrockBody(baseReq)).toBe(false);
+  });
+});

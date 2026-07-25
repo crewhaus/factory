@@ -139,6 +139,60 @@ describe("crewhaus eval CLI integration (T3)", () => {
     }
   });
 
+  // B13 — `--slice` is validated the same way: blank keys die loudly before
+  // any dataset load or model spend, so these need no credentials.
+  test("eval rejects blank --slice keys", async () => {
+    const base = ["eval", HELLO_SPEC, "--dataset", "d.jsonl", "--graders", "g.yaml"];
+    for (const bad of ["", " ", "difficulty,,family", "difficulty, ,family"]) {
+      const result = await runCli([...base, "--slice", bad]);
+      expect(result.exitCode).toBe(1);
+    }
+  });
+
+  // C30 / NEW-HUNT-3 — the gate-threshold and runtime-ceiling flags are
+  // validated up front too: a typo dies before any dataset load or spend,
+  // so none of these need credentials.
+  test("eval rejects malformed threshold/timeout/budget flag values", async () => {
+    const base = ["eval", HELLO_SPEC, "--dataset", "d.jsonl", "--graders", "g.yaml"];
+    const bads: Array<[string, string]> = [
+      ["--max-p95-latency-ms", "-1"],
+      ["--max-p95-latency-ms", "abc"],
+      ["--max-cost-usd", "-0.5"],
+      ["--max-cost-usd", "x"],
+      ["--sample-timeout-ms", "0"],
+      ["--sample-timeout-ms", "1.5"],
+      ["--sample-timeout-ms", "abc"],
+      ["--budget-usd", "0"],
+      ["--budget-usd", "-1"],
+      ["--budget-usd", "x"],
+    ];
+    for (const [flag, value] of bads) {
+      const result = await runCli([...base, flag, value]);
+      expect(result.exitCode).toBe(1);
+    }
+  });
+
+  test("eval rejects the gate thresholds with --models and --sentinel (which skip the gate)", async () => {
+    const base = ["eval", HELLO_SPEC, "--dataset", "d.jsonl", "--graders", "g.yaml"];
+    const matrix = await runCli([
+      ...base,
+      "--models",
+      "claude-sonnet-4-5,claude-haiku-4-5",
+      "--max-cost-usd",
+      "2",
+    ]);
+    expect(matrix.exitCode).toBe(1);
+    const sentinel = await runCli([
+      ...base,
+      "--sentinel",
+      "--baseline",
+      "does-not-matter",
+      "--max-p95-latency-ms",
+      "500",
+    ]);
+    expect(sentinel.exitCode).toBe(1);
+  });
+
   test("eval-report --help exits 0", async () => {
     const result = await runCli(["eval-report", "--help"]);
     expect(result.exitCode).toBe(0);
@@ -230,5 +284,167 @@ describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
   test("baseline rejects unknown sub-action", async () => {
     const root = newTempRoot();
     expect((await runCli(["eval-report", "baseline", "bogus"], root)).exitCode).toBe(1);
+  });
+});
+
+describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", () => {
+  /** Stderr-capturing variant (the datasets-cli.test.ts pattern: read the
+   *  pipe CONCURRENTLY with the exit — the Bun 1.3.x capture regression
+   *  bites only read-after-exit stdout). */
+  async function runCliStderr(
+    args: ReadonlyArray<string>,
+    cwd: string,
+  ): Promise<{ exitCode: number; stderr: string }> {
+    const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
+      cwd,
+      env: { PATH: process.env["PATH"] ?? "" },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    return { exitCode, stderr };
+  }
+
+  type FixtureSample = { id: string; passed: boolean; score: number };
+  /** Write a minimal-but-faithful results.json run dir for `loadRun`. */
+  function writeRunDir(
+    root: string,
+    name: string,
+    samples: ReadonlyArray<FixtureSample>,
+    slices?: Record<string, Record<string, unknown>>,
+  ): string {
+    const dir = join(root, name);
+    mkdirSync(dir, { recursive: true });
+    const summary = {
+      runId: `run_${name
+        .replace(/[^a-z0-9]/g, "0")
+        .padEnd(16, "0")
+        .slice(0, 16)}`,
+      startedAt: "2026-01-01T00:00:00Z",
+      endedAt: "2026-01-01T00:00:30Z",
+      samples: samples.map((s) => ({
+        sampleId: s.id,
+        sessionId: `sess_${s.id.padEnd(16, "0")}`,
+        startedAt: "2026-01-01T00:00:00Z",
+        endedAt: "2026-01-01T00:00:01Z",
+        latencyMs: 100,
+        turns: 1,
+        tokens: { input: 10, output: 20 },
+        model: "claude-opus-4-7",
+        agentOutput: s.passed ? "correct" : "wrong",
+        grades: {
+          overall: { passed: s.passed, score: s.score, rationale: s.passed ? "ok" : "nope" },
+          perGrader: [{ name: "exact", passed: s.passed, score: s.score, rationale: "" }],
+        },
+      })),
+      aggregates: {
+        passRate: samples.filter((s) => s.passed).length / Math.max(samples.length, 1),
+        meanScore: 0.5,
+        p50Turns: 1,
+        p95Turns: 1,
+        p50LatencyMs: 100,
+        p95LatencyMs: 100,
+        totalTokens: { input: 10, output: 20 },
+        errorCount: 0,
+      },
+      ...(slices !== undefined ? { slices } : {}),
+      config: {
+        specHash: "abc123",
+        datasetName: "fixture",
+        graderNames: ["exact"],
+        model: "claude-opus-4-7",
+        concurrency: 1,
+      },
+      outDir: dir,
+    };
+    writeFileSync(join(dir, "results.json"), JSON.stringify(summary, null, 2));
+    return dir;
+  }
+
+  const flipped = (ids: ReadonlyArray<string>, failing: number): FixtureSample[] =>
+    ids.map((id, i) => ({ id, passed: i >= failing, score: i >= failing ? 1 : 0 }));
+
+  test("diff.json carries significance (CI, p-value, paired-n) and slice deltas", async () => {
+    const root = newTempRoot();
+    const ids = ["s1", "s2", "s3", "s4"];
+    const sliceStats = (passRate: number) => ({ sampleCount: 2, passRate, meanScore: passRate });
+    const prev = writeRunDir(root, "prev", flipped(ids, 0), {
+      difficulty: { easy: sliceStats(1), hard: sliceStats(1) },
+    });
+    const next = writeRunDir(root, "next", flipped(ids, 1), {
+      difficulty: { easy: sliceStats(1), hard: sliceStats(0.5) },
+    });
+    const out = join(root, "out");
+    const result = await runCli(["eval-report", "diff", prev, next, "-o", out], root);
+    expect(result.exitCode).toBe(0);
+    const diff = JSON.parse(readFileSync(join(out, "diff.json"), "utf-8"));
+    expect(diff.significance).toMatchObject({
+      pairedN: 4,
+      method: "exact",
+      pValue: 1,
+      significant: false,
+    });
+    expect(Array.isArray(diff.significance.passRateDeltaCI95)).toBe(true);
+    expect(diff.sliceDeltas).toHaveLength(2);
+    const html = readFileSync(join(out, "index.html"), "utf-8");
+    expect(html).toContain("Paired significance:");
+    expect(html).toContain("Slice deltas (2)");
+  });
+
+  test("unseeded diffs are byte-identical across runs (fixed default seed)", async () => {
+    const root = newTempRoot();
+    // 25 shared ids > the exact bound → the Monte Carlo + bootstrap path.
+    const ids = Array.from({ length: 25 }, (_, i) => `s${i}`);
+    const prev = writeRunDir(root, "prev", flipped(ids, 0));
+    const next = writeRunDir(root, "next", flipped(ids, 6));
+    expect(
+      (await runCli(["eval-report", "diff", prev, next, "-o", join(root, "a")], root)).exitCode,
+    ).toBe(0);
+    expect(
+      (await runCli(["eval-report", "diff", prev, next, "-o", join(root, "b")], root)).exitCode,
+    ).toBe(0);
+    const a = readFileSync(join(root, "a", "diff.json"), "utf-8");
+    const b = readFileSync(join(root, "b", "diff.json"), "utf-8");
+    expect(a).toBe(b);
+    const parsed = JSON.parse(a);
+    expect(parsed.significance.method).toBe("monte-carlo");
+    // 6/25 same-direction regressions: decisively significant.
+    expect(parsed.significance.significant).toBe(true);
+  });
+
+  test("--seed override is recorded; a garbled seed dies loudly", async () => {
+    const root = newTempRoot();
+    const prev = writeRunDir(root, "prev", flipped(["s1", "s2"], 0));
+    const next = writeRunDir(root, "next", flipped(["s1", "s2"], 1));
+    const out = join(root, "out");
+    const ok = await runCli(["eval-report", "diff", prev, next, "--seed", "7", "-o", out], root);
+    expect(ok.exitCode).toBe(0);
+    const diff = JSON.parse(readFileSync(join(out, "diff.json"), "utf-8"));
+    expect(diff.significance.seed).toBe(7);
+    const bad = await runCliStderr(
+      ["eval-report", "diff", prev, next, "--seed", "lucky", "-o", out],
+      root,
+    );
+    expect(bad.exitCode).toBe(1);
+    expect(bad.stderr).toContain("--seed must be an integer");
+  });
+
+  test("disjoint sample ids → clean mismatch message, not a stack trace", async () => {
+    const root = newTempRoot();
+    const prev = writeRunDir(root, "prev", flipped(["a1", "a2"], 0));
+    const next = writeRunDir(root, "next", flipped(["b1", "b2"], 0));
+    const result = await runCliStderr(["eval-report", "diff", prev, next], root);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("dataset shape mismatch");
+    expect(result.stderr).not.toContain("    at "); // no stack frames
+  });
+
+  test("a missing run dir also dies cleanly", async () => {
+    const root = newTempRoot();
+    const prev = writeRunDir(root, "prev", flipped(["s1"], 0));
+    const result = await runCliStderr(["eval-report", "diff", prev, join(root, "nope")], root);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("results.json not found");
   });
 });

@@ -127,6 +127,38 @@ describe("runEval — llm_judge resolution", () => {
     const runJson = JSON.parse(readFileSync(join(outDir, "run.json"), "utf-8"));
     expect(runJson.judgeModel).toBe("claude-judge-x");
     expect(runJson.graderNames).toEqual(["rubricA"]);
+
+    // NEW-HUNT-2 — the reproducibility manifest records the judge sampling
+    // params with the DEFAULTS resolved (pinned temperature 0, single
+    // call), so the pin is visible even when nothing was declared.
+    expect(runJson.judgeSampling).toEqual([{ name: "rubricA", temperature: 0, repeats: 1 }]);
+    expect(summary.config.judgeSampling).toEqual([{ name: "rubricA", temperature: 0, repeats: 1 }]);
+  });
+
+  test("declared judgeSpec temperature/repeats land verbatim in judgeSampling", async () => {
+    const outDir = newTempRoot();
+    const ir = narrowToAgent(lower(parseSpec(SPEC)));
+    const samples: Sample[] = [{ id: "q1", input: "hi", expected_output: "y" }];
+    const invoker = async () => ({ agentOutput: "anything", events: [] });
+
+    const grader = judgeGraderNoModel("rubricT");
+    const summary = await runEval({
+      ir,
+      dataset: { name: "judged-sampling", samples: yieldSamples(samples) },
+      compiledGraders: [
+        {
+          ...grader,
+          judgeSpec: { ...(grader.judgeSpec as object), temperature: 0.5, repeats: 3 } as never,
+        },
+      ],
+      opts: { invoker, outDir },
+    });
+
+    const runJson = JSON.parse(readFileSync(join(outDir, "run.json"), "utf-8"));
+    expect(runJson.judgeSampling).toEqual([{ name: "rubricT", temperature: 0.5, repeats: 3 }]);
+    expect(summary.config.judgeSampling).toEqual([
+      { name: "rubricT", temperature: 0.5, repeats: 3 },
+    ]);
   });
 
   test("per-grader judgeSpec.model overrides the run judgeModel", async () => {

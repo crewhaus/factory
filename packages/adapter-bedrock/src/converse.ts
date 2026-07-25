@@ -62,7 +62,7 @@ export function buildConverseRequest(req: ProviderRequest): ConverseStreamComman
   const input: {
     modelId: string;
     messages: Message[];
-    inferenceConfig: { maxTokens: number };
+    inferenceConfig: { maxTokens: number; temperature?: number };
     system?: SystemContentBlock[];
     toolConfig?: ToolConfiguration;
   } = {
@@ -70,6 +70,13 @@ export function buildConverseRequest(req: ProviderRequest): ConverseStreamComman
     messages: req.messages.map(toConverseMessage),
     inferenceConfig: { maxTokens: req.maxTokens },
   };
+
+  // NEW-HUNT-2 — map the sampling temperature (the judge pin): Converse's
+  // cross-vendor inferenceConfig has a native temperature control, unlike
+  // the reasoning knobs the module header documents as ignored.
+  if (req.temperature !== undefined) {
+    input.inferenceConfig.temperature = req.temperature;
+  }
 
   const system = req.system
     .map((b) => b.text)

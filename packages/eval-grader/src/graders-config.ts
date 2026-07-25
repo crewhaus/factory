@@ -20,6 +20,8 @@
  *     - name: judge_correct
  *       type: llm_judge
  *       rubric: …
+ *       temperature: 0         # judge decoding pin, 0..1 (default 0)
+ *       repeats: 3             # odd judge panel; median score wins (default 1)
  *       weight: 3              # any grader may declare a positive weight (default 1)
  *
  * Combination modes (how per-grader results merge into the sample's overall):
@@ -117,13 +119,30 @@ const RubricSpec = z.object({
   passing_score: z.number().min(1).max(5).optional(),
 });
 
-const LlmJudgeSpec = z.object({
-  name: z.string(),
-  type: z.literal("llm_judge"),
-  rubric: RubricSpec,
-  model: z.string().optional(),
-  weight: WeightField,
-});
+const LlmJudgeSpec = z
+  .object({
+    name: z.string(),
+    type: z.literal("llm_judge"),
+    rubric: RubricSpec,
+    model: z.string().optional(),
+    // NEW-HUNT-2 — judge decoding controls. `temperature` overrides the
+    // pinned default (0); `repeats` fans out an odd judge panel whose median
+    // score is the verdict (odd keeps the majority-abstain vote tie-proof).
+    temperature: z.number().min(0).max(1).optional(),
+    repeats: z
+      .number()
+      .int()
+      .positive()
+      .refine((n) => n % 2 === 1, { message: "repeats must be an odd positive integer" })
+      .optional(),
+    weight: WeightField,
+  })
+  // NEW-HUNT-2 — strict: a typoed decoding key (`temperture: 0.5`,
+  // `repeat: 3`) must fail loudly at parse, not be silently stripped so the
+  // run judges with the pinned defaults while the user believes their
+  // override applied — the same silently-ignored-policy trap the top-level
+  // schema hardens against.
+  .strict();
 
 /**
  * v0.3.0 §7.3 (PR 19) — opt into a grader BY REGISTRY NAME. `grader` is the
@@ -162,7 +181,9 @@ export const GradersConfigSchema = z
   // must fail loudly at parse, not be silently stripped so the run proceeds in
   // default `all` mode with the declared policy ignored. (Per-variant
   // strictness inside GraderSpec is a compat decision deferred to the wave
-  // owner — stray keys in individual grader entries still parse.)
+  // owner — stray keys in individual grader entries still parse, EXCEPT
+  // `llm_judge` entries, strict as of NEW-HUNT-2: their decoding knobs make
+  // silent key-stripping actively dangerous.)
   .strict();
 
 export type GradersConfig = z.infer<typeof GradersConfigSchema>;
@@ -188,7 +209,14 @@ export type CompiledGrader = {
   readonly name: string;
   readonly grader: Grader;
   readonly weight: number;
-  readonly judgeSpec?: { rubric: RubricSpec; model?: string };
+  readonly judgeSpec?: {
+    rubric: RubricSpec;
+    model?: string;
+    /** NEW-HUNT-2 — judge sampling temperature override (default: pinned 0). */
+    temperature?: number;
+    /** NEW-HUNT-2 — odd judge-panel size; median score wins (default 1). */
+    repeats?: number;
+  };
   /** Present for `type: registry` entries — the runner resolves `grader`
    *  against its `graderRegistry` before invoking (see `RegistryGraderSpec`). */
   readonly registrySpec?: { grader: string };
@@ -308,6 +336,8 @@ function compile(spec: GraderSpec): CompiledGrader {
         judgeSpec: {
           rubric: spec.rubric,
           ...(spec.model !== undefined ? { model: spec.model } : {}),
+          ...(spec.temperature !== undefined ? { temperature: spec.temperature } : {}),
+          ...(spec.repeats !== undefined ? { repeats: spec.repeats } : {}),
         },
       };
     case "registry":
