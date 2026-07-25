@@ -23,7 +23,7 @@
  *   G15 `repeats` — k seed-offset trials per sample; pass@k / pass^k
  *       (tau-bench) in the aggregates, per-trial grades on the sample.
  *   G14 — a `type: registry` graders file without a caller registry gets
- *       the default one (six specialty packs + `.crewhaus/graders`
+ *       the default one (the specialty packs + `.crewhaus/graders`
  *       plugins; see `defaultGraderRegistry`).
  *   G56 — per-sample loop-quality metrics (tool-call accuracy,
  *       interventions, disjoint safety-violation buckets, per-model-call
@@ -53,13 +53,50 @@
  *       (or `--budget-usd`) caps the RUN's accrued agent-model spend —
  *       queued samples abort at the cap and the summary is marked partial.
  *
+ * Evals Wave 2 (judge quality, cluster K):
+ *   NEW-HUNT-7 — `type: registry` graders.yaml entries may carry `opts:`,
+ *       resolved through `resolveRegistryGrader` (shared with the exam):
+ *       the default registry validates them against the named pack's own
+ *       strict schema and threads them into the pack constructor; plugin
+ *       graders receive the record untouched as a third argument.
+ *   NEW-HUNT-5 — semantic.similarity's silent ROUGE-L fallback becomes a
+ *       run-level signal: `aggregates.semanticFallback` in results.json
+ *       plus an `[eval] warning:` stderr line from the runner itself, so
+ *       CLI evals and compiled bundles surface it identically.
+ *
+ * Evals Wave 2 (judge quality, cluster P):
+ *   A2  — `llm_judge` panels (`judges: [model, ...]`) thread through to
+ *       `createJudgeGrader`; a high-entropy panel vote flags the sample
+ *       `needsReview`, listed in the aggregates SEPARATELY from the
+ *       abstained needs-human bucket (the verdict still counts — see
+ *       `run-sample.ts` / `aggregate.ts`), and the panel roster rides in
+ *       the `judgeSampling` reproducibility manifest.
+ *
+ * Evals Wave 2 (judge quality, cluster C):
+ *   NEW-graders-2 — `llm_judge` rubrics may be CATEGORICAL
+ *       (`kind: categorical` + labels/passing_labels): the runner
+ *       dispatches on `kind` at resolution (`loadCategoricalRubric` →
+ *       `createJudgeGrader`); categorical rubrics never join the G47
+ *       calibrated-cut path (their gate is label membership, not a scalar
+ *       cut).
+ *   NEW-graders-3 — `llm_judge` `target: transcript` threads through to
+ *       the judge grader (the judge reads a bounded transcript digest) and
+ *       is recorded per grader in the `judgeSampling` manifest — a
+ *       transcript-judged run is a different measurement instrument.
+ *   A9/A10 — the `calibration.abstentionAware` and
+ *       `consistency.paraphraseGroup` registry packs live in this package
+ *       (calibration-abstention.ts / paraphrase-consistency.ts) and their
+ *       cross-sample lenses ride `aggregate()`'s post-run seam into
+ *       results.json (`aggregates.calibration` /
+ *       `aggregates.paraphraseConsistency`).
+ *
  * Reference: build-roadmap.md §16; AGENT-LOOPS-PLAN.md.
  */
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { CompiledGrader, Grader } from "@crewhaus/eval-grader";
-import { createJudgeGrader, loadRubric } from "@crewhaus/eval-judge";
+import { createJudgeGrader, loadCategoricalRubric, loadRubric } from "@crewhaus/eval-judge";
 import type { IrV0 } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { memoryFragmentFromIr, wireMemory } from "@crewhaus/memory-service";
@@ -70,12 +107,13 @@ import { currentTenantContext } from "@crewhaus/tenancy";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { aggregate } from "./aggregate";
 import { warnUnconsumedCombinePolicy } from "./combine-warnings";
-import { defaultGraderRegistry } from "./default-registry";
+import { defaultGraderRegistry, resolveRegistryGrader } from "./default-registry";
 import { RunnerError } from "./errors";
 import { runSample } from "./run-sample";
 import { createSampleOutputWriter } from "./sample-output";
+import { formatSemanticFallbackWarning } from "./semantic-fallback";
 import { Semaphore } from "./semaphore";
-import { DEFAULT_SLICE_KEYS, computeSlices, sampleAbstained } from "./slices";
+import { DEFAULT_SLICE_KEYS, computeSlices, sampleAbstained, sampleNeedsReview } from "./slices";
 import { meanCI95, tCritical975, wilsonCI95 } from "./stats";
 import type {
   AgentInvoker,
@@ -115,17 +153,62 @@ export type { SharedAgentDeps };
 export { wireRunOnce };
 // B13 — metadata slice aggregation (runner-computed so bundles inherit it)
 // and the A3 abstained-outcome predicate downstream consumers share.
-export { DEFAULT_SLICE_KEYS, computeSlices, sampleAbstained };
+// A2 — sampleNeedsReview is its needs-review sibling (verdict still counts).
+export { DEFAULT_SLICE_KEYS, computeSlices, sampleAbstained, sampleNeedsReview };
 // C27 — the closed-form CI helpers behind passRateCI95 / meanScoreCI95.
 export { meanCI95, tCritical975, wilsonCI95 };
 // Loop contract 0.4 (Batch B, G14) — the default grader registry: the six
 // specialty packs + `.crewhaus/graders` plugins, shared by `runEval`'s
-// fallback and the CLI/optimizer/flywheel wiring.
+// fallback and the CLI/optimizer/flywheel wiring. NEW-HUNT-7 adds the
+// `opts:` resolution surface (per-pack strict validation, plugin
+// passthrough) and the shared `resolveRegistryGrader` substitution helper.
 export {
+  DefaultGraderRegistry,
   EVAL_EMBEDDER_ENV,
   defaultGraderRegistry,
+  resolveRegistryGrader,
   type DefaultGraderRegistryOptions,
+  type PluginGraderWithOpts,
 } from "./default-registry";
+// A7 — judge-backed safety classifier (env/opts-selected model, fixed
+// severity rubric); A8 — vision-model OCR for imageOcrThenGrade.
+export {
+  EVAL_CLASSIFIER_ENV,
+  judgeBackedClassifier,
+  type JudgeClassifierKind,
+} from "./judge-classifier";
+export { EVAL_VISION_MODEL_ENV, sniffImageMediaType, visionOcr } from "./vision-ocr";
+// NEW-HUNT-5 — run-level surfacing of the semantic.similarity ROUGE-L
+// fallback (detection contract + the `[eval] warning:` line formatter).
+export {
+  SEMANTIC_FALLBACK_RATIONALE_PREFIX,
+  detectSemanticFallback,
+  formatSemanticFallbackWarning,
+  type SemanticFallbackSummary,
+} from "./semantic-fallback";
+// A9 — the `calibration.abstentionAware` pack (abstention-aware
+// correctness) + its cross-sample aggregation lens.
+export {
+  CALIBRATION_ABSTENTION_GRADER,
+  CALIBRATION_RATIONALE_PREFIX,
+  CalibrationAbstentionOptsSchema,
+  calibrationAbstentionAware,
+  detectCalibrationAggregates,
+  isExplicitDecline,
+  type CalibrationAbstentionOpts,
+  type CalibrationAggregates,
+  type CalibrationClassification,
+} from "./calibration-abstention";
+// A10 — the `consistency.paraphraseGroup` pack (cross-sample verdict
+// consistency over `metadata.paraphrase_group`) + its aggregation lens.
+export {
+  PARAPHRASE_GROUP_GRADER,
+  PARAPHRASE_GROUP_METADATA_KEY,
+  PARAPHRASE_RATIONALE_PREFIX,
+  detectParaphraseConsistency,
+  paraphraseGroupConsistency,
+  type ParaphraseConsistencySummary,
+} from "./paraphrase-consistency";
 // v0.3.0 Goal 2 (§3.3, PR 17) — the first-class competency exam: the
 // reference implementation of memory-service's injected `ExamRunner` seam.
 export {
@@ -201,8 +284,13 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   // actually left its gate unspecified (rubrics that declare a
   // `passing_score` are never overridden).
   const calibrationPath = join(opts.cwd ?? process.cwd(), JUDGE_CALIBRATION_RELPATH);
+  // NEW-graders-2 — categorical rubrics never join the calibrated-cut path:
+  // their gate is label membership, not a scalar passing_score.
   const needsCalibration = compiledGraders.some(
-    (g) => g.judgeSpec !== undefined && g.judgeSpec.rubric.passing_score === undefined,
+    (g) =>
+      g.judgeSpec !== undefined &&
+      g.judgeSpec.rubric.kind !== "categorical" &&
+      g.judgeSpec.rubric.passing_score === undefined,
   );
   const calibration = needsCalibration
     ? loadJudgeCalibration(calibrationPath, ir.name, opts.readCalibrationFile)
@@ -215,6 +303,23 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   // registry (PR 19 — loud at run start, not per-sample).
   const graders: GraderEntry[] = compiledGraders.map((g) => {
     if (g.judgeSpec) {
+      // NEW-graders-2 — categorical dispatch: validate through
+      // `loadCategoricalRubric` (same belt-and-braces re-validation the
+      // scalar path gets from `loadRubric`) and bind the label grader.
+      // No G47 calibration (no scalar cut), no repeats/judges (rejected at
+      // parse); temperature and target thread exactly like scalar.
+      if (g.judgeSpec.rubric.kind === "categorical") {
+        const categoricalRubric = loadCategoricalRubric(g.judgeSpec.rubric);
+        const categoricalModel = g.judgeSpec.model ?? opts.judgeModel;
+        const grader = createJudgeGrader(categoricalRubric, {
+          ...(categoricalModel !== undefined ? { model: categoricalModel } : {}),
+          ...(g.judgeSpec.temperature !== undefined
+            ? { temperature: g.judgeSpec.temperature }
+            : {}),
+          ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
+        });
+        return { name: g.name, grader, weight: g.weight };
+      }
       let rubric = loadRubric(g.judgeSpec.rubric);
       // G47 — an unspecified `passing_score` gates on the calibrated
       // min-score instead of the schema default (3/5). The file's [0,1] cut
@@ -241,9 +346,14 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
       const model = g.judgeSpec.model ?? opts.judgeModel;
       // NEW-HUNT-2 — thread the rubric-level decoding controls through
       // (temperature defaults to the pinned 0 inside `judge`; repeats
-      // defaults to a single call).
+      // defaults to a single call). A2 — a declared `judges` panel
+      // overrides the single model (and --judge-model) inside the grader.
+      // NEW-graders-3 — `target: transcript` makes every judge call read
+      // the bounded transcript digest instead of the final output.
       const grader = createJudgeGrader(rubric, {
         ...(model !== undefined ? { model } : {}),
+        ...(g.judgeSpec.judges !== undefined ? { judges: g.judgeSpec.judges } : {}),
+        ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
         ...(g.judgeSpec.temperature !== undefined ? { temperature: g.judgeSpec.temperature } : {}),
         ...(g.judgeSpec.repeats !== undefined ? { repeats: g.judgeSpec.repeats } : {}),
       });
@@ -257,21 +367,13 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
           `grader "${g.name}" resolves by registry name "${g.registrySpec.grader}" but no graderRegistry was supplied — pass RunEvalOptions.graderRegistry (and register the pack, e.g. registerContinuityGraders(registry))`,
         );
       }
-      try {
-        return {
-          name: g.name,
-          grader: graderRegistry.lookup(g.registrySpec.grader),
-          weight: g.weight,
-        };
-      } catch (err) {
-        const known = graderRegistry.list?.().join(", ");
-        throw new RunnerError(
-          `grader "${g.name}": ${err instanceof Error ? err.message : String(err)}${
-            known !== undefined ? ` — registered graders: ${known}` : ""
-          }`,
-          err,
-        );
-      }
+      // NEW-HUNT-7 — shared with `createExamRunner` (A11): entry `opts:`
+      // validate per pack / pass through to plugins; loud at run start.
+      return {
+        name: g.name,
+        grader: resolveRegistryGrader(graderRegistry, g.name, g.registrySpec),
+        weight: g.weight,
+      };
     }
     return { name: g.name, grader: g.grader, weight: g.weight };
   });
@@ -373,6 +475,13 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
             name: g.name,
             temperature: g.judgeSpec.temperature ?? 0,
             repeats: g.judgeSpec.repeats ?? 1,
+            // A2 — record the panel roster when one was declared (absent
+            // otherwise, keeping single-judge entries byte-identical).
+            ...(g.judgeSpec.judges !== undefined ? { judges: g.judgeSpec.judges } : {}),
+            // NEW-graders-3 — record a non-default judge target (a
+            // transcript-judged run is a different instrument; absent for
+            // default output judging, keeping entries byte-identical).
+            ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
           },
         ]
       : [],
@@ -579,6 +688,15 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
 
   const endedAt = new Date().toISOString();
   const aggregates = aggregate(results);
+  // NEW-HUNT-5 — the semantic.similarity ROUGE-L fallback fired: the run
+  // graded some samples with a DIFFERENT instrument. Warn at RUN level on
+  // stderr (the literal `[eval] warning:` grammar, not logger diagnostics)
+  // right here in the runner, so `crewhaus eval`, compiled target-eval
+  // bundles, and every other runEval caller inherit it without per-surface
+  // wiring. The per-sample rationale prefix stays untouched.
+  if (aggregates.semanticFallback !== undefined) {
+    process.stderr.write(`${formatSemanticFallbackWarning(aggregates.semanticFallback)}\n`);
+  }
   // B13 — per-slice aggregates over the samples' string metadata values.
   // Absent when nothing sliced, keeping metadata-less runs byte-identical.
   const slices = computeSlices(results, sliceKeys);

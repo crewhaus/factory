@@ -42,6 +42,17 @@ export type SemanticSimilarityOptions = {
 const DEFAULT_THRESHOLD = 0.7;
 const DEFAULT_FALLBACK_THRESHOLD = 0.5;
 
+/**
+ * NEW-HUNT-5 — the stable rationale marker every ROUGE-L-fallback grade
+ * starts with (`${PREFIX}<embedder error>] <rougeL rationale>`). Exported
+ * as the DETECTION CONTRACT: the eval-runner scans per-grader rationales
+ * for this prefix to count fallback-graded samples and emit the run-level
+ * `[eval] warning:` line, so a run silently swapping its instrument
+ * mid-flight is visible at run level, not only sample by sample. Do not
+ * reword without updating that consumer (it pins equality in tests).
+ */
+export const SEMANTIC_FALLBACK_RATIONALE_PREFIX = "[fallback ROUGE-L; embedder error: ";
+
 export function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length !== b.length) {
     throw new GraderError(`cosineSimilarity: vector dim mismatch ${a.length} vs ${b.length}`);
@@ -100,7 +111,7 @@ export function semanticSimilarity(opts: SemanticSimilarityOptions): Grader {
       return {
         passed: fb.passed,
         score: fb.score,
-        rationale: `[fallback ROUGE-L; embedder error: ${(err as Error).message ?? "unknown"}] ${fb.rationale}`,
+        rationale: `${SEMANTIC_FALLBACK_RATIONALE_PREFIX}${(err as Error).message ?? "unknown"}] ${fb.rationale}`,
       };
     }
     const refVec = vectors[0];

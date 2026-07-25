@@ -167,6 +167,26 @@ describe("renderReport — Wave 1 sections", () => {
     expect(html).toContain("Needs human");
     expect(html).toContain("crewhaus rate");
   });
+
+  test("A2: needs-review section + card render when the aggregates carry the bucket", () => {
+    const summary = baseSummary([baseSample("s1", true, 1), baseSample("s2", true, 0.75)]);
+    const withBucket = {
+      ...summary,
+      aggregates: {
+        ...summary.aggregates,
+        needsReview: 1,
+        needsReviewSampleIds: ["s2"],
+      },
+    };
+    const { html } = renderReport(loaded(withBucket));
+    expect(html).toContain('id="needs-review"');
+    expect(html).toContain("Needs review (1)");
+    expect(html).toContain("vote entropy");
+    // Bucket-free summaries render neither section nor card.
+    const { html: plain } = renderReport(loaded(summary));
+    expect(plain).not.toContain('id="needs-review"');
+    expect(plain).not.toContain("Needs review");
+  });
 });
 
 describe("diffReports — Wave 1 (B13 slice deltas, A3 abstained sides)", () => {
@@ -254,5 +274,60 @@ describe("matrix — C27 CI inheritance", () => {
     expect(html).toContain("[49.0–94.3%]");
     expect(html).toContain("[0.300–0.700]");
     expect(json).toContain("passRateCI95");
+  });
+});
+
+// Evals Wave 2 (cluster C) — A9 calibration + A10 paraphrase-consistency cards.
+describe("renderReport — cluster C aggregate cards (A9/A10)", () => {
+  test("calibration and paraphrase-consistency aggregates render as guarded cards", () => {
+    const summary = baseSummary([baseSample("s1", true, 1)]);
+    const { html } = renderReport(
+      loaded({
+        ...summary,
+        aggregates: {
+          ...summary.aggregates,
+          calibration: {
+            classifiedSamples: 4,
+            answerRate: 0.75,
+            abstentionRate: 0.25,
+            accuracyWhenAnswered: 2 / 3,
+          },
+          paraphraseConsistency: {
+            groupCount: 3,
+            consistencyByGroup: { g1: 1, g2: 0.5, g3: 1 },
+            meanConsistency: 5 / 6,
+          },
+        },
+      }),
+    );
+    expect(html).toContain("Answer rate");
+    expect(html).toContain("75.0%");
+    expect(html).toContain("Abstention rate");
+    expect(html).toContain("25.0%");
+    expect(html).toContain("Accuracy when answered");
+    expect(html).toContain("66.7%");
+    expect(html).toContain("Paraphrase consistency");
+    expect(html).toContain("83.3% (3 groups)");
+  });
+
+  test("accuracy-when-answered card is omitted when the field is absent", () => {
+    const summary = baseSummary([baseSample("s1", true, 1)]);
+    const { html } = renderReport(
+      loaded({
+        ...summary,
+        aggregates: {
+          ...summary.aggregates,
+          calibration: { classifiedSamples: 2, answerRate: 0, abstentionRate: 1 },
+        },
+      }),
+    );
+    expect(html).toContain("Answer rate");
+    expect(html).not.toContain("Accuracy when answered");
+  });
+
+  test("legacy summaries render neither cluster-C card", () => {
+    const { html } = renderReport(loaded(baseSummary([baseSample("s1", true, 1)])));
+    expect(html).not.toContain("Answer rate");
+    expect(html).not.toContain("Paraphrase consistency");
   });
 });

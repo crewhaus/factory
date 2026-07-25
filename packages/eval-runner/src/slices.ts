@@ -33,6 +33,23 @@ export function sampleAbstained(s: SampleResult): boolean {
 }
 
 /**
+ * A2 — a sample flagged for HUMAN REVIEW by a high-entropy judge-panel
+ * vote split. Unlike {@link sampleAbstained} the verdict is real and still
+ * COUNTS (pass-rate denominator unchanged) — the flag only lists the
+ * sample in the aggregates' separate needs-review bucket. Abstained
+ * samples are never needs-review (they already route to needs-human), and
+ * errored samples never carry the flag (the invoker crash wins). Old
+ * records (no `needsReview` field) are never needs-review.
+ */
+export function sampleNeedsReview(s: SampleResult): boolean {
+  return (
+    s.error === undefined &&
+    s.grades.overall.abstained !== true &&
+    s.grades.overall.needsReview === true
+  );
+}
+
+/**
  * Per-slice pass rate + mean score, mirroring the run-level semantics:
  * `passRate` excludes abstained samples from the denominator (errored ones
  * still count as failures), and `meanScore` averages the graded, non-errored

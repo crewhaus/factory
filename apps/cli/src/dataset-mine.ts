@@ -494,6 +494,13 @@ export function buildStressVariants(redactedInput: string, count: number): Synth
  * carries expected_output (a synthetic input has no gold answer), and the
  * metadata marks it clearly so it can never be mistaken for a human-gold
  * sample. Injection variants carry an `adversarial: true` flag + the rule id.
+ * Paraphrase variants additionally carry `paraphrase_group: <sourceId>` —
+ * the A10 consistency lineage: every paraphrase of the same parent shares
+ * the group, so the `consistency.paraphraseGroup` registry pack can score
+ * cross-variant verdict agreement at aggregation. Only paraphrases join a
+ * group (they are semantically equivalent restatements); truncate/
+ * ambiguate/inject deliberately CHANGE the question, so a shared verdict
+ * is not owed and they stay group-less.
  */
 export function variantToSample(variant: SynthVariant, sourceId: string, index: number): Sample {
   const metadata: Record<string, unknown> = {
@@ -502,6 +509,9 @@ export function variantToSample(variant: SynthVariant, sourceId: string, index: 
     from: sourceId,
     note: "synthetic stress variant — never a human-gold sample",
   };
+  if (variant.mutation === "paraphrase") {
+    metadata["paraphrase_group"] = sourceId;
+  }
   if (variant.mutation === "inject") {
     metadata["adversarial"] = true;
     if (variant.injectionRule !== undefined) metadata["injection_rule"] = variant.injectionRule;

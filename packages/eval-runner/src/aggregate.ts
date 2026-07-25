@@ -1,4 +1,7 @@
-import { sampleAbstained } from "./slices";
+import { detectCalibrationAggregates } from "./calibration-abstention";
+import { detectParaphraseConsistency } from "./paraphrase-consistency";
+import { detectSemanticFallback } from "./semantic-fallback";
+import { sampleAbstained, sampleNeedsReview } from "./slices";
 import { meanCI95, wilsonCI95 } from "./stats";
 import type { EvalAggregates, SafetyViolationCounts, SampleResult } from "./types";
 
@@ -58,12 +61,41 @@ const ZERO_SAFETY: SafetyViolationCounts = {
  * all-samples denominator), and pass@k/pass^k (an abstained trial is
  * conservatively not-passed). Runs without abstention are byte-identical.
  *
+ * Review honesty (A2): a sample flagged `needsReview` (high-entropy
+ * judge-panel vote) keeps its REAL verdict in every figure — pass-rate
+ * denominator included — and is only LISTED in
+ * `needsReview`/`needsReviewSampleIds`, a separate bucket from the
+ * abstained needs-human one (a coin-flip verdict is still a verdict; an
+ * abstention is not). Runs without the flag are byte-identical.
+ *
  * C27: `passRateCI95` (Wilson) and `meanScoreCI95` (Student t) quantify how
  * much the point estimates can be trusted at this n — attached whenever the
  * data supports them (graded n ≥ 1, scored n ≥ 2 respectively).
+ *
+ * NEW-HUNT-5: `semanticFallback` names the samples the semantic.similarity
+ * grader silently graded with ROUGE-L (embedder error) — an instrument swap
+ * the run-level record must not hide. Present only when a sample fell back
+ * (detected via the pack's stable rationale prefix, canonical grades only —
+ * consistent with every other aggregate).
+ *
+ * Cross-sample post-run seam (evals Wave 2, cluster C): `aggregate()` is
+ * THE additive hook for measurements that only exist ACROSS samples — it
+ * runs once over every canonical SampleResult after the run (`runEval` and
+ * every direct `aggregate()` consumer inherit it; the exam's own summary
+ * deliberately stays lean), and pack-emitted evidence reaches it via stable
+ * rationale markers (the semantic-fallback detection contract), so no
+ * per-sample grader API change is ever needed. A9
+ * `calibration` (answered-correct / answered-wrong / not-attempted →
+ * answerRate / abstentionRate / accuracyWhenAnswered) and A10
+ * `paraphraseConsistency` (verdict agreement across samples sharing
+ * `metadata.paraphrase_group`) both ride it; each block is present only
+ * when its pack actually graded, keeping pack-less runs byte-identical.
  */
 export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates {
   const abstainedIds = samples.filter(sampleAbstained).map((s) => s.sampleId);
+  // A2 — needs-review listing, disjoint from the abstained bucket by
+  // construction (sampleNeedsReview excludes abstained samples).
+  const needsReviewIds = samples.filter(sampleNeedsReview).map((s) => s.sampleId);
   // `ok` (non-errored) still includes abstained samples — their turns/
   // latency/token measurements are real. `scored` (non-errored, graded)
   // feeds the verdict-derived figures: passRate, meanScore, and both CIs.
@@ -163,6 +195,15 @@ export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates 
     );
   }
 
+  // NEW-HUNT-5 — ROUGE-L-fallback samples (semantic.similarity's embedder
+  // dropped out mid-run).
+  const semanticFallback = detectSemanticFallback(samples);
+
+  // A9 / A10 — pack-marker-detected cross-sample lenses (see the seam note
+  // in the doc comment). Each is undefined when its pack didn't grade.
+  const calibration = detectCalibrationAggregates(samples);
+  const paraphraseConsistency = detectParaphraseConsistency(samples);
+
   return {
     passRate: gradedTotal === 0 ? 0 : passed / gradedTotal,
     meanScore,
@@ -186,6 +227,12 @@ export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates 
     ...(abstainedIds.length > 0
       ? { needsHuman: abstainedIds.length, needsHumanSampleIds: abstainedIds }
       : {}),
+    ...(needsReviewIds.length > 0
+      ? { needsReview: needsReviewIds.length, needsReviewSampleIds: needsReviewIds }
+      : {}),
     ...(Object.keys(criterionMeans).length > 0 ? { criterionMeans } : {}),
+    ...(semanticFallback !== undefined ? { semanticFallback } : {}),
+    ...(calibration !== undefined ? { calibration } : {}),
+    ...(paraphraseConsistency !== undefined ? { paraphraseConsistency } : {}),
   };
 }

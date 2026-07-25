@@ -379,6 +379,18 @@ describe("variantToSample", () => {
     expect(s.metadata?.["adversarial"]).toBe(true);
     expect(s.metadata?.["injection_rule"]).toBe("ignore-previous");
   });
+
+  it("stamps paraphrase_group (the parent id) on paraphrase variants ONLY (A10)", () => {
+    // The consistency.paraphraseGroup pack groups on this key: every
+    // paraphrase of the same parent shares it; the other mutations change
+    // the question's meaning, so a shared verdict is not owed.
+    const p = variantToSample({ input: "paraphrased", mutation: "paraphrase" }, "gold_01", 1);
+    expect(p.metadata?.["paraphrase_group"]).toBe("gold_01");
+    for (const mutation of ["truncate", "ambiguate", "inject"] as const) {
+      const s = variantToSample({ input: `x-${mutation}`, mutation }, "gold_01", 2);
+      expect(s.metadata?.["paraphrase_group"]).toBeUndefined();
+    }
+  });
 });
 
 // -------- CLI integration (offline — env carries only PATH) --------

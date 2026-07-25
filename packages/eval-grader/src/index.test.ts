@@ -407,6 +407,117 @@ ${extra}
     );
     expect(() => parseGradersConfig(JUDGE_YAML("    repeat: 3"))).toThrow(/invalid graders config/);
   });
+
+  // A2 — the multi-model judge panel field.
+  test("accepts a judges panel; judgeSpec carries the roster verbatim", () => {
+    const { compiled } = parseGradersConfig(
+      JUDGE_YAML("    judges: [claude-sonnet-4-5, openai/gpt-4o, gemini/gemini-2.5-pro]"),
+    );
+    expect(compiled[0]?.judgeSpec?.judges).toEqual([
+      "claude-sonnet-4-5",
+      "openai/gpt-4o",
+      "gemini/gemini-2.5-pro",
+    ]);
+  });
+
+  test("judges and model may coexist (judges overrides at grading time)", () => {
+    const { compiled } = parseGradersConfig(
+      JUDGE_YAML("    model: claude-sonnet-4-5\n    judges: [openai/gpt-4o]"),
+    );
+    expect(compiled[0]?.judgeSpec?.model).toBe("claude-sonnet-4-5");
+    expect(compiled[0]?.judgeSpec?.judges).toEqual(["openai/gpt-4o"]);
+  });
+
+  test("judges composes with repeats (per-panelist repeats)", () => {
+    const { compiled } = parseGradersConfig(JUDGE_YAML("    judges: [a, b, c]\n    repeats: 3"));
+    expect(compiled[0]?.judgeSpec?.judges).toEqual(["a", "b", "c"]);
+    expect(compiled[0]?.judgeSpec?.repeats).toBe(3);
+  });
+
+  test("rejects an empty judges list and empty model strings", () => {
+    expect(() => parseGradersConfig(JUDGE_YAML("    judges: []"))).toThrow(
+      /invalid graders config/,
+    );
+    expect(() => parseGradersConfig(JUDGE_YAML('    judges: [""]'))).toThrow(
+      /invalid graders config/,
+    );
+  });
+
+  test("backward compat: absent judges leaves judgeSpec without the key", () => {
+    const { compiled } = parseGradersConfig(JUDGE_YAML(""));
+    const judgeSpec = compiled[0]?.judgeSpec;
+    expect(judgeSpec !== undefined && "judges" in judgeSpec).toBe(false);
+  });
+});
+
+describe("parseGradersConfig — registry opts (NEW-HUNT-7)", () => {
+  test("a registry entry carries its opts record verbatim onto registrySpec", () => {
+    const { compiled } = parseGradersConfig(`
+graders:
+  - name: close
+    type: registry
+    grader: semantic.similarity
+    opts:
+      threshold: 0.8
+      disableFallback: true
+      embedder: mock/deterministic
+`);
+    expect(compiled[0]?.registrySpec).toEqual({
+      grader: "semantic.similarity",
+      opts: { threshold: 0.8, disableFallback: true, embedder: "mock/deterministic" },
+    });
+  });
+
+  test("a registry entry without opts compiles exactly as before (no opts key)", () => {
+    const { compiled } = parseGradersConfig(
+      "graders:\n  - name: reg\n    type: registry\n    grader: nlg.rougeL\n",
+    );
+    expect(compiled[0]?.registrySpec).toEqual({ grader: "nlg.rougeL" });
+    expect(compiled[0]?.registrySpec !== undefined && "opts" in compiled[0].registrySpec).toBe(
+      false,
+    );
+  });
+
+  test("registry entries are strict: a typoed sibling key fails at parse", () => {
+    expect(() =>
+      parseGradersConfig(
+        "graders:\n  - name: reg\n    type: registry\n    grader: nlg.rougeL\n    options:\n      threshold: 0.8\n",
+      ),
+    ).toThrow(/invalid graders config/);
+    expect(() =>
+      parseGradersConfig(
+        "graders:\n  - name: reg\n    type: registry\n    grader: nlg.rougeL\n    opt: {}\n",
+      ),
+    ).toThrow(/invalid graders config/);
+  });
+
+  test("opts must be a record, not a scalar or list", () => {
+    expect(() =>
+      parseGradersConfig(
+        "graders:\n  - name: reg\n    type: registry\n    grader: nlg.rougeL\n    opts: 5\n",
+      ),
+    ).toThrow(/invalid graders config/);
+    expect(() =>
+      parseGradersConfig(
+        "graders:\n  - name: reg\n    type: registry\n    grader: nlg.rougeL\n    opts: [1]\n",
+      ),
+    ).toThrow(/invalid graders config/);
+  });
+
+  test("an opts block on a NON-registry entry rejects loudly, pointing at type: registry", () => {
+    // The deterministic variants are non-strict (zod strips unknown keys),
+    // so without the explicit post-parse check a misplaced `opts:` would
+    // silently apply to NOTHING while the user believes their thresholds
+    // took effect — the exact trap the registry/llm_judge strictness closes.
+    expect(() =>
+      parseGradersConfig(
+        "graders:\n  - name: rx\n    type: regex\n    pattern: ok\n    opts:\n      threshold: 0.9\n",
+      ),
+    ).toThrow(/grader "rx" \(type: regex\) declares `opts:`.*type: registry/);
+    expect(() =>
+      parseGradersConfig("graders:\n  - name: em\n    type: exact_match\n    opts: {}\n"),
+    ).toThrow(/grader "em" \(type: exact_match\) declares `opts:`.*type: registry/);
+  });
 });
 
 describe("parseGradersConfig — weight + combine (A4/A5)", () => {
@@ -567,5 +678,184 @@ graders:
     const r = await combineCompiledGraders(compiled)(sample, baseRun);
     expect(r.score).toBe(0.5);
     expect(r.passed).toBe(true); // exactly at the default cut
+  });
+});
+
+describe("parseGradersConfig — categorical rubric + judge target (NEW-graders-2/3)", () => {
+  const CATEGORICAL_YAML = (extra = "") => `
+graders:
+  - name: labeler
+    type: llm_judge
+${extra}
+    rubric:
+      kind: categorical
+      labels:
+        - name: correct
+          score: 1
+          description: right
+        - name: wrong
+          score: 0
+          description: not right
+      passing_labels: [correct]
+`;
+
+  const SCALAR_YAML = (extra = "") => `
+graders:
+  - name: judge
+    type: llm_judge
+${extra}
+    rubric:
+      criteria:
+        - name: c1
+          description: ok
+          anchors: { 1: bad, 2: meh, 3: ok, 4: good, 5: great }
+`;
+
+  test("parses a categorical rubric; judgeSpec carries kind/labels/passing_labels", () => {
+    const { compiled } = parseGradersConfig(CATEGORICAL_YAML());
+    const rubric = compiled[0]?.judgeSpec?.rubric;
+    expect(rubric?.kind).toBe("categorical");
+    if (rubric?.kind !== "categorical") throw new Error("expected categorical rubric");
+    expect(rubric.labels.map((l) => l.name)).toEqual(["correct", "wrong"]);
+    expect(rubric.labels[0]?.score).toBe(1);
+    expect(rubric.passing_labels).toEqual(["correct"]);
+  });
+
+  test("backward compat: a scalar rubric parses with NO kind key (gradersHash stability)", () => {
+    const { config, compiled } = parseGradersConfig(SCALAR_YAML());
+    const rubric = compiled[0]?.judgeSpec?.rubric;
+    expect(rubric).toBeDefined();
+    expect(rubric !== undefined && "kind" in rubric).toBe(false);
+    // The parsed CONFIG (the gradersHash input) must not gain a kind key either.
+    const specRubric = (config.graders[0] as { rubric?: object }).rubric;
+    expect(specRubric !== undefined && "kind" in specRubric).toBe(false);
+  });
+
+  test("an explicit kind: scalar is accepted on the scalar rubric", () => {
+    const { compiled } = parseGradersConfig(
+      SCALAR_YAML().replace("      criteria:", "      kind: scalar\n      criteria:"),
+    );
+    expect(compiled[0]?.judgeSpec?.rubric.kind).toBe("scalar");
+  });
+
+  test("rejects fewer than two labels and out-of-range label scores", () => {
+    expect(() =>
+      parseGradersConfig(`
+graders:
+  - name: labeler
+    type: llm_judge
+    rubric:
+      kind: categorical
+      labels:
+        - name: only
+          score: 1
+          description: single
+      passing_labels: [only]
+`),
+    ).toThrow(/invalid graders config/);
+    expect(() => parseGradersConfig(CATEGORICAL_YAML().replace("score: 1", "score: 2"))).toThrow(
+      /invalid graders config/,
+    );
+  });
+
+  test("rejects duplicate label names and undeclared passing labels", () => {
+    expect(() =>
+      parseGradersConfig(CATEGORICAL_YAML().replace("name: wrong", "name: correct")),
+    ).toThrow(/invalid graders config/);
+    expect(() =>
+      parseGradersConfig(
+        CATEGORICAL_YAML().replace("passing_labels: [correct]", "passing_labels: [excellent]"),
+      ),
+    ).toThrow(/invalid graders config/);
+  });
+
+  test("a confused rubric declaring BOTH kind: categorical and criteria fails loudly", () => {
+    // Neither union branch may silently absorb it: the scalar branch rejects
+    // the kind literal, the strict categorical branch rejects the stray key.
+    expect(() =>
+      parseGradersConfig(`
+graders:
+  - name: confused
+    type: llm_judge
+    rubric:
+      kind: categorical
+      labels:
+        - name: a
+          score: 1
+          description: x
+        - name: b
+          score: 0
+          description: y
+      passing_labels: [a]
+      criteria: []
+`),
+    ).toThrow(/invalid graders config/);
+  });
+
+  test("a half-migrated rubric (criteria + labels, NO kind) fails pointed — never silently scalar", () => {
+    // Without the deny-list the non-strict scalar branch would absorb this
+    // shape, strip the labels, and judge scalar while the user believes
+    // they declared a categorical rubric.
+    const halfMigrated = `
+graders:
+  - name: half
+    type: llm_judge
+    rubric:
+      criteria:
+        - name: c1
+          description: ok
+          anchors: { 1: bad, 2: meh, 3: ok, 4: good, 5: great }
+      labels:
+        - name: correct
+          score: 1
+          description: right
+        - name: wrong
+          score: 0
+          description: not right
+      passing_labels: [correct]
+`;
+    expect(() => parseGradersConfig(halfMigrated)).toThrow(/invalid graders config/);
+    expect(() => parseGradersConfig(halfMigrated)).toThrow(/did you mean `kind: categorical`/);
+  });
+
+  test("rejects repeats and judges with a categorical rubric (no label-vote fold)", () => {
+    expect(() => parseGradersConfig(CATEGORICAL_YAML("    repeats: 3"))).toThrow(
+      /categorical rubric/,
+    );
+    expect(() => parseGradersConfig(CATEGORICAL_YAML("    judges: [a, b]"))).toThrow(
+      /categorical rubric/,
+    );
+  });
+
+  test("categorical composes with model + temperature + target + weight", () => {
+    const { compiled } = parseGradersConfig(
+      CATEGORICAL_YAML(
+        "    model: openai/gpt-4o\n    temperature: 0.3\n    target: transcript\n    weight: 2",
+      ),
+    );
+    const spec = compiled[0]?.judgeSpec;
+    expect(spec?.model).toBe("openai/gpt-4o");
+    expect(spec?.temperature).toBe(0.3);
+    expect(spec?.target).toBe("transcript");
+    expect(compiled[0]?.weight).toBe(2);
+  });
+
+  test("NEW-graders-3 — target parses on scalar judges and rides judgeSpec", () => {
+    const { compiled } = parseGradersConfig(SCALAR_YAML("    target: transcript"));
+    expect(compiled[0]?.judgeSpec?.target).toBe("transcript");
+    const explicit = parseGradersConfig(SCALAR_YAML("    target: output"));
+    expect(explicit.compiled[0]?.judgeSpec?.target).toBe("output");
+  });
+
+  test("NEW-graders-3 — backward compat: absent target leaves judgeSpec without the key", () => {
+    const { compiled } = parseGradersConfig(SCALAR_YAML());
+    const judgeSpec = compiled[0]?.judgeSpec;
+    expect(judgeSpec !== undefined && "target" in judgeSpec).toBe(false);
+  });
+
+  test("NEW-graders-3 — rejects an unknown target value", () => {
+    expect(() => parseGradersConfig(SCALAR_YAML("    target: trajectory"))).toThrow(
+      /invalid graders config/,
+    );
   });
 });

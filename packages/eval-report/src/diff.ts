@@ -1,6 +1,7 @@
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
 import { ReportError } from "./errors";
 import type { LoadedRun } from "./load";
+import type { PairwiseDiff } from "./pairwise";
 import { renderDiffHtml } from "./render";
 import { type DiffSignificance, computeDiffSignificance } from "./significance";
 
@@ -25,6 +26,14 @@ export type ReportDiff = {
    * on a side) and on diff.json written by older CLIs.
    */
   readonly significance?: DiffSignificance;
+  /**
+   * A1 — head-to-head pairwise judging of the two runs' outputs
+   * (`eval-report diff --pairwise`): per-sample order-swapped verdicts,
+   * win/loss/tie tallies, win-rate, and order-consistency. Purely
+   * additive — absent on offline diffs (the default), so diff.json is
+   * byte-identical without the flag.
+   */
+  readonly pairwise?: PairwiseDiff;
 };
 
 export type DiffEntry = {
@@ -97,11 +106,15 @@ export function diffInstrumentWarnings(prev: LoadedRun, next: LoadedRun): string
  * C29 — `opts.seed` pins the significance test's Monte Carlo draw and
  * bootstrap CI (defaults to a fixed seed, so identical inputs give
  * byte-identical diff.json across runs).
+ *
+ * A1 — `opts.pairwise` attaches a pre-computed pairwise-judging block (the
+ * CLI's `--pairwise` runs the judge calls BEFORE this pure fold) to
+ * diff.json and the rendered report. Omitted ⇒ byte-identical output.
  */
 export function diffReports(
   prev: LoadedRun,
   next: LoadedRun,
-  opts: { readonly seed?: number } = {},
+  opts: { readonly seed?: number; readonly pairwise?: PairwiseDiff } = {},
 ): { html: string; json: string; diff: ReportDiff } {
   const prevById = new Map(prev.summary.samples.map((s) => [s.sampleId, s]));
   const nextById = new Map(next.summary.samples.map((s) => [s.sampleId, s]));
@@ -178,6 +191,7 @@ export function diffReports(
     unchanged,
     ...(sliceDeltas.length > 0 ? { sliceDeltas } : {}),
     ...(significance !== undefined ? { significance } : {}),
+    ...(opts.pairwise !== undefined ? { pairwise: opts.pairwise } : {}),
   };
   return {
     html: renderDiffHtml(diff, prev.summary, next.summary),

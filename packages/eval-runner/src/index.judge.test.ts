@@ -19,7 +19,14 @@ import type { IrNode, IrV0 } from "@crewhaus/ir";
 import { parseSpec } from "@crewhaus/spec";
 
 const boundModels: Array<string | undefined> = [];
+// A2 — the full option bags createJudgeGrader was called with, so the
+// judges-panel threading is assertable alongside the model binding.
+const boundOpts: Array<Record<string, unknown>> = [];
 const loadedRubrics: unknown[] = [];
+// NEW-graders-2 — the rubrics createJudgeGrader was handed, so the
+// categorical dispatch (real loadCategoricalRubric → grader factory) is
+// assertable alongside the option threading.
+const boundRubrics: unknown[] = [];
 
 // Capture the real module so `afterAll` can restore it — `mock.module` is
 // process-global and does not auto-restore across test files. The capture is
@@ -36,6 +43,8 @@ mock.module("@crewhaus/eval-judge", () => ({
   },
   createJudgeGrader: (_rubric: unknown, opts: { model?: string } = {}) => {
     boundModels.push(opts.model);
+    boundOpts.push({ ...opts });
+    boundRubrics.push(_rubric);
     // Deterministic grader: always passes, no network.
     return async (): Promise<GradeResult> => ({
       passed: true,
@@ -161,6 +170,65 @@ describe("runEval — llm_judge resolution", () => {
     ]);
   });
 
+  test("A2 — a judges panel threads to createJudgeGrader and rides judgeSampling", async () => {
+    const outDir = newTempRoot();
+    boundOpts.length = 0;
+    const ir = narrowToAgent(lower(parseSpec(SPEC)));
+    const samples: Sample[] = [{ id: "q1", input: "hi", expected_output: "y" }];
+    const invoker = async () => ({ agentOutput: "anything", events: [] });
+
+    const grader = judgeGraderNoModel("rubricPanel");
+    const summary = await runEval({
+      ir,
+      dataset: { name: "judged-panel", samples: yieldSamples(samples) },
+      compiledGraders: [
+        {
+          ...grader,
+          judgeSpec: {
+            ...(grader.judgeSpec as object),
+            judges: ["claude-sonnet-4-5", "openai/gpt-4o"],
+          } as never,
+        },
+      ],
+      opts: { invoker, outDir },
+    });
+
+    // The panel roster reaches the grader factory …
+    expect(boundOpts).toHaveLength(1);
+    expect(boundOpts[0]?.judges).toEqual(["claude-sonnet-4-5", "openai/gpt-4o"]);
+    // … and the reproducibility manifest, with defaults still resolved.
+    const runJson = JSON.parse(readFileSync(join(outDir, "run.json"), "utf-8"));
+    expect(runJson.judgeSampling).toEqual([
+      {
+        name: "rubricPanel",
+        temperature: 0,
+        repeats: 1,
+        judges: ["claude-sonnet-4-5", "openai/gpt-4o"],
+      },
+    ]);
+    expect(summary.config.judgeSampling?.[0]?.judges).toEqual([
+      "claude-sonnet-4-5",
+      "openai/gpt-4o",
+    ]);
+  });
+
+  test("A2 — single-judge graders record NO judges key (byte-identical entries)", async () => {
+    const outDir = newTempRoot();
+    const ir = narrowToAgent(lower(parseSpec(SPEC)));
+    const samples: Sample[] = [{ id: "q1", input: "hi", expected_output: "y" }];
+    const invoker = async () => ({ agentOutput: "anything", events: [] });
+
+    const summary = await runEval({
+      ir,
+      dataset: { name: "judged-single", samples: yieldSamples(samples) },
+      compiledGraders: [judgeGraderNoModel("rubricSingle")],
+      opts: { invoker, outDir },
+    });
+    const entry = summary.config.judgeSampling?.[0];
+    expect(entry).toEqual({ name: "rubricSingle", temperature: 0, repeats: 1 });
+    expect(entry !== undefined && "judges" in entry).toBe(false);
+  });
+
   test("per-grader judgeSpec.model overrides the run judgeModel", async () => {
     const outDir = newTempRoot();
     boundModels.length = 0;
@@ -195,5 +263,152 @@ describe("runEval — llm_judge resolution", () => {
 
     // model is undefined → createJudgeGrader called with `{}` (no model key).
     expect(boundModels).toEqual([undefined]);
+  });
+});
+
+// NEW-graders-2/3 — categorical dispatch + judge-target threading.
+describe("runEval — categorical rubrics + target (cluster C)", () => {
+  const CATEGORICAL_RUBRIC = {
+    kind: "categorical",
+    labels: [
+      { name: "good", score: 1, description: "acceptable" },
+      { name: "bad", score: 0, description: "unacceptable" },
+    ],
+    passing_labels: ["good"],
+  };
+
+  function categoricalGrader(name: string): CompiledGrader {
+    return {
+      name,
+      grader: async () => {
+        throw new Error("placeholder must be replaced");
+      },
+      weight: 1,
+      judgeSpec: { rubric: CATEGORICAL_RUBRIC } as never,
+    };
+  }
+
+  test("a categorical judgeSpec resolves through loadCategoricalRubric to the grader factory", async () => {
+    const outDir = newTempRoot();
+    boundRubrics.length = 0;
+    loadedRubrics.length = 0;
+    boundOpts.length = 0;
+    const ir = narrowToAgent(lower(parseSpec(SPEC)));
+    const samples: Sample[] = [{ id: "q1", input: "hi", expected_output: "y" }];
+    const invoker = async () => ({ agentOutput: "anything", events: [] });
+
+    const summary = await runEval({
+      ir,
+      dataset: { name: "judged-categorical", samples: yieldSamples(samples) },
+      compiledGraders: [categoricalGrader("labeler")],
+      opts: { invoker, outDir, judgeModel: "claude-judge-x" },
+    });
+
+    // The REAL loadCategoricalRubric validated it (defaults applied) and the
+    // grader factory received the categorical shape — never the scalar loader.
+    expect(loadedRubrics).toHaveLength(0);
+    expect(boundRubrics).toHaveLength(1);
+    expect((boundRubrics[0] as { kind?: string }).kind).toBe("categorical");
+    expect(boundOpts[0]?.model).toBe("claude-judge-x");
+    expect(summary.aggregates.passRate).toBe(1);
+    // judgeSampling still records the entry (defaults resolved, no target).
+    const runJson = JSON.parse(readFileSync(join(outDir, "run.json"), "utf-8"));
+    expect(runJson.judgeSampling).toEqual([{ name: "labeler", temperature: 0, repeats: 1 }]);
+  });
+
+  test("a malformed categorical rubric dies loudly at resolution", async () => {
+    const outDir = newTempRoot();
+    const ir = narrowToAgent(lower(parseSpec(SPEC)));
+    const samples: Sample[] = [{ id: "q1", input: "hi" }];
+    const invoker = async () => ({ agentOutput: "anything", events: [] });
+
+    const bad = categoricalGrader("broken");
+    await expect(
+      runEval({
+        ir,
+        dataset: { name: "judged-bad-categorical", samples: yieldSamples(samples) },
+        compiledGraders: [
+          {
+            ...bad,
+            judgeSpec: {
+              rubric: { ...CATEGORICAL_RUBRIC, passing_labels: ["nope"] },
+            } as never,
+          },
+        ],
+        opts: { invoker, outDir },
+      }),
+    ).rejects.toThrow(/not a declared label/);
+  });
+
+  test("G47 guard: categorical rubrics never join the calibrated-cut path", async () => {
+    const outDir = newTempRoot();
+    const ir = narrowToAgent(lower(parseSpec(SPEC)));
+    const samples: Sample[] = [{ id: "q1", input: "hi", expected_output: "y" }];
+    const invoker = async () => ({ agentOutput: "anything", events: [] });
+
+    const summary = await runEval({
+      ir,
+      dataset: { name: "judged-categorical-nocal", samples: yieldSamples(samples) },
+      compiledGraders: [categoricalGrader("labeler")],
+      opts: {
+        invoker,
+        outDir,
+        // A calibration file exists — a scalar cut-less rubric would consume
+        // it; the categorical one must NOT (its gate is label membership).
+        readCalibrationFile: () => JSON.stringify({ calibrations: { default: { minScore: 0.9 } } }),
+      },
+    });
+
+    expect(summary.config.judgeCalibration).toBeUndefined();
+    const runJson = JSON.parse(readFileSync(join(outDir, "run.json"), "utf-8"));
+    expect("judgeCalibration" in runJson).toBe(false);
+  });
+
+  test("NEW-graders-3 — target threads to the grader factory and rides judgeSampling", async () => {
+    const outDir = newTempRoot();
+    boundOpts.length = 0;
+    const ir = narrowToAgent(lower(parseSpec(SPEC)));
+    const samples: Sample[] = [{ id: "q1", input: "hi", expected_output: "y" }];
+    const invoker = async () => ({ agentOutput: "anything", events: [] });
+
+    const grader = judgeGraderNoModel("rubricTraj");
+    const summary = await runEval({
+      ir,
+      dataset: { name: "judged-target", samples: yieldSamples(samples) },
+      compiledGraders: [
+        {
+          ...grader,
+          judgeSpec: { ...(grader.judgeSpec as object), target: "transcript" } as never,
+        },
+      ],
+      opts: { invoker, outDir },
+    });
+
+    expect(boundOpts).toHaveLength(1);
+    expect(boundOpts[0]?.target).toBe("transcript");
+    const runJson = JSON.parse(readFileSync(join(outDir, "run.json"), "utf-8"));
+    expect(runJson.judgeSampling).toEqual([
+      { name: "rubricTraj", temperature: 0, repeats: 1, target: "transcript" },
+    ]);
+    expect(summary.config.judgeSampling?.[0]?.target).toBe("transcript");
+  });
+
+  test("NEW-graders-3 — default-target graders record NO target key (byte-identical)", async () => {
+    const outDir = newTempRoot();
+    boundOpts.length = 0;
+    const ir = narrowToAgent(lower(parseSpec(SPEC)));
+    const samples: Sample[] = [{ id: "q1", input: "hi", expected_output: "y" }];
+    const invoker = async () => ({ agentOutput: "anything", events: [] });
+
+    const summary = await runEval({
+      ir,
+      dataset: { name: "judged-no-target", samples: yieldSamples(samples) },
+      compiledGraders: [judgeGraderNoModel("rubricPlain")],
+      opts: { invoker, outDir },
+    });
+
+    expect(boundOpts[0] !== undefined && "target" in boundOpts[0]).toBe(false);
+    const entry = summary.config.judgeSampling?.[0];
+    expect(entry !== undefined && "target" in entry).toBe(false);
   });
 });

@@ -18,7 +18,11 @@
  * classifier + delimiter escaping like every other recall). No tools are
  * exposed to the exam session: the question is "can you answer from what the
  * wiki knows", graded by the spec's own graders — never "can you edit the
- * wiki mid-exam". Unlike `runEval`'s per-sample fabric isolation (§7.2),
+ * wiki mid-exam". The full graders.yaml grammar applies, `type: registry`
+ * included (A11): registry entries resolve against the same default
+ * registry `crewhaus eval` builds (the specialty packs + `.crewhaus/
+ * graders` plugins from the harness cwd, `opts:` parameterization and
+ * all). Unlike `runEval`'s per-sample fabric isolation (§7.2),
  * the exam deliberately reads the live wiki — an isolated empty wiki would
  * examine amnesia.
  *
@@ -32,7 +36,7 @@ import { join } from "node:path";
 import type { Sample } from "@crewhaus/eval-dataset";
 import { loadDataset } from "@crewhaus/eval-dataset";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
-import { createJudgeGrader, loadRubric } from "@crewhaus/eval-judge";
+import { createJudgeGrader, loadCategoricalRubric, loadRubric } from "@crewhaus/eval-judge";
 import type {
   ExamReport,
   ExamRunner,
@@ -44,10 +48,12 @@ import { wireWiki } from "@crewhaus/memory-service";
 import type { RunContext } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { warnUnconsumedCombinePolicy } from "./combine-warnings";
+import { defaultGraderRegistry, resolveRegistryGrader } from "./default-registry";
 import { RunnerError } from "./errors";
 import { runSample } from "./run-sample";
+import { detectSemanticFallback, formatSemanticFallbackWarning } from "./semantic-fallback";
 import { Semaphore } from "./semaphore";
-import type { AgentInvoker, GraderEntry, SampleResult } from "./types";
+import type { AgentInvoker, GraderEntry, GraderLookup, SampleResult } from "./types";
 
 /** Exam sessions run a couple at a time — an exam is an interactive,
  *  user-initiated pass, not a benchmark sweep. */
@@ -107,6 +113,15 @@ export type CreateExamRunnerOptions = {
   readonly thredz?: ThredzConnection | null;
   /** Judge model for `llm_judge` graders. Default: the harness model. */
   readonly judgeModel?: string;
+  /**
+   * A11 — resolves `type: registry` graders in `learning.exam.graders`.
+   * Absent (every production caller): the exam builds the SAME default
+   * registry `crewhaus eval` falls back to — the specialty packs plus
+   * `.crewhaus/graders` plugins discovered from the harness `cwd` —
+   * constructed lazily, only when the graders file actually carries a
+   * registry entry. Mirrors `RunEvalOptions.graderRegistry` exactly.
+   */
+  readonly graderRegistry?: GraderLookup;
   readonly concurrency?: number;
   /** Wiki lines recalled per question. Default 6 (§9 `wiki.recallK`). */
   readonly recallK?: number;
@@ -144,13 +159,40 @@ export function createExamRunner(opts: CreateExamRunnerOptions): ExamRunner {
     // `combine: weighted` — exactly like runEval.
     warnUnconsumedCombinePolicy(compiled);
     const combine = compiled.find((g) => g.combine !== undefined)?.combine;
+    // A11 — `type: registry` graders resolve exactly the way `crewhaus
+    // eval` resolves them (G14): an explicit registry wins wholesale, else
+    // the default one is built with the harness cwd as the
+    // `.crewhaus/graders` plugin discovery root. Constructed only when a
+    // registry entry exists, so pack imports stay off the common path.
+    let graderRegistry: GraderLookup | undefined = opts.graderRegistry;
+    if (graderRegistry === undefined && compiled.some((g) => g.registrySpec !== undefined)) {
+      graderRegistry = await defaultGraderRegistry({ cwd: opts.cwd });
+    }
     const graders: GraderEntry[] = compiled.map((g) => {
       if (g.judgeSpec) {
-        const rubric = loadRubric(g.judgeSpec.rubric);
         const model = g.judgeSpec.model ?? opts.judgeModel ?? opts.model;
+        // NEW-graders-2 — categorical rubrics dispatch exactly like runEval:
+        // label grader, no repeats/judges (parse-rejected), temperature +
+        // target thread as usual.
+        if (g.judgeSpec.rubric.kind === "categorical") {
+          const categoricalRubric = loadCategoricalRubric(g.judgeSpec.rubric);
+          const grader = createJudgeGrader(categoricalRubric, {
+            model,
+            ...(g.judgeSpec.temperature !== undefined
+              ? { temperature: g.judgeSpec.temperature }
+              : {}),
+            ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
+          });
+          return { name: g.name, grader, weight: g.weight };
+        }
+        const rubric = loadRubric(g.judgeSpec.rubric);
         // NEW-HUNT-2 — same rubric-level decoding threading as runEval.
+        // A2 — a declared `judges` panel overrides the single model.
+        // NEW-graders-3 — `target: transcript` judges the exam trajectory.
         const grader = createJudgeGrader(rubric, {
           model,
+          ...(g.judgeSpec.judges !== undefined ? { judges: g.judgeSpec.judges } : {}),
+          ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
           ...(g.judgeSpec.temperature !== undefined
             ? { temperature: g.judgeSpec.temperature }
             : {}),
@@ -158,16 +200,24 @@ export function createExamRunner(opts: CreateExamRunnerOptions): ExamRunner {
         });
         return { name: g.name, grader, weight: g.weight };
       }
-      // v0.3.0 final integration (PR 17 ∩ PR 19): `type: registry` graders
-      // resolve against RunEvalOptions.graderRegistry — a seam run_exam does
-      // not carry (the exam is invoked from inside a running harness, which
-      // has no grader registry to hand over). Reject LOUDLY at exam start,
-      // exactly like runEval does, instead of letting the compiled
-      // placeholder throw per-sample as confusing grader-infra noise.
+      // A11 (retiring the v0.3.0 PR 17 ∩ PR 19 rejection): registry
+      // graders now resolve through the same shared substitution
+      // `crewhaus eval` uses — packs, plugins, and `opts:` (NEW-HUNT-7)
+      // included — still loud at exam start on unknown names, never
+      // per-sample grader-infra noise.
       if (g.registrySpec) {
-        throw new RunnerError(
-          `exam: grader "${g.name}" is \`type: registry\` (→ "${g.registrySpec.grader}") — registry graders resolve via RunEvalOptions.graderRegistry under \`crewhaus eval\` and are not available to \`run_exam\`; use code/llm_judge graders in learning.exam.graders`,
-        );
+        if (graderRegistry === undefined) {
+          // Unreachable through the closure above — kept for parity with
+          // runEval's direct/partial-caller guard.
+          throw new RunnerError(
+            `exam: grader "${g.name}" resolves by registry name "${g.registrySpec.grader}" but no graderRegistry was available`,
+          );
+        }
+        return {
+          name: g.name,
+          grader: resolveRegistryGrader(graderRegistry, g.name, g.registrySpec),
+          weight: g.weight,
+        };
       }
       return { name: g.name, grader: g.grader, weight: g.weight };
     });
@@ -216,6 +266,14 @@ export function createExamRunner(opts: CreateExamRunnerOptions): ExamRunner {
         }
       }),
     );
+
+    // NEW-HUNT-5 — the exam grades with the same registry vocabulary as
+    // `crewhaus eval` now (A11), so the same run-level instrument-swap
+    // warning applies when semantic.similarity fell back to ROUGE-L.
+    const fallback = detectSemanticFallback(results);
+    if (fallback !== undefined) {
+      process.stderr.write(`${formatSemanticFallbackWarning(fallback)}\n`);
+    }
 
     const bySampleId = new Map(samples.map((s) => [s.id, s] as const));
     const outcomes: ExamSampleOutcome[] = results.map((r) => {

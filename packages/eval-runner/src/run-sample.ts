@@ -195,9 +195,19 @@ export async function runSample(args: {
     error === undefined &&
     perGrader.some((g) => g.abstained === true) &&
     perGrader.every((g) => g.abstained === true || g.passed);
+  // A2 — a high-entropy judge-panel vote (`needsReview` on a perGrader
+  // entry) flags the SAMPLE for human review without touching its verdict:
+  // the pass/fail is real (unlike abstention) and stays in the pass-rate
+  // denominator — the aggregates only list the sample in a separate
+  // needs-review bucket beside the abstained needs-human one. An abstained
+  // outcome wins over the flag (the sample already routes to needs-human).
+  const sampleNeedsReview =
+    error === undefined && !sampleAbstained && perGrader.some((g) => g.needsReview === true);
   const overall: GradeResult = sampleAbstained
     ? { ...combined, passed: false, score: 0, abstained: true }
-    : combined;
+    : sampleNeedsReview
+      ? { ...combined, needsReview: true }
+      : combined;
 
   // Loop contract 0.4 (Batch C, G59) — publish the AgentFlow `test_verdict`
   // feedback signal from the grader outcome. A distinct event kind (not a

@@ -147,25 +147,96 @@ describe("createExamRunner — grading + report (deterministic, no model)", () =
     );
   });
 
-  test("a `type: registry` grader is refused loudly at exam start (PR 17 ∩ PR 19)", async () => {
-    // Cross-branch seam pin (v0.3.0 final integration): registry graders
-    // resolve against RunEvalOptions.graderRegistry — a seam run_exam does
-    // not carry. The exam must reject them upfront with the eval-runner's
-    // loud-at-start behavior, never as per-sample grader-infra noise.
-    const { datasetPath } = writeExamFiles();
+  test("a `type: registry` grader resolves via the default registry (A11)", async () => {
+    // The v0.3.0 rejection is retired: registry entries in
+    // learning.exam.graders resolve exactly the way `crewhaus eval`
+    // resolves them — here nlg.rougeL from the packs, with NEW-HUNT-7
+    // `opts:` threading a non-default threshold into the construction.
+    const registryDatasetPath = join(tmp, "eval", "dataset-registry.jsonl");
+    mkdirSync(join(tmp, "eval"), { recursive: true });
+    writeFileSync(
+      registryDatasetPath,
+      `${JSON.stringify({ id: "q1", input: "define yield", expected_output: "dissolved coffee mass fraction" })}\n${JSON.stringify({ id: "q2", input: "tds range", expected_output: "the golden cup range" })}\n`,
+    );
     const registryGradersPath = join(tmp, "eval", "graders-registry.yaml");
     writeFileSync(
       registryGradersPath,
       `graders:
-  - name: reask
+  - name: overlap
     type: registry
-    grader: continuity.reAskRate
+    grader: nlg.rougeL
+    opts:
+      threshold: 0.9
+`,
+    );
+    const runner = createExamRunner(
+      runnerOpts({
+        // Echo the gold on q1, miss on q2 — rougeL at threshold 0.9 must
+        // split them.
+        invoker: async ({ sample }) => ({
+          agentOutput: sample.id === "q1" ? "dissolved coffee mass fraction" : "roughly 8-12%",
+        }),
+        outDir: join(tmp, "exam-registry"),
+      }),
+    );
+    const report = await runner({
+      datasetPath: registryDatasetPath,
+      gradersPath: registryGradersPath,
+    });
+    expect(report.total).toBe(2);
+    expect(report.passed).toBe(1);
+    const passedOutcome = report.outcomes.find((o) => o.passed);
+    expect(passedOutcome?.sampleId).toBe("q1");
+    expect(passedOutcome?.rationale).toMatch(/ROUGE-L/);
+  });
+
+  test("exam registry graders discover `.crewhaus/graders` plugins from the harness cwd (A11)", async () => {
+    const { datasetPath } = writeExamFiles();
+    const pluginRoot = join(tmp, ".crewhaus", "graders");
+    mkdirSync(join(pluginRoot, "custom"), { recursive: true });
+    writeFileSync(
+      join(pluginRoot, "custom", "index.ts"),
+      `export default {
+  name: "custom.examAlways",
+  grader: async () => ({ passed: true, score: 1, rationale: "exam plugin" }),
+};
+`,
+    );
+    const registryGradersPath = join(tmp, "eval", "graders-plugin.yaml");
+    writeFileSync(
+      registryGradersPath,
+      `graders:
+  - name: plugin_check
+    type: registry
+    grader: custom.examAlways
+`,
+    );
+    const runner = createExamRunner(
+      runnerOpts({
+        invoker: async () => ({ agentOutput: "x" }),
+        outDir: join(tmp, "exam-plugin"),
+      }),
+    );
+    const report = await runner({ datasetPath, gradersPath: registryGradersPath });
+    expect(report.passed).toBe(report.total);
+    expect(report.outcomes[0]?.rationale).toContain("exam plugin");
+  });
+
+  test("an unknown registry name still fails loudly at exam start (A11)", async () => {
+    const { datasetPath } = writeExamFiles();
+    const registryGradersPath = join(tmp, "eval", "graders-unknown.yaml");
+    writeFileSync(
+      registryGradersPath,
+      `graders:
+  - name: nope
+    type: registry
+    grader: no.suchGrader
 `,
     );
     const runner = createExamRunner(runnerOpts({ invoker: async () => ({ agentOutput: "x" }) }));
     expect(runner({ datasetPath, gradersPath: registryGradersPath })).rejects.toThrow(RunnerError);
     expect(runner({ datasetPath, gradersPath: registryGradersPath })).rejects.toThrow(
-      /type: registry.*not available to `run_exam`/,
+      /no grader registered as "no.suchGrader".*registered graders:/,
     );
   });
 

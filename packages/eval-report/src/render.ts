@@ -181,6 +181,23 @@ function needsHumanSection(a: EvalRunSummary["aggregates"]): string {
 </section>`;
 }
 
+/**
+ * A2 — the needs-review bucket: samples whose judge-panel vote nearly
+ * split (high normalized entropy). Their verdicts are REAL and still count
+ * in the pass rate — unlike the abstained needs-human bucket above — but a
+ * near-coin-flip vote deserves a human look.
+ */
+function needsReviewSection(a: EvalRunSummary["aggregates"]): string {
+  if (a.needsReview === undefined || a.needsReview === 0) return "";
+  const ids = (a.needsReviewSampleIds ?? []).map((id) => escapeHtml(id)).join(", ");
+  return `
+<section class="diff-section" id="needs-review">
+  <h2>Needs review (${a.needsReview})</h2>
+  <p class="meta">The judge panel nearly split on these samples (high vote entropy) — the recorded
+  verdicts still count in the pass rate, but deserve a human look: <span class="abstain">${ids}</span></p>
+</section>`;
+}
+
 function aggregateCards(s: EvalRunSummary): string {
   const a = s.aggregates;
   const cards = [
@@ -248,6 +265,31 @@ function aggregateCards(s: EvalRunSummary): string {
   }
   if (a.needsHuman !== undefined) {
     cards.push({ label: "Needs human", value: String(a.needsHuman) });
+  }
+  // A2 — high-entropy panel votes flagged for review (verdicts still count).
+  if (a.needsReview !== undefined) {
+    cards.push({ label: "Needs review", value: String(a.needsReview) });
+  }
+  // A9 — abstention-aware accuracy lens (calibration.abstentionAware pack).
+  if (a.calibration !== undefined) {
+    cards.push({ label: "Answer rate", value: `${(a.calibration.answerRate * 100).toFixed(1)}%` });
+    cards.push({
+      label: "Abstention rate",
+      value: `${(a.calibration.abstentionRate * 100).toFixed(1)}%`,
+    });
+    if (a.calibration.accuracyWhenAnswered !== undefined) {
+      cards.push({
+        label: "Accuracy when answered",
+        value: `${(a.calibration.accuracyWhenAnswered * 100).toFixed(1)}%`,
+      });
+    }
+  }
+  // A10 — cross-sample paraphrase consistency (consistency.paraphraseGroup).
+  if (a.paraphraseConsistency !== undefined) {
+    cards.push({
+      label: "Paraphrase consistency",
+      value: `${(a.paraphraseConsistency.meanConsistency * 100).toFixed(1)}% (${a.paraphraseConsistency.groupCount} groups)`,
+    });
   }
   return `<section class="aggregate">${cards
     .map(
@@ -480,7 +522,7 @@ export function renderReport(
   const body = `
 <h1>Eval run ${escapeHtml(s.runId)}</h1>
 <p class="meta">Started ${escapeHtml(s.startedAt)} · ended ${escapeHtml(s.endedAt)} · model ${escapeHtml(s.config.model)} · concurrency ${s.config.concurrency}${s.config.judgeModel ? ` · judge ${escapeHtml(s.config.judgeModel)}` : ""}${s.config.repeats !== undefined ? ` · repeats ${s.config.repeats}` : ""}</p>
-${calibrationNote}${aggregateCards(s)}${needsHumanSection(s.aggregates)}${s.slices !== undefined ? slicesSection(s.slices) : ""}${s.aggregates.criterionMeans !== undefined ? criterionSection(s.aggregates.criterionMeans) : ""}${opts.verdicts !== undefined ? triageSection(opts.verdicts) : ""}
+${calibrationNote}${aggregateCards(s)}${needsHumanSection(s.aggregates)}${needsReviewSection(s.aggregates)}${s.slices !== undefined ? slicesSection(s.slices) : ""}${s.aggregates.criterionMeans !== undefined ? criterionSection(s.aggregates.criterionMeans) : ""}${opts.verdicts !== undefined ? triageSection(opts.verdicts) : ""}
 <table data-sortable>
   <thead><tr>
     <th>Sample</th><th>Status</th><th>Score</th>${extraHeaders}<th>Turns</th><th>Latency</th><th>Tokens (in/out)</th><th>Drill</th>
@@ -581,12 +623,68 @@ export function renderDiffHtml(
       ? ""
       : `\n<p class="meta">Paired significance: ${escapeHtml(formatSignificanceLine(diff.significance))}</p>`;
 
+  // A1 — the pairwise-judging section (`--pairwise`): summary tallies plus
+  // per-sample order-swapped verdicts. Absent on offline diffs.
+  const pairwiseSection = diff.pairwise === undefined ? "" : renderPairwiseSection(diff.pairwise);
+
   const body = `
 <h1>Diff: ${escapeHtml(diff.prevRunId)} → ${escapeHtml(diff.newRunId)}</h1>
 <p class="meta">Prev pass rate: ${(prev.aggregates.passRate * 100).toFixed(1)}% · New pass rate: ${(next.aggregates.passRate * 100).toFixed(1)}% · Unchanged: ${diff.unchanged}</p>${significanceNote}
 ${section("Regressions (pass-rate dropped)", diff.regressions, "regression-row")}
 ${section("Recoveries (pass-rate rose)", diff.recoveries, "recovery-row")}
 ${section("Score shifts (|Δ| > 0.1)", diff.scoreShifts, "")}
-${sliceDeltaSection}`;
+${sliceDeltaSection}${pairwiseSection}`;
   return shell(`Diff ${diff.prevRunId} → ${diff.newRunId}`, body);
+}
+
+/**
+ * A1 — the pairwise head-to-head section of the diff report. A sample's
+ * consolidated verdict colors the row: NEW winning renders as a recovery
+ * (green), PREV winning as a regression (red), ties neutral. The two
+ * per-order verdicts are shown side by side so an order-inconsistent judge
+ * (position bias — consolidated to a tie) is visible at a glance.
+ */
+function renderPairwiseSection(p: NonNullable<ReportDiff["pairwise"]>): string {
+  const pct = (v: number): string => `${(v * 100).toFixed(1)}%`;
+  const verdictCell = (winner: "prev" | "new" | "tie"): string =>
+    winner === "new"
+      ? '<span class="pass">NEW</span>'
+      : winner === "prev"
+        ? '<span class="fail">PREV</span>'
+        : '<span class="na">TIE</span>';
+  const rows = p.samples
+    .map((s) => {
+      const cls =
+        s.verdict === "new" ? "recovery-row" : s.verdict === "prev" ? "regression-row" : "";
+      return `
+<tr class="${cls}">
+  <td>${escapeHtml(s.sampleId)}</td>
+  <td>${verdictCell(s.prevFirst.winner)}</td>
+  <td>${verdictCell(s.newFirst.winner)}</td>
+  <td>${s.agreed ? "✓" : "✗"}</td>
+  <td>${verdictCell(s.verdict)}</td>
+  <td>${escapeHtml(s.newFirst.rationale.slice(0, 200))}</td>
+</tr>`;
+    })
+    .join("");
+  const skipNote =
+    p.skippedErrored === undefined
+      ? ""
+      : `\n  <p class="meta">${p.skippedErrored} sample(s) skipped — errored on a side, no output to compare.</p>`;
+  return `
+<section class="diff-section" id="pairwise">
+  <h2>Pairwise judging (${p.samples.length})</h2>
+  <p class="meta">Judge ${escapeHtml(p.judgeModel)} · new wins ${p.newWins} · prev wins ${p.prevWins} · ties ${p.ties} ·
+  win-rate ${pct(p.winRate)} (new over prev, ties half) · order-consistency ${pct(p.orderConsistency)}.
+  Each sample is judged twice with the presentation order swapped; a disagreement between orders is
+  position bias and consolidates to a tie — a tie is never counted as a win.</p>${skipNote}
+  ${
+    p.samples.length === 0
+      ? '<p class="meta">none</p>'
+      : `<table>
+      <thead><tr><th>Sample</th><th>Prev-first</th><th>New-first</th><th>Agreed</th><th>Verdict</th><th>Rationale (new-first)</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`
+  }
+</section>`;
 }

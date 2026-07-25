@@ -3,6 +3,9 @@ import type { GradeResult, Grader } from "@crewhaus/eval-grader";
 import type { Event as TranscriptEvent } from "@crewhaus/event-log";
 import type { RunContext } from "@crewhaus/run-context";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
+import type { CalibrationAggregates } from "./calibration-abstention";
+import type { ParaphraseConsistencySummary } from "./paraphrase-consistency";
+import type { SemanticFallbackSummary } from "./semantic-fallback";
 
 /**
  * The agent-invocation contract. The runner provides a per-sample
@@ -250,12 +253,52 @@ export type EvalAggregates = {
    *  Present iff {@link needsHuman} is. */
   readonly needsHumanSampleIds?: ReadonlyArray<string>;
   /**
+   * A2 — count of samples flagged for human review by a high-entropy
+   * judge-panel vote split (`needsReview` on the overall grade). LISTED
+   * SEPARATELY from the abstained needs-human bucket: these verdicts are
+   * real and stay in the `passRate` denominator — the flag only says the
+   * panel nearly split on them. Present (with
+   * {@link needsReviewSampleIds}) only when at least one sample was
+   * flagged, so panel-free runs keep their exact pre-A2 shape.
+   */
+  readonly needsReview?: number;
+  /** A2 — the flagged samples' ids. Present iff {@link needsReview} is. */
+  readonly needsReviewSampleIds?: ReadonlyArray<string>;
+  /**
    * A12 — per-criterion mean judge scores, keyed grader name → criterion →
    * mean of the raw 1–5 criterion scores over the samples that grader
    * scored (abstained verdicts carry no breakdown and are excluded).
    * Present only when at least one grade carried a `detail` breakdown.
    */
   readonly criterionMeans?: Readonly<Record<string, Readonly<Record<string, number>>>>;
+  /**
+   * NEW-HUNT-5 — present iff at least one sample was graded by
+   * `semantic.similarity`'s ROUGE-L fallback (embedder error mid-run): the
+   * affected sample ids and the embedder error, mirrored by the runner's
+   * `[eval] warning:` stderr line. Such a run measured with a DIFFERENT
+   * instrument on those samples — treat its scores as not comparable with
+   * embedder-graded runs. Absent on fallback-free runs (byte-identical
+   * results.json) and on results persisted by older CLIs.
+   */
+  readonly semanticFallback?: SemanticFallbackSummary;
+  /**
+   * A9 — abstention-aware accuracy lens (answerRate / abstentionRate /
+   * accuracyWhenAnswered), present iff the run declared the
+   * `calibration.abstentionAware` registry pack and it classified at least
+   * one non-errored sample (detected via its stable rationale marker at
+   * aggregation). Absent otherwise — pack-less runs keep a byte-identical
+   * results.json — and on results persisted by older CLIs.
+   */
+  readonly calibration?: CalibrationAggregates;
+  /**
+   * A10 — cross-sample paraphrase-consistency lens, present iff the run
+   * declared the `consistency.paraphraseGroup` registry pack AND at least
+   * one sample carries a string `metadata.paraphrase_group`. Groups are
+   * scored on agreement with the group-majority verdict (singletons = 1.0
+   * — never NaN); absent groups = absent aggregate, keeping opted-out runs
+   * byte-identical.
+   */
+  readonly paraphraseConsistency?: ParaphraseConsistencySummary;
 };
 
 /**
@@ -369,6 +412,16 @@ export type EvalRunSummary = {
       readonly name: string;
       readonly temperature: number;
       readonly repeats: number;
+      /** A2 — the judge panel models when the grader declared `judges:`
+       *  (repeats then apply per panelist). Absent on single-judge
+       *  graders, keeping their entries byte-identical. */
+      readonly judges?: ReadonlyArray<string>;
+      /** NEW-graders-3 — recorded when the grader judged the run
+       *  `transcript` instead of the final output (measurement-instrument
+       *  identity: an output-judged and a transcript-judged run are not
+       *  the same measurement). Absent on default output-judged graders,
+       *  keeping their entries byte-identical. */
+      readonly target?: "output" | "transcript";
     }>;
     /** G47 — present when at least one `llm_judge` grader's gate came from
      *  the calibration file rather than a rubric-declared `passing_score`. */
@@ -390,6 +443,14 @@ export type EvalRunSummary = {
 export type GraderLookup = {
   lookup(name: string): Grader;
   list?(): ReadonlyArray<string>;
+  /**
+   * NEW-HUNT-7 — resolve a name WITH the graders.yaml entry's `opts`
+   * record. The default registry implements it (per-pack strict
+   * validation; untouched passthrough to plugin graders); a caller
+   * registry that omits it makes any `opts:`-carrying entry a loud
+   * RunnerError at run start — opts are never silently dropped.
+   */
+  resolveWithOpts?(name: string, opts: Readonly<Record<string, unknown>>): Grader;
 };
 
 export type RunEvalOptions = {

@@ -8,6 +8,7 @@ import { afterAll, describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Sample } from "@crewhaus/eval-dataset";
 import {
   type CalibrationPair,
   DEFAULT_JUDGE_CUT,
@@ -16,6 +17,8 @@ import {
   buildCalibrationCard,
   buildCalibrationFile,
   confusionAt,
+  dropDuplicateCandidates,
+  extractDatasetCalibrationPairs,
   flagDisagreements,
   judgeBias,
   normalizeJudge,
@@ -188,6 +191,132 @@ describe("buildCalibrationCard + file", () => {
   });
 });
 
+// -------- NEW-graders-1: dataset golden-verdict pairs --------
+
+function distilledSample(id: string, overrides: Partial<Sample> = {}): Sample {
+  return {
+    id,
+    input: `input for ${id}`,
+    expected_output: `rated answer for ${id}`,
+    metadata: {
+      sessionId: "sess_00000000000000aa",
+      turnNumber: 3,
+      source: "cli",
+      user_rating: 1,
+    },
+    ...overrides,
+  };
+}
+
+describe("extractDatasetCalibrationPairs (NEW-graders-1)", () => {
+  it("pairs a distilled positive: user_rating + the rated answer, keyed by the recorded refs", () => {
+    const got = extractDatasetCalibrationPairs([distilledSample("sess_00000000000000aa_t3")]);
+    expect(got.candidates).toHaveLength(1);
+    expect(got.candidates[0]).toEqual({
+      sessionId: "sess_00000000000000aa",
+      turnNumber: 3,
+      input: "input for sess_00000000000000aa_t3",
+      answer: "rated answer for sess_00000000000000aa_t3",
+      human: 1,
+    });
+    expect(got.skippedNoRating).toBe(0);
+    expect(got.skippedNoAnswer).toBe(0);
+    expect(got.skippedMisPaired).toBe(0);
+  });
+
+  it("falls back to the sample id / turn 0 when distill's refs are absent", () => {
+    const got = extractDatasetCalibrationPairs([
+      distilledSample("q1", { metadata: { user_rating: 0.25 } }),
+    ]);
+    expect(got.candidates[0]?.sessionId).toBe("q1");
+    expect(got.candidates[0]?.turnNumber).toBe(0);
+    expect(got.candidates[0]?.human).toBe(0.25);
+  });
+
+  it("skips samples without a numeric [0,1] user_rating (counted, never guessed)", () => {
+    const got = extractDatasetCalibrationPairs([
+      distilledSample("no-meta", { metadata: undefined }),
+      distilledSample("no-rating", { metadata: { sessionId: "sess_x" } }),
+      distilledSample("bad-type", { metadata: { user_rating: "up" } }),
+      distilledSample("out-of-range", { metadata: { user_rating: 5 } }),
+      distilledSample("nan", { metadata: { user_rating: Number.NaN } }),
+    ]);
+    expect(got.candidates).toHaveLength(0);
+    expect(got.skippedNoRating).toBe(5);
+  });
+
+  it("skips correction-carrying samples as mis-paired (the gold is not the rated answer)", () => {
+    const got = extractDatasetCalibrationPairs([
+      distilledSample("c1", {
+        metadata: { user_rating: 0, correction: "the better answer" },
+      }),
+    ]);
+    expect(got.candidates).toHaveLength(0);
+    expect(got.skippedMisPaired).toBe(1);
+  });
+
+  it("skips gold_refreshed samples as mis-paired (refresh-goldens replaced the gold)", () => {
+    const got = extractDatasetCalibrationPairs([
+      distilledSample("r1", {
+        metadata: {
+          user_rating: 1,
+          gold_refreshed: { from: "old", evidence: "correction", source: "sess_x#1" },
+        },
+      }),
+    ]);
+    expect(got.candidates).toHaveLength(0);
+    expect(got.skippedMisPaired).toBe(1);
+  });
+
+  it("skips rated samples without a non-empty answer to judge", () => {
+    const got = extractDatasetCalibrationPairs([
+      distilledSample("no-gold", { expected_output: undefined }),
+      distilledSample("blank-gold", { expected_output: "   " }),
+    ]);
+    expect(got.candidates).toHaveLength(0);
+    expect(got.skippedNoAnswer).toBe(2);
+  });
+});
+
+describe("dropDuplicateCandidates (NEW-graders-1)", () => {
+  it("drops candidates whose sessionId#turn is already paired from sessions", () => {
+    const extraction = extractDatasetCalibrationPairs([
+      distilledSample("dup"),
+      distilledSample("fresh", {
+        metadata: { sessionId: "sess_00000000000000bb", turnNumber: 1, user_rating: 0 },
+      }),
+    ]);
+    const { kept, duplicates } = dropDuplicateCandidates(
+      extraction.candidates,
+      new Set(["sess_00000000000000aa#3"]),
+    );
+    expect(duplicates).toBe(1);
+    expect(kept).toHaveLength(1);
+    expect(kept[0]?.sessionId).toBe("sess_00000000000000bb");
+  });
+
+  it("drops within-dataset duplicates of the same turn keep-first", () => {
+    // Two distill outputs of overlapping sessions merged into one dataset:
+    // the same sessionId#turnNumber appears under two different sample ids.
+    const extraction = extractDatasetCalibrationPairs([
+      distilledSample("first-copy"),
+      distilledSample("second-copy", {
+        metadata: { sessionId: "sess_00000000000000aa", turnNumber: 3, user_rating: 0 },
+      }),
+      distilledSample("fresh", {
+        metadata: { sessionId: "sess_00000000000000bb", turnNumber: 1, user_rating: 1 },
+      }),
+    ]);
+    const { kept, duplicates } = dropDuplicateCandidates(extraction.candidates, new Set());
+    expect(duplicates).toBe(1);
+    expect(kept).toHaveLength(2);
+    // Keep-first: the surviving aa#3 pair is the FIRST copy (human=1).
+    expect(kept[0]?.sessionId).toBe("sess_00000000000000aa");
+    expect(kept[0]?.human).toBe(1);
+    expect(kept[1]?.sessionId).toBe("sess_00000000000000bb");
+  });
+});
+
 // -------- CLI integration (offline — no judge credentials) --------
 
 const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
@@ -203,7 +332,10 @@ afterAll(() => {
   for (const dir of TMP_ROOTS) rmSync(dir, { recursive: true, force: true });
 });
 
-async function runCli(cliArgs: ReadonlyArray<string>, cwd: string): Promise<{ exitCode: number }> {
+async function runCli(
+  cliArgs: ReadonlyArray<string>,
+  cwd: string,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn([process.execPath, CLI_PATH, ...cliArgs], {
     cwd,
     // No ANTHROPIC creds → the judge path must exit cleanly, not fabricate.
@@ -212,7 +344,12 @@ async function runCli(cliArgs: ReadonlyArray<string>, cwd: string): Promise<{ ex
     stdout: "pipe",
     stderr: "pipe",
   });
-  return { exitCode: await proc.exited };
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { exitCode, stdout, stderr };
 }
 
 const CLI_SPEC = `name: helper
@@ -263,6 +400,176 @@ describe("crewhaus judge calibrate (CLI, no credentials)", () => {
     const root = newTempRoot();
     writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);
     mkdirSync(join(root, ".crewhaus", "sessions"), { recursive: true });
-    expect((await runCli(["judge", "calibrate"], root)).exitCode).toBe(1);
+    const got = await runCli(["judge", "calibrate"], root);
+    expect(got.exitCode).toBe(1);
+    expect(got.stderr).toContain("no rated turns");
+  });
+
+  // -------- NEW-graders-1: --dataset (offline halves) --------
+
+  it("documents the --dataset golden-verdict contract in help", async () => {
+    const got = await runCli(["judge", "calibrate", "--help"], newTempRoot());
+    expect(got.exitCode).toBe(0);
+    expect(got.stdout).toContain("--dataset");
+    expect(got.stdout).toContain("metadata.user_rating");
+    expect(got.stdout).toContain("gold_refreshed");
+  });
+
+  it("dies loudly (contract explained) when --dataset yields zero usable pairs", async () => {
+    const root = newTempRoot();
+    writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);
+    mkdirSync(join(root, ".crewhaus", "sessions"), { recursive: true });
+    // A dataset with samples but no user_rating metadata — nothing pairs.
+    writeFileSync(
+      join(root, "labeled.jsonl"),
+      `${JSON.stringify({ id: "q1", input: "hi", expected_output: "hello" })}\n`,
+    );
+    const got = await runCli(["judge", "calibrate", "--dataset", "labeled.jsonl"], root);
+    expect(got.exitCode).toBe(1);
+    expect(got.stderr).toContain("yielded no calibration pairs");
+    expect(got.stderr).toContain("metadata.user_rating");
+    expect(got.stderr).toContain("1 unrated");
+  });
+
+  it("accepts --dataset pairs even with zero session ratings, then stops at credentials", async () => {
+    const root = newTempRoot();
+    writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);
+    mkdirSync(join(root, ".crewhaus", "sessions"), { recursive: true });
+    // A distill-shaped sample: user_rating + the rated answer as the gold.
+    writeFileSync(
+      join(root, "labeled.jsonl"),
+      `${JSON.stringify({
+        id: "sess_00000000000000aa_t1",
+        input: "summarize this",
+        expected_output: "a fine summary",
+        metadata: { sessionId: "sess_00000000000000aa", turnNumber: 1, user_rating: 1 },
+      })}\n`,
+    );
+    const got = await runCli(["judge", "calibrate", "--dataset", "labeled.jsonl"], root);
+    // Past the pairing (no "no rated turns", no contract die) — the judge
+    // credential gate is what stops it, proving the dataset pairs counted.
+    expect(got.exitCode).toBe(1);
+    expect(got.stderr).not.toContain("no rated turns");
+    expect(got.stderr).not.toContain("yielded no calibration pairs");
+    expect(got.stderr).toContain("judge calibrate needs a judge model");
+  });
+
+  it("dies with the dataset error when --dataset names a missing file", async () => {
+    const root = newTempRoot();
+    writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);
+    mkdirSync(join(root, ".crewhaus", "sessions"), { recursive: true });
+    const got = await runCli(["judge", "calibrate", "--dataset", "missing.jsonl"], root);
+    expect(got.exitCode).toBe(1);
+    expect(got.stderr).toContain('--dataset "missing.jsonl" unusable');
+  });
+
+  it("mis-paired-only datasets die with the mis-paired count", async () => {
+    const root = newTempRoot();
+    writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);
+    mkdirSync(join(root, ".crewhaus", "sessions"), { recursive: true });
+    writeFileSync(
+      join(root, "labeled.jsonl"),
+      `${JSON.stringify({
+        id: "q1",
+        input: "hi",
+        expected_output: "the corrected answer",
+        metadata: { user_rating: 0, correction: "the corrected answer" },
+      })}\n`,
+    );
+    const got = await runCli(["judge", "calibrate", "--dataset", "labeled.jsonl"], root);
+    expect(got.exitCode).toBe(1);
+    expect(got.stderr).toContain("1 mis-paired");
+  });
+});
+
+// -------- NEW-graders-2 interplay: categorical rubrics never calibrate --------
+
+describe("crewhaus judge calibrate × categorical graders (NEW-graders-2)", () => {
+  /** A root with one rated turn so the flow reaches the graders gate; the
+   *  `local/` judge model bypasses the credential gate without env vars
+   *  (loopback endpoints need none) — and for the mixed case, every judge
+   *  call then fails fast on the unreachable port, so the run stays
+   *  offline + deterministic. */
+  function ratedRoot(): string {
+    const root = newTempRoot();
+    writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);
+    const sessionsDir = join(root, ".crewhaus", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    const lines = [
+      JSON.stringify({ kind: "user_message", payload: { content: "summarize this" } }),
+      JSON.stringify({
+        kind: "assistant_message",
+        payload: { content: [{ type: "text", text: "a summary" }] },
+      }),
+      JSON.stringify({
+        kind: "user_feedback",
+        payload: {
+          schemaVersion: 1,
+          id: "fb_1",
+          sessionId: "sess_00000000000000e1",
+          turnNumber: 1,
+          modality: "binary",
+          rating: { thumbs: "up" },
+          source: "cli",
+          ts: "2026-07-02T00:00:00.000Z",
+        },
+      }),
+    ];
+    writeFileSync(join(sessionsDir, "sess_00000000000000e1.jsonl"), `${lines.join("\n")}\n`);
+    return root;
+  }
+
+  const DEAD_LOCAL_JUDGE = "local/stub@http://127.0.0.1:9";
+
+  const CATEGORICAL_ENTRY = `  - name: labeler
+    type: llm_judge
+    rubric:
+      kind: categorical
+      labels:
+        - name: good
+          score: 1
+          description: fine
+        - name: bad
+          score: 0
+          description: not fine
+      passing_labels: [good]
+`;
+
+  const SCALAR_ENTRY = `  - name: quality
+    type: llm_judge
+    rubric:
+      criteria:
+        - name: c1
+          description: ok
+          anchors: { 1: bad, 2: meh, 3: ok, 4: good, 5: great }
+`;
+
+  it("dies pointedly when --graders holds ONLY categorical llm_judge graders", async () => {
+    const root = ratedRoot();
+    writeFileSync(join(root, "graders.yaml"), `graders:\n${CATEGORICAL_ENTRY}`);
+    const got = await runCli(
+      ["judge", "calibrate", "--graders", "graders.yaml", "--model", DEAD_LOCAL_JUDGE],
+      root,
+    );
+    expect(got.exitCode).toBe(1);
+    expect(got.stderr).toContain("has only categorical llm_judge grader");
+    expect(got.stderr).toContain("scalar passing cut");
+  });
+
+  it("a mixed graders.yaml calibrates the scalar entry — categorical-first is skipped", async () => {
+    const root = ratedRoot();
+    // Categorical FIRST: selection must skip it and pick the scalar entry,
+    // not die and not calibrate the label-gated rubric.
+    writeFileSync(join(root, "graders.yaml"), `graders:\n${CATEGORICAL_ENTRY}${SCALAR_ENTRY}`);
+    const got = await runCli(
+      ["judge", "calibrate", "--graders", "graders.yaml", "--model", DEAD_LOCAL_JUDGE],
+      root,
+    );
+    expect(got.exitCode).toBe(1);
+    // Past the graders gate (proving a scalar rubric was selected) …
+    expect(got.stderr).not.toContain("has only categorical");
+    expect(got.stderr).not.toContain("no llm_judge grader to calibrate");
+    // … and the run then stops at the dead judge endpoint, not earlier.
+    expect(got.stderr).toContain("produced no usable scores");
   });
 });

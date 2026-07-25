@@ -224,6 +224,199 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   force are recorded on `run.json`/`results.json` (`sampleTimeoutMs`,
   `budgetUsd`, additive). Specs without the blocks and runs without the
   flags behave byte-identically to before.
+Paste under `## [Unreleased]` in the repo CHANGELOG.md (sections merge with
+what is already there).
+
+
+
+- **`llm_judge` panels: `judges: [model, ...]` fans out a multi-model judge
+  panel with vote-entropy review routing.** A graders.yaml `llm_judge` entry
+  may now list a judge PANEL — one temperature-pinned call per listed model
+  (any model-router string; the list overrides `model:` and `--judge-model`)
+  — and the grade becomes the panel's fold: MEDIAN score over the
+  non-abstaining panelists, pass by STRICT MAJORITY of their pass votes (an
+  even panel's tie conservatively fails), per-panelist scores plus the
+  normalized entropy of the pass/fail vote split recorded on the grade
+  (`panel`), and a strict majority of abstaining panelists abstains the
+  whole verdict exactly like `repeats`. A high-entropy vote (normalized
+  entropy > 0.8 — a 2–1 or 3–2 split; 4–1 stays quiet) flags the sample
+  `needs_review`: the verdict still COUNTS (pass-rate denominator
+  unchanged, unlike abstention), but the run lists it in a NEW
+  `needsReview`/`needsReviewSampleIds` results.json bucket — rendered as
+  its own report section and card — separate from the abstained
+  needs-human one. `judges` composes with `repeats` the simple way: when
+  both are declared, repeats apply PER PANELIST (each panelist's own
+  verdict is its k-call median; k×m calls total), and the panel roster
+  rides the `judgeSampling` reproducibility manifest. Single-judge configs
+  are byte-identical. Spec-declared exams honor panels too.
+- **Categorical judge rubrics — `llm_judge` rubrics may declare
+  `kind: categorical` with `labels` + `passing_labels` (OpenAI
+  Fact/ClosedQA classify parity).** Instead of forcing every judgment onto
+  the 1–5 scalar anchors, a categorical rubric lists at least two labels
+  (`{name, score (0..1), description}`) and the judge picks EXACTLY ONE via
+  a forced `submit_label` tool call (the sibling of `submit_score` — scalar
+  judging is byte-identical): `passed` = the chosen label is in
+  `passing_labels`, `score` = the label's declared 0..1 score, no 1–5
+  projection. Label scores and the passing set are deliberately hidden from
+  the judge (classify, don't anchor); judge abstention and the pinned judge
+  temperature apply unchanged, and both `crewhaus eval` and the
+  competency exam (`run_exam`) resolve the new shape. Guard rails: the
+  rubric schema is strict (a leftover scalar `criteria:` block on a
+  half-migrated rubric is a loud parse error, and neither union branch can
+  silently absorb a confused rubric), duplicate/undeclared labels are
+  rejected, categorical rubrics never consume the calibrated passing-score
+  cut from `judge calibrate --apply` (their gate is label membership), and
+  `repeats`/`judges` panels are rejected at parse with a categorical
+  rubric — there is no label-vote fold yet, and a silently-single-call
+  panel would be worse than an error.
+- **Trajectory-aware judging — `llm_judge` gains `target: output |
+  transcript` (default `output`, byte-identical).** `target: transcript`
+  feeds the judge the run's TRANSCRIPT — turns, tool calls, tool results,
+  and errors — rendered as a bounded, sentinel-wrapped digest instead of
+  just the final message, so rubrics can finally grade process quality:
+  wasted or dangerous tool use, silent mid-run failures, unrecovered
+  errors. The digest contract is documented most-recent-turns-win: whole
+  events are kept from the end of the transcript within a ~24k-char budget
+  (dropped history announced by a `[transcript truncated: …]` header), each
+  event clipped to 2k chars tail-first so one enormous tool result cannot
+  evict the run, and a transcript-less RunResult degrades to the final
+  output behind an explicit `(no transcript recorded)` marker. Composes
+  with panels, repeats, and categorical rubrics; the effective target is
+  recorded per grader in the `judgeSampling` reproducibility manifest —
+  an output-judged and a transcript-judged run are different instruments.
+- **`type: registry` graders take `opts:` — pack thresholds and wiring are
+  finally tunable from graders.yaml.** A registry entry may now carry an
+  `opts:` record threaded into the named pack's constructor by the default
+  registry: `nlg.*` accept `threshold`/`reference`/`lowercase` (`nlg.meteor`
+  adds `alpha`/`beta`/`gamma`), `semantic.similarity` accepts `embedder` (a
+  `createEmbedder` model spec that overrides `CREWHAUS_EVAL_EMBEDDER`),
+  `threshold`, `reference`, `disableFallback`, and `fallbackThreshold`,
+  `multimodal.imageSimilarity` accepts `threshold`/`hashSize`, and
+  `safety.piiLeak` accepts `threshold`. Every pack validates its opts
+  against its own STRICT schema at run start — an unknown or ill-typed key
+  is a loud error naming the accepted vocabulary, never a silently-defaulted
+  grade — and registered names with no YAML-settable construction
+  (`twelve.*`, `continuity.*`, the classifier/OCR/STT wiring throwers)
+  reject all opts, pointing at the plugin override path.
+  `.crewhaus/graders` plugin graders (pack-name overrides included) receive
+  the record UNTOUCHED as an optional third grader argument —
+  `(sample, run, opts?)` is the documented plugin contract. A caller-built
+  registry without the new `resolveWithOpts` seam rejects opts-carrying
+  entries loudly instead of dropping them. STRICTNESS CHANGE: `registry`
+  entries are now strict like `llm_judge` — a typoed sibling key
+  (`options:`, `opt:`) fails at parse instead of being silently stripped.
+- **Spec-declared exams accept `type: registry` graders.** `run_exam` no
+  longer rejects registry entries in `learning.exam.graders`: it builds the
+  SAME default registry `crewhaus eval` falls back to — six specialty packs
+  plus `.crewhaus/graders` plugins discovered from the harness cwd, `opts:`
+  parameterization included — so a Thredz expert exam can grade with
+  `nlg.rougeL`, `semantic.similarity`, or the operator's own plugin
+  graders. Unknown names still fail loudly at exam start, never as
+  per-sample grader-infra noise.
+- **New registry pack `calibration.abstentionAware` — wrong and
+  declined-to-answer are finally different verdicts (SimpleQA-style).**
+  Classifies each sample answered-correct / answered-wrong / not-attempted:
+  empty/whitespace outputs and explicit declines (a curated, conservative
+  decline-opener heuristic — apology prefixes stripped, capped at 300 chars,
+  and the decline must be terminal: "I'm not sure, but it's Paris." and
+  other hedged-but-substantive answers count as attempts) are
+  not-attempted; answered samples grade against `expected_output` under
+  `opts: { mode: exact | contains, caseInsensitive }`, and an ANSWERED
+  sample with no gold is a loud grader error, never an invented verdict.
+  Per-sample grades stay conservative (only answered-correct passes); the
+  abstention-aware lens lands in results.json as the additive
+  `aggregates.calibration` block — answerRate, abstentionRate, and
+  accuracyWhenAnswered (absent when nothing was answered — never NaN) — so
+  a well-calibrated agent that abstains on unknowns no longer grades
+  identically to a confident hallucinator. Rendered as guarded cards in the
+  HTML report; pack-less runs keep a byte-identical results.json.
+- **New registry pack `consistency.paraphraseGroup` — the paraphrase
+  variants `dataset synthesize` generates finally get measured.**
+  `dataset synthesize` now stamps `metadata.paraphrase_group` (the parent
+  sample's id) on every paraphrase variant — template and model paraphrases
+  of the same parent share the group; truncate/ambiguate/inject variants
+  deliberately change the question and stay group-less. Hand-stamped
+  datasets work identically; datasets synthesized before this release carry
+  no groups (re-synthesize or stamp the key to opt in). Per sample the
+  grader is a vacuous pass (declaring it is the opt-in); at
+  aggregation, samples sharing a string `metadata.paraphrase_group` are
+  scored on verdict consistency — the fraction of the group's usable
+  verdicts (errored and abstained samples excluded) agreeing with the group
+  majority; singleton groups read 1.0 (never NaN), even splits 0.5. Emitted
+  additively as `aggregates.paraphraseConsistency`
+  (`consistencyByGroup` + `meanConsistency` + `groupCount`) and a guarded
+  report card; absent groups = absent aggregate, and lineage metadata alone
+  never conjures the block — grading stays opt-in. Note the pack's vacuous
+  per-sample pass contributes a constant score 1, so meanScore (and a
+  `combine: weighted` combined score) shifts upward the moment the pack is
+  declared — passRate under `all`/`any` is unaffected, and the gradersHash
+  lineage checks (baseline warning + `eval-report diff` instrument
+  mismatch) keep cross-run comparisons honest. Both packs ride
+  `aggregate()`'s documented cross-sample post-run seam (stable rationale
+  markers, the semantic-fallback detection contract), so no per-sample
+  grader API changed.
+- **`crewhaus graders test` — meta-eval your grader suite against labeled
+  golden verdicts.** `graders test --graders <g.yaml> --golden
+  <verdicts.jsonl> [--judge-model <m>] [--min-agreement F]` replays EVERY
+  grader in the config over recorded, human-adjudicated outputs. Each
+  golden line is strict JSONL — `{id, input, agent_output, expected_passed,
+  expected_score?}` (expected_score normalized 0..1; stray keys and
+  duplicate ids are loud, line-numbered errors). Deterministic and registry
+  graders (pack `opts` included) replay credential-free; `llm_judge`
+  graders — panels, categorical rubrics, temperature/repeats and all —
+  need visible judge credentials and are SKIPPED with a clear notice
+  without them (the rest still test); `target: transcript` judges always
+  skip (golden verdicts carry only the final output). Per tested grader
+  the report shows agreement rate and Cohen's kappa vs `expected_passed`,
+  false-positive/false-negative counts with up to 5 exemplar ids each,
+  abstained/error counts (excluded from the agreement denominator), and
+  the mean absolute score error when `expected_score` is present.
+  `--min-agreement F` exits non-zero when any TESTED grader falls below
+  the floor — the CI gate for rubric edits, usable exactly like
+  `eval --gate`. Judge rubrics test at their declared `passing_score`
+  (default 3/5); the `judge calibrate --apply` overlay is deliberately not
+  applied — the meta-eval measures the graders file as written.
+- **`crewhaus eval-report diff <prev> <new> --pairwise [--judge-model m]` —
+  order-swap-controlled head-to-head judging of two runs.** The strongest
+  instrument for "which spec version writes better answers": for every
+  shared sample, the judge compares the two runs' outputs TWICE with the
+  presentation order swapped (fresh injection sentinels wrapping the
+  input and BOTH outputs on each call; forced `submit_comparison` tool
+  with a strict a/b/tie schema; temperature pinned 0), records win/loss/
+  tie per order plus agreement-across-orders, and reports the NEW side's
+  win-rate (ties counted half) with an order-consistency figure. A verdict
+  that flips with the order is position bias by construction and
+  consolidates to a tie — a tie is never counted a win. Results land
+  ADDITIVELY in diff.json (`pairwise`), the diff report (a per-sample
+  verdict table), and a stdout summary block; samples errored on a side
+  are skipped and counted. Opt-in: 2 judge calls per shared sample, so the
+  flag requires visible judge credentials and dies with a clear message
+  without them — the offline deterministic diff (and its byte-identical
+  diff.json) stays the default. Sample inputs are recovered from the runs'
+  recorded per-sample transcripts, so the judge sees what the outputs were
+  answering.
+- **`crewhaus graders card` — the rubric card.** Renders a graders.yaml as a
+  markdown measurement-instrument card: every grader with its type, opts, and
+  thresholds; every `llm_judge` rubric with criteria, anchors or labels,
+  passing cut, panel/repeats/temperature/target; and the config's
+  `gradersHash` (the same identity the run history and baselines record).
+  Default stdout; `-o` writes a file.
+- **`crewhaus eval history|baseline|diff` now work** as aliases delegating to
+  the `eval-report` implementations (a one-line notice names the canonical
+  verb; flags pass through; a spec file literally named `history.yaml` still
+  runs the eval path).
+- **The judge temperature pin now reaches every provider.** `adapter-openai`,
+  `adapter-gemini`, and `adapter-bedrock` map `ProviderRequest.temperature`
+  (OpenAI drops it for reasoning models that reject it; Bedrock maps it onto
+  Converse's `inferenceConfig`), matching the anthropic adapter — so
+  non-Anthropic judges are temperature-pinned too.
+- **watchme judgments can abstain.** `watchme report`'s judge tool accepts the
+  abstain/confidence verdict; an abstained turn is never persisted as a
+  judgment and is routed to human review instead of counting as a failure.
+- **`safety.toxicity` / `safety.bias` and the multimodal OCR/STT graders now
+  print the exact wiring recipe.** Their needs-wiring errors name the
+  registry `opts` and `.crewhaus/graders` plugin contract to use, and the
+  pack doc comments document the classifier/ocr/stt plugin interface.
 
 ### Fixed
 
@@ -443,6 +636,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but never fails a strict build; remediable codes (`accepted-but-unwired`,
   `edge-unsafe-tool`) still escalate, and `compile --help` now lists all
   three codes.
+- **`semantic.similarity`'s silent ROUGE-L fallback is now loud at run
+  level.** When the embedder errors (quota, network, missing key) the
+  grader still degrades per sample to a ROUGE-L verdict with the rationale
+  prefix it always carried — but the run now ALSO reports the instrument
+  swap: results.json gains an additive `aggregates.semanticFallback`
+  block ({sampleCount, sampleIds, embedderError}) and the runner prints
+  `[eval] warning: N sample(s) graded by ROUGE-L fallback …` on stderr,
+  from `runEval` itself so `crewhaus eval`, compiled target-eval bundles,
+  and exams surface it identically. Scores from such a run are not
+  comparable with embedder-graded runs; `opts: { disableFallback: true }`
+  on the graders.yaml entry turns embedder errors into loud grader
+  failures instead (previously the opt-out was code-API-only).
+- **`judge calibrate --dataset` is now real — the documented flag was
+  silently ignored.** The flag was declared and shown in help but never
+  read: calibration always used ambient session ratings regardless of what
+  you passed. It now ADDS calibration pairs from the golden verdicts a
+  distilled dataset carries, combined with the session-ratings pairs
+  (which stay the default path). The contract is exactly what `crewhaus
+  distill` records: a sample pairs when `metadata.user_rating` is a number
+  in [0,1] AND `expected_output` is the non-empty answer that rating was
+  placed on; samples whose gold is NOT the rated answer are skipped as
+  mis-paired (`metadata.correction` — the gold is the human's correction —
+  and `metadata.gold_refreshed` — `dataset refresh-goldens` replaced the
+  gold after the rating), and samples already paired from the scanned
+  sessions are dropped as duplicates. A `--dataset` that yields zero
+  usable pairs dies loudly with the contract spelled out (parse, don't
+  ignore); registry refs resolve train+dev on a bare ref and the locked
+  test split stays locked. Also: with a `--graders` file whose only
+  `llm_judge` entries are categorical, calibrate now explains that a
+  label-gated rubric has no scalar cut to calibrate instead of failing
+  with a confusing rubric-shape error.
 
 ## [0.4.0] - 2026-07-18
 

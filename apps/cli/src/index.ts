@@ -57,10 +57,12 @@ import {
   optimizeSpec,
 } from "@crewhaus/eval-optimizer-orchestrator";
 import {
+  type LoadedRun,
   type RunIndexEntry,
   buildMatrix,
   diffInstrumentWarnings,
   diffReports,
+  formatPairwiseLines,
   formatSignificanceLine,
   formatSliceDeltaLines,
   formatUsd,
@@ -486,6 +488,14 @@ import {
 // calibration notes), in a side-effect-free module so all of it is
 // unit-testable (this entry file runs an argv switch on import).
 import { evalRunOutputLines, fitnessScore, graderRegistryForCompiled } from "./eval-output";
+// A1 — `eval-report diff --pairwise`: credential gate + the order-swapped
+// judging loop, in a side-effect-free module so both are unit-testable
+// with an injected stub adapter.
+import {
+  judgeRunsPairwise,
+  pairwiseCredentialError,
+  resolvePairwiseJudgeModel,
+} from "./eval-pairwise";
 // Item 30 — model-drift sentinel comparison logic, in a side-effect-free
 // module so it is unit-testable (this entry file runs an argv switch on
 // import). The fresh run + baseline load happen in index.ts; this decides drift.
@@ -574,6 +584,11 @@ import {
   scaffoldWorkflowFile,
   specIsDirty,
 } from "./flywheel";
+// NEW-HUNT-11 — `crewhaus graders card`: render the graders.yaml as the
+// deterministic markdown rubric card (the measurement-instrument
+// documentation artifact). Side-effect-free module; this entry file parses
+// flags, computes the run-history gradersHash, and does the file IO.
+import { renderGradersCard } from "./graders-card";
 // Item 4 — `crewhaus graders suggest`: deterministic failure-rationale
 // clustering + draft grader suites (plus the pure halves of the
 // model-drafted llm_judge rubric), in a side-effect-free module so it is
@@ -598,6 +613,22 @@ import {
   parseRunsFlag,
   renderSuggestedGradersYaml,
 } from "./graders-suggest";
+// E48 — `crewhaus graders test`: meta-eval every grader in a graders.yaml
+// against a labeled golden-verdict set (strict line-numbered parsing, the
+// runEval-mirroring resolution with judge credential/transcript skips, the
+// per-grader agreement/kappa/FP-FN statistics, and the --min-agreement
+// gate), in a side-effect-free module so all of it is unit-testable (this
+// entry file runs an argv switch on import).
+import {
+  type GraderTestReport,
+  GradersTestError,
+  belowFloor,
+  parseGoldenVerdicts,
+  renderGradersTestReport,
+  replayGraderOnGoldens,
+  resolveTestGraders,
+  summarizeGraderTest,
+} from "./graders-test";
 // Item 32 — incident bundle assembly (trigger classification, audit-window
 // join, cost summary, eval-report-styled render), in a side-effect-free module
 // so it is unit-testable (this entry file runs an argv switch on import).
@@ -642,9 +673,12 @@ import {
 import {
   type CalibrationPair,
   DEFAULT_JUDGE_CUT,
+  type DatasetPairCandidate,
   type JudgeCalibrationFile,
   buildCalibrationCard,
   buildCalibrationFile,
+  dropDuplicateCandidates,
+  extractDatasetCalibrationPairs,
   renderCalibrationCard,
 } from "./judge-calibrate";
 // AUTOMATION-OPPORTUNITIES.md item 52 — `crewhaus justification calibrate` +
@@ -1484,6 +1518,36 @@ const GRADERS_SUGGEST_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// E48 — `crewhaus graders test`: meta-eval every grader in a graders.yaml
+// against a labeled golden-verdict JSONL (agreement/kappa/FP-FN per grader).
+const GRADERS_TEST_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // The graders.yaml whose suite to meta-eval (required).
+    { name: "graders", takesValue: true },
+    // The golden verdicts JSONL: {id, input, agent_output, expected_passed,
+    // expected_score?} per line, strict (required).
+    { name: "golden", takesValue: true },
+    // Judge model for llm_judge entries without their own model:/judges:
+    // (model-router grammar); default claude-sonnet-4-5.
+    { name: "judge-model", takesValue: true },
+    // Exit non-zero when any TESTED grader's agreement rate falls below F.
+    { name: "min-agreement", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// NEW-HUNT-11 — `crewhaus graders card`: render a graders.yaml as the
+// deterministic markdown rubric card (stdout by default, -o writes a file).
+const GRADERS_CARD_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // The graders.yaml to document (required).
+    { name: "graders", takesValue: true },
+    // Write the card to a file instead of stdout.
+    { name: "out", short: "o", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 const DOCTOR_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "philosophy-alignment", takesValue: false },
@@ -1863,6 +1927,10 @@ const EVAL_REPORT_SCHEMA: ParseArgsSchema = {
     // C29 — pins `diff`'s Monte Carlo significance draw + bootstrap CI
     // (defaults to a fixed seed, so unseeded diffs are still deterministic).
     { name: "seed", takesValue: true },
+    // A1 — opt-in head-to-head judging of the two runs' outputs (2 judge
+    // calls per shared sample, order swapped; requires judge credentials).
+    { name: "pairwise", takesValue: false },
+    { name: "judge-model", takesValue: true },
     // `history` / `baseline show` filters.
     { name: "spec", takesValue: true },
     { name: "dataset", takesValue: true },
@@ -2633,6 +2701,9 @@ function usageText(): string {
     "  eval-report baseline show            print pinned baselines (.crewhaus/evals/baselines.json)",
     "       [--spec <name>] [--dataset <name>]",
     "  eval-report baseline set <runId>     pin a recorded run as its (spec, dataset) baseline",
+    "  eval history|baseline|diff ...       working aliases for the eval-report verbs above (E52):",
+    "                                       a stderr notice names the canonical verb, flags pass",
+    "                                       through; a spec file named history.yaml still runs",
     "  optimize <spec.yaml> --dataset <data> --graders <graders.yaml>",
     "       (--dataset also accepts registry:<name>[@version][#split])",
     "       [--mutator rule-based|claude] [--iterations N] [--seed N]",
@@ -2670,6 +2741,18 @@ function usageText(): string {
     "       [--min-score F] [--force]       into themes; drafts deterministic graders per theme",
     "                                       (+ an llm_judge rubric with --model/credentials) into",
     "                                       a REVIEW file — never auto-applied",
+    "  graders test --graders <g.yaml>      meta-eval every grader against labeled golden verdicts",
+    "       --golden <verdicts.jsonl>       (E48): per-line {id, input, agent_output, expected_passed,",
+    "       [--judge-model <m>]             expected_score?}; deterministic graders replay credential-",
+    "       [--min-agreement F]             free, judges skip loudly without credentials; reports",
+    "                                       agreement/kappa/FP+FN exemplars per grader; exits non-zero",
+    "                                       when any TESTED grader falls below --min-agreement",
+    "  graders card --graders <g.yaml>      render the measurement-instrument RUBRIC CARD as markdown",
+    "       [-o <file>]                     (NEW-HUNT-11): per-grader type/opts/thresholds, judge",
+    "                                       rubrics (criteria+anchors or labels, passing cut, panel/",
+    "                                       repeats/temperature/target), registry pack opts, and the",
+    "                                       gradersHash history records; deterministic (content-derived",
+    "                                       identity, no timestamps) — stdout by default, -o writes",
     "  doctor                               check environment health",
     "       [--philosophy-alignment [--json] [--baseline | --accept-baseline]]  pillar audit + scope-audit drift gate (item 49)",
     "       [--detect [--no-probe]]         inventory reachable providers/local models/MCP servers (item 40)",
@@ -2750,6 +2833,8 @@ function usageText(): string {
     "  judge calibrate                      calibrate an llm_judge against human ratings (item 8):",
     "       [--graders <g.yaml>] [--model <m>]  correlation/bias/ROC-optimal cut over paired",
     "       [--sessions N|all] [--apply]        (human rating, judge score); --apply writes the cut",
+    "       [--dataset <file|registry:ref>]     also pair the golden verdicts a distilled dataset",
+    "                                           carries (metadata.user_rating + the rated answer)",
     "  state backup [-o <file.tar.gz>]      snapshot the cwd .crewhaus state dir to a tarball (item 69)",
     "       [--exclude <glob,glob>]",
     "  state restore <file.tar.gz>          restore a snapshot (refuses a non-empty .crewhaus)",
@@ -9151,10 +9236,20 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  `crewhaus rate` follow-up, and excluded from the baseline gate's per-sample\n" +
         "  flip comparison. Judge criterion scores are persisted per grade (detail) and\n" +
         "  aggregated per criterion (criterionMeans + a `judge criteria` line).\n" +
-        "  Graders with `type: registry` resolve against the default grader registry:\n" +
-        "  the six specialty packs (continuity.*, twelve.*, nlg.*, semantic.similarity,\n" +
-        "  multimodal.*, safety.*) plus .crewhaus/graders plugins, which win on name\n" +
-        "  collisions. Constructed once per run and shared with every matrix cell.\n" +
+        "  llm_judge graders judge the final output by default; `target: transcript`\n" +
+        "  feeds the judge the run's bounded, sentinel-wrapped trajectory digest instead.\n" +
+        "  Rubrics are scalar (1-5 criteria/anchors) or categorical (`kind: categorical`\n" +
+        "  + labels/passing_labels — the judge picks exactly one label; the label's\n" +
+        "  declared 0..1 score is the grade).\n" +
+        "  Graders with `type: registry` resolve against the default grader registry —\n" +
+        "  the specialty packs (continuity.*, twelve.*, nlg.*, semantic.similarity,\n" +
+        "  multimodal.*, safety.*, calibration.*, consistency.*) plus .crewhaus/graders\n" +
+        "  plugins, which win on name collisions. Constructed once per run and shared\n" +
+        "  with every matrix cell.\n" +
+        "  Registry entries may carry `opts:` — pack construction options (thresholds,\n" +
+        "  embedder spec, disableFallback, ...) validated per pack at run start: an\n" +
+        "  unknown or out-of-range key errors naming the pack's accepted vocabulary,\n" +
+        "  never silently ignored. Plugin graders receive the opts record verbatim.\n" +
         "  llm_judge rubrics that declare no passing_score gate on the calibrated cut\n" +
         "  from .crewhaus/judge-calibration.json when present (`crewhaus judge calibrate\n" +
         "  --apply`); the run output and run.json note every grader gated this way.\n" +
@@ -9187,7 +9282,9 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  A specHash or dataset-hash mismatch is reported as not-comparable (also exits\n" +
         "  non-zero — a mis-pointed sentinel is loud, never silently green). Sentinel mode\n" +
         "  skips the run-history index/baselines/triage and the regression union (a probe,\n" +
-        "  not lineage); --gate/--no-promote/--models are rejected with it.\n",
+        "  not lineage); --gate/--no-promote/--models are rejected with it.\n" +
+        "  Read verbs: `crewhaus eval history|baseline|diff` alias the eval-report\n" +
+        "  verbs (E52) — see `crewhaus eval-report --help`.\n",
     );
     return;
   }
@@ -9371,7 +9468,7 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   // rubric/thresholds as the baseline (see hashGradersConfig doc comment).
   const gradersHash = hashGradersConfig(gradersConfig);
   // G14 — graders that resolve by registry name get the default registry
-  // (six specialty packs + .crewhaus/graders plugins), constructed ONCE here
+  // (the specialty packs + .crewhaus/graders plugins), constructed ONCE here
   // and shared with every matrix cell; `runEval` has the identical fallback,
   // so the vocabulary cannot differ between the CLI and library paths.
   const graderRegistry = await graderRegistryForCompiled(compiled);
@@ -10201,22 +10298,49 @@ async function runEvalReport(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus eval-report <action>\n" +
-        "  diff <prev> <new> [-o <out-dir>] [--seed N] compare two eval runs and emit a diff report\n" +
+        "  diff <prev> <new> [-o <out-dir>] [--seed N] [--pairwise [--judge-model <m>]]\n" +
+        "      compare two eval runs and emit a diff report;\n" +
         "      prints the paired-significance line (pass-rate delta, 95% CI, p-value) and\n" +
         "      per-slice deltas for slice keys both runs share; --seed pins the Monte Carlo\n" +
         "      draw behind the significance figures (unseeded diffs use a fixed default, so\n" +
         "      they are already deterministic). Significance is decision support — the\n" +
         "      strict `eval --gate` verdict never consults it.\n" +
+        "      --pairwise additionally judges each shared sample's two outputs head-to-head\n" +
+        "      (which run answered better?) TWICE with the presentation order swapped —\n" +
+        "      win/loss/tie per order, win-rate and order-consistency land additively in\n" +
+        "      diff.json, the report, and a stdout block; an order disagreement is position\n" +
+        "      bias and counts as a tie, never a win. Opt-in: 2 judge calls per shared\n" +
+        "      sample, so it requires visible judge credentials (--judge-model overrides\n" +
+        "      the default judge) and dies with a clear message without them.\n" +
         "  history [--spec <name>] [--dataset <name>]  list recorded runs (.crewhaus/evals/index.jsonl)\n" +
         "  baseline show [--spec <n>] [--dataset <n>]  print pinned baselines (.crewhaus/evals/baselines.json)\n" +
         "  baseline set <runId>                        pin a recorded run as its (spec, dataset) baseline\n" +
         "  --dataset matches the recorded name exactly OR with a `+` suffix segment, so\n" +
         "  `--dataset smoke` also finds runs recorded under the regression-suite union\n" +
-        "  name `smoke+regressions@vX`.\n",
+        "  name `smoke+regressions@vX`.\n" +
+        "  E52: `crewhaus eval history|baseline|diff` are working aliases for these\n" +
+        "  verbs (a stderr notice names the canonical spelling; flags pass through).\n",
     );
     return;
   }
   const action = args.positional[0];
+  // Strictness (NEW-HUNT-7 doctrine) — a silently-ignored knob is a trap.
+  // --judge-model only configures `diff --pairwise`'s judge, and both
+  // pairwise flags are inert on the offline read verbs; say so instead of
+  // quietly running a fully offline command the user believed was judged.
+  if (action === "diff" && args.flags["judge-model"] !== undefined && !args.flags["pairwise"]) {
+    process.stderr.write(
+      "[eval-report] warning: --judge-model has no effect without --pairwise — the diff runs fully offline\n",
+    );
+  } else if (action === "history" || action === "baseline") {
+    for (const flag of ["pairwise", "judge-model"]) {
+      if (args.flags[flag] !== undefined) {
+        process.stderr.write(
+          `[eval-report] warning: --${flag} only applies to \`eval-report diff\` — ignored by \`${action}\`\n`,
+        );
+      }
+    }
+  }
   switch (action) {
     case "diff":
       await runEvalReportDiff(args);
@@ -10249,9 +10373,11 @@ async function runEvalReportDiff(args: ParsedArgs): Promise<void> {
 
   const outArg = args.flags["out"];
   let result: ReturnType<typeof diffReports>;
+  let prevLoaded: LoadedRun;
+  let nextLoaded: LoadedRun;
   try {
-    const prevLoaded = await loadRun(prev);
-    const nextLoaded = await loadRun(next);
+    prevLoaded = await loadRun(prev);
+    nextLoaded = await loadRun(next);
     // NEW-HUNT-1 — the diff still renders, but when the two runs recorded
     // different graders configs or judge models the deltas may be the
     // instrument's, not the agent's. Warn on stderr so piped stdout stays clean.
@@ -10264,6 +10390,27 @@ async function runEvalReportDiff(args: ParsedArgs): Promise<void> {
     // render the message cleanly instead of an uncaught stack trace.
     if (err instanceof CrewhausError) die(err.message);
     throw err;
+  }
+
+  // A1 — opt-in pairwise judging: judge each shared sample's two outputs
+  // head-to-head, order-swapped, and fold the block additively into the
+  // (already-validated) diff. Runs AFTER the offline diff so a dataset
+  // mismatch dies before any judge call is spent; without the flag, the
+  // diff artifacts are byte-identical to before.
+  if (args.flags["pairwise"]) {
+    const judgeModel = resolvePairwiseJudgeModel(args.flags["judge-model"]);
+    const credentialError = pairwiseCredentialError(judgeModel, process.env);
+    if (credentialError !== undefined) die(credentialError);
+    try {
+      const pairwise = await judgeRunsPairwise(prevLoaded, nextLoaded, { judgeModel });
+      result = diffReports(prevLoaded, nextLoaded, {
+        ...(seed !== undefined ? { seed } : {}),
+        pairwise,
+      });
+    } catch (err) {
+      if (err instanceof CrewhausError) die(`eval-report diff --pairwise: ${err.message}`);
+      throw err;
+    }
   }
 
   if (typeof outArg === "string") {
@@ -10289,6 +10436,12 @@ async function runEvalReportDiff(args: ParsedArgs): Promise<void> {
   // B13 — per-slice deltas for the slice keys both runs share.
   for (const line of formatSliceDeltaLines(result.diff.sliceDeltas ?? [])) {
     process.stdout.write(`[eval-report] ${line}\n`);
+  }
+  // A1 — the pairwise summary block (only under --pairwise).
+  if (result.diff.pairwise !== undefined) {
+    for (const line of formatPairwiseLines(result.diff.pairwise)) {
+      process.stdout.write(`[eval-report] ${line}\n`);
+    }
   }
 }
 
@@ -11239,7 +11392,18 @@ async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
         "  judge-human disagreement is high (naming exemplars to re-anchor). Without\n" +
         "  judge credentials it explains what it needs and exits — it never\n" +
         "  fabricates scores. --apply writes the calibrated --min-score default to\n" +
-        "  .crewhaus/judge-calibration.json (a file distill/optimize could later read).\n",
+        "  .crewhaus/judge-calibration.json (a file distill/optimize could later read).\n" +
+        "  --dataset (NEW-graders-1) ADDS pairs from the golden verdicts a distilled\n" +
+        "  dataset carries, combined with the session-ratings pairs above (which stay\n" +
+        "  the default path). The contract is what `crewhaus distill` records: a\n" +
+        "  sample pairs when metadata.user_rating is a number in [0,1] AND\n" +
+        "  expected_output is the non-empty answer that rating was placed on.\n" +
+        "  Samples whose gold is NOT the rated answer are skipped as mis-paired\n" +
+        "  (metadata.correction — the gold is the human's correction — and\n" +
+        "  metadata.gold_refreshed — `dataset refresh-goldens` replaced the gold\n" +
+        "  after the rating); a sample already paired from the scanned sessions is\n" +
+        "  skipped as a duplicate. registry:<name>[@version][#split] refs resolve\n" +
+        "  train+dev on a bare ref; the locked test split stays locked.\n",
     );
     return;
   }
@@ -11278,7 +11442,59 @@ async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
     if (turn === undefined || turn.output.trim() === "") continue;
     rated.push({ turn, human });
   }
-  if (rated.length === 0) {
+
+  // NEW-graders-1 — `--dataset`: ADD calibration pairs from the golden
+  // verdicts a distilled dataset carries (see the help text for the exact
+  // contract). The two sources COMBINE; a candidate matching an
+  // already-rated session turn is dropped as a duplicate (session pairs
+  // win — they re-derive from the live transcript).
+  const datasetFlag = strFlag(args, "dataset");
+  let datasetCandidates: DatasetPairCandidate[] = [];
+  let datasetLabel: string | undefined;
+  let datasetSkipNote: string | undefined;
+  if (datasetFlag !== undefined) {
+    const datasetSamples: Sample[] = [];
+    try {
+      const registryRef = parseRegistryRef(datasetFlag);
+      if (registryRef !== undefined) {
+        const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+        const resolved = await resolveRegistryRef(registry, registryRef);
+        datasetSamples.push(...resolved.samples);
+        datasetLabel = resolved.datasetName;
+      } else {
+        const absDataset = resolve(datasetFlag);
+        const dataset = await loadDataset(absDataset);
+        for await (const s of dataset.samples) datasetSamples.push(s);
+        datasetLabel = dataset.name;
+      }
+    } catch (err) {
+      if (err instanceof DatasetRefError || err instanceof CrewhausError) {
+        die(`--dataset "${datasetFlag}" unusable: ${err.message}`);
+      }
+      throw err;
+    }
+    const extraction = extractDatasetCalibrationPairs(datasetSamples);
+    const takenRefs = new Set(rated.map((r) => `${r.turn.sessionId}#${r.turn.turnNumber}`));
+    const { kept, duplicates } = dropDuplicateCandidates(extraction.candidates, takenRefs);
+    datasetCandidates = kept;
+    datasetSkipNote =
+      `${extraction.skippedNoRating} unrated, ${extraction.skippedNoAnswer} no-answer, ` +
+      `${extraction.skippedMisPaired} mis-paired, ${duplicates} duplicate`;
+    if (kept.length === 0) {
+      const contract =
+        "the contract needs metadata.user_rating (a number in [0,1]) plus the rated answer in " +
+        "expected_output, exactly what `crewhaus distill` records; samples carrying " +
+        "metadata.correction or metadata.gold_refreshed are skipped (their gold is not the rated answer)";
+      die(
+        `--dataset "${datasetFlag}" yielded no calibration pairs (${datasetSamples.length} sample(s): ${datasetSkipNote}) — ${contract}`,
+      );
+    }
+  }
+
+  // Note: with --dataset we either died above (zero usable pairs) or hold
+  // candidates, so this fires exactly when the flagless path found nothing —
+  // byte-identical to the pre---dataset behavior.
+  if (rated.length === 0 && datasetCandidates.length === 0) {
     die(
       "no rated turns to calibrate against — collect numeric ratings (crewhaus rate --thumbs/--stars/--score) first",
     );
@@ -11300,9 +11516,19 @@ async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
   let rubricObject: unknown = defaultCalibrationRubric();
   if (gradersPath !== undefined) {
     const { compiled } = parseGradersConfig(readFileSync(resolve(gradersPath), "utf-8"));
-    const judgeEntry = compiled.find((g) => g.judgeSpec !== undefined);
+    // NEW-graders-2 interplay: calibration tunes a SCALAR passing cut, so
+    // categorical rubrics (label-gated, no 1–5 scale) never calibrate —
+    // pick the first scalar llm_judge and say so plainly when none exists.
+    const judgeEntry = compiled.find(
+      (g) => g.judgeSpec !== undefined && g.judgeSpec.rubric.kind !== "categorical",
+    );
     if (judgeEntry?.judgeSpec === undefined) {
-      die(`--graders "${gradersPath}" has no llm_judge grader to calibrate`);
+      const hasCategorical = compiled.some((g) => g.judgeSpec?.rubric.kind === "categorical");
+      die(
+        hasCategorical
+          ? `--graders "${gradersPath}" has only categorical llm_judge grader(s) — calibration tunes a scalar passing cut, which a label-gated rubric does not have`
+          : `--graders "${gradersPath}" has no llm_judge grader to calibrate`,
+      );
     }
     rubricObject = judgeEntry.judgeSpec.rubric;
   }
@@ -11336,6 +11562,33 @@ async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
       judgeFailures += 1;
     }
   }
+  const sessionPairCount = pairs.length;
+
+  // NEW-graders-1 — judge the dataset-carried golden verdicts the same way
+  // (same rubric, same judge, same best-effort skip on a flaky call). The
+  // pair keys on the candidate's sessionId#turn ref (distill records the
+  // real ones) so card exemplars stay navigable.
+  for (const c of datasetCandidates) {
+    try {
+      const result = await judge({
+        rubric,
+        sample: { id: `${c.sessionId}_t${c.turnNumber}`, input: c.input },
+        agentOutput: c.answer,
+        model: judgeModel,
+      });
+      pairs.push({
+        sessionId: c.sessionId,
+        turnNumber: c.turnNumber,
+        human: c.human,
+        judge: result.score,
+        ...(Object.keys(result.criterionScores).length > 0
+          ? { criterionScores: result.criterionScores }
+          : {}),
+      });
+    } catch {
+      judgeFailures += 1;
+    }
+  }
   if (pairs.length === 0) {
     die(`the judge model "${judgeModel}" produced no usable scores (${judgeFailures} failure(s))`);
   }
@@ -11345,6 +11598,11 @@ async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
     model: judgeModel,
   });
   process.stdout.write(renderCalibrationCard(card));
+  if (datasetFlag !== undefined) {
+    process.stdout.write(
+      `[judge calibrate] pairs: ${sessionPairCount} from session ratings + ${pairs.length - sessionPairCount} from --dataset "${datasetLabel ?? datasetFlag}" (skipped: ${datasetSkipNote})\n`,
+    );
+  }
   if (judgeFailures > 0) {
     process.stdout.write(
       `[judge calibrate] ${judgeFailures} turn(s) skipped (judge call failed)\n`,
@@ -13519,6 +13777,174 @@ async function runGradersSuggest(args: ParsedArgs): Promise<void> {
     "[graders] review file — adopt ONE grader into eval/graders.yaml (stacking graders\n" +
       "    hard-ANDs their scores; see the file header)\n",
   );
+}
+
+// -------- E48: crewhaus graders test --------
+
+/**
+ * E48 — `crewhaus graders test`: replay EVERY grader in a graders.yaml over
+ * a labeled golden-verdict set and score each one against the human
+ * verdicts (agreement, Cohen's kappa, FP/FN exemplars, score MAE). The
+ * pure halves live in ./graders-test; this is flag parsing + IO per house
+ * pattern. Deterministic + registry graders replay credential-free;
+ * llm_judge graders skip with a notice when no judge credentials are
+ * visible (never fabricate). `--min-agreement F` exits non-zero when any
+ * TESTED grader falls below the floor — the CI gate for rubric edits.
+ */
+async function runGradersTest(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus graders test --graders <graders.yaml> --golden <verdicts.jsonl>\n" +
+        "                             [--judge-model <model>] [--min-agreement F]\n" +
+        "  Meta-eval a grader suite against human-adjudicated golden verdicts (E48).\n" +
+        "  Each golden line is strict JSONL:\n" +
+        '    {"id": "q1", "input": "...", "agent_output": "...",\n' +
+        '     "expected_passed": true, "expected_score": 0.75}\n' +
+        "  expected_score is optional and normalized 0..1 (the GradeResult.score\n" +
+        "  scale — a judge's 1-5 maps via (n-1)/4). Every grader in the config is\n" +
+        "  replayed over the recorded agent_output: deterministic and registry\n" +
+        "  graders run credential-free; llm_judge graders need visible judge\n" +
+        "  credentials and are SKIPPED with a notice without them (the rest still\n" +
+        "  test). target: transcript judges always skip — golden verdicts carry\n" +
+        "  only the final output. Judge rubrics test at their DECLARED\n" +
+        "  passing_score (default 3/5); the judge-calibration overlay from\n" +
+        "  `judge calibrate --apply` is not applied here.\n" +
+        "  Per grader: agreement rate + Cohen's kappa vs expected_passed, false\n" +
+        "  positives/negatives with up to 5 exemplar ids each, abstained/error\n" +
+        "  counts (excluded from agreement), and mean absolute score error when\n" +
+        "  expected_score is present. --min-agreement F (0..1) exits non-zero when\n" +
+        "  any TESTED grader's agreement falls below F (skipped graders never\n" +
+        "  gate) — CI-gateable like `eval --gate`.\n",
+    );
+    return;
+  }
+  const gradersPath = strFlag(args, "graders");
+  if (gradersPath === undefined) die("missing --graders <graders.yaml>");
+  const goldenPath = strFlag(args, "golden");
+  if (goldenPath === undefined) die("missing --golden <verdicts.jsonl>");
+  const minAgreement = floatFlag(args, "min-agreement");
+  if (minAgreement !== undefined && (minAgreement < 0 || minAgreement > 1)) {
+    die(`invalid --min-agreement "${minAgreement}" — must be in [0,1]`);
+  }
+  const judgeModelFlag = strFlag(args, "judge-model");
+
+  const absGraders = resolve(gradersPath);
+  if (!existsSync(absGraders)) die(`graders file not found at ${absGraders}`);
+  let compiled: ReturnType<typeof parseGradersConfig>["compiled"];
+  try {
+    compiled = parseGradersConfig(readFileSync(absGraders, "utf-8")).compiled;
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+
+  const absGolden = resolve(goldenPath);
+  if (!existsSync(absGolden)) die(`golden file not found at ${absGolden}`);
+  let goldens: ReturnType<typeof parseGoldenVerdicts>;
+  try {
+    goldens = parseGoldenVerdicts(readFileSync(absGolden, "utf-8"));
+  } catch (err) {
+    if (err instanceof GradersTestError) die(err.message);
+    throw err;
+  }
+
+  // G14 — registry entries resolve against the default grader registry
+  // (packs + .crewhaus/graders plugins), built only when needed. Resolution
+  // failures (unknown name, bad opts) are loud at start, mirroring runEval.
+  let resolved: ReturnType<typeof resolveTestGraders>;
+  try {
+    const graderRegistry = await graderRegistryForCompiled(compiled);
+    resolved = resolveTestGraders(compiled, {
+      ...(judgeModelFlag !== undefined ? { judgeModel: judgeModelFlag } : {}),
+      ...(graderRegistry !== undefined ? { graderRegistry } : {}),
+    });
+  } catch (err) {
+    if (err instanceof GradersTestError || err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+  if (resolved.graders.length === 0) {
+    for (const s of resolved.skipped) {
+      process.stderr.write(`[graders test] skipped llm_judge "${s.name}" — ${s.reason}\n`);
+    }
+    die("no testable graders — every grader in the config was skipped");
+  }
+
+  const reports: GraderTestReport[] = [];
+  for (const g of resolved.graders) {
+    const outcomes = await replayGraderOnGoldens(g.grader, goldens);
+    reports.push(summarizeGraderTest(g.name, g.kind, outcomes));
+  }
+  process.stdout.write(renderGradersTestReport(reports, resolved.skipped, goldens.length));
+
+  if (minAgreement !== undefined) {
+    const failing = belowFloor(reports, minAgreement);
+    if (failing.length > 0) {
+      for (const r of failing) {
+        process.stderr.write(
+          `[graders test] FAIL: grader "${r.name}" agreement ${r.agreementRate.toFixed(3)} < --min-agreement ${minAgreement}\n`,
+        );
+      }
+      process.exit(1);
+    }
+    process.stdout.write(
+      `[graders test] gate passed — all ${reports.length} tested grader(s) at or above --min-agreement ${minAgreement}\n`,
+    );
+  }
+}
+
+/**
+ * NEW-HUNT-11 — `crewhaus graders card`: render the graders.yaml as the
+ * markdown rubric card (see graders-card.ts). The hash on the card is
+ * computed by the SAME `hashGradersConfig` the run-history index and
+ * baseline pins record, so the documented instrument identity can never
+ * drift from the one the sentinel/baseline guards compare. Deterministic:
+ * the only timestamp derives from the graders FILE's mtime — re-rendering
+ * an unchanged config is byte-identical.
+ */
+function runGradersCard(args: ParsedArgs): void {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus graders card --graders <graders.yaml> [-o <file>]\n" +
+        "  Render the graders config as a markdown RUBRIC CARD — the measurement-\n" +
+        "  instrument documentation artifact for a release PR (NEW-HUNT-11): every\n" +
+        "  grader's type, options, and thresholds; every llm_judge rubric's criteria\n" +
+        "  and anchors (or categorical labels + passing set), passing cut, and\n" +
+        "  panel/repeats/temperature/target; every registry entry's pack opts; and\n" +
+        "  the config's gradersHash — the exact instrument identity recorded in\n" +
+        "  run.json, the run-history index, and baseline pins.\n" +
+        "  Deterministic by design: no wall clock, randomness, or timestamps —\n" +
+        "  identity is content-derived (the gradersHash), so re-rendering an\n" +
+        "  unchanged config is byte-identical in ANY checkout and a card diff\n" +
+        "  shows real instrument changes only.\n" +
+        "  Writes to stdout; -o <file> writes the card there instead.\n",
+    );
+    return;
+  }
+  const gradersPath = strFlag(args, "graders");
+  if (gradersPath === undefined) die("missing --graders <graders.yaml>");
+  const absGraders = resolve(gradersPath);
+  if (!existsSync(absGraders)) die(`graders file not found at ${absGraders}`);
+  let config: GradersConfig;
+  try {
+    config = parseGradersConfig(readFileSync(absGraders, "utf-8")).config;
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+  const card = renderGradersCard({
+    config,
+    gradersHash: hashGradersConfig(config),
+    source: gradersPath,
+  });
+  const outArg = strFlag(args, "out");
+  if (outArg !== undefined) {
+    const absOut = resolve(outArg);
+    mkdirSync(dirname(absOut), { recursive: true });
+    writeFileSync(absOut, card);
+    process.stdout.write(`[graders card] wrote ${absOut}\n`);
+  } else {
+    process.stdout.write(card);
+  }
 }
 
 /**
@@ -17980,28 +18406,49 @@ function buildWatchmeJudgePhase(
         input: input.input,
         expectedOutput: undefined,
         agentOutput: input.output,
-        // A3 — watchme's `submit_score` tool schema below carries only
-        // score+rationale (its report roll-up has no abstained lane), so
-        // the abstention instructions must be omitted: told to abstain, the
-        // judge would set a field the strict tool schema forbids and the
-        // guessed score would be recorded as an authoritative verdict.
-        // Drop this (and add `abstain` to the schema) when the watchme
-        // report learns to route abstained turns to human review.
-        allowAbstain: false,
+        // A3 (Wave-2 residue closed) — `submit_score` below now carries the
+        // optional `abstain`/`confidence` lane and the report roll-up routes
+        // abstained turns to human review, so the abstention instructions
+        // are safe to include.
+        allowAbstain: true,
       });
-      let verdict: { score: number; rationale: string } | undefined;
+      let verdict:
+        | { score: number; rationale: string; abstained?: boolean; confidence?: number }
+        | undefined;
       const submitScore = buildTool({
         name: "submit_score",
         description: "Submit the structured judgment for this turn. Call exactly once.",
         inputSchema: z.object({
           score: z.number().int().min(1).max(5),
           rationale: z.string().min(1),
+          // A3 — abstention + self-reported confidence, mirroring eval-judge's
+          // SubmitScoreSchema: optional so a judge that never abstains is
+          // unaffected, declared so an abstaining judge is never rejected by
+          // the tool schema (which would silently launder the guessed score
+          // into an authoritative verdict).
+          abstain: z
+            .boolean()
+            .optional()
+            .describe(
+              "Set true when the evidence is insufficient to score honestly — abstain instead of guessing. Still fill in every required field.",
+            ),
+          confidence: z
+            .number()
+            .min(0)
+            .max(1)
+            .optional()
+            .describe("Self-reported confidence in this verdict, 0 (a guess) to 1 (certain)."),
         }),
         readOnly: true,
         destructive: false,
         concurrencySafe: false,
-        execute: async ({ score, rationale }) => {
-          verdict = { score: (score - 1) / 4, rationale };
+        execute: async ({ score, rationale, abstain, confidence }) => {
+          verdict = {
+            score: (score - 1) / 4,
+            rationale,
+            ...(abstain === true ? { abstained: true } : {}),
+            ...(confidence !== undefined ? { confidence } : {}),
+          };
           return "Judgment recorded. Reply with a one-line confirmation.";
         },
       });
@@ -18034,6 +18481,8 @@ function buildWatchmeJudgePhase(
           score: verdict.score,
           rationale: verdict.rationale,
           spentUsd: tracker.getRunCost(runContext.runId).totalUsdMicros / 1_000_000,
+          ...(verdict.abstained === true ? { abstained: true } : {}),
+          ...(verdict.confidence !== undefined ? { confidence: verdict.confidence } : {}),
         };
       } finally {
         tracker.unsubscribe();
@@ -19247,20 +19696,52 @@ switch (subcommand) {
     }
     break;
   }
-  case "eval":
+  case "eval": {
     // Item 6 — `eval coverage` is a distinct read-side report with its own
     // flags; every other `eval …` invocation is the run path.
-    if (rest[0] === "coverage") {
+    const evalFirst = rest[0] ?? "";
+    // E52 — the read verbs live under `eval-report`, but `crewhaus eval
+    // history|baseline|diff` is the commonly-guessed spelling and used to
+    // fall into the run path with a misleading "missing --dataset" death.
+    // The EXACT bare verbs (plus the plural guess "baselines") are working
+    // aliases: a one-line stderr notice names the canonical verb, then flags
+    // and positionals pass through to the eval-report implementations
+    // verbatim. Only whole-word matches alias — a spec FILE literally named
+    // history.yaml (or ./history) still takes the run path below. The
+    // carve-out is a file check, not a bare existsSync: a DIRECTORY named
+    // diff/ (eval-report diff -o diff creates one) must not resurrect the
+    // misleading "missing --dataset" death this alias exists to eliminate.
+    const EVAL_REPORT_ALIASES: Record<string, string> = {
+      history: "history",
+      baseline: "baseline",
+      baselines: "baseline",
+      diff: "diff",
+    };
+    const aliasVerb = EVAL_REPORT_ALIASES[evalFirst];
+    const isSpecFile = (p: string): boolean => {
+      try {
+        return statSync(p).isFile();
+      } catch {
+        return false;
+      }
+    };
+    if (evalFirst === "coverage") {
       try {
         await runEvalCoverage(parseFor(rest.slice(1), EVAL_COVERAGE_SCHEMA));
       } catch (err) {
         if (err instanceof CrewhausError) die(err.message);
         throw err;
       }
+    } else if (aliasVerb !== undefined && !isSpecFile(evalFirst)) {
+      process.stderr.write(
+        `[eval] note: \`crewhaus eval ${evalFirst}\` is an alias for the canonical \`crewhaus eval-report ${aliasVerb}\`\n`,
+      );
+      await runEvalReport(parseFor([aliasVerb, ...rest.slice(1)], EVAL_REPORT_SCHEMA));
     } else {
       await runEvalSubcommand(parseFor(rest, EVAL_SCHEMA));
     }
     break;
+  }
   case "eval-report":
     await runEvalReport(parseFor(rest, EVAL_REPORT_SCHEMA));
     break;
@@ -19528,11 +20009,19 @@ switch (subcommand) {
     break;
   case "graders": {
     const action = rest[0] ?? "";
-    if (action !== "suggest") {
-      die(`graders action must be "suggest" (got "${action}")`);
+    if (action !== "suggest" && action !== "test" && action !== "card") {
+      die(`graders action must be one of: suggest, test, card (got "${action}")`);
     }
     try {
-      await runGradersSuggest(parseFor(rest.slice(1), GRADERS_SUGGEST_SCHEMA));
+      if (action === "suggest") {
+        await runGradersSuggest(parseFor(rest.slice(1), GRADERS_SUGGEST_SCHEMA));
+      } else if (action === "test") {
+        // E48 — meta-eval the grader suite against labeled golden verdicts.
+        await runGradersTest(parseFor(rest.slice(1), GRADERS_TEST_SCHEMA));
+      } else {
+        // NEW-HUNT-11 — render the measurement-instrument rubric card.
+        runGradersCard(parseFor(rest.slice(1), GRADERS_CARD_SCHEMA));
+      }
     } catch (err) {
       if (err instanceof CrewhausError) die(err.message);
       throw err;

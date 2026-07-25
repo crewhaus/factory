@@ -12,6 +12,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/agent-context-isolation": "workspace:*",
     "@crewhaus/compiler": "workspace:*",
     "@crewhaus/embedder": "workspace:*",
@@ -32,6 +33,7 @@
     "@crewhaus/logging": "workspace:*",
     "@crewhaus/mcp-host": "workspace:*",
     "@crewhaus/memory-service": "workspace:*",
+    "@crewhaus/model-router": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
     "@crewhaus/recovery-engine": "workspace:*",
     "@crewhaus/run-context": "workspace:*",

@@ -250,6 +250,12 @@ export type WatchmeJudgeTurnVerdict = {
   readonly rationale: string;
   /** Observed spend for this call in USD (cost-tracker over the phase's bus). */
   readonly spentUsd: number;
+  /** A3 — the judge declined to score (insufficient evidence). The turn is
+   *  NOT recorded as an authoritative judgment; the report routes it to human
+   *  review (`crewhaus rate`) instead. */
+  readonly abstained?: boolean;
+  /** Judge-reported confidence in the verdict, 0..1 (absent when unreported). */
+  readonly confidence?: number;
 };
 
 /**
@@ -932,6 +938,12 @@ export type WatchmeReportJson = {
     readonly reason?: string;
     readonly sampled: number;
     readonly judged: number;
+    /** A3 — sampled turns whose judge abstained (insufficient evidence).
+     *  Never persisted as judgments; routed to human review instead. */
+    readonly abstained?: number;
+    /** `sessionId#turnNumber` keys of the abstained turns — the `crewhaus
+     *  rate` follow-up list (mirrors the eval needs_human machinery). */
+    readonly abstainedTurns?: ReadonlyArray<string>;
     readonly spentUsd: number;
     readonly evidence?: {
       readonly sessionId: string;
@@ -982,6 +994,11 @@ export function renderWatchmeReportMd(report: WatchmeReportJson): string {
     lines.push(
       `- Judge: ${j.model} — ${j.outcome}${j.reason !== undefined ? ` (${j.reason})` : ""}; sampled ${j.sampled}, judged ${j.judged}, spent $${j.spentUsd.toFixed(4)}`,
     );
+    if (j.abstained !== undefined && j.abstained > 0) {
+      lines.push(
+        `- Judge abstained on ${j.abstained} turn(s) (insufficient evidence) — rate them with \`crewhaus rate\`: ${(j.abstainedTurns ?? []).join(", ")}`,
+      );
+    }
     if (j.evidence !== undefined) {
       lines.push(
         `- Judge evidence (from its own session ${j.evidence.sessionId}): ${j.evidence.modelCalls} model call(s), ${usd(j.evidence.costUsdMicros)}`,
@@ -1812,6 +1829,7 @@ async function runJudgePhase(input: {
 
   let spentUsd = 0;
   let judged = 0;
+  const abstainedTurns: string[] = [];
   let failure: string | undefined;
   for (const { turn, model } of sampled) {
     if (spentUsd >= judge.budgetUsd) break; // the hard budget stop
@@ -1824,6 +1842,15 @@ async function runJudgePhase(input: {
         budgetRemainingUsd: judge.budgetUsd - spentUsd,
       });
       spentUsd += Math.max(0, verdict.spentUsd);
+      if (verdict.abstained === true) {
+        // A3 — an abstention is NOT an authoritative verdict: never appended
+        // to the judgment store (so it can't skew meanJudge or feed routing
+        // arms), surfaced instead as a human-review key. The turn stays
+        // eligible for a human rating (`crewhaus rate`), which permanently
+        // retires it from sampling via ratedKeys.
+        abstainedTurns.push(`${turn.sessionId}#${turn.turnNumber}`);
+        continue;
+      }
       judged += 1;
       deps.store.appendJudgment({
         v: 1,
@@ -1872,6 +1899,7 @@ async function runJudgePhase(input: {
     ...(failure !== undefined ? { reason: failure } : {}),
     sampled: sampled.length,
     judged,
+    ...(abstainedTurns.length > 0 ? { abstained: abstainedTurns.length, abstainedTurns } : {}),
     spentUsd,
     ...(evidence !== undefined ? { evidence } : {}),
   };
