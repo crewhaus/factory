@@ -59,6 +59,7 @@ import {
 import {
   type RunIndexEntry,
   buildMatrix,
+  diffInstrumentWarnings,
   diffReports,
   formatUsd,
   hashDatasetFile,
@@ -310,6 +311,17 @@ import {
   buildContextPressureReport,
   formatContextPressureLines,
 } from "./context-pressure";
+// B23 — `crewhaus dataset audit` (offline PII/secret scan of an existing
+// dataset) + the shared sync redaction the distill/mine ingestion surfaces
+// apply, in a side-effect-free module so it is unit-testable (this entry
+// file runs an argv switch on import).
+import {
+  auditSamples,
+  containsRedactionMarker,
+  redactDatasetText,
+  redactSample,
+  renderAuditReport,
+} from "./dataset-audit";
 // Item 2 — `crewhaus dataset mine` + `dataset synthesize`: grow the dataset
 // from production struggle signals + PII-redacted stress variants, in a
 // side-effect-free module so it is unit-testable (this entry file runs an argv
@@ -334,13 +346,19 @@ import {
   DEFAULT_SPLIT_SPEC,
   DatasetRefError,
   defaultDatasetsRoot,
+  inspectRegistryRef,
   isDatasetSplit,
+  nextVersion,
   parseNameVersion,
   parseRegistryRef,
   parseSplitSpec,
   recordToJsonl,
+  refuseTestSplitRef,
   registerDataset,
+  registryDatasetName,
   resolveRegistryRef,
+  samplesForSplits,
+  splitsPresent,
 } from "./datasets";
 // Item 29 — `crewhaus deploy canary` eval-gated ramp orchestration, in a
 // side-effect-free module so it is unit-testable (this entry file runs an
@@ -543,8 +561,10 @@ import {
   type FlywheelKnobs,
   type FlywheelOptimizeOutcome,
   buildFlywheelWorkflowYaml,
+  formatDatasetSourceLine,
   formatFlywheelKnobsGuide,
   formatFlywheelReport,
+  formatRatingsShadowWarning,
   resolveFlywheelData,
   resolveFlywheelKnobs,
   runFlywheelLoop,
@@ -1600,6 +1620,11 @@ const OPTIMIZE_SCHEMA: ParseArgsSchema = {
     // Synthesizes the dataset (and, when --graders is omitted, the graders too).
     { name: "ratings", takesValue: true },
     { name: "min-score", takesValue: true },
+    // B23 — the --ratings inline distill PII/secret-redacts sample text by
+    // default (same detector set and opt-out as `crewhaus distill`); this
+    // keeps raw text out of the sample pool, the synthesized graders, and
+    // the optimizer meta-prompt sent to the mutator model.
+    { name: "no-redact", takesValue: false },
     // Item #54 — inject the top-K harvested few-shot examples as in-context
     // demonstrations at the front of the seed instructions the optimizer
     // mutates. Value: a pool file path, or "auto" for the cwd default
@@ -1762,6 +1787,11 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     // suite (opting out of regression-suite integration means no writes
     // to it either).
     { name: "no-regressions", takesValue: false },
+    // B16 — explicit opt-in to consume an explicit `#test` registry ref
+    // (the locked held-out split; meant for release-gate runs only). Bare
+    // refs always resolve train+dev regardless of this flag, and
+    // optimize/flywheel refuse #test outright.
+    { name: "allow-test-split", takesValue: false },
     // Item 7 — opt out of the runner's default one-shot retry of ERRORED
     // samples (infra noise, not graded failures).
     { name: "no-retry", takesValue: false },
@@ -1915,6 +1945,10 @@ const DISTILL_SCHEMA: ParseArgsSchema = {
     // train/dev/test split), consumable as `--dataset registry:<name>`.
     // -o becomes optional when given; plain file output stays the default.
     { name: "register", takesValue: true },
+    // B23 — opt out of the default PII/secret redaction of distilled sample
+    // text (dev/local only; the unattended feedback.autoDistill teardown
+    // always redacts).
+    { name: "no-redact", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -2067,11 +2101,20 @@ const DATASET_SCHEMA: ParseArgsSchema = {
     // synthesize — dollar cap for model paraphrases (budget-gate pattern).
     { name: "budget-usd", takesValue: true },
     // refresh-goldens (item 5) — the dataset whose golds to reconcile.
+    // audit (B23) — the dataset to scan; --apply shared with refresh-goldens.
     { name: "dataset", takesValue: true },
     { name: "min-score", takesValue: true },
     { name: "apply", takesValue: false },
     // Model for synthesize paraphrases / refresh (model-router grammar).
     { name: "model", takesValue: true },
+    // mine (B23) — write candidates verbatim, skipping the default
+    // PII/secret redaction (dev/local parity with `distill --no-redact`).
+    { name: "no-redact", takesValue: false },
+    // audit (B23) — explicit scan-category selector; PII/secret is the only
+    // audit today, so a bare `dataset audit` implies it.
+    { name: "pii", takesValue: false },
+    // audit (B23) — exit non-zero when any hit is found (the CI gate).
+    { name: "strict", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -2369,6 +2412,25 @@ const DEPLOY_SCHEMA: ParseArgsSchema = {
     { name: "require-approval", takesValue: false },
     // Consult a PR check as an approval witness (drives `gh pr checks`).
     { name: "check-pr", takesValue: false },
+    // Item 29 — `deploy canary <spec> <version>` eval-gated ramp flags
+    // (previously misfiled on PROPOSE_SCHEMA, which made every documented
+    // canary invocation die at arg parse with `unknown flag: --dataset`).
+    { name: "traffic", takesValue: true },
+    { name: "dataset", takesValue: true },
+    { name: "graders", takesValue: true },
+    { name: "env", takesValue: true },
+    { name: "name", takesValue: true },
+    { name: "from", takesValue: true },
+    { name: "concurrency", takesValue: true },
+    { name: "seed", takesValue: true },
+    { name: "judge-model", takesValue: true },
+    // Gate threshold overrides (regression-runner GateThresholds).
+    { name: "max-pass-rate-drop", takesValue: true },
+    { name: "max-p95-latency-ms", takesValue: true },
+    // B16 — canary is a release-gating flow, i.e. a sanctioned spender of the
+    // held-out split: an explicit #test dataset ref is consumable here behind
+    // the same opt-in as `crewhaus eval`.
+    { name: "allow-test-split", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -2415,19 +2477,6 @@ const PROPOSE_SCHEMA: ParseArgsSchema = {
     { name: "spec-path", takesValue: true },
     // Assemble the bundle + print the plan without touching git/gh.
     { name: "dry-run", takesValue: false },
-    // Item 29 — `deploy canary <spec> <version>` eval-gated ramp flags.
-    { name: "traffic", takesValue: true },
-    { name: "dataset", takesValue: true },
-    { name: "graders", takesValue: true },
-    { name: "env", takesValue: true },
-    { name: "name", takesValue: true },
-    { name: "from", takesValue: true },
-    { name: "concurrency", takesValue: true },
-    { name: "seed", takesValue: true },
-    { name: "judge-model", takesValue: true },
-    // Gate threshold overrides (regression-runner GateThresholds).
-    { name: "max-pass-rate-drop", takesValue: true },
-    { name: "max-p95-latency-ms", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -2532,7 +2581,8 @@ function usageText(): string {
     "       [--models <m1,m2,...>]         benchmark matrix: run the dataset once per model",
     "                                      (cells write to <out>/<model-slug>/; emits matrix.json",
     "                                      + index.html; incompatible with --gate/--no-promote)",
-    "       --dataset also accepts registry:<name>[@version][#split] (Section 29 registry)",
+    "       --dataset also accepts registry:<name>[@version][#split] (Section 29 registry;",
+    "                                      bare refs = train+dev — #test needs --allow-test-split)",
     "  eval coverage                        detect prod behaviors no eval sample exercises (item 6):",
     "       [--sessions N|all] [--dataset <d>]  tool/MCP/bigram/compaction gaps ranked by prod",
     "       [-o <dir>] [--format text|html|json] frequency; json is a backlog for `dataset mine`",
@@ -2606,6 +2656,7 @@ function usageText(): string {
     "  distill --session <id> -o <ds.jsonl> turn ratings into an eval dataset + graders",
     "       [--all-sessions] [--graders-out <g.yaml>] [--min-score F]",
     "       [--register <name>]            also promote a new dataset version into the registry",
+    "       [--no-redact]                  keep raw sample text (PII/secret-redacted by default)",
     "  fewshot harvest [--all-sessions]     harvest up-rated turns into a golden few-shot pool (#54)",
     "       [--min-score F] [-o <pool>]     (PII/secret-redacted); optimize with --few-shot",
     "  fewshot show [--k N]                 print the pool as the injectable prompt block",
@@ -2644,13 +2695,18 @@ function usageText(): string {
     "       [--split-spec 70/15/15 | --split train]",
     "  dataset mine [--sessions N|all]      mine hard cases from session struggle signals (item 2):",
     "       [--out-dataset <name>] [--review]   tool-errors/loops/retries/egress → quarantine;",
-    "                                           --review promotes accepted into a mined dataset",
+    "       [--no-redact]                       --review promotes accepted into a mined dataset",
+    "                                           (candidate text PII/secret-redacted by default)",
     "  dataset synthesize --from <f|reg>    PII-redacted stress variants (item 2): paraphrase,",
     "       [--count N] [--budget-usd N]        truncate, ambiguate, inject → separate synthetic",
     "       [--out-dataset <name>]              split (never contaminates human golds)",
     "  dataset refresh-goldens              reconcile corrections/up-rated turns with golds (item 5):",
     "       --dataset <file|registry:ref>       propose gold updates as a review diff; --apply writes",
     "       [--min-score F] [--apply]           a NEW registry version (never in-place)",
+    "  dataset audit --dataset <f|reg>      offline PII/secret scan of an existing dataset (B23):",
+    "       [--pii] [--apply] [--strict]        per-detector/field/sample hit report (no model calls);",
+    "                                           --apply writes a redacted NEW registry version;",
+    "                                           --strict exits non-zero on hits (CI gate)",
     "  judge calibrate                      calibrate an llm_judge against human ratings (item 8):",
     "       [--graders <g.yaml>] [--model <m>]  correlation/bias/ROC-optimal cut over paired",
     "       [--sessions N|all] [--apply]        (human rating, judge score); --apply writes the cut",
@@ -2843,14 +2899,20 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "  --allow-unmarked-sinks   Opt out of the gate for this compile (alias:\n" +
         "             --no-strict-scope). Use only when you knowingly bypass it.\n" +
         "\n" +
-        "  Compile warnings: a spec key a shape ACCEPTS but whose emitter does\n" +
-        "  not wire yet (accepted-but-unwired — legal-but-inert config) always\n" +
-        "  prints as one line per warning:\n" +
+        "  Compile warnings always print as one line per warning:\n" +
         "    crewhaus: warning[<code>] <path>: <message>\n" +
-        "  --strict   Escalate compile warnings to errors: any warning fails\n" +
-        "             the compile (exit 1) before files are written. (The\n" +
-        "             FR-002 scope gate is on by default regardless of this\n" +
-        "             flag; --allow-unmarked-sinks is its only opt-out.)\n",
+        "  Codes today: accepted-but-unwired (a spec key a shape ACCEPTS but\n" +
+        "  whose emitter does not wire yet — legal-but-inert config),\n" +
+        "  edge-unsafe-tool (a custom tool whose edge-safety the cf-worker\n" +
+        "  flavour cannot verify offline), and channel-reactions-join\n" +
+        "  (informational — reaction feedback attributes to the exact turn\n" +
+        "  only once the outbound-ts join file accumulates).\n" +
+        "  --strict   Escalate compile warnings to errors: any remediable\n" +
+        "             warning fails the compile (exit 1) before files are\n" +
+        "             written. Informational codes (channel-reactions-join)\n" +
+        "             still print but never fail --strict. (The FR-002 scope\n" +
+        "             gate is on by default regardless of this flag;\n" +
+        "             --allow-unmarked-sinks is its only opt-out.)\n",
     );
     return;
   }
@@ -3048,14 +3110,22 @@ async function runCompile(args: ParsedArgs): Promise<void> {
 
   // Loop contract 0.4 (Batch A) — compile warnings ALWAYS print, one line
   // per warning (code + path + message; stderr so stdout stays the clean
-  // `wrote …` stream). With --strict any warning fails the compile HERE —
-  // before any file is written, so a strict-failed build emits nothing.
+  // `wrote …` stream). With --strict any REMEDIABLE warning fails the
+  // compile HERE — before any file is written, so a strict-failed build
+  // emits nothing.
   for (const warning of bundle.warnings) {
     process.stderr.write(`crewhaus: ${formatCompileWarning(warning)}\n`);
   }
-  if (strictWarnings && bundle.warnings.length > 0) {
+  // D40 — channel-reactions-join is INFORMATIONAL: it fires on a fully
+  // wired, correctly configured feature (the outbound-ts join file just has
+  // to accumulate at runtime), so no spec edit can ever clear it. Escalating
+  // it would make --strict permanently unusable for every reactions-enabled
+  // channel spec; it still prints above, but only remediable codes
+  // (accepted-but-unwired, edge-unsafe-tool) escalate.
+  const escalatedWarnings = bundle.warnings.filter((w) => w.code !== "channel-reactions-join");
+  if (strictWarnings && escalatedWarnings.length > 0) {
     die(
-      `--strict: ${bundle.warnings.length} compile warning(s) escalated to errors (see lines above)`,
+      `--strict: ${escalatedWarnings.length} compile warning(s) escalated to errors (see lines above)`,
     );
   }
 
@@ -7264,15 +7334,20 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus optimize <spec.yaml> (--dataset <data> --graders <graders.yaml> | --ratings <session>) " +
-        "[--min-score F] [--mutator rule-based|claude] [--iterations N] [--seed N] [--concurrency N] " +
+        "[--min-score F] [--no-redact] [--mutator rule-based|claude] [--iterations N] [--seed N] [--concurrency N] " +
         "[--improvement-threshold F] [--budget-usd N] [--from-advice <suggestions.json>] " +
         "[--write-back] [--no-register] [--no-pin-regressions] [--no-retry] [-o <out-dir>]\n" +
         "  --dataset takes a file path or registry:<name>[@version][#split] (Section 29 registry;\n" +
         "  default version: latest). A registry record with populated train AND dev splits is\n" +
         "  used as-is; otherwise the selected samples get the inline 70/30 split. The test\n" +
-        "  split is never optimized against unless #test is explicitly given.\n" +
+        "  split is never optimized against — an explicit #test ref is refused (the held-out\n" +
+        "  split gates releases; only `crewhaus eval` / `crewhaus deploy canary` consume\n" +
+        "  it, behind --allow-test-split).\n" +
         "  User-rating loops (item 1): --ratings <session>|all distills feedback inline for\n" +
-        "  this run only (unchanged). A spec with feedback.autoDistill maintains a VERSIONED\n" +
+        "  this run only (unchanged). Sample text is PII/secret-redacted by default before\n" +
+        "  it reaches the sample pool, the synthesized graders, or the optimizer meta-prompt\n" +
+        "  (the same detector set as `crewhaus distill`); --no-redact keeps it raw (dev/local\n" +
+        "  only). A spec with feedback.autoDistill maintains a VERSIONED\n" +
         "  `<specName>-ratings` registry dataset at run teardown instead — consume it here\n" +
         "  (and in `crewhaus eval`) as --dataset registry:<specName>-ratings (latest by\n" +
         "  default, or pin @vN).\n" +
@@ -7343,8 +7418,16 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   if (ratingsMinScore < 0 || ratingsMinScore > 1) {
     die(`invalid --min-score "${ratingsMinScore}" — must be in [0,1]`);
   }
+  // B23 — the inline distill redacts by default; --no-redact opts out
+  // (mirrors `crewhaus distill`, which shares the same ingestion core).
   const ratingsDistill =
-    typeof ratingsArg === "string" ? distillRatings(ratingsArg, ratingsMinScore) : undefined;
+    typeof ratingsArg === "string"
+      ? distillRatings(
+          ratingsArg,
+          ratingsMinScore,
+          args.flags["no-redact"] === true ? undefined : redactDatasetText,
+        )
+      : undefined;
 
   const iterationsFlag = args.flags["iterations"];
   const seedFlag = args.flags["seed"];
@@ -7484,9 +7567,9 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   // carries BOTH a populated train and dev split (and no explicit #split) is
   // used as-is instead of being re-split inline; the record's split
   // assignment is the reproducible source of truth. Otherwise the selected
-  // samples join the pool below and get the inline 70/30 split. The
-  // registry's test split never enters optimization unless #test is
-  // explicitly given.
+  // samples join the pool below and get the inline 70/30 split. B16 — the
+  // registry's test split NEVER enters optimization: an explicit #test ref
+  // is refused (a holdout the optimizer saw is burned as a release gate).
   let registrySplits: { train: OptimizerSample[]; dev: OptimizerSample[] } | undefined;
   if (typeof datasetPath === "string") {
     let registryRef: ReturnType<typeof parseRegistryRef>;
@@ -7500,6 +7583,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
       let resolved: Awaited<ReturnType<typeof resolveRegistryRef>>;
       try {
+        refuseTestSplitRef("optimize", registryRef);
         resolved = await resolveRegistryRef(registry, registryRef);
       } catch (err) {
         if (err instanceof DatasetRefError || err instanceof CrewhausError) die(err.message);
@@ -8129,7 +8213,7 @@ function gitSpecStatus(absSpec: string): { inRepo: boolean; dirty: boolean } {
 async function runFlywheelCmd(args: ParsedArgs, action: "init" | "run"): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      `usage:\n  crewhaus flywheel run [spec.yaml] [--dataset <data>] [--graders <graders.yaml>]\n      [--budget-usd N] [--iterations N] [--seed N] [--concurrency N]\n      [--mutator rule-based|claude] [--dry-run] [--allow-dirty]\n  crewhaus flywheel init [--force]\n\n  \`run\` executes the nightly self-improvement loop in one command:\n  compile gate → baseline eval → optimize (budget-capped; claude mutator\n  by default when an ANTHROPIC credential is present, rule-based fallback\n  otherwise) → post-patch compile → after eval → acceptance gate. The\n  patch is applied to the spec ONLY when pass_rate strictly improved with\n  zero per-sample regressions (the same strict gate \`eval --gate\` uses);\n  an accepted write-back then runs the standard auto-register + changelog\n  + regression-pin flow. A rejected patch never touches disk. --dry-run\n  runs everything but never writes.\n\n  Defaults: <spec> is ./crewhaus.yaml; --dataset falls back to\n  ${CONVENTIONAL_DATASET} then registry:<spec>-ratings (when the spec has a\n  feedback: block and ratings were distilled); --graders falls back to\n  ${CONVENTIONAL_GRADERS}; conventional paths resolve from the SPEC's directory,\n  not the cwd, so a spec passed by path brings its own eval/ files. When the\n  dataset is a registry ref (including the ratings fallback), the before/after\n  acceptance evals run over ALL splits — test included — matching \`eval\`'s\n  registry semantics; per-split acceptance gating is a future knob. The\n  optimizer only ever rewrites agent.instructions (OPTIMIZABLE_PATHS) —\n  permissions: stay exactly as a human reviewed them. The flywheel refuses to\n  run over uncommitted spec changes (--allow-dirty opts out).\n\n  \`init\` scaffolds .github/workflows/crewhaus-flywheel.yml: nightly cron +\n  workflow_dispatch, budget knobs as env, PR creation via gh for HUMAN\n  review — the workflow never merges on its own. Refuses to overwrite an\n  existing workflow without --force.\n\n${formatFlywheelKnobsGuide()
+      `usage:\n  crewhaus flywheel run [spec.yaml] [--dataset <data>] [--graders <graders.yaml>]\n      [--budget-usd N] [--iterations N] [--seed N] [--concurrency N]\n      [--mutator rule-based|claude] [--dry-run] [--allow-dirty]\n  crewhaus flywheel init [--force]\n\n  \`run\` executes the nightly self-improvement loop in one command:\n  compile gate → baseline eval → optimize (budget-capped; claude mutator\n  by default when an ANTHROPIC credential is present, rule-based fallback\n  otherwise) → post-patch compile → after eval → acceptance gate. The\n  patch is applied to the spec ONLY when pass_rate strictly improved with\n  zero per-sample regressions (the same strict gate \`eval --gate\` uses);\n  an accepted write-back then runs the standard auto-register + changelog\n  + regression-pin flow. A rejected patch never touches disk. --dry-run\n  runs everything but never writes.\n\n  Defaults: <spec> is ./crewhaus.yaml; --dataset falls back to\n  ${CONVENTIONAL_DATASET} then registry:<spec>-ratings (when the spec has a\n  feedback: block and ratings were distilled); --graders falls back to\n  ${CONVENTIONAL_GRADERS}; conventional paths resolve from the SPEC's directory,\n  not the cwd, so a spec passed by path brings its own eval/ files. When the\n  dataset is a registry ref (including the ratings fallback), bare refs resolve\n  train+dev only — the locked test split NEVER enters the flywheel, and an\n  explicit #test ref is refused (the held-out split gates releases, not\n  nightly loops). Every run prints the resolved dataset + its source\n  (flag|convention|ratings-registry) and warns when a conventional\n  ${CONVENTIONAL_DATASET} shadows a distilled <spec>-ratings dataset. The\n  optimizer only ever rewrites agent.instructions (OPTIMIZABLE_PATHS) —\n  permissions: stay exactly as a human reviewed them. The flywheel refuses to\n  run over uncommitted spec changes (--allow-dirty opts out).\n\n  \`init\` scaffolds .github/workflows/crewhaus-flywheel.yml: nightly cron +\n  workflow_dispatch, budget knobs as env, PR creation via gh for HUMAN\n  review — the workflow never merges on its own. Refuses to overwrite an\n  existing workflow without --force.\n\n${formatFlywheelKnobsGuide()
         .map((l) => `  ${l}`)
         .join("\n")}\n`,
     );
@@ -8229,10 +8313,12 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
   const specDir = dirname(absSpec);
   const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
   let ratingsRegistered = false;
+  let ratingsVersion: string | undefined;
   const ratingsName = `${ir.name}-ratings`;
   if (ir.feedback !== undefined && isRegistrySafeName(ratingsName)) {
     try {
-      ratingsRegistered = (await latestVersion(registry, ratingsName)) !== undefined;
+      ratingsVersion = await latestVersion(registry, ratingsName);
+      ratingsRegistered = ratingsVersion !== undefined;
     } catch {
       // An unreadable registry just means no ratings default.
     }
@@ -8254,6 +8340,18 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
     if (err instanceof FlywheelConfigError) die(err.message);
     throw err;
   }
+  // NEW-flywheel-shadow — always disclose which precedence rung chose the
+  // dataset, and warn loudly when the conventional file shadows a distilled
+  // `<spec>-ratings` registry dataset (the state every init --with-evals +
+  // feedback.autoDistill harness eventually lands in).
+  process.stdout.write(`${formatDatasetSourceLine(data)}\n`);
+  const shadowWarning = formatRatingsShadowWarning({
+    data,
+    specName: ir.name,
+    ratingsRegistered,
+    ...(ratingsVersion !== undefined ? { ratingsVersion } : {}),
+  });
+  if (shadowWarning !== undefined) process.stderr.write(`crewhaus: ${shadowWarning}\n`);
 
   let gradersYaml: string;
   try {
@@ -8284,6 +8382,11 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
   if (registryRef !== undefined) {
     let resolved: Awaited<ReturnType<typeof resolveRegistryRef>>;
     try {
+      // B16 — the acceptance evals gate accept/reject on these samples, so
+      // the locked test split must never be among them: bare refs (incl.
+      // the ratings fallback) resolve train+dev only, and an explicit
+      // #test ref is refused outright (mirrors `optimize`).
+      refuseTestSplitRef("flywheel", registryRef);
       resolved = await resolveRegistryRef(registry, registryRef);
     } catch (err) {
       if (err instanceof DatasetRefError || err instanceof CrewhausError) die(err.message);
@@ -8665,8 +8768,10 @@ async function runEvalCoverage(args: ParsedArgs): Promise<void> {
         "  a ranked list of gaps: 'mcp__jira__CreateIssue appears in 31% of sessions\n" +
         "  but 0 dataset samples', 'compaction fired in N sessions, never in eval',\n" +
         "  prod tool sequences no expected_tools covers. --dataset defaults to the\n" +
-        "  conventional eval/dataset.jsonl next to the cwd spec. --format json emits a\n" +
-        "  ranked backlog consumable by `crewhaus dataset mine`.\n",
+        "  conventional eval/dataset.jsonl next to the cwd spec; a bare registry ref is\n" +
+        "  inspected across ALL splits, the locked test split included (gap analysis is\n" +
+        "  inspection, not consumption). --format json emits a ranked backlog consumable\n" +
+        "  by `crewhaus dataset mine`.\n",
     );
     return;
   }
@@ -8715,9 +8820,14 @@ async function runEvalCoverage(args: ParsedArgs): Promise<void> {
     const registryRef = parseRegistryRef(datasetArg);
     if (registryRef !== undefined) {
       const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
-      const resolved = await resolveRegistryRef(registry, registryRef);
-      for (const s of resolved.samples) samples.push(s);
-      datasetName = resolved.datasetName;
+      // Inspection, not consumption (the `dataset audit` posture): gap
+      // detection must stay split-complete — a behavior only the locked test
+      // split exercises is NOT a gap — so a bare ref reads the whole record
+      // (test included) instead of resolveRegistryRef's train+dev
+      // consumption view. Nothing here runs or derives data from the samples.
+      const inspected = await inspectRegistryRef(registry, registryRef);
+      for (const s of inspected.samples) samples.push(s);
+      datasetName = inspected.datasetName;
       datasetResolved = true;
     } else {
       const absDataset = resolve(datasetArg);
@@ -8837,11 +8947,15 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus eval <spec.yaml> --dataset <data> --graders <graders.yaml> " +
         "[--judge-model <model>] [--concurrency N] [--seed N] [--repeats K] [-o <out-dir>] " +
-        "[--gate] [--no-promote] [--no-regressions] [--no-retry] [--models <m1,m2,...>]\n" +
+        "[--gate] [--no-promote] [--no-regressions] [--no-retry] [--allow-test-split] " +
+        "[--models <m1,m2,...>]\n" +
         "  --dataset takes a file path (jsonl/csv/yaml/http) or registry:<name>[@version][#split]\n" +
         "  — a Section 29 dataset-registry ref (.crewhaus/datasets, or CREWHAUS_DATASETS_DIR).\n" +
-        "  Default version: latest; default samples: the union of all splits (give #train,\n" +
-        "  #dev, or #test to eval one split). Runs key into the history index/baselines as\n" +
+        "  Default version: latest; default samples: train + dev (a bare ref EXCLUDES the\n" +
+        "  locked test split, with a stderr note when one existed; give #train or #dev to\n" +
+        "  eval one split). An explicit #test is refused unless --allow-test-split is also\n" +
+        "  passed — the held-out split exists to be spent at release-gate time, and\n" +
+        "  optimize/flywheel refuse it outright. Runs key into the history index/baselines as\n" +
         "  <name>@<version>[#split] with a content hash derived from the record's sample hashes.\n" +
         "  -o defaults to .crewhaus/evals/<runId>. Every run is appended to\n" +
         "  .crewhaus/evals/index.jsonl and diffed against the pinned baseline for its\n" +
@@ -9044,7 +9158,12 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
     let resolved: Awaited<ReturnType<typeof resolveRegistryRef>>;
     try {
-      resolved = await resolveRegistryRef(registry, registryRef);
+      // B16 — bare refs resolve train+dev only; an explicit #test needs the
+      // --allow-test-split opt-in (the CLI face of the registry's
+      // test-split lock — spend the holdout at release-gate time only).
+      resolved = await resolveRegistryRef(registry, registryRef, {
+        allowTestSplit: args.flags["allow-test-split"] === true,
+      });
     } catch (err) {
       if (err instanceof DatasetRefError || err instanceof CrewhausError) die(err.message);
       throw err;
@@ -9823,6 +9942,12 @@ async function runEvalReportDiff(args: ParsedArgs): Promise<void> {
   const outArg = args.flags["out"];
   const prevLoaded = await loadRun(prev);
   const nextLoaded = await loadRun(next);
+  // NEW-HUNT-1 — the diff still renders, but when the two runs recorded
+  // different graders configs or judge models the deltas may be the
+  // instrument's, not the agent's. Warn on stderr so piped stdout stays clean.
+  for (const warning of diffInstrumentWarnings(prevLoaded, nextLoaded)) {
+    process.stderr.write(`[eval-report] warning: ${warning}\n`);
+  }
   const result = diffReports(prevLoaded, nextLoaded);
 
   if (typeof outArg === "string") {
@@ -9947,10 +10072,14 @@ function runEvalReportBaseline(args: ParsedArgs): void {
         datasetName: entry.datasetName,
         runId: entry.runId,
         // Carry the spec source forward from the index entry (when present)
-        // so manual pins keep collision detection working.
+        // so manual pins keep collision detection working — and the
+        // instrument identity so gradersHash/judgeModel mismatch detection
+        // keeps working too.
         ...(entry.specSource !== undefined ? { specSource: entry.specSource } : {}),
         outDir: entry.outDir,
         datasetHash: entry.datasetHash,
+        ...(entry.gradersHash !== undefined ? { gradersHash: entry.gradersHash } : {}),
+        ...(entry.judgeModel !== undefined ? { judgeModel: entry.judgeModel } : {}),
         ts: new Date().toISOString(),
       });
       process.stdout.write(
@@ -9978,7 +10107,8 @@ async function runDatasets(args: ParsedArgs): Promise<void> {
         "  get <name>[@version] [--split train|dev|test]\n" +
         "                                              print samples as JSONL to stdout. Default: the\n" +
         "                                              latest version, all splits merged with a top-level\n" +
-        "                                              `split` column; --split prints one split verbatim\n" +
+        "                                              `split` column; --split prints one split verbatim.\n" +
+        "                                              Emitting locked test-split rows prints a stderr note\n" +
         "  put <name> --file <data.jsonl|csv|yaml> [--split-spec 70/15/15 | --split train]\n" +
         "                                              import a dataset file as a new auto-bumped version\n" +
         "                                              (v1, v2, …). Split assignment is deterministic —\n" +
@@ -10062,6 +10192,15 @@ async function runDatasetsGet(args: ParsedArgs): Promise<void> {
   if (split !== undefined && record.splits[split] === undefined) {
     die(`split "${split}" not present in "${name}@${resolvedVersion}"`);
   }
+  // B16 — `datasets get` keeps printing test rows (inspection is not
+  // consumption), but says so on stderr whenever it does: the test split is
+  // meant to be spent only at release-gate time.
+  const testRows = split === undefined || split === "test" ? (record.splits.test?.length ?? 0) : 0;
+  if (testRows > 0) {
+    process.stderr.write(
+      `[datasets] note: ${testRows} locked test-split row(s) emitted from "${name}@${resolvedVersion}" — the test split is reserved for release gating (--allow-test-split on \`crewhaus eval\` / \`crewhaus deploy canary\`)\n`,
+    );
+  }
   process.stdout.write(recordToJsonl(record, split));
 }
 
@@ -10127,15 +10266,17 @@ function readAuditRecords(): unknown[] {
   return out;
 }
 
-/** `dataset` dispatcher — mine / synthesize / refresh-goldens (item 5). */
+/** `dataset` dispatcher — mine / synthesize / refresh-goldens (item 5) /
+ *  audit (B23). */
 async function runDataset(args: ParsedArgs): Promise<void> {
   const action = args.positional[0];
   if (args.flags["help"] && action === undefined) {
     process.stdout.write(
-      "usage: crewhaus dataset <mine|synthesize|refresh-goldens> [...]\n" +
+      "usage: crewhaus dataset <mine|synthesize|refresh-goldens|audit> [...]\n" +
         "  mine            grow the dataset from production struggle signals (item 2)\n" +
         "  synthesize      generate PII-redacted stress variants of a source dataset (item 2)\n" +
-        "  refresh-goldens reconcile user corrections with existing golds (item 5)\n",
+        "  refresh-goldens reconcile user corrections with existing golds (item 5)\n" +
+        "  audit           offline PII/secret scan of an existing dataset (B23)\n",
     );
     return;
   }
@@ -10150,9 +10291,12 @@ async function runDataset(args: ParsedArgs): Promise<void> {
       case "refresh-goldens":
         await runRefreshGoldens(args);
         return;
+      case "audit":
+        await runDatasetAudit(args);
+        return;
       default:
         die(
-          `dataset: unknown action "${action ?? ""}" — supported: mine, synthesize, refresh-goldens`,
+          `dataset: unknown action "${action ?? ""}" — supported: mine, synthesize, refresh-goldens, audit`,
         );
     }
   } catch (err) {
@@ -10172,12 +10316,16 @@ async function runDatasetMine(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus dataset mine [--sessions N|all] [--out-dataset <name>] [--review] [--yes]\n" +
+        "                             [--no-redact]\n" +
         "  Scan .crewhaus/sessions/*.jsonl (this spec) for hard cases needing NO\n" +
         "  rating — error events, tool_result isError spikes, the synthetic\n" +
         "  '[runtime] possible loop detected' nudge, consecutive near-duplicate\n" +
         "  user retries — plus egress_decision blocks from .crewhaus/audit (if any).\n" +
         "  Each triggering turn's input becomes a candidate Sample in a QUARANTINE\n" +
         "  staging file (.crewhaus/datasets/_quarantine/<spec>-hardcases.jsonl).\n" +
+        "  Candidate text (input + reason) is PII/secret-redacted before it is\n" +
+        "  written (the same detector set `dataset synthesize` uses); --no-redact\n" +
+        "  keeps it raw (dev/local only).\n" +
         "  --review accepts/rejects candidates: interactive in a TTY ([a]ccept /\n" +
         "  [r]eject / [s]kip); in non-TTY it only PRINTS the candidates unless --yes\n" +
         "  is also given, in which case ALL listed candidates promote. This keeps a\n" +
@@ -10230,11 +10378,14 @@ async function runDatasetMine(args: ParsedArgs): Promise<void> {
     return;
   }
 
-  // Always (re)write the quarantine staging file.
+  // Always (re)write the quarantine staging file. B23 — candidate free-text
+  // (input + reason) is redacted at sample construction unless --no-redact,
+  // so raw PII/secrets never reach the quarantine file or a promoted version.
+  const redact = args.flags["no-redact"] === true ? undefined : redactDatasetText;
   const quarantineDir = join(process.cwd(), QUARANTINE_SUBDIR);
   mkdirSync(quarantineDir, { recursive: true });
   const quarantinePath = join(quarantineDir, `${specName}-hardcases.jsonl`);
-  const quarantineSamples = candidates.map(candidateToSample);
+  const quarantineSamples = candidates.map((c) => candidateToSample(c, redact));
   writeFileSync(quarantinePath, `${quarantineSamples.map((s) => JSON.stringify(s)).join("\n")}\n`);
   process.stdout.write(
     `[dataset mine] ${candidates.length} candidate(s) quarantined → ${quarantinePath}\n`,
@@ -10275,7 +10426,7 @@ async function runDatasetMine(args: ParsedArgs): Promise<void> {
   const rec = await registerDataset({
     registry,
     name: outDataset,
-    samples: accepted.map(candidateToSample),
+    samples: accepted.map((c) => candidateToSample(c, redact)),
   });
   process.stdout.write(
     `[dataset mine] promoted ${accepted.length} accepted candidate(s) → ${rec.name}@${rec.version} ` +
@@ -10338,7 +10489,10 @@ async function runDatasetSynthesize(args: ParsedArgs): Promise<void> {
         "  injection variants marked adversarial). Synthetic samples NEVER carry a\n" +
         "  human gold answer, so they can't contaminate real golds. Deterministic\n" +
         "  template mutations when no credentials; model paraphrases (budget-capped\n" +
-        "  via --budget-usd) when a model is available.\n",
+        "  via --budget-usd) when a model is available. A bare registry --from\n" +
+        "  resolves train+dev only — the locked test split never seeds synthetic\n" +
+        "  data (and an explicit #test is refused), so holdout inputs cannot leak\n" +
+        "  into a trainable dataset.\n",
     );
     return;
   }
@@ -10466,8 +10620,11 @@ async function runRefreshGoldens(args: ParsedArgs): Promise<void> {
         "  fail consistently across eval runs yet are repeatedly up-rated live are\n" +
         "  flagged stale (via the run-history index; no history → no stale signal).\n" +
         "  Default prints the diff only; --apply writes the reconciled samples as a\n" +
-        "  NEW dataset-registry version (never in-place). Sample content hashes give\n" +
-        "  provenance.\n",
+        "  NEW dataset-registry version (never in-place). A bare registry ref\n" +
+        "  reconciles train+dev only (the locked test split's golds are never\n" +
+        "  proposed against), and --apply preserves the record's split structure\n" +
+        "  exactly — unselected splits, test included, pass through untouched.\n" +
+        "  Sample content hashes give provenance.\n",
     );
     return;
   }
@@ -10485,16 +10642,20 @@ async function runRefreshGoldens(args: ParsedArgs): Promise<void> {
   }
 
   // Resolve the dataset samples + the registry name to version on --apply.
+  // B16 — a bare registry ref reconciles train+dev only (the locked test
+  // split's golds are never proposed against, or echoed into the diff).
   const registryRef = parseRegistryRef(datasetArg);
   const samples: Sample[] = [];
   let datasetLabel: string;
   let registryName: string | undefined;
+  let registryRecord: DatasetRecord | undefined;
   if (registryRef !== undefined) {
     const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
     const resolved = await resolveRegistryRef(registry, registryRef);
     for (const s of resolved.samples) samples.push(s);
     datasetLabel = resolved.datasetName;
     registryName = registryRef.name;
+    registryRecord = resolved.record;
   } else {
     const abs = resolve(datasetArg);
     if (!existsSync(abs)) die(`--dataset "${datasetArg}" not found`);
@@ -10545,13 +10706,155 @@ async function runRefreshGoldens(args: ParsedArgs): Promise<void> {
 
   if (!apply || result.proposals.length === 0) return;
 
-  const updated = applyProposals(samples, result.proposals);
   const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
-  // Registry name is guaranteed defined here (checked above).
-  const rec = await registerDataset({ registry, name: registryName as string, samples: updated });
+  // Registry name + record are guaranteed defined here (checked above).
+  const name = registryName as string;
+  const record = registryRecord as DatasetRecord;
+  // B16 — write the new version by applying the proposals WITHIN the
+  // record's existing split structure (never re-split): re-splitting the
+  // resolved union would silently drop the locked test rows (bare refs
+  // resolve train+dev only) and re-partition already-consumed train/dev
+  // samples into a fabricated — contaminated — "test" holdout. Proposals
+  // are keyed by sample id and only ever name samples of the splits the ref
+  // selected, so unselected splits (test included) pass through
+  // byte-identical.
+  const version = nextVersion(await registry.list(name));
+  const rec = await registry.put({
+    name,
+    version,
+    splits: {
+      train: applyProposals(record.splits.train, result.proposals),
+      dev: applyProposals(record.splits.dev, result.proposals),
+      ...(record.splits.test !== undefined
+        ? { test: applyProposals(record.splits.test, result.proposals) }
+        : {}),
+    },
+  });
   process.stdout.write(
-    `[refresh-goldens] applied ${result.proposals.length} gold update(s) → ${rec.name}@${rec.version} (new version; prior versions untouched)\n`,
+    `[refresh-goldens] applied ${result.proposals.length} gold update(s) → ${rec.name}@${rec.version} (new version, split structure preserved; prior versions untouched)\n`,
   );
+}
+
+/**
+ * B23 — `crewhaus dataset audit`: offline PII/secret scan of an EXISTING
+ * dataset (regex detectors only — no model calls, nothing leaves the box).
+ * Reports hits per detector/field/sample without ever echoing the matched
+ * text; `--apply` (registry refs only) writes the redacted samples as a NEW
+ * version preserving the record's split structure exactly (never in place,
+ * never re-split — moving a redacted sample between splits would corrupt the
+ * train/test separation); `--strict` exits non-zero when any hit is found so
+ * CI can gate on dataset hygiene.
+ */
+async function runDatasetAudit(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus dataset audit [--pii] --dataset <file|registry:ref> [--apply] [--strict]\n" +
+        "  Offline PII/secret scan of an EXISTING dataset (regex detectors only —\n" +
+        "  no model calls). Scans input, expected_output, and string metadata\n" +
+        "  fields of every sample; a registry ref without #split is scanned across\n" +
+        "  ALL splits, test included (inspection, not consumption). The report\n" +
+        "  counts hits per detector/field/sample id and never echoes the matched\n" +
+        "  text. --pii names the scan category explicitly (PII/secret is the only\n" +
+        "  category today, so it is implied). --apply requires a\n" +
+        "  registry:<name>[@version] ref and writes the redacted samples as a NEW\n" +
+        "  version preserving the record's split structure exactly (never in\n" +
+        "  place, never re-split). --strict exits non-zero when any hit is found\n" +
+        "  (the CI gate; with --apply the new version is written first).\n",
+    );
+    return;
+  }
+  const datasetArg = strFlag(args, "dataset");
+  if (datasetArg === undefined) die("missing --dataset <file|registry:ref>");
+  const apply = args.flags["apply"] === true;
+  const strict = args.flags["strict"] === true;
+
+  const registryRef = parseRegistryRef(datasetArg);
+  if (apply && registryRef === undefined) {
+    die(
+      "--apply requires --dataset registry:<name>[@version] — a redacted NEW version is written to the registry, never a file in place",
+    );
+  }
+  if (apply && registryRef?.split !== undefined) {
+    die("--apply rewrites the whole record (every split) — drop the #split from the ref");
+  }
+
+  // Resolve the samples to scan. Registry refs read the record directly
+  // (not resolveRegistryRef): the audit INSPECTS every split — test included
+  // — because PII in the held-out split is still a leak. That mirrors
+  // `datasets get`'s inspection posture; nothing here consumes the lock.
+  let samples: Sample[];
+  let label: string;
+  let record: DatasetRecord | undefined;
+  if (registryRef !== undefined) {
+    const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+    const version = registryRef.version ?? (await latestVersion(registry, registryRef.name));
+    if (version === undefined) {
+      die(
+        `dataset "${registryRef.name}" has no versions in the registry — import one with \`crewhaus datasets put\``,
+      );
+    }
+    record = await registry.getRecord(registryRef.name, version);
+    if (registryRef.split !== undefined && record.splits[registryRef.split] === undefined) {
+      die(`split "${registryRef.split}" not present in "${registryRef.name}@${version}"`);
+    }
+    const splits = registryRef.split !== undefined ? [registryRef.split] : splitsPresent(record);
+    samples = samplesForSplits(record, splits);
+    label = registryDatasetName(registryRef.name, version, registryRef.split);
+  } else {
+    const abs = resolve(datasetArg);
+    if (!existsSync(abs)) die(`--dataset "${datasetArg}" not found`);
+    const loaded = await loadDataset(abs);
+    samples = [];
+    for await (const s of loaded.samples) samples.push(s);
+    label = loaded.name;
+  }
+  if (samples.length === 0) die(`dataset "${datasetArg}" yielded zero samples`);
+
+  const report = auditSamples(samples);
+  process.stdout.write(renderAuditReport(report, label));
+
+  if (apply && registryRef !== undefined && record !== undefined) {
+    if (report.totalHits === 0) {
+      process.stdout.write("[dataset audit] no hits — nothing to rewrite\n");
+    } else {
+      const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+      const splits = {
+        train: record.splits.train.map((s) => redactSample(s)),
+        dev: record.splits.dev.map((s) => redactSample(s)),
+        ...(record.splits.test !== undefined
+          ? { test: record.splits.test.map((s) => redactSample(s)) }
+          : {}),
+      };
+      const version = nextVersion(await registry.list(registryRef.name));
+      const rec = await registry.put({ name: registryRef.name, version, splits });
+      process.stdout.write(
+        `[dataset audit] wrote redacted ${rec.name}@${rec.version} (new version, split structure preserved; prior versions untouched — prune them if the hits must not persist)\n`,
+      );
+      // B23 — a GOLD altered by redaction silently breaks string-comparison
+      // graders (live agent output is never redacted). Count before/after so
+      // the operator knows the instrument changed, not the agent.
+      let redactedGolds = 0;
+      for (const name of ["train", "dev", "test"] as const) {
+        const before = record.splits[name];
+        const after = splits[name];
+        if (before === undefined || after === undefined) continue;
+        for (const [i, s] of after.entries()) {
+          if (s.expected_output !== undefined && s.expected_output !== before[i]?.expected_output) {
+            redactedGolds += 1;
+          }
+        }
+      }
+      if (redactedGolds > 0) {
+        process.stderr.write(
+          `[dataset audit] warning: ${redactedGolds} gold(s) contained redacted text — exact_match/expected_contains graders will not match live outputs for those samples; prefer llm_judge or tool graders\n`,
+        );
+      }
+    }
+  }
+
+  if (strict && report.totalHits > 0) {
+    die(`dataset audit --strict: ${report.totalHits} PII/secret hit(s) found`);
+  }
 }
 
 // -------- item 8: crewhaus judge calibrate --------
@@ -11693,12 +11996,16 @@ async function runDistill(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus distill (--session <id> | --all-sessions) -o <dataset.jsonl> " +
         "[--graders-out <graders.yaml>] [--min-score F] [--judge] [--judge-model <model>] " +
-        "[--register <name>]\n" +
+        "[--register <name>] [--no-redact]\n" +
         "  --register promotes the distilled samples into the Section 29 dataset registry\n" +
         "  (.crewhaus/datasets, or CREWHAUS_DATASETS_DIR) as a new auto-bumped version of\n" +
         "  <name> with the deterministic default 70/15/15 train/dev/test split (stable by\n" +
         "  sample-id hash), printing <name>@<version>. -o is optional when --register is\n" +
-        "  given; without --register the plain file output is unchanged.\n",
+        "  given; without --register the plain file output is unchanged.\n" +
+        "  Sample text (turn inputs/outputs, comments, corrections) is PII/secret-redacted\n" +
+        "  by default before it lands in the dataset or graders (the same detector set\n" +
+        "  `dataset synthesize` uses); --no-redact keeps it raw (dev/local only — the\n" +
+        "  unattended feedback.autoDistill teardown always redacts).\n",
     );
     return;
   }
@@ -11738,12 +12045,28 @@ async function runDistill(args: ParsedArgs): Promise<void> {
     die("no feedback found — record some with `crewhaus rate` / `crewhaus feedback` first");
   }
 
+  // B23 — free-text redaction is the default; --no-redact opts out for
+  // dev/local parity (the autoDistill teardown consumer never opts out).
   const result = distillFeedback(turns, feedback, {
     minScore,
     ...(useJudge ? { judge: true } : {}),
     ...(typeof judgeModel === "string" ? { judgeModel } : {}),
+    ...(args.flags["no-redact"] === true ? {} : { redact: redactDatasetText }),
   });
   for (const w of result.warnings) process.stderr.write(`[distill] warning: ${w}\n`);
+  // B23 — redaction altering a GOLD is silent otherwise: live agent output is
+  // never redacted, so string-comparison graders can never match such a gold.
+  // Surface the count so a pass-rate drop is traceable to the instrument.
+  if (args.flags["no-redact"] !== true) {
+    const redactedGolds = result.samples.filter(
+      (s) => s.expected_output !== undefined && containsRedactionMarker(s.expected_output),
+    ).length;
+    if (redactedGolds > 0) {
+      process.stderr.write(
+        `[distill] warning: ${redactedGolds} gold(s) contained redacted text — exact_match/expected_contains graders will not match live outputs for those samples; prefer llm_judge or tool graders (or --no-redact for dev/local only)\n`,
+      );
+    }
+  }
   // Item 4 — the synthesis fell back to the floor grader (no consistent
   // tool/phrase signal in the ratings): point at the failure-rationale
   // drafting path, which mines eval runs the ratings can't see.
@@ -11812,10 +12135,16 @@ async function runDistill(args: ParsedArgs): Promise<void> {
  * Inline-distill ratings for `crewhaus optimize --ratings`. `ratingsArg` is a
  * session id or "all". Returns optimizer-shaped samples plus a synthesized
  * graders.yaml (used only when the user did not pass their own --graders).
+ * B23 — `redact` (the shared sync PII/secret redactor unless `--no-redact`
+ * was given) runs over every free-text field at ingestion: these samples
+ * become the optimizer's failing-sample windows (input + expected) in the
+ * meta-prompt sent to an external mutator model, so raw pasted credentials
+ * must never survive into them.
  */
 function distillRatings(
   ratingsArg: string,
   minScore: number,
+  redact: ((text: string) => string) | undefined,
 ): {
   samples: Array<{ id: string; input: string; expected_output?: string }>;
   gradersYaml: string;
@@ -11846,7 +12175,10 @@ function distillRatings(
     );
   }
 
-  const result = distillFeedback(turns, feedback, { minScore });
+  const result = distillFeedback(turns, feedback, {
+    minScore,
+    ...(redact !== undefined ? { redact } : {}),
+  });
   for (const w of result.warnings) process.stderr.write(`[optimize] ratings warning: ${w}\n`);
   const samples = result.samples.map((s) => ({
     id: s.id,
@@ -14309,11 +14641,15 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
         "  crewhaus deploy canary <spec.yaml> <version>      eval-gated ramp (item 29)\n" +
         "    --traffic 5,25,50,100    strictly-increasing ramp steps (default 5,25,50,100)\n" +
         "    --dataset <data>         eval dataset: a file path or registry:<name>[@ver][#split]\n" +
+        "                             (bare refs = train+dev; an explicit #test needs --allow-test-split)\n" +
         "    --graders <graders.yaml> grader config\n" +
         "    --from <version>         baseline version (default: the env's current pin)\n" +
         "    --env <env>              env pin to promote/rollback (default: prod)\n" +
         "    --name <name>            registry spec name (default: the spec's own name)\n" +
         "    --concurrency N --seed N --judge-model <m>   eval knobs (as `crewhaus eval`)\n" +
+        "    --allow-test-split       consume an explicit #test dataset ref — canary gates a\n" +
+        "                             release, so the held-out split is spendable here (the\n" +
+        "                             same opt-in as `crewhaus eval`)\n" +
         "    --max-pass-rate-drop <f> gate: max pass-rate drop before fail (default 0.05)\n" +
         "    --max-p95-latency-ms <n> gate: max p95 latency rise ms before fail (default 5000)\n" +
         "\n" +
@@ -14570,7 +14906,18 @@ async function runDeployCanary(args: ParsedArgs): Promise<void> {
   }
   if (registryRef !== undefined) {
     const dsReg = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
-    const resolved = await resolveRegistryRef(dsReg, registryRef);
+    let resolved: Awaited<ReturnType<typeof resolveRegistryRef>>;
+    try {
+      // B16 — canary IS release gating, so an explicit #test is consumable
+      // here behind the same --allow-test-split opt-in as `crewhaus eval`;
+      // bare refs still resolve train+dev only (with the exclusion notice).
+      resolved = await resolveRegistryRef(dsReg, registryRef, {
+        allowTestSplit: args.flags["allow-test-split"] === true,
+      });
+    } catch (err) {
+      if (err instanceof DatasetRefError || err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
     if (resolved.samples.length === 0)
       die(`dataset "${resolved.datasetName}" yielded zero samples`);
     sharedSamples = resolved.samples;

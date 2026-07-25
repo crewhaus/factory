@@ -301,17 +301,24 @@ export function candidateId(c: MineCandidate): string {
   return `mine_${c.signal}_${slugify(c.sessionId)}_t${c.turnNumber}`;
 }
 
-/** Turn a mined candidate into a quarantine Sample carrying full provenance. */
-export function candidateToSample(c: MineCandidate): Sample {
+/**
+ * Turn a mined candidate into a quarantine Sample carrying full provenance.
+ * `redact` (B23) is applied to the free-text fields — the turn input and the
+ * reason (which can quote a runtime error message verbatim) — before they
+ * land in a dataset; the CLI passes the shared sync PII/secret redactor
+ * unless `--no-redact` was given. Absent → text flows verbatim.
+ */
+export function candidateToSample(c: MineCandidate, redact?: (text: string) => string): Sample {
+  const clean = redact ?? ((t: string): string => t);
   return {
     id: candidateId(c),
-    input: c.input,
+    input: clean(c.input),
     metadata: {
       source: "mine",
       signal: c.signal,
       sessionId: c.sessionId,
       turnNumber: c.turnNumber,
-      reason: c.reason,
+      reason: clean(c.reason),
       status: "quarantine",
       note: "mined hard case — review, add an expected_output/expected_tools, then promote",
     },

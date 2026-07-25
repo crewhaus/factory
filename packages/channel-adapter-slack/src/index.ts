@@ -123,7 +123,19 @@ export interface ChannelAdapter {
   readonly id: string;
   verify(req: RawRequest): boolean;
   parseInbound(req: RawRequest): ParsedInbound;
-  sendReply(args: { event: InboundEvent; text: string }): Promise<void>;
+  /**
+   * D40 — post the reply; when the channel API returns a post receipt, the
+   * adapter surfaces the posted message's ts as `{ messageTs }` so the
+   * generated session-router can append its outbound-ts reaction join
+   * (exact-turn 👍/👎 attribution). Resolving void stays legal — an adapter
+   * without a receipt simply produces no join line, and reactions on its
+   * replies take the router's per-key fallback.
+   */
+  sendReply(args: {
+    event: InboundEvent;
+    text: string;
+    // biome-ignore lint/suspicious/noConfusingVoidType: `void` (not `undefined`) keeps Promise<void>-returning adapter implementations assignable — receipt-less adapters stay backward compatible.
+  }): Promise<{ messageTs?: string } | void>;
   setTyping(args: { event: InboundEvent }): Promise<void>;
   /**
    * Phase 3 §3.2 — add an emoji reaction to an inbound message as a
@@ -290,7 +302,11 @@ export function createSlackAdapter(
       return { kind: "event", event };
     },
 
-    async sendReply(args: { event: InboundEvent; text: string }): Promise<void> {
+    async sendReply(args: {
+      event: InboundEvent;
+      text: string;
+      // biome-ignore lint/suspicious/noConfusingVoidType: matches the ChannelAdapter contract above.
+    }): Promise<{ messageTs?: string } | void> {
       const url = `${apiBaseUrl}/chat.postMessage`;
       const threadKey = args.event.threadTs ?? args.event.ts;
       const res = await doFetch(url, {
@@ -311,10 +327,14 @@ export function createSlackAdapter(
       // Slack returns { ok: false } at HTTP 200 on logical errors; surface that.
       const ct = res.headers.get("content-type") ?? "";
       if (ct.includes("application/json")) {
-        const body = (await res.json()) as { ok?: boolean; error?: string };
+        const body = (await res.json()) as { ok?: boolean; error?: string; ts?: string };
         if (body.ok === false) {
           throw new SlackAdapterError(`chat.postMessage error: ${body.error ?? "unknown"}`);
         }
+        // D40 — surface the posted message's ts (mirroring postApproval's
+        // receipt) so the session-router can record the outbound-ts → turn
+        // join for exact-turn reaction attribution.
+        return typeof body.ts === "string" ? { messageTs: body.ts } : undefined;
       }
     },
 

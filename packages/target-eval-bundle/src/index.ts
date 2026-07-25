@@ -18,6 +18,11 @@ import {
 export function emitEval(ir: IrEvalV0, opts: EmitReadmeOptions = {}): Bundle {
   const seedLine = ir.seed !== undefined ? `  seed: ${ir.seed},\n` : "";
   const toolsLine = ir.agent.tools.length > 0 ? `  // Tools: ${ir.agent.tools.join(", ")}\n` : "";
+  // A spec that DECLARES `split: test` is the explicit release-gate opt-in,
+  // so the emitted bundle passes the registry's allowTestSplit escape hatch
+  // (without it the guarded get() throws at runtime with no way out). Other
+  // splits keep the three-argument call byte-identical.
+  const allowTestArg = ir.dataset.split === "test" ? ", { allowTestSplit: true }" : "";
   const gradersJson = JSON.stringify(ir.graders, null, 2)
     .split("\n")
     .map((l) => `      ${l}`)
@@ -76,7 +81,7 @@ async function main(): Promise<void> {
     ir,
     dataset: {
       name: DATASET.name,
-      samples: registry.get(DATASET.name, DATASET.version, DATASET.split),
+      samples: registry.get(DATASET.name, DATASET.version, DATASET.split${allowTestArg}),
     },
     compiledGraders: compiled,
     opts: {

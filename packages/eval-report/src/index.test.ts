@@ -3,7 +3,15 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
-import { ReportError, type ReportVerdicts, diffReports, loadRun, renderReport } from "./index";
+import {
+  type LoadedRun,
+  ReportError,
+  type ReportVerdicts,
+  diffInstrumentWarnings,
+  diffReports,
+  loadRun,
+  renderReport,
+} from "./index";
 
 const TMP_ROOTS: string[] = [];
 function newTempRoot(): string {
@@ -247,6 +255,69 @@ describe("diffReports (T1)", () => {
     const nextLoaded = await loadRun(nextDir);
     const result = diffReports(prevLoaded, nextLoaded);
     expect(result.diff.scoreShifts).toHaveLength(1);
+  });
+});
+
+// NEW-HUNT-1 — instrument-mismatch warnings: a diff between runs graded with
+// different graders configs or judge models is comparing instruments, not the
+// agent, and the caller should say so. Fields absent on either side (legacy
+// records) never warn.
+describe("diffInstrumentWarnings", () => {
+  function loaded(runId: string, config: Partial<EvalRunSummary["config"]>): LoadedRun {
+    const summary = makeRunSummary(runId, [makeSampleResult("a", true, 1)]);
+    return { summary: { ...summary, config: { ...summary.config, ...config } }, perSample: {} };
+  }
+
+  test("warns when gradersHash differs between the two runs", () => {
+    const warnings = diffInstrumentWarnings(
+      loaded("run_aaaa1111aaaa1111", { gradersHash: "g-hash-1" }),
+      loaded("run_bbbb2222bbbb2222", { gradersHash: "g-hash-2" }),
+    );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("g-hash-1");
+    expect(warnings[0]).toContain("g-hash-2");
+    expect(warnings[0]).toContain("graders configs");
+  });
+
+  test("warns when judgeModel differs between the two runs", () => {
+    const warnings = diffInstrumentWarnings(
+      loaded("run_aaaa1111aaaa1111", { judgeModel: "judge-model-a" }),
+      loaded("run_bbbb2222bbbb2222", { judgeModel: "judge-model-b" }),
+    );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("judge-model-a");
+    expect(warnings[0]).toContain("judge-model-b");
+  });
+
+  test("both mismatched produces one warning per field", () => {
+    const warnings = diffInstrumentWarnings(
+      loaded("run_aaaa1111aaaa1111", { gradersHash: "g-hash-1", judgeModel: "judge-model-a" }),
+      loaded("run_bbbb2222bbbb2222", { gradersHash: "g-hash-2", judgeModel: "judge-model-b" }),
+    );
+    expect(warnings).toHaveLength(2);
+  });
+
+  test("identical instruments produce no warnings", () => {
+    const warnings = diffInstrumentWarnings(
+      loaded("run_aaaa1111aaaa1111", { gradersHash: "g-hash-1", judgeModel: "judge-model-a" }),
+      loaded("run_bbbb2222bbbb2222", { gradersHash: "g-hash-1", judgeModel: "judge-model-a" }),
+    );
+    expect(warnings).toEqual([]);
+  });
+
+  test("a side missing the fields (legacy record) never warns", () => {
+    expect(
+      diffInstrumentWarnings(
+        loaded("run_aaaa1111aaaa1111", {}),
+        loaded("run_bbbb2222bbbb2222", { gradersHash: "g-hash-2", judgeModel: "judge-model-b" }),
+      ),
+    ).toEqual([]);
+    expect(
+      diffInstrumentWarnings(
+        loaded("run_aaaa1111aaaa1111", { gradersHash: "g-hash-1", judgeModel: "judge-model-a" }),
+        loaded("run_bbbb2222bbbb2222", {}),
+      ),
+    ).toEqual([]);
   });
 });
 

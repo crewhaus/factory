@@ -459,6 +459,17 @@ export type DistillOptions = {
   /** Judge model baked into the emitted llm_judge grader (else the runner's
    *  `--judge-model` applies at eval time). */
   judgeModel?: string;
+  /** B23 — applied to every free-text field before it can land in a sample:
+   *  turn input/output (→ `input` / `expected_output`), feedback
+   *  comment/correction (→ gold, metadata, and the judge-rubric/grader
+   *  synthesis they seed), and the rater identity (→ `metadata.rater` — it
+   *  can be an email or chat handle, and `dataset audit` scans ALL string
+   *  metadata leaves, so an unredacted rater would fail `--strict` on the
+   *  default pipeline's own output). The CLI passes the shared sync
+   *  PII/secret redactor (`dataset-audit.ts` `redactDatasetText`) unless
+   *  `--no-redact` was given; absent → text flows verbatim, byte-identical
+   *  to the pre-B23 behavior. */
+  redact?: (text: string) => string;
 };
 
 export type DistillStats = {
@@ -483,17 +494,34 @@ export type DistillResult = {
  * GOLD (expected_output set), the rest carry a low `metadata.user_rating` and
  * no expected_output so they feed the optimizer's failure channel. A single
  * deterministic grader is synthesized from the positive turns' behavior
- * (exactly one, to avoid the hard-AND collapse in `all(...)`).
+ * (exactly one, to avoid the hard-AND collapse in `all(...)`). When
+ * `opts.redact` is set it runs over every turn/feedback free-text field FIRST,
+ * so nothing downstream — samples, metadata, grader synthesis, the judge
+ * rubric — ever sees the raw text (B23).
  */
 export function distill(
   turns: ReadonlyArray<SessionTurn>,
   feedback: ReadonlyArray<FeedbackRecord>,
   opts: DistillOptions,
 ): DistillResult {
+  const redact = opts.redact;
+  const cleanTurns =
+    redact === undefined
+      ? turns
+      : turns.map((t) => ({ ...t, input: redact(t.input), output: redact(t.output) }));
+  const cleanFeedback =
+    redact === undefined
+      ? feedback
+      : feedback.map((r) => ({
+          ...r,
+          ...(r.comment !== undefined ? { comment: redact(r.comment) } : {}),
+          ...(r.correction !== undefined ? { correction: redact(r.correction) } : {}),
+          ...(r.rater !== undefined ? { rater: redact(r.rater) } : {}),
+        }));
   const turnByKey = new Map<string, SessionTurn>();
-  for (const t of turns) turnByKey.set(turnKey(t.sessionId, t.turnNumber), t);
+  for (const t of cleanTurns) turnByKey.set(turnKey(t.sessionId, t.turnNumber), t);
 
-  const merged = mergeFeedback(feedback);
+  const merged = mergeFeedback(cleanFeedback);
   const samples: Sample[] = [];
   const positiveTurns: DerivedTurn[] = [];
   const positiveComments: string[] = [];
@@ -700,15 +728,29 @@ function summarizeComments(comments: ReadonlyArray<string>): string | undefined 
   return joined.length > 400 ? `${joined.slice(0, 400)}…` : joined;
 }
 
+/** B23 — the ingestion redactor's own markers: replace-mode
+ *  `[REDACTED:<kind>]` (the only form `dataset-audit.ts` `redactDatasetText`
+ *  emits) plus the PiiRedactor hash mode's `[HASHED:<kind>:<hmac>]` for
+ *  symmetry. Stripped before tokenizing so the marker's own tokens
+ *  ("redacted", detector kinds like "email") can never win the frequency
+ *  ranking and become a `preferred_phrase` grader — live agent output is
+ *  never redacted, so such a grader could never pass. */
+const REDACTION_MARKER_RE = /\[(?:REDACTED:[a-z0-9_]+|HASHED:[a-z0-9_]+:[0-9a-f]+)\]/gi;
+
 /** The most frequent distinctive token (alnum, length ≥ 4, non-stopword)
- *  appearing in at least half of the answers. Undefined when none qualifies. */
+ *  appearing in at least half of the answers. Undefined when none qualifies.
+ *  Redaction markers are stripped first (see {@link REDACTION_MARKER_RE}) so
+ *  a grader is only ever derived from the up-rated behavior itself. */
 function commonToken(answers: ReadonlyArray<string>): string | undefined {
   const nonEmpty = answers.filter((a) => a.trim() !== "");
   if (nonEmpty.length === 0) return undefined;
   const docFreq = new Map<string, number>();
   for (const answer of nonEmpty) {
     const seen = new Set<string>();
-    for (const raw of answer.toLowerCase().split(/[^a-z0-9]+/)) {
+    for (const raw of answer
+      .replace(REDACTION_MARKER_RE, " ")
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)) {
       if (raw.length < 4 || STOPWORDS.has(raw) || seen.has(raw)) continue;
       seen.add(raw);
       docFreq.set(raw, (docFreq.get(raw) ?? 0) + 1);

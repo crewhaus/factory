@@ -18,8 +18,10 @@ import {
   type FlywheelOptimizeOutcome,
   buildFlywheelWorkflowYaml,
   evaluateFlywheelAcceptance,
+  formatDatasetSourceLine,
   formatFlywheelKnobsGuide,
   formatFlywheelReport,
+  formatRatingsShadowWarning,
   normalizeHarnessDir,
   resolveFlywheelData,
   resolveFlywheelKnobs,
@@ -285,6 +287,75 @@ describe("resolveFlywheelData", () => {
     expect(() => resolveFlywheelData({ ...base, hasConventionalDataset: true })).toThrow(
       "no graders",
     );
+  });
+});
+
+describe("formatDatasetSourceLine + formatRatingsShadowWarning (NEW-flywheel-shadow)", () => {
+  const base = {
+    specName: "concierge",
+    specDir: ".",
+    hasConventionalDataset: false,
+    hasConventionalGraders: true,
+    ratingsRegistered: false,
+  };
+
+  test("the source line names the resolved dataset and its precedence rung", () => {
+    const flag = resolveFlywheelData({ ...base, datasetFlag: "my.jsonl" });
+    expect(formatDatasetSourceLine(flag)).toBe("[flywheel] dataset: my.jsonl (source: flag)");
+    const convention = resolveFlywheelData({ ...base, hasConventionalDataset: true });
+    expect(formatDatasetSourceLine(convention)).toBe(
+      `[flywheel] dataset: ${CONVENTIONAL_DATASET} (source: convention)`,
+    );
+    const ratings = resolveFlywheelData({ ...base, ratingsRegistered: true });
+    expect(formatDatasetSourceLine(ratings)).toBe(
+      "[flywheel] dataset: registry:concierge-ratings (source: ratings-registry)",
+    );
+  });
+
+  test("warns when the convention file shadows a registered ratings dataset", () => {
+    const data = resolveFlywheelData({
+      ...base,
+      hasConventionalDataset: true,
+      ratingsRegistered: true,
+    });
+    const warning = formatRatingsShadowWarning({
+      data,
+      specName: "concierge",
+      ratingsRegistered: true,
+      ratingsVersion: "v3",
+    });
+    expect(warning).toContain(CONVENTIONAL_DATASET);
+    expect(warning).toContain("shadows");
+    expect(warning).toContain("registry:concierge-ratings@v3");
+    // The exact remediation flag, copy-pasteable.
+    expect(warning).toContain("pass --dataset registry:concierge-ratings");
+  });
+
+  test("no warning when the flag chose the dataset or no ratings exist", () => {
+    const flagged = resolveFlywheelData({
+      ...base,
+      datasetFlag: "my.jsonl",
+      hasConventionalDataset: true,
+      ratingsRegistered: true,
+    });
+    expect(
+      formatRatingsShadowWarning({ data: flagged, specName: "concierge", ratingsRegistered: true }),
+    ).toBeUndefined();
+    const noRatings = resolveFlywheelData({ ...base, hasConventionalDataset: true });
+    expect(
+      formatRatingsShadowWarning({
+        data: noRatings,
+        specName: "concierge",
+        ratingsRegistered: false,
+      }),
+    ).toBeUndefined();
+  });
+
+  test("the ratings-registry rung itself never warns (nothing is shadowed)", () => {
+    const data = resolveFlywheelData({ ...base, ratingsRegistered: true });
+    expect(
+      formatRatingsShadowWarning({ data, specName: "concierge", ratingsRegistered: true }),
+    ).toBeUndefined();
   });
 });
 
@@ -771,8 +842,79 @@ describe("crewhaus flywheel (CLI surface)", () => {
     expect(res.stdout).toContain("permissions");
     // H3 — budget scope honesty (evals are billed outside the budget).
     expect(res.stdout).toContain("NOT metered by this budget");
-    // H6 — registry-ratings acceptance evals span every split, test included.
-    expect(res.stdout).toContain("ALL splits");
-    expect(res.stdout).toContain("per-split acceptance gating is a future knob");
+    // B16 — registry refs resolve train+dev only; the locked test split
+    // never enters the flywheel (supersedes the old ALL-splits disclosure).
+    expect(res.stdout).toContain("train+dev only");
+    expect(res.stdout).toContain("#test ref is refused");
+    expect(res.stdout).not.toContain("ALL splits");
+    // NEW-flywheel-shadow — the provenance line + shadow warning are documented.
+    expect(res.stdout).toContain("flag|convention|ratings-registry");
+    expect(res.stdout).toContain("shadows");
+  });
+
+  test("B16 — flywheel run refuses an explicit #test registry ref", async () => {
+    const root = newTempRoot();
+    writeFileSync(
+      join(root, "crewhaus.yaml"),
+      "name: hello\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n",
+    );
+    mkdirSync(join(root, "eval"), { recursive: true });
+    writeFileSync(
+      join(root, "eval", "graders.yaml"),
+      "graders:\n  - name: g\n    type: contains\n    substring: 'x'\n",
+    );
+    const res = await runCli(["flywheel", "run", "--dataset", "registry:golden#test"], root);
+    expect(res.exitCode).toBe(1);
+    expect(res.stderr).toContain("flywheel never runs over the test split");
+    // NEW-flywheel-shadow — the provenance line printed before the refusal.
+    expect(res.stdout).toContain("[flywheel] dataset: registry:golden#test (source: flag)");
+  });
+
+  test("NEW-flywheel-shadow — a conventional dataset shadowing ratings warns loudly", async () => {
+    const root = newTempRoot();
+    writeFileSync(
+      join(root, "crewhaus.yaml"),
+      "name: hello\ntarget: cli\nagent:\n  model: m\n  instructions: hi\nfeedback:\n  enabled: true\n",
+    );
+    mkdirSync(join(root, "eval"), { recursive: true });
+    // Zero samples → a deterministic die strictly AFTER data resolution (and
+    // the provenance/shadow prints), before anything paid.
+    writeFileSync(join(root, "eval", "dataset.jsonl"), "");
+    writeFileSync(
+      join(root, "eval", "graders.yaml"),
+      "graders:\n  - name: g\n    type: contains\n    substring: 'x'\n",
+    );
+    const ratings = join(root, "ratings.jsonl");
+    writeFileSync(ratings, '{"id":"r1","input":"hi","expected_output":"yo"}\n');
+    expect(
+      (await runCli(["datasets", "put", "hello-ratings", "--file", ratings], root)).exitCode,
+    ).toBe(0);
+
+    const res = await runCli(["flywheel", "run"], root);
+    expect(res.exitCode).toBe(1);
+    // The conventional path is spec-dir-absolute; assert the stable suffix.
+    expect(res.stdout).toContain("[flywheel] dataset: ");
+    expect(res.stdout).toContain(`${join("eval", "dataset.jsonl")} (source: convention)`);
+    expect(res.stderr).toContain("shadows the distilled ratings dataset");
+    expect(res.stderr).toContain("registry:hello-ratings@v1");
+    expect(res.stderr).toContain("pass --dataset registry:hello-ratings");
+  });
+
+  test("NEW-flywheel-shadow — no shadow warning without a registered ratings dataset", async () => {
+    const root = newTempRoot();
+    writeFileSync(
+      join(root, "crewhaus.yaml"),
+      "name: hello\ntarget: cli\nagent:\n  model: m\n  instructions: hi\nfeedback:\n  enabled: true\n",
+    );
+    mkdirSync(join(root, "eval"), { recursive: true });
+    writeFileSync(join(root, "eval", "dataset.jsonl"), "");
+    writeFileSync(
+      join(root, "eval", "graders.yaml"),
+      "graders:\n  - name: g\n    type: contains\n    substring: 'x'\n",
+    );
+    const res = await runCli(["flywheel", "run"], root);
+    expect(res.exitCode).toBe(1);
+    expect(res.stdout).toContain("(source: convention)");
+    expect(res.stderr).not.toContain("shadows");
   });
 });

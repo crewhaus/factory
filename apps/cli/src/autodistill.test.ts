@@ -255,6 +255,35 @@ describe("maybeAutoDistill", () => {
     expect(c.lines[0]).toContain("registry:hello-ratings@v1");
   });
 
+  // B23 — the teardown consumer is unattended, so it ALWAYS redacts: raw
+  // PII/secrets in turn text or corrections never reach the registry.
+  test("always PII/secret-redacts the registered samples (no opt-out)", async () => {
+    const c = ctx();
+    const ssn = ["219", "09", "9999"].join("-");
+    const email = ["jane", "example.com"].join("@");
+    const { turns, records } = makeRatedSession(5);
+    const leakyTurns = turns.map((t, i) =>
+      i === 0 ? { ...t, input: `my ssn is ${ssn}`, output: `mail ${email}` } : t,
+    );
+    const result = await maybeAutoDistill({
+      specName: "hello",
+      feedback: FEEDBACK_ON,
+      turns: leakyTurns,
+      records,
+      registry: c.registry,
+      stateFilePath: c.stateFilePath,
+      env: {},
+      write: (l) => c.lines.push(l),
+    });
+    expect(result.ran).toBe(true);
+    const record = await c.registry.getRecord("hello-ratings", "v1");
+    const text = JSON.stringify(record);
+    expect(text).not.toContain(ssn);
+    expect(text).not.toContain(email);
+    expect(text).toContain("[REDACTED:ssn]");
+    expect(text).toContain("[REDACTED:email]");
+  });
+
   test("re-running with the same records does NOT re-distill (watermark)", async () => {
     const c = ctx();
     const { turns, records } = makeRatedSession(5);

@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { IrChannelV0 } from "@crewhaus/ir";
 import { TargetEmitError, emitChannelBot } from "./index";
 
@@ -63,25 +65,28 @@ describe("emitChannelBot — bundle structure (T1)", () => {
   });
 });
 
-describe("emitChannelBot — inbound reaction feedback (feedback.channelReactions)", () => {
+describe("emitChannelBot — inbound reaction feedback (feedback.channelReactions, D40)", () => {
   const withReactions = (sessionKey: "channel" | "user" | "thread"): IrChannelV0 => ({
     ...MIN_IR,
     routing: { sessionKey },
     feedback: { modality: "binary", channelReactions: true },
   });
 
-  test("no feedback block → session-router has no handleReaction; gateway skips reactions", () => {
+  test("no feedback block → no handleReaction, no join store, plain sendReply", () => {
     const files = fileMap(MIN_IR);
     const router = files.get("session-router.ts") ?? "";
     const gateway = files.get("gateway.ts") ?? "";
     expect(router).not.toContain("handleReaction");
     expect(router).not.toContain("user_feedback");
+    expect(router).not.toContain("appendReactionJoin");
+    expect(router).not.toContain("sendReplyWithJoin");
+    expect(router).toContain("await adapter.sendReply({ event, text: reply });");
     // Gateway still narrows the reaction kind (type-safety) but only ACKs it.
     expect(gateway).toContain('parsed.kind === "reaction"');
     expect(gateway).not.toContain("handleReaction");
   });
 
-  test("channel session-key → handleReaction appends a channel-sourced user_feedback line", () => {
+  test("channel session-key → join-first attribution with a last-turn fallback", () => {
     const files = fileMap(withReactions("channel"));
     const router = files.get("session-router.ts") ?? "";
     const gateway = files.get("gateway.ts") ?? "";
@@ -90,24 +95,217 @@ describe("emitChannelBot — inbound reaction feedback (feedback.channelReaction
     expect(router).toContain('kind: "user_feedback"');
     expect(router).toContain('source: "channel"');
     expect(router).toContain("thumbs: reaction.vote");
-    // channel routing key, not the reaction's own ts.
+    // D40 — the reacted-to ts resolves through the outbound-ts join first…
+    expect(router).toContain("resolveReactionJoin(reaction, adapter.id)");
+    // …and only a miss falls back to last-turn attribution under the
+    // channel routing key (the pre-join behavior).
+    expect(router).toContain("fall back to last-turn attribution");
     expect(router).toContain("${adapter.id}:${reaction.workspaceId}:${reaction.channelId}");
+    // Both reply-post sites append the join record (inbound + approval resume).
+    expect(router).toContain("await sendReplyWithJoin(adapter, event, sessionId, reply);");
+    expect(router).toContain("await sendReplyWithJoin(adapter, event, approval.sessionId, reply);");
+    // Join store: append-only JSONL beside the ratings sink.
+    expect(router).toContain('".crewhaus", "feedback", "joins", "channel.jsonl"');
     // gateway dedups + dispatches the reaction (and does NOT run a model turn for it).
     expect(gateway).toContain("config.sessionRouter.handleReaction(parsed.reaction, adapter)");
     expect(gateway).toContain("dedup.remember(parsed.reaction.idempotencyKey)");
   });
 
-  test("user session-key → reaction routing key uses the reacting user", () => {
+  test("user session-key → miss-fallback routing key uses the reacting user", () => {
     const router = fileMap(withReactions("user")).get("session-router.ts") ?? "";
+    expect(router).toContain("resolveReactionJoin(reaction, adapter.id)");
     expect(router).toContain("${adapter.id}:${reaction.workspaceId}:${reaction.userId}");
   });
 
-  test("thread session-key → handleReaction is a no-op (can't attribute without a join store)", () => {
+  test("thread session-key → join-resolved feedback; a miss drops instead of misattributing", () => {
     const router = fileMap(withReactions("thread")).get("session-router.ts") ?? "";
     expect(router).toContain("async handleReaction(");
-    expect(router).toContain("can't attribute a reaction");
-    expect(router).not.toContain('kind: "user_feedback"');
+    // Thread reactions are attributable now — via the join store.
+    expect(router).toContain("resolveReactionJoin(reaction, adapter.id)");
+    expect(router).toContain('kind: "user_feedback"');
+    // …but a join miss cannot recover the thread routing key: drop, never guess.
+    expect(router).toContain("The reaction is dropped");
+    expect(router).not.toContain("fall back to last-turn attribution");
   });
+});
+
+// --- reaction join-store behavior (D40) — the emitted session-router, run ----
+//
+// The generated session-router.ts is written to a temp dir under this package
+// (so its `@crewhaus/*` imports resolve) and driven by a `bun` subprocess with
+// cwd = that dir (the join store roots at process.cwd()). The driver fakes the
+// adapter (sendReply returns a `{ messageTs }` receipt unless the job says
+// not to) and the agent (bumps lastTurnIndex like the runtime does), replays
+// two turns in one session, then fires the job's reactions and reports the
+// join lines + user_feedback payloads it finds on disk.
+
+const REACTION_DRIVER_SRC = String.raw`
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { createSessionStore } from "@crewhaus/session-store";
+import { createSessionRouter } from "./session-router.ts";
+
+const cwd = process.cwd();
+const job = JSON.parse(readFileSync(join(cwd, "job.json"), "utf-8"));
+const rootDir = join(cwd, "sessions");
+const store = createSessionStore({ rootDir });
+
+let tsCounter = 0;
+const adapter = {
+  id: "slack",
+  verify: () => true,
+  parseInbound: () => ({ kind: "skip" }),
+  async sendReply() {
+    tsCounter += 1;
+    if (job.receipts === false) return undefined;
+    return { messageTs: "100." + tsCounter };
+  },
+  async setTyping() {},
+};
+
+const agent = {
+  async runTurn(args) {
+    const s = await store.get(args.sessionId);
+    await store.update(args.sessionId, { lastTurnIndex: (s === null ? 0 : s.lastTurnIndex) + 1 });
+    return "reply";
+  },
+};
+
+const router = createSessionRouter({ agent, sessionRootDir: rootDir });
+const base = { workspaceId: "T1", channelId: "C1", userId: "U1", text: "hello", subtype: "message" };
+await router.handle({ ...base, idempotencyKey: "e1", ts: "1.1", threadTs: "1.1" }, adapter);
+await router.handle({ ...base, idempotencyKey: "e2", ts: "1.2", threadTs: "1.1" }, adapter);
+for (const r of job.reactions) {
+  await router.handleReaction(
+    { idempotencyKey: r.key, workspaceId: "T1", channelId: "C1", messageTs: r.messageTs, userId: "U9", vote: r.vote ?? "up" },
+    adapter,
+  );
+}
+
+const joinFile = join(cwd, ".crewhaus", "feedback", "joins", "channel.jsonl");
+const joins = existsSync(joinFile)
+  ? readFileSync(joinFile, "utf-8").trim().split("\n").map((l) => JSON.parse(l))
+  : [];
+const feedback = [];
+for (const s of await store.list()) {
+  const logPath = join(rootDir, s.id + ".jsonl");
+  if (!existsSync(logPath)) continue;
+  for (const line of readFileSync(logPath, "utf-8").split("\n")) {
+    if (line.trim() === "") continue;
+    const ev = JSON.parse(line);
+    if (ev.kind === "user_feedback") feedback.push(ev.payload);
+  }
+}
+process.stdout.write(JSON.stringify({ joins, feedback }));
+`;
+
+type ReactionJobReaction = { key: string; messageTs: string; vote?: "up" | "down" };
+type ReactionJob = { reactions: ReactionJobReaction[]; receipts?: boolean };
+type ReactionJoinLine = {
+  schemaVersion: number;
+  adapterId: string;
+  workspaceId: string;
+  channelId: string;
+  outboundTs: string;
+  sessionId: string;
+  turnNumber: number;
+  ts: string;
+};
+type ReactionFeedbackLine = {
+  id: string;
+  sessionId: string;
+  turnNumber: number;
+  rating: { thumbs?: "up" | "down" };
+};
+type ReactionJobResult = { joins: ReactionJoinLine[]; feedback: ReactionFeedbackLine[] };
+
+async function runReactionJob(
+  sessionKey: "channel" | "thread",
+  job: ReactionJob,
+): Promise<ReactionJobResult> {
+  const router = new Map(
+    emitChannelBot({
+      ...MIN_IR,
+      routing: { sessionKey },
+      feedback: { modality: "binary", channelReactions: true },
+    }).files.map((f) => [f.path, f.content]),
+  ).get("session-router.ts");
+  if (router === undefined) throw new Error("no session-router.ts emitted");
+  const dir = mkdtempSync(join(import.meta.dir, ".d40-run-"));
+  writeFileSync(join(dir, "session-router.ts"), router);
+  writeFileSync(join(dir, "job.json"), JSON.stringify(job));
+  writeFileSync(join(dir, "driver.mjs"), REACTION_DRIVER_SRC);
+  try {
+    const proc = Bun.spawn([process.execPath, join(dir, "driver.mjs")], {
+      cwd: dir,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    await proc.exited;
+    if (!out) throw new Error(`driver produced no output; stderr:\n${err}`);
+    return JSON.parse(out) as ReactionJobResult;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("emitChannelBot — reaction join-store behavior (D40, emitted router executed)", () => {
+  test("thread key: reactions attribute to the EXACT reacted-to turn; unknown ts drops", async () => {
+    const res = await runReactionJob("thread", {
+      reactions: [
+        { key: "r1", messageTs: "100.1" }, // the OLDER reply → turn 1, not the newest
+        { key: "r2", messageTs: "100.2", vote: "down" }, // the newest reply → turn 2
+        { key: "r3", messageTs: "999.9" }, // no join record → dropped, never guessed
+      ],
+    });
+    expect(res.joins.map((j) => [j.outboundTs, j.turnNumber])).toEqual([
+      ["100.1", 1],
+      ["100.2", 2],
+    ]);
+    expect(res.joins[0]).toMatchObject({
+      schemaVersion: 1,
+      adapterId: "slack",
+      workspaceId: "T1",
+      channelId: "C1",
+    });
+    expect(res.feedback.map((f) => [f.turnNumber, f.rating.thumbs])).toEqual([
+      [1, "up"],
+      [2, "down"],
+    ]);
+    // fb_ idempotency-key hashing preserved on the join path.
+    for (const f of res.feedback) expect(f.id).toMatch(/^fb_[0-9a-f]{16}$/);
+  }, 20_000);
+
+  test("channel key: join hit lands on the exact turn; join miss falls back to the last turn", async () => {
+    const res = await runReactionJob("channel", {
+      reactions: [
+        { key: "r1", messageTs: "100.1" }, // join hit → turn 1
+        { key: "r2", messageTs: "999.9" }, // join miss → lastTurnIndex (2), pre-join behavior
+      ],
+    });
+    expect(res.feedback.map((f) => f.turnNumber)).toEqual([1, 2]);
+    for (const f of res.feedback) expect(f.id).toMatch(/^fb_[0-9a-f]{16}$/);
+  }, 20_000);
+
+  test("receipt-less sendReply: no joins accumulate; thread reactions drop (old contract)", async () => {
+    const res = await runReactionJob("thread", {
+      receipts: false,
+      reactions: [{ key: "r1", messageTs: "100.1" }],
+    });
+    expect(res.joins).toEqual([]);
+    expect(res.feedback).toEqual([]);
+  }, 20_000);
+
+  test("receipt-less sendReply: channel reactions keep today's last-turn fallback", async () => {
+    const res = await runReactionJob("channel", {
+      receipts: false,
+      reactions: [{ key: "r1", messageTs: "100.1" }],
+    });
+    expect(res.joins).toEqual([]);
+    expect(res.feedback.map((f) => f.turnNumber)).toEqual([2]);
+  }, 20_000);
 });
 
 describe("emitChannelBot — daemon.ts wiring", () => {

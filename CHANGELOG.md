@@ -32,6 +32,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   claim-vs-evidence checks instead of always-fail stubs — eval suites
   referencing them will change verdicts and (name, dataset)-keyed baselines
   will shift. [#341]
+- **`graders.yaml` grows a top-level `combine: all | any | weighted` mode —
+  grader `weight` and `passing_threshold` finally do something.** Every
+  grader variant now accepts an optional positive `weight` (default 1).
+  `combine: all` (the default) keeps today's exact semantics: overall
+  passed = AND of all graders, score = unweighted mean. `combine: any`
+  passes when any grader passes (score = max). `combine: weighted` scores
+  Σ(weight·score)/Σweight and passes when the combined score clears
+  `passing_threshold` (default 0.5). Previously `llm_judge`'s `weight` and
+  the top-level `passing_threshold` validated fine and changed nothing —
+  declaring either without `combine: weighted` now warns loudly on stderr
+  at run start instead of being silently ignored. Grader-throw infra-noise
+  semantics (`graderError`, the bounded noise retry, triage classification)
+  are unchanged in every mode, and the competency exam (`run_exam`) honors
+  the same policy. STRICTNESS CHANGE: `weight` must be positive — a config
+  declaring `weight: 0` or a negative weight (previously parsed on
+  `llm_judge` and ignored) is now rejected at parse time.
+- **New deterministic grader `type: expected_contains` — reference
+  containment (OpenAI "Includes" parity).** Passes when the agent output
+  contains the sample's `expected_output` (compared against the trimmed
+  gold; `case_insensitive` optional) and fails with a clear rationale when
+  the sample carries no gold — the per-sample counterpart to `contains`,
+  whose needle is a config literal.
+- **New `crewhaus dataset audit [--pii] --dataset <file|registry:ref>
+  [--apply] [--strict]` — an offline PII/secret scan of an EXISTING
+  dataset.** Regex detectors only (the same shared set `dataset synthesize`
+  and `fewshot harvest` redact with) — no model calls, nothing leaves the
+  box. The report counts hits per detector/field/sample id and never echoes
+  the matched text, so it is safe to paste into a CI log; a registry ref
+  without `#split` is scanned across ALL splits, test included (inspection,
+  not consumption of the test-split lock). `--apply` requires a
+  `registry:<name>[@version]` ref and writes the redacted samples as a NEW
+  auto-bumped version that preserves the record's split structure exactly
+  (never in place, never re-split — mirroring `refresh-goldens`);
+  `--strict` exits non-zero when any hit is found, making the audit a CI
+  gate on dataset hygiene.
+- **The eval regression gate now knows what instrument graded the run.** The
+  run-history index (`.crewhaus/evals/index.jsonl`) and per-(spec, dataset)
+  baseline pins (`baselines.json`) record the run's `gradersHash` and — when
+  `--judge-model` pinned one — `judgeModel`, so a baseline carries the
+  identity of the graders config and judge that scored it, not just the
+  scores. When a fresh run's hashes differ from the pinned baseline's,
+  `crewhaus eval` prints a loud `[eval]` warning and starts a new baseline
+  lineage exactly like the dataset-changed path — a stricter rubric or a
+  swapped judge can no longer fail (or silently pass) the gate as if the
+  agent changed. `eval-report diff` likewise warns on stderr when the two
+  runs' recorded `gradersHash` or `judgeModel` disagree, and
+  `eval-report baseline set` carries both fields forward onto manual pins.
+  Fully additive: entries and baselines written before the fields existed
+  gate and diff exactly as before.
 
 ### Fixed
 
@@ -55,6 +104,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifying.
 
 [#341]: https://github.com/crewhaus/factory/pull/341
+- **The dataset registry's test-split lock is now honored on every CLI
+  consumption path.** The registry always guarded `get(…, "test")` behind
+  `allowTestSplit` ("only do this at release-tag time"), but the CLI's
+  `registry:` shorthand resolved records directly, so a bare
+  `--dataset registry:<name>` silently unioned the locked test split into
+  `eval` runs and the flywheel's acceptance evals, and an explicit `#test`
+  needed no override anywhere. Now: bare refs resolve **train+dev only**
+  (with a one-line stderr notice whenever a test split existed and was
+  excluded); an explicit `#test` requires the new `--allow-test-split`
+  flag, accepted only by the two release-gating commands — `crewhaus eval`
+  and `crewhaus deploy canary` (canary is precisely the sanctioned spender
+  of the holdout, so its ramp gate can consume `#test` behind the same
+  opt-in); `optimize` and `flywheel` refuse `#test`
+  outright regardless of flags (an optimizer that sees the holdout burns
+  it); the flywheel's before/after acceptance evals therefore no longer
+  include test rows (its help text told the old truth and now tells the
+  new one); `datasets get` keeps printing test rows — inspection is not
+  consumption — but says so on stderr. Side fix: a `target: eval` spec
+  declaring `split: test` (spec-declared explicitness) now threads
+  `allowTestSplit: true` into the emitted bundle's registry call instead
+  of always throwing at runtime with no escape hatch.
+  The remaining `registry:` consumers, exhaustively: `eval coverage`
+  keeps inspecting bare refs across ALL splits, test included (gap
+  analysis over a partial record would misreport test-only behaviors as
+  uncovered — inspection, not consumption, like `dataset audit`);
+  `dataset synthesize --from` now resolves bare registry sources to
+  train+dev and refuses `#test`, so holdout inputs can never seed a
+  trainable synthetic dataset; `dataset refresh-goldens` now reconciles
+  bare refs against train+dev only (test golds are never proposed
+  against or echoed into the review diff) and its `--apply` writes the
+  new version by patching golds WITHIN the record's existing split
+  structure — never re-split — so unselected splits (test included) pass
+  through byte-identically (previously `--apply` re-split the reconciled
+  union wholesale, which under the new train+dev resolution would have
+  dropped the test rows and re-partitioned already-consumed samples into
+  a fabricated holdout, and on an explicit `#split` ref had always
+  discarded the other splits). BEHAVIOR CHANGE:
+  on records that carry a test split, bare-ref runs now grade fewer
+  samples and their dataset content hash changes, so the next `eval`
+  starts a new (spec, dataset) baseline lineage — the dataset-changed
+  path already warns about exactly this.
+- **`crewhaus deploy canary`'s documented flags now actually parse.** The
+  entire canary flag set (`--traffic`/`--dataset`/`--graders`/`--env`/
+  `--name`/`--from`/`--concurrency`/`--seed`/`--judge-model`/
+  `--max-pass-rate-drop`/`--max-p95-latency-ms`) was declared on
+  `propose`'s arg schema instead of `deploy`'s, so every invocation the
+  canary help advertises died at arg parse with `unknown flag:
+  --dataset`. The block now lives on the deploy schema (joined by the new
+  `--allow-test-split`), and `propose` no longer silently accepts eleven
+  flags it never read.
+- **`flywheel run` now discloses which dataset-precedence rung it chose —
+  and warns loudly when a stale scaffolded `eval/dataset.jsonl` shadows
+  distilled user ratings.** The precedence (flag > conventional
+  `eval/dataset.jsonl` > `registry:<spec>-ratings`) was computed but never
+  printed, so every `init --with-evals` + `feedback.autoDistill` harness
+  eventually had the nightly loop optimizing against the day-one scaffold
+  while real-user ratings piled up unused — silently. Every run now prints
+  `[flywheel] dataset: <resolved> (source: flag|convention|ratings-registry)`,
+  and when the convention file shadows an existing `<spec>-ratings`
+  registry dataset the run warns with the exact remediation:
+  `pass --dataset registry:<spec>-ratings to optimize against real user
+  ratings`.
+- **`crewhaus distill`, the unattended `feedback.autoDistill` teardown, and
+  `crewhaus dataset mine` no longer copy raw production text into
+  datasets.** Only `synthesize` and `fewshot harvest` redacted at
+  ingestion; the distill/mine paths wrote turn inputs and outputs, comments,
+  corrections, and error reasons verbatim into `eval/dataset.jsonl` files
+  the CI scaffold expects committed, into judge prompts, and into the
+  optimizer meta-prompt — defeating the fewshot-side mitigation ("a pasted
+  credential never survives into the pool"). All three now run the same
+  PII/secret detector set over every free-text field at sample
+  construction, deterministically replacing hits with the redactor's
+  `[REDACTED:<kind>]` marker and leaving non-PII text byte-identical.
+  `distill` and `dataset mine` accept `--no-redact` for dev/local
+  inspection; the autoDistill teardown is unattended and ALWAYS redacts.
+  BEHAVIOR CHANGE: distilled/mined sample text is redacted by default —
+  pass `--no-redact` where the raw text is required.
+- **Channel-bot 👍/👎 reactions now attribute to the exact reacted-to turn —
+  and work under `routing.sessionKey: thread`.** With
+  `feedback.channelReactions: true`, the generated session-router appends an
+  outbound-ts → (sessionId, turnNumber) join record to
+  `.crewhaus/feedback/joins/channel.jsonl` on every assistant reply it posts,
+  and `handleReaction` resolves the reacted-to message's ts through that join
+  for EVERY session key. Previously a reaction on an older bot reply was
+  recorded against the newest turn (channel/user keys — corrupting the exact
+  datasets autoDistill and `optimize --ratings` consume), and under
+  `sessionKey: thread` every reaction was silently discarded while the Slack
+  manifest still requested the reaction scopes. On a join miss (a reply
+  posted by an older build, or an adapter whose `sendReply` returns no
+  message-ts receipt) channel/user keys keep the old last-turn fallback and
+  thread drops the reaction rather than guessing; the `fb_` idempotency-key
+  hashing is unchanged, so platform redeliveries still collapse to one
+  record. `crewhaus compile` prints a one-line `channel-reactions-join`
+  warning when `channelReactions` is enabled explaining that attribution
+  needs the join file to accumulate — messages posted by older builds cannot
+  be attributed. Bundles without `channelReactions` are byte-identical.
+- **Slack adapter `sendReply` now returns the `chat.postMessage` receipt**
+  (`{ messageTs }`, mirroring `postApproval`), so the join store actually
+  accumulates with the production Slack adapter. The `ChannelAdapter`
+  contract widened backward-compatibly to
+  `Promise<{ messageTs?: string } | void>` — receipt-less adapters keep
+  resolving void and their replies take the per-key fallback.
+- **`compile --strict` does not escalate the informational
+  `channel-reactions-join` warning.** It fires on a fully wired,
+  correctly configured feature (no spec edit can clear it), so it prints
+  but never fails a strict build; remediable codes (`accepted-but-unwired`,
+  `edge-unsafe-tool`) still escalate, and `compile --help` now lists all
+  three codes.
 
 ## [0.4.0] - 2026-07-18
 

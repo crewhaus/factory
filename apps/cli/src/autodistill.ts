@@ -5,7 +5,9 @@
  *   - **autoDistill**: at CLI `run` teardown (NOT a spawned hook — hooks
  *     run credential-stripped), when the accumulated feedback store holds
  *     ≥ N unprocessed `user_feedback` records, the existing `distill()`
- *     runs over ALL sessions and the result is registered as a new
+ *     runs over ALL sessions — always PII/secret-redacted (B23: the
+ *     teardown is unattended, so there is no opt-out) — and the result is
+ *     registered as a new
  *     auto-bumped version of the `<specName>-ratings` registry dataset —
  *     immediately consumable as `--dataset registry:<specName>-ratings`
  *     (the item-12 shorthand `eval`/`optimize` already speak). The spec's
@@ -40,6 +42,7 @@ import { dirname, join } from "node:path";
 import type { DatasetRegistry } from "@crewhaus/dataset-registry";
 import type { DatasetRecord } from "@crewhaus/dataset-registry";
 import type { IrFeedback } from "@crewhaus/ir";
+import { redactDatasetText } from "./dataset-audit";
 import { DEFAULT_SPLIT_SPEC, registerDataset } from "./datasets";
 import { type DerivedTurn, type FeedbackRecord, type SessionTurn, distill } from "./feedback";
 import { isRegistrySafeName } from "./regression-pin";
@@ -233,8 +236,14 @@ export async function maybeAutoDistill(
   const watermark = newestTs(opts.records) ?? nowIso;
 
   // Full rebuild over EVERYTHING (see the module doc): merge semantics stay
-  // in mergeFeedback, and each registered version is self-contained.
-  const result = distill(opts.turns, opts.records, { minScore: opts.minScore ?? 0.7 });
+  // in mergeFeedback, and each registered version is self-contained. B23 —
+  // this consumer runs unattended at teardown, so it ALWAYS redacts (there
+  // is no --no-redact here): raw turn text and corrections must never land
+  // in the auto-registered ratings dataset.
+  const result = distill(opts.turns, opts.records, {
+    minScore: opts.minScore ?? 0.7,
+    redact: redactDatasetText,
+  });
   if (result.samples.length === 0) {
     // The ratings exist but none joined to a transcript turn (sessions
     // purged/rotated). Advance the watermark so the same unmatchable

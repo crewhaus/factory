@@ -10,6 +10,10 @@
  * - A keyset mismatch from `diffReports` (sample ids changed) means the
  *   dataset itself changed — start a new baseline lineage instead of
  *   failing the run.
+ * - A gradersHash/judgeModel mismatch vs the pinned baseline means the
+ *   *measurement instrument* changed — the two runs' scores are not
+ *   comparable, so warn loudly and start a new baseline lineage the same
+ *   way. Baselines pinned before the fields existed gate exactly as before.
  * - The regression gate is strict by default: ANY pass-rate drop fails, and
  *   any sample-level pass→fail flip fails even when a recovery elsewhere
  *   cancels it out in the aggregates.
@@ -118,6 +122,13 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
   const warn = opts.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
   const { summary, specName, specSource } = opts;
   const datasetName = summary.config.datasetName;
+  // Measurement-instrument identity, straight off the summary the runner
+  // recorded (the eval path computes gradersHash once for the sentinel and
+  // threads it into the run; judgeModel is present only when a run pinned
+  // one). Recorded on the index entry + baseline pin so a later run can
+  // detect that the instrument — not the agent — changed.
+  const gradersHash = summary.config.gradersHash;
+  const judgeModel = summary.config.judgeModel;
   const absOut = resolve(opts.outDir);
 
   // Belt (the runner already refuses to run zero samples): a 0-sample run
@@ -136,6 +147,8 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     ...(specSource !== undefined ? { specSource } : {}),
     datasetName,
     datasetHash: opts.datasetHash,
+    ...(gradersHash !== undefined ? { gradersHash } : {}),
+    ...(judgeModel !== undefined ? { judgeModel } : {}),
     passRate: summary.aggregates.passRate,
     meanScore: summary.aggregates.meanScore,
     sampleCount: summary.samples.length,
@@ -157,6 +170,8 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
       ...(specSource !== undefined ? { specSource } : {}),
       outDir: absOut,
       datasetHash: opts.datasetHash,
+      ...(gradersHash !== undefined ? { gradersHash } : {}),
+      ...(judgeModel !== undefined ? { judgeModel } : {}),
       ts: entry.ts,
     };
     setBaseline(pin, opts.evalsDir);
@@ -191,6 +206,40 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     warn(
       `[eval]   two specs sharing name "${specName}" share one baseline lineage — give them distinct \`name:\` values (or a separate evals dir) so their histories don't gate against each other. Gating this run against the other spec's baseline anyway.`,
     );
+  }
+
+  // Instrument guard: the gate compares SCORES, and scores are comparable
+  // only when both runs graded with the same measurement instrument — the
+  // same graders config (gradersHash) bound to the same judge (judgeModel).
+  // When the pinned baseline recorded either and this run's differs, gating
+  // would blame the agent for a rubric/judge change, so warn loudly and
+  // start a new baseline lineage exactly like the dataset-changed path.
+  // A side missing the field (old history, or no pinned judge) never trips
+  // the guard — hash-less entries gate exactly as before.
+  const gradersChanged =
+    gradersHash !== undefined &&
+    baseline.gradersHash !== undefined &&
+    baseline.gradersHash !== gradersHash;
+  const judgeChanged =
+    judgeModel !== undefined &&
+    baseline.judgeModel !== undefined &&
+    baseline.judgeModel !== judgeModel;
+  if (gradersChanged || judgeChanged) {
+    warn(
+      `[eval] warning: the measurement instrument changed since baseline ${baseline.runId} was pinned:`,
+    );
+    if (gradersChanged) {
+      warn(`[eval]   gradersHash: ${baseline.gradersHash} → ${gradersHash}`);
+    }
+    if (judgeChanged) {
+      warn(`[eval]   judgeModel: ${baseline.judgeModel} → ${judgeModel}`);
+    }
+    warn(
+      "[eval]   scores graded by different graders configs or judge models are not comparable — not gating this run against that baseline.",
+    );
+    write("[eval] graders/judge changed — starting new baseline lineage");
+    pinCurrentRun("new lineage");
+    return { gateFailed: false };
   }
 
   let prevLoaded: LoadedRun;

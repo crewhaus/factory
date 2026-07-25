@@ -24,7 +24,7 @@ export {
   shell,
   escapeHtml,
 } from "./render";
-export { diffReports, type ReportDiff, type DiffEntry } from "./diff";
+export { diffInstrumentWarnings, diffReports, type ReportDiff, type DiffEntry } from "./diff";
 // Matrix mode (item 11): fold per-model cells from `crewhaus eval --models`
 // into matrix.json + a best-per-metric-highlighted HTML table. Pricing is
 // injected via `MatrixPricingFn` to keep this package dependency-free.

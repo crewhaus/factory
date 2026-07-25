@@ -99,6 +99,24 @@ describe("run index (index.jsonl)", () => {
     expect(raw.trimEnd().split("\n")).toHaveLength(2);
   });
 
+  test("gradersHash/judgeModel round-trip when present and stay absent when omitted", () => {
+    const evalsDir = join(newTempRoot(), ".crewhaus", "evals");
+    appendRunIndex(
+      makeEntry("run_aaaa1111aaaa1111", {
+        gradersHash: "g".repeat(64),
+        judgeModel: "judge-model-x",
+      }),
+      evalsDir,
+    );
+    // A legacy-shaped entry (no instrument fields) in the same index.
+    appendRunIndex(makeEntry("run_bbbb2222bbbb2222"), evalsDir);
+    const [instrumented, legacy] = readRunIndex(evalsDir);
+    expect(instrumented?.gradersHash).toBe("g".repeat(64));
+    expect(instrumented?.judgeModel).toBe("judge-model-x");
+    expect(legacy?.gradersHash).toBeUndefined();
+    expect(legacy?.judgeModel).toBeUndefined();
+  });
+
   test("missing index file reads as empty", () => {
     expect(readRunIndex(join(newTempRoot(), "nope"))).toEqual([]);
   });
@@ -137,6 +155,21 @@ describe("baselines (baselines.json)", () => {
     setBaseline(makePin("run_bbbb2222bbbb2222"), evalsDir);
     expect(getBaseline("concierge", "smoke", evalsDir)?.runId).toBe("run_bbbb2222bbbb2222");
     expect(getBaseline("concierge", "full", evalsDir)?.runId).toBe("run_cccc3333cccc3333");
+  });
+
+  test("gradersHash/judgeModel round-trip on pins and stay absent when omitted", () => {
+    const evalsDir = join(newTempRoot(), ".crewhaus", "evals");
+    setBaseline(
+      makePin("run_aaaa1111aaaa1111", { gradersHash: "g".repeat(64), judgeModel: "judge-model-x" }),
+      evalsDir,
+    );
+    setBaseline(makePin("run_bbbb2222bbbb2222", { datasetName: "full" }), evalsDir);
+    const instrumented = getBaseline("concierge", "smoke", evalsDir);
+    expect(instrumented?.gradersHash).toBe("g".repeat(64));
+    expect(instrumented?.judgeModel).toBe("judge-model-x");
+    const legacy = getBaseline("concierge", "full", evalsDir);
+    expect(legacy?.gradersHash).toBeUndefined();
+    expect(legacy?.judgeModel).toBeUndefined();
   });
 
   test("malformed baselines.json throws ReportError", () => {

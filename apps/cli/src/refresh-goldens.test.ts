@@ -373,4 +373,55 @@ describe("crewhaus dataset refresh-goldens (CLI, offline)", () => {
     const root = newTempRoot();
     expect((await runCli(["dataset", "refresh-goldens"], root)).exitCode).toBe(1);
   });
+
+  // B16 — --apply must NEVER re-split the record: a bare ref reconciles
+  // train+dev only, so re-splitting the resolved union would drop the locked
+  // test rows and re-partition already-consumed train/dev samples into a
+  // fabricated (contaminated) holdout.
+  it("--apply on a record WITH a test split preserves that split byte-identically", async () => {
+    const root = newTempRoot();
+    const sessionsDir = join(root, ".crewhaus", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    seedSessionWithCorrection(
+      sessionsDir,
+      "sess_00000000000000f2",
+      "What is the deploy command?",
+      "the corrected gold answer",
+    );
+
+    const datasetsDir = join(root, ".crewhaus", "datasets");
+    const dsDir = join(datasetsDir, "split-keeper");
+    mkdirSync(dsDir, { recursive: true });
+    const v1 = {
+      name: "split-keeper",
+      version: "v1",
+      splits: {
+        train: [{ id: "s1", input: "What is the deploy command?", expected_output: "old gold" }],
+        dev: [{ id: "s2", input: "How do I roll back?", expected_output: "dev gold" }],
+        test: [
+          { id: "t1", input: "held-out question one", expected_output: "held-out gold one" },
+          { id: "t2", input: "held-out question two", expected_output: "held-out gold two" },
+        ],
+      },
+      sampleHashes: { train: [], dev: [], test: [] },
+      createdAt: "2026-07-01T00:00:00.000Z",
+    };
+    writeFileSync(join(dsDir, "v1.json"), JSON.stringify(v1));
+
+    const applied = await runCli(
+      ["dataset", "refresh-goldens", "--dataset", "registry:split-keeper", "--apply"],
+      root,
+    );
+    expect(applied.exitCode).toBe(0);
+    const v2 = JSON.parse(readFileSync(join(dsDir, "v2.json"), "utf-8"));
+    // The matched train gold is refreshed…
+    expect(v2.splits.train.map((s: { id: string }) => s.id)).toEqual(["s1"]);
+    expect(v2.splits.train[0].expected_output).toBe("the corrected gold answer");
+    // …the untouched dev split passes through unchanged…
+    expect(JSON.stringify(v2.splits.dev)).toBe(JSON.stringify(v1.splits.dev));
+    // …and the locked test split is preserved byte-identically: same rows,
+    // same golds, same order — never dropped, never re-populated from
+    // already-consumed train/dev samples.
+    expect(JSON.stringify(v2.splits.test)).toBe(JSON.stringify(v1.splits.test));
+  });
 });

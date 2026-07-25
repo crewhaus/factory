@@ -81,6 +81,25 @@ describe("target-eval-bundle — T1 emitted bundle structure", () => {
     expect(code).toContain('"split":"dev"');
   });
 
+  test("split: test threads the registry's allowTestSplit escape hatch (spec-declared opt-in)", () => {
+    const ir = makeIr({
+      dataset: { name: "release-gate", version: "v2", split: "test" },
+    });
+    const code = emitEval(ir).files[0]?.content ?? "";
+    expect(code).toContain(
+      "registry.get(DATASET.name, DATASET.version, DATASET.split, { allowTestSplit: true })",
+    );
+  });
+
+  test("train/dev splits keep the guarded three-argument get() byte-identical", () => {
+    for (const split of ["train", "dev"] as const) {
+      const ir = makeIr({ dataset: { name: "smoke-eval", version: "v1", split } });
+      const code = emitEval(ir).files[0]?.content ?? "";
+      expect(code).toContain("registry.get(DATASET.name, DATASET.version, DATASET.split)");
+      expect(code).not.toContain("allowTestSplit");
+    }
+  });
+
   test("agent.ts contains every grader name", () => {
     const ir = makeIr({
       graders: [{ name: "exact_match" }, { name: "regex", opts: { pattern: "\\d+" } }],

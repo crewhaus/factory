@@ -3,9 +3,13 @@
  *
  * The config file's shape:
  *
+ *   combine: weighted          # all (default) | any | weighted
+ *   passing_threshold: 0.7     # weighted-mode pass cut on the combined score (default 0.5)
  *   graders:
  *     - name: math_exact
  *       type: exact_match
+ *     - name: gold_included
+ *       type: expected_contains  # output contains the sample's expected_output
  *     - name: schema_check
  *       type: regex
  *       pattern: ^The answer is \d+
@@ -16,6 +20,15 @@
  *     - name: judge_correct
  *       type: llm_judge
  *       rubric: …
+ *       weight: 3              # any grader may declare a positive weight (default 1)
+ *
+ * Combination modes (how per-grader results merge into the sample's overall):
+ *   all       passed iff every grader passed; score = unweighted mean.
+ *   any       passed iff any grader passed;   score = max.
+ *   weighted  score = Σ(weight·score)/Σweight; passed iff
+ *             score >= (passing_threshold ?? 0.5).
+ * `weight` and `passing_threshold` only take effect under `combine: weighted`
+ * — the runner warns loudly when they are declared without it.
  *
  * The `llm_judge` type returns a placeholder grader that throws — the eval-runner
  * resolves it via `@crewhaus/eval-judge` and substitutes a real grader. This split
@@ -24,14 +37,28 @@
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { GraderError } from "./errors";
-import { all, contains, exactMatch, jsonPath, regex, toolCallSequence } from "./graders";
+import {
+  all,
+  any,
+  contains,
+  exactMatch,
+  expectedContains,
+  jsonPath,
+  regex,
+  toolCallSequence,
+  weighted,
+} from "./graders";
 import type { Grader } from "./types";
+
+/** Positive per-grader weight for `combine: weighted` (default 1). */
+const WeightField = z.number().positive().optional();
 
 const ExactMatchSpec = z.object({
   name: z.string(),
   type: z.literal("exact_match"),
   trim: z.boolean().optional(),
   case_insensitive: z.boolean().optional(),
+  weight: WeightField,
 });
 
 const ContainsSpec = z.object({
@@ -39,6 +66,14 @@ const ContainsSpec = z.object({
   type: z.literal("contains"),
   substring: z.string(),
   case_insensitive: z.boolean().optional(),
+  weight: WeightField,
+});
+
+const ExpectedContainsSpec = z.object({
+  name: z.string(),
+  type: z.literal("expected_contains"),
+  case_insensitive: z.boolean().optional(),
+  weight: WeightField,
 });
 
 const RegexSpec = z.object({
@@ -46,6 +81,7 @@ const RegexSpec = z.object({
   type: z.literal("regex"),
   pattern: z.string(),
   flags: z.string().optional(),
+  weight: WeightField,
 });
 
 const JsonPathSpec = z.object({
@@ -53,6 +89,7 @@ const JsonPathSpec = z.object({
   type: z.literal("json_path"),
   path: z.string(),
   expected: z.unknown().optional(),
+  weight: WeightField,
 });
 
 const ToolCallSequenceSpec = z.object({
@@ -60,6 +97,7 @@ const ToolCallSequenceSpec = z.object({
   type: z.literal("tool_call_sequence"),
   expected: z.array(z.string()),
   mode: z.enum(["exact", "subseq", "set"]).optional(),
+  weight: WeightField,
 });
 
 const RubricCriterionSpec = z.object({
@@ -84,7 +122,7 @@ const LlmJudgeSpec = z.object({
   type: z.literal("llm_judge"),
   rubric: RubricSpec,
   model: z.string().optional(),
-  weight: z.number().optional(),
+  weight: WeightField,
 });
 
 /**
@@ -100,11 +138,13 @@ const RegistryGraderSpec = z.object({
   name: z.string(),
   type: z.literal("registry"),
   grader: z.string().min(1),
+  weight: WeightField,
 });
 
 const GraderSpec = z.discriminatedUnion("type", [
   ExactMatchSpec,
   ContainsSpec,
+  ExpectedContainsSpec,
   RegexSpec,
   JsonPathSpec,
   ToolCallSequenceSpec,
@@ -112,14 +152,37 @@ const GraderSpec = z.discriminatedUnion("type", [
   RegistryGraderSpec,
 ]);
 
-export const GradersConfigSchema = z.object({
-  graders: z.array(GraderSpec).min(1),
-  passing_threshold: z.number().min(0).max(1).optional(),
-});
+export const GradersConfigSchema = z
+  .object({
+    graders: z.array(GraderSpec).min(1),
+    combine: z.enum(["all", "any", "weighted"]).optional(),
+    passing_threshold: z.number().min(0).max(1).optional(),
+  })
+  // A4/A5 hardening — a typoed top-level key (`combined:`, `passing_treshold:`)
+  // must fail loudly at parse, not be silently stripped so the run proceeds in
+  // default `all` mode with the declared policy ignored. (Per-variant
+  // strictness inside GraderSpec is a compat decision deferred to the wave
+  // owner — stray keys in individual grader entries still parse.)
+  .strict();
 
 export type GradersConfig = z.infer<typeof GradersConfigSchema>;
 export type GraderSpec = z.infer<typeof GraderSpec>;
 export type RubricSpec = z.infer<typeof RubricSpec>;
+
+export type GraderCombineMode = "all" | "any" | "weighted";
+
+/**
+ * The config's top-level combination policy (`combine:` +
+ * `passing_threshold:`). Compiled onto every `CompiledGrader` — consumers
+ * hand the runner only the compiled array, so the policy must survive that
+ * handoff without a parallel config parameter on every call path.
+ */
+export type GraderCombinePolicy = {
+  readonly mode: GraderCombineMode;
+  /** The weighted-mode pass cut on the combined score. Only present when
+   *  the config declared `passing_threshold` (runner default: 0.5). */
+  readonly passingThreshold?: number;
+};
 
 export type CompiledGrader = {
   readonly name: string;
@@ -129,6 +192,10 @@ export type CompiledGrader = {
   /** Present for `type: registry` entries — the runner resolves `grader`
    *  against its `graderRegistry` before invoking (see `RegistryGraderSpec`). */
   readonly registrySpec?: { grader: string };
+  /** The config's combination policy, identical on every entry. Absent when
+   *  the config declared neither `combine` nor `passing_threshold` (⇒ the
+   *  pre-policy default, `all`). See {@link GraderCombinePolicy}. */
+  readonly combine?: GraderCombinePolicy;
 };
 
 /**
@@ -154,7 +221,19 @@ export function parseGradersConfig(yamlText: string): {
     throw new GraderError(`invalid graders config: ${result.error.message}`);
   }
   const config = result.data;
-  const compiled: CompiledGrader[] = config.graders.map((spec) => compile(spec));
+  const combine: GraderCombinePolicy | undefined =
+    config.combine !== undefined || config.passing_threshold !== undefined
+      ? {
+          mode: config.combine ?? "all",
+          ...(config.passing_threshold !== undefined
+            ? { passingThreshold: config.passing_threshold }
+            : {}),
+        }
+      : undefined;
+  const compiled: CompiledGrader[] = config.graders.map((spec) => ({
+    ...compile(spec),
+    ...(combine !== undefined ? { combine } : {}),
+  }));
   return { config, compiled };
 }
 
@@ -169,7 +248,7 @@ function compile(spec: GraderSpec): CompiledGrader {
             ? { caseInsensitive: spec.case_insensitive }
             : {}),
         }),
-        weight: 1,
+        weight: spec.weight ?? 1,
       };
     case "contains":
       return {
@@ -180,13 +259,23 @@ function compile(spec: GraderSpec): CompiledGrader {
             ? { caseInsensitive: spec.case_insensitive }
             : {}),
         }),
-        weight: 1,
+        weight: spec.weight ?? 1,
+      };
+    case "expected_contains":
+      return {
+        name: spec.name,
+        grader: expectedContains({
+          ...(spec.case_insensitive !== undefined
+            ? { caseInsensitive: spec.case_insensitive }
+            : {}),
+        }),
+        weight: spec.weight ?? 1,
       };
     case "regex":
       return {
         name: spec.name,
         grader: regex(spec.pattern, spec.flags),
-        weight: 1,
+        weight: spec.weight ?? 1,
       };
     case "json_path":
       return {
@@ -195,7 +284,7 @@ function compile(spec: GraderSpec): CompiledGrader {
           path: spec.path,
           ...(spec.expected !== undefined ? { expected: spec.expected } : {}),
         }),
-        weight: 1,
+        weight: spec.weight ?? 1,
       };
     case "tool_call_sequence":
       return {
@@ -204,7 +293,7 @@ function compile(spec: GraderSpec): CompiledGrader {
           expected: spec.expected,
           ...(spec.mode !== undefined ? { mode: spec.mode } : {}),
         }),
-        weight: 1,
+        weight: spec.weight ?? 1,
       };
     case "llm_judge":
       return {
@@ -230,13 +319,29 @@ function compile(spec: GraderSpec): CompiledGrader {
             `registry grader "${spec.name}" (→ "${spec.grader}") must be resolved via the eval-runner's graderRegistry before invocation`,
           );
         },
-        weight: 1,
+        weight: spec.weight ?? 1,
         registrySpec: { grader: spec.grader },
       };
   }
 }
 
-/** Combine compiled graders into a single `all(...)` for the runner to invoke. */
+/**
+ * Combine compiled graders into a single Grader honoring the config's
+ * `combine:` policy — `all(...)` when none was declared (the pre-policy
+ * default), `any(...)`/`weighted(...)` otherwise.
+ */
 export function combineCompiledGraders(graders: ReadonlyArray<CompiledGrader>): Grader {
-  return all(graders.map((g) => ({ name: g.name, grader: g.grader })));
+  const policy = graders.find((g) => g.combine !== undefined)?.combine;
+  const entries = graders.map((g) => ({ name: g.name, grader: g.grader }));
+  switch (policy?.mode ?? "all") {
+    case "any":
+      return any(entries);
+    case "weighted":
+      return weighted(
+        graders.map((g) => ({ name: g.name, grader: g.grader, weight: g.weight })),
+        policy?.passingThreshold ?? 0.5,
+      );
+    default:
+      return all(entries);
+  }
 }

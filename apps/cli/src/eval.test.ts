@@ -161,6 +161,8 @@ describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
       specHash: "abc123",
       datasetName: "smoke",
       datasetHash: "d".repeat(64),
+      gradersHash: "g".repeat(64),
+      judgeModel: "judge-model-x",
       passRate: 0.8,
       meanScore: 0.75,
       sampleCount: 5,
@@ -205,6 +207,10 @@ describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
       specName: "concierge",
       datasetName: "smoke",
       outDir: "/abs/evals/run_aaaa1111aaaa1111",
+      // Instrument identity must be carried forward onto manual pins so
+      // gradersHash/judgeModel mismatch detection keeps working.
+      gradersHash: "g".repeat(64),
+      judgeModel: "judge-model-x",
     });
     // `baseline show` over the pin still exits 0.
     expect((await runCli(["eval-report", "baseline", "show"], root)).exitCode).toBe(0);
