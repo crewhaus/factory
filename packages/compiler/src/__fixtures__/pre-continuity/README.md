@@ -61,6 +61,70 @@ unchanged (no `wireMemory`/continuity wiring appears); every other pin —
 including `managed.agent.ts` (no gateway of its own) and the channel/research/
 crew shapes (federation is managed-only this batch) — is untouched.
 
+**Channel subscription-handshake delta — `channel.gateway.ts` only.** The
+channel gateway gained a channel-generic branch for unsigned GET subscription
+handshakes (Meta/WhatsApp's `hub.challenge` callback-URL verification), which
+must run before `adapter.verify` because such a request carries no body and no
+signature to verify. It is guarded at runtime on `adapter.handshake !==
+undefined`, so adapters without one (Slack/Telegram/Discord/iMessage) behave
+exactly as before; it rides the always-emitted gateway, NOT memory/continuity,
+so it appears on a memory-free `continuity: false` bundle too. The
+`channel.gateway.ts` pin was regenerated to its prior bytes **plus** that
+branch; the continuity opt-out contract is unchanged (no
+`wireMemory`/continuity wiring appears), and every other pin is untouched.
+
+**Adapter-construction-inside-main delta — `channel.daemon.ts` only.** The
+channel daemon now constructs (and registers) its channel adapters as the first
+statements of `main()` rather than at module scope. Adapter factories can refuse
+to boot by throwing — the iMessage adapter rejects a non-macOS host or a missing
+`CREWHAUS_IMESSAGE_HOST_ENABLED=1` opt-in — and at module scope such a throw
+escaped `main().catch`, printing a raw Bun stack trace instead of the v0.3.0
+formatted failure report every other daemon failure produces. The move is purely
+positional (same constructs, same order, indented one level, still before any
+`registerChannelAdapter` consumer), rides the always-emitted adapter block and
+NOT memory/continuity, so it appears on a memory-free `continuity: false` bundle
+too. The `channel.daemon.ts` pin was regenerated accordingly; the continuity
+opt-out contract is unchanged (no `wireMemory`/continuity wiring appears), and
+every other pin is untouched.
+
+**Zero-citation warning delta — `research.agent.ts` only.** The research daemon
+now warns on stderr when the finished report carries no citations at all (the
+report itself always renders a `## Citations` section, with an explicit
+"nothing is source-anchored" notice when the list is empty — see
+`@crewhaus/report-writer`). The warning is an unconditional post-report branch
+on `report.json.citations.length === 0`, riding the always-emitted report step,
+NOT memory/continuity, so it appears on a memory-free `continuity: false`
+bundle too. The `research.agent.ts` pin was regenerated to its prior bytes
+**plus** that branch; the continuity opt-out contract is unchanged (no
+`wireMemory`/continuity wiring appears), and every other pin is untouched.
+
+**job_end result delta — `batch.agent.ts` only.** A successful `job_end` now
+carries the handler's `result` (the assistant's terminal text) and
+`resultBytes`. Previously the worker's stdout event stream held status fields
+only, so a batch run's observable output never contained a model reply at all —
+replies were recoverable only from `.crewhaus/sessions/<id>.jsonl`, and the
+batch runtime smoke's "magic token appears in stdout" assertion was
+unsatisfiable. `CREWHAUS_BATCH_EMIT_RESULT=0` drops the payload and keeps
+`resultBytes`. The same pin also gained an explanatory comment above
+`createInMemoryIdempotencyStore` about when the idempotency window actually
+fires. Both ride the always-emitted consumer wiring, NOT memory/continuity, so
+they appear on a `continuity: false` bundle too; the `batch.agent.ts` pin was
+regenerated to its prior bytes **plus** those two changes. The continuity
+opt-out contract is unchanged (no `wireMemory`/continuity wiring appears), and
+every other pin is untouched.
+
+**Hex default-session-id delta — `managed.daemon.ts` only.** The managed
+daemon's `runs.create` mints a session id when the caller omits one. It used to
+mint a base36 string, which `@crewhaus/session-store` rejects (`sess_<16 hex>`);
+every `runs.create` without an explicit `sessionId` therefore failed with
+`internal_error` on the store's first write. It now mints
+`sess_${randomBytes(8).toString("hex")}`, exactly the way session-store's own
+`generateId` does. The mint rides the always-emitted gateway handler, NOT
+memory/continuity, so it appears on a memory-free `continuity: false` bundle
+too — the `managed.daemon.ts` pin was regenerated accordingly. The continuity
+opt-out contract is unchanged (no `wireMemory`/continuity wiring appears), and
+every other pin — including `managed.agent.ts` — is untouched.
+
 ## Regenerating
 
 Only regenerate when a LATER release deliberately changes emitted bundles;

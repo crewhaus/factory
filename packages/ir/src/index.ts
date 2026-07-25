@@ -1217,6 +1217,12 @@ export type IrWhatsAppConfig = {
   readonly phoneNumberId: IrSecretRef;
   readonly accessToken: IrSecretRef;
   readonly appSecret: IrSecretRef;
+  /**
+   * Shared token echoed back on Meta's unsigned GET callback-URL verification
+   * handshake (`hub.verify_token`). Optional — absent means the daemon fails
+   * that handshake closed and serves only an already-verified subscription.
+   */
+  readonly verifyToken?: IrSecretRef;
 };
 
 /**
@@ -1496,8 +1502,12 @@ export type IrGraphNode = {
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
   /**
-   * When set, the node calls `ctx.requestApproval(prompt)` after the
-   * LLM turn and pauses the graph until `resume(checkpointId, decision)`.
+   * When set, the node calls `ctx.requestApproval(prompt)` BEFORE its LLM
+   * turn and pauses the graph until `resume(checkpointId, decision)`. The
+   * gate is a pre-condition: at the pause the node has spent nothing, the
+   * `hitl_pause` event carries the upstream state the approver is deciding
+   * on, and a rejecting decision cancels the turn (the node records only
+   * `state["<name>_decision"]`).
    */
   readonly hitlPrompt?: string;
   /** Loop contract 0.4 (Batch B, G02) — `"judge"` marks a gate node over

@@ -130,6 +130,7 @@ import {
   createCliMarkdownRenderer,
   isCliMarkdownEnabled,
 } from "./cli-markdown";
+import { type ExitRatingFeedback, FEEDBACK_EVENT_KIND, runExitRating } from "./exit-rating";
 import { attachIncidentCollector } from "./incident-collector";
 import {
   type AlertSink,
@@ -653,6 +654,23 @@ export {
   classifyIncidentTrigger,
 } from "./incident-collector";
 
+// Item 1 — the exit rating prompt now lives in the runtime (so a COMPILED
+// bundle gets it too, not just `crewhaus run`). Re-exported so the CLI can
+// document the same opt-out env and share the record shape.
+export {
+  type ExitRatingChoice,
+  type ExitRatingDecision,
+  type ExitRatingFeedback,
+  type ExitRatingRecord,
+  EXIT_RATING_PROMPT,
+  EXIT_RATING_TIMEOUT_MS,
+  NO_EXIT_RATING_ENV,
+  buildExitRatingRecord,
+  parseExitRatingKey,
+  runExitRating,
+  shouldPromptExitRating,
+} from "./exit-rating";
+
 /**
  * Reconcile a message history by dropping "orphan" `tool_use` blocks — a
  * `tool_use` with no answering `tool_result` anywhere later in the
@@ -988,6 +1006,20 @@ export type RunChatLoopOptions = {
    */
   spinner?: boolean;
   /**
+   * Sink for the loop's HUMAN-facing output — the `agent> ` prefix, streamed
+   * assistant text, `[tool: X]` headers, the `[memory]` notices, abort/timeout
+   * notes. Defaults to `process.stdout`.
+   *
+   * The seam exists because concurrent runs share one stdout: an eval or
+   * optimizer pass runs N samples at once, and with every loop writing raw
+   * token deltas to the same file descriptor the terminal splices sentences
+   * from different samples together mid-word (audit item 20). Callers that
+   * fan out give each run its own sink — see eval-runner's per-sample
+   * line-buffered writer — so every line stays whole and attributable. A
+   * single interactive run passes nothing and is byte-identical to before.
+   */
+  stdout?: (chunk: string) => void;
+  /**
    * Override the directory under which session metadata `.json` files and
    * event-log `.jsonl` files live. Defaults to `.crewhaus/sessions`.
    */
@@ -1034,6 +1066,22 @@ export type RunChatLoopOptions = {
    * `pre-slash` first; deny falls through to the original input.
    */
   slashCommands?: ReadonlyMap<string, SlashCommand>;
+  /**
+   * Item 1 — the spec's `feedback:` block (the `IrFeedback` subset the runtime
+   * consumes). Presence opts the REPL into the one-keystroke exit rating
+   * prompt at clean exit; the answer is appended as the same durable
+   * `user_feedback` event `crewhaus rate` writes, so `distill` /
+   * `optimize --ratings` read it whichever surface produced it.
+   *
+   * Owned here rather than in the caller so a COMPILED bundle gets the prompt
+   * too: it used to live in the CLI's own teardown, and the cli emitter
+   * dropped the block, so a compiled harness silently had no rating capture at
+   * all. `enabled: false` disables the block; `exitPrompt: false` disables
+   * just the prompt; `CREWHAUS_NO_EXIT_RATING=1` is the per-run opt-out.
+   * Never prompts in non-TTY/piped mode, nor in `singleTurn` mode (the prompt
+   * is a REPL affordance, not a scripting one).
+   */
+  feedback?: ExitRatingFeedback;
   /**
    * Feature #53 — cross-session memory auto-recall/auto-capture wiring. When
    * `store` is supplied (the caller builds it from `createMemoryStore`), the
@@ -2437,10 +2485,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // byte-identical to before. `out.write` is the spinner-aware stdout sink:
   // every interactive write that can land while the animation is live goes
   // through it so the two never collide. `opts.spinner` overrides the auto
-  // decision.
+  // decision. `opts.stdout` redirects the whole human-facing surface (item 20
+  // — concurrent eval samples each get their own sink instead of splicing
+  // token deltas into one shared stdout).
   const spinnerEnabled =
     opts.spinner ?? (opts.singleTurn !== true && opts.input === undefined && isSpinnerEnabled());
-  const out: CliOutput = createCliOutput({ enabled: spinnerEnabled });
+  const out: CliOutput = createCliOutput({
+    enabled: spinnerEnabled,
+    ...(opts.stdout !== undefined ? { write: opts.stdout } : {}),
+  });
 
   // M2.1 — CLI markdown renderer (env-gated). When CREWHAUS_CLI_MARKDOWN=1,
   // text-delta chunks flow through a streaming markdown → ANSI transform so
@@ -2588,6 +2641,37 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     } catch (err) {
       runContext.logger.warn("memory auto-capture failed", { error: (err as Error).message });
     }
+  };
+
+  // Item 1 — how many turns produced a non-empty assistant answer. The exit
+  // rating prompt's "this session actually said something worth rating" floor.
+  let assistantAnswers = 0;
+
+  /**
+   * Item 1 — the exit rating prompt (spec `feedback:`). Runs in the REPL
+   * teardown AFTER readline has released stdin (the read is raw-mode) and
+   * BEFORE the event log closes, so the rating lands in this session's own
+   * transcript. Best-effort by contract: a prompt/append failure must never
+   * turn a clean session into a non-zero exit.
+   */
+  const maybeExitRating = async (cleanExit: boolean): Promise<void> => {
+    await runExitRating({
+      feedback: opts.feedback,
+      // A caller-supplied `input` stream means the runtime does not own the
+      // terminal (tests, piped hosts), so it is never a prompt target.
+      stdinIsTTY: opts.input === undefined && process.stdin.isTTY === true,
+      env: process.env,
+      assistantTurns: assistantAnswers,
+      cleanExit,
+      sessionId,
+      turnNumber: runContext.turnNumber,
+      append: async (record) => {
+        await eventLog.append({ kind: FEEDBACK_EVENT_KIND, payload: record });
+      },
+      write: (line) => out.write(line),
+      onError: (err) =>
+        runContext.logger.warn("exit rating prompt failed", { error: (err as Error).message }),
+    });
   };
 
   // -------------------------------------------------------------------------
@@ -2822,7 +2906,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         ]
       : [];
   if (projectMemory.files.length > 0) {
-    process.stdout.write(
+    // Human-facing loop output → the same sink as everything else, so a
+    // fanned-out caller (eval samples) can attribute the line (item 20).
+    out.write(
       `[memory] loaded ${projectMemory.files.length} project memory file(s): ${projectMemory.files
         .map((f) => f.filename)
         .join(", ")}\n`,
@@ -2854,7 +2940,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const text = await renderRecalledMemory(lines);
       if (text !== undefined) {
         memoryRecallBlock = [{ type: "text", text, cache_control: { type: "ephemeral" } }];
-        process.stdout.write(`[memory] recalled ${lines.length} memory(ies) into the prompt\n`);
+        out.write(`[memory] recalled ${lines.length} memory(ies) into the prompt\n`);
       }
     } catch (err) {
       runContext.logger.warn("memory auto-recall failed", { error: (err as Error).message });
@@ -2887,9 +2973,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const text = await renderRecalledMemory(lines);
       volatileRecallBlocks = text !== undefined ? [{ type: "text", text }] : [];
       if (lines.length > 0) {
-        process.stdout.write(
-          `[memory] refreshed ${lines.length} recalled memory(ies) for this turn\n`,
-        );
+        out.write(`[memory] refreshed ${lines.length} recalled memory(ies) for this turn\n`);
       }
     } catch (err) {
       // Keep the prior volatile block on a transient recall failure.
@@ -5242,6 +5326,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     process.on("SIGINT", sigintHandler);
   }
 
+  // Item 1 — set once the REPL loop has run to completion without throwing.
+  // The exit rating prompt fires only on such a clean exit: an aborted or
+  // crashed session is not one anyone wants to be asked to rate.
+  let replExitedCleanly = false;
+
   try {
     while (true) {
       if (runAbort.signal.aborted) break;
@@ -5353,7 +5442,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // RunFailedError, which the catch rethrows.
       armTurnTimer();
       try {
-        await runEvaluatedTurn(messages);
+        const { terminalContent } = await runEvaluatedTurn(messages);
+        // Item 1 — the exit rating prompt's "worth rating" floor: count only
+        // turns that ended in a real assistant answer.
+        if (terminalText(terminalContent).trim() !== "") assistantAnswers += 1;
       } catch (err) {
         // Defensive: tear down any animation a thrown turn left spinning.
         out.spinner.stop();
@@ -5389,6 +5481,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     if (runTimeout !== undefined) {
       await throwTimeout(runTimeout);
     }
+    replExitedCleanly = !runAbort.signal.aborted;
   } finally {
     clearAllTimers();
     out.spinner.stop();
@@ -5414,6 +5507,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       process.removeListener("SIGINT", sigintHandler);
     }
     rl.close();
+    // Item 1 — after readline released stdin (the rating read is raw-mode) and
+    // before the event log closes (the rating is appended to this session).
+    await maybeExitRating(replExitedCleanly);
     await sessionStore.update(sessionId, { lastTurnIndex: runContext.turnNumber }).catch((err) => {
       runContext.logger.warn("session-store: lastTurnIndex update failed", {
         error: (err as Error).message,

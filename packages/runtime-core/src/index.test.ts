@@ -176,6 +176,41 @@ describe("runChatLoop stdin EOF handling", () => {
   });
 });
 
+// Item 1 — the spec's `feedback:` block reaches the REPL teardown. The exit
+// rating prompt lives here (not in the CLI) so a COMPILED bundle asks it too;
+// the gate + record shape are unit-tested in ./exit-rating.test.ts, and this
+// pins the wiring: an injected `input` stream is never a TTY, so a piped or
+// hosted run must complete silently rather than block on a keystroke.
+describe("runChatLoop feedback (item 1)", () => {
+  test("a feedback block on a piped run never prompts and never fails the run", async () => {
+    const input = new PassThrough();
+    input.write("hi\n");
+    input.end();
+    const { adapter, calls } = makeStubAdapter("an answer worth rating");
+    const written: string[] = [];
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    // biome-ignore lint/suspicious/noExplicitAny: narrow stdout capture for one call
+    (process.stdout as any).write = (chunk: any, ...rest: any[]): boolean => {
+      written.push(String(chunk));
+      return originalWrite(chunk, ...(rest as []));
+    };
+    try {
+      await runChatLoop({
+        model: "test-model",
+        instructions: "test",
+        _adapter: adapter,
+        input,
+        feedback: {},
+      });
+    } finally {
+      process.stdout.write = originalWrite;
+    }
+
+    expect(calls()).toBe(1);
+    expect(written.join("")).not.toContain("rate this session?");
+  });
+});
+
 /**
  * Scripted ProviderAdapter (Section 17) that cycles through pre-baked
  * content-block arrays per call, synthesising the canonical StreamEvent

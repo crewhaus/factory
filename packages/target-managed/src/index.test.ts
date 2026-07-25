@@ -1,4 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import type { IrManagedV0 } from "@crewhaus/ir";
 import { TargetEmitError, emitManaged } from "./index";
@@ -308,6 +311,176 @@ describe("emitManaged — resume-path idempotency (loop contract 0.4, Batch F, I
     expect(optIdx).toBeGreaterThan(-1);
     expect(daemon.indexOf("justificationAuditSink: log,")).toBeGreaterThan(optIdx);
     expect(daemon.indexOf("egressAuditSink: log,")).toBeGreaterThan(optIdx);
+  });
+});
+
+describe("emitManaged — permission wiring for the tools the target installs itself", () => {
+  const agentOf = (i: IrManagedV0): string =>
+    emitManaged(i).files.find((f) => f.path === "agent.ts")?.content ?? "";
+
+  // What the compiler produces for a managed spec that declares NO
+  // `continuity:` block — continuity is default-on, so the memory fabric (and
+  // its FocusRead/PlanRead/… tool surface) is wired without the spec asking.
+  const withContinuity: IrManagedV0 = {
+    ...ir,
+    continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "spec" },
+  };
+
+  test("the fabric's own tools are granted, so a spec with no permissions block still works", () => {
+    const agent = agentOf(withContinuity);
+    // The grant is derived from the very array the fabric registered into —
+    // not a hard-coded tool list that can drift from what wireMemory wires.
+    expect(agent).toContain("const __memToolRules: PermissionRule[] = __memTools.map((t) => ({");
+    expect(agent).toContain('type: "alwaysAllow",');
+    expect(agent).toContain("pattern: t.name,");
+    expect(agent).toContain("builtin: [...BUILTIN_DEFAULT_RULES, ...__memToolRules],");
+    expect(agent).toContain('import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";');
+    expect(agent).toContain('import type { PermissionRule } from "@crewhaus/permission-engine";');
+    // Declared before the runChatLoop call that consumes it.
+    expect(agent.indexOf("const __memToolRules")).toBeLessThan(
+      agent.indexOf("return await runChatLoop({"),
+    );
+  });
+
+  test("the grant covers exactly the tool set handed to the model", () => {
+    const agent = agentOf(withContinuity);
+    // `tools:` and the rule mapping read the same array, so every tool the
+    // model can see has a matching allowance and nothing else is widened.
+    expect(agent).toContain("tools: __memTools,");
+    expect(agent).toContain("__memTools.map((t) => ({");
+  });
+
+  test("the grant sits at the builtin layer so a spec rule overrides it", () => {
+    // builtin is the LOWEST-priority source in permission-engine's
+    // SOURCE_PRIORITY, so a spec-declared rule on the same tool wins.
+    const agent = agentOf({
+      ...withContinuity,
+      permissions: { rules: [{ type: "alwaysDeny", pattern: "FocusWrite" }] },
+    });
+    expect(agent).toContain('{ type: "alwaysDeny", pattern: "FocusWrite", source: "yaml" },');
+    expect(agent).toContain("builtin: [...BUILTIN_DEFAULT_RULES, ...__memToolRules],");
+    expect(agent.indexOf("yaml: [")).toBeLessThan(agent.indexOf("builtin: ["));
+  });
+
+  test("spec-declared permissions.mode and permissions.rules reach runChatLoop", () => {
+    const agent = agentOf({
+      ...ir,
+      permissions: {
+        mode: "auto",
+        rules: [
+          { type: "alwaysAllow", pattern: "Read" },
+          { type: "alwaysDeny", pattern: "Bash(rm**)" },
+        ],
+      },
+    });
+    expect(agent).toContain('permissionMode: "auto",');
+    expect(agent).toContain('{ type: "alwaysAllow", pattern: "Read", source: "yaml" },');
+    expect(agent).toContain('{ type: "alwaysDeny", pattern: "Bash(rm**)", source: "yaml" },');
+  });
+
+  test("spec permissions without a memory fabric never reference __memToolRules", () => {
+    // `__memToolRules` only exists inside the fabric block; emitting a
+    // reference to it without the fabric would be a ReferenceError at boot.
+    const agent = agentOf({
+      ...ir,
+      permissions: { mode: "default", rules: [{ type: "alwaysAllow", pattern: "Read" }] },
+    });
+    expect(agent).toContain("builtin: BUILTIN_DEFAULT_RULES,");
+    expect(agent).not.toContain("__memToolRules");
+  });
+
+  test("no fabric and no permissions block emits no permission wiring at all", () => {
+    const agent = agentOf(ir);
+    expect(agent).not.toContain("permissionRules");
+    expect(agent).not.toContain("permissionMode");
+    expect(agent).not.toContain("@crewhaus/permission-engine");
+  });
+
+  test("Bun.Transpiler parses the emitted agent.ts with the permission wiring", () => {
+    const t = new Bun.Transpiler({ loader: "ts" });
+    expect(() =>
+      t.transformSync(
+        agentOf({
+          ...withContinuity,
+          permissions: { mode: "default", rules: [{ type: "alwaysAllow", pattern: "Read" }] },
+        }),
+      ),
+    ).not.toThrow();
+  });
+});
+
+describe("emitManaged — the default session id honors session-store's id contract", () => {
+  const daemonOf = (i: IrManagedV0): string =>
+    emitManaged(i).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+
+  // Verbatim from packages/session-store/src/index.ts (ID_REGEX). session-store
+  // is not a dependency of this package, so the contract is restated here; if it
+  // ever changes there, this test is the thing that has to move with it.
+  const SESSION_ID_REGEX = /^sess_[0-9a-f]{16}$/;
+
+  const workDir = mkdtempSync(join(tmpdir(), "crewhaus-managed-sessid-"));
+  afterAll(() => rmSync(workDir, { recursive: true, force: true }));
+
+  /**
+   * `runs.create` mints a session id when the caller omits one. Lift that exact
+   * expression out of the emitted daemon and RUN it the way a compiled bundle
+   * runs it — write it to a file, execute it with the same Bun — rather than
+   * asserting on its spelling. The defect this guards against was a perfectly
+   * readable base36 expression that produced store-invalid ids ~99.99% of the
+   * time; only executing it catches that class.
+   */
+  function mintDefaultSessionIds(daemon: string, count: number): string[] {
+    const match = daemon.match(/\n\s*const sessionId = p\.sessionId \?\? (.+);\n/);
+    expect(match).not.toBeNull();
+    const expr = (match as RegExpMatchArray)[1];
+    const file = join(workDir, "mint.ts");
+    writeFileSync(
+      file,
+      [
+        'import { randomBytes } from "node:crypto";',
+        "const p: { sessionId?: string } = {};",
+        `for (let i = 0; i < ${count}; i += 1) {`,
+        `  const sessionId = p.sessionId ?? ${expr};`,
+        "  console.log(sessionId);",
+        "}",
+      ].join("\n"),
+    );
+    const proc = Bun.spawnSync([process.execPath, file], {
+      env: { PATH: process.env["PATH"] ?? "" },
+    });
+    if (proc.exitCode !== 0) {
+      throw new Error(`session-id snippet failed: ${proc.stderr.toString()}`);
+    }
+    return proc.stdout.toString().trim().split("\n");
+  }
+
+  test("every minted default id matches sess_<16 hex>", () => {
+    const ids = mintDefaultSessionIds(daemonOf(ir), 500);
+    expect(ids).toHaveLength(500);
+    const invalid = ids.filter((id) => !SESSION_ID_REGEX.test(id));
+    // Report a sample so a regression names the shape it produced.
+    expect({ count: invalid.length, sample: invalid.slice(0, 3) }).toEqual({
+      count: 0,
+      sample: [],
+    });
+  });
+
+  test("minted ids are distinct — one run must not land on another run's session", () => {
+    const ids = mintDefaultSessionIds(daemonOf(ir), 500);
+    expect(new Set(ids).size).toBe(500);
+  });
+
+  test("the mint uses crypto randomBytes, the same source session-store uses", () => {
+    const daemon = daemonOf(ir);
+    const importLine = 'import { randomBytes } from "node:crypto";';
+    expect(daemon).toContain(importLine);
+    expect(daemon).toContain(
+      'const sessionId = p.sessionId ?? `sess_${randomBytes(8).toString("hex")}`;',
+    );
+    // The import has to precede the use or the emitted daemon does not run.
+    expect(daemon.indexOf(importLine)).toBeLessThan(
+      daemon.indexOf("const sessionId = p.sessionId ??"),
+    );
   });
 });
 

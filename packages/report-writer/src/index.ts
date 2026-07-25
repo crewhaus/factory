@@ -28,6 +28,11 @@
  *   [2] <url>
  *       <snippet>
  *
+ * The `## Citations` section is emitted UNCONDITIONALLY: a run that cited
+ * nothing renders the heading plus `NO_CITATIONS_NOTICE` rather than
+ * dropping the section, so an unsourced report can never pass for a
+ * sourced one.
+ *
  * The JSON report carries the same data programmatically so studio /
  * downstream consumers don't have to re-parse markdown.
  */
@@ -116,6 +121,14 @@ function citationNumbersForBranch(
   return out;
 }
 
+/**
+ * Rendered in place of the `[N] url` list when the run recorded no citations.
+ * Exported so a caller (or a test) can assert on the exact wording rather than
+ * pattern-matching prose.
+ */
+export const NO_CITATIONS_NOTICE =
+  "_No citations were recorded for this run — nothing above is anchored to a fetched source. Treat the findings as unverified._";
+
 function renderMarkdown(args: {
   goal: string;
   branches: ReadonlyArray<BranchAnswer>;
@@ -130,9 +143,15 @@ function renderMarkdown(args: {
     lines.push(b.answer.trim());
     lines.push("");
   }
-  if (args.numbered.length > 0) {
-    lines.push("## Citations");
-    lines.push("");
+  // The Citations section is UNCONDITIONAL. A research report that quietly
+  // drops its citation footer reads as a finished, sourced document while
+  // being nothing of the kind — for a shape whose premise is "must cite",
+  // silence is the worst possible rendering of "cited nothing". Say it.
+  lines.push("## Citations");
+  lines.push("");
+  if (args.numbered.length === 0) {
+    lines.push(NO_CITATIONS_NOTICE);
+  } else {
     for (const c of args.numbered) {
       lines.push(`[${c.number}] ${c.url}`);
       const trimmed = c.snippet.trim().replace(/\n+/g, " ");

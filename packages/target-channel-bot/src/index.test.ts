@@ -720,6 +720,21 @@ describe("emitChannelBot — gateway.ts", () => {
     expect(c).toContain("parsed.challenge");
   });
 
+  test("answers an unsigned GET subscription handshake before signature verification", () => {
+    const c = fileMap(MIN_IR).get("gateway.ts") ?? "";
+    // Meta's callback-URL verification is an unsigned GET with no body, so
+    // the branch must run BEFORE `adapter.verify` (which would 401 it) and
+    // must 403 — never echo — when the adapter rejects.
+    expect(c).toContain('req.method === "GET" && adapter.handshake !== undefined');
+    expect(c).toContain("adapter.handshake({ headers: req.headers, url })");
+    expect(c).toContain('handshake.kind === "challenge"');
+    expect(c).toContain("status: 403");
+    const handshakeAt = c.indexOf("adapter.handshake({");
+    const verifyAt = c.indexOf("if (!adapter.verify(rawReq))");
+    expect(handshakeAt).toBeGreaterThan(-1);
+    expect(handshakeAt).toBeLessThan(verifyAt);
+  });
+
   test("matches /<adapter>/events path prefix", () => {
     const c = fileMap(MIN_IR).get("gateway.ts") ?? "";
     // The generated regex literal is /^\/([^/]+)\/events$/ — match the
@@ -978,6 +993,29 @@ describe("emitChannelBot — WhatsApp channel (Section 33)", () => {
     expect(c).toContain('"WHATSAPP_APP_SECRET"');
   });
 
+  test("verifyToken is passed to the adapter and required at startup", () => {
+    const ir: IrChannelV0 = {
+      ...WHATSAPP_IR,
+      channels: {
+        whatsapp: {
+          phoneNumberId: { kind: "env", name: "WHATSAPP_PHONE_NUMBER_ID" },
+          accessToken: { kind: "env", name: "WHATSAPP_ACCESS_TOKEN" },
+          appSecret: { kind: "env", name: "WHATSAPP_APP_SECRET" },
+          verifyToken: { kind: "env", name: "WHATSAPP_VERIFY_TOKEN" },
+        },
+      },
+    };
+    const c = fileMap(ir).get("daemon.ts") ?? "";
+    expect(c).toContain('verifyToken: process.env["WHATSAPP_VERIFY_TOKEN"] ?? ""');
+    // Declared ⇒ load-bearing: an unset value must fail the boot check.
+    expect(c).toContain('"WHATSAPP_VERIFY_TOKEN"');
+  });
+
+  test("verifyToken is omitted from the adapter config when unset", () => {
+    const c = fileMap(WHATSAPP_IR).get("daemon.ts") ?? "";
+    expect(c).not.toContain("verifyToken:");
+  });
+
   test("daemon.ts can register all four channel adapters side-by-side", () => {
     const all: IrChannelV0 = {
       ...MIN_IR,
@@ -1026,6 +1064,63 @@ describe("emitChannelBot — iMessage channel (Section 33)", () => {
     );
     expect(c).toContain('registerChannelAdapter("imessage", imessageAdapter);');
     expect(c).toContain('["imessage", imessageAdapter]');
+  });
+
+  test("adapter construction is inside main(), covered by the failure-report catch", () => {
+    // createIMessageAdapter throws on a non-macOS host or without the
+    // CREWHAUS_IMESSAGE_HOST_ENABLED=1 opt-in. Constructed at module scope
+    // that throw escapes `main().catch`, and the operator gets a raw Bun
+    // stack trace instead of the formatted failure report.
+    const c = fileMap(IMESSAGE_IR).get("daemon.ts") ?? "";
+    const mainAt = c.indexOf("async function main(): Promise<void> {");
+    const constructAt = c.indexOf("createIMessageAdapter({");
+    const registerAt = c.indexOf('registerChannelAdapter("imessage", imessageAdapter);');
+    const catchAt = c.indexOf("main().catch((err) => {");
+    expect(mainAt).toBeGreaterThan(-1);
+    expect(constructAt).toBeGreaterThan(mainAt);
+    expect(registerAt).toBeGreaterThan(mainAt);
+    expect(constructAt).toBeLessThan(catchAt);
+    // Indented one level — it is a statement in main()'s body, not module scope.
+    expect(c).toContain("  const imessageAdapter = createIMessageAdapter({");
+    expect(c).not.toContain("\nconst imessageAdapter = createIMessageAdapter({");
+  });
+
+  test("every channel adapter constructs inside main(), not at module scope", () => {
+    const all: IrChannelV0 = {
+      ...MIN_IR,
+      channels: {
+        slack: MIN_IR.channels.slack,
+        telegram: {
+          botToken: { kind: "env", name: "TELEGRAM_BOT_TOKEN" },
+          secretToken: { kind: "env", name: "TELEGRAM_SECRET_TOKEN" },
+        },
+        discord: {
+          applicationId: { kind: "env", name: "DISCORD_APPLICATION_ID" },
+          botToken: { kind: "env", name: "DISCORD_BOT_TOKEN" },
+          publicKeyHex: { kind: "env", name: "DISCORD_PUBLIC_KEY" },
+        },
+        whatsapp: {
+          phoneNumberId: { kind: "env", name: "WHATSAPP_PHONE_NUMBER_ID" },
+          accessToken: { kind: "env", name: "WHATSAPP_ACCESS_TOKEN" },
+          appSecret: { kind: "env", name: "WHATSAPP_APP_SECRET" },
+        },
+        imessage: {},
+      },
+    };
+    const c = fileMap(all).get("daemon.ts") ?? "";
+    const mainAt = c.indexOf("async function main(): Promise<void> {");
+    for (const factory of [
+      "createSlackAdapter({",
+      "createTelegramAdapter({",
+      "createDiscordAdapter({",
+      "createWhatsAppAdapter({",
+      "createIMessageAdapter({",
+    ]) {
+      expect(c.indexOf(factory)).toBeGreaterThan(mainAt);
+    }
+    // No adapter const survives at column 0 (module scope).
+    expect(c).not.toMatch(/\nconst \w+Adapter = create/);
+    expect(c).not.toMatch(/\nregisterChannelAdapter\(/);
   });
 
   test("daemon.ts emits imessage adapter with no fields when none configured", () => {
@@ -1110,6 +1205,20 @@ describe("emitChannelBot — gateway control-UI (Phase 3 §3.4)", () => {
     // and the HTML branch checks it before serving.
     expect(c).toContain("__gatewayUiEnabled = false");
     expect(c).toContain("18080");
+  });
+
+  test("dashboard HTML interpolates the harness name with balanced braces", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      name: "hello-multichat",
+      gateway: { port: 19001, ui: true },
+    };
+    const c = fileMap(ir).get("daemon.ts") ?? "";
+    // The emitted page must not carry a stray `}` after the interpolation —
+    // that renders literally as "hello-multichat}" in the tab title and H1.
+    expect(c).toContain('<title>${"hello-multichat"}</title>');
+    expect(c).toContain('<h1>${"hello-multichat"}</h1>');
+    expect(c).not.toContain('"hello-multichat"}}');
   });
 
   test("status endpoint reports declared channels", () => {

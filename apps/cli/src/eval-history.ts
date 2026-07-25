@@ -44,10 +44,10 @@ import {
   type ReportDiff,
   ReportError,
   type RunIndexEntry,
-  appendRunIndex,
   diffReports,
   getBaseline,
   loadRun,
+  recordEvalRun,
   setBaseline,
 } from "@crewhaus/eval-report";
 import type { EvalRunSummary } from "@crewhaus/eval-runner";
@@ -213,40 +213,22 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
   const judgeModel = summary.config.judgeModel;
   const absOut = resolve(opts.outDir);
 
-  // Belt (the runner already refuses to run zero samples): a 0-sample run
-  // carries no signal and a passRate-0 "clean" entry would poison the index
-  // and could pin an empty baseline — refuse loudly instead of recording it.
-  if (summary.samples.length === 0) {
-    throw new Error(
-      `refusing to record 0-sample eval run ${summary.runId} — dataset "${datasetName}" produced no samples`,
-    );
-  }
-
-  const entry: RunIndexEntry = {
-    runId: summary.runId,
+  // Build + append the index entry through eval-report's shared recorder —
+  // the same call the standalone `target: eval` bundle makes, so one eval has
+  // ONE history whichever way it was launched. It also carries the belt (the
+  // runner already refuses to run zero samples): a 0-sample run has no signal,
+  // and a passRate-0 "clean" entry would poison the index and could pin an
+  // empty baseline, so it throws before anything is written.
+  const entry: RunIndexEntry = recordEvalRun(summary, {
     specName,
-    specHash: summary.config.specHash,
     ...(specSource !== undefined ? { specSource } : {}),
-    datasetName,
     datasetHash: opts.datasetHash,
-    ...(gradersHash !== undefined ? { gradersHash } : {}),
-    ...(judgeModel !== undefined ? { judgeModel } : {}),
-    passRate: summary.aggregates.passRate,
-    meanScore: summary.aggregates.meanScore,
-    sampleCount: summary.samples.length,
-    // C30 — additive ops columns: p95 latency straight off the aggregates,
-    // estimated cost when the caller could price the run.
-    p95LatencyMs: summary.aggregates.p95LatencyMs,
+    // C30 — the one column the shared recorder cannot derive: pricing needs
+    // the model catalogue, which the summary does not carry.
     ...(opts.costUsd !== undefined ? { costUsd: opts.costUsd } : {}),
-    retriedCount: summary.samples.filter((s) => s.retried === true).length,
-    // NEW-HUNT-3 — mark budget-aborted runs so history readers can tell
-    // this entry's deflated passRate (aborted samples count as errors)
-    // from a genuinely measured one.
-    ...(summary.partial !== undefined ? { partial: true } : {}),
-    ts: summary.endedAt,
     outDir: absOut,
-  };
-  appendRunIndex(entry, opts.evalsDir);
+    ...(opts.evalsDir !== undefined ? { evalsDir: opts.evalsDir } : {}),
+  });
 
   const pinCurrentRun = (label: string): void => {
     // NEW-HUNT-3 — a budget-aborted run records its unexecuted samples as

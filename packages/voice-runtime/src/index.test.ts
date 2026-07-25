@@ -64,11 +64,11 @@ function makeStubWs(): {
 }
 
 describe("createOpenAIRealtimeAdapter — connect + protocol contract (T2)", () => {
-  test("connect() sends a session.update after the WebSocket opens", async () => {
+  test("connect() sends a GA-shaped session.update after the WebSocket opens", async () => {
     const { ctor, socket } = makeStubWs();
     const adapter = createOpenAIRealtimeAdapter({ apiKey: "sk-test", _ws: ctor });
     const connectPromise = adapter.connect({
-      model: "gpt-4o-realtime-preview",
+      model: "gpt-realtime",
       instructions: "be brief",
       voice: "alloy",
       vad: "server",
@@ -81,11 +81,50 @@ describe("createOpenAIRealtimeAdapter — connect + protocol contract (T2)", () 
     if (sessionUpdate === undefined) throw new Error("missing session.update");
     expect(sessionUpdate["type"]).toBe("session.update");
     const session = sessionUpdate["session"] as Record<string, unknown>;
+    // GA requires session.type; omitting it is rejected server-side.
+    expect(session["type"]).toBe("realtime");
+    expect(session["model"]).toBe("gpt-realtime");
     expect(session["instructions"]).toBe("be brief");
-    expect(session["voice"]).toBe("alloy");
-    expect(session["input_audio_format"]).toBe("pcm16");
-    expect(session["output_audio_format"]).toBe("pcm16");
-    expect((session["turn_detection"] as { type?: string })["type"]).toBe("server_vad");
+    // GA cannot combine text + audio output; audio still yields transcripts.
+    expect(session["output_modalities"]).toEqual(["audio"]);
+    const audio = session["audio"] as {
+      input?: Record<string, unknown>;
+      output?: Record<string, unknown>;
+    };
+    // `rate` is mandatory on BOTH audio/pcm formats — omitting it on the
+    // output side is rejected with "Missing required parameter:
+    // 'session.audio.output.format.rate'".
+    expect(audio.input?.["format"]).toEqual({ type: "audio/pcm", rate: 24_000 });
+    expect(audio.output?.["format"]).toEqual({ type: "audio/pcm", rate: 24_000 });
+    expect(audio.output?.["voice"]).toBe("alloy");
+    expect((audio.input?.["turn_detection"] as { type?: string })["type"]).toBe("server_vad");
+  });
+
+  test("connect() sends no retired beta fields (issue #24 regression guard)", async () => {
+    const { ctor, socket } = makeStubWs();
+    const adapter = createOpenAIRealtimeAdapter({ apiKey: "sk-test", _ws: ctor });
+    const cp = adapter.connect({ model: "gpt-realtime", voice: "alloy", vad: "server" });
+    socket.triggerOpen();
+    await cp;
+    const session = socket.lastSent[0]?.["session"] as Record<string, unknown>;
+    // The beta wire shape closes the socket with 4000
+    // invalid_request_error.beta_api_shape_disabled.
+    expect(session["modalities"]).toBeUndefined();
+    expect(session["input_audio_format"]).toBeUndefined();
+    expect(session["output_audio_format"]).toBeUndefined();
+    expect(session["turn_detection"]).toBeUndefined();
+    expect(session["voice"]).toBeUndefined();
+  });
+
+  test("vad: 'none' nulls turn_detection under audio.input", async () => {
+    const { ctor, socket } = makeStubWs();
+    const adapter = createOpenAIRealtimeAdapter({ apiKey: "sk-test", _ws: ctor });
+    const cp = adapter.connect({ model: "gpt-realtime", vad: "none" });
+    socket.triggerOpen();
+    await cp;
+    const session = socket.lastSent[0]?.["session"] as Record<string, unknown>;
+    const audio = session["audio"] as { input?: Record<string, unknown> };
+    expect(audio.input?.["turn_detection"]).toBeNull();
   });
 
   test("sendAudio packs Int16Array as base64 and emits input_audio_buffer.append", async () => {
@@ -107,7 +146,55 @@ describe("createOpenAIRealtimeAdapter — connect + protocol contract (T2)", () 
     expect(decoded[2]).toBe(-1024);
   });
 
-  test("server response.audio_transcript.delta → transcript_partial event", async () => {
+  test("GA response.output_audio_transcript.{delta,done} → transcript events", async () => {
+    const { ctor, socket } = makeStubWs();
+    const adapter = createOpenAIRealtimeAdapter({ apiKey: "sk-test", _ws: ctor });
+    const events: RealtimeEvent[] = [];
+    adapter.on((e) => events.push(e));
+    const cp = adapter.connect({ model: "gpt-realtime" });
+    socket.triggerOpen();
+    await cp;
+
+    socket.mockServerEmit({
+      type: "response.output_audio_transcript.delta",
+      delta: "Hola",
+      item_id: "item_ga",
+    });
+    socket.mockServerEmit({
+      type: "response.output_audio_transcript.done",
+      transcript: "Hola mundo",
+      item_id: "item_ga",
+    });
+
+    const partial = events.find((e) => e.kind === "transcript_partial");
+    expect(partial).toEqual({ kind: "transcript_partial", text: "Hola", itemId: "item_ga" });
+    const final = events.find((e) => e.kind === "transcript_final");
+    expect(final).toEqual({ kind: "transcript_final", text: "Hola mundo", itemId: "item_ga" });
+  });
+
+  test("GA response.output_audio.delta → audio_chunk event", async () => {
+    const { ctor, socket } = makeStubWs();
+    const adapter = createOpenAIRealtimeAdapter({ apiKey: "sk-test", _ws: ctor });
+    const events: RealtimeEvent[] = [];
+    adapter.on((e) => events.push(e));
+    const cp = adapter.connect({ model: "gpt-realtime" });
+    socket.triggerOpen();
+    await cp;
+
+    socket.mockServerEmit({
+      type: "response.output_audio.delta",
+      delta: encodePcm16Base64(new Int16Array([7, -7, 700])),
+    });
+
+    const audio = events.find((e) => e.kind === "audio_chunk");
+    expect(audio).toBeDefined();
+    if (audio?.kind === "audio_chunk") {
+      expect(audio.sampleRate).toBe(24_000);
+      expect(Array.from(audio.pcm)).toEqual([7, -7, 700]);
+    }
+  });
+
+  test("legacy alias response.audio_transcript.delta → transcript_partial event", async () => {
     const { ctor, socket } = makeStubWs();
     const adapter = createOpenAIRealtimeAdapter({ apiKey: "sk-test", _ws: ctor });
     const events: RealtimeEvent[] = [];
@@ -144,7 +231,7 @@ describe("createOpenAIRealtimeAdapter — connect + protocol contract (T2)", () 
     }
   });
 
-  test("server response.audio.delta → audio_chunk event with PCM Int16Array", async () => {
+  test("legacy alias response.audio.delta → audio_chunk event with PCM Int16Array", async () => {
     const { ctor, socket } = makeStubWs();
     const adapter = createOpenAIRealtimeAdapter({ apiKey: "sk-test", _ws: ctor });
     const events: RealtimeEvent[] = [];

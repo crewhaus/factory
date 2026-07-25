@@ -841,6 +841,14 @@ describe("createSourceTool", () => {
   });
 });
 
+/**
+ * A tracker that reports the given bodies as already fetched, so CiteFact's
+ * verbatim check has something to verify against.
+ */
+function trackerWithBodies(bodies: Record<string, string>): ReturnType<typeof fakeTracker> {
+  return fakeTracker({ getFetchedContent: (url: string) => bodies[url] });
+}
+
 describe("createCiteFactTool", () => {
   test("declares safe, read-only tool metadata", () => {
     const tracker = fakeTracker();
@@ -851,7 +859,9 @@ describe("createCiteFactTool", () => {
   });
 
   test("records a citation and echoes the url + short sha256", async () => {
-    const tracker = fakeTracker();
+    const tracker = trackerWithBodies({
+      "https://example.com/x": "before. the quick brown fox. after.",
+    });
     const tool = createCiteFactTool({ tracker });
     const out = await tool.execute({
       uri: "https://example.com/x",
@@ -864,7 +874,7 @@ describe("createCiteFactTool", () => {
   });
 
   test("threads branchId and supportingClaim through to recordCitation", async () => {
-    const tracker = fakeTracker();
+    const tracker = trackerWithBodies({ "file:///doc.txt": "lead-in a verbatim quote trailer" });
     const tool = createCiteFactTool({ tracker, currentBranchId: () => "br-9" });
     await tool.execute({
       uri: "file:///doc.txt",
@@ -882,10 +892,134 @@ describe("createCiteFactTool", () => {
   });
 
   test("omits branchId when no resolver is configured", async () => {
-    const tracker = fakeTracker();
+    const tracker = trackerWithBodies({ u: "s" });
     const tool = createCiteFactTool({ tracker });
     await tool.execute({ uri: "u", snippet: "s" });
     expect(tracker.citations[0]).toEqual({ url: "u", snippet: "s" });
+  });
+});
+
+// A citation is a claim about bytes we actually hold. The tracker caches the
+// fetched body, so a snippet that does not occur in that body is a fabricated
+// quote — and recording it stamps a real URL + a real sha256 next to text that
+// was never there. CiteFact must refuse, not record.
+describe("createCiteFactTool — verbatim verification", () => {
+  test("refuses a snippet that does not occur in the fetched body, and records nothing", async () => {
+    const root = newRoot();
+    try {
+      const docDir = mkdtempSync(join(tmpdir(), "crawler-doc-"));
+      const doc = join(docDir, "paper.txt");
+      writeFileSync(doc, "CrewHaus compiles a spec into a bundle.\n");
+      const tracker = createCitationTracker({ rootDir: root });
+      const crawler = createCrawler({ tracker, config: { allowedFileRoots: [docDir] } });
+      const source = createSourceTool({ crawler });
+      const cite = createCiteFactTool({ tracker });
+
+      await source.execute({ uri: `file://${doc}` });
+      const out = await cite.execute({
+        uri: `file://${doc}`,
+        snippet: "CrewHaus guarantees a 40% latency reduction.",
+      });
+
+      expect(out).toContain("[CiteFact rejected]");
+      expect(out).toContain("does not appear in the body loaded from");
+      expect(out).toContain("Nothing was recorded.");
+      expect(tracker.listCitationsOrdered()).toEqual([]);
+      rmSync(docDir, { recursive: true, force: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts a snippet that occurs verbatim in the fetched body", async () => {
+    const root = newRoot();
+    try {
+      const docDir = mkdtempSync(join(tmpdir(), "crawler-doc-"));
+      const doc = join(docDir, "paper.txt");
+      writeFileSync(doc, "CrewHaus compiles a spec into a bundle.\n");
+      const tracker = createCitationTracker({ rootDir: root });
+      const crawler = createCrawler({ tracker, config: { allowedFileRoots: [docDir] } });
+      await createSourceTool({ crawler }).execute({ uri: `file://${doc}` });
+      const out = await createCiteFactTool({ tracker }).execute({
+        uri: `file://${doc}`,
+        snippet: "compiles a spec into a bundle",
+      });
+      expect(out).toStartWith("Recorded citation:");
+      expect(tracker.listCitationsOrdered().map((c) => c.snippet)).toEqual([
+        "compiles a spec into a bundle",
+      ]);
+      rmSync(docDir, { recursive: true, force: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("tolerates re-wrapped whitespace (hard-wrapped source quoted on one line)", async () => {
+    const tracker = trackerWithBodies({
+      "https://example.com/a": "the runtime\ncompiles   a spec\tinto a bundle",
+    });
+    const out = await createCiteFactTool({ tracker }).execute({
+      uri: "https://example.com/a",
+      snippet: "  the runtime compiles a spec into a bundle ",
+    });
+    expect(out).toStartWith("Recorded citation:");
+    expect(tracker.citations).toHaveLength(1);
+  });
+
+  test("refuses a citation against a uri that was never loaded", async () => {
+    const tracker = fakeTracker();
+    const out = await createCiteFactTool({ tracker }).execute({
+      uri: "https://example.com/never-fetched",
+      snippet: "anything at all",
+    });
+    expect(out).toContain("[CiteFact rejected]");
+    expect(out).toContain("Source(");
+    expect(tracker.citations).toEqual([]);
+  });
+
+  test("refuses, but distinguishes the case where the cached body has gone missing", async () => {
+    // Fetch record present, body unavailable: the agent DID load the uri, so
+    // "call Source first" would be a lie. Still a refusal — nothing left to
+    // verify the quote against.
+    const tracker = fakeTracker({
+      getFetchRecord: () => ({
+        version: 1 as const,
+        url: "https://example.com/a",
+        retrievedAt: "2026-06-04T00:00:00.000Z",
+        sha256: "c".repeat(64),
+        contentBytes: 10,
+      }),
+    });
+    const out = await createCiteFactTool({ tracker }).execute({
+      uri: "https://example.com/a",
+      snippet: "anything at all",
+    });
+    expect(out).toContain("[CiteFact rejected]");
+    expect(out).toContain("no longer available");
+    expect(out).not.toContain("Source(");
+    expect(tracker.citations).toEqual([]);
+  });
+
+  test("refuses a whitespace-only snippet (would trivially 'occur' in any body)", async () => {
+    const tracker = trackerWithBodies({ "https://example.com/a": "some body text" });
+    const out = await createCiteFactTool({ tracker }).execute({
+      uri: "https://example.com/a",
+      snippet: "   ",
+    });
+    expect(out).toContain("[CiteFact rejected]");
+    expect(tracker.citations).toEqual([]);
+  });
+
+  test("case and wording still matter (only whitespace is normalized)", async () => {
+    const tracker = trackerWithBodies({ "https://example.com/a": "the quick brown fox" });
+    const cite = createCiteFactTool({ tracker });
+    expect(
+      await cite.execute({ uri: "https://example.com/a", snippet: "The Quick Brown Fox" }),
+    ).toContain("[CiteFact rejected]");
+    expect(
+      await cite.execute({ uri: "https://example.com/a", snippet: "the quick brown dog" }),
+    ).toContain("[CiteFact rejected]");
+    expect(tracker.citations).toEqual([]);
   });
 });
 

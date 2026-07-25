@@ -6,7 +6,12 @@
  *   const graph = createGraph<State>()
  *     .addNode("plan",      async (ctx, s) => ({ ...s, plan: "..." }))
  *     .addNode("execute",   async (ctx, s) => {
- *       if (!ctx.approval) await ctx.requestApproval("execute the plan?");
+ *       // HITL is a PRE-condition: ask FIRST, then do the work. The pause
+ *       // checkpoints the pre-node state and `resume()` replays this node
+ *       // from the top, so anything computed before the ask is discarded
+ *       // and re-run (see NodeContext.requestApproval).
+ *       const decision = await ctx.requestApproval("execute the plan?");
+ *       if (decision === "reject") return s;
  *       return { ...s, result: "..." };
  *     })
  *     .addNode("summarise", async (ctx, s) => ({ ...s, summary: "..." }))
@@ -66,6 +71,16 @@ export interface NodeContext {
    *
    * Returns a value only on resume — on the first run this throws a
    * `HitlPauseSignal` that the engine catches.
+   *
+   * CONTRACT — approval is a PRE-condition. Call this BEFORE the node does
+   * any work: the checkpoint the engine saves on the pause holds the
+   * PRE-node state, and `resume()` replays the paused node from the top.
+   * Anything the node computed before pausing (a model turn, a tool call)
+   * is therefore discarded AND re-executed on resume — paid for twice, and
+   * never seen by the approver, since the `hitl_pause` event carries the
+   * pre-node state. Nodes that want a human to review their own output
+   * should hang the gate on the DOWNSTREAM node, whose pre-node state is
+   * exactly that output.
    */
   requestApproval(prompt: string): Promise<string>;
 }
@@ -160,12 +175,21 @@ export type BranchEvent = {
   readonly newGraphRunId: GraphRunId;
 };
 
-export type HitlPauseEvent = {
+// `S` defaults to `unknown` so the pre-0.4.x bare `HitlPauseEvent` spelling
+// still compiles for external consumers now that the event carries state.
+export type HitlPauseEvent<S = unknown> = {
   readonly kind: "hitl_pause";
   readonly graphRunId: GraphRunId;
   readonly nodeName: NodeName;
   readonly prompt: string;
   readonly checkpointId: CheckpointId;
+  /**
+   * The state the paused node is about to run on — the same state the
+   * pause checkpoint persists. Carried on the event so an approver can see
+   * WHAT they are approving (the upstream output that reached this node)
+   * without loading the checkpoint out of band.
+   */
+  readonly state: S;
 };
 
 export type GraphRunDoneEvent<S> = {
@@ -180,7 +204,7 @@ export type NodeEvent<S> =
   | EdgeTakenEvent
   | CheckpointEvent
   | BranchEvent
-  | HitlPauseEvent
+  | HitlPauseEvent<S>
   | GraphRunDoneEvent<S>;
 
 export type RunOptions = {
@@ -528,6 +552,9 @@ class CompiledGraph<Input, State> implements RunnableGraph<Input, State> {
               nodeName,
               prompt: err.prompt,
               checkpointId: cp.id,
+              // The pre-node state — what the approver is deciding on, and
+              // byte-identical to the state the checkpoint just persisted.
+              state,
             };
           } else {
             // No checkpoint store wired; surface a synthetic id so the
@@ -538,6 +565,7 @@ class CompiledGraph<Input, State> implements RunnableGraph<Input, State> {
               nodeName,
               prompt: err.prompt,
               checkpointId: "ckpt_unpersisted_0000",
+              state,
             };
           }
           return;
@@ -719,16 +747,24 @@ export async function collectTerminalState<S>(
 export async function collectLastCheckpoint<S>(stream: AsyncIterable<NodeEvent<S>>): Promise<{
   events: ReadonlyArray<NodeEvent<S>>;
   lastCheckpointId?: CheckpointId;
-  pausedAt?: { nodeName: NodeName; checkpointId: CheckpointId; prompt: string };
+  pausedAt?: { nodeName: NodeName; checkpointId: CheckpointId; prompt: string; state: S };
 }> {
   const events: NodeEvent<S>[] = [];
   let lastCheckpointId: CheckpointId | undefined;
-  let pausedAt: { nodeName: NodeName; checkpointId: CheckpointId; prompt: string } | undefined;
+  let pausedAt:
+    | { nodeName: NodeName; checkpointId: CheckpointId; prompt: string; state: S }
+    | undefined;
   for await (const ev of stream) {
     events.push(ev);
     if (ev.kind === "checkpoint") lastCheckpointId = ev.checkpointId;
     if (ev.kind === "hitl_pause") {
-      pausedAt = { nodeName: ev.nodeName, checkpointId: ev.checkpointId, prompt: ev.prompt };
+      // `state` = the pre-node state the approver is deciding on.
+      pausedAt = {
+        nodeName: ev.nodeName,
+        checkpointId: ev.checkpointId,
+        prompt: ev.prompt,
+        state: ev.state,
+      };
     }
   }
   return {

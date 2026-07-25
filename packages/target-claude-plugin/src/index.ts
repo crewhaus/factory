@@ -27,6 +27,13 @@
  *   - `crew` → one agent .md per role; the entry role becomes the
  *     primary SKILL.md.
  *
+ * On top of that PROJECTION, `opts.assets` carries the harness's
+ * AUTHORED surface — the `.crewhaus/skills/**` and `.crewhaus/commands/*.md`
+ * files the user hand-wrote — through verbatim, so an exported plugin is
+ * not a strictly smaller agent than the harness it came from. The caller
+ * reads them (this package still does no I/O) and they override a
+ * synthesized file at the same path.
+ *
  * This is a strict-emission package: no I/O, returns a `Bundle` of
  * files for the caller (the CLI) to write to disk. Pure functions.
  *
@@ -76,6 +83,22 @@ export type EmitClaudePluginOptions = {
    * Anthropic recommends 1-2 sentences describing trigger conditions.
    */
   readonly description?: string;
+  /**
+   * Item 14 — the harness's AUTHORED assets, already read from the
+   * `.crewhaus/` workspace by the caller (this package does no I/O) and
+   * addressed at their plugin-relative destination: `skills/<name>/SKILL.md`
+   * (plus anything else under the skill dir) and `commands/<name>.md`.
+   *
+   * Without these, an export of a spec whose harness ships hand-written
+   * skills + slash commands emitted only the ONE skill synthesized from
+   * `agent.instructions` and no `commands/` dir at all — the plugin was a
+   * strictly smaller agent than the harness it came from.
+   *
+   * Merged AFTER the synthesized files and overriding them on a path
+   * collision: a hand-authored `skills/<ir.name>/SKILL.md` is the author's
+   * explicit intent and beats the projection of `agent.instructions`.
+   */
+  readonly assets?: ReadonlyArray<PluginFile>;
 };
 
 /**
@@ -138,8 +161,65 @@ export function emitClaudePlugin(ir: IrNode, opts: EmitClaudePluginOptions): Plu
   // typed TargetClaudePluginError above, not a renderer error over a
   // malformed variant; inserted at index 1 to keep the historical
   // plugin.json → README.md → … file order.
-  files.splice(1, 0, { path: "README.md", content: renderReadme(ir, description) });
-  return { files };
+  const assets = opts.assets ?? [];
+  files.splice(1, 0, { path: "README.md", content: renderReadme(ir, description, assets) });
+  return { files: mergeAssets(files, assets) };
+}
+
+/**
+ * Append the caller-supplied authored assets to the synthesized files,
+ * deduping by path: an asset that collides with a synthesized file REPLACES
+ * it in place (author beats projection) instead of appending a second entry
+ * for the same path — the CLI writes the bundle file-by-file and reports
+ * `files.length`, so a duplicate path would silently inflate that count.
+ */
+function mergeAssets(
+  files: ReadonlyArray<PluginFile>,
+  assets: ReadonlyArray<PluginFile>,
+): PluginFile[] {
+  const merged: PluginFile[] = [];
+  const indexByPath = new Map<string, number>();
+  for (const file of [...files, ...assets]) {
+    const at = indexByPath.get(file.path);
+    if (at === undefined) {
+      indexByPath.set(file.path, merged.length);
+      merged.push(file);
+    } else {
+      merged[at] = file;
+    }
+  }
+  return merged;
+}
+
+/**
+ * The `Authored assets` README section — names the skills and slash commands
+ * carried verbatim out of the harness's `.crewhaus/` workspace, so a reader of
+ * the emitted plugin can tell hand-written surface from the projection of
+ * `agent.instructions`. Returns `undefined` when nothing was carried.
+ */
+function renderAssetsSection(
+  assets: ReadonlyArray<PluginFile>,
+): { readonly heading: string; readonly body: string } | undefined {
+  if (assets.length === 0) return undefined;
+  const skills = new Set<string>();
+  const commands = new Set<string>();
+  for (const asset of assets) {
+    const skill = asset.path.match(/^skills\/([^/]+)\//);
+    if (skill?.[1] !== undefined) {
+      skills.add(skill[1]);
+      continue;
+    }
+    const command = asset.path.match(/^commands\/([^/]+)\.md$/);
+    if (command?.[1] !== undefined) commands.add(command[1]);
+  }
+  const lines = ["Carried verbatim from the harness's `.crewhaus/` workspace:", ""];
+  if (skills.size > 0) {
+    lines.push(`- Skills: ${[...skills].map((s) => `\`${s}\``).join(", ")}`);
+  }
+  if (commands.size > 0) {
+    lines.push(`- Commands: ${[...commands].map((c) => `\`/${c}\``).join(", ")}`);
+  }
+  return { heading: "Authored assets", body: lines.join("\n") };
 }
 
 function defaultDescription(ir: IrNode): string {
@@ -170,7 +250,12 @@ function renderPluginJson(
  * note is suppressed — a Claude Code plugin has no CrewHaus runtime
  * workspace.
  */
-function renderReadme(ir: IrNode, description: string): string {
+function renderReadme(
+  ir: IrNode,
+  description: string,
+  assets: ReadonlyArray<PluginFile> = [],
+): string {
+  const assetsSection = renderAssetsSection(assets);
   return renderBundleReadme(ir, {
     description,
     usage: {
@@ -179,6 +264,7 @@ function renderReadme(ir: IrNode, description: string): string {
     },
     includeWorkspaceNote: false,
     extraSections: [
+      ...(assetsSection !== undefined ? [assetsSection] : []),
       {
         heading: "Origin",
         body: [

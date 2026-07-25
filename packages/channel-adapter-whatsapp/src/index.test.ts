@@ -11,6 +11,7 @@ import {
   createWhatsAppAdapter,
   signWhatsAppBody,
   verifyWhatsAppSignature,
+  verifyWhatsAppVerifyToken,
 } from "./index";
 
 // `tsc -b` also compiles this file into `dist/`; resolve fixtures from the
@@ -641,5 +642,115 @@ describe("sendReply — response handling (T3)", () => {
       })) as unknown as typeof fetch;
     const a = adapter({ fetch: f });
     await expect(a.sendReply({ event, text: "x" })).rejects.toThrow(/messages POST error: unknown/);
+  });
+});
+
+describe("handshake — Meta GET callback-URL verification", () => {
+  const VERIFY_TOKEN = "wa-verify-token";
+
+  const withToken = (): ChannelAdapter =>
+    createWhatsAppAdapter(
+      {
+        phoneNumberId: PHONE_NUMBER_ID,
+        accessToken: ACCESS_TOKEN,
+        appSecret: APP_SECRET,
+        verifyToken: VERIFY_TOKEN,
+      },
+      { apiBaseUrl: "https://test.graph.local", now: FIXTURE_NOW },
+    );
+
+  const hubUrl = (params: Record<string, string>): URL => {
+    const u = new URL("https://bot.example/whatsapp/events");
+    for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+    return u;
+  };
+
+  test("echoes hub.challenge when the verify token matches", () => {
+    const r = withToken().handshake({
+      headers: new Headers(),
+      url: hubUrl({
+        "hub.mode": "subscribe",
+        "hub.verify_token": VERIFY_TOKEN,
+        "hub.challenge": "1158201444",
+      }),
+    });
+    expect(r.kind).toBe("challenge");
+    if (r.kind !== "challenge") return;
+    expect(r.challenge).toBe("1158201444");
+  });
+
+  test("rejects a wrong verify token", () => {
+    const r = withToken().handshake({
+      headers: new Headers(),
+      url: hubUrl({
+        "hub.mode": "subscribe",
+        "hub.verify_token": "not-the-token",
+        "hub.challenge": "1158201444",
+      }),
+    });
+    expect(r.kind).toBe("reject");
+  });
+
+  test("rejects when no verifyToken is configured (fails closed)", () => {
+    const r = adapter().handshake({
+      headers: new Headers(),
+      url: hubUrl({
+        "hub.mode": "subscribe",
+        "hub.verify_token": "",
+        "hub.challenge": "1158201444",
+      }),
+    });
+    expect(r.kind).toBe("reject");
+  });
+
+  test("rejects a non-subscribe hub.mode", () => {
+    const r = withToken().handshake({
+      headers: new Headers(),
+      url: hubUrl({
+        "hub.mode": "unsubscribe",
+        "hub.verify_token": VERIFY_TOKEN,
+        "hub.challenge": "1158201444",
+      }),
+    });
+    expect(r.kind).toBe("reject");
+  });
+
+  test("rejects when hub.challenge or hub.verify_token is absent", () => {
+    const noChallenge = withToken().handshake({
+      headers: new Headers(),
+      url: hubUrl({ "hub.mode": "subscribe", "hub.verify_token": VERIFY_TOKEN }),
+    });
+    expect(noChallenge.kind).toBe("reject");
+    const noToken = withToken().handshake({
+      headers: new Headers(),
+      url: hubUrl({ "hub.mode": "subscribe", "hub.challenge": "42" }),
+    });
+    expect(noToken.kind).toBe("reject");
+  });
+
+  test("a token that is a prefix of the configured one does not match", () => {
+    const r = withToken().handshake({
+      headers: new Headers(),
+      url: hubUrl({
+        "hub.mode": "subscribe",
+        "hub.verify_token": VERIFY_TOKEN.slice(0, -1),
+        "hub.challenge": "42",
+      }),
+    });
+    expect(r.kind).toBe("reject");
+  });
+});
+
+describe("verifyWhatsAppVerifyToken", () => {
+  test("true only on an exact match", () => {
+    expect(verifyWhatsAppVerifyToken({ expected: "abc123", supplied: "abc123" })).toBe(true);
+    expect(verifyWhatsAppVerifyToken({ expected: "abc123", supplied: "abc124" })).toBe(false);
+    expect(verifyWhatsAppVerifyToken({ expected: "abc123", supplied: "abc123x" })).toBe(false);
+    expect(verifyWhatsAppVerifyToken({ expected: "abc123", supplied: "" })).toBe(false);
+  });
+
+  test("an unconfigured (empty) expected token never matches", () => {
+    expect(verifyWhatsAppVerifyToken({ expected: "", supplied: "" })).toBe(false);
+    expect(verifyWhatsAppVerifyToken({ expected: "", supplied: "anything" })).toBe(false);
   });
 });

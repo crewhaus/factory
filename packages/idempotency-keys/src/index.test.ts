@@ -2,19 +2,32 @@ import { describe, expect, test } from "bun:test";
 import { createInMemoryIdempotencyStore, idempotencyKey, withIdempotency } from "./index.js";
 
 describe("idempotencyKey", () => {
-  test("same (jobId, attempt) → same key (T9 invariant)", () => {
+  test("same (jobId, discriminator) → same key (T9 invariant)", () => {
     const a = idempotencyKey("job_001", 1);
     const b = idempotencyKey("job_001", 1);
     expect(a).toBe(b);
     expect(a).toMatch(/^[0-9a-f]{24}$/);
   });
 
-  test("different attempts produce different keys", () => {
+  test("different discriminators produce different keys", () => {
     expect(idempotencyKey("job_001", 1)).not.toBe(idempotencyKey("job_001", 2));
   });
 
   test("different jobIds produce different keys", () => {
     expect(idempotencyKey("a", 1)).not.toBe(idempotencyKey("b", 1));
+  });
+
+  // Audit item 23 — the queue consumer keys on the job id alone so a
+  // redelivery hits the cache. The discriminator therefore defaults to 0,
+  // which is also what the content-derived callers (`target-managed`,
+  // `target-browser-driver`) pass explicitly: their keys must not move.
+  test("the discriminator defaults to 0", () => {
+    expect(idempotencyKey("job_001")).toBe(idempotencyKey("job_001", 0));
+  });
+
+  test("a job id alone is a stable key across redeliveries", () => {
+    expect(idempotencyKey("job_00000001")).toBe(idempotencyKey("job_00000001"));
+    expect(idempotencyKey("job_00000001")).not.toBe(idempotencyKey("job_00000002"));
   });
 });
 

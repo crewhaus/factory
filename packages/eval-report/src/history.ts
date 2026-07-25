@@ -17,6 +17,7 @@
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { EvalRunSummary } from "@crewhaus/eval-runner";
 import { ReportError } from "./errors";
 
 /** Default location of the run index + baselines, relative to the cwd. */
@@ -160,6 +161,87 @@ export function hashDatasetFile(path: string): string {
 export function appendRunIndex(entry: RunIndexEntry, evalsDir: string = DEFAULT_EVALS_DIR): void {
   mkdirSync(evalsDir, { recursive: true });
   appendFileSync(join(evalsDir, INDEX_FILENAME), `${JSON.stringify(entry)}\n`);
+}
+
+/** Identity a run summary cannot supply on its own — see {@link recordEvalRun}. */
+export type RecordEvalRunOptions = {
+  /** The evaluated spec's `name:` (the baseline lineage key). */
+  readonly specName: string;
+  /** Resolved spec source path — see {@link RunIndexEntry.specSource}. */
+  readonly specSource?: string;
+  /** sha256 hex of the dataset content the run scored. */
+  readonly datasetHash: string;
+  /** ABSOLUTE path to the run's output directory. */
+  readonly outDir: string;
+  /**
+   * C30 — the run's estimated cost in USD, when the caller could price it.
+   * Caller-supplied because pricing needs the model catalogue, which the
+   * summary does not carry; every other ops column is derived here.
+   */
+  readonly costUsd?: number;
+  /** Override `.crewhaus/evals` (tenant scopes, tests, standalone bundles
+   *  whose run dir was rebased). */
+  readonly evalsDir?: string;
+};
+
+/**
+ * Project a completed run onto its index entry. The ONE place the summary →
+ * `index.jsonl` wire format is derived, so every launcher records the same
+ * shape: `crewhaus eval` (via `finishEvalRun`) and the standalone
+ * `target: eval` bundle, which used to write its run directory and nothing
+ * else — leaving `eval-report history`, `baseline set` and the gate machinery
+ * blind to any run that wasn't launched through the CLI.
+ *
+ * Refuses a 0-sample run: it carries no signal, and a passRate-0 "clean"
+ * entry would poison the index and could pin an empty baseline.
+ */
+export function runIndexEntryFromSummary(
+  summary: EvalRunSummary,
+  opts: RecordEvalRunOptions,
+): RunIndexEntry {
+  const datasetName = summary.config.datasetName;
+  if (summary.samples.length === 0) {
+    throw new ReportError(
+      `refusing to record 0-sample eval run ${summary.runId} — dataset "${datasetName}" produced no samples`,
+    );
+  }
+  const gradersHash = summary.config.gradersHash;
+  const judgeModel = summary.config.judgeModel;
+  return {
+    runId: summary.runId,
+    specName: opts.specName,
+    specHash: summary.config.specHash,
+    ...(opts.specSource !== undefined ? { specSource: opts.specSource } : {}),
+    datasetName,
+    datasetHash: opts.datasetHash,
+    ...(gradersHash !== undefined ? { gradersHash } : {}),
+    ...(judgeModel !== undefined ? { judgeModel } : {}),
+    passRate: summary.aggregates.passRate,
+    meanScore: summary.aggregates.meanScore,
+    sampleCount: summary.samples.length,
+    // C30 — additive ops columns: p95 latency straight off the aggregates,
+    // estimated cost when the caller could price the run.
+    p95LatencyMs: summary.aggregates.p95LatencyMs,
+    ...(opts.costUsd !== undefined ? { costUsd: opts.costUsd } : {}),
+    retriedCount: summary.samples.filter((s) => s.retried === true).length,
+    // NEW-HUNT-3 — mark budget-aborted runs so history readers can tell this
+    // entry's deflated passRate (aborted samples count as errors) from a
+    // genuinely measured one.
+    ...(summary.partial !== undefined ? { partial: true } : {}),
+    ts: summary.endedAt,
+    outDir: opts.outDir,
+  };
+}
+
+/**
+ * Record a completed run in the history index and return the entry that was
+ * appended. Build + append in one call so no caller can write a half-shaped
+ * line (see {@link runIndexEntryFromSummary}).
+ */
+export function recordEvalRun(summary: EvalRunSummary, opts: RecordEvalRunOptions): RunIndexEntry {
+  const entry = runIndexEntryFromSummary(summary, opts);
+  appendRunIndex(entry, opts.evalsDir);
+  return entry;
 }
 
 /**

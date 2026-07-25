@@ -6,7 +6,7 @@ const baseIr: IrVoiceV0 = {
   version: 0,
   name: "hello-voice",
   target: "voice",
-  agent: { model: "gpt-4o-realtime-preview", instructions: "be brief" },
+  agent: { model: "gpt-realtime", instructions: "be brief" },
   voice: {
     provider: "openai",
     voiceId: "alloy",
@@ -41,7 +41,7 @@ describe("emitVoice", () => {
     const code = emitVoice(baseIr).files.find((f) => f.path === "agent.ts")?.content ?? "";
     expect(code).toContain("AGENT_CONFIG");
     expect(code).toContain('"hello-voice"');
-    expect(code).toContain('"gpt-4o-realtime-preview"');
+    expect(code).toContain('"gpt-realtime"');
     expect(code).toContain('"alloy"');
     expect(code).toContain("bargeInTriggerFrames: 4");
   });

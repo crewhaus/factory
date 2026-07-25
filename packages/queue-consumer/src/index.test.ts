@@ -120,10 +120,9 @@ describe("startConsumer", () => {
     }
     await c1.drain();
 
-    // Re-enqueue an identical job — but force a different jobId via a
-    // separate enqueue so attempt=1 is fresh; idempotency-keys keys on
-    // (jobId, attempt) so this should NOT hit the cache (different
-    // job).
+    // Re-enqueue an identical job — a separate enqueue mints a NEW jobId,
+    // and idempotency-keys keys on the job id, so this must NOT hit the
+    // cache: it is a different job that happens to carry the same payload.
     await queue.enqueue({ id: "k1" });
     const c2 = startConsumer<{ id: string }, string>({
       queue,
@@ -159,6 +158,102 @@ describe("startConsumer", () => {
     await store.set(key1, "cached", 60_000);
     expect(await store.get(key1)).toBe("cached");
     expect(await store.get(key1)).toBe("cached");
+  });
+
+  /**
+   * Audit item 23 — `idempotencyWindowMs` was dead configuration. The cache
+   * was keyed on (job id, attempt) and every redelivery arrives with a
+   * bumped attempt, so the one path the window exists for could never hit
+   * and `fromCache` was false for every job, always.
+   *
+   * The reachable redelivery this exercises: the handler SUCCEEDS but the
+   * ack fails. `handleOne` deliberately swallows ack errors ("they'd
+   * surface as duplicate work on the next pull"), the visibility lease
+   * expires, the job comes back — and the expensive handler must not run a
+   * second time.
+   */
+  test("redelivery after a swallowed ack failure is served from cache (item 23)", async () => {
+    const base = createInMemoryQueue<string>({ initialJobs: ["only job"] });
+    let ackFailuresLeft = 1;
+    const queue: QueueAdapter<string> = {
+      ...base,
+      async ack(id) {
+        if (ackFailuresLeft > 0) {
+          ackFailuresLeft -= 1;
+          throw new Error("ack blip");
+        }
+        return base.ack(id);
+      },
+    };
+
+    let handlerCalls = 0;
+    const fromCacheFlags: boolean[] = [];
+    const consumer = startConsumer<string, string>({
+      queue,
+      handler: async (input) => {
+        handlerCalls += 1;
+        return `reply to ${input}`;
+      },
+      concurrency: 1,
+      visibilityTimeoutMs: 50,
+      visibilityRenewIntervalMs: 10_000,
+      maxRetries: 3,
+      idempotencyStore: createInMemoryIdempotencyStore<string>(),
+      idempotencyTtlMs: 60_000,
+      observer: {
+        onJobEnd: (_job, outcome) => {
+          if (outcome.kind === "ok") fromCacheFlags.push(outcome.fromCache);
+        },
+      },
+    });
+
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      if (fromCacheFlags.length >= 2) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    await consumer.drain();
+
+    // Delivered twice (the first ack was lost), but the model ran ONCE and
+    // the redelivery reported the cache hit.
+    expect(fromCacheFlags.length).toBeGreaterThanOrEqual(2);
+    expect(handlerCalls).toBe(1);
+    expect(fromCacheFlags[0]).toBe(false);
+    expect(fromCacheFlags[1]).toBe(true);
+  });
+
+  test("a failed attempt caches nothing, so its retry re-runs the handler (item 23)", async () => {
+    const queue = createInMemoryQueue<string>({ initialJobs: ["flaky"] });
+    let handlerCalls = 0;
+    const outcomes: string[] = [];
+    const consumer = startConsumer<string, string>({
+      queue,
+      handler: async (input) => {
+        handlerCalls += 1;
+        if (handlerCalls === 1) throw new Error("transient boom");
+        return `reply to ${input}`;
+      },
+      concurrency: 1,
+      visibilityTimeoutMs: 5_000,
+      maxRetries: 3,
+      idempotencyStore: createInMemoryIdempotencyStore<string>(),
+      idempotencyTtlMs: 60_000,
+      observer: {
+        onJobEnd: (_job, outcome) => outcomes.push(outcome.kind),
+      },
+    });
+
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      if ((await queue.stats()).acked === 1) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    await consumer.drain();
+
+    // Keying on the job id must NOT make a failure sticky: the retry of a
+    // throw re-invokes the handler and then succeeds.
+    expect(handlerCalls).toBe(2);
+    expect(outcomes).toEqual(["fail", "ok"]);
   });
 
   test("drain() blocks new pulls and lets in-flight finish (SIGTERM contract)", async () => {

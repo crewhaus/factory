@@ -1,4 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { IrBatchV0 } from "@crewhaus/ir";
 import { TargetEmitError, emitBatchWorker } from "./index.js";
 
@@ -412,6 +416,118 @@ describe("emitBatchWorker — schedule: wake loop (Batch F, temporal contract)",
     const drainIdx = code.indexOf("await consumer.drain();", shutdownIdx);
     expect(cancelIdx).toBeGreaterThan(shutdownIdx);
     expect(cancelIdx).toBeLessThan(drainIdx);
+  });
+});
+
+/**
+ * Audit item 22 — the emitted worker's observable output (its stdout JSON
+ * event stream) never contained a model reply: `onJobEnd` published only
+ * status fields, so a batch take was made entirely of status JSON and the
+ * work product was recoverable only from the session transcript. (The live
+ * batch runtime smoke asserts the model's magic token appears in the
+ * worker's stdout — an assertion nothing could satisfy.)
+ *
+ * These tests lift the emitted `onJobEnd` observer out of the generated
+ * source, load it as a real module, and RUN it against a stub `emit`, so
+ * the assertion is on behaviour rather than on the presence of a substring.
+ */
+describe("emitBatchWorker — job_end carries the handler result (item 22)", () => {
+  type Emitted = Record<string, unknown>;
+  type Observer = {
+    onJobEnd: (job: { id: string; attempt: number }, outcome: unknown) => void;
+  };
+
+  const tmpDirs: string[] = [];
+  afterAll(() => {
+    for (const dir of tmpDirs) rmSync(dir, { recursive: true, force: true });
+  });
+
+  /**
+   * Slice the `observer.onJobEnd` property out of the emitted agent.ts and
+   * re-host it in a throwaway module that takes `emit` as a parameter. The
+   * emitted handler closes over nothing but its own arguments and globals,
+   * so this runs the generated code unmodified.
+   */
+  async function emittedObserver(): Promise<{ observer: Observer; emitted: Emitted[] }> {
+    const code = emitBatchWorker(baseIr, { readme: false }).files[0]?.content ?? "";
+    const start = code.indexOf("onJobEnd:");
+    const end = code.indexOf("onDrainStart:", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-batch-observer-"));
+    tmpDirs.push(dir);
+    const file = join(dir, "observer.ts");
+    writeFileSync(
+      file,
+      `export function makeObserver(emit: (e: Record<string, unknown>) => void) {\n  return {\n    ${code.slice(start, end)}  };\n}\n`,
+    );
+    const mod = (await import(pathToFileURL(file).href)) as {
+      makeObserver: (emit: (e: Emitted) => void) => Observer;
+    };
+    const emitted: Emitted[] = [];
+    return { observer: mod.makeObserver((e) => void emitted.push(e)), emitted };
+  }
+
+  test("a successful job_end includes the reply verbatim + its byte size", async () => {
+    const { observer, emitted } = await emittedObserver();
+    observer.onJobEnd(
+      { id: "job_00000001", attempt: 1 },
+      { kind: "ok", value: "a single concise sentence.", fromCache: false },
+    );
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toEqual({
+      kind: "job_end",
+      jobId: "job_00000001",
+      attempt: 1,
+      status: "ok",
+      fromCache: false,
+      resultBytes: 26,
+      result: "a single concise sentence.",
+    });
+  });
+
+  test("resultBytes counts UTF-8 bytes, not code units", async () => {
+    const { observer, emitted } = await emittedObserver();
+    observer.onJobEnd(
+      { id: "job_00000002", attempt: 1 },
+      { kind: "ok", value: "né", fromCache: true },
+    );
+    expect(emitted[0]?.["resultBytes"]).toBe(3);
+    expect(emitted[0]?.["fromCache"]).toBe(true);
+  });
+
+  test("CREWHAUS_BATCH_EMIT_RESULT=0 drops the payload but keeps resultBytes", async () => {
+    const { observer, emitted } = await emittedObserver();
+    const EMIT_RESULT_ENV = "CREWHAUS_BATCH_EMIT_RESULT";
+    const prev = process.env[EMIT_RESULT_ENV];
+    process.env[EMIT_RESULT_ENV] = "0";
+    try {
+      observer.onJobEnd(
+        { id: "job_00000003", attempt: 1 },
+        { kind: "ok", value: "sensitive", fromCache: false },
+      );
+    } finally {
+      if (prev === undefined) delete process.env[EMIT_RESULT_ENV];
+      else process.env[EMIT_RESULT_ENV] = prev;
+    }
+    expect(emitted[0]).not.toHaveProperty("result");
+    expect(emitted[0]?.["resultBytes"]).toBe(9);
+  });
+
+  test("a failed job_end still carries reason + error and no result", async () => {
+    const { observer, emitted } = await emittedObserver();
+    observer.onJobEnd(
+      { id: "job_00000004", attempt: 3 },
+      { kind: "fail", reason: "permanent", error: new Error("boom") },
+    );
+    expect(emitted[0]).toEqual({
+      kind: "job_end",
+      jobId: "job_00000004",
+      attempt: 3,
+      status: "fail",
+      reason: "permanent",
+      error: "boom",
+    });
   });
 });
 

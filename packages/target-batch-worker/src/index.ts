@@ -16,7 +16,11 @@
  *      the job input as the user message; the assistant's terminal text
  *      is the cached result.
  *   4. Streams JSON events to stdout (`worker_start | job_start |
- *      job_end | drain_start | drain_end | worker_stop`).
+ *      job_end | drain_start | drain_end | worker_stop`). A successful
+ *      `job_end` carries the handler's `result` (the assistant's terminal
+ *      text) and `resultBytes`, so the run's observable output contains the
+ *      work product and not just status — `CREWHAUS_BATCH_EMIT_RESULT=0`
+ *      drops the payload and keeps `resultBytes`.
  *   5. Installs SIGTERM + SIGINT handlers that drain in-flight jobs
  *      cleanly before exit.
  *   6. Runs the boot-time self-heal janitor (ops item 36) — session TTL
@@ -614,6 +618,13 @@ async function main(): Promise<void> {
   }
 
 ${mcpBoot}  const queue = buildQueue();
+  // Idempotency window (SPEC_IDEMPOTENCY_WINDOW_MS): caches each job's
+  // SUCCESSFUL result under its job id for the window, so a job that is
+  // re-delivered after already completing (a lost ack, a crash between
+  // handler and ack, an expired visibility lease, a competing consumer)
+  // is served from cache instead of paying for the model twice — that
+  // job_end reports \`fromCache: true\`. A clean run never re-delivers, so
+  // \`fromCache\` staying false throughout means nothing was duplicated.
   const idempotencyStore = createInMemoryIdempotencyStore<string>();
   emit({ kind: "worker_start", queueAdapter: SPEC_QUEUE_ADAPTER, concurrency: SPEC_CONCURRENCY });
 
@@ -645,7 +656,23 @@ ${mcpBoot}  const queue = buildQueue();
     observer: {
       onJobEnd: (job, outcome) => {
         if (outcome.kind === "ok") {
-          emit({ kind: "job_end", jobId: job.id, attempt: job.attempt, status: "ok", fromCache: outcome.fromCache });
+          // The handler's return value IS the work product — a batch run
+          // whose stdout carried only status JSON had no observable result
+          // at all (replies were recoverable only from the session
+          // transcript). Emit it verbatim, plus its size so the line stays
+          // scannable. CREWHAUS_BATCH_EMIT_RESULT=0 suppresses the payload
+          // (large or sensitive results shipped to logs) while keeping
+          // resultBytes.
+          const includeResult = process.env["CREWHAUS_BATCH_EMIT_RESULT"] !== "0";
+          emit({
+            kind: "job_end",
+            jobId: job.id,
+            attempt: job.attempt,
+            status: "ok",
+            fromCache: outcome.fromCache,
+            resultBytes: Buffer.byteLength(outcome.value ?? "", "utf8"),
+            ...(includeResult ? { result: outcome.value } : {}),
+          });
         } else {
           emit({
             kind: "job_end",

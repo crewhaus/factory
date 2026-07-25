@@ -382,6 +382,49 @@ describe("emitCli — combined", () => {
   });
 });
 
+describe("emitCli — feedback block (item 1)", () => {
+  // The emitter used to DROP `feedback:` entirely: a compiled bundle had no
+  // rating prompt and no user_feedback capture while `crewhaus run` had both,
+  // silently removing the improvement contract from the shipped artifact.
+  test("threads the block into runChatLoop so the bundle captures ratings", () => {
+    const content = emitCli(baseIr({ feedback: { modality: "binary" } })).files[0]?.content ?? "";
+    expect(content).toContain("feedback: {}");
+  });
+
+  test("carries the two switches the runtime consumes", () => {
+    const content =
+      emitCli(baseIr({ feedback: { modality: "stars", enabled: true, exitPrompt: false } }))
+        .files[0]?.content ?? "";
+    expect(content).toContain('feedback: {"enabled":true,"exitPrompt":false}');
+  });
+
+  test("does not carry CLI-side keys (modality/storage/autoDistill/channelReactions)", () => {
+    const content =
+      emitCli(
+        baseIr({
+          feedback: {
+            modality: "scale",
+            scale: { min: 1, max: 7 },
+            storage: { location: ".crewhaus/feedback" },
+            autoDistill: true,
+            channelReactions: true,
+          },
+        }),
+      ).files[0]?.content ?? "";
+    // Presence still opts the runtime in; the rating verbs, the registry
+    // dataset and the channel reaction gate are not the bundle's business.
+    expect(content).toContain("feedback: {}");
+    expect(content).not.toContain("autoDistill");
+    expect(content).not.toContain("channelReactions");
+    expect(content).not.toContain("modality");
+  });
+
+  test("a spec without the block emits no feedback field (bundles stay byte-identical)", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("feedback");
+  });
+});
+
 describe("emitCli — CLI banner (Phase 3 §3.3)", () => {
   test("omits banner code when ir.cli.banner is undefined", () => {
     const content = emitCli(baseIr()).files[0]?.content ?? "";

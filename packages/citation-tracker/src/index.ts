@@ -205,7 +205,26 @@ export function createCitationTracker(opts: CreateCitationTrackerOptions = {}): 
 
     recordFetch(input) {
       const existing = fetchByUrl.get(input.url);
-      if (existing !== undefined) return existing;
+      if (existing !== undefined) {
+        // Self-heal a pruned content cache. The crawler only reaches this line
+        // for an already-recorded URL when `getFetchedContent` came back empty,
+        // i.e. the cache file behind the record is gone — and without the body
+        // nothing downstream can verify a citation snippet against it. The
+        // record stays the source of truth for the digest, so re-write the body
+        // only when it still hashes to the SAME sha256; a source that mutated
+        // since the first fetch deliberately stays uncached.
+        if (
+          typeof existing.sha256 === "string" &&
+          SHA256_RE.test(existing.sha256) &&
+          !existsSync(cachePathFor(existing.sha256))
+        ) {
+          const sha = createHash("sha256").update(input.content).digest("hex");
+          if (sha === existing.sha256) {
+            writeFileSync(cachePathFor(existing.sha256), input.content, { mode: 0o600 });
+          }
+        }
+        return existing;
+      }
       const sha256 = createHash("sha256").update(input.content).digest("hex");
       const rec: FetchRecord = {
         version: 1,

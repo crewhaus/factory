@@ -123,6 +123,64 @@ describe("target-eval-bundle — T1 emitted bundle structure", () => {
   });
 });
 
+/**
+ * Item 15 — a standalone bundle used to write its run directory and nothing
+ * else, so `crewhaus eval-report history` / `baseline set` / the regression
+ * gate could not see a single bundle run. The emitted bundle now appends to
+ * the SAME `.crewhaus/evals/index.jsonl` the `crewhaus eval` path writes,
+ * through eval-report's shared recorder (one wire format, one history).
+ */
+describe("target-eval-bundle — run history (item 15)", () => {
+  test("agent.ts records the finished run through eval-report's shared recorder", () => {
+    const code = emitEval(makeIr()).files[0]?.content ?? "";
+    expect(code).toContain('import { recordEvalRun } from "@crewhaus/eval-report";');
+    expect(code).toContain("recordEvalRun(result, {");
+    expect(code).toContain("specName: SPEC_NAME,");
+    // The run dir's parent IS the evals dir, so a tenant-rebased run records
+    // into that tenant's history rather than the global one.
+    expect(code).toContain("outDir: absOutDir,");
+    expect(code).toContain("evalsDir: dirname(absOutDir),");
+  });
+
+  test("the recorded datasetHash is the registry's own content digest", () => {
+    const code = emitEval(makeIr()).files[0]?.content ?? "";
+    // Same function `crewhaus eval --dataset registry:<name>@<version>#<split>`
+    // hashes with — a bundle run and a CLI run of the same registry dataset
+    // record the same identity instead of two incomparable digests.
+    expect(code).toContain(
+      "const record = await registry.getRecord(DATASET.name, DATASET.version)",
+    );
+    expect(code).toContain("const datasetHash = overallDatasetHash(record, [DATASET.split]);");
+    expect(code).toContain("datasetHash,");
+  });
+
+  test("the same digest is threaded into run.json, so `eval --sentinel` can use it", () => {
+    const code = emitEval(makeIr()).files[0]?.content ?? "";
+    const optsAt = code.indexOf("concurrency: CONCURRENCY,");
+    const recordAt = code.indexOf("recordEvalRun(result");
+    // `datasetHash` appears BOTH in the runEval opts (→ run.json/results.json)
+    // and in the history entry — one identity, two artifacts.
+    expect(code.indexOf("datasetHash,", optsAt)).toBeLessThan(recordAt);
+    expect(code.indexOf("datasetHash,", recordAt)).toBeGreaterThan(recordAt);
+  });
+
+  test("a failed index append never fails an eval that already scored", () => {
+    const code = emitEval(makeIr()).files[0]?.content ?? "";
+    const recordAt = code.indexOf("recordEvalRun(result");
+    expect(recordAt).toBeGreaterThan(-1);
+    // The append sits inside a try/catch that only warns on stderr…
+    expect(code).toContain("could not record run in the history index");
+    // …and the machine-readable stdout line still prints afterwards.
+    expect(code.indexOf("JSON.stringify({\n    runId: result.runId")).toBeGreaterThan(recordAt);
+  });
+
+  test("emitted agent.ts is syntactically valid TypeScript", () => {
+    const t = new Bun.Transpiler({ loader: "ts" });
+    const code = emitEval(makeIr()).files[0]?.content ?? "";
+    expect(() => t.transformSync(code)).not.toThrow();
+  });
+});
+
 describe("emitEval — failure_taxonomy ignored-note (item 23)", () => {
   test("agent.ts carries the ignored-taxonomy note when the spec declares one", () => {
     const ir = makeIr({

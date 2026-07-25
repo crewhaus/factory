@@ -10,6 +10,7 @@ import { z } from "zod";
 import { type SessionEvents, parseJsonlObjects } from "./advise-rules";
 import {
   CLI_RUNTIME_TOOL_KEYS,
+  TOOL_KEYWORDS,
   auditTools,
   buildToolList,
   buildToolUsage,
@@ -17,6 +18,7 @@ import {
   formatAuditLines,
   formatSuggestLines,
   formatToolListLines,
+  splitInstructionClauses,
   suggestTools,
 } from "./tools-cli";
 
@@ -144,6 +146,130 @@ describe("suggestTools", () => {
     const result = suggestTools("", [], TOOL_KEYS, TOOL_MAP);
     expect(result.missing).toEqual([]);
     expect(formatSuggestLines(result)[0]).toContain("no additional builtins");
+  });
+});
+
+// The three ways the keyword matcher lied about a real starter spec
+// (hello-procode / trader, crewhaus 0.4.0): it read refusals as requests,
+// matched keywords inside unrelated words, and could never name two builtins.
+describe("suggestTools — precision", () => {
+  const WIDE_MAP: Record<string, RegisteredTool> = {
+    ...TOOL_MAP,
+    edit: tool("Edit", { destructive: true }),
+    grep: tool("Grep", { readOnly: true }),
+    imageGenerate: tool("ImageGenerate", { scope: "external" }),
+    readImage: tool("ReadImage", { readOnly: true }),
+    bashOutput: tool("BashOutput", { readOnly: true }),
+    killShell: tool("KillShell", { destructive: true }),
+    todoWrite: tool("TodoWrite"),
+    codegraphSearch: tool("CodeGraphSearch", { readOnly: true }),
+  };
+  const WIDE_KEYS = Object.keys(WIDE_MAP);
+
+  it("does not suggest a tool the instructions refuse", () => {
+    // Verbatim shape from starters/showcases/procode — the refusal used to be
+    // the first line of the report, as "+ imageGenerate".
+    const instructions = [
+      "You are a coding agent for this repository.",
+      "- If the user asks for something unrelated to the codebase (open-",
+      "  domain chat, image generation, web research), say so and suggest",
+      "  they try the sibling `hello-prochat` demo.",
+    ].join("\n");
+    const result = suggestTools(instructions, [], WIDE_KEYS, WIDE_MAP);
+    expect(result.missing.map((s) => s.key)).not.toContain("imageGenerate");
+    expect(result.negated.map((s) => s.key)).toContain("imageGenerate");
+  });
+
+  it("keeps a tool implied when another clause asks for it affirmatively", () => {
+    const instructions = "Never generate image files. Read the file and grep the repo.";
+    const result = suggestTools(instructions, [], WIDE_KEYS, WIDE_MAP);
+    expect(result.missing.map((s) => s.key)).toContain("read");
+    expect(result.missing.map((s) => s.key)).toContain("grep");
+  });
+
+  it("matches on word boundaries, not substrings", () => {
+    // "already" contains "read"; "credit" contains "edit"; "drawdown"
+    // contains "draw" (which used to imply imageGenerate on the trader spec).
+    const result = suggestTools(
+      "The user has already been credited; cap the drawdown at 5% of the spread.",
+      [],
+      WIDE_KEYS,
+      WIDE_MAP,
+    );
+    expect(result.missing).toEqual([]);
+    expect(result.negated).toEqual([]);
+  });
+
+  it("still matches ordinary inflections", () => {
+    const result = suggestTools("Start by reading the config file.", [], WIDE_KEYS, WIDE_MAP);
+    expect(result.missing.map((s) => s.key)).toContain("read");
+  });
+
+  it("treats a camelCase builtin named in the instructions as a direct reference", () => {
+    const result = suggestTools(
+      "Poll long jobs with `bashOutput`, then `killShell` when they finish.",
+      [],
+      WIDE_KEYS,
+      WIDE_MAP,
+    );
+    const keys = result.missing.map((s) => s.key);
+    expect(keys).toContain("bashOutput");
+    expect(keys).toContain("killShell");
+  });
+
+  it("does not flag a companion tool as an over-grant when its parent is granted", () => {
+    const result = suggestTools(
+      "Run a shell command to build the project.",
+      ["bash", "bashOutput", "killShell"],
+      WIDE_KEYS,
+      WIDE_MAP,
+    );
+    expect(result.unimplied).toEqual([]);
+    // …but a companion granted WITHOUT its parent still gets flagged.
+    const orphan = suggestTools("Summarise the input.", ["killShell"], WIDE_KEYS, WIDE_MAP);
+    expect(orphan.unimplied).toEqual(["killShell"]);
+  });
+
+  it("every builtin the runtime can load has at least one keyword", () => {
+    // A builtin with no keywords can never be suggested — `tools suggest`
+    // would silently cover less than the catalogue it claims to rank.
+    const uncovered = CLI_RUNTIME_TOOL_KEYS.filter(
+      (k) => (TOOL_KEYWORDS[k] ?? []).length === 0,
+    ).sort();
+    expect(uncovered).toEqual([]);
+  });
+
+  it("formats the refusal section and the heuristic footer", () => {
+    const result = suggestTools(
+      "Refuse any request for image generation.",
+      ["imageGenerate"],
+      WIDE_KEYS,
+      WIDE_MAP,
+    );
+    const lines = formatSuggestLines(result);
+    const blob = lines.join("\n");
+    expect(blob).toContain("mentioned only in a refusal (NOT suggested):");
+    expect(blob).toContain("imageGenerate");
+    expect(blob).toContain("the instructions refuse it");
+    // a refused-but-granted tool is still an over-grant candidate
+    expect(result.unimplied).toEqual(["imageGenerate"]);
+    expect(lines[lines.length - 1]).toContain("literal keyword match");
+  });
+});
+
+describe("splitInstructionClauses", () => {
+  it("unwraps hard-wrapped prose so a cue stays with the text it negates", () => {
+    const clauses = splitInstructionClauses(
+      "if the user asks for something unrelated\nto x, say so.",
+    );
+    expect(clauses).toEqual(["if the user asks for something unrelated to x, say so."]);
+  });
+
+  it("starts a new clause at a list marker and at a sentence end", () => {
+    expect(splitInstructionClauses("- alpha one.\n- beta two\n  continued")).toEqual([
+      "- alpha one.",
+      "- beta two continued",
+    ]);
   });
 });
 

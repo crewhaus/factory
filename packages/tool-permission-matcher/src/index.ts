@@ -40,12 +40,34 @@ export function escapeGlobLiteral(value: string): string {
   return out;
 }
 
+/**
+ * What the regex emitted so far ends with — the context a `**` token needs in
+ * order to be boundary-aware: `a/**` must also match `a`, and a leading
+ * double-star segment must also match a bare `b`.
+ *
+ *   - `"start"` — nothing emitted yet, OR the previous token was a `**` group
+ *     that already absorbed the separator after it, so a new path segment
+ *     begins here.
+ *   - `"sep"`   — the regex ends with the literal `/` emitted for a glob `/`.
+ *     A `**` in this position folds that separator into its own optional group.
+ *   - `"other"` — anything else; a `**` here is mid-segment and just means
+ *     "any run of characters".
+ *
+ * Tracking this explicitly replaces the old `re.slice(0, -1)` guesswork, which
+ * silently mangled the regex whenever the assumed trailing `/` was not there:
+ * a bare `**` compiled to `^(?:/.*)?$` (issue #17 — a catch-all `Bash(**)` rule
+ * was dead), and two adjacent double-star segments compiled to a regex that
+ * required a trailing separator.
+ */
+type GlobPos = "start" | "sep" | "other";
+
 function globToRegex(glob: string): RegExp {
   // Tokenize character by character so replacement text is never re-processed.
   // This avoids the chaining bug where .* emitted for ** gets re-replaced by
   // the single-* rule on the next pass.
   let re = "";
   let i = 0;
+  let pos: GlobPos = "start";
 
   while (i < glob.length) {
     const ch = glob.charAt(i);
@@ -57,42 +79,59 @@ function globToRegex(glob: string): RegExp {
       // regex-escaped against the FULL metachar set (incl. `*`/`?`, which are
       // regex quantifiers) so e.g. `\?` becomes `\?` in the regex, not a bare
       // `?` that would make the previous atom optional.
-      re += glob.charAt(i + 1).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const lit = glob.charAt(i + 1);
+      re += lit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      // An escaped `/` is still the separator character in the emitted regex,
+      // so a following `**` may fold it exactly as it would an unescaped one.
+      pos = lit === "/" ? "sep" : "other";
       i += 2;
     } else if (ch === "*" && glob[i + 1] === "*") {
-      const prevIsSep = i === 0 || glob[i - 1] === "/";
       const afterTwo = glob[i + 2];
-      const nextIsSep = afterTwo === "/" || afterTwo === undefined;
 
-      if (prevIsSep && i === 0 && afterTwo === "/") {
-        // **/ at start → optional any-dir prefix
+      if (afterTwo === "/" && pos === "start") {
+        // `**/` at a segment start → optional any-dir prefix.
         re += "(?:.*/)?";
+        pos = "start";
         i += 3;
-      } else if (prevIsSep && afterTwo === undefined) {
-        // /** at end → optional any-dir suffix (leading / already emitted)
-        re = `${re.slice(0, -1)}(?:/.*)?`;
-        i += 2;
-      } else if (prevIsSep && nextIsSep && afterTwo === "/") {
-        // /**/ in middle → any sub-tree separator (leading / already emitted)
+      } else if (afterTwo === "/" && pos === "sep") {
+        // `/**/` in the middle → any sub-tree (the leading `/` is already
+        // emitted, so fold it into the group).
         re = `${re.slice(0, -1)}(?:/.*/|/)`;
+        pos = "start";
         i += 3;
+      } else if (afterTwo === undefined && pos === "sep") {
+        // `/**` at the end → optional any-dir suffix (leading `/` folded in).
+        re = `${re.slice(0, -1)}(?:/.*)?`;
+        pos = "other";
+        i += 2;
       } else {
+        // Everything else — a bare `**`, a `**` glued to a non-separator
+        // (`rm**`), or a redundant `**` right after another `**` group:
+        // any run of characters, separators included.
         re += ".*";
+        pos = "other";
         i += 2;
       }
     } else if (ch === "*") {
       re += "[^/]*";
+      pos = "other";
       i++;
     } else if (ch === "?") {
       re += "[^/]";
+      pos = "other";
       i++;
     } else {
       re += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+      pos = ch === "/" ? "sep" : "other";
       i++;
     }
   }
 
-  return new RegExp(`^${re}$`);
+  // `s` (dotAll) so the `.` emitted for `**` also crosses newlines. Without it
+  // `**` was NOT a superset of `*` (`[^/]*` matches a newline, `.*` did not),
+  // which let a multi-line command slip past a `**` guard: the builtin
+  // `alwaysAsk Bash(rm**)` floor did not fire on "rm -rf /\necho done".
+  return new RegExp(`^${re}$`, "s");
 }
 
 export function compilePattern(pattern: string): CompiledPattern {
