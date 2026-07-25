@@ -386,6 +386,32 @@ describe("crewhaus watchme (design/watch-me.md §11)", () => {
     expect(report.peers.length).toBeGreaterThan(0);
     expect(report.peers.every((p) => p.agentName === "alpha")).toBe(true);
     expect(report.peers.some((p) => p.agentName === "beta")).toBe(false);
+
+    // intents --all is harness-tagged (design §1(b)): the combined digest
+    // gains a per-harness attribution section in both output modes.
+    const intentsJson = await runCli(
+      ["watchme", "intents", "--all", "--root", globalRoot, "--json"],
+      consumer,
+      home,
+    );
+    expect(intentsJson.exitCode).toBe(0);
+    const tagged = JSON.parse(intentsJson.stdout) as {
+      totalTurns: number;
+      harnesses: Array<{ specName: string; turns: number; sessions: number }>;
+    };
+    const taggedByName = new Map(tagged.harnesses.map((h) => [h.specName, h]));
+    expect(taggedByName.get("alpha")?.turns).toBeGreaterThan(0);
+    expect(taggedByName.get("beta")?.turns).toBeGreaterThan(0);
+
+    const intentsText = await runCli(
+      ["watchme", "intents", "--all", "--root", globalRoot],
+      consumer,
+      home,
+    );
+    expect(intentsText.exitCode).toBe(0);
+    expect(intentsText.stdout).toContain("PER-HARNESS");
+    expect(intentsText.stdout).toContain("- alpha — ");
+    expect(intentsText.stdout).toContain("- beta — ");
   }, 120_000);
 
   test("run with a watchme-enabled spec writes the .events.jsonl sibling", async () => {

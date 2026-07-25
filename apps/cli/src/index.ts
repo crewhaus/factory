@@ -17894,9 +17894,20 @@ async function runWatchme(args: ParsedArgs, action: string): Promise<void> {
         sessionId: string;
         events: Array<{ kind?: string; payload?: unknown }>;
       }> = [];
+      // Rows kept per harness so the --all digest can be harness-tagged
+      // (design/watch-me.md §1(b)): the combined clusters answer "what do I
+      // keep asking", the per-harness section answers "which agent gets asked
+      // what".
+      const perHarness: Array<{
+        specName: string;
+        dir: string;
+        rows: typeof perSession;
+      }> = [];
       if (args.flags["all"] === true) {
         for (const entry of openHarnessRegistry(globalRoot).list()) {
-          perSession.push(...watchmeSessionRows(join(entry.dir, SESSIONS_SUBDIR)));
+          const rows = watchmeSessionRows(join(entry.dir, SESSIONS_SUBDIR));
+          perHarness.push({ specName: entry.specName, dir: entry.dir, rows });
+          perSession.push(...rows);
         }
       } else {
         perSession.push(...watchmeSessionRows(join(cwd, SESSIONS_SUBDIR)));
@@ -17912,10 +17923,46 @@ async function runWatchme(args: ParsedArgs, action: string): Promise<void> {
           failedTurnKeys.push({ sessionId: c.sessionId, turnNumber: c.turnNumber });
         }
       }
-      const digest = redactDigest(
-        clusterIntents(turns, feedback, failedTurnKeys),
-        watchmeSyncRedactor(),
-      );
+      const redactor = watchmeSyncRedactor();
+      const digest = redactDigest(clusterIntents(turns, feedback, failedTurnKeys), redactor);
+      if (args.flags["all"] === true) {
+        const harnesses = perHarness.map((h) => {
+          const hTurns = orderedTurnsFromSessions(h.rows, deriveTurns);
+          const hFeedback: FeedbackRecord[] = [];
+          const hFailed: TurnSignal[] = [];
+          for (const { sessionId, events } of h.rows) {
+            hFeedback.push(...extractFeedbackRecords(events));
+            for (const c of mineSession(sessionId, events)) {
+              hFailed.push({ sessionId: c.sessionId, turnNumber: c.turnNumber });
+            }
+          }
+          const hDigest =
+            hTurns.length === 0
+              ? undefined
+              : redactDigest(clusterIntents(hTurns, hFeedback, hFailed), redactor);
+          return {
+            specName: h.specName,
+            dir: h.dir,
+            turns: hDigest?.totalTurns ?? 0,
+            sessions: hDigest?.totalSessions ?? 0,
+            topIntents: (hDigest?.topIntents ?? []).slice(0, 3).map((i) => i.representative),
+          };
+        });
+        if (args.flags["json"] === true) {
+          process.stdout.write(`${JSON.stringify({ ...digest, harnesses }, null, 2)}\n`);
+        } else {
+          const lines = [renderIntentsText(digest).trimEnd(), "", "PER-HARNESS"];
+          if (harnesses.length === 0) lines.push("  (none registered)");
+          for (const h of harnesses) {
+            lines.push(
+              `  - ${h.specName} — ${h.turns} turn(s) across ${h.sessions} session(s) (${h.dir})`,
+            );
+            for (const rep of h.topIntents) lines.push(`      · ${rep}`);
+          }
+          process.stdout.write(`${lines.join("\n")}\n`);
+        }
+        return;
+      }
       process.stdout.write(
         args.flags["json"] === true ? renderIntentsJson(digest) : renderIntentsText(digest),
       );
