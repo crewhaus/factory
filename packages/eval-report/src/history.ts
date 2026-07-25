@@ -42,6 +42,23 @@ export type RunIndexEntry = {
   readonly datasetName: string;
   /** sha256 hex of the dataset file bytes (see {@link hashDatasetFile}). */
   readonly datasetHash: string;
+  /**
+   * sha256 hex of the parsed graders config the run graded with — the same
+   * digest the runner records into `run.json`/`results.json` for the drift
+   * sentinel. Together with {@link judgeModel} it identifies the *measurement
+   * instrument*: a changed rubric or threshold produces a new hash, and
+   * scores from different instruments are not comparable. Additive — absent
+   * on entries written before the field existed.
+   */
+  readonly gradersHash?: string;
+  /**
+   * Judge model the run's `llm_judge` graders were bound to, when the run
+   * pinned one explicitly (`--judge-model`). The other half of the
+   * measurement-instrument identity (see {@link gradersHash}). Additive —
+   * absent on entries written before the field existed, and on runs that
+   * used the default judge binding.
+   */
+  readonly judgeModel?: string;
   readonly passRate: number;
   readonly meanScore: number;
   readonly sampleCount: number;
@@ -73,6 +90,19 @@ export type BaselineEntry = {
   readonly outDir: string;
   /** Dataset content hash at the time the baseline was pinned. */
   readonly datasetHash: string;
+  /**
+   * Graders-config hash of the pinned run (see
+   * {@link RunIndexEntry.gradersHash}). Lets a later run detect that it
+   * graded with a *different* measurement instrument and start a new
+   * baseline lineage instead of gating scores from one rubric against
+   * another's. Additive; absent on baselines pinned before the field existed.
+   */
+  readonly gradersHash?: string;
+  /**
+   * Judge model of the pinned run (see {@link RunIndexEntry.judgeModel}).
+   * Additive; absent on baselines pinned before the field existed.
+   */
+  readonly judgeModel?: string;
   /** ISO-8601 timestamp of when the pin was written. */
   readonly ts: string;
 };

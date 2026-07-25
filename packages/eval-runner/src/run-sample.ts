@@ -5,6 +5,7 @@ import {
   type CompiledGrader,
   type GradeResult,
   type Grader,
+  type GraderCombinePolicy,
   type RunResult,
   type ToolCall,
   combineCompiledGraders,
@@ -51,6 +52,12 @@ export async function runSample(args: {
    * per-sample context as before (behaviour unchanged for existing callers).
    */
   runContext?: RunContext;
+  /**
+   * A4/A5 — the graders config's top-level `combine:` policy, governing how
+   * the per-grader results merge into `grades.overall`. Omitted ⇒ mode
+   * `all`, today's exact semantics (AND of passed, unweighted mean score).
+   */
+  combine?: GraderCombinePolicy;
 }): Promise<SampleResult> {
   const { sample, invoker, graders, outDir, model } = args;
   const trialSuffix = args.trial !== undefined && args.trial > 1 ? `.trial${args.trial}` : "";
@@ -170,16 +177,9 @@ export async function runSample(args: {
   const graderError =
     graderErrors.length > 0 ? `grader threw: ${graderErrors.join("; ")}` : undefined;
 
-  // Overall = AND of all graders, score = mean.
-  const overall: GradeResult = {
-    passed: error === undefined && perGrader.every((g) => g.passed),
-    score:
-      perGrader.length === 0 ? 0 : perGrader.reduce((s, g) => s + g.score, 0) / perGrader.length,
-    rationale:
-      error !== undefined
-        ? `agent invocation error: ${error}`
-        : perGrader.map((g) => `[${g.name}: ${g.passed ? "✓" : "✗"}] ${g.rationale}`).join(" & "),
-  };
+  // Overall = the config's `combine:` policy over the per-grader results
+  // (default `all`: AND of all graders, score = mean).
+  const overall = combineOverall(perGrader, graders, args.combine, error);
 
   // Loop contract 0.4 (Batch C, G59) — publish the AgentFlow `test_verdict`
   // feedback signal from the grader outcome. A distinct event kind (not a
@@ -295,6 +295,67 @@ function computeMetrics(
     },
     modelCallLatenciesMs,
   };
+}
+
+/**
+ * A4/A5 — merge the per-grader results into the sample's overall grade
+ * under the graders config's `combine:` policy.
+ *   all       (default) passed = AND of graders, score = unweighted mean —
+ *             byte-identical to the pre-policy behavior.
+ *   any       passed = OR of graders, score = max.
+ *   weighted  score = Σ(weight·score)/Σweight (weights from the
+ *             `GraderEntry`, default 1); passed iff the combined score
+ *             clears `passingThreshold` (default 0.5).
+ * An invoker `error` fails the sample in every mode. A thrown grader still
+ * contributes its failed zero-score `perGrader` entry — the infra-noise
+ * evidence lives in `graderError`, unchanged by the combination mode.
+ */
+function combineOverall(
+  perGrader: ReadonlyArray<{ name: string } & GradeResult>,
+  graders: ReadonlyArray<GraderEntry>,
+  policy: GraderCombinePolicy | undefined,
+  error: string | undefined,
+): GradeResult {
+  const rationale = (join: string) =>
+    error !== undefined
+      ? `agent invocation error: ${error}`
+      : perGrader.map((g) => `[${g.name}: ${g.passed ? "✓" : "✗"}] ${g.rationale}`).join(join);
+  switch (policy?.mode ?? "all") {
+    case "any":
+      return {
+        passed: error === undefined && perGrader.some((g) => g.passed),
+        score: perGrader.length === 0 ? 0 : Math.max(...perGrader.map((g) => g.score)),
+        rationale: rationale(" | "),
+      };
+    case "weighted": {
+      const weights = graders.map((g) => g.weight ?? 1);
+      const totalWeight = weights.reduce((s, w) => s + w, 0);
+      const score =
+        totalWeight === 0
+          ? 0
+          : perGrader.reduce((s, g, i) => s + g.score * (weights[i] ?? 1), 0) / totalWeight;
+      const threshold = policy?.passingThreshold ?? 0.5;
+      return {
+        passed: error === undefined && score >= threshold,
+        score,
+        rationale:
+          error !== undefined
+            ? `agent invocation error: ${error}`
+            : perGrader
+                .map((g, i) => `[${g.name} w=${weights[i]} s=${g.score.toFixed(2)}] ${g.rationale}`)
+                .join(" + "),
+      };
+    }
+    default:
+      return {
+        passed: error === undefined && perGrader.every((g) => g.passed),
+        score:
+          perGrader.length === 0
+            ? 0
+            : perGrader.reduce((s, g) => s + g.score, 0) / perGrader.length,
+        rationale: rationale(" & "),
+      };
+  }
 }
 
 /** Helper: produce one combined grader from an array of CompiledGrader. */

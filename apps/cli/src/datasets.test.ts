@@ -14,12 +14,14 @@ import { type Sample, SampleSchema } from "@crewhaus/eval-dataset";
 import {
   DEFAULT_SPLIT_SPEC,
   DatasetRefError,
+  inspectRegistryRef,
   nextVersion,
   overallDatasetHash,
   parseNameVersion,
   parseRegistryRef,
   parseSplitSpec,
   recordToJsonl,
+  refuseTestSplitRef,
   registerDataset,
   registryDatasetName,
   resolveRegistryRef,
@@ -211,18 +213,88 @@ describe("registerDataset — versioned promotion", () => {
 });
 
 describe("resolveRegistryRef — the registry: shorthand", () => {
-  test("defaults to the latest version and the union of all splits", async () => {
+  test("defaults to the latest version and the train+dev union (B16: test stays locked)", async () => {
     const registry = newRegistry();
     await registerDataset({ registry, name: "s", samples: samples(4) });
     const v2 = await registerDataset({ registry, name: "s", samples: samples(10) });
     const resolved = await resolveRegistryRef(registry, { name: "s" });
     expect(resolved.version).toBe("v2");
     expect(resolved.datasetName).toBe("s@v2");
-    expect(resolved.splits).toEqual(["train", "dev", "test"]);
-    expect(resolved.samples).toHaveLength(10);
-    // Union preserves canonical train → dev → test order.
+    expect(resolved.splits).toEqual(["train", "dev"]);
+    // 10 samples at 70/15/15 → 7 train + 1 dev; the 2 test rows are excluded.
+    expect(resolved.samples).toHaveLength(8);
+    // Union preserves canonical train → dev order.
     expect(resolved.samples.map((s) => s.id)).toEqual(
-      [...v2.splits.train, ...v2.splits.dev, ...(v2.splits.test ?? [])].map((s) => s.id),
+      [...v2.splits.train, ...v2.splits.dev].map((s) => s.id),
+    );
+  });
+
+  test("B16 — a bare ref on a record WITH a test split warns once (injected sink)", async () => {
+    const registry = newRegistry();
+    await registerDataset({ registry, name: "warned", samples: samples(10) });
+    const warned: string[] = [];
+    await resolveRegistryRef(registry, { name: "warned" }, { warn: (l) => warned.push(l) });
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toContain("warned@v1");
+    expect(warned[0]).toContain("test split");
+    expect(warned[0]).toContain("--allow-test-split");
+  });
+
+  test("B16 — a bare ref on a test-less record neither warns nor changes shape", async () => {
+    const registry = newRegistry();
+    await registerDataset({
+      registry,
+      name: "no-test",
+      samples: samples(10),
+      splitSpec: parseSplitSpec("70/30"),
+    });
+    const warned: string[] = [];
+    const resolved = await resolveRegistryRef(
+      registry,
+      { name: "no-test" },
+      { warn: (l) => warned.push(l) },
+    );
+    expect(warned).toHaveLength(0);
+    expect(resolved.splits).toEqual(["train", "dev"]);
+    expect(resolved.samples).toHaveLength(10);
+  });
+
+  test("B16 — an explicit #test throws without allowTestSplit and resolves with it", async () => {
+    const registry = newRegistry();
+    await registerDataset({ registry, name: "locked", samples: samples(10) });
+    expect(resolveRegistryRef(registry, { name: "locked", split: "test" })).rejects.toThrow(
+      "--allow-test-split",
+    );
+    const resolved = await resolveRegistryRef(
+      registry,
+      { name: "locked", split: "test" },
+      { allowTestSplit: true },
+    );
+    expect(resolved.splits).toEqual(["test"]);
+    expect(resolved.datasetName).toBe("locked@v1#test");
+    expect(resolved.samples.map((s) => s.id)).toEqual(
+      (resolved.record.splits.test ?? []).map((s) => s.id),
+    );
+  });
+
+  test("B16 — the #test lock fires before the registry lookup (no versions needed)", async () => {
+    const registry = newRegistry();
+    expect(resolveRegistryRef(registry, { name: "ghost", split: "test" })).rejects.toBeInstanceOf(
+      DatasetRefError,
+    );
+    // With the opt-in, the same ref reaches the normal versionless error.
+    expect(
+      resolveRegistryRef(registry, { name: "ghost", split: "test" }, { allowTestSplit: true }),
+    ).rejects.toThrow("no versions");
+  });
+
+  test("B16 — bare-ref datasetHash covers exactly train+dev", async () => {
+    const registry = newRegistry();
+    await registerDataset({ registry, name: "hashed", samples: samples(10) });
+    const resolved = await resolveRegistryRef(registry, { name: "hashed" }, { warn: () => {} });
+    expect(resolved.datasetHash).toBe(overallDatasetHash(resolved.record, ["train", "dev"]));
+    expect(resolved.datasetHash).not.toBe(
+      overallDatasetHash(resolved.record, ["train", "dev", "test"]),
     );
   });
 
@@ -263,6 +335,65 @@ describe("resolveRegistryRef — the registry: shorthand", () => {
     await registerDataset({ registry, name: "h", samples: samples(11) });
     const v2 = await resolveRegistryRef(registry, { name: "h" });
     expect(v2.datasetHash).not.toBe(all1.datasetHash);
+  });
+});
+
+describe("inspectRegistryRef — read-side resolution stays split-complete", () => {
+  test("a bare ref selects EVERY split present — the locked test split included", async () => {
+    const registry = newRegistry();
+    const rec = await registerDataset({ registry, name: "insp", samples: samples(10) });
+    const inspected = await inspectRegistryRef(registry, { name: "insp" });
+    expect(inspected.splits).toEqual(["train", "dev", "test"]);
+    // 10 samples at 70/15/15 → all 10 come back (consumption would see 8).
+    expect(inspected.samples).toHaveLength(10);
+    expect(inspected.samples.map((s) => s.id)).toEqual(
+      [...rec.splits.train, ...rec.splits.dev, ...(rec.splits.test ?? [])].map((s) => s.id),
+    );
+    expect(inspected.datasetName).toBe("insp@v1");
+  });
+
+  test("an explicit #test resolves without any opt-in (inspection is not consumption)", async () => {
+    const registry = newRegistry();
+    await registerDataset({ registry, name: "insp-t", samples: samples(10) });
+    const inspected = await inspectRegistryRef(registry, { name: "insp-t", split: "test" });
+    expect(inspected.splits).toEqual(["test"]);
+    expect(inspected.datasetName).toBe("insp-t@v1#test");
+    expect(inspected.samples.map((s) => s.id)).toEqual(
+      (inspected.record.splits.test ?? []).map((s) => s.id),
+    );
+  });
+
+  test("throws DatasetRefError for a versionless dataset and a missing split", async () => {
+    const registry = newRegistry();
+    expect(inspectRegistryRef(registry, { name: "ghost" })).rejects.toBeInstanceOf(DatasetRefError);
+    await registerDataset({
+      registry,
+      name: "insp-no-test",
+      samples: samples(10),
+      splitSpec: parseSplitSpec("70/30"),
+    });
+    expect(
+      inspectRegistryRef(registry, { name: "insp-no-test", split: "test" }),
+    ).rejects.toBeInstanceOf(DatasetRefError);
+  });
+});
+
+describe("refuseTestSplitRef — optimize/flywheel never touch the holdout (B16)", () => {
+  test("throws DatasetRefError on #test, naming the refusing command", () => {
+    for (const command of ["optimize", "flywheel"] as const) {
+      expect(() => refuseTestSplitRef(command, { name: "s", split: "test" })).toThrow(
+        DatasetRefError,
+      );
+      expect(() => refuseTestSplitRef(command, { name: "s", split: "test" })).toThrow(
+        `${command} never runs over the test split`,
+      );
+    }
+  });
+
+  test("bare, #train, and #dev refs pass through untouched", () => {
+    expect(() => refuseTestSplitRef("optimize", { name: "s" })).not.toThrow();
+    expect(() => refuseTestSplitRef("optimize", { name: "s", split: "train" })).not.toThrow();
+    expect(() => refuseTestSplitRef("flywheel", { name: "s", split: "dev" })).not.toThrow();
   });
 });
 
@@ -359,11 +490,12 @@ describe("distill → registerDataset (the --register pipeline)", () => {
     expect(rec.version).toBe("v1");
     const total = rec.splits.train.length + rec.splits.dev.length + (rec.splits.test?.length ?? 0);
     expect(total).toBe(4);
-    // The promoted version is immediately consumable via the shorthand.
+    // The promoted version is immediately consumable via the shorthand —
+    // minus the locked test rows (B16: bare refs select train+dev only).
     const resolved = await resolveRegistryRef(registry, { name: "ratings-golden" });
     expect(resolved.datasetName).toBe("ratings-golden@v1");
     expect(resolved.samples.map((s) => s.id).sort()).toEqual(
-      result.samples.map((s) => s.id).sort(),
+      [...rec.splits.train, ...rec.splits.dev].map((s) => s.id).sort(),
     );
 
     const rec2 = await registerDataset({

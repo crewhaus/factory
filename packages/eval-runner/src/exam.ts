@@ -43,6 +43,7 @@ import type {
 import { wireWiki } from "@crewhaus/memory-service";
 import type { RunContext } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
+import { warnUnconsumedCombinePolicy } from "./combine-warnings";
 import { RunnerError } from "./errors";
 import { runSample } from "./run-sample";
 import { Semaphore } from "./semaphore";
@@ -137,11 +138,17 @@ export function createExamRunner(opts: CreateExamRunnerOptions): ExamRunner {
       );
     }
     const { compiled } = parseGradersConfig(gradersYaml);
+    // A4/A5 — honor the config's `combine:` policy on the exam path too (it
+    // parses the same graders.yaml grammar `crewhaus eval` does), and warn
+    // loudly when `weight`/`passing_threshold` are declared without
+    // `combine: weighted` — exactly like runEval.
+    warnUnconsumedCombinePolicy(compiled);
+    const combine = compiled.find((g) => g.combine !== undefined)?.combine;
     const graders: GraderEntry[] = compiled.map((g) => {
       if (g.judgeSpec) {
         const rubric = loadRubric(g.judgeSpec.rubric);
         const model = g.judgeSpec.model ?? opts.judgeModel ?? opts.model;
-        return { name: g.name, grader: createJudgeGrader(rubric, { model }) };
+        return { name: g.name, grader: createJudgeGrader(rubric, { model }), weight: g.weight };
       }
       // v0.3.0 final integration (PR 17 ∩ PR 19): `type: registry` graders
       // resolve against RunEvalOptions.graderRegistry — a seam run_exam does
@@ -154,7 +161,7 @@ export function createExamRunner(opts: CreateExamRunnerOptions): ExamRunner {
           `exam: grader "${g.name}" is \`type: registry\` (→ "${g.registrySpec.grader}") — registry graders resolve via RunEvalOptions.graderRegistry under \`crewhaus eval\` and are not available to \`run_exam\`; use code/llm_judge graders in learning.exam.graders`,
         );
       }
-      return { name: g.name, grader: g.grader };
+      return { name: g.name, grader: g.grader, weight: g.weight };
     });
 
     // 2. Dataset — materialized like runEval (exams are small by design).
@@ -194,6 +201,7 @@ export function createExamRunner(opts: CreateExamRunnerOptions): ExamRunner {
             // PR 19's artifact seam: stamp the examinee's spec name so any
             // artifact-reading grader addresses the right state root.
             specName: opts.specName,
+            ...(combine !== undefined ? { combine } : {}),
           });
         } finally {
           release();

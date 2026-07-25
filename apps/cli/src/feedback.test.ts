@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { SampleSchema } from "@crewhaus/eval-dataset";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
+import { auditSamples, redactDatasetText } from "./dataset-audit";
 import {
   type FeedbackRecord,
   type LoggedEvent,
@@ -385,6 +386,89 @@ describe("distill (tag-all)", () => {
   });
 });
 
+describe("distill redaction (B23)", () => {
+  // A marker stub keeps the tests independent of the detector corpus — the
+  // threading, not the regexes, is under test here (the real redactor's
+  // equivalence is pinned in dataset-audit.test.ts).
+  const redact = (t: string): string => t.replaceAll("PII", "[R]");
+  const piiTurns: SessionTurn[] = [
+    {
+      sessionId: SESSION,
+      turnNumber: 1,
+      input: "question with PII",
+      output: "answer with PII",
+      toolNames: [],
+    },
+  ];
+
+  it("redacts input, gold output, and free-text metadata before samples form", () => {
+    const fb = record({ turnNumber: 1, rating: { thumbs: "up" }, comment: "note PII" });
+    const r = distill(piiTurns, [fb], { minScore: 0.7, redact });
+    const s = r.samples[0];
+    expect(s?.input).toBe("question with [R]");
+    expect(s?.expected_output).toBe("answer with [R]");
+    expect(s?.metadata?.["comment"]).toBe("note [R]");
+  });
+
+  it("redacts a correction wherever it lands (gold + metadata) and the judge rubric", () => {
+    const fb = record({
+      turnNumber: 1,
+      modality: "comment",
+      rating: {},
+      correction: "better PII answer",
+      comment: "liked the PII part",
+    });
+    const r = distill(piiTurns, [fb], { minScore: 0.7, redact, judge: true });
+    expect(r.samples[0]?.expected_output).toBe("better [R] answer");
+    expect(r.samples[0]?.metadata?.["correction"]).toBe("better [R] answer");
+    const judge = r.graders.graders[0];
+    if (judge?.type !== "llm_judge") throw new Error("expected an llm_judge grader");
+    const description = judge.rubric.criteria[0]?.description ?? "";
+    expect(description).toContain("[R]");
+    expect(description).not.toContain("PII");
+  });
+
+  it("without redact, text flows verbatim (byte-identical legacy behavior)", () => {
+    const fb = record({ turnNumber: 1, rating: { thumbs: "up" }, comment: "note PII" });
+    const r = distill(piiTurns, [fb], { minScore: 0.7 });
+    expect(r.samples[0]?.input).toBe("question with PII");
+    expect(r.samples[0]?.expected_output).toBe("answer with PII");
+    expect(r.samples[0]?.metadata?.["comment"]).toBe("note PII");
+  });
+
+  it("redacts the rater identity (metadata.rater can be an email/chat handle)", () => {
+    const fb = record({ turnNumber: 1, rating: { thumbs: "up" }, rater: "rater PII" });
+    const r = distill(piiTurns, [fb], { minScore: 0.7, redact });
+    expect(r.samples[0]?.metadata?.["rater"]).toBe("rater [R]");
+  });
+
+  it("output distilled with the REAL default redactor audits clean (round-trip)", () => {
+    // Synthetic PII assembled from parts (push protection — no real-shaped
+    // literal in source). rater is deliberately an email: the default
+    // pipeline's own output must pass `dataset audit --strict`.
+    const email = ["rater", "example.com"].join("@");
+    const ssn = ["219", "09", "9999"].join("-");
+    const turns: SessionTurn[] = [
+      {
+        sessionId: SESSION,
+        turnNumber: 1,
+        input: `my ssn is ${ssn}`,
+        output: `wrote to ${email} as asked`,
+        toolNames: [],
+      },
+    ];
+    const fb = record({
+      turnNumber: 1,
+      rating: { thumbs: "up" },
+      comment: `mail ${email} again`,
+      rater: email,
+    });
+    const r = distill(turns, [fb], { minScore: 0.7, redact: redactDatasetText });
+    expect(auditSamples(r.samples).totalHits).toBe(0);
+    expect(r.samples[0]?.metadata?.["rater"]).toBe("[REDACTED:email]");
+  });
+});
+
 describe("synthesizeGraders", () => {
   it("prefers tools shared by every tool-using positive turn", () => {
     const g = synthesizeGraders([
@@ -415,6 +499,39 @@ describe("synthesizeGraders", () => {
     );
     expect(g.graders[0]).toMatchObject({ type: "regex", pattern: "\\S" });
     expect(warnings.length).toBeGreaterThan(0);
+  });
+
+  it("never derives the phrase from redaction markers (B23) — real tokens win", () => {
+    // Both outputs carry the redactor's marker; "redacted"/"email" would
+    // otherwise tie the ranking and win alphabetically. The real shared
+    // behavior tokens must be preferred instead.
+    const g = synthesizeGraders([
+      {
+        turnNumber: 1,
+        input: "",
+        output: "your ticket [REDACTED:email] was refunded successfully",
+        toolNames: [],
+      },
+      {
+        turnNumber: 2,
+        input: "",
+        output: "the ticket [HASHED:email:0123456789abcdef] refunded is confirmed",
+        toolNames: [],
+      },
+    ]);
+    expect(g.graders[0]?.type).toBe("contains");
+    const substring = (g.graders[0] as { substring: string }).substring;
+    expect(["redacted", "hashed", "email"]).not.toContain(substring);
+    expect(["ticket", "refunded"]).toContain(substring);
+  });
+
+  it("falls to the floor grader when markers are the only shared content (B23)", () => {
+    const g = synthesizeGraders([
+      { turnNumber: 1, input: "", output: "[REDACTED:credit_card]", toolNames: [] },
+      { turnNumber: 2, input: "", output: "[REDACTED:credit_card] ok", toolNames: [] },
+    ]);
+    // Never a `contains: "redacted"` grader that live output could not pass.
+    expect(g.graders[0]).toMatchObject({ type: "regex", pattern: "\\S" });
   });
 });
 

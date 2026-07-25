@@ -45,6 +45,24 @@ async function runCli(
   return { exitCode: await proc.exited };
 }
 
+/** Variant capturing stderr for the B16 guard-message assertions. Reads the
+ *  pipe CONCURRENTLY with the exit (the flywheel.test.ts pattern) — the
+ *  Bun 1.3.x capture regression bites only read-after-exit stdout. */
+async function runCliStderr(
+  args: ReadonlyArray<string>,
+  cwd: string,
+): Promise<{ exitCode: number; stderr: string }> {
+  const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
+    cwd,
+    env: { PATH: process.env["PATH"] ?? "" },
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+  return { exitCode, stderr };
+}
+
 function writeDatasetFile(dir: string, n: number, name = "dataset.jsonl"): string {
   const path = join(dir, name);
   const lines = Array.from({ length: n }, (_, i) =>
@@ -175,6 +193,23 @@ describe("crewhaus datasets CLI (item 12)", () => {
     );
     expect((await runCli(["datasets", "get"], root)).exitCode).toBe(1);
   }, 15000);
+
+  // B16 — `datasets get` keeps emitting test rows (inspection, not
+  // consumption) but discloses it on stderr; test-free output stays silent.
+  test("get notes emitted test-split rows on stderr; train-only output stays silent", async () => {
+    const root = newTempRoot();
+    const file = writeDatasetFile(root, 10);
+    await runCli(["datasets", "put", "g", "--file", file], root);
+    const merged = await runCliStderr(["datasets", "get", "g"], root);
+    expect(merged.exitCode).toBe(0);
+    expect(merged.stderr).toContain("test-split row(s) emitted");
+    const testOnly = await runCliStderr(["datasets", "get", "g", "--split", "test"], root);
+    expect(testOnly.exitCode).toBe(0);
+    expect(testOnly.stderr).toContain("test-split row(s) emitted");
+    const trainOnly = await runCliStderr(["datasets", "get", "g", "--split", "train"], root);
+    expect(trainOnly.exitCode).toBe(0);
+    expect(trainOnly.stderr).not.toContain("test-split");
+  }, 15000);
 });
 
 describe("crewhaus distill --register (item 12)", () => {
@@ -259,6 +294,70 @@ describe("crewhaus distill --register (item 12)", () => {
     expect(result.exitCode).toBe(1);
     expect(existsSync(join(root, ".crewhaus", "escape"))).toBe(false);
   });
+
+  // B23 — distilled sample text is PII/secret-redacted by default;
+  // --no-redact restores the raw text for dev/local inspection.
+  test("redacts distilled sample text by default; --no-redact keeps it raw (B23)", async () => {
+    const ssn = ["219", "09", "9999"].join("-");
+    const email = ["jane", "example.com"].join("@");
+    const writeLeakySession = (root: string): void => {
+      const sessionsDir = join(root, ".crewhaus", "sessions");
+      mkdirSync(sessionsDir, { recursive: true });
+      const lines = [
+        { kind: "user_message", payload: { content: `my ssn is ${ssn}, what next?` } },
+        {
+          kind: "assistant_message",
+          payload: { content: [{ type: "text", text: `reach me at ${email}` }] },
+        },
+        {
+          kind: "user_feedback",
+          payload: {
+            schemaVersion: 1,
+            id: "fb_1",
+            sessionId: SESSION,
+            turnNumber: 1,
+            modality: "binary",
+            rating: { thumbs: "up" },
+            comment: `handled ${ssn} well`,
+            source: "cli",
+            ts: "2026-07-01T00:00:01.000Z",
+          },
+        },
+      ];
+      writeFileSync(
+        join(sessionsDir, `${SESSION}.jsonl`),
+        `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`,
+      );
+    };
+
+    const redacted = newTempRoot();
+    writeLeakySession(redacted);
+    const out = join(redacted, "ds.jsonl");
+    const run = await runCliStderr(["distill", "--session", SESSION, "-o", out], redacted);
+    expect(run.exitCode).toBe(0);
+    const redactedText = readFileSync(out, "utf-8");
+    expect(redactedText).not.toContain(ssn);
+    expect(redactedText).not.toContain(email);
+    expect(redactedText).toContain("[REDACTED:ssn]");
+    expect(redactedText).toContain("[REDACTED:email]");
+    // The up-rated turn's GOLD ("reach me at <email>") was altered by
+    // redaction — the instrument warning must say so (string-comparison
+    // graders can never match live, unredacted output against it).
+    expect(run.stderr).toContain("gold(s) contained redacted text");
+
+    const raw = newTempRoot();
+    writeLeakySession(raw);
+    const rawOut = join(raw, "ds.jsonl");
+    const rawRun = await runCliStderr(
+      ["distill", "--session", SESSION, "-o", rawOut, "--no-redact"],
+      raw,
+    );
+    expect(rawRun.exitCode).toBe(0);
+    expect(rawRun.stderr).not.toContain("gold(s) contained redacted text");
+    const rawText = readFileSync(rawOut, "utf-8");
+    expect(rawText).toContain(ssn);
+    expect(rawText).toContain(email);
+  }, 15000);
 });
 
 describe("registry: shorthand resolution errors in eval + optimize (item 12)", () => {
@@ -296,6 +395,36 @@ describe("registry: shorthand resolution errors in eval + optimize (item 12)", (
     expect(result.exitCode).toBe(1);
   });
 
+  // B16 — an explicit #test needs the --allow-test-split opt-in on eval.
+  test("eval refuses #test without --allow-test-split and unlocks with it", async () => {
+    const root = newTempRoot();
+    const graders = writeGraders(root);
+    // The lock fires before the registry lookup — no dataset setup needed.
+    const locked = await runCliStderr(
+      ["eval", HELLO_SPEC, "--dataset", "registry:ghost#test", "--graders", graders],
+      root,
+    );
+    expect(locked.exitCode).toBe(1);
+    expect(locked.stderr).toContain("test split locked");
+    expect(locked.stderr).toContain("--allow-test-split");
+    // With the opt-in, the same ref reaches the ordinary versionless error —
+    // proof the flag (and only the flag) disarmed the lock.
+    const unlocked = await runCliStderr(
+      [
+        "eval",
+        HELLO_SPEC,
+        "--dataset",
+        "registry:ghost#test",
+        "--graders",
+        graders,
+        "--allow-test-split",
+      ],
+      root,
+    );
+    expect(unlocked.exitCode).toBe(1);
+    expect(unlocked.stderr).toContain("no versions in the registry");
+  }, 15000);
+
   test("optimize exits 1 on an unknown registry dataset and on a malformed ref", async () => {
     const root = newTempRoot();
     const graders = writeGraders(root);
@@ -307,4 +436,46 @@ describe("registry: shorthand resolution errors in eval + optimize (item 12)", (
       expect(result.exitCode).toBe(1);
     }
   });
+
+  // B16 — optimize refuses #test outright; there is no opt-in flag for it.
+  test("optimize refuses an explicit #test ref with the release-gate explanation", async () => {
+    const root = newTempRoot();
+    const graders = writeGraders(root);
+    const result = await runCliStderr(
+      ["optimize", HELLO_SPEC, "--dataset", "registry:golden#test", "--graders", graders],
+      root,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("optimize never runs over the test split");
+  });
+
+  // B16 — deploy canary is a release-gating flow (a sanctioned holdout
+  // spender): #test is consumable there, behind the same opt-in as eval.
+  test("deploy canary refuses #test without --allow-test-split and unlocks with it", async () => {
+    const root = newTempRoot();
+    const graders = writeGraders(root);
+    const canaryArgs = (extra: string[]): string[] => [
+      "deploy",
+      "canary",
+      HELLO_SPEC,
+      "v2",
+      "--from",
+      "v1",
+      "--dataset",
+      "registry:ghost#test",
+      "--graders",
+      graders,
+      ...extra,
+    ];
+    // The lock fires before the registry lookup — no dataset setup needed.
+    const locked = await runCliStderr(canaryArgs([]), root);
+    expect(locked.exitCode).toBe(1);
+    expect(locked.stderr).toContain("test split locked");
+    expect(locked.stderr).toContain("--allow-test-split");
+    // With the opt-in, the same ref reaches the ordinary versionless error —
+    // proof the flag (and only the flag) disarmed the lock.
+    const unlocked = await runCliStderr(canaryArgs(["--allow-test-split"]), root);
+    expect(unlocked.exitCode).toBe(1);
+    expect(unlocked.stderr).toContain("no versions in the registry");
+  }, 15000);
 });

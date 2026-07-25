@@ -263,6 +263,40 @@ describe("compile() warnings — ACCEPTED_BUT_UNWIRED table", () => {
   });
 });
 
+describe("compile() warnings — channel-reactions-join (D40)", () => {
+  const channelYaml = (feedbackLines: readonly string[]): string =>
+    [
+      "name: ch",
+      "target: channel",
+      "agent:",
+      "  model: m",
+      "  instructions: i",
+      "channels:",
+      "  slack:",
+      "    botToken: $SLACK_BOT_TOKEN",
+      "    signingSecret: $SLACK_SIGNING_SECRET",
+      "routing:",
+      "  sessionKey: thread",
+      ...feedbackLines,
+    ].join("\n");
+
+  test("channelReactions: true → one join-accumulation heads-up", () => {
+    const result = compile(channelYaml(["feedback:", "  channelReactions: true"]));
+    expect(result.warnings.length).toBe(1);
+    const w = result.warnings[0];
+    expect(w?.code).toBe("channel-reactions-join");
+    expect(w?.path).toBe("feedback.channelReactions");
+    expect(w?.message).toContain(".crewhaus/feedback/joins/channel.jsonl");
+    expect(w?.message).toContain("older builds");
+  });
+
+  test("feedback without channelReactions (or channelReactions: false) does not warn", () => {
+    expect(compile(channelYaml(["feedback:", "  modality: binary"])).warnings).toEqual([]);
+    expect(compile(channelYaml(["feedback:", "  channelReactions: false"])).warnings).toEqual([]);
+    expect(compile(channelYaml([])).warnings).toEqual([]);
+  });
+});
+
 describe("G45 — validating ir-passes run unconditionally in compile()", () => {
   test("a graph with an unreachable node fails compile WITHOUT applyIrPasses", () => {
     const yaml = [

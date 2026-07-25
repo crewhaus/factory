@@ -324,6 +324,35 @@ describe("createSlackAdapter — sendReply", () => {
     expect(captured.thread_ts).toBe("9.9");
   });
 
+  // D40 — the returned receipt carries the posted message's ts so the
+  // generated session-router can append its outbound-ts reaction join
+  // (exact-turn 👍/👎 attribution).
+  test("returns { messageTs } from the chat.postMessage receipt", async () => {
+    const fakeFetch: typeof fetch = (async () =>
+      new Response(JSON.stringify({ ok: true, ts: "1719.4242" }), {
+        status: 200,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      })) as unknown as typeof fetch;
+
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb", signingSecret: SECRET },
+      { fetch: fakeFetch },
+    );
+    const receipt = await adapter.sendReply({
+      event: {
+        idempotencyKey: "E",
+        workspaceId: "T",
+        channelId: "C",
+        userId: "U",
+        ts: "1.0",
+        text: "x",
+        subtype: "message",
+      },
+      text: "out",
+    });
+    expect(receipt).toEqual({ messageTs: "1719.4242" });
+  });
+
   test("throws on Slack ok:false response", async () => {
     const fakeFetch: typeof fetch = (async () =>
       new Response(JSON.stringify({ ok: false, error: "channel_not_found" }), {

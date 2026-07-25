@@ -413,6 +413,35 @@ describe("crewhaus eval coverage (CLI, offline)", () => {
     expect(json.backlog[0].kind).toBe("mcp-tool");
   });
 
+  // B16 collateral — coverage is INSPECTION, not consumption: a bare registry
+  // ref must stay split-complete (test included), or gap analysis would
+  // misreport behaviors that only the held-out split exercises as uncovered.
+  it("a bare registry --dataset ref is inspected across ALL splits, test included", async () => {
+    const root = newTempRoot();
+    writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);
+    const sessionsDir = join(root, ".crewhaus", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, "sess_00000000000000c1.jsonl"), sessionJsonl([["Read"]]));
+
+    // 10 samples at the default 70/15/15 → 7 train + 1 dev + 2 test.
+    const file = join(root, "seed.jsonl");
+    writeFileSync(
+      file,
+      `${Array.from({ length: 10 }, (_, i) => JSON.stringify({ id: `s${i}`, input: `question ${i}` })).join("\n")}\n`,
+    );
+    expect((await runCli(["datasets", "put", "cov-ds", "--file", file], root)).exitCode).toBe(0);
+
+    const got = await runCli(
+      ["eval", "coverage", "--dataset", "registry:cov-ds", "--format", "json", "-o", "cov"],
+      root,
+    );
+    expect(got.exitCode).toBe(0);
+    const json = JSON.parse(readFileSync(join(root, "cov", "coverage.json"), "utf-8"));
+    // All 10 samples count — the consumption view (train+dev) would see 8.
+    expect(json.sampleCount).toBe(10);
+    expect(json.dataset).toBe("cov-ds@v1");
+  });
+
   it("html format is self-contained and text is the default", async () => {
     const root = newTempRoot();
     writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);

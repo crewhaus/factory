@@ -2,7 +2,8 @@
  * Catalog R-eval `eval-grader` — deterministic graders + composers.
  *
  * A `Grader` is `(sample, runResult) → Promise<GradeResult>`. Built-ins:
- *   exactMatch, contains, regex, jsonPath, schema, toolCallSequence.
+ *   exactMatch, contains, expectedContains, regex, jsonPath, schema,
+ *   toolCallSequence.
  *
  * Composers:
  *   all([g1,g2])          → AND-merged: passed iff all pass; score = min.
@@ -19,6 +20,7 @@ export { GraderError } from "./errors";
 export {
   exactMatch,
   contains,
+  expectedContains,
   regex,
   jsonPath,
   schema,
@@ -35,6 +37,8 @@ export {
   combineCompiledGraders,
   GradersConfigSchema,
   type CompiledGrader,
+  type GraderCombineMode,
+  type GraderCombinePolicy,
   type GradersConfig,
   type GraderSpec,
   type RubricSpec,

@@ -146,8 +146,9 @@ export type CompileOptions = {
 
 /**
  * Loop contract 0.4 (Batch A, G45 warnings framework) — one non-fatal
- * compile diagnostic. `code` is a stable machine key (today only
- * `"accepted-but-unwired"`), `path` the spec key it concerns (dot-joined),
+ * compile diagnostic. `code` is a stable machine key
+ * (`"accepted-but-unwired"`, `"edge-unsafe-tool"`,
+ * `"channel-reactions-join"`), `path` the spec key it concerns (dot-joined),
  * `message` the human explanation. Additive: every existing `compile()`
  * consumer that only reads `.files` keeps working unchanged.
  */
@@ -325,6 +326,23 @@ function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning> {
     if (specDeclares(spec, row.path)) {
       out.push({ code: "accepted-but-unwired", path: row.path, message: row.message });
     }
+  }
+  // D40 — channel 👍/👎 reactions attribute to the exact reacted-to turn
+  // through the outbound-ts join store the generated daemon appends as it
+  // posts replies (target-channel-bot's session-router). The join only
+  // covers replies posted once the daemon runs this build, so day-one
+  // reactions on older messages degrade; one honest compile-time heads-up
+  // beats silently-degraded attribution semantics.
+  if (spec.target === "channel" && spec.feedback?.channelReactions === true) {
+    out.push({
+      code: "channel-reactions-join",
+      path: "feedback.channelReactions",
+      message:
+        "reaction feedback attributes to the exact reacted-to turn via the outbound-ts join file " +
+        "(.crewhaus/feedback/joins/channel.jsonl) the daemon appends as it posts replies — the join " +
+        "must accumulate first, so reactions on messages posted by older builds fall back to " +
+        "last-turn attribution (sessionKey channel/user) or are dropped (sessionKey thread)",
+    });
   }
   return out;
 }

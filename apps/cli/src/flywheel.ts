@@ -219,6 +219,44 @@ export function resolveFlywheelData(opts: {
   return { dataset, graders, datasetSource, gradersSource };
 }
 
+/**
+ * NEW-flywheel-shadow — the always-printed dataset-provenance line. The run
+ * header shows the resolved dataset's IDENTITY (`dataset=<name>`), but not
+ * which precedence rung chose it (flag > convention > ratings-registry);
+ * this one-liner discloses the choice on every run so a stale scaffolded
+ * `eval/dataset.jsonl` can't silently masquerade as real-user ratings.
+ */
+export function formatDatasetSourceLine(data: FlywheelDataResolution): string {
+  return `[flywheel] dataset: ${data.dataset} (source: ${data.datasetSource})`;
+}
+
+/**
+ * NEW-flywheel-shadow — the shadow warning. Every `init --with-evals` +
+ * `feedback.autoDistill` harness eventually lands in the state where BOTH
+ * the day-one conventional `eval/dataset.jsonl` and a distilled
+ * `<spec>-ratings` registry dataset exist — and the convention file wins the
+ * precedence, leaving the nightly loop optimizing against the scaffold while
+ * real-user ratings pile up unused. Returns the warning line (naming the
+ * exact `--dataset` flag to pass) when that shadowing is in effect, else
+ * undefined.
+ */
+export function formatRatingsShadowWarning(opts: {
+  readonly data: FlywheelDataResolution;
+  readonly specName: string;
+  /** `registry:<specName>-ratings` has at least one version. */
+  readonly ratingsRegistered: boolean;
+  /** Its latest version, when known (for the `@vN` in the warning). */
+  readonly ratingsVersion?: string;
+}): string | undefined {
+  if (opts.data.datasetSource !== "convention" || !opts.ratingsRegistered) return undefined;
+  const ref = `registry:${opts.specName}-ratings`;
+  const at = opts.ratingsVersion !== undefined ? `@${opts.ratingsVersion}` : "";
+  return (
+    `[flywheel] warning: ${opts.data.dataset} shadows the distilled ratings dataset ` +
+    `${ref}${at} — pass --dataset ${ref} to optimize against real user ratings`
+  );
+}
+
 // -------- git cleanliness (invariant: never run over uncommitted spec edits) --------
 
 /** True when `git status --porcelain -- <spec>` reported any change. */

@@ -526,6 +526,32 @@ describe("crewhaus compile", () => {
     expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
   });
 
+  // D40 — channel-reactions-join is INFORMATIONAL: it fires on a fully
+  // wired, correctly configured feature (the outbound-ts join file just has
+  // to accumulate at runtime), so no spec edit can ever clear it. --strict
+  // must NOT escalate it — otherwise strict compiles would be permanently
+  // unusable for every reactions-enabled channel spec. The heads-up line
+  // itself still prints.
+  test("compile --strict does NOT escalate the informational channel-reactions-join warning", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: reactful\ntarget: channel\nagent:\n  model: claude-sonnet-4-6\n  instructions: reply kindly\nchannels:\n  slack:\n    botToken: $SLACK_BOT_TOKEN\n    signingSecret: $SLACK_SIGNING_SECRET\nrouting:\n  sessionKey: thread\nfeedback:\n  channelReactions: true\n",
+    );
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--strict", "--no-register", "-o", outDir], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    // The informational warning still prints (code + path)…
+    expect(result.stderr).toContain(
+      "crewhaus: warning[channel-reactions-join] feedback.channelReactions:",
+    );
+    // …but never escalates, and the bundle is written.
+    expect(result.stderr).not.toContain("escalated to errors");
+    expect(existsSync(join(outDir, "session-router.ts"))).toBe(true);
+  });
+
   test("compile --help documents the warning line shape and --strict escalation", async () => {
     const result = await runCli(["compile", "--help"]);
     expect(result.exitCode).toBe(0);

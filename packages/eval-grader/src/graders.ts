@@ -54,6 +54,43 @@ export function contains(opts: ContainsOptions): Grader {
   };
 }
 
+// -------- expectedContains --------
+
+export type ExpectedContainsOptions = {
+  /** Case-insensitive containment (default: false). */
+  readonly caseInsensitive?: boolean;
+};
+
+/**
+ * Reference-containment check: passes when `agentOutput` contains the
+ * sample's `expected_output` (compared against the trimmed gold). The
+ * per-sample counterpart to `contains` — no literal needle in the config;
+ * each sample's own gold is the needle. A sample without an
+ * `expected_output` fails loudly, mirroring `exactMatch`.
+ */
+export function expectedContains(opts: ExpectedContainsOptions = {}): Grader {
+  const ci = opts.caseInsensitive ?? false;
+  return async (sample, run) => {
+    const expected = sample.expected_output;
+    if (expected === undefined) {
+      return fail("expectedContains: sample has no expected_output");
+    }
+    const needle = transform(expected, true, ci);
+    // An empty (or whitespace-only) gold is a degenerate "no gold": ''
+    // is a substring of EVERYTHING, so passing here would vacuously pass
+    // any agent output and silently inflate pass rates. Fail loudly like
+    // the missing-gold case.
+    if (needle === "") {
+      return fail("expectedContains: sample's expected_output is empty after trimming");
+    }
+    const haystack = ci ? run.agentOutput.toLowerCase() : run.agentOutput;
+    if (haystack.includes(needle)) {
+      return pass(`output contains expected_output (${needle.length} chars)`);
+    }
+    return fail(`output missing expected_output "${truncate(needle)}"`);
+  };
+}
+
 // -------- regex --------
 
 export function regex(pattern: RegExp | string, flags?: string): Grader {

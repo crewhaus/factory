@@ -21,6 +21,38 @@ export type DiffEntry = {
 const SCORE_EPSILON = 0.1;
 
 /**
+ * Measurement-instrument mismatch check for a run diff. Scores are only
+ * comparable when both runs graded with the same instrument — the same
+ * graders config and the same judge model. When both runs recorded a
+ * `gradersHash` (or `judgeModel`) and the values differ, a score delta may
+ * reflect the rubric/judge change rather than the agent, so the caller
+ * should surface these lines as warnings alongside the diff. Fields absent
+ * on either side (runs recorded before the fields existed, or runs that
+ * never pinned a judge) produce no warning — old records stay diffable
+ * exactly as before.
+ */
+export function diffInstrumentWarnings(prev: LoadedRun, next: LoadedRun): string[] {
+  const p = prev.summary.config;
+  const n = next.summary.config;
+  const warnings: string[] = [];
+  if (
+    p.gradersHash !== undefined &&
+    n.gradersHash !== undefined &&
+    p.gradersHash !== n.gradersHash
+  ) {
+    warnings.push(
+      `runs graded with different graders configs (gradersHash ${p.gradersHash} vs ${n.gradersHash}) — score deltas may reflect the rubric change, not the agent`,
+    );
+  }
+  if (p.judgeModel !== undefined && n.judgeModel !== undefined && p.judgeModel !== n.judgeModel) {
+    warnings.push(
+      `runs graded with different judge models (${p.judgeModel} vs ${n.judgeModel}) — score deltas may reflect the judge change, not the agent`,
+    );
+  }
+  return warnings;
+}
+
+/**
  * Compare two eval runs by `sampleId`. Throws if the keysets don't match
  * (no silent alignment by index — that would mask schema drift).
  *

@@ -1056,38 +1056,144 @@ function renderSessionRouter(ir: IrChannelV0): string {
 
   // Inbound 👍/👎 reaction feedback (opt-in via spec `feedback.channelReactions`).
   // A reaction event carries the reacting user + channel but NOT the thread
-  // root (item.ts is the bot reply's ts), so the session is recoverable only
-  // for channel/user session keys; thread mode no-ops (it would need an
-  // outbound-ts→session join store).
+  // root (item.ts is the bot reply's ts), so exact attribution rides the
+  // outbound-ts → (sessionId, turnNumber) join store the router appends on
+  // every posted reply (D40): handleReaction resolves the reacted-to ts
+  // through the join for EVERY sessionKey — thread included — and lands the
+  // feedback on the exact turn (a reaction on an older reply is no longer
+  // pinned to the newest turn). On a join miss (a reply posted before the
+  // join accumulated, or an adapter whose sendReply returns no receipt)
+  // channel/user keys fall back to last-turn attribution under the routing
+  // key — the pre-join behavior — while thread drops the reaction (its
+  // routing key is unrecoverable from the reaction event alone).
   const feedbackReactions = ir.feedback?.channelReactions === true;
   const reactionRoutingKeyExpr =
     sessionKey === "user"
       ? "`${adapter.id}:${reaction.workspaceId}:${reaction.userId}`"
       : "`${adapter.id}:${reaction.workspaceId}:${reaction.channelId}`";
   const reactionImports = feedbackReactions
-    ? '\nimport { openEventLog } from "@crewhaus/event-log";\nimport type { InboundReaction } from "@crewhaus/channel-adapter-slack";'
+    ? '\nimport { appendFile, mkdir, readFile } from "node:fs/promises";\nimport { dirname, join } from "node:path";\nimport { openEventLog } from "@crewhaus/event-log";\nimport type { InboundReaction } from "@crewhaus/channel-adapter-slack";'
     : "";
   const reactionTypeMember = feedbackReactions
     ? "\n  handleReaction(reaction: InboundReaction, adapter: ChannelAdapter): Promise<void>;"
     : "";
-  const reactionMethod = !feedbackReactions
+  // Module-scope join store: append on post, scan on reaction. Lives beside
+  // the ratings sink (`.crewhaus/feedback/`) in a `joins/` subdirectory so
+  // the CLI's bare-record feedback readers (which glob `*.jsonl` files, not
+  // directories) never parse it as FeedbackRecords.
+  const reactionJoinBlock = !feedbackReactions
     ? ""
-    : sessionKey === "thread"
-      ? `
-    async handleReaction(_reaction: InboundReaction, _adapter: ChannelAdapter): Promise<void> {
-      // sessionKey "thread" can't attribute a reaction to a session: item.ts is
-      // the bot reply's ts, not the thread root, and no outbound-ts→session
-      // join store exists. Reactions are ignored here — use sessionKey channel
-      // or user for reaction feedback.
-    },`
-      : `
-    async handleReaction(reaction: InboundReaction, adapter: ChannelAdapter): Promise<void> {
-      const routingKey = ${reactionRoutingKeyExpr};
-      const sessionId = deriveSessionId(routingKey);
-      const session = await sessionStore.get(sessionId);
-      if (session === null || session.lastTurnIndex < 1) return;
-      const log = await openEventLog(
+    : `
+/**
+ * D40 — outbound-ts → (sessionId, turnNumber) join store. Every assistant
+ * reply this daemon posts appends one record here, so a reaction on that
+ * message (Slack's reaction_added carries only channel + message ts, never
+ * the thread root) attributes to the EXACT turn it reacted to — for every
+ * routing.sessionKey, thread included. Append-only JSONL beside the ratings
+ * sink (.crewhaus/feedback/), scanned in full per reaction (reactions are
+ * rare; the last matching record wins). Replies posted before this build's
+ * join began accumulating miss and take the per-key fallback in
+ * handleReaction.
+ */
+const REACTION_JOIN_FILE = join(process.cwd(), ".crewhaus", "feedback", "joins", "channel.jsonl");
+
+type ReactionJoin = {
+  schemaVersion: number;
+  adapterId: string;
+  workspaceId: string;
+  channelId: string;
+  outboundTs: string;
+  sessionId: string;
+  turnNumber: number;
+  ts: string;
+};
+
+async function appendReactionJoin(record: ReactionJoin): Promise<void> {
+  await mkdir(dirname(REACTION_JOIN_FILE), { recursive: true });
+  await appendFile(REACTION_JOIN_FILE, JSON.stringify(record) + "\\n", "utf-8");
+}
+
+async function resolveReactionJoin(
+  reaction: InboundReaction,
+  adapterId: string,
+): Promise<{ sessionId: string; turnNumber: number } | null> {
+  let raw: string;
+  try {
+    raw = await readFile(REACTION_JOIN_FILE, "utf-8");
+  } catch {
+    return null; // no join file yet — nothing posted since the store landed
+  }
+  let match: { sessionId: string; turnNumber: number } | null = null;
+  for (const line of raw.split("\\n")) {
+    if (line.trim().length === 0) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue; // torn append — skip the line, keep scanning
+    }
+    const r = parsed as Partial<ReactionJoin>;
+    if (
+      r.adapterId === adapterId &&
+      r.workspaceId === reaction.workspaceId &&
+      r.channelId === reaction.channelId &&
+      r.outboundTs === reaction.messageTs &&
+      typeof r.sessionId === "string" &&
+      typeof r.turnNumber === "number"
+    ) {
+      match = { sessionId: r.sessionId, turnNumber: r.turnNumber };
+    }
+  }
+  return match;
+}
+`;
+  // Closure-scope post helper: needs sessionStore for the turn number. The
+  // receipt cast tolerates adapters whose sendReply predates the message-ts
+  // receipt (they resolve void): no receipt ⇒ no join line ⇒ reactions on
+  // that reply take handleReaction's per-key fallback.
+  const sendReplyJoinHelper = !feedbackReactions
+    ? ""
+    : `
+  // D40 — post the assistant reply, then append the outbound-ts join record
+  // so a later reaction on this exact message attributes to this turn. A
+  // join append failure never fails the turn — the reply is already
+  // delivered.
+  const sendReplyWithJoin = async (
+    adapter: ChannelAdapter,
+    event: InboundEvent,
+    sessionId: string,
+    text: string,
+  ): Promise<void> => {
+    const receipt = (await adapter.sendReply({ event, text })) as unknown as
+      | { messageTs?: string }
+      | undefined;
+    const outboundTs = receipt?.messageTs;
+    if (outboundTs === undefined) return;
+    const session = await sessionStore.get(sessionId);
+    if (session === null || session.lastTurnIndex < 1) return;
+    try {
+      await appendReactionJoin({
+        schemaVersion: 1,
+        adapterId: adapter.id,
+        workspaceId: event.workspaceId,
+        channelId: event.channelId,
+        outboundTs,
         sessionId,
+        turnNumber: session.lastTurnIndex,
+        ts: new Date().toISOString(),
+      });
+    } catch (err) {
+      process.stderr.write(
+        "[session-router] reaction-join append error: " + (err as Error).message + "\\n",
+      );
+    }
+  };
+`;
+  // Both attribution paths (join hit + per-key fallback) append the SAME
+  // user_feedback record — fb_ idempotency-key hashing included — so a
+  // platform redelivery collapses to one id regardless of which path ran.
+  const reactionFeedbackAppend = `const log = await openEventLog(
+        joined.sessionId,
         config.sessionRootDir !== undefined ? { rootDir: config.sessionRootDir } : {},
       );
       await log.append({
@@ -1095,15 +1201,61 @@ function renderSessionRouter(ir: IrChannelV0): string {
         payload: {
           schemaVersion: 1,
           id: "fb_" + createHash("sha256").update(reaction.idempotencyKey).digest("hex").slice(0, 16),
-          sessionId,
-          turnNumber: session.lastTurnIndex,
+          sessionId: joined.sessionId,
+          turnNumber: joined.turnNumber,
           modality: "binary",
           rating: { thumbs: reaction.vote },
           source: "channel",
           ts: new Date().toISOString(),
         },
-      });
+      });`;
+  const reactionMethod = !feedbackReactions
+    ? ""
+    : sessionKey === "thread"
+      ? `
+    async handleReaction(reaction: InboundReaction, adapter: ChannelAdapter): Promise<void> {
+      // D40 — the join store resolves the reacted-to ts to the exact turn
+      // that posted the message, so thread-keyed sessions get reaction
+      // feedback too (the reaction event never carries the thread root).
+      const joined = await resolveReactionJoin(reaction, adapter.id);
+      if (joined === null) {
+        // Join miss under sessionKey "thread": item.ts is the bot reply's ts,
+        // not the thread root, so the routing key — and with it the session —
+        // is unrecoverable. The reaction is dropped; only replies posted
+        // since this build's join began accumulating can be attributed.
+        return;
+      }
+      ${reactionFeedbackAppend}
+    },`
+      : `
+    async handleReaction(reaction: InboundReaction, adapter: ChannelAdapter): Promise<void> {
+      // D40 — resolve through the join store first so the feedback lands on
+      // the EXACT reacted-to turn (a reaction on an older reply must not be
+      // pinned to the newest turn).
+      let joined = await resolveReactionJoin(reaction, adapter.id);
+      if (joined === null) {
+        // Join miss (a reply posted before this build's join began
+        // accumulating): fall back to last-turn attribution under the
+        // session's routing key — the pre-join behavior.
+        const routingKey = ${reactionRoutingKeyExpr};
+        const sessionId = deriveSessionId(routingKey);
+        const session = await sessionStore.get(sessionId);
+        if (session === null || session.lastTurnIndex < 1) return;
+        joined = { sessionId, turnNumber: session.lastTurnIndex };
+      }
+      ${reactionFeedbackAppend}
     },`;
+  // The reply-post call sites (inbound handle + approval resume) switch to
+  // the join-appending helper only when reactions are on, so every other
+  // bundle stays byte-identical. (The approval-prompt `sendText` fallback in
+  // approvalsCatch below is a THIRD outbound post site that deliberately
+  // does not join — see the D40 exemption note there.)
+  const replyPost = feedbackReactions
+    ? "await sendReplyWithJoin(adapter, event, sessionId, reply);"
+    : "await adapter.sendReply({ event, text: reply });";
+  const approvalReplyPost = feedbackReactions
+    ? "await sendReplyWithJoin(adapter, event, approval.sessionId, reply);"
+    : "await adapter.sendReply({ event, text: reply });";
 
   // Gateway status counters — the /status endpoint (daemon.ts) reports a
   // turnCount, so the router signals each completed agent turn back to the
@@ -1129,6 +1281,14 @@ function renderSessionRouter(ir: IrChannelV0): string {
   const approvalsResumeState = approvalsOn
     ? "\n  // G11 — approvalId → the inbound event that parked it, so a granted\n  // approval re-drives that turn and replies in the right thread.\n  const __resumeContexts = new Map<string, InboundEvent>();"
     : "";
+  // D40 join exemption — the approval-prompt text fallback (`sendText:` in
+  // the catch below) posts via plain adapter.sendReply, NEVER
+  // sendReplyWithJoin: the parked turn is incomplete (lastTurnIndex still
+  // names the PREVIOUS turn), so appending a join line for the prompt would
+  // attribute a reaction on it to that previous turn. Prompt reactions
+  // instead take handleReaction's per-key miss fallback (last-turn for
+  // channel/user, drop for thread) — the least-bad option for an in-flight
+  // turn. Do not "fix" this by switching the fallback to the join helper.
   const approvalsCatch = approvalsOn
     ? `      } catch (err) {
         if (
@@ -1179,7 +1339,7 @@ function renderSessionRouter(ir: IrChannelV0): string {
           message: event.text,
         });
         if (reply.length > 0) {
-          await adapter.sendReply({ event, text: reply });
+          ${approvalReplyPost}
         }
         if (adapter.react) {
           try {
@@ -1220,11 +1380,11 @@ export type SessionRouter = {
 function deriveSessionId(routingKey: string): string {
   return "sess_" + createHash("sha256").update(routingKey).digest("hex").slice(0, 16);
 }
-
+${reactionJoinBlock}
 export function createSessionRouter(config: SessionRouterConfig): SessionRouter {
   const sessionStore = createSessionStore(
     config.sessionRootDir !== undefined ? { rootDir: config.sessionRootDir } : {},
-  );${approvalsResumeState}
+  );${approvalsResumeState}${sendReplyJoinHelper}
   return {
     async handle(event: InboundEvent, adapter: ChannelAdapter): Promise<void> {
       const routingKey = ${routingKeyExpr};
@@ -1256,7 +1416,7 @@ export function createSessionRouter(config: SessionRouterConfig): SessionRouter 
       try {
         const reply = await config.agent.runTurn({ sessionId, isNew, message: event.text });
         if (reply.length > 0) {
-          await adapter.sendReply({ event, text: reply });
+          ${replyPost}
         }
         await tryReact("white_check_mark");${turnCompleteCall}
 ${approvalsCatch}

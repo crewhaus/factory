@@ -6,7 +6,7 @@
  * artifacts), and the failed-sample surface the `run_exam` tool logs gaps
  * from.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -176,6 +176,41 @@ describe("createExamRunner — grading + report (deterministic, no model)", () =
     const runner = createExamRunner(runnerOpts({ chatLoop: mockChatLoop([]) }));
     expect(runner({ datasetPath: emptyPath, gradersPath })).rejects.toThrow(RunnerError);
     expect(runner({ datasetPath: emptyPath, gradersPath })).rejects.toThrow(/zero samples/);
+  });
+
+  test("warns loudly when weight/passing_threshold lack combine: weighted (A4/A5)", async () => {
+    // The exam path parses the same graders.yaml grammar `crewhaus eval`
+    // does — the silent-ignore warnings must fire here too, not only in
+    // runEval.
+    const { datasetPath } = writeExamFiles();
+    const weightedGradersPath = join(tmp, "eval", "graders-weighted.yaml");
+    writeFileSync(
+      weightedGradersPath,
+      `passing_threshold: 0.9
+graders:
+  - name: cites_wiki
+    type: contains
+    substring: "(coffee/"
+    weight: 3
+`,
+    );
+    const writes: string[] = [];
+    const spy = spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write);
+    try {
+      const runner = createExamRunner(
+        runnerOpts({ chatLoop: mockChatLoop([]), outDir: join(tmp, "exam-warn") }),
+      );
+      await runner({ datasetPath, gradersPath: weightedGradersPath });
+    } finally {
+      spy.mockRestore();
+    }
+    const logged = writes.join("");
+    expect(logged).toContain("graders.weight_ignored");
+    expect(logged).toContain("cites_wiki");
+    expect(logged).toContain("graders.passing_threshold_ignored");
   });
 
   test("an invoker error becomes a failed outcome with the error surfaced", async () => {

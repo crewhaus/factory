@@ -50,6 +50,7 @@ import { createSkillTool } from "@crewhaus/skills-registry";
 import { currentTenantContext } from "@crewhaus/tenancy";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { aggregate } from "./aggregate";
+import { warnUnconsumedCombinePolicy } from "./combine-warnings";
 import { defaultGraderRegistry } from "./default-registry";
 import { RunnerError } from "./errors";
 import { runSample } from "./run-sample";
@@ -199,7 +200,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
       }
       const model = g.judgeSpec.model ?? opts.judgeModel;
       const grader = createJudgeGrader(rubric, model !== undefined ? { model } : {});
-      return { name: g.name, grader };
+      return { name: g.name, grader, weight: g.weight };
     }
     if (g.registrySpec) {
       if (graderRegistry === undefined) {
@@ -210,7 +211,11 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         );
       }
       try {
-        return { name: g.name, grader: graderRegistry.lookup(g.registrySpec.grader) };
+        return {
+          name: g.name,
+          grader: graderRegistry.lookup(g.registrySpec.grader),
+          weight: g.weight,
+        };
       } catch (err) {
         const known = graderRegistry.list?.().join(", ");
         throw new RunnerError(
@@ -221,8 +226,15 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         );
       }
     }
-    return { name: g.name, grader: g.grader };
+    return { name: g.name, grader: g.grader, weight: g.weight };
   });
+
+  // A4/A5 — the graders config's top-level `combine:` policy rides on the
+  // compiled entries (identical on each; absent = the pre-policy `all`).
+  // Warn LOUDLY at run start when `weight`/`passing_threshold` are declared
+  // without `combine: weighted` (shared with the exam surface).
+  const combine = compiledGraders.find((g) => g.combine !== undefined)?.combine;
+  warnUnconsumedCombinePolicy(compiledGraders);
 
   // The default invoker calls runChatLoop with the per-sample fresh runContext.
   const invoker = opts.invoker ?? (await defaultInvoker(ir, opts));
@@ -331,6 +343,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
               outDir,
               model: ir.agent.model,
               specName: ir.name,
+              ...(combine !== undefined ? { combine } : {}),
               ...(seed !== undefined ? { seed } : {}),
               ...(trial > 1 ? { trial } : {}),
             });

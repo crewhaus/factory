@@ -45,6 +45,7 @@ function makeSummary(
   samples: SampleResult[],
   outDir: string,
   p95LatencyMs = 100,
+  config: Partial<EvalRunSummary["config"]> = {},
 ): EvalRunSummary {
   return {
     runId,
@@ -68,6 +69,7 @@ function makeSummary(
       graderNames: ["exact"],
       model: "claude-opus-4-7",
       concurrency: 4,
+      ...config,
     },
     outDir,
   };
@@ -102,8 +104,13 @@ function newCtx(): Ctx {
   };
 }
 
-function makeRun(ctx: Ctx, runId: string, samples: SampleResult[], p95LatencyMs = 100) {
-  const summary = makeSummary(runId, samples, join(ctx.root, runId), p95LatencyMs);
+function makeRun(
+  ctx: Ctx,
+  runId: string,
+  samples: SampleResult[],
+  config: Partial<EvalRunSummary["config"]> = {},
+) {
+  const summary = makeSummary(runId, samples, join(ctx.root, runId), 100, config);
   persistRun(summary);
   return summary;
 }
@@ -333,6 +340,129 @@ describe("finishEvalRun — spec-source collision detection", () => {
     const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
     await finish(ctx, next); // no specSource
     expect(ctx.warnings.join("\n")).not.toContain("different spec file");
+  });
+});
+
+describe("finishEvalRun — measurement-instrument guard (NEW-HUNT-1)", () => {
+  test("records gradersHash/judgeModel on the index entry and baseline pin", async () => {
+    const ctx = newCtx();
+    const run = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {
+      gradersHash: "g-hash-1",
+      judgeModel: "judge-model-a",
+    });
+    await finish(ctx, run);
+    expect(readRunIndex(ctx.evalsDir)[0]).toMatchObject({
+      gradersHash: "g-hash-1",
+      judgeModel: "judge-model-a",
+    });
+    const pin = getBaseline("concierge", "smoke", ctx.evalsDir);
+    expect(pin?.gradersHash).toBe("g-hash-1");
+    expect(pin?.judgeModel).toBe("judge-model-a");
+  });
+
+  test("a gradersHash change vs the pinned baseline warns and starts a new lineage", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {
+      gradersHash: "g-hash-1",
+    });
+    await finish(ctx, prev);
+    // Same dataset/keyset, but the rubric changed AND the sample now fails —
+    // a naive gate would blame the agent for the stricter rubric.
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", false, 0)], {
+      gradersHash: "g-hash-2",
+    });
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result.gateFailed).toBe(false);
+    const warned = ctx.warnings.join("\n");
+    expect(warned).toContain("measurement instrument changed");
+    expect(warned).toContain("g-hash-1 → g-hash-2");
+    expect(ctx.lines.join("\n")).toContain("graders/judge changed — starting new baseline lineage");
+    const pin = getBaseline("concierge", "smoke", ctx.evalsDir);
+    expect(pin?.runId).toBe("run_bbbb2222bbbb2222");
+    expect(pin?.gradersHash).toBe("g-hash-2");
+  });
+
+  test("a judgeModel change vs the pinned baseline warns and starts a new lineage", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {
+      gradersHash: "g-hash-1",
+      judgeModel: "judge-model-a",
+    });
+    await finish(ctx, prev);
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", false, 0)], {
+      gradersHash: "g-hash-1",
+      judgeModel: "judge-model-b",
+    });
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result.gateFailed).toBe(false);
+    const warned = ctx.warnings.join("\n");
+    expect(warned).toContain("judge-model-a → judge-model-b");
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.judgeModel).toBe("judge-model-b");
+  });
+
+  test("instrument mismatch with --no-promote warns but keeps the old pin", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {
+      gradersHash: "g-hash-1",
+    });
+    await finish(ctx, prev);
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)], {
+      gradersHash: "g-hash-2",
+    });
+    const result = await finish(ctx, next, { promote: false });
+    expect(result.gateFailed).toBe(false);
+    expect(ctx.warnings.join("\n")).toContain("measurement instrument changed");
+    expect(ctx.lines.join("\n")).toContain("--no-promote");
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+  });
+
+  test("a hash-less legacy baseline gates exactly as before (no warning)", async () => {
+    const ctx = newCtx();
+    // Baseline pinned by an old CLI — no instrument fields recorded.
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctx, prev);
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", false, 0)], {
+      gradersHash: "g-hash-2",
+      judgeModel: "judge-model-b",
+    });
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result.gateFailed).toBe(true);
+    expect(ctx.warnings.join("\n")).not.toContain("measurement instrument");
+    expect(ctx.lines.join("\n")).toContain("vs baseline run_aaaa1111aaaa1111");
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+  });
+
+  test("a run without hashes never trips the guard against a hash-carrying pin", async () => {
+    // The symmetric back-compat direction: a summary recorded without the
+    // fields must gate normally even against a pin that carries them.
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {
+      gradersHash: "g-hash-1",
+      judgeModel: "judge-model-a",
+    });
+    await finish(ctx, prev);
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
+    const result = await finish(ctx, next);
+    expect(result.gateFailed).toBe(false);
+    expect(ctx.warnings.join("\n")).not.toContain("measurement instrument");
+    expect(ctx.lines.join("\n")).toContain("gate: PASS");
+  });
+
+  test("an unchanged instrument gates normally — genuine regressions still fail", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {
+      gradersHash: "g-hash-1",
+      judgeModel: "judge-model-a",
+    });
+    await finish(ctx, prev);
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", false, 0)], {
+      gradersHash: "g-hash-1",
+      judgeModel: "judge-model-a",
+    });
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result.gateFailed).toBe(true);
+    expect(ctx.warnings.join("\n")).not.toContain("measurement instrument");
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
   });
 });
 

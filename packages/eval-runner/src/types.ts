@@ -340,4 +340,7 @@ export type RunEvalOptions = {
 export type GraderEntry = {
   readonly name: string;
   readonly grader: Grader;
+  /** A4 — this grader's contribution under `combine: weighted` (positive,
+   *  default 1). Ignored by the `all`/`any` combination modes. */
+  readonly weight?: number;
 };
