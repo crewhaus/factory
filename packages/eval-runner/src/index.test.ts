@@ -177,6 +177,10 @@ describe("runEval — T3 5-sample fixture", () => {
     expect(summary.config.datasetHash).toBeUndefined();
     const runJson = JSON.parse(readFileSync(join(outDir, "run.json"), "utf-8"));
     expect("datasetHash" in runJson).toBe(false);
+    // NEW-HUNT-2 — a judge-less run records no judgeSampling block, keeping
+    // its run.json/results.json shape exactly as before.
+    expect("judgeSampling" in runJson).toBe(false);
+    expect(summary.config.judgeSampling).toBeUndefined();
   });
 
   test("captures grader failures correctly", async () => {

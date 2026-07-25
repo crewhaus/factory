@@ -63,11 +63,35 @@ export type RunIndexEntry = {
   readonly meanScore: number;
   readonly sampleCount: number;
   /**
+   * C30 — the run's p95 per-sample latency in ms
+   * (`aggregates.p95LatencyMs`), recorded so ops metrics are readable from
+   * the index without loading every run dir. Additive — absent on entries
+   * written before the field existed.
+   */
+  readonly p95LatencyMs?: number;
+  /**
+   * C30 — the run's estimated cost in USD, projected from its agent-model
+   * token totals through the same pricing seam as the `--models` matrix
+   * `est_$` column (judge/grader spend is not metered). Additive — absent
+   * on entries written before the field existed and on runs whose model
+   * has no pricing row.
+   */
+  readonly costUsd?: number;
+  /**
    * Samples whose recorded outcome replaced an errored first attempt via
    * the runner's noise auto-retry (`SampleResult.retried`). Additive —
    * absent on entries written before the field existed (read as 0).
    */
   readonly retriedCount?: number;
+  /**
+   * NEW-HUNT-3 — true when the run was cut short by its run-level budget
+   * cap (`EvalRunSummary.partial`): samples still queued at abort were
+   * recorded as synthetic errors, so this entry's passRate/meanScore read
+   * LOWER than a full run's would. Partial runs are never pinned or
+   * promoted as baselines. Additive — absent on full runs and on entries
+   * written before the field existed.
+   */
+  readonly partial?: boolean;
   /** ISO-8601 completion timestamp. */
   readonly ts: string;
   /** Absolute path to the run's output directory. */
@@ -103,6 +127,18 @@ export type BaselineEntry = {
    * Additive; absent on baselines pinned before the field existed.
    */
   readonly judgeModel?: string;
+  /**
+   * C30 — p95 per-sample latency of the pinned run (see
+   * {@link RunIndexEntry.p95LatencyMs}). Additive; absent on baselines
+   * pinned before the field existed.
+   */
+  readonly p95LatencyMs?: number;
+  /**
+   * C30 — estimated cost of the pinned run (see
+   * {@link RunIndexEntry.costUsd}). Additive; absent on baselines pinned
+   * before the field existed and when the model had no pricing row.
+   */
+  readonly costUsd?: number;
   /** ISO-8601 timestamp of when the pin was written. */
   readonly ts: string;
 };

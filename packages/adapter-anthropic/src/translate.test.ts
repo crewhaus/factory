@@ -79,6 +79,31 @@ describe("toAnthropicParams", () => {
     expect(params.thinking).toEqual({ type: "enabled", budget_tokens: 4096 });
   });
 
+  test("maps temperature onto the request (NEW-HUNT-2)", () => {
+    const params = toAnthropicParams({ ...baseReq, temperature: 0 }, false);
+    expect(params.temperature).toBe(0);
+    const warm = toAnthropicParams({ ...baseReq, temperature: 0.7 }, false);
+    expect(warm.temperature).toBe(0.7);
+  });
+
+  test("omits temperature when the request does not set it", () => {
+    const params = toAnthropicParams(baseReq, false);
+    expect("temperature" in params).toBe(false);
+  });
+
+  test("drops temperature when extended thinking is enabled (API constraint)", () => {
+    const explicit = toAnthropicParams(
+      { ...baseReq, temperature: 0, thinking: { type: "enabled", budgetTokens: 4096 } },
+      false,
+    );
+    expect("temperature" in explicit).toBe(false);
+    const viaEffort = toAnthropicParams(
+      { ...baseReq, temperature: 0, reasoningEffort: "low" },
+      false,
+    );
+    expect("temperature" in viaEffort).toBe(false);
+  });
+
   test("omits tools key entirely when empty", () => {
     const params = toAnthropicParams({ ...baseReq, tools: [] }, false);
     expect(params.tools).toBeUndefined();

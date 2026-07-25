@@ -342,6 +342,73 @@ graders:
   });
 });
 
+describe("parseGradersConfig — llm_judge decoding fields (NEW-HUNT-2)", () => {
+  const JUDGE_YAML = (extra: string) => `
+graders:
+  - name: judge
+    type: llm_judge
+${extra}
+    rubric:
+      criteria:
+        - name: c1
+          description: ok
+          anchors: { 1: bad, 2: meh, 3: ok, 4: good, 5: great }
+`;
+
+  test("accepts rubric-level temperature and repeats; judgeSpec carries them", () => {
+    const { compiled } = parseGradersConfig(JUDGE_YAML("    temperature: 0.5\n    repeats: 3"));
+    expect(compiled[0]?.judgeSpec?.temperature).toBe(0.5);
+    expect(compiled[0]?.judgeSpec?.repeats).toBe(3);
+  });
+
+  test("backward compat: absent fields leave judgeSpec without the keys", () => {
+    const { compiled } = parseGradersConfig(JUDGE_YAML(""));
+    const judgeSpec = compiled[0]?.judgeSpec;
+    expect(judgeSpec).toBeDefined();
+    expect(judgeSpec !== undefined && "temperature" in judgeSpec).toBe(false);
+    expect(judgeSpec !== undefined && "repeats" in judgeSpec).toBe(false);
+  });
+
+  test("rejects out-of-range temperature", () => {
+    expect(() => parseGradersConfig(JUDGE_YAML("    temperature: 1.5"))).toThrow(
+      /invalid graders config/,
+    );
+    expect(() => parseGradersConfig(JUDGE_YAML("    temperature: -0.1"))).toThrow(
+      /invalid graders config/,
+    );
+  });
+
+  test("rejects even, zero, negative, and fractional repeats", () => {
+    expect(() => parseGradersConfig(JUDGE_YAML("    repeats: 2"))).toThrow(
+      /invalid graders config/,
+    );
+    expect(() => parseGradersConfig(JUDGE_YAML("    repeats: 0"))).toThrow(
+      /invalid graders config/,
+    );
+    expect(() => parseGradersConfig(JUDGE_YAML("    repeats: -3"))).toThrow(
+      /invalid graders config/,
+    );
+    expect(() => parseGradersConfig(JUDGE_YAML("    repeats: 1.5"))).toThrow(
+      /invalid graders config/,
+    );
+  });
+
+  test("accepts repeats: 1 (the explicit default) and pinned temperature: 0", () => {
+    const { compiled } = parseGradersConfig(JUDGE_YAML("    temperature: 0\n    repeats: 1"));
+    expect(compiled[0]?.judgeSpec?.temperature).toBe(0);
+    expect(compiled[0]?.judgeSpec?.repeats).toBe(1);
+  });
+
+  test("strict llm_judge entries: a typoed decoding key fails loudly, never silently strips", () => {
+    // A stripped `temperture:` would judge with the pinned defaults while
+    // the user believes their override applied.
+    expect(() => parseGradersConfig(JUDGE_YAML("    temperture: 0.5"))).toThrow(
+      /invalid graders config/,
+    );
+    expect(() => parseGradersConfig(JUDGE_YAML("    repeat: 3"))).toThrow(/invalid graders config/);
+  });
+});
+
 describe("parseGradersConfig — weight + combine (A4/A5)", () => {
   test("accepts a positive weight on every grader variant", () => {
     const { compiled } = parseGradersConfig(`

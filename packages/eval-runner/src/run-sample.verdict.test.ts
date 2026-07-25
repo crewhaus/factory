@@ -76,6 +76,34 @@ describe("runSample — test_verdict publication", () => {
     expect(seen[0]?.verdict).toBe("fail");
   });
 
+  test("an A3 abstained sample publishes verdict skip, not fail", async () => {
+    const runContext = createRunContext();
+    const seen = verdictsOn(runContext);
+    const invoker: AgentInvoker = async () => ({ agentOutput: "ok", events: [] });
+    // Abstaining judge + passing exact_match → sample outcome `abstained`
+    // (A3), which must reach bus consumers as "skip" so they stay consistent
+    // with the aggregates (abstained samples leave the pass-rate denominator).
+    const abstainingJudge: GraderEntry = {
+      name: "judge",
+      grader: async () => ({
+        passed: false,
+        score: 0,
+        rationale: "judge abstained: evidence insufficient",
+        abstained: true,
+      }),
+    };
+    await runSample({
+      sample: SAMPLE,
+      invoker,
+      graders: [...EXACT, abstainingJudge],
+      outDir: newTempRoot(),
+      model: "claude-test",
+      runContext,
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.verdict).toBe("skip");
+  });
+
   test("an invoker error publishes verdict error", async () => {
     const runContext = createRunContext();
     const seen = verdictsOn(runContext);

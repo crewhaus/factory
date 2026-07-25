@@ -42,6 +42,7 @@ export type AnthropicBedrockBody = {
   readonly tools?: ReadonlyArray<AnthropicTool>;
   readonly tool_choice?: AnthropicToolChoice;
   readonly thinking?: { type: "enabled"; budget_tokens: number };
+  readonly temperature?: number;
 };
 
 export function buildAnthropicBedrockBody(req: ProviderRequest): AnthropicBedrockBody {
@@ -54,6 +55,7 @@ export function buildAnthropicBedrockBody(req: ProviderRequest): AnthropicBedroc
     tools?: AnthropicTool[];
     tool_choice?: AnthropicToolChoice;
     thinking?: { type: "enabled"; budget_tokens: number };
+    temperature?: number;
   } = {
     anthropic_version: ANTHROPIC_BEDROCK_VERSION,
     max_tokens: req.maxTokens,
@@ -85,6 +87,17 @@ export function buildAnthropicBedrockBody(req: ProviderRequest): AnthropicBedroc
       type: "enabled",
       budget_tokens: EFFORT_THINKING_BUDGET_TOKENS[req.reasoningEffort],
     };
+  }
+  // NEW-HUNT-2 — map the sampling temperature (the judge pin), EXCEPT when
+  // extended thinking is (or will be) enabled: the Anthropic API rejects an
+  // explicit temperature alongside `thinking` (mirrors
+  // adapter-anthropic/translate.ts).
+  if (
+    req.temperature !== undefined &&
+    req.thinking === undefined &&
+    req.reasoningEffort === undefined
+  ) {
+    body.temperature = req.temperature;
   }
   return body as AnthropicBedrockBody;
 }

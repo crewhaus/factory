@@ -149,14 +149,21 @@ export function toolNamesFromEventsJsonl(text: string): string[] {
 /**
  * Strip runner/judge boilerplate from a grader rationale so clustering sees
  * the substance: the `[name: ✗]` combinator markers, the `judge=N (need
- * ≥M):` prefix. Infra noise ("grader threw: …", "agent invocation error:
- * …") returns "" — an outage is not a failure theme.
+ * ≥M):` prefix in all its shapes (single call, `median of k repeats`
+ * panels). Infra noise ("grader threw: …", "agent invocation error: …")
+ * returns "" — an outage is not a failure theme — and so do A3 `judge
+ * abstained` rationales: an abstention is a needs-human marker carrying no
+ * signal about WHAT the agent did wrong, so it must never seed a theme.
  */
 export function cleanRationale(rationale: string): string {
   let s = rationale.trim();
   if (s.startsWith("grader threw:") || s.startsWith("agent invocation error")) return "";
+  if (s.startsWith("judge abstained")) return "";
   s = s.replace(/\[[^\]]*: [✓✗]\]/g, " ");
-  s = s.replace(/judge=\d+(?:\.\d+)? \(need ≥\d+(?:\.\d+)?\):/g, " ");
+  // Covers `judge=4 (need ≥3):`, `judge=3.5 (median of 3 repeats
+  // [3, abstain, 4], agreement 1/2, need ≥4):` and a mid-string `judge
+  // abstained (… need ≥3):` (after combinator-marker stripping).
+  s = s.replace(/judge(?:=\d+(?:\.\d+)?| abstained) \([^)]*need ≥\d+(?:\.\d+)?\):/g, " ");
   return s.replace(/\s+/g, " ").trim();
 }
 
@@ -201,7 +208,8 @@ export function criterionEvidence(
  * Extract failure evidence + pass exemplars from one loaded eval run.
  * Samples are visited in sampleId order (determinism), errored/grader-threw
  * samples are skipped wholesale (infra noise, not a failure theme — the
- * same posture as triage's pin guards).
+ * same posture as triage's pin guards), and so are A3-abstained samples
+ * (needs-human, not a graded fail).
  */
 export function evidenceFromRun(run: LoadedRun): SuggestEvidence {
   const runId = run.summary.runId;
@@ -210,6 +218,11 @@ export function evidenceFromRun(run: LoadedRun): SuggestEvidence {
   const samples = [...run.summary.samples].sort((a, b) => a.sampleId.localeCompare(b.sampleId));
   for (const s of samples) {
     if (s.error !== undefined || s.graderError !== undefined) continue;
+    // A3 — abstained samples are needs-human, not failure evidence: the
+    // conservative `passed: false` placeholder means the judge DECLINED to
+    // score, so drafting rubrics from it would count a non-verdict as a
+    // graded fail (the exact don't-count-a-guess trap A3 exists to close).
+    if (s.grades.overall.abstained === true) continue;
     const perSample = run.perSample[sanitizeSampleId(s.sampleId)];
     if (s.grades.overall.passed) {
       passes.push({
@@ -222,6 +235,9 @@ export function evidenceFromRun(run: LoadedRun): SuggestEvidence {
     }
     for (const g of s.grades.perGrader) {
       if (g.passed) continue;
+      // A3 — a judge that abstained beside a genuinely failing grader:
+      // keep the real failure, skip the abstention placeholder.
+      if (g.abstained === true) continue;
       const text = cleanRationale(g.rationale);
       if (text === "") continue;
       failures.push({ sampleId: s.sampleId, runId, source: g.name, text, output: s.agentOutput });

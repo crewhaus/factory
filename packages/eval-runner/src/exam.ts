@@ -148,7 +148,15 @@ export function createExamRunner(opts: CreateExamRunnerOptions): ExamRunner {
       if (g.judgeSpec) {
         const rubric = loadRubric(g.judgeSpec.rubric);
         const model = g.judgeSpec.model ?? opts.judgeModel ?? opts.model;
-        return { name: g.name, grader: createJudgeGrader(rubric, { model }), weight: g.weight };
+        // NEW-HUNT-2 — same rubric-level decoding threading as runEval.
+        const grader = createJudgeGrader(rubric, {
+          model,
+          ...(g.judgeSpec.temperature !== undefined
+            ? { temperature: g.judgeSpec.temperature }
+            : {}),
+          ...(g.judgeSpec.repeats !== undefined ? { repeats: g.judgeSpec.repeats } : {}),
+        });
+        return { name: g.name, grader, weight: g.weight };
       }
       // v0.3.0 final integration (PR 17 ∩ PR 19): `type: registry` graders
       // resolve against RunEvalOptions.graderRegistry — a seam run_exam does

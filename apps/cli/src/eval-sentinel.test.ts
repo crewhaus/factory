@@ -255,4 +255,80 @@ describe("evaluateSentinel", () => {
     expect(r.alert).toBe(true);
     expect(r.diff?.scoreShifts.length).toBe(1);
   });
+
+  // NEW-HUNT-3 — a budget-aborted run records its unexecuted samples as
+  // synthetic errors; with every hash equal those flips previously read as
+  // PROVIDER drift. They must read as not-comparable (budget exhaustion is
+  // systematic, not model behaviour).
+  function markPartial(run: LoadedRun, completedSamples: number, totalSamples: number): LoadedRun {
+    return {
+      ...run,
+      summary: {
+        ...run.summary,
+        partial: {
+          reason: "budget_exhausted",
+          completedSamples,
+          totalSamples,
+          spentUsd: 2.5,
+          budgetUsd: 2,
+        },
+      },
+    };
+  }
+
+  test("current run budget-partial, frozen hashes, aborted-sample flip ⇒ not-comparable, NOT drift", () => {
+    const baseline = loaded(HASH_A, [sample("s1", true, 1), sample("s2", true, 1)]);
+    // s2 never ran — the runner recorded it as an errored fail. Pre-fix
+    // this exact shape produced verdict "drift".
+    const current = markPartial(
+      loaded(HASH_A, [sample("s1", true, 1), sample("s2", false, 0)]),
+      1,
+      2,
+    );
+    const r = evaluateSentinel({
+      baseline,
+      current,
+      baselineDatasetHash: DS_HASH,
+      currentDatasetHash: DS_HASH,
+    });
+    expect(r.verdict).toBe("not-comparable");
+    expect(r.alert).toBe(true);
+    expect(r.reason).toContain("budget exhausted after 1/2 samples");
+    expect(r.reason).not.toContain("provider drift");
+  });
+
+  test("baseline run budget-partial ⇒ not-comparable (re-pin from a full run)", () => {
+    const baseline = markPartial(
+      loaded(HASH_A, [sample("s1", true, 1), sample("s2", false, 0)]),
+      1,
+      2,
+    );
+    const current = loaded(HASH_A, [sample("s1", true, 1), sample("s2", true, 1)]);
+    const r = evaluateSentinel({
+      baseline,
+      current,
+      baselineDatasetHash: DS_HASH,
+      currentDatasetHash: DS_HASH,
+    });
+    expect(r.verdict).toBe("not-comparable");
+    expect(r.alert).toBe(true);
+    expect(r.reason).toContain("re-pin the baseline from a full run");
+  });
+
+  test("a changed instrument still wins over the partial marker (primary re-pin action first)", () => {
+    const baseline = loaded(HASH_A, [sample("s1", true, 1)], { gradersHash: "g-hash-1" });
+    const current = markPartial(
+      loaded(HASH_A, [sample("s1", true, 1)], { gradersHash: "g-hash-2" }),
+      0,
+      1,
+    );
+    const r = evaluateSentinel({
+      baseline,
+      current,
+      baselineDatasetHash: DS_HASH,
+      currentDatasetHash: DS_HASH,
+    });
+    expect(r.verdict).toBe("not-comparable");
+    expect(r.reason).toContain("graders config changed");
+  });
 });

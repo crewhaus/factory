@@ -61,6 +61,8 @@ import {
   buildMatrix,
   diffInstrumentWarnings,
   diffReports,
+  formatSignificanceLine,
+  formatSliceDeltaLines,
   formatUsd,
   hashDatasetFile,
   loadRun,
@@ -1769,6 +1771,11 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     // K times (seed-offset when --seed is set); aggregates gain pass@K /
     // pass^K and the per-sample results carry per-trial grades.
     { name: "repeats", takesValue: true },
+    // B13 — metadata keys to slice the results by (comma-separated; default
+    // family,difficulty,language,source — applied only where present in
+    // sample metadata as strings). Per-slice figures land in results.json
+    // (`slices`), the stdout block, and the report's slice table.
+    { name: "slice", takesValue: true },
     // Item 11 — benchmark matrix: run the same dataset+graders once per
     // model; each cell writes to <out>/<model-slug>/. Incompatible with
     // --gate/--no-promote (cells skip the run-history lineage entirely).
@@ -1778,6 +1785,18 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     // pinned (spec, dataset) baseline (regression-runner gate, strict
     // defaults: any pass-rate drop or sample-level pass→fail flip fails).
     { name: "gate", takesValue: false },
+    // C30 — pre-declared ops thresholds for the baseline gate: fail the
+    // verdict when p95 per-sample latency rose more than N ms vs the
+    // baseline, or when the run's estimated agent-model cost exceeds $F
+    // (exits non-zero under --gate). Absent = pass-rate/flip-only gating.
+    { name: "max-p95-latency-ms", takesValue: true },
+    { name: "max-cost-usd", takesValue: true },
+    // NEW-HUNT-3 — runtime ceilings, overriding the spec's own blocks:
+    // --sample-timeout-ms > limits.deadline_ms (per-sample watchdog),
+    // --budget-usd > budget.usd (run-level spend cap; queued samples abort
+    // at the cap and results.json is marked partial).
+    { name: "sample-timeout-ms", takesValue: true },
+    { name: "budget-usd", takesValue: true },
     // Run-history item 3 — keep the existing baseline pin instead of
     // auto-promoting this run on gate pass (also skips the first-run pin).
     { name: "no-promote", takesValue: false },
@@ -1835,6 +1854,9 @@ const EVAL_COVERAGE_SCHEMA: ParseArgsSchema = {
 const EVAL_REPORT_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "out", short: "o", takesValue: true },
+    // C29 — pins `diff`'s Monte Carlo significance draw + bootstrap CI
+    // (defaults to a fixed seed, so unseeded diffs are still deterministic).
+    { name: "seed", takesValue: true },
     // `history` / `baseline show` filters.
     { name: "spec", takesValue: true },
     { name: "dataset", takesValue: true },
@@ -2576,7 +2598,14 @@ function usageText(): string {
     "  eval <spec.yaml> --dataset <data>    run the agent against a dataset and grade",
     "       --graders <graders.yaml>       (deterministic graders + LLM-as-judge)",
     "       [--judge-model <model>] [--concurrency N] [--seed N] [-o <out-dir>]",
+    "       [--slice <k1,k2,...>]          per-slice results by metadata keys (default:",
+    "                                      family,difficulty,language,source when present)",
     "       [--gate]                       exit non-zero on regression vs the pinned baseline",
+    "       [--max-p95-latency-ms N]       gate: fail when p95 latency rose > N ms vs baseline",
+    "       [--max-cost-usd F]             gate: fail when the run's estimated cost exceeds $F",
+    "       [--sample-timeout-ms N]        per-sample wall-clock timeout (default: the spec's",
+    "       [--budget-usd F]               limits.deadline_ms) + run spend cap (default: the",
+    "                                      spec's budget.usd; queued samples abort at the cap)",
     "       [--no-promote]                 keep the existing baseline pin after this run",
     "       [--models <m1,m2,...>]         benchmark matrix: run the dataset once per model",
     "                                      (cells write to <out>/<model-slug>/; emits matrix.json",
@@ -2587,7 +2616,8 @@ function usageText(): string {
     "       [--sessions N|all] [--dataset <d>]  tool/MCP/bigram/compaction gaps ranked by prod",
     "       [-o <dir>] [--format text|html|json] frequency; json is a backlog for `dataset mine`",
     "  eval-report diff <prev> <new>        compare two eval runs and emit a diff report",
-    "       [-o <out-dir>]",
+    "       [-o <out-dir>] [--seed N]       (paired significance + per-slice deltas ride along;",
+    "                                      --seed pins the Monte Carlo draw)",
     "  eval-report history                  list recorded runs (.crewhaus/evals/index.jsonl)",
     "       [--spec <name>] [--dataset <name>]",
     "  eval-report baseline show            print pinned baselines (.crewhaus/evals/baselines.json)",
@@ -8946,8 +8976,11 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus eval <spec.yaml> --dataset <data> --graders <graders.yaml> " +
-        "[--judge-model <model>] [--concurrency N] [--seed N] [--repeats K] [-o <out-dir>] " +
+        "[--judge-model <model>] [--concurrency N] [--seed N] [--repeats K] " +
+        "[--slice <k1,k2,...>] [-o <out-dir>] " +
         "[--gate] [--no-promote] [--no-regressions] [--no-retry] [--allow-test-split] " +
+        "[--max-p95-latency-ms N] [--max-cost-usd F] " +
+        "[--sample-timeout-ms N] [--budget-usd F] " +
         "[--models <m1,m2,...>]\n" +
         "  --dataset takes a file path (jsonl/csv/yaml/http) or registry:<name>[@version][#split]\n" +
         "  — a Section 29 dataset-registry ref (.crewhaus/datasets, or CREWHAUS_DATASETS_DIR).\n" +
@@ -8963,6 +8996,31 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  pair pins the baseline; later runs auto-promote when the regression gate\n" +
         "  passes. --no-promote keeps the existing pin; --gate exits non-zero when the\n" +
         "  gate fails (any pass-rate drop or sample-level pass→fail flip).\n" +
+        "  --max-p95-latency-ms N / --max-cost-usd F declare ops thresholds for the same\n" +
+        "  baseline gate: the verdict FAILS (and exits non-zero under --gate) when p95\n" +
+        "  per-sample latency rose more than N ms vs the pinned baseline, or when this\n" +
+        "  run's estimated cost exceeds $F. Cost is projected from the run's agent-model\n" +
+        "  token totals through the same pricing table as the --models est_$ column (all\n" +
+        "  trials under --repeats; judge/grader calls are NOT metered — their token usage\n" +
+        "  is not yet captured); an unpriced model leaves cost unknown, so the cost gate\n" +
+        "  warns instead of failing. Like the regression gate, the thresholds compare\n" +
+        "  against the pinned baseline — the first run for a pair pins and is not gated.\n" +
+        "  Every run's index entry/baseline pin also records p95LatencyMs + costUsd\n" +
+        "  (additive fields). Incompatible with --sentinel/--models, which skip the gate.\n" +
+        "  --sample-timeout-ms N bounds each sample's AGENT INVOCATION to N ms of wall\n" +
+        "  clock: a timed-out sample records an errored result (artifacts still written)\n" +
+        "  instead of stalling a concurrency slot forever. Defaults to the spec's\n" +
+        "  limits.deadline_ms when declared; the rest of the spec's limits: ceilings\n" +
+        "  (turn/model-call timeouts, max_tool_iterations, loop_detection, ...) now also\n" +
+        "  apply inside each sample's loop exactly as `crewhaus run` applies them.\n" +
+        "  --budget-usd F caps the RUN's estimated agent-model spend: when accrued cost\n" +
+        "  reaches the cap, in-flight samples finish, queued samples abort with an\n" +
+        "  '[eval] budget exhausted after k/N samples' error, and results.json is marked\n" +
+        "  partial (completed samples keep their grades). Defaults to the spec's\n" +
+        "  budget.usd when declared — eval always STOPS at the cap (the block's\n" +
+        "  on_exceed: degrade ladder never applies to a measurement run). Judge/grader\n" +
+        "  spend is not metered, and an unpriced model disables enforcement with a\n" +
+        "  warning. Under --models, each cell meters its own cap.\n" +
         "  When the registry contains <specName>-regressions (pinned by `crewhaus optimize`),\n" +
         "  its samples are unioned into the dataset by default (dedupe by id, primary wins).\n" +
         "  When the union actually ADDS samples, datasetName/datasetHash reflect it\n" +
@@ -8985,6 +9043,22 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  0.6^K). Trials run sequentially inside each sample's concurrency slot, so a\n" +
         "  K-repeat run costs ~K× the wall clock and spend; the summary's\n" +
         "  tokens_all_trials makes the real spend visible.\n" +
+        "  --slice <k1,k2,...> slices the results by sample-metadata keys (default:\n" +
+        "  family,difficulty,language,source). A key applies only to samples carrying it\n" +
+        "  in metadata as a STRING; per-slice sample count / pass rate / mean score land\n" +
+        "  in results.json (slices), one stdout line per key, and the report's slice\n" +
+        "  table — a macro pass rate can hold while the hard slice collapses. Computed by\n" +
+        "  the runner, so matrix cells and target-eval bundles inherit the default keys.\n" +
+        "  The summary line carries closed-form 95% CIs on pass_rate (Wilson) and\n" +
+        "  mean_score (Student t) — at small n the point estimates alone overstate\n" +
+        "  certainty. Both are also stored in results.json (passRateCI95/meanScoreCI95)\n" +
+        "  and inherited by matrix cells.\n" +
+        "  llm_judge graders may ABSTAIN (insufficient evidence): if nothing else failed\n" +
+        "  the sample's outcome is `abstained` — excluded from the pass-rate denominator,\n" +
+        "  counted + id-listed as needs_human in results.json/stdout/report for\n" +
+        "  `crewhaus rate` follow-up, and excluded from the baseline gate's per-sample\n" +
+        "  flip comparison. Judge criterion scores are persisted per grade (detail) and\n" +
+        "  aggregated per criterion (criterionMeans + a `judge criteria` line).\n" +
         "  Graders with `type: registry` resolve against the default grader registry:\n" +
         "  the six specialty packs (continuity.*, twelve.*, nlg.*, semantic.similarity,\n" +
         "  multimodal.*, safety.*) plus .crewhaus/graders plugins, which win on name\n" +
@@ -9102,6 +9176,77 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     (Number.isNaN(repeats) || repeats < 1 || String(repeats) !== (repeatsFlag as string).trim())
   ) {
     die(`invalid --repeats "${repeatsFlag}" — must be a positive integer`);
+  }
+  // B13 — slice keys, comma-separated. Blank segments die loudly here
+  // (mirroring the runner's own guard) rather than silently slicing nothing.
+  const sliceFlag = args.flags["slice"];
+  let sliceKeys: string[] | undefined;
+  if (typeof sliceFlag === "string") {
+    sliceKeys = sliceFlag.split(",").map((k) => k.trim());
+    if (sliceKeys.length === 0 || sliceKeys.some((k) => k === "")) {
+      die(
+        `invalid --slice "${sliceFlag}" — comma-separated non-empty metadata keys, e.g. family,difficulty`,
+      );
+    }
+  }
+
+  // C30 — pre-declared gate thresholds, validated up front like canary's
+  // identically-named flags (a typo must die before any spend).
+  const maxP95Flag = args.flags["max-p95-latency-ms"];
+  let maxP95LatencyMs: number | undefined;
+  if (typeof maxP95Flag === "string") {
+    const v = Number(maxP95Flag);
+    if (!Number.isFinite(v) || v < 0) {
+      die(`invalid --max-p95-latency-ms "${maxP95Flag}" — must be a non-negative number of ms`);
+    }
+    maxP95LatencyMs = v;
+  }
+  const maxCostFlag = args.flags["max-cost-usd"];
+  let maxCostUsd: number | undefined;
+  if (typeof maxCostFlag === "string") {
+    const v = Number(maxCostFlag);
+    if (!Number.isFinite(v) || v < 0) {
+      die(`invalid --max-cost-usd "${maxCostFlag}" — must be a non-negative dollar amount`);
+    }
+    maxCostUsd = v;
+  }
+  // The thresholds are criteria of the (spec, dataset) baseline gate, which
+  // sentinel probes and matrix cells deliberately skip — reject the combos
+  // instead of silently ignoring the flags (assertMatrixFlagsCompatible's
+  // posture for --gate/--no-promote).
+  if (sentinel && (maxP95LatencyMs !== undefined || maxCostUsd !== undefined)) {
+    die(
+      "--sentinel has its own drift gate — --max-p95-latency-ms/--max-cost-usd apply only to the baseline regression gate",
+    );
+  }
+  if (matrixModels !== undefined && (maxP95LatencyMs !== undefined || maxCostUsd !== undefined)) {
+    die(
+      "--models is incompatible with --max-p95-latency-ms/--max-cost-usd — matrix cells skip the (spec, dataset) baseline gate",
+    );
+  }
+
+  // NEW-HUNT-3 — per-sample timeout + run budget overrides (flag > spec
+  // limits.deadline_ms / budget.usd; the runner re-validates, but dying
+  // here keeps a bad value loud BEFORE any dataset load, like --repeats).
+  const sampleTimeoutFlag = args.flags["sample-timeout-ms"];
+  let sampleTimeoutMs: number | undefined;
+  if (typeof sampleTimeoutFlag === "string") {
+    sampleTimeoutMs = Number.parseInt(sampleTimeoutFlag, 10);
+    if (
+      Number.isNaN(sampleTimeoutMs) ||
+      sampleTimeoutMs < 1 ||
+      String(sampleTimeoutMs) !== sampleTimeoutFlag.trim()
+    ) {
+      die(`invalid --sample-timeout-ms "${sampleTimeoutFlag}" — must be a positive integer`);
+    }
+  }
+  const budgetUsdFlag = args.flags["budget-usd"];
+  let budgetUsd: number | undefined;
+  if (typeof budgetUsdFlag === "string") {
+    budgetUsd = Number(budgetUsdFlag);
+    if (!Number.isFinite(budgetUsd) || budgetUsd <= 0) {
+      die(`invalid --budget-usd "${budgetUsdFlag}" — must be a positive dollar amount`);
+    }
   }
 
   const absSpec = resolve(specPath);
@@ -9235,8 +9380,11 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
       ...(concurrency !== undefined ? { concurrency } : {}),
       ...(seed !== undefined ? { seed } : {}),
       ...(repeats !== undefined ? { repeats } : {}),
+      ...(sliceKeys !== undefined ? { sliceKeys } : {}),
       ...(graderRegistry !== undefined ? { graderRegistry } : {}),
       ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
+      ...(sampleTimeoutMs !== undefined ? { sampleTimeoutMs } : {}),
+      ...(budgetUsd !== undefined ? { budgetUsd } : {}),
     });
   }
 
@@ -9262,8 +9410,15 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
       ...(concurrency !== undefined ? { concurrency } : {}),
       ...(seed !== undefined ? { seed } : {}),
       ...(repeats !== undefined ? { repeats } : {}),
+      ...(sliceKeys !== undefined ? { sliceKeys } : {}),
       ...(graderRegistry !== undefined ? { graderRegistry } : {}),
       ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
+      // NEW-HUNT-3 — spec limits./budget. overrides + the pricing seam the
+      // runner meters --budget-usd/budget.usd through (the same lookup that
+      // prices the --models est_$ column).
+      ...(sampleTimeoutMs !== undefined ? { sampleTimeoutMs } : {}),
+      ...(budgetUsd !== undefined ? { budgetUsd } : {}),
+      pricing: defaultMatrixPricing(),
     },
   });
   // With -o omitted the runner picks .crewhaus/evals/<runId> relative to the
@@ -9308,10 +9463,22 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     for (const line of evalRunOutputLines(summary, { retriedCount: sentinelRetried })) {
       process.stdout.write(`${line}\n`);
     }
+    if (summary.partial !== undefined) {
+      process.stdout.write(
+        `[eval] budget exhausted after ${summary.partial.completedSamples}/${summary.partial.totalSamples} samples — remaining samples recorded as errors; results.json marked partial\n`,
+      );
+    }
     process.stdout.write(`[eval] report: ${join(absOut, "index.html")}\n`);
     process.stdout.write(`[sentinel] ${result.verdict}: ${result.reason}\n`);
     if (result.alert) {
-      die(`sentinel drift detected — ${result.reason}`);
+      // Alerting verdicts exit non-zero either way, but the reason must be
+      // honest: a not-comparable probe (changed instrument, budget-partial
+      // run) is NOT evidence the provider drifted.
+      die(
+        result.verdict === "drift"
+          ? `sentinel drift detected — ${result.reason}`
+          : `sentinel not comparable — ${result.reason}`,
+      );
     }
     return;
   }
@@ -9357,7 +9524,22 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   for (const line of evalRunOutputLines(summary, { retriedCount })) {
     process.stdout.write(`${line}\n`);
   }
+  if (summary.partial !== undefined) {
+    process.stdout.write(
+      `[eval] budget exhausted after ${summary.partial.completedSamples}/${summary.partial.totalSamples} samples — remaining samples recorded as errors; results.json marked partial\n`,
+    );
+  }
   process.stdout.write(`[eval] report: ${join(absOut, "index.html")}\n`);
+
+  // C30 — this run's estimated cost, from its agent-model token totals
+  // through the SAME pricing seam as the --models est_$ column (cost-tracker
+  // table keyed by the model-router grammar). All-trials totals when
+  // --repeats ran — the real spend. Judge/grader tokens are not metered
+  // (their usage is not yet captured); a pricing miss leaves cost undefined,
+  // which records nothing and makes the cost gate warn instead of failing.
+  const costTokens = summary.aggregates.totalTokensAllTrials ?? summary.aggregates.totalTokens;
+  const costMicros = defaultMatrixPricing()(summary.config.model, costTokens);
+  const costUsd = costMicros !== undefined ? costMicros / 1_000_000 : undefined;
 
   // Run-history: append to the index, diff/gate against the pinned baseline,
   // and promote per policy (see apps/cli/src/eval-history.ts).
@@ -9372,6 +9554,10 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     outDir: absOut,
     gateRequested,
     promote,
+    // C30 — the run's estimated cost + the pre-declared ops thresholds.
+    ...(costUsd !== undefined ? { costUsd } : {}),
+    ...(maxP95LatencyMs !== undefined ? { maxP95LatencyMs } : {}),
+    ...(maxCostUsd !== undefined ? { maxCostUsd } : {}),
   });
   if (finish.gateFailed) {
     die(`eval --gate: ${finish.gateReason ?? "regression gate failed"}`);
@@ -9403,9 +9589,17 @@ async function runEvalMatrixCommand(opts: {
   readonly seed?: number;
   /** G15 — `--repeats`, threaded into every cell (per-cell pass@k/pass^k). */
   readonly repeats?: number;
+  /** B13 — `--slice`, threaded into every cell (per-cell slice figures). */
+  readonly sliceKeys?: ReadonlyArray<string>;
   /** G14 — the shared default registry, constructed once for all cells. */
   readonly graderRegistry?: GraderLookup;
   readonly judgeModel?: string;
+  /** NEW-HUNT-3 — `--sample-timeout-ms`, threaded into every cell
+   *  (overrides the spec's `limits.deadline_ms`). */
+  readonly sampleTimeoutMs?: number;
+  /** NEW-HUNT-3 — `--budget-usd`, threaded into every cell: each cell
+   *  meters its OWN cap (overrides the spec's `budget.usd`). */
+  readonly budgetUsd?: number;
 }): Promise<void> {
   const rootDir =
     typeof opts.outDirArg === "string"
@@ -9416,6 +9610,9 @@ async function runEvalMatrixCommand(opts: {
     `[eval] matrix: ${opts.models.length} models × ${opts.samples.length} samples ` +
       `(${opts.datasetName}) → ${rootDir}\n`,
   );
+
+  // One pricing lookup for the cells' budget metering AND the est_$ column.
+  const pricing = defaultMatrixPricing();
 
   const cells = await runMatrixCells({
     models: opts.models,
@@ -9433,8 +9630,14 @@ async function runEvalMatrixCommand(opts: {
           ...(opts.concurrency !== undefined ? { concurrency: opts.concurrency } : {}),
           ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
           ...(opts.repeats !== undefined ? { repeats: opts.repeats } : {}),
+          ...(opts.sliceKeys !== undefined ? { sliceKeys: opts.sliceKeys } : {}),
           ...(opts.graderRegistry !== undefined ? { graderRegistry: opts.graderRegistry } : {}),
           ...(opts.judgeModel !== undefined ? { judgeModel: opts.judgeModel } : {}),
+          // NEW-HUNT-3 — per-cell runtime ceilings + the pricing seam the
+          // cell's budget cap meters through.
+          ...(opts.sampleTimeoutMs !== undefined ? { sampleTimeoutMs: opts.sampleTimeoutMs } : {}),
+          ...(opts.budgetUsd !== undefined ? { budgetUsd: opts.budgetUsd } : {}),
+          pricing,
         },
       });
       // Same per-cell artifact set as a single-model run (results.json +
@@ -9444,7 +9647,7 @@ async function runEvalMatrixCommand(opts: {
     },
   });
 
-  const matrix = buildMatrix(cells, { pricing: defaultMatrixPricing() });
+  const matrix = buildMatrix(cells, { pricing });
   const rendered = renderMatrix(matrix);
   writeFileSync(join(rootDir, "matrix.json"), rendered.json);
   writeFileSync(join(rootDir, "index.html"), rendered.html);
@@ -9906,7 +10109,12 @@ async function runEvalReport(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus eval-report <action>\n" +
-        "  diff <prev> <new> [-o <out-dir>]            compare two eval runs and emit a diff report\n" +
+        "  diff <prev> <new> [-o <out-dir>] [--seed N] compare two eval runs and emit a diff report\n" +
+        "      prints the paired-significance line (pass-rate delta, 95% CI, p-value) and\n" +
+        "      per-slice deltas for slice keys both runs share; --seed pins the Monte Carlo\n" +
+        "      draw behind the significance figures (unseeded diffs use a fixed default, so\n" +
+        "      they are already deterministic). Significance is decision support — the\n" +
+        "      strict `eval --gate` verdict never consults it.\n" +
         "  history [--spec <name>] [--dataset <name>]  list recorded runs (.crewhaus/evals/index.jsonl)\n" +
         "  baseline show [--spec <n>] [--dataset <n>]  print pinned baselines (.crewhaus/evals/baselines.json)\n" +
         "  baseline set <runId>                        pin a recorded run as its (spec, dataset) baseline\n" +
@@ -9938,17 +10146,33 @@ async function runEvalReportDiff(args: ParsedArgs): Promise<void> {
   if (typeof prev !== "string" || typeof next !== "string") {
     die("eval-report diff: missing <prev> <new>");
   }
+  // C29 — --seed pins the significance test's Monte Carlo draw + bootstrap
+  // CI. Unseeded diffs use the package's fixed default, so they are already
+  // deterministic; a garbled value dies loudly rather than silently seeding 0.
+  const seedFlag = args.flags["seed"];
+  if (typeof seedFlag === "string" && !/^-?\d+$/.test(seedFlag)) {
+    die(`eval-report diff: --seed must be an integer (got "${seedFlag}")`);
+  }
+  const seed = typeof seedFlag === "string" ? Number.parseInt(seedFlag, 10) : undefined;
 
   const outArg = args.flags["out"];
-  const prevLoaded = await loadRun(prev);
-  const nextLoaded = await loadRun(next);
-  // NEW-HUNT-1 — the diff still renders, but when the two runs recorded
-  // different graders configs or judge models the deltas may be the
-  // instrument's, not the agent's. Warn on stderr so piped stdout stays clean.
-  for (const warning of diffInstrumentWarnings(prevLoaded, nextLoaded)) {
-    process.stderr.write(`[eval-report] warning: ${warning}\n`);
+  let result: ReturnType<typeof diffReports>;
+  try {
+    const prevLoaded = await loadRun(prev);
+    const nextLoaded = await loadRun(next);
+    // NEW-HUNT-1 — the diff still renders, but when the two runs recorded
+    // different graders configs or judge models the deltas may be the
+    // instrument's, not the agent's. Warn on stderr so piped stdout stays clean.
+    for (const warning of diffInstrumentWarnings(prevLoaded, nextLoaded)) {
+      process.stderr.write(`[eval-report] warning: ${warning}\n`);
+    }
+    result = diffReports(prevLoaded, nextLoaded, seed !== undefined ? { seed } : {});
+  } catch (err) {
+    // C29 — mismatched sample ids (and unreadable runs) are user errors:
+    // render the message cleanly instead of an uncaught stack trace.
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
   }
-  const result = diffReports(prevLoaded, nextLoaded);
 
   if (typeof outArg === "string") {
     const absOut = resolve(outArg);
@@ -9965,6 +10189,15 @@ async function runEvalReportDiff(args: ParsedArgs): Promise<void> {
       `score_shifts=${result.diff.scoreShifts.length} ` +
       `unchanged=${result.diff.unchanged}\n`,
   );
+  // C29 — the plain-language significance line (decision support; the
+  // strict gate above never consults it).
+  if (result.diff.significance !== undefined) {
+    process.stdout.write(`[eval-report] ${formatSignificanceLine(result.diff.significance)}\n`);
+  }
+  // B13 — per-slice deltas for the slice keys both runs share.
+  for (const line of formatSliceDeltaLines(result.diff.sliceDeltas ?? [])) {
+    process.stdout.write(`[eval-report] ${line}\n`);
+  }
 }
 
 /** Filter helper shared by `history` and `baseline show`. The dataset
@@ -10011,6 +10244,7 @@ function runEvalReportHistory(args: ParsedArgs): void {
       "mean_score",
       "samples",
       "retried",
+      "partial",
       "base",
       "outDir",
     ],
@@ -10024,6 +10258,9 @@ function runEvalReportHistory(args: ParsedArgs): void {
       String(e.sampleCount),
       // Additive field — entries recorded before it existed read as 0.
       String(e.retriedCount ?? 0),
+      // NEW-HUNT-3 — budget-aborted run: its pass_rate counts the aborted
+      // samples as errors, so the figure reads lower than a full run's.
+      e.partial === true ? "y" : "",
       pinnedRunIds.has(e.runId) ? "*" : "",
       e.outDir,
     ]),
@@ -17721,6 +17958,14 @@ function buildWatchmeJudgePhase(
         input: input.input,
         expectedOutput: undefined,
         agentOutput: input.output,
+        // A3 — watchme's `submit_score` tool schema below carries only
+        // score+rationale (its report roll-up has no abstained lane), so
+        // the abstention instructions must be omitted: told to abstain, the
+        // judge would set a field the strict tool schema forbids and the
+        // guessed score would be recorded as an authoritative verdict.
+        // Drop this (and add `abstain` to the schema) when the watchme
+        // report learns to route abstained turns to human review.
+        allowAbstain: false,
       });
       let verdict: { score: number; rationale: string } | undefined;
       const submitScore = buildTool({

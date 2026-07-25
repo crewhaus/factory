@@ -179,21 +179,43 @@ export async function runSample(args: {
 
   // Overall = the config's `combine:` policy over the per-grader results
   // (default `all`: AND of all graders, score = mean).
-  const overall = combineOverall(perGrader, graders, args.combine, error);
+  const combined = combineOverall(perGrader, graders, args.combine, error);
+
+  // A3 — the sample-outcome abstention rule (locked): an abstained judge
+  // verdict makes the sample outcome `abstained` UNLESS another grader
+  // failed — a deterministic fail is a real verdict and wins, but when
+  // everything else passed the overall verdict is genuinely UNKNOWN, so
+  // `passed: false` / `score: 0` become conservative placeholders and the
+  // run routes the sample to human review (needs_human) instead of counting
+  // a guess. An invoker error always wins over abstention (nothing gradeable
+  // ran). Note this deliberately also overrides an `any`-combine pass: with
+  // an abstaining judge on the panel the combined verdict is still built on
+  // an unknown, and a human confirming costs less than a wrong pass.
+  const sampleAbstained =
+    error === undefined &&
+    perGrader.some((g) => g.abstained === true) &&
+    perGrader.every((g) => g.abstained === true || g.passed);
+  const overall: GradeResult = sampleAbstained
+    ? { ...combined, passed: false, score: 0, abstained: true }
+    : combined;
 
   // Loop contract 0.4 (Batch C, G59) — publish the AgentFlow `test_verdict`
   // feedback signal from the grader outcome. A distinct event kind (not a
   // `tool_call_end`) so the optimizer can filter cheaply and OTel exporters
   // can route verdicts to a verdict dashboard. An invoker error is an
-  // `"error"` verdict (the run never produced a gradeable output); otherwise
-  // the AND-of-graders `overall.passed` maps to `pass`/`fail`. Additive: it
-  // does NOT touch the already-persisted events.jsonl / metrics / aggregates
-  // — it is a bus emit on the (optionally shared) run context.
+  // `"error"` verdict (the run never produced a gradeable output); an A3
+  // abstained sample is a `"skip"` (needs-human, not a graded fail — keeping
+  // bus consumers consistent with the aggregates, which drop abstained
+  // samples from the pass-rate denominator); otherwise the combined
+  // `overall.passed` maps to `pass`/`fail`. Additive: it does NOT touch the
+  // already-persisted events.jsonl / metrics / aggregates — it is a bus emit
+  // on the (optionally shared) run context.
   const verdict: TestVerdictEvent = {
     ...runContext.eventBus.envelope(),
     kind: "test_verdict",
     testId: sample.id,
-    verdict: error !== undefined ? "error" : overall.passed ? "pass" : "fail",
+    verdict:
+      error !== undefined ? "error" : sampleAbstained ? "skip" : overall.passed ? "pass" : "fail",
     reason: overall.rationale,
     durationMs: latencyMs,
   };
@@ -209,6 +231,10 @@ export async function runSample(args: {
     tokens,
     model,
     agentOutput,
+    // B13 — carry the sample's metadata into the result so slice
+    // aggregation (and downstream results.json readers) can group without
+    // re-joining the dataset.
+    ...(sample.metadata !== undefined ? { metadata: sample.metadata } : {}),
     grades: { overall, perGrader },
     metrics,
     ...(error !== undefined ? { error } : {}),

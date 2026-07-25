@@ -53,7 +53,12 @@ export type SentinelResult = {
  *   - `not-comparable` (alert): specHash, dataset-hash, judgeModel, or
  *     gradersHash differs — the spec, the sentinel data, or what "pass" means
  *     changed, so a diff cannot be attributed to the provider. Loud, not
- *     silent: a mis-pointed sentinel must not read green.
+ *     silent: a mis-pointed sentinel must not read green. Likewise when
+ *     EITHER run is budget-aborted (`summary.partial`, NEW-HUNT-3): its
+ *     unexecuted samples were recorded as synthetic errors by the harness
+ *     itself, so their flips are systematic budget exhaustion, not provider
+ *     behaviour — misreading them as drift is exactly the false alarm a
+ *     nightly sentinel cron must not raise.
  *   - `drift` (alert): every hash/model equal AND the diff shows a regression
  *     or a score shift ⇒ the provider silently changed model behaviour.
  *   - `clean` (no alert): every hash/model equal AND no regression / no score
@@ -103,6 +108,27 @@ export function evaluateSentinel(opts: {
       verdict: "not-comparable",
       alert: true,
       reason: `graders config changed since the baseline (gradersHash ${short(baseGradersHash)} → ${short(curGradersHash)}) — a sentinel probe requires byte-identical graders; re-pin the baseline against the current graders.yaml`,
+    };
+  }
+
+  // NEW-HUNT-3 — a run-level budget abort records every still-queued sample
+  // as a synthetic error (passed: false, score 0). Those flips are the
+  // harness stopping, not the provider changing, so a partial run on either
+  // side makes drift unassessable — report the real cause, never "drift".
+  const curPartial = opts.current.summary.partial;
+  if (curPartial !== undefined) {
+    return {
+      verdict: "not-comparable",
+      alert: true,
+      reason: `budget exhausted after ${curPartial.completedSamples}/${curPartial.totalSamples} samples mid-probe — aborted samples read as synthetic errors, so drift is not assessable; raise the budget (--budget-usd or the spec's budget.usd) and re-run`,
+    };
+  }
+  const basePartial = opts.baseline.summary.partial;
+  if (basePartial !== undefined) {
+    return {
+      verdict: "not-comparable",
+      alert: true,
+      reason: `baseline run ${opts.baseline.summary.runId} is partial (budget exhausted after ${basePartial.completedSamples}/${basePartial.totalSamples} samples) — its aborted samples are synthetic errors, not measurements; re-pin the baseline from a full run`,
     };
   }
 

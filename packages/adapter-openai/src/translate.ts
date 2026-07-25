@@ -99,6 +99,14 @@ export function toOpenAIChatParams(
     }
   }
 
+  // NEW-HUNT-2 — map the sampling temperature (the judge pin). Reasoning
+  // models (the `max_completion_tokens` branch) reject any non-default
+  // temperature with a 400, so the field rides only the standard-model
+  // path — same model-id split as the token-cap rename above.
+  if (req.temperature !== undefined && !usesMaxCompletionTokens(req.model)) {
+    params.temperature = req.temperature;
+  }
+
   return params;
 }
 

@@ -490,3 +490,14 @@ describe("toGeminiParams — Gemma models", () => {
     expect(props["note"]?.["nullable"]).toBe(true);
   });
 });
+
+describe("toGeminiParams — temperature (NEW-HUNT-2)", () => {
+  test("maps req.temperature onto generation config", () => {
+    expect(toGeminiParams({ ...baseReq, temperature: 0 }).config?.temperature).toBe(0);
+    expect(toGeminiParams({ ...baseReq, temperature: 0.7 }).config?.temperature).toBe(0.7);
+  });
+
+  test("omits temperature entirely when the request carries none", () => {
+    expect(toGeminiParams(baseReq).config?.temperature).toBeUndefined();
+  });
+});

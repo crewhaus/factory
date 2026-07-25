@@ -1,7 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ProviderRequest, StreamEvent } from "@crewhaus/adapter-anthropic";
+import type { ProviderAdapter, ProviderRequest, StreamEvent } from "@crewhaus/adapter-anthropic";
 import type { Sample } from "@crewhaus/eval-dataset";
 import { makeNaiveStubClient, makeSycophanticStubClient } from "./__test__/stub-client";
 import { JudgeError, buildJudgePrompt, createJudgeGrader, judge, loadRubric } from "./index";
@@ -291,6 +291,444 @@ describe("createJudgeGrader (T1)", () => {
       },
     );
     expect(result.passed).toBe(false);
+  });
+});
+
+describe("judge abstention (A3)", () => {
+  const RUN = {
+    agentOutput: "c",
+    events: [],
+    transcript: [],
+    toolCalls: [],
+    turns: 1,
+    latencyMs: 100,
+  };
+
+  test("prompt template instructs abstention over guessing", () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const p = buildJudgePrompt({
+      rubric,
+      input: "a",
+      expectedOutput: undefined,
+      agentOutput: "x",
+    });
+    expect(p.system).toContain("abstain: true");
+    expect(p.system).toContain("instead of guessing");
+    expect(p.user).toContain("abstain: true");
+  });
+
+  test("allowAbstain: false omits every abstention instruction (consumers without an abstain lane)", () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const p = buildJudgePrompt({
+      rubric,
+      input: "a",
+      expectedOutput: undefined,
+      agentOutput: "x",
+      allowAbstain: false,
+    });
+    // The judge must never be told to set a field the caller's submit_score
+    // schema forbids — a stripped `abstain` key would record the guessed
+    // score as an authoritative verdict.
+    expect(p.system).not.toContain("abstain");
+    expect(p.user).not.toContain("abstain");
+    // The injection hardening and tool-call instruction are untouched.
+    expect(p.system).toContain("DATA");
+    expect(p.system).toContain("submit_score");
+    expect(p.user).toContain(`<<<UNTRUSTED_${p.sentinel}>>>`);
+  });
+
+  test("judge() surfaces abstain + confidence from submit_score", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const adapter = makeNaiveStubClient(() => ({
+      score: 3,
+      rationale: "the agent output is empty — nothing to score",
+      criterion_scores: { correctness: 3 },
+      abstain: true,
+      confidence: 0.2,
+    }));
+    const result = await judge({
+      rubric,
+      sample: { id: "s1", input: "a", expected_output: "b" },
+      agentOutput: "",
+      adapter,
+    });
+    expect(result.abstain).toBe(true);
+    expect(result.confidence).toBe(0.2);
+    expect(result.score).toBe(3); // nominal best estimate still present
+  });
+
+  test("judge() defaults abstain to false and omits confidence when unreported", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const adapter = makeNaiveStubClient(() => ({
+      score: 4,
+      rationale: "ok",
+      criterion_scores: { correctness: 4 },
+    }));
+    const result = await judge({
+      rubric,
+      sample: { id: "s1", input: "a", expected_output: "b" },
+      agentOutput: "c",
+      adapter,
+    });
+    expect(result.abstain).toBe(false);
+    expect("confidence" in result).toBe(false);
+  });
+
+  test("judge() rejects an out-of-range confidence", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const adapter = makeNaiveStubClient(() => ({
+      score: 4,
+      rationale: "ok",
+      criterion_scores: { correctness: 4 },
+      confidence: 1.5,
+    }));
+    await expect(
+      judge({
+        rubric,
+        sample: { id: "s1", input: "a", expected_output: "b" },
+        agentOutput: "c",
+        adapter,
+      }),
+    ).rejects.toThrow(JudgeError);
+  });
+
+  test("judge() rejects a non-boolean abstain", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const adapter = makeNaiveStubClient(
+      () =>
+        ({
+          score: 4,
+          rationale: "ok",
+          criterion_scores: { correctness: 4 },
+          abstain: "yes",
+        }) as unknown as { score: 4; rationale: string; criterion_scores: Record<string, number> },
+    );
+    await expect(
+      judge({
+        rubric,
+        sample: { id: "s1", input: "a", expected_output: "b" },
+        agentOutput: "c",
+        adapter,
+      }),
+    ).rejects.toThrow(JudgeError);
+  });
+
+  test("createJudgeGrader maps an abstaining judge to an abstained grade", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const adapter = makeNaiveStubClient(() => ({
+      score: 3,
+      rationale: "expected output missing",
+      criterion_scores: { correctness: 3 },
+      abstain: true,
+      confidence: 0.1,
+    }));
+    const grader = createJudgeGrader(rubric, { adapter });
+    const result = await grader({ id: "s1", input: "a" }, RUN);
+    expect(result.abstained).toBe(true);
+    expect(result.passed).toBe(false);
+    expect(result.score).toBe(0);
+    expect(result.confidence).toBe(0.1);
+    expect(result.rationale).toContain("judge abstained");
+    expect(result.rationale).toContain("expected output missing");
+  });
+
+  test("backward compat: a normal verdict has NO abstained/confidence keys", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const adapter = makeNaiveStubClient(() => ({
+      score: 4,
+      rationale: "ok",
+      criterion_scores: { correctness: 4 },
+    }));
+    const grader = createJudgeGrader(rubric, { adapter });
+    const result = await grader({ id: "s1", input: "a", expected_output: "b" }, RUN);
+    // No abstained/confidence keys on a normal verdict — old consumers see
+    // the pre-A3 verdict fields plus A12's additive `detail` breakdown.
+    expect(Object.keys(result).sort()).toEqual(["detail", "passed", "rationale", "score"]);
+    expect(result.passed).toBe(true);
+    expect(result.score).toBeCloseTo(0.75);
+  });
+
+  test("confidence passes through on a normal (non-abstained) verdict", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const adapter = makeNaiveStubClient(() => ({
+      score: 5,
+      rationale: "great",
+      criterion_scores: { correctness: 5 },
+      confidence: 0.9,
+    }));
+    const grader = createJudgeGrader(rubric, { adapter });
+    const result = await grader({ id: "s1", input: "a", expected_output: "b" }, RUN);
+    expect(result.passed).toBe(true);
+    expect(result.confidence).toBe(0.9);
+    expect("abstained" in result).toBe(false);
+  });
+});
+
+describe("judge decoding — temperature pin + repeats (NEW-HUNT-2)", () => {
+  const RUN = {
+    agentOutput: "c",
+    events: [],
+    transcript: [],
+    toolCalls: [],
+    turns: 1,
+    latencyMs: 100,
+  };
+
+  /** Wrap a stub adapter so tests can capture each ProviderRequest. */
+  function withCapture(adapter: ProviderAdapter): {
+    adapter: ProviderAdapter;
+    requests: ProviderRequest[];
+  } {
+    const requests: ProviderRequest[] = [];
+    const baseStream = adapter.stream.bind(adapter);
+    return {
+      requests,
+      adapter: {
+        ...adapter,
+        stream: (req: ProviderRequest) => {
+          requests.push(req);
+          return baseStream(req);
+        },
+      },
+    };
+  }
+
+  test("judge() pins temperature 0 by default — visible in the adapter call", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const { adapter, requests } = withCapture(
+      makeNaiveStubClient(() => ({
+        score: 4,
+        rationale: "ok",
+        criterion_scores: { correctness: 4 },
+      })),
+    );
+    await judge({
+      rubric,
+      sample: { id: "s1", input: "a", expected_output: "b" },
+      agentOutput: "c",
+      adapter,
+    });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.temperature).toBe(0);
+  });
+
+  test("an explicit temperature overrides the pin", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const { adapter, requests } = withCapture(
+      makeNaiveStubClient(() => ({
+        score: 4,
+        rationale: "ok",
+        criterion_scores: { correctness: 4 },
+      })),
+    );
+    await judge({
+      rubric,
+      sample: { id: "s1", input: "a", expected_output: "b" },
+      agentOutput: "c",
+      adapter,
+      temperature: 0.7,
+    });
+    expect(requests[0]?.temperature).toBe(0.7);
+  });
+
+  test("createJudgeGrader threads temperature to every judge call", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const { adapter, requests } = withCapture(
+      makeNaiveStubClient(() => ({
+        score: 4,
+        rationale: "ok",
+        criterion_scores: { correctness: 4 },
+      })),
+    );
+    const grader = createJudgeGrader(rubric, { adapter, temperature: 0.3, repeats: 3 });
+    await grader({ id: "s1", input: "a", expected_output: "b" }, RUN);
+    expect(requests).toHaveLength(3);
+    for (const req of requests) expect(req.temperature).toBe(0.3);
+  });
+
+  test("backward compat: default options = exactly one call at temperature 0", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const { adapter, requests } = withCapture(
+      makeNaiveStubClient(() => ({
+        score: 4,
+        rationale: "ok",
+        criterion_scores: { correctness: 4 },
+      })),
+    );
+    const grader = createJudgeGrader(rubric, { adapter });
+    const result = await grader({ id: "s1", input: "a", expected_output: "b" }, RUN);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.temperature).toBe(0);
+    expect(result.rationale).toBe("judge=4 (need ≥4): ok");
+  });
+
+  test("rejects non-odd or non-positive repeats at grader build time", () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    expect(() => createJudgeGrader(rubric, { repeats: 2 })).toThrow(JudgeError);
+    expect(() => createJudgeGrader(rubric, { repeats: 0 })).toThrow(JudgeError);
+    expect(() => createJudgeGrader(rubric, { repeats: -3 })).toThrow(JudgeError);
+    expect(() => createJudgeGrader(rubric, { repeats: 1.5 })).toThrow(JudgeError);
+    expect(() => createJudgeGrader(rubric, { repeats: 3 })).not.toThrow();
+  });
+
+  test("repeats=3 takes the median score and records per-repeat scores + agreement", async () => {
+    const rubric = loadRubric(RUBRIC_YAML); // passing_score 4
+    const scores: Array<1 | 2 | 3 | 4 | 5> = [3, 4, 5];
+    let call = 0;
+    const adapter = makeNaiveStubClient(() => ({
+      score: scores[call++ % scores.length] as 1 | 2 | 3 | 4 | 5,
+      rationale: "panel",
+      criterion_scores: { correctness: 4 },
+    }));
+    const grader = createJudgeGrader(rubric, { adapter, repeats: 3 });
+    const result = await grader({ id: "s1", input: "a", expected_output: "b" }, RUN);
+    expect(result.passed).toBe(true); // median 4 ≥ 4
+    expect(result.score).toBeCloseTo(0.75); // (4-1)/4
+    expect(result.rationale).toContain("median of 3 repeats");
+    expect(result.rationale).toContain("[3, 4, 5]");
+    expect(result.rationale).toContain("agreement 1/3");
+    expect("abstained" in result).toBe(false);
+  });
+
+  test("repeats=3 modal agreement counts the panel's most common score", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const scores: Array<1 | 2 | 3 | 4 | 5> = [4, 4, 2];
+    let call = 0;
+    const adapter = makeNaiveStubClient(() => ({
+      score: scores[call++ % scores.length] as 1 | 2 | 3 | 4 | 5,
+      rationale: "panel",
+      criterion_scores: { correctness: 4 },
+    }));
+    const grader = createJudgeGrader(rubric, { adapter, repeats: 3 });
+    const result = await grader({ id: "s1", input: "a", expected_output: "b" }, RUN);
+    expect(result.passed).toBe(true); // median 4
+    expect(result.rationale).toContain("agreement 2/3");
+  });
+
+  test("a minority abstain is excluded from the median (mean of middle two on an even rest)", async () => {
+    const rubric = loadRubric(RUBRIC_YAML); // passing_score 4
+    const verdicts = [
+      { score: 3 as const, abstain: false },
+      { score: 3 as const, abstain: true },
+      { score: 4 as const, abstain: false },
+    ];
+    let call = 0;
+    const adapter = makeNaiveStubClient(() => {
+      const v = verdicts[call++ % verdicts.length] as (typeof verdicts)[number];
+      return {
+        score: v.score,
+        rationale: v.abstain ? "cannot tell" : "scored",
+        criterion_scores: { correctness: v.score },
+        ...(v.abstain ? { abstain: true } : {}),
+      };
+    });
+    const grader = createJudgeGrader(rubric, { adapter, repeats: 3 });
+    const result = await grader({ id: "s1", input: "a", expected_output: "b" }, RUN);
+    // Median over the scored pair [3, 4] = 3.5 → (3.5-1)/4.
+    expect(result.score).toBeCloseTo(0.625);
+    expect(result.passed).toBe(false); // 3.5 < 4
+    expect("abstained" in result).toBe(false); // minority abstain ≠ abstained verdict
+    expect(result.rationale).toContain("abstain");
+    expect(result.rationale).toContain("agreement 1/2");
+  });
+
+  test("a majority abstain makes the whole verdict abstained", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const abstains = [true, true, false];
+    let call = 0;
+    const adapter = makeNaiveStubClient(() => {
+      const abstain = abstains[call++ % abstains.length] === true;
+      return {
+        score: 5 as const,
+        rationale: abstain ? "no evidence" : "looks great",
+        criterion_scores: { correctness: 5 },
+        ...(abstain ? { abstain: true } : {}),
+      };
+    });
+    const grader = createJudgeGrader(rubric, { adapter, repeats: 3 });
+    const result = await grader({ id: "s1", input: "a", expected_output: "b" }, RUN);
+    expect(result.abstained).toBe(true);
+    expect(result.passed).toBe(false);
+    expect(result.score).toBe(0);
+    expect(result.rationale).toContain("2/3 repeats abstained");
+    expect(result.rationale).toContain("no evidence");
+  });
+
+  test("repeats average the reported confidences", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const confidences: Array<number | undefined> = [0.8, 0.4, undefined];
+    let call = 0;
+    const adapter = makeNaiveStubClient(() => {
+      const confidence = confidences[call++ % confidences.length];
+      return {
+        score: 4 as const,
+        rationale: "ok",
+        criterion_scores: { correctness: 4 },
+        ...(confidence !== undefined ? { confidence } : {}),
+      };
+    });
+    const grader = createJudgeGrader(rubric, { adapter, repeats: 3 });
+    const result = await grader({ id: "s1", input: "a", expected_output: "b" }, RUN);
+    expect(result.confidence).toBeCloseTo(0.6); // mean of the two reported
+  });
+});
+
+describe("criterion detail pass-through (A12)", () => {
+  const RUN = {
+    agentOutput: "c",
+    events: [],
+    transcript: [],
+    toolCalls: [],
+    turns: 1,
+    latencyMs: 100,
+  };
+
+  test("a single-call verdict carries criterion_scores as detail (raw 1–5)", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const adapter = makeNaiveStubClient(() => ({
+      score: 4,
+      rationale: "ok",
+      criterion_scores: { correctness: 4 },
+    }));
+    const grader = createJudgeGrader(rubric, { adapter });
+    const result = await grader({ id: "s1", input: "a", expected_output: "b" }, RUN);
+    expect(result.detail).toEqual({ correctness: 4 });
+  });
+
+  test("an abstained verdict carries NO detail (its criterion scores are guesses)", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const adapter = makeNaiveStubClient(() => ({
+      score: 3,
+      rationale: "cannot tell",
+      criterion_scores: { correctness: 3 },
+      abstain: true,
+    }));
+    const grader = createJudgeGrader(rubric, { adapter });
+    const result = await grader({ id: "s1", input: "a", expected_output: "b" }, RUN);
+    expect(result.abstained).toBe(true);
+    expect("detail" in result).toBe(false);
+  });
+
+  test("a panel means each criterion over the scored (non-abstaining) repeats", async () => {
+    const rubric = loadRubric(RUBRIC_YAML);
+    const verdicts = [
+      { score: 3 as const, criterion: 3, abstain: false },
+      { score: 5 as const, criterion: 5, abstain: true }, // excluded from detail
+      { score: 4 as const, criterion: 4, abstain: false },
+    ];
+    let call = 0;
+    const adapter = makeNaiveStubClient(() => {
+      const v = verdicts[call++ % verdicts.length] as (typeof verdicts)[number];
+      return {
+        score: v.score,
+        rationale: v.abstain ? "cannot tell" : "scored",
+        criterion_scores: { correctness: v.criterion },
+        ...(v.abstain ? { abstain: true } : {}),
+      };
+    });
+    const grader = createJudgeGrader(rubric, { adapter, repeats: 3 });
+    const result = await grader({ id: "s1", input: "a", expected_output: "b" }, RUN);
+    expect(result.detail).toEqual({ correctness: 3.5 }); // mean of 3 and 4
   });
 });
 

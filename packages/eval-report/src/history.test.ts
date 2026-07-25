@@ -117,6 +117,21 @@ describe("run index (index.jsonl)", () => {
     expect(legacy?.judgeModel).toBeUndefined();
   });
 
+  test("C30 — p95LatencyMs/costUsd round-trip when present and stay absent when omitted", () => {
+    const evalsDir = join(newTempRoot(), ".crewhaus", "evals");
+    appendRunIndex(
+      makeEntry("run_aaaa1111aaaa1111", { p95LatencyMs: 4200, costUsd: 0.0375 }),
+      evalsDir,
+    );
+    // A legacy-shaped entry (no ops fields) in the same index.
+    appendRunIndex(makeEntry("run_bbbb2222bbbb2222"), evalsDir);
+    const [ops, legacy] = readRunIndex(evalsDir);
+    expect(ops?.p95LatencyMs).toBe(4200);
+    expect(ops?.costUsd).toBe(0.0375);
+    expect(legacy?.p95LatencyMs).toBeUndefined();
+    expect(legacy?.costUsd).toBeUndefined();
+  });
+
   test("missing index file reads as empty", () => {
     expect(readRunIndex(join(newTempRoot(), "nope"))).toEqual([]);
   });
