@@ -10,7 +10,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getBaseline, readRunIndex } from "@crewhaus/eval-report";
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
-import { datasetFilterMatches, finishEvalRun, gateRuns } from "./eval-history";
+import {
+  abstainedSampleIds,
+  costGateReason,
+  datasetFilterMatches,
+  finishEvalRun,
+  gateRuns,
+} from "./eval-history";
 
 const TMP_ROOTS: string[] = [];
 function newTempRoot(): string {
@@ -109,8 +115,9 @@ function makeRun(
   runId: string,
   samples: SampleResult[],
   config: Partial<EvalRunSummary["config"]> = {},
+  p95LatencyMs = 100,
 ) {
-  const summary = makeSummary(runId, samples, join(ctx.root, runId), 100, config);
+  const summary = makeSummary(runId, samples, join(ctx.root, runId), p95LatencyMs, config);
   persistRun(summary);
   return summary;
 }
@@ -123,6 +130,9 @@ async function finish(
     promote?: boolean;
     datasetHash?: string;
     specSource?: string;
+    costUsd?: number;
+    maxP95LatencyMs?: number;
+    maxCostUsd?: number;
   } = {},
 ) {
   return finishEvalRun({
@@ -136,6 +146,9 @@ async function finish(
     evalsDir: ctx.evalsDir,
     write: ctx.write,
     warn: ctx.warn,
+    ...(opts.costUsd !== undefined ? { costUsd: opts.costUsd } : {}),
+    ...(opts.maxP95LatencyMs !== undefined ? { maxP95LatencyMs: opts.maxP95LatencyMs } : {}),
+    ...(opts.maxCostUsd !== undefined ? { maxCostUsd: opts.maxCostUsd } : {}),
   });
 }
 
@@ -529,6 +542,135 @@ describe("gateRuns — strict defaults", () => {
   });
 });
 
+/** A3 — an abstained sample result: placeholders + the abstained flag. */
+function makeAbstained(id: string): SampleResult {
+  const base = makeSample(id, false, 0);
+  return {
+    ...base,
+    grades: {
+      overall: { passed: false, score: 0, rationale: "judge abstained", abstained: true },
+      perGrader: [
+        { name: "quality", passed: false, score: 0, rationale: "abstain", abstained: true },
+      ],
+    },
+  };
+}
+
+/** Patch a summary's aggregates the way the runner would for abstention:
+ *  abstained samples leave the pass-rate denominator + fill needsHuman. */
+function withAbstainAggregates(summary: EvalRunSummary): EvalRunSummary {
+  const abstained = summary.samples.filter((s) => s.grades.overall.abstained === true);
+  const graded = summary.samples.length - abstained.length;
+  const passed = summary.samples.filter((s) => s.grades.overall.passed).length;
+  return {
+    ...summary,
+    aggregates: {
+      ...summary.aggregates,
+      passRate: graded === 0 ? 0 : passed / graded,
+      ...(abstained.length > 0
+        ? {
+            needsHuman: abstained.length,
+            needsHumanSampleIds: abstained.map((s) => s.sampleId),
+          }
+        : {}),
+    },
+  };
+}
+
+describe("gateRuns — abstained samples leave the flip comparison (A3)", () => {
+  const out = "/unused";
+
+  test("abstainedSampleIds unions both runs; old records contribute nothing", () => {
+    const prev = makeSummary("run_aaaa1111aaaa1111", [makeSample("a", true, 1)], out);
+    const next = makeSummary(
+      "run_bbbb2222bbbb2222",
+      [makeSample("a", true, 1), makeAbstained("b")],
+      out,
+    );
+    expect([...abstainedSampleIds(prev, next)]).toEqual(["b"]);
+    expect(abstainedSampleIds(prev, prev).size).toBe(0);
+  });
+
+  test("pass → abstained is NOT a regression: the gate passes", () => {
+    const prev = makeSummary(
+      "run_aaaa1111aaaa1111",
+      [makeSample("a", true, 1), makeSample("b", true, 1)],
+      out,
+    );
+    const next = withAbstainAggregates(
+      makeSummary("run_bbbb2222bbbb2222", [makeSample("a", true, 1), makeAbstained("b")], out),
+    );
+    const verdict = gateRuns(prev, next);
+    expect(verdict.verdict).toBe("pass");
+    expect(verdict.report.regressions).toHaveLength(0);
+  });
+
+  test("abstained in the PREV run is excluded the same way", () => {
+    const prev = withAbstainAggregates(
+      makeSummary("run_aaaa1111aaaa1111", [makeSample("a", true, 1), makeAbstained("b")], out),
+    );
+    // b now honestly fails — but its baseline verdict was UNKNOWN, so this
+    // is not a flip the gate may count.
+    const next = withAbstainAggregates(
+      makeSummary(
+        "run_bbbb2222bbbb2222",
+        [makeSample("a", true, 1), makeSample("b", false, 0)],
+        out,
+      ),
+    );
+    // Both sides' recorded pass rates are 1/1 vs 1/2 — the pass-RATE
+    // criterion still sees the honest drop and fails; the flip list must
+    // still exclude b.
+    const verdict = gateRuns(prev, next);
+    expect(verdict.report.regressions).toHaveLength(0);
+    expect(verdict.verdict).toBe("fail");
+    expect(verdict.reason).toMatch(/pass-rate dropped/);
+  });
+
+  test("a REAL regression beside an abstained sample still fails on the flip", () => {
+    const prev = makeSummary(
+      "run_aaaa1111aaaa1111",
+      [makeSample("a", true, 1), makeSample("b", true, 1), makeSample("c", false, 0)],
+      out,
+    );
+    const next = withAbstainAggregates(
+      makeSummary(
+        "run_bbbb2222bbbb2222",
+        [makeSample("a", false, 0), makeAbstained("b"), makeSample("c", true, 1)],
+        out,
+      ),
+    );
+    const verdict = gateRuns(prev, next);
+    expect(verdict.verdict).toBe("fail");
+    expect(verdict.report.regressions.map((r) => r.sampleId)).toEqual(["a"]);
+  });
+});
+
+describe("finishEvalRun — abstained exclusion note (A3)", () => {
+  test("says which samples were excluded from the flip comparison, then gates", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [
+      makeSample("a", true, 1),
+      makeSample("b", true, 1),
+    ]);
+    await finish(ctx, prev);
+
+    const next = withAbstainAggregates(
+      makeSummary(
+        "run_bbbb2222bbbb2222",
+        [makeSample("a", true, 1), makeAbstained("b")],
+        join(ctx.root, "run_bbbb2222bbbb2222"),
+      ),
+    );
+    persistRun(next);
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result.gateFailed).toBe(false);
+    const output = ctx.lines.join("\n");
+    expect(output).toContain("excluding 1 abstained sample(s) from the flip comparison: [b]");
+    expect(output).toContain("[eval] gate: PASS");
+  });
+});
+
 describe("finishEvalRun — retried count + zero-sample belt (F12 / F6)", () => {
   test("F12: the index entry records how many samples were retried", async () => {
     const ctx = newCtx();
@@ -558,6 +700,244 @@ describe("finishEvalRun — retried count + zero-sample belt (F12 / F6)", () => 
     await expect(finish(ctx, summary)).rejects.toThrow(/0-sample/);
     expect(readRunIndex(ctx.evalsDir)).toHaveLength(0);
     expect(getBaseline("concierge", "smoke", ctx.evalsDir)).toBeUndefined();
+  });
+});
+
+describe("finishEvalRun — C30 latency/cost gate thresholds + additive ops fields", () => {
+  test("index entry + baseline pin record p95LatencyMs and costUsd (additive)", async () => {
+    const ctx = newCtx();
+    const run = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {}, 350);
+    await finish(ctx, run, { costUsd: 1.25 });
+    const entry = readRunIndex(ctx.evalsDir)[0];
+    expect(entry?.p95LatencyMs).toBe(350);
+    expect(entry?.costUsd).toBe(1.25);
+    const pin = getBaseline("concierge", "smoke", ctx.evalsDir);
+    expect(pin?.p95LatencyMs).toBe(350);
+    expect(pin?.costUsd).toBe(1.25);
+  });
+
+  test("unknown cost records no costUsd field (tolerant of absence)", async () => {
+    const ctx = newCtx();
+    const run = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctx, run);
+    const entry = readRunIndex(ctx.evalsDir)[0];
+    expect(entry !== undefined && "costUsd" in entry).toBe(false);
+    const pin = getBaseline("concierge", "smoke", ctx.evalsDir);
+    expect(pin !== undefined && "costUsd" in pin).toBe(false);
+  });
+
+  test("--max-p95-latency-ms fails the gate when p95 rose past it — and passes inside it", async () => {
+    // Fail side of the line: rise of 400ms > threshold 300ms.
+    const ctxA = newCtx();
+    const prevA = makeRun(ctxA, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {}, 100);
+    await finish(ctxA, prevA);
+    const nextA = makeRun(ctxA, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)], {}, 500);
+    const failed = await finish(ctxA, nextA, { gateRequested: true, maxP95LatencyMs: 300 });
+    expect(failed.gateFailed).toBe(true);
+    expect(failed.gateReason).toMatch(/latency/);
+    // Fail → never promote.
+    expect(getBaseline("concierge", "smoke", ctxA.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+
+    // Pass side: the same rise under threshold 600ms.
+    const ctxB = newCtx();
+    const prevB = makeRun(ctxB, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {}, 100);
+    await finish(ctxB, prevB);
+    const nextB = makeRun(ctxB, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)], {}, 500);
+    const passed = await finish(ctxB, nextB, { gateRequested: true, maxP95LatencyMs: 600 });
+    expect(passed.gateFailed).toBe(false);
+    expect(ctxB.lines.join("\n")).toContain("[eval] gate: PASS");
+    expect(getBaseline("concierge", "smoke", ctxB.evalsDir)?.runId).toBe("run_bbbb2222bbbb2222");
+  });
+
+  test("absent flags keep today's behavior — a huge latency rise still passes", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {}, 100);
+    await finish(ctx, prev);
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)], {}, 60_000);
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result.gateFailed).toBe(false);
+    expect(ctx.lines.join("\n")).toContain("[eval] gate: PASS");
+  });
+
+  test("--max-cost-usd fails the gate when the run cost exceeds it — and passes at the ceiling", async () => {
+    const ctxA = newCtx();
+    const prevA = makeRun(ctxA, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctxA, prevA);
+    const nextA = makeRun(ctxA, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
+    const failed = await finish(ctxA, nextA, {
+      gateRequested: true,
+      costUsd: 2.5,
+      maxCostUsd: 2,
+    });
+    expect(failed.gateFailed).toBe(true);
+    expect(failed.gateReason).toContain("run cost $2.5000 exceeded --max-cost-usd $2.0000");
+    expect(getBaseline("concierge", "smoke", ctxA.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+
+    // AT the ceiling is within budget — only exceeding it fails.
+    const ctxB = newCtx();
+    const prevB = makeRun(ctxB, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctxB, prevB);
+    const nextB = makeRun(ctxB, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
+    const passed = await finish(ctxB, nextB, { gateRequested: true, costUsd: 2, maxCostUsd: 2 });
+    expect(passed.gateFailed).toBe(false);
+    expect(ctxB.lines.join("\n")).toContain("[eval] gate: PASS");
+  });
+
+  test("--max-cost-usd with an unknown run cost warns and does not gate", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctx, prev);
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
+    const result = await finish(ctx, next, { gateRequested: true, maxCostUsd: 2 });
+    expect(result.gateFailed).toBe(false);
+    expect(ctx.warnings.join("\n")).toContain("cost gate not applied");
+    expect(ctx.lines.join("\n")).toContain("[eval] gate: PASS");
+  });
+
+  test("a regression AND a cost breach compose into one joined FAIL reason", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [
+      makeSample("a", true, 1),
+      makeSample("b", true, 1),
+    ]);
+    await finish(ctx, prev);
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [
+      makeSample("a", true, 1),
+      makeSample("b", false, 0),
+    ]);
+    const result = await finish(ctx, next, {
+      gateRequested: true,
+      costUsd: 3,
+      maxCostUsd: 1,
+    });
+    expect(result.gateFailed).toBe(true);
+    expect(result.gateReason).toMatch(/pass-rate dropped/);
+    expect(result.gateReason).toContain("; run cost $3.0000 exceeded --max-cost-usd $1.0000");
+  });
+
+  test("costGateReason: undefined off both sides, reason only past the ceiling", () => {
+    expect(costGateReason(undefined, undefined)).toBeUndefined();
+    expect(costGateReason(5, undefined)).toBeUndefined();
+    expect(costGateReason(undefined, 5)).toBeUndefined();
+    expect(costGateReason(4.9999, 5)).toBeUndefined();
+    expect(costGateReason(5, 5)).toBeUndefined();
+    expect(costGateReason(5.0001, 5)).toContain("exceeded --max-cost-usd");
+  });
+});
+
+describe("finishEvalRun — partial (budget-exhausted) runs never become baselines (NEW-HUNT-3)", () => {
+  /** A budget-aborted run: `completed` samples ran, the rest were recorded
+   *  as synthetic errors by the runner before the summary was built. */
+  function makePartialRun(
+    ctx: Ctx,
+    runId: string,
+    samples: SampleResult[],
+    completedSamples: number,
+    config: Partial<EvalRunSummary["config"]> = {},
+  ): EvalRunSummary {
+    const base = makeSummary(runId, samples, join(ctx.root, runId), 100, config);
+    const summary: EvalRunSummary = {
+      ...base,
+      partial: {
+        reason: "budget_exhausted",
+        completedSamples,
+        totalSamples: samples.length,
+        spentUsd: 1.25,
+        budgetUsd: 1,
+      },
+    };
+    persistRun(summary);
+    return summary;
+  }
+
+  test("a partial FIRST run is indexed (marked partial) but pins NO baseline", async () => {
+    const ctx = newCtx();
+    // Sample "b" never ran — the runner recorded it as an errored fail.
+    const run = makePartialRun(
+      ctx,
+      "run_aaaa1111aaaa1111",
+      [makeSample("a", true, 1), makeSample("b", false, 0)],
+      1,
+    );
+    const result = await finish(ctx, run, { gateRequested: true });
+    expect(result.gateFailed).toBe(false); // no baseline to gate against
+    const index = readRunIndex(ctx.evalsDir);
+    expect(index).toHaveLength(1);
+    expect(index[0]?.partial).toBe(true);
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)).toBeUndefined();
+    expect(ctx.lines.join("\n")).toContain("partial run (budget exhausted) — baseline not pinned");
+  });
+
+  test("a full run's index entry carries NO partial field (additive)", async () => {
+    const ctx = newCtx();
+    await finish(ctx, makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]));
+    expect(readRunIndex(ctx.evalsDir)[0]?.partial).toBeUndefined();
+  });
+
+  test("a partial run never PROMOTES — even when its aborted samples were already failing in the baseline", async () => {
+    const ctx = newCtx();
+    // Baseline: a passes, b fails. The partial run aborts b (also a fail):
+    // no flip, flat pass rate — pre-fix this read gate-PASS and promoted.
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [
+      makeSample("a", true, 1),
+      makeSample("b", false, 0),
+    ]);
+    await finish(ctx, prev);
+    const next = makePartialRun(
+      ctx,
+      "run_bbbb2222bbbb2222",
+      [makeSample("a", true, 1), makeSample("b", false, 0)],
+      1,
+    );
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result.gateFailed).toBe(true);
+    expect(result.gateReason).toMatch(/partial \(budget exhausted after 1\/2 samples\)/);
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+    const out = ctx.lines.join("\n");
+    expect(out).toContain("gate: FAIL");
+    expect(out).toContain("baseline kept: run_aaaa1111aaaa1111");
+  });
+
+  test("without --gate a partial run still fails the printed verdict and keeps the baseline", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [
+      makeSample("a", true, 1),
+      makeSample("b", false, 0),
+    ]);
+    await finish(ctx, prev);
+    const next = makePartialRun(
+      ctx,
+      "run_bbbb2222bbbb2222",
+      [makeSample("a", true, 1), makeSample("b", false, 0)],
+      1,
+    );
+    const result = await finish(ctx, next, { gateRequested: false });
+    expect(result.gateFailed).toBe(false); // --gate absent → clean exit, as ever
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+    expect(ctx.lines.join("\n")).toContain("gate: FAIL");
+  });
+
+  test("a partial run does not pin the new-lineage paths either (instrument change)", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {
+      gradersHash: "g1".repeat(32),
+    });
+    await finish(ctx, prev);
+    // Instrument changed → new lineage would normally pin this run.
+    const next = makePartialRun(
+      ctx,
+      "run_bbbb2222bbbb2222",
+      [makeSample("a", true, 1), makeSample("b", false, 0)],
+      1,
+      { gradersHash: "g2".repeat(32) },
+    );
+    const result = await finish(ctx, next);
+    expect(result.gateFailed).toBe(false);
+    // Old pin survives untouched; the partial run pinned nothing.
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+    expect(ctx.lines.join("\n")).toContain(
+      "partial run (budget exhausted) — baseline not pinned (new lineage)",
+    );
   });
 });
 

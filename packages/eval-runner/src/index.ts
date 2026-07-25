@@ -34,6 +34,25 @@
  *   G47 — `llm_judge` rubrics without a `passing_score` gate on the
  *       calibrated cut from `.crewhaus/judge-calibration.json`.
  *
+ * Evals Wave 1 (measurement literacy):
+ *   B13 `sliceKeys` — per-slice aggregates over sample metadata string
+ *       values (`summary.slices`; default keys family/difficulty/language/
+ *       source), computed here so target-eval bundles inherit them.
+ *   C27 — closed-form 95% CIs on the aggregates (`passRateCI95` Wilson,
+ *       `meanScoreCI95` Student t; see `stats.ts`).
+ *   A12 — per-criterion judge means per grader (`criterionMeans`), from
+ *       the `detail` breakdown judge grades now carry.
+ *   A3  — an abstained judge verdict (nothing else failing) makes the
+ *       sample outcome `abstained`: out of the pass-rate denominator, into
+ *       the `needsHuman` bucket for human review.
+ *   NEW-HUNT-3 — the spec's `limits:` and `budget:` blocks are honored by
+ *       eval runs: `limits.deadline_ms` (or `--sample-timeout-ms`) bounds
+ *       each sample's agent invocation with a wall-clock watchdog, the
+ *       remaining `limits:` ceilings thread into the default invoker's
+ *       chat loop exactly as `crewhaus run` threads them, and `budget.usd`
+ *       (or `--budget-usd`) caps the RUN's accrued agent-model spend —
+ *       queued samples abort at the cap and the summary is marked partial.
+ *
  * Reference: build-roadmap.md §16; AGENT-LOOPS-PLAN.md.
  */
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -56,9 +75,13 @@ import { RunnerError } from "./errors";
 import { runSample } from "./run-sample";
 import { createSampleOutputWriter } from "./sample-output";
 import { Semaphore } from "./semaphore";
+import { DEFAULT_SLICE_KEYS, computeSlices, sampleAbstained } from "./slices";
+import { meanCI95, tCritical975, wilsonCI95 } from "./stats";
 import type {
   AgentInvoker,
   EvalAggregates,
+  EvalPricingFn,
+  EvalRunPartial,
   EvalRunSummary,
   GraderEntry,
   GraderLookup,
@@ -67,6 +90,7 @@ import type {
   SafetyViolationCounts,
   SampleMetrics,
   SampleResult,
+  SliceStats,
   TrialResult,
 } from "./types";
 import { type SharedAgentDeps, wireRunOnce } from "./wire-once";
@@ -74,6 +98,8 @@ import { type SharedAgentDeps, wireRunOnce } from "./wire-once";
 export type {
   AgentInvoker,
   EvalAggregates,
+  EvalPricingFn,
+  EvalRunPartial,
   EvalRunSummary,
   GraderEntry,
   GraderLookup,
@@ -82,10 +108,16 @@ export type {
   SafetyViolationCounts,
   SampleMetrics,
   SampleResult,
+  SliceStats,
   TrialResult,
 };
 export type { SharedAgentDeps };
 export { wireRunOnce };
+// B13 — metadata slice aggregation (runner-computed so bundles inherit it)
+// and the A3 abstained-outcome predicate downstream consumers share.
+export { DEFAULT_SLICE_KEYS, computeSlices, sampleAbstained };
+// C27 — the closed-form CI helpers behind passRateCI95 / meanScoreCI95.
+export { meanCI95, tCritical975, wilsonCI95 };
 // Loop contract 0.4 (Batch B, G14) — the default grader registry: the six
 // specialty packs + `.crewhaus/graders` plugins, shared by `runEval`'s
 // fallback and the CLI/optimizer/flywheel wiring.
@@ -207,7 +239,14 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         });
       }
       const model = g.judgeSpec.model ?? opts.judgeModel;
-      const grader = createJudgeGrader(rubric, model !== undefined ? { model } : {});
+      // NEW-HUNT-2 — thread the rubric-level decoding controls through
+      // (temperature defaults to the pinned 0 inside `judge`; repeats
+      // defaults to a single call).
+      const grader = createJudgeGrader(rubric, {
+        ...(model !== undefined ? { model } : {}),
+        ...(g.judgeSpec.temperature !== undefined ? { temperature: g.judgeSpec.temperature } : {}),
+        ...(g.judgeSpec.repeats !== undefined ? { repeats: g.judgeSpec.repeats } : {}),
+      });
       return { name: g.name, grader, weight: g.weight };
     }
     if (g.registrySpec) {
@@ -244,8 +283,55 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   const combine = compiledGraders.find((g) => g.combine !== undefined)?.combine;
   warnUnconsumedCombinePolicy(compiledGraders);
 
-  // The default invoker calls runChatLoop with the per-sample fresh runContext.
-  const invoker = opts.invoker ?? (await defaultInvoker(ir, opts));
+  // NEW-HUNT-3 — per-sample wall-clock timeout: `--sample-timeout-ms` wins,
+  // else the spec's own `limits.deadline_ms` (in eval each sample IS one
+  // agent run, so the run-deadline ceiling maps per sample). Validated
+  // loudly at run start, matching the repeats guard below.
+  if (
+    opts.sampleTimeoutMs !== undefined &&
+    (!Number.isInteger(opts.sampleTimeoutMs) || opts.sampleTimeoutMs < 1)
+  ) {
+    throw new RunnerError(
+      `invalid sampleTimeoutMs ${JSON.stringify(opts.sampleTimeoutMs)} — must be an integer >= 1`,
+    );
+  }
+  const sampleTimeoutMs = opts.sampleTimeoutMs ?? ir.limits?.deadlineMs;
+
+  // NEW-HUNT-3 — run-level budget cap: `--budget-usd` wins, else the spec's
+  // `budget.usd`. Eval always STOPS at the cap (never `degrade` — swapping
+  // models mid-run would corrupt the measurement). Enforcement needs the
+  // injected pricing seam AND a priced model; otherwise warn loudly once
+  // and run un-metered rather than guessing spend.
+  if (opts.budgetUsd !== undefined && (!Number.isFinite(opts.budgetUsd) || opts.budgetUsd <= 0)) {
+    throw new RunnerError(
+      `invalid budgetUsd ${JSON.stringify(opts.budgetUsd)} — must be a positive dollar amount`,
+    );
+  }
+  const budgetUsd =
+    opts.budgetUsd ?? (ir.budget !== undefined ? ir.budget.usdMicros / 1_000_000 : undefined);
+  let budgetMicros: number | undefined;
+  if (budgetUsd !== undefined) {
+    const probe = opts.pricing?.(ir.agent.model, { input: 0, output: 0 });
+    if (probe === undefined) {
+      logger.warn("eval_budget.unpriced", {
+        model: ir.agent.model,
+        budgetUsd,
+        reason:
+          opts.pricing === undefined
+            ? "no pricing seam supplied"
+            : "model has no pricing row — budget cap not enforced",
+      });
+    } else {
+      budgetMicros = Math.round(budgetUsd * 1_000_000);
+    }
+  }
+
+  // The default invoker calls runChatLoop with the per-sample fresh
+  // runContext; the watchdog wraps WHICHEVER invoker runs (default or
+  // caller-supplied) so a hung provider/tool loop can't stall a slot.
+  const baseInvoker = opts.invoker ?? (await defaultInvoker(ir, opts));
+  const invoker =
+    sampleTimeoutMs !== undefined ? withSampleTimeout(baseInvoker, sampleTimeoutMs) : baseInvoker;
 
   // G15 — trials per sample. Validated here so a bad flag value is a loud
   // config error at run start, never a silently-clamped surprise.
@@ -253,6 +339,15 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   if (!Number.isInteger(repeats) || repeats < 1) {
     throw new RunnerError(
       `invalid repeats ${JSON.stringify(opts.repeats)} — must be an integer >= 1`,
+    );
+  }
+
+  // B13 — slice keys. Same posture as repeats: a blank key is a loud config
+  // error at run start, never a silently-empty slice.
+  const sliceKeys = opts.sliceKeys ?? DEFAULT_SLICE_KEYS;
+  if (sliceKeys.some((k) => k.trim() === "")) {
+    throw new RunnerError(
+      `invalid sliceKeys ${JSON.stringify(opts.sliceKeys)} — keys must be non-empty strings`,
     );
   }
 
@@ -264,6 +359,25 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
     calibrationApplied.length > 0
       ? { judgeCalibration: { path: calibrationPath, applied: calibrationApplied } }
       : {};
+
+  // NEW-HUNT-2 — record the judge sampling params (defaults resolved:
+  // pinned temperature 0, single call) in the reproducibility manifest.
+  // Without this the pinned-0 default is invisible: pre- and post-pin
+  // run.json are indistinguishable while judge verdicts shift. Present
+  // only when the run has `llm_judge` graders, so judge-less run.json /
+  // results.json stay byte-identical.
+  const judgeSampling = compiledGraders.flatMap((g) =>
+    g.judgeSpec !== undefined
+      ? [
+          {
+            name: g.name,
+            temperature: g.judgeSpec.temperature ?? 0,
+            repeats: g.judgeSpec.repeats ?? 1,
+          },
+        ]
+      : [],
+  );
+  const judgeSamplingConfig = judgeSampling.length > 0 ? { judgeSampling } : {};
 
   // Persist run-level config snapshot up front so SIGINT mid-run still leaves
   // a usable directory.
@@ -284,6 +398,9 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         concurrency,
         ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
         ...(repeats > 1 ? { repeats } : {}),
+        ...(sampleTimeoutMs !== undefined ? { sampleTimeoutMs } : {}),
+        ...(budgetUsd !== undefined ? { budgetUsd } : {}),
+        ...judgeSamplingConfig,
         ...judgeCalibrationConfig,
       },
       null,
@@ -319,6 +436,15 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
     return named !== undefined ? { ...r, failureClass: named.class } : r;
   };
 
+  // NEW-HUNT-3 — budget metering state: spend accrues (via the injected
+  // pricing seam) after every completed trial, and the pre-sample check
+  // below aborts queued samples once accrued spend reaches the cap.
+  // In-flight samples always complete — the same pre-unit posture as the
+  // run path's PRE-TURN budget check.
+  let spentMicros = 0;
+  let completedCount = 0;
+  const budgetAbortedIds = new Set<string>();
+
   const settled = await Promise.allSettled(
     samples.map(async (sample) => {
       const release = await sem.acquire();
@@ -329,6 +455,19 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
       if (interrupted) {
         release();
         throw new RunnerError(`run interrupted before sample "${sample.id}"`);
+      }
+      // NEW-HUNT-3 — budget gate, same posture as the interrupt check: a
+      // sample whose turn comes after the cap is reached aborts with the
+      // documented message and lands as an errored result; the summary is
+      // then marked partial (see below).
+      if (budgetMicros !== undefined && spentMicros >= budgetMicros) {
+        budgetAbortedIds.add(sample.id);
+        release();
+        throw new RunnerError(
+          `[eval] budget exhausted after ${completedCount}/${samples.length} samples — ` +
+            `$${(spentMicros / 1_000_000).toFixed(4)} spent >= $${(budgetMicros / 1_000_000).toFixed(4)} cap; ` +
+            `sample "${sample.id}" not run`,
+        );
       }
       try {
         // One trial: run the sample, then apply the bounded noise auto-retry
@@ -343,8 +482,8 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         // a `failure_taxonomy` entry that declares the class terminal (G54).
         const runTrial = async (trial: number): Promise<SampleResult> => {
           const seed = opts.seed !== undefined ? opts.seed + (trial - 1) : undefined;
-          const runOnce = () =>
-            runSample({
+          const runOnce = async () => {
+            const r = await runSample({
               sample,
               invoker,
               graders,
@@ -355,6 +494,14 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
               ...(seed !== undefined ? { seed } : {}),
               ...(trial > 1 ? { trial } : {}),
             });
+            // NEW-HUNT-3 — accrue this attempt's agent-model spend toward
+            // the budget cap (noise-retry attempts included — those tokens
+            // were really spent even though the result is replaced).
+            if (budgetMicros !== undefined) {
+              spentMicros += opts.pricing?.(ir.agent.model, r.tokens) ?? 0;
+            }
+            return r;
+          };
           const first = await runOnce();
           const infraNoise = first.error !== undefined || first.graderError !== undefined;
           if (!infraNoise || opts.retryErrors === false || interrupted) {
@@ -374,7 +521,10 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         // contribute per-trial grades + the sample's trial pass-rate. SIGINT
         // stops scheduling further trials (the rate is over completed ones).
         const first = await runTrial(1);
-        if (repeats === 1) return first;
+        if (repeats === 1) {
+          completedCount += 1;
+          return first;
+        }
         const results: SampleResult[] = [first];
         for (let trial = 2; trial <= repeats && !interrupted; trial++) {
           results.push(await runTrial(trial));
@@ -386,6 +536,9 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
           passed: r.grades.overall.passed,
           score: r.grades.overall.score,
           rationale: r.grades.overall.rationale,
+          // A3 — surface per-trial abstention; the trial still counts as
+          // not-passed in trialPassRate (conservative, like errored trials).
+          ...(r.grades.overall.abstained === true ? { abstained: true } : {}),
           latencyMs: r.latencyMs,
           tokens: r.tokens,
           ...(r.error !== undefined ? { error: r.error } : {}),
@@ -393,6 +546,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
           ...(r.retried !== undefined ? { retried: r.retried } : {}),
         }));
         const passCount = trials.filter((t) => t.passed).length;
+        completedCount += 1;
         return { ...first, trials, trialPassRate: passCount / trials.length };
       } finally {
         release();
@@ -425,6 +579,23 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
 
   const endedAt = new Date().toISOString();
   const aggregates = aggregate(results);
+  // B13 — per-slice aggregates over the samples' string metadata values.
+  // Absent when nothing sliced, keeping metadata-less runs byte-identical.
+  const slices = computeSlices(results, sliceKeys);
+
+  // NEW-HUNT-3 — mark the summary partial when the budget cap aborted
+  // queued samples: completed samples keep their real grades, aborted ones
+  // are the errored results carrying the budget message above.
+  const partial: EvalRunPartial | undefined =
+    budgetAbortedIds.size > 0 && budgetUsd !== undefined
+      ? {
+          reason: "budget_exhausted",
+          completedSamples: samples.length - budgetAbortedIds.size,
+          totalSamples: samples.length,
+          spentUsd: spentMicros / 1_000_000,
+          budgetUsd,
+        }
+      : undefined;
 
   const summary: EvalRunSummary = {
     runId,
@@ -432,6 +603,8 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
     endedAt,
     samples: results,
     aggregates,
+    ...(slices !== undefined ? { slices } : {}),
+    ...(partial !== undefined ? { partial } : {}),
     config: {
       specHash,
       datasetName: dataset.name,
@@ -443,6 +616,9 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
       concurrency,
       ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
       ...(repeats > 1 ? { repeats } : {}),
+      ...(sampleTimeoutMs !== undefined ? { sampleTimeoutMs } : {}),
+      ...(budgetUsd !== undefined ? { budgetUsd } : {}),
+      ...judgeSamplingConfig,
       ...judgeCalibrationConfig,
     },
     outDir,
@@ -500,6 +676,38 @@ function loadJudgeCalibration(
   return { minScore, specKey };
 }
 
+/**
+ * NEW-HUNT-3 — per-sample wall-clock watchdog around the agent invocation.
+ * Invoker-agnostic (default runChatLoop wrapper, target-eval bundles, test
+ * stubs alike): when the invocation outlives `timeoutMs` the wrapped call
+ * rejects with a clear timed-out error — which `runSample` records as a
+ * normal errored result with full artifacts — instead of stalling its
+ * concurrency slot forever. The losing invocation keeps running detached;
+ * its eventual settlement lands on an already-settled promise (a no-op).
+ */
+function withSampleTimeout(invoker: AgentInvoker, timeoutMs: number): AgentInvoker {
+  return (req) =>
+    new Promise((resolvePromise, reject) => {
+      const timer = setTimeout(() => {
+        reject(
+          new RunnerError(
+            `sample "${req.sample.id}" timed out after ${timeoutMs}ms (per-sample timeout — --sample-timeout-ms, or the spec's limits.deadline_ms)`,
+          ),
+        );
+      }, timeoutMs);
+      invoker(req).then(
+        (value) => {
+          clearTimeout(timer);
+          resolvePromise(value);
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      );
+    });
+}
+
 async function defaultInvoker(ir: IrV0, opts: RunEvalOptions): Promise<AgentInvoker> {
   const wired: SharedAgentDeps = await wireRunOnce(
     ir,
@@ -525,6 +733,10 @@ async function defaultInvoker(ir: IrV0, opts: RunEvalOptions): Promise<AgentInvo
   // line-buffered, sample-tagged sink; a sequential run keeps raw stdout so
   // its output stays byte-identical to `crewhaus run`.
   const fanOut = (opts.concurrency ?? DEFAULT_CONCURRENCY) > 1;
+  // NEW-HUNT-3 — the per-sample deadline the chat loop arms in-loop:
+  // flag > spec `limits.deadline_ms` (the same precedence as the runner's
+  // outer watchdog, so the two timers agree on the ceiling).
+  const sampleDeadlineMs = opts.sampleTimeoutMs ?? ir.limits?.deadlineMs;
   return async (req) => {
     let tools: RegisteredTool[] = [...wired.tools];
     let skills = wired.skills;
@@ -584,6 +796,31 @@ async function defaultInvoker(ir: IrV0, opts: RunEvalOptions): Promise<AgentInvo
           : {}),
         // Item 20 — this sample's own stdout sink while others run beside it.
         ...(sampleOut !== undefined ? { stdout: (chunk: string) => sampleOut.write(chunk) } : {}),
+        // NEW-HUNT-3 — the spec's `limits:` ceilings reach the IN-LOOP
+        // runtime exactly as `crewhaus run` threads them (the loop-contract
+        // option-name mapping): max_tool_iterations / max_concurrent_tools /
+        // context_limit / turn_timeout_ms / model_call_timeout_ms /
+        // loop_detection, plus deadline_ms as the per-sample run deadline
+        // (`--sample-timeout-ms` overrides it — same value the runner's
+        // outer watchdog enforces). Absent block ⇒ nothing spread, runtime
+        // defaults stay authoritative (byte-identical behavior).
+        ...(ir.limits?.maxToolIterations !== undefined
+          ? { maxToolIterations: ir.limits.maxToolIterations }
+          : {}),
+        ...(ir.limits?.maxConcurrentTools !== undefined
+          ? { maxConcurrentTools: ir.limits.maxConcurrentTools }
+          : {}),
+        ...(ir.limits?.contextLimit !== undefined ? { contextLimit: ir.limits.contextLimit } : {}),
+        ...(sampleDeadlineMs !== undefined ? { deadlineMs: sampleDeadlineMs } : {}),
+        ...(ir.limits?.turnTimeoutMs !== undefined
+          ? { turnTimeoutMs: ir.limits.turnTimeoutMs }
+          : {}),
+        ...(ir.limits?.modelCallTimeoutMs !== undefined
+          ? { modelCallTimeoutMs: ir.limits.modelCallTimeoutMs }
+          : {}),
+        ...(ir.limits?.loopDetection !== undefined
+          ? { loopDetection: ir.limits.loopDetection }
+          : {}),
         sessionName: `${wired.sessionName}_${req.sample.id}`,
         sessionTarget: wired.sessionTarget,
         runContext: req.runContext,

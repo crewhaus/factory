@@ -17,9 +17,25 @@
  * - The regression gate is strict by default: ANY pass-rate drop fails, and
  *   any sample-level pass→fail flip fails even when a recovery elsewhere
  *   cancels it out in the aggregates.
+ * - C30 — pre-declared ops thresholds join the gate verdict when the caller
+ *   declares them: `--max-p95-latency-ms` fails the gate when p95 latency
+ *   rose more than N ms vs the baseline (regression-runner's latency
+ *   criterion, un-disabled), and `--max-cost-usd` fails it when this run's
+ *   estimated cost exceeds the ceiling. Absent flags = pass-rate/flip-only,
+ *   byte-identical to before. p95 latency + estimated cost are also
+ *   recorded on every index entry/baseline pin (additive fields).
  * - Gate pass → auto-promote the new run to baseline (opt out with
  *   `--no-promote`); gate fail → never promote. `--gate` only controls
  *   whether a failing verdict maps to a non-zero exit.
+ * - NEW-HUNT-3 — a budget-aborted PARTIAL run is still appended to the
+ *   index (marked `partial: true` so readers can tell its deflated
+ *   passRate from a real one), but it is NEVER pinned or promoted as a
+ *   baseline on ANY path (first run, new lineage, gate-pass promotion):
+ *   its aborted samples are synthetic errors (passed: false, score 0),
+ *   not measurements, and a baseline seeded from them would make real
+ *   regressions read as recoveries forever after. Against an existing
+ *   baseline the gate verdict fails outright — an incomplete measurement
+ *   cannot honestly pass a pre-declared gate.
  */
 import { resolve } from "node:path";
 import {
@@ -50,6 +66,27 @@ export type FinishEvalOptions = {
   readonly specSource?: string;
   /** sha256 hex of the dataset file bytes. */
   readonly datasetHash: string;
+  /**
+   * C30 — this run's estimated cost in USD, projected from its agent-model
+   * token totals through the same pricing seam as the `--models` matrix
+   * `est_$` column (all trials under `--repeats`; judge/grader spend is not
+   * metered). Recorded on the index entry/baseline pin and compared against
+   * {@link maxCostUsd}. Absent when the model has no pricing row — the cost
+   * gate then warns instead of failing.
+   */
+  readonly costUsd?: number;
+  /**
+   * C30 — `--max-p95-latency-ms`: fail the baseline gate when p95
+   * per-sample latency rose more than this many ms vs the pinned baseline
+   * (threads into regression-runner's `latencyThreshold`, whose default
+   * here stays Infinity). Absent = latency not gated, today's behavior.
+   */
+  readonly maxP95LatencyMs?: number;
+  /**
+   * C30 — `--max-cost-usd`: fail the baseline gate when {@link costUsd}
+   * exceeds this ceiling. Absent = cost not gated, today's behavior.
+   */
+  readonly maxCostUsd?: number;
   /** Absolute path to the new run's output directory. */
   readonly outDir: string;
   /** `--gate`: map a failing gate verdict to a non-zero exit. */
@@ -82,21 +119,48 @@ export function datasetFilterMatches(filter: string, datasetName: string): boole
 }
 
 /**
+ * A3 — sample ids whose outcome was `abstained` in EITHER run (judge
+ * declined to score, nothing else failed). Such a sample's pass/fail is a
+ * placeholder awaiting a human verdict, so the flip comparison must not
+ * treat it as a real regression/recovery. Old records (no `abstained`
+ * field) contribute nothing — the set is empty and the gate is unchanged.
+ */
+export function abstainedSampleIds(prev: EvalRunSummary, next: EvalRunSummary): Set<string> {
+  const ids = new Set<string>();
+  for (const s of [...prev.samples, ...next.samples]) {
+    if (s.error === undefined && s.grades.overall.abstained === true) ids.add(s.sampleId);
+  }
+  return ids;
+}
+
+/**
  * Strict gate between a baseline run and a new run. Wraps
  * `regression-runner`'s `gate()` with `regressionThreshold: 0` (any
  * pass-rate drop fails) and additionally fails on sample-level regressions
  * that net out to a flat pass rate. The latency criterion is DISABLED by
  * default (threshold Infinity): the documented gate is pass-rate/flip-only,
  * and regression-runner's +5000ms p95 default would fail runs the docs say
- * pass. Latency gating arrives with explicit CLI flags later — callers can
- * already opt in via `thresholds.latencyThreshold`.
+ * pass. C30 — `crewhaus eval --max-p95-latency-ms N` is the explicit
+ * opt-in: `finishEvalRun` threads it in as `thresholds.latencyThreshold`,
+ * so the gate fails when p95 latency rose more than N ms vs the baseline.
+ *
+ * A3 — samples abstained in either run are excluded from the per-sample
+ * flip comparison (their verdict is UNKNOWN, not a fail — see
+ * {@link abstainedSampleIds}). The pass-RATE criterion still compares the
+ * runs' recorded aggregates, whose denominators already exclude each run's
+ * own abstained samples.
  */
 export function gateRuns(
   prev: EvalRunSummary,
   next: EvalRunSummary,
   thresholds: GateThresholds = {},
 ): GateVerdict {
-  const verdict = gate(prev, next, {
+  const abstained = abstainedSampleIds(prev, next);
+  const stripAbstained = (run: EvalRunSummary): EvalRunSummary =>
+    abstained.size === 0
+      ? run
+      : { ...run, samples: run.samples.filter((s) => !abstained.has(s.sampleId)) };
+  const verdict = gate(stripAbstained(prev), stripAbstained(next), {
     regressionThreshold: 0,
     latencyThreshold: Number.POSITIVE_INFINITY,
     ...thresholds,
@@ -110,6 +174,24 @@ export function gateRuns(
     };
   }
   return verdict;
+}
+
+/**
+ * C30 — the cost half of the pre-declared threshold gate: the failure
+ * reason when the run's estimated cost exceeds the declared ceiling,
+ * `undefined` when no ceiling was declared or it holds. A declared ceiling
+ * with an UNKNOWN run cost (no pricing row for the model) is NOT enforced —
+ * `finishEvalRun` warns instead, because failing a gate on a number nobody
+ * computed would be a guess.
+ */
+export function costGateReason(
+  costUsd: number | undefined,
+  maxCostUsd: number | undefined,
+): string | undefined {
+  if (maxCostUsd === undefined || costUsd === undefined || costUsd <= maxCostUsd) {
+    return undefined;
+  }
+  return `run cost $${costUsd.toFixed(4)} exceeded --max-cost-usd $${maxCostUsd.toFixed(4)}`;
 }
 
 /**
@@ -141,11 +223,24 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     specName,
     ...(specSource !== undefined ? { specSource } : {}),
     datasetHash: opts.datasetHash,
+    // C30 — the one column the shared recorder cannot derive: pricing needs
+    // the model catalogue, which the summary does not carry.
+    ...(opts.costUsd !== undefined ? { costUsd: opts.costUsd } : {}),
     outDir: absOut,
     ...(opts.evalsDir !== undefined ? { evalsDir: opts.evalsDir } : {}),
   });
 
   const pinCurrentRun = (label: string): void => {
+    // NEW-HUNT-3 — a budget-aborted run records its unexecuted samples as
+    // synthetic errors, so it is not an honest measurement of the spec:
+    // pinning it would seed every later gate with garbage (real
+    // regressions would read as recoveries against the deflated pin).
+    // Guarded HERE so every pin path — first run, new lineage, gate-pass
+    // promotion — refuses the same way.
+    if (summary.partial !== undefined) {
+      write(`[eval] partial run (budget exhausted) — baseline not pinned (${label})`);
+      return;
+    }
     if (!opts.promote) {
       write(`[eval] baseline not set (${label}; --no-promote)`);
       return;
@@ -159,6 +254,9 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
       datasetHash: opts.datasetHash,
       ...(gradersHash !== undefined ? { gradersHash } : {}),
       ...(judgeModel !== undefined ? { judgeModel } : {}),
+      // C30 — additive ops fields, mirroring the index entry.
+      p95LatencyMs: summary.aggregates.p95LatencyMs,
+      ...(opts.costUsd !== undefined ? { costUsd: opts.costUsd } : {}),
       ts: entry.ts,
     };
     setBaseline(pin, opts.evalsDir);
@@ -270,9 +368,47 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     );
   }
 
-  const verdict = gateRuns(prevLoaded.summary, nextLoaded.summary);
-  if (verdict.verdict === "fail") {
-    const reason = verdict.reason ?? "regression gate failed";
+  // A3 — say when the flip comparison is running on fewer samples than the
+  // diff above showed: abstained-in-either-run samples await a human
+  // verdict, so the gate must not count their placeholder fails as flips.
+  const abstained = abstainedSampleIds(prevLoaded.summary, nextLoaded.summary);
+  if (abstained.size > 0) {
+    write(
+      `[eval] gate: excluding ${abstained.size} abstained sample(s) from the flip comparison: ` +
+        `[${[...abstained].join(", ")}]`,
+    );
+  }
+
+  // C30 — pre-declared ops thresholds join the strict gate: the latency
+  // ceiling threads into regression-runner's (otherwise-Infinity) latency
+  // criterion, and the absolute cost ceiling is checked here (cost is not
+  // part of the run summaries regression-runner compares). A declared cost
+  // ceiling that cannot be checked (pricing miss → costUsd absent) warns
+  // loudly rather than failing on a number nobody computed.
+  const verdict = gateRuns(prevLoaded.summary, nextLoaded.summary, {
+    ...(opts.maxP95LatencyMs !== undefined ? { latencyThreshold: opts.maxP95LatencyMs } : {}),
+  });
+  if (opts.maxCostUsd !== undefined && opts.costUsd === undefined) {
+    warn(
+      "[eval] warning: --max-cost-usd declared but this run's cost is unknown (no pricing row for the model) — cost gate not applied",
+    );
+  }
+  const costReason = costGateReason(opts.costUsd, opts.maxCostUsd);
+  const failReasons: string[] = [];
+  // NEW-HUNT-3 — an incomplete measurement cannot honestly pass a
+  // pre-declared gate: the budget-aborted samples never ran, so "no
+  // regression" is unknowable. Without this a partial run whose aborted
+  // samples were ALREADY failing in the baseline flips nothing (fail→fail)
+  // and reads gate-PASS — a false green (and, pre-guard, a promotion).
+  if (summary.partial !== undefined) {
+    failReasons.push(
+      `run is partial (budget exhausted after ${summary.partial.completedSamples}/${summary.partial.totalSamples} samples) — an incomplete run cannot pass the gate`,
+    );
+  }
+  if (verdict.verdict === "fail") failReasons.push(verdict.reason ?? "regression gate failed");
+  if (costReason !== undefined) failReasons.push(costReason);
+  if (failReasons.length > 0) {
+    const reason = failReasons.join("; ");
     write(`[eval] gate: FAIL — ${reason}`);
     write(`[eval] baseline kept: ${baseline.runId}`);
     return opts.gateRequested ? { gateFailed: true, gateReason: reason } : { gateFailed: false };

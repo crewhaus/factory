@@ -1,3 +1,5 @@
+import { sampleAbstained } from "./slices";
+import { meanCI95, wilsonCI95 } from "./stats";
 import type { EvalAggregates, SafetyViolationCounts, SampleResult } from "./types";
 
 export function quantile(sorted: ReadonlyArray<number>, q: number): number {
@@ -46,13 +48,35 @@ const ZERO_SAFETY: SafetyViolationCounts = {
  * percentiles pool every individual `model_response` duration, and
  * `toolCallAccuracy` averages coverage over the samples that declare
  * `expected_tools` (absent when none do).
+ *
+ * Abstention honesty (A3): a sample whose outcome is `abstained` (judge
+ * declined, nothing else failed) is an UNKNOWN, not a fail — it leaves the
+ * `passRate` denominator and `meanScore` (its 0 score is a placeholder, not
+ * a measurement) and lands in `needsHuman`/`needsHumanSampleIds` for human
+ * review. Deliberately unchanged: turns/latency/token aggregates (the agent
+ * run itself was real), `partialScoreMean` (its whole point is the stable
+ * all-samples denominator), and pass@k/pass^k (an abstained trial is
+ * conservatively not-passed). Runs without abstention are byte-identical.
+ *
+ * C27: `passRateCI95` (Wilson) and `meanScoreCI95` (Student t) quantify how
+ * much the point estimates can be trusted at this n — attached whenever the
+ * data supports them (graded n ≥ 1, scored n ≥ 2 respectively).
  */
 export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates {
+  const abstainedIds = samples.filter(sampleAbstained).map((s) => s.sampleId);
+  // `ok` (non-errored) still includes abstained samples — their turns/
+  // latency/token measurements are real. `scored` (non-errored, graded)
+  // feeds the verdict-derived figures: passRate, meanScore, and both CIs.
   const ok = samples.filter((s) => s.error === undefined);
+  const scored = ok.filter((s) => !sampleAbstained(s));
   const total = samples.length;
-  const passed = ok.filter((s) => s.grades.overall.passed).length;
+  const gradedTotal = total - abstainedIds.length;
+  const passed = scored.filter((s) => s.grades.overall.passed).length;
+  const scoredScores = scored.map((s) => s.grades.overall.score);
   const meanScore =
-    ok.length === 0 ? 0 : ok.reduce((sum, s) => sum + s.grades.overall.score, 0) / ok.length;
+    scored.length === 0 ? 0 : scoredScores.reduce((a, b) => a + b, 0) / scored.length;
+  const passRateCI95 = wilsonCI95(passed, gradedTotal);
+  const meanScoreCI95 = meanCI95(scoredScores);
   const turnsSorted = ok.map((s) => s.turns).sort((a, b) => a - b);
   const latSorted = ok.map((s) => s.latencyMs).sort((a, b) => a - b);
   const totalTokens = ok.reduce(
@@ -118,8 +142,29 @@ export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates 
     );
   }
 
+  // A12 — per-criterion means per grader, over the grades that carried a
+  // `detail` breakdown (judge-backed graders on non-abstained verdicts).
+  const criterionAcc = new Map<string, Map<string, { sum: number; n: number }>>();
+  for (const s of ok) {
+    for (const g of s.grades.perGrader) {
+      if (g.detail === undefined) continue;
+      const byCriterion = criterionAcc.get(g.name) ?? new Map<string, { sum: number; n: number }>();
+      for (const [criterion, value] of Object.entries(g.detail)) {
+        const acc = byCriterion.get(criterion) ?? { sum: 0, n: 0 };
+        byCriterion.set(criterion, { sum: acc.sum + value, n: acc.n + 1 });
+      }
+      criterionAcc.set(g.name, byCriterion);
+    }
+  }
+  const criterionMeans: Record<string, Record<string, number>> = {};
+  for (const [grader, byCriterion] of criterionAcc) {
+    criterionMeans[grader] = Object.fromEntries(
+      [...byCriterion.entries()].map(([criterion, { sum, n }]) => [criterion, sum / n]),
+    );
+  }
+
   return {
-    passRate: total === 0 ? 0 : passed / total,
+    passRate: gradedTotal === 0 ? 0 : passed / gradedTotal,
     meanScore,
     p50Turns: quantile(turnsSorted, 0.5),
     p95Turns: quantile(turnsSorted, 0.95),
@@ -136,5 +181,11 @@ export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates 
     ...(passAtK !== undefined ? { passAtK } : {}),
     ...(passHatK !== undefined ? { passHatK } : {}),
     ...(totalTokensAllTrials !== undefined ? { totalTokensAllTrials } : {}),
+    ...(passRateCI95 !== undefined ? { passRateCI95 } : {}),
+    ...(meanScoreCI95 !== undefined ? { meanScoreCI95 } : {}),
+    ...(abstainedIds.length > 0
+      ? { needsHuman: abstainedIds.length, needsHumanSampleIds: abstainedIds }
+      : {}),
+    ...(Object.keys(criterionMeans).length > 0 ? { criterionMeans } : {}),
   };
 }

@@ -1,6 +1,7 @@
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
 import type { ReportDiff } from "./diff";
 import type { LoadedRun } from "./load";
+import { formatSignificanceLine } from "./significance";
 
 const STYLE = `
 :root {
@@ -22,6 +23,7 @@ th:hover { color: var(--link); }
 tr:last-child td { border-bottom: none; }
 .pass { color: var(--pass); font-weight: 600; }
 .fail { color: var(--fail); font-weight: 600; }
+.abstain { color: #ffb74d; font-weight: 600; }
 details { background: var(--card); margin: 12px 0; border-radius: 6px; padding: 0; border: 1px solid var(--border); }
 summary { padding: 12px 16px; cursor: pointer; user-select: none; }
 .drill { padding: 16px; border-top: 1px solid var(--border); }
@@ -92,6 +94,93 @@ ${body}
 </body></html>`;
 }
 
+/** C27 — `[87.2%, 99.0%]` / `[0.61, 0.79]` for the CI cards. */
+function formatCI(ci: readonly [number, number], asPct: boolean): string {
+  const fmt = (v: number) => (asPct ? `${(v * 100).toFixed(1)}%` : v.toFixed(3));
+  return `[${fmt(ci[0])}, ${fmt(ci[1])}]`;
+}
+
+/** A12 — a criterion mean on the raw 1–5 scale: `4` exact, `4.33` otherwise. */
+function formatCriterionMean(v: number): string {
+  return Number.isInteger(v) ? String(v) : v.toFixed(2);
+}
+
+/**
+ * B13 — the per-slice table: one row per (key, metadata value) with the
+ * slice's sample count, pass rate, and mean score. Rendered only when the
+ * summary carries `slices` (runs from pre-B13 CLIs, and metadata-less
+ * datasets, don't).
+ */
+function slicesSection(slices: NonNullable<EvalRunSummary["slices"]>): string {
+  const rows = Object.entries(slices)
+    .flatMap(([key, byValue]) =>
+      Object.entries(byValue).map(
+        ([value, stats]) => `
+<tr>
+  <td>${escapeHtml(key)}</td>
+  <td>${escapeHtml(value)}</td>
+  <td data-sort="${stats.sampleCount}">${stats.sampleCount}</td>
+  <td data-sort="${stats.passRate}">${(stats.passRate * 100).toFixed(1)}%</td>
+  <td data-sort="${stats.meanScore}">${stats.meanScore.toFixed(3)}</td>
+</tr>`,
+      ),
+    )
+    .join("");
+  return `
+<section class="diff-section" id="slices">
+  <h2>Slices</h2>
+  <table data-sortable>
+    <thead><tr><th>Key</th><th>Value</th><th>Samples</th><th>Pass rate</th><th>Mean score</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+</section>`;
+}
+
+/**
+ * A12 — per-criterion mean judge scores (raw 1–5 scale), one row per
+ * (grader, criterion). Rendered only when the aggregates carry
+ * `criterionMeans` (i.e. some judge grade carried a `detail` breakdown).
+ */
+function criterionSection(
+  means: NonNullable<EvalRunSummary["aggregates"]["criterionMeans"]>,
+): string {
+  const rows = Object.entries(means)
+    .flatMap(([grader, byCriterion]) =>
+      Object.entries(byCriterion).map(
+        ([criterion, mean]) => `
+<tr>
+  <td>${escapeHtml(grader)}</td>
+  <td>${escapeHtml(criterion)}</td>
+  <td data-sort="${mean}">${formatCriterionMean(mean)}</td>
+</tr>`,
+      ),
+    )
+    .join("");
+  return `
+<section class="diff-section" id="criteria">
+  <h2>Judge criteria (mean, 1–5)</h2>
+  <table data-sortable>
+    <thead><tr><th>Grader</th><th>Criterion</th><th>Mean score</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+</section>`;
+}
+
+/**
+ * A3 — the needs-human bucket: abstained samples awaiting a human verdict
+ * (excluded from the pass-rate denominator), id-listed for `crewhaus rate`.
+ */
+function needsHumanSection(a: EvalRunSummary["aggregates"]): string {
+  if (a.needsHuman === undefined || a.needsHuman === 0) return "";
+  const ids = (a.needsHumanSampleIds ?? []).map((id) => escapeHtml(id)).join(", ");
+  return `
+<section class="diff-section" id="needs-human">
+  <h2>Needs human (${a.needsHuman})</h2>
+  <p class="meta">The judge abstained on these samples (insufficient evidence) and nothing else failed —
+  they are excluded from the pass rate and await a human verdict (<code>crewhaus rate</code>): <span class="abstain">${ids}</span></p>
+</section>`;
+}
+
 function aggregateCards(s: EvalRunSummary): string {
   const a = s.aggregates;
   const cards = [
@@ -149,6 +238,17 @@ function aggregateCards(s: EvalRunSummary): string {
   if (a.p95ModelCallMs !== undefined) {
     cards.push({ label: "p95 model call", value: `${Math.round(a.p95ModelCallMs)}ms` });
   }
+  // C27 — closed-form 95% CIs; A3 — the needs-human bucket. All guarded:
+  // results.json from older CLIs lacks the fields.
+  if (a.passRateCI95 !== undefined) {
+    cards.push({ label: "Pass rate 95% CI", value: formatCI(a.passRateCI95, true) });
+  }
+  if (a.meanScoreCI95 !== undefined) {
+    cards.push({ label: "Mean score 95% CI", value: formatCI(a.meanScoreCI95, false) });
+  }
+  if (a.needsHuman !== undefined) {
+    cards.push({ label: "Needs human", value: String(a.needsHuman) });
+  }
   return `<section class="aggregate">${cards
     .map(
       (c) =>
@@ -176,7 +276,18 @@ function sampleColumnFlags(samples: ReadonlyArray<SampleResult>): SampleColumnFl
 }
 
 function sampleRow(s: SampleResult, cols: SampleColumnFlags): string {
-  const status = s.error ? "fail" : s.grades.overall.passed ? "pass" : "fail";
+  // A3 — an abstained sample is neither a pass nor a fail: the judge
+  // declined and nothing else failed, so the verdict awaits a human.
+  const abstained = s.error === undefined && s.grades.overall.abstained === true;
+  const status = abstained
+    ? "abstain"
+    : s.error
+      ? "fail"
+      : s.grades.overall.passed
+        ? "pass"
+        : "fail";
+  const statusText = abstained ? "ABSTAINED" : status.toUpperCase();
+  const statusSort = abstained ? 0.5 : status === "pass" ? 1 : 0;
   const scoreBar = `<span class="score-bar"><span style="width:${(s.grades.overall.score * 100).toFixed(0)}%"></span></span>`;
   const drillId = `drill-${escapeHtml(s.sampleId)}`;
   const trialsCell = (): string => {
@@ -203,7 +314,7 @@ function sampleRow(s: SampleResult, cols: SampleColumnFlags): string {
   return `
 <tr>
   <td>${escapeHtml(s.sampleId)}</td>
-  <td class="${status}" data-sort="${status === "pass" ? 1 : 0}">${status.toUpperCase()}</td>
+  <td class="${status}" data-sort="${statusSort}">${statusText}</td>
   <td data-sort="${s.grades.overall.score}">${scoreBar}${s.grades.overall.score.toFixed(2)}</td>${cols.trials ? trialsCell() : ""}${cols.toolAccuracy ? toolAccCell() : ""}${cols.interventions ? interventionsCell() : ""}${cols.safety ? safetyCell() : ""}
   <td data-sort="${s.turns}">${s.turns}</td>
   <td data-sort="${s.latencyMs}">${s.latencyMs}ms</td>
@@ -254,9 +365,15 @@ function metricsLine(s: SampleResult): string {
 function sampleDrill(s: SampleResult, perSample?: LoadedRun["perSample"][string]): string {
   const transcript = perSample?.transcript ?? "";
   const events = perSample?.events ?? "";
+  const verdict =
+    s.error === undefined && s.grades.overall.abstained === true
+      ? '<span class="abstain">ABSTAINED</span>'
+      : s.grades.overall.passed
+        ? '<span class="pass">PASS</span>'
+        : '<span class="fail">FAIL</span>';
   return `
 <details id="drill-${escapeHtml(s.sampleId)}">
-  <summary><strong>${escapeHtml(s.sampleId)}</strong> — ${s.grades.overall.passed ? '<span class="pass">PASS</span>' : '<span class="fail">FAIL</span>'} · score ${s.grades.overall.score.toFixed(2)}${s.error ? ` · <span class="fail">${escapeHtml(s.error)}</span>` : ""}${s.failureClass !== undefined ? ` · <span class="na">class: ${escapeHtml(s.failureClass)}</span>` : ""}</summary>
+  <summary><strong>${escapeHtml(s.sampleId)}</strong> — ${verdict} · score ${s.grades.overall.score.toFixed(2)}${s.error ? ` · <span class="fail">${escapeHtml(s.error)}</span>` : ""}${s.failureClass !== undefined ? ` · <span class="na">class: ${escapeHtml(s.failureClass)}</span>` : ""}</summary>
   <div class="drill">
     ${metricsLine(s)}${trialsTable(s)}
     <h3>Agent output</h3>
@@ -267,8 +384,16 @@ function sampleDrill(s: SampleResult, perSample?: LoadedRun["perSample"][string]
         (g) =>
           `<div class="grader-row">
             <span class="grader-name">${escapeHtml(g.name)}</span>
-            <span class="grader-score ${g.passed ? "pass" : "fail"}">${g.passed ? "✓" : "✗"} ${g.score.toFixed(2)}</span>
-            <span class="grader-rationale">${escapeHtml(g.rationale)}</span>
+            <span class="grader-score ${g.abstained === true ? "abstain" : g.passed ? "pass" : "fail"}">${g.abstained === true ? "?" : g.passed ? "✓" : "✗"} ${g.score.toFixed(2)}</span>
+            <span class="grader-rationale">${escapeHtml(g.rationale)}${
+              g.detail !== undefined
+                ? ` <span class="na">(${escapeHtml(
+                    Object.entries(g.detail)
+                      .map(([c, v]) => `${c}=${formatCriterionMean(v)}`)
+                      .join(" · "),
+                  )})</span>`
+                : ""
+            }</span>
           </div>`,
       )
       .join("")}
@@ -355,7 +480,7 @@ export function renderReport(
   const body = `
 <h1>Eval run ${escapeHtml(s.runId)}</h1>
 <p class="meta">Started ${escapeHtml(s.startedAt)} · ended ${escapeHtml(s.endedAt)} · model ${escapeHtml(s.config.model)} · concurrency ${s.config.concurrency}${s.config.judgeModel ? ` · judge ${escapeHtml(s.config.judgeModel)}` : ""}${s.config.repeats !== undefined ? ` · repeats ${s.config.repeats}` : ""}</p>
-${calibrationNote}${aggregateCards(s)}${opts.verdicts !== undefined ? triageSection(opts.verdicts) : ""}
+${calibrationNote}${aggregateCards(s)}${needsHumanSection(s.aggregates)}${s.slices !== undefined ? slicesSection(s.slices) : ""}${s.aggregates.criterionMeans !== undefined ? criterionSection(s.aggregates.criterionMeans) : ""}${opts.verdicts !== undefined ? triageSection(opts.verdicts) : ""}
 <table data-sortable>
   <thead><tr>
     <th>Sample</th><th>Status</th><th>Score</th>${extraHeaders}<th>Turns</th><th>Latency</th><th>Tokens (in/out)</th><th>Drill</th>
@@ -379,8 +504,20 @@ export function renderDiffHtml(
 ): string {
   // G15 — when a side carried repeat trials, show its per-sample pass-rate
   // beside the canonical verdict (the flip may be a pure reliability move).
-  const side = (v: { passed: boolean; score: number; passRate?: number }): string =>
-    `${v.passed ? '<span class="pass">PASS</span>' : '<span class="fail">FAIL</span>'} (${v.score.toFixed(2)})${v.passRate !== undefined ? ` · ${(v.passRate * 100).toFixed(0)}% of trials` : ""}`;
+  // A3 — an abstained side renders ABSTAINED: its FAIL is a placeholder.
+  const side = (v: {
+    passed: boolean;
+    score: number;
+    passRate?: number;
+    abstained?: boolean;
+  }): string =>
+    `${
+      v.abstained === true
+        ? '<span class="abstain">ABSTAINED</span>'
+        : v.passed
+          ? '<span class="pass">PASS</span>'
+          : '<span class="fail">FAIL</span>'
+    } (${v.score.toFixed(2)})${v.passRate !== undefined ? ` · ${(v.passRate * 100).toFixed(0)}% of trials` : ""}`;
   const flipRow = (e: ReportDiff["regressions"][number], cls: string): string => `
 <tr class="${cls}">
   <td>${escapeHtml(e.sampleId)}</td>
@@ -407,12 +544,49 @@ export function renderDiffHtml(
   }
 </section>`;
 
+  // B13 — per-slice deltas over the (key, value) slices both runs share.
+  const sliceDeltaSection =
+    diff.sliceDeltas === undefined
+      ? ""
+      : `
+<section class="diff-section">
+  <h2>Slice deltas (${diff.sliceDeltas.length})</h2>
+  <table data-sortable>
+    <thead><tr><th>Key</th><th>Value</th><th>Prev pass</th><th>New pass</th><th>Δ pass</th><th>Prev score</th><th>New score</th><th>n</th></tr></thead>
+    <tbody>${diff.sliceDeltas
+      .map((d) => {
+        const delta = d.next.passRate - d.prev.passRate;
+        const cls = delta < 0 ? "fail" : delta > 0 ? "pass" : "na";
+        return `
+<tr>
+  <td>${escapeHtml(d.key)}</td>
+  <td>${escapeHtml(d.value)}</td>
+  <td data-sort="${d.prev.passRate}">${(d.prev.passRate * 100).toFixed(1)}%</td>
+  <td data-sort="${d.next.passRate}">${(d.next.passRate * 100).toFixed(1)}%</td>
+  <td class="${cls}" data-sort="${delta}">${delta >= 0 ? "+" : ""}${(delta * 100).toFixed(1)}%</td>
+  <td data-sort="${d.prev.meanScore}">${d.prev.meanScore.toFixed(3)}</td>
+  <td data-sort="${d.next.meanScore}">${d.next.meanScore.toFixed(3)}</td>
+  <td data-sort="${d.next.sampleCount}">${d.prev.sampleCount === d.next.sampleCount ? d.next.sampleCount : `${d.prev.sampleCount}→${d.next.sampleCount}`}</td>
+</tr>`;
+      })
+      .join("")}</tbody>
+  </table>
+</section>`;
+
+  // C29 — the paired-significance line rides in the header as plain
+  // language (decision support; the strict flip sections below are the
+  // gate's view). Absent on diffs of runs with no comparable pairs.
+  const significanceNote =
+    diff.significance === undefined
+      ? ""
+      : `\n<p class="meta">Paired significance: ${escapeHtml(formatSignificanceLine(diff.significance))}</p>`;
+
   const body = `
 <h1>Diff: ${escapeHtml(diff.prevRunId)} → ${escapeHtml(diff.newRunId)}</h1>
-<p class="meta">Prev pass rate: ${(prev.aggregates.passRate * 100).toFixed(1)}% · New pass rate: ${(next.aggregates.passRate * 100).toFixed(1)}% · Unchanged: ${diff.unchanged}</p>
+<p class="meta">Prev pass rate: ${(prev.aggregates.passRate * 100).toFixed(1)}% · New pass rate: ${(next.aggregates.passRate * 100).toFixed(1)}% · Unchanged: ${diff.unchanged}</p>${significanceNote}
 ${section("Regressions (pass-rate dropped)", diff.regressions, "regression-row")}
 ${section("Recoveries (pass-rate rose)", diff.recoveries, "recovery-row")}
 ${section("Score shifts (|Δ| > 0.1)", diff.scoreShifts, "")}
-`;
+${sliceDeltaSection}`;
   return shell(`Diff ${diff.prevRunId} → ${diff.newRunId}`, body);
 }

@@ -120,6 +120,21 @@ describe("run index (index.jsonl)", () => {
     expect(legacy?.judgeModel).toBeUndefined();
   });
 
+  test("C30 — p95LatencyMs/costUsd round-trip when present and stay absent when omitted", () => {
+    const evalsDir = join(newTempRoot(), ".crewhaus", "evals");
+    appendRunIndex(
+      makeEntry("run_aaaa1111aaaa1111", { p95LatencyMs: 4200, costUsd: 0.0375 }),
+      evalsDir,
+    );
+    // A legacy-shaped entry (no ops fields) in the same index.
+    appendRunIndex(makeEntry("run_bbbb2222bbbb2222"), evalsDir);
+    const [ops, legacy] = readRunIndex(evalsDir);
+    expect(ops?.p95LatencyMs).toBe(4200);
+    expect(ops?.costUsd).toBe(0.0375);
+    expect(legacy?.p95LatencyMs).toBeUndefined();
+    expect(legacy?.costUsd).toBeUndefined();
+  });
+
   test("missing index file reads as empty", () => {
     expect(readRunIndex(join(newTempRoot(), "nope"))).toEqual([]);
   });
@@ -217,6 +232,9 @@ describe("recordEvalRun / runIndexEntryFromSummary", () => {
       passRate: 0.5,
       meanScore: 0.5,
       sampleCount: 2,
+      // C30's ops columns are derived here too, so the standalone bundle's
+      // history entry carries them exactly as the CLI's does.
+      p95LatencyMs: 100,
       retriedCount: 1,
       ts: "2026-07-01T00:00:30.000Z",
       outDir: "/abs/evals/run_cccc3333cccc3333",

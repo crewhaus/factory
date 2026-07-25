@@ -1824,6 +1824,9 @@ describe("emitChannelBot — evaluation block (loop contract 0.4, Batch B, G02)"
     expect(agent).toContain("evaluate: async ({ finalText }) => {");
     expect(agent).toContain("agentOutput: finalText,");
     expect(agent).toContain("(__verdict.score - 1) / 4");
+    // A3 — an abstaining judge scores 0 (a guess never passes the threshold).
+    expect(agent).toContain("if (__verdict.abstain) {");
+    expect(agent).toContain('"judge abstained: " + __verdict.rationale');
     expect(agent).toContain("evaluation: __evaluation,");
   });
 

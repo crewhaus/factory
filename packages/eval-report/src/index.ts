@@ -2,8 +2,10 @@
  * Catalog R-eval `eval-report` — render eval-runner output to HTML + JSON.
  *
  * Diff mode: `diffReports(prev, next)` highlights pass/fail flips and
- * score shifts above ε=0.1. Mismatched dataset shapes are rejected at load
- * time rather than silently aligned by index — sample IDs must match.
+ * score shifts above ε=0.1, plus a paired sign-flip significance test on
+ * the per-sample deltas (`significance.ts` — decision support only; the
+ * strict gate never consults it). Mismatched dataset shapes are rejected at
+ * load time rather than silently aligned by index — sample IDs must match.
  *
  * No HTML templating libraries; pure template strings with inlined CSS+JS.
  *
@@ -24,7 +26,24 @@ export {
   shell,
   escapeHtml,
 } from "./render";
-export { diffInstrumentWarnings, diffReports, type ReportDiff, type DiffEntry } from "./diff";
+export {
+  diffInstrumentWarnings,
+  diffReports,
+  formatSliceDeltaLines,
+  type ReportDiff,
+  type DiffEntry,
+  type DiffEntrySide,
+  type SliceDelta,
+} from "./diff";
+// C29 — paired significance on diffs: decision support beside the strict
+// gate (which is deliberately untouched by it).
+export {
+  DEFAULT_SIGNIFICANCE_SEED,
+  type DiffSignificance,
+  computeDiffSignificance,
+  formatSignificanceLine,
+  mulberry32,
+} from "./significance";
 // Matrix mode (item 11): fold per-model cells from `crewhaus eval --models`
 // into matrix.json + a best-per-metric-highlighted HTML table. Pricing is
 // injected via `MatrixPricingFn` to keep this package dependency-free.

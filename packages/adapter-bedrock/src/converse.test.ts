@@ -441,3 +441,19 @@ describe("translateConverseStream — stop reasons and errors", () => {
     ).rejects.toBe(inBand);
   });
 });
+
+describe("buildConverseRequest — temperature (NEW-HUNT-2)", () => {
+  test("maps req.temperature onto inferenceConfig", () => {
+    expect(buildConverseRequest({ ...baseReq, temperature: 0 }).inferenceConfig).toEqual({
+      maxTokens: 256,
+      temperature: 0,
+    });
+    expect(
+      buildConverseRequest({ ...baseReq, temperature: 0.7 }).inferenceConfig?.temperature,
+    ).toBe(0.7);
+  });
+
+  test("omits temperature entirely when the request carries none", () => {
+    expect(buildConverseRequest(baseReq).inferenceConfig).toEqual({ maxTokens: 256 });
+  });
+});

@@ -64,6 +64,17 @@ export function toAnthropicParams(
     params.tool_choice = toolChoiceToAnthropic(req.toolChoice);
   }
 
+  // NEW-HUNT-2 — map the pinned sampling temperature, EXCEPT when extended
+  // thinking is (or will be) enabled: the Anthropic API rejects any explicit
+  // temperature alongside `thinking`, so the thinking branches below win.
+  if (
+    req.temperature !== undefined &&
+    req.thinking === undefined &&
+    req.reasoningEffort === undefined
+  ) {
+    params.temperature = req.temperature;
+  }
+
   if (req.thinking !== undefined) {
     params.thinking = {
       type: "enabled",

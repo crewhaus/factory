@@ -208,6 +208,15 @@ export type ProviderRequest = {
    * control convert it via {@link EFFORT_THINKING_BUDGET_TOKENS}.
    */
   readonly reasoningEffort?: ReasoningEffort;
+  /**
+   * Evals hardening NEW-HUNT-2 — sampling temperature. Additive SPI field:
+   * adapters with a native control map it, others ignore it (capability-
+   * dependent, like `thinking`). `eval-judge` pins `0` here so judge
+   * verdicts are as deterministic as the provider allows. Adapters must
+   * drop it when extended thinking is enabled — Anthropic requires the
+   * default temperature alongside `thinking`.
+   */
+  readonly temperature?: number;
   readonly signal?: AbortSignal;
 };
 

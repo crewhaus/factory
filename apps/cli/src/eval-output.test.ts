@@ -11,11 +11,14 @@ import type { EvalAggregates, EvalRunSummary, SampleResult } from "@crewhaus/eva
 import {
   evalRunOutputLines,
   fitnessScore,
+  formatCriterionLines,
   formatEvalSummaryLine,
   formatFailureClassesLine,
   formatJudgeCalibrationLines,
   formatLoopMetricsLine,
+  formatNeedsHumanLine,
   formatRepeatsLine,
+  formatSliceLines,
   graderRegistryForCompiled,
 } from "./eval-output";
 
@@ -120,6 +123,81 @@ describe("formatEvalSummaryLine", () => {
     );
     expect(line).toContain("mean_score=0.750 partial_score=0.625 errors=1");
     expect(line).toContain("(2 retried)");
+  });
+
+  test("C27: the 95% CIs ride directly behind their point estimates", () => {
+    const line = formatEvalSummaryLine(
+      summary({
+        ...LEGACY_AGGREGATES,
+        passRateCI95: [0.4902, 0.9433],
+        meanScoreCI95: [0.61, 0.79],
+      }),
+      0,
+    );
+    expect(line).toContain("pass_rate=50.0% pass_rate_ci95=[49.0%,94.3%]");
+    expect(line).toContain("mean_score=0.750 mean_score_ci95=[0.610,0.790]");
+  });
+});
+
+describe("formatSliceLines (B13)", () => {
+  test("empty when the summary carries no slices", () => {
+    expect(formatSliceLines(summary(LEGACY_AGGREGATES))).toEqual([]);
+  });
+
+  test("one compact line per slice key", () => {
+    const s = summary(LEGACY_AGGREGATES, {
+      slices: {
+        difficulty: {
+          easy: { sampleCount: 4, passRate: 1, meanScore: 0.9 },
+          hard: { sampleCount: 5, passRate: 0.4, meanScore: 0.3 },
+        },
+        language: { de: { sampleCount: 2, passRate: 0.5, meanScore: 0.5 } },
+      },
+    });
+    expect(formatSliceLines(s)).toEqual([
+      "[eval] slice difficulty: easy 100.0% (n=4) · hard 40.0% (n=5)",
+      "[eval] slice language: de 50.0% (n=2)",
+    ]);
+  });
+});
+
+describe("formatCriterionLines (A12)", () => {
+  test("empty without criterionMeans", () => {
+    expect(formatCriterionLines(summary(LEGACY_AGGREGATES))).toEqual([]);
+  });
+
+  test("one line per judge grader; exact means render without decimals", () => {
+    const s = summary({
+      ...LEGACY_AGGREGATES,
+      criterionMeans: {
+        quality: { correctness: 4, tone: 4.333333 },
+        safety: { harmlessness: 5 },
+      },
+    });
+    expect(formatCriterionLines(s)).toEqual([
+      "[eval] judge criteria quality: correctness=4 tone=4.33",
+      "[eval] judge criteria safety: harmlessness=5",
+    ]);
+  });
+});
+
+describe("formatNeedsHumanLine (A3)", () => {
+  test("undefined when nothing abstained", () => {
+    expect(formatNeedsHumanLine(summary(LEGACY_AGGREGATES))).toBeUndefined();
+    expect(formatNeedsHumanLine(summary({ ...LEGACY_AGGREGATES, needsHuman: 0 }))).toBeUndefined();
+  });
+
+  test("counts + id-lists the abstained samples for rate follow-up", () => {
+    const line = formatNeedsHumanLine(
+      summary({
+        ...LEGACY_AGGREGATES,
+        needsHuman: 2,
+        needsHumanSampleIds: ["q3", "q7"],
+      }),
+    );
+    expect(line).toBe(
+      "[eval] needs_human=2: q3, q7 — judge abstained; review with `crewhaus rate`",
+    );
   });
 });
 
@@ -263,5 +341,28 @@ describe("evalRunOutputLines — the full block", () => {
     expect(lines[2]).toContain("[eval] repeats=2: pass@2=100.0% pass^2=50.0%");
     expect(lines[3]).toBe("[eval] failure classes: timeout=1");
     expect(lines[4]).toContain("judge calibration");
+  });
+
+  test("Wave 1 sections slot between repeats and failure classes, in order", () => {
+    const s = summary(
+      {
+        ...LEGACY_AGGREGATES,
+        criterionMeans: { quality: { correctness: 4 } },
+        needsHuman: 1,
+        needsHumanSampleIds: ["q9"],
+      },
+      {
+        samples: [sample("q1", { failureClass: "timeout", error: "deadline exceeded" })],
+        slices: { difficulty: { hard: { sampleCount: 3, passRate: 1 / 3, meanScore: 0.4 } } },
+      },
+    );
+    const lines = evalRunOutputLines(s, { retriedCount: 0 });
+    expect(lines).toEqual([
+      lines[0] as string, // summary line, asserted elsewhere
+      "[eval] slice difficulty: hard 33.3% (n=3)",
+      "[eval] judge criteria quality: correctness=4",
+      "[eval] needs_human=1: q9 — judge abstained; review with `crewhaus rate`",
+      "[eval] failure classes: timeout=1",
+    ]);
   });
 });

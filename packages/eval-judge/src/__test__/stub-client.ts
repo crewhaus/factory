@@ -22,6 +22,9 @@ export function makeNaiveStubClient(
     score: 1 | 2 | 3 | 4 | 5;
     rationale: string;
     criterion_scores: Record<string, number>;
+    /** A3 — optional abstention/confidence in the stub verdict. */
+    abstain?: boolean;
+    confidence?: number;
   },
 ): ProviderAdapter {
   return {

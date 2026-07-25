@@ -1317,6 +1317,10 @@ describe("emitCli — evaluation block (loop contract 0.4, Batch B, G02)", () =>
     expect(content).toContain("evaluate: async ({ finalText }) => {");
     expect(content).toContain("agentOutput: finalText,");
     expect(content).toContain("(__verdict.score - 1) / 4");
+    // A3 — an abstaining judge scores 0 (never passes the threshold as a
+    // nominal best-estimate guess); onFail applies as for a failed grade.
+    expect(content).toContain("if (__verdict.abstain) {");
+    expect(content).toContain('"judge abstained: " + __verdict.rationale');
     // and the option is threaded into runChatLoop
     expect(content).toContain("evaluation: __evaluation,");
   });

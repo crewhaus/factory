@@ -52,7 +52,13 @@ export type MatrixRow = {
   readonly runId?: string;
   readonly sampleCount?: number;
   readonly passRate?: number;
+  /** C27 — Wilson 95% CI on this cell's pass rate, inherited from the
+   *  cell's aggregates (absent on cells run by older CLIs). */
+  readonly passRateCI95?: readonly [number, number];
   readonly meanScore?: number;
+  /** C27 — Student t 95% CI on this cell's mean score (absent when the
+   *  cell scored < 2 samples or ran on an older CLI). */
+  readonly meanScoreCI95?: readonly [number, number];
   readonly errorCount?: number;
   readonly p50LatencyMs?: number;
   readonly p95LatencyMs?: number;
@@ -105,7 +111,9 @@ function toRow(cell: MatrixCell, pricing?: MatrixPricingFn): MatrixRow {
     runId: s.runId,
     sampleCount,
     passRate: a.passRate,
+    ...(a.passRateCI95 !== undefined ? { passRateCI95: a.passRateCI95 } : {}),
     meanScore: a.meanScore,
+    ...(a.meanScoreCI95 !== undefined ? { meanScoreCI95: a.meanScoreCI95 } : {}),
     errorCount: a.errorCount,
     p50LatencyMs: a.p50LatencyMs,
     p95LatencyMs: a.p95LatencyMs,
@@ -168,6 +176,14 @@ function metricCell(
   return `<td${cls} data-sort="${value}">${escapeHtml(text)}</td>`;
 }
 
+/** C27 — ` [87.2–99.0%]` / ` [0.61–0.79]` appended to a metric cell. */
+function ciSuffix(ci: readonly [number, number] | undefined, asPct: boolean): string {
+  if (ci === undefined) return "";
+  return asPct
+    ? ` [${(ci[0] * 100).toFixed(1)}–${(ci[1] * 100).toFixed(1)}%]`
+    : ` [${ci[0].toFixed(3)}–${ci[1].toFixed(3)}]`;
+}
+
 function matrixRowHtml(row: MatrixRow, best: MatrixBest): string {
   const statusCell =
     row.status === "ok"
@@ -181,8 +197,8 @@ function matrixRowHtml(row: MatrixRow, best: MatrixBest): string {
 <tr>
   <td>${escapeHtml(row.model)}</td>
   ${statusCell}
-  ${metricCell(row, best.passRate, row.passRate, row.passRate !== undefined ? `${(row.passRate * 100).toFixed(1)}%` : "n/a")}
-  ${metricCell(row, best.meanScore, row.meanScore, row.meanScore !== undefined ? row.meanScore.toFixed(3) : "n/a")}
+  ${metricCell(row, best.passRate, row.passRate, row.passRate !== undefined ? `${(row.passRate * 100).toFixed(1)}%${ciSuffix(row.passRateCI95, true)}` : "n/a")}
+  ${metricCell(row, best.meanScore, row.meanScore, row.meanScore !== undefined ? `${row.meanScore.toFixed(3)}${ciSuffix(row.meanScoreCI95, false)}` : "n/a")}
   ${metricCell(row, [], row.p50LatencyMs, row.p50LatencyMs !== undefined ? `${Math.round(row.p50LatencyMs)}ms` : "n/a")}
   ${metricCell(row, best.p95LatencyMs, row.p95LatencyMs, row.p95LatencyMs !== undefined ? `${Math.round(row.p95LatencyMs)}ms` : "n/a")}
   <td data-sort="${row.totalTokens !== undefined ? row.totalTokens.input + row.totalTokens.output : ""}">${escapeHtml(tokens)}</td>

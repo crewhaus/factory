@@ -98,6 +98,10 @@ export type TrialResult = {
   readonly passed: boolean;
   readonly score: number;
   readonly rationale: string;
+  /** A3 — this trial's outcome was `abstained` (judge declined, nothing
+   *  else failed). `passed: false` is then the conservative placeholder;
+   *  `trialPassRate` still counts the trial as not-passed. */
+  readonly abstained?: boolean;
   readonly latencyMs: number;
   readonly tokens: { input: number; output: number };
   readonly error?: string;
@@ -115,6 +119,14 @@ export type SampleResult = {
   readonly tokens: { input: number; output: number };
   readonly model: string;
   readonly agentOutput: string;
+  /**
+   * B13 — the dataset sample's `metadata`, carried verbatim into the result
+   * so slice aggregation (and any results.json consumer) can group by
+   * difficulty/family/language/source without re-joining the dataset.
+   * Absent when the sample declared none, and on results persisted by older
+   * CLIs.
+   */
+  readonly metadata?: Readonly<Record<string, unknown>>;
   readonly grades: { overall: GradeResult; perGrader: Array<{ name: string } & GradeResult> };
   /** G56 — loop-quality metrics from the sample's trace events. Always set
    *  by new runs; absent on results persisted by older CLIs. */
@@ -215,6 +227,46 @@ export type EvalAggregates = {
    * carried trials.
    */
   readonly totalTokensAllTrials?: { input: number; output: number };
+  /**
+   * C27 — closed-form Wilson 95% interval on `passRate` as `[lo, hi]`.
+   * Emitted by new runs whenever the graded denominator is non-zero; absent
+   * on results persisted by older CLIs (readers must tolerate absence).
+   */
+  readonly passRateCI95?: readonly [number, number];
+  /**
+   * C27 — Student t 95% interval on `meanScore` as `[lo, hi]`. Present when
+   * at least two samples were scored (the sample variance needs n ≥ 2).
+   */
+  readonly meanScoreCI95?: readonly [number, number];
+  /**
+   * A3 — count of samples whose outcome was `abstained` (judge declined to
+   * score, nothing else failed): excluded from the `passRate` denominator
+   * and from `meanScore`, routed to human review instead. Present (with
+   * {@link needsHumanSampleIds}) only when at least one sample abstained,
+   * so abstention-free runs keep their exact pre-A3 shape.
+   */
+  readonly needsHuman?: number;
+  /** A3 — the abstained samples' ids, for `crewhaus rate` follow-up.
+   *  Present iff {@link needsHuman} is. */
+  readonly needsHumanSampleIds?: ReadonlyArray<string>;
+  /**
+   * A12 — per-criterion mean judge scores, keyed grader name → criterion →
+   * mean of the raw 1–5 criterion scores over the samples that grader
+   * scored (abstained verdicts carry no breakdown and are excluded).
+   * Present only when at least one grade carried a `detail` breakdown.
+   */
+  readonly criterionMeans?: Readonly<Record<string, Readonly<Record<string, number>>>>;
+};
+
+/**
+ * B13 — one slice's aggregate figures. `passRate`/`meanScore` mirror the
+ * run-level semantics (abstained samples out of the denominator, errored
+ * samples failing); `sampleCount` is the slice's full membership.
+ */
+export type SliceStats = {
+  readonly sampleCount: number;
+  readonly passRate: number;
+  readonly meanScore: number;
 };
 
 /**
@@ -233,12 +285,59 @@ export type JudgeCalibrationApplication = {
   readonly passingScore: number;
 };
 
+/**
+ * NEW-HUNT-3 — projects a model's run cost from token totals, in USD
+ * micro-dollars (1 USD = 1_000_000, cost-tracker's metering unit). Returns
+ * `undefined` when the model has no pricing row — the budget cap is then
+ * unenforceable and the runner warns instead of guessing. Injected (rather
+ * than importing `@crewhaus/cost-tracker` + the model-router grammar here)
+ * for the same reason eval-report's `MatrixPricingFn` is: the CLI wires the
+ * real lookup, and the two share one source of truth.
+ */
+export type EvalPricingFn = (
+  model: string,
+  tokens: { readonly input: number; readonly output: number },
+) => number | undefined;
+
+/**
+ * NEW-HUNT-3 — why a run recorded fewer graded samples than the dataset
+ * held. Present on `EvalRunSummary`/`results.json` only when the run-level
+ * budget cap fired: samples still queued when accrued spend reached the cap
+ * were aborted (each recorded as an errored sample carrying the
+ * `[eval] budget exhausted after k/N samples` message), while completed
+ * samples keep their real grades. Additive — absent on full runs and on
+ * results persisted by older CLIs.
+ */
+export type EvalRunPartial = {
+  readonly reason: "budget_exhausted";
+  /** Samples that actually ran (graded or honestly errored). */
+  readonly completedSamples: number;
+  readonly totalSamples: number;
+  /** Accrued agent-model spend when the run stopped scheduling samples. */
+  readonly spentUsd: number;
+  /** The cap in force (`--budget-usd` flag, else the spec's `budget.usd`). */
+  readonly budgetUsd: number;
+};
+
 export type EvalRunSummary = {
   readonly runId: string;
   readonly startedAt: string;
   readonly endedAt: string;
   readonly samples: ReadonlyArray<SampleResult>;
   readonly aggregates: EvalAggregates;
+  /**
+   * NEW-HUNT-3 — present iff the run-level budget cap aborted queued
+   * samples (see {@link EvalRunPartial}). Readers must tolerate absence.
+   */
+  readonly partial?: EvalRunPartial;
+  /**
+   * B13 — per-slice aggregates, keyed slice key → metadata value →
+   * {@link SliceStats}. Computed by the runner (so target-eval bundles
+   * inherit them) over the keys from `RunEvalOptions.sliceKeys` (default
+   * family/difficulty/language/source), applied only where present in
+   * sample metadata as strings. Absent when nothing sliced.
+   */
+  readonly slices?: Readonly<Record<string, Readonly<Record<string, SliceStats>>>>;
   readonly config: {
     readonly specHash: string;
     readonly datasetName: string;
@@ -253,6 +352,24 @@ export type EvalRunSummary = {
     readonly seed?: number;
     /** G15 — trials per sample. Recorded only when > 1. */
     readonly repeats?: number;
+    /** NEW-HUNT-3 — the per-sample wall-clock timeout in force (flag, else
+     *  the spec's `limits.deadline_ms`). Recorded only when one applied. */
+    readonly sampleTimeoutMs?: number;
+    /** NEW-HUNT-3 — the run-level budget cap declared (flag, else the
+     *  spec's `budget.usd`). Recorded even when pricing was unavailable
+     *  and the cap therefore could not be enforced. */
+    readonly budgetUsd?: number;
+    /** NEW-HUNT-2 — the judge sampling params in force, one entry per
+     *  `llm_judge` grader with the defaults RESOLVED (pinned temperature 0,
+     *  repeats 1), so the reproducibility manifest records exactly how
+     *  judge verdicts were decoded — the pin default would otherwise be
+     *  invisible across the upgrade that introduced it. Present only when
+     *  the run had `llm_judge` graders. */
+    readonly judgeSampling?: ReadonlyArray<{
+      readonly name: string;
+      readonly temperature: number;
+      readonly repeats: number;
+    }>;
     /** G47 — present when at least one `llm_judge` grader's gate came from
      *  the calibration file rather than a rubric-declared `passing_score`. */
     readonly judgeCalibration?: {
@@ -327,6 +444,43 @@ export type RunEvalOptions = {
    * and spend of a single-trial run.
    */
   readonly repeats?: number;
+  /**
+   * B13 — metadata keys to slice the results by (`crewhaus eval --slice`).
+   * Defaults to family/difficulty/language/source; each key applies only to
+   * samples carrying it in metadata as a string. Keys must be non-empty —
+   * a blank key is a loud config error at run start.
+   */
+  readonly sliceKeys?: ReadonlyArray<string>;
+  /**
+   * NEW-HUNT-3 — per-sample wall-clock timeout in ms (`--sample-timeout-ms`).
+   * Bounds each sample's AGENT INVOCATION (grading is not covered): a sample
+   * exceeding it records an errored `SampleResult` (its artifacts still
+   * persist) instead of stalling a concurrency slot forever. Overrides the
+   * spec's `limits.deadline_ms`, which is the default when this is absent;
+   * absent both ⇒ no watchdog, today's exact behavior. Must be a positive
+   * integer — validated loudly at run start.
+   */
+  readonly sampleTimeoutMs?: number;
+  /**
+   * NEW-HUNT-3 — run-level spend cap in USD (`--budget-usd`). Overrides the
+   * spec's `budget.usd` (the default when absent; eval always STOPS at the
+   * cap — the block's `on_exceed: degrade` ladder never applies to a
+   * measurement run, since swapping models mid-eval would corrupt the
+   * measurement). Spend accrues per completed sample via {@link pricing};
+   * once accrued spend reaches the cap, queued samples abort with a
+   * `[eval] budget exhausted after k/N samples` error, in-flight samples
+   * complete, and the summary is marked {@link EvalRunSummary.partial}.
+   * Judge/grader calls are NOT metered (their usage is not yet captured);
+   * a model without a pricing row disables enforcement with a warning.
+   */
+  readonly budgetUsd?: number;
+  /**
+   * NEW-HUNT-3 — the cost seam budget metering charges through (see
+   * {@link EvalPricingFn}). The CLI passes the same lookup that prices the
+   * `--models` matrix `est_$` column; omitted ⇒ the budget cap (if any)
+   * cannot be enforced and the runner warns.
+   */
+  readonly pricing?: EvalPricingFn;
   /**
    * G47 — injectable read seam for `.crewhaus/judge-calibration.json`.
    * Receives the resolved path; returns the file text, or undefined when

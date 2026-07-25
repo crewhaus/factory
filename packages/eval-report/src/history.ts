@@ -64,11 +64,35 @@ export type RunIndexEntry = {
   readonly meanScore: number;
   readonly sampleCount: number;
   /**
+   * C30 — the run's p95 per-sample latency in ms
+   * (`aggregates.p95LatencyMs`), recorded so ops metrics are readable from
+   * the index without loading every run dir. Additive — absent on entries
+   * written before the field existed.
+   */
+  readonly p95LatencyMs?: number;
+  /**
+   * C30 — the run's estimated cost in USD, projected from its agent-model
+   * token totals through the same pricing seam as the `--models` matrix
+   * `est_$` column (judge/grader spend is not metered). Additive — absent
+   * on entries written before the field existed and on runs whose model
+   * has no pricing row.
+   */
+  readonly costUsd?: number;
+  /**
    * Samples whose recorded outcome replaced an errored first attempt via
    * the runner's noise auto-retry (`SampleResult.retried`). Additive —
    * absent on entries written before the field existed (read as 0).
    */
   readonly retriedCount?: number;
+  /**
+   * NEW-HUNT-3 — true when the run was cut short by its run-level budget
+   * cap (`EvalRunSummary.partial`): samples still queued at abort were
+   * recorded as synthetic errors, so this entry's passRate/meanScore read
+   * LOWER than a full run's would. Partial runs are never pinned or
+   * promoted as baselines. Additive — absent on full runs and on entries
+   * written before the field existed.
+   */
+  readonly partial?: boolean;
   /** ISO-8601 completion timestamp. */
   readonly ts: string;
   /** Absolute path to the run's output directory. */
@@ -104,6 +128,18 @@ export type BaselineEntry = {
    * Additive; absent on baselines pinned before the field existed.
    */
   readonly judgeModel?: string;
+  /**
+   * C30 — p95 per-sample latency of the pinned run (see
+   * {@link RunIndexEntry.p95LatencyMs}). Additive; absent on baselines
+   * pinned before the field existed.
+   */
+  readonly p95LatencyMs?: number;
+  /**
+   * C30 — estimated cost of the pinned run (see
+   * {@link RunIndexEntry.costUsd}). Additive; absent on baselines pinned
+   * before the field existed and when the model had no pricing row.
+   */
+  readonly costUsd?: number;
   /** ISO-8601 timestamp of when the pin was written. */
   readonly ts: string;
 };
@@ -137,6 +173,12 @@ export type RecordEvalRunOptions = {
   readonly datasetHash: string;
   /** ABSOLUTE path to the run's output directory. */
   readonly outDir: string;
+  /**
+   * C30 — the run's estimated cost in USD, when the caller could price it.
+   * Caller-supplied because pricing needs the model catalogue, which the
+   * summary does not carry; every other ops column is derived here.
+   */
+  readonly costUsd?: number;
   /** Override `.crewhaus/evals` (tenant scopes, tests, standalone bundles
    *  whose run dir was rebased). */
   readonly evalsDir?: string;
@@ -177,7 +219,15 @@ export function runIndexEntryFromSummary(
     passRate: summary.aggregates.passRate,
     meanScore: summary.aggregates.meanScore,
     sampleCount: summary.samples.length,
+    // C30 — additive ops columns: p95 latency straight off the aggregates,
+    // estimated cost when the caller could price the run.
+    p95LatencyMs: summary.aggregates.p95LatencyMs,
+    ...(opts.costUsd !== undefined ? { costUsd: opts.costUsd } : {}),
     retriedCount: summary.samples.filter((s) => s.retried === true).length,
+    // NEW-HUNT-3 — mark budget-aborted runs so history readers can tell this
+    // entry's deflated passRate (aborted samples count as errors) from a
+    // genuinely measured one.
+    ...(summary.partial !== undefined ? { partial: true } : {}),
     ts: summary.endedAt,
     outDir: opts.outDir,
   };
