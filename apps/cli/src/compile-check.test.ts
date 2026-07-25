@@ -122,6 +122,74 @@ describe("classifyBootOutcome", () => {
     expect(BOOT_GATE_PATTERNS.length).toBeGreaterThanOrEqual(6);
   });
 
+  // ── Audit item 9 — a declared MCP env ref is a credential GATE, not a break ─
+  test("an unset MCP server secret is gated (green), not a structural failure", () => {
+    // Verbatim stderr of a `compile --check` boot of a bundle whose spec
+    // declares `mcp_servers.probe.env.PROBE_API_KEY: $PROBE_API_KEY` —
+    // @crewhaus/mcp-host resolves the ref at module scope, so Bun prints the
+    // source excerpt, the ConfigError header, then the stack.
+    const stderr = [
+      '46 |         const where = opts.what !== undefined ? ` (required by ${opts.what})` : "";',
+      "47 |         throw new ConfigError(`environment variable ${ref.name} is not set${where} …`);",
+      "                   ^",
+      'ConfigError: environment variable PROBE_API_KEY is not set (required by mcp server "probe" env PROBE_API_KEY) — export it before launching, e.g. `export PROBE_API_KEY=…`',
+      ' code: "config"',
+      "",
+      "      at resolveSecretRef (/x/node_modules/@crewhaus/mcp-host/dist/resolve.js:47:15)",
+      "      at /x/agent.ts:22:28",
+      "",
+      "Bun v1.3.14 (macOS arm64)",
+    ].join("\n");
+    const outcome = classifyBootOutcome(run({ exitCode: 1, stderr }));
+    expect(outcome.status).toBe("gated");
+    expect(outcome.detail).toContain("MCP server credentials");
+  });
+
+  // ── Audit item 16 — the verdict sentence must be grammatical ──────────────
+  test("no gate phrase produces 'its a …' / 'needs live a …' (item 16)", () => {
+    for (const { gate, needs } of BOOT_GATE_PATTERNS) {
+      // `gate` sits after a possessive, so it must not open with an article…
+      expect(gate).not.toMatch(/^(?:a|an|the) /);
+      // …while `needs` is the standalone noun phrase and carries its own.
+      expect(needs.length).toBeGreaterThan(0);
+    }
+    const dataset = classifyBootOutcome(
+      run({ exitCode: 1, stderr: 'dataset "smoke-eval@v1" not found at /x' }),
+    );
+    expect(dataset.detail).toBe(
+      "boot reached its eval dataset gate — full boot needs a registered eval dataset",
+    );
+    const prompt = classifyBootOutcome(
+      run({ exitCode: 1, stderr: "[browser-driver] no prompt (pass --prompt <text>)" }),
+    );
+    expect(prompt.detail).toBe(
+      "boot reached its --prompt gate — full boot needs an initial --prompt",
+    );
+  });
+
+  test("a red boot names the error even when Bun buries it above the stack", () => {
+    const stderr = [
+      "1 | import { missing } from '@crewhaus/nope';",
+      "SyntaxError: Export named 'createJanitor' not found in module 'x'.",
+      "      at /x/agent.ts:3:10",
+      "",
+      "Bun v1.3.14 (macOS arm64)",
+    ].join("\n");
+    const outcome = classifyBootOutcome(run({ exitCode: 1, stderr }));
+    expect(outcome.status).toBe("failed");
+    // The old last-3-lines tail reported "at /x/agent.ts:3:10 | Bun v1.3.14".
+    expect(outcome.detail).toContain("SyntaxError: Export named 'createJanitor'");
+    expect(outcome.detail).not.toContain("Bun v1.3.14");
+  });
+
+  test("a bare-message failure with no error header still reports its tail", () => {
+    const outcome = classifyBootOutcome(
+      run({ exitCode: 3, stderr: "boom: the bundle gave up\nsecond line\n" }),
+    );
+    expect(outcome.status).toBe("failed");
+    expect(outcome.detail).toContain("second line");
+  });
+
   test("a gate printed to STDOUT still classifies as gated (F6 — combined-stream matching)", () => {
     const outcome = classifyBootOutcome(
       run({ exitCode: 1, stdout: "[crew] no input on stdin\n", stderr: "" }),
@@ -510,10 +578,16 @@ describe("BOOT_GATE_PATTERNS ↔ emitting workspace sources (F6)", () => {
       gate: "spec env refs",
       files: ["packages/target-onchain/src/index.ts", "packages/target-channel-bot/src/index.ts"],
     },
+    {
+      // Every MCP secret ref resolves through mcp-host at boot; the throw
+      // that names the unset variable lives in resolve.ts.
+      gate: "MCP server credentials",
+      files: ["packages/mcp-host/src/resolve.ts"],
+    },
     { gate: "stdin input", files: ["packages/target-crew/src/index.ts"] },
-    { gate: "a --smoke pcm fixture", files: ["packages/target-voice/src/index.ts"] },
-    { gate: "an initial --prompt", files: ["packages/target-browser-driver/src/index.ts"] },
-    { gate: "a registered eval dataset", files: ["packages/dataset-registry/src/index.ts"] },
+    { gate: "--smoke fixture", files: ["packages/target-voice/src/index.ts"] },
+    { gate: "--prompt", files: ["packages/target-browser-driver/src/index.ts"] },
+    { gate: "eval dataset", files: ["packages/dataset-registry/src/index.ts"] },
   ];
 
   test("the table covers every gate exactly once", () => {

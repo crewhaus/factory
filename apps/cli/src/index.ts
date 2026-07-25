@@ -141,6 +141,10 @@ import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 // Item 4 (§59) — `crewhaus export claude-plugin` emits an Anthropic-compatible
 // plugin directory from any IR variant.
 import { TargetClaudePluginError, emitClaudePlugin } from "@crewhaus/target-claude-plugin";
+// Phase 3 §3.3 — `cli.banner` is rendered from the SAME module the cli emitter
+// inlines into a compiled bundle, so `crewhaus run` and `bun dist/agent.ts`
+// print byte-identical banners.
+import { renderBanner, shouldPrintBanner } from "@crewhaus/target-cli";
 // Item 10 (G89) — the default public template registry (registry.crewhaus.ai)
 // `crewhaus templates list/search` fall back to when no --registry / env is set.
 import { DEFAULT_TEMPLATE_REGISTRY_URL } from "@crewhaus/template-marketplace-client";
@@ -227,18 +231,11 @@ import {
   summarizeVerifyResult,
 } from "./audit-verify";
 // Item 1 — the feedback.autoDistill consumer (watermarked ratings →
-// versioned `<spec>-ratings` registry datasets at run teardown) and the
-// REPL exit-rating gating logic, in a side-effect-free module so it is
-// unit-testable (this entry file runs an argv switch on import).
-import {
-  DISTILL_STATE_RELPATH,
-  EXIT_RATING_PROMPT,
-  EXIT_RATING_TIMEOUT_MS,
-  countAssistantTurns,
-  maybeAutoDistill,
-  parseExitRatingKey,
-  shouldPromptExitRating,
-} from "./autodistill";
+// versioned `<spec>-ratings` registry datasets at run teardown), in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import). The block's exit-rating half lives in the RUNTIME
+// (@crewhaus/runtime-core's exit-rating module) so compiled bundles get it too.
+import { DISTILL_STATE_RELPATH, maybeAutoDistill } from "./autodistill";
 // Local-bundle dependency manifest: `compile` writes the same synthesized
 // pin-to-CLI-version package.json that `--check` installs against, so the
 // documented standalone flow (`bun install` + `bun agent.ts` in the out-dir)
@@ -253,6 +250,7 @@ import { emitCfWorkerBundle } from "./cf-worker-emit";
 // doctor-style scope/webhook probes), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
 import {
+  CHANNEL_PLATFORMS,
   ChannelApiError,
   type ChannelCheck,
   InvalidBaseUrlError,
@@ -261,9 +259,12 @@ import {
   buildDiscordProvision,
   buildSlackManifest,
   buildTelegramProvision,
+  channelEnvChecks,
+  collectProvisionMissingEnv,
   describeVerifyProbes,
   discordNextSteps,
   joinBaseUrl,
+  modelCredentialChecks,
   performDiscordProvision,
   performTelegramSetWebhook,
   renderSlackManifestYaml,
@@ -856,9 +857,11 @@ import {
 // `activatePlugins` / dev spec-override wiring is below in this entry file.
 import { parsePluginsFlag, resolvePluginNames } from "./plugin-activation";
 // Item 4 (§59) — `crewhaus export claude-plugin` helpers: author / out-dir
-// resolution + the post-emit smoke check (the emitted plugin.json / .mcp.json
-// parse). Pure; the disk write + `emitClaudePlugin` call live below.
+// resolution, the harness's authored `.crewhaus/` skills + commands (item 14),
+// and the post-emit smoke check (the emitted plugin.json / .mcp.json parse).
+// The disk write + `emitClaudePlugin` call live below.
 import {
+  collectHarnessPluginAssets,
   resolveClaudePluginAuthor,
   resolveExportOutDir,
   smokeCheckClaudePluginBundle,
@@ -1389,6 +1392,9 @@ const EXPORT_SCHEMA: ParseArgsSchema = {
     { name: "author-email", takesValue: true },
     // Override the plugin description (default: the IR's name + target).
     { name: "description", takesValue: true },
+    // Item 14 — opt OUT of carrying the harness's authored `.crewhaus/skills`
+    // + `.crewhaus/commands` into the plugin (default: they travel).
+    { name: "no-assets", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -2377,6 +2383,10 @@ const CHANNEL_SCHEMA: ParseArgsSchema = {
     { name: "out", short: "o", takesValue: true },
     // print every network call (redacted) without performing it.
     { name: "dry-run", takesValue: false },
+    // verify only: run the boot-gate env checks and NOTHING else, so the
+    // verdict is a function of the environment alone (deterministic
+    // pre-flight — the live auth.test made it a function of the network).
+    { name: "offline", takesValue: false },
     // provision (discord) only: overwrite a DIFFERENT pre-existing
     // interactions_endpoint_url — read-before-write refuses without it
     // (mirrors `state restore --force`).
@@ -2769,9 +2779,11 @@ function usageText(): string {
     "       --base-url <public-url>         slack app manifest YAML, telegram setWebhook, discord",
     "       [--platform slack|telegram|discord|all]  interactions endpoint + invite URL",
     "       [-o <dir>] [--dry-run] [--force]",
-    "  channel verify <spec.yaml>           scope doctor: slack auth.test + granted scopes,",
-    "       [--platform ...] [--dry-run]    telegram getWebhookInfo, discord application fetch",
-    "       [--base-url <public-url>]       (exit 1 on missing scopes / mismatched webhook)",
+    "  channel verify <spec.yaml>           scope doctor: every env var the daemon boots on,",
+    "       [--platform ...] [--dry-run]    then slack auth.test + granted scopes, telegram",
+    "       [--base-url <public-url>]       getWebhookInfo, discord application fetch",
+    "       [--offline]                     (--offline = the env checks only: no network,",
+    "                                       deterministic exit code for CI/pre-flight)",
     "  version                              print the CLI version (also: --version, -v)",
     "",
   ].join("\n");
@@ -3122,7 +3134,16 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // it would make --strict permanently unusable for every reactions-enabled
   // channel spec; it still prints above, but only remediable codes
   // (accepted-but-unwired, edge-unsafe-tool) escalate.
-  const escalatedWarnings = bundle.warnings.filter((w) => w.code !== "channel-reactions-join");
+  //
+  // Item 1 — cli-autodistill-toolchain is informational for the same reason:
+  // `feedback.autoDistill` is honoured by `crewhaus run`, so the only "fix"
+  // would be deleting a working spec key. The heads-up says which half of the
+  // block a compiled bundle carries; it must never fail a strict compile.
+  const INFORMATIONAL_WARNING_CODES = new Set([
+    "channel-reactions-join",
+    "cli-autodistill-toolchain",
+  ]);
+  const escalatedWarnings = bundle.warnings.filter((w) => !INFORMATIONAL_WARNING_CODES.has(w.code));
   if (strictWarnings && escalatedWarnings.length > 0) {
     die(
       `--strict: ${escalatedWarnings.length} compile warning(s) escalated to errors (see lines above)`,
@@ -4506,10 +4527,12 @@ async function runRun(args: ParsedArgs): Promise<void> {
         "    model_call_timeout_ms, loop_detection) are enforced INDEPENDENTLY; whichever bound trips first governs. The budget check gates the NEXT turn (an in-flight turn is never\n" +
         "    severed mid-tool-call), while the limits ceilings bound the CURRENT turn/run. --budget-usd never widens a limit and limits: never raises the spend cap.\n" +
         "  A spec with a feedback: block asks `rate this session? [g]ood / [b]ad / [enter] skip`\n" +
-        "  on clean REPL exit (one keystroke, 10s timeout, TTY only — never when piped). Opt out\n" +
-        "  with CREWHAUS_NO_EXIT_RATING=1 or feedback.exitPrompt: false. With feedback.autoDistill\n" +
+        "  on clean REPL exit (one keystroke, 10s timeout, TTY only — never when piped; the prompt\n" +
+        "  lives in the runtime, so a COMPILED bundle asks it too). Opt out with\n" +
+        "  CREWHAUS_NO_EXIT_RATING=1 or feedback.exitPrompt: false. With feedback.autoDistill\n" +
         "  enabled, accumulated ratings are auto-distilled into the `<specName>-ratings` registry\n" +
-        "  dataset at teardown (item 1) — see `crewhaus optimize --help`.\n",
+        "  dataset at teardown (item 1, this path only — a compiled bundle captures ratings but\n" +
+        "  does not distill them; `crewhaus distill --register` does) — see `crewhaus optimize --help`.\n",
     );
     return;
   }
@@ -4756,6 +4779,21 @@ async function runRunCli(
       die("--prompt requires non-empty text");
     }
     oneShotPrompt = trimmed;
+  }
+
+  // Phase 3 §3.3 — the spec's `cli.banner`, printed on cold start. This used
+  // to be codegen-only: a compiled bundle showed the brand, `crewhaus run`
+  // never read `ir.cli`, so an authored banner was invisible to everyone who
+  // ran the spec directly. Both surfaces now render from the same module
+  // (@crewhaus/target-cli's `renderBanner`, which the emitted snippet is
+  // pinned to by a parity test), and a resumed session doesn't re-banner —
+  // the `--resume`/`--continue` behaviour the spec block always documented.
+  const banner = ir.cli?.banner;
+  if (
+    banner !== undefined &&
+    shouldPrintBanner({ banner, resumed: resumeId !== undefined, env: process.env })
+  ) {
+    process.stdout.write(renderBanner(ir.name, banner));
   }
 
   let tools: RegisteredTool[] = [];
@@ -5361,6 +5399,21 @@ async function runRunCli(
         ? { singleTurn: true, seedMessages: [{ role: "user" as const, content: oneShotPrompt }] }
         : {}),
       ...(hasCodeExecTools ? { sandboxAvailable } : {}),
+      // Item 1 — the spec's `feedback:` block. The exit rating prompt lives in
+      // the RUNTIME (so a compiled bundle gets it too, not just this path);
+      // only the two switches it consumes are threaded. The autoDistill
+      // consumer stays in this file's teardown — it registers a versioned
+      // registry dataset for `eval`/`optimize`, a toolchain step.
+      ...(ir.feedback !== undefined
+        ? {
+            feedback: {
+              ...(ir.feedback.enabled !== undefined ? { enabled: ir.feedback.enabled } : {}),
+              ...(ir.feedback.exitPrompt !== undefined
+                ? { exitPrompt: ir.feedback.exitPrompt }
+                : {}),
+            },
+          }
+        : {}),
       ...(subAgents !== undefined ? { subAgents, spawnSubAgent } : {}),
       ...(ir.target === "cli" && ir.agent.maxTokens !== undefined
         ? { maxTokens: ir.agent.maxTokens }
@@ -5477,16 +5530,16 @@ async function runRunCli(
     process.stdout.write(`${oneShotResult}\n`);
   }
 
-  // Item 1 — post-session feedback teardown: the one-keystroke exit rating
-  // prompt (TTY only) and the feedback.autoDistill consumer. Runs only on a
-  // clean REPL exit (runChatLoop returned; a throw above skips it) and is
-  // best-effort — a teardown failure never turns a successful session into
-  // a non-zero exit. Deliberately CLI teardown code (the in-process analogue
-  // of where the stop hook fires), NOT a spawned hook: hooks run
-  // credential-stripped, and the distill/registry path needs the caller's
-  // full environment.
+  // Item 1 — post-session feedback teardown: the feedback.autoDistill
+  // consumer. Runs only on a clean REPL exit (runChatLoop returned; a throw
+  // above skips it) and is best-effort — a teardown failure never turns a
+  // successful session into a non-zero exit. Deliberately CLI teardown code
+  // (the in-process analogue of where the stop hook fires), NOT a spawned
+  // hook: hooks run credential-stripped, and the distill/registry path needs
+  // the caller's full environment. (The exit rating prompt already fired
+  // INSIDE runChatLoop — the runtime owns it so compiled bundles have it too.)
   try {
-    await runFeedbackTeardown(ir, resumeId);
+    await runFeedbackTeardown(ir);
   } catch (err) {
     process.stderr.write(
       `[feedback] teardown skipped: ${err instanceof Error ? err.message : String(err)}\n`,
@@ -6009,13 +6062,18 @@ async function runExportClaudePlugin(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus export claude-plugin <spec.yaml> [--out <dir>] [--force]\n" +
         "                       [--author <name>] [--author-email <email>] [--description <text>]\n" +
+        "                       [--no-assets]\n" +
         "  Emits an Anthropic-compatible Claude Code plugin directory from the spec:\n" +
         "  .claude-plugin/plugin.json, README.md, skills/<name>/SKILL.md, one\n" +
         "  agents/<name>.md per sub-agent, and .mcp.json when the spec declares\n" +
-        "  mcp_servers. Drop the emitted dir under ~/.claude/plugins/ (or a project\n" +
-        "  .claude/plugins/) to load the agent's skills inside Claude Code. Default\n" +
-        "  output dir is ./<plugin-name>; --force overwrites a non-empty dir. The\n" +
-        "  emitted plugin.json / .mcp.json are smoke-checked before anything is written.\n",
+        "  mcp_servers. The harness's authored assets travel too — the spec dir's\n" +
+        "  .crewhaus/skills/<name>/** become skills/<name>/**, and its\n" +
+        "  .crewhaus/commands/<name>.md become commands/<name>.md; pass --no-assets\n" +
+        "  to emit the spec projection alone. Drop the emitted dir under\n" +
+        "  ~/.claude/plugins/ (or a project .claude/plugins/) to load the agent's\n" +
+        "  skills inside Claude Code. Default output dir is ./<plugin-name>; --force\n" +
+        "  overwrites a non-empty dir. The emitted plugin.json / .mcp.json are\n" +
+        "  smoke-checked before anything is written.\n",
     );
     return;
   }
@@ -6036,12 +6094,31 @@ async function runExportClaudePlugin(args: ParsedArgs): Promise<void> {
     throw err;
   }
 
+  // Item 14 — carry the harness's AUTHORED surface (`.crewhaus/skills/**`,
+  // `.crewhaus/commands/*.md`, resolved beside the spec — the standalone-harness
+  // convention) into the plugin, so the export is not a strictly smaller agent
+  // than the harness. A malformed authored SKILL.md fails the export rather than
+  // shipping a plugin Claude Code would refuse to load.
+  const assets =
+    args.flags["no-assets"] === true
+      ? { files: [], skipped: [], issues: [] }
+      : collectHarnessPluginAssets(dirname(absSpec));
+  if (assets.issues.length > 0) {
+    die(
+      `export claude-plugin: unusable authored asset(s):\n  - ${assets.issues.join("\n  - ")}\n  fix the file, or pass --no-assets to export the spec projection alone`,
+    );
+  }
+  for (const path of assets.skipped) {
+    process.stderr.write(`[export] skipped non-text authored asset ${path}\n`);
+  }
+
   const descriptionFlag = strFlag(args, "description");
   const bundle = emitClaudePlugin(ir, {
     author: resolveClaudePluginAuthor(strFlag(args, "author"), strFlag(args, "author-email")),
     ...(descriptionFlag !== undefined && descriptionFlag.trim() !== ""
       ? { description: descriptionFlag.trim() }
       : {}),
+    ...(assets.files.length > 0 ? { assets: assets.files } : {}),
   });
 
   // Smoke-test the projection BEFORE writing — a malformed plugin.json /
@@ -6066,8 +6143,23 @@ async function runExportClaudePlugin(args: ParsedArgs): Promise<void> {
     writeFileSync(full, file.content);
   }
   const hasMcp = bundle.files.some((f) => f.path === ".mcp.json");
+  // Item 14 — name what the harness contributed, so a silent "the authored
+  // skills didn't travel" regression is visible on the one line the user reads.
+  const carriedSkills = new Set(
+    assets.files.flatMap((f) => f.path.match(/^skills\/([^/]+)\//)?.[1] ?? []),
+  ).size;
+  const carriedCommands = assets.files.filter((f) => f.path.startsWith("commands/")).length;
+  const carriedParts = [
+    ...(carriedSkills > 0
+      ? [`${carriedSkills} authored skill${carriedSkills === 1 ? "" : "s"}`]
+      : []),
+    ...(carriedCommands > 0
+      ? [`${carriedCommands} authored command${carriedCommands === 1 ? "" : "s"}`]
+      : []),
+  ];
+  const carried = carriedParts.length > 0 ? `, incl. ${carriedParts.join(" + ")}` : "";
   process.stdout.write(
-    `exported ${ir.name} (${ir.target}) → ${outDir} — ${bundle.files.length} files${hasMcp ? ", incl. .mcp.json" : ""}, smoke check ✓\n`,
+    `exported ${ir.name} (${ir.target}) → ${outDir} — ${bundle.files.length} files${hasMcp ? ", incl. .mcp.json" : ""}${carried}, smoke check ✓\n`,
   );
 }
 
@@ -13193,27 +13285,27 @@ async function runGradersSuggest(args: ParsedArgs): Promise<void> {
 }
 
 /**
- * Item 1 — post-session feedback teardown for the cli run path. Two halves,
- * both gated on the compiled spec's `feedback:` block:
+ * Item 1 — post-session feedback teardown for the cli run path: the
+ * `feedback.autoDistill` consumer. When `autoDistill` is enabled and the
+ * accumulated store (all sessions + the web-UI feedback dir) holds enough
+ * unprocessed ratings past the watermark, run the existing distill() and
+ * register the result as a new version of the `<specName>-ratings` registry
+ * dataset (see ./autodistill.ts) — consumable as
+ * `--dataset registry:<specName>-ratings` by eval and optimize.
  *
- *  1. Exit rating prompt: on a clean REPL exit with ≥1 assistant turn, a
- *     TTY, and no opt-out (CREWHAUS_NO_EXIT_RATING / feedback.exitPrompt:
- *     false), ask `rate this session? [g]ood / [b]ad / [enter] skip` — one
- *     keystroke, 10s timeout, appended to the session's event log via the
- *     same `user_feedback` record `crewhaus rate` writes (source "cli",
- *     rating the last turn). NEVER prompts in non-TTY/piped mode.
- *
- *  2. autoDistill consumer: when `feedback.autoDistill` is enabled and the
- *     accumulated store (all sessions + the web-UI feedback dir) holds
- *     enough unprocessed ratings past the watermark, run the existing
- *     distill() and register the result as a new version of the
- *     `<specName>-ratings` registry dataset (see ./autodistill.ts) —
- *     consumable as `--dataset registry:<specName>-ratings` by eval and
- *     optimize.
+ * The block's OTHER half — the one-keystroke exit rating prompt — used to live
+ * here too, which is exactly why a COMPILED cli bundle had no rating capture:
+ * the cli emitter dropped the `feedback:` block and only this path implemented
+ * it. The prompt now belongs to the runtime (`runChatLoop`'s `feedback`
+ * option, @crewhaus/runtime-core's exit-rating module), so `crewhaus run` and
+ * `bun dist/agent.ts` ask it identically and write the same `user_feedback`
+ * record. Auto-distillation stays here: it registers a VERSIONED dataset for
+ * `eval`/`optimize` to consume, which is a toolchain step rather than a
+ * property of the running agent (the compiler warns when a cli spec declares
+ * `feedback.autoDistill`, so nobody ships a bundle expecting it).
  */
 async function runFeedbackTeardown(
   ir: Extract<ReturnType<typeof lower>, { target: "cli" }>,
-  resumeId: string | undefined,
 ): Promise<void> {
   // "Watch me" (design/watch-me.md §11) — a user-scope watched harness
   // self-registers in the global registry at run time, so `watchme report
@@ -13233,49 +13325,8 @@ async function runFeedbackTeardown(
 
   if (ir.feedback === undefined) return;
 
-  // Resolve the session that just ran: the resumed id, else the most recent
-  // session recorded for this spec name (the same resolution --continue
-  // uses; runChatLoop does not return its sessionId).
-  let sessionId = resumeId;
-  if (sessionId === undefined) {
-    const store = createSessionStore();
-    const sessions = await store.list();
-    sessionId = sessions.find((s: { name: string }) => s.name === ir.name)?.id;
-  }
-
-  // ---- half 1: the exit rating prompt ----
-  if (sessionId !== undefined && existsSync(sessionJsonlPath(sessionId))) {
-    const turns = deriveTurns(readSessionEvents(sessionId));
-    const decision = shouldPromptExitRating({
-      stdinIsTTY: process.stdin.isTTY === true,
-      env: process.env,
-      feedback: ir.feedback,
-      assistantTurns: countAssistantTurns(turns),
-    });
-    if (decision.prompt && turns.length > 0) {
-      const choice = parseExitRatingKey(await readExitRatingKey(EXIT_RATING_TIMEOUT_MS));
-      if (choice !== "skip") {
-        const turnNumber = (turns[turns.length - 1] as DerivedTurn).turnNumber;
-        const record = buildFeedbackRecord({
-          id: `fb_${randomBytes(6).toString("hex")}`,
-          sessionId,
-          turnNumber,
-          ts: new Date().toISOString(),
-          source: "cli",
-          thumbs: choice,
-        });
-        const log = await openEventLog(sessionId, {
-          rootDir: join(process.cwd(), SESSIONS_SUBDIR),
-        });
-        await log.append({ kind: FEEDBACK_EVENT_KIND, payload: record });
-        process.stdout.write(
-          `[feedback] recorded ${choice === "up" ? "good" : "bad"} on ${sessionId} turn ${turnNumber}\n`,
-        );
-      }
-    }
-  }
-
-  // ---- half 2: the autoDistill consumer ----
+  // The autoDistill consumer. (The exit rating prompt that used to run here
+  // first now fires inside runChatLoop — see this function's doc comment.)
   if (ir.feedback.autoDistill !== true) return;
   const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
   const turns: SessionTurn[] = [];
@@ -13293,35 +13344,6 @@ async function runFeedbackTeardown(
     records,
     registry: createFileBackedRegistry({ rootDir: defaultDatasetsRoot() }),
     stateFilePath: join(process.cwd(), DISTILL_STATE_RELPATH),
-  });
-}
-
-/**
- * One raw-mode keystroke with a timeout (undefined on timeout or when
- * stdin is unusable). Thin IO by design — the prompt gate and the key
- * mapping are the unit-tested functions in ./autodistill.ts.
- */
-async function readExitRatingKey(timeoutMs: number): Promise<string | undefined> {
-  const stdin = process.stdin;
-  if (stdin.isTTY !== true || stdin.destroyed) return undefined;
-  process.stdout.write(EXIT_RATING_PROMPT);
-  return await new Promise<string | undefined>((resolveKey) => {
-    let done = false;
-    const finish = (v: string | undefined): void => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      stdin.off("data", onData);
-      if (typeof stdin.setRawMode === "function") stdin.setRawMode(false);
-      stdin.pause();
-      process.stdout.write("\n");
-      resolveKey(v);
-    };
-    const timer = setTimeout(() => finish(undefined), timeoutMs);
-    const onData = (chunk: Buffer | string): void => finish(chunk.toString());
-    if (typeof stdin.setRawMode === "function") stdin.setRawMode(true);
-    stdin.resume();
-    stdin.on("data", onData);
   });
 }
 
@@ -18579,7 +18601,7 @@ async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Pro
         "                                  [--platform slack|telegram|discord|all] [-o <dir>]\n" +
         "                                  [--dry-run] [--force]\n" +
         "       crewhaus channel verify <spec.yaml> [--platform slack|telegram|discord|all]\n" +
-        "                                  [--base-url <public-url>] [--dry-run]\n" +
+        "                                  [--base-url <public-url>] [--dry-run] [--offline]\n" +
         "\n" +
         "  provision — platform-side app setup derived from the spec + compiled daemon:\n" +
         "    slack     write <dir>/slack-app-manifest.yaml (the bot scopes + event\n" +
@@ -18596,12 +18618,23 @@ async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Pro
         "              adapter-derived permission bits. Slash commands are NOT\n" +
         "              auto-registered: the spec declares no command list and the\n" +
         "              adapter routes any command name to the agent.\n" +
-        "  verify — doctor-style probes, ✓/~/✗ per check, exit 1 on hard failures:\n" +
-        "    slack     auth.test + granted scopes (x-oauth-scopes) vs the needed set\n" +
-        "    telegram  getWebhookInfo url / allowed_updates / pending updates / last error\n" +
-        "    discord   applications/@me id / verify_key / interactions endpoint\n" +
+        "  verify — ✓/~/✗ per check, exit 1 on hard failures, in two phases:\n" +
+        "    boot gate every secret env-ref the compiled daemon refuses to start\n" +
+        "              without (all configured channels, including whatsapp/imessage,\n" +
+        "              plus the agent model's provider credentials) — no network\n" +
+        "    probes    slack auth.test + granted scopes (x-oauth-scopes) vs the needed\n" +
+        "              set; telegram getWebhookInfo url / allowed_updates / pending /\n" +
+        "              last error; discord applications/@me id / verify_key /\n" +
+        "              interactions endpoint. Skipped for a channel whose boot gate\n" +
+        "              already failed — an unbootable daemon cannot be wired.\n" +
+        "  --platform  narrow to one channel (default `all` = every configured one).\n" +
+        "              On verify it narrows the boot gate too: `--platform slack` will\n" +
+        "              not fail on another channel's unset env or on model credentials\n" +
         "  --base-url  the daemon's publicly reachable origin (required for provision;\n" +
         "              on verify it upgrades the webhook-URL checks from ~ to ✓/✗)\n" +
+        "  --offline   verify only: run the boot gate and stop. No platform call, so\n" +
+        "              the exit code depends on the environment alone — usable as a\n" +
+        "              deterministic pre-flight in CI or a recording\n" +
         "  --dry-run   print every network call (secrets redacted) without performing it\n" +
         "  --force     discord provision reads applications/@me first and REFUSES to\n" +
         "              overwrite an interactions_endpoint_url that differs from the\n" +
@@ -18644,9 +18677,14 @@ async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Pro
     if (err instanceof InvalidPlatformFlagError) die(err.message);
     throw err;
   }
+  // whatsapp/imessage have no platform-side flow to drive or probe. `verify`
+  // still gates on their boot-time env refs below (see the boot-gate phase),
+  // so the note must not read as "nothing here is checked".
   for (const p of selection.unsupported) {
     process.stdout.write(
-      `note: channels.${p} is configured but \`channel ${action}\` does not support it yet (slack|telegram|discord)\n`,
+      action === "verify"
+        ? `note: channels.${p} has no platform-side probe (its config lives off-platform) — only its boot-gate env refs are checked\n`
+        : `note: channels.${p} is configured but \`channel ${action}\` does not support it yet (slack|telegram|discord)\n`,
     );
   }
 
@@ -18671,6 +18709,31 @@ async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Pro
     }
     const outFlag = args.flags["out"];
     const outDir = typeof outFlag === "string" ? resolve(outFlag) : process.cwd();
+
+    // Validate EVERY selected platform's env before the first side effect.
+    // Provision writes the Slack manifest into `-o` (default: the cwd) and
+    // calls two live APIs; validating lazily inside the loop meant a spec
+    // with only Slack credentials left a stray slack-app-manifest.yaml in
+    // the operator's repo and then exited 1 on Telegram.
+    if (!dryRun) {
+      const missing = collectProvisionMissingEnv(
+        selection.platforms,
+        ir.channels,
+        baseUrl,
+        process.env,
+      );
+      if (missing.length > 0) {
+        const byPlatform = [...new Set(missing.map((m) => m.platform))].join(", ");
+        die(
+          `channel provision (${byPlatform}): unset env: ${missing
+            .map((m) => `${m.label} → $${m.envName}`)
+            .join(", ")} — export them, or narrow with --platform <${CHANNEL_PLATFORMS.join(
+            "|",
+          )}>, or use --dry-run to print the calls (nothing was written or called)`,
+        );
+      }
+    }
+
     process.stdout.write(
       `channel provision: ${ir.name} (${selection.platforms.join(", ")})${dryRun ? " (dry run)" : ""}\n`,
     );
@@ -18781,8 +18844,16 @@ async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Pro
   }
 
   // action === "verify"
+  const offline = args.flags["offline"] === true;
+  if (offline && dryRun) {
+    die(
+      "--dry-run and --offline are mutually exclusive: --dry-run prints the platform calls verify WOULD make, --offline runs the boot-gate checks and makes none",
+    );
+  }
   process.stdout.write(
-    `channel verify: ${ir.name} (${selection.platforms.join(", ")})${dryRun ? " (dry run)" : ""}\n`,
+    `channel verify: ${ir.name} (${selection.platforms.join(", ")})${
+      dryRun ? " (dry run)" : offline ? " (offline)" : ""
+    }\n`,
   );
   if (dryRun) {
     for (const platform of selection.platforms) {
@@ -18795,6 +18866,7 @@ async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Pro
   const verifyOpts = {
     env: process.env,
     ...(baseUrl !== undefined ? { baseUrl } : {}),
+    ...(offline ? { offline } : {}),
   };
   const checks: ChannelCheck[] = [];
   for (const platform of selection.platforms) {
@@ -18808,7 +18880,18 @@ async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Pro
       checks.push(...(await verifyDiscordChannel(ir.channels.discord, verifyOpts)));
     }
   }
-  const summary = summarizeChannelChecks(checks);
+  // Boot-gate coverage for the channels with no platform probe, and for the
+  // agent model's provider credentials — the daemon exits 2 on any of them,
+  // so leaving them out let `verify` go green on a bot that cannot start.
+  // Narrowing with --platform narrows the whole verdict to that platform;
+  // the default (`all`) means all, so it covers these too.
+  if (platformFlag === undefined || platformFlag === "all") {
+    for (const platform of selection.unsupported) {
+      checks.push(...channelEnvChecks(platform, ir.channels, process.env));
+    }
+    checks.push(...modelCredentialChecks(ir.agent.model, process.env));
+  }
+  const summary = summarizeChannelChecks(checks, { offline });
   for (const line of summary.lines) {
     process.stdout.write(`  ${line}\n`);
   }

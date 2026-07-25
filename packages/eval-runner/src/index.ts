@@ -54,6 +54,7 @@ import { warnUnconsumedCombinePolicy } from "./combine-warnings";
 import { defaultGraderRegistry } from "./default-registry";
 import { RunnerError } from "./errors";
 import { runSample } from "./run-sample";
+import { createSampleOutputWriter } from "./sample-output";
 import { Semaphore } from "./semaphore";
 import type {
   AgentInvoker,
@@ -103,6 +104,13 @@ export {
   type ExamChatLoopOptions,
 } from "./exam";
 export { Semaphore };
+// Item 20 — the per-sample, line-buffered stdout writer concurrent runs use
+// so N samples never splice their tokens into one unreadable stream.
+export {
+  createSampleOutputWriter,
+  type SampleOutputWriter,
+  type SampleOutputWriterOptions,
+} from "./sample-output";
 export { aggregate };
 export { RunnerError };
 export { runSample };
@@ -510,6 +518,13 @@ async function defaultInvoker(ir: IrV0, opts: RunEvalOptions): Promise<AgentInvo
   // can never bleed into a measurement.
   const fabricOn =
     (ir.memory !== undefined && ir.memory.enabled !== false) || ir.continuity !== undefined;
+  // Item 20 — concurrent samples all drive `runChatLoop`, which streams the
+  // model's token deltas to stdout. Unprefixed, N of them on one file
+  // descriptor splice mid-word ("TheThe capital of Brazil is …capital of
+  // Japan is…"). Above 1 sample in flight, each run gets its OWN
+  // line-buffered, sample-tagged sink; a sequential run keeps raw stdout so
+  // its output stays byte-identical to `crewhaus run`.
+  const fanOut = (opts.concurrency ?? DEFAULT_CONCURRENCY) > 1;
   return async (req) => {
     let tools: RegisteredTool[] = [...wired.tools];
     let skills = wired.skills;
@@ -541,38 +556,46 @@ async function defaultInvoker(ir: IrV0, opts: RunEvalOptions): Promise<AgentInvo
         slashCommands = memWired.options.slashCommands;
       }
     }
-    const agentOutput = await runChatLoop({
-      model: wired.model,
-      instructions: wired.instructions,
-      tools,
-      hooks: wired.hooks,
-      skills,
-      slashCommands,
-      ...(wired.subAgents !== undefined && wired.spawnSubAgent !== undefined
-        ? { subAgents: wired.subAgents, spawnSubAgent: wired.spawnSubAgent }
-        : {}),
-      ...(memoryOpt !== undefined ? { memory: memoryOpt } : {}),
-      ...(continuityOpt !== undefined ? { continuity: continuityOpt } : {}),
-      permissionRules: wired.permissionRules,
-      permissionMode: "auto",
-      // G54 — the spec's `failure_taxonomy` reaches the IN-LOOP recovery
-      // engine (recovery-engine's matcher runs before its built-in
-      // classify+recover flow), exactly as `crewhaus run` wires it: a
-      // user-named transient class gets its declared classified recovery
-      // inside the loop instead of dying and burning the runner's one
-      // blunt noise retry. IrFailureTaxonomyEntry is structurally the
-      // engine's NamedFailureClass, so it threads verbatim.
-      ...(ir.failureTaxonomy !== undefined && ir.failureTaxonomy.length > 0
-        ? { failureTaxonomy: ir.failureTaxonomy }
-        : {}),
-      sessionName: `${wired.sessionName}_${req.sample.id}`,
-      sessionTarget: wired.sessionTarget,
-      runContext: req.runContext,
-      sessionRootDir: req.sessionRootDir,
-      singleTurn: true,
-      seedMessages: [{ role: "user", content: req.sample.input }],
-    });
-    return { agentOutput };
+    const sampleOut = fanOut ? createSampleOutputWriter({ label: req.sample.id }) : undefined;
+    try {
+      const agentOutput = await runChatLoop({
+        model: wired.model,
+        instructions: wired.instructions,
+        tools,
+        hooks: wired.hooks,
+        skills,
+        slashCommands,
+        ...(wired.subAgents !== undefined && wired.spawnSubAgent !== undefined
+          ? { subAgents: wired.subAgents, spawnSubAgent: wired.spawnSubAgent }
+          : {}),
+        ...(memoryOpt !== undefined ? { memory: memoryOpt } : {}),
+        ...(continuityOpt !== undefined ? { continuity: continuityOpt } : {}),
+        permissionRules: wired.permissionRules,
+        permissionMode: "auto",
+        // G54 — the spec's `failure_taxonomy` reaches the IN-LOOP recovery
+        // engine (recovery-engine's matcher runs before its built-in
+        // classify+recover flow), exactly as `crewhaus run` wires it: a
+        // user-named transient class gets its declared classified recovery
+        // inside the loop instead of dying and burning the runner's one
+        // blunt noise retry. IrFailureTaxonomyEntry is structurally the
+        // engine's NamedFailureClass, so it threads verbatim.
+        ...(ir.failureTaxonomy !== undefined && ir.failureTaxonomy.length > 0
+          ? { failureTaxonomy: ir.failureTaxonomy }
+          : {}),
+        // Item 20 — this sample's own stdout sink while others run beside it.
+        ...(sampleOut !== undefined ? { stdout: (chunk: string) => sampleOut.write(chunk) } : {}),
+        sessionName: `${wired.sessionName}_${req.sample.id}`,
+        sessionTarget: wired.sessionTarget,
+        runContext: req.runContext,
+        sessionRootDir: req.sessionRootDir,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: req.sample.input }],
+      });
+      return { agentOutput };
+    } finally {
+      // A sample that ended mid-line (or threw) still surfaces its tail.
+      sampleOut?.end();
+    }
   };
 }
 

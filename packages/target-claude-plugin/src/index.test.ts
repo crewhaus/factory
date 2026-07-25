@@ -346,6 +346,63 @@ describe("emitClaudePlugin — generic agent shapes", () => {
   });
 });
 
+describe("emitClaudePlugin — authored assets (item 14)", () => {
+  const authored = [
+    {
+      path: "skills/research-topic/SKILL.md",
+      content: "---\nname: research-topic\ndescription: corroborate\n---\n\nCite two sources.\n",
+    },
+    { path: "skills/research-topic/references/checklist.md", content: "- [ ] two sources\n" },
+    { path: "commands/browse.md", content: "---\ndescription: browse\n---\nBrowse $ARGUMENTS\n" },
+  ];
+
+  test("carries authored skills + commands verbatim alongside the projection", () => {
+    const b = emitClaudePlugin(baseCli, { author: { name: "x" }, assets: authored });
+    const paths = b.files.map((f) => f.path);
+    // The synthesized skill still ships…
+    expect(paths).toContain("skills/hello-plugin/SKILL.md");
+    // …and so does everything the harness author wrote, byte-for-byte.
+    for (const asset of authored) {
+      expect(paths).toContain(asset.path);
+      expect(b.files.find((f) => f.path === asset.path)?.content).toBe(asset.content);
+    }
+  });
+
+  test("an authored file overrides the synthesized file at the same path (no duplicates)", () => {
+    const override = {
+      path: "skills/hello-plugin/SKILL.md",
+      content: "---\nname: hello-plugin\ndescription: hand-written\n---\n\nMine.\n",
+    };
+    const b = emitClaudePlugin(baseCli, { author: { name: "x" }, assets: [override] });
+    const matches = b.files.filter((f) => f.path === "skills/hello-plugin/SKILL.md");
+    expect(matches).toHaveLength(1);
+    expect(matches[0]?.content).toBe(override.content);
+    // Position is preserved — the override replaces in place, it does not append.
+    expect(new Set(b.files.map((f) => f.path)).size).toBe(b.files.length);
+  });
+
+  test("the README names the carried skills and commands", () => {
+    const b = emitClaudePlugin(baseCli, { author: { name: "x" }, assets: authored });
+    const readme = b.files.find((f) => f.path === "README.md")?.content ?? "";
+    expect(readme).toContain("## Authored assets");
+    expect(readme).toContain("`research-topic`");
+    expect(readme).toContain("`/browse`");
+  });
+
+  test("no assets → no Authored assets section (unchanged legacy output)", () => {
+    const b = emitClaudePlugin(baseCli, { author: { name: "x" } });
+    expect(b.files.find((f) => f.path === "README.md")?.content ?? "").not.toContain(
+      "Authored assets",
+    );
+  });
+
+  test("assets do not disturb the plugin.json → README.md file order", () => {
+    const b = emitClaudePlugin(baseCli, { author: { name: "x" }, assets: authored });
+    expect(b.files[0]?.path).toBe(".claude-plugin/plugin.json");
+    expect(b.files[1]?.path).toBe("README.md");
+  });
+});
+
 describe("emitClaudePlugin — error handling", () => {
   test("throws on unsupported target shape", () => {
     expect(() =>

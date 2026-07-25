@@ -148,7 +148,8 @@ export type CompileOptions = {
  * Loop contract 0.4 (Batch A, G45 warnings framework) — one non-fatal
  * compile diagnostic. `code` is a stable machine key
  * (`"accepted-but-unwired"`, `"edge-unsafe-tool"`,
- * `"channel-reactions-join"`), `path` the spec key it concerns (dot-joined),
+ * `"channel-reactions-join"`, `"cli-autodistill-toolchain"`), `path` the spec
+ * key it concerns (dot-joined),
  * `message` the human explanation. Additive: every existing `compile()`
  * consumer that only reads `.files` keeps working unchanged.
  */
@@ -326,6 +327,26 @@ function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning> {
     if (specDeclares(spec, row.path)) {
       out.push({ code: "accepted-but-unwired", path: row.path, message: row.message });
     }
+  }
+  // Item 1 — a compiled cli bundle DOES capture ratings (the runtime asks the
+  // exit rating prompt and appends the same `user_feedback` events
+  // `crewhaus rate` writes), but it does NOT auto-distill them: registering a
+  // VERSIONED `<spec>-ratings` registry dataset exists to be consumed by
+  // `crewhaus eval`/`optimize`, so it stays a toolchain step in the CLI's run
+  // teardown. Saying so at compile time beats letting a bundle look like it
+  // maintains the dataset when nothing in it does.
+  if (spec.target === "cli" && spec.feedback?.autoDistill === true) {
+    out.push({
+      code: "cli-autodistill-toolchain",
+      path: "feedback.autoDistill",
+      message: [
+        "the compiled bundle CAPTURES ratings (exit rating prompt → user_feedback events in",
+        ".crewhaus/sessions) but does not auto-distill them into the",
+        `\`${spec.name}-ratings\` registry dataset — that runs in the CLI teardown.`,
+        "Distill a bundle's accumulated ratings with `crewhaus distill --register`,",
+        "or drive the harness with `crewhaus run`",
+      ].join(" "),
+    });
   }
   // D40 — channel 👍/👎 reactions attribute to the exact reacted-to turn
   // through the outbound-ts join store the generated daemon appends as it
@@ -649,6 +670,9 @@ function lowerWhatsApp(whatsapp: SpecWhatsAppChannel): IrWhatsAppConfig {
     phoneNumberId: lowerCredential("channels.whatsapp.phoneNumberId", whatsapp.phoneNumberId),
     accessToken: lowerCredential("channels.whatsapp.accessToken", whatsapp.accessToken),
     appSecret: lowerCredential("channels.whatsapp.appSecret", whatsapp.appSecret),
+    ...(whatsapp.verifyToken !== undefined
+      ? { verifyToken: lowerCredential("channels.whatsapp.verifyToken", whatsapp.verifyToken) }
+      : {}),
   };
 }
 

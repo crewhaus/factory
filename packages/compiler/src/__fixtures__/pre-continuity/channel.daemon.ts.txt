@@ -38,13 +38,17 @@ if (__missingEnv.length > 0) {
 // metrics, alerts, incidents, and OTel export stay opt-in.
 process.env["CREWHAUS_COST_TRACKING"] ??= "1";
 
-const slackAdapter = createSlackAdapter({
-  botToken: process.env["PIN_SLACK_BOT_TOKEN"] ?? "",
-  signingSecret: process.env["PIN_SLACK_SIGNING_SECRET"] ?? "",
-});
-registerChannelAdapter("slack", slackAdapter);
-
 async function main(): Promise<void> {
+  // Channel adapters construct here, inside main(), so an adapter that
+  // refuses to boot (the iMessage host opt-in / macOS gate, a bad chat.db
+  // path, ...) is reported through the formatted failure handler below
+  // instead of escaping as a raw stack trace at module load.
+  const slackAdapter = createSlackAdapter({
+    botToken: process.env["PIN_SLACK_BOT_TOKEN"] ?? "",
+    signingSecret: process.env["PIN_SLACK_SIGNING_SECRET"] ?? "",
+  });
+  registerChannelAdapter("slack", slackAdapter);
+
   const __cwd = process.cwd();
   const [__hooks, __skills, __slashCommands] = await Promise.all([
     loadHooks({ cwd: __cwd }),

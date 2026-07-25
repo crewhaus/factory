@@ -1556,10 +1556,13 @@ const transactionPolicyBlock = transactionPolicySchema.optional();
 
 /**
  * Phase 3 §3.3 — CLI banner with optional tagline rotation. When set,
- * the compiled cli-target bundle prints this banner on cold start
- * (suppressed under `--resume` / `--continue` so resumed sessions
- * don't re-banner). Static mode picks the first tagline; random mode
- * picks one uniformly per startup.
+ * BOTH cli surfaces print this banner on cold start — the compiled
+ * bundle and `crewhaus run` (which used to ignore the block entirely,
+ * making an authored banner invisible to anyone who ran the spec
+ * directly). Suppressed under `--resume` / `--continue` so resumed
+ * sessions don't re-banner, and under `CREWHAUS_RESUMED=1` for a
+ * wrapper re-invoking a compiled bundle. Static mode picks the first
+ * tagline; random mode picks one uniformly per startup.
  */
 const cliBannerBlock = z
   .object({
@@ -1900,6 +1903,17 @@ const whatsappChannelSchema = z
     phoneNumberId: z.string().min(1),
     accessToken: z.string().min(1),
     appSecret: z.string().min(1),
+    // The token Meta presents on the GET callback-URL verification handshake
+    // (`hub.verify_token`). Optional: a daemon serving an already-verified
+    // subscription does not need it, and without it the handshake fails
+    // closed rather than echoing an unauthenticated challenge.
+    verifyToken: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "shared token echoed back on Meta's GET callback-URL verification handshake; required to verify a new webhook subscription",
+      ),
   })
   .strict();
 
@@ -2021,9 +2035,28 @@ const graphNodeSchema = z
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
     /**
-     * When true, the node calls `ctx.requestApproval(prompt)` before
-     * returning. The engine pauses, persists a checkpoint, and waits for
-     * `resume(checkpointId, decision)` from the operator/CLI.
+     * A human approval gate on this node, and a PRE-condition: the node
+     * calls `ctx.requestApproval(prompt)` BEFORE its model turn, so the
+     * prompt is answered against the UPSTREAM state (which the `hitl_pause`
+     * event and the bundle's pause report both print) and no tokens are
+     * spent until the human answers. The engine pauses, persists a
+     * checkpoint, and waits for `resume(checkpointId, decision)` from the
+     * operator/CLI; the resumed run replays this node from the top and
+     * makes its FIRST model call.
+     *
+     * The decision string is recorded at `state["<node>_decision"]`, which
+     * every downstream node reads as part of the upstream state. (NOTE:
+     * `edges[].when.key` cannot name it yet — that key must name a declared
+     * node; see the `graphEdgeWhenSchema` note below.) A rejecting decision
+     * — `reject`, `no`, `deny`, `decline`, `abort`, `cancel`, `stop`, `veto`
+     * (trimmed, case-insensitive) — cancels this node's turn entirely, so
+     * the node records only its decision and no output; any other string,
+     * including free text, approves it. To halt the run on a rejection,
+     * guard the node's outgoing edge with `when: { key: <node>, exists:
+     * true }` — a cancelled node records no output, so no edge matches.
+     *
+     * To have a human approve a node's OWN output, put the gate on the
+     * DOWNSTREAM node: its upstream state is exactly that output.
      */
     hitl: z
       .object({
@@ -2063,8 +2096,16 @@ const graphAnyNodeSchema = z.union([graphNodeSchema, graphJudgeNodeSchema]);
  *   - `equals` — take the edge when `state[key] === equals` (string/number/
  *     boolean strict equality).
  *   - `exists: true` — take the edge when `state[key] !== undefined` (the
- *     node has produced output; pairs with hitl `_decision` gating in a
- *     follow-up).
+ *     node has produced output — which, for a `hitl:` node, is FALSE when
+ *     the operator rejected the gate, since a rejected node records only
+ *     `state["<node>_decision"]`).
+ *
+ * GAP (unchanged by the pre-condition HITL fix): `key` may not yet name a
+ * hitl node's `<node>_decision` record — the cross-check below pins it to a
+ * declared node name, so a rejection can be observed via `exists` on the
+ * node itself but not matched on the decision string. Widening it means
+ * touching the three mirrored checks (this one, ir-passes' graph
+ * wellformedness, target-graph's validateGraph).
  *
  * Lowered to `IrGraphEdge.when` and emitted as a graph-engine
  * `EdgeCondition` (`(state) => state[key] === equals` / `!== undefined`).

@@ -72,13 +72,41 @@ describe("writeReport", () => {
         { question: "What are the technical risks?", answer: "answer 1", citationUrls: [] },
         { question: "What are the operational risks?", answer: "answer 2", citationUrls: [] },
       ],
-      citations: [],
+      citations: [{ ...citation("https://a.example.com", "snip") }],
     });
     expect(r.markdown).toMatch(/^# Top risks of crews\n/);
     expect(r.markdown).toContain("## What are the technical risks?");
     expect(r.markdown).toContain("## What are the operational risks?");
-    // No citations footer when there are zero citations.
-    expect(r.markdown.includes("## Citations")).toBe(false);
+    expect(r.markdown).toContain("## Citations");
+    expect(r.markdown).toContain("[1] https://a.example.com");
+  });
+
+  // A research report whose whole premise is "must cite" must never look
+  // complete when nothing was cited: the section stays, and says so.
+  test("zero citations still emits a ## Citations section, with an explicit notice", () => {
+    const r = writeReport({
+      goal: "Top risks of crews",
+      branches: [
+        { question: "What are the technical risks?", answer: "answer 1", citationUrls: [] },
+      ],
+      citations: [],
+    });
+    expect(r.markdown).toContain("## Citations");
+    expect(r.markdown).toContain("No citations were recorded");
+    // The notice must not read like a numbered citation.
+    expect(r.markdown).not.toMatch(/\[1\]/);
+    expect(r.json.citations).toEqual([]);
+  });
+
+  test("the empty-citations notice is the last thing in the report", () => {
+    const r = writeReport({
+      goal: "g",
+      branches: [{ question: "q", answer: "a", citationUrls: [] }],
+      citations: [],
+    });
+    const lines = r.markdown.trimEnd().split("\n");
+    expect(lines.at(-1)).toContain("No citations were recorded");
+    expect(r.markdown.endsWith("\n")).toBe(true);
   });
 
   test("produces a stable JSON shape (snapshot-friendly)", () => {

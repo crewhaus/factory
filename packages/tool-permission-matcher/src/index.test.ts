@@ -180,6 +180,178 @@ describe("globToRegex — backslash escape (additive, back-compat)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Table-driven coverage of EVERY glob shape the grammar admits.
+//
+// Regression home for issue #17: a bare `**` arg-glob compiled to
+// `^(?:/.*)?$` — it matched only the empty string or a string starting with
+// `/`, so the catch-all `alwaysAsk Bash(**)` that two starters ship was dead.
+// The `/**`-at-end branch stripped the last character of the accumulated regex
+// assuming a leading `/` had been emitted; for a bare `**` (and for a `**`
+// following another `**` group) there was nothing to strip.
+// ---------------------------------------------------------------------------
+
+type GlobRow = {
+  /** The glob under test (used as both a tool-glob and an arg-glob). */
+  readonly glob: string;
+  /** Values the glob MUST match. */
+  readonly matches: readonly string[];
+  /** Values the glob MUST NOT match. */
+  readonly rejects: readonly string[];
+  /** Optional note explaining a non-obvious expectation. */
+  readonly note?: string;
+};
+
+/** Match `value` against `glob` through the arg-glob path (`Read(<glob>)`). */
+function argMatches(glob: string, value: string): boolean {
+  return matchesPattern(compilePattern(`Read(${glob})`), "Read", { file_path: value });
+}
+
+const GLOB_TABLE: readonly GlobRow[] = [
+  // -- literals ------------------------------------------------------------
+  { glob: "foo/bar.ts", matches: ["foo/bar.ts"], rejects: ["foo/bar_ts", "foo/bar.tsx", ""] },
+
+  // -- single `*` (one segment, never crosses `/`) --------------------------
+  { glob: "*", matches: ["", "abc", "a b", "a\nb"], rejects: ["a/b", "/a"] },
+  { glob: "*.ts", matches: ["index.ts", ".ts"], rejects: ["src/index.ts", "index.tsx"] },
+  { glob: "a/*", matches: ["a/b", "a/"], rejects: ["a", "a/b/c"] },
+  { glob: "git *", matches: ["git status", "git commit -m msg"], rejects: ["ls -la", "git"] },
+  {
+    glob: "git *",
+    matches: ["git log --oneline"],
+    rejects: ["git add src/x.ts"],
+    note: "`*` deliberately stops at `/` — even for Bash commands. Use `**` to cross one.",
+  },
+
+  // -- `?` (exactly one non-separator char) --------------------------------
+  { glob: "?", matches: ["a", "1", " "], rejects: ["", "ab", "/"] },
+  { glob: "a?c", matches: ["abc", "a c"], rejects: ["ac", "abbc", "a/c"] },
+
+  // -- bare `**` — issue #17 -----------------------------------------------
+  {
+    glob: "**",
+    matches: ["", "echo hi", "/bin/ls", "a/b/c", "rm -rf /\necho done"],
+    rejects: [],
+    note: "issue #17 — a catch-all must match everything, not just '' and /…",
+  },
+
+  // -- `**` at a segment boundary ------------------------------------------
+  { glob: "**/*.ts", matches: ["index.ts", "src/index.ts", "a/b/c.ts"], rejects: ["index.js"] },
+  { glob: "**/foo", matches: ["foo", "a/foo", "a/b/foo"], rejects: ["foobar", "foo/bar"] },
+  { glob: "src/**", matches: ["src", "src/a", "src/a/b"], rejects: ["srcx", "other/src/a"] },
+  { glob: "/tmp/**", matches: ["/tmp", "/tmp/x", "/tmp/x/y"], rejects: ["/tmpfile", "tmp/x"] },
+  { glob: "src/**/*.ts", matches: ["src/a.ts", "src/a/b.ts"], rejects: ["src.ts", "other/a.ts"] },
+  { glob: "/a/**/b", matches: ["/a/b", "/a/x/b", "/a/x/y/b"], rejects: ["/ab", "/a/b/c"] },
+  {
+    glob: "**/src/**",
+    matches: ["src", "src/index.ts", "/foo/src/bar.ts"],
+    rejects: ["/etc/hosts"],
+  },
+  {
+    glob: "/**",
+    matches: ["", "/", "/a/b"],
+    rejects: ["a", "a/b"],
+    note: "`x/**` also matches `x`; with x empty that admits the empty string.",
+  },
+
+  // -- `**` glued to non-separators (plain 'any run') ----------------------
+  { glob: "a**b", matches: ["ab", "axb", "a/x/b"], rejects: ["axc", "xab"] },
+  { glob: "rm**", matches: ["rm", "rm -rf /", "rm -rf /\necho done"], rejects: ["grm", "ls"] },
+  { glob: "**foo", matches: ["foo", "xfoo", "a/b/foo"], rejects: ["foobar"] },
+  { glob: "foo**", matches: ["foo", "foobar", "foo/bar"], rejects: ["afoo"] },
+
+  // -- adjacent `**` groups (the second slice-guess victim) -----------------
+  { glob: "**/**", matches: ["", "a", "a/b", "a/b/c"], rejects: [] },
+  { glob: "**/**/x", matches: ["x", "a/x", "a/b/x"], rejects: ["y", "x/y"] },
+  { glob: "a/**/**/b", matches: ["a/b", "a/x/b", "a/x/y/b"], rejects: ["ab", "a/b/c"] },
+
+  // -- backslash escapes ----------------------------------------------------
+  { glob: String.raw`a\*b`, matches: ["a*b"], rejects: ["aXb", "ab"] },
+  { glob: String.raw`a\?b`, matches: ["a?b"], rejects: ["aXb"] },
+  { glob: String.raw`a\\b`, matches: ["a\\b"], rejects: ["ab"] },
+  { glob: "a\\", matches: ["a\\"], rejects: ["a"], note: "a trailing backslash is a literal" },
+  {
+    glob: String.raw`\/**`,
+    matches: ["", "/", "/a/b"],
+    rejects: ["a"],
+    note: "an escaped separator still folds into a following `**`",
+  },
+
+  // -- regex metacharacters are literals ------------------------------------
+  { glob: "a.b", matches: ["a.b"], rejects: ["axb"] },
+  { glob: "a+b", matches: ["a+b"], rejects: ["aab"] },
+  { glob: "(a)", matches: ["(a)"], rejects: ["a"] },
+  { glob: "[a]", matches: ["[a]"], rejects: ["a"] },
+  { glob: "a|b", matches: ["a|b"], rejects: ["a", "b"] },
+  { glob: "a$b", matches: ["a$b"], rejects: ["ab"] },
+  { glob: "^a", matches: ["^a"], rejects: ["a"] },
+  { glob: "a{2}", matches: ["a{2}"], rejects: ["aa"] },
+];
+
+describe("globToRegex — glob shape table (arg-glob)", () => {
+  for (const row of GLOB_TABLE) {
+    const suffix = row.note ? ` — ${row.note}` : "";
+    for (const value of row.matches) {
+      test(`${JSON.stringify(row.glob)} matches ${JSON.stringify(value)}${suffix}`, () => {
+        expect(argMatches(row.glob, value)).toBe(true);
+      });
+    }
+    for (const value of row.rejects) {
+      test(`${JSON.stringify(row.glob)} rejects ${JSON.stringify(value)}${suffix}`, () => {
+        expect(argMatches(row.glob, value)).toBe(false);
+      });
+    }
+  }
+});
+
+describe("globToRegex — glob shape table (tool-glob)", () => {
+  // The same compiler drives the tool-name half of a pattern, so every row
+  // must behave identically there (no-arg form → the arg check is skipped).
+  // `(` is reserved by the pattern grammar as the arg-glob opener, so rows
+  // containing a paren cannot be expressed as a bare tool glob.
+  for (const row of GLOB_TABLE.filter((r) => !r.glob.includes("(") && !r.glob.includes(")"))) {
+    test(`${JSON.stringify(row.glob)} behaves the same as a tool glob`, () => {
+      const p = compilePattern(row.glob);
+      for (const value of row.matches) expect(p._toolRe.test(value)).toBe(true);
+      for (const value of row.rejects) expect(p._toolRe.test(value)).toBe(false);
+    });
+  }
+});
+
+describe("globToRegex — `**` invariants", () => {
+  test("issue #17 — a catch-all Bash(**) matches a real command", () => {
+    const p = compilePattern("Bash(**)");
+    expect(matchesPattern(p, "Bash", { command: "echo hi" })).toBe(true);
+    expect(matchesPattern(p, "Bash", { command: "git push --force" })).toBe(true);
+    expect(matchesPattern(p, "Bash", { command: "/bin/ls" })).toBe(true);
+    expect(matchesPattern(p, "Bash", { command: "" })).toBe(true);
+  });
+
+  test("issue #17 — a catch-all tool glob `**` matches every tool name", () => {
+    const p = compilePattern("**");
+    for (const name of ["Bash", "Read", "mcp__srv__tool", "a/b"]) {
+      expect(matchesPattern(p, name, {})).toBe(true);
+    }
+  });
+
+  test("`**` is a strict superset of `*` for every table value", () => {
+    // `**` widens `*`; it must never match LESS. (Before the dotAll fix `*`
+    // matched a newline via [^/]* and `**` did not, via `.*`.)
+    const values = new Set(GLOB_TABLE.flatMap((r) => [...r.matches, ...r.rejects]));
+    for (const value of values) {
+      if (argMatches("*", value)) expect(argMatches("**", value)).toBe(true);
+      if (argMatches("a/*", value)) expect(argMatches("a/**", value)).toBe(true);
+    }
+  });
+
+  test("a `**` guard fires on a multi-line command", () => {
+    // The builtin safety floor is `Bash(rm**)`; a newline must not slip past it.
+    const p = compilePattern("Bash(rm**)");
+    expect(matchesPattern(p, "Bash", { command: "rm -rf /\necho done" })).toBe(true);
+    expect(matchesPattern(p, "Bash", { command: "rm\n-rf\n/" })).toBe(true);
+  });
+});
+
 describe("OPERATIVE_ARG_FIELDS (exported single source of truth)", () => {
   test("covers the arg-constrained built-in tools", () => {
     for (const t of ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Fetch", "WebFetch"]) {

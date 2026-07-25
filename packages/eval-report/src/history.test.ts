@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
 import { ReportError } from "./errors";
 import {
   BASELINES_FILENAME,
@@ -22,6 +23,8 @@ import {
   hashDatasetFile,
   readBaselines,
   readRunIndex,
+  recordEvalRun,
+  runIndexEntryFromSummary,
   setBaseline,
 } from "./history";
 
@@ -128,6 +131,144 @@ describe("run index (index.jsonl)", () => {
     appendRunIndex(makeEntry("run_bbbb2222bbbb2222"), evalsDir);
     const entries = readRunIndex(evalsDir);
     expect(entries.map((e) => e.runId)).toEqual(["run_aaaa1111aaaa1111", "run_bbbb2222bbbb2222"]);
+  });
+});
+
+function makeSampleResult(id: string, passed: boolean, retried = false): SampleResult {
+  return {
+    sampleId: id,
+    sessionId: `sess_${id.padEnd(16, "0")}`,
+    startedAt: "2026-07-01T00:00:00.000Z",
+    endedAt: "2026-07-01T00:00:01.000Z",
+    latencyMs: 100,
+    turns: 1,
+    tokens: { input: 10, output: 20 },
+    model: "claude-opus-4-7",
+    agentOutput: passed ? "correct" : "wrong",
+    grades: {
+      overall: { passed, score: passed ? 1 : 0, rationale: "" },
+      perGrader: [],
+    },
+    ...(retried ? { retried: true } : {}),
+  };
+}
+
+function makeSummary(
+  samples: SampleResult[],
+  config: Partial<EvalRunSummary["config"]> = {},
+): EvalRunSummary {
+  const scored = samples.length > 0 ? samples : [];
+  return {
+    runId: "run_cccc3333cccc3333",
+    startedAt: "2026-07-01T00:00:00.000Z",
+    endedAt: "2026-07-01T00:00:30.000Z",
+    samples,
+    aggregates: {
+      passRate:
+        scored.length === 0
+          ? 0
+          : scored.filter((s) => s.grades.overall.passed).length / scored.length,
+      meanScore:
+        scored.length === 0
+          ? 0
+          : scored.reduce((n, s) => n + s.grades.overall.score, 0) / scored.length,
+      p50Turns: 1,
+      p95Turns: 1,
+      p50LatencyMs: 100,
+      p95LatencyMs: 100,
+      totalTokens: { input: 10, output: 20 },
+      errorCount: 0,
+    },
+    config: {
+      specHash: "spec-hash-1",
+      datasetName: "smoke",
+      graderNames: ["exact"],
+      model: "claude-opus-4-7",
+      concurrency: 4,
+      ...config,
+    },
+    outDir: "/abs/evals/run_cccc3333cccc3333",
+  };
+}
+
+/**
+ * Item 15 — the shared summary → index-entry recorder. `crewhaus eval` and
+ * the standalone `target: eval` bundle both go through this, so one eval has
+ * ONE history whichever way it was launched.
+ */
+describe("recordEvalRun / runIndexEntryFromSummary", () => {
+  test("projects a summary onto the index entry the CLI records", () => {
+    const entry = runIndexEntryFromSummary(
+      makeSummary([makeSampleResult("a", true), makeSampleResult("b", false, true)]),
+      {
+        specName: "hello-eval",
+        specSource: "/abs/specs/hello-eval.yaml",
+        datasetHash: "d".repeat(64),
+        outDir: "/abs/evals/run_cccc3333cccc3333",
+      },
+    );
+    expect(entry).toEqual({
+      runId: "run_cccc3333cccc3333",
+      specName: "hello-eval",
+      specHash: "spec-hash-1",
+      specSource: "/abs/specs/hello-eval.yaml",
+      datasetName: "smoke",
+      datasetHash: "d".repeat(64),
+      passRate: 0.5,
+      meanScore: 0.5,
+      sampleCount: 2,
+      retriedCount: 1,
+      ts: "2026-07-01T00:00:30.000Z",
+      outDir: "/abs/evals/run_cccc3333cccc3333",
+    });
+  });
+
+  test("carries the run's measurement instrument, and omits what the run never pinned", () => {
+    const instrumented = runIndexEntryFromSummary(
+      makeSummary([makeSampleResult("a", true)], {
+        gradersHash: "g".repeat(64),
+        judgeModel: "judge-x",
+      }),
+      { specName: "s", datasetHash: "d".repeat(64), outDir: "/abs/run" },
+    );
+    expect(instrumented.gradersHash).toBe("g".repeat(64));
+    expect(instrumented.judgeModel).toBe("judge-x");
+    const bare = runIndexEntryFromSummary(makeSummary([makeSampleResult("a", true)]), {
+      specName: "s",
+      datasetHash: "d".repeat(64),
+      outDir: "/abs/run",
+    });
+    expect(bare.gradersHash).toBeUndefined();
+    expect(bare.judgeModel).toBeUndefined();
+    expect(bare.specSource).toBeUndefined();
+  });
+
+  test("appends to index.jsonl so readRunIndex (and `eval-report history`) sees the run", () => {
+    const evalsDir = join(newTempRoot(), ".crewhaus", "evals");
+    expect(readRunIndex(evalsDir)).toHaveLength(0);
+    const entry = recordEvalRun(makeSummary([makeSampleResult("a", true)]), {
+      specName: "hello-eval",
+      datasetHash: "d".repeat(64),
+      outDir: "/abs/evals/run_cccc3333cccc3333",
+      evalsDir,
+    });
+    const index = readRunIndex(evalsDir);
+    expect(index).toHaveLength(1);
+    expect(index[0]).toEqual(entry);
+    expect(index[0]?.specName).toBe("hello-eval");
+  });
+
+  test("refuses a 0-sample run — nothing is written", () => {
+    const evalsDir = join(newTempRoot(), ".crewhaus", "evals");
+    expect(() =>
+      recordEvalRun(makeSummary([]), {
+        specName: "hello-eval",
+        datasetHash: "d".repeat(64),
+        outDir: "/abs/evals/run_cccc3333cccc3333",
+        evalsDir,
+      }),
+    ).toThrow(/0-sample/);
+    expect(readRunIndex(evalsDir)).toHaveLength(0);
   });
 });
 

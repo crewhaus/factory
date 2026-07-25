@@ -552,6 +552,31 @@ describe("crewhaus compile", () => {
     expect(existsSync(join(outDir, "session-router.ts"))).toBe(true);
   });
 
+  // Item 1 — the cli emitter used to DROP the spec's `feedback:` block, so a
+  // compiled bundle had no rating prompt and no user_feedback capture at all
+  // while `crewhaus run` had both. The bundle now threads the block into
+  // runChatLoop (the runtime owns the prompt); only the autoDistill half stays
+  // a toolchain step, and the compile says so without failing --strict.
+  test("a feedback spec compiles the block into the bundle and warns only about autoDistill", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: ghostwriter\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: ghostwrite\nfeedback:\n  modality: binary\n  autoDistill: true\n",
+    );
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--strict", "--no-register", "-o", outDir], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    // The improvement contract reached the shipped artifact.
+    expect(readFileSync(join(outDir, "agent.ts"), "utf-8")).toContain("feedback:");
+    // Honest about the half it does not carry — and never escalated.
+    expect(result.stderr).toContain(
+      "crewhaus: warning[cli-autodistill-toolchain] feedback.autoDistill:",
+    );
+    expect(result.stderr).not.toContain("escalated to errors");
+  });
+
   test("compile --help documents the warning line shape and --strict escalation", async () => {
     const result = await runCli(["compile", "--help"]);
     expect(result.exitCode).toBe(0);
@@ -698,6 +723,73 @@ describe("crewhaus run", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("invalid --justification-judge");
     expect(result.stderr).toContain("rule-based, claude");
+  });
+
+  // Phase 3 §3.3 — `cli.banner` used to be codegen-only: a compiled bundle
+  // printed the brand, `crewhaus run` never read `ir.cli`, so an authored
+  // banner was invisible to everyone who ran the spec directly. Both surfaces
+  // now render from @crewhaus/target-cli's `renderBanner` (the byte-level
+  // codegen/interpreter parity is pinned in that package's banner.test.ts).
+  describe("cli.banner", () => {
+    /** A cli spec carrying a banner block, written into the test's tmp dir. */
+    function writeBannerSpec(taglines: ReadonlyArray<string>, mode = "static"): string {
+      const path = join(tmp, "crewhaus.yaml");
+      writeFileSync(
+        path,
+        [
+          "name: bannered",
+          "target: cli",
+          "agent:",
+          "  model: claude-sonnet-4-6",
+          "  instructions: be brief",
+          "cli:",
+          "  banner:",
+          `    taglineMode: ${mode}`,
+          "    taglines:",
+          ...taglines.map((t) => `      - ${JSON.stringify(t)}`),
+          "",
+        ].join("\n"),
+      );
+      return path;
+    }
+
+    test("prints the spec's banner on a cold `crewhaus run`", async () => {
+      const spec = writeBannerSpec(["exhaustive by default"]);
+      const result = await runCli(["run", spec], {
+        cwd: tmp,
+        env: { ANTHROPIC_API_KEY: "test-no-call" },
+        closeStdinImmediately: true,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("\n\x1b[1mbannered\x1b[0m — exhaustive by default\n\n");
+      // Brand first: the banner precedes the boot diagnostics, exactly as it
+      // does in a compiled bundle.
+      expect(result.stdout.indexOf("exhaustive by default")).toBeLessThan(
+        result.stdout.indexOf("agent ready"),
+      );
+    });
+
+    test("a spec without a banner block prints none", async () => {
+      const result = await runCli(["run", HELLO_SPEC], {
+        cwd: tmp,
+        env: { ANTHROPIC_API_KEY: "test-no-call" },
+        closeStdinImmediately: true,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).not.toContain("\x1b[1m");
+    });
+
+    test("CREWHAUS_RESUMED=1 suppresses the banner (resumed sessions don't re-banner)", async () => {
+      const spec = writeBannerSpec(["exhaustive by default"]);
+      const result = await runCli(["run", spec], {
+        cwd: tmp,
+        env: { ANTHROPIC_API_KEY: "test-no-call", CREWHAUS_RESUMED: "1" },
+        closeStdinImmediately: true,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).not.toContain("exhaustive by default");
+      expect(result.stdout).toContain("agent ready");
+    });
   });
 
   // Section 18 (#18 remainder) — the run path must wire the sandbox floor for
@@ -2478,6 +2570,89 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     const result = await runCli(["channel", "verify", CHANNEL_SPEC, "--platform", "matrix"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("expected one of: slack, telegram, discord, all");
+  });
+
+  // Demo-driver audit: `verify` named 5 of the 8 env vars the emitted daemon
+  // refuses to boot without, so fixing exactly what it listed still produced
+  // a daemon that exited 2.
+  test("verify names EVERY env var the daemon boots on, not just the probeable ones", async () => {
+    const result = await runCli(["channel", "verify", CHANNEL_SPEC]);
+    expect(result.exitCode).toBe(1);
+    for (const name of [
+      "$SLACK_BOT_TOKEN",
+      "$SLACK_SIGNING_SECRET",
+      "$TELEGRAM_BOT_TOKEN",
+      "$TELEGRAM_SECRET_TOKEN",
+      "$DISCORD_APPLICATION_ID",
+      "$DISCORD_BOT_TOKEN",
+      "$DISCORD_PUBLIC_KEY",
+    ]) {
+      expect(result.stdout).toContain(name);
+    }
+    // …plus the provider credential group the daemon also gates on.
+    expect(result.stdout).toContain("ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY");
+    expect(result.stdout).toContain("8 check(s), 8 failed");
+  });
+
+  // Demo-driver audit: with a token present, verify made a live auth.test, so
+  // its exit code depended on the network. --offline is the deterministic
+  // pre-flight; the unroutable API bases below would make any probe fail.
+  test("verify --offline exits 0 on a fully-set env with no network", async () => {
+    const result = await runCli(["channel", "verify", CHANNEL_SPEC, "--offline"], {
+      env: {
+        SLACK_API_BASE_URL: "http://127.0.0.1:1",
+        TELEGRAM_API_BASE_URL: "http://127.0.0.1:1",
+        DISCORD_API_BASE_URL: "http://127.0.0.1:1",
+        SLACK_BOT_TOKEN: "xoxb-x",
+        SLACK_SIGNING_SECRET: "x",
+        TELEGRAM_BOT_TOKEN: "x",
+        TELEGRAM_SECRET_TOKEN: "x",
+        DISCORD_APPLICATION_ID: "x",
+        DISCORD_BOT_TOKEN: "x",
+        DISCORD_PUBLIC_KEY: "x",
+        ANTHROPIC_API_KEY: "x",
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("(offline)");
+    expect(result.stdout).toContain("offline: no platform probes ran");
+    expect(result.stdout).not.toContain("auth.test");
+  });
+
+  test("verify --offline and --dry-run are mutually exclusive", async () => {
+    const result = await runCli(["channel", "verify", CHANNEL_SPEC, "--offline", "--dry-run"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("mutually exclusive");
+  });
+
+  // Demo-driver audit: provision wrote slack-app-manifest.yaml into the cwd
+  // and only THEN validated telegram/discord env, leaving a stray file (and a
+  // repo diff) behind on the abort.
+  test("provision validates every platform's env BEFORE writing anything", async () => {
+    const result = await runCli(
+      ["channel", "provision", CHANNEL_SPEC, "--base-url", "https://bot.example.com"],
+      { cwd: tmp },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("$TELEGRAM_BOT_TOKEN");
+    expect(result.stderr).toContain("$DISCORD_BOT_TOKEN");
+    expect(result.stderr).toContain("nothing was written or called");
+    expect(existsSync(join(tmp, "slack-app-manifest.yaml"))).toBe(false);
+    // The single-platform escape hatch the message names still works.
+    const slackOnly = await runCli(
+      [
+        "channel",
+        "provision",
+        CHANNEL_SPEC,
+        "--platform",
+        "slack",
+        "--base-url",
+        "https://bot.example.com",
+      ],
+      { cwd: tmp },
+    );
+    expect(slackOnly.exitCode).toBe(0);
+    expect(existsSync(join(tmp, "slack-app-manifest.yaml"))).toBe(true);
   });
 });
 

@@ -306,6 +306,67 @@ describe("formatBody — every kind + optional-field branches", () => {
     );
   });
 
+  // Audit item 21 — runtime-core publishes a `decision: "ask"` event BEFORE
+  // the approval prompt and a SECOND one carrying `askOutcome` after it
+  // resolves. The renderer only knew about the (unrelated) egress `outcome`
+  // field, so both publishes printed the same bytes and an ask's resolution
+  // was invisible under CREWHAUS_TRACE=pretty.
+  test("permission_decision ask resolution renders askOutcome", () => {
+    const preAsk = {
+      ...envelope,
+      kind: "permission_decision",
+      toolName: "Bash",
+      decision: "ask",
+      mode: "default",
+    } satisfies TraceEvent;
+    const resolved = {
+      ...envelope,
+      kind: "permission_decision",
+      toolName: "Bash",
+      decision: "ask",
+      mode: "default",
+      askOutcome: "denied",
+    } satisfies TraceEvent;
+    expect(formatLine(preAsk)).toBe(
+      `${prefix("permission_decision")}tool=Bash decision=ask mode=default`,
+    );
+    expect(formatLine(resolved)).toBe(
+      `${prefix("permission_decision")}tool=Bash decision=ask mode=default askOutcome=denied`,
+    );
+    // The two publishes must be distinguishable.
+    expect(formatLine(preAsk)).not.toBe(formatLine(resolved));
+  });
+
+  test("permission_decision renders askOutcome approved", () => {
+    const ev = {
+      ...envelope,
+      kind: "permission_decision",
+      toolName: "Write",
+      decision: "ask",
+      mode: "default",
+      askOutcome: "approved",
+      reason: "user approved",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("permission_decision")}tool=Write decision=ask mode=default askOutcome=approved reason=user approved`,
+    );
+  });
+
+  test("permission_decision renders askOutcome and outcome side by side", () => {
+    const ev = {
+      ...envelope,
+      kind: "permission_decision",
+      toolName: "Bash",
+      decision: "ask",
+      mode: "default",
+      askOutcome: "approved",
+      outcome: "egress-warned",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("permission_decision")}tool=Bash decision=ask mode=default askOutcome=approved outcome=egress-warned`,
+    );
+  });
+
   test("error_recovered", () => {
     const ev = {
       ...envelope,

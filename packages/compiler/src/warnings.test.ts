@@ -297,6 +297,36 @@ describe("compile() warnings — channel-reactions-join (D40)", () => {
   });
 });
 
+describe("compile() warnings — cli-autodistill-toolchain (item 1)", () => {
+  const cliYaml = (feedbackLines: readonly string[]): string =>
+    [
+      "name: ghost",
+      "target: cli",
+      "agent:",
+      "  model: m",
+      "  instructions: i",
+      ...feedbackLines,
+    ].join("\n");
+
+  test("feedback.autoDistill: true → one honest toolchain-step heads-up", () => {
+    const result = compile(cliYaml(["feedback:", "  autoDistill: true"]));
+    expect(result.warnings.length).toBe(1);
+    const w = result.warnings[0];
+    expect(w?.code).toBe("cli-autodistill-toolchain");
+    expect(w?.path).toBe("feedback.autoDistill");
+    // Honest about BOTH halves: the bundle does capture, it does not distill.
+    expect(w?.message).toContain("CAPTURES ratings");
+    expect(w?.message).toContain("ghost-ratings");
+    expect(w?.message).toContain("crewhaus distill --register");
+  });
+
+  test("a plain feedback block does NOT warn — the bundle wires the capture half", () => {
+    expect(compile(cliYaml(["feedback:", "  modality: binary"])).warnings).toEqual([]);
+    expect(compile(cliYaml(["feedback:", "  autoDistill: false"])).warnings).toEqual([]);
+    expect(compile(cliYaml([])).warnings).toEqual([]);
+  });
+});
+
 describe("G45 — validating ir-passes run unconditionally in compile()", () => {
   test("a graph with an unreachable node fails compile WITHOUT applyIrPasses", () => {
     const yaml = [

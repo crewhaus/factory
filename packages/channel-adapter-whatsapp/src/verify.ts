@@ -96,6 +96,30 @@ export function verifyWhatsAppSignature(
 }
 
 /**
+ * Constant-time comparison of the `hub.verify_token` Meta presents during the
+ * GET subscription handshake against the token this daemon was configured
+ * with. Both are shared secrets, so the comparison must not leak length or
+ * prefix through timing.
+ *
+ * An empty `expected` (no `verifyToken` configured) NEVER matches: a daemon
+ * that was not told the token must not be verifiable by an arbitrary Meta app.
+ */
+export function verifyWhatsAppVerifyToken(args: {
+  readonly expected: string;
+  readonly supplied: string;
+}): boolean {
+  if (args.expected.length === 0) return false;
+  const expectedBuf = Buffer.from(args.expected, "utf8");
+  const suppliedBuf = Buffer.from(args.supplied, "utf8");
+  // timingSafeEqual throws on length mismatch, so compare a fixed-length
+  // digest of each instead of the raw bytes — that keeps the comparison
+  // constant-time without leaking the configured token's length.
+  const expectedMac = createHmac("sha256", expectedBuf).update(expectedBuf).digest();
+  const suppliedMac = createHmac("sha256", expectedBuf).update(suppliedBuf).digest();
+  return timingSafeEqual(expectedMac, suppliedMac);
+}
+
+/**
  * Sign a body — used by smoke tests and the in-repo integration test to
  * construct fixtures the daemon will accept. Production code should NEVER
  * call this — Meta signs requests, not us.

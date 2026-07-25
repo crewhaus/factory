@@ -3,8 +3,17 @@
  *
  * Long-running consumer loop. Pulls jobs from any `QueueAdapter`, runs
  * the user's handler with `concurrency`-bounded parallelism, wraps each
- * call in an idempotency-key cache so retries hit cache, and acks /
+ * call in an idempotency-key cache so redeliveries hit cache, and acks /
  * nacks based on the handler's outcome.
+ *
+ * Idempotency window: the cache is keyed on the job id alone and holds
+ * only SUCCESSFUL results for `idempotencyTtlMs`. It fires when a job that
+ * already completed comes back — a swallowed ack, a crash between handler
+ * and ack, a visibility lease that expired mid-handler, a competing
+ * consumer — and the handler is skipped (`fromCache: true`). A clean
+ * pull → success → ack cycle never re-delivers, so a healthy run reports
+ * `fromCache: false` throughout; that is the window doing nothing because
+ * nothing was duplicated, not the window being inert.
  *
  * Visibility renewal: while a handler is running, a sidecar timer
  * extends the job's visibility every `visibilityRenewIntervalMs` until
@@ -154,7 +163,14 @@ export function startConsumer<TInput, TResult>(
 
   async function handleOne(job: Job<TInput>): Promise<void> {
     opts.observer?.onJobStart?.(job);
-    const key = idempotencyKey(job.id, job.attempt);
+    // Key on the job's IDENTITY only. Including `job.attempt` made the
+    // idempotency window unreachable: a redelivery — the one case the cache
+    // exists for — always arrives with a bumped attempt (the in-memory and
+    // postgres adapters increment it on every pull), so every lookup missed
+    // and `idempotencyTtlMs` was dead configuration. Failed attempts cache
+    // nothing (see `withIdempotency`), so a retry after a genuine failure
+    // still re-runs the handler.
+    const key = idempotencyKey(job.id);
     const stopRenew = startVisibilityRenew(opts.queue, job.id, visRenewMs, ts, tc);
     let outcome: ConsumerHandlerOutcome<TResult>;
     try {

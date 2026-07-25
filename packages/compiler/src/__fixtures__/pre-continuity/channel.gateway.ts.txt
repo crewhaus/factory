@@ -93,6 +93,23 @@ export function createGateway(config: GatewayConfig): Gateway {
       const adapter = config.adapters.get(match[1]);
       if (!adapter) return new Response("unknown channel", { status: 404 });
 
+      // Subscription handshake (Meta/WhatsApp `hub.challenge`): an unsigned
+      // GET with no body, so it cannot go through verify()/parseInbound() —
+      // the adapter authenticates it against its own shared verify token and
+      // we echo the challenge only on its say-so. Adapters whose platform has
+      // no such handshake leave `handshake` undefined and fall through to the
+      // signed path below unchanged.
+      if (req.method === "GET" && adapter.handshake !== undefined) {
+        const handshake = adapter.handshake({ headers: req.headers, url });
+        if (handshake.kind === "challenge") {
+          return new Response(handshake.challenge, {
+            status: 200,
+            headers: { "content-type": "text/plain" },
+          });
+        }
+        return new Response("verification failed", { status: 403 });
+      }
+
       const body = await req.text();
       const rawReq = { headers: req.headers, body };
       if (!adapter.verify(rawReq)) {

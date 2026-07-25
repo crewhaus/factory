@@ -84,6 +84,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **26 defects found by building a screencast driver for every demos starter
+  and grounding each on-camera claim against real behaviour.** Every item was
+  reproduced against `origin/main` before it was fixed, and each carries a
+  test that fails without the change. The behaviour changes worth knowing:
+  - **`CiteFact` now refuses a snippet that is not verbatim in the body
+    `Source` fetched for that URI**, and refuses a URI never loaded in the run
+    (`@crewhaus/crawler`). The tracker previously recorded whatever string the
+    model passed, straight into the citation log under a real URL with a real
+    content sha256 beside it — a fabricated quote was indistinguishable from a
+    real one. Matching is whitespace-insensitive so a hard-wrapped source
+    quoted on one line still cites; case, wording, punctuation and numbers all
+    still matter. A rejected citation returns a `[CiteFact rejected] …` tool
+    result so the model can re-quote in the same turn. BEHAVIOR CHANGE: a
+    research spec whose model paraphrases when it cites will record fewer — or
+    zero — citations where it previously recorded fabricated ones.
+  - **A research report always renders its `## Citations` section**, with an
+    explicit "nothing above is anchored to a fetched source" notice when the
+    list is empty, and the research daemon warns on stderr
+    (`@crewhaus/report-writer`, `@crewhaus/target-research-bundle`). A run
+    that cited nothing used to ship a report shaped exactly like a sourced
+    one.
+  - **A `hitl:` gate is now a true pre-condition.** `target: graph` emitted
+    `ctx.requestApproval(...)` *after* the gated node's model turn, then threw
+    the output away — the approver approved work they could not see, and the
+    node's model call was billed a second time on resume. The emitter now asks
+    before the turn, matching the contract `@crewhaus/graph-engine` already
+    implemented (pre-node checkpoint, replay-at-node), which is now written
+    down in the engine. BEHAVIOR CHANGE: for existing graph specs the gate
+    fires against the upstream state, and a rejection cancels the node's turn
+    instead of merely being recorded after the fact.
+  - **`compile --check` no longer reports RED for a spec whose MCP server
+    declares a required env var.** The check boots credential-free by design,
+    so such a spec could never go green and the failure was indistinguishable
+    from a genuinely broken bundle. An unset MCP credential is now a
+    recognised boot gate (green, exit 0, `boot gated (MCP server credentials)`)
+    alongside provider credentials and spec env refs — the inconsistency with
+    the channel shape is gone. The gate verdict line is also grammatical again
+    ("boot reached its a registered eval dataset gate" → fixed).
+  - **The managed daemon mints a session id `session-store` accepts.** It
+    generated a base36 id while the store requires `sess_<16 hex>`, so every
+    `runs.create` that omitted `sessionId` failed with `internal_error` — the
+    entire happy path of a `target: managed` deployment. Its default
+    permission rules also denied the continuity tools it hands the agent.
+  - **The OpenAI Realtime adapter speaks the GA `/v1/realtime` protocol.**
+    `@crewhaus/voice-runtime` still sent the retired `OpenAI-Beta:
+    realtime=v1` upgrade header and the beta `session.update` shape, so every
+    compiled voice bundle failed at connect. Beta server-event names are kept
+    as read-path aliases. BEHAVIOR CHANGE: the default model is now
+    `gpt-realtime`, and the session requests audio-only output modality
+    (transcripts still arrive).
+  - **`Bash(**)` matches commands again.** `globToRegex` compiled a bare `**`
+    argument glob to `/^(?:\/.*)?$/`, so a catch-all `alwaysAsk Bash(**)` rule
+    never fired for any real command (`@crewhaus/tool-permission-matcher`).
+  - **The file tools no longer walk `node_modules`.** Compiling a bundle into
+    the working directory buried the user's project under thousands of
+    vendored dependency files that `Glob`/`Grep`/`Read` happily returned.
+  - **`crewhaus channel verify` gains an offline mode and checks every env var
+    the daemon requires.** It made a live `slack.com` call as soon as
+    `SLACK_BOT_TOKEN` was set — so its exit code depended on the network — and
+    checked 5 of the 8 variables the emitted daemon refuses to boot without.
+    `crewhaus channel provision` no longer writes `slack-app-manifest.yaml`
+    into the working directory before validating the other platforms' env and
+    aborting.
+  - **`crewhaus export claude-plugin` carries the harness's authored assets.**
+    `.crewhaus/skills/*` and `.crewhaus/commands/*` were dropped entirely; the
+    only skill exported was one synthesized from `agent.instructions`.
+  - **A standalone eval bundle records its run in `eval-report history`.** It
+    wrote the run directory but never appended `.crewhaus/evals/index.jsonl`,
+    so the same eval had two different histories depending on how it was
+    launched. `eval` and `optimize` also no longer interleave concurrent
+    samples' tokens into one unprefixed stream.
+  - **A batch run's output contains the model's reply.** The worker returned
+    it and `onJobEnd` dropped it. `idempotencyWindowMs` was dead configuration
+    (the cache keyed on a monotonic job counter, so it could never dedupe).
+  - **The emitted channel dashboard renders its own name.** A stray brace in
+    the codegen template put `name}` in both the `<title>` and the `<h1>`. The
+    WhatsApp adapter now implements Meta's GET verification handshake, so a
+    callback URL can actually complete verification; the iMessage adapter is
+    constructed inside `main()`, so its host opt-in refusal prints the
+    formatted failure report instead of a raw stack trace.
+  - **`cli.banner` and the `feedback:` block reach the runtime.** The banner
+    was codegen-only, so `crewhaus run` never showed it; the `feedback:` block
+    was lowered into the IR and then dropped by the cli emitter, so a compiled
+    bundle had no rating prompt. `crewhaus tools suggest` no longer reports a
+    tool as implied-but-missing because the instructions tell the agent to
+    *refuse* it, and covers the whole builtin catalogue. Under
+    `CREWHAUS_TRACE=pretty`, a permission decision's ask resolution renders
+    instead of `undefined`.
 - **`crewhaus compile` now emits a `package.json` beside the bundle, so the
   documented standalone flow actually runs.** A local bundle's emitted
   entrypoint imports a dozen `@crewhaus/*` runtime packages, but nothing

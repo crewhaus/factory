@@ -9,6 +9,18 @@ import {
   renderBundleReadme,
 } from "@crewhaus/ir";
 import { memoryFragmentFromIr } from "@crewhaus/memory-service";
+import { renderBannerBoot } from "./banner";
+
+// Phase 3 §3.3 — the banner contract is shared with the interpreter path
+// (`crewhaus run` reads these too), so it lives in its own module.
+export {
+  RESUMED_ENV,
+  formatBanner,
+  pickTagline,
+  renderBanner,
+  renderBannerBoot,
+  shouldPrintBanner,
+} from "./banner";
 
 /**
  * Emit a self-contained CLI agent bundle for a CLI-target IR.
@@ -664,23 +676,13 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
 
   // Phase 3 §3.3 — CLI banner with optional tagline rotation. Emitted
   // ahead of runChatLoop so users see the brand on cold start. Suppressed
-  // when the environment sets CREWHAUS_RESUMED=1. NOTE: nothing in the
-  // toolchain sets that var — `crewhaus run --continue/--resume` drives the
-  // interpreter path, not a compiled bundle, and never touches the env. It
-  // is purely a hook for an external wrapper that re-invokes a compiled
-  // bundle and wants to skip the re-banner on a resumed run.
-  const bannerBoot = ir.cli?.banner
-    ? `if (process.env.CREWHAUS_RESUMED !== "1") {
-  const __taglines = ${JSON.stringify(ir.cli.banner.taglines)};
-  const __tagline = ${
-    ir.cli.banner.taglineMode === "random"
-      ? "__taglines[Math.floor(Math.random() * __taglines.length)]"
-      : "__taglines[0]"
-  };
-  process.stdout.write(\`\\n\\x1b[1m${escapeBannerName(ir.name)}\\x1b[0m — \${__tagline}\\n\\n\`);
-}
-`
-    : "";
+  // when the environment sets CREWHAUS_RESUMED=1 (the hook for an external
+  // wrapper that re-invokes a compiled bundle on a resumed session — a
+  // bundle parses no flags of its own). The interpreter path prints the
+  // SAME banner from the same module (`renderBanner` + `shouldPrintBanner`,
+  // where `--resume` / `--continue` are the suppression signal), so a
+  // spec-authored banner is no longer codegen-only.
+  const bannerBoot = renderBannerBoot(ir.name, ir.cli?.banner);
   // Section 18 — only flip `sandboxAvailable` on at runtime when the
   // operator has wired a real backend. Default (unset) treats docker as
   // available; `CREWHAUS_SANDBOX=noop` always denies the floor.
@@ -752,6 +754,12 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   // "Watch me" (§6.3) — the live-capture env stamp. Empty when the spec did
   // not opt into full capture, keeping pre-existing bundles byte-identical.
   const watchmeEnvStamp = renderWatchmeEnvStamp(ir);
+  // Item 1 — the spec's `feedback:` block. The emitter used to DROP it
+  // entirely, so a compiled bundle had no exit rating prompt and no
+  // `user_feedback` capture at all while `crewhaus run` did — the improvement
+  // contract the spec advertised vanished from the shipped artifact. The
+  // runtime owns the prompt now, so both surfaces just thread the block.
+  const feedbackField = renderFeedbackField(ir);
   const runChatLoopCall = `await runChatLoop({
   model: ${escapeJsonString(ir.agent.model)},
   instructions: ${escapeJsonString(ir.agent.instructions)},
@@ -759,7 +767,7 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   sessionTarget: "cli",${maxTokensField}${thinkingField}${streamingField}${rateLimitsField}${compactionModelField}${compactionTuningFields}${limitsFields}${failoverFields}${failureTaxonomyField}${budgetField}${evaluation.field}${sloField}${toolsField}${permField}${sandboxField}
   hooks: ${specHooks.hooksExpr},
   skills: __skills,
-  slashCommands: __slashCommands,${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}${memory.field}
+  slashCommands: __slashCommands,${feedbackField}${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}${memory.field}
 });`;
   // v0.3.0 Goal 6 — the exact "agent exited" fix. The top-level
   // `await runChatLoop(...)` used to be bare, so a terminal failure
@@ -1011,6 +1019,36 @@ function renderSloField(ir: IrV0): string {
 }
 
 /**
+ * Item 1 — render the `feedback` runChatLoop field from the spec's `feedback:`
+ * block, so a COMPILED bundle honours the improvement contract instead of
+ * silently dropping it: the runtime's REPL asks the one-keystroke exit rating
+ * at clean exit and appends the same durable `user_feedback` event
+ * `crewhaus rate` writes, which `crewhaus distill` / `optimize --ratings`
+ * already read out of `.crewhaus/sessions`.
+ *
+ * Only the two switches the runtime consumes are carried (`enabled` /
+ * `exitPrompt`, both booleans — safe to JSON.stringify): `modality`, `scale`
+ * and `storage` describe the CLI-side rating verbs, and `channelReactions` is
+ * the channel target's own gate.
+ *
+ * NOT carried: `autoDistill`. Auto-distilling accumulated ratings into a
+ * VERSIONED registry dataset is a toolchain step (it exists to be consumed by
+ * `crewhaus eval`/`optimize --dataset registry:<spec>-ratings`), so it stays
+ * in the CLI teardown — the compiler emits an honest `cli-autodistill-toolchain`
+ * warning rather than letting a bundle look like it distills. Empty when the
+ * spec omits the block, keeping pre-existing bundles byte-identical.
+ */
+function renderFeedbackField(ir: {
+  readonly feedback?: { readonly enabled?: boolean; readonly exitPrompt?: boolean };
+}): string {
+  if (ir.feedback === undefined) return "";
+  const carried: { enabled?: boolean; exitPrompt?: boolean } = {};
+  if (ir.feedback.enabled !== undefined) carried.enabled = ir.feedback.enabled;
+  if (ir.feedback.exitPrompt !== undefined) carried.exitPrompt = ir.feedback.exitPrompt;
+  return `\n  feedback: ${JSON.stringify(carried)},`;
+}
+
+/**
  * "Watch me" (watch-me §6.3) — stamp the live-capture gate at bundle boot when
  * the spec opted into full capture (`watchme.enabled` + `capture: "full"`).
  * `??=` so an operator's own env always wins, matching the G26 stamp posture.
@@ -1181,15 +1219,4 @@ defaultCatalog.register(__knowledgeTool);`;
     ],
     bootBlock,
   };
-}
-
-/**
- * Escape a string for safe embedding inside a backtick template literal
- * in the generated bundle. Banner names come from spec.name (user-
- * controlled but already validated to be a non-empty string) — we still
- * sanitize to be defensive about backticks and template-literal
- * interpolation tokens.
- */
-function escapeBannerName(name: string): string {
-  return name.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${");
 }

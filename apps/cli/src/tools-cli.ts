@@ -88,7 +88,12 @@ export function formatToolListLines(rows: ReadonlyArray<ToolListRow>): string[] 
  * tool is likely wanted. Kept intentionally small and obvious (no model, no
  * fuzzy match) — the same posture scaffold-evals uses when it derives
  * `expected_tools` from a task. Unknown/custom tools never appear here (only
- * builtins are suggestible); a builtin with no keywords is never suggested.
+ * builtins are suggestible).
+ *
+ * EVERY builtin key must appear here: a builtin with no keywords can never be
+ * suggested no matter what the instructions say, which silently shrinks the
+ * catalogue this command claims to rank. `tools-cli.test.ts` asserts the key
+ * set covers `CLI_RUNTIME_TOOL_KEYS` — add keywords when you add a builtin.
  */
 export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Object.freeze({
   read: ["read", "open file", "file contents", "inspect file", "cat "],
@@ -97,6 +102,20 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
   glob: ["glob", "find files", "list files", "match files", "file pattern"],
   grep: ["grep", "search for", "search the", "find in files", "look for", "search code"],
   bash: ["bash", "shell", "run command", "execute command", "terminal", "run a script"],
+  bashOutput: [
+    "background command",
+    "background job",
+    "long-running command",
+    "poll the output",
+    "stream the output",
+  ],
+  killShell: [
+    "kill the shell",
+    "kill the command",
+    "terminate the command",
+    "stop the command",
+    "cancel the command",
+  ],
   todoWrite: ["todo", "task list", "track tasks", "checklist"],
   webFetch: ["fetch url", "fetch a url", "webpage", "web page", "http get", "download page"],
   webSearch: ["web search", "search the web", "search online", "look up online", "google"],
@@ -112,6 +131,139 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
   codegraphCallees: ["callees", "what does it call", "find callees"],
   codegraphImpact: ["impact analysis", "blast radius", "affected by"],
 });
+
+/**
+ * Tools that only make sense beside a parent tool. Granting `bashOutput`
+ * without `bash` is the anomaly; granting it WITH `bash` is the normal trio,
+ * so flagging it as an over-grant just because the prose never said
+ * "background command" is noise.
+ */
+export const TOOL_COMPANIONS: Readonly<Record<string, string>> = Object.freeze({
+  bashOutput: "bash",
+  killShell: "bash",
+});
+
+/**
+ * Phrases that make the clause they appear in a REFUSAL rather than a
+ * capability. "…say so if the user asks for image generation" must not read as
+ * "this agent needs imageGenerate" — that false positive is worse than a
+ * missed suggestion, because it is the first line of the report and the user
+ * would act on it by granting a tool the instructions forbid.
+ *
+ * Scoping is per clause, so a keyword sharing a clause with a cue ("never
+ * guess a path — read the file") is dropped too. That direction of error is
+ * the cheap one: `tools suggest` under-reports instead of recommending a tool
+ * the prose forbids, and any other clause asking for the tool still counts.
+ */
+const NEGATION_CUES: ReadonlyArray<string> = Object.freeze([
+  "do not",
+  "does not",
+  "don't",
+  "don’t",
+  "doesn't",
+  "doesn’t",
+  "never",
+  "refuse",
+  "refusal",
+  "decline",
+  "avoid",
+  "must not",
+  "cannot",
+  "can't",
+  "can’t",
+  "won't",
+  "won’t",
+  "should not",
+  "shouldn't",
+  "shouldn’t",
+  "no need to",
+  "without",
+  "unrelated",
+  "not allowed",
+  "not permitted",
+  "out of scope",
+  "off-limits",
+]);
+
+/**
+ * Word-boundary matcher for one keyword, with the common English inflections
+ * so "reads"/"reading" still count. A plain `includes()` matched "read" inside
+ * "already"/"spreadsheet" and "edit" inside "credit", which put tools in the
+ * report that the instructions never mentioned.
+ */
+function keywordRegex(keyword: string): RegExp {
+  const kw = keyword.trim();
+  const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const left = /^[\w]/.test(kw) ? "\\b" : "";
+  const right = /[\w]$/.test(kw) ? "(?:s|es|ed|ing)?\\b" : "";
+  return new RegExp(`${left}${escaped}${right}`);
+}
+
+/**
+ * Naming a tool outright is the strongest possible implication, so a
+ * camelCase builtin identifier counts as its own keyword — instructions that
+ * say "record the plan with `todoWrite`" or "run `codegraphImpact`" imply
+ * those tools even when no prose keyword fires. Restricted to multi-word
+ * identifiers: bare `write`/`fetch`/`shell` are ordinary English and would
+ * re-introduce the false positives the curated lists avoid.
+ */
+function identityKeywords(key: string, runtimeName: string | undefined): string[] {
+  if (!/[a-z][A-Z]/.test(key)) return [];
+  // Reported verbatim (matching is case-insensitive) so the evidence line
+  // reads "matched: codegraphImpact", the spelling the user wrote.
+  const ids = [key];
+  if (runtimeName !== undefined && runtimeName.toLowerCase() !== key.toLowerCase()) {
+    ids.push(runtimeName);
+  }
+  return ids;
+}
+
+const KEYWORD_REGEX_CACHE = new Map<string, RegExp>();
+/** Case-insensitive: clauses arrive lowercased, so lowercase the needle too. */
+function matchesKeyword(clause: string, keyword: string): boolean {
+  let re = KEYWORD_REGEX_CACHE.get(keyword);
+  if (re === undefined) {
+    re = keywordRegex(keyword.toLowerCase());
+    KEYWORD_REGEX_CACHE.set(keyword, re);
+  }
+  return re.test(clause);
+}
+
+/**
+ * Split instructions into clauses so a negation cue is scoped to the text it
+ * negates. Instructions are usually YAML block scalars — hard-wrapped prose
+ * mixed with bullet lists — so splitting on raw newlines would tear
+ * "…something unrelated to the codebase (open-domain chat, image generation…"
+ * in half and strand the cue in a different clause from the keyword. Unwrap
+ * continuation lines first (blank lines, headings and list markers start a new
+ * item), then cut on sentence ends. Exported for tests.
+ */
+export function splitInstructionClauses(text: string): string[] {
+  const items: string[] = [];
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim();
+    if (line === "") {
+      items.push(""); // hard break — the next line starts a new item
+      continue;
+    }
+    const startsItem = /^([-*•]|\d+[.)]|#{1,6}\s)/.test(line);
+    const prev = items.length > 0 ? items[items.length - 1] : undefined;
+    if (startsItem || prev === undefined || prev === "") items.push(line);
+    else items[items.length - 1] = `${prev} ${line}`;
+  }
+  const clauses: string[] = [];
+  for (const item of items) {
+    for (const part of item.split(/(?<=[.!?;])\s+/)) {
+      const clause = part.trim();
+      if (clause !== "") clauses.push(clause);
+    }
+  }
+  return clauses;
+}
+
+function isNegated(clause: string): boolean {
+  return NEGATION_CUES.some((cue) => clause.includes(cue));
+}
 
 export type ToolSuggestion = {
   readonly key: string;
@@ -129,6 +281,12 @@ export type ToolSuggestResult = {
   readonly present: ReadonlyArray<ToolSuggestion>;
   /** Tools in the spec that no keyword implied (candidate over-grants). */
   readonly unimplied: ReadonlyArray<string>;
+  /**
+   * Tools whose ONLY keyword hits sat in a refusal/negation clause. Reported
+   * as evidence (an instruction that forbids a capability is a reason to drop
+   * the tool, never to add it) but never suggested.
+   */
+  readonly negated: ReadonlyArray<ToolSuggestion>;
 };
 
 /**
@@ -136,6 +294,9 @@ export type ToolSuggestResult = {
  * current `tools:` list (camelCase keys, possibly empty); `toolKeys` is the
  * set of resolvable builtin keys (so a suggestion never names a tool the
  * runtime can't load). Pure and deterministic.
+ *
+ * Matching is literal and clause-scoped: word-boundary keyword hits, with hits
+ * inside a refusal clause routed to `negated` instead of `missing`.
  */
 export function suggestTools(
   instructions: string,
@@ -143,23 +304,32 @@ export function suggestTools(
   toolKeys: ReadonlyArray<string>,
   toolMap: Readonly<Record<string, RegisteredTool>>,
 ): ToolSuggestResult {
-  const haystack = instructions.toLowerCase();
+  const clauses = splitInstructionClauses(instructions.toLowerCase());
+  const affirmative = clauses.filter((c) => !isNegated(c));
+  const refusing = clauses.filter((c) => isNegated(c));
   const present = new Set(specTools);
   const known = new Set(toolKeys);
   const missing: ToolSuggestion[] = [];
   const alreadyPresent: ToolSuggestion[] = [];
+  const negated: ToolSuggestion[] = [];
 
-  for (const [key, keywords] of Object.entries(TOOL_KEYWORDS)) {
+  for (const [key, curated] of Object.entries(TOOL_KEYWORDS)) {
     if (!known.has(key)) continue; // never suggest an unresolvable tool
-    const matched = keywords.filter((kw) => haystack.includes(kw));
-    if (matched.length === 0) continue;
-    const suggestion: ToolSuggestion = {
+    const keywords = [...curated, ...identityKeywords(key, toolMap[key]?.name)];
+    const matched = keywords.filter((kw) => affirmative.some((c) => matchesKeyword(c, kw)));
+    const build = (kws: ReadonlyArray<string>): ToolSuggestion => ({
       key,
       name: toolMap[key]?.name ?? key,
-      matchedKeywords: matched,
+      matchedKeywords: kws,
       alreadyPresent: present.has(key),
-    };
-    (suggestion.alreadyPresent ? alreadyPresent : missing).push(suggestion);
+    });
+    if (matched.length > 0) {
+      const suggestion = build(matched);
+      (suggestion.alreadyPresent ? alreadyPresent : missing).push(suggestion);
+      continue;
+    }
+    const refused = keywords.filter((kw) => refusing.some((c) => matchesKeyword(c, kw)));
+    if (refused.length > 0) negated.push(build(refused));
   }
 
   const rank = (a: ToolSuggestion, b: ToolSuggestion): number => {
@@ -168,12 +338,22 @@ export function suggestTools(
   };
   missing.sort(rank);
   alreadyPresent.sort(rank);
+  negated.sort(rank);
 
-  // Spec tools no keyword implied — possible over-grants worth reviewing.
+  // Spec tools no keyword implied — possible over-grants worth reviewing. A
+  // companion of a granted parent (bashOutput beside bash) is expected, not an
+  // over-grant; a tool whose only mention was a refusal stays flagged, because
+  // "refuse image generation" IS the argument for dropping imageGenerate.
   const impliedKeys = new Set([...missing, ...alreadyPresent].map((s) => s.key));
-  const unimplied = specTools.filter((t) => !impliedKeys.has(t)).sort();
+  const unimplied = specTools
+    .filter((t) => !impliedKeys.has(t))
+    .filter((t) => {
+      const parent = TOOL_COMPANIONS[t];
+      return parent === undefined || !present.has(parent);
+    })
+    .sort();
 
-  return { missing, present: alreadyPresent, unimplied };
+  return { missing, present: alreadyPresent, unimplied, negated };
 }
 
 export function formatSuggestLines(result: ToolSuggestResult): string[] {
@@ -192,11 +372,22 @@ export function formatSuggestLines(result: ToolSuggestResult): string[] {
       lines.push(`  · ${s.key} — matched: ${s.matchedKeywords.join(", ")}`);
     }
   }
+  if (result.negated.length > 0) {
+    lines.push("mentioned only in a refusal (NOT suggested):");
+    for (const s of result.negated) {
+      lines.push(
+        `  − ${s.key} (${s.name}) — matched: ${s.matchedKeywords.join(", ")}${s.alreadyPresent ? " — granted in tools: though the instructions refuse it" : ""}`,
+      );
+    }
+  }
   if (result.unimplied.length > 0) {
     lines.push(
       `in tools: but not implied by instructions (review — possible over-grant): ${result.unimplied.join(", ")}`,
     );
   }
+  lines.push(
+    "heuristic: literal keyword match over agent.instructions, not a model — wording it doesn't recognize won't be suggested; `crewhaus tools list` shows every builtin",
+  );
   return lines;
 }
 

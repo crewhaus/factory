@@ -46,6 +46,7 @@ export {
   type BaselinesFile,
   DEFAULT_EVALS_DIR,
   INDEX_FILENAME,
+  type RecordEvalRunOptions,
   type RunIndexEntry,
   appendRunIndex,
   baselineKey,
@@ -53,5 +54,7 @@ export {
   hashDatasetFile,
   readBaselines,
   readRunIndex,
+  recordEvalRun,
+  runIndexEntryFromSummary,
   setBaseline,
 } from "./history";

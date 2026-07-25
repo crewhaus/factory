@@ -169,6 +169,10 @@ function requiredEnvNames(ir: IrChannelV0): string[] {
     if (whatsapp.phoneNumberId.kind === "env") names.push(whatsapp.phoneNumberId.name);
     if (whatsapp.accessToken.kind === "env") names.push(whatsapp.accessToken.name);
     if (whatsapp.appSecret.kind === "env") names.push(whatsapp.appSecret.name);
+    // verifyToken is optional in spec, but once declared it is load-bearing
+    // (Meta's callback-URL handshake fails closed without it), so an unset
+    // env var is a boot-time misconfiguration like any other.
+    if (whatsapp.verifyToken?.kind === "env") names.push(whatsapp.verifyToken.name);
   }
   const imessage = ir.channels.imessage;
   if (imessage !== undefined) {
@@ -1561,6 +1565,23 @@ ${gatewayActionsBlock}      // Match adapter by path prefix: /slack/events → "
       const adapter = config.adapters.get(match[1]);
       if (!adapter) return new Response("unknown channel", { status: 404 });
 
+      // Subscription handshake (Meta/WhatsApp \`hub.challenge\`): an unsigned
+      // GET with no body, so it cannot go through verify()/parseInbound() —
+      // the adapter authenticates it against its own shared verify token and
+      // we echo the challenge only on its say-so. Adapters whose platform has
+      // no such handshake leave \`handshake\` undefined and fall through to the
+      // signed path below unchanged.
+      if (req.method === "GET" && adapter.handshake !== undefined) {
+        const handshake = adapter.handshake({ headers: req.headers, url });
+        if (handshake.kind === "challenge") {
+          return new Response(handshake.challenge, {
+            status: 200,
+            headers: { "content-type": "text/plain" },
+          });
+        }
+        return new Response("verification failed", { status: 403 });
+      }
+
       const body = await req.text();
       const rawReq = { headers: req.headers, body };
       if (!adapter.verify(rawReq)) {
@@ -1810,10 +1831,14 @@ registerChannelAdapter("discord", discordAdapter);`);
     adapterImports.push(
       `import { createWhatsAppAdapter } from "@crewhaus/channel-adapter-whatsapp";`,
     );
+    const waVerifyToken =
+      whatsapp.verifyToken !== undefined
+        ? `\n  verifyToken: ${renderSecretExpr(whatsapp.verifyToken)} ?? "",`
+        : "";
     adapterConstructs.push(`const whatsappAdapter = createWhatsAppAdapter({
   phoneNumberId: ${waPhoneId} ?? "",
   accessToken: ${waAccessToken} ?? "",
-  appSecret: ${waAppSecret} ?? "",
+  appSecret: ${waAppSecret} ?? "",${waVerifyToken}
 });
 registerChannelAdapter("whatsapp", whatsappAdapter);`);
     adapterMapEntries.push(`["whatsapp", whatsappAdapter]`);
@@ -1835,7 +1860,18 @@ registerChannelAdapter("imessage", imessageAdapter);`);
     adapterMapEntries.push(`["imessage", imessageAdapter]`);
   }
 
-  const adapterConstructBlock = adapterConstructs.join("\n\n");
+  // Adapter construction lives INSIDE main() (indented one level), not at
+  // module scope: some adapters refuse to boot by throwing from their factory
+  // — iMessage rejects a non-macOS host or a missing
+  // CREWHAUS_IMESSAGE_HOST_ENABLED=1 opt-in, and every adapter's config
+  // validation can throw. At module scope those throws escape `main().catch`,
+  // so an operator saw a raw Bun stack trace instead of the v0.3.0 formatted
+  // failure report every other daemon failure produces.
+  const adapterConstructBlock = adapterConstructs
+    .join("\n\n")
+    .split("\n")
+    .map((line) => (line === "" ? "" : `  ${line}`))
+    .join("\n");
   const adapterMapLiteral = `new Map([${adapterMapEntries.join(", ")}])`;
 
   const builtinImportBlock = builtinImports.length > 0 ? `${builtinImports.join("\n")}\n` : "";
@@ -2008,7 +2044,7 @@ registerChannelAdapter("imessage", imessageAdapter);`);
       if (__gatewayUiEnabled && (url.pathname === "/" || url.pathname === "/index.html")) {
         // Minimal dashboard; Studio-UI integration is a follow-up.
         return new Response(
-          \`<!doctype html><html><head><meta charset="utf-8"><title>\${${escapeJsonString(ir.name)}}}</title><style>body{font-family:system-ui;padding:2rem;max-width:48rem;margin:auto;color:#333}h1{margin-bottom:0.25rem}pre{background:#f4f4f4;padding:1rem;border-radius:6px;overflow:auto}</style></head><body><h1>\${${escapeJsonString(ir.name)}}}</h1><p>channel daemon · <a href="/status">/status</a></p><pre id="s">loading…</pre><script>fetch("/status").then(r=>r.json()).then(d=>{document.getElementById("s").textContent=JSON.stringify(d,null,2)})</script></body></html>\`,
+          \`<!doctype html><html><head><meta charset="utf-8"><title>\${${escapeJsonString(ir.name)}}</title><style>body{font-family:system-ui;padding:2rem;max-width:48rem;margin:auto;color:#333}h1{margin-bottom:0.25rem}pre{background:#f4f4f4;padding:1rem;border-radius:6px;overflow:auto}</style></head><body><h1>\${${escapeJsonString(ir.name)}}</h1><p>channel daemon · <a href="/status">/status</a></p><pre id="s">loading…</pre><script>fetch("/status").then(r=>r.json()).then(d=>{document.getElementById("s").textContent=JSON.stringify(d,null,2)})</script></body></html>\`,
           { headers: { "content-type": "text/html; charset=utf-8" } },
         );
       }
@@ -2142,9 +2178,13 @@ import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
 ${approvalsImport}import { join } from "node:path";
 
 ${startupEnvCheck}${observabilityEnvStamp}
+async function main(): Promise<void> {
+  // Channel adapters construct here, inside main(), so an adapter that
+  // refuses to boot (the iMessage host opt-in / macOS gate, a bad chat.db
+  // path, ...) is reported through the formatted failure handler below
+  // instead of escaping as a raw stack trace at module load.
 ${adapterConstructBlock}
 
-async function main(): Promise<void> {
 ${extensionBoot}${specHooksBoot}${auditApprovalsBoot}
 ${registerBlock}${mcpBoot}${subAgentBoot}${knowledgeBoot}
   // Loop contract 0.4 (Batch E, G78) — per-spec cross-run prompt-cache

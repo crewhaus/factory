@@ -24,6 +24,7 @@ import {
   type DatasetRegistry,
   type DatasetSplit,
   latestVersion,
+  overallDatasetHash,
 } from "@crewhaus/dataset-registry";
 import type { Sample } from "@crewhaus/eval-dataset";
 
@@ -219,24 +220,13 @@ export function samplesForSplits(
 }
 
 /**
- * One stable sha256 over the per-sample content hashes of the selected
- * splits. Split names are folded in as domain separators (train vs dev with
- * identical samples still hash apart) and splits are visited in canonical
- * order, so neither the caller's array order nor record key order can change
- * the digest. Feeds RunIndexEntry.datasetHash for `registry:` datasets.
+ * The registry-content digest that feeds `RunIndexEntry.datasetHash`. Now
+ * owned by `@crewhaus/dataset-registry` (a pure function of a DatasetRecord)
+ * so the emitted `target: eval` bundle derives the SAME dataset identity for
+ * its run-index entry as `crewhaus eval --dataset registry:<ref>` does —
+ * re-exported here because this module is the CLI's dataset vocabulary.
  */
-export function overallDatasetHash(
-  record: DatasetRecord,
-  splits: ReadonlyArray<DatasetSplit>,
-): string {
-  const wanted = new Set(splits);
-  const h = createHash("sha256");
-  for (const s of SPLIT_ORDER) {
-    if (!wanted.has(s) || record.splits[s] === undefined) continue;
-    h.update(`${s}:${(record.sampleHashes[s] ?? []).join(",")}\n`);
-  }
-  return h.digest("hex");
-}
+export { overallDatasetHash };
 
 export type ResolvedRegistryRef = {
   readonly record: DatasetRecord;

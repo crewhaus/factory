@@ -2,15 +2,22 @@
  * Catalog R7 `idempotency-keys` — Section 23 BATCH.
  *
  * Per-key cached-result store the BATCH consumer wraps the user's
- * handler with so a job that's already been processed (e.g. after a
- * crash → retry, or after a transient nack that produced a partial
- * result) returns the cached value without re-invoking the model.
+ * handler with, so a job that ALREADY COMPLETED and comes back anyway
+ * (a crash or a lost ack between the handler returning and the queue
+ * being told, an expired visibility lease) returns the cached value
+ * without re-invoking the model.
  *
- * Key shape: `idempotencyKey(jobId, attempt)` — the consumer derives
- * the key from the job's id + attempt counter on the queue. Same job
- * + same attempt → same key, so two consumers grabbing the same job
- * (the "double-pull" race when visibility leases collide) get the
- * same cached result.
+ * Key shape: `idempotencyKey(jobId)` — the key is the job's IDENTITY and
+ * nothing else. It deliberately does NOT include the attempt counter: a
+ * redelivery (crash → retry, a swallowed ack, a visibility lease that
+ * collided with another consumer) is precisely the case the cache exists
+ * to serve, and every queue adapter that tracks attempts hands the
+ * redelivery a *higher* attempt number. Folding the attempt into the key
+ * therefore guaranteed a miss on exactly the path that matters and made
+ * the configured window unreachable.
+ *
+ * Only SUCCESSFUL results are cached (see `withIdempotency`), so a
+ * failed attempt never suppresses its own retry.
  *
  * The default `createInMemoryIdempotencyStore` is a Map with a per-key
  * TTL. Eviction happens lazily on next get/set; tests can override the
@@ -29,12 +36,19 @@ export interface IdempotencyStore<TValue = unknown> {
 }
 
 /**
- * Compose a stable key from a job id + attempt number. We hash so the
- * key fits the typical kv-store key-length limits regardless of job-id
- * shape.
+ * Compose a stable key from a job id. We hash so the key fits the typical
+ * kv-store key-length limits regardless of job-id shape.
+ *
+ * `discriminator` partitions the key space for callers whose dedupe unit is
+ * NARROWER than the job id — a graph node that must re-run once per attempt,
+ * say. It defaults to `0`, which is what queue redelivery wants and what the
+ * content-derived callers (`target-managed`, `target-browser-driver`) already
+ * pass explicitly, so their keys are unchanged. Passing a per-delivery
+ * counter here defeats redelivery dedupe: don't, unless re-running is the
+ * point.
  */
-export function idempotencyKey(jobId: string, attempt: number): IdempotencyKey {
-  return createHash("sha256").update(`${jobId}:${attempt}`).digest("hex").slice(0, 24);
+export function idempotencyKey(jobId: string, discriminator = 0): IdempotencyKey {
+  return createHash("sha256").update(`${jobId}:${discriminator}`).digest("hex").slice(0, 24);
 }
 
 export type InMemoryStoreOptions = {

@@ -1,7 +1,12 @@
 /**
  * Unit tests for the item-1 feedback.autoDistill consumer (watermark +
- * threshold + registration) and the REPL exit-rating gating logic. All
- * filesystem access goes to temp dirs; no LLM/credentials needed.
+ * threshold + registration). All filesystem access goes to temp dirs; no
+ * LLM/credentials needed.
+ *
+ * The block's exit-rating half moved to @crewhaus/runtime-core (so compiled
+ * bundles ask the prompt too); its gating/key/record tests live in
+ * packages/runtime-core/src/exit-rating.test.ts. The spawned-CLI test at the
+ * bottom of this file still pins the CLI surface: a piped run never prompts.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -13,18 +18,14 @@ import {
   AUTODISTILL_THRESHOLD_ENV,
   DEFAULT_AUTODISTILL_THRESHOLD,
   DISTILL_STATE_RELPATH,
-  NO_EXIT_RATING_ENV,
-  countAssistantTurns,
   countUnprocessed,
   maybeAutoDistill,
   newestTs,
   parseDistillState,
-  parseExitRatingKey,
   ratingsDatasetName,
   readDistillState,
   resolveAutoDistillThreshold,
   shouldAutoDistill,
-  shouldPromptExitRating,
   writeDistillState,
 } from "./autodistill";
 import type { FeedbackRecord, SessionTurn } from "./feedback";
@@ -432,95 +433,6 @@ describe("maybeAutoDistill", () => {
 
   test("ratingsDatasetName is the item-12 shorthand target", () => {
     expect(ratingsDatasetName("concierge")).toBe("concierge-ratings");
-  });
-});
-
-// -------- exit rating prompt gating --------
-
-describe("shouldPromptExitRating", () => {
-  const base = {
-    stdinIsTTY: true,
-    env: {} as Record<string, string | undefined>,
-    feedback: { modality: "binary" } as IrFeedback,
-    assistantTurns: 2,
-  };
-
-  test("prompts when the block is present, TTY, and the session has answers", () => {
-    expect(shouldPromptExitRating(base).prompt).toBe(true);
-  });
-
-  test("never prompts without a feedback block (presence opts in)", () => {
-    expect(shouldPromptExitRating({ ...base, feedback: undefined }).prompt).toBe(false);
-  });
-
-  test("never prompts in non-TTY / piped mode", () => {
-    expect(shouldPromptExitRating({ ...base, stdinIsTTY: false }).prompt).toBe(false);
-  });
-
-  test("CREWHAUS_NO_EXIT_RATING opts out (any truthy value)", () => {
-    expect(shouldPromptExitRating({ ...base, env: { [NO_EXIT_RATING_ENV]: "1" } }).prompt).toBe(
-      false,
-    );
-    expect(shouldPromptExitRating({ ...base, env: { [NO_EXIT_RATING_ENV]: "true" } }).prompt).toBe(
-      false,
-    );
-    // Explicit zero/empty do not opt out.
-    expect(shouldPromptExitRating({ ...base, env: { [NO_EXIT_RATING_ENV]: "0" } }).prompt).toBe(
-      true,
-    );
-    expect(shouldPromptExitRating({ ...base, env: { [NO_EXIT_RATING_ENV]: "" } }).prompt).toBe(
-      true,
-    );
-  });
-
-  test("spec-level opt-outs: exitPrompt false / enabled false", () => {
-    expect(
-      shouldPromptExitRating({
-        ...base,
-        feedback: { modality: "binary", exitPrompt: false },
-      }).prompt,
-    ).toBe(false);
-    expect(
-      shouldPromptExitRating({
-        ...base,
-        feedback: { modality: "binary", enabled: false },
-      }).prompt,
-    ).toBe(false);
-  });
-
-  test("requires at least one assistant turn", () => {
-    expect(shouldPromptExitRating({ ...base, assistantTurns: 0 }).prompt).toBe(false);
-  });
-});
-
-describe("parseExitRatingKey", () => {
-  test("g/G → up, b/B → down", () => {
-    expect(parseExitRatingKey("g")).toBe("up");
-    expect(parseExitRatingKey("G")).toBe("up");
-    expect(parseExitRatingKey("b")).toBe("down");
-    expect(parseExitRatingKey("B")).toBe("down");
-  });
-  test("enter / timeout / anything else skips", () => {
-    expect(parseExitRatingKey("\r")).toBe("skip");
-    expect(parseExitRatingKey("\n")).toBe("skip");
-    expect(parseExitRatingKey(undefined)).toBe("skip"); // timeout
-    expect(parseExitRatingKey("")).toBe("skip");
-    expect(parseExitRatingKey("x")).toBe("skip");
-    expect(parseExitRatingKey("")).toBe("skip"); // Ctrl-C in raw mode
-    expect(parseExitRatingKey("")).toBe("skip"); // Ctrl-D in raw mode
-  });
-});
-
-describe("countAssistantTurns", () => {
-  test("counts only turns with a non-empty answer", () => {
-    expect(
-      countAssistantTurns([
-        makeTurn({ turnNumber: 1 }),
-        makeTurn({ turnNumber: 2, output: "" }),
-        makeTurn({ turnNumber: 3, output: "   " }),
-      ]),
-    ).toBe(1);
-    expect(countAssistantTurns([])).toBe(0);
   });
 });
 

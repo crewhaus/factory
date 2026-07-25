@@ -81,6 +81,37 @@ export function hashSample(s: Sample): string {
   return createHash("sha256").update(JSON.stringify(s)).digest("hex").slice(0, 16);
 }
 
+/** Canonical split order — every content digest visits splits in this order
+ *  so neither caller array order nor record key order can change a hash. */
+const SPLIT_ORDER: ReadonlyArray<DatasetSplit> = ["train", "dev", "test"];
+
+/**
+ * One stable sha256 over the per-sample content hashes of the selected
+ * splits. Split names are folded in as domain separators (train vs dev with
+ * identical samples still hash apart) and splits are visited in canonical
+ * order, so neither the caller's array order nor record key order can change
+ * the digest. Feeds `RunIndexEntry.datasetHash` for registry-backed datasets —
+ * the registry analogue of eval-report's `hashDatasetFile`.
+ *
+ * Lives here (rather than in the CLI, where it was born) because BOTH run
+ * launchers need it: `crewhaus eval --dataset registry:<ref>` and the
+ * standalone `target: eval` bundle, which resolves its dataset straight out
+ * of this registry. One digest function → one dataset identity in the run
+ * history, whichever surface launched the run.
+ */
+export function overallDatasetHash(
+  record: DatasetRecord,
+  splits: ReadonlyArray<DatasetSplit>,
+): string {
+  const wanted = new Set(splits);
+  const h = createHash("sha256");
+  for (const s of SPLIT_ORDER) {
+    if (!wanted.has(s) || record.splits[s] === undefined) continue;
+    h.update(`${s}:${(record.sampleHashes[s] ?? []).join(",")}\n`);
+  }
+  return h.digest("hex");
+}
+
 export type FileBackedRegistryOptions = {
   /** Default: `.crewhaus/datasets`. */
   readonly rootDir: string;

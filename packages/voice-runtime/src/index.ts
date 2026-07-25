@@ -91,11 +91,39 @@ export interface RealtimeAdapter {
 }
 
 // ---------------------------------------------------------------------------
-// OpenAI Realtime adapter — speaks the v1 WebSocket protocol.
+// OpenAI Realtime adapter — speaks the GA `/v1/realtime` WebSocket protocol.
+//
+// The beta interface (`OpenAI-Beta: realtime=v1` upgrade header + the flat
+// `session.update` shape) is RETIRED server-side: connecting with it closes
+// the socket with code 4000 / `invalid_request_error.beta_api_shape_disabled`
+// and the error event "The Realtime Beta API is no longer supported. Please
+// use /v1/realtime for the GA API." The GA differences this adapter honours:
+//
+//   - no `OpenAI-Beta` header (sending it is what triggers the beta shape)
+//   - `session.type: "realtime"` is required
+//   - `modalities` → `output_modalities`, and text+audio may NOT be combined
+//     (audio output still emits transcript events, so `["audio"]` gives us
+//     both halves of this adapter's event surface)
+//   - `input_audio_format`/`output_audio_format` string enums → nested
+//     `audio.input.format` / `audio.output.format` objects
+//   - `voice` → `audio.output.voice`; `turn_detection` → `audio.input.turn_detection`
+//   - server events renamed: `response.audio.delta` →
+//     `response.output_audio.delta`, `response.audio_transcript.{delta,done}`
+//     → `response.output_audio_transcript.{delta,done}`
+//
+// The READ path still accepts the legacy event names as aliases — they cost
+// three case labels and keep the adapter usable against a gateway or proxy
+// (`opts.url`) that has not finished its own migration. The WRITE path is GA
+// only: there is no live endpoint left that accepts the beta payload, so a
+// "speak beta" toggle would be dead configuration.
 // ---------------------------------------------------------------------------
 
 const OPENAI_REALTIME_SAMPLE_RATE = 24_000;
-const DEFAULT_OPENAI_REALTIME_MODEL = "gpt-4o-realtime-preview";
+/**
+ * GA model alias. The beta-era `gpt-4o-realtime-preview` was removed from
+ * the API in March 2026 — it is not a valid fallback any more.
+ */
+const DEFAULT_OPENAI_REALTIME_MODEL = "gpt-realtime";
 const DEFAULT_OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime";
 
 /** Test injection: a factory that returns a WebSocket-like (skips `new`). */
@@ -161,6 +189,8 @@ export function createOpenAIRealtimeAdapter(
         // response.cancel needs the most recent response_id.
         break;
       }
+      // GA name first; the beta name is kept as a read-path alias.
+      case "response.output_audio_transcript.delta":
       case "response.audio_transcript.delta": {
         const delta = ev["delta"];
         const itemId = ev["item_id"];
@@ -173,6 +203,7 @@ export function createOpenAIRealtimeAdapter(
         }
         break;
       }
+      case "response.output_audio_transcript.done":
       case "response.audio_transcript.done": {
         const transcript = ev["transcript"];
         const itemId = ev["item_id"];
@@ -185,6 +216,7 @@ export function createOpenAIRealtimeAdapter(
         }
         break;
       }
+      case "response.output_audio.delta":
       case "response.audio.delta": {
         const b64 = ev["delta"];
         if (typeof b64 === "string") {
@@ -257,10 +289,11 @@ export function createOpenAIRealtimeAdapter(
               protocolsOrInit?: string | string[] | { headers?: Record<string, string> },
             ) => WebSocketLike
           )(u, init));
+      // GA takes Authorization only. Sending `OpenAI-Beta: realtime=v1` here
+      // is what selects the retired beta wire shape and kills the socket.
       ws = factory(url, {
         headers: {
           Authorization: `Bearer ${apiKey}`,
-          "OpenAI-Beta": "realtime=v1",
         },
       });
 
@@ -302,18 +335,34 @@ export function createOpenAIRealtimeAdapter(
         socket.addEventListener("message", onMessage);
       });
 
-      // Configure session.
+      // Configure session — GA shape. `output_modalities` is audio-only
+      // because GA rejects a combined ["text","audio"] request; the audio
+      // response still streams transcript deltas, which is where this
+      // adapter's transcript_partial/transcript_final events come from.
       send({
         type: "session.update",
         session: {
-          modalities: ["audio", "text"],
+          type: "realtime",
+          model: connectOpts.model || DEFAULT_OPENAI_REALTIME_MODEL,
+          output_modalities: ["audio"],
           ...(connectOpts.instructions !== undefined
             ? { instructions: connectOpts.instructions }
             : {}),
-          ...(connectOpts.voice !== undefined ? { voice: connectOpts.voice } : {}),
-          input_audio_format: "pcm16",
-          output_audio_format: "pcm16",
-          turn_detection: connectOpts.vad === "none" ? null : { type: "server_vad" },
+          audio: {
+            input: {
+              format: { type: "audio/pcm", rate: OPENAI_REALTIME_SAMPLE_RATE },
+              turn_detection: connectOpts.vad === "none" ? null : { type: "server_vad" },
+            },
+            output: {
+              // `rate` is REQUIRED on an audio/pcm output format — the server
+              // rejects the session with "Missing required parameter:
+              // 'session.audio.output.format.rate'" if it is omitted (the
+              // published docs example omits it, but that example uses
+              // audio/pcmu, which is 8kHz-only).
+              format: { type: "audio/pcm", rate: OPENAI_REALTIME_SAMPLE_RATE },
+              ...(connectOpts.voice !== undefined ? { voice: connectOpts.voice } : {}),
+            },
+          },
           ...(connectOpts.tools !== undefined && connectOpts.tools.length > 0
             ? {
                 tools: connectOpts.tools.map((t) => ({
