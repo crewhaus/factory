@@ -627,8 +627,12 @@ what is already there).
   the per-shape strategy the compile now prints. Under the flag the primary
   workflow/graph/pipeline bundle gains an exported `runForEval` entry (its
   CLI main now guarded by `import.meta.main`) and crew/channel bundles gain
-  an additive `eval-entry.ts`; a plain compile stays byte-for-byte
-  identical (pinned against the pre-change emitters in tests). Documented
+  an `eval-entry.ts` (the channel bundle's `agent.ts` additionally gains the
+  two seams that entry sets — `fabricRoot` per-sample fabric isolation and
+  the `_adapter` scripted-provider hook — both gated on the flag); a plain
+  compile stays byte-for-byte identical, including the 0.3.0
+  `continuity: false` byte-restore contract (pinned against the pre-change
+  emitters in tests). Documented
   residue: the channel eval entry does not yet mirror the daemon's
   `mcp_servers` / `knowledge:` boots (a generated note surfaces each;
   thredz-enabled specs degrade to local files via `thredz: null`), and

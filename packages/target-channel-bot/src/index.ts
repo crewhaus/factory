@@ -37,8 +37,14 @@ import { type ParsedModelString, parseModelString } from "@crewhaus/model-router
  * taxonomy/budget/limits all run exactly as deployed; the adapter/gateway
  * webhook layer is the only part stubbed out. Sample `history` pre-seeds the
  * session transcript so the real resume path replays it (no model calls for
- * history turns). Purely ADDITIVE: the existing agent/session-router/gateway/
- * daemon files stay byte-identical with or without the option.
+ * history turns).
+ *
+ * The option is INERT when off: session-router/gateway/daemon are untouched,
+ * and `agent.ts` gains the two eval-bridge seams (`fabricRoot`, `_adapter` on
+ * `AgentConfig`) ONLY in this variant — the same gating the workflow/graph/
+ * pipeline emitters use. That keeps the plain emission byte-identical, which
+ * the 0.3.0 `continuity: false` byte-restore contract requires
+ * (`packages/compiler/src/continuity-byte-restore.test.ts`).
  */
 export type EmitChannelBotOptions = EmitReadmeOptions & { readonly evalEntry?: boolean };
 
@@ -55,7 +61,7 @@ export function emitChannelBot(ir: IrChannelV0, opts: EmitChannelBotOptions = {}
     );
   }
   const files = [
-    { path: "agent.ts", content: renderAgent(ir) },
+    { path: "agent.ts", content: renderAgent(ir, opts.evalEntry === true) },
     { path: "session-router.ts", content: renderSessionRouter(ir) },
     { path: "gateway.ts", content: renderGateway(ir) },
     { path: "daemon.ts", content: renderDaemon(ir) },
@@ -868,7 +874,31 @@ function dreamFragmentJson(ir: IrChannelV0): string {
   );
 }
 
-function renderAgent(ir: IrChannelV0): string {
+function renderAgent(ir: IrChannelV0, evalEntry = false): string {
+  // Cluster S (D36/NEW-shape-1) — the eval-bridge seams on `AgentConfig`
+  // (`fabricRoot` per-sample fabric isolation + the `_adapter` scripted-
+  // provider seam) are emitted ONLY in the eval-entry variant, exactly as the
+  // workflow/graph/pipeline emitters gate theirs. The plain emission must stay
+  // byte-identical — `continuity: false` is a shipped byte-restore contract
+  // (see packages/compiler/src/continuity-byte-restore.test.ts) and the daemon
+  // never sets either field anyway.
+  const fabricRootField = evalEntry
+    ? `
+  // Cluster S (D36/NEW-shape-1) — the per-turn memory/continuity fabric root.
+  // The daemon leaves it unset (process.cwd(), the deployed posture); the eval
+  // bridge entry pins it to the runner's per-sample directory so a bridged
+  // eval keeps the Pillar-2 isolation invariant (no fact/plan/handoff leak
+  // between samples, nothing written into the operator's working tree).
+  fabricRoot?: string;
+  // Cluster S — scripted-provider test seam (the same \`_adapter\` the other
+  // bridged entries expose), so bridge smoke tests drive the REAL runTurn
+  // credential-free. Never set by the daemon.
+  _adapter?: Parameters<typeof runChatLoop>[0]["_adapter"];`
+    : "";
+  const evalAdapterLine = evalEntry
+    ? "\n        ...(config._adapter !== undefined ? { _adapter: config._adapter } : {}),"
+    : "";
+  const fabricCwdExpr = evalEntry ? "config.fabricRoot ?? process.cwd()" : "process.cwd()";
   // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation for the
   // interactive turn. Empty pieces when the spec omits the block.
   const evaluation = renderEvaluation(ir);
@@ -962,7 +992,7 @@ function __memFragment(scope?: "spec" | "session"): MemoryWiringFragment {
       const __memTools: RegisteredTool[] = [];
       const __memWired = await wireMemory(${fragmentExpr}, {
         catalog: { register: (t: RegisteredTool) => { __memTools.push(t); } },
-        cwd: config.fabricRoot ?? process.cwd(),${memEmbedderDep}${thredzOn ? "\n        thredz: config.thredz," : ""}
+        cwd: ${fabricCwdExpr},${memEmbedderDep}${thredzOn ? "\n        thredz: config.thredz," : ""}
         sessionScope: args.sessionId,
       });${
         fabric.continuityOn
@@ -1064,17 +1094,7 @@ export type AgentConfig = {
   skills: ReadonlyArray<SkillRef>;
   slashCommands: ReadonlyMap<string, SlashCommand>;
   tools: ReadonlyArray<RegisteredTool>;
-  sessionRootDir?: string;
-  // Cluster S (D36/NEW-shape-1) — the per-turn memory/continuity fabric root.
-  // The daemon leaves it unset (process.cwd(), the deployed posture); the eval
-  // bridge entry pins it to the runner's per-sample directory so a bridged
-  // eval keeps the Pillar-2 isolation invariant (no fact/plan/handoff leak
-  // between samples, nothing written into the operator's working tree).
-  fabricRoot?: string;
-  // Cluster S — scripted-provider test seam (the same \`_adapter\` the other
-  // bridged entries expose), so bridge smoke tests drive the REAL runTurn
-  // credential-free. Never set by the daemon.
-  _adapter?: Parameters<typeof runChatLoop>[0]["_adapter"];
+  sessionRootDir?: string;${fabricRootField}
   // Loop contract 0.4 (Batch E, G78) — cross-run prompt-cache rotation
   // persistence (§2.5): a long-running channel daemon reads the last rotation
   // stamp before each turn (so a still-fresh cache prefix is REUSED instead of
@@ -1133,8 +1153,7 @@ export function createAgent(config: AgentConfig): Agent {
           : {}),
         ...(config.egressAuditSink !== undefined
           ? { egressAuditSink: config.egressAuditSink }
-          : {}),
-        ...(config._adapter !== undefined ? { _adapter: config._adapter } : {}),
+          : {}),${evalAdapterLine}
       });
     },
   };
