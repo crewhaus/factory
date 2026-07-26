@@ -5070,6 +5070,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         verdict,
         graderType: evaluation.graderType,
         retryIndex,
+        // The cap is only knowable HERE. Without it a downstream reader
+        // (`dataset mine`'s eval-fail signal) cannot distinguish a ladder that
+        // was fully spent from one cut short, and over-claims "exhausted".
+        maxRetries,
       });
       if (verdict === "pass" || evaluation.onFail === "note") return attempt;
       const rationaleNote =

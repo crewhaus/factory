@@ -147,6 +147,17 @@ describe("defaultGraderRegistry (G14)", () => {
     expect(biased.passed).toBe(false);
   });
 
+  test("C35 — the run's judge-usage sink reaches the judge-backed classifiers", async () => {
+    const registry = await defaultGraderRegistry({ pluginRoot: join(newTempRoot(), "nope") });
+    // Installed by runEval on whatever registry it uses; the lazy safety
+    // graders read the holder at classify time, so a registry built before
+    // the run (the CLI builds its own) still meters its judge calls.
+    expect(registry.judgeUsage.sink).toBeUndefined();
+    const sink = () => {};
+    registry.setJudgeUsageSink(sink);
+    expect(registry.judgeUsage.sink).toBe(sink);
+  });
+
   test("semantic.similarity without the embedder env is a loud, teaching error", async () => {
     const prev = process.env["CREWHAUS_EVAL_EMBEDDER"];
     // Empty string counts as unset (assigning undefined would coerce to the

@@ -27,6 +27,11 @@
  * - Gate pass → auto-promote the new run to baseline (opt out with
  *   `--no-promote`); gate fail → never promote. `--gate` only controls
  *   whether a failing verdict maps to a non-zero exit.
+ * - NEW-HUNT-6 — a resumed run rewrites its own `results.json` under its
+ *   ORIGINAL runId, so when the pinned baseline IS the run being resumed both
+ *   sides of the diff would read the same file. That comparison is refused
+ *   loudly (no gate verdict, no promotion) instead of reporting a vacuous
+ *   `regressions=0 … gate: PASS`.
  * - NEW-HUNT-3 — a budget-aborted PARTIAL run is still appended to the
  *   index (marked `partial: true` so readers can tell its deflated
  *   passRate from a real one), but it is NEVER pinned or promoted as a
@@ -67,14 +72,19 @@ export type FinishEvalOptions = {
   /** sha256 hex of the dataset file bytes. */
   readonly datasetHash: string;
   /**
-   * C30 — this run's estimated cost in USD, projected from its agent-model
-   * token totals through the same pricing seam as the `--models` matrix
-   * `est_$` column (all trials under `--repeats`; judge/grader spend is not
-   * metered). Recorded on the index entry/baseline pin and compared against
-   * {@link maxCostUsd}. Absent when the model has no pricing row — the cost
-   * gate then warns instead of failing.
+   * C30 × C35 — this run's TOTAL estimated cost in USD (agent + judge),
+   * priced through the same seam as the `--models` matrix `est_$` column and
+   * by the same helper that builds the printed `[eval] cost:` line, so the
+   * figure the user sees and the figure this gate enforces are one number.
+   * Recorded on the index entry/baseline pin and compared against
+   * {@link maxCostUsd}. Absent when ANY model in the run has no pricing row
+   * — the cost gate then warns instead of failing on an undercount.
    */
   readonly costUsd?: number;
+  /** C35 — the agent half of {@link costUsd}, recorded on the index entry. */
+  readonly agentCostUsd?: number;
+  /** C35 — the judge/grader half of {@link costUsd}. */
+  readonly judgeCostUsd?: number;
   /**
    * C30 — `--max-p95-latency-ms`: fail the baseline gate when p95
    * per-sample latency rose more than this many ms vs the pinned baseline
@@ -226,6 +236,8 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     // C30 — the one column the shared recorder cannot derive: pricing needs
     // the model catalogue, which the summary does not carry.
     ...(opts.costUsd !== undefined ? { costUsd: opts.costUsd } : {}),
+    ...(opts.agentCostUsd !== undefined ? { agentCostUsd: opts.agentCostUsd } : {}),
+    ...(opts.judgeCostUsd !== undefined ? { judgeCostUsd: opts.judgeCostUsd } : {}),
     outDir: absOut,
     ...(opts.evalsDir !== undefined ? { evalsDir: opts.evalsDir } : {}),
   });
@@ -244,6 +256,15 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     if (!opts.promote) {
       write(`[eval] baseline not set (${label}; --no-promote)`);
       return;
+    }
+    // NEW-HUNT-4 — a cassette-replayed run IS pinnable (it is a real,
+    // reproducible measurement of the agent's reasoning), but pinning it
+    // silently would gate every future LIVE run against frozen tool results.
+    // Warn at the moment the pin happens, where it is actionable.
+    if (summary.config.toolRecording?.mode === "replay") {
+      warn(
+        `[eval] warning: pinning a REPLAYED run (--replay-tools ${summary.config.toolRecording.dir}) as the baseline for ${specName}/${datasetName} — every tool result came from the cassette, so later LIVE runs will be gated against frozen tool output.`,
+      );
     }
     const pin: BaselineEntry = {
       specName,
@@ -266,6 +287,30 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
   const baseline = getBaseline(specName, datasetName, opts.evalsDir);
   if (baseline === undefined) {
     pinCurrentRun(`first run for ${specName}/${datasetName}`);
+    return { gateFailed: false };
+  }
+
+  // NEW-HUNT-6 — self-comparison guard. `--resume` is the first feature that
+  // makes an already-recorded run directory MUTABLE: a resumed run keeps its
+  // ORIGINAL runId and REWRITES `<runDir>/results.json` with the union. If the
+  // pinned baseline IS that run (it was the first run for the pair, got
+  // interrupted, and pinned), then `loadRun(baseline.outDir)` and
+  // `loadRun(absOut)` below read the very same just-rewritten file: the diff
+  // is vacuous by construction (regressions=0, forever), the gate prints PASS
+  // without measuring anything, and the run promotes itself. A fabricated
+  // green is worse than no gate, so refuse the comparison loudly and touch
+  // neither the verdict nor the pin. The index entry above is still recorded.
+  if (baseline.runId === summary.runId || resolve(baseline.outDir) === absOut) {
+    warn(
+      `[eval] warning: the pinned baseline for ${specName}/${datasetName} IS this run (${baseline.runId}) — nothing to gate against.`,
+    );
+    warn(
+      "[eval]   a resumed run rewrites the very results.json the baseline points at, so the comparison would be the run against itself (it can never detect a regression).",
+    );
+    warn(
+      "[eval]   re-pin an earlier run as the baseline, or start a fresh run to re-gate this spec.",
+    );
+    write(`[eval] baseline kept: ${baseline.runId} (self-comparison — not gated, not promoted)`);
     return { gateFailed: false };
   }
 

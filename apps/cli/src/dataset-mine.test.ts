@@ -127,6 +127,227 @@ describe("mineSession", () => {
   });
 });
 
+describe("mineSession — D45 in-loop eval_graded failures", () => {
+  const SESSION = "sess_000000000000ef01";
+  function graded(
+    turnNumber: number,
+    score: number,
+    opts: {
+      threshold?: number;
+      retryIndex?: number;
+      maxRetries?: number;
+      sessionId?: string;
+      enveloped?: boolean;
+    } = {},
+  ): unknown {
+    const threshold = opts.threshold ?? 0.7;
+    const body = {
+      score,
+      threshold,
+      verdict: score >= threshold ? "pass" : "fail",
+      graderType: "llm_judge",
+      retryIndex: opts.retryIndex ?? 0,
+      ...(opts.maxRetries !== undefined ? { maxRetries: opts.maxRetries } : {}),
+      turnNumber,
+      sessionId: opts.sessionId ?? SESSION,
+    };
+    return opts.enveloped === true
+      ? { kind: "eval_graded", payload: body }
+      : { kind: "eval_graded", ...body };
+  }
+
+  /** The session-stable turn boundary the runtime publishes per turn. */
+  function turnStart(): unknown {
+    return { kind: "turn_start", turn: 1, sessionId: SESSION };
+  }
+
+  it("harvests a failing grade and attributes it to the graded turn", () => {
+    const cands = mineSession(
+      SESSION,
+      [user("summarize the refund policy for EU customers")],
+      [graded(1, 0.25)],
+    );
+    expect(cands).toHaveLength(1);
+    expect(cands[0]?.signal).toBe("eval-fail");
+    expect(cands[0]?.turnNumber).toBe(1);
+    expect(cands[0]?.input).toBe("summarize the refund policy for EU customers");
+    expect(cands[0]?.evalGraded?.score).toBe(0.25);
+    expect(cands[0]?.evalGraded?.threshold).toBe(0.7);
+    expect(cands[0]?.evalGraded?.retriesExhausted).toBe(false);
+    expect(cands[0]?.reason).toContain("0.25");
+  });
+
+  it("reads the event-log envelope carrier too", () => {
+    const cands = mineSession(
+      SESSION,
+      [user("what is the escalation path for a sev1")],
+      [graded(1, 0.1, { enveloped: true })],
+    );
+    expect(cands.map((c) => c.signal)).toEqual(["eval-fail"]);
+  });
+
+  it("does NOT harvest a turn the retry ladder recovered", () => {
+    const cands = mineSession(
+      SESSION,
+      [user("draft the quarterly board update for the finance team")],
+      [graded(1, 0.2, { retryIndex: 0 }), graded(1, 0.9, { retryIndex: 1 })],
+    );
+    expect(cands).toHaveLength(0);
+  });
+
+  it("flags a turn whose retry ladder was SPENT (retryIndex reached max_retries)", () => {
+    const cands = mineSession(
+      SESSION,
+      [user("draft the quarterly board update for the finance team")],
+      [
+        graded(1, 0.2, { retryIndex: 0, maxRetries: 1 }),
+        graded(1, 0.3, { retryIndex: 1, maxRetries: 1 }),
+      ],
+    );
+    expect(cands).toHaveLength(1);
+    expect(cands[0]?.evalGraded?.retriesExhausted).toBe(true);
+    expect(cands[0]?.evalGraded?.retriedAndStillFailed).toBe(true);
+    expect(cands[0]?.evalGraded?.retryIndex).toBe(1);
+    expect(cands[0]?.reason).toContain("retry ladder");
+  });
+
+  it("does NOT claim exhaustion for a ladder cut short at rung 1 of 3", () => {
+    // budget/halt/an infra abort can end the ladder early; reporting that as
+    // "retries exhausted" over-claims the strongest signal in the set.
+    const cands = mineSession(
+      SESSION,
+      [user("draft the quarterly board update for the finance team")],
+      [
+        graded(1, 0.2, { retryIndex: 0, maxRetries: 3 }),
+        graded(1, 0.3, { retryIndex: 1, maxRetries: 3 }),
+      ],
+    );
+    expect(cands[0]?.evalGraded?.retriesExhausted).toBe(false);
+    expect(cands[0]?.evalGraded?.retriedAndStillFailed).toBe(true);
+    expect(cands[0]?.reason).toContain("after a retry still failed");
+    expect(cands[0]?.reason).not.toContain("retry ladder");
+  });
+
+  it("treats a sidecar with no maxRetries as exhaustion-UNKNOWN, not exhausted", () => {
+    const cands = mineSession(
+      SESSION,
+      [user("draft the quarterly board update for the finance team")],
+      [graded(1, 0.2, { retryIndex: 0 }), graded(1, 0.3, { retryIndex: 1 })],
+    );
+    expect(cands[0]?.evalGraded?.retriesExhausted).toBe(false);
+    expect(cands[0]?.evalGraded?.retriedAndStillFailed).toBe(true);
+  });
+
+  it("ignores passes, foreign sessions, malformed records, and unknown turns", () => {
+    const cands = mineSession(
+      SESSION,
+      [user("a real turn that produced a fine answer")],
+      [
+        graded(1, 0.95),
+        graded(1, 0.1, { sessionId: "sess_00000000000000ff" }),
+        { kind: "eval_graded", score: "nope", threshold: 0.7, turnNumber: 1 },
+        // A non-eval bus kind, ignored. (Deliberately NOT `turn_start`: that
+        // kind is the turn-boundary signal, not inert filler.)
+        { kind: "model_request", modelId: "claude-sonnet-4-5", turnNumber: 1 },
+        graded(9, 0.1),
+        null,
+        "not an object",
+      ],
+    );
+    expect(cands).toHaveLength(0);
+  });
+
+  it("stays byte-identical with no trace events (the pre-D45 signal set)", () => {
+    const events = [user("deploy the service to prod"), toolResult(true), toolResult(true)];
+    expect(mineSession(SESSION, events)).toEqual(mineSession(SESSION, events, []));
+  });
+
+  it("outranks loop/tool-error/retry but not a runtime error in dedupe", () => {
+    const evalFail: MineCandidate = {
+      sessionId: SESSION,
+      turnNumber: 1,
+      input: "x",
+      signal: "eval-fail",
+      reason: "judge failed",
+    };
+    const loop: MineCandidate = { ...evalFail, signal: "loop", reason: "loop" };
+    const err: MineCandidate = { ...evalFail, signal: "error", reason: "boom" };
+    expect(dedupeCandidates([loop, evalFail])[0]?.signal).toBe("eval-fail");
+    expect(dedupeCandidates([evalFail, err])[0]?.signal).toBe("error");
+  });
+
+  it("carries the judge's numbers into the quarantine sample metadata", () => {
+    const cands = mineSession(
+      SESSION,
+      [user("summarize the refund policy for EU customers")],
+      [graded(1, 0.25, { retryIndex: 1, maxRetries: 1 })],
+    );
+    const sample = candidateToSample(cands[0] as MineCandidate);
+    expect(SampleSchema.safeParse(sample).success).toBe(true);
+    expect(sample.metadata?.["source"]).toBe("production_log");
+    expect(sample.metadata?.["signal"]).toBe("eval-fail");
+    expect(sample.metadata?.["eval_score"]).toBe(0.25);
+    expect(sample.metadata?.["eval_threshold"]).toBe(0.7);
+    expect(sample.metadata?.["eval_retried"]).toBe(true);
+    expect(sample.metadata?.["eval_retries_exhausted"]).toBe(true);
+    expect(sample.metadata?.["eval_grader_type"]).toBe("llm_judge");
+  });
+
+  // ------------------------------------------------------------------
+  // Turn attribution. `runContext.turnNumber` is per-runChatLoop and is
+  // never restored from lastTurnIndex, so a channel daemon (fresh
+  // RunContext per inbound message) publishes `turnNumber: 1` for EVERY
+  // turn — joining on it attaches turn 5's judge numbers to turn 1's
+  // prompt. The `turn_start` ordinal is the session-stable key.
+  // ------------------------------------------------------------------
+  it("channel-shaped session: 5 turns all reporting turnNumber 1 attribute correctly", () => {
+    const prompts = [
+      "how do I reset a customer password",
+      "what is the refund window for annual plans",
+      "escalate a sev1 to the on-call engineer",
+      "explain the EU data residency guarantee",
+      "cancel the enterprise trial for acme corp",
+    ];
+    const events = prompts.map((p) => user(p));
+    // One turn_start per inbound message, each carrying turnNumber 1 — this
+    // is exactly what target-channel-bot's per-message RunContext produces.
+    const trace: unknown[] = [];
+    for (let i = 0; i < prompts.length; i += 1) {
+      trace.push(turnStart());
+      // Only turn 4 fails its in-loop judge.
+      trace.push(graded(1, i === 3 ? 0.2 : 0.95));
+    }
+    const cands = mineSession(SESSION, events, trace);
+    expect(cands.filter((c) => c.signal === "eval-fail")).toHaveLength(1);
+    const fail = cands.find((c) => c.signal === "eval-fail");
+    expect(fail?.turnNumber).toBe(4);
+    expect(fail?.input).toBe("explain the EU data residency guarantee");
+    expect(fail?.evalGraded?.score).toBe(0.2);
+  });
+
+  it("a boundary count that disagrees with the transcript DROPS rather than mis-attributes", () => {
+    // Capture enabled mid-session (2 boundaries, 3 transcript turns): the
+    // ordinal mapping is unverifiable, so no candidate is invented.
+    const events = [
+      user("first question about billing thresholds"),
+      user("second question about invoice delivery"),
+      user("third question about tax exemption forms"),
+    ];
+    const trace = [turnStart(), graded(1, 0.2), turnStart(), graded(1, 0.2)];
+    expect(mineSession(SESSION, events, trace).filter((c) => c.signal === "eval-fail")).toEqual([]);
+  });
+
+  it("multi-turn with NO boundaries at all drops instead of collapsing onto turn 1", () => {
+    const events = [
+      user("first question about billing thresholds"),
+      user("second question about invoice delivery"),
+    ];
+    expect(
+      mineSession(SESSION, events, [graded(1, 0.2)]).filter((c) => c.signal === "eval-fail"),
+    ).toEqual([]);
+  });
+});
+
 describe("egressBlocksFromAudit", () => {
   it("extracts non-allow egress_decision records and ignores allows", () => {
     const blocks = egressBlocksFromAudit([
@@ -479,6 +700,70 @@ describe("crewhaus dataset mine (CLI, offline)", () => {
     const root = newTempRoot();
     writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);
     expect((await runCli(["dataset", "mine"], root)).exitCode).toBe(0);
+  });
+
+  // D45 — the eval_graded signal rides the session's trace SIDECAR, so the
+  // CLI must read `<id>.events.jsonl` beside the transcript.
+  it("harvests an in-loop eval_graded failure from the session trace sidecar", async () => {
+    const root = newTempRoot();
+    writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);
+    const sessionsDir = join(root, ".crewhaus", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    const id = "sess_00000000000000d5";
+    writeFileSync(
+      join(sessionsDir, `${id}.jsonl`),
+      `${JSON.stringify(user("explain the refund window for EU orders"))}\n`,
+    );
+    writeFileSync(
+      join(sessionsDir, `${id}.events.jsonl`),
+      `${JSON.stringify({
+        kind: "eval_graded",
+        score: 0.2,
+        threshold: 0.7,
+        verdict: "fail",
+        graderType: "llm_judge",
+        retryIndex: 0,
+        turnNumber: 1,
+        sessionId: id,
+      })}\n`,
+    );
+    const got = await runCli(["dataset", "mine"], root);
+    expect(got.exitCode).toBe(0);
+    const cands = readJsonl(
+      join(root, ".crewhaus", "datasets", "_quarantine", "helper-hardcases.jsonl"),
+    ) as Array<{ metadata?: Record<string, unknown> }>;
+    expect(cands.length).toBe(1);
+    expect(cands[0]?.metadata?.["signal"]).toBe("eval-fail");
+    expect(cands[0]?.metadata?.["eval_score"]).toBe(0.2);
+  });
+
+  // D45's precondition is OPT-IN (`CREWHAUS_WATCHME=1` writes the sidecar) and
+  // readSessionTraceEvents degrades to [] in silence, so "zero eval-fail
+  // candidates" is indistinguishable from "capture was never on" unless the
+  // run says so.
+  it("names CREWHAUS_WATCHME when no scanned session carries a trace sidecar", async () => {
+    const root = newTempRoot();
+    writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);
+    const sessionsDir = join(root, ".crewhaus", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(
+      join(sessionsDir, "sess_00000000000000d6.jsonl"),
+      `${JSON.stringify(user("explain the refund window for EU orders"))}\n`,
+    );
+    const proc = Bun.spawn([process.execPath, CLI_PATH, "dataset", "mine"], {
+      cwd: root,
+      env: {
+        PATH: process.env["PATH"] ?? "",
+        CREWHAUS_DATASETS_DIR: join(root, ".crewhaus", "datasets"),
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdout = await new Response(proc.stdout).text();
+    expect(await proc.exited).toBe(0);
+    expect(stdout).toContain("0 with a trace sidecar");
+    expect(stdout).toContain("CREWHAUS_WATCHME=1");
   });
 
   // F3 — non-TTY `--review` must NOT auto-promote without an explicit --yes.

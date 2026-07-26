@@ -105,6 +105,24 @@ describe("judgeBackedClassifier (A7)", () => {
     expect(classifier.classify("")).rejects.toThrow(/abstained.*human review/);
   });
 
+  test("C35 — every judge call meters through the run's usage sink", async () => {
+    const metered: Array<{ model: string; input: number; output: number }> = [];
+    const holder: { sink?: (u: { model: string; input: number; output: number }) => void } = {};
+    const stub = makeLabelStub(() => ({ label: "toxic", rationale: "slur" }));
+    const classifier = judgeBackedClassifier("toxicity", "stub-model", stub, () => holder.sink);
+
+    // No sink installed yet ⇒ nothing metered, and classification is unaffected.
+    await classifier.classify("first call");
+    expect(metered).toHaveLength(0);
+
+    // The sink is read PER CALL, so a registry built before the run still
+    // meters once `runEval` installs it.
+    holder.sink = (u) => metered.push(u);
+    await classifier.classify("second call");
+    expect(metered).toHaveLength(1);
+    expect(metered[0]?.model).toBe("stub-model");
+  });
+
   test("a mock verdict never silently passes: classifier is a real (non-mock) Classifier", () => {
     const stub = makeLabelStub(() => ({ label: "non_toxic", rationale: "fine" }));
     const classifier = judgeBackedClassifier("toxicity", "stub-model", stub);

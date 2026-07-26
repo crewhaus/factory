@@ -71,19 +71,48 @@ export type RunIndexEntry = {
    */
   readonly p95LatencyMs?: number;
   /**
-   * C30 — the run's estimated cost in USD, projected from its agent-model
-   * token totals through the same pricing seam as the `--models` matrix
-   * `est_$` column (judge/grader spend is not metered). Additive — absent
-   * on entries written before the field existed and on runs whose model
-   * has no pricing row.
+   * C30 × C35 — the run's TOTAL estimated cost in USD: agent-model spend
+   * plus judge/grader spend, priced through the same seam as the `--models`
+   * matrix `est_$` column. This is the number the run printed as
+   * `[eval] cost: … total=$X` and the number `--max-cost-usd` gates on —
+   * they are computed once, together (`evalRunCost`), because a gate that
+   * saw only the agent half let a judge-heavy run print $4.10 and still pass
+   * a $2.00 ceiling. The halves ride along in {@link agentCostUsd} /
+   * {@link judgeCostUsd} so trends can still separate them. Additive —
+   * absent on entries written before the field existed and on runs where
+   * ANY model (agent or judge) has no pricing row, since a partial sum would
+   * be an undercount.
    */
   readonly costUsd?: number;
+  /**
+   * C35 — the agent-model half of {@link costUsd}. Present even when the
+   * total is not (an unpriced JUDGE model does not erase the known agent
+   * figure). Additive — absent on entries written before the field existed.
+   */
+  readonly agentCostUsd?: number;
+  /**
+   * C35 — the judge/grader half of {@link costUsd}, summed over
+   * `aggregates.judgeUsage.byModel`. Additive — absent on runs that made no
+   * judge calls, on runs whose judge models are all unpriced, and on entries
+   * written before the field existed.
+   */
+  readonly judgeCostUsd?: number;
   /**
    * Samples whose recorded outcome replaced an errored first attempt via
    * the runner's noise auto-retry (`SampleResult.retried`). Additive —
    * absent on entries written before the field existed (read as 0).
    */
   readonly retriedCount?: number;
+  /**
+   * C34 — samples whose repeat trials DISAGREED in this run
+   * (`aggregates.flaky`): the run contains measured instability, so a
+   * strict any-flip gate against it will keep firing for reasons the agent
+   * did not cause. Recorded on the index so `eval-report history` can mark
+   * flake-containing runs without opening every run dir. Additive — absent
+   * on single-trial runs, on stable repeat runs, and on entries written
+   * before the field existed (read as 0).
+   */
+  readonly flakyCount?: number;
   /**
    * NEW-HUNT-3 — true when the run was cut short by its run-level budget
    * cap (`EvalRunSummary.partial`): samples still queued at abort were
@@ -93,6 +122,18 @@ export type RunIndexEntry = {
    * written before the field existed.
    */
   readonly partial?: boolean;
+  /**
+   * NEW-HUNT-4 — true when every tool call in this run was served from a
+   * RECORDED CASSETTE (`--replay-tools`, `config.toolRecording.mode ===
+   * "replay"`) rather than from the world. A replayed run is a legitimate
+   * measurement of the agent's reasoning, but it is not a measurement of the
+   * live system: pinning one as the baseline gates every future LIVE run
+   * against frozen tool results. Recorded here so `eval-report history` and
+   * the promotion path can SAY so — the run directory's `run.json` used to be
+   * the only place that knew. Additive — absent on live runs and on entries
+   * written before the field existed.
+   */
+  readonly replayed?: boolean;
   /** ISO-8601 completion timestamp. */
   readonly ts: string;
   /** Absolute path to the run's output directory. */
@@ -179,6 +220,10 @@ export type RecordEvalRunOptions = {
    * summary does not carry; every other ops column is derived here.
    */
   readonly costUsd?: number;
+  /** C35 — the agent half of {@link costUsd} (see the RunIndexEntry field). */
+  readonly agentCostUsd?: number;
+  /** C35 — the judge/grader half of {@link costUsd}. */
+  readonly judgeCostUsd?: number;
   /** Override `.crewhaus/evals` (tenant scopes, tests, standalone bundles
    *  whose run dir was rebased). */
   readonly evalsDir?: string;
@@ -223,11 +268,22 @@ export function runIndexEntryFromSummary(
     // estimated cost when the caller could price the run.
     p95LatencyMs: summary.aggregates.p95LatencyMs,
     ...(opts.costUsd !== undefined ? { costUsd: opts.costUsd } : {}),
+    // C35 — the halves behind the total, so `eval-report trends` can tell
+    // agent spend from grading spend without re-pricing every run.
+    ...(opts.agentCostUsd !== undefined ? { agentCostUsd: opts.agentCostUsd } : {}),
+    ...(opts.judgeCostUsd !== undefined ? { judgeCostUsd: opts.judgeCostUsd } : {}),
     retriedCount: summary.samples.filter((s) => s.retried === true).length,
+    // C34 — flake count straight off the aggregates (absent = no flakes, so
+    // the field only appears on runs that actually measured instability).
+    ...(summary.aggregates.flaky !== undefined ? { flakyCount: summary.aggregates.flaky } : {}),
     // NEW-HUNT-3 — mark budget-aborted runs so history readers can tell this
     // entry's deflated passRate (aborted samples count as errors) from a
     // genuinely measured one.
     ...(summary.partial !== undefined ? { partial: true } : {}),
+    // NEW-HUNT-4 — mark cassette-replayed runs: every tool result came from
+    // a recording, so this row is not a measurement of the live system.
+    // (`mode: "record"` still hit the world — only replay is marked.)
+    ...(summary.config.toolRecording?.mode === "replay" ? { replayed: true } : {}),
     ts: summary.endedAt,
     outDir: opts.outDir,
   };
@@ -245,9 +301,18 @@ export function recordEvalRun(summary: EvalRunSummary, opts: RecordEvalRunOption
 }
 
 /**
- * Read the run index, oldest first. Missing file → empty list. Corrupt or
- * torn lines are skipped rather than thrown — the index is an append-only
- * log and one bad line must not hide every other run.
+ * Read the run index, oldest first — EVERY line, superseding entries
+ * included. Missing file → empty list. Corrupt or torn lines are skipped
+ * rather than thrown — the index is an append-only log and one bad line must
+ * not hide every other run.
+ *
+ * NOTE: `runId` is NOT unique across the returned entries. `eval --resume`
+ * keeps the interrupted run's original id and APPENDS a superseding entry
+ * rather than rewriting history in place, so an N-times-resumed run occupies
+ * N+1 lines. A reader that tallies runs, sums cost or averages pass rates
+ * wants {@link readRunIndexLatest}, which keeps only the newest entry per id;
+ * use this raw reader only when the full append log is the point (auditing
+ * how a run's figures evolved across attempts).
  */
 export function readRunIndex(evalsDir: string = DEFAULT_EVALS_DIR): RunIndexEntry[] {
   const path = join(evalsDir, INDEX_FILENAME);
@@ -263,6 +328,42 @@ export function readRunIndex(evalsDir: string = DEFAULT_EVALS_DIR): RunIndexEntr
     }
   }
   return entries;
+}
+
+/**
+ * NEW-HUNT-6 — the run index with SUPERSEDED entries collapsed: one entry per
+ * `runId`, the newest by `ts`, in the underlying log's order.
+ *
+ * `eval --resume` keeps the interrupted run's original runId, so recording
+ * the completed run APPENDS a second line for that id rather than mutating
+ * the first (the index is an append-only log — rewriting history in place is
+ * exactly what it exists not to do). Every reader that treats the index as
+ * "one row per run" — history listings, trend series, cost-over-time sums,
+ * run tallies — must therefore collapse first, or an N-times-resumed run is
+ * counted N+1 times with its truncated early pass rates dragging the average
+ * down. This lives here, in the shared reader, rather than in one consumer,
+ * so non-CLI consumers of `@crewhaus/eval-report` are not silently wrong.
+ *
+ * Absent a resume the operation is the identity (run ids are 8 random bytes —
+ * duplicates only ever come from a deliberate supersede), so existing
+ * histories read exactly as before.
+ */
+export function readRunIndexLatest(evalsDir: string = DEFAULT_EVALS_DIR): RunIndexEntry[] {
+  const entries = readRunIndex(evalsDir);
+  const tsOf = (e: RunIndexEntry): number => {
+    const t = Date.parse(e.ts);
+    return Number.isNaN(t) ? Number.NEGATIVE_INFINITY : t;
+  };
+  const winner = new Map<string, number>();
+  entries.forEach((e, i) => {
+    const at = winner.get(e.runId);
+    // `>=` so a later append wins ties — a resume's superseding entry can
+    // share the same-second timestamp as the run it supersedes.
+    if (at === undefined || tsOf(e) >= tsOf(entries[at] as RunIndexEntry)) winner.set(e.runId, i);
+  });
+  if (winner.size === entries.length) return entries;
+  const keep = new Set(winner.values());
+  return entries.filter((_e, i) => keep.has(i));
 }
 
 /** Read `baselines.json`. Missing file → `{}`; malformed JSON → ReportError. */

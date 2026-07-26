@@ -8,9 +8,18 @@
  * `@crewhaus/eval-judge` is stubbed so no LLM/network is touched; the stub
  * records the rubric each judge grader was bound to. `mock.module` is
  * process-global, so this lives in its own file.
+ *
+ * HERMETICITY: every `runEval` here pins `cwd` to an `mkdtemp` sandbox, so the
+ * calibration path the runner resolves (and NAMES in its log records) can
+ * never reference the package checkout — a `judge_calibration.malformed` WARN
+ * carrying `.../packages/eval-runner/.crewhaus/judge-calibration.json` reads
+ * like a torn artifact leaked into the repo. The two tests that deliberately
+ * feed malformed input also CAPTURE stderr and assert the warning, so the
+ * expected diagnostic is a pinned assertion instead of noise in the suite
+ * output. Nothing here ever writes to disk outside the sandbox roots.
  */
 import { afterAll, describe, expect, mock, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { lower } from "@crewhaus/compiler";
@@ -36,7 +45,7 @@ mock.module("@crewhaus/eval-judge", () => ({
   },
 }));
 
-const { runEval } = await import("./index");
+const { runEval, JUDGE_CALIBRATION_RELPATH } = await import("./index");
 
 function narrowToAgent(ir: IrNode): IrV0 {
   if (ir.target !== "cli") throw new Error(`expected target:cli, got ${ir.target}`);
@@ -64,6 +73,35 @@ afterAll(() => {
   for (const dir of TMP_ROOTS) rmSync(dir, { recursive: true, force: true });
   mock.module("@crewhaus/eval-judge", () => realEvalJudge);
 });
+
+/** The sandbox the runner resolves `.crewhaus/judge-calibration.json` under.
+ *  Nothing is ever written there (every test injects `readCalibrationFile`);
+ *  it exists so the resolved path — which the runner logs — names a temp dir
+ *  rather than the package checkout. */
+const SANDBOX_CWD = newTempRoot();
+
+/** Snapshot (at module load, before any test runs) of whether the REAL cwd
+ *  carries a calibration file, so the closing test can pin that this suite
+ *  neither created nor removed one. */
+const CWD_CALIBRATION_PATH = join(process.cwd(), JUDGE_CALIBRATION_RELPATH);
+const CWD_CALIBRATION_EXISTED = existsSync(CWD_CALIBRATION_PATH);
+
+/** Capture stderr (the logger's sink) for the duration of `fn`, matching the
+ *  pattern in `index.resume-economics.test.ts`. Restored in a `finally`, so a
+ *  throwing assertion can never leave the suite's stderr hijacked. */
+async function captureStderr<T>(fn: () => Promise<T>): Promise<{ value: T; stderr: string }> {
+  const original = process.stderr.write.bind(process.stderr);
+  let captured = "";
+  (process.stderr as { write: unknown }).write = (chunk: unknown): boolean => {
+    captured += String(chunk);
+    return true;
+  };
+  try {
+    return { value: await fn(), stderr: captured };
+  } finally {
+    (process.stderr as { write: unknown }).write = original;
+  }
+}
 
 const RUBRIC = {
   criteria: [
@@ -128,6 +166,7 @@ describe("runEval — judge calibration consumption (G47)", () => {
       opts: {
         invoker,
         outDir,
+        cwd: SANDBOX_CWD,
         readCalibrationFile: (path) => {
           readPaths.push(path);
           return CALIBRATION_JSON;
@@ -136,7 +175,7 @@ describe("runEval — judge calibration consumption (G47)", () => {
     });
 
     expect(readPaths).toHaveLength(1);
-    expect(readPaths[0]).toMatch(/\.crewhaus[/\\]judge-calibration\.json$/);
+    expect(readPaths[0]).toBe(join(SANDBOX_CWD, ".crewhaus", "judge-calibration.json"));
     // minScore 0.62 on the [0,1] cut → 1 + 0.62·4 = 3.48 on the 1–5 gate.
     expect(boundRubrics).toHaveLength(1);
     expect(boundRubrics[0]?.passing_score).toBeCloseTo(3.48);
@@ -162,6 +201,7 @@ describe("runEval — judge calibration consumption (G47)", () => {
       opts: {
         invoker,
         outDir,
+        cwd: SANDBOX_CWD,
         readCalibrationFile: () => {
           reads += 1;
           return CALIBRATION_JSON;
@@ -184,7 +224,7 @@ describe("runEval — judge calibration consumption (G47)", () => {
       ir,
       dataset: { name: "cal3", samples: yieldSamples(SAMPLES) },
       compiledGraders: [judgeGrader("judge_c")],
-      opts: { invoker, outDir, readCalibrationFile: () => CALIBRATION_JSON },
+      opts: { invoker, outDir, cwd: SANDBOX_CWD, readCalibrationFile: () => CALIBRATION_JSON },
     });
     expect(boundRubrics[0]?.passing_score).toBeCloseTo(3.0);
     expect(summary.config.judgeCalibration?.applied[0]?.specKey).toBe("default");
@@ -198,7 +238,7 @@ describe("runEval — judge calibration consumption (G47)", () => {
       ir,
       dataset: { name: "cal4", samples: yieldSamples(SAMPLES) },
       compiledGraders: [judgeGrader("judge_d")],
-      opts: { invoker, outDir, readCalibrationFile: () => undefined },
+      opts: { invoker, outDir, cwd: SANDBOX_CWD, readCalibrationFile: () => undefined },
     });
     // The stubbed loadRubric echoes: no passing_score key was injected.
     expect(boundRubrics[0]?.passing_score).toBeUndefined();
@@ -209,14 +249,21 @@ describe("runEval — judge calibration consumption (G47)", () => {
     const outDir = newTempRoot();
     boundRubrics.length = 0;
     const ir = narrowToAgent(lower(parseSpec(SPEC)));
-    const summary = await runEval({
-      ir,
-      dataset: { name: "cal5", samples: yieldSamples(SAMPLES) },
-      compiledGraders: [judgeGrader("judge_e")],
-      opts: { invoker, outDir, readCalibrationFile: () => "{not json" },
-    });
+    // The WARN is the CONTRACT here, so capture it rather than let it bleed
+    // into the suite's stderr looking like a real leaked artifact.
+    const { value: summary, stderr } = await captureStderr(() =>
+      runEval({
+        ir,
+        dataset: { name: "cal5", samples: yieldSamples(SAMPLES) },
+        compiledGraders: [judgeGrader("judge_e")],
+        opts: { invoker, outDir, cwd: SANDBOX_CWD, readCalibrationFile: () => "{not json" },
+      }),
+    );
     expect(summary.config.judgeCalibration).toBeUndefined();
     expect(summary.aggregates.passRate).toBe(1);
+    expect(stderr).toContain("judge_calibration.malformed");
+    // …naming the SANDBOX path, never the package checkout.
+    expect(stderr).toContain(join(SANDBOX_CWD, ".crewhaus", "judge-calibration.json"));
   });
 
   test("an out-of-range minScore entry is rejected as malformed", async () => {
@@ -227,13 +274,31 @@ describe("runEval — judge calibration consumption (G47)", () => {
       calibrations: { "cal-test": { minScore: 7 } },
     });
     const ir = narrowToAgent(lower(parseSpec(SPEC)));
-    const summary = await runEval({
-      ir,
-      dataset: { name: "cal6", samples: yieldSamples(SAMPLES) },
-      compiledGraders: [judgeGrader("judge_f")],
-      opts: { invoker, outDir, readCalibrationFile: () => bad },
-    });
+    const { value: summary, stderr } = await captureStderr(() =>
+      runEval({
+        ir,
+        dataset: { name: "cal6", samples: yieldSamples(SAMPLES) },
+        compiledGraders: [judgeGrader("judge_f")],
+        opts: { invoker, outDir, cwd: SANDBOX_CWD, readCalibrationFile: () => bad },
+      }),
+    );
     expect(boundRubrics[0]?.passing_score).toBeUndefined();
     expect(summary.config.judgeCalibration).toBeUndefined();
+    expect(stderr).toContain("judge_calibration.malformed");
+    expect(stderr).toContain("minScore must be a number in [0,1], got 7");
+  });
+
+  test("no calibration file is ever created — not in the sandbox, not in cwd", () => {
+    // The runner only READS this path; `judge calibrate --apply` is the sole
+    // writer (and it is separately pinned atomic in
+    // `apps/cli/src/judge-calibrate.atomic.test.ts`). Nothing in this suite —
+    // and so nothing in a CI run of this package — may leave one behind, which
+    // is what the `judge_calibration.malformed` WARN naming the package tree
+    // made a CI reader believe had happened.
+    expect(existsSync(join(SANDBOX_CWD, ".crewhaus"))).toBe(false);
+    // Invariance, not absence: an operator may legitimately have run `judge
+    // calibrate --apply` in their checkout, so pin that THIS suite changed
+    // nothing rather than that the file is absent.
+    expect(existsSync(CWD_CALIBRATION_PATH)).toBe(CWD_CALIBRATION_EXISTED);
   });
 });

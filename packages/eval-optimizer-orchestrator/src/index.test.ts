@@ -668,3 +668,87 @@ describe("optimizeSpec — item 9 baseline/best eval-run dirs", () => {
     expect(result.bestEvalDir).toBeUndefined();
   });
 });
+
+describe("optimizeSpec — D43 knob/fitness contract", () => {
+  const KNOB_YAML = `target: cli
+name: hello-cli
+agent:
+  model: claude-sonnet-4-5
+  instructions: You are a helpful assistant.
+limits:
+  max_tool_iterations: 10
+tools:
+  - Read
+`;
+  const DIAL = {
+    path: ["limits", "max_tool_iterations"] as const,
+    value: 10,
+    min: 1,
+    max: 20,
+    step: 2,
+    integer: true,
+  };
+
+  test("REFUSES a knob-blind fitness instead of writing an unmeasured patch", async () => {
+    // A one-parameter fitness measures the SAME candidate for every dial
+    // value, so a knob "win" is pure variance — and the emitted patch would
+    // carry an "(eval-gated)" rationale for a comparison that never happened.
+    const specPath = join(tmpRoot, "crewhaus.yaml");
+    writeFileSync(specPath, KNOB_YAML);
+    const blind = async (prompt: string) => prompt.length / 100;
+    await expect(
+      optimizeSpec({
+        specPath,
+        fitness: blind,
+        trainSet: [{ id: "t1", input: "x" }],
+        devSet: [{ id: "d1", input: "x" }],
+        iterations: 2,
+        seed: 42,
+        outDir: join(tmpRoot, "out-blind"),
+        knobs: [DIAL],
+      }),
+    ).rejects.toThrow(/knob-blind fitness/);
+  });
+
+  test("accepts a knob-aware fitness (declared second parameter)", async () => {
+    const specPath = join(tmpRoot, "crewhaus.yaml");
+    writeFileSync(specPath, KNOB_YAML);
+    const seen: Array<number | undefined> = [];
+    const aware = async (
+      prompt: string,
+      knobs?: ReadonlyArray<{ path: ReadonlyArray<string>; value: number }>,
+    ) => {
+      seen.push(knobs?.[0]?.value);
+      // Reward BOTH a longer prompt and a higher dial, so the search has a
+      // real gradient on the knob rather than noise.
+      return prompt.length / 100 + (knobs?.[0]?.value ?? 0) / 100;
+    };
+    const result = await optimizeSpec({
+      specPath,
+      fitness: aware,
+      trainSet: [{ id: "t1", input: "x" }],
+      devSet: [{ id: "d1", input: "x" }],
+      iterations: 4,
+      seed: 42,
+      outDir: join(tmpRoot, "out-aware"),
+      knobs: [DIAL],
+    });
+    expect(seen.length).toBeGreaterThan(0);
+    expect(result.patch.path).toEqual(["agent", "instructions"]);
+  });
+
+  test("no knobs declared → a one-parameter fitness is unaffected", async () => {
+    const specPath = join(tmpRoot, "crewhaus.yaml");
+    writeFileSync(specPath, KNOB_YAML);
+    const result = await optimizeSpec({
+      specPath,
+      fitness: async (prompt: string) => prompt.length / 100,
+      trainSet: [{ id: "t1", input: "x" }],
+      devSet: [{ id: "d1", input: "x" }],
+      iterations: 2,
+      seed: 42,
+      outDir: join(tmpRoot, "out-none"),
+    });
+    expect(result.patches).toHaveLength(1);
+  });
+});

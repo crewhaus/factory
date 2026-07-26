@@ -25,8 +25,11 @@
  *     line, the pass@k/pass^k repeats line, the per-slice block (B13), one
  *     per-criterion line per judge grader (A12), the needs_human line (A3),
  *     the failure-taxonomy class tally, and one note per judge grader whose
- *     gate came from `.crewhaus/judge-calibration.json`. Every new segment
- *     is presence-gated, so a summary written by an older runner renders
+ *     gate came from `.crewhaus/judge-calibration.json`. Wave 4 adds the C34
+ *     flake block (samples whose repeat trials disagreed, plus what to do
+ *     about them) and the C35 cost line (agent AND judge spend, priced
+ *     through the injected matrix pricing seam). Every new segment is
+ *     presence-gated, so a summary written by an older runner renders
  *     exactly the pre-0.4 block.
  *
  * Side-effect-free (the CLI entry file runs an argv switch on import), so
@@ -229,6 +232,154 @@ export function formatFailureClassesLine(samples: ReadonlyArray<SampleResult>): 
 }
 
 /**
+ * C34 — the flake block: samples whose repeat trials DISAGREED, with each
+ * one's trial pass rate, plus a suggestion line. Their verdicts are coin
+ * flips, so the strict any-flip gate will keep re-failing on them for
+ * reasons the agent did not cause — naming them is the whole point. Empty
+ * when the run carried no trials or every sample was stable.
+ */
+export function formatFlakyLines(summary: EvalRunSummary): string[] {
+  const a = summary.aggregates;
+  if (a.flaky === undefined || a.flaky === 0) return [];
+  const rateById = new Map(summary.samples.map((s) => [s.sampleId, s.trialPassRate] as const));
+  const listed = (a.flakySampleIds ?? []).map((id) => {
+    const rate = rateById.get(id);
+    const k = summary.config.repeats;
+    if (rate === undefined) return id;
+    return k !== undefined
+      ? `${id} (${Math.round(rate * k)}/${k})`
+      : `${id} (${(rate * 100).toFixed(0)}%)`;
+  });
+  return [
+    // "verdicts still count" mirrors the needs_review line deliberately: the
+    // three buckets above this one each state their exclusion rule
+    // (needs_human and canary are OUT of the pass-rate denominator), so a
+    // reader who has just been told those rules would otherwise read "coin
+    // flip" as "excluded". A flaky sample keeps its canonical verdict in
+    // every figure — see aggregate.ts.
+    `[eval] flaky=${a.flaky}/${summary.samples.length}: ${listed.join(", ")} — trials disagreed, so these verdicts are coin flips; verdicts still count`,
+    `[eval] flaky: the strict gate cannot tell a coin flip from a regression — inspect with \`crewhaus eval-report export --runs ${summary.outDir} --format csv\`, then remove the nondeterminism (pin --seed, --replay-tools <dir>) or move the sample out of the gating dataset version`,
+  ];
+}
+
+/** The pricing seam the cost line meters through — the SAME lookup that
+ *  prices the `--models` matrix `est_$` column (USD micro-dollars, or
+ *  `undefined` when the model has no pricing row). */
+export type EvalCostPricingFn = (
+  model: string,
+  tokens: { readonly input: number; readonly output: number },
+) => number | undefined;
+
+const usd = (micros: number): string => `$${(micros / 1_000_000).toFixed(4)}`;
+
+/**
+ * C30 × C35 — one run's estimated spend, split by who spent it. THE single
+ * source for both the printed `[eval] cost:` line and the number recorded in
+ * run history / checked by `--max-cost-usd`: the figure a user is shown and
+ * the figure the gate enforces must be the same number, or a judge-heavy run
+ * prints `total=$4.10` and sails through `--max-cost-usd 2.00`.
+ *
+ * Every component is priced through the injected seam, never guessed.
+ * `totalMicros` is deliberately defined ONLY when the whole run is priceable
+ * (agent priced AND no judge model missing its pricing row) — a partial sum
+ * would be an UNDERCOUNT, and gating on an undercount is the very failure
+ * this type exists to prevent. An unpriceable total leaves the ceiling
+ * unchecked with a loud warning instead (see `finishEvalRun`).
+ */
+export type EvalCostBreakdown = {
+  /** Agent-model spend (all trials under `--repeats`), when priceable. */
+  readonly agentMicros?: number;
+  /** Judge/grader spend summed over `aggregates.judgeUsage.byModel`. */
+  readonly judgeMicros?: number;
+  /** Judge models with no pricing row — any at all makes the total unknown. */
+  readonly judgeUnpricedModels: number;
+  /** agent + judge, only when NOTHING in the run was unpriceable. */
+  readonly totalMicros?: number;
+};
+
+/** Price one run's agent + judge spend through the injected seam. */
+export function evalRunCost(
+  summary: EvalRunSummary,
+  pricing: EvalCostPricingFn,
+): EvalCostBreakdown {
+  const a = summary.aggregates;
+  const agentTokens = a.totalTokensAllTrials ?? a.totalTokens;
+  const agentMicros = pricing(summary.config.model, agentTokens);
+  const judge = a.judgeUsage;
+  let judgeMicros: number | undefined;
+  let judgeUnpricedModels = 0;
+  if (judge !== undefined) {
+    for (const [model, u] of Object.entries(judge.byModel)) {
+      const micros = pricing(model, { input: u.input, output: u.output });
+      if (micros === undefined) {
+        judgeUnpricedModels += 1;
+        continue;
+      }
+      judgeMicros = (judgeMicros ?? 0) + micros;
+    }
+  }
+  const totalMicros =
+    agentMicros !== undefined && judgeUnpricedModels === 0
+      ? agentMicros + (judgeMicros ?? 0)
+      : undefined;
+  return {
+    ...(agentMicros !== undefined ? { agentMicros } : {}),
+    ...(judgeMicros !== undefined ? { judgeMicros } : {}),
+    judgeUnpricedModels,
+    ...(totalMicros !== undefined ? { totalMicros } : {}),
+  };
+}
+
+/**
+ * C35 — the run's estimated cost, agent AND judge. Judge spend was
+ * previously invisible (the judge wire discarded provider usage), which is
+ * how a team can pay more for grading than for the agent and never see it.
+ *
+ * Every component is priced through the injected seam, never guessed: a
+ * model with no pricing row renders `n/a`, and a run where NOTHING is
+ * priceable prints no line at all rather than a misleading `$0.0000`.
+ * Agent tokens use the all-trials totals when `--repeats` ran — the real
+ * spend, not trial 1's.
+ */
+export function formatCostLine(
+  summary: EvalRunSummary,
+  pricing: EvalCostPricingFn,
+): string | undefined {
+  const a = summary.aggregates;
+  const judge = a.judgeUsage;
+  const {
+    agentMicros,
+    judgeMicros,
+    judgeUnpricedModels: judgeUnpriced,
+    totalMicros,
+  } = evalRunCost(summary, pricing);
+  if (agentMicros === undefined && judgeMicros === undefined) return undefined;
+
+  const parts: string[] = [];
+  parts.push(
+    `agent=${agentMicros !== undefined ? usd(agentMicros) : `n/a (${summary.config.model} unpriced)`}`,
+  );
+  if (judge !== undefined) {
+    const models = Object.keys(judge.byModel).length;
+    const judgeText =
+      judgeMicros !== undefined
+        ? `${usd(judgeMicros)}${judgeUnpriced > 0 ? ` + ${judgeUnpriced} unpriced model(s)` : ""}`
+        : "n/a (unpriced judge model)";
+    parts.push(
+      `judge=${judgeText} (${judge.calls} call(s), ${judge.tokens.input}/${judge.tokens.output} tokens across ${models} model(s))`,
+    );
+  }
+  // The printed total is the SAME number `--max-cost-usd` gates on and run
+  // history records (see `evalRunCost`), so it appears only when the run is
+  // fully priceable — an undercounted "total" beside an unpriced model would
+  // be the misleading figure, not the missing one.
+  if (totalMicros !== undefined && judge !== undefined) {
+    parts.push(`total=${usd(totalMicros)}`);
+  }
+  return `[eval] cost: ${parts.join(" ")}`;
+}
+
+/**
  * G47 — one note per `llm_judge` grader whose passing gate came from the
  * calibration file rather than a rubric-declared `passing_score`, so an
  * operator reading the run output knows the bar was the calibrated one.
@@ -246,7 +397,12 @@ export function formatJudgeCalibrationLines(config: EvalRunSummary["config"]): s
 /** The full `[eval]` stdout block for one finished run, in print order. */
 export function evalRunOutputLines(
   summary: EvalRunSummary,
-  opts: { readonly retriedCount: number },
+  opts: {
+    readonly retriedCount: number;
+    /** C35 — when supplied, the block gains the estimated-cost line
+     *  (agent + judge). Omitted ⇒ the pre-C35 block, byte-identical. */
+    readonly pricing?: EvalCostPricingFn;
+  },
 ): string[] {
   const lines = [formatEvalSummaryLine(summary, opts.retriedCount)];
   const loop = formatLoopMetricsLine(summary.aggregates);
@@ -261,6 +417,14 @@ export function evalRunOutputLines(
   if (needsReview !== undefined) lines.push(needsReview);
   const canary = formatCanaryLine(summary);
   if (canary !== undefined) lines.push(canary);
+  // C34 — measured instability, listed beside the other human-attention
+  // buckets (needs_human / needs_review / canary).
+  lines.push(...formatFlakyLines(summary));
+  // C35 — what the run cost, agent + judge, when the caller wired pricing.
+  if (opts.pricing !== undefined) {
+    const cost = formatCostLine(summary, opts.pricing);
+    if (cost !== undefined) lines.push(cost);
+  }
   const failures = formatFailureClassesLine(summary.samples);
   if (failures !== undefined) lines.push(failures);
   lines.push(...formatJudgeCalibrationLines(summary.config));

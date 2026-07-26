@@ -21,10 +21,22 @@
  *                  (ASR/response coverage) — an empty/absent response is a
  *                  transcript-quality failure.
  *
+ * D46 — CONTENT grading joins them when `eval --voice --graders <g.yaml>` is
+ * passed: the replayed transcript is projected onto the standard grader
+ * contract (`voiceSampleFromSession`) and scored by the ordinary grader
+ * stack — deterministic graders, registry packs, `llm_judge` rubrics. A
+ * voice agent fails on WHAT it says, and latency budgets alone cannot
+ * express "the agent quoted the wrong refund policy". A content failure
+ * fails the session exactly like a latency breach; without `--graders`
+ * nothing changes.
+ *
  * Everything here is side-effect-free (the CLI entry file reads the replay
  * JSONL files + writes the report). Deterministic: identical input timeline →
  * identical metrics, so a fixture replays byte-stably in CI.
  */
+
+import type { Sample } from "@crewhaus/eval-dataset";
+import type { Grader, GraderCombinePolicy, RunResult } from "@crewhaus/eval-grader";
 
 /** Thrown on a malformed replay log / bad flags. The CLI routes it through
  *  `die()`; tests assert on `.message`. */
@@ -324,6 +336,14 @@ export function gradeTranscript(metrics: VoiceMetrics): VoiceGrade {
 /** The three voice graders, by name — the registry-style pack. */
 export const VOICE_GRADER_NAMES = ["voice_latency", "voice_barge_in", "voice_transcript"] as const;
 
+/** D46 — one content grader's verdict on a replayed session's transcript. */
+export type VoiceContentGrade = {
+  readonly grader: string;
+  readonly passed: boolean;
+  readonly score: number;
+  readonly rationale: string;
+};
+
 /** A per-session voice eval result — the three grades + the raw metrics. */
 export type VoiceSessionResult = {
   readonly sessionId: string;
@@ -333,6 +353,13 @@ export type VoiceSessionResult = {
     readonly voice_barge_in: VoiceGrade;
     readonly voice_transcript: VoiceGrade;
   };
+  /**
+   * D46 — content grades from a `--graders` file, when one was passed. A
+   * voice agent's primary failure mode is WHAT it says; latency and
+   * barge-in are plumbing. Absent without `--graders`, so today's voice
+   * eval output is byte-identical.
+   */
+  readonly contentGrades?: ReadonlyArray<VoiceContentGrade>;
   readonly passed: boolean;
 };
 
@@ -353,6 +380,159 @@ export function gradeVoiceSession(
   };
 }
 
+/**
+ * D46 — project a replayed session onto the standard grader contract so the
+ * WHOLE grader stack (deterministic graders, registry packs, `llm_judge`
+ * rubrics) can score what the agent actually SAID.
+ *
+ * The projection is deliberately literal: the graded output is the agent's
+ * final transcripts in order, and the sample input is the user's — a replay
+ * carries no gold, so graders that need `expected_output` (exact_match,
+ * expected_contains) have nothing to compare against and say so honestly
+ * rather than being fed a fabricated reference. `events`/`transcript`/
+ * `toolCalls` are empty: a replay log is a call timeline, not a chat-loop
+ * trace, and inventing trace events would let trajectory graders "pass" on
+ * evidence that does not exist.
+ */
+export function voiceSampleFromSession(session: ReplaySession): {
+  sample: Sample;
+  run: RunResult;
+} {
+  const textsOf = (role: "user" | "agent"): string[] =>
+    session.events
+      .filter(
+        (e) =>
+          e.kind === "transcript_final" &&
+          (role === "user" ? e.role === "user" : e.role !== "user") &&
+          typeof e.text === "string" &&
+          e.text.trim() !== "",
+      )
+      .map((e) => (e.text as string).trim());
+  const first = session.events[0];
+  const last = session.events[session.events.length - 1];
+  const agentTurns = textsOf("agent");
+  return {
+    sample: { id: session.sessionId, input: textsOf("user").join("\n") },
+    run: {
+      agentOutput: agentTurns.join("\n"),
+      events: [],
+      transcript: [],
+      toolCalls: [],
+      turns: agentTurns.length,
+      latencyMs: first !== undefined && last !== undefined ? last.ts - first.ts : 0,
+    },
+  };
+}
+
+/** D46 — one named content grader (already constructed by the caller, which
+ *  owns judge/registry wiring). `weight` rides along for `combine: weighted`
+ *  (A4/A5), defaulting to 1 exactly like the text eval. */
+export type VoiceContentGrader = {
+  readonly name: string;
+  readonly grader: Grader;
+  readonly weight?: number;
+};
+
+/**
+ * D46 — run the content graders over a session's transcript. A grader that
+ * THROWS (judge 429, rubric fetch failure) records a failed grade naming the
+ * throw rather than aborting the whole voice eval: one flaky judge call must
+ * not lose the latency verdicts for every other session — and the session
+ * still fails, so a broken instrument can never read as a pass.
+ */
+export async function gradeVoiceContent(
+  session: ReplaySession,
+  graders: ReadonlyArray<VoiceContentGrader>,
+): Promise<VoiceContentGrade[]> {
+  const { sample, run } = voiceSampleFromSession(session);
+  const grades: VoiceContentGrade[] = [];
+  for (const { name, grader } of graders) {
+    try {
+      const result = await grader(sample, run);
+      grades.push({
+        grader: name,
+        passed: result.passed,
+        score: result.score,
+        rationale: result.rationale,
+      });
+    } catch (err) {
+      grades.push({
+        grader: name,
+        passed: false,
+        score: 0,
+        rationale: `grader threw: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  }
+  return grades;
+}
+
+/**
+ * A4/A5 — fold the content grades into ONE content verdict under the
+ * graders.yaml `combine:` policy, with the same semantics `run-sample.ts`
+ * applies to a text eval:
+ *   all       (default) passed = AND of graders, score = unweighted mean.
+ *   any       passed = OR of graders, score = max.
+ *   weighted  score = Σ(w·s)/Σw; passed iff score ≥ passing_threshold (0.5).
+ * A voice run that parses the full grammar must OBEY it — the silent ignore
+ * (parse `combine: any`, then hardcode all-must-pass) is precisely the trust
+ * hole A4/A5 closed on every other grading surface.
+ */
+export function combineVoiceContentGrades(
+  grades: ReadonlyArray<VoiceContentGrade>,
+  graders: ReadonlyArray<VoiceContentGrader>,
+  policy: GraderCombinePolicy | undefined,
+): { passed: boolean; score: number } {
+  if (grades.length === 0) return { passed: true, score: 0 };
+  switch (policy?.mode ?? "all") {
+    case "any":
+      return {
+        passed: grades.some((g) => g.passed),
+        score: Math.max(...grades.map((g) => g.score)),
+      };
+    case "weighted": {
+      const weights = grades.map((g) => graders.find((c) => c.name === g.grader)?.weight ?? 1);
+      const totalWeight = weights.reduce((s, w) => s + w, 0);
+      const score =
+        totalWeight === 0
+          ? 0
+          : grades.reduce((s, g, i) => s + g.score * (weights[i] ?? 1), 0) / totalWeight;
+      return { passed: score >= (policy?.passingThreshold ?? 0.5), score };
+    }
+    default:
+      return {
+        passed: grades.every((g) => g.passed),
+        score: grades.reduce((s, g) => s + g.score, 0) / grades.length,
+      };
+  }
+}
+
+/**
+ * D46 — grade a session on latency/barge-in/transcript AND content. Content
+ * failures fail the session exactly like a latency breach does (the command
+ * exits non-zero on any failing session), because "answered fast and wrong"
+ * is not a passing voice agent. Without graders this is `gradeVoiceSession`.
+ *
+ * A4/A5 — `combine` is the graders.yaml top-level policy (compiled onto
+ * every entry). Absent ⇒ `all`, today's byte-identical semantics.
+ */
+export async function gradeVoiceSessionWithContent(
+  session: ReplaySession,
+  thresholds: VoiceThresholds,
+  graders: ReadonlyArray<VoiceContentGrader>,
+  opts: { readonly combine?: GraderCombinePolicy } = {},
+): Promise<VoiceSessionResult> {
+  const base = gradeVoiceSession(session, thresholds);
+  if (graders.length === 0) return base;
+  const contentGrades = await gradeVoiceContent(session, graders);
+  const combined = combineVoiceContentGrades(contentGrades, graders, opts.combine);
+  return {
+    ...base,
+    contentGrades,
+    passed: base.passed && combined.passed,
+  };
+}
+
 /** Aggregate summary across a replay set. */
 export type VoiceEvalSummary = {
   readonly sessions: ReadonlyArray<VoiceSessionResult>;
@@ -360,6 +540,15 @@ export type VoiceEvalSummary = {
   readonly p50TtftMs: number | undefined;
   readonly p95TtftMs: number | undefined;
   readonly bargeInYieldRate: number;
+  /**
+   * D46 — (session × content grader) verdicts recorded. ABSENT (not 0)
+   * without `--graders`, so a no-graders `voice-eval.json` is byte-identical
+   * to the pre-D46 artifact — the same presence-gating every other additive
+   * eval field uses (`flaky`, `judgeUsage`, `cliVersion`, `contentGrades`).
+   */
+  readonly contentGraded?: number;
+  /** D46 — how many of those passed. Present iff {@link contentGraded} is. */
+  readonly contentPassed?: number;
 };
 
 function percentile(values: number[], p: number): number | undefined {
@@ -384,12 +573,21 @@ export function aggregateVoiceEval(results: ReadonlyArray<VoiceSessionResult>): 
       if (b.yielded) bargeInYielded += 1;
     }
   }
+  // D46 — content verdicts across every session. Presence-gated: a run
+  // without --graders writes no content keys at all.
+  const contentGrades = results.flatMap((r) => r.contentGrades ?? []);
   return {
     sessions: results,
     passRate: results.length === 0 ? 0 : passed / results.length,
     p50TtftMs: percentile(ttfts, 50),
     p95TtftMs: percentile(ttfts, 95),
     bargeInYieldRate: bargeInTotal === 0 ? 1 : bargeInYielded / bargeInTotal,
+    ...(contentGrades.length > 0
+      ? {
+          contentGraded: contentGrades.length,
+          contentPassed: contentGrades.filter((g) => g.passed).length,
+        }
+      : {}),
   };
 }
 
@@ -400,6 +598,11 @@ export function renderVoiceReport(summary: VoiceEvalSummary): string {
   lines.push(`  pass rate:          ${(summary.passRate * 100).toFixed(0)}%`);
   lines.push(`  TTFT p50 / p95:     ${fmtMs(summary.p50TtftMs)} / ${fmtMs(summary.p95TtftMs)}`);
   lines.push(`  barge-in yield rate: ${(summary.bargeInYieldRate * 100).toFixed(0)}%`);
+  if (summary.contentGraded !== undefined && summary.contentGraded > 0) {
+    lines.push(
+      `  content graders:    ${summary.contentPassed ?? 0}/${summary.contentGraded} session-grader verdicts passed`,
+    );
+  }
   for (const r of summary.sessions) {
     lines.push(`  ${r.passed ? "PASS" : "FAIL"} ${r.sessionId}`);
     if (!r.grades.voice_latency.passed) {
@@ -410,6 +613,11 @@ export function renderVoiceReport(summary: VoiceEvalSummary): string {
     }
     if (!r.grades.voice_transcript.passed) {
       lines.push(`    transcript: ${r.grades.voice_transcript.rationale}`);
+    }
+    // D46 — content verdicts: failures always, passes tallied (a green
+    // content grader is the reason to trust the whole line).
+    for (const g of r.contentGrades ?? []) {
+      if (!g.passed) lines.push(`    content ${g.grader}: ${g.rationale}`);
     }
   }
   return `${lines.join("\n")}\n`;

@@ -1,3 +1,4 @@
+import { DEFAULT_SCORE_EPSILON } from "@crewhaus/eval-runner";
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
 import { ReportError } from "./errors";
 import type { LoadedRun } from "./load";
@@ -60,7 +61,18 @@ export type SliceDelta = {
   readonly next: { passRate: number; meanScore: number; sampleCount: number };
 };
 
-const SCORE_EPSILON = 0.1;
+/**
+ * NEW-stats-1 — the score-shift sensitivity: how far a sample's score may
+ * move, with its pass/fail verdict unchanged, before the diff calls it a
+ * SHIFT. A knob (`eval-report diff --epsilon`) rather than a constant,
+ * because a 1–5 rubric and a 0/1 grader do not deserve the same tolerance.
+ *
+ * The default is re-exported from `@crewhaus/eval-runner` — ONE literal
+ * shared with `regression-runner`'s gate classifier, so the diff a human
+ * READS and the gate that BLOCKS can never drift apart. Unchanged in value
+ * (0.1), so every existing diff classifies byte-identically.
+ */
+export { DEFAULT_SCORE_EPSILON };
 
 /**
  * Measurement-instrument mismatch check for a run diff. Scores are only
@@ -110,12 +122,27 @@ export function diffInstrumentWarnings(prev: LoadedRun, next: LoadedRun): string
  * A1 — `opts.pairwise` attaches a pre-computed pairwise-judging block (the
  * CLI's `--pairwise` runs the judge calls BEFORE this pure fold) to
  * diff.json and the rendered report. Omitted ⇒ byte-identical output.
+ *
+ * NEW-stats-1 — `opts.epsilon` sets the score-shift tolerance (default
+ * {@link DEFAULT_SCORE_EPSILON}): only |Δscore| STRICTLY above it counts as
+ * a shift. Flips (pass↔fail, or a trial pass-rate move) are never subject to
+ * it — a verdict change is a verdict change at any epsilon.
  */
 export function diffReports(
   prev: LoadedRun,
   next: LoadedRun,
-  opts: { readonly seed?: number; readonly pairwise?: PairwiseDiff } = {},
+  opts: {
+    readonly seed?: number;
+    readonly pairwise?: PairwiseDiff;
+    readonly epsilon?: number;
+  } = {},
 ): { html: string; json: string; diff: ReportDiff } {
+  const epsilon = opts.epsilon ?? DEFAULT_SCORE_EPSILON;
+  if (!Number.isFinite(epsilon) || epsilon < 0) {
+    throw new ReportError(
+      `invalid score-shift epsilon ${JSON.stringify(opts.epsilon)} — must be a non-negative number`,
+    );
+  }
   const prevById = new Map(prev.summary.samples.map((s) => [s.sampleId, s]));
   const nextById = new Map(next.summary.samples.map((s) => [s.sampleId, s]));
 
@@ -170,7 +197,7 @@ export function diffReports(
     };
     if (nextRate < prevRate) regressions.push(entry);
     else if (nextRate > prevRate) recoveries.push(entry);
-    else if (Math.abs(n.grades.overall.score - p.grades.overall.score) > SCORE_EPSILON)
+    else if (Math.abs(n.grades.overall.score - p.grades.overall.score) > epsilon)
       scoreShifts.push(entry);
     else unchanged += 1;
     if (!prevAbstained && !nextAbstained) pairedDeltas.push(nextRate - prevRate);

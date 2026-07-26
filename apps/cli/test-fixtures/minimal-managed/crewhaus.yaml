@@ -1,0 +1,11 @@
+name: gateway-agent
+target: managed
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a managed gateway agent. Answer in one short sentence.
+tenants:
+  - id: eval
+    budget:
+      maxInputTokens: 100000
+      maxOutputTokens: 20000

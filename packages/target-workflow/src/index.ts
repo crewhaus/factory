@@ -53,11 +53,25 @@ import {
  * Future expansion: parallel/conditional steps, fan-out — this v0 emits
  * strictly sequential execution.
  */
-export function emitWorkflow(ir: IrWorkflowV0, opts: EmitReadmeOptions = {}): Bundle {
+/**
+ * Evals Wave 4, cluster S (D36 + NEW-shape-1) — `emitWorkflow` options.
+ * `evalEntry: true` (set only by `crewhaus compile --with-eval-harness`)
+ * additionally emits an exported `runForEval(input, opts)` entry: the SAME
+ * step sequence main() drives, parameterized on the trigger input instead of
+ * stdin, returning the final step's output, threading the caller's
+ * RunContext (step traces + judge verdicts land on the caller's bus) plus
+ * optional `sessionRootDir`/`_adapter` seams into every step call — and the
+ * CLI main is guarded by `import.meta.main` so the eval bundle can import
+ * the compiled runtime without running it. Absent (every existing caller),
+ * the emission is byte-identical to before.
+ */
+export type EmitWorkflowOptions = EmitReadmeOptions & { readonly evalEntry?: boolean };
+
+export function emitWorkflow(ir: IrWorkflowV0, opts: EmitWorkflowOptions = {}): Bundle {
   const files = [
     {
       path: "agent.ts",
-      content: renderAgent(ir),
+      content: renderAgent(ir, opts.evalEntry === true),
     },
   ];
   // Item 42 — generated bundle README; default ON (`crewhaus compile
@@ -189,6 +203,13 @@ type StepShared = {
    *  exactly-once. Only set for multi-step workflows with at least one plain
    *  step, so single-step bundles stay byte-identical. */
   readonly durable: boolean;
+  /** Cluster S — eval-entry variant: steps read `__evalInput` instead of
+   *  stdin, thread the per-invocation seams, and durable steps key on the
+   *  per-invocation run id. False keeps every rendered string byte-identical. */
+  readonly evalEntry: boolean;
+  /** Cluster S — per-step spread of the eval-entry seams
+   *  (`sessionRootDir` / `_adapter`); empty when `evalEntry` is off. */
+  readonly evalFields: string;
 };
 
 function renderStep(step: IrWorkflowStep, idx: number, total: number, shared: StepShared): string {
@@ -197,24 +218,37 @@ function renderStep(step: IrWorkflowStep, idx: number, total: number, shared: St
   const toolsField = renderStepToolsField(step.tools, shared.mcpWired);
   const stepTuningFields = renderStepTuningFields(step);
   const modelFailoverFields = renderStepModelFailoverFields(step);
-  const deadlineGuard = renderDeadlineGuard(shared.deadlineMs, stepNum, total, step.name);
+  const deadlineGuard = renderDeadlineGuard(
+    shared.deadlineMs,
+    stepNum,
+    total,
+    step.name,
+    shared.evalEntry,
+  );
 
   // Anthropic rejects empty user content with a 400, so fall back to a
   // non-empty placeholder when stdin is empty (autonomous-style agent —
   // the step's instructions ARE the prompt).
   const userContent = isFirst
-    ? 'stdinInput || "begin"'
+    ? shared.evalEntry
+      ? '__evalInput || "begin"'
+      : 'stdinInput || "begin"'
     : "`## Output of previous step:\\n${priorOutput}\\n\\n## Your task:\\n(continue based on the previous step's output)`";
 
-  const stdinReadLine = isFirst ? "  const stdinInput = await readStdinToEnd();\n" : "";
+  const stdinReadLine =
+    isFirst && !shared.evalEntry ? "  const stdinInput = await readStdinToEnd();\n" : "";
 
   // G61 — durable exactly-once: a plain step runs at most once per run, so
   // wrapping its runChatLoop in `__durableStep(name, …)` lets a crash-restart
   // of the same run (CREWHAUS_RUN_ID + a durable store) skip it when it
   // already completed. `open`/`close` are empty when durable wrapping is off,
-  // keeping the pre-Batch-F emission byte-identical.
+  // keeping the pre-Batch-F emission byte-identical. Cluster S — the
+  // eval-entry variant keys on the PER-INVOCATION `__runId` local so two eval
+  // samples never dedup against each other through the shared module store.
   const open = shared.durable
-    ? `__durableStep(${escapeJsonString(step.name)}, () => runChatLoop({`
+    ? shared.evalEntry
+      ? `__durableStep(__runId, ${escapeJsonString(step.name)}, () => runChatLoop({`
+      : `__durableStep(${escapeJsonString(step.name)}, () => runChatLoop({`
     : "runChatLoop({";
   const close = shared.durable ? "  }))" : "  })";
 
@@ -228,7 +262,7 @@ ${deadlineGuard}${stdinReadLine}  process.stdout.write("\\n[step ${stepNum}/${to
     seedMessages: [{ role: "user", content: ${userContent} }],${toolsField}${stepTuningFields}${modelFailoverFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.failureTaxonomyField}
     hooks: ${shared.hooksExpr},
     skills: __skills,
-    slashCommands: __slashCommands,${shared.runContextLine}
+    slashCommands: __slashCommands,${shared.runContextLine}${shared.evalFields}
 ${close};
 `;
 }
@@ -253,11 +287,20 @@ function renderGatedStep(
   const toolsField = renderStepToolsField(step.tools, shared.mcpWired);
   const stepTuningFields = renderStepTuningFields(step);
   const modelFailoverFields = renderStepModelFailoverFields(step);
-  const deadlineGuard = renderDeadlineGuard(shared.deadlineMs, stepNum, total, step.name);
+  const deadlineGuard = renderDeadlineGuard(
+    shared.deadlineMs,
+    stepNum,
+    total,
+    step.name,
+    shared.evalEntry,
+  );
   const inputExpr = isFirst
-    ? 'stdinInput || "begin"'
+    ? shared.evalEntry
+      ? '__evalInput || "begin"'
+      : 'stdinInput || "begin"'
     : "`## Output of previous step:\\n${priorOutput}\\n\\n## Your task:\\n(continue based on the previous step's output)`";
-  const stdinReadLine = isFirst ? "  const stdinInput = await readStdinToEnd();\n" : "";
+  const stdinReadLine =
+    isFirst && !shared.evalEntry ? "  const stdinInput = await readStdinToEnd();\n" : "";
 
   return `
   // ── Step ${stepNum}/${total}: ${step.name} ──
@@ -273,7 +316,7 @@ ${deadlineGuard}${stdinReadLine}  process.stdout.write(${escapeJsonString(`\n[st
     seedMessages: [{ role: "user", content: __step${stepNum}Input }],${toolsField}${stepTuningFields}${modelFailoverFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.failureTaxonomyField}
     hooks: ${shared.hooksExpr},
     skills: __skills,
-    slashCommands: __slashCommands,${shared.runContextLine}
+    slashCommands: __slashCommands,${shared.runContextLine}${shared.evalFields}
   });
   priorOutput = await __runStep${stepNum}("");
 `;
@@ -314,7 +357,13 @@ function renderJudgeStep(
   const gIdx = gatedStepIndex(steps, idx);
   const gated = steps[gIdx] as IrWorkflowStep;
   const gatedNum = gIdx + 1;
-  const deadlineGuard = renderDeadlineGuard(shared.deadlineMs, stepNum, total, step.name);
+  const deadlineGuard = renderDeadlineGuard(
+    shared.deadlineMs,
+    stepNum,
+    total,
+    step.name,
+    shared.evalEntry,
+  );
   const header = `
   // ── Step ${stepNum}/${total}: ${step.name} (judge — gates step ${gatedNum}/${total}: ${gated.name}) ──
 ${deadlineGuard}  process.stdout.write(${escapeJsonString(`\n[step ${stepNum}/${total}: ${step.name} (judge)]\n`)});
@@ -529,9 +578,22 @@ function renderDeadlineGuard(
   stepNum: number,
   total: number,
   stepName: string,
+  evalEntry = false,
 ): string {
   if (deadlineMs === undefined) return "";
   const notice = `\n[limits] workflow deadline exceeded (deadline_ms = ${deadlineMs}) — stopping before step ${stepNum}/${total}: ${stepName}\n`;
+  // Cluster S — inside runForEval a deadline stop must not poison the host
+  // process's exitCode (the eval runner records the thrown error as the
+  // sample's failure instead).
+  if (evalEntry) {
+    const message = `[limits] workflow deadline exceeded (deadline_ms = ${deadlineMs}) — stopped before step ${stepNum}/${total}: ${stepName}`;
+    return [
+      "  if (Date.now() >= __deadlineAt) {",
+      `    throw new Error(${escapeJsonString(message)});`,
+      "  }",
+      "",
+    ].join("\n");
+  }
   return [
     "  if (Date.now() >= __deadlineAt) {",
     `    process.stderr.write(${escapeJsonString(notice)});`,
@@ -765,7 +827,7 @@ const EVAL_EXIT_CONST = `
 const __EVAL_EXIT: number = (EXIT_CODES as Record<string, number>)["evaluation"] ?? 35;
 `;
 
-function renderAgent(ir: IrWorkflowV0): string {
+function renderAgent(ir: IrWorkflowV0, evalEntry = false): string {
   const importLines = resolveAllTools(ir.steps);
   const importBlock = importLines.length > 0 ? `${importLines.join("\n")}\n` : "";
   const hasRules = ir.permissions.rules.length > 0;
@@ -811,8 +873,15 @@ function renderAgent(ir: IrWorkflowV0): string {
     hooksExpr: hasSpecHooks ? "__allHooks" : "__hooks",
     deadlineMs,
     mcpWired: mcp.wired,
-    runContextLine: hasJudges ? "\n    runContext: __runContext," : "",
+    // Cluster S — the eval-entry variant threads the (caller-supplied or
+    // fresh) RunContext into EVERY step call so step traces land on the eval
+    // runner's per-sample bus; the plain emission keeps the judge-only line.
+    runContextLine: hasJudges || evalEntry ? "\n    runContext: __runContext," : "",
     durable,
+    evalEntry,
+    evalFields: evalEntry
+      ? "\n    ...(__evalOpts.sessionRootDir !== undefined ? { sessionRootDir: __evalOpts.sessionRootDir } : {}),\n    ...(__evalOpts._adapter !== undefined ? { _adapter: __evalOpts._adapter } : {}),"
+      : "",
   };
   const stepBodies = ir.steps
     .map((s, i) =>
@@ -853,7 +922,23 @@ import { createIdempotencyStore, runOnce } from "@crewhaus/durable-execution";
 `
     : "";
   const durableBlock = durable
-    ? `
+    ? evalEntry
+      ? `
+// Loop contract 0.4 (Batch F, temporal contract / G61) — durable exactly-once
+// step resume. Set CREWHAUS_RUN_ID to a stable value and
+// CREWHAUS_IDEMPOTENCY_STORE=file:<dir> to make a crashed run resume at the
+// first not-yet-completed plain step instead of re-running finished steps
+// (and their side effects). The default in-memory store is transparent.
+// Eval-entry variant: the run id is minted FRESH per runForEval invocation —
+// CREWHAUS_RUN_ID is deliberately IGNORED here (an exported run id in the
+// harness environment would otherwise make every sample share one id, and
+// samples 2..N would replay sample 1's step outputs out of the module-scope
+// store instead of running).
+const __idempotencyStore = createIdempotencyStore(${escapeJsonString(ir.name)});
+const __durableStep = (runId: string, name: string, fn: () => Promise<string>): Promise<string> =>
+  runOnce(__idempotencyStore, runId, name, fn);
+`
+      : `
 // Loop contract 0.4 (Batch F, temporal contract / G61) — durable exactly-once
 // step resume. Set CREWHAUS_RUN_ID to a stable value and
 // CREWHAUS_IDEMPOTENCY_STORE=file:<dir> to make a crashed run resume at the
@@ -905,19 +990,31 @@ import { judge } from "@crewhaus/eval-judge";
 import { createRunContext } from "@crewhaus/run-context";
 `
     : "";
+  // Cluster S — the eval-entry variant always mints/accepts a RunContext, so
+  // the import must exist even on judge-free workflows.
+  const evalEntryImports =
+    evalEntry && !hasJudges ? `import { createRunContext } from "@crewhaus/run-context";\n` : "";
   const judgeHelperBlock = hasJudges
     ? `${JUDGE_GATE_HELPER}${hasThrowingJudges ? EVAL_EXIT_CONST : ""}`
     : "";
-  const runContextBoot = hasJudges
+  const runContextBoot = evalEntry
     ? [
         "",
-        "  // G02 — one shared RunContext: every step's trace events and the",
-        "  // judge verdicts land on a single bus (single runId, like the graph",
-        "  // bundle's shared context).",
-        "  const __runContext = createRunContext();",
+        "  // Eval bridge (cluster S) — one RunContext per invocation: the eval",
+        "  // runner's per-sample context when supplied, else a fresh one. Step",
+        "  // traces AND judge verdicts land on this bus.",
+        "  const __runContext = __evalOpts.runContext ?? createRunContext();",
       ].join("\n")
-    : "";
-  const mainInvocation = hasJudges
+    : hasJudges
+      ? [
+          "",
+          "  // G02 — one shared RunContext: every step's trace events and the",
+          "  // judge verdicts land on a single bus (single runId, like the graph",
+          "  // bundle's shared context).",
+          "  const __runContext = createRunContext();",
+        ].join("\n")
+      : "";
+  const plainInvocation = hasJudges
     ? `try {
   await main();
 } catch (__err) {
@@ -929,12 +1026,68 @@ import { createRunContext } from "@crewhaus/run-context";
   process.exit(__report.exitCode);
 }`
     : "await main();";
+  // Cluster S — the eval-entry variant guards the CLI invocation so the eval
+  // bundle can `import * as entry from "../agent.ts"` without running it.
+  const mainInvocation = evalEntry
+    ? `if (import.meta.main) {
+${plainInvocation
+  .split("\n")
+  .map((l) => (l.length > 0 ? `  ${l}` : l))
+  .join("\n")}
+}`
+    : plainInvocation;
+
+  // Cluster S — the run body: identical statements either way, wrapped as
+  // main() on a plain compile and as the exported runForEval entry (with a
+  // thin stdin-reading main) on the eval-entry variant.
+  const runBody = `  let priorOutput = "";${deadlineBoot}${runContextBoot}
+  const __cwd = process.cwd();
+  const [__hooks, __skills, __slashCommands] = await Promise.all([
+    loadHooks({ cwd: __cwd }),
+    discoverSkills({ cwd: __cwd }),
+    loadCommands({ cwd: __cwd }),
+  ]);
+  const __skillTool = __skills.length > 0 ? createSkillTool(__skills) : null;
+  void __skillTool;${specHooksBoot}${mcp.bootBlock}
+${stepsSection}`;
+  const evalRunIdLine =
+    durable && evalEntry
+      ? "  // Always FRESH (no CREWHAUS_RUN_ID override): each eval sample must own\n" +
+        "  // its idempotency namespace or samples 2..N replay sample 1's outputs.\n" +
+        "  const __runId = `wf_${__randomUUID()}`;\n"
+      : "";
+  const mainSection = evalEntry
+    ? `/**
+ * Eval bridge (cluster S, D36/NEW-shape-1) — run the compiled workflow once:
+ * \`input\` is the step-1 trigger input (what main() reads from stdin); the
+ * return value is the FINAL step's output. The eval bundle in ./eval wraps
+ * this per sample; \`runContext\` threads the caller's trace bus through
+ * every step, \`sessionRootDir\` re-roots the step session logs, and
+ * \`_adapter\` is the scripted-provider test seam.
+ */
+export async function runForEval(
+  __evalInput: string,
+  __evalOpts: {
+    runContext?: Parameters<typeof runChatLoop>[0]["runContext"];
+    sessionRootDir?: string;
+    _adapter?: Parameters<typeof runChatLoop>[0]["_adapter"];
+  } = {},
+): Promise<string> {
+${evalRunIdLine}${runBody}  return priorOutput;
+}
+
+async function main(): Promise<void> {
+  const stdinInput = await readStdinToEnd();
+  await runForEval(stdinInput);
+}`
+    : `async function main(): Promise<void> {
+${runBody}}`;
 
   return `#!/usr/bin/env bun
 // Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: workflow, ir version: ${ir.version}, ${ir.steps.length} step(s))
 ${mcp.note}${continuityWarning}import { runChatLoop } from "@crewhaus/runtime-core";
-${judgeImports}${permImport}${durableImport}${extensionImports}${importBlock}${mcpImportBlock}
+${judgeImports}${evalEntryImports}${permImport}${durableImport}${extensionImports}${importBlock}${mcpImportBlock}
 async function readStdinToEnd(): Promise<string> {
   // No piped input — don't block waiting on an interactive TTY.
   if (process.stdin.isTTY) return "";
@@ -945,17 +1098,7 @@ async function readStdinToEnd(): Promise<string> {
   return Buffer.concat(chunks).toString("utf-8").trim();
 }
 ${judgeHelperBlock}${durableBlock}
-async function main(): Promise<void> {
-  let priorOutput = "";${deadlineBoot}${runContextBoot}
-  const __cwd = process.cwd();
-  const [__hooks, __skills, __slashCommands] = await Promise.all([
-    loadHooks({ cwd: __cwd }),
-    discoverSkills({ cwd: __cwd }),
-    loadCommands({ cwd: __cwd }),
-  ]);
-  const __skillTool = __skills.length > 0 ? createSkillTool(__skills) : null;
-  void __skillTool;${specHooksBoot}${mcp.bootBlock}
-${stepsSection}}
+${mainSection}
 
 ${mainInvocation}
 `;

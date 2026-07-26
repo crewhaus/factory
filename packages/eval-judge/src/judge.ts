@@ -20,6 +20,26 @@ export const DEFAULT_JUDGE_MODEL = "claude-sonnet-4-5";
 
 const logger = createLogger({ bindings: { module: "eval-judge" } });
 
+/**
+ * C35 — judge token metering sink. Judge calls are model calls the eval
+ * pays for, and until now their usage was discarded here (the adapter
+ * reports it; nothing read it), so `llm_judge` spend was invisible to the
+ * run summary, the matrix estimate, and every budget conversation.
+ *
+ * The sink is called ONCE per judge model call with the provider-reported
+ * usage and the model string as the CALLER named it (router grammar — the
+ * same key the pricing table is looked up by). It fires even when the call's
+ * response then fails validation: those tokens were really spent.
+ *
+ * Purely observational: the sink never influences the verdict, and a sink
+ * that throws would break judging, so callers must keep it total.
+ */
+export type JudgeUsageSink = (usage: {
+  readonly model: string;
+  readonly input: number;
+  readonly output: number;
+}) => void;
+
 export type JudgeOptions = {
   readonly rubric: Rubric;
   readonly sample: Sample;
@@ -49,6 +69,8 @@ export type JudgeOptions = {
    * `renderTranscriptDigest`); `createJudgeGrader` does both.
    */
   readonly target?: JudgeTarget;
+  /** C35 — per-call token metering sink (see {@link JudgeUsageSink}). */
+  readonly onUsage?: JudgeUsageSink;
 };
 
 export type JudgeResult = {
@@ -140,6 +162,10 @@ export async function judge(opts: JudgeOptions): Promise<JudgeResult> {
     }),
   );
 
+  // C35 — meter BEFORE validating the response: a judge call that answered
+  // in the wrong shape still burned the tokens it burned.
+  opts.onUsage?.({ model, input: final.usage.input, output: final.usage.output });
+
   const toolUse = extractToolUse(final, "submit_score");
   if (!toolUse) {
     throw new JudgeError(`judge did not call submit_score (stop_reason=${final.stopReason})`);
@@ -182,6 +208,8 @@ export type CategoricalJudgeOptions = {
   readonly temperature?: number;
   /** NEW-graders-3 — same prompt-framing switch as {@link JudgeOptions.target}. */
   readonly target?: JudgeTarget;
+  /** C35 — per-call token metering sink (see {@link JudgeUsageSink}). */
+  readonly onUsage?: JudgeUsageSink;
 };
 
 /** NEW-graders-2 — one categorical judge verdict. */
@@ -273,6 +301,9 @@ export async function judgeCategorical(
       temperature: opts.temperature ?? 0,
     }),
   );
+
+  // C35 — meter every judge model call, validation outcome notwithstanding.
+  opts.onUsage?.({ model, input: final.usage.input, output: final.usage.output });
 
   const toolUse = extractToolUse(final, "submit_label");
   if (!toolUse) {
@@ -483,6 +514,12 @@ export function createJudgeGrader(
     repeats?: number;
     judges?: ReadonlyArray<string>;
     target?: JudgeTarget;
+    /**
+     * C35 — token metering sink threaded into EVERY judge call this grader
+     * makes: single verdicts, each repeat, and each panelist (the sink
+     * receives that call's own model string, so a panel meters per model).
+     */
+    onUsage?: JudgeUsageSink;
   } = {},
 ): Grader {
   const repeats = opts.repeats ?? 1;
@@ -515,6 +552,7 @@ export function createJudgeGrader(
         ...(opts.model !== undefined ? { model: opts.model } : {}),
         ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
         ...(opts.target !== undefined ? { target: opts.target } : {}),
+        ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
       });
       if (result.abstain) {
         // A3 — same conservative-placeholder contract as the scalar path:
@@ -547,6 +585,7 @@ export function createJudgeGrader(
       ...(effectiveModel !== undefined ? { model: effectiveModel } : {}),
       ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
       ...(opts.target !== undefined ? { target: opts.target } : {}),
+      ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
     });
   };
 

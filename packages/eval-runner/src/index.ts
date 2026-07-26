@@ -90,6 +90,34 @@
  *       results.json (`aggregates.calibration` /
  *       `aggregates.paraphraseConsistency`).
  *
+ * Evals Wave 4 (reach & robustness, cluster R):
+ *   NEW-HUNT-4 — tool record/replay. `recordToolsDir` wraps every wired tool
+ *       so each execution's result is appended to `<dir>/tools.jsonl` keyed by
+ *       (sampleId, toolName, sha256(canonical-JSON args)); `replayToolsDir`
+ *       serves those results from the cassette instead of executing (miss
+ *       policy `error` by default, `live` to fall through). Tools only — the
+ *       model still runs live. See `tool-record.ts`.
+ *   NEW-HUNT-6 — `resume`: re-open an interrupted run directory (`outDir`),
+ *       verify its recorded specHash/datasetHash/gradersHash still match,
+ *       reload every sample that already wrote `grades.json`, run only the
+ *       missing ones, and re-aggregate the UNION under the ORIGINAL runId.
+ *       See `resume.ts`.
+ *
+ * Evals Wave 4 (reach & robustness, cluster T):
+ *   C33 — the reproducibility manifest completes: `run.json`/`results.json`
+ *       record `cliVersion` (supplied by the launcher), `bunVersion` and
+ *       `platform`, so a results.json says which build on which runtime
+ *       produced it.
+ *   C34 — flake DETECTION: a repeat run's samples whose trials disagreed
+ *       (`0 < trialPassRate < 1`) are flagged `flaky` per sample and listed
+ *       in `aggregates.flaky`/`flakySampleIds`. Verdicts are untouched —
+ *       quarantine is a human decision made against the dataset.
+ *   C35 — judge token METERING: every `llm_judge` call reports its provider
+ *       usage through a sink threaded into the graders this runner builds,
+ *       accumulating into `aggregates.judgeUsage` (per judge model, so the
+ *       CLI can price a panel). Previously the judge wire discarded usage
+ *       entirely and `llm_judge` spend was invisible.
+ *
  * Evals Wave 3 (data lifecycle, cluster A):
  *   B14 — multi-turn samples: a sample's optional `history` seeds the
  *       default invoker's chat-loop transcript verbatim (no model calls run
@@ -105,7 +133,12 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { CompiledGrader, Grader } from "@crewhaus/eval-grader";
-import { createJudgeGrader, loadCategoricalRubric, loadRubric } from "@crewhaus/eval-judge";
+import {
+  type JudgeUsageSink,
+  createJudgeGrader,
+  loadCategoricalRubric,
+  loadRubric,
+} from "@crewhaus/eval-judge";
 import type { IrV0 } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { memoryFragmentFromIr, wireMemory } from "@crewhaus/memory-service";
@@ -118,6 +151,7 @@ import { aggregate } from "./aggregate";
 import { warnUnconsumedCombinePolicy } from "./combine-warnings";
 import { defaultGraderRegistry, resolveRegistryGrader } from "./default-registry";
 import { RunnerError } from "./errors";
+import { assertResumeCompatible, loadCompletedSample, readRunManifest } from "./resume";
 import { runSample } from "./run-sample";
 import { createSampleOutputWriter } from "./sample-output";
 import { formatSemanticFallbackWarning } from "./semantic-fallback";
@@ -129,16 +163,30 @@ import {
   sampleIsCanary,
   sampleNeedsReview,
 } from "./slices";
-import { meanCI95, tCritical975, wilsonCI95 } from "./stats";
+import { DEFAULT_SCORE_EPSILON, meanCI95, tCritical975, wilsonCI95 } from "./stats";
+import {
+  TOOL_REPLAY_MISS_MARKER,
+  ToolRecorder,
+  type ToolReplayMissPolicy,
+  ToolReplayer,
+  formatReusedRecordingWarning,
+  loadToolRecording,
+  recordingTools,
+  replayingTools,
+} from "./tool-record";
 import type {
   AgentInvoker,
   EvalAggregates,
+  EvalChatLoopFn,
   EvalPricingFn,
   EvalRunPartial,
+  EvalRunResumed,
   EvalRunSummary,
+  EvalToolRecordingConfig,
   GraderEntry,
   GraderLookup,
   JudgeCalibrationApplication,
+  JudgeUsage,
   RunEvalOptions,
   SafetyViolationCounts,
   SampleMetrics,
@@ -151,12 +199,16 @@ import { type SharedAgentDeps, wireRunOnce } from "./wire-once";
 export type {
   AgentInvoker,
   EvalAggregates,
+  EvalChatLoopFn,
   EvalPricingFn,
   EvalRunPartial,
+  EvalRunResumed,
   EvalRunSummary,
+  EvalToolRecordingConfig,
   GraderEntry,
   GraderLookup,
   JudgeCalibrationApplication,
+  JudgeUsage,
   RunEvalOptions,
   SafetyViolationCounts,
   SampleMetrics,
@@ -171,8 +223,15 @@ export { wireRunOnce };
 // A2 — sampleNeedsReview is its needs-review sibling (verdict still counts).
 // B18 — sampleIsCanary marks contamination tripwires (excluded like abstained).
 export { DEFAULT_SLICE_KEYS, computeSlices, sampleAbstained, sampleIsCanary, sampleNeedsReview };
+// A4/A5 — the shared "you declared config nothing will consume" warning.
+// Every surface that PARSES the graders.yaml grammar must call it (runEval,
+// createExamRunner, and the CLI's `eval --voice --graders` path), so a
+// declared weight / passing_threshold is never silently dropped.
+export { warnUnconsumedCombinePolicy };
 // C27 — the closed-form CI helpers behind passRateCI95 / meanScoreCI95.
-export { meanCI95, tCritical975, wilsonCI95 };
+// NEW-stats-1 — the ONE score-shift epsilon `eval-report diff` (and its
+// `--epsilon` flag) and `regression-runner`'s gate classifier both default to.
+export { DEFAULT_SCORE_EPSILON, meanCI95, tCritical975, wilsonCI95 };
 // Loop contract 0.4 (Batch B, G14) — the default grader registry: the six
 // specialty packs + `.crewhaus/graders` plugins, shared by `runEval`'s
 // fallback and the CLI/optimizer/flywheel wiring. NEW-HUNT-7 adds the
@@ -234,6 +293,41 @@ export {
   type ExamChatLoopFn,
   type ExamChatLoopOptions,
 } from "./exam";
+// NEW-HUNT-4 — the tool record/replay layer (`--record-tools` /
+// `--replay-tools`): the cassette format, its canonical args hashing, and the
+// `RegisteredTool.execute` wrappers the default invoker installs per sample.
+export {
+  TOOL_RECORDING_FILENAME,
+  TOOL_REPLAY_MISS_MARKER,
+  ToolRecorder,
+  ToolReplayer,
+  canonicalJson,
+  formatReusedRecordingWarning,
+  hashToolArgs,
+  loadToolRecording,
+  recordingTools,
+  replayingTools,
+  toolRecordKey,
+  toolReplayMissError,
+  type LoadedToolRecording,
+  type ReusedRecordingEntry,
+  type ToolRecord,
+  type ToolRecorderOptions,
+  type ToolReplayMissPolicy,
+} from "./tool-record";
+// NEW-HUNT-6 — `--resume`: the run-manifest reader, the identity guard, and
+// the per-sample reload built from artifacts a completed sample already wrote.
+export {
+  RUN_MANIFEST_FILENAME,
+  assertResumeCompatible,
+  loadCompletedSample,
+  readRunManifest,
+  resumeMismatches,
+  sampleArtifactDirName,
+  type LoadCompletedSampleArgs,
+  type ResumeIdentity,
+  type ResumeManifest,
+} from "./resume";
 export { Semaphore };
 // Item 20 — the per-sample, line-buffered stdout writer concurrent runs use
 // so N samples never splice their tokens into one unreadable stream.
@@ -283,7 +377,57 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   const { ir, dataset, compiledGraders } = args;
   const opts = args.opts ?? {};
 
-  const runId = opts.runId ?? generateRunId();
+  // NEW-HUNT-4 — record and replay are two directions of one seam; asking for
+  // both at once has no coherent meaning, so refuse before any spend.
+  if (opts.recordToolsDir !== undefined && opts.replayToolsDir !== undefined) {
+    throw new RunnerError(
+      "recordToolsDir and replayToolsDir are mutually exclusive — record a run first, then replay it",
+    );
+  }
+  if (opts.replayMiss !== undefined && opts.replayToolsDir === undefined) {
+    throw new RunnerError("replayMiss is only meaningful with replayToolsDir");
+  }
+  // The wrappers live in the DEFAULT invoker (they wrap the tool list it
+  // wires). A caller-supplied invoker owns its own tool execution, so the
+  // flags would record nothing and replay nothing — say so instead.
+  if (
+    opts.invoker !== undefined &&
+    (opts.recordToolsDir !== undefined || opts.replayToolsDir !== undefined)
+  ) {
+    throw new RunnerError(
+      "tool record/replay requires the default invoker — a caller-supplied `invoker` executes its own tools, so the recording would be empty",
+    );
+  }
+
+  // NEW-HUNT-6 — a resumed run re-opens an EXISTING run directory: the id and
+  // the original start time come from its `run.json`, and the identity hashes
+  // recorded there must still match this invocation's.
+  const resumeDir = opts.resume === true ? opts.outDir : undefined;
+  if (opts.resume === true && resumeDir === undefined) {
+    throw new RunnerError("resume requires outDir — the run directory to resume into");
+  }
+  const resumeManifest = resumeDir !== undefined ? readRunManifest(resumeDir) : undefined;
+  const resumedAt = resumeManifest !== undefined ? new Date().toISOString() : undefined;
+  // The run.json resume LEDGER: every attempt that re-opened this directory,
+  // oldest first. Append rather than overwrite — a scalar "last resume" loses
+  // the fact that a run was resumed three times, which is exactly the thing a
+  // reader of a spliced-looking run directory needs to know.
+  const resumeLedger =
+    resumedAt !== undefined ? [...(resumeManifest?.resumedAt ?? []), resumedAt] : undefined;
+  // A resumed run keeps its ORIGINAL id — a caller pinning a DIFFERENT one is
+  // asking for two contradictory things, so say so rather than quietly
+  // re-labelling the directory (and orphaning its history entry).
+  if (
+    resumeManifest !== undefined &&
+    opts.runId !== undefined &&
+    opts.runId !== resumeManifest.runId
+  ) {
+    throw new RunnerError(
+      `resume keeps the original runId ${resumeManifest.runId}, but runId ${opts.runId} was requested — drop one of the two`,
+    );
+  }
+
+  const runId = resumeManifest?.runId ?? opts.runId ?? generateRunId();
   const outDir = resolveEvalOutDir(runId, opts.outDir);
   mkdirSync(outDir, { recursive: true });
 
@@ -313,6 +457,28 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
     : undefined;
   const calibrationApplied: JudgeCalibrationApplication[] = [];
 
+  // C35 — judge token metering. Every `llm_judge` grader this run builds gets
+  // the same sink, and every judge model call (single verdict, each repeat,
+  // each panelist) reports its provider usage through it. Accumulated per
+  // model string as the run NAMED it, so the CLI can price each judge model
+  // through the same table as the matrix `est_$` column. Judge-less runs
+  // never allocate an entry and their results.json stays byte-identical.
+  const judgeUsageByModel = new Map<string, { calls: number; input: number; output: number }>();
+  const meterJudgeUsage: JudgeUsageSink = ({ model, input, output }) => {
+    const acc = judgeUsageByModel.get(model) ?? { calls: 0, input: 0, output: 0 };
+    judgeUsageByModel.set(model, {
+      calls: acc.calls + 1,
+      input: acc.input + input,
+      output: acc.output + output,
+    });
+  };
+  // C35 — registry graders can make judge calls too (`safety.toxicity` /
+  // `safety.bias` classify through a categorical judge). Install the SAME
+  // sink on the registry — whether this run built it or the caller passed
+  // one in — so their spend is metered instead of paid for invisibly.
+  // Registries without the optional hook are unaffected.
+  graderRegistry?.setJudgeUsageSink?.(meterJudgeUsage);
+
   // Resolve graders. Replace any `llm_judge` placeholder with a real judge
   // grader bound to the runner's judgeModel (or the per-grader override),
   // and any `registry` placeholder with the named grader from the grader
@@ -333,6 +499,9 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
             ? { temperature: g.judgeSpec.temperature }
             : {}),
           ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
+          ...(opts.judgeAdapter !== undefined ? { adapter: opts.judgeAdapter } : {}),
+          // C35 — meter this grader's judge calls.
+          onUsage: meterJudgeUsage,
         });
         return { name: g.name, grader, weight: g.weight };
       }
@@ -372,6 +541,10 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
         ...(g.judgeSpec.temperature !== undefined ? { temperature: g.judgeSpec.temperature } : {}),
         ...(g.judgeSpec.repeats !== undefined ? { repeats: g.judgeSpec.repeats } : {}),
+        ...(opts.judgeAdapter !== undefined ? { adapter: opts.judgeAdapter } : {}),
+        // C35 — meter this grader's judge calls (repeats and panelists each
+        // report their own call, with their own model string).
+        onUsage: meterJudgeUsage,
       });
       return { name: g.name, grader, weight: g.weight };
     }
@@ -444,10 +617,53 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
     }
   }
 
+  // NEW-HUNT-3 × NEW-HUNT-6 — the budget meter starts at ZERO on every
+  // attempt, so resuming a run RE-ARMS the whole `--budget-usd` cap: a
+  // $10-capped run that aborted at $10 may spend $10 more. That is a
+  // defensible default (the operator asked for another attempt), but it must
+  // be a STATED decision, not an accident — so every metered attempt amends
+  // its cumulative spend onto `run.json` (see `amendRunManifest` below) and a
+  // resume that finds earlier spend says so before it spends anything.
+  const priorSpentUsd = resumeManifest?.spentUsd ?? 0;
+  if (priorSpentUsd > 0 && budgetUsd !== undefined) {
+    process.stderr.write(
+      `[eval] warning: run ${runId} already metered $${priorSpentUsd.toFixed(4)} in earlier attempt(s); the --budget-usd $${budgetUsd.toFixed(4)} cap is re-armed for THIS attempt, so cumulative spend on this run may reach $${(priorSpentUsd + budgetUsd).toFixed(4)}. run.json's spentUsd carries the running total.\n`,
+    );
+  }
+
+  // NEW-HUNT-4 — construct the cassette side ONCE per run: a recorder appends
+  // to `<dir>/tools.jsonl`; a replayer indexes it (a directory with no
+  // recording fails the run LOUDLY here rather than replaying all-misses).
+  // The per-sample wrapping happens inside the default invoker, where the
+  // sample id is known.
+  let toolRecorder: ToolRecorder | undefined;
+  let toolReplayer: ToolReplayer | undefined;
+  let toolRecording: EvalToolRecordingConfig | undefined;
+  if (opts.recordToolsDir !== undefined) {
+    toolRecorder = new ToolRecorder({ dir: opts.recordToolsDir });
+    toolRecording = { mode: "record", dir: opts.recordToolsDir };
+  } else if (opts.replayToolsDir !== undefined) {
+    const recording = loadToolRecording(opts.replayToolsDir);
+    toolReplayer = new ToolReplayer(recording);
+    toolRecording = {
+      mode: "replay",
+      dir: opts.replayToolsDir,
+      recordingHash: recording.hash,
+      missPolicy: opts.replayMiss ?? "error",
+    };
+  }
+  const toolRecordingConfig = toolRecording !== undefined ? { toolRecording } : {};
+
   // The default invoker calls runChatLoop with the per-sample fresh
   // runContext; the watchdog wraps WHICHEVER invoker runs (default or
   // caller-supplied) so a hung provider/tool loop can't stall a slot.
-  const baseInvoker = opts.invoker ?? (await defaultInvoker(ir, opts));
+  const baseInvoker =
+    opts.invoker ??
+    (await defaultInvoker(ir, opts, {
+      ...(toolRecorder !== undefined ? { recorder: toolRecorder } : {}),
+      ...(toolReplayer !== undefined ? { replayer: toolReplayer } : {}),
+      missPolicy: opts.replayMiss ?? "error",
+    }));
   const invoker =
     sampleTimeoutMs !== undefined ? withSampleTimeout(baseInvoker, sampleTimeoutMs) : baseInvoker;
 
@@ -469,7 +685,9 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
     );
   }
 
-  const startedAt = new Date().toISOString();
+  // NEW-HUNT-6 — a resumed run keeps the ORIGINAL start time (the reloaded
+  // samples were graded then); `resumed.resumedAt` records this attempt's.
+  const startedAt = resumeManifest?.startedAt ?? new Date().toISOString();
   const concurrency = opts.concurrency ?? DEFAULT_CONCURRENCY;
   const sem = new Semaphore(concurrency);
 
@@ -507,6 +725,23 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   // Persist run-level config snapshot up front so SIGINT mid-run still leaves
   // a usable directory.
   const specHash = await hashSpec(ir);
+  // NEW-HUNT-6 — the resume identity guard, checked BEFORE the manifest is
+  // rewritten (and before any sample runs): resuming into a directory whose
+  // spec, dataset or graders moved would splice two measurements together.
+  if (resumeManifest !== undefined && resumeDir !== undefined) {
+    assertResumeCompatible(resumeDir, resumeManifest, {
+      specHash,
+      ...(opts.datasetHash !== undefined ? { datasetHash: opts.datasetHash } : {}),
+      ...(opts.gradersHash !== undefined ? { gradersHash: opts.gradersHash } : {}),
+      // The rest of the measurement instrument: run-level overrides that live
+      // in no hash (`--judge-model`, `--seed`), the trial count, and whether
+      // tools faced the world or a cassette. See `resumeMismatches`.
+      ...(opts.judgeModel !== undefined ? { judgeModel: opts.judgeModel } : {}),
+      ...(repeats > 1 ? { repeats } : {}),
+      ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
+      ...toolRecordingConfig,
+    });
+  }
   await Bun.write(
     join(outDir, "run.json"),
     JSON.stringify(
@@ -521,12 +756,24 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         model: ir.agent.model,
         ...(opts.judgeModel !== undefined ? { judgeModel: opts.judgeModel } : {}),
         concurrency,
+        // C33 — reproducibility manifest: which build graded this, on which
+        // runtime, on what machine. `cliVersion` only when the launcher named
+        // itself (see RunEvalOptions.cliVersion).
+        ...(opts.cliVersion !== undefined ? { cliVersion: opts.cliVersion } : {}),
+        ...runtimeManifest(),
         ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
         ...(repeats > 1 ? { repeats } : {}),
         ...(sampleTimeoutMs !== undefined ? { sampleTimeoutMs } : {}),
         ...(budgetUsd !== undefined ? { budgetUsd } : {}),
         ...judgeSamplingConfig,
         ...judgeCalibrationConfig,
+        // NEW-HUNT-4 — how tool execution was treated (absent = live tools).
+        ...toolRecordingConfig,
+        // NEW-HUNT-6 — this directory was resumed; `runId`/`startedAt` above
+        // are the ORIGINAL run's. One ISO stamp per attempt, appended (the
+        // typed round-trip lives in `ResumeManifest.resumedAt`), so a run
+        // resumed twice still shows both attempts.
+        ...(resumeLedger !== undefined ? { resumedAt: resumeLedger } : {}),
       },
       null,
       2,
@@ -540,6 +787,30 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   for await (const s of dataset.samples) samples.push(s);
   if (samples.length === 0) {
     throw new RunnerError(`dataset "${dataset.name}" yielded zero samples`);
+  }
+
+  // NEW-HUNT-6 — resolve which samples this attempt does NOT have to pay for
+  // again: every sample whose per-sample artifacts already carry a full grade
+  // (all trials, under `repeats`) is reloaded from disk verbatim. Resolved
+  // BEFORE the run so the reused/ran split is reportable, and so a resume of
+  // an already-complete run costs exactly nothing.
+  const reusedResults = new Map<string, SampleResult>();
+  if (resumeManifest !== undefined) {
+    for (const sample of samples) {
+      const prior = loadCompletedSample({
+        runDir: outDir,
+        sample,
+        model: ir.agent.model,
+        repeats,
+      });
+      if (prior !== undefined) reusedResults.set(sample.id, prior);
+    }
+    logger.info("eval_resume.reused", {
+      runId,
+      runDir: outDir,
+      reusedSamples: reusedResults.size,
+      ranSamples: samples.length - reusedResults.size,
+    });
   }
 
   let interrupted = false;
@@ -567,11 +838,24 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   // In-flight samples always complete — the same pre-unit posture as the
   // run path's PRE-TURN budget check.
   let spentMicros = 0;
-  let completedCount = 0;
+  // NEW-HUNT-6 — reloaded samples are completed samples (they just cost this
+  // attempt nothing), so the budget message's k/N counts them.
+  let completedCount = reusedResults.size;
   const budgetAbortedIds = new Set<string>();
 
   const settled = await Promise.allSettled(
     samples.map(async (sample) => {
+      // NEW-HUNT-6 — already graded in this run directory: reuse it wholesale
+      // (no slot, no invoker, no judge, no spend) and let it join the union.
+      // G54 — but run it back through `classifyFailure`: the taxonomy class is
+      // attached AFTER `runSample` (so meta.json never carried it) and
+      // `--resume` documents errored samples as reused as-is — exactly the
+      // samples the taxonomy exists to triage. Without this the resumed run's
+      // "[eval] failure classes:" tally silently under-reports by every reused
+      // errored sample. Classification is a pure function of the recorded
+      // error message, so re-deriving it costs nothing and cannot drift.
+      const reused = reusedResults.get(sample.id);
+      if (reused !== undefined) return classifyFailure(reused);
       const release = await sem.acquire();
       // Check *after* acquiring the slot: every callback's synchronous prefix
       // runs during `.map()` (before any SIGINT can fire), so a pre-acquire
@@ -632,6 +916,13 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
           if (!infraNoise || opts.retryErrors === false || interrupted) {
             return classifyFailure(first);
           }
+          // NEW-HUNT-4 — a replay MISS is deterministic by construction (same
+          // key, same cassette), so the one blunt noise retry would only buy a
+          // second identical failure at a second model call's price. Terminal
+          // for exactly the reason a `recovery: fail` taxonomy class is.
+          if (first.error?.includes(TOOL_REPLAY_MISS_MARKER) === true) {
+            return classifyFailure(first);
+          }
           if (first.error !== undefined && taxonomy.length > 0) {
             const named = matchNamedFailure({ message: first.error }, taxonomy);
             if (named !== undefined && named.recovery === "fail") {
@@ -672,7 +963,17 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         }));
         const passCount = trials.filter((t) => t.passed).length;
         completedCount += 1;
-        return { ...first, trials, trialPassRate: passCount / trials.length };
+        const trialPassRate = passCount / trials.length;
+        // C34 — trials that disagreed = a flaky sample. Flagged on the
+        // sample itself (results.json per-sample visibility) as well as
+        // listed in the aggregates, which derive the same set from
+        // `trialPassRate` so resumed/older results classify identically.
+        return {
+          ...first,
+          trials,
+          trialPassRate,
+          ...(trialPassRate > 0 && trialPassRate < 1 ? { flaky: true } : {}),
+        };
       } finally {
         release();
       }
@@ -703,7 +1004,15 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   });
 
   const endedAt = new Date().toISOString();
-  const aggregates = aggregate(results);
+  // C35 — fold the metered judge spend onto the aggregates. Derived here (not
+  // in `aggregate()`) because it is RUN-ambient rather than per-sample: judge
+  // graders are built once and shared across concurrently-running samples, so
+  // the honest unit of attribution is the run.
+  const judgeUsage = summarizeJudgeUsage(judgeUsageByModel);
+  const aggregates: EvalAggregates = {
+    ...aggregate(results),
+    ...(judgeUsage !== undefined ? { judgeUsage } : {}),
+  };
   // NEW-HUNT-5 — the semantic.similarity ROUGE-L fallback fired: the run
   // graded some samples with a DIFFERENT instrument. Warn at RUN level on
   // stderr (the literal `[eval] warning:` grammar, not logger diagnostics)
@@ -713,6 +1022,33 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   if (aggregates.semanticFallback !== undefined) {
     process.stderr.write(`${formatSemanticFallbackWarning(aggregates.semanticFallback)}\n`);
   }
+  // NEW-HUNT-4 — a replay served an ALREADY-CONSUMED recording entry: the
+  // replayed trajectory called a tool more times than the recording did, so
+  // it diverged and was fed a stale result. Same posture as the NEW-HUNT-5
+  // fallback above — a run-level `[eval] warning:` naming the affected calls,
+  // inherited by every runEval caller — plus a `reusedEntries` count on the
+  // manifest's `toolRecording` block, so the divergence is on the record and
+  // not just on the console.
+  const reusedRecordingEntries = toolReplayer?.reusedEntries ?? [];
+  if (toolReplayer !== undefined) {
+    const reusedWarning = formatReusedRecordingWarning(
+      reusedRecordingEntries,
+      toolReplayer.recording.path,
+    );
+    if (reusedWarning !== undefined) process.stderr.write(`${reusedWarning}\n`);
+  }
+  const finalToolRecording: EvalToolRecordingConfig | undefined =
+    toolRecording !== undefined
+      ? {
+          ...toolRecording,
+          ...(reusedRecordingEntries.length > 0
+            ? { reusedEntries: reusedRecordingEntries.length }
+            : {}),
+        }
+      : undefined;
+  const finalToolRecordingConfig =
+    finalToolRecording !== undefined ? { toolRecording: finalToolRecording } : {};
+
   // B13 — per-slice aggregates over the samples' string metadata values.
   // Absent when nothing sliced, keeping metadata-less runs byte-identical.
   const slices = computeSlices(results, sliceKeys);
@@ -731,6 +1067,17 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         }
       : undefined;
 
+  // NEW-HUNT-6 — the resume ledger: what this attempt reloaded vs ran.
+  const resumed: EvalRunResumed | undefined =
+    resumedAt !== undefined
+      ? {
+          runDir: outDir,
+          resumedAt,
+          reusedSamples: reusedResults.size,
+          ranSamples: samples.length - reusedResults.size,
+        }
+      : undefined;
+
   const summary: EvalRunSummary = {
     runId,
     startedAt,
@@ -739,6 +1086,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
     aggregates,
     ...(slices !== undefined ? { slices } : {}),
     ...(partial !== undefined ? { partial } : {}),
+    ...(resumed !== undefined ? { resumed } : {}),
     config: {
       specHash,
       datasetName: dataset.name,
@@ -748,19 +1096,99 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
       model: ir.agent.model,
       ...(opts.judgeModel !== undefined ? { judgeModel: opts.judgeModel } : {}),
       concurrency,
+      // C33 — mirrors run.json: the manifest rides results.json too, so a run
+      // directory read on its own still says which build/runtime produced it.
+      ...(opts.cliVersion !== undefined ? { cliVersion: opts.cliVersion } : {}),
+      ...runtimeManifest(),
       ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
       ...(repeats > 1 ? { repeats } : {}),
       ...(sampleTimeoutMs !== undefined ? { sampleTimeoutMs } : {}),
       ...(budgetUsd !== undefined ? { budgetUsd } : {}),
       ...judgeSamplingConfig,
       ...judgeCalibrationConfig,
+      // NEW-HUNT-4 — mirrors run.json: a replayed run is gated and pinned
+      // like any other, and this is where it says its tools came from a
+      // cassette (and which one), plus how often the replay had to reuse an
+      // exhausted entry.
+      ...finalToolRecordingConfig,
     },
     outDir,
   };
 
   await Bun.write(join(outDir, "results.json"), JSON.stringify(summary, null, 2));
+  // The two figures only knowable once the run FINISHED, merged into the
+  // run.json written before the first sample: cumulative metered spend
+  // (so a resume can say the cap is being re-armed) and the replay's
+  // reused-entry count. Read-modify-write, so a run killed before this point
+  // still leaves the pre-run manifest exactly as it was.
+  await amendRunManifest(outDir, {
+    ...(priorSpentUsd + spentMicros / 1_000_000 > 0
+      ? { spentUsd: priorSpentUsd + spentMicros / 1_000_000 }
+      : {}),
+    ...finalToolRecordingConfig,
+  });
 
   return summary;
+}
+
+/**
+ * Merge post-run figures into `<outDir>/run.json`. Best-effort by design: a
+ * missing or torn manifest is left alone (results.json already carries every
+ * field), because failing a completed, paid-for run over a bookkeeping write
+ * would be the worse outcome.
+ */
+async function amendRunManifest(
+  outDir: string,
+  patch: Readonly<Record<string, unknown>>,
+): Promise<void> {
+  if (Object.keys(patch).length === 0) return;
+  const path = join(outDir, "run.json");
+  let base: Record<string, unknown>;
+  try {
+    base = JSON.parse(await Bun.file(path).text()) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  if (base === null || typeof base !== "object") return;
+  await Bun.write(path, JSON.stringify({ ...base, ...patch }, null, 2));
+}
+
+/**
+ * C35 — fold the per-model judge metering into the run-level
+ * {@link JudgeUsage} block, or `undefined` when the run made no judge calls
+ * (keeping judge-less results.json byte-identical). Model keys are sorted so
+ * two runs with the same spend produce byte-identical JSON.
+ */
+function summarizeJudgeUsage(
+  byModel: ReadonlyMap<string, { calls: number; input: number; output: number }>,
+): JudgeUsage | undefined {
+  if (byModel.size === 0) return undefined;
+  let calls = 0;
+  let input = 0;
+  let output = 0;
+  const sorted: Record<string, { calls: number; input: number; output: number }> = {};
+  for (const model of [...byModel.keys()].sort()) {
+    const m = byModel.get(model) as { calls: number; input: number; output: number };
+    sorted[model] = m;
+    calls += m.calls;
+    input += m.input;
+    output += m.output;
+  }
+  return { calls, tokens: { input, output }, byModel: sorted };
+}
+
+/**
+ * C33 — the environment half of the reproducibility manifest: the Bun build
+ * and machine the run executed on. `Bun.version` is guarded because this
+ * package is importable from a plain-Node consumer, where the global is
+ * absent (the field is then simply omitted, never faked).
+ */
+function runtimeManifest(): { bunVersion?: string; platform: string } {
+  const bun = (globalThis as { Bun?: { version?: string } }).Bun;
+  return {
+    ...(typeof bun?.version === "string" ? { bunVersion: bun.version } : {}),
+    platform: `${process.platform}-${process.arch}`,
+  };
 }
 
 /**
@@ -842,11 +1270,31 @@ function withSampleTimeout(invoker: AgentInvoker, timeoutMs: number): AgentInvok
     });
 }
 
-async function defaultInvoker(ir: IrV0, opts: RunEvalOptions): Promise<AgentInvoker> {
+/**
+ * NEW-HUNT-4 — the tool-execution interception the default invoker installs
+ * per sample. Exactly one of `recorder` / `replayer` is ever set (runEval
+ * refuses both); absent both ⇒ the tool list is handed to the chat loop
+ * untouched, byte-identical to a pre-NEW-HUNT-4 run.
+ */
+type ToolCassette = {
+  readonly recorder?: ToolRecorder;
+  readonly replayer?: ToolReplayer;
+  readonly missPolicy: ToolReplayMissPolicy;
+};
+
+async function defaultInvoker(
+  ir: IrV0,
+  opts: RunEvalOptions,
+  cassette: ToolCassette = { missPolicy: "error" },
+): Promise<AgentInvoker> {
   const wired: SharedAgentDeps = await wireRunOnce(
     ir,
     opts.cwd !== undefined ? { cwd: opts.cwd } : {},
   );
+  // The session runner: `runChatLoop` in production, an injected stub under
+  // `RunEvalOptions.chatLoop` (tests pin the options — including the wrapped
+  // tools below — without a process-global module mock).
+  const chatLoop: EvalChatLoopFn = opts.chatLoop ?? runChatLoop;
   // v0.3.0 §7.2 — eval/optimizer state ISOLATION. When the IR carries the
   // memory fabric (an enabled `memory` block and/or `continuity`, which is
   // DEFAULT-ON on the cli shape since 0.3.0), each sample gets its OWN
@@ -902,9 +1350,18 @@ async function defaultInvoker(ir: IrV0, opts: RunEvalOptions): Promise<AgentInvo
         slashCommands = memWired.options.slashCommands;
       }
     }
+    // NEW-HUNT-4 — install the cassette on THIS sample's final tool list (the
+    // wired stack plus whatever the memory fabric registered), so the key's
+    // sampleId is the sample actually calling. Absent a cassette the array is
+    // handed over untouched.
+    if (cassette.recorder !== undefined) {
+      tools = recordingTools(tools, req.sample.id, cassette.recorder);
+    } else if (cassette.replayer !== undefined) {
+      tools = replayingTools(tools, req.sample.id, cassette.replayer, cassette.missPolicy);
+    }
     const sampleOut = fanOut ? createSampleOutputWriter({ label: req.sample.id }) : undefined;
     try {
-      const agentOutput = await runChatLoop({
+      const agentOutput = await chatLoop({
         model: wired.model,
         instructions: wired.instructions,
         tools,

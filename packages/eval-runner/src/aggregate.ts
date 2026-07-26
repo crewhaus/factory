@@ -84,6 +84,13 @@ const ZERO_SAFETY: SafetyViolationCounts = {
  * much the point estimates can be trusted at this n — attached whenever the
  * data supports them (graded n ≥ 1, scored n ≥ 2 respectively).
  *
+ * Flake honesty (C34): a sample whose trials DISAGREED
+ * (`0 < trialPassRate < 1`) is listed in `flaky`/`flakySampleIds` — the run
+ * measured instability, not just reported pass^k. Nothing else changes: the
+ * sample keeps its canonical verdict in every figure (excluding it would be
+ * a silent quarantine, and quarantine is a human decision made against the
+ * dataset). Runs without repeats, and stable repeat runs, are byte-identical.
+ *
  * NEW-HUNT-5: `semanticFallback` names the samples the semantic.similarity
  * grader silently graded with ROUGE-L (embedder error) — an instrument swap
  * the run-level record must not hide. Present only when a sample fell back
@@ -216,6 +223,20 @@ export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates 
     );
   }
 
+  // C34 — flaky samples: trials that disagreed with each other. Derived from
+  // `trialPassRate` (not from the per-sample `flaky` flag) so a results.json
+  // written by an older CLI, or a sample reloaded by `--resume`, is classified
+  // identically. Ranked by instability — a 0.5 rate is maximally unstable, a
+  // 1/5 or 4/5 rate less so — so the listing leads with the worst offenders.
+  const flakySampleIds = samples
+    .filter((s) => s.trialPassRate !== undefined && s.trialPassRate > 0 && s.trialPassRate < 1)
+    .sort(
+      (a, b) =>
+        Math.abs((a.trialPassRate as number) - 0.5) - Math.abs((b.trialPassRate as number) - 0.5) ||
+        a.sampleId.localeCompare(b.sampleId),
+    )
+    .map((s) => s.sampleId);
+
   // NEW-HUNT-5 — ROUGE-L-fallback samples (semantic.similarity's embedder
   // dropped out mid-run).
   const semanticFallback = detectSemanticFallback(samples);
@@ -252,6 +273,9 @@ export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates 
       ? { needsReview: needsReviewIds.length, needsReviewSampleIds: needsReviewIds }
       : {}),
     ...(canaryIds.length > 0 ? { canary: canaryIds.length, canarySampleIds: canaryIds } : {}),
+    ...(flakySampleIds.length > 0
+      ? { flaky: flakySampleIds.length, flakySampleIds: flakySampleIds }
+      : {}),
     ...(Object.keys(criterionMeans).length > 0 ? { criterionMeans } : {}),
     ...(semanticFallback !== undefined ? { semanticFallback } : {}),
     ...(calibration !== undefined ? { calibration } : {}),

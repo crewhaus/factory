@@ -18,11 +18,16 @@
  *
  * `--apply` writes the per-spec calibrated `--min-score` default to
  * `.crewhaus/judge-calibration.json` (a small documented file distill/optimize
- * could later consult). Kept side-effect-free (the CLI entry file runs an argv
- * switch on import) mirroring `feedback.ts` / `graders-suggest.ts`; all
- * filesystem access + the judge model call live in `apps/cli/src/index.ts`.
+ * could later consult) — ATOMICALLY, via {@link writeCalibrationFileAtomic}
+ * (see its docstring: torn files were observed in the wild). Otherwise kept
+ * side-effect-free (the CLI entry file runs an argv switch on import)
+ * mirroring `feedback.ts` / `graders-suggest.ts`; the judge model call and
+ * every other filesystem access live in `apps/cli/src/index.ts`.
  */
 
+import { randomBytes } from "node:crypto";
+import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import type { Sample } from "@crewhaus/eval-dataset";
 
 /** Thrown on malformed flags / unusable inputs. The CLI entry file routes it
@@ -388,6 +393,38 @@ export type JudgeCalibrationFile = {
     }
   >;
 };
+
+/**
+ * Write `.crewhaus/judge-calibration.json` ATOMICALLY: serialize to a
+ * uniquely-named temp file in the SAME directory (so the rename stays within
+ * one filesystem), then `rename` it over the destination — POSIX rename is
+ * atomic, so every reader sees either the old file or the new one, never a
+ * half-written prefix.
+ *
+ * Why this is not a nicety: the eval runner READS this file at run start to
+ * gate `llm_judge` graders that declare no `passing_score` (G47). A plain
+ * `writeFileSync` is a truncate-then-write, and a concurrent
+ * `judge calibrate --apply` in a shared checkout produced exactly the torn
+ * artifact that state predicts — observed during the Wave-3 flake hunt,
+ * where a truncated calibration file was visible mid-run to the eval
+ * package's own tests. A malformed file only WARNS (calibration is skipped),
+ * so the failure mode is silent mis-gating, not a crash.
+ *
+ * The temp file is removed if the rename fails, so a failed write never
+ * leaves litter beside the artifact.
+ */
+export function writeCalibrationFileAtomic(path: string, file: JudgeCalibrationFile): void {
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true });
+  const tmp = join(dir, `.${basename(path)}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
+  try {
+    writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`);
+    renameSync(tmp, path);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
+}
 
 /** Build/merge the persisted calibration entry for a spec. Existing entries for
  *  OTHER specs are preserved. Returns the file object to write. The recommended

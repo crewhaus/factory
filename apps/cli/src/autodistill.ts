@@ -37,10 +37,18 @@
  * when `reviewRootDir` is supplied — the B20 review queue (split-verdict
  * ties must not vanish just because the distill ran unattended).
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
 import type { DatasetRegistry } from "@crewhaus/dataset-registry";
 import type { DatasetRecord } from "@crewhaus/dataset-registry";
+import {
+  DISTILL_STATE_RELPATH,
+  countUnprocessed,
+  newestTs,
+  ratingsDatasetName,
+  readDistillState,
+  resolveAutoDistillThreshold,
+  shouldAutoDistill,
+  writeDistillState,
+} from "@crewhaus/feedback-distill";
 import type { IrFeedback } from "@crewhaus/ir";
 import { redactDatasetText } from "./dataset-audit";
 import { DEFAULT_SPLIT_SPEC, registerDataset } from "./datasets";
@@ -48,133 +56,27 @@ import { type FeedbackRecord, type SessionTurn, distill } from "./feedback";
 import { isRegistrySafeName } from "./regression-pin";
 import { enqueueReviewEntries, entriesFromRaterTies } from "./review-queue";
 
-/** Default "≥ N unprocessed ratings" trigger (the spec's `autoDistill` is a
- *  plain boolean and carries no threshold of its own). */
-export const DEFAULT_AUTODISTILL_THRESHOLD = 5;
-
-/** Env override for the trigger threshold. */
-export const AUTODISTILL_THRESHOLD_ENV = "CREWHAUS_AUTODISTILL_THRESHOLD";
-
-/** The watermark file, relative to the harness cwd. */
-export const DISTILL_STATE_RELPATH = join(".crewhaus", "feedback", ".distill-state.json");
-
-/** The registry dataset autoDistill maintains for a spec. */
-export function ratingsDatasetName(specName: string): string {
-  return `${specName}-ratings`;
-}
-
-// -------- watermark state --------
-
-export type DistillState = {
-  readonly schemaVersion: 1;
-  /** ISO ts of the newest feedback record folded into the last auto-distill;
-   *  records with a STRICTLY greater ts count as unprocessed. */
-  readonly lastProcessedTs: string;
-  /** How many records the last auto-distill saw in total (informational). */
-  readonly processedCount: number;
-  /** The last registry version this consumer produced (informational). */
-  readonly lastRegistered?: {
-    readonly name: string;
-    readonly version: string;
-    readonly at: string;
-  };
-};
-
-/** Narrow parsed JSON to a DistillState; undefined on any malformation (a
- *  corrupt watermark degrades to "everything is unprocessed", never throws). */
-export function parseDistillState(text: string): DistillState | undefined {
-  let value: unknown;
-  try {
-    value = JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-  if (typeof value !== "object" || value === null) return undefined;
-  const v = value as Record<string, unknown>;
-  if (v["schemaVersion"] !== 1) return undefined;
-  if (typeof v["lastProcessedTs"] !== "string") return undefined;
-  if (typeof v["processedCount"] !== "number") return undefined;
-  return value as DistillState;
-}
-
-export function readDistillState(path: string): DistillState | undefined {
-  if (!existsSync(path)) return undefined;
-  try {
-    return parseDistillState(readFileSync(path, "utf-8"));
-  } catch {
-    return undefined;
-  }
-}
-
-export function writeDistillState(path: string, state: DistillState): void {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-}
-
-/** Records newer than the watermark (strict ISO-string comparison — the
- *  capture surfaces all stamp `new Date().toISOString()`, which compares
- *  lexicographically). No watermark → everything is unprocessed. */
-export function countUnprocessed(
-  records: ReadonlyArray<FeedbackRecord>,
-  lastProcessedTs: string | undefined,
-): number {
-  if (lastProcessedTs === undefined) return records.length;
-  return records.filter((r) => r.ts > lastProcessedTs).length;
-}
-
-export function newestTs(records: ReadonlyArray<FeedbackRecord>): string | undefined {
-  let max: string | undefined;
-  for (const r of records) {
-    if (max === undefined || r.ts > max) max = r.ts;
-  }
-  return max;
-}
-
-// -------- trigger decision --------
-
-export function resolveAutoDistillThreshold(
-  env: Readonly<Record<string, string | undefined>>,
-): number {
-  const raw = env[AUTODISTILL_THRESHOLD_ENV];
-  if (raw === undefined || raw === "") return DEFAULT_AUTODISTILL_THRESHOLD;
-  const n = Number.parseInt(raw, 10);
-  if (Number.isNaN(n) || n < 1) return DEFAULT_AUTODISTILL_THRESHOLD;
-  return n;
-}
-
-export type AutoDistillDecision = {
-  readonly run: boolean;
-  readonly reason: string;
-};
-
-/** Whether the teardown should distill: the spec opted in
- *  (`feedback.autoDistill: true`, block not disabled) AND enough
- *  unprocessed ratings accumulated. */
-export function shouldAutoDistill(opts: {
-  readonly feedback: IrFeedback | undefined;
-  readonly unprocessed: number;
-  readonly threshold: number;
-}): AutoDistillDecision {
-  if (opts.feedback === undefined) {
-    return { run: false, reason: "spec has no feedback block" };
-  }
-  if (opts.feedback.enabled === false) {
-    return { run: false, reason: "feedback block is disabled (enabled: false)" };
-  }
-  if (opts.feedback.autoDistill !== true) {
-    return { run: false, reason: "feedback.autoDistill is not enabled" };
-  }
-  if (opts.unprocessed < opts.threshold) {
-    return {
-      run: false,
-      reason: `${opts.unprocessed} unprocessed rating(s) < threshold ${opts.threshold}`,
-    };
-  }
-  return {
-    run: true,
-    reason: `${opts.unprocessed} unprocessed rating(s) ≥ threshold ${opts.threshold}`,
-  };
-}
+// D39 — the watermark/threshold/trigger primitives MOVED to
+// `@crewhaus/feedback-distill` so the daemon janitor step and this teardown
+// consumer share ONE implementation and ONE state file: once either lands a
+// batch, the other sees nothing unprocessed. (It is a shared watermark, not a
+// lock — see the package module doc for the overlapping-run caveat.)
+// Re-exported here so every existing `./autodistill` importer is unaffected.
+export {
+  AUTODISTILL_THRESHOLD_ENV,
+  DEFAULT_AUTODISTILL_THRESHOLD,
+  DISTILL_STATE_RELPATH,
+  type AutoDistillDecision,
+  type DistillState,
+  countUnprocessed,
+  newestTs,
+  parseDistillState,
+  ratingsDatasetName,
+  readDistillState,
+  resolveAutoDistillThreshold,
+  shouldAutoDistill,
+  writeDistillState,
+} from "@crewhaus/feedback-distill";
 
 // -------- the consumer --------
 

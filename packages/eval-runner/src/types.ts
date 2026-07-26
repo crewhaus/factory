@@ -1,11 +1,15 @@
+import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { GradeResult, Grader } from "@crewhaus/eval-grader";
+import type { JudgeUsageSink } from "@crewhaus/eval-judge";
 import type { Event as TranscriptEvent } from "@crewhaus/event-log";
 import type { RunContext } from "@crewhaus/run-context";
+import type { runChatLoop } from "@crewhaus/runtime-core";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 import type { CalibrationAggregates } from "./calibration-abstention";
 import type { ParaphraseConsistencySummary } from "./paraphrase-consistency";
 import type { SemanticFallbackSummary } from "./semantic-fallback";
+import type { ToolReplayMissPolicy } from "./tool-record";
 
 /**
  * The agent-invocation contract. The runner provides a per-sample
@@ -143,6 +147,15 @@ export type SampleResult = {
   /** G15 — fraction of this sample's trials that passed (over the trials
    *  that actually ran; SIGINT can truncate). Present iff `trials` is. */
   readonly trialPassRate?: number;
+  /**
+   * C34 — this sample is FLAKY: its trials disagreed with each other
+   * (`0 < trialPassRate < 1`), so its recorded verdict is a coin flip and
+   * the strict any-flip gate will keep re-failing on it for reasons the
+   * agent did not cause. Set only on repeat runs (`repeats > 1`); absent on
+   * single-trial samples, on all-pass/all-fail samples, and on results
+   * persisted by older CLIs.
+   */
+  readonly flaky?: boolean;
   readonly error?: string;
   /**
    * Set when one or more GRADERS threw while grading this sample (judge
@@ -313,6 +326,54 @@ export type EvalAggregates = {
    * byte-identical.
    */
   readonly paraphraseConsistency?: ParaphraseConsistencySummary;
+  /**
+   * C34 — samples whose trials disagreed (`0 < trialPassRate < 1`): the run
+   * MEASURED instability instead of just reporting pass^k. Present (with
+   * {@link flakySampleIds}) only when a repeat run actually found flaky
+   * samples, so single-trial and stable runs keep a byte-identical
+   * results.json.
+   */
+  readonly flaky?: number;
+  /** C34 — the flaky samples' ids, worst (most balanced) first. Present iff
+   *  {@link flaky} is. */
+  readonly flakySampleIds?: ReadonlyArray<string>;
+  /**
+   * C35 — judge token spend for this run (see {@link JudgeUsage}): every
+   * `llm_judge` grader call plus the judge-backed registry classifiers
+   * (`safety.toxicity` / `safety.bias`). Judge calls are model calls the
+   * eval pays for; before this field their usage was discarded at the judge
+   * wire, so a run's REAL cost — often judge-dominated — was unknowable.
+   * Present only when at least one judge call was metered, keeping
+   * judge-less runs byte-identical.
+   */
+  readonly judgeUsage?: JudgeUsage;
+};
+
+/**
+ * C35 — judge/grader model-call token usage for one run. `byModel` keys on
+ * the model string as the run NAMED it (router grammar), so the CLI can
+ * price each judge model through the same pricing table as the `--models`
+ * matrix `est_$` column instead of guessing one model for the whole run
+ * (a `judges:` panel legitimately spans several).
+ *
+ * Covered: every `llm_judge` grader call (single verdicts, repeats, each
+ * panelist) and the judge-backed safety classifiers `safety.toxicity` /
+ * `safety.bias`, which meter through the registry's
+ * {@link GraderLookup.setJudgeUsageSink} hook. NOT covered: grader model
+ * calls that are not judge calls — today only `multimodal.imageOcrThenGrade`,
+ * which calls a vision model through a raw adapter stream — and any
+ * custom/plugin grader that calls a model itself.
+ *
+ * Scope note: a RESUMED run meters only the judge calls THIS attempt made —
+ * reloaded samples were graded (and paid for) in an earlier attempt.
+ */
+export type JudgeUsage = {
+  /** Judge model calls made (repeats and panelists each count once). */
+  readonly calls: number;
+  readonly tokens: { readonly input: number; readonly output: number };
+  readonly byModel: Readonly<
+    Record<string, { readonly calls: number; readonly input: number; readonly output: number }>
+  >;
 };
 
 /**
@@ -376,6 +437,51 @@ export type EvalRunPartial = {
   readonly budgetUsd: number;
 };
 
+/**
+ * NEW-HUNT-4 — how this run treated TOOL EXECUTION, recorded in `run.json`
+ * and `results.json`. Absent on ordinary runs (every tool ran live), so an
+ * un-flagged run's manifests stay byte-identical.
+ *
+ * A replayed run is still a normal run for the history index, the baseline
+ * pin and the gate — the manifest is what says its tool results came from a
+ * cassette rather than from the world, and {@link recordingHash} identifies
+ * WHICH cassette.
+ */
+export type EvalToolRecordingConfig = {
+  readonly mode: "record" | "replay";
+  /** The recording directory (`--record-tools` / `--replay-tools`). */
+  readonly dir: string;
+  /** Replay only — sha256 hex of the recording's `tools.jsonl` bytes. */
+  readonly recordingHash?: string;
+  /** Replay only — `--replay-miss`, the policy for unrecorded calls. */
+  readonly missPolicy?: ToolReplayMissPolicy;
+  /**
+   * Replay only — how many calls were served a recording entry that had
+   * ALREADY been consumed (the replayed trajectory called a tool more times
+   * than the recording did, so it diverged and got a stale result). Absent
+   * when zero, keeping a clean replay's manifests byte-identical. The runner
+   * also raises a run-level `[eval] warning:` naming the affected calls.
+   */
+  readonly reusedEntries?: number;
+};
+
+/**
+ * NEW-HUNT-6 — present iff this run was produced by `eval --resume <runDir>`:
+ * the run kept its ORIGINAL `runId` and `startedAt`, reloaded
+ * {@link reusedSamples} already-graded samples from the directory's per-sample
+ * artifacts, and only invoked the agent for {@link ranSamples}. Absent on
+ * ordinary runs.
+ */
+export type EvalRunResumed = {
+  readonly runDir: string;
+  /** When THIS attempt started (the run's own `startedAt` is the original). */
+  readonly resumedAt: string;
+  /** Samples reloaded from disk — no agent call, no judge call, no spend. */
+  readonly reusedSamples: number;
+  /** Samples this attempt actually ran. */
+  readonly ranSamples: number;
+};
+
 export type EvalRunSummary = {
   readonly runId: string;
   readonly startedAt: string;
@@ -387,6 +493,10 @@ export type EvalRunSummary = {
    * samples (see {@link EvalRunPartial}). Readers must tolerate absence.
    */
   readonly partial?: EvalRunPartial;
+  /**
+   * NEW-HUNT-6 — present iff this run was resumed (see {@link EvalRunResumed}).
+   */
+  readonly resumed?: EvalRunResumed;
   /**
    * B13 — per-slice aggregates, keyed slice key → metadata value →
    * {@link SliceStats}. Computed by the runner (so target-eval bundles
@@ -406,6 +516,22 @@ export type EvalRunSummary = {
     readonly model: string;
     readonly judgeModel?: string;
     readonly concurrency: number;
+    /**
+     * C33 (reproducibility manifest) — the CLI build that produced this run,
+     * as reported by `crewhaus version`. Supplied by the launcher
+     * ({@link RunEvalOptions.cliVersion}); absent when the caller did not
+     * name itself (library callers, older CLIs). A results.json graded by
+     * 0.3 and one graded by 0.4 are different measurements — this is what
+     * says which.
+     */
+    readonly cliVersion?: string;
+    /** C33 — the Bun runtime the run executed on (`Bun.version`). Absent
+     *  outside Bun. */
+    readonly bunVersion?: string;
+    /** C33 — the machine the run executed on, `<platform>-<arch>` (e.g.
+     *  `darwin-arm64`) — the environment half of the report's minimum
+     *  reproducibility bundle. */
+    readonly platform?: string;
     readonly seed?: number;
     /** G15 — trials per sample. Recorded only when > 1. */
     readonly repeats?: number;
@@ -443,6 +569,10 @@ export type EvalRunSummary = {
       readonly path: string;
       readonly applied: ReadonlyArray<JudgeCalibrationApplication>;
     };
+    /** NEW-HUNT-4 — the tool record/replay mode in force, when either
+     *  `--record-tools` or `--replay-tools` was given (absent otherwise —
+     *  see {@link EvalToolRecordingConfig}). */
+    readonly toolRecording?: EvalToolRecordingConfig;
   };
   readonly outDir: string;
 };
@@ -465,6 +595,16 @@ export type GraderLookup = {
    * RunnerError at run start — opts are never silently dropped.
    */
   resolveWithOpts?(name: string, opts: Readonly<Record<string, unknown>>): Grader;
+  /**
+   * C35 — receive the run's judge-token sink. Registry graders that make
+   * JUDGE calls (`safety.toxicity` / `safety.bias`, whose classifier is a
+   * categorical judge call) meter through it, so their spend lands in
+   * {@link JudgeUsage} and on the `[eval] cost:` line instead of being paid
+   * for invisibly. `runEval` calls it on whatever registry it uses — its
+   * own, or one the caller built and passed in. Optional: a registry that
+   * omits it simply does not meter, exactly as before.
+   */
+  setJudgeUsageSink?(sink: JudgeUsageSink): void;
 };
 
 export type RunEvalOptions = {
@@ -545,8 +685,11 @@ export type RunEvalOptions = {
    * once accrued spend reaches the cap, queued samples abort with a
    * `[eval] budget exhausted after k/N samples` error, in-flight samples
    * complete, and the summary is marked {@link EvalRunSummary.partial}.
-   * Judge/grader calls are NOT metered (their usage is not yet captured);
-   * a model without a pricing row disables enforcement with a warning.
+   * Judge/grader calls are metered separately ({@link JudgeUsage}, C35) but
+   * are deliberately EXCLUDED from this cap: the budget bounds AGENT spend,
+   * the quantity a spec's `budget.usd` block declares, so wiring a judge
+   * into a rubric can never silently shrink the sample budget of an existing
+   * run. A model without a pricing row disables enforcement with a warning.
    */
   readonly budgetUsd?: number;
   /**
@@ -564,7 +707,68 @@ export type RunEvalOptions = {
    * without touching the filesystem.
    */
   readonly readCalibrationFile?: (path: string) => string | undefined;
+  /**
+   * NEW-HUNT-4 — record every tool execution into `<dir>/tools.jsonl`, keyed
+   * by `(sampleId, toolName, sha256(canonical-JSON args))`. Additive: tools
+   * still execute for real and return their real results; the run only gains
+   * a cassette (and a `toolRecording` note in `run.json`). Mutually exclusive
+   * with {@link replayToolsDir}, and only meaningful under the DEFAULT invoker
+   * — a caller-supplied {@link invoker} owns its own tool execution, so
+   * combining them is a loud error rather than a silently empty recording.
+   */
+  readonly recordToolsDir?: string;
+  /**
+   * NEW-HUNT-4 — serve every tool execution from the recording in `<dir>`
+   * instead of running it: deterministic, credential-free, side-effect-free
+   * tool behaviour. Unrecorded calls follow {@link replayMiss}. The model
+   * still runs live — this replays TOOLS, not the agent.
+   */
+  readonly replayToolsDir?: string;
+  /**
+   * NEW-HUNT-4 — what a replay does when the recording has no entry for a
+   * call's key: `"error"` (default) fails the sample with a message naming
+   * the missing key; `"live"` executes the tool for real. Only valid with
+   * {@link replayToolsDir}.
+   */
+  readonly replayMiss?: ToolReplayMissPolicy;
+  /**
+   * NEW-HUNT-6 — resume the interrupted run whose directory is {@link outDir}
+   * (required with this flag): the run's `run.json` supplies the ORIGINAL
+   * `runId`/`startedAt`, its identity hashes are checked against this
+   * invocation's (a mismatch refuses loudly), samples that already wrote
+   * `grades.json` are reloaded instead of re-run, and the union is
+   * re-aggregated into fresh `results.json`.
+   */
+  readonly resume?: boolean;
+  /**
+   * Session-runner seam under the DEFAULT invoker (the exam runner's
+   * `chatLoop` pattern). Production callers omit it and get
+   * `runChatLoop`; tests inject a capturing stub so the invoker's wiring —
+   * including the NEW-HUNT-4 tool wrappers on the `tools` it hands over — is
+   * assertable without a process-global module mock.
+   */
+  readonly chatLoop?: EvalChatLoopFn;
+  /**
+   * C33 — the launcher's own version string, recorded verbatim into
+   * `run.json`/`results.json` as `config.cliVersion` (the CLI passes what
+   * `crewhaus version` prints). Omitted ⇒ the field is absent — never
+   * guessed here, because this package cannot know which binary invoked it.
+   */
+  readonly cliVersion?: string;
+  /**
+   * Injectable judge transport (tests / bespoke judge stacks): a pre-built
+   * ProviderAdapter every `llm_judge` grader this run builds is bound to,
+   * exactly like `JudgeOptions.adapter` and `CreateExamRunnerOptions.
+   * judgeAdapter`. Absent (every production caller): each judge call
+   * resolves its model through the model-router. The seam exists so judge
+   * behaviour — including C35 token metering — is assertable over a stub
+   * adapter with no process-global `mock.module` involved.
+   */
+  readonly judgeAdapter?: ProviderAdapter;
 };
+
+/** The chat-loop seam under {@link RunEvalOptions.chatLoop}. */
+export type EvalChatLoopFn = (opts: Parameters<typeof runChatLoop>[0]) => Promise<string>;
 
 export type GraderEntry = {
   readonly name: string;

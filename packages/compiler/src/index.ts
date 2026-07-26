@@ -81,7 +81,7 @@ import { emitBrowserDriver } from "@crewhaus/target-browser-driver";
 import { emitChannelBot } from "@crewhaus/target-channel-bot";
 import { emitCli } from "@crewhaus/target-cli";
 import { emitCrew } from "@crewhaus/target-crew";
-import { emitEval } from "@crewhaus/target-eval-bundle";
+import { emitEval, emitSourceBundleWithEvalEntry } from "@crewhaus/target-eval-bundle";
 import { emitGraph } from "@crewhaus/target-graph";
 import { emitManaged } from "@crewhaus/target-managed";
 import { emitOnchain } from "@crewhaus/target-onchain";
@@ -142,13 +142,31 @@ export type CompileOptions = {
    * `crewhaus compile --no-readme` threads `false` through here.
    */
   readonly readme?: boolean;
+  /**
+   * Evals Wave 4, cluster S (D36/NEW-shape-1) — `crewhaus compile
+   * --with-eval-harness`: emit the shape's PRIMARY bundle in its eval-entry
+   * variant (workflow/graph/pipeline gain an exported `runForEval` +
+   * `import.meta.main` guard; crew/channel gain an additive `eval-entry.ts`),
+   * so the bridged `target: eval` bundle can invoke the shape's real compiled
+   * runtime in-process. Shapes that need no re-emission fall through to the
+   * ordinary `emit()`, so the bundle is byte-identical for them.
+   *
+   * It lives HERE, on `compile()`, rather than as a post-hoc re-emission in
+   * the CLI: the eval-entry bundle must come out of the SAME pipeline as the
+   * plain one (validating passes, and `applyIrPasses` when requested), or the
+   * artifact `--with-eval-harness` writes to disk could silently diverge from
+   * the artifact a plain compile writes — and that artifact is precisely the
+   * runtime the eval then measures. Default: false.
+   */
+  readonly evalEntry?: boolean;
 };
 
 /**
  * Loop contract 0.4 (Batch A, G45 warnings framework) — one non-fatal
  * compile diagnostic. `code` is a stable machine key
  * (`"accepted-but-unwired"`, `"edge-unsafe-tool"`,
- * `"channel-reactions-join"`, `"cli-autodistill-toolchain"`), `path` the spec
+ * `"channel-reactions-join"`, `"cli-autodistill-toolchain"`,
+ * `"managed-feedback-unsupported"`), `path` the spec
  * key it concerns (dot-joined),
  * `message` the human explanation. Additive: every existing `compile()`
  * consumer that only reads `.files` keeps working unchanged.
@@ -191,7 +209,14 @@ export function compile(yamlText: string, opts: CompileOptions = {}): CompileRes
     // pass-throughs on a valid IR, so the double run is free.)
     ir = applyIrPassesFn(ir);
   }
-  const bundle = emit(ir, { readme: opts.readme !== false });
+  // Cluster S — the eval-entry variant is chosen at the SAME point in the
+  // pipeline as the ordinary emit (post-passes), so the two bundles cannot
+  // drift. `undefined` = this shape needs no re-emission.
+  const bundle =
+    opts.evalEntry === true
+      ? (emitSourceBundleWithEvalEntry(ir, { readme: opts.readme !== false }) ??
+        emit(ir, { readme: opts.readme !== false }))
+      : emit(ir, { readme: opts.readme !== false });
   return { files: bundle.files, warnings: collectCompileWarnings(spec) };
 }
 
@@ -364,6 +389,30 @@ function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning> {
         "must accumulate first, so reactions on messages posted by older builds fall back to " +
         "last-turn attribution (sessionKey channel/user) or are dropped (sessionKey thread)",
     });
+  }
+  // NEW-inloop-coverage — `feedback:` now parses on the managed shape, but
+  // two of its switches describe surfaces the gateway daemon does not have.
+  // Say so at compile time rather than letting a spec look like it configured
+  // something (the parsed-but-dead trust hole strict schemas exist to close).
+  if (spec.target === "managed" && spec.feedback !== undefined) {
+    if (spec.feedback.exitPrompt !== undefined) {
+      out.push({
+        code: "managed-feedback-unsupported",
+        path: "feedback.exitPrompt",
+        message:
+          "the managed gateway has no REPL to exit — the exit rating prompt is a cli-shape surface. " +
+          "The gateway captures ratings through its `feedback.submit` JSON-RPC method instead",
+      });
+    }
+    if (spec.feedback.channelReactions !== undefined) {
+      out.push({
+        code: "managed-feedback-unsupported",
+        path: "feedback.channelReactions",
+        message:
+          "inbound 👍/👎 reactions are the channel shape's capture surface; the managed gateway " +
+          "captures ratings through its `feedback.submit` JSON-RPC method instead",
+      });
+    }
   }
   return out;
 }
@@ -2544,6 +2593,8 @@ export function lower(spec: Spec): IrNode {
         ...lowerSchedule(spec.schedule),
         // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
         ...lowerEvaluation(spec),
+        // NEW-inloop-coverage — rating capture on the gateway shape.
+        ...lowerFeedback(spec),
         ...memoryLowered,
         // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
         ...lowerKnowledge(spec),

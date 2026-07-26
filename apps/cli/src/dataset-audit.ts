@@ -29,45 +29,22 @@
  * write live in `apps/cli/src/index.ts`.
  */
 import type { Sample } from "@crewhaus/eval-dataset";
-import { type PiiDetector, type PiiHit, detectPii } from "@crewhaus/pii-redactor";
+import { dedupePiiHits, redactText } from "@crewhaus/feedback-distill";
+import { type PiiDetector, detectPii } from "@crewhaus/pii-redactor";
 import { SYNTHESIZE_PII_DETECTORS } from "./dataset-mine";
 
-/** Dedupe hits by (kind, value) in first-seen order — the same collapse
- *  `PiiRedactor.redact` applies so multiple detector passes over the same
- *  span never redact (or count) it twice. */
-function dedupeHits(hits: ReadonlyArray<PiiHit>): PiiHit[] {
-  const seen = new Set<string>();
-  const out: PiiHit[] = [];
-  for (const h of hits) {
-    const key = `${h.kind}${h.value}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(h);
-  }
-  return out;
-}
-
 /**
- * Deterministic SYNC redaction over the shared detector set — the regex-only
- * mirror of `createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS })
- * .redact(text).text`: deduped hits, empty-value sentinels dropped, wider
- * matches replaced first (so an SSN-shaped substring inside a longer token
- * never splits its enclosing match), each occurrence replaced with the
- * redactor's `[REDACTED:<kind>]` marker. Same input → same output, and text
- * with no hits comes back byte-identical.
+ * Deterministic SYNC redaction over the shared detector set. D39 moved the
+ * algorithm + detector set into `@crewhaus/feedback-distill` so the
+ * unattended daemon janitor step redacts EXACTLY what the CLI ingestion
+ * surfaces do; this stays the CLI's name for it (same behavior, same
+ * detectors, same `[REDACTED:<kind>]` markers).
  */
 export function redactDatasetText(
   text: string,
   detectors: ReadonlyArray<PiiDetector> = SYNTHESIZE_PII_DETECTORS,
 ): string {
-  const hits = dedupeHits(detectPii(text, detectors)).filter((h) => h.value.length > 0);
-  if (hits.length === 0) return text;
-  const sorted = [...hits].sort((a, b) => b.value.length - a.value.length);
-  let out = text;
-  for (const hit of sorted) {
-    out = out.split(hit.value).join(`[REDACTED:${hit.kind}]`);
-  }
-  return out;
+  return redactText(text, detectors);
 }
 
 /** The redactor's marker shapes: replace-mode `[REDACTED:<kind>]` (the only
@@ -199,7 +176,7 @@ export function auditSamples(
   let totalHits = 0;
   for (const s of samples) {
     for (const { field, text } of sampleTextFields(s)) {
-      const found = dedupeHits(detectPii(text, detectors)).filter((h) => h.value.length > 0);
+      const found = dedupePiiHits(detectPii(text, detectors)).filter((h) => h.value.length > 0);
       if (found.length === 0) continue;
       const byKind = new Map<string, number>();
       for (const h of found) byKind.set(h.kind, (byKind.get(h.kind) ?? 0) + 1);

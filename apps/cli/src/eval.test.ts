@@ -166,11 +166,16 @@ describe("crewhaus eval CLI integration (T3)", () => {
       ["--budget-usd", "-1"],
       ["--budget-usd", "x"],
     ];
-    for (const [flag, value] of bads) {
-      const result = await runCli([...base, flag, value]);
-      expect(result.exitCode).toBe(1);
+    // Spawned concurrently: each case is an arg-parse rejection that exits
+    // before touching the registry, and ten sequential CLI boots overrun the
+    // default per-test timeout on a slow runner.
+    const results = await Promise.all(
+      bads.map(async ([flag, value]) => ({ flag, ...(await runCli([...base, flag, value])) })),
+    );
+    for (const { flag, exitCode } of results) {
+      expect(`${flag}:${exitCode}`).toBe(`${flag}:1`);
     }
-  });
+  }, 60_000);
 
   test("eval rejects the gate thresholds with --models and --sentinel (which skip the gate)", async () => {
     const base = ["eval", HELLO_SPEC, "--dataset", "d.jsonl", "--graders", "g.yaml"];

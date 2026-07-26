@@ -209,10 +209,20 @@ export function parseRegistryRef(value: string): RegistryRef | undefined {
 
 // -------- deterministic splits --------
 
-export type SplitSpec = { readonly train: number; readonly dev: number; readonly test: number };
+/**
+ * D39 — the deterministic split assignment + `vN` auto-bump MOVED to
+ * `@crewhaus/feedback-distill` so a compiled daemon's auto-distill registers
+ * the SAME splits this toolchain does. Re-exported under their historical
+ * names; behavior is unchanged.
+ */
+import {
+  DEFAULT_SPLIT_SPEC,
+  type SplitSpec,
+  nextVersion,
+  splitSamples,
+} from "@crewhaus/feedback-distill";
 
-/** Default promotion split for `datasets put` / `distill --register`. */
-export const DEFAULT_SPLIT_SPEC: SplitSpec = { train: 70, dev: 15, test: 15 };
+export { DEFAULT_SPLIT_SPEC, type SplitSpec, nextVersion, splitSamples };
 
 /** Parse `--split-spec`: `train/dev` or `train/dev/test` integer percentages
  *  summing to 100 (e.g. `70/15/15`, `80/20`). */
@@ -238,59 +248,6 @@ export function parseSplitSpec(s: string): SplitSpec {
     );
   }
   return { train, dev, test };
-}
-
-function idHash(id: string): string {
-  return createHash("sha256").update(id).digest("hex");
-}
-
-/**
- * Deterministic split assignment. Samples are ordered by sha256(id) (stable
- * pseudo-shuffle, independent of input order; ties break on the raw id), then
- * cut at the cumulative percentage boundaries: train takes
- * `[0, floor(n·train%))`, dev the next slice, test the remainder — so the
- * three always partition the input exactly. NOT random: the same ids map to
- * the same splits on every run, which is what makes registry versions
- * reproducible. Tiny inputs can leave dev/test empty (floor); consumers fall
- * back accordingly (see the optimize `registry:` path).
- */
-export function splitSamples(
-  samples: ReadonlyArray<Sample>,
-  spec: SplitSpec,
-): { train: Sample[]; dev: Sample[]; test: Sample[] } {
-  const ordered = [...samples].sort((a, b) => {
-    const ha = idHash(a.id);
-    const hb = idHash(b.id);
-    if (ha !== hb) return ha < hb ? -1 : 1;
-    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-  });
-  const n = ordered.length;
-  const trainEnd = Math.floor((n * spec.train) / 100);
-  const devEnd = Math.floor((n * (spec.train + spec.dev)) / 100);
-  return {
-    train: ordered.slice(0, trainEnd),
-    dev: ordered.slice(trainEnd, devEnd),
-    test: ordered.slice(devEnd),
-  };
-}
-
-// -------- versioning --------
-
-/**
- * Auto-bump: `v<N+1>` where N is the highest existing `v<digits>` version
- * (0 when there is none → `v1`). Versions outside that grammar (a
- * hand-imported "1.0.0") are ignored rather than guessed at — the CLI's own
- * promotion lineage always lives in the vN namespace, so this can't collide.
- */
-export function nextVersion(existing: ReadonlyArray<string>): string {
-  let max = 0;
-  for (const v of existing) {
-    const m = /^v(\d+)$/.exec(v);
-    if (m === null) continue;
-    const n = Number.parseInt(m[1] as string, 10);
-    if (n > max) max = n;
-  }
-  return `v${max + 1}`;
 }
 
 // -------- registry resolution (the `registry:` shorthand) --------

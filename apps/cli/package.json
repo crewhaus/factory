@@ -59,6 +59,7 @@
     "@crewhaus/eval-report": "workspace:*",
     "@crewhaus/eval-runner": "workspace:*",
     "@crewhaus/event-log": "workspace:*",
+    "@crewhaus/feedback-distill": "workspace:*",
     "@crewhaus/gateway-server": "workspace:*",
     "@crewhaus/grader-safety-classifiers": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",

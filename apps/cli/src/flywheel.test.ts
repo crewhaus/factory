@@ -21,8 +21,11 @@ import {
   formatDatasetSourceLine,
   formatFlywheelKnobsGuide,
   formatFlywheelReport,
+  formatGateSplitLine,
   formatRatingsShadowWarning,
+  gateSplitRefusal,
   normalizeHarnessDir,
+  parseGateSplit,
   resolveFlywheelData,
   resolveFlywheelKnobs,
   runFlywheelLoop,
@@ -360,6 +363,53 @@ describe("formatDatasetSourceLine + formatRatingsShadowWarning (NEW-flywheel-sha
 });
 
 // -------- git dirtiness --------
+
+describe("D42 — --gate-split", () => {
+  test("undefined is the default (all resolved splits, unchanged behavior)", () => {
+    expect(parseGateSplit(undefined)).toBeUndefined();
+    expect(
+      gateSplitRefusal({ gateSplit: undefined, isRegistryRef: false, dataset: "eval/d.jsonl" }),
+    ).toBeUndefined();
+  });
+
+  test("accepts train/dev case-insensitively", () => {
+    expect(parseGateSplit("dev")).toBe("dev");
+    expect(parseGateSplit(" TRAIN ")).toBe("train");
+  });
+
+  test("refuses #test with the B16 rationale", () => {
+    expect(() => parseGateSplit("test")).toThrow(FlywheelConfigError);
+    expect(() => parseGateSplit("test")).toThrow(/held-out split/);
+  });
+
+  test("refuses an unknown split", () => {
+    expect(() => parseGateSplit("holdout")).toThrow(/expected one of: train, dev/);
+  });
+
+  test("refuses a flat-file dataset and names the fix", () => {
+    const msg = gateSplitRefusal({
+      gateSplit: "dev",
+      isRegistryRef: false,
+      dataset: "eval/dataset.jsonl",
+    });
+    expect(msg).toContain("needs a registry dataset with splits");
+    expect(msg).toContain("datasets put");
+    expect(
+      gateSplitRefusal({ gateSplit: "dev", isRegistryRef: true, dataset: "registry:x" }),
+    ).toBeUndefined();
+  });
+
+  test("discloses the narrowed gate on stdout", () => {
+    const line = formatGateSplitLine({
+      gateSplit: "dev",
+      datasetName: "concierge-ratings@v3#dev",
+      sampleCount: 12,
+    });
+    expect(line).toContain("concierge-ratings@v3#dev");
+    expect(line).toContain("12 sample(s)");
+    expect(line).toContain("dev split ONLY");
+  });
+});
 
 describe("specIsDirty", () => {
   test("empty / whitespace porcelain is clean", () => {
@@ -802,6 +852,39 @@ describe("crewhaus flywheel (CLI surface)", () => {
     expect(allowed.stderr).toContain("no dataset");
   });
 
+  // D42 — the flag is parsed before any spend, and per-split gating is a
+  // registry-only concept.
+  test("flywheel run --gate-split test is refused before anything is spent", async () => {
+    const root = newTempRoot();
+    writeFileSync(
+      join(root, "crewhaus.yaml"),
+      "name: hello\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n",
+    );
+    const res = await runCli(["flywheel", "run", "--gate-split", "test"], root);
+    expect(res.exitCode).toBe(1);
+    expect(res.stderr).toContain("held-out split");
+  });
+
+  test("flywheel run --gate-split over a flat-file dataset is refused", async () => {
+    const root = newTempRoot();
+    mkdirSync(join(root, "eval"), { recursive: true });
+    writeFileSync(
+      join(root, "crewhaus.yaml"),
+      "name: hello\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n",
+    );
+    writeFileSync(
+      join(root, "eval", "dataset.jsonl"),
+      `${JSON.stringify({ id: "s1", input: "hello there" })}\n`,
+    );
+    writeFileSync(
+      join(root, "eval", "graders.yaml"),
+      "graders:\n  - name: g\n    type: contains\n    substring: 'x'\n",
+    );
+    const res = await runCli(["flywheel", "run", "--gate-split", "dev"], root);
+    expect(res.exitCode).toBe(1);
+    expect(res.stderr).toContain("needs a registry dataset with splits");
+  });
+
   test("flywheel run without a spec dies with the harness-convention hint", async () => {
     const root = newTempRoot();
     const res = await runCli(["flywheel", "run"], root);
@@ -846,6 +929,17 @@ describe("crewhaus flywheel (CLI surface)", () => {
     // never enters the flywheel (supersedes the old ALL-splits disclosure).
     expect(res.stdout).toContain("train+dev only");
     expect(res.stdout).toContain("#test ref is refused");
+    // D42 — the per-split acceptance knob is documented (it used to be
+    // help text calling itself "a future knob").
+    expect(res.stdout).toContain("--gate-split train|dev");
+    expect(res.stdout).not.toContain("future knob");
+    // D43 — the help must describe what THIS COMMAND does. Neither
+    // `flywheel run` nor `optimize` passes `knobs` to optimizeSpec, so the
+    // dial search is a library capability only; claiming the command patches
+    // "the declared numeric dials" would be a shipped overclaim (and would
+    // retire the accurate wording, making the gap undetectable).
+    expect(res.stdout).toContain("only ever rewrites agent.instructions");
+    expect(res.stdout).toContain("reachable programmatically");
     expect(res.stdout).not.toContain("ALL splits");
     // NEW-flywheel-shadow — the provenance line + shadow warning are documented.
     expect(res.stdout).toContain("flag|convention|ratings-registry");

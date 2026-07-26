@@ -72,3 +72,19 @@ export function meanCI95(values: ReadonlyArray<number>): readonly [number, numbe
   const half = tCritical975(n - 1) * Math.sqrt(variance / n);
   return [mean - half, mean + half];
 }
+
+/**
+ * NEW-stats-1 — the score-shift epsilon: how far a sample's score may move,
+ * with its pass/fail verdict unchanged, before a comparison calls it a
+ * SHIFT. 0.1 on the normalized 0..1 scale — one fifth of a 1–5 judge step,
+ * a tenth of an exact-match grader's whole range.
+ *
+ * It lives HERE, in the package both comparison surfaces already depend on,
+ * because there used to be two independent 0.1 literals: `eval-report`'s
+ * `diffReports` (the human-facing diff, now knob-exposed as `eval-report
+ * diff --epsilon`) and `regression-runner`'s `regress` (the gate/sentinel
+ * classifier). With the flag shipped, two literals means a user can make the
+ * diff they READ and the gate that BLOCKS disagree about the same pair of
+ * runs by flag alone. One default, one place.
+ */
+export const DEFAULT_SCORE_EPSILON = 0.1;

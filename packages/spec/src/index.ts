@@ -2231,6 +2231,23 @@ const managedSchema = z
     expose: exposeBlock,
     // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
     evaluation: evaluationBlock,
+    // NEW-inloop-coverage — human-rating capture on the GATEWAY shape.
+    //
+    // WHAT MANAGED SUPPORTS: the daemon serves a `feedback.submit` JSON-RPC
+    // method (params = the user-supplied FeedbackRecord subset) that appends
+    // a standard record to `.crewhaus/feedback/<tenant>.jsonl` — the exact
+    // sink `crewhaus distill` / `optimize --ratings` / `judge calibrate`
+    // already read; and `autoDistill: true` registers the janitor step that
+    // turns those ratings into versioned `<name>-ratings` registry datasets
+    // on the daemon's own clock (D39), because a gateway daemon never runs a
+    // `crewhaus run` teardown.
+    //
+    // WHAT IT CANNOT SUPPORT: `exitPrompt` is meaningless here (there is no
+    // REPL to exit — the compiler warns when it is set), and
+    // `channelReactions` is the channel shape's own inbound-reaction gate
+    // (also warned). Both parse for schema uniformity across shapes rather
+    // than being silently honoured.
+    feedback: feedbackBlock,
     memory: memoryBlock,
     // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
     knowledge: knowledgeBlock,

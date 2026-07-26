@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../dataset-registry" },
+    { "path": "../eval-dataset" },
+    { "path": "../pii-redactor" }
+  ],
+  "include": ["src/**/*"]
+}

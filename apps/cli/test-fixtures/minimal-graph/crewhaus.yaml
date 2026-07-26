@@ -1,0 +1,12 @@
+name: mini-graph
+target: graph
+model: claude-sonnet-4-6
+entry: plan
+nodes:
+  plan:
+    instructions: Plan the answer.
+  answer:
+    instructions: Write the final answer from the plan.
+edges:
+  - from: plan
+    to: answer

@@ -7,9 +7,12 @@
  *
  *   - a PR opened by the scaffolded workflow is NEVER auto-merged — a
  *     human is always the last gate;
- *   - the optimizer only ever touches `agent.instructions` (spec-patch's
- *     OPTIMIZABLE_PATHS enforces this — `permissions:` stays exactly as a
- *     human last reviewed it);
+ *   - the optimizer only ever touches `agent.instructions` from this command
+ *     (spec-patch's OPTIMIZABLE_PATHS enforces the boundary — `permissions:`
+ *     stays exactly as a human last reviewed it). D43's numeric-dial search
+ *     exists in the optimizer library and is reachable programmatically
+ *     (`optimizeSpec({ knobs })`), but no CLI surface builds the dial set
+ *     yet, so a flywheel run proposes no knob changes;
  *   - the flywheel refuses to run over uncommitted spec changes
  *     (`--allow-dirty` opts out);
  *   - ACCEPT-THEN-WRITE: `optimize` runs WITHOUT write-back and the patch
@@ -217,6 +220,71 @@ export function resolveFlywheelData(opts: {
   }
 
   return { dataset, graders, datasetSource, gradersSource };
+}
+
+// -------- D42: per-split acceptance gating --------
+
+/** The splits `--gate-split` accepts. `test` is deliberately absent: B16
+ *  locks the held-out split out of every optimizing command (a nightly loop
+ *  that gates on the holdout adaptively overfits it), so naming it here is a
+ *  refusal, not an escape hatch. */
+export const FLYWHEEL_GATE_SPLITS = ["train", "dev"] as const;
+
+export type FlywheelGateSplit = (typeof FLYWHEEL_GATE_SPLITS)[number];
+
+/**
+ * D42 — parse `--gate-split`. Undefined (the default) keeps the pre-D42
+ * behavior byte-identical: the before/after acceptance evals run over every
+ * split the ref resolved (train+dev for a bare registry ref). Naming a split
+ * narrows ONLY the acceptance evals — the optimizer's own train/dev sets are
+ * untouched, so the search still reads what it always read.
+ */
+export function parseGateSplit(value: string | undefined): FlywheelGateSplit | undefined {
+  if (value === undefined) return undefined;
+  const v = value.trim().toLowerCase();
+  if (v === "test") {
+    throw new FlywheelConfigError(
+      'invalid --gate-split "test" — the flywheel never touches the held-out split (B16: it gates releases, not nightly loops); use dev or train',
+    );
+  }
+  if (!(FLYWHEEL_GATE_SPLITS as ReadonlyArray<string>).includes(v)) {
+    throw new FlywheelConfigError(
+      `invalid --gate-split "${value}" — expected one of: ${FLYWHEEL_GATE_SPLITS.join(", ")}`,
+    );
+  }
+  return v as FlywheelGateSplit;
+}
+
+/**
+ * D42 — the refusal for a flat-file dataset. Per-split gating is a REGISTRY
+ * concept: a bare `.jsonl` carries no split boundaries, so "gate on dev"
+ * would silently mean "gate on everything" — the exact shadowing the flag
+ * exists to prevent. Returns the message to `die()` with, or undefined when
+ * the request is coherent.
+ */
+export function gateSplitRefusal(opts: {
+  readonly gateSplit: FlywheelGateSplit | undefined;
+  readonly isRegistryRef: boolean;
+  readonly dataset: string;
+}): string | undefined {
+  if (opts.gateSplit === undefined) return undefined;
+  if (opts.isRegistryRef) return undefined;
+  const how = "Register it first (`crewhaus datasets put --name <n> --from <file>`)";
+  return `--gate-split ${opts.gateSplit} needs a registry dataset with splits — "${opts.dataset}" is a flat file. ${how} and pass --dataset registry:<n>.`;
+}
+
+/** D42 — the one-line disclosure printed when acceptance gating is narrowed
+ *  to a split (so a PR body never has to guess what the verdict was measured
+ *  on). */
+export function formatGateSplitLine(opts: {
+  readonly gateSplit: FlywheelGateSplit;
+  readonly datasetName: string;
+  readonly sampleCount: number;
+}): string {
+  return (
+    `[flywheel] acceptance gate: ${opts.datasetName} (${opts.sampleCount} sample(s)) — ` +
+    `the before/after evals score the ${opts.gateSplit} split ONLY (--gate-split)`
+  );
 }
 
 /**

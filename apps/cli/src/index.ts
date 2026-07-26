@@ -42,6 +42,7 @@ import {
   compareVersions,
   createFileBackedRegistry,
   latestVersion,
+  overallDatasetHash,
   verifySplitHashes,
 } from "@crewhaus/dataset-registry";
 // Loop contract 0.4 (Batch A) — `memory.embedder`: the run path constructs
@@ -51,38 +52,60 @@ import {
 import { createEmbedder } from "@crewhaus/embedder";
 import { CrewhausError, RunFailedError } from "@crewhaus/errors";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
-import { type CompiledGrader, type GradersConfig, parseGradersConfig } from "@crewhaus/eval-grader";
+import {
+  type CompiledGrader,
+  type Grader,
+  type GraderCombinePolicy,
+  type GradersConfig,
+  parseGradersConfig,
+} from "@crewhaus/eval-grader";
 // "Watch me" (design/watch-me.md §7 phase 2) — the injection-hardened judge
 // prompt, reused verbatim for the watchme judge phase built on runChatLoop.
-import { type Rubric, buildJudgePrompt } from "@crewhaus/eval-judge";
+import {
+  type Rubric,
+  buildJudgePrompt,
+  createJudgeGrader,
+  loadCategoricalRubric,
+  loadRubric,
+} from "@crewhaus/eval-judge";
 import {
   extractCurrentPrompt as extractInstructions,
   optimizeSpec,
 } from "@crewhaus/eval-optimizer-orchestrator";
 import {
+  type ExportRunInput,
   type LoadedRun,
   type RunIndexEntry,
+  buildExportRows,
   buildMatrix,
+  buildTrends,
   diffInstrumentWarnings,
   diffReports,
   formatPairwiseLines,
   formatSignificanceLine,
   formatSliceDeltaLines,
+  formatTrendSummaryLines,
   formatUsd,
   hashDatasetFile,
   loadRun,
   readBaselines,
-  readRunIndex,
+  readRunIndexLatest,
   renderMatrix,
   renderReport,
+  renderTrends,
+  rowsToCsv,
+  rowsToJsonl,
   setBaseline,
+  trendTable,
 } from "@crewhaus/eval-report";
 import {
   type EvalRunSummary,
   type GraderLookup,
   createExamRunner,
   defaultGraderRegistry,
+  resolveRegistryGrader,
   runEval as runEvalLib,
+  warnUnconsumedCombinePolicy,
 } from "@crewhaus/eval-runner";
 import { openEventLog } from "@crewhaus/event-log";
 import { loadHooks, runHooks } from "@crewhaus/hooks-engine";
@@ -336,6 +359,7 @@ import {
 import {
   type LintFinding,
   type LintGraderSpec,
+  graderNeedsGold,
   lintDataset,
   lintGraderSpecOf,
   preflightLint,
@@ -482,13 +506,17 @@ import {
 // detection, in a side-effect-free module so it is unit-testable (this entry
 // file runs an argv switch on import).
 import {
-  type CoverageSample,
+  type CoverageGraderSpec,
+  DEFAULT_COVERAGE_GRADER_RUNS,
   DEFAULT_COVERAGE_SESSIONS,
   EvalCoverageError,
+  type RunGradesText,
   buildEvalCoverage,
   buildProdBehavior,
   computeCoverage,
+  computeGraderCoverage,
   coverageFileName,
+  coverageGraderSpecOf,
   parseCoverageFormat,
   parseSessionsFlag,
   renderCoverage,
@@ -515,7 +543,12 @@ import {
 // (partial_score / loop metrics / pass@k–pass^k / failure classes / judge
 // calibration notes), in a side-effect-free module so all of it is
 // unit-testable (this entry file runs an argv switch on import).
-import { evalRunOutputLines, fitnessScore, graderRegistryForCompiled } from "./eval-output";
+import {
+  evalRunCost,
+  evalRunOutputLines,
+  fitnessScore,
+  graderRegistryForCompiled,
+} from "./eval-output";
 // A1 — `eval-report diff --pairwise`: credential gate + the order-swapped
 // judging loop, in a side-effect-free module so both are unit-testable
 // with an injected stub adapter.
@@ -524,6 +557,9 @@ import {
   pairwiseCredentialError,
   resolvePairwiseJudgeModel,
 } from "./eval-pairwise";
+// C28 — `crewhaus eval plan`: the offline sample-size helper (pure
+// arithmetic + the pilot reader), in its own side-effect-free module.
+import { EvalPlanError, planSampleSize, renderEvalPlan } from "./eval-plan";
 // Item 30 — model-drift sentinel comparison logic, in a side-effect-free
 // module so it is unit-testable (this entry file runs an argv switch on
 // import). The fresh run + baseline load happen in index.ts; this decides drift.
@@ -602,13 +638,17 @@ import {
   FLYWHEEL_WORKFLOW_RELPATH,
   FlywheelConfigError,
   type FlywheelDataResolution,
+  type FlywheelGateSplit,
   type FlywheelKnobs,
   type FlywheelOptimizeOutcome,
   buildFlywheelWorkflowYaml,
   formatDatasetSourceLine,
   formatFlywheelKnobsGuide,
   formatFlywheelReport,
+  formatGateSplitLine,
   formatRatingsShadowWarning,
+  gateSplitRefusal,
+  parseGateSplit,
   resolveFlywheelData,
   resolveFlywheelKnobs,
   runFlywheelLoop,
@@ -711,6 +751,7 @@ import {
   dropDuplicateCandidates,
   extractDatasetCalibrationPairs,
   renderCalibrationCard,
+  writeCalibrationFileAtomic,
 } from "./judge-calibrate";
 // AUTOMATION-OPPORTUNITIES.md item 52 — `crewhaus justification calibrate` +
 // `justification preflight` core (replay the intent gate over durable
@@ -1060,6 +1101,15 @@ import {
   parseModelSampleInputs,
   templateSampleInputs,
 } from "./scaffold-evals";
+// D41 — `crewhaus schedule generate`: the off-GitHub scheduling shim
+// (prints cron/launchd/systemd text; installs nothing).
+import {
+  ScheduleGenerateError,
+  buildSchedule,
+  parseScheduleRunner,
+  parseScheduleTarget,
+  renderSchedule,
+} from "./schedule-generate";
 // FR-002 — Pillar 3 sink-side scope gate, shared by `compile --strict` and
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -1210,7 +1260,7 @@ import {
   type VoiceSessionResult,
   type VoiceThresholds,
   aggregateVoiceEval,
-  gradeVoiceSession,
+  gradeVoiceSessionWithContent,
   parseReplayLog,
   renderVoiceReport,
 } from "./voice-eval";
@@ -1787,6 +1837,10 @@ const FLYWHEEL_SCHEMA: ParseArgsSchema = {
     { name: "seed", takesValue: true },
     { name: "concurrency", takesValue: true },
     { name: "mutator", takesValue: true },
+    // D42 — narrow the before/after ACCEPTANCE evals to one registry split
+    // (train|dev). Omitted keeps the historical behavior (every split the
+    // ref resolved). Refused for flat-file datasets (no split boundaries).
+    { name: "gate-split", takesValue: true },
     // Run the whole loop (evals + optimize + acceptance gate) but never
     // write the spec, register, or pin — a rehearsal run.
     { name: "dry-run", takesValue: false },
@@ -1917,6 +1971,18 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     // at the cap and results.json is marked partial).
     { name: "sample-timeout-ms", takesValue: true },
     { name: "budget-usd", takesValue: true },
+    // NEW-HUNT-4 — tool record/replay. --record-tools <dir> appends every
+    // tool execution's result to <dir>/tools.jsonl keyed by (sampleId,
+    // toolName, sha256(canonical-JSON args)); --replay-tools <dir> serves
+    // those results instead of executing (mutually exclusive), with
+    // --replay-miss error|live governing unrecorded calls.
+    { name: "record-tools", takesValue: true },
+    { name: "replay-tools", takesValue: true },
+    { name: "replay-miss", takesValue: true },
+    // NEW-HUNT-6 — resume an interrupted run: re-open <runDir>, keep its
+    // runId, skip samples that already wrote grades.json, run the rest, and
+    // re-aggregate the union.
+    { name: "resume", takesValue: true },
     // Run-history item 3 — keep the existing baseline pin instead of
     // auto-promoting this run on gate pass (also skips the first-run pin).
     { name: "no-promote", takesValue: false },
@@ -1948,6 +2014,8 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     // the voice grader pack (latency / barge-in / transcript) instead of the
     // text model-driven eval. --replay-dir points at the recorded session
     // JSONLs (default .crewhaus/voice-replays). Latency budgets via --max-*.
+    // D46 — the shared --graders flag additionally applies CONTENT graders to
+    // each replayed transcript (absent = the latency-only pack, as before).
     { name: "voice", takesValue: false },
     { name: "replay-dir", takesValue: true },
     { name: "max-ttft-ms", takesValue: true },
@@ -1966,8 +2034,10 @@ const EVAL_COVERAGE_SCHEMA: ParseArgsSchema = {
     // Intersect against a dataset's expected_tools (file or registry:<ref>);
     // defaults to the conventional eval/dataset.jsonl next to the cwd spec.
     { name: "dataset", takesValue: true },
-    // Accepted for symmetry with the other eval-flywheel commands; unused —
-    // coverage is grader-agnostic (it intersects tool behavior, not graders).
+    // D44 — the grader-side coverage join: which graders can score which
+    // samples, which declared graders never ran, and which judge criteria
+    // never varied across the inspected runs. Omitted = dataset-side report
+    // only (every pre-D44 invocation renders identically).
     { name: "graders", takesValue: true },
     { name: "out", short: "o", takesValue: true },
     { name: "format", takesValue: true },
@@ -1981,13 +2051,52 @@ const EVAL_REPORT_SCHEMA: ParseArgsSchema = {
     // C29 — pins `diff`'s Monte Carlo significance draw + bootstrap CI
     // (defaults to a fixed seed, so unseeded diffs are still deterministic).
     { name: "seed", takesValue: true },
+    // NEW-stats-1 — `diff`'s score-shift tolerance (default 0.1): how far a
+    // score may move, verdict unchanged, before the diff calls it a shift.
+    { name: "epsilon", takesValue: true },
     // A1 — opt-in head-to-head judging of the two runs' outputs (2 judge
     // calls per shared sample, order swapped; requires judge credentials).
     { name: "pairwise", takesValue: false },
     { name: "judge-model", takesValue: true },
-    // `history` / `baseline show` filters.
+    // `history` / `baseline show` / `trends` filters.
     { name: "spec", takesValue: true },
     { name: "dataset", takesValue: true },
+    // C32 — `export`: which runs to flatten (a run dir, a comma-separated
+    // list of them, or `last:N` from the history index) and in what format.
+    { name: "runs", takesValue: true },
+    { name: "format", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// C28 — `crewhaus eval plan`: offline sample-size planning (no run, no
+// credentials, no spend — just the arithmetic and where its terms came from).
+const EVAL_PLAN_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // The smallest pass-rate change worth detecting, as a fraction (0.05 = 5pp).
+    { name: "target-delta", takesValue: true },
+    // Two-sided confidence level (default 0.95).
+    { name: "confidence", takesValue: true },
+    // A previous run directory whose measured pass rate seeds p (else 0.5).
+    { name: "pilot", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// D41 — `crewhaus schedule generate`: print ready-to-install scheduling text
+// for the recurring eval surfaces, for teams not on GitHub Actions.
+const SCHEDULE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "for", takesValue: true },
+    { name: "runner", takesValue: true },
+    // Working directory the scheduled command runs in (default: cwd).
+    { name: "dir", takesValue: true },
+    // Command inputs (defaults: crewhaus.yaml, eval/dataset.jsonl,
+    // eval/graders.yaml, eval/sentinel-baseline).
+    { name: "spec", takesValue: true },
+    { name: "dataset", takesValue: true },
+    { name: "graders", takesValue: true },
+    { name: "baseline", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -2779,6 +2888,12 @@ function usageText(): string {
     "       [--budget-usd F]               limits.deadline_ms) + run spend cap (default: the",
     "                                      spec's budget.usd; queued samples abort at the cap)",
     "       [--no-promote]                 keep the existing baseline pin after this run",
+    "       [--record-tools <dir>]         record every tool result to <dir>/tools.jsonl, keyed",
+    "                                      by (sampleId, toolName, sha256 of canonical args)",
+    "       [--replay-tools <dir>]         serve tool results from that recording instead of",
+    "       [--replay-miss error|live]     executing them (miss: fail the sample, or run live)",
+    "       [--resume <runDir>]            re-open an interrupted run: reuse its graded samples,",
+    "                                      run only the missing ones, re-aggregate the union",
     "       [--models <m1,m2,...>]         benchmark matrix: run the dataset once per model",
     "                                      (cells write to <out>/<model-slug>/; emits matrix.json",
     "                                      + index.html; incompatible with --gate/--no-promote)",
@@ -2787,11 +2902,23 @@ function usageText(): string {
     "  eval coverage                        detect prod behaviors no eval sample exercises (item 6):",
     "       [--sessions N|all] [--dataset <d>]  tool/MCP/bigram/compaction gaps ranked by prod",
     "       [-o <dir>] [--format text|html|json] frequency; json is a backlog for `dataset mine`",
+    "       [--graders <g.yaml>]                + grader coverage: gold-needing graders vs gold-less",
+    "                                           samples, never-run graders, dead judge criteria",
+    "  eval plan --target-delta F           sample-size planner (C28): n ≈ z²·p(1−p)/e², printed",
+    "       [--confidence C] [--pilot <run>] with every term + source; --pilot seeds p from a run's",
+    "                                      measured pass rate (else 0.5 worst case). Offline.",
     "  eval-report diff <prev> <new>        compare two eval runs and emit a diff report",
     "       [-o <out-dir>] [--seed N]       (paired significance + per-slice deltas ride along;",
-    "                                      --seed pins the Monte Carlo draw)",
+    "       [--epsilon F]                   --seed pins the Monte Carlo draw; --epsilon sets the",
+    "                                      score-shift tolerance, default 0.1)",
     "  eval-report history                  list recorded runs (.crewhaus/evals/index.jsonl)",
     "       [--spec <name>] [--dataset <name>]",
+    "  eval-report trends                   pass-rate / mean-score / cost OVER TIME per (spec,",
+    "       [--spec <n>] [--dataset <n>]    dataset) from the same index; -o writes a",
+    "       [-o <dir>]                      self-contained HTML chart (inline SVG, no assets)",
+    "  eval-report export --runs <r>        flatten runs to one row per (run, sample, grader):",
+    "       --format csv|jsonl [-o <file>]  <dir>, <dir,dir> or last:N; the cross-run",
+    "                                      failure-analysis table nested results.json can't be",
     "  eval-report baseline show            print pinned baselines (.crewhaus/evals/baselines.json)",
     "       [--spec <name>] [--dataset <name>]",
     "  eval-report baseline set <runId>     pin a recorded run as its (spec, dataset) baseline",
@@ -2810,7 +2937,11 @@ function usageText(): string {
     "       accept; a rejected patch never touches the spec.",
     "       [--dataset <data>] [--graders <g.yaml>] [--budget-usd N] [--iterations N]",
     "       [--seed N] [--concurrency N] [--mutator rule-based|claude]",
-    "       [--dry-run] [--allow-dirty]",
+    "       [--gate-split train|dev] [--dry-run] [--allow-dirty]",
+    "  schedule generate --for <target>     print ready-to-install scheduling text (D41) for",
+    "       [--runner cron|launchd|systemd] flywheel | eval-gate | sentinel, wrapping the matching",
+    "       [--dir <path>]                  crewhaus command — for teams not on GitHub Actions.",
+    "                                       A shim: it prints, it never installs.",
     "  flywheel init [--force]              scaffold .github/workflows/crewhaus-flywheel.yml",
     "       (nightly cron + manual dispatch; accepted improvements arrive as",
     "       PRs for human review — never auto-merged)",
@@ -2923,7 +3054,7 @@ function usageText(): string {
     "  datasets card <name>[@version]       markdown datasheet: splits, provenance, hashes,",
     "       [-o <file.md>]                      release history + offline lint summary (B21)",
     "  dataset mine [--sessions N|all]      mine hard cases from session struggle signals (item 2):",
-    "       [--out-dataset <name>] [--review]   tool-errors/loops/retries/egress → quarantine;",
+    "       [--out-dataset <name>] [--review]   errors/eval-fails/loops/retries/egress → quarantine;",
     "       [--no-redact]                       --review promotes accepted into a mined dataset",
     "                                           (candidate text PII/secret-redacted by default)",
     "  dataset synthesize --from <f|reg>    PII-redacted stress variants (item 2): paraphrase,",
@@ -3051,6 +3182,24 @@ function printVersion(): void {
   process.stdout.write(`${version}\n`);
 }
 
+/**
+ * C33 — the reproducibility manifest's CLI half, as a spreadable opts
+ * fragment. The runner records bun/platform itself but cannot know which
+ * binary invoked it, and EVERY `runEvalLib` call in this file writes a real,
+ * loadable, diffable run directory — the matrix cells, `model scan`, the
+ * flywheel's before/after evals, optimize fitness runs and the version ramp
+ * included. One helper so a new call site cannot forget it. Memoized:
+ * `cliVersion()` reads package.json off disk.
+ */
+let cliVersionOptCache: { cliVersion?: string } | undefined;
+function cliVersionOpt(): { readonly cliVersion?: string } {
+  if (cliVersionOptCache === undefined) {
+    const v = cliVersion();
+    cliVersionOptCache = v !== undefined ? { cliVersion: v } : {};
+  }
+  return cliVersionOptCache;
+}
+
 function parseFor(rest: ReadonlyArray<string>, schema: ParseArgsSchema): ParsedArgs {
   try {
     return parseArgs(rest, schema);
@@ -3112,10 +3261,20 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "  --no-register  Skip the registry auto-put + changelog entry.\n" +
         "\n" +
         "  --with-eval-harness  Also emit an eval bridge — a target: eval bundle\n" +
-        "             projected from THIS (non-cli) shape's own agent — into\n" +
-        "             <out-dir>/eval/, so the shape can consume its distilled\n" +
-        "             feedback through eval/optimize/flywheel. Rejected for cli\n" +
-        "             (use `crewhaus eval` directly) and multi-stage shapes.\n" +
+        "             projected from THIS (non-cli) shape — into <out-dir>/eval/,\n" +
+        "             so the shape can consume its distilled feedback through\n" +
+        "             eval/optimize/flywheel. The bridge is RUNTIME-INVOKING:\n" +
+        "             workflow/graph/crew/pipeline samples drive the shape's\n" +
+        "             compiled bundle end-to-end (the primary bundle gains an\n" +
+        "             exported eval entry under this flag), channel samples run\n" +
+        "             the bot's real runTurn via a loopback, managed samples\n" +
+        "             drive the gateway's runOneTurn dispatcher; the remaining\n" +
+        "             shapes run their agent + real tools through the\n" +
+        "             single-turn loop (strategy printed per compile). Sample\n" +
+        "             `history` seeds only chat-capable shapes\n" +
+        "             (channel/managed/voice/pipeline); other shapes reject\n" +
+        "             history-carrying samples loudly at dataset load.\n" +
+        "             Rejected for cli (use `crewhaus eval` directly).\n" +
         "  --eval-dataset <name>  Dataset the bridge consumes (default\n" +
         "             <specName>-eval).\n" +
         "\n" +
@@ -3310,6 +3469,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
 
   const absOut = resolve(outDir as string);
 
+  const withEvalHarness = args.flags["with-eval-harness"] === true;
   let bundle: ReturnType<typeof compile>;
   if (emitCfWorker) {
     // Loop contract 0.4 (Batch F, item 6) — the cf-worker emit path drives
@@ -3327,7 +3487,12 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     }
   } else {
     try {
-      bundle = compile(yamlText, { readme });
+      // Cluster S — `--with-eval-harness` asks the compiler for the shape's
+      // eval-entry bundle variant (see CompileOptions.evalEntry) instead of
+      // re-emitting it here from a second, bare `lower(parseSpec(...))`: the
+      // artifact written under the flag must come out of the same pipeline
+      // as the one written without it.
+      bundle = compile(yamlText, { readme, ...(withEvalHarness ? { evalEntry: true } : {}) });
     } catch (err) {
       // compile() runs parse → lower → emit. parseSpec throws SpecParseError;
       // each target emitter throws its own TargetEmitError (e.g. an unresolvable
@@ -3373,6 +3538,10 @@ async function runCompile(args: ParsedArgs): Promise<void> {
       `--strict: ${escalatedWarnings.length} compile warning(s) escalated to errors (see lines above)`,
     );
   }
+
+  // (Cluster S — the eval-entry bundle variant is selected INSIDE compile()
+  // above via `evalEntry`, so `--with-eval-harness` and a plain compile share
+  // one pipeline. `--emit-as cf-worker` already refused the flag.)
 
   mkdirSync(absOut, { recursive: true });
   for (const file of bundle.files) {
@@ -3444,7 +3613,24 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     const strategy = selectInvoker(sourceIr.target);
     const evalOut = join(absOut, EVAL_BRIDGE_SUBDIR);
     mkdirSync(evalOut, { recursive: true });
-    const evalBundle = emitEval(projected, { readme });
+    // Cluster S — the bundle is emitted as a BRIDGE: it drives the shape's
+    // compiled runtime entry (when one exists) and gates history-carrying
+    // samples against non-chat shapes at dataset load.
+    // C33 — the bundle bakes in the version that emitted it, so its run.json
+    // carries the same reproducibility manifest a `crewhaus eval` run does
+    // (bunVersion/platform are computed inside runEval). Same version the
+    // emitted package.json pins.
+    const bundleCliVersion = cliVersion();
+    const evalBundle = emitEval(projected, {
+      readme,
+      ...(bundleCliVersion !== undefined ? { cliVersion: bundleCliVersion } : {}),
+      bridge: {
+        sourceTarget: sourceIr.target,
+        kind: strategy.kind,
+        chatCapable: strategy.chatCapable,
+        ...(strategy.entryImport !== undefined ? { entryImport: strategy.entryImport } : {}),
+      },
+    });
     for (const file of evalBundle.files) {
       const fullPath = join(evalOut, file.path);
       if (file.path === "README.md" && existsSync(fullPath)) {
@@ -8095,6 +8281,8 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       dataset: { name: datasetName, samples: makeAsyncIterable(devSet) },
       compiledGraders: compiled,
       opts: {
+        // C33 — which CLI produced this run (reproducibility manifest).
+        ...cliVersionOpt(),
         outDir: join(
           outDir,
           "evals",
@@ -8357,6 +8545,8 @@ async function runOptimizeFromAdvice(opts: {
       dataset: { name: opts.datasetName, samples: makeAsyncIterable(opts.devSet) },
       compiledGraders: opts.compiled,
       opts: {
+        // C33 — which CLI produced this run (reproducibility manifest).
+        ...cliVersionOpt(),
         outDir: join(adviceDir, label),
         concurrency: opts.concurrency,
         seed: opts.seed,
@@ -8575,7 +8765,7 @@ function gitSpecStatus(absSpec: string): { inRepo: boolean; dirty: boolean } {
 async function runFlywheelCmd(args: ParsedArgs, action: "init" | "run"): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      `usage:\n  crewhaus flywheel run [spec.yaml] [--dataset <data>] [--graders <graders.yaml>]\n      [--budget-usd N] [--iterations N] [--seed N] [--concurrency N]\n      [--mutator rule-based|claude] [--dry-run] [--allow-dirty]\n  crewhaus flywheel init [--force]\n\n  \`run\` executes the nightly self-improvement loop in one command:\n  compile gate → baseline eval → optimize (budget-capped; claude mutator\n  by default when an ANTHROPIC credential is present, rule-based fallback\n  otherwise) → post-patch compile → after eval → acceptance gate. The\n  patch is applied to the spec ONLY when pass_rate strictly improved with\n  zero per-sample regressions (the same strict gate \`eval --gate\` uses);\n  an accepted write-back then runs the standard auto-register + changelog\n  + regression-pin flow. A rejected patch never touches disk. --dry-run\n  runs everything but never writes.\n\n  Defaults: <spec> is ./crewhaus.yaml; --dataset falls back to\n  ${CONVENTIONAL_DATASET} then registry:<spec>-ratings (when the spec has a\n  feedback: block and ratings were distilled); --graders falls back to\n  ${CONVENTIONAL_GRADERS}; conventional paths resolve from the SPEC's directory,\n  not the cwd, so a spec passed by path brings its own eval/ files. When the\n  dataset is a registry ref (including the ratings fallback), bare refs resolve\n  train+dev only — the locked test split NEVER enters the flywheel, and an\n  explicit #test ref is refused (the held-out split gates releases, not\n  nightly loops). Every run prints the resolved dataset + its source\n  (flag|convention|ratings-registry) and warns when a conventional\n  ${CONVENTIONAL_DATASET} shadows a distilled <spec>-ratings dataset. The\n  optimizer only ever rewrites agent.instructions (OPTIMIZABLE_PATHS) —\n  permissions: stay exactly as a human reviewed them. The flywheel refuses to\n  run over uncommitted spec changes (--allow-dirty opts out).\n\n  \`init\` scaffolds .github/workflows/crewhaus-flywheel.yml: nightly cron +\n  workflow_dispatch, budget knobs as env, PR creation via gh for HUMAN\n  review — the workflow never merges on its own. Refuses to overwrite an\n  existing workflow without --force.\n\n${formatFlywheelKnobsGuide()
+      `usage:\n  crewhaus flywheel run [spec.yaml] [--dataset <data>] [--graders <graders.yaml>]\n      [--budget-usd N] [--iterations N] [--seed N] [--concurrency N]\n      [--mutator rule-based|claude] [--gate-split train|dev] [--dry-run]\n      [--allow-dirty]\n  crewhaus flywheel init [--force]\n\n  \`run\` executes the nightly self-improvement loop in one command:\n  compile gate → baseline eval → optimize (budget-capped; claude mutator\n  by default when an ANTHROPIC credential is present, rule-based fallback\n  otherwise) → post-patch compile → after eval → acceptance gate. The\n  patch is applied to the spec ONLY when pass_rate strictly improved with\n  zero per-sample regressions (the same strict gate \`eval --gate\` uses);\n  an accepted write-back then runs the standard auto-register + changelog\n  + regression-pin flow. A rejected patch never touches disk. --dry-run\n  runs everything but never writes.\n\n  Defaults: <spec> is ./crewhaus.yaml; --dataset falls back to\n  ${CONVENTIONAL_DATASET} then registry:<spec>-ratings (when the spec has a\n  feedback: block and ratings were distilled); --graders falls back to\n  ${CONVENTIONAL_GRADERS}; conventional paths resolve from the SPEC's directory,\n  not the cwd, so a spec passed by path brings its own eval/ files. When the\n  dataset is a registry ref (including the ratings fallback), bare refs resolve\n  train+dev only — the locked test split NEVER enters the flywheel, and an\n  explicit #test ref is refused (the held-out split gates releases, not\n  nightly loops). Every run prints the resolved dataset + its source\n  (flag|convention|ratings-registry) and warns when a conventional\n  ${CONVENTIONAL_DATASET} shadows a distilled <spec>-ratings dataset.\n\n  --gate-split train|dev (D42) narrows the BEFORE/AFTER acceptance evals to\n  one registry split; the optimizer's own train/dev sets are unchanged, so\n  the search still reads what it always read. Omitted, the gate scores every\n  split the ref resolved (train+dev) — the historical behavior. A split-gated\n  run keys into its own baseline lineage (<name>@<version>#<split>), and the\n  flag is REFUSED for a flat-file dataset (no split boundaries) and for\n  #test (B16 — the holdout gates releases, not nightly loops).\n\n  The optimizer only ever rewrites agent.instructions from this command —\n  permissions:, the model roster, and every security/allowlist field stay\n  exactly as a human reviewed them (spec-patch's OPTIMIZABLE_PATHS enforces\n  it). D43's numeric-dial search is implemented in the optimizer library and\n  is reachable programmatically (optimizeSpec({ knobs })); no CLI flag builds\n  the dial set yet, so a flywheel run proposes no knob changes. The flywheel\n  refuses to run over uncommitted spec changes (--allow-dirty opts out).\n\n  \`init\` scaffolds .github/workflows/crewhaus-flywheel.yml: nightly cron +\n  workflow_dispatch, budget knobs as env, PR creation via gh for HUMAN\n  review — the workflow never merges on its own. Refuses to overwrite an\n  existing workflow without --force.\n\n${formatFlywheelKnobsGuide()
         .map((l) => `  ${l}`)
         .join("\n")}\n`,
     );
@@ -8645,8 +8835,12 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
   }
 
   let knobs: FlywheelKnobs;
+  let gateSplit: FlywheelGateSplit | undefined;
   try {
     knobs = resolveFlywheelKnobs({ flags: args.flags, env: process.env });
+    // D42 — per-split acceptance gating. Parsed before anything is spent so
+    // a typo'd split fails instantly instead of after the baseline eval.
+    gateSplit = parseGateSplit(strFlag(args, "gate-split"));
   } catch (err) {
     if (err instanceof FlywheelConfigError) die(err.message);
     throw err;
@@ -8735,6 +8929,13 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
   let datasetHash: string;
   let registrySplits: { train: Sample[]; dev: Sample[] } | undefined;
   let registryRef: ReturnType<typeof parseRegistryRef>;
+  // D42 — the ACCEPTANCE-gate view. Defaults to the whole resolved set (the
+  // pre-D42 behavior); `--gate-split` narrows it to one registry split with
+  // its own name + hash so a split-gated run keys into its own baseline
+  // lineage instead of colliding with all-split history.
+  let gateSamples: Sample[] | undefined;
+  let gateDatasetName: string | undefined;
+  let gateDatasetHash: string | undefined;
   try {
     registryRef = parseRegistryRef(data.dataset);
   } catch (err) {
@@ -8768,6 +8969,17 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
     ) {
       registrySplits = { train: [...record.splits.train], dev: [...record.splits.dev] };
     }
+    if (gateSplit !== undefined) {
+      const split = record.splits[gateSplit] ?? [];
+      if (split.length === 0) {
+        die(
+          `--gate-split ${gateSplit} — "${resolved.datasetName}" has no ${gateSplit} samples (the acceptance gate would score nothing)`,
+        );
+      }
+      gateSamples = [...split];
+      gateDatasetName = registryDatasetName(registryRef.name, resolved.version, gateSplit);
+      gateDatasetHash = overallDatasetHash(record, [gateSplit]);
+    }
   } else {
     const absDataset = resolve(data.dataset);
     const dataset = await loadDataset(absDataset);
@@ -8775,7 +8987,27 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
     datasetHash = hashDatasetFile(absDataset);
     for await (const s of dataset.samples) samples.push(s);
   }
+  // D42 — a flat file has no split boundaries; refuse rather than silently
+  // gating on everything under a flag that says otherwise.
+  const gateRefusal = gateSplitRefusal({
+    gateSplit,
+    isRegistryRef: registryRef !== undefined,
+    dataset: data.dataset,
+  });
+  if (gateRefusal !== undefined) die(gateRefusal);
   if (samples.length === 0) die(`dataset "${datasetName}" yielded zero samples`);
+  const acceptanceSamples = gateSamples ?? samples;
+  const acceptanceDatasetName = gateDatasetName ?? datasetName;
+  const acceptanceDatasetHash = gateDatasetHash ?? datasetHash;
+  if (gateSplit !== undefined) {
+    process.stdout.write(
+      `${formatGateSplitLine({
+        gateSplit,
+        datasetName: acceptanceDatasetName,
+        sampleCount: acceptanceSamples.length,
+      })}\n`,
+    );
+  }
 
   // Optimizer train/dev sets (mirrors `optimize`: registry splits when both
   // populated, else the deterministic inline 70/30 split).
@@ -8785,7 +9017,11 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
     input: s.input,
     ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
   });
-  const originalById = new Map(samples.map((s) => [s.id, s] as const));
+  // D42 — the map must cover the ACCEPTANCE corpus too: with an explicit
+  // `#train` ref plus `--gate-split dev` the gated samples are not in
+  // `samples`, and the post-accept regression pinning resolves recovered
+  // sample ids through this map.
+  const originalById = new Map([...samples, ...acceptanceSamples].map((s) => [s.id, s] as const));
   let trainSet: OptimizerSample[];
   let devSet: OptimizerSample[];
   if (registrySplits !== undefined) {
@@ -8851,17 +9087,19 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
       throw new Error(`flywheel eval requires target: cli (got "${evalIr.target}")`);
     }
     process.stdout.write(
-      `[flywheel] ${label} eval: ${samples.length} samples → ${join(outRoot, label)}\n`,
+      `[flywheel] ${label} eval: ${acceptanceSamples.length} samples → ${join(outRoot, label)}\n`,
     );
     const summary = await runEvalLib({
       ir: evalIr,
-      dataset: { name: datasetName, samples: makeAsyncIterable(samples) },
+      dataset: { name: acceptanceDatasetName, samples: makeAsyncIterable(acceptanceSamples) },
       compiledGraders: compiled,
       opts: {
+        // C33 — which CLI produced this run (reproducibility manifest).
+        ...cliVersionOpt(),
         outDir: join(outRoot, label),
         concurrency: knobs.concurrency,
         seed: knobs.seed,
-        datasetHash,
+        datasetHash: acceptanceDatasetHash,
         retryErrors: true,
         ...(graderRegistry !== undefined ? { graderRegistry } : {}),
       },
@@ -8908,6 +9146,8 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
       dataset: { name: datasetName, samples: makeAsyncIterable(devSet) },
       compiledGraders: compiled,
       opts: {
+        // C33 — which CLI produced this run (reproducibility manifest).
+        ...cliVersionOpt(),
         outDir: join(
           outRoot,
           "optimize",
@@ -9072,8 +9312,10 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
 
   for (const line of formatFlywheelReport(result, {
     specPath,
-    datasetName,
-    sampleCount: samples.length,
+    // D42 — the report names what the VERDICT was measured on, which is the
+    // acceptance view (`…#dev` under --gate-split), not the search corpus.
+    datasetName: acceptanceDatasetName,
+    sampleCount: acceptanceSamples.length,
     budgetUsd: knobs.budgetUsd,
     artifactsDir: outRoot,
   })) {
@@ -9120,6 +9362,7 @@ async function runEvalCoverage(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus eval coverage [--sessions N|all] [--dataset <file|registry:ref>]\n" +
+        "                              [--graders <graders.yaml>]\n" +
         "                              [-o <dir>] [--format text|html|json]\n" +
         "  Detect agent behaviors present in PRODUCTION sessions that no eval sample\n" +
         "  exercises (item 6). Builds a behavior distribution from the cwd spec's\n" +
@@ -9133,7 +9376,13 @@ async function runEvalCoverage(args: ParsedArgs): Promise<void> {
         "  conventional eval/dataset.jsonl next to the cwd spec; a bare registry ref is\n" +
         "  inspected across ALL splits, the locked test split included (gap analysis is\n" +
         "  inspection, not consumption). --format json emits a ranked backlog consumable\n" +
-        "  by `crewhaus dataset mine`.\n",
+        "  by `crewhaus dataset mine`.\n" +
+        "  --graders (D44) adds the GRADER-side join: how many samples each grader can\n" +
+        "  actually score (gold-needing graders vs gold-less samples, agreeing with\n" +
+        "  `dataset lint`), which declared graders no recent run ever recorded, and which\n" +
+        "  judge CRITERIA never varied across the last few runs' persisted grades — a\n" +
+        "  dead criterion pays judge tokens on every sample and can never change a\n" +
+        "  verdict. Omitting the flag leaves the report exactly as before.\n",
     );
     return;
   }
@@ -9175,7 +9424,7 @@ async function runEvalCoverage(args: ParsedArgs): Promise<void> {
   // ---- eval coverage: dataset expected_tools ----
   const datasetFlag = strFlag(args, "dataset");
   const datasetArg = datasetFlag ?? join("eval", "dataset.jsonl");
-  const samples: CoverageSample[] = [];
+  const samples: Sample[] = [];
   let datasetName: string | undefined;
   let datasetResolved = false;
   try {
@@ -9216,7 +9465,9 @@ async function runEvalCoverage(args: ParsedArgs): Promise<void> {
 
   // ---- eval coverage: most recent eval run's per-sample tool usage ----
   const runEventTexts: string[] = [];
-  const entries = readRunIndex().filter((e) => specName === undefined || e.specName === specName);
+  const entries = readEvalRunIndex().filter(
+    (e) => specName === undefined || e.specName === specName,
+  );
   const latest = entries[entries.length - 1];
   if (latest !== undefined) {
     try {
@@ -9229,12 +9480,66 @@ async function runEvalCoverage(args: ParsedArgs): Promise<void> {
     }
   }
 
+  // ---- D44: grader coverage (only with --graders) ----
+  const gradersFlag = strFlag(args, "graders");
+  let graderCoverage: ReturnType<typeof computeGraderCoverage> | undefined;
+  if (gradersFlag !== undefined) {
+    const gradersPath = resolve(gradersFlag);
+    let gradersYaml: string;
+    try {
+      gradersYaml = readFileSync(gradersPath, "utf-8");
+    } catch (err) {
+      die(`--graders "${gradersFlag}" not readable: ${(err as Error).message}`);
+    }
+    let graderSpecs: CoverageGraderSpec[];
+    try {
+      graderSpecs = parseGradersConfig(gradersYaml).config.graders.map((g) =>
+        coverageGraderSpecOf(g as Parameters<typeof coverageGraderSpecOf>[0]),
+      );
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    // The dead-criterion signal needs a WINDOW, not one run: read up to the
+    // last N runs for this spec (most recent first), skipping any that
+    // vanished or are torn.
+    const windowEntries = entries.slice(-DEFAULT_COVERAGE_GRADER_RUNS).reverse();
+    const runGrades: RunGradesText[] = [];
+    for (const entry of windowEntries) {
+      try {
+        const run = await loadRun(entry.outDir);
+        const byId: Record<string, string> = {};
+        for (const [id, artifacts] of Object.entries(run.perSample)) byId[id] = artifacts.grades;
+        runGrades.push(byId);
+      } catch {
+        // A vanished/torn run dir contributes nothing; the window shrinks.
+      }
+    }
+    graderCoverage = computeGraderCoverage({
+      graders: graderSpecs,
+      samples,
+      runs: runGrades,
+      gradersFile: gradersFlag,
+      // One source of truth with `dataset lint`: the SAME gold-needing
+      // predicate, so the two surfaces can never disagree about which
+      // graders require an expected_output.
+      needsGold: (g) =>
+        graderNeedsGold({
+          name: g.name,
+          type: g.type,
+          ...(g.registryGrader !== undefined ? { registryGrader: g.registryGrader } : {}),
+          ...(g.hasReferenceOverride === true ? { hasReferenceOverride: true } : {}),
+        }),
+    });
+  }
+
   const evalCov = buildEvalCoverage(samples, runEventTexts);
   const report = computeCoverage({
     prod,
     evalCov,
     ...(specName !== undefined ? { specName } : {}),
     ...(datasetName !== undefined ? { datasetName } : {}),
+    ...(graderCoverage !== undefined ? { graderCoverage } : {}),
   });
 
   const rendered = renderCoverage(report, format);
@@ -9252,12 +9557,84 @@ async function runEvalCoverage(args: ParsedArgs): Promise<void> {
 }
 
 /**
+ * D46 — build the content graders for `eval --voice --graders <g.yaml>` from
+ * the ordinary graders config: deterministic graders as-is, `llm_judge`
+ * rubrics bound to a real judge (scalar or categorical), `type: registry`
+ * entries resolved against the default registry with their `opts:`. One
+ * construction path with the text eval, so a rubric that works there works
+ * here — including the credential requirement, which surfaces as the judge's
+ * own error on the first graded session.
+ *
+ * A4/A5 — the file's top-level `combine:` policy and per-grader `weight`
+ * come back with the graders: the voice path APPLIES the policy (see
+ * `combineVoiceContentGrades`) and warns about unconsumed weights /
+ * passing_threshold through the same `warnUnconsumedCombinePolicy` the
+ * runner and exam surfaces call. A surface that parses the grammar and
+ * ignores half of it is the trust hole A4/A5 exist to close.
+ */
+async function buildVoiceContentGraders(gradersPath: string): Promise<{
+  graders: Array<{ name: string; grader: Grader; weight?: number }>;
+  combine: GraderCombinePolicy | undefined;
+}> {
+  let compiled: ReadonlyArray<CompiledGrader>;
+  try {
+    compiled = parseGradersConfig(readFileSync(resolve(gradersPath), "utf-8")).compiled;
+  } catch (err) {
+    die(`--graders "${gradersPath}" unusable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  warnUnconsumedCombinePolicy(compiled);
+  const combine = compiled.find((g) => g.combine !== undefined)?.combine;
+  const registry = await graderRegistryForCompiled(compiled);
+  const built: Array<{ name: string; grader: Grader; weight?: number }> = [];
+  for (const g of compiled) {
+    if (g.judgeSpec !== undefined) {
+      const spec = g.judgeSpec;
+      const rubric =
+        spec.rubric.kind === "categorical"
+          ? loadCategoricalRubric(spec.rubric)
+          : loadRubric(spec.rubric);
+      built.push({
+        name: g.name,
+        weight: g.weight,
+        grader: createJudgeGrader(rubric, {
+          ...(spec.model !== undefined ? { model: spec.model } : {}),
+          ...(spec.judges !== undefined ? { judges: spec.judges } : {}),
+          ...(spec.temperature !== undefined ? { temperature: spec.temperature } : {}),
+          ...(spec.repeats !== undefined ? { repeats: spec.repeats } : {}),
+          ...(spec.target !== undefined ? { target: spec.target } : {}),
+        }),
+      });
+      continue;
+    }
+    if (g.registrySpec !== undefined) {
+      if (registry === undefined) {
+        die(`--graders "${gradersPath}": grader "${g.name}" needs a grader registry`);
+      }
+      built.push({
+        name: g.name,
+        weight: g.weight,
+        grader: resolveRegistryGrader(registry, g.name, g.registrySpec),
+      });
+      continue;
+    }
+    built.push({ name: g.name, grader: g.grader, weight: g.weight });
+  }
+  return { graders: built, ...(combine !== undefined ? { combine } : { combine: undefined }) };
+}
+
+/**
  * Item 65 — `crewhaus eval --voice`: replay recorded call-session logs through
  * the voice grader pack (latency / barge-in / transcript). Reads every
  * `*.jsonl` under --replay-dir (default `.crewhaus/voice-replays`), grades each
  * against the latency budgets, renders a report, and writes a machine-readable
  * `voice-eval.json`. Exits non-zero when any session fails a grader (a
  * pre-deploy voice gate). Credential-free + deterministic — no live audio.
+ *
+ * D46 — with `--graders <g.yaml>` the replayed transcripts are ALSO scored by
+ * the ordinary grader stack (content grading); a content failure fails the
+ * session exactly like a latency breach. Judge-backed rubrics need judge
+ * credentials — that is the one thing `--graders` gives up on the otherwise
+ * credential-free voice path.
  */
 async function runVoiceEval(args: ParsedArgs): Promise<void> {
   const replayDir = resolve(strFlag(args, "replay-dir") ?? join(".crewhaus", "voice-replays"));
@@ -9279,13 +9656,37 @@ async function runVoiceEval(args: ParsedArgs): Promise<void> {
     maxBargeInYieldMs:
       intFlag(args, "max-barge-in-yield-ms") ?? DEFAULT_VOICE_THRESHOLDS.maxBargeInYieldMs,
   };
+  // D46 — optional CONTENT grading: the same graders.yaml a text eval uses,
+  // applied to each replayed transcript. Built ONCE (registry packs and judge
+  // graders are per-run instruments, not per-session), and only when the flag
+  // is present — without it the voice eval is byte-identical to before.
+  const gradersFlag = strFlag(args, "graders");
+  const content =
+    gradersFlag !== undefined
+      ? await buildVoiceContentGraders(gradersFlag)
+      : { graders: [], combine: undefined };
+  const contentGraders = content.graders;
+  if (contentGraders.length > 0) {
+    // A4/A5 — say which policy is in force: `all` is the default, and a
+    // non-default one changes what "the session passed" MEANS.
+    const mode = content.combine?.mode ?? "all";
+    process.stdout.write(
+      `[voice-eval] content graders (combine: ${mode}): ${contentGraders.map((g) => g.name).join(", ")}\n`,
+    );
+  }
+
   const results: VoiceSessionResult[] = [];
   for (const f of files) {
     const sessionId = f.slice(0, -".jsonl".length);
     const jsonl = readFileSync(join(replayDir, f), "utf-8");
     let result: VoiceSessionResult;
     try {
-      result = gradeVoiceSession(parseReplayLog(sessionId, jsonl), thresholds);
+      result = await gradeVoiceSessionWithContent(
+        parseReplayLog(sessionId, jsonl),
+        thresholds,
+        contentGraders,
+        content.combine !== undefined ? { combine: content.combine } : {},
+      );
     } catch (err) {
       if (err instanceof VoiceEvalError) die(err.message);
       throw err;
@@ -9304,6 +9705,122 @@ async function runVoiceEval(args: ParsedArgs): Promise<void> {
   if (failed > 0) process.exit(1);
 }
 
+/**
+ * C28 — `crewhaus eval plan --target-delta F [--confidence C] [--pilot <runDir>]`.
+ * Offline arithmetic that PRINTS its own working: which z, which p and where
+ * it came from, which e, and the substituted formula — so the number teaches
+ * instead of just asserting.
+ */
+function runEvalPlanCmd(args: ParsedArgs): void {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus eval plan --target-delta F [--confidence C] [--pilot <runDir>]\n" +
+        "  Sample-size planning: how many samples does a dataset need to DETECT the\n" +
+        "  regression you care about? n ≈ z²·p(1−p)/e², printed with every term and its\n" +
+        "  source (report §9's metric literacy — gating a release on n=8 cannot see a\n" +
+        "  5-point drop, and this says so before you spend).\n" +
+        "  --target-delta F  the smallest pass-rate change worth detecting, as a FRACTION\n" +
+        "                    (0.05 = 5 percentage points). Required.\n" +
+        "  --confidence C    two-sided confidence level (default 0.95).\n" +
+        "  NOTE: n ≈ z²·p(1−p)/e² sizes an ESTIMATE's half-width, not a hypothesis test's\n" +
+        "  POWER (there is no z_β term) — at that n a true delta of e is detected only\n" +
+        "  about half the time. The output prints the ~80%-power figure alongside it.\n" +
+        "  --pilot <runDir>  seed p from a previous run's measured pass rate (its\n" +
+        "                    results.json); without it p = 0.5, the variance-maximizing\n" +
+        "                    worst case, which deliberately OVER-estimates n. With a pilot\n" +
+        "                    the output also reports the smallest delta that run's own n\n" +
+        "                    could have resolved.\n" +
+        "  Offline: no model call, no credentials, no spend, nothing written.\n",
+    );
+    return;
+  }
+  const deltaFlag = strFlag(args, "target-delta");
+  if (deltaFlag === undefined) {
+    die("eval plan: --target-delta F is required (0.05 = detect a 5 percentage-point change)");
+  }
+  const targetDelta = Number.parseFloat(deltaFlag as string);
+  const confidenceFlag = strFlag(args, "confidence");
+  const confidence = confidenceFlag !== undefined ? Number.parseFloat(confidenceFlag) : undefined;
+  if (confidenceFlag !== undefined && !Number.isFinite(confidence as number)) {
+    die(`eval plan: --confidence must be a number (got "${confidenceFlag}")`);
+  }
+  const pilot = strFlag(args, "pilot");
+  try {
+    const plan = planSampleSize({
+      targetDelta,
+      ...(confidence !== undefined ? { confidence } : {}),
+      ...(pilot !== undefined ? { pilotRunDir: resolve(pilot) } : {}),
+    });
+    process.stdout.write(renderEvalPlan(plan));
+  } catch (err) {
+    if (err instanceof EvalPlanError) die(err.message);
+    throw err;
+  }
+}
+
+/**
+ * D41 — `crewhaus schedule generate --for flywheel|eval-gate|sentinel
+ * [--runner cron|launchd|systemd]`. Prints ready-to-install scheduling text
+ * wrapping the matching `crewhaus` command; installs nothing, writes nothing.
+ * The GitHub scaffolds (`init --ci`, `init --sentinel`, `flywheel init`) are
+ * unchanged — this is the off-GitHub sibling.
+ */
+function runScheduleGenerate(args: ParsedArgs): void {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus schedule generate --for flywheel|eval-gate|sentinel\n" +
+        "                                 [--runner cron|launchd|systemd] [--dir <path>]\n" +
+        "                                 [--spec <f>] [--dataset <d>] [--graders <g>] [--baseline <dir>]\n" +
+        "  Recurring eval automation for teams NOT on GitHub Actions: prints a crontab\n" +
+        "  line, a launchd plist, or a systemd service+timer pair wrapping the same\n" +
+        "  command the corresponding workflow runs —\n" +
+        "    flywheel   → crewhaus flywheel run            (nightly 07:13)\n" +
+        "    eval-gate  → crewhaus eval … --gate           (nightly 05:23)\n" +
+        "    sentinel   → crewhaus eval … --sentinel …     (nightly 03:17)\n" +
+        "  A SHIM, not a daemon: nothing is installed, scheduled, or written — you review\n" +
+        "  the text and install it yourself. The scheduler's own failure reporting is the\n" +
+        "  alert, because the wrapped commands exit non-zero on regression/drift.\n" +
+        "  --dir defaults to the current directory (the scheduled command cd's there).\n" +
+        "  eval-gate/sentinel spell their paths out: --spec/--dataset/--graders default\n" +
+        "  to crewhaus.yaml, eval/dataset.jsonl, eval/graders.yaml (and --baseline to\n" +
+        "  eval/sentinel-baseline, sentinel ONLY — it is warned about and ignored on the\n" +
+        "  other targets). The flywheel command resolves those same conventional paths\n" +
+        "  itself, so they are emitted there only when you pass them explicitly.\n" +
+        "  The GitHub scaffolds are unchanged: see `crewhaus init --ci|--sentinel` and\n" +
+        "  `crewhaus flywheel init` when you ARE on GitHub Actions.\n",
+    );
+    return;
+  }
+  try {
+    const target = parseScheduleTarget(strFlag(args, "for"));
+    const runner = parseScheduleRunner(strFlag(args, "runner"));
+    const dir = resolve(strFlag(args, "dir") ?? process.cwd());
+    const spec = strFlag(args, "spec");
+    const dataset = strFlag(args, "dataset");
+    const graders = strFlag(args, "graders");
+    const baseline = strFlag(args, "baseline");
+    const generated = buildSchedule({
+      target,
+      runner,
+      dir,
+      ...(spec !== undefined ? { spec } : {}),
+      ...(dataset !== undefined ? { dataset } : {}),
+      ...(graders !== undefined ? { graders } : {}),
+      ...(baseline !== undefined ? { baseline } : {}),
+    });
+    // A path flag the chosen target cannot consume is announced, never
+    // silently dropped — the same doctrine as the `[eval-report] warning:
+    // --X only applies to …` lines.
+    for (const warning of generated.job.warnings) {
+      process.stderr.write(`[schedule] warning: ${warning}\n`);
+    }
+    process.stdout.write(renderSchedule(generated));
+  } catch (err) {
+    if (err instanceof ScheduleGenerateError) die(err.message);
+    throw err;
+  }
+}
+
 async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -9314,6 +9831,8 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "[--no-preflight] " +
         "[--max-p95-latency-ms N] [--max-cost-usd F] " +
         "[--sample-timeout-ms N] [--budget-usd F] " +
+        "[--record-tools <dir> | --replay-tools <dir> [--replay-miss error|live]] " +
+        "[--resume <runDir>] " +
         "[--models <m1,m2,...>]\n" +
         "  Before any model spend, an OFFLINE preflight lint-lite refuses runs with\n" +
         "  duplicate sample ids (artifact dirs collide, flip detection corrupts) or\n" +
@@ -9342,9 +9861,13 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  per-sample latency rose more than N ms vs the pinned baseline, or when this\n" +
         "  run's estimated cost exceeds $F. Cost is projected from the run's agent-model\n" +
         "  token totals through the same pricing table as the --models est_$ column (all\n" +
-        "  trials under --repeats; judge/grader calls are NOT metered — their token usage\n" +
-        "  is not yet captured); an unpriced model leaves cost unknown, so the cost gate\n" +
-        "  warns instead of failing. Like the regression gate, the thresholds compare\n" +
+        "  trials under --repeats); an unpriced model leaves cost unknown, so the cost\n" +
+        "  gate warns instead of failing. JUDGE spend is now metered too (C35): every\n" +
+        "  llm_judge call's token usage lands in results.json (aggregates.judgeUsage, per\n" +
+        "  judge model) and the run prints a `cost:` line breaking out agent vs judge vs\n" +
+        "  total — judge grading often costs more than the agent run it grades. The gate\n" +
+        "  thresholds themselves still compare AGENT cost, unchanged. Like the regression\n" +
+        "  gate, the thresholds compare\n" +
         "  against the pinned baseline — the first run for a pair pins and is not gated.\n" +
         "  Every run's index entry/baseline pin also records p95LatencyMs + costUsd\n" +
         "  (additive fields). Incompatible with --sentinel/--models, which skip the gate.\n" +
@@ -9359,9 +9882,49 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  '[eval] budget exhausted after k/N samples' error, and results.json is marked\n" +
         "  partial (completed samples keep their grades). Defaults to the spec's\n" +
         "  budget.usd when declared — eval always STOPS at the cap (the block's\n" +
-        "  on_exceed: degrade ladder never applies to a measurement run). Judge/grader\n" +
-        "  spend is not metered, and an unpriced model disables enforcement with a\n" +
-        "  warning. Under --models, each cell meters its own cap.\n" +
+        "  on_exceed: degrade ladder never applies to a measurement run). The cap meters\n" +
+        "  AGENT spend only (judge tokens are reported but do not move the cap), and an\n" +
+        "  unpriced model disables enforcement with a warning. Under --models, each cell\n" +
+        "  meters its own cap.\n" +
+        "  --record-tools <dir> records every TOOL execution to <dir>/tools.jsonl, keyed\n" +
+        "  by (sampleId, toolName, sha256 of the canonical-JSON args); tools still run\n" +
+        "  for real and the run is otherwise unchanged. --replay-tools <dir> serves those\n" +
+        "  results from the recording instead of executing anything — deterministic,\n" +
+        "  credential-free, side-effect-free tool behaviour for a tool-using agent's\n" +
+        "  eval. The two are mutually exclusive. A call whose key the recording does not\n" +
+        "  carry is a MISS: --replay-miss error (default) fails that sample with a\n" +
+        "  message naming the missing key (and is never noise-retried — it would fail\n" +
+        "  identically), --replay-miss live executes the tool for real. Repeated\n" +
+        "  identical calls replay the recorded results in order; once a key's entries run\n" +
+        "  out the last one keeps replaying, and because that means the replayed\n" +
+        "  trajectory called the tool more times than the recording did, the run prints an\n" +
+        "  `[eval] warning:` naming those calls and records a reusedEntries count.\n" +
+        "  Scope: TOOLS only — the agent stack is still wired (MCP servers\n" +
+        "  still boot so their tool schemas exist) and the MODEL still runs live. run.json\n" +
+        "  records the mode, the directory, and (on replay) the recording's content hash,\n" +
+        "  so a replayed run gates and pins like any other run but says what it was.\n" +
+        "  A recording holds tool args and results VERBATIM (bash stdout, MCP responses,\n" +
+        "  file contents) — treat <dir> like a session transcript and do not commit one\n" +
+        "  recorded against production credentials or production data.\n" +
+        "  --resume <runDir> re-opens an interrupted run instead of re-paying for it:\n" +
+        "  the run keeps its ORIGINAL runId and startedAt, every sample that already\n" +
+        "  wrote grades.json is reloaded from disk (no agent call, no judge call, no\n" +
+        "  spend), only the missing samples run, and the UNION is re-aggregated into a\n" +
+        "  fresh results.json + index.html. The resume REFUSES loudly when the run's\n" +
+        "  specHash, datasetHash or gradersHash no longer match the recorded run.json —\n" +
+        "  splicing two different measurements into one run is never silent. A sample\n" +
+        "  that ran and ERRORED is complete (it has grades.json) and is reused as-is;\n" +
+        "  delete its artifact directory to re-run just that one. The run history is\n" +
+        "  updated, not duplicated: the resumed run appends a superseding index entry\n" +
+        "  under the same runId, and every reader built on eval-report's\n" +
+        "  readRunIndexLatest (crewhaus eval-report history|trends and this CLI's own\n" +
+        "  listings) keeps only the newest — the raw readRunIndex still returns the full\n" +
+        "  append log. A budget-partial run still refuses to pin a baseline until it\n" +
+        "  completes, and when the PINNED baseline is the very run you are resuming the\n" +
+        "  gate is refused with a warning rather than comparing the run against itself.\n" +
+        "  --budget-usd is re-armed per attempt: the resume prints what earlier attempts\n" +
+        "  already spent (run.json's spentUsd) before spending more. Incompatible with -o\n" +
+        "  (the run directory IS the output) and with --models.\n" +
         "  When the registry contains <specName>-regressions (pinned by `crewhaus optimize`),\n" +
         "  its samples are unioned into the dataset by default (dedupe by id, primary wins).\n" +
         "  When the union actually ADDS samples, datasetName/datasetHash reflect it\n" +
@@ -9383,7 +9946,12 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  passed — tau-bench's reliability metric: a flaky 60%-reliable agent scores\n" +
         "  0.6^K). Trials run sequentially inside each sample's concurrency slot, so a\n" +
         "  K-repeat run costs ~K× the wall clock and spend; the summary's\n" +
-        "  tokens_all_trials makes the real spend visible.\n" +
+        "  tokens_all_trials makes the real spend visible. Samples whose trials DISAGREED\n" +
+        "  (0 < trial pass rate < 1) are flagged FLAKY (C34): marked per sample in\n" +
+        "  results.json, counted + listed on stdout with what to do about them, and\n" +
+        "  recorded on the run-history entry so `eval-report history` marks the run.\n" +
+        "  Their verdicts still count — quarantine is a decision you make against the\n" +
+        "  dataset, not one the runner makes silently.\n" +
         "  --slice <k1,k2,...> slices the results by sample-metadata keys (default:\n" +
         "  family,difficulty,language,source). A key applies only to samples carrying it\n" +
         "  in metadata as a STRING; per-slice sample count / pass rate / mean score land\n" +
@@ -9447,14 +10015,37 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  non-zero — a mis-pointed sentinel is loud, never silently green). Sentinel mode\n" +
         "  skips the run-history index/baselines/triage and the regression union (a probe,\n" +
         "  not lineage); --gate/--no-promote/--models are rejected with it.\n" +
+        "  --voice [--replay-dir <dir>] replays recorded call sessions through the voice\n" +
+        "  grader pack (latency / barge-in / transcript coverage) with the --max-ttft-ms /\n" +
+        "  --max-turn-latency-ms / --max-barge-in-yield-ms budgets. Adding --graders\n" +
+        "  <g.yaml> ALSO grades what the agent SAID (D46): each replayed transcript is\n" +
+        "  scored by the ordinary grader stack (deterministic graders, registry packs,\n" +
+        "  llm_judge rubrics), and a content failure fails the session exactly like a\n" +
+        "  latency breach. A replay carries no gold, so gold-needing graders\n" +
+        "  (exact_match / expected_contains) have nothing to compare against — use\n" +
+        "  contains/regex/llm_judge for content. Judge rubrics need judge credentials;\n" +
+        "  without --graders the voice path stays credential-free.\n" +
         "  Read verbs: `crewhaus eval history|baseline|diff` alias the eval-report\n" +
-        "  verbs (E52) — see `crewhaus eval-report --help`.\n",
+        "  verbs (E52) — see `crewhaus eval-report --help`. Planning verb: `crewhaus eval\n" +
+        "  plan --target-delta F` sizes the dataset BEFORE you spend on it.\n",
     );
     return;
   }
   // Item 65 — voice replay eval branches off before the text-eval flags: it
   // reads recorded call-session JSONLs, not a dataset/graders.yaml.
   if (args.flags["voice"] === true) {
+    // D44 posture — a flag the branch cannot honour must DIE, never be
+    // silently accepted. `--voice` already replays recorded sessions (there
+    // is no live agent to record tools from, and no run directory to resume),
+    // and since D46 taught it to honour the shared `--graders`, "shared flags
+    // are ignored under --voice" is no longer a rule a reader could infer.
+    for (const flag of ["record-tools", "replay-tools", "replay-miss", "resume"] as const) {
+      if (args.flags[flag] !== undefined) {
+        die(
+          `--voice does not support --${flag}: --voice replays recorded call sessions, so the tool cassette (--record-tools/--replay-tools/--replay-miss) and --resume apply to text evals only`,
+        );
+      }
+    }
     await runVoiceEval(args);
     return;
   }
@@ -9600,6 +10191,57 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     if (!Number.isFinite(budgetUsd) || budgetUsd <= 0) {
       die(`invalid --budget-usd "${budgetUsdFlag}" — must be a positive dollar amount`);
     }
+  }
+
+  // NEW-HUNT-4 — tool record/replay. Record and replay are two directions of
+  // one seam; --replay-miss without a replay would be silently dead config.
+  // Validated here so a bad combo dies BEFORE any dataset load or spend.
+  const recordToolsFlag = args.flags["record-tools"];
+  const replayToolsFlag = args.flags["replay-tools"];
+  const replayMissFlag = args.flags["replay-miss"];
+  if (typeof recordToolsFlag === "string" && typeof replayToolsFlag === "string") {
+    die("--record-tools and --replay-tools are mutually exclusive — record a run, then replay it");
+  }
+  if (typeof replayMissFlag === "string" && typeof replayToolsFlag !== "string") {
+    die("--replay-miss is only valid with --replay-tools");
+  }
+  if (
+    typeof replayMissFlag === "string" &&
+    replayMissFlag !== "error" &&
+    replayMissFlag !== "live"
+  ) {
+    die(`invalid --replay-miss "${replayMissFlag}" — must be "error" or "live"`);
+  }
+  const recordToolsDir = typeof recordToolsFlag === "string" ? resolve(recordToolsFlag) : undefined;
+  const replayToolsDir = typeof replayToolsFlag === "string" ? resolve(replayToolsFlag) : undefined;
+  const replayMiss = replayMissFlag === "live" ? ("live" as const) : undefined;
+
+  // NEW-HUNT-6 — `--resume <runDir>`: the run directory IS the output, so -o
+  // would be ambiguous, and a matrix has N cell directories rather than one.
+  const resumeFlag = args.flags["resume"];
+  let resumeDir: string | undefined;
+  if (typeof resumeFlag === "string") {
+    if (resumeFlag.trim() === "") die("--resume requires a run directory");
+    resumeDir = resolve(resumeFlag);
+    if (typeof outDirArg === "string") {
+      die("--resume and -o are mutually exclusive — the resumed run directory is the output");
+    }
+    if (matrixModels !== undefined) {
+      die("--resume and --models are mutually exclusive — matrix cells have their own run dirs");
+    }
+    if (!existsSync(join(resumeDir, "run.json"))) {
+      die(
+        `--resume: ${resumeDir} is not an eval run directory (no run.json — every run writes one before its first sample)`,
+      );
+    }
+  }
+  if (
+    matrixModels !== undefined &&
+    (recordToolsDir !== undefined || replayToolsDir !== undefined)
+  ) {
+    die(
+      "--models is incompatible with --record-tools/--replay-tools — matrix cells share sample ids, so one recording cannot address N cells",
+    );
   }
 
   const absSpec = resolve(specPath);
@@ -9780,15 +10422,46 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   dataset = { name: dataset.name, samples: tapSamples(dataset.samples, triageSamplesById) };
 
   const outDest =
-    typeof outDirArg === "string" ? resolve(outDirArg) : join(".crewhaus", "evals", "<runId>");
+    resumeDir ??
+    (typeof outDirArg === "string" ? resolve(outDirArg) : join(".crewhaus", "evals", "<runId>"));
   process.stdout.write(`[eval] running ${dataset.name}: ${compiled.length} graders → ${outDest}\n`);
+  if (resumeDir !== undefined) {
+    process.stdout.write(`[eval] resuming run at ${resumeDir}\n`);
+  }
+  if (recordToolsDir !== undefined) {
+    process.stdout.write(`[eval] recording tool results → ${recordToolsDir}\n`);
+  }
+  if (replayToolsDir !== undefined) {
+    process.stdout.write(
+      `[eval] replaying tool results from ${replayToolsDir} (miss: ${replayMiss ?? "error"})\n`,
+    );
+  }
 
+  // NEW-HUNT-4/6 — the cassette and resume refusals (missing recording,
+  // moved specHash/datasetHash/gradersHash) are USER-facing config errors:
+  // render them as a clean `crewhaus:` failure instead of a stack trace. The
+  // catch is scoped to runs that actually used the new flags, so every other
+  // error path stays exactly as it was.
+  const cassetteOrResume =
+    resumeDir !== undefined || recordToolsDir !== undefined || replayToolsDir !== undefined;
   const summary = await runEvalLib({
     ir,
     dataset,
     compiledGraders: compiled,
     opts: {
-      ...(typeof outDirArg === "string" ? { outDir: resolve(outDirArg) } : {}),
+      // C33 — which CLI produced this run (reproducibility manifest).
+      ...cliVersionOpt(),
+      // NEW-HUNT-6 — a resume writes into the run directory it re-opened;
+      // -o is refused alongside it, so the two can never disagree.
+      ...(resumeDir !== undefined
+        ? { outDir: resumeDir, resume: true }
+        : typeof outDirArg === "string"
+          ? { outDir: resolve(outDirArg) }
+          : {}),
+      // NEW-HUNT-4 — the tool cassette (record XOR replay; validated above).
+      ...(recordToolsDir !== undefined ? { recordToolsDir } : {}),
+      ...(replayToolsDir !== undefined ? { replayToolsDir } : {}),
+      ...(replayMiss !== undefined ? { replayMiss } : {}),
       datasetHash,
       gradersHash,
       retryErrors,
@@ -9805,10 +10478,24 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
       ...(budgetUsd !== undefined ? { budgetUsd } : {}),
       pricing: defaultMatrixPricing(),
     },
+  }).catch((err: unknown) => {
+    if (cassetteOrResume && err instanceof CrewhausError) die(err.message);
+    throw err;
   });
   // With -o omitted the runner picks .crewhaus/evals/<runId> relative to the
   // cwd — resolve to an absolute path for the report + history index.
   const absOut = resolve(summary.outDir);
+
+  // NEW-HUNT-6 — say what the resume actually saved (and under which runId,
+  // since the history entry supersedes the interrupted run's rather than
+  // adding a second one).
+  if (summary.resumed !== undefined) {
+    const r = summary.resumed;
+    process.stdout.write(
+      `[eval] resume: reused ${r.reusedSamples}/${r.reusedSamples + r.ranSamples} graded sample(s), ` +
+        `ran ${r.ranSamples} — run ${summary.runId}\n`,
+    );
+  }
 
   // Item 30 — sentinel drift probe. Skip triage + run-history entirely (a
   // sentinel is a one-off provider-drift check, not lineage): render the
@@ -9845,7 +10532,10 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     // metrics / repeats / failure classes / calibration notes) — a sentinel
     // is still a run someone reads.
     const sentinelRetried = summary.samples.filter((s) => s.retried === true).length;
-    for (const line of evalRunOutputLines(summary, { retriedCount: sentinelRetried })) {
+    for (const line of evalRunOutputLines(summary, {
+      retriedCount: sentinelRetried,
+      pricing: defaultMatrixPricing(),
+    })) {
       process.stdout.write(`${line}\n`);
     }
     if (summary.partial !== undefined) {
@@ -9906,7 +10596,12 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   // loop-metrics / pass@k–pass^k / failure-class / judge-calibration lines
   // (see eval-output.ts — each prints only when the run carries the data).
   const retriedCount = summary.samples.filter((s) => s.retried === true).length;
-  for (const line of evalRunOutputLines(summary, { retriedCount })) {
+  for (const line of evalRunOutputLines(summary, {
+    retriedCount,
+    // C35 — the cost line: agent spend as before, plus the newly metered
+    // judge spend, through the same pricing table as the matrix est_$ column.
+    pricing: defaultMatrixPricing(),
+  })) {
     process.stdout.write(`${line}\n`);
   }
   if (summary.partial !== undefined) {
@@ -9952,15 +10647,25 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     );
   }
 
-  // C30 — this run's estimated cost, from its agent-model token totals
-  // through the SAME pricing seam as the --models est_$ column (cost-tracker
-  // table keyed by the model-router grammar). All-trials totals when
-  // --repeats ran — the real spend. Judge/grader tokens are not metered
-  // (their usage is not yet captured); a pricing miss leaves cost undefined,
-  // which records nothing and makes the cost gate warn instead of failing.
-  const costTokens = summary.aggregates.totalTokensAllTrials ?? summary.aggregates.totalTokens;
-  const costMicros = defaultMatrixPricing()(summary.config.model, costTokens);
-  const costUsd = costMicros !== undefined ? costMicros / 1_000_000 : undefined;
+  // C30 × C35 — this run's estimated cost, through the SAME pricing seam as
+  // the --models est_$ column (cost-tracker table keyed by the model-router
+  // grammar) AND the same `evalRunCost` helper that builds the printed
+  // `[eval] cost:` line. Agent tokens use the all-trials totals when
+  // --repeats ran — the real spend.
+  //
+  // `costUsd` is the TOTAL (agent + judge). Metering judge spend was C35's
+  // whole point: gating the agent half alone let a judge-heavy run print
+  // `total=$4.10` and still pass `--max-cost-usd 2.00`, and pinned $1.80 in
+  // history forever. The halves are recorded separately too, so `eval-report
+  // trends` can still tell agent spend from grading spend.
+  //
+  // A pricing miss anywhere (agent model or ANY judge model) leaves the
+  // total undefined — the cost gate then warns instead of failing on an
+  // undercount nobody can verify.
+  const cost = evalRunCost(summary, defaultMatrixPricing());
+  const costUsd = cost.totalMicros !== undefined ? cost.totalMicros / 1_000_000 : undefined;
+  const agentCostUsd = cost.agentMicros !== undefined ? cost.agentMicros / 1_000_000 : undefined;
+  const judgeCostUsd = cost.judgeMicros !== undefined ? cost.judgeMicros / 1_000_000 : undefined;
 
   // Run-history: append to the index, diff/gate against the pinned baseline,
   // and promote per policy (see apps/cli/src/eval-history.ts).
@@ -9977,6 +10682,11 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     promote,
     // C30 — the run's estimated cost + the pre-declared ops thresholds.
     ...(costUsd !== undefined ? { costUsd } : {}),
+    // C35 — the halves behind that total, recorded additively so trends can
+    // separate agent spend from grading spend (and so a run with an unpriced
+    // JUDGE model still carries its known agent figure).
+    ...(agentCostUsd !== undefined ? { agentCostUsd } : {}),
+    ...(judgeCostUsd !== undefined ? { judgeCostUsd } : {}),
     ...(maxP95LatencyMs !== undefined ? { maxP95LatencyMs } : {}),
     ...(maxCostUsd !== undefined ? { maxCostUsd } : {}),
   });
@@ -10045,6 +10755,8 @@ async function runEvalMatrixCommand(opts: {
         dataset: { name: opts.datasetName, samples: makeAsyncIterable(opts.samples) },
         compiledGraders: opts.compiled,
         opts: {
+          // C33 — which CLI produced this run (reproducibility manifest).
+          ...cliVersionOpt(),
           outDir: cellOutDir,
           datasetHash: opts.datasetHash,
           retryErrors: opts.retryErrors,
@@ -10189,6 +10901,8 @@ async function runModelScan(args: ParsedArgs): Promise<void> {
         dataset: { name: dataset.name, samples: makeAsyncIterable(samples) },
         compiledGraders: compiled,
         opts: {
+          // C33 — which CLI produced this run (reproducibility manifest).
+          ...cliVersionOpt(),
           outDir: cellOutDir,
           datasetHash,
           ...(concurrency !== undefined ? { concurrency } : {}),
@@ -10408,6 +11122,8 @@ async function runModelRightSize(args: ParsedArgs): Promise<void> {
       dataset: { name: dataset.name, samples: makeAsyncIterable(samples) },
       compiledGraders: compiled,
       opts: {
+        // C33 — which CLI produced this run (reproducibility manifest).
+        ...cliVersionOpt(),
         outDir: cellDir,
         datasetHash,
         ...(concurrency !== undefined ? { concurrency } : {}),
@@ -10530,7 +11246,7 @@ async function runEvalReport(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus eval-report <action>\n" +
-        "  diff <prev> <new> [-o <out-dir>] [--seed N] [--pairwise [--judge-model <m>]]\n" +
+        "  diff <prev> <new> [-o <out-dir>] [--seed N] [--epsilon F] [--pairwise [--judge-model <m>]]\n" +
         "      compare two eval runs and emit a diff report;\n" +
         "      prints the paired-significance line (pass-rate delta, 95% CI, p-value) and\n" +
         "      per-slice deltas for slice keys both runs share; --seed pins the Monte Carlo\n" +
@@ -10544,7 +11260,25 @@ async function runEvalReport(args: ParsedArgs): Promise<void> {
         "      bias and counts as a tie, never a win. Opt-in: 2 judge calls per shared\n" +
         "      sample, so it requires visible judge credentials (--judge-model overrides\n" +
         "      the default judge) and dies with a clear message without them.\n" +
+        "      --epsilon F sets the score-shift tolerance (default 0.1 on the normalized\n" +
+        "      0..1 scale): only |Δscore| strictly above it is reported as a shift. Flips\n" +
+        "      (pass↔fail) are never subject to it. A 1-5 judge rubric and a 0/1 grader\n" +
+        "      deserve different tolerances — this is that knob.\n" +
         "  history [--spec <name>] [--dataset <name>]  list recorded runs (.crewhaus/evals/index.jsonl)\n" +
+        "  trends [--spec <n>] [--dataset <n>] [-o <dir>]\n" +
+        "      pass-rate / mean-score / cost OVER TIME per (spec, dataset), folded from the\n" +
+        "      same index.jsonl `history` lists: a text table plus a movement line per\n" +
+        "      lineage (first → last, delta in percentage POINTS). -o additionally writes a\n" +
+        "      SELF-CONTAINED index.html (inline CSS + inline SVG chart, no external assets,\n" +
+        "      opens from file://) and trends.json. Fully offline — no run directory is\n" +
+        "      opened, so a three-week drift is one command, not an eyeball exercise.\n" +
+        "  export --runs <dir|dir,dir|last:N> --format csv|jsonl [-o <file>] [--spec <n>] [--dataset <n>]\n" +
+        "      flatten runs into ONE ROW PER (run, sample, grader): run config columns\n" +
+        "      (runId, ts, specHash, dataset, model, judgeModel, seed), the sample's verdict\n" +
+        "      + latency + trial pass rate + flaky flag + slice membership, and each\n" +
+        "      grader's own passed/score/abstained/rationale (clipped). `last:N` takes the N\n" +
+        "      most recent indexed runs (after --spec/--dataset filtering); an unreadable or\n" +
+        "      moved run dir is reported and skipped. Without -o the table goes to stdout.\n" +
         "  baseline show [--spec <n>] [--dataset <n>]  print pinned baselines (.crewhaus/evals/baselines.json)\n" +
         "  baseline set <runId>                        pin a recorded run as its (spec, dataset) baseline\n" +
         "  --dataset matches the recorded name exactly OR with a `+` suffix segment, so\n" +
@@ -10564,11 +11298,27 @@ async function runEvalReport(args: ParsedArgs): Promise<void> {
     process.stderr.write(
       "[eval-report] warning: --judge-model has no effect without --pairwise — the diff runs fully offline\n",
     );
-  } else if (action === "history" || action === "baseline") {
-    for (const flag of ["pairwise", "judge-model"]) {
+  } else if (
+    action === "history" ||
+    action === "baseline" ||
+    action === "trends" ||
+    action === "export"
+  ) {
+    for (const flag of ["pairwise", "judge-model", "epsilon"]) {
       if (args.flags[flag] !== undefined) {
         process.stderr.write(
           `[eval-report] warning: --${flag} only applies to \`eval-report diff\` — ignored by \`${action}\`\n`,
+        );
+      }
+    }
+  }
+  // C32 — the mirror of the same doctrine: --runs/--format configure `export`
+  // only, and a silently-ignored knob is a trap on any verb.
+  if (action !== "export") {
+    for (const flag of ["runs", "format"]) {
+      if (args.flags[flag] !== undefined) {
+        process.stderr.write(
+          `[eval-report] warning: --${flag} only applies to \`eval-report export\` — ignored by \`${action ?? ""}\`\n`,
         );
       }
     }
@@ -10580,11 +11330,21 @@ async function runEvalReport(args: ParsedArgs): Promise<void> {
     case "history":
       runEvalReportHistory(args);
       return;
+    // C31 — cross-run trends (offline fold over the same index history reads).
+    case "trends":
+      runEvalReportTrends(args);
+      return;
+    // C32 — flat per-sample × per-grader export across runs.
+    case "export":
+      await runEvalReportExport(args);
+      return;
     case "baseline":
       runEvalReportBaseline(args);
       return;
     default:
-      die(`eval-report: unknown action "${action ?? ""}" — supported: diff, history, baseline`);
+      die(
+        `eval-report: unknown action "${action ?? ""}" — supported: diff, history, trends, export, baseline`,
+      );
   }
 }
 
@@ -10602,6 +11362,16 @@ async function runEvalReportDiff(args: ParsedArgs): Promise<void> {
     die(`eval-report diff: --seed must be an integer (got "${seedFlag}")`);
   }
   const seed = typeof seedFlag === "string" ? Number.parseInt(seedFlag, 10) : undefined;
+  // NEW-stats-1 — the score-shift tolerance, previously a module constant.
+  // Default unchanged (0.1), so an unflagged diff classifies exactly as before.
+  const epsilonFlag = args.flags["epsilon"];
+  let epsilon: number | undefined;
+  if (typeof epsilonFlag === "string") {
+    epsilon = Number.parseFloat(epsilonFlag);
+    if (!Number.isFinite(epsilon) || epsilon < 0) {
+      die(`eval-report diff: --epsilon must be a non-negative number (got "${epsilonFlag}")`);
+    }
+  }
 
   const outArg = args.flags["out"];
   let result: ReturnType<typeof diffReports>;
@@ -10616,7 +11386,10 @@ async function runEvalReportDiff(args: ParsedArgs): Promise<void> {
     for (const warning of diffInstrumentWarnings(prevLoaded, nextLoaded)) {
       process.stderr.write(`[eval-report] warning: ${warning}\n`);
     }
-    result = diffReports(prevLoaded, nextLoaded, seed !== undefined ? { seed } : {});
+    result = diffReports(prevLoaded, nextLoaded, {
+      ...(seed !== undefined ? { seed } : {}),
+      ...(epsilon !== undefined ? { epsilon } : {}),
+    });
   } catch (err) {
     // C29 — mismatched sample ids (and unreadable runs) are user errors:
     // render the message cleanly instead of an uncaught stack trace.
@@ -10637,6 +11410,7 @@ async function runEvalReportDiff(args: ParsedArgs): Promise<void> {
       const pairwise = await judgeRunsPairwise(prevLoaded, nextLoaded, { judgeModel });
       result = diffReports(prevLoaded, nextLoaded, {
         ...(seed !== undefined ? { seed } : {}),
+        ...(epsilon !== undefined ? { epsilon } : {}),
         pairwise,
       });
     } catch (err) {
@@ -10677,6 +11451,18 @@ async function runEvalReportDiff(args: ParsedArgs): Promise<void> {
   }
 }
 
+/**
+ * NEW-HUNT-6 — the run-history index, with superseded entries collapsed.
+ *
+ * The collapse itself lives in `@crewhaus/eval-report`'s `readRunIndexLatest`
+ * (the shared reader, so a non-CLI consumer of the package is not silently
+ * double-counting an N-times-resumed run); this is the thin cwd-default
+ * wrapper every reader in this file goes through.
+ */
+function readEvalRunIndex(evalsDir?: string): RunIndexEntry[] {
+  return evalsDir === undefined ? readRunIndexLatest() : readRunIndexLatest(evalsDir);
+}
+
 /** Filter helper shared by `history` and `baseline show`. The dataset
  *  filter also matches `<filter>+…` union names — see datasetFilterMatches. */
 function matchesEvalFilters(args: ParsedArgs, specName: string, datasetName: string): boolean {
@@ -10702,7 +11488,9 @@ function writeTable(header: ReadonlyArray<string>, rows: ReadonlyArray<ReadonlyA
 }
 
 function runEvalReportHistory(args: ParsedArgs): void {
-  const entries = readRunIndex().filter((e) => matchesEvalFilters(args, e.specName, e.datasetName));
+  const entries = readEvalRunIndex().filter((e) =>
+    matchesEvalFilters(args, e.specName, e.datasetName),
+  );
   if (entries.length === 0) {
     process.stdout.write(
       `[eval-report] no recorded runs match (${join(".crewhaus", "evals", "index.jsonl")})\n`,
@@ -10721,7 +11509,13 @@ function runEvalReportHistory(args: ParsedArgs): void {
       "mean_score",
       "samples",
       "retried",
+      // C34 — samples whose repeat trials disagreed in that run. A gate that
+      // keeps failing on a run with flakes is often failing on the noise.
+      "flaky",
       "partial",
+      // NEW-HUNT-4 — every tool result came from a cassette, so this row is
+      // not a measurement of the live system.
+      "replayed",
       "base",
       "outDir",
     ],
@@ -10735,13 +11529,143 @@ function runEvalReportHistory(args: ParsedArgs): void {
       String(e.sampleCount),
       // Additive field — entries recorded before it existed read as 0.
       String(e.retriedCount ?? 0),
+      // C34 — blank (not "0") on runs that measured no instability, so the
+      // column reads as a flag rather than a statistic.
+      e.flakyCount !== undefined && e.flakyCount > 0 ? String(e.flakyCount) : "",
       // NEW-HUNT-3 — budget-aborted run: its pass_rate counts the aborted
       // samples as errors, so the figure reads lower than a full run's.
       e.partial === true ? "y" : "",
+      // NEW-HUNT-4 — cassette-replayed run (`--replay-tools`).
+      e.replayed === true ? "y" : "",
       pinnedRunIds.has(e.runId) ? "*" : "",
       e.outDir,
     ]),
   );
+  // C34 — one honest pointer when the listing contains measured instability:
+  // the flip gate cannot tell a flaky sample's coin flip from a regression.
+  const flakyRuns = entries.filter((e) => (e.flakyCount ?? 0) > 0);
+  if (flakyRuns.length > 0) {
+    const worst = flakyRuns.reduce((a, b) => ((a.flakyCount ?? 0) >= (b.flakyCount ?? 0) ? a : b));
+    const inspect = `crewhaus eval-report export --runs ${worst.outDir} --format csv`;
+    process.stdout.write(
+      `[eval-report] ${flakyRuns.length} run(s) contain flaky samples (worst: ${worst.runId}, ${worst.flakyCount} sample(s) whose trials disagreed) — inspect with \`${inspect}\` and consider tagging them in the dataset before they keep tripping the strict flip gate.\n`,
+    );
+  }
+}
+
+/**
+ * C31 — `eval-report trends`: the cross-run view. Everything comes from the
+ * same on-disk artifacts `history` reads (index.jsonl + baselines.json), so
+ * this is offline, credential-free, and cheap; `-o` additionally writes the
+ * self-contained HTML chart page + trends.json.
+ */
+function runEvalReportTrends(args: ParsedArgs): void {
+  const entries = readEvalRunIndex().filter((e) =>
+    matchesEvalFilters(args, e.specName, e.datasetName),
+  );
+  if (entries.length === 0) {
+    process.stdout.write(
+      `[eval-report] no recorded runs match (${join(".crewhaus", "evals", "index.jsonl")})\n`,
+    );
+    return;
+  }
+  const pinnedRunIds = new Set(Object.values(readBaselines()).map((b) => b.runId));
+  const series = buildTrends(entries, { pinnedRunIds });
+  const { header, rows } = trendTable(series);
+  writeTable(header, rows);
+  for (const line of formatTrendSummaryLines(series)) {
+    process.stdout.write(`[eval-report] ${line}\n`);
+  }
+  const outArg = args.flags["out"];
+  if (typeof outArg === "string") {
+    const absOut = resolve(outArg);
+    mkdirSync(absOut, { recursive: true });
+    writeFileSync(join(absOut, "index.html"), renderTrends(series));
+    writeFileSync(join(absOut, "trends.json"), `${JSON.stringify(series, null, 2)}\n`);
+    process.stdout.write(`[eval-report] trends: ${join(absOut, "index.html")}\n`);
+  }
+}
+
+/**
+ * C32 — `eval-report export`: resolve `--runs` to run directories, load each,
+ * and flatten to CSV/JSONL. A run directory that has moved or been deleted is
+ * REPORTED and skipped — an export that silently drops a third of the history
+ * is worse than no export.
+ */
+async function runEvalReportExport(args: ParsedArgs): Promise<void> {
+  const runsFlag = args.flags["runs"];
+  if (typeof runsFlag !== "string" || runsFlag.trim() === "") {
+    die("eval-report export: --runs <dir|dir,dir|last:N> is required");
+  }
+  const formatFlag = args.flags["format"] ?? "csv";
+  if (formatFlag !== "csv" && formatFlag !== "jsonl") {
+    die(`eval-report export: --format must be csv or jsonl (got "${String(formatFlag)}")`);
+  }
+
+  // `last:N` reads the (filtered) history index; anything else is one or more
+  // run directories given verbatim.
+  const targets: Array<{ dir: string; specName?: string }> = [];
+  const lastMatch = /^last:(\d+)$/.exec((runsFlag as string).trim());
+  if (lastMatch !== null) {
+    const n = Number.parseInt(lastMatch[1] as string, 10);
+    if (n < 1) die("eval-report export: --runs last:N needs N >= 1");
+    const entries = readEvalRunIndex().filter((e) =>
+      matchesEvalFilters(args, e.specName, e.datasetName),
+    );
+    for (const e of entries.slice(-n)) targets.push({ dir: e.outDir, specName: e.specName });
+  } else {
+    for (const raw of (runsFlag as string).split(",")) {
+      const dir = raw.trim();
+      if (dir !== "") targets.push({ dir });
+    }
+  }
+  if (targets.length === 0) {
+    die(`eval-report export: --runs "${runsFlag}" matched no runs`);
+  }
+
+  const runs: ExportRunInput[] = [];
+  for (const target of targets) {
+    try {
+      const loaded = await loadRun(target.dir);
+      runs.push({
+        summary: loaded.summary,
+        ...(target.specName !== undefined ? { specName: target.specName } : {}),
+      });
+    } catch (err) {
+      process.stderr.write(
+        `[eval-report] warning: skipping ${target.dir} — ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+  }
+  if (runs.length === 0) die("eval-report export: none of the requested runs could be read");
+
+  const rows = buildExportRows(runs);
+  const text = formatFlag === "csv" ? rowsToCsv(rows) : rowsToJsonl(rows);
+  const outArg = args.flags["out"];
+  if (typeof outArg === "string") {
+    // Unlike its siblings (`diff -o`, `trends -o`) this `-o` names a FILE,
+    // so pointing it at a directory — the natural mistake — used to escape
+    // as a raw EISDIR stack trace. Die like every other error in this verb.
+    const absOut = resolve(outArg);
+    if (existsSync(absOut) && statSync(absOut).isDirectory()) {
+      die(
+        `eval-report export: -o takes a FILE path (e.g. rows.${formatFlag}), not a directory — "${absOut}" is one`,
+      );
+    }
+    try {
+      mkdirSync(dirname(absOut), { recursive: true });
+      writeFileSync(absOut, text);
+    } catch (err) {
+      die(
+        `eval-report export: could not write "${absOut}" — ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    process.stdout.write(
+      `[eval-report] export: ${rows.length} row(s) from ${runs.length} run(s) → ${absOut}\n`,
+    );
+  } else {
+    process.stdout.write(text);
+  }
 }
 
 function runEvalReportBaseline(args: ParsedArgs): void {
@@ -10767,7 +11691,7 @@ function runEvalReportBaseline(args: ParsedArgs): void {
       const runId = args.positional[2];
       if (typeof runId !== "string") die("eval-report baseline set: missing <runId>");
       // Latest index entry wins if a runId somehow appears twice.
-      const index = readRunIndex();
+      const index = readEvalRunIndex();
       let entry: RunIndexEntry | undefined;
       for (let i = index.length - 1; i >= 0; i--) {
         if (index[i]?.runId === runId) {
@@ -11074,7 +11998,7 @@ async function runDatasetsStatus(args: ParsedArgs): Promise<void> {
   const report = await computeDatasetStatus({
     name,
     versions,
-    entries: readRunIndex(),
+    entries: readEvalRunIndex(),
     now: new Date(),
     ...(lastN !== undefined ? { lastN } : {}),
     loadOutcomes: async (outDir) => {
@@ -11160,7 +12084,7 @@ async function runDatasetsRelease(args: ParsedArgs): Promise<void> {
   // never reaches here) — the newest entry for this exact datasetName is
   // the release run.
   const expectedName = registryDatasetName(name, version, "test");
-  const entry = readRunIndex()
+  const entry = readEvalRunIndex()
     .filter((e) => e.datasetName === expectedName)
     .pop();
   if (entry === undefined) {
@@ -11219,7 +12143,9 @@ async function runDatasetsCard(args: ParsedArgs): Promise<void> {
     ...(context.specHasTools !== undefined ? { specHasTools: context.specHasTools } : {}),
     leakScanTexts: context.leakScanTexts,
   });
-  const entries = readRunIndex().filter((e) => entryMatchesVersion(name, version, e.datasetName));
+  const entries = readEvalRunIndex().filter((e) =>
+    entryMatchesVersion(name, version, e.datasetName),
+  );
   const card = renderDatasetCard({
     name,
     version,
@@ -11327,7 +12253,17 @@ async function runDatasetMine(args: ParsedArgs): Promise<void> {
         "  Scan .crewhaus/sessions/*.jsonl (this spec) for hard cases needing NO\n" +
         "  rating — error events, tool_result isError spikes, the synthetic\n" +
         "  '[runtime] possible loop detected' nudge, consecutive near-duplicate\n" +
-        "  user retries — plus egress_decision blocks from .crewhaus/audit (if any).\n" +
+        "  user retries — plus egress_decision blocks from .crewhaus/audit (if any),\n" +
+        "  plus (D45) in-loop `eval_graded` FAILURES from each session's trace sidecar\n" +
+        "  (<id>.events.jsonl): the spec's own evaluation: judge already scored that\n" +
+        "  production turn below its threshold, so it is a hard case with zero human\n" +
+        "  effort. This signal is OPT-IN: the sidecar is written only when the run had\n" +
+        "  CREWHAUS_WATCHME=1 set, so a harness with evaluation: configured and watchme\n" +
+        "  off yields zero eval-fail candidates (the run prints how many scanned\n" +
+        "  sessions carried a sidecar). A turn that failed and then PASSED on an\n" +
+        "  on_fail: retry rung is not harvested; one whose retryIndex reached the\n" +
+        "  block's max_retries and still failed is flagged eval_retries_exhausted\n" +
+        "  (eval_retried marks the weaker 'a retry ran and still failed').\n" +
         "  Each triggering turn's input becomes a candidate Sample in a QUARANTINE\n" +
         "  staging file (.crewhaus/datasets/_quarantine/<spec>-hardcases.jsonl).\n" +
         "  Candidate text (input + reason) is PII/secret-redacted before it is\n" +
@@ -11358,7 +12294,24 @@ async function runDatasetMine(args: ParsedArgs): Promise<void> {
   const ids = sessionsWanted === "all" ? allIds : allIds.slice(0, sessionsWanted);
 
   const raw: MineCandidate[] = [];
-  for (const id of ids) raw.push(...mineSession(id, readSessionEvents(id)));
+  // D45 — the in-loop `eval_graded` signal lives on the session's persisted
+  // TRACE sidecar (`<id>.events.jsonl`), not the durable transcript; absent
+  // sidecar ⇒ empty list ⇒ exactly the pre-D45 signal set.
+  let sessionsWithSidecar = 0;
+  for (const id of ids) {
+    const traceEvents = readSessionTraceEvents(id);
+    if (traceEvents.length > 0) sessionsWithSidecar += 1;
+    raw.push(...mineSession(id, readSessionEvents(id), traceEvents));
+  }
+  // The sidecar is written ONLY under CREWHAUS_WATCHME=1, and
+  // readSessionTraceEvents degrades to [] in silence — so without this line a
+  // team with `evaluation:` configured and watchme off reads "no eval-fail
+  // candidates" as "my harness has none". Say which it is.
+  if (ids.length > 0 && sessionsWithSidecar === 0) {
+    process.stdout.write(
+      `[dataset mine] ${ids.length} session(s) scanned, 0 with a trace sidecar — set CREWHAUS_WATCHME=1 to capture in-loop eval_graded verdicts (D45 signal unavailable)\n`,
+    );
+  }
 
   // Egress blocks from the audit log (may be empty — no writer yet). Attach
   // each to the most-recent turn input of its named session when known.
@@ -11717,7 +12670,7 @@ async function runRefreshGoldens(args: ParsedArgs): Promise<void> {
   // runs for the cwd spec (best-effort; unreadable runs are skipped).
   const specName = cwdSpecName();
   const runOutcomes: RunSampleOutcome[][] = [];
-  const runEntries = readRunIndex().filter(
+  const runEntries = readEvalRunIndex().filter(
     (e) => specName === undefined || e.specName === specName,
   );
   for (const entry of runEntries.slice(-10)) {
@@ -12342,8 +13295,9 @@ async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
       }
     }
     const file = buildCalibrationFile(existing, card, new Date().toISOString());
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, `${JSON.stringify(file, null, 2)}\n`);
+    // Atomic (temp file + rename): the eval runner reads this file to gate
+    // llm_judge graders, and a torn read silently mis-gates a whole run.
+    writeCalibrationFileAtomic(path, file);
     const cut = card.recommendedCut?.cut ?? DEFAULT_JUDGE_CUT;
     process.stdout.write(
       `[judge calibrate] wrote calibrated --min-score ${cut.toFixed(3)} for "${specName ?? "default"}" → ${path}\n`,
@@ -13027,6 +13981,22 @@ function readSessionEvents(session: string): Array<{ kind?: string; payload?: un
     kind?: string;
     payload?: unknown;
   }>;
+}
+
+/**
+ * D45 — a session's persisted TRACE events (`<id>.events.jsonl` beside the
+ * transcript, the same sidecar `sessions export` reads for its reward
+ * ladder). Missing/torn files degrade to an empty list: the trace sidecar is
+ * optional, and no consumer may fail because a run never wrote one.
+ */
+function readSessionTraceEvents(session: string): unknown[] {
+  const file = `${sessionJsonlPath(session).slice(0, -".jsonl".length)}.events.jsonl`;
+  if (!existsSync(file)) return [];
+  try {
+    return parseJsonlLoose(readFileSync(file, "utf-8"));
+  } catch {
+    return [];
+  }
 }
 
 function strFlag(args: ParsedArgs, name: string): string | undefined {
@@ -14595,7 +15565,9 @@ async function runGradersSuggest(args: ParsedArgs): Promise<void> {
   if (selector.kind === "dir") {
     runDirs = [resolve(selector.dir)];
   } else {
-    const entries = readRunIndex().filter((e) => specName === undefined || e.specName === specName);
+    const entries = readEvalRunIndex().filter(
+      (e) => specName === undefined || e.specName === specName,
+    );
     runDirs = entries.slice(-selector.n).map((e) => e.outDir);
   }
 
@@ -15208,7 +16180,7 @@ async function runFleet(args: ParsedArgs, action: string): Promise<void> {
   // Eval-index reader: the harness's `.crewhaus/evals/index.jsonl`, mapped to
   // the minimal shape the fleet row needs.
   const readEvalIndex: BuildInventoryDeps["readEvalIndex"] = (evalsDir): LastEvalEntry[] =>
-    readRunIndex(evalsDir).map((e) => ({
+    readEvalRunIndex(evalsDir).map((e) => ({
       datasetName: e.datasetName,
       passRate: e.passRate,
       ts: e.ts,
@@ -15229,7 +16201,7 @@ async function runFleet(args: ParsedArgs, action: string): Promise<void> {
       // fresh harness isn't "attention"); a last run below the pinned
       // baseline → attention.
       const readEvalHealth: EvalHealthReader = (evalsDir) => {
-        const runs = readRunIndex(evalsDir);
+        const runs = readEvalRunIndex(evalsDir);
         if (runs.length === 0) return { healthy: true, note: "no runs recorded" };
         const baselines = readBaselines(evalsDir);
         const baselineList = Object.values(baselines);
@@ -16571,6 +17543,8 @@ async function runDeployCanary(args: ParsedArgs): Promise<void> {
       dataset: { name: datasetName, samples: makeAsyncIterable(sharedSamples) },
       compiledGraders: compiled,
       opts: {
+        // C33 — which CLI produced this run (reproducibility manifest).
+        ...cliVersionOpt(),
         datasetHash,
         ...(concurrency !== undefined ? { concurrency } : {}),
         ...(seed !== undefined ? { seed } : {}),
@@ -20669,6 +21643,11 @@ switch (subcommand) {
         if (err instanceof CrewhausError) die(err.message);
         throw err;
       }
+      // C28 — `eval plan`: pure sample-size arithmetic. Guarded by the same
+      // is-it-a-spec-file test the read aliases use, so a spec literally
+      // named `plan.yaml` still runs an eval.
+    } else if (evalFirst === "plan" && !isSpecFile(evalFirst)) {
+      runEvalPlanCmd(parseFor(rest.slice(1), EVAL_PLAN_SCHEMA));
     } else if (aliasVerb !== undefined && !isSpecFile(evalFirst)) {
       process.stderr.write(
         `[eval] note: \`crewhaus eval ${evalFirst}\` is an alias for the canonical \`crewhaus eval-report ${aliasVerb}\`\n`,
@@ -20682,6 +21661,23 @@ switch (subcommand) {
   case "eval-report":
     await runEvalReport(parseFor(rest, EVAL_REPORT_SCHEMA));
     break;
+  // D41 — `crewhaus schedule generate --for … [--runner …]`: print
+  // ready-to-install scheduling text (a shim — it installs nothing).
+  case "schedule": {
+    const action = rest[0] ?? "";
+    // `crewhaus schedule --help` (and bare `crewhaus schedule`) route to the
+    // usage block, like every other multi-action verb — dying with
+    // `action must be "generate" (got "--help")` teaches nothing.
+    if (action === "" || action.startsWith("-")) {
+      runScheduleGenerate({ positional: [], flags: { help: true } });
+      break;
+    }
+    if (action !== "generate") {
+      die(`schedule action must be "generate" (got "${action}")`);
+    }
+    runScheduleGenerate(parseFor(rest.slice(1), SCHEDULE_SCHEMA));
+    break;
+  }
   case "optimize":
     await runOptimize(parseFor(rest, OPTIMIZE_SCHEMA));
     break;

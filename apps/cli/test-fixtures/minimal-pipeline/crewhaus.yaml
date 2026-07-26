@@ -1,0 +1,15 @@
+name: mini-rag
+target: pipeline
+agent:
+  model: claude-sonnet-4-6
+  instructions: Answer using Retrieve.
+retrieve:
+  embedderModel: mock/deterministic
+  vectorBackend: in-memory
+indexing:
+  chunkStrategy: fixed
+  chunkSize: 200
+  chunkOverlap: 0
+  documents:
+    - id: doc-1
+      text: the quick brown fox jumps over the lazy dog

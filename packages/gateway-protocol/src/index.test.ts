@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   ErrorCode,
   GatewayProtocolError,
+  MAX_FEEDBACK_TEXT,
   Method,
   PROTOCOL_VERSION,
   RequestEnvelope,
@@ -154,6 +155,7 @@ describe("decodeRequest accepts every declared method", () => {
     ["sessions.list", {}],
     ["sessions.fork", { sessionId: "sess", atEventTs: 0 }],
     ["audit.tail", { tenantId: "t1" }],
+    ["feedback.submit", { sessionId: "sess_00000000000000aa", turnNumber: 1, thumbs: "up" }],
   ];
   for (const [method, params] of cases) {
     test(`decodes ${method}`, () => {
@@ -315,5 +317,44 @@ describe("GatewayProtocolError", () => {
     const err = new GatewayProtocolError("solo");
     expect(err.cause).toBeUndefined();
     expect(err.code).toBe("config");
+  });
+});
+
+describe("feedback.submit param grammar", () => {
+  const envelope = (params: unknown): unknown => ({
+    protocol: "crewhaus.v1",
+    id: "id",
+    method: "feedback.submit",
+    params,
+  });
+  const VALID_SESSION = "sess_00000000000000aa";
+
+  test("refuses a session id outside the store's grammar", () => {
+    // Accepting it would write a durable line every reader silently drops
+    // (isFeedbackRecord pins the same regex), and the managed daemon
+    // interpolates the id into a filesystem path.
+    for (const bad of ["sess_1", "sess_00000000000000AA", "../../etc/passwd", "run_abcdef"]) {
+      expect(() =>
+        decodeRequest(envelope({ sessionId: bad, turnNumber: 1, thumbs: "up" })),
+      ).toThrow(GatewayProtocolError);
+    }
+  });
+
+  test("refuses oversize free text instead of silently truncating it", () => {
+    const tooLong = "x".repeat(MAX_FEEDBACK_TEXT + 1);
+    for (const field of ["comment", "correction", "rater"] as const) {
+      expect(() =>
+        decodeRequest(
+          envelope({ sessionId: VALID_SESSION, turnNumber: 1, thumbs: "up", [field]: tooLong }),
+        ),
+      ).toThrow(GatewayProtocolError);
+    }
+    // Exactly at the bound still passes.
+    const atBound = "x".repeat(MAX_FEEDBACK_TEXT);
+    expect(() =>
+      decodeRequest(
+        envelope({ sessionId: VALID_SESSION, turnNumber: 1, thumbs: "up", comment: atBound }),
+      ),
+    ).not.toThrow();
   });
 });

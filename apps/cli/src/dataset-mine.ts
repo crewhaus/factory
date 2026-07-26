@@ -12,6 +12,11 @@
  *   - consecutive near-duplicate user_message retries — the user re-asking
  *     the same thing because the answer was bad.
  *   - `egress_decision` audit blocks (when the audit log carries them).
+ *   - D45: in-loop `eval_graded` FAILURES — the `evaluation:` block's own
+ *     judge already scored a real production turn below its threshold, so
+ *     the turn is a hard case with zero human involvement. Read from the
+ *     session's persisted TRACE sidecar (`<id>.events.jsonl`), since the
+ *     durable event log carries no `eval_graded` kind.
  * Each signal's TRIGGERING turn input becomes a candidate Sample in a
  * QUARANTINE staging dataset; `--review` promotes accepted candidates into a
  * mined dataset version. Provenance lands in `metadata` (source:
@@ -30,7 +35,6 @@
  * `apps/cli/src/index.ts`.
  */
 import type { Sample } from "@crewhaus/eval-dataset";
-import { DEFAULT_PII_DETECTORS, type PiiDetector } from "@crewhaus/pii-redactor";
 import { REGEX_RULES } from "@crewhaus/prompt-injection-detector";
 import type { LoggedEvent } from "./feedback";
 import { normalizeEvidenceTokens } from "./graders-suggest";
@@ -41,8 +45,10 @@ export class DatasetMineError extends Error {
   override readonly name = "DatasetMineError";
 }
 
-/** The negative signals `mine` recognizes. */
-export type MineSignal = "tool-error" | "error" | "loop" | "retry" | "egress-block";
+/** The negative signals `mine` recognizes. `eval-fail` (D45) is sourced from
+ *  the runtime's in-loop `eval_graded` trace events, not the session log —
+ *  see {@link mineSession}'s `traceEvents` argument. */
+export type MineSignal = "tool-error" | "error" | "loop" | "retry" | "egress-block" | "eval-fail";
 
 /** One mined candidate: the triggering turn's input plus its provenance. */
 export type MineCandidate = {
@@ -54,6 +60,32 @@ export type MineCandidate = {
   readonly signal: MineSignal;
   /** A short human-readable reason for the review UI. */
   readonly reason: string;
+  /**
+   * D45 — the in-loop judge's own numbers, present only on `eval-fail`
+   * candidates. They ride into the quarantine Sample's metadata so a
+   * reviewer sees WHY the production judge failed the turn (and whether the
+   * `on_fail: retry` ladder was already spent) without re-running anything.
+   */
+  readonly evalGraded?: {
+    readonly score: number;
+    readonly threshold: number;
+    readonly graderType?: string;
+    /** The retry ordinal of the FAILING event (0 = the original turn). */
+    readonly retryIndex: number;
+    /** True when at least one `on_fail: retry` rung ran and the highest-index
+     *  grade STILL failed. Says nothing about whether the ladder was spent —
+     *  a run cut short by budget/halt/an abort looks identical from here. */
+    readonly retriedAndStillFailed: boolean;
+    /**
+     * True only when the ladder was demonstrably SPENT: the event carried the
+     * block's `max_retries` and the failing grade sits at or past it. The
+     * strongest zero-human negative signal the runtime produces — and the one
+     * D45 promises "extra weight" for, so it must not be inferred from
+     * `retryIndex > 0` alone (a ladder stopped at rung 1 of 3 is not spent).
+     * False whenever the cap is unknown (pre-`maxRetries` sidecars).
+     */
+    readonly retriesExhausted: boolean;
+  };
 };
 
 /** The loop-nudge sentinel the runtime injects as a synthetic user_message. */
@@ -69,42 +101,16 @@ export const RETRY_SIMILARITY = 0.6;
 // -------- secret / API-key redaction (synthesize) --------
 
 /**
- * A `synthesize` source sample is real production input and may carry a
- * pasted credential (an API key dropped into a bug report, a Slack bot token
- * quoted in a support transcript, …). `@crewhaus/pii-redactor`'s
- * `DEFAULT_PII_DETECTORS` only covers SSN/credit-card/phone/email/IBAN, so a
- * secret would otherwise survive redaction into every synthesized variant AND
- * the model paraphrase prompt.
- *
- * Token shapes below are the SAME patterns already used for credential
- * masking elsewhere in the repo (`packages/ir/src/redact.ts` /
- * `packages/spec-patch/src/redact.ts` `TOKEN_SHAPE_RES` / `BEARER_RE` /
- * `CONTEXTUAL_OPAQUE_RE`) — reused here rather than reinvented so the whole
- * codebase agrees on what a "credential-shaped token" looks like:
- *   - `sk-…`            OpenAI/Anthropic/Stripe-style secret keys
- *   - `gh[oprsu]_…`      GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_)
- *   - `xox[abprs]-…`     Slack tokens
- *   - `AKIA…`            AWS access key ids
- *   - `Bearer <token>`   bearer auth headers pasted into prose
- *   - a 32+ char opaque token preceded by key/token/secret/password/
- *     credential context (so ordinary long ids/hashes in prose survive)
- *
- * A single `PiiDetector` combining all of the above via alternation, given
- * `detectPii`/`PiiRedactor` only accept one `regex` per detector kind.
+ * D39 — the credential-shaped-token detector and the full ingestion detector
+ * set MOVED to `@crewhaus/feedback-distill` (`redact.ts`), so the unattended
+ * daemon janitor step redacts exactly what `mine`/`synthesize`/`distill` do.
+ * Re-exported under their historical names: `SYNTHESIZE_PII_DETECTORS` is the
+ * package's `INGESTION_PII_DETECTORS`, unchanged byte for byte.
  */
-export const SECRET_KEY_DETECTOR: PiiDetector = {
-  kind: "secret",
-  regex:
-    /\bsk-[A-Za-z0-9_-]{8,}\b|\bgh[oprsu]_[A-Za-z0-9]{16,}\b|\bxox[abprs]-[A-Za-z0-9-]{10,}\b|\bAKIA[A-Z0-9]{12,}\b|\bbearer\s+[A-Za-z0-9._~+/-]{8,}=*|\b(?:api[-_ ]?)?(?:key|token|secret|password|credential)s?\b["'\s:=-]{0,5}[A-Za-z0-9+/_-]{32,}/gi,
-};
-
-/** `synthesize`'s full detector set: the shared PII defaults plus the
- *  secret/API-key detector above. Exported so the CLI and tests share one
- *  source of truth for "what synthesize redacts before mutation/model use". */
-export const SYNTHESIZE_PII_DETECTORS: ReadonlyArray<PiiDetector> = [
-  ...DEFAULT_PII_DETECTORS,
+export {
   SECRET_KEY_DETECTOR,
-];
+  INGESTION_PII_DETECTORS as SYNTHESIZE_PII_DETECTORS,
+} from "@crewhaus/feedback-distill";
 
 // -------- turn-aware session scan --------
 
@@ -179,6 +185,7 @@ function jaccard(a: ReadonlySet<string>, b: ReadonlySet<string>): number {
 export function mineSession(
   sessionId: string,
   events: ReadonlyArray<LoggedEvent>,
+  traceEvents: ReadonlyArray<unknown> = [],
 ): MineCandidate[] {
   const candidates: MineCandidate[] = [];
   const emitted = new Set<string>(); // `${turn}:${signal}`
@@ -188,13 +195,22 @@ export function mineSession(
   let prevTurnTokens: Set<string> | undefined;
   let prevTurnNumber = 0;
   let prevTurnInput = "";
+  /** D45 — turn ordinal → prompt, so an out-of-band trace event can be
+   *  attributed to the exact turn it graded. */
+  const turnInputs = new Map<number, string>();
 
-  const emit = (signal: MineSignal, reason: string, turn: number, input: string): void => {
+  const emit = (
+    signal: MineSignal,
+    reason: string,
+    turn: number,
+    input: string,
+    extra?: Pick<MineCandidate, "evalGraded">,
+  ): void => {
     if (turn < 1 || input.trim() === "") return;
     const key = `${turn}:${signal}`;
     if (emitted.has(key)) return;
     emitted.add(key);
-    candidates.push({ sessionId, turnNumber: turn, input, signal, reason });
+    candidates.push({ sessionId, turnNumber: turn, input, signal, reason, ...extra });
   };
 
   for (const ev of events) {
@@ -217,6 +233,7 @@ export function mineSession(
         }
         turnNumber += 1;
         currentInput = text;
+        turnInputs.set(turnNumber, text);
         toolErrorRun = 0;
         prevTurnTokens = tokens;
         prevTurnNumber = turnNumber;
@@ -250,7 +267,171 @@ export function mineSession(
       );
     }
   }
+
+  // D45 — in-loop `eval_graded` FAILURES. The runtime's `evaluation:` block
+  // scores every assistant turn and publishes the verdict on the TRACE bus
+  // (the durable event log carries no `eval_graded` kind), so the signal is
+  // read from the session's persisted trace sidecar rather than the
+  // transcript. Both carriers are accepted: the flat trace shape
+  // (`{kind, score, threshold, verdict, turnNumber}`) and an event-log-style
+  // envelope (`{kind, payload:{…}}`), mirroring sessions-export's reward
+  // ladder, so a future durable mirror needs no change here.
+  //
+  // ATTRIBUTION: the envelope's `turnNumber` is `runContext.turnNumber`, a
+  // PER-runChatLoop counter that starts at 0 and is never restored from
+  // `lastTurnIndex`. A channel daemon builds a fresh RunContext per inbound
+  // message, so every turn of a multi-turn channel session publishes
+  // `turnNumber: 1`; a resumed CLI session restarts at 1 too. Joining on it
+  // would attach turn 7's judge numbers to turn 1's prompt. The stable key is
+  // the ORDER of `turn_start` events in the sidecar: the k-th `turn_start` is
+  // the k-th transcript turn on every shape and across resumes.
+  for (const [turn, graded] of failedEvalGradesByTurn(traceEvents, sessionId, turnNumber)) {
+    const input = turnInputs.get(turn) ?? (turn === turnNumber ? currentInput : undefined);
+    if (input === undefined) continue;
+    const ladder = graded.retriesExhausted
+      ? " after the retry ladder was spent"
+      : graded.retriedAndStillFailed
+        ? " after a retry still failed"
+        : "";
+    emit(
+      "eval-fail",
+      `in-loop ${graded.graderType ?? "evaluation"} judge scored ${graded.score.toFixed(2)} < threshold ${graded.threshold}${ladder}`,
+      turn,
+      input,
+      { evalGraded: graded },
+    );
+  }
   return candidates;
+}
+
+/** One `eval_graded` trace record, normalized across the flat and enveloped
+ *  carriers. `undefined` when the value is not a usable eval_graded event. */
+function readEvalGraded(value: unknown):
+  | {
+      readonly turnNumber: number;
+      readonly sessionId?: string;
+      readonly score: number;
+      readonly threshold: number;
+      readonly verdict: string;
+      readonly graderType?: string;
+      readonly retryIndex: number;
+      readonly maxRetries?: number;
+    }
+  | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const top = value as Record<string, unknown>;
+  if (top["kind"] !== "eval_graded") return undefined;
+  const nested = top["payload"];
+  const body: Record<string, unknown> =
+    nested !== null && typeof nested === "object"
+      ? { ...(nested as Record<string, unknown>) }
+      : ({} as Record<string, unknown>);
+  const pick = (key: string): unknown => (body[key] !== undefined ? body[key] : top[key]);
+  const score = pick("score");
+  const threshold = pick("threshold");
+  const turn = pick("turnNumber");
+  if (typeof score !== "number" || !Number.isFinite(score)) return undefined;
+  if (typeof threshold !== "number" || !Number.isFinite(threshold)) return undefined;
+  if (typeof turn !== "number" || !Number.isInteger(turn) || turn < 1) return undefined;
+  const verdictRaw = pick("verdict");
+  const graderType = pick("graderType");
+  const retryIndex = pick("retryIndex");
+  const maxRetries = pick("maxRetries");
+  return {
+    turnNumber: turn,
+    ...(typeof maxRetries === "number" && Number.isInteger(maxRetries) && maxRetries >= 0
+      ? { maxRetries }
+      : {}),
+    ...(typeof pick("sessionId") === "string" ? { sessionId: pick("sessionId") as string } : {}),
+    score,
+    threshold,
+    // Pre-verdict records (or a torn line) fall back to the score/threshold
+    // comparison — the verdict field is a convenience, not the source of truth.
+    verdict: typeof verdictRaw === "string" ? verdictRaw : score >= threshold ? "pass" : "fail",
+    ...(typeof graderType === "string" ? { graderType } : {}),
+    retryIndex: typeof retryIndex === "number" && Number.isInteger(retryIndex) ? retryIndex : 0,
+  };
+}
+
+/** Is this trace record a `turn_start` for `sessionId`? Turn starts are the
+ *  session-stable turn boundaries (see {@link failedEvalGradesByTurn}). */
+function isTurnStart(value: unknown, sessionId: string): boolean {
+  if (value === null || typeof value !== "object") return false;
+  const top = value as Record<string, unknown>;
+  if (top["kind"] !== "turn_start") return false;
+  const sid = top["sessionId"];
+  return typeof sid !== "string" || sid === sessionId;
+}
+
+/**
+ * D45 — the FAILING in-loop grade per turn. A turn that failed and then
+ * PASSED on an `on_fail: retry` rung is not a hard case (the runtime already
+ * recovered), so only turns whose highest-retryIndex grade is a failure are
+ * harvested. Trace records naming a different session are ignored (a shared
+ * sidecar must never cross-attribute).
+ *
+ * TURN KEY. The envelope's `turnNumber` is per-`runChatLoop` and restarts at 1
+ * on every fresh RunContext (a channel daemon makes one per inbound message)
+ * and on every resume, so it is NOT a session-stable ordinal. The ordinal used
+ * here is the count of `turn_start` events seen so far in the sidecar — the
+ * k-th `turn_start` is the k-th transcript turn on every shape. When the
+ * sidecar's boundary count does not match the transcript's turn count the
+ * mapping is unverifiable (capture enabled mid-session, a truncated or foreign
+ * sidecar), so the grades are DROPPED rather than attached to the wrong
+ * prompt. The one exception is a single-turn transcript with no boundaries at
+ * all: there the only possible ordinal is 1, so the flat `turnNumber` carrier
+ * is safe (and pre-`turn_start` fixtures keep working).
+ */
+function failedEvalGradesByTurn(
+  traceEvents: ReadonlyArray<unknown>,
+  sessionId: string,
+  transcriptTurns: number,
+): Array<[number, NonNullable<MineCandidate["evalGraded"]>]> {
+  const boundaries = traceEvents.filter((e) => isTurnStart(e, sessionId)).length;
+  if (boundaries === 0) {
+    // No boundaries: only a single-turn transcript has an unambiguous mapping.
+    if (transcriptTurns !== 1) return [];
+  } else if (boundaries !== transcriptTurns) {
+    return [];
+  }
+
+  const latest = new Map<number, ReturnType<typeof readEvalGraded>>();
+  const sawRetry = new Map<number, boolean>();
+  let ordinal = 0;
+  for (const raw of traceEvents) {
+    if (isTurnStart(raw, sessionId)) {
+      ordinal += 1;
+      continue;
+    }
+    const g = readEvalGraded(raw);
+    if (g === undefined) continue;
+    if (g.sessionId !== undefined && g.sessionId !== sessionId) continue;
+    // With boundaries present the ordinal IS the turn; without them (the
+    // single-turn case guarded above) fall back to the record's own number.
+    const turn = boundaries === 0 ? g.turnNumber : ordinal;
+    if (turn < 1) continue; // a grade published before the first turn_start
+    if (g.retryIndex > 0) sawRetry.set(turn, true);
+    const prev = latest.get(turn);
+    if (prev === undefined || g.retryIndex >= prev.retryIndex) latest.set(turn, g);
+  }
+  const out: Array<[number, NonNullable<MineCandidate["evalGraded"]>]> = [];
+  for (const [turn, g] of [...latest.entries()].sort((a, b) => a[0] - b[0])) {
+    if (g === undefined || g.verdict === "pass") continue;
+    out.push([
+      turn,
+      {
+        score: g.score,
+        threshold: g.threshold,
+        ...(g.graderType !== undefined ? { graderType: g.graderType } : {}),
+        retryIndex: g.retryIndex,
+        retriedAndStillFailed: sawRetry.get(turn) === true,
+        // Only the runtime knows the cap; absent ⇒ exhaustion is UNKNOWN, and
+        // an unknown must never be reported as the strongest signal.
+        retriesExhausted: g.maxRetries !== undefined && g.retryIndex >= g.maxRetries,
+      },
+    ]);
+  }
+  return out;
 }
 
 /** One egress-block audit record, joined to a session if the payload names it. */
@@ -326,6 +507,26 @@ export function candidateToSample(c: MineCandidate, redact?: (text: string) => s
       sessionId: c.sessionId,
       turnNumber: c.turnNumber,
       reason: clean(c.reason),
+      // D45 — the in-loop judge's own numbers survive into the quarantine
+      // sample (numeric/boolean leaves, so the PII walk passes them through
+      // untouched) so a reviewer grades the candidate on the evidence the
+      // production run already paid for.
+      ...(c.evalGraded !== undefined
+        ? {
+            eval_score: c.evalGraded.score,
+            eval_threshold: c.evalGraded.threshold,
+            eval_retry_index: c.evalGraded.retryIndex,
+            // Two distinct facts, deliberately: a retry ran and still failed
+            // vs. the ladder was demonstrably SPENT. Collapsing them
+            // over-claims the strongest signal in the set on every run cut
+            // short by budget/halt/an abort.
+            eval_retried: c.evalGraded.retriedAndStillFailed,
+            eval_retries_exhausted: c.evalGraded.retriesExhausted,
+            ...(c.evalGraded.graderType !== undefined
+              ? { eval_grader_type: c.evalGraded.graderType }
+              : {}),
+          }
+        : {}),
       status: "quarantine",
       note: "mined hard case — review, add an expected_output/expected_tools, then promote",
     },
@@ -335,9 +536,15 @@ export function candidateToSample(c: MineCandidate, redact?: (text: string) => s
 /**
  * Dedupe candidates so a session that struggled the same way twice contributes
  * ONE sample. Keyed by (sessionId, turnNumber, signal); the highest-priority
- * signal survives per (session, turn) when several fired (error > loop >
- * tool-error > retry > egress-block). Returns candidates in a stable order
- * (sessionId, turnNumber, signal-priority) for reproducible datasets.
+ * signal survives per (session, turn) when several fired (error > eval-fail >
+ * loop > tool-error > retry > egress-block). Returns candidates in a stable
+ * order (sessionId, turnNumber, signal-priority) for reproducible datasets.
+ *
+ * D45 — `eval-fail` slots directly below `error`: a crash is still the
+ * loudest signal, but an in-loop judge that scored the REAL production answer
+ * below the bar is a graded verdict on the output itself, which beats the
+ * behavioural proxies (loop / tool-error / retry) below it. The relative
+ * order of the five pre-existing signals is unchanged.
  */
 export function dedupeCandidates(candidates: ReadonlyArray<MineCandidate>): MineCandidate[] {
   const byTurn = new Map<string, MineCandidate>();
@@ -357,7 +564,17 @@ export function dedupeCandidates(candidates: ReadonlyArray<MineCandidate>): Mine
 }
 
 function signalPriority(s: MineSignal): number {
-  return s === "error" ? 0 : s === "loop" ? 1 : s === "tool-error" ? 2 : s === "retry" ? 3 : 4;
+  return s === "error"
+    ? 0
+    : s === "eval-fail"
+      ? 1
+      : s === "loop"
+        ? 2
+        : s === "tool-error"
+          ? 3
+          : s === "retry"
+            ? 4
+            : 5;
 }
 
 // -------- review (accept/reject) --------

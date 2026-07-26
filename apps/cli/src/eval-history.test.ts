@@ -131,6 +131,8 @@ async function finish(
     datasetHash?: string;
     specSource?: string;
     costUsd?: number;
+    agentCostUsd?: number;
+    judgeCostUsd?: number;
     maxP95LatencyMs?: number;
     maxCostUsd?: number;
   } = {},
@@ -147,6 +149,8 @@ async function finish(
     write: ctx.write,
     warn: ctx.warn,
     ...(opts.costUsd !== undefined ? { costUsd: opts.costUsd } : {}),
+    ...(opts.agentCostUsd !== undefined ? { agentCostUsd: opts.agentCostUsd } : {}),
+    ...(opts.judgeCostUsd !== undefined ? { judgeCostUsd: opts.judgeCostUsd } : {}),
     ...(opts.maxP95LatencyMs !== undefined ? { maxP95LatencyMs: opts.maxP95LatencyMs } : {}),
     ...(opts.maxCostUsd !== undefined ? { maxCostUsd: opts.maxCostUsd } : {}),
   });
@@ -716,6 +720,55 @@ describe("finishEvalRun — C30 latency/cost gate thresholds + additive ops fiel
     expect(pin?.costUsd).toBe(1.25);
   });
 
+  test("C35 — the gated cost is the TOTAL, with the halves recorded beside it", async () => {
+    // The failure this closes: a judge-heavy run printed `total=$4.10` and
+    // still passed `--max-cost-usd 2.00`, because the gate only ever saw the
+    // agent half — and history pinned the agent half forever.
+    const ctx = newCtx();
+    // The cost ceiling is checked on the baseline-comparison path, so pin one.
+    const first = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctx, first);
+    const run = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
+    const gated = await finish(ctx, run, {
+      gateRequested: true,
+      costUsd: 4.1,
+      agentCostUsd: 1.8,
+      judgeCostUsd: 2.3,
+      maxCostUsd: 2,
+    });
+    expect(gated.gateFailed).toBe(true);
+    expect(gated.gateReason).toMatch(/\$4\.1000 exceeded --max-cost-usd \$2\.0000/);
+    const entry = readRunIndex(ctx.evalsDir).find((e) => e.runId === "run_bbbb2222bbbb2222");
+    expect(entry?.costUsd).toBe(4.1);
+    expect(entry?.agentCostUsd).toBe(1.8);
+    expect(entry?.judgeCostUsd).toBe(2.3);
+  });
+
+  test("NEW-HUNT-4 — pinning a cassette-REPLAYED run warns at the pin", async () => {
+    const ctx = newCtx();
+    const run = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {
+      toolRecording: { mode: "replay", dir: "/abs/cassette", recordingHash: "h".repeat(64) },
+    });
+    await finish(ctx, run);
+    // Still pinnable (a replayed run is a real, reproducible measurement) —
+    // but never silently: later LIVE runs would be gated against frozen
+    // tool results, and only run.json used to know.
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+    expect(ctx.warnings.join("\n")).toContain("pinning a REPLAYED run");
+    expect(ctx.warnings.join("\n")).toContain("/abs/cassette");
+    // …and the index entry says so too, so `eval-report history` can mark it.
+    expect(readRunIndex(ctx.evalsDir)[0]?.replayed).toBe(true);
+  });
+
+  test("a LIVE run neither warns nor gains the replayed marker", async () => {
+    const ctx = newCtx();
+    const run = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctx, run);
+    expect(ctx.warnings.join("\n")).not.toContain("REPLAYED");
+    const entry = readRunIndex(ctx.evalsDir)[0];
+    expect(entry !== undefined && "replayed" in entry).toBe(false);
+  });
+
   test("unknown cost records no costUsd field (tolerant of absence)", async () => {
     const ctx = newCtx();
     const run = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
@@ -938,6 +991,67 @@ describe("finishEvalRun — partial (budget-exhausted) runs never become baselin
     expect(ctx.lines.join("\n")).toContain(
       "partial run (budget exhausted) — baseline not pinned (new lineage)",
     );
+  });
+});
+
+describe("finishEvalRun — a resumed run never gates against ITSELF (NEW-HUNT-6)", () => {
+  test("the pinned baseline being this very run refuses the comparison, loudly", async () => {
+    const ctx = newCtx();
+    // First run for the pair: interrupted after one of two samples, but not
+    // budget-partial (SIGINT sets no `partial`), so it pins the baseline.
+    const interrupted = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctx, interrupted);
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+
+    // Now resume it: same runId, same outDir, results.json rewritten with the
+    // union. Both sides of the diff would read THAT file.
+    const resumed = makeSummary(
+      "run_aaaa1111aaaa1111",
+      [makeSample("a", true, 1), makeSample("b", false, 0)],
+      interrupted.outDir,
+    );
+    persistRun(resumed);
+    ctx.lines.length = 0;
+    ctx.warnings.length = 0;
+    const result = await finish(ctx, resumed, { gateRequested: true });
+
+    // No fabricated verdict…
+    expect(result.gateFailed).toBe(false);
+    const out = ctx.lines.join("\n");
+    expect(out).not.toContain("vs baseline");
+    expect(out).not.toContain("gate: PASS");
+    expect(out).toContain("self-comparison — not gated, not promoted");
+    // …and a loud explanation naming the run.
+    const warned = ctx.warnings.join("\n");
+    expect(warned).toContain("[eval] warning:");
+    expect(warned).toContain("IS this run (run_aaaa1111aaaa1111)");
+    expect(warned).toContain("start a fresh run");
+    // The run is still recorded in history (the superseding entry).
+    expect(readRunIndex(ctx.evalsDir)).toHaveLength(2);
+  });
+
+  test("a baseline pinned at the SAME directory under another id is caught too", async () => {
+    const ctx = newCtx();
+    const first = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctx, first);
+    // Same outDir, different runId (a hand-edited pin, or a re-run into the
+    // same -o): the diff would still read one file against itself.
+    const sameDir = makeSummary("run_cccc3333cccc3333", [makeSample("a", true, 1)], first.outDir);
+    persistRun(sameDir);
+    ctx.lines.length = 0;
+    const result = await finish(ctx, sameDir, { gateRequested: true });
+    expect(result.gateFailed).toBe(false);
+    expect(ctx.lines.join("\n")).toContain("self-comparison");
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+  });
+
+  test("an ordinary second run into its OWN directory still gates normally", async () => {
+    const ctx = newCtx();
+    await finish(ctx, makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]));
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", false, 0)]);
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result.gateFailed).toBe(true);
+    expect(ctx.lines.join("\n")).toContain("vs baseline run_aaaa1111aaaa1111");
   });
 });
 

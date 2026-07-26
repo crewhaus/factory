@@ -39,6 +39,25 @@ describe("ensureBundleManifest", () => {
     });
   });
 
+  test("a SUBPATH import pins its package, not the subpath", () => {
+    // The bridged eval bundle imports `@crewhaus/target-eval-bundle/runtime`
+    // (the two runtime helpers, without the codegen tree behind the root
+    // entry). The dependency is still the PACKAGE — pinning the subpath, or
+    // dropping it entirely, would leave the emitted manifest uninstallable.
+    const bridged = {
+      path: "agent.ts",
+      content:
+        'import { runEval } from "@crewhaus/eval-runner";\n' +
+        'import { createBridgeInvoker } from "@crewhaus/target-eval-bundle/runtime";\n',
+    };
+    const result = ensureBundleManifest([bridged], tmp);
+    const manifest = JSON.parse(readFileSync(result.path, "utf-8"));
+    expect(manifest.dependencies).toEqual({
+      "@crewhaus/eval-runner": cliVersion(),
+      "@crewhaus/target-eval-bundle": cliVersion(),
+    });
+  });
+
   test("skips when the bundle ships its own package.json (cf-worker flavour)", () => {
     const result = ensureBundleManifest(
       [AGENT, { path: "package.json", content: '{ "name": "emitted-by-target" }' }],

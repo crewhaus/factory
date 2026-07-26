@@ -154,7 +154,16 @@ export type AuditKind =
   // deployment pin — is itself tamper-evidenced. Payload shape (opaque JSON;
   // see the SloMitigationSink the CLI `run` path wires): { sessionId, rung,
   //   breach: { metric, observed, target, detail }, windowMs }.
-  | "slo_mitigation";
+  | "slo_mitigation"
+  // NEW-inloop-coverage — the managed gateway's `feedback.submit` route
+  // appends one record per DURABLE rating write, so the ratings that later
+  // become an `expected_output` in a `<spec>-ratings` dataset are themselves
+  // tamper-evidenced. Distinct from the `gateway_request` entry the server
+  // already appends for every authenticated call (duplicating that kind
+  // would double per-method request counts and read like a replay). Payload
+  // shape (opaque JSON): { tenantId, sessionId, turnNumber, modality,
+  //   recordId } — never the rater's free text.
+  | "feedback_recorded";
 
 export type AuditRecord = {
   readonly ts: number;

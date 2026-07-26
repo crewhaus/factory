@@ -82,11 +82,24 @@ import {
  * Layer F2. Pairs with `target-cli` (mirrors the codegen contract) and
  * `graph-engine` (R11 — runtime).
  */
-export function emitGraph(ir: IrGraphV0, opts: EmitReadmeOptions = {}): Bundle {
+/**
+ * Evals Wave 4, cluster S (D36 + NEW-shape-1) — `emitGraph` options.
+ * `evalEntry: true` (set only by `crewhaus compile --with-eval-harness`)
+ * additionally emits an exported `runForEval(input, opts)` entry that drives
+ * the compiled graph to `run_done` from the given input on the caller's
+ * RunContext (node traces + judge verdicts land on the caller's bus; a HITL
+ * pause fails loudly — approvals cannot resolve headless), returning the
+ * final state JSON — and guards the CLI main with `import.meta.main` so the
+ * eval bundle can import the compiled runtime without running it. Absent
+ * (every existing caller), the emission is byte-identical to before.
+ */
+export type EmitGraphOptions = EmitReadmeOptions & { readonly evalEntry?: boolean };
+
+export function emitGraph(ir: IrGraphV0, opts: EmitGraphOptions = {}): Bundle {
   const files = [
     {
       path: "agent.ts",
-      content: renderAgent(ir),
+      content: renderAgent(ir, opts.evalEntry === true),
     },
   ];
   // Item 42 — generated bundle README; default ON (`crewhaus compile
@@ -641,6 +654,7 @@ function renderNodeBody(
   graphLevelFields: string,
   toolsArrayLiteral: string | undefined,
   nudgeJudges: readonly string[] = [],
+  evalEntry = false,
 ): string {
   const instructionsJs = escapeJsonString(node.instructions);
   const modelJs = escapeJsonString(node.model);
@@ -688,8 +702,21 @@ function renderNodeBody(
       const __nudge = __nudges.length === 0 ? "" : "\\n\\n" + __nudges.join("\\n\\n");`
       : "";
   const instructionsExpr = nudgeJudges.length > 0 ? `${instructionsJs} + __nudge` : instructionsJs;
+  // Cluster S — the eval-entry variant reads THIS invocation's eval seams off
+  // the per-run lookup keyed by the RunContext the caller passed (never a
+  // module-scope mutable, which two concurrent samples would clobber):
+  // `sessionRootDir` re-roots the node's session log into the runner's
+  // per-sample artifact dir, `_adapter` is the scripted-provider test seam.
+  // Empty otherwise, keeping plain bundles byte-identical.
+  const evalSeamBlock = evalEntry
+    ? "\n      const __evalSeam = __evalSeams.get(ctx.runContext);"
+    : "";
+  const evalAdapterLine = evalEntry
+    ? "\n        ...(__evalSeam?.sessionRootDir !== undefined ? { sessionRootDir: __evalSeam.sessionRootDir } : {})," +
+      "\n        ...(__evalSeam?._adapter !== undefined ? { _adapter: __evalSeam._adapter } : {}),"
+    : "";
   return `
-    async (ctx, prev) => {${hitlPreBlock}${nudgeBlock}
+    async (ctx, prev) => {${evalSeamBlock}${hitlPreBlock}${nudgeBlock}
       const __seed = [
         { role: "user", content: \`Upstream state:\\n\\\`\\\`\\\`json\\n\${JSON.stringify(prev, null, 2)}\\n\\\`\\\`\\\`\` },
       ];
@@ -700,7 +727,7 @@ function renderNodeBody(
         sessionTarget: "graph-node",
         seedMessages: __seed,
         singleTurn: true,${renderNodeLoopFields(node)}${toolsField}${graphLevelFields}
-        runContext: ctx.runContext,
+        runContext: ctx.runContext,${evalAdapterLine}
       });
       const __next = { ...prev, [${nameJs}]: __reply };${hitlRecordBlock}
       return __next;
@@ -831,7 +858,7 @@ ${recordReturn("0")}
     }`;
 }
 
-function renderAgent(ir: IrGraphV0): string {
+function renderAgent(ir: IrGraphV0, evalEntry = false): string {
   validateGraph(ir);
 
   // Graph-LEVEL runChatLoop fields, identical in every node's call (the
@@ -879,6 +906,7 @@ function renderAgent(ir: IrGraphV0): string {
             graphLevelFields,
             tools.toolsArrayByNode.get(n.name),
             nudgeJudgesByNode.get(n.name) ?? [],
+            evalEntry,
           );
       const nameJs = escapeJsonString(n.name);
       return isDurable(n)
@@ -973,6 +1001,87 @@ function __durableNode(name: string, fn: NodeFn<unknown>): NodeFn<unknown> {
 }
 `
     : "";
+
+  // Cluster S (D36/NEW-shape-1) — the eval-entry variant: an exported
+  // runForEval that drives the SAME compiled __graph to run_done on the
+  // caller's RunContext, plus the PER-INVOCATION eval seams the node bodies
+  // read (keyed by RunContext), plus the import.meta.main guard so importing
+  // the bundle never runs the CLI. Empty/plain when off (byte-identical).
+  const evalEntryBlock = evalEntry
+    ? `
+/**
+ * Eval bridge (cluster S, D36/NEW-shape-1) — drive the compiled graph to
+ * completion once: \`input\` becomes the graph's entry state (exactly what
+ * main() reads from stdin) and the returned string is the run_done state
+ * JSON — what a deployed run prints. Runs on the caller's RunContext when
+ * supplied, so node traces + judge verdicts land on the caller's bus. A
+ * HITL pause throws: approvals cannot resolve inside a headless eval sample.
+ *
+ * The seams every node body reads — \`sessionRootDir\` (re-roots each node's
+ * session log into the runner's per-sample artifact dir, so the sample's
+ * transcript.jsonl is populated instead of piling up in the process cwd) and
+ * \`_adapter\` (the scripted-provider test path) — hang off THIS invocation's
+ * RunContext rather than a module-scope mutable, so two concurrent samples
+ * (the bundle's default concurrency is 2) each see their own.
+ */
+const __evalSeams = new WeakMap<
+  NonNullable<NonNullable<Parameters<typeof __graph.run>[1]>["runContext"]>,
+  { sessionRootDir?: string; _adapter?: Parameters<typeof runChatLoop>[0]["_adapter"] }
+>();
+export async function runForEval(
+  __evalInput: string,
+  __evalOpts: {
+    runContext?: NonNullable<Parameters<typeof __graph.run>[1]>["runContext"];
+    sessionRootDir?: string;
+    _adapter?: Parameters<typeof runChatLoop>[0]["_adapter"];
+  } = {},
+): Promise<string> {
+  const __evalRunContext = __evalOpts.runContext ?? __runContext;
+  __evalSeams.set(__evalRunContext, {
+    ...(__evalOpts.sessionRootDir !== undefined ? { sessionRootDir: __evalOpts.sessionRootDir } : {}),
+    ...(__evalOpts._adapter !== undefined ? { _adapter: __evalOpts._adapter } : {}),
+  });
+  const stream = __graph.run({ input: __evalInput }, { runContext: __evalRunContext });
+  let __finalState: unknown;
+  let __paused: { nodeName: string; prompt: string } | undefined;
+  for await (const ev of stream) {
+    process.stderr.write(\`[graph] \${JSON.stringify(ev)}\\n\`);
+    if (ev.kind === "hitl_pause") {
+      __paused = { nodeName: ev.nodeName, prompt: ev.prompt };
+    }
+    if (ev.kind === "run_done") {
+      __finalState = ev.state;
+    }
+  }
+  if (__paused !== undefined) {
+    throw new Error(\`graph paused for HITL approval at node "\${__paused.nodeName}" ("\${__paused.prompt}") — HITL gates cannot resolve inside a headless eval sample; remove hitl: from the node or eval a non-gated path\`);
+  }
+  if (__finalState === undefined) {
+    throw new Error("graph run ended without a run_done event — nothing to grade");
+  }
+  return JSON.stringify(__finalState, null, 2);
+}
+`
+    : "";
+  const plainInvocation = `try {
+  await main();
+} catch (__err) {
+  // v0.3.0 Goal 6 — render the ONE structured failure report (a classified
+  // RunFailedError — e.g. the engine's G69 parallel-merge collision —
+  // carries its own report; anything else synthesizes the generic one) and
+  // exit with its coded status instead of an unhandled Bun stack.
+  const __report = toFailureReport(__err);
+  process.stderr.write(\`\${formatRunFailure(__report, { prefix: "[graph]" })}\\n\`);
+  process.exit(__report.exitCode);
+}`;
+  const invocationBlock = evalEntry
+    ? `if (import.meta.main) {
+${plainInvocation
+  .split("\n")
+  .map((l) => (l.length > 0 ? `  ${l}` : l))
+  .join("\n")}
+}`
+    : plainInvocation;
 
   return `#!/usr/bin/env bun
 // Generated by crewhaus. DO NOT EDIT.
@@ -1114,17 +1223,7 @@ async function main(): Promise<void> {
     __writePause(pausedAt, lastGraphRunId ?? "?");
   }
 }
-
-try {
-  await main();
-} catch (__err) {
-  // v0.3.0 Goal 6 — render the ONE structured failure report (a classified
-  // RunFailedError — e.g. the engine's G69 parallel-merge collision —
-  // carries its own report; anything else synthesizes the generic one) and
-  // exit with its coded status instead of an unhandled Bun stack.
-  const __report = toFailureReport(__err);
-  process.stderr.write(\`\${formatRunFailure(__report, { prefix: "[graph]" })}\\n\`);
-  process.exit(__report.exitCode);
-}
+${evalEntryBlock}
+${invocationBlock}
 `;
 }

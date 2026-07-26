@@ -2141,3 +2141,90 @@ describe("emitChannelBot — emitted scheduled daemon is syntactically valid TS"
     expect(() => t.transformSync(daemon)).not.toThrow();
   });
 });
+
+describe("emitChannelBot — D39 daemon distill janitor step", () => {
+  const withAutoDistill = (extra: Partial<IrChannelV0> = {}): IrChannelV0 => ({
+    ...MIN_IR,
+    feedback: { modality: "binary", autoDistill: true },
+    ...extra,
+  });
+
+  test("no feedback block → no distill step and the janitor is untouched", () => {
+    const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(daemon).not.toContain("feedback-distill");
+    expect(daemon).not.toContain("__distillStep");
+    expect(daemon).not.toContain("steps:");
+  });
+
+  test("feedback without autoDistill stays byte-identical to the no-feedback daemon", () => {
+    const withReactionsOnly: IrChannelV0 = {
+      ...MIN_IR,
+      feedback: { modality: "binary", channelReactions: true },
+    };
+    const daemon = fileMap(withReactionsOnly).get("daemon.ts") ?? "";
+    expect(daemon).not.toContain("feedback-distill");
+    expect(daemon).not.toContain("__distillStep");
+  });
+
+  test("autoDistill: false is not an opt-in", () => {
+    const off: IrChannelV0 = { ...MIN_IR, feedback: { modality: "binary", autoDistill: false } };
+    expect(fileMap(off).get("daemon.ts") ?? "").not.toContain("__distillStep");
+  });
+
+  test("enabled: false disables the whole contract, autoDistill included", () => {
+    const disabled: IrChannelV0 = {
+      ...MIN_IR,
+      feedback: { modality: "binary", enabled: false, autoDistill: true },
+    };
+    expect(fileMap(disabled).get("daemon.ts") ?? "").not.toContain("__distillStep");
+  });
+
+  test("autoDistill wires createDistillJanitorStep into the existing janitor", () => {
+    const daemon = fileMap(withAutoDistill()).get("daemon.ts") ?? "";
+    expect(daemon).toContain(
+      'import { createDistillJanitorStep } from "@crewhaus/feedback-distill";',
+    );
+    expect(daemon).toContain(
+      'import { createFileBackedRegistry } from "@crewhaus/dataset-registry";',
+    );
+    expect(daemon).toContain("const __distillStep = createDistillJanitorStep({");
+    expect(daemon).toContain('specName: "demo"');
+    expect(daemon).toContain('feedback: {"autoDistill":true}');
+    // Registered through the SAME createJanitor({ steps }) seam as dream.
+    expect(daemon).toContain("steps: [...(__distillStep !== null ? [__distillStep] : [])],");
+    // Registry root matches the CLI's defaultDatasetsRoot convention.
+    expect(daemon).toContain('process.env["CREWHAUS_DATASETS_DIR"]');
+    expect(daemon).toContain('join(__cwd, ".crewhaus", "datasets")');
+    // Idempotency + opt-out are documented in the generated bundle.
+    expect(daemon).toContain("CREWHAUS_AUTODISTILL=0");
+    expect(daemon).toContain(".distill-state.json");
+  });
+
+  test("a dream-less autoDistill daemon registers exactly one step", () => {
+    const daemon = fileMap(withAutoDistill()).get("daemon.ts") ?? "";
+    expect(daemon).not.toContain("__dreamStep");
+    expect((daemon.match(/steps: \[/g) ?? []).length).toBe(1);
+  });
+
+  test("dream + autoDistill register BOTH steps side by side", () => {
+    const both = withAutoDistill({
+      memory: { enabled: true, dream: { everyMs: 86_400_000, mode: "full" } } as never,
+    });
+    const daemon = fileMap(both).get("daemon.ts") ?? "";
+    expect(daemon).toContain("const __dreamStep = createDreamStep();");
+    expect(daemon).toContain("const __distillStep = createDistillJanitorStep({");
+    expect(daemon).toContain(
+      "steps: [...(__dreamStep !== null ? [__dreamStep] : []), ...(__distillStep !== null ? [__distillStep] : [])],",
+    );
+  });
+
+  test("a dream-only daemon keeps its historical single-expression steps field", () => {
+    const dreamOnly: IrChannelV0 = {
+      ...MIN_IR,
+      memory: { enabled: true, dream: { everyMs: 86_400_000, mode: "full" } } as never,
+    };
+    const daemon = fileMap(dreamOnly).get("daemon.ts") ?? "";
+    expect(daemon).toContain("steps: __dreamStep !== null ? [__dreamStep] : [],");
+    expect(daemon).not.toContain("__distillStep");
+  });
+});

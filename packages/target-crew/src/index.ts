@@ -88,7 +88,20 @@ const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
   codegraphImpact: { package: "@crewhaus/tool-codegraph", export: "codegraphImpact" },
 };
 
-export function emitCrew(ir: IrCrewV0, opts: EmitReadmeOptions = {}): Bundle {
+/**
+ * Evals Wave 4, cluster S (D36 + NEW-shape-1) — `emitCrew` options.
+ * `evalEntry: true` (set only by `crewhaus compile --with-eval-harness`)
+ * additionally emits an `eval-entry.ts` file exporting
+ * `runForEval(input, opts)`: one crew run through the SAME compiled
+ * orchestrator + role definitions, with the SAME run options the daemon
+ * assembles (permissions/taxonomy/caps/limits/budget/hooks/MCP/memory),
+ * minus the stdin/stdout framing — the `crew_done` finalOutput is returned
+ * for grading. Purely ADDITIVE: the existing daemon/orchestrator/role files
+ * stay byte-identical with or without the option.
+ */
+export type EmitCrewOptions = EmitReadmeOptions & { readonly evalEntry?: boolean };
+
+export function emitCrew(ir: IrCrewV0, opts: EmitCrewOptions = {}): Bundle {
   if (ir.roles.length === 0) {
     throw new TargetEmitError("crew target requires at least one role");
   }
@@ -105,6 +118,9 @@ export function emitCrew(ir: IrCrewV0, opts: EmitReadmeOptions = {}): Bundle {
     { path: "orchestrator.ts", content: renderOrchestrator(ir, entryRole) },
     { path: "daemon.ts", content: renderDaemon(ir) },
   ];
+  if (opts.evalEntry === true) {
+    files.push({ path: "eval-entry.ts", content: renderEvalEntry(ir) });
+  }
   for (const role of ir.roles) {
     files.push({ path: `agent_${safeFileName(role.name)}.ts`, content: renderRoleAgent(ir, role) });
   }
@@ -791,5 +807,133 @@ main().catch((err) => {
   process.stderr.write(\`\${formatRunFailure(__report, { prefix: "[crew]" })}\\n\`);
   process.exit(__report.exitCode);
 });
+`;
+}
+
+// ---------------------------------------------------------------------------
+// File (cluster S, D36/NEW-shape-1): eval-entry.ts — the eval bridge's
+// runtime entry. Emitted ONLY under `emitCrew(ir, { evalEntry: true })`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Render `eval-entry.ts`: one crew run through the compiled orchestrator +
+ * roles, assembled with the SAME renderers the daemon uses (so the two run-
+ * option sets can never drift), minus the stdin/stdout framing. Each eval
+ * sample is one crew run; the `crew_done` finalOutput is the graded output.
+ * The runner's per-sample `sessionId`/`sessionRootDir` thread into the crew's
+ * own session machinery so the crew transcript lands in the sample artifacts
+ * (crew trace events stay on the orchestrator's internal bus in this slice —
+ * `crew.run` mints its own RunContext).
+ */
+function renderEvalEntry(ir: IrCrewV0): string {
+  const hasRules = ir.permissions.rules.length > 0;
+  const permImport = hasRules
+    ? `import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";\n`
+    : "";
+  const permField = renderPermissionsField(ir);
+  const taxonomyField = renderFailureTaxonomyField(ir);
+  const crewCapsFields = renderCrewCapsFields(ir);
+  const loopLimitsField = renderLoopLimitsField(ir);
+  const budgetField = renderBudgetField(ir);
+  const hooksField = renderHooksField(ir);
+  const fabric = memoryFabric(ir);
+  const mcp = renderMcpServers(ir);
+  const anySubAgents = ir.roles.some((r) => r.subAgents.length > 0);
+  const spawnImport = anySubAgents
+    ? `import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";\n`
+    : "";
+  const spawnField = anySubAgents ? "\n    spawnSubAgent," : "";
+  const toolCatalogImport =
+    mcp.hasAny && fabric.wired
+      ? `import { ToolCatalog, type RegisteredTool } from "@crewhaus/tool-catalog";\n`
+      : mcp.hasAny
+        ? `import { ToolCatalog } from "@crewhaus/tool-catalog";\n`
+        : fabric.wired
+          ? `import type { RegisteredTool } from "@crewhaus/tool-catalog";\n`
+          : "";
+  const mcpImport = mcp.hasAny ? `${mcp.imports.join("\n")}\n` : "";
+  const memImport = fabric.wired
+    ? `import { wireMemory } from "@crewhaus/memory-service";
+import { createSkillTool } from "@crewhaus/skills-registry";
+`
+    : "";
+  const memBoot = fabric.wired
+    ? `
+  // v0.3.0 — the memory fabric, wired ONCE through the stable composition-
+  // root call (design §1 principle 1): roles share the spec-scoped stores;
+  // the orchestrator threads the tools + seams into every role's turn.
+  //
+  // Cluster S (D36/NEW-shape-1) — the fabric roots at the caller's per-sample
+  // directory when one is supplied, so a bridged eval keeps the Pillar-2
+  // isolation invariant: sample N's facts/plan/handoff never leak into sample
+  // N+1, and nothing is written into the operator's working tree.
+  const __memTools: RegisteredTool[] = [];
+  const __memWired = await wireMemory(${fabric.fragmentJson}, {
+    catalog: { register: (t: RegisteredTool) => { __memTools.push(t); } },
+    cwd: __evalOpts.sessionRootDir ?? process.cwd(),
+  });
+  const __skills = __memWired.options.skills ?? [];
+  if (__skills.length > 0) __memTools.push(createSkillTool(__skills));`
+    : "";
+  const extraToolsField =
+    mcp.hasAny && fabric.wired
+      ? "\n    extraTools: [...__mcpTools, ...__memTools],"
+      : mcp.hasAny
+        ? "\n    extraTools: __mcpTools,"
+        : fabric.wired
+          ? "\n    extraTools: __memTools,"
+          : "";
+  const memOptsFields = fabric.wired
+    ? `
+    ...(__memWired.options.memory !== undefined ? { memory: __memWired.options.memory } : {}),
+    ...(__memWired.options.continuity !== undefined ? { continuity: __memWired.options.continuity } : {}),
+    ...(__skills.length > 0 ? { skills: __skills } : {}),`
+    : "";
+  const runBlock = mcp.hasAny
+    ? `  let __final = "";
+  try {
+    for await (const ev of crew.run(input, opts)) {
+      if (ev.kind === "crew_done") __final = ev.finalOutput;
+    }
+  } finally {
+    await mcpHost.disconnectAll().catch(() => {});
+  }
+  return __final;`
+    : `  let __final = "";
+  for await (const ev of crew.run(input, opts)) {
+    if (ev.kind === "crew_done") __final = ev.finalOutput;
+  }
+  return __final;`;
+  return `// Generated by crewhaus. DO NOT EDIT.
+// Source spec: ${escapeJsonString(ir.name)} (target: crew, ir version: ${ir.version}, file: eval-entry.ts — the compile --with-eval-harness bridge entry)
+${permImport}${memImport}${mcpImport}${spawnImport}${toolCatalogImport}import { buildCrew } from "./orchestrator.js";
+
+type __CrewRunOpts = NonNullable<Parameters<ReturnType<typeof buildCrew>["run"]>[1]>;
+
+/**
+ * Eval bridge (cluster S, D36/NEW-shape-1) — run ONE crew turn through the
+ * compiled orchestrator + role definitions with the SAME run options the
+ * daemon assembles, minus the stdin/stdout framing. Each eval sample is one
+ * crew run; the crew_done finalOutput is the graded output. \`sessionId\` /
+ * \`sessionRootDir\` thread into the crew's own session machinery so the crew
+ * transcript lands in the caller's per-sample directory; \`_adapter\` is the
+ * scripted-provider test seam every role turn shares.
+ */
+export async function runForEval(
+  input: string,
+  __evalOpts: {
+    sessionId?: string;
+    sessionRootDir?: string;
+    _adapter?: __CrewRunOpts["_adapter"];
+  } = {},
+): Promise<string> {
+  const crew = buildCrew();${mcp.bootBlock}${memBoot}
+  const opts: __CrewRunOpts = {${permField}${taxonomyField}${crewCapsFields}${loopLimitsField}${budgetField}${hooksField}${spawnField}${extraToolsField}${memOptsFields}
+    ...(__evalOpts.sessionId !== undefined ? { sessionId: __evalOpts.sessionId } : {}),
+    ...(__evalOpts.sessionRootDir !== undefined ? { sessionRootDir: __evalOpts.sessionRootDir } : {}),
+    ...(__evalOpts._adapter !== undefined ? { _adapter: __evalOpts._adapter } : {}),
+  };
+${runBlock}
+}
 `;
 }

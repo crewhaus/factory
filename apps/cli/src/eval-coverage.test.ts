@@ -12,12 +12,16 @@ import { join } from "node:path";
 import {
   type CoverageReport,
   EvalCoverageError,
+  MIN_CRITERION_OBSERVATIONS,
+  type RunGradesText,
   assistantToolNames,
   buildEvalCoverage,
   buildProdBehavior,
   clusterInputs,
   computeCoverage,
+  computeGraderCoverage,
   coverageFileName,
+  coverageGraderSpecOf,
   isMcpTool,
   parseCoverageFormat,
   parseSessionsFlag,
@@ -25,6 +29,7 @@ import {
   renderCoverageHtml,
   renderCoverageJson,
   renderCoverageText,
+  renderGraderCoverageLines,
   splitBigram,
 } from "./eval-coverage";
 import type { LoggedEvent } from "./feedback";
@@ -312,6 +317,209 @@ describe("splitBigram", () => {
   });
 });
 
+describe("D44 — grader coverage", () => {
+  const needsGold = (g: { type: string; registryGrader?: string }): boolean =>
+    g.type === "exact_match" ||
+    g.type === "expected_contains" ||
+    (g.registryGrader ?? "").startsWith("nlg.");
+
+  function grades(
+    entries: ReadonlyArray<{
+      name: string;
+      score: number;
+      detail?: Record<string, number>;
+    }>,
+  ): string {
+    return JSON.stringify({ overall: { passed: true, score: 1 }, perGrader: entries });
+  }
+
+  it("maps a parsed graders.yaml entry to the coverage view (judge criteria included)", () => {
+    expect(
+      coverageGraderSpecOf({
+        name: "quality",
+        type: "llm_judge",
+        rubric: { criteria: [{ name: "grounded" }, { name: "concise" }] },
+      }),
+    ).toEqual({ name: "quality", type: "llm_judge", criteria: ["grounded", "concise"] });
+    expect(
+      coverageGraderSpecOf({
+        name: "cls",
+        type: "llm_judge",
+        rubric: { kind: "categorical", labels: [{ name: "good" }, { name: "bad" }] },
+      }).criteria,
+    ).toEqual(["good", "bad"]);
+    expect(
+      coverageGraderSpecOf({ name: "r", type: "registry", grader: "nlg.rougeL", opts: {} }),
+    ).toEqual({ name: "r", type: "registry", registryGrader: "nlg.rougeL" });
+    expect(coverageGraderSpecOf({ name: "c", type: "contains" })).toEqual({
+      name: "c",
+      type: "contains",
+    });
+  });
+
+  it("reports gold-needing graders against gold-less samples", () => {
+    const report = computeGraderCoverage({
+      graders: [
+        { name: "exact", type: "exact_match" },
+        { name: "sub", type: "contains" },
+      ],
+      samples: [
+        { id: "s1", input: "a", expected_output: "gold" } as never,
+        { id: "s2", input: "b" } as never,
+        { id: "s3", input: "c", expected_output: "   " } as never,
+      ],
+      needsGold,
+    });
+    expect(report.goldlessSampleIds).toEqual(["s2", "s3"]);
+    const exact = report.perGrader.find((g) => g.grader === "exact");
+    expect(exact?.needsGold).toBe(true);
+    expect(exact?.scorable).toBe(1);
+    expect(exact?.unscorableSampleIds).toEqual(["s2", "s3"]);
+    const sub = report.perGrader.find((g) => g.grader === "sub");
+    expect(sub?.needsGold).toBe(false);
+    expect(sub?.scorable).toBe(3);
+    // No runs inspected ⇒ no "never observed" claim (absence of evidence).
+    expect(report.neverObservedGraders).toEqual([]);
+  });
+
+  it("reports which graders actually graded which samples, and which never ran", () => {
+    const run: RunGradesText = {
+      s1: grades([{ name: "quality", score: 0.8 }]),
+      s2: grades([{ name: "quality", score: 0.4 }]),
+    };
+    const report = computeGraderCoverage({
+      graders: [
+        { name: "quality", type: "llm_judge" },
+        { name: "ghost", type: "contains" },
+      ],
+      samples: [{ id: "s1", input: "a" } as never, { id: "s2", input: "b" } as never],
+      runs: [run],
+      needsGold,
+    });
+    expect(report.perGrader.find((g) => g.grader === "quality")?.observedSamples).toBe(2);
+    expect(report.neverObservedGraders).toEqual(["ghost"]);
+    expect(report.runsInspected).toBe(1);
+  });
+
+  it("flags a judge criterion whose score never moves, and spares one that does", () => {
+    const detailA = { grounded: 5, concise: 3 };
+    const detailB = { grounded: 5, concise: 5 };
+    const runs: RunGradesText[] = [
+      { s1: grades([{ name: "q", score: 1, detail: detailA }]) },
+      { s1: grades([{ name: "q", score: 1, detail: detailB }]) },
+      { s2: grades([{ name: "q", score: 1, detail: detailA }]) },
+      { s2: grades([{ name: "q", score: 1, detail: detailB }]) },
+    ];
+    const report = computeGraderCoverage({
+      graders: [{ name: "q", type: "llm_judge", criteria: ["grounded", "concise"] }],
+      samples: [{ id: "s1", input: "a" } as never, { id: "s2", input: "b" } as never],
+      runs,
+      needsGold,
+    });
+    expect(report.deadCriteria.map((d) => d.criterion)).toEqual(["grounded"]);
+    expect(report.deadCriteria[0]?.value).toBe(5);
+    expect(report.deadCriteria[0]?.observations).toBe(4);
+    expect(report.deadCriteria[0]?.grader).toBe("q");
+  });
+
+  it("skips the dead-criterion claim below the observation floor", () => {
+    const report = computeGraderCoverage({
+      graders: [{ name: "q", type: "llm_judge" }],
+      samples: [{ id: "s1", input: "a" } as never],
+      runs: [{ s1: grades([{ name: "q", score: 1, detail: { grounded: 5 } }]) }],
+      needsGold,
+    });
+    expect(report.criterionObservations).toBeLessThan(MIN_CRITERION_OBSERVATIONS);
+    expect(report.deadCriteria).toEqual([]);
+  });
+
+  it("keeps grader/criterion names with separators distinct", () => {
+    const detail = { "is grounded": 5, "is grounded x": 2 };
+    const runs: RunGradesText[] = Array.from({ length: 4 }, (_, i) => ({
+      [`s${i}`]: grades([{ name: "my judge", score: 1, detail }]),
+    }));
+    const report = computeGraderCoverage({
+      graders: [{ name: "my judge", type: "llm_judge" }],
+      samples: Array.from({ length: 4 }, (_, i) => ({ id: `s${i}`, input: "a" }) as never),
+      runs,
+      needsGold,
+    });
+    expect(report.deadCriteria.map((d) => d.criterion).sort()).toEqual([
+      "is grounded",
+      "is grounded x",
+    ]);
+    expect(report.deadCriteria.every((d) => d.grader === "my judge")).toBe(true);
+  });
+
+  it("tolerates torn/empty grades.json without throwing", () => {
+    const report = computeGraderCoverage({
+      graders: [{ name: "q", type: "contains" }],
+      samples: [{ id: "s1", input: "a" } as never],
+      runs: [{ s1: "{not json", s2: "", s3: JSON.stringify({ perGrader: "nope" }) }],
+      needsGold,
+    });
+    expect(report.deadCriteria).toEqual([]);
+    expect(report.perGrader[0]?.observedSamples).toBe(0);
+  });
+
+  it("renders nothing when absent, and a report block when present", () => {
+    expect(renderGraderCoverageLines(undefined)).toEqual([]);
+    const report = computeGraderCoverage({
+      graders: [{ name: "exact", type: "exact_match" }],
+      samples: [{ id: "s1", input: "a" } as never],
+      gradersFile: "eval/graders.yaml",
+      needsGold,
+    });
+    const text = renderGraderCoverageLines(report).join("\n");
+    expect(text).toContain("grader coverage: 1 grader(s) (eval/graders.yaml)");
+    expect(text).toContain("needs expected_output");
+    expect(text).toContain("s1");
+  });
+
+  it("leaves the dataset-side report byte-identical when --graders is absent", () => {
+    const prod = buildProdBehavior([{ sessionId: "sess_1", events: [] }]);
+    const evalCov = buildEvalCoverage([], []);
+    const base = computeCoverage({ prod, evalCov });
+    expect(base.graderCoverage).toBeUndefined();
+    expect(renderCoverageText(base)).toBe(renderCoverageText({ ...base }));
+    expect(JSON.parse(renderCoverageJson(base)).graderCoverage).toBeUndefined();
+  });
+
+  // The byte-identity claim is stated in the module doc, in `--help`, and at
+  // both renderers; the HTML path is the one that can quietly break it,
+  // because the section slot and its CSS rule live in a template literal.
+  it("HTML: no graderCoverage ⇒ no grader CSS and no stray newline before <script>", () => {
+    const prod = buildProdBehavior([{ sessionId: "sess_1", events: [] }]);
+    const base = computeCoverage({ prod, evalCov: buildEvalCoverage([], []) });
+    const html = renderCoverageHtml(base);
+    expect(html).not.toContain("<h2>Grader coverage</h2>");
+    // The `pre` rule styles ONLY the grader block — shipping it unconditionally
+    // is a rendered-byte difference for every pre-D44 report.
+    expect(html).not.toContain("pre { background:var(--card)");
+    // The themes/grader slots must collapse to nothing: exactly one blank line
+    // between the last emitted element and the script tag.
+    expect(html).toContain("</p>\n\n<script>");
+    expect(html).not.toContain("\n\n\n<script>");
+  });
+
+  it("HTML: with graderCoverage BOTH the section and its CSS rule appear", () => {
+    const prod = buildProdBehavior([{ sessionId: "sess_1", events: [] }]);
+    const withGraders = {
+      ...computeCoverage({ prod, evalCov: buildEvalCoverage([], []) }),
+      graderCoverage: computeGraderCoverage({
+        graders: [{ name: "exact", type: "exact_match" }],
+        samples: [{ id: "s1", input: "a" } as never],
+        gradersFile: "eval/graders.yaml",
+        needsGold,
+      }),
+    };
+    const html = renderCoverageHtml(withGraders);
+    expect(html).toContain("<h2>Grader coverage</h2>");
+    expect(html).toContain("pre { background:var(--card)");
+    expect(html).toContain("</pre>\n<script>");
+  });
+});
+
 // -------- CLI integration (offline — env carries only PATH) --------
 
 const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
@@ -411,6 +619,64 @@ describe("crewhaus eval coverage (CLI, offline)", () => {
     // MCP tool (2 sessions) ranks first.
     expect(json.backlog[0].subject).toBe("mcp__jira__CreateIssue");
     expect(json.backlog[0].kind).toBe("mcp-tool");
+  });
+
+  // D44 — the flag used to parse and do nothing; it now produces a report.
+  it("--graders reports gold-needing graders vs gold-less samples", async () => {
+    const root = newTempRoot();
+    writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);
+    const sessionsDir = join(root, ".crewhaus", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, "sess_00000000000000b1.jsonl"), sessionJsonl([["Read"]]));
+    const evalDir = join(root, "eval");
+    mkdirSync(evalDir, { recursive: true });
+    writeFileSync(
+      join(evalDir, "dataset.jsonl"),
+      `${JSON.stringify({ id: "s1", input: "read the file" })}\n${JSON.stringify({
+        id: "s2",
+        input: "read the other file",
+        expected_output: "done",
+      })}\n`,
+    );
+    writeFileSync(
+      join(evalDir, "graders.yaml"),
+      "graders:\n" +
+        "  - name: exact\n" +
+        "    type: exact_match\n" +
+        "  - name: sub\n" +
+        "    type: contains\n" +
+        "    substring: done\n",
+    );
+
+    const got = await runCli(
+      ["eval", "coverage", "--graders", "eval/graders.yaml", "--format", "json", "-o", "cov"],
+      root,
+    );
+    expect(got.exitCode).toBe(0);
+    const json = JSON.parse(readFileSync(join(root, "cov", "coverage.json"), "utf-8"));
+    expect(json.graderCoverage.graderCount).toBe(2);
+    expect(json.graderCoverage.goldlessSampleIds).toEqual(["s1"]);
+    const exact = json.graderCoverage.perGrader.find(
+      (g: { grader: string }) => g.grader === "exact",
+    );
+    expect(exact.needsGold).toBe(true);
+    expect(exact.scorable).toBe(1);
+    expect(exact.unscorableSampleIds).toEqual(["s1"]);
+    const sub = json.graderCoverage.perGrader.find((g: { grader: string }) => g.grader === "sub");
+    expect(sub.needsGold).toBe(false);
+    expect(sub.scorable).toBe(2);
+  });
+
+  it("without --graders the JSON report carries no graderCoverage key", async () => {
+    const root = newTempRoot();
+    writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);
+    const sessionsDir = join(root, ".crewhaus", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, "sess_00000000000000b2.jsonl"), sessionJsonl([["Read"]]));
+    const got = await runCli(["eval", "coverage", "--format", "json", "-o", "cov"], root);
+    expect(got.exitCode).toBe(0);
+    const text = readFileSync(join(root, "cov", "coverage.json"), "utf-8");
+    expect(text).not.toContain("graderCoverage");
   });
 
   // B16 collateral — coverage is INSPECTION, not consumption: a bare registry
