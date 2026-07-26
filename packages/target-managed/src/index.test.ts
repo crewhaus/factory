@@ -1183,3 +1183,88 @@ describe("emitManaged — prompt-cache rotation persistence (Loop contract 0.4, 
     );
   });
 });
+
+describe("emitManaged — NEW-inloop-coverage: gateway rating capture", () => {
+  const daemonOf = (spec: IrManagedV0): string =>
+    emitManaged(spec).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+
+  test("no feedback block → no capture route, no distill step (byte-identical)", () => {
+    const daemon = daemonOf(ir);
+    expect(daemon).not.toContain("feedback.submit");
+    expect(daemon).not.toContain("feedback-distill");
+    expect(daemon).not.toContain("DISTILL_STEP");
+    expect(daemon).not.toContain("steps:");
+  });
+
+  test("a feedback block wires the feedback.submit route into the gateway handler", () => {
+    const daemon = daemonOf({ ...ir, feedback: { modality: "binary" } });
+    expect(daemon).toContain('if (method === "feedback.submit") {');
+    // Writes the STANDARD record to the sink distill/optimize already read.
+    expect(daemon).toContain(".crewhaus/feedback");
+    expect(daemon).toContain("mode: 0o600");
+    // The record is built by the ONE constructor (clipping/bounds/adjudication
+    // rules), not hand-rolled inline where clipFeedbackText is bypassed.
+    expect(daemon).toContain('import { buildFeedbackRecord } from "@crewhaus/feedback-distill";');
+    expect(daemon).toContain("record = buildFeedbackRecord({");
+    expect(daemon).toContain('source: "ui",');
+    // Provenance is daemon-stamped, never client-supplied.
+    expect(daemon).toContain("ts: new Date().toISOString()");
+    expect(daemon).toContain('randomBytes(6).toString("hex")');
+    // TENANT FENCE — a foreign sessionId can never be rated.
+    expect(daemon).toContain("if (!existsSync(`${tenant.sessionRoot}/${fb.sessionId}.jsonl`)) {");
+    expect(daemon).toContain("feedback.submit only rates your own sessions");
+    // Per-tenant sink file + a DISTINCT audit record (gateway-server already
+    // appended the gateway_request entry for this call).
+    expect(daemon).toContain("${tenant.id}.jsonl");
+    expect(daemon).toContain('kind: "feedback_recorded"');
+    expect(daemon).not.toContain('method: "feedback.submit", tenantId: tenant.id');
+    // Exactly one `randomBytes` import — the unconditional preamble's.
+    expect(daemon.match(/import \{ randomBytes \} from "node:crypto";/g)).toHaveLength(1);
+    // …and the whole module still PARSES as TypeScript (a duplicate binding or
+    // an unbalanced template in the handler is a boot-time SyntaxError that no
+    // amount of string matching would catch).
+    expect(() => new Bun.Transpiler({ loader: "ts" }).scan(daemon)).not.toThrow();
+    // Capture alone does not schedule distillation.
+    expect(daemon).not.toContain("DISTILL_STEP");
+  });
+
+  test("enabled: false disables the whole contract", () => {
+    const daemon = daemonOf({
+      ...ir,
+      feedback: { modality: "binary", enabled: false, autoDistill: true },
+    });
+    expect(daemon).not.toContain("feedback.submit");
+    expect(daemon).not.toContain("DISTILL_STEP");
+  });
+
+  test("autoDistill registers the D39 janitor step beside the gateway route", () => {
+    const daemon = daemonOf({ ...ir, feedback: { modality: "binary", autoDistill: true } });
+    expect(daemon).toContain(
+      'import { createDistillJanitorStep } from "@crewhaus/feedback-distill";',
+    );
+    expect(daemon).toContain("const DISTILL_STEP = createDistillJanitorStep({");
+    expect(daemon).toContain('specName: "hello-managed"');
+    expect(daemon).toContain('feedback: {"autoDistill":true}');
+    expect(daemon).toContain("steps: [...(DISTILL_STEP !== null ? [DISTILL_STEP] : [])],");
+    expect(daemon).toContain("CREWHAUS_AUTODISTILL=0");
+    expect(daemon).toContain(".distill-state.json");
+    // BLOCKER guard: every managed turn runs inside withTenant(), so the
+    // transcripts live under <TENANTS_ROOT>/<tenant>/sessions. Without this
+    // the step reads an empty <cwd>/.crewhaus/sessions, distills 0 samples,
+    // and the watermark marks every submitted rating processed forever.
+    expect(daemon).toContain("tenantsRootDir: TENANTS_ROOT,");
+    expect(() => new Bun.Transpiler({ loader: "ts" }).scan(daemon)).not.toThrow();
+  });
+
+  test("dream + autoDistill register BOTH steps; dream alone keeps its old form", () => {
+    const dream = {
+      ...ir,
+      memory: { enabled: true, dream: { everyMs: 86_400_000, mode: "full" } },
+    } as unknown as IrManagedV0;
+    expect(daemonOf(dream)).toContain("steps: DREAM_STEP !== null ? [DREAM_STEP] : [],");
+    const both = { ...dream, feedback: { modality: "binary", autoDistill: true } } as IrManagedV0;
+    expect(daemonOf(both)).toContain(
+      "steps: [...(DREAM_STEP !== null ? [DREAM_STEP] : []), ...(DISTILL_STEP !== null ? [DISTILL_STEP] : [])],",
+    );
+  });
+});

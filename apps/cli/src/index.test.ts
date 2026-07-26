@@ -2629,7 +2629,15 @@ describe("crewhaus channel provision|verify (item 61)", () => {
   // refuses to boot without, so fixing exactly what it listed still produced
   // a daemon that exited 2.
   test("verify names EVERY env var the daemon boots on, not just the probeable ones", async () => {
-    const result = await runCli(["channel", "verify", CHANNEL_SPEC]);
+    // The spawned CLI runs with cwd=REPO_ROOT, and Bun auto-loads that
+    // directory's `.env` into the child's process.env — a developer checkout
+    // with a real ANTHROPIC_API_KEY made the provider-credential check PASS
+    // and this assertion read "8 check(s), 7 failed" locally while CI (no
+    // .env) stayed green. Explicit empties win: dotenv never overrides an
+    // already-present variable, and the check treats "" as unset.
+    const result = await runCli(["channel", "verify", CHANNEL_SPEC], {
+      env: { ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "" },
+    });
     expect(result.exitCode).toBe(1);
     for (const name of [
       "$SLACK_BOT_TOKEN",

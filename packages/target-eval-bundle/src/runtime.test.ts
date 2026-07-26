@@ -164,23 +164,38 @@ describe("guardHistorySamples — the load-time history gate", () => {
     expect(out).toEqual(list);
   });
 
-  test("rejects a history-carrying sample against a non-chat shape, loudly", async () => {
+  test("rejects a history-carrying sample against an entry-driven non-chat shape, loudly", async () => {
     const list: BridgeSample[] = [
       { id: "ok", input: "1" },
       { id: "multi", input: "2", history: [{ role: "user", content: "hi" }] },
     ];
-    const iter = guardHistorySamples(samples(list), {
+    const bridge = {
       sourceTarget: "graph",
       chatCapable: false,
-    });
-    await expect(collect(iter)).rejects.toThrow(EvalBridgeRuntimeError);
-    const iter2 = guardHistorySamples(samples(list), {
-      sourceTarget: "graph",
-      chatCapable: false,
-    });
-    await expect(collect(iter2)).rejects.toThrow(
-      /sample "multi" carries a multi-turn history.*target: graph.*not chat-capable/,
+      entryImport: "../agent.ts",
+    } as const;
+    await expect(collect(guardHistorySamples(samples(list), bridge))).rejects.toThrow(
+      EvalBridgeRuntimeError,
     );
+    await expect(collect(guardHistorySamples(samples(list), bridge))).rejects.toThrow(
+      /sample "multi" carries a multi-turn history.*target: graph.*compiled runtime entry \(\.\.\/agent\.ts\)/,
+    );
+  });
+
+  test("an ENTRY-LESS bridge keeps its history samples (the default invoker seeds them)", async () => {
+    // research / browser / onchain / onchain-game / batch / voice bridge to the
+    // eval-runner's DEFAULT single-turn invoker, which is itself a chat loop
+    // and seeds `history` natively (Wave-3 B14). Rejecting here would revoke a
+    // shipped capability for no runtime reason.
+    const list: BridgeSample[] = [
+      { id: "multi", input: "2", history: [{ role: "user", content: "hi" }] },
+    ];
+    for (const sourceTarget of ["research", "browser", "onchain", "batch"]) {
+      const out = await collect(
+        guardHistorySamples(samples(list), { sourceTarget, chatCapable: false }),
+      );
+      expect(out).toEqual(list);
+    }
   });
 
   test("chat-capable shapes keep their history samples", async () => {

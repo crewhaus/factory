@@ -93,8 +93,10 @@ describe("eval bridge smoke — workflow (workflow-run)", () => {
     const evalAgent = readFileSync(join(out, "eval", "agent.ts"), "utf-8");
     expect(evalAgent).toContain('import * as __entry from "../agent.ts";');
     expect(evalAgent).toContain(
-      'const BRIDGE = { sourceTarget: "workflow", kind: "workflow-run", chatCapable: false } as const;',
+      'const BRIDGE = { sourceTarget: "workflow", kind: "workflow-run", chatCapable: false, entryImport: "../agent.ts" } as const;',
     );
+    // Run identity tracks the DRIVEN stages, not just the stage count.
+    expect(evalAgent).toMatch(/step digest: [0-9a-f]{16} /);
     expect(evalAgent).toContain("invoker: __invoker,");
     // The primary bundle exports the entry AND keeps its CLI guarded.
     const agent = readFileSync(join(out, "agent.ts"), "utf-8");
@@ -112,6 +114,11 @@ describe("eval bridge smoke — workflow (workflow-run)", () => {
     // Full runEval through the bridge invoker: graded + artifacts persisted.
     expect(r["passRate"]).toBe(1);
     expect(r["persistedModelResponses"]).toBe(2);
+    // An exported CREWHAUS_RUN_ID must not make samples dedup against each
+    // other: the SECOND invocation under a pinned run id still runs both
+    // steps and returns its own output, not the first invocation's.
+    expect(r["pinnedRunIdSecondModelResponses"]).toBe(2);
+    expect(String(r["pinnedRunIdSecondOutput"])).toContain("second:");
   }, 240_000);
 });
 
@@ -123,6 +130,12 @@ describe("eval bridge smoke — graph (graph-run)", () => {
     expect(String(state["plan"])).toContain("node:");
     expect(String(state["answer"])).toContain("node:");
     expect(r["modelResponses"]).toBe(2);
+    // The node session log lands in the caller's per-sample dir — the file
+    // runSample reads to build transcript.jsonl (turns, tool-call accuracy and
+    // Wave-2 `target: transcript` judges all depend on it) — and NOT in the
+    // operator's working directory.
+    expect(r["sampleSessionLogs"]).toBeGreaterThan(0);
+    expect(r["cwdSessionsAdded"]).toBe(0);
   }, 240_000);
 });
 
@@ -149,6 +162,57 @@ describe("eval bridge smoke — pipeline (pipeline-query)", () => {
     // the seeded history.
     expect(r["output"]).toBe("rag:what does the fox do?");
     expect(r["modelResponses"]).toBe(1);
+  }, 240_000);
+});
+
+describe("eval bridge smoke — channel (channel-resume-turn)", () => {
+  test("both a history-less and a history-carrying sample run through the REAL runTurn", async () => {
+    const out = await compileBridged("minimal-channel");
+    expect(existsSync(join(out, "eval-entry.ts"))).toBe(true);
+    const evalAgent = readFileSync(join(out, "eval", "agent.ts"), "utf-8");
+    expect(evalAgent).toContain('import * as __entry from "../eval-entry.ts";');
+    expect(evalAgent).toContain("invoker: __invoker,");
+
+    const r = await drive("channel", out);
+    expect(r["hasRunForEval"]).toBe(true);
+    // (a) fresh session.
+    expect(r["freshOutput"]).toBe("chan:first ask");
+    // (b) the RESUME path — this is the combination the bridge advertises and
+    // it used to die at `sessionStore.get()` because the eval entry seeded an
+    // event log without ever creating the session record.
+    expect(r["resumeOutput"]).toBe("chan:follow-up");
+    // The session RECORD + transcript both live in the per-sample dir.
+    const sessionId = String(r["resumeSessionId"]);
+    expect(r["resumeFiles"]).toContain(`${sessionId}.json`);
+    expect(r["resumeFiles"]).toContain(`${sessionId}.jsonl`);
+    expect(r["freshFiles"]).toContain(`${String(r["freshSessionId"])}.jsonl`);
+    // The seeded turn is really in the transcript, ahead of the graded input.
+    expect(r["resumeUserMessages"]).toEqual(["hello", "follow-up"]);
+  }, 240_000);
+});
+
+describe("eval bridge smoke — managed (gateway-request)", () => {
+  test("both sample kinds run through the gateway's runOneTurn dispatcher", async () => {
+    const out = await compileBridged("minimal-managed");
+    const evalAgent = readFileSync(join(out, "eval", "agent.ts"), "utf-8");
+    expect(evalAgent).toContain('import * as __entry from "../agent.ts";');
+    expect(evalAgent).toContain(
+      'const BRIDGE = { sourceTarget: "managed", kind: "gateway-request", chatCapable: true, entryImport: "../agent.ts" } as const;',
+    );
+
+    const r = await drive("managed", out);
+    expect(r["hasRunOneTurn"]).toBe(true);
+    expect(r["freshOutput"]).toBe("mg:first ask");
+    expect(r["freshModelResponses"]).toBe(1);
+    // history rides extraOptions.seedMessages and OVERRIDES the dispatcher's
+    // single seed (extraOptions spreads last) — asserted on the real bundle,
+    // not on a hand-written stub.
+    expect(r["historyOutput"]).toBe("mg:follow-up");
+    expect(r["historyUserMessages"]).toEqual(["hello", "follow-up"]);
+    // Per-sample artifacts: the transcript + the isolated tenant root.
+    const sessionId = String(r["historySessionId"]);
+    expect(r["historyFiles"]).toContain(`${sessionId}.jsonl`);
+    expect(r["historyFiles"]).toContain("tenants");
   }, 240_000);
 });
 

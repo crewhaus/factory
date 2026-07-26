@@ -862,10 +862,15 @@ import { createSkillTool } from "@crewhaus/skills-registry";
   // v0.3.0 — the memory fabric, wired ONCE through the stable composition-
   // root call (design §1 principle 1): roles share the spec-scoped stores;
   // the orchestrator threads the tools + seams into every role's turn.
+  //
+  // Cluster S (D36/NEW-shape-1) — the fabric roots at the caller's per-sample
+  // directory when one is supplied, so a bridged eval keeps the Pillar-2
+  // isolation invariant: sample N's facts/plan/handoff never leak into sample
+  // N+1, and nothing is written into the operator's working tree.
   const __memTools: RegisteredTool[] = [];
   const __memWired = await wireMemory(${fabric.fragmentJson}, {
     catalog: { register: (t: RegisteredTool) => { __memTools.push(t); } },
-    cwd: process.cwd(),
+    cwd: __evalOpts.sessionRootDir ?? process.cwd(),
   });
   const __skills = __memWired.options.skills ?? [];
   if (__skills.length > 0) __memTools.push(createSkillTool(__skills));`

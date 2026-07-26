@@ -929,8 +929,11 @@ import { createIdempotencyStore, runOnce } from "@crewhaus/durable-execution";
 // CREWHAUS_IDEMPOTENCY_STORE=file:<dir> to make a crashed run resume at the
 // first not-yet-completed plain step instead of re-running finished steps
 // (and their side effects). The default in-memory store is transparent.
-// Eval-entry variant: the run id is minted PER runForEval invocation so two
-// eval samples never dedup against each other through the shared store.
+// Eval-entry variant: the run id is minted FRESH per runForEval invocation —
+// CREWHAUS_RUN_ID is deliberately IGNORED here (an exported run id in the
+// harness environment would otherwise make every sample share one id, and
+// samples 2..N would replay sample 1's step outputs out of the module-scope
+// store instead of running).
 const __idempotencyStore = createIdempotencyStore(${escapeJsonString(ir.name)});
 const __durableStep = (runId: string, name: string, fn: () => Promise<string>): Promise<string> =>
   runOnce(__idempotencyStore, runId, name, fn);
@@ -1049,7 +1052,9 @@ ${plainInvocation
 ${stepsSection}`;
   const evalRunIdLine =
     durable && evalEntry
-      ? '  const __runId = process.env["CREWHAUS_RUN_ID"] ?? `wf_${__randomUUID()}`;\n'
+      ? "  // Always FRESH (no CREWHAUS_RUN_ID override): each eval sample must own\n" +
+        "  // its idempotency namespace or samples 2..N replay sample 1's outputs.\n" +
+        "  const __runId = `wf_${__randomUUID()}`;\n"
       : "";
   const mainSection = evalEntry
     ? `/**

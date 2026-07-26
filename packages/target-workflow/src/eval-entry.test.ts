@@ -67,12 +67,14 @@ describe("emitWorkflow — evalEntry variant (cluster S)", () => {
     expect((c.match(/sessionRootDir: __evalOpts\.sessionRootDir/g) ?? []).length).toBe(2);
   });
 
-  test("durable steps key on the per-invocation run id (no cross-sample dedup)", () => {
+  test("durable steps key on a FRESH per-invocation run id (no cross-sample dedup)", () => {
     const c = agentTs(TWO_STEP_IR, true);
     expect(c).toContain("__durableStep(__runId, ");
-    expect(c).toContain(
-      'const __runId = process.env["CREWHAUS_RUN_ID"] ?? `wf_${__randomUUID()}`;',
-    );
+    expect(c).toContain("const __runId = `wf_${__randomUUID()}`;");
+    // CREWHAUS_RUN_ID must NOT win here: exported in the harness environment
+    // (its documented durable-resume use), it would give every sample one id
+    // and samples 2..N would replay sample 1's step outputs.
+    expect(c).not.toContain('process.env["CREWHAUS_RUN_ID"]');
     // The run id is minted INSIDE runForEval, not at module scope.
     expect(c.indexOf("const __runId")).toBeGreaterThan(
       c.indexOf("export async function runForEval"),

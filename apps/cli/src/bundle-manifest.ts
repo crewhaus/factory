@@ -23,10 +23,16 @@ import { cliVersion } from "./version";
  * user-authored package.json (mirrors GENERATED_README_MARKER semantics). */
 export const BUNDLE_MANIFEST_NAME = "crewhaus-compiled-bundle";
 
-/** Collect the @crewhaus/* packages the emitted bundle imports (sorted, deduped). */
+/**
+ * Collect the @crewhaus/* packages the emitted bundle imports (sorted,
+ * deduped). A SUBPATH import (`@crewhaus/target-eval-bundle/runtime`, which
+ * the bridged eval bundle uses to avoid loading the codegen tree at boot)
+ * resolves to its PACKAGE — the dependency is the package, not the subpath,
+ * and missing that would leave the emitted manifest unable to install.
+ */
 export function collectCrewhausDeps(files: Bundle["files"]): readonly string[] {
   const deps = new Set<string>();
-  const re = /["'](@crewhaus\/[a-z0-9-]+)["']/g;
+  const re = /["'](@crewhaus\/[a-z0-9-]+)(?:\/[a-zA-Z0-9._-]+)*["']/g;
   for (const file of files) {
     if (!file.path.endsWith(".ts") && !file.path.endsWith(".js")) continue;
     for (const m of file.content.matchAll(re)) {

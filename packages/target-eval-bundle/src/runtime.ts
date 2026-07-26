@@ -190,18 +190,28 @@ export function createBridgeInvoker(
 
 /**
  * LOAD-TIME history gate: pass samples through untouched, but fail loudly on
- * the first history-carrying sample when the bridged shape is not
- * chat-capable. The eval-runner materializes the sample iterable BEFORE any
- * agent invocation, so the throw aborts the run at load with zero spend.
+ * the first history-carrying sample when the bundle DRIVES a compiled runtime
+ * entry that consumes a single trigger input. The eval-runner materializes the
+ * sample iterable BEFORE any agent invocation, so the throw aborts the run at
+ * load with zero spend.
+ *
+ * The gate is keyed on `entryImport` — the real condition — not on
+ * `chatCapable` alone. A bridged shape with NO entry (research / browser /
+ * onchain / onchain-game / batch / voice) runs the eval-runner's DEFAULT
+ * single-turn invoker, which is itself a chat loop and seeds `history`
+ * natively (Wave-3 B14); rejecting those samples would revoke a shipped
+ * capability for no runtime reason. Only entry-driven, non-chat kinds
+ * (workflow-run / graph-run / crew-run) have nowhere to put a conversation.
  */
 export async function* guardHistorySamples<S extends BridgeSample>(
   samples: AsyncIterable<S>,
-  bridge: Pick<EvalBridge, "sourceTarget" | "chatCapable">,
+  bridge: Pick<EvalBridge, "sourceTarget" | "chatCapable" | "entryImport">,
 ): AsyncIterable<S> {
+  const rejects = bridge.entryImport !== undefined && !bridge.chatCapable;
   for await (const sample of samples) {
-    if (!bridge.chatCapable && sample.history !== undefined && sample.history.length > 0) {
+    if (rejects && sample.history !== undefined && sample.history.length > 0) {
       throw new EvalBridgeRuntimeError(
-        `sample "${sample.id}" carries a multi-turn history, but the bridged target: ${bridge.sourceTarget} shape is not chat-capable — its runtime consumes a single trigger input, not a seeded conversation. Remove the sample's history (or eval a chat-capable shape: channel, managed, voice, pipeline).`,
+        `sample "${sample.id}" carries a multi-turn history, but the bridged target: ${bridge.sourceTarget} shape is driven through its compiled runtime entry (${bridge.entryImport}), which consumes a single trigger input rather than a seeded conversation. Remove the sample's history (or eval a shape whose runtime is a conversation: channel, managed, pipeline).`,
       );
     }
     yield sample;

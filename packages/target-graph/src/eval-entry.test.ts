@@ -2,7 +2,8 @@
  * Evals Wave 4, cluster S (D36 + NEW-shape-1) — the `evalEntry` emit option:
  * byte-identity when absent; the exported `runForEval` (drive-to-run_done on
  * the caller's RunContext, HITL pause throws) + `import.meta.main` guard +
- * the module-scope scripted-adapter seam when set.
+ * the PER-INVOCATION eval seams (sessionRootDir + scripted adapter, keyed on
+ * the caller's RunContext) when set.
  */
 import { describe, expect, test } from "bun:test";
 import type { IrGraphV0 } from "@crewhaus/ir";
@@ -48,7 +49,7 @@ describe("emitGraph — evalEntry off is byte-identical (back-compat pin)", () =
     expect(c).toBe(a as string);
     expect(a).not.toContain("runForEval");
     expect(a).not.toContain("import.meta.main");
-    expect(a).not.toContain("__evalAdapter");
+    expect(a).not.toContain("__evalSeam");
   });
 });
 
@@ -62,7 +63,8 @@ describe("emitGraph — evalEntry variant (cluster S)", () => {
   test("runForEval drives the compiled graph on the caller's RunContext", () => {
     const c = agentTs(BASE_IR, true);
     expect(c).toContain("__graph.run(");
-    expect(c).toContain("runContext: __evalOpts.runContext ?? __runContext");
+    expect(c).toContain("const __evalRunContext = __evalOpts.runContext ?? __runContext;");
+    expect(c).toContain("{ runContext: __evalRunContext }");
     expect(c).toContain("return JSON.stringify(__finalState, null, 2);");
   });
 
@@ -71,11 +73,27 @@ describe("emitGraph — evalEntry variant (cluster S)", () => {
     expect(c).toContain("graph paused for HITL approval");
   });
 
-  test("node bodies spread the module-scope scripted-adapter seam", () => {
+  test("node bodies read PER-INVOCATION eval seams keyed on the RunContext", () => {
     const c = agentTs(BASE_IR, true);
-    expect(c).toContain("let __evalAdapter:");
-    // Both non-judge node bodies thread it into their runChatLoop call.
-    expect((c.match(/_adapter: __evalAdapter/g) ?? []).length).toBe(2);
+    // No module-scope mutable: two concurrent samples (default concurrency 2)
+    // would clobber each other's adapter/session root.
+    expect(c).not.toContain("let __evalAdapter");
+    expect(c).toContain("const __evalSeams = new WeakMap<");
+    expect(c).toContain("__evalSeams.set(__evalRunContext, {");
+    // Both non-judge node bodies look their seams up and thread BOTH through.
+    expect((c.match(/const __evalSeam = __evalSeams\.get\(ctx\.runContext\);/g) ?? []).length).toBe(
+      2,
+    );
+    expect((c.match(/_adapter: __evalSeam\._adapter/g) ?? []).length).toBe(2);
+    expect((c.match(/sessionRootDir: __evalSeam\.sessionRootDir/g) ?? []).length).toBe(2);
+  });
+
+  test("runForEval accepts sessionRootDir so node session logs land in the sample dir", () => {
+    const c = agentTs(BASE_IR, true);
+    expect(c).toContain("sessionRootDir?: string;");
+    expect(c).toContain(
+      "...(__evalOpts.sessionRootDir !== undefined ? { sessionRootDir: __evalOpts.sessionRootDir } : {}),",
+    );
   });
 
   test("judge-carrying graphs stay valid under the variant", () => {

@@ -86,6 +86,22 @@ describe("emitCrew — evalEntry variant (cluster S)", () => {
     expect(daemon).toContain('"class":"rate_limited"');
   });
 
+  test("a memory/continuity crew roots its fabric at the SAMPLE dir, not the cwd", () => {
+    // Pillar 2: plan/focus/handoff/facts written by sample N must never leak
+    // into sample N+1 — nor into the operator's working tree.
+    const ir: IrCrewV0 = { ...MIN_IR, memory: { enabled: true } };
+    const entry =
+      emitCrew(ir, { evalEntry: true }).files.find((f) => f.path === "eval-entry.ts")?.content ??
+      "";
+    expect(entry).toContain("await wireMemory(");
+    expect(entry).toContain("cwd: __evalOpts.sessionRootDir ?? process.cwd(),");
+    expect(entry).not.toContain("cwd: process.cwd(),");
+    // The daemon path is untouched (deployed posture stays the cwd).
+    const daemon =
+      emitCrew(ir, { evalEntry: true }).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(daemon).toContain("cwd: process.cwd(),");
+  });
+
   test("eval-entry.ts is syntactically valid TypeScript", () => {
     const t = new Bun.Transpiler({ loader: "ts" });
     const entry =

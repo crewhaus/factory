@@ -16,6 +16,7 @@
     { "path": "../../packages/audit-log" },
     { "path": "../../packages/canary-controller" },
     { "path": "../../packages/compiler" },
+    { "path": "../../packages/feedback-distill" },
     { "path": "../../packages/computer-use-driver" },
     { "path": "../../packages/context-bundle" },
     { "path": "../../packages/data-retention-engine" },

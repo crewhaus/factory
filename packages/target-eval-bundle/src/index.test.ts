@@ -179,6 +179,28 @@ describe("target-eval-bundle — run history (item 15)", () => {
     const code = emitEval(makeIr()).files[0]?.content ?? "";
     expect(() => t.transformSync(code)).not.toThrow();
   });
+
+  test("C33 — the emitting version rides into run.json, like a `crewhaus eval` run", () => {
+    // Without this a bundle row sat beside CLI rows in the same index.jsonl
+    // with a systematically emptier reproducibility manifest (bunVersion and
+    // platform are computed inside runEval; cliVersion only the emitter knows).
+    const code = emitEval(makeIr(), { cliVersion: "0.4.0" }).files[0]?.content ?? "";
+    expect(code).toContain('cliVersion: "0.4.0",');
+    // Omitted ⇒ absent, so a library caller's bundle is unchanged.
+    expect(emitEval(makeIr()).files[0]?.content ?? "").not.toContain("cliVersion:");
+  });
+
+  test("the bundle states which `crewhaus eval` features it does NOT have", () => {
+    // Flake detection needs --repeats, determinism needs --replay-tools and
+    // partial-run economics need --resume; the generated bundle exposes no
+    // argv for any of them (and record/replay is structurally unreachable
+    // for an entry-driven bridge). A documented gap, not a silent one.
+    const code = emitEval(makeIr()).files[0]?.content ?? "";
+    expect(code).toContain("--repeats");
+    expect(code).toContain("--replay-tools");
+    expect(code).toContain("--resume");
+    expect(code).toContain("`crewhaus eval`");
+  });
 });
 
 describe("emitEval — failure_taxonomy is WIRED (D37)", () => {
@@ -239,12 +261,16 @@ describe("emitEval — bridge mode (cluster S)", () => {
 
   test("an entry-driven bridge imports the compiled runtime and wires the invoker", () => {
     const code = emitEval(makeIr(), { bridge: workflowBridge }).files[0]?.content ?? "";
+    // The RUNTIME subpath, not the package root: the root entry statically
+    // imports all five shape codegen packages (bridge-emit), so importing it
+    // would make every bridged bundle load the whole codegen tree at boot for
+    // two helpers. `runtime.ts`'s only non-type import is @crewhaus/tenancy.
     expect(code).toContain(
-      'import { createBridgeInvoker, guardHistorySamples } from "@crewhaus/target-eval-bundle";',
+      'import { createBridgeInvoker, guardHistorySamples } from "@crewhaus/target-eval-bundle/runtime";',
     );
     expect(code).toContain('import * as __entry from "../agent.ts";');
     expect(code).toContain(
-      'const BRIDGE = { sourceTarget: "workflow", kind: "workflow-run", chatCapable: false } as const;',
+      'const BRIDGE = { sourceTarget: "workflow", kind: "workflow-run", chatCapable: false, entryImport: "../agent.ts" } as const;',
     );
     expect(code).toContain("const __invoker = createBridgeInvoker(BRIDGE, __entry);");
     expect(code).toContain("invoker: __invoker,");
@@ -263,7 +289,9 @@ describe("emitEval — bridge mode (cluster S)", () => {
       emitEval(makeIr(), {
         bridge: { sourceTarget: "voice", kind: "voice-replay", chatCapable: true },
       }).files[0]?.content ?? "";
-    expect(code).toContain('import { guardHistorySamples } from "@crewhaus/target-eval-bundle";');
+    expect(code).toContain(
+      'import { guardHistorySamples } from "@crewhaus/target-eval-bundle/runtime";',
+    );
     expect(code).not.toContain("createBridgeInvoker");
     expect(code).not.toContain("__entry");
     expect(code).not.toContain("invoker: __invoker");

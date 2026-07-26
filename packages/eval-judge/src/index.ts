@@ -49,6 +49,9 @@ export type {
   CategoricalJudgeResult,
   JudgeOptions,
   JudgeResult,
+  // C35 — judge token metering: the runner meters `llm_judge` spend by
+  // passing a sink into every grader it builds.
+  JudgeUsageSink,
 } from "./judge";
 export {
   loadRubric,

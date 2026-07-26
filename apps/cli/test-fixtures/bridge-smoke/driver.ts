@@ -11,9 +11,13 @@
  *   workflow — createBridgeInvoker + a full runEval (grades + artifacts);
  *   graph    — runForEval to run_done on a subscribed RunContext;
  *   crew     — runForEval through the compiled orchestrator;
- *   pipeline — runForEval with seeded history through the indexed agent.
+ *   pipeline — runForEval with seeded history through the indexed agent;
+ *   channel  — createBridgeInvoker over the bot's REAL createAgent().runTurn,
+ *              history-less AND history-carrying (the resume path);
+ *   managed  — createBridgeInvoker over the gateway's runOneTurn dispatcher,
+ *              history-less AND history-carrying (extraOptions.seedMessages).
  */
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
@@ -70,7 +74,29 @@ type RunForEvalFn = (input: string, opts?: Record<string, unknown>) => Promise<s
 const mode = process.argv[2];
 const bundleDir = process.argv[3];
 if (mode === undefined || bundleDir === undefined) {
-  throw new Error("usage: bun driver.ts <workflow|graph|crew|pipeline> <bundleDir>");
+  throw new Error(
+    "usage: bun driver.ts <workflow|graph|crew|pipeline|channel|managed> <bundleDir>",
+  );
+}
+
+const HISTORY = [
+  { role: "user", content: "hello" },
+  { role: "assistant", content: "hi!" },
+] as const;
+
+/** Every `user_message` payload recorded in a sample dir's session transcript,
+ *  in order — proof the seeded history actually reached the session log. */
+function transcriptUserMessages(sampleDir: string, sessionId: string): string[] {
+  const path = join(sampleDir, `${sessionId}.jsonl`);
+  const out: string[] = [];
+  for (const line of readFileSync(path, "utf-8").split("\n")) {
+    if (line.length === 0) continue;
+    const ev = JSON.parse(line) as { kind?: string; payload?: { content?: unknown } };
+    if (ev.kind === "user_message" && typeof ev.payload?.content === "string") {
+      out.push(ev.payload.content);
+    }
+  }
+  return out;
 }
 
 const result: Record<string, unknown> = {};
@@ -137,18 +163,54 @@ if (mode === "workflow") {
   result["persistedModelResponses"] = persisted
     .split("\n")
     .filter((l) => l.includes('"model_response"')).length;
+
+  // 3 — CREWHAUS_RUN_ID (the documented durable-resume knob, a plausible
+  // CI/harness export) must NOT collapse samples into one idempotency
+  // namespace: two invocations under a pinned run id must each execute their
+  // steps, not replay invocation 1's outputs out of the module-scope store.
+  process.env["CREWHAUS_RUN_ID"] = "pinned_by_the_harness";
+  const runForEvalDirect = entry["runForEval"] as RunForEvalFn;
+  await runForEvalDirect("first sample", { _adapter: scriptedAdapter("wf:") });
+  const secondCtx = createRunContext();
+  const secondEvents: TraceEvent[] = [];
+  secondCtx.eventBus.subscribe((e) => secondEvents.push(e));
+  const secondOut = await runForEvalDirect("second sample", {
+    runContext: secondCtx,
+    _adapter: scriptedAdapter("second:"),
+  });
+  result["pinnedRunIdSecondModelResponses"] = secondEvents.filter(
+    (e) => e.kind === "model_response",
+  ).length;
+  result["pinnedRunIdSecondOutput"] = secondOut;
 } else if (mode === "graph") {
   const entry = (await import(join(bundleDir, "agent.ts"))) as Record<string, unknown>;
   const runForEval = entry["runForEval"] as RunForEvalFn;
   const runContext = createRunContext();
   const events: TraceEvent[] = [];
   runContext.eventBus.subscribe((e) => events.push(e));
+  // A sandboxed sample dir: every node's session log must land HERE (the
+  // runner reads `<sampleDir>/<sessionId>.jsonl` to build transcript.jsonl),
+  // never in the process cwd's .crewhaus/sessions/.
+  const sampleDir = mkdtempSync(join(tmpdir(), "graph-sample-"));
+  const cwdSessions = join(process.cwd(), ".crewhaus", "sessions");
+  const countCwdSessions = (): number => {
+    try {
+      return readdirSync(cwdSessions).length;
+    } catch {
+      return 0;
+    }
+  };
+  const before = countCwdSessions();
   const output = await runForEval("what's the plan?", {
     runContext,
+    sessionRootDir: sampleDir,
     _adapter: scriptedAdapter("node:"),
   });
   result["state"] = JSON.parse(output);
   result["modelResponses"] = events.filter((e) => e.kind === "model_response").length;
+  result["sampleSessionLogs"] = readdirSync(sampleDir).filter((f) => f.endsWith(".jsonl")).length;
+  // Nothing may land in the operator's working directory.
+  result["cwdSessionsAdded"] = countCwdSessions() - before;
 } else if (mode === "crew") {
   const entry = (await import(join(bundleDir, "eval-entry.ts"))) as Record<string, unknown>;
   const runForEval = entry["runForEval"] as RunForEvalFn;
@@ -176,6 +238,81 @@ if (mode === "workflow") {
   });
   result["output"] = output;
   result["modelResponses"] = events.filter((e) => e.kind === "model_response").length;
+} else if (mode === "channel") {
+  // The bot's REAL createAgent().runTurn behind the loopback: inbound
+  // classification + the session resume machinery, driven through the same
+  // createBridgeInvoker the emitted bundle wires.
+  const entry = (await import(join(bundleDir, "eval-entry.ts"))) as Record<string, unknown>;
+  result["hasRunForEval"] = typeof entry["runForEval"] === "function";
+  const bridge = {
+    sourceTarget: "channel",
+    kind: "channel-resume-turn",
+    chatCapable: true,
+    entryImport: "../eval-entry.ts",
+  } as const;
+  const invoker = createBridgeInvoker(bridge, entry, { _adapter: scriptedAdapter("chan:") });
+
+  // (a) history-less sample — the fresh-session path.
+  const freshDir = mkdtempSync(join(tmpdir(), "chan-sample-fresh-"));
+  const freshCtx = createRunContext();
+  const fresh = await invoker({
+    sample: { id: "fresh", input: "first ask" },
+    runContext: freshCtx,
+    sessionRootDir: freshDir,
+  });
+  result["freshOutput"] = fresh.agentOutput;
+  result["freshFiles"] = readdirSync(freshDir).sort();
+  result["freshSessionId"] = freshCtx.sessionId;
+
+  // (b) history-carrying sample — the REAL resume path (isNew: false), which
+  // reads the session RECORD before replaying the seeded event log.
+  const resumeDir = mkdtempSync(join(tmpdir(), "chan-sample-resume-"));
+  const resumeCtx = createRunContext();
+  const resumed = await invoker({
+    sample: { id: "resumed", input: "follow-up", history: [...HISTORY] },
+    runContext: resumeCtx,
+    sessionRootDir: resumeDir,
+  });
+  result["resumeOutput"] = resumed.agentOutput;
+  result["resumeFiles"] = readdirSync(resumeDir).sort();
+  result["resumeSessionId"] = resumeCtx.sessionId;
+  result["resumeUserMessages"] = transcriptUserMessages(resumeDir, resumeCtx.sessionId);
+} else if (mode === "managed") {
+  // The gateway's runOneTurn dispatcher under an isolated per-sample tenant.
+  const entry = (await import(join(bundleDir, "agent.ts"))) as Record<string, unknown>;
+  result["hasRunOneTurn"] = typeof entry["runOneTurn"] === "function";
+  const bridge = {
+    sourceTarget: "managed",
+    kind: "gateway-request",
+    chatCapable: true,
+    entryImport: "../agent.ts",
+  } as const;
+  const invoker = createBridgeInvoker(bridge, entry, { _adapter: scriptedAdapter("mg:") });
+
+  const freshDir = mkdtempSync(join(tmpdir(), "mg-sample-fresh-"));
+  const freshCtx = createRunContext();
+  const freshEvents: TraceEvent[] = [];
+  freshCtx.eventBus.subscribe((e) => freshEvents.push(e));
+  const fresh = await invoker({
+    sample: { id: "fresh", input: "first ask" },
+    runContext: freshCtx,
+    sessionRootDir: freshDir,
+  });
+  result["freshOutput"] = fresh.agentOutput;
+  result["freshModelResponses"] = freshEvents.filter((e) => e.kind === "model_response").length;
+  result["freshFiles"] = readdirSync(freshDir).sort();
+
+  const histDir = mkdtempSync(join(tmpdir(), "mg-sample-hist-"));
+  const histCtx = createRunContext();
+  const hist = await invoker({
+    sample: { id: "hist", input: "follow-up", history: [...HISTORY] },
+    runContext: histCtx,
+    sessionRootDir: histDir,
+  });
+  result["historyOutput"] = hist.agentOutput;
+  result["historyFiles"] = readdirSync(histDir).sort();
+  result["historySessionId"] = histCtx.sessionId;
+  result["historyUserMessages"] = transcriptUserMessages(histDir, histCtx.sessionId);
 } else {
   throw new Error(`unknown mode "${mode}"`);
 }

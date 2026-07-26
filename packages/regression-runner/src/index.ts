@@ -15,6 +15,7 @@
  * can block merges.
  */
 import { CrewhausError } from "@crewhaus/errors";
+import { DEFAULT_SCORE_EPSILON } from "@crewhaus/eval-runner";
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
 
 export class RegressionError extends CrewhausError {
@@ -68,7 +69,12 @@ export type GateThresholds = {
   readonly regressionThreshold?: number;
   /** Maximum absolute regression in p95 latency (ms). Default: 5000. */
   readonly latencyThreshold?: number;
-  /** Score-shift epsilon for inclusion in scoreShifts. Default: 0.1. */
+  /**
+   * Score-shift epsilon for inclusion in scoreShifts. Default:
+   * {@link DEFAULT_SCORE_EPSILON} (0.1) — the SAME constant
+   * `eval-report diff` (and its `--epsilon` flag) defaults to, so the diff a
+   * human reads and the gate that blocks classify identically.
+   */
   readonly scoreShiftEpsilon?: number;
 };
 
@@ -83,7 +89,7 @@ export function regress(
   next: EvalRunSummary,
   opts: GateThresholds = {},
 ): RegressReport {
-  const epsilon = opts.scoreShiftEpsilon ?? 0.1;
+  const epsilon = opts.scoreShiftEpsilon ?? DEFAULT_SCORE_EPSILON;
   const prevById = new Map(prev.samples.map((s) => [s.sampleId, s]));
   const flipsRegress: SampleFlip[] = [];
   const flipsRecover: SampleFlip[] = [];

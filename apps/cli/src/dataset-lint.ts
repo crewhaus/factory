@@ -248,8 +248,11 @@ export function lintGraderSpecOf(g: {
  * grade lands). An `opts.reference` override lifts the requirement. Unknown
  * / third-party registry refs are NEVER assumed gold-needing, so foreign
  * packs can't false-positive.
+ *
+ * D44 — exported so `eval coverage --graders` reports the SAME gold-needing
+ * set this lint enforces (two surfaces, one predicate).
  */
-function graderNeedsGold(g: LintGraderSpec): boolean {
+export function graderNeedsGold(g: LintGraderSpec): boolean {
   if (GOLD_NEEDING_GRADER_TYPES.includes(g.type)) return true;
   if (g.type !== "registry" || g.hasReferenceOverride === true) return false;
   const ref = g.registryGrader;

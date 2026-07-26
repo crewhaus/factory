@@ -1121,7 +1121,153 @@ const DREAM_STEP = createDreamJanitorStep(${memoryFabric(ir).fragmentJson}, {
 });
 `
     : "";
-  const dreamStepsField = dreamOn ? "\n  steps: DREAM_STEP !== null ? [DREAM_STEP] : []," : "";
+  // NEW-inloop-coverage — the gateway's rating-capture surface. Presence of
+  // the `feedback:` block (not disabled) opts in to the `feedback.submit`
+  // JSON-RPC method; `autoDistill` additionally registers the D39 distill
+  // janitor step, because a gateway daemon never runs a `crewhaus run`
+  // teardown and its ratings would otherwise accumulate forever.
+  const feedbackOn = ir.feedback !== undefined && ir.feedback.enabled !== false;
+  const distillOn = feedbackOn && ir.feedback?.autoDistill === true;
+  // `randomBytes` is already in the unconditional preamble below, so this
+  // adds only what the handler needs on top of it.
+  const feedbackImport = feedbackOn
+    ? 'import { appendFileSync, existsSync, mkdirSync } from "node:fs";\nimport { buildFeedbackRecord } from "@crewhaus/feedback-distill";\n'
+    : "";
+  // GatewayServerError rides the existing gateway-server import so the emitted
+  // module never names one specifier twice.
+  const gatewayServerImport = feedbackOn
+    ? 'import { createGatewayServer, GatewayServerError, type GatewayFederationConfig } from "@crewhaus/gateway-server";'
+    : 'import { createGatewayServer, type GatewayFederationConfig } from "@crewhaus/gateway-server";';
+  const distillImport = distillOn
+    ? 'import { createDistillJanitorStep } from "@crewhaus/feedback-distill";\nimport { createFileBackedRegistry } from "@crewhaus/dataset-registry";\n'
+    : "";
+  const distillCarried: { enabled?: boolean; autoDistill: true } = { autoDistill: true };
+  if (ir.feedback?.enabled !== undefined) distillCarried.enabled = ir.feedback.enabled;
+  const distillStepBlock = distillOn
+    ? `
+// D39 / NEW-inloop-coverage — accumulated gateway ratings distill into a new
+// version of the \`${ir.name}-ratings\` registry dataset on the janitor's own
+// clock. Shares the .crewhaus/feedback/.distill-state.json watermark with the
+// CLI consumer, so once cron / \`crewhaus distill\` / this daemon lands a
+// batch the others see nothing unprocessed (a shared watermark, not a lock —
+// two OVERLAPPING runs can each register a version of the same ratings).
+//
+// tenantsRootDir is LOAD-BEARING: every turn runs inside withTenant(), so the
+// transcripts live under <TENANTS_ROOT>/<tenantId>/sessions and NOT under
+// <cwd>/.crewhaus/sessions. Sweeping the wrong root would make every
+// submitted rating look unmatchable — and the watermark would then burn it.
+// The per-tenant roots are re-enumerated each tick, exactly like the
+// janitor's own session sweep and the dream step above. The ratings sink and
+// the watermark stay at the harness root (that is where feedback.submit
+// writes them). Split rater verdicts (B19) go to .crewhaus/review/queue.jsonl
+// — \`crewhaus review next\`. CREWHAUS_AUTODISTILL=0 disables;
+// CREWHAUS_AUTODISTILL_THRESHOLD overrides the ">= 5 unprocessed" trigger.
+const DISTILL_STEP = createDistillJanitorStep({
+  specName: ${escapeJsonString(ir.name)},
+  feedback: ${JSON.stringify(distillCarried)},
+  registry: createFileBackedRegistry({
+    rootDir: process.env.CREWHAUS_DATASETS_DIR ?? \`\${process.cwd()}/.crewhaus/datasets\`,
+  }),
+  cwd: process.cwd(),
+  tenantsRootDir: TENANTS_ROOT,
+});
+`
+    : "";
+  // A dream-only daemon keeps its historical single-expression steps field
+  // byte for byte; the spread form appears only with a second step.
+  const dreamStepsField = !distillOn
+    ? dreamOn
+      ? "\n  steps: DREAM_STEP !== null ? [DREAM_STEP] : [],"
+      : ""
+    : `\n  steps: [${[
+        ...(dreamOn ? ["...(DREAM_STEP !== null ? [DREAM_STEP] : [])"] : []),
+        "...(DISTILL_STEP !== null ? [DISTILL_STEP] : [])",
+      ].join(", ")}],`;
+  const feedbackHandlerBlock = feedbackOn
+    ? `
+    if (method === "feedback.submit") {
+      // NEW-inloop-coverage — the gateway's rating-capture route. The record
+      // is written to the SAME .crewhaus/feedback sink \`crewhaus distill\` /
+      // \`optimize --ratings\` / \`judge calibrate\` already read, per tenant
+      // and mode 0600. The daemon stamps schemaVersion/id/source/ts itself so
+      // a client cannot forge provenance or backdate a rating past the
+      // auto-distill watermark.
+      const fb = params as {
+        sessionId: string;
+        turnNumber: number;
+        thumbs?: "up" | "down";
+        stars?: number;
+        scale?: { value: number; min: number; max: number };
+        comment?: string;
+        correction?: string;
+        rater?: string;
+        adjudication?: boolean;
+      };
+      // TENANT FENCE. distill() joins ratings to turns on (sessionId,
+      // turnNumber) across the WHOLE .crewhaus/feedback sink, so an
+      // unfenced write would let any authenticated tenant attach a rating —
+      // or a \`correction\`, which becomes expected_output — to another
+      // tenant's turn and poison the shared <spec>-ratings dataset. Every
+      // other managed storage path is fenced (session-store / event-log /
+      // audit-log assertSamePath); this one is fenced here. The protocol
+      // schema pins sessionId to /^sess_[0-9a-f]{16}$/, so the id can never
+      // escape the tenant's session root as a path.
+      if (!existsSync(\`\${tenant.sessionRoot}/\${fb.sessionId}.jsonl\`)) {
+        throw new GatewayServerError(
+          \`unknown session "\${fb.sessionId}" for this tenant — feedback.submit only rates your own sessions\`,
+        );
+      }
+      // buildFeedbackRecord is the ONE constructor for a FeedbackRecord: it
+      // clips + strips control characters from comment/correction
+      // (MAX_FEEDBACK_TEXT), enforces the stars range, and refuses an
+      // adjudication with no verdict. The gateway is the least-trusted
+      // capture surface in the product, so it must not hand-roll the shape.
+      let record: ReturnType<typeof buildFeedbackRecord>;
+      try {
+        record = buildFeedbackRecord({
+          id: \`fb_\${randomBytes(6).toString("hex")}\`,
+          sessionId: fb.sessionId,
+          turnNumber: fb.turnNumber,
+          ...(fb.thumbs !== undefined ? { thumbs: fb.thumbs } : {}),
+          ...(fb.stars !== undefined ? { stars: fb.stars } : {}),
+          ...(fb.scale !== undefined ? { scale: fb.scale } : {}),
+          ...(fb.comment !== undefined ? { comment: fb.comment } : {}),
+          ...(fb.correction !== undefined ? { correction: fb.correction } : {}),
+          ...(fb.rater !== undefined ? { rater: fb.rater } : {}),
+          ...(fb.adjudication === true ? { adjudicate: true } : {}),
+          source: "ui",
+          ts: new Date().toISOString(),
+        });
+      } catch (err) {
+        throw new GatewayServerError(
+          \`invalid feedback: \${err instanceof Error ? err.message : String(err)}\`,
+        );
+      }
+      const feedbackDir = \`\${process.cwd()}/.crewhaus/feedback\`;
+      mkdirSync(feedbackDir, { recursive: true });
+      appendFileSync(\`\${feedbackDir}/\${tenant.id}.jsonl\`, \`\${JSON.stringify(record)}\n\`, {
+        mode: 0o600,
+      });
+      // gateway-server already appended the \`gateway_request\` entry for THIS
+      // call before dispatching us, so a second one would double-count the
+      // method and read like a replay on the hash chain. This is a distinct
+      // record: the durable write, named by record id.
+      const log = await gateway.getAuditLog(tenant);
+      await log.append({
+        kind: "feedback_recorded",
+        payload: {
+          tenantId: tenant.id,
+          sessionId: fb.sessionId,
+          turnNumber: fb.turnNumber,
+          modality: record.modality,
+          recordId: record.id,
+        },
+      });
+      return { recorded: true, id: record.id };
+    }
+`
+    : "";
+
   const tenantList = ir.tenants
     .map(
       (t) =>
@@ -1136,7 +1282,7 @@ const DREAM_STEP = createDreamJanitorStep(${memoryFabric(ir).fragmentJson}, {
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createBudgetStore } from "@crewhaus/durable-state";
 import { formatRunFailure, isRunFailedError } from "@crewhaus/errors";
-import { createGatewayServer, type GatewayFederationConfig } from "@crewhaus/gateway-server";
+${gatewayServerImport}
 import {
   createInMemoryIdempotencyStore,
   idempotencyKey,
@@ -1144,7 +1290,7 @@ import {
 } from "@crewhaus/idempotency-keys";
 import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
 import { createRunContext, type RunContext } from "@crewhaus/run-context";
-${dreamImport}import { createJanitor } from "@crewhaus/runtime-core";
+${dreamImport}${distillImport}${feedbackImport}import { createJanitor } from "@crewhaus/runtime-core";
 import { buildTenant, withTenant, type Tenant } from "@crewhaus/tenancy";
 import { runOneTurn } from "./agent.ts";
 
@@ -1222,7 +1368,7 @@ try {
 // overrides the hourly re-run (0 keeps only the boot run);
 // CREWHAUS_JANITOR_CLEAR_RESERVATIONS=0 skips the reservation clear
 // (REQUIRED for multi-writer sqlite deployments — see BUDGET_STORE above).
-${dreamStepBlock}const janitor = createJanitor({
+${dreamStepBlock}${distillStepBlock}const janitor = createJanitor({
   ...(process.env.CREWHAUS_JANITOR_CLEAR_RESERVATIONS !== "0"
     ? { budgetStore: BUDGET_STORE }
     : {}),
@@ -1393,7 +1539,7 @@ const gateway = createGatewayServer({
     if (method === "runs.cancel") {
       return { ok: true };
     }
-    if (method === "audit.tail") {
+${feedbackHandlerBlock}    if (method === "audit.tail") {
       const log = await gateway.getAuditLog(tenant);
       const rows: unknown[] = [];
       for await (const r of log.read()) rows.push(r);

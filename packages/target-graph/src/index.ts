@@ -702,15 +702,21 @@ function renderNodeBody(
       const __nudge = __nudges.length === 0 ? "" : "\\n\\n" + __nudges.join("\\n\\n");`
       : "";
   const instructionsExpr = nudgeJudges.length > 0 ? `${instructionsJs} + __nudge` : instructionsJs;
-  // Cluster S — the eval-entry variant threads the module-scope scripted
-  // adapter seam (set once by runForEval) into every node's model turn so
-  // bridge smoke tests run without credentials; empty otherwise, keeping
-  // plain bundles byte-identical.
+  // Cluster S — the eval-entry variant reads THIS invocation's eval seams off
+  // the per-run lookup keyed by the RunContext the caller passed (never a
+  // module-scope mutable, which two concurrent samples would clobber):
+  // `sessionRootDir` re-roots the node's session log into the runner's
+  // per-sample artifact dir, `_adapter` is the scripted-provider test seam.
+  // Empty otherwise, keeping plain bundles byte-identical.
+  const evalSeamBlock = evalEntry
+    ? "\n      const __evalSeam = __evalSeams.get(ctx.runContext);"
+    : "";
   const evalAdapterLine = evalEntry
-    ? "\n        ...(__evalAdapter !== undefined ? { _adapter: __evalAdapter } : {}),"
+    ? "\n        ...(__evalSeam?.sessionRootDir !== undefined ? { sessionRootDir: __evalSeam.sessionRootDir } : {})," +
+      "\n        ...(__evalSeam?._adapter !== undefined ? { _adapter: __evalSeam._adapter } : {}),"
     : "";
   return `
-    async (ctx, prev) => {${hitlPreBlock}${nudgeBlock}
+    async (ctx, prev) => {${evalSeamBlock}${hitlPreBlock}${nudgeBlock}
       const __seed = [
         { role: "user", content: \`Upstream state:\\n\\\`\\\`\\\`json\\n\${JSON.stringify(prev, null, 2)}\\n\\\`\\\`\\\`\` },
       ];
@@ -998,9 +1004,9 @@ function __durableNode(name: string, fn: NodeFn<unknown>): NodeFn<unknown> {
 
   // Cluster S (D36/NEW-shape-1) — the eval-entry variant: an exported
   // runForEval that drives the SAME compiled __graph to run_done on the
-  // caller's RunContext, plus the module-scope scripted-adapter seam the node
-  // bodies spread, plus the import.meta.main guard so importing the bundle
-  // never runs the CLI. Empty/plain when the option is off (byte-identical).
+  // caller's RunContext, plus the PER-INVOCATION eval seams the node bodies
+  // read (keyed by RunContext), plus the import.meta.main guard so importing
+  // the bundle never runs the CLI. Empty/plain when off (byte-identical).
   const evalEntryBlock = evalEntry
     ? `
 /**
@@ -1010,20 +1016,32 @@ function __durableNode(name: string, fn: NodeFn<unknown>): NodeFn<unknown> {
  * JSON — what a deployed run prints. Runs on the caller's RunContext when
  * supplied, so node traces + judge verdicts land on the caller's bus. A
  * HITL pause throws: approvals cannot resolve inside a headless eval sample.
+ *
+ * The seams every node body reads — \`sessionRootDir\` (re-roots each node's
+ * session log into the runner's per-sample artifact dir, so the sample's
+ * transcript.jsonl is populated instead of piling up in the process cwd) and
+ * \`_adapter\` (the scripted-provider test path) — hang off THIS invocation's
+ * RunContext rather than a module-scope mutable, so two concurrent samples
+ * (the bundle's default concurrency is 2) each see their own.
  */
-let __evalAdapter: Parameters<typeof runChatLoop>[0]["_adapter"];
+const __evalSeams = new WeakMap<
+  NonNullable<NonNullable<Parameters<typeof __graph.run>[1]>["runContext"]>,
+  { sessionRootDir?: string; _adapter?: Parameters<typeof runChatLoop>[0]["_adapter"] }
+>();
 export async function runForEval(
   __evalInput: string,
   __evalOpts: {
     runContext?: NonNullable<Parameters<typeof __graph.run>[1]>["runContext"];
+    sessionRootDir?: string;
     _adapter?: Parameters<typeof runChatLoop>[0]["_adapter"];
   } = {},
 ): Promise<string> {
-  __evalAdapter = __evalOpts._adapter;
-  const stream = __graph.run(
-    { input: __evalInput },
-    { runContext: __evalOpts.runContext ?? __runContext },
-  );
+  const __evalRunContext = __evalOpts.runContext ?? __runContext;
+  __evalSeams.set(__evalRunContext, {
+    ...(__evalOpts.sessionRootDir !== undefined ? { sessionRootDir: __evalOpts.sessionRootDir } : {}),
+    ...(__evalOpts._adapter !== undefined ? { _adapter: __evalOpts._adapter } : {}),
+  });
+  const stream = __graph.run({ input: __evalInput }, { runContext: __evalRunContext });
   let __finalState: unknown;
   let __paused: { nodeName: string; prompt: string } | undefined;
   for await (const ev of stream) {

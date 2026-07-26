@@ -9,6 +9,15 @@
  *
  * No HTML templating libraries; pure template strings with inlined CSS+JS.
  *
+ * Trends mode (C31): `trends.ts` folds the run index into per-(spec,
+ * dataset) series and renders pass-rate/mean-score/cost over time as a text
+ * table plus a SELF-CONTAINED HTML page (inline CSS + hand-built inline
+ * SVG — no external assets, no chart library).
+ *
+ * Export mode (C32): `export.ts` flattens loaded runs into one row per
+ * (run, sample, grader) as CSV or JSONL — the cross-run failure-analysis
+ * surface that nested results.json cannot be.
+ *
  * History mode: `history.ts` maintains the append-only run index
  * (`.crewhaus/evals/index.jsonl`) and the per-(spec, dataset) baseline pins
  * (`.crewhaus/evals/baselines.json`) behind `crewhaus eval`'s auto-baseline
@@ -27,6 +36,7 @@ export {
   escapeHtml,
 } from "./render";
 export {
+  DEFAULT_SCORE_EPSILON,
   diffInstrumentWarnings,
   diffReports,
   formatSliceDeltaLines,
@@ -68,6 +78,27 @@ export {
   formatUsd,
   renderMatrix,
 } from "./matrix";
+// C31 — cross-run trends over the history index (text table + a
+// self-contained inline-SVG chart page).
+export {
+  type TrendPoint,
+  type TrendSeries,
+  buildTrends,
+  formatTrendSummaryLines,
+  renderTrends,
+  trendTable,
+} from "./trends";
+// C32 — flat per-sample × per-grader export across runs (csv / jsonl).
+export {
+  DEFAULT_RATIONALE_CHARS,
+  EXPORT_COLUMNS,
+  type ExportRow,
+  type ExportRunInput,
+  buildExportRows,
+  csvCell,
+  rowsToCsv,
+  rowsToJsonl,
+} from "./export";
 export { ReportError } from "./errors";
 export {
   BASELINES_FILENAME,
@@ -83,6 +114,7 @@ export {
   hashDatasetFile,
   readBaselines,
   readRunIndex,
+  readRunIndexLatest,
   recordEvalRun,
   runIndexEntryFromSummary,
   setBaseline,

@@ -149,6 +149,73 @@ export const AuditTailParams = z
   .strict();
 export type AuditTailParamsT = z.infer<typeof AuditTailParams>;
 
+/**
+ * NEW-inloop-coverage — the gateway's RATING-CAPTURE method. A gateway-served
+ * agent is the highest-traffic surface CrewHaus has, and until this method it
+ * had no spec'd way to record a human verdict at all: `distill`, `optimize
+ * --ratings`, `judge calibrate` and the auto-distill flywheel were all
+ * structurally unreachable for the managed shape.
+ *
+ * The params are the USER-SUPPLIED subset of a `FeedbackRecord` (the daemon
+ * stamps `schemaVersion`, `id`, `source: "ui"` and `ts` itself, so a client
+ * cannot forge provenance or backdate a rating past the auto-distill
+ * watermark). `sessionId` + `turnNumber` are the same join key `crewhaus
+ * rate` uses, so a gateway rating and a CLI rating distill identically.
+ *
+ * The grammars are pinned HERE, at the boundary, so a bad submission is a
+ * protocol error instead of a durable line nothing downstream can use:
+ *   - `sessionId` must match `@crewhaus/session-store`'s id grammar, which is
+ *     also what `isFeedbackRecord` requires — an id in any other shape would
+ *     be accepted, written, counted against disk, and then silently dropped
+ *     by every reader (and it is interpolated into a path by the managed
+ *     daemon's tenant-ownership check);
+ *   - the free-text fields are length-capped at the same bound
+ *     `clipFeedbackText` enforces, so oversize input is REFUSED rather than
+ *     silently truncated on a surface whose `correction` becomes a dataset's
+ *     `expected_output`.
+ */
+
+/** `@crewhaus/session-store`'s `generateId` grammar (mirrored — this package
+ *  is dependency-light by design and must not pull the store in). */
+const SESSION_ID_REGEX = /^sess_[0-9a-f]{16}$/;
+
+/** Mirror of `@crewhaus/feedback-distill`'s `MAX_FEEDBACK_TEXT`. Kept in sync
+ *  by hand for the same reason as SESSION_ID_REGEX above; the distill side
+ *  still clips, so a drift can only ever be stricter here. */
+export const MAX_FEEDBACK_TEXT = 8192;
+
+export const FeedbackSubmitParams = z
+  .object({
+    sessionId: z.string().regex(SESSION_ID_REGEX, "sessionId must look like sess_<16 hex digits>"),
+    /** 1-based ordinal of the rated user-text turn. */
+    turnNumber: z.number().int().positive(),
+    thumbs: z.enum(["up", "down"]).optional(),
+    stars: z.number().int().min(1).max(5).optional(),
+    scale: z.object({ value: z.number(), min: z.number(), max: z.number() }).strict().optional(),
+    comment: z.string().max(MAX_FEEDBACK_TEXT).optional(),
+    /** A better answer — becomes `expected_output` at distill time. */
+    correction: z.string().max(MAX_FEEDBACK_TEXT).optional(),
+    /** Opaque rater handle. Redacted at ingestion like every other free text. */
+    rater: z.string().max(MAX_FEEDBACK_TEXT).optional(),
+    /** B19 — this record settles a multi-rater disagreement. */
+    adjudication: z.boolean().optional(),
+  })
+  .strict()
+  .refine(
+    (p) =>
+      p.thumbs !== undefined ||
+      p.stars !== undefined ||
+      p.scale !== undefined ||
+      (p.comment ?? "") !== "" ||
+      (p.correction ?? "") !== "",
+    { message: "feedback.submit needs at least one of thumbs/stars/scale/comment/correction" },
+  );
+export const FeedbackSubmitResult = z
+  .object({ recorded: z.boolean(), id: z.string().min(1) })
+  .strict();
+export type FeedbackSubmitParamsT = z.infer<typeof FeedbackSubmitParams>;
+export type FeedbackSubmitResultT = z.infer<typeof FeedbackSubmitResult>;
+
 export const Method = z.enum([
   "runs.create",
   "runs.continue",
@@ -157,6 +224,7 @@ export const Method = z.enum([
   "sessions.list",
   "sessions.fork",
   "audit.tail",
+  "feedback.submit",
 ]);
 export type MethodT = z.infer<typeof Method>;
 
@@ -168,6 +236,7 @@ const PARAM_SCHEMAS: Record<MethodT, z.ZodType<unknown>> = {
   "sessions.list": SessionsListParams,
   "sessions.fork": SessionsForkParams,
   "audit.tail": AuditTailParams,
+  "feedback.submit": FeedbackSubmitParams,
 };
 
 export function decodeRequest(raw: unknown): RequestEnvelopeT & { method: MethodT } {

@@ -786,6 +786,69 @@ function dreamConfigured(ir: IrChannelV0): boolean {
   return ir.memory !== undefined && ir.memory.enabled !== false && ir.memory.dream !== undefined;
 }
 
+/**
+ * D39 — the daemon-side auto-distill step is emitted when the spec opted in
+ * (`feedback.autoDistill: true`, block not disabled). Gates the janitor-step
+ * codegen in daemon.ts, so every spec without it stays byte-identical.
+ *
+ * WHY the channel shape: this is the shape that actually PRODUCES ratings
+ * (the 👍/👎 reaction join), and its ratings previously accumulated in
+ * `.crewhaus/feedback` until somebody happened to run `crewhaus run` against
+ * the harness. The daemon runs with credentials and base distill is offline,
+ * so the credential-stripped-hooks rationale that keeps auto-distill out of
+ * the cli bundle does not apply here.
+ */
+function daemonDistillConfigured(ir: IrChannelV0): boolean {
+  return (
+    ir.feedback !== undefined && ir.feedback.enabled !== false && ir.feedback.autoDistill === true
+  );
+}
+
+/** D39 — the distill janitor step's boot + registration, shared by the
+ *  channel daemon (and mirrored by the managed daemon). Empty when the spec
+ *  did not opt in. */
+function renderDistillStepBoot(
+  specName: string,
+  feedback: { enabled?: boolean } | undefined,
+): {
+  readonly imports: string;
+  readonly boot: string;
+  readonly stepExpr: string;
+} {
+  const carried: { enabled?: boolean; autoDistill: true } = { autoDistill: true };
+  if (feedback?.enabled !== undefined) carried.enabled = feedback.enabled;
+  return {
+    imports:
+      'import { createDistillJanitorStep } from "@crewhaus/feedback-distill";\n' +
+      'import { createFileBackedRegistry } from "@crewhaus/dataset-registry";\n',
+    boot: `
+  // D39 — accumulated ratings (channel reactions + the web-UI/gateway sink)
+  // distill into a new version of the \`${specName}-ratings\` registry dataset
+  // on the janitor's own clock, instead of waiting for a \`crewhaus run\`
+  // teardown that may never happen for a daemon. Shares the
+  // .crewhaus/feedback/.distill-state.json watermark with the CLI consumer,
+  // so once cron / \`crewhaus distill\` / this daemon lands a batch, the
+  // others see nothing unprocessed (a shared watermark, not a lock — two
+  // OVERLAPPING runs can each register a version of the same ratings).
+  // The transcript root is resolved the way the RUNTIME resolves it
+  // (CREWHAUS_SESSION_DIR, else <cwd>/.crewhaus/sessions) — this daemon
+  // leaves createAgent's sessionRootDir unset, so those are the same bytes.
+  // Split rater verdicts (B19) go to .crewhaus/review/queue.jsonl —
+  // \`crewhaus review next\`. CREWHAUS_AUTODISTILL=0 disables;
+  // CREWHAUS_AUTODISTILL_THRESHOLD overrides the ">= 5 unprocessed" trigger.
+  const __distillStep = createDistillJanitorStep({
+    specName: ${escapeJsonString(specName)},
+    feedback: ${JSON.stringify(carried)},
+    registry: createFileBackedRegistry({
+      rootDir: process.env["CREWHAUS_DATASETS_DIR"] ?? join(__cwd, ".crewhaus", "datasets"),
+    }),
+    cwd: __cwd,
+  });
+`,
+    stepExpr: "__distillStep !== null ? [__distillStep] : []",
+  };
+}
+
 /** The dream's serialized fragment: SPEC-scoped continuity (§14.5 — the
  *  dream consolidates the daemon's own agenda, never a per-conversation
  *  store), regardless of the interactive scope the channel runs with. */
@@ -899,7 +962,7 @@ function __memFragment(scope?: "spec" | "session"): MemoryWiringFragment {
       const __memTools: RegisteredTool[] = [];
       const __memWired = await wireMemory(${fragmentExpr}, {
         catalog: { register: (t: RegisteredTool) => { __memTools.push(t); } },
-        cwd: process.cwd(),${memEmbedderDep}${thredzOn ? "\n        thredz: config.thredz," : ""}
+        cwd: config.fabricRoot ?? process.cwd(),${memEmbedderDep}${thredzOn ? "\n        thredz: config.thredz," : ""}
         sessionScope: args.sessionId,
       });${
         fabric.continuityOn
@@ -1002,6 +1065,16 @@ export type AgentConfig = {
   slashCommands: ReadonlyMap<string, SlashCommand>;
   tools: ReadonlyArray<RegisteredTool>;
   sessionRootDir?: string;
+  // Cluster S (D36/NEW-shape-1) — the per-turn memory/continuity fabric root.
+  // The daemon leaves it unset (process.cwd(), the deployed posture); the eval
+  // bridge entry pins it to the runner's per-sample directory so a bridged
+  // eval keeps the Pillar-2 isolation invariant (no fact/plan/handoff leak
+  // between samples, nothing written into the operator's working tree).
+  fabricRoot?: string;
+  // Cluster S — scripted-provider test seam (the same \`_adapter\` the other
+  // bridged entries expose), so bridge smoke tests drive the REAL runTurn
+  // credential-free. Never set by the daemon.
+  _adapter?: Parameters<typeof runChatLoop>[0]["_adapter"];
   // Loop contract 0.4 (Batch E, G78) — cross-run prompt-cache rotation
   // persistence (§2.5): a long-running channel daemon reads the last rotation
   // stamp before each turn (so a still-fresh cache prefix is REUSED instead of
@@ -1061,6 +1134,7 @@ export function createAgent(config: AgentConfig): Agent {
         ...(config.egressAuditSink !== undefined
           ? { egressAuditSink: config.egressAuditSink }
           : {}),
+        ...(config._adapter !== undefined ? { _adapter: config._adapter } : {}),
       });
     },
   };
@@ -2100,7 +2174,22 @@ registerChannelAdapter("imessage", imessageAdapter);`);
   const __dreamStep = createDreamStep();
 `
     : "";
-  const dreamStepsField = dreamOn ? "\n    steps: __dreamStep !== null ? [__dreamStep] : []," : "";
+  // D39 — the distill janitor step, registered BESIDE the dream step through
+  // the same `createJanitor({ steps })` seam.
+  const distillOn = daemonDistillConfigured(ir);
+  const distill = distillOn
+    ? renderDistillStepBoot(ir.name, ir.feedback)
+    : { imports: "", boot: "", stepExpr: "" };
+  // A dream-only spec keeps its historical single-expression form byte for
+  // byte; the spread form only appears once a second step is registered.
+  const dreamStepsField = !distillOn
+    ? dreamOn
+      ? "\n    steps: __dreamStep !== null ? [__dreamStep] : [],"
+      : ""
+    : `\n    steps: [${[
+        ...(dreamOn ? ["...(__dreamStep !== null ? [__dreamStep] : [])"] : []),
+        `...(${distill.stepExpr})`,
+      ].join(", ")}],`;
   // Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks (`hooks:`).
   // IrHook is HookDef-shaped by contract (the spec ↔ hooks-engine
   // cross-check test pins the event list), so codegen embeds them as a
@@ -2197,7 +2286,7 @@ import { createGateway } from "./gateway.js";
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createDedupStore } from "@crewhaus/durable-state";
 import { createJanitor } from "@crewhaus/runtime-core";
-import { openAuditLog } from "@crewhaus/audit-log";
+${distill.imports}import { openAuditLog } from "@crewhaus/audit-log";
 import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
 ${approvalsImport}import { join } from "node:path";
 
@@ -2255,7 +2344,7 @@ ${gatewayCounters}  const sessionRouter = createSessionRouter({ agent${sessionRo
     );
     __retentionTtlDays = Number.POSITIVE_INFINITY; // fail-safe: evict nothing
   }
-${dreamBoot}  const __janitor = createJanitor({
+${dreamBoot}${distill.boot}  const __janitor = createJanitor({
     sessionTtlDays: __retentionTtlDays,
     pinnedSessionIds: __retentionPins,${dreamStepsField}
   });
@@ -2399,9 +2488,10 @@ defaultCatalog.register(createTaskTool({ subAgents: __subAgents }));
 // Source spec: ${escapeJsonString(ir.name)} (target: channel, ir version: ${ir.version}, file: eval-entry.ts — the compile --with-eval-harness bridge entry)
 ${notesBlock}import { randomBytes } from "node:crypto";
 import { openEventLog } from "@crewhaus/event-log";
+import { createSessionStore } from "@crewhaus/session-store";
 ${hooksEngineImport}
 ${skillsImports}import { defaultCatalog } from "@crewhaus/tool-catalog";
-${builtinImportBlock}${subAgentImportBlock}import { createAgent } from "./agent.ts";
+${builtinImportBlock}${subAgentImportBlock}import { createAgent, type AgentConfig } from "./agent.ts";
 ${toolBoot}
 /**
  * Eval bridge (cluster S, D36/NEW-shape-1) — deliver ONE inbound message
@@ -2416,6 +2506,7 @@ export async function runForEval(
     sessionId?: string;
     sessionRootDir?: string;
     history?: ReadonlyArray<{ role: "user" | "assistant"; content: string }>;
+    _adapter?: AgentConfig["_adapter"];
   } = {},
 ): Promise<string> {
 ${extensionBoot}
@@ -2424,8 +2515,13 @@ ${extensionBoot}
 ${skillsFields}
     tools: defaultCatalog.list(),
     ...(__evalOpts.sessionRootDir !== undefined ? { sessionRootDir: __evalOpts.sessionRootDir } : {}),
+    // Pillar-2 per-sample isolation: the memory/continuity fabric roots at the
+    // caller's sample directory when supplied, so sample N's facts/plan/
+    // handoff can never leak into sample N+1 (nor into the operator's cwd).
+    ...(__evalOpts.sessionRootDir !== undefined ? { fabricRoot: __evalOpts.sessionRootDir } : {}),
     // One-shot eval turns never benefit from a persisted prompt-cache stamp.
     promptCacheStore: { read: async () => undefined, write: async () => {} },${thredzField}${subAgentFields}
+    ...(__evalOpts._adapter !== undefined ? { _adapter: __evalOpts._adapter } : {}),
   });
   const __sessionId = __evalOpts.sessionId ?? \`sess_\${randomBytes(8).toString("hex")}\`;
   const __history = __evalOpts.history ?? [];
@@ -2433,6 +2529,21 @@ ${skillsFields}
     // B14 semantics through the REAL session machinery: seeded turns land in
     // the transcript verbatim and the resumed turn replays them with no
     // model calls for history turns.
+    //
+    // The resume path reads the session RECORD (\`<root>/<id>.json\`) before it
+    // replays the log, so the record must exist alongside the seeded events —
+    // an event log alone makes runChatLoop throw "session not found".
+    const __store = createSessionStore(
+      __evalOpts.sessionRootDir !== undefined ? { rootDir: __evalOpts.sessionRootDir } : {},
+    );
+    if ((await __store.get(__sessionId)) === null) {
+      await __store.create({
+        id: __sessionId,
+        name: ${escapeJsonString(ir.name)},
+        target: "channel",
+        model: ${escapeJsonString(ir.agent.model)},
+      });
+    }
     const __log = await openEventLog(
       __sessionId,
       __evalOpts.sessionRootDir !== undefined ? { rootDir: __evalOpts.sessionRootDir } : {},

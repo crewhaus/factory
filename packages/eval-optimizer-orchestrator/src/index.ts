@@ -38,9 +38,12 @@ import type { Sample } from "@crewhaus/eval-dataset";
 import {
   type Candidate,
   type FitnessFn,
+  type KnobDial,
+  type KnobValue,
   type MutationProvider,
   type OptimizerState,
   type ProviderMutation,
+  formatKnobPath,
   optimize,
 } from "@crewhaus/prompt-optimizer";
 import { type Spec, parseSpec } from "@crewhaus/spec";
@@ -118,6 +121,17 @@ export type OptimizeSpecOptions = {
    * in unit tests.
    */
   readonly traceBus?: TraceEventBus;
+  /**
+   * D43 — declared numeric dials the search may step alongside the
+   * instruction rewrite. Each `path` must be in this target's
+   * `OPTIMIZABLE_PATHS` (validated here before anything is spent, and again
+   * by `validatePatch` per emitted patch). Omitted (the default) keeps the
+   * search instructions-only, exactly as before.
+   *
+   * REQUIRES a knob-aware `fitness` — see {@link OptimizeSpecOptions.fitness}
+   * and the arity check in {@link optimizeSpec}.
+   */
+  readonly knobs?: ReadonlyArray<KnobDial>;
 };
 
 export type OptimizeSpecResult = {
@@ -127,8 +141,16 @@ export type OptimizeSpecResult = {
   readonly improvement: number;
   /** True when improvement >= threshold. */
   readonly applied: boolean;
-  /** The structured patch the optimizer chose. */
+  /** The structured patch the optimizer chose (the instruction rewrite; the
+   *  D43 knob patches, when any, ride in {@link patches} alongside it). */
   readonly patch: SpecPatch;
+  /**
+   * D43 — EVERY patch applied, in application order: the instruction rewrite
+   * first, then one patch per dial the search actually moved. Always present
+   * and always starts with {@link patch}; a knob-less run's `patches` is
+   * exactly `[patch]`, so existing readers of `patch` are unaffected.
+   */
+  readonly patches: ReadonlyArray<SpecPatch>;
   /** The patched YAML — written back to disk only when `writeBack` is true. */
   readonly patchedYaml: string;
   /** Set when `writeBack: true` and the source was rewritten. */
@@ -189,8 +211,12 @@ export function extractCurrentPrompt(spec: Spec): string {
     case "workflow":
     case "graph":
     case "crew":
+      // NB: do NOT point users at `--path` — no such flag exists on
+      // `crewhaus optimize` (see OPTIMIZE_SCHEMA). Per-stage optimisation is
+      // D36's remaining half, deferred past the Wave-4 eval-bridge work; the
+      // message names what DOES work today instead of a phantom flag.
       throw new OptimizeSpecError(
-        `target "${spec.target}" has multiple prompts (one per step/node/role); the v0 orchestrator only optimises single-agent shapes. Specify --path <step.instructions> for granular tuning (follow-up).`,
+        `target "${spec.target}" has multiple prompts (one per step/node/role); the v0 orchestrator only optimises single-agent shapes. Per-stage prompt optimisation is not implemented yet. You can still MEASURE this shape end-to-end: \`crewhaus compile <spec> --with-eval-harness\` emits an eval bundle that drives the compiled ${spec.target} runtime per sample.`,
       );
   }
 }
@@ -218,6 +244,51 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
     );
   }
   const basePrompt = extractCurrentPrompt(spec);
+  // D43 — a knob search is only meaningful if the caller's `fitness` APPLIES
+  // the dials it is handed. A knob-blind fitness makes every knob candidate an
+  // A/A comparison against the incumbent prompt; `optimize()` accepts on
+  // `score > best.score`, so a noisy (judge-backed) fitness "wins" on pure
+  // variance and this function then writes a validated spec patch whose
+  // rationale claims the change was eval-gated. Refuse the run instead:
+  // declared arity >= 2 is the cheapest honest signal that the seam is wired
+  // (a fitness that truly ignores dials must not declare `knobs`).
+  if ((opts.knobs ?? []).length > 0 && opts.fitness.length < 2) {
+    throw new OptimizeSpecError(
+      "knobs were declared but `fitness` takes a single parameter — a knob-blind fitness " +
+        "measures the SAME candidate for every dial value, so any 'win' is noise and the " +
+        "emitted patch would claim an eval gate that never ran. Accept the dial values as " +
+        "the second argument (`(prompt, knobs) => …`) and apply them to the candidate spec " +
+        "before measuring, or drop `knobs`.",
+    );
+  }
+  // D43 — fail FAST on an undeclared dial: every knob path is whitelist-
+  // checked (and its bounds sanity-checked) before a single paid iteration
+  // runs, rather than after the search has spent its budget.
+  for (const dial of opts.knobs ?? []) {
+    if (!(dial.step > 0) || !Number.isFinite(dial.step)) {
+      throw new OptimizeSpecError(
+        `knob ${formatKnobPath(dial.path)} declares a non-positive step (${dial.step})`,
+      );
+    }
+    if (!(dial.min <= dial.max)) {
+      throw new OptimizeSpecError(
+        `knob ${formatKnobPath(dial.path)} declares min ${dial.min} > max ${dial.max}`,
+      );
+    }
+    try {
+      validatePatch(spec, {
+        target: spec.target,
+        path: [...dial.path],
+        op: "replace",
+        value: dial.value,
+      });
+    } catch (err) {
+      throw new OptimizeSpecError(
+        `knob ${formatKnobPath(dial.path)} is not an optimizable path for target "${spec.target}"`,
+        err,
+      );
+    }
+  }
   const runId = opts.runId ?? `opt_${Date.now().toString(16)}`;
   const outDir = opts.outDir ?? join(".crewhaus", "optimize", runId);
   mkdirSync(outDir, { recursive: true });
@@ -257,6 +328,7 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
       : {}),
     ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
     ...(gatedMutator !== undefined ? { mutator: gatedMutator } : {}),
+    ...(opts.knobs !== undefined && opts.knobs.length > 0 ? { knobs: opts.knobs } : {}),
     runId,
     outDir,
   });
@@ -302,12 +374,44 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
     rationale: `${opts.mutator?.name ?? "rule-based"} mutator improved fitness by ${result.improvement.toFixed(3)} over ${opts.iterations ?? 10} iterations`,
   };
   validatePatch(spec, patch);
-  const applyResult = applySpecPatch(yamlText, patch);
+  // D43 — one patch per dial the search actually MOVED (a dial that came back
+  // at its source value emits nothing, so a knob-declaring run that found no
+  // knob win produces exactly the pre-D43 single-patch output). Each is
+  // whitelist-validated and applied through the same CST round-trip, so
+  // comments/key order survive and an out-of-bounds value fails the strict
+  // re-parse instead of landing.
+  const knobPatches: SpecPatch[] = [];
+  for (const knob of result.knobs ?? []) {
+    const source = (opts.knobs ?? []).find(
+      (d) => formatKnobPath(d.path) === formatKnobPath(knob.path),
+    );
+    if (source === undefined || source.value === knob.value) continue;
+    knobPatches.push({
+      target: spec.target,
+      path: [...knob.path],
+      op: "replace",
+      value: knob.value,
+      rationale: `${opts.mutator?.name ?? "rule-based"} knob search moved ${formatKnobPath(knob.path)} from ${source.value} to ${knob.value} (eval-gated)`,
+    });
+  }
+  const patches: SpecPatch[] = [patch, ...knobPatches];
+  let applyResult = applySpecPatch(yamlText, patch);
+  for (const knobPatch of knobPatches) {
+    validatePatch(spec, knobPatch);
+    applyResult = applySpecPatch(applyResult.yaml, knobPatch);
+  }
 
   // Always persist the patch JSON + report (whether or not we apply).
+  // `patch.json` keeps its historical single-patch shape; the full ordered
+  // list lands beside it so nothing about the existing artifact changes.
   writeFileSync(join(outDir, "patch.json"), JSON.stringify(patch, null, 2), {
     mode: 0o600,
   });
+  if (knobPatches.length > 0) {
+    writeFileSync(join(outDir, "patches.json"), JSON.stringify(patches, null, 2), {
+      mode: 0o600,
+    });
+  }
   writeFileSync(
     join(outDir, "report.json"),
     JSON.stringify(
@@ -369,6 +473,7 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
     improvement: result.improvement,
     applied,
     patch,
+    patches,
     patchedYaml: applyResult.yaml,
     ...(writtenTo !== undefined ? { writtenTo } : {}),
     outDir,

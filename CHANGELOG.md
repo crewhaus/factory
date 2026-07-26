@@ -551,6 +551,234 @@ what is already there).
   adjudication so the disagreement closes at the feedback source too; in a
   non-TTY it prints the item and exits, never hanging a script or CI pipe.
   `review resolve <id> [--note t]` closes an item non-interactively.
+- **`crewhaus eval --record-tools <dir>` / `--replay-tools <dir>` — a
+  tool-level cassette, so a tool-using agent can finally be evaluated
+  deterministically, offline, and without side effects.** Eval wires the
+  spec's REAL tools and MCP servers at `permissionMode: "auto"`, so every
+  sample of every optimizer iteration used to execute live bash, live MCP
+  writes, and live egress. `--record-tools <dir>` appends each tool
+  execution's result to `<dir>/tools.jsonl` keyed by `(sampleId, toolName,
+  sha256 of the canonical-JSON parsed args)` — tools still run for real and
+  the run is otherwise byte-identical. `--replay-tools <dir>` serves those
+  results from the recording instead of executing anything. The
+  interception point is `RegisteredTool.execute`, wrapped per sample inside
+  the runner's default invoker, so built-ins, MCP tools, the Skill/Task
+  wrappers, and the memory fabric's tools are all covered. A call whose key
+  the recording does not carry is a MISS: `--replay-miss error` (the
+  default) fails that sample with a message naming the missing key and is
+  never noise-retried (a miss is deterministic by construction, exactly
+  like a `failure_taxonomy` class declaring `recovery: fail`);
+  `--replay-miss live` executes it for real. Repeated identical calls
+  replay the recorded results in order, then keep replaying the last one.
+  Scope is honest and documented: TOOLS only — the agent stack is still
+  wired (MCP servers still boot so their tool schemas exist) and the MODEL
+  still runs live. `run.json`/`results.json` record the mode, the
+  directory, and — on replay — the recording's content hash, so a replayed
+  run gates and pins like any other run while saying what it was. The flags
+  are mutually exclusive, refused with `--models` (matrix cells share
+  sample ids, so one recording cannot address N cells), and refused
+  alongside a caller-supplied `RunEvalOptions.invoker` (which owns its own
+  tool execution) instead of silently recording nothing.
+- **`crewhaus eval --resume <runDir>` — an interrupted eval no longer
+  forfeits everything it already paid for.** A run persists per-sample
+  artifacts incrementally and writes `run.json` before its first sample,
+  yet a ctrl-C, crash, or budget stop meant re-invoking the agent AND the
+  judge for every already-graded sample on the next attempt. `--resume`
+  re-opens the run directory under its ORIGINAL `runId` and `startedAt`,
+  reloads every sample that already wrote `grades.json` (no agent call, no
+  judge call, no spend), runs only the missing ones, and re-aggregates the
+  UNION into a fresh `results.json` + `index.html`. It REFUSES loudly,
+  before any spend, when the run's `specHash`, `datasetHash`, or
+  `gradersHash` no longer match the recorded manifest — splicing two
+  different measurements into one run is never silent — naming every field
+  that moved. A sample that ran and ERRORED is complete and is reused as-is
+  (delete its artifact directory to re-run just that one); under
+  `--repeats`, a sample re-runs whole unless EVERY trial directory is
+  complete, so no truncated pass@k is ever reported. The run history is
+  updated, not duplicated: the resumed run appends a superseding
+  `index.jsonl` entry under the same runId (the index stays append-only)
+  and every reader in the CLI now keeps the latest entry per runId — a
+  no-op for histories without a resumed run. The partial-run baseline
+  refusal is untouched: a budget-aborted run still refuses to pin or
+  promote until it completes. `--resume` is mutually exclusive with `-o`
+  (the run directory IS the output) and with `--models`.
+- **`compile --with-eval-harness` now bridges the multi-stage shapes, and a
+  bridged bundle drives the shape's ACTUAL compiled runtime instead of
+  impersonating it with a single-turn chat.** The former `per-step eval
+  bridges are not yet supported` rejection is lifted for `workflow`,
+  `graph`, `crew`, and `pipeline` — each projects into a first-class
+  `target: eval` bundle (`--emit-as cf-worker` stays rejected with the
+  bridge). Workflow samples run the compiled step sequence end-to-end
+  (`sample.input` = the step-1 trigger; the final step's output is graded;
+  step trace events land in `RunResult.events`); graph samples drive the
+  compiled graph to `run_done` on the per-sample RunContext (final state
+  JSON graded; HITL pauses fail the sample loudly); crew samples run one
+  crew turn through the compiled orchestrator + roles with the daemon's own
+  run options (`crew_done.finalOutput` graded, crew transcript captured);
+  pipeline samples query the indexed agent + Retrieve tool (module-scope
+  indexing runs once at entry import — the deployed boot); channel samples
+  loopback-deliver the inbound message through the bot's real `runTurn`
+  (inbound classification + session resume machinery; sample history
+  pre-seeds the session transcript so the real resume path replays it); and
+  managed samples drive the gateway's existing `runOneTurn` dispatcher
+  under an isolated per-sample tenant. The remaining shapes
+  (voice/onchain/onchain-game/batch/research/browser) keep the single-turn
+  loop over their agent's REAL wired tools, with each fidelity gap named in
+  the per-shape strategy the compile now prints. Under the flag the primary
+  workflow/graph/pipeline bundle gains an exported `runForEval` entry (its
+  CLI main now guarded by `import.meta.main`) and crew/channel bundles gain
+  an additive `eval-entry.ts`; a plain compile stays byte-for-byte
+  identical (pinned against the pre-change emitters in tests). Documented
+  residue: the channel eval entry does not yet mirror the daemon's
+  `mcp_servers` / `knowledge:` boots (a generated note surfaces each;
+  thredz-enabled specs degrade to local files via `thredz: null`), and
+  crew/channel trace-bus events stay on the runtime's internal bus (the
+  session transcript is the captured artifact) — workflow/graph/pipeline
+  thread the runner's per-sample RunContext fully.
+- **`target: eval` bundles honor `failure_taxonomy`.** The taxonomy lands
+  on the bundle's synthesized IR, so the eval-runner's classified-retry
+  suppression (`recovery: fail` classes are terminal) and
+  `SampleResult.failureClass` in `results.json` now apply to standalone
+  bundle runs exactly as they do to `crewhaus eval`; the generated
+  "ignored" warning comment is gone. Bridged projections carry the SOURCE
+  spec's taxonomy too.
+- **`crewhaus eval-report trends [--spec <n>] [--dataset <n>] [-o <dir>]`** —
+  pass-rate, mean-score and cost over time per (spec, dataset), folded from
+  the same `.crewhaus/evals/index.jsonl` `history` already reads. Prints a
+  per-run table plus a movement line per lineage (first → last, delta in
+  percentage POINTS); `-o` additionally writes a self-contained
+  `index.html` — inline CSS and a hand-built inline SVG chart, zero
+  external assets — and `trends.json`. Fully offline: no run directory is
+  opened, so noticing a three-week drift is one command instead of an
+  eyeball exercise.
+- **`crewhaus eval-report export --runs <dir|dir,dir|last:N> --format
+  csv|jsonl [-o <file>]`** — flattens runs into one row per (run, sample,
+  grader): run config columns (runId, ts, specHash, dataset, model,
+  judgeModel, seed), the sample's verdict, latency, trial pass rate, flaky
+  flag and slice membership, and each grader's own
+  passed/score/abstained/rationale (clipped, newline-flattened). A sample
+  whose graders never ran still emits a row — dropping errors is how a pass
+  rate lies. `last:N` reads the (filtered) history index; a moved or
+  unreadable run directory is reported on stderr and skipped, never
+  silently omitted.
+- **`crewhaus eval plan --target-delta F [--confidence C] [--pilot
+  <runDir>]` — the sample-size planner.** `n ≈ z²·p(1−p)/e²`, printed with
+  every term and where it came from (which z for the confidence, which p
+  and whether it came from a pilot run's measured pass rate or the
+  variance-maximizing 0.5 worst case, which e), the substituted arithmetic,
+  the doubled budget a two-run comparison needs, and — with `--pilot` — the
+  smallest delta that pilot's own n could ever have resolved. Offline: no
+  model call, no credentials, no spend.
+- **Flake detection.** Under `--repeats`, samples whose trials disagreed
+  (`0 < trialPassRate < 1`) are flagged `flaky` per sample in
+  `results.json`, counted and listed in
+  `aggregates.flaky`/`flakySampleIds`, printed with their trial tallies
+  plus a suggestion line (inspect via `eval-report export`, remove the
+  nondeterminism with `--seed`/`--replay-tools`, or move the sample out of
+  the gating dataset version), and recorded on the run-history entry so
+  `eval-report history` marks flake-containing runs. Verdicts are untouched
+  — quarantine is a decision made against the dataset, not one the runner
+  makes silently.
+- **Judge token metering.** `llm_judge` calls now report the provider usage
+  the judge wire previously discarded. Every judge call (single verdicts,
+  repeats, and each panelist under its own model string) accumulates into
+  `aggregates.judgeUsage` in `results.json`, and the run prints a `cost:`
+  line breaking out agent vs judge vs total through the same pricing table
+  as the `--models` matrix `est_$` column. An unpriced model renders `n/a`
+  rather than a fabricated `$0.0000`. Gate thresholds and the
+  `--budget-usd` cap still meter AGENT spend, unchanged.
+- **The reproducibility manifest is complete.** `run.json`/`results.json`
+  now record `cliVersion` (supplied by the launcher — `crewhaus version`'s
+  own string), `bunVersion` and `platform`, so a `results.json` says which
+  build, on which runtime, on what machine produced it.
+- **`eval-report diff --epsilon F`** — the score-shift tolerance,
+  previously a module constant, is now a flag (default 0.1, so every
+  existing diff classifies identically). A 1–5 judge rubric and a 0/1
+  exact-match grader no longer share one sensitivity. Flips are never
+  subject to it: a verdict change is a verdict change at any epsilon.
+- **`crewhaus eval --voice --graders <g.yaml>`** — content grading joins
+  the voice latency pack: each replayed transcript is projected onto the
+  standard grader contract and scored by the ordinary stack (deterministic
+  graders, registry packs, `llm_judge` rubrics), and a content failure
+  fails the session exactly like a latency breach. A replay carries no
+  gold, so gold-needing graders have nothing to compare against and say so
+  rather than being fed a fabricated reference; no trace events are
+  invented either. Without `--graders` the voice path is byte-identical —
+  and still credential-free.
+- **`crewhaus schedule generate --for flywheel|eval-gate|sentinel
+  [--runner cron|launchd|systemd]`** — recurring eval automation for teams
+  not on GitHub Actions: prints a ready-to-install crontab line, launchd
+  plist, or systemd service+timer pair wrapping the same command the
+  corresponding workflow runs, with the environment caveats each scheduler
+  actually has (cron's empty PATH, launchd's non-inherited environment,
+  systemd's EnvironmentFile). A shim, not a daemon — it prints and installs
+  nothing, and the GitHub scaffolds are unchanged.
+- **Daemon-side auto-distill.** `feedback.autoDistill` had exactly one
+  production consumer — the `crewhaus run` teardown — so the shapes that
+  actually generate ratings (channel 👍/👎 reactions, the gateway's web UI)
+  accumulated feedback that nothing ever distilled. The channel and managed
+  daemons now register a `feedback_distill` janitor step beside the dream
+  step: same `≥ 5 unprocessed ratings` trigger, same
+  `.crewhaus/feedback/.distill-state.json` watermark, same full-rebuild
+  semantics, so cron, `crewhaus distill` and a live daemon can never
+  double-fire. `CREWHAUS_AUTODISTILL=0` disables the tick;
+  `CREWHAUS_AUTODISTILL_THRESHOLD` retunes it. Specs without
+  `feedback.autoDistill` emit byte-identical bundles.
+- **Ratings on the gateway shape.** `feedback:` now parses on `target:
+  managed`, and the managed daemon serves a `feedback.submit` JSON-RPC
+  method that appends a standard `FeedbackRecord` to
+  `.crewhaus/feedback/<tenant>.jsonl` (mode 0600, audited, with
+  `schemaVersion`/`id`/`source`/`ts` daemon-stamped so a client cannot
+  forge provenance) — the exact sink `distill` / `optimize --ratings` /
+  `judge calibrate` already read. With `autoDistill` the janitor step rides
+  along. `@crewhaus/gateway-protocol` accepts the new method additively;
+  existing clients and methods are unaffected. `exitPrompt` and
+  `channelReactions` describe surfaces a gateway daemon does not have; both
+  now emit a `managed-feedback-unsupported` compile warning instead of
+  silently doing nothing.
+- **`eval_graded` failures are mined.** `crewhaus dataset mine` gains an
+  `eval-fail` signal: an in-loop `evaluation:` judge that scored a real
+  production turn below its threshold is a hard case with zero human
+  involvement. Read from each session's trace sidecar
+  (`<id>.events.jsonl` — the durable log carries no `eval_graded` kind),
+  both the flat and enveloped carriers accepted. A turn the `on_fail:
+  retry` ladder recovered is NOT harvested; one that burned the ladder and
+  still failed is flagged `eval_retries_exhausted`. The signal ranks just
+  below `error` in dedupe, and the judge's score/threshold/grader ride into
+  the quarantine sample's metadata.
+- **`crewhaus flywheel run --gate-split train|dev`.** Narrows the
+  before/after ACCEPTANCE evals to one registry split so a nightly loop
+  stops conditioning accept/reject on every split it resolved; the
+  optimizer's own train/dev sets are unchanged. A split-gated run keys into
+  its own baseline lineage (`<name>@<version>#<split>`). Refused for
+  flat-file datasets (no split boundaries) and for `#test` — the holdout
+  gates releases, not nightly loops. Omitted, behaviour is exactly as
+  before.
+- **Numeric-knob search in the optimizer.** `@crewhaus/prompt-optimizer`
+  gains a `knob-step` mutation: bounded coordinate-ascent steps over
+  declared `OPTIMIZABLE_PATHS` numeric dials, alternating with the
+  instruction rewrites, every proposal gated by the same fitness accept
+  loop. The orchestrator threads `knobs` through, validates each dial
+  against the whitelist BEFORE anything is spent, and emits one additional
+  whitelist-validated `SpecPatch` per dial the search actually moved
+  (`patches` on the result; `patches.json` beside `patch.json`). Declaring
+  no knobs leaves the search prompt-only and byte-identical.
+- **`crewhaus eval coverage --graders <g.yaml>` is real.** The flag was
+  accepted and ignored. It now reports how many samples each grader can
+  actually score (gold-needing graders vs gold-less samples, sharing
+  `dataset lint`'s own predicate so the two surfaces cannot disagree),
+  which declared graders no recent run ever recorded, and which judge
+  CRITERIA never varied across the last few runs' persisted per-criterion
+  grades — a dead criterion pays judge tokens on every sample and can never
+  change a verdict. Omitting the flag leaves every rendered byte unchanged.
+- **New package `@crewhaus/feedback-distill`.** The rating-distillation
+  core (`FeedbackRecord`, turn derivation, multi-rater resolution,
+  `distill()`, grader synthesis), the shared ingestion redactor, the
+  deterministic split/version helpers, and the auto-distill watermark moved
+  out of `apps/cli` so a COMPILED daemon runs the same code the toolchain
+  does. `apps/cli`'s `feedback.ts` / `autodistill.ts` / `dataset-mine.ts` /
+  `dataset-audit.ts` / `datasets.ts` re-export their historical names — no
+  import in the CLI changed.
 
 ### Changed
 
@@ -579,6 +807,29 @@ what is already there).
   a pointer to `synthetic_human_verified` — and `dataset refresh-goldens
   --apply` retags exactly that way when a human-evidence proposal golds a
   synthetic sample.
+- **BEHAVIOR CHANGE: sample `history` seeds only chat-capable shapes**
+  (channel / managed / voice / pipeline). A history-carrying sample against
+  any other bridged shape now fails LOUDLY at dataset load
+  (`guardHistorySamples`) instead of silently seeding a conversation into a
+  runtime that consumes one trigger input.
+- The flywheel help text and module docs no longer claim the optimizer
+  "only ever rewrites `agent.instructions`" — it patches the
+  `OPTIMIZABLE_PATHS` whitelist, which now includes the numeric dials the
+  knob search moves.
+- `DEFAULT_SCORE_EPSILON` now lives in `@crewhaus/eval-runner`
+  (`stats.ts`, the package both comparison surfaces already depend on) and
+  is re-exported by `eval-report`'s `diff.ts`; `regression-runner`'s
+  `scoreShiftEpsilon` defaults to it instead of a second `0.1` literal, so
+  the diff a human READS and the gate that BLOCKS cannot drift apart.
+- New runtime helpers in `@crewhaus/target-eval-bundle`
+  (`createBridgeInvoker`, `guardHistorySamples`,
+  `emitSourceBundleWithEvalEntry`) are imported by generated bridged
+  bundles; the package now depends on the four multi-stage target emitters
+  plus channel and tenancy.
+- `RunEvalOptions` gains `judgeAdapter` (mirroring
+  `CreateExamRunnerOptions.judgeAdapter`): an injectable judge transport so
+  judge behaviour — including the new metering — is assertable over a stub
+  provider adapter with no process-global `mock.module`.
 
 ### Fixed
 
@@ -850,6 +1101,34 @@ what is already there).
   dataset` — counted, logged, never silent. A dataset with no provenance
   metadata excludes nothing and behaves exactly as before; if EVERY pool
   example overlaps, the run refuses rather than injecting nothing.
+- The eval bridge's default grader was unrunnable: the projected default
+  was `substring_match`, not a real grader type, so every default bridged
+  bundle failed grader parsing at boot. The default is now
+  `expected_contains` (the deterministic gold-substring built-in).
+- `crewhaus judge calibrate --apply` writes
+  `.crewhaus/judge-calibration.json` atomically (temp file + rename)
+  instead of truncate-then-write. The eval runner reads that file at run
+  start to gate `llm_judge` graders that declare no `passing_score`, and a
+  malformed read only warns — so a torn file silently mis-gated a whole
+  run. A truncated calibration file was observed mid-run in a shared
+  checkout.
+
+---
+
+## Assembly notes (not for the repo CHANGELOG)
+
+- Fragment coverage: all four wave clusters supplied a fragment (`S.md`,
+  `R.md`, `A.md`, `T.md`). **No cluster fragment is missing.**
+- Dedupe applied: the gateway-protocol `feedback.submit` note appeared in
+  both an `Added` bullet and a standalone `Changed` bullet in the
+  automation fragment — folded into the single gateway-ratings entry.
+- Codenames stripped throughout (gap-item ids and cluster letters); the
+  shape-reach fragment's two bullets (bridge lifted / bridge invokes real
+  runtimes) were merged into one entry because they describe one shipped
+  capability. Each fragment's "known residue" text was kept as documented
+  scope inside the relevant bullet rather than as a separate section.
+- No PR reference appended — the repo CHANGELOG convention is a trailing
+  `[#NNN]`, which should be added when the wave PR number exists.
 
 ## [0.4.0] - 2026-07-18
 

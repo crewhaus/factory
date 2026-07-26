@@ -64,9 +64,15 @@
  *     the runner's wireRunOnce) is the shape's own runtime seam minus the
  *     stdin/driver framing. Not chat-capable.
  *
- * Sample `history` seeds only the chat-capable shapes above; a
- * history-carrying sample against any other shape fails LOUDLY at dataset
- * load (target-eval-bundle's `guardHistorySamples`).
+ * Sample `history` is REJECTED loudly at dataset load
+ * (target-eval-bundle's `guardHistorySamples`) only where there is nowhere to
+ * put it: an entry-driven runtime that consumes a single trigger input
+ * (workflow-run / graph-run / crew-run). The chat-capable kinds seed it into
+ * the shape's own conversation, and the entry-LESS kinds (voice / onchain /
+ * onchain-game / batch / research / browser) run the eval-runner's default
+ * single-turn invoker, which is itself a chat loop and seeds `history`
+ * natively (Wave-3 B14) — `chatCapable: false` there is a statement about the
+ * SHAPE, not a reason to drop a shipped runner capability.
  *
  * Two pieces live here, both side-effect-free (the CLI entry file does the
  * IO — `mkdirSync`/`writeFileSync` of the emitted bundle):
@@ -83,6 +89,7 @@
  *      compiled entry the bundle imports (when runtime-invoking), and
  *      chat-capability for the history gate.
  */
+import { createHash } from "node:crypto";
 import type { IrFailureTaxonomy, IrNode } from "@crewhaus/ir";
 
 /** Thrown on an un-projectable shape / malformed bridge options. The CLI entry
@@ -224,11 +231,41 @@ function extractAgent(
   };
 }
 
+/** One driven stage, reduced to the fields that change what the runtime does. */
+type StageIdentity = {
+  readonly name?: string;
+  readonly model?: string;
+  readonly instructions?: string;
+  readonly tools?: readonly string[];
+};
+
+/**
+ * Digest the stages the bridged runtime actually executes.
+ *
+ * The descriptor agent block is never used as a chat prompt, but it IS what
+ * the run-history `specHash` digests (eval-runner hashes
+ * {name,target,model,instructions,tools}). Without this, every bridged
+ * multi-stage eval recorded a specHash invariant to step/node/role
+ * instructions, tools and per-stage models — two materially different
+ * workflows would share a baseline, and cluster R's `--resume` guard would
+ * happily resume a run across a full rewrite. Folding the digest into the
+ * descriptor instructions restores the documented contract ("changes on every
+ * instruction edit") for bridged bundles too.
+ */
+function stageDigest(stages: readonly StageIdentity[]): string {
+  const canonical = JSON.stringify(
+    stages.map((s) => [s.name ?? "", s.model ?? "", s.instructions ?? "", [...(s.tools ?? [])]]),
+  );
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
+}
+
 /**
  * Cluster S — the multi-stage projection: the recorded agent block is a
  * bridge DESCRIPTOR (the runtime entry is what actually runs), so pipeline
  * keeps its real chat agent while workflow/graph/crew record the entry
- * stage's model plus synthesized instructions naming the driven bundle.
+ * stage's model plus synthesized instructions naming the driven bundle and
+ * carrying a digest of every driven stage (so run identity tracks the real
+ * runtime — see `stageDigest`).
  * Throws when the entry stage cannot be resolved (malformed direct IR — the
  * spec parser guarantees it otherwise).
  */
@@ -242,7 +279,7 @@ function extractMultistageAgent(ir: IrNode): {
     // corpus) — keep the real block.
     return { model: ir.agent.model, instructions: ir.agent.instructions, tools: [] };
   }
-  const describe = (unit: string, count: number, model: string | undefined) => {
+  const describe = (unit: string, stages: readonly StageIdentity[], model: string | undefined) => {
     if (model === undefined) {
       throw new EvalBridgeError(
         `spec "${ir.name}" (target: ${ir.target}) has no resolvable entry ${unit} to project — the IR is malformed`,
@@ -250,20 +287,20 @@ function extractMultistageAgent(ir: IrNode): {
     }
     return {
       model,
-      instructions: `[eval bridge] multi-stage ${ir.target} "${ir.name}" (${count} ${unit}s) — samples are driven end-to-end through the compiled bundle's runtime entry; per-${unit} instructions live in the primary bundle. This descriptor block is recorded for run identity and is never used as a chat prompt.`,
+      instructions: `[eval bridge] multi-stage ${ir.target} "${ir.name}" (${stages.length} ${unit}s) — samples are driven end-to-end through the compiled bundle's runtime entry; per-${unit} instructions live in the primary bundle. This descriptor block is recorded for run identity and is never used as a chat prompt. ${unit} digest: ${stageDigest(stages)} (covers every ${unit}'s name, model, instructions and tools, so the recorded specHash moves whenever the driven runtime does).`,
       tools: [] as readonly string[],
     };
   };
   if (ir.target === "workflow") {
-    return describe("step", ir.steps.length, ir.steps[0]?.model);
+    return describe("step", ir.steps, ir.steps[0]?.model);
   }
   if (ir.target === "graph") {
     const entry = ir.nodes.find((n) => n.name === ir.entry);
-    return describe("node", ir.nodes.length, entry?.model ?? ir.nodes[0]?.model);
+    return describe("node", ir.nodes, entry?.model ?? ir.nodes[0]?.model);
   }
   if (ir.target === "crew") {
     const entry = ir.roles.find((r) => r.name === ir.entry);
-    return describe("role", ir.roles.length, entry?.model ?? ir.roles[0]?.model);
+    return describe("role", ir.roles, entry?.model ?? ir.roles[0]?.model);
   }
   throw new EvalBridgeError(`spec "${ir.name}" target: ${ir.target} is not a multi-stage shape`);
 }
@@ -442,10 +479,19 @@ export const EVAL_BRIDGE_SUBDIR = "eval";
  * is accepted).
  */
 export function describeBridge(projected: ProjectedEvalIr, strategy: InvokerStrategy): string {
+  // History is rejected only where there is nowhere to put it: an entry-driven
+  // runtime that consumes a single trigger input. An entry-LESS bridge runs
+  // the eval-runner's default single-turn chat loop, which seeds history
+  // natively (B14) even though the shape itself is not a conversation.
+  const history = strategy.chatCapable
+    ? "seeded"
+    : strategy.entryImport !== undefined
+      ? "rejected (single-trigger runtime)"
+      : "seeded by the default single-turn invoker";
   return (
     `eval bridge for target: ${strategy.target} → dataset ${projected.dataset.name}@${projected.dataset.version}` +
     `#${projected.dataset.split}, graders [${projected.graders.map((g) => g.name).join(", ")}]; ` +
     `invoker: ${strategy.kind} (${strategy.description}); ` +
-    `history samples: ${strategy.chatCapable ? "seeded" : "rejected (non-chat shape)"}`
+    `history samples: ${history}`
   );
 }

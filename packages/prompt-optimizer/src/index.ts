@@ -12,6 +12,14 @@
  *   - add-few-shot: insert a sampled train example into the prompt
  *   - swap-example: swap an existing few-shot for a different sample
  *   - add-COT-prefix: prepend a "Think step by step." preamble
+ *   - knob-step (D43): one bounded ± step on a declared numeric dial
+ *     (`OptimizeOptions.knobs`), coordinate-ascent style, alternating with
+ *     the prompt mutations above. The dials are spec-patch
+ *     `OPTIMIZABLE_PATHS` entries with the spec schema's own bounds — the
+ *     search never invents a path and never leaves the declared range, and
+ *     `applySpecPatch`'s strict re-parse is the real backstop. Declaring no
+ *     knobs keeps the search prompt-only and byte-identical to the
+ *     pre-D43 behavior.
  *
  * Persists every candidate's run + grade trajectory under
  * `.crewhaus/prompt-optimizer/<runId>/<candidate-N>/` so the search is
@@ -39,14 +47,83 @@ export type Mutation =
   | { kind: "rephrase-instruction" }
   | { kind: "add-few-shot"; sample: Sample }
   | { kind: "swap-example"; oldSample: Sample; newSample: Sample }
-  | { kind: "add-COT-prefix" };
+  | { kind: "add-COT-prefix" }
+  /**
+   * D43 — one bounded step on a declared numeric dial. `path` is a
+   * spec-patch `OPTIMIZABLE_PATHS` entry (e.g. `["evaluation","threshold"]`);
+   * `from`/`to` are the dial's value before and after the step. The search
+   * never invents a path and never leaves the declared bounds — and every
+   * proposal is still measured by the SAME fitness gate as a prompt rewrite,
+   * so a knob that does not help is discarded exactly like a bad rewrite.
+   */
+  | { kind: "knob-step"; path: ReadonlyArray<string>; from: number; to: number };
+
+/** D43 — one dial's current value, the shape a fitness function receives
+ *  alongside the candidate prompt. */
+export type KnobValue = {
+  readonly path: ReadonlyArray<string>;
+  readonly value: number;
+};
+
+/**
+ * D43 — a tunable numeric dial: a declared `OPTIMIZABLE_PATHS` entry plus the
+ * bounds the SPEC SCHEMA already enforces. The bounds here are a search
+ * guard, not the authority: `applySpecPatch` re-parses against the strict
+ * schema, so an out-of-bounds value fails safely even if a dial is mis-declared.
+ */
+export type KnobDial = {
+  /** The `OPTIMIZABLE_PATHS` path this dial patches. */
+  readonly path: ReadonlyArray<string>;
+  /** Current value in the source spec — the search's starting point. */
+  readonly value: number;
+  /** Inclusive schema bounds. */
+  readonly min: number;
+  readonly max: number;
+  /** One coordinate-ascent step. Must be > 0. */
+  readonly step: number;
+  /** Whole numbers only (the schema said `z.number().int()`). */
+  readonly integer?: boolean;
+};
 
 export type Candidate = {
   readonly id: string;
   readonly prompt: string;
   readonly mutations: ReadonlyArray<Mutation>;
   readonly score: number;
+  /** D43 — the dial values measured with this candidate's prompt. Absent
+   *  when no knobs were declared (every pre-D43 result shape is unchanged). */
+  readonly knobs?: ReadonlyArray<KnobValue>;
 };
+
+/** Render a dial path for logs/rationales (`evaluation.threshold`). */
+export function formatKnobPath(path: ReadonlyArray<string>): string {
+  return path.join(".");
+}
+
+/** Clamp + round one proposed dial value into its declared bounds. */
+export function clampKnob(dial: KnobDial, proposed: number): number {
+  const rounded = dial.integer === true ? Math.round(proposed) : proposed;
+  const bounded = Math.min(dial.max, Math.max(dial.min, rounded));
+  // Float steps accumulate representation noise (0.7 - 0.05 = 0.6499…);
+  // snap to 6 decimals so a patched spec carries a value a human recognises.
+  return dial.integer === true ? bounded : Number(bounded.toFixed(6));
+}
+
+/**
+ * D43 — the bounded step for one dial in one direction. Returns `undefined`
+ * when the step would leave the value unchanged (already at the rail), so the
+ * search never burns an iteration measuring a no-op.
+ */
+export function stepKnob(
+  dial: KnobDial,
+  direction: 1 | -1,
+  current: number,
+): { readonly to: number } | undefined {
+  if (!(dial.step > 0) || !Number.isFinite(dial.step)) return undefined;
+  const to = clampKnob(dial, current + direction * dial.step);
+  if (to === clampKnob(dial, current)) return undefined;
+  return { to };
+}
 
 /**
  * Per-sample grade detail for one dev-set sample under the candidate
@@ -89,7 +166,17 @@ export type FitnessResult = {
   readonly runDir?: string;
 };
 
-export type FitnessFn = (prompt: string) => Promise<number | FitnessResult>;
+/**
+ * The fitness seam. D43 added the optional SECOND argument: the candidate's
+ * dial values. A fitness function written before D43 takes one parameter and
+ * ignores the extra argument (JS arity), so every existing caller is
+ * unaffected; a knob-aware caller applies the dials to the spec before
+ * measuring. `knobs` is `undefined` whenever no dials were declared.
+ */
+export type FitnessFn = (
+  prompt: string,
+  knobs?: ReadonlyArray<KnobValue>,
+) => Promise<number | FitnessResult>;
 
 /** Normalise a fitness return to `{ score, grades?, runDir? }` (bare number → neither). */
 function normalizeFitness(r: number | FitnessResult): {
@@ -137,11 +224,24 @@ export type OptimizerState = {
   readonly trajectory: ReadonlyArray<Candidate>;
   readonly trainSet: ReadonlyArray<Sample>;
   readonly devSet: ReadonlyArray<Sample>;
+  /**
+   * D43 — the declared numeric dials, with `value` reflecting the CURRENT
+   * best (coordinate ascent walks from where the search already is). Absent
+   * when the caller declared none.
+   */
+  readonly knobs?: ReadonlyArray<KnobDial>;
 };
 
 export type ProviderMutation = {
   /** The proposed new prompt. */
   readonly prompt: string;
+  /**
+   * D43 — the dial values this proposal wants measured. Omitted (every
+   * pre-D43 provider, and every prompt-only proposal) means "carry the
+   * current best's knobs unchanged", so an existing MutationProvider needs
+   * no edit and behaves exactly as before.
+   */
+  readonly knobs?: ReadonlyArray<KnobValue>;
   /** Structured record of what changed; persisted for audit. */
   readonly mutations: ReadonlyArray<Mutation>;
   /** Optional human-readable rationale (the Claude provider sets this). */
@@ -190,6 +290,13 @@ export type OptimizeOptions = {
    * in `prompt-optimizer-claude`'s `ClaudeMutationProvider`.
    */
   readonly mutator?: MutationProvider;
+  /**
+   * D43 — the numeric dials the default rule-based provider may step. Each
+   * entry must be a declared `OPTIMIZABLE_PATHS` path with the spec schema's
+   * bounds. Omitted (the default) keeps the search prompt-only and every
+   * result byte-identical to the pre-D43 behavior.
+   */
+  readonly knobs?: ReadonlyArray<KnobDial>;
 };
 
 export type OptimizeResult = {
@@ -200,6 +307,9 @@ export type OptimizeResult = {
   readonly baseRunDir?: string;
   /** Item 9 — eval-run dir of the returned best's measurement, when the fitness fn reported one. */
   readonly bestRunDir?: string;
+  /** D43 — the winning dial values, present only when knobs were declared.
+   *  Callers turn these into `OPTIMIZABLE_PATHS` spec patches. */
+  readonly knobs?: ReadonlyArray<KnobValue>;
 };
 
 const DEFAULT_MUTATIONS: ReadonlyArray<Mutation["kind"]> = [
@@ -241,6 +351,13 @@ export function applyMutation(prompt: string, m: Mutation): string {
       if (prompt.startsWith(prefix)) return prompt;
       return `${prefix}${prompt}`;
     }
+    case "knob-step": {
+      // D43 — a knob step edits the SPEC, never the prompt. The dial values
+      // travel on `ProviderMutation.knobs` / `Candidate.knobs`; the prompt
+      // passes through untouched so a knob candidate is measured against the
+      // same instructions the current best carries.
+      return prompt;
+    }
   }
 }
 
@@ -258,11 +375,63 @@ export class RuleBasedMutationProvider implements MutationProvider {
   readonly name = "rule-based";
   private readonly rng: () => number;
   private readonly mutationKinds: ReadonlyArray<Mutation["kind"]>;
+  /** D43 — round-robin cursor over the declared dials, so a multi-dial
+   *  search visits every knob instead of re-rolling the same one. */
+  private knobCursor = 0;
   constructor(opts: { seed?: number; mutations?: ReadonlyArray<Mutation["kind"]> } = {}) {
     this.rng = makeXorshift(opts.seed ?? 0xcafe);
     this.mutationKinds = opts.mutations ?? DEFAULT_MUTATIONS;
   }
+
+  /**
+   * D43 — coordinate ascent over the declared dials: one bounded ± step on
+   * ONE dial per proposal, alternating direction, prompt untouched. Returns
+   * `undefined` when no dial can move (none declared, or every one is at a
+   * rail), so the caller falls back to a prompt mutation and the search never
+   * stalls.
+   */
+  private proposeKnobStep(state: OptimizerState): ProviderMutation | undefined {
+    const dials = state.knobs ?? [];
+    if (dials.length === 0) return undefined;
+    const current = new Map(state.knobs?.map((d) => [formatKnobPath(d.path), d.value]) ?? []);
+    // Try each dial once, starting at the cursor, in both directions.
+    for (let attempt = 0; attempt < dials.length; attempt += 1) {
+      const dial = dials[(this.knobCursor + attempt) % dials.length];
+      if (dial === undefined) continue;
+      const from = current.get(formatKnobPath(dial.path)) ?? dial.value;
+      // The seeded RNG picks which direction is tried first; both are tried,
+      // so a dial at a rail still moves inward instead of being skipped.
+      const first: 1 | -1 = this.rng() < 0.5 ? 1 : -1;
+      for (const direction of [first, first === 1 ? -1 : 1] as ReadonlyArray<1 | -1>) {
+        const stepped = stepKnob(dial, direction, from);
+        if (stepped === undefined) continue;
+        this.knobCursor = (this.knobCursor + attempt + 1) % dials.length;
+        const knobs: KnobValue[] = dials.map((d) => {
+          const path = formatKnobPath(d.path);
+          return {
+            path: d.path,
+            value: path === formatKnobPath(dial.path) ? stepped.to : (current.get(path) ?? d.value),
+          };
+        });
+        return {
+          prompt: state.best.prompt,
+          mutations: [{ kind: "knob-step", path: dial.path, from, to: stepped.to }],
+          knobs,
+          rationale: `${formatKnobPath(dial.path)}: ${from} to ${stepped.to}`,
+        };
+      }
+    }
+    return undefined;
+  }
+
   async next(state: OptimizerState): Promise<ProviderMutation> {
+    // D43 — with dials declared, alternate knob steps and prompt rewrites so
+    // the search covers both axes; without them the provider is exactly the
+    // pre-D43 prompt-only mutator.
+    if ((state.knobs?.length ?? 0) > 0 && state.iteration % 2 === 0) {
+      const knobProposal = this.proposeKnobStep(state);
+      if (knobProposal !== undefined) return knobProposal;
+    }
     const kind =
       this.mutationKinds[Math.floor(this.rng() * this.mutationKinds.length)] ??
       "rephrase-instruction";
@@ -315,13 +484,23 @@ export async function optimize(basePrompt: string, opts: OptimizeOptions): Promi
       ...(opts.mutations !== undefined ? { mutations: opts.mutations } : {}),
     });
 
-  const base = normalizeFitness(await opts.fitness(basePrompt));
+  // D43 — the dial state the search walks. Undefined (no declared knobs)
+  // keeps every `fitness` call single-argument and every candidate/result
+  // shape byte-identical to the pre-D43 behavior.
+  const dials = opts.knobs ?? [];
+  const knobsDeclared = dials.length > 0;
+  const baseKnobs: ReadonlyArray<KnobValue> | undefined = knobsDeclared
+    ? dials.map((d) => ({ path: d.path, value: clampKnob(d, d.value) }))
+    : undefined;
+
+  const base = normalizeFitness(await opts.fitness(basePrompt, baseKnobs));
   const baseScore = base.score;
   const baseCandidate: Candidate = {
     id: "candidate-0",
     prompt: basePrompt,
     mutations: [],
     score: baseScore,
+    ...(baseKnobs !== undefined ? { knobs: baseKnobs } : {}),
   };
   const trajectory: Candidate[] = [baseCandidate];
   let best: Candidate = baseCandidate;
@@ -338,6 +517,11 @@ export async function optimize(basePrompt: string, opts: OptimizeOptions): Promi
   let bestRunDir = base.runDir;
 
   for (let i = 1; i <= iterations; i++) {
+    // D43 — the dials handed to the mutator carry the CURRENT best's values,
+    // so coordinate ascent walks from where the search already is.
+    const bestKnobByPath = new Map(
+      (best.knobs ?? []).map((k) => [formatKnobPath(k.path), k.value]),
+    );
     const state: OptimizerState = {
       iteration: i,
       best,
@@ -345,15 +529,27 @@ export async function optimize(basePrompt: string, opts: OptimizeOptions): Promi
       trajectory,
       trainSet: opts.trainSet,
       devSet: opts.devSet,
+      ...(knobsDeclared
+        ? {
+            knobs: dials.map((d) => ({
+              ...d,
+              value: bestKnobByPath.get(formatKnobPath(d.path)) ?? clampKnob(d, d.value),
+            })),
+          }
+        : {}),
     };
     const proposal = await mutator.next(state);
-    const measured = normalizeFitness(await opts.fitness(proposal.prompt));
+    // A prompt-only proposal (and every pre-D43 provider) inherits the
+    // current best's dial values verbatim.
+    const candidateKnobs = knobsDeclared ? (proposal.knobs ?? best.knobs) : undefined;
+    const measured = normalizeFitness(await opts.fitness(proposal.prompt, candidateKnobs));
     const score = measured.score;
     const candidate: Candidate = {
       id: `candidate-${i}`,
       prompt: proposal.prompt,
       mutations: [...best.mutations, ...proposal.mutations],
       score,
+      ...(candidateKnobs !== undefined ? { knobs: candidateKnobs } : {}),
     };
     trajectory.push(candidate);
     if (score > best.score) {
@@ -378,6 +574,7 @@ export async function optimize(basePrompt: string, opts: OptimizeOptions): Promi
     trajectory,
     ...(baseRunDir !== undefined ? { baseRunDir } : {}),
     ...(bestRunDir !== undefined ? { bestRunDir } : {}),
+    ...(best.knobs !== undefined ? { knobs: best.knobs } : {}),
   };
 }
 

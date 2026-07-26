@@ -11,6 +11,8 @@ import { join } from "node:path";
 import type { Sample } from "@crewhaus/eval-dataset";
 import {
   type FitnessFn,
+  type KnobDial,
+  type KnobValue,
   type MutationProvider,
   type OptimizerState,
   PromptOptimizerError,
@@ -18,7 +20,10 @@ import {
   RuleBasedMutationProvider,
   type SampleGrade,
   applyMutation,
+  clampKnob,
+  formatKnobPath,
   optimize,
+  stepKnob,
 } from "./index";
 
 /**
@@ -353,5 +358,173 @@ describe("prompt-optimizer — T9 search determinism with --seed", () => {
       }
     }
     expect(differs).toBe(true);
+  });
+});
+
+// -------- D43: bounded numeric-knob search --------
+
+const THRESHOLD_DIAL: KnobDial = {
+  path: ["evaluation", "threshold"],
+  value: 0.7,
+  min: 0,
+  max: 1,
+  step: 0.05,
+};
+const RETRIES_DIAL: KnobDial = {
+  path: ["evaluation", "max_retries"],
+  value: 1,
+  min: 1,
+  max: 5,
+  step: 1,
+  integer: true,
+};
+
+describe("prompt-optimizer — D43 knob dials", () => {
+  test("clampKnob honours bounds, integrality and float snapping", () => {
+    expect(clampKnob(THRESHOLD_DIAL, 1.4)).toBe(1);
+    expect(clampKnob(THRESHOLD_DIAL, -3)).toBe(0);
+    expect(clampKnob(THRESHOLD_DIAL, 0.7 - 0.05)).toBe(0.65);
+    expect(clampKnob(RETRIES_DIAL, 2.4)).toBe(2);
+    expect(clampKnob(RETRIES_DIAL, 99)).toBe(5);
+  });
+
+  test("stepKnob refuses a no-op step at a rail", () => {
+    expect(stepKnob(RETRIES_DIAL, -1, 1)).toBeUndefined();
+    expect(stepKnob(RETRIES_DIAL, 1, 5)).toBeUndefined();
+    expect(stepKnob(RETRIES_DIAL, 1, 1)?.to).toBe(2);
+    expect(stepKnob({ ...RETRIES_DIAL, step: 0 }, 1, 1)).toBeUndefined();
+  });
+
+  test("formatKnobPath renders the dotted spec path", () => {
+    expect(formatKnobPath(["evaluation", "threshold"])).toBe("evaluation.threshold");
+  });
+
+  test("the rule-based mutator proposes only in-bounds knob steps", async () => {
+    const provider = new RuleBasedMutationProvider({ seed: 7 });
+    const dials = [THRESHOLD_DIAL, RETRIES_DIAL];
+    const seen: KnobValue[][] = [];
+    for (let i = 0; i < 12; i += 1) {
+      const proposal = await provider.next({
+        iteration: i * 2,
+        best: { id: "c", prompt: "base", mutations: [], score: 0, knobs: [] },
+        trajectory: [],
+        trainSet: [sample("t1", "in", "out")],
+        devSet: [sample("d1", "in", "out")],
+        knobs: dials,
+      });
+      if (proposal.knobs !== undefined) seen.push([...proposal.knobs]);
+    }
+    expect(seen.length).toBeGreaterThan(0);
+    for (const knobs of seen) {
+      for (const k of knobs) {
+        const dial = dials.find((d) => formatKnobPath(d.path) === formatKnobPath(k.path));
+        expect(dial).toBeDefined();
+        expect(k.value).toBeGreaterThanOrEqual((dial as KnobDial).min);
+        expect(k.value).toBeLessThanOrEqual((dial as KnobDial).max);
+        if ((dial as KnobDial).integer === true) expect(Number.isInteger(k.value)).toBe(true);
+      }
+    }
+    // Round-robin: both dials get visited across the window.
+    const touched = new Set(seen.flatMap((knobs) => knobs.map((k) => formatKnobPath(k.path))));
+    expect(touched.size).toBe(2);
+  });
+
+  test("a knob-step proposal leaves the prompt untouched", async () => {
+    const provider = new RuleBasedMutationProvider({ seed: 3 });
+    const proposal = await provider.next({
+      iteration: 2,
+      best: { id: "c", prompt: "the base prompt", mutations: [], score: 0 },
+      trajectory: [],
+      trainSet: [sample("t1", "in", "out")],
+      devSet: [sample("d1", "in", "out")],
+      knobs: [THRESHOLD_DIAL],
+    });
+    expect(proposal.prompt).toBe("the base prompt");
+    expect(proposal.mutations[0]?.kind).toBe("knob-step");
+    expect(applyMutation("the base prompt", proposal.mutations[0] as never)).toBe(
+      "the base prompt",
+    );
+  });
+
+  test("declaring no knobs keeps fitness single-argument and the result knob-free", async () => {
+    const seenArgs: Array<ReadonlyArray<KnobValue> | undefined> = [];
+    const fitness: FitnessFn = async (prompt, knobs) => {
+      seenArgs.push(knobs);
+      return prompt.length / 100;
+    };
+    const result = await optimize("base", {
+      trainSet: [sample("t1", "in", "out")],
+      devSet: [sample("d1", "in", "out")],
+      fitness,
+      iterations: 3,
+      seed: 1,
+    });
+    expect(seenArgs.every((k) => k === undefined)).toBe(true);
+    expect(result.knobs).toBeUndefined();
+    expect(result.best.knobs).toBeUndefined();
+    expect(result.trajectory.every((c) => c.knobs === undefined)).toBe(true);
+  });
+
+  test("the accept loop gates knob proposals exactly like prompt proposals", async () => {
+    // Fitness rewards ONLY a lower threshold; every prompt rewrite is neutral.
+    const fitness: FitnessFn = async (_prompt, knobs) => {
+      const t = knobs?.find((k) => formatKnobPath(k.path) === "evaluation.threshold");
+      return t === undefined ? 0.5 : 1 - t.value;
+    };
+    const result = await optimize("base", {
+      trainSet: [sample("t1", "in", "out")],
+      devSet: [sample("d1", "in", "out")],
+      fitness,
+      iterations: 8,
+      seed: 11,
+      knobs: [THRESHOLD_DIAL],
+    });
+    const winning = result.knobs?.find((k) => formatKnobPath(k.path) === "evaluation.threshold");
+    expect(winning).toBeDefined();
+    // Strictly better than the source value, and still inside the bounds.
+    expect((winning as KnobValue).value).toBeLessThan(0.7);
+    expect((winning as KnobValue).value).toBeGreaterThanOrEqual(0);
+    expect(result.improvement).toBeGreaterThan(0);
+    // A knob candidate that does NOT improve is never adopted: the best
+    // carries the winning value, not the last one tried.
+    expect(result.best.knobs).toEqual(result.knobs as ReadonlyArray<KnobValue>);
+  });
+
+  test("a knob search that finds nothing returns the source dial values", async () => {
+    // Flat fitness: no candidate ever beats the baseline.
+    const fitness: FitnessFn = async () => 0.5;
+    const result = await optimize("base", {
+      trainSet: [sample("t1", "in", "out")],
+      devSet: [sample("d1", "in", "out")],
+      fitness,
+      iterations: 6,
+      seed: 5,
+      knobs: [THRESHOLD_DIAL, RETRIES_DIAL],
+    });
+    expect(result.improvement).toBe(0);
+    expect(result.knobs).toEqual([
+      { path: ["evaluation", "threshold"], value: 0.7 },
+      { path: ["evaluation", "max_retries"], value: 1 },
+    ]);
+  });
+
+  test("knob search stays deterministic under a fixed seed", async () => {
+    const fitness: FitnessFn = async (_p, knobs) => {
+      const t = knobs?.find((k) => formatKnobPath(k.path) === "evaluation.threshold");
+      return t === undefined ? 0 : 1 - Math.abs(t.value - 0.5);
+    };
+    const run = async () =>
+      await optimize("base", {
+        trainSet: [sample("t1", "in", "out")],
+        devSet: [sample("d1", "in", "out")],
+        fitness,
+        iterations: 6,
+        seed: 42,
+        knobs: [THRESHOLD_DIAL],
+      });
+    const a = await run();
+    const b = await run();
+    expect(a.knobs).toEqual(b.knobs as ReadonlyArray<KnobValue>);
+    expect(a.best.score).toBe(b.best.score);
   });
 });

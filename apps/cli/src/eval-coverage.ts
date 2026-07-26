@@ -23,6 +23,14 @@
  * eval-report / graders-suggest style), or JSON. The JSON is a stable,
  * ranked backlog `dataset mine` (item 2) can consume.
  *
+ * D44 — with `--graders <g.yaml>` a THIRD, grader-side distribution joins the
+ * report (the flag used to be accepted and ignored): which graders can
+ * actually score which samples, which samples no gold-needing grader can
+ * score, which declared graders no recent run ever recorded, and which judge
+ * CRITERIA never varied across the inspected runs (a dead criterion pays
+ * judge tokens on every sample and can never change a verdict). Omitting the
+ * flag leaves every rendered byte exactly as it was.
+ *
  * Kept in a side-effect-free module (the CLI entry file runs an argv switch on
  * import) mirroring `feedback.ts` / `graders-suggest.ts`; all filesystem
  * access and registry/run-index resolution live in `apps/cli/src/index.ts`.
@@ -314,7 +322,307 @@ export type CoverageReport = {
   /** Input themes with no obviously-covering sample (advisory — inputs aren't
    *  directly intersected, so these are surfaced, not counted as hard gaps). */
   readonly inputThemes: ReadonlyArray<InputTheme>;
+  /** D44 — the grader-side coverage report, present only when `--graders`
+   *  named a config. Absent keeps every pre-D44 render byte-identical. */
+  readonly graderCoverage?: GraderCoverageReport;
 };
+
+// -------- D44: grader coverage --------
+
+/**
+ * D44 — the graders.yaml view this report needs. Structural (no
+ * `@crewhaus/eval-grader` import), mirroring `dataset-lint`'s LintGraderSpec
+ * and extending it with the judge rubric's criterion names — the axis the
+ * dead-criterion signal is computed over.
+ */
+export type CoverageGraderSpec = {
+  readonly name: string;
+  readonly type: string;
+  /** `type: registry` — the pack ref (e.g. "nlg.rougeL"). */
+  readonly registryGrader?: string;
+  /** `type: registry` — `opts.reference` overrides the gold lookup. */
+  readonly hasReferenceOverride?: boolean;
+  /** `llm_judge` — scalar rubric criterion names, or categorical label names. */
+  readonly criteria?: ReadonlyArray<string>;
+};
+
+/**
+ * Map one parsed graders.yaml entry (any variant of the GraderSpec union) to
+ * the coverage view. Deliberately duck-typed over the union so this module
+ * needs no compile-machinery import, exactly like `lintGraderSpecOf`.
+ */
+export function coverageGraderSpecOf(g: {
+  readonly name: string;
+  readonly type: string;
+  readonly grader?: string;
+  readonly opts?: Readonly<Record<string, unknown>>;
+  readonly rubric?: {
+    readonly kind?: string;
+    readonly criteria?: ReadonlyArray<{ readonly name: string }>;
+    readonly labels?: ReadonlyArray<{ readonly name: string }>;
+  };
+}): CoverageGraderSpec {
+  const criteria =
+    g.type === "llm_judge"
+      ? g.rubric?.kind === "categorical"
+        ? (g.rubric.labels ?? []).map((l) => l.name)
+        : (g.rubric?.criteria ?? []).map((c) => c.name)
+      : undefined;
+  return {
+    name: g.name,
+    type: g.type,
+    ...(g.type === "registry" && g.grader !== undefined ? { registryGrader: g.grader } : {}),
+    ...(g.type === "registry" && g.opts !== undefined && g.opts["reference"] !== undefined
+      ? { hasReferenceOverride: true }
+      : {}),
+    ...(criteria !== undefined && criteria.length > 0 ? { criteria } : {}),
+  };
+}
+
+/** One grader's sample-level reach. */
+export type GraderSampleCoverage = {
+  readonly grader: string;
+  /** The registry pack ref when there is one — more actionable than "registry". */
+  readonly type: string;
+  /** Grading REQUIRES `expected_output` on the sample. */
+  readonly needsGold: boolean;
+  /** Dataset samples this grader can actually produce a real verdict on. */
+  readonly scorable: number;
+  /** Samples it cannot (gold-less samples under a gold-needing grader). */
+  readonly unscorableSampleIds: ReadonlyArray<string>;
+  /** Samples this grader was OBSERVED grading in the inspected runs. 0 with
+   *  no run history — the dataset-side numbers still stand on their own. */
+  readonly observedSamples: number;
+};
+
+/** A judge criterion whose score never moved across the inspected runs. */
+export type DeadCriterion = {
+  readonly grader: string;
+  readonly criterion: string;
+  /** The single value every observation carried. */
+  readonly value: number;
+  /** How many (run × sample) observations agreed. */
+  readonly observations: number;
+};
+
+export type GraderCoverageReport = {
+  readonly gradersFile?: string;
+  readonly graderCount: number;
+  readonly sampleCount: number;
+  readonly perGrader: ReadonlyArray<GraderSampleCoverage>;
+  /** Dataset samples carrying no `expected_output` (the gold-less set every
+   *  gold-needing grader auto-fails). */
+  readonly goldlessSampleIds: ReadonlyArray<string>;
+  /** Graders declared in the config that no inspected run ever recorded — a
+   *  grader that never ran cannot have caught anything. */
+  readonly neverObservedGraders: ReadonlyArray<string>;
+  /** How many persisted runs the criterion analysis read. */
+  readonly runsInspected: number;
+  readonly deadCriteria: ReadonlyArray<DeadCriterion>;
+  /** Criterion observations available; below the floor the dead-criterion
+   *  analysis is skipped rather than guessed at. */
+  readonly criterionObservations: number;
+};
+
+/** Minimum (run × sample) observations before "this criterion never varies"
+ *  is a claim rather than a coincidence. */
+export const MIN_CRITERION_OBSERVATIONS = 4;
+
+/** How many of the spec's most recent persisted eval runs the dead-criterion
+ *  window reads. One run cannot distinguish "never varies" from "this run's
+ *  samples happened to agree"; a handful can. */
+export const DEFAULT_COVERAGE_GRADER_RUNS = 5;
+
+/** How grader-coverage names a grader in the report: the registry pack ref
+ *  when there is one (more actionable than the bare `registry` type). */
+function graderTypeLabel(g: CoverageGraderSpec): string {
+  return g.registryGrader ?? g.type;
+}
+
+/** One inspected run's persisted grades: sampleId → the run's `grades.json`
+ *  text (exactly what `loadRun().perSample[id].grades` carries). */
+export type RunGradesText = Readonly<Record<string, string>>;
+
+type PerGraderGrade = { name?: unknown; score?: unknown; detail?: unknown };
+
+/** Parse one `grades.json` into its perGrader entries; [] on anything torn —
+ *  a partial run must never abort a read-only report. */
+function readPerGrader(text: string): PerGraderGrade[] {
+  if (text.trim() === "") return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const per = (parsed as { perGrader?: unknown } | null)?.perGrader;
+  return Array.isArray(per) ? (per as PerGraderGrade[]) : [];
+}
+
+/**
+ * D44 — the grader-side coverage report: which graders can actually score
+ * which samples, which samples no gold-needing grader can score, which
+ * declared graders never ran, and which judge CRITERIA never moved.
+ *
+ * The dead-criterion signal reads the per-criterion breakdown A12 persists in
+ * each sample's `grades.json` (`perGrader[].detail`): a rubric criterion
+ * whose score is identical on every observation across the inspected runs is
+ * measuring nothing — it costs judge tokens on every sample and can never
+ * change a verdict. Below {@link MIN_CRITERION_OBSERVATIONS} observations the
+ * analysis is skipped (reported as 0 dead criteria), never guessed at.
+ */
+export function computeGraderCoverage(opts: {
+  readonly graders: ReadonlyArray<CoverageGraderSpec>;
+  readonly samples: ReadonlyArray<{ readonly id: string; readonly expected_output?: string }>;
+  /** Most-recent-first persisted runs. */
+  readonly runs?: ReadonlyArray<RunGradesText>;
+  readonly gradersFile?: string;
+  /** Predicate for "this grader requires expected_output" — the CLI passes
+   *  `dataset lint`'s own `graderNeedsGold` so both surfaces agree. */
+  readonly needsGold: (g: CoverageGraderSpec) => boolean;
+}): GraderCoverageReport {
+  const runs = opts.runs ?? [];
+  const goldless = opts.samples.filter(
+    (s) => s.expected_output === undefined || s.expected_output.trim() === "",
+  );
+  const goldlessIds = goldless.map((s) => s.id);
+
+  // Observed grader → sample reach, plus the criterion observations, in ONE
+  // pass over the persisted runs.
+  const observedByGrader = new Map<string, Set<string>>();
+  // Keyed by a JSON tuple so grader/criterion names containing spaces (or
+  // any separator) can never collide or be mis-split back apart.
+  const criterionValues = new Map<
+    string,
+    { grader: string; criterion: string; values: Set<number>; count: number; last: number }
+  >();
+  let criterionObservations = 0;
+  for (const run of runs) {
+    for (const [sampleId, text] of Object.entries(run)) {
+      for (const entry of readPerGrader(text)) {
+        if (typeof entry.name !== "string") continue;
+        const seen = observedByGrader.get(entry.name) ?? new Set<string>();
+        seen.add(sampleId);
+        observedByGrader.set(entry.name, seen);
+        const detail = entry.detail;
+        if (detail === null || typeof detail !== "object") continue;
+        for (const [criterion, value] of Object.entries(detail as Record<string, unknown>)) {
+          if (typeof value !== "number" || !Number.isFinite(value)) continue;
+          const key = JSON.stringify([entry.name, criterion]);
+          const bucket = criterionValues.get(key) ?? {
+            grader: entry.name,
+            criterion,
+            values: new Set<number>(),
+            count: 0,
+            last: 0,
+          };
+          bucket.values.add(value);
+          bucket.count += 1;
+          bucket.last = value;
+          criterionValues.set(key, bucket);
+          criterionObservations += 1;
+        }
+      }
+    }
+  }
+
+  const perGrader: GraderSampleCoverage[] = opts.graders.map((g) => {
+    const needsGold = opts.needsGold(g);
+    return {
+      grader: g.name,
+      type: graderTypeLabel(g),
+      needsGold,
+      scorable: needsGold ? opts.samples.length - goldless.length : opts.samples.length,
+      unscorableSampleIds: needsGold ? goldlessIds : [],
+      observedSamples: observedByGrader.get(g.name)?.size ?? 0,
+    };
+  });
+
+  const deadCriteria: DeadCriterion[] = [];
+  if (criterionObservations >= MIN_CRITERION_OBSERVATIONS) {
+    for (const [key, bucket] of criterionValues) {
+      if (bucket.values.size !== 1) continue;
+      if (bucket.count < MIN_CRITERION_OBSERVATIONS) continue;
+      const { grader, criterion } = bucket;
+      deadCriteria.push({ grader, criterion, value: bucket.last, observations: bucket.count });
+    }
+    deadCriteria.sort(
+      (a, b) =>
+        b.observations - a.observations ||
+        a.grader.localeCompare(b.grader) ||
+        a.criterion.localeCompare(b.criterion),
+    );
+  }
+
+  return {
+    ...(opts.gradersFile !== undefined ? { gradersFile: opts.gradersFile } : {}),
+    graderCount: opts.graders.length,
+    sampleCount: opts.samples.length,
+    perGrader,
+    goldlessSampleIds: goldlessIds,
+    neverObservedGraders:
+      runs.length === 0
+        ? []
+        : perGrader.filter((g) => g.observedSamples === 0).map((g) => g.grader),
+    runsInspected: runs.length,
+    deadCriteria,
+    criterionObservations,
+  };
+}
+
+/** The grader-coverage block of the text report (empty when absent). */
+export function renderGraderCoverageLines(
+  report: GraderCoverageReport | undefined,
+): ReadonlyArray<string> {
+  if (report === undefined) return [];
+  const lines: string[] = [""];
+  lines.push(
+    `grader coverage: ${report.graderCount} grader(s)${
+      report.gradersFile !== undefined ? ` (${report.gradersFile})` : ""
+    } vs ${report.sampleCount} sample(s)`,
+  );
+  for (const g of report.perGrader) {
+    const observed =
+      report.runsInspected === 0
+        ? ""
+        : `, graded ${g.observedSamples} sample(s) across ${report.runsInspected} run(s)`;
+    lines.push(
+      `  - ${g.grader} (${g.type}): scores ${g.scorable}/${report.sampleCount} sample(s)${observed}`,
+    );
+    if (g.unscorableSampleIds.length > 0) {
+      lines.push(
+        `      needs expected_output — ${g.unscorableSampleIds.length} gold-less sample(s) auto-fail: ${idPreview(g.unscorableSampleIds)}`,
+      );
+    }
+  }
+  if (report.neverObservedGraders.length > 0) {
+    lines.push(
+      `  ! never ran in the inspected run(s): ${report.neverObservedGraders.join(", ")} — a grader that never runs catches nothing`,
+    );
+  }
+  if (report.deadCriteria.length > 0) {
+    lines.push("");
+    lines.push(
+      `${report.deadCriteria.length} dead judge criterion/criteria (identical score on every observation — paying judge tokens for a constant):`,
+    );
+    for (const d of report.deadCriteria) {
+      lines.push(
+        `  - ${d.grader} › ${d.criterion}: always ${d.value} across ${d.observations} observation(s)`,
+      );
+    }
+  } else if (report.criterionObservations < MIN_CRITERION_OBSERVATIONS) {
+    lines.push(
+      `  (dead-criterion analysis skipped — ${report.criterionObservations} criterion observation(s) < ${MIN_CRITERION_OBSERVATIONS})`,
+    );
+  }
+  return lines;
+}
+
+const ID_PREVIEW_MAX = 5;
+function idPreview(ids: ReadonlyArray<string>): string {
+  const shown = ids.slice(0, ID_PREVIEW_MAX).join(", ");
+  return ids.length > ID_PREVIEW_MAX ? `${shown} +${ids.length - ID_PREVIEW_MAX} more` : shown;
+}
 
 const pct = (f: number): string => `${Math.round(f * 100)}%`;
 
@@ -332,6 +640,8 @@ export function computeCoverage(opts: {
   evalCov: EvalCoverage;
   specName?: string;
   datasetName?: string;
+  /** D44 — the grader-side report, when `--graders` named a config. */
+  graderCoverage?: GraderCoverageReport;
 }): CoverageReport {
   const { prod, evalCov } = opts;
   const gaps: CoverageGap[] = [];
@@ -386,6 +696,7 @@ export function computeCoverage(opts: {
     hasRunEvents: evalCov.hasRunEvents,
     gaps,
     inputThemes: prod.inputThemes,
+    ...(opts.graderCoverage !== undefined ? { graderCoverage: opts.graderCoverage } : {}),
   };
 }
 
@@ -419,6 +730,9 @@ export function renderCoverageJson(report: CoverageReport): string {
         count: t.count,
         exemplar: t.exemplar,
       })),
+      // D44 — omitted entirely without `--graders`, so pre-D44 JSON is
+      // byte-identical for every existing invocation.
+      ...(report.graderCoverage !== undefined ? { graderCoverage: report.graderCoverage } : {}),
     },
     null,
     2,
@@ -452,6 +766,7 @@ export function renderCoverageText(report: CoverageReport): string {
       lines.push(`  - "${t.label}" (${t.count} input(s)) e.g. ${clip(t.exemplar, 80)}`);
     }
   }
+  lines.push(...renderGraderCoverageLines(report.graderCoverage));
   return `${lines.join("\n")}\n`;
 }
 
@@ -485,6 +800,22 @@ export function renderCoverageHtml(report: CoverageReport): string {
         `      <li><strong>${escapeHtml(t.label)}</strong> — ${t.count} input(s): <code>${escapeHtml(clip(t.exemplar, 120))}</code></li>`,
     )
     .join("\n");
+  // D44 — the grader-coverage section. Rendered from the SAME lines the text
+  // report uses (one source of truth for the wording); absent without
+  // `--graders`, so every pre-D44 HTML report is byte-identical. BOTH the
+  // section slot AND its `pre` style rule are gated: an unconditional slot
+  // injects a stray newline before <script>, and an unconditional rule adds
+  // CSS no element uses — either one breaks the byte-identity claim, which
+  // is exactly the kind of quiet drift this campaign is closing.
+  const graderLines = renderGraderCoverageLines(report.graderCoverage);
+  const graderSection =
+    graderLines.length === 0
+      ? ""
+      : `<h2>Grader coverage</h2>\n<pre>${escapeHtml(graderLines.join("\n").trim())}</pre>\n`;
+  const graderStyle =
+    graderLines.length === 0
+      ? ""
+      : "\npre { background:var(--card); border:1px solid var(--border); border-radius:6px; padding:12px 14px; overflow-x:auto; font-size:13px; }";
   const gapSection =
     report.gaps.length === 0
       ? `<p class="empty">No coverage gaps — every production tool/sequence is exercised by the eval.</p>`
@@ -513,7 +844,7 @@ tr:last-child td { border-bottom:none; }
 code { background:#0a0c10; padding:2px 5px; border-radius:4px; font-size:12px; }
 .kind { font-weight:600; font-size:12px; text-transform:uppercase; }
 .kind-mcp-tool { color:var(--mcp); } .kind-tool { color:var(--link); } .kind-bigram { color:var(--warn); } .kind-compaction { color:var(--muted); }
-.empty { color:var(--muted); } ul { padding-left:20px; }
+.empty { color:var(--muted); } ul { padding-left:20px; }${graderStyle}
 </style>
 </head>
 <body>
@@ -522,7 +853,7 @@ code { background:#0a0c10; padding:2px 5px; border-radius:4px; font-size:12px; }
 <h2>Coverage gaps</h2>
 ${gapSection}
 ${report.inputThemes.length > 0 ? `<h2>Production input themes</h2>\n<ul>\n${themes}\n</ul>` : ""}
-<script>
+${graderSection}<script>
 (function(){
   function sortTable(table,col){var tb=table.querySelector('tbody');if(!tb)return;var rows=Array.from(tb.rows);var asc=table.dataset.sortCol===String(col)?table.dataset.sortDir!=='asc':true;rows.sort(function(a,b){var va=a.cells[col].dataset.sort||a.cells[col].textContent.trim();var vb=b.cells[col].dataset.sort||b.cells[col].textContent.trim();var na=parseFloat(va),nb=parseFloat(vb);if(!isNaN(na)&&!isNaN(nb))return asc?na-nb:nb-na;return asc?va.localeCompare(vb):vb.localeCompare(va);});rows.forEach(function(r){tb.appendChild(r);});table.dataset.sortCol=String(col);table.dataset.sortDir=asc?'asc':'desc';}
   document.querySelectorAll('table[data-sortable] th').forEach(function(th,i){th.addEventListener('click',function(){sortTable(th.closest('table'),i);});});

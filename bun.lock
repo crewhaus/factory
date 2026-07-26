@@ -49,6 +49,7 @@
         "@crewhaus/eval-runner": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/federation-discovery": "workspace:*",
+        "@crewhaus/feedback-distill": "workspace:*",
         "@crewhaus/gateway-server": "workspace:*",
         "@crewhaus/grader-safety-classifiers": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
@@ -851,6 +852,15 @@
         "@crewhaus/federation-discovery": "workspace:*",
         "@crewhaus/federation-protocol": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
+      },
+    },
+    "packages/feedback-distill": {
+      "name": "@crewhaus/feedback-distill",
+      "version": "0.4.0",
+      "dependencies": {
+        "@crewhaus/dataset-registry": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/pii-redactor": "workspace:*",
       },
     },
     "packages/gateway-protocol": {
@@ -2544,6 +2554,8 @@
     "@crewhaus/federation-protocol": ["@crewhaus/federation-protocol@workspace:packages/federation-protocol"],
 
     "@crewhaus/federation-router": ["@crewhaus/federation-router@workspace:packages/federation-router"],
+
+    "@crewhaus/feedback-distill": ["@crewhaus/feedback-distill@workspace:packages/feedback-distill"],
 
     "@crewhaus/gateway-protocol": ["@crewhaus/gateway-protocol@workspace:packages/gateway-protocol"],
 

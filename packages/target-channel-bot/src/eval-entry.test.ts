@@ -62,12 +62,17 @@ describe("emitChannelBot — evalEntry variant (cluster S)", () => {
 
   test("the loopback drives the REAL runTurn path (fresh session per sample)", () => {
     const entry = entryOf(MIN_IR);
-    expect(entry).toContain('import { createAgent } from "./agent.ts";');
+    expect(entry).toContain('import { createAgent, type AgentConfig } from "./agent.ts";');
     expect(entry).toContain("export async function runForEval(");
     expect(entry).toContain("agent.runTurn({");
     expect(entry).toContain("isNew: __history.length === 0,");
     // The prompt-cache stamp is a no-op store for one-shot eval turns.
     expect(entry).toContain("promptCacheStore: { read: async () => undefined,");
+    // Per-sample isolation: the memory/continuity fabric roots at the sample
+    // dir, never the operator's cwd (Pillar 2).
+    expect(entry).toContain("{ fabricRoot: __evalOpts.sessionRootDir }");
+    // The scripted-provider seam every bridged entry exposes.
+    expect(entry).toContain('_adapter?: AgentConfig["_adapter"];');
   });
 
   test("sample history pre-seeds the session transcript in runtime-core's replay shape", () => {
@@ -75,6 +80,18 @@ describe("emitChannelBot — evalEntry variant (cluster S)", () => {
     expect(entry).toContain('kind: __m.role === "user" ? "user_message" : "assistant_message",');
     expect(entry).toContain("payload: { content: __m.content },");
     expect(entry).toContain('import { openEventLog } from "@crewhaus/event-log";');
+  });
+
+  test("a seeded history also creates the session RECORD the resume path reads", () => {
+    // `isNew: false` makes runChatLoop call sessionStore.get(id) BEFORE it
+    // replays the log; an event log without its `<id>.json` record throws
+    // `cannot --resume ...: session not found`, killing every history-carrying
+    // sample before any model call.
+    const entry = entryOf(MIN_IR);
+    expect(entry).toContain('import { createSessionStore } from "@crewhaus/session-store";');
+    expect(entry).toContain("if ((await __store.get(__sessionId)) === null) {");
+    expect(entry).toContain("await __store.create({");
+    expect(entry).toContain('target: "channel",');
   });
 
   test("declared built-in tools register onto the catalog the agent snapshots", () => {

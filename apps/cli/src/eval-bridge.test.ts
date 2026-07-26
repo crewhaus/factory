@@ -296,10 +296,77 @@ describe("describeBridge (#10 + cluster S)", () => {
     expect(line).toContain("history samples: seeded");
   });
 
-  test("non-chat shapes advertise the history rejection", () => {
+  test("entry-driven non-chat shapes advertise the history rejection", () => {
     const projected = projectEvalIr(ir(WORKFLOW_YAML));
     const line = describeBridge(projected, selectInvoker("workflow"));
     expect(line).toContain("workflow-run");
-    expect(line).toContain("history samples: rejected (non-chat shape)");
+    expect(line).toContain("history samples: rejected (single-trigger runtime)");
+  });
+
+  test("entry-LESS bridges advertise the default invoker's native history seeding", () => {
+    // research/browser/onchain/batch run the eval-runner's own single-turn
+    // chat loop, which seeds history (B14) — the line must not claim rejection.
+    const projected = projectEvalIr(ir(WORKFLOW_YAML));
+    const line = describeBridge(projected, selectInvoker("onchain"));
+    expect(line).toContain("history samples: seeded by the default single-turn invoker");
+    expect(line).not.toContain("rejected");
+  });
+});
+
+// The recorded `specHash` (eval-runner hashes {name,target,model,instructions,
+// tools}) must move when the DRIVEN runtime moves — otherwise bridged
+// multi-stage baselines and cluster R's `--resume` guard cannot tell two
+// materially different workflows apart.
+describe("projectEvalIr — multi-stage run identity tracks the driven stages", () => {
+  const flow = (oneInstructions: string, twoInstructions: string, model = "claude-sonnet-4-6") => `
+name: a-flow
+target: workflow
+model: ${model}
+steps:
+  - name: one
+    instructions: ${oneInstructions}
+  - name: two
+    instructions: ${twoInstructions}
+`;
+  /** The exact tuple eval-runner's hashSpec digests. */
+  const hashInput = (yaml: string) => {
+    const p = projectEvalIr(ir(yaml));
+    return JSON.stringify({
+      name: p.name,
+      target: p.target,
+      model: p.agent.model,
+      instructions: p.agent.instructions,
+      tools: p.agent.tools,
+    });
+  };
+
+  test("editing a step's instructions changes the projected hash input", () => {
+    expect(hashInput(flow("step one", "step two"))).not.toBe(
+      hashInput(flow("step one", "step two REWRITTEN")),
+    );
+  });
+
+  test("editing BOTH steps' instructions changes it (the stage count is unchanged)", () => {
+    expect(hashInput(flow("step one", "step two"))).not.toBe(hashInput(flow("A", "B")));
+  });
+
+  test("an identical spec projects an identical hash input (deterministic)", () => {
+    expect(hashInput(flow("step one", "step two"))).toBe(hashInput(flow("step one", "step two")));
+  });
+
+  test("a per-stage tool change is covered too", () => {
+    const withTool = `
+name: a-flow
+target: workflow
+model: claude-sonnet-4-6
+steps:
+  - name: one
+    instructions: step one
+    tools:
+      - read
+  - name: two
+    instructions: step two
+`;
+    expect(hashInput(flow("step one", "step two"))).not.toBe(hashInput(withTool));
   });
 });

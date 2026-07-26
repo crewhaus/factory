@@ -714,6 +714,14 @@ export type EvalGradedEvent = TraceEventEnvelope & {
   graderType: "llm_judge" | "contains" | "regex";
   /** 0 = the original turn, n = the n-th evaluation-triggered retry. */
   retryIndex: number;
+  /**
+   * The block's resolved `max_retries` cap. Without it a consumer cannot tell
+   * a ladder that was SPENT (`retryIndex >= maxRetries`) from one cut short by
+   * budget/halt/an abort — `dataset mine` was calling both "retries
+   * exhausted". Optional so a sidecar recorded before this field still parses
+   * (readers treat absence as "exhaustion unknown", never as "exhausted").
+   */
+  maxRetries?: number;
 };
 
 /**

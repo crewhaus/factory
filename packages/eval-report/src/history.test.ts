@@ -23,6 +23,7 @@ import {
   hashDatasetFile,
   readBaselines,
   readRunIndex,
+  readRunIndexLatest,
   recordEvalRun,
   runIndexEntryFromSummary,
   setBaseline,
@@ -149,6 +150,61 @@ describe("run index (index.jsonl)", () => {
   });
 });
 
+/**
+ * NEW-HUNT-6 — `eval --resume` appends a SUPERSEDING entry under the run's
+ * original id rather than rewriting history in place, so runId is not unique
+ * in the raw log. The collapse lives in the shared package reader (not in one
+ * CLI helper), because every non-CLI consumer would otherwise double-count an
+ * N-times-resumed run in its tallies and cost sums.
+ */
+describe("readRunIndexLatest (supersede collapse)", () => {
+  test("keeps the newest entry per runId, in log order", () => {
+    const evalsDir = join(newTempRoot(), ".crewhaus", "evals");
+    appendRunIndex(
+      makeEntry("run_aaaa1111aaaa1111", { passRate: 0.25, ts: "2026-07-01T00:00:00.000Z" }),
+      evalsDir,
+    );
+    appendRunIndex(
+      makeEntry("run_bbbb2222bbbb2222", { passRate: 1, ts: "2026-07-01T00:00:01.000Z" }),
+      evalsDir,
+    );
+    // Two more attempts of the FIRST run.
+    appendRunIndex(
+      makeEntry("run_aaaa1111aaaa1111", { passRate: 0.5, ts: "2026-07-01T00:00:02.000Z" }),
+      evalsDir,
+    );
+    appendRunIndex(
+      makeEntry("run_aaaa1111aaaa1111", { passRate: 0.9, ts: "2026-07-01T00:00:03.000Z" }),
+      evalsDir,
+    );
+
+    // The raw reader still returns every line (auditing the attempts).
+    expect(readRunIndex(evalsDir)).toHaveLength(4);
+
+    const latest = readRunIndexLatest(evalsDir);
+    expect(latest).toHaveLength(2);
+    expect(latest.map((e) => e.runId)).toEqual(["run_bbbb2222bbbb2222", "run_aaaa1111aaaa1111"]);
+    expect(latest.find((e) => e.runId === "run_aaaa1111aaaa1111")?.passRate).toBe(0.9);
+  });
+
+  test("a later append wins a timestamp TIE (same-second resume)", () => {
+    const evalsDir = join(newTempRoot(), ".crewhaus", "evals");
+    appendRunIndex(makeEntry("run_aaaa1111aaaa1111", { passRate: 0.25 }), evalsDir);
+    appendRunIndex(makeEntry("run_aaaa1111aaaa1111", { passRate: 1 }), evalsDir);
+    const latest = readRunIndexLatest(evalsDir);
+    expect(latest).toHaveLength(1);
+    expect(latest[0]?.passRate).toBe(1);
+  });
+
+  test("without duplicates it is the identity (existing histories read unchanged)", () => {
+    const evalsDir = join(newTempRoot(), ".crewhaus", "evals");
+    appendRunIndex(makeEntry("run_aaaa1111aaaa1111"), evalsDir);
+    appendRunIndex(makeEntry("run_bbbb2222bbbb2222"), evalsDir);
+    expect(readRunIndexLatest(evalsDir)).toEqual(readRunIndex(evalsDir));
+    expect(readRunIndexLatest(join(newTempRoot(), "nope"))).toEqual([]);
+  });
+});
+
 function makeSampleResult(id: string, passed: boolean, retried = false): SampleResult {
   return {
     sampleId: id,
@@ -259,6 +315,60 @@ describe("recordEvalRun / runIndexEntryFromSummary", () => {
     expect(bare.gradersHash).toBeUndefined();
     expect(bare.judgeModel).toBeUndefined();
     expect(bare.specSource).toBeUndefined();
+  });
+
+  test("marks a cassette-REPLAYED run — a live run and a replayed one are not the same measurement", () => {
+    // NEW-HUNT-4 — without this, `crewhaus eval --replay-tools ./cassette
+    // --gate --promote` pins a run whose every tool result was frozen, and
+    // nothing in `eval-report history`, `baseline show` or the gate output
+    // ever says so; only the run dir's run.json knew.
+    const replayed = runIndexEntryFromSummary(
+      makeSummary([makeSampleResult("a", true)], {
+        toolRecording: { mode: "replay", dir: "/abs/cassette", recordingHash: "h".repeat(64) },
+      }),
+      { specName: "s", datasetHash: "d".repeat(64), outDir: "/abs/run" },
+    );
+    expect(replayed.replayed).toBe(true);
+    // Recording still hits the world, so only replay is marked…
+    const recording = runIndexEntryFromSummary(
+      makeSummary([makeSampleResult("a", true)], {
+        toolRecording: { mode: "record", dir: "/abs/cassette" },
+      }),
+      { specName: "s", datasetHash: "d".repeat(64), outDir: "/abs/run" },
+    );
+    expect(recording.replayed).toBeUndefined();
+    // …and an ordinary run's entry is byte-identical to before the field.
+    const live = runIndexEntryFromSummary(makeSummary([makeSampleResult("a", true)]), {
+      specName: "s",
+      datasetHash: "d".repeat(64),
+      outDir: "/abs/run",
+    });
+    expect(live.replayed).toBeUndefined();
+    expect(Object.keys(live)).not.toContain("replayed");
+  });
+
+  test("records the agent/judge halves of the cost the caller priced", () => {
+    // C35 — `costUsd` is the TOTAL (what the run printed and what
+    // `--max-cost-usd` gates on); the halves ride along so trends can
+    // separate agent spend from grading spend.
+    const entry = runIndexEntryFromSummary(makeSummary([makeSampleResult("a", true)]), {
+      specName: "s",
+      datasetHash: "d".repeat(64),
+      outDir: "/abs/run",
+      costUsd: 6,
+      agentCostUsd: 2,
+      judgeCostUsd: 4,
+    });
+    expect(entry.costUsd).toBe(6);
+    expect(entry.agentCostUsd).toBe(2);
+    expect(entry.judgeCostUsd).toBe(4);
+    const unpriced = runIndexEntryFromSummary(makeSummary([makeSampleResult("a", true)]), {
+      specName: "s",
+      datasetHash: "d".repeat(64),
+      outDir: "/abs/run",
+    });
+    expect(Object.keys(unpriced)).not.toContain("agentCostUsd");
+    expect(Object.keys(unpriced)).not.toContain("judgeCostUsd");
   });
 
   test("appends to index.jsonl so readRunIndex (and `eval-report history`) sees the run", () => {

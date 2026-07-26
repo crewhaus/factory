@@ -83,6 +83,7 @@
 import { join } from "node:path";
 import { GraderError } from "@crewhaus/eval-grader";
 import type { GradeResult, Grader, RunResult, Sample } from "@crewhaus/eval-grader";
+import type { JudgeUsageSink } from "@crewhaus/eval-judge";
 import { GraderRegistry, discoverPluginGraders } from "@crewhaus/grader-registry";
 import { z } from "zod";
 import {
@@ -194,13 +195,23 @@ const SafetyClassifierOpts = z
 
 type SafetyClassifierOptsT = z.infer<typeof SafetyClassifierOpts>;
 
+/**
+ * C35 — the run's judge-token sink, held by reference so a registry built
+ * BEFORE the run (the CLI builds its own and passes it in) still meters:
+ * `runEval` installs the sink via {@link DefaultGraderRegistry.setJudgeUsageSink}
+ * and the lazy graders read `.sink` at classify time.
+ */
+export type JudgeUsageHolder = { sink?: JudgeUsageSink };
+
 /** A7 — `safety.toxicity`/`safety.bias`: resolve the judge-backed
  *  classifier from `opts.classifier` or the environment at FIRST grade
  *  (the lazySemanticSimilarity pattern), keeping the unwired default a
- *  loud teaching error. */
+ *  loud teaching error. C35 — every judge call it makes meters through
+ *  `usage.sink` (the same sink `llm_judge` graders report to). */
 function lazyJudgeSafetyGrader(
   kind: JudgeClassifierKind,
   opts: SafetyClassifierOptsT = {},
+  usage?: JudgeUsageHolder,
 ): Grader {
   let resolved: Grader | undefined;
   return async (sample, run) => {
@@ -214,7 +225,7 @@ function lazyJudgeSafetyGrader(
       const safety = await import("@crewhaus/grader-safety-classifiers");
       const build = kind === "toxicity" ? safety.toxicity : safety.bias;
       resolved = build({
-        classifier: judgeBackedClassifier(kind, spec),
+        classifier: judgeBackedClassifier(kind, spec, undefined, () => usage?.sink),
         ...(opts.threshold !== undefined ? { threshold: opts.threshold } : {}),
       });
     }
@@ -328,6 +339,21 @@ export class DefaultGraderRegistry extends GraderRegistry {
   private readonly pluginNames = new Set<string>();
   /** Pack names that accept construction opts, with their strict schemas. */
   private readonly packFactories = new Map<string, PackOptsFactory>();
+  /** C35 — the judge-token sink this registry's judge-backed graders report
+   *  to, shared by reference with every lazily-built classifier. */
+  readonly judgeUsage: JudgeUsageHolder = {};
+
+  /**
+   * C35 — install the run's judge-token sink. `runEval` calls this on
+   * whatever registry it ends up using (its own, or one the CLI built and
+   * passed in), so judge-backed registry graders — `safety.toxicity`,
+   * `safety.bias` — meter into `aggregates.judgeUsage` exactly like
+   * `llm_judge` graders. Registries that do not implement it simply do not
+   * meter (the optional method on {@link GraderLookup}).
+   */
+  setJudgeUsageSink(sink: JudgeUsageSink): void {
+    this.judgeUsage.sink = sink;
+  }
 
   /** @internal — construction wiring for `defaultGraderRegistry`. */
   installPackFactory(name: string, factory: PackOptsFactory): void {
@@ -409,8 +435,8 @@ export async function defaultGraderRegistry(
   // A7 — judge-backed classifiers wired lazily from
   // CREWHAUS_EVAL_CLASSIFIER / opts.classifier; the honest keyword mocks
   // stay reachable ONLY under the explicit `.heuristic` names.
-  registry.register("safety.toxicity", lazyJudgeSafetyGrader("toxicity"));
-  registry.register("safety.bias", lazyJudgeSafetyGrader("bias"));
+  registry.register("safety.toxicity", lazyJudgeSafetyGrader("toxicity", {}, registry.judgeUsage));
+  registry.register("safety.bias", lazyJudgeSafetyGrader("bias", {}, registry.judgeUsage));
   registry.register(
     "safety.toxicity.heuristic",
     safety.toxicity({ classifier: new safety.MockToxicityClassifier() }),
@@ -479,11 +505,15 @@ export async function defaultGraderRegistry(
   // A7/A8 — classifier + OCR wiring reachable via pack opts (NEW-HUNT-7).
   registry.installPackFactory(
     "safety.toxicity",
-    packOptsFactory(SafetyClassifierOpts, (o) => lazyJudgeSafetyGrader("toxicity", o)),
+    packOptsFactory(SafetyClassifierOpts, (o) =>
+      lazyJudgeSafetyGrader("toxicity", o, registry.judgeUsage),
+    ),
   );
   registry.installPackFactory(
     "safety.bias",
-    packOptsFactory(SafetyClassifierOpts, (o) => lazyJudgeSafetyGrader("bias", o)),
+    packOptsFactory(SafetyClassifierOpts, (o) =>
+      lazyJudgeSafetyGrader("bias", o, registry.judgeUsage),
+    ),
   );
   registry.installPackFactory(
     "safety.toxicity.heuristic",

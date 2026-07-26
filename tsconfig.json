@@ -142,6 +142,7 @@
     { "path": "./packages/deployment-controller" },
     { "path": "./packages/canary-controller" },
     { "path": "./packages/dataset-registry" },
+    { "path": "./packages/feedback-distill" },
     { "path": "./packages/grader-registry" },
     { "path": "./packages/regression-runner" },
     { "path": "./packages/prompt-optimizer" },

@@ -31,7 +31,7 @@
  */
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import { GraderError } from "@crewhaus/eval-grader";
-import type { CategoricalRubric } from "@crewhaus/eval-judge";
+import type { CategoricalRubric, JudgeUsageSink } from "@crewhaus/eval-judge";
 import type { Classifier, ClassifierResult } from "@crewhaus/grader-safety-classifiers";
 
 /** Env var naming the judge model spec for `safety.toxicity` /
@@ -98,17 +98,27 @@ const CLASSIFIER_RUBRICS: Record<JudgeClassifierKind, CategoricalRubric> = {
  * model-router spec (e.g. "openai/gpt-4o-mini", "claude-sonnet-4-5");
  * `adapter` injects a pre-built ProviderAdapter (tests / programmatic
  * callers) exactly like every other judge entrypoint.
+ *
+ * C35 — `onUsage` is the SAME per-call token sink `llm_judge` graders get
+ * (`runEval`'s `meterJudgeUsage`, installed on the default registry via
+ * `setJudgeUsageSink`). Without it a `safety.toxicity`/`safety.bias` run
+ * would pay for judge calls that appear in neither the `[eval] cost:` line
+ * nor `aggregates.judgeUsage` — an unmetered judge is exactly the hole C35
+ * exists to close. Resolved lazily per call so a sink installed after
+ * construction (registry built first, run started second) still meters.
  */
 export function judgeBackedClassifier(
   kind: JudgeClassifierKind,
   modelSpec: string,
   adapter?: ProviderAdapter,
+  onUsage?: () => JudgeUsageSink | undefined,
 ): Classifier {
   const rubric = CLASSIFIER_RUBRICS[kind];
   return {
     id: `judge-${kind}:${modelSpec}`,
     classify: async (text: string): Promise<ClassifierResult> => {
       const { judgeCategorical } = await import("@crewhaus/eval-judge");
+      const sink = onUsage?.();
       const result = await judgeCategorical({
         rubric,
         // The classifier grades bare text — there is no task input; say so
@@ -120,6 +130,7 @@ export function judgeBackedClassifier(
         agentOutput: text,
         model: modelSpec,
         ...(adapter !== undefined ? { adapter } : {}),
+        ...(sink !== undefined ? { onUsage: sink } : {}),
       });
       if (result.abstain) {
         throw new GraderError(

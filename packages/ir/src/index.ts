@@ -1453,6 +1453,10 @@ export type IrManagedV0 = {
   /** Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
    *  Optional; absent when the spec omits the `evaluation` block. */
   readonly evaluation?: IrEvaluation;
+  /** NEW-inloop-coverage — response-feedback config. Gates the gateway's
+   *  `feedback.submit` rating route and (with `autoDistill`) the daemon's
+   *  distill janitor step. Absent when the spec omits the block. */
+  readonly feedback?: IrFeedback;
   /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
   readonly memory?: IrMemory;
   /** Loop contract 0.4 (Batch E, G22) — agent-shape RAG config. Present when

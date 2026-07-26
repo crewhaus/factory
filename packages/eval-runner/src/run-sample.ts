@@ -19,6 +19,7 @@ import type {
   TraceEvent,
 } from "@crewhaus/trace-event-bus";
 import { RunnerError } from "./errors";
+import { sampleArtifactDirName } from "./resume";
 import type { AgentInvoker, GraderEntry, SampleMetrics, SampleResult } from "./types";
 
 /**
@@ -61,7 +62,7 @@ export async function runSample(args: {
 }): Promise<SampleResult> {
   const { sample, invoker, graders, outDir, model } = args;
   const trialSuffix = args.trial !== undefined && args.trial > 1 ? `.trial${args.trial}` : "";
-  const sampleDir = join(outDir, `${sanitize(sample.id)}${trialSuffix}`);
+  const sampleDir = join(outDir, `${sampleArtifactDirName(sample.id)}${trialSuffix}`);
   mkdirSync(sampleDir, { recursive: true });
 
   const runContext = args.runContext ?? createRunContext();
@@ -408,11 +409,6 @@ function combineOverall(
 /** Helper: produce one combined grader from an array of CompiledGrader. */
 export function combineGraderEntries(graders: ReadonlyArray<CompiledGrader>): Grader {
   return combineCompiledGraders(graders);
-}
-
-/** Strip path separators from sample IDs to keep the on-disk layout flat. */
-function sanitize(id: string): string {
-  return id.replace(/[^A-Za-z0-9_.-]/g, "_");
 }
 
 async function readTranscript(dir: string, sessionId: string): Promise<TranscriptEvent[]> {
