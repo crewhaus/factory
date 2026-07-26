@@ -33,6 +33,7 @@
 import { readFileSync } from "node:fs";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import type { Sample } from "@crewhaus/eval-dataset";
 import { loadDataset } from "@crewhaus/eval-dataset";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
@@ -114,6 +115,15 @@ export type CreateExamRunnerOptions = {
   /** Judge model for `llm_judge` graders. Default: the harness model. */
   readonly judgeModel?: string;
   /**
+   * Injectable judge transport (tests / bespoke judge stacks): a pre-built
+   * ProviderAdapter every `llm_judge` grader is bound to, exactly like
+   * `JudgeOptions.adapter`. Absent (every production caller): each judge
+   * call resolves its model through the model-router. This is the seam
+   * exam.judge.test.ts rides — a real eval-judge stack over a stub adapter,
+   * with no process-global `mock.module` involved.
+   */
+  readonly judgeAdapter?: ProviderAdapter;
+  /**
    * A11 — resolves `type: registry` graders in `learning.exam.graders`.
    * Absent (every production caller): the exam builds the SAME default
    * registry `crewhaus eval` falls back to — the specialty packs plus
@@ -178,6 +188,7 @@ export function createExamRunner(opts: CreateExamRunnerOptions): ExamRunner {
           const categoricalRubric = loadCategoricalRubric(g.judgeSpec.rubric);
           const grader = createJudgeGrader(categoricalRubric, {
             model,
+            ...(opts.judgeAdapter !== undefined ? { adapter: opts.judgeAdapter } : {}),
             ...(g.judgeSpec.temperature !== undefined
               ? { temperature: g.judgeSpec.temperature }
               : {}),
@@ -191,6 +202,7 @@ export function createExamRunner(opts: CreateExamRunnerOptions): ExamRunner {
         // NEW-graders-3 — `target: transcript` judges the exam trajectory.
         const grader = createJudgeGrader(rubric, {
           model,
+          ...(opts.judgeAdapter !== undefined ? { adapter: opts.judgeAdapter } : {}),
           ...(g.judgeSpec.judges !== undefined ? { judges: g.judgeSpec.judges } : {}),
           ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
           ...(g.judgeSpec.temperature !== undefined

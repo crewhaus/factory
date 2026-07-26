@@ -83,6 +83,14 @@ afterAll(() => {
   mock.module("@crewhaus/eval-judge", () => realEvalJudge);
 });
 
+// G47 hermeticity — the scalar judge rubrics here declare no
+// `passing_score`, so runEval would otherwise consult
+// `<process.cwd()>/.crewhaus/judge-calibration.json` for the calibrated
+// cut: a stale calibration file sitting in the checkout must never re-gate
+// (or WARN inside) these tests. The one test that PINS calibration
+// behavior injects its own readCalibrationFile instead.
+const noCalibration = { readCalibrationFile: () => undefined } as const;
+
 // A compiled grader with a judgeSpec but no per-grader model → uses opts.judgeModel.
 function judgeGraderNoModel(name: string): CompiledGrader {
   return {
@@ -123,7 +131,7 @@ describe("runEval — llm_judge resolution", () => {
       ir,
       dataset: { name: "judged", samples: yieldSamples(samples) },
       compiledGraders: [judgeGraderNoModel("rubricA")],
-      opts: { invoker, outDir, judgeModel: "claude-judge-x" },
+      opts: { invoker, outDir, judgeModel: "claude-judge-x", ...noCalibration },
     });
 
     expect(loadedRubrics).toHaveLength(1);
@@ -160,7 +168,7 @@ describe("runEval — llm_judge resolution", () => {
           judgeSpec: { ...(grader.judgeSpec as object), temperature: 0.5, repeats: 3 } as never,
         },
       ],
-      opts: { invoker, outDir },
+      opts: { invoker, outDir, ...noCalibration },
     });
 
     const runJson = JSON.parse(readFileSync(join(outDir, "run.json"), "utf-8"));
@@ -190,7 +198,7 @@ describe("runEval — llm_judge resolution", () => {
           } as never,
         },
       ],
-      opts: { invoker, outDir },
+      opts: { invoker, outDir, ...noCalibration },
     });
 
     // The panel roster reaches the grader factory …
@@ -222,7 +230,7 @@ describe("runEval — llm_judge resolution", () => {
       ir,
       dataset: { name: "judged-single", samples: yieldSamples(samples) },
       compiledGraders: [judgeGraderNoModel("rubricSingle")],
-      opts: { invoker, outDir },
+      opts: { invoker, outDir, ...noCalibration },
     });
     const entry = summary.config.judgeSampling?.[0];
     expect(entry).toEqual({ name: "rubricSingle", temperature: 0, repeats: 1 });
@@ -241,7 +249,7 @@ describe("runEval — llm_judge resolution", () => {
       dataset: { name: "judged2", samples: yieldSamples(samples) },
       compiledGraders: [judgeGraderWithModel("rubricB", "claude-override")],
       // No opts.judgeModel → the per-grader override must win.
-      opts: { invoker, outDir },
+      opts: { invoker, outDir, ...noCalibration },
     });
 
     expect(boundModels).toEqual(["claude-override"]);
@@ -258,7 +266,7 @@ describe("runEval — llm_judge resolution", () => {
       ir,
       dataset: { name: "judged3", samples: yieldSamples(samples) },
       compiledGraders: [judgeGraderNoModel("rubricC")],
-      opts: { invoker, outDir },
+      opts: { invoker, outDir, ...noCalibration },
     });
 
     // model is undefined → createJudgeGrader called with `{}` (no model key).
@@ -301,7 +309,7 @@ describe("runEval — categorical rubrics + target (cluster C)", () => {
       ir,
       dataset: { name: "judged-categorical", samples: yieldSamples(samples) },
       compiledGraders: [categoricalGrader("labeler")],
-      opts: { invoker, outDir, judgeModel: "claude-judge-x" },
+      opts: { invoker, outDir, judgeModel: "claude-judge-x", ...noCalibration },
     });
 
     // The REAL loadCategoricalRubric validated it (defaults applied) and the
@@ -335,7 +343,7 @@ describe("runEval — categorical rubrics + target (cluster C)", () => {
             } as never,
           },
         ],
-        opts: { invoker, outDir },
+        opts: { invoker, outDir, ...noCalibration },
       }),
     ).rejects.toThrow(/not a declared label/);
   });
@@ -381,7 +389,7 @@ describe("runEval — categorical rubrics + target (cluster C)", () => {
           judgeSpec: { ...(grader.judgeSpec as object), target: "transcript" } as never,
         },
       ],
-      opts: { invoker, outDir },
+      opts: { invoker, outDir, ...noCalibration },
     });
 
     expect(boundOpts).toHaveLength(1);
@@ -404,7 +412,7 @@ describe("runEval — categorical rubrics + target (cluster C)", () => {
       ir,
       dataset: { name: "judged-no-target", samples: yieldSamples(samples) },
       compiledGraders: [judgeGraderNoModel("rubricPlain")],
-      opts: { invoker, outDir },
+      opts: { invoker, outDir, ...noCalibration },
     });
 
     expect(boundOpts[0] !== undefined && "target" in boundOpts[0]).toBe(false);
