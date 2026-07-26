@@ -211,6 +211,16 @@ describe("assertFromAdviceFlagsCompatible", () => {
       /--from-advice is mutually exclusive with --iterations/,
     );
   });
+
+  test("rejects --stage: the advice path runs no per-stage search", () => {
+    expect(() =>
+      assertFromAdviceFlagsCompatible({ mutator: false, iterations: false, stage: true }),
+    ).toThrow(/--stage has no meaning with --from-advice/);
+    // Absent/false stays compatible (the flag is optional on the seam).
+    expect(() =>
+      assertFromAdviceFlagsCompatible({ mutator: false, iterations: false, stage: false }),
+    ).not.toThrow();
+  });
 });
 
 // -------- acceptance semantics --------

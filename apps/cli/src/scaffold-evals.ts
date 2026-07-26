@@ -27,6 +27,15 @@
  * stacking graders hard-ANDs their scores (the eval-grader `all(...)`
  * min-collapse), exactly the gotcha distill's output already documents.
  *
+ * E47 adds a THIRD mode on top of both: `--template <family>` consumes a
+ * `grader-template` manifest from the CLI's EMBEDDED eval-template library
+ * instead of drafting assets from scratch ({@link applyEvalTemplate}). Those
+ * families ship inside the binary, so there is nothing to fetch and no
+ * signature to check; the manifest KIND is registry-signable, but no consumer
+ * resolves a registry-hosted eval template yet. Template mode is offline by
+ * construction — a template is static content, so no model call happens on
+ * that path even with credentials in the environment.
+ *
  * Kept in a side-effect-free module (the CLI entry file runs an argv switch
  * on import) mirroring `feedback.ts` / `datasets.ts`; all filesystem access
  * and the actual model call live in `apps/cli/src/index.ts`.
@@ -397,6 +406,159 @@ export function buildScaffoldGraders(
       },
     ],
   };
+}
+
+// -------- E47: template mode (eval-template family library) --------
+
+/** A seed sample carried inside a `grader-template` manifest. Structurally
+ *  the template-registry's `EvalTemplateSample`, re-declared here so this
+ *  module keeps its pure-function shape (the CLI passes the manifest's
+ *  block straight in). */
+export type TemplateSeedSample = {
+  readonly id: string;
+  readonly input: string;
+  readonly expected_output?: string;
+  readonly expected_tools?: ReadonlyArray<string>;
+  readonly metadata?: Readonly<Record<string, unknown>>;
+};
+
+export type TemplateEvalAssets = {
+  readonly gradersYaml: string;
+  readonly notes?: string;
+  readonly seedDataset?: ReadonlyArray<TemplateSeedSample>;
+};
+
+export type TemplateApplication = {
+  /** graders.yaml text to write: the template's own, with one provenance
+   *  header prepended. The rubric body is byte-for-byte the template's — a
+   *  reviewer diffing against the published family must see no edits. */
+  readonly gradersYaml: string;
+  readonly samples: Sample[];
+  /** How many samples came from the template's seed dataset … */
+  readonly seedCount: number;
+  /** … and how many were topped up from the spec's own instructions. */
+  readonly stubCount: number;
+  /** True when `--samples N` was capped at the seed count because the
+   *  family's graders need a gold answer (see `requiresGold`). The CLI
+   *  prints the reason — a silently short dataset would look like a bug. */
+  readonly goldCapped: boolean;
+};
+
+/**
+ * Apply a grader-template family to a spec: the family's graders.yaml is
+ * copied verbatim (it is the reviewed artifact — the whole point of a
+ * template is that its anchors were written once, carefully), and its seed
+ * dataset is used as the starting samples, topped up to `n` with the
+ * deterministic spec-derived stubs when the family ships fewer.
+ *
+ * `requiresGold` SUPPRESSES that top-up: a family whose graders need
+ * `expected_output` on every sample (the `classify` family's
+ * `expected_contains`, any `nlg.*`/`semantic.similarity` pack) would grade a
+ * generated stub — which never carries a gold — as an automatic FAIL, and
+ * `crewhaus eval`'s preflight only REFUSES a wholly gold-less dataset, so a
+ * topped-up one would run, spend, and score a ceiling of
+ * `seeds / --samples`. Fewer real samples beat a dataset that is broken by
+ * construction; the caller reports the cap via {@link
+ * TemplateApplication.goldCapped}.
+ *
+ * Pure and offline: same inputs → same bytes, no credentials, no model call.
+ * Seed samples keep their own ids and metadata, plus the template provenance
+ * (`template` / `template_version`) so a later `dataset audit` can tell
+ * generic starter rows from real domain data.
+ */
+export function applyEvalTemplate(opts: {
+  readonly info: ScaffoldInfo;
+  readonly family: string;
+  readonly version: string;
+  readonly assets: TemplateEvalAssets;
+  readonly samples: number;
+  /** True when every grader in `assets.gradersYaml` needs a gold answer —
+   *  computed by the caller with the SAME predicate `dataset lint` and the
+   *  eval preflight use (`graderNeedsGold`), never a second heuristic. */
+  readonly requiresGold?: boolean;
+}): TemplateApplication {
+  const seeds = (opts.assets.seedDataset ?? []).slice(0, Math.max(0, opts.samples));
+  const seedSamples: Sample[] = seeds.map((s) => ({
+    id: s.id,
+    input: s.input,
+    ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
+    ...(s.expected_tools !== undefined ? { expected_tools: [...s.expected_tools] } : {}),
+    metadata: {
+      ...(s.metadata ?? {}),
+      template: opts.family,
+      template_version: opts.version,
+    },
+  }));
+  const requestedTopUp = Math.max(0, opts.samples - seedSamples.length);
+  const goldCapped = opts.requiresGold === true && requestedTopUp > 0;
+  const remaining = goldCapped ? 0 : requestedTopUp;
+  const stubs =
+    remaining > 0
+      ? buildScaffoldSamples(opts.info, templateSampleInputs(opts.info, remaining), "template").map(
+          (s) => ({
+            ...s,
+            metadata: { ...(s.metadata ?? {}), template: opts.family },
+          }),
+        )
+      : [];
+  // Seed ids are template-authored and stub ids are `scaffold_NN` — they
+  // cannot collide today, but a duplicate id would corrupt the run's
+  // per-sample artifact dirs, so the guard is cheap insurance.
+  const seen = new Set(seedSamples.map((s) => s.id));
+  const deduped: Sample[] = [...seedSamples];
+  for (const stub of stubs) {
+    let id = stub.id;
+    let n = 2;
+    while (seen.has(id)) {
+      id = `${stub.id}_${n}`;
+      n += 1;
+    }
+    seen.add(id);
+    deduped.push({ ...stub, id });
+  }
+  return {
+    gradersYaml: `${templateGradersHeader(opts.family, opts.version, opts.info.name).join("\n")}\n${opts.assets.gradersYaml}`,
+    samples: deduped,
+    seedCount: seedSamples.length,
+    stubCount: deduped.length - seedSamples.length,
+    goldCapped,
+  };
+}
+
+/** The note printed when {@link applyEvalTemplate} capped the sample count:
+ *  it must say WHY, or "I asked for 8 and got 3" reads as a bug. */
+export function goldCapNote(family: string, seedCount: number, requested: number): string {
+  return [
+    `--samples ${requested} capped at the ${seedCount} gold-carrying seed(s): every grader in the`,
+    `    "${family}" family needs an expected_output, and a generated stub has none — topping up`,
+    "    would write samples that auto-fail. Add rows with your own gold answers instead.",
+  ].join("\n");
+}
+
+/** The provenance header prepended to a copied family graders.yaml. */
+export function templateGradersHeader(
+  family: string,
+  version: string,
+  specName: string,
+): ReadonlyArray<string> {
+  return [
+    `# Copied from the eval-template family "${family}"@${version} by`,
+    `# \`crewhaus scaffold-evals --template ${family}\` for the "${specName}" harness.`,
+    "# The rubric below is the family's, unedited — review it against YOUR",
+    "# definition of a good answer before gating anything on it.",
+  ];
+}
+
+/** The refusal for an unknown `--template <family>`: never guess, always
+ *  list what is available (the gallery IS the discovery surface). */
+export function unknownTemplateMessage(
+  requested: string,
+  catalog: ReadonlyArray<{ readonly name: string; readonly description: string }>,
+): string {
+  const lines = [`unknown --template "${requested}" — available eval-template families:`];
+  for (const entry of catalog) lines.push(`  ${entry.name.padEnd(12)}${entry.description}`);
+  lines.push("run without --template for assets derived from the spec itself");
+  return lines.join("\n");
 }
 
 // -------- model mode (pure halves; the call lives in index.ts) --------

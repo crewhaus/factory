@@ -9,6 +9,7 @@
     { "path": "../../packages/adapter-anthropic" },
     { "path": "../../packages/agent-context-isolation" },
     { "path": "../../packages/eval-optimizer-orchestrator" },
+    { "path": "../../packages/meta-harness-optimizer" },
     { "path": "../../packages/prompt-optimizer" },
     { "path": "../../packages/prompt-optimizer-claude" },
     { "path": "../../packages/justification-judge-claude" },

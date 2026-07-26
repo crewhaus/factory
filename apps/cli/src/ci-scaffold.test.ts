@@ -172,6 +172,70 @@ describe("buildSentinelDriftWorkflowYaml (item 30)", () => {
     // Root scaffold stays unprefixed.
     expect(yaml).not.toContain("working-directory:");
   });
+
+  // NEW-HUNT-8 — the optional nightly tier beside the drift probe.
+  test("without --suite the document is byte-identical to the pre-suite scaffold", () => {
+    expect(buildSentinelDriftWorkflowYaml({ suite: undefined })).toBe(yaml);
+    expect(yaml).not.toContain("eval suite");
+  });
+
+  test("--suite appends a nightly-tier step that runs even when the probe failed", () => {
+    const withSuite = buildSentinelDriftWorkflowYaml({ suite: "eval/suite.yaml" });
+    expect(withSuite.startsWith(yaml)).toBe(true); // purely additive
+    expect(withSuite).toContain("crewhaus eval suite eval/suite.yaml --tier nightly --gate");
+    expect(withSuite).toContain("if: always()");
+  });
+});
+
+// -------- NEW-HUNT-8: the tiered CI workflow --------
+
+describe("buildEvalCiWorkflowYaml --suite (NEW-HUNT-8)", () => {
+  const plain = buildEvalCiWorkflowYaml();
+  const tiered = buildEvalCiWorkflowYaml({ suite: "eval/suite.yaml" });
+
+  test("omitting --suite leaves the single-eval workflow untouched", () => {
+    expect(buildEvalCiWorkflowYaml({ suite: undefined })).toBe(plain);
+    expect(plain).not.toContain("eval suite");
+  });
+
+  test("PR job runs the fast tier twice — base spec pins, PR spec gates", () => {
+    expect(tiered).toContain("crewhaus eval suite eval/suite.yaml --tier fast \\");
+    expect(tiered).toContain("--spec .crewhaus-ci/base/crewhaus.yaml");
+    expect(tiered).toContain("crewhaus eval suite eval/suite.yaml --tier fast --gate \\");
+    // The base run comes first — it is what pins each entry's baseline.
+    expect(tiered.indexOf("--spec .crewhaus-ci/base/crewhaus.yaml")).toBeLessThan(
+      tiered.indexOf("--tier fast --gate"),
+    );
+  });
+
+  test("a nightly job runs the nightly tier on a cron, not on PRs", () => {
+    expect(tiered).toContain("nightly-tier:");
+    expect(tiered).toContain("if: github.event_name != 'pull_request'");
+    expect(tiered).toContain("crewhaus eval suite eval/suite.yaml --tier nightly --gate");
+    expect(tiered).toContain("schedule:");
+  });
+
+  test("the suite manifest joins the paths filter", () => {
+    expect(tiered).toContain('- "eval/suite.yaml"');
+  });
+
+  test("the check fails on tier failure and the comment posts either way", () => {
+    expect(tiered).toContain("continue-on-error: true");
+    expect(tiered).toContain("if: steps.tier.outcome == 'failure'");
+    expect(tiered).toContain("suite.json");
+  });
+
+  test("fork PRs are skipped (they cannot read the API-key secret)", () => {
+    expect(tiered).toContain("github.event.pull_request.head.repo.full_name == github.repository");
+  });
+
+  test("harnessDir prefixes working-directory, paths filter and base checkout", () => {
+    const nested = buildEvalCiWorkflowYaml({ suite: "eval/suite.yaml", harnessDir: "agents/bot" });
+    expect(nested).toContain("working-directory: agents/bot");
+    expect(nested).toContain('- "agents/bot/eval/suite.yaml"');
+    expect(nested).toContain("path: agents/bot/.crewhaus-ci/base");
+    expect(nested).toContain("--spec .crewhaus-ci/base/agents/bot/crewhaus.yaml");
+  });
 });
 
 // -------- CLI surface (spawned) --------
@@ -238,6 +302,72 @@ describe("crewhaus init --ci (CLI surface)", () => {
     expect(forced.exitCode).toBe(0);
     expect(readFileSync(wfPath, "utf-8")).toBe(buildEvalCiWorkflowYaml());
   });
+
+  test("--suite scaffolds the tiered workflow, warns on a missing manifest, and refuses an outside path", async () => {
+    const tieredRoot = newTempRoot();
+    const outsideRoot = newTempRoot();
+    const barePath = newTempRoot();
+    writeFileSync(join(tieredRoot, "crewhaus.yaml"), SPEC_YAML);
+    writeFileSync(join(outsideRoot, "crewhaus.yaml"), SPEC_YAML);
+    writeFileSync(join(barePath, "crewhaus.yaml"), SPEC_YAML);
+    // Independent cases → concurrent spawns, with an explicit CI ceiling.
+    const [tiered, outside, bare] = await Promise.all([
+      runCli(["init", "--ci", "--suite", "eval/suite.yaml"], tieredRoot),
+      runCli(["init", "--ci", "--suite", "../elsewhere/suite.yaml"], outsideRoot),
+      // --suite without --ci/--sentinel has nothing to scaffold.
+      runCli(["init", "--suite", "eval/suite.yaml"], barePath),
+    ]);
+    expect(tiered.exitCode).toBe(0);
+    expect(readFileSync(join(tieredRoot, EVAL_CI_WORKFLOW_RELPATH), "utf-8")).toBe(
+      buildEvalCiWorkflowYaml({ suite: "eval/suite.yaml" }),
+    );
+    expect(tiered.stderr).toContain("does not exist yet");
+    expect(outside.exitCode).toBe(1);
+    expect(outside.stderr).toContain("inside the harness directory");
+    expect(bare.exitCode).toBe(1);
+    expect(bare.stderr).toContain("--ci");
+  }, 60_000);
+
+  test("--suite warns when the manifest declares no tier the workflow runs", async () => {
+    // The scaffolded YAML hard-codes `--tier fast` (PR job) and `--tier
+    // nightly` (cron). A fast-only manifest therefore gets a nightly cron
+    // that dies with "suite declares no nightly tier" EVERY NIGHT — a
+    // recurring red scheduled workflow caused purely by scaffold/manifest
+    // mismatch. Say it at scaffold time.
+    const fastOnly = newTempRoot();
+    const bothTiers = newTempRoot();
+    const unparseable = newTempRoot();
+    for (const dir of [fastOnly, bothTiers, unparseable]) {
+      writeFileSync(join(dir, "crewhaus.yaml"), SPEC_YAML);
+      mkdirSync(join(dir, "eval"), { recursive: true });
+    }
+    const FAST_ENTRY =
+      "  fast:\n    - name: smoke\n      dataset: eval/d.jsonl\n      graders: eval/g.yaml\n      thresholds: {min_pass_rate: 0.8}\n";
+    writeFileSync(join(fastOnly, "eval", "suite.yaml"), `tiers:\n${FAST_ENTRY}`);
+    writeFileSync(
+      join(bothTiers, "eval", "suite.yaml"),
+      `tiers:\n${FAST_ENTRY}  nightly:\n    - name: full\n      dataset: eval/d.jsonl\n      graders: eval/g.yaml\n      gate: true\n`,
+    );
+    writeFileSync(join(unparseable, "eval", "suite.yaml"), "tiers:\n  smoke: [\n");
+    const [fast, both, broken, sentinel] = await Promise.all([
+      runCli(["init", "--ci", "--suite", "eval/suite.yaml"], fastOnly),
+      runCli(["init", "--ci", "--suite", "eval/suite.yaml"], bothTiers),
+      runCli(["init", "--ci", "--suite", "eval/suite.yaml"], unparseable),
+      runCli(["init", "--sentinel", "--suite", "eval/suite.yaml"], fastOnly),
+    ]);
+    expect(fast.exitCode).toBe(0);
+    expect(fast.stderr).toContain("--tier nightly");
+    expect(fast.stderr).toContain("declares only: fast");
+    // A manifest declaring both tiers is silent.
+    expect(both.exitCode).toBe(0);
+    expect(both.stderr).not.toContain("declares only");
+    // An unparseable manifest is a warning too, never a silent scaffold.
+    expect(broken.exitCode).toBe(0);
+    expect(broken.stderr).toContain("not a valid suite manifest");
+    // The sentinel cron only runs the nightly tier — same warning, its tier.
+    expect(sentinel.exitCode).toBe(0);
+    expect(sentinel.stderr).toContain("--tier nightly");
+  }, 60_000);
 
   test("H5 — init [name] --ci (no repo): spec in the subdir, workflow at the CWD root", async () => {
     const root = newTempRoot();

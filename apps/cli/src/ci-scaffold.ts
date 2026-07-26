@@ -131,7 +131,7 @@ jobs:
  * GitHub's scheduled-workflow-failure notification alerts.
  */
 export function buildSentinelDriftWorkflowYaml(
-  opts: { readonly harnessDir?: string } = {},
+  opts: { readonly harnessDir?: string; readonly suite?: string } = {},
 ): string {
   const sub = normalizeHarnessDir(opts.harnessDir);
   const prefix = sub === "" ? "" : `${sub}/`;
@@ -209,6 +209,30 @@ jobs:
             --seed "$SENTINEL_SEED" \\
             --sentinel --baseline eval/sentinel-baseline \\
             -o .crewhaus/evals/sentinel-\$(date -u +%Y%m%d)
+${suiteSentinelStep(opts.suite)}`;
+}
+
+/**
+ * NEW-HUNT-8 — the optional nightly TIER step appended to the sentinel cron
+ * (`init --sentinel --suite <suite.yaml>`). Complementary, not a replacement:
+ * the sentinel above answers "did the PROVIDER change under an unchanged
+ * spec", the suite answers "does the nightly tier still pass". Both run on the
+ * same schedule because both are nightly practices; the step runs even when
+ * the sentinel step failed (`if: always()`) so one red signal never hides the
+ * other. Absent `--suite` this contributes nothing — the workflow is
+ * byte-identical to the pre-NEW-HUNT-8 scaffold.
+ */
+function suiteSentinelStep(suite: string | undefined): string {
+  if (suite === undefined) return "";
+  return `
+      - name: Run the nightly suite tier
+        # Runs even if the drift probe failed — a provider drift alert must
+        # not hide (or be hidden by) a tier regression.
+        if: always()
+        env:
+          ANTHROPIC_API_KEY: \${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          crewhaus eval suite ${suite} --tier nightly --gate
 `;
 }
 
@@ -222,7 +246,15 @@ jobs:
  * and the base-branch checkout `path:` are all repo-root-anchored, so every
  * one of them needs the prefix (finding 7).
  */
-export function buildEvalCiWorkflowYaml(opts: { readonly harnessDir?: string } = {}): string {
+export function buildEvalCiWorkflowYaml(
+  opts: { readonly harnessDir?: string; readonly suite?: string } = {},
+): string {
+  // NEW-HUNT-8 — `--suite` scaffolds the TIERED workflow instead (fast tier
+  // on PRs, nightly tier on a cron). Without it this function returns exactly
+  // what it always returned.
+  if (opts.suite !== undefined) {
+    return buildSuiteCiWorkflowYaml({ ...opts, suite: opts.suite });
+  }
   const sub = normalizeHarnessDir(opts.harnessDir);
   const prefix = sub === "" ? "" : `${sub}/`;
   const workingDirLine = sub === "" ? "" : `\n        working-directory: ${sub}`;
@@ -426,5 +458,197 @@ jobs:
         run: |
           echo "eval gate failed — the PR spec regressed against \${{ github.base_ref }}"
           exit 1
+`;
+}
+
+/**
+ * NEW-HUNT-8 — the TIERED eval workflow, scaffolded by `crewhaus init --ci
+ * --suite <suite.yaml>`. The report's CI tiering, made executable: the FAST
+ * tier gates every PR, the NIGHTLY tier runs on a cron, and both are one
+ * command with one verdict instead of a hand-composed list of eval steps.
+ *
+ * The baseline strategy is the single-eval workflow's, applied to a suite:
+ * the fast tier is run TWICE on a PR — once with `--spec` pointed at the base
+ * branch's spec (which pins each entry's (spec, dataset) baseline inside the
+ * job's fresh workspace) and once on the PR's spec with `--gate`. Entries that
+ * declare only absolute `thresholds` gate on the second run alone; entries
+ * that declare `gate: true` need the first.
+ *
+ * `suite` is the suite manifest path RELATIVE TO THE HARNESS (the job's
+ * working-directory), because that is how every other path in the manifest
+ * resolves.
+ */
+function buildSuiteCiWorkflowYaml(opts: {
+  readonly harnessDir?: string;
+  readonly suite: string;
+}): string {
+  const sub = normalizeHarnessDir(opts.harnessDir);
+  const prefix = sub === "" ? "" : `${sub}/`;
+  const workingDirLine = sub === "" ? "" : `\n        working-directory: ${sub}`;
+  const baseSpec = `.crewhaus-ci/base/${prefix}crewhaus.yaml`;
+  const subdirNote =
+    sub === ""
+      ? ""
+      : `#   - Scaffolded for the harness at ${sub}/ — the jobs' working-directory,
+#     the paths: filter and the base-checkout path are already prefixed.\n`;
+  return `# crewhaus-eval.yml — scaffolded by \`crewhaus init --ci --suite ${opts.suite}\`.
+#
+# CI TIERING (NEW-HUNT-8), the report's practice made executable:
+#   - every PR runs the FAST tier of ${prefix}${opts.suite} and gates on it,
+#   - a nightly cron runs the NIGHTLY tier,
+#   - \`crewhaus eval suite --tier release --gate\` is yours to wire into the
+#     release job you already have (it needs no scaffolding beyond this file).
+#
+# The PR job runs the fast tier TWICE, exactly like the single-eval scaffold:
+# once with --spec pointed at the BASE branch's spec (which pins each entry's
+# (spec, dataset) baseline in this fresh workspace) and once on the PR's spec
+# with --gate. Entries whose manifest declares absolute \`thresholds\` gate on
+# the second run alone; entries declaring \`gate: true\` need the first, since
+# a baseline regression gate has nothing to compare against until something
+# pins a baseline.
+${subdirNote}#
+# BRANCH-PROTECTION CAVEAT: this workflow only runs on PRs touching the
+# paths: filter below, so a REQUIRED check deadlocks PRs that do not. Leave it
+# optional, or enforce it through paths-aware tooling.
+# COST: every push to a matching PR bills the fast tier TWICE (base + PR).
+#
+# Required repo secret: ANTHROPIC_API_KEY (billed by every tier run).
+
+name: crewhaus-eval
+
+on:
+  pull_request:
+    paths:
+      - "${prefix}crewhaus.yaml"
+      - "${prefix}eval/**"
+      - "${prefix}${opts.suite}"
+  schedule:
+    # Nightly at 41 2 UTC (off the hour to dodge cron scheduling backlog).
+    - cron: "41 2 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write # the tier-verdict comment
+
+concurrency:
+  group: crewhaus-eval-\${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast-tier:
+    # Fork PRs cannot read secrets.ANTHROPIC_API_KEY, so the whole job is
+    # skipped there (a skipped check is neutral, not a red X).
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash${workingDirLine}
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+
+      - name: Checkout base branch (the gate's "before" spec)
+        uses: actions/checkout@v4
+        with:
+          ref: \${{ github.base_ref }}
+          # checkout paths resolve from the repo root (working-directory
+          # only applies to run steps).
+          path: ${prefix}.crewhaus-ci/base
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install crewhaus CLI
+        run: |
+          bun add -g crewhaus
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: Compile gate (offline)
+        run: crewhaus compile crewhaus.yaml --emit-ir > /dev/null
+
+      - name: Detect the baseline spec
+        id: baseline
+        run: |
+          if [ -f "${baseSpec}" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "first PR introducing the spec — no baseline; future PRs will gate"
+          fi
+
+      - name: Fast tier on the base spec (pins each entry's baseline)
+        if: steps.baseline.outputs.exists == 'true'
+        env:
+          ANTHROPIC_API_KEY: \${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Base SPEC, PR suite/data: only the spec differs between the runs.
+          crewhaus eval suite ${opts.suite} --tier fast \\
+            --spec ${baseSpec} \\
+            -o .crewhaus-ci/suite/base
+
+      - name: Fast tier on the PR spec (gated)
+        id: tier
+        # The comment must post either way; the last step re-fails the check.
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: \${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          crewhaus eval suite ${opts.suite} --tier fast --gate \\
+            -o .crewhaus-ci/suite/pr
+
+      - name: Comment the tier verdict on the PR
+        if: always()
+        env:
+          GH_TOKEN: \${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ROWS="$(bun -e "const s=JSON.parse(require('fs').readFileSync('.crewhaus-ci/suite/pr/suite.json','utf8'));process.stdout.write(s.entries.map(e=>'| '+e.name+' | '+(e.passed?'PASS':'FAIL')+' | '+(e.aggregates?(e.aggregates.passRate*100).toFixed(1)+'%':'n/a')+' | '+(e.failures.join('; ')||'-')+' |').join(String.fromCharCode(10)))" 2>/dev/null \\
+            || printf '| (suite produced no summary) | | | |')
+          if [ "\${{ steps.tier.outcome }}" = "success" ]; then
+            VERDICT="PASS ✅"
+          elif [ "\${{ steps.tier.outcome }}" = "failure" ]; then
+            VERDICT="FAIL ❌ (fast tier)"
+          else
+            VERDICT="NOT RUN ⚠️ — an earlier step failed before the tier (infra, not a regression)"
+          fi
+          BODY="$(printf '## crewhaus eval suite (fast tier): %s\\n\\n| entry | verdict | pass_rate | notes |\\n| --- | --- | --- | --- |\\n%s\\n\\n_suite: %s · a tier passes only when every entry passes_\\n' \\
+            "$VERDICT" "$ROWS" "${opts.suite}")"
+          gh api "repos/\${{ github.repository }}/issues/\${{ github.event.pull_request.number }}/comments" \\
+            -f body="$BODY" \\
+            || echo "comment skipped (read-only token — fork PR?)"
+
+      - name: Fail the check on tier failure
+        if: steps.tier.outcome == 'failure'
+        run: |
+          echo "fast tier failed — see the suite summary above"
+          exit 1
+
+  nightly-tier:
+    # The scheduled (and manually dispatched) rung: the medium suite the
+    # report recommends running once a day rather than per change.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash${workingDirLine}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install crewhaus CLI
+        run: |
+          bun add -g crewhaus
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: Nightly tier
+        env:
+          ANTHROPIC_API_KEY: \${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          crewhaus eval suite ${opts.suite} --tier nightly --gate
 `;
 }

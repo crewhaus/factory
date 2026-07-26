@@ -13,9 +13,13 @@ import { EventToMetrics } from "./handlers";
 import { Registry } from "./registry";
 import { type Sink, httpServer, prometheusTextfile, stdoutJson } from "./sinks";
 
-export { Registry, Counter, Histogram } from "./registry";
+export { Registry, Counter, Gauge, Histogram } from "./registry";
 export type { Labels, RegistryJsonSnapshot } from "./registry";
 export { EventToMetrics } from "./handlers";
+// E51 — offline eval run summaries reach the sinks through this recorder
+// (a run summary exists only after the last per-sample event, so it is not
+// a bus event; see ./eval-run.ts).
+export { recordEvalRunSummary, type EvalRunMetricsSummary } from "./eval-run";
 export {
   httpServer,
   prometheusTextfile,

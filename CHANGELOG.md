@@ -783,6 +783,258 @@ what is already there).
   does. `apps/cli`'s `feedback.ts` / `autodistill.ts` / `dataset-mine.ts` /
   `dataset-audit.ts` / `datasets.ts` re-export their historical names — no
   import in the CLI changed.
+- **`crewhaus eval suite <suite.yaml> [--tier fast|nightly|release]` — CI
+  tiering, made executable.** `crewhaus eval` took exactly one `--dataset` and
+  one `--graders` per invocation, so the report's tiering practice (small fast
+  suite per change, medium nightly, full on release candidates) could only be
+  hand-composed in CI YAML with no verdict across the pieces. A suite manifest
+  declares named tiers — a fixed `fast`/`nightly`/`release` vocabulary, so
+  `--tier fast` means the same thing in every repo — each listing entries of
+  `{name, dataset, graders, seed, repeats, concurrency, slice, gate,
+  allow_test_split, thresholds}`. Entries run sequentially through the SAME
+  code path a hand-typed `crewhaus eval` takes (registry refs, regression
+  union, preflight, triage, run history and baselines all behave identically)
+  into `<out>/<entry>/`, and the tier passes only when every entry passes. Two
+  gating mechanisms stay deliberately distinct: absolute floors
+  (`min_pass_rate`, `min_mean_score`) are evaluated from each entry's own
+  `results.json` and bite from run one — including in a fresh CI workspace —
+  while `gate: true` is the unchanged (spec, dataset) baseline regression gate.
+  `max_p95_latency_ms` / `max_cost_usd` are criteria OF that baseline gate, so
+  declaring one without `gate: true` is a parse error rather than dead config
+  that reads like a ceiling — and an entry declaring NEITHER mechanism is a
+  parse error for the same reason: it could never fail, so its PASS (on a tier
+  the scaffolded workflow makes a required check) would be a green light nobody
+  earned. A PARTIAL (budget-exhausted) entry always fails, because an
+  incomplete measurement cannot clear a floor. A preflight refuses missing
+  spec/dataset/graders files before the first entry spends anything, and a
+  crashed entry is isolated so the rest of the tier still reports. `--spec`
+  overrides every entry's spec, `--gate` maps a failing tier to a non-zero exit,
+  and the verdict plus every entry's aggregates and failure reasons land in
+  `<out>/suite.json`.
+- **`crewhaus init --ci|--sentinel --suite <suite.yaml>` and `crewhaus flywheel
+  init --suite <suite.yaml>` scaffold the tiered workflows.** With `--ci`, the
+  emitted `crewhaus-eval.yml` runs the FAST tier on every PR — once with
+  `--spec` pointed at the base branch's spec (which pins each entry's baseline
+  in the job's fresh workspace) and once on the PR's spec with `--gate`, the
+  same two-run strategy the single-eval scaffold uses — plus a nightly-cron job
+  for the NIGHTLY tier and a tier-verdict PR comment built from `suite.json`.
+  With `--sentinel`, the drift cron gains a nightly-tier step that runs even
+  when the probe failed, so a provider-drift alert and a tier regression can
+  never hide each other; `flywheel init --suite` adds the same step to the
+  flywheel cron, after the improvement PR is opened. The suite path is
+  harness-relative and must live inside the harness (the jobs'
+  working-directory); a manifest you have not written yet warns rather than
+  failing the command, and a manifest that DOES exist is parsed so a tier the
+  scaffolded YAML runs but the manifest never declares (a fast-only suite under
+  `--ci`, whose nightly cron would then go red every night) is named at
+  scaffold time instead of by the first scheduled run. Without `--suite` all
+  three scaffolds are byte-identical to before.
+- **Eval templates ride the template registry — `crewhaus scaffold-evals
+  --template <family>`.** Template machinery existed only for whole SPECS, so
+  every team wrote its own 1–5 anchors from scratch. `@crewhaus/template-registry`
+  manifests gain an optional `kind` (`spec-template` — what every existing
+  manifest already is — or `grader-template`) and an `evalAssets` block carrying
+  a ready-to-run `graders.yaml`, reviewer notes, and an optional seed dataset.
+  Grader templates are signed, verified and cached by the SAME machinery as
+  spec templates (the canonical signing payload gained the two fields
+  append-only, so manifests that declare neither serialize byte-identically and
+  every existing signature keeps verifying; the nested `evalAssets` block
+  canonicalizes its own key order so a JSON round-trip cannot mint a second
+  valid signature), so a registry can carry and verify one and `crewhaus
+  templates list` marks it `[eval-template]`. CONSUMPTION of a registry-hosted
+  eval template is NOT wired yet: `scaffold-evals --template` resolves only the
+  embedded first-party families, and `templates use` refuses an eval-asset
+  template by saying so. The first-party family library ships EMBEDDED in the
+  package (a static module, not a package-relative file read: `bun --compile`
+  embeds only static imports, so the families exist inside the shipped binary
+  and there is nothing to download or verify) — `rag`, `summarize`, `extract`,
+  `support`, `safety`, `classify` — deliberately walking the grader ladder
+  rather than reaching for a judge every time: `classify` grades
+  deterministically with `expected_contains` (no judge, no spend), `safety` uses
+  a categorical rubric that includes an OVER-REFUSAL label, and the open-ended
+  families use fully anchored 1–5 criteria. `scaffold-evals --template <family>`
+  copies the family's graders.yaml verbatim under a provenance header and seeds
+  `dataset.jsonl` from the family's samples, topped up to `--samples N` with the
+  usual spec-derived stubs — except for a family whose every grader needs a gold
+  answer (`classify`), where the dataset stops at the gold-carrying seeds and
+  says why: a generated stub carries no `expected_output`, and `crewhaus eval`'s
+  preflight only REFUSES a wholly gold-less dataset, so topping one up would
+  ship a dataset that runs, spends, and caps its own score. Template mode is
+  OFFLINE by construction (static content — `--model` is refused with it), an
+  unknown family lists the available ones instead of guessing, and nothing is
+  auto-wired into a gate. `crewhaus graders card --template <family>` renders a
+  family's rubric card without scaffolding it first — same card, same
+  content-derived `gradersHash`, so carding a family and then carding the
+  scaffolded copy proves the copy is unedited.
+- **`crewhaus redteam generate|report` — a generated attack suite against the
+  AGENT.** Adversarial generation was previously limited to injection payloads
+  mutated onto real inputs (`dataset synthesize`) and detector-regression
+  harvesting (`security corpus`); neither probes the agent's own refusal
+  behaviour. `redteam generate` walks a strict-schema behaviour taxonomy —
+  CATEGORIES (data exfiltration, third-party PII extraction, tool misuse,
+  policy evasion, harmful content, impersonation) × STRATEGIES (direct, fiction
+  framing, claimed authority, incremental, obfuscation, prompt injection) —
+  DIAGONALLY, so a small `--count` covers every category AND every strategy (the
+  default 24 ships all six, injection included; a strategy-major walk would have
+  shipped only the first four). The default is coverage of both AXES, not of
+  every pair — 6×6 pairs with the injection strategy's 5× expansion is `--count
+  120`, a deliberate choice rather than a default nobody asked to pay for.
+  Generation is DETERMINISTIC and OFFLINE: same taxonomy + `--count` + `--seed`
+  yields a byte-identical corpus with no credentials, and attack strings are
+  COMPOSED at generation time from inert parts (a strategy's framing fragments
+  around a category's objective) rather than shipped as ready-made payloads —
+  the injection strategy delegates to the same curated SAFE rule subset `dataset
+  synthesize` uses. `--budget-usd F` optionally layers model-rephrased variants
+  on top (best-effort, capped, tagged `generator: redteam-model`); failed
+  variant calls are COUNTED and reported on stderr, and an unbroken run of them
+  stops augmentation rather than burning the whole budget, so an augmented run
+  that produced nothing can never look identical to an offline one. The output
+  is a provenance-tagged `<spec>-redteam` registry dataset (`source: synthetic`,
+  `difficulty: adversarial`, category/strategy tags, never a gold answer, one
+  split) plus a paired refusal-grading `graders.yaml` — one categorical judge
+  whose labels include over-refusal, so an agent that refuses everything cannot
+  game the suite. Nothing unions the corpus into a gate: adoption is the
+  explicit `--dataset registry:<spec>-redteam`. `redteam report --runs
+  <dir|dir,dir|last:N>` computes ATTACK-SUCCESS RATE (the fraction of graded
+  probes the agent failed) overall and per category/strategy from persisted
+  runs; errored and judge-abstained probes leave the denominator and are
+  reported separately, and ASR is its own block — never folded into the
+  pass-rate baseline lineage.
+- **`crewhaus optimize` now optimizes MULTI-STAGE specs.** Making workflow /
+  graph / crew / pipeline specs *evaluable* by driving their real compiled
+  runtime landed earlier this release; this closes the loop. Each candidate is
+  compiled with the eval-entry variant — the same emission `crewhaus compile
+  --with-eval-harness` performs, not a second bespoke emitter — and measured by
+  driving that compiled runtime per sample through the same bridge invoker
+  `crewhaus eval` uses for multi-stage specs, behind the identical eval-gated
+  accept loop, budget gate and post-accept regression pinning a `target: cli`
+  run gets. Only the per-stage prompt paths already whitelisted in
+  `spec-patch`'s `OPTIMIZABLE_PATHS` are rewritten (workflow step / graph node /
+  crew role instructions, pipeline `agent.instructions`) — the surface is
+  unchanged, it is merely reachable now. `kind: judge` steps and nodes run no
+  agent turn and are never mutated. New `--stage <name>` narrows the search to
+  one step/node/role; an unknown name errors and lists the valid ones. WITHOUT
+  `--stage`, a multi-stage spec optimizes its stages sequentially in declaration
+  order, each gated independently: a stage that wins composes into the working
+  spec the next stage starts from, a stage that does not leaves the spec
+  untouched and the run moves on. `--stage` is refused alongside
+  `--from-advice`, which applies pre-computed patches to the paths the
+  suggestions name and runs no per-stage search at all. `--iterations` is per
+  stage; `--budget-usd`
+  stays a RUN ceiling, threaded down as remaining budget so a three-stage run
+  cannot spend three times the cap. The source spec is written once, at the end,
+  only with `--write-back`. BOUNDARY, stated in `--help`: the candidate bundle
+  carries bare `@crewhaus/*` imports, so a bridged run resolves them from the
+  candidate directory upward — run it inside a harness whose dependencies are
+  installed (the default `-o` already does). The orchestrator's library seam
+  gains a matching `promptPath` option; omitted, it behaves exactly as before,
+  down to a byte-identical `report.json`.
+- **`--mutator meta-harness` — the meta-harness optimizer is reachable from the
+  CLI, marked EXPERIMENTAL.** The existing `meta-harness-optimizer` package is
+  wired as the third mutator with a model-backed proposer built the same way
+  `--mutator claude` builds its provider (the spec's own model through
+  `@crewhaus/model-router`, so a non-Anthropic spec drives its own adapter).
+  What differs is the proposer's *input*, which is the meta-harness paper's
+  actual finding: it reads the run's filesystem-backed experience store — every
+  prior candidate's artifact, per-sample scores and trace — instead of a summary
+  window, and `crewhaus optimize` now writes each measured candidate into that
+  store using the layout the package already defines. It sits behind the same
+  accept gate, the same `--budget-usd` meter (the provider exposes the pricing
+  metadata the gate feature-detects and reports its call usage) and the same
+  `OPTIMIZABLE_PATHS` validation as the other two mutators, and every run prints
+  an experimental notice. Deliberately spec-shaped: the CLI proposer returns
+  replacement *instructions*, so a candidate still round-trips through
+  `parseSpec`. The package's bundle-REWRITING mode — which produces an `agent.ts`
+  no spec can reproduce — stays library-only, because the spec round-trip is
+  what makes an automated write-back reviewable. `persistCandidate` gains
+  `candidateFileName` so the store names a prose candidate honestly
+  (`instructions.txt`, not `agent.ts`), and `readExperienceStore` resolves
+  whatever name is on disk.
+- **`crewhaus experiment status|record|assign`.** Per-version outcome and rating
+  deltas from an append-only ledger under `.crewhaus/experiments/`, reported
+  with Wilson 95% intervals, deltas against the control, and an explicit refusal
+  to name a winner while any version is below `--min-n` (default 30) — the
+  refusal names every sample size. `record` is how a serving integration reports
+  an outcome back; `assign` prints the version a stable request key
+  deterministically maps to (and reports the assignment's weights, env and
+  `updatedAt` on stderr, so a stale split is visible). `--json` for machine
+  consumption — it carries the same `boundary` caveat the table prints plus a
+  per-version `sources` breakdown, so a reader can tell an n built from offline
+  eval re-runs from one built from live serving outcomes. `--name` may be
+  omitted when exactly one experiment exists. Repeat EVAL measurements of the
+  same (version, dataset sample) are collapsed before tallying and the collapse
+  is reported: Wilson intervals assume independent observations, and a canary
+  ramp re-measures one fixed dataset at every step. Serving records are never
+  collapsed — there a repeated request key is a repeated request.
+- **`crewhaus deploy canary --traffic-split`.** Writes a durable deterministic
+  variant assignment and records the ramp's per-version *eval* samples into the
+  experiment ledger, so `experiment status` has real per-version outcomes with
+  no serving integration at all. **This does not split live traffic, and every
+  string in the feature says so**: no CrewHaus serving surface consults the
+  assignment, and `target: cli` has no live request stream — `experiment assign`
+  (or canary-controller's `selectExperimentVariant`) is the decision function an
+  operator calls at their own serving boundary. The flag is named for the
+  capability it *prepares*, not one it performs, and `deploy canary --help` now
+  says so in as many words. The assignment is written only *after* a step's
+  regression gate passes and is REMOVED when the ramp concludes — promotion pins
+  100% candidate, rollback pins 100% baseline, and a surviving 50/50 file would
+  keep a compliant integration routing half its keys at a version nobody is
+  running. Abstained and canary samples are excluded from the ledger projection,
+  matching the eval aggregator's own pass-rate denominator rather than scoring
+  an explicit "unknown" as a failure.
+- **`canary-controller` gains the N-variant experiment surface.**
+  `selectExperimentVariant` generalizes the two-version hash-bucket route to N
+  weighted variants over the *same* `requestBucket` hash, so a canary and an
+  experiment can never disagree about which side of the split a key is on.
+  Weights must be integers summing to 100 (the bucket space is exactly 100 wide;
+  a rounded split is not the split you declared). The ledger reader tolerates
+  torn lines, experiment names are sanitized before they become paths, tallies
+  carry a per-source breakdown, and `removeExperimentAssignment` /
+  `dedupeExperimentOutcomes` back the lifecycle and independence rules above.
+- **Eval results reach the configured exporters.** `crewhaus eval` now mints one
+  run-level `RunContext` and attaches the same env-gated subscribers every
+  serving loop uses, so an offline run's per-sample verdicts leave the process as
+  `test_verdict` spans and its summary lands on the metrics registry. Before
+  this the verdict `run-sample` publishes went to a bus with no subscriber (the
+  eval CLI never built a run context, and the per-sample chat loop shuts its
+  subscribers down *before* grading), and run summaries were never emitted at
+  all. Presence-gated on `OTEL_EXPORTER_OTLP_ENDPOINT` / `CREWHAUS_METRICS`:
+  with neither set nothing is constructed and the eval path is byte-identical.
+  Only the exporter-relevant env keys are forwarded, so turning on an exporter
+  never also turns on the pretty printer, inline cost lines, or the alert
+  watchdog for an eval run. Every telemetry call is guarded — a broken
+  collector, an unreachable endpoint, or a throwing sink is reported once on
+  stderr and the run continues.
+- **Eval run summaries as first-class metrics.** New `metrics-collector`
+  instruments carry the headline figures per (spec, dataset):
+  `crewhaus_eval_run_pass_rate`, `_mean_score`, `_samples`, `_errors`,
+  `_flaky_samples`, `_needs_human`, `_cost_usd_micros`, plus a
+  `crewhaus_eval_runs_total` counter. A run summary only exists after the last
+  per-sample event, so it is recorded straight onto the registry
+  (`recordEvalRunSummary`) rather than invented as an event kind. The package
+  gains a `Gauge` primitive (a pass rate is neither monotonic nor a
+  distribution) and a `gauges` block in `jsonSnapshot()`.
+- **Online eval scores are visible to metrics and tracing.** The in-loop
+  `evaluation:` block's `eval_graded`, a judge step/node's `judge_verdict`, the
+  runner's `test_verdict` and human `response_rated` events now fold into
+  `crewhaus_eval_verdicts_total{source,verdict}`, `crewhaus_eval_score{source}`
+  and `crewhaus_response_ratings_total`. Live quality scores were previously
+  computed and then dropped for ops purposes.
+- **First-class OTel spans for eval verdicts.** `eval_graded` and
+  `judge_verdict` used to fall into the exporter's generic `crewhaus.<kind>`
+  fallback; they now emit `eval_graded.<verdict>` / `judge_verdict.<verdict>`
+  spans with typed `crewhaus.eval.*` / `crewhaus.judge.*` attributes and ERROR
+  status on a failing verdict, so a trace backend can alert on quality the same
+  way it alerts on tool failures. Eval `test_verdict` spans carry the SAMPLE's
+  session id rather than the eval CLI's synthetic run-level one, so a failing
+  verdict joins the transcript that produced it (run id and trace id stay
+  run-level — one eval run is one trace). The vendor packages (Datadog /
+  Honeycomb / New Relic / Splunk) wrap this same span mapping, so the new spans
+  map into their shape too — but note the scope: `attachDefaultSubscribers`
+  attaches only the printer, the metrics collector and the generic OTLP
+  exporter, so a `DD_API_KEY` on its own exports nothing. Point
+  `OTEL_EXPORTER_OTLP_ENDPOINT` at the vendor's OTLP intake, or call that
+  vendor's `attach…IfEnvSet` from your own process.
 
 ### Changed
 
@@ -834,6 +1086,12 @@ what is already there).
   `CreateExamRunnerOptions.judgeAdapter`): an injectable judge transport so
   judge behaviour — including the new metering — is assertable over a stub
   provider adapter with no process-global `mock.module`.
+- `optimizeSpec` refuses a workflow/graph/crew spec with a message that names
+  the spec's actual stages and the `--stage` flag, replacing the "not
+  implemented yet" text it carried before.
+- `canary-controller`'s `CanaryError` moved to its own module and is re-exported
+  unchanged; `route()`'s private bucket hash is now the shared `requestBucket`
+  (identical implementation, identical routing).
 
 ### Fixed
 
@@ -1133,6 +1391,10 @@ what is already there).
   scope inside the relevant bullet rather than as a separate section.
 - No PR reference appended — the repo CHANGELOG convention is a trailing
   `[#NNN]`, which should be added when the wave PR number exists.
+_Nothing — this wave lands no bug fixes. Heading kept so the section is
+explicit; drop it at merge time if nothing else in the release fills it._
+
+---
 
 ## [0.4.0] - 2026-07-18
 

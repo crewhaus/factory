@@ -21,9 +21,11 @@ import type {
   CostAccrualEvent,
   CoverageReportEvent,
   ErrorRecoveredEvent,
+  EvalGradedEvent,
   HandoffEvent,
   HookFiredEvent,
   JanitorActionEvent,
+  JudgeVerdictEvent,
   McpCallEndEvent,
   McpCallStartEvent,
   ModelFailoverEvent,
@@ -204,6 +206,20 @@ export const ATTR = {
   CREWHAUS_COVERAGE_LINES_TOTAL: "crewhaus.coverage.lines_total",
   CREWHAUS_COVERAGE_BRANCHES_COVERED: "crewhaus.coverage.branches_covered",
   CREWHAUS_COVERAGE_BRANCHES_TOTAL: "crewhaus.coverage.branches_total",
+  // E51 / NEW-E-2 — in-loop evaluation verdicts. The `evaluation:` block's
+  // per-turn grade and a judge step/node's verdict are quality measurements
+  // an operator alerts on, so they get first-class attribute keys instead of
+  // the generic `crewhaus.<kind>` fallback they used to fall into.
+  CREWHAUS_EVAL_SCORE: "crewhaus.eval.score",
+  CREWHAUS_EVAL_THRESHOLD: "crewhaus.eval.threshold",
+  CREWHAUS_EVAL_VERDICT: "crewhaus.eval.verdict",
+  CREWHAUS_EVAL_GRADER_TYPE: "crewhaus.eval.grader_type",
+  CREWHAUS_EVAL_RETRY_INDEX: "crewhaus.eval.retry_index",
+  CREWHAUS_EVAL_MAX_RETRIES: "crewhaus.eval.max_retries",
+  CREWHAUS_JUDGE_AT: "crewhaus.judge.at",
+  CREWHAUS_JUDGE_VERDICT: "crewhaus.judge.verdict",
+  CREWHAUS_JUDGE_SCORE: "crewhaus.judge.score",
+  CREWHAUS_JUDGE_RATIONALE: "crewhaus.judge.rationale",
   CREWHAUS_SANITIZER_KIND: "crewhaus.sanitizer.kind",
   CREWHAUS_SANITIZER_IS_ERROR: "crewhaus.sanitizer.is_error",
   CREWHAUS_SANITIZER_SUMMARY: "crewhaus.sanitizer.summary",
@@ -744,6 +760,57 @@ export function buildTestVerdictSpan(ev: TestVerdictEvent): OtelSpan {
   return pointSpan(ev, `test_verdict.${ev.verdict}`, attrs, {
     code: failed ? STATUS_ERROR : STATUS_OK,
     ...(failed && ev.reason !== undefined ? { message: ev.reason } : {}),
+  });
+}
+
+/**
+ * E51 / NEW-E-2 — an in-loop `evaluation:` grade (one per grading pass,
+ * retries included) as a point-in-time span. ERROR status on a failing
+ * verdict so a trace backend's error-rate panel counts quality failures the
+ * same way it counts tool failures; `crewhaus.eval.retry_index` +
+ * `max_retries` let a dashboard tell "failed once then recovered" from
+ * "burned the whole retry ladder".
+ */
+export function buildEvalGradedSpan(ev: EvalGradedEvent): OtelSpan {
+  const attrs: Attribute[] = [
+    { key: ATTR.CREWHAUS_EVAL_SCORE, value: { doubleValue: ev.score } },
+    { key: ATTR.CREWHAUS_EVAL_THRESHOLD, value: { doubleValue: ev.threshold } },
+    attrStr(ATTR.CREWHAUS_EVAL_VERDICT, ev.verdict),
+    attrStr(ATTR.CREWHAUS_EVAL_GRADER_TYPE, ev.graderType),
+    attrInt(ATTR.CREWHAUS_EVAL_RETRY_INDEX, ev.retryIndex),
+  ];
+  if (ev.maxRetries !== undefined) {
+    attrs.push(attrInt(ATTR.CREWHAUS_EVAL_MAX_RETRIES, ev.maxRetries));
+  }
+  const failed = ev.verdict === "fail";
+  return pointSpan(ev, `eval_graded.${ev.verdict}`, attrs, {
+    code: failed ? STATUS_ERROR : STATUS_OK,
+    ...(failed
+      ? {
+          message: `${ev.graderType} scored ${ev.score.toFixed(2)} below threshold ${ev.threshold.toFixed(2)}`,
+        }
+      : {}),
+  });
+}
+
+/**
+ * E51 / NEW-E-2 — a `kind: judge` workflow step / graph node verdict as a
+ * point-in-time span. ERROR status on a fail, and the judge's rationale
+ * rides as an attribute so the failing span carries its own explanation.
+ */
+export function buildJudgeVerdictSpan(ev: JudgeVerdictEvent): OtelSpan {
+  const attrs: Attribute[] = [
+    attrStr(ATTR.CREWHAUS_JUDGE_AT, ev.stepOrNode),
+    attrStr(ATTR.CREWHAUS_JUDGE_VERDICT, ev.verdict),
+    { key: ATTR.CREWHAUS_JUDGE_SCORE, value: { doubleValue: ev.score } },
+  ];
+  if (ev.rationale !== undefined) {
+    attrs.push(attrStr(ATTR.CREWHAUS_JUDGE_RATIONALE, ev.rationale));
+  }
+  const failed = ev.verdict === "fail";
+  return pointSpan(ev, `judge_verdict.${ev.verdict}`, attrs, {
+    code: failed ? STATUS_ERROR : STATUS_OK,
+    ...(failed && ev.rationale !== undefined ? { message: ev.rationale } : {}),
   });
 }
 

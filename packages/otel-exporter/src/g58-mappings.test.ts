@@ -410,16 +410,19 @@ describe("SpanTracker G58 routing", () => {
     expect(spans[0]?.name).toBe("role.writer");
   });
 
+  // `judge_verdict` used to be the example here; E51 gave it (and
+  // `eval_graded`) a dedicated mapping, so the fallback is asserted over a
+  // kind that genuinely has none.
   test("an unmapped kind still produces a generic span (never dropped)", () => {
     const { tracker, spans } = tracked();
     tracker.ingest({
       ...env(),
-      kind: "judge_verdict",
-      stepOrNode: "gate",
-      verdict: "pass",
-      score: 0.88,
+      kind: "crew_done",
+      finalRole: "editor",
+      totalActivations: 3,
+      durationMs: 42,
     } as TraceEvent);
     expect(spans).toHaveLength(1);
-    expect(spans[0]?.name).toBe("crewhaus.judge_verdict");
+    expect(spans[0]?.name).toBe("crewhaus.crew_done");
   });
 });

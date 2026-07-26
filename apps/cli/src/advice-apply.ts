@@ -66,6 +66,8 @@ export class AdviceApplyError extends Error {
 export function assertFromAdviceFlagsCompatible(flags: {
   readonly mutator: boolean;
   readonly iterations: boolean;
+  /** D36/D44 — `--stage` narrows a per-stage SEARCH; the advice path runs none. */
+  readonly stage?: boolean;
 }): void {
   if (flags.mutator) {
     throw new AdviceApplyError(
@@ -75,6 +77,11 @@ export function assertFromAdviceFlagsCompatible(flags: {
   if (flags.iterations) {
     throw new AdviceApplyError(
       "--from-advice is mutually exclusive with --iterations — every patch in the suggestions file is evaluated exactly once",
+    );
+  }
+  if (flags.stage === true) {
+    throw new AdviceApplyError(
+      "--stage has no meaning with --from-advice — the advice path applies pre-computed patches to the paths the suggestions name and runs no per-stage search",
     );
   }
 }

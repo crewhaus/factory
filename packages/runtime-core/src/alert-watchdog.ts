@@ -191,6 +191,13 @@ export class SessionMetricsAccumulator {
         else if (ev.outcome === undefined && ev.decision === "deny") this.permissionDenials += 1;
         return;
       default:
+        // NEW-E-2 is PARTIAL by decision, not by omission: `eval_graded`,
+        // `judge_verdict` and `response_rated` fold into metrics-collector
+        // (crewhaus_eval_verdicts_total / _score / crewhaus_response_ratings_total)
+        // but deliberately NOT into this accumulator, so there is no
+        // "judge score dropped below baseline" breach yet. Adding one means
+        // new persisted snapshot fields + a `detectBreaches` rule; see the
+        // Wave 5 amendments in EVALS-CAMPAIGN-0.4.md before closing the gap.
         return;
     }
   }

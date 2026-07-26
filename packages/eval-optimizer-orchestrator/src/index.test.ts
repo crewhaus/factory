@@ -130,7 +130,10 @@ describe("optimizeSpec — end-to-end fitness loop", () => {
     expect(source).toContain("# The system prompt:"); // structural comment preserved
   });
 
-  test("rejects workflow/graph/crew targets (v0 limitation)", async () => {
+  // D36 (Wave 5) — a multi-prompt target is still refused WITHOUT a stage
+  // selector, but the message now names the stages and the `--stage` flag
+  // (the flag exists; the retired `--path` misdirection never comes back).
+  test("rejects workflow/graph/crew targets when no stage is named", async () => {
     const WORKFLOW_YAML = `target: workflow
 name: hello-workflow
 model: claude-sonnet-4-5
@@ -151,7 +154,7 @@ steps:
         iterations: 1,
         outDir: join(tmpRoot, "out"),
       }),
-    ).rejects.toThrow(/multiple prompts/);
+    ).rejects.toThrow(/one prompt per step .* --stage/s);
   });
 
   test("rejects an invalid spec path", async () => {
