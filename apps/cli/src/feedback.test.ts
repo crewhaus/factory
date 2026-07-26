@@ -10,13 +10,16 @@ import {
   buildFeedbackRecord,
   buildJudgeRubricGrader,
   clipFeedbackText,
+  cohenKappa,
   deriveTurns,
   distill,
   extractFeedbackRecords,
+  formatAgreementLines,
   gradersConfigToYaml,
   isFeedbackRecord,
   mergeFeedback,
   normalizeRating,
+  resolveFeedback,
   samplesToJsonl,
   synthesizeGraders,
 } from "./feedback";
@@ -73,6 +76,27 @@ describe("buildFeedbackRecord", () => {
     expect("comment" in r).toBe(false);
     expect("correction" in r).toBe(false);
     expect("rater" in r).toBe(false);
+  });
+
+  it("stamps adjudication:true from the adjudicate flag (B19)", () => {
+    expect(buildFeedbackRecord({ ...base, thumbs: "up", adjudicate: true }).adjudication).toBe(
+      true,
+    );
+    // a correction IS a verdict, so it may adjudicate on its own
+    expect(
+      buildFeedbackRecord({ ...base, correction: "better", adjudicate: true }).adjudication,
+    ).toBe(true);
+    // absent flag → field omitted entirely (pre-B19 records stay byte-identical)
+    expect("adjudication" in buildFeedbackRecord({ ...base, thumbs: "up" })).toBe(false);
+    expect(
+      "adjudication" in buildFeedbackRecord({ ...base, thumbs: "up", adjudicate: false }),
+    ).toBe(false);
+  });
+
+  it("rejects a verdict-less adjudication (comment alone cannot settle a split)", () => {
+    expect(() =>
+      buildFeedbackRecord({ ...base, comment: "discussed offline", adjudicate: true }),
+    ).toThrow(/verdict/);
   });
 });
 
@@ -350,6 +374,17 @@ describe("distill (tag-all)", () => {
     expect(low?.metadata?.["user_rating"]).toBe(0);
   });
 
+  it("stamps the B22 taxonomy: source production_log, channel in feedback_source", () => {
+    const up = record({ turnNumber: 1, rating: { thumbs: "up" } });
+    const r = distill(turns, [up], { minScore: 0.7 });
+    const gold = r.samples.find((s) => s.id === `${SESSION}_t1`);
+    // Distilled samples come from real sessions → canonical provenance is
+    // "production_log"; the rating CHANNEL (what `source` used to carry)
+    // moves to `feedback_source` so no information is lost.
+    expect(gold?.metadata?.["source"]).toBe("production_log");
+    expect(gold?.metadata?.["feedback_source"]).toBe("cli");
+  });
+
   it("uses a correction as the gold output regardless of thumbs", () => {
     const fb = record({
       turnNumber: 2,
@@ -609,5 +644,333 @@ describe("distill --judge (llm_judge rubric seeded from comments)", () => {
     const yaml = gradersConfigToYaml({ graders: [buildJudgeRubricGrader([], [])] });
     const { compiled } = parseGradersConfig(yaml);
     expect(compiled[0]?.judgeSpec?.rubric.criteria).toHaveLength(1);
+  });
+});
+
+// ---------- B19 — multi-rater resolution ----------
+
+describe("resolveFeedback (B19)", () => {
+  const T = { threshold: 0.7 };
+  const vote = (
+    rater: string,
+    turnNumber: number,
+    fields: Partial<FeedbackRecord> = {},
+  ): FeedbackRecord =>
+    record({
+      id: `fb_${rater}_${turnNumber}`,
+      rater,
+      turnNumber,
+      ts: `2026-07-0${turnNumber}T00:00:00.000Z`,
+      ...fields,
+    });
+
+  it("single-rater turns fold byte-identically to mergeFeedback (also no-rater records)", () => {
+    const records = [
+      record({ turnNumber: 1, rating: { thumbs: "up" }, ts: "2026-01-01T00:00:00Z" }),
+      record({
+        turnNumber: 1,
+        modality: "comment",
+        rating: {},
+        comment: "nice",
+        ts: "2026-02-01T00:00:00Z",
+      }),
+      record({ id: "fb_b", turnNumber: 2, rating: { thumbs: "down" } }),
+    ];
+    const r = resolveFeedback(records, T);
+    expect(r.resolved).toEqual(mergeFeedback(records));
+    expect(r.agreement).toEqual([]);
+    expect(r.ties).toEqual([]);
+    expect(r.kappa).toBeUndefined();
+  });
+
+  it("all-thumbs multi-rater turns resolve by majority (2 up / 1 down → up)", () => {
+    const r = resolveFeedback(
+      [
+        vote("alice", 1),
+        vote("bob", 1, { rating: { thumbs: "down" }, modality: "binary" }),
+        vote("carol", 1),
+      ],
+      T,
+    );
+    expect(r.resolved).toHaveLength(1);
+    expect(r.resolved[0]?.rating).toEqual({ thumbs: "up" });
+    expect(r.resolved[0]?.modality).toBe("binary");
+    expect(r.agreement).toHaveLength(1);
+    expect(r.agreement[0]?.resolution).toBe("majority");
+    expect(r.agreement[0]?.unanimous).toBe(false);
+    expect(r.ties).toEqual([]);
+  });
+
+  it("stars/scale (or mixed) votes resolve to the mean normalized score", () => {
+    const r = resolveFeedback(
+      [
+        vote("alice", 1, { modality: "stars", rating: { stars: 3 } }), // 0.5
+        vote("bob", 1, { modality: "stars", rating: { stars: 5 } }), // 1.0
+      ],
+      T,
+    );
+    expect(r.resolved).toHaveLength(1);
+    expect(r.resolved[0]?.modality).toBe("scale");
+    expect(r.resolved[0]?.rating.scale).toEqual({ value: 0.75, min: 0, max: 1 });
+    expect(r.agreement[0]?.resolution).toBe("mean");
+    expect(r.ties).toEqual([]);
+  });
+
+  it("a split thumbs vote with no adjudication is a TIE — withheld, not resolved", () => {
+    const r = resolveFeedback(
+      [vote("alice", 1), vote("bob", 1, { rating: { thumbs: "down" }, modality: "binary" })],
+      T,
+    );
+    expect(r.resolved).toEqual([]);
+    expect(r.ties).toHaveLength(1);
+    expect(r.ties[0]?.resolution).toBe("tie");
+    expect(r.agreement).toHaveLength(1); // ties still count as multi-rater turns
+  });
+
+  it("an adjudication always wins — even against the majority — and closes the turn", () => {
+    const r = resolveFeedback(
+      [
+        vote("alice", 1),
+        vote("bob", 1),
+        vote("lead", 1, {
+          rating: { thumbs: "down" },
+          modality: "binary",
+          adjudication: true,
+          comment: "hallucinated the citation",
+          ts: "2026-07-01T01:00:00.000Z",
+        }),
+      ],
+      T,
+    );
+    expect(r.resolved).toHaveLength(1);
+    expect(r.resolved[0]?.rating.thumbs).toBe("down"); // minority adjudication wins
+    expect(r.resolved[0]?.comment).toBe("hallucinated the citation");
+    expect(r.agreement[0]?.resolution).toBe("adjudicated");
+    expect(r.ties).toEqual([]);
+  });
+
+  it("an adjudication settles a split thumbs vote (no tie enqueued)", () => {
+    const r = resolveFeedback(
+      [
+        vote("alice", 1),
+        vote("bob", 1, { rating: { thumbs: "down" }, modality: "binary" }),
+        vote("lead", 1, {
+          rating: { thumbs: "up" },
+          modality: "binary",
+          adjudication: true,
+          ts: "2026-07-01T02:00:00.000Z",
+        }),
+      ],
+      T,
+    );
+    expect(r.ties).toEqual([]);
+    expect(r.resolved[0]?.rating.thumbs).toBe("up");
+    expect(r.agreement[0]?.resolution).toBe("adjudicated");
+  });
+
+  it("a rating-less, correction-less adjudication does NOT settle a split — still a tie", () => {
+    // Pre-guard pathology: folding the comment-only adjudication last kept
+    // whichever disputing rater voted LAST (bob-down here) and stamped the
+    // turn "adjudicated" — the label flipped if alice/bob swapped timestamps.
+    const r = resolveFeedback(
+      [
+        vote("alice", 1),
+        vote("bob", 1, {
+          rating: { thumbs: "down" },
+          modality: "binary",
+          ts: "2026-07-01T01:00:00.000Z",
+        }),
+        vote("lead", 1, {
+          modality: "comment",
+          rating: {},
+          comment: "discussed offline",
+          adjudication: true,
+          ts: "2026-07-01T02:00:00.000Z",
+        }),
+      ],
+      T,
+    );
+    expect(r.resolved).toEqual([]);
+    expect(r.ties).toHaveLength(1);
+    expect(r.ties[0]?.resolution).toBe("tie");
+    expect(r.agreement[0]?.resolution).toBe("tie");
+  });
+
+  it("a correction-only adjudication settles the split (the correction is the verdict)", () => {
+    const r = resolveFeedback(
+      [
+        vote("alice", 1),
+        vote("bob", 1, {
+          rating: { thumbs: "down" },
+          modality: "binary",
+          ts: "2026-07-01T01:00:00.000Z",
+        }),
+        vote("lead", 1, {
+          modality: "comment",
+          rating: {},
+          correction: "the better answer",
+          adjudication: true,
+          ts: "2026-07-01T02:00:00.000Z",
+        }),
+      ],
+      T,
+    );
+    expect(r.ties).toEqual([]);
+    expect(r.resolved).toHaveLength(1);
+    expect(r.resolved[0]?.correction).toBe("the better answer");
+    expect(r.agreement[0]?.resolution).toBe("adjudicated");
+  });
+
+  it("computes the hand-checked overall Cohen's kappa (agree 3/4 → κ = 0.5)", () => {
+    // Rater A: up up down up; rater B: up up down down over turns 1–4.
+    // po = 3/4; marginals A(pos)=3/4 A(neg)=1/4, B(pos)=1/2 B(neg)=1/2 →
+    // pe = 3/8 + 1/8 = 1/2 → κ = (0.75 − 0.5)/(1 − 0.5) = 0.5.
+    const a = (n: number, thumbs: "up" | "down") =>
+      vote("a", n, { rating: { thumbs }, modality: "binary" });
+    const b = (n: number, thumbs: "up" | "down") =>
+      vote("b", n, { rating: { thumbs }, modality: "binary", ts: `2026-07-0${n}T01:00:00.000Z` });
+    const r = resolveFeedback(
+      [
+        a(1, "up"),
+        b(1, "up"),
+        a(2, "up"),
+        b(2, "up"),
+        a(3, "down"),
+        b(3, "down"),
+        a(4, "up"),
+        b(4, "down"),
+      ],
+      T,
+    );
+    expect(r.kappa).toBeCloseTo(0.5, 10);
+    expect(r.resolved).toHaveLength(3); // turn 4 is a tie
+    expect(r.ties).toHaveLength(1);
+    expect(r.ties[0]?.turnNumber).toBe(4);
+  });
+});
+
+describe("cohenKappa", () => {
+  it("matches the hand computation on a 4-item binary case", () => {
+    const k = cohenKappa([
+      ["pos", "pos"],
+      ["pos", "pos"],
+      ["neg", "neg"],
+      ["pos", "neg"],
+    ]);
+    expect(k).toBeCloseTo(0.5, 10);
+  });
+
+  it("is undefined on empty input, 1 on trivially perfect agreement, 0 on opposed constants", () => {
+    expect(cohenKappa([])).toBeUndefined();
+    expect(
+      cohenKappa([
+        ["pos", "pos"],
+        ["pos", "pos"],
+      ]),
+    ).toBe(1);
+    expect(
+      cohenKappa([
+        ["pos", "neg"],
+        ["pos", "neg"],
+      ]),
+    ).toBe(0);
+  });
+});
+
+describe("distill multi-rater (B19)", () => {
+  const turns: SessionTurn[] = [
+    { sessionId: SESSION, turnNumber: 1, input: "q1", output: "good answer", toolNames: [] },
+    { sessionId: SESSION, turnNumber: 2, input: "q2", output: "meh answer", toolNames: [] },
+  ];
+  const vote = (
+    rater: string,
+    turnNumber: number,
+    thumbs: "up" | "down",
+    extra: Partial<FeedbackRecord> = {},
+  ): FeedbackRecord =>
+    record({ id: `fb_${rater}_${turnNumber}`, rater, turnNumber, rating: { thumbs }, ...extra });
+
+  it("records every rater's verdict in metadata.ratings on multi-rater turns only", () => {
+    const r = distill(
+      turns,
+      [vote("alice", 1, "up"), vote("bob", 1, "up"), vote("alice", 2, "down")],
+      { minScore: 0.7 },
+    );
+    const multi = r.samples.find((s) => s.id === `${SESSION}_t1`);
+    const single = r.samples.find((s) => s.id === `${SESSION}_t2`);
+    expect(multi?.metadata?.["ratings"]).toEqual([
+      { rater: "alice", score: 1 },
+      { rater: "bob", score: 1 },
+    ]);
+    expect(multi?.expected_output).toBe("good answer");
+    expect(single?.metadata?.["ratings"]).toBeUndefined(); // single-rater unchanged
+    expect(r.agreement?.perTurn).toHaveLength(1);
+    expect(r.agreement?.kappa).toBe(1);
+  });
+
+  it("withholds tie turns from the samples, reports + warns, and keeps totalFeedback honest", () => {
+    const r = distill(turns, [vote("alice", 1, "up"), vote("bob", 1, "down")], { minScore: 0.7 });
+    expect(r.samples).toHaveLength(0);
+    expect(r.ties).toHaveLength(1);
+    expect(r.ties?.[0]?.sessionId).toBe(SESSION);
+    expect(r.stats.totalFeedback).toBe(1); // the tie turn still counts as rated
+    expect(r.warnings.join()).toContain("rater disagreement");
+  });
+
+  it("stamps metadata.adjudicated when an adjudication closed the turn", () => {
+    const r = distill(
+      turns,
+      [
+        vote("alice", 1, "up"),
+        vote("bob", 1, "down"),
+        vote("lead", 1, "up", { adjudication: true, ts: "2026-07-02T00:00:00.000Z" }),
+      ],
+      { minScore: 0.7 },
+    );
+    const s = r.samples.find((x) => x.id === `${SESSION}_t1`);
+    expect(s?.metadata?.["adjudicated"]).toBe(true);
+    expect(s?.expected_output).toBe("good answer");
+    expect(r.ties).toBeUndefined();
+  });
+
+  it("keeps the single-rater result shape byte-identical (no agreement/ties fields)", () => {
+    const r = distill(turns, [vote("alice", 1, "up")], { minScore: 0.7 });
+    expect("agreement" in r).toBe(false);
+    expect("ties" in r).toBe(false);
+  });
+});
+
+describe("formatAgreementLines (B19)", () => {
+  it("prints the kappa header plus one line per turn incl. the TIE marker", () => {
+    const lines = formatAgreementLines({
+      perTurn: [
+        {
+          sessionId: SESSION,
+          turnNumber: 1,
+          votes: [
+            { rater: "alice", score: 1, thumbs: "up" },
+            { rater: "bob", score: 0, thumbs: "down" },
+          ],
+          resolution: "tie",
+          unanimous: false,
+        },
+        {
+          sessionId: SESSION,
+          turnNumber: 2,
+          votes: [
+            { rater: "alice", score: 0.5 },
+            { rater: "", score: 1 },
+          ],
+          resolution: "mean",
+          unanimous: false,
+        },
+      ],
+      kappa: -0.25,
+    });
+    expect(lines[0]).toContain("Cohen's kappa -0.25");
+    expect(lines[1]).toContain("alice up / bob down");
+    expect(lines[1]).toContain("TIE");
+    expect(lines[2]).toContain("(unattributed) 1.00");
+    expect(lines[2]).toContain("mean 0.75");
   });
 });

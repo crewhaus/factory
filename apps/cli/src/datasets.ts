@@ -28,6 +28,108 @@ import {
 } from "@crewhaus/dataset-registry";
 import type { Sample } from "@crewhaus/eval-dataset";
 
+// -------- provenance taxonomy (B22) --------
+
+/**
+ * B22 — the canonical `metadata.source` provenance vocabulary. Every
+ * first-party writer stamps a member: `production_log` (distilled
+ * ratings/corrections AND `dataset mine` hard cases — both come from real
+ * sessions; the tool identity survives in sibling keys, `feedback_source`
+ * for distill and `mined: true` for mine), `synthetic` (dataset synthesize
+ * stress variants — never carry golds, an invariant the registry `put`
+ * enforces), `synthetic_human_verified` (generated samples whose gold a
+ * human verified, e.g. a refresh-goldens promotion onto a synthetic
+ * sample), `human_authored` (hand-written datasets), and `canary` (B18
+ * contamination tripwires). Values outside the taxonomy WARN at promotion
+ * and in `dataset lint` — never fail — so foreign datasets still import.
+ */
+export const SOURCE_TAXONOMY: ReadonlyArray<string> = [
+  "human_authored",
+  "production_log",
+  "synthetic",
+  "synthetic_human_verified",
+  "canary",
+];
+
+/** The sample's string `metadata.source`, or undefined when absent/non-string
+ *  (non-string values are provenance objects, not taxonomy labels). */
+export function sampleSource(s: Sample): string | undefined {
+  const v = s.metadata?.["source"];
+  return typeof v === "string" ? v : undefined;
+}
+
+/** Samples whose `metadata.source` is a string OUTSIDE the taxonomy, grouped
+ *  value → offending sample ids (insertion order). Sourceless samples are
+ *  fine — the taxonomy governs declared provenance, it does not require it. */
+export function offTaxonomySources(samples: ReadonlyArray<Sample>): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const s of samples) {
+    const source = sampleSource(s);
+    if (source === undefined || SOURCE_TAXONOMY.includes(source)) continue;
+    const ids = out.get(source);
+    if (ids !== undefined) ids.push(s.id);
+    else out.set(source, [s.id]);
+  }
+  return out;
+}
+
+/**
+ * B22 — retag `source: synthetic` samples that (now) carry a gold as
+ * `synthetic_human_verified`: the only path that golds a synthetic sample is
+ * a human-evidence promotion (refresh-goldens `--apply` reconciling
+ * corrections/up-rated turns), so the tag records exactly what happened —
+ * and keeps the registry's synthetic-never-gold invariant satisfiable.
+ * Everything else passes through untouched.
+ */
+export function promoteVerifiedSynthetics(samples: ReadonlyArray<Sample>): Sample[] {
+  return samples.map((s) =>
+    sampleSource(s) === "synthetic" && s.expected_output !== undefined
+      ? { ...s, metadata: { ...(s.metadata ?? {}), source: "synthetic_human_verified" } }
+      : s,
+  );
+}
+
+// -------- contamination canaries (B18) --------
+
+/**
+ * B18 — the deterministic canary phrase for one dataset version: a hex
+ * digest of the (name, version) pair, no wall clock involved, so the same
+ * version always carries the same phrase and `dataset lint` can recompute it
+ * offline. Unique enough (128 bits) that an appearance ANYWHERE outside the
+ * dataset — spec instructions, few-shot pools — is proof of leakage, not
+ * coincidence.
+ */
+export function canaryPhrase(name: string, version: string): string {
+  return createHash("sha256")
+    .update(`crewhaus-canary:${name}@${version}`)
+    .digest("hex")
+    .slice(0, 32);
+}
+
+/** The canary sample's id for a version (stable, collision-proof against
+ *  ordinary sample ids via the reserved prefix). */
+export function canarySampleId(name: string, version: string): string {
+  return `canary_${name}_${version}`;
+}
+
+/**
+ * B18 — the one canary sample `datasets put --canary` injects per version:
+ * a nonsense hex phrase with NO gold, tagged `metadata.source: "canary"`.
+ * The runner excludes it from the pass-rate denominator (like needs_human)
+ * and `dataset lint` scans spec instructions + few-shot pools for the
+ * phrase — if it ever shows up there, eval content leaked into the prompt.
+ */
+export function canarySample(name: string, version: string): Sample {
+  return {
+    id: canarySampleId(name, version),
+    input: `CREWHAUS-CANARY ${canaryPhrase(name, version)} — contamination tripwire; if this phrase appears in instructions or few-shot examples, this eval dataset has leaked into the prompt.`,
+    metadata: {
+      source: "canary",
+      note: "contamination canary injected by `crewhaus datasets put --canary` — excluded from pass rates",
+    },
+  };
+}
+
 /** `--dataset` values with this prefix resolve via the registry, not a file. */
 export const REGISTRY_PREFIX = "registry:";
 
@@ -375,25 +477,50 @@ export type RegisterDatasetOptions = {
   readonly splitSpec?: SplitSpec;
   /** Put every sample into this single named split instead of splitting. */
   readonly split?: DatasetSplit;
+  /** B18 — inject the version's one deterministic contamination-canary
+   *  sample (see {@link canarySample}) before split assignment. */
+  readonly canary?: boolean;
+  /** Warning sink (B22 off-taxonomy provenance notes); defaults to stderr. */
+  readonly warn?: (line: string) => void;
 };
+
+/** How many offending sample ids a provenance warning spells out. */
+const TAXONOMY_WARN_MAX_IDS = 5;
 
 /**
  * Import samples as a new auto-bumped version (v1, v2, …) of `name`, either
  * deterministically split per the spec (test key omitted when the spec gives
  * test 0%) or wholesale into one named split. Returns the persisted record.
+ *
+ * B22 — declared provenance outside {@link SOURCE_TAXONOMY} warns (never
+ * fails: foreign datasets still import; the registry `put` separately
+ * enforces the hard synthetic-never-gold invariant). B18 — `canary: true`
+ * appends the version's deterministic canary sample before splitting, so it
+ * rides the normal id-hash split assignment.
  */
 export async function registerDataset(opts: RegisterDatasetOptions): Promise<DatasetRecord> {
   const version = nextVersion(await opts.registry.list(opts.name));
+  const samples =
+    opts.canary === true ? [...opts.samples, canarySample(opts.name, version)] : opts.samples;
+  const warn = opts.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
+  for (const [source, ids] of offTaxonomySources(samples)) {
+    const shown = ids.slice(0, TAXONOMY_WARN_MAX_IDS).join(", ");
+    const elided =
+      ids.length > TAXONOMY_WARN_MAX_IDS ? ` +${ids.length - TAXONOMY_WARN_MAX_IDS} more` : "";
+    warn(
+      `[datasets] warning: metadata.source "${source}" is outside the provenance taxonomy (${SOURCE_TAXONOMY.join(" | ")}) — ${ids.length} sample(s): ${shown}${elided}`,
+    );
+  }
   let splits: { train: Sample[]; dev: Sample[]; test?: Sample[] };
   if (opts.split !== undefined) {
     splits = {
-      train: opts.split === "train" ? [...opts.samples] : [],
-      dev: opts.split === "dev" ? [...opts.samples] : [],
-      ...(opts.split === "test" ? { test: [...opts.samples] } : {}),
+      train: opts.split === "train" ? [...samples] : [],
+      dev: opts.split === "dev" ? [...samples] : [],
+      ...(opts.split === "test" ? { test: [...samples] } : {}),
     };
   } else {
     const spec = opts.splitSpec ?? DEFAULT_SPLIT_SPEC;
-    const { train, dev, test } = splitSamples(opts.samples, spec);
+    const { train, dev, test } = splitSamples(samples, spec);
     splits = { train, dev, ...(spec.test > 0 ? { test } : {}) };
   }
   return opts.registry.put({ name: opts.name, version, splits });

@@ -81,6 +81,44 @@ describe("sampleTextFields + auditSamples", () => {
     ]);
   });
 
+  it("scans B14 history message contents (per-turn fields, in order)", () => {
+    const fields = sampleTextFields({
+      id: "mt1",
+      input: "final question",
+      history: [
+        { role: "user", content: "first ask" },
+        { role: "assistant", content: "first answer" },
+      ],
+      expected_output: "out",
+    });
+    expect(fields.map((f) => f.field)).toEqual([
+      "input",
+      "history[0].content",
+      "history[1].content",
+      "expected_output",
+    ]);
+    expect(fields[1]?.text).toBe("first ask");
+    expect(fields[2]?.text).toBe("first answer");
+
+    const report = auditSamples([
+      {
+        id: "mt2",
+        input: "clean final turn",
+        history: [
+          { role: "user", content: `my ssn is ${SSN}` },
+          { role: "assistant", content: "noted" },
+        ],
+      },
+    ]);
+    expect(report.totalHits).toBe(1);
+    expect(report.hits).toContainEqual({
+      sampleId: "mt2",
+      field: "history[0].content",
+      kind: "ssn",
+      count: 1,
+    });
+  });
+
   it("reports hits per detector/field with sample ids and never fabricates any", () => {
     const report = auditSamples([
       { id: "s1", input: `ssn ${SSN} here` },
@@ -128,11 +166,31 @@ describe("redactSample", () => {
     expect(s.metadata?.["raw_rating"]).toEqual({ thumbs: "up" });
   });
 
+  it("preserves B14 history on rebuild — roles verbatim, contents redacted", () => {
+    const s = redactSample({
+      id: "mt1",
+      input: "clean final turn",
+      history: [
+        { role: "user", content: `reach me at ${EMAIL} please` },
+        { role: "assistant", content: "no pii in this turn" },
+      ],
+      expected_output: "gold",
+    });
+    expect(SampleSchema.safeParse(s).success).toBe(true);
+    expect(s.history).toEqual([
+      { role: "user", content: "reach me at [REDACTED:email] please" },
+      { role: "assistant", content: "no pii in this turn" },
+    ]);
+    expect(s.input).toBe("clean final turn");
+    expect(s.expected_output).toBe("gold");
+  });
+
   it("keeps a clean sample identical and never adds absent fields", () => {
     const s = redactSample({ id: "c1", input: "plain" });
     expect(s).toEqual({ id: "c1", input: "plain" });
     expect("expected_output" in s).toBe(false);
     expect("metadata" in s).toBe(false);
+    expect("history" in s).toBe(false);
   });
 });
 

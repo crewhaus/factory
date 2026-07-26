@@ -181,6 +181,33 @@ export function poolToJsonl(examples: ReadonlyArray<FewShotExample>): string {
   return `${examples.map((e) => JSON.stringify(e)).join("\n")}\n`;
 }
 
+/** NEW-datasets-1 — the (sessionId, turnNumber) join key shared by a pool
+ *  example's provenance and a distilled sample's metadata stamps. */
+export function fewShotOverlapKey(sessionId: string, turnNumber: number): string {
+  return `${sessionId}#${turnNumber}`;
+}
+
+/**
+ * NEW-datasets-1 — drop pool examples whose (sessionId, turnNumber)
+ * provenance appears in the eval dataset. distill stamps every sample's
+ * `metadata.sessionId` / `metadata.turnNumber` and every harvested example
+ * carries the same pair in `provenance`, so an example that IS an eval sample
+ * (its input + known-good output verbatim in the prompt — the train-on-test
+ * bug in flywheel form) is excluded before injection. An empty key set (a
+ * dataset with no provenance metadata) keeps the pool untouched — the caller
+ * logs the excluded count, never silently.
+ */
+export function excludeOverlappingExamples(
+  pool: ReadonlyArray<FewShotExample>,
+  overlapKeys: ReadonlySet<string>,
+): { kept: FewShotExample[]; excluded: number } {
+  if (overlapKeys.size === 0) return { kept: [...pool], excluded: 0 };
+  const kept = pool.filter(
+    (e) => !overlapKeys.has(fewShotOverlapKey(e.provenance.sessionId, e.provenance.turnNumber)),
+  );
+  return { kept, excluded: pool.length - kept.length };
+}
+
 const FEWSHOT_CLOSE_TAG_RE = /<\s*\/\s*few_shot_examples\s*>/gi;
 
 /**

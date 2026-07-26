@@ -198,6 +198,24 @@ function needsReviewSection(a: EvalRunSummary["aggregates"]): string {
 </section>`;
 }
 
+/**
+ * B18 — the canary bucket: contamination-tripwire samples
+ * (`metadata.source: "canary"`, injected by `crewhaus datasets put --canary`).
+ * Their verdicts are meaningless by construction, so they are excluded from
+ * the pass-rate denominator like the needs-human bucket — this section keeps
+ * the report's denominator story honest for canary-carrying runs.
+ */
+function canarySection(a: EvalRunSummary["aggregates"]): string {
+  if (a.canary === undefined || a.canary === 0) return "";
+  const ids = (a.canarySampleIds ?? []).map((id) => escapeHtml(id)).join(", ");
+  return `
+<section class="diff-section" id="canary">
+  <h2>Canary (${a.canary})</h2>
+  <p class="meta">Contamination-tripwire samples (<code>metadata.source: "canary"</code>) — their verdicts
+  are meaningless by construction and are excluded from the pass rate: <span class="abstain">${ids}</span></p>
+</section>`;
+}
+
 function aggregateCards(s: EvalRunSummary): string {
   const a = s.aggregates;
   const cards = [
@@ -269,6 +287,10 @@ function aggregateCards(s: EvalRunSummary): string {
   // A2 — high-entropy panel votes flagged for review (verdicts still count).
   if (a.needsReview !== undefined) {
     cards.push({ label: "Needs review", value: String(a.needsReview) });
+  }
+  // B18 — contamination canaries (excluded from the pass-rate denominator).
+  if (a.canary !== undefined) {
+    cards.push({ label: "Canary", value: String(a.canary) });
   }
   // A9 — abstention-aware accuracy lens (calibration.abstentionAware pack).
   if (a.calibration !== undefined) {
@@ -522,7 +544,7 @@ export function renderReport(
   const body = `
 <h1>Eval run ${escapeHtml(s.runId)}</h1>
 <p class="meta">Started ${escapeHtml(s.startedAt)} · ended ${escapeHtml(s.endedAt)} · model ${escapeHtml(s.config.model)} · concurrency ${s.config.concurrency}${s.config.judgeModel ? ` · judge ${escapeHtml(s.config.judgeModel)}` : ""}${s.config.repeats !== undefined ? ` · repeats ${s.config.repeats}` : ""}</p>
-${calibrationNote}${aggregateCards(s)}${needsHumanSection(s.aggregates)}${needsReviewSection(s.aggregates)}${s.slices !== undefined ? slicesSection(s.slices) : ""}${s.aggregates.criterionMeans !== undefined ? criterionSection(s.aggregates.criterionMeans) : ""}${opts.verdicts !== undefined ? triageSection(opts.verdicts) : ""}
+${calibrationNote}${aggregateCards(s)}${needsHumanSection(s.aggregates)}${needsReviewSection(s.aggregates)}${canarySection(s.aggregates)}${s.slices !== undefined ? slicesSection(s.slices) : ""}${s.aggregates.criterionMeans !== undefined ? criterionSection(s.aggregates.criterionMeans) : ""}${opts.verdicts !== undefined ? triageSection(opts.verdicts) : ""}
 <table data-sortable>
   <thead><tr>
     <th>Sample</th><th>Status</th><th>Score</th>${extraHeaders}<th>Turns</th><th>Latency</th><th>Tokens (in/out)</th><th>Drill</th>

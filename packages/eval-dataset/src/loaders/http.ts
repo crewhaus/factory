@@ -1,22 +1,26 @@
 import { parse as parseYaml } from "yaml";
 import { DatasetLoadError } from "../errors";
 import { DatasetSchema, type LoadedDataset, type Sample, SampleSchema } from "../index";
-import { parseCsv } from "./csv";
+import { csvRowsToSamples, parseCsv } from "./csv";
+import { samplesFromJsonlStream, samplesFromJsonlText } from "./jsonl";
 
 /**
- * HTTP loader — fetches the URL into memory, then dispatches to the
- * appropriate format parser based on the URL extension first, then
- * the response Content-Type as a fallback.
+ * HTTP loader — dispatches on the URL extension first, then the response
+ * Content-Type as a fallback.
  *
- * Buffers the entire body in memory; HuggingFace-scale datasets should
- * be downloaded ahead of time and loaded via the local-file loaders.
+ * B24 — `.jsonl`/`.ndjson` bodies STREAM line-by-line off the fetch body
+ * reader through the SAME incremental parser as the local file loader:
+ * memory stays bounded by the longest line, not the body, so a multi-GB
+ * JSONL URL parses as it downloads. CSV and YAML buffer the entire body via
+ * `response.text()` — YAML cannot be parsed incrementally and CSV quoting
+ * can span physical lines — matching the (also buffered) local CSV/YAML
+ * loaders.
  */
 export async function loadHttp(url: string): Promise<LoadedDataset> {
   const response = await fetch(url);
   if (!response.ok) {
     throw new DatasetLoadError(`HTTP ${response.status} fetching ${url}`);
   }
-  const text = await response.text();
   const ct = (response.headers.get("content-type") ?? "").toLowerCase();
   const lower = url.toLowerCase();
 
@@ -26,10 +30,14 @@ export async function loadHttp(url: string): Promise<LoadedDataset> {
     ct.includes("application/x-jsonlines") ||
     ct.includes("application/x-ndjson")
   ) {
-    return { name: deriveName(url), samples: parseJsonlText(text, url) };
+    return { name: deriveName(url), samples: streamJsonlBody(response, url) };
   }
   if (lower.endsWith(".csv") || ct.includes("text/csv")) {
-    return { name: deriveName(url), samples: parseCsvText(text, url) };
+    // Buffered: CSV quoting can span physical lines. Rows then flow through
+    // the SAME row → Sample generator as the file loader (metadata/history
+    // JSON columns included).
+    const [header, ...dataRows] = parseCsv(await response.text());
+    return { name: deriveName(url), samples: csvRowsToSamples(dataRows, header ?? [], url) };
   }
   if (
     lower.endsWith(".yaml") ||
@@ -37,7 +45,7 @@ export async function loadHttp(url: string): Promise<LoadedDataset> {
     ct.includes("application/yaml") ||
     ct.includes("text/yaml")
   ) {
-    return parseYamlText(text, url);
+    return parseYamlText(await response.text(), url);
   }
   throw new DatasetLoadError(
     `unrecognized HTTP dataset format for ${url} (content-type: ${ct || "unknown"})`,
@@ -54,56 +62,19 @@ function deriveName(url: string): string {
   }
 }
 
-async function* parseJsonlText(text: string, source: string): AsyncIterable<Sample> {
-  let lineNo = 0;
-  for (const raw of text.split(/\r?\n/)) {
-    lineNo += 1;
-    if (raw.trim() === "") continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (err) {
-      throw new DatasetLoadError(`malformed JSON on line ${lineNo} of ${source}`, err);
-    }
-    const result = SampleSchema.safeParse(parsed);
-    if (!result.success) {
-      throw new DatasetLoadError(
-        `invalid sample on line ${lineNo} of ${source}: ${result.error.message}`,
-      );
-    }
-    yield result.data;
+/**
+ * B24 — HTTP `.jsonl` delegates to the shared incremental JSONL parser (see
+ * `loaders/jsonl.ts`) over the fetch body reader. A null body (null-body
+ * statuses, minimal Response stubs) falls back to buffering — there is
+ * nothing to stream.
+ */
+async function* streamJsonlBody(response: Response, source: string): AsyncIterable<Sample> {
+  const body = response.body;
+  if (body === null || body === undefined) {
+    yield* samplesFromJsonlText(await response.text(), source);
+    return;
   }
-}
-
-async function* parseCsvText(text: string, source: string): AsyncIterable<Sample> {
-  const [header, ...dataRows] = parseCsv(text);
-  if (!header) return;
-  let rowNo = 1;
-  for (const row of dataRows) {
-    rowNo += 1;
-    if (row.length === 1 && row[0] === "") continue;
-    const obj: Record<string, string | string[]> = {};
-    for (let i = 0; i < header.length; i++) {
-      const key = header[i];
-      if (key === undefined) continue;
-      const cell = row[i] ?? "";
-      if (key === "expected_tools" && cell !== "") {
-        obj[key] = cell
-          .split(",")
-          .map((s) => s.trim())
-          .filter((s) => s.length > 0);
-      } else if (cell !== "") {
-        obj[key] = cell;
-      }
-    }
-    const result = SampleSchema.safeParse(obj);
-    if (!result.success) {
-      throw new DatasetLoadError(
-        `invalid sample on row ${rowNo} of ${source}: ${result.error.message}`,
-      );
-    }
-    yield result.data;
-  }
+  yield* samplesFromJsonlStream(body, source);
 }
 
 function parseYamlText(text: string, source: string): LoadedDataset {

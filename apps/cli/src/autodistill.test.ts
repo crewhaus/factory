@@ -29,6 +29,7 @@ import {
   writeDistillState,
 } from "./autodistill";
 import type { FeedbackRecord, SessionTurn } from "./feedback";
+import { readReviewQueue } from "./review-queue";
 
 const TMP_ROOTS: string[] = [];
 function newTempRoot(): string {
@@ -433,6 +434,85 @@ describe("maybeAutoDistill", () => {
 
   test("ratingsDatasetName is the item-12 shorthand target", () => {
     expect(ratingsDatasetName("concierge")).toBe("concierge-ratings");
+  });
+
+  // B19/B20 — an unattended teardown must not silently swallow a split
+  // verdict: distill's warnings surface through the write sink and the tie
+  // lands in the harness review queue (idempotent by (sessionId, turn)).
+  test("surfaces distill warnings and enqueues rater ties to the review queue", async () => {
+    const c = ctx();
+    const { turns, records } = makeRatedSession(5);
+    const tieTurn = makeTurn({ turnNumber: 6 });
+    const tieVotes: FeedbackRecord[] = [
+      {
+        ...makeRecord({ turnNumber: 6, ts: "2026-07-01T00:06:00.000Z", thumbs: "up" }),
+        id: "fb_t6_alice",
+        rater: "alice",
+      },
+      {
+        ...makeRecord({ turnNumber: 6, ts: "2026-07-01T00:07:00.000Z", thumbs: "down" }),
+        id: "fb_t6_bob",
+        rater: "bob",
+      },
+    ];
+    const result = await maybeAutoDistill({
+      specName: "hello",
+      feedback: FEEDBACK_ON,
+      turns: [...turns, tieTurn],
+      records: [...records, ...tieVotes],
+      registry: c.registry,
+      stateFilePath: c.stateFilePath,
+      reviewRootDir: c.root,
+      env: {},
+      write: (l) => c.lines.push(l),
+    });
+    // The 5 clean ratings still register; the tie turn is withheld.
+    expect(result.ran).toBe(true);
+    const record = await c.registry.getRecord("hello-ratings", "v1");
+    expect(
+      record.splits.train.length + record.splits.dev.length + (record.splits.test?.length ?? 0),
+    ).toBe(5);
+    // The disagreement warning reached the sink and the queue got the tie.
+    expect(c.lines.join("\n")).toContain("rater disagreement");
+    expect(c.lines.join("\n")).toContain("review queue (1 new)");
+    const queued = readReviewQueue(c.root);
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.kind).toBe("rater_disagreement");
+    expect(queued[0]?.sourceRef).toEqual({ sessionId: SESSION_A, turn: 6 });
+    expect(queued[0]?.status).toBe("open");
+    expect(queued[0]?.context).toContain("alice: up");
+    expect(queued[0]?.context).toContain("bob: down");
+  });
+
+  test("without reviewRootDir ties are not enqueued (pure-unit callers unchanged)", async () => {
+    const c = ctx();
+    const { turns, records } = makeRatedSession(5);
+    const tieVotes: FeedbackRecord[] = [
+      {
+        ...makeRecord({ turnNumber: 6, ts: "2026-07-01T00:06:00.000Z", thumbs: "up" }),
+        id: "fb_t6_alice",
+        rater: "alice",
+      },
+      {
+        ...makeRecord({ turnNumber: 6, ts: "2026-07-01T00:07:00.000Z", thumbs: "down" }),
+        id: "fb_t6_bob",
+        rater: "bob",
+      },
+    ];
+    const result = await maybeAutoDistill({
+      specName: "hello",
+      feedback: FEEDBACK_ON,
+      turns: [...turns, makeTurn({ turnNumber: 6 })],
+      records: [...records, ...tieVotes],
+      registry: c.registry,
+      stateFilePath: c.stateFilePath,
+      env: {},
+      write: (l) => c.lines.push(l),
+    });
+    expect(result.ran).toBe(true);
+    // The warning still surfaces even when no queue root was supplied.
+    expect(c.lines.join("\n")).toContain("rater disagreement");
+    expect(readReviewQueue(c.root)).toEqual([]);
   });
 });
 

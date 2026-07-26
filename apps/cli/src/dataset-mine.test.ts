@@ -159,7 +159,10 @@ describe("candidate → quarantine sample", () => {
   it("carries full provenance and is SampleSchema-valid", () => {
     const s = candidateToSample(cand);
     expect(SampleSchema.safeParse(s).success).toBe(true);
-    expect(s.metadata?.["source"]).toBe("mine");
+    // B22 — mined turns are production data: the canonical taxonomy value,
+    // with tool identity preserved in the sibling `mined` flag.
+    expect(s.metadata?.["source"]).toBe("production_log");
+    expect(s.metadata?.["mined"]).toBe(true);
     expect(s.metadata?.["signal"]).toBe("tool-error");
     expect(s.metadata?.["sessionId"]).toBe("sess_00000000000000aa");
     expect(s.metadata?.["status"]).toBe("quarantine");
@@ -360,7 +363,7 @@ describe("variantToSample", () => {
   it("tags synthetic provenance and NEVER carries an expected_output", () => {
     const s = variantToSample({ input: "paraphrased", mutation: "paraphrase" }, "gold_01", 1);
     expect(SampleSchema.safeParse(s).success).toBe(true);
-    expect(s.metadata?.["source"]).toBe("synthesize");
+    expect(s.metadata?.["source"]).toBe("synthetic");
     expect(s.metadata?.["from"]).toBe("gold_01");
     expect(s.expected_output).toBeUndefined();
     expect(s.id).toContain("synth_");
@@ -589,7 +592,7 @@ describe("crewhaus dataset synthesize (CLI, offline)", () => {
     const all = [...rec.splits.train, ...rec.splits.dev, ...(rec.splits.test ?? [])];
     expect(all.length).toBeGreaterThan(0);
     for (const s of all) {
-      expect(s.metadata.source).toBe("synthesize");
+      expect(s.metadata.source).toBe("synthetic");
       // No synthetic sample ever inherits the gold's expected_output.
       expect(s.expected_output).toBeUndefined();
     }
@@ -638,7 +641,7 @@ describe("crewhaus dataset synthesize (CLI, offline)", () => {
     expect(asText).not.toContain("219-09-9999");
     expect(asText).not.toContain("jane@example.com");
     for (const s of all) {
-      expect(s.metadata["source"]).toBe("synthesize");
+      expect(s.metadata["source"]).toBe("synthetic");
     }
     // Mutation is applied to the ALREADY-redacted text (redact-before-mutate
     // ordering): every non-truncated variant retains all three markers, and

@@ -50,18 +50,35 @@ export function sampleNeedsReview(s: SampleResult): boolean {
 }
 
 /**
+ * B18 — a contamination-canary sample (`metadata.source: "canary"`, injected
+ * by `crewhaus datasets put --canary`). Its verdict is MEANINGLESS by
+ * construction — the input is a nonsense hex phrase with no gold — so, like
+ * an abstained sample, it leaves the pass-rate denominator and is listed
+ * separately (`canary`/`canarySampleIds`). Unlike {@link sampleAbstained}
+ * the exclusion applies even to errored samples: a canary is never a
+ * measurement of the spec. Canary-less runs are byte-identical.
+ */
+export function sampleIsCanary(s: SampleResult): boolean {
+  return s.metadata?.["source"] === "canary";
+}
+
+/**
  * Per-slice pass rate + mean score, mirroring the run-level semantics:
- * `passRate` excludes abstained samples from the denominator (errored ones
- * still count as failures), and `meanScore` averages the graded, non-errored
- * samples only. `sampleCount` is the slice's full membership.
+ * `passRate` excludes abstained and canary samples from the denominator
+ * (errored ones still count as failures), and `meanScore` averages the
+ * graded, non-errored, non-canary samples only. `sampleCount` is the
+ * slice's full membership.
  */
 function sliceStats(group: ReadonlyArray<SampleResult>): SliceStats {
-  const abstained = group.filter(sampleAbstained);
-  const graded = group.length - abstained.length;
+  const excluded = group.filter((s) => sampleAbstained(s) || sampleIsCanary(s));
+  const graded = group.length - excluded.length;
   const passed = group.filter(
-    (s) => s.error === undefined && !sampleAbstained(s) && s.grades.overall.passed,
+    (s) =>
+      s.error === undefined && !sampleAbstained(s) && !sampleIsCanary(s) && s.grades.overall.passed,
   ).length;
-  const scored = group.filter((s) => s.error === undefined && !sampleAbstained(s));
+  const scored = group.filter(
+    (s) => s.error === undefined && !sampleAbstained(s) && !sampleIsCanary(s),
+  );
   return {
     sampleCount: group.length,
     passRate: graded === 0 ? 0 : passed / graded,

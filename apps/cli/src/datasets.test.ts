@@ -14,12 +14,15 @@ import { type Sample, SampleSchema } from "@crewhaus/eval-dataset";
 import {
   DEFAULT_SPLIT_SPEC,
   DatasetRefError,
+  canaryPhrase,
+  canarySample,
   inspectRegistryRef,
   nextVersion,
   overallDatasetHash,
   parseNameVersion,
   parseRegistryRef,
   parseSplitSpec,
+  promoteVerifiedSynthetics,
   recordToJsonl,
   refuseTestSplitRef,
   registerDataset,
@@ -507,5 +510,144 @@ describe("distill → registerDataset (the --register pipeline)", () => {
     // Same samples → same per-split assignment (determinism end to end).
     expect(rec2.splits.train.map((s) => s.id)).toEqual(rec.splits.train.map((s) => s.id));
     expect(rec2.sampleHashes).toEqual(rec.sampleHashes);
+  });
+});
+
+describe("B18 — contamination canaries", () => {
+  test("canarySample is deterministic (no wall clock) and taxonomy-tagged", () => {
+    const a = canarySample("support", "v3");
+    const b = canarySample("support", "v3");
+    expect(a).toEqual(b);
+    expect(SampleSchema.safeParse(a).success).toBe(true);
+    expect(a.metadata?.["source"]).toBe("canary");
+    expect(a.expected_output).toBeUndefined();
+    expect(a.input).toContain(canaryPhrase("support", "v3"));
+    // Distinct per version and per name.
+    expect(canarySample("support", "v4").input).not.toBe(a.input);
+    expect(canarySample("other", "v3").input).not.toBe(a.input);
+  });
+
+  test("registerDataset canary:true injects exactly ONE canary riding the deterministic split", async () => {
+    const registry = newRegistry();
+    const rec = await registerDataset({
+      registry,
+      name: "with-canary",
+      samples: samples(9),
+      canary: true,
+    });
+    const all = [...rec.splits.train, ...rec.splits.dev, ...(rec.splits.test ?? [])];
+    expect(all.length).toBe(10);
+    const canaries = all.filter((s) => s.metadata?.["source"] === "canary");
+    expect(canaries.length).toBe(1);
+    expect(canaries[0]?.input).toContain(canaryPhrase("with-canary", "v1"));
+    // The phrase folds the AUTO-BUMPED version, so v2's canary differs.
+    const rec2 = await registerDataset({
+      registry,
+      name: "with-canary",
+      samples: samples(9),
+      canary: true,
+    });
+    const all2 = [...rec2.splits.train, ...rec2.splits.dev, ...(rec2.splits.test ?? [])];
+    const canary2 = all2.find((s) => s.metadata?.["source"] === "canary");
+    expect(canary2?.input).toContain(canaryPhrase("with-canary", "v2"));
+  });
+
+  test("canary:true with --split lands the canary in that single split", async () => {
+    const registry = newRegistry();
+    const rec = await registerDataset({
+      registry,
+      name: "canary-split",
+      samples: samples(2),
+      split: "dev",
+      canary: true,
+    });
+    expect(rec.splits.train.length).toBe(0);
+    expect(rec.splits.dev.length).toBe(3);
+    expect(rec.splits.dev.some((s) => s.metadata?.["source"] === "canary")).toBe(true);
+  });
+
+  test("without canary:true nothing is injected (byte-identical promotion)", async () => {
+    const registry = newRegistry();
+    const rec = await registerDataset({ registry, name: "plain", samples: samples(4) });
+    const all = [...rec.splits.train, ...rec.splits.dev, ...(rec.splits.test ?? [])];
+    expect(all.length).toBe(4);
+    expect(all.some((s) => s.metadata?.["source"] === "canary")).toBe(false);
+  });
+});
+
+describe("B22 — provenance taxonomy at promotion", () => {
+  test("off-taxonomy metadata.source warns through the sink, listing offenders", async () => {
+    const registry = newRegistry();
+    const warnings: string[] = [];
+    await registerDataset({
+      registry,
+      name: "tax",
+      samples: [
+        { id: "a", input: "1", metadata: { source: "synthesize" } },
+        // B22 — legacy tool tag: mine now stamps "production_log", so a
+        // raw "mine" value is off-taxonomy and warns like any other.
+        { id: "b", input: "2", metadata: { source: "mine" } },
+        { id: "c", input: "3" },
+      ],
+      warn: (line) => warnings.push(line),
+    });
+    expect(warnings.length).toBe(2);
+    const synthesize = warnings.find((w) => w.includes('"synthesize"'));
+    expect(synthesize).toContain("a");
+    expect(synthesize).toContain("human_authored | production_log | synthetic");
+    const mine = warnings.find((w) => w.includes('"mine"'));
+    expect(mine).toContain("b");
+  });
+
+  test("taxonomy members and untagged samples promote silently", async () => {
+    const registry = newRegistry();
+    const warnings: string[] = [];
+    await registerDataset({
+      registry,
+      name: "tax2",
+      samples: [
+        { id: "a", input: "1", metadata: { source: "production_log" } },
+        { id: "b", input: "2" },
+      ],
+      warn: (line) => warnings.push(line),
+    });
+    expect(warnings).toEqual([]);
+  });
+
+  test("promoteVerifiedSynthetics retags ONLY golded synthetics", () => {
+    const out = promoteVerifiedSynthetics([
+      { id: "a", input: "1", expected_output: "g", metadata: { source: "synthetic", from: "x" } },
+      { id: "b", input: "2", metadata: { source: "synthetic" } },
+      { id: "c", input: "3", expected_output: "g", metadata: { source: "mine" } },
+    ]);
+    expect(out[0]?.metadata?.["source"]).toBe("synthetic_human_verified");
+    expect(out[0]?.metadata?.["from"]).toBe("x"); // rest of metadata kept
+    expect(out[1]?.metadata?.["source"]).toBe("synthetic");
+    expect(out[2]?.metadata?.["source"]).toBe("mine");
+  });
+
+  test("distill stamps production_log + the rating channel as feedback_source", () => {
+    const turns: SessionTurn[] = [
+      {
+        sessionId: "s1",
+        turnNumber: 1,
+        input: "question",
+        output: "answer",
+        toolNames: [],
+      },
+    ];
+    const feedback: FeedbackRecord[] = [
+      {
+        sessionId: "s1",
+        turnNumber: 1,
+        rating: "up",
+        source: "ui",
+        ts: "2026-07-25T00:00:00.000Z",
+      },
+    ];
+    const result = distill(turns, feedback, { minScore: 0.5 });
+    expect(result.samples.length).toBe(1);
+    expect(result.samples[0]?.metadata?.["source"]).toBe("production_log");
+    expect(result.samples[0]?.metadata?.["feedback_source"]).toBe("ui");
   });
 });

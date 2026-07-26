@@ -34,12 +34,12 @@ async function runCli(args: ReadonlyArray<string>, cwd: string): Promise<{ exitC
   return { exitCode: await proc.exited };
 }
 
-/** runCli variant that also returns captured stderr (the few-shot write-back
- *  notice is on stderr and reliably flushed before the process exits). */
+/** runCli variant that also returns captured stdout + stderr (the few-shot
+ *  write-back notice is on stderr and reliably flushed before exit). */
 async function runCliCapture(
   args: ReadonlyArray<string>,
   cwd: string,
-): Promise<{ exitCode: number; stderr: string }> {
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
     cwd,
     env: { PATH: process.env["PATH"] ?? "" },
@@ -47,8 +47,11 @@ async function runCliCapture(
     stdout: "pipe",
     stderr: "pipe",
   });
-  const stderr = await new Response(proc.stderr).text();
-  return { exitCode: await proc.exited, stderr };
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  return { exitCode: await proc.exited, stdout, stderr };
 }
 
 const SESSION = "sess_0123456789abcdef";
@@ -166,11 +169,20 @@ describe("optimize --few-shot is patch-only (#54 F8)", () => {
     const harvest = await runCli(["fewshot", "harvest", "--all-sessions"], root);
     expect(harvest.exitCode).toBe(0);
 
-    // Minimal dataset + graders so optimize's arg handling reaches the few-shot
-    // block (dataset resolution runs before it and dies otherwise). No model is
-    // needed to reach the notice — it prints during arg handling.
+    // A 2-sample provenance-free dataset so the run gets PAST the 70/30
+    // split validation and reaches the few-shot injection block (since
+    // NEW-datasets-1 the injection runs AFTER the dataset materializes, so
+    // overlapping pool examples can be excluded first). No model is needed:
+    // the notice prints at injection, and the run then dies fast on the
+    // unreadable --from-advice file — before any model call.
     const dataset = join(root, "dataset.jsonl");
-    writeFileSync(dataset, `${JSON.stringify({ id: "s1", input: "hi", expected_output: "ok" })}\n`);
+    writeFileSync(
+      dataset,
+      [
+        JSON.stringify({ id: "s1", input: "hi", expected_output: "ok" }),
+        JSON.stringify({ id: "s2", input: "yo", expected_output: "ok" }),
+      ].join("\n"),
+    );
     const graders = join(root, "graders.yaml");
     writeFileSync(graders, "graders:\n  - name: g\n    type: contains\n    substring: 'ok'\n");
 
@@ -180,9 +192,9 @@ describe("optimize --few-shot is patch-only (#54 F8)", () => {
 
     // Run optimize with BOTH --few-shot and --write-back. The few-shot path
     // forces writeBack:false: the augmented spec is written to a temp outDir,
-    // never the source. (The run itself may exit non-zero for lack of a model —
+    // never the source. (The run exits non-zero on the missing advice file —
     // the safety claim is about the on-disk spec + the stderr notice, both of
-    // which happen during arg handling before any model call.)
+    // which happen at injection time before any model call.)
     const r = await runCliCapture(
       [
         "optimize",
@@ -194,10 +206,8 @@ describe("optimize --few-shot is patch-only (#54 F8)", () => {
         "--few-shot",
         "auto",
         "--write-back",
-        "--mutator",
-        "rule-based",
-        "--iterations",
-        "1",
+        "--from-advice",
+        join(root, "missing-suggestions.json"),
       ],
       root,
     );
@@ -207,5 +217,56 @@ describe("optimize --few-shot is patch-only (#54 F8)", () => {
     expect(readFileSync(specFile, "utf-8")).toBe(before);
     // 2) The safety notice was printed to stderr.
     expect(r.stderr).toContain("--write-back is ignored with --few-shot");
+  });
+
+  test("NEW-datasets-1: pool examples overlapping the eval dataset are excluded, never injected", async () => {
+    const root = newTempRoot();
+    writeSession(root);
+    writeMinimalSpec(root);
+    // Pool = ONE example, provenance (SESSION, turn 1).
+    const harvest = await runCli(["fewshot", "harvest", "--all-sessions"], root);
+    expect(harvest.exitCode).toBe(0);
+
+    // The dataset carries a sample stamped with the SAME provenance distill
+    // writes (metadata.sessionId / metadata.turnNumber) — the classic
+    // registry:<spec>-ratings composition. The pool's only example therefore
+    // overlaps, and the run must refuse rather than inject the dev sample's
+    // own gold as a demonstration.
+    const dataset = join(root, "dataset.jsonl");
+    writeFileSync(
+      dataset,
+      [
+        JSON.stringify({
+          id: `${SESSION}_t1`,
+          input: "how do I deploy?",
+          expected_output: "Run crewhaus deploy.",
+          metadata: { sessionId: SESSION, turnNumber: 1 },
+        }),
+        JSON.stringify({ id: "clean", input: "yo", expected_output: "ok" }),
+      ].join("\n"),
+    );
+    const graders = join(root, "graders.yaml");
+    writeFileSync(graders, "graders:\n  - name: g\n    type: contains\n    substring: 'ok'\n");
+
+    const r = await runCliCapture(
+      [
+        "optimize",
+        join(root, "crewhaus.yaml"),
+        "--dataset",
+        dataset,
+        "--graders",
+        graders,
+        "--few-shot",
+        "auto",
+      ],
+      root,
+    );
+    // All pool examples overlapped → counted, logged, and refused BEFORE any
+    // model call (never silently injected, never silently skipped).
+    expect(r.exitCode).not.toBe(0);
+    expect(r.stderr).toContain("all 1 pool example(s) overlap the eval dataset");
+    expect(r.stdout).toContain(
+      "[optimize] few-shot: excluded 1 pool turn(s) overlapping the eval dataset",
+    );
   });
 });

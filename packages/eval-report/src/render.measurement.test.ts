@@ -187,6 +187,27 @@ describe("renderReport — Wave 1 sections", () => {
     expect(plain).not.toContain('id="needs-review"');
     expect(plain).not.toContain("Needs review");
   });
+
+  test("B18: canary section + card explain the excluded-from-pass-rate denominator", () => {
+    const summary = baseSummary([baseSample("s1", true, 1), baseSample("canary-1", true, 1)]);
+    const withBucket = {
+      ...summary,
+      aggregates: {
+        ...summary.aggregates,
+        canary: 1,
+        canarySampleIds: ["canary-1"],
+      },
+    };
+    const { html } = renderReport(loaded(withBucket));
+    expect(html).toContain('id="canary"');
+    expect(html).toContain("Canary (1)");
+    expect(html).toContain("excluded from the pass rate");
+    expect(html).toContain("canary-1");
+    // Canary-free summaries render neither section nor card.
+    const { html: plain } = renderReport(loaded(summary));
+    expect(plain).not.toContain('id="canary"');
+    expect(plain).not.toContain("Canary (");
+  });
 });
 
 describe("diffReports — Wave 1 (B13 slice deltas, A3 abstained sides)", () => {

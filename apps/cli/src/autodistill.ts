@@ -33,7 +33,9 @@
  *
  * Kept in a module with no import-time side effects (the CLI entry file
  * runs an argv switch on import), mirroring `eval-history.ts` /
- * `datasets.ts`. Filesystem access is limited to the watermark file.
+ * `datasets.ts`. Filesystem access is limited to the watermark file plus —
+ * when `reviewRootDir` is supplied — the B20 review queue (split-verdict
+ * ties must not vanish just because the distill ran unattended).
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -44,6 +46,7 @@ import { redactDatasetText } from "./dataset-audit";
 import { DEFAULT_SPLIT_SPEC, registerDataset } from "./datasets";
 import { type FeedbackRecord, type SessionTurn, distill } from "./feedback";
 import { isRegistrySafeName } from "./regression-pin";
+import { enqueueReviewEntries, entriesFromRaterTies } from "./review-queue";
 
 /** Default "≥ N unprocessed ratings" trigger (the spec's `autoDistill` is a
  *  plain boolean and carries no threshold of its own). */
@@ -191,6 +194,12 @@ export type MaybeAutoDistillOptions = {
   /** Positive-sample cutoff forwarded to distill(); default 0.7 (matches
    *  `crewhaus distill --min-score`). */
   readonly minScore?: number;
+  /** Harness root for the B20 review queue. When set, split-verdict turns
+   *  (B19 rater ties — withheld from the dataset) are enqueued as
+   *  `rater_disagreement` items, best-effort, exactly like the `crewhaus
+   *  distill` CLI path — an unattended teardown must not silently swallow a
+   *  disagreement. Omitted → no queue writes (pure-unit callers). */
+  readonly reviewRootDir?: string;
   readonly now?: () => Date;
   /** Line sink; defaults to stdout. */
   readonly write?: (line: string) => void;
@@ -239,6 +248,29 @@ export async function maybeAutoDistill(
     minScore: opts.minScore ?? 0.7,
     redact: redactDatasetText,
   });
+  // B19/B20 — this distill ran unattended, so its warnings (unmatched
+  // ratings, rater disagreements, floor-grader fallback) and its withheld
+  // split verdicts are the ONLY surfacing the teardown gets: print the
+  // warnings and route the ties to the persistent review queue (best-effort,
+  // idempotent by (sessionId, turn) — same as the `crewhaus distill` feeder).
+  // Runs before the zero-sample return so an all-ties corpus still enqueues.
+  for (const w of result.warnings) write(`[feedback] auto-distill warning: ${w}`);
+  if (opts.reviewRootDir !== undefined && result.ties !== undefined && result.ties.length > 0) {
+    try {
+      const q = enqueueReviewEntries(
+        opts.reviewRootDir,
+        entriesFromRaterTies(result.ties, { ts: nowIso }),
+      );
+      write(
+        `[feedback] auto-distill: ${result.ties.length} rater disagreement(s) withheld → review queue ` +
+          `(${q.added} new) — \`crewhaus review next\` or \`crewhaus rate --adjudicate\``,
+      );
+    } catch (err) {
+      write(
+        `[feedback] auto-distill review queue skipped: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
   if (result.samples.length === 0) {
     // The ratings exist but none joined to a transcript turn (sessions
     // purged/rotated). Advance the watermark so the same unmatchable

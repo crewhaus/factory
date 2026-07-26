@@ -67,7 +67,10 @@ mock.module("@crewhaus/runtime-core", () => ({
   ...realRuntimeCore,
   runChatLoop: async (opts: ChatLoopCall) => {
     chatLoopCalls.push(opts);
-    return `answer for ${(opts["seedMessages"] as Array<{ content: string }>)[0]?.content}`;
+    // Answer keyed on the FINAL seed entry — the graded `input` (B14: a
+    // multi-turn sample's history rides in front of it).
+    const seed = opts["seedMessages"] as Array<{ content: string }>;
+    return `answer for ${seed[seed.length - 1]?.content}`;
   },
 }));
 
@@ -143,6 +146,53 @@ describe("runEval — defaultInvoker (no caller invoker)", () => {
     // The agentOutput flowed back through to grading (exact_match passes).
     expect(summary.aggregates.passRate).toBe(1);
     expect(summary.samples.find((s) => s.sampleId === "a")?.agentOutput).toBe("answer for first");
+  });
+
+  test("seeds a multi-turn sample's history verbatim before the final input (B14)", async () => {
+    const outDir = newTempRoot();
+    chatLoopCalls.length = 0;
+    wireCalls.length = 0;
+    includeSubAgents = false;
+
+    const ir = narrowToAgent(lower(parseSpec(SPEC)));
+    const history = [
+      { role: "user" as const, content: "What is the capital of Brazil?" },
+      { role: "assistant" as const, content: "Brasília." },
+    ];
+    const samples: Sample[] = [
+      { id: "mt", input: "and Japan?", history, expected_output: "answer for and Japan?" },
+      // Control: a history-less sample beside it keeps the single-message seed.
+      { id: "plain", input: "solo", expected_output: "answer for solo" },
+    ];
+    const { compiled } = parseGradersConfig("graders:\n  - name: m\n    type: exact_match\n");
+
+    const summary = await runEval({
+      ir,
+      dataset: { name: "def-history", samples: yieldSamples(samples) },
+      compiledGraders: compiled,
+      opts: { outDir },
+    });
+
+    // ONE runChatLoop call for the multi-turn sample — history turns are
+    // seeded transcript, never separate model-driving invocations.
+    expect(chatLoopCalls).toHaveLength(2);
+    const mtCall = chatLoopCalls.find((c) => (c["sessionName"] as string).endsWith("_mt"));
+    expect(mtCall?.["singleTurn"]).toBe(true);
+    // Seed = history verbatim, then the graded final user input, in order.
+    expect(mtCall?.["seedMessages"]).toEqual([
+      { role: "user", content: "What is the capital of Brazil?" },
+      { role: "assistant", content: "Brasília." },
+      { role: "user", content: "and Japan?" },
+    ]);
+    // Only the final input drove the answer (the stub keys on the last seed
+    // entry), and grading saw exactly that output.
+    expect(summary.samples.find((s) => s.sampleId === "mt")?.agentOutput).toBe(
+      "answer for and Japan?",
+    );
+    // The history-less control kept the exact pre-B14 single-message seed.
+    const plainCall = chatLoopCalls.find((c) => (c["sessionName"] as string).endsWith("_plain"));
+    expect(plainCall?.["seedMessages"]).toEqual([{ role: "user", content: "solo" }]);
+    expect(summary.aggregates.passRate).toBe(1);
   });
 
   test("threads sub-agents through to runChatLoop when wired", async () => {
