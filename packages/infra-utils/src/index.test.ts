@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { ArgParseError, assertNever, escapeJsonString, parseArgs } from "./index";
+import { ArgParseError, ArgSchemaError, assertNever, escapeJsonString, parseArgs } from "./index";
 
 describe("escapeJsonString", () => {
   it("wraps plain strings in double quotes", () => {
@@ -60,6 +60,23 @@ describe("ArgParseError", () => {
   });
 });
 
+describe("ArgSchemaError", () => {
+  it("is an Error subclass that preserves its message and stable name", () => {
+    const err = new ArgSchemaError("bad schema");
+    expect(err).toBeInstanceOf(Error);
+    expect(err).toBeInstanceOf(ArgSchemaError);
+    expect(err.message).toBe("bad schema");
+    expect(err.name).toBe("ArgSchemaError");
+  });
+
+  it("is NOT an ArgParseError, so apps/cli's parseFor rethrows instead of die()-ing", () => {
+    // apps/cli/src/index.ts parseFor: `if (err instanceof ArgParseError) die(err.message)`.
+    // Making this an ArgParseError subclass would report a schema bug to the
+    // user as a mistyped flag.
+    expect(new ArgSchemaError("bad schema")).not.toBeInstanceOf(ArgParseError);
+  });
+});
+
 describe("parseArgs", () => {
   const schema = {
     flags: [
@@ -114,5 +131,98 @@ describe("parseArgs", () => {
     const result = parseArgs(["compile", "--", "--not-a-flag", "-x"], schema);
     expect(result.positional).toEqual(["compile", "--not-a-flag", "-x"]);
     expect(result.flags).toEqual({});
+  });
+
+  const dupLong = { flags: [{ name: "out", takesValue: true }, { name: "out" }] } as const;
+
+  it("throws ArgSchemaError on a duplicate long name", () => {
+    expect(() => parseArgs([], dupLong)).toThrow(ArgSchemaError);
+    expect(() => parseArgs([], dupLong)).toThrow(/--out/);
+  });
+
+  it("names both flags when two long names claim the same short alias", () => {
+    const s = {
+      flags: [
+        { name: "out", short: "o" },
+        { name: "output", short: "o" },
+      ],
+    } as const;
+    // The token alone can't identify either offender, so the message must
+    // carry both names — this is what forces .get() over .has().
+    expect(() => parseArgs([], s)).toThrow(/-o/);
+    expect(() => parseArgs([], s)).toThrow(/out/);
+    expect(() => parseArgs([], s)).toThrow(/output/);
+  });
+
+  it("throws when duplicate entries disagree on takesValue", () => {
+    const s = { flags: [{ name: "json", takesValue: true }, { name: "json" }] } as const;
+    expect(() => parseArgs(["--json", "x"], s)).toThrow(ArgSchemaError);
+  });
+
+  it("throws even when the duplicate entries are structurally identical", () => {
+    const s = {
+      flags: [
+        { name: "help", short: "h" },
+        { name: "help", short: "h" },
+      ],
+    } as const;
+    expect(() => parseArgs([], s)).toThrow(ArgSchemaError);
+  });
+
+  it("throws when a short alias with a leading dash collides with a long name", () => {
+    const s = { flags: [{ name: "x" }, { name: "other", short: "-x" }] } as const;
+    expect(() => parseArgs([], s)).toThrow(/--x/);
+  });
+
+  it("rejects a malformed schema even when argv is empty", () => {
+    expect(() => parseArgs([], dupLong)).toThrow(ArgSchemaError);
+  });
+
+  it("rejects a malformed schema even when the duplicated flag is never passed", () => {
+    expect(() => parseArgs(["build"], dupLong)).toThrow(ArgSchemaError);
+  });
+
+  it("reports the schema bug before any user-input error", () => {
+    let caught: unknown;
+    try {
+      parseArgs(["--bogus"], dupLong);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ArgSchemaError);
+    expect(caught).not.toBeInstanceOf(ArgParseError);
+  });
+
+  it("throws on every call, not just the first", () => {
+    expect(() => parseArgs([], dupLong)).toThrow(ArgSchemaError);
+    expect(() => parseArgs([], dupLong)).toThrow(ArgSchemaError);
+  });
+
+  it("throws on an empty flag name", () => {
+    expect(() => parseArgs([], { flags: [{ name: "" }] })).toThrow(/empty name/);
+  });
+
+  it("throws on an empty short alias", () => {
+    expect(() => parseArgs([], { flags: [{ name: "out", short: "" }] })).toThrow(
+      /empty short alias/,
+    );
+  });
+
+  it("accepts a long name and an unrelated short alias sharing a letter", () => {
+    // `--o` and `-o` are distinct tokens; keying on bare names would reject this.
+    const s = { flags: [{ name: "o" }, { name: "other", short: "o" }] } as const;
+    expect(() => parseArgs(["-o"], s)).not.toThrow();
+  });
+
+  it("accepts an empty flag list", () => {
+    expect(() => parseArgs(["build"], { flags: [] })).not.toThrow();
+  });
+
+  it("does not share token state across schemas", () => {
+    // Every real CLI schema declares -h; a cross-call registry would break them all.
+    const a = { flags: [{ name: "help", short: "h" }] } as const;
+    const b = { flags: [{ name: "help", short: "h" }] } as const;
+    expect(() => parseArgs(["-h"], a)).not.toThrow();
+    expect(() => parseArgs(["-h"], b)).not.toThrow();
   });
 });
