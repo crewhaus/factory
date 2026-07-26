@@ -19299,43 +19299,25 @@ async function runUpgrade(args: ParsedArgs): Promise<void> {
  * ID is a config digest that `docker pull repo@sha256:…` cannot resolve, so
  * the CLI says so instead of writing an unpullable pin.
  */
-async function runBuildImage(rest: ReadonlyArray<string>): Promise<void> {
-  const positional: string[] = [];
-  const flags = new Map<string, string | boolean>();
-  for (let i = 0; i < rest.length; i++) {
-    const a = rest[i];
-    if (a === undefined) continue;
-    if (a === "--help" || a === "-h") {
-      process.stdout.write(
-        "usage: crewhaus build-image <target> --tag <tag> [--platform <p>] [--push] [--no-record]\n" +
-          "  --push       push to the registry and record the pushed image's registry\n" +
-          "               manifest digest into docker/digests.json (the only pullable pin)\n" +
-          "  --no-record  skip recording the pushed image's digest into docker/digests.json\n" +
-          "  Local (--load) builds record nothing: a local image ID is a config digest,\n" +
-          "  not a registry digest — `docker pull repo@<id>` would fail.\n",
-      );
-      return;
-    }
-    if (a === "--push" || a === "--no-record") {
-      flags.set(a.slice(2), true);
-      continue;
-    }
-    if (a === "--tag" || a === "--platform") {
-      const v = rest[i + 1];
-      if (typeof v !== "string") die(`${a} requires a value`);
-      flags.set(a.slice(2), v);
-      i++;
-      continue;
-    }
-    positional.push(a);
+async function runBuildImage(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus build-image <target> --tag <tag> [--platform <p>] [--push] [--no-record]\n" +
+        "  --push       push to the registry and record the pushed image's registry\n" +
+        "               manifest digest into docker/digests.json (the only pullable pin)\n" +
+        "  --no-record  skip recording the pushed image's digest into docker/digests.json\n" +
+        "  Local (--load) builds record nothing: a local image ID is a config digest,\n" +
+        "  not a registry digest — `docker pull repo@<id>` would fail.\n",
+    );
+    return;
   }
-  const target = positional[0];
+  const target = args.positional[0];
   if (typeof target !== "string") die("missing <target> (one of cli, workflow, channel, ...)");
-  const tag = flags.get("tag");
+  const tag = args.flags["tag"];
   if (typeof tag !== "string") die("missing --tag <tag>");
-  const platform = flags.get("platform");
-  const push = flags.get("push") === true;
-  const record = flags.get("no-record") !== true;
+  const platform = args.flags["platform"];
+  const push = args.flags["push"] === true;
+  const record = args.flags["no-record"] !== true;
 
   const { buildImageAndRecord, digestsPath, isTargetShape } = await import(
     "@crewhaus/docker-images"
@@ -19679,36 +19661,23 @@ async function runCloudDeploy(
  * Resolves a peer's endpoint + supportedShapes + publicKeyFingerprint via
  * .well-known/crewhaus.json, optionally seeded by a DNS SRV lookup.
  */
-async function runFederation(rest: ReadonlyArray<string>): Promise<void> {
-  const positional: string[] = [];
-  const flags = new Map<string, string>();
-  for (let i = 0; i < rest.length; i++) {
-    const a = rest[i];
-    if (a === undefined) continue;
-    if (a === "--help" || a === "-h") {
-      process.stdout.write(
-        "usage: crewhaus federation discover <deployment> [--srv-domain <d>] [--format json|yaml]\n",
-      );
-      return;
-    }
-    if (a === "--srv-domain" || a === "--format") {
-      const v = rest[i + 1];
-      if (typeof v !== "string") die(`${a} requires a value`);
-      flags.set(a.slice(2), v);
-      i++;
-      continue;
-    }
-    positional.push(a);
+async function runFederation(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus federation discover <deployment> [--srv-domain <d>] [--format json|yaml]\n",
+    );
+    return;
   }
-  const deployment = positional[0];
+  const deployment = args.positional[0];
   if (typeof deployment !== "string") die("missing <deployment>");
   const { discoverDeployment } = await import("@crewhaus/federation-discovery");
   try {
     const config: { srvDomain?: string } = {};
-    const srv = flags.get("srv-domain");
+    const srv = args.flags["srv-domain"];
     if (typeof srv === "string") config.srvDomain = srv;
     const record = await discoverDeployment(deployment, config);
-    const format = flags.get("format") ?? "json";
+    const formatFlag = args.flags["format"];
+    const format = typeof formatFlag === "string" ? formatFlag : "json";
     if (format === "yaml") {
       const yaml = [
         `endpoint: ${record.endpoint}`,
@@ -23095,7 +23064,7 @@ switch (subcommand) {
     }
     break;
   case "build-image":
-    await runBuildImage(rest);
+    await runBuildImage(parseFor(rest, BUILD_IMAGE_SCHEMA));
     break;
   case "cloud": {
     const action = rest[0] ?? "";
@@ -23110,7 +23079,7 @@ switch (subcommand) {
     if (action !== "discover") {
       die(`federation action must be "discover" (got "${action}")`);
     }
-    await runFederation(rest.slice(1));
+    await runFederation(parseFor(rest.slice(1), FEDERATION_SCHEMA));
     break;
   }
   case "sandbox": {
