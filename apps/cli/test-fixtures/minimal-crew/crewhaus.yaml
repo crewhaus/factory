@@ -1,0 +1,7 @@
+name: mini-crew
+target: crew
+model: claude-sonnet-4-6
+entry: solo
+roles:
+  solo:
+    instructions: Answer the request in one line.

@@ -4,6 +4,15 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../infra-utils" }, { "path": "../ir" }],
+  "references": [
+    { "path": "../infra-utils" },
+    { "path": "../ir" },
+    { "path": "../target-channel-bot" },
+    { "path": "../target-crew" },
+    { "path": "../target-graph" },
+    { "path": "../target-pipeline" },
+    { "path": "../target-workflow" },
+    { "path": "../tenancy" }
+  ],
   "include": ["src/**/*"]
 }

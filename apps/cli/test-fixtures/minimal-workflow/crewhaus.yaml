@@ -1,0 +1,8 @@
+name: mini-flow
+target: workflow
+model: claude-sonnet-4-6
+steps:
+  - name: draft
+    instructions: Draft a one-line answer to the request.
+  - name: polish
+    instructions: Polish the draft into a final answer.

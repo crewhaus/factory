@@ -27,7 +27,22 @@ import { type ParsedModelString, parseModelString } from "@crewhaus/model-router
  * required env-ref is unset, so the daemon never accepts webhooks signed
  * with an empty secret.
  */
-export function emitChannelBot(ir: IrChannelV0, opts: EmitReadmeOptions = {}): Bundle {
+/**
+ * Evals Wave 4, cluster S (D36 + NEW-shape-1) — `emitChannelBot` options.
+ * `evalEntry: true` (set only by `crewhaus compile --with-eval-harness`)
+ * additionally emits an `eval-entry.ts` file exporting
+ * `runForEval(input, opts)`: a LOOPBACK delivery of one inbound message
+ * through the bot's REAL `createAgent().runTurn` path — inbound
+ * classification, session resume machinery, the in-loop evaluation block,
+ * taxonomy/budget/limits all run exactly as deployed; the adapter/gateway
+ * webhook layer is the only part stubbed out. Sample `history` pre-seeds the
+ * session transcript so the real resume path replays it (no model calls for
+ * history turns). Purely ADDITIVE: the existing agent/session-router/gateway/
+ * daemon files stay byte-identical with or without the option.
+ */
+export type EmitChannelBotOptions = EmitReadmeOptions & { readonly evalEntry?: boolean };
+
+export function emitChannelBot(ir: IrChannelV0, opts: EmitChannelBotOptions = {}): Bundle {
   if (
     ir.channels.slack === undefined &&
     ir.channels.telegram === undefined &&
@@ -45,6 +60,9 @@ export function emitChannelBot(ir: IrChannelV0, opts: EmitReadmeOptions = {}): B
     { path: "gateway.ts", content: renderGateway(ir) },
     { path: "daemon.ts", content: renderDaemon(ir) },
   ];
+  if (opts.evalEntry === true) {
+    files.push({ path: "eval-entry.ts", content: renderEvalEntry(ir) });
+  }
   // Item 42 — generated bundle README; default ON (`crewhaus compile
   // --no-readme` opts out).
   if (opts.readme !== false) {
@@ -2275,5 +2293,163 @@ main().catch((err) => {
   process.stderr.write(\`\${formatRunFailure(__report, { prefix: "[daemon]" })}\\n\`);
   process.exit(__report.exitCode);
 });
+`;
+}
+
+// ---------------------------------------------------------------------------
+// File (cluster S, D36/NEW-shape-1): eval-entry.ts — the eval bridge's
+// runtime entry. Emitted ONLY under `emitChannelBot(ir, { evalEntry: true })`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Render `eval-entry.ts`: the channel-resume-turn loopback. Each eval sample
+ * is delivered as ONE fresh inbound message through the compiled bot's real
+ * `createAgent().runTurn` — the channel boundary classifier, session resume
+ * machinery, in-loop evaluation block, taxonomy/budget/limits and the
+ * per-turn memory-fabric wiring all run exactly as deployed; only the
+ * adapter/gateway webhook layer (which needs live channel credentials) is
+ * stubbed out. A sample's `history` is pre-seeded into the session
+ * transcript (`user_message`/`assistant_message` events — the exact payload
+ * shape runtime-core replays) and the turn runs with `isNew: false`, so the
+ * REAL resume path replays it with no model calls for history turns.
+ *
+ * v0 honesty notes: `mcp_servers` / `knowledge:` / `plugins:` boots are
+ * daemon concerns not yet mirrored here (a generated note surfaces each);
+ * `runTurn` mints its own RunContext, so trace-bus events stay internal —
+ * the session transcript in the caller's `sessionRootDir` is the captured
+ * artifact.
+ */
+function renderEvalEntry(ir: IrChannelV0): string {
+  const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
+  const fabric = memoryFabric(ir);
+  const continuityOn = fabric.continuityOn;
+  const thredzOn = ir.thredz !== undefined && fabric.wired;
+  const subAgents = renderSubAgents(ir);
+  const specHooks = ir.hooks !== undefined && ir.hooks.length > 0 ? ir.hooks : undefined;
+
+  const notes = [
+    ...(Object.keys(ir.mcp_servers).length > 0
+      ? [
+          "// note: mcp_servers declared but not booted by the eval bridge entry in this slice — MCP tools are absent from bridged channel evals (the daemon boots them at startup)",
+        ]
+      : []),
+    ...(ir.knowledge !== undefined
+      ? [
+          "// note: knowledge: declared but not ingested by the eval bridge entry in this slice — the Retrieve tool is absent from bridged channel evals",
+        ]
+      : []),
+    ...(thredzOn
+      ? [
+          "// note: thredz declared — the eval bridge entry passes thredz: null (wireMemory degrades to local files), so bridged evals never write to a live Thredz backend",
+        ]
+      : []),
+  ];
+  const notesBlock = notes.length > 0 ? `${notes.join("\n")}\n` : "";
+
+  const builtinImportBlock = builtinImports.length > 0 ? `${builtinImports.join("\n")}\n` : "";
+  const subAgentImportBlock =
+    subAgents.imports.length > 0 ? `${subAgents.imports.join("\n")}\n` : "";
+  const skillsImports = continuityOn
+    ? ""
+    : `import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";
+import { loadCommands } from "@crewhaus/slash-commands";
+`;
+  const hooksEngineImport = `import { loadHooks${specHooks !== undefined ? ", type HookDef" : ""} } from "@crewhaus/hooks-engine";`;
+
+  const initLines = inits.length > 0 ? `${inits.join("\n")}\n` : "";
+  const registerLines = registrations.length > 0 ? `${registrations.join("\n")}\n` : "";
+  const subAgentBoot = subAgents.hasAny
+    ? `const __subAgents: ReadonlyMap<string, SubAgentDefinition> = new Map<string, SubAgentDefinition>([
+${ir.subAgents.map((d) => `  [${escapeJsonString(d.name)}, ${renderSubAgentDef(d)}],`).join("\n")}
+]);
+defaultCatalog.register(createTaskTool({ subAgents: __subAgents }));
+`
+    : "";
+  const toolBoot =
+    initLines.length > 0 || registerLines.length > 0 || subAgentBoot.length > 0
+      ? `\n// Built-in tools (from spec.agent.tools) — the same catalog the daemon\n// snapshots into createAgent.\n${initLines}${registerLines}${subAgentBoot}`
+      : "";
+
+  const specHooksBoot =
+    specHooks !== undefined
+      ? `\n  const __specHooks: ReadonlyArray<HookDef> = ${JSON.stringify(specHooks)};`
+      : "";
+  const hooksExpr = specHooks !== undefined ? "[...__specHooks, ...__hooks]" : "__hooks";
+  const extensionBoot = continuityOn
+    ? `  const __cwd = process.cwd();
+  const __hooks = await loadHooks({ cwd: __cwd });${specHooksBoot}`
+    : `  const __cwd = process.cwd();
+  const [__hooks, __skills, __slashCommands] = await Promise.all([
+    loadHooks({ cwd: __cwd }),
+    discoverSkills({ cwd: __cwd }),
+    loadCommands({ cwd: __cwd }),
+  ]);${specHooksBoot}
+  if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
+  const skillsFields = continuityOn
+    ? `    skills: [],
+    slashCommands: new Map(),`
+    : `    skills: __skills,
+    slashCommands: __slashCommands,`;
+  const thredzField = thredzOn ? "\n    thredz: null," : "";
+  const subAgentFields = subAgents.hasAny
+    ? "\n    subAgents: __subAgents,\n    spawnSubAgent,"
+    : "";
+
+  return `// Generated by crewhaus. DO NOT EDIT.
+// Source spec: ${escapeJsonString(ir.name)} (target: channel, ir version: ${ir.version}, file: eval-entry.ts — the compile --with-eval-harness bridge entry)
+${notesBlock}import { randomBytes } from "node:crypto";
+import { openEventLog } from "@crewhaus/event-log";
+${hooksEngineImport}
+${skillsImports}import { defaultCatalog } from "@crewhaus/tool-catalog";
+${builtinImportBlock}${subAgentImportBlock}import { createAgent } from "./agent.ts";
+${toolBoot}
+/**
+ * Eval bridge (cluster S, D36/NEW-shape-1) — deliver ONE inbound message
+ * through the compiled bot's real runTurn (loopback: no adapter/webhook).
+ * \`history\` pre-seeds the session transcript so the real resume path
+ * replays it; \`sessionRootDir\` re-roots the session log (the caller's
+ * per-sample artifact directory); the returned string is the bot's reply.
+ */
+export async function runForEval(
+  input: string,
+  __evalOpts: {
+    sessionId?: string;
+    sessionRootDir?: string;
+    history?: ReadonlyArray<{ role: "user" | "assistant"; content: string }>;
+  } = {},
+): Promise<string> {
+${extensionBoot}
+  const agent = createAgent({
+    hooks: ${hooksExpr},
+${skillsFields}
+    tools: defaultCatalog.list(),
+    ...(__evalOpts.sessionRootDir !== undefined ? { sessionRootDir: __evalOpts.sessionRootDir } : {}),
+    // One-shot eval turns never benefit from a persisted prompt-cache stamp.
+    promptCacheStore: { read: async () => undefined, write: async () => {} },${thredzField}${subAgentFields}
+  });
+  const __sessionId = __evalOpts.sessionId ?? \`sess_\${randomBytes(8).toString("hex")}\`;
+  const __history = __evalOpts.history ?? [];
+  if (__history.length > 0) {
+    // B14 semantics through the REAL session machinery: seeded turns land in
+    // the transcript verbatim and the resumed turn replays them with no
+    // model calls for history turns.
+    const __log = await openEventLog(
+      __sessionId,
+      __evalOpts.sessionRootDir !== undefined ? { rootDir: __evalOpts.sessionRootDir } : {},
+    );
+    for (const __m of __history) {
+      await __log.append({
+        kind: __m.role === "user" ? "user_message" : "assistant_message",
+        payload: { content: __m.content },
+      });
+    }
+    await __log.close();
+  }
+  return agent.runTurn({
+    sessionId: __sessionId,
+    isNew: __history.length === 0,
+    message: input,
+  });
+}
 `;
 }

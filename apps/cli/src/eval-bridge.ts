@@ -3,33 +3,87 @@
  * bridge (a `target: eval` bundle) for ANY shape's spec.
  *
  * `crewhaus eval` / `optimize` / `flywheel` hard-error on non-cli targets, so
- * the ~13 non-cli shapes (channel-bot, voice, managed, onchain, …) cannot
+ * the non-cli shapes (channel-bot, voice, managed, workflow, crew, …) cannot
  * consume their own distilled Slack/web-UI feedback through the eval loop.
  * The eval bridge closes that gap: it PROJECTS a shape's lowered IR into a
- * sibling `IrEvalV0` — reusing the SAME agent model/instructions/tools — so
- * `target-eval-bundle` can emit a first-class eval bundle that drives the
- * shape's own datasets + graders.
+ * sibling `IrEvalV0` so `target-eval-bundle` can emit a first-class eval
+ * bundle that drives the shape's own datasets + graders.
  *
- * Two pieces live here, both side-effect-free (the CLI entry file does the IO
- * — `mkdirSync`/`writeFileSync` of the emitted bundle):
+ * Evals Wave 4, cluster S (D36 + NEW-shape-1) — the bridge is RUNTIME-
+ * INVOKING: bridged bundles no longer impersonate every shape as a bare
+ * single-turn chat over `{ model, instructions, tools }`. Per-shape
+ * strategies (the `selectInvoker` table below is the machine copy):
  *
- *   1. `projectEvalIr(ir, opts)` — the IR → IrEvalV0 projection. Variant-
- *      agnostic: it pulls `{ model, instructions, tools }` off whichever agent
- *      sub-shape the source variant carries (cli/channel/managed/voice/browser/
- *      onchain/onchain-game/batch/research all carry a top-level `agent`).
- *      Shapes with NO single agent (workflow/graph/crew/pipeline are
- *      multi-stage) throw a clear diagnostic — their eval bridge is a per-step
- *      concern, deferred.
+ *   - workflow → `workflow-run`: the primary bundle re-emits with an
+ *     exported `runForEval`; each sample runs the compiled step sequence
+ *     end-to-end (sample.input = the step-1 trigger input), the FINAL step's
+ *     output is graded, and step trace events land on the runner's
+ *     per-sample bus (RunResult.events).
+ *   - graph → `graph-run`: `runForEval` drives the compiled graph to
+ *     `run_done` from sample.input on the per-sample RunContext; the final
+ *     state JSON is graded. A HITL pause fails the sample loudly (approvals
+ *     cannot resolve headless).
+ *   - crew → `crew-run`: an additive `eval-entry.ts` runs one crew turn
+ *     through the compiled orchestrator + role definitions with the SAME run
+ *     options the daemon assembles; `crew_done.finalOutput` is graded. The
+ *     runner's sessionId/sessionRootDir thread into the crew's real session
+ *     machinery (transcript captured); crew trace events stay on the
+ *     orchestrator's internal bus in this slice.
+ *   - pipeline → `pipeline-query`: module-scope indexing runs once at entry
+ *     import (the deployed boot); each sample is one single-turn query
+ *     through the SAME agent + Retrieve tool the REPL serves. Chat-capable:
+ *     sample `history` seeds the conversation.
+ *   - channel → `channel-resume-turn`: an additive `eval-entry.ts` delivers
+ *     sample.input as a fresh inbound message through the bot's REAL
+ *     `createAgent().runTurn` (inbound classification, session resume
+ *     machinery, in-loop evaluation block) with the adapter/webhook layer
+ *     stubbed as a loopback. Chat-capable: `history` pre-seeds the session
+ *     transcript so the real resume path replays it. v0 residue: the
+ *     daemon's mcp_servers/knowledge boots are not mirrored (generated
+ *     notes surface each), and runTurn's internal RunContext keeps trace
+ *     events off the runner bus (the transcript is the captured artifact).
+ *   - managed → `gateway-request`: the compiled `agent.ts` already exports
+ *     `runOneTurn` (the gateway's dispatcher); the bridge drives it per
+ *     sample under an isolated per-sample tenant, with the per-sample
+ *     RunContext/sessionRootDir/history threaded through `extraOptions`.
+ *     Chat-capable.
+ *   - voice → `voice-replay` (documented): the honest voice path is
+ *     `crewhaus eval --voice` over recorded call sessions; the bridged
+ *     bundle runs the shape's agent through the single-turn loop with its
+ *     real tools as a text projection. Chat-capable (a voice agent is a
+ *     conversation).
+ *   - onchain / onchain-game → `chain-trigger` (documented): the bridged
+ *     bundle evals the daemon's agent through the single-turn loop with its
+ *     real tools; the chain trigger daemon / simulated chain adapter is not
+ *     driven in this slice. Not chat-capable.
+ *   - batch → `batch-item` (documented): one sample per queue item through
+ *     the single-turn loop with the worker's real tools; the queue consumer
+ *     framing is not driven. Not chat-capable.
+ *   - research / browser → `single-turn-chat-loop`: their compiled runtime
+ *     IS one agent loop over the same wired tools; the default invoker (via
+ *     the runner's wireRunOnce) is the shape's own runtime seam minus the
+ *     stdin/driver framing. Not chat-capable.
  *
- *   2. `selectInvoker(target)` — names the per-shape AgentInvoker strategy the
- *      eval run should wrap the shape's runtime with (via the eval-runner
- *      `opts.invoker` seam). The emitted bundle drives the default single-turn
- *      `runChatLoop` invoker (correct for the one-shot shapes); this mapping
- *      records the runtime seam each shape's eval should ideally wrap so the
- *      bundle README + the CLI report point the author at it. Deterministic and
- *      exhaustive over the shape set.
+ * Sample `history` seeds only the chat-capable shapes above; a
+ * history-carrying sample against any other shape fails LOUDLY at dataset
+ * load (target-eval-bundle's `guardHistorySamples`).
+ *
+ * Two pieces live here, both side-effect-free (the CLI entry file does the
+ * IO — `mkdirSync`/`writeFileSync` of the emitted bundle):
+ *
+ *   1. `projectEvalIr(ir, opts)` — the IR → IrEvalV0 projection. Single-agent
+ *      shapes project `{ model, instructions, tools }` verbatim. The four
+ *      multi-stage shapes (workflow/graph/crew/pipeline) project a bridge
+ *      descriptor agent: pipeline keeps its real chat agent; workflow/graph/
+ *      crew synthesize instructions naming the driven bundle (their agent is
+ *      never invoked — the runtime entry is) with the entry stage's model as
+ *      the recorded model identity. The source spec's `failure_taxonomy`
+ *      rides the projection, so bridged bundles classify failures too (D37).
+ *   2. `selectInvoker(target)` — the per-shape strategy: invoker kind, the
+ *      compiled entry the bundle imports (when runtime-invoking), and
+ *      chat-capability for the history gate.
  */
-import type { IrNode } from "@crewhaus/ir";
+import type { IrFailureTaxonomy, IrNode } from "@crewhaus/ir";
 
 /** Thrown on an un-projectable shape / malformed bridge options. The CLI entry
  *  file routes it through `die()`; tests assert on `.message`. */
@@ -56,31 +110,43 @@ export type ProjectedEvalIr = {
   readonly graders: readonly { readonly name: string; readonly opts?: Record<string, unknown> }[];
   readonly concurrency: number;
   readonly seed?: number;
+  /** D37 — the source spec's failure taxonomy, carried into the bundle so
+   *  errored samples classify exactly as `crewhaus eval` classifies them. */
+  readonly failureTaxonomy?: IrFailureTaxonomy;
 };
 
-/** The per-shape invoker strategy an eval run should wrap the shape with. Each
- *  entry names the runtime seam the shape resumes/steps through so a downstream
- *  invoker (via eval-runner `opts.invoker`) can drive it deterministically. */
+/** The per-shape invoker strategy an eval run wraps the shape with. Entry-
+ *  driven kinds carry the compiled entry module the bundle imports; the rest
+ *  document the (real-tools) single-turn fallback with its fidelity note. */
 export type InvokerStrategy = {
   /** The source shape this strategy is for. */
   readonly target: string;
-  /** Stable id for the invoker approach (used in README + report text). */
+  /** Stable id for the invoker approach (used in README + report text AND as
+   *  the generated bundle's dispatch key). */
   readonly kind:
     | "single-turn-chat-loop"
     | "channel-resume-turn"
     | "voice-replay"
     | "gateway-request"
     | "chain-trigger"
-    | "batch-item";
+    | "batch-item"
+    | "workflow-run"
+    | "graph-run"
+    | "crew-run"
+    | "pipeline-query";
   /** One-line human description of what the invoker wraps. */
   readonly description: string;
+  /** May sample `history` seed this shape? Non-chat shapes reject
+   *  history-carrying samples loudly at dataset load. */
+  readonly chatCapable: boolean;
+  /** Relative import (from the eval bundle dir) of the compiled runtime
+   *  entry module, for the runtime-invoking kinds. */
+  readonly entryImport?: string;
 };
 
 /**
  * Shapes that carry a single top-level `agent { model, instructions, tools }`
- * and can therefore be projected 1:1 into an eval bundle. Multi-stage shapes
- * (workflow/graph/crew/pipeline) are intentionally excluded — their eval
- * bridge is a per-step projection, out of scope for slice 1.
+ * and therefore project 1:1 into the eval bundle's agent block.
  */
 const PROJECTABLE_TARGETS: ReadonlySet<string> = new Set([
   "cli",
@@ -94,7 +160,9 @@ const PROJECTABLE_TARGETS: ReadonlySet<string> = new Set([
   "research",
 ]);
 
-/** Multi-stage shapes with no single agent — a clearer error than "no model". */
+/** Multi-stage shapes — bridged by DRIVING their compiled runtime (cluster S
+ *  lifted the former rejection); the map records each shape's stage noun for
+ *  diagnostics + synthesized instructions. */
 const MULTISTAGE_TARGETS: ReadonlyMap<string, string> = new Map([
   ["workflow", "steps"],
   ["graph", "nodes"],
@@ -113,8 +181,11 @@ export type ProjectEvalOptions = {
   readonly datasetSplit?: "train" | "dev" | "test";
   /**
    * Grader names for the projected bundle. Defaults to a single
-   * `substring_match` (a registry built-in) so the bundle compiles + runs
-   * credential-free; authors swap in their own graders.yaml-derived names.
+   * `expected_contains` (the deterministic gold-substring built-in) so the
+   * bundle compiles + runs credential-free; authors swap in their own
+   * graders.yaml-derived names. (Cluster S fixed the previous default,
+   * `substring_match` — not a real grader type, so every default bridged
+   * bundle failed grader parsing at boot.)
    */
   readonly graders?: readonly { readonly name: string; readonly opts?: Record<string, unknown> }[];
   readonly concurrency?: number;
@@ -122,7 +193,7 @@ export type ProjectEvalOptions = {
 };
 
 type GraderEntry = { readonly name: string; readonly opts?: Record<string, unknown> };
-const DEFAULT_GRADERS: readonly GraderEntry[] = [{ name: "substring_match" }];
+const DEFAULT_GRADERS: readonly GraderEntry[] = [{ name: "expected_contains" }];
 const DEFAULT_CONCURRENCY = 2;
 
 /**
@@ -154,12 +225,58 @@ function extractAgent(
 }
 
 /**
- * Project a lowered IR node of ANY projectable shape into an `IrEvalV0`. The
- * eval bundle emitted from the result reuses the source shape's agent verbatim,
- * so the shape is evaluated on the exact model/instructions/tools it ships.
+ * Cluster S — the multi-stage projection: the recorded agent block is a
+ * bridge DESCRIPTOR (the runtime entry is what actually runs), so pipeline
+ * keeps its real chat agent while workflow/graph/crew record the entry
+ * stage's model plus synthesized instructions naming the driven bundle.
+ * Throws when the entry stage cannot be resolved (malformed direct IR — the
+ * spec parser guarantees it otherwise).
+ */
+function extractMultistageAgent(ir: IrNode): {
+  model: string;
+  instructions: string;
+  tools: readonly string[];
+} {
+  if (ir.target === "pipeline") {
+    // The pipeline's runtime IS its chat agent (+ Retrieve over the indexed
+    // corpus) — keep the real block.
+    return { model: ir.agent.model, instructions: ir.agent.instructions, tools: [] };
+  }
+  const describe = (unit: string, count: number, model: string | undefined) => {
+    if (model === undefined) {
+      throw new EvalBridgeError(
+        `spec "${ir.name}" (target: ${ir.target}) has no resolvable entry ${unit} to project — the IR is malformed`,
+      );
+    }
+    return {
+      model,
+      instructions: `[eval bridge] multi-stage ${ir.target} "${ir.name}" (${count} ${unit}s) — samples are driven end-to-end through the compiled bundle's runtime entry; per-${unit} instructions live in the primary bundle. This descriptor block is recorded for run identity and is never used as a chat prompt.`,
+      tools: [] as readonly string[],
+    };
+  };
+  if (ir.target === "workflow") {
+    return describe("step", ir.steps.length, ir.steps[0]?.model);
+  }
+  if (ir.target === "graph") {
+    const entry = ir.nodes.find((n) => n.name === ir.entry);
+    return describe("node", ir.nodes.length, entry?.model ?? ir.nodes[0]?.model);
+  }
+  if (ir.target === "crew") {
+    const entry = ir.roles.find((r) => r.name === ir.entry);
+    return describe("role", ir.roles.length, entry?.model ?? ir.roles[0]?.model);
+  }
+  throw new EvalBridgeError(`spec "${ir.name}" target: ${ir.target} is not a multi-stage shape`);
+}
+
+/**
+ * Project a lowered IR node of ANY bridgeable shape into an `IrEvalV0`.
+ * Single-agent shapes reuse the source agent verbatim; the four multi-stage
+ * shapes (cluster S) project a bridge-descriptor agent — the emitted bundle
+ * drives their compiled runtime, so the shape is evaluated on exactly the
+ * artifact it ships.
  *
- * Throws `EvalBridgeError` when the source is already `target: eval` (nothing to
- * bridge) or is a multi-stage shape with no single agent.
+ * Throws `EvalBridgeError` when the source is already `target: eval` (nothing
+ * to bridge) or `target: cli` (use `crewhaus eval` directly).
  */
 export function projectEvalIr(ir: IrNode, opts: ProjectEvalOptions = {}): ProjectedEvalIr {
   if (ir.target === "eval") {
@@ -172,25 +289,30 @@ export function projectEvalIr(ir: IrNode, opts: ProjectEvalOptions = {}): Projec
       `spec "${ir.name}" is target: cli — use \`crewhaus eval\` directly (the eval bridge is for non-cli shapes)`,
     );
   }
-  const multistage = MULTISTAGE_TARGETS.get(ir.target);
-  if (multistage !== undefined) {
-    throw new EvalBridgeError(
-      `spec "${ir.name}" is target: ${ir.target} — a multi-stage shape (${multistage}) has no single agent to project; per-step eval bridges are not yet supported`,
-    );
-  }
-  if (!PROJECTABLE_TARGETS.has(ir.target)) {
+  const multistage = MULTISTAGE_TARGETS.has(ir.target);
+  if (!multistage && !PROJECTABLE_TARGETS.has(ir.target)) {
     throw new EvalBridgeError(
       `spec "${ir.name}" target: ${ir.target} is not projectable into an eval bridge`,
     );
   }
-  const agent = extractAgent(ir);
-  if (agent === undefined) {
-    throw new EvalBridgeError(
-      `spec "${ir.name}" (target: ${ir.target}) has no agent { model, instructions } to project into an eval bridge`,
-    );
+  let agent: { model: string; instructions: string; tools: readonly string[] };
+  if (multistage) {
+    agent = extractMultistageAgent(ir);
+  } else {
+    const extracted = extractAgent(ir);
+    if (extracted === undefined) {
+      throw new EvalBridgeError(
+        `spec "${ir.name}" (target: ${ir.target}) has no agent { model, instructions } to project into an eval bridge`,
+      );
+    }
+    agent = extracted;
   }
   const graders =
     opts.graders !== undefined && opts.graders.length > 0 ? opts.graders : DEFAULT_GRADERS;
+  // D37 — the source spec's failure taxonomy rides the projection so the
+  // emitted bundle classifies errored samples exactly as `crewhaus eval`
+  // would (every bridgeable variant carries the optional field).
+  const failureTaxonomy = (ir as { failureTaxonomy?: IrFailureTaxonomy }).failureTaxonomy;
   const projected: ProjectedEvalIr = {
     version: 0,
     name: ir.name,
@@ -207,58 +329,106 @@ export function projectEvalIr(ir: IrNode, opts: ProjectEvalOptions = {}): Projec
     })),
     concurrency: opts.concurrency ?? DEFAULT_CONCURRENCY,
     ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
+    ...(failureTaxonomy !== undefined && failureTaxonomy.length > 0 ? { failureTaxonomy } : {}),
   };
   return projected;
 }
 
 /**
- * Select the per-shape AgentInvoker strategy an eval run should wrap the
- * shape's runtime with. Exhaustive over the projectable shapes; unknown shapes
- * fall back to the single-turn chat loop (the eval-runner default invoker).
+ * Select the per-shape invoker strategy. Runtime-invoking kinds carry the
+ * compiled entry the bundle imports; documented kinds fall back to the
+ * single-turn loop over the shape's REAL wired tools, with the fidelity gap
+ * named in the description. Exhaustive over the bridgeable shapes; unknown
+ * shapes fall back to the single-turn chat loop.
  */
 export function selectInvoker(target: string): InvokerStrategy {
   switch (target) {
+    case "workflow":
+      return {
+        target,
+        kind: "workflow-run",
+        chatCapable: false,
+        entryImport: "../agent.ts",
+        description:
+          "run the compiled workflow end-to-end per sample (runForEval in ../agent.ts): sample.input is the step-1 trigger input, the final step's output is graded, step trace events land in RunResult.events",
+      };
+    case "graph":
+      return {
+        target,
+        kind: "graph-run",
+        chatCapable: false,
+        entryImport: "../agent.ts",
+        description:
+          "drive the compiled graph to run_done from sample.input per sample (runForEval in ../agent.ts); the final state JSON is graded and node/judge trace events land in RunResult.events (a HITL pause fails the sample loudly)",
+      };
+    case "crew":
+      return {
+        target,
+        kind: "crew-run",
+        chatCapable: false,
+        entryImport: "../eval-entry.ts",
+        description:
+          "run one crew turn per sample through the compiled orchestrator + roles with the daemon's run options (runForEval in ../eval-entry.ts); crew_done.finalOutput is graded and the crew transcript lands in the sample artifacts",
+      };
+    case "pipeline":
+      return {
+        target,
+        kind: "pipeline-query",
+        chatCapable: true,
+        entryImport: "../agent.ts",
+        description:
+          "feed sample.input (plus any sample history) through the indexed pipeline agent + Retrieve tool (runForEval in ../agent.ts; module-scope indexing runs once at entry import — the deployed boot)",
+      };
     case "channel":
       return {
         target,
         kind: "channel-resume-turn",
+        chatCapable: true,
+        entryImport: "../eval-entry.ts",
         description:
-          "wrap the channel-bot single-turn resume path (channel-adapter runTurn) so each dataset sample is a fresh inbound message",
+          "deliver sample.input as a fresh inbound message through the compiled bot's real runTurn (inbound classification + session resume machinery; adapter/webhook layer stubbed as a loopback; sample history pre-seeds the session transcript)",
       };
     case "voice":
       return {
         target,
         kind: "voice-replay",
+        chatCapable: true,
         description:
-          "replay recorded call-session transcripts through the voice runtime (see `crewhaus eval --voice`)",
+          "replay recorded call-session transcripts through `crewhaus eval --voice` (the honest voice path); this bridged bundle runs the voice agent through the single-turn loop with its real tools as a text projection",
       };
     case "managed":
       return {
         target,
         kind: "gateway-request",
+        chatCapable: true,
+        entryImport: "../agent.ts",
         description:
-          "drive the managed gateway's run handler per sample (one authenticated request per dataset row)",
+          "drive the compiled gateway's runOneTurn dispatcher per sample (runOneTurn in ../agent.ts) under an isolated per-sample tenant, with the per-sample RunContext + history threaded through extraOptions",
       };
     case "onchain":
     case "onchain-game":
       return {
         target,
         kind: "chain-trigger",
+        chatCapable: false,
         description:
-          "invoke the onchain daemon's trigger handler per sample against a simulated chain adapter (no live broadcast)",
+          "eval the onchain daemon's agent through the single-turn loop with its real tools (no live broadcast); the chain trigger daemon / simulated chain adapter is not driven in this slice",
       };
     case "batch":
       return {
         target,
         kind: "batch-item",
-        description: "run one batch-worker item per dataset sample through the queue consumer",
+        chatCapable: false,
+        description:
+          "run one sample per queue item through the single-turn loop with the worker's real tools; the queue consumer framing is not driven in this slice",
       };
     default:
       return {
         target,
         kind: "single-turn-chat-loop",
+        chatCapable: false,
         description:
-          "single-turn runChatLoop over the shape's agent (the eval-runner default invoker)",
+          "single-turn agent loop over the shape's agent with its real wired tools (the eval-runner default invoker) — the shape's own runtime seam minus its stdin/driver framing",
       };
   }
 }
@@ -268,12 +438,14 @@ export const EVAL_BRIDGE_SUBDIR = "eval";
 
 /**
  * Render the one-line summary the CLI prints after emitting an eval bridge, so
- * the author knows which invoker seam to wrap for a faithful eval.
+ * the author knows which invoker drives the shape (and whether sample history
+ * is accepted).
  */
 export function describeBridge(projected: ProjectedEvalIr, strategy: InvokerStrategy): string {
   return (
     `eval bridge for target: ${strategy.target} → dataset ${projected.dataset.name}@${projected.dataset.version}` +
     `#${projected.dataset.split}, graders [${projected.graders.map((g) => g.name).join(", ")}]; ` +
-    `invoker: ${strategy.kind} (${strategy.description})`
+    `invoker: ${strategy.kind} (${strategy.description}); ` +
+    `history samples: ${strategy.chatCapable ? "seeded" : "rejected (non-chat shape)"}`
   );
 }

@@ -13,7 +13,13 @@
   },
   "dependencies": {
     "@crewhaus/infra-utils": "workspace:*",
-    "@crewhaus/ir": "workspace:*"
+    "@crewhaus/ir": "workspace:*",
+    "@crewhaus/target-channel-bot": "workspace:*",
+    "@crewhaus/target-crew": "workspace:*",
+    "@crewhaus/target-graph": "workspace:*",
+    "@crewhaus/target-pipeline": "workspace:*",
+    "@crewhaus/target-workflow": "workspace:*",
+    "@crewhaus/tenancy": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

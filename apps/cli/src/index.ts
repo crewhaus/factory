@@ -3112,10 +3112,20 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "  --no-register  Skip the registry auto-put + changelog entry.\n" +
         "\n" +
         "  --with-eval-harness  Also emit an eval bridge — a target: eval bundle\n" +
-        "             projected from THIS (non-cli) shape's own agent — into\n" +
-        "             <out-dir>/eval/, so the shape can consume its distilled\n" +
-        "             feedback through eval/optimize/flywheel. Rejected for cli\n" +
-        "             (use `crewhaus eval` directly) and multi-stage shapes.\n" +
+        "             projected from THIS (non-cli) shape — into <out-dir>/eval/,\n" +
+        "             so the shape can consume its distilled feedback through\n" +
+        "             eval/optimize/flywheel. The bridge is RUNTIME-INVOKING:\n" +
+        "             workflow/graph/crew/pipeline samples drive the shape's\n" +
+        "             compiled bundle end-to-end (the primary bundle gains an\n" +
+        "             exported eval entry under this flag), channel samples run\n" +
+        "             the bot's real runTurn via a loopback, managed samples\n" +
+        "             drive the gateway's runOneTurn dispatcher; the remaining\n" +
+        "             shapes run their agent + real tools through the\n" +
+        "             single-turn loop (strategy printed per compile). Sample\n" +
+        "             `history` seeds only chat-capable shapes\n" +
+        "             (channel/managed/voice/pipeline); other shapes reject\n" +
+        "             history-carrying samples loudly at dataset load.\n" +
+        "             Rejected for cli (use `crewhaus eval` directly).\n" +
         "  --eval-dataset <name>  Dataset the bridge consumes (default\n" +
         "             <specName>-eval).\n" +
         "\n" +
@@ -3374,6 +3384,22 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     );
   }
 
+  // Evals Wave 4, cluster S (D36/NEW-shape-1) — with the eval bridge
+  // requested, shapes whose compiled runtime the bridged bundle must invoke
+  // in-process re-emit their PRIMARY bundle with the eval-entry variant
+  // (workflow/graph/pipeline gain an exported runForEval + import.meta.main
+  // guard; crew/channel gain an additive eval-entry.ts). Gated on the flag:
+  // a plain compile stays byte-for-byte unaffected.
+  if (args.flags["with-eval-harness"] === true && !emitCfWorker) {
+    const { emitSourceBundleWithEvalEntry } = await import("@crewhaus/target-eval-bundle");
+    // compile() already succeeded, so re-lowering cannot throw here.
+    const bridgeIr = lower(parseSpec(yamlText));
+    const withEntry = emitSourceBundleWithEvalEntry(bridgeIr, { readme });
+    if (withEntry !== undefined) {
+      bundle = { files: withEntry.files, warnings: bundle.warnings };
+    }
+  }
+
   mkdirSync(absOut, { recursive: true });
   for (const file of bundle.files) {
     const fullPath = join(absOut, file.path);
@@ -3444,7 +3470,18 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     const strategy = selectInvoker(sourceIr.target);
     const evalOut = join(absOut, EVAL_BRIDGE_SUBDIR);
     mkdirSync(evalOut, { recursive: true });
-    const evalBundle = emitEval(projected, { readme });
+    // Cluster S — the bundle is emitted as a BRIDGE: it drives the shape's
+    // compiled runtime entry (when one exists) and gates history-carrying
+    // samples against non-chat shapes at dataset load.
+    const evalBundle = emitEval(projected, {
+      readme,
+      bridge: {
+        sourceTarget: sourceIr.target,
+        kind: strategy.kind,
+        chatCapable: strategy.chatCapable,
+        ...(strategy.entryImport !== undefined ? { entryImport: strategy.entryImport } : {}),
+      },
+    });
     for (const file of evalBundle.files) {
       const fullPath = join(evalOut, file.path);
       if (file.path === "README.md" && existsSync(fullPath)) {
