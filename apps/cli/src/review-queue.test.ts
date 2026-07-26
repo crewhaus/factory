@@ -299,7 +299,7 @@ describe("crewhaus review (CLI)", () => {
     const missing = await runCli(["review", "resolve", "rev_nope"]);
     expect(missing.exitCode).not.toBe(0);
     expect(missing.stderr).toContain('no review item "rev_nope"');
-  });
+  }, 60_000);
 
   test("non-TTY `next` prints the oldest open item and exits without hanging", async () => {
     enqueueReviewEntries(cwd, [

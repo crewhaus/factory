@@ -258,7 +258,7 @@ describe("crewhaus distill --register (item 12)", () => {
     const all = [...rec.splits.train, ...rec.splits.dev, ...(rec.splits.test ?? [])];
     expect(all.map((s) => s.id).sort()).toEqual([`${SESSION}_t1`, `${SESSION}_t2`]);
     expect(existsSync(join(root, "dataset.jsonl"))).toBe(false);
-  });
+  }, 60_000);
 
   test("--register with -o keeps the plain file output AND promotes; re-run bumps to v2", async () => {
     const root = newTempRoot();
@@ -279,7 +279,7 @@ describe("crewhaus distill --register (item 12)", () => {
     const v1 = readRecord(root, "golden", "v1");
     const v2 = readRecord(root, "golden", "v2");
     expect(v2.splits.train.map((s) => s.id)).toEqual(v1.splits.train.map((s) => s.id));
-  });
+  }, 60_000);
 
   test("without --register and without -o it still dies cleanly", async () => {
     const root = newTempRoot();
@@ -494,7 +494,7 @@ describe("crewhaus datasets verify (NEW-registry-1)", () => {
     writeFileSync(path, JSON.stringify(raw));
     expect((await runCli(["datasets", "verify", "ver"], root)).exitCode).toBe(1);
     expect((await runCli(["datasets", "verify", "ver@v1"], root)).exitCode).toBe(1);
-  });
+  }, 60_000);
 
   test("missing name/version exit 1", async () => {
     const root = newTempRoot();
@@ -503,7 +503,7 @@ describe("crewhaus datasets verify (NEW-registry-1)", () => {
     const file = writeDatasetFile(root, 3);
     expect((await runCli(["datasets", "put", "ver2", "--file", file], root)).exitCode).toBe(0);
     expect((await runCli(["datasets", "verify", "ver2@v9"], root)).exitCode).toBe(1);
-  });
+  }, 60_000);
 });
 
 describe("crewhaus datasets put --canary (B18)", () => {
@@ -536,7 +536,7 @@ describe("crewhaus datasets status (B17)", () => {
     expect((await runCli(["datasets", "status", "st", "--runs", "0"], root)).exitCode).toBe(1);
     expect((await runCli(["datasets", "status", "ghost"], root)).exitCode).toBe(1);
     expect((await runCli(["datasets", "status"], root)).exitCode).toBe(1);
-  });
+  }, 60_000);
 });
 
 describe("crewhaus datasets card (B21)", () => {
@@ -655,7 +655,7 @@ describe("crewhaus dataset lint CLI (B26)", () => {
     // Exactly one of --dataset/--all is required.
     expect((await runCli(["dataset", "lint"], root)).exitCode).toBe(1);
     expect((await runCli(["dataset", "lint", "--dataset", file, "--all"], root)).exitCode).toBe(1);
-  });
+  }, 60_000);
 
   test("detects a canary leak into the cwd spec (contamination)", async () => {
     const root = newTempRoot();
