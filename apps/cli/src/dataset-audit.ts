@@ -96,6 +96,8 @@ export type AuditedField = {
 
 /**
  * The free-text fields the audit scans and `--apply` redacts: `input`,
+ * `history[<i>].content` (B14 multi-turn samples carry prior conversation
+ * turns — production text every bit as leak-prone as the final input),
  * `expected_output`, and metadata string leaves one level deep (plus items
  * of string arrays) — the same shallow walk `PiiRedactor.redactObject`
  * performs. `expected_tools` entries are machine identifiers, not prose, and
@@ -104,6 +106,11 @@ export type AuditedField = {
  */
 export function sampleTextFields(s: Sample): AuditedField[] {
   const fields: AuditedField[] = [{ field: "input", text: s.input }];
+  if (s.history !== undefined) {
+    for (const [i, msg] of s.history.entries()) {
+      fields.push({ field: `history[${i}].content`, text: msg.content });
+    }
+  }
   if (s.expected_output !== undefined) {
     fields.push({ field: "expected_output", text: s.expected_output });
   }
@@ -124,12 +131,20 @@ export function sampleTextFields(s: Sample): AuditedField[] {
 }
 
 /** Redact every scannable field of a Sample (see {@link sampleTextFields}),
- *  leaving id / expected_tools / non-string metadata untouched. */
+ *  leaving id / expected_tools / non-string metadata untouched. `history`
+ *  is PRESERVED (roles verbatim, contents redacted) — dropping it would
+ *  silently turn a multi-turn sample single-turn on `--apply`. */
 export function redactSample(
   s: Sample,
   detectors: ReadonlyArray<PiiDetector> = SYNTHESIZE_PII_DETECTORS,
 ): Sample {
   const out: Sample = { id: s.id, input: redactDatasetText(s.input, detectors) };
+  if (s.history !== undefined) {
+    out.history = s.history.map((m) => ({
+      role: m.role,
+      content: redactDatasetText(m.content, detectors),
+    }));
+  }
   if (s.expected_output !== undefined) {
     out.expected_output = redactDatasetText(s.expected_output, detectors);
   }

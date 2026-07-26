@@ -14,7 +14,8 @@
  *   - `egress_decision` audit blocks (when the audit log carries them).
  * Each signal's TRIGGERING turn input becomes a candidate Sample in a
  * QUARANTINE staging dataset; `--review` promotes accepted candidates into a
- * mined dataset version. Provenance lands in `metadata` (source: 'mine',
+ * mined dataset version. Provenance lands in `metadata` (source:
+ * 'production_log' — mined turns ARE production data — plus mined: true,
  * signal, sessionId).
  *
  * `synthesize` samples real inputs from a source dataset, PII-redacts them,
@@ -314,7 +315,13 @@ export function candidateToSample(c: MineCandidate, redact?: (text: string) => s
     id: candidateId(c),
     input: clean(c.input),
     metadata: {
-      source: "mine",
+      // B22 — mined turns come from real production sessions, so the
+      // canonical provenance taxonomy value is "production_log" (same
+      // normalization distill applies); tool identity survives in the
+      // sibling `mined: true` (mirroring distill's `feedback_source`)
+      // alongside the mine-specific `signal`.
+      source: "production_log",
+      mined: true,
       signal: c.signal,
       sessionId: c.sessionId,
       turnNumber: c.turnNumber,
@@ -504,7 +511,10 @@ export function buildStressVariants(redactedInput: string, count: number): Synth
  */
 export function variantToSample(variant: SynthVariant, sourceId: string, index: number): Sample {
   const metadata: Record<string, unknown> = {
-    source: "synthesize",
+    // B22 — the canonical taxonomy value (was the tool-named "synthesize"
+    // before the taxonomy existed); the registry's put() enforces that
+    // "synthetic" samples never carry expected_output.
+    source: "synthetic",
     mutation: variant.mutation,
     from: sourceId,
     note: "synthetic stress variant — never a human-gold sample",

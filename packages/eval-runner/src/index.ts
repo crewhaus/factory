@@ -90,6 +90,15 @@
  *       results.json (`aggregates.calibration` /
  *       `aggregates.paraphraseConsistency`).
  *
+ * Evals Wave 3 (data lifecycle, cluster A):
+ *   B14 — multi-turn samples: a sample's optional `history` seeds the
+ *       default invoker's chat-loop transcript verbatim (no model calls run
+ *       for history turns) before the graded final `input`. Seeded turns
+ *       appear in the transcript — Wave-2 transcript-target judges see the
+ *       whole conversation — but publish no trace events, so tool/token/
+ *       latency metrics measure only the final turn's work, and `turns`
+ *       excludes the seeded assistant messages (run-sample.ts).
+ *
  * Reference: build-roadmap.md §16; AGENT-LOOPS-PLAN.md.
  */
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -113,7 +122,13 @@ import { runSample } from "./run-sample";
 import { createSampleOutputWriter } from "./sample-output";
 import { formatSemanticFallbackWarning } from "./semantic-fallback";
 import { Semaphore } from "./semaphore";
-import { DEFAULT_SLICE_KEYS, computeSlices, sampleAbstained, sampleNeedsReview } from "./slices";
+import {
+  DEFAULT_SLICE_KEYS,
+  computeSlices,
+  sampleAbstained,
+  sampleIsCanary,
+  sampleNeedsReview,
+} from "./slices";
 import { meanCI95, tCritical975, wilsonCI95 } from "./stats";
 import type {
   AgentInvoker,
@@ -154,7 +169,8 @@ export { wireRunOnce };
 // B13 — metadata slice aggregation (runner-computed so bundles inherit it)
 // and the A3 abstained-outcome predicate downstream consumers share.
 // A2 — sampleNeedsReview is its needs-review sibling (verdict still counts).
-export { DEFAULT_SLICE_KEYS, computeSlices, sampleAbstained, sampleNeedsReview };
+// B18 — sampleIsCanary marks contamination tripwires (excluded like abstained).
+export { DEFAULT_SLICE_KEYS, computeSlices, sampleAbstained, sampleIsCanary, sampleNeedsReview };
 // C27 — the closed-form CI helpers behind passRateCI95 / meanScoreCI95.
 export { meanCI95, tCritical975, wilsonCI95 };
 // Loop contract 0.4 (Batch B, G14) — the default grader registry: the six
@@ -944,7 +960,13 @@ async function defaultInvoker(ir: IrV0, opts: RunEvalOptions): Promise<AgentInvo
         runContext: req.runContext,
         sessionRootDir: req.sessionRootDir,
         singleTurn: true,
-        seedMessages: [{ role: "user", content: req.sample.input }],
+        // B14 — a multi-turn sample's `history` seeds the conversation
+        // VERBATIM: the chat loop logs each seeded message straight into the
+        // session transcript (transcript-target judges see them) and makes
+        // NO model calls for history turns — the required `input` is the one
+        // graded final user message, MT-Bench style. History-less samples
+        // keep the exact single-message seed as before.
+        seedMessages: [...(req.sample.history ?? []), { role: "user", content: req.sample.input }],
       });
       return { agentOutput };
     } finally {

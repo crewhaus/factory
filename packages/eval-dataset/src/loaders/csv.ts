@@ -16,7 +16,7 @@ export async function loadCsv(path: string): Promise<LoadedDataset> {
 
   return {
     name,
-    samples: rowsToSamples(dataRows, header, path),
+    samples: csvRowsToSamples(dataRows, header, path),
   };
 }
 
@@ -24,34 +24,57 @@ async function* emptyIterable(): AsyncIterable<Sample> {
   /* nothing */
 }
 
-async function* rowsToSamples(
+/**
+ * Shared CSV row → Sample generator (the file loader and the HTTP CSV path
+ * both dispatch here, so structured-column handling can never drift between
+ * them). Empty cells are omitted — a blank column keeps the sample
+ * byte-identical to one authored without it. Structured columns:
+ *   - `expected_tools` — comma-split list.
+ *   - `metadata` (NEW-formats-1) / `history` (B14) — JSON-encoded cells,
+ *     parsed here so CSV datasets can carry the fields the rest of the
+ *     eval system leans on (slicing, provenance, multi-turn). Malformed
+ *     JSON is a hard `DatasetLoadError` naming the row — the raw string
+ *     would otherwise reach schema validation and fail with a far more
+ *     confusing type error (previously EVERY non-empty metadata cell did).
+ */
+export async function* csvRowsToSamples(
   rows: ReadonlyArray<ReadonlyArray<string>>,
   header: ReadonlyArray<string>,
-  path: string,
+  source: string,
 ): AsyncIterable<Sample> {
   let rowNo = 1; // header was row 0
   for (const row of rows) {
     rowNo += 1;
     if (row.length === 1 && row[0] === "") continue; // trailing newline
-    const obj: Record<string, string | string[]> = {};
+    const obj: Record<string, unknown> = {};
     for (let i = 0; i < header.length; i++) {
       const key = header[i];
       if (key === undefined) continue;
       const cell = row[i] ?? "";
-      // expected_tools is the only array-shaped field — comma-split
-      if (key === "expected_tools" && cell !== "") {
+      if (cell === "") continue;
+      if (key === "expected_tools") {
+        // expected_tools is the only comma-split field.
         obj[key] = cell
           .split(",")
           .map((s) => s.trim())
           .filter((s) => s.length > 0);
-      } else if (cell !== "") {
+      } else if (key === "metadata" || key === "history") {
+        try {
+          obj[key] = JSON.parse(cell);
+        } catch (err) {
+          throw new DatasetLoadError(
+            `malformed JSON in "${key}" column on row ${rowNo} of ${source}`,
+            err,
+          );
+        }
+      } else {
         obj[key] = cell;
       }
     }
     const result = SampleSchema.safeParse(obj);
     if (!result.success) {
       throw new DatasetLoadError(
-        `invalid sample on row ${rowNo} of ${path}: ${result.error.message}`,
+        `invalid sample on row ${rowNo} of ${source}: ${result.error.message}`,
       );
     }
     yield result.data;

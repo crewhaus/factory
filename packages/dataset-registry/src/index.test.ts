@@ -20,9 +20,11 @@ import { CrewhausError } from "@crewhaus/errors";
 import type { Sample } from "@crewhaus/eval-dataset";
 import {
   DatasetRegistryError,
+  appendReleaseEntry,
   compareVersions,
   createFileBackedRegistry,
   latestVersion,
+  verifySplitHashes,
 } from "./index";
 
 let tmpRoot = "";
@@ -405,5 +407,156 @@ describe("dataset-registry — latestVersion", () => {
     await put(reg, "y", "1.0.2");
     await put(reg, "y", "1.0.10");
     expect(await latestVersion(reg, "y")).toBe("1.0.10");
+  });
+});
+
+describe("dataset-registry — NEW-registry-1 put overwrite guard", () => {
+  test("refuses to overwrite an existing version without allowOverwrite", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    await reg.put({ name: "guard", version: "v1", splits: { train: [sample("a", "x")], dev: [] } });
+    await expect(
+      reg.put({ name: "guard", version: "v1", splits: { train: [sample("b", "y")], dev: [] } }),
+    ).rejects.toThrow(/already exists.*allowOverwrite/s);
+    // Original content untouched.
+    const rec = await reg.getRecord("guard", "v1");
+    expect(rec.splits.train[0]?.id).toBe("a");
+  });
+
+  test("allowOverwrite: true replaces the version explicitly", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    await reg.put({
+      name: "guard2",
+      version: "v1",
+      splits: { train: [sample("a", "x")], dev: [] },
+    });
+    const rec = await reg.put(
+      { name: "guard2", version: "v1", splits: { train: [sample("b", "y")], dev: [] } },
+      { allowOverwrite: true },
+    );
+    expect(rec.splits.train[0]?.id).toBe("b");
+    expect((await reg.getRecord("guard2", "v1")).splits.train[0]?.id).toBe("b");
+  });
+});
+
+describe("dataset-registry — B22 synthetic-never-gold invariant at put", () => {
+  test("refuses a source: synthetic sample carrying expected_output", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    const bad: Sample = {
+      id: "synth_1",
+      input: "q",
+      expected_output: "leaked gold",
+      metadata: { source: "synthetic" },
+    };
+    await expect(
+      reg.put({ name: "inv", version: "v1", splits: { train: [bad], dev: [] } }),
+    ).rejects.toThrow(/synthetic samples never define the gold standard/);
+    expect(existsSync(join(tmpRoot, "inv", "v1.json"))).toBe(false);
+  });
+
+  test("synthetic_human_verified with a gold, and gold-less synthetic, both pass", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    const verified: Sample = {
+      id: "shv_1",
+      input: "q",
+      expected_output: "human-verified gold",
+      metadata: { source: "synthetic_human_verified" },
+    };
+    const goldless: Sample = { id: "synth_2", input: "q2", metadata: { source: "synthetic" } };
+    const rec = await reg.put({
+      name: "inv2",
+      version: "v1",
+      splits: { train: [verified, goldless], dev: [] },
+    });
+    expect(rec.splits.train.length).toBe(2);
+  });
+});
+
+describe("dataset-registry — NEW-registry-1 verifySplitHashes", () => {
+  test("an intact record verifies clean, per split", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    await reg.put({
+      name: "ver",
+      version: "v1",
+      splits: { train: [sample("a", "x")], dev: [sample("b", "y")], test: [sample("c", "z")] },
+    });
+    const rec = await reg.getRecord("ver", "v1");
+    expect(verifySplitHashes(rec)).toEqual([]);
+  });
+
+  test("hand-edited sample content is reported with stored vs actual hashes", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    await reg.put({
+      name: "ver2",
+      version: "v1",
+      splits: { train: [sample("a", "x"), sample("b", "y")], dev: [] },
+    });
+    const path = join(tmpRoot, "ver2", "v1.json");
+    const raw = JSON.parse(readFileSync(path, "utf-8"));
+    raw.splits.train[1].input = "TAMPERED";
+    writeFileSync(path, JSON.stringify(raw));
+    const mismatches = verifySplitHashes(await reg.getRecord("ver2", "v1"));
+    expect(mismatches.length).toBe(1);
+    expect(mismatches[0]?.split).toBe("train");
+    expect(mismatches[0]?.index).toBe(1);
+    expect(mismatches[0]?.sampleId).toBe("b");
+    expect(mismatches[0]?.storedHash).toBeDefined();
+    expect(mismatches[0]?.actualHash).toBeDefined();
+    expect(mismatches[0]?.storedHash).not.toBe(mismatches[0]?.actualHash);
+  });
+
+  test("length divergence (appended sample, dangling hash) is a mismatch", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    await reg.put({ name: "ver3", version: "v1", splits: { train: [sample("a", "x")], dev: [] } });
+    const path = join(tmpRoot, "ver3", "v1.json");
+    const raw = JSON.parse(readFileSync(path, "utf-8"));
+    raw.splits.train.push({ id: "smuggled", input: "extra" });
+    writeFileSync(path, JSON.stringify(raw));
+    const mismatches = verifySplitHashes(await reg.getRecord("ver3", "v1"));
+    expect(mismatches.length).toBe(1);
+    expect(mismatches[0]?.sampleId).toBe("smuggled");
+    expect(mismatches[0]?.storedHash).toBeUndefined();
+  });
+});
+
+describe("dataset-registry — NEW-HUNT-9 appendReleaseEntry", () => {
+  test("appends onto an empty history and preserves content identity", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    const before = await reg.put({
+      name: "rel",
+      version: "v1",
+      splits: { train: [sample("a", "x")], dev: [], test: [sample("t", "q")] },
+    });
+    const updated = appendReleaseEntry({
+      rootDir: tmpRoot,
+      name: "rel",
+      version: "v1",
+      entry: { version: "v1", runId: "run_1", ts: "2026-07-25T00:00:00.000Z", passRate: 0.8 },
+    });
+    expect(updated.releases?.length).toBe(1);
+    expect(updated.releases?.[0]?.runId).toBe("run_1");
+    // Samples, hashes, createdAt all byte-identical (a release consumes the
+    // version, it does not re-author it).
+    expect(updated.createdAt).toBe(before.createdAt);
+    expect(updated.sampleHashes).toEqual(before.sampleHashes as never);
+    expect(verifySplitHashes(await reg.getRecord("rel", "v1"))).toEqual([]);
+    // Second release appends (burn count 2).
+    const again = appendReleaseEntry({
+      rootDir: tmpRoot,
+      name: "rel",
+      version: "v1",
+      entry: { version: "v1", runId: "run_2", ts: "2026-07-25T01:00:00.000Z", passRate: 0.9 },
+    });
+    expect(again.releases?.map((r) => r.runId)).toEqual(["run_1", "run_2"]);
+  });
+
+  test("throws on a missing record", () => {
+    expect(() =>
+      appendReleaseEntry({
+        rootDir: tmpRoot,
+        name: "ghost",
+        version: "v1",
+        entry: { version: "v1", runId: "run_1", ts: "t", passRate: 1 },
+      }),
+    ).toThrow(DatasetRegistryError);
   });
 });

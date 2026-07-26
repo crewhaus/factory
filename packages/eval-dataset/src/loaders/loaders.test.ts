@@ -19,18 +19,32 @@ async function withTmp(name: string, contents: string): Promise<string> {
   return path;
 }
 
-/** Build a minimal Response stub the http loader understands. */
+/**
+ * Build a minimal Response stub the http loader understands. Carries a real
+ * single-chunk `body` stream (the B24 jsonl path reads it); `noBody: true`
+ * omits it to exercise the null-body buffered fallback.
+ */
 function httpResponse(
   body: string,
-  init: { status?: number; ok?: boolean; contentType?: string } = {},
+  init: { status?: number; ok?: boolean; contentType?: string; noBody?: boolean } = {},
 ): Response {
   const status = init.status ?? 200;
   const headers = new Headers();
   if (init.contentType !== undefined) headers.set("content-type", init.contentType);
+  const stream =
+    init.noBody === true
+      ? null
+      : new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(body));
+            controller.close();
+          },
+        });
   return {
     ok: init.ok ?? (status >= 200 && status < 300),
     status,
     headers,
+    body: stream,
     text: async () => body,
   } as unknown as Response;
 }
@@ -77,6 +91,79 @@ describe("loadCsv — file-level branches", () => {
     try {
       const ds = await loadCsv(path);
       await expect(collect(ds.samples)).rejects.toThrow(DatasetLoadError);
+      await expect(collect((await loadCsv(path)).samples)).rejects.toThrow(
+        /invalid sample on row 2/,
+      );
+    } finally {
+      await Bun.file(path).delete();
+    }
+  });
+});
+
+describe("loadCsv — structured metadata/history columns (NEW-formats-1 / B14)", () => {
+  test("parses a non-empty metadata column as JSON", async () => {
+    const path = await withTmp(
+      "meta.csv",
+      'id,input,metadata\nq1,hello,"{""difficulty"": ""hard"", ""tags"": [""a""]}"\nq2,world,\n',
+    );
+    try {
+      const samples = await collect((await loadCsv(path)).samples);
+      expect(samples[0]).toEqual({
+        id: "q1",
+        input: "hello",
+        metadata: { difficulty: "hard", tags: ["a"] },
+      });
+      // Empty cell → field omitted, byte-identical to a column-less sample.
+      expect(samples[1]).toEqual({ id: "q2", input: "world" });
+    } finally {
+      await Bun.file(path).delete();
+    }
+  });
+
+  test("parses a history column as JSON", async () => {
+    const history = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello!" },
+    ];
+    const cell = JSON.stringify(history).replaceAll('"', '""');
+    const path = await withTmp("hist.csv", `id,input,history\nq1,final,"${cell}"\n`);
+    try {
+      const samples = await collect((await loadCsv(path)).samples);
+      expect(samples[0]).toEqual({ id: "q1", input: "final", history });
+    } finally {
+      await Bun.file(path).delete();
+    }
+  });
+
+  test("malformed metadata JSON is a hard error naming the row", async () => {
+    const path = await withTmp("badmeta.csv", "id,input,metadata\nq1,ok,{}\nq2,bad,not-json\n");
+    try {
+      const ds = await loadCsv(path);
+      await expect(collect(ds.samples)).rejects.toThrow(DatasetLoadError);
+      await expect(collect((await loadCsv(path)).samples)).rejects.toThrow(
+        /malformed JSON in "metadata" column on row 3/,
+      );
+    } finally {
+      await Bun.file(path).delete();
+    }
+  });
+
+  test("malformed history JSON is a hard error naming the row", async () => {
+    const path = await withTmp("badhist.csv", "id,input,history\nq1,ok,[oops\n");
+    try {
+      await expect(collect((await loadCsv(path)).samples)).rejects.toThrow(
+        /malformed JSON in "history" column on row 2/,
+      );
+    } finally {
+      await Bun.file(path).delete();
+    }
+  });
+
+  test("well-formed JSON of the wrong shape still fails schema validation with the row", async () => {
+    // `metadata` must be a record — a JSON string parses fine but the
+    // sample is rejected by SampleSchema with the usual row-numbered error.
+    const path = await withTmp("wrongshape.csv", 'id,input,metadata\nq1,ok,"""just a string"""\n');
+    try {
       await expect(collect((await loadCsv(path)).samples)).rejects.toThrow(
         /invalid sample on row 2/,
       );
@@ -214,6 +301,43 @@ describe("loadHttp — dispatch and parsing", () => {
     await expect(collect(ds.samples)).rejects.toThrow(/invalid sample on row 2/);
   });
 
+  test("CSV over HTTP parses metadata/history JSON columns (shared row path)", async () => {
+    spyOn(globalThis, "fetch").mockResolvedValue(
+      httpResponse(
+        'id,input,metadata,history\nq1,final,"{""difficulty"": ""hard""}","[{""role"": ""user"", ""content"": ""hi""}]"\n',
+        { contentType: "text/csv" },
+      ),
+    );
+    const ds = await loadHttp("https://example.test/data.csv");
+    expect(await collect(ds.samples)).toEqual([
+      {
+        id: "q1",
+        input: "final",
+        metadata: { difficulty: "hard" },
+        history: [{ role: "user", content: "hi" }],
+      },
+    ]);
+  });
+
+  test("CSV over HTTP names the row on malformed metadata JSON", async () => {
+    spyOn(globalThis, "fetch").mockResolvedValue(
+      httpResponse("id,input,metadata\nq1,ok,nope\n", { contentType: "text/csv" }),
+    );
+    const ds = await loadHttp("https://example.test/data.csv");
+    await expect(collect(ds.samples)).rejects.toThrow(
+      /malformed JSON in "metadata" column on row 2/,
+    );
+  });
+
+  test("JSONL falls back to buffering when the response has no body stream", async () => {
+    spyOn(globalThis, "fetch").mockResolvedValue(
+      httpResponse('{"id":"q1","input":"hi"}\nbroken\n', { noBody: true }),
+    );
+    const ds = await loadHttp("https://example.test/data.jsonl");
+    // Parses AND keeps the buffered parser's exact line numbering.
+    await expect(collect(ds.samples)).rejects.toThrow(/malformed JSON on line 2/);
+  });
+
   test("parses YAML Dataset wrapper by extension", async () => {
     spyOn(globalThis, "fetch").mockResolvedValue(
       httpResponse("name: remote-yaml\nsamples:\n  - id: q1\n    input: hi\n"),
@@ -286,5 +410,81 @@ describe("loadHttp — dispatch and parsing", () => {
     const ds = await loadHttp("not a parseable url");
     expect(ds.name).toBe("remote-dataset");
     expect(await collect(ds.samples)).toEqual([{ id: "q1", input: "hi" }]);
+  });
+});
+
+describe("loadHttp — JSONL body streaming (B24)", () => {
+  test("yields samples incrementally off the fetch reader (no full-body buffering)", async () => {
+    // A real local server whose body we drip-feed: the FIRST sample must
+    // arrive while the response body is still open — `response.text()`
+    // (the old buffered path) would block until close, so this resolves
+    // only if the loader truly streams. The second line is split across
+    // chunks to exercise the carry buffer.
+    const enc = new TextEncoder();
+    let sendRest: () => void = () => {};
+    let bodyClosed = false;
+    const server = Bun.serve({
+      port: 0,
+      fetch: () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(enc.encode('{"id":"q1","input":"a"}\n{"id":"q2","in'));
+              sendRest = () => {
+                controller.enqueue(enc.encode('put":"b"}\r\n'));
+                controller.close();
+                bodyClosed = true;
+              };
+            },
+          }),
+          { headers: { "content-type": "application/x-ndjson" } },
+        ),
+    });
+    try {
+      const ds = await loadHttp(`http://127.0.0.1:${server.port}/drip.jsonl`);
+      expect(ds.name).toBe("drip");
+      const iter = ds.samples[Symbol.asyncIterator]();
+      const first = await iter.next();
+      // Proof of streaming: the body has NOT been fully sent yet.
+      expect(bodyClosed).toBe(false);
+      expect(first.value).toEqual({ id: "q1", input: "a" });
+      sendRest();
+      // Line split mid-token across chunks reassembles, CRLF tolerated.
+      const second = await iter.next();
+      expect(second.value).toEqual({ id: "q2", input: "b" });
+      expect((await iter.next()).done).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("streams a final line with no trailing newline", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => new Response('{"id":"q1","input":"a"}\n{"id":"q2","input":"b"}'),
+    });
+    try {
+      const ds = await loadHttp(`http://127.0.0.1:${server.port}/tail.jsonl`);
+      expect(await collect(ds.samples)).toEqual([
+        { id: "q1", input: "a" },
+        { id: "q2", input: "b" },
+      ]);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("streamed malformed JSON still names the line", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => new Response('{"id":"q1","input":"a"}\n\nnot json\n'),
+    });
+    try {
+      const ds = await loadHttp(`http://127.0.0.1:${server.port}/bad.jsonl`);
+      // Blank line counts toward numbering (parity with the buffered parser).
+      await expect(collect(ds.samples)).rejects.toThrow(/malformed JSON on line 3/);
+    } finally {
+      server.stop(true);
+    }
   });
 });

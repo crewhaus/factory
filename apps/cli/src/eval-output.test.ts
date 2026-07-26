@@ -11,12 +11,14 @@ import type { EvalAggregates, EvalRunSummary, SampleResult } from "@crewhaus/eva
 import {
   evalRunOutputLines,
   fitnessScore,
+  formatCanaryLine,
   formatCriterionLines,
   formatEvalSummaryLine,
   formatFailureClassesLine,
   formatJudgeCalibrationLines,
   formatLoopMetricsLine,
   formatNeedsHumanLine,
+  formatNeedsReviewLine,
   formatRepeatsLine,
   formatSliceLines,
   graderRegistryForCompiled,
@@ -197,6 +199,46 @@ describe("formatNeedsHumanLine (A3)", () => {
     );
     expect(line).toBe(
       "[eval] needs_human=2: q3, q7 — judge abstained; review with `crewhaus rate`",
+    );
+  });
+});
+
+describe("formatNeedsReviewLine (A2)", () => {
+  test("undefined when no panel vote split (prior shape)", () => {
+    expect(formatNeedsReviewLine(summary(LEGACY_AGGREGATES))).toBeUndefined();
+    expect(
+      formatNeedsReviewLine(summary({ ...LEGACY_AGGREGATES, needsReview: 0 })),
+    ).toBeUndefined();
+  });
+
+  test("counts + id-lists the flagged samples, naming the counted-verdict semantics", () => {
+    const line = formatNeedsReviewLine(
+      summary({
+        ...LEGACY_AGGREGATES,
+        needsReview: 2,
+        needsReviewSampleIds: ["q2", "q5"],
+      }),
+    );
+    expect(line).toBe("[eval] needs_review=2: q2, q5 — panel vote split; verdicts still count");
+  });
+});
+
+describe("formatCanaryLine (B18)", () => {
+  test("undefined when the run carried no canary samples (prior shape)", () => {
+    expect(formatCanaryLine(summary(LEGACY_AGGREGATES))).toBeUndefined();
+    expect(formatCanaryLine(summary({ ...LEGACY_AGGREGATES, canary: 0 }))).toBeUndefined();
+  });
+
+  test("counts + id-lists the canary tripwires", () => {
+    const line = formatCanaryLine(
+      summary({
+        ...LEGACY_AGGREGATES,
+        canary: 1,
+        canarySampleIds: ["canary_smoke_v1"],
+      }),
+    );
+    expect(line).toBe(
+      "[eval] canary=1: canary_smoke_v1 — contamination tripwires; excluded from pass rate",
     );
   });
 });

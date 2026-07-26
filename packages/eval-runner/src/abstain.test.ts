@@ -103,6 +103,12 @@ const invoker = async ({ sample }: { sample: Sample }) => ({
   events: [],
 });
 
+// G47 hermeticity — the judge rubrics here declare no `passing_score`, so
+// runEval would otherwise consult `<process.cwd()>/.crewhaus/
+// judge-calibration.json` for the calibrated cut: a stale calibration file
+// sitting in the checkout must never re-gate (or WARN inside) these tests.
+const noCalibration = { readCalibrationFile: () => undefined } as const;
+
 describe("runEval — abstained sample semantics (A3)", () => {
   test("judge abstains + everything else passes → outcome abstained, out of the denominator", async () => {
     const outDir = newTempRoot();
@@ -117,7 +123,7 @@ describe("runEval — abstained sample semantics (A3)", () => {
         ]),
       },
       compiledGraders: graders(),
-      opts: { invoker, outDir },
+      opts: { invoker, outDir, ...noCalibration },
     });
 
     const abstained = summary.samples.find((s) => s.sampleId === "abstain-1");
@@ -159,7 +165,7 @@ describe("runEval — abstained sample semantics (A3)", () => {
         ]),
       },
       compiledGraders: graders(),
-      opts: { invoker, outDir, sliceKeys: ["family"] },
+      opts: { invoker, outDir, sliceKeys: ["family"], ...noCalibration },
     });
 
     const s = summary.samples[0];
@@ -181,7 +187,7 @@ describe("runEval — abstained sample semantics (A3)", () => {
         samples: yieldSamples([{ id: "ok-1", input: "a", expected_output: "a" }]),
       },
       compiledGraders: graders(),
-      opts: { invoker, outDir },
+      opts: { invoker, outDir, ...noCalibration },
     });
     expect("needsHuman" in summary.aggregates).toBe(false);
     expect("needsHumanSampleIds" in summary.aggregates).toBe(false);
@@ -199,7 +205,7 @@ describe("runEval — abstained sample semantics (A3)", () => {
         samples: yieldSamples([{ id: "abstain-3", input: "a", expected_output: "a" }]),
       },
       compiledGraders: graders(),
-      opts: { invoker, outDir, repeats: 2 },
+      opts: { invoker, outDir, repeats: 2, ...noCalibration },
     });
     const s = summary.samples[0];
     expect(s?.trials).toHaveLength(2);
@@ -223,7 +229,7 @@ describe("runEval — judge criterion detail (A12)", () => {
         ]),
       },
       compiledGraders: graders(),
-      opts: { invoker, outDir },
+      opts: { invoker, outDir, ...noCalibration },
     });
 
     // Per-sample: the judge grade carries the breakdown into grades.json.
@@ -247,7 +253,7 @@ describe("runEval — judge criterion detail (A12)", () => {
         samples: yieldSamples([{ id: "abstain-4", input: "a", expected_output: "a" }]),
       },
       compiledGraders: graders(),
-      opts: { invoker, outDir },
+      opts: { invoker, outDir, ...noCalibration },
     });
     expect("criterionMeans" in summary.aggregates).toBe(false);
   });

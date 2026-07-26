@@ -57,6 +57,11 @@ export type FeedbackRecord = {
   correction?: string;
   source: FeedbackSource;
   rater?: string;
+  /** B19 — this record is an ADJUDICATION: at distill time it always wins a
+   *  multi-rater disagreement on its turn and closes it (no review-queue
+   *  entry). Written by `crewhaus rate --adjudicate` / `feedback
+   *  --adjudicate`; absent on every pre-B19 record. */
+  adjudication?: boolean;
   /** ISO 8601 timestamp. */
   ts: string;
 };
@@ -131,6 +136,7 @@ export function isFeedbackRecord(value: unknown): value is FeedbackRecord {
   if (!isValidRating(v["rating"] as Record<string, unknown>)) return false;
   if (typeof v["source"] !== "string") return false;
   if (typeof v["ts"] !== "string") return false;
+  if (v["adjudication"] !== undefined && typeof v["adjudication"] !== "boolean") return false;
   return true;
 }
 
@@ -143,6 +149,8 @@ export type BuildFeedbackInput = {
   runId?: string;
   targetSpanId?: string;
   rater?: string;
+  /** B19 — mark the record as an adjudication (see FeedbackRecord). */
+  adjudicate?: boolean;
   thumbs?: "up" | "down";
   stars?: number;
   /** A [0,1] scalar score (stored as scale {min:0,max:1}). */
@@ -186,6 +194,15 @@ export function buildFeedbackRecord(input: BuildFeedbackInput): FeedbackRecord {
     }
     modality = "comment";
   }
+  // B19 — an adjudication must carry a VERDICT. A comment alone can't settle
+  // a disagreement: resolveFeedback would have nothing to overrule the split
+  // with, and the turn's label would fall back to whichever disputing rater
+  // voted last — the exact timestamp pathology adjudication exists to end.
+  if (input.adjudicate === true && modality === "comment" && input.correction === undefined) {
+    throw new Error(
+      "--adjudicate needs a verdict — give a rating (--thumbs/--stars/--score) or --correction; a comment alone cannot settle a disagreement",
+    );
+  }
   return {
     schemaVersion: FEEDBACK_SCHEMA_VERSION,
     id: input.id,
@@ -199,6 +216,7 @@ export function buildFeedbackRecord(input: BuildFeedbackInput): FeedbackRecord {
     ...(input.correction !== undefined ? { correction: clipFeedbackText(input.correction) } : {}),
     source: input.source,
     ...(input.rater !== undefined ? { rater: input.rater } : {}),
+    ...(input.adjudicate === true ? { adjudication: true } : {}),
     ts: input.ts,
   };
 }
@@ -410,6 +428,271 @@ function foldRecords(earlier: FeedbackRecord, later: FeedbackRecord): FeedbackRe
   };
 }
 
+// -------- multi-rater resolution (B19) --------
+
+/** One rater's merged verdict on one turn ([0,1]-normalized). */
+export type RaterVote = {
+  /** The rater identity (`""` for an unattributed record). */
+  rater: string;
+  /** The rater's normalized [0,1] rating. */
+  score: number;
+  /** Present when the vote was a thumbs verdict (the majority-rule input). */
+  thumbs?: "up" | "down";
+};
+
+export type TurnResolutionKind = "majority" | "mean" | "adjudicated" | "tie";
+
+/** Per-turn agreement record for a turn with ≥2 rating raters. */
+export type TurnAgreement = {
+  sessionId: string;
+  turnNumber: number;
+  votes: RaterVote[];
+  resolution: TurnResolutionKind;
+  /** All votes binarized at the resolve threshold land on the same verdict. */
+  unanimous: boolean;
+};
+
+export type ResolvedFeedback = {
+  /** One record per turn, in the same order `mergeFeedback` would produce.
+   *  Single-rater turns fold exactly as before (byte-identical); multi-rater
+   *  turns carry the aggregate verdict. Tie turns are ABSENT. */
+  resolved: FeedbackRecord[];
+  /** One entry per multi-rater turn (≥2 raters with a rating), ties included. */
+  agreement: TurnAgreement[];
+  /** The split-verdict turns (no adjudication): excluded from `resolved`,
+   *  destined for the review queue instead of a silently-picked label. */
+  ties: TurnAgreement[];
+  /** Overall Cohen's kappa over the multi-rater turns: per rater pair over
+   *  their common turns (verdicts binarized at the threshold), pooled as the
+   *  common-turn-count-weighted mean. Present iff `agreement` is non-empty. */
+  kappa?: number;
+};
+
+/**
+ * B19 — collapse append-only feedback to one record per turn WITHOUT letting a
+ * second rater silently erase the first. Records are grouped per (sessionId,
+ * turnNumber) and then per rater (`rater ?? ""`), each rater's records folding
+ * chronologically like `mergeFeedback`. A turn with ≤1 rating rater folds all
+ * records chronologically — the exact pre-B19 behavior. A turn with ≥2 rating
+ * raters resolves explicitly:
+ *
+ *   - any `adjudication: true` record wins and closes the turn (all records
+ *     fold with the adjudications ordered last, so the adjudicator's fields
+ *     take precedence);
+ *   - else all-thumbs votes resolve by MAJORITY; a split vote is a TIE — the
+ *     turn is withheld from `resolved` and reported in `ties`;
+ *   - else (any stars/scale vote) the votes resolve to the MEAN normalized
+ *     score (recorded as a scale {min:0,max:1} rating — no tie possible).
+ *
+ * `threshold` binarizes votes (score ≥ threshold) for the `unanimous` flag and
+ * the Cohen's-kappa agreement statistic; distill passes its `minScore` so the
+ * agreement figures use the same positive/negative bar as sample labeling.
+ */
+export function resolveFeedback(
+  records: ReadonlyArray<FeedbackRecord>,
+  opts: { threshold: number },
+): ResolvedFeedback {
+  const sorted = [...records].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  const byTurn = new Map<string, FeedbackRecord[]>();
+  for (const r of sorted) {
+    const key = turnKey(r.sessionId, r.turnNumber);
+    const list = byTurn.get(key);
+    if (list === undefined) byTurn.set(key, [r]);
+    else list.push(r);
+  }
+
+  const resolved: FeedbackRecord[] = [];
+  const agreement: TurnAgreement[] = [];
+  const ties: TurnAgreement[] = [];
+  // rater → (turnKey → binarized verdict), the kappa input.
+  const labelsByRater = new Map<string, Map<string, string>>();
+
+  for (const [key, turnRecords] of byTurn) {
+    const foldChronological = (list: ReadonlyArray<FeedbackRecord>): FeedbackRecord => {
+      let acc = list[0] as FeedbackRecord;
+      for (const r of list.slice(1)) acc = foldRecords(acc, r);
+      return acc;
+    };
+    const foldAll = foldChronological(turnRecords);
+
+    // Per-rater fold (records without a rater share the "" bucket).
+    const byRater = new Map<string, FeedbackRecord>();
+    for (const r of turnRecords) {
+      const rk = r.rater ?? "";
+      const prev = byRater.get(rk);
+      byRater.set(rk, prev === undefined ? r : foldRecords(prev, r));
+    }
+    const votes: RaterVote[] = [];
+    for (const [rater, rec] of byRater) {
+      const score = normalizeRating(rec);
+      if (score === undefined) continue; // comment-only rater — no vote
+      votes.push({
+        rater,
+        score,
+        ...(rec.rating.thumbs !== undefined ? { thumbs: rec.rating.thumbs } : {}),
+      });
+    }
+    if (votes.length < 2) {
+      // Single (or zero) rating rater — exact mergeFeedback behavior.
+      resolved.push(foldAll);
+      continue;
+    }
+
+    const first = turnRecords[0] as FeedbackRecord;
+    const labels = votes.map((v) => (v.score >= opts.threshold ? "pos" : "neg"));
+    for (let i = 0; i < votes.length; i++) {
+      const vote = votes[i] as RaterVote;
+      let m = labelsByRater.get(vote.rater);
+      if (m === undefined) {
+        m = new Map();
+        labelsByRater.set(vote.rater, m);
+      }
+      m.set(key, labels[i] as string);
+    }
+    const unanimous = labels.every((l) => l === labels[0]);
+    const entry = (resolution: TurnResolutionKind): TurnAgreement => ({
+      sessionId: first.sessionId,
+      turnNumber: first.turnNumber,
+      votes,
+      resolution,
+      unanimous,
+    });
+
+    // Only an adjudication carrying a VERDICT (a rating or a correction) can
+    // settle the turn. The CLI rejects verdict-less --adjudicate at capture
+    // (buildFeedbackRecord), but a hand-edited/web-UI JSONL line can still
+    // arrive flagged adjudication:true with neither — folding it last would
+    // just re-crown whichever disputing rater voted latest, so it is ignored
+    // as an adjudication (its comment still folds in) and the turn falls
+    // through to the normal majority/tie logic.
+    const adjudications = turnRecords.filter(
+      (r) => r.adjudication === true && (hasRating(r) || r.correction !== undefined),
+    );
+    if (adjudications.length > 0) {
+      // Adjudication always wins: fold with the adjudication records ordered
+      // LAST so the adjudicator's rating/comment/correction take precedence
+      // under the same later-wins fold every other path uses.
+      const others = turnRecords.filter((r) => r.adjudication !== true);
+      resolved.push(foldChronological([...others, ...adjudications]));
+      agreement.push(entry("adjudicated"));
+      continue;
+    }
+
+    if (votes.every((v) => v.thumbs !== undefined)) {
+      const up = votes.filter((v) => v.thumbs === "up").length;
+      const down = votes.length - up;
+      if (up === down) {
+        // A true tie is never silently resolved — withhold from distill.
+        const tie = entry("tie");
+        agreement.push(tie);
+        ties.push(tie);
+        continue;
+      }
+      const winner: "up" | "down" = up > down ? "up" : "down";
+      resolved.push({ ...foldAll, modality: "binary", rating: { thumbs: winner } });
+      agreement.push(entry("majority"));
+      continue;
+    }
+
+    const mean = votes.reduce((s, v) => s + v.score, 0) / votes.length;
+    resolved.push({
+      ...foldAll,
+      modality: "scale",
+      rating: { scale: { value: mean, min: 0, max: 1 } },
+    });
+    agreement.push(entry("mean"));
+  }
+
+  const kappa = pairwiseKappa(labelsByRater);
+  return { resolved, agreement, ties, ...(kappa !== undefined ? { kappa } : {}) };
+}
+
+/**
+ * Cohen's kappa over paired categorical labels: (po − pe) / (1 − pe), po the
+ * observed agreement fraction, pe the expected-by-chance agreement from each
+ * side's marginal category distribution. `undefined` on an empty input. When
+ * both sides used a single identical category throughout (pe = 1, agreement
+ * trivially perfect) the degenerate ratio is reported as 1.
+ */
+export function cohenKappa(pairs: ReadonlyArray<readonly [string, string]>): number | undefined {
+  if (pairs.length === 0) return undefined;
+  const n = pairs.length;
+  let agree = 0;
+  const aCounts = new Map<string, number>();
+  const bCounts = new Map<string, number>();
+  for (const [a, b] of pairs) {
+    if (a === b) agree += 1;
+    aCounts.set(a, (aCounts.get(a) ?? 0) + 1);
+    bCounts.set(b, (bCounts.get(b) ?? 0) + 1);
+  }
+  const po = agree / n;
+  let pe = 0;
+  for (const [cat, ca] of aCounts) pe += (ca / n) * ((bCounts.get(cat) ?? 0) / n);
+  if (pe >= 1) return 1;
+  return (po - pe) / (1 - pe);
+}
+
+/** The overall figure: per-rater-pair Cohen's kappa over their common turns,
+ *  pooled as the common-turn-count-weighted mean. Undefined when no pair
+ *  shares a turn (i.e. no multi-rater turn existed). */
+function pairwiseKappa(labelsByRater: Map<string, Map<string, string>>): number | undefined {
+  const raters = [...labelsByRater.keys()].sort();
+  let weighted = 0;
+  let total = 0;
+  for (let i = 0; i < raters.length; i++) {
+    for (let j = i + 1; j < raters.length; j++) {
+      const a = labelsByRater.get(raters[i] as string) as Map<string, string>;
+      const b = labelsByRater.get(raters[j] as string) as Map<string, string>;
+      const pairs: Array<readonly [string, string]> = [];
+      for (const [key, la] of a) {
+        const lb = b.get(key);
+        if (lb !== undefined) pairs.push([la, lb]);
+      }
+      const k = cohenKappa(pairs);
+      if (k !== undefined) {
+        weighted += k * pairs.length;
+        total += pairs.length;
+      }
+    }
+  }
+  return total > 0 ? weighted / total : undefined;
+}
+
+/** Render a vote for the agreement print: thumbs verbatim, else the score. */
+function voteLabel(v: RaterVote): string {
+  const who = v.rater === "" ? "(unattributed)" : v.rater;
+  return `${who} ${v.thumbs ?? v.score.toFixed(2)}`;
+}
+
+/**
+ * B19 — the `[distill]` agreement block: a kappa header plus one line per
+ * multi-rater turn showing every rater's verdict and how it resolved.
+ */
+export function formatAgreementLines(agreement: {
+  perTurn: ReadonlyArray<TurnAgreement>;
+  kappa?: number;
+}): string[] {
+  const kappaText = agreement.kappa !== undefined ? agreement.kappa.toFixed(2) : "n/a";
+  const lines = [
+    `[distill] rater agreement: ${agreement.perTurn.length} multi-rater turn(s), Cohen's kappa ${kappaText}`,
+  ];
+  for (const t of agreement.perTurn) {
+    const votes = t.votes.map(voteLabel).join(" / ");
+    let outcome: string;
+    if (t.resolution === "adjudicated") outcome = "adjudicated";
+    else if (t.resolution === "tie") outcome = "TIE — withheld; needs adjudication";
+    else if (t.resolution === "majority") {
+      const up = t.votes.filter((v) => v.thumbs === "up").length;
+      outcome = `majority ${up > t.votes.length - up ? "up" : "down"}`;
+    } else {
+      const mean = t.votes.reduce((s, v) => s + v.score, 0) / t.votes.length;
+      outcome = `mean ${mean.toFixed(2)}`;
+    }
+    lines.push(`[distill]   ${t.sessionId} turn ${t.turnNumber}: ${votes} → ${outcome}`);
+  }
+  return lines;
+}
+
 // -------- distill --------
 
 type Sample = {
@@ -486,6 +769,13 @@ export type DistillResult = {
   stats: DistillStats;
   /** Non-fatal warnings (e.g. a rating whose turn is missing from the log). */
   warnings: string[];
+  /** B19 — per-turn agreement + overall Cohen's kappa. Present iff at least
+   *  one turn had ≥2 rating raters (single-rater corpora keep the exact
+   *  pre-B19 result shape). */
+  agreement?: { perTurn: TurnAgreement[]; kappa?: number };
+  /** B19 — split-verdict turns (no adjudication): NOT distilled into samples;
+   *  the CLI enqueues them to the review queue. Present iff non-empty. */
+  ties?: TurnAgreement[];
 };
 
 /**
@@ -497,7 +787,9 @@ export type DistillResult = {
  * (exactly one, to avoid the hard-AND collapse in `all(...)`). When
  * `opts.redact` is set it runs over every turn/feedback free-text field FIRST,
  * so nothing downstream — samples, metadata, grader synthesis, the judge
- * rubric — ever sees the raw text (B23).
+ * rubric — ever sees the raw text (B23). B19 — turns rated by MULTIPLE raters
+ * resolve via {@link resolveFeedback} (majority / mean / adjudication); split
+ * verdicts are withheld from the samples and surfaced in `ties` instead.
  */
 export function distill(
   turns: ReadonlyArray<SessionTurn>,
@@ -521,7 +813,14 @@ export function distill(
   const turnByKey = new Map<string, SessionTurn>();
   for (const t of cleanTurns) turnByKey.set(turnKey(t.sessionId, t.turnNumber), t);
 
-  const merged = mergeFeedback(cleanFeedback);
+  // B19 — multi-rater turns resolve explicitly (majority / mean /
+  // adjudication) instead of later-timestamp-wins; single-rater turns fold
+  // exactly as mergeFeedback always did. Split verdicts are withheld.
+  const resolution = resolveFeedback(cleanFeedback, { threshold: opts.minScore });
+  const merged = resolution.resolved;
+  const agreementByKey = new Map<string, TurnAgreement>(
+    resolution.agreement.map((a) => [turnKey(a.sessionId, a.turnNumber), a]),
+  );
   const samples: Sample[] = [];
   const positiveTurns: DerivedTurn[] = [];
   const positiveComments: string[] = [];
@@ -555,13 +854,26 @@ export function distill(
     const metadata: Record<string, unknown> = {
       sessionId: fb.sessionId,
       turnNumber: fb.turnNumber,
-      source: fb.source,
+      // B22 — distilled samples come from real production sessions, so the
+      // canonical provenance taxonomy value is "production_log"; the rating
+      // CHANNEL (user|ui|channel|cli — what `source` used to carry) moves to
+      // `feedback_source` so no information is lost.
+      source: "production_log",
+      feedback_source: fb.source,
       raw_rating: fb.rating,
     };
     if (score !== undefined) metadata["user_rating"] = score;
     if (fb.comment !== undefined) metadata["comment"] = fb.comment;
     if (fb.correction !== undefined) metadata["correction"] = fb.correction;
     if (fb.rater !== undefined) metadata["rater"] = fb.rater;
+    // B19 — a multi-rater turn records every rater's normalized verdict (the
+    // individual annotations survive into the sample) and whether an
+    // adjudication closed it. Single-rater samples are byte-identical.
+    const agr = agreementByKey.get(turnKey(fb.sessionId, fb.turnNumber));
+    if (agr !== undefined) {
+      metadata["ratings"] = agr.votes.map((v) => ({ rater: v.rater, score: v.score }));
+      if (agr.resolution === "adjudicated") metadata["adjudicated"] = true;
+    }
 
     const sample: Sample = { id: `${fb.sessionId}_t${fb.turnNumber}`, input: turn.input, metadata };
     if (expectedOutput !== undefined) sample.expected_output = expectedOutput;
@@ -578,6 +890,18 @@ export function distill(
     }
   }
 
+  // B19 — a split verdict with no adjudication is disagreement SIGNAL, not a
+  // label: say so loudly (the optimize --ratings path prints warnings too)
+  // and let the CLI route the turn to the review queue.
+  for (const t of resolution.ties) {
+    const up = t.votes.filter((v) => v.thumbs === "up").length;
+    warnings.push(
+      `rater disagreement on ${t.sessionId} turn ${t.turnNumber} (${up} up / ${
+        t.votes.length - up
+      } down, no adjudication) — not distilled; settle it with \`crewhaus rate --adjudicate\` or \`crewhaus review\``,
+    );
+  }
+
   return {
     samples,
     graders:
@@ -585,13 +909,23 @@ export function distill(
         ? { graders: [buildJudgeRubricGrader(positiveComments, negativeComments, opts.judgeModel)] }
         : synthesizeGraders(positiveTurns, warnings),
     stats: {
-      totalFeedback: merged.length,
+      // Ties count as rated turns (they exist; they just are not labelable).
+      totalFeedback: merged.length + resolution.ties.length,
       matchedTurns: matched,
       unmatchedFeedback: unmatched,
       positives,
       negatives,
     },
     warnings,
+    ...(resolution.agreement.length > 0
+      ? {
+          agreement: {
+            perTurn: resolution.agreement,
+            ...(resolution.kappa !== undefined ? { kappa: resolution.kappa } : {}),
+          },
+        }
+      : {}),
+    ...(resolution.ties.length > 0 ? { ties: resolution.ties } : {}),
   };
 }
 

@@ -33,6 +33,24 @@ export class DatasetRegistryError extends CrewhausError {
 
 export type DatasetSplit = "train" | "dev" | "test";
 
+/**
+ * NEW-HUNT-9 — one sanctioned consumption of a version's held-out test split
+ * (`crewhaus datasets release`). Appended onto the record AFTER the release
+ * eval ran; the entry count is the version's "burn count" — a holdout is only
+ * hidden while its peeks are counted.
+ */
+export type ReleaseEntry = {
+  /** The released version (redundant with the record's own — kept so the
+   *  entry is self-describing when it travels alone in reports). */
+  readonly version: string;
+  /** The eval run that consumed `#test` (run-history `runId`). */
+  readonly runId: string;
+  /** ISO-8601 timestamp of the release eval. */
+  readonly ts: string;
+  /** The release run's pass rate over the test split. */
+  readonly passRate: number;
+};
+
 export type DatasetRecord = {
   readonly name: string;
   readonly version: string;
@@ -45,6 +63,12 @@ export type DatasetRecord = {
     readonly [K in DatasetSplit]?: ReadonlyArray<string>;
   };
   readonly createdAt: string;
+  /**
+   * NEW-HUNT-9 — test-split release history (see {@link ReleaseEntry}).
+   * Additive: absent on records written before the field existed and on
+   * versions whose test split was never released.
+   */
+  readonly releases?: ReadonlyArray<ReleaseEntry>;
 };
 
 export type GetOptions = {
@@ -52,8 +76,22 @@ export type GetOptions = {
   readonly allowTestSplit?: boolean;
 };
 
+export type PutOptions = {
+  /**
+   * NEW-registry-1 — versions are immutable by convention: `put` onto an
+   * EXISTING version throws unless this is explicitly true. Every CLI
+   * promotion path auto-bumps (`nextVersion`), so nothing legitimate
+   * overwrites; a library caller that truly means to replace a version says
+   * so here.
+   */
+  readonly allowOverwrite?: boolean;
+};
+
 export interface DatasetRegistry {
-  put(record: Omit<DatasetRecord, "sampleHashes" | "createdAt">): Promise<DatasetRecord>;
+  put(
+    record: Omit<DatasetRecord, "sampleHashes" | "createdAt">,
+    opts?: PutOptions,
+  ): Promise<DatasetRecord>;
   get(name: string, version: string, split: DatasetSplit, opts?: GetOptions): AsyncIterable<Sample>;
   /** Read the full record (without split-leak guarding — caller already passed an allow flag). */
   getRecord(name: string, version: string): Promise<DatasetRecord>;
@@ -112,6 +150,87 @@ export function overallDatasetHash(
   return h.digest("hex");
 }
 
+/**
+ * NEW-registry-1 — one stored-vs-recomputed hash divergence found by
+ * {@link verifySplitHashes}. `sampleId`/`actualHash` are absent when the
+ * stored hash list is LONGER than the split (a hash with no sample);
+ * `storedHash` is absent when the split outgrew the stored list.
+ */
+export type HashMismatch = {
+  readonly split: DatasetSplit;
+  /** Position in the split's sample array (or stored hash list). */
+  readonly index: number;
+  readonly sampleId?: string;
+  readonly storedHash?: string;
+  readonly actualHash?: string;
+};
+
+/**
+ * Recompute every present split's per-sample content hashes and compare them
+ * against what the record STORED at `put` time. The stored hashes are what
+ * `overallDatasetHash` folds into the run-history datasetHash, so a mismatch
+ * means the version's eval identity has silently diverged from its content
+ * (hand-edited `<version>.json`, corruption) — the strict gate would compare
+ * different data under the same lineage. Empty result = the record is intact.
+ * Pure and offline; `crewhaus datasets verify` is the CLI face.
+ */
+export function verifySplitHashes(record: DatasetRecord): HashMismatch[] {
+  const mismatches: HashMismatch[] = [];
+  for (const split of SPLIT_ORDER) {
+    const samples = record.splits[split];
+    if (samples === undefined) continue;
+    const stored = record.sampleHashes[split] ?? [];
+    const n = Math.max(samples.length, stored.length);
+    for (let i = 0; i < n; i++) {
+      const sample = samples[i];
+      const storedHash = stored[i];
+      const actualHash = sample === undefined ? undefined : hashSample(sample);
+      if (storedHash === actualHash) continue;
+      mismatches.push({
+        split,
+        index: i,
+        ...(sample !== undefined ? { sampleId: sample.id } : {}),
+        ...(storedHash !== undefined ? { storedHash } : {}),
+        ...(actualHash !== undefined ? { actualHash } : {}),
+      });
+    }
+  }
+  return mismatches;
+}
+
+export type AppendReleaseEntryOptions = {
+  /** The file-backed registry root (e.g. `.crewhaus/datasets`). */
+  readonly rootDir: string;
+  readonly name: string;
+  readonly version: string;
+  readonly entry: ReleaseEntry;
+};
+
+/**
+ * NEW-HUNT-9 — append one test-split release entry onto an existing record's
+ * `releases` history, in place. Deliberately NOT `put`: the record's samples,
+ * hashes, and `createdAt` stay byte-identical (a release consumes the version,
+ * it does not re-author it), so the version's content identity — and every
+ * run-index entry keyed on it — is untouched. File-backed only, like the
+ * layout this package documents; standalone (not an interface method) so the
+ * `DatasetRegistry` contract stays additive, mirroring {@link latestVersion}.
+ */
+export function appendReleaseEntry(opts: AppendReleaseEntryOptions): DatasetRecord {
+  ensureSafe(opts.name, NAME_REGEX, "dataset name");
+  ensureSafe(opts.version, VERSION_REGEX, "version");
+  const path = join(opts.rootDir, opts.name, `${opts.version}.json`);
+  if (!existsSync(path)) {
+    throw new DatasetRegistryError(`dataset "${opts.name}@${opts.version}" not found at ${path}`);
+  }
+  const record = JSON.parse(readFileSync(path, "utf8")) as DatasetRecord;
+  const updated: DatasetRecord = {
+    ...record,
+    releases: [...(record.releases ?? []), opts.entry],
+  };
+  writeFileSync(path, JSON.stringify(updated, null, 2), { mode: 0o600 });
+  return updated;
+}
+
 export type FileBackedRegistryOptions = {
   /** Default: `.crewhaus/datasets`. */
   readonly rootDir: string;
@@ -130,9 +249,33 @@ export function createFileBackedRegistry(opts: FileBackedRegistryOptions): Datas
   }
 
   return {
-    async put(record): Promise<DatasetRecord> {
+    async put(record, putOpts: PutOptions = {}): Promise<DatasetRecord> {
       ensureSafe(record.name, NAME_REGEX, "dataset name");
       ensureSafe(record.version, VERSION_REGEX, "version");
+      const path = recordPath(record.name, record.version);
+      // NEW-registry-1 — versions are immutable by convention. Every CLI
+      // promotion path auto-bumps, so an existing file here means a caller
+      // is about to silently rewrite history (and orphan every run-index
+      // entry keyed on the old content) unless it explicitly opted in.
+      if (existsSync(path) && putOpts.allowOverwrite !== true) {
+        throw new DatasetRegistryError(
+          `version "${record.version}" of dataset "${record.name}" already exists at ${path} — versions are immutable; write a new version (nextVersion) or pass allowOverwrite: true if you truly mean to replace it`,
+        );
+      }
+      // B22 — the synthetic-never-gold invariant, enforced at the registry
+      // boundary: a `metadata.source: synthetic` sample carrying an
+      // expected_output would let generated data silently become the gold
+      // standard. A human-verified gold belongs under
+      // `source: synthetic_human_verified`.
+      for (const split of SPLIT_ORDER) {
+        for (const s of record.splits[split] ?? []) {
+          if (s.metadata?.["source"] === "synthetic" && s.expected_output !== undefined) {
+            throw new DatasetRegistryError(
+              `sample "${s.id}" (${split}) is tagged metadata.source: synthetic but carries expected_output — synthetic samples never define the gold standard; set source to "synthetic_human_verified" if a human verified this gold`,
+            );
+          }
+        }
+      }
       const sampleHashes: { [K in DatasetSplit]?: string[] } = {
         train: record.splits.train.map(hashSample),
         dev: record.splits.dev.map(hashSample),
@@ -146,7 +289,7 @@ export function createFileBackedRegistry(opts: FileBackedRegistryOptions): Datas
         createdAt: new Date().toISOString(),
       };
       mkdirSync(datasetDir(record.name), { recursive: true });
-      writeFileSync(recordPath(record.name, record.version), JSON.stringify(full, null, 2), {
+      writeFileSync(path, JSON.stringify(full, null, 2), {
         mode: 0o600,
       });
       return full;

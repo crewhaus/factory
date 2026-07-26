@@ -183,6 +183,32 @@ export function formatNeedsHumanLine(summary: EvalRunSummary): string | undefine
 }
 
 /**
+ * A2 — the needs-review line: samples whose judge-panel vote nearly split
+ * (high normalized entropy). Their verdicts are REAL and still COUNT in the
+ * pass rate — unlike the abstained needs-human bucket — but a near-coin-flip
+ * vote deserves a human look, so the stdout story lists them beside the
+ * needs_human/canary buckets. Undefined when nothing was flagged.
+ */
+export function formatNeedsReviewLine(summary: EvalRunSummary): string | undefined {
+  const a = summary.aggregates;
+  if (a.needsReview === undefined || a.needsReview === 0) return undefined;
+  const ids = (a.needsReviewSampleIds ?? []).join(", ");
+  return `[eval] needs_review=${a.needsReview}: ${ids} — panel vote split; verdicts still count`;
+}
+
+/**
+ * B18 — the canary line: contamination-tripwire samples
+ * (`metadata.source: canary`) are excluded from the pass-rate denominator
+ * like needs_human and listed here. Undefined when the run carried none.
+ */
+export function formatCanaryLine(summary: EvalRunSummary): string | undefined {
+  const a = summary.aggregates;
+  if (a.canary === undefined || a.canary === 0) return undefined;
+  const ids = (a.canarySampleIds ?? []).join(", ");
+  return `[eval] canary=${a.canary}: ${ids} — contamination tripwires; excluded from pass rate`;
+}
+
+/**
  * G54 — tally of `SampleResult.failureClass` (the spec's `failure_taxonomy`
  * class the sample's final error matched), so a classified run says WHY its
  * errors errored without opening results.json. Undefined when no sample
@@ -231,6 +257,10 @@ export function evalRunOutputLines(
   lines.push(...formatCriterionLines(summary));
   const needsHuman = formatNeedsHumanLine(summary);
   if (needsHuman !== undefined) lines.push(needsHuman);
+  const needsReview = formatNeedsReviewLine(summary);
+  if (needsReview !== undefined) lines.push(needsReview);
+  const canary = formatCanaryLine(summary);
+  if (canary !== undefined) lines.push(canary);
   const failures = formatFailureClassesLine(summary.samples);
   if (failures !== undefined) lines.push(failures);
   lines.push(...formatJudgeCalibrationLines(summary.config));

@@ -6,20 +6,27 @@
  * the categorical and scalar branches (the judge sees the trajectory
  * framing, not the bare output).
  *
- * The stub rides `mock.module("@crewhaus/model-router")` — `judge`/
- * `judgeCategorical` resolve their adapter through `resolveModel` when the
- * caller injects none (the exam path never does), so this is the narrowest
- * seam that leaves every eval-judge line real. `mock.module` is
- * process-global and does NOT auto-restore across test files, so this
- * lives in its own file and `afterAll` restores a `{ ...ns }` SNAPSHOT of
- * the real module (the namespace itself is a live view that would resolve
- * to the stub after patching).
+ * The stub rides `CreateExamRunnerOptions.judgeAdapter` — the injectable
+ * judge-transport seam threaded into every `createJudgeGrader` call
+ * (`JudgeOptions.adapter`), so every eval-judge line stays real and no
+ * process-global `mock.module` is involved. This file previously stubbed
+ * `@crewhaus/model-router` via `mock.module`; the seam replaced it.
+ *
+ * FLAKE TRAP (the reason `judgedBlock` exists): the judge prompt wraps each
+ * untrusted block in per-call random markers `<<<UNTRUSTED_<12 hex>>>>` …
+ * `<<<END_<12 hex>>>>` (prompt-template.ts `randomSentinel`). A verdict
+ * function that greps the WHOLE user prompt for "42" therefore fires
+ * spuriously whenever the sentinel hex happens to contain "42" —
+ * 1-(255/256)^11 ≈ 4.2% of calls — which made q2 "see the gold" and flip
+ * `report.passed` from 1 to 2 roughly once per ~24 CI runs. Verdicts must
+ * match against the judged block's CONTENT only, never the full prompt.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
+import { createExamRunner } from "./exam";
 
 /** Every judge request the stub served: tool name + the exact user text,
  *  so target-threading is assertable on the prompt the judge really saw. */
@@ -73,29 +80,29 @@ function stubJudgeAdapter(
   };
 }
 
-/** The active stub — tests swap the verdict function per case. */
+/**
+ * The judged block's CONTENT — the agent output (or transcript digest)
+ * between its sentinel markers. Verdict functions MUST match against this,
+ * never the whole prompt: the sentinel is random hex that can itself
+ * contain the matched needle (see the FLAKE TRAP note in the header).
+ */
+function judgedBlock(userText: string): string {
+  const m = userText.match(
+    /Agent (?:output|transcript) <<<UNTRUSTED_([0-9a-f]+)>>>\n([\s\S]*?)\n<<<END_\1>>>/,
+  );
+  if (m?.[2] === undefined) {
+    throw new Error(`no sentinel-wrapped judged block in prompt:\n${userText}`);
+  }
+  return m[2];
+}
+
+/** The active stub verdict — tests swap it per case. */
 let verdictFn: (userText: string, tool: string) => Record<string, unknown> = () => ({
   label: "correct",
   rationale: "stub default",
 });
 
-// Snapshot BEFORE mocking (a live namespace would restore the stub itself).
-const realModelRouter = { ...(await import("@crewhaus/model-router")) };
-
-mock.module("@crewhaus/model-router", () => ({
-  ...realModelRouter,
-  resolveModel: async (model: string) => ({
-    adapter: stubJudgeAdapter((userText, tool) => verdictFn(userText, tool)),
-    modelId: model,
-    providerId: "anthropic",
-  }),
-}));
-
-const { createExamRunner } = await import("./exam");
-
-afterAll(() => {
-  mock.module("@crewhaus/model-router", () => realModelRouter);
-});
+const adapter = stubJudgeAdapter((userText, tool) => verdictFn(userText, tool));
 
 let tmp: string;
 beforeEach(() => {
@@ -140,6 +147,7 @@ function runnerOpts(overrides: Partial<Parameters<typeof createExamRunner>[0]> =
     instructions: "You are an expert.",
     fragment: { specName: "expert" },
     cwd: tmp,
+    judgeAdapter: adapter,
     // Deterministic examinee: q1 answers 42, q2 bluffs.
     invoker: async ({ sample }: { sample: { id: string } }) => ({
       agentOutput: sample.id === "q1" ? "the answer is 42" : "no idea, maybe blue?",
@@ -158,8 +166,10 @@ describe("createExamRunner × llm_judge dispatch (real eval-judge, stub adapter)
     rubric:
 ${CATEGORICAL_RUBRIC}`,
     );
+    // Judge the OUTPUT block only — the full prompt's random sentinels can
+    // contain "42" themselves (the FLAKE TRAP in the header).
     verdictFn = (userText) =>
-      userText.includes("42")
+      judgedBlock(userText).includes("42")
         ? { label: "correct", rationale: "saw the gold" }
         : { label: "wrong", rationale: "bluffing" };
     const runner = createExamRunner(runnerOpts());
@@ -169,6 +179,7 @@ ${CATEGORICAL_RUBRIC}`,
     expect(report.passed).toBe(1);
     // The judge was forced onto submit_label (categorical dispatch, not a
     // scalar submit_score call).
+    expect(served).toHaveLength(2);
     expect(served.every((s) => s.tool === "submit_label")).toBe(true);
     const passed = report.outcomes.find((o) => o.passed);
     const failed = report.outcomes.find((o) => !o.passed);
@@ -200,7 +211,7 @@ ${CATEGORICAL_RUBRIC}`,
       // degrades behind its explicit marker).
       expect(s.tool).toBe("submit_label");
       expect(s.userText).toContain("Agent transcript");
-      expect(s.userText).toContain("(no transcript recorded)");
+      expect(judgedBlock(s.userText)).toContain("(no transcript recorded)");
     }
   });
 
@@ -230,7 +241,7 @@ ${CATEGORICAL_RUBRIC}`,
     for (const s of served) {
       expect(s.tool).toBe("submit_score");
       expect(s.userText).toContain("Agent transcript");
-      expect(s.userText).toContain("(no transcript recorded)");
+      expect(judgedBlock(s.userText)).toContain("(no transcript recorded)");
     }
   });
 });

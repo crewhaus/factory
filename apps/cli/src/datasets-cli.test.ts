@@ -479,3 +479,287 @@ describe("registry: shorthand resolution errors in eval + optimize (item 12)", (
     expect(unlocked.stderr).toContain("no versions in the registry");
   }, 15000);
 });
+
+describe("crewhaus datasets verify (NEW-registry-1)", () => {
+  test("an intact registry verifies clean; a tampered record exits 1", async () => {
+    const root = newTempRoot();
+    const file = writeDatasetFile(root, 6);
+    expect((await runCli(["datasets", "put", "ver", "--file", file], root)).exitCode).toBe(0);
+    expect((await runCli(["datasets", "verify", "ver"], root)).exitCode).toBe(0);
+    expect((await runCli(["datasets", "verify", "ver@v1"], root)).exitCode).toBe(0);
+    // Hand-edit a sample — the recorded identity no longer matches content.
+    const path = join(root, ".crewhaus", "datasets", "ver", "v1.json");
+    const raw = JSON.parse(readFileSync(path, "utf-8"));
+    raw.splits.train[0].input = "TAMPERED";
+    writeFileSync(path, JSON.stringify(raw));
+    expect((await runCli(["datasets", "verify", "ver"], root)).exitCode).toBe(1);
+    expect((await runCli(["datasets", "verify", "ver@v1"], root)).exitCode).toBe(1);
+  });
+
+  test("missing name/version exit 1", async () => {
+    const root = newTempRoot();
+    expect((await runCli(["datasets", "verify"], root)).exitCode).toBe(1);
+    expect((await runCli(["datasets", "verify", "ghost"], root)).exitCode).toBe(1);
+    const file = writeDatasetFile(root, 3);
+    expect((await runCli(["datasets", "put", "ver2", "--file", file], root)).exitCode).toBe(0);
+    expect((await runCli(["datasets", "verify", "ver2@v9"], root)).exitCode).toBe(1);
+  });
+});
+
+describe("crewhaus datasets put --canary (B18)", () => {
+  test("injects exactly one deterministic source:canary sample", async () => {
+    const root = newTempRoot();
+    const file = writeDatasetFile(root, 9);
+    expect(
+      (await runCli(["datasets", "put", "cnry", "--file", file, "--canary"], root)).exitCode,
+    ).toBe(0);
+    const rec = readRecord(root, "cnry", "v1");
+    const all = [...rec.splits.train, ...rec.splits.dev, ...(rec.splits.test ?? [])];
+    expect(all).toHaveLength(10);
+    const canaries = all.filter(
+      (s) => (s.metadata as Record<string, unknown> | undefined)?.["source"] === "canary",
+    );
+    expect(canaries).toHaveLength(1);
+    expect(canaries[0]?.input).toMatch(/CREWHAUS-CANARY [0-9a-f]{32}/);
+    expect(canaries[0]?.expected_output).toBeUndefined();
+    // The canary'd registry still verifies clean.
+    expect((await runCli(["datasets", "verify", "cnry"], root)).exitCode).toBe(0);
+  });
+});
+
+describe("crewhaus datasets status (B17)", () => {
+  test("reports a run-less dataset (exit 0) and rejects bad --runs", async () => {
+    const root = newTempRoot();
+    const file = writeDatasetFile(root, 6);
+    expect((await runCli(["datasets", "put", "st", "--file", file], root)).exitCode).toBe(0);
+    expect((await runCli(["datasets", "status", "st"], root)).exitCode).toBe(0);
+    expect((await runCli(["datasets", "status", "st", "--runs", "0"], root)).exitCode).toBe(1);
+    expect((await runCli(["datasets", "status", "ghost"], root)).exitCode).toBe(1);
+    expect((await runCli(["datasets", "status"], root)).exitCode).toBe(1);
+  });
+});
+
+describe("crewhaus datasets card (B21)", () => {
+  test("-o writes the markdown datasheet without mutating the record", async () => {
+    const root = newTempRoot();
+    const file = writeDatasetFile(root, 8);
+    expect(
+      (await runCli(["datasets", "put", "cardset", "--file", file, "--canary"], root)).exitCode,
+    ).toBe(0);
+    const before = readFileSync(join(root, ".crewhaus", "datasets", "cardset", "v1.json"), "utf-8");
+    const out = join(root, "card.md");
+    expect((await runCli(["datasets", "card", "cardset", "-o", out], root)).exitCode).toBe(0);
+    const card = readFileSync(out, "utf-8");
+    expect(card).toContain("# Dataset card — cardset@v1");
+    expect(card).toContain("## Splits");
+    expect(card).toContain("## Provenance");
+    expect(card).toContain("| canary | 1 |");
+    expect(card).toContain("Test split never released");
+    expect(card).toContain("## Lint");
+    const after = readFileSync(join(root, ".crewhaus", "datasets", "cardset", "v1.json"), "utf-8");
+    expect(after).toBe(before);
+    // Unknown dataset exits 1.
+    expect((await runCli(["datasets", "card", "ghost"], root)).exitCode).toBe(1);
+  });
+});
+
+describe("crewhaus datasets release (NEW-HUNT-9)", () => {
+  const writeSpecAndGraders = (root: string): { spec: string; graders: string } => {
+    const spec = join(root, "crewhaus.yaml");
+    writeFileSync(
+      spec,
+      "name: rel-spec\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: test\n",
+    );
+    const graders = join(root, "graders.yaml");
+    writeFileSync(graders, "graders:\n  - name: exact\n    type: exact_match\n");
+    return { spec, graders };
+  };
+
+  test("refuses a version without a test split, before any eval", async () => {
+    const root = newTempRoot();
+    const { spec, graders } = writeSpecAndGraders(root);
+    const file = writeDatasetFile(root, 4);
+    // 80/20 split spec → no test key at all.
+    expect(
+      (await runCli(["datasets", "put", "no-test", "--file", file, "--split-spec", "80/20"], root))
+        .exitCode,
+    ).toBe(0);
+    const result = await runCliStderr(
+      ["datasets", "release", "no-test", "--spec", spec, "--graders", graders],
+      root,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("has no test split");
+  });
+
+  test("refuses a second release without --force (the holdout is spent)", async () => {
+    const root = newTempRoot();
+    const { spec, graders } = writeSpecAndGraders(root);
+    const file = writeDatasetFile(root, 10);
+    expect((await runCli(["datasets", "put", "burned", "--file", file], root)).exitCode).toBe(0);
+    // Simulate a prior sanctioned release directly on the record.
+    const path = join(root, ".crewhaus", "datasets", "burned", "v1.json");
+    const raw = JSON.parse(readFileSync(path, "utf-8"));
+    raw.releases = [
+      { version: "v1", runId: "run_prior", ts: "2026-07-24T00:00:00.000Z", passRate: 0.9 },
+    ];
+    writeFileSync(path, JSON.stringify(raw));
+    const result = await runCliStderr(
+      ["datasets", "release", "burned", "--spec", spec, "--graders", graders],
+      root,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("already released");
+    expect(result.stderr).toContain("--force");
+    // The record's release history is untouched by the refusal.
+    const after = JSON.parse(readFileSync(path, "utf-8"));
+    expect(after.releases).toHaveLength(1);
+  });
+
+  test("missing --spec/--graders/name exit 1", async () => {
+    const root = newTempRoot();
+    expect((await runCli(["datasets", "release"], root)).exitCode).toBe(1);
+    expect((await runCli(["datasets", "release", "x"], root)).exitCode).toBe(1);
+    expect((await runCli(["datasets", "release", "x", "--spec", "spec.yaml"], root)).exitCode).toBe(
+      1,
+    );
+  });
+});
+
+describe("crewhaus dataset lint CLI (B26)", () => {
+  test("reports findings; --strict exits 1, plain lint exits 0", async () => {
+    const root = newTempRoot();
+    const bad = join(root, "bad.jsonl");
+    writeFileSync(
+      bad,
+      [
+        JSON.stringify({ id: "dup", input: "same question" }),
+        JSON.stringify({ id: "dup", input: "same question again" }),
+        JSON.stringify({ id: "empty-gold", input: "q", expected_output: "" }),
+      ].join("\n"),
+    );
+    expect((await runCli(["dataset", "lint", "--dataset", bad], root)).exitCode).toBe(0);
+    const strict = await runCliStderr(["dataset", "lint", "--dataset", bad, "--strict"], root);
+    expect(strict.exitCode).toBe(1);
+    expect(strict.stderr).toContain("finding(s)");
+  });
+
+  test("a clean registry dataset lints clean under --strict; --all sweeps", async () => {
+    const root = newTempRoot();
+    const file = writeDatasetFile(root, 5);
+    expect((await runCli(["datasets", "put", "clean", "--file", file], root)).exitCode).toBe(0);
+    expect(
+      (await runCli(["dataset", "lint", "--dataset", "registry:clean", "--strict"], root)).exitCode,
+    ).toBe(0);
+    expect((await runCli(["dataset", "lint", "--all", "--strict"], root)).exitCode).toBe(0);
+    // Exactly one of --dataset/--all is required.
+    expect((await runCli(["dataset", "lint"], root)).exitCode).toBe(1);
+    expect((await runCli(["dataset", "lint", "--dataset", file, "--all"], root)).exitCode).toBe(1);
+  });
+
+  test("detects a canary leak into the cwd spec (contamination)", async () => {
+    const root = newTempRoot();
+    const file = writeDatasetFile(root, 5);
+    expect(
+      (await runCli(["datasets", "put", "leaky", "--file", file, "--canary"], root)).exitCode,
+    ).toBe(0);
+    const rec = readRecord(root, "leaky", "v1");
+    const all = [...rec.splits.train, ...rec.splits.dev, ...(rec.splits.test ?? [])];
+    const canary = all.find(
+      (s) => (s.metadata as Record<string, unknown> | undefined)?.["source"] === "canary",
+    );
+    const phrase = /[0-9a-f]{32}/.exec(canary?.input ?? "")?.[0] as string;
+    // Leak the phrase into the conventional spec.
+    writeFileSync(
+      join(root, "crewhaus.yaml"),
+      `name: leaked\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: say ${phrase}\n`,
+    );
+    const result = await runCliStderr(
+      ["dataset", "lint", "--dataset", "registry:leaky", "--strict"],
+      root,
+    );
+    expect(result.exitCode).toBe(1);
+  });
+});
+
+describe("crewhaus eval preflight (NEW-HUNT-10)", () => {
+  test("duplicate ids refuse before any model spend (no out dir, no credentials needed)", async () => {
+    const root = newTempRoot();
+    const dataset = join(root, "dup.jsonl");
+    writeFileSync(
+      dataset,
+      [
+        JSON.stringify({ id: "q1", input: "a", expected_output: "a" }),
+        JSON.stringify({ id: "q1", input: "b", expected_output: "b" }),
+      ].join("\n"),
+    );
+    const graders = join(root, "graders.yaml");
+    writeFileSync(graders, "graders:\n  - name: exact\n    type: exact_match\n");
+    const out = join(root, "out");
+    const result = await runCliStderr(
+      ["eval", HELLO_SPEC, "--dataset", dataset, "--graders", graders, "-o", out],
+      root,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("preflight refused");
+    expect(result.stderr).toContain('duplicate sample id "q1"');
+    expect(result.stderr).toContain("--no-preflight");
+    expect(existsSync(out)).toBe(false);
+  });
+
+  test("--no-preflight skips the refusal (the run proceeds past the lint-lite)", async () => {
+    const root = newTempRoot();
+    const dataset = join(root, "dup.jsonl");
+    writeFileSync(
+      dataset,
+      [
+        JSON.stringify({ id: "q1", input: "a", expected_output: "a" }),
+        JSON.stringify({ id: "q1", input: "b", expected_output: "b" }),
+      ].join("\n"),
+    );
+    const graders = join(root, "graders.yaml");
+    writeFileSync(graders, "graders:\n  - name: exact\n    type: exact_match\n");
+    // `-o` points at an existing regular FILE: the runner's own out-dir
+    // mkdir throws immediately — offline, deterministic, and strictly
+    // AFTER the preflight point — so a non-"preflight refused" failure
+    // here proves the escape hatch let the run proceed without any model
+    // spend in this test.
+    const outAsFile = join(root, "not-a-dir");
+    writeFileSync(outAsFile, "occupied");
+    const result = await runCliStderr(
+      [
+        "eval",
+        HELLO_SPEC,
+        "--dataset",
+        dataset,
+        "--graders",
+        graders,
+        "--no-preflight",
+        "-o",
+        outAsFile,
+      ],
+      root,
+    );
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).not.toContain("preflight refused");
+  });
+
+  test("gold-needing graders over an all-goldless dataset refuse pre-spend", async () => {
+    const root = newTempRoot();
+    const dataset = join(root, "goldless.jsonl");
+    writeFileSync(
+      dataset,
+      [JSON.stringify({ id: "q1", input: "a" }), JSON.stringify({ id: "q2", input: "b" })].join(
+        "\n",
+      ),
+    );
+    const graders = join(root, "graders.yaml");
+    writeFileSync(graders, "graders:\n  - name: exact\n    type: exact_match\n");
+    const result = await runCliStderr(
+      ["eval", HELLO_SPEC, "--dataset", dataset, "--graders", graders, "-o", join(root, "out")],
+      root,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("fail by construction");
+  });
+});

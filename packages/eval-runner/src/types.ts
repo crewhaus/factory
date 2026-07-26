@@ -265,6 +265,20 @@ export type EvalAggregates = {
   /** A2 — the flagged samples' ids. Present iff {@link needsReview} is. */
   readonly needsReviewSampleIds?: ReadonlyArray<string>;
   /**
+   * B18 — count of contamination-canary samples in the run
+   * (`metadata.source: "canary"`, injected by `crewhaus datasets put
+   * --canary`). Their verdicts are meaningless by construction (nonsense
+   * hex input, no gold), so like the abstained bucket they are excluded
+   * from the `passRate` denominator and `meanScore` and listed here
+   * instead — disjoint from (and winning over) the needs-human/
+   * needs-review buckets. Present (with {@link canarySampleIds}) only when
+   * the run carried at least one canary, so canary-free runs keep their
+   * exact prior shape.
+   */
+  readonly canary?: number;
+  /** B18 — the canary samples' ids. Present iff {@link canary} is. */
+  readonly canarySampleIds?: ReadonlyArray<string>;
+  /**
    * A12 — per-criterion mean judge scores, keyed grader name → criterion →
    * mean of the raw 1–5 criterion scores over the samples that grader
    * scored (abstained verdicts carry no breakdown and are excluded).

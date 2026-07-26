@@ -417,6 +417,168 @@ what is already there).
   print the exact wiring recipe.** Their needs-wiring errors name the
   registry `opts` and `.crewhaus/graders` plugin contract to use, and the
   pack doc comments document the classifier/ocr/stt plugin interface.
+## [Unreleased]
+
+
+
+- **Multi-turn eval samples: a dataset sample may now carry `history` —
+  MT-Bench-style conversational evaluation.** `SampleSchema` gains an
+  optional additive `history: [{role: "user" | "assistant", content}]`
+  (strict item shape, non-empty when present); `input` stays the required
+  FINAL user message, so every history-less dataset parses byte-identically
+  and registry sample hashes are untouched (registry-stored samples never
+  carried the key — schema validation stripped it at `put`). One deliberate
+  break: a hand-authored dataset whose samples already carried a free-form
+  `history` field (or CSV column) was silently ignored before — it now
+  validates, so a shape-mismatched value fails the load loudly and a
+  shape-matched one starts seeding turns (changing that dataset's sample
+  hashes). Rename the column/key or fix its shape. The eval default invoker (CLI
+  `crewhaus eval` and compiled `target: eval` bundles alike) seeds the
+  history messages into the session transcript VERBATIM — no model calls
+  run for history turns — then runs `input` as the one graded turn. Seeded
+  turns appear in the per-sample transcript, so `target: transcript`
+  judges read the whole conversation, while tool-call accuracy, token
+  sums, per-model-call latencies, and `turns` measure only the final
+  turn's work. CSV datasets author it as a JSON-encoded `history` column.
+- **CSV datasets can finally carry `metadata`.** A non-empty `metadata`
+  column now parses as JSON (so slicing, provenance, and per-sample grader
+  conventions all reach CSV-authored datasets); malformed JSON is a hard
+  `DatasetLoadError` naming the row. Previously ANY non-empty metadata
+  cell failed the load with a confusing schema type error. Empty cells
+  still mean "no metadata" — column-less files are byte-identical.
+- **New `crewhaus datasets verify <name>[@version]` — registry integrity is
+  no longer write-time-only.** Recomputes every split's per-sample content
+  hashes and compares them with what the record stored at `put` time — the
+  hashes `overallDatasetHash` folds into the run-history datasetHash, so a
+  mismatch means a version's content silently diverged from its eval-history
+  identity (hand-edited `<version>.json`, corruption) and the strict gate
+  would compare different data under the same lineage. Version omitted →
+  every version is checked. Offline; exits non-zero on any mismatch (the CI
+  gate). The library `put()` now also REFUSES to overwrite an existing
+  version unless the new explicit `allowOverwrite: true` option is passed —
+  every CLI promotion path auto-bumps, so nothing legitimate changes.
+- **New `crewhaus datasets status <name> [--runs N]` — the freshness /
+  saturation report.** Joins the registry's versions with the
+  run-history index (`<name>@<version>[#split][+…]` grammar): per-version
+  age from `createdAt`, how many indexed runs evaluated each version (and
+  when last), how many consumed the locked `#test` split, and the
+  test-split burn count. Saturation signal: sample ids that appeared in ≥ 2
+  of the last N joined runs (default 10) and passed every time are listed
+  as rotation candidates — they no longer discriminate.
+- **New `crewhaus datasets release <name>[@version] --spec <spec.yaml>
+  --graders <g.yaml> [--force]` — test-split consumption is now
+  governed.** The sanctioned holdout spend: runs `crewhaus eval` over
+  the version's locked `#test` split (threading the same
+  `--allow-test-split` machinery, with the regression union skipped so the
+  holdout stays pure), then appends a release entry `{version, runId, ts,
+  passRate}` onto the registry record — an additive `releases` field that
+  `datasets status` and `datasets card` report as the burn count. A version
+  whose test split was already released REFUSES a second release without
+  `--force` (which warns that a re-run holdout score is no longer a first
+  look). A holdout is only hidden while its peeks are counted.
+- **New `crewhaus datasets card <name>[@version] [-o <file.md>]` — dataset
+  datasheets.** Renders a markdown card: split sizes and sample-hash
+  counts, the all-splits content hash, `createdAt` + age, provenance
+  breakdown by `metadata.source` (percentages, untagged counted), indexed
+  eval-run count, the full release/burn history, and an embedded offline
+  lint summary. A generated artifact (stdout or `-o`) — it never mutates
+  the record; commit it wherever cards live.
+- **New `crewhaus dataset lint (--dataset <file|registry:ref> | --all)
+  [--graders <g.yaml>] [--strict]` — offline dataset hygiene.**
+  No model calls: duplicate sample ids (error —
+  artifact dirs collide and the gate's id-keyed flip detection corrupts);
+  ids reused with DIFFERENT content in other versions of the same registry
+  dataset (warning; same-content reuse is normal lineage); near-duplicate
+  inputs (normalized token overlap ≥ 0.9, warning); grader↔dataset
+  mismatches when a graders.yaml is findable (`--graders`, else the
+  conventional `eval/graders.yaml`): gold-needing graders
+  (`exact_match`/`expected_contains`) over gold-less samples (error when NO
+  sample carries a gold — all-fail-by-construction) and `expected_tools` on
+  samples when the conventional spec exposes no tools; `metadata.source`
+  outside the provenance taxonomy (warning, offenders listed); empty-string
+  golds (error); and the canary leak scan (below). Registry refs lint every
+  split (inspection posture); `--all` sweeps every registered dataset's
+  latest version; `--strict` exits non-zero on any finding (the CI gate).
+- **`crewhaus eval` now runs a pre-spend preflight lint-lite.**
+  Before any model call, duplicate sample ids and the
+  all-gold-less × gold-needing-graders mismatch REFUSE the run with a clear
+  message (partial gold gaps warn on stderr and proceed); the new
+  `--no-preflight` flag is the explicit escape hatch. Offline and
+  streaming-friendly — the file/dataset loader is re-opened after the
+  preflight pass, so large datasets still stream into the runner.
+- **New `crewhaus datasets put --canary` + runner canary semantics —
+  contamination tripwires.** `--canary` injects exactly ONE canary
+  sample into the new version: its input is a deterministic 32-hex phrase
+  derived from the (name, version) hash — no wall clock — tagged
+  `metadata.source: "canary"` with no gold. The eval runner now treats
+  `source: "canary"` samples like the abstained needs_human bucket:
+  excluded from the pass-rate denominator and meanScore, counted +
+  id-listed separately (`canary`/`canarySampleIds` in results.json, a
+  `[eval] canary=N:` stdout line), disjoint from needs_human/needs_review.
+  `dataset lint` scans the conventional spec text and every
+  `.crewhaus/fewshot` pool for any canary phrase — a hit is a
+  contamination ERROR (the phrase exists nowhere but the dataset).
+  Canary-free runs are byte-identical.
+- **Multi-rater agreement: a second reviewer no longer erases the
+  first.** Feedback stays append-only, and `crewhaus distill` now resolves
+  turns rated by MULTIPLE raters explicitly instead of
+  later-timestamp-wins: all-thumbs votes resolve by majority, stars/scale
+  (or mixed) votes resolve to the mean normalized score, and a record made
+  with the new `crewhaus rate --adjudicate` / `feedback --adjudicate` flag
+  always wins and closes the disagreement. A true split verdict (even
+  thumbs, no adjudication) is NOT silently labeled — the turn is withheld
+  from the dataset and enqueued for human review. Multi-rater samples
+  record every rater's normalized verdict in `metadata.ratings` (plus
+  `metadata.adjudicated` when an adjudication settled it), and distill
+  prints per-turn agreement plus the overall Cohen's kappa (pairwise,
+  common-turn-weighted) whenever any turn has ≥2 raters. Single-rater
+  corpora — including everything recorded before this release — distill
+  byte-identically.
+- **Persistent human-review queue: `crewhaus review list|next|resolve`.**
+  Review-worthy items used to be print-only; they now land in an
+  append-only store at `.crewhaus/review/queue.jsonl`, fed by three
+  surfaces: `crewhaus eval` enqueues judge-abstained samples (`abstained`)
+  and panel-entropy flags (`needs_review`) at run end (additive and
+  best-effort — a queue write can never fail the run), `distill` enqueues
+  unresolved rater disagreements, and `dataset mine` enqueues POINTERS to
+  its quarantined hard-case candidates (the quarantine JSONL stays the
+  payload store). Entry ids are deterministic from the source key, so every
+  feeder is idempotent — re-running distill/mine never duplicates an item,
+  and a resolved item stays settled. `review list [--kind k] [--all]` shows
+  the queue, `review next` surfaces the oldest open item with its context
+  and (in a TTY) records the verdict — a session-turn item routes through
+  the SAME capture machinery as `crewhaus rate`, recorded as an
+  adjudication so the disagreement closes at the feedback source too; in a
+  non-TTY it prints the item and exits, never hanging a script or CI pipe.
+  `review resolve <id> [--note t]` closes an item non-interactively.
+
+### Changed
+
+- **JSONL datasets stream — remote and local.** HTTP `.jsonl`/`.ndjson`
+  bodies now parse line-by-line off the fetch body reader, and the local
+  `.jsonl` loader (which previously buffered the whole file via
+  `Bun.file().text()`) streams off `Bun.file().stream()` through the same
+  shared incremental parser — memory stays bounded by the longest line,
+  not the file or body, so multi-GB JSONL loads without OOM either way.
+  Line numbering in error messages is unchanged. CSV and YAML still
+  buffer, locally and over HTTP alike (YAML can't stream; CSV quoting
+  spans physical lines), as the module doc now notes.
+- **The `metadata.source` provenance taxonomy is now canonical and
+  enforced: `human_authored | production_log | synthetic |
+  synthetic_human_verified | mine | canary`.** BEHAVIOR CHANGE — the
+  first-party writers normalize onto it: `dataset synthesize` stamps
+  `source: "synthetic"` (was the tool-named `"synthesize"`), and `distill`
+  stamps `source: "production_log"` with the rating channel
+  (user|ui|channel|cli — what `source` used to carry) preserved as the new
+  `metadata.feedback_source`. Default `source` slice labels and
+  provenance-keyed reports shift accordingly. Promotion
+  (`registerDataset`) warns on stderr — never fails — when declared
+  provenance falls outside the taxonomy, listing offenders. The registry
+  `put()` now enforces the hard synthetic-never-gold invariant: a
+  `source: "synthetic"` sample carrying `expected_output` is refused with
+  a pointer to `synthetic_human_verified` — and `dataset refresh-goldens
+  --apply` retags exactly that way when a human-evidence proposal golds a
+  synthetic sample.
 
 ### Fixed
 
@@ -667,6 +829,27 @@ what is already there).
   `llm_judge` entries are categorical, calibrate now explains that a
   label-gated rubric has no scalar cut to calibrate instead of failing
   with a confusing rubric-shape error.
+- **`crewhaus dataset audit` now scans — and `--apply` preserves —
+  multi-turn `history`.** The audit's field walk predated the new
+  `Sample.history` field: PII inside prior conversation turns was never
+  scanned, and `--apply` rebuilt samples from a fixed field list, silently
+  DROPPING `history` (a redacted multi-turn sample came back single-turn).
+  History message contents now scan as `history[<i>].content` fields and
+  `--apply` keeps every turn — roles verbatim, contents redacted with the
+  same shared detector set.
+- **`optimize --few-shot` can no longer hand a dev sample its own gold as a
+  demonstration.** The few-shot pool and ratings-derived eval datasets are
+  mined from the same rated turns, so a pool example could be one of the
+  dev samples being measured — its input + known-good output verbatim in
+  the prompt, silently inflating candidate fitness. Injection now runs
+  after the dataset is materialized and drops every pool example whose
+  (sessionId, turnNumber) provenance appears in the eval dataset's
+  `metadata.sessionId`/`metadata.turnNumber` stamps (the `--ratings`
+  inline distill reports the same pairs), printing
+  `[optimize] few-shot: excluded N pool turn(s) overlapping the eval
+  dataset` — counted, logged, never silent. A dataset with no provenance
+  metadata excludes nothing and behaves exactly as before; if EVERY pool
+  example overlaps, the run refuses rather than injecting nothing.
 
 ## [0.4.0] - 2026-07-18
 

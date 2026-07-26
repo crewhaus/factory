@@ -1,7 +1,7 @@
 import { detectCalibrationAggregates } from "./calibration-abstention";
 import { detectParaphraseConsistency } from "./paraphrase-consistency";
 import { detectSemanticFallback } from "./semantic-fallback";
-import { sampleAbstained, sampleNeedsReview } from "./slices";
+import { sampleAbstained, sampleIsCanary, sampleNeedsReview } from "./slices";
 import { meanCI95, wilsonCI95 } from "./stats";
 import type { EvalAggregates, SafetyViolationCounts, SampleResult } from "./types";
 
@@ -68,6 +68,18 @@ const ZERO_SAFETY: SafetyViolationCounts = {
  * abstained needs-human one (a coin-flip verdict is still a verdict; an
  * abstention is not). Runs without the flag are byte-identical.
  *
+ * Canary honesty (B18): a contamination-canary sample
+ * (`metadata.source: "canary"`) has a MEANINGLESS verdict by construction —
+ * its input is a nonsense hex phrase with no gold, injected purely as a
+ * memorization tripwire — so it is treated like the abstained bucket:
+ * excluded from the pass-rate denominator and `meanScore`, listed in
+ * `canary`/`canarySampleIds`. The buckets are disjoint (canary wins:
+ * an abstained or needs-review canary lists as canary only). As with
+ * abstention, turns/latency/tokens and `partialScoreMean` keep counting it
+ * (the agent run was real; the stable all-samples denominator stays
+ * stable), and pass@k/pass^k conservatively count it not-passed. Runs
+ * without canary samples are byte-identical.
+ *
  * C27: `passRateCI95` (Wilson) and `meanScoreCI95` (Student t) quantify how
  * much the point estimates can be trusted at this n — attached whenever the
  * data supports them (graded n ≥ 1, scored n ≥ 2 respectively).
@@ -92,17 +104,26 @@ const ZERO_SAFETY: SafetyViolationCounts = {
  * when its pack actually graded, keeping pack-less runs byte-identical.
  */
 export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates {
-  const abstainedIds = samples.filter(sampleAbstained).map((s) => s.sampleId);
+  // B18 — canary tripwires: excluded from every verdict-derived figure and
+  // listed in their own bucket, disjoint from (and winning over) the
+  // abstained/needs-review listings below.
+  const canaryIds = samples.filter(sampleIsCanary).map((s) => s.sampleId);
+  const abstainedIds = samples
+    .filter((s) => sampleAbstained(s) && !sampleIsCanary(s))
+    .map((s) => s.sampleId);
   // A2 — needs-review listing, disjoint from the abstained bucket by
   // construction (sampleNeedsReview excludes abstained samples).
-  const needsReviewIds = samples.filter(sampleNeedsReview).map((s) => s.sampleId);
-  // `ok` (non-errored) still includes abstained samples — their turns/
-  // latency/token measurements are real. `scored` (non-errored, graded)
-  // feeds the verdict-derived figures: passRate, meanScore, and both CIs.
+  const needsReviewIds = samples
+    .filter((s) => sampleNeedsReview(s) && !sampleIsCanary(s))
+    .map((s) => s.sampleId);
+  // `ok` (non-errored) still includes abstained/canary samples — their
+  // turns/latency/token measurements are real. `scored` (non-errored,
+  // graded) feeds the verdict-derived figures: passRate, meanScore, and
+  // both CIs.
   const ok = samples.filter((s) => s.error === undefined);
-  const scored = ok.filter((s) => !sampleAbstained(s));
+  const scored = ok.filter((s) => !sampleAbstained(s) && !sampleIsCanary(s));
   const total = samples.length;
-  const gradedTotal = total - abstainedIds.length;
+  const gradedTotal = total - abstainedIds.length - canaryIds.length;
   const passed = scored.filter((s) => s.grades.overall.passed).length;
   const scoredScores = scored.map((s) => s.grades.overall.score);
   const meanScore =
@@ -230,6 +251,7 @@ export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates 
     ...(needsReviewIds.length > 0
       ? { needsReview: needsReviewIds.length, needsReviewSampleIds: needsReviewIds }
       : {}),
+    ...(canaryIds.length > 0 ? { canary: canaryIds.length, canarySampleIds: canaryIds } : {}),
     ...(Object.keys(criterionMeans).length > 0 ? { criterionMeans } : {}),
     ...(semanticFallback !== undefined ? { semanticFallback } : {}),
     ...(calibration !== undefined ? { calibration } : {}),

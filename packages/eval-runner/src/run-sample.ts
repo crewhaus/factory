@@ -126,7 +126,18 @@ export async function runSample(args: {
     finalEvents.map((e) => JSON.stringify(e)).join("\n") + (finalEvents.length > 0 ? "\n" : ""),
   );
 
-  const turns = transcript.filter((e) => e.kind === "assistant_message").length;
+  // B14 — count only the assistant turns THIS invocation produced. A
+  // multi-turn sample's seeded `history` assistant messages land in the
+  // transcript verbatim (deliberately — transcript-target judges read the
+  // whole conversation), but they are replayed context, not final-turn
+  // work: exclude them from `turns` exactly as they are naturally absent
+  // from the trace-event metrics below (seeding publishes no bus events).
+  // History-less samples: byte-identical count.
+  const seededAssistantTurns = sample.history?.filter((m) => m.role === "assistant").length ?? 0;
+  const turns = Math.max(
+    0,
+    transcript.filter((e) => e.kind === "assistant_message").length - seededAssistantTurns,
+  );
   const toolCalls = extractToolCalls(finalEvents);
   const tokens = sumTokens(finalEvents);
   const metrics = computeMetrics(sample, finalEvents, toolCalls);
