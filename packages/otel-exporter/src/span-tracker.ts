@@ -13,9 +13,11 @@ import type {
   CostAccrualEvent,
   CoverageReportEvent,
   ErrorRecoveredEvent,
+  EvalGradedEvent,
   HandoffEvent,
   HookFiredEvent,
   JanitorActionEvent,
+  JudgeVerdictEvent,
   McpCallEndEvent,
   McpCallStartEvent,
   ModelFailoverEvent,
@@ -60,10 +62,12 @@ import {
   buildCostAccrualSpan,
   buildCoverageReportSpan,
   buildErrorRecoveredSpan,
+  buildEvalGradedSpan,
   buildGenericSpan,
   buildHandoffSpan,
   buildHookSpan,
   buildJanitorActionSpan,
+  buildJudgeVerdictSpan,
   buildMcpSpan,
   buildModelFailoverSpan,
   buildModelRouteSpan,
@@ -262,6 +266,16 @@ export class SpanTracker {
       case "test_verdict":
         this.emit(buildTestVerdictSpan(ev as TestVerdictEvent));
         return;
+      // E51 / NEW-E-2 — in-loop quality verdicts. These used to reach the
+      // generic `crewhaus.<kind>` fallback below, which carried the score
+      // only as an untyped JSON blob; they now get dedicated attributes and
+      // an ERROR status on a fail so trace backends can alert on them.
+      case "eval_graded":
+        this.emit(buildEvalGradedSpan(ev as EvalGradedEvent));
+        return;
+      case "judge_verdict":
+        this.emit(buildJudgeVerdictSpan(ev as JudgeVerdictEvent));
+        return;
       case "program_output":
         this.emit(buildProgramOutputSpan(ev as ProgramOutputEvent));
         return;
@@ -278,8 +292,8 @@ export class SpanTracker {
         this.emit(buildApprovalResolvedSpan(ev as ApprovalResolvedEvent));
         return;
       // G58 — never silently drop: any TraceEvent kind without a dedicated
-      // mapping (e.g. `eval_graded`, `judge_verdict`, or a kind added after
-      // this exporter) still produces a generic `crewhaus.<kind>` span. The
+      // mapping (a kind added after this exporter, or a low-traffic
+      // lifecycle event) still produces a generic `crewhaus.<kind>` span. The
       // `*_start` events tracked above intentionally never reach here (they are
       // paired with their `*_end` and emit on the end), so this default carries
       // only genuinely-standalone events.

@@ -625,8 +625,15 @@ export function normalizeHarnessDir(dir: string | undefined): string {
  * working-directory at a nested harness AND prefixes the artifact upload
  * `path:` — actions paths resolve from the repo root and do NOT honor
  * `defaults.run.working-directory` (finding 7).
+ *
+ * `suite` (NEW-HUNT-8) appends the nightly TIER step beside the flywheel run,
+ * so a team driving its flywheel from CI gets the same `--suite` wiring
+ * `init --ci` and `init --sentinel` already emit instead of hand-composing
+ * it. Absent it, the document is byte-identical to the pre-suite scaffold.
  */
-export function buildFlywheelWorkflowYaml(opts: { readonly harnessDir?: string } = {}): string {
+export function buildFlywheelWorkflowYaml(
+  opts: { readonly harnessDir?: string; readonly suite?: string } = {},
+): string {
   const sub = normalizeHarnessDir(opts.harnessDir);
   const prefix = sub === "" ? "" : `${sub}/`;
   const workingDirLine = sub === "" ? "" : `\n        working-directory: ${sub}`;
@@ -768,6 +775,30 @@ jobs:
           path: ${prefix}.crewhaus/flywheel/
           if-no-files-found: ignore
           retention-days: 30
+${suiteFlywheelStep(opts.suite)}`;
+}
+
+/**
+ * NEW-HUNT-8 — the optional nightly TIER step appended to the flywheel cron
+ * (`crewhaus flywheel init --suite <suite.yaml>`). Complementary, not a
+ * replacement: the flywheel above answers "can the optimizer improve the
+ * spec tonight", the tier answers "does the nightly suite still pass". It
+ * runs even when the flywheel step failed (`if: always()`) so one red signal
+ * never hides the other, and it runs LAST so a tier failure cannot stop the
+ * improvement PR from being opened. Absent `--suite` this contributes
+ * nothing — the workflow is byte-identical to the pre-NEW-HUNT-8 scaffold.
+ */
+function suiteFlywheelStep(suite: string | undefined): string {
+  if (suite === undefined) return "";
+  return `
+      - name: Run the nightly suite tier
+        # Runs even if the flywheel failed — an optimizer blow-up must not
+        # hide (or be hidden by) a tier regression.
+        if: always()
+        env:
+          ANTHROPIC_API_KEY: \${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          crewhaus eval suite ${suite} --tier nightly --gate
 `;
 }
 

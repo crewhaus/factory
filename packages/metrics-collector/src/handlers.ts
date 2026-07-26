@@ -6,6 +6,12 @@
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 import type { Registry } from "./registry";
 
+/** Clamp a possibly-rogue grader score onto the histogram's 0..1 domain. */
+function clamp01(v: number): number {
+  if (!Number.isFinite(v)) return 0;
+  return Math.min(1, Math.max(0, v));
+}
+
 export class EventToMetrics {
   private readonly registry: Registry;
   /** traceId → ms timestamp of the most recent model_request that has not seen a token yet. */
@@ -64,6 +70,43 @@ export class EventToMetrics {
           ev.costUsdMicros,
         );
         return;
+      // NEW-E-2 — in-loop quality. The `evaluation:` block emits one
+      // `eval_graded` per grading pass (retries included) on cli / channel /
+      // managed serving loops; nothing folded it, so live quality scores were
+      // computed and then dropped for ops purposes. Labeled by grader type so
+      // a judge-graded loop and a regex-graded one stay distinguishable.
+      case "eval_graded":
+        this.registry.evalVerdictsTotal.inc({ source: "in_loop", verdict: ev.verdict });
+        this.registry.evalScore.observe(clamp01(ev.score), {
+          source: "in_loop",
+          grader: ev.graderType,
+        });
+        return;
+      // NEW-E-2 — a `kind: judge` workflow step / graph node verdict.
+      case "judge_verdict":
+        this.registry.evalVerdictsTotal.inc({ source: "judge_step", verdict: ev.verdict });
+        this.registry.evalScore.observe(clamp01(ev.score), { source: "judge_step" });
+        return;
+      // E51 — the eval runner's per-sample verdict (`test_verdict`), which a
+      // run-level bus carries when the CLI attaches exporters to an offline
+      // eval run. `skip` is an abstained sample, `error` an invoker failure —
+      // both are counted so a dashboard's denominator matches the run's.
+      case "test_verdict":
+        this.registry.evalVerdictsTotal.inc({ source: "eval_sample", verdict: ev.verdict });
+        return;
+      // NEW-E-2 — human ratings, the third online quality channel. Thumbs
+      // land as `up`/`down`; numeric ratings additionally feed the score
+      // histogram normalized onto the same 0..1 scale as the graders' when
+      // they are already in range (an out-of-range scale is counted but not
+      // silently rescaled — we cannot know its maximum).
+      case "response_rated": {
+        const rating = typeof ev.rating === "number" ? String(ev.rating) : ev.rating;
+        this.registry.responseRatingsTotal.inc({ source: ev.source ?? "unknown", rating });
+        if (typeof ev.rating === "number" && ev.rating >= 0 && ev.rating <= 1) {
+          this.registry.evalScore.observe(ev.rating, { source: "human_rating" });
+        }
+        return;
+      }
       default:
         return;
     }

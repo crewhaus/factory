@@ -1,16 +1,33 @@
 /**
  * Track E (§56) — `meta-harness-optimizer`.
  *
- * **BREAKING — opt-in only.** Default optimizer mutator stays `rule`;
- * this mutator is consumed programmatically by passing a
- * `MetaHarnessMutationProvider` to `optimizeSpec({ mutator: ... })`.
- * (CLI `--mutator meta-harness` wiring is a follow-up; the CLI today
- * exposes `rule-based` and `claude` only.) When used, the optimizer's
- * output is a rewritten bundle (`agent.ts`) that no longer round-trips
- * through `parseSpec`. That sidesteps the spec-as-source-of-truth
- * invariant in exchange for full expressiveness over the runtime
- * program. A run header comment is prepended to the bundle so reviewers
- * see the divergence immediately.
+ * **EXPERIMENTAL — opt-in only.** The default optimizer mutator stays
+ * `rule-based`.
+ *
+ * TWO consumption modes, and the difference matters:
+ *
+ *   1. **Programmatic bundle rewriting (BREAKING).** Pass a
+ *      `MetaHarnessMutationProvider` whose `ProposerFn` returns BUNDLE SOURCE
+ *      to `optimizeSpec({ mutator })` together with a bundle-aware fitness.
+ *      The optimizer's output is then a rewritten `agent.ts` that no longer
+ *      round-trips through `parseSpec` — full expressiveness over the runtime
+ *      program, at the cost of the spec-as-source-of-truth invariant.
+ *      {@link formatBreakingChangeHeader} stamps the divergence into the
+ *      bundle so a reviewer sees it immediately. This mode stays
+ *      library-only, deliberately: `crewhaus optimize` writes back through
+ *      `spec-patch` (`OPTIMIZABLE_PATHS` + a strict `parseSpec` re-parse),
+ *      which is exactly what makes an automated write-back reviewable, and a
+ *      model-authored bundle has neither gate.
+ *   2. **CLI `--mutator meta-harness` (D38, Wave 5).** The CLI supplies a
+ *      Claude-backed proposer that returns REPLACEMENT INSTRUCTIONS for the
+ *      spec's optimised prompt, not bundle source. The paper's finding this
+ *      mode adopts is about the proposer's INPUT — filesystem-backed full
+ *      history beats scores-only/summary-only ablations — so the experience
+ *      store below is the point, and the candidate artifact stays a
+ *      spec-shaped rewrite behind the same eval-gated accept loop, budget
+ *      meter and `OPTIMIZABLE_PATHS` validation as `--mutator claude`.
+ *      `persistCandidate({ candidateFileName })` names the artifact honestly
+ *      in that mode (`instructions.txt`, not `agent.ts`).
  *
  * Source: Meta-Harness (Lee et al., Stanford/KRAFTON/MIT,
  * arxiv 2603.28052, March 2026). The paper's key empirical finding:
@@ -29,7 +46,8 @@
  *
  *   experience/
  *     candidate_000/
- *       bundle/agent.ts         (the harness code)
+ *       bundle/agent.ts         (the harness code — or `instructions.txt`
+ *                                in the CLI's spec-shaped mode)
  *       scores.json             (per-sample scores)
  *       trace.jsonl             (full execution trace events)
  *     candidate_001/
@@ -83,14 +101,30 @@ export type ExperienceStoreSummary = {
 };
 
 /**
- * The proposer signature. In production this wraps a Claude Code SDK
- * call; for tests it's deterministic. The proposer is told the
- * experience-store root and asked to produce the next candidate
- * bundle's source — the orchestrator handles writing it to disk.
+ * The proposer signature. In production this wraps a model call; for tests
+ * it's deterministic. The proposer is told the experience-store root and
+ * asked to produce the next candidate's source — the provider handles
+ * handing it back to the optimizer loop.
+ *
+ * D38 — the SECOND argument is the optimizer's live state (current best
+ * prompt, its per-sample grades, the trajectory). It is additive: a proposer
+ * written before D38 declares one parameter and ignores it, unchanged. The
+ * optional `usage` in the return is likewise additive — a model-backed
+ * proposer reports its call's token counts so the orchestrator's `--budget-usd`
+ * meter can gate the run exactly as it gates `--mutator claude`; omitting it
+ * leaves the meter at $0 (the pre-D38 behaviour).
  */
-export type ProposerFn = (summary: ExperienceStoreSummary) => Promise<{
+export type ProposerFn = (
+  summary: ExperienceStoreSummary,
+  state?: OptimizerState,
+) => Promise<{
   readonly bundleSource: string;
   readonly rationale: string;
+  readonly usage?: {
+    readonly input: number;
+    readonly output: number;
+    readonly cacheRead?: number;
+  };
 }>;
 
 /**
@@ -113,12 +147,19 @@ export function persistCandidate(opts: {
   readonly bundleSource: string;
   readonly scores: Readonly<Record<string, number>>;
   readonly traceLines: ReadonlyArray<string>;
+  /**
+   * D38 — file name for the candidate artifact inside `bundle/`. Defaults to
+   * `agent.ts` (the bundle-rewriting mode, unchanged). The CLI's spec-shaped
+   * mode passes `instructions.txt` so the store never claims a prose block is
+   * TypeScript. {@link readExperienceStore} resolves whatever name is there.
+   */
+  readonly candidateFileName?: string;
 }): ExperienceRecord {
   const rootAbs = ensureExperienceStore(opts.rootDir);
   const dir = join(rootAbs, "experience", opts.candidateId);
   const bundleDir = join(dir, "bundle");
   mkdirSync(bundleDir, { recursive: true });
-  const bundlePath = join(bundleDir, "agent.ts");
+  const bundlePath = join(bundleDir, opts.candidateFileName ?? "agent.ts");
   const scoresPath = join(dir, "scores.json");
   const tracePath = join(dir, "trace.jsonl");
   writeFileSync(bundlePath, opts.bundleSource, { mode: 0o600 });
@@ -143,6 +184,25 @@ export function persistCandidate(opts: {
     tracePath,
     aggregateScore,
   };
+}
+
+/**
+ * D38 — the candidate artifact's real file name inside a `bundle/` dir. The
+ * bundle-rewriting mode writes `agent.ts`; the CLI's spec-shaped mode writes
+ * `instructions.txt`. Prefers `agent.ts` when present so an existing store
+ * reads back byte-identically, otherwise takes the first entry (sorted), and
+ * falls back to `agent.ts` for an unreadable/empty dir — the record then names
+ * the conventional path exactly as it did before this option existed.
+ */
+function resolveCandidateFileName(bundleDir: string): string {
+  let entries: string[];
+  try {
+    entries = readdirSync(bundleDir).sort();
+  } catch {
+    return "agent.ts";
+  }
+  if (entries.includes("agent.ts")) return "agent.ts";
+  return entries[0] ?? "agent.ts";
 }
 
 /**
@@ -190,7 +250,7 @@ export function readExperienceStore(rootDir: string): ExperienceStoreSummary {
     }
     records.push({
       candidateId: name,
-      bundlePath: join(dir, "bundle", "agent.ts"),
+      bundlePath: join(dir, "bundle", resolveCandidateFileName(join(dir, "bundle"))),
       scoresPath,
       tracePath: join(dir, "trace.jsonl"),
       aggregateScore: count === 0 ? 0 : total / count,
@@ -235,32 +295,84 @@ export function formatBreakingChangeHeader(opts: {
 }
 
 /**
+ * D38 — pricing/metering metadata a MODEL-backed proposer exposes so the
+ * orchestrator's FR-003 budget gate can treat this provider exactly like
+ * `ClaudeMutationProvider`. The orchestrator feature-detects the matching
+ * getters (`providerId` / `modelId` / `maxOutputTokens`) and the optional
+ * `estimateInputChars(state)` hook; omitting these options leaves the meter
+ * unpriced ($0, gate inert) — the pre-D38 behaviour for a deterministic
+ * proposer that issues no model call.
+ */
+export type MetaHarnessMutationProviderOptions = {
+  /** Adapter provider id (`anthropic` / `openai` / …) for the pricing table. */
+  readonly providerId?: string;
+  /** Wire model id the proposer calls. */
+  readonly modelId?: string;
+  /** Output-token ceiling per proposer call (the gate's worst case). */
+  readonly maxOutputTokens?: number;
+  /** Exact serialized INPUT char count the proposer will transmit for `state`. */
+  readonly estimateInputChars?: (state: OptimizerState) => number;
+  /** Artifact file name the store records for this run's candidates. */
+  readonly candidateFileName?: string;
+};
+
+/**
  * Optimizer-loop adapter. Wraps a `ProposerFn` so meta-harness can
  * drop into the existing `eval-optimizer-orchestrator`. Each `next()`
- * call invokes the proposer, persists the candidate, and emits a
- * `ProviderMutation` whose `prompt` field carries the bundle source
- * itself. The orchestrator's fitness function is expected to know
- * how to handle a bundle-source prompt (the CLI's --mutator
- * meta-harness mode swaps in a bundle-aware fitness).
+ * call reads the experience store, invokes the proposer, and emits a
+ * `ProviderMutation` whose `prompt` field carries whatever the proposer
+ * produced — bundle source in the programmatic mode, replacement
+ * instructions in the CLI's spec-shaped mode (see the module docs). The
+ * caller's fitness function owns the interpretation; writing the candidates
+ * BACK into the store (so the next proposer call sees full history) is also
+ * the caller's job, via {@link persistCandidate}.
  */
 export class MetaHarnessMutationProvider implements MutationProvider {
   readonly name = "meta-harness";
   private iter = 0;
+  private readonly opts: MetaHarnessMutationProviderOptions;
 
   constructor(
     private readonly rootDir: string,
     private readonly proposer: ProposerFn,
-  ) {}
+    opts: MetaHarnessMutationProviderOptions = {},
+  ) {
+    this.opts = opts;
+  }
 
-  async next(_state: OptimizerState): Promise<ProviderMutation> {
+  /** FR-003 cost-gate seam — see {@link MetaHarnessMutationProviderOptions}. */
+  get modelId(): string | undefined {
+    return this.opts.modelId;
+  }
+
+  get providerId(): string | undefined {
+    return this.opts.providerId;
+  }
+
+  get maxOutputTokens(): number | undefined {
+    return this.opts.maxOutputTokens;
+  }
+
+  /** The artifact file name this run's candidates are stored under. */
+  get candidateFileName(): string {
+    return this.opts.candidateFileName ?? "agent.ts";
+  }
+
+  /** FR-003 — exact input size of the upcoming proposer call, when known. */
+  estimateInputChars(state: OptimizerState): number | undefined {
+    return this.opts.estimateInputChars?.(state);
+  }
+
+  async next(state: OptimizerState): Promise<ProviderMutation> {
     const summary = readExperienceStore(this.rootDir);
-    const { bundleSource, rationale } = await this.proposer(summary);
+    const { bundleSource, rationale, usage } = await this.proposer(summary, state);
     this.iter++;
     const mutation: Mutation = { kind: "rephrase-instruction" };
     return {
       prompt: bundleSource,
       mutations: [mutation],
       rationale: `meta-harness iter ${this.iter}: ${rationale}`,
+      ...(usage !== undefined ? { usage } : {}),
     };
   }
 }

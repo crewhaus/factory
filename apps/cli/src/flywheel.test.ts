@@ -738,6 +738,25 @@ describe("buildFlywheelWorkflowYaml", () => {
     expect(yaml).toContain("FLYWHEEL_GH_TOKEN");
     expect(yaml).toContain("ANTHROPIC_API_KEY");
   });
+
+  test("NEW-HUNT-8 — without --suite the document is byte-identical to before", () => {
+    // The suite step is purely additive: a scaffold with no --suite must be
+    // exactly the pre-NEW-HUNT-8 bytes (same pin the CI/sentinel scaffolds
+    // carry).
+    expect(buildFlywheelWorkflowYaml({})).toBe(yaml);
+    expect(buildFlywheelWorkflowYaml({ harnessDir: "" })).toBe(yaml);
+    expect(yaml).not.toContain("eval suite");
+  });
+
+  test("NEW-HUNT-8 — --suite appends a nightly-tier step that runs even on failure", () => {
+    const tiered = buildFlywheelWorkflowYaml({ suite: "eval/suite.yaml" });
+    expect(tiered.startsWith(yaml.trimEnd())).toBe(true);
+    expect(tiered).toContain("crewhaus eval suite eval/suite.yaml --tier nightly --gate");
+    // `if: always()` — an optimizer blow-up must not hide a tier regression.
+    expect(tiered).toContain("if: always()");
+    // It runs LAST, after the improvement PR is opened.
+    expect(tiered.indexOf("eval suite")).toBeGreaterThan(tiered.indexOf("gh pr create"));
+  });
 });
 
 describe("formatFlywheelKnobsGuide", () => {
@@ -796,6 +815,29 @@ describe("crewhaus flywheel (CLI surface)", () => {
     const forced = await runCli(["flywheel", "init", "--force"], root);
     expect(forced.exitCode).toBe(0);
   });
+
+  test("NEW-HUNT-8 — flywheel init --suite wires the nightly tier and validates the path", async () => {
+    const tieredRoot = newTempRoot();
+    const outsideRoot = newTempRoot();
+    mkdirSync(join(tieredRoot, "eval"), { recursive: true });
+    writeFileSync(
+      join(tieredRoot, "eval", "suite.yaml"),
+      "tiers:\n  fast:\n    - name: smoke\n      dataset: eval/d.jsonl\n      graders: eval/g.yaml\n      thresholds: {min_pass_rate: 0.8}\n",
+    );
+    const [tiered, outside] = await Promise.all([
+      runCli(["flywheel", "init", "--suite", "eval/suite.yaml"], tieredRoot),
+      runCli(["flywheel", "init", "--suite", "../elsewhere/suite.yaml"], outsideRoot),
+    ]);
+    expect(tiered.exitCode).toBe(0);
+    expect(
+      readFileSync(join(tieredRoot, ".github", "workflows", "crewhaus-flywheel.yml"), "utf-8"),
+    ).toBe(buildFlywheelWorkflowYaml({ suite: "eval/suite.yaml" }));
+    expect(tiered.stdout).toContain("--tier nightly --gate");
+    // The manifest declares no nightly tier — the cron job would fail nightly.
+    expect(tiered.stderr).toContain("declares only: fast");
+    expect(outside.exitCode).toBe(1);
+    expect(outside.stderr).toContain("inside the harness directory");
+  }, 60_000);
 
   test("H5 — flywheel init from a repo subdir writes the workflow at the REPO ROOT", async () => {
     const root = newTempRoot();

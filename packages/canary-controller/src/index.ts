@@ -18,19 +18,45 @@
  *
  * Without an eval gate (manual mode), the controller waits for an
  * explicit `crewhaus deploy promote` call.
+ *
+ * E50 — the N-variant generalization (deterministic per-request version
+ * selection + per-version outcome accounting) lives in `./experiment`, which
+ * shares this module's hash so a two-version canary and an N-variant
+ * experiment can never disagree about which side of the split a key is on.
+ * Read that module's HONEST BOUNDARY note before describing any of this as
+ * live traffic splitting: nothing here intercepts a request.
  */
-import { createHash } from "node:crypto";
 import type { AuditLog } from "@crewhaus/audit-log";
 import type { DeploymentController } from "@crewhaus/deployment-controller";
-import { CrewhausError } from "@crewhaus/errors";
 import type { RegistryAdapter } from "@crewhaus/spec-registry";
+import { CanaryError } from "./errors";
+import { requestBucket } from "./experiment";
 
-export class CanaryError extends CrewhausError {
-  override readonly name = "CanaryError";
-  constructor(message: string, cause?: unknown) {
-    super("config", message, cause);
-  }
-}
+export { CanaryError };
+export {
+  DEFAULT_EXPERIMENTS_DIR,
+  EXPERIMENT_ASSIGNMENT_SUFFIX,
+  EXPERIMENT_LEDGER_SUFFIX,
+  appendExperimentOutcome,
+  appendExperimentOutcomes,
+  dedupeExperimentOutcomes,
+  experimentFileName,
+  listExperiments,
+  readExperimentAssignment,
+  readExperimentOutcomes,
+  removeExperimentAssignment,
+  requestBucket,
+  selectExperimentVariant,
+  tallyExperimentOutcomes,
+  validateExperimentConfig,
+  writeExperimentAssignment,
+  type ExperimentAssignment,
+  type ExperimentConfig,
+  type ExperimentOutcomeRecord,
+  type ExperimentSelection,
+  type ExperimentVariant,
+  type VariantTally,
+} from "./experiment";
 
 export type CanaryRoutingDecision = {
   readonly version: string;
@@ -137,7 +163,7 @@ export function createCanaryController(opts: CanaryControllerOptions): CanaryCon
       ) {
         throw new CanaryError(`trafficPercent must be in 0..100; got ${config.trafficPercent}`);
       }
-      const bucket = computeBucket(config.tenantId, requestId);
+      const bucket = requestBucket(config.tenantId, requestId);
       const isCanary = bucket < config.trafficPercent;
       return {
         version: isCanary ? config.toVersion : config.fromVersion,
@@ -216,13 +242,4 @@ export function createCanaryController(opts: CanaryControllerOptions): CanaryCon
       };
     },
   };
-}
-
-function computeBucket(tenantId: string | undefined, requestId: string): number {
-  const seed = `${tenantId ?? ""}|${requestId}`;
-  const hash = createHash("sha256").update(seed).digest();
-  // Take first 4 bytes as uint32, mod 100.
-  const v =
-    ((hash[0] ?? 0) << 24) | ((hash[1] ?? 0) << 16) | ((hash[2] ?? 0) << 8) | (hash[3] ?? 0);
-  return Math.abs(v) % 100;
 }

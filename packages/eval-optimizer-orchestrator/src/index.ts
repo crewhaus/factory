@@ -60,6 +60,7 @@ import {
   type StoppedReason,
   actualCallMicros,
 } from "./budget-gate";
+import { formatStageNames, listOptimizableStages } from "./stages";
 
 export class OptimizeSpecError extends CrewhausError {
   override readonly name = "OptimizeSpecError";
@@ -132,6 +133,25 @@ export type OptimizeSpecOptions = {
    * and the arity check in {@link optimizeSpec}.
    */
   readonly knobs?: ReadonlyArray<KnobDial>;
+  /**
+   * D36 (Wave 5, cluster O) — the spec path the search rewrites. Omitted (the
+   * default) keeps the historical behaviour EXACTLY: the base prompt comes
+   * from {@link extractCurrentPrompt} and the emitted patch targets
+   * `["agent","instructions"]`.
+   *
+   * Set it to optimise ONE stage of a multi-stage spec — a workflow step
+   * (`["steps","0","instructions"]`), a graph node
+   * (`["nodes","plan","instructions"]`) or a crew role
+   * (`["roles","writer","instructions"]`). Use
+   * {@link listOptimizableStages} to enumerate the legal paths; every one it
+   * returns is already inside `spec-patch`'s `OPTIMIZABLE_PATHS`, and
+   * `validatePatch` runs on the emitted patch either way, so a hand-built
+   * path outside the whitelist is refused before anything is written.
+   *
+   * The value at the path must be a string (an instructions block) — the
+   * search rewrites prose, not structure.
+   */
+  readonly promptPath?: ReadonlyArray<string>;
 };
 
 export type OptimizeSpecResult = {
@@ -187,12 +207,14 @@ export type OptimizeSpecResult = {
 };
 
 /**
- * Read the agent's current `instructions` block from a Spec. Handles
- * every target shape that's optimizable today; throws if the target
- * doesn't have a single `agent.instructions` field. (Workflow / crew /
- * graph have nested prompts; v0 of the orchestrator targets only
- * single-agent shapes — the OPTIMIZABLE_PATHS list will expand to
- * cover the rest via path-prefix matching.)
+ * Read the agent's current `instructions` block from a Spec — the base prompt
+ * for a search that did NOT declare {@link OptimizeSpecOptions.promptPath}.
+ *
+ * Multi-prompt shapes (workflow / graph / crew) have no single
+ * `agent.instructions` field, so they are refused here: a caller optimising
+ * one of those must name the stage explicitly (D36 — `crewhaus optimize
+ * --stage <name>`, or `promptPath` on the library seam), because "the prompt"
+ * is ambiguous when there are several.
  */
 export function extractCurrentPrompt(spec: Spec): string {
   switch (spec.target) {
@@ -210,15 +232,37 @@ export function extractCurrentPrompt(spec: Spec): string {
       return spec.agent.instructions;
     case "workflow":
     case "graph":
-    case "crew":
-      // NB: do NOT point users at `--path` — no such flag exists on
-      // `crewhaus optimize` (see OPTIMIZE_SCHEMA). Per-stage optimisation is
-      // D36's remaining half, deferred past the Wave-4 eval-bridge work; the
-      // message names what DOES work today instead of a phantom flag.
+    case "crew": {
+      const stages = listOptimizableStages(spec);
+      const vocabulary =
+        stages.length > 0 ? ` Stages in this spec: ${formatStageNames(stages)}.` : "";
       throw new OptimizeSpecError(
-        `target "${spec.target}" has multiple prompts (one per step/node/role); the v0 orchestrator only optimises single-agent shapes. Per-stage prompt optimisation is not implemented yet. You can still MEASURE this shape end-to-end: \`crewhaus compile <spec> --with-eval-harness\` emits an eval bundle that drives the compiled ${spec.target} runtime per sample.`,
+        `target "${spec.target}" has one prompt per ${stages[0]?.kind ?? "stage"} — name the one to optimise (\`crewhaus optimize --stage <name>\`, or pass \`promptPath\` on the library seam).${vocabulary}`,
       );
+    }
   }
+}
+
+/**
+ * D36 — read the string living at `path` in an already-parsed spec. Throws
+ * `OptimizeSpecError` (not a TypeError) when the path is absent or does not
+ * hold a string, so a mis-declared `promptPath` fails before any spend.
+ */
+function readPromptAtPath(spec: Spec, path: ReadonlyArray<string>): string {
+  let cursor: unknown = spec;
+  for (const segment of path) {
+    if (cursor === null || typeof cursor !== "object") {
+      cursor = undefined;
+      break;
+    }
+    cursor = (cursor as Record<string, unknown>)[segment];
+  }
+  if (typeof cursor !== "string") {
+    throw new OptimizeSpecError(
+      `promptPath ${path.join(".")} does not name a string instructions block in this ${spec.target} spec — use \`listOptimizableStages(spec)\` to enumerate the legal paths`,
+    );
+  }
+  return cursor;
 }
 
 /**
@@ -243,7 +287,11 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
       err,
     );
   }
-  const basePrompt = extractCurrentPrompt(spec);
+  // D36 — an explicit `promptPath` names ONE stage of a multi-stage spec;
+  // omitted, the historical single-agent path runs verbatim.
+  const promptPath: ReadonlyArray<string> = opts.promptPath ?? ["agent", "instructions"];
+  const basePrompt =
+    opts.promptPath === undefined ? extractCurrentPrompt(spec) : readPromptAtPath(spec, promptPath);
   // D43 — a knob search is only meaningful if the caller's `fitness` APPLIES
   // the dials it is handed. A knob-blind fitness makes every knob candidate an
   // A/A comparison against the incumbent prompt; `optimize()` accepts on
@@ -368,10 +416,10 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
 
   const patch: SpecPatch = {
     target: spec.target,
-    path: ["agent", "instructions"],
+    path: [...promptPath],
     op: "replace",
     value: result.best.prompt,
-    rationale: `${opts.mutator?.name ?? "rule-based"} mutator improved fitness by ${result.improvement.toFixed(3)} over ${opts.iterations ?? 10} iterations`,
+    rationale: `${opts.mutator?.name ?? "rule-based"} mutator improved fitness by ${result.improvement.toFixed(3)} over ${opts.iterations ?? 10} iterations${opts.promptPath !== undefined ? ` (stage ${promptPath.join(".")})` : ""}`,
   };
   validatePatch(spec, patch);
   // D43 — one patch per dial the search actually MOVED (a dial that came back
@@ -420,6 +468,9 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
         specPath: specAbs,
         target: spec.target,
         mutator: opts.mutator?.name ?? "rule-based",
+        // D36 — recorded ONLY for a stage-scoped run, so a single-agent
+        // report.json stays byte-identical to every one written before.
+        ...(opts.promptPath !== undefined ? { promptPath: [...promptPath] } : {}),
         iterations: opts.iterations ?? 10,
         scoreBefore: result.best.score - result.improvement,
         scoreAfter: result.best.score,
@@ -655,3 +706,15 @@ export { aggregate, arbitrate } from "./failure-arbiter";
 // it owns the cost-tracker dependency and the iteration accounting.
 export type { CallUsage, IterationSpend, SpendSummary, StoppedReason } from "./budget-gate";
 export { BudgetMeter, actualCallMicros, estimateCallMicros } from "./budget-gate";
+
+// D36 (Wave 5, cluster O) — per-stage prompt enumeration for multi-stage
+// specs. See ./stages.ts; every path it returns is already inside spec-patch's
+// OPTIMIZABLE_PATHS whitelist.
+export type { OptimizableStage, StageKind } from "./stages";
+export {
+  MULTI_PROMPT_TARGETS,
+  findStage,
+  formatStageNames,
+  listOptimizableStages,
+  stagePathIsWhitelisted,
+} from "./stages";

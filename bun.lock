@@ -62,6 +62,7 @@
         "@crewhaus/mcp-server": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/memory-store": "workspace:*",
+        "@crewhaus/meta-harness-optimizer": "workspace:*",
         "@crewhaus/migration-engine": "workspace:*",
         "@crewhaus/migration-runner": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
