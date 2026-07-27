@@ -417,10 +417,6 @@ what is already there).
   print the exact wiring recipe.** Their needs-wiring errors name the
   registry `opts` and `.crewhaus/graders` plugin contract to use, and the
   pack doc comments document the classifier/ocr/stt plugin interface.
-## [Unreleased]
-
-
-
 - **Multi-turn eval samples: a dataset sample may now carry `history` —
   MT-Bench-style conversational evaluation.** `SampleSchema` gains an
   optional additive `history: [{role: "user" | "assistant", content}]`
