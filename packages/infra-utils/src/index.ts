@@ -59,8 +59,40 @@ export class ArgParseError extends Error {
 }
 
 /**
+ * Signals a malformed `ParseArgsSchema` — a programmer bug in a schema literal,
+ * NOT bad user input. Deliberately not an `ArgParseError` subclass: apps/cli's
+ * `parseFor` catches `ArgParseError` and calls `die()`, which would report a
+ * schema bug to the end user as though they mistyped a flag. This must escape
+ * uncaught, so do not add it to a `die()` branch.
+ */
+export class ArgSchemaError extends Error {
+  override readonly name = "ArgSchemaError";
+  // biome-ignore lint/complexity/noUselessConstructor: explicit constructor so Bun --coverage counts it as a covered function (field-initializer-only classes can't hit 100% function coverage otherwise)
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+/**
+ * Register `token` for `spec`. `Map.set` is last-write-wins, so without this a
+ * duplicate `--name` or `-short` would silently discard one FlagSpec — and when
+ * the two disagree on `takesValue`, the survivor changes how argv parses.
+ */
+function claimToken(byToken: Map<string, FlagSpec>, token: string, spec: FlagSpec): void {
+  const prev = byToken.get(token);
+  if (prev !== undefined) {
+    throw new ArgSchemaError(
+      `duplicate flag token "${token}" (declared by "${prev.name}" and "${spec.name}")`,
+    );
+  }
+  byToken.set(token, spec);
+}
+
+/**
  * Parse `argv` into positionals and flags per `schema`. Throws ArgParseError
- * for unknown flags or flags missing a required value. Treats `--` as the
+ * for unknown flags or flags missing a required value. Throws ArgSchemaError —
+ * a programmer bug, not user input — if `schema` declares the same flag token
+ * twice, or declares an empty name or short alias. Treats `--` as the
  * end-of-flags sentinel; everything after it is positional.
  */
 export function parseArgs(argv: ReadonlyArray<string>, schema: ParseArgsSchema): ParsedArgs {
@@ -69,8 +101,17 @@ export function parseArgs(argv: ReadonlyArray<string>, schema: ParseArgsSchema):
 
   const byToken = new Map<string, FlagSpec>();
   for (const spec of schema.flags) {
-    byToken.set(`--${spec.name}`, spec);
-    if (spec.short !== undefined) byToken.set(`-${spec.short}`, spec);
+    // An empty name renders as `--`, which the end-of-flags sentinel below
+    // claims first; an empty short renders as `-`, which hijacks the
+    // single-dash positional. Both would be permanently dead flags.
+    if (spec.name === "") throw new ArgSchemaError("flag spec has an empty name");
+    claimToken(byToken, `--${spec.name}`, spec);
+    if (spec.short !== undefined) {
+      if (spec.short === "") {
+        throw new ArgSchemaError(`flag "${spec.name}" has an empty short alias`);
+      }
+      claimToken(byToken, `-${spec.short}`, spec);
+    }
   }
 
   for (let i = 0; i < argv.length; i++) {
