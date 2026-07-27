@@ -26,6 +26,9 @@
  *   6. Runs the boot-time self-heal janitor (ops item 36) — session TTL
  *      eviction + orphaned-tool_use report — at boot and hourly
  *      (`CREWHAUS_JANITOR=0` / `CREWHAUS_JANITOR_INTERVAL_MS` to tune).
+ *   7. Builds the pending-approval store (G11) so a tool that resolves to
+ *      `ask` PARKS for an out-of-band grant instead of collapsing to a deny
+ *      on this surface, which has nobody to prompt.
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
@@ -137,6 +140,33 @@ function renderPermissionsField(ir: IrBatchV0): string {
     );
   }
   return `\n${lines.join("\n")}`;
+}
+
+/**
+ * Loop contract 0.4 (G11) — the `askMode` + `approvals` fields. Unlike the
+ * CLI's `approvalRunOptions`, a bundle parses no `--ask-mode`, so the spec
+ * value is FIXED here at emit time. The store is built UNCONDITIONALLY,
+ * including under `"deny"` where it never parks, so runtime-core's denial
+ * diagnostic can honestly say `ask_mode: "deny"` instead of blaming absent
+ * plumbing (it branches on `approvals === undefined`).
+ *
+ * Deliberately SEPARATE from renderPermissionsField, which early-returns ""
+ * when the spec declares no `permissions:` block — precisely the case where
+ * parking matters most, since with no block every unmatched tool resolves to
+ * `ask`.
+ *
+ * CAVEAT unique to this shape: a park throws `RunFailedError`
+ * (`approval_pending`) out of the queue handler, so the queue-consumer sees a
+ * failed job and retries it per SPEC_MAX_RETRIES — the job can dead-letter
+ * before a human ever grants. The store keys on (toolName, inputHash), so a
+ * later re-delivery DOES find the grant and re-resolves pre-decided, but only
+ * while the retry budget lasts.
+ */
+function renderApprovalFields(ir: IrBatchV0, indent: string): string {
+  return (
+    `\n${indent}askMode: ${escapeJsonString(ir.permissions.askMode ?? "pause")},` +
+    `\n${indent}approvals: { store: __approvals, surface: "batch" },`
+  );
 }
 
 /**
@@ -562,6 +592,7 @@ import { startConsumer } from "@crewhaus/queue-consumer";
 import { createInMemoryIdempotencyStore } from "@crewhaus/idempotency-keys";
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createJanitor, runChatLoop } from "@crewhaus/runtime-core";
+import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { defaultCatalog } from "@crewhaus/tool-catalog";
 ${permImport}${hooksImport}${scheduleImport}${mcpImportBlock}${importBlock}
@@ -617,7 +648,19 @@ async function main(): Promise<void> {
     janitor.start(Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000));
   }
 
-${mcpBoot}  const queue = buildQueue();
+${mcpBoot}  // G11 — a compiled bundle is NON-INTERACTIVE: a tool that lands on \`ask\`
+  // has nobody to prompt, so without this it collapsed to a deny. Rooted
+  // where the run's session files land, so parks live beside them (and
+  // inside a tenant's rebased root when one is active). No I/O until a park.
+  // A park fails the job, so it is retried per SPEC_MAX_RETRIES — an
+  // out-of-band grant lands on the same (toolName, inputHash) key and the
+  // next delivery within that budget proceeds.
+  const __approvalRoot = resolveSessionRootDir(undefined);
+  const __approvals = createPendingApprovalStore(
+    __approvalRoot !== undefined ? { rootDir: __approvalRoot } : {},
+  );
+
+  const queue = buildQueue();
   // Idempotency window (SPEC_IDEMPOTENCY_WINDOW_MS): caches each job's
   // SUCCESSFUL result under its job id for the window, so a job that is
   // re-delivered after already completing (a lost ack, a crash between
@@ -643,7 +686,7 @@ ${mcpBoot}  const queue = buildQueue();
         seedMessages: [{ role: "user", content: input }],
         tools: defaultCatalog.list(),
         installSigintHandler: false,
-        maxTokens: ${ir.agent.maxTokens ?? 1024},${budgetField(ir, "        ")}${limitsFields(ir, "        ")}${hooksField}${permField}
+        maxTokens: ${ir.agent.maxTokens ?? 1024},${budgetField(ir, "        ")}${limitsFields(ir, "        ")}${hooksField}${permField}${renderApprovalFields(ir, "        ")}
       });
       return reply.trim();
     },

@@ -9,10 +9,20 @@ import { formatRunFailure, toFailureReport } from "@crewhaus/errors";
 import { decompose, type Plan } from "@crewhaus/planner";
 import { writeReport, type BranchAnswer } from "@crewhaus/report-writer";
 import { runChatLoop } from "@crewhaus/runtime-core";
+import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";
 import { defaultCatalog } from "@crewhaus/tool-catalog";
 
+
+// G11 — a compiled bundle is NON-INTERACTIVE: a tool that lands on `ask`
+// has nobody to prompt, so without this it collapsed to a deny. Rooted
+// where the run's session files land, so parks live beside them (and
+// inside a tenant's rebased root when one is active). No I/O until a park.
+const __approvalRoot = resolveSessionRootDir(undefined);
+const __approvals = createPendingApprovalStore(
+  __approvalRoot !== undefined ? { rootDir: __approvalRoot } : {},
+);
 
 type ResearchState = {
   readonly version: 1;
@@ -156,6 +166,8 @@ async function runOneBranch(args: {
           hooks: [],
           builtin: BUILTIN_DEFAULT_RULES,
         },
+    askMode: "pause",
+    approvals: { store: __approvals, surface: "research" },
   });
 
   // Citations recorded for this branch are append-only, so:

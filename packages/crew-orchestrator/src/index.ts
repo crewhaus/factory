@@ -176,6 +176,22 @@ export type RunOptions = {
   /** v0.3.0 PR 11 — skills advertised in every role's system prompt (the
    *  caller registers the matching Skill tool via `extraTools`). */
   readonly skills?: RunChatLoopOptions["skills"];
+  /**
+   * Loop contract 0.4 (Batch C, G11) — how a tool permission that resolves to
+   * `ask` behaves on a role turn. Crew turns are single-turn by construction,
+   * so there is never a stdin prompter: `"pause"` parks the run against
+   * `approvals` below, `"deny"` keeps the pre-0.4 collapse-in-place. Left
+   * undefined the runtime applies its own `"pause"` default — which still only
+   * parks once a store is wired (it requires BOTH).
+   */
+  readonly askMode?: "pause" | "deny";
+  /**
+   * Loop contract 0.4 (Batch C, G11) — the pending-approval seam, threaded
+   * verbatim into every role's runChatLoop. Crew-wide on purpose: one store
+   * across all roles means an out-of-band grant resolves the park no matter
+   * which role (or which role's A2A peer) raised the ask.
+   */
+  readonly approvals?: RunChatLoopOptions["approvals"];
   /** Cap on consecutive handoffs before HandoffRefusedError fires. Default 2. */
   readonly refusalDepth?: number;
   /** Cap on the total number of role activations. Default 16 — keeps runaway crews bounded. */
@@ -544,6 +560,12 @@ async function* driveCrew(
           ...(args.opts.memory !== undefined ? { memory: args.opts.memory } : {}),
           ...(args.opts.continuity !== undefined ? { continuity: args.opts.continuity } : {}),
           ...(args.opts.skills !== undefined ? { skills: args.opts.skills } : {}),
+          // Loop contract 0.4 (Batch C, G11) — a peer turn is as headless as a
+          // primary activation, so it gets the same ask disposition + park
+          // store. Omitting them here would let a tool the crew would have
+          // parked for be silently denied just because a peer asked for it.
+          ...(args.opts.askMode !== undefined ? { askMode: args.opts.askMode } : {}),
+          ...(args.opts.approvals !== undefined ? { approvals: args.opts.approvals } : {}),
           // Loop contract 0.4 (Batch A) — run-level ceilings + the peer
           // role's own selectors, identical to a primary activation; the
           // cast is composeLoopTuning's documented forward-compat seam.
@@ -625,6 +647,13 @@ async function* driveCrew(
           ...(args.opts.memory !== undefined ? { memory: args.opts.memory } : {}),
           ...(args.opts.continuity !== undefined ? { continuity: args.opts.continuity } : {}),
           ...(args.opts.skills !== undefined ? { skills: args.opts.skills } : {}),
+          // Loop contract 0.4 (Batch C, G11) — headless ask disposition + the
+          // park store, crew-wide. Kept out of composeLoopTuning: that
+          // fragment mixes RUN-level ceilings with per-ROLE selectors, and
+          // these two are neither — they are a run-wide policy every role
+          // shares verbatim.
+          ...(args.opts.askMode !== undefined ? { askMode: args.opts.askMode } : {}),
+          ...(args.opts.approvals !== undefined ? { approvals: args.opts.approvals } : {}),
           // Loop contract 0.4 (Batch A) — run-level ceilings (limits/budget/
           // hooks/spawner) + this role's selectors (thinking/subAgents); the
           // cast is composeLoopTuning's documented forward-compat seam.

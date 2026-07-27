@@ -226,6 +226,81 @@ describe("emitWorkflow", () => {
   });
 });
 
+describe("emitWorkflow — ask_mode + approvals (loop contract 0.4, G11)", () => {
+  test("every step call carries askMode + the shared approval store", () => {
+    const c = emitWorkflow(TWO_STEP_IR).files[0]?.content ?? "";
+    expect((c.match(/askMode: "pause",/g) ?? []).length).toBe(2);
+    expect(
+      (c.match(/approvals: \{ store: __approvals, surface: "workflow-step" \},/g) ?? []).length,
+    ).toBe(2);
+  });
+
+  test("the store is booted once at module scope, from the session root", () => {
+    const c = emitWorkflow(TWO_STEP_IR).files[0]?.content ?? "";
+    expect(c).toContain(
+      'import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";',
+    );
+    expect(c).toContain("const __approvalRoot = resolveSessionRootDir(undefined);");
+    expect((c.match(/const __approvals = createPendingApprovalStore\(/g) ?? []).length).toBe(1);
+    // Module scope, not inside main() — the parks outlive one step's call.
+    expect(c.indexOf("const __approvals =")).toBeLessThan(c.indexOf("async function main("));
+  });
+
+  test("the fields survive a spec with NO permissions block (the case that needs them most)", () => {
+    // No `mode`, no `rules` — renderPermissionsFields early-returns "", so
+    // every unmatched tool resolves to `ask`. Parking must still be wired.
+    const c = emitWorkflow(TWO_STEP_IR).files[0]?.content ?? "";
+    expect(c).not.toContain("permissionMode");
+    expect(c).toContain("askMode:");
+    expect(c).toContain("approvals: { store: __approvals");
+  });
+
+  test('ask_mode: deny emits askMode: "deny" — and STILL builds the store', () => {
+    const ir: IrWorkflowV0 = {
+      ...TWO_STEP_IR,
+      permissions: { ...TWO_STEP_IR.permissions, askMode: "deny" },
+    };
+    const c = emitWorkflow(ir).files[0]?.content ?? "";
+    expect((c.match(/askMode: "deny",/g) ?? []).length).toBe(2);
+    expect(c).not.toContain('askMode: "pause"');
+    // Unconditional by design: runtime-core's diagnostic branches on
+    // `approvals === undefined`, so handing it the store lets it report the
+    // deny as the DECLARED choice rather than as missing plumbing.
+    expect(c).toContain('approvals: { store: __approvals, surface: "workflow-step" },');
+  });
+
+  test("a judge-gated step's re-invocable closure carries them too", () => {
+    const ir: IrWorkflowV0 = {
+      ...TWO_STEP_IR,
+      steps: [
+        TWO_STEP_IR.steps[0] as IrWorkflowV0["steps"][number],
+        {
+          name: "gate",
+          instructions: "score it",
+          model: "claude-sonnet-4-6",
+          tools: [],
+          toolConfigs: {},
+          kind: "judge",
+          judge: { criteria: "is it good?", threshold: 0.5, onFail: "halt", maxRetries: 0 },
+        },
+      ],
+    };
+    const c = emitWorkflow(ir).files[0]?.content ?? "";
+    // Only the gated step calls runChatLoop (the judge scores via __judgeGate).
+    expect(c).toContain("const __runStep1 = async (__nudge: string)");
+    expect((c.match(/askMode: "pause",/g) ?? []).length).toBe(1);
+    expect(
+      (c.match(/approvals: \{ store: __approvals, surface: "workflow-step" \},/g) ?? []).length,
+    ).toBe(1);
+  });
+
+  test("the approval plumbing keeps the emission syntactically valid TypeScript", () => {
+    const c = emitWorkflow(TWO_STEP_IR).files[0]?.content ?? "";
+    const t = new Bun.Transpiler({ loader: "ts" });
+    expect(() => t.transformSync(c.replace(/^#!.*\n/, ""))).not.toThrow();
+  });
+});
+
 describe("emitWorkflow — failureTaxonomy field (item 23)", () => {
   test("threads failureTaxonomy into every step's runChatLoop call", () => {
     const ir: IrWorkflowV0 = {

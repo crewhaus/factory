@@ -344,6 +344,58 @@ describe("emitBatchWorker — loop contract 0.4 threading (Batch A)", () => {
   });
 });
 
+/**
+ * G11 — ask_mode was inert in every compiled bundle: no emitter passed
+ * `askMode`/`approvals`, and runtime-core only parks when BOTH are present,
+ * so a headless `ask` collapsed to a denial. The store is emitted
+ * UNCONDITIONALLY (a spec with no `permissions:` block is exactly the case
+ * where every unmatched tool resolves to `ask`).
+ */
+describe("emitBatchWorker — ask_mode parking (G11)", () => {
+  test("the per-job runChatLoop carries askMode + approvals, defaulting to pause", () => {
+    const c = emitBatchWorker(baseIr).files[0]?.content ?? "";
+    expect(c).toContain('askMode: "pause",');
+    expect(c).toContain('approvals: { store: __approvals, surface: "batch" },');
+  });
+
+  test("ask_mode: deny emits the deny value but still wires the store", () => {
+    const ir: IrBatchV0 = { ...baseIr, permissions: { rules: [], askMode: "deny" } };
+    const c = emitBatchWorker(ir).files[0]?.content ?? "";
+    expect(c).toContain('askMode: "deny",');
+    // Still wired: runtime-core's denial note branches on `approvals ===
+    // undefined`, so the store is what lets it blame ask_mode honestly
+    // instead of missing plumbing.
+    expect(c).toContain('approvals: { store: __approvals, surface: "batch" },');
+  });
+
+  test("the store boots in main() before the consumer that closes over it", () => {
+    const c = emitBatchWorker(baseIr).files[0]?.content ?? "";
+    expect(c).toContain(
+      'import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";',
+    );
+    expect(c).toContain("const __approvalRoot = resolveSessionRootDir(undefined);");
+    expect(c).toContain("const __approvals = createPendingApprovalStore(");
+    expect(c.indexOf("const __approvals = createPendingApprovalStore(")).toBeLessThan(
+      c.indexOf("const queue = buildQueue();"),
+    );
+  });
+
+  test("a spec with NO permissions block still parks (the case that needs it most)", () => {
+    // baseIr declares `permissions: { rules: [] }` — renderPermissionsField
+    // early-returns "" for it, so folding the approval fields in there would
+    // have left this bundle unparked.
+    const c = emitBatchWorker(baseIr).files[0]?.content ?? "";
+    expect(c).not.toContain("permissionMode:");
+    expect(c).toContain('askMode: "pause",');
+  });
+
+  test("Bun.Transpiler parses the emitted approval plumbing", () => {
+    const t = new Bun.Transpiler({ loader: "ts" });
+    const code = emitBatchWorker(baseIr, { readme: false }).files[0]?.content ?? "";
+    expect(() => t.transformSync(code)).not.toThrow();
+  });
+});
+
 describe("emitBatchWorker — failureTaxonomy field (item 23)", () => {
   test("threads failureTaxonomy into the per-job runChatLoop call", () => {
     const ir: IrBatchV0 = {

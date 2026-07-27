@@ -480,3 +480,49 @@ describe("emitCrew — limits / budget / hooks (loop contract 0.4)", () => {
     expect(bare).not.toContain("maxActivations:");
   });
 });
+
+describe("emitCrew — headless ask parking (loop contract 0.4, G11)", () => {
+  const daemonOf = (ir: IrCrewV0): string =>
+    emitCrew(ir).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+
+  test("daemon builds the park store and threads askMode + approvals into crew.run", () => {
+    // `minimalIr` declares NO mode and NO rules, so renderPermissionsField
+    // emits nothing at all — the bundle where every unmatched tool resolves to
+    // `ask` and parking matters most. The approval fields must survive that.
+    const daemon = daemonOf(minimalIr);
+    expect(daemon).not.toContain("permissionMode");
+    expect(daemon).toContain(
+      'import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";',
+    );
+    expect(daemon).toContain("const __approvalRoot = resolveSessionRootDir(undefined);");
+    expect(daemon).toContain("const __approvals = createPendingApprovalStore(");
+    expect(daemon).toContain('askMode: "pause",');
+    expect(daemon).toContain('approvals: { store: __approvals, surface: "crew" },');
+  });
+
+  test("ask_mode: deny is fixed at emit time — and still gets the store", () => {
+    const daemon = daemonOf({
+      ...minimalIr,
+      permissions: { ...minimalIr.permissions, askMode: "deny" },
+    });
+    expect(daemon).toContain('askMode: "deny",');
+    // The store rides along under deny too: runtime-core branches its denial
+    // wording on `approvals === undefined`, so withholding it would make a
+    // deliberate operator choice read as missing plumbing.
+    expect(daemon).toContain('approvals: { store: __approvals, surface: "crew" },');
+  });
+
+  test("eval-entry carries the same fields, rooted at the caller's sample dir", () => {
+    const evalEntry =
+      emitCrew(minimalIr, { evalEntry: true }).files.find((f) => f.path === "eval-entry.ts")
+        ?.content ?? "";
+    expect(evalEntry).toContain('askMode: "pause",');
+    expect(evalEntry).toContain('approvals: { store: __approvals, surface: "crew" },');
+    // A parked record embeds the raw tool input, so it must land in the
+    // sample's own directory — not the operator's working tree (the same
+    // per-sample isolation the memory fabric keeps in this file).
+    expect(evalEntry).toContain(
+      "const __approvalRoot = resolveSessionRootDir(__evalOpts.sessionRootDir);",
+    );
+  });
+});

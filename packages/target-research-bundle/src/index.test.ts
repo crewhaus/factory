@@ -258,6 +258,45 @@ describe("emitResearchBundle — loop contract 0.4 threading (Batch A)", () => {
   });
 });
 
+describe("emitResearchBundle — ask_mode / pending approvals (G11)", () => {
+  test("every branch loop carries askMode + the approval store (default pause)", () => {
+    const c = emitResearchBundle(baseIr).files[0]?.content ?? "";
+    expect(c).toContain(
+      'import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";',
+    );
+    expect(c).toContain("const __approvalRoot = resolveSessionRootDir(undefined);");
+    expect(c).toContain("const __approvals = createPendingApprovalStore(");
+    expect(c).toContain('askMode: "pause",');
+    expect(c).toContain('approvals: { store: __approvals, surface: "research" },');
+    // Module-level boot — one store shared by every branch, built before
+    // runOneBranch can reference it.
+    expect(c.indexOf("const __approvals = ")).toBeLessThan(
+      c.indexOf("async function runOneBranch"),
+    );
+  });
+
+  test("ask_mode: deny emits the deny value but still wires the store", () => {
+    const ir: IrResearchV0 = {
+      ...baseIr,
+      permissions: { ...baseIr.permissions, askMode: "deny" },
+    };
+    const c = emitResearchBundle(ir).files[0]?.content ?? "";
+    expect(c).toContain('askMode: "deny",');
+    expect(c).not.toContain('askMode: "pause",');
+    // Unconditional on purpose: runtime-core's diagnostic branches on
+    // `approvals === undefined`, so the store must be present for it to
+    // report the mode rather than missing plumbing.
+    expect(c).toContain('approvals: { store: __approvals, surface: "research" },');
+  });
+
+  test("a spec with NO permissions rules still parks — that is where ask is most reachable", () => {
+    const ir: IrResearchV0 = { ...baseIr, permissions: { rules: [] } };
+    const c = emitResearchBundle(ir).files[0]?.content ?? "";
+    expect(c).toContain('askMode: "pause",');
+    expect(c).toContain("approvals: { store: __approvals");
+  });
+});
+
 describe("emitResearchBundle — terminal-failure reporting (0.3.0 Goal 6)", () => {
   test("main().catch renders the structured report and exits with the coded status", () => {
     const content = emitResearchBundle(baseIr).files[0]?.content ?? "";

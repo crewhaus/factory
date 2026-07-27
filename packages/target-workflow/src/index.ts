@@ -191,6 +191,11 @@ function gatedStepIndex(steps: readonly IrWorkflowStep[], judgeIdx: number): num
  */
 type StepShared = {
   readonly permFields: string;
+  /** G11 — `askMode` + the module-scope `__approvals` store. Separate from
+   *  `permFields` because it is UNCONDITIONAL: a spec with no `permissions:`
+   *  block resolves every unmatched tool to `ask`, so that is precisely the
+   *  bundle that needs somewhere to park. */
+  readonly approvalFields: string;
   readonly failureTaxonomyField: string;
   readonly limitsFields: string;
   readonly budgetField: string;
@@ -259,7 +264,7 @@ ${deadlineGuard}${stdinReadLine}  process.stdout.write("\\n[step ${stepNum}/${to
     model: ${escapeJsonString(step.model)},
     instructions: ${escapeJsonString(step.instructions)},
     singleTurn: true,
-    seedMessages: [{ role: "user", content: ${userContent} }],${toolsField}${stepTuningFields}${modelFailoverFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.failureTaxonomyField}
+    seedMessages: [{ role: "user", content: ${userContent} }],${toolsField}${stepTuningFields}${modelFailoverFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}
     hooks: ${shared.hooksExpr},
     skills: __skills,
     slashCommands: __slashCommands,${shared.runContextLine}${shared.evalFields}
@@ -313,7 +318,7 @@ ${deadlineGuard}${stdinReadLine}  process.stdout.write(${escapeJsonString(`\n[st
     model: ${escapeJsonString(step.model)},
     instructions: ${escapeJsonString(step.instructions)} + __nudge,
     singleTurn: true,
-    seedMessages: [{ role: "user", content: __step${stepNum}Input }],${toolsField}${stepTuningFields}${modelFailoverFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.failureTaxonomyField}
+    seedMessages: [{ role: "user", content: __step${stepNum}Input }],${toolsField}${stepTuningFields}${modelFailoverFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}
     hooks: ${shared.hooksExpr},
     skills: __skills,
     slashCommands: __slashCommands,${shared.runContextLine}${shared.evalFields}
@@ -759,6 +764,44 @@ function renderPermissionsFields(ir: IrWorkflowV0): string {
   return `\n${lines.join("\n")}`;
 }
 
+/**
+ * Loop contract 0.4 (Batch C, G11) — the `askMode` + `approvals` fields.
+ * Unlike the CLI's approvalRunOptions, a bundle parses no `--ask-mode`, so
+ * the spec value is FIXED here at emit time.
+ *
+ * Deliberately NOT folded into {@link renderPermissionsFields}: that renderer
+ * early-returns "" when the spec declares no `permissions:` block — which is
+ * exactly the case where parking matters MOST, because with no block every
+ * unmatched tool resolves to `ask`. So this one is unconditional, including
+ * under `"deny"` where it never parks: runtime-core branches its diagnostic on
+ * `approvals === undefined`, and handing it the store lets it honestly report
+ * `ask_mode: "deny"` instead of blaming absent plumbing.
+ */
+function renderApprovalFields(ir: IrWorkflowV0, indent: string): string {
+  return (
+    `\n${indent}askMode: ${escapeJsonString(ir.permissions.askMode ?? "pause")},` +
+    `\n${indent}approvals: { store: __approvals, surface: "workflow-step" },`
+  );
+}
+
+/**
+ * G11 — module-scope approval store, emitted unconditionally. A compiled
+ * bundle is NON-INTERACTIVE, so an `ask` has nobody to prompt; without a store
+ * it collapsed to a deny. Rooted where the run's session files land, so parks
+ * live beside them (and inside a tenant's rebased root when one is active).
+ * Constructing it does no I/O — the first write happens at a park.
+ */
+const APPROVAL_STORE_BOOT = `
+// G11 — a compiled bundle is NON-INTERACTIVE: a tool that lands on \`ask\`
+// has nobody to prompt, so without this it collapsed to a deny. Rooted
+// where the run's session files land, so parks live beside them (and
+// inside a tenant's rebased root when one is active). No I/O until a park.
+const __approvalRoot = resolveSessionRootDir(undefined);
+const __approvals = createPendingApprovalStore(
+  __approvalRoot !== undefined ? { rootDir: __approvalRoot } : {},
+);
+`;
+
 /** Indent every non-empty line by one extra level (the MCP try wrapper). */
 function indentStepBodies(stepBodies: string): string {
   return stepBodies
@@ -835,6 +878,7 @@ function renderAgent(ir: IrWorkflowV0, evalEntry = false): string {
     ? `import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";\n`
     : "";
   const permFields = renderPermissionsFields(ir);
+  const approvalFields = renderApprovalFields(ir, "    ");
   const failureTaxonomyField = renderFailureTaxonomyField(ir);
   const limitsFields = renderLimitsFields(ir);
   const budgetField = renderBudgetField(ir);
@@ -867,6 +911,7 @@ function renderAgent(ir: IrWorkflowV0, evalEntry = false): string {
   const durable = ir.steps.length > 1 && hasPlainStep;
   const shared: StepShared = {
     permFields,
+    approvalFields,
     failureTaxonomyField,
     limitsFields,
     budgetField,
@@ -1087,7 +1132,8 @@ ${runBody}}`;
 // Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: workflow, ir version: ${ir.version}, ${ir.steps.length} step(s))
 ${mcp.note}${continuityWarning}import { runChatLoop } from "@crewhaus/runtime-core";
-${judgeImports}${evalEntryImports}${permImport}${durableImport}${extensionImports}${importBlock}${mcpImportBlock}
+import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
+${judgeImports}${evalEntryImports}${permImport}${durableImport}${extensionImports}${importBlock}${mcpImportBlock}${APPROVAL_STORE_BOOT}
 async function readStdinToEnd(): Promise<string> {
   // No piped input — don't block waiting on an interactive TTY.
   if (process.stdin.isTTY) return "";
