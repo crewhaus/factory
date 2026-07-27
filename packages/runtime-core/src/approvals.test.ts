@@ -23,8 +23,10 @@ import { DEFAULT_PRICING, computeCostMicros, resolvePricing } from "@crewhaus/co
 import { RunFailedError } from "@crewhaus/errors";
 import { createRunContext } from "@crewhaus/run-context";
 import {
+  type PendingApproval,
   type PendingApprovalStore,
   createPendingApprovalStore,
+  generateApprovalId,
   hashApprovalInput,
 } from "@crewhaus/session-store";
 import { buildTool } from "@crewhaus/tool-builder";
@@ -543,5 +545,63 @@ describe("Item 7 — per-tool cost attribution on tool_use records", () => {
     const toolUse = logged.find((l) => l.kind === "tool_use");
     expect(toolUse).toBeDefined();
     expect(toolUse?.payload?.["attributedCostUsdMicros"]).toBeUndefined();
+  });
+});
+
+/**
+ * G11 retention — a run's boot housekeeping sweeps the approvals log beside
+ * its sessions, exactly as it already sweeps expired sessions.
+ *
+ * Nothing else prunes this file unattended: only `list()` compacts it, and
+ * `list()`'s only production callers are the human-invoked `crewhaus
+ * approvals` verbs. Every record embeds the raw tool input of a call some
+ * policy deemed sensitive enough to require a human, so an unswept log is
+ * both unbounded and a stale-secret store that `crewhaus retention purge`
+ * cannot reach.
+ */
+describe("G11 — boot-time approvals retention", () => {
+  test("a run sweeps expired approvals from its own session root", async () => {
+    const sessionDir = mkdtempSync(join(root, "sweep-"));
+    const bootStore = createPendingApprovalStore({ rootDir: sessionDir });
+    const stale: PendingApproval = {
+      id: generateApprovalId(),
+      toolName: "bash",
+      inputHash: hashApprovalInput("bash", { cmd: "curl -H 'Authorization: Bearer sk-live'" }),
+      input: { cmd: "curl -H 'Authorization: Bearer sk-live'" },
+      runId: "run_00000000",
+      sessionId: "sess_00000000000000ff",
+      surface: "single-turn",
+      createdAt: new Date(Date.now() - 90 * 86_400_000).toISOString(),
+    };
+    await bootStore.persist(stale);
+    expect(await bootStore.get(stale.toolName, stale.inputHash)).toBeNull(); // TTL hides it…
+    expect(readFileSync(join(sessionDir, "approvals.jsonl"), "utf-8")).toContain(stale.id); // …but disk still has it
+
+    // Any run rooted here sweeps it at boot.
+    await runChatLoop({
+      model: "test-model",
+      instructions: "x",
+      runContext: createRunContext(),
+      sessionRootDir: sessionDir,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      _adapter: scriptedAdapter([[text("done")]]).adapter,
+    });
+
+    expect(readFileSync(join(sessionDir, "approvals.jsonl"), "utf-8")).not.toContain(stale.id);
+  });
+
+  test("a run against a root with no approvals log does not fail", async () => {
+    const sessionDir = mkdtempSync(join(root, "nolog-"));
+    const out = await runChatLoop({
+      model: "test-model",
+      instructions: "x",
+      runContext: createRunContext(),
+      sessionRootDir: sessionDir,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      _adapter: scriptedAdapter([[text("fine")]]).adapter,
+    });
+    expect(out).toBe("fine");
   });
 });

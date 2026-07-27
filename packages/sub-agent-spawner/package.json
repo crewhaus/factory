@@ -29,6 +29,7 @@
     "@crewhaus/gateway-server": "workspace:*",
     "@crewhaus/memory-service": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/session-store": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "@crewhaus/tool-task": "workspace:*",

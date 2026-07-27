@@ -74,6 +74,14 @@ jobs:
           # Make the runtime tests fail (not skip) if the secret somehow
           # isn't set when this job runs.
           CREWHAUS_RUNTIME_SMOKE_REQUIRED: "1"
+          # The browser shape is a HARD gate again. It was advisory because it
+          # could not pass: its fixture page is on loopback, which the SSRF
+          # floor refused with no way for a spec to opt in. The fixture now
+          # declares `driver.allowPrivateTargets: true` and the shape passes,
+          # so the advisory (which reported green for weeks while the shape
+          # covered nothing) is no longer load-bearing and must not be relied
+          # on again.
+          CREWHAUS_RUNTIME_SMOKE_BROWSER: "1"
           # Budget cap for the unattended nightly: pin the cheapest capable
           # model (the harness forwards this as `crewhaus run --model`).
           # Empty string = unset, so dispatch and release-gate runs exercise

@@ -1977,6 +1977,51 @@ agent:
     expect(ir.groundingModel).toBe("only-model");
     expect("startUrl" in ir.driver).toBe(false);
   });
+
+  // SECURITY — `driver.allowPrivateTargets` waives the Navigate pre-goto
+  // guard's private-host checks AND the chromium DNS-pinning proxy. It must be
+  // opt-in, and absent from both the IR and the emitted bundle unless the spec
+  // asks for it, or an ordinary browser bundle silently changes shape.
+  test("allowPrivateTargets defaults off and is absent from the IR and the bundle", () => {
+    const spec = `
+name: br3
+target: browser
+agent:
+  model: m
+  instructions: i
+driver:
+  backend: chromium
+`;
+    const ir = lower(parseSpec(spec));
+    if (ir.target !== "browser") throw new Error("unexpected target");
+    expect("allowPrivateTargets" in ir.driver).toBe(false);
+    const code = compile(spec).files.find((f) => f.path === "agent.ts")?.content;
+    expect(code).toBeDefined();
+    expect(code).not.toContain("ssrfProxy");
+    expect(code).not.toContain("allowPrivateTargets");
+  });
+
+  test("allowPrivateTargets: true reaches the IR and waives BOTH layers in the bundle", () => {
+    const spec = `
+name: br4
+target: browser
+agent:
+  model: m
+  instructions: i
+driver:
+  backend: chromium
+  allowPrivateTargets: true
+`;
+    const ir = lower(parseSpec(spec));
+    if (ir.target !== "browser") throw new Error("unexpected target");
+    expect(ir.driver.allowPrivateTargets).toBe(true);
+    const code = compile(spec).files.find((f) => f.path === "agent.ts")?.content;
+    // Both halves, or the relaxation is worse than none: with only the guard
+    // waived, the DNS-pinning proxy still answers loopback with a 403 body
+    // that RENDERS, so the agent screenshots a block page rather than failing.
+    expect(code).toContain("ssrfProxy: false");
+    expect(code).toContain("allowPrivateTargets: true");
+  });
 });
 
 describe("lower/compile — eval target (Section 29)", () => {
