@@ -1946,6 +1946,14 @@ export type IrBrowserV0 = {
     };
     /** Optional initial URL; daemon calls driver.goto() before runChatLoop. */
     readonly startUrl?: string;
+    /**
+     * SECURITY — the spec opted in to private/loopback navigation targets
+     * (`driver.allowPrivateTargets: true`). Relaxes BOTH the Navigate
+     * pre-goto guard and the chromium DNS-pinning proxy for this harness,
+     * never the http/https scheme allowlist. Carried only when true, so a
+     * bundle that leaves it at the default stays byte-identical.
+     */
+    readonly allowPrivateTargets?: boolean;
   };
   /** Vision-grounding model. Defaults at lower-time to agent.model. */
   readonly groundingModel: string;

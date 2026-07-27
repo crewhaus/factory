@@ -2825,6 +2825,9 @@ export function lower(spec: Spec): IrNode {
           backend: spec.driver.backend,
           viewport: { width: spec.driver.viewport.width, height: spec.driver.viewport.height },
           ...(spec.driver.startUrl !== undefined ? { startUrl: spec.driver.startUrl } : {}),
+          // SECURITY — carried ONLY when the spec opts in, so every bundle
+          // that leaves it at the default stays byte-identical to 0.4.1.
+          ...(spec.driver.allowPrivateTargets ? { allowPrivateTargets: true } : {}),
         },
         groundingModel: spec.groundingModel ?? spec.agent.model,
         tools: spec.tools ?? [],

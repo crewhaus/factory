@@ -174,7 +174,10 @@ function isPrivateIp(addr: string): boolean {
  * elsewhere, so for that backend this pre-goto guard is still the only
  * navigate-side control; pin egress at the remote browser's host.
  */
-export async function assertSafeNavigationTarget(rawUrl: string): Promise<void> {
+export async function assertSafeNavigationTarget(
+  rawUrl: string,
+  opts: { readonly allowPrivateTargets?: boolean } = {},
+): Promise<void> {
   let url: URL;
   try {
     url = new URL(rawUrl);
@@ -186,6 +189,7 @@ export async function assertSafeNavigationTarget(rawUrl: string): Promise<void> 
       `navigation to ${rawUrl} blocked: only http/https is allowed (got "${url.protocol}")`,
     );
   }
+  if (opts.allowPrivateTargets === true) return;
   const hostname = url.hostname.toLowerCase();
   if (hostname === "localhost" || hostname.endsWith(".localhost")) {
     throw new NavigateError(`navigation to ${rawUrl} blocked: loopback host`);
@@ -217,6 +221,20 @@ export async function assertSafeNavigationTarget(rawUrl: string): Promise<void> 
 
 export type CreateNavigateToolOptions = {
   readonly driver: Driver;
+  /**
+   * SECURITY — spec `driver.allowPrivateTargets: true`. Waives ONLY the
+   * private/loopback/mDNS host checks, for a harness whose whole job is a
+   * private target the operator controls: an intranet app under test, or a
+   * locally-served fixture page. The scheme allowlist is never waived, so an
+   * opted-in spec still cannot reach `file:`/`data:`/`chrome:`.
+   *
+   * Default false, and a per-spec compile-time decision — there is
+   * deliberately no env var or global switch, so it cannot be turned on by an
+   * ambient misconfiguration, and a reviewer sees it in the spec diff. The
+   * chromium backend drops its DNS-pinning proxy under the same flag, so the
+   * two layers agree instead of one silently 403ing what the other allowed.
+   */
+  readonly allowPrivateTargets?: boolean;
 };
 
 export function createNavigateTool(opts: CreateNavigateToolOptions): RegisteredTool {
@@ -233,7 +251,9 @@ export function createNavigateTool(opts: CreateNavigateToolOptions): RegisteredT
     execute: async (input): Promise<ToolResultContent> => {
       // SSRF guard runs BEFORE the browser touches the URL. Throws
       // NavigateError directly so the block reason surfaces unwrapped.
-      await assertSafeNavigationTarget(input.url);
+      await assertSafeNavigationTarget(input.url, {
+        allowPrivateTargets: opts.allowPrivateTargets === true,
+      });
       try {
         await opts.driver.goto(input.url);
       } catch (err) {
