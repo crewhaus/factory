@@ -98,6 +98,7 @@ import {
   type PendingApprovalStore,
   type SessionStore,
   createSessionStore,
+  evictExpiredApprovals,
   generateApprovalId,
   hashApprovalInput,
 } from "@crewhaus/session-store";
@@ -611,6 +612,7 @@ export {
   type PendingApprovalStore,
   type PendingApprovalStoreOptions,
   createPendingApprovalStore,
+  evictExpiredApprovals,
   generateApprovalId,
   hashApprovalInput,
 } from "@crewhaus/session-store";
@@ -2176,6 +2178,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Housekeeping side-effect: evicts any session whose mtime is older than
   // the TTL (default 30 days). The returned list is intentionally discarded.
   await sessionStore.list();
+  // Loop contract 0.4 (G11) — the same sweep for the approvals log sitting
+  // beside those sessions. It has no other unattended pruner: only `list()`
+  // compacts it, and `list()`'s only production callers are the human-invoked
+  // `crewhaus approvals` verbs — so on a daemon or a cron'd run the file grew
+  // forever, carrying the raw tool input of every park.
+  //
+  // Deliberately NOT routed through `opts.approvals.store`: that option is
+  // narrowed to `persist | get | resolve` so callers can inject minimal twins,
+  // and widening the Pick would break them. Unconditional (not gated on
+  // `opts.approvals`) so a harness that has since switched to `ask_mode: deny`
+  // still gets its old parks pruned; it costs one ENOENT when the file does
+  // not exist. Best-effort, exactly like the session sweep above.
+  await evictExpiredApprovals({
+    ...(sessionRootDir !== undefined ? { rootDir: sessionRootDir } : {}),
+  }).catch(() => undefined);
 
   // Adaptive model routing (spec `agent.model_pool`). Resolve every candidate
   // adapter ONCE at boot (mirroring the tier router), open the durable reward

@@ -13,6 +13,7 @@ import {
   DEFAULT_APPROVALS_FILENAME,
   type PendingApproval,
   createPendingApprovalStore,
+  evictExpiredApprovals,
   generateApprovalId,
   hashApprovalInput,
 } from "./index";
@@ -177,5 +178,71 @@ describe("createPendingApprovalStore", () => {
     appendFileSync(join(root, DEFAULT_APPROVALS_FILENAME), "not json\n");
     await store.resolve(p.id, "grant", "max");
     expect((await store.get(p.toolName, p.inputHash))?.decision).toBe("grant");
+  });
+});
+
+/**
+ * The approvals counterpart to `evictExpiredSessions`. Before it existed,
+ * `list()` was the only pruner and its only production callers were the
+ * human-invoked `crewhaus approvals` verbs — so an unattended harness never
+ * compacted this file at all, and every record embeds a raw tool input.
+ */
+describe("evictExpiredApprovals", () => {
+  const DAY = 86_400_000;
+
+  test("drops records past the TTL and rewrites the log without them", async () => {
+    const store = createPendingApprovalStore({ rootDir: root });
+    const old = pending({ createdAt: new Date(Date.now() - 40 * DAY).toISOString() });
+    const fresh = pending({ toolName: "bash", inputHash: hashApprovalInput("bash", { c: "ls" }) });
+    await store.persist(old);
+    await store.persist(fresh);
+
+    const { evictedIds } = await evictExpiredApprovals({ rootDir: root });
+    expect(evictedIds).toEqual([old.id]);
+
+    // Gone from DISK — the whole point. A TTL check that only filtered the
+    // return value (which `get` already does) leaves the input on the
+    // filesystem, which is what made this leak invisible.
+    const raw = readFileSync(join(root, DEFAULT_APPROVALS_FILENAME), "utf-8");
+    expect(raw).not.toContain(old.id);
+    expect(raw).toContain(fresh.id);
+  });
+
+  test("sweeps without any store instance, and tolerates a missing file", async () => {
+    // The unattended caller (runtime-core boot) holds no store, and may run
+    // against a root that has never parked anything.
+    await expect(evictExpiredApprovals({ rootDir: join(root, "nope") })).resolves.toEqual({
+      evictedIds: [],
+    });
+  });
+
+  test("a record with an unparseable createdAt is evicted, not immortal", async () => {
+    const store = createPendingApprovalStore({ rootDir: root });
+    await store.persist(pending({ createdAt: "sometime last tuesday" }));
+    const { evictedIds } = await evictExpiredApprovals({ rootDir: root });
+    expect(evictedIds).toHaveLength(1);
+    // The shape guard only demands a string, so a corrupted or hand-edited
+    // line would otherwise survive every compaction forever, still carrying
+    // its tool input.
+    expect(readFileSync(join(root, DEFAULT_APPROVALS_FILENAME), "utf-8").trim()).toBe("");
+  });
+
+  test("honours a custom ttlDays", async () => {
+    const store = createPendingApprovalStore({ rootDir: root });
+    const p = pending({ createdAt: new Date(Date.now() - 2 * DAY).toISOString() });
+    await store.persist(p);
+    expect((await evictExpiredApprovals({ rootDir: root, ttlDays: 30 })).evictedIds).toEqual([]);
+    expect((await evictExpiredApprovals({ rootDir: root, ttlDays: 1 })).evictedIds).toEqual([p.id]);
+  });
+
+  test("list() and the standalone sweep agree — they share one implementation", async () => {
+    const store = createPendingApprovalStore({ rootDir: root });
+    const old = pending({ createdAt: new Date(Date.now() - 40 * DAY).toISOString() });
+    await store.persist(old);
+    await store.persist(pending({ toolName: "b", inputHash: hashApprovalInput("b", {}) }));
+    // list() compacts as well, so the sweep afterwards finds nothing to do.
+    const listed = await store.list();
+    expect(listed.map((a) => a.id)).not.toContain(old.id);
+    expect((await evictExpiredApprovals({ rootDir: root })).evictedIds).toEqual([]);
   });
 });
