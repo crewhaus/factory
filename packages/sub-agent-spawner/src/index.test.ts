@@ -14,6 +14,7 @@ import { type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type RuleSet, emptyRuleSet } from "@crewhaus/permission-engine";
 import { type AgentIdentity, createRunContext } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
+import { createPendingApprovalStore } from "@crewhaus/session-store";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { createTaskTool } from "@crewhaus/tool-task";
@@ -745,6 +746,131 @@ describe("spawnSubAgent — §7.1 fatal child failures escalate as RunFailedErro
       expect(thrown.report.class).toBe("auth");
       const ends = await readEnds(parent, root);
       expect(ends[0]?.failureClass).toBe("auth");
+      await parentLog.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * Loop contract 0.4 (G11) — a child that PARKS.
+   *
+   * Two separate defects met here. The child loop never received the parent's
+   * `askMode`/`approvals`, so its headless `ask` collapsed to a denial no
+   * matter what the parent's spec asked for; and even once it CAN park, the
+   * escalation predicate listed only billing/auth, so the park dissolved into
+   * an `is_error` tool result. The parent then exited 0 with a PendingApproval
+   * sitting on disk, free to retry the Task and re-fire `approvals.notify` for
+   * a decision already pending.
+   *
+   * A park is not a failure — it is resumable, and the parent run is the only
+   * thing that can be resumed — so it must reach the parent as a classified
+   * `approval_pending` report, which is what every consumer keys on.
+   */
+  test("a child that parks escalates approval_pending and persists the approval", async () => {
+    const root = newTempRoot();
+    try {
+      const { parent, parentLog } = await makeParent(root);
+      const store = createPendingApprovalStore({ rootDir: root });
+      // A non-readOnly tool with no matching rule resolves to `ask` in
+      // `default` mode — precisely the case that used to deny in place.
+      const gated = buildTool({
+        name: "Danger",
+        description: "does something that needs a human",
+        inputSchema: z.object({ what: z.string() }),
+        readOnly: false,
+        destructive: true,
+        execute: async () => "should never run",
+      });
+      let thrown: unknown;
+      try {
+        await spawnSubAgent(
+          { ...parent, askMode: "pause", approvals: { store } },
+          {
+            def: DEF_NO_TOOLS,
+            prompt: "do the dangerous thing",
+            permissionMode: "default",
+            permissionRules: { ...emptyRuleSet },
+            childTools: [gated],
+            sessionRootDir: root,
+            _client: makeScriptedClient([
+              [
+                {
+                  type: "tool_use",
+                  id: "tu_1",
+                  name: "Danger",
+                  input: { what: "x" },
+                } as Anthropic.ContentBlock,
+              ],
+            ]),
+          },
+        );
+      } catch (err) {
+        thrown = err;
+      }
+
+      expect(isRunFailedError(thrown)).toBe(true);
+      if (!isRunFailedError(thrown)) throw new Error("unreachable");
+      expect(thrown.report.class).toBe("approval_pending");
+
+      // The park is real and addressable — `crewhaus approvals grant <id>`
+      // needs something to resolve.
+      const parked = await store.list();
+      expect(parked).toHaveLength(1);
+      expect(parked[0]?.toolName).toBe("Danger");
+      expect(parked[0]?.decision).toBeUndefined();
+
+      // Bracket integrity, same as the fatal classes above.
+      const ends = await readEnds(parent, root);
+      expect(ends[0]?.isError).toBe(true);
+      await parentLog.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the parent's ask_mode: deny keeps the child denying in place — no park, no escalation", async () => {
+    const root = newTempRoot();
+    try {
+      const { parent, parentLog } = await makeParent(root);
+      const store = createPendingApprovalStore({ rootDir: root });
+      const gated = buildTool({
+        name: "Danger",
+        description: "does something that needs a human",
+        inputSchema: z.object({ what: z.string() }),
+        readOnly: false,
+        destructive: true,
+        execute: async () => "should never run",
+      });
+      let thrown: unknown;
+      try {
+        await spawnSubAgent(
+          { ...parent, askMode: "deny", approvals: { store } },
+          {
+            def: DEF_NO_TOOLS,
+            prompt: "do the dangerous thing",
+            permissionMode: "default",
+            permissionRules: { ...emptyRuleSet },
+            childTools: [gated],
+            sessionRootDir: root,
+            _client: makeScriptedClient([
+              [
+                {
+                  type: "tool_use",
+                  id: "tu_1",
+                  name: "Danger",
+                  input: { what: "x" },
+                } as Anthropic.ContentBlock,
+              ],
+              [{ type: "text", text: "could not do it" } as Anthropic.ContentBlock],
+            ]),
+          },
+        );
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeUndefined();
+      expect(await store.list()).toHaveLength(0);
       await parentLog.close();
     } finally {
       rmSync(root, { recursive: true, force: true });
