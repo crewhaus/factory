@@ -3691,6 +3691,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       ...(skills.length > 0 ? { skills } : {}),
       ...(opts.failureTaxonomy !== undefined ? { failureTaxonomy: opts.failureTaxonomy } : {}),
       ...(bridgeContinuitySeam !== undefined ? { continuity: bridgeContinuitySeam } : {}),
+      // Loop contract 0.4 (G11) — the approval seam, so a Task child's
+      // headless `ask` parks against the SAME store the parent parks against
+      // instead of collapsing to a denial. `askMode` is spread only when the
+      // caller set it, so an unset parent leaves the child on this loop's own
+      // `"pause"` default — identical resolution, no double-defaulting.
+      ...(opts.askMode !== undefined ? { askMode: opts.askMode } : {}),
+      ...(opts.approvals !== undefined ? { approvals: opts.approvals } : {}),
     };
     // Spin "running <tool>…" for exactly the execution window — started after
     // every gate (permission/justification/egress) so it never overlaps the
