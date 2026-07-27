@@ -32,12 +32,16 @@
  *   - `runs resume --ask-mode`, which reaches runRunCli through synthesized
  *     args and would otherwise silently rot.
  *   - `serve --mcp`, whose daemon turn must park and REPORT rather than die.
+ *   - the BROWSER target, via a virtual `playwright` module (see
+ *     fake-playwright-preload.ts). That shape reaches its loop options only
+ *     after `driver.connect()`, so faking the browser is the only way to
+ *     observe the wiring without a real chromium — which the main `ci` job
+ *     never installs, so a skip-if-missing test would skip 100% of the time.
  *
- * Each of the above was mutation-checked: removing the corresponding
- * production hunk fails at least one case.
- *
- * KNOWN COVERAGE GAP: the browser target's threading is not exercised — that
- * shape needs a real chromium, which this suite deliberately does not require.
+ * Each of the above is mutation-checked: removing the corresponding production
+ * hunk fails at least one case. All three call sites are covered — an earlier
+ * revision could have had its browser AND serve spreads deleted with the whole
+ * 2882-test suite still green.
  *
  * NO live model calls: the spec's model is `local/<m>@<url>` (credential-free
  * through the OpenAI-compatible adapter) pointed at an in-test Bun.serve stub
@@ -50,7 +54,7 @@
  * BUILTIN_DEFAULT_RULES, so without the explicit `alwaysAsk` rule below the
  * tool simply executes and every one of these tests passes vacuously.
  */
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -80,8 +84,28 @@ function sseChunk(obj: unknown): string {
 }
 
 /**
- * One streamed assistant turn whose only content is a `Read` tool call, in
- * OpenAI chunk-stream wire format (id+name first, arguments as a later delta,
+ * Which tool the stub asks for. The cli cases want `Read`; the browser case
+ * wants `Navigate`, since a browser bundle registers no `Read` and an unknown
+ * tool never reaches the permission gate at all (it fails earlier, which would
+ * make the test vacuously green). Bun runs a file's tests sequentially, so a
+ * module-level switch is safe here.
+ */
+let stubToolCall: { name: string; args: string } = {
+  name: "Read",
+  args: '{"path":"secret.txt"}',
+};
+
+// Reset per test. The browser case switches this to `Navigate`, and a leaked
+// switch makes a LATER cli case ask for a tool its spec never registers —
+// which fails BEFORE the permission gate, so the case goes red for a reason
+// that has nothing to do with what it is testing.
+beforeEach(() => {
+  stubToolCall = { name: "Read", args: '{"path":"secret.txt"}' };
+});
+
+/**
+ * One streamed assistant turn whose only content is a tool call, in OpenAI
+ * chunk-stream wire format (id+name first, arguments as a later delta,
  * `finish_reason: "tool_calls"`), mirroring adapter-openai/src/stream.test.ts.
  */
 function toolCallSse(): string {
@@ -102,7 +126,7 @@ function toolCallSse(): string {
                 index: 0,
                 id: "call_1",
                 type: "function",
-                function: { name: "Read", arguments: "" },
+                function: { name: stubToolCall.name, arguments: "" },
               },
             ],
           },
@@ -116,7 +140,7 @@ function toolCallSse(): string {
         {
           index: 0,
           delta: {
-            tool_calls: [{ index: 0, function: { arguments: '{"path":"secret.txt"}' } }],
+            tool_calls: [{ index: 0, function: { arguments: stubToolCall.args } }],
           },
           finish_reason: null,
         },
@@ -423,6 +447,73 @@ describe("the documented park → grant → resume round trip", () => {
     expect(resumed.exitCode).toBe(0);
     expect(toolResults(root)).toContain('ask_mode: "deny"');
   }, 120_000);
+});
+
+describe("crewhaus run — browser target ask_mode threading (G11)", () => {
+  /**
+   * The browser shape reaches its `runChatLoop` options only AFTER
+   * `driver.connect()`, so nothing about the threading is observable until a
+   * browser has launched — which is why this was the one call site left
+   * uncovered. A virtual `playwright` module (see fake-playwright-preload.ts)
+   * removes the BROWSER without removing the code path: the run still goes
+   * driver → Navigate → permission engine, with no binary anywhere. The repo's
+   * established posture for browser tests is a faked playwright rather than a
+   * skipped test, and a chromium-gated skip would skip in CI 100% of the time
+   * (the main `ci` job never runs `playwright install`).
+   */
+  test("a browser run parks on an unruled `ask` — no chromium required", async () => {
+    const root = newTempRoot();
+    mkdirSync(root, { recursive: true });
+    stubToolCall = { name: "Navigate", args: '{"url":"https://example.com/"}' };
+    // `alwaysAsk` on Navigate, and NO ask_mode declared: the documented
+    // default is pause, so a threaded run parks here.
+    writeFileSync(
+      join(root, "crewhaus.yaml"),
+      [
+        "name: ask-mode-browser-e2e",
+        "target: browser",
+        "agent:",
+        `  model: ${STUB_MODEL}`,
+        "  instructions: Navigate somewhere.",
+        "permissions:",
+        "  rules:",
+        "    - type: alwaysAsk",
+        "      pattern: Navigate",
+        "",
+      ].join("\n"),
+    );
+
+    const proc = Bun.spawn(
+      [
+        process.execPath,
+        "--preload",
+        join(SRC_DIR, "fake-playwright-preload.ts"),
+        CLI_PATH,
+        "run",
+        "crewhaus.yaml",
+        "--prompt",
+        "go to example.com",
+      ],
+      {
+        cwd: root,
+        env: { PATH: process.env["PATH"] ?? "" },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    const [, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+
+    // Un-threaded, this shape is identical to `--ask-mode deny`: exit 0, a
+    // `browser_done` line, and no approvals file. Both assertions therefore
+    // flip the moment the `...approvalRunOptions(...)` spread is removed from
+    // runRunBrowser.
+    expect(exitCode).toBe(APPROVAL_PENDING_EXIT);
+    expect(existsSync(join(root, ".crewhaus", "sessions", "approvals.jsonl"))).toBe(true);
+    const listed = await runCli(["approvals", "list", "--json"], root);
+    const records = JSON.parse(listed.stdout) as Array<{ toolName: string }>;
+    expect(records.some((r) => r.toolName === "Navigate")).toBe(true);
+  }, 90_000);
 });
 
 describe("crewhaus serve --mcp — ask_mode threading (G11)", () => {
