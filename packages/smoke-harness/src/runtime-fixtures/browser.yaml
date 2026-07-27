@@ -36,7 +36,16 @@ agent:
 # Click/Type/Key/Scroll are deliberately left UNRULED: this smoke never needs
 # to mutate the page, and an unruled destructive tool failing closed is the
 # outcome we want.
+#
+# `ask_mode: deny` is what makes "failing closed" still mean DENY here. Once
+# the interpreter learned to honour ask_mode, an unruled `ask` on this
+# non-interactive surface began PARKING instead: exit 36, no `browser_done`
+# line, and — now that this shape is a hard gate — a red job. A denial keeps
+# the turn running so the harness can still assert on what the agent grounded
+# its answer in, which is the thing this smoke exists to measure. It also
+# keeps the smoke from writing pending approvals nobody will ever grant.
 permissions:
+  ask_mode: deny
   rules:
     - type: alwaysAllow
       pattern: Navigate
