@@ -115,7 +115,7 @@ If you'd rather develop against the workspace directly (contributing to factory 
 name: my-agent
 target: cli
 agent:
-  model: claude-opus-4-7
+  model: claude-opus-5
   instructions: |
     You are a helpful assistant. Replace these instructions with your
     agent's actual behavior, persona, and constraints.
@@ -148,7 +148,7 @@ The two specs below share an identical `agent:` block — only `target:` changes
 name: research-assistant
 target: cli
 agent:
-  model: claude-sonnet-4-6
+  model: claude-sonnet-5
   instructions: |
     You help users research a topic. Given a question, produce a
     short, cited summary. If you have browser tools, start by calling
@@ -161,7 +161,7 @@ agent:
 name: research-assistant
 target: browser
 agent:
-  model: claude-sonnet-4-6
+  model: claude-sonnet-5
   instructions: |
     You help users research a topic. Given a question, produce a
     short, cited summary. If you have browser tools, start by calling
@@ -192,7 +192,7 @@ The example above needs no tools. Most real agents do — and tools come from tw
 name: github-issue-triage
 target: cli
 agent:
-  model: claude-sonnet-4-6
+  model: claude-sonnet-5
   instructions: |
     You triage GitHub issues by reading them and assigning labels.
 mcp_servers:
@@ -211,7 +211,7 @@ Richer shapes keep that same `agent:` (and `mcp_servers:`) block and layer their
 name: github-issue-triage
 target: channel
 agent:
-  model: claude-sonnet-4-6
+  model: claude-sonnet-5
   instructions: |
     You triage GitHub issues by reading them and assigning labels.
 mcp_servers:
@@ -234,7 +234,7 @@ routing:
 name: github-issue-triage
 target: eval
 agent:
-  model: claude-sonnet-4-6
+  model: claude-sonnet-5
   instructions: |
     You triage GitHub issues by reading them and assigning labels.
 dataset:

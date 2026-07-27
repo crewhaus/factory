@@ -330,7 +330,7 @@ export const GRADERS_TEST_SCHEMA: ParseArgsSchema = {
     // expected_score?} per line, strict (required).
     { name: "golden", takesValue: true },
     // Judge model for llm_judge entries without their own model:/judges:
-    // (model-router grammar); default claude-sonnet-4-5.
+    // (model-router grammar); default claude-sonnet-5.
     { name: "judge-model", takesValue: true },
     // Exit non-zero when any TESTED grader's agreement rate falls below F.
     { name: "min-agreement", takesValue: true },
@@ -1192,7 +1192,7 @@ export const JUDGE_SCHEMA: ParseArgsSchema = {
     { name: "graders", takesValue: true },
     // How many recent sessions' rated turns to calibrate against (default 50; `all`).
     { name: "sessions", takesValue: true },
-    // The judge model (model-router grammar); default claude-sonnet-4-5.
+    // The judge model (model-router grammar); default claude-sonnet-5.
     { name: "model", takesValue: true },
     // Persist the calibrated --min-score default to .crewhaus/judge-calibration.json.
     { name: "apply", takesValue: false },

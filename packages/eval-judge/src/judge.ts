@@ -16,7 +16,7 @@ import type { AnyRubric, CategoricalRubric, Rubric } from "./rubric";
 import { isCategoricalRubric } from "./rubric";
 import { renderTranscriptDigest } from "./transcript-digest";
 
-export const DEFAULT_JUDGE_MODEL = "claude-sonnet-4-5";
+export const DEFAULT_JUDGE_MODEL = "claude-sonnet-5";
 
 const logger = createLogger({ bindings: { module: "eval-judge" } });
 

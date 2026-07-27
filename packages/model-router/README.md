@@ -18,7 +18,7 @@ the harness runs.
 
 | Model string | Provider / wire path | Credentials (env) |
 | --- | --- | --- |
-| `claude-sonnet-4-6` (unprefixed `claude-*`) | Anthropic API | `ANTHROPIC_AUTH_TOKEN` (Claude subscription) or `ANTHROPIC_API_KEY`; `ANTHROPIC_BASE_URL` optional for gateways/proxies |
+| `claude-sonnet-5` (unprefixed `claude-*`) | Anthropic API | `ANTHROPIC_AUTH_TOKEN` (Claude subscription) or `ANTHROPIC_API_KEY`; `ANTHROPIC_BASE_URL` optional for gateways/proxies |
 | `openai/gpt-4o-mini` | OpenAI API (or any OpenAI-compatible endpoint via `OPENAI_BASE_URL`) | `OPENAI_API_KEY` (or `OPENAI_BASE_URL` alone for keyless endpoints) |
 | `gemini/gemini-2.5-flash` | Gemini API — or Vertex AI when `GOOGLE_GENAI_USE_VERTEXAI=true` / project+location are set | `GEMINI_API_KEY` / `GOOGLE_API_KEY`, or ADC with `GOOGLE_CLOUD_PROJECT` + `GOOGLE_CLOUD_LOCATION` |
 | `bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0` | AWS Bedrock. Family inferred from the id (`anthropic`, `meta.llama`, `mistral`, `amazon.nova`, `amazon.titan-text`, `deepseek`, `cohere.command`, `ai21`, `qwen`, `openai.gpt-oss`, `writer`), tolerating cross-region inference-profile prefixes (`us.` / `eu.` / `apac.` / `global.` / …). Anthropic streams over the native InvokeModel path; every other family uses ConverseStream. | AWS credential chain (`AWS_ACCESS_KEY_ID`/profile/IAM role) or a Bedrock API key via `AWS_BEARER_TOKEN_BEDROCK`; region from `AWS_REGION`/`AWS_DEFAULT_REGION` or your AWS profile |
@@ -33,7 +33,7 @@ the harness runs.
 | `mistral/mistral-large-latest` | api.mistral.ai | `MISTRAL_API_KEY` |
 | `cerebras/llama-3.3-70b` | api.cerebras.ai | `CEREBRAS_API_KEY` |
 | `azure/<deployment>` | Azure OpenAI (classic surface: api-key header + api-version query) | `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, optional `AZURE_OPENAI_API_VERSION` |
-| `vertex/claude-sonnet-4-6` | Claude on Google Vertex AI (`@anthropic-ai/vertex-sdk`, optional dependency) | ADC + `ANTHROPIC_VERTEX_PROJECT_ID` (or `GOOGLE_CLOUD_PROJECT`); region via `CLOUD_ML_REGION`/`GOOGLE_CLOUD_LOCATION` (default `us-east5`) |
+| `vertex/claude-sonnet-5` | Claude on Google Vertex AI (`@anthropic-ai/vertex-sdk`, optional dependency) | ADC + `ANTHROPIC_VERTEX_PROJECT_ID` (or `GOOGLE_CLOUD_PROJECT`); region via `CLOUD_ML_REGION`/`GOOGLE_CLOUD_LOCATION` (default `us-east5`) |
 | `vertex/gemini-2.5-flash` | Gemini on Vertex AI (Vertex mode forced) | ADC + `GOOGLE_CLOUD_PROJECT` (+ `GOOGLE_CLOUD_LOCATION`, default `us-central1`) |
 
 Named hosts (`groq/`, `xai/`, …) read **their own** key env var, never

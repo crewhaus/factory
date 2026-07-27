@@ -46,7 +46,7 @@ export function parseModelsFlag(value: string): string[] {
     .filter((m) => m.length > 0);
   if (models.length === 0) {
     throw new MatrixArgError(
-      "--models: expected a comma-separated list of model strings (e.g. claude-sonnet-4-5,openai/gpt-4o)",
+      "--models: expected a comma-separated list of model strings (e.g. claude-sonnet-5,openai/gpt-4o)",
     );
   }
   const seen = new Set<string>();

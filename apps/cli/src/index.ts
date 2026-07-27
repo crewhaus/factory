@@ -2500,7 +2500,7 @@ function runInit(args: ParsedArgs): void {
     const yamlText = `name: ${specName}
 target: cli
 agent:
-  model: claude-opus-4-7
+  model: claude-opus-5
   instructions: |
     You are a helpful assistant. Replace these instructions with your
     agent's actual behavior, persona, and constraints.
@@ -3099,7 +3099,7 @@ async function runInitInteractive(args: ParsedArgs): Promise<void> {
   // Item 39 ↔ #40 — compose with --detect to prefill a default model. When a
   // local endpoint is reachable, offer its first model as `local/<m>@<url>`;
   // otherwise fall back to the standard claude default.
-  let defaultModel = "claude-opus-4-7";
+  let defaultModel = "claude-opus-5";
   if (args.flags["detect"] === true) {
     const prefill = await detectDefaultModel();
     if (prefill !== undefined) defaultModel = prefill;
@@ -7746,7 +7746,7 @@ async function createClaudeMutatorForSpec(
   const { createClaudeMutationProvider } = await import("@crewhaus/prompt-optimizer-claude");
   const { resolveModel } = await import("@crewhaus/model-router");
   const ir = lower(parseSpec(readFileSync(absSpec, "utf-8")));
-  const mutatorModel = ir.target === "cli" ? ir.agent.model : "claude-sonnet-4-5";
+  const mutatorModel = ir.target === "cli" ? ir.agent.model : "claude-sonnet-5";
   const resolution = await resolveModel(mutatorModel);
   return createClaudeMutationProvider({
     adapter: resolution.adapter,

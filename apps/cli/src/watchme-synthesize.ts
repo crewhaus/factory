@@ -69,7 +69,7 @@ export function cliTemplateYaml(specName: string): string {
   return `name: ${specName}
 target: cli
 agent:
-  model: claude-opus-4-7
+  model: claude-opus-5
   instructions: |
     You are a helpful assistant. Replace these instructions with your
     agent's actual behavior, persona, and constraints.

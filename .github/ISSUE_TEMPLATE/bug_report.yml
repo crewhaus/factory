@@ -49,7 +49,7 @@ body:
         name: minimal-repro
         model:
           provider: anthropic
-          name: claude-sonnet-4-6
+          name: claude-sonnet-5
         instructions: |
           ...
     validations:

@@ -216,7 +216,7 @@ export async function createMetaHarnessMutatorForSpec(
 ): Promise<MutationProvider> {
   const { resolveModel } = await import("@crewhaus/model-router");
   const ir = lower(parseSpec(readFileSync(absSpec, "utf-8")));
-  const proposerModel = ir.target === "cli" ? ir.agent.model : "claude-sonnet-4-5";
+  const proposerModel = ir.target === "cli" ? ir.agent.model : "claude-sonnet-5";
   const resolution = await resolveModel(proposerModel);
   return createMetaHarnessMutator({
     storeRootDir,
