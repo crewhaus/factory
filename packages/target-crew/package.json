@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-crew",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "type": "module",
   "description": "Codegen for the CRW target — emits a daemon + per-role agent files driven by crew-orchestrator (Section 22)",
   "main": "src/index.ts",

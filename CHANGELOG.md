@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-27
+
 ### Changed
 
 - **Docs, starter templates and the default judge now name the current Claude

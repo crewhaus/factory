@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/watchme-store",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "type": "module",
   "description": "Durable \"watch me\" observation store — per-harness session digests, judge verdicts, and the cross-harness registry behind crewhaus watchme",
   "main": "src/index.ts",

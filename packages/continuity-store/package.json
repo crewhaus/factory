@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/continuity-store",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "type": "module",
   "description": "v0.3.0 Goal 1 — focus/plans/goals/handoff stores under .crewhaus/state/ with the claimed→proven proof ladder verified against session event logs, trash/restore clearing, advisory locking, and tenant path fencing.",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-task",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "type": "module",
   "description": "Task(description, prompt, subagent_type?) tool — spawns a sub-agent and returns its final message (Section 13)",
   "main": "src/index.ts",

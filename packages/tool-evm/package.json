@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-evm",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "type": "module",
   "description": "Built-in read-only EVM tools (EvmCall, EvmGetLogs, EvmGetTransaction, EvmGetBalance, EvmBlockNumber). Slice 0 of §47 — destructive transaction tools land in slice 1 with tool-evm-tx.",
   "main": "src/index.ts",
