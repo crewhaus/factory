@@ -474,6 +474,102 @@ describe("emitGraph — budget/limits/hooks threading (Batch A)", () => {
   });
 });
 
+/**
+ * The graph target rendered NO permission fields at all: IrGraphV0 carries
+ * `permissions`, but nothing read it, so a spec's whole `permissions:` block
+ * was silently discarded and every node ran on the runtime's defaults.
+ */
+describe("emitGraph — permissions threading (mode + rules)", () => {
+  const permIr: IrGraphV0 = {
+    ...baseIr,
+    permissions: {
+      mode: "plan",
+      rules: [
+        { type: "deny", pattern: "bash(rm *)" },
+        { type: "allow", pattern: "read(*)" },
+      ],
+    },
+  };
+
+  test("permissionMode + permissionRules land in EVERY node's runChatLoop call", () => {
+    const c = emitGraph(permIr).files[0]?.content ?? "";
+    expect(c.split('permissionMode: "plan",').length - 1).toBe(3); // one per node
+    expect(c.split("permissionRules: {").length - 1).toBe(3);
+    expect(c).toContain('{ type: "deny", pattern: "bash(rm *)", source: "yaml" },');
+    expect(c).toContain('{ type: "allow", pattern: "read(*)", source: "yaml" },');
+    // Rules name the builtin layer, so the import rides along.
+    expect(c).toContain('import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";');
+    expect(c).toContain("builtin: BUILTIN_DEFAULT_RULES,");
+  });
+
+  test("mode alone emits no rules block and no permission-engine import", () => {
+    const c =
+      emitGraph({ ...baseIr, permissions: { mode: "auto", rules: [] } }).files[0]?.content ?? "";
+    expect(c).toContain('permissionMode: "auto",');
+    expect(c).not.toContain("permissionRules:");
+    expect(c).not.toContain("@crewhaus/permission-engine");
+  });
+
+  test("a block-less spec emits neither field (only the G11 approval fields)", () => {
+    const c = emitGraph(baseIr).files[0]?.content ?? "";
+    expect(c).not.toContain("permissionMode:");
+    expect(c).not.toContain("permissionRules:");
+  });
+
+  test("a malicious rule pattern stays an escaped string literal, never bare code", () => {
+    const c =
+      emitGraph({
+        ...baseIr,
+        permissions: { rules: [{ type: "deny", pattern: '"); process.exit(1); ("' }] },
+      }).files[0]?.content ?? "";
+    expect(c).toContain(`pattern: ${escapeJsonString('"); process.exit(1); ("')},`);
+    expect(() => new Bun.Transpiler({ loader: "ts" }).transformSync(c)).not.toThrow();
+  });
+});
+
+/**
+ * Loop contract 0.4 (Batch C, G11) — a compiled bundle is non-interactive, so
+ * an `ask` must PARK rather than collapse to a deny. runtime-core parks only
+ * when BOTH `askMode: "pause"` and an `approvals` store reach runChatLoop; the
+ * emitter passed neither, leaving `permissions.ask_mode` inert in every graph
+ * bundle.
+ */
+describe("emitGraph — ask_mode + pending-approval store (G11)", () => {
+  test("every node's runChatLoop carries askMode + approvals, and the store boots once", () => {
+    const c = emitGraph(baseIr).files[0]?.content ?? "";
+    expect(c).toContain(
+      'import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";',
+    );
+    expect(c).toContain("const __approvalRoot = resolveSessionRootDir(undefined);");
+    expect(c).toContain(
+      "const __approvals = createPendingApprovalStore(\n  __approvalRoot !== undefined ? { rootDir: __approvalRoot } : {},\n);",
+    );
+    // Fixed at emit time — a bundle parses no --ask-mode.
+    expect(c.split('askMode: "pause",').length - 1).toBe(3); // one per node
+    expect(c.split('approvals: { store: __approvals, surface: "graph-node" },').length - 1).toBe(3);
+  });
+
+  test('ask_mode: deny emits askMode: "deny" — with the store still wired', () => {
+    const c =
+      emitGraph({ ...baseIr, permissions: { askMode: "deny", rules: [] } }).files[0]?.content ?? "";
+    expect(c).toContain('askMode: "deny",');
+    expect(c).not.toContain('askMode: "pause",');
+    // Passed under "deny" too (it never parks there): runtime-core's diagnostic
+    // branches on `approvals === undefined`, so withholding it would blame
+    // absent plumbing for a deliberate operator choice.
+    expect(c).toContain('approvals: { store: __approvals, surface: "graph-node" },');
+  });
+
+  test("the fields are unconditional — a spec with no permissions block still parks", () => {
+    // The case where parking matters MOST: with no block every unmatched tool
+    // resolves to `ask`.
+    const c = emitGraph(baseIr).files[0]?.content ?? "";
+    expect(baseIr.permissions).toEqual({ rules: [] });
+    expect(c).toContain('askMode: "pause",');
+    expect(c).toContain("approvals: { store: __approvals,");
+  });
+});
+
 describe("emitGraph — classified terminal failures (v0.3.0 Goal 6)", () => {
   test("main() is wrapped so a classified error renders its report and coded exit", () => {
     const c = emitGraph(baseIr).files[0]?.content ?? "";

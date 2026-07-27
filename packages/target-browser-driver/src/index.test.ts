@@ -505,3 +505,56 @@ describe("emitBrowserDriver — spec hooks (loop contract 0.4, Batch A)", () => 
     }
   });
 });
+
+describe("emitBrowserDriver — headless ask parking (loop contract 0.4, G11)", () => {
+  test("the one-shot turn carries askMode + approvals plus the store boot", () => {
+    const code = emitBrowserDriver(baseIr).files[0]?.content ?? "";
+    expect(code).toContain(
+      'import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";',
+    );
+    // Rooted where the run's session files land (tenant root included), not cwd.
+    expect(code).toContain("const __approvalRoot = resolveSessionRootDir(undefined);");
+    expect(code).toContain("const __approvals = createPendingApprovalStore(");
+    expect(code).toContain("__approvalRoot !== undefined ? { rootDir: __approvalRoot } : {},");
+    // BOTH halves are required — runtime-core parks only on
+    // `approvals !== undefined && askMode === "pause"`.
+    expect(code).toContain('askMode: "pause",');
+    expect(code).toContain('approvals: { store: __approvals, surface: "browser" },');
+  });
+
+  test("emitted even with NO permissions: block — the case where every unmatched tool asks", () => {
+    const code = emitBrowserDriver(baseIr).files[0]?.content ?? "";
+    expect(code).not.toContain("permissionMode");
+    expect(code).not.toContain("permissionRules");
+    expect(code).toContain('askMode: "pause",');
+    expect(code).toContain("approvals: { store: __approvals");
+  });
+
+  test('ask_mode: deny emits askMode: "deny" and STILL wires the store', () => {
+    const ir: IrBrowserV0 = { ...baseIr, permissions: { rules: [], askMode: "deny" } };
+    const code = emitBrowserDriver(ir).files[0]?.content ?? "";
+    expect(code).toContain('askMode: "deny",');
+    expect(code).not.toContain('askMode: "pause",');
+    // runtime-core tells "(no approvals store wired)" from a deliberate deny by
+    // testing `approvals === undefined`, so withholding the store here would
+    // blame absent plumbing for an operator's choice.
+    expect(code).toContain('approvals: { store: __approvals, surface: "browser" },');
+  });
+
+  test("the REPL branch gets neither field — an interactive ask has stdin to prompt on", () => {
+    const code = emitBrowserDriver(baseIr).files[0]?.content ?? "";
+    // Exactly one call site carries them...
+    expect(code.split("askMode:").length - 1).toBe(1);
+    expect(code.split("approvals:").length - 1).toBe(1);
+    // ...and it is the one-shot literal, not the REPL branch above it nor the
+    // shared runOptions object that branch spreads.
+    const runOptionsIdx = code.indexOf("const runOptions = {");
+    const replIdx = code.indexOf("installSigintHandler: true,");
+    const oneShotIdx = code.indexOf("singleTurn: true,");
+    expect(runOptionsIdx).toBeGreaterThan(-1);
+    expect(replIdx).toBeGreaterThan(runOptionsIdx);
+    expect(oneShotIdx).toBeGreaterThan(replIdx);
+    expect(code.slice(runOptionsIdx, oneShotIdx)).not.toContain("askMode:");
+    expect(code.slice(runOptionsIdx, oneShotIdx)).not.toContain("approvals:");
+  });
+});

@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Compiled bundles honour `permissions.ask_mode` too.** The interpreter
+  learned to park a headless `ask` rather than deny it in place, but every
+  target emitter still passed neither `askMode` nor `approvals` into the
+  `runChatLoop` it emitted — so the field stayed inert in generated code, and
+  a compiled daemon, worker, workflow step or graph node refused a gated call
+  with no way for anyone to approve it. Now threaded in
+  `target-batch-worker`, `target-browser-driver`, `target-graph`,
+  `target-managed`, `target-pipeline` (its `runForEval` entry only),
+  `target-research-bundle`, `target-workflow`, and `target-crew` through
+  `crew-orchestrator`'s `RunOptions`, each stamping a `surface` so
+  `crewhaus approvals list` says where a park came from.
+
+  Only NON-INTERACTIVE emitted paths are threaded. A REPL bundle prompts on
+  stdin, so the interactive halves of `target-browser-driver` and
+  `target-pipeline` are deliberately untouched, as is the channel bot's
+  `dream` maintenance turn — an unattended janitor pass that must never hang
+  waiting for a human nobody told to look.
+
+  Specs with no `permissions:` block are what this matters most for: with no
+  block every unmatched tool resolves to `ask`, and most of the existing
+  permission-field renderers early-return in exactly that case. The approval
+  fields are therefore emitted by a separate, unconditional renderer rather
+  than folded into those.
+
+  `target-managed` builds its store PER TURN rather than at module scope,
+  because every turn runs inside `withTenant()` — a module-scope store would
+  pool one tenant's parked approvals, which echo the raw tool input, into the
+  process-global sessions directory.
+
+  NOT included: the channel bot. Threading its loop alone would make
+  `approval_pending` throwable while its session router queries a different,
+  empty, structurally incompatible approval store that nothing writes to —
+  a bot that parks with no Slack prompt and no way to grant, which is worse
+  than the denial it replaces. That needs a store bridge, tracked separately.
+- **A `target: graph` spec's `permissions:` block is no longer silently
+  discarded.** `IrGraphV0` has always carried `permissions` and the compiler
+  has always lowered it, but the graph emitter rendered no permission fields
+  at all — so every node ran on runtime defaults and a spec's `alwaysDeny`
+  rules were dropped on the floor. Found while threading `ask_mode` through
+  the same emitter.
+
 ### Added
 
 - **`parseArgs` now rejects a malformed arg schema instead of silently

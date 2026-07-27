@@ -592,14 +592,15 @@ defaultCatalog.register(__knowledgeTool);`;
  * dropped on the floor — a managed spec that declared `permissions.mode` or
  * `permissions.rules` got a daemon that ignored both (target-cli and
  * target-channel-bot have always wired theirs; mirror them). Second, the
- * daemon is non-interactive: an unmatched tool falls through to `ask`, and
- * with no approvals store to park against, the runtime collapses that to a
- * denial the model then explains to the caller. Since this target installs the
- * memory-fabric tools itself — `continuity:` is default-on, so a spec with no
- * `tools:` and no `permissions:` still gets FocusRead/PlanRead/… — it also
- * grants them, at the BUILTIN (lowest-priority) layer so a spec-declared rule
- * still overrides. `__memToolRules` is built next to the `wireMemory` call, so
- * the grant is exactly the tool set that was actually registered for this turn.
+ * daemon is non-interactive: an unmatched tool falls through to `ask` with
+ * nobody to prompt. That ask now PARKS as a pending approval (see
+ * `renderApprovalFields`), but parking is still an interruption the caller has
+ * to resolve out of band. Since this target installs the memory-fabric tools
+ * itself — `continuity:` is default-on, so a spec with no `tools:` and no
+ * `permissions:` still gets FocusRead/PlanRead/… — it also grants them, at the
+ * BUILTIN (lowest-priority) layer so a spec-declared rule still overrides.
+ * `__memToolRules` is built next to the `wireMemory` call, so the grant is
+ * exactly the tool set that was actually registered for this turn.
  *
  * Returns "" when there is nothing to say (no fabric, no mode, no rules),
  * keeping those bundles byte-identical.
@@ -629,6 +630,27 @@ function renderManagedPermissions(ir: IrManagedV0, fabricWired: boolean): string
     ].join("\n"),
   );
   return `\n${lines.join("\n")}`;
+}
+
+/**
+ * Loop contract 0.4 (G11) — the `askMode` + `approvals` runChatLoop fields.
+ * Unlike the CLI's `approvalRunOptions` a bundle parses no `--ask-mode`, so
+ * the spec value is FIXED at emit time.
+ *
+ * Deliberately SEPARATE from `renderManagedPermissions`, which returns "" for
+ * a spec with no `permissions:` block and no fabric — precisely the case where
+ * parking matters most, since with no rules every unmatched tool resolves to
+ * `ask`. So this is unconditional, and the store is emitted even under
+ * `"deny"`, where it never parks: runtime-core picks its diagnostic by testing
+ * whether a store was supplied, so withholding it would report absent plumbing
+ * for what is a deliberate operator choice. It costs nothing — the store does
+ * no I/O until something is actually persisted.
+ */
+function renderApprovalFields(ir: IrManagedV0, indent: string): string {
+  return (
+    `\n${indent}askMode: ${escapeJsonString(ir.permissions.askMode ?? "pause")},` +
+    `\n${indent}approvals: { store: __approvals, surface: "managed" },`
+  );
 }
 
 function renderAgent(ir: IrManagedV0): string {
@@ -789,15 +811,15 @@ const __memEmbedder = createEmbedder({ model: ${escapeJsonString(memEmbedderMode
   const __skills = __memWired.options.skills ?? [];
   if (__skills.length > 0) __memTools.push(createSkillTool(__skills));
   // The daemon is a NON-INTERACTIVE surface, so an "ask" decision has nobody
-  // to prompt and collapses to a denial the model narrates back to the caller.
-  // The fabric above installs these tools WITHOUT the spec asking for them
-  // (\`continuity:\` is default-on), so this target grants exactly what it
-  // installed — a spec with no \`permissions:\` block must not answer an
-  // open-ended prompt with a complaint about its own tools. These sit at the
-  // BUILTIN layer, the lowest-priority source: they are a default, so any
-  // spec-declared rule (including an \`alwaysDeny\` on a memory tool) still
-  // wins. Nothing else is widened — tools the spec itself declared keep the
-  // ordinary ask-then-deny floor.
+  // to prompt: it parks the turn for out-of-band approval (or, under
+  // \`ask_mode: deny\`, denies in place). The fabric above installs these tools
+  // WITHOUT the spec asking for them (\`continuity:\` is default-on), so this
+  // target grants exactly what it installed — a spec with no \`permissions:\`
+  // block must not stall an open-ended prompt on its own bookkeeping tools.
+  // These sit at the BUILTIN layer, the lowest-priority source: they are a
+  // default, so any spec-declared rule (including an \`alwaysDeny\` on a memory
+  // tool) still wins. Nothing else is widened — tools the spec itself declared
+  // keep the ordinary ask floor.
   const __memToolRules: PermissionRule[] = __memTools.map((t) => ({
     type: "alwaysAllow",
     pattern: t.name,
@@ -825,6 +847,22 @@ const __memEmbedder = createEmbedder({ model: ${escapeJsonString(memEmbedderMode
     tools: ${toolsExpr},`
       : "";
   const permissionsField = renderManagedPermissions(ir, fabric.wired);
+  // Loop contract 0.4 (G11) — the pending-approval store, built PER TURN and
+  // never at module scope: every turn runs inside the request's `withTenant`,
+  // and `resolveSessionRootDir` reads the ACTIVE tenant's rebased root. A
+  // module-scope store would resolve once, outside any tenant scope, and pool
+  // every tenant's parks — records that echo the raw tool input — into the
+  // process-global `.crewhaus/sessions`.
+  const approvalsBoot = `  // G11 — a compiled bundle is NON-INTERACTIVE: a tool that lands on \`ask\`
+  // has nobody to prompt, so without this it collapsed to a deny. Rooted where
+  // this turn's session files land, so parks live beside them, inside the
+  // requesting tenant's root. No I/O until a park.
+  const __approvalRoot = resolveSessionRootDir(undefined);
+  const __approvals = createPendingApprovalStore(
+    __approvalRoot !== undefined ? { rootDir: __approvalRoot } : {},
+  );
+
+`;
   const permissionImports =
     permissionsField.length > 0
       ? `\nimport { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";${
@@ -835,6 +873,7 @@ const __memEmbedder = createEmbedder({ model: ${escapeJsonString(memEmbedderMode
 // Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: managed, ir version: ${ir.version})
 import { runChatLoop } from "@crewhaus/runtime-core";
+import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
 import type { RunChatLoopOptions } from "@crewhaus/runtime-core";${permissionImports}${pcImport}${memImports}${thredzImports}${catalogImport}${toolImportBlock}${knowledgeImports}${embedderImport}${evalImport}${evaluationBlock}${toolBootBlock}${thredzBootBlock}${embedderBootBlock}${knowledgeBootBlock}${pcBootBlock}
 
 export type ManagedAgentArgs = {
@@ -845,13 +884,13 @@ export type ManagedAgentArgs = {
 };
 
 export async function runOneTurn(args: ManagedAgentArgs): Promise<string> {
-${memBlock}  return await runChatLoop({
+${memBlock}${approvalsBoot}  return await runChatLoop({
     model: ${escapeJsonString(ir.agent.model)},
     instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentLoopFields(ir)}${renderModelFailoverFields(ir)}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderHooksField(ir)}${renderSloField(ir)}
     sessionName: args.sessionId,
     sessionTarget: "managed",
     seedMessages: [{ role: "user", content: args.input }],
-    singleTurn: true,${pcFields}${memRunFields}${permissionsField}
+    singleTurn: true,${pcFields}${memRunFields}${permissionsField}${renderApprovalFields(ir, "    ")}
     ...(args.extraOptions ?? {}),
   });
 }

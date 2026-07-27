@@ -22,7 +22,10 @@
  *      in sync.
  *   5. Reads user input and runs `runChatLoop`. Two modes (G51):
  *        - ONE-SHOT: a `--prompt <text>` value or piped stdin runs a single
- *          turn and exits (the pre-0.4 behaviour, for CI/scripting).
+ *          turn and exits (the pre-0.4 behaviour, for CI/scripting). Nobody
+ *          is there to answer an `ask` permission, so this branch alone
+ *          carries the G11 approval seam (`permissions.ask_mode`, default
+ *          `pause`) and PARKS the turn instead of collapsing it to a deny.
  *        - REPL: an interactive TTY with no `--prompt` drops into the
  *          persistent driver REPL — the chromium context stays connected for
  *          the whole `runChatLoop` call, so the agent observes → acts →
@@ -283,6 +286,7 @@ import { createScreenshotTool } from "@crewhaus/tool-screen-capture";
 import { createAllMouseKeyboardTools } from "@crewhaus/tool-mouse-keyboard";
 import { createFindElementTool } from "@crewhaus/tool-vision-grounding";
 import { runChatLoop } from "@crewhaus/runtime-core";
+import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { defaultCatalog } from "@crewhaus/tool-catalog";
 import { createSessionStore } from "@crewhaus/session-store";
@@ -401,6 +405,15 @@ async function main(): Promise<void> {
     maxTokens: ${ir.agent.maxTokens ?? 4096},${budgetField(ir, "    ")}${limitsFields(ir, "    ")}${hooksField}${permField}
   };
 
+  // G11 — a compiled bundle is NON-INTERACTIVE: a tool that lands on \`ask\`
+  // has nobody to prompt, so without this it collapsed to a deny. Rooted
+  // where the run's session files land, so parks live beside them (and
+  // inside a tenant's rebased root when one is active). No I/O until a park.
+  const __approvalRoot = resolveSessionRootDir(undefined);
+  const __approvals = createPendingApprovalStore(
+    __approvalRoot !== undefined ? { rootDir: __approvalRoot } : {},
+  );
+
   // The REPL lets runChatLoop drive stdin turn-by-turn (singleTurn omitted);
   // one-shot seeds the single inbound message. \`resume\` + \`seedMessages\` is
   // legal ONLY under singleTurn (the seed is the new inbound, the replayed
@@ -416,7 +429,7 @@ async function main(): Promise<void> {
     return await runChatLoop({
       ...runOptions,
       singleTurn: true,
-      installSigintHandler: false,
+      installSigintHandler: false,${renderApprovalFields(ir, "      ")}
       seedMessages: [{ role: "user", content: oneShotPrompt }],
       ...(resume !== undefined ? { resume } : {}),
     });
@@ -449,6 +462,29 @@ main().catch((err) => {
   process.exit(1);
 });
 `;
+}
+
+/**
+ * Loop contract 0.4 (G11) — the `askMode` + `approvals` fields. Unlike the
+ * CLI's `approvalRunOptions`, a bundle parses no `--ask-mode`, so the spec
+ * value is FIXED here at emit time. Deliberately NOT folded into
+ * `renderPermissionsField`: that one early-returns "" when the spec declares
+ * no `permissions:` block, which is exactly the case where parking matters
+ * most — with no block every unmatched tool resolves to `ask`.
+ *
+ * The store is rendered UNCONDITIONALLY, including under `"deny"` where it
+ * never parks, so runtime-core's diagnostic can honestly say `ask_mode:
+ * "deny"` instead of blaming absent plumbing (it branches on `approvals ===
+ * undefined`).
+ *
+ * One-shot ONLY. The REPL branch spreads `runOptions`, and a REPL prompts on
+ * stdin — parking a turn that has a human sitting at it would be wrong.
+ */
+function renderApprovalFields(ir: IrBrowserV0, indent: string): string {
+  return (
+    `\n${indent}askMode: ${escapeJsonString(ir.permissions.askMode ?? "pause")},` +
+    `\n${indent}approvals: { store: __approvals, surface: "browser" },`
+  );
 }
 
 function renderPermissionsField(ir: IrBrowserV0): string {

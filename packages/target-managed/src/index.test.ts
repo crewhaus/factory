@@ -394,6 +394,10 @@ describe("emitManaged — permission wiring for the tools the target installs it
     expect(agent).not.toContain("permissionRules");
     expect(agent).not.toContain("permissionMode");
     expect(agent).not.toContain("@crewhaus/permission-engine");
+    // The approvals wiring is deliberately NOT part of this — it is
+    // unconditional, precisely because this is the spec where every unmatched
+    // tool falls through to `ask`.
+    expect(agent).toContain("approvals: { store: __approvals");
   });
 
   test("Bun.Transpiler parses the emitted agent.ts with the permission wiring", () => {
@@ -405,6 +409,78 @@ describe("emitManaged — permission wiring for the tools the target installs it
           permissions: { mode: "default", rules: [{ type: "alwaysAllow", pattern: "Read" }] },
         }),
       ),
+    ).not.toThrow();
+  });
+});
+
+describe("emitManaged — G11 headless `ask` parks instead of collapsing to a deny", () => {
+  const agentOf = (i: IrManagedV0): string =>
+    emitManaged(i).files.find((f) => f.path === "agent.ts")?.content ?? "";
+
+  const withContinuity: IrManagedV0 = {
+    ...ir,
+    continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "spec" },
+  };
+
+  test("both halves of the park contract reach runChatLoop", () => {
+    // runtime-core parks only when BOTH are present (`approvals !== undefined
+    // && askMode === "pause"`), so asserting one without the other would pass
+    // while ask_mode stayed inert.
+    const agent = agentOf(ir);
+    expect(agent).toContain('askMode: "pause",');
+    expect(agent).toContain('approvals: { store: __approvals, surface: "managed" },');
+    expect(agent).toContain(
+      'import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";',
+    );
+    expect(agent).toContain("const __approvalRoot = resolveSessionRootDir(undefined);");
+    expect(agent).toContain("__approvalRoot !== undefined ? { rootDir: __approvalRoot } : {},");
+  });
+
+  test("an absent permissions.askMode emits the safe `pause` default", () => {
+    // The IR carries askMode only when the spec sets it; the emitter, not the
+    // bundle, resolves the default — a compiled bundle parses no --ask-mode.
+    expect(ir.permissions.askMode).toBeUndefined();
+    expect(agentOf(ir)).toContain('askMode: "pause",');
+  });
+
+  test("permissions.ask_mode: deny emits the deny mode AND still wires the store", () => {
+    // The store is passed under "deny" too: runtime-core picks between "(no
+    // approvals store wired)" and 'ask_mode: "deny"' by testing whether a
+    // store was supplied, so withholding it would blame missing plumbing for a
+    // deliberate operator choice. It never parks, so it never writes.
+    const agent = agentOf({ ...ir, permissions: { rules: [], askMode: "deny" } });
+    expect(agent).toContain('askMode: "deny",');
+    expect(agent).toContain('approvals: { store: __approvals, surface: "managed" },');
+  });
+
+  test("the store is built PER TURN, inside runOneTurn, not at module scope", () => {
+    // Every turn runs inside the request's withTenant, and the store root is
+    // resolved from the ACTIVE tenant. A module-scope store would resolve once
+    // outside any tenant scope and pool every tenant's parked approvals —
+    // which echo the raw tool input — into the process-global directory.
+    const agent = agentOf(withContinuity);
+    const turnIdx = agent.indexOf("export async function runOneTurn(");
+    const storeIdx = agent.indexOf("const __approvals = createPendingApprovalStore(");
+    const callIdx = agent.indexOf("return await runChatLoop({");
+    expect(turnIdx).toBeGreaterThan(-1);
+    expect(storeIdx).toBeGreaterThan(turnIdx);
+    expect(storeIdx).toBeLessThan(callIdx);
+  });
+
+  test("a host can still override both fields through extraOptions", () => {
+    const agent = agentOf(ir);
+    expect(agent.indexOf("approvals: { store: __approvals")).toBeLessThan(
+      agent.indexOf("...(args.extraOptions ?? {}),"),
+    );
+  });
+
+  test("Bun.Transpiler parses the emitted agent.ts with the approvals wiring", () => {
+    const t = new Bun.Transpiler({ loader: "ts" });
+    // Both shapes: no fabric / no permissions block (where the permissions
+    // renderer emits nothing at all) and the full fabric + deny mode.
+    expect(() => t.transformSync(agentOf(ir))).not.toThrow();
+    expect(() =>
+      t.transformSync(agentOf({ ...withContinuity, permissions: { rules: [], askMode: "deny" } })),
     ).not.toThrow();
   });
 });

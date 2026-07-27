@@ -11,8 +11,9 @@ import type {
   SubAgentDefinition,
 } from "@crewhaus/agent-context-isolation";
 import { BUILTIN_DEFAULT_RULES, type RuleSet, emptyRuleSet } from "@crewhaus/permission-engine";
+import { createPendingApprovalStore } from "@crewhaus/runtime-core";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { ToolExecuteContext } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { isValidSpanId, isValidTraceId, parseTraceparent } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
 import {
@@ -1135,6 +1136,167 @@ describe("handoff context serialisation", () => {
       expect(seed).toContain('"city": "Berlin"');
       expect(seed).toContain('"urgent"');
       expect(seed).not.toContain("[tool output redacted:");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("headless ask parking (loop contract 0.4, G11)", () => {
+  // A crew turn is single-turn by construction — there is never a stdin
+  // prompter — so a tool that resolves to `ask` used to collapse to an
+  // in-place deny no matter what the spec said. These tests drive a real
+  // `ask` (an ungranted tool under the builtin floor) through both
+  // runChatLoop call sites the orchestrator owns.
+
+  /** A tool that records whether it ever ran. Never granted, so it asks. */
+  function askingProbe(): { tool: RegisteredTool; ran: () => boolean } {
+    let executed = false;
+    const tool = buildTool({
+      name: "Probe",
+      description: "A tool the permission floor never allows outright.",
+      inputSchema: z.object({}).strict(),
+      readOnly: true,
+      execute: async () => {
+        executed = true;
+        return "probed";
+      },
+    });
+    return { tool, ran: () => executed };
+  }
+
+  test("askMode pause + a store PARKS a primary role turn instead of denying", async () => {
+    const root = newTempRoot();
+    try {
+      const probe = askingProbe();
+      const adapter = makeProgrammableAdapter(() => [
+        { type: "tool_use", id: "tu_probe", name: "Probe", input: {} },
+      ]);
+      const store = createPendingApprovalStore({ rootDir: root });
+      const crew = Crew()
+        .setName("park-primary")
+        .addRole("solo", { model: "stub", instructions: "Solo.", tools: [probe.tool] })
+        .setEntry("solo")
+        .compile();
+
+      await expect(
+        collect(
+          crew.run("go", {
+            sessionRootDir: root,
+            _adapter: adapter,
+            askMode: "pause",
+            approvals: { store },
+            maxActivations: 2,
+          }),
+        ),
+      ).rejects.toThrow(/approval/i);
+
+      const parked = await store.list();
+      expect(parked.map((a) => a.toolName)).toEqual(["Probe"]);
+      // Parked, not run: the whole point is the call waits for a decision.
+      expect(probe.ran()).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("askMode pause + a store PARKS an inline A2A peer turn too", async () => {
+    const root = newTempRoot();
+    try {
+      const probe = askingProbe();
+      const toolResults: string[] = [];
+      const adapter = makeProgrammableAdapter(({ seed, previousToolResults }) => {
+        // The peer is the one that asks — proving the A2A call site threads
+        // the pair as well, not just primary activations.
+        if (seed.includes("[A2A from")) {
+          return [{ type: "tool_use", id: "tu_probe", name: "Probe", input: {} }];
+        }
+        if (previousToolResults.length > 0) {
+          toolResults.push(...previousToolResults);
+          return [{ type: "text", text: "done" }];
+        }
+        return [
+          {
+            type: "tool_use",
+            id: "tu_a2a",
+            name: "SendMessage",
+            input: { target: "peer", payload: "please probe" },
+          },
+        ];
+      });
+      const store = createPendingApprovalStore({ rootDir: root });
+      const crew = Crew()
+        .setName("park-a2a")
+        .addRole("lead", { model: "stub", instructions: "Lead." })
+        .addRole("peer", { model: "stub", instructions: "Peer.", tools: [probe.tool] })
+        .setEntry("lead")
+        .compile();
+
+      const events = await collect(
+        crew.run("go", {
+          sessionRootDir: root,
+          _adapter: adapter,
+          askMode: "pause",
+          approvals: { store },
+          maxActivations: 2,
+        }),
+      );
+
+      const parked = await store.list();
+      expect(parked.map((a) => a.toolName)).toEqual(["Probe"]);
+      expect(probe.ran()).toBe(false);
+      // The peer's park does NOT halt the crew: `SendMessage` turns any throw
+      // from the peer turn into an `[A2A error] …` tool result, so the sender
+      // reads the park as a failed peer call and keeps going. Asserted rather
+      // than "fixed" — whether a parked peer should park its caller is the
+      // same open question sub-agent turns raise, not something to settle in
+      // passing. What matters here is that the peer PARKED (an unthreaded
+      // peer would instead have collapsed to "no way to prompt").
+      expect(events[events.length - 1]?.kind).toBe("crew_done");
+      expect(toolResults.join("\n")).toContain("[A2A error]");
+      expect(toolResults.join("\n")).toContain(parked[0]?.id ?? "<no park>");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("askMode deny never parks — and the store still reaches the runtime", async () => {
+    const root = newTempRoot();
+    try {
+      const probe = askingProbe();
+      const toolResults: string[] = [];
+      const adapter = makeProgrammableAdapter(({ previousToolResults }) => {
+        if (previousToolResults.length > 0) {
+          toolResults.push(...previousToolResults);
+          return [{ type: "text", text: "gave up" }];
+        }
+        return [{ type: "tool_use", id: "tu_probe", name: "Probe", input: {} }];
+      });
+      const store = createPendingApprovalStore({ rootDir: root });
+      const crew = Crew()
+        .setName("deny-primary")
+        .addRole("solo", { model: "stub", instructions: "Solo.", tools: [probe.tool] })
+        .setEntry("solo")
+        .compile();
+
+      const events = await collect(
+        crew.run("go", {
+          sessionRootDir: root,
+          _adapter: adapter,
+          askMode: "deny",
+          approvals: { store },
+          maxActivations: 2,
+        }),
+      );
+
+      expect(events[events.length - 1]?.kind).toBe("crew_done");
+      expect(probe.ran()).toBe(false);
+      // Construction does no I/O and `deny` never writes: nothing parked.
+      expect(await store.list()).toEqual([]);
+      // The runtime picks its denial wording by testing whether a store was
+      // supplied. Blaming `ask_mode: "deny"` (rather than "no approvals store
+      // wired") is the only observable proof the store arrived under deny.
+      expect(toolResults.join("\n")).toContain('ask_mode: "deny"');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
