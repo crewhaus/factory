@@ -76,3 +76,51 @@ describe("emitPipeline — evalEntry variant (cluster S)", () => {
     expect(() => t.transformSync(agentTs(BASE_IR, true))).not.toThrow();
   });
 });
+
+/**
+ * Loop contract 0.4 (G11) — the eval turn is the bundle's NON-INTERACTIVE
+ * surface, so an `ask` there must park rather than collapse to a deny.
+ * runtime-core parks only when BOTH `askMode: "pause"` and an `approvals`
+ * store are present, so both fields have to reach `runForEval`.
+ */
+describe("emitPipeline — ask_mode plumbing (G11)", () => {
+  test("runForEval carries askMode + the approval store", () => {
+    const c = agentTs(BASE_IR, true);
+    expect(c).toContain('askMode: "pause",');
+    expect(c).toContain('approvals: { store: __approvals, surface: "pipeline-eval" },');
+    expect(c).toContain(
+      'import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";',
+    );
+    expect(c).toContain("const __approvalRoot = resolveSessionRootDir(undefined);");
+    // Module scope, so the store is built once — before the entry can use it.
+    expect(c.indexOf("const __approvals =")).toBeLessThan(c.indexOf("export async function"));
+  });
+
+  test("the fields survive a spec with no permissions block — where ask is the default", () => {
+    // BASE_IR declares no mode and no rules, so the emitted permission block
+    // is empty; the approval fields must NOT ride along with it.
+    expect(agentTs(BASE_IR, true)).not.toContain("permissionMode:");
+    expect(agentTs(BASE_IR, true)).toContain('askMode: "pause",');
+  });
+
+  test('ask_mode: deny emits askMode: "deny" — with the store still wired', () => {
+    const c = agentTs({ ...BASE_IR, permissions: { rules: [], askMode: "deny" } }, true);
+    expect(c).toContain('askMode: "deny",');
+    // Passed even under "deny" (where it never parks) so runtime-core's
+    // diagnostic reports the spec's choice instead of missing plumbing.
+    expect(c).toContain("approvals: { store: __approvals,");
+  });
+
+  test("the REPL is untouched — it prompts on stdin, so it never parks", () => {
+    const c = agentTs(BASE_IR, true);
+    const repl = c.slice(c.indexOf("if (import.meta.main) {"));
+    expect(repl).not.toContain("askMode:");
+    expect(repl).not.toContain("approvals:");
+  });
+
+  test("a plain (non-eval) bundle emits no approval plumbing", () => {
+    const c = agentTs(BASE_IR, false);
+    expect(c).not.toContain("askMode:");
+    expect(c).not.toContain("createPendingApprovalStore");
+  });
+});

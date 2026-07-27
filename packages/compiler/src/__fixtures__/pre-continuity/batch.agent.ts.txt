@@ -6,6 +6,7 @@ import { startConsumer } from "@crewhaus/queue-consumer";
 import { createInMemoryIdempotencyStore } from "@crewhaus/idempotency-keys";
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createJanitor, runChatLoop } from "@crewhaus/runtime-core";
+import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { defaultCatalog } from "@crewhaus/tool-catalog";
 
@@ -71,6 +72,18 @@ async function main(): Promise<void> {
     janitor.start(Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000));
   }
 
+  // G11 — a compiled bundle is NON-INTERACTIVE: a tool that lands on `ask`
+  // has nobody to prompt, so without this it collapsed to a deny. Rooted
+  // where the run's session files land, so parks live beside them (and
+  // inside a tenant's rebased root when one is active). No I/O until a park.
+  // A park fails the job, so it is retried per SPEC_MAX_RETRIES — an
+  // out-of-band grant lands on the same (toolName, inputHash) key and the
+  // next delivery within that budget proceeds.
+  const __approvalRoot = resolveSessionRootDir(undefined);
+  const __approvals = createPendingApprovalStore(
+    __approvalRoot !== undefined ? { rootDir: __approvalRoot } : {},
+  );
+
   const queue = buildQueue();
   // Idempotency window (SPEC_IDEMPOTENCY_WINDOW_MS): caches each job's
   // SUCCESSFUL result under its job id for the window, so a job that is
@@ -98,6 +111,8 @@ async function main(): Promise<void> {
         tools: defaultCatalog.list(),
         installSigintHandler: false,
         maxTokens: 1024,
+        askMode: "pause",
+        approvals: { store: __approvals, surface: "batch" },
       });
       return reply.trim();
     },

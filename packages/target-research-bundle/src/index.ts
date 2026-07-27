@@ -145,6 +145,23 @@ function renderPermissionsField(ir: IrResearchV0): string {
 }
 
 /**
+ * Loop contract 0.4 (G11) — the `askMode` + `approvals` fields. Unlike the
+ * CLI's approvalRunOptions, a bundle parses no `--ask-mode`, so the spec
+ * value is FIXED here. Deliberately NOT folded into renderPermissionsField:
+ * a spec with no `permissions:` block is exactly where parking matters most
+ * (every unmatched tool resolves to `ask`), so this must stay unconditional.
+ * The store is built even under "deny", where it never parks, so
+ * runtime-core's diagnostic can honestly say `ask_mode: "deny"` instead of
+ * blaming absent plumbing (it branches on `approvals === undefined`).
+ */
+function renderApprovalFields(ir: IrResearchV0, indent: string): string {
+  return (
+    `\n${indent}askMode: ${escapeJsonString(ir.permissions.askMode ?? "pause")},` +
+    `\n${indent}approvals: { store: __approvals, surface: "research" },`
+  );
+}
+
+/**
  * Adaptive model routing — render the `modelPool` runChatLoop field.
  * JSON.stringify safely quotes the validated pool object (mirroring
  * target-cli's renderModelFailoverFields; keep the pipeline/research/batch/
@@ -391,11 +408,21 @@ import { formatRunFailure, toFailureReport } from "@crewhaus/errors";
 import { decompose, type Plan } from "@crewhaus/planner";
 import { writeReport, type BranchAnswer } from "@crewhaus/report-writer";
 import { runChatLoop } from "@crewhaus/runtime-core";
+import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";
 import { defaultCatalog } from "@crewhaus/tool-catalog";
 ${hooksImport}${memImportBlock}${mcpImportBlock}${importBlock}
 ${initLines}${registrationBlock}${memBootBlock}${mcpBootBlock}
+// G11 — a compiled bundle is NON-INTERACTIVE: a tool that lands on \`ask\`
+// has nobody to prompt, so without this it collapsed to a deny. Rooted
+// where the run's session files land, so parks live beside them (and
+// inside a tenant's rebased root when one is active). No I/O until a park.
+const __approvalRoot = resolveSessionRootDir(undefined);
+const __approvals = createPendingApprovalStore(
+  __approvalRoot !== undefined ? { rootDir: __approvalRoot } : {},
+);
+
 type ResearchState = {
   readonly version: 1;
   readonly runId: string;
@@ -527,7 +554,7 @@ async function runOneBranch(args: {
     seedMessages: [{ role: "user", content: seedContent }],
     tools,
     installSigintHandler: false,
-    maxTokens: ${ir.agent.maxTokens ?? 4096},${budgetField(ir, "    ")}${limitsFields(ir, "    ")}${hooksField}${permField}${memRunFields}
+    maxTokens: ${ir.agent.maxTokens ?? 4096},${budgetField(ir, "    ")}${limitsFields(ir, "    ")}${hooksField}${permField}${renderApprovalFields(ir, "    ")}${memRunFields}
   });
 
   // Citations recorded for this branch are append-only, so:

@@ -649,6 +649,73 @@ function renderHooksField(ir: IrGraphV0): string {
   return `\n        hooks: ${JSON.stringify(ir.hooks)},`;
 }
 
+/**
+ * Render the spec's `permissions:` block as the `permissionMode` /
+ * `permissionRules` runChatLoop fields, indented for the generated node body.
+ * Graph-level, like the taxonomy: every node's turn is gated by the same
+ * policy. Until now the graph target rendered NEITHER, so a spec's whole
+ * `permissions:` block was silently discarded and every node ran on the
+ * runtime's defaults — a `deny` rule the author wrote was simply not there.
+ * The rule literals carry `source: "yaml"` and sit above `BUILTIN_DEFAULT_RULES`
+ * in the precedence layers exactly as the sibling emitters render them
+ * (target-workflow / target-batch-worker — keep the three in sync). Empty when
+ * the spec declares neither half, so bundles without a block stay
+ * byte-identical.
+ */
+function renderPermissionsFields(ir: IrGraphV0): string {
+  const { mode, rules } = ir.permissions;
+  if (mode === undefined && rules.length === 0) return "";
+  const lines: string[] = [];
+  if (mode !== undefined) {
+    lines.push(`        permissionMode: ${escapeJsonString(mode)},`);
+  }
+  if (rules.length > 0) {
+    const ruleLits = rules
+      .map(
+        (r) =>
+          `            { type: ${escapeJsonString(r.type)}, pattern: ${escapeJsonString(r.pattern)}, source: "yaml" },`,
+      )
+      .join("\n");
+    lines.push(
+      [
+        "        permissionRules: {",
+        "          flag: [],",
+        "          settings: [],",
+        "          yaml: [",
+        ruleLits,
+        "          ],",
+        "          hooks: [],",
+        "          builtin: BUILTIN_DEFAULT_RULES,",
+        "        },",
+      ].join("\n"),
+    );
+  }
+  return `\n${lines.join("\n")}`;
+}
+
+/**
+ * Loop contract 0.4 (Batch C, G11) — the `askMode` + `approvals` fields.
+ * Unlike the CLI's approvalRunOptions, a bundle parses no `--ask-mode`, so the
+ * spec value is FIXED here at emit time. runtime-core parks a headless `ask`
+ * only when BOTH halves are present (`approvals !== undefined && askMode ===
+ * "pause"`), so emitting one without the other leaves ask_mode inert.
+ *
+ * UNCONDITIONAL, and deliberately NOT folded into renderPermissionsFields:
+ * that renderer early-returns on a spec with no `permissions:` block, which is
+ * exactly the case where parking matters most — with no block every unmatched
+ * tool resolves to `ask`. The store is built under `"deny"` too, where it never
+ * parks: it costs nothing (no I/O until something is persisted) and keeps
+ * runtime-core's diagnostic honest, since that branches on `approvals ===
+ * undefined` and would otherwise blame absent plumbing for a deliberate
+ * operator choice.
+ */
+function renderApprovalFields(ir: IrGraphV0, indent: string): string {
+  return (
+    `\n${indent}askMode: ${escapeJsonString(ir.permissions.askMode ?? "pause")},` +
+    `\n${indent}approvals: { store: __approvals, surface: "graph-node" },`
+  );
+}
+
 function renderNodeBody(
   node: IrGraphNode,
   graphLevelFields: string,
@@ -862,8 +929,9 @@ function renderAgent(ir: IrGraphV0, evalEntry = false): string {
   validateGraph(ir);
 
   // Graph-LEVEL runChatLoop fields, identical in every node's call (the
-  // taxonomy precedent): failure taxonomy, spend cap, hard ceilings, hooks.
-  const graphLevelFields = `${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${renderLimitsFields(ir)}${renderHooksField(ir)}`;
+  // taxonomy precedent): failure taxonomy, spend cap, hard ceilings, hooks,
+  // permission policy, and the G11 ask disposition + approval store.
+  const graphLevelFields = `${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${renderLimitsFields(ir)}${renderHooksField(ir)}${renderPermissionsFields(ir)}${renderApprovalFields(ir, "        ")}`;
   // G07 — per-node tools: one grouped import/init block for the file,
   // one array literal per declaring node.
   const tools = resolveTools(ir);
@@ -968,6 +1036,14 @@ function renderAgent(ir: IrGraphV0, evalEntry = false): string {
   const judgeHelperBlock = hasJudges
     ? `${JUDGE_GATE_HELPER}${hasThrowingJudges ? EVAL_EXIT_CONST : ""}`
     : "";
+
+  // The rule literals name BUILTIN_DEFAULT_RULES as their bottom precedence
+  // layer, so the import rides only when the spec declared rules (mirror:
+  // target-batch-worker).
+  const permImport =
+    ir.permissions.rules.length > 0
+      ? `import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";\n`
+      : "";
 
   // HITL machinery, emitted only when a node declares `hitl:` so gate-free
   // bundles stay byte-identical (the judge-helper precedent).
@@ -1088,10 +1164,19 @@ ${plainInvocation
 // Source spec: ${escapeJsonString(ir.name)} (target: graph, ir version: ${ir.version})
 ${errorsImport}${judgeImport}
 import { runChatLoop } from "@crewhaus/runtime-core";
+import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
 import { createCheckpointStore } from "@crewhaus/checkpoint-store";
 ${graphEngineImport}
 import { createRunContext } from "@crewhaus/run-context";${durableImport}
-${toolImportBlock}${toolInitBlock}${hitlHelperBlock}${judgeHelperBlock}${durableHelperBlock}
+${permImport}${toolImportBlock}${toolInitBlock}${hitlHelperBlock}${judgeHelperBlock}${durableHelperBlock}
+// G11 — a compiled bundle is NON-INTERACTIVE: a node whose tool call lands on
+// \`ask\` has nobody to prompt, so without this it collapsed to a deny. Rooted
+// where the run's session files land, so parks live beside them (and inside a
+// tenant's rebased root when one is active). No I/O until a park.
+const __approvalRoot = resolveSessionRootDir(undefined);
+const __approvals = createPendingApprovalStore(
+  __approvalRoot !== undefined ? { rootDir: __approvalRoot } : {},
+);
 const __store = createCheckpointStore();
 const __runContext = createRunContext();
 const __graph = createGraph({ checkpointStore: __store })
