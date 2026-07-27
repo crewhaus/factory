@@ -716,6 +716,21 @@ ${mcpBoot}  // G11 — a compiled bundle is NON-INTERACTIVE: a tool that lands o
             resultBytes: Buffer.byteLength(outcome.value ?? "", "utf8"),
             ...(includeResult ? { result: outcome.value } : {}),
           });
+        } else if (outcome.kind === "deferred") {
+          // NOT a failure: the turn parked on a tool permission that needs a
+          // human. The job is neither ack'd nor dead-lettered — it returns to
+          // the queue after the defer window and the attempt does not count
+          // against maxRetries. Reported under its own status so an operator
+          // watching this stream can tell "waiting on someone" apart from
+          // "broken", and knows to run \`crewhaus approvals list\`.
+          emit({
+            kind: "job_end",
+            jobId: job.id,
+            attempt: job.attempt,
+            status: "awaiting_approval",
+            defers: outcome.defers,
+            error: (outcome.error as Error).message ?? String(outcome.error),
+          });
         } else {
           emit({
             kind: "job_end",

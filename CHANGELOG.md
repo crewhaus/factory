@@ -82,6 +82,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parse now counts as EXPIRED rather than immortal — the shape guard only
   demands a string, so a corrupted line would otherwise survive every
   compaction forever while still carrying its input.
+- **A queue job that parks on an approval no longer burns its retry budget
+  waiting for a human.** With `ask_mode` threaded into the batch worker, a
+  tool permission resolving to `ask` throws `approval_pending` out of the
+  queue handler — and `startConsumer` counted that as a job FAILURE. With the
+  default `maxRetries: 3` and a visibility timeout in the tens of seconds, the
+  budget was spent in under a minute, so a job dead-lettered long before
+  anyone could run `crewhaus approvals grant`. The approval seam could never
+  actually complete on this shape.
+
+  A park is now a DEFER: the job is neither ack'd nor nack'd, its visibility
+  lease is pushed out by `deferVisibilityMs` (default 60s), and the attempt is
+  excluded from the retry budget. The consumer tracks parks per job and
+  subtracts them from `job.attempt`, so a job that parked three times and then
+  genuinely fails still gets its full `maxRetries` worth of real attempts —
+  parking defers the deadline, it does not grant immortality.
+
+  The lease push is the backoff, and it matters: returning a parked job
+  straight to pending spins the consumer — pull, run a model turn, hit the
+  same ungranted permission, park — burning a model call per lap while a human
+  is still deciding.
+
+  Deliberately implemented in the consumer rather than the queue protocol: it
+  uses `extendVisibility`, which every adapter already implements, so
+  in-memory, SQS, Redis-streams and Postgres all behave the same with no
+  interface change. Detection is structural (`report.class`), not
+  `instanceof` — the error crosses a package boundary and, in a compiled
+  bundle, possibly a duplicated `@crewhaus/errors` instance, where an identity
+  check would silently fall through to the failure path.
+
+  Emitted batch bundles report a park as `status: "awaiting_approval"` with a
+  `defers` count, rather than mislabelling it `status: "fail"` with an
+  undefined reason.
 - **Compiled bundles honour `permissions.ask_mode` too.** The interpreter
   learned to park a headless `ask` rather than deny it in place, but every
   target emitter still passed neither `askMode` nor `approvals` into the
