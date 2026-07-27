@@ -398,3 +398,187 @@ export async function resolveApproval(deps: {
   }
   return resolved;
 }
+
+// ---------------------------------------------------------------------------
+// Loop contract 0.4 (G11) — bridging the channel store to the RUNTIME store.
+// ---------------------------------------------------------------------------
+
+/**
+ * The slice of `@crewhaus/session-store`'s `PendingApprovalStore` this bridge
+ * needs. Declared STRUCTURALLY rather than imported so `channel-adapter-base`
+ * gains no dependency on the session store (and no cycle): the emitted daemon
+ * injects the concrete store it already builds for `runChatLoop`.
+ */
+export type RuntimeApprovalRecord = {
+  readonly id: string;
+  readonly toolName: string;
+  readonly inputHash: string;
+  readonly input: unknown;
+  readonly runId: string;
+  readonly sessionId: string;
+  readonly surface: string;
+  readonly createdAt: string;
+  readonly decision?: "grant" | "deny";
+  readonly decidedBy?: string;
+  readonly decidedAt?: string;
+  readonly consumedAt?: string;
+};
+
+export type RuntimeApprovalStoreLike = {
+  persist(approval: RuntimeApprovalRecord): Promise<void>;
+  get(toolName: string, inputHash: string): Promise<RuntimeApprovalRecord | null>;
+  resolve(
+    id: string,
+    decision: ApprovalDecision,
+    by: string,
+  ): Promise<RuntimeApprovalRecord | null>;
+  list(): Promise<RuntimeApprovalRecord[]>;
+};
+
+export type RuntimeBackedApprovalStoreOptions = {
+  /** Mints ids for `put()`. Defaults to the runtime's `appr_<16 hex>` shape. */
+  readonly genId?: () => string;
+  /** Poll interval for `waitFor`. Defaults to 1s. */
+  readonly waitForPollMs?: number;
+  readonly now?: () => Date;
+};
+
+function toChannelApproval(r: RuntimeApprovalRecord): PendingApproval {
+  return {
+    id: r.id,
+    toolName: r.toolName,
+    // The runtime keeps the raw input; the channel surface only ever renders a
+    // preview, and rendering it here (rather than storing it) keeps the raw
+    // value off the Slack path unless a caller asks for it.
+    inputPreview: previewApprovalInput(r.input),
+    surface: r.surface,
+    sessionId: r.sessionId,
+    status: r.decision ?? "pending",
+    createdAt: r.createdAt,
+    ...(r.decidedAt !== undefined ? { decidedAt: r.decidedAt } : {}),
+    ...(r.decidedBy !== undefined ? { decidedBy: r.decidedBy } : {}),
+  };
+}
+
+/**
+ * An {@link ApprovalStore} backed by the RUNTIME's pending-approval store.
+ *
+ * The channel surface and the runtime kept two different stores, and the
+ * runtime's was the only one anything wrote to — so the Slack approve/deny
+ * flow queried an empty map and could never prompt, let alone resume. This is
+ * the adapter that makes them one store.
+ *
+ * It has to be the runtime's store underneath, not the reverse: a granted
+ * approval is consumed when the re-driven turn re-asks runtime-core, which
+ * consults ONLY its own store, keyed `(toolName, inputHash)`. A decision
+ * recorded anywhere else is a decision the agent never sees.
+ *
+ * Three semantics worth knowing, each load-bearing:
+ *
+ *   - `resolve` returns `null` when the record was ALREADY decided. The
+ *     runtime's own `resolve` overwrites and returns the record, but the
+ *     gateway's `/actions` route treats a non-null return as "this call
+ *     transitioned it" and uses it to decide whether to ACK Slack and re-drive
+ *     the turn. Passing the runtime's return through directly would double-ACK
+ *     and double-drive on a Slack retry, which is a real duplicate-side-effect
+ *     bug, not a cosmetic one.
+ *   - ids stay in the runtime's `appr_<16 hex>` space. The channel store minted
+ *     24 hex, which `session-store.resolve()` rejects outright and which
+ *     `crewhaus approvals grant` — the command the Slack prompt itself tells
+ *     the operator to run — will not accept either.
+ *   - it is DURABLE. The in-memory store lost every park on daemon restart and
+ *     shared nothing between processes, so a bot restarted mid-approval left a
+ *     human staring at buttons wired to nothing.
+ */
+export function createRuntimeBackedApprovalStore(
+  runtime: RuntimeApprovalStoreLike,
+  opts: RuntimeBackedApprovalStoreOptions = {},
+): ApprovalStore {
+  const now = opts.now ?? (() => new Date());
+  const waitForPollMs = opts.waitForPollMs ?? 1_000;
+  const genId =
+    opts.genId ??
+    (() => {
+      // Mirror of the runtime's `appr_` + 16 lowercase hex. Kept local rather
+      // than imported so this module stays dependency-free.
+      let out = "appr_";
+      for (let i = 0; i < 16; i++) out += Math.floor(Math.random() * 16).toString(16);
+      return out;
+    });
+
+  async function byId(id: string): Promise<RuntimeApprovalRecord | null> {
+    for (const r of await runtime.list()) if (r.id === id) return r;
+    return null;
+  }
+
+  return {
+    /**
+     * Present for interface parity. Production parks are written by
+     * runtime-core itself, which has the real `inputHash` — the key a grant is
+     * later matched on. A record put here carries a hash derived from the
+     * preview instead, so granting it would NOT unblock a real tool call.
+     */
+    async put(input: NewPendingApproval): Promise<PendingApproval> {
+      const record: RuntimeApprovalRecord = {
+        id: genId(),
+        toolName: input.toolName,
+        inputHash: `preview:${input.inputPreview}`,
+        input: input.inputPreview,
+        runId: "run_channel",
+        sessionId: input.sessionId,
+        surface: input.surface,
+        createdAt: now().toISOString(),
+      };
+      await runtime.persist(record);
+      return toChannelApproval(record);
+    },
+
+    async get(id: string): Promise<PendingApproval | null> {
+      const r = await byId(id);
+      return r === null ? null : toChannelApproval(r);
+    },
+
+    async resolve(
+      id: string,
+      decision: ApprovalDecision,
+      by: string,
+    ): Promise<PendingApproval | null> {
+      // Read BEFORE writing: the pending→decided transition is what the
+      // gateway keys its ACK + resume on, and the runtime store will happily
+      // overwrite a decision without telling us it was already made.
+      const before = await byId(id);
+      if (before === null || before.decision !== undefined) return null;
+      const after = await runtime.resolve(id, decision, by);
+      return after === null ? null : toChannelApproval(after);
+    },
+
+    async list(filter?: ApprovalListFilter): Promise<readonly PendingApproval[]> {
+      const all = (await runtime.list()).map(toChannelApproval);
+      const matched = all.filter(
+        (a) =>
+          (filter?.status === undefined || a.status === filter.status) &&
+          (filter?.sessionId === undefined || a.sessionId === filter.sessionId),
+      );
+      // Newest-first, matching InMemoryApprovalStore's contract.
+      return matched.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+    },
+
+    /**
+     * Polled, because the runtime store is a file other processes also write —
+     * there is no in-process waiter to hook. Unused by the emitted daemon
+     * (which resolves through the gateway route), but the interface promises
+     * it, and an unknown id must reject rather than hang forever.
+     */
+    async waitFor(id: string): Promise<ApprovalDecision> {
+      if ((await byId(id)) === null) {
+        throw new Error(`waitFor: unknown approval "${id}"`);
+      }
+      for (;;) {
+        const r = await byId(id);
+        if (r === null) throw new Error(`waitFor: approval "${id}" disappeared`);
+        if (r.decision !== undefined) return r.decision;
+        await new Promise((resolve) => setTimeout(resolve, waitForPollMs));
+      }
+    },
+  };
+}

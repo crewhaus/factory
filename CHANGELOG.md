@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The channel bot's Slack approve/deny surface is reachable code.** A
+  compiled channel bot emitted a complete park → prompt → grant → resume
+  flow — the router's `approval_pending` catch, `postApprovalPrompt`, the
+  gateway's `/<adapter>/actions` route, `resumeApproval` — and none of it
+  could ever run. Three independent breaks: the emitted turn threaded neither
+  `askMode` nor `approvals`, so the runtime never threw; the catch queried a
+  channel-side `ApprovalStore` that nothing in the emitted daemon ever wrote
+  to, so it would have found nothing anyway; and that store was structurally
+  incompatible with the runtime's, which is where a decision has to land.
+
+  `@crewhaus/channel-adapter-base` now exports
+  `createRuntimeBackedApprovalStore`, an `ApprovalStore` over the runtime's
+  pending-approval store, and the emitted daemon builds ONE store with two
+  faces: the runtime face for `runChatLoop` to park into, the channel face for
+  the router and gateway. It has to be that way round — a granted approval is
+  consumed when the re-driven turn re-asks runtime-core, which consults only
+  its own store, keyed `(toolName, inputHash)`.
+
+  Three consequences worth knowing:
+  - `resolve` returns `null` on a SECOND decision. The gateway treats a
+    non-null return as "I transitioned this" and uses it to ACK Slack and
+    re-drive the turn, while the runtime's own `resolve` overwrites and
+    returns the record regardless — so a Slack interaction retry would have
+    driven the turn twice.
+  - approval ids are now the runtime's `appr_<16 hex>`. The channel store
+    minted 24 hex, which `session-store` rejects outright and which
+    `crewhaus approvals grant` — the command the Slack prompt itself prints —
+    would not accept either.
+  - parks are DURABLE and cross-process. The in-memory store lost every park
+    on restart, leaving a human staring at buttons wired to nothing.
+
+  Covered by a test that EXECUTES the emitted router over the real store:
+  every other approval test in that package asserts on emitted source text,
+  which is precisely how a fully unreachable surface passed CI.
+
+  Still open: a park raised inside a Task SUB-AGENT records the child's
+  `sessionId`, so the router's session-scoped `list()` will not match it. The
+  prompt is posted for top-level turns only; widening the query without a
+  parent link would risk posting one thread's approval into another.
+
 - **Compiled bundles honour `permissions.ask_mode` too.** The interpreter
   learned to park a headless `ask` rather than deny it in place, but every
   target emitter still passed neither `askMode` nor `approvals` into the
