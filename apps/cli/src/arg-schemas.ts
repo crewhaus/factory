@@ -82,6 +82,9 @@ export const RUN_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "model", takesValue: true },
     { name: "permission-mode", takesValue: true },
+    // Loop contract 0.4 (G11) — pause|deny. Overrides the spec's
+    // `permissions.ask_mode` for how a non-interactive `ask` behaves.
+    { name: "ask-mode", takesValue: true },
     { name: "resume", takesValue: true },
     { name: "continue", takesValue: false },
     { name: "prompt", takesValue: true },
@@ -147,6 +150,9 @@ export const RUNS_SCHEMA: ParseArgsSchema = {
     { name: "spec", takesValue: true },
     { name: "model", takesValue: true },
     { name: "permission-mode", takesValue: true },
+    // Loop contract 0.4 (G11) — `runs resume` re-drives a run that PARKED on a
+    // pending approval, so it must accept the same knob the original run did.
+    { name: "ask-mode", takesValue: true },
     { name: "prompt", takesValue: true },
     { name: "justification-judge", takesValue: true },
     { name: "no-justification-audit", takesValue: false },
@@ -195,6 +201,7 @@ export const SERVE_SCHEMA: ParseArgsSchema = {
     // Threaded into the projected agent's turn exactly as on `crewhaus run`.
     { name: "model", takesValue: true },
     { name: "permission-mode", takesValue: true },
+    { name: "ask-mode", takesValue: true },
     { name: "plugins", takesValue: true },
     { name: "no-mcp-quarantine", takesValue: false },
     { name: "help", short: "h" },

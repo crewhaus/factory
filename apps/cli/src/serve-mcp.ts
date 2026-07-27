@@ -25,7 +25,8 @@ export class ServeMcpError extends Error {
 
 export const SERVE_MCP_USAGE =
   "usage: crewhaus serve --mcp <spec.yaml> [--sse] [--port <n>] [--model <m>]\n" +
-  "                      [--permission-mode <default|plan|auto|bypass>] [--plugins <a,b>]\n" +
+  "                      [--permission-mode <default|plan|auto|bypass>]\n" +
+  "                      [--ask-mode <pause|deny>] [--plugins <a,b>]\n" +
   "  Projects the spec's agent as an MCP server so Claude Code / an IDE / another\n" +
   "  CrewHaus runtime can call it as a tool. Each tool call runs one agent turn\n" +
   "  (the same interpreter `crewhaus run` drives) and returns the final reply.\n" +
@@ -37,8 +38,14 @@ export const SERVE_MCP_USAGE =
   "               for stdio.\n" +
   "  The tool projection follows the spec's `expose.mcp.tools` (default `chat` —\n" +
   "  one tool for the whole agent; `per-subagent` also projects one tool per\n" +
-  "  declared sub-agent). `--model` / `--permission-mode` / `--plugins` thread\n" +
-  "  through exactly as on `crewhaus run`.\n";
+  "  declared sub-agent). `--model` / `--permission-mode` / `--ask-mode` /\n" +
+  "  `--plugins` thread through exactly as on `crewhaus run`.\n" +
+  "\n" +
+  "  --ask-mode <pause|deny> matters most here: a daemon has no stdin to prompt\n" +
+  "  on, so a tool permission that resolves to `ask` either parks the turn\n" +
+  "  (pause, the default — the caller gets an error naming the approval id, and\n" +
+  "  `crewhaus approvals grant <id>` releases it for the next identical call) or\n" +
+  "  is refused in place (deny). Overrides the spec's `permissions.ask_mode`.\n";
 
 /** Default SSE listen port when neither `--port` nor `CREWHAUS_MCP_PORT` is set. */
 export const SERVE_MCP_DEFAULT_PORT = 8000;

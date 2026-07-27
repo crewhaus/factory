@@ -2,10 +2,40 @@ import { describe, expect, test } from "bun:test";
 import type { HookDef } from "@crewhaus/hooks-engine";
 import {
   formatCompileWarning,
+  isValidAskMode,
   loopContractRunOptions,
   mergeSpecHooks,
+  resolveAskMode,
   resolveStreaming,
 } from "./loop-contract";
+
+describe("resolveAskMode (loop contract 0.4, Batch C — G11)", () => {
+  test('defaults to "pause" — the documented safe direction', () => {
+    expect(resolveAskMode(undefined, undefined)).toBe("pause");
+  });
+
+  test("the spec's permissions.ask_mode is honoured when no flag is given", () => {
+    expect(resolveAskMode(undefined, "deny")).toBe("deny");
+    expect(resolveAskMode(undefined, "pause")).toBe("pause");
+  });
+
+  test("a valid flag beats the spec, mirroring --permission-mode precedence", () => {
+    expect(resolveAskMode("deny", "pause")).toBe("deny");
+    expect(resolveAskMode("pause", "deny")).toBe("pause");
+  });
+
+  test("a non-string flag (a bare --ask-mode parses as true) falls through to the spec", () => {
+    expect(resolveAskMode(true, "deny")).toBe("deny");
+  });
+
+  test("validation is the caller's job — an invalid flag never silently wins", () => {
+    // The CLI die()s on this before calling. If that guard were ever dropped,
+    // falling through to the spec/default is the safe direction.
+    expect(isValidAskMode("sometimes")).toBe(false);
+    expect(resolveAskMode("sometimes", "pause")).toBe("pause");
+    expect(resolveAskMode("sometimes", undefined)).toBe("pause");
+  });
+});
 
 describe("loopContractRunOptions (loop contract 0.4, Batch A)", () => {
   test("an empty IR slice spreads NOTHING (runtime defaults stay authoritative)", () => {

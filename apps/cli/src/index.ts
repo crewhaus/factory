@@ -160,9 +160,15 @@ import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-lo
 // mines the same scoreboard into pool-policy suggestions.
 import { openScoreboard } from "@crewhaus/routing-store";
 import { createRunContext } from "@crewhaus/run-context";
-import { type AgentIdentityFile, runChatLoop } from "@crewhaus/runtime-core";
+import {
+  type AgentIdentityFile,
+  type RunChatLoopOptions,
+  resolveSessionRootDir,
+  runChatLoop,
+} from "@crewhaus/runtime-core";
 import {
   type PendingApproval,
+  type PendingApprovalStore,
   createPendingApprovalStore,
   createSessionStore,
   evictExpiredSessions,
@@ -964,9 +970,13 @@ import {
 // argv switch on import). Mirror: @crewhaus/target-cli codegen threads the
 // same fields into compiled bundles — keep the two in sync.
 import {
+  type AskMode,
+  VALID_ASK_MODES,
   formatCompileWarning,
+  isValidAskMode,
   loopContractRunOptions,
   mergeSpecHooks,
+  resolveAskMode,
   resolveStreaming,
 } from "./loop-contract";
 // Loop contract 0.4 (Batch B, G42) — the human-readable `compile
@@ -3421,6 +3431,82 @@ function buildRuleSet(
 }
 
 /**
+ * Loop contract 0.4 (Batch C, G11) — the `askMode` + `approvals` fragment
+ * spread into every non-interactive `runChatLoop` this CLI drives.
+ *
+ * Both halves are required for a headless `ask` to PARK rather than deny in
+ * place: runtime-core's branch is `approvals !== undefined && askMode ===
+ * "pause"`. The spec field, the IR lowering, the runtime park logic, the
+ * `crewhaus approvals` verbs and `crewhaus runs resume` all shipped — only
+ * this fragment was missing, so `permissions.ask_mode: pause` was silently
+ * inert on every interpreter path and `createPendingApprovalStore` had no
+ * production caller at all.
+ *
+ * The store root comes from `resolveSessionRootDir`, NOT `process.cwd()`:
+ * parks then land beside the session files they belong to, and inside a
+ * tenant's rebased root when one is active — a process-global
+ * `.crewhaus/sessions` would pool one tenant's pending approvals (including
+ * the tool input echoed in the record) into another tenant's directory.
+ *
+ * The store is passed under `"deny"` too, even though that mode never parks.
+ * It costs nothing — `createPendingApprovalStore` does no I/O until something
+ * is actually persisted, so a deny-mode run still writes no `approvals.jsonl`
+ * — and it keeps the runtime's own diagnostic honest: runtime-core picks
+ * between "(no approvals store wired)" and '(ask_mode: "deny")' by testing
+ * whether a store was supplied, so withholding it would blame missing plumbing
+ * for what is a deliberate operator choice. Getting that wrong is precisely
+ * how this defect stayed invisible.
+ *
+ * The REPL is unaffected either way — runtime-core prefers its interactive
+ * `askApproval` prompter, and only falls through to this when there is no
+ * one to ask.
+ */
+function approvalRunOptions(
+  args: ParsedArgs,
+  permissions: { readonly askMode?: AskMode },
+): Pick<RunChatLoopOptions, "askMode" | "approvals"> {
+  const rootDir = resolveSessionRootDir(undefined);
+  return {
+    askMode: resolveAskMode(args.flags["ask-mode"], permissions.askMode),
+    approvals: { store: createPendingApprovalStore(rootDir !== undefined ? { rootDir } : {}) },
+  };
+}
+
+/**
+ * Reject an invalid `--ask-mode` at the TOP of a command, before any boot
+ * work. Separate from `approvalRunOptions` because that runs inline in the
+ * `runChatLoop({...})` literal — far too late for a `die()` (a process.exit)
+ * to unwind a launched browser or a connected MCP server.
+ */
+function assertValidAskModeFlag(args: ParsedArgs): void {
+  const flag = args.flags["ask-mode"];
+  if (typeof flag === "string" && !isValidAskMode(flag)) {
+    die(`invalid --ask-mode "${flag}" — allowed: ${VALID_ASK_MODES.join(", ")}`);
+  }
+}
+
+/** The root a run's sessions and approvals actually live under. */
+function sessionRootDir(): string {
+  return resolveSessionRootDir(undefined) ?? join(process.cwd(), SESSIONS_SUBDIR);
+}
+
+/**
+ * A session store rooted where `runChatLoop` actually writes — tenant root,
+ * else `CREWHAUS_SESSION_DIR`, else `<cwd>/.crewhaus/sessions`.
+ *
+ * The bare `createSessionStore()` these call sites used defaults to the
+ * cwd-relative path only, so with `CREWHAUS_SESSION_DIR` set a run wrote its
+ * transcript to one directory while `--continue` and `runs resume` looked in
+ * another and reported "no session". That was survivable while nothing
+ * depended on it; it is not now, because `runs resume` is half of the
+ * documented park → grant → resume flow this CLI finally supports.
+ */
+function openRunSessionStore(): ReturnType<typeof createSessionStore> {
+  const rootDir = resolveSessionRootDir(undefined);
+  return createSessionStore(rootDir !== undefined ? { rootDir } : {});
+}
+
+/**
  * FR-004 — resolve the Pillar 3 intent-gate judge for a `run`. Precedence:
  * `--justification-judge` flag > spec `security.justification.judge` >
  * `"rule-based"`. Returns `undefined` for the rule-based path so the
@@ -3483,8 +3569,11 @@ async function resolveEgressMatcher(
 async function runRun(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--streaming] [--trace off|ring|pretty|json] [--budget-usd <n>] [--justification-judge rule-based|claude] [--egress-matcher substring|semantic] [--egress-embedder <model>]\n" +
+      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--ask-mode <pause|deny>] [--resume <sessionId> | --continue] [--prompt <text>] [--streaming] [--trace off|ring|pretty|json] [--budget-usd <n>] [--justification-judge rule-based|claude] [--egress-matcher substring|semantic] [--egress-embedder <model>]\n" +
         "  --prompt <text> runs a single turn non-interactively and prints the reply, then exits (no REPL) — for scripting/CI; composes with --resume/--continue\n" +
+        "  --ask-mode <pause|deny> overrides the spec's permissions.ask_mode for a tool permission that resolves to `ask` with no interactive surface to prompt on:\n" +
+        "    pause (default) parks the run — persists a pending approval, exits 36 — so `crewhaus approvals grant <id>` + `crewhaus runs resume <session>` can re-drive it pre-approved;\n" +
+        "    deny refuses the call in place and lets the turn continue with the denial explained to the model. The REPL always prompts on stdin regardless.\n" +
         "  --model accepts the full router grammar: claude-* (Anthropic), openai/<m>, gemini/<m>, bedrock/<id> (geo prefixes tolerated), local/<m>@<url>\n" +
         '  --plugins <a,b,c> overrides the spec\'s plugins: list for this run (installed plugin names, comma-separated; --plugins "" activates none)\n' +
         "  --streaming dispatches tools mid-stream (as each tool_use block completes) instead of after the full response; the spec's agent.streaming sets the default, the flag forces it on\n" +
@@ -3506,6 +3595,11 @@ async function runRun(args: ParsedArgs): Promise<void> {
   }
   const specPath = args.positional[0];
   if (typeof specPath !== "string") die("missing <spec.yaml>");
+  // Reject a bad --ask-mode HERE, before anything boots. `die()` is a
+  // process.exit, so validating it where it is consumed (inline in the
+  // runChatLoop literal) would skip the browser path's
+  // `finally { driver.disconnect() }` and orphan a headless Chromium on a typo.
+  assertValidAskModeFlag(args);
 
   // Item 41 — `run --watch`: the same debounced parse→lint→compile re-validate
   // loop as `compile --watch`, an authoring aid that does NOT re-launch the
@@ -3615,15 +3709,21 @@ async function runRunsResume(args: ParsedArgs): Promise<void> {
   if (args.flags["help"] === true) {
     process.stdout.write(
       "usage: crewhaus runs resume <session> [--spec <path>] [--prompt <text>] [--model <m>]\n" +
-        "                        [--trace off|ring|pretty|json] [--budget-usd <n>] [--streaming]\n" +
+        "                        [--ask-mode <pause|deny>] [--trace off|ring|pretty|json]\n" +
+        "                        [--budget-usd <n>] [--streaming]\n" +
         "  Re-drives a persisted cli session (a sess_<16 hex> id) — replaying its\n" +
         "  transcript and continuing the loop. The session store keeps only\n" +
         "  name/target/model, so the spec is resolved from --spec, else\n" +
-        "  crewhaus.yaml in the cwd (sessions live under the dir you run from).\n" +
+        "  crewhaus.yaml in the cwd (sessions live under the dir you run from,\n" +
+        "  or under CREWHAUS_SESSION_DIR when it is set).\n" +
         "  Typical use: after a headless run PARKED on a pending approval\n" +
         "  (permissions.ask_mode: pause, exit 36) and `crewhaus approvals grant`\n" +
-        "  resolved it — `runs resume` re-issues the parked call pre-approved.\n" +
-        "  --prompt <text> runs one more turn non-interactively and exits.\n",
+        "  resolved it — `runs resume --prompt <text>` re-issues the parked call\n" +
+        "  pre-approved (the grant is one-shot). Without --prompt this resumes the\n" +
+        "  interactive REPL, where an `ask` prompts on stdin instead.\n" +
+        "  --prompt <text> runs one more turn non-interactively and exits.\n" +
+        "  --ask-mode <pause|deny> overrides the spec's permissions.ask_mode,\n" +
+        "  exactly as on `crewhaus run`.\n",
     );
     return;
   }
@@ -3668,11 +3768,11 @@ async function runRunsResume(args: ParsedArgs): Promise<void> {
   // Confirm the session exists AND belongs to this spec before re-driving — a
   // mismatched name means the wrong spec was resolved, which would replay one
   // agent's transcript into another's instructions.
-  const store = createSessionStore();
+  const store = openRunSessionStore();
   const session = await store.get(sessionId);
   if (session === null) {
     die(
-      `no session "${sessionId}" under ${join(process.cwd(), SESSIONS_SUBDIR)}. Run from the harness directory that owns it, or check the id with \`crewhaus sessions tail\`.`,
+      `no session "${sessionId}" under ${sessionRootDir()}. Run from the harness directory that owns it, or check the id with \`crewhaus sessions tail\`.`,
     );
   }
   if (session.name !== ir.name) {
@@ -3720,7 +3820,7 @@ async function runRunCli(
   // store. session-store's list() returns sessions sorted by updatedAt
   // descending, with a TTL-based eviction sweep as a side effect.
   if (continueFlag) {
-    const store = createSessionStore();
+    const store = openRunSessionStore();
     const sessions = await store.list();
     const match = sessions.find((s: { name: string }) => s.name === ir.name);
     if (match === undefined) {
@@ -4355,6 +4455,10 @@ async function runRunCli(
       tools,
       permissionMode,
       permissionRules,
+      // G11 — honours `permissions.ask_mode` / `--ask-mode`. Inert on the
+      // REPL shape (runtime-core prefers its stdin prompter); load-bearing
+      // under `--prompt`, where an `ask` used to deny in place.
+      ...approvalRunOptions(args, ir.permissions),
       sessionName: ir.name,
       sessionTarget: ir.target,
       hooks,
@@ -4478,7 +4582,7 @@ async function runRunCli(
   if (runFailure !== undefined) {
     const notes: string[] = [];
     try {
-      const store = createSessionStore();
+      const store = openRunSessionStore();
       const sessions = await store.list();
       if (sessions.some((s: { name: string }) => s.name === ir.name)) {
         notes.push(CONTINUE_NOTE);
@@ -4651,6 +4755,9 @@ async function runRunBrowser(
       tools: allTools,
       permissionMode,
       permissionRules,
+      // G11 — always load-bearing here: this shape is non-interactive by
+      // construction (it rejects a TTY with no --prompt).
+      ...approvalRunOptions(args, ir.permissions),
       sessionName: ir.name,
       sessionTarget: "browser",
       singleTurn: true,
@@ -5157,6 +5264,9 @@ async function runServeMcp(args: ParsedArgs): Promise<void> {
   }
   const specPath = args.positional[0];
   if (typeof specPath !== "string") die("missing <spec.yaml>");
+  // Before any MCP server is connected — `die()` is a process.exit and would
+  // skip the daemon's cleanup path.
+  assertValidAskModeFlag(args);
   const absSpec = resolve(specPath);
   let yamlText: string;
   try {
@@ -5472,6 +5582,11 @@ async function buildServeRuntime(
   const commonOptions = {
     permissionMode,
     permissionRules,
+    // G11 — the MCP daemon is the most headless surface there is (under stdio
+    // transport stdout is even redirected to stderr), so an `ask` here has
+    // never had anywhere to go. Threaded once here, covering the primary turn
+    // and the per-sub-agent turn below.
+    ...approvalRunOptions(args, ir.permissions),
     sessionName: ir.name,
     sessionTarget: ir.target,
     hooks,
@@ -13457,9 +13572,16 @@ async function runApprovals(args: ParsedArgs, action: string): Promise<void> {
     );
     return;
   }
+  // Resolve the SAME root a parking run writes to, or the documented
+  // remediation ("grant … then rerun") points at an empty file. An explicit
+  // `--dir` wins; otherwise defer to `resolveSessionRootDir`, which honours a
+  // tenant's rebased root and `CREWHAUS_SESSION_DIR` exactly as the run path
+  // does, and falls back to `<cwd>/.crewhaus/sessions` when neither is set.
   const dirFlag = args.flags["dir"];
-  const harnessRoot = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
-  const rootDir = join(harnessRoot, SESSIONS_SUBDIR);
+  const rootDir =
+    typeof dirFlag === "string"
+      ? join(resolve(dirFlag), SESSIONS_SUBDIR)
+      : (resolveSessionRootDir(undefined) ?? join(process.cwd(), SESSIONS_SUBDIR));
   const store = createPendingApprovalStore({ rootDir });
   const json = args.flags["json"] === true;
 

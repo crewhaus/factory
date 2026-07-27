@@ -19,8 +19,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be reported to the user as a mistyped flag. BEHAVIOR CHANGE for downstream
   consumers that build schemas dynamically: a collision that previously
   resolved to last-write-wins now throws.
+- **`crewhaus run --ask-mode <pause|deny>`** overrides the spec's
+  `permissions.ask_mode` for a single run, with the same flag-beats-spec
+  precedence as `--permission-mode`. Also accepted by `crewhaus runs resume`
+  (which re-drives a parked run) and `crewhaus serve --mcp`.
 
 ### Fixed
+
+- **`permissions.ask_mode` finally does something.** The field was parsed,
+  lowered into the IR, honoured by runtime-core, referenced in `crewhaus runs
+  resume --help`, and backed by working `crewhaus approvals
+  list|show|grant|deny` verbs — but NO interpreter path ever passed `askMode`
+  or `approvals` to `runChatLoop`, and the runtime parks only when it has
+  BOTH. So a spec declaring `ask_mode: pause` (the documented default) was
+  silently inert: every non-interactive `ask` collapsed to an in-place denial,
+  `createPendingApprovalStore` had zero production callers repo-wide, and the
+  remediation the runtime printed — "grant … then rerun" — pointed at a store
+  nothing ever wrote to. `crewhaus run` (cli + browser targets) and `crewhaus
+  serve --mcp` now thread both, so the documented flow works end to end for
+  the first time: a headless `ask` parks (exit 36), the park is visible to
+  `crewhaus approvals list`, and `crewhaus approvals grant <id>` + a rerun
+  re-issues the call pre-approved and consumes the one-shot grant.
+
+  BEHAVIOR CHANGE: a tool permission that resolves to `ask` on a
+  non-interactive surface now PARKS the run (exit 36) instead of denying in
+  place and letting the turn continue. That is what `ask_mode`'s documented
+  default has always specified, but it is new in practice. To keep the old
+  behaviour, declare `permissions.ask_mode: deny` in the spec or pass
+  `--ask-mode deny`. Runs whose tools all resolve to allow/deny are
+  unaffected, as is the interactive REPL, which still prompts on stdin.
+
+  The store root comes from `resolveSessionRootDir`, so parks land beside the
+  session files they belong to and stay inside a tenant's rebased root rather
+  than a process-global `.crewhaus/sessions` — a pending-approval record
+  echoes the tool input, so pooling them across tenants would leak it.
+  `crewhaus approvals` now resolves the same root (an explicit `--dir` still
+  wins), so the verbs and the run path cannot disagree about where the store
+  lives. For the same reason `runs resume`, `run --continue` and the
+  resume-hint probe now open the session store at the resolved root instead of
+  a cwd-relative one: with `CREWHAUS_SESSION_DIR` set they previously looked
+  where the run had NOT written, reporting "no session" for a session that
+  existed — which would have broken the resume half of this very flow.
+- **`crewhaus fleet run` no longer reports a parked harness as unclassified
+  breakage.** `describeFleetExit` had no row for exit 36, so a park rolled up
+  as `unknown ×1` beside real failures — contradicting
+  `EXIT_CODES.approval_pending`'s own docblock, which says this surface should
+  report "needs approval" and resume rather than alert. Newly reachable now
+  that runs can actually park.
+
+  NOT fixed here, and deliberately so:
+  - Every compiled target bundle has the same gap — no emitter passes either
+    option, so `ask_mode` stays inert in generated bundles. The channel bot is
+    the sharpest case: it builds an approvals store and implements the full
+    Slack park→approve→resume surface, but its emitted `runChatLoop` receives
+    neither option, so `approval_pending` can never be thrown and the router's
+    handler is unreachable.
+  - Sub-agent (`Task`) turns. The child loop in `@crewhaus/sub-agent-spawner`
+    forwards `permissionMode`/`permissionRules` but not `askMode`/`approvals`,
+    and runtime-core's `RuntimeBridge` does not carry them, so an `ask` inside
+    a sub-agent still denies in place and still prints "(no approvals store
+    wired)". Threading it raises a real design question this change should not
+    answer in passing: whether a parked CHILD parks the parent run or surfaces
+    as a Task-tool error.
 
 - **The browser runtime smoke boots again — and a failing advisory can no
   longer report green.** `playwright` was dropped from the root

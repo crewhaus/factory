@@ -724,6 +724,16 @@ export function describeFleetExit(
       title: "run stopped by the configured budget cap",
     },
     [EXIT_CODES.tool]: { class: "tool", title: "tool / MCP failure" },
+    // Not breakage — the run PARKED awaiting a human decision, which is what
+    // `EXIT_CODES.approval_pending`'s own docblock says this surface should
+    // report as "needs approval" rather than alert on. Reachable for the
+    // first time now that the interpreter actually threads `approvals`;
+    // without a row here a parked harness rolls up as `unknown ×1` beside
+    // real failures.
+    [EXIT_CODES.approval_pending]: {
+      class: "approval_pending",
+      title: "parked awaiting tool approval (see `crewhaus approvals list`)",
+    },
   };
   return table[exitCode];
 }

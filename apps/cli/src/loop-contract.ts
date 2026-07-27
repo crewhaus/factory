@@ -56,6 +56,35 @@ export type LoopContractIrSlice = {
   readonly compaction?: Pick<IrCompaction, "threshold" | "snipKeepHead" | "snipKeepTail">;
 };
 
+/** Valid `--ask-mode` values, mirroring `VALID_PERMISSION_MODES`. */
+export const VALID_ASK_MODES = ["pause", "deny"] as const;
+
+export type AskMode = (typeof VALID_ASK_MODES)[number];
+
+export function isValidAskMode(value: string): value is AskMode {
+  return (VALID_ASK_MODES as ReadonlyArray<string>).includes(value);
+}
+
+/**
+ * Loop contract 0.4 (Batch C, G11) — resolve how a tool permission that lands
+ * on `ask` behaves where there is no interactive surface to prompt on.
+ *
+ * Precedence mirrors `--permission-mode` exactly: an explicit valid flag wins,
+ * then the spec's `permissions.ask_mode`, then the documented default
+ * `"pause"`. An INVALID flag is not this function's problem — the caller
+ * validates and `die()`s first, so this stays pure and unit-testable.
+ *
+ * Returned as a concrete value rather than left to the runtime's own
+ * `askMode ?? "pause"` default so the resolved disposition is explicit in the
+ * options object. `"pause"` only PARKS when an approvals store is also wired
+ * (runtime-core requires both); the caller builds that store, because it needs
+ * a session root this module deliberately does not know about.
+ */
+export function resolveAskMode(flag: unknown, specAskMode: AskMode | undefined): AskMode {
+  if (typeof flag === "string" && isValidAskMode(flag)) return flag;
+  return specAskMode ?? "pause";
+}
+
 /**
  * Build the loop-contract options fragment from a lowered IR. Every key is
  * absent-when-omitted (spread-return-{} discipline) so an empty spec spreads
