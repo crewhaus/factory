@@ -20,6 +20,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumers that build schemas dynamically: a collision that previously
   resolved to last-write-wins now throws.
 
+### Fixed
+
+- **The browser runtime smoke boots again — and a failing advisory can no
+  longer report green.** `playwright` was dropped from the root
+  devDependencies by the docs/demos split (36140d81), so `bun install` stopped
+  putting the *package* in the tree while `Smoke (runtime)` kept installing
+  only the *browser binaries*. Every run since died in the chromium driver's
+  `import("playwright")` ~450ms in — before a session log existed, before any
+  model turn — and the advisory gate swallowed it, so the nightly cron
+  reported green for weeks while the browser shape covered nothing at all
+  (the cli shape kept passing, which is why the job looked healthy). The
+  pinned devDependency is restored (`playwright` 1.59.1, the version the
+  lockfile's optional peer already expected), and the workflow now preflights
+  the package half so a dropped dependency names itself instead of surfacing
+  as a cryptic non-zero exit; `bunx` resolves the repo-pinned CLI, so
+  installed chromium build ids match the package that imports them.
+- **The browser smoke's own tools are no longer denied before they run.**
+  `Navigate` and `Screenshot` both resolve to `ask`, and the smoke drives a
+  one-shot `--prompt` run — a non-interactive surface with no approvals store,
+  where an unruled `ask` collapses into a denial. Confirmed against a live
+  model: `tool denied: \`Navigate\` defaulted to "ask" and this
+  non-interactive surface has no way to prompt`, after which the agent
+  correctly reported it could not proceed. The fixture now grants
+  `alwaysAllow` for exactly those two tools — no permission-mode change,
+  nothing else widened. This was masked by the boot failure above, which
+  killed the run long before any permission check.
+- **The runtime smoke's "the agent used the tool" assertions are now
+  load-bearing.** `tool_use` is logged when the model *requests* a tool —
+  before the permission gate and before `execute()` — so a denied tool and a
+  working tool were indistinguishable in the stream the harness inspected.
+  Both shapes now pair each `tool_use` with its `tool_result` and fail on an
+  error result. This was not theoretical: while the browser tools were being
+  denied outright, the `Navigate` and `Screenshot` assertions passed and the
+  smoke blamed the model for "not grounding its answer".
+- **Advisory smoke failures are now visible without reading the log.** A
+  non-fatal browser failure emits a GitHub Actions `::error` annotation and a
+  job-summary entry (`reportBrowserAdvisory`), and the failure strings carry
+  the spawned process's stderr tail — previously the sole output was one
+  stdout line listing symptoms with the cause discarded, which is exactly the
+  "unattended green must never mean silently skipped" failure the workflow
+  header says the job exists to prevent.
+
+  KNOWN, STILL FAILING: the browser runtime smoke does not pass yet. Its
+  fixture page is served on `http://127.0.0.1:<port>`, and the SSRF floor
+  refuses private/loopback targets in two independent layers
+  (`assertSafeNavigationTarget`, and the chromium backend's DNS-pinning
+  proxy), neither of which a spec can opt out of today. Until a reviewed
+  `driver.allowPrivateTargets` opt-in lands, every run emits the advisory
+  annotation above with `Navigate was called but returned an error:
+  navigation to … blocked: private/loopback IP`. That is deliberate — the
+  alternative is the silent green this entry exists to end — but it does mean
+  the annotation is expected, not new information, until the opt-in ships.
+
 ## [0.4.1] - 2026-07-26
 
 ### Added

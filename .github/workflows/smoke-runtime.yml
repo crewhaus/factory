@@ -47,8 +47,26 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # TWO halves, both required — this is what silently broke the browser
+      # smoke for weeks. `bun install` puts the playwright PACKAGE in the tree
+      # (root devDependency, pinned); this step adds the matching BROWSER
+      # binaries. Installing only the browsers leaves the chromium driver's
+      # `import("playwright")` failing at runtime, which exits `crewhaus run`
+      # ~450ms in with no session log — a boot failure that reads like flake.
+      # The preflight asserts the package half, so a dropped dependency names
+      # itself instead of hiding behind a cryptic non-zero exit.
+      #
+      # bunx resolves the repo-pinned CLI (node_modules/.bin), so the browser
+      # build ids match the package that imports them; an unpinned
+      # `playwright@latest` would fetch a different chromium revision than the
+      # runtime looks for.
       - name: Install Playwright chromium
-        run: bunx playwright install --with-deps chromium
+        run: |
+          bun -e 'await import("playwright")' || {
+            echo "::error title=playwright package missing::playwright must resolve from node_modules for the chromium driver — restore the root devDependency (installing only the browser binaries is not enough)"
+            exit 1
+          }
+          bunx playwright install --with-deps chromium
 
       - name: Runtime smoke (cli + browser)
         env:

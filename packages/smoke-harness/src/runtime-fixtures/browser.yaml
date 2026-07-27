@@ -11,3 +11,26 @@ agent:
     the page, then report the magic phrase verbatim in your final reply.
     Do not answer from prior knowledge — the phrase is randomised per
     run, so guessing will fail the test.
+# Every browser tool resolves to "ask" in `default` mode (readOnly/destructive
+# are consulted only in `auto`), and this smoke drives a ONE-SHOT (`--prompt`)
+# run: a non-interactive surface with no approvals store has nothing to prompt,
+# so an unruled `ask` collapses into a denial in place and the agent reports it
+# cannot proceed.
+#
+# `runRunBrowser` registers SEVEN tools and advertises all of them. The three
+# read-only ones are ruled here: Navigate and Screenshot because the harness
+# asserts on them, and FindElement because its description sells it to the
+# model as the way to locate content on a page — a model that finds the
+# screenshot hard to read reaches for it and hits the same denial.
+#
+# Click/Type/Key/Scroll are deliberately left UNRULED: this smoke never needs
+# to mutate the page, and an unruled destructive tool failing closed is the
+# outcome we want.
+permissions:
+  rules:
+    - type: alwaysAllow
+      pattern: Navigate
+    - type: alwaysAllow
+      pattern: Screenshot
+    - type: alwaysAllow
+      pattern: FindElement
