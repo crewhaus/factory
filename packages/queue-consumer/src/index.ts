@@ -27,6 +27,17 @@
  *   - handler throws + `attempt >= maxRetries` → `nack(permanent)` so
  *     the queue moves the job to its DLQ.
  *   - handler resolves → `ack`.
+ *   - handler throws `approval_pending` (loop contract 0.4, G11) → DEFER:
+ *     neither ack nor nack, push the visibility lease out by
+ *     `deferVisibilityMs`, and do not count the attempt.
+ *
+ * Why parking is not a retry: a parked job is waiting on a human running
+ * `crewhaus approvals grant`, which takes as long as it takes. Counted as a
+ * failure — the pre-G11 behaviour — the default 3-retry budget was spent in
+ * under a minute and the job dead-lettered long before anyone looked at it,
+ * so the approval seam could never actually complete on this shape. The
+ * grant is keyed on `(toolName, inputHash)`, so any later re-delivery finds
+ * it; the only thing that had to change was not throwing the job away first.
  *
  * Drain semantics: `drain()` stops new pulls but lets in-flight handlers
  * complete + ack. `stop()` is `drain()` plus a wait — used by the
@@ -46,7 +57,16 @@ export class QueueConsumerError extends CrewhausError {
 
 export type ConsumerHandlerOutcome<TResult> =
   | { kind: "ok"; value: TResult; fromCache: boolean }
-  | { kind: "fail"; reason: NackReason; error: unknown };
+  | { kind: "fail"; reason: NackReason; error: unknown }
+  /**
+   * The handler PARKED awaiting a human decision (`approval_pending`) rather
+   * than failing. The job is neither ack'd nor nack'd: its visibility lease
+   * is pushed out by `deferVisibilityMs`, and when that expires the adapter
+   * returns it to pending for a later re-delivery. `defers` is how many times
+   * THIS job has parked, and those attempts are excluded from the retry
+   * budget — see `handleOne`.
+   */
+  | { kind: "deferred"; error: unknown; defers: number };
 
 export type ConsumerObserver<TInput, TResult> = {
   onJobStart?(job: Job<TInput>): void;
@@ -66,6 +86,17 @@ export type ConsumerOptions<TInput, TResult> = {
   readonly idempotencyStore?: IdempotencyStore<TResult>;
   readonly idempotencyTtlMs?: number;
   readonly maxRetries?: number;
+  /**
+   * How long a PARKED job (handler threw `approval_pending`) stays invisible
+   * before the queue re-delivers it. Defaults to 60s.
+   *
+   * A park is not a failure, so the job must come back — but it must not come
+   * back IMMEDIATELY. Returning it straight to pending spins the consumer:
+   * pull → run a model turn → hit the same ungranted permission → park, over
+   * and over, burning a model call per lap while a human is still deciding.
+   * The lease push is the backoff.
+   */
+  readonly deferVisibilityMs?: number;
   /** Per-pull batch cap. Defaults to `concurrency`. */
   readonly pullBatchSize?: number;
   /** Wait between empty-queue pulls. Defaults to 100ms. */
@@ -97,6 +128,21 @@ const DEFAULT_VISIBILITY_RENEW_INTERVAL_MS = 5_000;
 const DEFAULT_IDEMPOTENCY_TTL_MS = 60_000;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_EMPTY_QUEUE_POLL_MS = 100;
+const DEFAULT_DEFER_VISIBILITY_MS = 60_000;
+
+/**
+ * Loop contract 0.4 (G11) — did the handler PARK on a pending approval rather
+ * than fail?
+ *
+ * Structural, not `instanceof`: the error crosses a package boundary (and, in
+ * a compiled bundle, possibly a duplicated `@crewhaus/errors` instance), so an
+ * identity check would silently fall through to the failure path — which is
+ * exactly the bug this function exists to prevent, and it would be invisible.
+ */
+function isApprovalPending(err: unknown): boolean {
+  const report = (err as { report?: { class?: unknown } } | null | undefined)?.report;
+  return typeof report === "object" && report !== null && report.class === "approval_pending";
+}
 
 export function startConsumer<TInput, TResult>(
   opts: ConsumerOptions<TInput, TResult>,
@@ -106,6 +152,7 @@ export function startConsumer<TInput, TResult>(
   const maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES;
   const pullBatch = opts.pullBatchSize ?? opts.concurrency;
   const emptyPollMs = opts.emptyQueuePollMs ?? DEFAULT_EMPTY_QUEUE_POLL_MS;
+  const deferVisibilityMs = opts.deferVisibilityMs ?? DEFAULT_DEFER_VISIBILITY_MS;
   const ts = opts._setTimeout ?? setTimeout;
   const tc = opts._clearTimeout ?? clearTimeout;
 
@@ -119,6 +166,14 @@ export function startConsumer<TInput, TResult>(
   let stopping = false;
   let drainPromise: Promise<void> | undefined;
   const inFlight = new Set<Promise<void>>();
+  /**
+   * jobId → how many of its deliveries ended in an approval park. Subtracted
+   * from `job.attempt` so waiting on a human never advances a job toward the
+   * DLQ. Cleared when the job reaches a terminal state (ack / permanent
+   * nack), so this holds at most one integer per job currently awaiting
+   * approval — a job parked forever is the intended outcome, not a leak.
+   */
+  const deferCounts = new Map<string, number>();
 
   // Pull loop runs as a background async function. It awaits available
   // concurrency before pulling the next batch.
@@ -179,23 +234,55 @@ export function startConsumer<TInput, TResult>(
         : { value: await opts.handler(job.input, { key, job }), fromCache: false };
       outcome = { kind: "ok", value: r.value, fromCache: r.fromCache };
     } catch (err) {
-      const isLast = job.attempt >= maxRetries;
-      outcome = {
-        kind: "fail",
-        reason: isLast ? "permanent" : "transient",
-        error: err,
-      };
+      if (isApprovalPending(err)) {
+        // A park is NOT a failure — it is a run waiting on a human, and the
+        // only thing that can resolve it is someone running `crewhaus
+        // approvals grant`. Counting it against `maxRetries` meant a job
+        // almost always dead-lettered before that happened: with the default
+        // 3 retries and a visibility timeout in the tens of seconds, the
+        // budget was spent in under a minute.
+        const defers = (deferCounts.get(job.id) ?? 0) + 1;
+        deferCounts.set(job.id, defers);
+        outcome = { kind: "deferred", error: err, defers };
+      } else {
+        // Attempts spent parking do not count toward the retry budget, so a
+        // job that parked twice and then genuinely fails still gets its full
+        // `maxRetries` worth of real attempts.
+        const effectiveAttempt = job.attempt - (deferCounts.get(job.id) ?? 0);
+        outcome = {
+          kind: "fail",
+          reason: effectiveAttempt >= maxRetries ? "permanent" : "transient",
+          error: err,
+        };
+      }
     } finally {
       stopRenew();
     }
     if (outcome.kind === "ok") {
+      deferCounts.delete(job.id);
       try {
         await opts.queue.ack(job.id);
       } catch (err) {
         // Best-effort: log + continue. Adapter ack failures don't reach
         // userland; they'd surface as duplicate work on the next pull.
       }
+    } else if (outcome.kind === "deferred") {
+      // Neither ack nor nack: acking would drop the job on the floor, and
+      // nacking would either burn the budget (transient) or dead-letter it
+      // (permanent). Instead push the lease out — every adapter already
+      // implements `extendVisibility`, so this needs no protocol change and
+      // behaves the same on in-memory, SQS, Redis and Postgres. When the
+      // lease expires the adapter returns the job to pending on its own.
+      try {
+        await opts.queue.extendVisibility(job.id, deferVisibilityMs);
+      } catch {
+        // If the lease can no longer be extended the job has already been
+        // reclaimed — it will be re-delivered anyway, which is the same
+        // outcome, just sooner.
+      }
     } else {
+      // Terminal for this job: stop tracking its parks.
+      if (outcome.reason === "permanent") deferCounts.delete(job.id);
       try {
         await opts.queue.nack(job.id, outcome.reason);
       } catch {

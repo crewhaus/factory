@@ -594,3 +594,25 @@ describe("emitBatchWorker — emitted scheduled bundle is syntactically valid TS
     expect(() => t.transformSync(code)).not.toThrow();
   });
 });
+
+describe("emitBatchWorker — a parked job is reported as awaiting_approval (G11)", () => {
+  const ir = baseIr;
+
+  test("the emitted observer has a deferred branch, distinct from fail", () => {
+    const code = emitBatchWorker(ir).files[0]?.content ?? "";
+    // Without this branch a park falls into the `else` and is emitted as
+    // `status: "fail"` with `reason: undefined` — telling an operator the job
+    // broke when it is actually waiting on them.
+    expect(code).toContain('outcome.kind === "deferred"');
+    expect(code).toContain('status: "awaiting_approval"');
+    expect(code).toContain("defers: outcome.defers");
+    // and the ordinary failure branch survives
+    expect(code).toContain('status: "fail"');
+    expect(code).toContain("reason: outcome.reason");
+  });
+
+  test("the emitted bundle still parses", () => {
+    const code = emitBatchWorker(ir).files[0]?.content ?? "";
+    expect(() => new Bun.Transpiler({ loader: "ts" }).transformSync(code)).not.toThrow();
+  });
+});
