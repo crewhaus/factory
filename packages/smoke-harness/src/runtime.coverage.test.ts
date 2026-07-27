@@ -28,10 +28,15 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
  * Every spy is restored in `afterEach`; the harness's own temp dirs are
  * cleaned by its `finally` blocks, so no handle outlives a test.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  type RuntimeSmokeResult,
   browserRuntimeSmokeIsRequired,
+  renderBrowserAdvisory,
+  renderBrowserAdvisorySummary,
+  reportBrowserAdvisory,
   resolveSmokeModel,
   runBrowserRuntimeSmoke,
   runCliRuntimeSmoke,
@@ -553,6 +558,102 @@ describe("browserRuntimeSmokeIsRequired", () => {
   test('false for any value other than exactly "1"', () => {
     expect(browserRuntimeSmokeIsRequired({ CREWHAUS_RUNTIME_SMOKE_BROWSER: "true" })).toBe(false);
     expect(browserRuntimeSmokeIsRequired({ CREWHAUS_RUNTIME_SMOKE_BROWSER: "0" })).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Advisory reporting — an advisory failure stays non-fatal but must be
+// IMPOSSIBLE to miss. The old one-line stdout note let a deterministic boot
+// failure ride green for weeks; these cover the annotation + job summary.
+// ---------------------------------------------------------------------------
+
+const advisoryResult: RuntimeSmokeResult = {
+  shape: "browser",
+  status: "failed",
+  failures: [
+    "crewhaus run exited non-zero (1) — stderr: crewhaus: Playwright not installed.",
+    "no event-log .jsonl written to /tmp/crewhaus-runtime-smoke-abc123",
+  ],
+  stderr: "crewhaus: Playwright not installed.\n",
+};
+
+describe("renderBrowserAdvisory", () => {
+  test("emits a GitHub error annotation under Actions", () => {
+    const line = renderBrowserAdvisory(advisoryResult, { GITHUB_ACTIONS: "true" });
+    expect(line.startsWith("::error title=")).toBe(true);
+    expect(line).toContain("Playwright not installed");
+    expect(line).toContain("CREWHAUS_RUNTIME_SMOKE_BROWSER=1");
+  });
+
+  test("annotation stays single-line (newlines escaped as %0A)", () => {
+    const line = renderBrowserAdvisory(
+      { ...advisoryResult, failures: ["first\nsecond", "100% broken"] },
+      { GITHUB_ACTIONS: "true" },
+    );
+    expect(line.includes("\n")).toBe(false);
+    expect(line).toContain("%0A");
+    expect(line).toContain("100%25 broken");
+  });
+
+  test("falls back to a plain stdout line outside Actions", () => {
+    const line = renderBrowserAdvisory(advisoryResult, {});
+    expect(line.startsWith("[smoke:runtime browser] ADVISORY")).toBe(true);
+    expect(line).toContain("Playwright not installed");
+  });
+});
+
+describe("renderBrowserAdvisorySummary", () => {
+  test("lists every failure and includes the stderr tail", () => {
+    const md = renderBrowserAdvisorySummary(advisoryResult);
+    expect(md).toContain("Browser runtime smoke failed");
+    for (const f of advisoryResult.failures) expect(md).toContain(f);
+    expect(md).toContain("stderr tail");
+    expect(md).toContain("Playwright not installed");
+  });
+
+  test("omits the stderr block when the subprocess wrote nothing", () => {
+    const md = renderBrowserAdvisorySummary({ ...advisoryResult, stderr: "" });
+    expect(md).not.toContain("stderr tail");
+  });
+});
+
+describe("reportBrowserAdvisory", () => {
+  test("writes the annotation and appends to $GITHUB_STEP_SUMMARY", () => {
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-advisory-"));
+    const summaryPath = join(dir, "summary.md");
+    writeFileSync(summaryPath, "# existing\n");
+    const written: string[] = [];
+    try {
+      reportBrowserAdvisory(
+        advisoryResult,
+        { GITHUB_ACTIONS: "true", GITHUB_STEP_SUMMARY: summaryPath },
+        (t) => written.push(t),
+      );
+      expect(written.join("")).toContain("::error title=");
+      const summary = readFileSync(summaryPath, "utf-8");
+      expect(summary).toContain("# existing");
+      expect(summary).toContain("Browser runtime smoke failed");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("no summary env → stdout only, no throw", () => {
+    const written: string[] = [];
+    reportBrowserAdvisory(advisoryResult, {}, (t) => written.push(t));
+    expect(written.join("")).toContain("[smoke:runtime browser] ADVISORY");
+  });
+
+  test("an unwritable summary path is swallowed — reporting never fails the run", () => {
+    const written: string[] = [];
+    expect(() =>
+      reportBrowserAdvisory(
+        advisoryResult,
+        { GITHUB_STEP_SUMMARY: "/nonexistent-dir-crewhaus/summary.md" },
+        (t) => written.push(t),
+      ),
+    ).not.toThrow();
+    expect(written.length).toBe(1);
   });
 });
 

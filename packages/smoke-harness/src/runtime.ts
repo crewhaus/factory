@@ -31,6 +31,7 @@
  * model.
  */
 import {
+  appendFileSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -93,19 +94,109 @@ export function resolveSmokeModel(env: NodeJS.ProcessEnv = process.env): string 
 }
 
 /**
- * Whether the browser runtime smoke is a HARD gate. Defaults OFF: the
- * browser runtime smoke still RUNS and REPORTS, but a browser-shape failure
- * is advisory and must NOT block the release gate. On the CI runner the live
- * headless-chromium + browser-bundle startup is flaky (no session log / no
- * tool calls), which is a runner/environment issue separate from product
- * correctness — the browser target is already covered by its unit and
- * compile-time smoke tests. The release gate therefore requires only the CLI
- * runtime smoke (the core "a real agent does real tool use and grounds its
- * answer" assurance). Set `CREWHAUS_RUNTIME_SMOKE_BROWSER=1` to promote the
- * browser runtime smoke back to a hard assertion once CI chromium is hardened.
+ * Whether the browser runtime smoke is a HARD gate. Defaults OFF, so a
+ * browser-shape failure does not block the release gate; the CLI runtime
+ * smoke remains the hard gate.
+ *
+ * HISTORY — read before trusting this default. The advisory was introduced
+ * (PR #33) on the theory that "live headless-chromium startup is flaky on the
+ * CI runner". That diagnosis was wrong. The failure was deterministic, not
+ * flaky: the docs/demos split (36140d81) deleted `playwright` from the root
+ * devDependencies, so `bun install` stopped putting the PACKAGE in the tree
+ * while the workflow kept installing only the BROWSER binaries. Every run
+ * since died in `import("playwright")` inside the chromium driver, ~450ms in,
+ * before a session log existed. The advisory then hid it: the job reported
+ * green for weeks. Fixed by restoring the pinned devDependency.
+ *
+ * A failure here is therefore a REAL signal, never ambient flake. It must
+ * never again be swallowed silently — an advisory failure emits a GitHub
+ * Actions error annotation and a job-summary entry (see
+ * `reportBrowserAdvisory`), so an unattended green can no longer mean
+ * "quietly broken". Set `CREWHAUS_RUNTIME_SMOKE_BROWSER=1` to promote it to a
+ * hard assertion.
  */
 export function browserRuntimeSmokeIsRequired(env: NodeJS.ProcessEnv = process.env): boolean {
   return env["CREWHAUS_RUNTIME_SMOKE_BROWSER"] === "1";
+}
+
+/**
+ * Last few stderr lines from the spawned `crewhaus run`, flattened onto one
+ * line. A boot failure (missing dependency, bad config) says exactly what
+ * went wrong on stderr; the advisory path used to discard it entirely, which
+ * is why "exited non-zero (1)" was all anyone ever saw of a one-line
+ * "Playwright not installed" error.
+ */
+function stderrTail(stderr: string, lines = 3, max = 400): string {
+  const tail = stderr
+    .trim()
+    .split("\n")
+    .filter((l) => l.trim().length > 0)
+    .slice(-lines)
+    .join(" | ")
+    .trim();
+  return tail.length > max ? `${tail.slice(0, max)}…` : tail;
+}
+
+/** GitHub Actions annotation messages are single-line; newlines are %0A. */
+function escapeAnnotation(message: string): string {
+  return message.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+}
+
+/**
+ * Text printed when the browser runtime smoke fails while advisory. Inside
+ * GitHub Actions this is an `::error::` workflow command, which surfaces the
+ * failure as a run annotation even though the job stays green — the whole
+ * point being that a persistently-failing smoke can be seen without reading
+ * the log.
+ */
+export function renderBrowserAdvisory(
+  result: RuntimeSmokeResult,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const detail = `browser runtime smoke FAILED (non-fatal — set CREWHAUS_RUNTIME_SMOKE_BROWSER=1 to enforce). Failures: ${result.failures.join("; ")}`;
+  if (env["GITHUB_ACTIONS"] === "true") {
+    return `::error title=Browser runtime smoke failed (advisory)::${escapeAnnotation(detail)}`;
+  }
+  return `[smoke:runtime browser] ADVISORY — ${detail}`;
+}
+
+/** Markdown appended to `$GITHUB_STEP_SUMMARY` for an advisory failure. */
+export function renderBrowserAdvisorySummary(result: RuntimeSmokeResult): string {
+  const failures = result.failures.map((f) => `- ${f}`).join("\n");
+  const tail = stderrTail(result.stderr ?? "", 10, 2000);
+  return [
+    "### ⚠️ Browser runtime smoke failed (advisory — job still green)",
+    "",
+    "This shape is not a release gate, but a failure here is a real signal.",
+    "",
+    failures,
+    "",
+    ...(tail.length > 0
+      ? ["<details><summary>stderr tail</summary>", "", "```", tail, "```", "", "</details>", ""]
+      : []),
+    "Set `CREWHAUS_RUNTIME_SMOKE_BROWSER=1` to make this a hard failure.",
+    "",
+  ].join("\n");
+}
+
+/**
+ * Report an advisory browser failure loudly: stdout line (an annotation under
+ * Actions) plus a job-summary entry. Summary-append failures are swallowed —
+ * reporting must never be what breaks the run.
+ */
+export function reportBrowserAdvisory(
+  result: RuntimeSmokeResult,
+  env: NodeJS.ProcessEnv = process.env,
+  write: (text: string) => void = (text) => process.stdout.write(text),
+): void {
+  write(`${renderBrowserAdvisory(result, env)}\n`);
+  const summaryPath = env["GITHUB_STEP_SUMMARY"];
+  if (summaryPath === undefined || summaryPath === "") return;
+  try {
+    appendFileSync(summaryPath, renderBrowserAdvisorySummary(result));
+  } catch {
+    // best-effort — a missing/unwritable summary file must not fail the test
+  }
 }
 
 /**
@@ -319,7 +410,10 @@ export async function runCliRuntimeSmoke(
 
     const failures: string[] = [];
     if (exitCode !== 0) {
-      failures.push(`crewhaus run exited non-zero (${exitCode})`);
+      const tail = stderrTail(stderr);
+      failures.push(
+        `crewhaus run exited non-zero (${exitCode})${tail.length > 0 ? ` — stderr: ${tail}` : ""}`,
+      );
     }
 
     const events = readSessionEventLog(sessionDir);
@@ -436,7 +530,13 @@ export async function runBrowserRuntimeSmoke(
 
     const failures: string[] = [];
     if (exitCode !== 0) {
-      failures.push(`crewhaus run exited non-zero (${exitCode})`);
+      // Carry the stderr tail INTO the failure string: this list is all the
+      // advisory path prints, and a sub-second non-zero exit is always a boot
+      // error whose reason is on stderr.
+      const tail = stderrTail(stderr);
+      failures.push(
+        `crewhaus run exited non-zero (${exitCode})${tail.length > 0 ? ` — stderr: ${tail}` : ""}`,
+      );
     }
 
     const events = readSessionEventLog(sessionDir);

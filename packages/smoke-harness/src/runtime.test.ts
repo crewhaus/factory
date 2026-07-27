@@ -11,6 +11,7 @@ import { describe, expect, test } from "bun:test";
 import {
   type RuntimeSmokeResult,
   browserRuntimeSmokeIsRequired,
+  reportBrowserAdvisory,
   runBrowserRuntimeSmoke,
   runCliRuntimeSmoke,
   runtimeSmokeIsEnabled,
@@ -57,18 +58,17 @@ describe("runtime smoke — browser", () => {
     async () => {
       if (shouldSkip("browser")) return;
       const result = await runBrowserRuntimeSmoke();
-      // The browser runtime smoke is ADVISORY by default: it runs and reports
-      // its outcome, but a failure does NOT block the release gate. Live
-      // headless-chromium + browser-bundle startup is flaky on the CI runner
-      // (no session log / no tool calls) — a runner issue, not a product
-      // regression; the browser target is covered by its unit + compile-time
-      // smoke tests. Set CREWHAUS_RUNTIME_SMOKE_BROWSER=1 to make it a hard
-      // assertion once CI chromium is hardened. The CLI runtime smoke remains
-      // the hard gate below.
+      // The browser runtime smoke is ADVISORY by default: a failure does NOT
+      // block the release gate (the CLI runtime smoke below is the hard gate).
+      // It is NOT, however, silent. The previous advisory printed one stdout
+      // line with no stderr, so a deterministic boot failure (playwright
+      // missing from the tree) reported green for weeks — the exact
+      // "unattended green must never mean silently skipped" failure the
+      // workflow header says this job exists to prevent. `reportBrowserAdvisory`
+      // therefore emits a GitHub error annotation + job-summary entry, and the
+      // failure strings now carry the spawned process's stderr tail.
       if (result.status === "failed" && !browserRuntimeSmokeIsRequired()) {
-        process.stdout.write(
-          `[smoke:runtime browser] ADVISORY — browser runtime smoke failed but is non-fatal (set CREWHAUS_RUNTIME_SMOKE_BROWSER=1 to enforce). Failures: ${result.failures.join("; ")}\n`,
-        );
+        reportBrowserAdvisory(result);
         return;
       }
       process.stdout.write(`[smoke:runtime browser] result: ${result.status}\n`);

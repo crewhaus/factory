@@ -20,6 +20,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumers that build schemas dynamically: a collision that previously
   resolved to last-write-wins now throws.
 
+### Fixed
+
+- **The browser runtime smoke boots again — and a failing advisory can no
+  longer report green.** `playwright` was dropped from the root
+  devDependencies by the docs/demos split (36140d81), so `bun install` stopped
+  putting the *package* in the tree while `Smoke (runtime)` kept installing
+  only the *browser binaries*. Every run since died in the chromium driver's
+  `import("playwright")` ~450ms in — before a session log existed, before any
+  model turn — and the advisory gate swallowed it, so the nightly cron
+  reported green for weeks while the browser shape covered nothing at all
+  (the cli shape kept passing, which is why the job looked healthy). The
+  pinned devDependency is restored (`playwright` 1.59.1, the version the
+  lockfile's optional peer already expected), and the workflow now preflights
+  the package half so a dropped dependency names itself instead of surfacing
+  as a cryptic non-zero exit; `bunx` resolves the repo-pinned CLI, so
+  installed chromium build ids match the package that imports them.
+- **Advisory smoke failures are now visible without reading the log.** A
+  non-fatal browser failure emits a GitHub Actions `::error` annotation and a
+  job-summary entry (`reportBrowserAdvisory`), and the failure strings carry
+  the spawned process's stderr tail — previously the sole output was one
+  stdout line listing symptoms with the cause discarded, which is exactly the
+  "unattended green must never mean silently skipped" failure the workflow
+  header says the job exists to prevent.
+
 ## [0.4.1] - 2026-07-26
 
 ### Added
