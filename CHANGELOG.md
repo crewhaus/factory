@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`parseArgs` now rejects a malformed arg schema instead of silently
+  dropping a flag.** `@crewhaus/infra-utils` exports a new `ArgSchemaError`,
+  thrown when a `ParseArgsSchema` declares the same token (`--name` or
+  `-short`) twice, or declares an empty name or short alias. Previously the
+  duplicate won last-write-wins with no diagnostic, so two entries disagreeing
+  on `takesValue` silently changed how argv parsed. It is deliberately NOT an
+  `ArgParseError` subclass — a schema bug is a programmer error and must not
+  be reported to the user as a mistyped flag. BEHAVIOR CHANGE for downstream
+  consumers that build schemas dynamically: a collision that previously
+  resolved to last-write-wins now throws.
+
 ## [0.4.1] - 2026-07-26
 
 ### Added
