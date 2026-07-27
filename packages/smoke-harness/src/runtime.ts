@@ -287,6 +287,43 @@ function toolUseNames(events: ReadonlyArray<{ kind: string; payload: unknown }>)
 }
 
 /**
+ * The error result, if any, for the FIRST call to `name`.
+ *
+ * A `tool_use` event alone does not prove the tool ran: runtime-core logs it
+ * when the model REQUESTS the tool, before the permission gate and before
+ * `execute()`. A denied tool and a working tool are therefore identical in
+ * the `tool_use` stream, which made the Navigate/Screenshot assertions below
+ * non-load-bearing — they passed while both tools were being denied outright
+ * ("defaulted to \"ask\" and this non-interactive surface has no way to
+ * prompt"), and the smoke then blamed the model for not grounding its answer.
+ * Pairing each `tool_use` with its `tool_result` is what makes "the agent
+ * actually used the tool" a real assertion.
+ */
+function toolCallError(
+  events: ReadonlyArray<{ kind: string; payload: unknown }>,
+  name: string,
+): string | undefined {
+  const ids = new Set<string>();
+  for (const e of events) {
+    if (e.kind !== "tool_use") continue;
+    const p = e.payload as { id?: unknown; name?: unknown };
+    if (typeof p?.name === "string" && p.name.toLowerCase() === name.toLowerCase()) {
+      if (typeof p.id === "string") ids.add(p.id);
+    }
+  }
+  if (ids.size === 0) return undefined;
+  for (const e of events) {
+    if (e.kind !== "tool_result") continue;
+    const p = e.payload as { toolUseId?: unknown; isError?: unknown; content?: unknown };
+    if (typeof p?.toolUseId !== "string" || !ids.has(p.toolUseId)) continue;
+    if (p.isError !== true) continue;
+    const detail = typeof p.content === "string" ? p.content : JSON.stringify(p.content);
+    return detail.slice(0, 300);
+  }
+  return undefined;
+}
+
+/**
  * Pull the text content out of every `assistant_message` event in spec
  * order. The runtime serialises the model's output as a discriminated
  * union of content blocks; we collapse the text-typed blocks per turn
@@ -429,6 +466,12 @@ export async function runCliRuntimeSmoke(
     if (!toolNames.some((n) => n.toLowerCase() === "read")) {
       failures.push(`expected a tool_use event with name="Read", got [${toolNames.join(", ")}]`);
     }
+    // Same reason as the browser shape: a `tool_use` event proves the model
+    // asked, not that the read succeeded.
+    const readErr = toolCallError(events, "Read");
+    if (readErr !== undefined) {
+      failures.push(`Read was called but returned an error: ${readErr}`);
+    }
 
     // Confirm the agent's final reply grounds in the file content. The
     // last assistant_message in the log is the model's terminal reply
@@ -559,6 +602,14 @@ export async function runBrowserRuntimeSmoke(
     }
     if (navIdx !== -1 && screenshotIdx !== -1 && navIdx > screenshotIdx) {
       failures.push("Navigate must precede Screenshot — agent screenshot a blank page");
+    }
+    // Requesting a tool is not using it — see `toolCallError`. Without these,
+    // a denied or throwing tool still satisfies the two assertions above and
+    // the smoke reports the far more confusing "the agent did not ground its
+    // answer" instead of naming what actually failed.
+    for (const name of ["Navigate", "Screenshot"]) {
+      const err = toolCallError(events, name);
+      if (err !== undefined) failures.push(`${name} was called but returned an error: ${err}`);
     }
 
     const finalText = extractFinalText(stdout);
