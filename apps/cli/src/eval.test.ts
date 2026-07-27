@@ -29,9 +29,21 @@ afterAll(() => {
   for (const dir of TMP_ROOTS) rmSync(dir, { recursive: true, force: true });
 });
 
+/**
+ * Default spawn cwd. `crewhaus eval` finishes a run by appending to the run
+ * history index, and that root (`@crewhaus/eval-report`'s
+ * `DEFAULT_EVALS_DIR = ".crewhaus/evals"`) is RELATIVE — it resolves against
+ * the child's cwd, and no flag or env var here overrides it. With cwd at the
+ * repo root a credentialed run therefore appended to the operator's own
+ * `.crewhaus/evals/index.jsonl` and `baselines.json`, which `.gitignore`
+ * hides. `CREWHAUS_DATASETS_DIR` below already pins the sibling registry for
+ * the same reason; this pins the rest.
+ */
+const SPAWN_CWD = newTempRoot();
+
 async function runCli(
   args: ReadonlyArray<string>,
-  cwd: string = REPO_ROOT,
+  cwd: string = SPAWN_CWD,
 ): Promise<{ exitCode: number }> {
   const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
     cwd,
