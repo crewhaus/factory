@@ -669,13 +669,128 @@ function isPendingApprovalShape(value: unknown): value is PendingApproval {
  * path-traversal fence + tenant fence from the session store apply — the file
  * always resolves inside `rootDir`.
  */
+/** The approvals log path for a root, through the same fence sessions use. */
+function approvalsPath(rootDir: string): string {
+  return fencePath(resolve(rootDir, DEFAULT_APPROVALS_FILENAME));
+}
+
+/**
+ * Fold the append-only approvals log into the latest record per id. A
+ * malformed line never aborts the fold (best-effort, like session `list()`).
+ */
+async function foldApprovals(rootDir: string): Promise<Map<string, PendingApproval>> {
+  let raw: string;
+  try {
+    raw = await readFile(approvalsPath(rootDir), "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return new Map();
+    throw err;
+  }
+  const byId = new Map<string, PendingApproval>();
+  for (const line of raw.split("\n")) {
+    if (line.trim() === "") continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (isPendingApprovalShape(parsed)) byId.set(parsed.id, parsed);
+  }
+  return byId;
+}
+
+/**
+ * Whether an approval has aged past the cutoff.
+ *
+ * An UNPARSEABLE `createdAt` counts as EXPIRED. `isPendingApprovalShape` only
+ * requires a string, so a hand-edited or corrupted line would otherwise
+ * survive every compaction forever — and these records embed the raw tool
+ * input, which is by construction a call some policy deemed sensitive enough
+ * to need a human. For a file holding that, failing open on a bad timestamp
+ * is the wrong direction.
+ */
+function approvalIsExpired(approval: PendingApproval, cutoffMs: number): boolean {
+  const created = Date.parse(approval.createdAt);
+  if (!Number.isFinite(created)) return true;
+  return created < cutoffMs;
+}
+
+/**
+ * Compact the approvals log down to the live, latest-per-id records: expired
+ * and superseded lines are dropped, atomically (tmp+rename). Shared by the
+ * store's `list()` and the standalone {@link evictExpiredApprovals} — exactly
+ * as `sweepExpired` is shared by `SessionStore.list()` and
+ * {@link evictExpiredSessions}.
+ */
+async function sweepExpiredApprovals(
+  rootDir: string,
+  cutoffMs: number,
+): Promise<{ evictedIds: string[]; live: PendingApproval[] }> {
+  const folded = await foldApprovals(rootDir);
+  // Nothing folded → nothing to compact, and crucially nothing to CREATE.
+  // Writing here would drop an empty `approvals.jsonl` into every session
+  // root at boot (the sweep runs unconditionally), polluting a directory
+  // whose `.jsonl` files everything else treats as event logs.
+  if (folded.size === 0) return { evictedIds: [], live: [] };
+  const live: PendingApproval[] = [];
+  const evictedIds: string[] = [];
+  for (const approval of folded.values()) {
+    if (approvalIsExpired(approval, cutoffMs)) evictedIds.push(approval.id);
+    else live.push(approval);
+  }
+  try {
+    await mkdir(rootDir, { recursive: true });
+    const finalPath = approvalsPath(rootDir);
+    const tmpPath = `${finalPath}.tmp`;
+    const body = live.map((a) => JSON.stringify(a)).join("\n");
+    await writeFile(tmpPath, body.length > 0 ? `${body}\n` : "", { mode: 0o600 });
+    await rename(tmpPath, finalPath);
+  } catch (err) {
+    // Best-effort compaction — a rewrite failure must not break listing.
+    console.error("session-store: approvals compaction failed", err);
+  }
+  return { evictedIds, live };
+}
+
+/**
+ * Sweep expired pending approvals WITHOUT listing them — the approvals
+ * counterpart to {@link evictExpiredSessions}, and for the same reason.
+ *
+ * `list()` was the only operation that ever pruned this log, and its only
+ * production callers are the human-invoked `crewhaus approvals list|show`
+ * verbs, so on an unattended harness nothing compacted it at all: a full
+ * park→grant→consume cycle appends three lines, a consumed or expired record
+ * makes the next identical call mint a fresh id and append again, and `get`
+ * re-folds the entire file on every `ask`.
+ *
+ * The retention angle is the sharper one. Each record embeds the raw tool
+ * input, and nothing in the harness's retention machinery could reach it:
+ * `evictExpiredSessions`, `SessionStore.delete()` and `crewhaus retention
+ * sweep|purge` all key on `sess_<16 hex>.json`, and the retention inventory
+ * classifies `approvals.jsonl` as "not a session artifact" and skips it. An
+ * operator could purge a session for compliance while the tool input that
+ * session tried to run survived indefinitely in a sibling file, with mode
+ * 0600 as the only control.
+ */
+export async function evictExpiredApprovals(
+  opts: PendingApprovalStoreOptions = {},
+): Promise<{ evictedIds: string[] }> {
+  const rootDir = opts.rootDir ?? DEFAULT_ROOT_DIR;
+  const ttlDays = opts.ttlDays ?? DEFAULT_TTL_DAYS;
+  const now = opts.now ?? (() => new Date());
+  const cutoffMs = now().getTime() - ttlDays * MS_PER_DAY;
+  const { evictedIds } = await sweepExpiredApprovals(rootDir, cutoffMs);
+  return { evictedIds };
+}
+
 export function createPendingApprovalStore(
   opts: PendingApprovalStoreOptions = {},
 ): PendingApprovalStore {
   const rootDir = opts.rootDir ?? DEFAULT_ROOT_DIR;
   const ttlDays = opts.ttlDays ?? DEFAULT_TTL_DAYS;
   const now = opts.now ?? (() => new Date());
-  const filePath = (): string => fencePath(resolve(rootDir, DEFAULT_APPROVALS_FILENAME));
+  const filePath = (): string => approvalsPath(rootDir);
 
   function validateId(id: string): void {
     if (!APPROVAL_ID_REGEX.test(id)) {
@@ -683,34 +798,10 @@ export function createPendingApprovalStore(
     }
   }
 
-  // Fold the append-only log into the latest record per id. A malformed line
-  // never aborts the fold (best-effort, like session `list()`).
-  async function foldAll(): Promise<Map<string, PendingApproval>> {
-    let raw: string;
-    try {
-      raw = await readFile(filePath(), "utf8");
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return new Map();
-      throw err;
-    }
-    const byId = new Map<string, PendingApproval>();
-    for (const line of raw.split("\n")) {
-      if (line.trim() === "") continue;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (isPendingApprovalShape(parsed)) byId.set(parsed.id, parsed);
-    }
-    return byId;
-  }
-
-  function isExpired(approval: PendingApproval, cutoffMs: number): boolean {
-    const created = Date.parse(approval.createdAt);
-    return Number.isFinite(created) && created < cutoffMs;
-  }
+  // Fold + TTL live at module scope so this store and the standalone
+  // `evictExpiredApprovals` sweep share ONE implementation.
+  const foldAll = (): Promise<Map<string, PendingApproval>> => foldApprovals(rootDir);
+  const isExpired = approvalIsExpired;
 
   async function append(approval: PendingApproval): Promise<void> {
     await mkdir(rootDir, { recursive: true });
@@ -764,22 +855,11 @@ export function createPendingApprovalStore(
 
     async list(): Promise<PendingApproval[]> {
       const cutoffMs = now().getTime() - ttlDays * MS_PER_DAY;
-      const folded = await foldAll();
-      const live = [...folded.values()].filter((a) => !isExpired(a, cutoffMs));
-      // Compact: rewrite the log with only the live, latest-per-id records so
-      // it can't grow without bound. Atomic (tmp+rename); a concurrent append
-      // racing the rewrite is the only loss window and approvals are low-rate.
-      try {
-        await mkdir(rootDir, { recursive: true });
-        const finalPath = filePath();
-        const tmpPath = `${finalPath}.tmp`;
-        const body = live.map((a) => JSON.stringify(a)).join("\n");
-        await writeFile(tmpPath, body.length > 0 ? `${body}\n` : "", { mode: 0o600 });
-        await rename(tmpPath, finalPath);
-      } catch (err) {
-        // Best-effort compaction — a rewrite failure must not break listing.
-        console.error("session-store: approvals compaction failed", err);
-      }
+      // Same sweep the standalone `evictExpiredApprovals` runs: drop expired
+      // and superseded records, rewrite atomically (tmp+rename). A concurrent
+      // append racing the rewrite is the only loss window, and approvals are
+      // low-rate.
+      const { live } = await sweepExpiredApprovals(rootDir, cutoffMs);
       live.sort((a, b) => {
         const at = Date.parse(a.decidedAt ?? a.createdAt);
         const bt = Date.parse(b.decidedAt ?? b.createdAt);
