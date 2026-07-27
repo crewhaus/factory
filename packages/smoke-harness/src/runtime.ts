@@ -108,12 +108,19 @@ export function resolveSmokeModel(env: NodeJS.ProcessEnv = process.env): string 
  * before a session log existed. The advisory then hid it: the job reported
  * green for weeks. Fixed by restoring the pinned devDependency.
  *
- * A failure here is therefore a REAL signal, never ambient flake. It must
- * never again be swallowed silently — an advisory failure emits a GitHub
- * Actions error annotation and a job-summary entry (see
- * `reportBrowserAdvisory`), so an unattended green can no longer mean
- * "quietly broken". Set `CREWHAUS_RUNTIME_SMOKE_BROWSER=1` to promote it to a
- * hard assertion.
+ * A failure here is therefore a REAL signal, never ambient flake.
+ *
+ * The `Smoke (runtime)` workflow now sets `CREWHAUS_RUNTIME_SMOKE_BROWSER=1`,
+ * so in CI this shape is a HARD gate. It could not be one before: the fixture
+ * page is served on loopback, which the SSRF floor refused in two layers with
+ * no way for a spec to opt in — so the smoke failed 100% of the time and the
+ * advisory was the only thing keeping the job green. The fixture now declares
+ * `driver.allowPrivateTargets: true` and the shape passes.
+ *
+ * The advisory path below therefore survives only for local/ad-hoc runs. It
+ * still annotates loudly (see `reportBrowserAdvisory`), because the failure
+ * mode it was written for — an unattended green that means "quietly broken" —
+ * is the one this whole file exists to prevent.
  */
 export function browserRuntimeSmokeIsRequired(env: NodeJS.ProcessEnv = process.env): boolean {
   return env["CREWHAUS_RUNTIME_SMOKE_BROWSER"] === "1";

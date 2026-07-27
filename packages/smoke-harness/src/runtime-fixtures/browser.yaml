@@ -1,5 +1,15 @@
 name: runtime-smoke-browser
 target: browser
+# The harness serves its randomised magic-phrase page on http://127.0.0.1:<port>
+# — a loopback target the SSRF floor refuses in two independent layers (the
+# Navigate pre-goto guard, and the chromium backend's DNS-pinning proxy). Both
+# refusals are correct for an ordinary harness and this is the narrow case they
+# are not written for: the page is served by this very process, and the phrase
+# on it is the only thing that can prove the agent really navigated and really
+# read the screen. Opting in waives the private-host checks ONLY; the
+# http/https scheme allowlist still applies.
+driver:
+  allowPrivateTargets: true
 agent:
   model: claude-sonnet-4-6
   instructions: |

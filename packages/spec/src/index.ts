@@ -2576,6 +2576,22 @@ const browserDriverSchema = z
       .strict()
       .default({ width: 1280, height: 720 }),
     startUrl: z.string().url().optional(),
+    /**
+     * SECURITY — opt in to private/loopback navigation targets. Default false:
+     * the Navigate tool refuses private/loopback/link-local/metadata hosts
+     * before `driver.goto`, and the chromium backend routes every request
+     * through a DNS-pinning proxy that refuses the same floor at the
+     * connection layer. Together they stop a prompt-injected page from
+     * reaching the host's own services.
+     *
+     * Set true ONLY when the browser legitimately must reach a private target
+     * the operator controls AND the page content is trusted — an intranet app
+     * under test, or a locally-served fixture page (what the browser runtime
+     * smoke does). It relaxes BOTH layers for this spec, so it stays a
+     * per-spec reviewed decision and never a global switch. The http/https
+     * scheme allowlist is NOT waived.
+     */
+    allowPrivateTargets: z.boolean().default(false),
   })
   .strict();
 
