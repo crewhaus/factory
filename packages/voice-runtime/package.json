@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/voice-runtime",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "type": "module",
   "description": "Realtime voice loop — provider-agnostic RealtimeAdapter + OpenAI Realtime WebSocket adapter (Section 24 VOICE)",
   "main": "src/index.ts",

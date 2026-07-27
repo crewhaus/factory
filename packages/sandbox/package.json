@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/sandbox",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "type": "module",
   "description": "Containerised exec environment with docker/podman/noop backends; production safety floor",
   "main": "src/index.ts",

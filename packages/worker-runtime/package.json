@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/worker-runtime",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "type": "module",
   "description": "Platform-neutral agent-loop runtime (tools + budget + limits + trace) with all host services injected — imports no node:* builtins, runs on Cloudflare Workers",
   "main": "src/index.ts",

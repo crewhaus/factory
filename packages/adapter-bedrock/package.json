@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/adapter-bedrock",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "type": "module",
   "description": "AWS Bedrock provider adapter (Section 17). Anthropic over native InvokeModel; all other families (Llama / Mistral / Nova / DeepSeek / Cohere / AI21 / Qwen / gpt-oss / Titan / Writer) over the Converse API",
   "main": "src/index.ts",
