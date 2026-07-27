@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/rules-engine",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "type": "module",
   "description": "Cross-cutting (Track 10) — reads multi-language rule packs from rules/{common,typescript,python,...} and injects them as system-prompt prefixes. Source: ECC reference repo.",
   "main": "src/index.ts",

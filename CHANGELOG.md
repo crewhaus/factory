@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-26
+
 ### Added
 
 - **"Watch me": `crewhaus watchme` observes harness interactions and learns
@@ -224,15 +226,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   force are recorded on `run.json`/`results.json` (`sampleTimeoutMs`,
   `budgetUsd`, additive). Specs without the blocks and runs without the
   flags behave byte-identically to before.
-Paste under `## [Unreleased]` in the repo CHANGELOG.md (sections merge with
-what is already there).
 
-
-
-- **`llm_judge` panels: `judges: [model, ...]` fans out a multi-model judge
-  panel with vote-entropy review routing.** A graders.yaml `llm_judge` entry
-  may now list a judge PANEL — one temperature-pinned call per listed model
-  (any model-router string; the list overrides `model:` and `--judge-model`)
   — and the grade becomes the panel's fold: MEDIAN score over the
   non-abstaining panelists, pass by STRICT MAJORITY of their pass votes (an
   even panel's tie conservatively fails), per-panelist scores plus the
