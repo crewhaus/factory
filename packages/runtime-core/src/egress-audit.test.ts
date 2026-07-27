@@ -10,8 +10,19 @@
  * single-shot `input` stream, an in-memory EgressAuditSink, and a RunContext
  * pre-seeded with tagged data-lineage so the external-scope tool trips the
  * classifier deterministically.
+ *
+ * HERMETICITY: the audit sink is in-memory, but `runChatLoop` ALSO persists a
+ * session JSON + event-log JSONL, rooted at `<cwd>/.crewhaus/sessions` by
+ * default. The workspace test script runs `bun test src` with the PACKAGE dir
+ * as cwd, so an unpinned run leaves artifacts in `packages/runtime-core/`
+ * in the operator's checkout — `.gitignore`d, so they accumulate unnoticed and
+ * a stale session id can still resolve in a later test. `runOnce` pins
+ * `sessionRootDir` to an mkdtemp root instead.
  */
-import { describe, expect, spyOn, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
@@ -21,6 +32,11 @@ import type { TrustOrigin } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
 import { z } from "zod";
 import { type EgressAuditSink, runChatLoop } from "./index";
+
+const SESSION_ROOT = mkdtempSync(join(tmpdir(), "crewhaus-egress-audit-"));
+afterAll(() => {
+  rmSync(SESSION_ROOT, { recursive: true, force: true });
+});
 
 const FEATURES = {
   caching: "explicit" as const,
@@ -136,6 +152,7 @@ async function runOnce(opts: {
       runContext: ctx,
       tools: [exfil],
       permissionMode: "bypass",
+      sessionRootDir: SESSION_ROOT,
       ...(opts.sink !== undefined ? { egressAuditSink: opts.sink } : {}),
       ...(opts.dynamic === true ? { resolveSinkScope: () => "external-dynamic" } : {}),
     });
