@@ -55,8 +55,6 @@ const CLI_PATH = join(
   "index.ts",
 );
 
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
-
 const DEFAULT_TIMEOUT_MS = 120_000;
 
 export type RuntimeSmokeStatus = "ok" | "skipped" | "failed";
@@ -277,9 +275,9 @@ export async function runCliRuntimeSmoke(
     if (apiKey !== undefined && apiKey !== "") env["ANTHROPIC_API_KEY"] = apiKey;
 
     const model = opts.model ?? resolveSmokeModel();
-    // Spawn with cwd = workDir (the dir holding secret.txt), NOT REPO_ROOT.
-    // The built-in `Read` tool sandboxes every path to `process.cwd()`
-    // (tool-fs resolveSafe), so a REPO_ROOT cwd makes the /tmp secret file
+    // Spawn with cwd = workDir (the dir holding secret.txt), never the repo
+    // root. The built-in `Read` tool sandboxes every path to `process.cwd()`
+    // (tool-fs resolveSafe), so a repo-root cwd makes the /tmp secret file
     // legitimately out-of-workspace and the read is correctly denied — the
     // agent tries, the permission engine rejects, the smoke fails. Running
     // from workDir puts secret.txt in-workspace so the read is allowed.
@@ -383,6 +381,14 @@ export async function runBrowserRuntimeSmoke(
   }
 
   const sessionDir = mkdtempSync(join(tmpdir(), "crewhaus-runtime-smoke-"));
+  // Spawn cwd, for the same reason the CLI smoke above uses `workDir`:
+  // `CREWHAUS_SESSION_DIR` relocates the sessions root but NOT the security
+  // audit root, which the CLI opens at `<cwd>/.crewhaus/audit` and which
+  // `openAuditLog` mkdir's eagerly (mode 0700). With cwd at the repo root that
+  // created a 0700 `.crewhaus/audit/` inside the operator's checkout on every
+  // credentialed smoke run. CLI_PATH, the fixture and CREWHAUS_SESSION_DIR are
+  // all absolute, so the changed cwd disturbs nothing else.
+  const workDir = mkdtempSync(join(tmpdir(), "crewhaus-runtime-smoke-cwd-"));
   const server = startMagicPhraseServer();
   try {
     const prompt = `Navigate to ${server.url}, take a screenshot, and report the magic phrase on the page.`;
@@ -411,7 +417,7 @@ export async function runBrowserRuntimeSmoke(
         prompt,
       ],
       {
-        cwd: REPO_ROOT,
+        cwd: workDir,
         env,
         stdin: "ignore",
         stdout: "pipe",
@@ -477,5 +483,6 @@ export async function runBrowserRuntimeSmoke(
   } finally {
     await server.stop();
     rmSync(sessionDir, { recursive: true, force: true });
+    rmSync(workDir, { recursive: true, force: true });
   }
 }

@@ -7,7 +7,7 @@
  * and `serve` boots the projection + answers `initialize`/`tools/list` without
  * ever running an agent turn.
  */
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -20,13 +20,25 @@ const VOICE_SPEC = join(REPO_ROOT, "apps/cli/test-fixtures/minimal-voice/crewhau
 
 type RunResult = { exitCode: number; stdout: string; stderr: string };
 
+/**
+ * Default spawn cwd. `serve --mcp` opens an audit chain under
+ * `<cwd>/.crewhaus/audit`, so defaulting to the repo root wrote into the
+ * operator's checkout — invisibly, since `.gitignore` hides `.crewhaus/`.
+ * Nothing here reads the cwd otherwise: specs are passed as absolute paths and
+ * authored assets resolve beside the SPEC, not beside the process.
+ */
+const SPAWN_CWD = mkdtempSync(join(tmpdir(), "crewhaus-serve-export-cwd-"));
+afterAll(() => {
+  rmSync(SPAWN_CWD, { recursive: true, force: true });
+});
+
 /** Spawn the CLI, optionally feeding `stdin` (then EOF), and capture streams. */
 async function runCli(
   args: ReadonlyArray<string>,
   opts: { cwd?: string; stdin?: string } = {},
 ): Promise<RunResult> {
   const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
-    cwd: opts.cwd ?? REPO_ROOT,
+    cwd: opts.cwd ?? SPAWN_CWD,
     env: { PATH: process.env["PATH"] ?? "" },
     stdin: opts.stdin !== undefined ? "pipe" : "ignore",
     stdout: "pipe",
@@ -107,7 +119,8 @@ describe("crewhaus export claude-plugin", () => {
    * export a strictly SMALLER agent than itself: the only skill emitted was the
    * one synthesized from `agent.instructions`, and no `commands/` dir existed.
    * The assets are resolved beside the SPEC (the standalone-harness convention),
-   * not from the process cwd, which is why the CLI here still runs from REPO_ROOT.
+   * not from the process cwd — which is why the CLI here can run from the
+   * default sandbox cwd and still find them.
    */
   describe("authored .crewhaus/ assets", () => {
     const SKILL = "---\nname: research-topic\ndescription: corroborate claims\n---\n\nCite two.\n";

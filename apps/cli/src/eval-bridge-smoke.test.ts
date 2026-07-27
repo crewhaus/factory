@@ -16,6 +16,17 @@
  * emitted package.json is removed before import (a manifest-carrying dir opts
  * out of Bun's cwd-workspace resolution, and the smoke wants the in-tree
  * packages, not published ones).
+ *
+ * The spawn cwd is a mkdtemp sandbox too, NOT the repo root. Whatever the
+ * driven runtime fails to pin lands in `<cwd>/.crewhaus` — the crew shape's
+ * sub-agent sessions, the graph shape's `graphs/` checkpoints, the gateway
+ * `prompt-cache/` entry all did — and with cwd at the repo root that was
+ * written straight into the operator's checkout, hidden by `.gitignore`.
+ * Sandboxing the cwd contains them without weakening resolution: the root
+ * `node_modules` holds no `@crewhaus/*` entries under the isolated install
+ * layout, so a repo-root cwd never resolved the workspace for these
+ * out-of-tree bundles in the first place — `@crewhaus/runtime-core` resolves
+ * to the same file from either cwd.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
@@ -39,13 +50,16 @@ function newTmp(prefix: string): string {
   return dir;
 }
 
+/** The spawn cwd for every compile/drive subprocess — see the file header. */
+const SPAWN_CWD = newTmp("crewhaus-bridge-cwd-");
+
 async function spawnBun(args: ReadonlyArray<string>): Promise<{
   exitCode: number;
   stdout: string;
   stderr: string;
 }> {
   const proc = Bun.spawn([process.execPath, ...args], {
-    cwd: REPO_ROOT,
+    cwd: SPAWN_CWD,
     env: { PATH: process.env["PATH"] ?? "" },
     stdout: "pipe",
     stderr: "pipe",

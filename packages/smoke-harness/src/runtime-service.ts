@@ -32,7 +32,6 @@ import { type RuntimeSmokeResult, runtimeSmokeIsEnabled } from "./runtime.js";
  */
 
 const RUNTIME_FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "runtime-fixtures");
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const DEFAULT_TIMEOUT_MS = 120_000;
 
 /** Compile a runtime fixture YAML to a fresh temp dir and return its path. */
@@ -117,10 +116,17 @@ export async function runBatchRuntimeSmoke(
 
   const bundleDir = compileFixtureToDisk("batch");
   const sessionDir = mkdtempSync(join(tmpdir(), "crewhaus-runtime-batch-session-"));
+  // Spawn cwd. The worker roots whatever `CREWHAUS_SESSION_DIR` does not
+  // relocate — audit chain, state, prompt cache — at `<cwd>/.crewhaus`, so a
+  // repo-root cwd wrote into the operator's checkout. The bundle is spawned by
+  // ABSOLUTE path and resolves its `@crewhaus/*` imports from its own location
+  // rather than the cwd (verified: identical resolution and identical output
+  // from both cwds), so sandboxing the cwd changes nothing the smoke asserts.
+  const workDir = mkdtempSync(join(tmpdir(), "crewhaus-runtime-batch-cwd-"));
   try {
     const env = forwardAuthEnv({ CREWHAUS_SESSION_DIR: sessionDir });
     const spawnOpts: SpawnOptions.OptionsObject<"ignore", "pipe", "pipe"> = {
-      cwd: REPO_ROOT,
+      cwd: workDir,
       env,
       stdin: "ignore",
       stdout: "pipe",
@@ -164,6 +170,7 @@ export async function runBatchRuntimeSmoke(
   } finally {
     rmSync(bundleDir, { recursive: true, force: true });
     rmSync(sessionDir, { recursive: true, force: true });
+    rmSync(workDir, { recursive: true, force: true });
   }
 }
 

@@ -37,14 +37,32 @@ type RunOpts = {
   closeStdinImmediately?: boolean;
 };
 
-/** Spawn the CLI as a child Bun process and capture exit code + streams. */
+/**
+ * Spawn the CLI as a child Bun process and capture exit code + streams.
+ *
+ * HERMETICITY: the CLI roots its runtime artifacts at `<cwd>/.crewhaus` —
+ * sessions, event logs, emitted specs, graph checkpoints, prompt cache, state,
+ * audit chains. This helper used to default `cwd` to REPO_ROOT, so ~125 spawns
+ * wrote all of that straight into the operator's checkout root. `.gitignore`
+ * hides `.crewhaus/`, which is exactly what made it easy to miss: it
+ * accumulated across every run (2642 session files in one checkout) and a
+ * stale session id could still resolve in a later test.
+ *
+ * The default is now a per-test `sandboxCwd`, so each spawn starts from an
+ * empty directory and its artifacts die with the test. Exactly one call site
+ * still opts back in with `cwd: REPO_ROOT` — `doctor --philosophy-alignment`,
+ * whose package-presence checks stat `process.cwd()` directly. Everything
+ * else is cwd-independent: specs and `-o` targets are passed as absolute
+ * paths, and the built-in tool map resolves from the CLI module rather than
+ * the working directory.
+ */
 async function runCli(args: ReadonlyArray<string>, opts: RunOpts = {}): Promise<RunResult> {
   const baseEnv: Record<string, string> = { PATH: process.env["PATH"] ?? "" };
   for (const [k, v] of Object.entries(opts.env ?? {})) {
     if (v !== undefined) baseEnv[k] = v;
   }
   const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
-    cwd: opts.cwd ?? REPO_ROOT,
+    cwd: opts.cwd ?? sandboxCwd,
     env: baseEnv,
     stdin: opts.closeStdinImmediately ? "pipe" : "ignore",
     stdout: "pipe",
@@ -62,11 +80,19 @@ async function runCli(args: ReadonlyArray<string>, opts: RunOpts = {}): Promise<
 }
 
 let tmp: string;
+/**
+ * The default spawn cwd. Kept SEPARATE from `tmp` (which tests pass as the
+ * `-o` output dir and then assert on) so the CLI's own `.crewhaus/` artifacts
+ * never show up in a directory listing a test is inspecting.
+ */
+let sandboxCwd: string;
 beforeEach(() => {
   tmp = mkdtempSync(join(tmpdir(), "crewhaus-cli-test-"));
+  sandboxCwd = mkdtempSync(join(tmpdir(), "crewhaus-cli-cwd-"));
 });
 afterEach(() => {
   rmSync(tmp, { recursive: true, force: true });
+  rmSync(sandboxCwd, { recursive: true, force: true });
 });
 
 describe("crewhaus compile", () => {
@@ -1171,9 +1197,15 @@ describe("crewhaus doctor", () => {
 
   // FR-002 — the philosophy-alignment audit now includes a Pillar 3 sink-side
   // pass over the built-in tool map, sharing auditToolScopes with
-  // `compile --strict`. Run from REPO_ROOT so the package-presence checks and
-  // loadToolMap() see the real workspace. All built-in outward tools ship
-  // scope:"external", so the new check is green and the overall audit exits 0.
+  // `compile --strict`. All built-in outward tools ship scope:"external", so
+  // the new check is green and the overall audit exits 0.
+  //
+  // This is the ONE spawn in this file that genuinely needs REPO_ROOT:
+  // collectPhilosophyFindings() stats `join(process.cwd(), "packages", …)` and
+  // `join(process.cwd(), "AGENTS.md")` with no upward walk and no fallback, so
+  // from the default sandbox cwd it reports 11 findings and exits 1. (The tool
+  // map is NOT why — loadToolMap() resolves static bare specifiers from the
+  // CLI module, so Pillar 3 stays green from any cwd.)
   test("--philosophy-alignment audits built-in tool scopes and reports them green", async () => {
     const result = await runCli(["doctor", "--philosophy-alignment"], {
       cwd: REPO_ROOT,
@@ -1190,9 +1222,10 @@ describe("crewhaus doctor", () => {
 // Levenshtein-2 from BOTH the read-only built-in `Read` and the mutating
 // built-in `Edit`; a plain alphabetical tie-break would previously pick one
 // (Edit, alphabetically first) without the author ever consenting to a
-// mutating tool being substituted for a typo. Run from REPO_ROOT so
-// loadToolMap() resolves the real built-in tool packages (Read/Edit/Write
-// among them).
+// mutating tool being substituted for a typo. These run from the default
+// sandbox cwd: loadToolMap() resolves the built-in tool packages from static
+// bare specifiers in the CLI module, never from the cwd, so the real
+// Read/Edit/Write entries are in the map either way.
 describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)", () => {
   test("a typo equidistant from a read-only and a mutating tool is NOT auto-applied; prints a suggestion", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -1200,7 +1233,6 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
       "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n  tools:\n    - Reit\n";
     writeFileSync(specPath, original);
     const result = await runCli(["lint", specPath, "--fix"], {
-      cwd: REPO_ROOT,
       env: { ANTHROPIC_API_KEY: "test" },
     });
     // Not auto-fixed: the spec on disk is byte-for-byte unchanged.
@@ -1223,7 +1255,6 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
       "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n  tools:\n    - Reed\n",
     );
     const result = await runCli(["lint", specPath, "--fix"], {
-      cwd: REPO_ROOT,
       env: { ANTHROPIC_API_KEY: "test" },
     });
     expect(result.stdout).toContain('fixed: tool "Reed" → "Read" (nearest match)');
@@ -1398,12 +1429,13 @@ describe("crewhaus optimize --budget-usd", () => {
         env: {
           ANTHROPIC_API_KEY: process.env["ANTHROPIC_API_KEY"] ?? "",
           // Hermetic dataset registry: optimize PINS recovered dev samples
-          // into `<specName>-regressions` by default (item 9); with
-          // cwd=REPO_ROOT that would write the shared checkout's
+          // into `<specName>-regressions` by default (item 9). Back when the
+          // spawn cwd was the repo root that wrote the shared checkout's
           // `.crewhaus/datasets/hello-regressions`, which every later
-          // `crewhaus eval` on the hello fixture then unions into ITS
+          // `crewhaus eval` on the hello fixture then unioned into ITS
           // dataset (observed: eval.test.ts graded 3 samples out of a
-          // 2-sample dataset). Point the registry at this test's tmp dir.
+          // 2-sample dataset). The sandbox cwd closes that path too; this
+          // explicit pin keeps the registry visible to the assertions below.
           CREWHAUS_DATASETS_DIR: join(tmp, "datasets"),
         },
       },
@@ -2629,12 +2661,14 @@ describe("crewhaus channel provision|verify (item 61)", () => {
   // refuses to boot without, so fixing exactly what it listed still produced
   // a daemon that exited 2.
   test("verify names EVERY env var the daemon boots on, not just the probeable ones", async () => {
-    // The spawned CLI runs with cwd=REPO_ROOT, and Bun auto-loads that
-    // directory's `.env` into the child's process.env — a developer checkout
-    // with a real ANTHROPIC_API_KEY made the provider-credential check PASS
-    // and this assertion read "8 check(s), 7 failed" locally while CI (no
-    // .env) stayed green. Explicit empties win: dotenv never overrides an
-    // already-present variable, and the check treats "" as unset.
+    // Bun auto-loads `<cwd>/.env` into the child's process.env, and back when
+    // the spawn cwd was the repo root a developer checkout with a real
+    // ANTHROPIC_API_KEY made the provider-credential check PASS — this
+    // assertion read "8 check(s), 7 failed" locally while CI (no .env) stayed
+    // green. The empty sandbox cwd has no `.env` to load, so that vector is
+    // gone; the explicit empties stay as belt-and-braces, and they still win
+    // regardless (dotenv never overrides an already-present variable, and the
+    // check treats "" as unset).
     const result = await runCli(["channel", "verify", CHANNEL_SPEC], {
       env: { ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "" },
     });

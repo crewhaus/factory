@@ -27,9 +27,18 @@ afterAll(() => {
   for (const dir of TMP_ROOTS) rmSync(dir, { recursive: true, force: true });
 });
 
+/**
+ * Default spawn cwd. Today every default-cwd call here is a `--help` or
+ * arg-validation path that exits before opening a store, so nothing leaks —
+ * but the CLI roots `.crewhaus/{evals,sessions,specs}` at its cwd, so pointing
+ * the default at the repo root left one added assertion away from writing into
+ * the operator's checkout.
+ */
+const SPAWN_CWD = newTempRoot();
+
 async function runCli(
   args: ReadonlyArray<string>,
-  cwd: string = REPO_ROOT,
+  cwd: string = SPAWN_CWD,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
     cwd,
