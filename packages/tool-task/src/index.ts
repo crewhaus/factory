@@ -325,6 +325,14 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
           ? { failureTaxonomy: bridge.failureTaxonomy }
           : {}),
         ...(bridge.continuity !== undefined ? { continuity: bridge.continuity } : {}),
+        // Loop contract 0.4 (G11) — the parent's ask_mode + approval seam, so
+        // a child's headless `ask` parks against the same store instead of
+        // collapsing to a denial. THIS projection is the mechanism of the bug
+        // it fixes: `RuntimeBridge` extends `ParentRunHandle`, but the handle
+        // is hand-copied field by field and every seam field is optional — an
+        // omission type-checks perfectly and drops the capability silently.
+        ...(bridge.askMode !== undefined ? { askMode: bridge.askMode } : {}),
+        ...(bridge.approvals !== undefined ? { approvals: bridge.approvals } : {}),
       };
 
       // A fatal child failure (billing/auth) makes `spawnSubAgent` throw

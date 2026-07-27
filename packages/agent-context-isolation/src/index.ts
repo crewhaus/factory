@@ -29,6 +29,7 @@ import type { HookDef } from "@crewhaus/hooks-engine";
 import type { PermissionMode, RuleSet } from "@crewhaus/permission-engine";
 import type { NamedFailureClass } from "@crewhaus/recovery-engine";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
+import type { PendingApproval, PendingApprovalStore } from "@crewhaus/session-store";
 import type { SkillRef } from "@crewhaus/skills-registry";
 import { type Store, createStore } from "@crewhaus/state-store";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -153,6 +154,25 @@ export type ParentRunHandle = {
   readonly skills?: ReadonlyArray<SkillRef>;
   readonly failureTaxonomy?: ReadonlyArray<NamedFailureClass>;
   readonly continuity?: SubAgentContinuitySeam;
+  /**
+   * Loop contract 0.4 (G11) — the parent's `permissions.ask_mode`, inherited
+   * verbatim. A child loop is `singleTurn` with no readline, so its `ask`
+   * decisions can never prompt; without this the child took runtime-core's
+   * collapse-to-deny branch even when the parent was configured to park.
+   */
+  readonly askMode?: "pause" | "deny";
+  /**
+   * Loop contract 0.4 (G11) — the parent's approval store, SHARED rather than
+   * narrowed. Unlike `memory` (recall without capture) or `continuity`
+   * (read-only), there is nothing to restrict: a park is a run-level pause,
+   * and the store is keyed on `(toolName, inputHash)` across sessions, so a
+   * grant issued for a child's call is found by whoever re-issues it.
+   */
+  readonly approvals?: {
+    readonly store: Pick<PendingApprovalStore, "persist" | "get" | "resolve">;
+    readonly notify?: (approval: PendingApproval) => Promise<void>;
+    readonly surface?: string;
+  };
 };
 
 /**

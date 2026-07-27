@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A tool permission that lands on `ask` inside a sub-agent (`Task`) turn now
+  parks like any other, instead of denying in place.** Three links were
+  missing at once: `ParentRunHandle` carried no approval seam, the Task tool's
+  hand-copied `parentHandle` projection could not have forwarded one, and the
+  child `runChatLoop` was never given `askMode`/`approvals` — so a child was
+  non-interactive with nothing to park against, and every `ask` collapsed to a
+  denial regardless of the parent's `permissions.ask_mode`.
+
+  A parked child also used to be SWALLOWED. The spawner escalates only
+  terminal classes to the parent, and its predicate listed just
+  `billing`/`auth`, so a park dissolved into an `is_error` tool result: the
+  parent exited 0 with a `PendingApproval` on disk, and the model was free to
+  retry the Task and re-fire `approvals.notify` for a decision already
+  pending. `approval_pending` now escalates too — for the opposite reason to
+  billing/auth: those are fatal, a park is RESUMABLE, and the parent run is
+  the only thing that can be resumed. Every consumer keys on that classified
+  report (`crewhaus failures` treats it as a non-failure, `fleet` renders
+  "needs approval", the channel bot posts its approve/deny prompt), and none
+  of it was reachable from an `is_error` string.
+
+  The child shares the parent's store rather than a narrowed one — unlike the
+  memory (recall-without-capture) and continuity (read-only) seams there is
+  nothing to restrict, since a park is a run-level pause and the store is
+  keyed on `(toolName, inputHash)` across sessions.
 - **Pending approvals are swept on an unattended harness, so raw tool inputs
   stop outliving the sessions they came from.** `approvals.jsonl` had exactly
   one pruner — `list()` — whose only production callers are the human-invoked
