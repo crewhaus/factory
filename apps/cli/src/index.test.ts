@@ -2241,6 +2241,49 @@ describe("crewhaus build-image — digest recording wiring (item 47)", () => {
   });
 });
 
+// build-image and federation used to hand-roll their own argv loops, which
+// swallowed unknown flags as positionals and emitted bespoke error strings.
+// They now route through parseFor/BUILD_IMAGE_SCHEMA and FEDERATION_SCHEMA
+// like every other subcommand.
+describe("crewhaus build-image / federation — shared arg parsing", () => {
+  test("build-image rejects an unknown flag instead of treating it as a positional", async () => {
+    const result = await runCli(["build-image", "cli", "--tag", "t1", "--bogus"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("unknown flag: --bogus");
+  });
+
+  test("build-image reports a missing flag value in the shared wording", async () => {
+    const result = await runCli(["build-image", "cli", "--tag"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('flag "--tag" requires a value');
+  });
+
+  test("build-image -h prints the same usage as --help", async () => {
+    const short = await runCli(["build-image", "-h"]);
+    const long = await runCli(["build-image", "--help"]);
+    expect(short.exitCode).toBe(0);
+    expect(short.stdout).toBe(long.stdout);
+  });
+
+  test("federation discover --help exits 0", async () => {
+    const result = await runCli(["federation", "discover", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("usage: crewhaus federation discover <deployment>");
+  });
+
+  test("federation discover without a deployment exits 1", async () => {
+    const result = await runCli(["federation", "discover"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("missing <deployment>");
+  });
+
+  test("federation discover rejects an unknown flag", async () => {
+    const result = await runCli(["federation", "discover", "peer.example", "--bogus"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("unknown flag: --bogus");
+  });
+});
+
 describe("crewhaus compile --check — flag surface (item 33)", () => {
   // The check pipeline itself (assertion selection, install/boot behind an
   // injectable runner, verdict mapping) is covered in compile-check.test.ts;
