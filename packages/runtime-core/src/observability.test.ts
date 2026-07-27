@@ -1,14 +1,30 @@
 /**
  * T3 — single-turn `runChatLoop` round-trip emits the expected ordered
  * sequence of TraceEvents under one traceId.
+ *
+ * HERMETICITY: the assertions here are all on the in-memory trace bus, but
+ * `runChatLoop` also persists a session JSON + event-log JSONL, rooted at
+ * `<cwd>/.crewhaus/sessions` by default. The workspace test script runs
+ * `bun test src` with the PACKAGE dir as cwd, so an unpinned run leaves
+ * artifacts in `packages/runtime-core/` in the operator's checkout —
+ * `.gitignore`d, so they accumulate unnoticed and a stale session id can still
+ * resolve in a later test. `sessionRootDir` pins them to an mkdtemp root.
  */
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type Anthropic from "@anthropic-ai/sdk";
 import { createRunContext } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { TraceEvent, TraceEventKind } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
 import { runChatLoop } from "./index";
+
+const SESSION_ROOT = mkdtempSync(join(tmpdir(), "crewhaus-observability-"));
+afterAll(() => {
+  rmSync(SESSION_ROOT, { recursive: true, force: true });
+});
 
 function makeOneTurnAdapter(
   toolUseId: string,
@@ -96,6 +112,7 @@ describe("runChatLoop observability", () => {
       seedMessages: [{ role: "user", content: "hello" }],
       tools: [noop],
       permissionMode: "default",
+      sessionRootDir: SESSION_ROOT,
     });
 
     const kinds = seen.map((e) => e.kind);
