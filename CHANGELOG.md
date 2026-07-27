@@ -36,6 +36,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`driver.allowPrivateTargets` (browser specs, default false) — and with it,
+  the browser runtime smoke is a HARD gate again.** The smoke serves its
+  randomised magic-phrase page on `http://127.0.0.1:<port>`, which the SSRF
+  floor refused in two independent layers (the Navigate pre-goto guard, and
+  the chromium backend's DNS-pinning proxy) with no way for a spec to opt in.
+  The shape therefore could not pass, and the advisory that hid that was the
+  only thing keeping the job green. The fixture now opts in, the smoke passes,
+  and `CREWHAUS_RUNTIME_SMOKE_BROWSER=1` promotes it back to a hard assertion.
+
+  The flag waives ONLY the private/loopback/mDNS host checks, for a harness
+  whose whole job is a private target the operator controls — an intranet app
+  under test, or a locally-served fixture page. It does NOT waive the
+  http/https scheme allowlist: an opted-in spec still cannot reach
+  `file:`/`data:`/`chrome:`. It is a per-spec, compile-time decision with no
+  env var and no global switch, so it cannot be turned on by an ambient
+  misconfiguration and a reviewer sees it in the spec diff. It is carried into
+  the IR only when true, so every bundle that leaves it alone stays
+  byte-identical.
+
+  Both layers move together, deliberately: waiving one alone is worse than
+  waiving neither, because with only the guard relaxed the DNS-pinning proxy
+  answers loopback with its own 403 body — which RENDERS, so the agent
+  screenshots a block page and reports whatever it can make of that instead of
+  failing cleanly.
 - **`parseArgs` now rejects a malformed arg schema instead of silently
   dropping a flag.** `@crewhaus/infra-utils` exports a new `ArgSchemaError`,
   thrown when a `ParseArgsSchema` declares the same token (`--name` or

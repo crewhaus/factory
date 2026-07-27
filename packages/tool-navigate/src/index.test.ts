@@ -154,3 +154,58 @@ describe("Navigate SSRF guard", () => {
     expect(record.calls).toEqual(["https://93.184.216.34/"]);
   });
 });
+
+/**
+ * SECURITY — `driver.allowPrivateTargets` (spec-level, default false) is the
+ * only way to reach a private target, and it waives the private-range checks
+ * ONLY. Everything else about the guard survives it. These tests pin that
+ * boundary, because the difference between "waives loopback" and "waives the
+ * guard" is the difference between a testable fixture page and an SSRF hole.
+ */
+describe("Navigate SSRF guard — allowPrivateTargets opt-in", () => {
+  test("without the opt-in, loopback is still refused (the default is unchanged)", async () => {
+    const record: GotoRecord = { calls: [] };
+    const tool = createNavigateTool({ driver: stubDriver(record) });
+    await expect(tool.execute({ url: "http://127.0.0.1:8080/" }, {})).rejects.toThrow(
+      /private\/loopback IP/,
+    );
+    expect(record.calls).toEqual([]);
+  });
+
+  test("with the opt-in, a loopback fixture page is reachable", async () => {
+    const record: GotoRecord = { calls: [] };
+    const tool = createNavigateTool({ driver: stubDriver(record), allowPrivateTargets: true });
+    await tool.execute({ url: "http://127.0.0.1:8080/" }, {});
+    expect(record.calls).toEqual(["http://127.0.0.1:8080/"]);
+  });
+
+  test("the opt-in does NOT waive the scheme allowlist", async () => {
+    const record: GotoRecord = { calls: [] };
+    const tool = createNavigateTool({ driver: stubDriver(record), allowPrivateTargets: true });
+    for (const url of ["file:///etc/passwd", "data:text/html,<h1>x</h1>", "chrome://settings"]) {
+      await expect(tool.execute({ url }, {})).rejects.toThrow(/only http\/https is allowed/);
+    }
+    expect(record.calls).toEqual([]);
+  });
+
+  test("the opt-in does NOT waive the absolute-URL check", async () => {
+    const record: GotoRecord = { calls: [] };
+    const tool = createNavigateTool({ driver: stubDriver(record), allowPrivateTargets: true });
+    await expect(tool.execute({ url: "not a url" }, {})).rejects.toThrow();
+    expect(record.calls).toEqual([]);
+  });
+
+  test("cloud metadata is reachable ONLY under the explicit opt-in", async () => {
+    // 169.254.169.254 is the canonical SSRF prize. It stays blocked by
+    // default; an opted-in spec is one whose operator has accepted that its
+    // whole job is a private target, so it is reachable there by design.
+    const blocked = createNavigateTool({ driver: stubDriver({ calls: [] }) });
+    await expect(blocked.execute({ url: "http://169.254.169.254/" }, {})).rejects.toThrow(
+      /private\/loopback IP/,
+    );
+    const record: GotoRecord = { calls: [] };
+    const opted = createNavigateTool({ driver: stubDriver(record), allowPrivateTargets: true });
+    await opted.execute({ url: "http://169.254.169.254/" }, {});
+    expect(record.calls).toEqual(["http://169.254.169.254/"]);
+  });
+});

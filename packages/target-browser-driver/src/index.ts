@@ -240,6 +240,16 @@ export function emitBrowserDriver(ir: IrBrowserV0, opts: EmitReadmeOptions = {})
 
 function renderAgent(ir: IrBrowserV0): string {
   const startUrl = ir.driver.startUrl;
+  // SECURITY — `driver.allowPrivateTargets` relaxes BOTH SSRF layers together:
+  // the chromium backend's DNS-pinning proxy and the Navigate tool's pre-goto
+  // guard. Emitted ONLY when the spec opts in, so an ordinary bundle is
+  // byte-identical to 0.4.1. Waiving one layer alone would be worse than
+  // waiving neither: with only the guard relaxed, the proxy answers loopback
+  // with its own 403 body, which RENDERS, so the agent screenshots a block
+  // page instead of failing cleanly.
+  const allowPrivate = ir.driver.allowPrivateTargets === true;
+  const allowPrivateField = allowPrivate ? ", ssrfProxy: false" : "";
+  const allowPrivateNavField = allowPrivate ? ", allowPrivateTargets: true" : "";
   const hasRules = ir.permissions.rules.length > 0;
   const permImport = hasRules
     ? `import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";\n`
@@ -371,14 +381,14 @@ async function main(): Promise<void> {
   }
 
   emit({ kind: "browser_start", backend: SPEC_BACKEND });
-  const driver = createDriver({ backend: SPEC_BACKEND, viewport: SPEC_VIEWPORT });
+  const driver = createDriver({ backend: SPEC_BACKEND, viewport: SPEC_VIEWPORT${allowPrivateField} });
   await driver.connect();
   if (SPEC_START_URL !== undefined) {
     await driver.goto(SPEC_START_URL);
     emit({ kind: "navigated", url: SPEC_START_URL });
   }
 
-  const navigateTool = createNavigateTool({ driver });
+  const navigateTool = createNavigateTool({ driver${allowPrivateNavField} });
   const screenshotTool = createScreenshotTool({ driver });
   const mk = createAllMouseKeyboardTools({ driver });
   const findElement = createFindElementTool({ driver, model: SPEC_GROUNDING_MODEL });
