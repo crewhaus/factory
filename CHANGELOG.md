@@ -33,6 +33,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memory (recall-without-capture) and continuity (read-only) seams there is
   nothing to restrict, since a park is a run-level pause and the store is
   keyed on `(toolName, inputHash)` across sessions.
+- **Pending approvals are swept on an unattended harness, so raw tool inputs
+  stop outliving the sessions they came from.** `approvals.jsonl` had exactly
+  one pruner — `list()` — whose only production callers are the human-invoked
+  `crewhaus approvals list|show` verbs. A daemon or a cron'd run therefore
+  never compacted it: a full park→grant→consume cycle appends three lines, a
+  consumed or expired record makes the next identical call mint a fresh id and
+  append again, and `get` re-folds the entire file on every `ask`, so ask
+  latency degraded against a file nothing ever truncated.
+
+  The retention angle is the sharper one. Every record embeds the tool input
+  verbatim — by construction the calls a policy deemed sensitive enough to
+  need a human, so exactly the ones likely to carry credentials, payloads or
+  file contents — and nothing in the retention machinery could reach it:
+  `evictExpiredSessions`, `SessionStore.delete()` and `crewhaus retention
+  sweep|purge` all key on `sess_<16 hex>.json`, and the retention inventory
+  classifies `approvals.jsonl` as "not a session artifact" and skips it. An
+  operator could purge a session for compliance while the input that session
+  tried to run survived indefinitely in a sibling file.
+
+  `@crewhaus/session-store` now exports `evictExpiredApprovals`, mirroring
+  `evictExpiredSessions`, and a run sweeps its own session root at boot beside
+  the session eviction it already did. A record whose `createdAt` will not
+  parse now counts as EXPIRED rather than immortal — the shape guard only
+  demands a string, so a corrupted line would otherwise survive every
+  compaction forever while still carrying its input.
 - **Compiled bundles honour `permissions.ask_mode` too.** The interpreter
   learned to park a headless `ask` rather than deny it in place, but every
   target emitter still passed neither `askMode` nor `approvals` into the
