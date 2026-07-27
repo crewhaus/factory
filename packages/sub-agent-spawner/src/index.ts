@@ -230,6 +230,16 @@ export async function spawnSubAgent(
       ...(parent.continuity !== undefined
         ? { continuity: { loadPlan: parent.continuity.loadPlan, ledger: false } }
         : {}),
+      //   - approvals: Loop contract 0.4 (G11) parking. The child inherits the
+      //     parent's ask_mode and the SAME store. Nothing is narrowed here,
+      //     unlike memory/continuity — a park is a run-level pause, and the
+      //     store is keyed on (toolName, inputHash) across sessions, so the
+      //     grant issued for a child's call is found when it is re-issued.
+      //     Without these a child loop is non-interactive with nothing to park
+      //     against, so its every `ask` collapsed to a deny no matter what the
+      //     parent's spec asked for.
+      ...(parent.askMode !== undefined ? { askMode: parent.askMode } : {}),
+      ...(parent.approvals !== undefined ? { approvals: parent.approvals } : {}),
       ...(opts._client !== undefined ? { _adapter: opts._client as ProviderAdapter } : {}),
     });
   } catch (err) {
@@ -251,7 +261,20 @@ export async function spawnSubAgent(
         failureClass: childFailure.failureClass,
         report: childFailure.report,
       });
-      if (childFailure.report.class === "billing" || childFailure.report.class === "auth") {
+      // `approval_pending` escalates alongside billing/auth, for a DIFFERENT
+      // reason: those are fatal, a park is RESUMABLE and the parent is the
+      // only thing that can be resumed. Swallowing it into an `is_error` tool
+      // result loses the one signal every consumer keys on — exit code 36 and
+      // `report.class` (`crewhaus failures` explicitly classifies it as a
+      // non-failure, `fleet` renders it as "needs approval", the channel bot
+      // posts its approve/deny prompt) — and leaves the model free to retry
+      // the Task, re-firing `approvals.notify` and prompting the operator
+      // again for a decision already pending.
+      if (
+        childFailure.report.class === "billing" ||
+        childFailure.report.class === "auth" ||
+        childFailure.report.class === "approval_pending"
+      ) {
         escalation =
           err instanceof RunFailedError ? err : new RunFailedError(childFailure.report, err);
       }

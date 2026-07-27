@@ -215,6 +215,7 @@
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/state-store": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
