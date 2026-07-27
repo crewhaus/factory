@@ -1378,27 +1378,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run. A truncated calibration file was observed mid-run in a shared
   checkout.
 
----
-
-## Assembly notes (not for the repo CHANGELOG)
-
-- Fragment coverage: all four wave clusters supplied a fragment (`S.md`,
-  `R.md`, `A.md`, `T.md`). **No cluster fragment is missing.**
-- Dedupe applied: the gateway-protocol `feedback.submit` note appeared in
-  both an `Added` bullet and a standalone `Changed` bullet in the
-  automation fragment — folded into the single gateway-ratings entry.
-- Codenames stripped throughout (gap-item ids and cluster letters); the
-  shape-reach fragment's two bullets (bridge lifted / bridge invokes real
-  runtimes) were merged into one entry because they describe one shipped
-  capability. Each fragment's "known residue" text was kept as documented
-  scope inside the relevant bullet rather than as a separate section.
-- No PR reference appended — the repo CHANGELOG convention is a trailing
-  `[#NNN]`, which should be added when the wave PR number exists.
-_Nothing — this wave lands no bug fixes. Heading kept so the section is
-explicit; drop it at merge time if nothing else in the release fills it._
-
----
-
 ## [0.4.0] - 2026-07-18
 
 ### Added
