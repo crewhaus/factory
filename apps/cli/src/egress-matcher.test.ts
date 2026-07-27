@@ -1,4 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import { _clearEgressCache } from "@crewhaus/egress-classifier";
 import { createRunContext } from "@crewhaus/run-context";
@@ -13,6 +16,21 @@ import {
   createEgressMatcher,
   resolveEgressMatcherChoice,
 } from "./egress-matcher";
+
+/**
+ * HERMETICITY: `runChatLoop` persists a session JSON + event-log JSONL for
+ * every run, rooted at `<cwd>/.crewhaus/sessions` by default — and the
+ * workspace test script runs each package's `bun test src` with the PACKAGE
+ * dir as cwd, so an unpinned run drops artifacts into `apps/cli/.crewhaus/` in
+ * the operator's checkout. `.gitignore` hides them, which is exactly what
+ * makes them easy to miss: they accumulate across runs and a stale session id
+ * can still resolve in a later test. Every `runChatLoop` below pins
+ * `sessionRootDir` to this mkdtemp root instead.
+ */
+const SESSION_ROOT = mkdtempSync(join(tmpdir(), "crewhaus-egress-matcher-"));
+afterAll(() => {
+  rmSync(SESSION_ROOT, { recursive: true, force: true });
+});
 
 // ---------------------------------------------------------------------------
 // Pure matcher-choice resolution (flag > spec(ir.security.egressMatcher) >
@@ -205,6 +223,7 @@ describe("egress matcher end-to-end (CLI-resolved semantic matcher -> real egres
       seedMessages: [{ role: "user", content: "go" }],
       tools: [exfil],
       permissionMode: "bypass",
+      sessionRootDir: SESSION_ROOT,
       // biome-ignore lint/style/noNonNullAssertion: asserted defined above.
       egressMatcher: matcher!,
     });
@@ -256,6 +275,7 @@ describe("egress matcher end-to-end (CLI-resolved semantic matcher -> real egres
       seedMessages: [{ role: "user", content: "go" }],
       tools: [exfil],
       permissionMode: "bypass",
+      sessionRootDir: SESSION_ROOT,
       // biome-ignore lint/style/noNonNullAssertion: matcher is defined.
       egressMatcher: matcher!,
     });

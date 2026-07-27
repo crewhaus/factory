@@ -179,6 +179,22 @@ function makeGatedToolUseAdapter(justification: string): ProviderAdapter {
   };
 }
 
+/**
+ * HERMETICITY: both e2e tests below already sandbox the AUDIT chain under a
+ * per-test `mkdtemp` cwd, but `runChatLoop` separately persists a session JSON
+ * + event-log JSONL, and that root defaults to `<process cwd>/.crewhaus/sessions`
+ * — NOT the `cwd` variable these tests pass around. The workspace test script
+ * runs `bun test src` with the PACKAGE dir as cwd, so leaving it unpinned drops
+ * session artifacts into `apps/cli/.crewhaus/` in the operator's checkout;
+ * `.gitignore` hides them, so they accumulate across runs and a stale session
+ * id can still resolve in a later test. Rooting the sessions under the same
+ * per-test `cwd` puts them exactly where `crewhaus run` would put them and
+ * lets the existing `finally` cleanup carry them off.
+ */
+function sessionRootUnder(cwd: string): string {
+  return join(cwd, ".crewhaus", "sessions");
+}
+
 describe("justification gate end-to-end (CLI sink + judge -> durable audit)", () => {
   test("a CLI-opened audit sink records a verify()-clean permission_justification_evaluated record carrying the judge identity", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "crewhaus-just-gate-"));
@@ -218,6 +234,7 @@ describe("justification gate end-to-end (CLI sink + judge -> durable audit)", ()
         seedMessages: [{ role: "user", content: "ack the ticket" }],
         tools: [sendMessage],
         permissionMode: "bypass",
+        sessionRootDir: sessionRootUnder(cwd),
         justificationJudge: judge,
         // biome-ignore lint/style/noNonNullAssertion: asserted defined above.
         justificationAuditSink: sink!,
@@ -278,6 +295,7 @@ describe("justification gate end-to-end (CLI sink + judge -> durable audit)", ()
         seedMessages: [{ role: "user", content: "ack the ticket" }],
         tools: [sendMessage],
         permissionMode: "bypass",
+        sessionRootDir: sessionRootUnder(cwd),
         // no judge => rule-based default; no sink => no durable record.
       });
 
