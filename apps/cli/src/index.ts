@@ -4718,9 +4718,17 @@ async function runRunBrowser(
       import("@crewhaus/tool-vision-grounding"),
     ]);
 
+  // SECURITY — `driver.allowPrivateTargets` relaxes BOTH SSRF layers together:
+  // the chromium backend's DNS-pinning proxy here, and the Navigate tool's
+  // pre-goto guard below. Relaxing one alone is worse than relaxing neither —
+  // with only the guard waived the proxy still answers loopback with its own
+  // 403 body, which RENDERS, so the agent screenshots a block page and reports
+  // whatever it can make of it rather than failing cleanly.
+  const allowPrivateTargets = ir.driver.allowPrivateTargets === true;
   const driver = createDriver({
     backend: ir.driver.backend,
     viewport: ir.driver.viewport,
+    ...(allowPrivateTargets ? { ssrfProxy: false } : {}),
   });
 
   emitEvent({ kind: "browser_start", backend: ir.driver.backend });
@@ -4731,7 +4739,10 @@ async function runRunBrowser(
       emitEvent({ kind: "navigated", url: ir.driver.startUrl });
     }
 
-    const navigateTool = navigate.createNavigateTool({ driver });
+    const navigateTool = navigate.createNavigateTool({
+      driver,
+      ...(allowPrivateTargets ? { allowPrivateTargets: true } : {}),
+    });
     const screenshotTool = screenCapture.createScreenshotTool({ driver });
     const mk = mouseKeyboard.createAllMouseKeyboardTools({ driver });
     const findElement = visionGrounding.createFindElementTool({

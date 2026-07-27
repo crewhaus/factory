@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A tool permission that lands on `ask` inside a sub-agent (`Task`) turn now
+  parks like any other, instead of denying in place.** Three links were
+  missing at once: `ParentRunHandle` carried no approval seam, the Task tool's
+  hand-copied `parentHandle` projection could not have forwarded one, and the
+  child `runChatLoop` was never given `askMode`/`approvals` — so a child was
+  non-interactive with nothing to park against, and every `ask` collapsed to a
+  denial regardless of the parent's `permissions.ask_mode`.
+
+  A parked child also used to be SWALLOWED. The spawner escalates only
+  terminal classes to the parent, and its predicate listed just
+  `billing`/`auth`, so a park dissolved into an `is_error` tool result: the
+  parent exited 0 with a `PendingApproval` on disk, and the model was free to
+  retry the Task and re-fire `approvals.notify` for a decision already
+  pending. `approval_pending` now escalates too — for the opposite reason to
+  billing/auth: those are fatal, a park is RESUMABLE, and the parent run is
+  the only thing that can be resumed. Every consumer keys on that classified
+  report (`crewhaus failures` treats it as a non-failure, `fleet` renders
+  "needs approval", the channel bot posts its approve/deny prompt), and none
+  of it was reachable from an `is_error` string.
+
+  The child shares the parent's store rather than a narrowed one — unlike the
+  memory (recall-without-capture) and continuity (read-only) seams there is
+  nothing to restrict, since a park is a run-level pause and the store is
+  keyed on `(toolName, inputHash)` across sessions.
+- **Pending approvals are swept on an unattended harness, so raw tool inputs
+  stop outliving the sessions they came from.** `approvals.jsonl` had exactly
+  one pruner — `list()` — whose only production callers are the human-invoked
+  `crewhaus approvals list|show` verbs. A daemon or a cron'd run therefore
+  never compacted it: a full park→grant→consume cycle appends three lines, a
+  consumed or expired record makes the next identical call mint a fresh id and
+  append again, and `get` re-folds the entire file on every `ask`, so ask
+  latency degraded against a file nothing ever truncated.
+
+  The retention angle is the sharper one. Every record embeds the tool input
+  verbatim — by construction the calls a policy deemed sensitive enough to
+  need a human, so exactly the ones likely to carry credentials, payloads or
+  file contents — and nothing in the retention machinery could reach it:
+  `evictExpiredSessions`, `SessionStore.delete()` and `crewhaus retention
+  sweep|purge` all key on `sess_<16 hex>.json`, and the retention inventory
+  classifies `approvals.jsonl` as "not a session artifact" and skips it. An
+  operator could purge a session for compliance while the input that session
+  tried to run survived indefinitely in a sibling file.
+
+  `@crewhaus/session-store` now exports `evictExpiredApprovals`, mirroring
+  `evictExpiredSessions`, and a run sweeps its own session root at boot beside
+  the session eviction it already did. A record whose `createdAt` will not
+  parse now counts as EXPIRED rather than immortal — the shape guard only
+  demands a string, so a corrupted line would otherwise survive every
+  compaction forever while still carrying its input.
 - **A queue job that parks on an approval no longer burns its retry budget
   waiting for a human.** With `ask_mode` threaded into the batch worker, a
   tool permission resolving to `ask` throws `approval_pending` out of the
@@ -84,6 +133,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`driver.allowPrivateTargets` (browser specs, default false) — and with it,
+  the browser runtime smoke is a HARD gate again.** The smoke serves its
+  randomised magic-phrase page on `http://127.0.0.1:<port>`, which the SSRF
+  floor refused in two independent layers (the Navigate pre-goto guard, and
+  the chromium backend's DNS-pinning proxy) with no way for a spec to opt in.
+  The shape therefore could not pass, and the advisory that hid that was the
+  only thing keeping the job green. The fixture now opts in, the smoke passes,
+  and `CREWHAUS_RUNTIME_SMOKE_BROWSER=1` promotes it back to a hard assertion.
+
+  The flag waives ONLY the private/loopback/mDNS host checks, for a harness
+  whose whole job is a private target the operator controls — an intranet app
+  under test, or a locally-served fixture page. It does NOT waive the
+  http/https scheme allowlist: an opted-in spec still cannot reach
+  `file:`/`data:`/`chrome:`. It is a per-spec, compile-time decision with no
+  env var and no global switch, so it cannot be turned on by an ambient
+  misconfiguration and a reviewer sees it in the spec diff. It is carried into
+  the IR only when true, so every bundle that leaves it alone stays
+  byte-identical.
+
+  Both layers move together, deliberately: waiving one alone is worse than
+  waiving neither, because with only the guard relaxed the DNS-pinning proxy
+  answers loopback with its own 403 body — which RENDERS, so the agent
+  screenshots a block page and reports whatever it can make of that instead of
+  failing cleanly.
 - **`parseArgs` now rejects a malformed arg schema instead of silently
   dropping a flag.** `@crewhaus/infra-utils` exports a new `ArgSchemaError`,
   thrown when a `ParseArgsSchema` declares the same token (`--name` or
