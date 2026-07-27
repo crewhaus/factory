@@ -1997,15 +1997,53 @@ describe("emitChannelBot — G48 durable security audit sink", () => {
 });
 
 describe("emitChannelBot — G11 pending-approval channel surface (ask_mode pause)", () => {
-  test("daemon constructs the shared approval store and wires it into gateway + router", () => {
+  test("daemon builds ONE store with two faces: runtime for the loop, bridge for the channel", () => {
     const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    // The runtime store is what runChatLoop parks into and re-reads when a
+    // turn is re-driven, so it must be the SAME store the channel surface
+    // serves from — otherwise a Slack grant records a decision the agent
+    // never sees.
     expect(daemon).toContain(
-      'import { InMemoryApprovalStore } from "@crewhaus/channel-adapter-base";',
+      'import { createRuntimeBackedApprovalStore } from "@crewhaus/channel-adapter-base";',
     );
-    expect(daemon).toContain("const __approvals = new InMemoryApprovalStore();");
+    expect(daemon).toContain(
+      'import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";',
+    );
+    expect(daemon).toContain("const __runtimeApprovals = createPendingApprovalStore(");
+    expect(daemon).toContain(
+      "const __approvals = createRuntimeBackedApprovalStore(__runtimeApprovals);",
+    );
+    // The loop gets the runtime face…
+    expect(daemon).toContain("runtimeApprovals: __runtimeApprovals,");
+    // …the router and gateway get the channel face.
     expect(daemon).toContain("createSessionRouter({ agent, approvals: __approvals })");
     expect(daemon).toContain("approvals: __approvals,");
     expect(daemon).toContain("auditSink: __securityAudit,");
+    // The in-memory store is gone: nothing ever wrote to it, and it was
+    // volatile — a restart forgot every park.
+    expect(daemon).not.toContain("InMemoryApprovalStore");
+  });
+
+  test("the emitted turn threads askMode + approvals — without it the whole surface is dead code", () => {
+    const agent = fileMap(MIN_IR).get("agent.ts") ?? "";
+    expect(agent).toContain('askMode: "pause",');
+    expect(agent).toContain('approvals: { store: config.runtimeApprovals, surface: "channel" },');
+    expect(agent).toContain("runtimeApprovals: RuntimeApprovalStore;");
+  });
+
+  test("ask_mode: deny emits no store, and no turn field referencing one", () => {
+    const denyIr = {
+      ...MIN_IR,
+      permissions: { ...MIN_IR.permissions, askMode: "deny" as const },
+    };
+    const files = fileMap(denyIr);
+    const daemon = files.get("daemon.ts") ?? "";
+    const agent = files.get("agent.ts") ?? "";
+    expect(daemon).not.toContain("createRuntimeBackedApprovalStore");
+    expect(daemon).not.toContain("__runtimeApprovals");
+    // The turn must not reference a store the daemon never built.
+    expect(agent).not.toContain("config.runtimeApprovals");
+    expect(agent).not.toContain("runtimeApprovals: RuntimeApprovalStore;");
   });
 
   test("gateway adds the /<adapter>/actions route: verify → resolve → ack → resume", () => {

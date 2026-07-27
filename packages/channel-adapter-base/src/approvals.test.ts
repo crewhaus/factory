@@ -5,8 +5,10 @@ import {
   InMemoryApprovalStore,
   type NewPendingApproval,
   type PendingApproval,
+  type RuntimeApprovalRecord,
   approvalFallbackText,
   createApprovalPrompter,
+  createRuntimeBackedApprovalStore,
   postApprovalPrompt,
   previewApprovalInput,
   resolveApproval,
@@ -286,5 +288,158 @@ describe("previewApprovalInput", () => {
     const cyclic: Record<string, unknown> = {};
     cyclic["self"] = cyclic;
     expect(typeof previewApprovalInput(cyclic)).toBe("string");
+  });
+});
+
+/**
+ * Loop contract 0.4 (G11) — the bridge that makes the channel approval surface
+ * reachable. The channel store and the runtime store were separate, and only
+ * the runtime's was ever written to, so the Slack approve/deny flow queried an
+ * empty map: it could not prompt, and a grant could not resume anything.
+ */
+describe("createRuntimeBackedApprovalStore", () => {
+  /** A minimal stand-in for @crewhaus/session-store's PendingApprovalStore. */
+  function fakeRuntimeStore(seed: RuntimeApprovalRecord[] = []) {
+    const records = new Map(seed.map((r) => [r.id, r]));
+    return {
+      records,
+      store: {
+        async persist(a: RuntimeApprovalRecord) {
+          records.set(a.id, a);
+        },
+        async get(toolName: string, inputHash: string) {
+          for (const r of records.values()) {
+            // Mirrors the real store: it skips CONSUMED records, not decided
+            // ones — returning a decided record is exactly how a grant is found.
+            if (
+              r.toolName === toolName &&
+              r.inputHash === inputHash &&
+              r.consumedAt === undefined
+            ) {
+              return r;
+            }
+          }
+          return null;
+        },
+        async resolve(id: string, decision: "grant" | "deny", by: string) {
+          const cur = records.get(id);
+          if (cur === undefined) return null;
+          // Deliberately mirrors the REAL runtime store: it overwrites and
+          // returns the record even when already decided.
+          const next = { ...cur, decision, decidedBy: by, decidedAt: "2026-01-01T00:00:00.000Z" };
+          records.set(id, next);
+          return next;
+        },
+        async list() {
+          return [...records.values()];
+        },
+      },
+    };
+  }
+
+  function record(over: Partial<RuntimeApprovalRecord> = {}): RuntimeApprovalRecord {
+    return {
+      id: "appr_00000000000000aa",
+      toolName: "sendmessage",
+      inputHash: "h1",
+      input: { text: "ship it" },
+      runId: "run_1",
+      sessionId: "sess_00000000000000aa",
+      surface: "channel",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      ...over,
+    };
+  }
+
+  test("a runtime park is visible to the channel surface, shape-mapped", async () => {
+    const { store } = fakeRuntimeStore([record()]);
+    const bridged = createRuntimeBackedApprovalStore(store);
+    const listed = await bridged.list({ status: "pending", sessionId: "sess_00000000000000aa" });
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.id).toBe("appr_00000000000000aa");
+    expect(listed[0]?.status).toBe("pending");
+    // The channel surface renders a preview; the raw input stays behind.
+    expect(listed[0]?.inputPreview).toContain("ship it");
+    expect((listed[0] as unknown as { input?: unknown }).input).toBeUndefined();
+  });
+
+  test("a decided record maps status from the runtime's `decision`", async () => {
+    const { store } = fakeRuntimeStore([record({ decision: "grant", decidedBy: "slack:U1" })]);
+    const bridged = createRuntimeBackedApprovalStore(store);
+    expect((await bridged.get("appr_00000000000000aa"))?.status).toBe("grant");
+    expect(await bridged.list({ status: "pending" })).toHaveLength(0);
+  });
+
+  /**
+   * The gateway's /actions route treats a non-null `resolve` as "I transitioned
+   * it" and uses that to ACK Slack and re-drive the turn. The runtime store
+   * overwrites and returns the record regardless, so passing it through would
+   * double-ACK and double-drive on a Slack retry — a duplicate side effect,
+   * not a cosmetic one.
+   */
+  test("resolve returns null on a SECOND decision, preserving the gateway's guard", async () => {
+    const { store } = fakeRuntimeStore([record()]);
+    const bridged = createRuntimeBackedApprovalStore(store);
+    const first = await bridged.resolve("appr_00000000000000aa", "grant", "slack:U1");
+    expect(first?.status).toBe("grant");
+    expect(first?.decidedBy).toBe("slack:U1");
+    // The retry — Slack redelivers interactions freely.
+    expect(await bridged.resolve("appr_00000000000000aa", "grant", "slack:U1")).toBeNull();
+    expect(await bridged.resolve("appr_00000000000000aa", "deny", "slack:U2")).toBeNull();
+  });
+
+  test("resolve returns null for an unknown id", async () => {
+    const { store } = fakeRuntimeStore();
+    const bridged = createRuntimeBackedApprovalStore(store);
+    expect(await bridged.resolve("appr_ffffffffffffffff", "grant", "x")).toBeNull();
+  });
+
+  test("the decision lands in the RUNTIME store — the only one the agent re-asks", async () => {
+    const fake = fakeRuntimeStore([record()]);
+    const bridged = createRuntimeBackedApprovalStore(fake.store);
+    await bridged.resolve("appr_00000000000000aa", "grant", "slack:U1");
+    // Keyed the way runtime-core looks it up when the turn is re-driven.
+    const found = await fake.store.get("sendmessage", "h1");
+    expect(found?.decision).toBe("grant");
+  });
+
+  test("put() mints an id in the runtime's appr_<16 hex> space", async () => {
+    const { store } = fakeRuntimeStore();
+    const bridged = createRuntimeBackedApprovalStore(store);
+    const created = await bridged.put({
+      toolName: "t",
+      inputPreview: "p",
+      surface: "channel",
+      sessionId: "sess_00000000000000ab",
+    });
+    // The old channel store minted 24 hex, which session-store's resolve()
+    // rejects outright — and so does `crewhaus approvals grant`, the command
+    // the Slack prompt tells the operator to run.
+    expect(created.id).toMatch(/^appr_[0-9a-f]{16}$/);
+  });
+
+  test("list is newest-first", async () => {
+    const { store } = fakeRuntimeStore([
+      record({ id: "appr_00000000000000a1", createdAt: "2026-01-01T00:00:00.000Z" }),
+      record({
+        id: "appr_00000000000000a2",
+        createdAt: "2026-01-02T00:00:00.000Z",
+        inputHash: "h2",
+      }),
+    ]);
+    const bridged = createRuntimeBackedApprovalStore(store);
+    expect((await bridged.list()).map((a) => a.id)).toEqual([
+      "appr_00000000000000a2",
+      "appr_00000000000000a1",
+    ]);
+  });
+
+  test("waitFor settles on a decision and rejects an unknown id", async () => {
+    const fake = fakeRuntimeStore([record()]);
+    const bridged = createRuntimeBackedApprovalStore(fake.store, { waitForPollMs: 1 });
+    await expect(bridged.waitFor("appr_ffffffffffffffff")).rejects.toThrow(/unknown approval/);
+    const settled = bridged.waitFor("appr_00000000000000aa");
+    await bridged.resolve("appr_00000000000000aa", "deny", "slack:U9");
+    expect(await settled).toBe("deny");
   });
 });

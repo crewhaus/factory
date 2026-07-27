@@ -515,6 +515,26 @@ const __evaluation: RunEvaluation = {
   return { imports: [typeImport], bootBlock, field };
 }
 
+/**
+ * Loop contract 0.4 (G11) — the `askMode` + `approvals` fields for the emitted
+ * turn. Without these runtime-core can never throw `approval_pending`, which
+ * made the entire Slack park -> approve -> resume surface below unreachable
+ * code: the router's catch never fired, so its prompt never posted.
+ *
+ * The store here is the RUNTIME one, deliberately — a decision has to land
+ * where the re-driven turn will look for it, and runtime-core consults only
+ * its own store, keyed `(toolName, inputHash)`.
+ *
+ * Emitted only when `ask_mode` is not "deny": under deny there is nothing to
+ * park, and the daemon builds no store to point at.
+ */
+function renderApprovalRunFields(ir: IrChannelV0, approvalsOn: boolean): string {
+  if (!approvalsOn) return "";
+  return `\n        askMode: ${escapeJsonString(
+    ir.permissions.askMode ?? "pause",
+  )},\n        approvals: { store: config.runtimeApprovals, surface: "channel" },`;
+}
+
 function renderPermissionsField(ir: IrChannelV0): string {
   const { mode, rules } = ir.permissions;
   if (mode === undefined && rules.length === 0) return "";
@@ -909,6 +929,13 @@ function renderAgent(ir: IrChannelV0, evalEntry = false): string {
     ? `import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";\n`
     : "";
   const permField = renderPermissionsField(ir);
+  // G11 — under `ask_mode: deny` the daemon builds no approval store, so the
+  // emitted turn must not reference one. Same gate the daemon boot uses.
+  const approvalsOn = ir.permissions.askMode !== "deny";
+  const approvalRunFields = renderApprovalRunFields(ir, approvalsOn);
+  const approvalTypeImport = approvalsOn
+    ? `import type { RuntimeApprovalStoreLike as RuntimeApprovalStore } from "@crewhaus/channel-adapter-base";\n`
+    : "";
   const hasSubAgents = ir.subAgents.length > 0;
   const subAgentTypeImport = hasSubAgents
     ? `import type { SubAgentDefinition, SpawnSubAgentFn } from "@crewhaus/agent-context-isolation";\n`
@@ -1083,7 +1110,7 @@ import { runChatLoop } from "@crewhaus/runtime-core";
 import type { EgressAuditSink, JustificationAuditSink } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { classifyInbound } from "@crewhaus/channel-adapter-base";
-${permImport}${subAgentTypeImport}${memImport}${evalImport}import type { HookDef } from "@crewhaus/hooks-engine";
+${permImport}${approvalTypeImport}${subAgentTypeImport}${memImport}${evalImport}import type { HookDef } from "@crewhaus/hooks-engine";
 import type { SkillRef } from "@crewhaus/skills-registry";
 import type { SlashCommand } from "@crewhaus/slash-commands";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -1106,7 +1133,7 @@ export type AgentConfig = {
   // the intent-gate + egress records land on one gapless chain.
   justificationAuditSink?: JustificationAuditSink;
   egressAuditSink?: EgressAuditSink;
-${thredzOn ? "  // Loop contract 0.4 (Batch E, G23) — the live Thredz connection from the\n  // daemon's connectThredz boot (null when the backend degraded to local\n  // files), threaded into every per-turn wireMemory call as the backend flip.\n  thredz: ThredzConnection | null;\n" : ""}${subAgentConfigFields}};
+${approvalsOn ? "  // Loop contract 0.4 (G11) — the RUNTIME pending-approval store the daemon\n  // builds. runChatLoop parks into this one; the session-router and the\n  // /<adapter>/actions webhook see the same records through the channel-shaped\n  // bridge built over it.\n  runtimeApprovals: RuntimeApprovalStore;\n" : ""}${thredzOn ? "  // Loop contract 0.4 (Batch E, G23) — the live Thredz connection from the\n  // daemon's connectThredz boot (null when the backend degraded to local\n  // files), threaded into every per-turn wireMemory call as the backend flip.\n  thredz: ThredzConnection | null;\n" : ""}${subAgentConfigFields}};
 
 export type RunTurnArgs = {
   sessionId: string;
@@ -1147,7 +1174,7 @@ export function createAgent(config: AgentConfig): Agent {
         tools: ${toolsExpr},
         hooks: config.hooks,
         skills: ${skillsExpr},
-        slashCommands: ${slashCommandsExpr},${permField}${subAgentRunFields}${memRunField}
+        slashCommands: ${slashCommandsExpr},${permField}${approvalRunFields}${subAgentRunFields}${memRunField}
         ...(config.justificationAuditSink !== undefined
           ? { justificationAuditSink: config.justificationAuditSink }
           : {}),
@@ -2263,7 +2290,8 @@ import { defaultCatalog } from "@crewhaus/tool-catalog";`;
   const observabilityEnvStamp = renderObservabilityEnvStamp(ir);
   const approvalsOn = ir.permissions.askMode !== "deny";
   const approvalsImport = approvalsOn
-    ? 'import { InMemoryApprovalStore } from "@crewhaus/channel-adapter-base";\n'
+    ? 'import { createRuntimeBackedApprovalStore } from "@crewhaus/channel-adapter-base";\n' +
+      'import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";\n'
     : "";
   const auditApprovalsBoot = `
   // G48 — durable, hash-chained security audit sink rooted at
@@ -2276,11 +2304,15 @@ import { defaultCatalog } from "@crewhaus/tool-catalog";`;
       : await openAuditLog({ rootDir: join(__cwd, ".crewhaus", "audit") });
 ${
   approvalsOn
-    ? "  // G11 — the shared pending-approval store: the parked turn (session-router)\n  // and the /<adapter>/actions webhook rendezvous here. In-memory default —\n  // volatile, so a restart forgets parked approvals; a durable/cross-process\n  // backend (shared with the `crewhaus approvals` CLI verbs) is a follow-up.\n  const __approvals = new InMemoryApprovalStore();\n"
+    ? "  // G11 — ONE pending-approval store, two faces. `__runtimeApprovals` is what\n  // runChatLoop parks into and re-reads when a turn is re-driven; the bridge\n  // is the channel-shaped view the session-router and the /<adapter>/actions\n  // webhook use. They MUST be the same underlying store: a decision recorded\n  // anywhere else is a decision the agent never sees, because the re-driven\n  // turn asks runtime-core, which consults only its own store.\n  //\n  // Durable and cross-process, so a daemon restart no longer forgets a parked\n  // approval (leaving a human staring at buttons wired to nothing), and the\n  // ids are the `appr_<16 hex>` space `crewhaus approvals grant` accepts —\n  // the command the Slack prompt itself tells the operator to run.\n  const __approvalRoot = resolveSessionRootDir(undefined);\n  const __runtimeApprovals = createPendingApprovalStore(\n    __approvalRoot !== undefined ? { rootDir: __approvalRoot } : {},\n  );\n  const __approvals = createRuntimeBackedApprovalStore(__runtimeApprovals);\n"
     : ""
 }`;
   const agentAuditFields =
     "\n    ...(__securityAudit !== undefined\n      ? { justificationAuditSink: __securityAudit, egressAuditSink: __securityAudit }\n      : {}),";
+  // G11 — the RUNTIME store goes to the agent (runChatLoop parks into it);
+  // the channel-shaped bridge over the SAME store goes to the router and the
+  // gateway below. Two faces, one file on disk.
+  const agentApprovalsField = approvalsOn ? "\n    runtimeApprovals: __runtimeApprovals," : "";
   const sessionRouterApprovalsField = approvalsOn ? ", approvals: __approvals" : "";
   const gatewayApprovalsFields = approvalsOn
     ? "\n    approvals: __approvals,\n    auditSink: __securityAudit,"
@@ -2328,7 +2360,7 @@ ${registerBlock}${mcpBoot}${subAgentBoot}${knowledgeBoot}
     hooks: ${agentHooksExpr},
 ${agentSkillsFields}
     tools: defaultCatalog.list(),${subAgentCreateAgentFields}${agentAuditFields}${thredzCreateAgentField}
-    promptCacheStore: __promptCacheStore,
+    promptCacheStore: __promptCacheStore,${agentApprovalsField}
   });
 ${gatewayCounters}  const sessionRouter = createSessionRouter({ agent${sessionRouterApprovalsField}${sessionRouterCountersField} });
   // SECURITY (audit R3) — replay-dedup backend. Default in-memory; set

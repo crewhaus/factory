@@ -16,7 +16,8 @@ import { createDedupStore } from "@crewhaus/durable-state";
 import { createJanitor } from "@crewhaus/runtime-core";
 import { openAuditLog } from "@crewhaus/audit-log";
 import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
-import { InMemoryApprovalStore } from "@crewhaus/channel-adapter-base";
+import { createRuntimeBackedApprovalStore } from "@crewhaus/channel-adapter-base";
+import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
 import { join } from "node:path";
 
 const __requiredEnv = ["PIN_SLACK_BOT_TOKEN","PIN_SLACK_SIGNING_SECRET"];
@@ -64,11 +65,22 @@ async function main(): Promise<void> {
     process.env["CREWHAUS_SECURITY_AUDIT"] === "0"
       ? undefined
       : await openAuditLog({ rootDir: join(__cwd, ".crewhaus", "audit") });
-  // G11 — the shared pending-approval store: the parked turn (session-router)
-  // and the /<adapter>/actions webhook rendezvous here. In-memory default —
-  // volatile, so a restart forgets parked approvals; a durable/cross-process
-  // backend (shared with the `crewhaus approvals` CLI verbs) is a follow-up.
-  const __approvals = new InMemoryApprovalStore();
+  // G11 — ONE pending-approval store, two faces. `__runtimeApprovals` is what
+  // runChatLoop parks into and re-reads when a turn is re-driven; the bridge
+  // is the channel-shaped view the session-router and the /<adapter>/actions
+  // webhook use. They MUST be the same underlying store: a decision recorded
+  // anywhere else is a decision the agent never sees, because the re-driven
+  // turn asks runtime-core, which consults only its own store.
+  //
+  // Durable and cross-process, so a daemon restart no longer forgets a parked
+  // approval (leaving a human staring at buttons wired to nothing), and the
+  // ids are the `appr_<16 hex>` space `crewhaus approvals grant` accepts —
+  // the command the Slack prompt itself tells the operator to run.
+  const __approvalRoot = resolveSessionRootDir(undefined);
+  const __runtimeApprovals = createPendingApprovalStore(
+    __approvalRoot !== undefined ? { rootDir: __approvalRoot } : {},
+  );
+  const __approvals = createRuntimeBackedApprovalStore(__runtimeApprovals);
 
 
   // Loop contract 0.4 (Batch E, G78) — per-spec cross-run prompt-cache
@@ -85,6 +97,7 @@ async function main(): Promise<void> {
       ? { justificationAuditSink: __securityAudit, egressAuditSink: __securityAudit }
       : {}),
     promptCacheStore: __promptCacheStore,
+    runtimeApprovals: __runtimeApprovals,
   });
   const sessionRouter = createSessionRouter({ agent, approvals: __approvals });
   // SECURITY (audit R3) — replay-dedup backend. Default in-memory; set

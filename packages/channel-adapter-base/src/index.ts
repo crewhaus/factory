@@ -112,4 +112,8 @@ export {
   postApprovalPrompt,
   createApprovalPrompter,
   resolveApproval,
+  createRuntimeBackedApprovalStore,
+  type RuntimeApprovalRecord,
+  type RuntimeApprovalStoreLike,
+  type RuntimeBackedApprovalStoreOptions,
 } from "./approvals.js";

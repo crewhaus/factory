@@ -4,6 +4,7 @@ import { runChatLoop } from "@crewhaus/runtime-core";
 import type { EgressAuditSink, JustificationAuditSink } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { classifyInbound } from "@crewhaus/channel-adapter-base";
+import type { RuntimeApprovalStoreLike as RuntimeApprovalStore } from "@crewhaus/channel-adapter-base";
 import type { HookDef } from "@crewhaus/hooks-engine";
 import type { SkillRef } from "@crewhaus/skills-registry";
 import type { SlashCommand } from "@crewhaus/slash-commands";
@@ -27,6 +28,11 @@ export type AgentConfig = {
   // the intent-gate + egress records land on one gapless chain.
   justificationAuditSink?: JustificationAuditSink;
   egressAuditSink?: EgressAuditSink;
+  // Loop contract 0.4 (G11) — the RUNTIME pending-approval store the daemon
+  // builds. runChatLoop parks into this one; the session-router and the
+  // /<adapter>/actions webhook see the same records through the channel-shaped
+  // bridge built over it.
+  runtimeApprovals: RuntimeApprovalStore;
 };
 
 export type RunTurnArgs = {
@@ -69,6 +75,8 @@ export function createAgent(config: AgentConfig): Agent {
         hooks: config.hooks,
         skills: config.skills,
         slashCommands: config.slashCommands,
+        askMode: "pause",
+        approvals: { store: config.runtimeApprovals, surface: "channel" },
         ...(config.justificationAuditSink !== undefined
           ? { justificationAuditSink: config.justificationAuditSink }
           : {}),
