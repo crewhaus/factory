@@ -493,3 +493,155 @@ describe("startConsumer — visibility renewal sidecar", () => {
     expect(cleared.length).toBeGreaterThanOrEqual(1);
   });
 });
+
+/**
+ * Loop contract 0.4 (G11) — a handler that PARKS on a pending approval is
+ * waiting on a human, not failing.
+ *
+ * Before this, a park was an ordinary throw: it burned a retry, and with the
+ * default 3-retry budget and a visibility timeout in the tens of seconds a
+ * job dead-lettered within a minute — long before anyone ran
+ * `crewhaus approvals grant`. So the approval seam could never complete on
+ * this shape at all.
+ */
+describe("startConsumer — approval_pending defers instead of retrying", () => {
+  /** The shape runtime-core throws: a classified report, not a bare Error. */
+  function approvalPending(): Error {
+    return Object.assign(new Error("awaiting tool approval"), {
+      report: { class: "approval_pending", title: "awaiting tool approval" },
+    });
+  }
+
+  test("a job parked well past maxRetries never dead-letters, and completes once granted", async () => {
+    const queue = createInMemoryQueue<string>();
+    await queue.enqueue("needs-a-human");
+
+    let granted = false;
+    let calls = 0;
+    const outcomes: string[] = [];
+
+    const consumer = startConsumer<string, string>({
+      queue,
+      handler: async () => {
+        calls += 1;
+        if (!granted) throw approvalPending();
+        return "did the thing";
+      },
+      concurrency: 1,
+      visibilityTimeoutMs: 40,
+      // Deliberately tiny: with the old behaviour maxRetries: 2 dead-letters
+      // on the second delivery. The job below parks FIVE times first.
+      maxRetries: 2,
+      deferVisibilityMs: 1,
+      emptyQueuePollMs: 5,
+      observer: {
+        onJobEnd: (_job, outcome) => outcomes.push(outcome.kind),
+      },
+    });
+
+    // Park repeatedly — far past the retry budget.
+    const parkDeadline = Date.now() + 4_000;
+    while (Date.now() < parkDeadline && outcomes.filter((o) => o === "deferred").length < 5) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(outcomes.filter((o) => o === "deferred").length).toBeGreaterThanOrEqual(5);
+
+    // The whole point: still alive, not in the DLQ.
+    const parked = await queue.stats();
+    expect(parked.deadLetter).toBe(0);
+    expect(parked.acked).toBe(0);
+
+    // A human grants it out of band; the next delivery proceeds.
+    granted = true;
+    const ackDeadline = Date.now() + 4_000;
+    while (Date.now() < ackDeadline) {
+      if ((await queue.stats()).acked === 1) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    await consumer.drain();
+
+    const done = await queue.stats();
+    expect(done.acked).toBe(1);
+    expect(done.deadLetter).toBe(0);
+    expect(outcomes).toContain("ok");
+    expect(calls).toBeGreaterThan(5);
+  }, 20_000);
+
+  test("a park is reported as `deferred`, never as `fail`", async () => {
+    const queue = createInMemoryQueue<string>();
+    await queue.enqueue("x");
+    const seen: Array<{ kind: string; defers?: number }> = [];
+
+    const consumer = startConsumer<string, string>({
+      queue,
+      handler: async () => {
+        throw approvalPending();
+      },
+      concurrency: 1,
+      visibilityTimeoutMs: 40,
+      maxRetries: 1,
+      deferVisibilityMs: 1,
+      emptyQueuePollMs: 5,
+      observer: {
+        onJobEnd: (_job, outcome) =>
+          seen.push({
+            kind: outcome.kind,
+            ...(outcome.kind === "deferred" ? { defers: outcome.defers } : {}),
+          }),
+      },
+    });
+
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline && seen.length < 3) await new Promise((r) => setTimeout(r, 10));
+    await consumer.drain();
+
+    expect(seen.length).toBeGreaterThanOrEqual(3);
+    expect(seen.every((s) => s.kind === "deferred")).toBe(true);
+    // The counter climbs per park, so an operator can alert on a job that has
+    // been waiting a long time.
+    expect(seen[2]?.defers).toBe(3);
+    expect((await queue.stats()).deadLetter).toBe(0);
+  }, 15_000);
+
+  test("parked attempts do not spend the budget a REAL failure still needs", async () => {
+    const queue = createInMemoryQueue<string>();
+    await queue.enqueue("mixed");
+    let phase: "park" | "fail" = "park";
+    let parks = 0;
+    let fails = 0;
+
+    const consumer = startConsumer<string, string>({
+      queue,
+      handler: async () => {
+        if (phase === "park") {
+          parks += 1;
+          throw approvalPending();
+        }
+        fails += 1;
+        throw new Error("genuinely broken");
+      },
+      concurrency: 1,
+      visibilityTimeoutMs: 40,
+      maxRetries: 2,
+      deferVisibilityMs: 1,
+      emptyQueuePollMs: 5,
+    });
+
+    while (parks < 3) await new Promise((r) => setTimeout(r, 10));
+    phase = "fail";
+
+    const deadline = Date.now() + 4_000;
+    while (Date.now() < deadline) {
+      if ((await queue.stats()).deadLetter === 1) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    await consumer.drain();
+
+    // It DOES eventually dead-letter — parking is not immortality — but only
+    // after the real failures spend the real budget. Without subtracting the
+    // parked attempts, the very first genuine failure would have been
+    // permanent, because job.attempt was already past maxRetries.
+    expect((await queue.stats()).deadLetter).toBe(1);
+    expect(fails).toBeGreaterThanOrEqual(2);
+  }, 20_000);
+});
