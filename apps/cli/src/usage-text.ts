@@ -520,7 +520,7 @@ export const EVAL_USAGE =
   "  entirely when the run looks infrastructure-failed. Best-effort — a triage failure\n" +
   "  never fails the eval. Matrix cells (--models) skip triage.\n" +
   "  --judge-model accepts the full router grammar (claude-*, openai/<m>, gemini/<m>,\n" +
-  "  bedrock/<id>, local/<m>@<url>); the default judge claude-sonnet-4-5 requires\n" +
+  "  bedrock/<id>, local/<m>@<url>); the default judge claude-sonnet-5 requires\n" +
   "  Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)\n" +
   "  --models <m1,m2,...> runs a benchmark matrix: the SAME dataset (resolved once,\n" +
   "  regression union included) and graders once per model, patching the spec's\n" +

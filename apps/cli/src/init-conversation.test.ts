@@ -838,7 +838,7 @@ describe("crewhaus init --interactive — scripted fallback + non-TTY gating (su
       "no model credentials detected — falling back to the scripted questionnaire.\n",
       "harness name [scripted-bot]: ",
       "target shape (cli | workflow | research) [cli]: ",
-      "model [claude-opus-4-7]: ",
+      "model [claude-opus-5]: ",
       "one-line instructions for the agent: ",
       "tools (comma-separated names, or blank): ",
       `wrote ${targetFile}\n`,

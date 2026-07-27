@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AuditKind, FileAnchorStore, openAuditLog } from "@crewhaus/audit-log";
+import { DEFAULT_JUDGE_MODEL } from "@crewhaus/eval-judge";
 import { parseSpec } from "@crewhaus/spec";
 import { cliVersion } from "./version";
 
@@ -622,7 +623,7 @@ describe("crewhaus init", () => {
     const spec = parseSpec(readFileSync(written, "utf-8"));
     expect(spec.target).toBe("cli");
     if (spec.target !== "cli") expect.unreachable();
-    expect(spec.agent.model).toBe("claude-opus-4-7");
+    expect(spec.agent.model).toBe("claude-opus-5");
     expect(spec.agent.instructions.length).toBeGreaterThan(0);
     expect(result.stdout).toMatch(/wrote .*crewhaus\.yaml/);
     // Scaffolded in cwd → run in place, no cd needed.
@@ -902,7 +903,9 @@ describe("crewhaus run", () => {
     const result = await runCli(["eval", "--help"], { cwd: tmp, env: {} });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("--judge-model accepts the full router grammar");
-    expect(result.stdout).toContain("claude-sonnet-4-5");
+    // Bound to the constant, not a literal: the help text naming a stale
+    // default is the exact drift this assertion exists to catch.
+    expect(result.stdout).toContain(DEFAULT_JUDGE_MODEL);
     expect(result.stdout).toContain("Anthropic credentials");
   });
 

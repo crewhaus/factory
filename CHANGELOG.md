@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Docs, starter templates and the default judge now name the current Claude
+  models.** Every user-facing model string had drifted a generation behind:
+  the README's six spec examples and the `crewhaus init` / `doctor --fix` /
+  `watchme synthesize` scaffolds all handed a new user `claude-opus-4-7`, the
+  issue template asked for repros on `claude-sonnet-4-6`, and
+  `DEFAULT_JUDGE_MODEL` — what every `llm_judge` grader without an explicit
+  `model:` resolves to — was still `claude-sonnet-4-5`. Scaffolds and the
+  interactive `init` default now emit `claude-opus-5`; the judge default and
+  the docs that quote it are `claude-sonnet-5`. Haiku references are
+  unchanged, `claude-haiku-4-5` still being current.
+
+  Two assertions that pinned the old strings as literals are now bound to
+  `DEFAULT_JUDGE_MODEL` itself, since help text naming a stale default is the
+  drift they exist to catch — pinning the literal is what let it drift.
+
+  The model-router README's Bedrock row keeps its dated
+  `claude-sonnet-4-5-20250929-v1:0` id: that row documents how the id
+  *grammar* is parsed (inference-profile prefixes, family inference, the
+  `-v1:0` snapshot suffix), and a suffix-free current id would stop
+  illustrating it. Routing itself is version-agnostic — `claude-opus-5`,
+  `claude-sonnet-5` and `vertex/claude-sonnet-5` all resolve unchanged.
+
 ### Fixed
 
 - **A tool permission that lands on `ask` inside a sub-agent (`Task`) turn now

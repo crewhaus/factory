@@ -9,7 +9,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
-import { createJudgeGrader, judge } from "./judge";
+import { DEFAULT_JUDGE_MODEL, createJudgeGrader, judge } from "./judge";
 import { loadRubric } from "./rubric";
 
 type Served = { model: string };
@@ -114,7 +114,7 @@ describe("judge onUsage (C35)", () => {
       }),
     ).rejects.toThrow(/invalid shape/);
     // The default judge model is reported when the caller named none.
-    expect(seen).toEqual([{ model: "claude-sonnet-4-5", input: 10, output: 2 }]);
+    expect(seen).toEqual([{ model: DEFAULT_JUDGE_MODEL, input: 10, output: 2 }]);
   });
 
   test("no sink = no behaviour change (the grader still returns its verdict)", async () => {

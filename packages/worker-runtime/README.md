@@ -27,7 +27,7 @@ const result = await runWorkerLoop({
     randomId: () => crypto.randomUUID(),
     fetch: fetch.bind(globalThis),
   },
-  model: "claude-sonnet-4-5",
+  model: "claude-sonnet-5",
   instructions: "You are a helpful assistant.",
   messages: [{ role: "user", content: "hello" }],
   apiKey: env.ANTHROPIC_API_KEY,
