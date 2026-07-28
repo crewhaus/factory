@@ -249,9 +249,49 @@ function applyRelease(pkg: Json, pkgDir: string, isRoot: boolean): boolean {
   }
 
   // --for-publish: flip entrypoints + the packed `files` from src → built dist so the
-  // tarball is plain-Node loadable. Internal deps stay `workspace:*` (untouched here);
-  // `bun publish` resolves those to the concrete cut version at pack time.
+  // tarball is plain-Node loadable, and resolve internal `workspace:*` deps to the
+  // concrete version being cut.
+  //
+  // Resolving them HERE, from TARGET_VERSION, fixes two things at once.
+  //
+  // 1. It makes the stamped tree publisher-agnostic. `bun publish` rewrote
+  //    `workspace:*` at pack time and `npm publish` does not — it ships the literal
+  //    range and every install of the tarball then fails. That single difference is
+  //    what pinned the release to bun, and bun cannot do OIDC trusted publishing
+  //    (no --provenance, no id-token exchange as of 1.3.14), which npm now requires.
+  //
+  // 2. It removes a silent, install-breaking bug class. bun resolves `workspace:*`
+  //    from **bun.lock**, not from the version just stamped — so a lockfile that
+  //    predates the bump ships internal deps pinned to the PREVIOUS version.
+  //    Verified: packing a freshly-stamped 0.4.3 tree against a 0.4.1 lockfile
+  //    produced `crewhaus-eval-judge-0.4.3.tgz` whose deps all read "0.4.1". That is
+  //    the bug that tombstoned v0.1.0, and why publish-workspace.ts used to delete
+  //    bun.lock and reinstall before publishing. TARGET_VERSION cannot go stale.
+  //
+  // Only the three blocks that actually ship are rewritten. `devDependencies` are
+  // dropped from the tarball by npm and bun alike (verified on both packers), so a
+  // `workspace:` range surviving there never reaches a consumer.
+  //
+  // The pin is EXACT, not a caret range, to stay byte-identical to what bun already
+  // published: `@crewhaus/eval-judge@0.4.0` on the registry declares
+  // `"@crewhaus/errors": "0.4.0"`. A caret would silently widen every internal edge
+  // across a 214-package lockstep graph.
   if (FOR_PUBLISH) {
+    for (const field of ["dependencies", "peerDependencies", "optionalDependencies"] as const) {
+      const deps = pkg[field];
+      if (deps === null || typeof deps !== "object") continue;
+      const next: Record<string, string> = {};
+      let touched = false;
+      for (const [dep, range] of Object.entries(deps as Record<string, string>)) {
+        if (typeof range === "string" && range.startsWith("workspace:")) {
+          next[dep] = TARGET_VERSION;
+          touched = true;
+        } else {
+          next[dep] = range;
+        }
+      }
+      if (touched) set(field, next);
+    }
     if (typeof pkg.main === "string") set("main", toDist(pkg.main, ".js"));
     if (typeof pkg.types === "string") set("types", toDist(pkg.types, ".d.ts"));
     if (pkg.exports && typeof pkg.exports === "object") {

@@ -6,14 +6,33 @@
  *
  * This IS the release path: versioning is lockstep via scripts/release-prep.ts
  * (a changesets config existed 2026-05→06 but was never adopted and has been
- * removed). Stay on `bun publish` — never `npm publish` — because bun rewrites
- * `workspace:*` deps to concrete versions at pack time; npm ships the literal
- * range and breaks every install.
+ * removed).
  *
- * Pre-flight:
- *   export NPM_CONFIG_TOKEN=…  # classic npm *Automation* token; a 2FA-bound
- *                              # token dead-ends `bun publish` in a web-OTP
- *                              # prompt ("failed to send OTP request")
+ * Publishes with `npm publish`. It used to be `bun publish`, for one reason: bun
+ * rewrote `workspace:*` deps to concrete versions at pack time and npm shipped the
+ * literal range, breaking every install. `release-prep.ts --for-publish` now does
+ * that resolution itself, from the stamped version, so the manifest is publisher-
+ * agnostic before either tool sees it — and checkPublishableManifest() refuses to
+ * publish if one slipped through. That unblocks npm, which is required because only
+ * the npm CLI can do the OIDC trusted-publishing token exchange (bun 1.3.14 has
+ * neither OIDC nor --provenance; oven-sh/bun#22423 is open).
+ *
+ * Doing the resolution from the stamped version also kills a bug class bun was prone
+ * to: bun resolved `workspace:*` from bun.lock, so a lockfile predating the bump
+ * shipped internal deps pinned to the PREVIOUS version — the failure that tombstoned
+ * v0.1.0, and the reason this script used to delete bun.lock and reinstall.
+ *
+ * Auth, in preference order:
+ *   1. OIDC trusted publishing — nothing to export. In GitHub Actions with
+ *      `permissions: id-token: write` and a trusted publisher configured for the
+ *      package, npm mints a short-lived package-scoped credential itself, and this
+ *      script adds --provenance. There is no `npm whoami` identity on this path.
+ *   2. A *granular* access token with bypass-2FA, scoped to the @crewhaus scope plus
+ *      the unscoped `crewhaus` package, as NPM_TOKEN / ~/.npmrc. Fallback only.
+ *      Classic automation tokens are NOT an option: npm permanently revoked all of
+ *      them on 2025-12-09 and they cannot be recreated.
+ *
+ * Pre-flight (token path):
  *   npm whoami                 # must succeed
  *   bun install                # ensure node_modules are in shape
  *   bun run typecheck          # belt-and-braces
@@ -210,6 +229,14 @@ type PublishResult = "ok" | "already" | "failed";
 
 function publish(p: PkgInfo): PublishResult {
   console.log(`\n→ publishing ${p.name}@${p.version}`);
+  // Checked BEFORE the dry-run early-return, like the ownership guard above: a
+  // manifest that would install broken is exactly what a pre-flight is for, and
+  // catching it under --dry-run costs nothing and needs no credentials.
+  const manifestErr = checkPublishableManifest(p);
+  if (manifestErr !== undefined) {
+    console.error(`✗ ${p.name}: ${manifestErr}`);
+    return "failed";
+  }
   if (DRY) {
     console.log("  (dry-run, skipping)");
     return "ok";
@@ -229,43 +256,100 @@ function publish(p: PkgInfo): PublishResult {
     return "failed";
   }
   // Capture output so we can recognize "already published" as success.
-  const r = spawnSync("bun", ["publish"], { cwd: p.dir, encoding: "utf-8" });
+  // `npm publish`, not `bun publish`: only the npm CLI can do the OIDC trusted-
+  // publishing token exchange (bun 1.3.14 has neither OIDC nor --provenance), and
+  // OIDC is what replaces the revoked classic automation token. Safe to switch only
+  // because the manifest no longer carries `workspace:` ranges — that difference,
+  // not anything else about bun, was why this script was pinned to `bun publish`.
+  const r = spawnSync("npm", ["publish", ...PUBLISH_FLAGS], { cwd: p.dir, encoding: "utf-8" });
   const out = (r.stdout ?? "") + (r.stderr ?? "");
   process.stdout.write(out);
   if (r.status === 0) return "ok";
-  if (/cannot publish over the previously published versions/i.test(out)) {
+  // bun says "cannot publish over the previously published versions"; npm says
+  // "You cannot publish over the previously published versions" / EPUBLISHCONFLICT.
+  if (/cannot publish over the previously published versions|EPUBLISHCONFLICT/i.test(out)) {
     console.log("  (already published — treating as success)");
     return "already";
   }
   return "failed";
 }
 
-// ─── main ──────────────────────────────────────────────────────────────────
-const whoamiResult = spawnSync("npm", ["whoami"], { encoding: "utf-8" });
-if (!DRY && whoamiResult.status !== 0) {
-  console.error("✗ npm whoami failed. Run `npm login` (or `npm login --scope=@crewhaus`) first.");
-  console.error(`  stderr: ${whoamiResult.stderr?.trim()}`);
-  process.exit(1);
-}
-if (!DRY) {
-  console.log(`✓ Logged in as: ${whoamiResult.stdout.trim()}`);
+/**
+ * OIDC trusted publishing is detected by the npm CLI itself: when GitHub Actions
+ * exposes ACTIONS_ID_TOKEN_REQUEST_URL (i.e. the job has `permissions: id-token:
+ * write`) and the package has a trusted publisher configured, npm exchanges the
+ * OIDC token automatically. Nothing here has to request it.
+ *
+ * `--provenance` is only added on that path: provenance attestation requires the
+ * OIDC identity, and asking for it while authenticating with a plain token makes
+ * npm reject the publish outright rather than degrade.
+ */
+const OIDC_AVAILABLE = process.env["ACTIONS_ID_TOKEN_REQUEST_URL"] !== undefined;
+const PUBLISH_FLAGS: readonly string[] = OIDC_AVAILABLE ? ["--provenance"] : [];
 
-  // Regenerate bun.lock so workspace:* deps resolve to current versions, not
-  // whatever the lockfile last saw. Without this, freshly-bumped packages can
-  // publish with the previous version recorded as their internal dep range —
-  // the silent bug that tombstoned v0.1.0 on the initial cut.
-  console.log("Refreshing bun.lock so workspace:* deps resolve to current versions...");
-  const { unlinkSync, existsSync: lockExists } = require("node:fs");
-  const lockPath = join(ROOT, "bun.lock");
-  if (lockExists(lockPath)) unlinkSync(lockPath);
-  const install = spawnSync("bun", ["install"], { cwd: ROOT, stdio: "inherit" });
-  if (install.status !== 0) {
-    console.error("✗ bun install failed; aborting publish");
+/** Every workspace package name; populated from discovery before publishing starts. */
+const INTERNAL_NAMES = new Set<string>();
+
+/**
+ * Refuse to publish a manifest that would install broken.
+ *
+ * Two failure shapes, both silent at pack time and both fatal for consumers:
+ *   - a surviving `workspace:` range (npm ships it literally), and
+ *   - an internal dep pinned to some version OTHER than the one being cut, which is
+ *     what a stale bun.lock produces.
+ * Returns an error string, or undefined when the manifest is publishable.
+ */
+function checkPublishableManifest(p: PkgInfo): string | undefined {
+  const pj = readJson<Record<string, unknown>>(join(p.dir, "package.json"));
+  for (const field of ["dependencies", "peerDependencies", "optionalDependencies"] as const) {
+    const deps = pj[field];
+    if (deps === null || typeof deps !== "object") continue;
+    for (const [dep, range] of Object.entries(deps as Record<string, string>)) {
+      if (typeof range !== "string") continue;
+      if (range.startsWith("workspace:")) {
+        return `${field}["${dep}"] is still "${range}" — run \`release-prep.ts --for-publish\` before publishing (npm ships the literal range and every install fails).`;
+      }
+      // Internal deps are lockstep: anything else means a stale resolution.
+      if (INTERNAL_NAMES.has(dep) && range !== p.version) {
+        return `${field}["${dep}"] is "${range}" but this cut is ${p.version} — internal deps are lockstep, so this tarball would resolve a different generation.`;
+      }
+    }
+  }
+  return undefined;
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+// `npm whoami` is a TOKEN identity check and there is no equivalent under OIDC:
+// trusted publishing mints a short-lived, package-scoped credential during
+// `npm publish` itself, so there is no logged-in user to report and whoami
+// legitimately fails. Only demand it on the token path.
+if (!DRY && !OIDC_AVAILABLE) {
+  const whoamiResult = spawnSync("npm", ["whoami"], { encoding: "utf-8" });
+  if (whoamiResult.status !== 0) {
+    console.error("✗ npm whoami failed — no usable npm credential.");
+    console.error("  In CI this means the NPM_TOKEN secret is missing or revoked. Note that npm");
+    console.error("  permanently revoked ALL classic automation tokens on 2025-12-09; they cannot");
+    console.error(
+      "  be recreated. Mint a granular access token scoped to the @crewhaus scope plus",
+    );
+    console.error("  the unscoped `crewhaus` package, with bypass-2FA enabled.");
+    console.error(`  stderr: ${whoamiResult.stderr?.trim()}`);
     process.exit(1);
   }
+  console.log(`✓ Logged in as: ${whoamiResult.stdout.trim()}`);
+} else if (!DRY) {
+  console.log("✓ OIDC trusted publishing detected (ACTIONS_ID_TOKEN_REQUEST_URL set)");
+  console.log("  publishing with --provenance; no npm token required");
 }
 
+// NOTE: this used to delete bun.lock and reinstall, so `bun publish` would resolve
+// `workspace:*` against current versions instead of whatever the lockfile last saw
+// (the bug that tombstoned v0.1.0). That workaround is gone because the cause is:
+// `release-prep.ts --for-publish` now resolves those ranges from the stamped
+// version, and checkPublishableManifest() refuses to publish if any survived.
+
 const pkgs = discoverPackages();
+for (const p of pkgs) INTERNAL_NAMES.add(p.name);
 console.log(`Discovered ${pkgs.length} publishable packages (crewhaus + @crewhaus/*) in ${ROOT}`);
 
 const sorted = topoSort(pkgs);
