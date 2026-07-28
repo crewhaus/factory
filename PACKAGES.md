@@ -116,7 +116,7 @@ All thirteen publish in their own lockstep (currently 0.1.5), independent of the
 
 - `factory` (the root workspace itself) — `"private": true` permanently. It's a workspace orchestrator, not a consumable package.
 - `crewhaus-utilities` (the root workspace in `utilities/`) — same reason.
-- The deployable app at [crewhaus/studio-pwa](https://github.com/crewhaus/studio-pwa) — it's an Astro PWA you deploy on Cloudflare Pages, not an npm package.
+- The deployable Studio PWA — it's an Astro PWA you deploy on Cloudflare Pages, not an npm package.
 - The demos workspace at [crewhaus/demos](https://github.com/crewhaus/demos) and the smoke packages under `demos/smoke/*` — `@crewhaus-examples/*` smoke tests per catalog section. Internal CI artifacts; the example code is freely copyable under Apache-2.0.
 - The doc site at [crewhaus/docs](https://github.com/crewhaus/docs) — prose, not code.
 - The sibling apps and tooling in the development meta-repo — none are npm-shipped.

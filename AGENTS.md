@@ -4,7 +4,7 @@ This file is the source of truth for *how* to develop factory. The *what* lives 
 
 - [COMPILER-ARCHITECTURE.md](https://github.com/crewhaus/docs/blob/main/COMPILER-ARCHITECTURE.md) — the meta-harness compiler walked through with file paths
 - [build-roadmap.md](https://github.com/crewhaus/docs/blob/main/build-roadmap.md) — what's been built and what comes next
-- [MODULE-CATALOG.md](https://github.com/crewhaus/docs/blob/main/MODULE-CATALOG.md) — ~190 modules across 25 catalog layers
+- [MODULE-CATALOG.md](https://github.com/crewhaus/docs/blob/main/MODULE-CATALOG.md) — every module, by catalog layer
 
 Read those for *what*. Read this for *how*.
 
@@ -16,13 +16,13 @@ Every change in this repo must respect three invariants. They exist because in 2
 
 ### Pillar 1 — The compiler is the protagonist
 
-Crewhaus is a **meta-harness compiler**, not "yet another agent loop." Specs flow through `parseSpec → lower → applyPasses → emit` ([packages/compiler/src/index.ts](packages/compiler/src/index.ts)). The IR is a discriminated union — `IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0 | IrManagedV0 | IrPipelineV0 | IrCrewV0 | IrResearchV0 | IrBatchV0 | IrVoiceV0 | IrBrowserV0 | IrEvalV0 | IrChainV0 | IrChainGameV0` ([packages/ir/src/index.ts:912](packages/ir/src/index.ts:912)) — and each target shape consumes its own IR variant.
+Crewhaus is a **meta-harness compiler**, not "yet another agent loop." Specs flow through `parseSpec → lower → applyPasses → emit` ([packages/compiler/src/index.ts](packages/compiler/src/index.ts)). The IR is a discriminated union — `IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0 | IrManagedV0 | IrPipelineV0 | IrCrewV0 | IrResearchV0 | IrBatchV0 | IrVoiceV0 | IrBrowserV0 | IrEvalV0 | IrChainV0 | IrChainGameV0` ([packages/ir/src/index.ts:2116](packages/ir/src/index.ts:2116)) — and each target shape consumes its own IR variant.
 
 **Contributor rules:**
 
-1. **New target shapes start at the IR**, not at codegen. Add an `Ir<Target>V0` type to the discriminated union, add a `lower` case, add an `emit<Target>(ir: Ir<Target>V0)` function, register it in `emit()`. The `assertNever(ir)` exhaustive check at [packages/compiler/src/index.ts:878](packages/compiler/src/index.ts:878) keeps you honest.
+1. **New target shapes start at the IR**, not at codegen. Add an `Ir<Target>V0` type to the discriminated union, add a `lower` case, add an `emit<Target>(ir: Ir<Target>V0)` function, register it in `emit()`. The `assertNever(ir)` exhaustive check at [packages/compiler/src/index.ts:3019](packages/compiler/src/index.ts:3019) keeps you honest.
 2. **Targets receive their typed IR variant**, never the raw spec. If you reach into `spec.foo` from a target emitter, you've broken the polymorphism — push the field into the IR variant instead.
-3. **IR-level optimizations live in `packages/ir-passes/`** as `(IrNode) → IrNode` functions with a type-guard for the variants they touch. See `redundantMcpServerCollapse` at [packages/ir-passes/src/index.ts:127](packages/ir-passes/src/index.ts:127) for the template.
+3. **IR-level optimizations live in `packages/ir-passes/`** as `(IrNode) → IrNode` functions with a type-guard for the variants they touch. See `redundantMcpServerCollapse` at [packages/ir-passes/src/index.ts:155](packages/ir-passes/src/index.ts:155) for the template.
 4. **Eval-driven mutations do NOT go in `ir-passes`.** They patch the spec, not the IR — see Pillar 2.
 5. **The roadmap, briefs, and recipes for a new feature must cite its IR variant.** If you find yourself documenting something without an IR variant, you're probably adding a runtime feature without first deciding where it lives in the compiler.
 
@@ -93,7 +93,7 @@ The fabric has **two symmetric halves**: a source side (classify content coming 
 - **TypeScript + Bun** is the primary runtime. Python interop is reserved for slots where the ecosystem genuinely outclasses TS (today: nothing — the Claude-backed `MutationProvider` superseded the originally-deferred DSPy bridge).
 - **No new package without a module brief** in [module-briefs](https://github.com/crewhaus/docs/tree/main/module-briefs). Briefs document responsibilities, depended-on / unblocks, and the catalog layer.
 - **Every package owns its tests** under `__tests__/` next to `src/`. Aim for `bun test` to stay ≥ the current pre-PR count.
-- **`bun run tsc -b` and `biome check` clean** before every PR. The `.github/workflows/example-corpus.yml` matrix also has to be green.
+- **`bun run tsc -b` and `biome check` clean** before every PR. The `.github/workflows/ci.yml` job (typecheck → test → lint) has to be green; the cross-repo `example-corpus` compile matrix now lives in [crewhaus/demos](https://github.com/crewhaus/demos).
 - **Run `crewhaus doctor --philosophy-alignment`** before sending a PR that touches the IR, the eval stack, or any boundary site. It audits the three pillars against the current tree and exits 1 on drift.
 
 ## Where to start reading
