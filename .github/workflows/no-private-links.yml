@@ -1,9 +1,19 @@
 name: No private-repo links
 
-# Public repos must never link into the private launch-plan/operations repo.
-# This is a cheap grep-guard that complements link checking: a link-checker
-# that excludes github.com/crewhaus/* (to avoid 404s on still-private siblings)
-# cannot catch a link INTO a repo that must stay private. This can.
+# A public repo must never link into a crewhaus repo that isn't public: the link
+# 404s for every external reader and discloses that the repo exists. This is a
+# cheap grep-guard that complements link checking — a link-checker that excludes
+# github.com/crewhaus/* (to avoid 404s on still-private siblings) cannot catch a
+# link INTO a private repo. This can.
+#
+# The check is an ALLOWLIST of the org's public repos, not a denylist of private
+# ones: a denylist silently stops protecting the moment a new private repo is
+# created, while an allowlist fails closed. When a repo is published, add it here
+# as part of publishing it.
+#
+# Security note: no untrusted event data (titles, bodies, branch names) is
+# interpolated anywhere in this workflow. The single env value below is a literal
+# maintained in-tree.
 
 on:
   push:
@@ -16,19 +26,29 @@ permissions:
 
 jobs:
   guard:
+    # NOTE: this exact string is a REQUIRED status check in the "protect main"
+    # ruleset. Renaming the job silently blocks every PR (the required context
+    # stops reporting), so change the ruleset first if this ever needs a new name.
     name: No links into private crewhaus repos
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - name: Fail on links to private crewhaus repos
+      - name: Fail on links to non-public crewhaus repos
+        env:
+          # Every PUBLIC repo in the crewhaus org. Keep sorted; add on publish.
+          PUBLIC_REPOS: '\.github|apt|awesome-bun|demo-driver|demos|docs|factory|homebrew-tap|scoop-bucket|thredz-mcp|ui|utilities|winget-pkgs'
         run: |
-          if grep -rnI -E 'github\.com/crewhaus/(operations|launch-plan)' \
-               --include='*.md' --include='*.mdx' \
-               --include='*.yml' --include='*.yaml' --include='*.json' \
-               --include='*.ts' --include='*.tsx' --include='*.js' --include='*.jsx' \
-               --exclude-dir=node_modules --exclude-dir=.git . ; then
-            echo "::error::Found a link into a private crewhaus repo (operations/launch-plan). Repoint it to the public docs repo before merge."
+          set -uo pipefail
+          hits=$(grep -rnI -oE 'github\.com/crewhaus/[A-Za-z0-9._-]+' \
+                   --include='*.md' --include='*.mdx' \
+                   --include='*.yml' --include='*.yaml' --include='*.json' \
+                   --include='*.ts' --include='*.tsx' --include='*.js' --include='*.jsx' \
+                   --exclude-dir=node_modules --exclude-dir=.git . \
+                 | grep -vE "github\.com/crewhaus/($PUBLIC_REPOS)(\.git)?$" || true)
+          if [ -n "$hits" ]; then
+            echo "$hits"
+            echo "::error::Found a link to a crewhaus repo that is not on the public allowlist. Either the repo is private (repoint the link, or drop it), or it was just published — in which case add it to PUBLIC_REPOS in this workflow."
             exit 1
           fi
-          echo "OK -- no links into private crewhaus repos."
+          echo "OK -- every crewhaus link points at a public repo."
