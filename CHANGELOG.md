@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`crewhaus cloud deploy` no longer writes generated infrastructure into its
+  own package directory.** Without `--working-dir`, `deployCloud` and
+  `teardownCloud` defaulted to `<package>/recipes/.out/<cluster>` — resolved
+  from `import.meta.url`, so it followed the code rather than the caller. In a
+  source checkout that means every deploy leaves an untracked
+  `packages/crewhaus-cloud/recipes/` in `git status` (the path is not covered
+  by `.gitignore`); installed from npm it means writing terraform state
+  scaffolding into `node_modules`, which may be read-only and is wiped on the
+  next install. The default is now `.crewhaus/cloud/<cluster>` under the
+  current working directory, matching the convention the rest of the workspace
+  already uses for runtime artefacts (`.crewhaus/sessions`,
+  `.crewhaus/compliance`, …) and gitignored along with them.
+
+  The default stays a *stable* path rather than the temp dir the option's
+  docstring used to promise, because `teardownCloud` has to find what
+  `deployCloud` wrote — a fresh `mkdtemp` per call would break teardown. The
+  docstring now says what the code does.
+
+### Removed
+
+- **`recipesRoot()` is gone from `@crewhaus/crewhaus-cloud`'s public API.** It
+  returned `<package>/recipes`, and with the deploy default moved out of the
+  package directory nothing reads or writes beneath that path any more. The
+  package has never shipped a `recipes/` directory either — `files` in
+  package.json does not list one — so the function returned a path that does
+  not exist in an installed copy and, in a source checkout, existed only as a
+  side effect of the bug above. Anything that needs to know where a deploy put
+  its artefacts should read `workingDir` off the `deployCloud` result (or the
+  `Working dir:` line `summariseDeploy` prints) rather than reconstructing a
+  path from the package location.
+
 ## [0.4.2] - 2026-07-27
 
 ### Changed
