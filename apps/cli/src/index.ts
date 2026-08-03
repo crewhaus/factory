@@ -17961,7 +17961,7 @@ async function runBuildImage(args: ParsedArgs): Promise<void> {
 async function runCloud(args: ParsedArgs, action: string): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      `usage: crewhaus cloud ${action} --provider <aws|gcp|azure|aws-localstack> --region <r> [--tier <dev|default|production>] [--image-tag <tag>]\n`,
+      `usage: crewhaus cloud ${action} --provider <aws|gcp|azure|aws-localstack> --region <r> [--tier <dev|default|production>] [--image-tag <tag>] [--working-dir <dir>]\n       --working-dir defaults to .crewhaus/cloud/<cluster-name> under the current directory\n`,
     );
     return;
   }

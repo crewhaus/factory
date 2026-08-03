@@ -1,8 +1,9 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import * as nodeCrypto from "node:crypto";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   type CloudConfig,
@@ -14,13 +15,20 @@ import {
   deployCloud,
   isCloudProvider,
   listProviders,
-  recipesRoot,
   renderKustomizeOverlay,
   renderTerraformModule,
   summariseDeploy,
   teardownCloud,
   tierShapes,
 } from "./index";
+
+/**
+ * The package directory, derived here from the *test* file's own location
+ * rather than from anything the module exports. Deliberate: these tests assert
+ * that no deploy ever writes beneath it, and an assertion that trusted a
+ * constant out of the module under test would move in lockstep with the bug.
+ */
+const PACKAGE_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 describe("PROVIDERS / TIERS / defaultCloudConfig", () => {
   test("listProviders returns canonical list", () => {
@@ -301,11 +309,75 @@ describe("teardownCloud", () => {
   });
 });
 
-describe("recipesRoot + summariseDeploy + sanity", () => {
-  test("recipesRoot lives inside the package", () => {
-    expect(recipesRoot()).toMatch(/crewhaus-cloud\/recipes$/);
+describe("default workingDir (regression — never inside the package dir)", () => {
+  /** Run `fn` with the process cwd pointed at a fresh temp dir. */
+  async function inTempCwd(fn: (cwd: string) => Promise<void>): Promise<void> {
+    // realpath: on macOS os.tmpdir() is a symlink, and process.cwd() reports
+    // the resolved path — without this the path assertions compare /var to
+    // /private/var and fail.
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-cloud-cwd-")));
+    const previous = process.cwd();
+    process.chdir(cwd);
+    try {
+      await fn(cwd);
+    } finally {
+      process.chdir(previous);
+    }
+  }
+
+  test("deployCloud writes under .crewhaus/cloud/<cluster> in the cwd", async () => {
+    await inTempCwd(async (cwd) => {
+      const config = defaultCloudConfig("gcp", "us-central1");
+      const result = await deployCloud({ config });
+      expect(result.workingDir).toBe(join(cwd, ".crewhaus", "cloud", config.clusterName));
+      expect(readFileSync(join(result.workingDir, "terraform", "main.tf"), "utf8")).toContain(
+        "google_container_cluster",
+      );
+    });
   });
 
+  test("a default-dir deploy writes nothing into the package directory", async () => {
+    await inTempCwd(async () => {
+      // The old default was `<package>/recipes/.out/<cluster>`, which left
+      // untracked files in `git status` after every test run or CLI deploy —
+      // and, once installed from npm, wrote into node_modules.
+      const recipes = join(PACKAGE_DIR, "recipes");
+      const before = existsSync(recipes);
+      const result = await deployCloud({ config: defaultCloudConfig("aws", "us-east-1") });
+      expect(result.workingDir.startsWith(PACKAGE_DIR)).toBe(false);
+      expect(existsSync(recipes)).toBe(before);
+    });
+  });
+
+  test("teardownCloud resolves the same default dir deployCloud wrote", async () => {
+    await inTempCwd(async (cwd) => {
+      const config = defaultCloudConfig("aws", "us-east-1");
+      await deployCloud({ config });
+      const calls: Array<{ argv: readonly string[]; cwd: string }> = [];
+      await teardownCloud({
+        config,
+        runner: async (argv, runnerCwd) => {
+          calls.push({ argv, cwd: runnerCwd });
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.cwd).toBe(join(cwd, ".crewhaus", "cloud", config.clusterName, "terraform"));
+    });
+  });
+
+  test("teardownCloud without a prior deploy still reports the default dir", async () => {
+    await inTempCwd(async (cwd) => {
+      const config = defaultCloudConfig("azure", "eastus");
+      // Substring match, not a RegExp: the temp path is data, not a pattern.
+      await expect(teardownCloud({ config })).rejects.toThrow(
+        `no working directory at ${join(cwd, ".crewhaus", "cloud", config.clusterName)}`,
+      );
+    });
+  });
+});
+
+describe("summariseDeploy + sanity", () => {
   test("summariseDeploy emits readable lines", () => {
     const summary = summariseDeploy({
       workingDir: "/tmp/x",

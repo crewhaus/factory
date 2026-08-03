@@ -1,7 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { type TargetShape, isTargetShape } from "@crewhaus/docker-images";
 /**
  * Section 32 — `@crewhaus/crewhaus-cloud`
@@ -41,13 +40,6 @@ export type CloudProvider = (typeof PROVIDERS)[number];
 
 export const TIERS = ["dev", "default", "production"] as const;
 export type Tier = (typeof TIERS)[number];
-
-const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const RECIPES_ROOT = join(PACKAGE_ROOT, "recipes");
-
-export function recipesRoot(): string {
-  return RECIPES_ROOT;
-}
 
 export type CloudConfig = {
   readonly provider: CloudProvider;
@@ -371,9 +363,26 @@ export type CloudRunner = (
   cwd: string,
 ) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
 
+/**
+ * Where generated Terraform/Kustomize lands when the caller passes no
+ * `workingDir`. Rooted at the *invocation* directory, never at the package
+ * directory: under an npm install the package dir may be read-only and is
+ * wiped on reinstall, and in a source checkout it turns every deploy into
+ * untracked files in `git status`. `.crewhaus/` is the repo-wide convention
+ * for runtime artefacts (`.crewhaus/sessions`, `.crewhaus/compliance`, …) and
+ * is gitignored. The path also has to be *stable* rather than a fresh temp
+ * dir, because `teardownCloud` has to find what `deployCloud` wrote.
+ */
+function defaultWorkingDir(clusterName: string): string {
+  return join(process.cwd(), ".crewhaus", "cloud", clusterName);
+}
+
 export type DeployCloudOptions = {
   readonly config: CloudConfig;
-  /** Working directory to write generated artefacts into; defaults to a temp dir. */
+  /**
+   * Working directory to write generated artefacts into; defaults to
+   * `.crewhaus/cloud/<clusterName>` under the current working directory.
+   */
   readonly workingDir?: string;
   /** Override the terraform binary path; defaults to env TF_BIN or "terraform". */
   readonly tfBin?: string;
@@ -391,7 +400,7 @@ export type DeployCloudResult = {
 
 export async function deployCloud(opts: DeployCloudOptions): Promise<DeployCloudResult> {
   const { config } = opts;
-  const workingDir = opts.workingDir ?? join(RECIPES_ROOT, ".out", config.clusterName);
+  const workingDir = opts.workingDir ?? defaultWorkingDir(config.clusterName);
   mkdirSync(join(workingDir, "terraform"), { recursive: true });
   mkdirSync(join(workingDir, "kustomize"), { recursive: true });
 
@@ -456,7 +465,7 @@ export async function deployCloud(opts: DeployCloudOptions): Promise<DeployCloud
 
 export async function teardownCloud(opts: DeployCloudOptions): Promise<void> {
   const tfBin = opts.tfBin ?? process.env["TF_BIN"] ?? "terraform";
-  const workingDir = opts.workingDir ?? join(RECIPES_ROOT, ".out", opts.config.clusterName);
+  const workingDir = opts.workingDir ?? defaultWorkingDir(opts.config.clusterName);
   if (!existsSync(workingDir)) {
     throw new CrewhausCloudError(
       `no working directory at ${workingDir} (was deployCloud ever run?)`,
