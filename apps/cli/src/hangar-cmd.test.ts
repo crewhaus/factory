@@ -13,18 +13,23 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type HangarServer, startHangarServer } from "@crewhaus/hangar-server";
+import {
+  type HangarServer,
+  type HangarServerOptions,
+  startHangarServer,
+} from "@crewhaus/hangar-server";
+import { openHangarRegistry } from "@crewhaus/harness-registry";
+import type { JobRecord, SupervisedChild } from "@crewhaus/harness-supervisor";
 import {
   HANGAR_LOCK_FILENAME,
   type HangarLock,
-  type RunningJob,
   acquireHangarLock,
   defaultIsPidAlive,
+  heldSupervisors,
   readHangarLock,
   releaseHangarLock,
   resolveHangarRoot,
   runHangarCommand,
-  shutdownNotices,
   writeHangarLock,
 } from "./hangar-cmd";
 
@@ -143,6 +148,71 @@ describe("hangar lock helpers", () => {
   });
 });
 
+/**
+ * Boot `serve` against a server that binds nothing, wait for it to settle,
+ * then take it down with SIGTERM. Returns the options the server factory was
+ * HANDED.
+ *
+ * That return value is the point: a boot flag that is parsed and then dropped
+ * looks exactly like a flag nobody added, which is how M4's `--read-only` and
+ * its remote-bind gate both shipped inert. Asserting on the constant, or on
+ * the parser, would have passed either way.
+ */
+async function driveServe(
+  argv: readonly string[],
+  opts: {
+    readonly env: Record<string, string | undefined>;
+    readonly platform?: string;
+    readonly write?: (line: string) => void;
+  },
+): Promise<HangarServerOptions[]> {
+  const seen: HangarServerOptions[] = [];
+  const baseline = process.listenerCount("SIGTERM");
+  const run = runHangarCommand(["serve", "--no-open", ...argv], {
+    env: opts.env,
+    ...(opts.platform !== undefined ? { platform: opts.platform } : {}),
+    pid: 4242,
+    isPidAlive: () => false,
+    write: opts.write ?? ((): void => {}),
+    startServer: (options) => {
+      seen.push(options);
+      return fakeServer({ handles: new Map(), runningJobs: [] }, []);
+    },
+    exit: () => {},
+  });
+  await awaitSignalWait(baseline);
+  process.emit("SIGTERM");
+  await run;
+  return seen;
+}
+
+/** The sentinel a boot refusal must never reach. */
+const SERVER_FACTORY_REACHED = "the server factory was reached — the refusal did not fire";
+
+/**
+ * Drive `serve` expecting it to REFUSE before anything boots.
+ *
+ * The server factory is injected and throws, so a gate that silently stops
+ * firing fails this suite fast and loudly instead of binding a real socket
+ * (`--host 0.0.0.0` would bind every interface on the machine running the
+ * tests) and then blocking until a signal that never comes.
+ */
+function refuseServe(
+  argv: readonly string[],
+  env: Record<string, string | undefined>,
+): Promise<unknown> {
+  return runHangarCommand(["serve", "--no-open", ...argv], {
+    env,
+    pid: 4242,
+    isPidAlive: () => false,
+    write: () => {},
+    startServer: () => {
+      throw new Error(SERVER_FACTORY_REACHED);
+    },
+    exit: () => {},
+  });
+}
+
 // ---------------------------------------------------------------------------
 // serve — argument validation + live-refusal (no server boots here)
 // ---------------------------------------------------------------------------
@@ -153,6 +223,88 @@ describe("hangar serve argument validation", () => {
     expect(
       runHangarCommand(["serve", "--host", "0.0.0.0", "--no-auth"], { env: ws.env }),
     ).rejects.toThrow(/--host .*REQUIRES auth.*drop --no-auth/);
+  });
+
+  test("HM-201: a non-loopback --host is REFUSED without the opt-in variable", async () => {
+    const ws = newWorkspace();
+    // The two that look the most harmless are the most exposing: `0.0.0.0`
+    // and `::` bind every interface the machine has.
+    for (const host of ["0.0.0.0", "::", "192.168.1.10"]) {
+      await expect(refuseServe(["--host", host], ws.env)).rejects.toThrow(/binds beyond loopback/);
+    }
+    // The refusal names the variable AND the supported answer — an error
+    // that withholds the escape hatch just gets worked around with something
+    // worse.
+    await expect(refuseServe(["--host", "0.0.0.0"], ws.env)).rejects.toThrow(
+      /CREWHAUS_HANGAR_ALLOW_REMOTE=1.*Tailscale, an SSH tunnel/,
+    );
+    // A typo in the variable fails CLOSED: the check is an allow-list.
+    await expect(
+      refuseServe(["--host", "0.0.0.0"], { ...ws.env, CREWHAUS_HANGAR_ALLOW_REMOTE: "yes" }),
+    ).rejects.toThrow(/binds beyond loopback/);
+    // …and the gate runs BEFORE anything is booted: no socket, no lock.
+    await expect(refuseServe(["--host", "0.0.0.0"], ws.env)).rejects.not.toThrow(
+      new RegExp(SERVER_FACTORY_REACHED),
+    );
+    expect(existsSync(join(ws.hangarRoot, HANGAR_LOCK_FILENAME))).toBe(false);
+  });
+
+  test("HM-201: a loopback --host never needs the opt-in", async () => {
+    const ws = newWorkspace();
+    for (const host of ["127.0.0.1", "localhost", "::1", "127.0.0.2"]) {
+      const seen = await driveServe(["--host", host], { env: ws.env });
+      expect(seen[0]?.hostname).toBe(host);
+    }
+  });
+
+  test("HM-201: with the opt-in set, the remote host reaches the server", async () => {
+    const ws = newWorkspace();
+    const seen = await driveServe(["--host", "0.0.0.0"], {
+      env: { ...ws.env, CREWHAUS_HANGAR_ALLOW_REMOTE: "1" },
+    });
+    expect(seen[0]?.hostname).toBe("0.0.0.0");
+  });
+
+  test("--read-only and --read-only-locked reach the server (the flag the 403 remedy names)", async () => {
+    const ws = newWorkspace();
+    const plain = await driveServe(["--read-only"], { env: ws.env });
+    expect(plain[0]?.readOnly).toBe(true);
+    expect(plain[0]?.readOnlyLocked).toBeUndefined();
+
+    // The lock is the strictly stronger posture, so it implies read-only: an
+    // operator who types only the lock must not get a WRITABLE console
+    // because they omitted the weaker flag.
+    const locked = await driveServe(["--read-only-locked"], { env: ws.env });
+    expect(locked[0]?.readOnly).toBe(true);
+    expect(locked[0]?.readOnlyLocked).toBe(true);
+
+    // …and a plain boot stays writable.
+    const open = await driveServe([], { env: ws.env });
+    expect(open[0]?.readOnly).toBeUndefined();
+    expect(open[0]?.readOnlyLocked).toBeUndefined();
+  });
+
+  test("HM-188: win32 is told supervision there is UNVERIFIED; nobody else is", async () => {
+    const ws = newWorkspace();
+    const onWindows: string[] = [];
+    await driveServe([], { env: ws.env, platform: "win32", write: (l) => onWindows.push(l) });
+    const notice = onWindows.find((l) => l.includes("UNVERIFIED"));
+    expect(notice).toBeDefined();
+    // The payload is the failure and its cheap check, not a bare
+    // "unsupported": a wrong liveness verdict is what starts a second copy.
+    expect(notice).toContain("supervision on Windows");
+    expect(notice).toContain("second copy");
+    expect(notice).toContain("crewhaus daemon status");
+    // …and it lands ABOVE the summary box, not as a footnote under it.
+    expect(onWindows.indexOf(notice ?? "")).toBeLessThan(
+      onWindows.findIndex((l) => l.includes("┌─ Hangar")),
+    );
+
+    for (const platform of ["darwin", "linux"]) {
+      const elsewhere: string[] = [];
+      await driveServe([], { env: ws.env, platform, write: (l) => elsewhere.push(l) });
+      expect(elsewhere.join("\n")).not.toContain("UNVERIFIED");
+    }
   });
 
   test("--smoke with --no-auth and --smoke with --port are rejected", () => {
@@ -366,9 +518,35 @@ describe("hangar serve --smoke", () => {
 // serve shutdown — the exit path, driven with a FAKE supervised child
 // ---------------------------------------------------------------------------
 
+/** A fake supervision handle: one live child and a recorded stop. */
+function fakeHandle(child: SupervisedChild | undefined, log: string[]) {
+  return {
+    supervisor: {
+      liveChild: () => child,
+      stop: async () => {
+        log.push(`stop ${child?.harnessDir}`);
+        return { stopped: true, forced: true };
+      },
+      close: () => {
+        log.push(`close ${child?.harnessDir}`);
+      },
+    },
+  };
+}
+
+type FakeProcesses = {
+  readonly handles: ReadonlyMap<string, ReturnType<typeof fakeHandle>>;
+  readonly runningJobs: readonly JobRecord[];
+  /** Dirs the run looked up by key. The shutdown enumeration must leave this
+   *  EMPTY: its source is the process layer's own handle map, not a walk of
+   *  `registry.list()` (which a mid-session remove/relocate silently
+   *  shrinks). */
+  readonly peeked?: string[];
+};
+
 /** A `HangarServer` that binds nothing: enough surface for `serve` to boot,
- *  print its summary and shut down, with a controllable job queue. */
-function fakeServer(running: readonly RunningJob[], stops: string[]): HangarServer {
+ *  print its summary and shut down, with a fake process layer. */
+function fakeServer(processes: FakeProcesses, log: string[]): HangarServer {
   return {
     url: "http://127.0.0.1:4321",
     port: 4321,
@@ -381,13 +559,56 @@ function fakeServer(running: readonly RunningJob[], stops: string[]): HangarServ
     noAuth: false,
     idleTimeoutSeconds: 120,
     processes: {
-      jobs: { running: () => running },
+      held: () => [...processes.handles.values()],
+      peek: (dir: string) => {
+        processes.peeked?.push(dir);
+        return processes.handles.get(dir);
+      },
+      // Enumerating for shutdown must never BUILD a supervisor: building one
+      // adopts, and a manager on its way down must not adopt a daemon.
+      get: () => {
+        throw new Error("shutdown must not build a supervisor");
+      },
+      jobs: {
+        running: () => processes.runningJobs,
+        terminateRunning: async () => {
+          log.push("terminateRunning");
+          return processes.runningJobs;
+        },
+      },
     } as unknown as HangarServer["processes"],
     ready: Promise.resolve({ adopted: 0, lost: 0, jobs: 0 }),
     stop: async () => {
-      stops.push("stop");
+      log.push("server.stop");
     },
   } as unknown as HangarServer;
+}
+
+/** A live child description, as `HarnessSupervisor.liveChild()` returns. */
+function liveChild(over: Partial<SupervisedChild> & { harnessDir: string }): SupervisedChild {
+  return {
+    target: "channel",
+    state: "running",
+    kind: "daemon",
+    runId: "run_0123456789abcdef",
+    pid: 4_242,
+    adopted: false,
+    detached: true,
+    reAdoptable: true,
+    ...over,
+  };
+}
+
+function runningJob(jobId: string, kind: string, harnessDir: string): JobRecord {
+  return {
+    jobId,
+    harnessDir,
+    kind,
+    argv: [kind],
+    mutating: true,
+    state: "running",
+    enqueuedAt: "2026-08-04T00:00:00.000Z",
+  };
 }
 
 /** Resolve once `serve` has installed its signal handlers. */
@@ -399,32 +620,62 @@ async function awaitSignalWait(baseline: number): Promise<void> {
   throw new Error("serve never installed its SIGTERM handler");
 }
 
-describe("hangar serve shutdown", () => {
-  test("shutdownNotices names the work being left behind, and says nothing when there is none", () => {
-    expect(shutdownNotices([])).toEqual([]);
-    const notices = shutdownNotices([
-      { jobId: "job_a", kind: "dev", harnessDir: "/h/one" },
-      { jobId: "job_b", kind: "compile", harnessDir: "/h/two" },
-    ]);
-    expect(notices.join("\n")).toContain("2 job(s) still running (compile, dev)");
-    expect(notices.join("\n")).toContain("interrupted");
+describe("heldSupervisors", () => {
+  test("de-duplicates the handle map's supervisors and touches none of them", () => {
+    const log: string[] = [];
+    const one = fakeHandle(liveChild({ harnessDir: "/h/one" }), log);
+    const two = fakeHandle(liveChild({ harnessDir: "/h/two" }), log);
+    // A supervisor listed twice must not be shut down twice…
+    expect(heldSupervisors([one, two, one])).toEqual([one.supervisor, two.supervisor]);
+    expect(heldSupervisors([])).toEqual([]);
+    // …and enumerating is pure: nothing is stopped, closed, or built by
+    // counting what is held. Building a handle ADOPTS, which a manager on
+    // its way down must never do.
+    expect(log).toEqual([]);
   });
+});
 
-  test("SIGTERM with a live supervised child stops, releases the lock, and EXITS", async () => {
+describe("hangar serve shutdown", () => {
+  test("SIGTERM stops the orphanable child, leaves the daemon, releases the lock, and EXITS", async () => {
     const ws = newWorkspace();
+    const daemonDir = join(ws.root, "chat");
+    const cliDir = join(ws.root, "helper");
+    mkdirSync(daemonDir, { recursive: true });
+    mkdirSync(cliDir, { recursive: true });
+    // Register both so the shutdown enumeration has dirs to peek at.
+    const registry = openHangarRegistry({ env: ws.env });
+    registry.upsert({ dir: daemonDir, target: "channel" });
+    registry.upsert({ dir: cliDir, target: "cli" });
+
     const lines: string[] = [];
-    const stops: string[] = [];
+    const log: string[] = [];
     const exits: number[] = [];
     const baseline = process.listenerCount("SIGTERM");
     const baselineSigint = process.listenerCount("SIGINT");
-    const child: RunningJob = { jobId: "job_dev", kind: "dev", harnessDir: join(ws.root, "h") };
+    const handles = new Map([
+      [daemonDir, fakeHandle(liveChild({ harnessDir: daemonDir }), log)],
+      [
+        cliDir,
+        fakeHandle(
+          liveChild({
+            harnessDir: cliDir,
+            target: "cli",
+            kind: "interactive",
+            detached: false,
+            reAdoptable: false,
+          }),
+          log,
+        ),
+      ],
+    ]);
 
     const run = runHangarCommand(["serve", "--no-open"], {
       env: ws.env,
       pid: 4242,
       isPidAlive: () => false,
       write: (line) => lines.push(line),
-      startServer: () => fakeServer([child], stops),
+      startServer: () =>
+        fakeServer({ handles, runningJobs: [runningJob("job_dev", "dev", cliDir)] }, log),
       exit: (code) => exits.push(code),
     });
     await awaitSignalWait(baseline);
@@ -434,16 +685,119 @@ describe("hangar serve shutdown", () => {
     const out = await run;
 
     expect(out.exitCode).toBe(0);
-    expect(stops).toEqual(["stop"]);
+    // The attached run was STOPPED and the running job SIGNALLED, and both
+    // happened BEFORE the socket and the lock were given up: freeing the
+    // port while children are still held is how a second manager bound it
+    // while the first lived on.
+    expect(log).toEqual([
+      `stop ${cliDir}`,
+      "terminateRunning",
+      `close ${daemonDir}`,
+      `close ${cliDir}`,
+      "server.stop",
+    ]);
     // The lock is gone AND the process was told to exit — releasing the lock
     // without exiting is exactly the orphaned-manager failure (F-6).
     expect(existsSync(join(ws.hangarRoot, HANGAR_LOCK_FILENAME))).toBe(false);
     expect(exits).toEqual([0]);
-    expect(lines.join("\n")).toContain("hangar: shutting down…");
-    expect(lines.join("\n")).toContain("1 job(s) still running (dev)");
+    const text = lines.join("\n");
+    expect(text).toContain("hangar: shutting down…");
+    expect(text).toContain("stopped 1 supervised run(s)");
+    expect(text).toContain(`cli ${cliDir}`);
+    // …and the operator is told what survived and what happens to it next.
+    expect(text).toContain("left 1 daemon(s) running");
+    expect(text).toContain(`crewhaus daemon stop '${daemonDir}'`);
+    expect(text).toContain("signalled 1 running job(s) (dev)");
+    expect(text).toContain("`interrupted`");
     // Both signal handlers are gone: nothing of this run is left installed.
     expect(process.listenerCount("SIGTERM")).toBe(baseline);
     expect(process.listenerCount("SIGINT")).toBe(baselineSigint);
+  });
+
+  test("a manager holding nothing shuts down silently and still exits", async () => {
+    const ws = newWorkspace();
+    const lines: string[] = [];
+    const log: string[] = [];
+    const exits: number[] = [];
+    const baseline = process.listenerCount("SIGTERM");
+
+    const run = runHangarCommand(["serve", "--no-open"], {
+      env: ws.env,
+      pid: 4242,
+      isPidAlive: () => false,
+      write: (line) => lines.push(line),
+      startServer: () => fakeServer({ handles: new Map(), runningJobs: [] }, log),
+      exit: (code) => exits.push(code),
+    });
+    await awaitSignalWait(baseline);
+    process.emit("SIGTERM");
+    await run;
+
+    expect(log).toEqual(["terminateRunning", "server.stop"]);
+    expect(exits).toEqual([0]);
+    expect(lines.join("\n")).not.toContain("daemon(s) running");
+  });
+
+  test("a harness REMOVED from the registry mid-session is still stopped and still named", async () => {
+    const ws = newWorkspace();
+    // A `workflow` harness: the one-shot class is spawned DETACHED and writes
+    // no runfile, so it lives in its own process group (immune to the
+    // terminal's SIGINT) and no later manager can enumerate, adopt, stop or
+    // even name it. Missing it at shutdown is silent and permanent — this is
+    // the orphan class the M4 shutdown exists to close.
+    const jobDir = join(ws.root, "nightly");
+    mkdirSync(jobDir, { recursive: true });
+    const registry = openHangarRegistry({ env: ws.env });
+    const entry = registry.upsert({ dir: jobDir, target: "workflow" });
+
+    const lines: string[] = [];
+    const log: string[] = [];
+    const peeked: string[] = [];
+    const exits: number[] = [];
+    const baseline = process.listenerCount("SIGTERM");
+    const handles = new Map([
+      [
+        jobDir,
+        fakeHandle(
+          liveChild({
+            harnessDir: jobDir,
+            target: "workflow",
+            kind: "job",
+            detached: true,
+            reAdoptable: false,
+          }),
+          log,
+        ),
+      ],
+    ]);
+
+    const run = runHangarCommand(["serve", "--no-open"], {
+      env: ws.env,
+      pid: 4242,
+      isPidAlive: () => false,
+      write: (line) => lines.push(line),
+      startServer: () => fakeServer({ handles, runningJobs: [], peeked }, log),
+      exit: (code) => exits.push(code),
+    });
+    await awaitSignalWait(baseline);
+    // The registry row goes away while the child is live — `DELETE
+    // /api/h/:id`, the Library's Remove on a missing card, or `crewhaus
+    // harness remove` in another terminal. None of them has a live-run
+    // guard, and none of them touches the handle map.
+    registry.remove(entry.id);
+    expect(registry.list()).toHaveLength(0);
+    process.emit("SIGTERM");
+    await run;
+
+    // The child is still ours, so it is still stopped — before the socket
+    // and the lock are given up — and still reported.
+    expect(log).toEqual([`stop ${jobDir}`, "terminateRunning", `close ${jobDir}`, "server.stop"]);
+    expect(lines.join("\n")).toContain("stopped 1 supervised run(s)");
+    expect(lines.join("\n")).toContain(`workflow ${jobDir}`);
+    expect(exits).toEqual([0]);
+    // And the registry was never the enumeration source: nothing was looked
+    // up by key at all.
+    expect(peeked).toEqual([]);
   });
 });
 

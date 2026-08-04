@@ -24,6 +24,8 @@
     "@crewhaus/harness-registry": "workspace:*",
     "@crewhaus/harness-supervisor": "workspace:*",
     "@crewhaus/memory-store": "workspace:*",
+    "@crewhaus/plugin-loader": "workspace:*",
+    "@crewhaus/plugin-sdk": "workspace:*",
     "@crewhaus/preflight": "workspace:*",
     "@crewhaus/session-store": "workspace:*",
     "@crewhaus/spec": "workspace:*",

@@ -25,10 +25,19 @@ import type {
   SpawnedProcess,
 } from "@crewhaus/harness-supervisor";
 import type { ControlClient } from "./control-client";
+import type { Delivery } from "./notifications";
 import { type ProcessLayer, createProcessLayer } from "./process";
 import { type HangarServer, type HangarServerOptions, startHangarServer } from "./server";
 
 export const FETCH_TIMEOUT_MS = 10_000;
+
+/** What the recording notification sinks captured. The sinks are PRESENT
+ *  (so availability matches production) but they reach nothing outside the
+ *  test: no `osascript`, no socket. */
+export type RecordedSinks = {
+  readonly os: Delivery[];
+  readonly webhook: Array<{ readonly delivery: Delivery; readonly url: string }>;
+};
 
 // ---------------------------------------------------------------------------
 // Fake process ops + clock
@@ -160,6 +169,10 @@ export type TestServer = {
   readonly ops?: FakeProcessOps;
   /** The fake clock driving backoff, the stop grace, and the log pump. */
   readonly clock?: FakeClock;
+  /** Everything the OS and webhook sinks were handed. Recording fakes, so
+   *  the suite proves the fan-out without spawning `osascript` or opening a
+   *  socket (undefined when the caller supplied their own sinks). */
+  readonly sinks?: RecordedSinks;
   /** Fetch with an explicit timeout and NO auth header. */
   fetchRaw(path: string, init?: RequestInit): Promise<Response>;
   /** Fetch with the bearer token; returns parsed status + JSON body. */
@@ -242,6 +255,21 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
     if (wrapProcessLayer !== undefined) processLayer = wrapProcessLayer(processLayer);
   }
 
+  // Recording sinks by default: production wires the REAL ones, so a suite
+  // that let the default through would raise OS toasts on the developer's
+  // machine — and one that passed `{}` would silently test a manager whose
+  // sinks are unavailable, which is the defect this replaced.
+  let sinks: RecordedSinks | undefined;
+  let notificationSinks = rest.notificationSinks;
+  if (notificationSinks === undefined) {
+    const recorded: RecordedSinks = { os: [], webhook: [] };
+    sinks = recorded;
+    notificationSinks = {
+      os: (delivery) => recorded.os.push(delivery),
+      webhook: (delivery, url) => recorded.webhook.push({ delivery, url }),
+    };
+  }
+
   const server = startHangarServer({
     ...rest,
     port: 0,
@@ -249,6 +277,7 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
     registryRoot,
     env,
     processLayer,
+    notificationSinks,
     ...(controlClient !== undefined ? { controlClient } : {}),
     onWarn: collectWarn,
   });
@@ -291,6 +320,7 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
     warnings,
     ...(ops !== undefined ? { ops } : {}),
     ...(clock !== undefined ? { clock } : {}),
+    ...(sinks !== undefined ? { sinks } : {}),
     fetchRaw,
     api,
     apiText,

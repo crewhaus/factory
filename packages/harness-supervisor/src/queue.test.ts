@@ -3,12 +3,16 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  type CancellableChild,
+  type JobRunContext,
   createFileJobStore,
   createHarnessMutex,
   createJobQueue,
   createMemoryJobStore,
   isReadOnlyJob,
+  processOpsChild,
 } from "./queue";
+import { createFakeClock, createFakeProcessOps } from "./testkit";
 
 const dirs: string[] = [];
 function tempDir(): string {
@@ -182,6 +186,221 @@ describe("createJobQueue", () => {
     store.append({ jobId: "job_a", state: "pending" });
     Bun.write(path, `${'{"jobId":"job_a","state":"pending"}'}\n{"jobId":"job_b"`);
     expect(store.read().map((j) => j.jobId)).toEqual(["job_a"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reaching a RUNNING child
+// ---------------------------------------------------------------------------
+
+/**
+ * A runner that spawns — i.e. one that hands the queue a child handle, the
+ * way a real spawning runner must. `ignoreTerm` reproduces a child that
+ * refuses SIGTERM, which is the whole reason the ladder has a second step.
+ */
+function childRunner(options: { readonly ignoreTerm?: boolean } = {}) {
+  const signals: string[] = [];
+  const started: string[] = [];
+  return {
+    signals,
+    started,
+    run: async (job: { jobId: string }, ctx: JobRunContext) => {
+      started.push(job.jobId);
+      let finish: (value: { exitCode?: number }) => void = () => {};
+      const exited = new Promise<{ exitCode?: number }>((resolve) => {
+        finish = resolve;
+      });
+      const child: CancellableChild = {
+        pid: 31_337,
+        terminate: () => {
+          signals.push("SIGTERM");
+          if (options.ignoreTerm !== true) finish({ exitCode: 143 });
+        },
+        forceKill: () => {
+          signals.push("SIGKILL");
+          finish({ exitCode: 137 });
+        },
+      };
+      ctx.register(child);
+      return exited;
+    },
+  };
+}
+
+describe("cancelling a RUNNING job", () => {
+  test("the child is terminated and the row closes as cancelled", async () => {
+    const clock = createFakeClock();
+    const ctl = childRunner();
+    const store = createMemoryJobStore();
+    const queue = createJobQueue({ store, run: ctl.run, clock, stopGraceMs: 500 });
+    const job = queue.submit({ harnessDir: "/a", kind: "eval", argv: ["eval"] });
+    expect(queue.running().map((j) => j.jobId)).toEqual([job.jobId]);
+
+    expect(queue.cancel(job.jobId)).toBe(true);
+    await queue.idle();
+
+    expect(ctl.signals).toEqual(["SIGTERM"]);
+    const row = store.read().find((j) => j.jobId === job.jobId);
+    expect(row?.state).toBe("cancelled");
+    // A graceful stop is not a forced one.
+    expect(row?.forced).toBeUndefined();
+  });
+
+  test("a child that ignores SIGTERM is SIGKILLed after the grace and recorded forced", async () => {
+    const clock = createFakeClock();
+    const ctl = childRunner({ ignoreTerm: true });
+    const store = createMemoryJobStore();
+    const queue = createJobQueue({ store, run: ctl.run, clock, stopGraceMs: 500 });
+    const job = queue.submit({ harnessDir: "/a", kind: "eval", argv: ["eval"] });
+
+    expect(queue.cancel(job.jobId)).toBe(true);
+    expect(ctl.signals).toEqual(["SIGTERM"]);
+    // Still alive on the far side of SIGTERM — that is the failure mode.
+    expect(queue.running()).toHaveLength(1);
+
+    clock.advance(500);
+    await queue.idle();
+
+    expect(ctl.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    const row = store.read().find((j) => j.jobId === job.jobId);
+    expect(row?.state).toBe("cancelled");
+    expect(row?.forced).toBe(true);
+  });
+
+  test("cancel is honest when the runner handed us no child to signal", async () => {
+    const store = createMemoryJobStore();
+    let finish: (() => void) | undefined;
+    const queue = createJobQueue({
+      store,
+      run: () =>
+        new Promise<{ exitCode?: number }>((resolve) => {
+          finish = () => resolve({ exitCode: 0 });
+        }),
+    });
+    const job = queue.submit({ harnessDir: "/a", kind: "eval", argv: [] });
+    // `true` here would claim a cancellation that never reached a process —
+    // which is how "cancel" came to mean "removed a row from a list".
+    expect(queue.cancel(job.jobId)).toBe(false);
+    finish?.();
+    await queue.idle();
+    expect(store.read()[0]?.state).toBe("done");
+  });
+
+  test("a second cancel does not re-signal or re-arm the escalation", async () => {
+    const clock = createFakeClock();
+    const ctl = childRunner({ ignoreTerm: true });
+    const queue = createJobQueue({
+      store: createMemoryJobStore(),
+      run: ctl.run,
+      clock,
+      stopGraceMs: 500,
+    });
+    const job = queue.submit({ harnessDir: "/a", kind: "eval", argv: [] });
+    queue.cancel(job.jobId);
+    queue.cancel(job.jobId);
+    expect(ctl.signals).toEqual(["SIGTERM"]);
+    clock.advance(500);
+    await queue.idle();
+    expect(ctl.signals).toEqual(["SIGTERM", "SIGKILL"]);
+  });
+
+  test("processOpsChild signals through the ops adapter, and tolerates no pid", () => {
+    const ops = createFakeProcessOps();
+    const spawned = ops.spawn({
+      argv: ["bun", "job.ts"],
+      cwd: "/a",
+      env: {},
+      stdio: { mode: "pipe" },
+      detached: false,
+    });
+    const fake = ops.last();
+    if (fake !== undefined) fake.ignoreTerm = true;
+    const child = processOpsChild(ops, spawned.pid);
+    child.terminate();
+    child.forceKill();
+    expect(fake?.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    // A runner that never got a pid must not blow up the ladder.
+    expect(() => processOpsChild(ops, undefined).forceKill()).not.toThrow();
+  });
+});
+
+describe("terminateRunning — manager shutdown", () => {
+  test("signals the children, leaves the rows OPEN, and restore() reopens them as interrupted", async () => {
+    const dir = tempDir();
+    const store = createFileJobStore(join(dir, "jobs.jsonl"));
+    const clock = createFakeClock();
+    const ctl = childRunner();
+    const queue = createJobQueue({ store, run: ctl.run, clock, concurrency: 1, stopGraceMs: 500 });
+    const running = queue.submit({ harnessDir: "/a", kind: "eval", argv: ["eval"] });
+    const waiting = queue.submit({ harnessDir: "/b", kind: "compile", argv: ["compile"] });
+    expect(ctl.started).toEqual([running.jobId]);
+
+    const abandoned = await queue.terminateRunning();
+
+    expect(abandoned.map((j) => j.jobId)).toEqual([running.jobId]);
+    expect(ctl.signals).toEqual(["SIGTERM"]);
+    // The ledger row is STILL open — no done, no failed, no cancelled.
+    expect(store.read().find((j) => j.jobId === running.jobId)?.state).toBe("running");
+    // The latch: queued work is not spawned into a manager on its way out.
+    expect(ctl.started).toEqual([running.jobId]);
+
+    // The next manager boots over the same persisted ledger.
+    const next = controllable();
+    const revived = createJobQueue({ store, run: next.run, concurrency: 1 });
+    const restored = revived.restore();
+    expect(restored.interrupted.map((j) => j.jobId)).toEqual([running.jobId]);
+    expect(restored.requeued.map((j) => j.jobId)).toEqual([waiting.jobId]);
+    // The killed job is reopened as `interrupted`, never silently re-run.
+    expect(next.started).toEqual([waiting.jobId]);
+    expect(revived.recent().find((j) => j.jobId === running.jobId)?.state).toBe("interrupted");
+    next.finish(waiting.jobId);
+  });
+
+  test("a job child that ignores SIGTERM is escalated rather than orphaned", async () => {
+    const clock = createFakeClock();
+    const ctl = childRunner({ ignoreTerm: true });
+    const queue = createJobQueue({
+      store: createMemoryJobStore(),
+      run: ctl.run,
+      clock,
+      stopGraceMs: 400,
+    });
+    queue.submit({ harnessDir: "/a", kind: "eval", argv: [] });
+
+    const done = queue.terminateRunning({ graceMs: 400, deadlineMs: 5_000 });
+    expect(ctl.signals).toEqual(["SIGTERM"]);
+    clock.advance(400);
+    await done;
+
+    expect(ctl.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(queue.running()).toEqual([]);
+  });
+
+  test("a runner that hands us nothing to signal is still bounded by the deadline", async () => {
+    const clock = createFakeClock();
+    const queue = createJobQueue({
+      store: createMemoryJobStore(),
+      run: () => new Promise<{ exitCode?: number }>(() => {}),
+      clock,
+    });
+    queue.submit({ harnessDir: "/a", kind: "eval", argv: [] });
+    const done = queue.terminateRunning({ deadlineMs: 2_000 });
+    clock.advance(2_000);
+    // The manager exits regardless — a wedged runner must never hold it.
+    expect((await done).map((j) => j.harnessDir)).toEqual(["/a"]);
+  });
+
+  test("nothing running means nothing signalled and no waiting at all", async () => {
+    const clock = createFakeClock();
+    const queue = createJobQueue({
+      store: createMemoryJobStore(),
+      run: async () => ({ exitCode: 0 }),
+      clock,
+    });
+    await queue.idle();
+    expect(await queue.terminateRunning()).toEqual([]);
+    // No deadline timer was ever armed.
+    expect(clock.pendingCount()).toBe(0);
   });
 });
 

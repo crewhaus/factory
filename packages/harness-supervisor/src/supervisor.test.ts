@@ -1251,3 +1251,80 @@ describe("the scrubber survives adoption", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// liveChild() — the enumeration seam manager shutdown decides fates with
+// ---------------------------------------------------------------------------
+
+describe("liveChild", () => {
+  test("nothing is running, so there is nothing to shut down", async () => {
+    const h = setup("channel");
+    expect(h.supervisor.liveChild()).toBeUndefined();
+    // …and it stays undefined once the run has ended.
+    await h.supervisor.start();
+    h.ops.last()?.exit(0);
+    await tick();
+    expect(h.supervisor.liveChild()).toBeUndefined();
+  });
+
+  test("a spawned daemon reports itself detached and re-adoptable", async () => {
+    const h = setup("channel");
+    await h.supervisor.start();
+    const child = h.supervisor.liveChild();
+    expect(child).toMatchObject({
+      harnessDir: h.dir,
+      target: "channel",
+      kind: "daemon",
+      state: "running",
+      detached: true,
+      reAdoptable: true,
+      adopted: false,
+    });
+    expect(child?.pid).toBe(h.ops.last()?.pid as number);
+    expect(child?.runId).toBe(h.supervisor.snapshot().runId as string);
+  });
+
+  test("an ATTACHED interactive run is neither detached nor re-adoptable", async () => {
+    const h = setup("cli");
+    await h.supervisor.start();
+    expect(h.supervisor.liveChild()).toMatchObject({
+      kind: "interactive",
+      detached: false,
+      reAdoptable: false,
+    });
+  });
+
+  test("an ADOPTED daemon is detached and re-adoptable even with no plan of ours", async () => {
+    const h = setup("channel");
+    foreignDaemon(h, 9_100);
+    expect(await h.supervisor.adopt()).toBe("adopted");
+    expect(h.supervisor.liveChild()).toMatchObject({
+      kind: "daemon",
+      pid: 9_100,
+      adopted: true,
+      // No `currentPlan` exists for an adopted run; a runfile only ever
+      // describes a detached daemon, so this is a fact, not a guess.
+      detached: true,
+      reAdoptable: true,
+    });
+  });
+
+  test("a daemon whose runfile went missing is no longer re-adoptable", async () => {
+    const h = setup("channel");
+    await h.supervisor.start();
+    expect(h.supervisor.liveChild()?.reAdoptable).toBe(true);
+    // Nothing can find this daemon again — leaving it up at shutdown would
+    // orphan it, so the fate has to flip.
+    rmSync(join(runDir(h.dir), "daemon.json"));
+    expect(h.supervisor.liveChild()?.reAdoptable).toBe(false);
+  });
+
+  test("reading it never signals, never adopts, and never writes", async () => {
+    const h = setup("channel");
+    await h.supervisor.start();
+    const before = readRunfile(h.dir);
+    for (let i = 0; i < 3; i += 1) h.supervisor.liveChild();
+    expect(h.ops.last()?.signals).toEqual([]);
+    expect(readRunfile(h.dir)).toEqual(before);
+  });
+});

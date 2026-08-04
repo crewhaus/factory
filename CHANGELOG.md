@@ -164,6 +164,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   control env vars therefore gains exactly one new route — `/healthz` — and
   no listener, no token file, and no reachable control surface.
 
+- **Binding the Hangar console beyond loopback now needs an explicit
+  opt-in.** `crewhaus hangar --host <h>` has always required auth; it now
+  additionally requires `CREWHAUS_HANGAR_ALLOW_REMOTE=1` whenever the host
+  is not this machine. The console is machine control — it starts and stops
+  processes, reads every transcript and writes credentials — behind a bearer
+  token over plain HTTP with no TLS, no origin pinning and no rate limiting,
+  which is a fine posture for `127.0.0.1` and a poor one for a LAN, so the
+  fleet can no longer be exposed by muscle memory. Loopback is the whole of
+  `127.0.0.0/8`, `::1` in any spelling (bracketed, expanded, or IPv4-mapped)
+  and `localhost`; everything else needs the opt-in, including the two
+  values that look the most harmless — `0.0.0.0` and `::` are the wildcards
+  and bind every interface the machine has. Hostnames are never resolved to
+  decide this: an unrecognised host fails closed. The refusal names the
+  variable AND the answer, which is a private network (Tailscale, an SSH
+  tunnel) rather than a port-forward.
+
+- **CI runs the process layer on Windows.** `createWindowsProcessOps` —
+  PowerShell `Get-Process` for liveness and start time, `taskkill /T` for
+  the tree — shipped with the process layer, but only its output PARSERS
+  were tested, against captured strings; the adapter itself had never
+  executed on Windows, and the one `windows-latest` job in the release
+  workflow verifies that the packaged `.exe` downloads rather than that the
+  supervisor works. A new `windows-supervision` CI job runs the
+  `@crewhaus/harness-supervisor` and `@crewhaus/hangar-server` suites on
+  `windows-latest`, and the supervisor suite gains a Windows-only
+  integration test that spawns one real child and asks the real adapter the
+  three questions liveness is made of: is the pid alive, when did it start,
+  and is it still running our argv. A wrong answer to any of them is what
+  lets a restart spawn a second copy of a channel daemon (double message
+  processing, double provider spend), so it is worth proving rather than
+  asserting. The job is non-blocking while the platform is unproven, and
+  until it is green `crewhaus hangar` and `crewhaus daemon` print one line
+  on win32 saying supervision there is unverified. Windows binaries ship
+  through Scoop and winget, so the honest options were to prove it or to say
+  so — not to leave "written but unrun" implied. Several suite-level POSIX
+  assumptions were fixed along the way: `0600` file-mode assertions are
+  POSIX claims (Windows reports `0666` for any writable file and carries the
+  real permission in the ACL), and a fixture path fell back to `/tmp` when
+  `TMPDIR` was unset, which is every Windows machine.
+
 ### Changed
 
 - **The `fleet` and `doctor`/`channel` cores are consumed from the new
@@ -196,6 +236,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter that existed only alongside an optional spec block would make the
   control surface lie about a gateway-less bot. Observable through the
   control status route, which needs the control port bound.
+
+- **`crewhaus fleet` and `crewhaus harness` now signpost each other.**
+  `fleet` is KEPT indefinitely — it is a thin, golden-tested consumer of
+  `@crewhaus/harness-inventory` whose maintenance cost is near zero, and it
+  is a genuinely different entry point rather than a legacy one, so
+  deprecating it would break scripts for no gain. What was missing was the
+  axis, and each verb's help now states it and points across: `fleet` is
+  FILESYSTEM-centric (walks `--root`, needs no registration, has no
+  console), `harness` is REGISTRY-centric (the machine-wide list wherever
+  the harnesses live, plus groups/tags/pins, preflight, and the console).
+  Both `--help` screens and the top-level subcommand list say that both are
+  supported and neither replaces the other, so an operator who found one
+  first discovers the other from it.
 
 ### Fixed
 

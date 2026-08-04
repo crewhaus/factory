@@ -38,3 +38,41 @@ jobs:
 
       - name: Lint
         run: bun run lint
+
+  # HM-188 — the harness manager's process layer, executed on Windows.
+  #
+  # `createWindowsProcessOps` (PowerShell `Get-Process` for liveness and start
+  # time, `taskkill /T` for the tree) shipped with the process layer but had
+  # never RUN on Windows: nothing in CI ran it, and release.yml's
+  # windows-latest job verifies that the packaged .exe downloads rather than
+  # that the supervisor works. A wrong liveness verdict is the one failure
+  # with real consequences — it is what lets a restart spawn a second copy of
+  # a channel daemon — and Windows binaries ship through Scoop and winget, so
+  # there are real users behind the gap. This job closes it.
+  #
+  # Scoped to the two packages that own supervision rather than `bun run test`:
+  # the rest of the repo is platform-agnostic, and a second full matrix would
+  # buy minutes of runtime for no new signal.
+  #
+  # NON-BLOCKING FOR NOW (continue-on-error), and deliberately so: the suites
+  # have never executed on this platform, so a red result here is information
+  # rather than a reason to stop every merge and every release — the decision
+  # on record was to make the gap KNOWN, not to gate on it. The job still runs
+  # the whole of both suites and its result is visible on every PR. When it is
+  # green, drop `continue-on-error` (making it a real gate) and delete the
+  # win32 notice: apps/cli/src/win32-notice.ts and its call sites.
+  windows-supervision:
+    name: Supervisor + Hangar server (Windows)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ">=1.2.0"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Test the process layer + the manager server
+        run: bun --filter '@crewhaus/harness-supervisor' --filter '@crewhaus/hangar-server' test

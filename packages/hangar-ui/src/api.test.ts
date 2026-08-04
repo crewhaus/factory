@@ -207,6 +207,23 @@ const DRIVERS: Record<
   deployments: { call: () => api.deployments(ID), params: { id: ID } },
   pinSession: { call: () => api.pinSession(ID, SESS, true), params: { id: ID, sess: SESS } },
   pinBaseline: { call: () => api.pinBaseline(ID, RUN), params: { id: ID } },
+  // ---- M4 --------------------------------------------------------------
+  health: { call: () => api.health(ID), params: { id: ID } },
+  fleetHealth: { call: () => api.fleetHealth() },
+  onboarding: { call: () => api.onboarding() },
+  demoInstall: { call: () => api.demoInstall("cli-quickstart", "/tmp/demo") },
+  search: { call: () => api.search("poly"), query: "?q=poly" },
+  notifications: { call: () => api.notifications() },
+  setNotifications: { call: () => api.setNotifications({ mutedGroups: [] }) },
+  clearNotifications: { call: () => api.clearNotifications() },
+  readOnly: { call: () => api.readOnly() },
+  setReadOnly: { call: () => api.setReadOnly(true) },
+  plugins: { call: () => api.plugins() },
+  pluginPane: {
+    call: () => api.pluginPane("cost-lens", "spend"),
+    params: { plugin: "cost-lens", pane: "spend" },
+  },
+  panes: { call: () => api.panes(ID), params: { id: ID } },
 };
 
 /**

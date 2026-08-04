@@ -31,7 +31,7 @@
  *     cannot, and the Run controls must say so rather than pretend.
  */
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { EnvOverride, RunClass, RunKind } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -558,5 +558,15 @@ export function shellQuote(value: string): string {
 export function isInside(root: string, path: string): boolean {
   const r = resolve(root);
   const p = isAbsolute(path) ? resolve(path) : resolve(root, path);
-  return p === r || p.startsWith(r.endsWith("/") ? r : `${r}/`);
+  // `relative()` rather than a string prefix, because a hardcoded "/" is
+  // wrong on Windows: `resolve` returns `D:\a\b\c`, which never startsWith
+  // `D:\a\b/`, so EVERY genuinely-inside path read as outside. That failed
+  // CLOSED — the manager refused legitimate reads rather than allowing
+  // illegitimate ones — but it broke the feature wholesale, and the sibling
+  // case it exists to reject (`/a/bc` under `/a/b`) is exactly what a naive
+  // prefix test gets wrong in the OTHER direction on POSIX.
+  const rel = relative(r, p);
+  if (rel === "") return true; // the root itself
+  if (rel.startsWith("..")) return false; // above, or a sibling
+  return !isAbsolute(rel); // a different drive on Windows
 }

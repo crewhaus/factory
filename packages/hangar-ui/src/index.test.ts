@@ -179,6 +179,61 @@ describe("js module hygiene", () => {
     }
   });
 
+  test("srcdoc appears in exactly one module, and only alongside a sandbox", () => {
+    // M4 (HM-179) introduces the ONE deliberate exception to the
+    // markup-string ban: a plugin pane's document is handed to an iframe via
+    // `srcdoc`. That is safe precisely because the string never joins THIS
+    // document — the frame gets an opaque origin (no `allow-same-origin`)
+    // and a CSP. Both halves are load-bearing, so the exception is pinned to
+    // one file and to the presence of the sandbox attribute beside it; a
+    // second module reaching for `srcdoc` fails here.
+    const users = jsEntries
+      .filter(([, entry]) => entry.body.includes("srcdoc"))
+      .map(([key]) => key);
+    expect(users).toEqual(["/assets/js/views/panes.js"]);
+    const panes = hangarAssets["/assets/js/views/panes.js"]?.body ?? "";
+    expect(panes).toContain("sandbox:");
+    // …and it is the ONLY module allowed to build an iframe at all: the
+    // sandbox is what makes the exception safe, so a frame appearing
+    // elsewhere would be one nobody had to think about.
+    const frames = jsEntries
+      .filter(([, entry]) => entry.body.includes('el("iframe"'))
+      .map(([key]) => key);
+    expect(frames).toEqual(["/assets/js/views/panes.js"]);
+    // The sandbox token list itself (never `allow-same-origin` alongside
+    // `allow-scripts`) is proven behaviourally in `m4-views.test.ts`, where
+    // `paneSandbox` is called with a payload that tries to widen it.
+  });
+
+  test("no module hardcodes a `harness scan-root` verb (the CLI has none)", () => {
+    // The console's CLI twins are its trust affordance: a command shown
+    // beside a button has to be one a terminal accepts. `crewhaus harness`
+    // takes list|show|add|remove|relocate|group|tag|pin|scan|preflight — a
+    // scan root is added by `harness scan --root <dir>`, which remembers the
+    // root before it walks it. A twin nobody can paste teaches the opposite
+    // of what the discipline is for, and the first-boot screen is where an
+    // operator learns whether to believe them.
+    for (const [key, entry] of jsEntries) {
+      expect(`${key}:${entry.body.includes("scan-root add")}`).toBe(`${key}:false`);
+    }
+  });
+
+  test("the evaluating notifications GET has exactly one caller, and the app runs it", () => {
+    // `GET /api/notifications` IS the rules evaluation (HM-183: the manager
+    // runs no timer). Every delivery it returns is added to the server's
+    // dedupe set and never returned again — so a second caller does not read
+    // the same state, it CONSUMES it, and the toast for whatever it ate can
+    // never appear again in that manager process. One caller, therefore, and
+    // every screen that needs the state goes through it.
+    const callers = jsEntries
+      .filter(([, entry]) => entry.body.includes("api.notifications("))
+      .map(([key]) => key);
+    expect(callers).toEqual(["/assets/js/notify.js"]);
+    // …and the app must actually START that loop: a poll nobody runs is the
+    // boot-time read this whole arrangement exists to replace.
+    expect(hangarAssets["/assets/js/app.js"]?.body ?? "").toContain("notifications.start()");
+  });
+
   test("every relative import resolves to another embedded asset (import-graph closure)", () => {
     const importRe = /import\s+[^"']*?["']([^"']+)["']/g;
     for (const [key, entry] of jsEntries) {

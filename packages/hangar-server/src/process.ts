@@ -49,6 +49,7 @@ import {
   type HarnessSupervisor,
   type JobQueue,
   type JobRecord,
+  type JobRunContext,
   type JobRunner,
   type JobStore,
   type PortLedger,
@@ -66,6 +67,7 @@ import {
   createProcessOps,
   ensureRunDir,
   isReadOnlyJob,
+  processOpsChild,
   readRunfile,
   resolveCrewhausBin,
   runClassFor,
@@ -191,6 +193,19 @@ export type ProcessLayer = {
   get(entry: HangarHarnessEntry): HarnessProcess;
   /** Already-created handles only — no side effects. */
   peek(harnessDir: string): HarnessProcess | undefined;
+  /**
+   * Every handle this layer currently HOLDS, in insertion order.
+   *
+   * The same iteration `close()` does, exposed so a caller that must reach
+   * every live supervisor (manager shutdown) enumerates what this process
+   * actually supervises rather than re-deriving it from the registry — a
+   * harness removed, relocated or never registered mid-session still has a
+   * handle here, and that handle is the only thing that can stop it.
+   *
+   * SIDE-EFFECT FREE, exactly like {@link peek}: no supervisor is built and
+   * nothing is adopted, so enumerating is never how a daemon gets picked up.
+   */
+  held(): readonly HarnessProcess[];
   readonly jobs: JobQueue;
   /** Adopt every registered harness, then restore the job queue. */
   boot(): Promise<{ readonly adopted: number; readonly lost: number; readonly jobs: number }>;
@@ -210,12 +225,23 @@ function liveTarget(harnessDir: string): string | undefined {
 
 /** Default job runner: spawn `crewhaus <argv>` in the harness root through
  *  the same `ProcessOps` seam the supervisor uses, capturing into the run
- *  dir. Never a shell — argv is passed as a vector. */
-function defaultJobRunner(
+ *  dir. Never a shell — argv is passed as a vector.
+ *
+ *  DETACHED, like every other non-interactive spawn in the system. A job is
+ *  a TREE, not a process: `crewhaus eval` connects the spec's `mcp_servers`
+ *  and the bash tool spawns `sh -c`, so the thing that has to be signalled
+ *  is the process GROUP. `detached: true` makes the child a group leader,
+ *  which is the only thing that makes `createPosixProcessOps.signalGroup`'s
+ *  `kill(-pid, sig)` succeed — attached, that call raises ESRCH and silently
+ *  degrades to `kill(pid, sig)`, so cancel/shutdown reach `crewhaus eval`
+ *  and leave its MCP servers holding the harness env. Nothing is lost by
+ *  detaching: the child is registered as a {@link CancellableChild} below
+ *  and is signalled explicitly through it. */
+export function defaultJobRunner(
   ops: ProcessOps,
   harnessBin: (dir: string) => string | undefined,
 ): JobRunner {
-  return async (job: JobRecord) => {
+  return async (job: JobRecord, ctx: JobRunContext) => {
     const bin = harnessBin(job.harnessDir);
     if (bin === undefined) {
       return { error: "no resolvable `crewhaus` CLI (harness node_modules/.bin, then PATH)" };
@@ -227,8 +253,13 @@ function defaultJobRunner(
       cwd: job.harnessDir,
       env: mergedSpawnEnv(process.env, job.harnessDir).env as Record<string, string>,
       stdio: { mode: "file", path: logFile },
-      detached: false,
+      detached: true,
     });
+    // HAND THE CHILD TO THE QUEUE. Without this the queue knows a job is
+    // "running" but holds nothing it can signal: `cancel()` answers false and
+    // manager shutdown marks the ledger row while the process keeps going —
+    // the orphan M4 exists to stop, reintroduced through the console path.
+    ctx.register(processOpsChild(ops, child.pid));
     const { code } = await child.exited;
     return { exitCode: code ?? 1 };
   };
@@ -362,6 +393,7 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
       return created;
     },
     peek: (harnessDir) => handles.get(harnessDir),
+    held: () => [...handles.values()],
     jobs,
     boot: async () => {
       let adopted = 0;

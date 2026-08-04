@@ -13,7 +13,7 @@
  */
 import { existsSync } from "node:fs";
 import { lstat, mkdir, readdir, rename, rm } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 
 export class TrashError extends CrewhausError {
@@ -55,7 +55,14 @@ function trashTimestamp(now: () => Date): string {
 }
 
 function assertUnder(absPath: string, root: string, what: string): void {
-  if (absPath !== root && !absPath.startsWith(`${root}/`)) {
+  // `relative()`, not a `${root}/` prefix: on Windows `resolve` produces
+  // `C:\…\.crewhaus\state\focus.md`, which never startsWith `C:\…\.crewhaus/`,
+  // so this refused every path that WAS under the root. It failed closed —
+  // it refused to trash rather than trashing something outside — but that
+  // made continuity clear/restore unusable on Windows entirely.
+  const rel = relative(root, absPath);
+  const outside = rel !== "" && (rel.startsWith("..") || isAbsolute(rel));
+  if (outside) {
     throw new TrashError(
       `${what} "${absPath}" is outside the .crewhaus dir "${root}" — refusing to trash it`,
     );
@@ -110,7 +117,11 @@ export async function moveToTrash(
   for (const path of paths) {
     const abs = resolve(path);
     assertUnder(abs, root, "path");
-    if (abs === trashRoot || abs.startsWith(`${trashRoot}/`)) {
+    // Same separator bug as `assertUnder`, but this one fails OPEN: on
+    // Windows `C:\…\trash\ts\f` never startsWith `C:\…\trash/`, so the guard
+    // never fired and the trash could be moved into itself.
+    const relToTrash = relative(trashRoot, abs);
+    if (relToTrash === "" || !(relToTrash.startsWith("..") || isAbsolute(relToTrash))) {
       throw new TrashError(`path "${abs}" is inside the trash — refusing to trash the trash`);
     }
     try {

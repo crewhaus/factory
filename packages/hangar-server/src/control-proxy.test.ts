@@ -14,6 +14,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createControlClient } from "./control-client";
 import { makeFixtureHarness } from "./fixture";
@@ -206,8 +207,10 @@ describe("control.v1 proxy", () => {
 
   test("the token is re-read per call — a daemon that reminted it is not cached out", async () => {
     const stub = startStubControlPlane(STUB_TOKEN);
-    const root = process.env["TMPDIR"] ?? "/tmp";
-    const dir = makeFixtureHarness(join(root, `hangar-ctl-remint-${process.pid}`), {
+    // `tmpdir()`, not `TMPDIR` — the variable is unset on Windows (it is
+    // TEMP/TMP there), and the `/tmp` fallback would put a fixture at the
+    // root of the system drive.
+    const dir = makeFixtureHarness(join(tmpdir(), `hangar-ctl-remint-${process.pid}`), {
       specName: "remint",
       controlToken: ["old", "token", "0123456789abcdef"].join("-"),
     });

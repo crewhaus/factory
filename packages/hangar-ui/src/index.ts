@@ -27,7 +27,10 @@ import indexHtmlBundle from "../assets/index.html" with { type: "text" };
 import apiJs from "../assets/js/api.js" with { type: "text" };
 import appJs from "../assets/js/app.js" with { type: "text" };
 import domJs from "../assets/js/dom.js" with { type: "text" };
+import keysJs from "../assets/js/keys.js" with { type: "text" };
 import markdownJs from "../assets/js/markdown.js" with { type: "text" };
+import notifyJs from "../assets/js/notify.js" with { type: "text" };
+import omniboxJs from "../assets/js/omnibox.js" with { type: "text" };
 import routerJs from "../assets/js/router.js" with { type: "text" };
 import routesJs from "../assets/js/routes.js" with { type: "text" };
 import shapesJs from "../assets/js/shapes.js" with { type: "text" };
@@ -44,13 +47,16 @@ import deployViewJs from "../assets/js/views/deploy.js" with { type: "text" };
 import evalsLabViewJs from "../assets/js/views/evals-lab.js" with { type: "text" };
 import evalsViewJs from "../assets/js/views/evals.js" with { type: "text" };
 import feedbackViewJs from "../assets/js/views/feedback.js" with { type: "text" };
+import healthViewJs from "../assets/js/views/health.js" with { type: "text" };
 import inboxViewJs from "../assets/js/views/inbox.js" with { type: "text" };
 import inspectViewJs from "../assets/js/views/inspect.js" with { type: "text" };
 import jobsViewJs from "../assets/js/views/jobs.js" with { type: "text" };
 import libraryViewJs from "../assets/js/views/library.js" with { type: "text" };
 import memoryFabricViewJs from "../assets/js/views/memory-fabric.js" with { type: "text" };
 import memoryViewJs from "../assets/js/views/memory.js" with { type: "text" };
+import onboardingViewJs from "../assets/js/views/onboarding.js" with { type: "text" };
 import overviewViewJs from "../assets/js/views/overview.js" with { type: "text" };
+import panesViewJs from "../assets/js/views/panes.js" with { type: "text" };
 import procViewJs from "../assets/js/views/proc.js" with { type: "text" };
 import reviewViewJs from "../assets/js/views/review.js" with { type: "text" };
 import runsViewJs from "../assets/js/views/runs.js" with { type: "text" };
@@ -58,6 +64,7 @@ import runtimeViewJs from "../assets/js/views/runtime.js" with { type: "text" };
 import schedulersViewJs from "../assets/js/views/schedulers.js" with { type: "text" };
 import securityViewJs from "../assets/js/views/security.js" with { type: "text" };
 import sessionsViewJs from "../assets/js/views/sessions.js" with { type: "text" };
+import settingsViewJs from "../assets/js/views/settings.js" with { type: "text" };
 import specEditViewJs from "../assets/js/views/spec-edit.js" with { type: "text" };
 import specViewJs from "../assets/js/views/spec.js" with { type: "text" };
 import thredzViewJs from "../assets/js/views/thredz.js" with { type: "text" };
@@ -104,7 +111,10 @@ export const hangarAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/app.js": asset(appJs, "app.js"),
   "/assets/js/api.js": asset(apiJs, "api.js"),
   "/assets/js/dom.js": asset(domJs, "dom.js"),
+  "/assets/js/keys.js": asset(keysJs, "keys.js"),
   "/assets/js/markdown.js": asset(markdownJs, "markdown.js"),
+  "/assets/js/notify.js": asset(notifyJs, "notify.js"),
+  "/assets/js/omnibox.js": asset(omniboxJs, "omnibox.js"),
   "/assets/js/router.js": asset(routerJs, "router.js"),
   "/assets/js/routes.js": asset(routesJs, "routes.js"),
   "/assets/js/shapes.js": asset(shapesJs, "shapes.js"),
@@ -121,13 +131,16 @@ export const hangarAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/views/evals-lab.js": asset(evalsLabViewJs, "evals-lab.js"),
   "/assets/js/views/evals.js": asset(evalsViewJs, "evals.js"),
   "/assets/js/views/feedback.js": asset(feedbackViewJs, "feedback.js"),
+  "/assets/js/views/health.js": asset(healthViewJs, "health.js"),
   "/assets/js/views/inbox.js": asset(inboxViewJs, "inbox.js"),
   "/assets/js/views/inspect.js": asset(inspectViewJs, "inspect.js"),
   "/assets/js/views/jobs.js": asset(jobsViewJs, "jobs.js"),
   "/assets/js/views/library.js": asset(libraryViewJs, "library.js"),
   "/assets/js/views/memory-fabric.js": asset(memoryFabricViewJs, "memory-fabric.js"),
   "/assets/js/views/memory.js": asset(memoryViewJs, "memory.js"),
+  "/assets/js/views/onboarding.js": asset(onboardingViewJs, "onboarding.js"),
   "/assets/js/views/overview.js": asset(overviewViewJs, "overview.js"),
+  "/assets/js/views/panes.js": asset(panesViewJs, "panes.js"),
   "/assets/js/views/proc.js": asset(procViewJs, "proc.js"),
   "/assets/js/views/review.js": asset(reviewViewJs, "review.js"),
   "/assets/js/views/runs.js": asset(runsViewJs, "runs.js"),
@@ -135,6 +148,7 @@ export const hangarAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/views/schedulers.js": asset(schedulersViewJs, "schedulers.js"),
   "/assets/js/views/security.js": asset(securityViewJs, "security.js"),
   "/assets/js/views/sessions.js": asset(sessionsViewJs, "sessions.js"),
+  "/assets/js/views/settings.js": asset(settingsViewJs, "settings.js"),
   "/assets/js/views/spec-edit.js": asset(specEditViewJs, "spec-edit.js"),
   "/assets/js/views/spec.js": asset(specViewJs, "spec.js"),
   "/assets/js/views/thredz.js": asset(thredzViewJs, "thredz.js"),

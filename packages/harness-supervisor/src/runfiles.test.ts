@@ -91,7 +91,14 @@ describe("the runfile", () => {
     writeRunfile(dir, runfile);
     expect(readRunfile(dir)).toEqual(runfile);
     const mode = statSync(join(runDir(dir), RUNFILE_NAME)).mode & 0o777;
-    expect(mode).toBe(0o600);
+    // HM-188: Windows has no POSIX mode bits — `stat` reports 0666 for any
+    // writable file and 0444 for a read-only one, and `chmod` only toggles
+    // that one attribute. The 0600 claim is a POSIX claim; on Windows the
+    // file inherits the directory's ACL, which this suite does not model.
+    // What is still assertable there is owner read+write, and that the write
+    // path ran at all.
+    if (process.platform === "win32") expect(mode & 0o600).toBe(0o600);
+    else expect(mode).toBe(0o600);
   });
 
   test("a corrupt or shape-invalid runfile reads as absent, never throws", () => {

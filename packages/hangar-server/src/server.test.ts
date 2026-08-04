@@ -207,7 +207,13 @@ describe("auth", () => {
     const t = boot();
     expect(t.server.tokenPath).toBe(join(t.hangarRoot, "token"));
     const mode = statSync(t.server.tokenPath as string).mode & 0o777;
-    expect(mode).toBe(0o600);
+    // HM-188: Windows reports 0666 for any writable file (0444 read-only) and
+    // `chmod` only toggles that attribute, so the 0600 claim is a POSIX claim.
+    // The token's confidentiality there rests on the ACL of the hangar root,
+    // which this suite does not model — owner read+write is what remains
+    // assertable.
+    if (process.platform === "win32") expect(mode & 0o600).toBe(0o600);
+    else expect(mode).toBe(0o600);
     const again = bootTestServer({});
     servers.push(again);
     expect(again.token).not.toBe(t.token); // different roots → different tokens
