@@ -3,17 +3,36 @@
  * from the URL fragment into sessionStorage and strip it via replaceState),
  * theme, shell render, router start, version footer. Booting is guarded on
  * `document` existing so the module can be imported by tests.
+ *
+ * M2 adds the fleet-wide nav (Runs, Approvals, Review, Activity) with live
+ * counts, and gives the harness header its supervision pill, bundle
+ * freshness badge, control availability and — when the spawn plan cannot be
+ * built — the remedy as a BUTTON rather than an error.
  */
 
 import { ApiError, api, onUnauthorized, setToken } from "./api.js";
-import { clear, copyBtn, dot, el, skeleton } from "./dom.js";
-import { HARNESS_TABS, hrefHarness, hrefLibrary, parseRoute, startRouter } from "./router.js";
+import { clear, copyBtn, dot, el, skeleton, toast } from "./dom.js";
+import {
+  HARNESS_TABS,
+  hrefGlobal,
+  hrefHarness,
+  hrefLibrary,
+  parseRoute,
+  startRouter,
+} from "./router.js";
 import { shapeAccent, shapeLabel } from "./shapes.js";
+import { procRow } from "./supervision.js";
+import { renderActivity } from "./views/activity.js";
+import { renderApprovals } from "./views/approvals.js";
 import { renderCosts } from "./views/costs.js";
+import { renderDeploy } from "./views/deploy.js";
 import { renderEvals } from "./views/evals.js";
 import { renderLibrary } from "./views/library.js";
 import { renderMemory } from "./views/memory.js";
 import { renderOverview } from "./views/overview.js";
+import { renderReview } from "./views/review.js";
+import { renderRuns, renderRunsBoard } from "./views/runs.js";
+import { renderSchedulers } from "./views/schedulers.js";
 import { renderSessions } from "./views/sessions.js";
 import { renderSpec } from "./views/spec.js";
 import { renderTokenScreen } from "./views/token.js";
@@ -22,15 +41,28 @@ const THEME_KEY = "hangar.theme";
 const TAB_LABELS = {
   overview: "Overview",
   spec: "Spec",
+  runs: "Runs",
+  schedulers: "Schedulers",
   sessions: "Sessions",
   evals: "Evals",
   memory: "Memory",
   costs: "Costs",
+  deploy: "Deployments",
 };
+
+/** The fleet-wide screens in the header rail, with their count sources. */
+const NAV = [
+  { view: "runs", label: "Runs & daemons" },
+  { view: "approvals", label: "Approvals" },
+  { view: "review", label: "Review" },
+  { view: "activity", label: "Activity" },
+];
 
 let viewRoot = null;
 let footRoot = null;
+let navRoot = null;
 let dispatchSeq = 0;
+let navCounts = {};
 
 /** Move a `#t=<token>` fragment into sessionStorage and off the URL. */
 function bootstrapToken() {
@@ -79,23 +111,66 @@ function renderShell(appRoot) {
     title: "Toggle light/dark",
     onClick: toggleTheme,
   });
+  navRoot = el("nav", { class: "app-nav", "aria-label": "fleet screens" });
   const header = el("header", { class: "app-header" }, [
     el("a", { class: "brand", href: hrefLibrary() }, [
       el("span", { class: "logo", "aria-hidden": "true", text: "H" }),
       el("span", { class: "brand-name", text: "Hangar" }),
       el("span", { class: "brand-sub", text: "CrewHaus harness manager" }),
     ]),
+    navRoot,
     el("span", { class: "spacer" }),
     themeBtn,
   ]);
   viewRoot = el("main", { class: "view", id: "view" });
   footRoot = el("footer", { class: "app-foot", id: "foot" }, [
-    el("span", { class: "muted", text: "read-only alpha — every write goes through the CLI" }),
+    el("span", { class: "muted", text: "every action shows the CLI command it runs" }),
   ]);
   appRoot.appendChild(header);
   appRoot.appendChild(viewRoot);
   appRoot.appendChild(footRoot);
+  drawNav(parseRoute(window.location.hash));
   loadVersion();
+  loadNavCounts();
+}
+
+/** The nav, with the active screen marked. Counts arrive separately. */
+function drawNav(route, counts = {}) {
+  if (navRoot === null) return;
+  clear(navRoot);
+  navRoot.appendChild(
+    el("a", {
+      class: `navlink${route.view === "library" ? " active" : ""}`,
+      href: hrefLibrary(),
+      text: "Library",
+    }),
+  );
+  for (const item of NAV) {
+    const count = counts[item.view];
+    const link = el("a", {
+      class: `navlink${route.view === item.view ? " active" : ""}`,
+      href: hrefGlobal(item.view),
+    });
+    link.appendChild(el("span", { text: item.label }));
+    if (typeof count === "number" && count > 0) {
+      link.appendChild(el("span", { class: "nav-badge", text: String(count) }));
+    }
+    navRoot.appendChild(link);
+  }
+}
+
+/** Pending approvals + open review items — the two numbers worth a badge. */
+async function loadNavCounts() {
+  const [approvals, review] = await Promise.allSettled([api.approvals(), api.review()]);
+  const counts = {};
+  if (approvals.status === "fulfilled" && approvals.value && typeof approvals.value === "object") {
+    counts.approvals = approvals.value.pending;
+  }
+  if (review.status === "fulfilled" && review.value && typeof review.value === "object") {
+    counts.review = review.value.open;
+  }
+  navCounts = counts;
+  drawNav(parseRoute(window.location.hash), counts);
 }
 
 async function loadVersion() {
@@ -117,12 +192,21 @@ async function loadVersion() {
 
 async function dispatch(route) {
   const seq = ++dispatchSeq;
+  drawNav(route, navCounts);
   clear(viewRoot).appendChild(skeleton(6));
   try {
     if (route.view === "library") {
       await renderLibrary(viewRoot);
     } else if (route.view === "harness") {
       await renderHarnessPage(viewRoot, route);
+    } else if (route.view === "runs") {
+      await renderRunsBoard(viewRoot);
+    } else if (route.view === "approvals") {
+      await renderApprovals(viewRoot);
+    } else if (route.view === "review") {
+      await renderReview(viewRoot);
+    } else if (route.view === "activity") {
+      await renderActivity(viewRoot);
     } else {
       renderNotFound(viewRoot, route);
     }
@@ -134,7 +218,15 @@ async function dispatch(route) {
 }
 
 async function renderHarnessPage(root, route) {
-  const detail = await api.harness(route.id);
+  // The process picture rides along with the detail so the header can show
+  // supervision without a second paint; a failure leaves the M1 header.
+  const [detailRes, procRes] = await Promise.allSettled([
+    api.harness(route.id),
+    api.proc(route.id),
+  ]);
+  if (detailRes.status === "rejected") throw detailRes.reason;
+  const detail = detailRes.value;
+  const proc = procRes.status === "fulfilled" ? procRes.value : null;
   clear(root);
   if (detail === null) {
     root.appendChild(
@@ -146,7 +238,16 @@ async function renderHarnessPage(root, route) {
     );
     return;
   }
-  root.appendChild(harnessHeader(detail, route));
+  const entry = detail.entry && typeof detail.entry === "object" ? detail.entry : {};
+  const ctx = {
+    id: route.id,
+    detail,
+    route,
+    proc,
+    dir: typeof entry.dir === "string" ? entry.dir : "",
+    reload: () => renderHarnessPage(root, route),
+  };
+  root.appendChild(harnessHeader(detail, route, ctx));
   const nav = el(
     "nav",
     { class: "tabs", "aria-label": "harness tabs" },
@@ -162,12 +263,14 @@ async function renderHarnessPage(root, route) {
   root.appendChild(nav);
   const tabRoot = el("div", { class: "tab-body" });
   root.appendChild(tabRoot);
-  const ctx = { id: route.id, detail, route };
   if (route.tab === "spec") await renderSpec(tabRoot, ctx);
+  else if (route.tab === "runs") await renderRuns(tabRoot, ctx);
+  else if (route.tab === "schedulers") await renderSchedulers(tabRoot, ctx);
   else if (route.tab === "sessions") await renderSessions(tabRoot, ctx);
   else if (route.tab === "evals") await renderEvals(tabRoot, ctx);
   else if (route.tab === "memory") await renderMemory(tabRoot, ctx);
   else if (route.tab === "costs") await renderCosts(tabRoot, ctx);
+  else if (route.tab === "deploy") await renderDeploy(tabRoot, ctx);
   else await renderOverview(tabRoot, ctx);
 }
 
@@ -175,9 +278,10 @@ async function renderHarnessPage(root, route) {
  * Detail header. The detail payload nests all identity fields under
  * `entry` (the registry row) with richer names on `inventory`; the header
  * reads those, never invented top-level fields. Capability chips come from
- * the server's `badges` (the lenient spec scan) — the M1 posture line.
+ * the server's `badges` (the lenient spec scan) — the M1 posture line — and
+ * M2 adds the supervision strip beneath it.
  */
-function harnessHeader(detail, route) {
+function harnessHeader(detail, route, ctx) {
   const entry = detail.entry && typeof detail.entry === "object" ? detail.entry : {};
   const inv = detail.inventory && typeof detail.inventory === "object" ? detail.inventory : {};
   const header = inv.header && typeof inv.header === "object" ? inv.header : {};
@@ -198,8 +302,66 @@ function harnessHeader(detail, route) {
         ])
       : null,
     badgeStrip(detail.badges),
+    supervisionStrip(ctx),
   ]);
   return head;
+}
+
+/** Supervision pill + bundle freshness + control availability + remedy. */
+function supervisionStrip(ctx) {
+  if (ctx.proc === null) return null;
+  const row = procRow(ctx.proc, Date.now());
+  const strip = el("div", { class: "sup-strip" }, [
+    dot(row.pill.dot, row.pill.label),
+    row.adopted ? el("span", { class: "chip", text: "adopted" }) : null,
+    row.draining ? el("span", { class: "chip chip-warn", text: "draining" }) : null,
+    row.runId !== null
+      ? el("a", {
+          class: "chip",
+          href: hrefHarness(ctx.id, "runs", row.runId),
+          text: "watch this run",
+        })
+      : null,
+    // The exact/approximate distinction is the badge's whole point — but
+    // only where there IS a verdict to qualify.
+    el("span", {
+      class: `chip${row.bundle.dot === "warn" ? " chip-warn" : ""}`,
+      title: row.bundle.precision,
+      text: row.bundle.present
+        ? `${row.bundle.label} · ${row.bundle.exact ? "exact" : "approximate"}`
+        : row.bundle.label,
+    }),
+    dot(row.control.dot, row.control.label),
+  ]);
+  const planError = row.launch.error;
+  if (planError !== null) {
+    strip.appendChild(el("span", { class: "muted gated-why", text: planError.message }));
+    if (planError.action !== null) {
+      const btn = el("button", {
+        class: "btn",
+        type: "button",
+        text: planError.action.label,
+        title: planError.action.hint,
+      });
+      if (planError.action.jobKind === null) {
+        btn.disabled = true;
+      } else {
+        btn.addEventListener("click", async () => {
+          btn.disabled = true;
+          try {
+            await api.submitJob(ctx.id, planError.action.jobKind);
+            toast(`Queued ${planError.action.jobKind}`, "info");
+            ctx.reload();
+          } catch (err) {
+            btn.disabled = false;
+            toast(`Could not queue: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        });
+      }
+      strip.appendChild(btn);
+    }
+  }
+  return strip;
 }
 
 /** Capability-badge chips from the detail payload's `badges` booleans. */
@@ -248,6 +410,7 @@ function boot() {
   onUnauthorized(() => {
     renderTokenScreen(viewRoot, () => {
       loadVersion();
+      loadNavCounts();
       dispatch(parseRoute(window.location.hash));
     });
   });

@@ -9,6 +9,7 @@ import { api } from "../api.js";
 import { asOf, clear, copyBtn, dot, el, emptyState, skeleton, toast } from "../dom.js";
 import { hrefHarness } from "../router.js";
 import { shapeAccent, shapeLabel } from "../shapes.js";
+import { procStatePill } from "../supervision.js";
 import {
   deriveSmartGroups,
   dirTail,
@@ -47,7 +48,7 @@ const COLUMNS = [
   { key: "name", label: "Name", get: (r) => r.specName || dirTail(r.dir, 1) },
   { key: "shape", label: "Shape", get: (r) => r.target },
   { key: "model", label: "Model", get: (r) => r.model },
-  { key: "process", label: "Process", get: () => null, sortable: false },
+  { key: "process", label: "Process", get: (r) => r.supervision, sortable: true },
   { key: "eval", label: "Last eval", get: (r) => r.lastEval?.passRate ?? null },
   { key: "sessions", label: "Sessions", get: (r) => r.sessions },
   { key: "spend", label: "Spend 7d", get: (r) => r.spend7dUsd },
@@ -463,7 +464,20 @@ function harnessRow(row, groups, reload) {
       }),
     ]),
     el("td", { class: "mono", text: row.model ?? "—" }),
-    el("td", { class: "muted", title: "Process supervision arrives with M2", text: "—" }),
+    el("td", null, [
+      row.supervision === null
+        ? el("span", { class: "muted", text: "—" })
+        : el("a", { class: "state-link", href: hrefHarness(row.id, "runs") }, [
+            dot(procStatePill(row.supervision).dot, procStatePill(row.supervision).label),
+          ]),
+      row.pendingApprovals > 0
+        ? el("a", {
+            class: "chip chip-warn",
+            href: "#/approvals",
+            text: `${row.pendingApprovals} waiting`,
+          })
+        : null,
+    ]),
     el("td", null, [
       dot(
         health.state === "pass"

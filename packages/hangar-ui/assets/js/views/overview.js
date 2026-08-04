@@ -1,7 +1,8 @@
 /**
- * Harness detail — Overview tab: health checklist, eval trend mini-line,
- * memory-fabric mini-cards, cost mini-chart, and the expandable preflight
- * report. Pure reads; every absent payload renders as "nothing yet".
+ * Harness detail — Overview tab: the process card (M2's Start/Stop/Restart/
+ * Drain, with the preflight-refusal flow), health checklist, eval trend
+ * mini-line, memory-fabric mini-cards, cost mini-chart, and the expandable
+ * preflight report. Every absent payload renders as "nothing yet".
  */
 
 import { api } from "../api.js";
@@ -15,6 +16,7 @@ import {
   sparklinePath,
   usdFromMicros,
 } from "../util.js";
+import { procCard } from "./proc.js";
 
 export async function renderOverview(root, ctx) {
   clear(root).appendChild(skeleton(5));
@@ -24,6 +26,9 @@ export async function renderOverview(root, ctx) {
     api.costs(ctx.id),
   ]);
   clear(root);
+  // The process picture came with the page load — render it without a
+  // second fetch, at the top, because it is the only card with verbs.
+  if (ctx.proc) root.appendChild(procCard(ctx.proc, ctx, ctx.reload ?? (() => {})));
   const grid = el("div", { class: "ov-grid" });
   grid.appendChild(healthCard(ctx.detail));
   grid.appendChild(evalTrendCard(settled(evalsRes)));
