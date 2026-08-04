@@ -13,6 +13,10 @@
  *   - visibility is always set explicitly, defaulting to private.
  *   - a wiki write carries `expectedVersion` and gets the same
  *     re-read-retry flow as the local wiki.
+ *   - every article arrives MASKED, so the editor writes back only what the
+ *     operator typed: it never echoes a served value, and it goes read-only
+ *     when the body carries the mask mark rather than persisting `***` over
+ *     what it hid.
  *   - card-grammar validation messages are shown VERBATIM (KPI cards need
  *     both `display.aggregation` and `display.aggregationField`; record
  *     filters take a `tags` array, task/goal filters a singular `tag`).
@@ -65,6 +69,56 @@ function list(payload, key) {
 function idOf(row) {
   if (!row || typeof row !== "object") return "";
   return str(row._id, str(row.id, ""));
+}
+
+// ---------------------------------------------------------------------------
+// write safety (pure — unit-tested in hangar-ui/src/thredz-views.test.ts)
+// ---------------------------------------------------------------------------
+
+/** What the server's value-shape masker leaves behind. Text carrying it is
+ *  not safe to write back — the mask would replace what it hid. */
+export const MASK_MARK = "***";
+
+/**
+ * Whether a served article body may be written back at all.
+ *
+ * Every Thredz article is served through the server's `maskText`, so a body
+ * carrying the mask mark is a VIEW rather than the article: saving it would
+ * persist `***` over a real span — upstream, in a workspace other people
+ * read. The local wiki editor holds exactly this line (`memory-fabric.js`);
+ * the hosted one is not allowed to be looser.
+ */
+export function maskedEditGuard(bodyText) {
+  if (typeof bodyText !== "string" || !bodyText.includes(MASK_MARK)) {
+    return { readOnly: false, reason: null };
+  }
+  return {
+    readOnly: true,
+    reason:
+      "this body contains a masked credential-shaped span; saving from the console would persist the mask over what it hid — edit this article in the Thredz workspace",
+  };
+}
+
+/**
+ * The exact body a wiki EDIT posts.
+ *
+ * A field this form does not edit is ABSENT rather than echoed. The server
+ * leaves an omitted field alone; an echoed one would be the MASKED value
+ * (the title is masked too), and a defaulted one would rename the article
+ * and force-publish a draft. `expectedVersion` rides along whenever the read
+ * gave us one — without it the server refuses the update outright, which is
+ * the same answer the local wiki gives.
+ */
+export function wikiEditBody(bodyText, version, visibilityChoice, editMessage) {
+  const message = typeof editMessage === "string" ? editMessage.trim() : "";
+  return {
+    body: bodyText,
+    ...(message === "" ? {} : { editMessage: message }),
+    ...(typeof version === "number" ? { expectedVersion: version } : {}),
+    ...(visibilityChoice === "private" || visibilityChoice === "shared"
+      ? { visibility: visibilityChoice }
+      : {}),
+  };
 }
 
 /** The one place a proxy answer becomes a traffic light + a sentence. Colour
@@ -513,6 +567,13 @@ async function renderArticle(host, ctx, state) {
  * The editor. Every write carries `expectedVersion`; a stale answer is a
  * FIRST-CLASS state — the panel says which version moved, offers a re-read,
  * and keeps the operator's draft so nothing typed is lost.
+ *
+ * Two things this form deliberately does NOT do, both because the text it
+ * was seeded with is a masked VIEW of the article rather than the article:
+ *   - it never echoes the title back (the served one may carry `***`, and an
+ *     echoed default renames the article upstream);
+ *   - it goes read-only when the served body carries the mask mark, the same
+ *     guard the local wiki editor uses (`memory-fabric.js`).
  */
 function editorCard(ctx, slug, article, version, reload) {
   const body = el("textarea", { class: "input", rows: 12, spellcheck: "false" });
@@ -520,28 +581,41 @@ function editorCard(ctx, slug, article, version, reload) {
   const visibility = select(["(unchanged)", "private", "shared"], "(unchanged)");
   const message = input({ placeholder: "edit message (optional)" });
   const conflict = el("div", { class: "gated-why" });
+  const save = el("button", { class: "btn btn-primary", type: "submit", text: "Save" });
+  const guard = el("div", null, []);
   const form = el("form", { class: "row-editor" }, [
     field("Body", body),
     field("Visibility", visibility),
     field("Edit message", message),
+    guard,
     conflict,
-    el("div", { class: "editor-actions" }, [
-      el("button", { class: "btn btn-primary", type: "submit", text: "Save" }),
-    ]),
+    el("div", { class: "editor-actions" }, [save]),
   ]);
+  const masked = maskedEditGuard(body.value);
+  if (masked.readOnly) {
+    save.disabled = true;
+    body.readOnly = true;
+    guard.appendChild(
+      el("div", { class: "gated" }, [
+        dot("warn", "read-only here"),
+        el("span", { class: "muted gated-why", text: masked.reason }),
+      ]),
+    );
+  }
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     clear(conflict);
-    const edit = {
-      body: body.value,
-      title: str(article.title, slug),
-      ...(message.value.trim() === "" ? {} : { editMessage: message.value.trim() }),
-      ...(version !== null ? { expectedVersion: version } : {}),
-      ...(visibility.value === "(unchanged)" ? {} : { visibility: visibility.value }),
-    };
+    const stillMasked = maskedEditGuard(body.value);
+    if (stillMasked.readOnly) {
+      toast(stillMasked.reason);
+      return;
+    }
+    const edit = wikiEditBody(body.value, version, visibility.value, message.value);
     const res = await write(() => api.thredzWikiWrite({ id: ctx.id, slug }, edit), "Article saved");
     if (res && res.stale === true) {
-      conflict.appendChild(dot("warn", `this article moved to v${res.currentVersion ?? "?"}`));
+      conflict.appendChild(
+        dot("warn", str(res.note, `this article moved to v${res.currentVersion ?? "?"}`)),
+      );
       conflict.appendChild(
         el("p", {
           class: "muted",
@@ -563,7 +637,7 @@ function editorCard(ctx, slug, article, version, reload) {
   return card("Edit", [
     el("p", {
       class: "muted",
-      text: "Writes carry the version you read; a create is private unless you say otherwise.",
+      text: "Writes carry the version you read; a create is private unless you say otherwise. The title is edited in the workspace, never echoed from here.",
     }),
     form,
   ]);
@@ -671,12 +745,24 @@ async function renderRecordsPanel(host, ctx, state = { type: "", status: "", tag
               class: "btn btn-ghost",
               type: "button",
               text: "Restore",
-              onClick: async () => {
-                const res = await write(
-                  () => api.thredzRecordRestore({ id: ctx.id, recordId }, {}),
-                  "Record restored",
+              onClick: async (e) => {
+                // A restore is a one-shot: the second click has no stashed
+                // status to put back, so the button leaves the flight rather
+                // than firing again, and the toast quotes what the server
+                // actually did instead of asserting a restore.
+                const button = e.currentTarget;
+                if (button) button.disabled = true;
+                const res = await callProxy(() =>
+                  api.thredzRecordRestore({ id: ctx.id, recordId }, {}),
                 );
-                if (res && res.ok === true) void reload();
+                if (res === null) {
+                  if (button) button.disabled = false;
+                  return;
+                }
+                if (res.restored === true) toast("Record restored", "info");
+                else toast(str(res.note, "the workspace refused that"));
+                if (res.ok === true) void reload();
+                else if (button) button.disabled = false;
               },
             })
           : el("button", {

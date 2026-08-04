@@ -100,10 +100,15 @@ function autoMaintained(ctx: M3Context, name: string): string | null {
 type SplitSizes = { train: number; dev: number; test: number | null };
 
 function splitSizes(record: DatasetRecord): SplitSizes {
+  // `splits` is required by the type and optional on disk — these records are
+  // `JSON.parse`d and cast, and a hand-written `<version>.json` is precisely
+  // what this panel is here to show. An absent block reads as empty, never as
+  // a 500 that takes the whole registry list with it.
+  const splits = record.splits ?? {};
   return {
-    train: record.splits.train?.length ?? 0,
-    dev: record.splits.dev?.length ?? 0,
-    test: record.splits.test === undefined ? null : record.splits.test.length,
+    train: splits.train?.length ?? 0,
+    dev: splits.dev?.length ?? 0,
+    test: splits.test === undefined ? null : splits.test.length,
   };
 }
 
@@ -117,8 +122,9 @@ function splitSizes(record: DatasetRecord): SplitSizes {
 function provenance(record: DatasetRecord): Record<string, number> {
   const tally: Record<string, number> = {};
   const splits: readonly DatasetSplit[] = ["train", "dev", "test"];
+  const recordSplits = record.splits ?? {};
   for (const split of splits) {
-    for (const sample of record.splits[split] ?? []) {
+    for (const sample of recordSplits[split] ?? []) {
       const source = str(sample.metadata?.["source"]) ?? "(unlabelled)";
       tally[source] = (tally[source] ?? 0) + 1;
     }

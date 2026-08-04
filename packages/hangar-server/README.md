@@ -10,8 +10,8 @@ M1 was read-only over harness state (registry CRUD was the only write).
 of a layer that already exists rather than a second implementation of it.
 **M3 adds the detail surface** — the spec's write side, the memory fabric's
 write side, the eval/dataset/feedback loops, credentials + channels +
-security, Thredz, and the raw inspectors — with its routes, guards and
-client wrappers frozen ahead of its handlers (see *M3* under Routes):
+security, Thredz, and the raw inspectors — over routes, guards and client
+wrappers that were frozen ahead of its handlers (see *M3* under Routes):
 
 | Surface | Composed from |
 |---|---|
@@ -105,15 +105,18 @@ GET  /api/review[?all=1]                   POST /api/h/:id/review/:itemId {verdi
 GET  /api/activity[?since=]                GET  /api/jobs   POST /api/h/:id/jobs {kind}
 ```
 
-### M3 — the detail surface (handlers are stubs)
+### M3 — the detail surface
 
-M3 is the tab-level detail behind every M2 screen. **Its contract is frozen
-and its handlers are not written yet**: every route below exists, is
-dispatched, applies every guard, and answers `501 not implemented (M3)`. That
-is deliberate — freezing routes, guards, masking and client wrappers first is
-what lets the six areas be implemented in parallel without colliding, and the
-contract test accepts a 501 today while demanding the view's fields the moment
-a route goes real.
+M3 is the tab-level detail behind every M2 screen. **Its contract was frozen
+before its handlers were written** — routes, guards, masking and client
+wrappers first — which is what let the six areas be implemented in parallel
+without colliding; the contract test drives each route against a live fixture
+server and demands the fields its view dereferences.
+
+Every route below is implemented, with ONE deliberate exception: `POST
+/api/h/:id/secrets/:name/rotate` still answers `501 not implemented (M3)`,
+because cross-harness rotation needs `@crewhaus/secrets-manager`, which this
+package does not depend on. It says so in its own refusal.
 
 ```
 # spec — structured editing, trust tiers, versions, builders
@@ -189,7 +192,7 @@ already-validated `M3Context`. The per-area modules (`spec-edit.ts`,
 `channels-ops.ts`, `security-ops.ts`, `thredz.ts`, `inspect.ts`,
 `runtime-ops.ts`) therefore contain nothing but subject matter.
 
-Each stub's docblock carries the write covenant it must honour — the store
+Each handler's docblock carries the write covenant it honours — the store
 library or CLI verb that is the sanctioned path for its write, and the trap it
 must not re-learn. `src/m3.ts` states the covenant once for all of them: spec
 via `applySpecEdits` with `restrictToOptimizable` (human-owned paths route to
@@ -248,6 +251,15 @@ nothing writes `.crewhaus/deployments.json` yet, and inventing a writer
 here would make the manager the source of truth for a fact it does not
 observe.
 
+**There is no manager-action audit ledger yet.** `<hangarRoot>/jobs.jsonl`
+is the durable record of QUEUED work (the 19 job kinds), and control.v1
+calls append `gateway_request` records to the harness's own hash-chained
+audit log — but a mutating call that writes directly (a spec edit,
+`env`/`envUnset`, a session pin, an eval baseline re-pin) leaves no
+manager-side trace. `~/.crewhaus/hangar/actions.jsonl` is planned (HM-143)
+and has no writer in this milestone; saying so here is cheaper than an
+operator discovering it while trying to answer "who changed this".
+
 Each `/api/harnesses` row carries the registry fields plus flattened
 `capabilities` (lenient spec-badge scan), `evalHealthy` (latest run vs the
 pinned baseline) and `cachedAt`, alongside the nested `rollup` (null until
@@ -260,7 +272,8 @@ writes must take effect, reads must carry every field the UI views read
 (the test's `VIEW_READS` table).
 
 The M3 routes are driven by that same test, and each must answer either `501
-not implemented (M3)` (still a stub) or a 2xx — at which point its
+not implemented (M3)` (only `secrets/:name/rotate` today) or a 2xx — at
+which point its
 `VIEW_READS` table is enforced automatically, with no edit to the driving
 loop. A 404 there would mean the dispatch table and the route map have
 drifted apart; a 500 would mean a guard threw. The test additionally asserts
@@ -307,7 +320,12 @@ whole stop grace, which is exactly when an operator asks to watch.
 
 `server.stop()` releases timers and subscriptions but deliberately leaves
 the CHILDREN alone: a detached daemon outliving its manager is the whole
-point of the runfile, and the next boot adopts it.
+point of the runfile, and the next boot adopts it. The corollary is a trap
+for the embedder: an ATTACHED job child keeps a handle on the host
+process's event loop, so `stop()` is not by itself an exit. `crewhaus
+hangar` therefore names what it is leaving behind and calls `process.exit`
+after releasing its lock — a manager that let the loop decide stayed alive
+for hours with no lock and no port.
 
 ## Testing
 

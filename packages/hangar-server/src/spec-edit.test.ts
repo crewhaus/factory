@@ -20,9 +20,16 @@
  * literal is built from string parts at runtime.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { lintMcpEnv, looksLikeCredential, scanGraders, scanMcpServers } from "./builders";
+import {
+  lintMcpEnv,
+  looksLikeCredential,
+  newlyMaskedSpan,
+  scanGraders,
+  scanMcpServers,
+  sseUrlCredential,
+} from "./builders";
 import { makeFixtureHarness } from "./fixture";
 import {
   classifyPath,
@@ -116,6 +123,32 @@ describe("trust tiers", () => {
       );
       expect(row.reason.length).toBeGreaterThan(10);
     }
+  });
+
+  test("a SECURITY surface stays human-owned even when OPTIMIZABLE_PATHS lists it", () => {
+    // `transaction_policy`, `chains`, `security.*` and the `model_pool`
+    // policy knobs are in BOTH tables. Reading OPTIMIZABLE_PATHS first made
+    // the SECURITY_SURFACES rows dead for exactly the paths they were
+    // written to gate: the on-chain value ceiling could be raised, and
+    // pre-broadcast simulation switched off, with no typed confirmation.
+    for (const path of [
+      ["transaction_policy"],
+      ["transaction_policy", "maxValueWei"],
+      ["transaction_policy", "simulationRequired"],
+      ["chains"],
+      ["chains", "0", "rpcUrls"],
+      ["security", "justification"],
+      ["agent", "model_pool", "policy"],
+    ]) {
+      const row = classifyPath("cli", path);
+      expect(`${path.join(".")}:${row.tier}:${row.securitySurface}`).toBe(
+        `${path.join(".")}:human-owned:true`,
+      );
+    }
+    // The OPTIMIZER's whitelist is untouched — the two tables answer
+    // different questions, and the badge's reason says which is which.
+    expect(isAutoTunable("cli", ["transaction_policy"])).toBe(true);
+    expect(classifyPath("cli", ["transaction_policy"]).reason).toContain("typed confirmation");
   });
 
   test("a container of tunable fields is itself human-owned, and says why", () => {
@@ -254,6 +287,18 @@ describe("graders scan", () => {
       { name: "cites", type: "contains" },
       { name: "future", type: "some_future_kind" },
     ]);
+  });
+
+  test("a mask span is only 'newly introduced' when the stored file has fewer of it", () => {
+    // The hazard: an editor pane prefilled from a MASKED read, saved back.
+    expect(newlyMaskedSpan("substring: real-value\n", "substring: ***\n")).toBe("***");
+    expect(newlyMaskedSpan('token: "abc"\n', 'token: "[redacted]"\n')).toBe("[redacted]");
+    // An operator's own `***` is theirs to keep — a count, not a substring test.
+    expect(
+      newlyMaskedSpan("criteria: ***bold***\n", "criteria: ***bold*** and brief\n"),
+    ).toBeNull();
+    // Nothing stored ⇒ this document cannot be a masked view of anything.
+    expect(newlyMaskedSpan("", "substring: ***\n")).toBeNull();
   });
 });
 
@@ -459,6 +504,27 @@ describe("the structured editor", () => {
     }
   });
 
+  test("an edit preserves the spec's file mode — a write never chmods the operator's file", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "mode");
+      const specPath = join(dir, "crewhaus.yaml");
+      // An operator who narrowed their spec on purpose.
+      chmodSync(specPath, 0o600);
+      const id = await register(t, dir);
+      const { status } = await t.api(
+        `/api/h/${id}/spec/patch`,
+        post({ edit: { path: "agent.instructions", value: "Be extremely brief." } }),
+      );
+      expect(status).toBe(200);
+      // The write is tmp+rename, and rename replaces the INODE: a hardcoded
+      // mode on the temp file silently becomes the spec's mode.
+      expect((statSync(specPath).mode & 0o777).toString(8)).toBe("600");
+    } finally {
+      await t.stop();
+    }
+  });
+
   test("a batch that would not validate leaves the spec byte-identical", async () => {
     const t = boot();
     try {
@@ -473,6 +539,193 @@ describe("the structured editor", () => {
       expect(body["ok"]).toBe(false);
       expect(body["code"]).toBe("edit_rejected");
       expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(before);
+    } finally {
+      await t.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// a capped read is a VIEW, never a source for a write
+// ---------------------------------------------------------------------------
+
+/** A VALID cli spec larger than the manager's 256 KiB read cap: one long
+ *  block scalar, and REAL configuration after it. The cap cuts inside the
+ *  block scalar, so the surviving head still parses and still validates —
+ *  which is exactly why writing that head back destroys the tail silently. */
+const OVER_CAP_SPEC = [
+  "name: spec-edit-fixture",
+  "target: cli",
+  "agent:",
+  "  model: anthropic/claude-sonnet-4",
+  "  instructions: |",
+  ...Array.from({ length: 12_000 }, (_, i) => `    line ${i} ${"x".repeat(24)}`),
+  "  max_tokens: 4096",
+  "permissions:",
+  "  mode: default",
+  "limits:",
+  "  max_tool_iterations: 5",
+  "",
+].join("\n");
+
+describe("a spec past the read cap", () => {
+  test("the fixture is genuinely over the cap, and its head genuinely still validates", async () => {
+    const bytes = Buffer.from(OVER_CAP_SPEC, "utf8");
+    expect(bytes.byteLength).toBeGreaterThan(256 * 1024);
+    const head = bytes.subarray(0, 256 * 1024).toString("utf8");
+    const { parseSpecIssues } = await import("@crewhaus/spec");
+    // Validation cannot save this: the truncated document is a legal spec.
+    // The refusal has to be explicit, or the loss is silent.
+    expect(parseSpecIssues(head)).toEqual([]);
+    expect(head).not.toContain("max_tool_iterations");
+  });
+
+  test("every write path REFUSES instead of renaming the head over the file", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "over-cap", OVER_CAP_SPEC);
+      const specPath = join(dir, "crewhaus.yaml");
+      const before = readFileSync(specPath, "utf8");
+      const id = await register(t, dir);
+      const edit = { path: "agent.max_tokens", value: 9000 };
+      const attempts: Array<[string, string, RequestInit]> = [
+        ["batch", `/api/h/${id}/spec`, put({ edits: [edit] })],
+        ["patch", `/api/h/${id}/spec/patch`, post({ edit })],
+        ["propose", `/api/h/${id}/spec/propose`, post({ edits: [edit] })],
+        [
+          "connector-write",
+          `/api/h/${id}/builders/mcp`,
+          post({ name: "files", command: "bunx", args: ["-y", "some-server"] }),
+        ],
+        [
+          "connector-remove",
+          `/api/h/${id}/builders/mcp/files?confirmName=spec-edit-fixture`,
+          { method: "DELETE" },
+        ],
+      ];
+      for (const [label, path, init] of attempts) {
+        const { status, body } = await t.api(path, init);
+        expect(`${label}:${status}`).toBe(`${label}:409`);
+        expect(`${label}:${String(body["error"])}`).toContain("could not read whole");
+      }
+      // Nothing written, and no proposal staged from a mutilated candidate.
+      expect(readFileSync(specPath, "utf8")).toBe(before);
+      expect(existsSync(join(dir, ".crewhaus", "proposals"))).toBe(false);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("the READS still render the head — and every one of them says it is a head", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "over-cap-reads", OVER_CAP_SPEC);
+      const id = await register(t, dir);
+      for (const path of [
+        `/api/h/${id}/spec/schema`,
+        `/api/h/${id}/spec/trust`,
+        `/api/h/${id}/builders/mcp`,
+      ]) {
+        const { status, body } = await t.api(path);
+        expect(`${path}:${status}:${body["truncated"]}`).toBe(`${path}:200:true`);
+      }
+      // The preview is a read too, so it renders — but it stops claiming the
+      // batch could be applied straight from the editor.
+      const diff = await t.api(
+        `/api/h/${id}/spec/diff`,
+        post({ edits: [{ path: "agent.max_tokens", value: 9000 }] }),
+      );
+      expect(diff.status).toBe(200);
+      expect(diff.body["truncated"]).toBe(true);
+      expect(diff.body["autoApplicable"]).toBe(false);
+    } finally {
+      await t.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// a security surface is human-owned even where the optimizer may tune it
+// ---------------------------------------------------------------------------
+
+/** A VALID cli spec declaring the three surfaces that `OPTIMIZABLE_PATHS`
+ *  and `SECURITY_SURFACES` both name. */
+const ONCHAIN_SPEC = [
+  "name: spec-edit-fixture",
+  "target: cli",
+  "agent:",
+  "  model: anthropic/claude-sonnet-4",
+  "  instructions: |",
+  "    You are a fixture. Answer briefly.",
+  "security:",
+  "  justification:",
+  "    judge: rule-based",
+  "chains:",
+  "  - id: mainnet",
+  "    kind: evm",
+  "    rpcUrls:",
+  "      - $RPC_URL",
+  "    finality:",
+  "      kind: finalized",
+  "transaction_policy:",
+  '  maxValueWei: "1000"',
+  "  simulationRequired: true",
+  "",
+].join("\n");
+
+describe("the security surfaces the optimizer may also tune", () => {
+  test("the badge and the write gate both say human-owned, and the confirmation still applies it", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "onchain", ONCHAIN_SPEC);
+      const specPath = join(dir, "crewhaus.yaml");
+      const before = readFileSync(specPath, "utf8");
+      const id = await register(t, dir);
+
+      const trust = await t.api(`/api/h/${id}/spec/trust`);
+      const rows = new Map(
+        (
+          trust.body["paths"] as Array<{ path: string; tier: string; securitySurface: boolean }>
+        ).map((row) => [row.path, row]),
+      );
+      for (const path of [
+        "transaction_policy",
+        "transaction_policy.maxValueWei",
+        "transaction_policy.simulationRequired",
+        "chains",
+        "security",
+        "security.justification",
+      ]) {
+        const row = rows.get(path);
+        expect(`${path}:${row?.tier}:${row?.securitySurface}`).toBe(`${path}:human-owned:true`);
+      }
+
+      // The value ceiling, the simulation switch, the RPC endpoint and the
+      // intent judge: each one refused without the typed confirmation.
+      for (const edit of [
+        { path: "transaction_policy.maxValueWei", value: "999999999999999999999" },
+        { path: "transaction_policy.simulationRequired", value: false },
+        { path: "chains.0.rpcUrls", value: ["https://rpc.invalid/v1"] },
+        { path: "security.justification.judge", value: "claude" },
+      ]) {
+        const { status, body } = await t.api(`/api/h/${id}/spec/patch`, post({ edit }));
+        expect(`${edit.path}:${status}`).toBe(`${edit.path}:409`);
+        expect(`${edit.path}:${String(body["error"])}`).toContain(edit.path);
+      }
+      expect(readFileSync(specPath, "utf8")).toBe(before);
+
+      // Human-owned is not read-only: the operator types the spec name and
+      // the same edit lands, unrestricted.
+      const confirmed = await t.api(
+        `/api/h/${id}/spec/patch`,
+        post({
+          edit: { path: "transaction_policy.simulationRequired", value: false },
+          confirmName: "spec-edit-fixture",
+        }),
+      );
+      expect(confirmed.status).toBe(200);
+      expect(confirmed.body["applied"]).toBe(1);
+      expect(readFileSync(specPath, "utf8")).toContain("simulationRequired: false");
     } finally {
       await t.stop();
     }
@@ -940,6 +1193,46 @@ describe("builders", () => {
     }
   });
 
+  test("graders: the pane is served MASKED, and saving that pane back is REFUSED", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "graders-mask");
+      const gradersPath = join(dir, "eval", "graders.yaml");
+      mkdirSync(join(dir, "eval"), { recursive: true });
+      // Built from parts: a realistic-looking literal must never be committed.
+      const literal = ["sk", "-", "live", "-", "A".repeat(24)].join("");
+      const stored = `graders:\n  - name: cites\n    type: contains\n    substring: ${literal}\n`;
+      writeFileSync(gradersPath, stored);
+      const id = await register(t, dir);
+
+      // What the console's editor pane is prefilled with.
+      const read = await t.api(`/api/h/${id}/builders/graders`);
+      const pane = String(read.body["yaml"]);
+      expect(pane).not.toContain(literal);
+      expect(pane).toContain("***");
+
+      // Clicking Save on that pane would rename the mask over what it hid.
+      const saved = await t.api(
+        `/api/h/${id}/builders/graders`,
+        post({ yaml: pane, confirmName: "spec-edit-fixture" }),
+      );
+      expect(saved.status).toBe(409);
+      expect(String(saved.body["error"])).toContain("masked span");
+      expect(readFileSync(gradersPath, "utf8")).toBe(stored);
+
+      // An edit that carries the real content through is still a normal save.
+      const real = `graders:\n  - name: cites\n    type: contains\n    substring: ${literal}\n  - name: brief\n    type: max_words\n`;
+      const ok = await t.api(
+        `/api/h/${id}/builders/graders`,
+        post({ yaml: real, confirmName: "spec-edit-fixture" }),
+      );
+      expect(ok.status).toBe(200);
+      expect(readFileSync(gradersPath, "utf8")).toContain(literal);
+    } finally {
+      await t.stop();
+    }
+  });
+
   test("the dataset builder refuses honestly instead of growing a second state machine", async () => {
     const t = boot();
     try {
@@ -1018,5 +1311,23 @@ describe("reads never mutate", () => {
     } finally {
       await t.stop();
     }
+  });
+});
+
+describe("the MCP connector form refuses a credential in an SSE url", () => {
+  // Masking a value that has ALREADY been written is not the same as
+  // refusing to write it: this url lands in the harness's committed
+  // crewhaus.yaml, where the read-side masker can no longer help the
+  // operator who pushed it.
+  test("userinfo, opaque path segments and key-ish query values are each refused", () => {
+    const key = ["kZ8b", "Qw3n", "Rt5v", "Xy7m", "Ab1c", "De4f", "Gh6j", "Kl9p"].join("");
+    expect(sseUrlCredential(`https://user:${key}@mcp.example.com/sse`)).toBe("userinfo");
+    expect(sseUrlCredential(`https://eth-mainnet.example.com/v2/${key}`)).toBe("a path segment");
+    expect(sseUrlCredential(`https://mcp.example.com/sse?apiKey=${key}`)).toBe(
+      'the "apiKey" query parameter',
+    );
+    // …and an ordinary endpoint is left alone.
+    expect(sseUrlCredential("https://mcp.example.com/sse")).toBeUndefined();
+    expect(sseUrlCredential("https://mcp.example.com/v2/events?mode=stream")).toBeUndefined();
   });
 });

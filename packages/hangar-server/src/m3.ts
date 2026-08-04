@@ -15,10 +15,18 @@
  *     matched its guard ({@link PARAM_GUARDS}, {@link SAFE_SEGMENT_RE}
  *     by default) BEFORE any filesystem work.
  *   - BODY — POST/PUT bodies are parsed and proven to be JSON objects.
- *   - MASKING — whatever a handler returns passes `maskDeep` on the way out.
- *     That is defense in depth, not permission: a handler that reads free
- *     text (a wiki body, a changelog, a captured log) still masks it itself,
- *     because `maskDeep`'s key-based redaction cannot see into prose.
+ *   - MASKING — whatever a handler returns passes `maskDeep` on the way out,
+ *     carrying the HARNESS'S OWN ENV SCRUBBER. Three layers, and each covers
+ *     a case the others cannot: key NAME (`botToken`), value SHAPE (`sk-…`),
+ *     and env VALUE — the credential this manager demonstrably holds, which
+ *     has neither a credential name nor a recognizable shape when it sits in
+ *     a `body`, a `note`, a `tags[]` entry or a line of prose. The scrubber
+ *     rides the dispatcher precisely so a handler cannot forget it; twenty
+ *     routes echoed that third case verbatim while every one of them was
+ *     already masked.
+ *     Still defense in depth, not permission: a handler that reads free text
+ *     (a wiki body, a changelog, a captured log) masks it itself too, because
+ *     key-based redaction cannot see into prose.
  *
  * ---------------------------------------------------------------------------
  * THE WRITE COVENANT — every M3 handler is bound by it

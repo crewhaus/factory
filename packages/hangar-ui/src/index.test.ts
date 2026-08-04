@@ -56,7 +56,6 @@ describe("embed map completeness", () => {
 
   test("every M3 area ships a view module (one per implementer area)", () => {
     const m3 = [
-      "/assets/js/pending.js",
       "/assets/js/views/spec-edit.js",
       "/assets/js/views/memory-fabric.js",
       "/assets/js/views/evals-lab.js",
@@ -191,6 +190,33 @@ describe("js module hygiene", () => {
         expect(hangarAssets[resolved]).toBeDefined();
       }
     }
+  });
+
+  test("no orphaned module is shipped (every js asset is reachable from the shell entry)", () => {
+    // R-20: `pending.js` — the stub-era "not built yet" screen — outlived its
+    // last importer and was still embedded, served over HTTP and compiled
+    // into the single-binary CLI, with a docblock telling readers that
+    // eleven live screens "have no data behind them yet". A dead module in a
+    // zero-build tree has nothing to catch it: the transpiler, the
+    // completeness check and the import-graph closure above all pass on code
+    // nobody imports. Reachability is the check that does not.
+    const entry = "/assets/js/app.js";
+    const importRe = /import\s+[^"']*?["']([^"']+)["']/g;
+    const seen = new Set<string>([entry]);
+    const queue = [entry];
+    while (queue.length > 0) {
+      const key = queue.pop() as string;
+      const body = hangarAssets[key]?.body ?? "";
+      const dir = key.slice(0, key.lastIndexOf("/"));
+      for (const match of body.matchAll(importRe)) {
+        const resolved = resolvePosix(dir, match[1] ?? "");
+        if (seen.has(resolved)) continue;
+        seen.add(resolved);
+        queue.push(resolved);
+      }
+    }
+    const orphans = jsEntries.map(([key]) => key).filter((key) => !seen.has(key));
+    expect(orphans).toEqual([]);
   });
 
   test("browser modules never import bun/node builtins", () => {

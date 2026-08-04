@@ -321,8 +321,24 @@ export function requirementsFor(
 
   // 2. Channels — the exact set the compiled daemon exits 2 on at boot.
   const lowered = loweredChannels(spec.doc);
+  // A field the spec never gave a usable value names NO variable, so it can
+  // never be a grid row — but "pinned inline in the spec" would be a lie
+  // about it, and silence would hide the reason the daemon cannot start. It
+  // carries preflight's own sentence, the same shape the ambient-provider
+  // notes use.
+  const unusable = new Map(lowered.missing.map((entry) => [entry.label, entry.message] as const));
   for (const platform of CHANNEL_ENV_PLATFORMS) {
     for (const entry of platformSecretRefs(platform, lowered.channels)) {
+      const absent = unusable.get(entry.label);
+      if (absent !== undefined) {
+        requirements.push({
+          group: [],
+          requiredBy: entry.label,
+          detail: maskText(absent),
+          informational: true,
+        });
+        continue;
+      }
       if (entry.ref.kind === "env") {
         requirements.push({
           group: [entry.ref.name],
@@ -708,8 +724,31 @@ function matrixRow(harness: M3Harness, baseEnv: Readonly<Record<string, string |
 export const credentialsMatrix: M3Handler = (ctx) => {
   const harnesses: Array<Record<string, unknown>> = [];
   const allKeys = new Map<string, { requiredBy: number; missing: number }>();
+  let unreadable = 0;
   for (const harness of ctx.harnesses()) {
-    const { spec, keys } = matrixRow(harness, ctx.env);
+    // A FOLD OVER THE FLEET DEGRADES PER ROW, NEVER AS A WHOLE. One harness
+    // whose spec cannot be read — an unfinished channels block, a torn file,
+    // a permission error — used to take this shared screen down for every
+    // other harness on the manager. The row says what happened; the fleet
+    // keeps its answer. The reason is masked: a parse failure can quote the
+    // document it choked on.
+    let row: { spec: HarnessSpec; keys: CredentialKey[] };
+    try {
+      row = matrixRow(harness, ctx.env);
+    } catch (err) {
+      unreadable += 1;
+      harnesses.push({
+        id: harness.id,
+        specName: harness.specName,
+        cells: [],
+        missing: 0,
+        unreadable: maskText(
+          err instanceof Error ? err.message : "its credential requirements could not be derived",
+        ),
+      });
+      continue;
+    }
+    const { spec, keys } = row;
     for (const key of keys) {
       const tally = allKeys.get(key.name) ?? { requiredBy: 0, missing: 0 };
       tally.requiredBy += 1;
@@ -721,6 +760,7 @@ export const credentialsMatrix: M3Handler = (ctx) => {
       specName: spec.specName,
       cells: keys.map((key) => ({ name: key.name, state: key.state, source: key.source })),
       missing: keys.filter((key) => key.state === "missing").length,
+      unreadable: null,
     });
   }
   const keys = [...allKeys.entries()]
@@ -729,10 +769,15 @@ export const credentialsMatrix: M3Handler = (ctx) => {
   return {
     ...m3Base(
       harnesses.length > 0,
-      harnesses.length === 0 ? "no harnesses are registered with this manager yet" : null,
+      harnesses.length === 0
+        ? "no harnesses are registered with this manager yet"
+        : unreadable > 0
+          ? `${unreadable} harness${unreadable === 1 ? "" : "es"} could not be read — those rows say why, and the rest of the fleet is unaffected`
+          : null,
       "crewhaus hangar add <dir>",
     ),
     harnesses,
+    unreadable,
     keys,
     /** A live fold, computed for this request — not a cached figure. */
     asOf: new Date(ctx.now()).toISOString(),

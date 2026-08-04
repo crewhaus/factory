@@ -13,16 +13,18 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startHangarServer } from "@crewhaus/hangar-server";
+import { type HangarServer, startHangarServer } from "@crewhaus/hangar-server";
 import {
   HANGAR_LOCK_FILENAME,
   type HangarLock,
+  type RunningJob,
   acquireHangarLock,
   defaultIsPidAlive,
   readHangarLock,
   releaseHangarLock,
   resolveHangarRoot,
   runHangarCommand,
+  shutdownNotices,
   writeHangarLock,
 } from "./hangar-cmd";
 
@@ -358,6 +360,91 @@ describe("hangar serve --smoke", () => {
     expect(readFileSync(join(ws.hangarRoot, "token"), "utf8").trim().length).toBeGreaterThan(0);
     expect(existsSync(join(ws.hangarRoot, HANGAR_LOCK_FILENAME))).toBe(false);
   }, 120_000);
+});
+
+// ---------------------------------------------------------------------------
+// serve shutdown — the exit path, driven with a FAKE supervised child
+// ---------------------------------------------------------------------------
+
+/** A `HangarServer` that binds nothing: enough surface for `serve` to boot,
+ *  print its summary and shut down, with a controllable job queue. */
+function fakeServer(running: readonly RunningJob[], stops: string[]): HangarServer {
+  return {
+    url: "http://127.0.0.1:4321",
+    port: 4321,
+    hostname: "127.0.0.1",
+    hangarRoot: "/nonexistent/hangar",
+    registryPath: "/nonexistent/harnesses.json",
+    token: "fake-token",
+    tokenPath: "/nonexistent/token",
+    bootPath: "/boot/fake-nonce",
+    noAuth: false,
+    idleTimeoutSeconds: 120,
+    processes: {
+      jobs: { running: () => running },
+    } as unknown as HangarServer["processes"],
+    ready: Promise.resolve({ adopted: 0, lost: 0, jobs: 0 }),
+    stop: async () => {
+      stops.push("stop");
+    },
+  } as unknown as HangarServer;
+}
+
+/** Resolve once `serve` has installed its signal handlers. */
+async function awaitSignalWait(baseline: number): Promise<void> {
+  for (let i = 0; i < 500; i += 1) {
+    if (process.listenerCount("SIGTERM") > baseline) return;
+    await Bun.sleep(2);
+  }
+  throw new Error("serve never installed its SIGTERM handler");
+}
+
+describe("hangar serve shutdown", () => {
+  test("shutdownNotices names the work being left behind, and says nothing when there is none", () => {
+    expect(shutdownNotices([])).toEqual([]);
+    const notices = shutdownNotices([
+      { jobId: "job_a", kind: "dev", harnessDir: "/h/one" },
+      { jobId: "job_b", kind: "compile", harnessDir: "/h/two" },
+    ]);
+    expect(notices.join("\n")).toContain("2 job(s) still running (compile, dev)");
+    expect(notices.join("\n")).toContain("interrupted");
+  });
+
+  test("SIGTERM with a live supervised child stops, releases the lock, and EXITS", async () => {
+    const ws = newWorkspace();
+    const lines: string[] = [];
+    const stops: string[] = [];
+    const exits: number[] = [];
+    const baseline = process.listenerCount("SIGTERM");
+    const baselineSigint = process.listenerCount("SIGINT");
+    const child: RunningJob = { jobId: "job_dev", kind: "dev", harnessDir: join(ws.root, "h") };
+
+    const run = runHangarCommand(["serve", "--no-open"], {
+      env: ws.env,
+      pid: 4242,
+      isPidAlive: () => false,
+      write: (line) => lines.push(line),
+      startServer: () => fakeServer([child], stops),
+      exit: (code) => exits.push(code),
+    });
+    await awaitSignalWait(baseline);
+    expect(existsSync(join(ws.hangarRoot, HANGAR_LOCK_FILENAME))).toBe(true);
+
+    process.emit("SIGTERM");
+    const out = await run;
+
+    expect(out.exitCode).toBe(0);
+    expect(stops).toEqual(["stop"]);
+    // The lock is gone AND the process was told to exit — releasing the lock
+    // without exiting is exactly the orphaned-manager failure (F-6).
+    expect(existsSync(join(ws.hangarRoot, HANGAR_LOCK_FILENAME))).toBe(false);
+    expect(exits).toEqual([0]);
+    expect(lines.join("\n")).toContain("hangar: shutting down…");
+    expect(lines.join("\n")).toContain("1 job(s) still running (dev)");
+    // Both signal handlers are gone: nothing of this run is left installed.
+    expect(process.listenerCount("SIGTERM")).toBe(baseline);
+    expect(process.listenerCount("SIGINT")).toBe(baselineSigint);
+  });
 });
 
 describe("lock contention (exclusive create)", () => {

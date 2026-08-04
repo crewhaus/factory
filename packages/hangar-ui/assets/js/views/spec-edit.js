@@ -1,8 +1,17 @@
 /**
- * Spec — the M3 half of the Spec tab: the structured (form ⇄ YAML) editor,
- * trust-tier badges, version history with pins and diffs, and the four
- * builders (new-spec wizard, grader builder, dataset builder, MCP
- * connectors).
+ * Spec — the M3 half of the Spec tab: the field editor, trust-tier badges,
+ * version history with pins and diffs, and the four builders (new-spec
+ * wizard, grader builder, dataset builder, MCP connectors).
+ *
+ * The field editor is honest about its two halves. A SCALAR leaf edits
+ * inline. Everything else — a block, a list, a field inside a list item, or
+ * a block this spec does not declare at all — edits through the JSON pane,
+ * which sends ONE edit (`path` + `value`) down the same `specDiff` →
+ * `specEdit` road every other write here takes, so the server's trust tiers
+ * and typed confirmation still decide what may land. There is no YAML
+ * editor in this console and this screen never says there is: the console is
+ * zero-build and dependency-free, so it has no YAML parser to be honest
+ * with.
  *
  * The M1 read (`views/spec.js`: YAML, issues, env-ref presence, badges)
  * stays where it is and is rendered above this.
@@ -295,15 +304,29 @@ function renderValue(value) {
  *     restriction the optimizer runs under, enforced server-side);
  *   human-owned  → "Review & apply", which fetches the redacted diff FIRST
  *     and only then offers the typed confirmation, plus "Propose" for the
- *     review-PR path.
+ *     review-PR path;
+ *   a block or a list → the JSON pane, which takes the same diff → tier →
+ *     confirm road with the whole value as one edit.
  */
 function trustCard(ctx, trust, valueByPath, reload) {
   const rows = Array.isArray(trust.paths) ? trust.paths : [];
+  // Rows are what the spec DECLARES; the pane is how anything else is
+  // reached, so it belongs on the empty screen too — a spec with no rows is
+  // exactly the one an operator needs to add a block to.
+  const addBlock = el("button", { class: "btn", type: "button", text: "Edit any path…" });
+  addBlock.addEventListener("click", () => {
+    valueDialog(ctx, { path: "", value: undefined, pathEditable: true, reload });
+  });
+  const addForm = (lead) =>
+    el("div", { class: "add-form" }, [el("p", { class: "muted grow", text: lead }), addBlock]);
   if (rows.length === 0) {
     return card("Fields & trust tiers", dot("off", "no fields"), [
       emptyState(
         typeof trust.note === "string" ? trust.note : "This spec declares no editable fields",
         typeof trust.verb === "string" ? trust.verb : "crewhaus init",
+      ),
+      addForm(
+        "A path this spec has not declared is still reachable — the server applies it with the same diff, tier and typed confirmation.",
       ),
     ]);
   }
@@ -321,7 +344,7 @@ function trustCard(ctx, trust, valueByPath, reload) {
           ? row.tier === "auto-tunable"
             ? autoTunableEditor(ctx, path, current, reload)
             : humanOwnedActions(ctx, path, current, confirmName, reload)
-          : el("span", { class: "muted", text: "edit as YAML" }),
+          : jsonPaneButton(ctx, path, current, reload),
       ]),
     ]);
   });
@@ -337,6 +360,9 @@ function trustCard(ctx, trust, valueByPath, reload) {
         text: "Auto-tunable fields are the ones the optimizer may write, so the console may write them too. Everything else needs a review of the diff and a typed confirmation — the server enforces the same split.",
       }),
       table(["Path", "Tier", "Why", ""], body),
+      addForm(
+        "Rows list what this spec DECLARES. A block it has never declared, or a field inside a list item, is reachable by path — same diff, same tier, same typed confirmation.",
+      ),
     ],
   );
 }
@@ -373,6 +399,216 @@ function coerce(text, current) {
   }
   if (typeof current === "boolean") return text === "true";
   return text;
+}
+
+// ---------------------------------------------------------------------------
+// the JSON pane — blocks, lists, and paths this spec has not declared
+// ---------------------------------------------------------------------------
+
+/**
+ * A dotted path as the segment array the server's edit parser takes.
+ *
+ * A segment that is a non-negative integer becomes a NUMBER, because that is
+ * the difference between `candidates.0.id` addressing the first list item
+ * and addressing a mapping key called "0". Pure, so the rule is testable.
+ */
+export function editPath(dotted) {
+  return String(dotted ?? "")
+    .split(".")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment !== "")
+    .map((segment) => (/^(?:0|[1-9][0-9]*)$/.test(segment) ? Number(segment) : segment));
+}
+
+/**
+ * Parse the pane's text into the value to write. Empty text is DELETE (the
+ * server treats an edit with no `value` as one), which is how a block is
+ * removed; anything else must be JSON — a subset of the YAML the spec is
+ * written in, and the only structured format this dependency-free console
+ * can parse without guessing.
+ */
+export function parseJsonValue(text) {
+  const raw = String(text ?? "").trim();
+  if (raw === "") return { ok: true, remove: true };
+  try {
+    return { ok: true, remove: false, value: JSON.parse(raw) };
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** The one-edit batch a path + pane produce — or a refusal carrying the
+ *  sentence to render, because "nothing happened" is not an answer. */
+export function editsFor(path, text) {
+  const segments = editPath(path);
+  if (segments.length === 0) return { ok: false, message: "a path is required" };
+  const parsed = parseJsonValue(text);
+  if (!parsed.ok) return { ok: false, message: `that is not valid JSON: ${parsed.message}` };
+  // No `value` key at all ⇒ the server deletes the path. `value: undefined`
+  // would not survive JSON.stringify, so the key is omitted deliberately.
+  return {
+    ok: true,
+    edits: [parsed.remove ? { path: segments } : { path: segments, value: parsed.value }],
+    removing: parsed.remove === true,
+  };
+}
+
+/** The row control for a path the inline editor cannot type: a container, or
+ *  a declared path with no effective value to seed an input from. */
+function jsonPaneButton(ctx, path, current, reload) {
+  const open = el("button", { class: "btn btn-ghost", type: "button", text: "Edit as JSON…" });
+  open.addEventListener("click", () => {
+    valueDialog(ctx, { path, value: current, pathEditable: false, reload });
+  });
+  return open;
+}
+
+/**
+ * The pane. It writes NOTHING on its own: Preview asks `specDiff` what would
+ * change and which tier the batch lands in, and only the answer decides what
+ * the operator is offered — a plain Apply for an auto-tunable path (the
+ * optimizer's own surface), or the typed confirmation for a human-owned one.
+ * Both roads end at the same `specEdit` PUT, so the server remains the gate
+ * and this screen stays the explanation.
+ */
+function valueDialog(ctx, { path, value, pathEditable, reload }) {
+  let backdrop = null;
+  const pathInput = el("input", {
+    class: "input grow",
+    type: "text",
+    value: path,
+    placeholder: "agent.model_pool.candidates.0.id",
+    "aria-label": "spec path — dotted, and a number is a list index",
+  });
+  const editor = el("textarea", {
+    class: "input notes",
+    rows: 12,
+    spellcheck: "false",
+    "aria-label": "value as JSON",
+  });
+  editor.value = value === undefined ? "" : JSON.stringify(value, null, 2);
+  const out = el("div", { class: "modal-body" });
+
+  const preview = el("button", { class: "btn btn-primary", type: "button", text: "Preview diff" });
+  preview.addEventListener("click", async () => {
+    const target = pathInput.value.trim();
+    const batch = editsFor(target, editor.value);
+    clear(out);
+    if (!batch.ok) {
+      out.appendChild(el("p", { class: "reason", text: batch.message }));
+      return;
+    }
+    const res = await api.specDiff({ id: ctx.id }, { edits: batch.edits });
+    clear(out);
+    if (!res.ok) {
+      out.appendChild(el("p", { class: "reason", text: res.body?.error ?? `HTTP ${res.status}` }));
+      return;
+    }
+    const body = res.body ?? {};
+    if (body.ok === false) {
+      out.appendChild(
+        el("p", {
+          class: "reason",
+          text: `${body.code ?? "refused"}: ${body.reason ?? "this edit does not apply"}`,
+        }),
+      );
+      return;
+    }
+    if (batch.removing) {
+      out.appendChild(
+        el("p", { class: "muted", text: `an empty pane DELETES ${target} from the spec` }),
+      );
+    }
+    out.appendChild(pre(String(body.diff ?? "")));
+    const apply = async (extra) => {
+      const wrote = await api.specEdit({ id: ctx.id }, { edits: batch.edits, ...extra });
+      if (reportWrite(wrote, `Applied ${target}`)) {
+        if (backdrop !== null) backdrop.remove();
+        reload();
+      }
+    };
+    if (body.autoApplicable === true) {
+      const go = el("button", { class: "btn btn-primary", type: "button", text: "Apply" });
+      go.addEventListener("click", () => {
+        void apply({});
+      });
+      out.appendChild(
+        el("p", {
+          class: "muted",
+          text: "every path in this edit is auto-tunable — the surface the optimizer already writes.",
+        }),
+      );
+      out.appendChild(el("div", { class: "modal-actions" }, [go]));
+      return;
+    }
+    const confirmName = String(body.confirmName ?? "");
+    const typed = el("input", {
+      class: "input",
+      type: "text",
+      placeholder: confirmName,
+      "aria-label": `type ${confirmName} to confirm`,
+    });
+    const go = el("button", {
+      class: "btn btn-danger",
+      type: "button",
+      text: "Apply to the live spec",
+      disabled: true,
+    });
+    typed.addEventListener("input", () => {
+      go.disabled = typed.value.trim() !== confirmName;
+    });
+    go.addEventListener("click", () => {
+      void apply({ confirmName });
+    });
+    // The same batch, sent for review instead — the road the scalar rows
+    // offer, and the reason this pane can name it without lying.
+    const propose = el("button", { class: "btn btn-ghost", type: "button", text: "Propose" });
+    propose.addEventListener("click", async () => {
+      const staged = await api.specPropose(
+        { id: ctx.id },
+        { edits: batch.edits, title: `hangar: ${target}` },
+      );
+      if (
+        reportWrite(
+          staged,
+          "Proposal staged — the review bundle is a dry run until you open the PR",
+        )
+      ) {
+        if (backdrop !== null) backdrop.remove();
+        reload();
+      }
+    });
+    out.appendChild(
+      el("p", {
+        class: "muted",
+        text: "This batch touches a human-owned path, so the server asks for the spec's name in writing — or send the same edit for review instead.",
+      }),
+    );
+    out.appendChild(
+      el("label", { class: "field" }, [
+        el("span", { text: `Type ${confirmName} to confirm` }),
+        typed,
+      ]),
+    );
+    out.appendChild(el("div", { class: "modal-actions" }, [go, propose]));
+  });
+
+  backdrop = viewModal(pathEditable ? "Edit a spec path" : `Edit ${path}`, [
+    pathEditable
+      ? el("label", { class: "field grow" }, [
+          el("span", { text: "Path (dotted; a number is a list index)" }),
+          pathInput,
+        ])
+      : el("p", { class: "muted mono", text: path }),
+    el("p", {
+      class: "muted",
+      text: "The value is JSON. An empty pane deletes the path. Nothing is written until the diff below has been read.",
+    }),
+    editor,
+    el("div", { class: "modal-actions" }, [preview]),
+    out,
+  ]);
+  return backdrop;
 }
 
 /** "Review & apply" (diff → typed confirm) and "Propose" for a human-owned

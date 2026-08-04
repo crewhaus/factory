@@ -22,6 +22,14 @@
  * except `settings.json`, which is human-owned configuration and therefore
  * carries the same redacted diff plus typed confirmation the spec's
  * human-owned paths do.
+ *
+ * And one rule sits above that editor: every document on this screen arrives
+ * MASKED. A masked read is a view, never a source for a write — replaying it
+ * would persist `[redacted]` over the operator's real env values and `***`
+ * over a hook command's token. So a settings document carrying a mask marker
+ * makes the editor read-only and says which file to edit instead. Refusing
+ * to write is the only honest answer available to a screen that was never
+ * shown what it would be overwriting.
  */
 
 import { api } from "../api.js";
@@ -43,6 +51,47 @@ import { fmtCount, fmtRelativeTime } from "../util.js";
 /** The store opened when the screen first paints — the one that answers
  *  "what is this agent allowed to do", which is what people come here for. */
 const DEFAULT_STORE = "settings";
+
+/**
+ * What the server's redaction leaves behind: `[redacted]` for a value under
+ * a credential-named key (`env`, `headers`, `*Token`, …) and `***` for a
+ * token-shaped span inside free text (a hook command, say). Either one in a
+ * document means the console was NOT shown what is on disk.
+ */
+const MASK_MARKS = ["[redacted]", "***"];
+
+/**
+ * Whether a served document may be written back, and why not when it may
+ * not. Pure — the decision is unit-tested rather than clicked at.
+ *
+ * The check is textual on purpose: it runs over the serialized document, so
+ * it catches a marker at any depth, in a key or a value, in a document this
+ * screen has no schema for. A false positive (a settings.json that really
+ * does contain `***`) costs one refusal that names the file to edit; a false
+ * negative costs the operator their real credentials, silently, behind a
+ * success toast.
+ */
+export function settingsWriteGuard(document, path) {
+  let serialized;
+  try {
+    serialized = JSON.stringify(document ?? {});
+  } catch {
+    // A document that will not serialize cannot be written back either.
+    return {
+      blocked: true,
+      marks: [],
+      reason: "this document could not be serialized, so the console cannot write it back",
+    };
+  }
+  const marks = MASK_MARKS.filter((mark) => serialized.includes(mark));
+  if (marks.length === 0) return { blocked: false, marks: [], reason: null };
+  const file = typeof path === "string" && path !== "" ? path : ".crewhaus/settings.json";
+  return {
+    blocked: true,
+    marks,
+    reason: `this document was served masked (${marks.join(" and ")}) — the manager redacts credential-named keys and token-shaped spans before they leave the server, so saving it from here would write the mask over the real values. Edit ${file} on the harness host instead; \`crewhaus permissions suggest\` writes the permission half.`,
+  };
+}
 
 export async function renderInspect(root, ctx) {
   clear(root).appendChild(skeleton(6));
@@ -393,6 +442,12 @@ function identityCard(doc) {
  * diff), then a typed confirmation the SERVER verifies. Nothing here
  * auto-tunes, and nothing merges — the editor holds the whole next document,
  * so what an operator confirmed is exactly what lands.
+ *
+ * Which is exactly why a MASKED document cannot be edited here: "what an
+ * operator confirmed is what lands" would then mean landing `[redacted]` on
+ * top of a real value. {@link settingsWriteGuard} makes that document
+ * read-only and names the file to edit instead — and the guard runs again on
+ * the way out, so text pasted in from the raw view cannot slip past it.
  */
 function settingsPanel(ctx, view, reload) {
   const summary = view.summary && typeof view.summary === "object" ? view.summary : {};
@@ -428,8 +483,13 @@ function settingsPanel(ctx, view, reload) {
     );
   }
 
+  const guard = settingsWriteGuard(view.document, String(view.path ?? ""));
   const editor = el("textarea", { class: "notes", rows: "14", spellcheck: "false" });
   editor.value = source;
+  if (guard.blocked) {
+    editor.readOnly = true;
+    editor.setAttribute("aria-readonly", "true");
+  }
   const diffHost = el("div");
   const confirm = el("input", {
     class: "token-input",
@@ -437,6 +497,7 @@ function settingsPanel(ctx, view, reload) {
     placeholder: "type the spec name to confirm",
     "aria-label": "typed confirmation",
   });
+  confirm.disabled = guard.blocked;
 
   const parsed = () => {
     try {
@@ -447,6 +508,7 @@ function settingsPanel(ctx, view, reload) {
   };
 
   const previewBtn = el("button", { class: "btn", type: "button", text: "Preview changes" });
+  previewBtn.disabled = guard.blocked;
   previewBtn.addEventListener("click", async () => {
     const next = parsed();
     if (!next.ok) {
@@ -483,10 +545,18 @@ function settingsPanel(ctx, view, reload) {
   });
 
   const applyBtn = el("button", { class: "btn btn-danger", type: "button", text: "Apply" });
+  applyBtn.disabled = guard.blocked;
   applyBtn.addEventListener("click", async () => {
     const next = parsed();
     if (!next.ok) {
       toast(`That is not valid JSON: ${next.message}`);
+      return;
+    }
+    // The document in the box, not the one that was served: a mask marker
+    // pasted in from the raw view would destroy just as much.
+    const outgoing = settingsWriteGuard(next.value, String(view.path ?? ""));
+    if (outgoing.blocked) {
+      toast(outgoing.reason);
       return;
     }
     const res = await api.settingsWrite(
@@ -510,13 +580,21 @@ function settingsPanel(ctx, view, reload) {
     collapsible(
       [
         el("span", { class: "muted", text: "edit settings.json" }),
-        el("span", { class: "chip chip-warn", text: "human-owned" }),
+        el("span", {
+          class: "chip chip-warn",
+          text: guard.blocked ? "read-only here" : "human-owned",
+        }),
       ],
       [
-        el("p", {
-          class: "muted",
-          text: "These rules decide what the agent may do. Preview shows a credential-redacted diff; applying needs the harness's spec name typed in, and the server checks it.",
-        }),
+        guard.blocked
+          ? el("div", { class: "gated" }, [
+              dot("warn", "read-only here"),
+              el("span", { class: "muted gated-why", text: guard.reason }),
+            ])
+          : el("p", {
+              class: "muted",
+              text: "These rules decide what the agent may do. Preview shows a credential-redacted diff; applying needs the harness's spec name typed in, and the server checks it.",
+            }),
         editor,
         el("div", { class: "editor-actions" }, [previewBtn, confirm, applyBtn]),
         diffHost,

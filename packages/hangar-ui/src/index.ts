@@ -28,7 +28,6 @@ import apiJs from "../assets/js/api.js" with { type: "text" };
 import appJs from "../assets/js/app.js" with { type: "text" };
 import domJs from "../assets/js/dom.js" with { type: "text" };
 import markdownJs from "../assets/js/markdown.js" with { type: "text" };
-import pendingJs from "../assets/js/pending.js" with { type: "text" };
 import routerJs from "../assets/js/router.js" with { type: "text" };
 import routesJs from "../assets/js/routes.js" with { type: "text" };
 import shapesJs from "../assets/js/shapes.js" with { type: "text" };
@@ -106,7 +105,6 @@ export const hangarAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/api.js": asset(apiJs, "api.js"),
   "/assets/js/dom.js": asset(domJs, "dom.js"),
   "/assets/js/markdown.js": asset(markdownJs, "markdown.js"),
-  "/assets/js/pending.js": asset(pendingJs, "pending.js"),
   "/assets/js/router.js": asset(routerJs, "router.js"),
   "/assets/js/routes.js": asset(routesJs, "routes.js"),
   "/assets/js/shapes.js": asset(shapesJs, "shapes.js"),

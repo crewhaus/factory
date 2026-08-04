@@ -9,7 +9,10 @@ M1 was read-only over harness state. **M2 makes the console a driver**: it
 starts, stops, restarts and drains supervised harnesses, watches a run live,
 pokes scheduler lanes through `crewhaus.control.v1`, and settles parked
 approvals and review items — and every one of those actions shows the exact
-CLI command it runs.
+CLI command it runs. **M3 adds the detail surface**: eight more harness tabs
+and three more fleet screens over a 178-route contract, covering the spec's
+write side, the memory fabric's write side, the eval/dataset/feedback loops,
+credentials + channels + security, Thredz, and the raw inspectors.
 
 ## Zero-build by design
 
@@ -50,9 +53,13 @@ server's static-asset option; a server route for `path` responds with
   default). The live run feed is hand-rolled over `fetch` for the same
   reason `EventSource` cannot be used: it carries no bearer header.
 - **Hash router, deep-linkable** — `#/` (Library), the fleet screens
-  `#/{runs, approvals, review, activity}`, `#/h/<id>` (Overview), and
-  `#/h/<id>/{spec, runs[/<runId>], schedulers, sessions[/<sess>],
-  evals[/<runId>[/<sampleId>]], memory[/wiki/<slug>], costs, deploy}`.
+  `#/{runs, approvals, review, activity, credentials, feedback, thredz}`,
+  `#/h/<id>` (Overview), and `#/h/<id>/{spec, runs[/<runId>], schedulers,
+  sessions[/<sess>], evals[/<runId>[/<sampleId>]], memory[/wiki/<slug>],
+  data, feedback, costs, creds, channels, security, thredz, deploy, inspect,
+  dev}`. The eight M3 tabs capture their trailing segments GENERICALLY
+  (`M3_TABS` → a `rest` array), so a sub-screen inside one of them never
+  needs a new `parseRoute` case.
 - **Library** — dense sortable table (name + dir tail, shape badge, model,
   supervision state + parked-approval count, eval health dot + text,
   sessions, spend 7d, capability badges, group chips); a sub-rail of stored
@@ -103,6 +110,48 @@ server's static-asset option; a server route for `path` responds with
   re-pin, dream "Run now" (through the job queue), plus the supervision
   pill, bundle-freshness badge and control availability on the detail
   header, where a plan that cannot be built renders its remedy as a button.
+
+### M3 — the detail surface
+
+Eleven new view modules (`views/{spec-edit, memory-fabric, evals-lab, data,
+feedback, creds, channels, security, thredz, inspect, runtime}.js`) draw
+eight new harness tabs and three new fleet screens:
+
+- **Spec** (`#/h/<id>/spec`) gains the write side — the trust-tier table
+  (auto-tunable rows edit inline; human-owned rows demand the typed spec-name
+  confirm or route to `crewhaus propose`), the diff interstitial, version
+  history with pin/rollback, and the builders (templates, graders, dataset,
+  MCP connectors).
+- **Memory** (`#/h/<id>/memory`) gains the fabric's write side — facts with
+  forget/sweep (tombstones, never a delete), continuity trash + restore, the
+  wiki editor with `expectedVersion` and its stale retry, watch-me analytics,
+  reports, intents and the synthesize review.
+- **Datasets** (`#/h/<id>/data`), **Feedback** (`#/h/<id>/feedback`) and the
+  eval lab inside **Evals** cover the quality loops: registry + hygiene +
+  growth, the fewshot/faq/lessons/advice feeds, and the matrix / trends /
+  judge / graders / coverage / sentinel screens.
+- **Credentials**, **Channels** and **Security** (`#/h/<id>/{creds,channels,
+  security}`) show env-key PRESENCE (never a value), the channel doctor and
+  provisioning, and the egress / PII / compliance / on-chain / retention
+  panels.
+- **Thredz** (`#/h/<id>/thredz`) is proxied server-side — the workspace key
+  never reaches the browser.
+- **Inspect** (`#/h/<id>/inspect`) is the raw store browser, and **Dev & MCP**
+  (`#/h/<id>/dev`) drives the dev server and the MCP servers.
+- Fleet-wide: **Credentials** (`#/credentials`, the provider × harness
+  matrix), **Feedback** (`#/feedback`) and **Thredz** (`#/thredz`).
+
+Two conventions make that surface cheap to extend:
+
+1. **The client wrappers are GENERATED.** `routes.js` carries all 178 M3
+   routes as pure data tagged with a `group`, and `api.js` builds one wrapper
+   per key from the map rather than hand-writing them. A hand-written name
+   WINS a collision, so an M1/M2 verb keeps its bespoke wrapper.
+2. **Every M3 read answers `{present, note, verb, …}`** — is there anything
+   to show, why is it empty, and which CLI verb creates it. Most of this
+   surface is normally empty on a given harness, so the views render that
+   triple directly through `emptyState(message, verb)`; an empty panel is
+   never indistinguishable from a broken one.
 
 ### UX invariants
 
@@ -162,6 +211,13 @@ verbs: `POST /api/h/:id/proc/{start,stop,restart,drain}`,
 `POST /api/h/:id/review/:itemId`, `POST /api/h/:id/jobs`,
 `POST /api/h/:id/sessions/:sess/pin`, `POST /api/h/:id/evals/baseline`.
 
+M3 adds 178 more, grouped `spec | memory | evals | data | feedback | creds |
+channels | security | thredz | inspect | runtime` — enumerated in
+`assets/js/routes.js` and mirrored route-for-route by the server's
+`M3_ROUTES`, which the contract test asserts is the same set (key, method and
+path). They are not re-listed here: the map is the inventory, and a README
+copy of it would be the thing that goes stale.
+
 All payload readers are tolerant: unknown fields are ignored, missing
 fields degrade to "—", and unknown transcript/trace kinds still render. A
 failed write is never silent — non-2xx surfaces as a toast, and a zero-root
@@ -190,3 +246,10 @@ The M2 screens stay testable without a browser by keeping the decisions —
 state → row, envelope → disabled-with-reason, SSE frame → feed item,
 refusal → modal model, keystroke → next state — as pure functions in
 `supervision.js`; `views/*.js` are thin DOM builders over them.
+
+The M3 suites follow the same shape: `routes.test.ts` pins the route map's
+grammar, `api.test.ts` drives every generated M3 wrapper against it under a
+stubbed `fetch`, and `creds-views.test.ts` / `memory-fabric.test.ts` unit-test
+the pure decisions those tabs make. The embed-map suite additionally asserts
+that no module is ORPHANED — reachable from `app.js`'s import graph — so a
+view that loses its last importer cannot keep shipping to the browser.

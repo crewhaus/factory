@@ -24,6 +24,7 @@ import {
   compareVersions,
   createFileBackedRegistry,
   latestVersion,
+  overallDatasetHash,
   verifySplitHashes,
 } from "./index";
 
@@ -515,6 +516,41 @@ describe("dataset-registry — NEW-registry-1 verifySplitHashes", () => {
     expect(mismatches.length).toBe(1);
     expect(mismatches[0]?.sampleId).toBe("smuggled");
     expect(mismatches[0]?.storedHash).toBeUndefined();
+  });
+
+  /**
+   * The record this function exists to catch is the HAND-WRITTEN one — and a
+   * hand-written `<version>.json` is exactly the file that may carry no
+   * `sampleHashes` (or no `splits`) at all. The guard covered the inner index
+   * only, so the outer dereference threw: one such file took down every
+   * caller that verifies a whole registry.
+   */
+  test("a hand-written record with no sampleHashes verifies instead of throwing", async () => {
+    mkdirSync(join(tmpRoot, "handwritten"), { recursive: true });
+    writeFileSync(
+      join(tmpRoot, "handwritten", "v1.json"),
+      JSON.stringify({
+        name: "handwritten",
+        version: "v1",
+        splits: { train: [sample("a", "x")], dev: [] },
+        createdAt: new Date(0).toISOString(),
+      }),
+    );
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    const record = await reg.getRecord("handwritten", "v1");
+    // Every sample is a mismatch — there is no stored identity to match — and
+    // that is the honest answer, not a crash.
+    const mismatches = verifySplitHashes(record);
+    expect(mismatches).toHaveLength(1);
+    expect(mismatches[0]?.split).toBe("train");
+    expect(mismatches[0]?.storedHash).toBeUndefined();
+    expect(mismatches[0]?.actualHash).toBeDefined();
+  });
+
+  test("a record with neither splits nor sampleHashes verifies clean and hashes empty", () => {
+    const bare = { name: "bare", version: "v1", createdAt: "" };
+    expect(verifySplitHashes(bare as never)).toEqual([]);
+    expect(() => overallDatasetHash(bare as never, ["train", "dev"])).not.toThrow();
   });
 });
 

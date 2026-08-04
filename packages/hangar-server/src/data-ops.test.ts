@@ -232,6 +232,54 @@ describe("the registry panel", () => {
     expect(body["present"]).toBe(false);
     expect(body["versions"]).toEqual([]);
   });
+
+  /**
+   * The verifier's whole purpose is the HAND-WRITTEN record — and a
+   * hand-written `<version>.json` is exactly the file that may carry no
+   * `sampleHashes` (or no `splits`) at all. The guard covered the inner index
+   * only, so the outer dereference threw and one such file 500'd the whole
+   * registry panel, taking every well-formed dataset down with it.
+   */
+  test("a record written by hand, without sampleHashes, lists as tampered", async () => {
+    const t = boot();
+    const dir = dataHarness(t);
+    writeJson(dir, [".crewhaus", "datasets", "byhand", "v1.json"], {
+      name: "byhand",
+      version: "v1",
+      splits: { train: [sample("h1", "human")], dev: [] },
+      createdAt: iso(NOW - DAY),
+    });
+    // A record with no `splits` either — the emptiest thing an operator can
+    // leave behind that still parses as JSON.
+    writeJson(dir, [".crewhaus", "datasets", "bare", "v1.json"], {
+      name: "bare",
+      version: "v1",
+      createdAt: iso(NOW - DAY),
+    });
+    const id = await register(t, dir);
+
+    const list = await t.api(`/api/h/${id}/data/datasets`);
+    expect(list.status).toBe(200);
+    const rows = list.body["datasets"] as Array<{
+      name: string;
+      verify: { ok: boolean; badge: string; mismatches: number } | null;
+      splits: { train: number; dev: number; test: number | null } | null;
+    }>;
+    // The well-formed datasets are still there — the bad file did not take
+    // the panel with it.
+    expect(rows.find((r) => r.name === "core")).toBeDefined();
+    const byhand = rows.find((r) => r.name === "byhand") as (typeof rows)[number];
+    expect(byhand.verify?.badge).toBe("tampered");
+    expect(byhand.verify?.mismatches).toBe(1);
+    expect(byhand.splits).toEqual({ train: 1, dev: 0, test: null });
+    const bare = rows.find((r) => r.name === "bare") as (typeof rows)[number];
+    expect(bare.verify?.ok).toBe(true);
+    expect(bare.splits).toEqual({ train: 0, dev: 0, test: null });
+
+    const detail = await t.api(`/api/h/${id}/data/datasets/byhand`);
+    expect(detail.status).toBe(200);
+    expect(detail.body["name"]).toBe("byhand");
+  });
 });
 
 describe("status + quarantine", () => {

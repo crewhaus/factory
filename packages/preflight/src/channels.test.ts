@@ -6,7 +6,7 @@ import {
   lowerSpecChannels,
   platformSecretRefs,
 } from "./channels";
-import type { SecretRef } from "./secret-grammar";
+import { type SecretRef, isMalformedEnvRef } from "./secret-grammar";
 
 const env = (name: string): SecretRef => ({ kind: "env", name });
 const lit = (value: string): SecretRef => ({ kind: "literal", value });
@@ -150,6 +150,21 @@ describe("channelItems", () => {
     expect(present?.level).toBe("info");
   });
 
+  test("a field with no usable value is blocking, and says which mistake it was", () => {
+    const items = channelItems(lowerSpecChannels({ slack: { botToken: "$SLACK_BOT_TOKEN" } }), {
+      SLACK_BOT_TOKEN: "x",
+    });
+    const item = items.find((i) => i.id === "channels.channels.slack.signingSecret");
+    expect(item?.level).toBe("blocking");
+    expect(item?.message).toContain("required but the spec does not declare it");
+    expect(item?.remediation).toContain("channels: block");
+    // NOT the warn-pass a genuinely pasted literal earns: an absent field is
+    // not "a value in the wrong place", it is no value at all.
+    expect(items.some((i) => i.message.includes("inline literal"))).toBe(false);
+    // Exactly one item for the field — the boot-gate slot it would have had.
+    expect(items.filter((i) => i.id === "channels.channels.slack.signingSecret")).toHaveLength(1);
+  });
+
   test("compile errors surface as blocking; literals as warn", () => {
     const lowered = lowerSpecChannels({
       telegram: { botToken: "${TG_TOKEN}", secretToken: "inline-not-a-secret" },
@@ -161,5 +176,108 @@ describe("channelItems", () => {
     expect(items.some((i) => i.level === "warn" && i.message.includes("inline literal"))).toBe(
       true,
     );
+  });
+});
+
+/**
+ * An unfinished `channels:` block is a REPORT, never a throw.
+ *
+ * The regression: `lowerSpecChannels` handed each field straight to the
+ * secret grammar, which called `.startsWith` on it. A channel block missing a
+ * required field — the most common spec mistake, and precisely the thing this
+ * package exists to name — therefore crashed the lowering, and with it every
+ * route that predicts boot behaviour, including the fleet-wide credentials
+ * matrix that folds over every registered harness.
+ *
+ * The rule these pin: preflight reads an UNVALIDATED document. Absent, empty,
+ * wrong-typed and not-a-mapping are four different mistakes, each gets its own
+ * sentence, and none of them may stop the lowering.
+ */
+describe("an unfinished channels block is reported, not thrown", () => {
+  test("the grammar predicate tolerates a value the spec never declared", () => {
+    expect(isMalformedEnvRef(undefined)).toBe(false);
+    expect(isMalformedEnvRef(null)).toBe(false);
+    expect(isMalformedEnvRef(1234)).toBe(false);
+    // The real grammar is untouched.
+    expect(isMalformedEnvRef("${SLACK_BOT_TOKEN}")).toBe(true);
+    expect(isMalformedEnvRef("$SLACK_BOT_TOKEN")).toBe(false);
+  });
+
+  test("every platform's required fields survive being absent", () => {
+    const { channels, missing, compileErrors } = lowerSpecChannels({
+      slack: { botToken: "$SLACK_BOT_TOKEN" },
+      telegram: { botToken: "$TG_BOT_TOKEN" },
+      discord: { applicationId: "$D_APP", botToken: "$D_BOT" },
+      whatsapp: { phoneNumberId: "$WA_PHONE" },
+    });
+    // Absence is not a malformed reference — a different fault, reported
+    // under its own heading.
+    expect(compileErrors).toEqual([]);
+    expect(missing.map((m) => m.label)).toEqual([
+      "channels.slack.signingSecret",
+      "channels.telegram.secretToken",
+      "channels.discord.publicKeyHex",
+      "channels.whatsapp.accessToken",
+      "channels.whatsapp.appSecret",
+    ]);
+    expect(missing[0]?.message).toContain("required but the spec does not declare it");
+    // The shape survives, so every downstream walker still has one.
+    expect(channels.slack?.signingSecret).toEqual({ kind: "literal", value: "" });
+    expect(channels.slack?.botToken).toEqual({ kind: "env", name: "SLACK_BOT_TOKEN" });
+  });
+
+  test("an unquoted YAML scalar says what it is instead of posing as a token", () => {
+    const { missing } = lowerSpecChannels({
+      discord: { applicationId: 1234, botToken: "$D_BOT", publicKeyHex: "$D_KEY" },
+    });
+    expect(missing).toHaveLength(1);
+    expect(missing[0]?.label).toBe("channels.discord.applicationId");
+    expect(missing[0]?.message).toContain("must be a string");
+    expect(missing[0]?.message).toContain("a number");
+  });
+
+  test("a platform key with nothing under it is reported, not dereferenced", () => {
+    // `slack:` with no fields parses as null — an unfinished spec, which is
+    // the state an operator asks the manager to explain.
+    const lowered = lowerSpecChannels({ slack: null, telegram: ["a"] });
+    expect(lowered.channels.slack).toBeUndefined();
+    expect(lowered.missing.map((m) => m.label)).toEqual(["channels.slack", "channels.telegram"]);
+    // No boot-gate slot to occupy, so it is still reported on its own.
+    const items = channelItems(lowered, {});
+    expect(items.find((i) => i.id === "channels.channels.slack")?.level).toBe("blocking");
+    expect(items.find((i) => i.id === "channels.channels.telegram")?.message).toContain("a list");
+  });
+
+  test("a declared-but-empty field is as boot-fatal as an absent one", () => {
+    const lowered = lowerSpecChannels({
+      slack: { botToken: "$SLACK_BOT_TOKEN", signingSecret: "" },
+    });
+    expect(lowered.missing[0]?.message).toContain("declared but empty");
+    const checks = channelEnvChecks("slack", lowered.channels, { SLACK_BOT_TOKEN: "x" });
+    expect(checks[1]?.pass).toBe(false);
+    expect(checks[1]?.reason).toContain("no usable value");
+    // and never the warn-pass an inline literal gets
+    expect(checks[1]?.warn).toBeUndefined();
+  });
+
+  test("the doctor summary fails a platform whose field has no value", () => {
+    const lowered = lowerSpecChannels({ slack: { botToken: "$SLACK_BOT_TOKEN" } });
+    const checks = buildChannelEnvSummaryChecks(lowered.channels, { SLACK_BOT_TOKEN: "x" });
+    expect(checks[0]?.pass).toBe(false);
+    expect(checks[0]?.reason).toContain("channels.slack.signingSecret");
+  });
+
+  test("an iMessage path of the wrong type is dropped with a reason", () => {
+    const lowered = lowerSpecChannels({ imessage: { chatDbPath: 5, cursorPath: "$CURSOR" } });
+    expect(lowered.channels.imessage?.chatDbPath).toBeUndefined();
+    expect(lowered.channels.imessage?.cursorPath).toEqual({ kind: "env", name: "CURSOR" });
+    expect(lowered.missing[0]?.message).toContain("must be a path string");
+  });
+
+  test("a channels: block that is not a mapping at all lowers to nothing", () => {
+    for (const raw of [undefined, null, "nope", 7, ["slack"]]) {
+      expect(() => lowerSpecChannels(raw)).not.toThrow();
+      expect(lowerSpecChannels(raw)).toEqual({ channels: {}, compileErrors: [], missing: [] });
+    }
   });
 });

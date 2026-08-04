@@ -777,16 +777,29 @@ export const watchmeSynthesized: M3Handler = (ctx) => {
       yaml: proposal.yaml,
     });
   }
-  return {
-    ...readBase(
-      proposals.length > 0,
-      proposals.length === 0 ? "no synthesized proposal has been written yet" : null,
-      "crewhaus watchme synthesize",
-    ),
-    proposals,
-    advisory: true,
-    note: "advisory only — reading a proposal is not applying it; apply picks edits one by one and goes back through the spec write path",
-  };
+  // ONE note, chosen — not `readBase(…)` spread and then overwritten by a
+  // second `note:` in the same literal, which made the empty state read
+  // "advisory only …" and left the console with nothing to say about WHY
+  // the panel is empty. `feedback-ops.advice` is the shape to copy.
+  return proposals.length === 0
+    ? {
+        ...readBase(
+          false,
+          "no synthesized proposal has been written yet",
+          "crewhaus watchme synthesize",
+        ),
+        proposals,
+        advisory: true,
+      }
+    : {
+        ...readBase(
+          true,
+          "advisory only — reading a proposal is not applying it; apply picks edits one by one and goes back through the spec write path",
+          "crewhaus watchme synthesize",
+        ),
+        proposals,
+        advisory: true,
+      };
 };
 
 /**

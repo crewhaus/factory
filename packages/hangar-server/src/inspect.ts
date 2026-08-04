@@ -15,7 +15,10 @@
  *     browser over that directory would serve in cleartext exactly what the
  *     run console masks. The run routes stay the only way in.
  * Those exclusions are enforced HERE, in the store allowlist and in the
- * generic raw browser, not in the UI.
+ * generic raw browser, not in the UI — and they are matched CASE-FOLDED,
+ * because the default filesystem on darwin and Windows resolves
+ * `.crewhaus/AUDIT` to the real directory while a case-sensitive comparison
+ * waves it through. See {@link exclusionFor}.
  *
  * The named stores this module browses ({@link INSPECT_STORE_NOTE}):
  *   scope-audit    `.crewhaus/scope-audit/baseline.json` (lint's output)
@@ -55,13 +58,16 @@
  *   - a file that parses as JSON (or JSONL, line by line) is served as a
  *     PARSED, masked document, which is why `identity.json`'s `privateKey`
  *     and an approval's `headers` disappear at all;
- *   - anything genuinely prose is served through the harness's own env
- *     SCRUBBER first — the same one the run console reads history through, so
- *     a credential this manager holds the value of becomes its NAME whatever
- *     it looks like;
- *   - and then through {@link maskRawText}: value-shape masking plus a PEM
- *     private-key block redactor, because a key block carries no key-ish
- *     context word and the generic shape masker walks straight past it.
+ *   - EVERY read — parsed or prose — goes through the harness's own env
+ *     SCRUBBER, the same one the run console reads history through, so a
+ *     credential this manager holds the value of becomes its NAME whatever it
+ *     looks like. It sat on the prose branch alone once, which made the two
+ *     branches disagree about the same credential;
+ *   - and then through {@link maskRawText}: KEY-AWARE line masking (the key
+ *     read off the line, so text gets the redaction a tree gets), value-shape
+ *     masking, plus a PEM private-key block redactor, because a key block
+ *     carries no key-ish context word and the generic shape masker walks
+ *     straight past it.
  *
  * `identity.json` never rides any of those paths verbatim: it is projected to
  * the fingerprint plus PRESENCE booleans for the key material, so the private
@@ -74,7 +80,7 @@ import { HttpError } from "./http";
 import { readTextCapped } from "./jsonl";
 import type { M3Context, M3Handler } from "./m3";
 import { requireTypedConfirm } from "./m3";
-import { maskDeep, maskText } from "./mask";
+import { type TextScrubber, maskDeep, maskKeyedText } from "./mask";
 import { spawnEnvScrubber } from "./runs";
 
 /** The closed set of named stores the inspector browses. Anything outside it
@@ -246,18 +252,27 @@ export const INSPECT_EXCLUSIONS: readonly InspectExclusion[] = [
  * Deliberately broader than the literal paths above: ANY segment named
  * `secrets` is refused, wherever it sits, and any name that starts `.env`.
  * Over-refusing a browser is recoverable; under-refusing it is not.
+ *
+ * CASE-FOLDED, ALL FOUR OF THEM. The default filesystem on darwin (APFS) and
+ * on Windows (NTFS) is case-INSENSITIVE, so the OS happily resolves
+ * `.crewhaus/AUDIT` and `.crewhaus/Run/Logs` to the real directories — and
+ * `resolveContained` answers with the caller's casing rather than the
+ * realpath, so containment passes. Comparing any branch of this list against
+ * raw segments therefore makes that branch a suggestion, not a boundary:
+ * two of the four were exactly-cased once, and `?path=.crewhaus/AUDIT/…`
+ * walked straight through them.
  */
 export function exclusionFor(segments: readonly string[]): InspectExclusion | null {
-  for (const raw of segments) {
-    const segment = raw.toLowerCase();
+  const lower = segments.map((s) => s.toLowerCase());
+  for (const segment of lower) {
     if (segment === "secrets") return INSPECT_EXCLUSIONS[0] as InspectExclusion;
     if (segment === ".env" || segment.startsWith(".env.")) {
       return INSPECT_EXCLUSIONS[2] as InspectExclusion;
     }
   }
-  if (segments[0] !== ".crewhaus") return null;
-  if (segments[1] === "audit") return INSPECT_EXCLUSIONS[1] as InspectExclusion;
-  if (segments[1] === "run" && segments[2] === "logs") {
+  if (lower[0] !== ".crewhaus") return null;
+  if (lower[1] === "audit") return INSPECT_EXCLUSIONS[1] as InspectExclusion;
+  if (lower[1] === "run" && lower[2] === "logs") {
     return INSPECT_EXCLUSIONS[3] as InspectExclusion;
   }
   return null;
@@ -277,10 +292,19 @@ export function isExcludedPath(segments: readonly string[]): boolean {
 const PEM_PRIVATE_BLOCK_RE =
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
 
-/** Mask one raw document served as TEXT: the shared value-shape masker plus
- *  the PEM redactor above. */
+/**
+ * Mask one raw document served as TEXT.
+ *
+ * KEY-AWARE, not merely shape-aware. `maskKeyedText` reads the key off the
+ * LINE, so a document that never became a tree still gets the key-based
+ * redaction `maskDeep` gives a parsed one — which is what makes the raw
+ * browser and the spec view agree about `signingSecret: <inline literal>`
+ * instead of one redacting it and the other serving it verbatim. Then the PEM
+ * redactor, because a private-key block carries no key-ish context word and
+ * the generic shape masker walks straight past it.
+ */
 export function maskRawText(text: string): string {
-  return maskText(text).replace(PEM_PRIVATE_BLOCK_RE, "[redacted private key block]");
+  return maskKeyedText(text).replace(PEM_PRIVATE_BLOCK_RE, "[redacted private key block]");
 }
 
 /**
@@ -293,7 +317,7 @@ export function maskRawText(text: string): string {
  * this module goes through it, so a scheduled-job log under `.crewhaus/logs/`
  * is protected to the same standard as a supervised run's captured output.
  */
-function scrubberFor(ctx: M3Context): (text: string) => string {
+function scrubberFor(ctx: M3Context): TextScrubber {
   const dir = ctx.harnessDir;
   if (dir === null) return (text) => text;
   try {
@@ -324,13 +348,17 @@ export type InspectFileBody = {
  * wholesale; the same document served as text gets only shape masking, which
  * cannot see `"privateKey": "<base64>"`. So JSON parses, JSONL parses
  * line-by-line (torn lines skipped, never fatal), and only what is genuinely
- * prose falls through to `maskRawText` — with the harness's env `scrub`
- * applied first, so a credential VALUE this manager knows is replaced by its
- * NAME exactly as the run console does it.
+ * prose falls through to `maskRawText`.
+ *
+ * `scrub` RIDES BOTH BRANCHES. It was on the text fallback alone once, which
+ * made the two branches disagree about the same credential: an opaque value
+ * this manager holds was replaced by its NAME in a `.md` and served verbatim
+ * out of a `.json` beside it, because no shape rule can see an opaque value
+ * under an innocent key. A parsed document is not a safer document.
  *
  * Never throws: an unreadable file reads empty.
  */
-function readBody(path: string, scrub: (text: string) => string): InspectFileBody {
+function readBody(path: string, scrub: TextScrubber): InspectFileBody {
   const { text, truncated } = readTextCapped(path, MAX_INSPECT_BYTES);
   const bytes = Buffer.byteLength(text, "utf8");
   if (text.trim() === "") {
@@ -353,7 +381,7 @@ function readBody(path: string, scrub: (text: string) => string): InspectFileBod
     for (const line of text.split("\n")) {
       if (line.trim() === "") continue;
       try {
-        rows.push(maskDeep(JSON.parse(line)));
+        rows.push(maskDeep(JSON.parse(line), scrub));
       } catch {
         torn += 1; // one torn line must never hide the rest of the file
       }
@@ -371,7 +399,7 @@ function readBody(path: string, scrub: (text: string) => string): InspectFileBod
   }
   try {
     return {
-      document: maskDeep(JSON.parse(text)),
+      document: maskDeep(JSON.parse(text), scrub),
       text: null,
       parseError: null,
       bytes,
@@ -477,6 +505,19 @@ function storePath(ctx: M3Context, store: InspectStore): string | undefined {
 
 const relPath = (segments: readonly string[]): string => segments.join("/");
 
+/**
+ * The note for a store whose path RESOLVES OUTSIDE the harness.
+ *
+ * "Nothing there yet" and "there is something there and this server refuses to
+ * follow it" are different facts, and only one of them is an empty state. A
+ * store symlinked out of the tree read as ABSENT — so the console offered the
+ * CLI verb that CREATES it, over a file that already exists somewhere else.
+ * `inspectRaw` already says the true thing; the modelled readers say it in the
+ * same words.
+ */
+const escapedNote = (segments: readonly string[]): string =>
+  `${relPath(segments)} resolves outside the harness directory and is not readable from here`;
+
 // ---------------------------------------------------------------------------
 // GET /api/h/:id/inspect — the store index
 // ---------------------------------------------------------------------------
@@ -523,8 +564,11 @@ export const inspectIndex: M3Handler = (ctx) => {
         bytes: null,
         modifiedAt: null,
         what: def.what,
-        verb: def.verb,
-        note: `nothing at ${relPath(def.segments)} yet`,
+        verb: path === undefined ? null : def.verb,
+        note:
+          path === undefined
+            ? escapedNote(def.segments)
+            : `nothing at ${relPath(def.segments)} yet`,
       });
       continue;
     }
@@ -656,8 +700,13 @@ export const inspectStore: M3Handler = (ctx) => {
   if (path === undefined || stat === undefined) {
     return {
       present: false,
-      note: `nothing at ${relPath(def.segments)} yet — ${def.what}`,
-      verb: def.verb,
+      note:
+        path === undefined
+          ? escapedNote(def.segments)
+          : `nothing at ${relPath(def.segments)} yet — ${def.what}`,
+      // A refused path is not a store waiting to be created, so it must not
+      // advertise the verb that would create one.
+      verb: path === undefined ? null : def.verb,
       ...base,
       entries: [],
       truncated: false,

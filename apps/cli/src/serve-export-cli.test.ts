@@ -28,8 +28,26 @@ type RunResult = { exitCode: number; stdout: string; stderr: string };
  * authored assets resolve beside the SPEC, not beside the process.
  */
 const SPAWN_CWD = mkdtempSync(join(tmpdir(), "crewhaus-serve-export-cwd-"));
+
+/**
+ * Hermetic harness registry for every spawn in this file.
+ *
+ * `run`/`compile`/`eval`/`dev` self-register the harness they touch, and for
+ * a spec passed by path that is the SPEC's directory — `CLI_SPEC`/
+ * `VOICE_SPEC` above, inside the repo. The default registry root's
+ * ephemeral-cwd guard cannot help (it looks at the cwd, not at the spec
+ * dir), so without this every run of this file writes a row into the
+ * developer's real `~/.crewhaus/harnesses.json`.
+ */
+const REGISTRY_ROOT = mkdtempSync(join(tmpdir(), "crewhaus-serve-export-reg-"));
+const HERMETIC_REGISTRY: Record<string, string> = {
+  CREWHAUS_REGISTRY_ROOT: join(REGISTRY_ROOT, "registry"),
+  CREWHAUS_WATCHME_ROOT: join(REGISTRY_ROOT, "watchme"),
+};
+
 afterAll(() => {
   rmSync(SPAWN_CWD, { recursive: true, force: true });
+  rmSync(REGISTRY_ROOT, { recursive: true, force: true });
 });
 
 /** Spawn the CLI, optionally feeding `stdin` (then EOF), and capture streams. */
@@ -39,7 +57,7 @@ async function runCli(
 ): Promise<RunResult> {
   const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
     cwd: opts.cwd ?? SPAWN_CWD,
-    env: { PATH: process.env["PATH"] ?? "" },
+    env: { PATH: process.env["PATH"] ?? "", ...HERMETIC_REGISTRY },
     stdin: opts.stdin !== undefined ? "pipe" : "ignore",
     stdout: "pipe",
     stderr: "pipe",

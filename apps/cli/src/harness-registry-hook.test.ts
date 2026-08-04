@@ -12,6 +12,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -144,4 +145,36 @@ describe("Hangar F-1 — command-path self-registration", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(regRoot, "harnesses.json"))).toBe(false);
   }, 60000);
+});
+
+// ---------------------------------------------------------------------------
+// The sibling-suite guard (F-11)
+// ---------------------------------------------------------------------------
+
+/**
+ * The ephemeral-cwd guard above protects the COMMON case: a fixture harness
+ * synthesized into the OS temp dir. It cannot protect the other one — a spec
+ * that lives IN THE REPO, passed by path. The hook records the SPEC's
+ * directory for those, so `apps/cli/test-fixtures/minimal-*` is what lands in
+ * the registry, and `.../.worktrees/<branch>/apps/cli/test-fixtures/minimal-*`
+ * rows really did accumulate in developers' real `~/.crewhaus/harnesses.json`.
+ *
+ * The fix is one line per suite (`CREWHAUS_REGISTRY_ROOT` in the spawn env);
+ * this test is what stops the next suite from forgetting it.
+ */
+describe("F-11 — no suite registers an in-repo fixture into the real machine registry", () => {
+  test("every CLI test that spawns the entry file against an in-repo fixture pins a registry root", () => {
+    const spawnsCli = /Bun\.spawn\(\s*\[\s*process\.execPath/;
+    const unguarded: string[] = [];
+    for (const name of readdirSync(SRC_DIR).sort()) {
+      if (!name.endsWith(".test.ts")) continue;
+      const body = readFileSync(join(SRC_DIR, name), "utf8");
+      if (!body.includes("test-fixtures") || !spawnsCli.test(body)) continue;
+      if (body.includes("CREWHAUS_REGISTRY_ROOT") || body.includes("CREWHAUS_NO_REGISTRY")) {
+        continue;
+      }
+      unguarded.push(name);
+    }
+    expect(unguarded).toEqual([]);
+  });
 });

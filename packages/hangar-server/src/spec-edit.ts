@@ -7,9 +7,12 @@
  * `applySpecEdits(yaml, edits, …)`, which is atomic, comment-preserving and
  * re-validating. Two tiers, enforced HERE and not merely in the UI:
  *
- *   auto-tunable — paths inside `OPTIMIZABLE_PATHS`. Apply with
- *     `{ restrictToOptimizable: true }`; the same restriction the optimizer
- *     runs under, so the console can never write what the machine may not.
+ *   auto-tunable — paths inside `OPTIMIZABLE_PATHS` that are NOT also a
+ *     `SECURITY_SURFACES` prefix. Apply with `{ restrictToOptimizable:
+ *     true }`; the same restriction the optimizer runs under, so the console
+ *     can never write what the machine may not. The exclusion is the other
+ *     half of that sentence: a surface the optimizer may tune against an
+ *     eval is still human-owned when one operator clicks Save.
  *   human-owned — everything else (permissions, the model roster/candidates,
  *     watchme.*, plugins, expose, learning.sources, thredz,
  *     sandbox/tool_config, transaction_policy). These require the
@@ -50,11 +53,13 @@
  */
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   renameSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -128,6 +133,10 @@ export type SpecFileRead = {
   readonly present: boolean;
   /** Raw text, UNMASKED — masked only on the way out. */
   readonly text: string;
+  /** True when the file is past `MAX_TEXT_BYTES` and `text` is only its
+   *  HEAD. A view may render a prefix; a write may never round-trip one —
+   *  see {@link requireWholeSpec}. */
+  readonly truncated: boolean;
   readonly specName: string;
   readonly target: string;
   readonly hash: string;
@@ -143,23 +152,71 @@ function hashOf(text: string): string {
 export function readSpecFile(ctx: M3Context): SpecFileRead {
   const path = ctx.contain([SPEC_FILE]);
   const present = existsSync(path);
-  const text = present ? readTextCapped(path, MAX_TEXT_BYTES).text : "";
-  const header = text === "" ? {} : readSpecHeader(text);
+  const read = present ? readTextCapped(path, MAX_TEXT_BYTES) : { text: "", truncated: false };
+  const header = read.text === "" ? {} : readSpecHeader(read.text);
   return {
     path,
     present,
-    text,
+    text: read.text,
+    truncated: read.truncated,
     specName: header.name ?? ctx.entry?.specName ?? "spec",
     target: header.target ?? "unknown",
-    hash: hashOf(text),
+    hash: hashOf(read.text),
   };
 }
 
-/** Write the spec back atomically (temp file in the SAME directory, then
- *  rename) so a crashed write can never truncate a harness's spec. */
-function writeSpecFile(path: string, text: string): void {
+/**
+ * The refusal a CAPPED read owes every write path.
+ *
+ * `readSpecFile` reads through `readTextCapped`, so a spec past the cap
+ * comes back as a PREFIX of itself. A prefix is a VIEW: rendering one is
+ * honest, writing one back is not. `writeSpecFile` renames over the
+ * original, so everything past the cap would be deleted — silently, because
+ * the surviving head of an over-cap spec usually still parses (the cut lands
+ * inside a long block scalar), and because the answer's own diff and `hash`
+ * are computed from the damaged text, which re-anchors the editor's rebase
+ * token to the damage. Refuse instead, with the verb that can do the job.
+ *
+ * The same refusal `watchme-ops`' `liveSpec` and the settings writer in
+ * `inspect.ts` already make; this is the write path that had missed it.
+ */
+export function requireWholeSpec(file: SpecFileRead): void {
+  if (!file.truncated) return;
+  throw new HttpError(
+    409,
+    `${SPEC_FILE} is larger than this server reads (${MAX_TEXT_BYTES} bytes) — refusing to write back a spec it could not read whole. Edit it with the CLI, then \`crewhaus compile ${SPEC_FILE} -o dist\`.`,
+  );
+}
+
+/** The mode a spec gets when this manager CREATES the file. It is never
+ *  applied to one that already exists — see {@link writeSpecFile}. */
+const NEW_SPEC_MODE = 0o644;
+
+/**
+ * Write the spec back atomically (temp file in the SAME directory, then
+ * rename) so a crashed write can never truncate a harness's spec.
+ *
+ * The rename replaces the INODE, which means the temp file's mode BECOMES
+ * the spec's mode. Writing a hardcoded one would silently chmod a file the
+ * operator owns — a deliberately narrowed `crewhaus.yaml` would come back
+ * world-readable after any edit made from the console. So the existing mode
+ * is carried across the rename, and the default applies only when there is
+ * no file to carry one from. Exported because a spec file must be replaced
+ * the same way wherever it is replaced.
+ */
+export function writeSpecFile(path: string, text: string): void {
+  let mode = NEW_SPEC_MODE;
+  try {
+    mode = statSync(path).mode & 0o7777;
+  } catch {
+    // Nothing there to preserve — the default is the only answer there is.
+  }
   const tmp = `${path}.hangar-tmp`;
-  writeFileSync(tmp, text, { mode: 0o644 });
+  writeFileSync(tmp, text, { mode });
+  // `writeFileSync`'s mode is masked by the process umask at CREATE time, so
+  // it is a request rather than a guarantee; the chmod is what makes the
+  // preserved mode exact.
+  chmodSync(tmp, mode);
   renameSync(tmp, path);
 }
 
@@ -384,9 +441,34 @@ export function isAutoTunable(target: string, path: readonly string[]): boolean 
   return optimizableFor(target).some((entry) => isPrefix(entry, path));
 }
 
-/** Classify one path for the badge AND for the write gate. */
+/**
+ * Classify one path for the badge AND for the write gate.
+ *
+ * `SECURITY_SURFACES` is consulted BEFORE `OPTIMIZABLE_PATHS`, and the order
+ * is the whole point: a security surface stays human-owned even when the
+ * optimizer may tune it. The two tables answer different questions. The
+ * optimizer writes `transaction_policy`, `chains`, `security.justification`
+ * and the `agent.model_pool` policy knobs only as the outcome of an eval
+ * that scored the change; the console writes them because one operator
+ * clicked once. Testing `isAutoTunable` first made those `SECURITY_SURFACES`
+ * rows unreachable for exactly the paths they were written to gate — the
+ * on-chain value ceiling could be raised, and pre-broadcast simulation
+ * switched off, with no interstitial and no typed confirmation at all.
+ */
 export function classifyPath(target: string, segments: readonly string[]): SpecTrustRow {
   const path = segments.join(".");
+  const surface = SECURITY_SURFACES.find((s) => isPrefix(s.prefix, segments));
+  if (surface !== undefined) {
+    return {
+      path,
+      segments,
+      tier: "human-owned",
+      securitySurface: true,
+      reason: isAutoTunable(target, segments)
+        ? `${surface.reason} — the optimizer may tune it against an eval, but a console write takes the typed confirmation`
+        : surface.reason,
+    };
+  }
   if (isAutoTunable(target, segments)) {
     return {
       path,
@@ -395,10 +477,6 @@ export function classifyPath(target: string, segments: readonly string[]): SpecT
       securitySurface: false,
       reason: "listed in OPTIMIZABLE_PATHS — the optimizer may write it, so the console may too",
     };
-  }
-  const surface = SECURITY_SURFACES.find((s) => isPrefix(s.prefix, segments));
-  if (surface !== undefined) {
-    return { path, segments, tier: "human-owned", securitySurface: true, reason: surface.reason };
   }
   const holdsTunable =
     segments.length > 0 && optimizableFor(target).some((entry) => isPrefix(segments, entry));
@@ -642,6 +720,9 @@ async function applyBatch(
       verb: "crewhaus init",
     });
   }
+  // Before ANY of the rest: the read this batch would be applied to, and
+  // written back from, has to be the whole document.
+  requireWholeSpec(file);
   const expected = ctx.body["expectedHash"];
   if (typeof expected === "string" && expected !== "" && expected !== file.hash) {
     throw new HttpError(
@@ -885,11 +966,14 @@ export const specDiff: M3Handler = async (ctx) => {
     specName: file.specName,
     target: file.target,
     hash: file.hash,
+    /** A preview of a spec read past the cap is a preview of its HEAD; the
+     *  write path refuses that batch, so the flag says why in advance. */
+    truncated: file.truncated,
     entries: preview.entries,
     diff: preview.diff,
     tiers: { autoTunable: auto, humanOwned: human },
     /** True when this batch may be applied straight from the editor. */
-    autoApplicable: human.length === 0,
+    autoApplicable: human.length === 0 && !file.truncated,
     confirmName: human.length > 0 ? file.specName : null,
     proposeRoute: human.length > 0 ? "specPropose" : null,
     issues: issuesOf(mod, file.text),
@@ -959,6 +1043,7 @@ export const specSchema: M3Handler = async (ctx) => {
       warnings: [],
       warningsVerb: "crewhaus compile crewhaus.yaml -o dist",
       hash: file.hash,
+      truncated: false,
     };
   }
   let schema: Record<string, unknown> | null = null;
@@ -1003,6 +1088,9 @@ export const specSchema: M3Handler = async (ctx) => {
     warnings: [],
     warningsVerb: "crewhaus compile crewhaus.yaml -o dist",
     hash: file.hash,
+    /** This VIEW may show the head of an over-cap spec; the write path
+     *  refuses it. The flag is what stops the two reading as the same file. */
+    truncated: file.truncated,
   };
 };
 
@@ -1026,6 +1114,7 @@ export const specTrust: M3Handler = (ctx) => {
       humanOwnedCount: 0,
       securitySurfaceCount: 0,
       confirmName: file.specName,
+      truncated: false,
     };
   }
   const paths = declaredPaths(file.text).map((segments) => classifyPath(file.target, segments));
@@ -1043,6 +1132,9 @@ export const specTrust: M3Handler = (ctx) => {
     humanOwnedCount: paths.length - auto,
     securitySurfaceCount: paths.filter((row) => row.securitySurface).length,
     confirmName: file.specName,
+    /** True ⇒ these are the paths of the spec's HEAD only, and no edit from
+     *  this table will be applied. */
+    truncated: file.truncated,
   };
 };
 
@@ -1366,6 +1458,10 @@ export const specPropose: M3Handler = async (ctx) => {
       verb: "crewhaus init",
     });
   }
+  // A proposal STAGES a candidate document — `applySpecEdits(file.text, …)`
+  // — so a capped read would put a mutilated spec into the review bundle and
+  // ask a human to approve it. Same refusal as a direct write.
+  requireWholeSpec(file);
   const preview = previewSpecEdits(file.text, edits);
   if (!preview.ok) {
     return refusal("edit_rejected", preview.error ?? "the batch does not apply", {

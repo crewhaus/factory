@@ -31,9 +31,11 @@
  * Side-effect-free on import, mirroring `harness-cmd.ts`: every function
  * takes an injected environment/clock/pid-liveness/browser-opener seam and
  * returns lines + an exit code; `serve` streams progress through the
- * injected `write` sink because it blocks until SIGINT/SIGTERM. Bad
- * arguments throw plain `Error`s; the entry file routes them through
- * `die()` like `harness` does.
+ * injected `write` sink because it blocks until SIGINT/SIGTERM, and then
+ * EXITS explicitly (see `shutdownNotices`) rather than returning and hoping
+ * the event loop drains — a supervised child keeps it open. Bad arguments
+ * throw plain `Error`s; the entry file routes them through `die()` like
+ * `harness` does.
  */
 import { spawn } from "node:child_process";
 import {
@@ -48,6 +50,7 @@ import { join, resolve } from "node:path";
 import {
   DEFAULT_HANGAR_PORT,
   type HangarServer,
+  type HangarServerOptions,
   TOKEN_FILENAME,
   startHangarServer,
 } from "@crewhaus/hangar-server";
@@ -84,6 +87,15 @@ export type HangarCommandOptions = {
   readonly openBrowser?: (url: string) => void;
   /** Line sink for `serve`'s streamed progress; defaults to stdout. */
   readonly write?: (line: string) => void;
+  /** Server factory; injected so a test can drive `serve`'s shutdown path
+   *  against a fake child without binding a socket or spawning anything.
+   *  Defaults to `startHangarServer`. */
+  readonly startServer?: (options: HangarServerOptions) => HangarServer;
+  /** Process exit, called by `serve` after a clean shutdown. Injected by
+   *  tests (a real `process.exit` would take the test runner with it);
+   *  defaults to `process.exit`. See {@link shutdownNotices} for why the
+   *  exit has to be explicit. */
+  readonly exit?: (code: 0 | 1) => void;
 };
 
 const HANGAR_USAGE_LINES: readonly string[] = [
@@ -493,6 +505,41 @@ function summaryLines(
   ];
 }
 
+/** The minimum a queued job row has to carry for the shutdown notice. */
+export type RunningJob = {
+  readonly jobId: string;
+  readonly kind: string;
+  readonly harnessDir: string;
+};
+
+/**
+ * What shutdown says about the work this manager was still supervising —
+ * and why `serve` exits EXPLICITLY instead of letting the event loop drain.
+ *
+ * `server.stop()` releases the socket, the timers and the subscriptions, but
+ * it leaves supervised CHILDREN alone on purpose: a detached daemon
+ * outliving its manager is the whole point of the harness-local runfile, and
+ * the next boot adopts it. An attached job child (`dev`, `compile`, `eval`,
+ * …) is a different story — it is spawned with `detached: false` and its
+ * process handle keeps THIS process's event loop alive. So "stop and return"
+ * is not an exit. Observed: a manager that printed "shutting down…",
+ * released `hangar.lock` and freed its port (a second manager bound it) was
+ * still alive minutes later with `crewhaus dev` running under it; one such
+ * orphan survived a whole workday and had to be SIGKILLed.
+ *
+ * Shutdown therefore does two things: it names what it is leaving behind
+ * (silently orphaning an operator's job is the other half of the same
+ * dishonesty), and then it exits deterministically.
+ */
+export function shutdownNotices(running: readonly RunningJob[]): string[] {
+  if (running.length === 0) return [];
+  const kinds = [...new Set(running.map((j) => j.kind))].sort().join(", ");
+  return [
+    `note: ${running.length} job(s) still running (${kinds}) — shutting down does not stop them;`,
+    "      they keep running, and the next manager reopens their ledger rows as `interrupted`.",
+  ];
+}
+
 async function hangarServe(
   argv: readonly string[],
   opts: HangarCommandOptions,
@@ -529,7 +576,7 @@ async function hangarServe(
   }
 
   const version = cliVersion();
-  const server = startHangarServer({
+  const server = (opts.startServer ?? startHangarServer)({
     port: flags.smoke ? 0 : (flags.port ?? DEFAULT_HANGAR_PORT),
     ...(flags.host !== undefined ? { hostname: flags.host } : {}),
     root: hangarRoot,
@@ -602,6 +649,11 @@ async function hangarServe(
   write("hangar: shutting down…");
   await server.stop();
   releaseHangarLock(hangarRoot, pid);
+  for (const line of shutdownNotices(server.processes.jobs.running())) write(line);
+  // Deterministic exit — see `shutdownNotices`. Without this the process
+  // lingers for as long as a supervised child holds the event loop, having
+  // already given up its lock and its port.
+  (opts.exit ?? ((code: 0 | 1): void => process.exit(code)))(0);
   return { lines: [], exitCode: 0 };
 }
 

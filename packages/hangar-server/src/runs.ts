@@ -27,7 +27,7 @@
  * "safe on its face" is exactly the assumption a planted symlink inside the
  * run dir defeats.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   type ExitClassification,
@@ -42,9 +42,10 @@ import {
   readRunLedger,
   replayRunEvents,
 } from "@crewhaus/harness-supervisor";
+import { REDACTED_VALUE, isCredentialKey } from "@crewhaus/spec-patch";
 import { MAX_JSONL_LINES } from "./constants";
 import { mergedSpawnEnv } from "./env-file";
-import { maskDeep, maskText } from "./mask";
+import { type TextScrubber, maskDeep, maskText } from "./mask";
 import { resolveInside } from "./safety";
 
 export function isSupervisorRunId(id: string): boolean {
@@ -106,6 +107,91 @@ export function spawnEnvScrubber(
   return createEnvScrubber(mergedSpawnEnv(processEnv, harnessDir).env);
 }
 
+/**
+ * Credential VALUES written as literals in the harness's own spec, keyed by
+ * the spec key that held them.
+ *
+ * The `.env` scrubber covers what the harness keeps in `.env`. It cannot
+ * cover an INLINE literal — `channels.slack.signingSecret: <value>` — and
+ * key-based redaction only fires where the value sits under its key. The
+ * same value quoted in an agent's `instructions`, echoed into a memory fact,
+ * or copied into a continuity note has no key and (below the opaque-token
+ * threshold) no shape, so nothing catches it.
+ *
+ * The manager DOES hold the value: it read the spec. So it belongs in the
+ * scrub set for exactly the reason `.env` values do. Detection is by key —
+ * `isCredentialKey` — not by shape, so a short literal is caught too.
+ */
+export function specCredentialValues(harnessDir: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  let text: string;
+  try {
+    text = readFileSync(join(harnessDir, SPEC_FILENAME), "utf8");
+  } catch {
+    return out;
+  }
+  for (const line of text.split("\n")) {
+    const m = line.match(SPEC_SCALAR_LINE_RE);
+    if (m === null) continue;
+    const [, key = "", rawValue = ""] = m;
+    const value = unquote(rawValue.trim());
+    // A `$VAR` reference is a NAME, not a value — and is the shape we WANT
+    // operators to see. Empty and `[redacted]` are not secrets either.
+    if (value === "" || value.startsWith("$") || value === REDACTED_VALUE) continue;
+    if (!isCredentialKey(key)) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+const SPEC_FILENAME = "crewhaus.yaml";
+const SPEC_SCALAR_LINE_RE = /^[ \t]*(?:- )?([A-Za-z0-9_.-]+):[ \t]*(.*)$/;
+
+function unquote(s: string): string {
+  if (
+    s.length >= 2 &&
+    ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'")))
+  ) {
+    return s.slice(1, -1);
+  }
+  return s;
+}
+
+/**
+ * {@link spawnEnvScrubber} widened with {@link specCredentialValues}, and
+ * degrading to the identity scrubber rather than throwing: an unreadable
+ * `.env` chain must not take a read down, and the shape masker still runs
+ * underneath whatever this returns.
+ */
+export function safeSpawnEnvScrubber(
+  harnessDir: string,
+  processEnv: Readonly<Record<string, string | undefined>>,
+): TextScrubber {
+  try {
+    // Env first, and a spec value added ONLY when no env entry already
+    // carries it: the placeholder an operator sees is the NAME the scrubber
+    // found the value under, and the env name is the one they set. Merging
+    // the other way silently renamed «PLANTED_SECRET» to «HELPER_TOKEN» for
+    // a value that happened to appear under both.
+    const env = mergedSpawnEnv(processEnv, harnessDir).env;
+    const known = new Set(Object.values(env).filter((v): v is string => typeof v === "string"));
+    const merged: Record<string, string> = {};
+    for (const [key, value] of Object.entries(env)) {
+      if (typeof value === "string") merged[key] = value;
+    }
+    for (const [key, value] of Object.entries(specCredentialValues(harnessDir))) {
+      if (!known.has(value)) merged[key] = value;
+    }
+    return createEnvScrubber(merged);
+  } catch {
+    try {
+      return createEnvScrubber(specCredentialValues(harnessDir));
+    } catch {
+      return (text) => text;
+    }
+  }
+}
+
 /** One run: ledger row + scrubbed events + scrubbed prose tail. */
 export function runDetail(
   harnessDir: string,
@@ -132,18 +218,23 @@ export function runDetail(
   const maxEvents = opts.maxEvents ?? MAX_JSONL_LINES;
   const all = eventsFile === undefined ? [] : replayRunEvents(eventsFile);
   const events = all.slice(Math.max(0, all.length - maxEvents));
+  // ONE scrubber for BOTH halves of this payload. It sat on `proseTail` alone
+  // once, so the same response contradicted itself: an opaque credential this
+  // manager holds came back as `«NAME»` in the tail and verbatim in the
+  // events array beside it. The events were persisted by a pump that scrubbed
+  // with the SPAWN env — but an adopted run's events were written by a pump
+  // this process never built, so "already scrubbed" is an assumption, not a
+  // guarantee, and re-scrubbing a scrubbed string costs nothing.
+  const scrub = safeSpawnEnvScrubber(harnessDir, opts.env ?? process.env);
   return {
     runId,
     entry,
     live: opts.live === true,
-    // maskDeep on top of the pump's env scrubbing: the scrubber knows the
-    // harness's own credential VALUES, the masker knows credential SHAPES.
-    events: events.map((e) => maskDeep(e)),
+    // maskDeep on top of the env scrubbing: the scrubber knows the harness's
+    // own credential VALUES, the masker knows credential SHAPES.
+    events: events.map((e) => maskDeep(e, scrub)),
     eventsTruncated: all.length > events.length,
-    proseTail:
-      logFile === undefined
-        ? []
-        : readLogTail(logFile, spawnEnvScrubber(harnessDir, opts.env ?? process.env)).map(String),
+    proseTail: logFile === undefined ? [] : readLogTail(logFile, scrub).map(String),
   };
 }
 
@@ -216,6 +307,10 @@ export type RunStreamOptions = {
   readonly subscribe?: (listener: (event: SupervisorEvent) => void) => () => void;
   /** Live only when the supervisor is actually on this run. */
   readonly live: boolean;
+  /** The harness's env scrubber, so the stream masks to the same standard
+   *  `GET /runs/:runId` does. Defaults to the identity scrubber, which leaves
+   *  only the SHAPE layer — never pass nothing on a real request. */
+  readonly scrub?: TextScrubber;
   /** Cap on live frames before the stream closes itself (a runaway daemon
    *  must not be able to hold a browser connection open forever). */
   readonly maxFrames?: number;
@@ -237,6 +332,7 @@ export const MAX_SSE_FRAMES = 5_000;
  */
 export function runEventStream(options: RunStreamOptions): Response {
   const maxFrames = options.maxFrames ?? MAX_SSE_FRAMES;
+  const scrub: TextScrubber = options.scrub ?? ((text) => text);
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const encoder = new TextEncoder();
@@ -278,8 +374,9 @@ export function runEventStream(options: RunStreamOptions): Response {
 
       // maskDeep on the way out: `replay` carries the run's prose tail, which
       // is the one payload built from the raw capture file rather than from
-      // the pump's already-masked events.
-      send("replay", maskDeep(options.replay));
+      // the pump's already-masked events. The env scrubber rides with it, or
+      // the stream serves in cleartext what `GET /runs/:runId` hides.
+      send("replay", maskDeep(options.replay, scrub));
 
       if (!options.live || options.subscribe === undefined) {
         finish("closed");
@@ -312,11 +409,13 @@ export function runEventStream(options: RunStreamOptions): Response {
             if (event.runId !== options.runId) return;
             send("output", {
               runId: event.runId,
-              // The pump's env scrubber already ran; this is the SHAPE layer,
-              // so a credential in no env file cannot ride the live feed out
-              // while history (maskDeep'd) hides it.
-              prose: maskText(event.prose),
-              events: event.events.map((e) => maskDeep(e)),
+              // The pump's env scrubber already ran; re-running ours is free
+              // and covers an ADOPTED pump this process never configured,
+              // and then the SHAPE layer, so a credential in no env file
+              // cannot ride the live feed out while history (maskDeep'd)
+              // hides it.
+              prose: maskText(scrub(event.prose)),
+              events: event.events.map((e) => maskDeep(e, scrub)),
             });
             break;
           case "exit":

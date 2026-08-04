@@ -26,8 +26,9 @@ import { mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "n
 import { join } from "node:path";
 import { type AuditRecord, recomputeRecordHash } from "@crewhaus/audit-log";
 import { signSynthetic } from "./channels-ops";
-import { unsetEnvVar, upsertEnvVar } from "./creds-ops";
+import { credentialsMatrix, unsetEnvVar, upsertEnvVar } from "./creds-ops";
 import { makeFixtureHarness } from "./fixture";
+import type { M3Context } from "./m3";
 import { M3_ROUTES } from "./m3-routes";
 import { type TestServer, bootTestServer } from "./testkit";
 import { readYamlLoose } from "./yaml-scan";
@@ -1168,6 +1169,135 @@ describe("security", () => {
       ]);
       const browser = await t.api(`/api/h/${id}/security/compliance`);
       expect(String(browser.body["retireNote"])).toContain("retire");
+    } finally {
+      await t.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// An unfinished spec is the NORMAL case for a manager
+// ---------------------------------------------------------------------------
+
+/**
+ * A channel block missing a required field is the most common spec mistake —
+ * and the exact thing these panels exist to name. It used to throw out of the
+ * secret grammar instead, which 500'd five per-harness routes AND the
+ * fleet-wide credentials matrix: one unfinished harness blanked a screen
+ * shared by every harness on the manager.
+ *
+ * Two rules, both pinned below: the spec's fault is REPORTED, and a fold over
+ * the fleet degrades one ROW at most.
+ */
+describe("an unfinished channel block is reported, never a 500", () => {
+  /** telegram.secretToken and slack.signingSecret are simply not written. */
+  const UNFINISHED = [
+    "channels:",
+    "  slack:",
+    "    botToken: $SLACK_BOT_TOKEN",
+    "  telegram:",
+    "    botToken: $TELEGRAM_BOT_TOKEN",
+  ].join("\n");
+
+  async function seedUnfinished(t: TestServer): Promise<string> {
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "unfinished"), {
+      specName: "unfinished-harness",
+      target: "channel",
+      model: "claude-opus-5",
+      specExtra: UNFINISHED,
+      envLines: ["SLACK_BOT_TOKEN=bot", "TELEGRAM_BOT_TOKEN=bot"],
+    });
+    const added = await t.api("/api/harnesses", { method: "POST", body: JSON.stringify({ dir }) });
+    return (added.body["entry"] as { id: string }).id;
+  }
+
+  test("every per-harness route that predicts boot still answers", async () => {
+    const t = boot();
+    try {
+      const id = await seedUnfinished(t);
+      for (const path of [
+        `/api/h/${id}/env`,
+        `/api/h/${id}/doctor`,
+        `/api/h/${id}/channels`,
+        `/api/h/${id}/secrets/doctor`,
+      ]) {
+        const { status } = await t.api(path);
+        expect([path, status]).toEqual([path, 200]);
+      }
+      const verify = await t.api(`/api/h/${id}/channels/verify`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      expect(verify.status).toBe(200);
+      // Reported, not merely survived: the boot gate fails and names the
+      // field, rather than passing it off as an inline literal.
+      const platforms = verify.body["platforms"] as Array<{
+        platform: string;
+        checks: Array<{ pass: boolean; reason: string | null }>;
+      }>;
+      const slack = platforms.find((entry) => entry.platform === "slack");
+      const failed = slack?.checks.find((check) => !check.pass);
+      expect(failed?.reason).toContain("no usable value");
+      expect(verify.body["ok"]).toBe(false);
+      expect(verify.body["failing"]).toContain("slack: Slack signing secret");
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("one unfinished harness cannot blank the fleet matrix", async () => {
+    const t = boot();
+    try {
+      const healthy = await seed(t);
+      const unfinished = await seedUnfinished(t);
+      const { status, body } = await t.api("/api/credentials");
+      expect(status).toBe(200);
+      const harnesses = body["harnesses"] as Array<Record<string, unknown>>;
+      expect(harnesses).toHaveLength(2);
+      // The healthy harness keeps its whole row.
+      const row = harnesses.find((entry) => entry["id"] === healthy.id);
+      const cells = row?.["cells"] as Array<Record<string, unknown>>;
+      expect(cells.some((cell) => cell["name"] === "SLACK_BOT_TOKEN")).toBe(true);
+      expect(harnesses.find((entry) => entry["id"] === unfinished)).toBeDefined();
+      expect(body["unreadable"]).toBe(0);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  /**
+   * Defense in depth for the fold itself. Every reader under `matrixRow` is
+   * individually tolerant today, so this drives the handler with a row whose
+   * derivation throws — the shape ANY future unguarded dereference would
+   * take — and asserts the blast radius stays inside that row.
+   */
+  test("a row whose derivation throws degrades to that row alone", async () => {
+    const t = boot();
+    try {
+      const healthy = await seed(t);
+      const healthyHarness = { id: healthy.id, dir: healthy.dir, specName: "area-harness" };
+      const exploding = {
+        id: "hrn_exploding",
+        specName: "exploding",
+        get dir(): string {
+          throw new Error("the harness directory could not be read");
+        },
+      };
+      const body = (await credentialsMatrix({
+        env: {},
+        now: () => NOW,
+        harnesses: () => [healthyHarness, exploding],
+      } as unknown as M3Context)) as Record<string, unknown>;
+      const harnesses = body["harnesses"] as Array<Record<string, unknown>>;
+      expect(harnesses).toHaveLength(2);
+      const healthyRow = harnesses.find((entry) => entry["id"] === healthy.id);
+      expect((healthyRow?.["cells"] as unknown[]).length).toBeGreaterThan(0);
+      expect(healthyRow?.["unreadable"]).toBeNull();
+      const badRow = harnesses.find((entry) => entry["id"] === "hrn_exploding");
+      expect(badRow?.["cells"]).toEqual([]);
+      expect(String(badRow?.["unreadable"])).toContain("could not be read");
+      expect(body["unreadable"]).toBe(1);
+      expect(String(body["note"])).toContain("rest of the fleet is unaffected");
     } finally {
       await t.stop();
     }

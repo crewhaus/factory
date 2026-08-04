@@ -48,7 +48,7 @@ import { HttpError } from "./http";
 import { readTextCapped } from "./jsonl";
 import { type M3Context, type M3Handler, requireTypedConfirm } from "./m3";
 import { maskSpecYaml, maskText } from "./mask";
-import { commitSpecEdits, previewSpecEdits, readSpecFile } from "./spec-edit";
+import { commitSpecEdits, previewSpecEdits, readSpecFile, requireWholeSpec } from "./spec-edit";
 
 const SPEC_FILE = "crewhaus.yaml";
 const GRADERS_PATH = ["eval", "graders.yaml"] as const;
@@ -403,19 +403,48 @@ const GRADERS_VERB = "crewhaus graders suggest -o eval/graders.yaml";
 export const graderCatalog: M3Handler = (ctx) => {
   const path = ctx.contain([...GRADERS_PATH]);
   const present = existsSync(path);
-  const text = present ? readTextCapped(path, MAX_TEXT_BYTES).text : "";
+  const read = present ? readTextCapped(path, MAX_TEXT_BYTES) : { text: "", truncated: false };
   return {
     ...base(present, present ? null : "this harness has no eval/graders.yaml yet", GRADERS_VERB),
     path: GRADERS_PATH.join("/"),
-    graders: present ? scanGraders(text) : [],
-    yaml: present ? maskSpecYaml(text) : null,
-    hash: present ? hashOf(text) : null,
+    graders: present ? scanGraders(read.text) : [],
+    /** MASKED, and capped — a VIEW of the file. {@link graderWrite} refuses
+     *  to take this string back, because saving it would rename the mask
+     *  over whatever it hid. */
+    yaml: present ? maskSpecYaml(read.text) : null,
+    hash: present ? hashOf(read.text) : null,
+    truncated: read.truncated,
     cardVerb: "crewhaus graders card eval/graders.yaml",
     // The structured builder is a published package this build does not
     // bundle; the YAML pane below it is the write path that works today.
     structuredBuilder: false,
   };
 };
+
+/** The two spans this server's maskers leave behind: `[redacted]` from the
+ *  key-name redactor, `***` from the token-shape one. */
+const MASK_MARKS = ["[redacted]", "***"] as const;
+
+function countOf(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
+
+/**
+ * The mark an incoming document INTRODUCES relative to the stored one, or
+ * null when it introduces none.
+ *
+ * A count, not a substring test: an operator's own `***` already in the file
+ * is theirs to keep, and only an increase means a masked span is arriving
+ * where real content used to be. A document with nothing stored behind it
+ * cannot be a masked view of anything, so that case never asks.
+ */
+export function newlyMaskedSpan(stored: string, incoming: string): string | null {
+  if (stored === "") return null;
+  for (const mark of MASK_MARKS) {
+    if (countOf(incoming, mark) > countOf(stored, mark)) return mark;
+  }
+  return null;
+}
 
 /**
  * `POST /api/h/:id/builders/graders` — write `eval/graders.yaml`.
@@ -425,6 +454,19 @@ export const graderCatalog: M3Handler = (ctx) => {
  * STRUCTURED `{ graders: [...] }` write is refused: its serializer lives in
  * the published grader-builder, and hand-rolling a second one is exactly the
  * duplication this surface exists to avoid.
+ *
+ * Two refusals guard the round trip, because the pane the console posts back
+ * was prefilled from {@link graderCatalog} — a MASKED, CAPPED read:
+ *
+ *   - a body that introduces a mask span the stored file does not have is
+ *     the masked view being saved over the real document. Persisting `***`
+ *     would replace whatever it hid: silent data loss dressed up as safety.
+ *   - a stored file past the read cap cannot be compared (and the pane only
+ *     ever held its head), so the write is refused rather than allowed to
+ *     truncate it.
+ *
+ * Both name the verb that does the job. A masked or capped read is a VIEW,
+ * never a source for a write.
  */
 export const graderWrite: M3Handler = (ctx) => {
   const yaml = ctx.body["yaml"];
@@ -443,8 +485,28 @@ export const graderWrite: M3Handler = (ctx) => {
   if (yaml.trim() === "") throw new HttpError(400, '"yaml" is empty');
   const file = readSpecFile(ctx);
   requireTypedConfirm(ctx.body, file.specName);
+  const stored = existsSync(path)
+    ? readTextCapped(path, MAX_TEXT_BYTES)
+    : { text: "", truncated: false };
+  if (stored.truncated) {
+    throw new HttpError(
+      409,
+      `the existing ${GRADERS_PATH.join("/")} is larger than this server reads (${MAX_TEXT_BYTES} bytes) — refusing to replace a file it could only show you the head of. Edit it with \`${GRADERS_VERB}\` or an editor.`,
+    );
+  }
+  const mark = newlyMaskedSpan(stored.text, yaml);
+  if (mark !== null) {
+    throw new HttpError(
+      409,
+      `this body introduces a masked span (${mark}) the stored ${GRADERS_PATH.join("/")} does not have — the editor pane is served MASKED, and saving it would replace what the mask hid. Edit the file with \`${GRADERS_VERB}\` or an editor.`,
+    );
+  }
   const dir = ctx.contain([GRADERS_PATH[0]]);
   mkdirSync(dir, { recursive: true });
+  // In PLACE, not tmp+rename: `mode` applies only when the file is created,
+  // so an existing graders.yaml keeps the permissions its author gave it.
+  // (A rename would replace the inode and impose this mode — which is the
+  // trap `writeSpecFile` has to work around.)
   writeFileSync(path, yaml.endsWith("\n") ? yaml : `${yaml}\n`, { mode: 0o644 });
   // Re-read: the answer is what is on disk, not what was sent.
   const onDisk = readTextCapped(path, MAX_TEXT_BYTES).text;
@@ -641,6 +703,40 @@ const ENV_REF_ANYWHERE_RE = /\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/;
  * masker sees it: the token-shape masker only masks a generic opaque string
  * when a key-ish word precedes it, and here the key IS that context.
  */
+/**
+ * Which part of an SSE URL looks like a credential, or undefined when none
+ * does. Checks the three places a key actually rides:
+ *
+ *   userinfo      — `https://user:KEY@host/…` (also leaks via Referer)
+ *   path segment  — `/v2/<32+ opaque chars>`, the Alchemy/Infura shape
+ *   query value   — `?apiKey=…`, by key name OR by opaque shape
+ *
+ * Deliberately refuses rather than masks: this value is written into the
+ * harness's committed `crewhaus.yaml`.
+ */
+export function sseUrlCredential(url: string): string | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return undefined; // not a URL we can reason about; the spec editor path applies
+  }
+  if (parsed.username !== "" || parsed.password !== "") return "userinfo";
+  for (const segment of parsed.pathname.split("/")) {
+    if (OPAQUE_URL_PART_RE.test(segment)) return "a path segment";
+  }
+  for (const [key, value] of parsed.searchParams) {
+    if (value !== "" && (isCredentialKey(key) || OPAQUE_URL_PART_RE.test(value))) {
+      return `the "${key}" query parameter`;
+    }
+  }
+  return undefined;
+}
+
+/** A standalone opaque token: long, and not a word. Mirrors the read-side
+ *  rule in `mask.ts` so the write refusal and the display masking agree. */
+const OPAQUE_URL_PART_RE = /^[A-Za-z0-9_-]{32,}$/;
+
 export function looksLikeCredential(key: string, value: string): boolean {
   if (value === "") return false;
   if (isCredentialKey(key)) return true;
@@ -781,6 +877,10 @@ export const mcpConnectors: M3Handler = (ctx) => {
     findings,
     confirmName: file.specName,
     catalogRoute: "mcpCatalog",
+    /** True ⇒ this list was scanned from the HEAD of an over-cap spec, so a
+     *  server declared past the cap is missing from it — and both connector
+     *  writes refuse rather than round-trip that read. */
+    truncated: file.truncated,
   };
 };
 
@@ -819,6 +919,18 @@ function connectorValue(ctx: M3Context): { name: string; value: Record<string, u
   if (transport === "sse") {
     const url = ctx.body["url"];
     if (typeof url !== "string" || url === "") throw new HttpError(400, 'sse needs a "url"');
+    // The URL is a credential carrier too, and the read-side masker cannot
+    // save us here: masking a value that has already been written is not the
+    // same as refusing to write it. An Alchemy/Infura-style key rides in a
+    // PATH SEGMENT (`/v2/<key>`), a query value, or userinfo — and this value
+    // lands in `crewhaus.yaml`, which is committed to the operator's repo.
+    const credentialPart = sseUrlCredential(url);
+    if (credentialPart !== undefined) {
+      throw new HttpError(
+        400,
+        `sse "url" carries ${credentialPart} that looks like a credential — put it in this harness's .env and reference it, or add the connector as a spec edit through the editor. The spec is committed; a value here is a leak.`,
+      );
+    }
     if (ctx.body["headers"] !== undefined) {
       // SSE auth headers are credential carriers with their own lowering
       // rules. This form refuses to guess them: they are a spec edit, made
@@ -864,6 +976,11 @@ export const mcpConnectorWrite: M3Handler = async (ctx) => {
       verb: "crewhaus init",
     });
   }
+  // A connector write is a spec edit, so it inherits the write path's
+  // refusal — but it has to fire HERE, before the dry run: a preview built
+  // from the head of an over-cap spec would show a clean diff for a batch
+  // that can never be applied.
+  requireWholeSpec(file);
   const { name, value } = connectorValue(ctx);
   const edits = [{ path: [MCP_KEY, name], value }];
   const preview = previewSpecEdits(file.text, edits);
@@ -901,6 +1018,9 @@ export const mcpConnectorWrite: M3Handler = async (ctx) => {
  */
 export const mcpConnectorRemove: M3Handler = async (ctx) => {
   const file = readSpecFile(ctx);
+  // Before the "is it declared?" answer, which would otherwise be read off
+  // the head of an over-cap spec and report a server past the cap as absent.
+  requireWholeSpec(file);
   const name = ctx.params["name"] as string;
   const declared = scanMcpServers(file.text).map((s) => s.name);
   if (!declared.includes(name)) {

@@ -143,8 +143,21 @@ export function overallDatasetHash(
 ): string {
   const wanted = new Set(splits);
   const h = createHash("sha256");
+  // TOLERANT OF AN ABSENT `splits`, DELIBERATELY NOT OF ABSENT HASHES —
+  // the two cases mean different things and must not be collapsed.
+  //
+  //   no `splits` at all  — a bare/pre-registry record. There are no samples,
+  //                         so the empty digest IS its honest identity.
+  //   `splits` but no `sampleHashes` — the record HAS samples and has lost
+  //                         their hashes. Hashing it as if empty would let
+  //                         two different datasets compare equal, and the
+  //                         regression-union guard relies on this throw to
+  //                         notice a corrupt suite record and fall back to
+  //                         the materialized primary instead of silently
+  //                         running a 0-sample eval.
+  const recordSplits = record.splits ?? {};
   for (const s of SPLIT_ORDER) {
-    if (!wanted.has(s) || record.splits[s] === undefined) continue;
+    if (!wanted.has(s) || recordSplits[s] === undefined) continue;
     h.update(`${s}:${(record.sampleHashes[s] ?? []).join(",")}\n`);
   }
   return h.digest("hex");
@@ -176,10 +189,18 @@ export type HashMismatch = {
  */
 export function verifySplitHashes(record: DatasetRecord): HashMismatch[] {
   const mismatches: HashMismatch[] = [];
+  // `splits` and `sampleHashes` are REQUIRED by the type but optional in
+  // reality: records are `JSON.parse`d off disk and cast, and the record this
+  // function exists to catch — hand-written, hand-edited, pre-registry — is
+  // exactly the one that may carry neither. Guarding only the inner index
+  // turns "this file is missing its hashes" into a crash in every caller that
+  // verifies a whole registry.
+  const splits = record.splits ?? {};
+  const sampleHashes = record.sampleHashes ?? {};
   for (const split of SPLIT_ORDER) {
-    const samples = record.splits[split];
+    const samples = splits[split];
     if (samples === undefined) continue;
-    const stored = record.sampleHashes[split] ?? [];
+    const stored = sampleHashes[split] ?? [];
     const n = Math.max(samples.length, stored.length);
     for (let i = 0; i < n; i++) {
       const sample = samples[i];

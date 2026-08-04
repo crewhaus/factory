@@ -41,6 +41,22 @@ afterAll(() => {
  */
 const SPAWN_CWD = newTempRoot();
 
+/**
+ * Hermetic harness registry for every spawn in this file.
+ *
+ * `run`/`compile`/`eval`/`dev` self-register the harness they touch, and for
+ * a spec passed by path that is the SPEC's directory — which here is
+ * `apps/cli/test-fixtures/minimal-*`, inside the repo. The default registry
+ * root's ephemeral-cwd guard cannot help (it looks at the cwd, not at the
+ * spec dir), so without this every run of this file writes a row into the
+ * developer's real `~/.crewhaus/harnesses.json`.
+ */
+const REGISTRY_ROOT = newTempRoot();
+const HERMETIC_REGISTRY: Record<string, string> = {
+  CREWHAUS_REGISTRY_ROOT: join(REGISTRY_ROOT, "registry"),
+  CREWHAUS_WATCHME_ROOT: join(REGISTRY_ROOT, "watchme"),
+};
+
 async function runCli(
   args: ReadonlyArray<string>,
   cwd: string = SPAWN_CWD,
@@ -49,6 +65,7 @@ async function runCli(
     cwd,
     env: {
       PATH: process.env["PATH"] ?? "",
+      ...HERMETIC_REGISTRY,
       // Hermetic dataset registry per invocation: `crewhaus eval` unions the
       // per-spec `<specName>-regressions` suite (item 9) from the registry
       // under the cwd by default, and `optimize` PINS into it — running with
@@ -314,7 +331,7 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
   ): Promise<{ exitCode: number; stderr: string }> {
     const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
       cwd,
-      env: { PATH: process.env["PATH"] ?? "" },
+      env: { PATH: process.env["PATH"] ?? "", ...HERMETIC_REGISTRY },
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",

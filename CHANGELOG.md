@@ -109,6 +109,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supervision state is harness-local under `.crewhaus/run/`, and a daemon
   either head starts is adopted by the other.
 
+- **The Hangar console gained its detail surface.** M3 adds 178 routes to
+  `@crewhaus/hangar-server` and eight harness tabs plus three fleet screens to
+  `@crewhaus/hangar-ui`, across six areas: the spec's write side (structured
+  editing with trust tiers, diff interstitial, version pin/rollback, and the
+  template/grader/dataset/MCP-connector builders), the memory fabric's write
+  side (facts with forget/sweep, continuity trash + restore, the wiki editor,
+  watch-me analytics/reports/intents/synthesize), the eval + dataset +
+  feedback loops (matrix, trends, judge, graders, coverage, sentinel; the
+  dataset registry with hygiene and growth; the fewshot/faq/lessons/advice
+  feeds), credentials + channels + security (env-key presence, the fleet-wide
+  provider matrix, channel provisioning and verification, egress/PII/
+  compliance/on-chain/retention), a server-side Thredz proxy, and the raw
+  store inspectors. The route contract was frozen ahead of the handlers and is
+  EXECUTABLE from both sides: `hangar-ui`'s `routes.js` carries every route as
+  pure data (which is also what generates the client wrappers instead of
+  hand-writing 178 of them), and the server's contract test asserts the two
+  tables are the same set — key, method and path — then drives each route
+  against a live fixture server. One route is deliberately unimplemented and
+  says so: `POST /api/h/:id/secrets/:name/rotate` needs
+  `@crewhaus/secrets-manager`, which the server does not depend on.
+
+  Every write on that surface goes through the layer that already owns it,
+  never around it: spec edits through `applySpecEdits` with
+  `restrictToOptimizable` (a human-owned path routes to `crewhaus propose`
+  rather than being written), env through `upsertEnvVar` (values in, presence
+  booleans out), no hard delete anywhere in the memory fabric (tombstones,
+  trash directories and TTL sweeps only), wiki writes carrying
+  `expectedVersion` with a first-class stale-version refusal, Thredz keys read
+  server-side and never returned, and a confirm → typed-confirm →
+  dry-run-first ladder in front of destructive verbs. Every M3 read answers
+  `{present, note, verb}` alongside its payload, so an empty panel says why it
+  is empty and which CLI verb fills it.
+
 - **Compiled daemon bundles now serve `crewhaus.control.v1`.** Every daemon
   shape (channel, managed, crew, voice, batch) constructs a control plane at
   boot. It binds a loopback listener ONLY when `CREWHAUS_CONTROL_PORT` is

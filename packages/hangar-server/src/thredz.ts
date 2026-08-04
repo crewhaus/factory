@@ -45,7 +45,9 @@
  *     `DELETE /records/:id` destroys the document — so a record "delete" here
  *     is an UPDATE that parks the record in the `deleted` status and stashes
  *     the status it had, and restore puts that status back. This module never
- *     issues an upstream DELETE.
+ *     issues an upstream DELETE. BOTH HALVES ARE IDEMPOTENT: delete refuses a
+ *     record already parked, restore refuses one that is not, and neither
+ *     ever writes a `null` status over a live one.
  *   - VISIBILITY IS ALWAYS EXPLICIT. Hangar sets `visibility` on every CREATE,
  *     defaulting to private — the API's shared-by-default behaviour is a
  *     foot-gun the manager neutralizes rather than inherits. An UPDATE sends
@@ -53,7 +55,12 @@
  *     edit can never silently flip an article public.
  *   - WIKI WRITES CARRY `expectedVersion` and use the same
  *     `stale_article_version` re-read-retry UX as the local wiki
- *     (`wiki-ops.ts`). Identical, deliberately.
+ *     (`wiki-ops.ts`). Identical, deliberately — including the REFUSAL when
+ *     an update arrives without one, because a blind write is a lost update
+ *     and the local store refuses the byte-identical request.
+ *   - AN UPDATE SENDS ONLY WHAT THE CALLER SUPPLIED, and never a body that
+ *     newly carries the mask mark. Every article is served masked; a default
+ *     or a masked span written back destroys what it replaced.
  *   - THE `## Sources` GATE IS LOCAL-ONLY. Not displayed as a Thredz rule.
  *   - DASHBOARD CARD GRAMMAR IS VALIDATED UPSTREAM AND IT IS FUSSY: KPI
  *     cards require both `display.aggregation` AND `display.aggregationField`;
@@ -799,6 +806,23 @@ function objectField(body: Readonly<Record<string, unknown>>, key: string): Extr
   return asRecord(body[key]);
 }
 
+/**
+ * What value-shape masking leaves behind (`MASKED_TOKEN` in
+ * `@crewhaus/spec-patch`, which does not re-export it).
+ *
+ * It matters on the WRITE side: every article this module serves has been
+ * through `maskText`, so text that came from a console editor may carry a
+ * mark where a real span used to be. Persisting it replaces what it hid.
+ */
+const MASK_MARK = "***";
+
+/** How many mask marks a document carries. Comparing the incoming count with
+ *  the stored one is what separates "the operator wrote three asterisks" from
+ *  "the masked view is being written back". */
+function countMaskMarks(text: string): number {
+  return text.split(MASK_MARK).length - 1;
+}
+
 /** Article free text is masked by hand as well as by `maskDeep`: prose is
  *  where a pasted credential hides from key-based redaction. */
 function maskArticle(article: unknown): unknown {
@@ -969,6 +993,24 @@ export const thredzWikiArticle: M3Handler = async (ctx) => {
  * only when the caller explicitly asked to change it. A version conflict
  * answers with the current version so the client runs the same re-read-retry
  * flow as the local wiki.
+ *
+ * Three rules an UPDATE holds that a CREATE does not, each one a way this
+ * route could otherwise destroy someone else's writing:
+ *
+ *   1. AN OMITTED FIELD IS LEFT ALONE. A PATCH carries only what the caller
+ *      explicitly supplied. `title` defaulting to the slug and `status`
+ *      defaulting to `published` are CREATE defaults; applied to an existing
+ *      article they rename it and force-publish a draft, silently. The local
+ *      wiki spreads its optional fields conditionally for exactly this
+ *      reason (`wiki-ops.ts`).
+ *   2. `expectedVersion` IS REQUIRED. Without it neither side can detect a
+ *      concurrent edit, and `@crewhaus/wiki-store` refuses the identical
+ *      write — the two backends must not disagree about a lost update. It
+ *      stays optional on the CREATE branch, where there is nothing to lose.
+ *   3. A BODY THAT NEWLY CARRIES THE MASK MARK IS REFUSED. Every article is
+ *      served masked; writing that view back persists `***` over whatever it
+ *      hid. The console guards its editor, but the guard has to hold for a
+ *      direct API call too.
  */
 export const thredzWikiWrite: M3Handler = async (ctx) => {
   const r = resolveHarnessSession(ctx);
@@ -982,32 +1024,65 @@ export const thredzWikiWrite: M3Handler = async (ctx) => {
     ctx.body["visibility"] === "private" || ctx.body["visibility"] === "shared"
       ? (ctx.body["visibility"] as "private" | "shared")
       : undefined;
+  const rawVersion = ctx.body["expectedVersion"];
   const expectedVersion =
-    typeof ctx.body["expectedVersion"] === "number" ? ctx.body["expectedVersion"] : undefined;
+    typeof rawVersion === "number" && Number.isInteger(rawVersion) && rawVersion >= 0
+      ? rawVersion
+      : undefined;
+  const explicitTitle = stringField(ctx.body["title"]);
+  const explicitStatus = stringField(ctx.body["status"]);
+  // Everything the caller ACTUALLY asked for. `title` and `status` are
+  // spread conditionally like their siblings; their CREATE defaults are
+  // applied on the create branch alone.
   const fields: Extra = {
     slug,
     body: bodyText,
-    title: stringField(ctx.body["title"]) ?? slug,
+    ...(explicitTitle !== null ? { title: explicitTitle } : {}),
     ...(stringField(ctx.body["summary"]) !== null ? { summary: ctx.body["summary"] } : {}),
     ...(Array.isArray(ctx.body["tags"]) ? { tags: ctx.body["tags"] } : {}),
     ...(stringField(ctx.body["category"]) !== null ? { category: ctx.body["category"] } : {}),
-    status: stringField(ctx.body["status"]) ?? "published",
+    ...(explicitStatus !== null ? { status: explicitStatus } : {}),
     editMessage: stringField(ctx.body["editMessage"]) ?? "hangar edit",
   };
   const encoded = encodeURIComponent(slug);
+  // The projection carries `body` because the write path needs the STORED
+  // text to tell an edit apart from a masked view being written back.
   const existing = await callThredz(r.session, "GET", `/wiki/articles/${encoded}`, {
-    query: { fields: "id,slug,version" },
+    query: { fields: "id,slug,version,title,status,body" },
   });
   if (existing.ok) {
     const doc = asRecord(existing.data);
     const inner = asRecord(doc["article"]);
     const current = Object.keys(inner).length > 0 ? inner : doc;
     const currentVersion = typeof current["version"] === "number" ? current["version"] : null;
-    if (
-      expectedVersion !== undefined &&
-      currentVersion !== null &&
-      currentVersion !== expectedVersion
-    ) {
+    if (expectedVersion === undefined) {
+      // A blind update is a lost update. The local backend refuses this exact
+      // request (`stale_article_version` with `expectedVersion: null`), so
+      // this one does too — and says so in the same first-class shape, which
+      // is also what a "create" aimed at an existing slug lands on.
+      return envelope(
+        ctx,
+        {
+          present: false,
+          note:
+            currentVersion === null
+              ? `"${slug}" already exists in this workspace — an update carries the version you read ("expectedVersion"); re-read it and re-apply the edit`
+              : `"${slug}" already exists at version ${currentVersion} — an update carries the version you read ("expectedVersion"); re-read it and re-apply the edit`,
+          verb: null,
+          ok: false,
+          resolution: r,
+        },
+        {
+          slug,
+          wrote: false,
+          stale: true,
+          versionRequired: true,
+          currentVersion,
+          expectedVersion: null,
+        },
+      );
+    }
+    if (currentVersion !== null && currentVersion !== expectedVersion) {
       // The same first-class refusal the local wiki gives: nothing is
       // written, the mover's version comes back, the client re-reads.
       return envelope(
@@ -1022,11 +1097,42 @@ export const thredzWikiWrite: M3Handler = async (ctx) => {
         { slug, wrote: false, stale: true, currentVersion, expectedVersion },
       );
     }
+    // `maskArticle` masks the title as well as the body, so both round-trip
+    // through a console editor and both are checked. A field carrying more
+    // mask marks than the stored one is that masked VIEW coming back:
+    // writing it replaces a real span with `***`, which the manager cannot
+    // un-mask. With no stored text to compare against the guard fails
+    // CLOSED — a mask mark it cannot account for is refused, not written.
+    const storedBody = typeof current["body"] === "string" ? current["body"] : null;
+    const storedTitle = typeof current["title"] === "string" ? current["title"] : null;
+    const maskedField =
+      countMaskMarks(bodyText) > countMaskMarks(storedBody ?? "")
+        ? "body"
+        : explicitTitle !== null &&
+            countMaskMarks(explicitTitle) > countMaskMarks(storedTitle ?? "")
+          ? "title"
+          : null;
+    if (maskedField !== null) {
+      const blind = maskedField === "body" ? storedBody === null : storedTitle === null;
+      return envelope(
+        ctx,
+        {
+          present: false,
+          note: blind
+            ? `this ${maskedField} carries a masked credential-shaped span ("${MASK_MARK}") and the workspace returned no stored text to compare it against — saving it could persist the mask over whatever it hid; edit "${slug}" in the Thredz workspace instead`
+            : `this ${maskedField} carries a masked credential-shaped span ("${MASK_MARK}") that the stored article does not — saving it would persist the mask over whatever it hid; edit "${slug}" in the Thredz workspace instead`,
+          verb: null,
+          ok: false,
+          resolution: r,
+        },
+        { slug, wrote: false, maskedWrite: true, maskedField, currentVersion, expectedVersion },
+      );
+    }
     const patch = await callThredz(r.session, "PATCH", `/wiki/articles/${encoded}`, {
       body: {
         ...fields,
         ...(explicitVisibility !== undefined ? { visibility: explicitVisibility } : {}),
-        ...(expectedVersion !== undefined ? { version: expectedVersion } : {}),
+        version: expectedVersion,
       },
     });
     if (!patch.ok) {
@@ -1059,8 +1165,15 @@ export const thredzWikiWrite: M3Handler = async (ctx) => {
   }
   if (existing.status !== 404) return refused(ctx, r, existing, null, { slug, wrote: false });
   const visibility = explicitVisibility ?? r.session.defaultVisibility;
+  // CREATE defaults — a new article needs a title and a status, and there is
+  // nothing here to overwrite. They are deliberately NOT applied above.
   const created = await callThredz(r.session, "POST", "/wiki/articles", {
-    body: { ...fields, visibility },
+    body: {
+      ...fields,
+      title: explicitTitle ?? slug,
+      status: explicitStatus ?? "published",
+      visibility,
+    },
   });
   if (!created.ok) return refused(ctx, r, created, null, { slug, wrote: false });
   return answered(
@@ -1272,8 +1385,17 @@ export const thredzRecordDelete: M3Handler = async (ctx) => {
   );
 };
 
-/** `POST /api/h/:id/thredz/records/:recordId/restore` — undo a soft delete.
- *  Its existence is what makes the delete affordance acceptable. */
+/**
+ * `POST /api/h/:id/thredz/records/:recordId/restore` — undo a soft delete.
+ * Its existence is what makes the delete affordance acceptable.
+ *
+ * IT MUST BE IDEMPOTENT. A restore that ran already has consumed the stash,
+ * so a second one has nothing to put back — and a double-clicked button, a
+ * retried request after the 10 s timeout, or a restore aimed at a record
+ * that was never deleted all arrive here. Each of those is a NO-OP reported
+ * as a fact (the shape the delete route uses for `alreadyDeleted`), never a
+ * write of `null` over a live status.
+ */
 export const thredzRecordRestore: M3Handler = async (ctx) => {
   const r = resolveHarnessSession(ctx);
   const recordId = ctx.params["recordId"] ?? "";
@@ -1282,14 +1404,34 @@ export const thredzRecordRestore: M3Handler = async (ctx) => {
   const current = await callThredz(r.session, "GET", `/records/${encoded}`);
   if (!current.ok) return refused(ctx, r, current, null, { recordId, restored: false });
   const doc = asRecord(current.data);
+  if (doc["status"] !== DELETED_STATUS) {
+    return answered(
+      ctx,
+      r,
+      {
+        present: true,
+        note: "this record is not soft-deleted — there is nothing to restore, and nothing was written",
+      },
+      {
+        recordId,
+        restored: false,
+        notDeleted: true,
+        status: stringField(doc["status"]),
+      },
+    );
+  }
   const customFields = asRecord(doc["customFields"]);
   const previous = customFields[RESTORE_FIELD];
+  const status = typeof previous === "string" && previous !== "" ? previous : null;
   const restored: Extra = { ...customFields };
   delete restored[RESTORE_FIELD];
   delete restored[DELETED_AT_FIELD];
   const result = await callThredz(r.session, "PUT", `/records/${encoded}`, {
     body: {
-      status: typeof previous === "string" && previous !== "" ? previous : null,
+      // No stashed status means the manager does not KNOW what to put back.
+      // The field is omitted rather than sent as `null`, which would blank
+      // whatever status the record carries.
+      ...(status !== null ? { status } : {}),
       customFields: restored,
     },
   });
@@ -1297,13 +1439,14 @@ export const thredzRecordRestore: M3Handler = async (ctx) => {
   return answered(
     ctx,
     r,
-    { present: true },
     {
-      recordId,
-      restored: true,
-      status: typeof previous === "string" ? previous : null,
-      record: result.data,
+      present: true,
+      note:
+        status === null
+          ? "no previous status was stashed, so the record's status is left exactly as it is — set it in the workspace"
+          : null,
     },
+    { recordId, restored: status !== null, status, record: result.data },
   );
 };
 

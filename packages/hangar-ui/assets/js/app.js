@@ -12,21 +12,24 @@
  * M3 adds the detail tabs (Datasets, Feedback, Credentials, Channels,
  * Security, Thredz, Inspect, Dev & MCP), stacks an M3 half beneath the
  * existing Spec, Evals and Memory panels, and puts the fleet credential
- * matrix, feedback rollup and Thredz explorer in the rail. Their handlers
- * are still stubs, so those screens render an honest "not built yet" surface
- * that lists the routes they will read — navigation is real from day one so
- * the shape of the app is reviewable before the data arrives.
+ * matrix, feedback rollup and Thredz explorer in the rail.
+ *
+ * The tab strip is where the shape × panel matrix is applied: the target
+ * shape decides which tabs are live and which render disabled with the
+ * reason (`tabAvailability` in router.js owns the table). Gating stops at
+ * the strip — a deep link to an off-matrix tab still resolves and the
+ * screen still answers, so no URL an operator saved goes dead.
  */
 
 import { ApiError, api, onUnauthorized, setToken } from "./api.js";
 import { clear, copyBtn, dot, el, skeleton, toast } from "./dom.js";
 import {
-  HARNESS_TABS,
   hrefGlobal,
   hrefHarness,
   hrefLibrary,
   parseRoute,
   startRouter,
+  tabAvailability,
 } from "./router.js";
 import { shapeAccent, shapeLabel } from "./shapes.js";
 import { procRow } from "./supervision.js";
@@ -284,19 +287,27 @@ async function renderHarnessPage(root, route) {
     reload: () => renderHarnessPage(root, route),
   };
   root.appendChild(harnessHeader(detail, route, ctx));
-  const nav = el(
-    "nav",
-    { class: "tabs", "aria-label": "harness tabs" },
-    HARNESS_TABS.map((tab) =>
-      el("a", {
-        class: `tab${route.tab === tab ? " active" : ""}`,
-        "aria-current": route.tab === tab ? "page" : null,
-        href: hrefHarness(route.id, tab),
-        text: TAB_LABELS[tab] ?? tab,
-      }),
+  // The shape × panel matrix, applied where the strip is drawn: a tab this
+  // target's schema cannot declare renders as a disabled label carrying the
+  // reason, not as a link into a screen whose only content is "not
+  // applicable". The deep link still resolves, so a shared URL still opens.
+  const availability = tabAvailability(targetOf(detail));
+  root.appendChild(
+    el(
+      "nav",
+      { class: "tabs", "aria-label": "harness tabs" },
+      availability.map((row) => tabNode(route, row)),
     ),
   );
-  root.appendChild(nav);
+  const current = availability.find((row) => row.tab === route.tab);
+  if (current !== undefined && !current.on) {
+    root.appendChild(
+      el("div", { class: "rollup" }, [
+        dot("off", "off this shape's panel matrix"),
+        el("span", { class: "muted", text: current.reason }),
+      ]),
+    );
+  }
   const tabRoot = el("div", { class: "tab-body" });
   root.appendChild(tabRoot);
   // The three tabs that gained an M3 half render the M1/M2 surface first and
@@ -326,6 +337,48 @@ async function renderHarnessPage(root, route) {
   else await renderOverview(tabRoot, ctx);
 }
 
+/**
+ * One tab in the strip. An on-matrix tab is a link; an off-matrix one is a
+ * disabled label whose accessible name carries the reason as TEXT — the
+ * dimming is never the whole message.
+ */
+function tabNode(route, row) {
+  const label = TAB_LABELS[row.tab] ?? row.tab;
+  const active = route.tab === row.tab;
+  if (row.on) {
+    return el("a", {
+      class: `tab${active ? " active" : ""}`,
+      "aria-current": active ? "page" : null,
+      href: hrefHarness(route.id, row.tab),
+      text: label,
+    });
+  }
+  return el("span", {
+    class: `tab tab-off muted${active ? " active" : ""}`,
+    // The console ships one stylesheet and this state is the only new one on
+    // the strip, so it dims inline rather than growing the CSS a rule that
+    // one span uses. The reason still travels as text, in both the tooltip
+    // and the accessible name — the dimming is a hint, never the message.
+    style: { opacity: "0.45", cursor: "not-allowed" },
+    "aria-disabled": "true",
+    "aria-current": active ? "page" : null,
+    "aria-label": `${label} — not part of this shape: ${row.reason}`,
+    title: row.reason,
+    text: label,
+  });
+}
+
+/** The target shape string, read from the same places the header reads it
+ *  (the inventory's parsed header first, the registry row as the fallback).
+ *  One reader, so the strip and the badge can never disagree. */
+function targetOf(detail) {
+  const entry = detail.entry && typeof detail.entry === "object" ? detail.entry : {};
+  const inv = detail.inventory && typeof detail.inventory === "object" ? detail.inventory : {};
+  const header = inv.header && typeof inv.header === "object" ? inv.header : {};
+  const explicit = header.target ?? entry.target;
+  return typeof explicit === "string" ? explicit : "";
+}
+
 /** Append a fresh sub-container so a second render into the same tab does
  *  not clear the first (every view clears the root it is handed). */
 function section(root) {
@@ -344,9 +397,8 @@ function section(root) {
 function harnessHeader(detail, route, ctx) {
   const entry = detail.entry && typeof detail.entry === "object" ? detail.entry : {};
   const inv = detail.inventory && typeof detail.inventory === "object" ? detail.inventory : {};
-  const header = inv.header && typeof inv.header === "object" ? inv.header : {};
   const name = String(inv.specName ?? entry.specName ?? route.id);
-  const target = String(header.target ?? entry.target ?? "");
+  const target = targetOf(detail);
   const dir = String(entry.dir ?? "");
   const missing = detail.missing === true || typeof entry.missingSince === "string";
   const head = el("div", { class: "h-head", style: { "--accent": shapeAccent(target) } }, [

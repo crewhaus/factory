@@ -508,7 +508,27 @@ export const memoryFacts: M3Handler = (ctx) => {
   const spec = ctx.params["spec"] ?? "";
   const path = containedPath(ctx, [".crewhaus", "memories", `${spec}.jsonl`]);
   const stems = factStems(ctx);
-  if (path === undefined || !existsSync(path)) {
+  // Refused by containment is NOT absent. The file may well exist — it is a
+  // symlink out of the harness — and reporting "no memories/<spec>.jsonl"
+  // would blame the operator for an absence that is really a refusal, and
+  // hide the one fact worth acting on. `inspect/raw` already says the true
+  // thing; say it identically here.
+  if (path === undefined) {
+    return {
+      ...readBase(
+        false,
+        `memories/${spec}.jsonl resolves outside the harness directory and is not readable from here`,
+        null,
+      ),
+      specName: spec,
+      specs: stems,
+      counts: { live: 0, superseded: 0, expired: 0, total: 0 },
+      items: [],
+      truncated: false,
+      torn: 0,
+    };
+  }
+  if (!existsSync(path)) {
     return {
       ...readBase(
         false,

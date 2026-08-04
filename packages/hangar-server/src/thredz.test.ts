@@ -604,6 +604,192 @@ describe("wiki writes", () => {
     expect(JSON.stringify(article)).not.toContain(leaked);
     expect(String((article["article"] as Record<string, unknown>)["body"])).toContain("***");
   });
+
+  test("an UPDATE sends ONLY what the caller supplied — no title rename, no forced publish", async () => {
+    // The fields a caller omits belong to the article, not to this route: a
+    // defaulted `title` renames it to its slug and a defaulted `status`
+    // publishes a draft, both silently and both upstream.
+    const workspace = stub({
+      "GET /wiki/articles/auth": {
+        status: 200,
+        body: { slug: "auth", title: "Auth Runbook", status: "draft", version: 7 },
+      },
+      "PATCH /wiki/articles/auth": { status: 200, body: { slug: "auth", version: 8 } },
+    });
+    const t = boot();
+    const id = await register(t, wiredHarness(workspace.base, { key: TEST_KEY }));
+    const wrote = await send(t, "PUT", `/api/h/${id}/thredz/wiki/auth`, {
+      body: "MY TEXT",
+      expectedVersion: 7,
+    });
+    expect(wrote["wrote"]).toBe(true);
+    const patch = workspace.calls.find((c) => c.method === "PATCH") as StubCall;
+    const sent = patch.body as Record<string, unknown>;
+    expect(sent["body"]).toBe("MY TEXT");
+    expect(sent).not.toHaveProperty("title");
+    expect(sent).not.toHaveProperty("status");
+    // A caller who DOES ask for them still gets them.
+    const explicit = await send(t, "PUT", `/api/h/${id}/thredz/wiki/auth`, {
+      body: "MY TEXT",
+      title: "Auth Runbook v2",
+      status: "review",
+      expectedVersion: 7,
+    });
+    expect(explicit["wrote"]).toBe(true);
+    const second = workspace.calls.filter((c) => c.method === "PATCH")[1] as StubCall;
+    expect((second.body as Record<string, unknown>)["title"]).toBe("Auth Runbook v2");
+    expect((second.body as Record<string, unknown>)["status"]).toBe("review");
+  });
+
+  test("a CREATE still gets its title and status defaults", async () => {
+    const workspace = stub({
+      "GET /wiki/articles/new-note": { status: 404, body: { message: "Not found" } },
+      "POST /wiki/articles": { status: 201, body: { slug: "new-note", version: 1 } },
+    });
+    const t = boot();
+    const id = await register(t, wiredHarness(workspace.base, { key: TEST_KEY }));
+    const wrote = await send(t, "PUT", `/api/h/${id}/thredz/wiki/new-note`, { body: "# New\n" });
+    expect(wrote["created"]).toBe(true);
+    const post = workspace.calls.find((c) => c.method === "POST") as StubCall;
+    const sent = post.body as Record<string, unknown>;
+    expect(sent["title"]).toBe("new-note");
+    expect(sent["status"]).toBe("published");
+  });
+
+  test("an UPDATE with no expectedVersion is REFUSED — the local store refuses the identical write", async () => {
+    // A blind update is a lost update. `@crewhaus/wiki-store` answers
+    // `stale_article_version` for this exact request; the two backends must
+    // not disagree. It is also what a "create" aimed at a slug that already
+    // exists lands on — the console's New-article form never sends a version.
+    const workspace = stub({
+      "GET /wiki/articles/how-to-deploy": {
+        status: 200,
+        body: { slug: "how-to-deploy", title: "Deploy", status: "draft", version: 7 },
+      },
+      "PATCH /wiki/articles/how-to-deploy": { status: 200, body: { version: 8 } },
+    });
+    const t = boot();
+    const id = await register(t, wiredHarness(workspace.base, { key: TEST_KEY }));
+    const wrote = await send(t, "PUT", `/api/h/${id}/thredz/wiki/how-to-deploy`, {
+      body: "MY TEXT",
+      title: "Deploy",
+      visibility: "private",
+    });
+    expect(wrote["ok"]).toBe(false);
+    expect(wrote["wrote"]).toBe(false);
+    expect(wrote["stale"]).toBe(true);
+    expect(wrote["versionRequired"]).toBe(true);
+    expect(wrote["currentVersion"]).toBe(7);
+    expect(String(wrote["note"])).toContain("expectedVersion");
+    // Nothing was written: no PATCH, so no lost update and no visibility flip.
+    expect(workspace.calls.some((c) => c.method === "PATCH")).toBe(false);
+  });
+
+  test("a non-integer expectedVersion is treated as absent rather than as a check", async () => {
+    const workspace = stub({
+      "GET /wiki/articles/how-to-deploy": { status: 200, body: { slug: "how-to-deploy" } },
+      "PATCH /wiki/articles/how-to-deploy": { status: 200, body: { version: 8 } },
+    });
+    const t = boot();
+    const id = await register(t, wiredHarness(workspace.base, { key: TEST_KEY }));
+    const wrote = await send(t, "PUT", `/api/h/${id}/thredz/wiki/how-to-deploy`, {
+      body: "MY TEXT",
+      expectedVersion: "7",
+    });
+    expect(wrote["wrote"]).toBe(false);
+    expect(wrote["versionRequired"]).toBe(true);
+    expect(workspace.calls.some((c) => c.method === "PATCH")).toBe(false);
+  });
+
+  test("a body that NEWLY carries the mask mark is refused — the mask is never persisted", async () => {
+    // The article is served masked. An operator who fixes a typo in that
+    // served text and saves would write `***` over the real span, upstream,
+    // where the manager cannot recover it.
+    const leaked = `token=${"A1b2C3d4".repeat(5)}`;
+    const workspace = stub({
+      "GET /wiki/articles/runbook": {
+        status: 200,
+        body: { slug: "runbook", version: 3, body: `step one\nexport ${leaked}\nstep two` },
+      },
+      "PATCH /wiki/articles/runbook": { status: 200, body: { version: 4 } },
+    });
+    const t = boot();
+    const id = await register(t, wiredHarness(workspace.base, { key: TEST_KEY }));
+    const wrote = await send(t, "PUT", `/api/h/${id}/thredz/wiki/runbook`, {
+      body: "step one\nexport token=***\nstep TWO",
+      expectedVersion: 3,
+    });
+    expect(wrote["ok"]).toBe(false);
+    expect(wrote["wrote"]).toBe(false);
+    expect(wrote["maskedWrite"]).toBe(true);
+    expect(wrote["maskedField"]).toBe("body");
+    expect(String(wrote["note"])).toContain("persist the mask");
+    expect(workspace.calls.some((c) => c.method === "PATCH")).toBe(false);
+  });
+
+  test("the TITLE is guarded too — `maskArticle` masks it, so it round-trips as well", async () => {
+    const workspace = stub({
+      "GET /wiki/articles/rotate": {
+        status: 200,
+        body: {
+          slug: "rotate",
+          version: 2,
+          title: `Rotate ${"A1b2C3d4".repeat(5)} now`,
+          body: "unchanged",
+        },
+      },
+      "PATCH /wiki/articles/rotate": { status: 200, body: { version: 3 } },
+    });
+    const t = boot();
+    const id = await register(t, wiredHarness(workspace.base, { key: TEST_KEY }));
+    const wrote = await send(t, "PUT", `/api/h/${id}/thredz/wiki/rotate`, {
+      body: "unchanged",
+      title: "Rotate *** now",
+      expectedVersion: 2,
+    });
+    expect(wrote["maskedWrite"]).toBe(true);
+    expect(wrote["maskedField"]).toBe("title");
+    expect(workspace.calls.some((c) => c.method === "PATCH")).toBe(false);
+  });
+
+  test("with no stored text to compare against, a masked body fails CLOSED", async () => {
+    const workspace = stub({
+      // A projection this workspace does not honour: no `body` comes back,
+      // so the manager cannot tell an edit from the masked view.
+      "GET /wiki/articles/runbook": { status: 200, body: { slug: "runbook", version: 3 } },
+      "PATCH /wiki/articles/runbook": { status: 200, body: { version: 4 } },
+    });
+    const t = boot();
+    const id = await register(t, wiredHarness(workspace.base, { key: TEST_KEY }));
+    const wrote = await send(t, "PUT", `/api/h/${id}/thredz/wiki/runbook`, {
+      body: "step one\nexport token=***\nstep two",
+      expectedVersion: 3,
+    });
+    expect(wrote["maskedWrite"]).toBe(true);
+    expect(wrote["maskedField"]).toBe("body");
+    expect(String(wrote["note"])).toContain("no stored text to compare");
+    expect(workspace.calls.some((c) => c.method === "PATCH")).toBe(false);
+  });
+
+  test("a body whose mask marks the stored article ALREADY had is written normally", async () => {
+    // The guard is about NEWLY introduced marks: an article that genuinely
+    // documents `***` must stay editable.
+    const workspace = stub({
+      "GET /wiki/articles/runbook": {
+        status: 200,
+        body: { slug: "runbook", version: 3, body: "redact it as *** in the ticket" },
+      },
+      "PATCH /wiki/articles/runbook": { status: 200, body: { version: 4 } },
+    });
+    const t = boot();
+    const id = await register(t, wiredHarness(workspace.base, { key: TEST_KEY }));
+    const wrote = await send(t, "PUT", `/api/h/${id}/thredz/wiki/runbook`, {
+      body: "redact it as *** in the TICKET",
+      expectedVersion: 3,
+    });
+    expect(wrote["wrote"]).toBe(true);
+    expect(workspace.calls.some((c) => c.method === "PATCH")).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -642,6 +828,84 @@ describe("records", () => {
     const customFields = stored["customFields"] as Record<string, unknown>;
     expect(customFields["hangarRestoreStatus"]).toBeUndefined();
     expect(customFields["owner"]).toBe("ops");
+  });
+
+  test("restore is IDEMPOTENT: a second one is a reported no-op, never a null status", async () => {
+    // The first restore consumes the stash, so a double-clicked button or a
+    // retry after the 10 s timeout arrives with nothing to put back. Writing
+    // `null` there blanks the status the restore just put in place.
+    let stored: Record<string, unknown> = {
+      _id: "rec_1",
+      status: "active",
+      customFields: { owner: "ops" },
+    };
+    const workspace = stub({
+      "GET /records/rec_1": () => ({ status: 200, body: stored }),
+      "PUT /records/rec_1": (call) => {
+        stored = { ...stored, ...(call.body as Record<string, unknown>) };
+        return { status: 200, body: stored };
+      },
+    });
+    const t = boot();
+    const id = await register(t, wiredHarness(workspace.base, { key: TEST_KEY }));
+
+    await send(t, "DELETE", `/api/h/${id}/thredz/records/rec_1`, undefined);
+    const first = await send(t, "POST", `/api/h/${id}/thredz/records/rec_1/restore`, {});
+    expect(first["restored"]).toBe(true);
+    expect(stored["status"]).toBe("active");
+
+    const writesBefore = workspace.calls.filter((c) => c.method === "PUT").length;
+    const second = await send(t, "POST", `/api/h/${id}/thredz/records/rec_1/restore`, {});
+    expect(second["restored"]).toBe(false);
+    expect(second["notDeleted"]).toBe(true);
+    expect(String(second["note"])).toContain("nothing to restore");
+    expect(stored["status"]).toBe("active");
+    expect(workspace.calls.filter((c) => c.method === "PUT").length).toBe(writesBefore);
+  });
+
+  test("restoring a record that was never deleted writes nothing at all", async () => {
+    let stored: Record<string, unknown> = { _id: "rec_2", status: "active", customFields: {} };
+    const workspace = stub({
+      "GET /records/rec_2": () => ({ status: 200, body: stored }),
+      "PUT /records/rec_2": (call) => {
+        stored = { ...stored, ...(call.body as Record<string, unknown>) };
+        return { status: 200, body: stored };
+      },
+    });
+    const t = boot();
+    const id = await register(t, wiredHarness(workspace.base, { key: TEST_KEY }));
+    const answer = await send(t, "POST", `/api/h/${id}/thredz/records/rec_2/restore`, {});
+    expect(answer["restored"]).toBe(false);
+    expect(answer["notDeleted"]).toBe(true);
+    expect(answer["status"]).toBe("active");
+    expect(stored["status"]).toBe("active");
+    expect(workspace.calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
+  test("a parked record with no stashed status keeps the status it has — no `null` on the wire", async () => {
+    // Parked outside the manager (or by an older build), so there is no
+    // stash. The manager does not KNOW what to put back, so it omits the
+    // field rather than guessing `null`, and says so.
+    let stored: Record<string, unknown> = {
+      _id: "rec_3",
+      status: "deleted",
+      customFields: { owner: "ops", hangarDeletedAt: "2026-08-01T00:00:00.000Z" },
+    };
+    const workspace = stub({
+      "GET /records/rec_3": () => ({ status: 200, body: stored }),
+      "PUT /records/rec_3": (call) => {
+        stored = { ...stored, ...(call.body as Record<string, unknown>) };
+        return { status: 200, body: stored };
+      },
+    });
+    const t = boot();
+    const id = await register(t, wiredHarness(workspace.base, { key: TEST_KEY }));
+    const answer = await send(t, "POST", `/api/h/${id}/thredz/records/rec_3/restore`, {});
+    expect(answer["restored"]).toBe(false);
+    expect(String(answer["note"])).toContain("no previous status was stashed");
+    const put = workspace.calls.find((c) => c.method === "PUT") as StubCall;
+    expect(put.body as Record<string, unknown>).not.toHaveProperty("status");
+    expect(stored["status"]).toBe("deleted");
   });
 
   test("schema validation is surfaced verbatim, details and all", async () => {

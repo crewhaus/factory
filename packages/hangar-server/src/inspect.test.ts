@@ -109,6 +109,29 @@ describe("inspect — pure helpers", () => {
     expect(exclusionFor([".crewhaus", "skills", "faq"])).toBeNull();
   });
 
+  test("the exclusions are CASE-FOLDED — the default filesystem here is not case-sensitive", () => {
+    // APFS (darwin) and NTFS resolve these to the real directories, and
+    // `resolveContained` answers with the caller's casing rather than the
+    // realpath, so a branch compared case-SENSITIVELY is a suggestion rather
+    // than a boundary. Two of the four were, and `.crewhaus/AUDIT/…` walked
+    // through them.
+    for (const segments of [
+      [".crewhaus", "AUDIT", "2026-08-01.jsonl"],
+      [".crewhaus", "Audit"],
+      [".CREWHAUS", "audit", "2026-08-01.jsonl"],
+      [".crewhaus", "run", "LOGS", "run_00000000000000aa.log"],
+      [".crewhaus", "Run", "Logs"],
+      [".CrewHaus", "RUN", "logs"],
+      [".crewhaus", "SECRETS", "vault.json"],
+      [".ENV"],
+      [".Env.Local"],
+    ]) {
+      expect(`${segments.join("/")}:${exclusionFor(segments) === null}`).toBe(
+        `${segments.join("/")}:false`,
+      );
+    }
+  });
+
   test("raw text masking redacts a PEM private-key block the shape masker cannot see", () => {
     const pem = ["-----BEGIN PRIVATE KEY-----", "b".repeat(64), "-----END PRIVATE KEY-----"].join(
       "\n",
@@ -117,6 +140,28 @@ describe("inspect — pure helpers", () => {
     expect(masked).toContain("[redacted private key block]");
     expect(masked).not.toContain("b".repeat(64));
     expect(masked).toContain("before");
+  });
+
+  test("raw text masking is KEY-aware, so it agrees with maskSpecYaml about an inline literal", () => {
+    // The literal `lowerCredential` compiles for any non-`$` value. SHORT on
+    // purpose: under 32 characters, so every opaque-token rule in the shape
+    // masker is out of reach and only reading the KEY off the line can catch
+    // it — which is precisely how the raw browser came to serve in cleartext
+    // what the spec view redacted.
+    const inline = ["2a3b", "4c5d", "6e7f", "8a9b"].join("");
+    expect(maskRawText(`    signingSecret: ${inline}`)).not.toContain(inline);
+    expect(maskRawText(`  botToken: "${inline}" ?? "",`)).not.toContain(inline);
+    expect(maskRawText(`  "api_key": "${inline}",`)).not.toContain(inline);
+    // A REFERENCE is a name, not a value, and stays readable in both
+    // spellings — the raw browser is where an operator goes to check exactly
+    // that.
+    expect(maskRawText("  signingSecret: $SLACK_SIGNING_SECRET")).toContain(
+      "$SLACK_SIGNING_SECRET",
+    );
+    // Ordinary prose under an ordinary key is left alone: over-refusing a
+    // browser is recoverable, but a masker that chews up every line is a
+    // browser nobody reads.
+    expect(maskRawText("  model: claude-opus-5")).toBe("  model: claude-opus-5");
   });
 
   test("settings validation mirrors what the loaders require, and passes unknown keys", () => {
@@ -368,6 +413,123 @@ describe("inspect — the generic raw browser", () => {
           `${path}:false`,
         );
       }
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("the exclusions survive a case-varied ?path= on a case-insensitive filesystem", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const id = await register(t, inspectHarness(t));
+      // Each of these resolves to the real, excluded file on APFS/NTFS. The
+      // exclusion list IS the boundary here — there is no second gate
+      // downstream — so a case-sensitive comparison hands over the raw
+      // hash-chained audit records and the raw child capture.
+      const refused = [
+        ".crewhaus/AUDIT",
+        ".crewhaus/Audit/2026-08-01.jsonl",
+        ".CREWHAUS/audit/2026-08-01.jsonl",
+        ".crewhaus/run/LOGS",
+        ".crewhaus/Run/Logs/run_00000000000000aa.log",
+        ".crewhaus/SECRETS/vault.json",
+        ".ENV",
+      ];
+      for (const path of refused) {
+        const { status, body } = await t.api(
+          `/api/h/${id}/inspect/raw?path=${encodeURIComponent(path)}`,
+        );
+        expect(`${path}:${status}`).toBe(`${path}:403`);
+        expect(`${path}:${JSON.stringify(body).includes("placeholder-not-a-credential")}`).toBe(
+          `${path}:false`,
+        );
+      }
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("an inline spec credential is redacted by the raw browser exactly as by /spec", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      // The one condition the whole stack models — `creds-ops` lints it,
+      // `lowerCredential` compiles it — and the one the harness `.env`
+      // scrubber by definition cannot help with, because the value is in the
+      // spec rather than in any env file. Under 32 characters, so no
+      // opaque-token rule can reach it and only the KEY can.
+      const inline = ["2a3b", "4c5d", "6e7f", "8a9b"].join("");
+      const dir = makeFixtureHarness(join(t.harnessesRoot, "inline"), {
+        specName: "inline",
+        target: "channel",
+        specExtra: [
+          "channels:",
+          "  slack:",
+          "    botToken: $SLACK_BOT_TOKEN",
+          `    signingSecret: ${inline}`,
+        ].join("\n"),
+        // `lowerCredential` bakes a non-`$` value into the compiled bundle as
+        // `{kind:"literal"}`, so the SAME secret sits in a file the raw
+        // browser also serves as text. A `.yaml`-only rule would miss it.
+        bundle: { entry: "agent.ts", body: `  signingSecret: "${inline}" ?? "",\n` },
+      });
+      mkdirSync(join(dir, ".crewhaus", "specs", "inline"), { recursive: true });
+      writeFileSync(
+        join(dir, ".crewhaus", "specs", "inline", "v1.yaml"),
+        `name: inline\nchannels:\n  slack:\n    signingSecret: ${inline}\n`,
+      );
+      const id = await register(t, dir);
+
+      const spec = await t.api(`/api/h/${id}/spec`);
+      expect(spec.body["yaml"] as string).not.toContain(inline);
+
+      for (const path of ["crewhaus.yaml", ".crewhaus/specs/inline/v1.yaml", "dist/agent.ts"]) {
+        const { status, body } = await t.api(
+          `/api/h/${id}/inspect/raw?path=${encodeURIComponent(path)}`,
+        );
+        expect(`${path}:${status}`).toBe(`${path}:200`);
+        expect(`${path}:${JSON.stringify(body).includes(inline)}`).toBe(`${path}:false`);
+      }
+      // The env REFERENCE beside it is a name, not a value: still readable,
+      // because "which variable does this harness want?" is the question the
+      // raw browser exists to answer.
+      const yaml = await t.api(
+        `/api/h/${id}/inspect/raw?path=${encodeURIComponent("crewhaus.yaml")}`,
+      );
+      expect(String(yaml.body["text"])).toContain("$SLACK_BOT_TOKEN");
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a store symlinked out of the tree is REFUSED, not reported absent", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const outside = join(t.workspace, "real-settings.json");
+      writeFileSync(outside, `${JSON.stringify({ permissions: { allow: ["Read"] } })}\n`);
+      const dir = makeFixtureHarness(join(t.harnessesRoot, "escaped"), { specName: "escaped" });
+      mkdirSync(join(dir, ".crewhaus"), { recursive: true });
+      symlinkSync(outside, join(dir, ".crewhaus", "settings.json"));
+      const id = await register(t, dir);
+
+      // "Nothing there yet" and "there IS something there and this server
+      // refuses to follow it" are different facts, and only one of them is an
+      // empty state. Reporting the first offered the CLI verb that CREATES
+      // the store, over a file that already exists somewhere else.
+      const store = await t.api(`/api/h/${id}/inspect/settings`);
+      expect(store.status).toBe(200);
+      expect(store.body["present"]).toBe(false);
+      expect(String(store.body["note"])).toContain("outside the harness directory");
+      expect(store.body["verb"]).toBeNull();
+      expect(JSON.stringify(store.body)).not.toContain("Read");
+
+      // The index tells the same story as the store, and as the raw browser,
+      // which already said the true thing.
+      const index = await t.api(`/api/h/${id}/inspect`);
+      const row = (index.body["stores"] as Array<Record<string, unknown>>).find(
+        (s) => s["store"] === "settings",
+      );
+      expect(String(row?.["note"])).toContain("outside the harness directory");
+      expect(row?.["verb"]).toBeNull();
     } finally {
       await t.stop();
     }
