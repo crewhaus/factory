@@ -81,7 +81,6 @@ import {
 } from "@crewhaus/harness-supervisor";
 import { REMOTE_BIND_ENV, remoteBindRefusal } from "./remote-bind";
 import { cliVersion } from "./version";
-import { windowsSupervisionNotice } from "./win32-notice";
 
 /** What a verb returns: lines for stdout + the process exit code. `serve`
  *  streams through the `write` sink instead (it blocks), so its lines come
@@ -122,11 +121,6 @@ export type HangarCommandOptions = {
   /** Hard cap on waiting for any one child to confirm its exit; default the
    *  supervisor package's `SHUTDOWN_DEADLINE_MS`. */
   readonly shutdownDeadlineMs?: number;
-  /** Platform the win32 supervision notice (HM-188) is decided against;
-   *  defaults to `process.platform`. Injected so the notice — whose whole
-   *  purpose is to describe a platform the test run is NOT on — is
-   *  assertable from any machine. Delete alongside `./win32-notice`. */
-  readonly platform?: string;
 };
 
 const HANGAR_USAGE_LINES: readonly string[] = [
@@ -681,13 +675,6 @@ async function hangarServe(
       }${booted.jobs > 0 ? `, re-queued ${booted.jobs} pending job(s)` : ""}`,
     );
   }
-
-  // HM-188 — say out loud that Windows supervision has never had a green CI
-  // run. Printed before the summary (and before the smoke checks) so it is
-  // the first thing an operator reads on the platform it is about, not a
-  // footnote under a box they have already stopped reading.
-  const win32Notice = windowsSupervisionNotice(opts.platform ?? process.platform);
-  if (win32Notice !== undefined) write(win32Notice);
 
   if (flags.smoke) {
     write(`smoke: booted ${server.url} (ephemeral port ${server.port})`);

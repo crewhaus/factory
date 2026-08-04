@@ -284,29 +284,6 @@ describe("hangar serve argument validation", () => {
     expect(open[0]?.readOnlyLocked).toBeUndefined();
   });
 
-  test("HM-188: win32 is told supervision there is UNVERIFIED; nobody else is", async () => {
-    const ws = newWorkspace();
-    const onWindows: string[] = [];
-    await driveServe([], { env: ws.env, platform: "win32", write: (l) => onWindows.push(l) });
-    const notice = onWindows.find((l) => l.includes("UNVERIFIED"));
-    expect(notice).toBeDefined();
-    // The payload is the failure and its cheap check, not a bare
-    // "unsupported": a wrong liveness verdict is what starts a second copy.
-    expect(notice).toContain("supervision on Windows");
-    expect(notice).toContain("second copy");
-    expect(notice).toContain("crewhaus daemon status");
-    // …and it lands ABOVE the summary box, not as a footnote under it.
-    expect(onWindows.indexOf(notice ?? "")).toBeLessThan(
-      onWindows.findIndex((l) => l.includes("┌─ Hangar")),
-    );
-
-    for (const platform of ["darwin", "linux"]) {
-      const elsewhere: string[] = [];
-      await driveServe([], { env: ws.env, platform, write: (l) => elsewhere.push(l) });
-      expect(elsewhere.join("\n")).not.toContain("UNVERIFIED");
-    }
-  });
-
   test("--smoke with --no-auth and --smoke with --port are rejected", () => {
     const ws = newWorkspace();
     expect(runHangarCommand(["serve", "--smoke", "--no-auth"], { env: ws.env })).rejects.toThrow(

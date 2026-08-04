@@ -194,11 +194,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and is it still running our argv. A wrong answer to any of them is what
   lets a restart spawn a second copy of a channel daemon (double message
   processing, double provider spend), so it is worth proving rather than
-  asserting. The job is non-blocking while the platform is unproven, and
-  until it is green `crewhaus hangar` and `crewhaus daemon` print one line
-  on win32 saying supervision there is unverified. Windows binaries ship
-  through Scoop and winget, so the honest options were to prove it or to say
-  so — not to leave "written but unrun" implied. Several suite-level POSIX
+  asserting. **The job is GATING and Windows supervision is now verified**:
+  its first run found six real bugs — none of them the predicted spawn
+  problem, all path handling, and two of them containment checks written as
+  `startsWith(root + "/")`, which never matches on Windows because `resolve`
+  yields `D:\a\b\c`. One of those failed OPEN (a "refusing to trash the
+  trash" guard that never fired). With those fixed both suites pass on
+  `windows-latest`, so a Windows regression now stops a merge exactly like a
+  POSIX one, and the interim win32 "unverified" notice is deleted — it was a
+  statement about CI, and CI can now make the statement itself. Windows
+  binaries ship through Scoop and winget, so the honest options were to
+  prove it or to say so — not to leave "written but unrun" implied. Several suite-level POSIX
   assumptions were fixed along the way: `0600` file-mode assertions are
   POSIX claims (Windows reports `0666` for any writable file and carries the
   real permission in the ACL), and a fixture path fell back to `/tmp` when
