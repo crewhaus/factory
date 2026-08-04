@@ -208,10 +208,12 @@ export {
 } from "./gate";
 
 export type {
+  CancellableChild,
   HarnessMutex,
   JobQueue,
   JobQueueOptions,
   JobRecord,
+  JobRunContext,
   JobRunner,
   JobState,
   JobStore,
@@ -223,9 +225,29 @@ export {
   createJobQueue,
   createMemoryJobStore,
   DEFAULT_JOB_CONCURRENCY,
+  DEFAULT_JOB_SHUTDOWN_DEADLINE_MS,
+  DEFAULT_JOB_STOP_GRACE_MS,
   isReadOnlyJob,
+  processOpsChild,
   READ_ONLY_JOB_KINDS,
 } from "./queue";
+
+export type {
+  ChildFate,
+  ShutdownJobs,
+  ShutdownOptions,
+  ShutdownReport,
+  ShutdownSupervisor,
+  StoppedChild,
+  SupervisedChild,
+} from "./shutdown";
+export {
+  runManagerShutdown,
+  SHUTDOWN_DEADLINE_MS,
+  SHUTDOWN_GRACE_MS,
+  shutdownFate,
+  shutdownReportLines,
+} from "./shutdown";
 
 export type {
   HarnessSupervisor,

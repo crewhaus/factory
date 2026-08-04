@@ -53,6 +53,7 @@ import {
   type BuildInventoryDeps,
   buildHarnessHealth,
   buildHarnessInventory,
+  countOpenIncidents,
   discoverHarnesses,
   readSpecHeader,
 } from "@crewhaus/harness-inventory";
@@ -107,8 +108,16 @@ import { foldHarnessCosts } from "./costs";
 import { deploymentsView } from "./deployments";
 import { mergedSpawnEnv } from "./env-file";
 import { evalHealth, evalRunView, evalSampleView, evalsView, isRunId } from "./evals";
+import {
+  type HealthPreflightItem,
+  type HealthResult,
+  cadenceToMs,
+  computeHealth,
+  declaredBudgetUsd,
+  dreamOverdue,
+} from "./health";
 import { HttpError, errResponse, json } from "./http";
-import type { M3Context, M3Harness } from "./m3";
+import { type M3Context, type M3Harness, requireBoolean, requireString } from "./m3";
 import { type M3Match, matchM3 } from "./m3-routes";
 import { type TextScrubber, maskDeep } from "./mask";
 import {
@@ -120,6 +129,29 @@ import {
   wikiArticle,
   wikiView,
 } from "./memory";
+import {
+  type HarnessSignal,
+  type NotificationCentre,
+  type NotificationSinks,
+  createNotificationCentre,
+  deriveEvents,
+} from "./notifications";
+import { OMNI_LIMIT, type OmniIndex, createOmniIndex } from "./omnibox";
+import {
+  DEMOS_DIR_ENV,
+  StarterInstallError,
+  demoAvailability,
+  installStarter,
+  onboardingView,
+  suggestScanRoots,
+} from "./onboarding";
+import {
+  defaultPluginsDir,
+  panesForHarness,
+  readPaneDocument,
+  readPluginInventory,
+  traceObservers,
+} from "./plugins";
 import {
   type HarnessProcess,
   JobArgumentError,
@@ -139,7 +171,7 @@ import {
   safeSpawnEnvScrubber,
 } from "./runs";
 import { resolveInside } from "./safety";
-import { buildSchedulersView, readSpecYaml } from "./schedulers";
+import { buildSchedulersView, declaredCadences, dreamStates, readSpecYaml } from "./schedulers";
 import {
   isSessionId,
   listSessions,
@@ -147,6 +179,13 @@ import {
   readTranscriptRaw,
   resolveSessionRoot,
 } from "./sessions";
+import {
+  READ_ONLY_EXEMPT,
+  type SettingsStore,
+  isReadOnlyRefused,
+  openSettingsStore,
+  readOnlyRefusal,
+} from "./settings";
 import { BADGE_KEYS, capabilityBadges, specView } from "./spec-view";
 
 export type StaticAsset = {
@@ -192,6 +231,23 @@ export type HangarServerOptions = {
    *  {@link SSE_HEARTBEAT_MS}. Tests shorten it to prove the frame exists
    *  without waiting out the real interval. */
   readonly sseHeartbeatMs?: number;
+  /** M4 (HM-187): start in read-only mode. Persisted settings still apply —
+   *  this only forces the mode ON at boot. */
+  readonly readOnly?: boolean;
+  /** M4 (HM-187): refuse the un-toggle too, so a screen-shared manager
+   *  cannot be made writable over the wire. Implies `readOnly`. */
+  readonly readOnlyLocked?: boolean;
+  /** M4 (HM-12): the demos checkout demo mode copies starters from.
+   *  Defaults to `CREWHAUS_DEMOS_DIR` in `env`. */
+  readonly demosDir?: string;
+  /** M4 (HM-12): the directory shown as "where you started the manager" in
+   *  the scan-root picker. Defaults to `process.cwd()`. */
+  readonly cwd?: string;
+  /** M4 (HM-179): installed-plugin root; default `~/.crewhaus/plugins`. */
+  readonly pluginsDir?: string;
+  /** M4 (HM-183): notification sinks. The OS and webhook sinks are injected
+   *  so the test suite neither spawns `osascript` nor opens a socket. */
+  readonly notificationSinks?: NotificationSinks;
 };
 
 export type HangarServer = {
@@ -217,6 +273,8 @@ export type HangarServer = {
   /** The process layer this server drives — exposed so `crewhaus hangar`
    *  can shut supervision down cleanly and so tests can assert on it. */
   readonly processes: ProcessLayer;
+  /** True while read-only mode refuses mutating requests (HM-187). */
+  readOnly(): boolean;
   /**
    * Resolves once the boot sequence has run: port ledger open → `adopt()`
    * per registered harness → `jobQueue.restore()`. `Bun.serve` binds
@@ -277,6 +335,27 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       managerVersion: version,
     });
   const control: ControlClient = opts.controlClient ?? createControlClient();
+
+  // ---- M4: settings, notifications, the lazy omnibox index, plugins -------
+  const settings: SettingsStore = openSettingsStore(hangarRoot, { onWarn });
+  const readOnlyLocked = opts.readOnlyLocked === true;
+  /**
+   * The mode for THIS process, when a boot flag set it. Deliberately NOT
+   * persisted: `--read-only` is a posture for one demo, and an operator who
+   * restarts normally afterwards must get a writable console back rather
+   * than a mystery. The PERSISTED setting is what a flagless boot uses, and
+   * an explicit toggle through the API writes both.
+   */
+  let sessionReadOnly: boolean | undefined =
+    opts.readOnly === true || readOnlyLocked ? true : undefined;
+  const readOnlyNow = (): boolean => sessionReadOnly ?? settings.get().readOnly;
+  const notifications: NotificationCentre = createNotificationCentre(opts.notificationSinks ?? {});
+  // Allocated, not built: the first ⌘K query pays for the harnesses it
+  // needs, so boot does no indexing work at all (HM-189).
+  const omni: OmniIndex = createOmniIndex();
+  const pluginsDir = opts.pluginsDir ?? defaultPluginsDir(homedir());
+  const demosDir = opts.demosDir ?? env[DEMOS_DIR_ENV];
+  const cwd = opts.cwd ?? process.cwd();
 
   // ---- shared lookups -----------------------------------------------------
 
@@ -514,6 +593,165 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     }
     return { harnesses: rows, fleet: { totalUsdMicros, spend7dUsdMicros, calls } };
   };
+
+  // ---- M4: health, signals, onboarding, search, plugins -------------------
+
+  /**
+   * One harness's health score (HM-11).
+   *
+   * Every input is a panel that already exists — preflight (the Start
+   * gate), eval health (the Library column), incidents and the spec lint
+   * (Security and Spec), supervision state (Runs), the capability badges
+   * (the fleet row) and the dream states (Schedulers). The score is folded
+   * from them here so the number and the screens can never disagree.
+   */
+  const healthFor = async (entry: HangarHarnessEntry): Promise<HealthResult> => {
+    const dir = liveDirOr404(entry);
+    const yamlText = readYamlSafe(dir);
+    const view = specView(dir, env);
+    let preflight: { items: readonly HealthPreflightItem[] } | null = null;
+    try {
+      const merged = mergedSpawnEnv(env, dir);
+      const report = await runPreflight({ harnessDir: dir, env: merged.env });
+      preflight = { items: report.items };
+    } catch (err) {
+      onWarn(
+        `hangar-server: preflight failed for ${dir}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    let evals: { healthy: boolean; note: string } | null = null;
+    try {
+      evals = evalHealth(join(dir, ".crewhaus", "evals"), view.specName);
+    } catch {
+      evals = null;
+    }
+    const cadence = cadenceToMs(declaredCadences(yamlText).dream ?? null);
+    const dreams = dreamStates(dir).map((row) => ({
+      specName: row.specName,
+      ...dreamOverdue(
+        cadence,
+        (row.state ?? null) as { lastRunAt?: unknown; lastOutcome?: unknown } | null,
+        now(),
+      ),
+    }));
+    return computeHealth({
+      preflight,
+      evalHealth: evals,
+      openIncidents: countOpenIncidents(dir),
+      procState: processes.peek(dir)?.snapshot().state ?? null,
+      envRefs: view.envRefs,
+      specIssues: view.issues,
+      specUnreadable: view.specUnreadable,
+      budgeted: view.badges.budget === true,
+      dreams,
+    });
+  };
+
+  /**
+   * The notification snapshot (HM-183). Cheap by construction — the same
+   * folds the Library row already does, plus the run ledger's recent
+   * terminal exits. No transcript is opened and no preflight is run here:
+   * the credential-probe signal comes from the CHEAP half (a spec `$VAR`
+   * the merged env does not hold), because a fleet-wide preflight on every
+   * badge poll would be the most expensive thing this manager does.
+   */
+  const fleetSignals = (): readonly HarnessSignal[] =>
+    registry
+      .list()
+      .filter((e) => e.missingSince === null && existsSync(e.dir))
+      .map((entry) => {
+        const dir = entry.dir;
+        const yamlText = readYamlSafe(dir);
+        const view = specView(dir, env);
+        const cadence = cadenceToMs(declaredCadences(yamlText).dream ?? null);
+        const overdueDreams = dreamStates(dir)
+          .map((row) => ({
+            specName: row.specName,
+            ...dreamOverdue(
+              cadence,
+              (row.state ?? null) as { lastRunAt?: unknown; lastOutcome?: unknown } | null,
+              now(),
+            ),
+          }))
+          .filter((d) => d.neverRan || (d.windows !== null && d.windows > 2))
+          .map((d) => d.specName);
+        const budgetUsd = declaredBudgetUsd(yamlText);
+        // The CACHED rollup, not a fresh fold: this runs on every badge poll
+        // across the whole fleet, and re-reading every session log for a
+        // number the Library already caches would make the cheapest screen
+        // the most expensive request.
+        const spentUsd = cache.get(entry.id, dir, now()).costBreakdown.totalUsdMicros / 1_000_000;
+        return {
+          harnessId: entry.id,
+          specName: view.specName,
+          groups: entry.groups,
+          pendingApprovals: pendingApprovalCount(dir),
+          procState: processes.peek(dir)?.snapshot().state ?? null,
+          evalHealthy: evalHealth(join(dir, ".crewhaus", "evals"), view.specName).healthy,
+          openIncidents: countOpenIncidents(dir),
+          overdueDreams,
+          recentExits: runsView(dir, 20)
+            .runs.filter((r) => typeof r.exitCode === "number")
+            .map((r) => ({
+              runId: r.runId,
+              exitCode: r.exitCode as number,
+              endedAt: r.endedAt ?? null,
+            })),
+          budgetUsedRatio: budgetUsd === null ? null : spentUsd / budgetUsd,
+          credentialProbeFailed: view.envRefs.some((r) => !r.set),
+        } satisfies HarnessSignal;
+      });
+
+  /** GET /api/notifications — rules + the badge, evaluated at poll time. */
+  const notificationsView = (): unknown => {
+    const current = settings.get().notifications;
+    const events = deriveEvents(fleetSignals());
+    const result = notifications.poll(
+      {
+        rules: current.rules,
+        quietHours: current.quietHours,
+        mutedGroups: current.mutedGroups,
+        events,
+        nowMs: now(),
+      },
+      current.webhookUrl,
+    );
+    const inApp = notifications.inApp();
+    return {
+      rules: current.rules,
+      quietHours: current.quietHours,
+      mutedGroups: current.mutedGroups,
+      webhookUrl: current.webhookUrl,
+      /** Fired on THIS poll — the toast list. */
+      delivered: result.deliveries,
+      /** Events that did not notify, with the reason — a silent rule is
+       *  always explainable from the screen. */
+      suppressed: result.suppressed,
+      /** The badge queue, newest first. */
+      inApp,
+      badge: inApp.length,
+      cliTwin: "crewhaus harness list --json  # the same signals, unfiltered",
+    };
+  };
+
+  /** The registry rows the omnibox indexes over. */
+  const indexHarnesses = (): ReadonlyArray<{
+    id: string;
+    specName: string;
+    dir: string;
+    groups: readonly string[];
+    tags: readonly string[];
+  }> =>
+    registry
+      .list()
+      .filter((e) => e.missingSince === null && existsSync(e.dir))
+      .map((e) => ({
+        id: e.id,
+        specName: e.specName,
+        dir: e.dir,
+        groups: e.groups,
+        tags: e.tags,
+      }));
 
   // ---- M2: process, control, and the fleet inboxes -------------------------
 
@@ -1286,6 +1524,28 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     if (head === "costs" && tail.length === 0) {
       return jsonMasked({ id: entry.id, costs: foldHarnessCosts(liveDirOr404(entry), now()) });
     }
+    // ---- M4 -------------------------------------------------------------
+    if (head === "health" && tail.length === 0 && method === "GET") {
+      return jsonMasked({ id: entry.id, health: await healthFor(entry) });
+    }
+    if (head === "panes" && tail.length === 0 && method === "GET") {
+      const dir = liveDirOr404(entry);
+      const inventory = readPluginInventory(pluginsDir);
+      return jsonMasked({
+        id: entry.id,
+        // Both extension points, evaluated against the SAME fail-closed
+        // filesystem permission: a plugin that may not read this harness
+        // neither draws a tab on it nor sees its trace events.
+        panes: panesForHarness(inventory.plugins, dir).map((row) => ({
+          plugin: row.plugin,
+          id: row.pane.id,
+          title: row.pane.title,
+          sandbox: row.sandbox,
+        })),
+        traceObservers: traceObservers(inventory.plugins, dir),
+        deferred: inventory.deferred,
+      });
+    }
     throw new HttpError(404, "not found");
   };
 
@@ -1426,6 +1686,160 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       return json(fleetCosts());
     }
 
+    // ---- M4: the fleet health board, onboarding, ⌘K, notifications ------
+    // `/api/health` runs a preflight per harness, so it is the "needs
+    // attention" board an operator opens — never the first paint. The
+    // Library's own row keeps using the cached rollup.
+    if (head === "health" && rest.length === 0) {
+      if (method !== "GET") throw new HttpError(405, "method not allowed");
+      const rows: unknown[] = [];
+      for (const entry of registry.list()) {
+        if (entry.missingSince !== null || !existsSync(entry.dir)) continue;
+        rows.push({ id: entry.id, specName: entry.specName, health: await healthFor(entry) });
+      }
+      return json(maskDeep({ harnesses: rows }, fleetScrub()));
+    }
+
+    if (head === "onboarding" && rest.length === 0) {
+      if (method !== "GET") throw new HttpError(405, "method not allowed");
+      return json(
+        onboardingView({
+          harnessCount: registry.list().length,
+          scanRootCount: registry.listScanRoots().length,
+          suggestions: suggestScanRoots(env, homedir(), cwd),
+          demo: demoAvailability(env, demosDir),
+          completedAt: settings.get().onboarding.completedAt,
+        }),
+      );
+    }
+
+    if (head === "onboarding" && rest[0] === "demo" && rest.length === 1) {
+      if (method !== "POST") throw new HttpError(405, "method not allowed");
+      const body = await readBody(req);
+      const availability = demoAvailability(env, demosDir);
+      if (!availability.available || availability.source === null) {
+        // 409, not 500: nothing is broken — a checkout is missing, and the
+        // answer names the repo, the variable and the CLI verb.
+        return json(
+          {
+            ok: false,
+            reason: "no-demos-checkout",
+            message: availability.reason,
+            remedy: availability.remedy,
+          },
+          409,
+        );
+      }
+      const starter = requireString(body, "starter");
+      const destDir = requireAbsoluteDir(body["dir"], "dir");
+      let install: ReturnType<typeof installStarter>;
+      try {
+        install = installStarter({ demosDir: availability.source, starter, destDir });
+      } catch (err) {
+        if (err instanceof StarterInstallError) {
+          return json(
+            { ok: false, reason: "refused", message: err.message, remedy: err.remedy },
+            409,
+          );
+        }
+        throw err;
+      }
+      const header = readHeaderSafe(install.dir);
+      const entry = registry.upsert({
+        dir: install.dir,
+        ...(header.name !== undefined ? { specName: header.name } : {}),
+        ...(header.target !== undefined ? { target: header.target } : {}),
+        origin: "manual",
+        originDetail: "demo",
+      });
+      settings.update({ onboarding: { completedAt: new Date(now()).toISOString() } });
+      return json({ ok: true, entry, install }, 201);
+    }
+
+    if (head === "search" && rest.length === 0) {
+      if (method !== "GET") throw new HttpError(405, "method not allowed");
+      const q = url.searchParams.get("q") ?? "";
+      const limitRaw = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+      const limit =
+        Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 100) : OMNI_LIMIT;
+      return json(maskDeep(omni.search(q, indexHarnesses(), limit), fleetScrub()));
+    }
+
+    if (head === "notifications" && rest.length === 0) {
+      if (method === "GET") return json(maskDeep(notificationsView(), fleetScrub()));
+      if (method === "PUT") {
+        const body = await readBody(req);
+        try {
+          settings.update({ notifications: body });
+        } catch (err) {
+          throw new HttpError(400, err instanceof Error ? err.message : String(err));
+        }
+        return json(maskDeep(notificationsView(), fleetScrub()));
+      }
+      throw new HttpError(405, "method not allowed");
+    }
+
+    if (head === "notifications" && rest[0] === "clear" && rest.length === 1) {
+      if (method !== "POST") throw new HttpError(405, "method not allowed");
+      notifications.clear();
+      return json({ ok: true, badge: 0 });
+    }
+
+    if (head === "read-only" && rest.length === 0) {
+      if (method === "GET") {
+        return json({
+          enabled: readOnlyNow(),
+          locked: readOnlyLocked,
+          exempt: [...READ_ONLY_EXEMPT].sort(),
+          note: "read-only mode prevents accidents during a demo or screen-share; the bearer token, not this toggle, is the security boundary",
+        });
+      }
+      if (method === "PUT") {
+        const body = await readBody(req);
+        const enabled = requireBoolean(body, "enabled");
+        if (readOnlyLocked && !enabled) {
+          return json(
+            {
+              ok: false,
+              reason: "locked",
+              message:
+                "this manager was started with read-only LOCKED — the mode cannot be lifted over the wire",
+              remedy: "restart the manager without --read-only",
+            },
+            409,
+          );
+        }
+        // Both, so the change takes effect now AND is what the next boot
+        // starts from — an explicit toggle is a preference, unlike a flag.
+        sessionReadOnly = enabled;
+        settings.update({ readOnly: enabled });
+        return json({ ok: true, enabled: readOnlyNow(), locked: readOnlyLocked });
+      }
+      throw new HttpError(405, "method not allowed");
+    }
+
+    if (head === "plugins" && rest.length === 0) {
+      if (method !== "GET") throw new HttpError(405, "method not allowed");
+      return json(maskDeep(readPluginInventory(pluginsDir), fleetScrub()));
+    }
+
+    if (head === "plugins" && rest.length === 3 && rest[1] === "panes") {
+      if (method !== "GET") throw new HttpError(405, "method not allowed");
+      const name = rest[0] as string;
+      const paneId = rest[2] as string;
+      if (!SAFE_SEGMENT_RE.test(name) || !SAFE_SEGMENT_RE.test(paneId)) {
+        throw new HttpError(400, "invalid plugin or pane id");
+      }
+      const plugin = readPluginInventory(pluginsDir).plugins.find((p) => p.name === name);
+      if (plugin === undefined) throw new HttpError(404, "no such plugin");
+      const doc = readPaneDocument(plugin, paneId);
+      if (doc === undefined) throw new HttpError(404, "no such pane");
+      // NOT masked: the pane document is the plugin's own markup, and
+      // maskDeep would rewrite its text. It is contained by the sandbox and
+      // the CSP that travel with it, which is the containment that matters.
+      return json(doc);
+    }
+
     // ---- M2 fleet inboxes ---------------------------------------------
     // Every fleet fold quotes free text out of harnesses this request never
     // names — a tool input a policy parked for approval, a quarantined
@@ -1525,6 +1939,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       "GET  /api/review      POST /api/h/:id/review/:itemId",
       "GET  /api/activity[?since=]",
       "GET  /api/jobs        POST /api/h/:id/jobs {kind}",
+      "--- M4 ---",
+      "GET  /api/health      GET  /api/h/:id/health",
+      "GET  /api/onboarding  POST /api/onboarding/demo {starter,dir}",
+      "GET  /api/search?q=",
+      "GET|PUT /api/notifications   POST /api/notifications/clear",
+      "GET|PUT /api/read-only",
+      "GET  /api/plugins     GET /api/plugins/:name/panes/:paneId   GET /api/h/:id/panes",
       "--- M3 (handlers are stubs: every route below answers 501) ---",
       "PUT  /api/h/:id/spec  POST /api/h/:id/spec/{patch,diff,pin,rollback,propose}",
       "GET  /api/h/:id/spec/{schema,trust,versions[/:version[/diff]]}",
@@ -1601,6 +2022,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           return errResponse(401, "missing or invalid bearer token");
         }
       }
+      // HM-187 — read-only mode, enforced HERE, ahead of every handler.
+      // Placed after auth and before dispatch so it covers the M1/M2 chain
+      // and the M3 table identically, and so a route added next month is
+      // covered by construction rather than by remembering to be.
+      if (readOnlyNow() && isReadOnlyRefused(req.method, pathname)) {
+        return json(readOnlyRefusal(req.method, pathname), 403);
+      }
       let segs: string[];
       try {
         segs = pathname
@@ -1664,6 +2092,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     noAuth,
     idleTimeoutSeconds: SSE_IDLE_TIMEOUT_SECONDS,
     processes,
+    readOnly: readOnlyNow,
     ready,
     stop: async () => {
       // Release timers and subscriptions; the CHILDREN are deliberately left

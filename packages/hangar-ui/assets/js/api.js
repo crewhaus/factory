@@ -336,6 +336,33 @@ export const api = {
   pinSession: (id, sess, pinned) => call(ROUTES.pinSession, { id, sess }, { pinned }),
   pinBaseline: (id, runId) => call(ROUTES.pinBaseline, { id }, { runId }),
 
+  // ---- M4: health, onboarding, ⌘K, notifications, read-only, plugins ----
+  health: (id) => call(ROUTES.health, { id }),
+  fleetHealth: () => call(ROUTES.fleetHealth, {}),
+  onboarding: () => call(ROUTES.onboarding, {}),
+  // A refusal here is a PAYLOAD (409 `no-demos-checkout` / `refused`), not an
+  // error: the reason and the remedy are the whole point of the screen.
+  demoInstall: (starter, dir) => callTyped(ROUTES.demoInstall, {}, { starter, dir }),
+  search: (q, limit) =>
+    call(
+      ROUTES.search,
+      {},
+      undefined,
+      `?q=${encodeURIComponent(String(q ?? ""))}${
+        typeof limit === "number" ? `&limit=${limit}` : ""
+      }`,
+    ),
+  notifications: () => call(ROUTES.notifications, {}),
+  setNotifications: (settings) => call(ROUTES.setNotifications, {}, settings ?? {}),
+  clearNotifications: () => call(ROUTES.clearNotifications, {}, {}),
+  readOnly: () => call(ROUTES.readOnly, {}),
+  // 409 `locked` when the manager was started read-only — a fact to render,
+  // not a transport error.
+  setReadOnly: (enabled) => callTyped(ROUTES.setReadOnly, {}, { enabled: enabled === true }),
+  plugins: () => call(ROUTES.plugins, {}),
+  pluginPane: (plugin, pane) => call(ROUTES.pluginPane, { plugin, pane }),
+  panes: (id) => call(ROUTES.panes, { id }),
+
   // cross-cutting
   version: () => call(ROUTES.version, {}),
 };

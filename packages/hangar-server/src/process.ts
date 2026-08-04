@@ -49,6 +49,7 @@ import {
   type HarnessSupervisor,
   type JobQueue,
   type JobRecord,
+  type JobRunContext,
   type JobRunner,
   type JobStore,
   type PortLedger,
@@ -66,6 +67,7 @@ import {
   createProcessOps,
   ensureRunDir,
   isReadOnlyJob,
+  processOpsChild,
   readRunfile,
   resolveCrewhausBin,
   runClassFor,
@@ -211,11 +213,11 @@ function liveTarget(harnessDir: string): string | undefined {
 /** Default job runner: spawn `crewhaus <argv>` in the harness root through
  *  the same `ProcessOps` seam the supervisor uses, capturing into the run
  *  dir. Never a shell — argv is passed as a vector. */
-function defaultJobRunner(
+export function defaultJobRunner(
   ops: ProcessOps,
   harnessBin: (dir: string) => string | undefined,
 ): JobRunner {
-  return async (job: JobRecord) => {
+  return async (job: JobRecord, ctx: JobRunContext) => {
     const bin = harnessBin(job.harnessDir);
     if (bin === undefined) {
       return { error: "no resolvable `crewhaus` CLI (harness node_modules/.bin, then PATH)" };
@@ -229,6 +231,11 @@ function defaultJobRunner(
       stdio: { mode: "file", path: logFile },
       detached: false,
     });
+    // HAND THE CHILD TO THE QUEUE. Without this the queue knows a job is
+    // "running" but holds nothing it can signal: `cancel()` answers false and
+    // manager shutdown marks the ledger row while the process keeps going —
+    // the orphan M4 exists to stop, reintroduced through the console path.
+    ctx.register(processOpsChild(ops, child.pid));
     const { code } = await child.exited;
     return { exitCode: code ?? 1 };
   };

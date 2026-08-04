@@ -23,6 +23,8 @@
 
 import { ApiError, api, onUnauthorized, setToken } from "./api.js";
 import { clear, copyBtn, dot, el, skeleton, toast } from "./dom.js";
+import { bindingSheet, globalKey, initialKeyState, keyShape } from "./keys.js";
+import { openOmnibox } from "./omnibox.js";
 import {
   hrefGlobal,
   hrefHarness,
@@ -43,17 +45,20 @@ import { renderDeploy } from "./views/deploy.js";
 import { renderEvalsLab } from "./views/evals-lab.js";
 import { renderEvals } from "./views/evals.js";
 import { renderFeedback, renderFeedbackBoard } from "./views/feedback.js";
+import { renderHealthBoard, renderHealthCard } from "./views/health.js";
 import { renderInspect } from "./views/inspect.js";
 import { renderLibrary } from "./views/library.js";
 import { renderMemoryFabric } from "./views/memory-fabric.js";
 import { renderMemory } from "./views/memory.js";
 import { renderOverview } from "./views/overview.js";
+import { renderPanes } from "./views/panes.js";
 import { renderReview } from "./views/review.js";
 import { renderRuns, renderRunsBoard } from "./views/runs.js";
 import { renderRuntime } from "./views/runtime.js";
 import { renderSchedulers } from "./views/schedulers.js";
 import { renderSecurity } from "./views/security.js";
 import { renderSessions } from "./views/sessions.js";
+import { renderSettings } from "./views/settings.js";
 import { renderSpecEdit } from "./views/spec-edit.js";
 import { renderSpec } from "./views/spec.js";
 import { renderThredz, renderThredzGlobal } from "./views/thredz.js";
@@ -78,6 +83,7 @@ const TAB_LABELS = {
   deploy: "Deployments",
   inspect: "Inspect",
   dev: "Dev & MCP",
+  panes: "Plugin panes",
 };
 
 /** The fleet-wide screens in the header rail, with their count sources. */
@@ -86,16 +92,25 @@ const NAV = [
   { view: "approvals", label: "Approvals" },
   { view: "review", label: "Review" },
   { view: "activity", label: "Activity" },
+  { view: "health", label: "Health" },
   { view: "credentials", label: "Credentials" },
   { view: "feedback", label: "Feedback" },
   { view: "thredz", label: "Thredz" },
+  { view: "settings", label: "Settings" },
 ];
 
 let viewRoot = null;
 let footRoot = null;
 let navRoot = null;
+let bannerRoot = null;
 let dispatchSeq = 0;
 let navCounts = {};
+// M4 (HM-190): overlay ownership. `inboxMounted` is set per navigation so
+// `?` goes to the inbox's own sheet on the two screens that bind it, and to
+// the app's sheet everywhere else.
+let keyState = initialKeyState();
+let omnibox = null;
+let sheetNode = null;
 
 /** Move a `#t=<token>` fragment into sessionStorage and off the URL. */
 function bootstrapToken() {
@@ -145,6 +160,16 @@ function renderShell(appRoot) {
     onClick: toggleTheme,
   });
   navRoot = el("nav", { class: "app-nav", "aria-label": "fleet screens" });
+  // A visible affordance for ⌘K: a keyboard-only feature is a feature only
+  // the person who built it knows about.
+  const searchBtn = el("button", {
+    class: "btn btn-ghost omni-open",
+    type: "button",
+    title: "Search the fleet (⌘K)",
+    onClick: () => openOverlay(),
+  });
+  searchBtn.appendChild(el("span", { text: "Search" }));
+  searchBtn.appendChild(el("kbd", { class: "mono", text: "⌘K" }));
   const header = el("header", { class: "app-header" }, [
     el("a", { class: "brand", href: hrefLibrary() }, [
       el("span", { class: "logo", "aria-hidden": "true", text: "H" }),
@@ -153,18 +178,52 @@ function renderShell(appRoot) {
     ]),
     navRoot,
     el("span", { class: "spacer" }),
+    searchBtn,
     themeBtn,
   ]);
+  bannerRoot = el("div", { class: "banner-slot", id: "banners" });
   viewRoot = el("main", { class: "view", id: "view" });
   footRoot = el("footer", { class: "app-foot", id: "foot" }, [
     el("span", { class: "muted", text: "every action shows the CLI command it runs" }),
   ]);
   appRoot.appendChild(header);
+  appRoot.appendChild(bannerRoot);
   appRoot.appendChild(viewRoot);
   appRoot.appendChild(footRoot);
   drawNav(parseRoute(window.location.hash));
   loadVersion();
   loadNavCounts();
+  loadReadOnlyBanner();
+  installKeyboard();
+}
+
+/**
+ * HM-187 — the read-only banner. The mode is enforced SERVER-side; this
+ * banner exists so an operator is not left guessing why a button just
+ * answered 403. It states the mode, and it links to the toggle.
+ */
+async function loadReadOnlyBanner() {
+  if (bannerRoot === null) return;
+  let state = null;
+  try {
+    state = await api.readOnly();
+  } catch {
+    return; // an old server without the route: no banner, no error
+  }
+  clear(bannerRoot);
+  if (state?.enabled !== true) return;
+  bannerRoot.appendChild(
+    el("div", { class: "banner banner-warn", role: "status" }, [
+      dot("warn", "read-only mode"),
+      el("span", {
+        text: "every mutating request is refused by the server — this manager is in demo/screen-share mode.",
+      }),
+      el("a", { class: "banner-link", href: hrefGlobal("settings"), text: "Settings →" }),
+      state.locked === true
+        ? el("span", { class: "chip chip-warn", text: "locked at startup" })
+        : null,
+    ]),
+  );
 }
 
 /** The nav, with the active screen marked. Counts arrive separately. */
@@ -192,15 +251,36 @@ function drawNav(route, counts = {}) {
   }
 }
 
-/** Pending approvals + open review items — the two numbers worth a badge. */
+/** Pending approvals, open review items, and the notification badge —
+ *  the three numbers worth carrying in the nav. The notifications poll is
+ *  ALSO the rules evaluation pass (HM-183: the manager runs no timer), so a
+ *  console left open keeps the badge honest without a background loop. */
 async function loadNavCounts() {
-  const [approvals, review] = await Promise.allSettled([api.approvals(), api.review()]);
+  const [approvals, review, notifications] = await Promise.allSettled([
+    api.approvals(),
+    api.review(),
+    api.notifications(),
+  ]);
   const counts = {};
   if (approvals.status === "fulfilled" && approvals.value && typeof approvals.value === "object") {
     counts.approvals = approvals.value.pending;
   }
   if (review.status === "fulfilled" && review.value && typeof review.value === "object") {
     counts.review = review.value.open;
+  }
+  if (
+    notifications.status === "fulfilled" &&
+    notifications.value &&
+    typeof notifications.value === "object"
+  ) {
+    counts.settings = notifications.value.badge;
+    // Anything delivered on THIS poll is new since the last one: one toast,
+    // and the badge carries the rest.
+    const delivered = Array.isArray(notifications.value.delivered)
+      ? notifications.value.delivered
+      : [];
+    if (delivered.length === 1) toast(String(delivered[0]?.label ?? "notification"), "info");
+    else if (delivered.length > 1) toast(`${delivered.length} new notifications`, "info");
   }
   navCounts = counts;
   drawNav(parseRoute(window.location.hash), counts);
@@ -226,6 +306,10 @@ async function loadVersion() {
 async function dispatch(route) {
   const seq = ++dispatchSeq;
   drawNav(route, navCounts);
+  // The two screens that bind `?` for their own inbox sheet. Tracked here
+  // rather than sniffed from the DOM so the ownership rule stays a pure
+  // input to the `keys.js` reducer.
+  keyState = { ...keyState, inboxMounted: route.view === "approvals" || route.view === "review" };
   clear(viewRoot).appendChild(skeleton(6));
   try {
     if (route.view === "library") {
@@ -246,6 +330,10 @@ async function dispatch(route) {
       await renderFeedbackBoard(viewRoot);
     } else if (route.view === "thredz") {
       await renderThredzGlobal(viewRoot);
+    } else if (route.view === "health") {
+      await renderHealthBoard(viewRoot);
+    } else if (route.view === "settings") {
+      await renderSettings(viewRoot);
     } else {
       renderNotFound(viewRoot, route);
     }
@@ -334,7 +422,13 @@ async function renderHarnessPage(root, route) {
   else if (route.tab === "deploy") await renderDeploy(tabRoot, ctx);
   else if (route.tab === "inspect") await renderInspect(tabRoot, ctx);
   else if (route.tab === "dev") await renderRuntime(tabRoot, ctx);
-  else await renderOverview(tabRoot, ctx);
+  else if (route.tab === "panes") await renderPanes(tabRoot, ctx);
+  else {
+    await renderOverview(tabRoot, ctx);
+    // The explained score (HM-11) loads on its own: it runs a preflight, and
+    // the Overview's first paint must not wait for one.
+    await renderHealthCard(section(tabRoot), ctx);
+  }
 }
 
 /**
@@ -512,6 +606,89 @@ function renderError(root, err) {
       }),
     ]),
   );
+}
+
+/**
+ * HM-190 — the app-level keyboard layer.
+ *
+ * One listener, one pure reducer (`keys.js`). It claims ⌘K, Escape and — on
+ * screens with no inbox — `?`, and it claims NOTHING else, so the inbox
+ * triage reducer that shipped with M2 keeps receiving j/k/g/d untouched on
+ * the two screens that mount it.
+ */
+function installKeyboard() {
+  document.addEventListener("keydown", (event) => {
+    const { state, effect, claimed } = globalKey(keyState, keyShape(event));
+    keyState = state;
+    if (claimed) event.preventDefault();
+    if (effect === "open-omnibox") openOverlay();
+    else if (effect === "close-omnibox") closeOverlay();
+    else if (effect === "toggle-sheet") drawSheet();
+    else if (effect === "close-sheet") drawSheet();
+  });
+}
+
+function openOverlay() {
+  if (omnibox !== null) return;
+  keyState = { ...keyState, omniboxOpen: true, sheetOpen: false };
+  drawSheet();
+  omnibox = openOmnibox(document.body, {
+    onClose: () => {
+      omnibox = null;
+      keyState = { ...keyState, omniboxOpen: false };
+    },
+  });
+}
+
+function closeOverlay() {
+  if (omnibox === null) return;
+  omnibox.close();
+  omnibox = null;
+}
+
+/** The `?` bindings overlay. Rendered from `bindingSheet()` so the list and
+ *  the reducer can never disagree about what a key does. */
+function drawSheet() {
+  if (sheetNode !== null) {
+    sheetNode.remove();
+    sheetNode = null;
+  }
+  if (!keyState.sheetOpen) return;
+  sheetNode = el(
+    "div",
+    {
+      class: "sheet-backdrop",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-label": "keyboard bindings",
+    },
+    [
+      el("div", { class: "card sheet" }, [
+        el("h3", { class: "card-title", text: "Keyboard" }),
+        ...bindingSheet(keyState.inboxMounted).flatMap((group) => [
+          el("h4", { class: "sheet-section", text: group.section }),
+          el(
+            "ul",
+            { class: "check-list" },
+            group.bindings.map((b) =>
+              el("li", null, [
+                el("kbd", { class: "mono", text: b.keys }),
+                el("span", { text: ` — ${b.does}` }),
+              ]),
+            ),
+          ),
+        ]),
+        el("p", { class: "muted small", text: "Esc closes." }),
+      ]),
+    ],
+  );
+  sheetNode.addEventListener("click", (event) => {
+    if (event.target === sheetNode) {
+      keyState = { ...keyState, sheetOpen: false };
+      drawSheet();
+    }
+  });
+  document.body.appendChild(sheetNode);
 }
 
 function boot() {

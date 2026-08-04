@@ -74,6 +74,7 @@ import {
   writeRunfile,
 } from "./runfiles";
 import { type Scrubber, createEnvScrubber, scrubbableEnvKeys } from "./scrub";
+import type { SupervisedChild } from "./shutdown";
 import { type SpawnPlan, isSupervisedClass, loadEnvChain, runClassFor } from "./spawn-contracts";
 import {
   type LogPump,
@@ -208,6 +209,17 @@ export type SupervisorOptions = {
 
 export type HarnessSupervisor = {
   snapshot(): SupervisorSnapshot;
+  /**
+   * The live supervised child, or undefined when this supervisor holds no
+   * pid. A pure read — it never signals, never adopts, never writes.
+   *
+   * This is the enumeration manager shutdown needs: a snapshot says what
+   * STATE a harness is in, but shutdown has to decide a FATE, and that turns
+   * on facts the snapshot does not carry — whether the child is detached,
+   * and whether a runfile makes it re-adoptable by the next manager. Without
+   * it the only honest shutdown was to print what survived and hope.
+   */
+  liveChild(): SupervisedChild | undefined;
   start(options?: GateOptions): Promise<StartResult>;
   stop(options?: { readonly graceMs?: number }): Promise<StopResult>;
   restart(options?: GateOptions): Promise<StartResult>;
@@ -313,6 +325,33 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     ...(currentPorts !== undefined ? { ports: currentPorts } : {}),
     ...(controlPort !== undefined ? { controlPort } : {}),
   });
+
+  /**
+   * Describe the live child for shutdown planning.
+   *
+   * Two fields carry the whole decision:
+   *
+   *   - `detached` — an ADOPTED run has no plan of ours, but a runfile only
+   *     ever describes a detached daemon, so `true` is the fact rather than
+   *     a guess.
+   *   - `reAdoptable` — a runfile has to still be THERE. A daemon whose
+   *     claim was deleted underneath it cannot be found again by anyone, so
+   *     leaving it up would orphan it exactly like an mcp-server projection.
+   */
+  const liveChild = (): SupervisedChild | undefined => {
+    if (pid === undefined || currentKind === undefined) return undefined;
+    return {
+      harnessDir: options.harnessDir,
+      target: options.target,
+      state,
+      kind: currentKind,
+      ...(runId !== undefined ? { runId } : {}),
+      pid,
+      adopted,
+      detached: currentPlan?.detached ?? true,
+      reAdoptable: currentKind === "daemon" && runfileExists(options.harnessDir),
+    };
+  };
 
   const emit = (event: SupervisorEvent): void => {
     for (const listener of listeners) {
@@ -1093,6 +1132,7 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
 
   return {
     snapshot,
+    liveChild,
     start,
     stop,
     markOperatorStop: () => {

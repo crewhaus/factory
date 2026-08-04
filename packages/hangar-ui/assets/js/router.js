@@ -25,6 +25,9 @@
  *   #/h/<id>/deploy                     → deployment records
  *
  * M3 adds the detail tabs and two more fleet screens:
+ *   #/health                            → the fleet health board (M4)
+ *   #/settings                          → notification rules, read-only, plugins (M4)
+ *   #/h/<id>/panes                      → sandboxed plugin panes (M4)
  *   #/credentials                       → the fleet credential matrix
  *   #/thredz                            → the global Thredz explorer
  *   #/feedback                          → the fleet feedback rollup
@@ -53,6 +56,11 @@ export const HARNESS_TABS = [
   "deploy",
   "inspect",
   "dev",
+  // M4 (HM-179): the sandboxed plugin panes this harness shows. Always on
+  // the strip — a harness with no applicable pane renders the honest empty
+  // state naming the install verb, which is more useful than a tab that
+  // appears only once a plugin exists.
+  "panes",
 ];
 
 /** The M3 tabs, whose trailing segments are captured generically as `rest`.
@@ -80,6 +88,10 @@ export const GLOBAL_VIEWS = [
   "credentials",
   "feedback",
   "thredz",
+  // M4: the fleet health board (HM-11) and Settings (HM-198's console half:
+  // notification rules, read-only mode, the plugin inventory).
+  "health",
+  "settings",
 ];
 
 /**
@@ -213,6 +225,7 @@ export function parseRoute(hash) {
     case "costs":
     case "schedulers":
     case "deploy":
+    case "panes":
       return { view: "harness", id, tab };
     case "sessions":
       return rest[0] !== undefined

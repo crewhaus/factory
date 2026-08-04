@@ -38,7 +38,8 @@
  * to one truth.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { logLine, makeFixtureHarness } from "./fixture";
 import { M3_ROUTES } from "./m3-routes";
@@ -385,6 +386,111 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["costs.days[].day", "string"],
     ["costs.days[].usdMicros", "number"],
     ["costs.days[].calls", "number"],
+  ],
+
+  // ---- M4 --------------------------------------------------------------
+  // views/health.js healthScoreCard — the score is never rendered alone, so
+  // the deduction fields ARE the contract.
+  health: [
+    ["id", "string"],
+    ["health.score", "number"],
+    ["health.band", "string"],
+    ["health.summary", "string"],
+    ["health.deductions", "array"],
+    ["health.unknowns", "array"],
+    ["health.deductions[].id", "string"],
+    ["health.deductions[].points", "number"],
+    ["health.deductions[].label", "string"],
+    ["health.deductions[].detail", "string"],
+    ["health.deductions[].screen", "string"],
+  ],
+  // views/health.js renderHealthBoard
+  fleetHealth: [
+    ["harnesses[].id", "string"],
+    ["harnesses[].specName", "string"],
+    ["harnesses[].health.score", "number"],
+    ["harnesses[].health.band", "string"],
+    ["harnesses[].health.deductions", "array"],
+  ],
+  // views/onboarding.js
+  onboarding: [
+    ["firstBoot", "boolean"],
+    ["harnessCount", "number"],
+    ["scanRootCount", "number"],
+    ["suggestions", "array"],
+    ["suggestions[].dir", "string"],
+    ["suggestions[].exists", "boolean"],
+    ["suggestions[].why", "string"],
+    ["demo.available", "boolean"],
+    ["demo.source", "string|null"],
+    ["demo.starters", "array"],
+    ["demo.reason", "string|null"],
+    ["demo.remedy", "string|null"],
+    ["completedAt", "string|null"],
+    ["cliTwins", "object"],
+  ],
+  // omnibox.js omniRows
+  search: [
+    ["query", "string"],
+    ["entries", "array"],
+    ["actions", "array"],
+    ["indexed", "number"],
+    ["size", "number"],
+    ["entries[].kind", "string"],
+    ["entries[].id", "string"],
+    ["entries[].title", "string"],
+    ["entries[].subtitle", "string"],
+    ["entries[].href", "string"],
+    ["entries[].harnessId", "string|null"],
+  ],
+  // views/settings.js notificationCard + app.js nav badge
+  notifications: [
+    ["rules", "array"],
+    ["rules[].kind", "string"],
+    ["rules[].enabled", "boolean"],
+    ["rules[].sinks", "array"],
+    ["rules[].mutedGroups", "array"],
+    ["quietHours.enabled", "boolean"],
+    ["quietHours.startHour", "number"],
+    ["quietHours.endHour", "number"],
+    ["quietHours.utcOffsetMinutes", "number"],
+    ["mutedGroups", "array"],
+    ["webhookUrl", "string|null"],
+    ["delivered", "array"],
+    ["suppressed", "array"],
+    ["inApp", "array"],
+    ["badge", "number"],
+  ],
+  // views/settings.js readOnlyCard + app.js banner
+  readOnly: [
+    ["enabled", "boolean"],
+    ["locked", "boolean"],
+    ["exempt", "array"],
+    ["note", "string"],
+  ],
+  // views/settings.js pluginCard
+  plugins: [
+    ["pluginsDir", "string"],
+    ["plugins", "array"],
+    ["wired", "array"],
+    ["deferred", "object"],
+  ],
+  // views/panes.js paneCard
+  pluginPane: [
+    ["plugin", "string"],
+    ["paneId", "string"],
+    ["title", "string"],
+    ["doc", "string"],
+    ["sandbox", "string"],
+    ["csp", "string"],
+    ["truncated", "boolean"],
+  ],
+  // views/panes.js renderPanes
+  panes: [
+    ["id", "string"],
+    ["panes", "array"],
+    ["traceObservers", "array"],
+    ["deferred", "object"],
   ],
 };
 
@@ -1438,8 +1544,13 @@ function contractHarness(t: TestServer): string {
 describe("UI route contract", () => {
   test("every route in the console's map answers with what its view reads (and writes take effect)", async () => {
     const ROUTES = await loadRoutes();
+    // The plugin fixture lives beside the workspace the server creates, so
+    // it is written after boot and picked up on the first read (discovery is
+    // per-request — nothing is cached at boot).
+    const pluginsDir = mkdtempSync(join(tmpdir(), "hangar-contract-plugins-"));
     const t = bootTestServer({
       now: () => NOW,
+      pluginsDir,
       // `doctor` runs to completion (so the ledger has a terminal job);
       // anything else parks, so the queue also has a live one.
       runJob: (job) =>
@@ -1681,6 +1792,84 @@ describe("UI route contract", () => {
         if (route.method === "GET") assertViewReads(key, body);
       }
 
+      // -- M4: health, onboarding, ⌘K, notifications, read-only, plugins ---
+      // Every one is a REAL handler (no `group`, so no 501 is acceptable);
+      // each read must carry the fields its view dereferences.
+      const health = await drive("health", { id }, { readsKey: "health" });
+      const score = (health["health"] as { score: number; deductions: unknown[] }).score;
+      // The invariant the item exists for: a score under 100 is never a bare
+      // number — the deductions that produced it travel with it.
+      if (score < 100) {
+        expect((health["health"] as { deductions: unknown[] }).deductions.length).toBeGreaterThan(
+          0,
+        );
+      }
+      await drive("fleetHealth", {}, { readsKey: "fleetHealth" });
+
+      const onboarding = await drive("onboarding", {}, { readsKey: "onboarding" });
+      // A registered harness means this is not first boot.
+      expect(onboarding["firstBoot"]).toBe(false);
+      // With no demos checkout configured the refusal names the remedy.
+      const demoRefusal = await drive(
+        "demoInstall",
+        {},
+        {
+          body: { starter: "cli-quickstart", dir: join(t.workspace, "demo-target") },
+          expectStatus: 409,
+        },
+      );
+      expect(demoRefusal["reason"]).toBe("no-demos-checkout");
+      expect(String(demoRefusal["remedy"])).toContain("crewhaus/demos");
+
+      const found = await drive("search", {}, { query: "?q=contract-harness", readsKey: "search" });
+      expect((found["entries"] as Array<{ id: string }>).some((e) => e.id === id)).toBe(true);
+
+      const notifications = await drive("notifications", {}, { readsKey: "notifications" });
+      expect((notifications["rules"] as Array<{ kind: string }>).length).toBeGreaterThan(5);
+      await drive("setNotifications", {}, { body: { mutedGroups: ["prod"] } });
+      expect((await drive("notifications", {}))["mutedGroups"]).toEqual(["prod"]);
+      await drive("clearNotifications", {}, { body: {} });
+      expect((await drive("notifications", {}))["badge"]).toBe(0);
+
+      const readOnly = await drive("readOnly", {}, { readsKey: "readOnly" });
+      expect(readOnly["enabled"]).toBe(false);
+      // Engaged and lifted again, with the effect visible on re-read — the
+      // toggle must not strand this test in a mode where nothing else works.
+      await drive("setReadOnly", {}, { body: { enabled: true } });
+      expect((await drive("readOnly", {}))["enabled"]).toBe(true);
+      expect((await t.api("/api/scan", { method: "POST", body: "{}" })).status).toBe(403);
+      await drive("setReadOnly", {}, { body: { enabled: false } });
+      expect((await drive("readOnly", {}))["enabled"]).toBe(false);
+
+      // The plugin fabric: one installed plugin whose read glob covers this
+      // server's harness root, so it draws a pane and observes traces.
+      mkdirSync(join(pluginsDir, "cost-lens"), { recursive: true });
+      writeFileSync(
+        join(pluginsDir, "cost-lens", "plugin.json"),
+        JSON.stringify({
+          name: "cost-lens",
+          version: "1.0.0",
+          onTraceEvent: true,
+          onSpecLoad: true,
+          panes: [{ id: "spend", title: "Spend", file: "spend.html" }],
+          permissions: { fs: [`read:${t.harnessesRoot}/**`] },
+        }),
+      );
+      writeFileSync(join(pluginsDir, "cost-lens", "spend.html"), "<p>spend</p>");
+      const inventory = await drive("plugins", {}, { readsKey: "plugins" });
+      expect(inventory["wired"]).toEqual(["onTraceEvent", "panes"]);
+      const pane = await drive(
+        "pluginPane",
+        { plugin: "cost-lens", pane: "spend" },
+        { readsKey: "pluginPane" },
+      );
+      // The containment travels WITH the document, always.
+      expect(pane["sandbox"]).toBe("allow-scripts");
+      expect(String(pane["csp"])).toContain("connect-src 'none'");
+      const panes = await drive("panes", { id }, { readsKey: "panes" });
+      expect((panes["panes"] as Array<{ id: string }>).map((p) => p.id)).toEqual(["spend"]);
+      expect(panes["traceObservers"]).toEqual(["cost-lens"]);
+
       // -- scan root + scan (effect: the root is scanned, entries refresh) --
       await drive("addScanRoot", {}, { body: { dir: t.harnessesRoot }, expectStatus: 201 });
       const scanned = await drive("scan", {}, { body: {} });
@@ -1700,6 +1889,7 @@ describe("UI route contract", () => {
       expect([...driven].sort()).toEqual(Object.keys(ROUTES).sort());
     } finally {
       await t.stop();
+      rmSync(pluginsDir, { recursive: true, force: true });
     }
   }, 30_000);
 

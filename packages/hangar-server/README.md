@@ -281,6 +281,60 @@ that `M3_ROUTES` and the map's grouped entries are the same set — key for
 key, method for method, path for path — so `routes.js`, `m3-routes.ts` and
 the test stay one truth rather than three opinions.
 
+### M4 — health, onboarding, ⌘K, notifications, read-only, plugins
+
+| Route | What it answers |
+|---|---|
+| `GET /api/h/:id/health` · `GET /api/health` | the 0–100 score with its DEDUCTIONS, each naming the console tab that fixes it (HM-11) |
+| `GET /api/onboarding` · `POST /api/onboarding/demo` | first-boot state + scan-root suggestions; demo mode copies a starter out of a LOCAL demos checkout (HM-12) |
+| `GET /api/search?q=` | the lazy ⌘K index over harnesses/sessions/wiki/facts/datasets/graders/eval runs/incidents/approvals, plus ACTION proposals (HM-189) |
+| `GET·PUT /api/notifications` · `POST /api/notifications/clear` | the rules engine + the badge; the GET is also the evaluation pass (HM-183) |
+| `GET·PUT /api/read-only` | the demo/screen-share mode, enforced ahead of every handler (HM-187) |
+| `GET /api/plugins` · `GET /api/plugins/:plugin/panes/:pane` · `GET /api/h/:id/panes` | the plugin inventory, one sandboxed pane document, and the panes a harness shows (HM-179) |
+
+Four properties are worth stating because they are easy to get wrong:
+
+**The score is never a bare number.** `computeHealth` is pure and returns
+every deduction it applied — points, the fact it came from, and the tab that
+fixes it — so the arithmetic is reconstructible by hand and the number is a
+route into the work. An input the server could not read comes back as an
+`unknown` rather than as a pass. Preflight's credentials area and the spec's
+own `$VAR` list describe the same missing key from two directions, so the
+unset-env deduction dedupes on `envVar` and one missing key costs once.
+
+**Demo mode copies; it never downloads.** `POST /api/onboarding/demo` reads a
+local demos checkout (`CREWHAUS_DEMOS_DIR` or the `demosDir` option) and
+answers `409 no-demos-checkout` naming the repo, the variable and the CLI
+verb when there is none. It refuses a non-empty destination, refuses to
+install inside the checkout, skips symlinks rather than following them, and
+is capped by file count and bytes.
+
+**The ⌘K index never blocks boot.** `createOmniIndex()` allocates a map; the
+first query pays for the harnesses it needs and memoizes each against a cheap
+mtime token. Sessions are listed by NAME from a directory scan — never
+`SessionStore.list()`, whose TTL sweep deletes transcripts. The `actions` a
+query returns are PROPOSALS carrying a route key and a CLI twin; the search
+route executes nothing.
+
+**Read-only mode is enforced here, not in the UI.** Every non-GET `/api`
+request is refused unless it is on the short exact-match exempt list
+(`READ_ONLY_EXEMPT`), so a route added next month is covered by construction.
+It prevents accidents during a demo — the bearer token, not this toggle, is
+the security boundary — and `readOnlyLocked` refuses even the un-toggle for
+the case where the person driving is not the person who owns the machine. A
+`--read-only` BOOT flag is a posture for one process and is deliberately not
+persisted; an explicit toggle through the API is a preference and is.
+
+**The plugin wiring is deliberately partial, and says so.** Exactly two
+extension points are wired — `onTraceEvent` and `panes` — and
+`onSpecLoad`/`onEvalSampleRendered` are reported declared-but-deferred WITH
+their reasons rather than silently ignored. Discovery reads manifests and
+never `import()`s plugin code into the manager (which holds every harness's
+`.env` chain); a pane's own code runs only inside an iframe with an opaque
+origin and a CSP built from its `net` allow-list. Visibility is decided by
+`@crewhaus/plugin-loader`'s own fail-closed `isFsAllowed`, so a plugin that
+may not read a harness neither draws a tab on it nor sees its trace events.
+
 ## Library use
 
 ```ts

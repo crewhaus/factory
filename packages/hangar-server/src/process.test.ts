@@ -13,11 +13,25 @@
  */
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type HangarHarnessEntry, openHangarRegistry } from "@crewhaus/harness-registry";
 import { makeFixtureHarness } from "./fixture";
-import { JobArgumentError, type ProcessLayer, createProcessLayer, jobArgv } from "./process";
-import { type TestServer, bootTestServer, startStubControlPlane } from "./testkit";
+import {
+  JobArgumentError,
+  type ProcessLayer,
+  createProcessLayer,
+  defaultJobRunner,
+  jobArgv,
+} from "./process";
+import {
+  type TestServer,
+  bootTestServer,
+  createTestClock,
+  createTestProcessOps,
+  startStubControlPlane,
+} from "./testkit";
 
 const NOW = Date.parse("2026-08-03T00:00:00.000Z");
 
@@ -602,5 +616,49 @@ describe("job argv", () => {
     for (const bad of ["--write-back", "../../etc/passwd", "/abs/path", "a b", "a;b", ""]) {
       expect(() => jobArgv("eval", { dataset: bad })).toThrow(JobArgumentError);
     }
+  });
+});
+
+describe("a console-submitted job is cancellable (the seam, not just the ledger)", () => {
+  test("the default job runner hands its child to the queue", async () => {
+    // The queue can only signal a child the RUNNER handed it. Without the
+    // `ctx.register` call the queue knows a job is "running" and holds
+    // nothing: cancel() answers false and manager shutdown marks the ledger
+    // row while the process keeps going — the orphan M4 exists to stop,
+    // reintroduced through the console path.
+    //
+    // Tested against the REAL runner rather than through the server, whose
+    // testkit injects a never-settling stub in its place.
+    const clock = createTestClock(NOW);
+    const ops = createTestProcessOps(() => clock.now());
+    const dir = makeFixtureHarness(join(mkdtempSync(join(tmpdir(), "hangar-jobrun-")), "h"), {
+      specName: "jobbed",
+    });
+    const runner = defaultJobRunner(ops, () => "/bin/crewhaus");
+
+    const registered: Array<{ terminate: (signal: string) => void }> = [];
+    const job = {
+      jobId: "job_00000000000000a1",
+      harnessDir: dir,
+      kind: "doctor",
+      argv: ["doctor"],
+      mutating: false,
+      state: "running",
+      enqueuedAt: new Date(NOW).toISOString(),
+    } as Parameters<typeof runner>[0];
+
+    void runner(job, {
+      register: (child) => registered.push(child as never),
+      isCancelled: () => false,
+    } as Parameters<typeof runner>[1]);
+    await Promise.resolve();
+
+    expect(ops.children.filter((c) => c.alive).length).toBe(1);
+    expect(registered.length).toBe(1);
+
+    // …and the thing it registered actually reaches the process.
+    const pid = (ops.last() as NonNullable<ReturnType<typeof ops.last>>).pid;
+    (registered[0] as { terminate: (s: string) => void }).terminate("SIGKILL");
+    expect(ops.children.find((c) => c.pid === pid)?.alive).toBe(false);
   });
 });

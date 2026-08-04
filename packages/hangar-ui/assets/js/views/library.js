@@ -22,6 +22,7 @@ import {
   rollupLine,
   sortRows,
 } from "../util.js";
+import { renderOnboarding, shouldOnboard } from "./onboarding.js";
 
 const state = {
   sortKey: "name",
@@ -65,6 +66,20 @@ export async function renderLibrary(root) {
   const [feedRes, groupsRes] = await Promise.allSettled([api.harnesses(), api.groups()]);
   if (feedRes.status === "rejected") throw feedRes.reason;
   const rows = normalizeRows(feedRes.value);
+  // HM-12: an empty Library on a machine with no scan roots is FIRST BOOT,
+  // not an empty list — hand over to onboarding rather than showing a table
+  // with no rows and a verb nobody has run yet. A machine that HAS a root
+  // configured keeps the empty state below, because "the scan found nothing"
+  // is a different fact and its own verb answers it.
+  if (rows.length === 0) {
+    const onboardingRes = await Promise.allSettled([api.onboarding()]);
+    const view = onboardingRes[0].status === "fulfilled" ? onboardingRes[0].value : null;
+    if (shouldOnboard(view, rows.length)) {
+      clear(root);
+      await renderOnboarding(root, { reload: () => renderLibrary(root) });
+      return;
+    }
+  }
   const groups = normalizeGroups(groupsRes.status === "fulfilled" ? groupsRes.value : null, rows);
   draw(root, rows, groups, { hydrating: true });
   hydrateInBackground(root, groups);

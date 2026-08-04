@@ -511,6 +511,11 @@ describe("the structured editor", () => {
       const specPath = join(dir, "crewhaus.yaml");
       // An operator who narrowed their spec on purpose.
       chmodSync(specPath, 0o600);
+      // The claim is PRESERVATION, so the comparison is before-vs-after
+      // rather than against a literal: Windows has no POSIX mode bits (it
+      // reports 0666 for a writable file), and a hardcoded 0600 would test
+      // the platform instead of the rename.
+      const before = statSync(specPath).mode & 0o777;
       const id = await register(t, dir);
       const { status } = await t.api(
         `/api/h/${id}/spec/patch`,
@@ -519,7 +524,8 @@ describe("the structured editor", () => {
       expect(status).toBe(200);
       // The write is tmp+rename, and rename replaces the INODE: a hardcoded
       // mode on the temp file silently becomes the spec's mode.
-      expect((statSync(specPath).mode & 0o777).toString(8)).toBe("600");
+      expect((statSync(specPath).mode & 0o777).toString(8)).toBe(before.toString(8));
+      if (process.platform !== "win32") expect(before.toString(8)).toBe("600");
     } finally {
       await t.stop();
     }

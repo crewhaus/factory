@@ -125,6 +125,47 @@ export const ROUTES = {
   pinSession: { method: "POST", path: "/api/h/:id/sessions/:sess/pin", body: "PinSession" }, // {pinned}
   pinBaseline: { method: "POST", path: "/api/h/:id/evals/baseline", body: "PinBaseline" }, // {runId}
 
+  // ---- M4: polish, fleet ops, notifications -----------------------------
+  // Real handlers, not stubs — so these carry NO `group` and are driven by
+  // the contract test like any M1/M2 route.
+  //
+  // `health` is the explained score (HM-11): never a bare number, always the
+  // deductions that produced it, each naming the tab that fixes it.
+  // `fleetHealth` runs a preflight per harness, so it is the "needs
+  // attention" board an operator opens — never the Library's first paint.
+  health: { method: "GET", path: "/api/h/:id/health" },
+  fleetHealth: { method: "GET", path: "/api/health" },
+
+  // First boot (HM-12). `demoInstall` copies a starter out of a LOCAL demos
+  // checkout; with none configured it answers 409 naming the repo, the env
+  // var and the CLI verb — it never fetches code from the network.
+  onboarding: { method: "GET", path: "/api/onboarding" },
+  demoInstall: { method: "POST", path: "/api/onboarding/demo", body: "DemoInstall" }, // {starter, dir}
+
+  // ⌘K (HM-189). `?q=` + optional `?limit=`. The response's `actions` are
+  // PROPOSALS carrying a route key and a CLI twin; the console executes them
+  // through the ordinary route after an explicit confirm, so an action is
+  // never a side effect of typing.
+  search: { method: "GET", path: "/api/search" },
+
+  // Notification rules (HM-183). The GET is the badge poll AND the
+  // evaluation pass (the manager runs no timer of its own).
+  notifications: { method: "GET", path: "/api/notifications" },
+  setNotifications: { method: "PUT", path: "/api/notifications", body: "NotificationRules" },
+  clearNotifications: { method: "POST", path: "/api/notifications/clear", body: "Empty" }, // {}
+
+  // Read-only mode (HM-187) — enforced SERVER-side ahead of every handler.
+  readOnly: { method: "GET", path: "/api/read-only" },
+  setReadOnly: { method: "PUT", path: "/api/read-only", body: "ReadOnly" }, // {enabled}
+
+  // Plugin SDK minimal wiring (HM-179): the inventory (which extension
+  // points are wired and which are declared-but-deferred), one pane document
+  // with the sandbox + CSP that must accompany it, and the panes a given
+  // harness shows after the fail-closed fs permission is evaluated.
+  plugins: { method: "GET", path: "/api/plugins" },
+  pluginPane: { method: "GET", path: "/api/plugins/:plugin/panes/:pane" },
+  panes: { method: "GET", path: "/api/h/:id/panes" },
+
   // ======================================================================
   // M3 — the detail surface. Every entry carries `group`.
   // ======================================================================

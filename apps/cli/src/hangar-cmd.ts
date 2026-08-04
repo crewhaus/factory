@@ -31,11 +31,15 @@
  * Side-effect-free on import, mirroring `harness-cmd.ts`: every function
  * takes an injected environment/clock/pid-liveness/browser-opener seam and
  * returns lines + an exit code; `serve` streams progress through the
- * injected `write` sink because it blocks until SIGINT/SIGTERM, and then
- * EXITS explicitly (see `shutdownNotices`) rather than returning and hoping
- * the event loop drains — a supervised child keeps it open. Bad arguments
- * throw plain `Error`s; the entry file routes them through `die()` like
- * `harness` does.
+ * injected `write` sink because it blocks until SIGINT/SIGTERM.
+ *
+ * M4 shutdown: SIGINT/SIGTERM drives `runManagerShutdown()` over every
+ * supervisor this manager holds BEFORE the socket and the lock are given up
+ * — daemons detach (runfile-tracked, the next boot adopts them), everything
+ * else is stopped so it cannot be orphaned, running jobs are signalled and
+ * left open for `restore()` to reopen as `interrupted` — and only then does
+ * the process exit, explicitly. Bad arguments throw plain `Error`s; the
+ * entry file routes them through `die()` like `harness` does.
  */
 import { spawn } from "node:child_process";
 import {
@@ -60,6 +64,11 @@ import {
   openHangarRegistry,
   resolveRegistryRoot,
 } from "@crewhaus/harness-registry";
+import {
+  type ShutdownSupervisor,
+  runManagerShutdown,
+  shutdownReportLines,
+} from "@crewhaus/harness-supervisor";
 import { cliVersion } from "./version";
 
 /** What a verb returns: lines for stdout + the process exit code. `serve`
@@ -93,9 +102,14 @@ export type HangarCommandOptions = {
   readonly startServer?: (options: HangarServerOptions) => HangarServer;
   /** Process exit, called by `serve` after a clean shutdown. Injected by
    *  tests (a real `process.exit` would take the test runner with it);
-   *  defaults to `process.exit`. See {@link shutdownNotices} for why the
-   *  exit has to be explicit. */
+   *  defaults to `process.exit`. */
   readonly exit?: (code: 0 | 1) => void;
+  /** SIGTERM → SIGKILL grace for each supervised child at shutdown; default
+   *  the supervisor package's `SHUTDOWN_GRACE_MS`. */
+  readonly shutdownGraceMs?: number;
+  /** Hard cap on waiting for any one child to confirm its exit; default the
+   *  supervisor package's `SHUTDOWN_DEADLINE_MS`. */
+  readonly shutdownDeadlineMs?: number;
 };
 
 const HANGAR_USAGE_LINES: readonly string[] = [
@@ -496,7 +510,10 @@ function summaryLines(
     "registry",
     `${server.registryPath}${harnessCount !== undefined ? ` (${harnessCount} harness(es))` : ""}`,
   ]);
-  rows.push(["stop", "Ctrl-C (SIGINT/SIGTERM) — releases the hangar.lock"]);
+  rows.push([
+    "stop",
+    "Ctrl-C (SIGINT/SIGTERM) — stops attached runs, leaves daemons up, releases the lock",
+  ]);
   const width = Math.max(...rows.map(([k]) => k.length));
   return [
     "┌─ Hangar — the CrewHaus harness manager",
@@ -505,39 +522,41 @@ function summaryLines(
   ];
 }
 
-/** The minimum a queued job row has to carry for the shutdown notice. */
-export type RunningJob = {
-  readonly jobId: string;
-  readonly kind: string;
-  readonly harnessDir: string;
-};
-
 /**
- * What shutdown says about the work this manager was still supervising —
- * and why `serve` exits EXPLICITLY instead of letting the event loop drain.
+ * Every supervisor this manager is holding, in registry order.
  *
- * `server.stop()` releases the socket, the timers and the subscriptions, but
- * it leaves supervised CHILDREN alone on purpose: a detached daemon
- * outliving its manager is the whole point of the harness-local runfile, and
- * the next boot adopts it. An attached job child (`dev`, `compile`, `eval`,
- * …) is a different story — it is spawned with `detached: false` and its
- * process handle keeps THIS process's event loop alive. So "stop and return"
- * is not an exit. Observed: a manager that printed "shutting down…",
- * released `hangar.lock` and freed its port (a second manager bound it) was
- * still alive minutes later with `crewhaus dev` running under it; one such
- * orphan survived a whole workday and had to be SIGKILLed.
+ * `peek` is deliberately the side-effect-free half of the process layer: it
+ * returns already-created handles only, so enumerating for shutdown never
+ * builds a supervisor — and therefore never adopts a daemon — as a side
+ * effect of going down. A harness with no handle never had a child here.
  *
- * Shutdown therefore does two things: it names what it is leaving behind
- * (silently orphaning an operator's job is the other half of the same
- * dishonesty), and then it exits deterministically.
+ * Exported because it is the seam the shutdown wiring is tested through:
+ * `ProcessLayer` is keyed by harness dir and has no enumeration of its own,
+ * which is exactly why M2 and M3 could only ever print what survived.
  */
-export function shutdownNotices(running: readonly RunningJob[]): string[] {
-  if (running.length === 0) return [];
-  const kinds = [...new Set(running.map((j) => j.kind))].sort().join(", ");
-  return [
-    `note: ${running.length} job(s) still running (${kinds}) — shutting down does not stop them;`,
-    "      they keep running, and the next manager reopens their ledger rows as `interrupted`.",
-  ];
+export function heldSupervisors(
+  dirs: readonly string[],
+  peek: (dir: string) => { readonly supervisor: ShutdownSupervisor } | undefined,
+): ShutdownSupervisor[] {
+  const held: ShutdownSupervisor[] = [];
+  const seen = new Set<string>();
+  for (const dir of dirs) {
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    const handle = peek(dir);
+    if (handle !== undefined) held.push(handle.supervisor);
+  }
+  return held;
+}
+
+/** Registered harness dirs, or none when the registry cannot be read — a
+ *  registry that fails to open must not wedge the console shut. */
+function registeredDirs(registry: HangarRegistry | undefined): string[] {
+  try {
+    return registry?.list().map((entry) => entry.dir) ?? [];
+  } catch {
+    return [];
+  }
 }
 
 async function hangarServe(
@@ -647,12 +666,26 @@ async function hangarServe(
     process.once("SIGTERM", onSigterm);
   });
   write("hangar: shutting down…");
+  // Children FIRST, before the socket and before the lock. Freeing the port
+  // while this manager still holds children is precisely the observed
+  // failure: a second manager bound the port and the first lived on with a
+  // job child under it. Holding the port until supervision has settled is
+  // what makes "the console is up" and "the console owns these processes"
+  // the same statement.
+  const report = await runManagerShutdown({
+    supervisors: heldSupervisors(registeredDirs(registry), (dir) => server.processes.peek(dir)),
+    jobs: server.processes.jobs,
+    ...(opts.shutdownGraceMs !== undefined ? { graceMs: opts.shutdownGraceMs } : {}),
+    ...(opts.shutdownDeadlineMs !== undefined ? { deadlineMs: opts.shutdownDeadlineMs } : {}),
+  });
   await server.stop();
   releaseHangarLock(hangarRoot, pid);
-  for (const line of shutdownNotices(server.processes.jobs.running())) write(line);
-  // Deterministic exit — see `shutdownNotices`. Without this the process
-  // lingers for as long as a supervised child holds the event loop, having
-  // already given up its lock and its port.
+  for (const line of shutdownReportLines(report)) write(line);
+  // Deterministic exit. Even with every child stopped or detached, a
+  // half-drained pipe or a straggling handle can keep the loop alive, and a
+  // manager that has already given up its lock and its port must not linger:
+  // that is the state an operator reads as "it exited" and an orphan hunter
+  // finds hours later.
   (opts.exit ?? ((code: 0 | 1): void => process.exit(code)))(0);
   return { lines: [], exitCode: 0 };
 }

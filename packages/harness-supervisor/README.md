@@ -124,12 +124,31 @@ global queue runs 3 at a time and persists its pending entries, so queued work
 survives a manager restart; work that was *running* when the manager died is
 recorded `interrupted` and never silently re-run.
 
+`cancel()` reaches a RUNNING job, not just a queued one — but only through a
+child the runner handed back (`ctx.register(processOpsChild(ops, pid))`). A
+runner that registers nothing cannot be cancelled and cannot be stopped at
+shutdown, and `cancel()` answers `false` rather than claiming otherwise.
+
+## Manager shutdown
+
+`runManagerShutdown()` is what makes a console's Ctrl-C an actual exit. It
+enumerates every supervisor's `liveChild()` and applies one rule: **a run
+survives iff the next manager can find it again.** A daemon-kind run holds a
+runfile, so it detaches and is re-adopted with its log intact; an attached
+interactive run, an mcp-server projection, and a manager-spawned one-shot hold
+no claim anyone could enumerate, so they are stopped rather than orphaned.
+Running jobs are signalled and their ledger rows left OPEN, so `restore()`
+reopens them as `interrupted`. Every stop is bounded by a deadline — a child
+that will not die must not stop the manager from exiting — and the report
+names what survived and what the next manager will do with it.
+
 ## Testing
 
 Every seam is injectable — `ProcessOps`, `Clock`, the plan builder, the gate,
 the scrubber, the id minter — and `./testkit` ships a controllable clock and a
 fake `ProcessOps` so the manager server and the CLI can test their own
 supervision wiring without spawning anything. The only real spawns in this
-package's own suite are four tiny fixture scripts under `fixtures/`, each with
-an explicit timeout, covering the things a fake cannot prove: signals, OS start
-times, and fd-redirected stdout.
+package's own suite are a handful of tiny fixture scripts under `fixtures/`,
+each with an explicit timeout, covering the things a fake cannot prove:
+signals, OS start times, fd-redirected stdout, and whether a manager process
+actually exits while its children are alive (`mini-manager.ts`).

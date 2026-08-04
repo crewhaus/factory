@@ -179,6 +179,32 @@ describe("js module hygiene", () => {
     }
   });
 
+  test("srcdoc appears in exactly one module, and only alongside a sandbox", () => {
+    // M4 (HM-179) introduces the ONE deliberate exception to the
+    // markup-string ban: a plugin pane's document is handed to an iframe via
+    // `srcdoc`. That is safe precisely because the string never joins THIS
+    // document — the frame gets an opaque origin (no `allow-same-origin`)
+    // and a CSP. Both halves are load-bearing, so the exception is pinned to
+    // one file and to the presence of the sandbox attribute beside it; a
+    // second module reaching for `srcdoc` fails here.
+    const users = jsEntries
+      .filter(([, entry]) => entry.body.includes("srcdoc"))
+      .map(([key]) => key);
+    expect(users).toEqual(["/assets/js/views/panes.js"]);
+    const panes = hangarAssets["/assets/js/views/panes.js"]?.body ?? "";
+    expect(panes).toContain("sandbox:");
+    // …and it is the ONLY module allowed to build an iframe at all: the
+    // sandbox is what makes the exception safe, so a frame appearing
+    // elsewhere would be one nobody had to think about.
+    const frames = jsEntries
+      .filter(([, entry]) => entry.body.includes('el("iframe"'))
+      .map(([key]) => key);
+    expect(frames).toEqual(["/assets/js/views/panes.js"]);
+    // The sandbox token list itself (never `allow-same-origin` alongside
+    // `allow-scripts`) is proven behaviourally in `m4-views.test.ts`, where
+    // `paneSandbox` is called with a payload that tries to widen it.
+  });
+
   test("every relative import resolves to another embedded asset (import-graph closure)", () => {
     const importRe = /import\s+[^"']*?["']([^"']+)["']/g;
     for (const [key, entry] of jsEntries) {

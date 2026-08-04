@@ -89,6 +89,17 @@ const HARNESS_USAGE_LINES: readonly string[] = [
   "  (CREWHAUS_REGISTRY_ROOT, default ~/.crewhaus). CREWHAUS_NO_REGISTRY=1",
   "  turns every write into a no-op. run/compile/eval/dev self-register the",
   "  harnesses they touch (origin: run-hook), so `harness list` fills itself.",
+  "",
+  // HM-202 — the signpost back to `fleet`. The two verbs are different
+  // ENTRY POINTS, not a migration: `harness` answers "what does this machine
+  // have registered, wherever it lives", `fleet` answers "what is under this
+  // directory right now". Both are kept indefinitely, so the help says so
+  // rather than leaving an operator to guess which one is the survivor.
+  "  `harness` is REGISTRY-centric: it lists what this machine has registered,",
+  "  wherever those directories live, and backs the Hangar console",
+  "  (`crewhaus hangar`). `crewhaus fleet` is the FILESYSTEM-centric twin — it",
+  "  walks a --root and needs no registration. Both are supported; neither",
+  "  replaces the other.",
 ];
 
 // ---------------------------------------------------------------------------

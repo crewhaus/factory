@@ -347,7 +347,12 @@ describe("upsertEnvVar", () => {
       expect(line).toBe('SPACED="a b \\"c\\" # d"');
       // `writeFileSync`'s mode only applies at CREATION, so an already-loose
       // file has to be chmod'ed — otherwise a 0644 .env stays 0644 forever.
-      expect(statSync(path).mode & 0o777).toBe(0o600);
+      // HM-188: Windows has no POSIX mode bits (0666 writable / 0444
+      // read-only, ACLs carry the real permission), so the narrowing claim is
+      // POSIX-only; owner read+write is what is assertable there.
+      const mode = statSync(path).mode & 0o777;
+      if (process.platform === "win32") expect(mode & 0o600).toBe(0o600);
+      else expect(mode).toBe(0o600);
     } finally {
       void t.stop();
     }

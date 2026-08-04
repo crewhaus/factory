@@ -231,6 +231,41 @@ The Library paints twice by design: instantly from the cache-only feed
 (figures labeled with their `cachedAt` as-of time), then again from a
 background `?hydrate=1` refetch with freshly computed rollups.
 
+## M4 — the polish layer
+
+| Module | What it owns |
+|---|---|
+| `assets/js/keys.js` | the app-level keyboard reducer: who owns ⌘K, Escape and `?` (HM-190) |
+| `assets/js/omnibox.js` | the ⌘K overlay — navigation rows are links, ACTION rows are proposals |
+| `assets/js/views/health.js` | the explained score, per harness and as the fleet board |
+| `assets/js/views/onboarding.js` | first boot: scan-root picker, demo mode, direct registration |
+| `assets/js/views/settings.js` | notification rules, read-only mode, the plugin inventory |
+| `assets/js/views/panes.js` | sandboxed plugin panes |
+
+**Keyboard ownership is a reducer, not a race.** M2 shipped the inbox half of
+HM-190 (`triageKey` in `supervision.js`: j/k, one-key verdicts, `.`, `?`).
+`keys.js` adds the layer above it and decides between them: a field owns its
+keys (including ⌘K), the open omnibox owns everything but Escape, and `?`
+goes to the app sheet only when no inbox is mounted — two sheets opening on
+one keypress is the bug that rule exists to prevent. The reducer claims
+nothing else, so the inbox keeps receiving j/k/g/d untouched.
+
+**The omnibox proposes; it never acts.** Enter on a navigation row goes
+somewhere. Enter on an ACTION row opens a confirm, showing the exact CLI
+command it will run, and only the four process verbs are executable at all —
+anything else the server proposes renders with a reason instead.
+
+**The score is never rendered alone.** Every deduction row is a link to the
+tab that fixes it; signals the server could not read are shown as unknowns
+rather than folded into the number.
+
+**Panes are the one deliberate exception to the markup-string ban.** A pane
+document is handed to an `<iframe>` via `srcdoc` with `sandbox="allow-scripts"`
+and no `allow-same-origin`, so it becomes a SANDBOXED document with an opaque
+origin — never part of this one. The asset-hygiene suite pins the exception
+to that single module, and `paneSandbox` strips `allow-same-origin` even if a
+payload asks for it.
+
 ## Testing
 
 `bun test src` — the embed-map completeness/hygiene suite plus unit tests

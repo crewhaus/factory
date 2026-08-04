@@ -1443,3 +1443,284 @@ tr.deflated td {
   align-items: baseline;
   flex-wrap: wrap;
 }
+
+/* ==========================================================================
+   M4 — health score, omnibox, bindings sheet, onboarding, settings, panes
+   ========================================================================== */
+
+/* ── the read-only / mode banner strip ─────────────────────────────────── */
+
+.banner-slot:empty {
+  display: none;
+}
+.banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--panel-2);
+  font-size: 13px;
+}
+.banner-warn {
+  border-left: 3px solid var(--warn);
+}
+.banner-link {
+  color: var(--accent);
+}
+
+/* ── health score (HM-11): the number never appears alone ──────────────── */
+
+.health-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.health-score {
+  font-family: var(--mono);
+  font-size: 30px;
+  font-weight: 600;
+  line-height: 1.1;
+}
+.health-good {
+  color: var(--ok);
+}
+.health-fair {
+  color: var(--warn);
+}
+.health-poor {
+  color: var(--bad);
+}
+.health-of {
+  font-size: 13px;
+}
+.health-row-head {
+  margin-bottom: 4px;
+}
+.health-name {
+  font-weight: 600;
+  color: var(--accent);
+}
+.ded-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ded-row {
+  display: grid;
+  grid-template-columns: 44px 1fr auto;
+  gap: 4px 10px;
+  align-items: baseline;
+  padding-top: 8px;
+  border-top: 1px solid var(--rule);
+}
+.ded-points {
+  color: var(--bad);
+  font-weight: 600;
+}
+.ded-label {
+  font-weight: 500;
+}
+.ded-detail {
+  grid-column: 2 / 4;
+  font-size: 12px;
+}
+.ded-fix {
+  color: var(--accent);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* ── ⌘K omnibox (HM-189) ───────────────────────────────────────────────── */
+
+.omni-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.omni-open kbd {
+  border: 1px solid var(--rule-2);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: 11px;
+  color: var(--ink-2);
+}
+.omni-backdrop,
+.sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 10vh 16px 16px;
+  overflow-y: auto;
+}
+.omni-panel {
+  width: min(760px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--rule-2);
+  border-radius: var(--radius);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+.omni-input {
+  width: 100%;
+  font: inherit;
+  font-size: 16px;
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+  padding: 14px 16px;
+}
+.omni-input:focus {
+  outline: none;
+  border-bottom-color: var(--accent);
+}
+.omni-list {
+  max-height: 52vh;
+  overflow-y: auto;
+}
+.omni-row {
+  display: grid;
+  grid-template-columns: 84px 1fr auto;
+  gap: 10px;
+  align-items: baseline;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--rule);
+  color: var(--ink);
+}
+.omni-row.selected {
+  background: var(--panel-2);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.omni-kind {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-2);
+  text-transform: lowercase;
+}
+.omni-title {
+  font-weight: 500;
+}
+.omni-sub {
+  font-size: 12px;
+  justify-self: end;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.omni-action {
+  border-left: 3px solid var(--warn);
+}
+.omni-twin {
+  grid-column: 2 / 3;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.omni-confirm {
+  display: flex;
+  gap: 6px;
+}
+.omni-hint {
+  padding: 8px 16px;
+  font-size: 12px;
+  border-top: 1px solid var(--rule);
+}
+
+/* ── the `?` bindings sheet (HM-190) ───────────────────────────────────── */
+
+.sheet {
+  width: min(520px, 100%);
+}
+.sheet-section {
+  margin: 12px 0 4px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-2);
+}
+.sheet kbd {
+  display: inline-block;
+  min-width: 92px;
+  color: var(--accent);
+}
+
+/* ── onboarding + settings forms ───────────────────────────────────────── */
+
+.suggest-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.field-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.num-input {
+  width: 84px;
+}
+.note {
+  font-size: 12px;
+}
+.rules-table td,
+.rules-table th {
+  vertical-align: middle;
+}
+.plugin-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--rule);
+}
+
+/* ── sandboxed plugin panes (HM-179) ───────────────────────────────────── */
+
+.pane-frame {
+  width: 100%;
+  min-height: 240px;
+  border: 1px solid var(--rule-2);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+}
+
+/* ── narrow screens: the overlays become full-bleed ────────────────────── */
+
+@media (max-width: 720px) {
+  .omni-backdrop,
+  .sheet-backdrop {
+    padding: 0;
+  }
+  .omni-panel,
+  .sheet {
+    width: 100%;
+    border-radius: 0;
+    min-height: 100%;
+  }
+  .omni-row {
+    grid-template-columns: 1fr;
+  }
+  .omni-sub {
+    justify-self: start;
+    max-width: 100%;
+  }
+  .ded-row {
+    grid-template-columns: 44px 1fr;
+  }
+  .ded-fix {
+    grid-column: 2 / 3;
+  }
+}

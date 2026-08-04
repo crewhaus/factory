@@ -14,17 +14,18 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type HangarServer, startHangarServer } from "@crewhaus/hangar-server";
+import { openHangarRegistry } from "@crewhaus/harness-registry";
+import type { JobRecord, SupervisedChild } from "@crewhaus/harness-supervisor";
 import {
   HANGAR_LOCK_FILENAME,
   type HangarLock,
-  type RunningJob,
   acquireHangarLock,
   defaultIsPidAlive,
+  heldSupervisors,
   readHangarLock,
   releaseHangarLock,
   resolveHangarRoot,
   runHangarCommand,
-  shutdownNotices,
   writeHangarLock,
 } from "./hangar-cmd";
 
@@ -366,9 +367,30 @@ describe("hangar serve --smoke", () => {
 // serve shutdown — the exit path, driven with a FAKE supervised child
 // ---------------------------------------------------------------------------
 
+/** A fake supervision handle: one live child and a recorded stop. */
+function fakeHandle(child: SupervisedChild | undefined, log: string[]) {
+  return {
+    supervisor: {
+      liveChild: () => child,
+      stop: async () => {
+        log.push(`stop ${child?.harnessDir}`);
+        return { stopped: true, forced: true };
+      },
+      close: () => {
+        log.push(`close ${child?.harnessDir}`);
+      },
+    },
+  };
+}
+
+type FakeProcesses = {
+  readonly handles: ReadonlyMap<string, ReturnType<typeof fakeHandle>>;
+  readonly runningJobs: readonly JobRecord[];
+};
+
 /** A `HangarServer` that binds nothing: enough surface for `serve` to boot,
- *  print its summary and shut down, with a controllable job queue. */
-function fakeServer(running: readonly RunningJob[], stops: string[]): HangarServer {
+ *  print its summary and shut down, with a fake process layer. */
+function fakeServer(processes: FakeProcesses, log: string[]): HangarServer {
   return {
     url: "http://127.0.0.1:4321",
     port: 4321,
@@ -381,13 +403,47 @@ function fakeServer(running: readonly RunningJob[], stops: string[]): HangarServ
     noAuth: false,
     idleTimeoutSeconds: 120,
     processes: {
-      jobs: { running: () => running },
+      peek: (dir: string) => processes.handles.get(dir),
+      jobs: {
+        running: () => processes.runningJobs,
+        terminateRunning: async () => {
+          log.push("terminateRunning");
+          return processes.runningJobs;
+        },
+      },
     } as unknown as HangarServer["processes"],
     ready: Promise.resolve({ adopted: 0, lost: 0, jobs: 0 }),
     stop: async () => {
-      stops.push("stop");
+      log.push("server.stop");
     },
   } as unknown as HangarServer;
+}
+
+/** A live child description, as `HarnessSupervisor.liveChild()` returns. */
+function liveChild(over: Partial<SupervisedChild> & { harnessDir: string }): SupervisedChild {
+  return {
+    target: "channel",
+    state: "running",
+    kind: "daemon",
+    runId: "run_0123456789abcdef",
+    pid: 4_242,
+    adopted: false,
+    detached: true,
+    reAdoptable: true,
+    ...over,
+  };
+}
+
+function runningJob(jobId: string, kind: string, harnessDir: string): JobRecord {
+  return {
+    jobId,
+    harnessDir,
+    kind,
+    argv: [kind],
+    mutating: true,
+    state: "running",
+    enqueuedAt: "2026-08-04T00:00:00.000Z",
+  };
 }
 
 /** Resolve once `serve` has installed its signal handlers. */
@@ -399,32 +455,64 @@ async function awaitSignalWait(baseline: number): Promise<void> {
   throw new Error("serve never installed its SIGTERM handler");
 }
 
-describe("hangar serve shutdown", () => {
-  test("shutdownNotices names the work being left behind, and says nothing when there is none", () => {
-    expect(shutdownNotices([])).toEqual([]);
-    const notices = shutdownNotices([
-      { jobId: "job_a", kind: "dev", harnessDir: "/h/one" },
-      { jobId: "job_b", kind: "compile", harnessDir: "/h/two" },
-    ]);
-    expect(notices.join("\n")).toContain("2 job(s) still running (compile, dev)");
-    expect(notices.join("\n")).toContain("interrupted");
+describe("heldSupervisors", () => {
+  test("enumerates only already-created handles, once each", () => {
+    const log: string[] = [];
+    const one = fakeHandle(liveChild({ harnessDir: "/h/one" }), log);
+    const peeked: string[] = [];
+    const held = heldSupervisors(["/h/one", "/h/one", "/h/two"], (dir) => {
+      peeked.push(dir);
+      return dir === "/h/one" ? one : undefined;
+    });
+    expect(held).toEqual([one.supervisor]);
+    // A registry row listed twice must not be shut down twice, and a
+    // harness that never had a child is never built here — enumerating for
+    // shutdown must not adopt a daemon as a side effect.
+    expect(peeked).toEqual(["/h/one", "/h/two"]);
   });
+});
 
-  test("SIGTERM with a live supervised child stops, releases the lock, and EXITS", async () => {
+describe("hangar serve shutdown", () => {
+  test("SIGTERM stops the orphanable child, leaves the daemon, releases the lock, and EXITS", async () => {
     const ws = newWorkspace();
+    const daemonDir = join(ws.root, "chat");
+    const cliDir = join(ws.root, "helper");
+    mkdirSync(daemonDir, { recursive: true });
+    mkdirSync(cliDir, { recursive: true });
+    // Register both so the shutdown enumeration has dirs to peek at.
+    const registry = openHangarRegistry({ env: ws.env });
+    registry.upsert({ dir: daemonDir, target: "channel" });
+    registry.upsert({ dir: cliDir, target: "cli" });
+
     const lines: string[] = [];
-    const stops: string[] = [];
+    const log: string[] = [];
     const exits: number[] = [];
     const baseline = process.listenerCount("SIGTERM");
     const baselineSigint = process.listenerCount("SIGINT");
-    const child: RunningJob = { jobId: "job_dev", kind: "dev", harnessDir: join(ws.root, "h") };
+    const handles = new Map([
+      [daemonDir, fakeHandle(liveChild({ harnessDir: daemonDir }), log)],
+      [
+        cliDir,
+        fakeHandle(
+          liveChild({
+            harnessDir: cliDir,
+            target: "cli",
+            kind: "interactive",
+            detached: false,
+            reAdoptable: false,
+          }),
+          log,
+        ),
+      ],
+    ]);
 
     const run = runHangarCommand(["serve", "--no-open"], {
       env: ws.env,
       pid: 4242,
       isPidAlive: () => false,
       write: (line) => lines.push(line),
-      startServer: () => fakeServer([child], stops),
+      startServer: () =>
+        fakeServer({ handles, runningJobs: [runningJob("job_dev", "dev", cliDir)] }, log),
       exit: (code) => exits.push(code),
     });
     await awaitSignalWait(baseline);
@@ -434,16 +522,57 @@ describe("hangar serve shutdown", () => {
     const out = await run;
 
     expect(out.exitCode).toBe(0);
-    expect(stops).toEqual(["stop"]);
+    // The attached run was STOPPED and the running job SIGNALLED, and both
+    // happened BEFORE the socket and the lock were given up: freeing the
+    // port while children are still held is how a second manager bound it
+    // while the first lived on.
+    expect(log).toEqual([
+      `stop ${cliDir}`,
+      "terminateRunning",
+      `close ${daemonDir}`,
+      `close ${cliDir}`,
+      "server.stop",
+    ]);
     // The lock is gone AND the process was told to exit — releasing the lock
     // without exiting is exactly the orphaned-manager failure (F-6).
     expect(existsSync(join(ws.hangarRoot, HANGAR_LOCK_FILENAME))).toBe(false);
     expect(exits).toEqual([0]);
-    expect(lines.join("\n")).toContain("hangar: shutting down…");
-    expect(lines.join("\n")).toContain("1 job(s) still running (dev)");
+    const text = lines.join("\n");
+    expect(text).toContain("hangar: shutting down…");
+    expect(text).toContain("stopped 1 supervised run(s)");
+    expect(text).toContain(`cli ${cliDir}`);
+    // …and the operator is told what survived and what happens to it next.
+    expect(text).toContain("left 1 daemon(s) running");
+    expect(text).toContain(`crewhaus daemon stop '${daemonDir}'`);
+    expect(text).toContain("signalled 1 running job(s) (dev)");
+    expect(text).toContain("`interrupted`");
     // Both signal handlers are gone: nothing of this run is left installed.
     expect(process.listenerCount("SIGTERM")).toBe(baseline);
     expect(process.listenerCount("SIGINT")).toBe(baselineSigint);
+  });
+
+  test("a manager holding nothing shuts down silently and still exits", async () => {
+    const ws = newWorkspace();
+    const lines: string[] = [];
+    const log: string[] = [];
+    const exits: number[] = [];
+    const baseline = process.listenerCount("SIGTERM");
+
+    const run = runHangarCommand(["serve", "--no-open"], {
+      env: ws.env,
+      pid: 4242,
+      isPidAlive: () => false,
+      write: (line) => lines.push(line),
+      startServer: () => fakeServer({ handles: new Map(), runningJobs: [] }, log),
+      exit: (code) => exits.push(code),
+    });
+    await awaitSignalWait(baseline);
+    process.emit("SIGTERM");
+    await run;
+
+    expect(log).toEqual(["terminateRunning", "server.stop"]);
+    expect(exits).toEqual([0]);
+    expect(lines.join("\n")).not.toContain("daemon(s) running");
   });
 });
 
