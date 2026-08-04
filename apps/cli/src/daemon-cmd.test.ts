@@ -1,0 +1,573 @@
+/**
+ * `crewhaus daemon` — the terminal head of the supervision state tree.
+ *
+ * Everything here runs against an injected `ProcessOps` and clock, so no
+ * daemon is ever spawned: the point of these tests is the WIRING (does the
+ * verb resolve the right harness, gate the right spawn, read the right
+ * scrubbed capture, speak the right control call), not the supervision
+ * machinery, which `@crewhaus/harness-supervisor` proves in its own suite.
+ *
+ * The load-bearing claim under test is the covenant: a daemon started here
+ * leaves exactly the harness-local state (`.crewhaus/run/`) the Hangar
+ * console adopts, and vice versa.
+ */
+import { describe, expect, test } from "bun:test";
+import {
+  appendFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Clock, ProcessOps, SpawnRequest, SpawnedProcess } from "@crewhaus/harness-supervisor";
+import { runDaemonCommand } from "./daemon-cmd";
+
+// --- seams -----------------------------------------------------------------
+
+type FakeChild = {
+  pid: number;
+  request: SpawnRequest;
+  signals: string[];
+  exit(code: number | null, signal?: string | null): void;
+  writeLog(text: string): void;
+};
+
+type FakeOps = ProcessOps & { children: FakeChild[]; last(): FakeChild | undefined };
+
+function fakeOps(now: () => number): FakeOps {
+  let nextPid = 9_001;
+  const children: FakeChild[] = [];
+  const live = new Map<number, { startTimeMs: number; commandLine: string }>();
+  const childFor = (pid: number): FakeChild | undefined => children.find((c) => c.pid === pid);
+  return {
+    platform: "posix",
+    children,
+    last: () => children[children.length - 1],
+    spawn: (request) => {
+      const pid = nextPid;
+      nextPid += 1;
+      let settle: (v: { code: number | null; signal: string | null }) => void = () => {};
+      const exited = new Promise<{ code: number | null; signal: string | null }>((r) => {
+        settle = r;
+      });
+      const logPath = request.stdio.mode === "file" ? request.stdio.path : undefined;
+      const child: FakeChild = {
+        pid,
+        request,
+        signals: [],
+        exit: (code, signal = null) => {
+          live.delete(pid);
+          settle({ code, signal });
+        },
+        writeLog: (text) => {
+          if (logPath !== undefined) appendFileSync(logPath, text);
+        },
+      };
+      children.push(child);
+      live.set(pid, { startTimeMs: now(), commandLine: request.argv.join(" ") });
+      return {
+        pid,
+        exited,
+        write: () => {},
+        closeStdin: () => {},
+        unref: () => {},
+      } as SpawnedProcess;
+    },
+    isAlive: (pid) => live.has(pid),
+    startTimeMs: (pid) => live.get(pid)?.startTimeMs,
+    commandLine: (pid) => live.get(pid)?.commandLine,
+    terminate: (pid) => {
+      childFor(pid)?.signals.push("SIGTERM");
+      childFor(pid)?.exit(null, "SIGTERM");
+    },
+    forceKill: (pid) => {
+      childFor(pid)?.signals.push("SIGKILL");
+      childFor(pid)?.exit(null, "SIGKILL");
+    },
+  };
+}
+
+type Fixture = {
+  readonly dir: string;
+  readonly ops: FakeOps;
+  readonly opts: {
+    env: Record<string, string | undefined>;
+    ops: ProcessOps;
+    cwd: string;
+  };
+  cleanup(): void;
+};
+
+/** A compiled channel harness whose spec parses — so a preflight refusal in
+ *  these tests is the channel-secret boot gate, not a spec lint. */
+function fixture(specLines?: readonly string[]): Fixture {
+  const root = mkdtempSync(join(tmpdir(), "daemon-cmd-"));
+  const dir = join(root, "harness");
+  mkdirSync(join(dir, "dist"), { recursive: true });
+  writeFileSync(join(dir, "dist", "daemon.ts"), "// compiled bundle\n");
+  const spec = specLines ?? [
+    "name: daemon-fixture",
+    "target: channel",
+    "agent:",
+    "  model: anthropic/claude-sonnet-4",
+    "  instructions: |",
+    "    You are a fixture.",
+    "routing:",
+    "  sessionKey: channel",
+  ];
+  writeFileSync(join(dir, "crewhaus.yaml"), `${spec.join("\n")}\n`);
+  // The REAL clock on purpose. An ADOPTED run is not ours to await — the
+  // supervisor never held its exit promise — so its exit is noticed by the
+  // log pump's liveness poll, which is a timer. A frozen clock would hang
+  // every `stop`/`drain`/`restart` here, and the thing under test is the
+  // wiring, not the backoff arithmetic (the supervisor's own suite owns
+  // that, with its own controllable clock).
+  const ops = fakeOps(() => Date.now());
+  return {
+    dir,
+    ops,
+    opts: {
+      // A temp registry root so nothing here touches the real ~/.crewhaus.
+      env: { CREWHAUS_REGISTRY_ROOT: join(root, "registry"), CREWHAUS_NO_REGISTRY: "1" },
+      ops,
+      cwd: dir,
+    },
+    cleanup: () => rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+/**
+ * What a control-serving daemon writes at bind: the announcement on stdout
+ * (the ONLY place a kernel-assigned port exists) plus the 0600 token file it
+ * mints at the same moment. Written directly rather than compiled, because
+ * the thing under test is the CLI's wiring, not the daemon emitter.
+ */
+function announceControl(f: Fixture, port: number): void {
+  f.ops
+    .last()
+    ?.writeLog(
+      `[control] crewhaus.control.v1 listening on http://127.0.0.1:${port} (token: .crewhaus/run/control-token)\n`,
+    );
+  // Built from parts: this repo's push protection rejects realistic secret
+  // literals, and a fixture never needs one.
+  const token = ["ctl", "fixture", "token"].join("-");
+  writeFileSync(join(f.dir, ".crewhaus", "run", "control-token"), `${token}\n`, { mode: 0o600 });
+}
+
+/** A `fetch` that records the URLs it was asked for and answers `body`. */
+function spyFetch(seen: string[], body: unknown, onCall?: () => void): typeof fetch {
+  return (async (input: string | URL | Request) => {
+    seen.push(String(input));
+    onCall?.();
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+}
+
+// --- tests -----------------------------------------------------------------
+
+describe("crewhaus daemon", () => {
+  test("--help lists every verb and says these drive the supervisor directly", async () => {
+    const out = await runDaemonCommand(["--help"]);
+    expect(out.exitCode).toBe(0);
+    const text = out.lines.join("\n");
+    for (const verb of ["start", "stop", "restart", "status", "logs", "wake", "drain"]) {
+      expect(text).toContain(`crewhaus daemon ${verb}`);
+    }
+    expect(text).toContain("with no Hangar console running");
+  });
+
+  test("an unknown verb throws a plain Error (the entry file routes it through die())", async () => {
+    await expect(runDaemonCommand(["frobnicate"])).rejects.toThrow(/unknown daemon verb/);
+  });
+
+  test("start spawns, writes the runfile the console adopts, and refuses a second start", async () => {
+    const f = fixture();
+    try {
+      const started = await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      expect(started.exitCode).toBe(0);
+      expect(started.lines[0]).toContain("started run_");
+      expect(f.ops.children.length).toBe(1);
+
+      // The harness-local state the OTHER head reads. This file is the whole
+      // "one state tree, two heads" covenant.
+      const runfile = JSON.parse(
+        readFileSync(join(f.dir, ".crewhaus", "run", "daemon.json"), "utf8"),
+      );
+      expect(runfile.pid).toBe(f.ops.last()?.pid);
+      expect(typeof runfile.argvFingerprint).toBe("string");
+
+      const again = await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      expect(again.exitCode).toBe(1);
+      expect(again.lines[0]).toContain("already running");
+      expect(f.ops.children.length).toBe(1);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("the control port is stamped in the ENV as 0 and the token never enters argv", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const request = f.ops.last()?.request;
+      expect(request?.env["CREWHAUS_CONTROL_PORT"]).toBe("0");
+      // Omitting the token is what makes the daemon MINT a fresh one each
+      // boot — a token left by a dead daemon must not authenticate against
+      // its replacement.
+      expect(request?.env["CREWHAUS_CONTROL_TOKEN"]).toBeUndefined();
+      expect(request?.argv.join(" ")).not.toContain("TOKEN");
+      // …and cwd is the harness ROOT, never the bundle dir.
+      expect(request?.cwd).toBe(f.dir);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a preflight refusal names the unforceable finding and --force cannot clear it", async () => {
+    const f = fixture([
+      "name: daemon-fixture",
+      "target: channel",
+      "agent:",
+      "  model: anthropic/claude-sonnet-4",
+      "  instructions: |",
+      "    You are a fixture.",
+      "routing:",
+      "  sessionKey: channel",
+      "channels:",
+      "  slack:",
+      "    botToken: $DAEMON_TEST_SLACK_BOT_TOKEN",
+      "    signingSecret: $DAEMON_TEST_SLACK_SIGNING_SECRET",
+    ]);
+    try {
+      const refused = await runDaemonCommand(["start"], f.opts);
+      expect(refused.exitCode).toBe(1);
+      const text = refused.lines.join("\n");
+      expect(text).toContain("preflight refused the spawn");
+      expect(text).toContain("cannot be overridden");
+      expect(f.ops.children.length).toBe(0);
+
+      const forced = await runDaemonCommand(["start", "--force"], f.opts);
+      expect(forced.exitCode).toBe(1);
+      expect(forced.lines.join("\n")).toContain("cannot be overridden");
+      // The refusal REPLACED the spawn — it did not precede one.
+      expect(f.ops.children.length).toBe(0);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("stop adopts a daemon this process did not spawn, then signals it", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const pid = f.ops.last()?.pid;
+
+      // A FRESH command invocation: no in-memory supervisor knows this pid,
+      // so `stop` has to adopt off the runfile first.
+      const stopped = await runDaemonCommand(["stop"], f.opts);
+      expect(stopped.exitCode).toBe(0);
+      expect(stopped.lines[0]).toContain("stopped");
+      expect(f.ops.children.find((c) => c.pid === pid)?.signals).toEqual(["SIGTERM"]);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("stop with no runfile is a no-op that says so, not an error", async () => {
+    const f = fixture();
+    try {
+      const out = await runDaemonCommand(["stop"], f.opts);
+      expect(out.exitCode).toBe(0);
+      expect(out.lines[0]).toContain("not running");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("status reports liveness, the control port, recent runs, and the CLI twin", async () => {
+    const f = fixture();
+    try {
+      const cold = await runDaemonCommand(["status"], f.opts);
+      expect(cold.lines[0]).toContain("not running (no runfile)");
+      expect(cold.lines.join("\n")).toContain("would run:");
+
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const hot = await runDaemonCommand(["status"], f.opts);
+      expect(hot.lines[0]).toContain("running · pid");
+      // No announcement has been pumped yet, so it must say so rather than
+      // imply wake/drain will work.
+      expect(hot.lines.join("\n")).toContain("control: none recorded");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("status --json is machine-readable and carries the same facts", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const out = await runDaemonCommand(["status", "--json"], f.opts);
+      const parsed = JSON.parse(out.lines.join("\n")) as Record<string, unknown>;
+      expect(parsed["running"]).toBe(true);
+      expect(parsed["runClass"]).toBe("daemon");
+      expect(parsed["target"]).toBe("channel");
+      expect(parsed["controlPort"]).toBe(null);
+      expect(Array.isArray(parsed["recentRuns"])).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("logs render the SCRUBBED capture — a credential value from .env never prints", async () => {
+    const f = fixture();
+    try {
+      // Built from parts: this repo's push protection rejects realistic
+      // secret literals, and a fixture never needs one.
+      const secret = ["sk", "test", "0123456789abcdefghij"].join("-");
+      writeFileSync(join(f.dir, ".env"), `MY_API_KEY=${secret}\n`, { mode: 0o600 });
+
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      f.ops.last()?.writeLog(`connecting with ${secret}\nready\n`);
+
+      const out = await runDaemonCommand(["logs", "--tail", "10"], f.opts);
+      const text = out.lines.join("\n");
+      expect(text).toContain("ready");
+      // The raw file still holds it — the scrubber is the read-side gate,
+      // and reading `logs/<runId>.log` directly is what this must never do.
+      expect(text).not.toContain(secret);
+      expect(text).toContain("«MY_API_KEY»");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("--tail N renders N lines, not the 8-line crash window", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const child = f.ops.last();
+      for (let i = 1; i <= 30; i++) child?.writeLog(`line-${i}\n`);
+
+      const out = await runDaemonCommand(["logs", "--tail", "20"], f.opts);
+      // The header, then exactly the 20 lines that were asked for. The byte
+      // budget bounds the READ; it must not silently clip the result to the
+      // forensics tail.
+      expect(out.lines.slice(1)).toHaveLength(20);
+      expect(out.lines.at(1)).toBe("line-11");
+      expect(out.lines.at(-1)).toBe("line-30");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("--follow keeps emitting past the tail window instead of going silent", async () => {
+    const f = fixture();
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const child = f.ops.last();
+      for (let i = 1; i <= 12; i++) child?.writeLog(`line-${i}\n`);
+
+      // More lines arrive AFTER the opening window, which is exactly the
+      // case an index into a sliding N-line window cannot see: `emitted`
+      // saturates at N and every later poll slices an empty list.
+      timers.push(
+        setTimeout(() => {
+          for (let i = 13; i <= 20; i++) child?.writeLog(`line-${i}\n`);
+        }, 20),
+      );
+      // The follow loop ends when the daemon does — the only clean exit a
+      // blocking verb has in a test.
+      timers.push(setTimeout(() => child?.exit(0), 150));
+
+      const seen: string[] = [];
+      await runDaemonCommand(["logs", "--follow", "--tail", "5"], {
+        ...f.opts,
+        followPollMs: 5,
+        write: (line) => seen.push(line),
+      });
+      const expected: string[] = [];
+      for (let i = 8; i <= 20; i++) expected.push(`line-${i}`);
+      expect(seen.filter((l) => l.startsWith("line-"))).toEqual(expected);
+    } finally {
+      for (const t of timers) clearTimeout(t);
+      f.cleanup();
+    }
+  });
+
+  test("logs with no runs says so instead of failing", async () => {
+    const f = fixture();
+    try {
+      const out = await runDaemonCommand(["logs"], f.opts);
+      expect(out.exitCode).toBe(0);
+      expect(out.lines[0]).toContain("no runs recorded yet");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("wake without a control port degrades to a FACT, not a failure", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const out = await runDaemonCommand(["wake", "--lane", "heartbeat"], f.opts);
+      // Exit 0: a bundle with no control plane is not an operator error.
+      expect(out.exitCode).toBe(0);
+      expect(out.lines[0]).toContain("no_control_port");
+      // …and it names WHICH cause it is. This fixture's bundle carries no
+      // provenance stamp, so "recompile" is the true remedy; telling an
+      // operator that about a current bundle would send them nowhere.
+      expect(out.lines[0]).toContain("predates crewhaus.control.v1");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a current bundle that has not announced yet is told to wait, not to recompile", async () => {
+    const f = fixture();
+    try {
+      // The provenance stamp `compile` writes. A bundle from this release
+      // DOES bind a control port, so the honest answer is "not yet" —
+      // "recompile" would send an operator down a road that changes nothing.
+      writeFileSync(
+        join(f.dir, "dist", "package.json"),
+        JSON.stringify({
+          name: "crewhaus-compiled-bundle",
+          crewhaus: { specHash: "sha256:deadbeef", compiledWith: "0.5.0" },
+        }),
+      );
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const out = await runDaemonCommand(["wake", "--lane", "heartbeat"], f.opts);
+      expect(out.exitCode).toBe(0);
+      expect(out.lines[0]).toContain("no control port recorded yet");
+      expect(out.lines[0]).not.toContain("recompile");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("wake pumps the daemon's own announcement out of the log and dials it", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      // What a control-serving daemon prints at bind. It is the ONLY place
+      // the kernel-assigned port exists, and `daemon start` exits long
+      // before it lands — so a head that never pumps the log can never
+      // reach control.v1 for a daemon it started itself.
+      announceControl(f, 41_234);
+
+      const seen: string[] = [];
+      const out = await runDaemonCommand(["wake", "--lane", "heartbeat"], {
+        ...f.opts,
+        fetch: spyFetch(seen, { ok: true, sessionId: "sess_abc" }),
+      });
+      expect(out.exitCode).toBe(0);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toContain(":41234/");
+      expect(out.lines[0]).toContain("heartbeat tick accepted");
+
+      // The port is now in the harness-local state tree, so the OTHER head
+      // (and the next invocation) finds it with no pump at all.
+      const runfile = JSON.parse(
+        readFileSync(join(f.dir, ".crewhaus", "run", "daemon.json"), "utf8"),
+      );
+      expect(runfile.controlPort).toBe(41_234);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("status reports the announced port once the log has been pumped", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      announceControl(f, 41_235);
+      const out = await runDaemonCommand(["status"], f.opts);
+      expect(out.lines.join("\n")).toContain("crewhaus.control.v1 on 127.0.0.1:41235");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("drain reaches control.v1 rather than degrading to SIGTERM", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const child = f.ops.last();
+      announceControl(f, 41_236);
+
+      const seen: string[] = [];
+      const out = await runDaemonCommand(["drain"], {
+        ...f.opts,
+        // A drained daemon finishes its in-flight work and exits on its own
+        // — which is the whole point of preferring this path to a signal.
+        fetch: spyFetch(seen, { ok: true }, () => child?.exit(0)),
+      });
+      expect(out.exitCode).toBe(0);
+      expect(out.lines[0]).toContain("drained");
+      expect(out.lines.join("\n")).not.toContain("SIGTERM");
+      expect(seen[0]).toContain(":41236/");
+      expect(child?.signals).toEqual([]);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("wake rejects a lane control.v1 does not define", async () => {
+    const f = fixture();
+    try {
+      await expect(runDaemonCommand(["wake", "--lane", "janitor"], f.opts)).rejects.toThrow(
+        /--lane must be heartbeat or schedule/,
+      );
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("drain with no control plane falls back to the signal path and says which it was", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const out = await runDaemonCommand(["drain"], f.opts);
+      expect(out.exitCode).toBe(0);
+      const text = out.lines.join("\n");
+      expect(text).toContain("stopped (SIGTERM)");
+      expect(text).toContain("control.v1 unavailable");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a directory with no crewhaus.yaml is refused with a directing message", async () => {
+    const root = mkdtempSync(join(tmpdir(), "daemon-nohar-"));
+    try {
+      await expect(runDaemonCommand(["status"], { cwd: root })).rejects.toThrow(/is not a harness/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("restart rebuilds the plan, so a recompile between the two is picked up", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const firstArgv = f.ops.last()?.request.argv.join(" ");
+
+      // Recompile to a different entry: `plan` is a closure, not a value.
+      writeFileSync(join(f.dir, "dist", "daemon.ts"), "// recompiled\n");
+      const out = await runDaemonCommand(["restart", "--no-preflight"], f.opts);
+      expect(out.exitCode).toBe(0);
+      expect(f.ops.children.length).toBe(2);
+      expect(f.ops.last()?.request.argv.join(" ")).toBe(firstArgv as string);
+      expect(out.lines[0]).toContain("restarted run_");
+    } finally {
+      f.cleanup();
+    }
+  });
+});

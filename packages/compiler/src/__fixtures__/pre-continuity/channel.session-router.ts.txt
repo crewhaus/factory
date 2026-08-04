@@ -12,6 +12,7 @@ export type SessionRouterConfig = {
   agent: Agent;
   sessionRootDir?: string;
   approvals?: ApprovalStore;
+  onTurnComplete?: () => void;
 };
 
 export type SessionRouter = {
@@ -69,6 +70,7 @@ export function createSessionRouter(config: SessionRouterConfig): SessionRouter 
           await adapter.sendReply({ event, text: reply });
         }
         await tryReact("white_check_mark");
+        config.onTurnComplete?.();
       } catch (err) {
         if (
           config.approvals !== undefined &&
@@ -122,6 +124,7 @@ export function createSessionRouter(config: SessionRouterConfig): SessionRouter 
             // non-fatal
           }
         }
+        config.onTurnComplete?.();
       } catch (err) {
         process.stderr.write(
           "[session-router] approval resume error (" + approval.id + "): " + (err as Error).message + "\n",

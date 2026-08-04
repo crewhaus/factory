@@ -125,6 +125,53 @@ too — the `managed.daemon.ts` pin was regenerated accordingly. The continuity
 opt-out contract is unchanged (no `wireMemory`/continuity wiring appears), and
 every other pin — including `managed.agent.ts` — is untouched.
 
+**`crewhaus.control.v1` delta — every daemon-shape pin.** The five
+daemon-emitting shapes (channel, managed, batch, crew, voice) now serve the
+`crewhaus.control.v1` control plane: a dedicated, loopback-bound port carrying
+`/control/v1/healthz|status|wake|drain`, plus a bare unauthenticated
+`GET /healthz` on the public port for PaaS health checks. It is rendered from
+ONE shared `@crewhaus/gateway-protocol` module, so the five shapes cannot
+drift. Three consequences show up in these pins:
+
+- each daemon gains the plane construction, its drain steps, and `await
+  __control.start()` (which binds NOTHING unless `CREWHAUS_CONTROL_PORT` is
+  set, so an un-supervised daemon opens no new socket);
+- a `heartbeat:`/`schedule:` tick body moves inside a control LANE, so the
+  timer fire and an operator's `POST /control/v1/wake` run the identical
+  function and can never overlap each other;
+- `channel.session-router.ts` emits `onTurnComplete` unconditionally. It used
+  to be gated on `gateway:`; `/control/v1/status` reports `counters.turns` on
+  EVERY daemon shape, and a counter that only exists when an optional spec
+  block is present would make the control surface lie about a gateway-less bot.
+
+The whole surface rides the always-emitted daemon wiring, NOT
+memory/continuity, so it appears on a memory-free `continuity: false` bundle
+too — `channel.daemon.ts`, `channel.session-router.ts`, `managed.daemon.ts`,
+`crew.daemon.ts`, `voice.daemon.ts` and `batch.agent.ts` were regenerated to
+their prior bytes **plus** that seam. The continuity opt-out contract is
+unchanged (no `wireMemory`/continuity wiring appears), and every other pin —
+including `cli`, `browser`, `research` and the `*.agent.ts` pins of the daemon
+shapes — is untouched.
+
+**Drain-sweep delta — `channel.daemon.ts` + `managed.daemon.ts` only.** The
+janitor sweep moved OUT of the drain's critical path. It used to run inside the
+drain step before the listeners closed, which spent a supervisor's whole drain
+deadline on housekeeping the next boot repeats — and on a spec with `dream:` or
+`feedback:` that housekeeping fans out to model calls — while the in-flight turn
+the drain existed to finish was still waiting for its chance, and got SIGTERM'd
+at the deadline anyway. The step now closes every listener first and runs the
+sweep last through `runDrainSweep`, which time-boxes it (`CREWHAUS_DRAIN_SWEEP_MS`)
+and reports rather than throws. So `await __janitor.runOnce();` /
+`await janitor.runOnce();` become a trailing `runDrainSweep(...)` call, and the
+control-runtime import gains `runDrainSweep`. It rides the always-emitted drain
+step, NOT memory/continuity, so it appears on a memory-free `continuity: false`
+bundle too; those two pins were regenerated to their prior bytes **plus** that
+change. The continuity opt-out contract is unchanged (no `wireMemory`/continuity
+wiring appears), and every other pin is untouched — the fixture specs declare no
+`heartbeat:`/`schedule:`, so the same release's lane changes (`ownsSession:
+false` on the managed/batch wake lanes, `sanitizeControlText` on the emitted turn
+previews) do not reach any pin.
+
 ## Regenerating
 
 Only regenerate when a LATER release deliberately changes emitted bundles;

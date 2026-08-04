@@ -11,8 +11,9 @@
  */
 
 import { api } from "../api.js";
-import { clear, collapsible, dot, el, emptyState, jsonPre, skeleton } from "../dom.js";
+import { clear, collapsible, dot, el, emptyState, jsonPre, skeleton, toast } from "../dom.js";
 import { hrefHarness } from "../router.js";
+import { NO_TWIN_NOTES } from "../supervision.js";
 import {
   clampText,
   fmtRelativeTime,
@@ -21,6 +22,7 @@ import {
   ttlCountdown,
   usdFromMicros,
 } from "../util.js";
+import { cliTwin } from "./control.js";
 
 export async function renderSessions(root, ctx) {
   if (ctx.route.sessionId !== undefined) {
@@ -36,6 +38,10 @@ export async function renderSessions(root, ctx) {
     return;
   }
   const nowMs = Date.now();
+  // Pinned transcripts are the ONE thing that stops both retention enforcers
+  // from deleting them, so the pin is a real write with a visible effect.
+  const pins = new Set(data && Array.isArray(data.pins) ? data.pins.map(String) : []);
+  const reload = () => renderSessions(root, ctx);
   const tbody = el("tbody");
   for (const s of list) {
     const id = String(s.id ?? s.sessionId ?? "");
@@ -46,6 +52,7 @@ export async function renderSessions(root, ctx) {
     tbody.appendChild(
       el("tr", { class: evicted ? "evicted" : null }, [
         el("td", null, [
+          pinToggle(ctx.id, id, pins.has(id), reload),
           el("a", {
             class: "mono name-link",
             href: hrefHarness(ctx.id, "sessions", id),
@@ -81,6 +88,36 @@ export async function renderSessions(root, ctx) {
       ]),
     ]),
   );
+  // The pin has no CLI verb yet; say what it writes rather than invent one.
+  root.appendChild(cliTwin(null, NO_TWIN_NOTES["pin-session"]));
+}
+
+/**
+ * The retention pin. A pinned transcript survives both enforcers (the
+ * `retention sweep` verb and the daemon shapes' boot janitor), so this is
+ * the highest-consequence small write in the console — it is a toggle with
+ * an immediate, re-readable effect, never a silent one.
+ */
+function pinToggle(harnessId, sessionId, pinned, reload) {
+  const btn = el("button", {
+    class: `pin${pinned ? " pinned" : ""}`,
+    type: "button",
+    title: pinned ? "Unpin (retention may delete it again)" : "Pin — retention will not delete it",
+    "aria-label": pinned ? `unpin ${sessionId}` : `pin ${sessionId}`,
+    text: pinned ? "★" : "☆",
+  });
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    try {
+      await api.pinSession(harnessId, sessionId, !pinned);
+    } catch (err) {
+      btn.disabled = false;
+      toast(`Pin failed: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    reload();
+  });
+  return btn;
 }
 
 async function renderTranscript(root, ctx, sessionId) {

@@ -6,9 +6,10 @@
  */
 
 import { api } from "../api.js";
-import { clear, dot, el, emptyState, jsonPre, skeleton } from "../dom.js";
+import { clear, dot, el, emptyState, jsonPre, skeleton, toast } from "../dom.js";
 import { hrefHarness } from "../router.js";
 import { fmtPct, fmtRelativeTime, fmtUsd } from "../util.js";
+import { actionTwin } from "./control.js";
 
 export async function renderEvals(root, ctx) {
   if (ctx.route.runId !== undefined && ctx.route.sampleId !== undefined) {
@@ -46,6 +47,7 @@ async function renderHistory(root, ctx) {
       .filter((id) => typeof id === "string"),
   );
   const nowMs = Date.now();
+  const reload = () => renderHistory(root, ctx);
   const tbody = el("tbody");
   for (const run of runs) {
     const runId = String(run.runId ?? run.id ?? "");
@@ -76,6 +78,9 @@ async function renderHistory(root, ctx) {
           partial ? el("span", { class: "chip chip-warn", text: "partial" }) : null,
           run.replayed === true ? el("span", { class: "chip", text: "replayed" }) : null,
         ]),
+        el("td", { class: "cell-edit" }, [
+          baselineBtn(ctx.id, runId, baselineRunIds.has(runId), ctx.dir ?? "", reload),
+        ]),
       ]),
     );
   }
@@ -88,8 +93,8 @@ async function renderHistory(root, ctx) {
           el(
             "tr",
             null,
-            ["When", "Run", "Dataset", "Pass rate", "Mean score", "Cost", "Flags"].map((h) =>
-              el("th", { text: h }),
+            ["When", "Run", "Dataset", "Pass rate", "Mean score", "Cost", "Flags", "Baseline"].map(
+              (h) => el("th", { text: h }),
             ),
           ),
         ),
@@ -97,6 +102,35 @@ async function renderHistory(root, ctx) {
       ]),
     ]),
   );
+}
+
+/**
+ * Re-pin the eval baseline to this run. The baseline key is
+ * `(specName, datasetName)` BY DESIGN — that is what keeps a spec edit gated
+ * against the same measurement — so the server copies both off the run's own
+ * index entry and this button only names the run.
+ */
+function baselineBtn(harnessId, runId, isBaseline, dir, reload) {
+  if (isBaseline) return el("span", { class: "chip chip-group", text: "baseline" });
+  const btn = el("button", {
+    class: "btn btn-ghost",
+    type: "button",
+    text: "Pin baseline",
+    title: "make this run the gate every future run is compared against",
+  });
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    try {
+      await api.pinBaseline(harnessId, runId);
+    } catch (err) {
+      btn.disabled = false;
+      toast(`Re-pin failed: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    toast("Baseline re-pinned", "info");
+    reload();
+  });
+  return el("div", { class: "job-action" }, [btn, actionTwin("baseline", { dir, runId })]);
 }
 
 async function renderRun(root, ctx, runId) {

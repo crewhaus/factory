@@ -14,6 +14,7 @@
  */
 
 import { ROUTES, buildPath } from "./routes.js";
+import { createSseParser } from "./supervision.js";
 
 const TOKEN_KEY = "hangar.token";
 
@@ -53,10 +54,17 @@ export class ApiError extends Error {
   }
 }
 
-async function request(method, path, body) {
-  const headers = { accept: "application/json" };
+function authHeaders(accept) {
+  const headers = { accept };
   const token = getToken();
   if (token) headers.authorization = `Bearer ${token}`;
+  return headers;
+}
+
+/** One request, reported as `{ status, body }` — no throwing on a non-2xx.
+ *  401 still fires the unauthorized handler (the token screen owns the view). */
+async function rawRequest(method, path, body) {
+  const headers = authHeaders("application/json");
   const init = { method, headers };
   if (body !== undefined) {
     headers["content-type"] = "application/json";
@@ -72,18 +80,25 @@ async function request(method, path, body) {
     if (unauthorizedHandler) unauthorizedHandler();
     throw new ApiError(401, "unauthorized");
   }
-  if (res.status === 404) return null;
-  if (res.status === 204) return null;
-  if (!res.ok) {
-    let detail = "";
-    try {
-      detail = await res.text();
-    } catch {
-      // body unreadable — the status alone is the message
-    }
-    throw new ApiError(res.status, detail !== "" ? detail : `HTTP ${res.status}`);
+  if (res.status === 404 || res.status === 204) return { status: res.status, body: null };
+  let parsed = null;
+  let text = "";
+  try {
+    text = await res.text();
+    parsed = text === "" ? null : JSON.parse(text);
+  } catch {
+    parsed = null; // an unparseable body leaves `text` as the message
   }
-  return res.json();
+  return { status: res.status, body: parsed, text };
+}
+
+async function request(method, path, body) {
+  const { status, body: parsed, text } = await rawRequest(method, path, body);
+  if (status === 404 || status === 204) return null;
+  if (status < 200 || status >= 300) {
+    throw new ApiError(status, text !== undefined && text !== "" ? text : `HTTP ${status}`);
+  }
+  return parsed;
 }
 
 /** Issue one request from a `ROUTES` entry (+ params + optional body/query). */
@@ -92,10 +107,103 @@ function call(route, params, body, query = "") {
 }
 
 /**
- * Every server route the M1 console talks to — thin named wrappers over the
- * `ROUTES` contract map. Reads everywhere; the ONLY writes are registry
- * CRUD (add/scan/group-create/groups/tags/pin/notes/relocate/remove +
- * scan-root create) — manager-state writes, never harness state.
+ * Issue one request whose REFUSAL is a payload, not an error: `POST
+ * /proc/{start,restart}` answers 409 with the typed preflight refusal the
+ * console renders as a modal, and `POST /proc/{stop,drain}` answers 409
+ * `not-adopted` when a daemon is running that this manager never adopted.
+ * Swallowing either into an ApiError would throw away the very thing the
+ * screen exists to show. Returns `{ ok, status, body }`.
+ */
+async function callTyped(route, params, body) {
+  const {
+    status,
+    body: parsed,
+    text,
+  } = await rawRequest(route.method, buildPath(route.path, params), body);
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    body: parsed ?? (text !== undefined && text !== "" ? { message: text } : {}),
+  };
+}
+
+/** Body for a start/restart: `{}` unless the operator waved findings through. */
+function startBody(opts) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  const acknowledge = Array.isArray(o.acknowledge) ? o.acknowledge.map(String) : null;
+  return {
+    ...(o.force === true ? { force: true } : {}),
+    ...(acknowledge !== null && acknowledge.length > 0 ? { acknowledge } : {}),
+  };
+}
+
+/**
+ * Open the run's SSE feed. Hand-rolled over `fetch` rather than
+ * `EventSource`, which cannot carry the bearer header (its only credential
+ * channel is cookies, and this app has none by design).
+ *
+ * The frame grammar is the server's: `replay` first, then live
+ * `state`/`output`/`exit`, and ALWAYS `done` last — so a closed run replays
+ * and terminates with no live-vs-dead branch here. A dropped connection
+ * emits a synthetic `{ event: "closed" }` so the view can tell the two apart.
+ */
+export function streamRunEvents(id, runId, onFrame) {
+  const controller = new AbortController();
+  const path = buildPath(ROUTES.runEvents.path, { id, runId });
+  const emit = (event, data) => {
+    if (!controller.signal.aborted) onFrame({ event, data });
+  };
+  (async () => {
+    let res;
+    try {
+      res = await fetch(path, {
+        headers: authHeaders("text/event-stream"),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (!controller.signal.aborted) {
+        emit("error", { message: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+    if (res.status === 401) {
+      if (unauthorizedHandler) unauthorizedHandler();
+      return;
+    }
+    if (!res.ok || res.body === null || res.body === undefined) {
+      emit("error", { message: res.status === 404 ? "no such run" : `HTTP ${res.status}` });
+      return;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    const parser = createSseParser();
+    for (;;) {
+      let chunk;
+      try {
+        chunk = await reader.read();
+      } catch {
+        break; // aborted or dropped — the synthetic `closed` frame says so
+      }
+      if (chunk.done) break;
+      for (const frame of parser.push(decoder.decode(chunk.value, { stream: true }))) {
+        emit(frame.event, frame.data);
+      }
+    }
+    emit("closed", null);
+  })();
+  return {
+    close: () => {
+      controller.abort();
+    },
+  };
+}
+
+/**
+ * Every server route the console talks to — thin named wrappers over the
+ * `ROUTES` contract map. M1's writes were registry CRUD only (manager
+ * state); M2 adds the driving verbs: process control, the control.v1 proxy,
+ * the two inboxes' decisions, the job queue, and the two action faces
+ * (session pin, eval baseline).
  */
 export const api = {
   // fleet feed + registry CRUD
@@ -125,6 +233,66 @@ export const api = {
   memory: (id, area) => call(ROUTES.memory, { id, area }),
   wikiArticle: (id, slug) => call(ROUTES.wikiArticle, { id, slug }),
   costs: (id) => call(ROUTES.costs, { id }),
+
+  // ---- M2: the process layer ------------------------------------------
+  proc: (id) => call(ROUTES.proc, { id }),
+  // start/restart answer 409 with a typed refusal — surfaced, not thrown.
+  procStart: (id, opts) => callTyped(ROUTES.procStart, { id }, startBody(opts)),
+  procRestart: (id, opts) => callTyped(ROUTES.procRestart, { id }, startBody(opts)),
+  // …and so do stop/drain: a 409 `not-adopted` says a daemon IS running
+  // that this manager never adopted, so nothing was signalled. Thrown away
+  // as an ApiError it reads as a transport fault; kept as a body the console
+  // can say what actually happened.
+  procStop: (id) => callTyped(ROUTES.procStop, { id }, {}),
+  procDrain: (id) => callTyped(ROUTES.procDrain, { id }, {}),
+
+  // run history + one run's detail (the live feed is `streamRunEvents`)
+  runs: (id) => call(ROUTES.runs, { id }),
+  run: (id, runId) => call(ROUTES.run, { id, runId }),
+
+  // ---- M2: crewhaus.control.v1 (always a 200 envelope) ------------------
+  controlStatus: (id) => call(ROUTES.controlStatus, { id }),
+  controlWake: (id, lane, reason) =>
+    call(
+      ROUTES.controlWake,
+      { id },
+      typeof reason === "string" && reason !== "" ? { lane, reason } : { lane },
+    ),
+  controlDrain: (id) => call(ROUTES.controlDrain, { id }, {}),
+  schedulers: (id) => call(ROUTES.schedulers, { id }),
+
+  // ---- M2: fleet inboxes ------------------------------------------------
+  approvals: (all = false) => call(ROUTES.approvals, {}, undefined, all ? "?all=1" : ""),
+  grantApproval: (id, apprId, by) =>
+    call(ROUTES.grantApproval, { id, apprId }, typeof by === "string" && by !== "" ? { by } : {}),
+  denyApproval: (id, apprId, by) =>
+    call(ROUTES.denyApproval, { id, apprId }, typeof by === "string" && by !== "" ? { by } : {}),
+  review: (all = false) => call(ROUTES.review, {}, undefined, all ? "?all=1" : ""),
+  adjudicateReview: (id, itemId, verdict, note) =>
+    call(
+      ROUTES.adjudicateReview,
+      { id, itemId },
+      typeof note === "string" && note !== "" ? { verdict, note } : { verdict },
+    ),
+  activity: (since) =>
+    call(
+      ROUTES.activity,
+      {},
+      undefined,
+      typeof since === "string" && since !== "" ? `?since=${encodeURIComponent(since)}` : "",
+    ),
+
+  // ---- M2: jobs + the remaining action faces ----------------------------
+  jobs: () => call(ROUTES.jobs, {}),
+  submitJob: (id, kind, options) =>
+    call(
+      ROUTES.submitJob,
+      { id },
+      { kind, ...(options && typeof options === "object" ? options : {}) },
+    ),
+  deployments: (id) => call(ROUTES.deployments, { id }),
+  pinSession: (id, sess, pinned) => call(ROUTES.pinSession, { id, sess }, { pinned }),
+  pinBaseline: (id, runId) => call(ROUTES.pinBaseline, { id }, { runId }),
 
   // cross-cutting
   version: () => call(ROUTES.version, {}),

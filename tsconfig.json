@@ -217,6 +217,7 @@
     { "path": "./packages/watchme-store" },
     { "path": "./packages/harness-registry" },
     { "path": "./packages/preflight" },
+    { "path": "./packages/harness-supervisor" },
     { "path": "./packages/hangar-ui" },
     { "path": "./packages/hangar-server" },
     { "path": "./apps/cli" }

@@ -204,6 +204,11 @@ export function normalizeRows(feed) {
             ? usdFromMicros(rollup.spend7d)
             : null,
       lastEval,
+      // M2 fleet-feed additions: the supervision state (a cheap runfile
+      // read, null when the dir is missing) and the parked-approval count —
+      // neither opens a transcript, so the feed stays a fold.
+      supervision: typeof src.supervision === "string" ? src.supervision : null,
+      pendingApprovals: typeof src.pendingApprovals === "number" ? src.pendingApprovals : 0,
       capabilities: caps,
       budgeted: typeof src.budgeted === "boolean" ? src.budgeted : caps.includes("budget"),
       cachedAt:

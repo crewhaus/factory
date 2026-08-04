@@ -331,9 +331,12 @@ describe("emitChannelBot — daemon.ts wiring", () => {
     // Boot-time runOnce, env kill-switch, and configurable hourly interval.
     expect(c).toContain('process.env["CREWHAUS_JANITOR"] !== "0"');
     expect(c).toContain("await __janitor.runOnce()");
+    // control.v1 hoisted the interval into a named const so the janitor's
+    // cadence can be reported on /control/v1/status.
     expect(c).toContain(
-      '__janitor.start(Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000))',
+      'const __janitorIntervalMs = Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000);',
     );
+    expect(c).toContain("__janitor.start(__janitorIntervalMs);");
     // The janitor boots ahead of the webhook listener.
     expect(c.indexOf("createJanitor({")).toBeLessThan(c.indexOf("Bun.serve({"));
     // Shutdown halts the interval.
@@ -1261,8 +1264,11 @@ describe("emitChannelBot — gateway status counters (turnCount / heartbeatCount
     const router = files.get("session-router.ts") ?? "";
     expect(daemon).not.toContain("__turnCount");
     expect(daemon).not.toContain("__heartbeatCount");
-    expect(daemon).not.toContain("onTurnComplete");
-    expect(router).not.toContain("onTurnComplete");
+    // control.v1's own turn counter is NOT gateway-gated — it is the lowest
+    // common denominator every daemon shape reports — so onTurnComplete is
+    // always wired; only the gateway's `__turnCount` is conditional.
+    expect(daemon).toContain("onTurnComplete: () => { __control.counters.turns++; }");
+    expect(router).toContain("onTurnComplete");
   });
 
   test("gateway → __turnCount is declared, wired into createSessionRouter, and read by /status", () => {
@@ -1270,7 +1276,9 @@ describe("emitChannelBot — gateway status counters (turnCount / heartbeatCount
     expect(daemon).toContain("let __turnCount = 0;");
     expect(daemon).toContain("let __heartbeatCount = 0;");
     // The router bumps __turnCount via the onTurnComplete callback.
-    expect(daemon).toContain("onTurnComplete: () => { __turnCount++; }");
+    expect(daemon).toContain(
+      "onTurnComplete: () => { __turnCount++; __control.counters.turns++; }",
+    );
     // /status reports both counters.
     expect(daemon).toContain("turnCount: __turnCount,");
     expect(daemon).toContain("heartbeatCount: __heartbeatCount,");
@@ -1348,7 +1356,10 @@ describe("emitChannelBot — heartbeat (Phase 3 §3.1)", () => {
     expect(c).toContain('"Wake and decide what\'s useful."');
     expect(c).toContain("[heartbeat] tick");
     expect(c).toContain("clearInterval(__heartbeatTimer)");
-    expect(c).toContain("import { randomBytes as __hbRandomBytes }");
+    // The session id is minted by the control lane now (one mint for the
+    // timer fire AND the operator wake), so the daemon needs no randomBytes.
+    expect(c).not.toContain("__hbRandomBytes");
+    expect(c).toContain("__heartbeatLane.tick()");
     // The heartbeat fires the agent via the same runTurn surface as
     // inbound messages, so each tick gets a fresh session id.
     expect(c).toContain("agent.runTurn({");
@@ -2016,7 +2027,7 @@ describe("emitChannelBot — G11 pending-approval channel surface (ask_mode paus
     // The loop gets the runtime face…
     expect(daemon).toContain("runtimeApprovals: __runtimeApprovals,");
     // …the router and gateway get the channel face.
-    expect(daemon).toContain("createSessionRouter({ agent, approvals: __approvals })");
+    expect(daemon).toContain("createSessionRouter({ agent, approvals: __approvals,");
     expect(daemon).toContain("approvals: __approvals,");
     expect(daemon).toContain("auditSink: __securityAudit,");
     // The in-memory store is gone: nothing ever wrote to it, and it was
@@ -2126,10 +2137,15 @@ describe("emitChannelBot — schedule: wake loop (Batch F, temporal contract)", 
 
   test("cron schedule arms armSchedule with the WakeSchedule literal (no instructions)", () => {
     const daemon = fileMap(withCron()).get("daemon.ts") ?? "";
-    expect(daemon).toContain('import { armSchedule } from "@crewhaus/durable-execution";');
     expect(daemon).toContain(
-      'armSchedule({"kind":"cron","cron":"0 */6 * * *","timezone":"America/New_York","jitterMs":30000}',
+      'import { armSchedule, nextWakeDelayMs } from "@crewhaus/durable-execution";',
     );
+    // The literal is bound once (control.v1's /status projects nextDueAt from
+    // the same object) and armed from the binding.
+    expect(daemon).toContain(
+      'const __scheduleSpec = {"kind":"cron","cron":"0 */6 * * *","timezone":"America/New_York","jitterMs":30000} as const;',
+    );
+    expect(daemon).toContain("armSchedule(__scheduleSpec, {");
     // instructions ride in onWake, never in the schedule literal.
     expect(daemon).toContain("Post the six-hour digest.");
     expect(daemon).not.toContain('"instructions":"Post the six-hour digest."');
@@ -2148,7 +2164,10 @@ describe("emitChannelBot — schedule: wake loop (Batch F, temporal contract)", 
 
   test("interval schedule with no instructions falls back to the default wake prompt", () => {
     const daemon = fileMap(withInterval()).get("daemon.ts") ?? "";
-    expect(daemon).toContain('armSchedule({"kind":"interval","everyMs":21600000}');
+    expect(daemon).toContain(
+      'const __scheduleSpec = {"kind":"interval","everyMs":21600000} as const;',
+    );
+    expect(daemon).toContain("armSchedule(__scheduleSpec, {");
     expect(daemon).toContain("[scheduled wake] proceed with your standing instructions.");
     expect(daemon).toContain("[schedule] armed (every 21600000ms)");
   });
@@ -2264,5 +2283,130 @@ describe("emitChannelBot — D39 daemon distill janitor step", () => {
     const daemon = fileMap(dreamOnly).get("daemon.ts") ?? "";
     expect(daemon).toContain("steps: __dreamStep !== null ? [__dreamStep] : [],");
     expect(daemon).not.toContain("__distillStep");
+  });
+});
+
+/**
+ * crewhaus.control.v1 (upstream F-4) — the control plane every daemon-shape
+ * bundle serves, rendered from the ONE shared `gateway-protocol` module.
+ */
+describe("emitChannelBot — crewhaus.control.v1", () => {
+  const withLanes = (): IrChannelV0 => ({
+    ...MIN_IR,
+    heartbeat: { everyMs: 60_000, instructions: "Wake and check." },
+    schedule: { kind: "interval", everyMs: 900_000, instructions: "Sweep." },
+  });
+
+  test("the runtime comes from the shared module, never a per-target copy", () => {
+    const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(daemon).toContain('from "@crewhaus/gateway-protocol/control"');
+    expect(daemon).toContain("const __control = createControlPlane({");
+    expect(daemon).toContain('target: "channel",');
+    expect(daemon).toContain('name: "demo",');
+    // Bound only at the end of main(), after every lane and drain step is in.
+    expect(daemon).toContain("await __control.start();");
+    expect(daemon.indexOf("__control.onDrain(")).toBeLessThan(
+      daemon.indexOf("await __control.start();"),
+    );
+  });
+
+  test("declared channels and the parked-approval count are reported", () => {
+    const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(daemon).toContain('channels: () => ["slack"],');
+    // NEVER `store.list()` — that compacts the approvals ledger as a
+    // side-effect, and a polled status endpoint must not rewrite operator
+    // state.
+    expect(daemon).toContain("countPendingApprovals(");
+    expect(daemon).not.toContain("__runtimeApprovals.list()");
+  });
+
+  test("every control call rides the daemon's existing hash-chained audit log", () => {
+    const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(daemon).toContain("audit: async (__rec) => {");
+    expect(daemon).toContain("const __log = __securityAudit;");
+  });
+
+  test("the heartbeat tick body IS the wake body — one function, no second path", () => {
+    const daemon = fileMap(withLanes()).get("daemon.ts") ?? "";
+    expect(daemon).toContain('const __heartbeatLane = __control.lane({\n    lane: "heartbeat",');
+    expect(daemon).toContain('cadence: "every 60000ms",');
+    expect(daemon).toContain("everyMs: 60000,");
+    // The timer no longer owns the body; it just fires the lane.
+    expect(daemon).toContain("void __heartbeatLane.tick();");
+    expect(daemon).toContain("const __sessionId = __tick.sessionId;");
+    expect(daemon).toContain("message: __heartbeatInstructions,");
+    // ...and there is exactly one `agent.runTurn` in the heartbeat block.
+    const hbStart = daemon.indexOf("const __heartbeatLane");
+    const hbEnd = daemon.indexOf("const __heartbeatTimer");
+    expect(daemon.slice(hbStart, hbEnd).split("agent.runTurn({").length - 1).toBe(1);
+  });
+
+  test("the schedule lane is armed through armSchedule and reports nextDueAt", () => {
+    const daemon = fileMap(withLanes()).get("daemon.ts") ?? "";
+    expect(daemon).toContain('const __scheduleLane = __control.lane({\n    lane: "schedule",');
+    expect(daemon).toContain("nextWakeDelayMs(__scheduleSpec, Date.now())");
+    expect(daemon).toContain("await __scheduleLane.tick();");
+  });
+
+  test("a failed tick is rendered AND rethrown so /status records lastOutcome", () => {
+    const daemon = fileMap(withLanes()).get("daemon.ts") ?? "";
+    expect(daemon).toContain('formatRunFailure(__err.report, { prefix: "[heartbeat]" })');
+    expect(daemon).toContain('formatRunFailure(__err.report, { prefix: "[schedule]" })');
+    expect(daemon.split("  throw __err;").length - 1).toBe(2);
+  });
+
+  test("the PUBLIC port gains a bare /healthz and sheds intake while draining", () => {
+    const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    // The gate runs before the webhook handler, on the PUBLIC port only.
+    expect(daemon).toContain(
+      "fetch: (__req) => __control.publicGate(__req) ?? ((req: Request) => gateway.handle(req))(__req),",
+    );
+    // Control routes are never served on the public port.
+    expect(daemon).not.toContain('"/control/v1');
+  });
+
+  test("drain stops the timers and closes every listener, THEN sweeps", () => {
+    const daemon = fileMap(withLanes()).get("daemon.ts") ?? "";
+    const start = daemon.indexOf("__control.onDrain(");
+    const end = daemon.indexOf("await __control.start();");
+    const step = daemon.slice(start, end);
+    expect(step).toContain("__janitor.stop();");
+    expect(step).toContain("clearInterval(__heartbeatTimer);");
+    expect(step).toContain("__schedule.cancel();");
+    // Graceful (no closeActiveConnections): a channel turn runs INSIDE the
+    // webhook request that carried it.
+    expect(step).toContain("await server.stop();");
+    // M2 review — the janitor sweep runs LAST and time-boxed. Inside the drain
+    // deadline it fanned out to dream/distill MODEL CALLS before the listeners
+    // had closed, so the in-flight turn the drain existed to finish was
+    // SIGTERM'd at the deadline anyway. A bare `await __janitor.runOnce();`
+    // between the timer cancels and `server.stop()` is the regression.
+    expect(step).not.toContain("await __janitor.runOnce();");
+    expect(step).toContain("await runDrainSweep(() => __janitor.runOnce()");
+    expect(step.indexOf("await server.stop();")).toBeLessThan(step.indexOf("runDrainSweep"));
+  });
+
+  /**
+   * M2 review — the manager PARSES the daemon's prose stdout for the
+   * `[control] … listening on …` announcement, so anything the daemon echoes
+   * that it did not author is a log-injection surface. The agent's own turn
+   * output is the worst case: a channel message steers it, so no operator
+   * action is needed at all.
+   */
+  test("a heartbeat/schedule turn preview is flattened before it is printed", () => {
+    const daemon = fileMap(withLanes()).get("daemon.ts") ?? "";
+    expect(daemon).toContain(
+      'runDrainSweep, sanitizeControlText } from "@crewhaus/gateway-protocol/control";',
+    );
+    // Both lanes, and neither keeps the raw slice that could carry a newline.
+    expect(daemon.split("const __preview = sanitizeControlText(__out, 200);").length - 1).toBe(2);
+    expect(daemon).not.toContain('__out.slice(0, 200) + "…"');
+  });
+
+  test("the emitted bundle names no control token and mints none at emit time", () => {
+    for (const [, content] of fileMap(withLanes())) {
+      expect(content).not.toContain("CREWHAUS_CONTROL_TOKEN=");
+      expect(content).not.toMatch(/control-token["']?\s*[:=]\s*["'][0-9a-f]{16,}/);
+    }
   });
 });

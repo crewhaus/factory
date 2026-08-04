@@ -87,11 +87,14 @@ describe("emitManaged", () => {
     // Boot-time runOnce, env kill-switch, and configurable hourly interval.
     expect(daemon).toContain('process.env.CREWHAUS_JANITOR !== "0"');
     expect(daemon).toContain("await janitor.runOnce()");
+    // control.v1 hoisted the interval into a named const so the janitor's
+    // cadence can be reported on /control/v1/status.
     expect(daemon).toContain(
-      "janitor.start(Number(process.env.CREWHAUS_JANITOR_INTERVAL_MS ?? 3_600_000))",
+      "const JANITOR_INTERVAL_MS = Number(process.env.CREWHAUS_JANITOR_INTERVAL_MS ?? 3_600_000);",
     );
-    // Both signal handlers halt the interval.
-    expect(daemon.split("janitor.stop();").length - 1).toBe(2);
+    expect(daemon).toContain("janitor.start(JANITOR_INTERVAL_MS);");
+    // Both signal handlers halt the interval, and so does the control.v1 drain.
+    expect(daemon.split("janitor.stop();").length - 1).toBe(3);
   });
 
   test("daemon.ts janitor honors .crewhaus/retention.json (ops-review F2)", () => {
@@ -237,7 +240,8 @@ describe("emitManaged — schedule wake loop (loop contract 0.4, Batch F, ITEM 7
     expect(daemon).toContain('const __sessionId = `sess_${randomBytes(8).toString("hex")}`;');
     expect(daemon).toContain("if (isRunFailedError(__err)) {");
     // The timer is cleared on shutdown (both signals).
-    expect(daemon.split("clearInterval(__scheduleTimer)").length - 1).toBe(2);
+    // Cleared by both signal handlers AND the control.v1 drain step.
+    expect(daemon.split("clearInterval(__scheduleTimer)").length - 1).toBe(3);
   });
 
   test("interval jitter adds a randomized pre-tick delay", () => {
@@ -1341,6 +1345,110 @@ describe("emitManaged — NEW-inloop-coverage: gateway rating capture", () => {
     const both = { ...dream, feedback: { modality: "binary", autoDistill: true } } as IrManagedV0;
     expect(daemonOf(both)).toContain(
       "steps: [...(DREAM_STEP !== null ? [DREAM_STEP] : []), ...(DISTILL_STEP !== null ? [DISTILL_STEP] : [])],",
+    );
+  });
+});
+
+/**
+ * crewhaus.control.v1 (upstream F-4). The managed shape keeps its richer
+ * crewhaus.v1 JSON-RPC gateway on the public port; control.v1 is the
+ * lowest-common-denominator surface every daemon shape shares, on its own
+ * loopback-bound port.
+ */
+describe("emitManaged — crewhaus.control.v1", () => {
+  const daemon = (i: IrManagedV0 = ir): string =>
+    emitManaged(i, { readme: false }).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+
+  test("the runtime comes from the shared module and is bound after the gateway", () => {
+    const d = daemon();
+    expect(d).toContain(
+      'import { createControlPlane, runDrainSweep } from "@crewhaus/gateway-protocol/control";',
+    );
+    expect(d).toContain('target: "managed",');
+    expect(d).toContain("await __control.start();");
+    expect(d.indexOf("const handle = await gateway.listen(PORT);")).toBeLessThan(
+      d.indexOf("await __control.start();"),
+    );
+  });
+
+  test("control calls append to a HARNESS-level audit log, not a tenant's", () => {
+    const d = daemon();
+    expect(d).toContain("const CONTROL_AUDIT =");
+    expect(d).toContain('process.env.CREWHAUS_SECURITY_AUDIT === "0"');
+    expect(d).toContain("await openAuditLog({ rootDir: `${process.cwd()}/.crewhaus/audit` })");
+    expect(d).toContain("const __log = CONTROL_AUDIT;");
+  });
+
+  test("the public gate rides gateway-server, so control is never on the public port", () => {
+    const d = daemon();
+    expect(d).toContain("publicGate: (__req) => __control.publicGate(__req),");
+    expect(d).not.toContain('"/control/v1');
+  });
+
+  test("the schedule fan-out becomes the pokeable lane", () => {
+    const d = daemon({ ...ir, schedule: { kind: "interval", everyMs: 3_600_000 } });
+    expect(d).toContain('const __scheduleLane = __control.lane({\n  lane: "schedule",');
+    expect(d).toContain("everyMs: 3600000,");
+    // The pre-existing entrypoint still exists and simply fires the lane, so
+    // the timer and an operator wake share ONE body.
+    expect(d).toContain(
+      "async function __fireScheduledWake(): Promise<void> {\n  await __scheduleLane.tick();\n}",
+    );
+    expect(d).toContain("for (const __tenantId of Object.keys(TENANT_OVERRIDES))");
+  });
+
+  test("no schedule block arms no lane — wake answers lane_not_armed at runtime", () => {
+    expect(daemon()).not.toContain("__control.lane({");
+  });
+
+  test("counters.turns is bumped by the gateway handler and the scheduled fan-out", () => {
+    const d = daemon({ ...ir, schedule: { kind: "interval", everyMs: 60_000 } });
+    expect(d.split("__control.counters.turns++;").length - 1).toBe(2);
+  });
+
+  test("drain stops intake, cancels the timer, closes the gateway, THEN sweeps", () => {
+    const d = daemon({ ...ir, schedule: { kind: "interval", everyMs: 60_000 } });
+    const step = d.slice(d.indexOf("__control.onDrain("), d.indexOf("await __control.start();"));
+    expect(step).toContain("janitor.stop();");
+    expect(step).toContain("clearInterval(__scheduleTimer);");
+    expect(step).toContain("await handle.close();");
+    // The janitor sweep is housekeeping the next boot repeats, so it runs LAST
+    // and under its own budget: inside the drain deadline it spent the
+    // operator's whole budget (dream/distill model calls) before the listeners
+    // had even closed, and the turn the drain existed to finish was SIGTERM'd
+    // anyway. A bare `await janitor.runOnce();` in this step is the regression.
+    expect(step).not.toContain("await janitor.runOnce();");
+    expect(step).toContain("await runDrainSweep(() => janitor.runOnce()");
+    expect(step.indexOf("await handle.close();")).toBeLessThan(step.indexOf("runDrainSweep"));
+  });
+
+  /**
+   * M2 review — the 202's `sessionId` was an ORPHAN on this shape. One tick
+   * fans out to a turn per tenant, each minting its own session, so the id the
+   * lane minted named nothing; worse, the marker it wrote was a `.jsonl` with
+   * no `.json` beside it, which `sweepExpired`, `crewhaus retention` and the
+   * janitor's TTL eviction all skip by design.
+   */
+  describe("the schedule lane does not own the tick's session", () => {
+    test("the lane declares ownsSession: false", () => {
+      const d = daemon({ ...ir, schedule: { kind: "interval", everyMs: 60_000 } });
+      const lane = d.slice(d.indexOf("const __scheduleLane"), d.indexOf("async function __fire"));
+      expect(lane).toContain("ownsSession: false,");
+    });
+
+    test("the fan-out still mints a session PER TENANT, never the tick's", () => {
+      const d = daemon({ ...ir, schedule: { kind: "interval", everyMs: 60_000 } });
+      const lane = d.slice(d.indexOf("const __scheduleLane"), d.indexOf("async function __fire"));
+      expect(lane).toContain('const __sessionId = `sess_${randomBytes(8).toString("hex")}`;');
+      expect(lane).not.toContain("__tick.sessionId");
+    });
+  });
+
+  test("a tenant reply is flattened before it reaches the pumped log line", () => {
+    const d = daemon({ ...ir, schedule: { kind: "interval", everyMs: 60_000 } });
+    expect(d).toContain("const __preview = sanitizeControlText(__reply, 200);");
+    expect(d).toContain(
+      'import { createControlPlane, runDrainSweep, sanitizeControlText } from "@crewhaus/gateway-protocol/control";',
     );
   });
 });

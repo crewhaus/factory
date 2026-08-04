@@ -4,18 +4,19 @@
  * only on writes, and NO PATCH anywhere (the M1 server has no PATCH route;
  * the old client's PATCH /api/h/:id/registry 405'd silently). The
  * server-side half — every route answering with the fields the views read —
- * lives in hangar-server's contract.test.ts against a live fixture server.
+ * lives in hangar-server's contract.test.ts against a live fixture server,
+ * and `api.test.ts` proves every wrapper here is the one the client issues.
  */
 import { describe, expect, test } from "bun:test";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { ROUTES, buildPath } from "../assets/js/routes.js";
 
-type RouteDef = { method: string; path: string; body?: string };
+type RouteDef = { method: string; path: string; body?: string; stream?: string };
 const entries = Object.entries(ROUTES as Record<string, RouteDef>);
 
 describe("ROUTES map", () => {
-  test("covers the M1 surface and nothing exotic", () => {
-    expect(entries.length).toBeGreaterThanOrEqual(20);
+  test("covers the M1 + M2 surface and nothing exotic", () => {
+    expect(entries.length).toBeGreaterThanOrEqual(40);
     for (const [key, def] of entries) {
       expect(`${key}:${["GET", "POST", "PUT", "DELETE"].includes(def.method)}`).toBe(`${key}:true`);
       expect(`${key}:${def.path.startsWith("/api/")}`).toBe(`${key}:true`);
@@ -71,6 +72,42 @@ describe("ROUTES map", () => {
       path: "/api/registry/scan-roots",
       body: "ScanRootCreate",
     });
+  });
+
+  test("the M2 driving verbs are all present and correctly shaped", () => {
+    const byKey = ROUTES as Record<string, RouteDef>;
+    for (const key of ["proc", "runs", "run", "controlStatus", "schedulers", "deployments"]) {
+      expect(`${key}:${byKey[key]?.method}`).toBe(`${key}:GET`);
+    }
+    for (const key of [
+      "procStart",
+      "procStop",
+      "procRestart",
+      "procDrain",
+      "controlWake",
+      "controlDrain",
+      "grantApproval",
+      "denyApproval",
+      "adjudicateReview",
+      "submitJob",
+      "pinSession",
+      "pinBaseline",
+    ]) {
+      expect(`${key}:${byKey[key]?.method}`).toBe(`${key}:POST`);
+    }
+    // The fleet inboxes are un-parameterized reads; the decisions that settle
+    // them are per-harness writes (the harness owns its own state tree).
+    expect(byKey["approvals"]?.path).toBe("/api/approvals");
+    expect(byKey["review"]?.path).toBe("/api/review");
+    expect(byKey["activity"]?.path).toBe("/api/activity");
+    expect(byKey["jobs"]?.path).toBe("/api/jobs");
+    expect(byKey["grantApproval"]?.path).toBe("/api/h/:id/approvals/:apprId/grant");
+  });
+
+  test("exactly one route is an SSE stream (api.js must not res.json() it)", () => {
+    const streams = entries.filter(([, d]) => d.stream !== undefined);
+    expect(streams.map(([k]) => k)).toEqual(["runEvents"]);
+    expect(streams[0]?.[1].stream).toBe("sse");
   });
 });
 

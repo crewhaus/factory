@@ -4,7 +4,14 @@
  */
 import { describe, expect, test } from "bun:test";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
-import { HARNESS_TABS, hrefHarness, hrefLibrary, parseRoute } from "../assets/js/router.js";
+import {
+  GLOBAL_VIEWS,
+  HARNESS_TABS,
+  hrefGlobal,
+  hrefHarness,
+  hrefLibrary,
+  parseRoute,
+} from "../assets/js/router.js";
 
 const ID = "hrn_9f2c41d07ab3e851";
 
@@ -57,6 +64,30 @@ describe("parseRoute", () => {
     });
   });
 
+  test("M2 fleet screens live at the root", () => {
+    expect(parseRoute("#/runs")).toEqual({ view: "runs" });
+    expect(parseRoute("#/approvals")).toEqual({ view: "approvals" });
+    expect(parseRoute("#/review")).toEqual({ view: "review" });
+    expect(parseRoute("#/activity")).toEqual({ view: "activity" });
+    // …and do not collide with the per-harness tab of the same name.
+    expect(parseRoute(`#/h/${ID}/runs`)).toEqual({ view: "harness", id: ID, tab: "runs" });
+  });
+
+  test("M2 harness tabs: runs (with a run console), schedulers, deploy", () => {
+    expect(parseRoute(`#/h/${ID}/runs/run_0123456789abcdef`)).toEqual({
+      view: "harness",
+      id: ID,
+      tab: "runs",
+      runId: "run_0123456789abcdef",
+    });
+    expect(parseRoute(`#/h/${ID}/schedulers`)).toEqual({
+      view: "harness",
+      id: ID,
+      tab: "schedulers",
+    });
+    expect(parseRoute(`#/h/${ID}/deploy`)).toEqual({ view: "harness", id: ID, tab: "deploy" });
+  });
+
   test("unknown routes are notfound, never a throw", () => {
     expect(parseRoute("#/nope").view).toBe("notfound");
     expect(parseRoute(`#/h/${ID}/bogus`).view).toBe("notfound");
@@ -88,5 +119,11 @@ describe("href builders round-trip through parseRoute", () => {
     const href = hrefHarness(ID, "memory", "wiki", "a b/c");
     const route = parseRoute(href);
     expect(route.wikiSlug).toBe("a b/c");
+  });
+
+  test("every fleet screen in the nav round-trips", () => {
+    for (const view of GLOBAL_VIEWS) {
+      expect(parseRoute(hrefGlobal(view))).toEqual({ view });
+    }
   });
 });

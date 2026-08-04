@@ -1,4 +1,12 @@
 import { CrewhausError } from "@crewhaus/errors";
+import {
+  renderControlDrain,
+  renderControlImports,
+  renderControlLane,
+  renderControlPlaneBoot,
+  renderControlStart,
+  renderControlTimer,
+} from "@crewhaus/gateway-protocol/control-codegen";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import {
   type Bundle,
@@ -924,37 +932,61 @@ function renderScheduleWake(ir: IrManagedV0): { helpers: string; block: string; 
     schedule.jitterMs !== undefined && schedule.jitterMs > 0
       ? `Math.floor(Math.random() * ${schedule.jitterMs})`
       : "0";
+  // crewhaus.control.v1 — the wake body is registered as a control LANE, so
+  // `POST /control/v1/wake {lane:"schedule"}` drives this exact fan-out and a
+  // poke arriving mid-tick is refused with 409 rather than overlapping it.
+  // On this MULTI-TENANT shape one tick is one turn PER DECLARED TENANT, each
+  // in its own session — so the lane declares `ownsSession: false`: it never
+  // threads the tick's id into a session, the 202 omits `sessionId` instead of
+  // naming a transcript that does not exist, and no orphan marker `.jsonl` is
+  // left behind for retention to skip forever. The poke is evidenced through
+  // the control plane's `gateway_request` audit record instead.
   const fireFn = `
 // Loop contract 0.4 (Batch F, temporal contract) — schedule: wake loop.
 const __SCHEDULE_INSTRUCTIONS = ${instructions};
 let __scheduleTick = 0;
 let __scheduleTimer: ReturnType<typeof setInterval> | undefined;
-async function __fireScheduledWake(): Promise<void> {
-  const __tick = __scheduleTick++;
-  for (const __tenantId of Object.keys(TENANT_OVERRIDES)) {
-    const __tenant = tenantOverrides[__tenantId];
-    if (__tenant === undefined) continue;
-    const __sessionId = \`sess_\${randomBytes(8).toString("hex")}\`;
-    try {
-      const __reply = await runOneTurn({
-        tenantId: __tenantId,
-        sessionId: __sessionId,
-        input: __SCHEDULE_INSTRUCTIONS,${wakeTenant}
-      });
-      const __preview = __reply.length > 200 ? \`\${__reply.slice(0, 200)}…\` : __reply;
-      console.error(\`[schedule] tenant \${__tenantId} tick #\${__tick} → \${__preview}\`);
-    } catch (__err) {
-      // A dead provider account / classified failure for one tenant must not
-      // stop the scheduler; render its report and keep ticking.
-      if (isRunFailedError(__err)) {
-        process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[schedule]" })}\\n\`);
-      } else {
-        process.stderr.write(
-          \`[schedule] tenant \${__tenantId} tick #\${__tick} error: \${(__err as Error).message}\\n\`,
-        );
-      }
+${renderControlLane({
+  lane: "schedule",
+  varName: "__scheduleLane",
+  cadence:
+    schedule.kind === "cron"
+      ? `cron "${schedule.cron}"${schedule.timezone !== undefined ? ` ${schedule.timezone}` : " local"}`
+      : `every ${schedule.everyMs}ms`,
+  ...(schedule.kind === "interval" ? { everyMs: schedule.everyMs } : {}),
+  ownsSession: false,
+  body: `const __tickNo = __scheduleTick++;
+const __origin = __tick.synthetic !== undefined ? \` (synthetic: \${__tick.synthetic.reason})\` : "";
+for (const __tenantId of Object.keys(TENANT_OVERRIDES)) {
+  const __tenant = tenantOverrides[__tenantId];
+  if (__tenant === undefined) continue;
+  const __sessionId = \`sess_\${randomBytes(8).toString("hex")}\`;
+  try {
+    const __reply = await runOneTurn({
+      tenantId: __tenantId,
+      sessionId: __sessionId,
+      input: __SCHEDULE_INSTRUCTIONS,${wakeTenant.replace("\n        ", "\n      ")}
+    });
+    __control.counters.turns++;
+    // The tenant turn's output is UNTRUSTED text on a stream the manager's log
+    // pump parses for the control-port announcement — flattened to one bounded
+    // line so a reply can never start a line.
+    const __preview = sanitizeControlText(__reply, 200);
+    console.error(\`[schedule] tenant \${__tenantId} tick #\${__tickNo}\${__origin} → \${__preview}\`);
+  } catch (__err) {
+    // A dead provider account / classified failure for one tenant must not
+    // stop the scheduler; render its report and keep ticking.
+    if (isRunFailedError(__err)) {
+      process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[schedule]" })}\\n\`);
+    } else {
+      process.stderr.write(
+        \`[schedule] tenant \${__tenantId} tick #\${__tickNo} error: \${(__err as Error).message}\\n\`,
+      );
     }
   }
+}`,
+})}async function __fireScheduledWake(): Promise<void> {
+  await __scheduleLane.tick();
 }`;
 
   if (schedule.kind === "interval") {
@@ -1307,6 +1339,38 @@ const DISTILL_STEP = createDistillJanitorStep({
 `
     : "";
 
+  // crewhaus.control.v1 — emitted into every daemon-shape bundle from the
+  // shared gateway-protocol renderers. The managed shape keeps its richer
+  // crewhaus.v1 JSON-RPC gateway on the public port; control.v1 is the
+  // lowest-common-denominator surface every daemon shape shares, on its own
+  // loopback-bound port.
+  const controlPlaneBoot = renderControlPlaneBoot({
+    name: ir.name,
+    target: "managed",
+    auditLogExpr: "CONTROL_AUDIT",
+  });
+  const controlJanitorTimer = renderControlTimer({
+    expr:
+      '{ lane: "janitor", cadence: `every ${JANITOR_INTERVAL_MS}ms`, ' +
+      '...(__janitorLastRunAt !== undefined ? { lastFiredAt: __janitorLastRunAt, lastOutcome: "ok" } : {}) }',
+  });
+  // Listeners close FIRST — `handle.close()` awaits `Bun.serve`'s graceful
+  // stop, which is what lets an in-flight `runs.submit` turn finish — and the
+  // janitor sweep runs afterwards under its own budget. It is housekeeping the
+  // next boot repeats, so it must never sit between the operator's drain and
+  // the exit, eating the supervisor's deadline while a turn is still running.
+  const controlDrain = renderControlDrain({
+    body: `console.error("[managed] draining — intake stopped");
+janitor.stop();${ir.schedule ? "\nif (__scheduleTimer !== undefined) clearInterval(__scheduleTimer);" : ""}
+await handle.close();
+await runDrainSweep(() => janitor.runOnce(), {
+  onOutcome: (__o) => {
+    if (__o !== "done") console.error(\`[managed] drain sweep \${__o}\`);
+  },
+});`,
+  });
+  const controlStart = renderControlStart({});
+
   const tenantList = ir.tenants
     .map(
       (t) =>
@@ -1327,7 +1391,8 @@ import {
   idempotencyKey,
   withIdempotency,
 } from "@crewhaus/idempotency-keys";
-import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
+import { openAuditLog } from "@crewhaus/audit-log";
+${renderControlImports({ drainSweep: true, logSafe: ir.schedule !== undefined })}import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
 import { createRunContext, type RunContext } from "@crewhaus/run-context";
 ${dreamImport}${distillImport}${feedbackImport}import { createJanitor } from "@crewhaus/runtime-core";
 import { buildTenant, withTenant, type Tenant } from "@crewhaus/tenancy";
@@ -1355,6 +1420,15 @@ if (ENV_JWT_SECRET === undefined) {
   );
 }
 
+// control.v1 — the harness-level (NOT per-tenant) hash-chained audit log every
+// control call appends a \`gateway_request\` record to. Per-tenant logs stay the
+// record of per-tenant activity; a control call is an operator action against
+// the whole daemon. CREWHAUS_SECURITY_AUDIT=0 opts out.
+const CONTROL_AUDIT =
+  process.env.CREWHAUS_SECURITY_AUDIT === "0"
+    ? undefined
+    : await openAuditLog({ rootDir: \`\${process.cwd()}/.crewhaus/audit\` });
+${controlPlaneBoot}
 const TENANT_OVERRIDES: Record<string, Partial<Tenant>> = {
 ${tenantList}
 };
@@ -1416,11 +1490,19 @@ ${dreamStepBlock}${distillStepBlock}const janitor = createJanitor({
   sessionTtlDays: RETENTION_TTL_DAYS,
   pinnedSessionIds: RETENTION_PINS,${dreamStepsField}
 });
+// control.v1 reports the janitor as a read-only timer lane; per-run outcomes
+// past the boot run come from the captured [managed] janitor log lines
+// (createJanitor exposes no per-tick callback).
+const JANITOR_INTERVAL_MS = Number(process.env.CREWHAUS_JANITOR_INTERVAL_MS ?? 3_600_000);
+let __janitorLastRunAt: string | undefined;
 if (process.env.CREWHAUS_JANITOR !== "0") {
   const janitorReport = await janitor.runOnce();
+  __janitorLastRunAt = new Date().toISOString();
+  __control.counters.janitorRuns++;
   console.error(\`[managed] janitor: \${JSON.stringify(janitorReport.steps)}\`);
-  janitor.start(Number(process.env.CREWHAUS_JANITOR_INTERVAL_MS ?? 3_600_000));
+  janitor.start(JANITOR_INTERVAL_MS);
 }
+${controlJanitorTimer}
 
 // Ops item 37 — SLO intake gate. The CLI \`run\`/monitor path (registry-backed)
 // flips \`.crewhaus/slo/intake.json\` { paused } on a SUSTAINED SLO breach (and
@@ -1479,7 +1561,11 @@ const gateway = createGatewayServer({
   tenantsRoot: TENANTS_ROOT,
   tenantOverrides,
   budgetStore: BUDGET_STORE,
-  intakeGate: readIntakeGate,${federationSurface.field}
+  intakeGate: readIntakeGate,
+  // control.v1 — bare unauthenticated GET /healthz (liveness only, no state)
+  // plus the 503 + Retry-After intake shed once a drain has been requested.
+  // Control routes themselves are NEVER served on this public port.
+  publicGate: (__req) => __control.publicGate(__req),${federationSurface.field}
   // Contract item 3 — resolve a run's live trace stream for runs.subscribe from
   // the per-run bus registry, fenced to the owning tenant. Returning undefined
   // (unknown OR cross-tenant runId) makes the gateway answer 404.
@@ -1566,6 +1652,7 @@ const gateway = createGatewayServer({
         }
         throw err;
       }
+      __control.counters.turns++;
       const inputTokens = Math.ceil(p.input.length / 4);
       const outputTokens = Math.ceil(reply.length / 4);
       await gateway.recordUsage(tenant.id, { input: inputTokens, output: outputTokens });
@@ -1590,7 +1677,7 @@ ${feedbackHandlerBlock}    if (method === "audit.tail") {
 
 const handle = await gateway.listen(PORT);
 console.error(\`[managed] gateway listening on :\${handle.port}\`);
-${scheduleWake.helpers}${scheduleWake.block}
+${scheduleWake.helpers}${scheduleWake.block}${controlDrain}${controlStart}
 process.on("SIGTERM", async () => {
   console.error("[managed] SIGTERM — closing gateway");
   janitor.stop();${scheduleWake.shutdown}

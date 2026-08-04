@@ -465,6 +465,10 @@ describe("/api/harnesses rows + rollup cache", () => {
       missingSince: null,
       capabilities: [],
       evalHealthy: true, // runs exist but no baseline is pinned
+      // M2 fleet columns: no supervisor has been created for this harness
+      // (nothing has driven it), and nothing is parked on a human.
+      supervision: null,
+      pendingApprovals: 0,
       cachedAt: iso(NOW),
       rollup: {
         digest: "<digest>",

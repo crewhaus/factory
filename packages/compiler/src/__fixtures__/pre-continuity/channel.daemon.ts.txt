@@ -18,6 +18,7 @@ import { openAuditLog } from "@crewhaus/audit-log";
 import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
 import { createRuntimeBackedApprovalStore } from "@crewhaus/channel-adapter-base";
 import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
+import { countPendingApprovals, createControlPlane, runDrainSweep } from "@crewhaus/gateway-protocol/control";
 import { join } from "node:path";
 
 const __requiredEnv = ["PIN_SLACK_BOT_TOKEN","PIN_SLACK_SIGNING_SECRET"];
@@ -82,6 +83,19 @@ async function main(): Promise<void> {
   );
   const __approvals = createRuntimeBackedApprovalStore(__runtimeApprovals);
 
+  // crewhaus.control.v1 — the supervisor-facing control plane (§ dedicated
+  // port from CREWHAUS_CONTROL_PORT, bearer from CREWHAUS_CONTROL_TOKEN or a
+  // boot-minted .crewhaus/run/control-token). Unset port ⇒ no socket opens.
+  const __control = createControlPlane({
+    name: "pin-channel",
+    target: "channel",
+    channels: () => ["slack"],
+    pendingApprovals: async () => countPendingApprovals(join(__approvalRoot ?? ".crewhaus/sessions", "approvals.jsonl")),
+    audit: async (__rec) => {
+      const __log = __securityAudit;
+      if (__log !== undefined) await __log.append(__rec);
+    },
+  });
 
   // Loop contract 0.4 (Batch E, G78) — per-spec cross-run prompt-cache
   // rotation store (§2.5). One small JSON record under
@@ -99,7 +113,7 @@ async function main(): Promise<void> {
     promptCacheStore: __promptCacheStore,
     runtimeApprovals: __runtimeApprovals,
   });
-  const sessionRouter = createSessionRouter({ agent, approvals: __approvals });
+  const sessionRouter = createSessionRouter({ agent, approvals: __approvals, onTurnComplete: () => { __control.counters.turns++; } });
   // SECURITY (audit R3) — replay-dedup backend. Default in-memory; set
   // CREWHAUS_DEDUP_STORE=sqlite:<path> so seen webhook ids survive restarts
   // and are shared by every daemon process on this host.
@@ -138,15 +152,45 @@ async function main(): Promise<void> {
     sessionTtlDays: __retentionTtlDays,
     pinnedSessionIds: __retentionPins,
   });
+  // control.v1 reports the janitor as a read-only timer lane; per-run
+  // outcomes past the boot run are recovered from the captured [janitor] log
+  // lines (createJanitor exposes no per-tick callback).
+  const __janitorIntervalMs = Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000);
+  let __janitorLastRunAt: string | undefined;
   if (process.env["CREWHAUS_JANITOR"] !== "0") {
     const __janitorReport = await __janitor.runOnce();
+    __janitorLastRunAt = new Date().toISOString();
+    __control.counters.janitorRuns++;
     process.stdout.write(`[janitor] ${JSON.stringify(__janitorReport.steps)}\n`);
-    __janitor.start(Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000));
+    __janitor.start(__janitorIntervalMs);
   }
+  __control.timer(() => ({ lane: "janitor", cadence: `every ${__janitorIntervalMs}ms`, ...(__janitorLastRunAt !== undefined ? { lastFiredAt: __janitorLastRunAt, lastOutcome: "ok" } : {}) }));
 
   const port = Number(process.env["PORT"] ?? 3000);
-  const server = Bun.serve({ port, fetch: (req) => gateway.handle(req) });
+  // The PUBLIC port additionally answers a bare, unauthenticated GET /healthz
+  // (liveness only, no state — what PaaS scaffolds have been health-checking
+  // against nothing) and sheds every other request with 503 + Retry-After once
+  // control.v1 drain has been requested. Control itself is NEVER on this port.
+  const server = Bun.serve({
+    port,
+    fetch: (__req) => __control.publicGate(__req) ?? ((req: Request) => gateway.handle(req))(__req),
+  });
   process.stdout.write(`[daemon] listening on http://localhost:${server.port}\n`);
+  __control.onDrain(async () => {
+    process.stdout.write("[daemon] draining — intake stopped\n");
+    __janitor.stop();
+    // GRACEFUL stop (no closeActiveConnections): a channel turn runs INSIDE the
+    // webhook request that carried it, so forcing connections shut here would
+    // abort exactly the in-flight turns a drain exists to finish.
+    await server.stop();
+    // Best-effort housekeeping, time-boxed and outside everything above.
+    await runDrainSweep(() => __janitor.runOnce(), {
+      onOutcome: (__o) => {
+        if (__o !== "done") process.stdout.write(`[daemon] drain sweep ${__o}\n`);
+      },
+    });
+  });
+  await __control.start();
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {

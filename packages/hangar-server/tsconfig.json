@@ -5,10 +5,14 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../data-retention-engine" },
     { "path": "../eval-report" },
+    { "path": "../event-log" },
     { "path": "../feedback-distill" },
+    { "path": "../gateway-protocol" },
     { "path": "../harness-inventory" },
     { "path": "../harness-registry" },
+    { "path": "../harness-supervisor" },
     { "path": "../preflight" },
     { "path": "../spec" },
     { "path": "../spec-patch" }

@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Three new packages carry the harness manager's library layers.**
+- **Four new packages carry the harness manager's library layers.**
   `@crewhaus/harness-registry` is the machine-wide registry file layer — one
   `harnesses.json` (format v2) under the registry root
   (`CREWHAUS_REGISTRY_ROOT`, default `~/.crewhaus`) listing every registered
@@ -25,7 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   route to, the channel daemon's boot-gate env refs, MCP secret-ref dry-run,
   port bindability, bundle freshness, and durability warnings — every core
   function taking an injected `env` so the same checks serve the CLI, tests,
-  and a fleet manager identically.
+  and a fleet manager identically. `@crewhaus/harness-supervisor` is the
+  process layer — spawn contracts per run class, the preflight gate, the
+  supervision state machine with its restart window and exit classification,
+  the byte-exact log pump, and adoption — over state that is entirely
+  HARNESS-LOCAL under `<harness>/.crewhaus/run/` (runfile, append-only run
+  ledger, captured logs + cursors, the minted control token). Nothing lives
+  in a central manager directory, which is what lets the console and
+  `crewhaus daemon` drive the same daemon from either side, and what makes a
+  harness copied to another machine carry its own run history with it.
 
 - **`run`, `compile`, `eval`, and `dev` now self-register the harness they
   touch.** After the spec resolves, each command records the cwd (the
@@ -80,6 +88,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the bearer token (200) and without (401) — then exits; it is the
   release workflow's compiled-binary smoke entry.
 
+- **The Hangar console became a driver, and `crewhaus daemon` is its
+  terminal twin.** `@crewhaus/hangar-server` gained the M2 surface:
+  `POST /api/h/:id/proc/{start,stop,restart,drain}` over
+  `@crewhaus/harness-supervisor` (preflight gates every spawn and returns
+  the typed refusal — with each blocking item marked acknowledgeable or
+  not — instead of spawning), a run ledger plus a live `text/event-stream`
+  run feed that opens with the durable replay and always terminates with a
+  `done` frame, a `crewhaus.control.v1` proxy for wake/drain/status whose
+  bearer is read server-side and never crosses the API boundary, the
+  four-lane scheduler timeline (heartbeat / schedule / dream / janitor)
+  merging spec-declared cadence with the phase only the daemon's own
+  process can report, fleet-wide approvals and review inboxes that settle
+  work through the same stores the CLI writes through, an activity digest
+  built from stats rather than transcript reads, read-only deployment
+  records, and a bounded job queue behind the dream-run / eval / doctor /
+  compile action faces. The new `crewhaus daemon
+  start|stop|restart|status|logs|wake|drain` family drives the same
+  supervisor DIRECTLY, so it works with no console running — all
+  supervision state is harness-local under `.crewhaus/run/`, and a daemon
+  either head starts is adopted by the other.
+
+- **Compiled daemon bundles now serve `crewhaus.control.v1`.** Every daemon
+  shape (channel, managed, crew, voice, batch) constructs a control plane at
+  boot. It binds a loopback listener ONLY when `CREWHAUS_CONTROL_PORT` is
+  set, so upgrading a bundle never opens a listener nobody asked for; when
+  it does bind it answers `GET /control/v1/{healthz,status}` and `POST
+  /control/v1/{wake,drain}` behind a bearer compared in constant time, taken
+  from `CREWHAUS_CONTROL_TOKEN` or minted at boot into
+  `<cwd>/.crewhaus/run/control-token` (0600) so a local manager can read it
+  off disk without one ever entering argv. `CREWHAUS_CONTROL_BIND`
+  (default `127.0.0.1`) moves the listener; a port of `0` lets the kernel
+  choose and the daemon announces the number on stdout, which is the only
+  place it exists. Every call appends a `gateway_request` record to the
+  harness's hash-chained audit log when one is wired. **Independently of the
+  control port**, the channel and managed daemons now answer a bare,
+  UNAUTHENTICATED `GET /healthz` on their PUBLIC port — deployment scaffolds
+  have always declared that health check and no daemon served it, and the
+  liveness answer carries no state — and, once draining, shed every other
+  request on that port with `503` + `Retry-After: 15` so a PaaS backs off
+  instead of reaping a process mid-turn. A deployed bundle that sets no
+  control env vars therefore gains exactly one new route — `/healthz` — and
+  no listener, no token file, and no reachable control surface.
+
 ### Changed
 
 - **The `fleet` and `doctor`/`channel` cores are consumed from the new
@@ -91,7 +142,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   channel-IR extraction staying in the CLI. Internal rewire only — no
   behavior change to `fleet`, `doctor`, or `channel provision|verify`.
 
+- **Every compiled bundle's `dist/package.json` now carries a provenance
+  stamp**, `crewhaus: { specHash, compiledWith }` — the hash of the
+  normalized `crewhaus.yaml` it was emitted from plus the crewhaus version
+  that emitted it. It is what lets a manager answer "is this bundle current?"
+  EXACTLY instead of comparing file mtimes, and the console labels which of
+  the two answers it got. A bundle with no stamp is reported as unstamped,
+  never as stale, so upgrading does not nag every harness that has not been
+  recompiled yet. `compile --check` carries an existing stamp forward rather
+  than dropping it. Bundles also gain `@crewhaus/gateway-protocol` in their
+  dependency list (the control plane above), and the crew, voice and batch
+  daemons additionally open the hash-chained audit log at boot, creating
+  `<cwd>/.crewhaus/audit/` on first run — `CREWHAUS_SECURITY_AUDIT=0` opts
+  out.
+
+- **The channel daemon's session router signals every completed turn.** The
+  `onTurnComplete` callback used to be emitted only when the spec declared a
+  `gateway:` block; `crewhaus.control.v1` made it unconditional, because
+  `/control/v1/status` reports `counters.turns` on every daemon shape and a
+  counter that existed only alongside an optional spec block would make the
+  control surface lie about a gateway-less bot. Observable through the
+  control status route, which needs the control port bound.
+
 ### Fixed
+
+- **Hangar's preflight now evaluates the environment the spawn actually
+  receives.** `mergedSpawnEnv` layered the harness `.env` chain ON TOP of
+  the manager's process env, while `buildSpawnPlan` layers it UNDERNEATH —
+  so the console could pass a check against a value the daemon would never
+  see, the exact inversion of "it passed preflight and then died on a
+  missing key". It now delegates to `buildSpawnEnv`, the function the plan
+  builds `plan.env` with, so there is one encoding of the precedence and a
+  test pins the two together.
 
 - **The Hangar console masks and containment-checks every harness read, not
   just some.** Memory-fabric text (facts and their tags, wiki article bodies,

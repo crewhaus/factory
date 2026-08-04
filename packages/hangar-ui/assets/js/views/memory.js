@@ -12,6 +12,7 @@ import { api } from "../api.js";
 import { clear, collapsible, dot, el, emptyState, jsonPre, mdBlocks, skeleton } from "../dom.js";
 import { hrefHarness } from "../router.js";
 import { fmtRelativeTime } from "../util.js";
+import { jobButton } from "./jobs.js";
 
 export async function renderMemory(root, ctx) {
   if (ctx.route.wikiSlug !== undefined) {
@@ -31,7 +32,7 @@ export async function renderMemory(root, ctx) {
   grid.appendChild(factsCard(value(facts)));
   grid.appendChild(wikiCard(value(wiki), ctx));
   grid.appendChild(continuityCard(value(continuity)));
-  grid.appendChild(dreamCard(value(dream)));
+  grid.appendChild(dreamCard(value(dream), ctx, () => renderMemory(root, ctx)));
   grid.appendChild(watchmeCard(value(watchme)));
   root.appendChild(grid);
 }
@@ -176,10 +177,13 @@ function continuityCard(data) {
   return card("Continuity", children);
 }
 
-function dreamCard(data) {
+function dreamCard(data, ctx, reload) {
   const specs = Array.isArray(data?.specs) ? data.specs : [];
+  // Dream is a read-only timer row in control.v1 — there is nothing to poke,
+  // so "Run now" goes through the job queue, exactly as the CLI would.
+  const runNow = jobButton("Run now", ctx.id, "dream-run", undefined, reload);
   if (specs.length === 0) {
-    return card("Dream", emptyState("No dream state yet", "crewhaus dream run"));
+    return card("Dream", [emptyState("No dream state yet", "crewhaus dream run"), runNow]);
   }
   const children = specs.map((s) => {
     const state = s?.state && typeof s.state === "object" ? s.state : {};
@@ -195,6 +199,7 @@ function dreamCard(data) {
       [jsonPre(state)],
     );
   });
+  children.push(runNow);
   return card("Dream", children);
 }
 

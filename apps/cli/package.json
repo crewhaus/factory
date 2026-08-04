@@ -66,6 +66,7 @@
     "@crewhaus/hangar-ui": "workspace:*",
     "@crewhaus/harness-inventory": "workspace:*",
     "@crewhaus/harness-registry": "workspace:*",
+    "@crewhaus/harness-supervisor": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*",

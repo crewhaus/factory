@@ -141,6 +141,54 @@ describe("credential hygiene (end-to-end)", () => {
       watchmeObservations: [{ sessionId: sess, digest: "clean" }],
       focus: `current focus: rotate ${FAKE_KEY} everywhere\n`,
       goals: `- id: g1\n  title: retire ${FAKE_KEY}\n  status: active\n`,
+      // M2 surfaces. A captured daemon log is UNSCRUBBED on disk by
+      // construction, an approval embeds the raw tool input a policy deemed
+      // sensitive enough to need a human, and a review context is free text
+      // — all three are exactly where a key ends up.
+      runLedger: [
+        {
+          runId: "run_00000000000000cc",
+          kind: "daemon",
+          argv: ["bun", "dist/daemon.ts"],
+          startedAt: iso(NOW - 3600_000),
+          logFile: "logs/run_00000000000000cc.log",
+        },
+        { runId: "run_00000000000000cc", endedAt: iso(NOW), exitCode: 0 },
+      ],
+      runLogs: [
+        {
+          runId: "run_00000000000000cc",
+          log: `booting with ANTHROPIC_API_KEY=${FAKE_KEY}\nready\n`,
+          events: [
+            { kind: "run_failed", runId: "run_00000000000000cc", error: `auth ${FAKE_KEY}` },
+          ],
+        },
+      ],
+      approvals: [
+        {
+          id: "appr_00000000000000c1",
+          toolName: "Fetch",
+          inputHash: "h",
+          input: { url: "https://example.invalid", headers: { authorization: FAKE_KEY } },
+          runId: "run_00000000000000cc",
+          sessionId: sess,
+          surface: "daemon",
+          createdAt: iso(NOW),
+        },
+      ],
+      reviewQueue: [
+        {
+          schemaVersion: 1,
+          id: "rev_quarantine_d_s1",
+          kind: "quarantine",
+          sourceRef: { dataset: "d", sampleId: "s1" },
+          ts: iso(NOW),
+          status: "open",
+          context: `sample quoted ${FAKE_KEY}`,
+        },
+      ],
+      deployments: { deployments: [{ env: "prod", note: `deployed with ${FAKE_KEY}` }] },
+      bundle: { entry: "daemon.ts" },
     });
     const { body: created } = await t.api("/api/harnesses", {
       method: "POST",
@@ -171,6 +219,18 @@ describe("credential hygiene (end-to-end)", () => {
       `/api/h/${id}/memory/dream`,
       `/api/h/${id}/memory/watchme`,
       `/api/h/${id}/costs`,
+      // M2
+      `/api/h/${id}/proc`,
+      `/api/h/${id}/runs`,
+      `/api/h/${id}/runs/run_00000000000000cc`,
+      `/api/h/${id}/runs/run_00000000000000cc/events`,
+      `/api/h/${id}/control/status`,
+      `/api/h/${id}/schedulers`,
+      `/api/h/${id}/deployments`,
+      "/api/approvals?all=1",
+      "/api/review?all=1",
+      "/api/activity?since=30d",
+      "/api/jobs",
     ];
     for (const path of paths) {
       const res = await t.fetchRaw(path, {
@@ -183,6 +243,15 @@ describe("credential hygiene (end-to-end)", () => {
       expect(text).not.toContain(FAKE_OPAQUE);
     }
 
+    // A run detail's prose tail is the ONE payload built from the raw
+    // capture file. Both layers must be on it, or the same response body
+    // contradicts itself: the pump-extracted `events` masked, the same bytes
+    // verbatim in `proseTail`.
+    const detail = await t.api(`/api/h/${id}/runs/run_00000000000000cc`);
+    const tail = (detail.body["proseTail"] as string[]).join("\n");
+    expect(tail).not.toContain(FAKE_KEY);
+    expect(tail).toContain("«ANTHROPIC_API_KEY»");
+
     // The spec view still names the env refs (presence only) …
     const spec = await t.api(`/api/h/${id}/spec`);
     const yaml = spec.body["yaml"] as string;
@@ -192,5 +261,70 @@ describe("credential hygiene (end-to-end)", () => {
     const transcript = await t.api(`/api/h/${id}/sessions/${sess}`);
     const tools = transcript.body["tools"] as Array<Record<string, unknown>>;
     expect((tools[0] as { input: { apiKey: string } }).input.apiKey).toBe("[redacted]");
+  });
+
+  test("run history is scrubbed to the SAME standard as the live feed", async () => {
+    // The two gaps a `.env`-only scrubber leaves, both reachable on the very
+    // first daemon boot:
+    //   1. a key exported in the shell that launched the manager. The spawn
+    //      env layers the harness chain UNDER the process env, so the daemon
+    //      inherits it and an MCP server echoing its env quotes it into the
+    //      log — but no `.env` file has ever heard of it. Deliberately under
+    //      32 chars and of no known shape, so ONLY the env scrubber can
+    //      catch it.
+    const EXPORTED = "orange-marmalade-42";
+    //   2. a credential in no env file at all (an OAuth token a tool echoed
+    //      back), which only the SHAPE masker can catch.
+    const runId = "run_00000000000000dd";
+    const t = bootTestServer({ now: () => NOW, env: { HELPER_API_KEY: EXPORTED } });
+    servers.push(t);
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "history-scrub"), {
+      specName: "history-scrub",
+      target: "channel",
+      envLines: ["PLAIN_SETTING=not-a-secret"],
+      bundle: { entry: "daemon.ts" },
+      runLedger: [
+        {
+          runId,
+          kind: "daemon",
+          argv: ["bun", "dist/daemon.ts"],
+          startedAt: iso(NOW - 3600_000),
+          logFile: `logs/${runId}.log`,
+        },
+        { runId, endedAt: iso(NOW), exitCode: 0 },
+      ],
+      runLogs: [
+        {
+          runId,
+          log: [
+            `booting helper-mcp with HELPER_API_KEY=${EXPORTED}`,
+            `provider 401 body: {"error":"invalid key ${FAKE_KEY}"}`,
+            "",
+          ].join("\n"),
+          events: [{ kind: "run_started", runId }],
+        },
+      ],
+    });
+    const { body: created } = await t.api("/api/harnesses", {
+      method: "POST",
+      body: JSON.stringify({ dir }),
+    });
+    const id = (created["entry"] as { id: string }).id;
+
+    const detail = await t.api(`/api/h/${id}/runs/${runId}`);
+    const tail = (detail.body["proseTail"] as string[]).join("\n");
+    // Named, not just hidden: the operator still learns WHICH variable the
+    // log was talking about — which is the whole contract of the scrubber.
+    expect(tail).toContain("«HELPER_API_KEY»");
+    expect(tail).not.toContain(EXPORTED);
+    expect(tail).not.toContain(FAKE_KEY);
+
+    // …and the SSE `replay` frame ships the same bytes. It is the same
+    // object; serving it through a second path must not serve it raw.
+    const stream = await t.apiText(`/api/h/${id}/runs/${runId}/events`);
+    expect(stream.status).toBe(200);
+    expect(stream.text).toContain("event: replay");
+    expect(stream.text).not.toContain(EXPORTED);
+    expect(stream.text).not.toContain(FAKE_KEY);
   });
 });

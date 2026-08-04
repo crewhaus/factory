@@ -25,7 +25,12 @@ const NOW = Date.parse("2026-08-03T00:00:00.000Z");
 const iso = (ms: number): string => new Date(ms).toISOString();
 const DAY = 86_400_000;
 
-type RouteDef = { readonly method: string; readonly path: string; readonly body?: string };
+type RouteDef = {
+  readonly method: string;
+  readonly path: string;
+  readonly body?: string;
+  readonly stream?: string;
+};
 
 /** The client's route map, loaded from the sibling package's asset file.
  *  Dynamic import by URL: the asset is a browser ES module, not part of
@@ -68,6 +73,8 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["harnesses[].evalHealthy", "boolean|null"],
     ["harnesses[].cachedAt", "string|null"],
     ["harnesses[].rollup", "object|null"],
+    ["harnesses[].supervision", "string|null"],
+    ["harnesses[].pendingApprovals", "number"],
   ],
   // …and hydrated: the nested rollup the table's columns come from
   harnesses: [
@@ -128,6 +135,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
   // views/sessions.js list
   sessions: [
     ["sessionRoot", "object"],
+    ["pins", "array"],
     ["sessions[].id", "string"],
     ["sessions[].name", "string"],
     ["sessions[].model", "string"],
@@ -211,6 +219,130 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["slug", "string"],
     ["body", "string"],
     ["truncated", "boolean"],
+  ],
+  // ---- M2 ---------------------------------------------------------------
+  // views/proc.js — the Start/Stop/Drain card
+  proc: [
+    ["id", "string"],
+    ["target", "string"],
+    ["runClass", "string"],
+    ["state", "string"],
+    ["adopted", "boolean"],
+    ["draining", "boolean"],
+    ["restartsInWindow", "number"],
+    ["runfile", "object|null"],
+    ["control.port", "number|null"],
+    ["control.available", "boolean"],
+    ["control.reason", "string|null"],
+    ["bundle.present", "boolean"],
+    ["bundle.freshness.state", "string"],
+    ["bundle.freshness.exact", "boolean"],
+    ["bundle.freshness.label", "string"],
+    ["launch.mode", "string|null"],
+    ["launch.canResume", "boolean"],
+    ["launch.cliTwin", "string|null"],
+    ["launch.error", "object|null"],
+    ["recentRuns", "array"],
+  ],
+  // views/runs.js — the run-history table
+  runs: [
+    ["runs[].runId", "string"],
+    ["runs[].kind", "string"],
+    ["runs[].startedAt", "string"],
+    ["runs[].logFile", "string"],
+    ["truncated", "boolean"],
+  ],
+  // views/runs.js — one run's drill-down
+  run: [
+    ["runId", "string"],
+    ["entry", "object|null"],
+    ["live", "boolean"],
+    ["events", "array"],
+    ["eventsTruncated", "boolean"],
+    ["proseTail", "array"],
+  ],
+  // views/control.js — the wake/drain card. ALWAYS a typed envelope.
+  controlStatus: [
+    ["ok", "boolean"],
+    ["code", "string"],
+    ["reason", "string"],
+    ["retryable", "boolean"],
+    ["expected", "boolean"],
+  ],
+  // views/schedulers.js — the four-lane timeline
+  schedulers: [
+    ["lanes[].lane", "string"],
+    ["lanes[].armed", "boolean"],
+    ["lanes[].cadence", "string|null"],
+    ["lanes[].cadenceSource", "string"],
+    ["lanes[].lastFiredAt", "string|null"],
+    ["lanes[].nextDueAt", "string|null"],
+    ["lanes[].pokeable", "boolean"],
+    ["lanes[].pokeReason", "string|null"],
+    ["controlReachable", "boolean"],
+    ["controlReason", "string|null"],
+    ["draining", "boolean"],
+  ],
+  // views/approvals.js — the fleet inbox
+  approvals: [
+    ["approvals[].id", "string"],
+    ["approvals[].harnessId", "string"],
+    ["approvals[].specName", "string"],
+    ["approvals[].toolName", "string"],
+    ["approvals[].inputHash", "string"],
+    ["approvals[].surface", "string"],
+    ["approvals[].createdAt", "string"],
+    ["approvals[].status", "string"],
+    ["approvals[].decidedBy", "string|null"],
+    ["approvals[].parkedRun.harnessId", "string"],
+    ["approvals[].parkedRun.runId", "string"],
+    ["approvals[].parkedRun.sessionId", "string"],
+    ["pending", "number"],
+    ["truncatedHarnesses", "array"],
+  ],
+  // views/review.js — the fleet review queue
+  review: [
+    ["items[].id", "string"],
+    ["items[].kind", "string"],
+    ["items[].status", "string"],
+    ["items[].ts", "string"],
+    ["items[].harnessId", "string"],
+    ["items[].specName", "string"],
+    ["items[].adjudicable", "boolean"],
+    ["items[].sourceRef", "object"],
+    ["open", "number"],
+  ],
+  // views/activity.js — the digest
+  activity: [
+    ["since", "string"],
+    ["truncated", "boolean"],
+    ["items[].kind", "string"],
+    ["items[].harnessId", "string"],
+    ["items[].specName", "string"],
+    ["items[].at", "string"],
+    ["items[].label", "string"],
+  ],
+  // views/jobs.js — the queue. `recent` is not decoration: a job the queue
+  // RESTORED as `interrupted` (mutating work a dead manager abandoned) never
+  // re-enters pending/running, so the ledger fold is the only place it can
+  // ever be seen — as is every job the moment it finishes.
+  jobs: [
+    ["pending", "array"],
+    ["running[].jobId", "string"],
+    ["running[].kind", "string"],
+    ["running[].harnessDir", "string"],
+    ["running[].state", "string"],
+    ["running[].mutating", "boolean"],
+    ["recent[].jobId", "string"],
+    ["recent[].state", "string"],
+  ],
+  // views/deploy.js — F-6, read-only + honest empty state
+  deployments: [
+    ["present", "boolean"],
+    ["deployments", "array"],
+    ["error", "string|null"],
+    ["path", "string"],
+    ["note", "string|null"],
   ],
   // views/costs.js + overview.js costCard
   costs: [
@@ -305,16 +437,86 @@ function assertViewReads(routeKey: string, payload: unknown): void {
 // comes back empty
 // ---------------------------------------------------------------------------
 
+/** A run id the fixture seeds captured artifacts for. */
+const SEEDED_RUN = "run_00000000000000bb";
+
 function contractHarness(t: TestServer): string {
   return makeFixtureHarness(join(t.harnessesRoot, "contract"), {
     specName: "contract-harness",
     specExtra: [
       "memory:",
       "  recall: true",
+      "  dream:",
+      "    every: 24h",
+      "heartbeat:",
+      "  every: 60s",
+      "  instructions: check in",
+      "schedule:",
+      "  kind: cron",
+      '  cron: "0 */6 * * *"',
       "budget:",
       "  usd: 10",
       "notify_env: $CONTRACT_VAR",
     ].join("\n"),
+    // A compiled bundle, F-5-stamped with a hash that does NOT match the
+    // spec above — so the freshness verdict is the EXACT "stale" answer
+    // rather than the approximate mtime one.
+    bundle: { entry: "agent.ts", specHash: `sha256:${"0".repeat(64)}`, compiledWith: "0.5.0" },
+    runLedger: [
+      {
+        runId: SEEDED_RUN,
+        kind: "daemon",
+        argv: ["bun", "dist/daemon.ts"],
+        startedAt: iso(NOW - DAY),
+        logFile: `logs/${SEEDED_RUN}.log`,
+      },
+      { runId: SEEDED_RUN, endedAt: iso(NOW - DAY + 1000), exitCode: 0 },
+    ],
+    runLogs: [
+      {
+        runId: SEEDED_RUN,
+        log: "booting\n[control] crewhaus.control.v1 listening on http://127.0.0.1:41234 (token: .crewhaus/run/control-token)\ndone\n",
+        events: [{ kind: "run_started", runId: SEEDED_RUN, sessionId: "sess_00000000000000aa" }],
+      },
+    ],
+    approvals: [
+      {
+        id: "appr_00000000000000a1",
+        toolName: "SendMessage",
+        inputHash: "h1",
+        input: { channel: "ops", text: "ship it" },
+        runId: SEEDED_RUN,
+        sessionId: "sess_00000000000000aa",
+        surface: "daemon",
+        createdAt: iso(NOW - DAY),
+      },
+      {
+        id: "appr_00000000000000a2",
+        toolName: "Fetch",
+        inputHash: "h2",
+        input: { url: "https://example.invalid/x" },
+        runId: SEEDED_RUN,
+        sessionId: "sess_00000000000000aa",
+        surface: "daemon",
+        createdAt: iso(NOW - DAY),
+      },
+    ],
+    reviewQueue: [
+      {
+        schemaVersion: 1,
+        id: "rev_quarantine_smoke_s1",
+        kind: "quarantine",
+        sourceRef: { dataset: "smoke", sampleId: "s1" },
+        ts: iso(NOW - DAY),
+        status: "open",
+        context: "[low-confidence] a hard case",
+      },
+    ],
+    deployments: {
+      deployments: [{ env: "prod", version: "1.2.3", at: iso(NOW - DAY), provider: "fly" }],
+    },
+    incidents: ["2026-08-02-crash"],
+    specChangelogs: { "contract-harness": "# Changelog\n- 1.0.0\n" },
     envLines: ["CONTRACT_VAR=set-in-harness-env"],
     sessions: [
       {
@@ -423,7 +625,15 @@ function contractHarness(t: TestServer): string {
 describe("UI route contract", () => {
   test("every route in the console's map answers with what its view reads (and writes take effect)", async () => {
     const ROUTES = await loadRoutes();
-    const t = bootTestServer({ now: () => NOW });
+    const t = bootTestServer({
+      now: () => NOW,
+      // `doctor` runs to completion (so the ledger has a terminal job);
+      // anything else parks, so the queue also has a live one.
+      runJob: (job) =>
+        job.kind === "doctor"
+          ? Promise.resolve({ exitCode: 0 })
+          : new Promise<{ exitCode?: number }>(() => {}),
+    });
     const driven = new Set<string>();
     try {
       const dir = contractHarness(t);
@@ -452,6 +662,20 @@ describe("UI route contract", () => {
         }
         if (opts.readsKey !== undefined) assertViewReads(opts.readsKey, body);
         return body;
+      };
+
+      /** Drive a `stream: "sse"` route: the body is text/event-stream, so
+       *  it is read as TEXT and asserted on its frame grammar. */
+      const driveSse = async (key: string, params: Record<string, string>): Promise<string> => {
+        const route = ROUTES[key];
+        if (route === undefined) throw new Error(`route "${key}" missing from routes.js`);
+        if (route.stream !== "sse") throw new Error(`route "${key}" is not marked stream:"sse"`);
+        driven.add(key);
+        const { status, text } = await t.apiText(fill(route.path, params), {
+          method: route.method,
+        });
+        if (status !== 200) throw new Error(`${key}: expected 200, got ${status}`);
+        return text;
       };
 
       // -- registration (write + effect) ----------------------------------
@@ -499,6 +723,107 @@ describe("UI route contract", () => {
       expect(afterWrites["tags"]).toEqual(["blue", "canary"]);
       expect(afterWrites["notes"]).toBe("contract note");
       expect(afterWrites["groups"]).toEqual(["prod"]);
+
+      // -- M2 reads ---------------------------------------------------------
+      const proc0 = await drive("proc", { id }, { readsKey: "proc" });
+      expect(proc0["state"]).toBe("stopped");
+      // The F-5 stamp is present and does NOT match the spec, so the answer
+      // is the EXACT one — never the mtime approximation.
+      expect(
+        (proc0["bundle"] as { freshness: { state: string; exact: boolean } }).freshness,
+      ).toMatchObject({ state: "stale", exact: true });
+      const runsBody = await drive("runs", { id }, { readsKey: "runs" });
+      expect((runsBody["runs"] as Array<{ runId: string }>)[0]?.runId).toBe(SEEDED_RUN);
+      const runBody = await drive("run", { id, runId: SEEDED_RUN }, { readsKey: "run" });
+      expect(runBody["live"]).toBe(false);
+      await drive("schedulers", { id }, { readsKey: "schedulers" });
+      await drive("deployments", { id }, { readsKey: "deployments" });
+      await drive("approvals", {}, { query: "?all=1", readsKey: "approvals" });
+      await drive("review", {}, { readsKey: "review" });
+      await drive("activity", {}, { query: "?since=30d", readsKey: "activity" });
+
+      // A closed run's stream replays its durable history and terminates.
+      const sse = await driveSse("runEvents", { id, runId: SEEDED_RUN });
+      expect(sse).toContain("event: replay");
+      expect(sse.trimEnd().endsWith("}")).toBe(true);
+      expect(sse).toContain("event: done");
+
+      // -- M2 process control (write + observable state change) -------------
+      const started = await drive("procStart", { id }, { body: {} });
+      expect(started["ok"]).toBe(true);
+      expect(((await drive("proc", { id })) as { state: string }).state).toBe("running");
+      await drive("procRestart", { id }, { body: { force: true } });
+      expect(((await drive("proc", { id })) as { state: string }).state).toBe("running");
+      // Drain with no control plane degrades to the signal path, honestly.
+      const drained = await drive("procDrain", { id }, { body: {} });
+      expect(drained["viaSignal"]).toBe(true);
+      await drive("procStart", { id }, { body: {} });
+      const stopped = await drive("procStop", { id }, { body: {} });
+      expect(stopped["stopped"]).toBe(true);
+      expect(((await drive("proc", { id })) as { state: string }).state).toBe("stopped");
+
+      // -- M2 control.v1 proxy: no port ⇒ typed unavailable, not an error ---
+      const controlCases: ReadonlyArray<readonly [string, unknown]> = [
+        ["controlStatus", undefined],
+        ["controlWake", { lane: "heartbeat" }],
+        ["controlDrain", {}],
+      ];
+      for (const [key, body] of controlCases) {
+        const answer = await drive(
+          key,
+          { id },
+          { ...(body !== undefined ? { body } : {}), readsKey: "controlStatus" },
+        );
+        expect(answer["ok"]).toBe(false);
+        expect(answer["code"]).toBe("no_control_port");
+        expect(answer["expected"]).toBe(true);
+      }
+
+      // -- M2 inboxes: grant + deny + adjudicate, each visible on re-read ---
+      await drive("grantApproval", { id, apprId: "appr_00000000000000a1" }, { body: {} });
+      await drive("denyApproval", { id, apprId: "appr_00000000000000a2" }, { body: {} });
+      const settled = (await drive("approvals", {}, { query: "?all=1" }))["approvals"] as Array<{
+        id: string;
+        status: string;
+      }>;
+      expect(settled.find((a) => a.id === "appr_00000000000000a1")?.status).toBe("granted");
+      expect(settled.find((a) => a.id === "appr_00000000000000a2")?.status).toBe("denied");
+
+      await drive(
+        "adjudicateReview",
+        { id, itemId: "rev_quarantine_smoke_s1" },
+        { body: { verdict: "pass", note: "reviewed" } },
+      );
+      const reviewAfter = (await drive("review", {}, { query: "?all=1" }))["items"] as Array<{
+        id: string;
+        status: string;
+      }>;
+      expect(reviewAfter.find((i) => i.id === "rev_quarantine_smoke_s1")?.status).toBe("resolved");
+
+      // -- M2 action faces --------------------------------------------------
+      await drive("pinSession", { id, sess: "sess_00000000000000aa" }, { body: { pinned: true } });
+      const sessionsAfter = await drive("sessions", { id });
+      expect(sessionsAfter["pins"]).toEqual(["sess_00000000000000aa"]);
+
+      await drive("pinBaseline", { id }, { body: { runId: "run_00000000000000aa" } });
+      const evalsAfter = await drive("evals", { id });
+      expect(
+        (evalsAfter["baselines"] as Record<string, { runId: string }>)["contract-harness::smoke"]
+          ?.runId,
+      ).toBe("run_00000000000000aa");
+
+      // -- M2 jobs: submit through the queue, visible in the queue view ------
+      // One job that FINISHES and one that is still going, because the panel
+      // has two halves and the contract must cover both: `recent` is the
+      // only surface a completed — or `interrupted` — job ever appears on.
+      const job = await drive("submitJob", { id }, { body: { kind: "doctor" }, expectStatus: 202 });
+      expect((job["job"] as { kind: string }).kind).toBe("doctor");
+      await t.server.processes.jobs.idle();
+      await drive("submitJob", { id }, { body: { kind: "eval" }, expectStatus: 202 });
+      const queue = await drive("jobs", {}, { readsKey: "jobs" });
+      expect((queue["recent"] as Array<{ kind: string }>).some((j) => j.kind === "doctor")).toBe(
+        true,
+      );
 
       // -- scan root + scan (effect: the root is scanned, entries refresh) --
       await drive("addScanRoot", {}, { body: { dir: t.harnessesRoot }, expectStatus: 201 });

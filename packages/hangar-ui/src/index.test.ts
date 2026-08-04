@@ -32,6 +32,28 @@ describe("embed map completeness", () => {
     expect(files).toContain("js/app.js");
   });
 
+  test("every M2 screen ships as an embedded module with the js content type", () => {
+    const m2 = [
+      "/assets/js/supervision.js",
+      "/assets/js/views/proc.js",
+      "/assets/js/views/runs.js",
+      "/assets/js/views/control.js",
+      "/assets/js/views/schedulers.js",
+      "/assets/js/views/approvals.js",
+      "/assets/js/views/review.js",
+      "/assets/js/views/inbox.js",
+      "/assets/js/views/activity.js",
+      "/assets/js/views/jobs.js",
+      "/assets/js/views/deploy.js",
+    ];
+    for (const key of m2) {
+      const entry = hangarAssets[key];
+      expect(`${key}:${entry !== undefined}`).toBe(`${key}:true`);
+      expect(`${key}:${entry?.contentType}`).toBe(`${key}:text/javascript; charset=utf-8`);
+      expect(`${key}:${(entry?.body.length ?? 0) > 0}`).toBe(`${key}:true`);
+    }
+  });
+
   test("every file under assets/ is embedded under its serve path with exact bytes", () => {
     for (const rel of files) {
       const key = servePathFor(rel);
@@ -117,6 +139,21 @@ describe("js module hygiene", () => {
   test("no innerHTML anywhere (injection-safe DOM building only)", () => {
     for (const [key, entry] of jsEntries) {
       expect(`${key}:${entry.body.includes("innerHTML")}`).toBe(`${key}:false`);
+    }
+  });
+
+  test("no markup-string assignment of any kind (the ban is wider than innerHTML)", () => {
+    // Built from parts so this test file cannot itself trip a scanner.
+    const banned = [
+      "outer" + "HTML",
+      "insertAdjacent" + "HTML",
+      "document." + "write",
+      "createContextual" + "Fragment",
+    ];
+    for (const [key, entry] of jsEntries) {
+      for (const needle of banned) {
+        expect(`${key}:${needle}:${entry.body.includes(needle)}`).toBe(`${key}:${needle}:false`);
+      }
     }
   });
 
