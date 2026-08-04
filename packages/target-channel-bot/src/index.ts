@@ -1,4 +1,13 @@
 import { CrewhausError } from "@crewhaus/errors";
+import {
+  renderControlDrain,
+  renderControlImports,
+  renderControlLane,
+  renderControlPlaneBoot,
+  renderControlStart,
+  renderControlTimer,
+  renderPublicGateFetch,
+} from "@crewhaus/gateway-protocol/control-codegen";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import {
   type Bundle,
@@ -1405,14 +1414,15 @@ async function resolveReactionJoin(
     ? "await sendReplyWithJoin(adapter, event, approval.sessionId, reply);"
     : "await adapter.sendReply({ event, text: reply });";
 
-  // Gateway status counters — the /status endpoint (daemon.ts) reports a
-  // turnCount, so the router signals each completed agent turn back to the
-  // daemon via an optional onTurnComplete callback. Gated on `gateway:` so a
-  // gateway-less channel bundle stays byte-identical (no field, no call).
-  const countersOn = ir.gateway !== undefined;
-  const countersConfigField = countersOn ? "\n  onTurnComplete?: () => void;" : "";
+  // Turn counters — the router signals each completed agent turn back to the
+  // daemon through an optional onTurnComplete callback. It used to be gated on
+  // `gateway:`; crewhaus.control.v1 made it unconditional, because
+  // `/control/v1/status` reports `counters.turns` on EVERY daemon shape and a
+  // counter that only exists when an optional spec block is present would make
+  // the control surface lie about a gateway-less bot.
+  const countersConfigField = "\n  onTurnComplete?: () => void;";
   // Emitted after each successful runTurn (inbound handle + approval resume).
-  const turnCompleteCall = countersOn ? "\n        config.onTurnComplete?.();" : "";
+  const turnCompleteCall = "\n        config.onTurnComplete?.();";
 
   // G11 — when `permissions.ask_mode` is "pause" (the default; only "deny"
   // opts out) a tool ask on this non-interactive surface PARKS a pending
@@ -2054,9 +2064,13 @@ registerChannelAdapter("imessage", imessageAdapter);`);
   // an agent turn per tick. Each tick runs in a fresh session so the
   // heartbeat history doesn't accumulate (the "wake, decide, act, sleep"
   // pattern). Errors are logged but don't crash the daemon.
-  const heartbeatImport = ir.heartbeat
-    ? `import { randomBytes as __hbRandomBytes } from "node:crypto";\n`
-    : "";
+  //
+  // crewhaus.control.v1 — the tick BODY is registered as a control lane, so
+  // `POST /control/v1/wake {lane:"heartbeat"}` runs this exact function with
+  // this exact prompt (no second code path to drift), the lane mints the
+  // fresh session id for both callers, and a poke arriving mid-tick is
+  // refused with 409 instead of overlapping the timer's own fire.
+  const heartbeatImport = "";
   // v0.3.0 — with continuity on, heartbeat ticks read the daemon's own
   // agenda: `spec`-scoped continuity instead of a throwaway per-tick
   // session store (§2.7/§14.5).
@@ -2078,29 +2092,39 @@ registerChannelAdapter("imessage", imessageAdapter);`);
   // Phase 3 §3.1 — heartbeat scheduled wake
   const __heartbeatInstructions = ${escapeJsonString(hbInstructions)};
   let __heartbeatTick = 0;
-  const __heartbeatTimer = setInterval(async () => {
-    __heartbeatTick++;${ir.gateway ? "\n    __heartbeatCount++; // gateway /status wake counter (heartbeat + schedule)" : ""}
-    const __sessionId = \`sess_\${__hbRandomBytes(8).toString("hex")}\`;
-    process.stdout.write(\`[heartbeat] tick #\${__heartbeatTick} (session \${__sessionId})\\n\`);
-    try {
-      const __out = await agent.runTurn({
-        sessionId: __sessionId,
-        isNew: true,
-        message: __heartbeatInstructions,${hbScopeField}
-      });
-      const __preview = __out.length > 200 ? __out.slice(0, 200) + "…" : __out;
-      process.stdout.write(\`[heartbeat] → \${__preview}\\n\`);
-    } catch (__err) {
-      // v0.3.0 Goal 6 — a classified terminal failure (billing/auth/…)
-      // renders its full structured report; anything else keeps the bare
-      // line. Either way the daemon keeps running — a failed tick must
-      // not kill the scheduler.
-      if (isRunFailedError(__err)) {
-        process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[heartbeat]" })}\\n\`);
-      } else {
-        process.stderr.write(\`[heartbeat] error: \${(__err as Error).message}\\n\`);
-      }
-    }
+${renderControlLane({
+  lane: "heartbeat",
+  varName: "__heartbeatLane",
+  cadence: `every ${ir.heartbeat.everyMs}ms`,
+  everyMs: ir.heartbeat.everyMs,
+  indent: "  ",
+  body: `__heartbeatTick++;${ir.gateway ? "\n__heartbeatCount++; // gateway /status wake counter (heartbeat + schedule)" : ""}
+const __sessionId = __tick.sessionId;
+const __origin = __tick.synthetic !== undefined ? \` (synthetic: \${__tick.synthetic.reason})\` : "";
+process.stdout.write(\`[heartbeat] tick #\${__heartbeatTick}\${__origin} (session \${__sessionId})\\n\`);
+try {
+  const __out = await agent.runTurn({
+    sessionId: __sessionId,
+    isNew: true,
+    message: __heartbeatInstructions,${hbScopeField.replace(/\n {8}/g, "\n    ")}
+  });
+  const __preview = __out.length > 200 ? __out.slice(0, 200) + "…" : __out;
+  process.stdout.write(\`[heartbeat] → \${__preview}\\n\`);
+} catch (__err) {
+  // v0.3.0 Goal 6 — a classified terminal failure (billing/auth/…)
+  // renders its full structured report; anything else keeps the bare
+  // line. Rethrown so the control lane records this tick's outcome as
+  // \`error\` for /control/v1/status; the lane absorbs it there, so a
+  // failed tick still never kills the scheduler.
+  if (isRunFailedError(__err)) {
+    process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[heartbeat]" })}\\n\`);
+  } else {
+    process.stderr.write(\`[heartbeat] error: \${(__err as Error).message}\\n\`);
+  }
+  throw __err;
+}`,
+})}  const __heartbeatTimer = setInterval(() => {
+    void __heartbeatLane.tick();
   }, ${ir.heartbeat.everyMs});
   process.stdout.write(\`[heartbeat] enabled every ${ir.heartbeat.everyMs}ms\\n\`);
 `
@@ -2116,36 +2140,56 @@ registerChannelAdapter("imessage", imessageAdapter);`);
   // crashes the daemon. Absent `schedule:` emits NOTHING, so unscheduled
   // channel bundles stay byte-identical.
   const scheduleImport = ir.schedule
-    ? `import { armSchedule } from "@crewhaus/durable-execution";\nimport { randomBytes as __schedRandomBytes } from "node:crypto";\n`
+    ? `import { armSchedule, nextWakeDelayMs } from "@crewhaus/durable-execution";\n`
     : "";
   const schedScopeField =
-    ir.schedule && ir.continuity !== undefined ? `\n          continuityScope: "spec",` : "";
+    ir.schedule && ir.continuity !== undefined ? `\n    continuityScope: "spec",` : "";
   const scheduleBoot = ir.schedule
     ? `
   // Loop contract 0.4 (Batch F) — schedule: wake loop (cron|interval + jitter)
   const __scheduleInstructions = ${escapeJsonString(ir.schedule.instructions ?? "[scheduled wake] proceed with your standing instructions.")};
+  const __scheduleSpec = ${wakeScheduleLiteral(ir.schedule)} as const;
   let __scheduleTick = 0;
-  const __schedule = armSchedule(${wakeScheduleLiteral(ir.schedule)}, {
+${renderControlLane({
+  lane: "schedule",
+  varName: "__scheduleLane",
+  cadence: describeSchedule(ir.schedule),
+  // Unlike a heartbeat, a schedule's next fire IS computable offline — this
+  // reports the same arithmetic armSchedule itself uses (jitter aside).
+  nextDueAtExpr: "new Date(Date.now() + nextWakeDelayMs(__scheduleSpec, Date.now())).toISOString()",
+  indent: "  ",
+  body: `__scheduleTick++;${ir.gateway ? "\n__heartbeatCount++; // gateway /status wake counter (heartbeat + schedule)" : ""}
+const __sessionId = __tick.sessionId;
+const __origin = __tick.synthetic !== undefined ? \` (synthetic: \${__tick.synthetic.reason})\` : "";
+process.stdout.write(\`[schedule] wake #\${__scheduleTick}\${__origin} (session \${__sessionId})\\n\`);
+try {
+  const __out = await agent.runTurn({
+    sessionId: __sessionId,
+    isNew: true,
+    message: __scheduleInstructions,${schedScopeField}
+  });
+  const __preview = __out.length > 200 ? __out.slice(0, 200) + "…" : __out;
+  process.stdout.write(\`[schedule] → \${__preview}\\n\`);
+} catch (__err) {
+  // A classified terminal failure renders its full report; anything else
+  // keeps the bare line. Rethrown so the control lane records the wake's
+  // outcome as \`error\` for /control/v1/status; the lane absorbs it there,
+  // so the daemon keeps serving and armSchedule still re-arms.
+  if (isRunFailedError(__err)) {
+    process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[schedule]" })}\\n\`);
+  } else {
+    process.stderr.write(\`[schedule] error: \${(__err as Error).message}\\n\`);
+  }
+  throw __err;
+}`,
+})}  const __schedule = armSchedule(__scheduleSpec, {
     onWake: async () => {
-      __scheduleTick++;${ir.gateway ? "\n      __heartbeatCount++; // gateway /status wake counter (heartbeat + schedule)" : ""}
-      const __sessionId = \`sess_\${__schedRandomBytes(8).toString("hex")}\`;
-      process.stdout.write(\`[schedule] wake #\${__scheduleTick} (session \${__sessionId})\\n\`);
-      const __out = await agent.runTurn({
-        sessionId: __sessionId,
-        isNew: true,
-        message: __scheduleInstructions,${schedScopeField}
-      });
-      const __preview = __out.length > 200 ? __out.slice(0, 200) + "…" : __out;
-      process.stdout.write(\`[schedule] → \${__preview}\\n\`);
+      await __scheduleLane.tick();
     },
     onError: (__err) => {
-      // A classified terminal failure renders its full report; anything else
-      // keeps the bare line. Either way the daemon keeps serving.
-      if (isRunFailedError(__err)) {
-        process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[schedule]" })}\\n\`);
-      } else {
-        process.stderr.write(\`[schedule] error: \${(__err as Error).message}\\n\`);
-      }
+      // Defensive: the lane already renders + absorbs a failed wake, so this
+      // only fires for an armSchedule-internal fault.
+      process.stderr.write(\`[schedule] error: \${(__err as Error).message}\\n\`);
     },
   });
   process.stdout.write(${escapeJsonString(`[schedule] armed (${describeSchedule(ir.schedule)})\n`)});
@@ -2323,7 +2367,62 @@ ${
   // endpoint (gatewayBoot) is their only reader, so both are gated on
   // `gateway:` — a gateway-less bundle declares nothing and stays unchanged.
   const gatewayCounters = ir.gateway ? "  let __turnCount = 0;\n  let __heartbeatCount = 0;\n" : "";
-  const sessionRouterCountersField = ir.gateway ? ", onTurnComplete: () => { __turnCount++; }" : "";
+  // control.v1's `counters.turns` is bumped on every completed turn regardless
+  // of `gateway:` — the control plane is the lowest common denominator every
+  // daemon shape serves, so its counters can never be gated on an optional
+  // spec block.
+  const sessionRouterCountersField = `, onTurnComplete: () => { ${
+    ir.gateway ? "__turnCount++; " : ""
+  }__control.counters.turns++; }`;
+
+  // crewhaus.control.v1 (§ the daemon control API). Emitted into EVERY
+  // daemon-shape bundle from the shared gateway-protocol renderers, so the
+  // five shapes serve one identical surface. The plane is constructed here —
+  // after the audit sink and approval store exist, before the lanes register —
+  // and bound at the very end of main(), once every lane and drain step is in.
+  const controlPlaneBoot = renderControlPlaneBoot({
+    name: ir.name,
+    target: "channel",
+    indent: "  ",
+    channelsExpr: JSON.stringify(
+      Object.keys(ir.channels).filter(
+        (k) => (ir.channels as Record<string, unknown>)[k] !== undefined,
+      ),
+    ),
+    ...(approvalsOn
+      ? {
+          // countPendingApprovals reads the ledger; `store.list()` would
+          // COMPACT it as a side-effect (the SessionStore.list() trap), and a
+          // polled status endpoint must never rewrite operator state.
+          pendingApprovalsExpr: `countPendingApprovals(join(__approvalRoot ?? ".crewhaus/sessions", "approvals.jsonl"))`,
+        }
+      : {}),
+    auditLogExpr: "__securityAudit",
+  });
+  const controlJanitorTimer = renderControlTimer({
+    indent: "  ",
+    expr:
+      '{ lane: "janitor", cadence: `every ${__janitorIntervalMs}ms`, ' +
+      '...(__janitorLastRunAt !== undefined ? { lastFiredAt: __janitorLastRunAt, lastOutcome: "ok" } : {}) }',
+  });
+  // Drain: intake is already shedding 503 + Retry-After (the public gate flips
+  // the moment the request lands); these steps wait out the work already
+  // accepted, flush the janitor, and close every listener before exit 0.
+  const controlDrain = renderControlDrain({
+    indent: "  ",
+    body: `process.stdout.write("[daemon] draining — intake stopped\\n");
+__janitor.stop();${ir.heartbeat ? "\nclearInterval(__heartbeatTimer);" : ""}${
+      ir.schedule ? "\n__schedule.cancel();" : ""
+    }
+await __janitor.runOnce();
+// GRACEFUL stop (no closeActiveConnections): a channel turn runs INSIDE the
+// webhook request that carried it, so forcing connections shut here would
+// abort exactly the in-flight turns a drain exists to finish.
+await server.stop();${ir.gateway ? "\nawait __gatewayServer.stop();" : ""}${
+      mcp.hasAny ? `\n${mcp.cleanupBlock}` : ""
+    }`,
+  });
+  const controlStart = renderControlStart({ indent: "  " });
   return `#!/usr/bin/env bun
 // Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: channel, ir version: ${ir.version}, file: daemon.ts)
@@ -2339,7 +2438,7 @@ import { createDedupStore } from "@crewhaus/durable-state";
 import { createJanitor } from "@crewhaus/runtime-core";
 ${distill.imports}import { openAuditLog } from "@crewhaus/audit-log";
 import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
-${approvalsImport}import { join } from "node:path";
+${approvalsImport}${renderControlImports({ pendingApprovals: approvalsOn })}import { join } from "node:path";
 
 ${startupEnvCheck}${observabilityEnvStamp}
 async function main(): Promise<void> {
@@ -2350,7 +2449,7 @@ async function main(): Promise<void> {
 ${adapterConstructBlock}
 
 ${extensionBoot}${specHooksBoot}${auditApprovalsBoot}
-${registerBlock}${mcpBoot}${subAgentBoot}${knowledgeBoot}
+${controlPlaneBoot}${registerBlock}${mcpBoot}${subAgentBoot}${knowledgeBoot}
   // Loop contract 0.4 (Batch E, G78) — per-spec cross-run prompt-cache
   // rotation store (§2.5). One small JSON record under
   // .crewhaus/prompt-cache/<spec>.json survives restarts so the daemon reuses
@@ -2399,16 +2498,30 @@ ${dreamBoot}${distill.boot}  const __janitor = createJanitor({
     sessionTtlDays: __retentionTtlDays,
     pinnedSessionIds: __retentionPins,${dreamStepsField}
   });
+  // control.v1 reports the janitor as a read-only timer lane; per-run
+  // outcomes past the boot run are recovered from the captured [janitor] log
+  // lines (createJanitor exposes no per-tick callback).
+  const __janitorIntervalMs = Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000);
+  let __janitorLastRunAt: string | undefined;
   if (process.env["CREWHAUS_JANITOR"] !== "0") {
     const __janitorReport = await __janitor.runOnce();
+    __janitorLastRunAt = new Date().toISOString();
+    __control.counters.janitorRuns++;
     process.stdout.write(\`[janitor] \${JSON.stringify(__janitorReport.steps)}\\n\`);
-    __janitor.start(Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000));
+    __janitor.start(__janitorIntervalMs);
   }
-
+${controlJanitorTimer}
   const port = Number(process.env["PORT"] ?? 3000);
-  const server = Bun.serve({ port, fetch: (req) => gateway.handle(req) });
+  // The PUBLIC port additionally answers a bare, unauthenticated GET /healthz
+  // (liveness only, no state — what PaaS scaffolds have been health-checking
+  // against nothing) and sheds every other request with 503 + Retry-After once
+  // control.v1 drain has been requested. Control itself is NEVER on this port.
+  const server = Bun.serve({
+    port,
+    fetch: ${renderPublicGateFetch({ innerExpr: "(req: Request) => gateway.handle(req)" })},
+  });
   process.stdout.write(\`[daemon] listening on http://localhost:\${server.port}\\n\`);
-${gatewayBoot}${heartbeatBoot}${scheduleBoot}
+${gatewayBoot}${heartbeatBoot}${scheduleBoot}${controlDrain}${controlStart}
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;

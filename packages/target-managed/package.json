@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
+    "@crewhaus/gateway-protocol": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*",
     "@crewhaus/memory-service": "workspace:*"

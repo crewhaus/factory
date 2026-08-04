@@ -526,3 +526,55 @@ describe("emitCrew — headless ask parking (loop contract 0.4, G11)", () => {
     );
   });
 });
+
+/**
+ * crewhaus.control.v1 (upstream F-4). The crew daemon is a ONE-SHOT — it
+ * consumes stdin, runs the crew and exits — so it arms no pokeable lane;
+ * `/control/v1/wake` answers 404 lane_not_armed at runtime. What control.v1
+ * adds is the uniform observe + graceful-finish surface every daemon shape
+ * serves.
+ */
+describe("emitCrew — crewhaus.control.v1", () => {
+  const daemon = (i: IrCrewV0 = minimalIr): string =>
+    emitCrew(i, { readme: false }).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+
+  test("the runtime comes from the shared module and binds before stdin is read", () => {
+    const d = daemon();
+    expect(d).toContain('import { createControlPlane } from "@crewhaus/gateway-protocol/control";');
+    expect(d).toContain('target: "crew",');
+    expect(d.indexOf("await __control.start();")).toBeLessThan(
+      d.indexOf("const input = await readAllStdin();"),
+    );
+  });
+
+  test("control calls append to the harness-wide hash-chained audit log", () => {
+    const d = daemon();
+    expect(d).toContain("await openAuditLog({ rootDir: `${process.cwd()}/.crewhaus/audit` })");
+    expect(d).toContain("const __log = __controlAudit;");
+  });
+
+  test("a one-shot shape arms no lane", () => {
+    expect(daemon()).not.toContain("__control.lane({");
+  });
+
+  test("drain lets the in-flight run finish instead of truncating it", () => {
+    const d = daemon();
+    expect(d).toContain("let __crewRunning = false;");
+    expect(d).toContain("__crewRunning = true;");
+    const step = d.slice(d.indexOf("__control.onDrain("), d.indexOf("await __control.start();"));
+    expect(step).toContain(
+      "while (__crewRunning) await new Promise((__r) => setTimeout(__r, 100));",
+    );
+    // Declared once, then cleared on BOTH exits — the classified-failure path
+    // and the clean one.
+    expect(d.split("__crewRunning = false;").length - 1).toBe(3);
+  });
+
+  test("counters.turns is bumped once per completed crew run", () => {
+    const d = daemon();
+    const doneIdx = d.indexOf('if (ev.kind === "crew_done")');
+    expect(doneIdx).toBeGreaterThan(-1);
+    expect(d.slice(doneIdx)).toContain("__control.counters.turns++;");
+    expect(d.split("__control.counters.turns++;").length - 1).toBe(1);
+  });
+});

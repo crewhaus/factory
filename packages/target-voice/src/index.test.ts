@@ -154,3 +154,46 @@ describe("emitVoice — tools ignored-note (G33 short-term)", () => {
     }
   });
 });
+
+/**
+ * crewhaus.control.v1 (upstream F-4). The v0 voice daemon runs ONE headless
+ * call and exits, so it arms no pokeable lane; control.v1 is the uniform
+ * observe + graceful-finish surface every daemon shape serves.
+ */
+describe("emitVoice — crewhaus.control.v1", () => {
+  const daemon = (): string =>
+    emitVoice(baseIr, { readme: false }).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+
+  test("the runtime comes from the shared module, bound before the call starts", () => {
+    const d = daemon();
+    expect(d).toContain('import { createControlPlane } from "@crewhaus/gateway-protocol/control";');
+    expect(d).toContain('target: "voice",');
+    expect(d).toContain('name: "hello-voice",');
+    expect(d.indexOf("await __control.start();")).toBeLessThan(
+      d.indexOf("const args = process.argv"),
+    );
+  });
+
+  test("control calls append to the harness-wide hash-chained audit log", () => {
+    const d = daemon();
+    expect(d).toContain("await openAuditLog({ rootDir: `${process.cwd()}/.crewhaus/audit` })");
+    expect(d).toContain("const __log = __controlAudit;");
+  });
+
+  test("a one-shot shape arms no lane", () => {
+    expect(daemon()).not.toContain("__control.lane({");
+  });
+
+  test("drain waits out the in-flight call, and the listener closes on every exit", () => {
+    const d = daemon();
+    expect(d).toContain("let __callInFlight = false;");
+    expect(d).toContain("__callInFlight = true;");
+    expect(d).toContain("} finally {\n    __callInFlight = false;\n  }");
+    const step = d.slice(d.indexOf("__control.onDrain("), d.indexOf("await __control.start();"));
+    expect(step).toContain(
+      "while (__callInFlight) await new Promise((__r) => setTimeout(__r, 100));",
+    );
+    // Both the smoke path and the no-args path release the control port.
+    expect(d.split("await __control.stop();").length - 1).toBe(2);
+  });
+});

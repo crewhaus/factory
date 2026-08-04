@@ -2035,7 +2035,10 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // them — synthesize the pinned manifest so `bun install` in the out-dir
   // makes the emitted entrypoint runnable standalone. (The cf-worker
   // emitters ship their own package.json; a user-authored one is kept.)
-  const manifest = ensureBundleManifest(bundle.files, absOut);
+  // F-5 — the manifest carries the SOURCE SPEC's hash + the compiling
+  // crewhaus version, so a manager can tell "bundle is stale vs crewhaus.yaml"
+  // exactly instead of guessing from mtimes.
+  const manifest = ensureBundleManifest(bundle.files, absOut, { specYaml: yamlText });
   if (manifest.action === "wrote") {
     process.stdout.write(`wrote ${manifest.path}\n`);
   } else if (manifest.action === "kept") {
@@ -2116,7 +2119,9 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     }
     // The eval bridge is its own local bundle in <out-dir>/eval/ — it needs
     // its own manifest for the same standalone-run reason as the primary.
-    const evalManifest = ensureBundleManifest(evalBundle.files, evalOut);
+    // The eval bridge is projected FROM this same spec, so it carries the same
+    // stamp: recompiling the primary bundle is what refreshes both.
+    const evalManifest = ensureBundleManifest(evalBundle.files, evalOut, { specYaml: yamlText });
     if (evalManifest.action === "wrote") {
       process.stdout.write(`wrote ${evalManifest.path}\n`);
     } else if (evalManifest.action === "kept") {

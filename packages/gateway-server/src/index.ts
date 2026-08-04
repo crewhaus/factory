@@ -358,6 +358,20 @@ export type CreateGatewayServerOptions = {
    * (behaviour-preserving for a non-federated gateway).
    */
   readonly federation?: GatewayFederationConfig;
+  /**
+   * `crewhaus.control.v1` — the PUBLIC-port gate, consulted before every other
+   * route under `listen()`. The control plane's `publicGate` returns a
+   * `Response` for the bare unauthenticated `GET /healthz` liveness check (the
+   * check deployment scaffolds declare and no daemon served), and — once a
+   * `POST /control/v1/drain` has landed — a `503` + `Retry-After` for
+   * everything else, so intake stops while in-flight turns finish.
+   *
+   * Returning `undefined` falls through to the normal routing, so a gateway
+   * without a control plane behaves exactly as before this seam existed. The
+   * CONTROL routes themselves are never served here: they live on their own
+   * loopback-bound port.
+   */
+  readonly publicGate?: (req: Request) => Response | undefined;
 };
 
 export type UsageDelta = {
@@ -669,6 +683,12 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
         port,
         hostname: host,
         fetch: async (req): Promise<Response> => {
+          // control.v1 — liveness + drain shed, BEFORE anything reads a body:
+          // a draining daemon must refuse new work without first parsing it,
+          // and `/healthz` must answer even while draining or a PaaS reaps the
+          // process mid-drain.
+          const gated = opts.publicGate?.(req);
+          if (gated !== undefined) return gated;
           // Item 2 (G31) — the federation surface is served OUTSIDE the JWT
           // plane (peers authenticate via mTLS, not the tenant bearer). Route
           // it first so a federation request never hits the JSON-RPC decoder.

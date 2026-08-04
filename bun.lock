@@ -876,6 +876,7 @@
       "version": "0.4.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
         "zod": "^3.23.8",
       },
     },
@@ -1001,6 +1002,15 @@
       "version": "0.4.2",
       "dependencies": {
         "@crewhaus/watchme-store": "workspace:*",
+      },
+    },
+    "packages/harness-supervisor": {
+      "name": "@crewhaus/harness-supervisor",
+      "version": "0.4.2",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/harness-inventory": "workspace:*",
+        "@crewhaus/preflight": "workspace:*",
       },
     },
     "packages/helm-chart": {
@@ -1665,6 +1675,7 @@
       "version": "0.4.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
       },
@@ -1725,6 +1736,7 @@
       "version": "0.4.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
@@ -1788,6 +1800,7 @@
       "version": "0.4.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
@@ -1821,6 +1834,7 @@
       "version": "0.4.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
@@ -1868,6 +1882,7 @@
       "version": "0.4.2",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
       },
@@ -2639,6 +2654,8 @@
     "@crewhaus/harness-inventory": ["@crewhaus/harness-inventory@workspace:packages/harness-inventory"],
 
     "@crewhaus/harness-registry": ["@crewhaus/harness-registry@workspace:packages/harness-registry"],
+
+    "@crewhaus/harness-supervisor": ["@crewhaus/harness-supervisor@workspace:packages/harness-supervisor"],
 
     "@crewhaus/helm-chart": ["@crewhaus/helm-chart@workspace:packages/helm-chart"],
 

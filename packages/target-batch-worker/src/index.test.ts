@@ -82,13 +82,17 @@ describe("emitBatchWorker", () => {
     // Boot-time runOnce, env kill-switch, and configurable hourly interval.
     expect(code).toContain('process.env["CREWHAUS_JANITOR"] !== "0"');
     expect(code).toContain("await janitor.runOnce()");
+    // control.v1 hoisted the interval into a named const so the janitor's
+    // cadence can be reported on /control/v1/status.
     expect(code).toContain(
-      'janitor.start(Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000))',
+      'const __janitorIntervalMs = Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000);',
     );
+    expect(code).toContain("janitor.start(__janitorIntervalMs);");
     // The report goes to stderr so the stdout JSON event stream is untouched.
     expect(code).toContain("process.stderr.write(`[janitor]");
-    // Both the signal path and the queue_idle exit path halt the interval.
-    expect(code.split("janitor.stop();").length - 1).toBe(2);
+    // The signal path, the queue_idle exit path, and the control.v1 drain all
+    // halt the interval.
+    expect(code.split("janitor.stop();").length - 1).toBe(3);
   });
 
   test("janitor honors .crewhaus/retention.json pins + TTL (ops-review F2)", () => {
@@ -197,8 +201,9 @@ describe("emitBatchWorker — env-driven queue adapters (G06, Batch A)", () => {
     const c = emitBatchWorker(withAdapter("sqs")).files[0]?.content ?? "";
     expect(c).not.toContain('"queue_idle"');
     expect(c).toContain("const keepAliveMs = 200;");
-    // Only the signal path stops the janitor now.
-    expect(c.split("janitor.stop();").length - 1).toBe(1);
+    // No queue_idle path here — only the signal path and the control.v1 drain
+    // stop the janitor.
+    expect(c.split("janitor.stop();").length - 1).toBe(2);
   });
 
   test("the in-memory queue_idle fast-exit is untouched (byte-identity guard)", () => {
@@ -248,7 +253,8 @@ describe("emitBatchWorker — mcp_servers wiring (G05, Batch A)", () => {
 
   test("disconnects on BOTH exit paths: signal shutdown and queue_idle", () => {
     const c = emitBatchWorker(irMcp).files[0]?.content ?? "";
-    expect(c.split("await mcpHost.disconnectAll();").length - 1).toBe(2);
+    // Signal shutdown, queue_idle, and the control.v1 drain step.
+    expect(c.split("await mcpHost.disconnectAll();").length - 1).toBe(3);
   });
 
   test("empty mcp_servers emits zero MCP plumbing (byte-identity guard)", () => {
@@ -439,10 +445,17 @@ describe("emitBatchWorker — schedule: wake loop (Batch F, temporal contract)",
 
   test("interval schedule arms armSchedule and enqueues the wake prompt as a job", () => {
     const code = emitBatchWorker(withInterval).files[0]?.content ?? "";
-    expect(code).toContain('import { armSchedule } from "@crewhaus/durable-execution";');
-    expect(code).toContain('armSchedule({"kind":"interval","everyMs":3600000}');
+    expect(code).toContain(
+      'import { armSchedule, nextWakeDelayMs } from "@crewhaus/durable-execution";',
+    );
+    // The literal is bound once (control.v1's /status projects nextDueAt from
+    // the same object) and armed from the binding.
+    expect(code).toContain(
+      'const __scheduleSpec = {"kind":"interval","everyMs":3600000} as const;',
+    );
+    expect(code).toContain("armSchedule(__scheduleSpec, {");
     expect(code).toContain("const jobId = await queue.enqueue(__scheduleInstructions);");
-    expect(code).toContain('emit({ kind: "scheduled_wake", tick: __scheduleTick, jobId });');
+    expect(code).toContain('kind: "scheduled_wake",');
     expect(code).toContain("Reconcile ledgers.");
     expect(code).toContain("__schedule.cancel();");
   });
@@ -456,7 +469,10 @@ describe("emitBatchWorker — schedule: wake loop (Batch F, temporal contract)",
 
   test("cron schedule carries the verbatim cron + jitter (no instructions in the literal)", () => {
     const code = emitBatchWorker(withCron).files[0]?.content ?? "";
-    expect(code).toContain('armSchedule({"kind":"cron","cron":"*/15 * * * *","jitterMs":500}');
+    expect(code).toContain(
+      'const __scheduleSpec = {"kind":"cron","cron":"*/15 * * * *","jitterMs":500} as const;',
+    );
+    expect(code).toContain("armSchedule(__scheduleSpec, {");
     expect(code).toContain('"[scheduled wake]"'); // default prompt when instructions absent
     expect(code).toContain('kind: "schedule_armed"');
   });
@@ -614,5 +630,68 @@ describe("emitBatchWorker — a parked job is reported as awaiting_approval (G11
   test("the emitted bundle still parses", () => {
     const code = emitBatchWorker(ir).files[0]?.content ?? "";
     expect(() => new Bun.Transpiler({ loader: "ts" }).transformSync(code)).not.toThrow();
+  });
+});
+
+/**
+ * crewhaus.control.v1 (upstream F-4). The batch worker has no public HTTP
+ * port, so control.v1 is its ONLY remote surface — and the shape whose drain
+ * semantics already existed (the consumer drains in-flight jobs on SIGTERM);
+ * control.v1 just gives an operator a signal-free way to ask for it.
+ */
+describe("emitBatchWorker — crewhaus.control.v1", () => {
+  const code = (i: IrBatchV0 = baseIr): string =>
+    emitBatchWorker(i, { readme: false }).files[0]?.content ?? "";
+  const scheduled: IrBatchV0 = {
+    ...baseIr,
+    schedule: { kind: "interval", everyMs: 3_600_000, instructions: "Reconcile ledgers." },
+  };
+
+  test("the runtime comes from the shared module and binds after the signal handlers", () => {
+    const c = code();
+    expect(c).toContain('import { createControlPlane } from "@crewhaus/gateway-protocol/control";');
+    expect(c).toContain('target: "batch",');
+    expect(c).toContain("await __control.start();");
+    expect(c.indexOf('process.on("SIGTERM"')).toBeLessThan(c.indexOf("await __control.start();"));
+  });
+
+  test("control calls append to the harness-wide hash-chained audit log", () => {
+    const c = code();
+    expect(c).toContain('import { openAuditLog } from "@crewhaus/audit-log";');
+    expect(c).toContain("await openAuditLog({ rootDir: `${process.cwd()}/.crewhaus/audit` })");
+    expect(c).toContain("const __log = __controlAudit;");
+  });
+
+  test("the schedule enqueue becomes the pokeable lane and marks synthetic wakes", () => {
+    const c = code(scheduled);
+    expect(c).toContain('const __scheduleLane = __control.lane({\n    lane: "schedule",');
+    expect(c).toContain("await __scheduleLane.tick();");
+    expect(c).toContain(
+      "...(__tick.synthetic !== undefined ? { synthetic: true, reason: __tick.synthetic.reason, by: __tick.synthetic.by } : {}),",
+    );
+  });
+
+  test("counters.turns is bumped where the model ran, not on a cache-served re-delivery", () => {
+    const c = code();
+    const handlerStart = c.indexOf("handler: async (input, ctx) => {");
+    const handlerEnd = c.indexOf("concurrency: SPEC_CONCURRENCY,", handlerStart);
+    expect(c.slice(handlerStart, handlerEnd)).toContain("__control.counters.turns++;");
+    // Never inside the observer, where `fromCache` outcomes also land.
+    const obsStart = c.indexOf("onJobEnd:");
+    expect(c.slice(obsStart).includes("__control.counters.turns++;")).toBe(false);
+  });
+
+  test("drain stops intake, cancels the schedule and drains in-flight jobs", () => {
+    const c = code(scheduled);
+    const step = c.slice(c.indexOf("__control.onDrain("), c.indexOf("await __control.start();"));
+    expect(step).toContain("stopping = true;");
+    expect(step).toContain("janitor.stop();");
+    expect(step).toContain("__schedule.cancel();");
+    expect(step).toContain('emit({ kind: "drain_requested", via: "control.v1" });');
+    expect(step).toContain("await consumer.drain();");
+  });
+
+  test("an unscheduled worker arms no lane", () => {
+    expect(code()).not.toContain("__control.lane({");
   });
 });

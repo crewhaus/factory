@@ -4,6 +4,11 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }, { "path": "../infra-utils" }, { "path": "../ir" }],
+  "references": [
+    { "path": "../errors" },
+    { "path": "../gateway-protocol" },
+    { "path": "../infra-utils" },
+    { "path": "../ir" }
+  ],
   "include": ["src/**/*"]
 }

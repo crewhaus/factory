@@ -1263,3 +1263,95 @@ describe("listen — real Bun.serve HTTP surface (loopback)", () => {
     }
   });
 });
+
+/**
+ * `publicGate` — the seam crewhaus.control.v1 uses to put a bare, state-free
+ * `GET /healthz` on the PUBLIC port and to shed intake with 503 + Retry-After
+ * once a drain has been requested. Control routes themselves are never served
+ * here: they live on their own loopback-bound port.
+ */
+describe("publicGate (crewhaus.control.v1 on the public port)", () => {
+  async function withHttp(
+    server: ReturnType<typeof createGatewayServer>,
+    fn: (base: string) => Promise<void>,
+  ): Promise<void> {
+    const { port, close } = await server.listen(0);
+    try {
+      await fn(`http://127.0.0.1:${port}`);
+    } finally {
+      await close();
+    }
+  }
+
+  function gated(gate: (req: Request) => Response | undefined) {
+    const tenantA = buildTenant("tenant-a", { tenantsRoot: tmp });
+    return createGatewayServer({
+      jwtSecret: SECRET,
+      tenantsRoot: tmp,
+      handler: async () => ({ ok: true }),
+      tenantOverrides: { "tenant-a": tenantA },
+      publicGate: gate,
+    });
+  }
+
+  test("a gate Response short-circuits before the body is even read", async () => {
+    const server = gated((req) =>
+      new URL(req.url).pathname === "/healthz"
+        ? Response.json({ ok: true }, { status: 200 })
+        : undefined,
+    );
+    await withHttp(server, async (base) => {
+      const res = await fetch(`${base}/healthz`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+    });
+  });
+
+  test("a draining gate sheds every other request with 503 + Retry-After", async () => {
+    const server = gated((req) =>
+      new URL(req.url).pathname === "/healthz"
+        ? Response.json({ ok: true })
+        : Response.json({ error: "draining" }, { status: 503, headers: { "retry-after": "15" } }),
+    );
+    const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
+    await withHttp(server, async (base) => {
+      const res = await fetch(base, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          protocol: PROTOCOL_VERSION,
+          id: "1",
+          method: "runs.create",
+          params: { spec: "s", input: "hi" },
+        }),
+      });
+      expect(res.status).toBe(503);
+      expect(res.headers.get("retry-after")).toBe("15");
+      // …while liveness keeps answering, or a PaaS reaps the process mid-drain.
+      expect((await fetch(`${base}/healthz`)).status).toBe(200);
+    });
+  });
+
+  test("returning undefined falls through — a gateway without a control plane is unchanged", async () => {
+    let consulted = 0;
+    const server = gated(() => {
+      consulted += 1;
+      return undefined;
+    });
+    const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
+    await withHttp(server, async (base) => {
+      const res = await fetch(base, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          protocol: PROTOCOL_VERSION,
+          id: "1",
+          method: "runs.cancel",
+          params: { runId: "run_1" },
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(consulted).toBe(1);
+    });
+  });
+});

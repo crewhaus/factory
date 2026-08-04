@@ -10,6 +10,8 @@ import {
   idempotencyKey,
   withIdempotency,
 } from "@crewhaus/idempotency-keys";
+import { openAuditLog } from "@crewhaus/audit-log";
+import { createControlPlane } from "@crewhaus/gateway-protocol/control";
 import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
 import { createRunContext, type RunContext } from "@crewhaus/run-context";
 import { createJanitor } from "@crewhaus/runtime-core";
@@ -37,6 +39,26 @@ if (ENV_JWT_SECRET === undefined) {
     `[managed] no CREWHAUS_GATEWAY_JWT_SECRET in env — generated a one-shot dev secret. Export it to re-use:\n  export CREWHAUS_GATEWAY_JWT_SECRET=${JWT_SECRET}`,
   );
 }
+
+// control.v1 — the harness-level (NOT per-tenant) hash-chained audit log every
+// control call appends a `gateway_request` record to. Per-tenant logs stay the
+// record of per-tenant activity; a control call is an operator action against
+// the whole daemon. CREWHAUS_SECURITY_AUDIT=0 opts out.
+const CONTROL_AUDIT =
+  process.env.CREWHAUS_SECURITY_AUDIT === "0"
+    ? undefined
+    : await openAuditLog({ rootDir: `${process.cwd()}/.crewhaus/audit` });
+// crewhaus.control.v1 — the supervisor-facing control plane (§ dedicated
+// port from CREWHAUS_CONTROL_PORT, bearer from CREWHAUS_CONTROL_TOKEN or a
+// boot-minted .crewhaus/run/control-token). Unset port ⇒ no socket opens.
+const __control = createControlPlane({
+  name: "pin-managed",
+  target: "managed",
+  audit: async (__rec) => {
+    const __log = CONTROL_AUDIT;
+    if (__log !== undefined) await __log.append(__rec);
+  },
+});
 
 const TENANT_OVERRIDES: Record<string, Partial<Tenant>> = {
   "tenant-pin": { id: "tenant-pin", budget: { maxInputTokens: 100000, maxOutputTokens: 20000 } }
@@ -99,11 +121,20 @@ const janitor = createJanitor({
   sessionTtlDays: RETENTION_TTL_DAYS,
   pinnedSessionIds: RETENTION_PINS,
 });
+// control.v1 reports the janitor as a read-only timer lane; per-run outcomes
+// past the boot run come from the captured [managed] janitor log lines
+// (createJanitor exposes no per-tick callback).
+const JANITOR_INTERVAL_MS = Number(process.env.CREWHAUS_JANITOR_INTERVAL_MS ?? 3_600_000);
+let __janitorLastRunAt: string | undefined;
 if (process.env.CREWHAUS_JANITOR !== "0") {
   const janitorReport = await janitor.runOnce();
+  __janitorLastRunAt = new Date().toISOString();
+  __control.counters.janitorRuns++;
   console.error(`[managed] janitor: ${JSON.stringify(janitorReport.steps)}`);
-  janitor.start(Number(process.env.CREWHAUS_JANITOR_INTERVAL_MS ?? 3_600_000));
+  janitor.start(JANITOR_INTERVAL_MS);
 }
+__control.timer(() => ({ lane: "janitor", cadence: `every ${JANITOR_INTERVAL_MS}ms`, ...(__janitorLastRunAt !== undefined ? { lastFiredAt: __janitorLastRunAt, lastOutcome: "ok" } : {}) }));
+
 
 // Ops item 37 — SLO intake gate. The CLI `run`/monitor path (registry-backed)
 // flips `.crewhaus/slo/intake.json` { paused } on a SUSTAINED SLO breach (and
@@ -224,6 +255,10 @@ const gateway = createGatewayServer({
   tenantOverrides,
   budgetStore: BUDGET_STORE,
   intakeGate: readIntakeGate,
+  // control.v1 — bare unauthenticated GET /healthz (liveness only, no state)
+  // plus the 503 + Retry-After intake shed once a drain has been requested.
+  // Control routes themselves are NEVER served on this public port.
+  publicGate: (__req) => __control.publicGate(__req),
   federation,
   // Contract item 3 — resolve a run's live trace stream for runs.subscribe from
   // the per-run bus registry, fenced to the owning tenant. Returning undefined
@@ -311,6 +346,7 @@ const gateway = createGatewayServer({
         }
         throw err;
       }
+      __control.counters.turns++;
       const inputTokens = Math.ceil(p.input.length / 4);
       const outputTokens = Math.ceil(reply.length / 4);
       await gateway.recordUsage(tenant.id, { input: inputTokens, output: outputTokens });
@@ -335,6 +371,13 @@ const gateway = createGatewayServer({
 
 const handle = await gateway.listen(PORT);
 console.error(`[managed] gateway listening on :${handle.port}`);
+__control.onDrain(async () => {
+  console.error("[managed] draining — intake stopped");
+  janitor.stop();
+  await janitor.runOnce();
+  await handle.close();
+});
+await __control.start();
 
 process.on("SIGTERM", async () => {
   console.error("[managed] SIGTERM — closing gateway");
