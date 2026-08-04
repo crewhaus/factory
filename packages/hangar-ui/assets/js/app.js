@@ -8,33 +8,55 @@
  * counts, and gives the harness header its supervision pill, bundle
  * freshness badge, control availability and — when the spawn plan cannot be
  * built — the remedy as a BUTTON rather than an error.
+ *
+ * M3 adds the detail tabs (Datasets, Feedback, Credentials, Channels,
+ * Security, Thredz, Inspect, Dev & MCP), stacks an M3 half beneath the
+ * existing Spec, Evals and Memory panels, and puts the fleet credential
+ * matrix, feedback rollup and Thredz explorer in the rail.
+ *
+ * The tab strip is where the shape × panel matrix is applied: the target
+ * shape decides which tabs are live and which render disabled with the
+ * reason (`tabAvailability` in router.js owns the table). Gating stops at
+ * the strip — a deep link to an off-matrix tab still resolves and the
+ * screen still answers, so no URL an operator saved goes dead.
  */
 
 import { ApiError, api, onUnauthorized, setToken } from "./api.js";
 import { clear, copyBtn, dot, el, skeleton, toast } from "./dom.js";
 import {
-  HARNESS_TABS,
   hrefGlobal,
   hrefHarness,
   hrefLibrary,
   parseRoute,
   startRouter,
+  tabAvailability,
 } from "./router.js";
 import { shapeAccent, shapeLabel } from "./shapes.js";
 import { procRow } from "./supervision.js";
 import { renderActivity } from "./views/activity.js";
 import { renderApprovals } from "./views/approvals.js";
+import { renderChannels } from "./views/channels.js";
 import { renderCosts } from "./views/costs.js";
+import { renderCredentialsMatrix, renderCreds } from "./views/creds.js";
+import { renderData } from "./views/data.js";
 import { renderDeploy } from "./views/deploy.js";
+import { renderEvalsLab } from "./views/evals-lab.js";
 import { renderEvals } from "./views/evals.js";
+import { renderFeedback, renderFeedbackBoard } from "./views/feedback.js";
+import { renderInspect } from "./views/inspect.js";
 import { renderLibrary } from "./views/library.js";
+import { renderMemoryFabric } from "./views/memory-fabric.js";
 import { renderMemory } from "./views/memory.js";
 import { renderOverview } from "./views/overview.js";
 import { renderReview } from "./views/review.js";
 import { renderRuns, renderRunsBoard } from "./views/runs.js";
+import { renderRuntime } from "./views/runtime.js";
 import { renderSchedulers } from "./views/schedulers.js";
+import { renderSecurity } from "./views/security.js";
 import { renderSessions } from "./views/sessions.js";
+import { renderSpecEdit } from "./views/spec-edit.js";
 import { renderSpec } from "./views/spec.js";
+import { renderThredz, renderThredzGlobal } from "./views/thredz.js";
 import { renderTokenScreen } from "./views/token.js";
 
 const THEME_KEY = "hangar.theme";
@@ -46,8 +68,16 @@ const TAB_LABELS = {
   sessions: "Sessions",
   evals: "Evals",
   memory: "Memory",
+  data: "Datasets",
+  feedback: "Feedback",
   costs: "Costs",
+  creds: "Credentials",
+  channels: "Channels",
+  security: "Security",
+  thredz: "Thredz",
   deploy: "Deployments",
+  inspect: "Inspect",
+  dev: "Dev & MCP",
 };
 
 /** The fleet-wide screens in the header rail, with their count sources. */
@@ -56,6 +86,9 @@ const NAV = [
   { view: "approvals", label: "Approvals" },
   { view: "review", label: "Review" },
   { view: "activity", label: "Activity" },
+  { view: "credentials", label: "Credentials" },
+  { view: "feedback", label: "Feedback" },
+  { view: "thredz", label: "Thredz" },
 ];
 
 let viewRoot = null;
@@ -207,6 +240,12 @@ async function dispatch(route) {
       await renderReview(viewRoot);
     } else if (route.view === "activity") {
       await renderActivity(viewRoot);
+    } else if (route.view === "credentials") {
+      await renderCredentialsMatrix(viewRoot);
+    } else if (route.view === "feedback") {
+      await renderFeedbackBoard(viewRoot);
+    } else if (route.view === "thredz") {
+      await renderThredzGlobal(viewRoot);
     } else {
       renderNotFound(viewRoot, route);
     }
@@ -248,30 +287,104 @@ async function renderHarnessPage(root, route) {
     reload: () => renderHarnessPage(root, route),
   };
   root.appendChild(harnessHeader(detail, route, ctx));
-  const nav = el(
-    "nav",
-    { class: "tabs", "aria-label": "harness tabs" },
-    HARNESS_TABS.map((tab) =>
-      el("a", {
-        class: `tab${route.tab === tab ? " active" : ""}`,
-        "aria-current": route.tab === tab ? "page" : null,
-        href: hrefHarness(route.id, tab),
-        text: TAB_LABELS[tab] ?? tab,
-      }),
+  // The shape × panel matrix, applied where the strip is drawn: a tab this
+  // target's schema cannot declare renders as a disabled label carrying the
+  // reason, not as a link into a screen whose only content is "not
+  // applicable". The deep link still resolves, so a shared URL still opens.
+  const availability = tabAvailability(targetOf(detail));
+  root.appendChild(
+    el(
+      "nav",
+      { class: "tabs", "aria-label": "harness tabs" },
+      availability.map((row) => tabNode(route, row)),
     ),
   );
-  root.appendChild(nav);
+  const current = availability.find((row) => row.tab === route.tab);
+  if (current !== undefined && !current.on) {
+    root.appendChild(
+      el("div", { class: "rollup" }, [
+        dot("off", "off this shape's panel matrix"),
+        el("span", { class: "muted", text: current.reason }),
+      ]),
+    );
+  }
   const tabRoot = el("div", { class: "tab-body" });
   root.appendChild(tabRoot);
-  if (route.tab === "spec") await renderSpec(tabRoot, ctx);
-  else if (route.tab === "runs") await renderRuns(tabRoot, ctx);
+  // The three tabs that gained an M3 half render the M1/M2 surface first and
+  // the new one beneath it — one screen, not two competing ones.
+  if (route.tab === "spec") {
+    await renderSpec(tabRoot, ctx);
+    await renderSpecEdit(section(tabRoot), ctx);
+  } else if (route.tab === "runs") await renderRuns(tabRoot, ctx);
   else if (route.tab === "schedulers") await renderSchedulers(tabRoot, ctx);
   else if (route.tab === "sessions") await renderSessions(tabRoot, ctx);
-  else if (route.tab === "evals") await renderEvals(tabRoot, ctx);
-  else if (route.tab === "memory") await renderMemory(tabRoot, ctx);
+  else if (route.tab === "evals") {
+    await renderEvals(tabRoot, ctx);
+    await renderEvalsLab(section(tabRoot), ctx);
+  } else if (route.tab === "memory") {
+    await renderMemory(tabRoot, ctx);
+    await renderMemoryFabric(section(tabRoot), ctx);
+  } else if (route.tab === "data") await renderData(tabRoot, ctx);
+  else if (route.tab === "feedback") await renderFeedback(tabRoot, ctx);
   else if (route.tab === "costs") await renderCosts(tabRoot, ctx);
+  else if (route.tab === "creds") await renderCreds(tabRoot, ctx);
+  else if (route.tab === "channels") await renderChannels(tabRoot, ctx);
+  else if (route.tab === "security") await renderSecurity(tabRoot, ctx);
+  else if (route.tab === "thredz") await renderThredz(tabRoot, ctx);
   else if (route.tab === "deploy") await renderDeploy(tabRoot, ctx);
+  else if (route.tab === "inspect") await renderInspect(tabRoot, ctx);
+  else if (route.tab === "dev") await renderRuntime(tabRoot, ctx);
   else await renderOverview(tabRoot, ctx);
+}
+
+/**
+ * One tab in the strip. An on-matrix tab is a link; an off-matrix one is a
+ * disabled label whose accessible name carries the reason as TEXT — the
+ * dimming is never the whole message.
+ */
+function tabNode(route, row) {
+  const label = TAB_LABELS[row.tab] ?? row.tab;
+  const active = route.tab === row.tab;
+  if (row.on) {
+    return el("a", {
+      class: `tab${active ? " active" : ""}`,
+      "aria-current": active ? "page" : null,
+      href: hrefHarness(route.id, row.tab),
+      text: label,
+    });
+  }
+  return el("span", {
+    class: `tab tab-off muted${active ? " active" : ""}`,
+    // The console ships one stylesheet and this state is the only new one on
+    // the strip, so it dims inline rather than growing the CSS a rule that
+    // one span uses. The reason still travels as text, in both the tooltip
+    // and the accessible name — the dimming is a hint, never the message.
+    style: { opacity: "0.45", cursor: "not-allowed" },
+    "aria-disabled": "true",
+    "aria-current": active ? "page" : null,
+    "aria-label": `${label} — not part of this shape: ${row.reason}`,
+    title: row.reason,
+    text: label,
+  });
+}
+
+/** The target shape string, read from the same places the header reads it
+ *  (the inventory's parsed header first, the registry row as the fallback).
+ *  One reader, so the strip and the badge can never disagree. */
+function targetOf(detail) {
+  const entry = detail.entry && typeof detail.entry === "object" ? detail.entry : {};
+  const inv = detail.inventory && typeof detail.inventory === "object" ? detail.inventory : {};
+  const header = inv.header && typeof inv.header === "object" ? inv.header : {};
+  const explicit = header.target ?? entry.target;
+  return typeof explicit === "string" ? explicit : "";
+}
+
+/** Append a fresh sub-container so a second render into the same tab does
+ *  not clear the first (every view clears the root it is handed). */
+function section(root) {
+  const node = el("div", { class: "tab-section" });
+  root.appendChild(node);
+  return node;
 }
 
 /**
@@ -284,9 +397,8 @@ async function renderHarnessPage(root, route) {
 function harnessHeader(detail, route, ctx) {
   const entry = detail.entry && typeof detail.entry === "object" ? detail.entry : {};
   const inv = detail.inventory && typeof detail.inventory === "object" ? detail.inventory : {};
-  const header = inv.header && typeof inv.header === "object" ? inv.header : {};
   const name = String(inv.specName ?? entry.specName ?? route.id);
-  const target = String(header.target ?? entry.target ?? "");
+  const target = targetOf(detail);
   const dir = String(entry.dir ?? "");
   const missing = detail.missing === true || typeof entry.missingSince === "string";
   const head = el("div", { class: "h-head", style: { "--accent": shapeAccent(target) } }, [

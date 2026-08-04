@@ -48,6 +48,32 @@ export { mergedSpawnEnv, parseEnvText, readHarnessEnvFiles } from "./env-file";
 export { readJsonlCapped, readTextCapped, type JsonlRead } from "./jsonl";
 export { maskDeep, maskSpecYaml } from "./mask";
 export { isSafePathSegment, resolveContained, resolveInside } from "./safety";
+export { errResponse, HttpError, json, JSON_HEADERS } from "./http";
+export {
+  isDryRun,
+  jobArg,
+  M3_JOB_ARG_RE,
+  notImplemented,
+  requireBoolean,
+  requireString,
+  requireTypedConfirm,
+  type M3Context,
+  type M3Handler,
+  type M3Harness,
+  type M3Params,
+} from "./m3";
+export {
+  M3_GROUPS,
+  M3_ROUTES,
+  matchM3,
+  PARAM_GUARDS,
+  paramOk,
+  type M3Group,
+  type M3Match,
+  type M3Method,
+  type M3Route,
+} from "./m3-routes";
+export { INSPECT_STORES, isInspectStore, type InspectStore } from "./inspect";
 export {
   GUTTER_KINDS,
   isSessionId,

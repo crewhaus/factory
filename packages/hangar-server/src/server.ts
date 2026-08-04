@@ -35,6 +35,15 @@
  *     spec/transcript routes pass the spec-patch maskers; captured daemon
  *     output is served only through the supervisor's scrubbed paths, never
  *     by reading `logs/<runId>.log` (raw, unscrubbed by construction).
+ *
+ * M3 is the detail surface — the spec's write side, the memory fabric's
+ * write side, the eval/dataset/feedback loops, credentials + channels +
+ * security, Thredz, and the raw inspectors. It is far too many routes to
+ * hand-branch, so it dispatches from ONE table (`m3-routes.ts`) through one
+ * function (`runM3` below) that applies every guard above uniformly; the
+ * per-area handler modules receive an already-validated `M3Context` and can
+ * only be about their own subject. The handlers ship as 501 stubs whose
+ * docblocks carry the write covenant each must honour.
  */
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -98,7 +107,10 @@ import { foldHarnessCosts } from "./costs";
 import { deploymentsView } from "./deployments";
 import { mergedSpawnEnv } from "./env-file";
 import { evalHealth, evalRunView, evalSampleView, evalsView, isRunId } from "./evals";
-import { maskDeep } from "./mask";
+import { HttpError, errResponse, json } from "./http";
+import type { M3Context, M3Harness } from "./m3";
+import { type M3Match, matchM3 } from "./m3-routes";
+import { type TextScrubber, maskDeep } from "./mask";
 import {
   dreamView,
   factsView,
@@ -118,7 +130,14 @@ import {
 } from "./process";
 import { type ReviewHarness, adjudicateReview, isReviewVerdict, reviewInbox } from "./review";
 import { type HarnessRollup, openRollupCache } from "./rollups";
-import { isLiveFeedState, isSupervisorRunId, runDetail, runEventStream, runsView } from "./runs";
+import {
+  isLiveFeedState,
+  isSupervisorRunId,
+  runDetail,
+  runEventStream,
+  runsView,
+  safeSpawnEnvScrubber,
+} from "./runs";
 import { resolveInside } from "./safety";
 import { buildSchedulersView, readSpecYaml } from "./schedulers";
 import {
@@ -212,32 +231,6 @@ export type HangarServer = {
   stop(): Promise<void>;
 };
 
-class HttpError extends Error {
-  readonly status: number;
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
-
-const JSON_HEADERS: Record<string, string> = {
-  "content-type": "application/json; charset=utf-8",
-  "cache-control": "no-store",
-  "x-content-type-options": "nosniff",
-};
-
-function json(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
-  return new Response(`${JSON.stringify(data)}\n`, {
-    status,
-    headers: { ...JSON_HEADERS, ...headers },
-  });
-}
-
-function errResponse(status: number, message: string): Response {
-  const headers: Record<string, string> = status === 401 ? { "www-authenticate": "Bearer" } : {};
-  return json({ error: message }, status, headers);
-}
-
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
 
@@ -299,6 +292,34 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       throw new HttpError(404, "harness dir missing — relocate or remove the entry");
     }
     return entry.dir;
+  };
+
+  /**
+   * The THIRD masking layer, for one harness: its `.env` chain under the
+   * manager's own environment — the same record the supervisor's pump scrubs
+   * live output with.
+   *
+   * `maskDeep` redacts by key NAME and by value SHAPE. A credential whose
+   * value this manager demonstrably holds, but which has neither — an opaque
+   * string under `body`, `note`, `tags[]`, `justification`, `patch`, or in
+   * prose — survives both, and did: twenty routes echoed one back verbatim.
+   * The scrubber is the only layer that can catch it, so it is applied at the
+   * seams where payloads are serialized rather than remembered per handler.
+   */
+  const harnessScrub = (dir: string): TextScrubber => safeSpawnEnvScrubber(dir, env);
+
+  /**
+   * The same, folded over every live harness — for the FLEET payloads
+   * (`/api/approvals`, `/api/review`, `/api/activity`, the M3 fleet routes),
+   * which quote content from harnesses the request never names. A value from
+   * harness A rendered on a fleet screen is the same leak wherever it came
+   * from.
+   */
+  const fleetScrub = (): TextScrubber => {
+    const scrubbers = liveHarnesses().map((h) => harnessScrub(h.dir));
+    if (scrubbers.length === 0) return (text) => text;
+    if (scrubbers.length === 1) return scrubbers[0] as TextScrubber;
+    return (text) => scrubbers.reduce((acc, s) => s(acc), text);
   };
 
   const readYamlSafe = (dir: string): string => {
@@ -776,6 +797,78 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     return resolve(value);
   };
 
+  /**
+   * The M3 detail surface — ~180 routes across eleven groups — dispatched
+   * from one place.
+   *
+   * Every guard the M1/M2 branches apply by hand is applied HERE, once, for
+   * every M3 route: the `:id` is shape-checked and resolved against the
+   * registry (the allowlist), a vanished directory 404s before any handler
+   * runs, remaining params were guarded during matching, POST/PUT bodies are
+   * proven to be JSON objects, harness-relative reads go through a
+   * containment closure, and whatever comes back is masked on the way out.
+   *
+   * That uniformity is the point: six people are filling these handlers in
+   * parallel, and not one of them should be re-deriving path safety.
+   */
+  const runM3 = async (req: Request, url: URL, match: M3Match): Promise<Response> => {
+    const { route, params } = match;
+    const perHarness = params["id"] !== undefined;
+    let entry: HangarHarnessEntry | null = null;
+    let harnessDir: string | null = null;
+    if (perHarness) {
+      entry = entryOr404(params["id"] as string);
+      harnessDir = liveDirOr404(entry);
+    }
+    const body =
+      route.method === "POST" || route.method === "PUT" ? await readBody(req) : ({} as const);
+    const dir = harnessDir;
+    const context: M3Context = {
+      entry,
+      harnessDir,
+      params,
+      query: url.searchParams,
+      body,
+      // Harness `.env` layered over the manager's env — the same picture
+      // preflight and spawns see. Values, because a handler may need to sign
+      // a synthetic inbound server-side; never serialize one.
+      env: dir === null ? env : mergedSpawnEnv(env, dir).env,
+      now,
+      operator,
+      contain: (segments) => {
+        if (dir === null) throw new HttpError(400, "not a per-harness route");
+        // Per FILE, never per directory: a listed name can be a symlink.
+        const resolved = resolveInside(dir, segments);
+        if (resolved === undefined) throw new HttpError(400, "path escapes the harness directory");
+        return resolved;
+      },
+      harnesses: (): readonly M3Harness[] => liveHarnesses(),
+      process: async () => {
+        if (entry === null) throw new HttpError(400, "not a per-harness route");
+        return await processFor(entry);
+      },
+      control,
+      jobs: processes.jobs,
+      submitJob: (kind, argv) =>
+        processes.jobs.submit({
+          harnessDir: dir ?? "",
+          ...(entry !== null ? { harnessId: entry.id } : {}),
+          kind,
+          argv,
+        }),
+      warn: onWarn,
+    };
+    const result = await route.handler(context);
+    if (result instanceof Response) return result;
+    // Masked AND SCRUBBED unconditionally, in one place, so a handler written
+    // next month inherits both layers without knowing they exist. Defense in
+    // depth, not permission: a handler that reads free text still masks it
+    // itself, because key-based redaction cannot see into prose — and the
+    // scrubber is the only layer that catches a credential with no shape
+    // under an innocent key, which is what leaked from twenty routes.
+    return json(maskDeep(result, dir === null ? fleetScrub() : harnessScrub(dir)));
+  };
+
   const handleHarnessSub = async (
     req: Request,
     url: URL,
@@ -785,6 +878,33 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     const method = req.method;
     const [head, ...tail] = rest;
 
+    /**
+     * ONE EXIT for every M1/M2 per-harness payload — the same guarantee
+     * `runM3` gives the detail surface.
+     *
+     * These branches each called `json()` directly, some with `maskDeep` and
+     * some without, which is how the transcript, session-list, spec, eval and
+     * run routes ended up echoing an opaque `.env`-held credential while the
+     * routes beside them did not. Masking is idempotent, so wrapping a
+     * payload a handler already masked costs nothing and the wrapper cannot
+     * be forgotten.
+     *
+     * Built lazily and once per request: a harness whose directory has
+     * vanished 404s in the branch, and only then, rather than here.
+     */
+    let scrubMemo: TextScrubber | undefined;
+    const scrubOf = (): TextScrubber => {
+      if (scrubMemo === undefined) {
+        scrubMemo =
+          entry.missingSince === null && existsSync(entry.dir)
+            ? harnessScrub(entry.dir)
+            : (text) => text;
+      }
+      return scrubMemo;
+    };
+    const jsonMasked = (value: unknown, status?: number): Response =>
+      json(maskDeep(value, scrubOf()), status);
+
     if (head === "relocate" && method === "POST" && tail.length === 0) {
       const body = await readBody(req);
       const newDir = requireAbsoluteDir(body["newDir"], "newDir");
@@ -792,7 +912,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         throw new HttpError(400, "newDir does not exist");
       }
       try {
-        return json({ entry: registry.relocate(entry.id, newDir) });
+        return jsonMasked({ entry: registry.relocate(entry.id, newDir) });
       } catch (err) {
         throw new HttpError(409, err instanceof Error ? err.message : String(err));
       }
@@ -803,21 +923,21 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       if (head === "groups") {
         const groups = asStringArray(body["groups"]);
         if (groups === undefined) throw new HttpError(400, 'missing "groups" string array');
-        return json({ entry: registry.setGroups(entry.id, groups) });
+        return jsonMasked({ entry: registry.setGroups(entry.id, groups) });
       }
       if (head === "tags") {
         const tags = asStringArray(body["tags"]);
         if (tags === undefined) throw new HttpError(400, 'missing "tags" string array');
-        return json({ entry: registry.setTags(entry.id, tags) });
+        return jsonMasked({ entry: registry.setTags(entry.id, tags) });
       }
       if (head === "pin") {
         if (typeof body["pinned"] !== "boolean")
           throw new HttpError(400, 'missing "pinned" boolean');
-        return json({ entry: registry.setPinned(entry.id, body["pinned"]) });
+        return jsonMasked({ entry: registry.setPinned(entry.id, body["pinned"]) });
       }
       if (head === "notes") {
         if (typeof body["notes"] !== "string") throw new HttpError(400, 'missing "notes" string');
-        return json({ entry: registry.setNotes(entry.id, body["notes"]) });
+        return jsonMasked({ entry: registry.setNotes(entry.id, body["notes"]) });
       }
       throw new HttpError(404, "not found");
     }
@@ -833,7 +953,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         if (verb === "stop") {
           const result = await handle.supervisor.stop();
           if (notAdopted(result)) return notAdoptedResponse("stop", result);
-          return json({ ok: true, stopped: result.stopped, forced: result.forced });
+          return jsonMasked({ ok: true, stopped: result.stopped, forced: result.forced });
         }
         if (verb === "drain") {
           // The supervisor drives the state and awaits the exit; the control
@@ -851,7 +971,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
               if (!outcome.ok) throw new Error(outcome.reason);
             });
             if (notAdopted(result)) return notAdoptedResponse("drain", result);
-            return json({
+            return jsonMasked({
               ok: true,
               stopped: result.stopped,
               // True when control.v1 was unavailable and the supervisor fell
@@ -879,7 +999,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
             throw new HttpError(400, 'missing "lane" — one of: heartbeat, schedule');
           }
           const reason = typeof body["reason"] === "string" ? body["reason"] : undefined;
-          return json(
+          return jsonMasked(
             controlEnvelope(
               await control.wake(controlTarget(handle), {
                 lane,
@@ -896,7 +1016,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           // suppress a restart the daemon still needs and disable every
           // process verb in the console with "this daemon is draining".
           if (outcome.ok) handle.markDraining();
-          return json(controlEnvelope(outcome));
+          return jsonMasked(controlEnvelope(outcome));
         }
         throw new HttpError(404, "not found");
       }
@@ -917,7 +1037,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         });
         if (result.outcome === "not-found") throw new HttpError(404, "no such approval");
         if (result.outcome === "unreachable") throw new HttpError(409, result.reason);
-        return json({ ok: true, approval: maskDeep(result.approval) });
+        return jsonMasked({ ok: true, approval: result.approval });
       }
 
       if (head === "review" && tail.length === 1) {
@@ -940,9 +1060,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         if (result.outcome === "not-found") throw new HttpError(404, "no such review item");
         if (result.outcome === "rejected") throw new HttpError(409, result.reason);
         if (result.outcome === "already-resolved") {
-          return json({ ok: true, alreadyResolved: true, entry: result.entry });
+          return jsonMasked({ ok: true, alreadyResolved: true, entry: result.entry });
         }
-        return json({
+        return jsonMasked({
           ok: true,
           alreadyResolved: false,
           entry: result.entry,
@@ -968,7 +1088,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           throw err;
         }
         const record = processes.jobs.submit({ harnessDir: dir, harnessId: entry.id, kind, argv });
-        return json({ ok: true, job: record }, 202);
+        return jsonMasked({ ok: true, job: record }, 202);
       }
 
       if (head === "sessions" && tail.length === 2 && tail[1] === "pin") {
@@ -984,7 +1104,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           now,
         });
         if (result.outcome === "rejected") throw new HttpError(409, result.reason);
-        return json({
+        return jsonMasked({
           ok: true,
           pinned: result.pinned,
           pins: result.pins,
@@ -1004,7 +1124,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           nowIso: new Date(now()).toISOString(),
         });
         if (result.outcome === "rejected") throw new HttpError(409, result.reason);
-        return json({ ok: true, baseline: result.baseline });
+        return jsonMasked({ ok: true, baseline: result.baseline });
       }
 
       throw new HttpError(404, "not found");
@@ -1017,10 +1137,10 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       // maskDeep on the way out: the runfile and the plan preview carry
       // operator-supplied strings (env overrides, a bundle path, a control
       // token PATH) that no route should be trusted to have pre-filtered.
-      return json(maskDeep(procView(entry, handle)));
+      return jsonMasked(procView(entry, handle));
     }
     if (head === "runs" && tail.length === 0) {
-      return json(runsView(liveDirOr404(entry)));
+      return jsonMasked(runsView(liveDirOr404(entry)));
     }
     if (head === "runs" && tail.length >= 1 && tail.length <= 2) {
       const runId = tail[0] as string;
@@ -1037,7 +1157,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       // maskDeep: `proseTail` is built from the RAW capture file, so the env
       // scrubber is only half the story — a credential with no env entry at
       // all is caught by shape or not at all.
-      if (tail.length === 1) return json(maskDeep(detail));
+      if (tail.length === 1) return jsonMasked(detail);
       if (tail[1] !== "events") throw new HttpError(404, "not found");
       // SSE. `replay` first (durable history), `done` always last — a
       // terminal frame is what lets a client tell "finished" from "the
@@ -1048,23 +1168,39 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         runId,
         replay: detail,
         live,
+        // The SSE body bypasses `jsonMasked`, so the third layer has to be
+        // handed to the stream explicitly — the `replay` frame is the same
+        // object `GET /runs/:runId` serves, and the two must not disagree.
+        scrub: harnessScrub(dir),
         ...(live ? { subscribe: handle.supervisor.subscribe } : {}),
         ...(opts.sseHeartbeatMs !== undefined ? { heartbeatMs: opts.sseHeartbeatMs } : {}),
         ...(req.signal !== undefined ? { signal: req.signal } : {}),
       });
     }
     if (head === "control" && tail.length === 1 && tail[0] === "status") {
-      return json(controlEnvelope(await control.status(controlTarget(await processFor(entry)))));
+      return jsonMasked(
+        controlEnvelope(await control.status(controlTarget(await processFor(entry)))),
+      );
     }
     if (head === "schedulers" && tail.length === 0) {
-      return json(maskDeep(await schedulersFor(await processFor(entry))));
+      return jsonMasked(await schedulersFor(await processFor(entry)));
     }
     if (head === "deployments" && tail.length === 0) {
-      return json(deploymentsView(liveDirOr404(entry)));
+      return jsonMasked(deploymentsView(liveDirOr404(entry)));
     }
 
     if (head === "spec" && tail.length === 0) {
-      return json(specView(liveDirOr404(entry), env));
+      const view = specView(liveDirOr404(entry), env);
+      // A SCOPED ALLOWLIST, which is the pattern `mask.ts` prescribes for a
+      // field that must keep a credential-shaped name. `envRefs[].key` is an
+      // env variable NAME and `key` is an exact credential-key match, so the
+      // generic masker redacts the one thing the env panel exists to show —
+      // while no VALUE is in that field at all (`set` is a boolean, and the
+      // whole point of `envRefs` is that values never leave the server). The
+      // names ride around the masker; the spec TEXT still goes through it,
+      // which is where an inline credential would actually be.
+      const masked = maskDeep({ ...view, envRefs: [] }, scrubOf()) as Record<string, unknown>;
+      return json({ ...masked, envRefs: view.envRefs });
     }
     if (head === "preflight" && tail.length === 0) {
       const dir = liveDirOr404(entry);
@@ -1072,13 +1208,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       const report = await runPreflight({ harnessDir: dir, env: merged.env });
       // maskDeep: a preflight lint may quote a literal it found in the spec
       // (e.g. the pasted-credential MCP lint) — mask before serializing.
-      return json(maskDeep({ report, envFiles: merged.envFiles }));
+      return jsonMasked({ report, envFiles: merged.envFiles });
     }
     if (head === "sessions" && tail.length === 0) {
       const dir = liveDirOr404(entry);
       // `pins` rides along so the list can badge protected transcripts and
       // the pin action face has a visible effect on re-read.
-      return json({ ...listSessions(dir, now()), pins: readPins(dir) });
+      return jsonMasked({ ...listSessions(dir, now()), pins: readPins(dir) });
     }
     if (head === "sessions" && tail.length === 1) {
       const sess = tail[0] as string;
@@ -1088,10 +1224,10 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       if (url.searchParams.get("raw") !== null) {
         const raw = readTranscriptRaw(rootInfo.root, sess);
         if (raw === undefined) throw new HttpError(404, "no transcript recorded yet");
-        return json(raw);
+        return jsonMasked(raw);
       }
       const view = readTranscript(rootInfo.root, sess);
-      if (view !== undefined) return json(view);
+      if (view !== undefined) return jsonMasked(view);
       // Fall through to the durable index for evicted sessions. Resolved
       // from the HARNESS dir (an overridden session root's parent is not
       // ours), containment-checked, and masked like every other payload.
@@ -1099,13 +1235,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       if (indexPath === undefined) throw new HttpError(404, "no session recorded yet");
       try {
         const summary: unknown = JSON.parse(readFileSync(indexPath, "utf8"));
-        return json({ id: sess, evicted: true, summary: maskDeep(summary) });
+        return jsonMasked({ id: sess, evicted: true, summary });
       } catch {
         throw new HttpError(404, "no session recorded yet");
       }
     }
     if (head === "evals" && tail.length === 0) {
-      return json(evalsView(liveDirOr404(entry)));
+      return jsonMasked(evalsView(liveDirOr404(entry)));
     }
     if (head === "evals" && tail.length >= 1 && tail.length <= 2) {
       const runId = tail[0] as string;
@@ -1116,13 +1252,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         if (view === undefined) throw new HttpError(404, "no such eval run");
         // maskDeep: eval artifacts embed agent transcripts — mask token
         // shapes before serializing (defense in depth).
-        return json(maskDeep(view));
+        return jsonMasked(view);
       }
       const sampleId = tail[1] as string;
       if (!SAFE_SEGMENT_RE.test(sampleId)) throw new HttpError(400, "invalid sample id");
       const view = evalSampleView(dir, runId, sampleId);
       if (view === undefined) throw new HttpError(404, "no such sample");
-      return json(maskDeep(view));
+      return jsonMasked(view);
     }
     if (head === "memory" && tail.length >= 1 && tail.length <= 2) {
       const area = tail[0] as string;
@@ -1131,24 +1267,24 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         if (area !== "wiki") throw new HttpError(404, "not found");
         const article = wikiArticle(dir, tail[1] as string);
         if (article === undefined) throw new HttpError(404, "no such article");
-        return json(article);
+        return jsonMasked(article);
       }
       if (!isMemoryArea(area)) throw new HttpError(404, "not found");
       switch (area) {
         case "facts":
-          return json(factsView(dir, now()));
+          return jsonMasked(factsView(dir, now()));
         case "wiki":
-          return json(wikiView(dir));
+          return jsonMasked(wikiView(dir));
         case "state":
-          return json(stateView(dir));
+          return jsonMasked(stateView(dir));
         case "dream":
-          return json(dreamView(dir));
+          return jsonMasked(dreamView(dir));
         case "watchme":
-          return json(watchmeView(dir));
+          return jsonMasked(watchmeView(dir));
       }
     }
     if (head === "costs" && tail.length === 0) {
-      return json({ id: entry.id, costs: foldHarnessCosts(liveDirOr404(entry), now()) });
+      return jsonMasked({ id: entry.id, costs: foldHarnessCosts(liveDirOr404(entry), now()) });
     }
     throw new HttpError(404, "not found");
   };
@@ -1156,6 +1292,14 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   const api = async (req: Request, url: URL, segs: readonly string[]): Promise<Response> => {
     const method = req.method;
     const [head, ...rest] = segs;
+
+    // M3 first, and literal-first inside it: a template whose segments are
+    // all literals beats one with a param, so `GET …/evals/matrix` matches
+    // the M3 route while `GET …/evals/run_…` falls through to the M2 branch
+    // below untouched. A param that fails its shape guard does not match at
+    // all, so a malformed id still meets the M1/M2 chain's own 400.
+    const m3 = matchM3(method, ["api", ...segs]);
+    if (m3 !== undefined) return await runM3(req, url, m3);
 
     if (head === "version" && rest.length === 0 && method === "GET") {
       return json({ hangar: version, protocolV: PROTOCOL_V });
@@ -1171,7 +1315,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
 
     if (head === "harnesses" && rest.length === 0) {
       if (method === "GET") {
-        return json(harnessRows(url.searchParams.get("hydrate") !== null));
+        return json(maskDeep(harnessRows(url.searchParams.get("hydrate") !== null), fleetScrub()));
       }
       if (method === "POST") {
         const body = await readBody(req);
@@ -1283,28 +1427,38 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     }
 
     // ---- M2 fleet inboxes ---------------------------------------------
+    // Every fleet fold quotes free text out of harnesses this request never
+    // names — a tool input a policy parked for approval, a quarantined
+    // sample, an activity label — so all three carry the fleet scrubber as
+    // well as the masker.
     if (head === "approvals" && rest.length === 0) {
       if (method !== "GET") throw new HttpError(405, "method not allowed");
       return json(
-        approvalsInbox(liveHarnesses(), {
-          includeSettled: url.searchParams.get("all") !== null,
-        }),
+        maskDeep(
+          approvalsInbox(liveHarnesses(), {
+            includeSettled: url.searchParams.get("all") !== null,
+          }),
+          fleetScrub(),
+        ),
       );
     }
 
     if (head === "review" && rest.length === 0) {
       if (method !== "GET") throw new HttpError(405, "method not allowed");
       return json(
-        reviewInbox(liveHarnesses(), {
-          includeResolved: url.searchParams.get("all") !== null,
-        }),
+        maskDeep(
+          reviewInbox(liveHarnesses(), {
+            includeResolved: url.searchParams.get("all") !== null,
+          }),
+          fleetScrub(),
+        ),
       );
     }
 
     if (head === "activity" && rest.length === 0) {
       if (method !== "GET") throw new HttpError(405, "method not allowed");
       const since = parseSince(url.searchParams.get("since"), now(), DEFAULT_ACTIVITY_WINDOW_MS);
-      return json(activityDigest(liveHarnesses(), since));
+      return json(maskDeep(activityDigest(liveHarnesses(), since), fleetScrub()));
     }
 
     if (head === "jobs" && rest.length === 0) {
@@ -1327,7 +1481,16 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     if (head === "h" && rest.length >= 1) {
       const entry = entryOr404(rest[0] as string);
       if (rest.length === 1) {
-        if (method === "GET") return json(await detailView(entry));
+        if (method === "GET") {
+          return json(
+            maskDeep(
+              await detailView(entry),
+              entry.missingSince === null && existsSync(entry.dir)
+                ? harnessScrub(entry.dir)
+                : undefined,
+            ),
+          );
+        }
         if (method === "DELETE") return json({ removed: registry.remove(entry.id) });
         throw new HttpError(405, "method not allowed");
       }
@@ -1362,6 +1525,20 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       "GET  /api/review      POST /api/h/:id/review/:itemId",
       "GET  /api/activity[?since=]",
       "GET  /api/jobs        POST /api/h/:id/jobs {kind}",
+      "--- M3 (handlers are stubs: every route below answers 501) ---",
+      "PUT  /api/h/:id/spec  POST /api/h/:id/spec/{patch,diff,pin,rollback,propose}",
+      "GET  /api/h/:id/spec/{schema,trust,versions[/:version[/diff]]}",
+      "GET|POST /api/builders/…   GET|POST|DELETE /api/h/:id/builders/{graders,dataset,mcp}",
+      "GET|POST /api/h/:id/memory/{facts/:spec,recall,continuity,learning,knowledge,reflect}",
+      "PUT|GET|POST /api/h/:id/memory/wiki/:slug/…   GET|POST /api/h/:id/memory/watchme/…",
+      "GET|POST /api/h/:id/evals/{run,matrix,suites,trends,judge,graders,redteam,coverage,…}",
+      "GET|POST /api/h/:id/data/…   GET|POST /api/h/:id/feedback/…   GET /api/feedback",
+      "GET|POST|DELETE /api/h/:id/env[/:key]   GET|POST /api/credentials[/set]",
+      "GET|POST /api/h/:id/{doctor,secrets,mcp/lint,channels/…,gateway,audit,slo}",
+      "GET|POST /api/h/:id/security/{egress,pii,justification,corpus,sandbox,onchain,…}",
+      "GET|PUT|POST|DELETE /api/h/:id/thredz/…   GET /api/thredz",
+      "GET  /api/h/:id/inspect[/:store[/:name]]   PUT /api/h/:id/inspect/settings",
+      "GET|POST /api/h/:id/{mcp-servers,dev}/…",
     ];
     const items = routes.map((r) => `<li><code>${r}</code></li>`).join("\n");
     const html = `<!doctype html><meta charset="utf-8"><title>Hangar</title><h1>Hangar manager API</h1><p>No UI assets embedded in this build. Every <code>/api</code> route requires <code>Authorization: Bearer &lt;token&gt;</code>.</p><ul>${items}</ul>`;

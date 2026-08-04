@@ -426,7 +426,7 @@ describe("/api/harnesses rows + rollup cache", () => {
     const coldRow = cold[0] as Record<string, unknown>;
     expect(coldRow["rollup"]).toBeNull();
     expect(coldRow["specName"]).toBe("golden-harness");
-    expect(coldRow["model"]).toBe("anthropic/claude-sonnet-4");
+    expect(coldRow["model"]).toBe("claude-opus-5");
 
     // Pin the log's mtime to a whole millisecond first: utimesSync truncates
     // sub-ms precision, and the warm-path proof below must re-set the SAME
@@ -453,7 +453,7 @@ describe("/api/harnesses rows + rollup cache", () => {
       dir: "<dir>",
       specName: "golden-harness",
       target: "cli",
-      model: "anthropic/claude-sonnet-4",
+      model: "claude-opus-5",
       origin: "manual",
       groups: [],
       tags: [],

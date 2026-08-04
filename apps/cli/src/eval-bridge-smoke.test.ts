@@ -53,6 +53,22 @@ function newTmp(prefix: string): string {
 /** The spawn cwd for every compile/drive subprocess — see the file header. */
 const SPAWN_CWD = newTmp("crewhaus-bridge-cwd-");
 
+/**
+ * Hermetic harness registry for every spawn in this file.
+ *
+ * `run`/`compile`/`eval`/`dev` self-register the harness they touch, and for
+ * a spec passed by path that is the SPEC's directory — every fixture here
+ * lives under `apps/cli/test-fixtures/`, inside the repo. The default
+ * registry root's ephemeral-cwd guard cannot help (it looks at the cwd, not
+ * at the spec dir), so without this every run of this file writes a row per
+ * fixture into the developer's real `~/.crewhaus/harnesses.json`.
+ */
+const REGISTRY_ROOT = newTmp("crewhaus-bridge-reg-");
+const HERMETIC_REGISTRY: Record<string, string> = {
+  CREWHAUS_REGISTRY_ROOT: join(REGISTRY_ROOT, "registry"),
+  CREWHAUS_WATCHME_ROOT: join(REGISTRY_ROOT, "watchme"),
+};
+
 async function spawnBun(args: ReadonlyArray<string>): Promise<{
   exitCode: number;
   stdout: string;
@@ -60,7 +76,7 @@ async function spawnBun(args: ReadonlyArray<string>): Promise<{
 }> {
   const proc = Bun.spawn([process.execPath, ...args], {
     cwd: SPAWN_CWD,
-    env: { PATH: process.env["PATH"] ?? "" },
+    env: { PATH: process.env["PATH"] ?? "", ...HERMETIC_REGISTRY },
     stdout: "pipe",
     stderr: "pipe",
   });

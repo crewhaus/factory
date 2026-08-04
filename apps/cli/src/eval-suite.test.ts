@@ -381,6 +381,22 @@ const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
 const CLI_PATH = join(SRC_DIR, "index.ts");
 const HELLO_SPEC = join(SRC_DIR, "..", "test-fixtures", "minimal-cli", "crewhaus.yaml");
 
+/**
+ * Hermetic harness registry for every spawn in this file.
+ *
+ * `run`/`compile`/`eval`/`dev` self-register the harness they touch, and for
+ * a spec passed by path that is the SPEC's directory — `HELLO_SPEC` above,
+ * inside the repo. The default registry root's ephemeral-cwd guard cannot
+ * help (it looks at the cwd, not at the spec dir), so without this every run
+ * of this file writes a row into the developer's real
+ * `~/.crewhaus/harnesses.json`.
+ */
+const REGISTRY_ROOT = newTempRoot();
+const HERMETIC_REGISTRY: Record<string, string> = {
+  CREWHAUS_REGISTRY_ROOT: join(REGISTRY_ROOT, "registry"),
+  CREWHAUS_WATCHME_ROOT: join(REGISTRY_ROOT, "watchme"),
+};
+
 async function runCli(
   args: ReadonlyArray<string>,
   cwd: string,
@@ -389,6 +405,7 @@ async function runCli(
     cwd,
     env: {
       PATH: process.env["PATH"] ?? "",
+      ...HERMETIC_REGISTRY,
       CREWHAUS_DATASETS_DIR: join(cwd, "datasets"),
     },
     stdin: "ignore",

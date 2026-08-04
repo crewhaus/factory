@@ -685,6 +685,11 @@ table.fleet {
   background: var(--panel);
   border-color: var(--rule-2);
 }
+/* A second surface stacked inside one tab (an M1/M2 panel above its M3
+   half). Each view clears the container it is given, so they get their own. */
+.tab-section {
+  margin-top: 12px;
+}
 
 .crumb-line {
   display: flex;

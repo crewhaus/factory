@@ -48,11 +48,22 @@ export function lowerSecretString(raw: string): SecretRef {
   return { kind: "literal", value: raw };
 }
 
-/** True when a credential-shaped value would FAIL compilation: it starts
- *  with `$` but is not a valid `$UPPER_SNAKE` reference (e.g. `$slack_token`,
- *  `${SLACK_BOT_TOKEN}`, `$1PASSWORD`). Mirrors `lowerCredential`. */
-export function isMalformedEnvRef(raw: string): boolean {
-  return raw.startsWith("$") && !ENV_REF_RE.test(raw);
+/**
+ * True when a credential-shaped value would FAIL compilation: it starts with
+ * `$` but is not a valid `$UPPER_SNAKE` reference (e.g. `$slack_token`,
+ * `${SLACK_BOT_TOKEN}`, `$1PASSWORD`). Mirrors `lowerCredential`.
+ *
+ * Takes `unknown` on purpose. Every caller in this package reads a RAW
+ * parsed spec — the artifact that has NOT been validated yet, which is the
+ * whole reason preflight exists. A channel block missing a required field,
+ * or a YAML scalar the operator forgot to quote (`applicationId: 1234` is a
+ * number), must come back as a reported finding; a grammar predicate that
+ * throws on it turns the most common spec mistake into a 500 on every route
+ * that predicts boot behaviour. Non-strings are not malformed REFERENCES —
+ * they are a different fault, and the callers name it themselves.
+ */
+export function isMalformedEnvRef(raw: unknown): boolean {
+  return typeof raw === "string" && raw.startsWith("$") && !ENV_REF_RE.test(raw);
 }
 
 /** The compiler's diagnostic for a malformed credential env ref, reproduced

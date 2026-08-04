@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -58,7 +58,10 @@ type RunOpts = {
  * the working directory.
  */
 async function runCli(args: ReadonlyArray<string>, opts: RunOpts = {}): Promise<RunResult> {
-  const baseEnv: Record<string, string> = { PATH: process.env["PATH"] ?? "" };
+  const baseEnv: Record<string, string> = {
+    PATH: process.env["PATH"] ?? "",
+    ...HERMETIC_REGISTRY,
+  };
   for (const [k, v] of Object.entries(opts.env ?? {})) {
     if (v !== undefined) baseEnv[k] = v;
   }
@@ -87,6 +90,26 @@ let tmp: string;
  * never show up in a directory listing a test is inspecting.
  */
 let sandboxCwd: string;
+
+/**
+ * Hermetic harness registry for every spawn in this file.
+ *
+ * `run`/`compile`/`eval`/`dev` self-register the harness they touch, and for
+ * a spec passed by path that is the SPEC's directory — `HELLO_SPEC` and its
+ * siblings above, inside the repo. The default registry root's ephemeral-cwd
+ * guard cannot help (it looks at the cwd, not at the spec dir), so without
+ * this every run of this file writes a row per fixture into the developer's
+ * real `~/.crewhaus/harnesses.json`.
+ */
+const REGISTRY_ROOT = mkdtempSync(join(tmpdir(), "crewhaus-cli-registry-"));
+const HERMETIC_REGISTRY: Record<string, string> = {
+  CREWHAUS_REGISTRY_ROOT: join(REGISTRY_ROOT, "registry"),
+  CREWHAUS_WATCHME_ROOT: join(REGISTRY_ROOT, "watchme"),
+};
+afterAll(() => {
+  rmSync(REGISTRY_ROOT, { recursive: true, force: true });
+});
+
 beforeEach(() => {
   tmp = mkdtempSync(join(tmpdir(), "crewhaus-cli-test-"));
   sandboxCwd = mkdtempSync(join(tmpdir(), "crewhaus-cli-cwd-"));

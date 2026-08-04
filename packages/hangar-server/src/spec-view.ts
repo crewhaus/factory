@@ -7,10 +7,17 @@
  * SET/UNSET booleans against the merged spawn env — names and presence
  * only, never a value.
  *
- * Capability badges come from a LENIENT top-level key scan, not a schema
- * parse: a fleet page must badge a harness whose spec is a version ahead of
- * (or behind) the manager's schema. The badge list is the fleet-table
- * capability column of the read-only milestone.
+ * Capability badges come from a LENIENT key scan, not a schema parse: a
+ * fleet page must badge a harness whose spec is a version ahead of (or
+ * behind) the manager's schema. The badge list is the fleet-table capability
+ * column of the read-only milestone.
+ *
+ * Lenient does not mean wrong about where a block lives. `wiki:` and
+ * `dream:` are NOT top-level keys — the schema nests them under `memory:`
+ * (`memory.wiki` / `memory.dream`), and a top-level `dream:` fails
+ * validation outright — so scanning only column 0 made two of the seven
+ * badges unreachable for every valid spec. Each badge therefore carries the
+ * parent block it may nest under, and the scan looks in both places.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -19,7 +26,7 @@ import { parseSpecIssues } from "@crewhaus/spec";
 import { mergedSpawnEnv } from "./env-file";
 import { maskSpecYaml } from "./mask";
 
-/** The M1 capability-badge set (presence of the top-level spec block). */
+/** The M1 capability-badge set (presence of the spec block that declares it). */
 export const BADGE_KEYS = [
   "memory",
   "wiki",
@@ -31,11 +38,53 @@ export const BADGE_KEYS = [
 ] as const;
 export type BadgeKey = (typeof BADGE_KEYS)[number];
 
-/** Lenient top-level-key scan: `<key>:` at column 0. */
+/**
+ * The top-level block a badge key may ALSO appear inside. `wiki:` and
+ * `dream:` are schema children of `memory:`; the rest are top-level blocks
+ * with no nesting parent. The top-level scan is still tried first, so a spec
+ * a schema version ahead (or behind) that hoists one of them still badges.
+ */
+const BADGE_PARENTS: Partial<Record<BadgeKey, readonly string[]>> = {
+  wiki: ["memory"],
+  dream: ["memory"],
+};
+
+/**
+ * The text of a top-level YAML block: the remainder of the `<key>:` line
+ * plus every following line that is indented, blank, or a comment — up to
+ * the next key at column 0. Comments are stripped so a commented-out
+ * `# wiki:` does not badge. Deliberately textual, like the rest of this
+ * scan: a spec that does not parse under this manager's schema must still
+ * badge correctly.
+ */
+function topLevelBlockText(yamlText: string, key: string): string {
+  const lines = yamlText.split(/\r?\n/);
+  const uncommented = (line: string): string => line.replace(/#.*$/, "");
+  const start = lines.findIndex((line) => new RegExp(`^${key}\\s*:`).test(line));
+  if (start === -1) return "";
+  const block = [uncommented(lines[start] as string).replace(new RegExp(`^${key}\\s*:`), "")];
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const line = lines[i] as string;
+    if (line.trim() === "" || /^[\s#]/.test(line)) block.push(uncommented(line));
+    else break;
+  }
+  return block.join("\n");
+}
+
+/** `<key>:` anywhere inside a block's text (flow or indented mapping). */
+function declaresKey(blockText: string, key: string): boolean {
+  return new RegExp(`(?:^|[\\s{,])${key}\\s*:`, "m").test(blockText);
+}
+
+/** Lenient key scan: `<key>:` at column 0, or inside the block that owns it. */
 export function capabilityBadges(yamlText: string): Record<BadgeKey, boolean> {
   const out = {} as Record<BadgeKey, boolean>;
   for (const key of BADGE_KEYS) {
-    out[key] = new RegExp(`^${key}:`, "m").test(yamlText);
+    out[key] =
+      new RegExp(`^${key}:`, "m").test(yamlText) ||
+      (BADGE_PARENTS[key] ?? []).some((parent) =>
+        declaresKey(topLevelBlockText(yamlText, parent), key),
+      );
   }
   return out;
 }

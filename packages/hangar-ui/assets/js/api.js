@@ -13,7 +13,7 @@
  * (no cookies ⇒ no CSRF surface) and never in a query string.
  */
 
-import { ROUTES, buildPath } from "./routes.js";
+import { ROUTES, buildPath, m3RouteKeys } from "./routes.js";
 import { createSseParser } from "./supervision.js";
 
 const TOKEN_KEY = "hangar.token";
@@ -199,13 +199,55 @@ export function streamRunEvents(id, runId, onFrame) {
 }
 
 /**
+ * One M3 request. Uniform signature — `(params, body, query)` — and a
+ * uniform ANSWER: `{ ok, status, body }`, never a throw for a non-2xx.
+ *
+ * That is deliberate for this surface. M3 refusals are the interesting part:
+ * a `409` carrying the human-owned spec diff, a `409 stale_article_version`
+ * with the version that moved under you, a `501 not implemented (M3)` while
+ * a handler is still a stub. Turning any of those into an `ApiError` throws
+ * away the exact payload the screen exists to render. `401` still routes to
+ * the token screen (that is a session fact, not a route answer).
+ */
+async function callM3(route, params, body, query) {
+  const path = `${buildPath(route.path, params ?? {})}${query ?? ""}`;
+  const { status, body: parsed, text } = await rawRequest(route.method, path, body);
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    body: parsed ?? (text !== undefined && text !== "" ? { message: text } : {}),
+  };
+}
+
+/**
+ * The M3 wrappers, GENERATED from the route map rather than hand-written.
+ *
+ * There are ~180 of them across eleven groups; typing each one out would be
+ * 180 chances to mistype a path that the contract test would then have to
+ * catch. Generating them makes the map the only place a path exists on this
+ * side, which is the same reason `routes.js` exists at all. Each wrapper
+ * takes `(params, body, query)`; writes default to an empty body so a
+ * no-argument call is still a well-formed request.
+ */
+const m3Api = {};
+for (const key of m3RouteKeys()) {
+  const route = ROUTES[key];
+  const needsBody = route.method === "POST" || route.method === "PUT";
+  m3Api[key] = (params, body, query) =>
+    callM3(route, params, needsBody ? (body ?? {}) : undefined, query);
+}
+
+/**
  * Every server route the console talks to — thin named wrappers over the
  * `ROUTES` contract map. M1's writes were registry CRUD only (manager
  * state); M2 adds the driving verbs: process control, the control.v1 proxy,
  * the two inboxes' decisions, the job queue, and the two action faces
- * (session pin, eval baseline).
+ * (session pin, eval baseline); M3's detail surface is spread in from the
+ * generated wrappers above (hand-written names below win a collision, so a
+ * route that later earns a friendlier signature can simply be written out).
  */
 export const api = {
+  ...m3Api,
   // fleet feed + registry CRUD
   harnesses: (hydrate = false) =>
     call(ROUTES.harnesses, {}, undefined, hydrate ? "?hydrate=1" : ""),
