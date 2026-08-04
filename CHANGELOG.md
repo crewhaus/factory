@@ -56,6 +56,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `list`/`status`/`run`, scoping the discovered set to registry-group
   members.
 
+- **`crewhaus hangar` — the manager console.** `crewhaus hangar` (alias
+  `hangar serve`) opens the local Hangar web console over the machine-wide
+  registry: it seeds the registry from the legacy watchme store
+  (best-effort), boots the loopback `@crewhaus/hangar-server` with the
+  embedded `@crewhaus/hangar-ui` assets (default `127.0.0.1:4200`;
+  `--port`/`--host` rebind, and `--host` REQUIRES auth), prints a boxed
+  summary, and opens the browser at `<url>/#t=<token>` — the bearer token
+  travels as a URL FRAGMENT, never a query string, so it cannot land in
+  server logs or referrer headers (`--no-open` skips the browser;
+  `--no-auth` is loopback dev only). A single-instance lock at
+  `<hangarRoot>/hangar.lock` (JSON pid/startedAt/port/url, written
+  atomically) refuses a second boot while the first pid is alive, replaces
+  a stale lock left by a dead pid with a note, and is released on
+  SIGINT/SIGTERM shutdown. `hangar status [--json]` reports
+  lock/port/registry/token state without needing a running server, and
+  `hangar open` re-reads the token file to rebuild the fragment URL for a
+  running console. `hangar serve --smoke` boots on an ephemeral port and
+  self-checks — healthz, the embedded UI shell, and `/api/harnesses` both
+  with the bearer token (200) and without (401) — then exits; it is the
+  release workflow's compiled-binary smoke entry.
+
 ### Changed
 
 - **The `fleet` and `doctor`/`channel` cores are consumed from the new

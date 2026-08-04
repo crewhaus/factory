@@ -62,6 +62,8 @@
     "@crewhaus/feedback-distill": "workspace:*",
     "@crewhaus/gateway-server": "workspace:*",
     "@crewhaus/grader-safety-classifiers": "workspace:*",
+    "@crewhaus/hangar-server": "workspace:*",
+    "@crewhaus/hangar-ui": "workspace:*",
     "@crewhaus/harness-inventory": "workspace:*",
     "@crewhaus/harness-registry": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",

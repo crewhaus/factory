@@ -18,6 +18,8 @@
     { "path": "../../packages/canary-controller" },
     { "path": "../../packages/compiler" },
     { "path": "../../packages/feedback-distill" },
+    { "path": "../../packages/hangar-server" },
+    { "path": "../../packages/hangar-ui" },
     { "path": "../../packages/harness-inventory" },
     { "path": "../../packages/harness-registry" },
     { "path": "../../packages/preflight" },

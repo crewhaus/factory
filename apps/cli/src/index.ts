@@ -21433,6 +21433,25 @@ switch (subcommand) {
     }
     break;
   }
+  case "hangar": {
+    // Hangar M1 — the manager console: `hangar [serve]` boots the loopback
+    // hangar-server with the embedded hangar-ui assets (single-instance
+    // lock, watchme seed, #fragment token handoff, --smoke self-check);
+    // `hangar status|open` inspect/reopen it. Heavy lifting lives in the
+    // side-effect-free ./hangar-cmd module (this entry file runs an argv
+    // switch on import); it throws plain Errors on bad arguments, routed
+    // through die() like `harness`.
+    try {
+      const { runHangarCommand } = await import("./hangar-cmd");
+      const out = await runHangarCommand(rest);
+      for (const line of out.lines) process.stdout.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "knowledge": {
     // Item 63 — cross-harness knowledge sync (memories/graders/prompts).
     const action = rest[0] ?? "";
