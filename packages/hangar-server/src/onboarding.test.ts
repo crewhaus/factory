@@ -10,7 +10,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import {
   DEMOS_DIR_ENV,
   StarterInstallError,
@@ -43,23 +43,30 @@ function makeDemosCheckout(root: string, starter = "cli-quickstart"): string {
 
 describe("suggestScanRoots", () => {
   test("suggests the conventional home and the launch directory, each with a reason", () => {
-    const suggestions = suggestScanRoots({}, "/home/op", "/home/op/work", () => true);
-    expect(suggestions.map((s) => s.dir)).toEqual(["/home/op/harnesses", "/home/op/work"]);
+    const home = join(sep, "home", "op");
+    const work = join(home, "work");
+    const suggestions = suggestScanRoots({}, home, work, () => true);
+    // Built with `join`, not literals: the impl joins, so a literal POSIX
+    // expectation asserts the platform rather than the behaviour.
+    expect(suggestions.map((s) => s.dir)).toEqual([join(home, "harnesses"), work]);
     for (const s of suggestions) expect(s.why.length).toBeGreaterThan(0);
   });
 
   test("a configured demos checkout and harness root are offered too, de-duplicated", () => {
     const suggestions = suggestScanRoots(
-      { [DEMOS_DIR_ENV]: "/opt/demos", CREWHAUS_HARNESS_ROOT: "/home/op/harnesses" },
-      "/home/op",
-      "/home/op",
+      {
+        [DEMOS_DIR_ENV]: join(sep, "opt", "demos"),
+        CREWHAUS_HARNESS_ROOT: join(sep, "home", "op", "harnesses"),
+      },
+      join(sep, "home", "op"),
+      join(sep, "home", "op"),
       () => false,
     );
     const dirs = suggestions.map((s) => s.dir);
-    expect(dirs).toContain("/opt/demos/starters");
+    expect(dirs).toContain(join(sep, "opt", "demos", "starters"));
     // `~/harnesses` was already suggested; CREWHAUS_HARNESS_ROOT must not
     // add it a second time.
-    expect(dirs.filter((d) => d === "/home/op/harnesses")).toHaveLength(1);
+    expect(dirs.filter((d) => d === join(sep, "home", "op", "harnesses"))).toHaveLength(1);
     expect(suggestions.every((s) => !s.exists)).toBe(true);
   });
 

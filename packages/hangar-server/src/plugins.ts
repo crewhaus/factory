@@ -199,10 +199,18 @@ export function pluginSeesHarness(
   permissions: PluginPermissions | undefined,
   harnessDir: string,
 ): boolean {
+  // `matchesGlob`'s pattern language is defined with `/` — a plugin manifest
+  // writes `read:…/harnesses/**` whatever platform it runs on — so the TARGET
+  // has to speak the same alphabet. Passing a Windows path here matched
+  // nothing at all, which failed closed (no pane, rather than a pane on a
+  // harness the plugin may not read) but silently disabled every plugin.
+  // Normalized at the call site rather than inside `matchesGlob`, whose
+  // semantics other consumers depend on.
+  const posix = harnessDir.replace(/\\/g, "/");
   return (
-    isFsAllowed(permissions, "read", harnessDir) ||
-    isFsAllowed(permissions, "read", `${harnessDir}/`) ||
-    isFsAllowed(permissions, "read", join(harnessDir, "crewhaus.yaml"))
+    isFsAllowed(permissions, "read", posix) ||
+    isFsAllowed(permissions, "read", `${posix}/`) ||
+    isFsAllowed(permissions, "read", `${posix}/crewhaus.yaml`)
   );
 }
 

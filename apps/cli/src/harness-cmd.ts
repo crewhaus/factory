@@ -23,7 +23,7 @@
  * `Error`s; the entry file routes them through `die()` like `route` does.
  */
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { readBaselines, readRunIndexLatest } from "@crewhaus/eval-report";
 import {
   type BuildInventoryDeps,
@@ -564,6 +564,13 @@ function harnessPin(reg: HangarRegistry, argv: readonly string[]): HarnessComman
   };
 }
 
+/** Containment by `relative()`, not a `${root}/` prefix: the separator is
+ *  `\\` on Windows, so a prefix test silently matched nothing there. */
+function isUnder(root: string, dir: string): boolean {
+  const rel = relative(resolve(root), resolve(dir));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
 function harnessScan(
   reg: HangarRegistry,
   argv: readonly string[],
@@ -620,9 +627,7 @@ function harnessScan(
   // scanned roots are counted (never pruned — that is remove()'s job).
   const missing = reg
     .list()
-    .filter(
-      (e) => e.missingSince !== null && roots.some((r) => e.dir === r || e.dir.startsWith(`${r}/`)),
-    ).length;
+    .filter((e) => e.missingSince !== null && roots.some((r) => isUnder(r, e.dir))).length;
   lines.push(
     `scan: ${added} added, ${refreshed} refreshed, ${missing} missing (${roots.length} root(s))`,
   );

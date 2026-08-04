@@ -56,7 +56,7 @@ import {
   readdirSync,
   statSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { EXIT_CODES, type FailureClass } from "@crewhaus/errors";
 import { extractFeedbackRecords, mergeFeedback } from "@crewhaus/feedback-distill";
 import type { Manifest } from "@crewhaus/spec-registry";
@@ -457,7 +457,12 @@ function relTo(root: string, dir: string): string {
   const absRoot = resolve(root);
   const absDir = resolve(dir);
   if (absDir === absRoot) return ".";
-  if (absDir.startsWith(`${absRoot}/`)) return absDir.slice(absRoot.length + 1);
+  // `relative()` rather than a `${root}/` prefix — the separator is `\` on
+  // Windows, so the prefix never matched and every row showed its full
+  // absolute path. Cosmetic here, but it is the same bug that broke
+  // containment in `isInside` and the continuity trash.
+  const rel = relative(absRoot, absDir);
+  if (rel !== "" && !rel.startsWith("..") && !isAbsolute(rel)) return rel;
   return absDir;
 }
 
