@@ -47,6 +47,12 @@ export type ExitClassification = {
   /** True for a zero exit the operator did not ask for — a daemon that
    *  "finished" is a bug worth naming, not a success. */
   readonly unexpectedClean: boolean;
+  /** True when this was reconstructed from the harness's run ledger after a
+   *  manager restart rather than observed live. Callers should say so
+   *  ("from the ledger") instead of implying they watched it exit. */
+  readonly fromLedger?: boolean;
+  /** ISO end time, present on ledger-derived classifications. */
+  readonly endedAt?: string;
 };
 
 export type ClassifyExitInput = {

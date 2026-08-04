@@ -1215,9 +1215,18 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
 
     if (head === "jobs" && rest.length === 0) {
       if (method !== "GET") throw new HttpError(405, "method not allowed");
+      // `recent` folds terminal jobs from the persisted ledger. Without it a
+      // job vanishes the instant it finishes and `interrupted` — the state
+      // restore() assigns to work a dead manager abandoned — is never
+      // visible to the operator it exists to inform.
+      const limitRaw = url.searchParams.get("recent");
+      const limit = limitRaw === null ? undefined : Number.parseInt(limitRaw, 10);
       return json({
         pending: processes.jobs.pending(),
         running: processes.jobs.running(),
+        recent: processes.jobs.recent(
+          limit !== undefined && Number.isFinite(limit) ? limit : undefined,
+        ),
       });
     }
 

@@ -156,10 +156,30 @@ export type JobQueue = {
   };
   pending(): readonly JobRecord[];
   running(): readonly JobRecord[];
+  /**
+   * Recently FINISHED jobs (`done`/`failed`/`cancelled`/`interrupted`),
+   * newest first, folded from the persisted ledger.
+   *
+   * Without this a terminal state is invisible: a job vanishes from the
+   * queue view the instant it finishes, and `interrupted` — the whole point
+   * of `restore()` reopening work a dead manager abandoned — could never be
+   * shown to the operator it exists to inform.
+   */
+  recent(limit?: number): readonly JobRecord[];
   /** Resolves when nothing is pending or running. */
   idle(): Promise<void>;
   cancel(jobId: string): boolean;
 };
+
+/** Job states that mean the job will not run again. */
+export const TERMINAL_JOB_STATES: ReadonlySet<JobState> = new Set<JobState>([
+  "done",
+  "failed",
+  "cancelled",
+  "interrupted",
+]);
+
+export const DEFAULT_RECENT_JOBS = 20;
 
 export const DEFAULT_JOB_CONCURRENCY = 3;
 
@@ -272,6 +292,15 @@ export function createJobQueue(options: JobQueueOptions): JobQueue {
     },
     pending: () => [...queued],
     running: () => [...active.values()],
+    recent: (limit = DEFAULT_RECENT_JOBS) => {
+      // Folded from the ledger, not from memory: after a manager restart the
+      // in-memory maps are empty but the operator most needs to see what the
+      // previous manager left behind (especially `interrupted`).
+      const finished = options.store.read().filter((j) => TERMINAL_JOB_STATES.has(j.state));
+      const at = (j: JobRecord): number => Date.parse(j.endedAt ?? j.startedAt ?? j.enqueuedAt) || 0;
+      finished.sort((a, b) => at(b) - at(a));
+      return finished.slice(0, Math.max(0, limit));
+    },
     idle: () =>
       new Promise<void>((resolve) => {
         idleWaiters.push(resolve);

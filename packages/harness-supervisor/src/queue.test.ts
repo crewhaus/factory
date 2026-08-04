@@ -199,3 +199,31 @@ describe("createHarnessMutex", () => {
     expect(mutex.tryAcquire("/a")).toBeDefined();
   });
 });
+
+describe("recent() — terminal jobs stay visible", () => {
+  test("finished jobs are folded from the ledger, newest first, after a restart", async () => {
+    const store = createMemoryJobStore();
+    const q1 = createJobQueue({ store, run: async () => ({ exitCode: 0 }) });
+    const done = q1.submit({ harnessDir: "/h/a", kind: "doctor", argv: ["doctor"] });
+    await q1.idle();
+
+    // A job still RUNNING when the manager dies: nothing marks it finished,
+    // so the ledger keeps it open. That is exactly the record `restore()`
+    // reopens as `interrupted` — the state an operator most needs to see.
+    const stuckQueue = createJobQueue({ store, run: () => new Promise<void>(() => {}) });
+    const stuck = stuckQueue.submit({ harnessDir: "/h/b", kind: "eval", argv: ["eval"] });
+    expect(stuckQueue.running().map((j) => j.jobId)).toContain(stuck.jobId);
+
+    // The manager restarts over the same persisted ledger.
+    const q2 = createJobQueue({ store, run: async () => ({ exitCode: 0 }) });
+    q2.restore();
+
+    const byId = new Map(q2.recent().map((j) => [j.jobId, j.state]));
+    expect(byId.get(done.jobId)).toBe("done");
+    expect(byId.get(stuck.jobId)).toBe("interrupted");
+    // A fresh queue holds nothing in memory — this can only come from the
+    // persisted ledger.
+    expect(q2.running()).toHaveLength(0);
+    expect(q2.recent(1)).toHaveLength(1);
+  });
+});

@@ -597,6 +597,41 @@ describe("adopt", () => {
     const h = setup("channel");
     expect(await h.supervisor.adopt()).toBe("none");
   });
+
+  test("a restart recovers the last exit from the ledger, flagged as ledger-derived", async () => {
+    const h = setup("channel");
+    await h.supervisor.start();
+    const runfile = readRunfile(h.dir);
+    const child = h.ops.last();
+    if (runfile === undefined || child === undefined) throw new Error("no run");
+    // The daemon dies out of funding while we are watching, so the ledger
+    // records the exit and the runfile is cleared.
+    child.exit(EXIT_CODES.billing);
+    await tick();
+    h.supervisor.close();
+
+    // A NEW manager: nothing live to adopt, but the fleet failure board must
+    // not go blank just because the console restarted.
+    const second = createHarnessSupervisor({
+      harnessDir: h.dir,
+      target: "channel",
+      ops: h.ops,
+      clock: createFakeClock(),
+      plan: h.plan,
+      gate: allowGate,
+    });
+    expect(await second.adopt()).toBe("none");
+    const snap = second.snapshot();
+    expect(snap.state).toBe("stopped");
+    expect(snap.lastExit?.exitCode).toBe(EXIT_CODES.billing);
+    expect(snap.lastExit?.failureClass).toBe("billing");
+    // Provenance is explicit — we did not watch this happen.
+    expect(snap.lastExit?.fromLedger).toBe(true);
+    expect(snap.lastExit?.endedAt).toBeTruthy();
+    // And it is never treated as restartable on the strength of a ledger read.
+    expect(snap.lastExit?.restartable).toBe(false);
+    second.close();
+  });
 });
 
 describe("close", () => {

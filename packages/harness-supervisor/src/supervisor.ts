@@ -55,6 +55,7 @@ import {
   pruneRuns,
   readRetentionPolicy,
   readRunfile,
+  recentRuns,
   runCursorPath,
   runEventsPath,
   runLogPath,
@@ -662,6 +663,27 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         now: clock.now,
       });
       if (result.status === "none") {
+        // No live runfile — but the harness's own ledger outlives this
+        // process, and it is the only record of how the last run ended. A
+        // manager restart must not blank the fleet's failure board, so fold
+        // the newest CLOSED ledger entry into `lastExit`, flagged as
+        // ledger-derived so callers never imply we watched it happen.
+        if (lastExit === undefined) {
+          const [last] = recentRuns(options.harnessDir, 1);
+          if (last !== undefined && last.endedAt !== undefined && last.exitCode !== undefined) {
+            lastExit = {
+              ...classifyExit({
+                exitCode: last.exitCode,
+                // We were not running when it ended, so we cannot claim the
+                // stop was ours; `longRunning` follows the run's kind.
+                operatorStop: false,
+                longRunning: last.kind === "daemon",
+              }),
+              fromLedger: true,
+              endedAt: last.endedAt,
+            };
+          }
+        }
         setState("stopped");
         return "none";
       }
