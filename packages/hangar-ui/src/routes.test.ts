@@ -9,9 +9,15 @@
  */
 import { describe, expect, test } from "bun:test";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
-import { ROUTES, buildPath } from "../assets/js/routes.js";
+import {
+  M3_GROUPS,
+  ROUTES,
+  buildPath,
+  m3RouteKeys,
+  routeKeysInGroup,
+} from "../assets/js/routes.js";
 
-type RouteDef = { method: string; path: string; body?: string; stream?: string };
+type RouteDef = { method: string; path: string; body?: string; stream?: string; group?: string };
 const entries = Object.entries(ROUTES as Record<string, RouteDef>);
 
 describe("ROUTES map", () => {
@@ -105,9 +111,50 @@ describe("ROUTES map", () => {
   });
 
   test("exactly one route is an SSE stream (api.js must not res.json() it)", () => {
+    // M3 deliberately adds none: the dev loop and the MCP projection are run
+    // CLASSES, so their live output rides the one existing run feed rather
+    // than a second streaming mechanism.
     const streams = entries.filter(([, d]) => d.stream !== undefined);
     expect(streams.map(([k]) => k)).toEqual(["runEvents"]);
     expect(streams[0]?.[1].stream).toBe("sse");
+  });
+});
+
+describe("the M3 surface is grouped, and the grouping is the contract", () => {
+  const groups = M3_GROUPS as string[];
+  const m3Keys = m3RouteKeys() as string[];
+
+  test("every M3 route names one of the eleven groups", () => {
+    for (const key of m3Keys) {
+      const group = (ROUTES as Record<string, RouteDef>)[key]?.group;
+      expect(`${key}:${groups.includes(group ?? "")}`).toBe(`${key}:true`);
+    }
+  });
+
+  test("no group is empty — an area with no routes is a planning bug", () => {
+    for (const group of groups) {
+      expect(`${group}:${(routeKeysInGroup(group) as string[]).length > 0}`).toBe(`${group}:true`);
+    }
+    // …and the groups partition the M3 keys exactly.
+    const fromGroups = groups.flatMap((g) => routeKeysInGroup(g) as string[]).sort();
+    expect(fromGroups).toEqual([...m3Keys].sort());
+  });
+
+  test("M1/M2 routes carry no group (a group means an M3 handler owns it)", () => {
+    const ungrouped = entries.filter(([, d]) => d.group === undefined).map(([k]) => k);
+    expect(ungrouped).toContain("harnesses");
+    expect(ungrouped).toContain("proc");
+    expect(ungrouped).toContain("runEvents");
+    expect(ungrouped.length + m3Keys.length).toBe(entries.length);
+  });
+
+  test("the six implementer areas are all present in the map", () => {
+    // spec · memory · evals+data+feedback · creds+channels+security · thredz
+    // · inspect+runtime — the split the M3 build is parallelized along.
+    for (const group of groups) {
+      expect(`${group}:${(routeKeysInGroup(group) as string[]).length}`).not.toBe(`${group}:0`);
+    }
+    expect(m3Keys.length).toBeGreaterThanOrEqual(150);
   });
 });
 

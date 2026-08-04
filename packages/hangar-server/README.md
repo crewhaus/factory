@@ -7,7 +7,11 @@ lifecycle around it.
 
 M1 was read-only over harness state (registry CRUD was the only write).
 **M2 makes the console a driver**, and every new surface is a composition
-of a layer that already exists rather than a second implementation of it:
+of a layer that already exists rather than a second implementation of it.
+**M3 adds the detail surface** — the spec's write side, the memory fabric's
+write side, the eval/dataset/feedback loops, credentials + channels +
+security, Thredz, and the raw inspectors — with its routes, guards and
+client wrappers frozen ahead of its handlers (see *M3* under Routes):
 
 | Surface | Composed from |
 |---|---|
@@ -101,6 +105,107 @@ GET  /api/review[?all=1]                   POST /api/h/:id/review/:itemId {verdi
 GET  /api/activity[?since=]                GET  /api/jobs   POST /api/h/:id/jobs {kind}
 ```
 
+### M3 — the detail surface (handlers are stubs)
+
+M3 is the tab-level detail behind every M2 screen. **Its contract is frozen
+and its handlers are not written yet**: every route below exists, is
+dispatched, applies every guard, and answers `501 not implemented (M3)`. That
+is deliberate — freezing routes, guards, masking and client wrappers first is
+what lets the six areas be implemented in parallel without colliding, and the
+contract test accepts a 501 today while demanding the view's fields the moment
+a route goes real.
+
+```
+# spec — structured editing, trust tiers, versions, builders
+PUT  /api/h/:id/spec                       POST /api/h/:id/spec/{patch,diff,pin,rollback,propose}
+GET  /api/h/:id/spec/{schema,trust,versions[/:version[/diff]]}
+GET  /api/builders/{templates,mcp-catalog} POST /api/builders/spec
+GET|POST /api/h/:id/builders/{graders,dataset,mcp}   DELETE /api/h/:id/builders/mcp/:name
+
+# memory — facts, continuity, wiki, watchme, learning, knowledge
+GET  /api/h/:id/memory/facts/:spec         POST /api/h/:id/memory/facts/:spec/{forget,sweep}
+POST /api/h/:id/memory/{recall,migrate}    GET  /api/h/:id/memory/{learning,knowledge,reflect}
+GET  /api/h/:id/memory/continuity[/trash]  POST /api/h/:id/memory/continuity/restore
+POST /api/h/:id/memory/knowledge/sync      GET  /api/h/:id/memory/dream/scaffold
+PUT  /api/h/:id/memory/wiki/:slug          GET  /api/h/:id/memory/wiki/:slug/{versions[/:version],links}
+POST /api/h/:id/memory/wiki/:slug/{signals,archive}
+GET  /api/h/:id/memory/watchme/{analytics,reports[/:stamp],intents,synthesized}
+POST /api/h/:id/memory/watchme/{toggle,publish,synthesized/:stamp/apply}
+
+# evals — the quality lab
+POST /api/h/:id/evals/{run,suites,plan,judge,redteam,sentinel,optimize,flywheel,experiments}
+GET  /api/h/:id/evals/{matrix[/:cell],suites,trends,judge,graders,coverage,sentinel,voice}
+GET  /api/h/:id/evals/{optimize[/:optRunId],flywheel,experiments,annotations}
+POST /api/h/:id/evals/graders/{suggest,test}
+POST /api/h/:id/evals/:runId/:sampleId/annotate
+
+# data — the dataset registry, hygiene, growth (the NAME travels in the body)
+GET  /api/h/:id/data/{datasets[/:name],status,quarantine}
+POST /api/h/:id/data/{verify,audit,lint,mine,synthesize,refresh-goldens}
+
+# feedback — the growth loops
+GET  /api/h/:id/feedback[/{fewshot,faq,lessons,advice,reactions}]   GET /api/feedback
+POST /api/h/:id/feedback/{distill,fewshot,faq,lessons,advice[/:adviceId/apply]}
+
+# creds / channels / security
+GET|POST /api/h/:id/env    DELETE /api/h/:id/env/:key
+GET  /api/credentials      POST /api/credentials/set
+GET|POST /api/h/:id/doctor GET /api/h/:id/secrets[/doctor]  POST /api/h/:id/secrets/:name/rotate
+GET  /api/h/:id/mcp/lint   GET  /api/h/:id/{channels,gateway,audit,slo}
+POST /api/h/:id/channels/verify  GET|POST /api/h/:id/channels/:channel/provision
+POST /api/h/:id/channels/:channel/{probe,synthetic}   POST /api/h/:id/audit/verify
+GET|POST /api/h/:id/security/{egress[/:decisionId],pii,corpus,compliance,onchain/tune}
+GET  /api/h/:id/security/{justification,sandbox,onchain[/sentinel],retention}
+POST /api/h/:id/security/justification/{calibrate,preflight}
+POST /api/h/:id/security/retention/{sweep,purge}
+
+# thredz — server-side proxied; the key never reaches the browser
+GET  /api/h/:id/thredz[/{wiki,records,schemas,goals,tasks,views,dashboards,listeners,
+                         webhooks,connectors,activity,keys}]        GET /api/thredz
+GET|PUT /api/h/:id/thredz/wiki/:slug        GET  /api/h/:id/thredz/wiki/:slug/versions
+POST /api/h/:id/thredz/wiki/:slug/rollback  GET|DELETE /api/h/:id/thredz/records/:recordId
+POST /api/h/:id/thredz/{records,listeners,keys,traverse}
+POST /api/h/:id/thredz/records/:recordId/restore   POST /api/h/:id/thredz/tasks/:taskId
+POST /api/h/:id/thredz/views/:viewId/execute       GET  /api/h/:id/thredz/dashboards/:dashboardId
+POST /api/h/:id/thredz/dashboards/:dashboardId/cards
+POST /api/h/:id/thredz/keys/:keyId/rotate
+
+# inspect / runtime
+GET  /api/h/:id/inspect[/{raw?path=,:store[/:name]}]   PUT /api/h/:id/inspect/settings
+GET  /api/h/:id/mcp-servers   POST /api/h/:id/mcp-servers/{start,stop}
+GET  /api/h/:id/dev           POST /api/h/:id/dev/{start,stop}
+```
+
+**Dispatch is a table, not a chain.** `src/m3-routes.ts` holds one row per
+route (key, method, path template, group, handler) and `matchM3` resolves a
+request against it LITERAL-FIRST, so `GET …/evals/matrix` matches the M3 route
+while `GET …/evals/run_…` still falls through to the M2 handler. One place in
+`server.ts` then applies every guard uniformly — id shape + registry lookup +
+live-directory check, per-param shape guards, JSON body parsing, a
+containment closure, and `maskDeep` on the way out — and hands the handler an
+already-validated `M3Context`. The per-area modules (`spec-edit.ts`,
+`builders.ts`, `memory-ops.ts`, `wiki-ops.ts`, `watchme-ops.ts`,
+`evals-ops.ts`, `data-ops.ts`, `feedback-ops.ts`, `creds-ops.ts`,
+`channels-ops.ts`, `security-ops.ts`, `thredz.ts`, `inspect.ts`,
+`runtime-ops.ts`) therefore contain nothing but subject matter.
+
+Each stub's docblock carries the write covenant it must honour — the store
+library or CLI verb that is the sanctioned path for its write, and the trap it
+must not re-learn. `src/m3.ts` states the covenant once for all of them: spec
+via `applySpecEdits` with `restrictToOptimizable` (human-owned paths route to
+`crewhaus propose`), env via `upsertEnvVar` (values in, presence booleans
+out), secrets via `secrets rotate` (so `onRotation` subscribers refresh), no
+hard delete anywhere in the memory fabric, wiki writes carrying
+`expectedVersion` with the stale-version retry, Thredz keys read server-side
+and never persisted, and the confirm → typed-confirm → dry-run-first ladder
+for destructive verbs.
+
+**Every M3 read answers `{present, note, verb, …}`.** Those three fields are
+the arguments the console's `emptyState(message, verb)` already takes: is
+there anything to show, why is it empty, and which CLI verb creates it. Most
+of this surface is normally empty on a given harness, and without them an
+empty panel is indistinguishable from a broken one.
+
 Absence is not an error: missing state renders as "nothing yet" shapes,
 and a vanished harness dir keeps its registry row (`missingSince`) with a
 relocate/remove affordance instead of disappearing.
@@ -153,6 +258,15 @@ console's route map: `src/contract.test.ts` imports hangar-ui's
 `assets/js/routes.js` and drives every route on a fixture server —
 writes must take effect, reads must carry every field the UI views read
 (the test's `VIEW_READS` table).
+
+The M3 routes are driven by that same test, and each must answer either `501
+not implemented (M3)` (still a stub) or a 2xx — at which point its
+`VIEW_READS` table is enforced automatically, with no edit to the driving
+loop. A 404 there would mean the dispatch table and the route map have
+drifted apart; a 500 would mean a guard threw. The test additionally asserts
+that `M3_ROUTES` and the map's grouped entries are the same set — key for
+key, method for method, path for path — so `routes.js`, `m3-routes.ts` and
+the test stay one truth rather than three opinions.
 
 ## Library use
 

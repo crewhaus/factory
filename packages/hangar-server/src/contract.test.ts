@@ -14,11 +14,34 @@
  * that prevents the M1 "every write 405s / every column is em-dash" class
  * of contract drift from recurring. A route added to routes.js without a
  * driver below fails the completeness check.
+ *
+ * ---------------------------------------------------------------------------
+ * M3 — how a frozen contract stays honest while its handlers are stubs
+ * ---------------------------------------------------------------------------
+ * The M3 detail surface (every route carrying a `group`) is driven too, and
+ * each one must answer one of exactly two things:
+ *
+ *   501 `not implemented (M3): …`  the handler is still a stub. The route
+ *       exists, its guards ran, its client wrapper reached it.
+ *   2xx                            the handler is REAL — and then, for a
+ *       read, `VIEW_READS` must carry its table and every field in it must
+ *       be present.
+ *
+ * Nothing else passes. A 404 means the dispatch table and the route map
+ * disagree; a 500 means a guard threw. So an implementer's whole job is:
+ * make the handler return real data, add the `VIEW_READS` entry, and add an
+ * effect assertion for a write. No edit to this file's driving loop, and no
+ * edit to `routes.js` — which is what lets six areas be built in parallel.
+ *
+ * The server's own dispatch table is asserted equal to the map's grouped
+ * entries, so all three files (routes.js, m3-routes.ts, this test) are held
+ * to one truth.
  */
 import { describe, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { logLine, makeFixtureHarness } from "./fixture";
+import { M3_ROUTES } from "./m3-routes";
 import { type TestServer, bootTestServer } from "./testkit";
 
 const NOW = Date.parse("2026-08-03T00:00:00.000Z");
@@ -30,6 +53,8 @@ type RouteDef = {
   readonly path: string;
   readonly body?: string;
   readonly stream?: string;
+  /** Set on every M3 route; names the area module that owns it. */
+  readonly group?: string;
 };
 
 /** The client's route map, loaded from the sibling package's asset file.
@@ -364,6 +389,290 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
 };
 
 // ---------------------------------------------------------------------------
+// M3 — the read envelope, and the per-area target tables
+// ---------------------------------------------------------------------------
+
+/**
+ * The three fields EVERY M3 read answers, whatever else it carries.
+ *
+ * They are not decoration: they are the arguments the console's empty state
+ * already takes. `emptyState(message, verb)` renders "nothing yet" plus the
+ * CLI verb that would create the data, and this surface is full of screens
+ * whose normal state is empty — a harness with no datasets, no redteam runs,
+ * no Thredz key, no compliance bundles. Without `present`/`note`/`verb` each
+ * of those renders as either a blank panel or an error, and both are lies.
+ *
+ *   present  is there anything to show (on disk, or upstream)
+ *   note     why it is empty, when it is  (null when it is not)
+ *   verb     the CLI verb that creates it (null when there is none)
+ */
+const M3_READ_BASE: ReadonlyArray<readonly [string, string]> = [
+  ["present", "boolean"],
+  ["note", "string|null"],
+  ["verb", "string|null"],
+];
+
+/** Compose the baseline with a route's own fields. */
+function m3Read(
+  ...extra: Array<readonly [string, string]>
+): ReadonlyArray<readonly [string, string]> {
+  return [...M3_READ_BASE, ...extra];
+}
+
+/**
+ * TARGET shapes for the M3 reads, one section per implementer area.
+ *
+ * These are NOT enforced while a handler is a stub — the drive below accepts
+ * a 501 and skips the check. They become enforced the instant a route
+ * answers 2xx, which is exactly when they should. Each area's implementer
+ * owns their own section: refine the `extra` fields as the payload firms up,
+ * and add the ones their view actually dereferences. Keeping the sections
+ * separate is deliberate — six people editing one table is a merge conflict,
+ * six people editing six blocks is not.
+ */
+const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
+  // ---- M3 · spec (owner: the Spec implementer) --------------------------
+  specSchema: m3Read(),
+  specTrust: m3Read(["paths", "array"]),
+  specVersions: m3Read(["versions", "array"]),
+  specVersion: m3Read(["version", "string"]),
+  specVersionDiff: m3Read(["diff", "string"]),
+  wizardTemplates: m3Read(["templates", "array"]),
+  mcpCatalog: m3Read(["connectors", "array"]),
+  graderCatalog: m3Read(),
+  datasetBuilder: m3Read(),
+  mcpConnectors: m3Read(["servers", "array"]),
+
+  // ---- M3 · memory (owner: the Memory implementer) ----------------------
+  memoryFacts: m3Read(["items", "array"]),
+  continuity: m3Read(),
+  continuityTrash: m3Read(["snapshots", "array"]),
+  learning: m3Read(),
+  knowledge: m3Read(),
+  dreamScaffold: m3Read(),
+  wikiVersions: m3Read(["versions", "array"]),
+  wikiVersion: m3Read(["version", "string"]),
+  wikiLinks: m3Read(["links", "array"]),
+  wikiReflect: m3Read(["articles", "array"]),
+  watchmeAnalytics: m3Read(),
+  watchmeReports: m3Read(["reports", "array"]),
+  watchmeReport: m3Read(),
+  watchmeIntents: m3Read(["intents", "array"]),
+  watchmeSynthesized: m3Read(["proposals", "array"]),
+
+  // ---- M3 · evals + data + feedback (owner: the Evals+Data implementer) -
+  evalMatrix: m3Read(["cells", "array"]),
+  evalMatrixCell: m3Read(),
+  evalSuites: m3Read(["suites", "array"]),
+  evalTrends: m3Read(["series", "array"]),
+  judgeCalibration: m3Read(),
+  graderCards: m3Read(["graders", "array"]),
+  redteam: m3Read(),
+  evalCoverage: m3Read(["gaps", "array"]),
+  sentinel: m3Read(),
+  voiceEvals: m3Read(),
+  optimizer: m3Read(["runs", "array"]),
+  optimizerArtifacts: m3Read(),
+  flywheel: m3Read(),
+  experiments: m3Read(["experiments", "array"]),
+  annotations: m3Read(["annotations", "array"]),
+  datasets: m3Read(["datasets", "array"]),
+  dataset: m3Read(["name", "string"]),
+  datasetStatus: m3Read(),
+  datasetQuarantine: m3Read(["entries", "array"]),
+  feedback: m3Read(["items", "array"]),
+  fewshot: m3Read(["entries", "array"]),
+  faq: m3Read(),
+  lessons: m3Read(),
+  advice: m3Read(["proposals", "array"]),
+  reactions: m3Read(),
+  feedbackFleet: m3Read(["harnesses", "array"]),
+
+  // ---- M3 · creds + channels + security (owner: that implementer) -------
+  // Credential reads answer PRESENCE only; there is no field here that
+  // could ever hold a value, and there must never be one.
+  env: m3Read(["keys", "array"]),
+  credentialsMatrix: m3Read(["harnesses", "array"], ["keys", "array"]),
+  doctor: m3Read(),
+  secrets: m3Read(["names", "array"]),
+  secretsDoctor: m3Read(),
+  mcpLint: m3Read(["findings", "array"]),
+  channels: m3Read(["channels", "array"]),
+  channelProvision: m3Read(),
+  gateway: m3Read(),
+  audit: m3Read(["records", "array"]),
+  egress: m3Read(["decisions", "array"]),
+  pii: m3Read(),
+  justification: m3Read(),
+  securityCorpus: m3Read(),
+  sandboxDoctor: m3Read(),
+  onchain: m3Read(),
+  onchainSentinel: m3Read(),
+  compliance: m3Read(["bundles", "array"]),
+  retention: m3Read(["pins", "array"]),
+  slo: m3Read(),
+
+  // ---- M3 · thredz (owner: the Thredz implementer) ----------------------
+  // No field here may ever hold key material: the proxy reads the key
+  // server-side and the browser never sees one.
+  thredzStatus: m3Read(),
+  thredzWiki: m3Read(["articles", "array"]),
+  thredzWikiArticle: m3Read(),
+  thredzWikiVersions: m3Read(["versions", "array"]),
+  thredzRecords: m3Read(["records", "array"]),
+  thredzRecord: m3Read(),
+  thredzSchemas: m3Read(["schemas", "array"]),
+  thredzGoals: m3Read(["goals", "array"]),
+  thredzTasks: m3Read(["tasks", "array"]),
+  thredzViews: m3Read(["views", "array"]),
+  thredzDashboards: m3Read(["dashboards", "array"]),
+  thredzDashboard: m3Read(),
+  thredzListeners: m3Read(["listeners", "array"]),
+  thredzWebhooks: m3Read(["webhooks", "array"]),
+  thredzConnectors: m3Read(["connectors", "array"]),
+  thredzActivity: m3Read(["items", "array"]),
+  thredzKeys: m3Read(["keys", "array"]),
+  thredzGlobal: m3Read(),
+
+  // ---- M3 · inspect + runtime (owner: that implementer) -----------------
+  inspectIndex: m3Read(["stores", "array"], ["excluded", "array"]),
+  inspectStore: m3Read(),
+  inspectEntry: m3Read(),
+  inspectRaw: m3Read(),
+  mcpServers: m3Read(),
+  dev: m3Read(),
+};
+
+/** Every read table, M1/M2 and M3 alike. */
+const ALL_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
+  ...VIEW_READS,
+  ...M3_VIEW_READS,
+};
+
+/**
+ * A value for every `:param` the M3 templates use, chosen to satisfy the
+ * dispatcher's guards so the drive reaches the handler and sees its 501
+ * rather than a 400.
+ */
+const M3_PARAMS: Record<string, string> = {
+  runId: "run_00000000000000aa",
+  optRunId: "run_00000000000000aa",
+  sampleId: "s1",
+  version: "1.0.0",
+  name: "smoke",
+  spec: "contract-harness",
+  slug: "how-to-deploy",
+  stamp: "20260803T000000Z",
+  cell: "m-alpha",
+  adviceId: "adv_1",
+  key: "CONTRACT_VAR",
+  channel: "slack",
+  decisionId: "egr_1",
+  recordId: "rec_1",
+  taskId: "task_1",
+  viewId: "view_1",
+  dashboardId: "dash_1",
+  keyId: "key_1",
+  store: "settings",
+};
+
+/**
+ * Request bodies for the M3 writes. They document each write's shape (which
+ * is what a stub cannot), and they are what the drive will send the day the
+ * handler is real — so a body key an implementer decides to require lands
+ * here rather than being discovered in the browser.
+ */
+const M3_BODIES: Record<string, unknown> = {
+  specEdit: { edits: [], confirmName: "contract-harness" },
+  specPatch: { edit: { path: "agent.instructions", value: "be concise" } },
+  specDiff: { edits: [] },
+  specPin: { env: "prod", version: "1.0.0", confirmName: "contract-harness" },
+  specRollback: { env: "prod", version: "1.0.0", confirmName: "contract-harness" },
+  specPropose: { edits: [], title: "tune instructions" },
+  wizardCreate: { dir: "/nonexistent", template: "cli", answers: {} },
+  graderWrite: { graders: [] },
+  datasetBuilderStep: { event: "start" },
+  mcpConnectorWrite: { name: "files", command: "bunx", args: [] },
+  memoryForget: { factId: "mem_0000000000000001", reason: "superseded by policy", confirm: true },
+  memorySweep: { dryRun: true },
+  memoryRecall: { query: "what is the deploy step" },
+  memoryMigrate: { dryRun: true },
+  continuityRestore: { stamp: "20260803T000000Z", confirm: true },
+  knowledgeSync: { direction: "pull", dryRun: true },
+  wikiWrite: { body: "# Deploy\nsteps\n", expectedVersion: 1 },
+  wikiSignals: { verified: true },
+  wikiArchive: { archived: true, confirm: true },
+  watchmeToggle: { watching: false, confirm: true },
+  watchmeApply: { edits: [], confirm: true },
+  watchmePublish: { dryRun: true },
+  evalLaunch: { dataset: "smoke" },
+  evalSuiteRun: { suite: "eval/suite.yaml", tier: "fast" },
+  evalPlan: { targetDelta: 0.05 },
+  judgeCalibrate: {},
+  gradersSuggest: {},
+  gradersTest: { golden: true },
+  redteamGenerate: {},
+  sentinelRun: {},
+  optimizerRun: { mutator: "rule-based" },
+  flywheelRun: {},
+  experimentRecord: { action: "record", name: "exp1", variant: "a" },
+  annotateSample: { verdict: "fail", note: "missed the constraint" },
+  datasetVerify: { name: "smoke" },
+  datasetAudit: {},
+  datasetLint: {},
+  datasetMine: { name: "smoke", dryRun: true },
+  datasetSynthesize: { name: "smoke", dryRun: true },
+  datasetRefreshGoldens: { name: "smoke", dryRun: true },
+  distillRun: {},
+  fewshotHarvest: {},
+  faqDistill: {},
+  lessonsUpdate: {},
+  adviceRun: {},
+  adviceApply: { confirm: true },
+  // A NAME and a placeholder — never a realistic credential literal. The
+  // repo's push protection rejects those in fixtures, and rightly.
+  envSet: { key: "CONTRACT_VAR", value: "placeholder-not-a-credential" },
+  credentialsSetAcross: {
+    key: "CONTRACT_VAR",
+    value: "placeholder-not-a-credential",
+    harnessIds: [],
+    confirmName: "contract-harness",
+  },
+  doctorRun: {},
+  secretsRotate: { value: "placeholder-not-a-credential", confirmName: "contract-harness" },
+  channelVerify: { offline: true },
+  channelProvisionRun: { confirm: true },
+  channelProbe: {},
+  channelSynthetic: { confirm: true },
+  auditVerify: {},
+  egressReview: { verdict: "allow" },
+  piiTune: { policy: {}, dryRun: true },
+  justificationCalibrate: {},
+  justificationPreflight: { tool: "Fetch" },
+  securityCorpusCheck: {},
+  onchainTune: { policy: {}, dryRun: true },
+  complianceEvidence: { framework: "soc2" },
+  retentionSweep: { dryRun: true },
+  retentionPurge: { dryRun: true },
+  thredzWikiWrite: { body: "# Deploy\n", expectedVersion: 1, visibility: "private" },
+  thredzWikiRollback: { version: 1, confirm: true },
+  thredzRecordCreate: { schema: "note", fields: {} },
+  thredzRecordRestore: {},
+  thredzTaskUpdate: { status: "done" },
+  thredzViewExecute: { params: {} },
+  thredzCardCreate: { title: "KPI", display: { aggregation: "sum", aggregationField: "amount" } },
+  thredzListenerCreate: { event: "record.created" },
+  thredzTraverse: { start: "rec_1", depth: 1 },
+  thredzKeyCreate: { label: "hangar" },
+  thredzKeyRotate: { confirm: true },
+  settingsWrite: { settings: {}, confirmName: "contract-harness" },
+  mcpServerStart: { transport: "stdio" },
+  mcpServerStop: {},
+  devStart: { checkOnly: true },
+  devStop: {},
+};
+
+// ---------------------------------------------------------------------------
 // field checker
 // ---------------------------------------------------------------------------
 
@@ -419,7 +728,7 @@ function typeOk(expected: string, v: unknown): boolean {
 }
 
 function assertViewReads(routeKey: string, payload: unknown): void {
-  const table = VIEW_READS[routeKey];
+  const table = ALL_VIEW_READS[routeKey];
   if (table === undefined) throw new Error(`no VIEW_READS table for read route "${routeKey}"`);
   for (const [path, type] of table) {
     for (const v of valuesAt(routeKey, payload, path)) {
@@ -825,6 +1134,49 @@ describe("UI route contract", () => {
         true,
       );
 
+      // -- M3: the whole detail surface, driven ------------------------------
+      // Each route must answer 501 (a stub) or 2xx (real, and then its
+      // VIEW_READS table is enforced). A 404 would mean the server's dispatch
+      // table and the console's map have drifted apart; a 500 would mean a
+      // guard threw. Both fail here, loudly, which is the entire point.
+      const m3Keys = Object.keys(ROUTES).filter((key) => ROUTES[key]?.group !== undefined);
+      expect(m3Keys.length).toBeGreaterThanOrEqual(150);
+      for (const key of m3Keys) {
+        const route = ROUTES[key] as RouteDef;
+        const params: Record<string, string> = { id };
+        for (const m of route.path.matchAll(/:([A-Za-z][A-Za-z0-9]*)/g)) {
+          const name = m[1] as string;
+          if (name === "id") continue;
+          const value = M3_PARAMS[name];
+          if (value === undefined) {
+            throw new Error(`no M3_PARAMS value for ":${name}" (route ${key} ${route.path})`);
+          }
+          params[name] = value;
+        }
+        const writes = route.method === "POST" || route.method === "PUT";
+        if (writes && M3_BODIES[key] === undefined) {
+          throw new Error(`no M3_BODIES entry for write route "${key}" (${route.path})`);
+        }
+        driven.add(key);
+        const { status, body } = await t.api(fill(route.path, params), {
+          method: route.method,
+          ...(writes ? { body: JSON.stringify(M3_BODIES[key]) } : {}),
+        });
+        if (status === 501) {
+          expect(`${key}:${String(body["error"] ?? "")}`).toContain("not implemented (M3)");
+          continue;
+        }
+        if (status < 200 || status >= 300) {
+          throw new Error(
+            `${key} ${route.method} ${route.path}: expected 501 (stub) or 2xx (implemented), got ${status} ${JSON.stringify(body)}`,
+          );
+        }
+        // Implemented. A read must now carry every field its view derefs; a
+        // write must additionally get an effect assertion in its area's
+        // section above — this loop proves it answered, not that it worked.
+        if (route.method === "GET") assertViewReads(key, body);
+      }
+
       // -- scan root + scan (effect: the root is scanned, entries refresh) --
       await drive("addScanRoot", {}, { body: { dir: t.harnessesRoot }, expectStatus: 201 });
       const scanned = await drive("scan", {}, { body: {} });
@@ -846,4 +1198,32 @@ describe("UI route contract", () => {
       await t.stop();
     }
   }, 30_000);
+
+  test("the server's M3 dispatch table IS the console's grouped route map", async () => {
+    // Three files, one truth: `routes.js` (what the client calls),
+    // `m3-routes.ts` (what the server dispatches), and this test (what CI
+    // proves). Any two of them agreeing while the third drifts is exactly
+    // the failure mode that shipped a console of dead buttons twice.
+    const ROUTES = await loadRoutes();
+    const mapped = Object.entries(ROUTES)
+      .filter(([, def]) => def.group !== undefined)
+      .map(([key, def]) => `${key} ${def.method} ${def.path} ${def.group}`)
+      .sort();
+    const dispatched = M3_ROUTES.map(
+      (route) => `${route.key} ${route.method} ${route.path} ${route.group}`,
+    ).sort();
+    expect(dispatched).toEqual(mapped);
+  });
+
+  test("every M3 read route declares the fields its view will dereference", async () => {
+    // A read with no VIEW_READS table is a screen nobody has designed yet.
+    // Catching that HERE — while the handler is still a stub — is the whole
+    // reason the contract is frozen before the implementations start.
+    const ROUTES = await loadRoutes();
+    const missing = Object.entries(ROUTES)
+      .filter(([, def]) => def.group !== undefined && def.method === "GET")
+      .map(([key]) => key)
+      .filter((key) => ALL_VIEW_READS[key] === undefined);
+    expect(missing).toEqual([]);
+  });
 });

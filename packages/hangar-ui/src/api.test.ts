@@ -9,10 +9,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { api, streamRunEvents } from "../assets/js/api.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
-import { ROUTES, buildPath } from "../assets/js/routes.js";
+import { ROUTES, buildPath, m3RouteKeys } from "../assets/js/routes.js";
 
 type Recorded = { method: string; path: string; body: unknown };
-type RouteDef = { method: string; path: string; body?: string; stream?: string };
+type RouteDef = { method: string; path: string; body?: string; stream?: string; group?: string };
 
 const calls: Recorded[] = [];
 const realFetch = globalThis.fetch;
@@ -209,6 +209,47 @@ const DRIVERS: Record<
   pinBaseline: { call: () => api.pinBaseline(ID, RUN), params: { id: ID } },
 };
 
+/**
+ * A value for every `:param` the M3 templates use. The M3 wrappers are
+ * GENERATED from the route map, so what needs proving is not that someone
+ * typed 178 paths correctly — it is that the generator fills params, picks
+ * the method, and sends a body exactly where the map says one belongs.
+ */
+const M3_PARAM_VALUES: Record<string, string> = {
+  id: ID,
+  runId: RUN,
+  optRunId: RUN,
+  sampleId: "s1",
+  sess: SESS,
+  version: "1.2.0",
+  name: "smoke",
+  spec: "contract-harness",
+  slug: "how-to-deploy",
+  stamp: "20260803T000000Z",
+  cell: "m-alpha",
+  adviceId: "adv_1",
+  key: "SOME_PROVIDER_KEY",
+  channel: "slack",
+  decisionId: "egr_1",
+  recordId: "rec_1",
+  taskId: "task_1",
+  viewId: "view_1",
+  dashboardId: "dash_1",
+  keyId: "key_1",
+  store: "settings",
+};
+
+function m3Params(path: string): Record<string, string> {
+  const params: Record<string, string> = {};
+  for (const match of path.matchAll(/:([A-Za-z][A-Za-z0-9]*)/g)) {
+    const name = match[1] as string;
+    const value = M3_PARAM_VALUES[name];
+    if (value === undefined) throw new Error(`no M3 test value for param ":${name}" in ${path}`);
+    params[name] = value;
+  }
+  return params;
+}
+
 describe("api.js cannot drift from routes.js", () => {
   test("every wrapper issues its route's method, path and body-or-not", async () => {
     for (const [key, driver] of Object.entries(DRIVERS)) {
@@ -225,8 +266,40 @@ describe("api.js cannot drift from routes.js", () => {
     }
   });
 
+  test("every generated M3 wrapper issues its route's method, path and body-or-not", async () => {
+    const keys = m3RouteKeys() as string[];
+    expect(keys.length).toBeGreaterThan(100);
+    for (const key of keys) {
+      const route = (ROUTES as Record<string, RouteDef>)[key];
+      const wrapper = (api as Record<string, (p: unknown) => Promise<unknown>>)[key];
+      expect(`${key}:${typeof wrapper}`).toBe(`${key}:function`);
+      const params = m3Params(route.path);
+      const call = await record(wrapper(params));
+      expect(`${key}:${call.method}`).toBe(`${key}:${route.method}`);
+      expect(`${key}:${call.path}`).toBe(`${key}:${buildPath(route.path, params)}`);
+      expect(`${key}:${call.body !== undefined}`).toBe(`${key}:${route.body !== undefined}`);
+    }
+  });
+
+  test("an M3 wrapper answers with a typed envelope, never a throw", async () => {
+    // 501 while a handler is a stub, 409 for a refusal that carries a diff:
+    // both are the payload the screen renders, so neither may become an
+    // ApiError the way a M1/M2 read's failure does.
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: "not implemented (M3): spec batch edit" }), {
+        status: 501,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+    const answer = (await (api as Record<string, (p: unknown) => Promise<unknown>>)["specEdit"]?.({
+      id: ID,
+    })) as { ok: boolean; status: number; body: { error: string } };
+    expect(answer.ok).toBe(false);
+    expect(answer.status).toBe(501);
+    expect(answer.body.error).toContain("not implemented (M3)");
+  });
+
   test("the drivers cover every route in the map (the SSE stream aside)", () => {
-    const covered = [...Object.keys(DRIVERS), "runEvents"].sort();
+    const covered = [...Object.keys(DRIVERS), "runEvents", ...(m3RouteKeys() as string[])].sort();
     expect(covered).toEqual(Object.keys(ROUTES).sort());
   });
 

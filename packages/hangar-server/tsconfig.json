@@ -5,6 +5,13 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../spec-registry" },
+    { "path": "../memory-store" },
+    { "path": "../wiki-store" },
+    { "path": "../continuity-store" },
+    { "path": "../watchme-store" },
+    { "path": "../dataset-registry" },
+    { "path": "../audit-log" },
     { "path": "../data-retention-engine" },
     { "path": "../eval-report" },
     { "path": "../event-log" },

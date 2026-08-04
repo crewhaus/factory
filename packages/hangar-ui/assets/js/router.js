@@ -23,6 +23,16 @@
  *   #/h/<id>/memory/wiki/<slug>         → wiki article reader
  *   #/h/<id>/costs                      → costs
  *   #/h/<id>/deploy                     → deployment records
+ *
+ * M3 adds the detail tabs and two more fleet screens:
+ *   #/credentials                       → the fleet credential matrix
+ *   #/thredz                            → the global Thredz explorer
+ *   #/feedback                          → the fleet feedback rollup
+ *   #/h/<id>/{data,feedback,creds,channels,security,thredz,inspect,dev}
+ * Each M3 tab accepts trailing segments, captured verbatim as `rest` — the
+ * sub-screens inside them (a dataset, a store, a Thredz article) are the
+ * area implementer's to name, and the router should not have to be edited
+ * again for each one.
  */
 
 export const HARNESS_TABS = [
@@ -33,12 +43,42 @@ export const HARNESS_TABS = [
   "sessions",
   "evals",
   "memory",
+  "data",
+  "feedback",
   "costs",
+  "creds",
+  "channels",
+  "security",
+  "thredz",
   "deploy",
+  "inspect",
+  "dev",
+];
+
+/** The M3 tabs, whose trailing segments are captured generically as `rest`.
+ *  Shape gating (which tabs a given target shows) is applied where the tab
+ *  strip is drawn, not here: a deep link must still resolve. */
+export const M3_TABS = [
+  "data",
+  "feedback",
+  "creds",
+  "channels",
+  "security",
+  "thredz",
+  "inspect",
+  "dev",
 ];
 
 /** The global (fleet-wide) screens, in nav order. `#/` is the Library. */
-export const GLOBAL_VIEWS = ["runs", "approvals", "review", "activity"];
+export const GLOBAL_VIEWS = [
+  "runs",
+  "approvals",
+  "review",
+  "activity",
+  "credentials",
+  "feedback",
+  "thredz",
+];
 
 function safeDecode(part) {
   try {
@@ -92,6 +132,11 @@ export function parseRoute(hash) {
         ? { view: "harness", id, tab, wikiSlug: rest[1] }
         : { view: "harness", id, tab };
     default:
+      // The M3 tabs take their trailing segments generically, so adding a
+      // sub-screen inside one is a view change, not a router change.
+      if (M3_TABS.includes(tab)) {
+        return rest.length > 0 ? { view: "harness", id, tab, rest } : { view: "harness", id, tab };
+      }
       return { view: "notfound", hash: raw };
   }
 }

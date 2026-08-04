@@ -8,6 +8,14 @@
  * counts, and gives the harness header its supervision pill, bundle
  * freshness badge, control availability and — when the spawn plan cannot be
  * built — the remedy as a BUTTON rather than an error.
+ *
+ * M3 adds the detail tabs (Datasets, Feedback, Credentials, Channels,
+ * Security, Thredz, Inspect, Dev & MCP), stacks an M3 half beneath the
+ * existing Spec, Evals and Memory panels, and puts the fleet credential
+ * matrix, feedback rollup and Thredz explorer in the rail. Their handlers
+ * are still stubs, so those screens render an honest "not built yet" surface
+ * that lists the routes they will read — navigation is real from day one so
+ * the shape of the app is reviewable before the data arrives.
  */
 
 import { ApiError, api, onUnauthorized, setToken } from "./api.js";
@@ -24,17 +32,28 @@ import { shapeAccent, shapeLabel } from "./shapes.js";
 import { procRow } from "./supervision.js";
 import { renderActivity } from "./views/activity.js";
 import { renderApprovals } from "./views/approvals.js";
+import { renderChannels } from "./views/channels.js";
 import { renderCosts } from "./views/costs.js";
+import { renderCredentialsMatrix, renderCreds } from "./views/creds.js";
+import { renderData } from "./views/data.js";
 import { renderDeploy } from "./views/deploy.js";
+import { renderEvalsLab } from "./views/evals-lab.js";
 import { renderEvals } from "./views/evals.js";
+import { renderFeedback, renderFeedbackBoard } from "./views/feedback.js";
+import { renderInspect } from "./views/inspect.js";
 import { renderLibrary } from "./views/library.js";
+import { renderMemoryFabric } from "./views/memory-fabric.js";
 import { renderMemory } from "./views/memory.js";
 import { renderOverview } from "./views/overview.js";
 import { renderReview } from "./views/review.js";
 import { renderRuns, renderRunsBoard } from "./views/runs.js";
+import { renderRuntime } from "./views/runtime.js";
 import { renderSchedulers } from "./views/schedulers.js";
+import { renderSecurity } from "./views/security.js";
 import { renderSessions } from "./views/sessions.js";
+import { renderSpecEdit } from "./views/spec-edit.js";
 import { renderSpec } from "./views/spec.js";
+import { renderThredz, renderThredzGlobal } from "./views/thredz.js";
 import { renderTokenScreen } from "./views/token.js";
 
 const THEME_KEY = "hangar.theme";
@@ -46,8 +65,16 @@ const TAB_LABELS = {
   sessions: "Sessions",
   evals: "Evals",
   memory: "Memory",
+  data: "Datasets",
+  feedback: "Feedback",
   costs: "Costs",
+  creds: "Credentials",
+  channels: "Channels",
+  security: "Security",
+  thredz: "Thredz",
   deploy: "Deployments",
+  inspect: "Inspect",
+  dev: "Dev & MCP",
 };
 
 /** The fleet-wide screens in the header rail, with their count sources. */
@@ -56,6 +83,9 @@ const NAV = [
   { view: "approvals", label: "Approvals" },
   { view: "review", label: "Review" },
   { view: "activity", label: "Activity" },
+  { view: "credentials", label: "Credentials" },
+  { view: "feedback", label: "Feedback" },
+  { view: "thredz", label: "Thredz" },
 ];
 
 let viewRoot = null;
@@ -207,6 +237,12 @@ async function dispatch(route) {
       await renderReview(viewRoot);
     } else if (route.view === "activity") {
       await renderActivity(viewRoot);
+    } else if (route.view === "credentials") {
+      await renderCredentialsMatrix(viewRoot);
+    } else if (route.view === "feedback") {
+      await renderFeedbackBoard(viewRoot);
+    } else if (route.view === "thredz") {
+      await renderThredzGlobal(viewRoot);
     } else {
       renderNotFound(viewRoot, route);
     }
@@ -263,15 +299,39 @@ async function renderHarnessPage(root, route) {
   root.appendChild(nav);
   const tabRoot = el("div", { class: "tab-body" });
   root.appendChild(tabRoot);
-  if (route.tab === "spec") await renderSpec(tabRoot, ctx);
-  else if (route.tab === "runs") await renderRuns(tabRoot, ctx);
+  // The three tabs that gained an M3 half render the M1/M2 surface first and
+  // the new one beneath it — one screen, not two competing ones.
+  if (route.tab === "spec") {
+    await renderSpec(tabRoot, ctx);
+    await renderSpecEdit(section(tabRoot), ctx);
+  } else if (route.tab === "runs") await renderRuns(tabRoot, ctx);
   else if (route.tab === "schedulers") await renderSchedulers(tabRoot, ctx);
   else if (route.tab === "sessions") await renderSessions(tabRoot, ctx);
-  else if (route.tab === "evals") await renderEvals(tabRoot, ctx);
-  else if (route.tab === "memory") await renderMemory(tabRoot, ctx);
+  else if (route.tab === "evals") {
+    await renderEvals(tabRoot, ctx);
+    await renderEvalsLab(section(tabRoot), ctx);
+  } else if (route.tab === "memory") {
+    await renderMemory(tabRoot, ctx);
+    await renderMemoryFabric(section(tabRoot), ctx);
+  } else if (route.tab === "data") await renderData(tabRoot, ctx);
+  else if (route.tab === "feedback") await renderFeedback(tabRoot, ctx);
   else if (route.tab === "costs") await renderCosts(tabRoot, ctx);
+  else if (route.tab === "creds") await renderCreds(tabRoot, ctx);
+  else if (route.tab === "channels") await renderChannels(tabRoot, ctx);
+  else if (route.tab === "security") await renderSecurity(tabRoot, ctx);
+  else if (route.tab === "thredz") await renderThredz(tabRoot, ctx);
   else if (route.tab === "deploy") await renderDeploy(tabRoot, ctx);
+  else if (route.tab === "inspect") await renderInspect(tabRoot, ctx);
+  else if (route.tab === "dev") await renderRuntime(tabRoot, ctx);
   else await renderOverview(tabRoot, ctx);
+}
+
+/** Append a fresh sub-container so a second render into the same tab does
+ *  not clear the first (every view clears the root it is handed). */
+function section(root) {
+  const node = el("div", { class: "tab-section" });
+  root.appendChild(node);
+  return node;
 }
 
 /**

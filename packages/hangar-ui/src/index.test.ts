@@ -54,6 +54,29 @@ describe("embed map completeness", () => {
     }
   });
 
+  test("every M3 area ships a view module (one per implementer area)", () => {
+    const m3 = [
+      "/assets/js/pending.js",
+      "/assets/js/views/spec-edit.js",
+      "/assets/js/views/memory-fabric.js",
+      "/assets/js/views/evals-lab.js",
+      "/assets/js/views/data.js",
+      "/assets/js/views/feedback.js",
+      "/assets/js/views/creds.js",
+      "/assets/js/views/channels.js",
+      "/assets/js/views/security.js",
+      "/assets/js/views/thredz.js",
+      "/assets/js/views/inspect.js",
+      "/assets/js/views/runtime.js",
+    ];
+    for (const key of m3) {
+      const entry = hangarAssets[key];
+      expect(`${key}:${entry !== undefined}`).toBe(`${key}:true`);
+      expect(`${key}:${entry?.contentType}`).toBe(`${key}:text/javascript; charset=utf-8`);
+      expect(`${key}:${(entry?.body.length ?? 0) > 0}`).toBe(`${key}:true`);
+    }
+  });
+
   test("every file under assets/ is embedded under its serve path with exact bytes", () => {
     for (const rel of files) {
       const key = servePathFor(rel);

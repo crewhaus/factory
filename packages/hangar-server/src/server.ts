@@ -35,6 +35,15 @@
  *     spec/transcript routes pass the spec-patch maskers; captured daemon
  *     output is served only through the supervisor's scrubbed paths, never
  *     by reading `logs/<runId>.log` (raw, unscrubbed by construction).
+ *
+ * M3 is the detail surface — the spec's write side, the memory fabric's
+ * write side, the eval/dataset/feedback loops, credentials + channels +
+ * security, Thredz, and the raw inspectors. It is far too many routes to
+ * hand-branch, so it dispatches from ONE table (`m3-routes.ts`) through one
+ * function (`runM3` below) that applies every guard above uniformly; the
+ * per-area handler modules receive an already-validated `M3Context` and can
+ * only be about their own subject. The handlers ship as 501 stubs whose
+ * docblocks carry the write covenant each must honour.
  */
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -98,6 +107,9 @@ import { foldHarnessCosts } from "./costs";
 import { deploymentsView } from "./deployments";
 import { mergedSpawnEnv } from "./env-file";
 import { evalHealth, evalRunView, evalSampleView, evalsView, isRunId } from "./evals";
+import { HttpError, errResponse, json } from "./http";
+import type { M3Context, M3Harness } from "./m3";
+import { type M3Match, matchM3 } from "./m3-routes";
 import { maskDeep } from "./mask";
 import {
   dreamView,
@@ -211,32 +223,6 @@ export type HangarServer = {
   }>;
   stop(): Promise<void>;
 };
-
-class HttpError extends Error {
-  readonly status: number;
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
-
-const JSON_HEADERS: Record<string, string> = {
-  "content-type": "application/json; charset=utf-8",
-  "cache-control": "no-store",
-  "x-content-type-options": "nosniff",
-};
-
-function json(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
-  return new Response(`${JSON.stringify(data)}\n`, {
-    status,
-    headers: { ...JSON_HEADERS, ...headers },
-  });
-}
-
-function errResponse(status: number, message: string): Response {
-  const headers: Record<string, string> = status === 401 ? { "www-authenticate": "Bearer" } : {};
-  return json({ error: message }, status, headers);
-}
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
@@ -776,6 +762,75 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     return resolve(value);
   };
 
+  /**
+   * The M3 detail surface — ~180 routes across eleven groups — dispatched
+   * from one place.
+   *
+   * Every guard the M1/M2 branches apply by hand is applied HERE, once, for
+   * every M3 route: the `:id` is shape-checked and resolved against the
+   * registry (the allowlist), a vanished directory 404s before any handler
+   * runs, remaining params were guarded during matching, POST/PUT bodies are
+   * proven to be JSON objects, harness-relative reads go through a
+   * containment closure, and whatever comes back is masked on the way out.
+   *
+   * That uniformity is the point: six people are filling these handlers in
+   * parallel, and not one of them should be re-deriving path safety.
+   */
+  const runM3 = async (req: Request, url: URL, match: M3Match): Promise<Response> => {
+    const { route, params } = match;
+    const perHarness = params["id"] !== undefined;
+    let entry: HangarHarnessEntry | null = null;
+    let harnessDir: string | null = null;
+    if (perHarness) {
+      entry = entryOr404(params["id"] as string);
+      harnessDir = liveDirOr404(entry);
+    }
+    const body =
+      route.method === "POST" || route.method === "PUT" ? await readBody(req) : ({} as const);
+    const dir = harnessDir;
+    const context: M3Context = {
+      entry,
+      harnessDir,
+      params,
+      query: url.searchParams,
+      body,
+      // Harness `.env` layered over the manager's env — the same picture
+      // preflight and spawns see. Values, because a handler may need to sign
+      // a synthetic inbound server-side; never serialize one.
+      env: dir === null ? env : mergedSpawnEnv(env, dir).env,
+      now,
+      operator,
+      contain: (segments) => {
+        if (dir === null) throw new HttpError(400, "not a per-harness route");
+        // Per FILE, never per directory: a listed name can be a symlink.
+        const resolved = resolveInside(dir, segments);
+        if (resolved === undefined) throw new HttpError(400, "path escapes the harness directory");
+        return resolved;
+      },
+      harnesses: (): readonly M3Harness[] => liveHarnesses(),
+      process: async () => {
+        if (entry === null) throw new HttpError(400, "not a per-harness route");
+        return await processFor(entry);
+      },
+      control,
+      jobs: processes.jobs,
+      submitJob: (kind, argv) =>
+        processes.jobs.submit({
+          harnessDir: dir ?? "",
+          ...(entry !== null ? { harnessId: entry.id } : {}),
+          kind,
+          argv,
+        }),
+      warn: onWarn,
+    };
+    const result = await route.handler(context);
+    if (result instanceof Response) return result;
+    // Masked unconditionally. Defense in depth, not permission: a handler
+    // that reads free text still masks it itself, because key-based
+    // redaction cannot see into prose.
+    return json(maskDeep(result));
+  };
+
   const handleHarnessSub = async (
     req: Request,
     url: URL,
@@ -1157,6 +1212,14 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     const method = req.method;
     const [head, ...rest] = segs;
 
+    // M3 first, and literal-first inside it: a template whose segments are
+    // all literals beats one with a param, so `GET …/evals/matrix` matches
+    // the M3 route while `GET …/evals/run_…` falls through to the M2 branch
+    // below untouched. A param that fails its shape guard does not match at
+    // all, so a malformed id still meets the M1/M2 chain's own 400.
+    const m3 = matchM3(method, ["api", ...segs]);
+    if (m3 !== undefined) return await runM3(req, url, m3);
+
     if (head === "version" && rest.length === 0 && method === "GET") {
       return json({ hangar: version, protocolV: PROTOCOL_V });
     }
@@ -1362,6 +1425,20 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       "GET  /api/review      POST /api/h/:id/review/:itemId",
       "GET  /api/activity[?since=]",
       "GET  /api/jobs        POST /api/h/:id/jobs {kind}",
+      "--- M3 (handlers are stubs: every route below answers 501) ---",
+      "PUT  /api/h/:id/spec  POST /api/h/:id/spec/{patch,diff,pin,rollback,propose}",
+      "GET  /api/h/:id/spec/{schema,trust,versions[/:version[/diff]]}",
+      "GET|POST /api/builders/…   GET|POST|DELETE /api/h/:id/builders/{graders,dataset,mcp}",
+      "GET|POST /api/h/:id/memory/{facts/:spec,recall,continuity,learning,knowledge,reflect}",
+      "PUT|GET|POST /api/h/:id/memory/wiki/:slug/…   GET|POST /api/h/:id/memory/watchme/…",
+      "GET|POST /api/h/:id/evals/{run,matrix,suites,trends,judge,graders,redteam,coverage,…}",
+      "GET|POST /api/h/:id/data/…   GET|POST /api/h/:id/feedback/…   GET /api/feedback",
+      "GET|POST|DELETE /api/h/:id/env[/:key]   GET|POST /api/credentials[/set]",
+      "GET|POST /api/h/:id/{doctor,secrets,mcp/lint,channels/…,gateway,audit,slo}",
+      "GET|POST /api/h/:id/security/{egress,pii,justification,corpus,sandbox,onchain,…}",
+      "GET|PUT|POST|DELETE /api/h/:id/thredz/…   GET /api/thredz",
+      "GET  /api/h/:id/inspect[/:store[/:name]]   PUT /api/h/:id/inspect/settings",
+      "GET|POST /api/h/:id/{mcp-servers,dev}/…",
     ];
     const items = routes.map((r) => `<li><code>${r}</code></li>`).join("\n");
     const html = `<!doctype html><meta charset="utf-8"><title>Hangar</title><h1>Hangar manager API</h1><p>No UI assets embedded in this build. Every <code>/api</code> route requires <code>Authorization: Bearer &lt;token&gt;</code>.</p><ul>${items}</ul>`;
