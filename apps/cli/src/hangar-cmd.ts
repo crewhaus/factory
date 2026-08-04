@@ -553,6 +553,21 @@ async function hangarServe(
   }
   if (acquired.staleNote !== undefined) write(`note: ${acquired.staleNote}`);
 
+  // M2: the process picture. `Bun.serve` already bound, so the console is
+  // reachable either way; awaiting the boot means the first paint shows
+  // adopted daemons rather than an empty fleet that fills in a beat later.
+  // Order inside: port ledger → adopt() per registered harness →
+  // jobQueue.restore() (pending re-enqueued, running closed as
+  // `interrupted`, never silently re-run).
+  const booted = await server.ready;
+  if (booted.adopted > 0 || booted.lost > 0 || booted.jobs > 0) {
+    write(
+      `adopted ${booted.adopted} running daemon(s)${
+        booted.lost > 0 ? `, ${booted.lost} gone since the last manager` : ""
+      }${booted.jobs > 0 ? `, re-queued ${booted.jobs} pending job(s)` : ""}`,
+    );
+  }
+
   if (flags.smoke) {
     write(`smoke: booted ${server.url} (ephemeral port ${server.port})`);
     let exitCode: 0 | 1;

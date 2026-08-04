@@ -22,6 +22,7 @@
     { "path": "../../packages/hangar-ui" },
     { "path": "../../packages/harness-inventory" },
     { "path": "../../packages/harness-registry" },
+    { "path": "../../packages/harness-supervisor" },
     { "path": "../../packages/preflight" },
     { "path": "../../packages/computer-use-driver" },
     { "path": "../../packages/context-bundle" },

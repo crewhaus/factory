@@ -141,6 +141,54 @@ describe("credential hygiene (end-to-end)", () => {
       watchmeObservations: [{ sessionId: sess, digest: "clean" }],
       focus: `current focus: rotate ${FAKE_KEY} everywhere\n`,
       goals: `- id: g1\n  title: retire ${FAKE_KEY}\n  status: active\n`,
+      // M2 surfaces. A captured daemon log is UNSCRUBBED on disk by
+      // construction, an approval embeds the raw tool input a policy deemed
+      // sensitive enough to need a human, and a review context is free text
+      // — all three are exactly where a key ends up.
+      runLedger: [
+        {
+          runId: "run_00000000000000cc",
+          kind: "daemon",
+          argv: ["bun", "dist/daemon.ts"],
+          startedAt: iso(NOW - 3600_000),
+          logFile: "logs/run_00000000000000cc.log",
+        },
+        { runId: "run_00000000000000cc", endedAt: iso(NOW), exitCode: 0 },
+      ],
+      runLogs: [
+        {
+          runId: "run_00000000000000cc",
+          log: `booting with ANTHROPIC_API_KEY=${FAKE_KEY}\nready\n`,
+          events: [
+            { kind: "run_failed", runId: "run_00000000000000cc", error: `auth ${FAKE_KEY}` },
+          ],
+        },
+      ],
+      approvals: [
+        {
+          id: "appr_00000000000000c1",
+          toolName: "Fetch",
+          inputHash: "h",
+          input: { url: "https://example.invalid", headers: { authorization: FAKE_KEY } },
+          runId: "run_00000000000000cc",
+          sessionId: sess,
+          surface: "daemon",
+          createdAt: iso(NOW),
+        },
+      ],
+      reviewQueue: [
+        {
+          schemaVersion: 1,
+          id: "rev_quarantine_d_s1",
+          kind: "quarantine",
+          sourceRef: { dataset: "d", sampleId: "s1" },
+          ts: iso(NOW),
+          status: "open",
+          context: `sample quoted ${FAKE_KEY}`,
+        },
+      ],
+      deployments: { deployments: [{ env: "prod", note: `deployed with ${FAKE_KEY}` }] },
+      bundle: { entry: "daemon.ts" },
     });
     const { body: created } = await t.api("/api/harnesses", {
       method: "POST",
@@ -171,6 +219,18 @@ describe("credential hygiene (end-to-end)", () => {
       `/api/h/${id}/memory/dream`,
       `/api/h/${id}/memory/watchme`,
       `/api/h/${id}/costs`,
+      // M2
+      `/api/h/${id}/proc`,
+      `/api/h/${id}/runs`,
+      `/api/h/${id}/runs/run_00000000000000cc`,
+      `/api/h/${id}/runs/run_00000000000000cc/events`,
+      `/api/h/${id}/control/status`,
+      `/api/h/${id}/schedulers`,
+      `/api/h/${id}/deployments`,
+      "/api/approvals?all=1",
+      "/api/review?all=1",
+      "/api/activity?since=30d",
+      "/api/jobs",
     ];
     for (const path of paths) {
       const res = await t.fetchRaw(path, {

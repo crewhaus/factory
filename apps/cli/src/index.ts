@@ -21478,6 +21478,27 @@ switch (subcommand) {
     }
     break;
   }
+  case "daemon": {
+    // Hangar M2 — supervise a harness process from the terminal:
+    // `daemon start|stop|restart|status|logs|wake|drain`. These verbs drive
+    // @crewhaus/harness-supervisor DIRECTLY, not the Hangar server, so they
+    // work with no console running — the "one state tree, two heads"
+    // covenant (all supervision state is harness-local under
+    // .crewhaus/run/, so either head adopts what the other started).
+    // Heavy lifting lives in the side-effect-free ./daemon-cmd module (this
+    // entry file runs an argv switch on import); it throws plain Errors on
+    // bad arguments, routed through die() like `hangar`.
+    try {
+      const { runDaemonCommand } = await import("./daemon-cmd");
+      const out = await runDaemonCommand(rest);
+      for (const line of out.lines) process.stdout.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "knowledge": {
     // Item 63 — cross-harness knowledge sync (memories/graders/prompts).
     const action = rest[0] ?? "";

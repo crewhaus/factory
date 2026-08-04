@@ -80,6 +80,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the bearer token (200) and without (401) — then exits; it is the
   release workflow's compiled-binary smoke entry.
 
+- **The Hangar console became a driver, and `crewhaus daemon` is its
+  terminal twin.** `@crewhaus/hangar-server` gained the M2 surface:
+  `POST /api/h/:id/proc/{start,stop,restart,drain}` over
+  `@crewhaus/harness-supervisor` (preflight gates every spawn and returns
+  the typed refusal — with each blocking item marked acknowledgeable or
+  not — instead of spawning), a run ledger plus a live `text/event-stream`
+  run feed that opens with the durable replay and always terminates with a
+  `done` frame, a `crewhaus.control.v1` proxy for wake/drain/status whose
+  bearer is read server-side and never crosses the API boundary, the
+  four-lane scheduler timeline (heartbeat / schedule / dream / janitor)
+  merging spec-declared cadence with the phase only the daemon's own
+  process can report, fleet-wide approvals and review inboxes that settle
+  work through the same stores the CLI writes through, an activity digest
+  built from stats rather than transcript reads, read-only deployment
+  records, and a bounded job queue behind the dream-run / eval / doctor /
+  compile action faces. The new `crewhaus daemon
+  start|stop|restart|status|logs|wake|drain` family drives the same
+  supervisor DIRECTLY, so it works with no console running — all
+  supervision state is harness-local under `.crewhaus/run/`, and a daemon
+  either head starts is adopted by the other.
+
 ### Changed
 
 - **The `fleet` and `doctor`/`channel` cores are consumed from the new
@@ -92,6 +113,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behavior change to `fleet`, `doctor`, or `channel provision|verify`.
 
 ### Fixed
+
+- **Hangar's preflight now evaluates the environment the spawn actually
+  receives.** `mergedSpawnEnv` layered the harness `.env` chain ON TOP of
+  the manager's process env, while `buildSpawnPlan` layers it UNDERNEATH —
+  so the console could pass a check against a value the daemon would never
+  see, the exact inversion of "it passed preflight and then died on a
+  missing key". It now delegates to `buildSpawnEnv`, the function the plan
+  builds `plan.env` with, so there is one encoding of the precedence and a
+  test pins the two together.
 
 - **The Hangar console masks and containment-checks every harness read, not
   just some.** Memory-fabric text (facts and their tags, wiki article bodies,

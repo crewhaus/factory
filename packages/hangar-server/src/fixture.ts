@@ -1,11 +1,14 @@
 /**
  * Deterministic harness-directory synthesizer for tests (the
  * grader-continuity `fixture.ts` pattern). Builds a standalone harness dir —
- * `crewhaus.yaml` + a `.crewhaus` state tree — with every store the M1
- * routes read: sessions (live, expired-mtime, torn lines), the durable
- * sessions index, eval history (index/baselines/run dirs), memories with
- * tombstones, wiki, continuity state, dream state, watchme state, and
- * feedback records.
+ * `crewhaus.yaml` + a `.crewhaus` state tree — with every store the routes
+ * read: sessions (live, expired-mtime, torn lines), the durable sessions
+ * index, eval history (index/baselines/run dirs), memories with tombstones,
+ * wiki, continuity state, dream state, watchme state, feedback records, and
+ * the M2 ops tree (runfile, run ledger, captured run logs + events, control
+ * token, approvals, review queue, retention pins, deployment records,
+ * incidents, spec changelogs, and a compiled bundle with or without the F-5
+ * spec-hash stamp).
  *
  * Everything is injectable and clock-driven; nothing here contains a
  * realistic-shaped secret (tests build those from string parts).
@@ -60,6 +63,45 @@ export type FixtureHarnessOptions = {
   readonly watchmeObservations?: readonly unknown[];
   /** feedback/<file>.jsonl lines (bare FeedbackRecord objects). */
   readonly feedback?: Readonly<Record<string, readonly unknown[]>>;
+
+  // -- M2: the process layer's harness-local ops state ---------------------
+  /** `.crewhaus/run/runs.jsonl` lines (ledger entries and/or patches). */
+  readonly runLedger?: readonly unknown[];
+  /** Captured run artifacts: `logs/<runId>.log` + `.events.jsonl`. */
+  readonly runLogs?: ReadonlyArray<{
+    readonly runId: string;
+    /** Raw captured text (UNSCRUBBED, as a real child writes it). */
+    readonly log?: string;
+    /** Extracted TraceEvents, as the pump persists them. */
+    readonly events?: readonly unknown[];
+  }>;
+  /** `.crewhaus/run/daemon.json`. Written verbatim so a test can synthesize
+   *  a stale runfile (a pid that is gone) as easily as a live one. */
+  readonly runfile?: unknown;
+  /** `.crewhaus/run/control-token` contents (built from parts by callers —
+   *  never a realistic-shaped literal in a fixture). */
+  readonly controlToken?: string;
+  /** `approvals.jsonl` lines beside the session files. */
+  readonly approvals?: readonly unknown[];
+  /** `.crewhaus/review/queue.jsonl` lines. */
+  readonly reviewQueue?: readonly unknown[];
+  /** `.crewhaus/deployments.json` (F-6 — read-only; nothing writes it yet). */
+  readonly deployments?: unknown;
+  /** `.crewhaus/retention.json`. */
+  readonly retention?: unknown;
+  /** `.crewhaus/incidents/<name>/` directories. */
+  readonly incidents?: readonly string[];
+  /** `.crewhaus/specs/<name>/CHANGELOG.md` bodies. */
+  readonly specChangelogs?: Readonly<Record<string, string>>;
+  /** A compiled bundle at `dist/`: the entry file plus, optionally, the
+   *  F-5 spec-hash-stamped `package.json`. */
+  readonly bundle?: {
+    readonly entry: string;
+    readonly body?: string;
+    /** Omit for a pre-F-5 (unstamped) bundle. */
+    readonly specHash?: string;
+    readonly compiledWith?: string;
+  };
 };
 
 const jsonl = (lines: ReadonlyArray<unknown | string>): string =>
@@ -225,6 +267,96 @@ export function makeFixtureHarness(dir: string, opts: FixtureHarnessOptions = {}
     const fbDir = join(ch, "feedback");
     mkdirSync(fbDir, { recursive: true });
     writeFileSync(join(fbDir, `${file}.jsonl`), jsonl(lines));
+  }
+
+  // -- M2: the harness-local ops tree the process layer owns ---------------
+
+  if (
+    opts.runLedger !== undefined ||
+    opts.runLogs !== undefined ||
+    opts.runfile !== undefined ||
+    opts.controlToken !== undefined
+  ) {
+    const runRoot = join(ch, "run");
+    mkdirSync(join(runRoot, "logs"), { recursive: true });
+    if (opts.runLedger !== undefined) {
+      writeFileSync(join(runRoot, "runs.jsonl"), jsonl(opts.runLedger), { mode: 0o600 });
+    }
+    if (opts.runfile !== undefined) {
+      writeFileSync(join(runRoot, "daemon.json"), `${JSON.stringify(opts.runfile, null, 2)}\n`, {
+        mode: 0o600,
+      });
+    }
+    if (opts.controlToken !== undefined) {
+      writeFileSync(join(runRoot, "control-token"), `${opts.controlToken}\n`, { mode: 0o600 });
+    }
+    for (const run of opts.runLogs ?? []) {
+      if (run.log !== undefined) {
+        writeFileSync(join(runRoot, "logs", `${run.runId}.log`), run.log, { mode: 0o600 });
+      }
+      if (run.events !== undefined) {
+        writeFileSync(join(runRoot, "logs", `${run.runId}.events.jsonl`), jsonl(run.events), {
+          mode: 0o600,
+        });
+      }
+    }
+  }
+
+  // Approvals live BESIDE the session files, so a relocated session root
+  // relocates them too — the fixture writes them where the default root is.
+  if (opts.approvals !== undefined) {
+    writeFileSync(join(sessionsDir, "approvals.jsonl"), jsonl(opts.approvals), { mode: 0o600 });
+  }
+
+  if (opts.reviewQueue !== undefined) {
+    const reviewDir = join(ch, "review");
+    mkdirSync(reviewDir, { recursive: true });
+    writeFileSync(join(reviewDir, "queue.jsonl"), jsonl(opts.reviewQueue), { mode: 0o600 });
+  }
+
+  if (opts.deployments !== undefined) {
+    writeFileSync(join(ch, "deployments.json"), `${JSON.stringify(opts.deployments, null, 2)}\n`);
+  }
+
+  if (opts.retention !== undefined) {
+    writeFileSync(join(ch, "retention.json"), `${JSON.stringify(opts.retention, null, 2)}\n`);
+  }
+
+  for (const name of opts.incidents ?? []) {
+    mkdirSync(join(ch, "incidents", name), { recursive: true });
+    writeFileSync(join(ch, "incidents", name, "report.md"), `# ${name}\n`);
+  }
+
+  for (const [name, body] of Object.entries(opts.specChangelogs ?? {})) {
+    mkdirSync(join(ch, "specs", name), { recursive: true });
+    writeFileSync(join(ch, "specs", name, "CHANGELOG.md"), body);
+  }
+
+  if (opts.bundle !== undefined) {
+    const distDir = join(dir, "dist");
+    mkdirSync(distDir, { recursive: true });
+    writeFileSync(join(distDir, opts.bundle.entry), opts.bundle.body ?? "// compiled bundle\n");
+    if (opts.bundle.specHash !== undefined) {
+      // The F-5 stamp, exactly as `crewhaus compile` writes it. Omitting it
+      // is how a test synthesizes a pre-F-5 ("unstamped") bundle.
+      writeFileSync(
+        join(distDir, "package.json"),
+        `${JSON.stringify(
+          {
+            name: "crewhaus-compiled-bundle",
+            version: "0.0.0",
+            crewhaus: {
+              specHash: opts.bundle.specHash,
+              ...(opts.bundle.compiledWith !== undefined
+                ? { compiledWith: opts.bundle.compiledWith }
+                : {}),
+            },
+          },
+          null,
+          2,
+        )}\n`,
+      );
+    }
   }
 
   return dir;
