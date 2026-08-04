@@ -263,10 +263,13 @@ describe("hangar status / open", () => {
     expect(opened).toEqual([]);
   });
 
-  test("open re-reads the token file and builds the #fragment url", async () => {
+  test("open prints the #fragment url but never hands the token to the opener", async () => {
     const ws = newWorkspace();
     mkdirSync(ws.hangarRoot, { recursive: true });
     writeFileSync(join(ws.hangarRoot, "token"), "tok-abc123\n");
+    // Nothing is listening on this port, so the boot-ticket mint fails and
+    // the opener falls back to the bare url — the token still must not
+    // appear in what another process would see.
     writeHangarLock(ws.hangarRoot, { ...LOCK, pid: process.pid, url: "http://127.0.0.1:4321" });
     const opened: string[] = [];
     const out = await runHangarCommand(["open"], {
@@ -274,10 +277,46 @@ describe("hangar status / open", () => {
       openBrowser: (url) => opened.push(url),
     });
     expect(out.exitCode).toBe(0);
+    // Printed to the operator's own terminal: the full fragment url.
     expect(out.lines).toEqual(["http://127.0.0.1:4321/#t=tok-abc123"]);
-    expect(opened).toEqual(["http://127.0.0.1:4321/#t=tok-abc123"]);
-    // The token travels as a fragment, never a query string.
-    expect(out.lines[0]).not.toContain("?");
+    expect(out.lines[0]).not.toContain("?"); // fragment, never a query string
+    // Handed to another process: never the token.
+    expect(opened).toEqual(["http://127.0.0.1:4321"]);
+    expect(opened[0]).not.toContain("tok-abc123");
+  });
+
+  test("open trades the token for a single-use boot path against a live console", async () => {
+    const ws = newWorkspace();
+    const server = startHangarServer({
+      port: 0,
+      root: ws.hangarRoot,
+      registryRoot: ws.registryRoot,
+      env: ws.env,
+    });
+    try {
+      writeHangarLock(ws.hangarRoot, {
+        ...LOCK,
+        pid: process.pid,
+        port: server.port,
+        url: server.url,
+      });
+      const opened: string[] = [];
+      const out = await runHangarCommand(["open"], {
+        env: ws.env,
+        openBrowser: (url) => opened.push(url),
+      });
+      expect(out.exitCode).toBe(0);
+      const handed = opened[0] as string;
+      expect(handed).toMatch(/\/boot\/[0-9a-f]{64}$/);
+      expect(handed).not.toContain(server.token as string);
+      // It is a real, single-use ticket: it redirects once to the fragment.
+      const first = await fetch(handed, { redirect: "manual" });
+      expect(first.status).toBe(302);
+      expect(first.headers.get("location")).toBe(`/#t=${server.token}`);
+      expect((await fetch(handed, { redirect: "manual" })).status).toBe(404);
+    } finally {
+      await server.stop();
+    }
   });
 });
 
@@ -319,4 +358,28 @@ describe("hangar serve --smoke", () => {
     expect(readFileSync(join(ws.hangarRoot, "token"), "utf8").trim().length).toBeGreaterThan(0);
     expect(existsSync(join(ws.hangarRoot, HANGAR_LOCK_FILENAME))).toBe(false);
   }, 120_000);
+});
+
+describe("lock contention (exclusive create)", () => {
+  test("a second live claimant loses the race rather than co-owning the root", () => {
+    const ws = newWorkspace();
+    // The winner's lock is already on disk with a LIVE pid.
+    writeHangarLock(ws.hangarRoot, { ...LOCK, pid: 4242 });
+    const loser = acquireHangarLock(ws.hangarRoot, { ...LOCK, pid: 7777 }, () => true);
+    expect(loser.ok).toBe(false);
+    if (!loser.ok) expect(loser.existing.pid).toBe(4242);
+    // The winner's lock is untouched.
+    expect(readHangarLock(ws.hangarRoot)?.pid).toBe(4242);
+  });
+
+  test("a stale lock is replaced under contention, and the replacement is exclusive", () => {
+    const ws = newWorkspace();
+    writeHangarLock(ws.hangarRoot, { ...LOCK, pid: 4242 });
+    const first = acquireHangarLock(ws.hangarRoot, { ...LOCK, pid: 7777 }, (p) => p !== 4242);
+    expect(first.ok).toBe(true);
+    expect(readHangarLock(ws.hangarRoot)?.pid).toBe(7777);
+    // Now 7777 holds it and is alive: a third console must be refused.
+    const third = acquireHangarLock(ws.hangarRoot, { ...LOCK, pid: 8888 }, () => true);
+    expect(third.ok).toBe(false);
+  });
 });

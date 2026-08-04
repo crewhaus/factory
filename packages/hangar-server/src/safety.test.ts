@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { makeFixtureHarness } from "./fixture";
+import { logLine, makeFixtureHarness } from "./fixture";
 import { isSafePathSegment, resolveContained, resolveInside } from "./safety";
 import { type TestServer, bootTestServer } from "./testkit";
 
 const NOW = Date.parse("2026-08-03T00:00:00.000Z");
+const ISO = new Date(NOW).toISOString();
+const GOOD_SESSION = "sess_000000000000c1ea";
+const SNEAKY_SESSION = "sess_00000000000005ea";
 
 const servers: TestServer[] = [];
 afterEach(async () => {
@@ -137,5 +140,63 @@ describe("traversal fuzzing over HTTP", () => {
     // Sanity: the legitimate resources still resolve.
     expect((await t.api(`/api/h/${id}/memory/wiki/real-article`)).status).toBe(200);
     expect((await t.api(`/api/h/${id}/evals/run_00000000000000aa/s1`)).status).toBe(200);
+  });
+
+  test("planted symlinks in every read area stay unread (memory, sessions, costs, rollups)", async () => {
+    const t = boot();
+    const outside = join(t.workspace, "outside-store");
+    mkdirSync(outside, { recursive: true });
+    const secret = "OUTSIDE-SECRET-BYTES";
+    // Files shaped like the ones each reader expects, so ONLY containment
+    // stands between the reader and them.
+    writeFileSync(join(outside, "leak.jsonl"), `${JSON.stringify({ leaked: secret })}\n`);
+    writeFileSync(join(outside, "leak.md"), secret);
+    writeFileSync(join(outside, "leak.json"), JSON.stringify({ leaked: secret }));
+
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "symlinked"), {
+      specName: "symlinked",
+      memories: { real: [{ id: "mem_0000000000000001", text: "clean", createdAt: ISO }] },
+      focus: "clean focus\n",
+      sessions: [{ id: GOOD_SESSION, updatedAt: ISO, log: [logLine("user_message", { c: 1 })] }],
+    });
+    const ch = join(dir, ".crewhaus");
+    // memories/, state/plans/, dream/<spec>/, watchme/, sessions/ and
+    // feedback/ each get an escaping entry with a plausible name.
+    symlinkSync(join(outside, "leak.jsonl"), join(ch, "memories", "sneaky.jsonl"));
+    mkdirSync(join(ch, "state", "plans"), { recursive: true });
+    symlinkSync(join(outside, "leak.md"), join(ch, "state", "plans", "plan-sneaky.md"));
+    mkdirSync(join(ch, "dream"), { recursive: true });
+    symlinkSync(outside, join(ch, "dream", "sneaky"));
+    mkdirSync(join(ch, "watchme"), { recursive: true });
+    symlinkSync(join(outside, "leak.jsonl"), join(ch, "watchme", "observations.jsonl"));
+    symlinkSync(join(outside, "leak.jsonl"), join(ch, "sessions", `${SNEAKY_SESSION}.jsonl`));
+    mkdirSync(join(ch, "feedback"), { recursive: true });
+    symlinkSync(join(outside, "leak.jsonl"), join(ch, "feedback", "sneaky.jsonl"));
+    mkdirSync(join(ch, "sessions-index"), { recursive: true });
+    symlinkSync(join(outside, "leak.json"), join(ch, "sessions-index", `${SNEAKY_SESSION}.json`));
+
+    const id = await register(t, dir);
+    const paths = [
+      `/api/h/${id}`,
+      `/api/h/${id}/memory/facts`,
+      `/api/h/${id}/memory/state`,
+      `/api/h/${id}/memory/dream`,
+      `/api/h/${id}/memory/watchme`,
+      `/api/h/${id}/sessions`,
+      `/api/h/${id}/sessions/${SNEAKY_SESSION}`,
+      `/api/h/${id}/sessions/${SNEAKY_SESSION}?raw=1`,
+      `/api/h/${id}/costs`,
+      "/api/costs",
+      "/api/harnesses?hydrate=1",
+    ];
+    for (const path of paths) {
+      const res = await t.fetchRaw(path, { headers: { authorization: `Bearer ${t.token}` } });
+      const text = await res.text();
+      expect(`${path}:${text.includes(secret)}`).toBe(`${path}:false`);
+    }
+    // The harness's own data is still served (containment, not paranoia).
+    const facts = await t.api(`/api/h/${id}/memory/facts`);
+    expect(JSON.stringify(facts.body)).toContain("clean");
+    expect((await t.api(`/api/h/${id}/sessions/${GOOD_SESSION}`)).status).toBe(200);
   });
 });

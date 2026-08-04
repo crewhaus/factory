@@ -28,6 +28,7 @@ import { type LastEval, lastEvalFor } from "@crewhaus/harness-inventory";
 import { SESSION_JSONL_RE, SESSION_JSON_RE } from "./constants";
 import { type HarnessCosts, foldHarnessCosts } from "./costs";
 import { readJsonlCapped } from "./jsonl";
+import { resolveContained } from "./safety";
 import { resolveSessionRoot } from "./sessions";
 
 export type HarnessRollup = {
@@ -62,7 +63,13 @@ function dirLines(dir: string, filter?: (name: string) => boolean): string[] {
   return names
     .filter((n) => (filter ? filter(n) : true))
     .sort()
-    .map((n) => statLine(join(dir, n)));
+    .map((n) => {
+      // Stat only what stays inside the directory we were asked about — a
+      // planted symlink must not leak a foreign file's size/mtime into the
+      // digest (and, via invalidation timing, its change history).
+      const path = resolveContained(dir, n);
+      return path === undefined ? `${n}:escaped` : statLine(path);
+    });
 }
 
 /**
@@ -75,7 +82,11 @@ export function computeRollupDigest(harnessDir: string): string {
   const { root } = resolveSessionRoot(harnessDir);
   const lines: string[] = [`root:${root}`];
   lines.push(...dirLines(root, (n) => SESSION_JSON_RE.test(n) || SESSION_JSONL_RE.test(n)));
-  lines.push(...dirLines(join(dirname(root), "sessions-index"), (n) => SESSION_JSON_RE.test(n)));
+  // From the harness dir, not dirname(root): an overridden session root can
+  // sit anywhere, and its parent is not part of this harness.
+  lines.push(
+    ...dirLines(join(harnessDir, ".crewhaus", "sessions-index"), (n) => SESSION_JSON_RE.test(n)),
+  );
   lines.push(...dirLines(join(harnessDir, ".crewhaus", "feedback")));
   lines.push(statLine(join(harnessDir, ".crewhaus", "evals", "index.jsonl")));
   lines.push(statLine(join(harnessDir, ".env")));
@@ -105,7 +116,9 @@ function countFeedbackRecords(harnessDir: string, sessionRoot: string): number {
     }
     for (const name of names) {
       if (!name.endsWith(".jsonl")) continue;
-      objects.push(...readJsonlCapped(join(dir, name)).objects);
+      const path = resolveContained(dir, name);
+      if (path === undefined) continue;
+      objects.push(...readJsonlCapped(path).objects);
     }
   }
   return mergeFeedback(extractFeedbackRecords(objects)).length;

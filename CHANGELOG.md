@@ -62,12 +62,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (best-effort), boots the loopback `@crewhaus/hangar-server` with the
   embedded `@crewhaus/hangar-ui` assets (default `127.0.0.1:4200`;
   `--port`/`--host` rebind, and `--host` REQUIRES auth), prints a boxed
-  summary, and opens the browser at `<url>/#t=<token>` — the bearer token
-  travels as a URL FRAGMENT, never a query string, so it cannot land in
-  server logs or referrer headers (`--no-open` skips the browser;
-  `--no-auth` is loopback dev only). A single-instance lock at
+  summary, and opens the browser at a single-use `<url>/boot/<nonce>` path
+  that redirects to `<url>/#t=<token>` — the token travels as a URL FRAGMENT
+  (never a query string, so it cannot land in server logs or referrer
+  headers) and never as a command-line argument to the browser opener (argv
+  is world-readable; a scraped nonce is already spent). `--no-open` skips
+  the browser; `--no-auth` is loopback dev only. A single-instance lock at
   `<hangarRoot>/hangar.lock` (JSON pid/startedAt/port/url, written
-  atomically) refuses a second boot while the first pid is alive, replaces
+  atomically, claimed with an exclusive create so two racing consoles cannot
+  both win) refuses a second boot while the first pid is alive, replaces
   a stale lock left by a dead pid with a note, and is released on
   SIGINT/SIGTERM shutdown. `hangar status [--json]` reports
   lock/port/registry/token state without needing a running server, and
@@ -89,6 +92,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behavior change to `fleet`, `doctor`, or `channel provision|verify`.
 
 ### Fixed
+
+- **The Hangar console masks and containment-checks every harness read, not
+  just some.** Memory-fabric text (facts and their tags, wiki article bodies,
+  continuity focus/goals/plans) and durable session summaries for evicted
+  sessions went out unmasked — a credential an agent quoted into a fact or a
+  note would render verbatim, even though transcripts and spec YAML were
+  already masked. Every one of those payloads now passes the same
+  credential masker, and the end-to-end test plants a fake-shaped key in each
+  of them. Separately, only the wiki-article and eval readers enforced
+  realpath containment: a symlink planted inside `.crewhaus/memories`,
+  `state/plans`, `dream`, `watchme`, `sessions`, `sessions-index`, or
+  `feedback` could pull a file from outside the harness into a response or a
+  cost/rollup walk. All of those reads (and the evicted-session fall-through,
+  which additionally derived its path from `dirname(sessionRoot)` rather than
+  the harness directory) are now contained per file.
 
 - **`crewhaus cloud deploy` no longer writes generated infrastructure into its
   own package directory.** Without `--working-dir`, `deployCloud` and

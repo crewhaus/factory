@@ -30,6 +30,14 @@ function maskTree(value: unknown, underCredentialKey: boolean): unknown {
   return value;
 }
 
+/** Mask one free-text document (a transcript chunk, a memory fact, a wiki
+ *  body, a continuity note). Key-based redaction does not apply to prose, so
+ *  this is value-shape masking only — the same pass `maskDeep` gives every
+ *  string it walks. */
+export function maskText(text: string): string {
+  return maskCredentialTokens(text);
+}
+
 /** A `$UPPER_SNAKE` env REFERENCE — a name, not a value; safe to show. */
 const ENV_REF_VALUE_RE = /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/;
 

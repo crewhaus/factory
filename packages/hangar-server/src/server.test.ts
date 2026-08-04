@@ -622,3 +622,38 @@ describe("cost routes", () => {
     expect((fleet.body["harnesses"] as unknown[]).length).toBe(1);
   });
 });
+
+describe("boot tickets (browser handoff without argv exposure)", () => {
+  test("a ticket redirects once to the fragment form, then is spent", async () => {
+    const t = boot({ now: () => NOW });
+    const bootPath = t.server.bootPath as string;
+    expect(bootPath).toMatch(/^\/boot\/[0-9a-f]{64}$/);
+    // The path itself carries no token — that is the whole point.
+    expect(bootPath).not.toContain(t.token);
+
+    const first = await t.fetchRaw(bootPath, { redirect: "manual" });
+    expect(first.status).toBe(302);
+    expect(first.headers.get("location")).toBe(`/#t=${encodeURIComponent(t.token)}`);
+    expect(first.headers.get("referrer-policy")).toBe("no-referrer");
+
+    // Single use: a replayed ticket (from a shell history or a process list)
+    // is already dead.
+    expect((await t.fetchRaw(bootPath, { redirect: "manual" })).status).toBe(404);
+  });
+
+  test("unknown and expired nonces 404; minting requires the bearer token", async () => {
+    let clock = NOW;
+    const t = boot({ now: () => clock });
+    expect((await t.fetchRaw(`/boot/${"0".repeat(64)}`, { redirect: "manual" })).status).toBe(404);
+
+    // Minting is authed — an unauthenticated caller cannot obtain a handoff.
+    const unauthed = await t.fetchRaw("/api/boot-ticket", { method: "POST" });
+    expect(unauthed.status).toBe(401);
+
+    const { status, body } = await t.api("/api/boot-ticket", { method: "POST" });
+    expect(status).toBe(200);
+    const minted = body["bootPath"] as string;
+    clock = NOW + 120_001; // past BOOT_TICKET_TTL_MS
+    expect((await t.fetchRaw(minted, { redirect: "manual" })).status).toBe(404);
+  });
+});

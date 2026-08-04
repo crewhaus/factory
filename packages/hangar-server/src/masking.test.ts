@@ -94,12 +94,26 @@ describe("credential hygiene (end-to-end)", () => {
           ],
         },
       ],
+      // Every free-text memory-fabric surface carries a planted key: an agent
+      // that saw a credential in a tool result can quote it into a fact, a
+      // wiki body, or a continuity note, and none of those are spec YAML.
       wikiIndex: { note: { title: "note" } },
-      wikiArticles: { note: "# clean article\n" },
+      wikiArticles: { note: `# notes\n\nthe helper key is ${FAKE_KEY}\n` },
       memories: {
         planted: [
-          { id: "mem_0000000000000001", text: "a clean fact", tags: [], createdAt: iso(NOW) },
+          {
+            id: "mem_0000000000000001",
+            text: `the deploy key is ${FAKE_KEY}`,
+            tags: [`tagged-${FAKE_KEY}`],
+            createdAt: iso(NOW),
+          },
         ],
+      },
+      sessionIndex: {
+        sess_00000000000000bb: {
+          summarizedAt: iso(NOW - 7200_000),
+          summary: `wrapped up after rotating ${FAKE_KEY}`,
+        },
       },
       evalIndex: [
         {
@@ -125,8 +139,8 @@ describe("credential hygiene (end-to-end)", () => {
       dreamState: { planted: { lastRunAt: iso(NOW) } },
       watchmeState: { schemaVersion: 1, watching: false },
       watchmeObservations: [{ sessionId: sess, digest: "clean" }],
-      focus: "current focus: keep secrets secret\n",
-      goals: "- id: g1\n  title: ship\n  status: active\n",
+      focus: `current focus: rotate ${FAKE_KEY} everywhere\n`,
+      goals: `- id: g1\n  title: retire ${FAKE_KEY}\n  status: active\n`,
     });
     const { body: created } = await t.api("/api/harnesses", {
       method: "POST",

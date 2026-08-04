@@ -24,7 +24,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { MAX_MEMORY_ITEMS, MAX_TAIL_LINES, MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
 import { readJsonlCapped, readTextCapped } from "./jsonl";
-import { maskDeep } from "./mask";
+import { maskDeep, maskText } from "./mask";
 import { resolveInside } from "./safety";
 
 /** The exact memory areas served; anything else is a 404. */
@@ -35,7 +35,17 @@ export function isMemoryArea(area: string): area is MemoryArea {
   return (MEMORY_AREAS as readonly string[]).includes(area);
 }
 
-const crewhausDir = (harnessDir: string): string => join(harnessDir, ".crewhaus");
+/**
+ * A `.crewhaus` subpath that is realpath-contained inside the harness dir.
+ * Every read in this module goes through it — listing a directory yields
+ * names, and a name can be a symlink pointing anywhere, so containment is
+ * re-checked per file rather than once per directory. undefined means the
+ * path escapes (or the harness root is unreadable); callers render the area
+ * as absent rather than reading.
+ */
+function contained(harnessDir: string, segments: readonly string[]): string | undefined {
+  return resolveInside(harnessDir, [".crewhaus", ...segments]);
+}
 
 function listDirSafe(dir: string): string[] {
   try {
@@ -119,8 +129,12 @@ export function foldFactsFile(path: string, specName: string, nowMs: number): Fa
     if (items.length < MAX_MEMORY_ITEMS) {
       items.push({
         id: e.id,
-        text: e.text,
-        tags: Array.isArray(e.tags) ? e.tags.filter((t): t is string => typeof t === "string") : [],
+        // Fact text is agent-authored prose that can quote a credential it
+        // saw in a tool result; mask it like any other served text.
+        text: maskText(e.text),
+        tags: Array.isArray(e.tags)
+          ? e.tags.filter((t): t is string => typeof t === "string").map((t) => maskText(t))
+          : [],
         createdAt: typeof e.createdAt === "string" ? e.createdAt : "",
         status,
       });
@@ -137,13 +151,16 @@ export function foldFactsFile(path: string, specName: string, nowMs: number): Fa
 }
 
 export function factsView(harnessDir: string, nowMs: number): { files: readonly FactsFile[] } {
-  const dir = join(crewhausDir(harnessDir), "memories");
+  const dir = contained(harnessDir, ["memories"]);
+  if (dir === undefined) return { files: [] };
   const files: FactsFile[] = [];
   for (const name of listDirSafe(dir)) {
     if (!name.endsWith(".jsonl")) continue;
     const stem = name.slice(0, -".jsonl".length);
     if (!SAFE_SEGMENT_RE.test(stem)) continue;
-    files.push(foldFactsFile(join(dir, name), stem, nowMs));
+    const path = contained(harnessDir, ["memories", name]);
+    if (path === undefined) continue;
+    files.push(foldFactsFile(path, stem, nowMs));
   }
   return { files };
 }
@@ -160,12 +177,16 @@ export type WikiListView = {
 };
 
 export function wikiView(harnessDir: string): WikiListView {
-  const wikiDir = join(crewhausDir(harnessDir), "wiki");
-  const index = readJsonSafe(join(wikiDir, "index.json")) ?? null;
-  const articles = listDirSafe(join(wikiDir, "articles"))
-    .filter((n) => n.endsWith(".md"))
-    .map((n) => n.slice(0, -".md".length))
-    .filter((slug) => SAFE_SEGMENT_RE.test(slug));
+  const indexPath = contained(harnessDir, ["wiki", "index.json"]);
+  const articlesDir = contained(harnessDir, ["wiki", "articles"]);
+  const index = indexPath === undefined ? null : (readJsonSafe(indexPath) ?? null);
+  const articles =
+    articlesDir === undefined
+      ? []
+      : listDirSafe(articlesDir)
+          .filter((n) => n.endsWith(".md"))
+          .map((n) => n.slice(0, -".md".length))
+          .filter((slug) => SAFE_SEGMENT_RE.test(slug));
   return { index: maskDeep(index), articles };
 }
 
@@ -181,7 +202,7 @@ export function wikiArticle(harnessDir: string, slug: string): WikiArticleView |
   const path = resolveInside(harnessDir, [".crewhaus", "wiki", "articles", `${slug}.md`]);
   if (path === undefined || !existsSync(path)) return undefined;
   const { text, truncated } = readTextCapped(path, MAX_TEXT_BYTES);
-  return { slug, body: text, truncated };
+  return { slug, body: maskText(text), truncated };
 }
 
 // ---------------------------------------------------------------------------
@@ -194,21 +215,26 @@ export type StateView = {
   readonly plans: ReadonlyArray<{ readonly file: string; readonly text: string }>;
 };
 
+function readContainedText(harnessDir: string, segments: readonly string[]): string | null {
+  const path = contained(harnessDir, segments);
+  if (path === undefined || !existsSync(path)) return null;
+  return maskText(readTextCapped(path, MAX_TEXT_BYTES).text);
+}
+
 export function stateView(harnessDir: string): StateView {
-  const stateDir = join(crewhausDir(harnessDir), "state");
-  const focusPath = join(stateDir, "focus.md");
-  const goalsPath = join(stateDir, "goals.yaml");
+  const plansDir = contained(harnessDir, ["state", "plans"]);
   const plans: Array<{ file: string; text: string }> = [];
-  for (const name of listDirSafe(join(stateDir, "plans"))) {
-    if (!name.endsWith(".md") || !SAFE_SEGMENT_RE.test(name)) continue;
-    plans.push({
-      file: name,
-      text: readTextCapped(join(stateDir, "plans", name), MAX_TEXT_BYTES).text,
-    });
+  if (plansDir !== undefined) {
+    for (const name of listDirSafe(plansDir)) {
+      if (!name.endsWith(".md") || !SAFE_SEGMENT_RE.test(name)) continue;
+      const text = readContainedText(harnessDir, ["state", "plans", name]);
+      if (text === null) continue;
+      plans.push({ file: name, text });
+    }
   }
   return {
-    focus: existsSync(focusPath) ? readTextCapped(focusPath, MAX_TEXT_BYTES).text : null,
-    goals: existsSync(goalsPath) ? readTextCapped(goalsPath, MAX_TEXT_BYTES).text : null,
+    focus: readContainedText(harnessDir, ["state", "focus.md"]),
+    goals: readContainedText(harnessDir, ["state", "goals.yaml"]),
     plans,
   };
 }
@@ -222,11 +248,14 @@ export type DreamView = {
 };
 
 export function dreamView(harnessDir: string): DreamView {
-  const dreamDir = join(crewhausDir(harnessDir), "dream");
+  const dreamDir = contained(harnessDir, ["dream"]);
+  if (dreamDir === undefined) return { specs: [] };
   const specs: Array<{ specName: string; state: unknown }> = [];
   for (const name of listDirSafe(dreamDir)) {
     if (!SAFE_SEGMENT_RE.test(name)) continue;
-    const state = readJsonSafe(join(dreamDir, name, "state.json"));
+    const path = contained(harnessDir, ["dream", name, "state.json"]);
+    if (path === undefined) continue;
+    const state = readJsonSafe(path);
     if (state !== undefined) specs.push({ specName: name, state: maskDeep(state) });
   }
   return { specs };
@@ -242,16 +271,18 @@ export type WatchmeView = {
   readonly judgmentsTail: readonly unknown[];
 };
 
-function tail(path: string): readonly unknown[] {
+function tail(harnessDir: string, file: string): readonly unknown[] {
+  const path = contained(harnessDir, ["watchme", file]);
+  if (path === undefined) return [];
   const { objects } = readJsonlCapped(path);
   return objects.slice(-MAX_TAIL_LINES).map((o) => maskDeep(o));
 }
 
 export function watchmeView(harnessDir: string): WatchmeView {
-  const dir = join(crewhausDir(harnessDir), "watchme");
+  const statePath = contained(harnessDir, ["watchme", "state.json"]);
   return {
-    state: maskDeep(readJsonSafe(join(dir, "state.json")) ?? null),
-    observationsTail: tail(join(dir, "observations.jsonl")),
-    judgmentsTail: tail(join(dir, "judgments.jsonl")),
+    state: maskDeep(statePath === undefined ? null : (readJsonSafe(statePath) ?? null)),
+    observationsTail: tail(harnessDir, "observations.jsonl"),
+    judgmentsTail: tail(harnessDir, "judgments.jsonl"),
   };
 }

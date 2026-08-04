@@ -164,24 +164,71 @@ export function writeHangarLock(hangarRoot: string, lock: HangarLock): void {
   renameSync(tmp, path);
 }
 
+/** Exclusive create (`wx`): succeeds only if we created the file, so two
+ *  racing consoles cannot both believe they hold the lock. */
+function createLockExclusive(hangarRoot: string, lock: HangarLock): boolean {
+  mkdirSync(hangarRoot, { recursive: true, mode: 0o700 });
+  try {
+    writeFileSync(join(hangarRoot, HANGAR_LOCK_FILENAME), `${JSON.stringify(lock, null, 2)}\n`, {
+      mode: 0o600,
+      flag: "wx",
+    });
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw err;
+  }
+}
+
 /**
  * Claim the single-instance lock. A live foreign pid refuses; a stale lock
  * (dead pid or unreadable file) is replaced and reported via `staleNote`;
  * re-acquiring under our own pid just rewrites (port updates after boot).
+ *
+ * The claim is an exclusive create, not a read-then-write: between "no lock
+ * found" and "lock written" a second console could otherwise slip through
+ * and both would serve the same root. Only the loser of that race falls back
+ * to inspecting the winner's lock.
  */
 export function acquireHangarLock(
   hangarRoot: string,
   lock: HangarLock,
   isPidAlive: (pid: number) => boolean = defaultIsPidAlive,
 ): LockAcquisition {
-  const existing = readHangarLock(hangarRoot);
-  if (existing !== undefined && existing.pid !== lock.pid) {
+  // Two passes at most: create → (someone else holds it) → resolve that
+  // holder → if it was stale, unlink and create again. A third contender
+  // taking the slot in between is itself a live holder, so we refuse.
+  let replacedPid: number | undefined;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (createLockExclusive(hangarRoot, lock)) {
+      return replacedPid === undefined
+        ? { ok: true }
+        : {
+            ok: true,
+            staleNote: `replaced a stale hangar.lock left by pid ${replacedPid} (process no longer running)`,
+          };
+    }
+    const existing = readHangarLock(hangarRoot);
+    if (existing === undefined) {
+      // Unparseable/corrupt: not a claim by anyone. Take it.
+      writeHangarLock(hangarRoot, lock);
+      return { ok: true, staleNote: "replaced an unreadable hangar.lock" };
+    }
+    if (existing.pid === lock.pid) {
+      writeHangarLock(hangarRoot, lock); // our own: rewrite with the bound port
+      return { ok: true };
+    }
     if (isPidAlive(existing.pid)) return { ok: false, existing };
-    writeHangarLock(hangarRoot, lock);
-    return {
-      ok: true,
-      staleNote: `replaced a stale hangar.lock left by pid ${existing.pid} (process no longer running)`,
-    };
+    replacedPid = existing.pid;
+    try {
+      unlinkSync(join(hangarRoot, HANGAR_LOCK_FILENAME));
+    } catch {
+      // Someone else cleaned it up first; the next create decides.
+    }
+  }
+  const existing = readHangarLock(hangarRoot);
+  if (existing !== undefined && existing.pid !== lock.pid && isPidAlive(existing.pid)) {
+    return { ok: false, existing };
   }
   writeHangarLock(hangarRoot, lock);
   return { ok: true };
@@ -283,10 +330,20 @@ function jsonLines(value: unknown): string[] {
   return JSON.stringify(value, null, 2).split("\n");
 }
 
-/** The open URL: token as a #fragment (never a query string — fragments
- *  never leave the browser, so the token cannot leak into logs/referrers). */
+/** The URL to PRINT: token as a #fragment (never a query string — fragments
+ *  never leave the browser, so the token cannot leak into logs/referrers).
+ *  Printing to the operator's own terminal is fine; see {@link handoffUrl}
+ *  for what may be passed to another process. */
 function fragmentUrl(baseUrl: string, token: string | undefined): string {
   return token !== undefined && token !== "" ? `${baseUrl}/#t=${token}` : baseUrl;
+}
+
+/** The URL to HAND TO THE BROWSER. A child process's argv is readable by
+ *  every other process on the machine, so the token must not appear in it:
+ *  the server's single-use `/boot/<nonce>` path redirects to the fragment
+ *  form instead, and a nonce scraped from a process list is already spent. */
+function handoffUrl(baseUrl: string, bootPath: string | undefined): string {
+  return bootPath !== undefined && bootPath !== "" ? `${baseUrl}${bootPath}` : baseUrl;
 }
 
 // ---------------------------------------------------------------------------
@@ -510,7 +567,9 @@ async function hangarServe(
 
   const openUrl = fragmentUrl(server.url, server.token);
   for (const line of summaryLines(server, openUrl, registry?.list().length)) write(line);
-  if (!flags.noOpen) (opts.openBrowser ?? openInBrowser)(openUrl);
+  if (!flags.noOpen) {
+    (opts.openBrowser ?? openInBrowser)(handoffUrl(server.url, server.bootPath));
+  }
 
   // Block until SIGINT/SIGTERM, then stop cleanly and release the lock.
   await new Promise<void>((resolveWait) => {
@@ -594,7 +653,10 @@ function hangarStatus(argv: readonly string[], opts: HangarCommandOptions): Hang
 // open
 // ---------------------------------------------------------------------------
 
-function hangarOpen(argv: readonly string[], opts: HangarCommandOptions): HangarCommandResult {
+async function hangarOpen(
+  argv: readonly string[],
+  opts: HangarCommandOptions,
+): Promise<HangarCommandResult> {
   parseVerbArgs("open", argv, {});
   const env = opts.env ?? process.env;
   const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
@@ -614,9 +676,30 @@ function hangarOpen(argv: readonly string[], opts: HangarCommandOptions): Hangar
   } catch {
     token = undefined;
   }
-  const url = fragmentUrl(lock.url, token);
-  (opts.openBrowser ?? openInBrowser)(url);
-  return { lines: [url], exitCode: 0 };
+  // Trade the token (which we can read from disk) for a single-use handoff
+  // path, so the browser command line carries no secret. If the running
+  // console is older or unreachable, fall back to opening the bare url and
+  // let the UI's token screen take over — never put the token in argv.
+  let handoff = lock.url;
+  if (token !== undefined && token !== "") {
+    try {
+      const res = await fetch(`${lock.url}/api/boot-ticket`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (res.ok) {
+        const body = (await res.json()) as { bootPath?: unknown };
+        if (typeof body.bootPath === "string") handoff = handoffUrl(lock.url, body.bootPath);
+      }
+    } catch {
+      // Unreachable or auth-disabled console — bare url below.
+    }
+  }
+  (opts.openBrowser ?? openInBrowser)(handoff);
+  // Printed for manual copy: the operator's own terminal, not another
+  // process's argv.
+  return { lines: [fragmentUrl(lock.url, token)], exitCode: 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -640,7 +723,7 @@ export async function runHangarCommand(
     case "status":
       return hangarStatus(argv.slice(1), opts);
     case "open":
-      return hangarOpen(argv.slice(1), opts);
+      return await hangarOpen(argv.slice(1), opts);
     default:
       throw new Error(`unknown hangar verb "${verb}" (expected: serve | status | open)`);
   }

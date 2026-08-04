@@ -108,7 +108,10 @@ export function listSessions(harnessDir: string, nowMs: number): SessionListing 
   for (const file of listDirSafe(rootInfo.root)) {
     if (!SESSION_JSON_RE.test(file)) continue;
     const id = file.slice(0, -".json".length);
-    const path = join(rootInfo.root, file);
+    // Shape-checked above; still containment-checked because a session file
+    // can be a symlink planted inside the (possibly overridden) root.
+    const path = resolveContained(rootInfo.root, file);
+    if (path === undefined) continue;
     const meta = readJsonSafe(path) ?? {};
     let mtimeMs = nowMs;
     try {
@@ -134,19 +137,29 @@ export function listSessions(harnessDir: string, nowMs: number): SessionListing 
   }
 
   // Fall-through merge: durable summaries for ids with no live metadata.
-  const indexDir = join(dirname(rootInfo.root), "sessions-index");
+  // Derived from the HARNESS dir, never from dirname(sessionRoot): an
+  // overridden session root can sit anywhere, and its parent is not ours to
+  // read. Summaries are masked like every other served payload.
+  const indexDir = resolveContained(harnessDir, join(".crewhaus", "sessions-index"));
   const evicted: Array<{ row: EvictedSessionRow; sortTs: number }> = [];
-  for (const file of listDirSafe(indexDir)) {
+  for (const file of indexDir === undefined ? [] : listDirSafe(indexDir)) {
     if (!SESSION_JSON_RE.test(file)) continue;
     const id = file.slice(0, -".json".length);
     if (live.has(id)) continue;
-    const summary = readJsonSafe(join(indexDir, file));
+    const summaryPath = indexDir === undefined ? undefined : resolveContained(indexDir, file);
+    if (summaryPath === undefined) continue;
+    const summary = readJsonSafe(summaryPath);
     if (summary === undefined) continue;
     const summarizedAt = str(summary["summarizedAt"]);
     const parsed = Date.parse(summarizedAt);
     evicted.push({
       sortTs: Number.isNaN(parsed) ? 0 : parsed,
-      row: { id, evicted: true, summary, summarizedAt },
+      row: {
+        id,
+        evicted: true,
+        summary: maskDeep(summary) as Record<string, unknown>,
+        summarizedAt,
+      },
     });
   }
 
@@ -238,8 +251,11 @@ export function isSessionId(id: string): boolean {
  * the harness's own data, but a pasted key must still never render).
  */
 export function readTranscript(sessionRoot: string, id: string): TranscriptView | undefined {
-  const logPath = join(sessionRoot, `${id}.jsonl`);
-  const metaPath = join(sessionRoot, `${id}.json`);
+  // Containment even though `id` is shape-checked upstream: either file may
+  // be a symlink pointing out of the session root.
+  const logPath = resolveContained(sessionRoot, `${id}.jsonl`);
+  const metaPath = resolveContained(sessionRoot, `${id}.json`);
+  if (logPath === undefined || metaPath === undefined) return undefined;
   if (!existsSync(logPath) && !existsSync(metaPath)) return undefined;
   const read = readJsonlCapped(logPath);
 
@@ -328,7 +344,8 @@ export type RawTranscript = {
 
 /** The `?raw=1` escape hatch: capped raw lines, still masked. */
 export function readTranscriptRaw(sessionRoot: string, id: string): RawTranscript | undefined {
-  const logPath = join(sessionRoot, `${id}.jsonl`);
+  const logPath = resolveContained(sessionRoot, `${id}.jsonl`);
+  if (logPath === undefined) return undefined;
   if (!existsSync(logPath)) return undefined;
   const read = readJsonlCapped(logPath, MAX_RAW_LINES);
   return {

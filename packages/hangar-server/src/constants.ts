@@ -10,9 +10,16 @@
 /** Wire-protocol version reported by `GET /api/version`. */
 export const PROTOCOL_V = 1;
 
-/** Package version reported by `GET /api/version` (kept in lockstep with
- *  package.json by the release train's workspace-wide bump). */
-export const HANGAR_SERVER_VERSION = "0.4.2";
+/**
+ * Package version reported by `GET /api/version` when the caller supplies
+ * none. Read from this package's own package.json rather than duplicated as
+ * a literal: the release train bumps package.json, and a hand-maintained
+ * copy would silently drift. Static import — a compiled binary embeds it.
+ */
+import pkg from "../package.json" with { type: "json" };
+
+export const HANGAR_SERVER_VERSION: string =
+  typeof pkg.version === "string" ? pkg.version : "0.0.0";
 
 /** Default TCP port for the manager console (`127.0.0.1:4200`). */
 export const DEFAULT_HANGAR_PORT = 4200;

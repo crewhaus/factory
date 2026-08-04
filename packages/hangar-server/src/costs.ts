@@ -11,9 +11,9 @@
  * only widens the window, never narrows it).
  */
 import { readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
 import { SESSION_JSONL_RE } from "./constants";
 import { readJsonlCapped } from "./jsonl";
+import { resolveContained } from "./safety";
 import { resolveSessionRoot } from "./sessions";
 
 export type ModelCostRow = {
@@ -86,7 +86,10 @@ export function foldHarnessCosts(harnessDir: string, nowMs: number): HarnessCost
   }
 
   for (const file of files.sort()) {
-    const path = join(root, file);
+    // Containment per file: a symlink in the session root must not pull an
+    // arbitrary log into the cost fold.
+    const path = resolveContained(root, file);
+    if (path === undefined) continue;
     let mtimeMs = 0;
     try {
       mtimeMs = statSync(path).mtimeMs;

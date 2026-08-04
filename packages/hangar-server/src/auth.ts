@@ -49,6 +49,45 @@ export function tokenEquals(a: string, b: string): boolean {
   return timingSafeEqual(ha, hb);
 }
 
+/**
+ * One-time boot tickets — how the token reaches the browser without ever
+ * appearing in a process argument list.
+ *
+ * `crewhaus hangar` opens a URL in the user's browser. Passing
+ * `…/#t=<token>` on that command line would publish the token to every
+ * process table reader on the machine (argv is world-readable on Linux and
+ * visible to `ps` on macOS). Instead the CLI opens `…/boot/<nonce>`: an
+ * unauthenticated route that redirects ONCE to the fragment form and then
+ * forgets the nonce. The nonce is 256 bits of CSPRNG, single-use, and
+ * short-lived, so a leaked argv yields a value that is already spent.
+ */
+export const BOOT_TICKET_TTL_MS = 120_000;
+
+export type BootTickets = {
+  /** Mint a ticket and return its path (`/boot/<nonce>`). */
+  mint(nowMs: number): string;
+  /** Consume a nonce; undefined when unknown, spent, or expired. */
+  consume(nonce: string, nowMs: number): "ok" | undefined;
+};
+
+export function createBootTickets(): BootTickets {
+  const live = new Map<string, number>(); // nonce → expiry
+  return {
+    mint(nowMs) {
+      for (const [n, exp] of live) if (exp <= nowMs) live.delete(n);
+      const nonce = randomBytes(32).toString("hex");
+      live.set(nonce, nowMs + BOOT_TICKET_TTL_MS);
+      return `/boot/${nonce}`;
+    },
+    consume(nonce, nowMs) {
+      const exp = live.get(nonce);
+      if (exp === undefined) return undefined;
+      live.delete(nonce); // single-use, spent even when expired
+      return exp > nowMs ? "ok" : undefined;
+    },
+  };
+}
+
 /** True when the request carries `Authorization: Bearer <expected>`. */
 export function isAuthorized(req: Request, expected: string): boolean {
   const header = req.headers.get("authorization");

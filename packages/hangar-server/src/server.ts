@@ -38,7 +38,7 @@ import {
   openHangarRegistry,
 } from "@crewhaus/harness-registry";
 import { runPreflight } from "@crewhaus/preflight";
-import { type TokenSetup, ensureToken, isAuthorized } from "./auth";
+import { type TokenSetup, createBootTickets, ensureToken, isAuthorized } from "./auth";
 import {
   DEFAULT_HANGAR_PORT,
   HANGAR_SERVER_VERSION,
@@ -59,6 +59,7 @@ import {
   wikiView,
 } from "./memory";
 import { type HarnessRollup, openRollupCache } from "./rollups";
+import { resolveInside } from "./safety";
 import {
   isSessionId,
   listSessions,
@@ -111,6 +112,10 @@ export type HangarServer = {
   readonly token?: string;
   /** Where the minted token lives; undefined when supplied via options. */
   readonly tokenPath?: string;
+  /** A single-use `/boot/<nonce>` path that redirects to the fragment form.
+   *  The launcher opens THIS, so the token never enters a command line.
+   *  Undefined when `noAuth` is set (there is nothing to hand over). */
+  readonly bootPath?: string;
   readonly noAuth: boolean;
   stop(): Promise<void>;
 };
@@ -163,6 +168,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   } else {
     tokenSetup = ensureToken(hangarRoot, opts.token);
   }
+  const bootTickets = createBootTickets();
 
   const registry: HangarRegistry = openHangarRegistry({
     ...(opts.registryRoot !== undefined ? { root: opts.registryRoot } : {}),
@@ -473,11 +479,14 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       }
       const view = readTranscript(rootInfo.root, sess);
       if (view !== undefined) return json(view);
-      // Fall through to the durable index for evicted sessions.
+      // Fall through to the durable index for evicted sessions. Resolved
+      // from the HARNESS dir (an overridden session root's parent is not
+      // ours), containment-checked, and masked like every other payload.
+      const indexPath = resolveInside(dir, [".crewhaus", "sessions-index", `${sess}.json`]);
+      if (indexPath === undefined) throw new HttpError(404, "no session recorded yet");
       try {
-        const indexPath = join(rootInfo.root, "..", "sessions-index", `${sess}.json`);
         const summary: unknown = JSON.parse(readFileSync(indexPath, "utf8"));
-        return json({ id: sess, evicted: true, summary });
+        return json({ id: sess, evicted: true, summary: maskDeep(summary) });
       } catch {
         throw new HttpError(404, "no session recorded yet");
       }
@@ -537,6 +546,14 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
 
     if (head === "version" && rest.length === 0 && method === "GET") {
       return json({ hangar: version, protocolV: PROTOCOL_V });
+    }
+
+    // Mint a fresh single-use browser handoff. Bearer-authed: `crewhaus
+    // hangar open` reads the token file (it already has filesystem access to
+    // it) and trades it for a path safe to put on a command line.
+    if (head === "boot-ticket" && rest.length === 0 && method === "POST") {
+      if (tokenSetup === undefined) throw new HttpError(409, "auth is disabled; open / directly");
+      return json({ bootPath: bootTickets.mint(now()) });
     }
 
     if (head === "harnesses" && rest.length === 0) {
@@ -718,6 +735,26 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     const pathname = url.pathname;
     if (pathname === "/healthz") return json({ ok: true });
 
+    // Unauthenticated by necessity — the caller is a fresh browser that has
+    // no token yet. Security rests on the nonce being unguessable and
+    // single-use, not on the request being authorized.
+    if (pathname.startsWith("/boot/")) {
+      if (req.method !== "GET") return errResponse(405, "method not allowed");
+      if (tokenSetup === undefined) return errResponse(404, "not found");
+      const nonce = pathname.slice("/boot/".length);
+      if (bootTickets.consume(nonce, now()) === undefined) {
+        return errResponse(404, "boot ticket already used or expired");
+      }
+      return new Response(null, {
+        status: 302,
+        headers: {
+          location: `/#t=${encodeURIComponent(tokenSetup.token)}`,
+          "cache-control": "no-store",
+          "referrer-policy": "no-referrer",
+        },
+      });
+    }
+
     if (pathname === "/api" || pathname.startsWith("/api/")) {
       if (!noAuth) {
         if (tokenSetup === undefined || !isAuthorized(req, tokenSetup.token)) {
@@ -763,6 +800,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     registryPath: registry.path,
     ...(tokenSetup !== undefined ? { token: tokenSetup.token } : {}),
     ...(tokenSetup?.tokenPath !== undefined ? { tokenPath: tokenSetup.tokenPath } : {}),
+    ...(tokenSetup !== undefined ? { bootPath: bootTickets.mint(now()) } : {}),
     noAuth,
     stop: async () => {
       await server.stop(true);
