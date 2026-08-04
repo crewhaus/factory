@@ -139,6 +139,36 @@ function fixture(specLines?: readonly string[]): Fixture {
   };
 }
 
+/**
+ * What a control-serving daemon writes at bind: the announcement on stdout
+ * (the ONLY place a kernel-assigned port exists) plus the 0600 token file it
+ * mints at the same moment. Written directly rather than compiled, because
+ * the thing under test is the CLI's wiring, not the daemon emitter.
+ */
+function announceControl(f: Fixture, port: number): void {
+  f.ops
+    .last()
+    ?.writeLog(
+      `[control] crewhaus.control.v1 listening on http://127.0.0.1:${port} (token: .crewhaus/run/control-token)\n`,
+    );
+  // Built from parts: this repo's push protection rejects realistic secret
+  // literals, and a fixture never needs one.
+  const token = ["ctl", "fixture", "token"].join("-");
+  writeFileSync(join(f.dir, ".crewhaus", "run", "control-token"), `${token}\n`, { mode: 0o600 });
+}
+
+/** A `fetch` that records the URLs it was asked for and answers `body`. */
+function spyFetch(seen: string[], body: unknown, onCall?: () => void): typeof fetch {
+  return (async (input: string | URL | Request) => {
+    seen.push(String(input));
+    onCall?.();
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+}
+
 // --- tests -----------------------------------------------------------------
 
 describe("crewhaus daemon", () => {
@@ -317,6 +347,60 @@ describe("crewhaus daemon", () => {
     }
   });
 
+  test("--tail N renders N lines, not the 8-line crash window", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const child = f.ops.last();
+      for (let i = 1; i <= 30; i++) child?.writeLog(`line-${i}\n`);
+
+      const out = await runDaemonCommand(["logs", "--tail", "20"], f.opts);
+      // The header, then exactly the 20 lines that were asked for. The byte
+      // budget bounds the READ; it must not silently clip the result to the
+      // forensics tail.
+      expect(out.lines.slice(1)).toHaveLength(20);
+      expect(out.lines.at(1)).toBe("line-11");
+      expect(out.lines.at(-1)).toBe("line-30");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("--follow keeps emitting past the tail window instead of going silent", async () => {
+    const f = fixture();
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const child = f.ops.last();
+      for (let i = 1; i <= 12; i++) child?.writeLog(`line-${i}\n`);
+
+      // More lines arrive AFTER the opening window, which is exactly the
+      // case an index into a sliding N-line window cannot see: `emitted`
+      // saturates at N and every later poll slices an empty list.
+      timers.push(
+        setTimeout(() => {
+          for (let i = 13; i <= 20; i++) child?.writeLog(`line-${i}\n`);
+        }, 20),
+      );
+      // The follow loop ends when the daemon does — the only clean exit a
+      // blocking verb has in a test.
+      timers.push(setTimeout(() => child?.exit(0), 150));
+
+      const seen: string[] = [];
+      await runDaemonCommand(["logs", "--follow", "--tail", "5"], {
+        ...f.opts,
+        followPollMs: 5,
+        write: (line) => seen.push(line),
+      });
+      const expected: string[] = [];
+      for (let i = 8; i <= 20; i++) expected.push(`line-${i}`);
+      expect(seen.filter((l) => l.startsWith("line-"))).toEqual(expected);
+    } finally {
+      for (const t of timers) clearTimeout(t);
+      f.cleanup();
+    }
+  });
+
   test("logs with no runs says so instead of failing", async () => {
     const f = fixture();
     try {
@@ -333,10 +417,103 @@ describe("crewhaus daemon", () => {
     try {
       await runDaemonCommand(["start", "--no-preflight"], f.opts);
       const out = await runDaemonCommand(["wake", "--lane", "heartbeat"], f.opts);
-      // Exit 0: a pre-0.5.0 bundle (or a daemon that has not announced yet)
-      // is not an operator error.
+      // Exit 0: a bundle with no control plane is not an operator error.
       expect(out.exitCode).toBe(0);
       expect(out.lines[0]).toContain("no_control_port");
+      // …and it names WHICH cause it is. This fixture's bundle carries no
+      // provenance stamp, so "recompile" is the true remedy; telling an
+      // operator that about a current bundle would send them nowhere.
+      expect(out.lines[0]).toContain("predates crewhaus.control.v1");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a current bundle that has not announced yet is told to wait, not to recompile", async () => {
+    const f = fixture();
+    try {
+      // The provenance stamp `compile` writes. A bundle from this release
+      // DOES bind a control port, so the honest answer is "not yet" —
+      // "recompile" would send an operator down a road that changes nothing.
+      writeFileSync(
+        join(f.dir, "dist", "package.json"),
+        JSON.stringify({
+          name: "crewhaus-compiled-bundle",
+          crewhaus: { specHash: "sha256:deadbeef", compiledWith: "0.5.0" },
+        }),
+      );
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const out = await runDaemonCommand(["wake", "--lane", "heartbeat"], f.opts);
+      expect(out.exitCode).toBe(0);
+      expect(out.lines[0]).toContain("no control port recorded yet");
+      expect(out.lines[0]).not.toContain("recompile");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("wake pumps the daemon's own announcement out of the log and dials it", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      // What a control-serving daemon prints at bind. It is the ONLY place
+      // the kernel-assigned port exists, and `daemon start` exits long
+      // before it lands — so a head that never pumps the log can never
+      // reach control.v1 for a daemon it started itself.
+      announceControl(f, 41_234);
+
+      const seen: string[] = [];
+      const out = await runDaemonCommand(["wake", "--lane", "heartbeat"], {
+        ...f.opts,
+        fetch: spyFetch(seen, { ok: true, sessionId: "sess_abc" }),
+      });
+      expect(out.exitCode).toBe(0);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toContain(":41234/");
+      expect(out.lines[0]).toContain("heartbeat tick accepted");
+
+      // The port is now in the harness-local state tree, so the OTHER head
+      // (and the next invocation) finds it with no pump at all.
+      const runfile = JSON.parse(
+        readFileSync(join(f.dir, ".crewhaus", "run", "daemon.json"), "utf8"),
+      );
+      expect(runfile.controlPort).toBe(41_234);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("status reports the announced port once the log has been pumped", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      announceControl(f, 41_235);
+      const out = await runDaemonCommand(["status"], f.opts);
+      expect(out.lines.join("\n")).toContain("crewhaus.control.v1 on 127.0.0.1:41235");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("drain reaches control.v1 rather than degrading to SIGTERM", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const child = f.ops.last();
+      announceControl(f, 41_236);
+
+      const seen: string[] = [];
+      const out = await runDaemonCommand(["drain"], {
+        ...f.opts,
+        // A drained daemon finishes its in-flight work and exits on its own
+        // — which is the whole point of preferring this path to a signal.
+        fetch: spyFetch(seen, { ok: true }, () => child?.exit(0)),
+      });
+      expect(out.exitCode).toBe(0);
+      expect(out.lines[0]).toContain("drained");
+      expect(out.lines.join("\n")).not.toContain("SIGTERM");
+      expect(seen[0]).toContain(":41236/");
+      expect(child?.signals).toEqual([]);
     } finally {
       f.cleanup();
     }

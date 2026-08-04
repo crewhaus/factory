@@ -936,9 +936,11 @@ function renderScheduleWake(ir: IrManagedV0): { helpers: string; block: string; 
   // `POST /control/v1/wake {lane:"schedule"}` drives this exact fan-out and a
   // poke arriving mid-tick is refused with 409 rather than overlapping it.
   // On this MULTI-TENANT shape one tick is one turn PER DECLARED TENANT, each
-  // in that tenant's own session root; the id the wake answers with identifies
-  // the WAKE itself (the record carrying `{synthetic, reason, by}`), not any
-  // single tenant's transcript.
+  // in its own session — so the lane declares `ownsSession: false`: it never
+  // threads the tick's id into a session, the 202 omits `sessionId` instead of
+  // naming a transcript that does not exist, and no orphan marker `.jsonl` is
+  // left behind for retention to skip forever. The poke is evidenced through
+  // the control plane's `gateway_request` audit record instead.
   const fireFn = `
 // Loop contract 0.4 (Batch F, temporal contract) — schedule: wake loop.
 const __SCHEDULE_INSTRUCTIONS = ${instructions};
@@ -952,6 +954,7 @@ ${renderControlLane({
       ? `cron "${schedule.cron}"${schedule.timezone !== undefined ? ` ${schedule.timezone}` : " local"}`
       : `every ${schedule.everyMs}ms`,
   ...(schedule.kind === "interval" ? { everyMs: schedule.everyMs } : {}),
+  ownsSession: false,
   body: `const __tickNo = __scheduleTick++;
 const __origin = __tick.synthetic !== undefined ? \` (synthetic: \${__tick.synthetic.reason})\` : "";
 for (const __tenantId of Object.keys(TENANT_OVERRIDES)) {
@@ -965,7 +968,10 @@ for (const __tenantId of Object.keys(TENANT_OVERRIDES)) {
       input: __SCHEDULE_INSTRUCTIONS,${wakeTenant.replace("\n        ", "\n      ")}
     });
     __control.counters.turns++;
-    const __preview = __reply.length > 200 ? \`\${__reply.slice(0, 200)}…\` : __reply;
+    // The tenant turn's output is UNTRUSTED text on a stream the manager's log
+    // pump parses for the control-port announcement — flattened to one bounded
+    // line so a reply can never start a line.
+    const __preview = sanitizeControlText(__reply, 200);
     console.error(\`[schedule] tenant \${__tenantId} tick #\${__tickNo}\${__origin} → \${__preview}\`);
   } catch (__err) {
     // A dead provider account / classified failure for one tenant must not
@@ -1348,11 +1354,20 @@ const DISTILL_STEP = createDistillJanitorStep({
       '{ lane: "janitor", cadence: `every ${JANITOR_INTERVAL_MS}ms`, ' +
       '...(__janitorLastRunAt !== undefined ? { lastFiredAt: __janitorLastRunAt, lastOutcome: "ok" } : {}) }',
   });
+  // Listeners close FIRST — `handle.close()` awaits `Bun.serve`'s graceful
+  // stop, which is what lets an in-flight `runs.submit` turn finish — and the
+  // janitor sweep runs afterwards under its own budget. It is housekeeping the
+  // next boot repeats, so it must never sit between the operator's drain and
+  // the exit, eating the supervisor's deadline while a turn is still running.
   const controlDrain = renderControlDrain({
     body: `console.error("[managed] draining — intake stopped");
 janitor.stop();${ir.schedule ? "\nif (__scheduleTimer !== undefined) clearInterval(__scheduleTimer);" : ""}
-await janitor.runOnce();
-await handle.close();`,
+await handle.close();
+await runDrainSweep(() => janitor.runOnce(), {
+  onOutcome: (__o) => {
+    if (__o !== "done") console.error(\`[managed] drain sweep \${__o}\`);
+  },
+});`,
   });
   const controlStart = renderControlStart({});
 
@@ -1377,7 +1392,7 @@ import {
   withIdempotency,
 } from "@crewhaus/idempotency-keys";
 import { openAuditLog } from "@crewhaus/audit-log";
-${renderControlImports()}import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
+${renderControlImports({ drainSweep: true, logSafe: ir.schedule !== undefined })}import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
 import { createRunContext, type RunContext } from "@crewhaus/run-context";
 ${dreamImport}${distillImport}${feedbackImport}import { createJanitor } from "@crewhaus/runtime-core";
 import { buildTenant, withTenant, type Tenant } from "@crewhaus/tenancy";

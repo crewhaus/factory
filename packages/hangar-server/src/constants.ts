@@ -24,6 +24,17 @@ export const HANGAR_SERVER_VERSION: string =
 /** Default TCP port for the manager console (`127.0.0.1:4200`). */
 export const DEFAULT_HANGAR_PORT = 4200;
 
+/**
+ * Socket idle timeout for the manager server, in seconds (Bun's maximum).
+ *
+ * The live run feed is an SSE stream over a daemon that is SUPPOSED to be
+ * quiet — a `heartbeat: every 60s` shape emits nothing in between. Bun's 10 s
+ * default therefore severs exactly the connections the console exists to
+ * hold open, and the client has no reconnect. Paired with the stream's own
+ * `: ping` keep-alive (`SSE_HEARTBEAT_MS`), which must stay well under this.
+ */
+export const SSE_IDLE_TIMEOUT_SECONDS = 255;
+
 /** Hard cap on JSONL LINES parsed from any single file. */
 export const MAX_JSONL_LINES = 5000;
 

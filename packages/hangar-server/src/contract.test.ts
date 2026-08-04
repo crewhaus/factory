@@ -322,7 +322,10 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["items[].at", "string"],
     ["items[].label", "string"],
   ],
-  // views/jobs.js — the queue
+  // views/jobs.js — the queue. `recent` is not decoration: a job the queue
+  // RESTORED as `interrupted` (mutating work a dead manager abandoned) never
+  // re-enters pending/running, so the ledger fold is the only place it can
+  // ever be seen — as is every job the moment it finishes.
   jobs: [
     ["pending", "array"],
     ["running[].jobId", "string"],
@@ -330,6 +333,8 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["running[].harnessDir", "string"],
     ["running[].state", "string"],
     ["running[].mutating", "boolean"],
+    ["recent[].jobId", "string"],
+    ["recent[].state", "string"],
   ],
   // views/deploy.js — F-6, read-only + honest empty state
   deployments: [
@@ -620,7 +625,15 @@ function contractHarness(t: TestServer): string {
 describe("UI route contract", () => {
   test("every route in the console's map answers with what its view reads (and writes take effect)", async () => {
     const ROUTES = await loadRoutes();
-    const t = bootTestServer({ now: () => NOW });
+    const t = bootTestServer({
+      now: () => NOW,
+      // `doctor` runs to completion (so the ledger has a terminal job);
+      // anything else parks, so the queue also has a live one.
+      runJob: (job) =>
+        job.kind === "doctor"
+          ? Promise.resolve({ exitCode: 0 })
+          : new Promise<{ exitCode?: number }>(() => {}),
+    });
     const driven = new Set<string>();
     try {
       const dir = contractHarness(t);
@@ -800,9 +813,17 @@ describe("UI route contract", () => {
       ).toBe("run_00000000000000aa");
 
       // -- M2 jobs: submit through the queue, visible in the queue view ------
+      // One job that FINISHES and one that is still going, because the panel
+      // has two halves and the contract must cover both: `recent` is the
+      // only surface a completed — or `interrupted` — job ever appears on.
       const job = await drive("submitJob", { id }, { body: { kind: "doctor" }, expectStatus: 202 });
       expect((job["job"] as { kind: string }).kind).toBe("doctor");
-      await drive("jobs", {}, { readsKey: "jobs" });
+      await t.server.processes.jobs.idle();
+      await drive("submitJob", { id }, { body: { kind: "eval" }, expectStatus: 202 });
+      const queue = await drive("jobs", {}, { readsKey: "jobs" });
+      expect((queue["recent"] as Array<{ kind: string }>).some((j) => j.kind === "doctor")).toBe(
+        true,
+      );
 
       // -- scan root + scan (effect: the root is scanned, entries refresh) --
       await drive("addScanRoot", {}, { body: { dir: t.harnessesRoot }, expectStatus: 201 });

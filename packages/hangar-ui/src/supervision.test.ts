@@ -215,6 +215,65 @@ describe("procActions — every disabled control says why", () => {
   });
 });
 
+describe("procWriteOutcome — a refusal never reads as a stop", () => {
+  test("a real stop says nothing; the board reload is the whole report", () => {
+    const out = sup.procWriteOutcome(
+      { ok: true, status: 200, body: { ok: true, stopped: true, forced: false } },
+      "Stop",
+    );
+    expect(out.ok).toBe(true);
+    expect(out.message).toBeNull();
+  });
+
+  test("a SIGTERM fallback is an honest degradation, not a failure", () => {
+    const out = sup.procWriteOutcome(
+      { ok: true, status: 200, body: { ok: true, stopped: true, viaSignal: true } },
+      "Drain",
+    );
+    expect(out.ok).toBe(true);
+    expect(out.tone).toBe("info");
+    expect(out.message).toContain("SIGTERM");
+  });
+
+  test("a 409 not-adopted is reported as nothing-was-signalled", () => {
+    // The supervisor held no pid while a live runfile existed: a daemon IS
+    // running, this console just never adopted it. Rendered as success, an
+    // operator walks away believing a live channel bot is down.
+    const out = sup.procWriteOutcome(
+      {
+        ok: false,
+        status: 409,
+        body: { ok: false, reason: "not-adopted", message: "a daemon is running (pid 4242)" },
+      },
+      "Stop",
+    );
+    expect(out.ok).toBe(false);
+    expect(out.notAdopted).toBe(true);
+    expect(out.tone).toBe("error");
+    expect(out.message).toContain("Stop did nothing");
+    expect(out.message).toContain("pid 4242");
+    // …and what to do next, which the server's sentence never carries.
+    expect(out.message).toContain("adopts it off the runfile");
+  });
+
+  test("a 200 that admits `stopped: false` is not a stop either", () => {
+    const out = sup.procWriteOutcome(
+      { ok: true, status: 200, body: { ok: true, stopped: false, reason: "not-adopted" } },
+      "Drain",
+    );
+    expect(out.ok).toBe(false);
+    expect(out.notAdopted).toBe(true);
+    expect(out.message).toContain("this console does not hold it");
+  });
+
+  test("an unrecognized refusal still says something, never silence", () => {
+    const out = sup.procWriteOutcome({ ok: false, status: 500, body: null }, "Stop");
+    expect(out.ok).toBe(false);
+    expect(out.code).toBe("http-500");
+    expect(out.message).toContain("Stop did nothing");
+  });
+});
+
 describe("failureBoard — three red rows become one incident", () => {
   test("groups by failure class with a countable label", () => {
     const billing = {
@@ -818,6 +877,31 @@ describe("jobs + deployments", () => {
     expect(model.interrupted).toHaveLength(1);
     expect(model.total).toBe(3);
     expect(sup.jobQueueModel(null).total).toBe(0);
+  });
+
+  test("an interrupted job is folded out of `recent` — the only list it can reach us in", () => {
+    // The shape the SERVER actually emits after a manager dies mid-compile:
+    // `restore()` closes the job in the ledger rather than returning it to
+    // the queue, so `pending`/`running` are empty and `recent` carries it.
+    const model = sup.jobQueueModel({
+      pending: [],
+      running: [],
+      recent: [
+        { jobId: "job_9", state: "interrupted", kind: "compile", mutating: true },
+        { jobId: "job_8", state: "done", kind: "doctor" },
+      ],
+    });
+    expect(model.interrupted.map((j: { jobId: string }) => j.jobId)).toEqual(["job_9"]);
+    // Non-zero total is what keeps the panel off "No jobs queued" — the
+    // abandoned mutating compile is the one fact the group exists to report.
+    expect(model.total).toBe(1);
+  });
+
+  test("a job listed twice across the restore is counted once", () => {
+    const job = { jobId: "job_9", state: "interrupted", kind: "eval" };
+    const model = sup.jobQueueModel({ running: [job], pending: [], recent: [{ ...job }] });
+    expect(model.interrupted).toHaveLength(1);
+    expect(model.total).toBe(1);
   });
 
   test("a job row carries its argv and state dot", () => {

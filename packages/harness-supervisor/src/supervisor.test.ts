@@ -6,7 +6,17 @@ import { EXIT_CODES } from "@crewhaus/errors";
 import { buildReport } from "@crewhaus/preflight";
 import type { GateDecision } from "./gate";
 import { createPortLedger } from "./ports";
-import { readRunLedger, readRunfile, runLogPath, writeRunfile } from "./runfiles";
+import type { ProcessOps } from "./process-ops";
+import {
+  acquireStartLock,
+  appendRunLedger,
+  readRunLedger,
+  readRunfile,
+  readStartLock,
+  runDir,
+  runLogPath,
+  writeRunfile,
+} from "./runfiles";
 import { type SpawnPlan, buildSpawnPlan } from "./spawn-contracts";
 import { createHarnessSupervisor } from "./supervisor";
 import type { HarnessSupervisor, SupervisorEvent } from "./supervisor";
@@ -51,41 +61,74 @@ type Harness = {
   plan: () => SpawnPlan;
 };
 
-function setup(
-  target: string,
-  options: {
-    gate?: () => Promise<GateDecision>;
-    env?: string;
-    maxRestarts?: number;
-    ports?: ReturnType<typeof createPortLedger>;
-  } = {},
-): Harness {
+type SetupOptions = {
+  gate?: () => Promise<GateDecision>;
+  env?: string;
+  maxRestarts?: number;
+  ports?: ReturnType<typeof createPortLedger>;
+  /** Override the ports the PLAN stamps (0 = kernel-assigned control port). */
+  planPorts?: { port?: number; gatewayPort?: number; controlPort?: number };
+  /** Wrap the fake ops — for injecting spawn failures or spying on signals. */
+  wrapOps?: (ops: FakeProcessOps) => ProcessOps;
+  /** The manager pid recorded in the start lock. */
+  ownerPid?: number;
+  newRunId?: () => string;
+};
+
+function setup(target: string, options: SetupOptions = {}): Harness {
   const dir = tempHarness(target, options.env ?? "");
   const clock = createFakeClock();
   const ops = createFakeProcessOps({ now: clock.now });
+  const planPorts =
+    options.planPorts ?? (target === "channel" ? { port: 3000, controlPort: 3001 } : undefined);
   const plan = (): SpawnPlan =>
     buildSpawnPlan({
       harnessDir: dir,
       target,
       processEnv: {},
-      ...(target === "channel" ? { ports: { port: 3000, controlPort: 3001 } } : {}),
+      ...(planPorts !== undefined ? { ports: planPorts } : {}),
     });
   let seq = 0;
   const supervisor = createHarnessSupervisor({
     harnessDir: dir,
     target,
-    ops,
+    ops: options.wrapOps === undefined ? ops : options.wrapOps(ops),
     clock,
     plan,
     gate: options.gate ?? allowGate,
     managerVersion: "0.5.0-test",
-    newRunId: () => `run_${String(++seq).padStart(16, "0")}`,
+    newRunId: options.newRunId ?? (() => `run_${String(++seq).padStart(16, "0")}`),
     ...(options.maxRestarts !== undefined ? { maxRestarts: options.maxRestarts } : {}),
     ...(options.ports !== undefined ? { ports: options.ports } : {}),
+    ...(options.ownerPid !== undefined ? { ownerPid: options.ownerPid } : {}),
   });
   const events: SupervisorEvent[] = [];
   supervisor.subscribe((event) => events.push(event));
   return { dir, ops, clock, supervisor, events, plan };
+}
+
+/** A runfile for a daemon "started by the other head" — a live pid this
+ *  supervisor never spawned and has never adopted. */
+function foreignDaemon(h: Harness, pid: number, runId = "run_ffffffffffffffff"): void {
+  h.ops.register(pid, h.clock.now(), "bun dist/daemon.ts");
+  writeRunfile(h.dir, {
+    v: RUNFILE_VERSION,
+    pid,
+    pidStartTimeMs: h.clock.now(),
+    argvFingerprint: "foreign",
+    entry: "daemon.ts",
+    bundleDir: join(h.dir, "dist"),
+    runId,
+    startedAt: new Date(h.clock.now()).toISOString(),
+    managerVersion: "0.5.0",
+  });
+  appendRunLedger(h.dir, {
+    runId,
+    kind: "daemon",
+    argv: ["bun", "dist/daemon.ts"],
+    startedAt: new Date(h.clock.now()).toISOString(),
+    logFile: `logs/${runId}.log`,
+  });
 }
 
 describe("start", () => {
@@ -631,6 +674,367 @@ describe("adopt", () => {
     // And it is never treated as restartable on the strength of a ledger read.
     expect(snap.lastExit?.restartable).toBe(false);
     second.close();
+  });
+});
+
+describe("the start lock", () => {
+  test("two managers racing through preflight spawn ONE daemon, not two", async () => {
+    // The runfile is written AFTER the spawn, so it could never cover the
+    // window that matters — the whole preflight run sat inside it. Two
+    // managers both read "no runfile", both passed preflight, and both
+    // spawned a channel daemon on the same credentials.
+    const dir = tempHarness("channel");
+    const clock = createFakeClock();
+    const ops = createFakeProcessOps({ now: clock.now });
+    ops.register(1001, clock.now(), "manager-a");
+    ops.register(1002, clock.now(), "manager-b");
+    const plan = (): SpawnPlan =>
+      buildSpawnPlan({ harnessDir: dir, target: "channel", processEnv: {} });
+
+    let releaseGate: (() => void) | undefined;
+    const slowGate = async (): Promise<GateDecision> => {
+      await new Promise<void>((resolve) => {
+        releaseGate = resolve;
+      });
+      return allowGate();
+    };
+    const managerA = createHarnessSupervisor({
+      harnessDir: dir,
+      target: "channel",
+      ops,
+      clock,
+      plan,
+      gate: slowGate,
+      ownerPid: 1001,
+    });
+    const managerB = createHarnessSupervisor({
+      harnessDir: dir,
+      target: "channel",
+      ops,
+      clock,
+      plan,
+      gate: allowGate,
+      ownerPid: 1002,
+    });
+
+    const startingA = managerA.start();
+    await tick(); // A is now inside preflight, holding the lock
+    expect(readStartLock(dir)?.pid).toBe(1001);
+
+    const resultB = await managerB.start();
+    expect(resultB.ok).toBe(false);
+    if (resultB.ok) throw new Error("unreachable");
+    expect(resultB.reason).toBe("already-running");
+
+    releaseGate?.();
+    expect((await startingA).ok).toBe(true);
+    expect(ops.children).toHaveLength(1);
+    // The claim is handed over to the runfile, never left behind.
+    expect(readStartLock(dir)).toBeUndefined();
+    managerA.close();
+    managerB.close();
+  });
+
+  test("an abandoned lock is broken, never a permanent wedge", async () => {
+    const h = setup("channel", { ownerPid: 1001 });
+    h.ops.register(1001, h.clock.now(), "manager-a");
+    // A manager that was killed mid-preflight left its claim behind.
+    expect(acquireStartLock(h.dir, { pid: 4_040_404, at: h.clock.now() })).toBe(true);
+    expect((await h.supervisor.start()).ok).toBe(true);
+    expect(h.ops.children).toHaveLength(1);
+  });
+
+  test("the lock is released on the preflight-blocked path too", async () => {
+    const blocked: GateDecision = {
+      allowed: false,
+      report: buildReport([]),
+      refused: [],
+      unforceable: [],
+      acknowledged: [],
+    };
+    const h = setup("channel", { gate: async () => blocked });
+    await h.supervisor.start();
+    expect(readStartLock(h.dir)).toBeUndefined();
+    // …and the next start is not refused by the corpse of the last one.
+    const h2 = setup("channel");
+    expect((await h2.supervisor.start()).ok).toBe(true);
+  });
+});
+
+describe("a start that cannot launch", () => {
+  test("a throwing spawn returns a typed failure instead of wedging in `starting`", async () => {
+    let failing = true;
+    const h = setup("channel", {
+      wrapOps: (ops) => ({
+        ...ops,
+        spawn: (request) => {
+          if (failing) throw new Error("EMFILE: too many open files");
+          return ops.spawn(request);
+        },
+      }),
+    });
+    const result = await h.supervisor.start();
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.reason).toBe("plan-failed");
+    if (result.reason !== "plan-failed") throw new Error("unreachable");
+    expect(result.stage).toBe("spawn");
+    expect(result.error.message).toContain("EMFILE");
+    // NOT wedged: `starting` used to stick, and the entry guard then refused
+    // every later start with `already-running` until the manager restarted.
+    expect(h.supervisor.snapshot().state).not.toBe("starting");
+    expect(readStartLock(h.dir)).toBeUndefined();
+
+    failing = false;
+    const second = await h.supervisor.start();
+    expect(second.ok).toBe(true);
+    expect(h.ops.children).toHaveLength(1);
+  });
+
+  test("a throw AFTER the spawn kills the orphan rather than leaving it unobserved", async () => {
+    const h = setup("channel");
+    // Make the run ledger un-appendable (stands in for ENOSPC/EMFILE): the
+    // child is already spawned when this throws, and it used to be left with
+    // no exit handler at all — its exit was never observed and `stop()`
+    // awaited an event that could never fire.
+    mkdirSync(join(runDir(h.dir), "runs.jsonl"), { recursive: true });
+    const result = await h.supervisor.start();
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.reason).toBe("plan-failed");
+    expect(h.ops.children).toHaveLength(1);
+    expect(h.ops.last()?.signals).toContain("SIGKILL");
+    expect(h.ops.last()?.alive).toBe(false);
+    expect(h.supervisor.snapshot().state).toBe("crashed");
+    expect(h.supervisor.snapshot().pid).toBeUndefined();
+    // No lock and no runfile left behind for the next start to trip over.
+    expect(readStartLock(h.dir)).toBeUndefined();
+    expect(readRunfile(h.dir)).toBeUndefined();
+    // And a stop resolves rather than hanging on an exit that never comes.
+    expect(await h.supervisor.stop()).toMatchObject({ stopped: true });
+  });
+
+  test("an automatic restart that throws is caught, not left to unhandledRejection", async () => {
+    let mints = 0;
+    const h = setup("channel", {
+      newRunId: () => {
+        mints += 1;
+        if (mints > 1) throw new Error("the id minter exploded");
+        return "run_00000000000000a1";
+      },
+    });
+    await h.supervisor.start();
+    h.ops.last()?.exit(EXIT_CODES.tool);
+    await tick();
+    expect(h.supervisor.snapshot().state).toBe("crashed");
+    // The auto-restart runs on a TIMER — outside every caller's try/catch.
+    h.clock.advance(500);
+    await tick();
+    await h.supervisor.idle();
+    expect(h.supervisor.snapshot().lastExit?.title).toContain("automatic restart failed");
+    expect(h.supervisor.snapshot().state).toBe("crashed");
+    // And the supervisor is not wedged: the entry guard reads `starting` as
+    // "already-running", so a state we enter must be one we can leave.
+    expect(h.supervisor.snapshot().state).not.toBe("starting");
+    expect(readStartLock(h.dir)).toBeUndefined();
+  });
+});
+
+describe("a daemon this manager did not start", () => {
+  test("stop() says so instead of deleting a LIVE daemon's lock", async () => {
+    const h = setup("channel");
+    foreignDaemon(h, 9911);
+    // The console never adopted it, so it holds no pid…
+    expect(h.supervisor.snapshot().pid).toBeUndefined();
+    // The operator presses Start first; it is correctly refused — but that
+    // refusal is what used to arm the cleanup path with a daemon plan.
+    const refused = await h.supervisor.start();
+    expect(refused.ok).toBe(false);
+    expect(h.ops.children).toHaveLength(0);
+
+    const result = await h.supervisor.stop();
+    // …and stop must not claim it stopped something.
+    expect(result.stopped).toBe(false);
+    expect(result.reason).toBe("not-adopted");
+    expect(result.runfile?.pid).toBe(9911);
+    // The singleton lock survives, so the next start is still refused
+    // instead of sailing through and spawning a second daemon.
+    expect(readRunfile(h.dir)?.pid).toBe(9911);
+    expect(h.ops.isAlive(9911)).toBe(true);
+    const start = await h.supervisor.start();
+    expect(start.ok).toBe(false);
+    expect(h.ops.children).toHaveLength(0);
+  });
+
+  test("restart() adopts and signals it — it never spawns a duplicate beside it", async () => {
+    const terminated: number[] = [];
+    const h = setup("channel", {
+      wrapOps: (ops) => ({
+        ...ops,
+        terminate: (pid) => {
+          terminated.push(pid);
+          ops.terminate(pid);
+        },
+      }),
+    });
+    foreignDaemon(h, 9911);
+    const restarting = h.supervisor.restart();
+    await tick();
+    expect(terminated).toEqual([9911]);
+    // The daemon obeys the signal; the pump tick is its liveness poll.
+    h.ops.unregister(9911);
+    h.clock.advance(250);
+    await tick();
+    const result = await restarting;
+    expect(result.ok).toBe(true);
+    // Exactly ONE new daemon, and the old one is gone — not two live
+    // channel daemons consuming the same webhook stream.
+    expect(h.ops.children).toHaveLength(1);
+    expect(h.ops.isAlive(9911)).toBe(false);
+    expect(readRunfile(h.dir)?.pid).toBe(h.ops.last()?.pid);
+  });
+
+  test("drain() reports not-adopted rather than a graceful drain it never did", async () => {
+    const h = setup("channel");
+    foreignDaemon(h, 9911);
+    let called = false;
+    const result = await h.supervisor.drain(async () => {
+      called = true;
+    });
+    expect(called).toBe(false);
+    expect(result).toMatchObject({ stopped: false, reason: "not-adopted" });
+    expect(readRunfile(h.dir)?.pid).toBe(9911);
+  });
+
+  test("adoptIfRunfile adopts a late-arriving daemon and is a no-op otherwise", async () => {
+    const h = setup("channel");
+    // Nothing on disk: the cheap path, and it must not disturb any state.
+    expect(await h.supervisor.adoptIfRunfile()).toBe("none");
+    expect(h.supervisor.snapshot().state).toBe("stopped");
+
+    foreignDaemon(h, 9911);
+    expect(await h.supervisor.adoptIfRunfile()).toBe("adopted");
+    expect(h.supervisor.snapshot().pid).toBe(9911);
+    expect(h.supervisor.snapshot().adopted).toBe(true);
+    // Already holding it: no second adoption, no second pump.
+    expect(await h.supervisor.adoptIfRunfile()).toBe("none");
+    expect(h.supervisor.snapshot().pid).toBe(9911);
+  });
+});
+
+describe("an adopted run", () => {
+  test("a clean stop clears the runfile, so it never reads back as a crash", async () => {
+    const h = setup("channel");
+    foreignDaemon(h, 9911, "run_00000000000000ff");
+    expect(await h.supervisor.adopt()).toBe("adopted");
+
+    const stopping = h.supervisor.stop();
+    await tick();
+    h.ops.unregister(9911); // it obeyed the SIGTERM
+    h.clock.advance(250);
+    await tick();
+    await stopping;
+
+    expect(h.supervisor.snapshot().state).toBe("stopped");
+    // The runfile used to SURVIVE a deliberate stop, because cleanup was
+    // gated on a plan an adopted run never has.
+    expect(readRunfile(h.dir)).toBeUndefined();
+    const ledger = readRunLedger(h.dir);
+    expect(ledger[0]?.endedAt).toBeTruthy();
+    expect(ledger[0]?.failureClass).toBeUndefined();
+
+    // The next manager over the same harness sees a harness that was STOPPED
+    // — not a crash, and it does not stamp `interrupted` over a clean row.
+    const second = createHarnessSupervisor({
+      harnessDir: h.dir,
+      target: "channel",
+      ops: h.ops,
+      clock: createFakeClock(h.clock.now()),
+      plan: h.plan,
+      gate: allowGate,
+    });
+    expect(await second.adopt()).toBe("none");
+    expect(second.snapshot().state).toBe("stopped");
+    expect(readRunLedger(h.dir)[0]?.failureClass).toBeUndefined();
+    second.close();
+  });
+
+  test("its ports come from the runfile so the snapshot is not blank", async () => {
+    const h = setup("channel");
+    h.ops.register(9911, h.clock.now(), "bun dist/daemon.ts");
+    writeRunfile(h.dir, {
+      v: RUNFILE_VERSION,
+      pid: 9911,
+      pidStartTimeMs: h.clock.now(),
+      argvFingerprint: "foreign",
+      port: 3000,
+      controlPort: 41234,
+      entry: "daemon.ts",
+      bundleDir: join(h.dir, "dist"),
+      runId: "run_00000000000000ff",
+      startedAt: "t",
+      managerVersion: "0.5.0",
+    });
+    expect(await h.supervisor.adopt()).toBe("adopted");
+    expect(h.supervisor.snapshot().ports).toEqual({ port: 3000, controlPort: 41234 });
+    expect(h.supervisor.snapshot().controlPort).toBe(41234);
+  });
+});
+
+describe("the control.v1 announcement", () => {
+  test("the announced port is recorded in the runfile, for BOTH heads", async () => {
+    // The plan asks for a kernel-assigned port, so the runfile starts at 0 —
+    // "not known yet". The daemon announces the real one on stdout, and that
+    // line is the only place it exists. Capturing it here (not in the
+    // console) is what lets `crewhaus daemon wake/drain` reach a daemon a
+    // shell started.
+    const h = setup("channel", { planPorts: { port: 3000, controlPort: 0 } });
+    await h.supervisor.start();
+    expect(readRunfile(h.dir)?.controlPort).toBe(0);
+    expect(h.supervisor.snapshot().controlPort).toBeUndefined();
+
+    h.ops
+      .last()
+      ?.writeLog(
+        "booting\n[control] crewhaus.control.v1 listening on http://127.0.0.1:41234 (token: .crewhaus/run/control-token)\n",
+      );
+    h.clock.advance(250);
+    expect(readRunfile(h.dir)?.controlPort).toBe(41234);
+    expect(h.supervisor.snapshot().controlPort).toBe(41234);
+
+    // It does not survive the run it belongs to.
+    h.ops.last()?.exit(EXIT_CODES.billing);
+    await tick();
+    expect(h.supervisor.snapshot().controlPort).toBeUndefined();
+  });
+});
+
+describe("markOperatorStop", () => {
+  test("the next exit reads as a clean stop, with no restart scheduled", async () => {
+    const h = setup("channel");
+    await h.supervisor.start();
+    // The caller drained the daemon over control.v1; it will exit on its own.
+    h.supervisor.markOperatorStop();
+    h.supervisor.markOperatorStop(); // idempotent
+    h.ops.last()?.exit(0);
+    await tick();
+    expect(h.supervisor.snapshot().lastExit?.title).toBe("stopped by the operator");
+    expect(h.supervisor.snapshot().state).toBe("stopped");
+    h.clock.advance(600_000);
+    await tick();
+    expect(h.ops.children).toHaveLength(1);
+    expect(readRunfile(h.dir)).toBeUndefined();
+  });
+
+  test("a successful start consumes the mark rather than carrying it forward", async () => {
+    const h = setup("channel");
+    h.supervisor.markOperatorStop();
+    await h.supervisor.start();
+    h.ops.last()?.exit(EXIT_CODES.tool);
+    await tick();
+    // A real crash after the start is still a crash.
+    expect(h.supervisor.snapshot().state).toBe("crashed");
+    expect(h.supervisor.snapshot().lastExit?.disposition).toBe("crash");
   });
 });
 

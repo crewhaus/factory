@@ -31,6 +31,22 @@ describe("renderControlImports", () => {
       "countPendingApprovals",
     );
   });
+
+  test("pulls the drain sweep and the log flattener in only when the shape needs them", () => {
+    expect(renderControlImports({ drainSweep: true })).toBe(
+      `import { createControlPlane, runDrainSweep } from "${CONTROL_RUNTIME_MODULE}";\n`,
+    );
+    expect(renderControlImports({ logSafe: true })).toBe(
+      `import { createControlPlane, sanitizeControlText } from "${CONTROL_RUNTIME_MODULE}";\n`,
+    );
+    expect(
+      renderControlImports({ pendingApprovals: true, drainSweep: true, logSafe: true }),
+    ).toContain("countPendingApprovals, createControlPlane, runDrainSweep, sanitizeControlText");
+    // A bundle that needs neither still imports exactly what it did before.
+    expect(renderControlImports({ drainSweep: false, logSafe: false })).not.toContain(
+      "runDrainSweep",
+    );
+  });
 });
 
 describe("renderControlPlaneBoot", () => {
@@ -102,6 +118,21 @@ describe("renderControlLane", () => {
     });
     expect(out).toContain("nextDueAt: () => computeNext(),");
     expect(out).not.toContain("everyMs:");
+  });
+
+  test("a lane that owns no session says so, and one that does stays silent", () => {
+    const base = { lane: "schedule", varName: "__s", cadence: "every 1000ms" } as const;
+    // The managed fan-out / batch producer: the tick id is never threaded into
+    // a session, so the 202 must not advertise one.
+    expect(renderControlLane({ ...base, ownsSession: false, body: "await go();" })).toContain(
+      "  ownsSession: false,",
+    );
+    // Default (and an explicit true) emit nothing — pre-existing bundles keep
+    // their bytes.
+    expect(renderControlLane({ ...base, body: "await go();" })).not.toContain("ownsSession");
+    expect(renderControlLane({ ...base, ownsSession: true, body: "await go();" })).not.toContain(
+      "ownsSession",
+    );
   });
 });
 

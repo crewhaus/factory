@@ -70,6 +70,25 @@ export const RUNFILE_NAME = "daemon.json";
 export const RUN_LEDGER_NAME = "runs.jsonl";
 export const LOGS_DIR_NAME = "logs";
 export const CONTROL_TOKEN_NAME = "control-token";
+/** The cross-process claim on the daemon slot while a start is in flight. */
+export const START_LOCK_NAME = "daemon.lock";
+
+/**
+ * `<harness>/.crewhaus/run/daemon.lock` — held from before preflight until
+ * the runfile exists, so the singleton is a LOCK rather than a check.
+ *
+ * A runfile cannot serve: it records a pid, and there is no pid until the
+ * spawn. The holder is identified so an abandoned lock is breakable — a
+ * manager killed mid-preflight must not wedge the harness shut.
+ */
+export type StartLock = {
+  /** The MANAGER process holding the lock (not the daemon). */
+  readonly pid: number;
+  /** Its OS start time, when the platform reports one — the pid-reuse guard. */
+  readonly pidStartTimeMs?: number;
+  /** Epoch ms the lock was taken. */
+  readonly at: number;
+};
 
 /** Runfile schema version — readers migrate on read, never abort. */
 export const RUNFILE_VERSION = 1;

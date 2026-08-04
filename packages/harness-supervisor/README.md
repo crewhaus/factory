@@ -35,6 +35,7 @@ harness copied to another machine carries its own history with it.
 ```
 .crewhaus/run/
   daemon.json                 runfile: pid + OS start time + argv fingerprint (atomic, 0600)
+  daemon.lock                 the start claim, held across preflight (O_EXCL, 0600)
   runs.jsonl                  append-only run ledger (open record + close patch, folded by runId)
   logs/<runId>.log            captured child stdout+stderr
   logs/<runId>.events.jsonl   extracted TraceEvents, already scrubbed
@@ -83,6 +84,13 @@ holds back torn lines, and recognises the run-id-less crew kinds — then scrubs
 every byte before it leaves the process: values from the harness's own env
 become `«NAME»`.
 
+The pump is also where the control plane's port is learned. The plan asks for
+`CREWHAUS_CONTROL_PORT=0`, so the daemon's `[control] … listening on
+http://host:port` line is the only place the real port exists; the supervisor
+parses it out of the captured prose and patches `controlPort` into the runfile.
+Recording it here rather than in the console is what lets `crewhaus daemon
+wake` / `drain` reach a daemon a shell started, with no console running.
+
 ## Exit classification
 
 | Exit | Class | Policy |
@@ -94,7 +102,22 @@ become `«NAME»`.
 
 ## Concurrency
 
-Daemons are singleton per harness (the runfile is the lock). One **mutating**
+Daemons are singleton per harness, under **two** claims. The runfile cannot be
+the whole lock — it records a pid, and there is no pid until the spawn, so the
+entire preflight run would sit inside the window. `start()` therefore takes
+`daemon.lock` with an `O_EXCL` create before the liveness check, and hands the
+claim over to the runfile once that exists; a lock whose holder is gone, whose
+pid was recycled, or that is simply older than any start can take is broken and
+retaken. Two managers starting the same harness in the same second now produce
+one daemon, not two.
+
+`stop()` only signals what it holds. A supervisor that never adopted the
+running daemon (the other head started it) answers
+`{ stopped: false, reason: "not-adopted" }` rather than deleting a live
+daemon's lock and reporting success — call `adoptIfRunfile()` first, which
+`restart()` does for you.
+
+One **mutating**
 job per harness — eval, optimize, flywheel, dream, compile, and one-shot runs
 queue; read-only jobs (`doctor`, `audit verify`, `security digest`) bypass. The
 global queue runs 3 at a time and persists its pending entries, so queued work

@@ -153,6 +153,25 @@ unchanged (no `wireMemory`/continuity wiring appears), and every other pin —
 including `cli`, `browser`, `research` and the `*.agent.ts` pins of the daemon
 shapes — is untouched.
 
+**Drain-sweep delta — `channel.daemon.ts` + `managed.daemon.ts` only.** The
+janitor sweep moved OUT of the drain's critical path. It used to run inside the
+drain step before the listeners closed, which spent a supervisor's whole drain
+deadline on housekeeping the next boot repeats — and on a spec with `dream:` or
+`feedback:` that housekeeping fans out to model calls — while the in-flight turn
+the drain existed to finish was still waiting for its chance, and got SIGTERM'd
+at the deadline anyway. The step now closes every listener first and runs the
+sweep last through `runDrainSweep`, which time-boxes it (`CREWHAUS_DRAIN_SWEEP_MS`)
+and reports rather than throws. So `await __janitor.runOnce();` /
+`await janitor.runOnce();` become a trailing `runDrainSweep(...)` call, and the
+control-runtime import gains `runDrainSweep`. It rides the always-emitted drain
+step, NOT memory/continuity, so it appears on a memory-free `continuity: false`
+bundle too; those two pins were regenerated to their prior bytes **plus** that
+change. The continuity opt-out contract is unchanged (no `wireMemory`/continuity
+wiring appears), and every other pin is untouched — the fixture specs declare no
+`heartbeat:`/`schedule:`, so the same release's lane changes (`ownsSession:
+false` on the managed/batch wake lanes, `sanitizeControlText` on the emitted turn
+previews) do not reach any pin.
+
 ## Regenerating
 
 Only regenerate when a LATER release deliberately changes emitted bundles;

@@ -113,6 +113,12 @@ of spawning, and every blocking item says whether it is `acknowledgeable`
 gate exits 2 on exactly that set. `409 plan-failed` carries the `remedy`
 (`compile` / `add-spec` / `install-cli`) the UI turns into a button.
 
+`POST /proc/{stop,drain}` answer `409 not-adopted` when a runfile says a
+daemon IS running but this manager could not adopt it. "I signalled
+nothing and the daemon is still there" and "the daemon is gone" are
+opposite facts, and the console renders `{ok:true, stopped:true}`
+identically for both — so the honest refusal is its own status.
+
 The control routes ALWAYS answer `200` with an envelope, because the UI
 needs the reason text in the refused cases just as much as in the happy
 one:
@@ -170,6 +176,20 @@ ledger → `adopt()` every registered harness with a runfile →
 *running* when the previous manager died is closed as `interrupted`
 against an already-accurate process picture — never silently re-run.
 `Bun.serve` binds synchronously, so the socket is live either way.
+
+Boot adoption is not the whole story: it only sees the daemons that
+existed at that instant. Every request that touches a harness's process
+state calls `supervisor.adoptIfRunfile()` first — a no-op unless a runfile
+exists and the supervisor holds no pid — so a daemon started from a
+terminal (or one belonging to a harness registered after boot) is picked
+up rather than reported `stopped` over its own live runfile.
+
+The live run feed is an SSE stream over a daemon that is *supposed* to be
+quiet, so two settings keep it open: the server binds with an explicit
+`idleTimeout` (Bun's 10 s default severs a `heartbeat: every 60s` console
+mid-watch) and the stream emits a `: ping` comment frame on a timer. The
+feed stays open for `starting`/`running`/`draining` — a drain can take the
+whole stop grace, which is exactly when an operator asks to watch.
 
 `server.stop()` releases timers and subscriptions but deliberately leaves
 the CHILDREN alone: a detached daemon outliving its manager is the whole

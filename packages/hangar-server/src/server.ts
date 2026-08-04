@@ -56,6 +56,7 @@ import {
 import {
   type GateDecision,
   SpawnPlanError,
+  type StopResult,
   cliTwin,
   isUnforceable,
   readRunfile,
@@ -84,6 +85,7 @@ import {
   HANGAR_SERVER_VERSION,
   PROTOCOL_V,
   SAFE_SEGMENT_RE,
+  SSE_IDLE_TIMEOUT_SECONDS,
 } from "./constants";
 import {
   type ControlClient,
@@ -116,7 +118,7 @@ import {
 } from "./process";
 import { type ReviewHarness, adjudicateReview, isReviewVerdict, reviewInbox } from "./review";
 import { type HarnessRollup, openRollupCache } from "./rollups";
-import { isSupervisorRunId, runDetail, runEventStream, runsView } from "./runs";
+import { isLiveFeedState, isSupervisorRunId, runDetail, runEventStream, runsView } from "./runs";
 import { resolveInside } from "./safety";
 import { buildSchedulersView, readSpecYaml } from "./schedulers";
 import {
@@ -167,6 +169,10 @@ export type HangarServerOptions = {
   readonly controlClient?: ControlClient;
   /** Identity recorded on approvals/review decisions made through the API. */
   readonly operator?: string;
+  /** Keep-alive cadence for live run streams; default
+   *  {@link SSE_HEARTBEAT_MS}. Tests shorten it to prove the frame exists
+   *  without waiting out the real interval. */
+  readonly sseHeartbeatMs?: number;
 };
 
 export type HangarServer = {
@@ -184,6 +190,11 @@ export type HangarServer = {
    *  Undefined when `noAuth` is set (there is nothing to hand over). */
   readonly bootPath?: string;
   readonly noAuth: boolean;
+  /** The socket idle timeout this server bound with, in seconds. Exposed
+   *  because it is a CORRECTNESS setting for the live run console, not a
+   *  tuning knob: Bun's 10 s default severs any SSE stream whose daemon has
+   *  been quiet for that long. */
+  readonly idleTimeoutSeconds: number;
   /** The process layer this server drives — exposed so `crewhaus hangar`
    *  can shut supervision down cleanly and so tests can assert on it. */
   readonly processes: ProcessLayer;
@@ -492,9 +503,35 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       .filter((e) => e.missingSince === null && existsSync(e.dir))
       .map((e) => ({ id: e.id, dir: e.dir, specName: e.specName }));
 
-  const processFor = (entry: HangarHarnessEntry): HarnessProcess => {
+  /**
+   * The supervision handle for a harness, RE-ATTACHED to a daemon this
+   * manager did not spawn.
+   *
+   * Adoption at boot only sees the daemons that existed at that instant. A
+   * daemon started from a terminal, by a launchd unit, or for a harness
+   * registered after boot is otherwise invisible: the supervisor holds no
+   * pid, so `/proc` reports `stopped` while the same payload's runfile
+   * carries a live one, and stop/drain would return "stopped" having sent no
+   * signal and made no control call. `adoptIfRunfile()` is the cheap guard
+   * for that — it returns immediately unless a runfile exists AND this
+   * supervisor holds no pid — so it belongs on the request path, which is
+   * exactly what `crewhaus daemon stop` already does before every signal.
+   */
+  const processFor = async (entry: HangarHarnessEntry): Promise<HarnessProcess> => {
     liveDirOr404(entry);
-    return processes.get(entry);
+    const handle = processes.get(entry);
+    try {
+      await handle.supervisor.adoptIfRunfile();
+    } catch (err) {
+      // A failed adoption must not fail the read: the honest answer is the
+      // un-adopted picture plus a warning, never a 500.
+      onWarn(
+        `hangar-server: adopt failed for ${handle.harnessDir}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    return handle;
   };
 
   /**
@@ -622,7 +659,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     body: Record<string, unknown>,
     restart: boolean,
   ): Promise<Response> => {
-    const handle = processFor(entry);
+    const handle = await processFor(entry);
     const acknowledge = asStringArray(body["acknowledge"]);
     const gateOptions = {
       ...(body["force"] === true ? { force: true } : {}),
@@ -632,6 +669,10 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       ? await handle.supervisor.restart(gateOptions)
       : await handle.supervisor.start(gateOptions);
     if (result.ok) {
+      // A daemon that just started is not draining, whatever a previous
+      // drain left latched — the supervisor clears its own operator-stop
+      // latch on a successful start, and the display flag must follow.
+      handle.clearDraining();
       return json({
         ok: true,
         runId: result.runId,
@@ -666,6 +707,33 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           409,
         );
     }
+  };
+
+  /**
+   * A stop/drain that held no pid while a live runfile says a daemon IS
+   * running. The supervisor reports this rather than claiming `stopped`,
+   * because "I signalled nothing and the daemon is still there" and "the
+   * daemon is gone" are opposite facts that the console renders identically.
+   */
+  const notAdopted = (result: StopResult): boolean =>
+    !result.stopped && result.reason === "not-adopted";
+
+  const notAdoptedResponse = (verb: string, result: StopResult): Response =>
+    json(
+      {
+        ok: false,
+        reason: "not-adopted",
+        message: `${verb} reached no daemon: a runfile says one is running, but this manager could not adopt it (a foreign pid, a runfile from another machine, or a process it may not signal). Nothing was signalled.`,
+        runfile: result.runfile ?? null,
+      },
+      409,
+    );
+
+  /** True while the supervisor is on its way out — the states in which a
+   *  `draining` flag is still telling the truth. */
+  const isGoingAway = (handle: HarnessProcess): boolean => {
+    const state = handle.snapshot().state;
+    return state === "running" || state === "draining";
   };
 
   const controlTarget = (
@@ -758,12 +826,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     if (method === "POST") {
       if (head === "proc" && tail.length === 1) {
         const verb = tail[0];
-        const handle = processFor(entry);
+        const handle = await processFor(entry);
         if (verb === "start" || verb === "restart") {
           return await startProc(entry, await readBody(req), verb === "restart");
         }
         if (verb === "stop") {
           const result = await handle.supervisor.stop();
+          if (notAdopted(result)) return notAdoptedResponse("stop", result);
           return json({ ok: true, stopped: result.stopped, forced: result.forced });
         }
         if (verb === "drain") {
@@ -771,26 +840,38 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           // call itself is ours. `markDraining` is what makes the imminent
           // exit-0 read as an OPERATOR STOP instead of "exited cleanly
           // (unexpected)" — which would restart what we just shut down.
-          handle.markDraining();
+          // Only when there is a pid to drain, though: with none the drain
+          // is either a no-op or a `not-adopted` refusal, and marking either
+          // would latch an operator stop no daemon was ever told about.
+          if (handle.snapshot().pid !== undefined) handle.markDraining();
           let outcome: ControlResult<unknown> | undefined;
-          const result = await handle.supervisor.drain(async () => {
-            outcome = await control.drain(controlTarget(handle));
-            if (!outcome.ok) throw new Error(outcome.reason);
-          });
-          return json({
-            ok: true,
-            stopped: result.stopped,
-            // True when control.v1 was unavailable and the supervisor fell
-            // back to SIGTERM — an honest degradation, not a failure.
-            viaSignal: outcome === undefined || !outcome.ok,
-            control: outcome === undefined ? null : controlEnvelope(outcome),
-          });
+          try {
+            const result = await handle.supervisor.drain(async () => {
+              outcome = await control.drain(controlTarget(handle));
+              if (!outcome.ok) throw new Error(outcome.reason);
+            });
+            if (notAdopted(result)) return notAdoptedResponse("drain", result);
+            return json({
+              ok: true,
+              stopped: result.stopped,
+              // True when control.v1 was unavailable and the supervisor fell
+              // back to SIGTERM — an honest degradation, not a failure.
+              viaSignal: outcome === undefined || !outcome.ok,
+              control: outcome === undefined ? null : controlEnvelope(outcome),
+            });
+          } finally {
+            // A drain that did not actually take the daemon away must not
+            // leave the flag latched: nothing else ever clears it (only an
+            // `exit` event does) and every process verb in the console reads
+            // it. A real drain has already cleared it via that exit.
+            if (!isGoingAway(handle)) handle.clearDraining();
+          }
         }
         throw new HttpError(404, "not found");
       }
 
       if (head === "control" && tail.length === 1) {
-        const handle = processFor(entry);
+        const handle = await processFor(entry);
         if (tail[0] === "wake") {
           const body = await readBody(req);
           const lane = body["lane"];
@@ -809,8 +890,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           );
         }
         if (tail[0] === "drain") {
-          handle.markDraining();
-          return json(controlEnvelope(await control.drain(controlTarget(handle))));
+          const outcome = await control.drain(controlTarget(handle));
+          // ONLY after the daemon accepted it. A refusal (`no_control_port`,
+          // say) told the daemon nothing, and marking anyway would both
+          // suppress a restart the daemon still needs and disable every
+          // process verb in the console with "this daemon is draining".
+          if (outcome.ok) handle.markDraining();
+          return json(controlEnvelope(outcome));
         }
         throw new HttpError(404, "not found");
       }
@@ -927,7 +1013,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     if (method !== "GET") throw new HttpError(405, "method not allowed");
 
     if (head === "proc" && tail.length === 0) {
-      const handle = processFor(entry);
+      const handle = await processFor(entry);
       // maskDeep on the way out: the runfile and the plan preview carry
       // operator-supplied strings (env overrides, a bundle path, a control
       // token PATH) that no route should be trusted to have pre-filtered.
@@ -940,11 +1026,18 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       const runId = tail[0] as string;
       if (!isSupervisorRunId(runId)) throw new HttpError(400, "invalid run id");
       const dir = liveDirOr404(entry);
-      const handle = processFor(entry);
-      const live = handle.snapshot().runId === runId && handle.snapshot().state === "running";
-      const detail = runDetail(dir, runId, { live });
+      const handle = await processFor(entry);
+      const snapshot = handle.snapshot();
+      // Every state the pump still serves, not just `running`: a drain can
+      // take ~30 s, and "watch the live run" is what the operator clicks the
+      // moment they start one.
+      const live = snapshot.runId === runId && isLiveFeedState(snapshot.state);
+      const detail = runDetail(dir, runId, { live, env });
       if (detail === undefined) throw new HttpError(404, "no such run");
-      if (tail.length === 1) return json(detail);
+      // maskDeep: `proseTail` is built from the RAW capture file, so the env
+      // scrubber is only half the story — a credential with no env entry at
+      // all is caught by shape or not at all.
+      if (tail.length === 1) return json(maskDeep(detail));
       if (tail[1] !== "events") throw new HttpError(404, "not found");
       // SSE. `replay` first (durable history), `done` always last — a
       // terminal frame is what lets a client tell "finished" from "the
@@ -956,14 +1049,15 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         replay: detail,
         live,
         ...(live ? { subscribe: handle.supervisor.subscribe } : {}),
+        ...(opts.sseHeartbeatMs !== undefined ? { heartbeatMs: opts.sseHeartbeatMs } : {}),
         ...(req.signal !== undefined ? { signal: req.signal } : {}),
       });
     }
     if (head === "control" && tail.length === 1 && tail[0] === "status") {
-      return json(controlEnvelope(await control.status(controlTarget(processFor(entry)))));
+      return json(controlEnvelope(await control.status(controlTarget(await processFor(entry)))));
     }
     if (head === "schedulers" && tail.length === 0) {
-      return json(maskDeep(await schedulersFor(processFor(entry))));
+      return json(maskDeep(await schedulersFor(await processFor(entry))));
     }
     if (head === "deployments" && tail.length === 0) {
       return json(deploymentsView(liveDirOr404(entry)));
@@ -1357,6 +1451,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     port: opts.port ?? DEFAULT_HANGAR_PORT,
     hostname,
     development: false,
+    // NOT a tuning knob. Bun severs an idle socket after 10 s by default,
+    // and a live run stream is idle by nature — a `heartbeat: every 60s`
+    // daemon says nothing in between. The console has no reconnect, so the
+    // default turns "quietly working" into "connection dropped" every ~12 s.
+    // The keep-alive comment frame (SSE_HEARTBEAT_MS) is the other half:
+    // this raises the ceiling, the ping keeps the socket under it.
+    idleTimeout: SSE_IDLE_TIMEOUT_SECONDS,
     fetch: handle,
   });
 
@@ -1384,6 +1485,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     ...(tokenSetup?.tokenPath !== undefined ? { tokenPath: tokenSetup.tokenPath } : {}),
     ...(tokenSetup !== undefined ? { bootPath: bootTickets.mint(now()) } : {}),
     noAuth,
+    idleTimeoutSeconds: SSE_IDLE_TIMEOUT_SECONDS,
     processes,
     ready,
     stop: async () => {

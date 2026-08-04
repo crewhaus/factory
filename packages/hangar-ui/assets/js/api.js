@@ -109,9 +109,10 @@ function call(route, params, body, query = "") {
 /**
  * Issue one request whose REFUSAL is a payload, not an error: `POST
  * /proc/{start,restart}` answers 409 with the typed preflight refusal the
- * console renders as a modal, so swallowing it into an ApiError would throw
- * away the very thing the screen exists to show. Returns
- * `{ ok, status, body }`.
+ * console renders as a modal, and `POST /proc/{stop,drain}` answers 409
+ * `not-adopted` when a daemon is running that this manager never adopted.
+ * Swallowing either into an ApiError would throw away the very thing the
+ * screen exists to show. Returns `{ ok, status, body }`.
  */
 async function callTyped(route, params, body) {
   const {
@@ -238,8 +239,12 @@ export const api = {
   // start/restart answer 409 with a typed refusal — surfaced, not thrown.
   procStart: (id, opts) => callTyped(ROUTES.procStart, { id }, startBody(opts)),
   procRestart: (id, opts) => callTyped(ROUTES.procRestart, { id }, startBody(opts)),
-  procStop: (id) => call(ROUTES.procStop, { id }, {}),
-  procDrain: (id) => call(ROUTES.procDrain, { id }, {}),
+  // …and so do stop/drain: a 409 `not-adopted` says a daemon IS running
+  // that this manager never adopted, so nothing was signalled. Thrown away
+  // as an ApiError it reads as a transport fault; kept as a body the console
+  // can say what actually happened.
+  procStop: (id) => callTyped(ROUTES.procStop, { id }, {}),
+  procDrain: (id) => callTyped(ROUTES.procDrain, { id }, {}),
 
   // run history + one run's detail (the live feed is `streamRunEvents`)
   runs: (id) => call(ROUTES.runs, { id }),

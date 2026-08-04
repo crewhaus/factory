@@ -372,7 +372,66 @@ export type CreateGatewayServerOptions = {
    * loopback-bound port.
    */
   readonly publicGate?: (req: Request) => Response | undefined;
+  /**
+   * How long {@link GatewayServer.listen}'s `close()` waits for in-flight work
+   * before forcing connections shut. Defaults to {@link DEFAULT_CLOSE_GRACE_MS}.
+   * See `close()` for why the wait is BOUNDED rather than open-ended.
+   */
+  readonly closeGraceMs?: number;
 };
+
+/**
+ * Default bound on `close()`'s graceful phase.
+ *
+ * Long enough for a `runs.submit` turn (a model round-trip plus tool calls) to
+ * land, short enough to stay well inside a supervisor's drain deadline — the
+ * drain has other steps to run after the listeners close, and a close that
+ * never returned would be SIGTERM'd, which is exactly the abort a drain exists
+ * to avoid.
+ */
+export const DEFAULT_CLOSE_GRACE_MS = 10_000;
+
+/**
+ * Stop a `Bun.serve` handle gracefully, but under a bound.
+ *
+ * GRACEFUL, because `stop()`'s promise resolves only once in-flight requests
+ * have finished, and on this shape a request IS a turn: the managed daemon's
+ * drain step ends `await handle.close()` and control.v1 then calls `exit(0)`,
+ * so discarding that promise killed tenant turns mid-tool-call — the precise
+ * failure a drain exists to prevent.
+ *
+ * BOUNDED, because `runs.subscribe` streams are long-lived BY DESIGN: measured
+ * on Bun 1.3.14, a graceful stop with one open SSE response never resolves,
+ * even after the client cancels its reader. An unbounded await would hand a
+ * single idle subscriber the power to wedge every drain. So the graceful phase
+ * gets `graceMs`; past that the connections are forced shut. The forced stop is
+ * deliberately NOT awaited — once a graceful stop is pending, its promise does
+ * not resolve either — and it does close the listener: a connect to the port
+ * afterwards is refused.
+ */
+async function closeGracefully(
+  server: { stop(closeActiveConnections?: boolean): unknown },
+  graceMs: number,
+): Promise<void> {
+  if (graceMs <= 0) {
+    void server.stop(true);
+    return;
+  }
+  const graceful = Promise.resolve(server.stop() as unknown).then(
+    () => false,
+    () => false,
+  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = await Promise.race([
+    graceful,
+    new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(true), graceMs);
+      (timer as unknown as { unref?: () => void }).unref?.();
+    }),
+  ]);
+  if (timer !== undefined) clearTimeout(timer);
+  if (timedOut) void server.stop(true);
+}
 
 export type UsageDelta = {
   readonly input: number;
@@ -747,8 +806,8 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
       });
       return {
         port: server.port ?? port,
-        async close(): Promise<void> {
-          server.stop();
+        close(): Promise<void> {
+          return closeGracefully(server, opts.closeGraceMs ?? DEFAULT_CLOSE_GRACE_MS);
         },
       };
     },

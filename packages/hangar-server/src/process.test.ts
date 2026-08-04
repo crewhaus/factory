@@ -12,13 +12,17 @@
  * what the console renders.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { type HangarHarnessEntry, openHangarRegistry } from "@crewhaus/harness-registry";
 import { makeFixtureHarness } from "./fixture";
-import { JobArgumentError, jobArgv } from "./process";
-import { type TestServer, bootTestServer } from "./testkit";
+import { JobArgumentError, type ProcessLayer, createProcessLayer, jobArgv } from "./process";
+import { type TestServer, bootTestServer, startStubControlPlane } from "./testkit";
 
 const NOW = Date.parse("2026-08-03T00:00:00.000Z");
+
+/** Never a realistic-shaped literal in a fixture: built from parts. */
+const STUB_TOKEN = ["c0ntrol", "test", "bearer", "0123456789abcdef"].join("-");
 
 async function register(t: TestServer, dir: string): Promise<string> {
   const res = await t.api("/api/harnesses", { method: "POST", body: JSON.stringify({ dir }) });
@@ -29,8 +33,123 @@ function daemonHarness(t: TestServer, name: string): string {
   return makeFixtureHarness(join(t.harnessesRoot, name), {
     specName: name,
     target: "channel",
+    controlToken: STUB_TOKEN,
     bundle: { entry: "daemon.ts" },
   });
+}
+
+/**
+ * THE OTHER HEAD: a second process layer over the same fake OS, the same
+ * fake clock, and the same registry file — which is exactly what a terminal
+ * `crewhaus daemon start` (or a launchd unit) is to a console that is
+ * already running. Its daemon is a real, live, runfile-holding process that
+ * the server's own layer has never seen.
+ */
+function terminalManager(t: TestServer): ProcessLayer {
+  return createProcessLayer({
+    registry: openHangarRegistry({
+      root: t.registryRoot,
+      env: { CREWHAUS_WATCHME_ROOT: join(t.workspace, "watchme") },
+      now: () => NOW,
+      onWarn: () => {},
+    }),
+    env: { CREWHAUS_WATCHME_ROOT: join(t.workspace, "watchme") },
+    now: () => NOW,
+    onWarn: () => {},
+    hangarRoot: t.hangarRoot,
+    managerVersion: "terminal",
+    ...(t.ops !== undefined ? { ops: t.ops } : {}),
+    ...(t.clock !== undefined ? { clock: t.clock } : {}),
+    noPreflight: true,
+    runJob: () => new Promise<{ exitCode?: number }>(() => {}),
+  });
+}
+
+/** The registry row the terminal manager supervises, read from the same
+ *  `harnesses.json` the server just wrote. */
+function entryFor(t: TestServer, id: string): HangarHarnessEntry {
+  const reg = openHangarRegistry({
+    root: t.registryRoot,
+    env: { CREWHAUS_WATCHME_ROOT: join(t.workspace, "watchme") },
+    now: () => NOW,
+    onWarn: () => {},
+  });
+  const entry = reg.get(id);
+  if (entry === undefined) throw new Error(`no registry entry for ${id}`);
+  return entry;
+}
+
+/** Start a daemon the way the OTHER head does, then let that manager go:
+ *  `close()` releases its timers and subscriptions and deliberately leaves
+ *  the child alone — a detached daemon outliving the process that spawned it
+ *  is the whole point of the runfile. */
+async function startFromTerminal(t: TestServer, id: string): Promise<number> {
+  const terminal = terminalManager(t);
+  try {
+    const started = await terminal.get(entryFor(t, id)).supervisor.start();
+    expect(started).toMatchObject({ ok: true });
+    return t.ops?.last()?.pid as number;
+  } finally {
+    terminal.close();
+  }
+}
+
+/** The daemon states its kernel-assigned control port on stdout — the only
+ *  place it is ever stated — and the pump hands the manager that line. */
+function announceControlPort(t: TestServer, port: number): void {
+  t.ops
+    ?.last()
+    ?.writeLog(
+      `[control] crewhaus.control.v1 listening on http://127.0.0.1:${port} (token: .crewhaus/run/control-token)\n`,
+    );
+  t.clock?.advance(300); // one pump tick
+}
+
+/**
+ * Settle a request that is waiting on the FAKE clock. An adopted run's exit
+ * is noticed on a pump tick — this manager never held its exit promise — so
+ * a stop of an adopted daemon needs time to move before it can answer.
+ */
+async function settleWithClock<T>(t: TestServer, pending: Promise<T>): Promise<T> {
+  let settled = false;
+  const done = pending.finally(() => {
+    settled = true;
+  });
+  for (let i = 0; i < 200 && !settled; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    t.clock?.advance(300);
+  }
+  return done;
+}
+
+type RunFeed = {
+  /** Everything received so far. */
+  text(): string;
+  /** Read until the predicate holds (or the stream ends). */
+  until(predicate: (text: string) => boolean): Promise<void>;
+  close(): Promise<void>;
+};
+
+/** Open a run's SSE feed and read it incrementally. */
+async function openRunFeed(t: TestServer, id: string, runId: string): Promise<RunFeed> {
+  const res = await t.fetchRaw(`/api/h/${id}/runs/${runId}/events`, {
+    headers: { authorization: `Bearer ${t.token}` },
+  });
+  expect(res.headers.get("content-type")).toContain("text/event-stream");
+  const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+  const decoder = new TextDecoder();
+  let seen = "";
+  return {
+    text: () => seen,
+    until: async (predicate) => {
+      while (!predicate(seen)) {
+        const { value, done } = await reader.read();
+        if (done) return;
+        seen += decoder.decode(value, { stream: true });
+      }
+    },
+    close: () => reader.cancel(),
+  };
 }
 
 describe("process control", () => {
@@ -217,6 +336,224 @@ describe("process control", () => {
       expect(forced.status).toBe(409);
       expect((forced.body["unforceable"] as string[]).length).toBeGreaterThan(0);
       expect(t.ops?.children.length ?? 0).toBe(0);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("a daemon this manager did not start is adopted on the next request", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = daemonHarness(t, "proc-foreign");
+      const id = await register(t, dir);
+      // Boot adoption has already run and had nothing to adopt …
+      await t.server.ready;
+      // … and ONLY NOW does the other head start the daemon.
+      const pid = await startFromTerminal(t, id);
+      expect(t.ops?.isAlive(pid)).toBe(true);
+
+      // The console must not report `stopped` over a live runfile: every
+      // button it paints is decided by this payload.
+      const proc = await t.api(`/api/h/${id}/proc`);
+      expect(proc.body["state"]).toBe("running");
+      expect(proc.body["adopted"]).toBe(true);
+      expect(proc.body["pid"]).toBe(pid);
+
+      // …and Stop must SIGNAL the daemon rather than answer 200 having done
+      // nothing at all.
+      const stopped = await settleWithClock(
+        t,
+        t.api(`/api/h/${id}/proc/stop`, { method: "POST", body: "{}" }),
+      );
+      expect(stopped.status).toBe(200);
+      expect(stopped.body["stopped"]).toBe(true);
+      expect(t.ops?.last()?.signals).toEqual(["SIGTERM"]);
+      expect(t.ops?.isAlive(pid)).toBe(false);
+      // The lock is released — not left for the next start to trip over.
+      expect(existsSync(join(dir, ".crewhaus", "run", "daemon.json"))).toBe(false);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("a stop that could not adopt the live daemon answers 409, never a false success", async () => {
+    const t = bootTestServer({
+      now: () => NOW,
+      // Adoption itself fails (an unreadable run dir, a pid this user may
+      // not signal). The honest answer is "I reached nothing" — the answer
+      // that let a Restart delete a live daemon's lock is "stopped: true".
+      wrapProcessLayer: (layer) => ({
+        ...layer,
+        get: (entry) => {
+          const handle = layer.get(entry);
+          return {
+            ...handle,
+            supervisor: {
+              ...handle.supervisor,
+              adoptIfRunfile: () => Promise.reject(new Error("simulated: EACCES on the run dir")),
+            },
+          };
+        },
+      }),
+    });
+    try {
+      const dir = daemonHarness(t, "proc-unadoptable");
+      const id = await register(t, dir);
+      const pid = await startFromTerminal(t, id);
+
+      const stopped = await t.api(`/api/h/${id}/proc/stop`, { method: "POST", body: "{}" });
+      expect(stopped.status).toBe(409);
+      expect(stopped.body["reason"]).toBe("not-adopted");
+      expect((stopped.body["runfile"] as { pid: number }).pid).toBe(pid);
+
+      const drained = await t.api(`/api/h/${id}/proc/drain`, { method: "POST", body: "{}" });
+      expect(drained.status).toBe(409);
+      expect(drained.body["reason"]).toBe("not-adopted");
+
+      // Nothing was signalled and the lock is intact: the daemon is exactly
+      // as it was, which is what the 409 claims.
+      expect(t.ops?.last()?.signals).toEqual([]);
+      expect(t.ops?.isAlive(pid)).toBe(true);
+      expect(existsSync(join(dir, ".crewhaus", "run", "daemon.json"))).toBe(true);
+      // The refused drain did NOT latch the flag that disables every process
+      // verb in the console — only an exit clears that, and none is coming.
+      expect((await t.api(`/api/h/${id}/proc`)).body["draining"]).toBe(false);
+      // The adoption failure was reported, not swallowed.
+      expect(t.warnings.some((w) => w.includes("adopt failed"))).toBe(true);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("a control-plane drain is an operator stop — the daemon is not restarted underneath it", async () => {
+    const stub = startStubControlPlane(STUB_TOKEN);
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = daemonHarness(t, "ctl-drain-restart");
+      const id = await register(t, dir);
+      await t.api(`/api/h/${id}/proc/start`, { method: "POST", body: "{}" });
+      announceControlPort(t, stub.port);
+      expect((await t.api(`/api/h/${id}/proc`)).body["control"]).toMatchObject({ port: stub.port });
+
+      const drained = await t.api(`/api/h/${id}/control/drain`, { method: "POST", body: "{}" });
+      expect(drained.body["ok"]).toBe(true);
+
+      // The drain contract: the daemon answers 202, finishes in flight work,
+      // and exits 0 ON ITS OWN. An unflagged exit 0 from a long-running
+      // shape reads as "exited cleanly (unexpected)" — restartable — so this
+      // is the exit that used to resurrect what the operator just shut down.
+      t.ops?.last()?.exit(0, null);
+      await t.api(`/api/h/${id}/proc`); // flush the exit handler
+      t.clock?.advance(60_000); // …and run any backoff timer it armed
+
+      const proc = await t.api(`/api/h/${id}/proc`);
+      expect(proc.body["state"]).toBe("stopped");
+      expect(proc.body["nextRestartAtMs"]).toBe(null);
+      expect(proc.body["lastExit"]).toMatchObject({
+        title: "stopped by the operator",
+        restartable: false,
+      });
+      expect(t.ops?.children.length).toBe(1);
+    } finally {
+      await t.stop();
+      await stub.stop();
+    }
+  }, 20_000);
+
+  test("a REFUSED control drain leaves the process verbs alone", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = daemonHarness(t, "ctl-drain-refused");
+      const id = await register(t, dir);
+      await t.api(`/api/h/${id}/proc/start`, { method: "POST", body: "{}" });
+
+      // No control port ⇒ `no_control_port`, an EXPECTED refusal. The daemon
+      // was told nothing, so it is not draining and must not be marked so:
+      // the flag is only ever cleared by an exit that is not coming.
+      const refused = await t.api(`/api/h/${id}/control/drain`, { method: "POST", body: "{}" });
+      expect(refused.body["ok"]).toBe(false);
+      expect(refused.body["code"]).toBe("no_control_port");
+
+      const proc = await t.api(`/api/h/${id}/proc`);
+      expect(proc.body["state"]).toBe("running");
+      expect(proc.body["draining"]).toBe(false);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("the live feed follows a DRAINING run instead of reporting it finished", async () => {
+    const stub = startStubControlPlane(STUB_TOKEN);
+    const t = bootTestServer({ now: () => NOW });
+    // The drain is deliberately left in flight; keep a handle so a failing
+    // assertion cannot leave it unsettled and drown the real failure in a
+    // connection-reset from the teardown.
+    let draining: Promise<unknown> = Promise.resolve();
+    try {
+      const dir = daemonHarness(t, "proc-draining-feed");
+      const id = await register(t, dir);
+      const started = await t.api(`/api/h/${id}/proc/start`, { method: "POST", body: "{}" });
+      const runId = started.body["runId"] as string;
+      announceControlPort(t, stub.port);
+
+      // Drain, but do NOT await it: the supervisor sits in `draining` until
+      // the daemon exits, and that window — up to the whole stop grace — is
+      // exactly when an operator clicks "watch the live run".
+      draining = t.api(`/api/h/${id}/proc/drain`, { method: "POST", body: "{}" }).catch(() => ({
+        status: 0,
+        body: {},
+      }));
+      await t.api(`/api/h/${id}/proc`); // let the route reach supervisor.drain()
+      expect((await t.api(`/api/h/${id}/proc`)).body["state"]).toBe("draining");
+
+      const feed = await openRunFeed(t, id, runId);
+      await feed.until((s) => s.includes("event: replay"));
+      // The bug: `live: false` sends replay and `done` in the same breath,
+      // so the operator sees history and "stream closed" while the daemon is
+      // still shutting down in front of them.
+      expect(feed.text()).not.toContain("event: done");
+
+      t.ops?.last()?.writeLog("draining: flushing in-flight turns\n");
+      t.clock?.advance(300);
+      await feed.until((s) => s.includes("event: output"));
+      expect(feed.text()).toContain("flushing in-flight turns");
+
+      t.ops?.last()?.exit(0, null);
+      await feed.until((s) => s.includes("event: done"));
+      expect(feed.text()).toContain("event: exit");
+      await feed.close();
+      expect(((await draining) as { body: Record<string, unknown> }).body["stopped"]).toBe(true);
+    } finally {
+      // Settle any in-flight drain before the socket goes away.
+      t.ops?.last()?.exit(0, null);
+      await draining;
+      await t.stop();
+      await stub.stop();
+    }
+  }, 20_000);
+
+  test("a quiet live feed keeps its socket alive with heartbeat comment frames", async () => {
+    // Bun severs an idle socket after 10 s by default, and a `heartbeat:
+    // every 60s` daemon is silent for a minute at a time — the exact shape
+    // this console exists to watch. The stream must speak even when the
+    // daemon does not.
+    const t = bootTestServer({ now: () => NOW, sseHeartbeatMs: 25 });
+    try {
+      const dir = daemonHarness(t, "proc-quiet-feed");
+      const id = await register(t, dir);
+      const started = await t.api(`/api/h/${id}/proc/start`, { method: "POST", body: "{}" });
+      const runId = started.body["runId"] as string;
+
+      const feed = await openRunFeed(t, id, runId);
+      // Not one byte of daemon output — only the keep-alive can arrive.
+      await feed.until((s) => s.includes(": ping"));
+      // A comment frame, so it never reaches the client's `onmessage`.
+      expect(feed.text()).not.toContain("event: ping");
+      await feed.close();
+
+      // And the socket's own ceiling is raised above Bun's 10 s default, or
+      // the ping would never get a chance to fire.
+      expect(t.server.idleTimeoutSeconds).toBeGreaterThan(60);
     } finally {
       await t.stop();
     }

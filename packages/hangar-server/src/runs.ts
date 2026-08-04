@@ -9,6 +9,19 @@
  * from `supervisor.subscribe()`, whose `output` events are scrubbed before
  * they are emitted.
  *
+ * HISTORY IS SCRUBBED TO THE SAME STANDARD AS THE LIVE FEED, and that takes
+ * BOTH layers, on BOTH paths:
+ *   - the env scrubber is built from the MERGED spawn env (`.env` chain
+ *     UNDER the manager's own environment), because that is the record the
+ *     pump scrubbed the live frames with — a key exported into the shell
+ *     that launched `crewhaus hangar` is in the daemon's env and therefore
+ *     in its log, but in no `.env` file;
+ *   - `maskDeep` runs on the serialized detail, because a credential with no
+ *     env entry at all (an OAuth token echoed back by a tool) can only be
+ *     caught by SHAPE.
+ * `runEventStream` masks the `replay` frame and the live `output` prose for
+ * the same reason, so the stream and `GET /runs/:runId` cannot drift.
+ *
  * Every harness-relative read still goes through `resolveInside`. A `runId`
  * is `run_<16hex>` and therefore safe as a path segment on its face, but
  * "safe on its face" is exactly the assumption a planted symlink inside the
@@ -21,6 +34,7 @@ import {
   RUN_ID_RE,
   type RunLedgerEntry,
   type Scrubber,
+  type SupervisionState,
   type SupervisorEvent,
   createEnvScrubber,
   loadEnvChain,
@@ -29,7 +43,8 @@ import {
   replayRunEvents,
 } from "@crewhaus/harness-supervisor";
 import { MAX_JSONL_LINES } from "./constants";
-import { maskDeep } from "./mask";
+import { mergedSpawnEnv } from "./env-file";
+import { maskDeep, maskText } from "./mask";
 import { resolveInside } from "./safety";
 
 export function isSupervisorRunId(id: string): boolean {
@@ -69,18 +84,39 @@ export type RunDetail = {
   readonly proseTail: readonly string[];
 };
 
-/** A scrubber built from the harness's own `.env` chain — the same default
- *  the supervisor uses, so an adopted run (whose spawn env this process never
- *  built) is scrubbed identically. */
+/** A scrubber built from the harness's own `.env` chain — the supervisor's
+ *  fallback default, and the weakest of the two. Kept exported because an
+ *  adopted run's spawn env was never built by this process; prefer
+ *  {@link spawnEnvScrubber}, which is a strict superset of it. */
 export function harnessScrubber(harnessDir: string): Scrubber {
   return createEnvScrubber(loadEnvChain(harnessDir).vars);
+}
+
+/**
+ * The scrubber the LIVE pump runs: the harness `.env` chain UNDER the
+ * manager's own environment — `buildSpawnEnv`'s precedence, via the same
+ * function the spawn plan uses. Serving history with anything weaker means a
+ * key exported in the shell that launched the manager is `«KEY»` in the live
+ * `output` frame and verbatim in the `replay` frame of the same stream.
+ */
+export function spawnEnvScrubber(
+  harnessDir: string,
+  processEnv: Readonly<Record<string, string | undefined>>,
+): Scrubber {
+  return createEnvScrubber(mergedSpawnEnv(processEnv, harnessDir).env);
 }
 
 /** One run: ledger row + scrubbed events + scrubbed prose tail. */
 export function runDetail(
   harnessDir: string,
   runId: string,
-  opts: { readonly live?: boolean; readonly maxEvents?: number } = {},
+  opts: {
+    readonly live?: boolean;
+    readonly maxEvents?: number;
+    /** The manager's environment — the base layer of the spawn env, and so
+     *  of the tail scrubber. Defaults to this process's own. */
+    readonly env?: Readonly<Record<string, string | undefined>>;
+  } = {},
 ): RunDetail | undefined {
   if (!isSupervisorRunId(runId)) return undefined;
   const eventsFile = resolveInside(harnessDir, [
@@ -105,7 +141,9 @@ export function runDetail(
     events: events.map((e) => maskDeep(e)),
     eventsTruncated: all.length > events.length,
     proseTail:
-      logFile === undefined ? [] : readLogTail(logFile, harnessScrubber(harnessDir)).map(String),
+      logFile === undefined
+        ? []
+        : readLogTail(logFile, spawnEnvScrubber(harnessDir, opts.env ?? process.env)).map(String),
   };
 }
 
@@ -132,6 +170,37 @@ export const SSE_HEADERS: Record<string, string> = {
   "x-content-type-options": "nosniff",
 };
 
+/**
+ * The supervision states in which the pump is still serving this run — the
+ * window the live feed must stay open for.
+ *
+ * `draining` is the one that matters: a drain runs the control call, then
+ * waits out the stop grace, then a SIGTERM grace on top — up to ~30 s during
+ * which the operator has just clicked Drain and asked to watch it finish.
+ * Gating the feed on `running` alone answers that click with "stream closed".
+ */
+export const LIVE_FEED_STATES: ReadonlySet<SupervisionState> = new Set<SupervisionState>([
+  "starting",
+  "running",
+  "draining",
+]);
+
+export function isLiveFeedState(state: SupervisionState): boolean {
+  return LIVE_FEED_STATES.has(state);
+}
+
+/**
+ * How often a live stream emits a `: ping` comment frame.
+ *
+ * Two things kill a quiet SSE connection, and one interval answers both: the
+ * server's own socket idle timeout (Bun's default is 10 s — see
+ * `SSE_IDLE_TIMEOUT_SECONDS`), and any proxy in between that buffers a
+ * response until it sees bytes. A heartbeat-shaped daemon can be silent for
+ * a minute at a time, which is precisely the case the live console exists
+ * for, so silence must not read as death.
+ */
+export const SSE_HEARTBEAT_MS = 15_000;
+
 function frame(event: SseEventName, data: unknown): string {
   // One JSON object per frame; newlines inside the payload are impossible
   // because JSON.stringify escapes them, so a single `data:` line is safe.
@@ -150,6 +219,8 @@ export type RunStreamOptions = {
   /** Cap on live frames before the stream closes itself (a runaway daemon
    *  must not be able to hold a browser connection open forever). */
   readonly maxFrames?: number;
+  /** Keep-alive cadence; see {@link SSE_HEARTBEAT_MS}. Tests shorten it. */
+  readonly heartbeatMs?: number;
   readonly signal?: AbortSignal;
 };
 
@@ -171,11 +242,13 @@ export function runEventStream(options: RunStreamOptions): Response {
       const encoder = new TextEncoder();
       let frames = 0;
       let closed = false;
-      // `finish` closes over this BEFORE the subscription exists — a send
-      // during the replay frame can already finish the stream — so the
-      // binding has to be declared ahead of its assignment.
+      // `finish` closes over these BEFORE they exist — a send during the
+      // replay frame can already finish the stream — so the bindings have to
+      // be declared ahead of their assignment.
       // biome-ignore lint/style/useConst: forward-referenced by finish()
       let unsubscribe: (() => void) | undefined;
+      // biome-ignore lint/style/useConst: forward-referenced by finish()
+      let heartbeat: ReturnType<typeof setInterval> | undefined;
 
       const send = (event: SseEventName, data: unknown): void => {
         if (closed) return;
@@ -194,6 +267,7 @@ export function runEventStream(options: RunStreamOptions): Response {
         if (closed) return;
         closed = true;
         unsubscribe?.();
+        if (heartbeat !== undefined) clearInterval(heartbeat);
         try {
           controller.enqueue(encoder.encode(frame("done", { runId: options.runId, reason })));
           controller.close();
@@ -202,23 +276,35 @@ export function runEventStream(options: RunStreamOptions): Response {
         }
       };
 
-      send("replay", options.replay);
+      // maskDeep on the way out: `replay` carries the run's prose tail, which
+      // is the one payload built from the raw capture file rather than from
+      // the pump's already-masked events.
+      send("replay", maskDeep(options.replay));
 
       if (!options.live || options.subscribe === undefined) {
         finish("closed");
         return;
       }
 
+      // A COMMENT frame, not an event: it keeps the socket (and any buffering
+      // proxy) awake without appearing in the client's `onmessage` or
+      // counting against `maxFrames`.
+      heartbeat = setInterval(() => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(": ping\n\n"));
+        } catch {
+          finish("client-gone");
+        }
+      }, options.heartbeatMs ?? SSE_HEARTBEAT_MS);
+      // Never hold the process open for a keep-alive.
+      (heartbeat as { unref?: () => void }).unref?.();
+
       unsubscribe = options.subscribe((event) => {
         switch (event.type) {
           case "state":
             send("state", { snapshot: event.snapshot });
-            if (
-              event.snapshot.runId === options.runId &&
-              event.snapshot.state !== "running" &&
-              event.snapshot.state !== "draining" &&
-              event.snapshot.state !== "starting"
-            ) {
+            if (event.snapshot.runId === options.runId && !isLiveFeedState(event.snapshot.state)) {
               finish("state-terminal");
             }
             break;
@@ -226,7 +312,10 @@ export function runEventStream(options: RunStreamOptions): Response {
             if (event.runId !== options.runId) return;
             send("output", {
               runId: event.runId,
-              prose: event.prose,
+              // The pump's env scrubber already ran; this is the SHAPE layer,
+              // so a credential in no env file cannot ride the live feed out
+              // while history (maskDeep'd) hides it.
+              prose: maskText(event.prose),
               events: event.events.map((e) => maskDeep(e)),
             });
             break;

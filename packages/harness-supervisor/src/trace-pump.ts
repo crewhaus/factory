@@ -444,13 +444,36 @@ export function tailLines(
   return kept;
 }
 
-/** Read the tail of a captured log, scrubbed, for a crash card. Reads at
- *  most `maxBytes` from the END of the file. */
+/** How a caller sizes a tail read. */
+export type LogTailOptions = {
+  /** Bytes read from the END of the file. Default 64 KiB. */
+  readonly maxBytes?: number;
+  /** Lines kept from that window. Default {@link LOG_TAIL_LINES} (8) — the
+   *  forensics tail. `daemon logs --tail N` passes N. */
+  readonly lines?: number;
+};
+
+/**
+ * Read the tail of a captured log, scrubbed.
+ *
+ * Two independent budgets, and BOTH matter: `maxBytes` bounds the read (a
+ * multi-GB log must not be slurped), `lines` bounds the result. The default
+ * line budget is the 8-line crash tail every forensics caller wants, which
+ * is why a caller that widened only the byte window used to still get 8
+ * lines — pass `lines` (or `{ maxBytes, lines }`) to ask for more.
+ *
+ * The third argument stays positional-compatible: a bare number is the BYTE
+ * budget, as it always was.
+ */
 export function readLogTail(
   logFile: string,
   scrub: Scrubber = noopScrubber,
-  maxBytes = 64 * 1024,
+  sizing: number | LogTailOptions = 64 * 1024,
+  lines?: number,
 ): string[] {
+  const maxBytes = (typeof sizing === "number" ? sizing : sizing.maxBytes) ?? 64 * 1024;
+  const keepLines =
+    lines ?? (typeof sizing === "number" ? undefined : sizing.lines) ?? LOG_TAIL_LINES;
   let size: number;
   try {
     size = statSync(logFile).size;
@@ -474,5 +497,48 @@ export function readLogTail(
   } finally {
     closeSync(fd);
   }
-  return tailLines(scrub(text));
+  return tailLines(scrub(text), keepLines);
+}
+
+/**
+ * `readLogTail` with the LINE budget in the obvious place — for `daemon logs
+ * --tail N`, where passing N as the third argument would silently mean N
+ * BYTES. The byte budget defaults to 512 KiB, enough for any plausible N.
+ */
+export function readLogTailLines(
+  logFile: string,
+  scrub: Scrubber = noopScrubber,
+  lines: number = LOG_TAIL_LINES,
+  maxBytes = 512 * 1024,
+): string[] {
+  return readLogTail(logFile, scrub, maxBytes, lines);
+}
+
+// ---------------------------------------------------------------------------
+// The control-plane boot announcement
+// ---------------------------------------------------------------------------
+
+/**
+ * The boot line a control-serving daemon prints on stdout:
+ *
+ * ```
+ * [control] crewhaus.control.v1 listening on http://127.0.0.1:41234 (token: …)
+ * ```
+ *
+ * The manager passes `CREWHAUS_CONTROL_PORT=0` (kernel-assigned) so it never
+ * has to reserve a number in advance, which makes THIS line the only way to
+ * learn the port. It is matched off the log pump's prose, which is why it
+ * lives in the supervision layer: whoever is pumping the log — the console,
+ * `crewhaus daemon start`, or a manager that adopted the run — records the
+ * port in the runfile, and every other head reads it back from there.
+ */
+export const CONTROL_ANNOUNCE_RE =
+  /\[control\]\s+crewhaus\.control\.v1\s+listening\s+on\s+https?:\/\/[^\s/:]+:(\d{1,5})/;
+
+/** The control port a chunk of captured daemon output announces, if any. */
+export function parseAnnouncedControlPort(text: string): number | undefined {
+  const m = text.match(CONTROL_ANNOUNCE_RE);
+  if (m === null) return undefined;
+  const port = Number(m[1]);
+  return Number.isInteger(port) && port > 0 && port <= 65_535 ? port : undefined;
 }

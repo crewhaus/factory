@@ -328,6 +328,70 @@ export function procActions(proc) {
   };
 }
 
+/** What the supervisor says when it held no pid and a live runfile exists:
+ *  a daemon is running that this manager never adopted, so nothing was
+ *  signalled. It is NOT a stop, and rendering it as one is how a console
+ *  tells an operator a live channel bot is down. */
+const NOT_ADOPTED_SENTENCE =
+  "a daemon is running for this harness but this console does not hold it — nothing was signalled";
+/** …and what to do about it, which the server's own sentence never carries. */
+const NOT_ADOPTED_RETRY = "Try again: the next request adopts it off the runfile.";
+
+/**
+ * `POST /proc/{stop,drain}` → what ACTUALLY happened.
+ *
+ * Three answers hide behind one button, and only one of them is a stop:
+ *
+ *   - the daemon stopped (`stopped: true`) — silence is the right report;
+ *   - it drained by SIGTERM because no control plane answered
+ *     (`viaSignal: true`) — an honest degradation, said out loud;
+ *   - nothing was signalled at all — a 409 `not-adopted`, or a body that
+ *     says `stopped: false`. This one must never read as success.
+ *
+ * `res` is the `{ ok, status, body }` envelope `api.procStop`/`api.procDrain`
+ * return, because a refusal here is a PAYLOAD, not an exception.
+ */
+export function procWriteOutcome(res, label = "Stop") {
+  const r = res && typeof res === "object" ? res : {};
+  const body = r.body && typeof r.body === "object" ? r.body : {};
+  const status = typeof r.status === "number" ? r.status : 0;
+  const reason = typeof body.reason === "string" && body.reason !== "" ? body.reason : null;
+  const serverMessage =
+    typeof body.message === "string" && body.message !== "" ? body.message : null;
+  const notAdopted = reason === "not-adopted";
+  if (r.ok === true && body.stopped !== false) {
+    return body.viaSignal === true
+      ? {
+          ok: true,
+          code: "via-signal",
+          notAdopted: false,
+          tone: "info",
+          message: "No control plane — drained with SIGTERM instead",
+        }
+      : { ok: true, code: "stopped", notAdopted: false, tone: "info", message: null };
+  }
+  if (notAdopted) {
+    return {
+      ok: false,
+      code: "not-adopted",
+      notAdopted: true,
+      tone: "error",
+      message: `${label} did nothing — ${(serverMessage ?? NOT_ADOPTED_SENTENCE).replace(
+        /\.$/,
+        "",
+      )}. ${NOT_ADOPTED_RETRY}`,
+    };
+  }
+  const code = reason ?? (status === 0 ? "error" : `http-${status}`);
+  return {
+    ok: false,
+    code,
+    notAdopted: false,
+    tone: "error",
+    message: `${label} did nothing — ${serverMessage ?? code}`,
+  };
+}
+
 /** One `/api/h/:id/proc` payload → the board row / detail header model. */
 export function procRow(proc, nowMs) {
   const p = proc && typeof proc === "object" ? proc : {};
@@ -1100,23 +1164,44 @@ const JOB_DOT = {
   done: "off",
 };
 
-/** `/api/jobs` → the queue panel model. */
+/**
+ * `/api/jobs` → the queue panel model.
+ *
+ * `recent` is READ, not decoration. A job that was running when the previous
+ * manager died is closed as `interrupted` at the next boot and never
+ * silently re-run — and closing it is exactly what takes it OUT of the
+ * queue: `restore()` appends the terminal record to the ledger rather than
+ * returning the job to `pending`/`running`. So the only channel an
+ * interrupted job reaches the console through is `recent`, and folding just
+ * `pending` + `running` left the Interrupted group permanently empty while
+ * an abandoned mutating `compile` went unreported.
+ */
 export function jobQueueModel(payload) {
   const p = payload && typeof payload === "object" ? payload : {};
-  const pending = (Array.isArray(p.pending) ? p.pending : []).filter(
-    (j) => j && typeof j === "object",
-  );
-  const running = (Array.isArray(p.running) ? p.running : []).filter(
-    (j) => j && typeof j === "object",
-  );
-  const all = [...running, ...pending];
+  const jobs = (v) => (Array.isArray(v) ? v : []).filter((j) => j && typeof j === "object");
+  const pending = jobs(p.pending);
+  const running = jobs(p.running);
+  const recent = jobs(p.recent);
+  // The same job can legitimately appear in two lists across a restore, so
+  // the fold is de-duplicated by id rather than concatenated.
+  const seen = new Set();
+  const interrupted = [];
+  for (const job of [...running, ...pending, ...recent]) {
+    if (job.state !== "interrupted") continue;
+    const key = typeof job.jobId === "string" && job.jobId !== "" ? job.jobId : null;
+    if (key !== null) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+    interrupted.push(job);
+  }
+  const runningLive = running.filter((j) => j.state !== "interrupted");
+  const pendingLive = pending.filter((j) => j.state !== "interrupted");
   return {
-    running: running.filter((j) => j.state !== "interrupted"),
-    pending: pending.filter((j) => j.state !== "interrupted"),
-    // A job that was running when the previous manager died is closed as
-    // `interrupted` and never silently re-run.
-    interrupted: all.filter((j) => j.state === "interrupted"),
-    total: all.length,
+    running: runningLive,
+    pending: pendingLive,
+    interrupted,
+    total: runningLive.length + pendingLive.length + interrupted.length,
   };
 }
 

@@ -13,8 +13,23 @@
 import { api } from "../api.js";
 import { clear, collapsible, dot, el, jsonPre, toast } from "../dom.js";
 import { hrefHarness } from "../router.js";
-import { procRow, refusalModel } from "../supervision.js";
+import { procRow, procWriteOutcome, refusalModel } from "../supervision.js";
 import { actionTwin, cliTwin, gatedBtn, refusalModal, runAction } from "./control.js";
+
+/**
+ * Report what a Stop / Drain actually did, then reload.
+ *
+ * A 200 is not the same as a stop. The supervisor answers `not-adopted` when
+ * it held no pid while a live runfile existed — a daemon IS running, this
+ * manager just never adopted it, and nothing was signalled. Reloading
+ * silently there would paint the row from a snapshot that agrees the daemon
+ * is "stopped", which is precisely the lie this reports instead.
+ */
+function reportProcWrite(res, label, reload) {
+  const outcome = procWriteOutcome(res, label);
+  if (outcome.message !== null) toast(outcome.message, outcome.tone);
+  reload();
+}
 
 /**
  * Start (or restart) a harness, routing the typed 409 to the refusal modal.
@@ -71,24 +86,25 @@ export function procActionBar(id, dir, row, reload) {
     "btn btn-primary",
   );
   const stopBtn = gatedBtn("Stop", row.actions.stop, () => {
-    runAction(stopBtn, "Stop", () => api.procStop(id), reload);
+    runAction(
+      stopBtn,
+      "Stop",
+      () => api.procStop(id),
+      (res) => reportProcWrite(res, "Stop", reload),
+    );
   });
   const restartBtn = gatedBtn("Restart", row.actions.restart, () =>
     startProc(id, dir, {}, true, reload),
   );
   const drainBtn = gatedBtn("Drain", row.actions.drain, () => {
+    // A drain has three endings — drained, drained by SIGTERM because no
+    // control plane answered, and nothing-was-signalled — and only the first
+    // deserves silence.
     runAction(
       drainBtn,
       "Drain",
       () => api.procDrain(id),
-      (result) => {
-        // An honest degradation, not a failure: with no control plane the
-        // supervisor falls back to SIGTERM and says so.
-        if (result && result.viaSignal === true) {
-          toast("No control plane — drained with SIGTERM instead", "info");
-        }
-        reload();
-      },
+      (res) => reportProcWrite(res, "Drain", reload),
     );
   });
 

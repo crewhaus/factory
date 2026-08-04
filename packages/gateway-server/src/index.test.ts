@@ -848,6 +848,11 @@ describe("runs.subscribe — SSE stream (contract item 3)", () => {
       tenantOverrides: { "tenant-a": tenantA, "tenant-b": tenantB },
       resolveRunEvents,
       sseHeartbeatMs: 60_000, // no heartbeat interference unless a test wants it
+      // A graceful `Bun.serve` stop never resolves while an SSE response is
+      // open (measured on Bun 1.3.14, even after the client cancels its
+      // reader), so these fixtures skip straight to the forced close instead
+      // of paying the production grace on teardown.
+      closeGraceMs: 0,
       ...extra,
     });
   }
@@ -1353,5 +1358,75 @@ describe("publicGate (crewhaus.control.v1 on the public port)", () => {
       expect(res.status).toBe(200);
       expect(consulted).toBe(1);
     });
+  });
+});
+
+describe("listen().close() — the drain contract (M2 review)", () => {
+  /** A handler that takes `ms` to answer, standing in for a real turn. */
+  function slowServer(ms: number, closeGraceMs?: number): ReturnType<typeof createGatewayServer> {
+    const tenantA = buildTenant("tenant-a", { tenantsRoot: tmp });
+    return createGatewayServer({
+      jwtSecret: SECRET,
+      tenantsRoot: tmp,
+      handler: async ({ tenant }) => {
+        await Bun.sleep(ms);
+        return { runId: "run_slow", tenantId: tenant.id };
+      },
+      tenantOverrides: { "tenant-a": tenantA },
+      ...(closeGraceMs !== undefined ? { closeGraceMs } : {}),
+    });
+  }
+
+  function submit(base: string): Promise<Response> {
+    return fetch(base, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${signJwt({ tenant_id: "tenant-a" }, SECRET)}`,
+      },
+      body: JSON.stringify({
+        protocol: PROTOCOL_VERSION,
+        id: "1",
+        method: "runs.create",
+        params: { spec: "s", input: "hi" },
+      }),
+    });
+  }
+
+  test("close() waits for an in-flight turn instead of resolving instantly", async () => {
+    const HANDLER_MS = 400;
+    const server = slowServer(HANDLER_MS);
+    const { port, close } = await server.listen(0);
+    const t0 = Date.now();
+    let respondedAt = -1;
+    let body: unknown;
+    const inFlight = submit(`http://127.0.0.1:${port}`).then(async (res) => {
+      body = await res.json();
+      respondedAt = Date.now() - t0;
+    });
+    // Let the request reach the handler, then drain underneath it.
+    await Bun.sleep(50);
+    await close();
+    const closedAt = Date.now() - t0;
+    await inFlight;
+    // Without the await inside close(), `closedAt` is ~50ms — the drain would
+    // call exit(0) here and the tenant's turn would die mid-flight.
+    expect(closedAt).toBeGreaterThanOrEqual(HANDLER_MS * 0.7);
+    expect(respondedAt).toBeGreaterThan(0);
+    expect(closedAt).toBeGreaterThanOrEqual(respondedAt - 50);
+    expect(body).toMatchObject({ result: { runId: "run_slow" } });
+  });
+
+  test("close() is BOUNDED — a wedged connection cannot hold the drain open forever", async () => {
+    // graceMs 0 is the degenerate bound: force immediately. The real guarantee
+    // being pinned is that close() always returns, whatever is still attached.
+    const server = slowServer(400, 0);
+    const { port, close } = await server.listen(0);
+    const inFlight = submit(`http://127.0.0.1:${port}`).catch(() => undefined);
+    await Bun.sleep(50);
+    const t0 = Date.now();
+    await close();
+    expect(Date.now() - t0).toBeLessThan(200);
+    await inFlight;
   });
 });

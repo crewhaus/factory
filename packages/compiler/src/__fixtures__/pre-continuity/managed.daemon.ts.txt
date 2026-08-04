@@ -11,7 +11,7 @@ import {
   withIdempotency,
 } from "@crewhaus/idempotency-keys";
 import { openAuditLog } from "@crewhaus/audit-log";
-import { createControlPlane } from "@crewhaus/gateway-protocol/control";
+import { createControlPlane, runDrainSweep } from "@crewhaus/gateway-protocol/control";
 import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
 import { createRunContext, type RunContext } from "@crewhaus/run-context";
 import { createJanitor } from "@crewhaus/runtime-core";
@@ -374,8 +374,12 @@ console.error(`[managed] gateway listening on :${handle.port}`);
 __control.onDrain(async () => {
   console.error("[managed] draining — intake stopped");
   janitor.stop();
-  await janitor.runOnce();
   await handle.close();
+  await runDrainSweep(() => janitor.runOnce(), {
+    onOutcome: (__o) => {
+      if (__o !== "done") console.error(`[managed] drain sweep ${__o}`);
+    },
+  });
 });
 await __control.start();
 

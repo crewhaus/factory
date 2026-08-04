@@ -12,6 +12,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   RUN_ID_RE,
+  START_LOCK_MAX_AGE_MS,
+  acquireStartLock,
   appendRunLedger,
   clearRunfile,
   ensureRunDir,
@@ -22,9 +24,14 @@ import {
   readRetentionPolicy,
   readRunLedger,
   readRunfile,
+  readStartLock,
   recentRuns,
+  releaseStartLock,
   runDir,
   runLogPath,
+  runfileExists,
+  startLockIsStale,
+  startLockPath,
   writeRunfile,
 } from "./runfiles";
 import { DEFAULT_RETENTION, type DaemonRunfile, RUNFILE_NAME, RUNFILE_VERSION } from "./types";
@@ -116,6 +123,65 @@ describe("the runfile", () => {
     clearRunfile(dir);
     clearRunfile(dir);
     expect(readRunfile(dir)).toBeUndefined();
+  });
+
+  test("runfileExists answers without parsing", () => {
+    const dir = tempHarness();
+    expect(runfileExists(dir)).toBe(false);
+    writeRunfile(dir, sampleRunfile());
+    expect(runfileExists(dir)).toBe(true);
+    // Even a corrupt one exists — the caller decides what to do about it.
+    writeFileSync(join(runDir(dir), RUNFILE_NAME), "{not json");
+    expect(runfileExists(dir)).toBe(true);
+    expect(readRunfile(dir)).toBeUndefined();
+  });
+});
+
+describe("the start lock", () => {
+  const probe = (alive: readonly number[], startTimes: Record<number, number> = {}) => ({
+    isAlive: (pid: number) => alive.includes(pid),
+    startTimeMs: (pid: number) => startTimes[pid],
+  });
+
+  test("only one starter can hold it — O_EXCL, not last-writer-wins", () => {
+    const dir = tempHarness();
+    expect(acquireStartLock(dir, { pid: 100, pidStartTimeMs: 5, at: 1_000 })).toBe(true);
+    // The second manager loses. This is the window the runfile could never
+    // cover: it is not written until AFTER the spawn, so preflight used to
+    // run with the slot unclaimed and both managers spawned a daemon.
+    expect(acquireStartLock(dir, { pid: 200, pidStartTimeMs: 6, at: 1_001 })).toBe(false);
+    expect(readStartLock(dir)).toEqual({ pid: 100, pidStartTimeMs: 5, at: 1_000 });
+    releaseStartLock(dir);
+    expect(acquireStartLock(dir, { pid: 200, pidStartTimeMs: 6, at: 1_001 })).toBe(true);
+  });
+
+  test("releasing and reading are forgiving", () => {
+    const dir = tempHarness();
+    expect(readStartLock(dir)).toBeUndefined();
+    releaseStartLock(dir);
+    ensureRunDir(dir);
+    writeFileSync(startLockPath(dir), "{not json");
+    expect(readStartLock(dir)).toBeUndefined();
+  });
+
+  test("a lock is stale when its holder is gone, recycled, or simply too old", () => {
+    const held = { pid: 100, pidStartTimeMs: 5_000, at: 1_000 };
+    // Holder alive with the recorded start time: HELD.
+    expect(startLockIsStale(held, probe([100], { 100: 5_000 }), 2_000)).toBe(false);
+    // Holder gone: breakable — a manager killed mid-preflight must not wedge
+    // the harness shut.
+    expect(startLockIsStale(held, probe([], {}), 2_000)).toBe(true);
+    // Pid recycled by an unrelated process: breakable.
+    expect(startLockIsStale(held, probe([100], { 100: 900_000 }), 2_000)).toBe(true);
+    // Older than any start can take: breakable even with the pid alive.
+    expect(
+      startLockIsStale(held, probe([100], { 100: 5_000 }), 1_000 + START_LOCK_MAX_AGE_MS + 1),
+    ).toBe(true);
+    // No lock at all is trivially breakable.
+    expect(startLockIsStale(undefined, probe([100]), 2_000)).toBe(true);
+    // An unknown start time errs toward HELD: stealing the slot from a
+    // manager that is really there is the worse mistake.
+    expect(startLockIsStale(held, probe([100], {}), 2_000)).toBe(false);
   });
 });
 

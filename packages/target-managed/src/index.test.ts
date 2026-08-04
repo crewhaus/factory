@@ -1361,7 +1361,9 @@ describe("emitManaged — crewhaus.control.v1", () => {
 
   test("the runtime comes from the shared module and is bound after the gateway", () => {
     const d = daemon();
-    expect(d).toContain('import { createControlPlane } from "@crewhaus/gateway-protocol/control";');
+    expect(d).toContain(
+      'import { createControlPlane, runDrainSweep } from "@crewhaus/gateway-protocol/control";',
+    );
     expect(d).toContain('target: "managed",');
     expect(d).toContain("await __control.start();");
     expect(d.indexOf("const handle = await gateway.listen(PORT);")).toBeLessThan(
@@ -1404,12 +1406,49 @@ describe("emitManaged — crewhaus.control.v1", () => {
     expect(d.split("__control.counters.turns++;").length - 1).toBe(2);
   });
 
-  test("drain stops intake, cancels the timer, flushes the janitor and closes the gateway", () => {
+  test("drain stops intake, cancels the timer, closes the gateway, THEN sweeps", () => {
     const d = daemon({ ...ir, schedule: { kind: "interval", everyMs: 60_000 } });
     const step = d.slice(d.indexOf("__control.onDrain("), d.indexOf("await __control.start();"));
     expect(step).toContain("janitor.stop();");
     expect(step).toContain("clearInterval(__scheduleTimer);");
-    expect(step).toContain("await janitor.runOnce();");
     expect(step).toContain("await handle.close();");
+    // The janitor sweep is housekeeping the next boot repeats, so it runs LAST
+    // and under its own budget: inside the drain deadline it spent the
+    // operator's whole budget (dream/distill model calls) before the listeners
+    // had even closed, and the turn the drain existed to finish was SIGTERM'd
+    // anyway. A bare `await janitor.runOnce();` in this step is the regression.
+    expect(step).not.toContain("await janitor.runOnce();");
+    expect(step).toContain("await runDrainSweep(() => janitor.runOnce()");
+    expect(step.indexOf("await handle.close();")).toBeLessThan(step.indexOf("runDrainSweep"));
+  });
+
+  /**
+   * M2 review — the 202's `sessionId` was an ORPHAN on this shape. One tick
+   * fans out to a turn per tenant, each minting its own session, so the id the
+   * lane minted named nothing; worse, the marker it wrote was a `.jsonl` with
+   * no `.json` beside it, which `sweepExpired`, `crewhaus retention` and the
+   * janitor's TTL eviction all skip by design.
+   */
+  describe("the schedule lane does not own the tick's session", () => {
+    test("the lane declares ownsSession: false", () => {
+      const d = daemon({ ...ir, schedule: { kind: "interval", everyMs: 60_000 } });
+      const lane = d.slice(d.indexOf("const __scheduleLane"), d.indexOf("async function __fire"));
+      expect(lane).toContain("ownsSession: false,");
+    });
+
+    test("the fan-out still mints a session PER TENANT, never the tick's", () => {
+      const d = daemon({ ...ir, schedule: { kind: "interval", everyMs: 60_000 } });
+      const lane = d.slice(d.indexOf("const __scheduleLane"), d.indexOf("async function __fire"));
+      expect(lane).toContain('const __sessionId = `sess_${randomBytes(8).toString("hex")}`;');
+      expect(lane).not.toContain("__tick.sessionId");
+    });
+  });
+
+  test("a tenant reply is flattened before it reaches the pumped log line", () => {
+    const d = daemon({ ...ir, schedule: { kind: "interval", everyMs: 60_000 } });
+    expect(d).toContain("const __preview = sanitizeControlText(__reply, 200);");
+    expect(d).toContain(
+      'import { createControlPlane, runDrainSweep, sanitizeControlText } from "@crewhaus/gateway-protocol/control";',
+    );
   });
 });

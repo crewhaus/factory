@@ -29,6 +29,15 @@
  *     registered harness → `jobQueue.restore()`. Restore last, so a job that
  *     was running when the manager died is closed as `interrupted` against a
  *     process picture that is already accurate.
+ *   - **Boot adoption is not sufficient.** It only sees daemons that existed
+ *     at that instant. A daemon started afterwards from a terminal, by a
+ *     launchd unit, or for a harness registered later would never be
+ *     adopted, and an unadopted supervisor holds no pid — so the console
+ *     would report `stopped` over a live runfile and stop/drain would answer
+ *     "stopped" having signalled nothing. The server therefore calls
+ *     `supervisor.adoptIfRunfile()` on the request path (see `processFor` in
+ *     `server.ts`); it is a no-op unless a runfile exists and this
+ *     supervisor holds no pid.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -164,8 +173,15 @@ export type HarnessProcess = {
   /** Marks the next exit as an operator stop — the drain contract: the
    *  daemon answers 202 and exits 0 shortly after, and an unflagged exit 0
    *  from a long-running shape reads as "exited cleanly (unexpected)" and
-   *  gets restarted. */
+   *  gets restarted. Reaches the SUPERVISOR (`markOperatorStop`), not just
+   *  the display flag: a boolean this layer keeps to itself would leave the
+   *  restart policy free to spawn the daemon the operator just drained. */
   markDraining(): void;
+  /** Undo a `markDraining()` the drain never earned — a refused control call
+   *  or a no-op drain. Without this the flag can only be cleared by an exit
+   *  that is never coming, and the console's four process verbs stay
+   *  disabled ("this daemon is draining") for the manager's lifetime. */
+  clearDraining(): void;
   isDraining(): boolean;
   close(): void;
 };
@@ -320,6 +336,14 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
       controlPort: () => controlPort ?? knownControlPort(readRunfile(harnessDir)?.controlPort),
       markDraining: () => {
         draining = true;
+        // The latch the exit classifier reads. A drained daemon exits 0, and
+        // an unflagged exit 0 from a long-running shape is "exited cleanly
+        // (unexpected)" — restartable — so without this the control-plane
+        // drain is undone by our own restart policy ~500 ms later.
+        supervisor.markOperatorStop();
+      },
+      clearDraining: () => {
+        draining = false;
       },
       isDraining: () => draining,
       close: () => {

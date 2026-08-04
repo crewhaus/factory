@@ -2108,7 +2108,11 @@ try {
     isNew: true,
     message: __heartbeatInstructions,${hbScopeField.replace(/\n {8}/g, "\n    ")}
   });
-  const __preview = __out.length > 200 ? __out.slice(0, 200) + "…" : __out;
+  // The turn's own output is UNTRUSTED text (a channel message can steer it)
+  // and this line is captured by the manager's log pump, which parses prose
+  // for the control-port announcement. Flattened to one bounded line so a
+  // reply can never start a line — let alone forge that announcement.
+  const __preview = sanitizeControlText(__out, 200);
   process.stdout.write(\`[heartbeat] → \${__preview}\\n\`);
 } catch (__err) {
   // v0.3.0 Goal 6 — a classified terminal failure (billing/auth/…)
@@ -2168,7 +2172,9 @@ try {
     isNew: true,
     message: __scheduleInstructions,${schedScopeField}
   });
-  const __preview = __out.length > 200 ? __out.slice(0, 200) + "…" : __out;
+  // Untrusted turn output on a pumped, machine-parsed stream — flattened to
+  // one bounded line (see the heartbeat lane).
+  const __preview = sanitizeControlText(__out, 200);
   process.stdout.write(\`[schedule] → \${__preview}\\n\`);
 } catch (__err) {
   // A classified terminal failure renders its full report; anything else
@@ -2407,20 +2413,34 @@ ${
   });
   // Drain: intake is already shedding 503 + Retry-After (the public gate flips
   // the moment the request lands); these steps wait out the work already
-  // accepted, flush the janitor, and close every listener before exit 0.
+  // accepted and close every listener before exit 0.
+  //
+  // ORDER MATTERS, and the janitor sweep comes LAST for a reason. A supervisor
+  // holds the whole drain to a deadline, and the sweep is housekeeping the next
+  // boot repeats — not work anyone is waiting on. Running it BEFORE the
+  // listeners closed spent the operator's drain budget on dream/distill model
+  // calls while the turn the drain existed to finish still had not been given
+  // its chance, and the deadline then SIGTERM'd it anyway. Now everything the
+  // drain actually guarantees happens first, and the sweep runs afterwards
+  // under its own small budget (`CREWHAUS_DRAIN_SWEEP_MS`).
   const controlDrain = renderControlDrain({
     indent: "  ",
     body: `process.stdout.write("[daemon] draining — intake stopped\\n");
 __janitor.stop();${ir.heartbeat ? "\nclearInterval(__heartbeatTimer);" : ""}${
       ir.schedule ? "\n__schedule.cancel();" : ""
     }
-await __janitor.runOnce();
 // GRACEFUL stop (no closeActiveConnections): a channel turn runs INSIDE the
 // webhook request that carried it, so forcing connections shut here would
 // abort exactly the in-flight turns a drain exists to finish.
 await server.stop();${ir.gateway ? "\nawait __gatewayServer.stop();" : ""}${
       mcp.hasAny ? `\n${mcp.cleanupBlock}` : ""
-    }`,
+    }
+// Best-effort housekeeping, time-boxed and outside everything above.
+await runDrainSweep(() => __janitor.runOnce(), {
+  onOutcome: (__o) => {
+    if (__o !== "done") process.stdout.write(\`[daemon] drain sweep \${__o}\\n\`);
+  },
+});`,
   });
   const controlStart = renderControlStart({ indent: "  " });
   return `#!/usr/bin/env bun
@@ -2438,7 +2458,7 @@ import { createDedupStore } from "@crewhaus/durable-state";
 import { createJanitor } from "@crewhaus/runtime-core";
 ${distill.imports}import { openAuditLog } from "@crewhaus/audit-log";
 import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
-${approvalsImport}${renderControlImports({ pendingApprovals: approvalsOn })}import { join } from "node:path";
+${approvalsImport}${renderControlImports({ pendingApprovals: approvalsOn, drainSweep: true, logSafe: ir.heartbeat !== undefined || ir.schedule !== undefined })}import { join } from "node:path";
 
 ${startupEnvCheck}${observabilityEnvStamp}
 async function main(): Promise<void> {

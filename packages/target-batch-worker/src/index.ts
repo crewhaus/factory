@@ -576,7 +576,12 @@ function renderAgent(ir: IrBatchV0): string {
     : "";
   // crewhaus.control.v1 — the wake body is a control LANE, so `POST
   // /control/v1/wake {lane:"schedule"}` enqueues a job down the exact path the
-  // timer uses (and 409s while an enqueue is in flight).
+  // timer uses (and 409s while an enqueue is in flight). This shape is a
+  // PRODUCER: the wake enqueues a job and the consumer's handler mints its own
+  // session, so the lane never threads `__tick.sessionId` anywhere. It
+  // therefore declares `ownsSession: false` — the 202 answers with the enqueued
+  // `jobId` on the event stream rather than a session id that names nothing,
+  // and no orphan marker `.jsonl` is left where retention can never reach it.
   const scheduleBoot = ir.schedule
     ? `
   // Loop contract 0.4 (Batch F) — schedule: wake loop (cron|interval + jitter)
@@ -589,6 +594,7 @@ ${renderControlLane({
   cadence: describeSchedule(ir.schedule),
   nextDueAtExpr: "new Date(Date.now() + nextWakeDelayMs(__scheduleSpec, Date.now())).toISOString()",
   indent: "  ",
+  ownsSession: false,
   body: `__scheduleTick++;
 const jobId = await queue.enqueue(__scheduleInstructions);
 emit({

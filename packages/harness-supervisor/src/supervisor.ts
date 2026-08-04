@@ -11,8 +11,12 @@
  *   - **Preflight before every spawn.** A blocking finding refuses the
  *     spawn and returns the typed report; missing channel secrets can never
  *     be forced (the compiled daemon exits 2 on exactly that set).
- *   - **Singleton daemons.** The runfile is the lock: a verified-live
- *     runfile makes `start()` a no-op rather than a second process.
+ *   - **Singleton daemons.** Two claims, because one is not enough: a
+ *     `daemon.lock` (O_EXCL) is held from before preflight until the runfile
+ *     exists, and the runfile itself is the claim from then on. A
+ *     verified-live runfile makes `start()` a no-op rather than a second
+ *     process, and a start already in flight in another manager loses the
+ *     lock rather than racing it through preflight.
  *   - **Honest exits.** Our own SIGTERM reads as `stopped`; exit 0 from a
  *     long-running shape reads as "exited cleanly (unexpected)"; 20/21/30/
  *     31/33 are terminal and NEVER auto-restart; 36 parks; everything else
@@ -24,7 +28,9 @@
  *     and post-restart adoption are then the same mechanism, and the
  *     scrubber sits on it exactly once.
  *   - **Stop means stop.** SIGTERM, then SIGKILL after a 15 s grace, with
- *     `forced: true` recorded in the ledger.
+ *     `forced: true` recorded in the ledger — and a stop that holds no pid
+ *     while a LIVE runfile exists says so (`reason: "not-adopted"`) instead
+ *     of reporting a success it did not perform.
  *
  * Every side-effecting dependency is injected — process ops, clock, plan
  * builder, gate, scrubber, id minter — so the whole machine is exercised in
@@ -45,8 +51,9 @@ import {
   createRestartWindow,
 } from "./policy";
 import { type PortLedger, runfilePortClaims } from "./ports";
-import { type ProcessOps, argvFingerprint } from "./process-ops";
+import { type ProcessOps, type SpawnedProcess, argvFingerprint } from "./process-ops";
 import {
+  acquireStartLock,
   appendRunLedger,
   clearRunfile,
   ensureRunDir,
@@ -55,20 +62,26 @@ import {
   pruneRuns,
   readRetentionPolicy,
   readRunfile,
+  readStartLock,
   recentRuns,
+  releaseStartLock,
   runCursorPath,
   runEventsPath,
   runLogPath,
+  runfileExists,
+  startLockIsStale,
   writeRunfile,
 } from "./runfiles";
 import { type Scrubber, createEnvScrubber } from "./scrub";
 import { type SpawnPlan, isSupervisedClass, loadEnvChain, runClassFor } from "./spawn-contracts";
-import { type LogPump, createLogPump, readLogTail } from "./trace-pump";
+import { type LogPump, createLogPump, parseAnnouncedControlPort, readLogTail } from "./trace-pump";
 import {
   type Clock,
   type DaemonRunfile,
   RUNFILE_VERSION,
   type RetentionPolicy,
+  type RunKind,
+  type StartLock,
   type SupervisionState,
   systemClock,
 } from "./types";
@@ -104,6 +117,10 @@ export type SupervisorSnapshot = {
   /** True when the run was adopted rather than spawned by this manager. */
   readonly adopted?: boolean;
   readonly ports?: SpawnPlan["ports"];
+  /** The control.v1 port this run is really serving on, once it is known:
+   *  announced on stdout (the plan asks for a kernel-assigned 0) or read
+   *  from the runfile at adoption. */
+  readonly controlPort?: number;
 };
 
 export type SupervisorEvent =
@@ -124,12 +141,29 @@ export type StartResult =
   | { readonly ok: true; readonly runId: string; readonly pid: number | undefined }
   | { readonly ok: false; readonly reason: "already-running"; readonly runfile?: DaemonRunfile }
   | { readonly ok: false; readonly reason: "preflight-blocked"; readonly gate: GateDecision }
-  | { readonly ok: false; readonly reason: "plan-failed"; readonly error: Error };
+  | {
+      readonly ok: false;
+      readonly reason: "plan-failed";
+      readonly error: Error;
+      /** Which half of `start()` failed. `plan` is a spec/bundle problem the
+       *  operator can fix; `spawn` is the machine refusing to launch
+       *  (EMFILE, ENOSPC, EACCES on the run dir) — same shape, different
+       *  remedy, and the caller can say so. */
+      readonly stage?: "plan" | "spawn";
+    };
 
 export type StopResult = {
   readonly stopped: boolean;
   /** True when the grace period expired and SIGKILL was used. */
   readonly forced: boolean;
+  /** Why nothing was stopped. `not-adopted` means a LIVE daemon holds the
+   *  runfile but this supervisor never adopted it, so it has no pid to
+   *  signal — the caller must `adoptIfRunfile()` first. Reporting
+   *  `stopped: true` here is what let a Restart delete a live daemon's lock
+   *  and spawn a second one beside it. */
+  readonly reason?: "not-adopted";
+  /** The live runfile, on `not-adopted`. */
+  readonly runfile?: DaemonRunfile;
 };
 
 export type SupervisorOptions = {
@@ -160,6 +194,9 @@ export type SupervisorOptions = {
   readonly stopGraceMs?: number;
   /** Restart a long-running shape that exited 0 unasked. Default true. */
   readonly restartUnexpectedCleanExit?: boolean;
+  /** The MANAGER process id recorded in the start lock. Defaults to
+   *  `process.pid`; injected in tests so two "managers" can race. */
+  readonly ownerPid?: number;
 };
 
 export type HarnessSupervisor = {
@@ -172,6 +209,22 @@ export type HarnessSupervisor = {
   drain(request: () => Promise<void>, timeoutMs?: number): Promise<StopResult>;
   /** Re-attach to a runfile written by a previous manager. */
   adopt(): Promise<"adopted" | "lost" | "none">;
+  /**
+   * Adopt ONLY when there is a runfile and this supervisor holds no pid —
+   * otherwise a cheap `existsSync` and out. Safe (and intended) at the top
+   * of every request: adoption at boot alone is not enough, because the
+   * other head can start a daemon at any moment afterwards and a supervisor
+   * that never noticed will happily spawn a second one.
+   */
+  adoptIfRunfile(): Promise<"adopted" | "lost" | "none">;
+  /**
+   * Record that the NEXT exit was asked for by an operator — the exit then
+   * classifies as a clean stop and no restart is scheduled. For the drain
+   * path, where the daemon exits on its own after a control.v1 call and
+   * would otherwise read as a crash-and-restart. Idempotent; consumed by
+   * the next exit or cleared by a successful start.
+   */
+  markOperatorStop(): void;
   /** Drain the log once, now (tests; also the manual Refresh action). */
   pumpNow(): void;
   subscribe(listener: (event: SupervisorEvent) => void): () => void;
@@ -208,6 +261,13 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
   let forensics: RunForensics | undefined;
   let adopted = false;
   let currentPlan: SpawnPlan | undefined;
+  /** The run kind of the CURRENT run, however it started. `currentPlan` is
+   *  undefined for an adopted run — gating the runfile cleanup on it meant a
+   *  deliberately stopped daemon left its runfile behind and read back as a
+   *  crash on the next boot. */
+  let currentKind: RunKind | undefined;
+  let currentPorts: SpawnPlan["ports"] | undefined;
+  let controlPort: number | undefined;
   let pump: LogPump | undefined;
   let pumpTimer: unknown;
   let restartTimer: unknown;
@@ -222,6 +282,13 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
   let scrub: Scrubber = options.scrub ?? createEnvScrubber(loadEnvChain(options.harnessDir).vars);
   const listeners = new Set<(event: SupervisorEvent) => void>();
   const idleWaiters: Array<() => void> = [];
+  const ownerPid = options.ownerPid ?? process.pid;
+
+  /** A port of 0 means "kernel, pick one" — not-known-yet, never reachable. */
+  const knownPort = (port: number | undefined): number | undefined =>
+    port !== undefined && Number.isInteger(port) && port > 0 ? port : undefined;
+
+  const toError = (err: unknown): Error => (err instanceof Error ? err : new Error(String(err)));
 
   const snapshot = (): SupervisorSnapshot => ({
     state,
@@ -236,7 +303,8 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     ...(lastExit !== undefined ? { lastExit } : {}),
     ...(forensics !== undefined ? { forensics } : {}),
     ...(adopted ? { adopted: true } : {}),
-    ...(currentPlan !== undefined ? { ports: currentPlan.ports } : {}),
+    ...(currentPorts !== undefined ? { ports: currentPorts } : {}),
+    ...(controlPort !== undefined ? { controlPort } : {}),
   });
 
   const emit = (event: SupervisorEvent): void => {
@@ -260,10 +328,37 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     }
   };
 
+  /**
+   * Learn the control.v1 port from the daemon's own boot announcement and
+   * write it into the runfile.
+   *
+   * The plan asks for `CREWHAUS_CONTROL_PORT=0`, so the port is chosen by
+   * the kernel and announced on stdout — this line is the ONLY place it
+   * exists. Capturing it here rather than in the console is what makes
+   * `crewhaus daemon wake/drain` work against a daemon the shell started:
+   * whoever pumps the log records the port, and every other head reads it
+   * back out of the runfile.
+   */
+  const noteControlAnnouncement = (prose: string): void => {
+    if (prose === "") return;
+    const port = parseAnnouncedControlPort(prose);
+    if (port === undefined || port === controlPort) return;
+    controlPort = port;
+    const runfile = readRunfile(options.harnessDir);
+    if (runfile === undefined || runfile.controlPort === port) return;
+    try {
+      writeRunfile(options.harnessDir, { ...runfile, controlPort: port });
+    } catch {
+      // The port is still in memory, so THIS head can still reach control.v1;
+      // a runfile we cannot write is not a reason to fail the run.
+    }
+  };
+
   const drainPump = (): void => {
     if (pump === undefined || runId === undefined) return;
     const result = pump.pumpOnce();
     if (result.prose === "" && result.events.length === 0) return;
+    noteControlAnnouncement(result.prose);
     for (const event of result.events) {
       const kind = event["kind"];
       const sid = event["sessionId"];
@@ -296,6 +391,24 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       clock.clearTimeout(pumpTimer);
       pumpTimer = undefined;
     }
+  };
+
+  /**
+   * Remove the runfile IF it is still the one this run wrote.
+   *
+   * Ownership matters: a daemon that loses a start race and dies seconds
+   * later must not delete the WINNER's runfile — that would leave a live
+   * daemon nothing claims, invisible to `daemon status` and duplicated by
+   * the next start.
+   */
+  const clearOwnRunfile = (endedRunId: string | undefined): void => {
+    const existing = readRunfile(options.harnessDir);
+    if (existing === undefined) return;
+    const ours =
+      (endedRunId !== undefined && existing.runId === endedRunId) ||
+      (pid !== undefined && existing.pid === pid);
+    if (!ours) return;
+    clearRunfile(options.harnessDir);
   };
 
   const finishRun = (classification: ExitClassification, forced: boolean): void => {
@@ -336,14 +449,17 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       });
       emit({ type: "exit", runId: endedRunId, classification });
     }
-    if (currentPlan !== undefined && currentPlan.kind === "daemon") {
-      clearRunfile(options.harnessDir);
-    }
+    // Cleanup is gated on the run KIND, not on `currentPlan`: an adopted run
+    // has no plan of ours, and skipping the cleanup for it left a dead
+    // runfile behind after every deliberate stop — which the next boot read
+    // back as a crash and stamped `interrupted` over a clean ledger row.
+    if (currentKind === "daemon") clearOwnRunfile(endedRunId);
     if (options.ports !== undefined && endedRunId !== undefined) {
       options.ports.releaseRun(endedRunId);
     }
     pid = undefined;
     pump = undefined;
+    controlPort = undefined;
     // Retention runs on rotation, protecting the run that just ended so its
     // forensics survive long enough to be read.
     try {
@@ -377,7 +493,21 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     restartTimer = clock.setTimeout(() => {
       restartTimer = undefined;
       nextRestartAtMs = undefined;
-      void start().finally(settleIfIdle);
+      // `start()` returns its failures rather than throwing — but this call
+      // runs on a TIMER, outside every caller's try/catch, so anything that
+      // did escape would land on `unhandledRejection` and take the whole
+      // manager down over one harness's bad day.
+      void start()
+        .catch((err: unknown) => {
+          lastExit = {
+            disposition: "crash",
+            title: `automatic restart failed: ${toError(err).message}`,
+            restartable: false,
+            unexpectedClean: false,
+          };
+          setState("crashed");
+        })
+        .finally(settleIfIdle);
     }, delay);
   };
 
@@ -446,9 +576,98 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     schedulePump();
   };
 
+  /**
+   * Take the cross-process claim on the daemon slot.
+   *
+   * The runfile is written after the spawn, so it cannot be the lock for the
+   * window that matters — the one that spans preflight. `O_EXCL` create is
+   * atomic, so exactly one starter wins; an abandoned lock (its manager was
+   * killed, or its pid was recycled, or it is simply older than any start
+   * can take) is broken and retaken once.
+   */
+  const claimStartSlot = (): boolean => {
+    const observedStart = options.ops.startTimeMs(ownerPid);
+    const lock: StartLock = {
+      pid: ownerPid,
+      ...(observedStart !== undefined ? { pidStartTimeMs: observedStart } : {}),
+      at: clock.now(),
+    };
+    if (acquireStartLock(options.harnessDir, lock)) return true;
+    if (!startLockIsStale(readStartLock(options.harnessDir), options.ops, clock.now())) {
+      return false;
+    }
+    releaseStartLock(options.harnessDir);
+    return acquireStartLock(options.harnessDir, lock);
+  };
+
+  /**
+   * Unwind a start that threw AFTER `setState("starting")`.
+   *
+   * Everything between the spawn and `child.exited.then(onExit)` is a real
+   * failure surface on a long-lived manager — EMFILE on the log fd, ENOSPC
+   * on the ledger, EACCES on the run dir. Left unhandled it wedged the
+   * supervisor in `starting` (which the entry guard reads as
+   * "already-running" forever) and, worse, left a SPAWNED child with no exit
+   * handler: its exit was never observed and `stop()` awaited an event that
+   * could never fire. So: kill the orphan, drop the claim, close the ledger
+   * row, and hand the caller a typed failure.
+   */
+  const abandonStart = (
+    id: string,
+    child: SpawnedProcess | undefined,
+    ledgerOpened: boolean,
+    err: unknown,
+  ): StartResult => {
+    const error = toError(err);
+    if (child?.pid !== undefined) {
+      try {
+        options.ops.forceKill(child.pid);
+      } catch {
+        // Already gone, or not ours to signal — nothing better to do.
+      }
+      // Nobody is awaiting this child; make sure its promise cannot reject
+      // into the void.
+      void child.exited.then(
+        () => {},
+        () => {},
+      );
+    }
+    stopPump();
+    pump = undefined;
+    pid = undefined;
+    // We still hold the start lock here, so any runfile present is one we
+    // just wrote (or a stale one we already verified dead) — never a live
+    // daemon's claim.
+    if (currentKind === "daemon") clearRunfile(options.harnessDir);
+    if (options.ports !== undefined) options.ports.releaseRun(id);
+    if (ledgerOpened) {
+      patchRunLedger(options.harnessDir, {
+        runId: id,
+        endedAt: new Date(clock.now()).toISOString(),
+        failureClass: "interrupted",
+      });
+    }
+    runId = undefined;
+    startedAt = undefined;
+    controlPort = undefined;
+    lastExit = {
+      disposition: "crash",
+      title: `could not launch: ${error.message}`,
+      restartable: false,
+      unexpectedClean: false,
+    };
+    setState("crashed");
+    return { ok: false, reason: "plan-failed", stage: "spawn", error };
+  };
+
   const start = async (gateOptions: GateOptions = {}): Promise<StartResult> => {
     if (closed) {
-      return { ok: false, reason: "plan-failed", error: new Error("supervisor is closed") };
+      return {
+        ok: false,
+        reason: "plan-failed",
+        stage: "plan",
+        error: new Error("supervisor is closed"),
+      };
     }
     if (state === "running" || state === "starting" || starting) {
       return { ok: false, reason: "already-running" };
@@ -460,31 +679,45 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     // armed would spawn a second child moments later.
     cancelPendingRestart();
     starting = true;
+    let heldLock = false;
     try {
       let plan: SpawnPlan;
       try {
         plan = await options.plan();
       } catch (err) {
-        return {
-          ok: false,
-          reason: "plan-failed",
-          error: err instanceof Error ? err : new Error(String(err)),
-        };
+        return { ok: false, reason: "plan-failed", stage: "plan", error: toError(err) };
       }
-      currentPlan = plan;
 
-      // Singleton guard: a verified-live runfile means the daemon is
-      // already up, whoever started it. The argv is deliberately NOT part of
-      // this check — a daemon started from an older spec is still a running
-      // daemon for this harness, and starting a second one is the failure
-      // mode the runfile exists to prevent.
+      // Claim the slot BEFORE the liveness check and before preflight. The
+      // check-then-spawn ordering made the runfile a check rather than a
+      // lock: two managers starting the same harness within the same second
+      // both read "no runfile", both passed preflight, and both spawned —
+      // and the second runfile overwrote the first, orphaning a live channel
+      // daemon that nothing could stop and that answered every inbound
+      // message twice.
       if (plan.kind === "daemon") {
+        if (!claimStartSlot()) {
+          return { ok: false, reason: "already-running" };
+        }
+        heldLock = true;
+
+        // Singleton guard: a verified-live runfile means the daemon is
+        // already up, whoever started it. The argv is deliberately NOT part
+        // of this check — a daemon started from an older spec is still a
+        // running daemon for this harness, and starting a second one is the
+        // failure mode the runfile exists to prevent.
         const existing = readRunfile(options.harnessDir);
         const verdict = verifyRunfile(existing, options.ops);
         if (verdict.live && existing !== undefined) {
           return { ok: false, reason: "already-running", runfile: existing };
         }
       }
+
+      // Only now is this plan the current one: a refused start must not arm
+      // the cleanup paths with a run it never made.
+      currentPlan = plan;
+      currentKind = plan.kind;
+      currentPorts = plan.ports;
 
       if (options.gate !== undefined) {
         setState("preflight");
@@ -495,78 +728,106 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         }
       }
 
-      setState("starting");
+      // Mint BEFORE announcing `starting`: the entry guard treats that state
+      // as "already-running", so a state we enter must always be a state we
+      // can leave.
       const id = mintRunId();
+      setState("starting");
       runId = id;
       sessionId = undefined;
       lastRunFailed = undefined;
       adopted = false;
-      ensureRunDir(options.harnessDir);
-      const logFile = runLogPath(options.harnessDir, id);
-      // Touch the log so the pump has a file to stat from the first tick,
-      // and so an fd-redirected child appends rather than creates.
-      appendFileSync(logFile, "", { mode: 0o600 });
+      controlPort = knownPort(plan.ports.controlPort);
+      // Everything from here to the exit handler can fail on a machine that
+      // is out of fds, out of disk, or has had its run dir chmodded — and a
+      // throw here used to escape as an unhandled rejection.
+      let child: SpawnedProcess | undefined;
+      let ledgerOpened = false;
+      try {
+        ensureRunDir(options.harnessDir);
+        const logFile = runLogPath(options.harnessDir, id);
+        // Touch the log so the pump has a file to stat from the first tick,
+        // and so an fd-redirected child appends rather than creates.
+        appendFileSync(logFile, "", { mode: 0o600 });
 
-      const child = options.ops.spawn({
-        argv: plan.argv,
-        cwd: plan.cwd,
-        env: plan.env,
-        stdio: plan.stdio === "file" ? { mode: "file", path: logFile } : { mode: "pipe" },
-        detached: plan.detached,
-      });
-      pid = child.pid;
-      startedAt = new Date(clock.now()).toISOString();
-      appendRunLedger(options.harnessDir, {
-        runId: id,
-        kind: plan.kind,
-        argv: [...plan.argv],
-        startedAt,
-        logFile: `logs/${id}.log`,
-      });
-
-      if (plan.kind === "daemon") {
-        const observedStart = pid !== undefined ? options.ops.startTimeMs(pid) : undefined;
-        writeRunfile(options.harnessDir, {
-          v: RUNFILE_VERSION,
-          pid: pid ?? 0,
-          pidStartTimeMs: observedStart ?? clock.now(),
-          argvFingerprint: argvFingerprint(plan.cwd, plan.argv),
-          ...(plan.ports.port !== undefined ? { port: plan.ports.port } : {}),
-          ...(plan.ports.gatewayPort !== undefined ? { gatewayPort: plan.ports.gatewayPort } : {}),
-          ...(plan.ports.controlPort !== undefined ? { controlPort: plan.ports.controlPort } : {}),
-          ...(plan.controlTokenPath !== undefined
-            ? { controlTokenPath: plan.controlTokenPath }
-            : {}),
-          entry: plan.entry,
-          bundleDir: plan.bundleDir,
-          runId: id,
-          startedAt,
-          managerVersion,
+        child = options.ops.spawn({
+          argv: plan.argv,
+          cwd: plan.cwd,
+          env: plan.env,
+          stdio: plan.stdio === "file" ? { mode: "file", path: logFile } : { mode: "pipe" },
+          detached: plan.detached,
         });
-      }
-      if (options.ports !== undefined) {
-        for (const claim of runfilePortClaims(plan.cwd, {
+        pid = child.pid;
+        startedAt = new Date(clock.now()).toISOString();
+        appendRunLedger(options.harnessDir, {
           runId: id,
-          ...(plan.ports.port !== undefined ? { port: plan.ports.port } : {}),
-          ...(plan.ports.gatewayPort !== undefined ? { gatewayPort: plan.ports.gatewayPort } : {}),
-          ...(plan.ports.controlPort !== undefined ? { controlPort: plan.ports.controlPort } : {}),
-        })) {
-          options.ports.claim(claim);
-        }
-      }
+          kind: plan.kind,
+          argv: [...plan.argv],
+          startedAt,
+          logFile: `logs/${id}.log`,
+        });
+        ledgerOpened = true;
 
-      startPump(id, plan.env);
-      if (plan.detached) child.unref?.();
-      // Attached runs tee their pipes into the SAME log file the pump reads,
-      // so both modes share one extraction and one scrubbing path.
-      if (plan.stdio === "pipe") {
-        void teePipe(child.stdout, logFile);
-        void teePipe(child.stderr, logFile);
+        if (plan.kind === "daemon") {
+          const observedStart = pid !== undefined ? options.ops.startTimeMs(pid) : undefined;
+          writeRunfile(options.harnessDir, {
+            v: RUNFILE_VERSION,
+            pid: pid ?? 0,
+            pidStartTimeMs: observedStart ?? clock.now(),
+            argvFingerprint: argvFingerprint(plan.cwd, plan.argv),
+            ...(plan.ports.port !== undefined ? { port: plan.ports.port } : {}),
+            ...(plan.ports.gatewayPort !== undefined
+              ? { gatewayPort: plan.ports.gatewayPort }
+              : {}),
+            ...(plan.ports.controlPort !== undefined
+              ? { controlPort: plan.ports.controlPort }
+              : {}),
+            ...(plan.controlTokenPath !== undefined
+              ? { controlTokenPath: plan.controlTokenPath }
+              : {}),
+            entry: plan.entry,
+            bundleDir: plan.bundleDir,
+            runId: id,
+            startedAt,
+            managerVersion,
+          });
+        }
+        if (options.ports !== undefined) {
+          for (const claim of runfilePortClaims(plan.cwd, {
+            runId: id,
+            ...(plan.ports.port !== undefined ? { port: plan.ports.port } : {}),
+            ...(plan.ports.gatewayPort !== undefined
+              ? { gatewayPort: plan.ports.gatewayPort }
+              : {}),
+            ...(plan.ports.controlPort !== undefined
+              ? { controlPort: plan.ports.controlPort }
+              : {}),
+          })) {
+            options.ports.claim(claim);
+          }
+        }
+
+        startPump(id, plan.env);
+        if (plan.detached) child.unref?.();
+        // Attached runs tee their pipes into the SAME log file the pump
+        // reads, so both modes share one extraction and one scrubbing path.
+        if (plan.stdio === "pipe") {
+          void teePipe(child.stdout, logFile);
+          void teePipe(child.stderr, logFile);
+        }
+        void child.exited.then(({ code, signal }) => onExit(code, signal));
+        // A run that started supersedes any armed operator-stop: the mark is
+        // for the exit of the run it was made against, not the next one.
+        operatorStop = false;
+        setState("running");
+        return { ok: true, runId: id, pid };
+      } catch (err) {
+        return abandonStart(id, child, ledgerOpened, err);
       }
-      void child.exited.then(({ code, signal }) => onExit(code, signal));
-      setState("running");
-      return { ok: true, runId: id, pid };
     } finally {
+      // The claim is released on EVERY path out — refusal, preflight block,
+      // spawn failure, success (the runfile is the claim from here on).
+      if (heldLock) releaseStartLock(options.harnessDir);
       starting = false;
       settleIfIdle();
     }
@@ -577,9 +838,22 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     // the backoff timer would resurrect the daemon after the stop.
     cancelPendingRestart();
     if (pid === undefined) {
-      // Nothing of ours is running; clear a stale runfile so the next start
-      // is not refused by a ghost.
-      if (currentPlan?.kind === "daemon") clearRunfile(options.harnessDir);
+      // We hold no pid — but that does NOT mean nothing is running. The
+      // other head (`crewhaus daemon start`) may have started the daemon
+      // after this manager booted, and a supervisor that never adopted it
+      // has no pid for it. Deleting that live daemon's runfile and reporting
+      // `stopped: true` is exactly how a Restart click ended up with two
+      // channel daemons on the same credentials: the lock was gone, so the
+      // start that followed sailed through the singleton guard.
+      const existing = readRunfile(options.harnessDir);
+      if (existing !== undefined) {
+        if (verifyRunfile(existing, options.ops).live) {
+          return { stopped: false, forced: false, reason: "not-adopted", runfile: existing };
+        }
+        // Verified dead: clearing it is what keeps a ghost from refusing the
+        // next start.
+        clearRunfile(options.harnessDir);
+      }
       setState("stopped");
       return { stopped: true, forced: false };
     }
@@ -620,16 +894,107 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     };
   };
 
+  const adopt = async (): Promise<"adopted" | "lost" | "none"> => {
+    const result = adoptRunning(options.harnessDir, {
+      ops: options.ops,
+      scrub,
+      now: clock.now,
+    });
+    if (result.status === "none") {
+      // No live runfile — but the harness's own ledger outlives this
+      // process, and it is the only record of how the last run ended. A
+      // manager restart must not blank the fleet's failure board, so fold
+      // the newest CLOSED ledger entry into `lastExit`, flagged as
+      // ledger-derived so callers never imply we watched it happen.
+      if (lastExit === undefined) {
+        const [last] = recentRuns(options.harnessDir, 1);
+        if (last !== undefined && last.endedAt !== undefined && last.exitCode !== undefined) {
+          lastExit = {
+            ...classifyExit({
+              exitCode: last.exitCode,
+              // We were not running when it ended, so we cannot claim the
+              // stop was ours; `longRunning` follows the run's kind.
+              operatorStop: false,
+              longRunning: last.kind === "daemon",
+            }),
+            fromLedger: true,
+            endedAt: last.endedAt,
+          };
+        }
+      }
+      setState("stopped");
+      return "none";
+    }
+    if (result.status === "lost") {
+      forensics = { tail: result.tail };
+      lastExit = {
+        disposition: "crash",
+        title: `daemon is gone (${result.reason}) — the manager was not running when it exited`,
+        restartable: false,
+        unexpectedClean: false,
+      };
+      setState("crashed");
+      return "lost";
+    }
+    runId = result.runfile.runId;
+    pid = result.runfile.pid;
+    startedAt = result.runfile.startedAt;
+    adopted = true;
+    pump = result.pump;
+    // A runfile only ever describes a daemon-kind run, so this IS the run
+    // kind — and recording it is what makes a clean stop of an adopted run
+    // clear the runfile instead of leaving a corpse for the next boot to
+    // misread as a crash.
+    currentKind = "daemon";
+    currentPorts = {
+      ...(result.runfile.port !== undefined ? { port: result.runfile.port } : {}),
+      ...(result.runfile.gatewayPort !== undefined
+        ? { gatewayPort: result.runfile.gatewayPort }
+        : {}),
+      ...(result.runfile.controlPort !== undefined
+        ? { controlPort: result.runfile.controlPort }
+        : {}),
+    };
+    controlPort = knownPort(result.runfile.controlPort);
+    if (options.ports !== undefined) {
+      options.ports.adopt(runfilePortClaims(options.harnessDir, result.runfile));
+    }
+    schedulePump();
+    setState("running");
+    return "adopted";
+  };
+
+  const adoptIfRunfile = async (): Promise<"adopted" | "lost" | "none"> => {
+    // Cheap enough to sit at the top of every request: one `existsSync` in
+    // the common case.
+    if (closed || starting || pid !== undefined) return "none";
+    if (!runfileExists(options.harnessDir)) return "none";
+    return adopt();
+  };
+
   return {
     snapshot,
     start,
     stop,
+    markOperatorStop: () => {
+      operatorStop = true;
+    },
     restart: async (gateOptions) => {
+      // Adopt first: the daemon may have been started by the other head, and
+      // "stop" without a pid is a no-op that used to delete a LIVE daemon's
+      // runfile and spawn a duplicate beside it.
+      await adoptIfRunfile();
       await stop();
       return start(gateOptions);
     },
     drain: async (request, timeoutMs) => {
-      if (pid === undefined) return { stopped: true, forced: false };
+      if (pid === undefined) {
+        const existing = readRunfile(options.harnessDir);
+        if (existing !== undefined && verifyRunfile(existing, options.ops).live) {
+          return { stopped: false, forced: false, reason: "not-adopted", runfile: existing };
+        }
+        return { stopped: true, forced: false };
+      }
       // Subscribe BEFORE the control call: a daemon that drains promptly can
       // exit inside `request()`, and a subscription taken afterwards would
       // wait forever for an event that already fired.
@@ -656,60 +1021,8 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       }
       return { stopped: true, forced: false };
     },
-    adopt: async () => {
-      const result = adoptRunning(options.harnessDir, {
-        ops: options.ops,
-        scrub,
-        now: clock.now,
-      });
-      if (result.status === "none") {
-        // No live runfile — but the harness's own ledger outlives this
-        // process, and it is the only record of how the last run ended. A
-        // manager restart must not blank the fleet's failure board, so fold
-        // the newest CLOSED ledger entry into `lastExit`, flagged as
-        // ledger-derived so callers never imply we watched it happen.
-        if (lastExit === undefined) {
-          const [last] = recentRuns(options.harnessDir, 1);
-          if (last !== undefined && last.endedAt !== undefined && last.exitCode !== undefined) {
-            lastExit = {
-              ...classifyExit({
-                exitCode: last.exitCode,
-                // We were not running when it ended, so we cannot claim the
-                // stop was ours; `longRunning` follows the run's kind.
-                operatorStop: false,
-                longRunning: last.kind === "daemon",
-              }),
-              fromLedger: true,
-              endedAt: last.endedAt,
-            };
-          }
-        }
-        setState("stopped");
-        return "none";
-      }
-      if (result.status === "lost") {
-        forensics = { tail: result.tail };
-        lastExit = {
-          disposition: "crash",
-          title: `daemon is gone (${result.reason}) — the manager was not running when it exited`,
-          restartable: false,
-          unexpectedClean: false,
-        };
-        setState("crashed");
-        return "lost";
-      }
-      runId = result.runfile.runId;
-      pid = result.runfile.pid;
-      startedAt = result.runfile.startedAt;
-      adopted = true;
-      pump = result.pump;
-      if (options.ports !== undefined) {
-        options.ports.adopt(runfilePortClaims(options.harnessDir, result.runfile));
-      }
-      schedulePump();
-      setState("running");
-      return "adopted";
-    },
+    adopt,
+    adoptIfRunfile,
     pumpNow: drainPump,
     subscribe,
     idle: () =>

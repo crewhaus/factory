@@ -529,12 +529,28 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
 /** The CLI twin of a plan — the command an operator could paste. Never
  *  includes the env (which carries the control token). */
 export function cliTwin(plan: SpawnPlan): string {
-  const argv = plan.argv.map(quoteIfNeeded);
-  return `cd ${quoteIfNeeded(plan.cwd)} && ${argv.join(" ")}`;
+  const argv = plan.argv.map(shellQuote);
+  return `cd ${shellQuote(plan.cwd)} && ${argv.join(" ")}`;
 }
 
-function quoteIfNeeded(value: string): string {
-  return value.includes(" ") ? JSON.stringify(value) : value;
+/**
+ * POSIX single-quoting — the only quoting that is actually safe.
+ *
+ * Inside single quotes the shell expands NOTHING, so `$(…)`, backticks,
+ * `${…}`, `;`, `|`, `&`, `(`, `)` and whitespace are all inert. The one
+ * character that cannot appear is `'` itself, which is closed, escaped, and
+ * reopened (`'\''`) — the standard idiom.
+ *
+ * This matters because the twin is presented as "the exact command an
+ * operator could paste": a harness directory is an attacker-influenceable
+ * name on a shared mount or in a cloned repo, and a conditional quote (only
+ * when the value contains a space) or a JSON double-quote leaves every
+ * expansion live. Quoting is therefore UNCONDITIONAL — a twin that is
+ * uglier than it needs to be is strictly better than one that runs
+ * something else.
+ */
+export function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 /** True when `path` is inside `root` (lexical check on already-resolved

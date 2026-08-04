@@ -25,14 +25,17 @@
  */
 import {
   appendFileSync,
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { join } from "node:path";
 import {
@@ -47,6 +50,8 @@ import {
   type RetentionPolicy,
   type RunLedgerEntry,
   type RunLedgerPatch,
+  START_LOCK_NAME,
+  type StartLock,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -81,6 +86,21 @@ export function runCursorPath(harnessDir: string, runId: string): string {
 /** `<harness>/.crewhaus/run/control-token`. */
 export function controlTokenPath(harnessDir: string): string {
   return join(runDir(harnessDir), CONTROL_TOKEN_NAME);
+}
+
+/** `<harness>/.crewhaus/run/daemon.json`. */
+export function runfilePath(harnessDir: string): string {
+  return join(runDir(harnessDir), RUNFILE_NAME);
+}
+
+/** True when a runfile exists at all — the cheap check before the parse. */
+export function runfileExists(harnessDir: string): boolean {
+  return existsSync(runfilePath(harnessDir));
+}
+
+/** `<harness>/.crewhaus/run/daemon.lock`. */
+export function startLockPath(harnessDir: string): string {
+  return join(runDir(harnessDir), START_LOCK_NAME);
 }
 
 /** Create the run tree (0700 dirs). Idempotent. */
@@ -182,6 +202,109 @@ export function clearRunfile(harnessDir: string): void {
   } catch {
     // Never existed, or a sibling already cleaned it up.
   }
+}
+
+// ---------------------------------------------------------------------------
+// The start lock
+// ---------------------------------------------------------------------------
+
+/**
+ * `daemon.lock` — the claim on the daemon SLOT while a start is in flight.
+ *
+ * The runfile cannot be that claim: it records a pid, and there is no pid
+ * until the spawn. Everything between the liveness check and the spawn —
+ * the whole preflight run, which parses the spec and probes live ports — sat
+ * inside that gap, so two managers starting the same harness within the same
+ * second both read "no runfile", both passed preflight, and both spawned.
+ *
+ * `O_EXCL` create is atomic across processes, so exactly one starter wins.
+ * The holder's pid + OS start time are recorded so a lock left behind by a
+ * killed manager is BREAKABLE rather than a permanent wedge (see
+ * {@link startLockIsStale}), and the winner removes it on every path out of
+ * `start()`.
+ */
+export function acquireStartLock(harnessDir: string, lock: StartLock): boolean {
+  ensureRunDir(harnessDir);
+  let fd: number;
+  try {
+    // wx: create-or-fail. This is the whole mutual exclusion.
+    fd = openSync(startLockPath(harnessDir), "wx", 0o600);
+  } catch {
+    return false;
+  }
+  try {
+    writeSync(fd, `${JSON.stringify(lock)}\n`);
+  } catch {
+    // The lock is held either way; its contents are only used for staleness.
+  } finally {
+    closeSync(fd);
+  }
+  return true;
+}
+
+/** Read `daemon.lock`. Absent/corrupt reads as "no lock". */
+export function readStartLock(harnessDir: string): StartLock | undefined {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(startLockPath(harnessDir), "utf8"));
+  } catch {
+    return undefined;
+  }
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const r = raw as Record<string, unknown>;
+  const pid = r["pid"];
+  const at = r["at"];
+  if (typeof pid !== "number" || !Number.isInteger(pid)) return undefined;
+  if (typeof at !== "number") return undefined;
+  const startTime = r["pidStartTimeMs"];
+  return {
+    pid,
+    at,
+    ...(typeof startTime === "number" ? { pidStartTimeMs: startTime } : {}),
+  };
+}
+
+/** Release `daemon.lock`. Missing file is success. */
+export function releaseStartLock(harnessDir: string): void {
+  try {
+    rmSync(startLockPath(harnessDir));
+  } catch {
+    // Never existed, or a sibling already broke it.
+  }
+}
+
+/** How long a start lock may be held before it is assumed abandoned. Longer
+ *  than any preflight run (spec parse + live port probes), short enough that
+ *  a manager killed mid-start never wedges a harness for an operator. */
+export const START_LOCK_MAX_AGE_MS = 120_000;
+
+/**
+ * True when a held lock may be broken: the holder is gone, the holder's pid
+ * was recycled (start time moved), or the lock has simply been sitting there
+ * longer than any start can legitimately take.
+ */
+export function startLockIsStale(
+  lock: StartLock | undefined,
+  probe: {
+    readonly isAlive: (pid: number) => boolean;
+    readonly startTimeMs: (pid: number) => number | undefined;
+  },
+  now: number,
+  maxAgeMs: number = START_LOCK_MAX_AGE_MS,
+  toleranceMs = 2_000,
+): boolean {
+  if (lock === undefined) return true;
+  if (now - lock.at > maxAgeMs) return true;
+  if (!probe.isAlive(lock.pid)) return true;
+  if (lock.pidStartTimeMs !== undefined) {
+    const observed = probe.startTimeMs(lock.pid);
+    // Unknown start time errs toward "held": refusing a start is safer than
+    // stealing the slot from a manager that is really there.
+    if (observed !== undefined && Math.abs(observed - lock.pidStartTimeMs) > toleranceMs) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------

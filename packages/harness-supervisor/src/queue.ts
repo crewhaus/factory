@@ -297,7 +297,8 @@ export function createJobQueue(options: JobQueueOptions): JobQueue {
       // in-memory maps are empty but the operator most needs to see what the
       // previous manager left behind (especially `interrupted`).
       const finished = options.store.read().filter((j) => TERMINAL_JOB_STATES.has(j.state));
-      const at = (j: JobRecord): number => Date.parse(j.endedAt ?? j.startedAt ?? j.enqueuedAt) || 0;
+      const at = (j: JobRecord): number =>
+        Date.parse(j.endedAt ?? j.startedAt ?? j.enqueuedAt) || 0;
       finished.sort((a, b) => at(b) - at(a));
       return finished.slice(0, Math.max(0, limit));
     },

@@ -176,6 +176,10 @@ export type BootOptions = Omit<
   readonly env?: Record<string, string | undefined>;
   /** Supply a process layer instead of the fake-ops one built here. */
   readonly processLayer?: ProcessLayer;
+  /** Wrap the fake-ops layer built here — the seam for injecting a
+   *  supervision FAULT (an adoption that throws, say) without hand-building
+   *  a whole `ProcessLayer`. Ignored when `processLayer` is supplied. */
+  readonly wrapProcessLayer?: (layer: ProcessLayer) => ProcessLayer;
   readonly controlClient?: ControlClient;
   /** Job executor for the built-in layer. Defaults to a runner that never
    *  resolves, so a submitted job stays observably `running` instead of
@@ -198,6 +202,7 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
     env: extraEnv,
     onWarn,
     processLayer: suppliedLayer,
+    wrapProcessLayer,
     preflight,
     controlClient,
     runJob,
@@ -234,6 +239,7 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
       runJob: runJob ?? (() => new Promise<{ exitCode?: number }>(() => {})),
       ...(preflight === true ? {} : { noPreflight: true }),
     });
+    if (wrapProcessLayer !== undefined) processLayer = wrapProcessLayer(processLayer);
   }
 
   const server = startHangarServer({

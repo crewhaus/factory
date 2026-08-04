@@ -16,8 +16,10 @@ import {
   createLogPump,
   drain,
   looksLikeEvent,
+  parseAnnouncedControlPort,
   readCursor,
   readLogTail,
+  readLogTailLines,
   replayRunEvents,
   scanBalanced,
   tailLines,
@@ -314,6 +316,48 @@ describe("forensics helpers", () => {
     const tail = readLogTail(files.logFile, createEnvScrubber({ SLACK_BOT_TOKEN: secret }), 12);
     expect(tail.join("\n")).not.toContain(secret);
     expect(tail.join("\n")).not.toContain("�");
+  });
+
+  test("readLogTail honours a line budget instead of always capping at 8", () => {
+    const files = pumpFiles();
+    writeFileSync(
+      files.logFile,
+      `${Array.from({ length: 100 }, (_, i) => `line-${i + 1}`).join("\n")}\n`,
+    );
+    // The forensics default is unchanged — 8 lines, whatever the byte budget.
+    expect(readLogTail(files.logFile)).toHaveLength(LOG_TAIL_LINES);
+    expect(readLogTail(files.logFile, undefined, 512 * 1024)).toHaveLength(LOG_TAIL_LINES);
+
+    // A caller that asks for 100 gets 100. This is `daemon logs --tail N`,
+    // which used to print 8 lines for any N and give no sign it truncated.
+    const forty = readLogTail(files.logFile, undefined, 512 * 1024, 40);
+    expect(forty).toHaveLength(40);
+    expect(forty[0]).toBe("line-61");
+    expect(forty[39]).toBe("line-100");
+    const all = readLogTail(files.logFile, undefined, { maxBytes: 512 * 1024, lines: 100 });
+    expect(all).toHaveLength(100);
+    expect(all[0]).toBe("line-1");
+
+    // The byte budget still bounds the read: a bare number stays maxBytes.
+    expect(readLogTail(files.logFile, undefined, 32, 100).length).toBeLessThan(10);
+
+    // …which is exactly why `--tail N` should use the line-first helper: N in
+    // the third position would otherwise silently mean N bytes.
+    expect(readLogTailLines(files.logFile, undefined, 40)).toHaveLength(40);
+    expect(readLogTailLines(files.logFile)).toHaveLength(LOG_TAIL_LINES);
+  });
+
+  test("parseAnnouncedControlPort reads the daemon's control.v1 boot line", () => {
+    const line =
+      "[control] crewhaus.control.v1 listening on http://127.0.0.1:41234 (token: .crewhaus/run/control-token)";
+    expect(parseAnnouncedControlPort(`booting\n${line}\nready\n`)).toBe(41234);
+    expect(parseAnnouncedControlPort("[control] crewhaus.control.v1 listening on https://[::1]:80")) // not the loopback form we emit
+      .toBeUndefined();
+    expect(parseAnnouncedControlPort("nothing to see here")).toBeUndefined();
+    // Port 0 is "kernel, pick one" — never a reachable port.
+    expect(
+      parseAnnouncedControlPort("[control] crewhaus.control.v1 listening on http://127.0.0.1:0"),
+    ).toBeUndefined();
   });
 
   test("replayRunEvents skips torn lines", () => {

@@ -24,6 +24,7 @@ export type {
   RunKind,
   RunLedgerEntry,
   RunLedgerPatch,
+  StartLock,
   SupervisionState,
 } from "./types";
 export {
@@ -34,6 +35,7 @@ export {
   RUN_LEDGER_NAME,
   RUNFILE_NAME,
   RUNFILE_VERSION,
+  START_LOCK_NAME,
   START_TIME_TOLERANCE_MS,
   systemClock,
 } from "./types";
@@ -63,6 +65,7 @@ export {
 
 export type { PruneResult } from "./runfiles";
 export {
+  acquireStartLock,
   appendRunLedger,
   clearRunfile,
   controlTokenPath,
@@ -74,12 +77,19 @@ export {
   readRetentionPolicy,
   readRunLedger,
   readRunfile,
+  readStartLock,
   recentRuns,
+  releaseStartLock,
   RUN_ID_RE,
   runCursorPath,
   runDir,
   runEventsPath,
+  runfileExists,
+  runfilePath,
   runLogPath,
+  START_LOCK_MAX_AGE_MS,
+  startLockIsStale,
+  startLockPath,
   writeRunfile,
 } from "./runfiles";
 
@@ -96,17 +106,27 @@ export {
   scrubDeep,
 } from "./scrub";
 
-export type { Drained, LogPump, LogPumpOptions, PumpCursor, PumpResult } from "./trace-pump";
+export type {
+  Drained,
+  LogPump,
+  LogPumpOptions,
+  LogTailOptions,
+  PumpCursor,
+  PumpResult,
+} from "./trace-pump";
 export {
   completeUtf8Length,
+  CONTROL_ANNOUNCE_RE,
   createLogPump,
   DEFAULT_MAX_CHUNK_BYTES,
   drain,
   LOG_TAIL_LINES,
   LOG_TAIL_MAX_CHARS,
   looksLikeEvent,
+  parseAnnouncedControlPort,
   readCursor,
   readLogTail,
+  readLogTailLines,
   replayRunEvents,
   RUNIDLESS_EVENT_KINDS,
   scanBalanced,
@@ -145,6 +165,7 @@ export {
   runKindFor,
   runOptionFlags,
   SESSION_ID_RE,
+  shellQuote,
   SPEC_FILENAMES,
   SpawnPlanError,
 } from "./spawn-contracts";

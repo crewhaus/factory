@@ -694,4 +694,20 @@ describe("emitBatchWorker — crewhaus.control.v1", () => {
   test("an unscheduled worker arms no lane", () => {
     expect(code()).not.toContain("__control.lane({");
   });
+
+  /**
+   * M2 review — the 202's `sessionId` was an ORPHAN on this shape. The wake
+   * ENQUEUES a job; the consumer's handler builds its own `createRunContext()`
+   * and mints its own session, so nothing ever reads `__tick.sessionId`. The
+   * marker the lane wrote for it was a `.jsonl` with no `.json` beside it,
+   * which `sweepExpired`, `crewhaus retention` and the janitor's TTL eviction
+   * all skip by design — a file no retention path could ever reach.
+   */
+  test("the producer lane declares ownsSession: false and never reads the tick id", () => {
+    const c = code(scheduled);
+    const lane = c.slice(c.indexOf("const __scheduleLane"), c.indexOf("const __schedule ="));
+    expect(lane).toContain("ownsSession: false,");
+    expect(lane).toContain("const jobId = await queue.enqueue(__scheduleInstructions);");
+    expect(lane).not.toContain("__tick.sessionId");
+  });
 });

@@ -2365,7 +2365,7 @@ describe("emitChannelBot — crewhaus.control.v1", () => {
     expect(daemon).not.toContain('"/control/v1');
   });
 
-  test("drain stops the timers, flushes the janitor and closes every listener", () => {
+  test("drain stops the timers and closes every listener, THEN sweeps", () => {
     const daemon = fileMap(withLanes()).get("daemon.ts") ?? "";
     const start = daemon.indexOf("__control.onDrain(");
     const end = daemon.indexOf("await __control.start();");
@@ -2373,10 +2373,34 @@ describe("emitChannelBot — crewhaus.control.v1", () => {
     expect(step).toContain("__janitor.stop();");
     expect(step).toContain("clearInterval(__heartbeatTimer);");
     expect(step).toContain("__schedule.cancel();");
-    expect(step).toContain("await __janitor.runOnce();");
     // Graceful (no closeActiveConnections): a channel turn runs INSIDE the
     // webhook request that carried it.
     expect(step).toContain("await server.stop();");
+    // M2 review — the janitor sweep runs LAST and time-boxed. Inside the drain
+    // deadline it fanned out to dream/distill MODEL CALLS before the listeners
+    // had closed, so the in-flight turn the drain existed to finish was
+    // SIGTERM'd at the deadline anyway. A bare `await __janitor.runOnce();`
+    // between the timer cancels and `server.stop()` is the regression.
+    expect(step).not.toContain("await __janitor.runOnce();");
+    expect(step).toContain("await runDrainSweep(() => __janitor.runOnce()");
+    expect(step.indexOf("await server.stop();")).toBeLessThan(step.indexOf("runDrainSweep"));
+  });
+
+  /**
+   * M2 review — the manager PARSES the daemon's prose stdout for the
+   * `[control] … listening on …` announcement, so anything the daemon echoes
+   * that it did not author is a log-injection surface. The agent's own turn
+   * output is the worst case: a channel message steers it, so no operator
+   * action is needed at all.
+   */
+  test("a heartbeat/schedule turn preview is flattened before it is printed", () => {
+    const daemon = fileMap(withLanes()).get("daemon.ts") ?? "";
+    expect(daemon).toContain(
+      'runDrainSweep, sanitizeControlText } from "@crewhaus/gateway-protocol/control";',
+    );
+    // Both lanes, and neither keeps the raw slice that could carry a newline.
+    expect(daemon.split("const __preview = sanitizeControlText(__out, 200);").length - 1).toBe(2);
+    expect(daemon).not.toContain('__out.slice(0, 200) + "…"');
   });
 
   test("the emitted bundle names no control token and mints none at emit time", () => {

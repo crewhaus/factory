@@ -18,7 +18,7 @@ import { openAuditLog } from "@crewhaus/audit-log";
 import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
 import { createRuntimeBackedApprovalStore } from "@crewhaus/channel-adapter-base";
 import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
-import { countPendingApprovals, createControlPlane } from "@crewhaus/gateway-protocol/control";
+import { countPendingApprovals, createControlPlane, runDrainSweep } from "@crewhaus/gateway-protocol/control";
 import { join } from "node:path";
 
 const __requiredEnv = ["PIN_SLACK_BOT_TOKEN","PIN_SLACK_SIGNING_SECRET"];
@@ -179,11 +179,16 @@ async function main(): Promise<void> {
   __control.onDrain(async () => {
     process.stdout.write("[daemon] draining — intake stopped\n");
     __janitor.stop();
-    await __janitor.runOnce();
     // GRACEFUL stop (no closeActiveConnections): a channel turn runs INSIDE the
     // webhook request that carried it, so forcing connections shut here would
     // abort exactly the in-flight turns a drain exists to finish.
     await server.stop();
+    // Best-effort housekeeping, time-boxed and outside everything above.
+    await runDrainSweep(() => __janitor.runOnce(), {
+      onOutcome: (__o) => {
+        if (__o !== "done") process.stdout.write(`[daemon] drain sweep ${__o}\n`);
+      },
+    });
   });
   await __control.start();
 

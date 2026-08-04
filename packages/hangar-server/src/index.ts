@@ -41,6 +41,7 @@ export {
   SAFE_SEGMENT_RE,
   SESSION_DIR_ENV,
   SESSION_ID_RE,
+  SSE_IDLE_TIMEOUT_SECONDS,
 } from "./constants";
 export { ensureToken, isAuthorized, TOKEN_FILENAME, tokenEquals, type TokenSetup } from "./auth";
 export { mergedSpawnEnv, parseEnvText, readHarnessEnvFiles } from "./env-file";
@@ -144,12 +145,16 @@ export {
 } from "./control-client";
 export {
   harnessScrubber,
+  isLiveFeedState,
   isSupervisorRunId,
   runDetail,
   runEventStream,
   runLogFile,
   runsView,
+  spawnEnvScrubber,
+  LIVE_FEED_STATES,
   SSE_EVENTS,
+  SSE_HEARTBEAT_MS,
   type RunDetail,
   type RunsView,
 } from "./runs";

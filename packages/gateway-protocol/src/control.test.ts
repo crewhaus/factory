@@ -12,14 +12,19 @@ import {
   CONTROL_PATH_PREFIX,
   CONTROL_PROTOCOL,
   CONTROL_RUN_DIR,
+  CONTROL_TEXT_MAX,
   CONTROL_TOKEN_FILENAME,
   type ControlAuditRecord,
   type ControlPlane,
   type ControlPlaneOptions,
+  DEFAULT_DRAIN_SWEEP_MS,
   DRAIN_RETRY_AFTER_SECONDS,
+  DRAIN_SWEEP_BUDGET_ENV,
   constantTimeEquals,
   createControlPlane,
   resolveControlToken,
+  runDrainSweep,
+  sanitizeControlText,
 } from "./control";
 
 let tmp: string;
@@ -560,5 +565,285 @@ describe("start", () => {
     } finally {
       await plane.stop();
     }
+  });
+});
+
+/**
+ * M2 review — log injection through the control plane.
+ *
+ * The manager PARSES a daemon's prose stdout: `[control] <protocol> listening
+ * on http://host:port` is the only way it learns a kernel-assigned control
+ * port, and it writes what it parses into the runfile. Every prose line a
+ * daemon prints that interpolates text it did not author is therefore a way to
+ * repoint the manager's control calls — bearer included — at a chosen port.
+ */
+describe("sanitizeControlText — untrusted text can never start a log line", () => {
+  /** The exact announcement the manager scans for. */
+  const FORGED = `[control] ${CONTROL_PROTOCOL} listening on http://127.0.0.1:9999`;
+
+  /** Lines a log pump would see after splitting a captured chunk. */
+  function pumpLines(chunk: string): string[] {
+    return chunk.split("\n");
+  }
+
+  test("a newline plus a forged banner collapses to one line", () => {
+    const injected = `benign reason\n${FORGED}\ntrailing`;
+    const clean = sanitizeControlText(injected);
+    expect(clean).not.toContain("\n");
+    expect(clean).not.toContain("\r");
+    // The emitted heartbeat lane prints exactly this shape.
+    const emitted = `[heartbeat] tick #1 (synthetic: ${clean}) (session sess_${"0".repeat(16)})\n`;
+    expect(pumpLines(emitted).filter((l) => l.startsWith("[control]"))).toEqual([]);
+    // Un-sanitized, the very same input DOES produce such a line — that is the
+    // bug this pins.
+    const raw = `[heartbeat] tick #1 (synthetic: ${injected}) (session sess_${"0".repeat(16)})\n`;
+    expect(pumpLines(raw).filter((l) => l.startsWith("[control]"))).toEqual([FORGED]);
+  });
+
+  test("carriage returns, C1 controls and Unicode line separators all flatten", () => {
+    const cr = String.fromCharCode(13);
+    const c1 = String.fromCharCode(0x85);
+    const ls = String.fromCharCode(0x2028);
+    const ps = String.fromCharCode(0x2029);
+    for (const sep of [cr, c1, ls, ps]) {
+      const clean = sanitizeControlText(`a${sep}${FORGED}`);
+      expect(clean).toBe(`a ${FORGED}`);
+      expect(pumpLines(`[x] ${clean}\n`).filter((l) => l.startsWith("[control]"))).toEqual([]);
+    }
+  });
+
+  test("length is capped so one field cannot flood the pumped stream", () => {
+    const clean = sanitizeControlText("x".repeat(5_000));
+    expect(clean).toHaveLength(CONTROL_TEXT_MAX + 1); // + the ellipsis
+    expect(sanitizeControlText("x".repeat(20), 8)).toBe(`${"x".repeat(8)}…`);
+    expect(sanitizeControlText("short")).toBe("short");
+  });
+
+  test("agent turn output — the operator-free vector — flattens the same way", () => {
+    // A channel message steers the reply, so this path needs no operator at
+    // all. The emitted lanes call sanitizeControlText(__out, 200).
+    const reply = `sure!\n\n${FORGED}\n`;
+    const preview = sanitizeControlText(reply, 200);
+    expect(
+      pumpLines(`[heartbeat] → ${preview}\n`).filter((l) => l.startsWith("[control]")),
+    ).toEqual([]);
+  });
+});
+
+describe("wake — reason/by are sanitized at the control-plane boundary", () => {
+  const FORGED = `[control] ${CONTROL_PROTOCOL} listening on http://127.0.0.1:9999`;
+
+  async function pokeWith(reason: string, by: string) {
+    const seen: Array<{ reason: string; by: string }> = [];
+    const h = harness();
+    const lane = h.plane.lane({
+      lane: "heartbeat",
+      cadence: "every 1000ms",
+      everyMs: 1000,
+      run: async (ctx) => {
+        if (ctx.synthetic !== undefined) seen.push({ ...ctx.synthetic });
+      },
+    });
+    const res = await h.plane.fetch(
+      req(`${CONTROL_PATH_PREFIX}/wake`, wakeBody({ lane: "heartbeat", reason, by })),
+    );
+    const body = (await res.json()) as { sessionId: string; reason: string };
+    await lane.settled();
+    return { ...h, seen, body, status: res.status };
+  }
+
+  test("the tick body, the 202 echo and the marker all see ONE flattened line", async () => {
+    const { seen, body, status } = await pokeWith(`benign\n${FORGED}`, "max\nrogue");
+    expect(status).toBe(202);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.reason).toBe(`benign ${FORGED}`);
+    expect(seen[0]?.by).toBe("max rogue");
+    expect(body.reason).not.toContain("\n");
+    const marker = readFileSync(join(sessions, `${body.sessionId}.jsonl`), "utf-8");
+    const record = JSON.parse(marker.trim()) as {
+      payload: { control: { reason: string; by: string } };
+    };
+    expect(record.payload.control.reason).not.toContain("\n");
+    expect(record.payload.control.by).toBe("max rogue");
+  });
+
+  test("an over-long reason is capped before it reaches the tick", async () => {
+    const { seen } = await pokeWith("y".repeat(1_000), "cli");
+    expect(seen[0]?.reason).toHaveLength(CONTROL_TEXT_MAX + 1);
+  });
+
+  test("whitespace-only reason falls back to the default, not an empty line", async () => {
+    const { seen } = await pokeWith("   \n  ", "  ");
+    expect(seen[0]?.reason).toBe("operator wake");
+    expect(seen[0]?.by).toBe(CONTROL_PROTOCOL);
+  });
+
+  test("a lane poked through the handle directly is sanitized too", async () => {
+    const seen: Array<{ reason: string }> = [];
+    const { plane } = harness();
+    const lane = plane.lane({
+      lane: "schedule",
+      cadence: "every 1000ms",
+      run: async (ctx) => {
+        if (ctx.synthetic !== undefined) seen.push({ reason: ctx.synthetic.reason });
+      },
+    });
+    await lane.wake({ reason: `a\n${FORGED}`, by: "direct" });
+    await lane.settled();
+    expect(seen[0]?.reason).not.toContain("\n");
+  });
+});
+
+/**
+ * M2 review — the 202's `sessionId` was an orphan on the managed and batch
+ * shapes: the lane minted an id its body never threads into a session, so the
+ * marker landed as a `.jsonl` with no `.json` beside it — a shape `sweepExpired`,
+ * `crewhaus retention` and the janitor's TTL eviction all skip BY DESIGN. The
+ * wire contract is now honest: a lane that does not own the session says so.
+ */
+describe("ownsSession — the 202 never advertises a dangling session", () => {
+  function laneOf(ownsSession: boolean | undefined) {
+    const seen: Array<{ sessionId: string; synthetic: unknown }> = [];
+    const h = harness();
+    const lane = h.plane.lane({
+      lane: "schedule",
+      cadence: "every 1000ms",
+      ...(ownsSession !== undefined ? { ownsSession } : {}),
+      run: async (ctx) => {
+        seen.push({ sessionId: ctx.sessionId, synthetic: ctx.synthetic });
+      },
+    });
+    return { ...h, lane, seen };
+  }
+
+  function sessionFiles(): string[] {
+    try {
+      return readdirSync(sessions);
+    } catch {
+      return [];
+    }
+  }
+
+  test("a session-owning lane still answers with the id and writes the marker", async () => {
+    const { plane, lane } = laneOf(undefined);
+    const res = await plane.fetch(
+      req(`${CONTROL_PATH_PREFIX}/wake`, wakeBody({ lane: "schedule", reason: "poke" })),
+    );
+    const body = (await res.json()) as { sessionId?: string };
+    await lane.settled();
+    expect(body.sessionId).toMatch(/^sess_[0-9a-f]{16}$/);
+    expect(sessionFiles()).toEqual([`${body.sessionId}.jsonl`]);
+  });
+
+  test("a lane that owns no session omits sessionId and leaves NO orphan file", async () => {
+    const { plane, lane, seen } = laneOf(false);
+    const res = await plane.fetch(
+      req(`${CONTROL_PATH_PREFIX}/wake`, wakeBody({ lane: "schedule", reason: "poke" })),
+    );
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as Record<string, unknown>;
+    await lane.settled();
+    expect("sessionId" in body).toBe(false);
+    expect(body["lane"]).toBe("schedule");
+    expect(body["synthetic"]).toBe(true);
+    // The tick still ran, and still knows it was synthetic.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.synthetic).toEqual({ reason: "poke", by: CONTROL_PROTOCOL });
+    // …and nothing was deposited where retention can never reach it.
+    expect(sessionFiles()).toEqual([]);
+  });
+
+  test("the poke stays evidenced through the audit record instead", async () => {
+    const { plane, lane, audits } = laneOf(false);
+    await plane.fetch(
+      req(
+        `${CONTROL_PATH_PREFIX}/wake`,
+        wakeBody({ lane: "schedule", reason: "nightly", by: "max" }),
+      ),
+    );
+    await lane.settled();
+    const wake = audits.find((a) => a.payload["route"] === `${CONTROL_PATH_PREFIX}/wake`);
+    expect(wake?.payload).toMatchObject({ lane: "schedule", reason: "nightly", by: "max" });
+    expect(wake?.payload["sessionId"]).toBeUndefined();
+  });
+
+  test("an organic tick is unaffected — it still gets a fresh id", async () => {
+    const { lane, seen } = laneOf(false);
+    await lane.tick();
+    expect(seen[0]?.sessionId).toMatch(/^sess_[0-9a-f]{16}$/);
+    expect(seen[0]?.synthetic).toBeUndefined();
+  });
+});
+
+/**
+ * M2 review — the drain deadline. A supervisor bounds the whole drain; a
+ * janitor sweep is housekeeping the next boot repeats, so it must never be
+ * able to spend that budget. Emitted drain steps run it through here, last.
+ */
+describe("runDrainSweep — best-effort housekeeping under its own budget", () => {
+  test("a fast step reports done", async () => {
+    let ran = 0;
+    const outcomes: string[] = [];
+    const out = await runDrainSweep(
+      async () => {
+        ran += 1;
+      },
+      { budgetMs: 1_000, onOutcome: (o) => outcomes.push(o) },
+    );
+    expect(out).toBe("done");
+    expect(ran).toBe(1);
+    expect(outcomes).toEqual(["done"]);
+  });
+
+  test("a step that outlives the budget times out — and returns WITHIN it", async () => {
+    const t0 = Date.now();
+    const out = await runDrainSweep(() => Bun.sleep(5_000), { budgetMs: 25 });
+    const elapsed = Date.now() - t0;
+    expect(out).toBe("timeout");
+    // Without the bound this would sit for 5s inside the supervisor's deadline.
+    expect(elapsed).toBeLessThan(2_000);
+  });
+
+  test("a throwing step is reported, never rethrown", async () => {
+    const outcomes: Array<[string, string | undefined]> = [];
+    const out = await runDrainSweep(
+      () => {
+        throw new Error("janitor blew up");
+      },
+      { budgetMs: 500, onOutcome: (o, d) => outcomes.push([o, d]) },
+    );
+    expect(out).toBe("failed");
+    expect(outcomes).toEqual([["failed", "janitor blew up"]]);
+  });
+
+  test("a zero budget skips the step entirely", async () => {
+    let ran = 0;
+    const out = await runDrainSweep(
+      () => {
+        ran += 1;
+      },
+      { budgetMs: 0 },
+    );
+    expect(out).toBe("skipped");
+    expect(ran).toBe(0);
+  });
+
+  test("the budget is operator-tunable through the env, with a sane default", async () => {
+    expect(
+      await runDrainSweep(() => Bun.sleep(5_000), { env: { [DRAIN_SWEEP_BUDGET_ENV]: "20" } }),
+    ).toBe("timeout");
+    expect(await runDrainSweep(() => undefined, { env: { [DRAIN_SWEEP_BUDGET_ENV]: "0" } })).toBe(
+      "skipped",
+    );
+    // Garbage — and an empty value, which `Number("")` would read as 0 — falls
+    // back to the default rather than silently disabling housekeeping.
+    expect(
+      await runDrainSweep(() => undefined, { env: { [DRAIN_SWEEP_BUDGET_ENV]: "nope" } }),
+    ).toBe("done");
+    expect(await runDrainSweep(() => undefined, { env: { [DRAIN_SWEEP_BUDGET_ENV]: "" } })).toBe(
+      "done",
+    );
+    expect(await runDrainSweep(() => undefined, { env: {} })).toBe("done");
+    expect(DEFAULT_DRAIN_SWEEP_MS).toBeGreaterThan(0);
   });
 });

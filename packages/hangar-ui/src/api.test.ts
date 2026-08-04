@@ -272,6 +272,24 @@ describe("a typed refusal is surfaced, not thrown", () => {
     expect(res.body.reason).toBe("preflight-blocked");
   });
 
+  test("procStop's 409 not-adopted comes back as a body, not an ApiError", async () => {
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          ok: false,
+          reason: "not-adopted",
+          message: "a daemon is running that this manager never adopted",
+        }),
+        { status: 409, headers: { "content-type": "application/json" } },
+      )) as typeof fetch;
+    for (const call of [api.procStop(ID), api.procDrain(ID)]) {
+      const res = (await call) as { ok: boolean; status: number; body: { reason: string } };
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(409);
+      expect(res.body.reason).toBe("not-adopted");
+    }
+  });
+
   test("the run stream reads text/event-stream, never res.json()", async () => {
     let requested = "";
     let accept = "";

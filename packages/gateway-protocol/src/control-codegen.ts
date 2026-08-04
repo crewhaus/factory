@@ -53,11 +53,21 @@ export type ControlPlaneEmit = {
  * daemon-shape target — control.v1 is the lowest common denominator all
  * daemon shapes share, so a bundle either has it or is a pre-0.5.0 bundle.
  */
-export function renderControlImports(opts: { readonly pendingApprovals?: boolean } = {}): string {
-  const names =
-    opts.pendingApprovals === true
-      ? "countPendingApprovals, createControlPlane"
-      : "createControlPlane";
+export function renderControlImports(
+  opts: {
+    readonly pendingApprovals?: boolean;
+    /** Pull in {@link runDrainSweep} — a drain step that sweeps housekeeping. */
+    readonly drainSweep?: boolean;
+    /** Pull in {@link sanitizeControlText} — a daemon that logs untrusted text. */
+    readonly logSafe?: boolean;
+  } = {},
+): string {
+  const names = [
+    ...(opts.pendingApprovals === true ? ["countPendingApprovals"] : []),
+    "createControlPlane",
+    ...(opts.drainSweep === true ? ["runDrainSweep"] : []),
+    ...(opts.logSafe === true ? ["sanitizeControlText"] : []),
+  ].join(", ");
   return `import { ${names} } from ${q(CONTROL_RUNTIME_MODULE)};\n`;
 }
 
@@ -109,6 +119,13 @@ export type ControlLaneEmit = {
   /** JS expression returning `string | undefined` — overrides the projection. */
   readonly nextDueAtExpr?: string;
   /**
+   * `false` for a lane whose body does NOT thread `__tick.sessionId` into a
+   * session of its own (the managed fan-out, the batch producer). Such a lane
+   * writes no wake marker and its 202 omits `sessionId` instead of handing the
+   * operator an id that names nothing — see `ControlLaneOptions.ownsSession`.
+   */
+  readonly ownsSession?: boolean;
+  /**
    * The tick body. Rendered inside `async (__tick) => { … }`, so it can read
    * `__tick.sessionId` (minted by the lane, identical for timer + operator
    * fires) and `__tick.synthetic`.
@@ -132,6 +149,7 @@ export function renderControlLane(opts: ControlLaneEmit): string {
     `  cadence: ${q(opts.cadence)},`,
     ...(opts.everyMs !== undefined ? [`  everyMs: ${opts.everyMs},`] : []),
     ...(opts.nextDueAtExpr !== undefined ? [`  nextDueAt: () => ${opts.nextDueAtExpr},`] : []),
+    ...(opts.ownsSession === false ? ["  ownsSession: false,"] : []),
     "  run: async (__tick) => {",
     indentBlock(opts.body, "    "),
     "  },",
