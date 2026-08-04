@@ -135,18 +135,28 @@ export function feedbackRecord(
 export function makeFixtureHarness(dir: string, opts: FixtureHarnessOptions = {}): string {
   const specName = opts.specName ?? "fixture-harness";
   const target = opts.target ?? "cli";
-  const model = opts.model ?? "anthropic/claude-sonnet-4";
+  // Must satisfy `parseModelString` — otherwise every credential-derived
+  // view (env keys, doctor checks, the fleet credentials matrix) is
+  // legitimately EMPTY against this fixture and those areas silently lose
+  // their coverage.
+  const model = opts.model ?? "claude-opus-5";
   mkdirSync(dir, { recursive: true });
   const ch = join(dir, ".crewhaus");
 
   if (opts.noSpec !== true) {
+    // This spec must PARSE. `instructions` belongs under `agent:` (at the
+    // document root the strict union rejects the whole file), and the model
+    // must satisfy `parseModelString`. A fixture that fails validation is
+    // not merely untidy: `applySpecEdits` re-validates after every edit, so
+    // an invalid fixture makes even a zero-edit batch throw, and every area
+    // that round-trips a spec loses its coverage against the shared fixture.
     const yaml = [
       `name: ${specName}`,
       `target: ${target}`,
       "agent:",
       `  model: ${model}`,
-      "instructions: |",
-      "  You are a fixture. Answer briefly.",
+      "  instructions: |",
+      "    You are a fixture. Answer briefly.",
       ...(opts.specExtra !== undefined ? [opts.specExtra] : []),
       "",
     ].join("\n");

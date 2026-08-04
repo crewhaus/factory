@@ -8,9 +8,27 @@
  */
 import { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "@crewhaus/spec-patch";
 
-/** Mask a JSON tree: values under credential-naming keys are replaced
- *  wholesale; every other string is token-shape masked. Arrays/objects are
- *  walked; non-string scalars pass through. */
+/**
+ * Mask a JSON tree: values under credential-naming keys are replaced
+ * wholesale; every other string is token-shape masked. Arrays/objects are
+ * walked; non-string scalars pass through.
+ *
+ * **Naming hazard — read before adding a response field.** Redaction is by
+ * KEY NAME: `isCredentialKey` matches an exact `key` and any camel-case
+ * `…Key` / `…Token` / `…Secret` / `…Password`. It cannot tell a secret from
+ * a field that merely rhymes with one, and it is applied to EVERY payload
+ * this server serves — so a perfectly innocent field name silently becomes
+ * `"[redacted]"` with no error and no warning.
+ *
+ * Six independent M3 areas each lost time to this: `sessionKey` (a routing
+ * mode), `filterKey`, `idempotencyKey`, and a bare `key` on a table cell all
+ * vanished from their payloads. The convention that works is to NAME AROUND
+ * it — `sessionKeyMode`, `filterParam`, `idempotency`, `name` — rather than
+ * to widen the matcher, because every exemption is a place a real credential
+ * could later hide. If a field must keep a credential-shaped name, prove it
+ * carries no secret and add it to a scoped allowlist next to its own reader,
+ * never to a global one.
+ */
 export function maskDeep(value: unknown): unknown {
   return maskTree(value, false);
 }
@@ -44,11 +62,34 @@ const ENV_REF_VALUE_RE = /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/;
 const YAML_SCALAR_LINE_RE = /^([ \t]*(?:- )?)([A-Za-z0-9_.-]+):([ \t]*)(.*)$/;
 
 /**
+ * Spec keys that LOOK credential-shaped to `isCredentialKey` (which matches a
+ * trailing `Key`/`Token`/`Secret`/`Password`) but carry no secret.
+ *
+ * `sessionKey` is the one that bit: it selects a channel's session-routing
+ * MODE — `thread` | `channel` | `user` — so redacting it hid a routing
+ * decision from every channel harness's spec view while protecting nothing.
+ *
+ * Keep this list tiny and evidence-driven. A wrong entry here leaks a
+ * credential, which is far worse than the over-redaction it cures.
+ */
+const NON_CREDENTIAL_SPEC_KEYS: ReadonlySet<string> = new Set(["sessionKey"]);
+
+/**
+ * Redaction placeholder, YAML-QUOTED.
+ *
+ * `[redacted]` unquoted is a flow SEQUENCE — a bare `botToken: [redacted]`
+ * re-parses as a one-item list, so the masked document no longer has the
+ * shape the original did. Quoting keeps a redacted scalar a scalar.
+ */
+const REDACTED_YAML_SCALAR = `"${REDACTED_VALUE}"`;
+
+/**
  * Mask a YAML spec text line-by-line without parsing it (the spec may not
  * parse — masking must still hold). A scalar under a credential-naming key
  * is redacted unless it is a `$VAR` env reference (a name the operator needs
- * to see); every line additionally passes the token-shape masker so a
- * credential pasted into prose or a non-credential key never survives.
+ * to see) or a known non-secret key; every line additionally passes the
+ * token-shape masker so a credential pasted into prose or a non-credential
+ * key never survives.
  */
 export function maskSpecYaml(yamlText: string): string {
   const lines = yamlText.split("\n").map((line) => {
@@ -60,9 +101,10 @@ export function maskSpecYaml(yamlText: string): string {
         value !== "" &&
         !value.startsWith("#") &&
         isCredentialKey(key) &&
+        !NON_CREDENTIAL_SPEC_KEYS.has(key) &&
         !ENV_REF_VALUE_RE.test(stripQuotes(value))
       ) {
-        return `${indent}${key}:${gap === "" ? " " : gap}${REDACTED_VALUE}`;
+        return `${indent}${key}:${gap === "" ? " " : gap}${REDACTED_YAML_SCALAR}`;
       }
     }
     return maskCredentialTokens(line);

@@ -30,8 +30,20 @@ describe("credential hygiene (unit)", () => {
     ].join("\n");
     const masked = maskSpecYaml(yaml);
     expect(masked).not.toContain(FAKE_KEY);
-    expect(masked).toContain("botToken: [redacted]");
+    // QUOTED: bare `[redacted]` is a YAML flow sequence, so an unquoted
+    // redaction silently changed a scalar into a one-item list.
+    expect(masked).toContain('botToken: "[redacted]"');
+    expect(masked).not.toMatch(/botToken: \[redacted\]/);
     expect(masked).toContain("signingSecret: $SLACK_SIGNING_SECRET");
+
+    // `sessionKey` ends in "Key" but selects a channel's session-routing
+    // MODE, not a secret. Redacting it hid a routing decision from every
+    // channel harness's spec view while protecting nothing.
+    const routing = maskSpecYaml(
+      ["channels:", "  slack:", "    routing:", "      sessionKey: thread"].join("\n"),
+    );
+    expect(routing).toContain("sessionKey: thread");
+    expect(routing).not.toContain("[redacted]");
     expect(masked).toContain("name: demo");
   });
 
@@ -256,7 +268,7 @@ describe("credential hygiene (end-to-end)", () => {
     const spec = await t.api(`/api/h/${id}/spec`);
     const yaml = spec.body["yaml"] as string;
     expect(yaml).not.toContain(FAKE_KEY);
-    expect(yaml).toContain("HELPER_TOKEN: [redacted]");
+    expect(yaml).toContain('HELPER_TOKEN: "[redacted]"');
     // … and the transcript kept its shape while masking the values.
     const transcript = await t.api(`/api/h/${id}/sessions/${sess}`);
     const tools = transcript.body["tools"] as Array<Record<string, unknown>>;
