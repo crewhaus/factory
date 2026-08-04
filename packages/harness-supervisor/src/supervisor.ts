@@ -61,6 +61,7 @@ import {
   patchRunLedger,
   pruneRuns,
   readRetentionPolicy,
+  readRunLedger,
   readRunfile,
   readStartLock,
   recentRuns,
@@ -72,9 +73,15 @@ import {
   startLockIsStale,
   writeRunfile,
 } from "./runfiles";
-import { type Scrubber, createEnvScrubber } from "./scrub";
+import { type Scrubber, createEnvScrubber, scrubbableEnvKeys } from "./scrub";
 import { type SpawnPlan, isSupervisedClass, loadEnvChain, runClassFor } from "./spawn-contracts";
-import { type LogPump, createLogPump, parseAnnouncedControlPort, readLogTail } from "./trace-pump";
+import {
+  type LogPump,
+  createLogPump,
+  parseAnnouncedControlPort,
+  readLogTail,
+  replayRunEvents,
+} from "./trace-pump";
 import {
   type Clock,
   type DaemonRunfile,
@@ -497,7 +504,10 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       // runs on a TIMER, outside every caller's try/catch, so anything that
       // did escape would land on `unhandledRejection` and take the whole
       // manager down over one harness's bad day.
-      void start()
+      // `automatic: true` is what keeps the rolling window intact: a manual
+      // start clears it, an auto-restart must not (that would make the
+      // 5-in-10-minutes rule unreachable).
+      void start({}, { automatic: true })
         .catch((err: unknown) => {
           lastExit = {
             disposition: "crash",
@@ -511,14 +521,64 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     }, delay);
   };
 
+  /**
+   * Recover the exit code of a run whose death we only inferred (an adopted
+   * run, noticed by pid-polling). Three sources, best first:
+   *
+   *   1. the `run_failed` trace event this manager already saw;
+   *   2. the same event in the run's DURABLE `.events.jsonl` — the case that
+   *      matters, because a manager that restarted mid-run has an empty
+   *      in-memory record while the evidence sits on disk;
+   *   3. the ledger row, if some other writer closed it with a code.
+   *
+   * Returns undefined only when there is genuinely nothing, so the honest
+   * "exit code unknown" title is still told when it is true.
+   */
+  const recoverExitCode = (): { readonly exitCode: number } | undefined => {
+    const fromEvent = (event: Record<string, unknown> | undefined): number | undefined => {
+      const value = event?.["exitCode"];
+      return typeof value === "number" && Number.isInteger(value) ? value : undefined;
+    };
+    const inMemory = fromEvent(lastRunFailed);
+    if (inMemory !== undefined) return { exitCode: inMemory };
+    if (runId !== undefined) {
+      try {
+        const durable = replayRunEvents(runEventsPath(options.harnessDir, runId));
+        for (let i = durable.length - 1; i >= 0; i -= 1) {
+          const event = durable[i];
+          if (event?.["kind"] !== "run_failed") continue;
+          const code = fromEvent(event);
+          if (code !== undefined) {
+            // Keep it for the forensics panel too — this manager never saw
+            // the event live, but the operator still wants the remediation.
+            if (lastRunFailed === undefined) lastRunFailed = event;
+            return { exitCode: code };
+          }
+        }
+      } catch {
+        // Unreadable events file — fall through to the ledger.
+      }
+      const row = readRunLedger(options.harnessDir).find((entry) => entry.runId === runId);
+      if (typeof row?.exitCode === "number") return { exitCode: row.exitCode };
+    }
+    return undefined;
+  };
+
   const onExit = (code: number | null, signal: string | null): void => {
     const wasOperatorStop = operatorStop;
     operatorStop = false;
     // An adopted run has no plan of ours; the target's run class still says
     // whether it is long-running, so supervision survives a manager restart.
     const longRunning = currentPlan?.supervised ?? isSupervisedClass(runClassFor(options.target));
+    // An adopted run's death is noticed by pid-polling, so the OS exit code
+    // never reaches us. Recovering it is not a nicety: without it a billing
+    // (31) or budget (33) exit classifies as a plain crash and gets
+    // RESTARTED — restarting the one class of failure a restart cannot fix,
+    // and re-arming spend the budget cap just stopped. The daemon told us
+    // what happened on its way out; the pump already wrote it down.
+    const recovered = code === null && signal === null ? recoverExitCode() : undefined;
     const base = classifyExit({
-      exitCode: code,
+      exitCode: recovered?.exitCode ?? code,
       signal,
       operatorStop: wasOperatorStop,
       longRunning,
@@ -527,7 +587,7 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         : {}),
     });
     const classification: ExitClassification =
-      adopted && code === null && signal === null && !wasOperatorStop
+      adopted && code === null && signal === null && !wasOperatorStop && recovered === undefined
         ? { ...base, title: "exited while unobserved — exit code unknown (adopted run)" }
         : base;
     finishRun(classification, forcedStopInFlight);
@@ -660,7 +720,10 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     return { ok: false, reason: "plan-failed", stage: "spawn", error };
   };
 
-  const start = async (gateOptions: GateOptions = {}): Promise<StartResult> => {
+  const start = async (
+    gateOptions: GateOptions = {},
+    internal: { readonly automatic?: boolean } = {},
+  ): Promise<StartResult> => {
     if (closed) {
       return {
         ok: false,
@@ -678,6 +741,13 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     // A manual start supersedes a scheduled auto-restart; leaving the timer
     // armed would spawn a second child moments later.
     cancelPendingRestart();
+    // …and a MANUAL start clears the rolling window. An operator who reaches
+    // for Start after a crash-loop has usually just fixed something; leaving
+    // the count at its cap would drop the very next crash straight back into
+    // `crash-looping` with no backoff ladder at all. An automatic restart
+    // must never reset it — that would make the 5-in-10-minutes rule
+    // unreachable.
+    if (internal.automatic !== true) window.reset();
     starting = true;
     let heldLock = false;
     try {
@@ -790,6 +860,11 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
             runId: id,
             startedAt,
             managerVersion,
+            // Names only — so a manager that adopts this daemon later can
+            // rebuild the same scrubber instead of seeing only the harness
+            // `.env` chain and writing process-env secrets to disk in
+            // cleartext.
+            scrubKeys: scrubbableEnvKeys(plan.env),
           });
         }
         if (options.ports !== undefined) {
@@ -895,6 +970,27 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
   };
 
   const adopt = async (): Promise<"adopted" | "lost" | "none"> => {
+    // Rebuild the spawning manager's scrubber BEFORE the pump exists, or the
+    // first drained bytes go out under the weaker `.env`-only default. The
+    // runfile carries the NAMES it scrubbed against; resolving them here
+    // against our own environment restores the strength a spawned run has.
+    // Without this, a secret held in `process.env` rather than the harness
+    // `.env` stopped being scrubbed the moment a manager restarted — and the
+    // pump wrote it in cleartext into the durable events file.
+    if (options.scrub === undefined) {
+      const runfile = readRunfile(options.harnessDir);
+      const keys = runfile?.scrubKeys ?? [];
+      if (keys.length > 0) {
+        const base: Record<string, string | undefined> = {
+          ...loadEnvChain(options.harnessDir).vars,
+        };
+        for (const key of keys) {
+          const value = process.env[key];
+          if (typeof value === "string" && base[key] === undefined) base[key] = value;
+        }
+        scrub = createEnvScrubber(base);
+      }
+    }
     const result = adoptRunning(options.harnessDir, {
       ops: options.ops,
       scrub,
@@ -908,18 +1004,41 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       // ledger-derived so callers never imply we watched it happen.
       if (lastExit === undefined) {
         const [last] = recentRuns(options.harnessDir, 1);
-        if (last !== undefined && last.endedAt !== undefined && last.exitCode !== undefined) {
-          lastExit = {
-            ...classifyExit({
-              exitCode: last.exitCode,
-              // We were not running when it ended, so we cannot claim the
-              // stop was ours; `longRunning` follows the run's kind.
-              operatorStop: false,
-              longRunning: last.kind === "daemon",
-            }),
-            fromLedger: true,
-            endedAt: last.endedAt,
-          };
+        // A closed row needs an ending, but NOT necessarily an exit code: the
+        // stale-runfile path closes a run with `failureClass: "interrupted"`
+        // and no code at all — which is precisely the case this fold exists
+        // for. Requiring a code left the failure board blank exactly when a
+        // manager had died mid-run.
+        if (last !== undefined && last.endedAt !== undefined) {
+          if (last.exitCode !== undefined) {
+            lastExit = {
+              ...classifyExit({
+                exitCode: last.exitCode,
+                // We were not running when it ended, so we cannot claim the
+                // stop was ours; `longRunning` follows the run's kind.
+                operatorStop: false,
+                longRunning: last.kind === "daemon",
+              }),
+              fromLedger: true,
+              endedAt: last.endedAt,
+            };
+          } else if (last.failureClass !== undefined) {
+            // Never restartable: we did not watch this end and have no code
+            // to judge it by, so the operator decides. `failureClass` is left
+            // unset — the ledger's marker (`interrupted`) is ours, not one of
+            // the provider classes `ExitClassification.failureClass` names.
+            lastExit = {
+              disposition: "crash",
+              title:
+                last.failureClass === "interrupted"
+                  ? "interrupted — the manager was not running when it ended"
+                  : `ended as ${last.failureClass}`,
+              restartable: false,
+              unexpectedClean: false,
+              fromLedger: true,
+              endedAt: last.endedAt,
+            };
+          }
         }
       }
       setState("stopped");

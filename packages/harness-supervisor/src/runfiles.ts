@@ -192,6 +192,16 @@ export function readRunfile(harnessDir: string): DaemonRunfile | undefined {
     runId: str("runId") ?? "",
     startedAt: str("startedAt") ?? "",
     managerVersion: str("managerVersion") ?? "",
+    // Names only — how an adopting manager rebuilds the scrubber the
+    // spawning one used. Dropping these on read is what let a
+    // `process.env`-sourced secret go unscrubbed after a restart.
+    ...(Array.isArray(r["scrubKeys"])
+      ? {
+          scrubKeys: (r["scrubKeys"] as unknown[]).filter(
+            (k): k is string => typeof k === "string",
+          ),
+        }
+      : {}),
   };
 }
 

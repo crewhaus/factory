@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EXIT_CODES } from "@crewhaus/errors";
@@ -10,10 +10,13 @@ import type { ProcessOps } from "./process-ops";
 import {
   acquireStartLock,
   appendRunLedger,
+  patchRunLedger,
   readRunLedger,
   readRunfile,
   readStartLock,
+  runCursorPath,
   runDir,
+  runEventsPath,
   runLogPath,
   writeRunfile,
 } from "./runfiles";
@@ -26,6 +29,7 @@ import {
   createFakeClock,
   createFakeProcessOps,
 } from "./testkit";
+import { replayRunEvents } from "./trace-pump";
 import { RUNFILE_VERSION } from "./types";
 
 const roots: string[] = [];
@@ -1046,5 +1050,204 @@ describe("close", () => {
     expect(h.clock.pendingCount()).toBe(0);
     expect(h.ops.last()?.signals).toEqual([]);
     expect(h.ops.last()?.alive).toBe(true);
+  });
+});
+
+describe("an adopted run's exit code is recovered, not discarded", () => {
+  test("a billing exit stays TERMINAL after a manager restart instead of auto-restarting", async () => {
+    const h = setup("channel");
+    const runId = "run_00000000000000b1";
+    foreignDaemon(h, 9931, runId);
+    // Exactly what a manager that died mid-run leaves behind: the log, the
+    // events the PREVIOUS manager's pump already extracted from it, and the
+    // cursor covering both. This run_failed line is the evidence a pid-polled
+    // exit used to throw away.
+    const logText = `starting up\n${JSON.stringify({
+      kind: "run_failed",
+      class: "billing",
+      exitCode: EXIT_CODES.billing,
+      remediation: "add credits, then rerun.",
+    })}\n`;
+    const eventsText = `${JSON.stringify({
+      kind: "run_failed",
+      class: "billing",
+      exitCode: EXIT_CODES.billing,
+      remediation: "add credits, then rerun.",
+    })}\n`;
+    writeFileSync(runLogPath(h.dir, runId), logText);
+    writeFileSync(runEventsPath(h.dir, runId), eventsText);
+    writeFileSync(
+      runCursorPath(h.dir, runId),
+      JSON.stringify({
+        logOffset: Buffer.byteLength(logText),
+        eventsBytes: Buffer.byteLength(eventsText),
+      }),
+    );
+    expect(await h.supervisor.adopt()).toBe("adopted");
+    expect(replayRunEvents(runEventsPath(h.dir, runId)).length).toBe(1);
+
+    h.ops.unregister(9931); // died while we were only polling its pid
+    h.clock.advance(250);
+    await tick();
+
+    const snap = h.supervisor.snapshot();
+    expect(snap.lastExit?.disposition).toBe("terminal");
+    expect(snap.lastExit?.failureClass).toBe("billing");
+    expect(snap.lastExit?.restartable).toBe(false);
+    // The whole point: no restart was scheduled, and none happens.
+    expect(snap.state).toBe("terminal");
+    expect(snap.nextRestartAtMs).toBeUndefined();
+    h.clock.advance(60_000);
+    await tick();
+    expect(h.supervisor.snapshot().state).toBe("terminal");
+    // The remediation the daemon supplied is still in front of the operator.
+    expect(h.supervisor.snapshot().forensics?.lastRunFailed?.["remediation"]).toBe(
+      "add credits, then rerun.",
+    );
+  });
+
+  test("with genuinely no evidence it still says the code is unknown", async () => {
+    const h = setup("channel");
+    foreignDaemon(h, 9932, "run_00000000000000b2");
+    expect(await h.supervisor.adopt()).toBe("adopted");
+    h.ops.unregister(9932);
+    h.clock.advance(250);
+    await tick();
+    expect(h.supervisor.snapshot().lastExit?.title).toContain("exit code unknown");
+  });
+});
+
+describe("the ledger-derived lastExit", () => {
+  test("fires for an INTERRUPTED row, which carries no exit code at all", async () => {
+    const h = setup("channel");
+    const runId = "run_00000000000000c1";
+    appendRunLedger(h.dir, {
+      runId,
+      kind: "daemon",
+      argv: ["bun", "dist/daemon.ts"],
+      startedAt: new Date(h.clock.now() - 5_000).toISOString(),
+      logFile: `logs/${runId}.log`,
+    });
+    // Exactly what the stale-runfile path writes: an ending, a failure
+    // class, and NO exitCode.
+    patchRunLedger(h.dir, {
+      runId,
+      endedAt: new Date(h.clock.now()).toISOString(),
+      failureClass: "interrupted",
+    });
+
+    expect(await h.supervisor.adopt()).toBe("none");
+    const snap = h.supervisor.snapshot();
+    // Used to be undefined — the failure board was blank in exactly the
+    // case this fold exists for.
+    expect(snap.lastExit).toBeDefined();
+    expect(snap.lastExit?.fromLedger).toBe(true);
+    expect(snap.lastExit?.title).toContain("interrupted");
+    expect(snap.lastExit?.restartable).toBe(false);
+  });
+});
+
+describe("the rolling restart window", () => {
+  test("a MANUAL start clears it; an automatic restart does not", async () => {
+    const h = setup("channel");
+    expect((await h.supervisor.start()).ok).toBe(true);
+
+    // Crash it enough times to exhaust the window.
+    for (let i = 0; i < 5; i += 1) {
+      h.ops.last()?.exit(1);
+      await tick();
+      h.clock.advance(60_000); // past the longest backoff
+      await tick();
+      // Each automatic restart must LEAVE the count climbing.
+      expect(h.supervisor.snapshot().restartsInWindow).toBe(i + 1);
+    }
+    h.ops.last()?.exit(1);
+    await tick();
+    expect(h.supervisor.snapshot().state).toBe("crash-looping");
+
+    // The operator intervenes. That is the one signal the loop may be over.
+    expect((await h.supervisor.start()).ok).toBe(true);
+    expect(h.supervisor.snapshot().restartsInWindow).toBe(0);
+    // …so the next crash gets the full backoff ladder again rather than
+    // dropping straight back into crash-looping.
+    h.ops.last()?.exit(1);
+    await tick();
+    expect(h.supervisor.snapshot().state).toBe("crashed");
+    expect(h.supervisor.snapshot().restartsInWindow).toBe(1);
+  });
+});
+
+describe("the scrubber survives adoption", () => {
+  test("a process-env secret stays scrubbed after a manager restart, on disk too", async () => {
+    const dir = tempHarness("channel", "HARNESS_ONLY_TOKEN=harness-side-value-1234567890\n");
+    // Lives ONLY in the manager's environment — never in the harness .env.
+    // This is the common case for a manager-launched daemon, and it is what
+    // used to stop being scrubbed the moment a manager restarted.
+    const SECRET = ["PROC", "SIDE", "FIXTURE", "VALUE", "0987654321"].join("-");
+    const clock = createFakeClock();
+    const ops = createFakeProcessOps({ now: clock.now });
+    const first = createHarnessSupervisor({
+      harnessDir: dir,
+      target: "channel",
+      ops,
+      clock,
+      plan: () =>
+        buildSpawnPlan({
+          harnessDir: dir,
+          target: "channel",
+          processEnv: { SECRET_IN_PROCESSENV: SECRET },
+        }),
+      gate: allowGate,
+      newRunId: () => "run_00000000000000d1",
+    });
+    expect((await first.start()).ok).toBe(true);
+    ops
+      .last()
+      ?.writeLog(
+        `${JSON.stringify({ kind: "tool_result", runId: "run_00000000000000d1", value: SECRET })}\n`,
+      );
+    first.pumpNow();
+
+    const runId = "run_00000000000000d1";
+    // Spawned run: scrubbed, and the runfile records the NAMES (never values).
+    expect(readFileSync(runEventsPath(dir, runId), "utf8")).not.toContain(SECRET);
+    const runfile = readRunfile(dir);
+    expect(runfile?.scrubKeys).toContain("SECRET_IN_PROCESSENV");
+    expect(JSON.stringify(runfile)).not.toContain(SECRET);
+    first.close();
+
+    // The manager restarts. Same machine, so the value is in ITS env too.
+    process.env["SECRET_IN_PROCESSENV"] = SECRET;
+    try {
+      const second = createHarnessSupervisor({
+        harnessDir: dir,
+        target: "channel",
+        ops,
+        clock: createFakeClock(clock.now()),
+        plan: () => buildSpawnPlan({ harnessDir: dir, target: "channel", processEnv: {} }),
+        gate: allowGate,
+      });
+      expect(await second.adopt()).toBe("adopted");
+      const seen: string[] = [];
+      second.subscribe((event) => {
+        if (event.type === "output") seen.push(event.prose, JSON.stringify(event.events));
+      });
+      ops
+        .last()
+        ?.writeLog(
+          `${JSON.stringify({ kind: "tool_result", runId: "run_00000000000000d1", value: SECRET })}\nbye\n`,
+        );
+      second.pumpNow();
+
+      // The live feed is still clean …
+      expect(seen.join("")).not.toContain(SECRET);
+      expect(seen.join("")).toContain("«SECRET_IN_PROCESSENV»");
+      // … and so is the DURABLE events file, which is the part that used to
+      // persist the credential in cleartext.
+      expect(readFileSync(runEventsPath(dir, runId), "utf8")).not.toContain(SECRET);
+      second.close();
+    } finally {
+      process.env["SECRET_IN_PROCESSENV"] = undefined;
+    }
   });
 });

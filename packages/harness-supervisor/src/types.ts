@@ -129,6 +129,21 @@ export type DaemonRunfile = {
   /** The manager version that wrote this runfile (mixed-version fleets are
    *  the normal case, so every record is version-stamped). */
   readonly managerVersion: string;
+  /**
+   * NAMES (never values) of the environment variables the spawning manager
+   * scrubbed this run's output against.
+   *
+   * A spawned run scrubs against the full merged spawn env; a run ADOPTED by
+   * a later manager could only see the harness `.env` chain, so any secret
+   * that lived in `process.env` — the common case for a manager-launched
+   * daemon — silently stopped being scrubbed and was written in cleartext
+   * into the durable events file. Recording the names lets an adopting
+   * manager rebuild an equivalent scrubber by resolving them against its own
+   * environment. Values are NEVER persisted here; a name whose value the new
+   * manager does not hold simply cannot be scrubbed, which is still strictly
+   * better than dropping names it does hold.
+   */
+  readonly scrubKeys?: readonly string[];
 };
 
 /** How far apart two start-time readings may be and still count as the same

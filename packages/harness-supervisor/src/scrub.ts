@@ -110,6 +110,35 @@ export function createEnvScrubber(
   };
 }
 
+/**
+ * The env-variable NAMES `createEnvScrubber` would actually scrub for a given
+ * env — i.e. those whose value is long enough, not allow-listed, and not
+ * obviously non-secret.
+ *
+ * Persisted (names only) in the runfile so a manager that ADOPTS a running
+ * daemon can rebuild an equivalent scrubber instead of falling back to the
+ * harness `.env` chain alone and leaking `process.env`-sourced secrets into
+ * the durable events file.
+ */
+export function scrubbableEnvKeys(
+  vars: Readonly<Record<string, string | undefined>>,
+  options: EnvScrubberOptions = {},
+): string[] {
+  const minLength = options.minLength ?? MIN_SCRUBBED_VALUE_LENGTH;
+  const allow = new Set<string>(NON_SECRET_ENV_KEYS);
+  for (const k of options.allowKeys ?? []) allow.add(k);
+  const keys: string[] = [];
+  for (const [name, value] of Object.entries(vars)) {
+    if (typeof value !== "string") continue;
+    if (allow.has(name)) continue;
+    const trimmed = value.trim();
+    if (trimmed.length < minLength) continue;
+    if (NON_SECRET_VALUE_RE.test(trimmed)) continue;
+    keys.push(name);
+  }
+  return keys.sort();
+}
+
 /** Chain scrubbers left to right; the identity scrubber when empty. */
 export function composeScrubbers(...scrubbers: readonly Scrubber[]): Scrubber {
   const active = scrubbers.filter((s) => typeof s === "function");
