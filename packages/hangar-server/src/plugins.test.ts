@@ -377,3 +377,22 @@ describe("GET /api/plugins, /api/plugins/:name/panes/:paneId and /api/h/:id/pane
     }
   }, 20_000);
 });
+
+describe("pane scoping speaks the glob's alphabet on both sides", () => {
+  // Provable on ANY platform: feed the Windows-shaped strings directly.
+  // `matchesGlob` defines `*`/`**` over `/`, so a backslash target OR a
+  // backslash pattern matches nothing — and the failure is silent (no pane),
+  // which is why it survived until a Windows runner existed.
+  test("a backslash target and a backslash pattern both still match", () => {
+    const winDir = "C:\\Users\\op\\harnesses\\paned";
+    const winRoot = "C:\\Users\\op\\harnesses";
+    expect(pluginSeesHarness({ fs: [`read:${winRoot}/**`] }, winDir)).toBe(true);
+    expect(pluginSeesHarness({ fs: [`read:${winRoot}\\**`] }, winDir)).toBe(true);
+    expect(pluginSeesHarness({ fs: ["read:C:/Users/op/harnesses/**"] }, winDir)).toBe(true);
+    // …and a plugin scoped elsewhere still gets nothing.
+    expect(pluginSeesHarness({ fs: ["read:C:\\Users\\other\\**"] }, winDir)).toBe(false);
+    // POSIX behaviour is unchanged.
+    expect(pluginSeesHarness({ fs: ["read:/h/**"] }, "/h/one")).toBe(true);
+    expect(pluginSeesHarness({ fs: ["read:/other/**"] }, "/h/one")).toBe(false);
+  });
+});

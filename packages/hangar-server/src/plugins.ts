@@ -199,18 +199,23 @@ export function pluginSeesHarness(
   permissions: PluginPermissions | undefined,
   harnessDir: string,
 ): boolean {
-  // `matchesGlob`'s pattern language is defined with `/` — a plugin manifest
-  // writes `read:…/harnesses/**` whatever platform it runs on — so the TARGET
-  // has to speak the same alphabet. Passing a Windows path here matched
-  // nothing at all, which failed closed (no pane, rather than a pane on a
-  // harness the plugin may not read) but silently disabled every plugin.
-  // Normalized at the call site rather than inside `matchesGlob`, whose
+  // `matchesGlob`'s pattern language is defined with `/` (`*` = anything but
+  // `/`, `**` = anything), so BOTH SIDES have to speak that alphabet. On
+  // Windows the target is `C:\…\paned` and a manifest generated from a real
+  // path carries `read:C:\…\harnesses/**` — normalizing only one side still
+  // matches nothing, which failed closed (no pane) and silently disabled
+  // every plugin. Normalized here rather than inside `matchesGlob`, whose
   // semantics other consumers depend on.
-  const posix = harnessDir.replace(/\\/g, "/");
+  const toPosix = (p: string): string => p.replace(/\\/g, "/");
+  const posix = toPosix(harnessDir);
+  const normalized: PluginPermissions | undefined =
+    permissions?.fs === undefined
+      ? permissions
+      : { ...permissions, fs: permissions.fs.map(toPosix) };
   return (
-    isFsAllowed(permissions, "read", posix) ||
-    isFsAllowed(permissions, "read", `${posix}/`) ||
-    isFsAllowed(permissions, "read", `${posix}/crewhaus.yaml`)
+    isFsAllowed(normalized, "read", posix) ||
+    isFsAllowed(normalized, "read", `${posix}/`) ||
+    isFsAllowed(normalized, "read", `${posix}/crewhaus.yaml`)
   );
 }
 
