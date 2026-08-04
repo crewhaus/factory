@@ -5,7 +5,13 @@ import type {
   IrSlackConfig,
   IrTelegramConfig,
 } from "@crewhaus/ir";
-import { parseModelString } from "@crewhaus/model-router";
+import {
+  CHANNEL_PLATFORMS,
+  type ChannelPlatform,
+  type PreflightCheck,
+  channelEnvChecks,
+  describeSecretRef,
+} from "@crewhaus/preflight";
 
 /**
  * Item 61 — `crewhaus channel provision|verify`: one-command channel app
@@ -62,36 +68,32 @@ import { parseModelString } from "@crewhaus/model-router";
 // Shared plumbing
 // ---------------------------------------------------------------------------
 
-/** Platforms with a PLATFORM-SIDE flow `channel provision|verify` drives.
- *  whatsapp (Meta app config lives in the Meta developer console) and
- *  imessage (host-local chat.db — there is no platform side to provision)
- *  have no such flow; when a spec configures them the CLI prints a note
- *  instead of failing. Their boot-gate env refs ARE still checked by
- *  `verify` — see {@link CHANNEL_ENV_PLATFORMS}. */
-export const CHANNEL_PLATFORMS = ["slack", "telegram", "discord"] as const;
-export type ChannelPlatform = (typeof CHANNEL_PLATFORMS)[number];
+// The channel BOOT-GATE core (the platform lists, per-field secret-ref
+// derivation, and the offline env checks the compiled daemon's own startup
+// check mirrors) moved to `@crewhaus/preflight` so any manager can predict
+// daemon boot without the network. These re-exports keep this module the
+// CLI's import surface — every `./channel-provision` importer keeps working
+// unchanged. whatsapp (Meta app config lives in the Meta developer console)
+// and imessage (host-local chat.db) have no platform-side provision/probe
+// flow; when a spec configures them the CLI prints a note instead of
+// failing. Their boot-gate env refs ARE still checked by `verify` — the
+// CHANNEL_ENV_PLATFORMS list covers all five, so "verify is green" and "the
+// daemon boots" cannot drift apart.
+export {
+  CHANNEL_ENV_PLATFORMS,
+  CHANNEL_PLATFORMS,
+  type ChannelEnvPlatform,
+  type ChannelPlatform,
+  type ChannelSecretRefEntry,
+  channelEnvChecks,
+  modelCredentialChecks,
+  modelCredentialGroups,
+  platformSecretRefs,
+} from "@crewhaus/preflight";
 
 /** Channels with no platform-side provision/probe flow. */
 export const CHANNEL_UNPROBED_PLATFORMS = ["whatsapp", "imessage"] as const;
 export type ChannelUnprobedPlatform = (typeof CHANNEL_UNPROBED_PLATFORMS)[number];
-
-/**
- * Every channel whose secret fields the compiled daemon gates its boot on
- * (target-channel-bot's `requiredEnvNames` covers all five, not just the
- * three with a platform API). `verify`'s boot-gate phase walks THIS list, so
- * "verify is green" and "the daemon boots" cannot drift apart — the earlier
- * split checked only what it could also probe, which left DISCORD_APP_ID and
- * DISCORD_PUBLIC_KEY (and both no-probe channels) unchecked while the daemon
- * exited 2 on them.
- */
-export const CHANNEL_ENV_PLATFORMS = [
-  "slack",
-  "telegram",
-  "discord",
-  "whatsapp",
-  "imessage",
-] as const;
-export type ChannelEnvPlatform = (typeof CHANNEL_ENV_PLATFORMS)[number];
 
 export type FetchLike = typeof fetch;
 
@@ -192,10 +194,9 @@ export function resolveSecretRef(label: string, ref: IrSecretRef, env: NodeJS.Pr
 }
 
 /** Printable form of a secret ref: `$NAME` for env-refs (the indirection is
- *  not a secret), {@link REDACTED_LITERAL} for inline literals. */
-export function describeSecretRef(ref: IrSecretRef): string {
-  return ref.kind === "env" ? `$${ref.name}` : REDACTED_LITERAL;
-}
+ *  not a secret), {@link REDACTED_LITERAL} for inline literals. Moved to
+ *  `@crewhaus/preflight` with the boot-gate core; re-exported here. */
+export { describeSecretRef } from "@crewhaus/preflight";
 
 /** The daemon route the platform must deliver webhooks to. Single source:
  *  target-channel-bot's gateway matches `/^\/([^/]+)\/events$/` and looks the
@@ -242,163 +243,13 @@ function collectMissing(
   return missing;
 }
 
-/** One boot-gated secret field: its spec path (`label`), the human `title`
- *  used as a check label, and the lowered ref. */
-export type ChannelSecretRefEntry = {
-  readonly label: string;
-  readonly title: string;
-  readonly ref: IrSecretRef;
-};
-
-/**
- * The secret fields a platform's daemon REQUIRES at boot — a mirror of
- * target-channel-bot's `requiredEnvNames`, field for field:
- *   slack     botToken + signingSecret (appToken is reserved for a future
- *             Socket-Mode path — parsed but unused, so not required)
- *   telegram  botToken + secretToken
- *   discord   applicationId + botToken + publicKeyHex
- *   whatsapp  phoneNumberId + accessToken + appSecret (+ verifyToken once
- *             declared — Meta's callback handshake fails closed without it)
- *   imessage  chatDbPath / cursorPath, ONLY when written as env refs (both
- *             are optional paths, not secrets: a literal is a legitimate
- *             spec value the daemon never gates on)
- * Shared by the doctor channel check and `verify`'s boot-gate phase. A
- * parity test compiles a five-channel spec and asserts this set equals the
- * emitted daemon's `__requiredEnv`, so the mirror cannot silently drift.
- */
-export function platformSecretRefs(
-  platform: ChannelEnvPlatform,
-  channels: IrChannels,
-): ReadonlyArray<ChannelSecretRefEntry> {
-  switch (platform) {
-    case "slack": {
-      const slack = channels.slack;
-      if (slack === undefined) return [];
-      return [
-        { label: "channels.slack.botToken", title: "Slack bot token", ref: slack.botToken },
-        {
-          label: "channels.slack.signingSecret",
-          title: "Slack signing secret",
-          ref: slack.signingSecret,
-        },
-      ];
-    }
-    case "telegram": {
-      const telegram = channels.telegram;
-      if (telegram === undefined) return [];
-      return [
-        {
-          label: "channels.telegram.botToken",
-          title: "Telegram bot token",
-          ref: telegram.botToken,
-        },
-        {
-          label: "channels.telegram.secretToken",
-          title: "Telegram secret token (daemon side; Telegram never returns it)",
-          ref: telegram.secretToken,
-        },
-      ];
-    }
-    case "discord": {
-      const discord = channels.discord;
-      if (discord === undefined) return [];
-      return [
-        {
-          label: "channels.discord.applicationId",
-          title: "Discord application id",
-          ref: discord.applicationId,
-        },
-        { label: "channels.discord.botToken", title: "Discord bot token", ref: discord.botToken },
-        {
-          label: "channels.discord.publicKeyHex",
-          title: "Discord public key",
-          ref: discord.publicKeyHex,
-        },
-      ];
-    }
-    case "whatsapp": {
-      const whatsapp = channels.whatsapp;
-      if (whatsapp === undefined) return [];
-      const entries: ChannelSecretRefEntry[] = [
-        {
-          label: "channels.whatsapp.phoneNumberId",
-          title: "WhatsApp phone number id",
-          ref: whatsapp.phoneNumberId,
-        },
-        {
-          label: "channels.whatsapp.accessToken",
-          title: "WhatsApp access token",
-          ref: whatsapp.accessToken,
-        },
-        {
-          label: "channels.whatsapp.appSecret",
-          title: "WhatsApp app secret",
-          ref: whatsapp.appSecret,
-        },
-      ];
-      if (whatsapp.verifyToken !== undefined) {
-        entries.push({
-          label: "channels.whatsapp.verifyToken",
-          title: "WhatsApp verify token",
-          ref: whatsapp.verifyToken,
-        });
-      }
-      return entries;
-    }
-    case "imessage": {
-      const imessage = channels.imessage;
-      if (imessage === undefined) return [];
-      const entries: ChannelSecretRefEntry[] = [];
-      if (imessage.chatDbPath?.kind === "env") {
-        entries.push({
-          label: "channels.imessage.chatDbPath",
-          title: "iMessage chat.db path",
-          ref: imessage.chatDbPath,
-        });
-      }
-      if (imessage.cursorPath?.kind === "env") {
-        entries.push({
-          label: "channels.imessage.cursorPath",
-          title: "iMessage cursor path",
-          ref: imessage.cursorPath,
-        });
-      }
-      return entries;
-    }
-  }
-}
-
-/**
- * The provider-credential EITHER-OR groups the compiled daemon gates its
- * boot on — a mirror of target-channel-bot's `providerEnvGroups`, which
- * derives them from `agent.model` at emit time. At least one name per group
- * must be set or the daemon exits 2 before it ever serves a webhook, so a
- * channel pre-flight that ignored them would still green-light a daemon
- * that cannot start.
- *
- * bedrock (the AWS SDK's default credential chain is authoritative), local
- * endpoints (URL baked into the model string), and model strings outside the
- * router grammar contribute NO group — exactly like the emitter.
- */
-export function modelCredentialGroups(model: string): ReadonlyArray<ReadonlyArray<string>> {
-  let parsed: ReturnType<typeof parseModelString>;
-  try {
-    parsed = parseModelString(model);
-  } catch {
-    return [];
-  }
-  switch (parsed.providerId) {
-    case "anthropic":
-      return [["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]];
-    case "openai":
-      // local/<m>@<url> parses to openai WITH a baked baseUrl — no creds.
-      return parsed.baseUrl !== undefined ? [] : [["OPENAI_API_KEY", "OPENAI_BASE_URL"]];
-    case "gemini":
-      return [["GEMINI_API_KEY", "GOOGLE_API_KEY"]];
-    default:
-      return [];
-  }
-}
+// (The per-field secret-ref derivation `platformSecretRefs` — the mirror of
+// target-channel-bot's `requiredEnvNames`, field for field — and the
+// provider-credential EITHER-OR groups `modelCredentialGroups` — the mirror
+// of its `providerEnvGroups` — now live in `@crewhaus/preflight` and are
+// re-exported above. The parity test against the emitted daemon's
+// `__requiredEnv` stays in channel-provision.test.ts, so the mirror still
+// cannot silently drift.)
 
 // ---------------------------------------------------------------------------
 // Slack — app manifest generation (emit-and-instruct; see header for the
@@ -927,14 +778,10 @@ export function collectProvisionMissingEnv(
 // ---------------------------------------------------------------------------
 
 /** Shape shared with `index.ts`'s DoctorCheck and audit-verify's
- *  AuditIntegrityCheck (label/pass/warn/reason). */
-export type ChannelCheck = {
-  readonly label: string;
-  readonly pass: boolean;
-  /** warn+pass renders as "~" — informational, never fails verify. */
-  readonly warn?: boolean;
-  readonly reason?: string;
-};
+ *  AuditIntegrityCheck (label/pass/warn/reason; warn+pass renders as "~" —
+ *  informational, never fails verify). Identical to preflight's
+ *  `PreflightCheck`, which the re-exported boot-gate checks return. */
+export type ChannelCheck = PreflightCheck;
 
 export type ChannelVerifyOptions = {
   readonly env: NodeJS.ProcessEnv;
@@ -949,58 +796,10 @@ export type ChannelVerifyOptions = {
   readonly offline?: boolean;
 };
 
-function envRefCheck(entry: ChannelSecretRefEntry, env: NodeJS.ProcessEnv): ChannelCheck {
-  const { title: label, label: fieldLabel, ref } = entry;
-  if (ref.kind === "literal") {
-    return {
-      label,
-      pass: true,
-      warn: true,
-      reason: `${fieldLabel} is an inline literal — prefer a $ENV ref so the value stays out of the spec`,
-    };
-  }
-  const set = env[ref.name] !== undefined && env[ref.name] !== "";
-  return set
-    ? { label, pass: true }
-    : {
-        label,
-        pass: false,
-        reason: `${fieldLabel} references $${ref.name} but it is unset — the daemon exits at boot without it`,
-      };
-}
-
-/**
- * The boot-gate phase for one channel: a check per secret field the compiled
- * daemon requires at boot. Pure (env only) and therefore deterministic —
- * this is everything `--offline` runs, and the prefix every online run
- * starts with.
- */
-export function channelEnvChecks(
-  platform: ChannelEnvPlatform,
-  channels: IrChannels,
-  env: NodeJS.ProcessEnv,
-): ChannelCheck[] {
-  return platformSecretRefs(platform, channels).map((entry) => envRefCheck(entry, env));
-}
-
-/**
- * The daemon's provider-credential gate as a check (see
- * {@link modelCredentialGroups}). Returns [] when the model contributes no
- * group, so bedrock/local specs gain no spurious failure.
- */
-export function modelCredentialChecks(model: string, env: NodeJS.ProcessEnv): ChannelCheck[] {
-  return modelCredentialGroups(model).map((group) => {
-    const satisfied = group.some((name) => env[name] !== undefined && env[name] !== "");
-    const names = group.join(" or ");
-    return satisfied
-      ? { label: `Agent model credentials (${model}: ${names})`, pass: true }
-      : {
-          label: `Agent model credentials (${model})`,
-          pass: false,
-          reason: `none of ${names} is set — the daemon exits at boot before it serves any channel`,
-        };
-  });
-}
+// (The boot-gate phase for one channel — `channelEnvChecks`, everything
+// `--offline` runs and the prefix every online run starts with — and the
+// daemon's provider-credential gate `modelCredentialChecks` now live in
+// `@crewhaus/preflight` and are re-exported above, message-identical.)
 
 /**
  * Slack: the boot-gate env refs (bot token + signing secret), then — unless

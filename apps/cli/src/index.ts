@@ -113,6 +113,11 @@ import {
   warnUnconsumedCombinePolicy,
 } from "@crewhaus/eval-runner";
 import { openEventLog } from "@crewhaus/event-log";
+// Hangar F-1 — best-effort harness self-registration: run/compile/eval/dev
+// record the cwd in the machine-wide registry (`~/.crewhaus/harnesses.json`)
+// after a spec resolves. The hook never throws and honours
+// CREWHAUS_NO_REGISTRY=1, so call sites need no try/catch.
+import { registerHarnessHook } from "@crewhaus/harness-registry";
 import { loadHooks, runHooks } from "@crewhaus/hooks-engine";
 import {
   ArgParseError,
@@ -735,17 +740,21 @@ import {
 // per-harness `crewhaus` invocations through an injected seam.
 import {
   type BuildInventoryDeps,
+  type BulkRunResult,
   type EvalHealthReader,
   FleetError,
   type FleetRunner,
   type HarnessInventory,
   type LastEvalEntry,
+  type RunFleetBulkReport,
   buildFleetInventory,
   buildHarnessHealth,
   fleetSelfInvokeArgv,
   formatBulkReport,
   formatInventory as formatFleetInventory,
   formatHealth,
+  matchesFilter,
+  resolveBulkCommand,
   runFleetBulk,
 } from "./fleet";
 // Item 45 — `crewhaus flywheel init|run`: the packaged nightly
@@ -1565,6 +1574,79 @@ function parseFor(rest: ReadonlyArray<string>, schema: ParseArgsSchema): ParsedA
   }
 }
 
+/**
+ * Hangar F-1 — best-effort harness self-registration: record that a command
+ * touched the harness rooted at the CWD (the standalone-harness convention's
+ * harness root, NOT the spec file's directory when the two differ) in the
+ * machine-wide registry, origin `run-hook`. `registerHarnessHook` never
+ * throws and honours CREWHAUS_NO_REGISTRY, so callers need no try/catch.
+ *
+ * Ephemeral-cwd guard: under the DEFAULT registry root, a cwd inside the OS
+ * temp directory is skipped — compiles/runs against temp fixtures (`bun
+ * test` drives dozens per suite, scratch experiments more) would otherwise
+ * fill the real `~/.crewhaus/harnesses.json` with guaranteed-dead rows the
+ * registry never auto-prunes. An explicit CREWHAUS_REGISTRY_ROOT means the
+ * caller took control of registry placement (a test, a sandboxed manager),
+ * so every cwd registers there.
+ */
+function registerHarnessCwd(fields: {
+  readonly specName?: string;
+  readonly target?: string;
+  readonly originDetail: "run" | "compile" | "eval" | "dev";
+}): void {
+  const dir = process.cwd();
+  const explicitRoot = process.env["CREWHAUS_REGISTRY_ROOT"];
+  if (explicitRoot === undefined || explicitRoot === "") {
+    // The guard cannot rely on tmpdir() alone: it follows $TMPDIR, which a
+    // spawned child often lacks, while the cwd may live under the parent's
+    // per-user temp. So compare against tmpdir() (both spellings — macOS's
+    // is a /var → /private/var symlink while process.cwd() is physical) AND
+    // the canonical POSIX temp roots (/tmp; macOS's per-user /var/folders).
+    // The literals never match on Windows, where tmpdir() (TEMP/TMP) rules.
+    const tempRoots = new Set<string>([
+      tmpdir(),
+      "/tmp",
+      "/private/tmp",
+      "/var/folders",
+      "/private/var/folders",
+    ]);
+    try {
+      tempRoots.add(realpathSync(tmpdir()));
+    } catch {
+      // tmpdir unresolvable — the literal spellings still guard
+    }
+    if ([...tempRoots].some((t) => dir === t || dir.startsWith(`${t}${sep}`))) return;
+  }
+  registerHarnessHook({
+    dir,
+    ...(fields.specName !== undefined ? { specName: fields.specName } : {}),
+    ...(fields.target !== undefined ? { target: fields.target } : {}),
+    originDetail: fields.originDetail,
+  });
+}
+
+/**
+ * The {@link registerHarnessCwd} entry for command paths that hold only the
+ * spec TEXT. Parses tolerantly: an unparseable spec registers nothing (the
+ * command surfaces the real error itself).
+ */
+function registerHarnessTouch(yamlText: string, originDetail: "compile"): void {
+  let name: string | undefined;
+  let target: string | undefined;
+  try {
+    const spec = parseSpec(yamlText) as unknown as { name?: unknown; target?: unknown };
+    name = typeof spec.name === "string" ? spec.name : undefined;
+    target = typeof spec.target === "string" ? spec.target : undefined;
+  } catch {
+    return; // the spec did not resolve — nothing to register
+  }
+  registerHarnessCwd({
+    ...(name !== undefined ? { specName: name } : {}),
+    ...(target !== undefined ? { target } : {}),
+    originDetail,
+  });
+}
+
 async function runCompile(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -1744,6 +1826,12 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   } catch (err) {
     die(`could not read ${absSpec}: ${(err as Error).message}`);
   }
+
+  // Hangar F-1 — self-register the harness the moment its spec resolves,
+  // ahead of the mode branches below so every compile flavour (bundle,
+  // --emit-ir, --emit-loop) records the touch. Skips silently when the spec
+  // does not parse — the pipeline below surfaces the real error.
+  registerHarnessTouch(yamlText, "compile");
 
   // FR-006 — `security.egressMatcher: semantic` is now emitted into the
   // standalone cli bundle by `@crewhaus/target-cli` (it constructs
@@ -3627,6 +3715,11 @@ async function runRun(args: ParsedArgs): Promise<void> {
     throw err;
   }
 
+  // Hangar F-1 — the spec resolved: self-register the cwd (the harness root
+  // per the standalone-harness convention) in the machine-wide registry.
+  // Never throws; CREWHAUS_NO_REGISTRY=1 opts out.
+  registerHarnessCwd({ specName: ir.name, target: ir.target, originDetail: "run" });
+
   // Loop contract 0.4 (Batch C, G26) — apply the run's observability toggles to
   // the env the runtime's subscriber layer reads, mirroring what a compiled
   // bundle stamps at boot (cost-on-by-default; trace printer for pretty/json).
@@ -4901,7 +4994,7 @@ function devCompileAndEmit(
   absSpec: string,
   pluginsOverride?: readonly string[],
 ):
-  | { readonly ok: true; readonly cwd: string; readonly target: string }
+  | { readonly ok: true; readonly cwd: string; readonly target: string; readonly specName: string }
   | { readonly ok: false; readonly error: string } {
   let yamlText: string;
   try {
@@ -4924,9 +5017,12 @@ function devCompileAndEmit(
   }
   let bundle: ReturnType<typeof compile>;
   let target: string;
+  let specName: string;
   try {
     bundle = compile(yamlText, { readme: false });
-    target = lower(parseSpec(yamlText)).target;
+    const devIr = lower(parseSpec(yamlText));
+    target = devIr.target;
+    specName = devIr.name;
   } catch (err) {
     return {
       ok: false,
@@ -4939,7 +5035,7 @@ function devCompileAndEmit(
     mkdirSync(dirname(full), { recursive: true });
     writeFileSync(full, file.content);
   }
-  return { ok: true, cwd, target };
+  return { ok: true, cwd, target, specName };
 }
 
 /**
@@ -5021,6 +5117,14 @@ async function runDev(args: ParsedArgs): Promise<void> {
   // nothing is launched.
   const initial = devCompileAndEmit(absSpec, pluginsOverride);
   if (!initial.ok) die(`dev: ${initial.error}`);
+  // Hangar F-1 — the spec compiled, so it resolved: self-register the cwd
+  // (the harness root, not the throwaway temp dir the child runs in). Never
+  // throws; CREWHAUS_NO_REGISTRY=1 opts out.
+  registerHarnessCwd({
+    specName: initial.specName,
+    target: initial.target,
+    originDetail: "dev",
+  });
   const target = initial.target;
   const entry = devEntrypointFor(target);
   const childEnv = devChildEnv();
@@ -9113,6 +9217,10 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     if (err instanceof SpecParseError) die(err.message);
     throw err;
   }
+  // Hangar F-1 — the spec resolved: self-register the cwd (the harness root
+  // per the standalone-harness convention) in the machine-wide registry.
+  // Never throws; CREWHAUS_NO_REGISTRY=1 opts out.
+  registerHarnessCwd({ specName: ir.name, target: ir.target, originDetail: "eval" });
   if (ir.target !== "cli") {
     die(`crewhaus eval only supports target: cli (got "${ir.target}")`);
   }
@@ -15567,14 +15675,16 @@ async function runFleet(args: ParsedArgs, action: string): Promise<void> {
   if (args.flags["help"] || action === "") {
     process.stdout.write(
       "usage:\n" +
-        "  crewhaus fleet list [--root <dir>]                  cross-harness inventory\n" +
-        "  crewhaus fleet status [--root <dir>]                per-harness health rollup\n" +
-        "  crewhaus fleet run <sub> [--filter <glob>] [--root <dir>]\n" +
+        "  crewhaus fleet list [--root <dir>] [--group <name>]  cross-harness inventory\n" +
+        "  crewhaus fleet status [--root <dir>] [--group <name>]  per-harness health rollup\n" +
+        "  crewhaus fleet run <sub> [--filter <glob>] [--group <name>] [--root <dir>]\n" +
         "                                                     bulk-run a read-only subcommand\n" +
         "         [--allow-mutating] [--yes]                  across the filtered fleet\n" +
         "\n" +
         "  A harness is any directory carrying a crewhaus.yaml (the standalone-harness\n" +
         "  convention). Discovery skips .crewhaus/, node_modules/, .git/, dist/.\n" +
+        "  --group <name> keeps only harnesses whose machine-registry entry carries the\n" +
+        "  group (manage membership with `crewhaus harness group`).\n" +
         "  Read-only bulk subcommands: eval, doctor, security digest, audit verify.\n" +
         "  A mutating subcommand requires --allow-mutating and per-harness confirmation.\n",
     );
@@ -15613,14 +15723,50 @@ async function runFleet(args: ParsedArgs, action: string): Promise<void> {
 
   const deps: BuildInventoryDeps = { readManifest, readEvalIndex };
 
+  // Hangar F-2 — `--group <name>`: restrict the discovered set to harnesses
+  // whose machine-registry entry carries the group (membership is
+  // user-managed via `crewhaus harness group`). Discovery still walks the
+  // filesystem; rows whose dir has no in-group registry entry drop out.
+  const groupFlag = args.flags["group"];
+  let inGroup: ((dir: string) => boolean) | undefined;
+  if (typeof groupFlag === "string") {
+    const { openHangarRegistry } = await import("@crewhaus/harness-registry");
+    const memberDirs = new Set(
+      openHangarRegistry()
+        .list()
+        .filter((e) => e.groups.includes(groupFlag))
+        .map((e) => e.dir),
+    );
+    inGroup = (dir: string): boolean => memberDirs.has(resolve(dir));
+  }
+
+  // A group filter that empties a non-empty discovery must say so — the
+  // package's zero-row message ("no crewhaus.yaml found") would be wrong.
+  const emptiedByGroup = (filteredCount: number, discoveredCount: number): boolean =>
+    inGroup !== undefined && filteredCount === 0 && discoveredCount > 0;
+
   try {
     if (action === "list") {
-      const rows = await buildFleetInventory(root, deps);
+      const discovered = await buildFleetInventory(root, deps);
+      const rows = discovered.filter((r) => inGroup === undefined || inGroup(r.dir));
+      if (emptiedByGroup(rows.length, discovered.length)) {
+        process.stdout.write(
+          `no harnesses under ${resolve(root)} are in group "${groupFlag}" (${discovered.length} discovered — manage membership with \`crewhaus harness group\`)\n`,
+        );
+        return;
+      }
       for (const line of formatFleetInventory(rows, root)) process.stdout.write(`${line}\n`);
       return;
     }
     if (action === "status") {
-      const rows = await buildFleetInventory(root, deps);
+      const discovered = await buildFleetInventory(root, deps);
+      const rows = discovered.filter((r) => inGroup === undefined || inGroup(r.dir));
+      if (emptiedByGroup(rows.length, discovered.length)) {
+        process.stdout.write(
+          `no harnesses under ${resolve(root)} are in group "${groupFlag}" (${discovered.length} discovered — manage membership with \`crewhaus harness group\`)\n`,
+        );
+        return;
+      }
       // Eval health: the last run for a (spec, its pinned dataset) baseline
       // held or beat the baseline's pass rate. No baseline yet → healthy (a
       // fresh harness isn't "attention"); a last run below the pinned
@@ -15705,15 +15851,51 @@ async function runFleet(args: ParsedArgs, action: string): Promise<void> {
         );
       };
 
-      const report = await runFleetBulk({
-        root,
-        subcommandTokens: tokens,
-        ...(filter !== undefined ? { filter } : {}),
-        allowMutating,
-        deps,
-        runner,
-        confirm,
-      });
+      let report: RunFleetBulkReport;
+      if (inGroup === undefined) {
+        report = await runFleetBulk({
+          root,
+          subcommandTokens: tokens,
+          ...(filter !== undefined ? { filter } : {}),
+          allowMutating,
+          deps,
+          runner,
+          confirm,
+        });
+      } else {
+        // Hangar F-2 — `fleet run --group`: runFleetBulk discovers its own
+        // inventory and exposes no membership seam, so the group case
+        // composes the SAME exported pieces (plan resolution, inventory,
+        // glob filter, runner/confirm seams, report shape) around a
+        // pre-filtered row set. Group non-members are dropped before the
+        // loop (not reported as skipped — they were never candidates).
+        const plan = resolveBulkCommand(tokens, allowMutating);
+        const inventory = (await buildFleetInventory(root, deps)).filter((inv) => inGroup(inv.dir));
+        const results: BulkRunResult[] = [];
+        let failed = 0;
+        let passed = 0;
+        let skipped = 0;
+        for (const inv of inventory) {
+          if (!matchesFilter(inv, filter)) {
+            results.push({ inv, ran: false, skipReason: "filtered out" });
+            skipped += 1;
+            continue;
+          }
+          if (plan.mutating) {
+            const ok = await confirm(inv, plan.argv);
+            if (!ok) {
+              results.push({ inv, ran: false, skipReason: "declined at confirm" });
+              skipped += 1;
+              continue;
+            }
+          }
+          const { exitCode, tail } = await runner({ cwd: inv.dir, argv: plan.argv });
+          results.push({ inv, ran: true, exitCode, tail });
+          if (exitCode === 0) passed += 1;
+          else failed += 1;
+        }
+        report = { plan, results, failed, passed, skipped };
+      }
       for (const line of formatBulkReport(report)) process.stdout.write(`${line}\n`);
       if (report.failed > 0) process.exit(1);
       return;
@@ -21232,6 +21414,23 @@ switch (subcommand) {
       die(`fleet action must be one of: list, status, run (got "${action}")`);
     }
     await runFleet(parseFor(rest.slice(1), FLEET_SCHEMA), action);
+    break;
+  }
+  case "harness": {
+    // Hangar M1 — the harness manager verb family over the machine-wide
+    // registry (list/show/add/remove/relocate/group/tag/pin/scan/preflight).
+    // Heavy lifting lives in the side-effect-free ./harness-cmd module (this
+    // entry file runs an argv switch on import); it throws plain Errors on
+    // bad arguments, routed through die() like `route`.
+    try {
+      const { runHarnessCommand } = await import("./harness-cmd");
+      const out = await runHarnessCommand(rest);
+      for (const line of out.lines) process.stdout.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
     break;
   }
   case "knowledge": {

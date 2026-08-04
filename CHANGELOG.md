@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Three new packages carry the harness manager's library layers.**
+  `@crewhaus/harness-registry` is the machine-wide registry file layer — one
+  `harnesses.json` (format v2) under the registry root
+  (`CREWHAUS_REGISTRY_ROOT`, default `~/.crewhaus`) listing every registered
+  harness with a stable `hrn_` id plus user-managed groups/tags/pins, scan
+  roots, and group definitions; writes are atomic tmp+rename with a
+  read-merge-write retry loop, vanished directories are stamped
+  `missingSince` rather than pruned, and the legacy watchme registry is
+  seeded from and written through best-effort. `@crewhaus/harness-inventory`
+  is the cross-harness discovery + inventory/health rollup + seam-injected
+  bulk runner that previously lived inside the CLI as the `crewhaus fleet`
+  core. `@crewhaus/preflight` is typed pre-spawn health checks — spec lint,
+  a provider-credential matrix over the union of every model a spec can
+  route to, the channel daemon's boot-gate env refs, MCP secret-ref dry-run,
+  port bindability, bundle freshness, and durability warnings — every core
+  function taking an injected `env` so the same checks serve the CLI, tests,
+  and a fleet manager identically.
+
+- **`run`, `compile`, `eval`, and `dev` now self-register the harness they
+  touch.** After the spec resolves, each command records the cwd (the
+  harness root per the standalone-harness convention) in the machine-wide
+  registry with origin `run-hook`, so `crewhaus harness list` fills itself
+  from normal use with no ceremony. The hook is best-effort by contract — it
+  never throws, and a registry failure never fails the command that
+  triggered it. `CREWHAUS_NO_REGISTRY=1` opts out of every registry write.
+  Under the default registry root, a cwd inside the OS temp directory is not
+  recorded (fixture compiles and scratch runs would otherwise accumulate
+  guaranteed-dead rows the registry never auto-prunes); an explicit
+  `CREWHAUS_REGISTRY_ROOT` registers every cwd.
+
+- **`crewhaus harness` — the harness manager verb family.** `harness list
+  [--group G] [--json]` renders every registered harness joined with the
+  on-disk inventory (missing directories are flagged "relocate or remove",
+  never auto-pruned); `harness show <dir|hrn_id>` adds the per-harness
+  inventory row and health rollup; `harness add|remove|relocate` manage
+  registration by hand (`add` warns rather than fails on a directory without
+  a readable `crewhaus.yaml`; `remove` drops only the registry row);
+  `harness group|tag|pin` manage the user-facing organization fields;
+  `harness scan [--root <dir>]` walks the configured scan roots (an explicit
+  `--root` is remembered as one) with the fleet discovery walk and upserts
+  every harness found (origin `scan`), reporting added/refreshed/missing
+  counts; `harness preflight <dir|id>` renders the typed will-it-boot report
+  in the doctor's check-list style and exits 1 when blocking findings exist.
+  `crewhaus fleet` gains the matching `--group <name>` filter on
+  `list`/`status`/`run`, scoping the discovered set to registry-group
+  members.
+
+### Changed
+
+- **The `fleet` and `doctor`/`channel` cores are consumed from the new
+  packages instead of living in the CLI.** `apps/cli/src/fleet.ts` re-exports
+  `@crewhaus/harness-inventory` (the lift is byte-identical, and the CLI's
+  fleet tests run unmodified against it); the doctor credential checks and
+  the channel boot-gate/provider-gate checks now come from
+  `@crewhaus/preflight`, message-identical, with only the compiler-dependent
+  channel-IR extraction staying in the CLI. Internal rewire only — no
+  behavior change to `fleet`, `doctor`, or `channel provision|verify`.
+
 ### Fixed
 
 - **`crewhaus cloud deploy` no longer writes generated infrastructure into its
