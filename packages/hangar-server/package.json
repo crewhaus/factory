@@ -1,0 +1,42 @@
+{
+  "name": "@crewhaus/hangar-server",
+  "version": "0.4.2",
+  "type": "module",
+  "description": "The Hangar manager's local HTTP server (M1, read-only): token-gated loopback API over the machine-wide harness registry — fleet rows with cached rollups, per-harness detail/spec/preflight/sessions/evals/memory/cost views, and registry CRUD",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/eval-report": "workspace:*",
+    "@crewhaus/feedback-distill": "workspace:*",
+    "@crewhaus/harness-inventory": "workspace:*",
+    "@crewhaus/harness-registry": "workspace:*",
+    "@crewhaus/preflight": "workspace:*",
+    "@crewhaus/spec": "workspace:*",
+    "@crewhaus/spec-patch": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/hangar-server"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/hangar-server#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

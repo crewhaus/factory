@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../eval-report" },
+    { "path": "../feedback-distill" },
+    { "path": "../harness-inventory" },
+    { "path": "../harness-registry" },
+    { "path": "../preflight" },
+    { "path": "../spec" },
+    { "path": "../spec-patch" }
+  ],
+  "include": ["src/**/*"]
+}

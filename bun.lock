@@ -53,6 +53,8 @@
         "@crewhaus/feedback-distill": "workspace:*",
         "@crewhaus/gateway-server": "workspace:*",
         "@crewhaus/grader-safety-classifiers": "workspace:*",
+        "@crewhaus/harness-inventory": "workspace:*",
+        "@crewhaus/harness-registry": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
@@ -73,6 +75,7 @@
         "@crewhaus/plugin-loader": "workspace:*",
         "@crewhaus/plugin-registry": "workspace:*",
         "@crewhaus/plugin-sdk": "workspace:*",
+        "@crewhaus/preflight": "workspace:*",
         "@crewhaus/prompt-injection-detector": "workspace:*",
         "@crewhaus/prompt-optimizer": "workspace:*",
         "@crewhaus/prompt-optimizer-claude": "workspace:*",
@@ -961,6 +964,23 @@
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
       },
+    },
+    "packages/hangar-server": {
+      "name": "@crewhaus/hangar-server",
+      "version": "0.4.2",
+      "dependencies": {
+        "@crewhaus/eval-report": "workspace:*",
+        "@crewhaus/feedback-distill": "workspace:*",
+        "@crewhaus/harness-inventory": "workspace:*",
+        "@crewhaus/harness-registry": "workspace:*",
+        "@crewhaus/preflight": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
+        "@crewhaus/spec-patch": "workspace:*",
+      },
+    },
+    "packages/hangar-ui": {
+      "name": "@crewhaus/hangar-ui",
+      "version": "0.4.2",
     },
     "packages/harness-inventory": {
       "name": "@crewhaus/harness-inventory",
@@ -2609,6 +2629,10 @@
     "@crewhaus/grader-semantic-similarity": ["@crewhaus/grader-semantic-similarity@workspace:packages/grader-semantic-similarity"],
 
     "@crewhaus/graph-engine": ["@crewhaus/graph-engine@workspace:packages/graph-engine"],
+
+    "@crewhaus/hangar-server": ["@crewhaus/hangar-server@workspace:packages/hangar-server"],
+
+    "@crewhaus/hangar-ui": ["@crewhaus/hangar-ui@workspace:packages/hangar-ui"],
 
     "@crewhaus/harness-inventory": ["@crewhaus/harness-inventory@workspace:packages/harness-inventory"],
 
