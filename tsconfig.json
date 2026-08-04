@@ -182,6 +182,7 @@
     { "path": "./packages/crawler" },
     { "path": "./packages/crew-orchestrator" },
     { "path": "./packages/event-log" },
+    { "path": "./packages/harness-inventory" },
     { "path": "./packages/idempotency-keys" },
     { "path": "./packages/memory-service" },
     { "path": "./packages/memory-store" },
@@ -214,6 +215,8 @@
     { "path": "./packages/vad-engine" },
     { "path": "./packages/voice-runtime" },
     { "path": "./packages/watchme-store" },
+    { "path": "./packages/harness-registry" },
+    { "path": "./packages/preflight" },
     { "path": "./apps/cli" }
   ]
 }

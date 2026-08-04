@@ -1,0 +1,39 @@
+{
+  "name": "@crewhaus/preflight",
+  "version": "0.4.2",
+  "type": "module",
+  "description": "Typed pre-spawn health checks for harnesses: spec lint, provider-credential matrix, channel boot-gate env refs, MCP secret-ref dry-run, port availability, bundle freshness, and durability warnings",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/mcp-host": "workspace:*",
+    "@crewhaus/model-router": "workspace:*",
+    "@crewhaus/spec": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/preflight"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/preflight#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}
