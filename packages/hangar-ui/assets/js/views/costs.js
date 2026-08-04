@@ -1,20 +1,23 @@
 /**
  * Costs tab — per-model spend table plus the 7-day bar mini-chart (inline
- * SVG, no chart lib). Unpriced usage is flagged distinctly, never silently
- * folded into dollar totals. Cached figures show their as-of time.
+ * SVG, no chart lib). The route returns `{ id, costs }` where `costs` holds
+ * integer USD-micros figures (`byModel`, zero-filled `days`, rolling
+ * `spend7dUsdMicros`, `truncatedFiles`); dollars are derived client-side in
+ * one place (`usdFromMicros`). Capped reads are flagged, never hidden.
  */
 
 import { api } from "../api.js";
-import { asOf, clear, el, emptyState, skeleton, svgEl } from "../dom.js";
-import { barRects, fmtCount, fmtUsd } from "../util.js";
+import { clear, el, emptyState, skeleton, svgEl } from "../dom.js";
+import { barRects, fmtCount, fmtUsd, usdFromMicros } from "../util.js";
 
 export async function renderCosts(root, ctx) {
   clear(root).appendChild(skeleton(6));
   const data = await api.costs(ctx.id);
   clear(root);
-  const models = Array.isArray(data?.models) ? data.models : [];
-  const days = Array.isArray(data?.days) ? data.days : [];
-  if (models.length === 0 && days.length === 0) {
+  const costs = data?.costs && typeof data.costs === "object" ? data.costs : null;
+  const models = Array.isArray(costs?.byModel) ? costs.byModel : [];
+  const days = Array.isArray(costs?.days) ? costs.days : [];
+  if (costs === null || (models.length === 0 && costs.calls === 0)) {
     root.appendChild(
       emptyState("No cost data yet", "crewhaus run (cost tracking is on by default)"),
     );
@@ -22,15 +25,24 @@ export async function renderCosts(root, ctx) {
   }
 
   if (days.length > 0) {
-    const values = days.slice(-7).map((d) => (typeof d.costUsd === "number" ? d.costUsd : 0));
-    const total = values.reduce((a, b) => a + b, 0);
+    const shown = days.slice(-7);
+    const values = shown.map((d) => usdFromMicros(d.usdMicros) ?? 0);
     const rects = barRects(values, 420, 64);
     root.appendChild(
       el("div", { class: "card" }, [
         el("h3", { class: "card-title" }, [
           el("span", { text: "Last 7 days" }),
-          el("span", { class: "muted card-sub", text: fmtUsd(total) }),
-          data?.cachedAt ? asOf(data.cachedAt) : null,
+          el("span", {
+            class: "muted card-sub",
+            text: fmtUsd(usdFromMicros(costs.spend7dUsdMicros)),
+          }),
+          typeof costs.truncatedFiles === "number" && costs.truncatedFiles > 0
+            ? el("span", {
+                class: "chip chip-warn",
+                title: "some session logs hit the read cap — totals are floors, not lies",
+                text: `${costs.truncatedFiles} capped file${costs.truncatedFiles === 1 ? "" : "s"}`,
+              })
+            : null,
         ]),
         svgEl(
           "svg",
@@ -45,9 +57,7 @@ export async function renderCosts(root, ctx) {
         el(
           "div",
           { class: "bar-labels" },
-          days
-            .slice(-7)
-            .map((d) => el("span", { class: "muted", text: String(d.day ?? "").slice(5) })),
+          shown.map((d) => el("span", { class: "muted", text: String(d.day ?? "").slice(5) })),
         ),
       ]),
     );
@@ -58,21 +68,12 @@ export async function renderCosts(root, ctx) {
     for (const m of models) {
       tbody.appendChild(
         el("tr", null, [
-          el("td", { class: "mono", text: String(m.model ?? "?") }),
+          el("td", { class: "mono", text: String(m.modelId ?? "?") }),
           el("td", { text: String(m.provider ?? "—") }),
           el("td", { class: "num", text: fmtCount(numOr(m.calls)) }),
           el("td", { class: "num", text: fmtCount(numOr(m.inputTokens)) }),
           el("td", { class: "num", text: fmtCount(numOr(m.outputTokens)) }),
-          el("td", { class: "num" }, [
-            el("span", { text: fmtUsd(numOr(m.costUsd)) }),
-            m.unpriced === true
-              ? el("span", {
-                  class: "chip chip-warn",
-                  title: "no pricing entry for this model — dollars unknown, not zero",
-                  text: "unpriced",
-                })
-              : null,
-          ]),
+          el("td", { class: "num", text: fmtUsd(usdFromMicros(m.usdMicros)) }),
         ]),
       );
     }

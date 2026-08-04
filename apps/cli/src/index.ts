@@ -1576,25 +1576,39 @@ function parseFor(rest: ReadonlyArray<string>, schema: ParseArgsSchema): ParsedA
 
 /**
  * Hangar F-1 — best-effort harness self-registration: record that a command
- * touched the harness rooted at the CWD (the standalone-harness convention's
- * harness root, NOT the spec file's directory when the two differ) in the
- * machine-wide registry, origin `run-hook`. `registerHarnessHook` never
- * throws and honours CREWHAUS_NO_REGISTRY, so callers need no try/catch.
+ * touched the harness rooted at `dir` in the machine-wide registry, origin
+ * `run-hook`. `dir` defaults to the CWD — correct for `run`/`eval`, where
+ * the standalone-harness convention makes the cwd the harness root. Compile
+ * and dev pass `dirname(absSpec)` instead: both are routinely invoked from
+ * OUTSIDE the harness (`crewhaus compile path/to/crewhaus.yaml -o …`), and
+ * registering the invoker's cwd would pollute the registry with a non-
+ * harness row whose specName churns to whatever compiled last.
+ * `registerHarnessHook` never throws and honours CREWHAUS_NO_REGISTRY, so
+ * callers need no try/catch.
  *
- * Ephemeral-cwd guard: under the DEFAULT registry root, a cwd inside the OS
- * temp directory is skipped — compiles/runs against temp fixtures (`bun
- * test` drives dozens per suite, scratch experiments more) would otherwise
- * fill the real `~/.crewhaus/harnesses.json` with guaranteed-dead rows the
- * registry never auto-prunes. An explicit CREWHAUS_REGISTRY_ROOT means the
- * caller took control of registry placement (a test, a sandboxed manager),
- * so every cwd registers there.
+ * Ephemeral-dir guard: under the DEFAULT registry root, a harness dir
+ * inside the OS temp directory is skipped — compiles/runs against temp
+ * fixtures (`bun test` drives dozens per suite, scratch experiments more)
+ * would otherwise fill the real `~/.crewhaus/harnesses.json` with
+ * guaranteed-dead rows the registry never auto-prunes. An explicit
+ * CREWHAUS_REGISTRY_ROOT means the caller took control of registry
+ * placement (a test, a sandboxed manager), so every dir registers there.
  */
 function registerHarnessCwd(fields: {
+  readonly dir?: string;
   readonly specName?: string;
   readonly target?: string;
   readonly originDetail: "run" | "compile" | "eval" | "dev";
 }): void {
-  const dir = process.cwd();
+  let dir = fields.dir ?? process.cwd();
+  try {
+    // Physical path, like process.cwd() reports: a spec reached through a
+    // symlink spelling (macOS /var → /private/var) must not mint a second
+    // registry row for the same harness.
+    dir = realpathSync(dir);
+  } catch {
+    // Unresolvable (racing delete) — register the resolved spelling as-is.
+  }
   const explicitRoot = process.env["CREWHAUS_REGISTRY_ROOT"];
   if (explicitRoot === undefined || explicitRoot === "") {
     // The guard cannot rely on tmpdir() alone: it follows $TMPDIR, which a
@@ -1626,11 +1640,13 @@ function registerHarnessCwd(fields: {
 }
 
 /**
- * The {@link registerHarnessCwd} entry for command paths that hold only the
- * spec TEXT. Parses tolerantly: an unparseable spec registers nothing (the
+ * The {@link registerHarnessCwd} entry for command paths that hold the spec
+ * TEXT and its resolved absolute path. Registers the spec file's own
+ * directory (the dir that actually roots the harness), NOT the invoker's
+ * cwd. Parses tolerantly: an unparseable spec registers nothing (the
  * command surfaces the real error itself).
  */
-function registerHarnessTouch(yamlText: string, originDetail: "compile"): void {
+function registerHarnessTouch(yamlText: string, absSpec: string, originDetail: "compile"): void {
   let name: string | undefined;
   let target: string | undefined;
   try {
@@ -1641,6 +1657,7 @@ function registerHarnessTouch(yamlText: string, originDetail: "compile"): void {
     return; // the spec did not resolve — nothing to register
   }
   registerHarnessCwd({
+    dir: dirname(absSpec),
     ...(name !== undefined ? { specName: name } : {}),
     ...(target !== undefined ? { target } : {}),
     originDetail,
@@ -1829,9 +1846,11 @@ async function runCompile(args: ParsedArgs): Promise<void> {
 
   // Hangar F-1 — self-register the harness the moment its spec resolves,
   // ahead of the mode branches below so every compile flavour (bundle,
-  // --emit-ir, --emit-loop) records the touch. Skips silently when the spec
-  // does not parse — the pipeline below surfaces the real error.
-  registerHarnessTouch(yamlText, "compile");
+  // --emit-ir, --emit-loop) records the touch. Registers dirname(absSpec) —
+  // compile is routinely invoked from outside the harness dir. Skips
+  // silently when the spec does not parse — the pipeline below surfaces the
+  // real error.
+  registerHarnessTouch(yamlText, absSpec, "compile");
 
   // FR-006 — `security.egressMatcher: semantic` is now emitted into the
   // standalone cli bundle by `@crewhaus/target-cli` (it constructs
@@ -5117,10 +5136,12 @@ async function runDev(args: ParsedArgs): Promise<void> {
   // nothing is launched.
   const initial = devCompileAndEmit(absSpec, pluginsOverride);
   if (!initial.ok) die(`dev: ${initial.error}`);
-  // Hangar F-1 — the spec compiled, so it resolved: self-register the cwd
-  // (the harness root, not the throwaway temp dir the child runs in). Never
-  // throws; CREWHAUS_NO_REGISTRY=1 opts out.
+  // Hangar F-1 — the spec compiled, so it resolved: self-register the spec
+  // file's own directory (dev's watch root — NOT the invoker's cwd, which
+  // may be elsewhere, and not the throwaway temp dir the child runs in).
+  // Never throws; CREWHAUS_NO_REGISTRY=1 opts out.
   registerHarnessCwd({
+    dir: dirname(absSpec),
     specName: initial.specName,
     target: initial.target,
     originDetail: "dev",

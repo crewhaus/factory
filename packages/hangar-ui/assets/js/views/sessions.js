@@ -1,16 +1,26 @@
 /**
  * Sessions tab — the TTL-safe browser (the server reads via raw dir scans,
- * never an evicting store call) and the transcript view. The transcript
- * renders per-kind envelopes: chat bubbles for turns, collapsible tool
- * cards, a metadata gutter (cost / model route / permission chips), and a
- * Raw toggle. Unknown kinds render as generic cards — tolerant-reader
- * contract, never abort on a future kind.
+ * never an evicting store call) and the transcript view. The server's
+ * transcript envelope is `{ turns, tools, gutter, otherKinds, truncated,
+ * lineCount, tornCount }` — pre-sorted per kind with per-item `line`
+ * anchors — and this view interleaves the three streams by line into chat
+ * bubbles, collapsible tool cards (with the joined result + error flag),
+ * and a metadata gutter, plus a Raw toggle. Unknown kinds are tallied
+ * server-side in `otherKinds`; the count renders so nothing is silently
+ * dropped — tolerant-reader contract.
  */
 
 import { api } from "../api.js";
 import { clear, collapsible, dot, el, emptyState, jsonPre, skeleton } from "../dom.js";
 import { hrefHarness } from "../router.js";
-import { clampText, fmtRelativeTime, fmtUsd, ttlCountdown } from "../util.js";
+import {
+  clampText,
+  fmtRelativeTime,
+  fmtUsd,
+  interleaveTranscript,
+  ttlCountdown,
+  usdFromMicros,
+} from "../util.js";
 
 export async function renderSessions(root, ctx) {
   if (ctx.route.sessionId !== undefined) {
@@ -50,7 +60,6 @@ export async function renderSessions(root, ctx) {
         el("td", null, [
           evicted ? dot("off", "evicted") : dot(ttl.expired ? "warn" : "ok", ttl.label),
         ]),
-        el("td", { class: "num", text: fmtUsd(typeof s.costUsd === "number" ? s.costUsd : null) }),
       ]),
     );
   }
@@ -63,7 +72,7 @@ export async function renderSessions(root, ctx) {
           el(
             "tr",
             null,
-            ["Session", "Name", "Model", "Turns", "Age", "Retention", "Cost"].map((h) =>
+            ["Session", "Name", "Model", "Turns", "Age", "Retention"].map((h) =>
               el("th", { text: h }),
             ),
           ),
@@ -88,11 +97,13 @@ async function renderTranscript(root, ctx, sessionId) {
     root.appendChild(emptyState("Nothing here yet — this session has no readable transcript"));
     return;
   }
-  if (data.evicted === true || (data.summary && !hasEntries(data))) {
-    root.appendChild(summaryCard(data.summary ?? {}));
+  if (data.evicted === true) {
+    root.appendChild(
+      summaryCard(data.summary && typeof data.summary === "object" ? data.summary : {}),
+    );
     return;
   }
-  const entries = entriesOf(data);
+  const entries = interleaveTranscript(data);
   if (entries.length === 0) {
     root.appendChild(emptyState("Transcript is empty"));
     return;
@@ -108,20 +119,38 @@ async function renderTranscript(root, ctx, sessionId) {
   root.appendChild(el("div", { class: "transcript-tools" }, [rawBtn]));
   root.appendChild(rawPre);
 
+  const otherCount = Object.values(
+    data.otherKinds && typeof data.otherKinds === "object" ? data.otherKinds : {},
+  ).reduce((a, b) => (typeof b === "number" ? a + b : a), 0);
+  if (
+    data.truncated === true ||
+    (typeof data.tornCount === "number" && data.tornCount > 0) ||
+    otherCount > 0
+  ) {
+    root.appendChild(
+      el("div", { class: "transcript-meta" }, [
+        data.truncated === true
+          ? el("span", { class: "chip chip-warn", text: "truncated — long log capped" })
+          : null,
+        typeof data.tornCount === "number" && data.tornCount > 0
+          ? el("span", {
+              class: "chip",
+              text: `${data.tornCount} torn line${data.tornCount === 1 ? "" : "s"} skipped`,
+            })
+          : null,
+        otherCount > 0
+          ? el("span", {
+              class: "chip",
+              text: `${otherCount} other event${otherCount === 1 ? "" : "s"} (Raw)`,
+            })
+          : null,
+      ]),
+    );
+  }
+
   const feed = el("div", { class: "transcript" });
   for (const entry of entries) feed.appendChild(entryNode(entry));
   root.appendChild(feed);
-}
-
-function hasEntries(data) {
-  return entriesOf(data).length > 0;
-}
-
-function entriesOf(data) {
-  if (Array.isArray(data.entries)) return data.entries;
-  if (Array.isArray(data.timeline)) return data.timeline;
-  if (Array.isArray(data.events)) return data.events;
-  return [];
 }
 
 function summaryCard(summary) {
@@ -141,91 +170,59 @@ function summaryCard(summary) {
   ]);
 }
 
-const GUTTER_KINDS = new Set([
-  "cost_accrual",
-  "model_route",
-  "model_meta",
-  "permission",
-  "permission_decision",
-  "tool_stats",
-  "mcp_stats",
-  "user_feedback",
-  "recovery",
-]);
-
+/** One interleaved entry (see `interleaveTranscript`) → its DOM node. */
 function entryNode(entry) {
-  const kind = String(entry.kind ?? entry.type ?? "event");
-  if (kind === "turn" || kind === "message" || kind === "chat") {
-    const role = String(entry.role ?? "assistant");
+  if (entry.type === "turn") {
+    const role = entry.role === "user" ? "user" : "assistant";
     return el("div", { class: `bubble bubble-${role === "user" ? "user" : "agent"}` }, [
       el("div", { class: "bubble-role", text: role }),
-      el("div", { class: "bubble-body", text: contentText(entry) }),
+      el("div", { class: "bubble-body", text: String(entry.text ?? "") }),
     ]);
   }
-  if (kind === "tool_use" || kind === "tool" || kind === "tool_result") {
-    const name = String(entry.name ?? entry.tool ?? "tool");
-    const isError = entry.isError === true || entry.error !== undefined;
+  if (entry.type === "tool") {
+    const name = String(entry.name ?? "tool");
+    const isError = entry.isError === true;
     return collapsible(
       [
         el("span", { class: "chip chip-tool", text: name }),
         isError ? dot("bad", "error") : dot("ok", "ok"),
-        el("span", { class: "muted tool-summary", text: clampText(inputSummary(entry), 100) }),
+        el("span", { class: "muted tool-summary", text: clampText(jsonText(entry.input), 100) }),
       ],
-      [jsonPre(entry)],
+      [jsonPre({ input: entry.input, result: entry.result ?? null })],
     );
   }
-  if (GUTTER_KINDS.has(kind)) {
-    return el("div", { class: "gutter" }, [
-      el("span", { class: "chip", text: kind }),
-      gutterDetail(kind, entry),
-    ]);
-  }
-  // Unknown/future kind: label it, keep the payload inspectable, move on.
-  return collapsible([el("span", { class: "chip", text: kind })], [jsonPre(entry)]);
+  // gutter
+  const kind = String(entry.kind ?? "event");
+  return el("div", { class: "gutter" }, [
+    el("span", { class: "chip", text: kind }),
+    gutterDetail(kind, entry.payload),
+  ]);
 }
 
-function contentText(entry) {
-  if (typeof entry.text === "string") return entry.text;
-  if (typeof entry.content === "string") return entry.content;
-  if (Array.isArray(entry.content)) {
-    return entry.content
-      .map((b) =>
-        typeof b === "string"
-          ? b
-          : typeof b?.text === "string"
-            ? b.text
-            : `[${String(b?.type ?? "block")}]`,
-      )
-      .join("\n");
-  }
-  return "";
-}
-
-function inputSummary(entry) {
-  const input = entry.input ?? entry.args ?? null;
-  if (input === null) return "";
-  if (typeof input === "string") return input;
+function jsonText(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
   try {
-    return JSON.stringify(input);
+    return JSON.stringify(value);
   } catch {
-    return String(input);
+    return String(value);
   }
 }
 
-function gutterDetail(kind, entry) {
+function gutterDetail(kind, payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
   if (kind === "cost_accrual") {
-    const usd = typeof entry.usd === "number" ? entry.usd : entry.costUsd;
-    return el("span", { class: "muted", text: fmtUsd(typeof usd === "number" ? usd : null) });
+    return el("span", { class: "muted", text: fmtUsd(usdFromMicros(p.costUsdMicros)) });
   }
-  if (kind === "model_route" || kind === "model_meta") {
+  if (kind === "model_route") {
     return el("span", {
       class: "mono muted",
-      text: String(entry.model ?? entry.route ?? entry.band ?? ""),
+      text: String(p.modelId ?? p.model ?? p.route ?? p.band ?? ""),
     });
   }
-  if (kind === "permission" || kind === "permission_decision") {
-    const outcome = String(entry.outcome ?? entry.decision ?? "?");
+  if (kind === "permission") {
+    const outcome = String(p.outcome ?? p.decision ?? "?");
     return dot(outcome === "deny" ? "bad" : outcome === "ask" ? "warn" : "ok", outcome);
   }
-  return el("span", { class: "muted", text: clampText(inputSummary(entry) || "", 60) });
+  return el("span", { class: "muted", text: clampText(jsonText(payload) || "", 60) });
 }

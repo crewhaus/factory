@@ -1,14 +1,17 @@
 /**
- * Memory tab — the fabric, read-only: facts (tombstones folded), local wiki
- * (list + safe-markdown reader), continuity focus/plan, dream state, and
- * watchme state. Each area loads independently so one absent store never
- * hides another ("absence is not an error").
+ * Memory tab — the fabric, read-only, rendered from the server's actual
+ * view shapes: facts `{files:[{items,…}]}` (status folded server-side from
+ * tombstones), wiki `{index, articles: [slug]}`, continuity
+ * `{focus, goals, plans:[{file,text}]}`, dream `{specs:[{specName,state}]}`,
+ * and watchme `{state, observationsTail, judgmentsTail}`. Each area loads
+ * independently so one absent store never hides another ("absence is not
+ * an error").
  */
 
 import { api } from "../api.js";
-import { clear, collapsible, dot, el, emptyState, mdBlocks, skeleton } from "../dom.js";
+import { clear, collapsible, dot, el, emptyState, jsonPre, mdBlocks, skeleton } from "../dom.js";
 import { hrefHarness } from "../router.js";
-import { fmtRelativeTime, parseTs } from "../util.js";
+import { fmtRelativeTime } from "../util.js";
 
 export async function renderMemory(root, ctx) {
   if (ctx.route.wikiSlug !== undefined) {
@@ -45,14 +48,18 @@ function card(title, children, wide = false) {
 }
 
 function factsCard(data) {
-  const facts = Array.isArray(data) ? data : Array.isArray(data?.facts) ? data.facts : [];
-  if (facts.length === 0) {
+  // One entry per memories/<spec>.jsonl file; items carry a folded status.
+  const files = Array.isArray(data?.files) ? data.files : [];
+  const items = files.flatMap((f) =>
+    Array.isArray(f?.items)
+      ? f.items.map((i) => ({ ...i, specName: String(f.specName ?? "") }))
+      : [],
+  );
+  if (items.length === 0) {
     return card("Facts", emptyState("No facts yet", "crewhaus remember"));
   }
-  const isTombstoned = (f) =>
-    f.tombstone === true || (f.supersededBy !== undefined && f.supersededBy !== null);
-  const active = facts.filter((f) => !isTombstoned(f));
-  const superseded = facts.filter(isTombstoned);
+  const live = items.filter((i) => i.status === "live");
+  const folded = items.filter((i) => i.status !== "live");
   const factLi = (f) =>
     el("li", { class: "fact" }, [
       el("div", { text: String(f.text ?? "") }),
@@ -60,50 +67,57 @@ function factsCard(data) {
         ...(Array.isArray(f.tags) ? f.tags : []).map((t) =>
           el("span", { class: "chip", text: String(t) }),
         ),
-        f.supersededBy
-          ? el("span", { class: "chip chip-warn", text: `superseded by ${String(f.supersededBy)}` })
+        f.status !== "live"
+          ? el("span", { class: "chip chip-warn", text: String(f.status) })
           : null,
       ]),
     ]);
-  const children = [el("ul", { class: "fact-list" }, active.map(factLi))];
-  if (superseded.length > 0) {
+  const children = [el("ul", { class: "fact-list" }, live.map(factLi))];
+  if (folded.length > 0) {
     children.push(
       collapsible(
         [
           el("span", {
             class: "muted",
-            text: `${superseded.length} superseded fact${superseded.length === 1 ? "" : "s"} (tombstoned, never deleted)`,
+            text: `${folded.length} superseded/expired fact${folded.length === 1 ? "" : "s"} (tombstoned, never deleted)`,
           }),
         ],
-        [el("ul", { class: "fact-list folded" }, superseded.map(factLi))],
+        [el("ul", { class: "fact-list folded" }, folded.map(factLi))],
       ),
+    );
+  }
+  if (files.some((f) => f?.truncated === true)) {
+    children.push(
+      el("p", { class: "muted", text: "Long store — showing the first entries only." }),
     );
   }
   return card("Facts", children, true);
 }
 
 function wikiCard(data, ctx) {
-  const articles = Array.isArray(data) ? data : Array.isArray(data?.articles) ? data.articles : [];
-  if (articles.length === 0) {
+  // Articles are slugs (the on-disk authority); titles come from the
+  // tolerant index.json cache when it has them.
+  const slugs = Array.isArray(data?.articles) ? data.articles.map(String) : [];
+  if (slugs.length === 0) {
     return card("Wiki", emptyState("No wiki articles yet", "crewhaus wiki write"));
   }
+  const index = data?.index && typeof data.index === "object" ? data.index : {};
   return card(
     "Wiki",
     el(
       "ul",
       { class: "wiki-list" },
-      articles.map((a) => {
-        const slug = String(a.slug ?? a.id ?? "");
+      slugs.map((slug) => {
+        const meta = index[slug] && typeof index[slug] === "object" ? index[slug] : {};
         return el("li", null, [
           el("a", {
             class: "name-link",
             href: hrefHarness(ctx.id, "memory", "wiki", slug),
-            text: String(a.title ?? slug),
+            text: typeof meta.title === "string" && meta.title !== "" ? meta.title : slug,
           }),
-          ...(Array.isArray(a.tags) ? a.tags : []).map((t) =>
+          ...(Array.isArray(meta.tags) ? meta.tags : []).map((t) =>
             el("span", { class: "chip", text: String(t) }),
           ),
-          a.status ? el("span", { class: "chip chip-group", text: String(a.status) }) : null,
         ]);
       }),
     ),
@@ -124,25 +138,22 @@ async function renderWikiArticle(root, ctx, slug) {
     root.appendChild(emptyState("Nothing here yet — no article with that slug"));
     return;
   }
-  const body = typeof data.markdown === "string" ? data.markdown : String(data.body ?? "");
   root.appendChild(
     el("article", { class: "card wiki-article" }, [
-      el("h2", { text: String(data.title ?? slug) }),
-      data.updatedAt
-        ? el("p", {
-            class: "muted",
-            text: `updated ${fmtRelativeTime(data.updatedAt, Date.now())}`,
-          })
+      el("h2", { text: slug }),
+      data.truncated === true
+        ? el("p", { class: "muted", text: "Long article — showing the first part only." })
         : null,
-      mdBlocks(body),
+      mdBlocks(String(data.body ?? "")),
     ]),
   );
 }
 
 function continuityCard(data) {
   const focus = typeof data?.focus === "string" ? data.focus : "";
-  const plan = typeof data?.plan === "string" ? data.plan : "";
-  if (focus === "" && plan === "") {
+  const goals = typeof data?.goals === "string" ? data.goals : "";
+  const plans = Array.isArray(data?.plans) ? data.plans : [];
+  if (focus === "" && goals === "" && plans.length === 0) {
     return card("Continuity", emptyState("No continuity state yet", "crewhaus /focus (or /plan)"));
   }
   const children = [];
@@ -150,59 +161,63 @@ function continuityCard(data) {
     children.push(el("h4", { class: "sub-title", text: "Focus" }));
     children.push(el("pre", { class: "prose-pre", text: focus }));
   }
-  if (plan !== "") {
-    children.push(el("h4", { class: "sub-title", text: "Plan" }));
-    children.push(el("pre", { class: "prose-pre", text: plan }));
+  if (goals !== "") {
+    children.push(el("h4", { class: "sub-title", text: "Goals" }));
+    children.push(el("pre", { class: "prose-pre", text: goals }));
+  }
+  for (const plan of plans) {
+    children.push(
+      collapsible(
+        [el("span", { class: "mono", text: String(plan.file ?? "plan") })],
+        [el("pre", { class: "prose-pre", text: String(plan.text ?? "") })],
+      ),
+    );
   }
   return card("Continuity", children);
 }
 
 function dreamCard(data) {
-  if (data === null || typeof data !== "object") {
+  const specs = Array.isArray(data?.specs) ? data.specs : [];
+  if (specs.length === 0) {
     return card("Dream", emptyState("No dream state yet", "crewhaus dream run"));
   }
-  const nextDue = typeof data.nextDueAt === "string" ? data.nextDueAt : null;
-  const overdue =
-    data.overdue === true ||
-    (nextDue !== null && (parseTs(nextDue) ?? Number.POSITIVE_INFINITY) < Date.now());
-  return card("Dream", [
-    el("div", { class: "kv" }, [
-      el("span", { class: "kv-k", text: "last outcome" }),
-      el("span", { class: "kv-v", text: String(data.lastOutcome ?? "—") }),
-    ]),
-    el("div", { class: "kv" }, [
-      el("span", { class: "kv-k", text: "next due" }),
-      el("span", { class: "kv-v" }, [
-        el("span", { text: nextDue ? fmtRelativeTime(nextDue, Date.now()) : "—" }),
-        overdue ? el("span", { class: "chip chip-warn", text: "overdue" }) : null,
-      ]),
-    ]),
-  ]);
+  const children = specs.map((s) => {
+    const state = s?.state && typeof s.state === "object" ? s.state : {};
+    const lastRunAt = typeof state.lastRunAt === "string" ? state.lastRunAt : null;
+    return collapsible(
+      [
+        el("span", { class: "mono", text: String(s.specName ?? "spec") }),
+        el("span", {
+          class: "muted",
+          text: lastRunAt ? ` last ran ${fmtRelativeTime(lastRunAt, Date.now())}` : "",
+        }),
+      ],
+      [jsonPre(state)],
+    );
+  });
+  return card("Dream", children);
 }
 
 function watchmeCard(data) {
-  if (data === null || typeof data !== "object") {
+  const state = data?.state && typeof data.state === "object" ? data.state : null;
+  if (state === null) {
     return card("Watchme", emptyState("Not watching yet", "crewhaus watchme start"));
   }
-  const watching = data.watching === true || data.active === true;
+  const watching = state.watching === true || state.active === true;
+  const observations = Array.isArray(data.observationsTail) ? data.observationsTail.length : 0;
+  const judgments = Array.isArray(data.judgmentsTail) ? data.judgmentsTail.length : 0;
   return card("Watchme", [
     el("div", { class: "kv" }, [
       el("span", { class: "kv-k", text: "state" }),
       el("span", { class: "kv-v" }, [dot(watching ? "ok" : "off", watching ? "watching" : "off")]),
     ]),
     el("div", { class: "kv" }, [
-      el("span", { class: "kv-k", text: "observations" }),
-      el("span", {
-        class: "kv-v",
-        text: String(data.observationCount ?? data.observations ?? "—"),
-      }),
+      el("span", { class: "kv-k", text: "recent observations" }),
+      el("span", { class: "kv-v", text: String(observations) }),
     ]),
     el("div", { class: "kv" }, [
-      el("span", { class: "kv-k", text: "last report" }),
-      el("span", {
-        class: "kv-v",
-        text: data.lastReportAt ? fmtRelativeTime(data.lastReportAt, Date.now()) : "—",
-      }),
+      el("span", { class: "kv-k", text: "recent judgments" }),
+      el("span", { class: "kv-v", text: String(judgments) }),
     ]),
   ]);
 }

@@ -136,6 +136,171 @@ describe("normalizeRows", () => {
     expect(r.pinned).toBe(false);
     expect(r.lastEval).toBeNull();
   });
+
+  // The REAL server row: registry fields + flattened capabilities/
+  // evalHealthy/cachedAt + a NESTED rollup in USD micros. This fixture must
+  // stay in lockstep with hangar-server's harnessRows — the contract test
+  // (hangar-server/src/contract.test.ts) is the cross-package alarm.
+  const serverRow = {
+    id: "hrn_0123456789abcdef",
+    dir: "/tmp/x/support-bot",
+    specName: "support-bot",
+    target: "channel",
+    model: "anthropic/claude-sonnet-4",
+    origin: "manual",
+    groups: ["prod"],
+    tags: ["t1"],
+    pinned: false,
+    notes: "",
+    kind: "local",
+    registeredAt: iso(-3 * DAY),
+    lastSeen: iso(-HOUR),
+    missingSince: null,
+    capabilities: ["memory", "budget"],
+    evalHealthy: false,
+    cachedAt: iso(-HOUR),
+    rollup: {
+      digest: "d",
+      cachedAt: iso(-HOUR),
+      lastEval: { datasetName: "smoke", passRate: 0.6, ts: iso(-DAY) },
+      sessionCount: 4,
+      feedbackCount: 1,
+      spend7d: 1_230_000, // USD micros
+      costBreakdown: { totalUsdMicros: 1_230_000, calls: 3 },
+    },
+  };
+
+  test("hydrated server row: nested rollup feeds sessions/spend/lastEval, micros become dollars", () => {
+    const [r] = util.normalizeRows({ harnesses: [serverRow] });
+    expect(r.sessions).toBe(4);
+    expect(r.spend7dUsd).toBe(1.23);
+    expect(r.capabilities).toEqual(["memory", "budget"]);
+    expect(r.budgeted).toBe(true);
+    expect(r.cachedAt).toBe(iso(-HOUR));
+    // evalHealthy joins onto lastEval so the dot can go red.
+    expect(r.lastEval).toEqual({
+      datasetName: "smoke",
+      passRate: 0.6,
+      ts: iso(-DAY),
+      healthy: false,
+    });
+    expect(util.evalHealth(r.lastEval)).toEqual({ state: "fail", label: "60%" });
+  });
+
+  test("cold server row (rollup null): row fields render, rollup figures degrade to —", () => {
+    const cold = { ...serverRow, rollup: null, cachedAt: null };
+    const [r] = util.normalizeRows([cold]);
+    expect(r.sessions).toBeNull();
+    expect(r.spend7dUsd).toBeNull();
+    expect(r.lastEval).toBeNull();
+    expect(r.capabilities).toEqual(["memory", "budget"]);
+    expect(r.cachedAt).toBeNull();
+  });
+
+  test("stale row: rollupStaleCachedAt still labels the as-of time", () => {
+    const stale = { ...serverRow, rollup: null, cachedAt: null, rollupStaleCachedAt: iso(-DAY) };
+    const [r] = util.normalizeRows([stale]);
+    expect(r.cachedAt).toBe(iso(-DAY));
+  });
+});
+
+describe("usdFromMicros / oldestCachedAt", () => {
+  test("micros to dollars, null for junk", () => {
+    expect(util.usdFromMicros(2_500_000)).toBe(2.5);
+    expect(util.usdFromMicros(0)).toBe(0);
+    expect(util.usdFromMicros(null)).toBeNull();
+    expect(util.usdFromMicros("2")).toBeNull();
+    expect(util.usdFromMicros(Number.NaN)).toBeNull();
+  });
+
+  test("oldestCachedAt picks the stalest row (honest fleet as-of)", () => {
+    const rows = [
+      { cachedAt: iso(-HOUR) },
+      { cachedAt: iso(-2 * DAY) },
+      { cachedAt: null },
+      { cachedAt: iso(-DAY) },
+    ];
+    expect(util.oldestCachedAt(rows)).toBe(iso(-2 * DAY));
+    expect(util.oldestCachedAt([{ cachedAt: null }])).toBeNull();
+    expect(util.oldestCachedAt(null)).toBeNull();
+  });
+});
+
+describe("healthChecks", () => {
+  test("maps the server's HarnessHealth fields into checklist rows", () => {
+    const checks = util.healthChecks({
+      dir: "/x",
+      specName: "s",
+      registered: true,
+      pinnedEnvs: [],
+      evalHealthy: false,
+      evalNote: "pass rate 50.0% below baseline 90.0% (smoke)",
+      openIncidents: 2,
+      hasAudit: true,
+    });
+    expect(checks.map((c: { state: string; label: string }) => `${c.state}:${c.label}`)).toEqual([
+      "ok:spec registered",
+      "bad:eval regression",
+      "bad:2 open incidents",
+      "ok:audit trail present",
+    ]);
+    expect(checks[1].reason).toContain("below baseline");
+  });
+
+  test("unregistered with env pins is bad, without is warn; junk yields []", () => {
+    const pinned = util.healthChecks({ registered: false, pinnedEnvs: ["prod"] });
+    expect(pinned[0]).toEqual({
+      state: "bad",
+      label: "spec not registered",
+      reason: "pinned envs: prod",
+    });
+    const bare = util.healthChecks({ registered: false, pinnedEnvs: [] });
+    expect(bare[0].state).toBe("warn");
+    expect(util.healthChecks(null)).toEqual([]);
+    expect(util.healthChecks("nope")).toEqual([]);
+  });
+});
+
+describe("interleaveTranscript", () => {
+  test("merges turns/tools/gutter by line anchor, turn before tool before gutter", () => {
+    const view = {
+      turns: [
+        { role: "user", text: "hi", line: 0 },
+        { role: "assistant", text: "hello", line: 1 },
+      ],
+      tools: [{ toolUseId: "tu_1", name: "search", input: { q: "x" }, line: 1, isError: false }],
+      gutter: [{ kind: "cost_accrual", line: 2, payload: { costUsdMicros: 1000 } }],
+    };
+    const entries = util.interleaveTranscript(view);
+    expect(entries.map((e: { type: string; line: number }) => `${e.type}@${e.line}`)).toEqual([
+      "turn@0",
+      "turn@1",
+      "tool@1",
+      "gutter@2",
+    ]);
+    expect(entries[2].name).toBe("search");
+    expect(entries[3].kind).toBe("cost_accrual");
+  });
+
+  test("the real server envelope with no entries yields [] (empty state), junk too", () => {
+    expect(
+      util.interleaveTranscript({
+        id: "sess_0000000000000001",
+        evicted: false,
+        turns: [],
+        tools: [],
+        gutter: [],
+        otherKinds: {},
+        truncated: false,
+        lineCount: 0,
+        tornCount: 0,
+      }),
+    ).toEqual([]);
+    expect(util.interleaveTranscript(null)).toEqual([]);
+    // The OLD client guessed at entries/timeline/events — those must not
+    // resurface as accepted shapes now that the server contract won.
+    expect(util.interleaveTranscript({ entries: [{ kind: "turn" }] })).toEqual([]);
+  });
 });
 
 describe("evalHealth / needsAttention / rollupLine", () => {

@@ -66,7 +66,7 @@ import {
   readTranscriptRaw,
   resolveSessionRoot,
 } from "./sessions";
-import { capabilityBadges, specView } from "./spec-view";
+import { BADGE_KEYS, capabilityBadges, specView } from "./spec-view";
 
 export type StaticAsset = {
   readonly body: string | Uint8Array;
@@ -190,9 +190,17 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     return entry.dir;
   };
 
+  const readYamlSafe = (dir: string): string => {
+    try {
+      return readFileSync(join(dir, "crewhaus.yaml"), "utf8");
+    } catch {
+      return "";
+    }
+  };
+
   const readHeaderSafe = (dir: string): { name?: string; target?: string; model?: string } => {
     try {
-      return readSpecHeader(readFileSync(join(dir, "crewhaus.yaml"), "utf8"));
+      return readSpecHeader(readYamlSafe(dir));
     } catch {
       return {};
     }
@@ -227,7 +235,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   const harnessRows = (hydrate: boolean): unknown => {
     const rows = registry.list().map((entry) => {
       const missing = entry.missingSince !== null;
-      const header = missing ? {} : readHeaderSafe(entry.dir);
+      const yamlText = missing ? "" : readYamlSafe(entry.dir);
+      let header: { name?: string; target?: string; model?: string } = {};
+      try {
+        header = readSpecHeader(yamlText);
+      } catch {
+        header = {};
+      }
       let rollup: HarnessRollup | null = null;
       let rollupStaleCachedAt: string | undefined;
       if (!missing) {
@@ -239,6 +253,15 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           rollupStaleCachedAt = peeked.staleCachedAt;
         }
       }
+      // Flattened alongside the nested rollup: the row-level fields the
+      // Library table cannot derive client-side — capability badges (lenient
+      // spec scan), eval health vs the pinned baseline, and the honest
+      // as-of time for whichever rollup figures (fresh or stale) exist.
+      const badges = capabilityBadges(yamlText);
+      const capabilities = BADGE_KEYS.filter((k) => badges[k]);
+      const evalHealthy = missing
+        ? null
+        : evalHealth(join(entry.dir, ".crewhaus", "evals"), header.name ?? entry.specName).healthy;
       return {
         id: entry.id,
         dir: entry.dir,
@@ -254,6 +277,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         registeredAt: entry.registeredAt,
         lastSeen: entry.lastSeen,
         missingSince: entry.missingSince,
+        capabilities,
+        evalHealthy,
+        cachedAt: rollup?.cachedAt ?? rollupStaleCachedAt ?? null,
         rollup,
         ...(rollupStaleCachedAt !== undefined ? { rollupStaleCachedAt } : {}),
       };
@@ -283,6 +309,11 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     } catch {
       yamlText = "";
     }
+    // Small memory-fabric counts for the Overview mini-cards: live facts +
+    // wiki articles on disk. Counts only — the full views stay on their own
+    // /memory/* routes.
+    const facts = factsView(dir, now()).files.reduce((n, f) => n + f.live, 0);
+    const articles = wikiView(dir).articles.length;
     return {
       entry,
       missing: false,
@@ -291,6 +322,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       preflight: { ok: report.ok, ...counts },
       badges: capabilityBadges(yamlText),
       envFiles: merged.envFiles,
+      memory: { facts, articles },
       rollup: cache.get(entry.id, dir, now()),
     };
   };

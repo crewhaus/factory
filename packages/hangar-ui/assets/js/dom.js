@@ -125,6 +125,23 @@ export function asOf(cachedAtIso) {
   });
 }
 
+/**
+ * Error/notice toast — the "no write ever fails silently" affordance. One
+ * toast at a time (a newer message replaces the older); auto-dismisses, and
+ * `role="alert"` makes screen readers announce it.
+ */
+export function toast(message, kind = "error") {
+  for (const old of document.querySelectorAll(".toast")) old.remove();
+  const node = el("div", {
+    class: `toast toast-${kind === "error" ? "error" : "info"}`,
+    role: "alert",
+    text: message,
+  });
+  document.body.appendChild(node);
+  setTimeout(() => node.remove(), 6000);
+  return node;
+}
+
 /** Click-to-copy button (clipboard API; silently no-ops when unavailable). */
 export function copyBtn(value, label = "copy") {
   const btn = el("button", { class: "btn btn-ghost btn-copy", type: "button", text: label });

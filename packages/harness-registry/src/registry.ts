@@ -21,11 +21,13 @@
  *     explicit `remove()` deletes a row.
  *
  * watchme interop: `seedFromWatchme()` merges the legacy watchme registry
- * in once (idempotent, safe every boot), and `upsert`/`remove`/`relocate`
- * write through to the watchme registry best-effort so the two files stay
- * in sync until that registry delegates here. The write-through uses
- * `@crewhaus/watchme-store`'s own API — this package never touches the
- * watchme file format directly.
+ * in once (idempotent, safe every boot), and `upsert`/`relocate` MIRROR
+ * freshness (dir/specName/target) onto a watchme row that ALREADY exists,
+ * best-effort. Hangar-side writes never create a watchme row, never delete
+ * one, and never touch `share`/`agentId` — watchme membership means
+ * "explicitly watched" and belongs to the watchme verbs (`watchme start`,
+ * `watchme stop --forget`) alone. The mirror uses `@crewhaus/watchme-store`'s
+ * own API — this package never touches the watchme file format directly.
  */
 import {
   existsSync,
@@ -125,7 +127,9 @@ export type HangarRegistry = {
   /** True when `CREWHAUS_NO_REGISTRY` disabled all writes. */
   readonly disabled: boolean;
   /** All entries, missing-dir state freshly stamped (and persisted, along
-   *  with any pending v1 lift, unless writes are disabled). */
+   *  with any pending v1 lift, unless writes are disabled). An unwritable
+   *  registry root degrades to the computed, un-persisted view (reported
+   *  via `onWarn`) — a read surface never fails on a persist error. */
   list(opts?: ListOptions): HangarHarnessEntry[];
   /** Look up by absolute dir or `hrn_` id; liveness is recomputed for the
    *  returned entry but nothing is persisted. */
@@ -291,12 +295,32 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
   /** Read-merge-write with a fingerprint-checked retry loop: if another
    *  writer landed between our read and our rename, re-read and re-apply
    *  rather than clobbering their rows. Disabled mode computes the result
-   *  against the current file but never writes. */
-  const mutate = <T>(fn: Mutation<T>): { result: T; wrote: boolean } => {
+   *  against the current file but never writes. `degradeOnWriteError` is for
+   *  read-triggered persists (list()'s stamp/lift heals): a failing write
+   *  (EROFS, EACCES, ENOSPC) warns and returns the computed view un-persisted
+   *  — mirroring the disabled path — instead of failing a semantic read. */
+  const mutate = <T>(
+    fn: Mutation<T>,
+    mutateOpts: { readonly degradeOnWriteError?: boolean } = {},
+  ): { result: T; wrote: boolean } => {
     if (disabled) {
       const out = fn(read());
       return { result: out.result, wrote: false };
     }
+    const tryWrite = (doc: HangarRegistryDoc): boolean => {
+      try {
+        writeDoc(doc);
+        return true;
+      } catch (err) {
+        if (mutateOpts.degradeOnWriteError !== true) throw err;
+        onWarn(
+          `harness-registry: could not persist to ${path} (continuing with the un-persisted view): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        return false;
+      }
+    };
     for (let attempt = 0; attempt < MAX_WRITE_ATTEMPTS; attempt++) {
       const state = read();
       const out = fn(state);
@@ -305,16 +329,14 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
         sleepSync(1 + attempt * 2);
         continue;
       }
-      writeDoc(out.doc);
-      return { result: out.result, wrote: true };
+      return { result: out.result, wrote: tryWrite(out.doc) };
     }
     // Contention exhausted the retries: land last-writer-wins on a final
     // fresh read (still merge-based, so only same-instant races can lose).
     const state = read();
     const out = fn(state);
     if (!out.write) return { result: out.result, wrote: false };
-    writeDoc(out.doc);
-    return { result: out.result, wrote: true };
+    return { result: out.result, wrote: tryWrite(out.doc) };
   };
 
   const findEntry = (doc: HangarRegistryDoc, dirOrId: string): HangarHarnessEntry | undefined =>
@@ -327,7 +349,7 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
     harnesses: [...doc.harnesses.filter((e) => e.id !== entry.id), entry],
   });
 
-  // ---- watchme write-through (best-effort, never fails the primary write) --
+  // ---- watchme mirror (best-effort, never fails the primary write) --------
 
   const watchme = (): ReturnType<typeof openWatchmeRegistry> =>
     openWatchmeRegistry(watchmeRoot, { now, onWarn: () => {} });
@@ -339,29 +361,32 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
       }`,
     );
 
-  const watchmeUpsert = (entry: HangarHarnessEntry): void => {
+  /**
+   * Freshness-only mirror: refresh the dir/specName/target of a watchme row
+   * that ALREADY exists, and nothing else. A hangar-side write never CREATES
+   * a watchme row (membership means "explicitly watched" — only the watchme
+   * verbs enroll, so `watchme stop --forget` stays durable) and never
+   * touches `share`/`agentId` (those belong to the watchme verbs too — a
+   * fresh hangar row defaulting share:false must not clobber an enrolled
+   * share:true). `previousDir` handles relocate: the pre-existing row is
+   * looked up at the OLD dir and moved.
+   */
+  const watchmeRefresh = (entry: HangarHarnessEntry, previousDir?: string): void => {
     try {
       const reg = watchme();
-      // Preserve a previously-recorded agentId — the watchme register API
-      // replaces descriptive fields wholesale.
-      const prev = reg.list().find((e) => e.dir === entry.dir);
+      const fromDir = previousDir ?? entry.dir;
+      const prev = reg.list().find((e) => e.dir === fromDir);
+      if (prev === undefined) return; // never explicitly watched — never create
+      if (previousDir !== undefined && previousDir !== entry.dir) reg.deregister(previousDir);
       reg.register({
         dir: entry.dir,
         specName: entry.specName,
         target: entry.target,
-        share: entry.watchme.share,
-        ...(prev?.agentId !== undefined ? { agentId: prev.agentId } : {}),
+        ...(prev.share !== undefined ? { share: prev.share } : {}),
+        ...(prev.agentId !== undefined ? { agentId: prev.agentId } : {}),
       });
     } catch (err) {
       warnInterop("register", err);
-    }
-  };
-
-  const watchmeRemove = (dir: string): void => {
-    try {
-      watchme().deregister(dir);
-    } catch (err) {
-      warnInterop("deregister", err);
     }
   };
 
@@ -370,25 +395,31 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
   const list = (listOpts: ListOptions = {}): HangarHarnessEntry[] => {
     const includeMissing = listOpts.includeMissing !== false;
     const stampIso = nowIso();
-    const { result } = mutate<HangarHarnessEntry[]>((state) => {
-      let stampsChanged = false;
-      const entries = state.doc.harnesses.map((entry) => {
-        const alive = existsSync(entry.dir);
-        if (!alive && entry.missingSince === null) {
-          stampsChanged = true;
-          return { ...entry, missingSince: stampIso };
-        }
-        if (alive && entry.missingSince !== null) {
-          stampsChanged = true;
-          return { ...entry, missingSince: null };
-        }
-        return entry;
-      });
-      // Persist when stamps moved, or to heal a pre-v2 / id-less document.
-      // A registry that has never been written is NOT created by a read.
-      const write = stampsChanged || (state.existed && state.healable && state.lifted);
-      return { doc: { ...state.doc, harnesses: entries }, result: entries, write };
-    });
+    const { result } = mutate<HangarHarnessEntry[]>(
+      (state) => {
+        let stampsChanged = false;
+        const entries = state.doc.harnesses.map((entry) => {
+          const alive = existsSync(entry.dir);
+          if (!alive && entry.missingSince === null) {
+            stampsChanged = true;
+            return { ...entry, missingSince: stampIso };
+          }
+          if (alive && entry.missingSince !== null) {
+            stampsChanged = true;
+            return { ...entry, missingSince: null };
+          }
+          return entry;
+        });
+        // Persist when stamps moved, or to heal a pre-v2 / id-less document.
+        // A registry that has never been written is NOT created by a read.
+        const write = stampsChanged || (state.existed && state.healable && state.lifted);
+        return { doc: { ...state.doc, harnesses: entries }, result: entries, write };
+        // degrade: list() is semantically a READ — an unwritable registry root
+        // (root-owned ~/.crewhaus, read-only home fs, disk full) must not take
+        // down every read surface just because a stamp/lift wanted persisting.
+      },
+      { degradeOnWriteError: true },
+    );
     const sorted = [...result].sort((a, b) => a.dir.localeCompare(b.dir));
     return includeMissing ? sorted : sorted.filter((e) => e.missingSince === null);
   };
@@ -452,7 +483,7 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
         write: true,
       };
     });
-    if (wrote) watchmeUpsert(result);
+    if (wrote) watchmeRefresh(result);
     return result;
   };
 
@@ -466,7 +497,8 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
         write: true,
       };
     });
-    if (wrote && result !== undefined) watchmeRemove(result.dir);
+    // Deliberately NO watchme mirror: removing a hangar row never
+    // un-watches a harness the user explicitly enrolled.
     return wrote && result !== undefined;
   };
 
@@ -488,8 +520,9 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
       return { doc: replaceEntry(state.doc, next), result: next, write: true };
     });
     if (wrote && result !== undefined && oldDir !== undefined && oldDir !== result.dir) {
-      watchmeRemove(oldDir);
-      watchmeUpsert(result);
+      // Move a PRE-EXISTING watchme row along with the relocate (a dir
+      // refresh of an explicitly-watched harness); never creates one.
+      watchmeRefresh(result, oldDir);
     }
     return result;
   };

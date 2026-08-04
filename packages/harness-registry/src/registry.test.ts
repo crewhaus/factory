@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -350,6 +351,68 @@ describe("migrate-on-read (v1 lift)", () => {
     reg.upsert({ dir: harness, specName: "healer", target: "cli" });
     expect(readRaw(root)["v"]).toBe(2);
     expect(reg.list().length).toBe(1);
+  });
+
+  test("list() degrades to the computed view when a missing-dir stamp cannot persist", () => {
+    // Read surfaces must survive an unwritable registry root (root-owned
+    // ~/.crewhaus, read-only home fs): the stamp heal is best-effort, the
+    // entries still come back, and the failure is reported via onWarn.
+    const root = newRoot();
+    const harness = newHarnessDir(root, "doomed");
+    const warnings: string[] = [];
+    const reg = openReg(root, { onWarn: (message) => warnings.push(message) });
+    reg.upsert({ dir: harness, specName: "doomed", target: "cli" });
+    rmSync(harness, { recursive: true, force: true }); // → next list wants to stamp
+    chmodSync(join(root, "registry"), 0o500); // readable, unwritable
+    try {
+      const listed = reg.list();
+      expect(listed.length).toBe(1);
+      expect(typeof listed[0]?.missingSince).toBe("string"); // stamped in the view…
+    } finally {
+      chmodSync(join(root, "registry"), 0o700);
+    }
+    // …but not on disk, and the read did not throw.
+    const persisted = (readRaw(root)["harnesses"] as Record<string, unknown>[])[0];
+    expect(persisted?.["missingSince"]).toBeNull();
+    expect(warnings.some((w) => w.includes("could not persist"))).toBe(true);
+  });
+
+  test("list() degrades on an unwritable root with a pending v1 lift, then heals when writable", () => {
+    const root = newRoot();
+    const harness = newHarnessDir(root, "legacy-ro");
+    const registryRoot = join(root, "registry");
+    mkdirSync(registryRoot, { recursive: true });
+    const v1 = JSON.stringify({
+      v: 1,
+      harnesses: [
+        {
+          dir: harness,
+          specName: "legacy-ro",
+          target: "cli",
+          registeredAt: 1_000,
+          lastSeen: 2_000,
+        },
+      ],
+    });
+    writeFileSync(regFile(root), v1, "utf8");
+    const warnings: string[] = [];
+    const reg = openReg(root, { onWarn: (message) => warnings.push(message) });
+    chmodSync(registryRoot, 0o500);
+    let liftedId: string | undefined;
+    try {
+      const listed = reg.list(); // lift wants persisting — write fails, view survives
+      expect(listed.length).toBe(1);
+      liftedId = listed[0]?.id;
+      expect(liftedId).toMatch(ID_RE);
+      expect(readFileSync(regFile(root), "utf8")).toBe(v1); // still v1 on disk
+      expect(warnings.some((w) => w.includes("could not persist"))).toBe(true);
+    } finally {
+      chmodSync(registryRoot, 0o700);
+    }
+    // Once the root is writable again the same handle heals with the SAME id.
+    const healed = reg.list();
+    expect(healed[0]?.id).toBe(liftedId);
+    expect(readRaw(root)["v"]).toBe(2);
   });
 
   test("malformed rows inside an otherwise-valid file are skipped", () => {

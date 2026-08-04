@@ -1,12 +1,15 @@
 /**
  * Interop with the legacy watchme registry: the one-time seed merge and the
- * best-effort write-through that keeps `harnesses.json` (v2) and the
- * watchme `harnesses.json` (v1) in sync. Everything goes through
- * `@crewhaus/watchme-store`'s public API — the watchme file format is never
- * touched directly, here or in the implementation.
+ * best-effort freshness mirror. The policy under test: watchme membership
+ * means EXPLICITLY WATCHED — hangar-side writes (upsert/registerHook/scan/
+ * server CRUD) never create a watchme row, never delete one, and never touch
+ * `share`/`agentId`; only dir/specName/target freshness of a pre-existing
+ * row is mirrored. Everything goes through `@crewhaus/watchme-store`'s
+ * public API — the watchme file format is never touched directly, here or
+ * in the implementation.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openHarnessRegistry as openWatchmeRegistry } from "@crewhaus/watchme-store";
@@ -88,95 +91,149 @@ describe("seedFromWatchme", () => {
   });
 });
 
-describe("write-through (dual-write)", () => {
-  test("upsert writes through to the watchme registry; remove deregisters", () => {
+describe("freshness mirror (hangar → watchme)", () => {
+  test("upsert of a never-watched dir creates no watchme row — not even a watchme file", () => {
     const root = newRoot();
-    const harness = newHarnessDir(root, "synced");
-    const reg = openReg(root, { now: () => 1_000 });
-    reg.upsert({ dir: harness, specName: "synced", target: "cli", watchme: { share: true } });
-
-    const legacy = openWatchmeRegistry(watchmeRootOf(root), { onWarn: () => {} });
-    const mirrored = legacy.list().find((e) => e.dir === harness);
-    expect(mirrored?.specName).toBe("synced");
-    expect(mirrored?.target).toBe("cli");
-    expect(mirrored?.share).toBe(true);
-
-    reg.remove(harness);
-    expect(legacy.list().find((e) => e.dir === harness)).toBeUndefined();
+    const harness = newHarnessDir(root, "unwatched");
+    const reg = openReg(root);
+    // Even a hangar row that CARRIES a share flag never enrolls: membership
+    // belongs to the watchme verbs alone.
+    reg.upsert({ dir: harness, specName: "unwatched", target: "cli", watchme: { share: true } });
+    expect(existsSync(join(watchmeRootOf(root), "harnesses.json"))).toBe(false);
   });
 
-  test("a refresh preserves the agentId the watchme registry already had", () => {
+  test("a share:true watchme row survives a fresh-hangar-row hook upsert", () => {
+    // The F-1 clobber scenario: enrolled via `watchme start` with share:true,
+    // hangar has never seen the dir, then `crewhaus run` fires the hook. The
+    // fresh hangar row defaults watchme.share=false — the mirror must not
+    // push that default onto the explicitly-enrolled row.
+    const root = newRoot();
+    const harness = newHarnessDir(root, "shared");
+    const legacy = openWatchmeRegistry(watchmeRootOf(root), { now: () => 1_000 });
+    legacy.register({ dir: harness, specName: "shared", target: "cli", share: true });
+
+    const reg = openReg(root, { now: () => 2_000 });
+    const hook = reg.registerHook({
+      dir: harness,
+      specName: "shared",
+      target: "cli",
+      originDetail: "run",
+    });
+    expect(hook.ok).toBe(true);
+    expect(reg.get(harness)?.watchme.share).toBe(false); // hangar default…
+    expect(legacy.list().find((e) => e.dir === harness)?.share).toBe(true); // …never mirrored
+  });
+
+  test("a refresh mirrors specName/target freshness but preserves share and agentId", () => {
     const root = newRoot();
     const harness = newHarnessDir(root, "agented");
     const legacy = openWatchmeRegistry(watchmeRootOf(root), { now: () => 1_000 });
-    legacy.register({ dir: harness, specName: "agented", target: "cli", agentId: "agent-42" });
+    legacy.register({
+      dir: harness,
+      specName: "agented",
+      target: "cli",
+      share: true,
+      agentId: "agent-42",
+    });
 
     const reg = openReg(root, { now: () => 2_000 });
     reg.upsert({ dir: harness, specName: "agented-v2", target: "channel" });
 
     const mirrored = legacy.list().find((e) => e.dir === harness);
     expect(mirrored?.specName).toBe("agented-v2");
+    expect(mirrored?.target).toBe("channel");
+    expect(mirrored?.share).toBe(true);
     expect(mirrored?.agentId).toBe("agent-42");
   });
 
-  test("relocate moves the watchme row to the new dir", () => {
+  test("hangar remove never deletes a watchme row", () => {
+    const root = newRoot();
+    const harness = newHarnessDir(root, "kept-watched");
+    const legacy = openWatchmeRegistry(watchmeRootOf(root), { now: () => 1_000 });
+    legacy.register({ dir: harness, specName: "kept-watched", target: "cli", share: true });
+
+    const reg = openReg(root);
+    reg.upsert({ dir: harness, specName: "kept-watched", target: "cli" });
+    expect(reg.remove(harness)).toBe(true);
+    expect(reg.get(harness)).toBeUndefined();
+    // Still explicitly watched: only `watchme stop --forget` un-enrolls.
+    expect(legacy.list().find((e) => e.dir === harness)?.share).toBe(true);
+  });
+
+  test("watchme stop --forget stays durable: later hangar refreshes never re-enroll", () => {
+    const root = newRoot();
+    const harness = newHarnessDir(root, "forgotten");
+    const legacy = openWatchmeRegistry(watchmeRootOf(root), { now: () => 1_000 });
+    legacy.register({ dir: harness, specName: "forgotten", target: "cli" });
+
+    const reg = openReg(root);
+    reg.upsert({ dir: harness, specName: "forgotten", target: "cli" });
+    legacy.deregister(harness); // what `watchme stop --forget` does
+    // The surviving hangar row keeps getting touched by command hooks…
+    reg.upsert({ dir: harness, specName: "forgotten", target: "cli" });
+    reg.registerHook({ dir: harness, originDetail: "run" });
+    // …but the watchme registry never regains the row.
+    expect(legacy.list().find((e) => e.dir === harness)).toBeUndefined();
+  });
+
+  test("relocate moves a pre-existing watchme row (share/agentId intact); never creates one", () => {
     const root = newRoot();
     const oldDir = newHarnessDir(root, "old-spot");
     const newDir = newHarnessDir(root, "new-spot");
+    const legacy = openWatchmeRegistry(watchmeRootOf(root), { now: () => 1_000 });
+    legacy.register({
+      dir: oldDir,
+      specName: "mover",
+      target: "cli",
+      share: true,
+      agentId: "agent-7",
+    });
+
     const reg = openReg(root);
     const entry = reg.upsert({ dir: oldDir, specName: "mover", target: "cli" });
     reg.relocate(entry.id, newDir);
+    const rows = legacy.list();
+    expect(rows.map((e) => e.dir)).not.toContain(oldDir);
+    const moved = rows.find((e) => e.dir === newDir);
+    expect(moved?.share).toBe(true);
+    expect(moved?.agentId).toBe("agent-7");
 
-    const legacy = openWatchmeRegistry(watchmeRootOf(root), { onWarn: () => {} });
+    // A never-watched harness relocates without gaining a watchme row.
+    const plainOld = newHarnessDir(root, "plain-old");
+    const plainNew = newHarnessDir(root, "plain-new");
+    const plain = reg.upsert({ dir: plainOld, specName: "plain", target: "cli" });
+    reg.relocate(plain.id, plainNew);
     const dirs = legacy.list().map((e) => e.dir);
-    expect(dirs).toContain(newDir);
-    expect(dirs).not.toContain(oldDir);
+    expect(dirs).not.toContain(plainOld);
+    expect(dirs).not.toContain(plainNew);
   });
 
-  test("a failing watchme write-through never fails the primary write", () => {
+  test("a failing watchme mirror never fails the primary write", () => {
     const root = newRoot();
     const harness = newHarnessDir(root, "resilient");
-    const blocker = join(root, "a-file");
-    // watchme root nested under a regular FILE → its mkdir must fail.
-    mkdirSync(join(root, "registry"), { recursive: true });
-    writeFileSync(blocker, "not a dir", "utf8");
+    // A PRE-EXISTING watchme row, so the mirror attempts a register write…
+    const legacy = openWatchmeRegistry(watchmeRootOf(root), { now: () => 1_000 });
+    legacy.register({ dir: harness, specName: "resilient", target: "cli" });
     const warnings: string[] = [];
-    const reg = openHangarRegistry({
-      root: join(root, "registry"),
-      watchmeRoot: join(blocker, "watchme"),
-      env: {},
-      onWarn: (message) => warnings.push(message),
-    });
-    const entry = reg.upsert({ dir: harness, specName: "resilient", target: "cli" });
-    expect(entry.id).toMatch(/^hrn_[0-9a-f]{16}$/);
-    expect(reg.list().map((e) => e.dir)).toEqual([harness]);
+    const reg = openReg(root, { onWarn: (message) => warnings.push(message) });
+    // …against a read-only watchme root (reads fine, tmp-file write fails).
+    chmodSync(watchmeRootOf(root), 0o500);
+    try {
+      const entry = reg.upsert({ dir: harness, specName: "resilient-v2", target: "cli" });
+      expect(entry.id).toMatch(/^hrn_[0-9a-f]{16}$/);
+      expect(reg.list().map((e) => e.dir)).toEqual([harness]);
+    } finally {
+      chmodSync(watchmeRootOf(root), 0o700);
+    }
     expect(warnings.length).toBeGreaterThanOrEqual(1);
     expect(warnings[0]).toContain("write-through failed");
   });
 
-  test("NO_REGISTRY suppresses the write-through too", () => {
+  test("NO_REGISTRY suppresses the mirror too", () => {
     const root = newRoot();
     const harness = newHarnessDir(root, "frozen");
     const frozen = openReg(root, { env: { CREWHAUS_NO_REGISTRY: "1" } });
     frozen.upsert({ dir: harness, specName: "frozen", target: "cli" });
     expect(existsSync(join(watchmeRootOf(root), "harnesses.json"))).toBe(false);
-  });
-
-  test("both files stay in agreement after a mixed sequence", () => {
-    const root = newRoot();
-    const a = newHarnessDir(root, "a");
-    const b = newHarnessDir(root, "b");
-    const reg = openReg(root);
-    reg.upsert({ dir: a, specName: "a", target: "cli" });
-    reg.upsert({ dir: b, specName: "b", target: "channel", watchme: { share: true } });
-    reg.remove(a);
-
-    const legacy = openWatchmeRegistry(watchmeRootOf(root), { onWarn: () => {} });
-    expect(legacy.list().map((e) => e.dir)).toEqual([b]);
-    expect(reg.list().map((e) => e.dir)).toEqual([b]);
-
-    // The watchme file is 0600, as its own store writes it.
-    const watchmeFile = join(watchmeRootOf(root), "harnesses.json");
-    expect(readFileSync(watchmeFile, "utf8")).toContain(b);
   });
 });

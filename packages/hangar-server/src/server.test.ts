@@ -106,6 +106,17 @@ function goldenHarness(t: TestServer): string {
   });
 }
 
+/** The golden fixture's zero-filled 7-day cost buckets at `NOW`: 2 priced
+ *  calls (2000 micros) land on yesterday, everything else is zero. */
+function goldenDays(): Array<{ day: string; usdMicros: number; calls: number }> {
+  const days: Array<{ day: string; usdMicros: number; calls: number }> = [];
+  for (let i = 6; i >= 0; i -= 1) {
+    const day = iso(NOW - i * DAY).slice(0, 10);
+    days.push(i === 1 ? { day, usdMicros: 2000, calls: 2 } : { day, usdMicros: 0, calls: 0 });
+  }
+  return days;
+}
+
 describe("healthz + version + static", () => {
   test("healthz is unauthenticated; version requires auth and reports protocolV", async () => {
     const t = boot({ now: () => NOW });
@@ -452,6 +463,9 @@ describe("/api/harnesses rows + rollup cache", () => {
       registeredAt: iso(NOW),
       lastSeen: iso(NOW),
       missingSince: null,
+      capabilities: [],
+      evalHealthy: true, // runs exist but no baseline is pinned
+      cachedAt: iso(NOW),
       rollup: {
         digest: "<digest>",
         cachedAt: iso(NOW),
@@ -481,6 +495,7 @@ describe("/api/harnesses rows + rollup cache", () => {
               outputTokens: 0,
             },
           ],
+          days: goldenDays(),
           truncatedFiles: 0,
         },
       },
@@ -592,6 +607,7 @@ describe("cost routes", () => {
             outputTokens: 0,
           },
         ],
+        days: goldenDays(),
         truncatedFiles: 0,
       },
     });

@@ -5,8 +5,16 @@
  */
 
 import { api } from "../api.js";
-import { asOf, clear, collapsible, dot, el, emptyState, skeleton, svgEl } from "../dom.js";
-import { barRects, fmtCount, fmtPct, fmtRelativeTime, fmtUsd, sparklinePath } from "../util.js";
+import { clear, collapsible, dot, el, emptyState, skeleton, svgEl } from "../dom.js";
+import {
+  barRects,
+  fmtCount,
+  fmtPct,
+  fmtUsd,
+  healthChecks,
+  sparklinePath,
+  usdFromMicros,
+} from "../util.js";
 
 export async function renderOverview(root, ctx) {
   clear(root).appendChild(skeleton(5));
@@ -37,7 +45,9 @@ function card(title, children) {
 }
 
 function healthCard(detail) {
-  const checks = Array.isArray(detail?.health?.checks) ? detail.health.checks : [];
+  // The detail payload's `health` is the server's HarnessHealth record;
+  // `healthChecks` maps its fields into checklist rows.
+  const checks = healthChecks(detail?.health);
   if (checks.length === 0) {
     return card("Health", emptyState("No health data yet", "crewhaus doctor"));
   }
@@ -48,11 +58,8 @@ function healthCard(detail) {
       { class: "check-list" },
       checks.map((c) =>
         el("li", null, [
-          dot(
-            c.pass === false ? "bad" : c.warn === true ? "warn" : "ok",
-            String(c.label ?? "check"),
-          ),
-          c.reason ? el("span", { class: "muted reason", text: String(c.reason) }) : null,
+          dot(c.state, c.label),
+          c.reason ? el("span", { class: "muted reason", text: c.reason }) : null,
         ]),
       ),
     ),
@@ -90,6 +97,7 @@ function evalTrendCard(evals) {
 }
 
 function memoryCard(detail) {
+  // The detail payload carries small counts only: { facts, articles }.
   const mem = detail?.memory && typeof detail.memory === "object" ? detail.memory : null;
   if (mem === null) {
     return card("Memory fabric", emptyState("No memory data yet", "crewhaus remember"));
@@ -102,33 +110,27 @@ function memoryCard(detail) {
   return card(
     "Memory fabric",
     el("div", { class: "mini-row" }, [
-      mini("facts", fmtCount(mem.facts ?? mem.factCount)),
-      mini("wiki articles", fmtCount(mem.wikiArticles ?? mem.wikiCount)),
-      mini("plans", fmtCount(mem.plans ?? mem.planCount)),
-      mini(
-        "last dream",
-        typeof mem.lastDreamAt === "string" ? fmtRelativeTime(mem.lastDreamAt, Date.now()) : "—",
-      ),
+      mini("live facts", fmtCount(mem.facts)),
+      mini("wiki articles", fmtCount(mem.articles)),
     ]),
   );
 }
 
-function costCard(costs) {
+function costCard(payload) {
+  // `/api/h/:id/costs` returns { id, costs: { spend7dUsdMicros, days, … } }.
+  const costs = payload?.costs && typeof payload.costs === "object" ? payload.costs : null;
   const days = Array.isArray(costs?.days) ? costs.days : [];
-  if (days.length === 0) {
+  if (costs === null || (costs.calls === 0 && days.every((d) => d.usdMicros === 0))) {
     return card(
       "Spend (7d)",
       emptyState("No cost data yet", "crewhaus run (cost tracking is on by default)"),
     );
   }
-  const values = days.map((d) => (typeof d.costUsd === "number" ? d.costUsd : 0));
-  const total = values.reduce((a, b) => a + b, 0);
+  const values = days.map((d) => usdFromMicros(d.usdMicros) ?? 0);
+  const total = usdFromMicros(costs.spend7dUsdMicros);
   const rects = barRects(values.slice(-7), 220, 44);
   return card("Spend (7d)", [
-    el("div", { class: "big-stat" }, [
-      el("span", { class: "stat-num", text: fmtUsd(total) }),
-      costs?.cachedAt ? asOf(costs.cachedAt) : null,
-    ]),
+    el("div", { class: "big-stat" }, [el("span", { class: "stat-num", text: fmtUsd(total) })]),
     svgEl(
       "svg",
       { class: "bars", viewBox: "0 0 220 44", role: "img", "aria-label": "daily spend bars" },
@@ -143,7 +145,9 @@ const LEVEL_META = {
   blocking: { mark: "✗", state: "bad" },
 };
 
-function preflightCard(report) {
+function preflightCard(payload) {
+  // The preflight route returns { report, envFiles }; tolerate a bare report.
+  const report = payload?.report && typeof payload.report === "object" ? payload.report : payload;
   const items = Array.isArray(report?.items) ? report.items : [];
   if (items.length === 0) {
     return card("Preflight", emptyState("No preflight report yet", "crewhaus harness preflight"));

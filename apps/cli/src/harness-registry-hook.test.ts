@@ -47,8 +47,9 @@ type RegistryDoc = {
 async function runCompile(
   cwd: string,
   extraEnv: Record<string, string>,
+  specArg = "crewhaus.yaml",
 ): Promise<{ exitCode: number }> {
-  const proc = Bun.spawn([process.execPath, CLI_PATH, "compile", "crewhaus.yaml", "--emit-loop"], {
+  const proc = Bun.spawn([process.execPath, CLI_PATH, "compile", specArg, "--emit-loop"], {
     cwd,
     env: { PATH: process.env["PATH"] ?? "", ...extraEnv },
     stdin: "ignore",
@@ -88,6 +89,32 @@ describe("Hangar F-1 — command-path self-registration", () => {
     expect(entry?.specName).toBe("hook-probe");
     expect(entry?.target).toBe("cli");
     expect(entry?.origin).toBe("run-hook");
+    expect(entry?.originDetail).toBe("compile");
+  }, 60000);
+
+  test("compile from OUTSIDE the harness dir registers the spec's dir, not the cwd", async () => {
+    // `crewhaus compile starters/x/crewhaus.yaml -o …` from a workspace root
+    // is a routine invocation (the demos verify scripts do exactly this).
+    // The registered row must be the harness (dirname of the resolved spec),
+    // never the invoker's cwd — a workspace root is not a harness, and one
+    // row there would churn its specName to whatever compiled last.
+    const harnessDir = seedHarness(newTempRoot());
+    const invokerCwd = newTempRoot(); // deliberately NOT the harness
+    const regRoot = newTempRoot();
+    const watchmeRoot = newTempRoot();
+    const result = await runCompile(
+      invokerCwd,
+      { CREWHAUS_REGISTRY_ROOT: regRoot, CREWHAUS_WATCHME_ROOT: watchmeRoot },
+      join(harnessDir, "crewhaus.yaml"),
+    );
+    expect(result.exitCode).toBe(0);
+
+    const doc = JSON.parse(readFileSync(join(regRoot, "harnesses.json"), "utf-8")) as RegistryDoc;
+    expect(doc.harnesses).toHaveLength(1);
+    const entry = doc.harnesses[0];
+    expect(entry?.dir).toBe(realpathSync(harnessDir));
+    expect(entry?.dir).not.toBe(realpathSync(invokerCwd));
+    expect(entry?.specName).toBe("hook-probe");
     expect(entry?.originDetail).toBe("compile");
   }, 60000);
 

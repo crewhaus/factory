@@ -6,7 +6,7 @@
  */
 
 import { api } from "../api.js";
-import { asOf, clear, copyBtn, dot, el, emptyState, skeleton } from "../dom.js";
+import { asOf, clear, copyBtn, dot, el, emptyState, skeleton, toast } from "../dom.js";
 import { hrefHarness } from "../router.js";
 import { shapeAccent, shapeLabel } from "../shapes.js";
 import {
@@ -17,6 +17,7 @@ import {
   fmtRelativeTime,
   fmtUsd,
   normalizeRows,
+  oldestCachedAt,
   rollupLine,
   sortRows,
 } from "../util.js";
@@ -27,6 +28,20 @@ const state = {
   filter: { kind: "all" }, // {kind:"all"} | {kind:"group",name} | {kind:"smart",id}
   query: "",
 };
+
+/**
+ * Run one registry write; on failure surface a toast (a write must NEVER
+ * vanish silently) and skip the reload so the form/state stays visible.
+ */
+async function tryWrite(label, fn, onOk) {
+  try {
+    await fn();
+  } catch (err) {
+    toast(`${label} failed: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  onOk();
+}
 
 const COLUMNS = [
   { key: "name", label: "Name", get: (r) => r.specName || dirTail(r.dir, 1) },
@@ -43,14 +58,26 @@ const COLUMNS = [
 
 export async function renderLibrary(root) {
   clear(root).appendChild(skeleton(6));
+  // First paint from the plain (cache-only) feed — instant, stale-labeled
+  // via each row's cachedAt — then a background ?hydrate=1 refetch replaces
+  // the rows with freshly computed rollups.
   const [feedRes, groupsRes] = await Promise.allSettled([api.harnesses(), api.groups()]);
   if (feedRes.status === "rejected") throw feedRes.reason;
-  const feed = feedRes.value;
-  const rows = normalizeRows(feed);
+  const rows = normalizeRows(feedRes.value);
   const groups = normalizeGroups(groupsRes.status === "fulfilled" ? groupsRes.value : null, rows);
-  const cachedAt =
-    feed && typeof feed === "object" && typeof feed.cachedAt === "string" ? feed.cachedAt : null;
-  draw(root, rows, groups, cachedAt);
+  draw(root, rows, groups, { hydrating: true });
+  hydrateInBackground(root, groups);
+}
+
+async function hydrateInBackground(root, groups) {
+  let feed;
+  try {
+    feed = await api.harnesses(true);
+  } catch {
+    return; // the cold paint stands; the next reload retries
+  }
+  if (!root.isConnected) return; // navigated away meanwhile
+  draw(root, normalizeRows(feed), groups, { hydrating: false });
 }
 
 function normalizeGroups(payload, rows) {
@@ -99,9 +126,9 @@ function applyFilter(rows, nowMs) {
   return out;
 }
 
-function draw(root, rows, groups, cachedAt) {
+function draw(root, rows, groups, opts = {}) {
   const nowMs = Date.now();
-  const redraw = () => draw(root, rows, groups, cachedAt);
+  const redraw = () => draw(root, rows, groups, opts);
   const reload = () => renderLibrary(root);
   clear(root);
 
@@ -110,10 +137,12 @@ function draw(root, rows, groups, cachedAt) {
 
   const main = el("section", { class: "lib-main" });
   main.appendChild(renderToolbar(reload));
+  const cachedAt = oldestCachedAt(rows);
   main.appendChild(
     el("div", { class: "rollup" }, [
       el("span", { text: rollupLine(rows) }),
       cachedAt ? asOf(cachedAt) : null,
+      opts.hydrating === true ? el("span", { class: "muted", text: "· refreshing…" }) : null,
     ]),
   );
 
@@ -208,12 +237,11 @@ function groupForm(groups, reload, onCancel) {
     el("button", { class: "btn btn-primary", type: "submit", text: "Add" }),
     el("button", { class: "btn btn-ghost", type: "button", text: "Cancel", onClick: onCancel }),
   ]);
-  form.addEventListener("submit", async (e) => {
+  form.addEventListener("submit", (e) => {
     e.preventDefault();
     const name = input.value.trim();
     if (name === "" || groups.some((g) => g.name === name)) return;
-    await api.saveGroups([...groups, { name, order: groups.length + 1, color: "" }]);
-    reload();
+    tryWrite("Create group", () => api.addGroup(name), reload);
   });
   return form;
 }
@@ -231,29 +259,20 @@ function renderToolbar(reload) {
   });
   search.addEventListener("change", reload);
 
-  const scanBtn = el("button", { class: "btn", type: "button", text: "Scan" });
-  scanBtn.addEventListener("click", async () => {
-    scanBtn.disabled = true;
-    scanBtn.textContent = "Scanning…";
-    try {
-      await api.scan();
-    } finally {
-      reload();
-    }
-  });
-
-  const addBtn = el("button", { class: "btn", type: "button", text: "Add harness…" });
-  const bar = el("div", { class: "toolbar" }, [search, scanBtn, addBtn]);
-  addBtn.addEventListener("click", () => {
+  // A dir-input form under the toolbar (Add harness / Add scan root share
+  // the pattern); only one open at a time.
+  let openedForm = null;
+  const openForm = (bar, placeholder, ariaLabel, submitLabel, onSubmit) => {
+    if (openedForm !== null) openedForm.remove();
     const dirInput = el("input", {
       class: "input grow",
       type: "text",
-      placeholder: "/absolute/path/to/harness",
-      "aria-label": "harness directory",
+      placeholder,
+      "aria-label": ariaLabel,
     });
     const form = el("form", { class: "add-form" }, [
       dirInput,
-      el("button", { class: "btn btn-primary", type: "submit", text: "Add" }),
+      el("button", { class: "btn btn-primary", type: "submit", text: submitLabel }),
       el("button", {
         class: "btn btn-ghost",
         type: "button",
@@ -261,15 +280,66 @@ function renderToolbar(reload) {
         onClick: () => form.remove(),
       }),
     ]);
-    form.addEventListener("submit", async (e) => {
+    form.addEventListener("submit", (e) => {
       e.preventDefault();
       const dir = dirInput.value.trim();
       if (dir === "") return;
-      await api.addHarness(dir);
-      reload();
+      onSubmit(dir);
     });
     bar.after(form);
+    openedForm = form;
     dirInput.focus();
+  };
+
+  const scanBtn = el("button", { class: "btn", type: "button", text: "Scan" });
+  const rootBtn = el("button", { class: "btn", type: "button", text: "Add scan root…" });
+  const addBtn = el("button", { class: "btn", type: "button", text: "Add harness…" });
+  const bar = el("div", { class: "toolbar" }, [search, scanBtn, rootBtn, addBtn]);
+
+  scanBtn.addEventListener("click", async () => {
+    scanBtn.disabled = true;
+    scanBtn.textContent = "Scanning…";
+    try {
+      const result = await api.scan();
+      const roots = result && typeof result === "object" ? result.roots : null;
+      if (roots === 0) {
+        // Zero-work scan is not success — say so and open the fix.
+        toast("No scan roots configured — add one first", "info");
+        rootBtn.click();
+      } else {
+        reload();
+        return;
+      }
+    } catch (err) {
+      toast(`Scan failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      scanBtn.disabled = false;
+      scanBtn.textContent = "Scan";
+    }
+  });
+
+  rootBtn.addEventListener("click", () => {
+    openForm(bar, "/absolute/path/to/scan", "scan root directory", "Add root", (dir) => {
+      // After the root lands, scan it right away so the table fills.
+      tryWrite(
+        "Add scan root",
+        () => api.addScanRoot(dir),
+        async () => {
+          try {
+            await api.scan();
+          } catch {
+            // root saved; the next manual Scan retries discovery
+          }
+          reload();
+        },
+      );
+    });
+  });
+
+  addBtn.addEventListener("click", () => {
+    openForm(bar, "/absolute/path/to/harness", "harness directory", "Add", (dir) => {
+      tryWrite("Add harness", () => api.addHarness(dir), reload);
+    });
   });
   return bar;
 }
@@ -286,21 +356,19 @@ function missingCard(row, reload) {
     dirInput,
     el("button", { class: "btn", type: "submit", text: "Relocate" }),
   ]);
-  relocate.addEventListener("submit", async (e) => {
+  relocate.addEventListener("submit", (e) => {
     e.preventDefault();
     const dir = dirInput.value.trim();
     if (dir === "") return;
-    await api.relocateHarness(row.id, dir);
-    reload();
+    tryWrite("Relocate", () => api.relocateHarness(row.id, dir), reload);
   });
   const removeBtn = el("button", { class: "btn btn-danger", type: "button", text: "Remove entry" });
-  removeBtn.addEventListener("click", async () => {
+  removeBtn.addEventListener("click", () => {
     const sure = window.confirm(
       `Remove "${name}" from the registry? Only the registry row is deleted — no harness data.`,
     );
     if (!sure) return;
-    await api.removeHarness(row.id);
-    reload();
+    tryWrite("Remove", () => api.removeHarness(row.id), reload);
   });
   return el("div", { class: "card missing-card" }, [
     el("div", { class: "missing-head" }, [
@@ -375,9 +443,8 @@ function harnessRow(row, groups, reload) {
     "aria-label": row.pinned ? `unpin ${name}` : `pin ${name}`,
     text: row.pinned ? "★" : "☆",
   });
-  pin.addEventListener("click", async () => {
-    await api.updateRegistry(row.id, { pinned: !row.pinned });
-    reload();
+  pin.addEventListener("click", () => {
+    tryWrite("Pin", () => api.setPin(row.id, !row.pinned), reload);
   });
 
   const tr = el("tr", { class: "fleet-row" }, [
@@ -486,17 +553,23 @@ function editorRow(row, groups, reload) {
       el("button", { class: "btn btn-primary", type: "submit", text: "Save" }),
     ]),
   ]);
-  form.addEventListener("submit", async (e) => {
+  form.addEventListener("submit", (e) => {
     e.preventDefault();
-    await api.updateRegistry(row.id, {
-      tags: tags.value
-        .split(",")
-        .map((t) => t.trim())
-        .filter((t) => t !== ""),
-      notes: notes.value,
-      groups: checks.filter((c) => c.cb.checked).map((c) => c.name),
-    });
-    reload();
+    const tagList = tags.value
+      .split(",")
+      .map((t) => t.trim())
+      .filter((t) => t !== "");
+    const groupList = checks.filter((c) => c.cb.checked).map((c) => c.name);
+    // The server's registry writes are per-field PUTs; save all three.
+    tryWrite(
+      "Save",
+      async () => {
+        await api.setTags(row.id, tagList);
+        await api.setNotes(row.id, notes.value);
+        await api.setGroups(row.id, groupList);
+      },
+      reload,
+    );
   });
   const td = el("td", { colspan: String(COLUMNS.length) }, [form, copyBtn(row.dir, "copy dir")]);
   return el("tr", { class: "editor-tr" }, [td]);

@@ -104,9 +104,10 @@ async function loadVersion() {
   try {
     const v = await api.version();
     if (!v || typeof v !== "object") return;
+    // The version route reports { hangar, protocolV }.
     node = el("span", {
       class: "muted mono foot-version",
-      text: `hangar ${String(v.hangar ?? "?")} · crewhaus ${String(v.cli ?? "?")}`,
+      text: `hangar ${String(v.hangar ?? "?")} · protocol v${String(v.protocolV ?? "?")}`,
     });
   } catch {
     node = el("span", { class: "muted foot-version", text: "version unavailable" });
@@ -170,15 +171,25 @@ async function renderHarnessPage(root, route) {
   else await renderOverview(tabRoot, ctx);
 }
 
+/**
+ * Detail header. The detail payload nests all identity fields under
+ * `entry` (the registry row) with richer names on `inventory`; the header
+ * reads those, never invented top-level fields. Capability chips come from
+ * the server's `badges` (the lenient spec scan) — the M1 posture line.
+ */
 function harnessHeader(detail, route) {
-  const name = String(detail.specName ?? detail.name ?? route.id);
-  const target = String(detail.target ?? "");
-  const dir = String(detail.dir ?? "");
+  const entry = detail.entry && typeof detail.entry === "object" ? detail.entry : {};
+  const inv = detail.inventory && typeof detail.inventory === "object" ? detail.inventory : {};
+  const header = inv.header && typeof inv.header === "object" ? inv.header : {};
+  const name = String(inv.specName ?? entry.specName ?? route.id);
+  const target = String(header.target ?? entry.target ?? "");
+  const dir = String(entry.dir ?? "");
+  const missing = detail.missing === true || typeof entry.missingSince === "string";
   const head = el("div", { class: "h-head", style: { "--accent": shapeAccent(target) } }, [
     el("div", { class: "h-title" }, [
       el("span", { class: "shape-badge", text: shapeLabel(target) }),
       el("h2", { text: name }),
-      detail.missingSince ? dot("bad", "directory missing") : null,
+      missing ? dot("bad", "directory missing") : null,
     ]),
     dir !== ""
       ? el("div", { class: "h-dir" }, [
@@ -186,35 +197,21 @@ function harnessHeader(detail, route) {
           copyBtn(dir, "copy"),
         ])
       : null,
-    safetyStrip(detail.safety),
+    badgeStrip(detail.badges),
   ]);
   return head;
 }
 
-/**
- * The safety strip: the harness's whole posture on one line, straight from
- * the detail payload (parsed-spec values, computed server-side).
- */
-function safetyStrip(safety) {
-  const strip = el("div", { class: "safety-strip", "aria-label": "safety posture" });
-  if (!safety || typeof safety !== "object") {
-    strip.appendChild(el("span", { class: "chip", text: "safety posture unavailable" }));
-    return strip;
-  }
-  const chip = (label, warn = false) =>
-    strip.appendChild(el("span", { class: `chip${warn ? " chip-warn" : ""}`, text: label }));
-  if (safety.permissionsMode) chip(`permissions: ${String(safety.permissionsMode)}`);
-  if (safety.askMode) chip(`ask: ${String(safety.askMode)}`);
-  if (typeof safety.budgetUsd === "number") {
-    chip(`budget $${safety.budgetUsd}${safety.onExceed ? ` → ${String(safety.onExceed)}` : ""}`);
-  } else {
-    chip("no budget cap", true);
-  }
-  if (safety.transactionPolicy) chip(`tx: ${String(safety.transactionPolicy)}`);
-  if (safety.allowPrivateTargets === true) chip("browser: private targets allowed", true);
-  if (safety.thredzMessaging === true) chip("thredz messaging on", true);
-  if (safety.justificationJudge) chip(`judge: ${String(safety.justificationJudge)}`);
-  return strip;
+/** Capability-badge chips from the detail payload's `badges` booleans. */
+function badgeStrip(badges) {
+  if (!badges || typeof badges !== "object") return null;
+  const active = Object.keys(badges).filter((k) => badges[k] === true);
+  if (active.length === 0) return null;
+  return el(
+    "div",
+    { class: "safety-strip", "aria-label": "capabilities" },
+    active.map((k) => el("span", { class: "chip", text: k })),
+  );
 }
 
 function renderNotFound(root, route) {

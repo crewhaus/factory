@@ -36,6 +36,17 @@ export function fmtRelativeTime(iso, nowMs) {
   return diff >= 0 ? `${label} ago` : `in ${label}`;
 }
 
+/**
+ * USD micros → dollars. The server's money unit is integer USD micros
+ * everywhere (rollups, cost folds, gutter events); this is the ONE place
+ * the client converts. Returns null for anything non-numeric so the result
+ * feeds `fmtUsd` (which renders null as "—").
+ */
+export function usdFromMicros(micros) {
+  if (typeof micros !== "number" || !Number.isFinite(micros)) return null;
+  return micros / 1_000_000;
+}
+
 /** Format a dollar figure; "—" for null/undefined/NaN. */
 export function fmtUsd(value) {
   if (typeof value !== "number" || Number.isNaN(value)) return "—";
@@ -124,7 +135,10 @@ export function sortRows(rows, getter, dir = "asc") {
 
 /**
  * Normalize one `/api/harnesses` feed into flat row objects the Library can
- * render. Tolerant by design: the server may send a bare array or
+ * render. The server's row shape is registry fields + flattened
+ * `capabilities`/`evalHealthy`/`cachedAt` + a NESTED `rollup`
+ * (`sessionCount`, `spend7d` in USD micros, `lastEval`, `cachedAt`) that is
+ * null until hydrated. Tolerant by design: the feed may be a bare array or
  * `{ harnesses: [...] }`, and every field falls back rather than throwing.
  */
 export function normalizeRows(feed) {
@@ -135,7 +149,23 @@ export function normalizeRows(feed) {
       : [];
   return list.map((r) => {
     const src = r && typeof r === "object" ? r : {};
+    const rollup = src.rollup && typeof src.rollup === "object" ? src.rollup : null;
     const caps = Array.isArray(src.capabilities) ? src.capabilities.map(String) : [];
+    // Prefer the flat legacy fields when present (tolerance), else the
+    // nested rollup; join the row-level evalHealthy flag onto lastEval so
+    // `evalHealth` can color the dot.
+    const rawEval =
+      src.lastEval && typeof src.lastEval === "object"
+        ? src.lastEval
+        : rollup?.lastEval && typeof rollup.lastEval === "object"
+          ? rollup.lastEval
+          : null;
+    const lastEval =
+      rawEval !== null &&
+      typeof rawEval.healthy !== "boolean" &&
+      typeof src.evalHealthy === "boolean"
+        ? { ...rawEval, healthy: src.evalHealthy }
+        : rawEval;
     return {
       id: typeof src.id === "string" ? src.id : "",
       dir: typeof src.dir === "string" ? src.dir : "",
@@ -159,14 +189,51 @@ export function normalizeRows(feed) {
           : typeof src.lastSeen === "string"
             ? src.lastSeen
             : null,
-      sessions: typeof src.sessions === "number" ? src.sessions : (src.sessionCount ?? null),
-      spend7dUsd: typeof src.spend7dUsd === "number" ? src.spend7dUsd : null,
-      lastEval: src.lastEval && typeof src.lastEval === "object" ? src.lastEval : null,
+      sessions:
+        typeof src.sessions === "number"
+          ? src.sessions
+          : typeof src.sessionCount === "number"
+            ? src.sessionCount
+            : rollup && typeof rollup.sessionCount === "number"
+              ? rollup.sessionCount
+              : null,
+      spend7dUsd:
+        typeof src.spend7dUsd === "number"
+          ? src.spend7dUsd
+          : rollup
+            ? usdFromMicros(rollup.spend7d)
+            : null,
+      lastEval,
       capabilities: caps,
       budgeted: typeof src.budgeted === "boolean" ? src.budgeted : caps.includes("budget"),
-      cachedAt: typeof src.cachedAt === "string" ? src.cachedAt : null,
+      cachedAt:
+        typeof src.cachedAt === "string"
+          ? src.cachedAt
+          : rollup && typeof rollup.cachedAt === "string"
+            ? rollup.cachedAt
+            : typeof src.rollupStaleCachedAt === "string"
+              ? src.rollupStaleCachedAt
+              : null,
     };
   });
+}
+
+/**
+ * The oldest non-null `cachedAt` across rows — the honest fleet-level as-of
+ * time (a rollup line must never claim to be fresher than its stalest row).
+ * Null when no row carries one.
+ */
+export function oldestCachedAt(rows) {
+  let oldest = null;
+  let oldestMs = Number.POSITIVE_INFINITY;
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const ms = parseTs(row && typeof row === "object" ? row.cachedAt : null);
+    if (ms !== null && ms < oldestMs) {
+      oldestMs = ms;
+      oldest = row.cachedAt;
+    }
+  }
+  return oldest;
 }
 
 /**
@@ -237,6 +304,76 @@ export function deriveSmartGroups(rows, nowMs) {
     label: g.label,
     rows: rows.filter((r) => smartGroupMatch(g.id, r, nowMs)),
   }));
+}
+
+/**
+ * Map the server's `HarnessHealth` detail field (registered / pinnedEnvs /
+ * evalHealthy / evalNote / openIncidents / hasAudit) into the Overview
+ * health checklist: `[{ state, label, reason }]` with dot states matching
+ * `dot()` ("ok" | "warn" | "bad" | "off"). Tolerant — absent fields are
+ * skipped, junk input yields [] (the card renders its empty state).
+ */
+export function healthChecks(health) {
+  if (!health || typeof health !== "object") return [];
+  const checks = [];
+  if (typeof health.registered === "boolean") {
+    const pins = Array.isArray(health.pinnedEnvs) ? health.pinnedEnvs.map(String) : [];
+    checks.push({
+      // Unregistered WITH env pins = a pin pointing at nothing — bad.
+      state: health.registered ? "ok" : pins.length > 0 ? "bad" : "warn",
+      label: health.registered ? "spec registered" : "spec not registered",
+      reason: pins.length > 0 ? `pinned envs: ${pins.join(", ")}` : "",
+    });
+  }
+  if (typeof health.evalHealthy === "boolean") {
+    checks.push({
+      state: health.evalHealthy ? "ok" : "bad",
+      label: health.evalHealthy ? "evals healthy" : "eval regression",
+      reason: typeof health.evalNote === "string" ? health.evalNote : "",
+    });
+  }
+  if (typeof health.openIncidents === "number") {
+    const n = health.openIncidents;
+    checks.push({
+      state: n === 0 ? "ok" : "bad",
+      label: n === 0 ? "no open incidents" : `${n} open incident${n === 1 ? "" : "s"}`,
+      reason: "",
+    });
+  }
+  if (typeof health.hasAudit === "boolean") {
+    checks.push({
+      state: health.hasAudit ? "ok" : "off",
+      label: health.hasAudit ? "audit trail present" : "no audit trail",
+      reason: "",
+    });
+  }
+  return checks;
+}
+
+/**
+ * Interleave a server transcript view (`{ turns, tools, gutter }`, each item
+ * carrying a 0-based `line` anchor) into one render-ordered list of
+ * `{ type: "turn"|"tool"|"gutter", ...item }`. Ordering: by line, then
+ * turn < tool < gutter at the same line (a tool_use is emitted at its
+ * assistant turn's line), then source order. Pure + tolerant: junk input
+ * yields [].
+ */
+export function interleaveTranscript(view) {
+  const src = view && typeof view === "object" ? view : {};
+  const staged = [];
+  const stage = (type, items, rank) => {
+    if (!Array.isArray(items)) return;
+    for (const item of items) {
+      if (!item || typeof item !== "object") continue;
+      const line = typeof item.line === "number" ? item.line : 0;
+      staged.push({ type, line, rank, seq: staged.length, item });
+    }
+  };
+  stage("turn", src.turns, 0);
+  stage("tool", src.tools, 1);
+  stage("gutter", src.gutter, 2);
+  staged.sort((a, b) => a.line - b.line || a.rank - b.rank || a.seq - b.seq);
+  return staged.map((s) => ({ type: s.type, ...s.item }));
 }
 
 /**

@@ -37,16 +37,25 @@ async function renderHistory(root, ctx) {
     root.appendChild(emptyState("No evals yet", "crewhaus eval"));
     return;
   }
+  // Baselines are keyed `<spec>::<dataset>` → the pinned run; star any run
+  // that IS a pinned baseline.
+  const baselines = data?.baselines && typeof data.baselines === "object" ? data.baselines : {};
+  const baselineRunIds = new Set(
+    Object.values(baselines)
+      .map((b) => (b && typeof b === "object" ? b.runId : null))
+      .filter((id) => typeof id === "string"),
+  );
   const nowMs = Date.now();
   const tbody = el("tbody");
   for (const run of runs) {
     const runId = String(run.runId ?? run.id ?? "");
     const partial = run.partial === true;
+    const flaky = run.flaky === true || (typeof run.flakyCount === "number" && run.flakyCount > 0);
     tbody.appendChild(
       el("tr", { class: partial ? "deflated" : null }, [
         el("td", { text: fmtRelativeTime(run.ts ?? run.at ?? null, nowMs) }),
         el("td", null, [
-          run.baseline === true
+          baselineRunIds.has(runId)
             ? el("span", { class: "baseline-star", title: "baseline run", text: "★ " })
             : null,
           el("a", {
@@ -55,7 +64,7 @@ async function renderHistory(root, ctx) {
             text: runId || "(run)",
           }),
         ]),
-        el("td", { class: "mono", text: String(run.dataset ?? "—") }),
+        el("td", { class: "mono", text: String(run.datasetName ?? run.dataset ?? "—") }),
         el("td", null, [passDot(run.passRate, run.gatePassed)]),
         el("td", { class: "num", text: fmtScore(run.meanScore) }),
         el("td", {
@@ -63,7 +72,7 @@ async function renderHistory(root, ctx) {
           text: fmtUsd(typeof run.costUsd === "number" ? run.costUsd : null),
         }),
         el("td", { class: "cell-caps" }, [
-          run.flaky === true ? el("span", { class: "chip chip-warn", text: "flaky" }) : null,
+          flaky ? el("span", { class: "chip chip-warn", text: "flaky" }) : null,
           partial ? el("span", { class: "chip chip-warn", text: "partial" }) : null,
           run.replayed === true ? el("span", { class: "chip", text: "replayed" }) : null,
         ]),
@@ -104,37 +113,56 @@ async function renderRun(root, ctx, runId) {
     root.appendChild(emptyState("Nothing here yet — no run with that id"));
     return;
   }
-  const summary = data.summary && typeof data.summary === "object" ? data.summary : data;
+  // The run view is { runId, summary, sampleIds }: `summary` is the run's
+  // parsed results.json (tolerated shape), `sampleIds` the on-disk sample
+  // dirs — the navigable authority for the drill-down table.
+  const summary = data.summary && typeof data.summary === "object" ? data.summary : {};
   root.appendChild(
     el("div", { class: "card" }, [
       el("div", { class: "mini-row" }, [
         miniStat("pass rate", fmtPct(numOr(summary.passRate))),
         miniStat("mean score", fmtScore(summary.meanScore)),
-        miniStat("samples", String(summary.samples ?? summary.sampleCount ?? "—")),
+        miniStat("samples", String(summary.sampleCount ?? summary.samples ?? "—")),
         miniStat("cost", fmtUsd(numOr(summary.costUsd))),
       ]),
     ]),
   );
 
-  const samples = Array.isArray(data.samples) ? data.samples : [];
-  if (samples.length === 0) {
+  const sampleIds = Array.isArray(data.sampleIds) ? data.sampleIds.map(String) : [];
+  if (sampleIds.length === 0) {
     root.appendChild(emptyState("No per-sample results recorded for this run"));
     return;
   }
+  // Join per-sample verdicts out of the summary when it carries them.
+  const verdicts = new Map();
+  const summaryRows = Array.isArray(summary.results)
+    ? summary.results
+    : Array.isArray(summary.samples)
+      ? summary.samples
+      : [];
+  for (const s of summaryRows) {
+    if (!s || typeof s !== "object") continue;
+    const sid = String(s.sampleId ?? s.id ?? "");
+    if (sid !== "") verdicts.set(sid, s);
+  }
+  const known = sampleIds.some((sid) => typeof verdicts.get(sid)?.pass === "boolean");
+
   let filter = "all";
   const listWrap = el("div");
   const drawList = () => {
     clear(listWrap);
-    const visible = samples.filter((s) =>
-      filter === "all" ? true : filter === "pass" ? s.pass === true : s.pass !== true,
-    );
+    const visible = sampleIds.filter((sid) => {
+      if (filter === "all") return true;
+      const pass = verdicts.get(sid)?.pass;
+      return filter === "pass" ? pass === true : pass !== true;
+    });
     if (visible.length === 0) {
       listWrap.appendChild(emptyState(`No ${filter} samples`));
       return;
     }
     const tbody = el("tbody");
-    for (const s of visible) {
-      const sid = String(s.id ?? s.sampleId ?? "");
+    for (const sid of visible) {
+      const s = verdicts.get(sid) ?? {};
       tbody.appendChild(
         el("tr", null, [
           el("td", null, [
@@ -167,22 +195,24 @@ async function renderRun(root, ctx, runId) {
       ]),
     );
   };
-  const filterBar = el(
-    "div",
-    { class: "filter-bar", role: "group", "aria-label": "sample filter" },
-    ["all", "pass", "fail"].map((f) => {
-      const btn = el("button", { class: "btn btn-ghost", type: "button", text: f });
-      btn.addEventListener("click", () => {
-        filter = f;
-        for (const b of filterBar.querySelectorAll("button")) b.classList.remove("active");
-        btn.classList.add("active");
-        drawList();
-      });
-      if (f === "all") btn.classList.add("active");
-      return btn;
-    }),
-  );
-  root.appendChild(filterBar);
+  if (known) {
+    const filterBar = el(
+      "div",
+      { class: "filter-bar", role: "group", "aria-label": "sample filter" },
+      ["all", "pass", "fail"].map((f) => {
+        const btn = el("button", { class: "btn btn-ghost", type: "button", text: f });
+        btn.addEventListener("click", () => {
+          filter = f;
+          for (const b of filterBar.querySelectorAll("button")) b.classList.remove("active");
+          btn.classList.add("active");
+          drawList();
+        });
+        if (f === "all") btn.classList.add("active");
+        return btn;
+      }),
+    );
+    root.appendChild(filterBar);
+  }
   drawList();
   root.appendChild(listWrap);
 }
@@ -201,7 +231,13 @@ async function renderSample(root, ctx, runId, sampleId) {
     root.appendChild(emptyState("Nothing here yet — no sample with that id"));
     return;
   }
-  const grades = Array.isArray(data.grades) ? data.grades : [];
+  // grades.json is passed through tolerantly: a list of grader results or
+  // one bare result object.
+  const grades = Array.isArray(data.grades)
+    ? data.grades
+    : data.grades && typeof data.grades === "object"
+      ? [data.grades]
+      : [];
   const gradeCard = el("div", { class: "card" }, [
     el("h3", { class: "card-title", text: "Grades" }),
     grades.length === 0
@@ -221,16 +257,19 @@ async function renderSample(root, ctx, runId, sampleId) {
   ]);
   root.appendChild(gradeCard);
 
-  const excerpt = data.transcriptExcerpt ?? data.transcript ?? null;
+  const transcript = Array.isArray(data.transcript) ? data.transcript : [];
   const excerptCard = el("div", { class: "card" }, [
-    el("h3", { class: "card-title", text: "Transcript excerpt" }),
+    el("h3", { class: "card-title" }, [
+      el("span", { text: "Transcript" }),
+      data.transcriptTruncated === true
+        ? el("span", { class: "chip chip-warn", text: "truncated" })
+        : null,
+    ]),
   ]);
-  if (excerpt === null) {
+  if (transcript.length === 0) {
     excerptCard.appendChild(el("p", { class: "muted", text: "No transcript captured." }));
-  } else if (typeof excerpt === "string") {
-    excerptCard.appendChild(el("pre", { class: "rawjson", text: excerpt }));
   } else {
-    excerptCard.appendChild(jsonPre(excerpt));
+    excerptCard.appendChild(jsonPre(transcript));
   }
   root.appendChild(excerptCard);
 }

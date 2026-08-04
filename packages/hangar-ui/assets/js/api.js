@@ -1,6 +1,7 @@
 /**
- * API client. One place knows every server route, attaches the bearer
- * token, and enforces two read-path invariants:
+ * API client. Every request is built from the `routes.js` contract map
+ * (the same map the hangar server's contract test drives), attaches the
+ * bearer token, and enforces two read-path invariants:
  *
  *   - 404 → `null`, never an error ("absence is not an error" — the caller
  *     renders a "nothing yet" empty state);
@@ -11,6 +12,8 @@
  * reach server logs) and lives in sessionStorage only — never in a cookie
  * (no cookies ⇒ no CSRF surface) and never in a query string.
  */
+
+import { ROUTES, buildPath } from "./routes.js";
 
 const TOKEN_KEY = "hangar.token";
 
@@ -83,44 +86,46 @@ async function request(method, path, body) {
   return res.json();
 }
 
-const get = (path) => request("GET", path);
-const post = (path, body) => request("POST", path, body);
-const put = (path, body) => request("PUT", path, body);
-const patch = (path, body) => request("PATCH", path, body);
-const del = (path) => request("DELETE", path);
-
-const enc = encodeURIComponent;
+/** Issue one request from a `ROUTES` entry (+ params + optional body/query). */
+function call(route, params, body, query = "") {
+  return request(route.method, `${buildPath(route.path, params)}${query}`, body);
+}
 
 /**
- * Every server route the M1 console talks to, in one map. Reads everywhere;
- * the ONLY writes are registry CRUD (add/scan/groups/tags/pin/notes/
- * relocate/remove) — manager-state writes, never harness state.
+ * Every server route the M1 console talks to — thin named wrappers over the
+ * `ROUTES` contract map. Reads everywhere; the ONLY writes are registry
+ * CRUD (add/scan/group-create/groups/tags/pin/notes/relocate/remove +
+ * scan-root create) — manager-state writes, never harness state.
  */
 export const api = {
   // fleet feed + registry CRUD
-  harnesses: () => get("/api/harnesses"),
-  addHarness: (dir) => post("/api/harnesses", { dir }),
-  scan: () => post("/api/scan", {}),
-  groups: () => get("/api/registry/groups"),
-  saveGroups: (groups) => put("/api/registry/groups", { groups }),
-  updateRegistry: (id, fields) => patch(`/api/h/${enc(id)}/registry`, fields),
-  relocateHarness: (id, dir) => post(`/api/h/${enc(id)}/relocate`, { dir }),
-  removeHarness: (id) => del(`/api/h/${enc(id)}`),
+  harnesses: (hydrate = false) =>
+    call(ROUTES.harnesses, {}, undefined, hydrate ? "?hydrate=1" : ""),
+  addHarness: (dir) => call(ROUTES.addHarness, {}, { dir }),
+  scan: () => call(ROUTES.scan, {}, {}),
+  groups: () => call(ROUTES.groups, {}),
+  addGroup: (name) => call(ROUTES.addGroup, {}, { name }),
+  addScanRoot: (dir) => call(ROUTES.addScanRoot, {}, { dir }),
+  setGroups: (id, groups) => call(ROUTES.setGroups, { id }, { groups }),
+  setTags: (id, tags) => call(ROUTES.setTags, { id }, { tags }),
+  setPin: (id, pinned) => call(ROUTES.setPin, { id }, { pinned }),
+  setNotes: (id, notes) => call(ROUTES.setNotes, { id }, { notes }),
+  relocateHarness: (id, newDir) => call(ROUTES.relocate, { id }, { newDir }),
+  removeHarness: (id) => call(ROUTES.removeHarness, { id }),
 
   // per-harness reads
-  harness: (id) => get(`/api/h/${enc(id)}`),
-  spec: (id) => get(`/api/h/${enc(id)}/spec`),
-  preflight: (id) => get(`/api/h/${enc(id)}/preflight`),
-  sessions: (id) => get(`/api/h/${enc(id)}/sessions`),
-  session: (id, sess) => get(`/api/h/${enc(id)}/sessions/${enc(sess)}`),
-  evals: (id) => get(`/api/h/${enc(id)}/evals`),
-  evalRun: (id, runId) => get(`/api/h/${enc(id)}/evals/${enc(runId)}`),
-  evalSample: (id, runId, sampleId) =>
-    get(`/api/h/${enc(id)}/evals/${enc(runId)}/${enc(sampleId)}`),
-  memory: (id, area) => get(`/api/h/${enc(id)}/memory/${enc(area)}`),
-  wikiArticle: (id, slug) => get(`/api/h/${enc(id)}/memory/wiki/${enc(slug)}`),
-  costs: (id) => get(`/api/h/${enc(id)}/costs`),
+  harness: (id) => call(ROUTES.harness, { id }),
+  spec: (id) => call(ROUTES.spec, { id }),
+  preflight: (id) => call(ROUTES.preflight, { id }),
+  sessions: (id) => call(ROUTES.sessions, { id }),
+  session: (id, sess) => call(ROUTES.session, { id, sess }),
+  evals: (id) => call(ROUTES.evals, { id }),
+  evalRun: (id, runId) => call(ROUTES.evalRun, { id, runId }),
+  evalSample: (id, runId, sampleId) => call(ROUTES.evalSample, { id, runId, sampleId }),
+  memory: (id, area) => call(ROUTES.memory, { id, area }),
+  wikiArticle: (id, slug) => call(ROUTES.wikiArticle, { id, slug }),
+  costs: (id) => call(ROUTES.costs, { id }),
 
   // cross-cutting
-  version: () => get("/api/version"),
+  version: () => call(ROUTES.version, {}),
 };

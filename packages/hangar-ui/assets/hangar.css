@@ -1060,3 +1060,31 @@ tr.deflated td {
 .foot-version {
   white-space: nowrap;
 }
+
+.toast {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 100;
+  max-width: 420px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--panel-3);
+  color: var(--ink);
+  border: 1px solid var(--rule-2);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+}
+.toast-error {
+  border-color: var(--bad);
+  background: var(--bad-ghost);
+}
+.toast-info {
+  border-color: var(--ok);
+}
+
+.transcript-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 8px 0;
+}

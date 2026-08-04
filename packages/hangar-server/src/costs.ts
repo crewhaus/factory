@@ -25,11 +25,26 @@ export type ModelCostRow = {
   readonly outputTokens: number;
 };
 
+/** One calendar day (UTC) of the trailing-7-day bar series. */
+export type DailyCostRow = {
+  /** `YYYY-MM-DD` (UTC). */
+  readonly day: string;
+  readonly usdMicros: number;
+  readonly calls: number;
+};
+
 export type HarnessCosts = {
   readonly totalUsdMicros: number;
   readonly calls: number;
   readonly spend7dUsdMicros: number;
   readonly byModel: readonly ModelCostRow[];
+  /**
+   * The last 7 UTC calendar days (oldest first, today last), zero-filled so
+   * a no-spend day is visibly present. Per-day buckets are calendar-dated,
+   * while `spend7dUsdMicros` is a rolling window — the two may differ at the
+   * oldest edge by design.
+   */
+  readonly days: readonly DailyCostRow[];
   /** Session files whose read hit a cap (the totals are floors, not lies). */
   readonly truncatedFiles: number;
 };
@@ -45,6 +60,9 @@ type AccrualFields = {
 };
 
 const WEEK_MS = 7 * 86_400_000;
+const DAY_MS = 86_400_000;
+
+const utcDay = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
 
 /** Fold every `sess_*.jsonl` under the harness's resolved session root. */
 export function foldHarnessCosts(harnessDir: string, nowMs: number): HarnessCosts {
@@ -60,6 +78,12 @@ export function foldHarnessCosts(harnessDir: string, nowMs: number): HarnessCost
   let spend7d = 0;
   let truncatedFiles = 0;
   const byModel = new Map<string, ModelCostRow>();
+  // Zero-filled trailing-7-day buckets, oldest first — the UI bar chart
+  // renders absence as a baseline sliver, never as missing data.
+  const byDay = new Map<string, { usdMicros: number; calls: number }>();
+  for (let i = 6; i >= 0; i -= 1) {
+    byDay.set(utcDay(nowMs - i * DAY_MS), { usdMicros: 0, calls: 0 });
+  }
 
   for (const file of files.sort()) {
     const path = join(root, file);
@@ -90,6 +114,11 @@ export function foldHarnessCosts(harnessDir: string, nowMs: number): HarnessCost
       const tsMs =
         tsRaw !== undefined && !Number.isNaN(Date.parse(tsRaw)) ? Date.parse(tsRaw) : mtimeMs;
       if (nowMs - tsMs <= WEEK_MS) spend7d += micros;
+      const bucket = byDay.get(utcDay(tsMs));
+      if (bucket !== undefined) {
+        bucket.usdMicros += micros;
+        bucket.calls += 1;
+      }
       const key = `${provider}/${modelId}`;
       const row = byModel.get(key) ?? {
         provider,
@@ -118,6 +147,7 @@ export function foldHarnessCosts(harnessDir: string, nowMs: number): HarnessCost
     byModel: [...byModel.values()].sort((a, b) =>
       `${a.provider}/${a.modelId}`.localeCompare(`${b.provider}/${b.modelId}`),
     ),
+    days: [...byDay.entries()].map(([day, b]) => ({ day, ...b })),
     truncatedFiles,
   };
 }

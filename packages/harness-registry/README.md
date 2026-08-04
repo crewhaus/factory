@@ -43,7 +43,9 @@ directory mode `0700`, and read-merge-write with a small
 fingerprint-checked retry loop so two same-machine writers do not lose each
 other's rows. Vanished directories are **never silently pruned**: `list()`
 stamps `missingSince` (and clears it when the dir is back); only an
-explicit `remove()` deletes a row.
+explicit `remove()` deletes a row. `list()`'s stamp/lift persists are
+best-effort — on an unwritable registry root it warns and returns the
+computed view un-persisted rather than failing the read.
 
 ## API
 
@@ -67,13 +69,16 @@ registerHook, seedFromWatchme }`.
 
 ## watchme interop
 
-Until the legacy watchme registry delegates here, the two files are kept in
-sync through `@crewhaus/watchme-store`'s own API (never by touching its
-file format):
+Watchme membership means **explicitly watched** — only the watchme verbs
+(`watchme start`, `watchme stop --forget`) enroll or un-enroll a harness.
+Interop goes through `@crewhaus/watchme-store`'s own API (never by touching
+its file format):
 
 - `seedFromWatchme()` merges the watchme registry in once (idempotent —
   safe to call every boot; already-registered dirs are left untouched).
   Imported entries get `origin: "import"` / `originDetail: "watchme"`.
-- `upsert`/`remove`/`relocate` write through to the watchme registry
-  best-effort; a write-through failure never fails the primary write (it is
-  reported via `onWarn`, silent by default).
+- `upsert`/`relocate` mirror **freshness only** onto a watchme row that
+  already exists (dir/specName/target); they never create a watchme row,
+  never delete one, and never touch `share` or `agentId`. `remove()` does
+  not touch the watchme registry at all. A mirror failure never fails the
+  primary write (it is reported via `onWarn`, silent by default).

@@ -72,6 +72,17 @@ Absence is not an error: missing state renders as "nothing yet" shapes,
 and a vanished harness dir keeps its registry row (`missingSince`) with a
 relocate/remove affordance instead of disappearing.
 
+Each `/api/harnesses` row carries the registry fields plus flattened
+`capabilities` (lenient spec-badge scan), `evalHealthy` (latest run vs the
+pinned baseline) and `cachedAt`, alongside the nested `rollup` (null until
+hydrated). Cost folds include a zero-filled trailing-7-day `days` series;
+the detail payload includes small `memory: { facts, articles }` counts for
+the Overview mini-cards. The whole surface is CONTRACT-TESTED against the
+console's route map: `src/contract.test.ts` imports hangar-ui's
+`assets/js/routes.js` and drives every route on a fixture server —
+writes must take effect, reads must carry every field the UI views read
+(the test's `VIEW_READS` table).
+
 ## Library use
 
 ```ts

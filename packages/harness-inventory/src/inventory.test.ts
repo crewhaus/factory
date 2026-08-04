@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildFeedbackRecord } from "@crewhaus/feedback-distill";
@@ -195,6 +195,39 @@ describe("state counters", () => {
     expect(countFeedback(dir)).toBe(2);
   });
 
+  test("countFeedback caps lines per file (mirrors hangar-server's JSONL caps)", () => {
+    // 5001 distinct (session,turn) records in one file: the 5000-line cap
+    // must bound the parse — a runaway log can never make a request-path
+    // view (harness show, the Hangar detail route) buffer unbounded work.
+    const lines: string[] = [];
+    for (let turn = 1; turn <= 5001; turn++) lines.push(fbLine(turn, "up"));
+    const dir = seedHarness("bot", { spec: CLI_SPEC, feedbackLines: lines });
+    expect(countFeedback(dir)).toBe(5000);
+  });
+
+  test("countFeedback caps bytes per file and drops the torn final line", () => {
+    // First line blows past the 8 MiB byte cap, so the read window ends
+    // mid-line (dropped, not parsed torn) and the valid record AFTER the
+    // cap is never reached. Uncapped, this would count 1 — and buffer the
+    // whole file into one string on every detail-view request.
+    const giant = JSON.stringify({ pad: "x".repeat(9 * 1024 * 1024) });
+    const dir = seedHarness("bot", { spec: CLI_SPEC });
+    const fbDir = join(dir, ".crewhaus", "feedback");
+    mkdirSync(fbDir, { recursive: true });
+    writeFileSync(join(fbDir, "huge.jsonl"), `${giant}\n${fbLine(1, "up")}\n`);
+    expect(countFeedback(dir)).toBe(0);
+  });
+
+  test("an unreadable feedback file degrades to zero without aborting the row", () => {
+    const dir = seedHarness("bot", {
+      spec: CLI_SPEC,
+      feedbackLines: [fbLine(1, "up"), fbLine(2, "down")],
+    });
+    // A dangling symlink ends in .jsonl but stat/open on it throws.
+    symlinkSync(join(dir, "no-such-target"), join(dir, ".crewhaus", "feedback", "bad.jsonl"));
+    expect(countFeedback(dir)).toBe(2); // the good file still counts
+  });
+
   test("countOpenIncidents ignores resolved incidents", () => {
     const dir = seedHarness("bot", {
       spec: CLI_SPEC,
@@ -271,6 +304,20 @@ describe("buildFleetInventory", () => {
 
   test("formatInventory reports an empty fleet", () => {
     expect(formatInventory([], root).join("\n")).toContain("no harnesses");
+  });
+
+  test("one harness with an unreadable feedback file never aborts the fleet build", async () => {
+    const broken = seedHarness("broken", { spec: CLI_SPEC });
+    mkdirSync(join(broken, ".crewhaus", "feedback"), { recursive: true });
+    symlinkSync(
+      join(broken, "no-such-target"),
+      join(broken, ".crewhaus", "feedback", "dead.jsonl"),
+    );
+    seedHarness("healthy", { spec: WORKFLOW_SPEC, feedbackLines: [fbLine(1, "up")] });
+    const rows = await buildFleetInventory(root, emptyDeps());
+    expect(rows).toHaveLength(2);
+    expect(rows.find((r) => r.dir === broken)?.feedbackCount).toBe(0); // degraded, not fatal
+    expect(rows.find((r) => r.dir !== broken)?.feedbackCount).toBe(1);
   });
 });
 

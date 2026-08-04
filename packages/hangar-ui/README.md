@@ -53,9 +53,9 @@ server's static-asset option; a server route for `path` responds with
   relocate/remove; Scan and Add-harness actions; a one-line fleet rollup.
   Registry CRUD is the ONLY write surface — harness state is never
   mutated from this UI in M1.
-- **Detail** — Overview (header with click-to-copy dir, safety strip,
-  health checklist, eval-trend SVG, memory mini-cards, cost mini-chart,
-  expandable preflight report), Spec (masked YAML with line numbers,
+- **Detail** — Overview (header with click-to-copy dir and capability
+  chips, health checklist, eval-trend SVG, memory mini-cards, cost
+  mini-chart, expandable preflight report), Spec (masked YAML with line numbers,
   env-ref presence checklist, parse issues), Sessions (TTL countdowns,
   evicted rows fall through to summaries, per-kind transcript rendering
   with a metadata gutter and a Raw toggle), Evals (history with
@@ -70,7 +70,7 @@ Dark theme default with an explicit light toggle; traffic-light dots are
 always paired with text; every empty state names the CLI verb that creates
 its data; 404s render as "nothing yet", never as errors; loading skeletons
 everywhere; cached figures show their as-of time; the footer shows the
-hangar/cli version pair. No animation beyond opacity.
+hangar version + wire-protocol pair. No animation beyond opacity.
 
 ### Injection safety
 
@@ -82,21 +82,39 @@ them as text nodes; raw HTML in an article body stays literal text.
 
 ## Server routes consumed
 
-This package is the client of record for the M1 route surface; `api.js` is
-the single module that names server paths. Reads: `/api/harnesses`,
-`/api/registry/groups`, `/api/h/:id`, and per-harness `spec`, `preflight`,
-`sessions[/:sess]`, `evals[/:runId[/:sampleId]]`,
+This package is the client of record for the M1 route surface, and the
+contract is EXECUTABLE: `assets/js/routes.js` holds every route as pure
+data (method, path template, body-shape name), `api.js` builds every
+request from that map, and the hangar server's `contract.test.ts` imports
+the same map and drives each route against a live fixture server — writes
+must take effect, reads must carry every field the views dereference. The
+two sides cannot drift silently.
+
+Reads: `/api/harnesses[?hydrate=1]`, `/api/registry/groups`, `/api/h/:id`,
+and per-harness `spec`, `preflight`, `sessions[/:sess]`,
+`evals[/:runId[/:sampleId]]`,
 `memory/{facts,wiki[/:slug],state,dream,watchme}`, `costs`, plus
 `/api/version`. Writes (registry-only): `POST /api/harnesses` `{dir}`,
-`POST /api/scan`, `PUT /api/registry/groups`, `PATCH /api/h/:id/registry`
-`{groups?, tags?, pinned?, notes?}`, `POST /api/h/:id/relocate` `{dir}`,
-and `DELETE /api/h/:id`. All payload readers are tolerant: unknown fields
-are ignored, missing fields degrade to "—", and unknown transcript kinds
-render as generic labeled cards.
+`POST /api/scan`, `POST /api/registry/groups` `{name}`,
+`POST /api/registry/scan-roots` `{dir}`,
+`PUT /api/h/:id/{groups,tags,pin,notes}` (per-field bodies),
+`POST /api/h/:id/relocate` `{newDir}`, and `DELETE /api/h/:id`. All
+payload readers are tolerant: unknown fields are ignored, missing fields
+degrade to "—", and unknown transcript kinds are tallied by the server and
+surfaced as a count. A failed write is never silent — non-2xx surfaces as
+a toast, and a zero-root Scan says "no scan roots configured" and offers
+the add-scan-root input instead of pretending success.
+
+The Library paints twice by design: instantly from the cache-only feed
+(figures labeled with their `cachedAt` as-of time), then again from a
+background `?hydrate=1` refetch with freshly computed rollups.
 
 ## Testing
 
 `bun test src` — the embed-map completeness/hygiene suite plus unit tests
 for the pure browser modules (`util.js`, `markdown.js`, `router.js`,
-`shapes.js`), which are DOM-free at import time and imported directly by
-bun. Deterministic: clocks are injected, no network, no subprocesses.
+`routes.js`, `shapes.js`) and the `api.js` client under a stubbed `fetch`
+(every write asserted against the server's real method/path/body). All
+DOM-free at import time and imported directly by bun. Deterministic:
+clocks are injected, no network, no subprocesses. The server side of the
+same contract runs in `@crewhaus/hangar-server`'s `contract.test.ts`.

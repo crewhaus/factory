@@ -47,7 +47,15 @@
  * harness dir, the convention every subcommand resolves state from) and
  * aggregates exit codes.
  */
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  statSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 import { EXIT_CODES, type FailureClass } from "@crewhaus/errors";
 import { extractFeedbackRecords, mergeFeedback } from "@crewhaus/feedback-distill";
@@ -238,11 +246,50 @@ export function countSessions(harnessDir: string): number {
   return n;
 }
 
-/** Parse a JSONL blob into objects, skipping blank/malformed lines. */
-function parseJsonlObjects(text: string): unknown[] {
+/** Hard cap on JSONL LINES parsed from any single file. Mirrors
+ *  `@crewhaus/hangar-server`'s `MAX_JSONL_LINES` (that package depends on
+ *  this one, so the constants are duplicated, not imported). */
+const MAX_JSONL_LINES = 5000;
+
+/** Hard cap on BYTES read from any single JSONL file (8 MiB) — mirrors
+ *  `@crewhaus/hangar-server`'s `MAX_JSONL_BYTES`. A larger file is read up
+ *  to the cap; the final partial line is dropped rather than parsed torn. */
+const MAX_JSONL_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Read + parse a JSONL file into objects under both caps
+ * ({@link MAX_JSONL_LINES} lines, {@link MAX_JSONL_BYTES} bytes), skipping
+ * blank/malformed lines. A missing/unreadable file reads as empty — this
+ * feeds request-path views (`fleet list`, `harness show`, the Hangar detail
+ * route), where one corrupt or multi-GB session log must degrade that
+ * harness's row, never buffer whole into memory or abort the fleet build.
+ */
+function readJsonlObjectsCapped(path: string): unknown[] {
+  let text: string;
+  let byteTruncated = false;
+  try {
+    const size = statSync(path).size;
+    const fd = openSync(path, "r");
+    try {
+      const take = Math.min(size, MAX_JSONL_BYTES);
+      const buf = Buffer.alloc(take);
+      const read = readSync(fd, buf, 0, take, 0);
+      text = buf.subarray(0, read).toString("utf-8");
+      byteTruncated = size > MAX_JSONL_BYTES;
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return []; // unreadable — degrade this file, don't abort the row
+  }
+  let lines = text.split("\n");
+  if (byteTruncated) lines = lines.slice(0, -1); // the cut tore the last line
   const out: unknown[] = [];
-  for (const line of text.split("\n")) {
+  let seen = 0;
+  for (const line of lines) {
     if (line.trim() === "") continue;
+    if (seen >= MAX_JSONL_LINES) break;
+    seen += 1;
     try {
       out.push(JSON.parse(line));
     } catch {
@@ -258,15 +305,23 @@ function parseJsonlObjects(text: string): unknown[] {
  * `feedback/*.jsonl` (`extractFeedbackRecords` accepts both encodings), then
  * `mergeFeedback` collapses to one per (sessionId, turnNumber). The row shows
  * distinct rated turns, not raw line count, so a re-rated turn counts once.
+ * Every file read is capped ({@link readJsonlObjectsCapped}) and per-file
+ * tolerant, matching hangar-server's rollup counter.
  */
 export function countFeedback(harnessDir: string): number {
   const objects: unknown[] = [];
   for (const sub of ["sessions", "feedback"]) {
     const dir = join(harnessDir, ".crewhaus", sub);
     if (!existsSync(dir)) continue;
-    for (const f of readdirSync(dir)) {
+    let files: string[];
+    try {
+      files = readdirSync(dir);
+    } catch {
+      continue; // unreadable dir — skip, don't abort the row
+    }
+    for (const f of files) {
       if (!f.endsWith(".jsonl")) continue;
-      objects.push(...parseJsonlObjects(readFileSync(join(dir, f), "utf-8")));
+      objects.push(...readJsonlObjectsCapped(join(dir, f)));
     }
   }
   return mergeFeedback(extractFeedbackRecords(objects)).length;
