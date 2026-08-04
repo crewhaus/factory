@@ -24,6 +24,7 @@
 import { ApiError, api, onUnauthorized, setToken } from "./api.js";
 import { clear, copyBtn, dot, el, skeleton, toast } from "./dom.js";
 import { bindingSheet, globalKey, initialKeyState, keyShape } from "./keys.js";
+import { notifications } from "./notify.js";
 import { openOmnibox } from "./omnibox.js";
 import {
   hrefGlobal,
@@ -111,6 +112,7 @@ let navCounts = {};
 let keyState = initialKeyState();
 let omnibox = null;
 let sheetNode = null;
+let notificationsStarted = false;
 
 /** Move a `#t=<token>` fragment into sessionStorage and off the URL. */
 function bootstrapToken() {
@@ -193,6 +195,7 @@ function renderShell(appRoot) {
   drawNav(parseRoute(window.location.hash));
   loadVersion();
   loadNavCounts();
+  startNotifications();
   loadReadOnlyBanner();
   installKeyboard();
 }
@@ -251,16 +254,19 @@ function drawNav(route, counts = {}) {
   }
 }
 
-/** Pending approvals, open review items, and the notification badge —
- *  the three numbers worth carrying in the nav. The notifications poll is
- *  ALSO the rules evaluation pass (HM-183: the manager runs no timer), so a
- *  console left open keeps the badge honest without a background loop. */
+/** Merge counts into the nav and redraw. The three numbers arrive from two
+ *  sources — the inbox reads here, the notification badge from the shared
+ *  poll — so they are merged rather than replaced, and neither can wipe the
+ *  other's number on the way past. */
+function setNavCounts(patch) {
+  navCounts = { ...navCounts, ...patch };
+  drawNav(parseRoute(window.location.hash), navCounts);
+}
+
+/** Pending approvals and open review items — the two inbox numbers. The
+ *  notification badge is the shared poll's (see {@link startNotifications}). */
 async function loadNavCounts() {
-  const [approvals, review, notifications] = await Promise.allSettled([
-    api.approvals(),
-    api.review(),
-    api.notifications(),
-  ]);
+  const [approvals, review] = await Promise.allSettled([api.approvals(), api.review()]);
   const counts = {};
   if (approvals.status === "fulfilled" && approvals.value && typeof approvals.value === "object") {
     counts.approvals = approvals.value.pending;
@@ -268,22 +274,36 @@ async function loadNavCounts() {
   if (review.status === "fulfilled" && review.value && typeof review.value === "object") {
     counts.review = review.value.open;
   }
-  if (
-    notifications.status === "fulfilled" &&
-    notifications.value &&
-    typeof notifications.value === "object"
-  ) {
-    counts.settings = notifications.value.badge;
-    // Anything delivered on THIS poll is new since the last one: one toast,
-    // and the badge carries the rest.
-    const delivered = Array.isArray(notifications.value.delivered)
-      ? notifications.value.delivered
-      : [];
+  setNavCounts(counts);
+}
+
+/**
+ * HM-183 — the notification loop.
+ *
+ * The manager runs no timer of its own: `GET /api/notifications` IS the
+ * rules evaluation, so a console that asks only at boot never notifies
+ * anybody however long it is left open — which is precisely the case the
+ * one default-on rule (a parked approval) exists for. The console asks on
+ * an interval instead, through the single shared poll in `notify.js`, so
+ * that no OTHER screen can consume a delivery this listener would have
+ * toasted. Every snapshot the poll sees lands here: the badge follows it,
+ * and anything delivered on that pass is said out loud.
+ */
+function startNotifications() {
+  if (notificationsStarted) return;
+  notificationsStarted = true;
+  notifications.subscribe((payload, delivered) => {
+    setNavCounts({ settings: Number(payload?.badge ?? 0) });
     if (delivered.length === 1) toast(String(delivered[0]?.label ?? "notification"), "info");
     else if (delivered.length > 1) toast(`${delivered.length} new notifications`, "info");
-  }
-  navCounts = counts;
-  drawNav(parseRoute(window.location.hash), counts);
+  });
+  notifications.start();
+  // A hidden tab is nobody's console: stop the fleet-wide scan each poll
+  // costs the server, and take a fresh reading the moment it comes back.
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden === true) notifications.stop();
+    else notifications.start();
+  });
 }
 
 async function loadVersion() {
@@ -700,6 +720,9 @@ function boot() {
     renderTokenScreen(viewRoot, () => {
       loadVersion();
       loadNavCounts();
+      // The polls that ran while the token was missing answered 401 and
+      // returned nothing; take a reading now rather than at the next tick.
+      notifications.refresh();
       dispatch(parseRoute(window.location.hash));
     });
   });

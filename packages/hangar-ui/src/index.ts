@@ -29,6 +29,7 @@ import appJs from "../assets/js/app.js" with { type: "text" };
 import domJs from "../assets/js/dom.js" with { type: "text" };
 import keysJs from "../assets/js/keys.js" with { type: "text" };
 import markdownJs from "../assets/js/markdown.js" with { type: "text" };
+import notifyJs from "../assets/js/notify.js" with { type: "text" };
 import omniboxJs from "../assets/js/omnibox.js" with { type: "text" };
 import routerJs from "../assets/js/router.js" with { type: "text" };
 import routesJs from "../assets/js/routes.js" with { type: "text" };
@@ -112,6 +113,7 @@ export const hangarAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/dom.js": asset(domJs, "dom.js"),
   "/assets/js/keys.js": asset(keysJs, "keys.js"),
   "/assets/js/markdown.js": asset(markdownJs, "markdown.js"),
+  "/assets/js/notify.js": asset(notifyJs, "notify.js"),
   "/assets/js/omnibox.js": asset(omniboxJs, "omnibox.js"),
   "/assets/js/router.js": asset(routerJs, "router.js"),
   "/assets/js/routes.js": asset(routesJs, "routes.js"),

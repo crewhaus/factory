@@ -257,13 +257,29 @@ export function isReadOnlyRefused(method: string, pathname: string): boolean {
 }
 
 /** The refusal body — a fact about the manager, with the way out named. */
-export function readOnlyRefusal(method: string, pathname: string): Record<string, unknown> {
+/**
+ * The 403 body for a refused mutating request.
+ *
+ * `locked` is not decoration: the two modes have DIFFERENT remedies, and a
+ * remedy that names the wrong one sends an operator to restart a manager
+ * they could have toggled over the wire (or to toggle one that will refuse).
+ * Plain `--read-only` is a session default and CAN be lifted with
+ * `PUT /api/read-only {"enabled":false}`; only `--read-only-locked` requires
+ * a restart.
+ */
+export function readOnlyRefusal(
+  method: string,
+  pathname: string,
+  locked = false,
+): Record<string, unknown> {
   return {
     error: "read-only mode is engaged — this manager refuses every mutating request",
     code: "read_only",
     method,
     path: pathname,
-    remedy:
-      'turn it off in Settings (or PUT /api/read-only {"enabled":false}); a manager started with --read-only must be restarted instead',
+    locked,
+    remedy: locked
+      ? "this manager was started with --read-only-locked; restart it without that flag"
+      : 'turn it off in Settings (or PUT /api/read-only {"enabled":false})',
   };
 }

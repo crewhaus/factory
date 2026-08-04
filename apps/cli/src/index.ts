@@ -742,6 +742,7 @@ import {
   type BuildInventoryDeps,
   type BulkRunResult,
   type EvalHealthReader,
+  FLEET_USAGE,
   FleetError,
   type FleetRunner,
   type HarnessInventory,
@@ -15699,21 +15700,10 @@ async function runSecrets(args: ParsedArgs, action: string): Promise<void> {
  */
 async function runFleet(args: ParsedArgs, action: string): Promise<void> {
   if (args.flags["help"] || action === "") {
-    process.stdout.write(
-      "usage:\n" +
-        "  crewhaus fleet list [--root <dir>] [--group <name>]  cross-harness inventory\n" +
-        "  crewhaus fleet status [--root <dir>] [--group <name>]  per-harness health rollup\n" +
-        "  crewhaus fleet run <sub> [--filter <glob>] [--group <name>] [--root <dir>]\n" +
-        "                                                     bulk-run a read-only subcommand\n" +
-        "         [--allow-mutating] [--yes]                  across the filtered fleet\n" +
-        "\n" +
-        "  A harness is any directory carrying a crewhaus.yaml (the standalone-harness\n" +
-        "  convention). Discovery skips .crewhaus/, node_modules/, .git/, dist/.\n" +
-        "  --group <name> keeps only harnesses whose machine-registry entry carries the\n" +
-        "  group (manage membership with `crewhaus harness group`).\n" +
-        "  Read-only bulk subcommands: eval, doctor, security digest, audit verify.\n" +
-        "  A mutating subcommand requires --allow-mutating and per-harness confirmation.\n",
-    );
+    // HM-202 — the text lives in `./fleet` so it is testable without
+    // executing this file's top-level argv switch. It must be PRINTED from
+    // here, though: a constant no invocation reaches documents nothing.
+    process.stdout.write(FLEET_USAGE);
     return;
   }
 
@@ -21436,6 +21426,14 @@ switch (subcommand) {
     // Item 58 — list | status | run <sub>. `run` takes a subcommand as
     // positionals after the action, so the schema is parsed over the tail.
     const action = rest[0] ?? "";
+    // HM-202 — `crewhaus fleet --help` (and `-h`) route to the usage block,
+    // like `schedule` does. Dying with `fleet action must be one of: …
+    // (got "--help")` is the one answer that helps nobody: the operator was
+    // asking which actions exist.
+    if (action.startsWith("-")) {
+      await runFleet({ positional: [], flags: { help: true } }, "");
+      break;
+    }
     if (action !== "" && action !== "list" && action !== "status" && action !== "run") {
       die(`fleet action must be one of: list, status, run (got "${action}")`);
     }

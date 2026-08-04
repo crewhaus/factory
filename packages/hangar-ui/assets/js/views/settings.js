@@ -13,10 +13,18 @@
  *   - The plugin table lists the DEFERRED extension points beside the wired
  *     ones, with their reasons. A capability that is declared but not wired
  *     has to be visible, or the next person wires it a second time.
+ *
+ * This screen does NOT read `GET /api/notifications` itself. That GET is the
+ * rules evaluation (HM-183), so a second caller consumes deliveries the app's
+ * poll would otherwise have toasted — the state comes from the one shared
+ * poll in `notify.js`, and the PUT's answer is folded back into it.
  */
 
 import { api } from "../api.js";
 import { clear, dot, el, emptyState, skeleton, toast } from "../dom.js";
+import { notifications } from "../notify.js";
+import { hrefHarness } from "../router.js";
+import { fmtRelativeTime } from "../util.js";
 
 /** kind → the sentence the rule row shows. Mirrors the server's KIND_LABELS;
  *  an unknown kind falls back to its slug rather than disappearing. */
@@ -35,10 +43,20 @@ const KIND_LABELS = {
 
 const SINKS = ["in-app", "os", "webhook"];
 
+/** Why an event did not notify — the sentence beside the reason slug. */
+const SUPPRESSED_REASONS = {
+  "rule-off": "the rule is off",
+  "group-muted": "the harness is in a muted group",
+  "quiet-hours": "quiet hours silenced every sink it had",
+  "already-delivered": "already notified this session",
+  "sink-unavailable": "no sink this manager can deliver on was selected",
+};
+
 export async function renderSettings(root) {
   clear(root).appendChild(skeleton(6));
   const [notifRes, readOnlyRes, pluginsRes, groupsRes] = await Promise.allSettled([
-    api.notifications(),
+    // The shared poll's state — never a second evaluating GET from here.
+    notifications.current(),
     api.readOnly(),
     api.plugins(),
     api.groups(),
@@ -51,7 +69,9 @@ export async function renderSettings(root) {
     ]),
   );
   root.appendChild(readOnlyCard(settled(readOnlyRes)));
-  root.appendChild(notificationCard(settled(notifRes), settled(groupsRes)));
+  root.appendChild(
+    notificationCard(settled(notifRes), settled(groupsRes), () => renderSettings(root)),
+  );
   root.appendChild(pluginCard(settled(pluginsRes)));
 }
 
@@ -113,7 +133,7 @@ function readOnlyCard(state) {
 // Notification rules
 // ---------------------------------------------------------------------------
 
-function notificationCard(state, groupsPayload) {
+function notificationCard(state, groupsPayload, reload) {
   const rules = Array.isArray(state?.rules) ? state.rules : [];
   const card = el("section", { class: "card" }, [
     el("h3", { class: "card-title", text: "Notifications" }),
@@ -253,7 +273,7 @@ function notificationCard(state, groupsPayload) {
           const button = event.currentTarget;
           button.disabled = true;
           try {
-            await api.setNotifications({
+            const updated = await api.setNotifications({
               rules: draft.rules,
               quietHours: {
                 enabled: draft.quietHours.enabled,
@@ -264,6 +284,10 @@ function notificationCard(state, groupsPayload) {
               mutedGroups: splitList(mutedField.value),
               webhookUrl: webhookField.value.trim() === "" ? null : webhookField.value.trim(),
             });
+            // The PUT answers with the same evaluated view the GET does —
+            // deliveries included. Fold it into the shared poll so nothing it
+            // just consumed goes unseen, and so the badge follows the save.
+            notifications.accept(updated);
             toast("Notification rules saved", "info");
           } catch (err) {
             toast(err instanceof Error ? err.message : String(err), "error");
@@ -278,7 +302,9 @@ function notificationCard(state, groupsPayload) {
         onClick: async () => {
           try {
             await api.clearNotifications();
+            await notifications.refresh();
             toast("Badge cleared", "info");
+            reload?.();
           } catch (err) {
             toast(err instanceof Error ? err.message : String(err), "error");
           }
@@ -286,7 +312,74 @@ function notificationCard(state, groupsPayload) {
       }),
     ]),
   );
+  card.appendChild(pendingList(state));
+  const why = suppressedList(state);
+  if (why !== null) card.appendChild(why);
   return card;
+}
+
+/**
+ * What the badge is COUNTING. A number an operator cannot open is a number
+ * they learn to ignore, and the in-app queue is the only record of a
+ * delivery there is — the dedupe set means the server will not report it a
+ * second time.
+ */
+function pendingList(state) {
+  const inApp = Array.isArray(state?.inApp) ? state.inApp : [];
+  const box = el("div", { class: "notif-queue" }, [
+    el("h4", { class: "sheet-section", text: "Waiting for you" }),
+  ]);
+  if (inApp.length === 0) {
+    box.appendChild(el("p", { class: "muted note", text: "Nothing pending." }));
+    return box;
+  }
+  const now = Date.now();
+  box.appendChild(
+    el(
+      "ul",
+      { class: "check-list" },
+      inApp.map((d) => {
+        const id = String(d?.harnessId ?? "");
+        const label = String(d?.label ?? d?.kind ?? "");
+        return el("li", null, [
+          dot("warn", label),
+          el("span", { class: "muted", text: ` ${fmtRelativeTime(String(d?.at ?? ""), now)}` }),
+          id === ""
+            ? null
+            : el("a", { class: "chip", href: hrefHarness(id, "overview"), text: "open →" }),
+        ]);
+      }),
+    ),
+  );
+  return box;
+}
+
+/**
+ * …and what did NOT notify, with the reason. A silent rule has to be
+ * explainable from the screen, or the operator's only model of the feature
+ * is "it sometimes tells me things".
+ */
+function suppressedList(state) {
+  const suppressed = Array.isArray(state?.suppressed) ? state.suppressed : [];
+  if (suppressed.length === 0) return null;
+  const counts = new Map();
+  for (const s of suppressed) {
+    const reason = String(s?.reason ?? "unknown");
+    counts.set(reason, (counts.get(reason) ?? 0) + 1);
+  }
+  return el("div", { class: "notif-suppressed" }, [
+    el("h4", { class: "sheet-section", text: "Seen, but not notified" }),
+    el(
+      "ul",
+      { class: "check-list" },
+      [...counts.entries()].map(([reason, n]) =>
+        el("li", null, [
+          dot("off", `${n} × ${reason}`),
+          el("span", { class: "muted", text: ` — ${SUPPRESSED_REASONS[reason] ?? reason}` }),
+        ]),
+      ),
+    ),
+  ]);
 }
 
 function checkbox(checked, onChange, label) {

@@ -32,6 +32,7 @@
  */
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { shellQuote } from "@crewhaus/harness-supervisor";
 import { MAX_JSONL_LINES, SAFE_SEGMENT_RE, SESSION_JSON_RE } from "./constants";
 import { readJsonlCapped } from "./jsonl";
 import { resolveInside } from "./safety";
@@ -169,7 +170,20 @@ export function rankEntries(
 // Actions (pure)
 // ---------------------------------------------------------------------------
 
-/** Verb → the route it maps to, its CLI twin, and how it reads in the list. */
+/**
+ * Verb → the route it maps to, its CLI twin, and how it reads in the list.
+ *
+ * THE TWIN HAS TO RUN. It is displayed as "the exact command that does the
+ * same thing in a terminal", which is the console's whole trust affordance;
+ * a twin that fails when pasted is worse than none. `crewhaus daemon` takes
+ * the harness POSITIONALLY (`daemon start [<dir|hrn_id>]`) and its flag
+ * parser hard-rejects anything it does not know, so `--dir <path>` is not a
+ * near-miss — every verb throws on it. And the path is SHELL-QUOTED, the way
+ * M2's own twins are (`shutdownReportLines`, `spawn-contracts`): an unquoted
+ * `/srv/my harnesses/poly` splits into two arguments and targets the wrong
+ * directory. `cli-twins.test.ts` checks every twin against the CLI's own
+ * dispatch.
+ */
 const ACTION_VERBS: ReadonlyArray<{
   readonly verb: string;
   readonly route: string;
@@ -179,28 +193,34 @@ const ACTION_VERBS: ReadonlyArray<{
   {
     verb: "start",
     route: "procStart",
-    cli: (dir) => `crewhaus daemon start --dir ${dir}`,
+    cli: (dir) => `crewhaus daemon start ${shellQuote(dir)}`,
     label: (name) => `Start ${name}`,
   },
   {
     verb: "stop",
     route: "procStop",
-    cli: (dir) => `crewhaus daemon stop --dir ${dir}`,
+    cli: (dir) => `crewhaus daemon stop ${shellQuote(dir)}`,
     label: (name) => `Stop ${name}`,
   },
   {
     verb: "restart",
     route: "procRestart",
-    cli: (dir) => `crewhaus daemon restart --dir ${dir}`,
+    cli: (dir) => `crewhaus daemon restart ${shellQuote(dir)}`,
     label: (name) => `Restart ${name}`,
   },
   {
     verb: "drain",
     route: "procDrain",
-    cli: (dir) => `crewhaus daemon drain --dir ${dir}`,
+    cli: (dir) => `crewhaus daemon drain ${shellQuote(dir)}`,
     label: (name) => `Drain ${name}`,
   },
 ];
+
+/** Every CLI twin the omnibox can propose, for one harness directory —
+ *  the surface `cli-twins.test.ts` validates against the CLI's dispatch. */
+export function actionCliTwins(dir: string): readonly string[] {
+  return ACTION_VERBS.map((action) => action.cli(dir));
+}
 
 export type ActionHarness = {
   readonly id: string;

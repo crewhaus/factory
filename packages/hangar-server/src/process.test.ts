@@ -17,6 +17,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type HangarHarnessEntry, openHangarRegistry } from "@crewhaus/harness-registry";
+import { createProcessOps } from "@crewhaus/harness-supervisor";
 import { makeFixtureHarness } from "./fixture";
 import {
   JobArgumentError,
@@ -661,4 +662,127 @@ describe("a console-submitted job is cancellable (the seam, not just the ledger)
     (registered[0] as { terminate: (s: string) => void }).terminate("SIGKILL");
     expect(ops.children.find((c) => c.pid === pid)?.alive).toBe(false);
   });
+
+  test("the signal reaches the job's whole GROUP, not just the direct child", async () => {
+    // A job is a TREE: `crewhaus eval` connects the spec's MCP servers and
+    // the bash tool spawns `sh -c`. The kill ladder signals the process
+    // GROUP (`kill(-pid)`), which only exists when the child was spawned
+    // detached — attached, that call raises ESRCH and degrades to the bare
+    // pid, so the manager kills `crewhaus eval` and leaves its children
+    // running with the harness env (provider keys) in hand.
+    //
+    // Proven against the REAL process ops, with a real grandchild: a fake
+    // cannot show group semantics, which is the entire defect.
+    if (process.platform === "win32") return; // POSIX process groups
+    const dir = makeFixtureHarness(join(mkdtempSync(join(tmpdir(), "hangar-jobtree-")), "h"), {
+      specName: "job-tree",
+    });
+    const pidFile = join(dir, "grandchild.pid");
+    const ops = createProcessOps();
+    const runner = defaultJobRunner(ops, () => "/bin/sh");
+    const job = {
+      jobId: "job_00000000000000b2",
+      harnessDir: dir,
+      kind: "doctor",
+      // A child that spawns its own long-lived child and then waits — the
+      // shape of every job that talks to an stdio MCP server.
+      argv: ["-c", `sleep 120 & echo $! > "${pidFile}"; wait`],
+      mutating: false,
+      state: "running",
+      enqueuedAt: new Date(NOW).toISOString(),
+    } as Parameters<typeof runner>[0];
+
+    const registered: Array<{ terminate: () => void; forceKill: () => void }> = [];
+    const finished = runner(job, {
+      register: (child) => registered.push(child as never),
+      isCancelled: () => false,
+    } as Parameters<typeof runner>[1]);
+
+    const alive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "EPERM";
+      }
+    };
+    const until = async (predicate: () => boolean): Promise<void> => {
+      for (let i = 0; i < 200 && !predicate(); i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    };
+
+    let grandchild = 0;
+    try {
+      await until(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").trim() !== "");
+      grandchild = Number(readFileSync(pidFile, "utf8").trim());
+      expect(Number.isInteger(grandchild) && grandchild > 0).toBe(true);
+      expect(alive(grandchild)).toBe(true);
+      expect(registered).toHaveLength(1);
+
+      // The ladder the queue runs on cancel AND on manager shutdown.
+      (registered[0] as { terminate: () => void }).terminate();
+      await finished;
+      await until(() => !alive(grandchild));
+      expect(alive(grandchild)).toBe(false);
+    } finally {
+      if (grandchild > 0 && alive(grandchild)) {
+        try {
+          process.kill(grandchild, "SIGKILL");
+        } catch {
+          // Already gone — nothing to clean up.
+        }
+      }
+    }
+  }, 20_000);
+});
+
+describe("ProcessLayer.held", () => {
+  test("held() enumerates the handles this manager holds, and builds nothing", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = daemonHarness(t, "held-enumerated");
+      const id = await register(t, dir);
+      // Registration alone builds no supervisor: `held()` is the handles
+      // map, not the registry.
+      expect(t.server.processes.held().map((h) => h.harnessDir)).toEqual([]);
+
+      await t.api(`/api/h/${id}/proc/start`, { method: "POST", body: "{}" });
+      const held = t.server.processes.held();
+      expect(held.map((h) => h.harnessDir)).toEqual([dir]);
+      expect(held[0]?.harnessId).toBe(id);
+
+      // …and enumerating is a READ: no second supervisor, no spawn, and no
+      // adoption of the live daemon it just listed.
+      const spawnedBefore = t.ops?.children.length ?? 0;
+      expect(t.server.processes.held()).toHaveLength(1);
+      expect(t.ops?.children.length ?? 0).toBe(spawnedBefore);
+      // The same memoized handle, not a rebuilt one.
+      expect(t.server.processes.held()[0] === held[0]).toBe(true);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("held() adopts nothing — a harness this manager never touched stays absent", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = daemonHarness(t, "held-foreign");
+      const id = await register(t, dir);
+      await t.server.ready;
+      // The OTHER head starts the daemon: a live runfile this layer has
+      // never seen. Enumerating must not pick it up — adoption is the
+      // request path's job (`adoptIfRunfile`), and a side-effecting
+      // enumeration would adopt during shutdown, when it is far too late.
+      const pid = await startFromTerminal(t, id);
+      expect(t.ops?.isAlive(pid)).toBe(true);
+      expect(t.server.processes.held()).toEqual([]);
+
+      // The ordinary request path still adopts it.
+      expect((await t.api(`/api/h/${id}/proc`)).body["adopted"]).toBe(true);
+      expect(t.server.processes.held().map((h) => h.harnessDir)).toEqual([dir]);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
 });

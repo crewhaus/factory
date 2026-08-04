@@ -15,11 +15,16 @@
  * THE OWNERSHIP RULES, in the order they apply:
  *
  *   1. A key pressed inside an INPUT, TEXTAREA or contenteditable belongs to
- *      the field. No exceptions, including ⌘K — an operator typing a spec
- *      edit must never have a modal stolen out from under them by a
- *      shortcut. (⌘K reaches the omnibox from the field only because the
- *      browser's own focus rules are irrelevant here: we simply do not
- *      claim it.)
+ *      the field — an operator typing a spec edit must never have a modal
+ *      stolen out from under them by a shortcut. There is exactly ONE
+ *      exception, and it is the omnibox's own input: the overlay focuses it
+ *      the instant it opens, so from that instant every key arrives with
+ *      `inField: true`. Bailing unconditionally would make Escape and the
+ *      ⌘K toggle unreachable and turn a keyboard feature into a keyboard
+ *      TRAP — the only way out a mouse click on the backdrop. So while the
+ *      omnibox is open, the two keys that CLOSE it are claimed even in a
+ *      field, and nothing else is: typing a query still belongs to the
+ *      field.
  *   2. ⌘K / Ctrl-K opens the omnibox from anywhere else, and toggles it
  *      closed when it is already open.
  *   3. While the omnibox is OPEN it owns every key: the list beneath it must
@@ -53,6 +58,11 @@ export const INBOX_BINDINGS = [
 
 /** Fields that own their keystrokes. */
 const FIELD_TAGS = new Set(["INPUT", "TEXTAREA", "SELECT"]);
+
+/** The omnibox chord, in both flavours. */
+function isOmniChord(k) {
+  return (k.meta === true || k.ctrl === true) && (k.key === "k" || k.key === "K");
+}
 
 /**
  * Normalize a KeyboardEvent into the plain record the reducer takes. Pure
@@ -93,11 +103,14 @@ export function globalKey(state, shape) {
   const k = { key: "", meta: false, ctrl: false, alt: false, inField: false, ...(shape ?? {}) };
   const keep = { state: s, effect: null, claimed: false };
 
-  // 1. A field owns its keys — including ⌘K.
-  if (k.inField) return keep;
+  // 1. A field owns its keys — including ⌘K — except the two that close an
+  //    open omnibox. The overlay focuses its own input, so without this
+  //    exception it would swallow both of its own exits.
+  const closesOmnibox = s.omniboxOpen && (k.key === "Escape" || isOmniChord(k));
+  if (k.inField && !closesOmnibox) return keep;
 
   // 2. ⌘K / Ctrl-K toggles the omnibox.
-  if ((k.meta || k.ctrl) && (k.key === "k" || k.key === "K")) {
+  if (isOmniChord(k)) {
     return s.omniboxOpen
       ? { state: { ...s, omniboxOpen: false }, effect: "close-omnibox", claimed: true }
       : {

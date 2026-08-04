@@ -64,6 +64,7 @@ import {
 } from "@crewhaus/harness-supervisor";
 import { readBundleSpecStamp } from "./bundle-manifest";
 import { cliVersion } from "./version";
+import { windowsSupervisionNotice } from "./win32-notice";
 
 /** What a verb returns: lines for stdout + the process exit code. */
 export type DaemonCommandResult = {
@@ -88,6 +89,11 @@ export type DaemonCommandOptions = {
   readonly followPollMs?: number;
   /** `fetch` for the control.v1 calls; injected in tests. */
   readonly fetch?: typeof fetch;
+  /** Platform the win32 supervision notice (HM-188) is decided against;
+   *  defaults to `process.platform`. Injected so the notice — whose whole
+   *  purpose is to describe a platform the test run is NOT on — is
+   *  assertable from any machine. Delete alongside `./win32-notice`. */
+  readonly platform?: string;
 };
 
 const DAEMON_USAGE_LINES: readonly string[] = [
@@ -927,6 +933,25 @@ export const DAEMON_VERBS = [
   "drain",
 ] as const;
 
+/**
+ * HM-188 — lead the output with the win32 supervision notice.
+ *
+ * Only `start` and `restart` carry it, for two reasons. The failure the
+ * notice names IS the start path: a wrong liveness verdict on Windows is
+ * what lets a restart spawn a SECOND copy of a channel daemon (double
+ * message processing, double provider spend). And the notice's own remedy is
+ * "confirm with `crewhaus daemon status`" — printing it above `status` would
+ * be circular, and above `status --json` it would corrupt the document a
+ * caller is piping into `jq`.
+ */
+function withPlatformNotice(
+  result: DaemonCommandResult,
+  opts: DaemonCommandOptions,
+): DaemonCommandResult {
+  const notice = windowsSupervisionNotice(opts.platform ?? process.platform);
+  return notice === undefined ? result : { ...result, lines: [notice, ...result.lines] };
+}
+
 /** Run `crewhaus daemon <verb> …`. Bad arguments throw plain `Error`s (the
  *  entry file routes them through `die()`); everything else returns lines +
  *  an exit code. */
@@ -941,9 +966,9 @@ export async function runDaemonCommand(
   const rest = argv.slice(1);
   switch (verb) {
     case "start":
-      return await daemonStart(rest, opts, false);
+      return withPlatformNotice(await daemonStart(rest, opts, false), opts);
     case "restart":
-      return await daemonStart(rest, opts, true);
+      return withPlatformNotice(await daemonStart(rest, opts, true), opts);
     case "stop":
       return await daemonStop(rest, opts);
     case "drain":

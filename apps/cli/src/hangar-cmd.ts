@@ -34,12 +34,22 @@
  * injected `write` sink because it blocks until SIGINT/SIGTERM.
  *
  * M4 shutdown: SIGINT/SIGTERM drives `runManagerShutdown()` over every
- * supervisor this manager holds BEFORE the socket and the lock are given up
- * — daemons detach (runfile-tracked, the next boot adopts them), everything
- * else is stopped so it cannot be orphaned, running jobs are signalled and
- * left open for `restore()` to reopen as `interrupted` — and only then does
- * the process exit, explicitly. Bad arguments throw plain `Error`s; the
- * entry file routes them through `die()` like `harness` does.
+ * supervisor this manager holds — enumerated from the process layer's own
+ * handle map (`processes.held()`), never from the registry, which a removal
+ * or a relocation can silently shrink mid-session — BEFORE the socket and
+ * the lock are given up: daemons detach (runfile-tracked, the next boot
+ * adopts them), everything else is stopped so it cannot be orphaned, running
+ * jobs are signalled and left open for `restore()` to reopen as
+ * `interrupted` — and only then does the process exit, explicitly.
+ *
+ * Two M4 boot-time postures live here too, because the flags are the only
+ * way in: the HM-201 remote-bind opt-in (a non-loopback `--host` needs
+ * `CREWHAUS_HANGAR_ALLOW_REMOTE=1` on top of the M1 auth requirement) and
+ * `--read-only` / `--read-only-locked`, the screen-share posture the server's
+ * 403 remedy tells operators to restart into.
+ *
+ * Bad arguments throw plain `Error`s; the entry file routes them through
+ * `die()` like `harness` does.
  */
 import { spawn } from "node:child_process";
 import {
@@ -69,7 +79,9 @@ import {
   runManagerShutdown,
   shutdownReportLines,
 } from "@crewhaus/harness-supervisor";
+import { REMOTE_BIND_ENV, remoteBindRefusal } from "./remote-bind";
 import { cliVersion } from "./version";
+import { windowsSupervisionNotice } from "./win32-notice";
 
 /** What a verb returns: lines for stdout + the process exit code. `serve`
  *  streams through the `write` sink instead (it blocks), so its lines come
@@ -110,6 +122,11 @@ export type HangarCommandOptions = {
   /** Hard cap on waiting for any one child to confirm its exit; default the
    *  supervisor package's `SHUTDOWN_DEADLINE_MS`. */
   readonly shutdownDeadlineMs?: number;
+  /** Platform the win32 supervision notice (HM-188) is decided against;
+   *  defaults to `process.platform`. Injected so the notice — whose whole
+   *  purpose is to describe a platform the test run is NOT on — is
+   *  assertable from any machine. Delete alongside `./win32-notice`. */
+  readonly platform?: string;
 };
 
 const HANGAR_USAGE_LINES: readonly string[] = [
@@ -117,13 +134,21 @@ const HANGAR_USAGE_LINES: readonly string[] = [
   "  crewhaus hangar [serve]                      boot the Hangar manager console (the local",
   "       [--port <n>] [--host <h>]               web UI over the machine-wide harness",
   "       [--no-auth] [--no-open] [--smoke]       registry) and open it in the browser",
+  "       [--read-only] [--read-only-locked]",
   "  crewhaus hangar status [--json]              lock/port/registry/token report — works",
   "                                               without a running server",
   "  crewhaus hangar open                         print + open the running console's URL",
   "",
   "  The console binds 127.0.0.1:4200 by default and hands its bearer token",
   "  to the browser as a URL #fragment (never a query string). --host binds",
-  "  another interface and REQUIRES auth; --no-auth is loopback-dev only.",
+  "  another interface: it REQUIRES auth and, because the console is machine",
+  `  control over plain HTTP, also ${REMOTE_BIND_ENV}=1.`,
+  "  --no-auth is loopback-dev only.",
+  "  --read-only boots the console with every mutating route refused (403) —",
+  "  the screen-share posture; it can still be lifted from the UI. Add",
+  "  --read-only-locked when the person driving is not the person who owns",
+  "  the machine: the mode then cannot be turned off over the wire, only by",
+  "  restarting the manager without the flag.",
   "  --smoke boots on an ephemeral port, self-checks the embedded UI + API",
   "  auth, and exits — the release workflow's compiled-binary smoke entry.",
   "  One instance per hangar root: <hangarRoot>/hangar.lock (stale locks",
@@ -382,6 +407,12 @@ type ServeFlags = {
   readonly noAuth: boolean;
   readonly noOpen: boolean;
   readonly smoke: boolean;
+  /** Boot the console with every mutating route refused. Persisted settings
+   *  can also engage this; the flag is the posture for ONE process. */
+  readonly readOnly: boolean;
+  /** …and refuse the un-toggle too, so the mode cannot be lifted over the
+   *  wire by whoever is driving. Implies {@link ServeFlags.readOnly}. */
+  readonly readOnlyLocked: boolean;
 };
 
 function parseServeFlags(argv: readonly string[]): ServeFlags {
@@ -391,6 +422,8 @@ function parseServeFlags(argv: readonly string[]): ServeFlags {
     "no-auth": "boolean",
     "no-open": "boolean",
     smoke: "boolean",
+    "read-only": "boolean",
+    "read-only-locked": "boolean",
   });
   if (args.positional.length > 0) {
     throw new Error(`hangar serve: unexpected argument "${args.positional[0]}"`);
@@ -404,12 +437,18 @@ function parseServeFlags(argv: readonly string[]): ServeFlags {
     }
   }
   const hostFlag = args.flags.get("host");
+  // `--read-only-locked` is the strictly stronger posture, so it implies
+  // `--read-only`: an operator who types only the lock must not get a
+  // writable console because they omitted the weaker flag.
+  const readOnlyLocked = args.flags.get("read-only-locked") === true;
   const flags: ServeFlags = {
     port,
     host: typeof hostFlag === "string" ? hostFlag : undefined,
     noAuth: args.flags.get("no-auth") === true,
     noOpen: args.flags.get("no-open") === true,
     smoke: args.flags.get("smoke") === true,
+    readOnly: readOnlyLocked || args.flags.get("read-only") === true,
+    readOnlyLocked,
   };
   if (flags.host !== undefined && flags.noAuth) {
     throw new Error(
@@ -523,40 +562,39 @@ function summaryLines(
 }
 
 /**
- * Every supervisor this manager is holding, in registry order.
+ * Every supervisor this manager is holding.
  *
- * `peek` is deliberately the side-effect-free half of the process layer: it
- * returns already-created handles only, so enumerating for shutdown never
- * builds a supervisor — and therefore never adopts a daemon — as a side
- * effect of going down. A harness with no handle never had a child here.
+ * THE SOURCE IS THE PROCESS LAYER, NOT THE REGISTRY. `ProcessLayer.held()`
+ * enumerates the handle map — the only authority on which supervisors hold a
+ * pid. The registry is a strictly smaller and differently-keyed set: handles
+ * are keyed by the dir they were CREATED with, `DELETE /api/h/:id` and
+ * `POST /api/h/:id/relocate` (and their `crewhaus harness` twins) mutate the
+ * registry with no live-run guard, and nothing prunes the handle map. Driving
+ * shutdown from `registry.list()` therefore drops any harness removed or
+ * relocated mid-session: not signalled, not even named in the report. The
+ * guaranteed casualty is the detached one-shot class (`workflow`, `graph`,
+ * `pipeline`, `research`, `eval`, `onchain`), which lives in its own process
+ * group — immune to the terminal's SIGINT — and writes no runfile, so no
+ * later manager can enumerate, adopt, stop or name it either.
  *
- * Exported because it is the seam the shutdown wiring is tested through:
- * `ProcessLayer` is keyed by harness dir and has no enumeration of its own,
- * which is exactly why M2 and M3 could only ever print what survived.
+ * `held()` is the side-effect-free half of the layer, like `peek`: it returns
+ * already-created handles only, so enumerating for shutdown never builds a
+ * supervisor — and therefore never adopts a daemon — as a side effect of
+ * going down. This function only de-duplicates, keeping that property intact.
+ *
+ * Exported because it is the seam the shutdown wiring is tested through.
  */
 export function heldSupervisors(
-  dirs: readonly string[],
-  peek: (dir: string) => { readonly supervisor: ShutdownSupervisor } | undefined,
+  handles: readonly { readonly supervisor: ShutdownSupervisor }[],
 ): ShutdownSupervisor[] {
   const held: ShutdownSupervisor[] = [];
-  const seen = new Set<string>();
-  for (const dir of dirs) {
-    if (seen.has(dir)) continue;
-    seen.add(dir);
-    const handle = peek(dir);
-    if (handle !== undefined) held.push(handle.supervisor);
+  const seen = new Set<ShutdownSupervisor>();
+  for (const handle of handles) {
+    if (seen.has(handle.supervisor)) continue;
+    seen.add(handle.supervisor);
+    held.push(handle.supervisor);
   }
   return held;
-}
-
-/** Registered harness dirs, or none when the registry cannot be read — a
- *  registry that fails to open must not wedge the console shut. */
-function registeredDirs(registry: HangarRegistry | undefined): string[] {
-  try {
-    return registry?.list().map((entry) => entry.dir) ?? [];
-  } catch {
-    return [];
-  }
 }
 
 async function hangarServe(
@@ -565,6 +603,14 @@ async function hangarServe(
 ): Promise<HangarCommandResult> {
   const flags = parseServeFlags(argv);
   const env = opts.env ?? process.env;
+  // HM-201 — the remote-bind opt-in. `parseServeFlags` is pure argv, and
+  // this gate reads the environment, so it lives here rather than in the
+  // parser: everything the refusal depends on is injected, and the check
+  // runs BEFORE the lock is claimed, the registry is opened, or a socket is
+  // bound. `--host` already implies auth (M1); this is the second gate,
+  // because a bearer token over plain HTTP is a poor answer to a LAN.
+  const remoteRefusal = remoteBindRefusal(flags.host, env);
+  if (remoteRefusal !== undefined) throw new Error(remoteRefusal);
   const now = opts.now ?? Date.now;
   const pid = opts.pid ?? process.pid;
   const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
@@ -600,6 +646,8 @@ async function hangarServe(
     ...(flags.host !== undefined ? { hostname: flags.host } : {}),
     root: hangarRoot,
     ...(flags.noAuth ? { noAuth: true } : {}),
+    ...(flags.readOnly ? { readOnly: true } : {}),
+    ...(flags.readOnlyLocked ? { readOnlyLocked: true } : {}),
     assets: hangarAssets,
     env,
     now,
@@ -633,6 +681,13 @@ async function hangarServe(
       }${booted.jobs > 0 ? `, re-queued ${booted.jobs} pending job(s)` : ""}`,
     );
   }
+
+  // HM-188 — say out loud that Windows supervision has never had a green CI
+  // run. Printed before the summary (and before the smoke checks) so it is
+  // the first thing an operator reads on the platform it is about, not a
+  // footnote under a box they have already stopped reading.
+  const win32Notice = windowsSupervisionNotice(opts.platform ?? process.platform);
+  if (win32Notice !== undefined) write(win32Notice);
 
   if (flags.smoke) {
     write(`smoke: booted ${server.url} (ephemeral port ${server.port})`);
@@ -673,7 +728,7 @@ async function hangarServe(
   // what makes "the console is up" and "the console owns these processes"
   // the same statement.
   const report = await runManagerShutdown({
-    supervisors: heldSupervisors(registeredDirs(registry), (dir) => server.processes.peek(dir)),
+    supervisors: heldSupervisors(server.processes.held()),
     jobs: server.processes.jobs,
     ...(opts.shutdownGraceMs !== undefined ? { graceMs: opts.shutdownGraceMs } : {}),
     ...(opts.shutdownDeadlineMs !== undefined ? { deadlineMs: opts.shutdownDeadlineMs } : {}),

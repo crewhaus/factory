@@ -11,6 +11,8 @@ import { describe, expect, test } from "bun:test";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { bindingSheet, globalKey, initialKeyState, keyShape } from "../assets/js/keys.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
+import { createNotificationPoll } from "../assets/js/notify.js";
+// @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { canRunAction, omniRows } from "../assets/js/omnibox.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { GLOBAL_VIEWS, HARNESS_TABS, parseRoute } from "../assets/js/router.js";
@@ -71,6 +73,30 @@ describe("globalKey — HM-190 ownership", () => {
     const esc = press(open, { key: "Escape" });
     expect(esc.effect).toBe("close-omnibox");
     expect(esc.state.omniboxOpen).toBe(false);
+  });
+
+  test("the omnibox cannot trap the keyboard it just took over", () => {
+    // `openOmnibox` focuses its own <input>, so from the instant the overlay
+    // mounts EVERY key arrives with `inField: true`. If the field rule bailed
+    // unconditionally there, both of the overlay's exits would be swallowed
+    // by the overlay itself and the only way out would be a mouse click on
+    // the backdrop — on the feature whose whole point is the keyboard.
+    const open = { ...initialKeyState(), omniboxOpen: true };
+    const esc = press(open, { key: "Escape", inField: true });
+    expect(esc.effect).toBe("close-omnibox");
+    expect(esc.claimed).toBe(true); // claimed ⇒ preventDefault ⇒ no native search-clear
+    expect(esc.state.omniboxOpen).toBe(false);
+    for (const mod of [{ meta: true }, { ctrl: true }]) {
+      const chord = press(open, { key: "k", inField: true, ...mod });
+      expect(chord.effect).toBe("close-omnibox");
+      expect(chord.claimed).toBe(true);
+      expect(chord.state.omniboxOpen).toBe(false);
+    }
+    // …and NOTHING else is taken from the field: the query still types.
+    for (const key of ["k", "j", "?", "a", "ArrowDown", "Enter", " "]) {
+      const r = press(open, { key, inField: true });
+      expect(`${key}:${r.claimed}:${r.effect}`).toBe(`${key}:false:null`);
+    }
   });
 
   test("`?` opens the app sheet only when no inbox is mounted", () => {
@@ -141,7 +167,11 @@ describe("omniRows — HM-189", () => {
         label: "Start polymarket",
         route: "procStart",
         params: { id: "hrn_1" },
-        cliTwin: "crewhaus daemon start --dir /h/poly",
+        // A twin is only worth showing if a terminal accepts it: the daemon
+        // verbs take the harness POSITIONALLY (`--dir` is not a flag on any
+        // of them), so the fixture carries the form `supervision.js` already
+        // emits rather than one that would fail on paste.
+        cliTwin: "cd /h/poly && crewhaus daemon start",
         confirm: true,
       },
     ],
@@ -176,6 +206,136 @@ describe("omniRows — HM-189", () => {
     for (const route of ["removeHarness", "specEdit", "memoryForget", "", "nonsense"]) {
       expect(`${route}:${canRunAction(route)}`).toBe(`${route}:false`);
     }
+  });
+});
+
+describe("the notification poll — HM-183", () => {
+  /** Let every queued microtask (and one macrotask) settle. */
+  const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  /** A clock the test owns: `schedule` parks the callback, `advance` runs it. */
+  function fakeTimers() {
+    let parked: Array<() => void> = [];
+    return {
+      schedule: (fn: () => void): number => parked.push(fn),
+      cancel: (): void => {
+        parked = [];
+      },
+      pending: (): number => parked.length,
+      advance: async (): Promise<void> => {
+        const due = parked;
+        parked = [];
+        for (const fn of due) fn();
+        await flush();
+      },
+    };
+  }
+
+  test("a console left open keeps evaluating — the poll is a loop, not a boot-time read", async () => {
+    // `GET /api/notifications` IS the rules evaluation (the manager runs no
+    // timer of its own), so a console that asks once at boot notifies nobody
+    // for as long as it stays open — which is exactly the case the one
+    // default-on rule, a parked approval, exists for.
+    const timers = fakeTimers();
+    let calls = 0;
+    const poll = createNotificationPoll({
+      load: async () => {
+        calls += 1;
+        return { badge: calls, delivered: [] };
+      },
+      intervalMs: 1000,
+      schedule: timers.schedule,
+      cancel: timers.cancel,
+    });
+    poll.start();
+    await flush();
+    expect(calls).toBe(1);
+    await timers.advance();
+    expect(calls).toBe(2);
+    await timers.advance();
+    expect(calls).toBe(3);
+    // …and stopped means stopped (a hidden tab costs the server nothing).
+    poll.stop();
+    await timers.advance();
+    expect(calls).toBe(3);
+  });
+
+  test("two screens asking at once share ONE evaluating GET", async () => {
+    // The GET is a mutation in one respect: a delivery it returns is deduped
+    // away and never returned again. A second caller would not read the same
+    // state, it would EAT it — so a view asks the shared poll instead.
+    let calls = 0;
+    const poll = createNotificationPoll({
+      load: async () => {
+        calls += 1;
+        await flush();
+        return { badge: 1, delivered: [{ label: "polymarket: 1 approval parked" }] };
+      },
+      schedule: () => 0,
+      cancel: () => {},
+    });
+    const fromApp = poll.refresh();
+    const fromSettings = poll.current(); // the Settings screen, arriving mid-flight
+    const [a, b] = await Promise.all([fromApp, fromSettings]);
+    expect(calls).toBe(1);
+    expect(b).toBe(a);
+    // With a snapshot in hand, rendering the screen again asks for nothing.
+    expect(await poll.current()).toBe(a);
+    expect(calls).toBe(1);
+  });
+
+  test("nothing consumes a delivery without showing it", async () => {
+    const shown: string[] = [];
+    const poll = createNotificationPoll({
+      load: async () => ({
+        badge: 1,
+        delivered: [{ label: "polymarket: 1 approval parked" }],
+      }),
+      schedule: () => 0,
+      cancel: () => {},
+    });
+    poll.subscribe((_payload: unknown, delivered: Array<{ label?: string }>) => {
+      for (const d of delivered) shown.push(String(d?.label ?? ""));
+    });
+    await poll.refresh();
+    expect(shown).toEqual(["polymarket: 1 approval parked"]);
+    // The PUT that saves the rules answers with the same evaluated view,
+    // deliveries and all. Folding it back in is what stops a write from
+    // eating a toast nothing ever showed.
+    poll.accept({ badge: 2, delivered: [{ label: "brewbird: eval gate failed" }] });
+    expect(shown).toEqual(["polymarket: 1 approval parked", "brewbird: eval gate failed"]);
+    expect((poll.snapshot() as { badge: number }).badge).toBe(2);
+  });
+
+  test("a failed poll, and a listener that throws, both leave the loop running", async () => {
+    const timers = fakeTimers();
+    let calls = 0;
+    const poll = createNotificationPoll({
+      load: async () => {
+        calls += 1;
+        if (calls === 1) throw new Error("network error");
+        return { badge: 0, delivered: [] };
+      },
+      intervalMs: 1000,
+      schedule: timers.schedule,
+      cancel: timers.cancel,
+    });
+    poll.subscribe(() => {
+      throw new Error("a broken toast must not break the badge");
+    });
+    let seen = 0;
+    poll.subscribe(() => {
+      seen += 1;
+    });
+    poll.start();
+    await flush();
+    expect(calls).toBe(1);
+    expect(poll.snapshot()).toBeNull(); // a failed poll records nothing
+    await timers.advance();
+    expect(calls).toBe(2);
+    expect(seen).toBe(1); // the second listener still ran
+    await timers.advance();
+    expect(calls).toBe(3);
   });
 });
 

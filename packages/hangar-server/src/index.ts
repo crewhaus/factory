@@ -257,6 +257,7 @@ export {
   dreamOverdue,
   HEALTH_SCREENS,
   HEALTH_WEIGHTS,
+  PREFLIGHT_BUDGET_ITEM,
   type DreamOverdue,
   type HealthDeduction,
   type HealthInputs,
@@ -280,6 +281,7 @@ export {
   type StarterInstall,
 } from "./onboarding";
 export {
+  actionCliTwins,
   buildHarnessEntries,
   createOmniIndex,
   harnessIndexToken,
@@ -299,17 +301,23 @@ export {
 } from "./omnibox";
 export {
   createNotificationCentre,
+  defaultNotificationSinks,
   deriveEvents,
   evaluateNotifications,
   inQuietHours,
   normalizeQuietHours,
   normalizeRules,
+  osNotifierArgv,
+  toastBody,
+  webhookPayload,
   DEFAULT_QUIET_HOURS,
   DEFAULT_RULES,
   KIND_LABELS,
   MAX_INAPP_DELIVERIES,
   NOTIFICATION_KINDS,
   NOTIFICATION_SINKS,
+  OS_NOTIFICATION_TITLE,
+  WEBHOOK_TIMEOUT_MS,
   type Delivery,
   type HarnessSignal,
   type NotificationCentre,
@@ -317,8 +325,10 @@ export {
   type NotificationKind,
   type NotificationRule,
   type NotificationSink,
+  type NotificationSinkDeps,
   type NotificationSinks,
   type QuietHours,
+  type SinkAvailability,
   type SuppressedEvent,
 } from "./notifications";
 export {

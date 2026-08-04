@@ -106,7 +106,14 @@ describe("matchActions", () => {
     expect(actions).toHaveLength(1);
     expect(actions[0]?.route).toBe("procStart");
     expect(actions[0]?.params).toEqual({ id: "hrn_1" });
-    expect(actions[0]?.cliTwin).toContain("crewhaus daemon start");
+    // The EXACT string, not a prefix: `toContain("crewhaus daemon start")`
+    // is satisfied by `crewhaus daemon start --dir /h/poly`, which every
+    // daemon verb rejects. `cli-twins.test.ts` checks the whole surface
+    // against the CLI's dispatch; this pins the one row.
+    // …and the path is quoted UNCONDITIONALLY, the convention `shellQuote`
+    // exists for: a directory name is attacker-influenceable on a shared
+    // mount, and a conditional quote leaves every expansion live.
+    expect(actions[0]?.cliTwin).toBe("crewhaus daemon start '/h/poly'");
     // Every action must be confirmed before it runs — the search route
     // executes nothing.
     expect(actions.every((a) => a.confirm === true)).toBe(true);

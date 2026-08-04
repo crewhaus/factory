@@ -337,8 +337,15 @@ export function onboardingView(args: {
     suggestions: args.suggestions,
     demo: args.demo,
     completedAt: args.completedAt,
+    // Every one of these is shown beside a copy button on the FIRST screen a
+    // new operator sees, so every one has to run. `crewhaus harness` has no
+    // `scan-root` verb — the dispatch accepts list|show|add|remove|relocate|
+    // group|tag|pin|scan|preflight — and `harness scan --root <dir>` is the
+    // true equivalent of the button next to it: `harnessScan` remembers the
+    // root (`addScanRoot`) before it walks. `cli-twins.test.ts` checks these
+    // against the CLI's own dispatch so the pair cannot drift apart again.
     cliTwins: {
-      addScanRoot: "crewhaus harness scan-root add <dir>",
+      addScanRoot: "crewhaus harness scan --root <dir>",
       scan: "crewhaus harness scan",
       addHarness: "crewhaus harness add <dir>",
       demo: "cp -R <demos>/starters/<starter> <dir> && crewhaus harness add <dir>",

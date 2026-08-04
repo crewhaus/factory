@@ -8,6 +8,8 @@
  * silently disabling a rule it never mentioned.
  */
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { makeFixtureHarness } from "./fixture";
 import {
@@ -17,13 +19,18 @@ import {
   type HarnessSignal,
   NOTIFICATION_KINDS,
   type NotificationRule,
+  OS_NOTIFICATION_TITLE,
   createNotificationCentre,
+  defaultNotificationSinks,
   deriveEvents,
   evaluateNotifications,
   inQuietHours,
   normalizeQuietHours,
   normalizeRules,
+  osNotifierArgv,
+  webhookPayload,
 } from "./notifications";
+import { startHangarServer } from "./server";
 import { bootTestServer } from "./testkit";
 
 const NOW = Date.parse("2026-08-03T12:00:00.000Z");
@@ -268,6 +275,146 @@ describe("createNotificationCentre", () => {
     );
     expect(called).toBe(0);
   });
+
+  test("an event no sink could carry is NOT marked delivered, and comes back", () => {
+    // The dedupe key is burned for the life of the process, so recording a
+    // delivery nothing carried makes that occurrence unreachable forever —
+    // on exactly the sinks whose job is reaching an absent operator.
+    const centre = createNotificationCentre({}); // no os sink, no webhook sink
+    const input = {
+      rules: allOn.map((r) => ({ ...r, sinks: ["os", "webhook"] as const })),
+      quietHours: DEFAULT_QUIET_HOURS,
+      mutedGroups: [],
+      events: deriveEvents([signal({ pendingApprovals: 1 })]),
+      nowMs: NOW,
+    };
+    const first = centre.poll(input, "https://hooks.example.test/hangar");
+    expect(first.deliveries).toEqual([]);
+    expect(first.suppressed.map((s) => s.reason)).toEqual(["sink-unavailable"]);
+    expect(centre.inApp()).toEqual([]);
+
+    // Still true on the next poll ⇒ still reported. It was never delivered,
+    // so "already-delivered" would be a lie.
+    const second = centre.poll(input, "https://hooks.example.test/hangar");
+    expect(second.suppressed.map((s) => s.reason)).toEqual(["sink-unavailable"]);
+  });
+
+  test("a delivery reports the sinks that ACTUALLY carried it", () => {
+    // in-app + os are wired; webhook is wired but has no URL. The delivery
+    // is real, so the key IS remembered — but it must not claim a webhook
+    // POST that never happened.
+    const os: Delivery[] = [];
+    const centre = createNotificationCentre({ os: (d) => os.push(d), webhook: () => {} });
+    const result = centre.poll(
+      {
+        rules: allOn.map((r) => ({ ...r, sinks: ["in-app", "os", "webhook"] as const })),
+        quietHours: DEFAULT_QUIET_HOURS,
+        mutedGroups: [],
+        events: deriveEvents([signal({ pendingApprovals: 1 })]),
+        nowMs: NOW,
+      },
+      null,
+    );
+    expect(result.deliveries[0]?.sinks).toEqual(["in-app", "os"]);
+    expect(os[0]?.sinks).toEqual(["in-app", "os"]);
+    expect(centre.inApp()[0]?.sinks).toEqual(["in-app", "os"]);
+  });
+
+  test("availability names every sink this manager cannot deliver on", () => {
+    const none = createNotificationCentre({}).availability(null);
+    expect(none.find((s) => s.sink === "in-app")?.available).toBe(true);
+    expect(none.find((s) => s.sink === "os")?.available).toBe(false);
+    expect(none.find((s) => s.sink === "os")?.reason).toContain("no OS notifier");
+    expect(none.find((s) => s.sink === "webhook")?.available).toBe(false);
+
+    const wired = createNotificationCentre({ os: () => {}, webhook: () => {} });
+    expect(wired.availability(null).find((s) => s.sink === "webhook")?.reason).toContain(
+      "no webhook URL",
+    );
+    const live = wired.availability("https://hooks.example.test/hangar");
+    expect(live.every((s) => s.available)).toBe(true);
+    expect(live.every((s) => s.reason === null)).toBe(true);
+  });
+});
+
+describe("defaultNotificationSinks — the sinks the shipping binary uses", () => {
+  const delivery: Delivery = {
+    key: "crash-looping:hrn_00000000000000a1:state",
+    kind: "crash-looping",
+    harnessId: "hrn_00000000000000a1",
+    specName: "poly",
+    label: 'poly: the "daemon" is crash-looping',
+    ref: null,
+    sinks: ["os", "webhook"],
+    at: new Date(NOW).toISOString(),
+  };
+
+  test("the OS notifier is an argv VECTOR whose message is never script source", () => {
+    const argv = osNotifierArgv("darwin", OS_NOTIFICATION_TITLE, 'a "quoted" name');
+    expect(argv?.[0]).toBe("osascript");
+    // The body travels as an argv ITEM the script reads back — so a spec
+    // name containing a quote cannot become AppleScript.
+    expect(argv).toContain('a "quoted" name');
+    expect(argv?.some((part) => part.includes('display notification "'))).toBe(false);
+    expect(osNotifierArgv("linux", OS_NOTIFICATION_TITLE, "x")?.[0]).toBe("notify-send");
+    // No half-working Windows toast: absent is honest, and `availability`
+    // renders it.
+    expect(osNotifierArgv("win32", OS_NOTIFICATION_TITLE, "x")).toBeUndefined();
+  });
+
+  test("the real sinks spawn the notifier and POST the webhook", async () => {
+    const spawned: Array<readonly string[]> = [];
+    const posts: Array<{ url: string; body: string }> = [];
+    const sinks = defaultNotificationSinks({
+      platform: "darwin",
+      notify: (argv) => spawned.push(argv),
+      post: async (url, body) => {
+        posts.push({ url, body });
+        return undefined;
+      },
+    });
+    sinks.os?.(delivery);
+    sinks.webhook?.(delivery, "https://hooks.example.test/hangar");
+    await Promise.resolve();
+
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]?.[0]).toBe("osascript");
+    expect(spawned[0]).toContain(delivery.label);
+    expect(posts[0]?.url).toBe("https://hooks.example.test/hangar");
+    expect(JSON.parse(posts[0]?.body ?? "{}")).toEqual(webhookPayload(delivery));
+  });
+
+  test("a platform with no notifier declares no os sink at all", () => {
+    const sinks = defaultNotificationSinks({ platform: "win32", notify: () => {} });
+    expect(sinks.os).toBeUndefined();
+    // …and the centre built over them says so rather than silently eating
+    // the delivery.
+    expect(
+      createNotificationCentre(sinks)
+        .availability(null)
+        .find((s) => s.sink === "os")?.available,
+    ).toBe(false);
+  });
+
+  test("a failing sink is warned about, never swallowed and never thrown", async () => {
+    const warnings: string[] = [];
+    const sinks = defaultNotificationSinks({
+      platform: "linux",
+      onWarn: (m) => warnings.push(m),
+      notify: () => {
+        throw new Error("notify-send: not installed");
+      },
+      post: () => Promise.reject(new Error("ECONNREFUSED")),
+    });
+    expect(() => sinks.os?.(delivery)).not.toThrow();
+    expect(() => sinks.webhook?.(delivery, "https://hooks.example.test/hangar")).not.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(warnings.some((w) => w.includes("not installed"))).toBe(true);
+    expect(warnings.some((w) => w.includes("ECONNREFUSED"))).toBe(true);
+    // The URL is never echoed into the log — a path segment is as good a
+    // place to hide a token as a query string.
+    expect(warnings.some((w) => w.includes("hooks.example.test"))).toBe(false);
+  });
 });
 
 describe("GET/PUT /api/notifications", () => {
@@ -320,6 +467,102 @@ describe("GET/PUT /api/notifications", () => {
       expect(((await t.api("/api/notifications")).body["inApp"] as unknown[]).length).toBe(0);
     } finally {
       await t.stop();
+    }
+  }, 20_000);
+
+  test("a sink the manager cannot deliver on suppresses — and starts working the moment it can", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = join(t.harnessesRoot, "webhooked");
+      makeFixtureHarness(dir, {
+        specName: "webhooked",
+        approvals: [
+          {
+            id: "appr_00000000000000b1",
+            toolName: "shell",
+            input: { cmd: "ls" },
+            inputHash: "0".repeat(64),
+            runId: "run_00000000000000b1",
+            sessionId: "sess_00000000000000bb",
+            surface: "cli",
+            createdAt: new Date(NOW - 60_000).toISOString(),
+          },
+        ],
+      });
+      await t.api("/api/harnesses", { method: "POST", body: JSON.stringify({ dir }) });
+
+      // Webhook only, and no URL yet: nothing can carry it.
+      const configured = await t.api("/api/notifications", {
+        method: "PUT",
+        body: JSON.stringify({
+          rules: [{ kind: "approval-parked", enabled: true, sinks: ["webhook"] }],
+        }),
+      });
+      expect(configured.status).toBe(200);
+      expect(configured.body["delivered"]).toEqual([]);
+      expect(
+        (configured.body["suppressed"] as Array<{ reason: string }>).map((s) => s.reason),
+      ).toEqual(["sink-unavailable"]);
+      expect(configured.body["badge"]).toBe(0);
+      expect(t.sinks?.webhook).toEqual([]);
+      // …and the screen can say why.
+      const availability = configured.body["sinkAvailability"] as Array<{
+        sink: string;
+        available: boolean;
+        reason: string | null;
+      }>;
+      expect(availability.find((s) => s.sink === "webhook")).toMatchObject({
+        available: false,
+        reason: "no webhook URL is configured",
+      });
+
+      // Give it a URL: the SAME event now delivers, because it was never
+      // marked delivered while nothing could carry it.
+      const withUrl = await t.api("/api/notifications", {
+        method: "PUT",
+        body: JSON.stringify({ webhookUrl: "https://hooks.example.test/hangar" }),
+      });
+      const delivered = withUrl.body["delivered"] as Array<{ kind: string; sinks: string[] }>;
+      expect(delivered).toHaveLength(1);
+      expect(delivered[0]?.kind).toBe("approval-parked");
+      expect(delivered[0]?.sinks).toEqual(["webhook"]);
+      expect(t.sinks?.webhook).toHaveLength(1);
+      expect(t.sinks?.webhook[0]?.url).toBe("https://hooks.example.test/hangar");
+      // Webhook only ⇒ no in-app badge, and the payload says so honestly.
+      expect(withUrl.body["badge"]).toBe(0);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("the shipping composition wires real sinks — omitting them is not `{}`", async () => {
+    // The defect this replaced: `crewhaus hangar` passed no sinks, so `os`
+    // and `webhook` were permanent no-ops in the only build anyone runs.
+    // Booted here the way the CLI boots it: no `notificationSinks` at all.
+    const workspace = mkdtempSync(join(tmpdir(), "hangar-sinks-"));
+    const server = startHangarServer({
+      port: 0,
+      root: join(workspace, "hangar"),
+      registryRoot: join(workspace, "registry"),
+      env: { CREWHAUS_WATCHME_ROOT: join(workspace, "watchme") },
+      now: () => NOW,
+      onWarn: () => {},
+    });
+    try {
+      const res = await fetch(`${server.url}/api/notifications`, {
+        headers: { authorization: `Bearer ${server.token ?? ""}` },
+        signal: AbortSignal.timeout(10_000),
+      });
+      const body = (await res.json()) as Record<string, unknown>;
+      const availability = body["sinkAvailability"] as Array<{ sink: string; reason: string }>;
+      // A `{}` sink set would say "built with no webhook sink"; the real one
+      // is present and only wants a URL.
+      expect(availability.find((s) => s.sink === "webhook")?.reason).toBe(
+        "no webhook URL is configured",
+      );
+    } finally {
+      await server.stop();
+      rmSync(workspace, { recursive: true, force: true });
     }
   }, 20_000);
 

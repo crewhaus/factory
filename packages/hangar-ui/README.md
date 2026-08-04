@@ -237,6 +237,7 @@ background `?hydrate=1` refetch with freshly computed rollups.
 |---|---|
 | `assets/js/keys.js` | the app-level keyboard reducer: who owns ⌘K, Escape and `?` (HM-190) |
 | `assets/js/omnibox.js` | the ⌘K overlay — navigation rows are links, ACTION rows are proposals |
+| `assets/js/notify.js` | the ONE notification poll: the evaluating GET, shared (HM-183) |
 | `assets/js/views/health.js` | the explained score, per harness and as the fleet board |
 | `assets/js/views/onboarding.js` | first boot: scan-root picker, demo mode, direct registration |
 | `assets/js/views/settings.js` | notification rules, read-only mode, the plugin inventory |
@@ -249,6 +250,24 @@ keys (including ⌘K), the open omnibox owns everything but Escape, and `?`
 goes to the app sheet only when no inbox is mounted — two sheets opening on
 one keypress is the bug that rule exists to prevent. The reducer claims
 nothing else, so the inbox keeps receiving j/k/g/d untouched.
+
+The field rule has exactly one exception, and the omnibox is it: the overlay
+focuses its own input, so from the moment it opens every key arrives from a
+field. Escape and the ⌘K toggle are therefore claimed even in a field while
+the omnibox is open — otherwise the overlay swallows both of its own exits
+and the only way out is a mouse click, on the feature whose whole point is
+the keyboard. Nothing else is taken: the query still types.
+
+**One evaluating poll, shared.** `GET /api/notifications` IS the rules
+evaluation (the manager runs no timer of its own), and every delivery it
+returns is deduped away server-side and never returned again — so a second
+caller does not read that state, it consumes it. `notify.js` owns the only
+call: it polls on an interval so a console left open actually notifies,
+toasts what each pass delivered, keeps the nav badge honest, and hands the
+same snapshot to the Settings screen rather than letting it issue a GET that
+would eat a toast. The PUT that saves the rules answers with the same
+evaluated view, so its answer is folded back in through the same path. The
+asset-hygiene suite pins the single caller.
 
 **The omnibox proposes; it never acts.** Enter on a navigation row goes
 somewhere. Enter on an ACTION row opens a confirm, showing the exact CLI

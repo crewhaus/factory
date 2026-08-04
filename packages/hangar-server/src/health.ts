@@ -25,12 +25,33 @@
  * result; the gathering (which does touch the filesystem) is the caller's,
  * so the weighting can be unit-tested without a fixture harness.
  *
- * DOUBLE-COUNTING IS THE ONE REAL TRAP. Preflight's credentials area and
- * the spec's own `$VAR` reference list describe the same missing key from
- * two directions, and an operator who is missing one API key should not be
- * charged for it twice. The unset-env deduction therefore subtracts only
- * the keys preflight did not already name (it dedupes on `envVar`), and the
- * test suite pins that.
+ * EVERY CREDENTIAL SIGNAL COMES FROM PREFLIGHT — never from a `$VAR` scan of
+ * the spec text. That is the one rule this module has learned the hard way,
+ * and it answers three separate failures at once:
+ *
+ *   - **Comments and prose are not references.** `collectEnvRefs` is a raw
+ *     regex over the whole YAML, so an instructions block that says "listing
+ *     every `$VAR` the spec references" produced a −6 charge telling the
+ *     operator to go set an environment variable called `VAR`. It is the
+ *     right scan for the informational Spec panel and the wrong one for a
+ *     score with a "fix in creds →" link on it.
+ *   - **Either-or groups are one requirement, not two.** Anthropic's group is
+ *     `ANTHROPIC_AUTH_TOKEN` *or* `ANTHROPIC_API_KEY`; preflight reports one
+ *     item for it. A text scan that finds the OTHER spelling in the spec
+ *     charged 6 on top of preflight's 12 for the same missing credential —
+ *     exactly the double-count this docblock used to promise it prevented.
+ *   - **"Can this harness spend?" is a question about the ENVIRONMENT.**
+ *     Preflight answers it with `hasLiveProviderCredentials(models, env)` and
+ *     publishes the verdict as `durability.budget`. Deriving it from "the
+ *     spec interpolates some variable that happens to be set" charged a
+ *     local-model harness with a Slack token and let every harness that names
+ *     its model literally off entirely.
+ *
+ * So: blocking preflight items are charged at full weight, warn-level items
+ * that NAME an env var are charged once each (deduped against the blocking
+ * pass on `envVar`), and the budget deduction is preflight's own
+ * `durability.budget` finding. Preflight is the authority on what a start
+ * actually needs; this module only prices it.
  */
 
 /** The console tab a deduction is fixed on — every value is a real tab in
@@ -96,10 +117,10 @@ export const HEALTH_WEIGHTS = {
   /** Supervision parked in a state that needs a human. */
   crashLooping: 30,
   terminal: 15,
-  /** Per `$VAR` the spec references that is unset AND preflight did not
-   *  already charge for. */
-  missingCredential: 6,
-  missingCredentialCap: 18,
+  /** Per warn-level preflight item that names an env var, when the blocking
+   *  pass did not already charge for that variable. */
+  unsetEnvVar: 6,
+  unsetEnvVarCap: 18,
   /** Per `parseSpecIssues` diagnostic; the spec being unreadable is worse
    *  than any number of individual issues. */
   specIssue: 5,
@@ -124,7 +145,13 @@ export type HealthPreflightItem = {
 };
 
 export type HealthInputs = {
-  /** The preflight report, or null when it could not be run. */
+  /**
+   * The preflight report, or null when it could not be run.
+   *
+   * The SOLE source of every credential/environment signal this module
+   * prices — including whether the harness can spend (`durability.budget`).
+   * Null therefore makes all of them unknowns rather than passes.
+   */
   readonly preflight: { readonly items: readonly HealthPreflightItem[] } | null;
   /** `evalHealth()` for this harness, or null when unread. */
   readonly evalHealth: { readonly healthy: boolean; readonly note: string } | null;
@@ -132,13 +159,9 @@ export type HealthInputs = {
   /** Supervision state (`running`, `crash-looping`, `terminal`, …) or null
    *  when the process layer holds no handle for this harness. */
   readonly procState: string | null;
-  /** Spec `$VAR` references with SET/UNSET presence (never values). */
-  readonly envRefs: ReadonlyArray<{ readonly key: string; readonly set: boolean }>;
   /** `parseSpecIssues` diagnostics. */
   readonly specIssues: ReadonlyArray<{ readonly message: string }>;
   readonly specUnreadable: boolean;
-  /** True when the spec declares a `budget:` block. */
-  readonly budgeted: boolean;
   /** Dream specs with their overdue verdict (see {@link dreamOverdue}). */
   readonly dreams: ReadonlyArray<{ readonly specName: string } & DreamOverdue>;
 };
@@ -168,6 +191,14 @@ const AREA_SCREEN: Readonly<Record<string, HealthScreen>> = {
   bundle: "runs",
   durability: "memory",
 };
+
+/**
+ * Preflight's own "this harness can spend, uncapped" finding — raised when
+ * `hasLiveProviderCredentials(models, env)` holds and the spec declares no
+ * `budget:` block. Warn-level by design (a manager surfaces it, never
+ * refuses on it), which is why the blocking pass does not see it.
+ */
+export const PREFLIGHT_BUDGET_ITEM = "durability.budget";
 
 /** Supervision states that mean "a human is required" (M2's own vocabulary). */
 const CRASH_LOOPING = "crash-looping";
@@ -270,21 +301,30 @@ export function computeHealth(inputs: HealthInputs): HealthResult {
     });
   }
 
-  // --- credentials the spec names but the environment does not hold -------
-  // Deliberately AFTER preflight, and only for keys preflight did not
-  // already charge for: one missing key is one problem, not two.
-  const unsetRefs = inputs.envRefs.filter((r) => !r.set && !chargedEnvVars.has(r.key));
+  // --- environment variables preflight names, below the blocking bar ------
+  // Deliberately AFTER the blocking pass, and only for variables it did not
+  // already charge for: one missing key is one problem, not two. Preflight
+  // is the source (see the docblock) — one item per requirement, so an
+  // either-or credential group is charged once, and a `$VAR` that only
+  // appears in a comment or a prompt is not charged at all.
+  const warnEnvVars = new Set<string>();
+  const warnEnvItems = (inputs.preflight?.items ?? []).filter((item) => {
+    if (item.level !== "warn" || item.envVar === undefined) return false;
+    if (chargedEnvVars.has(item.envVar) || warnEnvVars.has(item.envVar)) return false;
+    warnEnvVars.add(item.envVar);
+    return true;
+  });
   clampPoints(
     deductions,
-    unsetRefs.map((ref) => ({
-      id: `env:${ref.key}`,
-      points: HEALTH_WEIGHTS.missingCredential,
-      label: `${ref.key} is referenced by the spec but unset`,
+    warnEnvItems.map((item) => ({
+      id: `env:${item.envVar as string}`,
+      points: HEALTH_WEIGHTS.unsetEnvVar,
+      label: `${item.envVar} is unset`,
       detail:
-        "the spec interpolates this variable; nothing in the .env chain or the manager's environment sets it",
-      screen: "creds" as HealthScreen,
+        item.remediation !== undefined ? `${item.message} — ${item.remediation}` : item.message,
+      screen: AREA_SCREEN[item.area] ?? "creds",
     })),
-    HEALTH_WEIGHTS.missingCredentialCap,
+    HEALTH_WEIGHTS.unsetEnvVarCap,
   );
 
   // --- spec drift ----------------------------------------------------------
@@ -311,8 +351,14 @@ export function computeHealth(inputs: HealthInputs): HealthResult {
   }
 
   // --- an unbudgeted harness that CAN spend --------------------------------
-  const hasLiveCredential = inputs.envRefs.some((r) => r.set);
-  if (!inputs.budgeted && hasLiveCredential) {
+  // Preflight's verdict, not a re-derivation of it. `durability.budget`
+  // fires exactly when live PROVIDER credentials are visible for a model the
+  // spec routes to and no `budget:` block caps them. The signal this
+  // replaced was "the spec interpolates some variable that is set", which
+  // charged a local/ollama harness for holding a Slack token and let every
+  // harness that names its model literally — nearly all of them — off.
+  const unbudgeted = inputs.preflight?.items.find((i) => i.id === PREFLIGHT_BUDGET_ITEM);
+  if (unbudgeted !== undefined) {
     deductions.push({
       id: "budget:absent",
       points: HEALTH_WEIGHTS.unbudgeted,

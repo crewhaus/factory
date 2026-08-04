@@ -134,6 +134,7 @@ import {
   type NotificationCentre,
   type NotificationSinks,
   createNotificationCentre,
+  defaultNotificationSinks,
   deriveEvents,
 } from "./notifications";
 import { OMNI_LIMIT, type OmniIndex, createOmniIndex } from "./omnibox";
@@ -245,8 +246,10 @@ export type HangarServerOptions = {
   readonly cwd?: string;
   /** M4 (HM-179): installed-plugin root; default `~/.crewhaus/plugins`. */
   readonly pluginsDir?: string;
-  /** M4 (HM-183): notification sinks. The OS and webhook sinks are injected
-   *  so the test suite neither spawns `osascript` nor opens a socket. */
+  /** M4 (HM-183): notification sinks. Defaults to the REAL ones
+   *  ({@link defaultNotificationSinks}: an argv-vector OS notifier and a
+   *  `fetch` webhook POST); overridden in tests so the suite neither spawns
+   *  `osascript` nor opens a socket. */
   readonly notificationSinks?: NotificationSinks;
 };
 
@@ -349,7 +352,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   let sessionReadOnly: boolean | undefined =
     opts.readOnly === true || readOnlyLocked ? true : undefined;
   const readOnlyNow = (): boolean => sessionReadOnly ?? settings.get().readOnly;
-  const notifications: NotificationCentre = createNotificationCentre(opts.notificationSinks ?? {});
+  // The sinks the operator ticks in Settings have to be the sinks that
+  // actually fire: an `os`/`webhook` checkbox wired to `{}` is a persisted,
+  // validated alerting path that silently does nothing. Real by default,
+  // injectable for tests.
+  const notifications: NotificationCentre = createNotificationCentre(
+    opts.notificationSinks ?? defaultNotificationSinks({ onWarn }),
+  );
   // Allocated, not built: the first ⌘K query pays for the harnesses it
   // needs, so boot does no indexing work at all (HM-189).
   const omni: OmniIndex = createOmniIndex();
@@ -634,15 +643,19 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         now(),
       ),
     }));
+    // NOTE the inputs that are NOT here: `view.envRefs` and the budget
+    // badge. Both are spec-TEXT derivations, and the score is the one place
+    // they must not be used — `envRefs` counts `$VAR` tokens found in
+    // comments and prompt prose, and cannot see an either-or credential
+    // group at all. Every credential and spend signal comes from the
+    // preflight report above, which is the same gate Start runs.
     return computeHealth({
       preflight,
       evalHealth: evals,
       openIncidents: countOpenIncidents(dir),
       procState: processes.peek(dir)?.snapshot().state ?? null,
-      envRefs: view.envRefs,
       specIssues: view.issues,
       specUnreadable: view.specUnreadable,
-      budgeted: view.badges.budget === true,
       dreams,
     });
   };
@@ -722,7 +735,12 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       quietHours: current.quietHours,
       mutedGroups: current.mutedGroups,
       webhookUrl: current.webhookUrl,
-      /** Fired on THIS poll — the toast list. */
+      /** What this manager can actually deliver on, and why not — so a sink
+       *  that cannot fire here is visibly unusable rather than a checkbox
+       *  the operator ticks into silence. */
+      sinkAvailability: notifications.availability(current.webhookUrl),
+      /** Fired on THIS poll — the toast list. Each delivery's `sinks` names
+       *  the sinks that actually carried it, never the ones asked for. */
       delivered: result.deliveries,
       /** Events that did not notify, with the reason — a silent rule is
        *  always explainable from the screen. */
@@ -2027,7 +2045,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       // and the M3 table identically, and so a route added next month is
       // covered by construction rather than by remembering to be.
       if (readOnlyNow() && isReadOnlyRefused(req.method, pathname)) {
-        return json(readOnlyRefusal(req.method, pathname), 403);
+        return json(readOnlyRefusal(req.method, pathname, readOnlyLocked), 403);
       }
       let segs: string[];
       try {

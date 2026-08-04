@@ -206,6 +206,10 @@ describe("onboardingView", () => {
     });
     expect(empty.firstBoot).toBe(true);
     expect(Object.keys(empty.cliTwins).length).toBeGreaterThan(3);
+    // The scan-root step's twin is a command the CLI accepts — there is no
+    // `harness scan-root` verb, and this is the FIRST screen a new operator
+    // copies from. `cli-twins.test.ts` validates the whole set.
+    expect(empty.cliTwins["addScanRoot"]).toBe("crewhaus harness scan --root <dir>");
 
     expect(
       onboardingView({

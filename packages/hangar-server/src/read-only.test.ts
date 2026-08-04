@@ -192,3 +192,20 @@ describe("the boot flag is a posture, not a preference", () => {
     }
   }, 20_000);
 });
+
+describe("the read-only refusal names the remedy that actually applies", () => {
+  // Two modes, two remedies. Naming the wrong one sends an operator to
+  // restart a manager they could have toggled over the wire — or to toggle
+  // one that will refuse the toggle.
+  test("an unlocked refusal offers the toggle; a locked one demands the restart", () => {
+    const unlocked = readOnlyRefusal("POST", "/api/h/x/proc/start", false);
+    expect(String(unlocked["remedy"])).toContain("PUT /api/read-only");
+    expect(String(unlocked["remedy"])).not.toContain("restart");
+    expect(unlocked["locked"]).toBe(false);
+
+    const locked = readOnlyRefusal("POST", "/api/h/x/proc/start", true);
+    expect(String(locked["remedy"])).toContain("--read-only-locked");
+    expect(String(locked["remedy"])).toContain("restart");
+    expect(locked["locked"]).toBe(true);
+  });
+});

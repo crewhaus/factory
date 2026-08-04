@@ -29,7 +29,17 @@
  * still true, which is right: after a restart the operator has not seen
  * anything, and a persisted "already told you" would silently swallow the
  * first badge of the session.
+ *
+ * A SINK THAT DID NOT RUN IS NOT A DELIVERY. The dedupe key is burned for
+ * the life of the process, so marking an event delivered when nothing
+ * carried it means the operator can never be told about that occurrence
+ * again — the worst possible outcome for the two sinks whose whole job is
+ * reaching someone who is NOT looking at the console. `poll` therefore fans
+ * out first, reports the sinks that ACTUALLY took the delivery, and only
+ * remembers the key when at least one did; an event no sink could carry
+ * comes back as `suppressed: sink-unavailable`, every poll, until it can.
  */
+import { spawn } from "node:child_process";
 
 /** The event kinds rules can fire on (§5 HM-183's list, verbatim). */
 export const NOTIFICATION_KINDS = [
@@ -330,8 +340,18 @@ export type SuppressedEvent = {
   readonly kind: NotificationKind;
   readonly harnessId: string;
   /** Why it did not notify — rendered in the rules screen so a silent rule
-   *  can always be explained without reading this file. */
-  readonly reason: "rule-off" | "group-muted" | "quiet-hours" | "already-delivered";
+   *  can always be explained without reading this file.
+   *
+   *  `sink-unavailable` means the rule's sinks all exist but none could
+   *  carry this delivery on this manager (no webhook URL configured, or no
+   *  OS notifier on this platform). It is NOT deduped: the event returns on
+   *  every poll until a sink can take it. */
+  readonly reason:
+    | "rule-off"
+    | "group-muted"
+    | "quiet-hours"
+    | "already-delivered"
+    | "sink-unavailable";
 };
 
 export type EvaluateInput = {
@@ -405,18 +425,183 @@ export function evaluateNotifications(input: EvaluateInput): EvaluateResult {
 // ---------------------------------------------------------------------------
 
 export type NotificationSinks = {
-  /** Post one delivery to the OS notification centre. */
+  /** Post one delivery to the OS notification centre. Absent when this
+   *  platform has no notifier this manager knows how to drive. */
   readonly os?: (delivery: Delivery) => void;
   /** POST one delivery to the configured webhook. */
   readonly webhook?: (delivery: Delivery, url: string) => void;
 };
 
+/** What the console shows beside a sink checkbox: whether this manager can
+ *  actually deliver on it, and — when it cannot — why. A capability that is
+ *  declared but not usable has to be visible, or the operator configures an
+ *  alert that silently never arrives. */
+export type SinkAvailability = {
+  readonly sink: NotificationSink;
+  readonly available: boolean;
+  /** Null when available; otherwise the reason, in the operator's words. */
+  readonly reason: string | null;
+};
+
+/** Title on the OS toast. Fixed — it is the product, not the event. */
+export const OS_NOTIFICATION_TITLE = "CrewHaus Hangar";
+
+/** How long a webhook POST is given before it is abandoned. */
+export const WEBHOOK_TIMEOUT_MS = 5_000;
+
+/** Longest label an OS toast carries; the console holds the full text. */
+const OS_BODY_MAX = 240;
+
+/** One line, no control characters — a toast body is not a log line, and a
+ *  notifier argument is not a place to smuggle an escape sequence. */
+export function toastBody(delivery: Delivery): string {
+  const flat = [...delivery.label]
+    .map((ch) => (ch < " " || ch === "\u007f" ? " " : ch))
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
+  return flat.length > OS_BODY_MAX ? `${flat.slice(0, OS_BODY_MAX - 1)}…` : flat;
+}
+
+/**
+ * The argv vector that raises one OS notification, or undefined when this
+ * platform has no notifier this manager knows how to drive.
+ *
+ * NEVER a shell string, and on macOS never string-interpolated into the
+ * AppleScript either: the body travels as an `argv` ITEM the script reads
+ * back, so a spec name containing a quote (or anything else) cannot become
+ * script source. Windows is deliberately absent — the PowerShell toast APIs
+ * differ by OS build, and a notifier that works on one machine and silently
+ * does nothing on another is worse than saying "not on this platform".
+ */
+export function osNotifierArgv(
+  platform: string,
+  title: string,
+  body: string,
+): readonly string[] | undefined {
+  if (platform === "darwin") {
+    return [
+      "osascript",
+      "-e",
+      "on run argv",
+      "-e",
+      "display notification (item 1 of argv) with title (item 2 of argv)",
+      "-e",
+      "end run",
+      body,
+      title,
+    ];
+  }
+  if (platform === "linux") return ["notify-send", "--app-name=crewhaus", title, body];
+  return undefined;
+}
+
+/** The JSON body one webhook delivery POSTs. Never carries the manager's
+ *  token, the harness env, or anything the console masks. */
+export function webhookPayload(delivery: Delivery): Record<string, unknown> {
+  return {
+    source: "crewhaus-hangar",
+    kind: delivery.kind,
+    label: delivery.label,
+    harnessId: delivery.harnessId,
+    specName: delivery.specName,
+    ref: delivery.ref,
+    at: delivery.at,
+  };
+}
+
+export type NotificationSinkDeps = {
+  /** `process.platform`. Injected so the platform choice is testable. */
+  readonly platform?: string;
+  /** Spawn seam for the OS notifier — an argv VECTOR, never a shell line. */
+  readonly notify?: (argv: readonly string[]) => void;
+  /** POST seam for the webhook; defaults to `fetch`. */
+  readonly post?: (url: string, body: string) => Promise<unknown>;
+  /** A sink failure is reported, never swallowed — an operator who thinks
+   *  they are being paged has to hear that they are not. */
+  readonly onWarn?: (message: string) => void;
+  readonly timeoutMs?: number;
+};
+
+/**
+ * The REAL sinks the shipping manager uses: an OS notifier spawned as an
+ * argv vector, and a `fetch` POST to the configured webhook. Both seams are
+ * injectable, which is how the test suite proves the fan-out without
+ * spawning `osascript` or opening a socket.
+ */
+export function defaultNotificationSinks(deps: NotificationSinkDeps = {}): NotificationSinks {
+  const platform = deps.platform ?? process.platform;
+  const onWarn = deps.onWarn ?? ((): void => {});
+  const timeoutMs = deps.timeoutMs ?? WEBHOOK_TIMEOUT_MS;
+
+  const notify =
+    deps.notify ??
+    ((argv: readonly string[]): void => {
+      const [cmd, ...args] = argv;
+      if (cmd === undefined) return;
+      const child = spawn(cmd, args, { stdio: "ignore", windowsHide: true });
+      // A box with no notifier installed is a warning, not a crash.
+      child.on("error", (err: Error) =>
+        onWarn(`hangar-server: OS notification failed: ${err.message}`),
+      );
+      child.unref();
+    });
+
+  const post =
+    deps.post ??
+    ((url: string, body: string): Promise<unknown> =>
+      fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        // A redirect to somewhere else is not the target the operator
+        // configured, so it is an error rather than a hop to follow.
+        redirect: "error",
+        signal: AbortSignal.timeout(timeoutMs),
+      }));
+
+  const sinks: { os?: (d: Delivery) => void; webhook?: (d: Delivery, url: string) => void } = {};
+  if (osNotifierArgv(platform, OS_NOTIFICATION_TITLE, "probe") !== undefined) {
+    sinks.os = (delivery) => {
+      const argv = osNotifierArgv(platform, OS_NOTIFICATION_TITLE, toastBody(delivery));
+      if (argv === undefined) return;
+      try {
+        notify(argv);
+      } catch (err) {
+        onWarn(
+          `hangar-server: OS notification failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    };
+  }
+  sinks.webhook = (delivery, url) => {
+    // The URL is never logged: the operator chose it, but a path segment is
+    // as good a place to hide a token as a query string.
+    const fail = (err: unknown): void =>
+      onWarn(
+        `hangar-server: webhook delivery ${delivery.key} failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    try {
+      void Promise.resolve(post(url, JSON.stringify(webhookPayload(delivery)))).catch(fail);
+    } catch (err) {
+      fail(err);
+    }
+  };
+  return sinks;
+}
+
 /** Cap on the in-app queue — a badge, not a log. */
 export const MAX_INAPP_DELIVERIES = 100;
 
 export type NotificationCentre = {
-  /** Evaluate a snapshot and fan out. Returns what was delivered NOW. */
+  /** Evaluate a snapshot and fan out. Returns what was delivered NOW, with
+   *  each delivery's `sinks` naming the sinks that ACTUALLY carried it. */
   poll(input: Omit<EvaluateInput, "delivered">, webhookUrl: string | null): EvaluateResult;
+  /** Which sinks this manager can deliver on right now, given the webhook
+   *  URL currently configured. */
+  availability(webhookUrl: string | null): readonly SinkAvailability[];
   /** The in-app queue, newest first. */
   inApp(): readonly Delivery[];
   /** Drop the in-app queue (the console's "mark all read"). */
@@ -430,26 +615,71 @@ export type NotificationCentre = {
  * The stateful shell around the pure evaluator: the dedupe set and the
  * in-app queue, both in memory, plus sink fan-out. Sinks are injected —
  * nothing here spawns `osascript` or opens a socket by itself, so the
- * server's tests never do either.
+ * server's tests never do either. The shipping composition passes
+ * {@link defaultNotificationSinks}.
  */
 export function createNotificationCentre(sinks: NotificationSinks = {}): NotificationCentre {
   const delivered = new Set<string>();
   let queue: Delivery[] = [];
+
+  /** The sinks that can carry THIS delivery, in canonical order. */
+  const usable = (candidate: Delivery, webhookUrl: string | null): readonly NotificationSink[] => {
+    const fired: NotificationSink[] = [];
+    if (candidate.sinks.includes("in-app")) fired.push("in-app");
+    if (candidate.sinks.includes("os") && sinks.os !== undefined) fired.push("os");
+    if (candidate.sinks.includes("webhook") && sinks.webhook !== undefined && webhookUrl !== null) {
+      fired.push("webhook");
+    }
+    return fired;
+  };
+
   return {
     poll: (input, webhookUrl) => {
       const result = evaluateNotifications({ ...input, delivered });
-      for (const delivery of result.deliveries) {
-        delivered.add(delivery.key);
-        if (delivery.sinks.includes("in-app")) {
-          queue = [delivery, ...queue].slice(0, MAX_INAPP_DELIVERIES);
+      const deliveries: Delivery[] = [];
+      const suppressed = [...result.suppressed];
+      for (const candidate of result.deliveries) {
+        const fired = usable(candidate, webhookUrl);
+        if (fired.length === 0) {
+          // Nothing carried it, so nothing is remembered: burning the dedupe
+          // key here would make this occurrence unreachable forever.
+          suppressed.push({
+            key: candidate.key,
+            kind: candidate.kind,
+            harnessId: candidate.harnessId,
+            reason: "sink-unavailable",
+          });
+          continue;
         }
-        if (delivery.sinks.includes("os")) sinks.os?.(delivery);
-        if (delivery.sinks.includes("webhook") && webhookUrl !== null) {
-          sinks.webhook?.(delivery, webhookUrl);
-        }
+        const final: Delivery = { ...candidate, sinks: fired };
+        delivered.add(final.key);
+        if (fired.includes("in-app")) queue = [final, ...queue].slice(0, MAX_INAPP_DELIVERIES);
+        if (fired.includes("os")) sinks.os?.(final);
+        if (fired.includes("webhook") && webhookUrl !== null) sinks.webhook?.(final, webhookUrl);
+        deliveries.push(final);
       }
-      return result;
+      return { deliveries, suppressed };
     },
+    availability: (webhookUrl) => [
+      { sink: "in-app", available: true, reason: null },
+      sinks.os !== undefined
+        ? { sink: "os", available: true, reason: null }
+        : {
+            sink: "os",
+            available: false,
+            reason:
+              "no OS notifier on this platform — macOS uses osascript and Linux notify-send; there is none this manager drives here",
+          },
+      sinks.webhook === undefined
+        ? {
+            sink: "webhook",
+            available: false,
+            reason: "this manager was built with no webhook sink",
+          }
+        : webhookUrl === null
+          ? { sink: "webhook", available: false, reason: "no webhook URL is configured" }
+          : { sink: "webhook", available: true, reason: null },
+    ],
     inApp: () => queue,
     clear: () => {
       queue = [];

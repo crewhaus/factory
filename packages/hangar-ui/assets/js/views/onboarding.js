@@ -130,7 +130,10 @@ function scanRootCard(view, twins, reload) {
       }),
     ]),
   );
-  card.appendChild(twin(twins.addScanRoot ?? "crewhaus harness scan-root add <dir>"));
+  // `harness scan --root <dir>` is the real twin for this card's two
+  // buttons: the CLI remembers the root it was handed before it walks it,
+  // which is exactly "add + scan". There is no `harness scan-root` verb.
+  card.appendChild(twin(twins.addScanRoot ?? "crewhaus harness scan --root <dir>"));
   card.appendChild(twin(twins.scan ?? "crewhaus harness scan"));
   return card;
 }
