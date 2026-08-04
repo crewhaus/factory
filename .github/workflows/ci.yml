@@ -54,17 +54,19 @@ jobs:
   # the rest of the repo is platform-agnostic, and a second full matrix would
   # buy minutes of runtime for no new signal.
   #
-  # NON-BLOCKING FOR NOW (continue-on-error), and deliberately so: the suites
-  # have never executed on this platform, so a red result here is information
-  # rather than a reason to stop every merge and every release — the decision
-  # on record was to make the gap KNOWN, not to gate on it. The job still runs
-  # the whole of both suites and its result is visible on every PR. When it is
-  # green, drop `continue-on-error` (making it a real gate) and delete the
-  # win32 notice: apps/cli/src/win32-notice.ts and its call sites.
+  # GATING. It was non-blocking while the suites had never executed on this
+  # platform — a red result then was information, not a reason to stop every
+  # merge and every release. Its first run found six real bugs (path handling,
+  # not the predicted spawn problem; two of them containment checks using
+  # `startsWith(root + "/")`, which never matches on Windows because `resolve`
+  # yields `D:\a\b\c`). Those are fixed and both suites are green here, so the
+  # reason for the exemption is gone: from now on a Windows regression stops
+  # the merge, exactly like a POSIX one. The win32 "unverified" notice was
+  # deleted in the same change — it was a statement about CI, and CI can now
+  # make the statement itself.
   windows-supervision:
     name: Supervisor + Hangar server (Windows)
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2

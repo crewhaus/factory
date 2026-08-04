@@ -43,7 +43,6 @@ function fakeOps(now: () => number): FakeOps {
   const live = new Map<number, { startTimeMs: number; commandLine: string }>();
   const childFor = (pid: number): FakeChild | undefined => children.find((c) => c.pid === pid);
   return {
-    platform: "posix",
     children,
     last: () => children[children.length - 1],
     spawn: (request) => {
@@ -100,7 +99,6 @@ type Fixture = {
     /** Pinned so the HM-188 win32 notice cannot prepend a line to the output
      *  these tests assert on when the suite runs on Windows. The notice has
      *  its own test, which injects `win32`. */
-    platform: string;
   };
   cleanup(): void;
 };
@@ -138,7 +136,6 @@ function fixture(specLines?: readonly string[]): Fixture {
       env: { CREWHAUS_REGISTRY_ROOT: join(root, "registry"), CREWHAUS_NO_REGISTRY: "1" },
       ops,
       cwd: dir,
-      platform: "linux",
     },
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
@@ -189,37 +186,6 @@ describe("crewhaus daemon", () => {
 
   test("an unknown verb throws a plain Error (the entry file routes it through die())", async () => {
     await expect(runDaemonCommand(["frobnicate"])).rejects.toThrow(/unknown daemon verb/);
-  });
-
-  test("HM-188: on win32, start and restart LEAD with the unverified-supervision notice", async () => {
-    const f = fixture();
-    try {
-      const started = await runDaemonCommand(["start", "--no-preflight"], {
-        ...f.opts,
-        platform: "win32",
-      });
-      expect(started.lines[0]).toContain("supervision on Windows is UNVERIFIED");
-      // The notice is a preface, not a replacement: the verb still reports.
-      expect(started.lines.join("\n")).toContain("started run_");
-
-      const restarted = await runDaemonCommand(["restart", "--no-preflight"], {
-        ...f.opts,
-        platform: "win32",
-      });
-      expect(restarted.lines[0]).toContain("supervision on Windows is UNVERIFIED");
-
-      // Nothing else carries it. `status` is the notice's own remedy, so
-      // prefacing it would be circular — and `status --json` is a document
-      // somebody pipes into `jq`, which a prose line would corrupt.
-      const status = await runDaemonCommand(["status", "--json"], {
-        ...f.opts,
-        platform: "win32",
-      });
-      expect(() => JSON.parse(status.lines.join("\n"))).not.toThrow();
-      expect(status.lines.join("\n")).not.toContain("UNVERIFIED");
-    } finally {
-      f.cleanup();
-    }
   });
 
   test("HM-188: every other platform is told nothing", async () => {
