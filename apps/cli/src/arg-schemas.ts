@@ -642,6 +642,7 @@ export const FLEET_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "root", takesValue: true },
     { name: "filter", takesValue: true },
+    { name: "group", takesValue: true },
     { name: "allow-mutating", takesValue: false },
     { name: "yes", short: "y", takesValue: false },
     { name: "help", short: "h" },

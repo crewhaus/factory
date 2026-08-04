@@ -1,0 +1,33 @@
+{
+  "name": "@crewhaus/hangar-ui",
+  "version": "0.4.2",
+  "type": "module",
+  "description": "The Hangar web console's static UI — zero-build, dependency-free browser ES modules embedded as text assets for the single-binary CLI to hand to the hangar server",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/hangar-ui"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/hangar-ui#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "assets", "README.md", "LICENSE", "NOTICE"]
+}

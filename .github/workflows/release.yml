@@ -137,6 +137,24 @@ jobs:
           fi
           echo "compiled linux-x64 binary smoke OK: $OUT"
 
+      # The manager console is the one subsystem whose assets are EMBEDDED in
+      # the binary (`with { type: "text" }`), so only a compiled run can prove
+      # they made it in. `hangar serve --smoke` boots on an ephemeral port and
+      # self-checks /healthz, the embedded UI shell, an authed API call, and
+      # the 401 path. Temp roots keep it from touching a real ~/.crewhaus.
+      - name: Smoke-test the embedded Hangar console (compiled binary)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          BIN="dist/crewhaus-linux-x64-$VERSION"
+          HANGAR_TMP="$(mktemp -d)"
+          export CREWHAUS_REGISTRY_ROOT="$HANGAR_TMP/registry"
+          export CREWHAUS_HANGAR_ROOT="$HANGAR_TMP/hangar"
+          export CREWHAUS_WATCHME_ROOT="$HANGAR_TMP/watchme"
+          "$BIN" hangar serve --smoke
+          rm -rf "$HANGAR_TMP"
+          echo "compiled binary Hangar console smoke OK"
+
       - name: Generate package manifests
         env:
           VERSION: ${{ steps.version.outputs.version }}

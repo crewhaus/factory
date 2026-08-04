@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../errors" },
+    { "path": "../mcp-host" },
+    { "path": "../model-router" },
+    { "path": "../spec" }
+  ],
+  "include": ["src/**/*"]
+}
