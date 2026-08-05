@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/otel-exporter",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "type": "module",
   "description": "OTLP/HTTP exporter for TraceEvent — gen_ai/* semantic conventions, 5s batch flush",
   "main": "src/index.ts",

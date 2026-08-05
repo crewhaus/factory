@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/compiler",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "type": "module",
   "description": "Compiler core: parse → validate → lower → emit",
   "main": "src/index.ts",

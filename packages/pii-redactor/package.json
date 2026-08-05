@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/pii-redactor",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "type": "module",
   "description": "Composable PII redaction: regex + classifier + policy-driven detectors; replace and hash modes (Section 39)",
   "main": "src/index.ts",
