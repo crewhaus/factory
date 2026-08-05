@@ -1192,7 +1192,8 @@ const continuityBlock = z.union([z.boolean(), continuityObject]).optional();
 /**
  * v0.3.0 Goal 3 (§4.1) — the top-level `thredz:` block: ONE knob that flips
  * the memory fabric's wiki backend to a hosted Thredz wiki over the published
- * `thredz-mcp` stdio server (npm, v0.2.0 — 25 tools incl. `goal_*`/`task_*`).
+ * `thredz-mcp` stdio server (npm, v0.3.0 — 27 tools incl. `goal_*`/`task_*`
+ * and the `wiki_space_*` pair).
  *
  * Forms:
  *   - boolean shorthand: `thredz: true` ≡ `{ api_key: "$THREDZ_API_KEY" }`
@@ -1225,6 +1226,22 @@ const thredzObject = z
     api_key: z.string().min(1),
     base_url: z.string().url().optional(),
     visibility: z.enum(["private", "shared"]).optional(),
+    /**
+     * 0.5.0 — a Thredz **wiki space** (Pro/Scale) to scope this agent's memory
+     * to; becomes the synthesized server's `THREDZ_DEFAULT_SPACE`. A `shared`
+     * space is readable by every wiki-enabled key on the account; an
+     * `individual` space only by the key that owns it.
+     *
+     * The space TYPE is chosen when the space is created (over the API, or via
+     * the model-callable `wiki_space_create`), not here — so this cannot be
+     * validated at compile time and `visibility` is not cross-checked against
+     * it. Inside a space the space's type decides visibility outright.
+     *
+     * ONE individual space per API KEY is a hard Thredz limit, so per-agent
+     * private memory means a per-agent `api_key`. That is one `thredz:` block
+     * per spec today; a crew gives each role its own (see the role-keyed form).
+     */
+    space: z.string().min(1).optional(),
     goals: z.boolean().optional(),
     agents: z
       .union([

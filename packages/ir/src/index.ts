@@ -687,6 +687,13 @@ export type IrThredz = {
    *  agent memory is never public by accident (Thredz's own API defaults
    *  new articles to globally-shared). */
   readonly visibility: IrThredzVisibility;
+  /** 0.5.0 — the Thredz wiki space (Pro/Scale) this agent's memory is scoped
+   *  to; becomes `THREDZ_DEFAULT_SPACE`. Absent → unspaced, i.e. the legacy
+   *  account-wide wiki, which is also the only path on Free/Starter. Inside a
+   *  space the space's TYPE decides visibility, so {@link visibility} stops
+   *  applying — it is still carried, because the two are independent knobs and
+   *  a bundle may be pointed at a space after the fact. */
+  readonly space?: string;
   /** RESOLVED — mirror continuity goal writes to Thredz `goal_write`/
    *  `goal_update` (spec-scoped only, §14.5 decision 5). Defaulted at lower
    *  time to "on when continuity goals are on". */

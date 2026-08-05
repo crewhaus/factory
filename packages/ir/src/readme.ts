@@ -82,6 +82,7 @@ export type CollectedSecretRefs = {
  */
 const SYNTHESIZED_LITERAL_KEYS: ReadonlySet<string> = new Set([
   "THREDZ_DEFAULT_VISIBILITY",
+  "THREDZ_DEFAULT_SPACE",
   "THREDZ_API_BASE",
 ]);
 

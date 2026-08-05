@@ -1133,7 +1133,7 @@ describe("emitManaged — thredz emit-wired (Loop contract 0.4, Batch E, G23)", 
     expect(c).toContain('import { defaultCatalog } from "@crewhaus/tool-catalog";');
     // The synthesized server: version-pinned npx, secret-ref API key, resolved
     // visibility (never left to the server default).
-    expect(c).toContain('"args":["-y","thredz-mcp@0.2.0"]');
+    expect(c).toContain('"args":["-y","thredz-mcp@0.3.0"]');
     expect(c).toContain('"THREDZ_API_KEY":{"kind":"env","name":"THREDZ_API_KEY"}');
     expect(c).toContain('"THREDZ_DEFAULT_VISIBILITY":{"kind":"literal","value":"private"}');
     expect(c).toContain("const __thredzHost = new McpHost();");

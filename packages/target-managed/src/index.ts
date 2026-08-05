@@ -758,14 +758,18 @@ const __promptCacheStore = createPromptCacheRotationStore({ specName: ${escapeJs
     ? JSON.stringify({
         transport: "stdio",
         command: "npx",
-        // NOTE: keep in sync with the compiler's THREDZ_MCP_PACKAGE_SPEC.
-        args: ["-y", "thredz-mcp@0.2.0"],
+        // NOTE: keep in sync with the compiler's THREDZ_MCP_PACKAGE_SPEC —
+        // `thredz-pin-parity.test.ts` asserts the two literals match.
+        args: ["-y", "thredz-mcp@0.3.0"],
         env: {
           THREDZ_API_KEY: ir.thredz?.apiKey,
           ...(ir.thredz?.baseUrl !== undefined
             ? { THREDZ_API_BASE: { kind: "literal", value: ir.thredz.baseUrl } }
             : {}),
           THREDZ_DEFAULT_VISIBILITY: { kind: "literal", value: ir.thredz?.visibility },
+          ...(ir.thredz?.space !== undefined
+            ? { THREDZ_DEFAULT_SPACE: { kind: "literal", value: ir.thredz.space } }
+            : {}),
         },
       })
     : "";

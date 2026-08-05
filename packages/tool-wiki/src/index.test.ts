@@ -71,16 +71,20 @@ describe("thredz-mcp tool-name parity", () => {
       const schema = tool?.inputSchema as unknown as { shape: Record<string, unknown> };
       return Object.keys(schema.shape).sort();
     };
-    expect(shapeKeys("wiki_recall")).toEqual(["limit", "query"]);
-    expect(shapeKeys("wiki_semantic_search")).toEqual(["limit", "minScore", "query"]);
-    expect(shapeKeys("wiki_search")).toEqual(["query"]);
-    expect(shapeKeys("wiki_get")).toEqual(["concise", "slug"]);
+    // `space` rides on all nine wiki tools as of thredz-mcp 0.3.0 — the local
+    // twins accept it too (a no-op over files) so a spec written for the Thredz
+    // backend runs unchanged over the file backend.
+    expect(shapeKeys("wiki_recall")).toEqual(["limit", "query", "space"]);
+    expect(shapeKeys("wiki_semantic_search")).toEqual(["limit", "minScore", "query", "space"]);
+    expect(shapeKeys("wiki_search")).toEqual(["query", "space"]);
+    expect(shapeKeys("wiki_get")).toEqual(["concise", "slug", "space"]);
     expect(shapeKeys("wiki_write")).toEqual([
       "body",
       "category",
       "confidenceScore",
       "editMessage",
       "slug",
+      "space",
       "status",
       "summary",
       "tags",
@@ -93,12 +97,13 @@ describe("thredz-mcp tool-name parity", () => {
       "order",
       "query",
       "sort",
+      "space",
       "status",
       "tags",
     ]);
-    expect(shapeKeys("wiki_related")).toEqual(["slug"]);
-    expect(shapeKeys("wiki_set_signals")).toEqual(["confidenceScore", "slug", "verified"]);
-    expect(shapeKeys("wiki_stats")).toEqual([]);
+    expect(shapeKeys("wiki_related")).toEqual(["slug", "space"]);
+    expect(shapeKeys("wiki_set_signals")).toEqual(["confidenceScore", "slug", "space", "verified"]);
+    expect(shapeKeys("wiki_stats")).toEqual(["space"]);
     expect(shapeKeys("log_knowledge_gap")).toEqual(["detail", "priority", "tags", "topic"]);
   });
 });

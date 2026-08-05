@@ -235,6 +235,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   half is `continue-on-error`, because an upstream outage is not a reason to page
   anyone about our own table. Nothing is auto-committed.
 
+- **Thredz wiki spaces — `thredz.space` scopes an agent's hosted memory to one
+  space.** A space is a memory boundary *inside* a Thredz account: a `shared`
+  space is readable by every wiki-enabled key on the account, an `individual`
+  space only by the key that owns it. The lowered value becomes
+  `THREDZ_DEFAULT_SPACE` on the synthesized stdio server, enforced the same
+  deterministic way `visibility` already is — the server env is the single
+  enforcement point, so no call site passes a per-call space. Declaring no space
+  omits the key entirely, leaving unspaced bundles byte-identical to 0.4.x.
+
+  **One `individual` space per API key is a hard Thredz limit**, so per-agent
+  private memory means a per-agent `api_key` — today that is one `thredz:` block
+  per spec, i.e. one harness process per agent. The `space` and `visibility`
+  knobs stay independent: inside a space the space's *type* decides visibility,
+  but the compiler still emits both, because the same bundle may be pointed at a
+  different space later and silently dropping `visibility` would re-expose the
+  Thredz shared-by-default footgun.
+
+- **`wiki_space_list` and `wiki_space_create` join the Thredz alias set.** They
+  are remote-only by construction — a space has no local twin — so they are
+  deliberately NOT in `THREDZ_WIKI_TOOL_NAMES`, the local/remote parity list
+  `backend-conformance` asserts `createWikiTools` matches exactly. Against a
+  pre-0.3.0 server they come back in `registerMcpToolAliases`' `missing` list
+  and `connectThredz` warns, never a hard failure. `wiki_space_create` carries
+  the justification gate: it consumes plan quota and can 402/409.
+
 ### Changed
 
 - **The `fleet` and `doctor`/`channel` cores are consumed from the new
@@ -280,6 +305,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Both `--help` screens and the top-level subcommand list say that both are
   supported and neither replaces the other, so an operator who found one
   first discovers the other from it.
+
+- **The thredz-mcp pin moves to `thredz-mcp@0.3.0`** in both the compiler and
+  `target-managed`, which spell it out separately. A new `thredz-pin-parity`
+  test asserts the two literals match and that the pin is new enough to
+  understand spaces — a drifted pin fails silently, sending every write to the
+  unspaced legacy wiki instead of the space the spec asked for.
+
+- **409s classify as `thredz_conflict`, not `thredz_unavailable`.** A stale
+  version, an ambiguous slug across spaces, or an existing individual space are
+  all things the *caller* can fix by retrying differently. Calling them outages
+  sent every spaces conflict down the "backend is down, degrade to files" path.
+  The 402 test deliberately stays ahead of the 409 test so
+  `space_quota_exceeded` still classifies as quota.
+
+- `@crewhaus/tool-wiki` accepts `space` on all nine wiki tools, a no-op over
+  files, so a spec written for the Thredz backend runs unchanged over the local
+  backend — the parity contract the schema-mirror test pins.
 
 ### Fixed
 
