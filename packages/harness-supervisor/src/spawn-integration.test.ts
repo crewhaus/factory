@@ -228,7 +228,18 @@ describe.skipIf(process.platform === "win32")("real spawns", () => {
       const pid = child.pid;
       if (pid === undefined) throw new Error("no pid");
       try {
-        await waitFor(() => ops.startTimeMs(pid) !== undefined, 5_000, "a readable start time");
+        // Wait for BOTH facts this assertion depends on, not just the start
+        // time. `verifyRunfile` with `expectedArgv` also reads the command
+        // line, and the two become observable at different moments: on Linux
+        // /proc/<pid>/stat carries a start time from fork, while
+        // /proc/<pid>/cmdline can still show the pre-exec argv for a beat.
+        // Waiting on the start time alone raced that gap and returned
+        // `argv-mismatch` under CI load — a flake in the test, not the code.
+        await waitFor(
+          () => ops.startTimeMs(pid) !== undefined && ops.commandLine(pid) !== undefined,
+          5_000,
+          "a readable start time and command line",
+        );
         const startTimeMs = ops.startTimeMs(pid) as number;
         const runfile = {
           v: RUNFILE_VERSION,
