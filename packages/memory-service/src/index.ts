@@ -313,6 +313,11 @@ export type ThredzWiringFragment = {
   /** The enforced default visibility (informational at this layer — the
    *  synthesized server env `THREDZ_DEFAULT_VISIBILITY` does the enforcing). */
   readonly visibility?: "private" | "shared";
+  /** The wiki space this agent's memory is scoped to (informational at this
+   *  layer, exactly like {@link visibility} — the synthesized server env
+   *  `THREDZ_DEFAULT_SPACE` is the single enforcement point, so no call site
+   *  passes a per-call `space`). Absent → the unspaced legacy wiki. */
+  readonly space?: string;
   /** The boot-registered agent handle (`connectThredz` consumes it). */
   readonly agentName?: string;
 };
@@ -381,6 +386,7 @@ export type IrContinuityLike = {
 export type IrThredzLike = {
   readonly goals?: boolean;
   readonly visibility?: "private" | "shared";
+  readonly space?: string;
   readonly agentName?: string;
 };
 
@@ -466,6 +472,7 @@ export function memoryFragmentFromIr(ir: {
           thredz: {
             ...(thredz.goals !== undefined ? { goals: thredz.goals } : {}),
             ...(thredz.visibility !== undefined ? { visibility: thredz.visibility } : {}),
+            ...(thredz.space !== undefined ? { space: thredz.space } : {}),
             ...(thredz.agentName !== undefined ? { agentName: thredz.agentName } : {}),
           },
         }

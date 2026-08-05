@@ -55,13 +55,22 @@ export const THREDZ_GOAL_TOOL_NAMES = [
   "task_complete",
 ] as const;
 
+/** 0.5.0 — the two space-management tools. Remote-ONLY on purpose: a space is
+ *  a Thredz account boundary with no local twin, so these are deliberately not
+ *  in `THREDZ_WIKI_TOOL_NAMES` (the local/remote parity list that
+ *  `backend-conformance` asserts `createWikiTools` matches exactly). Against a
+ *  pre-0.3.0 server they simply come back in `registerMcpToolAliases`'
+ *  `missing` list and `connectThredz` warns — never a hard failure. */
+export const THREDZ_SPACE_TOOL_NAMES: readonly string[] = ["wiki_space_list", "wiki_space_create"];
+
 /** Every bare name the Thredz backend aliases onto the catalog (§4.3): the
- *  ten wiki-vocabulary tools + the six goal/task tools. Messaging tools are
- *  deliberately NOT exposed — the memory knob never widens the outward
- *  surface beyond the memory vocabulary. */
+ *  ten wiki-vocabulary tools + the six goal/task tools + the two space tools.
+ *  Messaging tools are deliberately NOT exposed — the memory knob never widens
+ *  the outward surface beyond the memory vocabulary. */
 export const THREDZ_ALIAS_TOOL_NAMES: readonly string[] = [
   ...THREDZ_WIKI_TOOL_NAMES,
   ...THREDZ_GOAL_TOOL_NAMES,
+  ...THREDZ_SPACE_TOOL_NAMES,
 ];
 
 /**
@@ -81,6 +90,10 @@ export const THREDZ_ALIAS_TOOL_FLAGS: Readonly<Record<string, McpToolFlags>> = {
   wiki_related: { readOnly: true },
   wiki_set_signals: { destructive: true, requireJustification: true },
   wiki_stats: { readOnly: true },
+  // Creating a space consumes plan quota and can 402/409, so it carries the
+  // same justification gate as a durable write; listing is a plain read.
+  wiki_space_list: { readOnly: true },
+  wiki_space_create: { destructive: true, requireJustification: true },
   log_knowledge_gap: { destructive: true },
   goal_list: { readOnly: true },
   goal_get: { readOnly: true },
@@ -122,6 +135,7 @@ export type ThredzFailureClass =
   | "thredz_auth"
   | "thredz_billing"
   | "thredz_quota"
+  | "thredz_conflict"
   | "thredz_rate_limit"
   | "thredz_unavailable";
 
@@ -136,9 +150,19 @@ export type ThredzFailureClass =
  *   - 402 (code quota_exceeded /
  *     upgrade_required)             → thredz_quota (plan caps, e.g. 3 goals
  *                                     on the free tier)
+ *   - 409 (stale_article_version,
+ *     ambiguous_article_slug,
+ *     individual_space_exists)      → thredz_conflict (the CALLER can fix this
+ *                                     by retrying differently — it is not an
+ *                                     outage, and calling it one sent every
+ *                                     spaces conflict down the "backend is
+ *                                     down, degrade to files" path)
  *   - 429                           → thredz_rate_limit
  *   - HTTP 0 + missing-key text     → thredz_auth (the server's pre-flight)
  *   - anything else (network, …)    → thredz_unavailable
+ *
+ * ORDER MATTERS: `space_quota_exceeded` is a 402 and must classify as quota,
+ * so the 402 test stays ahead of the 409 test.
  */
 export function classifyThredzFailure(text: string): ThredzFailureClass {
   const statusMatch = /\(HTTP (\d+)\)/.exec(text);
@@ -150,6 +174,14 @@ export function classifyThredzFailure(text: string): ThredzFailureClass {
   }
   if (status === 403 && /disabled/i.test(text)) return "thredz_billing";
   if (status === 401 || status === 403) return "thredz_auth";
+  if (
+    status === 409 ||
+    code === "stale_article_version" ||
+    code === "ambiguous_article_slug" ||
+    code === "individual_space_exists"
+  ) {
+    return "thredz_conflict";
+  }
   if (status === 429) return "thredz_rate_limit";
   if (/THREDZ_API_KEY is not set/.test(text)) return "thredz_auth";
   return "thredz_unavailable";

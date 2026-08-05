@@ -140,6 +140,49 @@ describe("thredz: MCP synthesis (§4.1/§4.2 — the PR 5 machinery end-to-end)"
     });
   });
 
+  test("a declared space becomes THREDZ_DEFAULT_SPACE alongside visibility", () => {
+    const ir = lowerCli(cliSpec("thredz:\n  api_key: $THREDZ_API_KEY\n  space: researcher-notes"));
+    expect(thredzServer(ir).env).toEqual({
+      THREDZ_API_KEY: { kind: "env", name: "THREDZ_API_KEY" },
+      THREDZ_DEFAULT_VISIBILITY: { kind: "literal", value: "private" },
+      THREDZ_DEFAULT_SPACE: { kind: "literal", value: "researcher-notes" },
+    });
+  });
+
+  test("no space declared → the key is ABSENT, not empty: unspaced bundles stay byte-identical to 0.4.x", () => {
+    const env = thredzServer(lowerCli(cliSpec("thredz: true"))).env;
+    expect("THREDZ_DEFAULT_SPACE" in env).toBe(false);
+  });
+
+  test("the space reaches the emitted boot block as a literal", () => {
+    const bundle = compile(cliSpec("thredz:\n  api_key: $THREDZ_API_KEY\n  space: company"));
+    const agent = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agent).toContain('"THREDZ_DEFAULT_SPACE":{"kind":"literal","value":"company"}');
+  });
+
+  test("space and visibility are independent knobs — a space does not suppress visibility", () => {
+    // Inside a space the SERVER ignores visibility (the space's type decides),
+    // but the compiler still emits both: the same bundle may be pointed at a
+    // different space via the env later, and dropping visibility here would
+    // silently re-expose the Thredz shared-by-default footgun if it were.
+    const ir = lowerCli(
+      cliSpec("thredz:\n  api_key: $THREDZ_API_KEY\n  space: company\n  visibility: shared"),
+    );
+    expect(thredzServer(ir).env).toMatchObject({
+      THREDZ_DEFAULT_VISIBILITY: { kind: "literal", value: "shared" },
+      THREDZ_DEFAULT_SPACE: { kind: "literal", value: "company" },
+    });
+  });
+
+  test("the space is carried on the IR itself, so emitters other than cli can read it", () => {
+    const ir = lowerCli(cliSpec("thredz:\n  api_key: $THREDZ_API_KEY\n  space: notes"));
+    expect(ir.thredz?.space).toBe("notes");
+  });
+
+  test("an empty space is rejected at parse time rather than emitting an empty env value", () => {
+    expect(() => parseSpec(cliSpec('thredz:\n  api_key: $THREDZ_API_KEY\n  space: ""'))).toThrow();
+  });
+
   test("visibility defaults PRIVATE end-to-end: `thredz: true` compiles to THREDZ_DEFAULT_VISIBILITY=private in the emitted boot block", () => {
     const bundle = compile(cliSpec("thredz: true"));
     const agent = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";

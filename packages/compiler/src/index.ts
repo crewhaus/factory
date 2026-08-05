@@ -1739,10 +1739,15 @@ function lowerContinuity(
 /** The synthesized MCP server's name. Everything downstream — alias
  *  registration, the goal mirror, doctor's probe — keys on this. */
 export const THREDZ_MCP_SERVER_NAME = "thredz";
-/** Exact pin (design §4.1): the published stdio server whose v0.2.0 tool
- *  contract (25 tools incl. `goal_*`/`task_*`, `THREDZ_DEFAULT_VISIBILITY`)
- *  the wiring layer is built against. */
-export const THREDZ_MCP_PACKAGE_SPEC = "thredz-mcp@0.2.0";
+/** Exact pin (design §4.1): the published stdio server whose v0.3.0 tool
+ *  contract (27 tools incl. `goal_*`/`task_*`, the `wiki_space_*` pair,
+ *  `THREDZ_DEFAULT_VISIBILITY` and `THREDZ_DEFAULT_SPACE`) the wiring layer is
+ *  built against.
+ *
+ *  KEEP IN SYNC with `target-managed`'s copy — `thredz-pin-parity.test.ts`
+ *  asserts the two literals match, because a drifted pin silently downgrades
+ *  managed bundles to a server that ignores `space`. */
+export const THREDZ_MCP_PACKAGE_SPEC = "thredz-mcp@0.3.0";
 
 type SpecThredz =
   | boolean
@@ -1751,6 +1756,7 @@ type SpecThredz =
       readonly api_key: string;
       readonly base_url?: string;
       readonly visibility?: "private" | "shared";
+      readonly space?: string;
       readonly goals?: boolean;
       readonly agents?: boolean | string;
       readonly messaging?: boolean;
@@ -1806,6 +1812,7 @@ function lowerThredzBlock(spec: SpecWithThredz, continuityGoalsOn: boolean): IrT
     apiKey: lowerCredential("thredz.api_key", obj.api_key),
     ...(obj.base_url !== undefined ? { baseUrl: obj.base_url } : {}),
     visibility: obj.visibility ?? "private",
+    ...(obj.space !== undefined ? { space: obj.space } : {}),
     goals: obj.goals ?? continuityGoalsOn,
     ...(agentName !== undefined ? { agentName } : {}),
     // Item 5 (G44) — messaging tools stay OFF unless explicitly asked; carried
@@ -1837,6 +1844,13 @@ function synthesizeThredzServer(thredz: IrThredz): IrMcpServerConfig {
       // server's own default, even though thredz-mcp v0.2.0 also defaults
       // private.
       THREDZ_DEFAULT_VISIBILITY: { kind: "literal", value: thredz.visibility },
+      // 0.5.0 — scope every wiki call to one space. Deterministic, exactly like
+      // visibility: the server would otherwise fall back to the unspaced legacy
+      // wiki. Omitted entirely when no space is declared, so unspaced bundles
+      // stay byte-identical to 0.4.x.
+      ...(thredz.space !== undefined
+        ? { THREDZ_DEFAULT_SPACE: { kind: "literal", value: thredz.space } }
+        : {}),
     },
   };
 }

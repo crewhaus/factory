@@ -159,24 +159,42 @@ export type WikiToolBundle = {
 // schemas — field-for-field mirrors of thredz-mcp's TOOLS inputSchemas
 // ---------------------------------------------------------------------------
 
+/**
+ * `space` rides on every wiki tool for cross-backend parity with thredz-mcp
+ * 0.3.0, which accepts it on all nine. Locally it is a no-op — the file wiki is
+ * a single unspaced corpus — but accepting it means a spec written against the
+ * Thredz backend still runs unchanged over files, which is the whole point of
+ * the parity contract (`backend-conformance`, and the schema-mirror test).
+ */
+const spaceField = z
+  .string()
+  .optional()
+  .describe(
+    "Thredz wiki space slug or id (accepted for cross-backend parity, meaningless locally — the local wiki is a single unspaced corpus)",
+  );
+
 const recallSchema = z.object({
   query: z.string().min(1).describe("what to recall about"),
   limit: z.number().int().min(1).max(50).optional().describe("max snippets (default 6)"),
+  space: spaceField,
 });
 
 const semanticSearchSchema = z.object({
   query: z.string().min(1).describe("natural-language query"),
   limit: z.number().int().min(1).max(50).optional().describe("max results (default 6)"),
   minScore: z.number().min(0).max(1).optional().describe("similarity floor 0–1 (default 0.05)"),
+  space: spaceField,
 });
 
 const searchSchema = z.object({
   query: z.string().min(1).describe("keyword query"),
+  space: spaceField,
 });
 
 const getSchema = z.object({
   slug: z.string().min(1).describe("article slug"),
   concise: z.boolean().optional().describe("trim to essentials"),
+  space: spaceField,
 });
 
 const articleStatusSchema = z.enum(["draft", "published", "review", "archived"]);
@@ -199,6 +217,7 @@ const writeSchema = z.object({
     .describe(
       "'private' (default — the local wiki is private by construction) | 'shared' (a Thredz concept; accepted for cross-backend parity, meaningless locally)",
     ),
+  space: spaceField,
 });
 
 const listSchema = z.object({
@@ -212,19 +231,24 @@ const listSchema = z.object({
     .describe("updated | created | title | relevance | popular | trending"),
   order: z.string().optional().describe("asc | desc"),
   limit: z.number().int().min(1).max(100).optional().describe("page size (default 25, max 100)"),
+  space: spaceField,
 });
 
 const relatedSchema = z.object({
   slug: z.string().min(1).describe("article slug"),
+  space: spaceField,
 });
 
 const setSignalsSchema = z.object({
+  space: spaceField,
   slug: z.string().min(1).describe("article slug"),
   verified: z.boolean().optional().describe("fact-checked"),
   confidenceScore: z.number().min(0).max(1).optional().describe("0–1"),
 });
 
-const statsSchema = z.object({});
+const statsSchema = z.object({
+  space: spaceField,
+});
 
 const logGapSchema = z.object({
   topic: z.string().min(1).describe("the topic the expert was weak on"),
@@ -486,7 +510,11 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
           input.visibility === "shared"
             ? "\nnote: the local wiki is private by construction — 'shared' visibility only applies on the Thredz backend."
             : "";
-        return `wiki_write: ${verb} "${result.slug}" at v${result.version}${sharedNote}`;
+        const spaceNote =
+          input.space !== undefined
+            ? "\nnote: the local wiki is a single unspaced corpus — 'space' only applies on the Thredz backend."
+            : "";
+        return `wiki_write: ${verb} "${result.slug}" at v${result.version}${sharedNote}${spaceNote}`;
       } catch (err) {
         if (err instanceof WikiVersionConflictError) {
           return `wiki_write failed (stale_article_version) — ${STALE_WRITE_REMEDIATION}`;
