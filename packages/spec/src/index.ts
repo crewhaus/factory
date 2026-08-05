@@ -1268,6 +1268,51 @@ const thredzObject = z
 const thredzBlock = z.union([z.boolean(), z.string().min(1), thredzObject]).optional();
 
 /**
+ * 0.5.0 — the CREW-ONLY superset of {@link thredzObject}. `roles` fans the
+ * block out per role so each role can carry its OWN `api_key` and its own
+ * `space`; every other field at this level is the DEFAULT a role inherits and
+ * may override.
+ *
+ * WHY THE MAP LIVES HERE, under `thredz.roles.<role>`, and NOT on the role as
+ * `roles.<role>.thredz` — this is load-bearing, not taste. Two security
+ * surfaces prefix-match on `["thredz"]`:
+ *
+ *   - `@crewhaus/spec-patch`'s `OPTIMIZABLE_PATHS.crew` allows `["roles"]`
+ *     (whole-role replacement) and matches by PREFIX. Under `roles.*`, a
+ *     role's `api_key` would become optimizer-reachable and
+ *     `optimize --write-back` could rewrite a credential.
+ *   - the hangar's spec editor denies the `["thredz"]` prefix outright
+ *     ("thredz crosses the harness boundary to a hosted wiki"). Under
+ *     `roles.*`, `api_key` would be editable from a browser.
+ *
+ * Keeping the fan-out under `thredz.` inherits both protections with zero
+ * code change. The `^thredz:` header/badge regexes keep matching too.
+ *
+ * `api_key` is optional ONLY here: a pure fan-out crew gives every role its
+ * own key and needs no crew-wide one. The refinement below enforces that at
+ * least one of the two exists.
+ */
+const crewThredzObject = thredzObject
+  .extend({
+    api_key: z.string().min(1).optional(),
+    roles: z.record(safeName, thredzObject.partial({ api_key: true })).optional(),
+  })
+  .strict()
+  .superRefine((t, ctx) => {
+    const fanOut = t.roles !== undefined && Object.keys(t.roles).length > 0;
+    if (!fanOut && t.api_key === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "thredz.api_key is required unless thredz.roles gives each role its own key (one individual wiki space per API key is a hard Thredz limit, so per-role private memory needs per-role keys)",
+      });
+    }
+  });
+
+/** The crew mount: the shorthands still work, plus the role-keyed superset. */
+const crewThredzBlock = z.union([z.boolean(), z.string().min(1), crewThredzObject]).optional();
+
+/**
  * v0.3.0 Goal 2 (§3.3, PR 17) — the top-level `learning:` block: continual
  * learning as a first-class capability. Presence (with `enabled` not `false`)
  * registers the builtin `learning-loop` skill with `domain`/`curriculum`/
@@ -2434,7 +2479,7 @@ const crewSchema = z
     // surface, §2.7).
     memory: memoryBlock,
     continuity: continuityBlock,
-    thredz: thredzBlock,
+    thredz: crewThredzBlock,
     learning: learningBlock,
     // Loop contract 0.4 (Batch C, G26) — crew joins the observability-carrying
     // shapes (cli/channel/managed): the orchestrator's cost/trace/metrics/
@@ -2980,6 +3025,60 @@ function crossFieldIssues(data: Spec): SpecIssue[] {
         ["entry"],
         `crew.entry "${data.entry}" must name one of crew.roles (got: ${roleNames.join(", ")})`,
       );
+    }
+    // 0.5.0 — the role-keyed thredz fan-out. Both checks are cross-field, so
+    // they cannot live in the schema: `thredz.roles` and `roles` are siblings.
+    const crewThredz = data.thredz;
+    if (typeof crewThredz === "object" && crewThredz !== null && "roles" in crewThredz) {
+      const fanOut = (crewThredz as { roles?: Record<string, { api_key?: string }> }).roles;
+      const inheritedKey = (crewThredz as { api_key?: string }).api_key;
+      if (fanOut !== undefined) {
+        for (const name of Object.keys(fanOut)) {
+          if (!roleNames.includes(name)) {
+            custom(
+              ["thredz", "roles", name],
+              `thredz.roles["${name}"]: no such role — crew.roles declares ${roleNames.join(", ")}`,
+            );
+          }
+        }
+        // Every role must resolve to a key: its own, or the inherited one. A
+        // role with neither would silently get NO hosted wiki while its
+        // siblings got one, which is the kind of gap you find in production.
+        if (inheritedKey === undefined) {
+          for (const name of roleNames) {
+            if (fanOut[name]?.api_key === undefined) {
+              custom(
+                ["thredz", "roles", name],
+                `role "${name}" has no Thredz api_key and thredz.api_key is not set — give it one, or set a crew-wide thredz.api_key for the roles that share a wiki`,
+              );
+            }
+          }
+        }
+        // Two role names that slugify to the same MCP server name would make
+        // one silently overwrite the other's server entry.
+        const slugs = new Map<string, string>();
+        for (const name of Object.keys(fanOut)) {
+          const slug = name
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-")
+            .replace(/^-+|-+$/g, "");
+          if (slug === "") {
+            custom(
+              ["thredz", "roles", name],
+              `thredz.roles["${name}"]: the role name has no characters usable in an MCP server name — rename the role`,
+            );
+            continue;
+          }
+          const clash = slugs.get(slug);
+          if (clash !== undefined) {
+            custom(
+              ["thredz", "roles", name],
+              `thredz.roles["${name}"] and thredz.roles["${clash}"] both reduce to the MCP server name "thredz-${slug}" — rename one`,
+            );
+          }
+          slugs.set(slug, name);
+        }
+      }
     }
     if (data.routing !== undefined && data.routing.kind === "match" && data.routing.match) {
       for (const [from, rules] of Object.entries(data.routing.match)) {

@@ -167,6 +167,20 @@ export type RunOptions = {
    * the coordination surface (design §2.7).
    */
   readonly extraTools?: ReadonlyArray<RegisteredTool>;
+  /** 0.5.0 — per-role tools, merged AFTER the role's own tools and BEFORE the
+   *  crew-wide {@link extraTools}. Keyed by role name; a role with no entry is
+   *  unaffected.
+   *
+   *  The crew shape uses this for per-role Thredz vocabularies: each role's
+   *  aliases live in its OWN `ToolCatalog`, so two roles may both own
+   *  `wiki_write` without tripping the alias collision guard (which is
+   *  per-catalog, not global). Doing the merge HERE rather than in codegen
+   *  buys the A2A peer path for free and keeps `agent_<role>.ts` byte-stable. */
+  readonly roleExtraTools?: Readonly<Record<string, ReadonlyArray<RegisteredTool>>>;
+  /** 0.5.0 — per-role override of the {@link memory} seam, falling back to it
+   *  when a role has no entry. Lets each role auto-recall from its own Thredz
+   *  space instead of one crew-wide corpus. */
+  readonly roleMemory?: Readonly<Record<string, RunOptions["memory"]>>;
   /** v0.3.0 PR 11 — the memory seam (auto-recall/auto-capture), threaded
    *  verbatim into every role's runChatLoop. Constructed by memory-service. */
   readonly memory?: RunChatLoopOptions["memory"];
@@ -551,13 +565,20 @@ async function* driveCrew(
             role: toRole,
             roles: args.roleNames,
             roleTools: peerDef.tools ?? [],
+            ...(args.opts.roleExtraTools?.[toRole] !== undefined
+              ? { roleExtraTools: args.opts.roleExtraTools[toRole] }
+              : {}),
             ...(args.opts.extraTools !== undefined ? { extraTools: args.opts.extraTools } : {}),
           }),
           permissionMode,
           permissionRules,
           ...(failureTaxonomy !== undefined ? { failureTaxonomy } : {}),
           // v0.3.0 — the memory fabric's seams/skills, crew-wide (§2.7).
-          ...(args.opts.memory !== undefined ? { memory: args.opts.memory } : {}),
+          // 0.5.0 — except `memory`, which a role may override so it recalls
+          // from its OWN Thredz space.
+          ...((args.opts.roleMemory?.[toRole] ?? args.opts.memory) !== undefined
+            ? { memory: args.opts.roleMemory?.[toRole] ?? args.opts.memory }
+            : {}),
           ...(args.opts.continuity !== undefined ? { continuity: args.opts.continuity } : {}),
           ...(args.opts.skills !== undefined ? { skills: args.opts.skills } : {}),
           // Loop contract 0.4 (Batch C, G11) — a peer turn is as headless as a
@@ -638,13 +659,20 @@ async function* driveCrew(
             role: currentRoleName,
             roles: args.roleNames,
             roleTools: def.tools ?? [],
+            ...(args.opts.roleExtraTools?.[currentRoleName] !== undefined
+              ? { roleExtraTools: args.opts.roleExtraTools[currentRoleName] }
+              : {}),
             ...(args.opts.extraTools !== undefined ? { extraTools: args.opts.extraTools } : {}),
           }),
           permissionMode,
           permissionRules,
           ...(failureTaxonomy !== undefined ? { failureTaxonomy } : {}),
           // v0.3.0 — the memory fabric's seams/skills, crew-wide (§2.7).
-          ...(args.opts.memory !== undefined ? { memory: args.opts.memory } : {}),
+          // 0.5.0 — except `memory`, which a role may override so it recalls
+          // from its OWN Thredz space.
+          ...((args.opts.roleMemory?.[currentRoleName] ?? args.opts.memory) !== undefined
+            ? { memory: args.opts.roleMemory?.[currentRoleName] ?? args.opts.memory }
+            : {}),
           ...(args.opts.continuity !== undefined ? { continuity: args.opts.continuity } : {}),
           ...(args.opts.skills !== undefined ? { skills: args.opts.skills } : {}),
           // Loop contract 0.4 (Batch C, G11) — headless ask disposition + the
@@ -946,6 +974,7 @@ function composeRoleTools(args: {
   role: string;
   roles: ReadonlyArray<string>;
   roleTools: ReadonlyArray<RegisteredTool>;
+  roleExtraTools?: ReadonlyArray<RegisteredTool>;
   extraTools?: ReadonlyArray<RegisteredTool>;
 }): ReadonlyArray<RegisteredTool> {
   const handoff = createHandoffTool({ from: args.role, targets: args.roles });
@@ -955,7 +984,15 @@ function composeRoleTools(args: {
   // Handoff/SendMessage are appended last and never collide (no spec-side
   // tool today is named "Handoff" or "SendMessage" in a CRW bundle —
   // channel-bot's SendMessage lives in a different target shape).
-  return [...args.roleTools, ...(args.extraTools ?? []), handoff, a2a];
+  // Order: the role's own spec tools, then ITS per-role extras (the Thredz
+  // vocabulary it alone owns), then the crew-wide extras, then Handoff/A2A.
+  return [
+    ...args.roleTools,
+    ...(args.roleExtraTools ?? []),
+    ...(args.extraTools ?? []),
+    handoff,
+    a2a,
+  ];
 }
 
 export { createHandoffTool, createSendMessageA2ATool };

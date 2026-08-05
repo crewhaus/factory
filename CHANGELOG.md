@@ -260,6 +260,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `connectThredz` warns, never a hard failure. `wiki_space_create` carries
   the justification gate: it consumes plan quota and can 402/409.
 
+- **Thredz is emit-wired on `target: crew`, with a per-role fan-out.** One
+  Thredz API key owns at most ONE `individual` (private) wiki space, and
+  `thredz-mcp` reads exactly one key per process — so per-role private memory
+  is per-role keys is per-role server processes. `thredz.roles.<role>` gives a
+  role its own `api_key` and `space`; every other field at that level is the
+  default a role inherits and may override:
+
+  ```yaml
+  thredz:
+    visibility: private          # inherited by both roles
+    roles:
+      researcher: { api_key: $THREDZ_KEY_RESEARCHER, space: researcher-notes }
+      editor:     { api_key: $THREDZ_KEY_EDITOR,     space: editor-notes }
+  ```
+
+  A role with no override rides the crew-wide block, sharing one key, one space
+  and one process — a crew with one brain stays the easy case. A server nobody
+  rides is never synthesized, so a fully-overridden crew spawns no spare child.
+
+  **The fan-out map lives under `thredz.`, not on the role, and that is
+  load-bearing.** Two surfaces prefix-match on `["thredz"]`: the optimizer's
+  `OPTIMIZABLE_PATHS.crew` allows whole-role replacement under `["roles"]`, and
+  the hangar's spec editor denies the `thredz` prefix outright. Under
+  `roles.<r>.thredz` a role's `api_key` would have become both
+  optimizer-rewritable and browser-editable. Keeping it under `thredz.roles`
+  inherits both protections with no new code.
+
+  Each role's Thredz vocabulary is registered as BARE names into its OWN
+  `ToolCatalog` — the alias collision guard is per-catalog, so two roles can
+  both own `wiki_write`. Prefixing was rejected: `wiki_write` is a vocabulary
+  five prompt sites and four policy surfaces match verbatim. Two new
+  orchestrator seams, `roleExtraTools` and `roleMemory`, carry it, which also
+  buys the agent-to-agent peer path for free and keeps `agent_<role>.ts`
+  byte-stable.
+
 ### Changed
 
 - **The `fleet` and `doctor`/`channel` cores are consumed from the new
@@ -322,6 +357,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `@crewhaus/tool-wiki` accepts `space` on all nine wiki tools, a no-op over
   files, so a spec written for the Thredz backend runs unchanged over the local
   backend — the parity contract the schema-mirror test pins.
+
+- **The crew-wide memory fabric no longer registers the wiki when roles carry
+  their own.** Facts, continuity, plan and skills stay crew-wide; the wiki
+  becomes per-role by definition. Without this a role's tool array carried the
+  ten local wiki twins beside its ten aliased ones, and duplicate names in the
+  array advertised to the provider are a 400.
+
+- **Crew's `ACCEPTED_BUT_UNWIRED` row is deleted, not silenced**, and the
+  emitted bundle's "thredz configured but ignored on crew" note is gone —
+  the table's contract is that a row exists only while the shape really does
+  ignore the block. `research` is now the only shape that still carries it.
+
+- The continuity goal mirror rides the crew-default connection only. A pure
+  fan-out crew gets `goals: false` forced with the mirror dropped rather than
+  failing to compile: the continuity store is spec-scoped and shared, and
+  mirroring one crew plan into N private spaces has no correct semantics.
+
+- `connectThredz` takes a `serverName`, and every `[thredz]` log line now names
+  its server. With N per-role servers an undifferentiated prefix leaves an
+  operator unable to tell which role's key lapsed.
 
 ### Fixed
 

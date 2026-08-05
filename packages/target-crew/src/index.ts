@@ -367,12 +367,26 @@ function renderHooksField(ir: IrCrewV0): string {
  * daemon's stdout is the JSON-per-line event stream and must stay
  * machine-parseable.
  */
+/** The `mcp_servers` keys that carry a synthesized Thredz server for this
+ *  crew: the crew-wide `"thredz"` plus one `"thredz-<slug>"` per role that
+ *  owns its own key. They are spawned on the shared host but deliberately
+ *  kept OUT of the namespaced `registerMcpServer` pass — their tools are
+ *  registered as BARE names into per-role catalogs by `connectThredz`, which
+ *  is what makes `wiki_write` mean "my wiki" to each role. Namespacing them
+ *  too would double-register the whole vocabulary as `thredz__wiki_write`. */
+function thredzServerNames(ir: IrCrewV0): ReadonlySet<string> {
+  const names = new Set<string>();
+  for (const role of ir.roles) if (role.thredzServer !== undefined) names.add(role.thredzServer);
+  return names;
+}
+
 function renderMcpServers(ir: IrCrewV0): {
   imports: string[];
   bootBlock: string;
   hasAny: boolean;
 } {
-  const entries = Object.entries(ir.mcp_servers);
+  const thredzNames = thredzServerNames(ir);
+  const entries = Object.entries(ir.mcp_servers).filter(([name]) => !thredzNames.has(name));
   if (entries.length === 0) {
     return { imports: [], bootBlock: "", hasAny: false };
   }
@@ -719,11 +733,22 @@ function memoryFabric(ir: IrCrewV0): { wired: boolean; fragmentJson: string } {
   const memoryOn = ir.memory !== undefined && ir.memory.enabled !== false;
   const continuityOn = ir.continuity !== undefined;
   const wired = memoryOn || continuityOn;
+  // 0.5.0 — AMENDS the crew-wide scope stated above: when any role carries its
+  // own Thredz config, the WIKI stops being crew-wide. Each role gets its own,
+  // scoped to its own space, and the crew-wide fabric must not also register
+  // the ten LOCAL wiki twins — a role's tool array would then carry both, and
+  // duplicate names in the array advertised to the provider are a 400.
+  // Facts, continuity, plan and skills stay crew-wide and local.
+  const perRoleWiki = ir.roles.some((r) => r.thredz !== undefined);
+  const crewMemory =
+    memoryOn && perRoleWiki && ir.memory !== undefined
+      ? (({ wiki: _perRole, ...rest }) => rest)(ir.memory)
+      : ir.memory;
   const fragmentJson = wired
     ? JSON.stringify(
         memoryFragmentFromIr({
           name: ir.name,
-          ...(memoryOn ? { memory: ir.memory } : {}),
+          ...(memoryOn ? { memory: crewMemory } : {}),
           ...(continuityOn ? { continuity: ir.continuity } : {}),
           // v0.3.0 Goal 2 (PR 17) — learning rides the fragment: wireMemory
           // renders the learning-loop skill + gates in /study /reflect.
@@ -732,6 +757,125 @@ function memoryFabric(ir: IrCrewV0): { wired: boolean; fragmentJson: string } {
       )
     : "";
   return { wired, fragmentJson };
+}
+
+/**
+ * 0.5.0 — the per-role Thredz boot. One `addServer` + one `ToolCatalog` +
+ * one `connectThredz` + one `wireWiki` per role that carries a config.
+ *
+ * The catalog is per role ON PURPOSE: `registerMcpToolAliases` throws on a
+ * bare-name collision within the catalog it is handed, so two roles could not
+ * both own `wiki_write` in one catalog. A catalog is a boot-time composition
+ * device — one Map plus N registrations — and `runChatLoop` never sees one, so
+ * this costs essentially nothing and lets every role keep the BARE vocabulary
+ * that five prompt sites and four policy surfaces match verbatim.
+ */
+function renderRoleThredz(ir: IrCrewV0): {
+  imports: string[];
+  bootBlock: string;
+  roleExtraToolsField: string;
+  roleMemoryField: string;
+  hasAny: boolean;
+} {
+  const roles = ir.roles.filter((r) => r.thredz !== undefined && r.thredzServer !== undefined);
+  if (roles.length === 0) {
+    return {
+      imports: [],
+      bootBlock: "",
+      roleExtraToolsField: "",
+      roleMemoryField: "",
+      hasAny: false,
+    };
+  }
+  // Distinct servers: roles sharing the crew default share one npx process.
+  const servers = new Map<string, IrCrewRole>();
+  for (const r of roles)
+    if (!servers.has(r.thredzServer as string)) servers.set(r.thredzServer as string, r);
+
+  const ident = (role: string) => role.replace(/[^A-Za-z0-9]/g, "_");
+  const addLines = [...servers].map(
+    ([name, r]) => `  try {
+    mcpHost.addServer(${escapeJsonString(name)}, resolveMcpServerConfig(${JSON.stringify(
+      synthesizedThredzServerFor(ir, name),
+    )}, { name: ${escapeJsonString(name)} }));
+  } catch (__err) {
+    const __report = toFailureReport(__err);
+    process.stderr.write(\`\${formatRunFailure(__report, { prefix: "[crew]" })}\\n\`);
+    process.exit(__report.exitCode);
+  }`,
+  );
+  const connectLines = [...servers].map(([name, r]) => {
+    const id = ident(name);
+    const agent = r.thredz?.agentName;
+    return `  const __thredzCat_${id} = new ToolCatalog();
+  const __thredz_${id} = await connectThredz(mcpHost, __thredzCat_${id}, {
+    serverName: ${escapeJsonString(name)},${
+      agent !== undefined ? `\n    agentName: ${escapeJsonString(agent)},` : ""
+    }
+    log: (line) => process.stderr.write(line),
+  });`;
+  });
+  // Per-role wiki seam. With a live connection wireWiki returns
+  // { store: null, tools: [] } plus a client-bound recall; on the degrade it
+  // returns the ten LOCAL tools — so exactly one of the two arrays is
+  // non-empty per role, and both are safe to concatenate.
+  const wikiLines = roles.map((r) => {
+    const id = ident(r.name);
+    const server = ident(r.thredzServer as string);
+    return `  const __wiki_${id} = wireWiki(${JSON.stringify({
+      specName: ir.name,
+      ...(ir.memory !== undefined ? { memory: ir.memory } : {}),
+      thredz: r.thredz,
+    })}, { catalog: { register: () => {} }, cwd: process.cwd(), thredz: __thredz_${server} });`;
+  });
+  const recallK = ir.memory?.wiki?.recallK ?? 5;
+  const roleExtraToolsField = `\n    roleExtraTools: {${roles
+    .map(
+      (r) =>
+        `\n      ${escapeJsonString(r.name)}: [...__thredzCat_${ident(
+          r.thredzServer as string,
+        )}.list(), ...(__wiki_${ident(r.name)}?.tools ?? [])],`,
+    )
+    .join("")}\n    },`;
+  const roleMemoryField = `\n    roleMemory: {${roles
+    .map(
+      (r) =>
+        `\n      ${escapeJsonString(r.name)}: foldWikiRecall(__memWired?.options.memory, __wiki_${ident(
+          r.name,
+        )}, ${recallK}),`,
+    )
+    .join("")}\n    },`;
+  // The Thredz servers ride the SHARED McpHost. When the crew declares no
+  // user MCP servers, `renderMcpServers` emits nothing — so this block owns
+  // the host declaration and its imports instead.
+  const ownsHost = Object.keys(ir.mcp_servers).every((n) => servers.has(n));
+  return {
+    imports: [
+      `import { connectThredz, wireWiki, foldWikiRecall } from "@crewhaus/memory-service";`,
+      ...(ownsHost
+        ? [`import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";`]
+        : []),
+    ],
+    bootBlock: `
+  // 0.5.0 — per-role Thredz. One key owns one private wiki space and
+  // thredz-mcp reads one key per process, so per-role private memory is one
+  // spawned server per role. Each role's vocabulary lands in its OWN catalog.${
+    ownsHost ? "\n  const mcpHost = new McpHost();" : ""
+  }
+${addLines.join("\n")}
+${connectLines.join("\n")}
+${wikiLines.join("\n")}`,
+    roleExtraToolsField,
+    roleMemoryField,
+    hasAny: true,
+  };
+}
+
+/** The synthesized server config the compiler put in `ir.mcp_servers`. */
+function synthesizedThredzServerFor(ir: IrCrewV0, name: string): unknown {
+  const cfg = ir.mcp_servers[name];
+  if (cfg === undefined) throw new Error(`crew emitter: no mcp_servers entry for ${name}`);
+  return cfg;
 }
 
 function renderDaemon(ir: IrCrewV0): string {
@@ -749,6 +893,8 @@ function renderDaemon(ir: IrCrewV0): string {
   const hooksField = renderHooksField(ir);
   const fabric = memoryFabric(ir);
   const mcp = renderMcpServers(ir);
+  // 0.5.0 — per-role Thredz servers, catalogs and wiki seams.
+  const roleThredz = renderRoleThredz(ir);
   // Section 13 (Batch A, G34) — when any role declares sub-agents, inject
   // the spawner once at the run level; the orchestrator stamps it (plus the
   // per-role subAgents map) onto each role's runChatLoop bridge.
@@ -767,7 +913,9 @@ function renderDaemon(ir: IrCrewV0): string {
         : fabric.wired
           ? `import type { RegisteredTool } from "@crewhaus/tool-catalog";\n`
           : "";
-  const mcpImport = mcp.hasAny ? `${mcp.imports.join("\n")}\n` : "";
+  const mcpImport = `${[...(mcp.hasAny ? mcp.imports : []), ...roleThredz.imports].join("\n")}${
+    mcp.hasAny || roleThredz.hasAny ? "\n" : ""
+  }`;
   const memImport = fabric.wired
     ? `import { wireMemory } from "@crewhaus/memory-service";
 import { createSkillTool } from "@crewhaus/skills-registry";
@@ -802,15 +950,16 @@ import { createSkillTool } from "@crewhaus/skills-registry";
     ...(__memWired.options.continuity !== undefined ? { continuity: __memWired.options.continuity } : {}),
     ...(__skills.length > 0 ? { skills: __skills } : {}),`
     : "";
-  const mcpShutdownOk = mcp.hasAny ? "\n  await mcpHost.disconnectAll();" : "";
-  const mcpShutdownErr = mcp.hasAny ? "\n    await mcpHost.disconnectAll().catch(() => {});" : "";
-  // v0.3.0 Goal 3 — thredz is spec-carried on this shape but not emit-wired
-  // in this release (the one-knob backend flip ships on cli). Surface it,
-  // 0.2.3-style, so nobody wonders why their wiki stayed local.
-  const thredzWarning =
-    ir.thredz !== undefined
-      ? "// note: thredz configured but ignored on crew in 0.3.0 — the Thredz backend flip is wired on the cli shape (design §4)\n"
-      : "";
+  // The host is shared by user MCP servers and the per-role Thredz servers —
+  // disconnect it if EITHER put something on it, or N npx children outlive the
+  // run.
+  const hostLive = mcp.hasAny || roleThredz.hasAny;
+  const mcpShutdownOk = hostLive ? "\n  await mcpHost.disconnectAll();" : "";
+  const mcpShutdownErr = hostLive ? "\n    await mcpHost.disconnectAll().catch(() => {});" : "";
+  // 0.5.0 — thredz is EMIT-WIRED on crew. A crew whose roles each carry their
+  // own key gets one server, one space and one vocabulary per role; roles that
+  // share the crew-wide block share one brain. Nothing is ignored any more.
+  const thredzWarning = "";
   // crewhaus.control.v1, from the shared gateway-protocol renderers. The crew
   // daemon is a ONE-SHOT: it consumes stdin, runs the crew and exits, so it
   // arms no pokeable lane — `/control/v1/wake` answers 404 lane_not_armed.
@@ -852,8 +1001,8 @@ ${controlPlaneBoot}${controlDrain}${controlStart}  const crew = buildCrew();
   if (trimmed.length === 0) {
     process.stderr.write("[crew] no input on stdin\\n");
     process.exit(2);
-  }${mcp.bootBlock}${memBoot}
-  const opts: Parameters<typeof crew.run>[1] = {${permField}${approvalFields}${taxonomyField}${crewCapsFields}${loopLimitsField}${budgetField}${hooksField}${spawnField}${extraToolsField}${memOptsFields}
+  }${mcp.bootBlock}${roleThredz.bootBlock}${memBoot}
+  const opts: Parameters<typeof crew.run>[1] = {${permField}${approvalFields}${taxonomyField}${crewCapsFields}${loopLimitsField}${budgetField}${hooksField}${spawnField}${extraToolsField}${roleThredz.roleExtraToolsField}${roleThredz.roleMemoryField}${memOptsFields}
   };
   let lastFinalOutput = "";
   __crewRunning = true;
