@@ -1687,6 +1687,18 @@ export type IrCrewRole = {
    *  PolicyRouter decides per role against the shared routing-store
    *  scoreboard). Absent → single-model. */
   readonly modelPool?: IrModelPool;
+  /** 0.5.0 — this role's RESOLVED Thredz config: the crew-wide defaults with
+   *  the role's own `thredz.roles.<name>` overrides merged in, shorthands
+   *  expanded and the credential lowered. Absent → this role has no hosted
+   *  wiki. Resolution happens at lower time precisely so the emitter does no
+   *  inheritance logic. */
+  readonly thredz?: IrThredz;
+  /** 0.5.0 — the `mcp_servers` key of the server this role's Thredz rides:
+   *  `"thredz"` for the crew default, `"thredz-<slug>"` for a role override.
+   *  Carried explicitly so the emitter never re-derives it — a name derived
+   *  twice is a name that can drift, and `McpHost.getClient` on a name the
+   *  host does not carry degrades the role to local files SILENTLY. */
+  readonly thredzServer?: string;
 };
 
 export type IrCrewRoutingKind = "match" | "llm";

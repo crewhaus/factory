@@ -287,7 +287,9 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
   // channel + managed (connectThredz ported from the cli emitter), so their
   // rows are gone; research + crew stay carried-with-note this batch.
   research: [unwired("thredz", "research", "the generated daemon prints the ignored-note comment")],
-  crew: [unwired("thredz", "crew", "the generated bundle prints the ignored-note comment")],
+  // 0.5.0 — crew's row is DELETED, not silenced: thredz is emit-wired on crew
+  // now, with the per-role fan-out. The table's contract is that a row exists
+  // only while the shape really does ignore the block.
   // Loop contract 0.4 (Batch F) — the `schedule:` block is now emit-WIRED on
   // channel/managed/batch: each daemon arms its wake loop (channel + batch via
   // durable-execution's `armSchedule`, managed via its per-tenant
@@ -1753,14 +1755,34 @@ type SpecThredz =
   | boolean
   | string
   | {
-      readonly api_key: string;
+      /** OPTIONAL because the crew superset allows a pure fan-out where every
+       *  role brings its own key and there is no crew-wide one. The spec layer
+       *  guarantees a key exists wherever one is required; `lowerThredzBlock`
+       *  re-checks rather than trusting that across a package boundary. */
+      readonly api_key?: string;
       readonly base_url?: string;
       readonly visibility?: "private" | "shared";
       readonly space?: string;
       readonly goals?: boolean;
       readonly agents?: boolean | string;
       readonly messaging?: boolean;
+      /** 0.5.0, CREW ONLY — per-role overrides. Every other field on this
+       *  object is the default a role inherits. */
+      readonly roles?: Readonly<Record<string, SpecThredzRoleOverride>>;
     };
+
+/** A role's slice of `thredz.roles.<name>` — every field of the object form
+ *  except the fan-out map itself, and `api_key` optional because a role may
+ *  inherit the crew-wide one. */
+type SpecThredzRoleOverride = {
+  readonly api_key?: string;
+  readonly base_url?: string;
+  readonly visibility?: "private" | "shared";
+  readonly space?: string;
+  readonly goals?: boolean;
+  readonly agents?: boolean | string;
+  readonly messaging?: boolean;
+};
 
 type SpecWithThredz = {
   readonly name: string;
@@ -1801,6 +1823,15 @@ function lowerThredzBlock(spec: SpecWithThredz, continuityGoalsOn: boolean): IrT
   if (t === undefined || t === false) return undefined;
   const obj =
     t === true ? { api_key: "$THREDZ_API_KEY" } : typeof t === "string" ? { api_key: t } : t;
+  if (obj.api_key === undefined) {
+    // Unreachable through parseSpec — the crew refinement requires a key per
+    // role or a crew-wide one, and every other shape's schema makes api_key
+    // required. Reachable by a direct-IR builder, and a silently missing
+    // credential would mean a bundle that boots with no auth at all.
+    throw new CompilerError(
+      "thredz.api_key is missing — every Thredz block needs a key (a crew may give one per role under thredz.roles instead).",
+    );
+  }
   const agents = obj.agents;
   const agentName =
     agents === undefined || agents === false
@@ -1946,6 +1977,171 @@ function lowerThredzWiredNoMcp(
  * loudly (dead config that would degrade-warn every run beats nobody's use
  * case).
  */
+/**
+ * 0.5.0 — the deterministic `mcp_servers` key for a role that overrides the
+ * crew-wide Thredz config.
+ *
+ * Hyphen, never ":" — a role name may legally contain spaces, dots and colons
+ * (`safeName` is permissive), and if the server name ever falls through to
+ * `namespacedToolName` it builds `<server>__<tool>`, which must satisfy the
+ * providers' `^[a-zA-Z0-9_-]{1,64}$`. The spec layer already rejects two roles
+ * whose names collapse to the same slug, so this cannot silently collide.
+ */
+function thredzServerNameForRole(role: string): string {
+  const slug = role
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (slug === "") {
+    throw new CompilerError(
+      `thredz.roles[${JSON.stringify(role)}]: the role name has no characters usable in an MCP server name — rename the role.`,
+    );
+  }
+  return `${THREDZ_MCP_SERVER_NAME}-${slug}`;
+}
+
+/**
+ * 0.5.0 — emit-wired Thredz for the crew shape, with the per-role fan-out.
+ *
+ * One Thredz API key owns at most ONE individual (private) wiki space, and
+ * `thredz-mcp` reads exactly one key per process. So per-role private memory
+ * is per-role keys is per-role SERVER PROCESSES — this function resolves each
+ * role's config and assigns it a server name, and the emitter spawns one npx
+ * child per distinct name.
+ *
+ * Roles that do not override the crew-wide block share the single `"thredz"`
+ * server, and therefore share one key, one space and one process. That is the
+ * right default: a crew with one brain is the common case.
+ */
+function lowerThredzWiredCrew(
+  spec: SpecWithThredz & { readonly roles: Readonly<Record<string, unknown>> },
+  opts: {
+    readonly continuityGoalsOn: boolean;
+    readonly mcpServers: IrMcpServers;
+    readonly memory: { memory?: IrMemory };
+  },
+): {
+  thredz?: IrThredz;
+  mcp_servers: IrMcpServers;
+  memory?: IrMemory;
+  roleThredz: ReadonlyMap<string, { thredz: IrThredz; server: string }>;
+} {
+  const block = spec.thredz;
+  const fanOut =
+    typeof block === "object" && block !== null && block.roles !== undefined
+      ? block.roles
+      : undefined;
+  const hasFanOut = fanOut !== undefined && Object.keys(fanOut).length > 0;
+
+  // The crew-wide default. `roles` is stripped first — `lowerThredzBlock`
+  // reads the strict object shape and must not see the fan-out map.
+  const crewDefaultSpec: SpecWithThredz = {
+    ...spec,
+    ...(typeof block === "object" && block !== null
+      ? {
+          thredz: Object.fromEntries(
+            Object.entries(block).filter(([k]) => k !== "roles"),
+          ) as SpecThredz,
+        }
+      : {}),
+  };
+  const hasCrewKey = typeof block !== "object" || block === null || block.api_key !== undefined;
+  const crewDefault = hasCrewKey
+    ? lowerThredzBlock(crewDefaultSpec, opts.continuityGoalsOn)
+    : undefined;
+
+  if (crewDefault === undefined && !hasFanOut) {
+    if (spec.memory?.backend === "thredz") {
+      throw new CompilerError(
+        `memory.backend "thredz" needs the top-level thredz: block (it carries the API key) — add \`thredz: $THREDZ_API_KEY\`, or drop the backend override to stay on local files.`,
+      );
+    }
+    return { mcp_servers: opts.mcpServers, ...opts.memory, roleThredz: new Map() };
+  }
+  if (spec.memory?.backend === "file") {
+    throw new CompilerError(
+      `memory.backend "file" contradicts the thredz: block — the one knob flips the wiki backend to Thredz (design §4). Drop the backend override (or remove thredz:) and recompile.`,
+    );
+  }
+
+  // Resolve every role. A role with an override gets its own server; a role
+  // without one rides the crew default (when there is one).
+  const roleThredz = new Map<string, { thredz: IrThredz; server: string }>();
+  const defaults =
+    typeof block === "object" && block !== null
+      ? Object.fromEntries(Object.entries(block).filter(([k]) => k !== "roles" && k !== "api_key"))
+      : {};
+  for (const roleName of Object.keys(spec.roles).sort((a, b) => a.localeCompare(b))) {
+    const override = fanOut?.[roleName];
+    if (override === undefined) {
+      if (crewDefault !== undefined) {
+        roleThredz.set(roleName, { thredz: crewDefault, server: THREDZ_MCP_SERVER_NAME });
+      }
+      continue;
+    }
+    // Field-by-field merge, so an override omitting `visibility` inherits it.
+    // The merged object goes back through `lowerThredzBlock` so credential
+    // lowering, the visibility default and `agents: true` handle derivation
+    // all happen in exactly one place. The derived handle is per-role, or two
+    // roles would race for the same Thredz agent handle.
+    const merged = {
+      ...defaults,
+      ...Object.fromEntries(Object.entries(override).filter(([, v]) => v !== undefined)),
+      api_key:
+        override.api_key ??
+        (typeof block === "object" && block !== null ? block.api_key : undefined),
+    } as Exclude<SpecThredz, boolean | string>;
+    const resolved = lowerThredzBlock(
+      { ...spec, name: `${spec.name}-${roleName}`, thredz: merged },
+      opts.continuityGoalsOn,
+    );
+    if (resolved === undefined) continue;
+    roleThredz.set(roleName, { thredz: resolved, server: thredzServerNameForRole(roleName) });
+  }
+
+  // The continuity goal mirror is singular and the continuity store is
+  // spec-scoped and SHARED by every role. Mirroring one crew plan into N
+  // private spaces has no correct semantics, so the mirror rides the crew
+  // default only. A pure fan-out crew gets it forced off rather than failing
+  // to compile, because `goals` defaults to `continuityGoalsOn`.
+  const goalMirrorHomeless = crewDefault === undefined;
+  const finalRoleThredz = goalMirrorHomeless
+    ? new Map(
+        [...roleThredz].map(([name, entry]) => [
+          name,
+          { ...entry, thredz: { ...entry.thredz, goals: false } },
+        ]),
+      )
+    : roleThredz;
+
+  // One synthesized entry per DISTINCT server name, and the
+  // explicit-beats-implicit check is asked PER KEY — asking it once against
+  // the bare "thredz" name would let a user-declared override of one role's
+  // server suppress every other role's.
+  let mcpServers = opts.mcpServers;
+  const synthesized: Record<string, IrMcpServerConfig> = {};
+  for (const [, entry] of finalRoleThredz) {
+    if (opts.mcpServers[entry.server] !== undefined) continue;
+    if (synthesized[entry.server] !== undefined) continue;
+    synthesized[entry.server] = synthesizeThredzServer(entry.thredz);
+  }
+  if (Object.keys(synthesized).length > 0) {
+    mcpServers = Object.freeze({ ...opts.mcpServers, ...synthesized }) as IrMcpServers;
+  }
+
+  const memory =
+    opts.memory.memory !== undefined
+      ? { memory: { ...opts.memory.memory, backend: "thredz" as const } }
+      : {};
+
+  return {
+    ...(crewDefault !== undefined ? { thredz: crewDefault } : {}),
+    mcp_servers: mcpServers,
+    ...memory,
+    roleThredz: finalRoleThredz,
+  };
+}
+
 function lowerThredzCarried(
   spec: SpecWithThredz,
   continuityGoalsOn: boolean,
@@ -1953,7 +2149,7 @@ function lowerThredzCarried(
 ): { thredz?: IrThredz } {
   if (spec.memory?.backend === "thredz") {
     throw new CompilerError(
-      `memory.backend "thredz" is emit-wired on cli/channel/managed in this release — the ${shape} shape carries the thredz: block for forward compatibility but keeps the local backend. Remove the backend override.`,
+      `memory.backend "thredz" is emit-wired on cli/channel/managed/crew in this release — the ${shape} shape carries the thredz: block for forward compatibility but keeps the local backend. Remove the backend override.`,
     );
   }
   const thredz = lowerThredzBlock(spec, continuityGoalsOn);
@@ -2673,6 +2869,14 @@ export function lower(spec: Spec): IrNode {
       const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
       // v0.3.0 Goal 2 — learning (validated + Sources-required wiki stamp).
       const learning = lowerLearning(spec);
+      // 0.5.0 — thredz is emit-wired on crew, with the per-role fan-out. This
+      // resolves each role's config, assigns it a server name, and synthesizes
+      // one mcp_servers entry per DISTINCT server.
+      const crewThredz = lowerThredzWiredCrew(spec, {
+        continuityGoalsOn: continuity.continuity?.plan === true,
+        mcpServers: lowerMcpServers(spec.mcp_servers),
+        memory: lowerMemory(spec),
+      });
       return {
         version: 0,
         name: spec.name,
@@ -2681,7 +2885,15 @@ export function lower(spec: Spec): IrNode {
         // Stable order: sort by role name so generated bundles diff cleanly.
         roles: Object.entries(spec.roles)
           .sort(([a], [b]) => a.localeCompare(b))
-          .map(([name, role]) => lowerCrewRole(name, role, spec.model)),
+          .map(([name, role]) => {
+            const lowered = lowerCrewRole(name, role, spec.model);
+            // 0.5.0 — attach this role's RESOLVED Thredz config and the
+            // server it rides. Absent for a role with no hosted wiki.
+            const wired = crewThredz.roleThredz.get(name);
+            return wired === undefined
+              ? lowered
+              : { ...lowered, thredz: wired.thredz, thredzServer: wired.server };
+          }),
         ...(spec.routing !== undefined
           ? {
               routing: {
@@ -2690,7 +2902,6 @@ export function lower(spec: Spec): IrNode {
               },
             }
           : {}),
-        mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
@@ -2701,12 +2912,17 @@ export function lower(spec: Spec): IrNode {
         ...lowerHooks(spec),
         // v0.3.0 — crew joins the memory-carrying shapes (§9) and gets
         // DEFAULT-ON continuity: roles share the `spec`-scoped plan store
-        // (the plan IS the coordination surface, §2.7).
-        ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
+        // (the plan IS the coordination surface, §2.7). The memory here is
+        // the THREDZ-FLIPPED one when a hosted wiki is wired.
+        ...applyLearningWikiGovernance(
+          crewThredz.memory !== undefined ? { memory: crewThredz.memory } : lowerMemory(spec),
+          learning.learning !== undefined,
+        ),
         ...continuity,
-        // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
-        // the emitted bundle), not emit-wired yet.
-        ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "crew"),
+        // 0.5.0 — thredz is EMIT-WIRED on crew, with the per-role fan-out:
+        // one key (and therefore one space, and one npx process) per role
+        // that overrides the crew-wide block.
+        ...(({ roleThredz: _drop, ...rest }) => rest)(crewThredz),
         ...learning,
         // Loop contract 0.4 (Batch C, G26) — observability subscriber/exporter
         // controls (crew joins cli/channel/managed).

@@ -976,6 +976,33 @@ export type WireWikiExtras = {
  *     spec promised never vanishes mid-run.
  *   - **null**: no wiki anywhere (no enabled `memory.wiki`, no thredz).
  */
+/**
+ * 0.5.0 — fold a wiki's `recall` into an existing memory seam as a SECOND
+ * ranker, returning a new seam. Extracted verbatim from `wireMemory`'s inline
+ * wiki auto-recall fold so the crew emitter can apply it PER ROLE — each role
+ * recalling from its own Thredz space — without a second copy of this logic
+ * drifting from the one inside `wireMemory`.
+ *
+ * `wiki === null` returns the base untouched, which is the degrade path: a
+ * role whose Thredz connection failed keeps whatever recall it already had.
+ */
+export function foldWikiRecall(
+  base: MemorySeam | undefined,
+  wiki: { readonly recall: (query: string, k: number) => Promise<readonly string[]> } | null,
+  k: number,
+): MemorySeam | undefined {
+  if (wiki === null) return base;
+  const baseRecall = base?.recall;
+  return {
+    ...(base ?? {}),
+    autoRecall: true,
+    recall: async (query, requestedK) => {
+      const factLines = baseRecall !== undefined ? await baseRecall(query, requestedK) : [];
+      return [...factLines, ...(await wiki.recall(query, k))];
+    },
+  };
+}
+
 export function wireWiki(
   fragment: Pick<MemoryWiringFragment, "specName" | "memory" | "thredz">,
   deps: WireMemoryDeps,

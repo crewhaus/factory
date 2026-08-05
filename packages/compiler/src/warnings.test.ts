@@ -128,7 +128,7 @@ describe("compile() warnings — ACCEPTED_BUT_UNWIRED table", () => {
     expect(paths(bt.warnings)).toEqual(["continuity"]);
   });
 
-  test("thredz warns on research/crew only (channel/managed now emit-WIRED, G23)", () => {
+  test("thredz warns on research only (cli/channel/managed/crew emit-WIRED)", () => {
     // Batch E (G23) — channel + managed port the cli connectThredz fragment,
     // so thredz no longer warns there; research + crew stay carried-with-note.
     const channel = compile(
@@ -189,7 +189,10 @@ describe("compile() warnings — ACCEPTED_BUT_UNWIRED table", () => {
         "thredz: $THREDZ_API_KEY",
       ].join("\n"),
     );
-    expect(paths(crew.warnings)).toEqual(["thredz"]);
+    // 0.5.0 — crew thredz is emit-WIRED too (with the per-role fan-out), so
+    // its ACCEPTED_BUT_UNWIRED row is DELETED rather than silenced. research
+    // is now the only shape that still carries the block with an ignored-note.
+    expect(crew.warnings).toEqual([]);
     // cli thredz is emit-WIRED — no warning.
     const cli = compile(
       "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nthredz: $THREDZ_API_KEY",

@@ -628,7 +628,16 @@ export function memoryIntegrityPass(ir: IrNode): IrNode {
   // load-bearing cross-field check): the local one enabled, or thredz.
   if (learning !== undefined) {
     const wikiOn = memory?.wiki !== undefined && memory.wiki.enabled !== false;
-    if (!wikiOn && ir.thredz === undefined) {
+    // 0.5.0 — a crew in per-role fan-out mode has no TOP-LEVEL thredz block
+    // (every role carries its own key), but every role does have a hosted
+    // wiki. Without this branch such a crew fails the gate with `learning:` on.
+    const roleThredzOn =
+      ir.target === "crew" &&
+      Array.isArray((ir as { roles?: ReadonlyArray<{ thredz?: unknown }> }).roles) &&
+      (ir as { roles: ReadonlyArray<{ thredz?: unknown }> }).roles.some(
+        (r) => r.thredz !== undefined,
+      );
+    if (!wikiOn && ir.thredz === undefined && !roleThredzOn) {
       throw new IrPassError(
         "learning needs a wiki to learn into — carry memory.wiki (enabled) or a thredz block on this IR",
       );

@@ -119,7 +119,14 @@ export type ThredzClient = {
 
 /** A live Thredz connection, as produced by {@link connectThredz} and
  *  consumed by `wireMemory` (`deps.thredz`). */
-export type ThredzConnection = { readonly client: ThredzClient };
+export type ThredzConnection = {
+  readonly client: ThredzClient;
+  /** 0.5.0 — the McpHost key this connection was made under. Carried so the
+   *  recall-failure logs can NAME the server: with N per-role Thredz servers
+   *  in one crew, an undifferentiated `[thredz]` line leaves an operator
+   *  unable to tell which role's key lapsed. */
+  readonly serverName: string;
+};
 
 // ---------------------------------------------------------------------------
 // §4.4 — the one error-mapping choke point
@@ -203,6 +210,14 @@ export type ConnectThredzOptions = {
   readonly agentName?: string;
   /** Status-line sink for `[thredz] …` boot lines. */
   readonly log?: (line: string) => void;
+  /** 0.5.0 — the McpHost key this server was added under. Defaults to
+   *  {@link THREDZ_SERVER_NAME} so cli/channel/managed are untouched; the crew
+   *  shape passes `thredz-<role>` for a role that owns its own key.
+   *
+   *  LOAD-BEARING, and quietly so: `host.getClient` on a name the host does
+   *  not carry THROWS, which this function catches into a `null` return — i.e.
+   *  a wrong name is not a crash but a silent degrade to local files. */
+  readonly serverName?: string;
 };
 
 /**
@@ -220,49 +235,50 @@ export async function connectThredz(
   catalog: ToolCatalog,
   opts: ConnectThredzOptions = {},
 ): Promise<ThredzConnection | null> {
+  const serverName = opts.serverName ?? THREDZ_SERVER_NAME;
   let registration: Awaited<ReturnType<typeof registerMcpToolAliases>>;
   try {
     registration = await registerMcpToolAliases(
       host,
-      THREDZ_SERVER_NAME,
+      serverName,
       catalog,
       THREDZ_ALIAS_TOOL_NAMES,
       {
         perTool: THREDZ_ALIAS_TOOL_FLAGS,
-        onRegister: ({ fullName }) => opts.log?.(`[thredz] registered ${fullName}\n`),
+        onRegister: ({ fullName }) => opts.log?.(`[${serverName}] registered ${fullName}\n`),
       },
     );
   } catch (err) {
     // §4.4 — a boot failure (npx offline, server crash, bad command) is the
     // mcp_boot class and DEGRADES: the harness keeps running on local files.
     opts.log?.(
-      `[thredz] boot failed (mcp_boot): ${firstLine((err as Error).message)} — degraded to the local backend for this run; local stores under .crewhaus/ stay authoritative\n`,
+      `[${serverName}] boot failed (mcp_boot): ${firstLine((err as Error).message)} — degraded to the local backend for this run; local stores under .crewhaus/ stay authoritative\n`,
     );
     return null;
   }
   if (registration.missing.length > 0) {
     opts.log?.(
-      `[thredz] server does not advertise ${registration.missing.join(", ")} — vendored/older server? The wired contract is thredz-mcp v0.2.0\n`,
+      `[${serverName}] server does not advertise ${registration.missing.join(", ")} — vendored/older server? The wired contract is thredz-mcp v0.3.0\n`,
     );
   }
-  const client = host.getClient(THREDZ_SERVER_NAME);
+  const client = host.getClient(serverName);
   if (opts.agentName !== undefined) {
     try {
       const res = await client.callTool("agent_register", { name: opts.agentName });
       if (res.isError) {
         opts.log?.(
-          `[thredz] agent_register "${opts.agentName}" failed (${classifyThredzFailure(res.content)}) — continuing without a registered handle\n`,
+          `[${serverName}] agent_register "${opts.agentName}" failed (${classifyThredzFailure(res.content)}) — continuing without a registered handle\n`,
         );
       } else {
-        opts.log?.(`[thredz] agent handle registered: ${opts.agentName}\n`);
+        opts.log?.(`[${serverName}] agent handle registered: ${opts.agentName}\n`);
       }
     } catch (err) {
       opts.log?.(
-        `[thredz] agent_register "${opts.agentName}" failed (thredz_unavailable): ${firstLine((err as Error).message)} — continuing without a registered handle\n`,
+        `[${serverName}] agent_register "${opts.agentName}" failed (thredz_unavailable): ${firstLine((err as Error).message)} — continuing without a registered handle\n`,
       );
     }
   }
-  return { client };
+  return { client, serverName };
 }
 
 // ---------------------------------------------------------------------------
