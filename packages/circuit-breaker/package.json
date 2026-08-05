@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/circuit-breaker",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "type": "module",
   "description": "Half-open circuit breaker that wraps a ProviderAdapter; refuses to stream while open so callers can route to their next candidate model",
   "main": "src/index.ts",

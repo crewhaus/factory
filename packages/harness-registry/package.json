@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/harness-registry",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "type": "module",
   "description": "Machine-wide harness registry (harnesses.json v2) — stable hrn_ ids, groups/tags/pins, scan roots, missing-dir stamping, and watchme registry interop behind the harness manager",
   "main": "src/index.ts",

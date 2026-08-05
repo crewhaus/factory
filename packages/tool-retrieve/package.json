@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-retrieve",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "type": "module",
   "description": "Retrieve(query, k?, filter?) tool — composes embedder + vector-store",
   "main": "src/index.ts",

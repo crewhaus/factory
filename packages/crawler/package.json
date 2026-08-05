@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/crawler",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "type": "module",
   "description": "Citation-tracker-backed crawler — HTTP fetch + file:// reads with URL-dedup, rate limiting (Section 23 RES)",
   "main": "src/index.ts",
