@@ -25,7 +25,7 @@
  *                              # bounded transcript digest — trajectory judging)
  *       temperature: 0         # judge decoding pin, 0..1 (default 0)
  *       repeats: 3             # odd judge panel; median score wins (default 1)
- *       judges: [claude-sonnet-4-5, openai/gpt-4o]  # A2 multi-model panel —
+ *       judges: [claude-sonnet-5, openai/gpt-4o]  # A2 multi-model panel —
  *                              # overrides model:; median score, majority pass,
  *                              # vote entropy; repeats then apply per panelist
  *       weight: 3              # any grader may declare a positive weight (default 1)

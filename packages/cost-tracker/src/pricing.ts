@@ -55,23 +55,43 @@ export type PricingTable = {
  * more-specific row covers.
  *
  * Anthropic pricing note (2026-07): current Anthropic prices come from the
- * `claude-api` skill — Opus 4.5+ is $5/$25 (the `claude-opus-4-8` row and the
- * `claude-opus` fallback), Sonnet is $3/$15, Haiku is $1/$5, Fable is $10/$50.
- * The pre-existing `claude-opus-4-7`/`4-6` and the `claude-opus-4` base are
- * kept at their original $15/$75 (they also price the genuinely-legacy Opus
- * 4.0/4.1 lineage the base catches) so historical audit-log re-aggregation
- * against a pinned older table is unchanged and the wide cross-package test
- * fixtures that key on that rate stay stable.
+ * `claude-api` skill — Opus 4.5+ is $5/$25, Sonnet is $3/$15, Haiku is $1/$5,
+ * Fable/Mythos is $10/$50. Every current family is spelled out rather than left
+ * to a fallback so each rate is greppable, and because the bedrock table's
+ * fallbacks were added late: an id no row covered there matched NOTHING and
+ * billed $0 rather than merely mispricing.
+ *
+ * `claude-opus-4-7`/`4-6` previously sat at $15/$75. That contradicted the
+ * "Opus 4.5+ is $5/$25" rule one paragraph up, and two independent public
+ * datasets plus the `claude-api` skill agree the real rate is $5/$25 — so the
+ * table was overcharging 3x on two current models. The `claude-opus-4` base
+ * stays $15/$75 because what it catches now is the genuinely-legacy 4.0/4.1
+ * lineage, which really did cost that. Historical re-aggregation is unaffected:
+ * that guarantee comes from table `version` pinning, not from freezing rows in
+ * the current table.
+ *
+ * KEEPING THIS HONEST — `scripts/pricing-audit.ts` pins a golden for every
+ * current model and fails the build if a row drifts from it, if a capabilities
+ * key has no price, or if the table ages past 120 days.
+ * `scripts/pricing-refresh.ts` diffs the table against two independent public
+ * datasets and reports; it never writes. Update a price and its golden in the
+ * same commit.
  */
 export const DEFAULT_PRICING: PricingTable = {
-  version: "2026-07-14",
+  version: "2026-07-31",
   providers: {
     anthropic: {
       // Current generation (2026-07). Opus 4.5+ dropped to $5/$25.
+      "claude-opus-5": { inputPer1M: 5.0, outputPer1M: 25.0 },
       "claude-opus-4-8": { inputPer1M: 5.0, outputPer1M: 25.0 },
       // Kept at the original Opus rate — see the header note.
-      "claude-opus-4-7": { inputPer1M: 15.0, outputPer1M: 75.0 },
-      "claude-opus-4-6": { inputPer1M: 15.0, outputPer1M: 75.0 },
+      "claude-opus-4-7": { inputPer1M: 5.0, outputPer1M: 25.0 },
+      "claude-opus-4-6": { inputPer1M: 5.0, outputPer1M: 25.0 },
+      // Opus 4.5 is $5/$25 (the header's "Opus 4.5+" line). Without this row it
+      // fell through to the `claude-opus-4` legacy base and billed $15/$75 — a
+      // 3x overcharge on a current model. The base below stays $15/$75 because
+      // what it now catches is the genuinely-legacy 4.0/4.1 lineage.
+      "claude-opus-4-5": { inputPer1M: 5.0, outputPer1M: 25.0 },
       "claude-opus-4": { inputPer1M: 15.0, outputPer1M: 75.0 },
       "claude-sonnet-5": { inputPer1M: 3.0, outputPer1M: 15.0 },
       "claude-sonnet-4-6": { inputPer1M: 3.0, outputPer1M: 15.0 },
@@ -79,8 +99,12 @@ export const DEFAULT_PRICING: PricingTable = {
       "claude-sonnet-4": { inputPer1M: 3.0, outputPer1M: 15.0 },
       "claude-haiku-4-5": { inputPer1M: 1.0, outputPer1M: 5.0 },
       "claude-haiku-4": { inputPer1M: 1.0, outputPer1M: 5.0 },
-      // Fable 5: Anthropic's most capable widely-released model.
+      // Fable 5: Anthropic's most capable widely-released model. Mythos 5
+      // (Project Glasswing) is the same capabilities and the same $10/$50; it
+      // is invitation-only so it appears in no public dataset — sourced from
+      // the bundled `claude-api` skill, not from a price feed.
       "claude-fable-5": { inputPer1M: 10.0, outputPer1M: 50.0 },
+      "claude-mythos-5": { inputPer1M: 10.0, outputPer1M: 50.0 },
       "claude-3-7-sonnet": { inputPer1M: 3.0, outputPer1M: 15.0 },
       "claude-3-5-haiku": { inputPer1M: 0.8, outputPer1M: 4.0 },
       // Bare-family fallbacks at the current-generation rate so a next-major
@@ -90,6 +114,7 @@ export const DEFAULT_PRICING: PricingTable = {
       "claude-sonnet": { inputPer1M: 3.0, outputPer1M: 15.0 },
       "claude-haiku": { inputPer1M: 1.0, outputPer1M: 5.0 },
       "claude-fable": { inputPer1M: 10.0, outputPer1M: 50.0 },
+      "claude-mythos": { inputPer1M: 10.0, outputPer1M: 50.0 },
     },
     openai: {
       // OpenAI's automatic prompt caching charges no write premium — cached
@@ -138,25 +163,55 @@ export const DEFAULT_PRICING: PricingTable = {
         cacheWritePer1M: 0.25,
       },
       o1: { inputPer1M: 15.0, outputPer1M: 60.0 },
+      // `o3`/`o4-mini` previously had no row at all and billed $0. Both
+      // cross-checked against two independent datasets (2026-07-31).
+      o3: { inputPer1M: 2.0, outputPer1M: 8.0 },
       "o3-mini": { inputPer1M: 1.1, outputPer1M: 4.4 },
+      "o4-mini": { inputPer1M: 1.1, outputPer1M: 4.4 },
     },
     gemini: {
-      // Gemini 3 Pro (current, 2026-07); standard-context tier, best-known
-      // public pricing.
+      // Standard-context tier. The Gemini Developer API and Vertex publish the
+      // same per-token rates for these text models, so one table serves both
+      // paths the adapter can take. Every row below was cross-checked against
+      // two independent datasets on 2026-07-31 unless noted.
       "gemini-3-pro": { inputPer1M: 2.0, outputPer1M: 12.0 },
-      "gemini-2.5-pro": { inputPer1M: 1.25, outputPer1M: 5.0 },
-      "gemini-2.5-flash": { inputPer1M: 0.15, outputPer1M: 0.6 },
+      "gemini-3.6-flash": { inputPer1M: 1.5, outputPer1M: 7.5 },
+      "gemini-3.5-flash": { inputPer1M: 1.5, outputPer1M: 9.0 },
+      "gemini-3.1-flash-lite": { inputPer1M: 0.25, outputPer1M: 1.5 },
+      "gemini-2.5-pro": { inputPer1M: 1.25, outputPer1M: 10.0 },
+      // 2.5-flash-lite must precede nothing in particular (longest-prefix
+      // wins), but it needs its OWN row: without it, it inherited 2.5-flash
+      // and billed 1.5x input / 6.25x output.
+      "gemini-2.5-flash-lite": { inputPer1M: 0.1, outputPer1M: 0.4 },
+      "gemini-2.5-flash": { inputPer1M: 0.3, outputPer1M: 2.5 },
       "gemini-2.0-flash": { inputPer1M: 0.1, outputPer1M: 0.4 },
+      // Retired generation — no longer in any current price feed; kept so
+      // historical audit-log re-aggregation still resolves.
       "gemini-1.5-pro": { inputPer1M: 1.25, outputPer1M: 5.0 },
       "gemini-1.5-flash": { inputPer1M: 0.075, outputPer1M: 0.3 },
     },
     bedrock: {
       // Current-generation Anthropic-on-Bedrock at first-party rates, so a
       // current model no longer inherits the legacy $15/$75 base.
+      "anthropic.claude-opus-5": { inputPer1M: 5.0, outputPer1M: 25.0 },
       "anthropic.claude-opus-4-8": { inputPer1M: 5.0, outputPer1M: 25.0 },
+      // Same 4.5-falls-to-legacy-base trap as the first-party table.
+      "anthropic.claude-opus-4-5": { inputPer1M: 5.0, outputPer1M: 25.0 },
       "anthropic.claude-sonnet-5": { inputPer1M: 3.0, outputPer1M: 15.0 },
+      "anthropic.claude-haiku-4-5": { inputPer1M: 1.0, outputPer1M: 5.0 },
+      "anthropic.claude-fable-5": { inputPer1M: 10.0, outputPer1M: 50.0 },
       "anthropic.claude-opus-4": { inputPer1M: 15.0, outputPer1M: 75.0 },
       "anthropic.claude-sonnet-4": { inputPer1M: 3.0, outputPer1M: 15.0 },
+      // Bare-family fallbacks, mirroring the anthropic table. Their absence is
+      // why bedrock was the worse half: with no catch-all, an id one row did
+      // not spell out (`anthropic.claude-haiku-4-5`, `…fable-5`, any next
+      // major) matched NOTHING and billed $0 instead of merely mispricing.
+      // Kept last; the version-specific and major-base rows above win on
+      // longest-prefix.
+      "anthropic.claude-opus": { inputPer1M: 5.0, outputPer1M: 25.0 },
+      "anthropic.claude-sonnet": { inputPer1M: 3.0, outputPer1M: 15.0 },
+      "anthropic.claude-haiku": { inputPer1M: 1.0, outputPer1M: 5.0 },
+      "anthropic.claude-fable": { inputPer1M: 10.0, outputPer1M: 50.0 },
       "meta.llama3-1-70b": { inputPer1M: 0.99, outputPer1M: 0.99 },
       "meta.llama3-1-8b": { inputPer1M: 0.22, outputPer1M: 0.22 },
       "mistral.mistral-large": { inputPer1M: 4.0, outputPer1M: 12.0 },

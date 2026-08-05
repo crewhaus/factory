@@ -60,8 +60,10 @@ export {
 export {
   classifyPricingStaleness,
   findSunset,
+  KNOWN_PROVIDERS,
   KNOWN_SUNSETS,
   parsePricingFeed,
+  type ParsePricingFeedOptions,
   pickNewestPricing,
   pricingTableAgeDays,
   PricingFeedError,

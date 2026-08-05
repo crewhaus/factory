@@ -1,0 +1,107 @@
+name: Pricing drift
+
+# Keeps `DEFAULT_PRICING` honest against the outside world.
+#
+# The failure mode this exists to stop is silent, in both directions:
+#   - a model with no matching row is a pricing MISS, and cost-tracker charges
+#     $0 for it rather than throwing (deliberately — an unmapped id must not
+#     crash an in-flight run). Nothing surfaces it.
+#   - a model that falls through to a legacy family base bills at the legacy
+#     rate. Opus 4.5 inheriting the `claude-opus-4` base billed $15/$75 against
+#     a real $5/$25 for as long as anyone had been looking.
+#
+# Two jobs, deliberately split by whether they touch the network:
+#
+#   audit   — hermetic. Zero network, zero secrets. Also runs on every PR via
+#             `bun test scripts` (root package.json), so this scheduled copy
+#             exists only to catch the one check the test suite cannot hold:
+#             wall-clock freshness. `feed.test.ts` pins fixed clocks on purpose
+#             so the suite never reddens as time passes, which is correct there
+#             and is exactly why staleness needs a scheduled home.
+#
+#   refresh — fetches two INDEPENDENT public datasets and reports drift. It is
+#             allowed to fail without failing the workflow (`continue-on-error`)
+#             because an upstream outage or schema change is not a reason to
+#             page anyone about our own table. It never writes: it proposes, a
+#             human disposes. Auto-applying was rejected outright — during
+#             development a naive prefix match reported the *correct*
+#             `mistral.mistral-large` row as 2x drift by matching a different
+#             variant, and auto-apply would have corrupted a good row.
+#
+# Monthly, not daily: this table moves a handful of times a year, and the
+# failure mode of a review-gated mechanism is a reviewer who has learned to
+# rubber-stamp. `workflow_dispatch` covers launch days, when a human already
+# knows a model shipped.
+#
+# SECURITY: no untrusted event input is read anywhere in this workflow (no
+# issue/PR titles or bodies, no head_ref). The single expression that reaches a
+# `run:` block is passed via `env:` and quoted, per the workflow-injection
+# guidance already followed in release.yml and no-private-links.yml.
+on:
+  schedule:
+    # 06:23 UTC on the 1st — off the top of the hour to dodge the cron rush.
+    - cron: "23 6 1 * *"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    # Forks have neither the schedule nor a reason to run this.
+    if: ${{ github.repository == 'crewhaus/factory' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ">=1.2.0"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      # Wall-clock freshness lives here and only here.
+      - name: Audit pricing tables
+        run: bun scripts/pricing-audit.ts
+
+  refresh:
+    runs-on: ubuntu-latest
+    if: ${{ github.repository == 'crewhaus/factory' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ">=1.2.0"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      # Needs no credentials: both datasets are public and unauthenticated.
+      # Exit 1 = drift worth a human's attention; exit 2 = fetch failed.
+      # Neither should redden the run — see the header.
+      - name: Check pricing against upstream datasets
+        id: drift
+        continue-on-error: true
+        run: bun scripts/pricing-refresh.ts | tee pricing-drift.txt
+      - name: Upload drift report
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: pricing-drift-report
+          path: pricing-drift.txt
+          if-no-files-found: warn
+      - name: Summarize
+        env:
+          DRIFT_OUTCOME: ${{ steps.drift.outcome }}
+        run: |
+          {
+            echo "## Pricing drift"
+            echo
+            echo "Refresh step outcome: \`${DRIFT_OUTCOME}\`"
+            echo
+            echo '```'
+            cat pricing-drift.txt || echo "(no report produced)"
+            echo '```'
+            echo
+            echo "Nothing was changed automatically. To accept a price: update the row in"
+            echo "\`packages/cost-tracker/src/pricing.ts\` AND its golden in"
+            echo "\`scripts/pricing-audit.ts\`, in the same commit, and bump \`VERIFIED_ON\`."
+          } >> "$GITHUB_STEP_SUMMARY"
