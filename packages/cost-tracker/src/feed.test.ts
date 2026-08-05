@@ -10,18 +10,58 @@ import {
   pickNewestPricing,
   pricingTableAgeDays,
 } from "./feed";
-import { DEFAULT_PRICING } from "./pricing";
+import { DEFAULT_PRICING, resolvePricing } from "./pricing";
+
+/** A feed covering every provider — the only shape accepted by default. */
+const completeFeed = (version = "2026-07-01") => ({
+  version,
+  providers: {
+    anthropic: { "claude-opus-4": { inputPer1M: 12, outputPer1M: 60 } },
+    openai: { "gpt-4o": { inputPer1M: 2.5, outputPer1M: 10 } },
+    gemini: { "gemini-2.5-pro": { inputPer1M: 1.25, outputPer1M: 10 } },
+    bedrock: { "anthropic.claude-opus-5": { inputPer1M: 5, outputPer1M: 25 } },
+  },
+});
 
 describe("parsePricingFeed", () => {
   test("accepts a well-formed feed", () => {
-    const table = parsePricingFeed(
-      JSON.stringify({
-        version: "2026-07-01",
-        providers: { anthropic: { "claude-opus-4": { inputPer1M: 12, outputPer1M: 60 } } },
-      }),
-    );
+    const table = parsePricingFeed(JSON.stringify(completeFeed()));
     expect(table.version).toBe("2026-07-01");
     expect(table.providers.anthropic?.["claude-opus-4"]?.inputPer1M).toBe(12);
+  });
+
+  test("rejects a feed that omits a provider (it would price that provider at $0)", () => {
+    // A feed REPLACES the effective table, so a provider absent from the feed
+    // has no rows at all — every one of its models becomes a pricing miss,
+    // which cost-tracker charges at $0.
+    const partial = completeFeed();
+    (partial.providers as Record<string, unknown>)["gemini"] = {};
+    expect(() => parsePricingFeed(JSON.stringify(partial))).toThrow(/incomplete/);
+  });
+
+  test("rejects the empty-providers feed that silently zeroed the whole table", () => {
+    // Regression: `{"version":"2099-01-01","providers":{}}` parsed clean, won
+    // pickNewestPricing on version, and turned EVERY model into a $0 miss.
+    // One file dropped into ~/.crewhaus/pricing/ was enough to zero all billing.
+    const evil = JSON.stringify({ version: "2099-01-01", providers: {} });
+    expect(() => parsePricingFeed(evil)).toThrow(PricingFeedError);
+
+    // Closed end-to-end, not merely at the parser boundary.
+    let zeroed = false;
+    try {
+      const table = parsePricingFeed(evil);
+      const winner = pickNewestPricing([DEFAULT_PRICING, table]);
+      zeroed = resolvePricing(winner, "anthropic", "claude-opus-5") === undefined;
+    } catch {
+      zeroed = false;
+    }
+    expect(zeroed).toBe(false);
+  });
+
+  test("partial:true opts a caller into an incomplete feed deliberately", () => {
+    const partial = { version: "2026-07-01", providers: { anthropic: {} } };
+    expect(() => parsePricingFeed(JSON.stringify(partial))).toThrow(/incomplete/);
+    expect(parsePricingFeed(JSON.stringify(partial), { partial: true }).version).toBe("2026-07-01");
   });
 
   test("rejects non-JSON", () => {

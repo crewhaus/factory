@@ -95,7 +95,7 @@ const CLASSIFIER_RUBRICS: Record<JudgeClassifierKind, CategoricalRubric> = {
 
 /**
  * Build the judge-backed {@link Classifier}. `modelSpec` is any
- * model-router spec (e.g. "openai/gpt-4o-mini", "claude-sonnet-4-5");
+ * model-router spec (e.g. "openai/gpt-4o-mini", "claude-sonnet-5");
  * `adapter` injects a pre-built ProviderAdapter (tests / programmatic
  * callers) exactly like every other judge entrypoint.
  *

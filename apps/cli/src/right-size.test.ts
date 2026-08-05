@@ -90,7 +90,10 @@ describe("projectCostUsd", () => {
 describe("buildRightSizeReport", () => {
   const baseline: BaselineEvalOutcome = {
     passRate: 0.9,
-    model: "claude-opus-4-7",
+    // This block resolves against DEFAULT_PRICING (no pricing seam is passed),
+    // so it needs a model whose rate is stable. `claude-opus-4` is the legacy
+    // base and genuinely costs $15/$75; the current Opus line is $5/$25.
+    model: "claude-opus-4",
     tokens: { input: 100_000, output: 100_000 }, // 15*0.1 + 75*0.1 = 9 USD
   };
 

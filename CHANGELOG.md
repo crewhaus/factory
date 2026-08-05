@@ -210,6 +210,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real permission in the ACL), and a fixture path fell back to `/tmp` when
   `TMPDIR` was unset, which is every Windows machine.
 
+- **`scripts/pricing-audit.ts` — a hermetic guard that runs on every PR.** Zero
+  network, zero secrets; picked up by the existing `bun test scripts` half of
+  the root test script, so no CI change was needed. Checks golden prices for
+  every shipping model, bare-family fallback coverage (including a next-major
+  probe), capabilities/pricing coherence, sunset-replacement resolvability, and
+  table freshness. Wall-clock freshness runs only from the CLI — `feed.test.ts`
+  pins fixed clocks on purpose so the suite never reddens with time, which is
+  why staleness needed a separate home.
+
+- **`scripts/pricing-refresh.ts` — proposes, never applies.** Diffs the table
+  against two independent public datasets (LiteLLM and OpenRouter, both public
+  and unauthenticated, so CI needs no credentials). Two rules, both paid for
+  empirically: two sources must agree, because LiteLLM alone lists
+  `gemini-1.5-flash` at an output cost of exactly 0 and auto-applying would have
+  zeroed a live row; and matching is EXACT-key only, because a naive prefix scan
+  reported the *correct* `mistral.mistral-large` row as 2x drift by matching a
+  different variant — AWS's own price list confirmed the committed value was
+  right. Unmatched rows are surfaced for a human rather than resolved to a
+  neighbour.
+
+- **`.github/workflows/pricing-drift.yml`** — monthly (plus `workflow_dispatch`
+  for launch days), fork-guarded. The hermetic audit fails the job; the fetching
+  half is `continue-on-error`, because an upstream outage is not a reason to page
+  anyone about our own table. Nothing is auto-committed.
+
 ### Changed
 
 - **The `fleet` and `doctor`/`channel` cores are consumed from the new
@@ -299,6 +324,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   docstring used to promise, because `teardownCloud` has to find what
   `deployCloud` wrote — a fresh `mkdtemp` per call would break teardown. The
   docstring now says what the code does.
+
+- **A pricing feed missing a provider silently zeroed that provider's billing —
+  and an empty one zeroed everything.** A feed REPLACES the effective table
+  (`pickNewestPricing` selects by version and deliberately does not merge, so a
+  pinned historical table stays reproducible), but nothing checked that a feed
+  actually covered the providers it was replacing. A document as small as
+  `{"version":"2099-01-01","providers":{}}` parsed clean, won on version, and
+  turned every model into a pricing miss — which `cost-tracker` charges at $0.
+  One file in `~/.crewhaus/pricing/` was enough to zero all billing.
+  `parsePricingFeed` now requires every known provider to carry at least one
+  row, with `{ partial: true }` for callers that merge themselves. Rejecting
+  rather than merging over `DEFAULT_PRICING` keeps the determinism contract
+  intact.
+
+- **Sixteen currently-shipping model ids billed $0, and three billed the wrong
+  rate.** The bedrock table had no bare-family fallbacks, so an id no row spelled
+  out matched *nothing* there (`anthropic.claude-haiku-4-5`,
+  `anthropic.claude-fable-5`, any next major) rather than merely mispricing;
+  `claude-mythos-5`, `o3`, `o4-mini` and the Gemini 3.x line had no rows at all.
+  Separately, `claude-opus-4-5` fell through to the `claude-opus-4` legacy base
+  and billed $15/$75 against a real $5/$25 — a 3x overcharge that coverage and
+  freshness checks both pass. Bedrock now mirrors the first-party fallback
+  convention, and every current family has an explicit row.
+
+- **Two Gemini rows were materially wrong**, both undercharging:
+  `gemini-2.5-pro` carried a $5 output rate against a real $10, and
+  `gemini-2.5-flash` $0.15/$0.60 against $0.30/$2.50. `gemini-2.5-flash-lite`
+  inherited the (wrong) flash row instead of its own $0.10/$0.40.
+
+- **`claude-opus-4-7`/`4-6` corrected to $5/$25** from $15/$75. The old value
+  contradicted the same file's "Opus 4.5+ is $5/$25" rule, and two independent
+  public datasets plus the bundled `claude-api` reference agree. The
+  `claude-opus-4` base stays $15/$75 — what it catches now is the genuinely
+  legacy 4.0/4.1 lineage, which really did cost that. Historical re-aggregation
+  is unaffected: that guarantee comes from `version` pinning, not from freezing
+  rows in the current table. Fixtures that used a current Opus purely as an
+  "expensive model" now name `claude-opus-4` explicitly.
+
+- **`bedrock/meta.llama3-1` had capabilities but no resolvable price.** Both
+  pricing keys (`…-70b`, `…-8b`) are longer, so longest-prefix matching never
+  reached them and anything enumerated at that key priced at $0. The capability
+  key is now split to match pricing granularity.
 
 ### Removed
 

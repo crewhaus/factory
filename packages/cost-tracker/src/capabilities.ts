@@ -242,6 +242,13 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
       // Transcribes adapter-bedrock featuresForFamily(): anthropic on Bedrock
       // keeps explicit caching + thinking; llama/mistral are tools-only;
       // nova adds vision.
+      "anthropic.claude-opus-5": {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: false,
+      },
       "anthropic.claude-opus-4-8": {
         caching: "explicit",
         tool_use: true,
@@ -270,7 +277,20 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         thinking: true,
         web_search: false,
       },
-      "meta.llama3-1": {
+      // Split to match the pricing table's granularity. As a single
+      // `meta.llama3-1` family base this key resolved to NO pricing row —
+      // both pricing keys (`…-70b`, `…-8b`) are longer, so longest-prefix
+      // matching never reached them — and any candidate enumerated here
+      // priced at $0. Capabilities are identical across the two sizes; only
+      // the price differs.
+      "meta.llama3-1-70b": {
+        caching: false,
+        tool_use: true,
+        vision: false,
+        thinking: false,
+        web_search: false,
+      },
+      "meta.llama3-1-8b": {
         caching: false,
         tool_use: true,
         vision: false,

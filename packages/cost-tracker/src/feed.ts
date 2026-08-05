@@ -20,7 +20,18 @@ export class PricingFeedError extends Error {
   override readonly name = "PricingFeedError";
 }
 
-const KNOWN_PROVIDERS = ["anthropic", "openai", "gemini", "bedrock"] as const;
+export const KNOWN_PROVIDERS = ["anthropic", "openai", "gemini", "bedrock"] as const;
+
+/** Options for {@link parsePricingFeed}. */
+export type ParsePricingFeedOptions = {
+  /**
+   * Accept a feed that does not cover every provider in
+   * {@link KNOWN_PROVIDERS}. Default `false` — see the completeness gate note
+   * on {@link parsePricingFeed}. Only pass `true` when the caller is going to
+   * merge the result into a complete table itself.
+   */
+  readonly partial?: boolean;
+};
 
 function isRow(v: unknown): v is PricingRow {
   if (typeof v !== "object" || v === null) return false;
@@ -32,8 +43,26 @@ function isRow(v: unknown): v is PricingRow {
   return true;
 }
 
-/** Parse + structurally validate a feed JSON document. */
-export function parsePricingFeed(json: string): PricingTable {
+/**
+ * Parse + structurally validate a feed JSON document.
+ *
+ * COMPLETENESS GATE — a feed REPLACES the effective table wholesale
+ * (`pickNewestPricing` picks one table by version; it deliberately does not
+ * merge, so a pinned historical table stays byte-reproducible). That makes an
+ * under-populated feed a silent, total billing regression rather than a
+ * partial one: a document as small as `{"version":"2099-01-01","providers":{}}`
+ * used to parse clean, win on version, and turn EVERY model into a pricing
+ * miss — which `cost-tracker` charges at $0. A feed naming only one provider
+ * zeroed the other three the same way.
+ *
+ * So a feed must carry every provider in {@link KNOWN_PROVIDERS}, each with at
+ * least one row, unless the caller explicitly opts into `{ partial: true }`
+ * and takes responsibility for merging. Rejecting is the right lever rather
+ * than merging over `DEFAULT_PRICING`: merging would silently blend the
+ * built-in table into a feed pinned for historical re-aggregation and break
+ * the determinism contract this module exists to uphold.
+ */
+export function parsePricingFeed(json: string, opts: ParsePricingFeedOptions = {}): PricingTable {
   let doc: unknown;
   try {
     doc = JSON.parse(json);
@@ -70,6 +99,17 @@ export function parsePricingFeed(json: string): PricingTable {
           `pricing feed: ${provider}/"${modelPrefix}" is not a valid pricing row (needs numeric inputPer1M + outputPer1M)`,
         );
       }
+    }
+  }
+  if (opts.partial !== true) {
+    const missing = KNOWN_PROVIDERS.filter((p) => {
+      const t = providers[p];
+      return typeof t !== "object" || t === null || Object.keys(t).length === 0;
+    });
+    if (missing.length > 0) {
+      throw new PricingFeedError(
+        `pricing feed is incomplete: no rows for ${missing.join("/")}. A feed REPLACES the effective pricing table, so an absent provider prices every one of its models at $0. Supply rows for all of ${KNOWN_PROVIDERS.join("/")}.`,
+      );
     }
   }
   return doc as PricingTable;

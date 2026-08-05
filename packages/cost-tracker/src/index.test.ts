@@ -61,20 +61,51 @@ function modelResponse(
 
 describe("cost-tracker — T1 pricing table", () => {
   test("resolvePricing matches family-base prefix for versioned model id", () => {
-    const row = resolvePricing(DEFAULT_PRICING, "anthropic", "claude-opus-4-7");
+    // `claude-opus-4-1` has no row of its own, so this exercises the
+    // `claude-opus-4` legacy base — which is what the test is actually about.
+    // (It deliberately does NOT use a current Opus: those carry explicit rows
+    // now, so they would exercise exact matching, not family-base fallthrough.)
+    const row = resolvePricing(DEFAULT_PRICING, "anthropic", "claude-opus-4-1");
     expect(row?.inputPer1M).toBe(15.0);
     expect(row?.outputPer1M).toBe(75.0);
   });
 
   test("resolvePricing uses longest matching prefix for nested model families", () => {
+    // A suffixed 4.7 id must reach the `claude-opus-4-7` row ($5/$25), not the
+    // shorter `claude-opus-4` legacy base ($15/$75).
     const opus = resolvePricing(DEFAULT_PRICING, "anthropic", "claude-opus-4-7-extended");
-    expect(opus?.inputPer1M).toBe(15.0);
+    expect(opus?.inputPer1M).toBe(5.0);
     const sonnet = resolvePricing(DEFAULT_PRICING, "anthropic", "claude-sonnet-4-5");
     expect(sonnet?.inputPer1M).toBe(3.0);
   });
 
   test("resolvePricing returns undefined for unknown provider", () => {
     expect(resolvePricing(DEFAULT_PRICING, "openai", "gpt-not-a-real-model")).toBeUndefined();
+  });
+
+  test("claude-opus-5 prices at $5/$25 on both anthropic and bedrock", () => {
+    // Regression: the bedrock table has no bare-family fallback rows, so
+    // `anthropic.claude-opus-5` matched nothing — `anthropic.claude-opus-4` is
+    // not a prefix of it — and the current flagship silently priced at $0 on
+    // Bedrock. First-party resolved correctly via the `claude-opus` fallback;
+    // both now carry an explicit row.
+    const firstParty = resolvePricing(DEFAULT_PRICING, "anthropic", "claude-opus-5");
+    expect(firstParty?.inputPer1M).toBe(5.0);
+    expect(firstParty?.outputPer1M).toBe(25.0);
+
+    const bedrock = resolvePricing(DEFAULT_PRICING, "bedrock", "anthropic.claude-opus-5");
+    expect(bedrock?.inputPer1M).toBe(5.0);
+    expect(bedrock?.outputPer1M).toBe(25.0);
+
+    // Geo-prefixed inference profile resolves the same way.
+    expect(
+      resolvePricing(DEFAULT_PRICING, "bedrock", "us.anthropic.claude-opus-5")?.inputPer1M,
+    ).toBe(5.0);
+
+    // The explicit row must not shadow the legacy Opus 4 base.
+    expect(
+      resolvePricing(DEFAULT_PRICING, "bedrock", "anthropic.claude-opus-4-7")?.inputPer1M,
+    ).toBe(15.0);
   });
 
   test("resolvePricing strips Bedrock cross-region inference-profile prefixes", () => {
@@ -176,7 +207,7 @@ describe("cost-tracker — T3 trace bus integration", () => {
     const tracker = createCostTracker(bus);
     bus.publish(
       modelResponse(bus, {
-        model: "claude-opus-4-7",
+        model: "claude-opus-4",
         provider: "anthropic",
         inputTokens: 1000,
         outputTokens: 500,
@@ -184,7 +215,7 @@ describe("cost-tracker — T3 trace bus integration", () => {
     );
     bus.publish(
       modelResponse(bus, {
-        model: "claude-opus-4-7",
+        model: "claude-opus-4",
         provider: "anthropic",
         inputTokens: 200,
         outputTokens: 100,
@@ -192,7 +223,7 @@ describe("cost-tracker — T3 trace bus integration", () => {
     );
     bus.publish(
       modelResponse(bus, {
-        model: "claude-opus-4-7",
+        model: "claude-opus-4",
         provider: "anthropic",
         inputTokens: 50,
         outputTokens: 25,
@@ -425,7 +456,7 @@ describe("cost-tracker — T3 trace bus integration", () => {
     const tracker = createCostTracker(bus, { tenantId: "tenant-alpha" });
     bus.publish(
       modelResponse(bus, {
-        model: "claude-opus-4-7",
+        model: "claude-opus-4",
         provider: "anthropic",
         inputTokens: 1000,
         outputTokens: 1000,
@@ -442,7 +473,7 @@ describe("cost-tracker — T3 trace bus integration", () => {
       ...bus.envelope(),
       runId: bus.runId,
       kind: "model_response",
-      model: "claude-opus-4-7",
+      model: "claude-opus-4",
       stopReason: "end_turn",
       usage: { input: 100, output: 100 },
       durationMs: 50,
@@ -457,7 +488,7 @@ describe("cost-tracker — T3 trace bus integration", () => {
     const tracker = createCostTracker(bus);
     bus.publish(
       modelResponse(bus, {
-        model: "claude-opus-4-7",
+        model: "claude-opus-4",
         provider: "anthropic",
         inputTokens: 100,
         outputTokens: 100,
@@ -467,7 +498,7 @@ describe("cost-tracker — T3 trace bus integration", () => {
     tracker.unsubscribe();
     bus.publish(
       modelResponse(bus, {
-        model: "claude-opus-4-7",
+        model: "claude-opus-4",
         provider: "anthropic",
         inputTokens: 100,
         outputTokens: 100,
@@ -485,7 +516,7 @@ describe("cost-tracker — T3 trace bus integration", () => {
     const tracker = createCostTracker(bus, { suppressEvents: true });
     bus.publish(
       modelResponse(bus, {
-        model: "claude-opus-4-7",
+        model: "claude-opus-4",
         provider: "anthropic",
         inputTokens: 100,
         outputTokens: 100,
