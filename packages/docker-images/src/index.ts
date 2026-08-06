@@ -1,6 +1,9 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
 /**
  * Section 32 — `@crewhaus/docker-images`
  *
@@ -27,6 +30,7 @@ import { fileURLToPath } from "node:url";
  *     the lockfile would hand users an unpullable pin.
  */
 import { CrewhausError } from "@crewhaus/errors";
+import { DOCKERFILE_BODIES } from "./embedded";
 
 export class DockerImagesError extends CrewhausError {
   override readonly name = "DockerImagesError";
@@ -78,20 +82,33 @@ export function dockerfilePath(target: TargetShape): string {
   return join(DOCKER_ROOT, target, "Dockerfile");
 }
 
+/**
+ * The Dockerfile body for a shape, served from {@link DOCKERFILE_BODIES}.
+ *
+ * Reading it from disk broke `build-image` on both published channels — under
+ * `/$bunfs` in the compiled binary and against an npm tarball that omitted
+ * `docker/`. See `embedded.ts`. {@link dockerfilePath} still returns a real
+ * path for the build CONTEXT and for humans; only the body comes from the
+ * embedded map.
+ */
 export function readDockerfile(target: TargetShape): string {
-  const path = dockerfilePath(target);
-  if (!existsSync(path)) {
-    throw new DockerImagesError(`dockerfile missing for target ${target} (expected at ${path})`);
+  const body = DOCKERFILE_BODIES[target];
+  if (body === undefined) {
+    throw new DockerImagesError(
+      `dockerfile missing for target ${target} (expected at ${dockerfilePath(target)})`,
+    );
   }
-  return readFileSync(path, "utf8");
+  return body;
 }
 
 export function dockerfileSize(target: TargetShape): number {
-  return statSync(dockerfilePath(target)).size;
+  // Byte length of the embedded body — `statSync` would fail wherever the file
+  // is not on disk, which is every shipped artifact.
+  return Buffer.byteLength(readDockerfile(target), "utf8");
 }
 
 export function listAvailableTargets(): readonly TargetShape[] {
-  return TARGET_SHAPES.filter((t) => existsSync(dockerfilePath(t)));
+  return TARGET_SHAPES.filter((t) => DOCKERFILE_BODIES[t] !== undefined);
 }
 
 export type BuildRunner = (
@@ -127,12 +144,14 @@ export async function buildImage(opts: BuildImageOptions): Promise<BuildImageRes
       `invalid tag: ${JSON.stringify(opts.tag)} — must be non-empty and contain no whitespace`,
     );
   }
-  const dockerfile = dockerfilePath(opts.target);
-  if (!existsSync(dockerfile)) {
-    throw new DockerImagesError(
-      `dockerfile missing for target ${opts.target} (expected at ${dockerfile})`,
-    );
-  }
+  // `docker build --file` needs a REAL path, and the checked-in Dockerfile is
+  // absent from every shipped artifact — `/$bunfs` in the compiled binary, and
+  // (before this release) an npm tarball without `docker/`. The body is
+  // embedded, so materialize it when the file is not on disk and hand docker
+  // the temp copy. Prefer the real file when present: a source checkout then
+  // builds from exactly what the developer is editing.
+  const onDisk = dockerfilePath(opts.target);
+  const dockerfile = existsSync(onDisk) ? onDisk : materializeDockerfile(opts.target);
   const contextPath = opts.contextPath ?? resolve(PACKAGE_ROOT, "..", "..");
   const argv: string[] = [
     "docker",
@@ -157,6 +176,25 @@ export async function buildImage(opts: BuildImageOptions): Promise<BuildImageRes
     );
   }
   return { tag: opts.tag, target: opts.target, buildArgv: argv };
+}
+
+/**
+ * Write the embedded Dockerfile for a shape to a temp file and return its
+ * path, for the one caller that needs a real one: `docker build --file`.
+ *
+ * Only reached where the checked-in file is absent — i.e. every shipped
+ * artifact. Deterministic per (target, body) so repeat builds reuse one file
+ * instead of littering tmp, and content-addressed so a changed body never
+ * reuses a stale copy.
+ */
+function materializeDockerfile(target: TargetShape): string {
+  const body = readDockerfile(target);
+  const stamp = createHash("sha256").update(body).digest("hex").slice(0, 16);
+  const dir = join(tmpdir(), `crewhaus-dockerfiles-${stamp}`);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `${target}.Dockerfile`);
+  if (!existsSync(path)) writeFileSync(path, body, { mode: 0o644 });
+  return path;
 }
 
 export const defaultRunner: BuildRunner = async (argv, cwd) => {

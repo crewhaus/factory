@@ -192,6 +192,24 @@ jobs:
           rm -rf "$CHART_TMP"
           echo "compiled binary Helm chart smoke OK"
 
+      # The per-shape Dockerfiles are the third embedded-asset subsystem, and
+      # they were broken the same way (`dockerfile missing for target cli
+      # (expected at /$bunfs/docker/cli/Dockerfile)`). Proving they resolve
+      # needs no Docker daemon: pass a deliberately INVALID tag and assert the
+      # failure is about the tag, not a missing Dockerfile — resolution happens
+      # first, so reaching the tag error means the body was found.
+      - name: Smoke-test the embedded Dockerfiles (compiled binary)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          BIN="$PWD/dist/crewhaus-linux-x64-$VERSION"
+          OUT="$("$BIN" build-image cli --tag 'bad:tag' 2>&1 || true)"
+          case "$OUT" in
+            *"dockerfile missing"*)
+              echo "::error::compiled binary cannot resolve its embedded Dockerfile: $OUT"; exit 1 ;;
+          esac
+          echo "compiled binary Dockerfile smoke OK"
+
       - name: Generate package manifests
         env:
           VERSION: ${{ steps.version.outputs.version }}
