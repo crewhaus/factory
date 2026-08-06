@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/audit-encryption",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "Envelope encryption for hash-chained audit records: per-tenant DEK wrapped by KEK from @crewhaus/secrets-manager (Section 39)",
   "main": "src/index.ts",

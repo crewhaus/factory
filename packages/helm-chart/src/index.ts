@@ -1,6 +1,6 @@
-import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
 import { TARGET_SHAPES, type TargetShape, isTargetShape } from "@crewhaus/docker-images";
 /**
  * Section 32 — `@crewhaus/helm-chart`
@@ -23,6 +23,7 @@ import { TARGET_SHAPES, type TargetShape, isTargetShape } from "@crewhaus/docker
  * helm/crewhaus -f values.yaml`.
  */
 import { CrewhausError } from "@crewhaus/errors";
+import { TEMPLATE_BODIES } from "./embedded";
 
 export class HelmChartError extends CrewhausError {
   override readonly name = "HelmChartError";
@@ -33,30 +34,40 @@ export class HelmChartError extends CrewhausError {
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CHART_ROOT = join(PACKAGE_ROOT, "helm", "crewhaus");
-const TEMPLATES_DIR = join(CHART_ROOT, "templates");
 
+/**
+ * On-disk location of the chart, for humans and for tooling that wants to run
+ * `helm install … <chartRoot()>` directly. Present in a source checkout and in
+ * a published npm install (`helm/` is in this package's `files`), but NOT in
+ * the compiled binary, where the chart exists only as embedded text. Rendering
+ * never reads it — use {@link renderChart}.
+ */
 export function chartRoot(): string {
   return CHART_ROOT;
 }
 
+/**
+ * The chart's template filenames, in the same sorted order the old
+ * `readdirSync().sort()` produced.
+ *
+ * Served from {@link TEMPLATE_BODIES} rather than the filesystem: the previous
+ * package-relative read failed on BOTH published channels — under `/$bunfs` in
+ * the compiled binary, and against an absent `helm/` in the npm tarball. See
+ * `embedded.ts`.
+ */
 export function templateFiles(): readonly string[] {
-  if (!existsSync(TEMPLATES_DIR)) {
-    throw new HelmChartError(`templates directory missing at ${TEMPLATES_DIR}`);
-  }
-  return readdirSync(TEMPLATES_DIR)
-    .filter((f) => /\.(ya?ml|tpl)$/.test(f))
-    .sort();
+  return Object.keys(TEMPLATE_BODIES);
 }
 
 export function readTemplate(name: string): string {
   if (name.includes("/") || name.includes("..")) {
     throw new HelmChartError(`invalid template name: ${name}`);
   }
-  const path = join(TEMPLATES_DIR, name);
-  if (!existsSync(path)) {
+  const body = TEMPLATE_BODIES[name];
+  if (body === undefined) {
     throw new HelmChartError(`template not found: ${name}`);
   }
-  return readFileSync(path, "utf8");
+  return body;
 }
 
 // ─── Values shape ────────────────────────────────────────────────────────────

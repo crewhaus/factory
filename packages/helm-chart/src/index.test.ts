@@ -490,3 +490,39 @@ describe("toYaml filter (simpleYaml)", () => {
     expect(out).toContain("b.example.com");
   });
 });
+
+/**
+ * The chart is EMBEDDED at build time (`embedded.ts`), not read from disk at
+ * render time. That distinction is the whole fix for a bug that shipped from
+ * at least 0.4.2 through 0.5.0: a package-relative read fails under `/$bunfs`
+ * in the compiled binary AND against an npm tarball that omitted `helm/`.
+ *
+ * These tests guard the two ways the embedding can silently rot. Neither can
+ * catch a broken *binary* — only the release workflow's compiled smoke does
+ * that — but they catch the authoring mistake that causes it.
+ */
+describe("embedded chart templates", () => {
+  test("every template on disk is embedded — adding one without wiring it fails here", async () => {
+    const { readdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const onDisk = readdirSync(join(chartRoot(), "templates"))
+      .filter((f) => /\.(ya?ml|tpl)$/.test(f))
+      .sort();
+    // templateFiles() now serves the embedded map; if the two ever diverge,
+    // rendering silently drops (or invents) a manifest.
+    expect([...templateFiles()].sort()).toEqual(onDisk);
+  });
+
+  test("each embedded body is byte-identical to its file on disk", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    for (const name of templateFiles()) {
+      expect(readTemplate(name)).toBe(readFileSync(join(chartRoot(), "templates", name), "utf8"));
+    }
+  });
+
+  test("readTemplate still refuses traversal and unknown names", () => {
+    expect(() => readTemplate("../values.yaml")).toThrow(HelmChartError);
+    expect(() => readTemplate("nope.yaml")).toThrow(HelmChartError);
+  });
+});

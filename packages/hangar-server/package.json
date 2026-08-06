@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/hangar-server",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "The Hangar manager's local HTTP server: token-gated loopback API over the machine-wide harness registry — fleet rows with cached rollups, per-harness detail/spec/preflight/sessions/evals/memory/cost views, registry CRUD, and the M2 driver surface (supervised process control, a live SSE run feed, crewhaus.control.v1 wake/drain, the approvals + review inboxes, an activity digest, and a job queue)",
   "main": "src/index.ts",

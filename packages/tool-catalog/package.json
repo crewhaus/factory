@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-catalog",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "ToolDefinition interface, RegisteredTool, and ToolCatalog registry",
   "main": "src/index.ts",

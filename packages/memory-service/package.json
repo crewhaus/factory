@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/memory-service",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "v0.3.0 composition root (design §1 principle 1): wireMemory/wireContinuity/wireWiki construct the memory fabric's stores, register its tools, and return runChatLoop-ready seams — one stable call replacing per-emitter memory codegen.",
   "main": "src/index.ts",

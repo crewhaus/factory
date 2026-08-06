@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/cloud-adapter-heroku",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "One-click deploy adapter for Heroku — generates a heroku.yml + app.json + Dockerfile and wraps the Heroku Platform API for daemon target shapes (Section 44)",
   "main": "src/index.ts",

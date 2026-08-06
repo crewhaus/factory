@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-web",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "WebFetch (URL → markdown via cheerio + turndown) and WebSearch (provider dispatch)",
   "main": "src/index.ts",

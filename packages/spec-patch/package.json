@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/spec-patch",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "Pillar-2 patch infrastructure — apply a SpecPatch to a YAML source preserving comments and key order via the yaml CST. Drives the active eval optimizer's spec-level mutation loop.",
   "main": "src/index.ts",
