@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-05
+
+### Fixed
+
+- **`crewhaus cloud deploy` was broken on every published channel**, and had
+  been since at least 0.4.2 — it worked only from a source checkout.
+  `@crewhaus/helm-chart` resolved its templates package-relative from
+  `import.meta.url`, which fails two different ways once shipped: under
+  `/$bunfs` in the compiled binary, where the chart was never embedded
+  (`templates directory missing at /$bunfs/helm/crewhaus/templates`), and
+  against the npm tarball, whose `files` array listed only `src` and so omitted
+  `helm/` outright.
+
+  The chart templates are now embedded with `with { type: "text" }` — the same
+  mechanism that fixed the `default-skills` ENOENT in 0.3.2 — so rendering
+  reads no files at all, and `helm/` joins `files` so a published consumer can
+  still `helm install` the real chart from `chartRoot()`. Rendered output is
+  byte-identical to the filesystem path it replaces.
+
+  **This class of bug is invisible to CI**, which runs from a source checkout
+  where `packages/helm-chart/helm/` is on disk — exactly how it shipped twice.
+  The release workflow now renders a chart with the *compiled binary* and
+  asserts a real Deployment manifest comes out, alongside the existing Hangar
+  console smoke. The guard was verified against the shipped 0.5.0 binary: it
+  fails there, and passes on this build.
+
 ## [0.5.0] - 2026-08-05
 
 ### Added

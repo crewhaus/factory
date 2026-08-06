@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/plugin-sdk",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "Plugin SDK v2 — public typed surface for third-party tools / channels / models / graders / target backends, with manifest validation and Ed25519 signature verification (Section 41)",
   "main": "src/index.ts",

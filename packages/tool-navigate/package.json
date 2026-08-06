@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-navigate",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "Navigate tool — drives driver.goto(url) for the BROW agent (Section 25 BROW)",
   "main": "src/index.ts",

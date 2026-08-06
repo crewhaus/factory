@@ -155,6 +155,61 @@ jobs:
           rm -rf "$HANGAR_TMP"
           echo "compiled binary Hangar console smoke OK"
 
+      # The Helm chart is the OTHER embedded-asset subsystem, and it shipped
+      # broken from at least 0.4.2 through 0.5.0 without anything noticing:
+      # `helm-chart` resolved its templates package-relative, which fails BOTH
+      # under /$bunfs in the compiled binary AND against an npm tarball whose
+      # `files` array omitted `helm/`. Neither reproduces from a source
+      # checkout, which is all CI otherwise exercises — the same blind spot
+      # that let the default-skills ENOENT ship in 0.3.0.
+      #
+      # Rendering a chart is the cheapest end-to-end proof the assets are
+      # really embedded: `cloud deploy` without --live plans and writes
+      # manifests, touching no cloud account.
+      - name: Smoke-test the embedded Helm chart (compiled binary)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          BIN="$PWD/dist/crewhaus-linux-x64-$VERSION"
+          CHART_TMP="$(mktemp -d)"
+          cat > "$CHART_TMP/crewhaus.yaml" <<'SPEC'
+          name: chart-smoke
+          target: cli
+          agent:
+            model: claude-sonnet-5
+            instructions: smoke
+          SPEC
+          (
+            cd "$CHART_TMP"
+            "$BIN" cloud deploy --provider aws --region us-east-1 --tier dev
+          )
+          # A rendered Deployment is the assertion: an unembedded chart throws
+          # `templates directory missing` long before writing one.
+          MANIFEST="$CHART_TMP/.crewhaus/cloud/crewhaus-aws-us-east-1/kustomize/managed-deployment.yaml"
+          test -s "$MANIFEST" || { echo "::error::chart render produced no deployment manifest"; exit 1; }
+          grep -q "kind: Deployment" "$MANIFEST" || {
+            echo "::error::rendered manifest is not a Deployment"; exit 1; }
+          rm -rf "$CHART_TMP"
+          echo "compiled binary Helm chart smoke OK"
+
+      # The per-shape Dockerfiles are the third embedded-asset subsystem, and
+      # they were broken the same way (`dockerfile missing for target cli
+      # (expected at /$bunfs/docker/cli/Dockerfile)`). Proving they resolve
+      # needs no Docker daemon: pass a deliberately INVALID tag and assert the
+      # failure is about the tag, not a missing Dockerfile — resolution happens
+      # first, so reaching the tag error means the body was found.
+      - name: Smoke-test the embedded Dockerfiles (compiled binary)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          BIN="$PWD/dist/crewhaus-linux-x64-$VERSION"
+          OUT="$("$BIN" build-image cli --tag 'bad:tag' 2>&1 || true)"
+          case "$OUT" in
+            *"dockerfile missing"*)
+              echo "::error::compiled binary cannot resolve its embedded Dockerfile: $OUT"; exit 1 ;;
+          esac
+          echo "compiled binary Dockerfile smoke OK"
+
       - name: Generate package manifests
         env:
           VERSION: ${{ steps.version.outputs.version }}

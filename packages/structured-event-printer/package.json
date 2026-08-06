@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/structured-event-printer",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "Pretty/JSON Lines printer for TraceEvent — gates on CREWHAUS_TRACE",
   "main": "src/index.ts",

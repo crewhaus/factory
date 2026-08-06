@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/eval-dataset",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "Eval dataset loaders (JSONL, CSV, YAML, HTTP) with a lazy iterator API",
   "main": "src/index.ts",

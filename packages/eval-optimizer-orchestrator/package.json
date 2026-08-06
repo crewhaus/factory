@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/eval-optimizer-orchestrator",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "Pillar-2 orchestration — wires eval-runner (fitness) + prompt-optimizer (search) + spec-patch (mutation) into a single 'crewhaus optimize' workflow that closes the active-optimization loop.",
   "main": "src/index.ts",

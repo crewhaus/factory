@@ -505,3 +505,35 @@ describe("buildImageAndRecord()", () => {
     expect(recordCalls).toBe(0);
   });
 });
+
+/**
+ * The Dockerfiles are EMBEDDED at build time (`embedded.ts`), not read from
+ * disk. Reading them package-relative broke `crewhaus build-image` on every
+ * shipped artifact — `/$bunfs` in the compiled binary, and an npm tarball that
+ * omitted `docker/`. These guard the authoring mistake that would reintroduce
+ * it; only the release workflow's compiled smoke can catch a broken binary.
+ */
+describe("embedded Dockerfiles", () => {
+  test("every Dockerfile on disk is embedded — adding a shape without wiring it fails here", async () => {
+    const { readdirSync, existsSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const onDisk = readdirSync(dockerRoot(), { withFileTypes: true })
+      .filter((e) => e.isDirectory() && existsSync(join(dockerRoot(), e.name, "Dockerfile")))
+      .map((e) => e.name)
+      .sort();
+    expect([...listAvailableTargets()].sort()).toEqual(onDisk);
+  });
+
+  test("each embedded body is byte-identical to its file on disk", async () => {
+    const { readFileSync } = await import("node:fs");
+    for (const target of listAvailableTargets()) {
+      expect(readDockerfile(target)).toBe(readFileSync(dockerfilePath(target), "utf8"));
+    }
+  });
+
+  test("dockerfileSize reports the embedded body's length, not a stat of a maybe-absent file", () => {
+    for (const target of listAvailableTargets()) {
+      expect(dockerfileSize(target)).toBe(Buffer.byteLength(readDockerfile(target), "utf8"));
+    }
+  });
+});

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/harness-inventory",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "Cross-harness discovery + fleet inventory/health rollup — the library core behind crewhaus fleet (discoverHarnesses, buildFleetInventory, buildHarnessHealth, describeFleetExit, seam-injected bulk runner)",
   "main": "src/index.ts",
