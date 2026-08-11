@@ -60,6 +60,13 @@ export type PendingApproval = {
   readonly decidedAt?: string;
   /** Free-form deciding identity (e.g. `"cli"`, `"slack:U0123"`). */
   readonly decidedBy?: string;
+  /**
+   * #383 — present (true) when a `grant` was recorded as a STANDING allow
+   * (the Slack "Always allow" button / `crewhaus approvals grant --always`):
+   * the resolving surface also persists an `alwaysAllow` permission rule for
+   * the tool, so future calls skip the approval flow entirely.
+   */
+  readonly always?: boolean;
 };
 
 /** Filter for {@link ApprovalStore.list}. */
@@ -92,8 +99,14 @@ export interface ApprovalStore {
    * CLI verb) is a no-op the caller can treat as "nothing to ACK", so the FIRST
    * decision wins and the audit/trace/resume fire exactly once. Read the final
    * decision of an already-resolved approval with {@link get}.
+   * `opts.always` marks a `grant` as a standing allow (#383).
    */
-  resolve(id: string, decision: ApprovalDecision, by: string): Promise<PendingApproval | null>;
+  resolve(
+    id: string,
+    decision: ApprovalDecision,
+    by: string,
+    opts?: { readonly always?: boolean },
+  ): Promise<PendingApproval | null>;
   /** All approvals matching the filter (newest first), or all when unfiltered. */
   list(filter?: ApprovalListFilter): Promise<readonly PendingApproval[]>;
   /**
@@ -131,6 +144,8 @@ export type ApprovalTraceEvent =
       readonly approvalId: string;
       readonly decision: ApprovalDecision;
       readonly by: string;
+      /** #383 — true when the grant was recorded as a standing allow. */
+      readonly always?: boolean;
     };
 
 export type ApprovalTracePublish = (event: ApprovalTraceEvent) => void;
@@ -189,7 +204,12 @@ export class InMemoryApprovalStore implements ApprovalStore {
     return Promise.resolve(this.records.get(id) ?? null);
   }
 
-  resolve(id: string, decision: ApprovalDecision, by: string): Promise<PendingApproval | null> {
+  resolve(
+    id: string,
+    decision: ApprovalDecision,
+    by: string,
+    opts?: { readonly always?: boolean },
+  ): Promise<PendingApproval | null> {
     const existing = this.records.get(id);
     if (existing === undefined) return Promise.resolve(null);
     // Idempotent: the first decision wins. A re-resolve is a no-op that returns
@@ -200,6 +220,8 @@ export class InMemoryApprovalStore implements ApprovalStore {
       status: decision,
       decidedAt: new Date(this.now()).toISOString(),
       decidedBy: by,
+      // #383 — a standing allow only ever rides on a grant.
+      ...(decision === "grant" && opts?.always === true ? { always: true } : {}),
     };
     this.records.set(id, resolved);
     const waiters = this.waiters.get(id);
@@ -275,7 +297,7 @@ export function previewApprovalInput(input: unknown, max = 200): string {
 /** The channel-generic text every non-interactive adapter falls back to when it
  *  cannot render Approve/Deny buttons. */
 export function approvalFallbackText(approvalId: string): string {
-  return `approval pending — run \`crewhaus approvals grant ${approvalId}\` (or \`deny\`) to decide`;
+  return `approval pending — run \`crewhaus approvals grant ${approvalId}\` (or \`deny\`) to decide; add \`--always\` to allow the tool from now on`;
 }
 
 /**
@@ -370,16 +392,25 @@ export async function resolveApproval(deps: {
   readonly approvalId: string;
   readonly decision: ApprovalDecision;
   readonly by: string;
+  /** #383 — record a `grant` as a standing allow (Slack "Always allow"). */
+  readonly always?: boolean;
   readonly publish?: ApprovalTracePublish;
   readonly auditSink?: ApprovalAuditSink;
 }): Promise<PendingApproval | null> {
-  const resolved = await deps.store.resolve(deps.approvalId, deps.decision, deps.by);
+  const always = deps.decision === "grant" && deps.always === true;
+  const resolved = await deps.store.resolve(
+    deps.approvalId,
+    deps.decision,
+    deps.by,
+    always ? { always: true } : undefined,
+  );
   if (resolved === null) return null;
   deps.publish?.({
     kind: "approval_resolved",
     approvalId: resolved.id,
     decision: deps.decision,
     by: deps.by,
+    ...(always ? { always: true } : {}),
   });
   if (deps.auditSink !== undefined) {
     await deps.auditSink.append({
@@ -392,6 +423,7 @@ export async function resolveApproval(deps: {
         sessionId: resolved.sessionId,
         decision: deps.decision,
         by: deps.by,
+        ...(always ? { always: true } : {}),
         ...(resolved.decidedAt !== undefined ? { decidedAt: resolved.decidedAt } : {}),
       },
     });
@@ -422,6 +454,8 @@ export type RuntimeApprovalRecord = {
   readonly decidedBy?: string;
   readonly decidedAt?: string;
   readonly consumedAt?: string;
+  /** #383 — the grant is a standing allow (unconsumed; a rule covers the tool). */
+  readonly always?: boolean;
 };
 
 export type RuntimeApprovalStoreLike = {
@@ -431,6 +465,7 @@ export type RuntimeApprovalStoreLike = {
     id: string,
     decision: ApprovalDecision,
     by: string,
+    opts?: { readonly always?: boolean },
   ): Promise<RuntimeApprovalRecord | null>;
   list(): Promise<RuntimeApprovalRecord[]>;
 };
@@ -457,6 +492,7 @@ function toChannelApproval(r: RuntimeApprovalRecord): PendingApproval {
     createdAt: r.createdAt,
     ...(r.decidedAt !== undefined ? { decidedAt: r.decidedAt } : {}),
     ...(r.decidedBy !== undefined ? { decidedBy: r.decidedBy } : {}),
+    ...(r.always === true ? { always: true } : {}),
   };
 }
 
@@ -542,13 +578,14 @@ export function createRuntimeBackedApprovalStore(
       id: string,
       decision: ApprovalDecision,
       by: string,
+      opts?: { readonly always?: boolean },
     ): Promise<PendingApproval | null> {
       // Read BEFORE writing: the pending→decided transition is what the
       // gateway keys its ACK + resume on, and the runtime store will happily
       // overwrite a decision without telling us it was already made.
       const before = await byId(id);
       if (before === null || before.decision !== undefined) return null;
-      const after = await runtime.resolve(id, decision, by);
+      const after = await runtime.resolve(id, decision, by, opts);
       return after === null ? null : toChannelApproval(after);
     },
 

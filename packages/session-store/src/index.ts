@@ -584,6 +584,18 @@ export type PendingApproval = {
   decidedAt?: string;
   /** Set when a one-shot `grant` has been spent by a run (re-ask on next call). */
   consumedAt?: string;
+  /**
+   * #383 — set when a `grant` was recorded as a STANDING allow
+   * (`crewhaus approvals grant <id> --always`, the Slack "Always allow"
+   * button). The resolving surface also persists an `alwaysAllow` rule for
+   * the tool into the harness's `.crewhaus/settings.json` — THAT rule
+   * carries the standing behavior, pre-deciding future calls before this
+   * store is consulted. The grant record itself stays one-shot (consumed on
+   * use like any grant), so removing the rule fully revokes the standing
+   * allow; the flag exists for display and audit provenance. Absent on
+   * plain one-shot grants and denies.
+   */
+  always?: boolean;
 };
 
 /**
@@ -605,8 +617,15 @@ export interface PendingApprovalStore {
   /**
    * Record an out-of-band decision on the approval `id` (the CLI/Slack verb
    * path). Returns the updated record, or `null` when no such id exists.
+   * `opts.always` marks a `grant` as a standing allow (#383) — recorded on
+   * the record verbatim; ignored for `deny`.
    */
-  resolve(id: string, decision: ApprovalDecision, by: string): Promise<PendingApproval | null>;
+  resolve(
+    id: string,
+    decision: ApprovalDecision,
+    by: string,
+    opts?: { readonly always?: boolean },
+  ): Promise<PendingApproval | null>;
   /**
    * Every live (non-expired) approval, newest-first. Compacts the backing
    * file as a side-effect (drops expired + superseded lines), mirroring
@@ -838,6 +857,7 @@ export function createPendingApprovalStore(
       id: string,
       decision: ApprovalDecision,
       by: string,
+      opts?: { readonly always?: boolean },
     ): Promise<PendingApproval | null> {
       validateId(id);
       const folded = await foldAll();
@@ -848,6 +868,8 @@ export function createPendingApprovalStore(
         decision,
         decidedBy: by,
         decidedAt: now().toISOString(),
+        // #383 — a standing allow only ever rides on a grant.
+        ...(decision === "grant" && opts?.always === true ? { always: true } : {}),
       };
       await append(updated);
       return updated;

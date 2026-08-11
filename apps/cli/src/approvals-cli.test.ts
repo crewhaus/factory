@@ -4,7 +4,7 @@
  * file-backed approvals store seeded in a tmp cwd.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PendingApproval } from "@crewhaus/session-store";
@@ -237,5 +237,124 @@ describe("crewhaus approvals (CLI)", () => {
     } finally {
       rmSync(sibling, { recursive: true, force: true });
     }
+  });
+
+  test("#383 — grant --always records the grant AND writes the standing settings rule", async () => {
+    await seedApproval(ID, "log_knowledge_gap");
+    const granted = await runCli(["approvals", "grant", ID, "--always", "--by", "max"]);
+    expect(granted.exitCode).toBe(0);
+    expect(granted.stdout).toContain("granted");
+    expect(granted.stdout).toContain("standing allow");
+    expect(granted.stdout).not.toContain("one-shot");
+
+    // The settings file carries the rule, in the exact shape buildRuleSet reads.
+    const settings = JSON.parse(readFileSync(join(cwd, ".crewhaus", "settings.json"), "utf8")) as {
+      permissions: { rules: Array<{ type: string; pattern: string }> };
+    };
+    expect(settings.permissions.rules).toEqual([
+      { type: "alwaysAllow", pattern: "log_knowledge_gap" },
+    ]);
+
+    // The record carries always, and the display status says so.
+    const shown = await runCli(["approvals", "show", ID, "--json"]);
+    const parsed = JSON.parse(shown.stdout) as PendingApproval;
+    expect(parsed.decision).toBe("grant");
+    expect(parsed.always).toBe(true);
+    const listed = await runCli(["approvals", "list"]);
+    expect(listed.stdout).toContain("granted-always");
+  });
+
+  test("#383 — a second grant --always for the same tool is a dedupe no-op", async () => {
+    await seedApproval(ID, "log_knowledge_gap");
+    const other = "appr_00000000feedface";
+    await seedApproval(other, "log_knowledge_gap");
+    await runCli(["approvals", "grant", ID, "--always"]);
+    const second = await runCli(["approvals", "grant", other, "--always"]);
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout).toContain("already carries");
+    const settings = JSON.parse(readFileSync(join(cwd, ".crewhaus", "settings.json"), "utf8")) as {
+      permissions: { rules: unknown[] };
+    };
+    expect(settings.permissions.rules).toHaveLength(1);
+  });
+
+  test("#383 — --always preserves unrelated settings.json keys", async () => {
+    mkdirSync(join(cwd, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(cwd, ".crewhaus", "settings.json"),
+      `${JSON.stringify({ hooks: { "pre-tool": [] } }, null, 2)}\n`,
+    );
+    await seedApproval(ID);
+    const granted = await runCli(["approvals", "grant", ID, "--always"]);
+    expect(granted.exitCode).toBe(0);
+    const settings = JSON.parse(readFileSync(join(cwd, ".crewhaus", "settings.json"), "utf8")) as {
+      hooks: unknown;
+      permissions: { rules: Array<{ pattern: string }> };
+    };
+    expect(settings.hooks).toEqual({ "pre-tool": [] });
+    expect(settings.permissions.rules[0]?.pattern).toBe("Bash");
+  });
+
+  test("#383 — --always with a CREWHAUS_SESSION_DIR-located store fails closed (needs --dir)", async () => {
+    // Seed the store in a RELOCATED root — the env var finds it, but the
+    // operator's cwd is no longer provably the harness root.
+    const relocated = mkdtempSync(join(tmpdir(), "approvals-relocated-"));
+    try {
+      const { createPendingApprovalStore, hashApprovalInput } = await import(
+        "@crewhaus/session-store"
+      );
+      const relocatedStore = createPendingApprovalStore({ rootDir: relocated });
+      await relocatedStore.persist({
+        id: ID,
+        toolName: "log_knowledge_gap",
+        inputHash: hashApprovalInput("log_knowledge_gap", { gap: "x" }),
+        input: { gap: "x" },
+        runId: "run_1",
+        sessionId: "sess_00000000deadbeef",
+        surface: "channel",
+        createdAt: new Date().toISOString(),
+      });
+      const proc = Bun.spawn([process.execPath, CLI_PATH, "approvals", "grant", ID, "--always"], {
+        cwd,
+        env: { PATH: process.env["PATH"] ?? "", CREWHAUS_SESSION_DIR: relocated },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain("--dir <harness root>");
+      // Fails BEFORE recording anything: still pending, and no rule written.
+      const record = (await relocatedStore.list()).find((a) => a.id === ID);
+      expect(record?.decision).toBeUndefined();
+      expect(existsSync(join(cwd, ".crewhaus", "settings.json"))).toBe(false);
+    } finally {
+      rmSync(relocated, { recursive: true, force: true });
+    }
+  });
+
+  test("#383 — deny --always is rejected", async () => {
+    await seedApproval(ID);
+    const { exitCode, stderr } = await runCli(["approvals", "deny", ID, "--always"]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("--always applies only");
+    // Nothing was decided or written.
+    const shown = await runCli(["approvals", "show", ID, "--json"]);
+    expect((JSON.parse(shown.stdout) as PendingApproval).decision).toBeUndefined();
+    expect(existsSync(join(cwd, ".crewhaus", "settings.json"))).toBe(false);
+  });
+
+  test("#383 — a malformed settings.json fails the --always write loudly, grant stays recorded", async () => {
+    mkdirSync(join(cwd, ".crewhaus"), { recursive: true });
+    writeFileSync(join(cwd, ".crewhaus", "settings.json"), "{broken");
+    await seedApproval(ID);
+    const { exitCode, stderr } = await runCli(["approvals", "grant", ID, "--always"]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("standing alwaysAllow rule failed");
+    // The grant itself IS recorded (the operator's decision is not lost)…
+    const shown = await runCli(["approvals", "show", ID, "--json"]);
+    expect((JSON.parse(shown.stdout) as PendingApproval).decision).toBe("grant");
+    // …and the unparseable file is untouched.
+    expect(readFileSync(join(cwd, ".crewhaus", "settings.json"), "utf8")).toBe("{broken");
   });
 });

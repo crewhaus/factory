@@ -14,9 +14,11 @@
  * orchestration live in `@crewhaus/channel-adapter-base`.
  */
 
-/** Block Kit `action_id`s for the two buttons — the interaction parser keys on
- *  these, so they are part of the wire contract. */
+/** Block Kit `action_id`s for the three buttons — the interaction parser keys
+ *  on these, so they are part of the wire contract. */
 export const APPROVE_ACTION_ID = "crewhaus_approve";
+/** #383 — grant AND persist a standing `alwaysAllow` rule for the tool. */
+export const APPROVE_ALWAYS_ACTION_ID = "crewhaus_approve_always";
 export const DENY_ACTION_ID = "crewhaus_deny";
 /** `block_id` prefix carrying the approval id (a redundant channel to the
  *  buttons' `value`, so the id survives even if Slack ever elides `value`). */
@@ -39,10 +41,14 @@ export type SlackApprovalMessage = {
 };
 
 /**
- * Build the Approve/Deny Block Kit message for a parked approval. Each button
- * carries the `approvalId` in its `value`, and the actions block's `block_id`
- * carries it too (`crewhaus_approval:<id>`), so the interaction parser can
- * recover the id from either.
+ * Build the Approve / Always allow / Deny Block Kit message for a parked
+ * approval. Each button carries the `approvalId` in its `value`, and the
+ * actions block's `block_id` carries it too (`crewhaus_approval:<id>`), so the
+ * interaction parser can recover the id from either. "Always allow" (#383)
+ * grants this call AND persists a standing `alwaysAllow` rule for the tool in
+ * the harness's `.crewhaus/settings.json`, so a tool the loop calls repeatedly
+ * with varying input stops re-prompting (a plain Approve is one-shot and keyed
+ * on the exact input).
  */
 export function buildApprovalMessage(content: ApprovalPromptContent): SlackApprovalMessage {
   const text = `Approval needed: \`${content.toolName}\` wants to run (surface: ${content.surface})`;
@@ -67,6 +73,12 @@ export function buildApprovalMessage(content: ApprovalPromptContent): SlackAppro
         },
         {
           type: "button",
+          action_id: APPROVE_ALWAYS_ACTION_ID,
+          text: { type: "plain_text", text: `Always allow ${truncateForButton(content.toolName)}` },
+          value: content.approvalId,
+        },
+        {
+          type: "button",
           action_id: DENY_ACTION_ID,
           text: { type: "plain_text", text: "Deny" },
           style: "danger",
@@ -79,7 +91,7 @@ export function buildApprovalMessage(content: ApprovalPromptContent): SlackAppro
       elements: [
         {
           type: "mrkdwn",
-          text: `id \`${content.approvalId}\` · or run \`crewhaus approvals grant ${content.approvalId}\``,
+          text: `id \`${content.approvalId}\` · or run \`crewhaus approvals grant ${content.approvalId}\` (add \`--always\` for a standing allow)`,
         },
       ],
     },
@@ -96,11 +108,15 @@ export function buildApprovalAckMessage(args: {
   readonly decision: "grant" | "deny";
   readonly by: string;
   readonly toolName?: string;
+  /** #383 — the grant was recorded as a standing allow. */
+  readonly always?: boolean;
 }): SlackApprovalMessage {
-  const verb = args.decision === "grant" ? "Approved" : "Denied";
+  const always = args.decision === "grant" && args.always === true;
+  const verb = args.decision === "grant" ? (always ? "Approved (always)" : "Approved") : "Denied";
   const icon = args.decision === "grant" ? "✅" : "🚫";
   const tool = args.toolName !== undefined ? ` \`${args.toolName}\`` : "";
-  const text = `${icon} ${verb}${tool} by ${args.by}`;
+  const suffix = always ? " — future calls run pre-approved" : "";
+  const text = `${icon} ${verb}${tool} by ${args.by}${suffix}`;
   return {
     text,
     blocks: [{ type: "context", elements: [{ type: "mrkdwn", text }] }],
@@ -114,6 +130,8 @@ export type ParsedInteraction =
       readonly kind: "approval_action";
       readonly approvalId: string;
       readonly decision: "grant" | "deny";
+      /** #383 — the click was "Always allow": grant + persist a standing rule. */
+      readonly always?: boolean;
       /** The Slack user who clicked (deciding identity). */
       readonly userId: string;
       readonly channelId?: string;
@@ -155,13 +173,15 @@ export function parseSlackInteraction(body: string): ParsedInteraction {
   const action = actions[0] as Record<string, unknown> | undefined;
   if (action === undefined) return { kind: "skip" };
 
+  const actionId = action["action_id"];
   const decision =
-    action["action_id"] === APPROVE_ACTION_ID
+    actionId === APPROVE_ACTION_ID || actionId === APPROVE_ALWAYS_ACTION_ID
       ? "grant"
-      : action["action_id"] === DENY_ACTION_ID
+      : actionId === DENY_ACTION_ID
         ? "deny"
         : undefined;
   if (decision === undefined) return { kind: "skip" };
+  const always = actionId === APPROVE_ALWAYS_ACTION_ID;
 
   // Prefer the button's `value`; fall back to the actions block_id suffix.
   const approvalId =
@@ -215,6 +235,7 @@ export function parseSlackInteraction(body: string): ParsedInteraction {
     kind: "approval_action",
     approvalId,
     decision,
+    ...(always ? { always: true } : {}),
     userId,
     ...(channelId !== undefined ? { channelId } : {}),
     ...(messageTs !== undefined ? { messageTs } : {}),
@@ -235,4 +256,10 @@ function approvalIdFromBlockId(blockId: unknown): string | undefined {
 function truncateForBlock(preview: string, max = 500): string {
   const safe = preview.replace(/```/g, "'''");
   return safe.length > max ? `${safe.slice(0, max)}…` : safe;
+}
+
+/** Slack caps a button's plain_text at 75 chars; keep room for the
+ *  "Always allow " prefix so a long MCP tool name can't break the block. */
+function truncateForButton(toolName: string, max = 40): string {
+  return toolName.length > max ? `${toolName.slice(0, max)}…` : toolName;
 }

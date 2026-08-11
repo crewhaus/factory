@@ -1617,7 +1617,7 @@ function renderGateway(ir: IrChannelV0): string {
   // whenever `permissions.ask_mode` is not "deny".
   const approvalsOn = ir.permissions.askMode !== "deny";
   const gatewayApprovalImports = approvalsOn
-    ? '\nimport { resolveApproval } from "@crewhaus/channel-adapter-base";\nimport type { ApprovalStore, ApprovalAuditSink } from "@crewhaus/channel-adapter-base";'
+    ? '\nimport { resolveApproval } from "@crewhaus/channel-adapter-base";\nimport type { ApprovalStore, ApprovalAuditSink } from "@crewhaus/channel-adapter-base";\nimport { appendSettingsRule } from "@crewhaus/permission-engine";'
     : "";
   const gatewayApprovalConfig = approvalsOn
     ? `
@@ -1656,9 +1656,21 @@ function renderGateway(ir: IrChannelV0): string {
           approvalId: interaction.approvalId,
           decision: interaction.decision,
           by,
+          ...(interaction.always === true ? { always: true } : {}),
           ...(config.auditSink !== undefined ? { auditSink: config.auditSink } : {}),
         });
         if (resolved === null) return new Response("unknown approval", { status: 200 });
+        // #383 — "Always allow": persist a standing settings-source rule for
+        // the tool BEFORE the resume re-drives the turn, so the re-driven run
+        // (and every later one) loads it at loop start and stops re-asking.
+        // Best-effort: the grant above already covers this exact call.
+        if (interaction.always === true) {
+          try {
+            appendSettingsRule(process.cwd(), { type: "alwaysAllow", pattern: resolved.toolName });
+          } catch (err) {
+            process.stderr.write("[gateway] standing-allow settings write failed: " + (err as Error).message + "\\n");
+          }
+        }
         const ackApproval = actionAdapter.ackApproval;
         if (ackApproval !== undefined) {
           try {

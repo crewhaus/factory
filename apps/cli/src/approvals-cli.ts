@@ -18,12 +18,21 @@ import type { PendingApproval } from "@crewhaus/session-store";
  * The operator-facing lifecycle state of a parked approval, derived from the
  * store record. `consumed` is a spent one-shot grant (a later identical call
  * re-asks under a fresh id); `granted`/`denied` are recorded-but-not-yet-spent
- * decisions; `pending` still awaits one.
+ * decisions; `granted-always` is a standing allow (#383 — the terminal state
+ * whether or not the parked call was since consumed, because the standing
+ * behavior rides the `alwaysAllow` rule in `.crewhaus/settings.json`, not
+ * this record); `pending` still awaits one.
  */
-export type ApprovalDisplayStatus = "pending" | "granted" | "denied" | "consumed";
+export type ApprovalDisplayStatus =
+  | "pending"
+  | "granted"
+  | "granted-always"
+  | "denied"
+  | "consumed";
 
 /** Derive the display status from the record's `decision` + `consumedAt`. */
 export function approvalStatus(a: PendingApproval): ApprovalDisplayStatus {
+  if (a.decision === "grant" && a.always === true) return "granted-always";
   if (a.consumedAt !== undefined) return "consumed";
   if (a.decision === "grant") return "granted";
   if (a.decision === "deny") return "denied";
@@ -106,6 +115,7 @@ export function formatApprovalDetail(a: PendingApproval, now: number = Date.now(
   row("created", `${a.createdAt} (${formatApprovalAge(a.createdAt, now)} ago)`);
   row("inputHash", a.inputHash);
   if (a.decision !== undefined) row("decision", a.decision);
+  if (a.always === true) row("always", "true (standing allow — see .crewhaus/settings.json)");
   if (a.decidedBy !== undefined) row("decidedBy", a.decidedBy);
   if (a.decidedAt !== undefined) row("decidedAt", a.decidedAt);
   if (a.consumedAt !== undefined) row("consumedAt", a.consumedAt);

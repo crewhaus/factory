@@ -153,6 +153,7 @@ import {
   PermissionConfigError,
   type PermissionMode,
   type RuleSet,
+  appendSettingsRule,
   parsePermissionsConfig,
   tagRules,
 } from "@crewhaus/permission-engine";
@@ -13712,6 +13713,11 @@ async function runApprovals(args: ParsedArgs, action: string): Promise<void> {
         "                       proceeds pre-approved. --once (default) is one-shot: the\n" +
         "                       runtime consumes the grant on use, so a later identical call\n" +
         "                       re-asks. --by <who> records the deciding identity (> CREWHAUS_USER > cli).\n" +
+        "  grant <id> --always  record a STANDING allow: grants this call AND writes an\n" +
+        "                       `alwaysAllow` rule for the tool to .crewhaus/settings.json, so\n" +
+        "                       every future call of the tool runs pre-approved on this harness\n" +
+        "                       (any input — unlike a one-shot grant, which is keyed to the\n" +
+        "                       exact input). Undo by removing the rule from settings.json.\n" +
         "  deny <id>            record a DENY — the parked call is refused with a note on resume.\n" +
         "  These resolve the parks a headless run creates when a tool permission asks and\n" +
         "  `permissions.ask_mode: pause` (the default) is set.\n",
@@ -13758,20 +13764,54 @@ async function runApprovals(args: ParsedArgs, action: string): Promise<void> {
   // grant | deny — record an out-of-band decision.
   const by = strFlag(args, "by") ?? process.env["CREWHAUS_USER"] ?? "cli";
   const decision: "grant" | "deny" = action === "grant" ? "grant" : "deny";
+  // #383 — a standing allow: grant + persist an alwaysAllow rule for the tool.
+  const always = args.flags["always"] === true;
+  if (always && decision !== "grant") die("--always applies only to `approvals grant`");
+  // Fail CLOSED before recording anything when --always cannot know the
+  // harness root: with the store located via CREWHAUS_SESSION_DIR or a
+  // tenant scope (not --dir, not cwd), the current directory may not be the
+  // daemon's harness, and a rule written here would never be loaded.
+  if (always && typeof dirFlag !== "string" && resolveSessionRootDir(undefined) !== undefined) {
+    die(
+      `--always writes .crewhaus/settings.json under the HARNESS root, but the approvals store was located via CREWHAUS_SESSION_DIR/tenant scope (${resolveSessionRootDir(undefined)}), so the harness owning settings.json cannot be inferred from the current directory. Re-run with --dir <harness root>.`,
+    );
+  }
   let updated: PendingApproval | null;
   try {
-    updated = await store.resolve(id, decision, by);
+    updated = await store.resolve(id, decision, by, always ? { always: true } : undefined);
   } catch (err) {
     // resolve() throws on a malformed id (not appr_<16 hex>).
     die(err instanceof Error ? err.message : String(err));
   }
   if (updated === null) die(`no approval "${id}" under ${rootDir}`);
+  let ruleNote = "";
+  if (always) {
+    // The settings file lives at the HARNESS root (the dir owning .crewhaus/),
+    // not under the sessions subdir the store uses.
+    const harnessDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+    try {
+      const written = appendSettingsRule(harnessDir, {
+        type: "alwaysAllow",
+        pattern: updated.toolName,
+      });
+      ruleNote = written.added
+        ? ` (standing allow — wrote { type: alwaysAllow, pattern: ${updated.toolName} } to ${written.path}; every future \`${updated.toolName}\` call runs pre-approved on this harness)`
+        : ` (standing allow — ${written.path} already carries the alwaysAllow \`${updated.toolName}\` rule)`;
+    } catch (err) {
+      die(
+        `granted ${id}, but writing the standing alwaysAllow rule failed: ${
+          err instanceof Error ? err.message : String(err)
+        }\nThe grant itself is recorded (one-shot). Fix .crewhaus/settings.json and re-run \`crewhaus approvals grant ${id} --always\`, or add the rule by hand.`,
+      );
+    }
+  }
   if (json) {
     process.stdout.write(`${JSON.stringify(updated, null, 2)}\n`);
     return;
   }
-  const note =
-    decision === "grant"
+  const note = always
+    ? ruleNote
+    : decision === "grant"
       ? " (one-shot — the runtime consumes it on the next matching tool call)"
       : "";
   process.stdout.write(

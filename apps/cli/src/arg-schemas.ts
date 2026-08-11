@@ -955,6 +955,10 @@ export const APPROVALS_SCHEMA: ParseArgsSchema = {
     // grant only — the grant applies to the next matching tool call only
     // (default; the runtime consumes a grant on use). Explicit for scripting.
     { name: "once", takesValue: false },
+    // grant only (#383) — a STANDING allow: grants this call AND persists an
+    // `alwaysAllow` rule for the tool into `.crewhaus/settings.json`, so
+    // future calls (any input) run pre-approved on this harness.
+    { name: "always", takesValue: false },
     { name: "json", takesValue: false },
     { name: "help", short: "h" },
   ],

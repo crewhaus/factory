@@ -2,10 +2,12 @@ import { describe, expect, test } from "bun:test";
 import {
   type ApprovalDecision,
   type ApprovalStore,
+  type ApprovalTraceEvent,
   InMemoryApprovalStore,
   type NewPendingApproval,
   type PendingApproval,
   type RuntimeApprovalRecord,
+  type RuntimeApprovalStoreLike,
   approvalFallbackText,
   createApprovalPrompter,
   createRuntimeBackedApprovalStore,
@@ -441,5 +443,123 @@ describe("createRuntimeBackedApprovalStore", () => {
     const settled = bridged.waitFor("appr_00000000000000aa");
     await bridged.resolve("appr_00000000000000aa", "deny", "slack:U9");
     expect(await settled).toBe("deny");
+  });
+});
+
+describe("#383 — standing (always) grants through the channel seam", () => {
+  test("resolveApproval threads always into the store, trace event, and audit record", async () => {
+    const store = new InMemoryApprovalStore({ genId: seqIds(), now: () => 0 });
+    const p = await store.put({
+      toolName: "log_knowledge_gap",
+      inputPreview: '{"gap":"x"}',
+      surface: "channel",
+      sessionId: "sess_1",
+    });
+    const events: ApprovalTraceEvent[] = [];
+    const audit: Array<{ kind: string; payload: unknown }> = [];
+    const resolved = await resolveApproval({
+      store,
+      approvalId: p.id,
+      decision: "grant",
+      by: "slack:U1",
+      always: true,
+      publish: (e) => events.push(e),
+      auditSink: {
+        append: async (r) => {
+          audit.push(r);
+        },
+      },
+    });
+    expect(resolved?.status).toBe("grant");
+    expect(resolved?.always).toBe(true);
+    expect(events).toEqual([
+      {
+        kind: "approval_resolved",
+        approvalId: p.id,
+        decision: "grant",
+        by: "slack:U1",
+        always: true,
+      },
+    ]);
+    expect(audit).toHaveLength(1);
+    expect((audit[0]?.payload as { always?: boolean }).always).toBe(true);
+  });
+
+  test("always is dropped on a deny", async () => {
+    const store = new InMemoryApprovalStore({ genId: seqIds(), now: () => 0 });
+    const p = await store.put({
+      toolName: "t",
+      inputPreview: "{}",
+      surface: "channel",
+      sessionId: "sess_1",
+    });
+    const events: ApprovalTraceEvent[] = [];
+    const resolved = await resolveApproval({
+      store,
+      approvalId: p.id,
+      decision: "deny",
+      by: "slack:U1",
+      always: true,
+      publish: (e) => events.push(e),
+    });
+    expect(resolved?.status).toBe("deny");
+    expect(resolved?.always).toBeUndefined();
+    expect(events[0]).not.toHaveProperty("always");
+  });
+
+  test("an always grant still resolves first-decision-wins (idempotent)", async () => {
+    const store = new InMemoryApprovalStore({ genId: seqIds(), now: () => 0 });
+    const p = await store.put({
+      toolName: "t",
+      inputPreview: "{}",
+      surface: "channel",
+      sessionId: "sess_1",
+    });
+    expect(
+      (await resolveApproval({ store, approvalId: p.id, decision: "grant", by: "a", always: true }))
+        ?.always,
+    ).toBe(true);
+    // The duplicate click is a no-op (nothing to ACK), not a second effect.
+    expect(
+      await resolveApproval({ store, approvalId: p.id, decision: "grant", by: "b", always: true }),
+    ).toBeNull();
+  });
+
+  test("the runtime-backed bridge passes always through and surfaces it on the record", async () => {
+    const persisted: RuntimeApprovalRecord[] = [];
+    let record: RuntimeApprovalRecord = {
+      id: "appr_0123456789abcdef",
+      toolName: "log_knowledge_gap",
+      inputHash: "h",
+      input: { gap: "x" },
+      runId: "run_1",
+      sessionId: "sess_1",
+      surface: "channel",
+      createdAt: new Date(0).toISOString(),
+    };
+    const runtime: RuntimeApprovalStoreLike = {
+      persist: async (a) => {
+        persisted.push(a);
+      },
+      get: async () => record,
+      resolve: async (_id, decision, by, opts) => {
+        record = {
+          ...record,
+          decision,
+          decidedBy: by,
+          decidedAt: new Date(1).toISOString(),
+          ...(decision === "grant" && opts?.always === true ? { always: true } : {}),
+        };
+        return record;
+      },
+      list: async () => [record],
+    };
+    const store = createRuntimeBackedApprovalStore(runtime);
+    const resolved = await store.resolve(record.id, "grant", "slack:U1", { always: true });
+    expect(resolved?.status).toBe("grant");
+    expect(resolved?.always).toBe(true);
+    // And list() surfaces it for any downstream display.
+    const listed = await store.list();
+    expect(listed[0]?.always).toBe(true);
   });
 });

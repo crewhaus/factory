@@ -246,3 +246,51 @@ describe("evictExpiredApprovals", () => {
     expect((await evictExpiredApprovals({ rootDir: root })).evictedIds).toEqual([]);
   });
 });
+
+describe("#383 — standing (always) grants", () => {
+  test("resolve with { always: true } records always on a grant", async () => {
+    const store = createPendingApprovalStore({ rootDir: root });
+    const p = pending();
+    await store.persist(p);
+    const resolved = await store.resolve(p.id, "grant", "max", { always: true });
+    expect(resolved?.decision).toBe("grant");
+    expect(resolved?.always).toBe(true);
+    const found = await store.get(p.toolName, p.inputHash);
+    expect(found?.always).toBe(true);
+  });
+
+  test("always is ignored on a deny", async () => {
+    const store = createPendingApprovalStore({ rootDir: root });
+    const p = pending();
+    await store.persist(p);
+    const resolved = await store.resolve(p.id, "deny", "max", { always: true });
+    expect(resolved?.decision).toBe("deny");
+    expect(resolved?.always).toBeUndefined();
+  });
+
+  test("a plain grant stays always-less (wire back-compat)", async () => {
+    const store = createPendingApprovalStore({ rootDir: root });
+    const p = pending();
+    await store.persist(p);
+    const resolved = await store.resolve(p.id, "grant", "max");
+    expect(resolved?.always).toBeUndefined();
+    // The on-disk line carries no always key at all.
+    const raw = readFileSync(join(root, DEFAULT_APPROVALS_FILENAME), "utf8");
+    const lines = raw.trim().split("\n");
+    const lastLine = lines[lines.length - 1] ?? "";
+    expect(lastLine).not.toContain("always");
+  });
+
+  test("an always grant survives list() compaction", async () => {
+    const store = createPendingApprovalStore({ rootDir: root });
+    const p = pending();
+    await store.persist(p);
+    await store.resolve(p.id, "grant", "max", { always: true });
+    const listed = await store.list();
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.always).toBe(true);
+    // And re-reads from the compacted file, not just the in-memory fold.
+    const again = await store.list();
+    expect(again[0]?.always).toBe(true);
+  });
+});

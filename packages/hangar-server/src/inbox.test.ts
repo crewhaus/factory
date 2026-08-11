@@ -148,6 +148,46 @@ describe("approvals inbox", () => {
     }
   }, 20_000);
 
+  test("#383 — a standing (always) grant surfaces as granted-always, even once consumed", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = makeFixtureHarness(join(t.harnessesRoot, "inbox-always"), {
+        specName: "inbox-always",
+        sessions: [],
+        approvals: [
+          {
+            id: "appr_00000000000000c1",
+            toolName: "log_knowledge_gap",
+            inputHash: "hash-2",
+            input: { gap: "x" },
+            runId: "run_00000000000000c0",
+            sessionId: "sess_00000000000000aa",
+            surface: "channel",
+            createdAt: iso(NOW - DAY),
+            decision: "grant",
+            decidedBy: "slack:U9",
+            decidedAt: iso(NOW - DAY + 1),
+            always: true,
+            // Consumed by the re-driven run — the standing state still wins.
+            consumedAt: iso(NOW - DAY + 2),
+          },
+        ],
+        reviewQueue: [],
+      });
+      await register(t, dir);
+      const rows = (await t.api("/api/approvals?all=1")).body["approvals"] as Array<{
+        id: string;
+        status: string;
+        always?: boolean;
+      }>;
+      const row = rows.find((r) => r.id === "appr_00000000000000c1");
+      expect(row?.status).toBe("granted-always");
+      expect(row?.always).toBe(true);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
   test("an unknown approval id is a 404, not a silent no-op", async () => {
     const t = bootTestServer({ now: () => NOW });
     try {

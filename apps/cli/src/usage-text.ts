@@ -197,6 +197,8 @@ export function usageText(): string {
     "       [--turn N] [--correction <better answer>] [--adjudicate]",
     "  approvals list|show|grant|deny <id>  resolve tool-permission approvals a headless run parked",
     "       [--dir <root>] [--by <who>]      (permissions.ask_mode: pause); grant is one-shot (--once)",
+    "       [--always]                       unless --always, which also writes a standing alwaysAllow",
+    "                                        rule for the tool to .crewhaus/settings.json",
     "  review list|next|resolve <id>        persistent human-review queue (.crewhaus/review/): eval",
     "       [--kind <k>] [--all] [--note t]     abstentions/panel flags, rater ties, mined quarantine (B20)",
     "  distill --session <id> -o <ds.jsonl> turn ratings into an eval dataset + graders",

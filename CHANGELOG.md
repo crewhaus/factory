@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Standing "always allow" grants on the headless approval surfaces, and
+  builtin allows for the runtime's own bookkeeping tools** (#383). Approval
+  grants are one-shot and keyed on `(toolName, inputHash)` — the right shape
+  for a sensitive one-off, and the wrong one for a tool the agent loop calls
+  autonomously with varying input (`Skill`, the continuity focus/plan/goal
+  tools, knowledge tools like thredz `log_knowledge_gap`): every call hashes
+  fresh, so an operator's Approve could never satisfy the next call and a
+  headless daemon parked in an endless approve loop. The only exit was an
+  `alwaysAllow` rule in the spec plus a recompile and restart.
+
+  Three things close that loop:
+
+  - **`crewhaus approvals grant <id> --always`** (and a third **"Always
+    allow"** button on the Slack approval message) records the grant AND
+    persists `{ type: alwaysAllow, pattern: <toolName> }` into the harness's
+    `.crewhaus/settings.json` — the `settings` rule source, which outranks the
+    spec's `yaml` rules and needs no recompile. The RULE carries the standing
+    behavior; the grant record itself stays one-shot (consumed on use like
+    any grant), so deleting the rule fully revokes the allow. The record
+    carries `always: true` for provenance (`approvals list` and the Hangar
+    inbox show `granted-always`), and the `approval_resolved` trace/audit
+    records carry the flag. In the Slack flow the rule is written before the
+    resume re-drives the parked turn, so the re-driven run already loads it.
+    When the approvals store was located via `CREWHAUS_SESSION_DIR`/a tenant
+    scope, `--always` refuses to guess the harness root and asks for an
+    explicit `--dir` (fail closed, before anything is recorded).
+  - **`runChatLoop` now loads `.crewhaus/settings.json` permission rules on
+    every surface** (new `settingsDir` option, defaulting to the working
+    directory). Compiled bundles previously hardcoded `settings: []`, so the
+    settings layer only existed for `crewhaus run`/`serve`; now a standing
+    allow reaches a running daemon on its next turn. Rules the caller already
+    passed are deduped on `(type, pattern)`; a malformed settings file fails
+    closed, exactly like the CLI's own reader. Sub-agent child loops pass
+    `settingsDir: null` and skip the load: a child's RuleSet is already
+    narrowed from the parent's merged rules by `resolveChildPermissions`, and
+    re-merging the harness file would let a standing allow (settings source)
+    outrank a replace-mode child's explicit deny (yaml source).
+  - **`BUILTIN_DEFAULT_RULES` now pre-allows the runtime's bookkeeping
+    toolset** (new `BUILTIN_BOOKKEEPING_RULES`: `Skill`, `FocusRead`,
+    `FocusWrite`, `PlanRead`, `PlanUpdate`, `PlanComplete`, `GoalWrite`,
+    `GoalUpdate`, `GoalList`). Continuity is default-on and these are
+    local-only reads/writes of the harness's own state — parking a daemon on
+    its own default-on bookkeeping is never what an operator wants, and the
+    reasoning is the same one that already pre-allowed `Read`/`Glob`/`Grep`.
+    `MemoryClear` is deliberately excluded (it erases continuity state), and
+    a spec-level `alwaysAsk`/`alwaysDeny` still overrides (`yaml` outranks
+    `builtin`).
+
+  A grant without `--always` behaves exactly as before (one-shot, consumed on
+  use), the deny path is unchanged, and old approval records — which carry no
+  `always` field — resolve identically.
+
 ## [0.5.1] - 2026-08-05
 
 ### Fixed

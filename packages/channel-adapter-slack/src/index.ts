@@ -36,6 +36,7 @@ export { signSlackBody, verifySlackSignature } from "./verify.js";
 // Loop contract 0.4 (Batch C, G11) — Slack interactive approval surface.
 export {
   APPROVE_ACTION_ID,
+  APPROVE_ALWAYS_ACTION_ID,
   DENY_ACTION_ID,
   APPROVAL_BLOCK_ID_PREFIX,
   type ApprovalPromptContent,
@@ -469,6 +470,8 @@ export function createSlackAdapter(
       const ack = buildApprovalAckMessage({
         decision: args.decision,
         by: args.by,
+        // #383 — an "Always allow" click acks as a standing approval.
+        ...(args.interaction.always === true ? { always: true } : {}),
         ...(args.toolName !== undefined ? { toolName: args.toolName } : {}),
       });
       if (args.interaction.responseUrl !== undefined) {
