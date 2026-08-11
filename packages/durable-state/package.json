@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/durable-state",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "type": "module",
   "description": "Pluggable dedup + budget stores (audit follow-up R3) — in-memory defaults, bun:sqlite cross-process backend",
   "main": "src/index.ts",
