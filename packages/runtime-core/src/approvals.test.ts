@@ -23,6 +23,7 @@ import { DEFAULT_PRICING, computeCostMicros, resolvePricing } from "@crewhaus/co
 import { RunFailedError } from "@crewhaus/errors";
 import {
   BUILTIN_DEFAULT_RULES,
+  type JustificationJudge,
   appendSettingsRule,
   emptyRuleSet,
 } from "@crewhaus/permission-engine";
@@ -302,6 +303,74 @@ describe("G11 — pending-approval parking (headless ask, ask_mode: pause)", () 
     const third = await park();
     expect(third.caught).toBeInstanceOf(RunFailedError);
     expect(third.events.some((e) => e.kind === "approval_requested")).toBe(true);
+  });
+
+  test("a grant is consumed by a regenerated call whose injected justification was re-worded (#386)", async () => {
+    // A justification-gated variant of the danger tool. Its own schema does
+    // NOT declare the field (and is .strict(), so an unstripped field would
+    // fail validation) — the runtime injects it into the advertised schema,
+    // and the model re-words it on every regeneration. The approval hash
+    // must therefore key on the OPERATIVE input, or a granted approval could
+    // never be consumed and the run would re-park forever.
+    const gatedDanger = (onCall?: (input: unknown) => void) =>
+      buildTool({
+        name: "danger",
+        description: "a justification-gated tool that must be approved",
+        inputSchema: z.object({ x: z.number() }).strict(),
+        requireJustification: true,
+        execute: async (i) => {
+          onCall?.(i);
+          return `did ${i.x}`;
+        },
+      });
+    const judge: JustificationJudge = async () => ({
+      allow: true,
+      reason: "consistent with the session goal",
+      judgeModel: "test-judge",
+    });
+
+    // Phase 1 — park.
+    const first = await runSingleTurn({
+      _adapter: scriptedAdapter([
+        [use("tu_1", "danger", { x: 9, justification: "initial wording tied to the goal" })],
+        [text("done")],
+      ]).adapter,
+      tools: [gatedDanger()],
+      approvals: { store },
+      justificationJudge: judge,
+    });
+    const req = first.events.find((e) => e.kind === "approval_requested");
+    if (req?.kind !== "approval_requested") throw new Error("expected a park");
+    // Keyed on the OPERATIVE input (justification excluded)…
+    const parked = await store.get("danger", hashApprovalInput("danger", { x: 9 }));
+    expect(parked?.id).toBe(req.approvalId);
+    // …while the persisted record still shows the approving operator the
+    // full model input, justification included.
+    expect((parked?.input as Record<string, unknown> | undefined)?.["justification"]).toBe(
+      "initial wording tied to the goal",
+    );
+
+    await store.resolve(req.approvalId, "grant", "tester");
+
+    // Phase 2 — the rerun regenerates the call: identical operative args,
+    // re-worded justification. The grant must be found and consumed.
+    const executed: unknown[] = [];
+    const second = await runSingleTurn({
+      _adapter: scriptedAdapter([
+        [use("tu_1", "danger", { x: 9, justification: "a re-worded reason, same intent" })],
+        [text("done")],
+      ]).adapter,
+      tools: [gatedDanger((i) => executed.push(i))],
+      approvals: { store },
+      justificationJudge: judge,
+    });
+    expect(second.caught).toBeUndefined();
+    expect(second.result).toBe("done");
+    // The .strict() schema proves the injected field was stripped en route.
+    expect(executed).toEqual([{ x: 9 }]);
+    expect(second.events.some((e) => e.kind === "approval_requested")).toBe(false);
+    // One-shot: consumed.
+    expect(await store.get("danger", hashApprovalInput("danger", { x: 9 }))).toBeNull();
   });
 
   test("resume after a deny denies the tool with a note (no park, run continues)", async () => {

@@ -159,6 +159,18 @@ export interface ToolDefinition<TInput = unknown> {
    * `permission_justification_evaluated` record to `@crewhaus/audit-log`; a
    * deny additionally blocks the call.
    *
+   * The contract is advertised, not just enforced (#386): at request-build
+   * time the runtime augments the tool's MODEL-FACING input schema with a
+   * required `justification` string property (via
+   * `withJustificationField`) unless the tool's own schema already declares
+   * one — models conform tightly to advertised schemas and never invent
+   * undeclared fields, so an unadvertised requirement would deny every
+   * call. When the field was runtime-injected it is stripped from the input
+   * again (via `stripJustificationField`) before the input reaches the
+   * tool's validator/executor, so remote MCP servers and strict zod schemas
+   * never see a field their own schema doesn't allow. A tool that declares
+   * the field itself keeps receiving it verbatim.
+   *
    * Default at normalization is `false`. Recommended `true` for any tool
    * with destructive or external side effects (evm-tx, message-channel,
    * federation outbound). Independent of `scope` — a tool can be
@@ -366,6 +378,109 @@ export class ToolCatalog {
   quarantineInfo(name: string): QuarantinedTool | undefined {
     return this._quarantined.get(name);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Pillar 3 intent gate — justification schema advertisement (#386)
+// ---------------------------------------------------------------------------
+
+/**
+ * The reserved input field the intent gate reads the model's justification
+ * from. Runtime loops read `input[JUSTIFICATION_INPUT_FIELD]` on every
+ * `requireJustification` tool call and hand it to `permission-engine`'s
+ * `evaluateJustification`.
+ */
+export const JUSTIFICATION_INPUT_FIELD = "justification";
+
+/**
+ * Model-facing description attached to a runtime-injected `justification`
+ * property. This is the only place the model learns the contract, so it
+ * states all three facts: what to write, who evaluates it, and that it is
+ * recorded.
+ */
+export const JUSTIFICATION_FIELD_DESCRIPTION =
+  "Required by the runtime's intent gate: one or two sentences explaining how this " +
+  "specific call serves the session's stated goal. A justification judge evaluates it " +
+  "before the tool runs and it is recorded verbatim in the audit log; calls whose " +
+  "justification is missing, too brief, or unrelated to the goal are denied.";
+
+/** Result of {@link withJustificationField}: the schema to advertise, and
+ *  whether the `justification` property was injected by the runtime (true) or
+ *  was already declared by the tool's own schema (false — schema returned
+ *  untouched, by reference). */
+export type JustificationSchemaResult = {
+  readonly schema: Record<string, unknown>;
+  readonly injected: boolean;
+};
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Does this JSON schema itself declare a top-level `justification` property?
+ * When it does, the tool (or the remote MCP server behind it) owns the
+ * contract: the runtime must neither re-inject the property nor strip the
+ * field from the input it forwards.
+ */
+export function schemaDeclaresJustification(schema: unknown): boolean {
+  if (!isPlainObject(schema)) return false;
+  const properties = schema["properties"];
+  return isPlainObject(properties) && properties[JUSTIFICATION_INPUT_FIELD] !== undefined;
+}
+
+/**
+ * Augment a model-facing JSON schema with the required `justification`
+ * string property the intent gate reads (#386). Pure and non-mutating: the
+ * input schema object is never modified — collections are shallow-copied on
+ * the injected path, and the untouched path returns the input by reference.
+ *
+ * - Top-level object schema without a declared `justification` → returns a
+ *   copy with the property added and `"justification"` appended to
+ *   `required` (`injected: true`).
+ * - Schema that already declares the property → returned untouched
+ *   (`injected: false`); the tool owns the contract.
+ * - Non-object schema (no `type: "object"`) → returned untouched
+ *   (`injected: false`). Model providers require an object root for tool
+ *   input schemas, and runtime loops coerce degenerate schemas to an object
+ *   BEFORE calling this, so this arm only skips schemas the provider would
+ *   reject anyway.
+ */
+export function withJustificationField(schema: Record<string, unknown>): JustificationSchemaResult {
+  if (schema["type"] !== "object" || schemaDeclaresJustification(schema)) {
+    return { schema, injected: false };
+  }
+  const baseProperties = isPlainObject(schema["properties"]) ? schema["properties"] : {};
+  const properties: Record<string, unknown> = {
+    ...baseProperties,
+    [JUSTIFICATION_INPUT_FIELD]: {
+      type: "string",
+      description: JUSTIFICATION_FIELD_DESCRIPTION,
+    },
+  };
+  const baseRequired = Array.isArray(schema["required"])
+    ? (schema["required"] as unknown[]).filter(
+        (entry): entry is string => typeof entry === "string",
+      )
+    : [];
+  const required = baseRequired.includes(JUSTIFICATION_INPUT_FIELD)
+    ? baseRequired
+    : [...baseRequired, JUSTIFICATION_INPUT_FIELD];
+  return { schema: { ...schema, properties, required }, injected: true };
+}
+
+/**
+ * Remove a runtime-injected `justification` field from a tool input before
+ * it is forwarded to the tool's validator/executor. Callers apply this ONLY
+ * when {@link withJustificationField} reported `injected: true` for the
+ * tool — a tool whose own schema declares the field keeps receiving it.
+ * Non-mutating: returns a shallow copy without the key, or the input
+ * unchanged (by reference) when there is nothing to strip.
+ */
+export function stripJustificationField(input: unknown): unknown {
+  if (!isPlainObject(input) || !(JUSTIFICATION_INPUT_FIELD in input)) return input;
+  const { [JUSTIFICATION_INPUT_FIELD]: _stripped, ...rest } = input;
+  return rest;
 }
 
 export const defaultCatalog = new ToolCatalog();

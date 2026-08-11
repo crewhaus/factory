@@ -515,6 +515,50 @@ describe("G27 — loop-detection escalation ladder", () => {
     expect(warning).toBeDefined();
     expect(warning).toContain("near-identical inputs");
   });
+
+  test("re-worded injected justifications do not hide a loop of identical operative calls (#386)", async () => {
+    // A justification-gated tool: the runtime injects the field into the
+    // advertised schema, and the model re-words it on every call. History
+    // must record the OPERATIVE input, or the varying wording keeps the
+    // signatures apart in both detector tiers and the loop is invisible.
+    const gatedEcho = buildTool({
+      name: "gecho",
+      description: "echo the message back (justification-gated)",
+      inputSchema: z.object({ msg: z.string() }).strict(),
+      readOnly: true,
+      concurrencySafe: true,
+      requireJustification: true,
+      execute: async (i) => i.msg,
+    });
+    const judge: import("@crewhaus/permission-engine").JustificationJudge = async () => ({
+      allow: true,
+      reason: "consistent with the session goal",
+      judgeModel: "test-judge",
+    });
+    const gatedUse = (id: string, justification: string): ScriptBlock => ({
+      type: "tool_use",
+      id,
+      name: "gecho",
+      input: { msg: "same", justification },
+    });
+    const { adapter, reqs, calls } = scriptedAdapter([
+      [gatedUse("t1", "echo the message the user asked for")],
+      [gatedUse("t2", "repeating the echo to fulfil the request")],
+      [gatedUse("t3", "the user's request still needs this echo")],
+      [gatedUse("t4", "one more echo toward the stated goal")],
+      [text("done")],
+    ]);
+    const { caught } = await runSingleTurnCollecting({
+      _adapter: adapter,
+      tools: [gatedEcho],
+      justificationJudge: judge,
+    });
+    expect(caught).toBeUndefined();
+    expect(calls()).toBe(5);
+    // Identical operative inputs trip the exact tier at the default
+    // threshold 3 — the warning rides call 4's request.
+    expect(syntheticTexts(reqs[3]).some((t) => t.includes("possible loop detected"))).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

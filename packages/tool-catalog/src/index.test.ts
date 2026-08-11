@@ -1,7 +1,17 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { CrewhausError } from "@crewhaus/errors";
 import { z } from "zod";
-import { type RegisteredTool, ToolCatalog, ToolCatalogError, defaultCatalog } from "./index";
+import {
+  JUSTIFICATION_FIELD_DESCRIPTION,
+  JUSTIFICATION_INPUT_FIELD,
+  type RegisteredTool,
+  ToolCatalog,
+  ToolCatalogError,
+  defaultCatalog,
+  schemaDeclaresJustification,
+  stripJustificationField,
+  withJustificationField,
+} from "./index";
 
 function makeTool(name: string): RegisteredTool {
   return {
@@ -149,5 +159,110 @@ describe("RegisteredTool jsonSchema field", () => {
     const tool = makeTool("Plain");
     catalog.register(tool);
     expect(catalog.get("Plain")?.jsonSchema).toBeUndefined();
+  });
+});
+
+describe("justification schema advertisement (#386)", () => {
+  test("withJustificationField injects a required, described string property", () => {
+    const base = {
+      type: "object",
+      properties: { page: { type: "string" } },
+      required: ["page"],
+    };
+    const { schema, injected } = withJustificationField(base);
+    expect(injected).toBe(true);
+    const properties = schema["properties"] as Record<string, unknown>;
+    expect(properties["page"]).toEqual({ type: "string" });
+    expect(properties[JUSTIFICATION_INPUT_FIELD]).toEqual({
+      type: "string",
+      description: JUSTIFICATION_FIELD_DESCRIPTION,
+    });
+    expect(schema["required"]).toEqual(["page", JUSTIFICATION_INPUT_FIELD]);
+  });
+
+  test("withJustificationField creates required when the base schema has none", () => {
+    const { schema, injected } = withJustificationField({ type: "object" });
+    expect(injected).toBe(true);
+    expect(schema["required"]).toEqual([JUSTIFICATION_INPUT_FIELD]);
+    const properties = schema["properties"] as Record<string, unknown>;
+    expect(properties[JUSTIFICATION_INPUT_FIELD]).toBeDefined();
+  });
+
+  test("withJustificationField does not mutate the input schema", () => {
+    const base = {
+      type: "object",
+      properties: { page: { type: "string" } },
+      required: ["page"],
+      additionalProperties: false,
+    };
+    const snapshot = structuredClone(base);
+    const { schema } = withJustificationField(base);
+    expect(base).toEqual(snapshot);
+    expect(schema).not.toBe(base);
+    // Non-schema keys ride along untouched on the copy.
+    expect(schema["additionalProperties"]).toBe(false);
+  });
+
+  test("withJustificationField is a no-op when the schema declares the field itself", () => {
+    const base = {
+      type: "object",
+      properties: {
+        page: { type: "string" },
+        [JUSTIFICATION_INPUT_FIELD]: { type: "string", description: "server-owned contract" },
+      },
+      required: ["page"],
+    };
+    const { schema, injected } = withJustificationField(base);
+    expect(injected).toBe(false);
+    // Untouched, by reference — the tool owns the contract, `required` included.
+    expect(schema).toBe(base);
+  });
+
+  test("withJustificationField leaves non-object schemas alone", () => {
+    const base = { type: "string" };
+    const { schema, injected } = withJustificationField(base);
+    expect(injected).toBe(false);
+    expect(schema).toBe(base);
+  });
+
+  test("withJustificationField does not duplicate a pre-listed required entry", () => {
+    // Degenerate but legal: `required` names the field, `properties` omits it.
+    const base = { type: "object", required: [JUSTIFICATION_INPUT_FIELD] };
+    const { schema, injected } = withJustificationField(base);
+    expect(injected).toBe(true);
+    expect(schema["required"]).toEqual([JUSTIFICATION_INPUT_FIELD]);
+  });
+
+  test("schemaDeclaresJustification distinguishes declared from undeclared", () => {
+    expect(
+      schemaDeclaresJustification({
+        type: "object",
+        properties: { [JUSTIFICATION_INPUT_FIELD]: { type: "string" } },
+      }),
+    ).toBe(true);
+    expect(
+      schemaDeclaresJustification({ type: "object", properties: { page: { type: "string" } } }),
+    ).toBe(false);
+    expect(schemaDeclaresJustification({ type: "object" })).toBe(false);
+    expect(schemaDeclaresJustification(undefined)).toBe(false);
+    expect(schemaDeclaresJustification("not a schema")).toBe(false);
+  });
+
+  test("stripJustificationField removes the key without mutating the input", () => {
+    const input = { page: "runbook", [JUSTIFICATION_INPUT_FIELD]: "goal-tied reason" };
+    const snapshot = structuredClone(input);
+    const stripped = stripJustificationField(input) as Record<string, unknown>;
+    expect(stripped).toEqual({ page: "runbook" });
+    expect(input).toEqual(snapshot);
+  });
+
+  test("stripJustificationField passes through inputs with nothing to strip", () => {
+    const plain = { page: "runbook" };
+    expect(stripJustificationField(plain)).toBe(plain);
+    expect(stripJustificationField("text")).toBe("text");
+    expect(stripJustificationField(null)).toBe(null);
+    expect(stripJustificationField(undefined)).toBe(undefined);
+    const arr = [1, 2];
+    expect(stripJustificationField(arr)).toBe(arr);
   });
 });

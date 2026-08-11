@@ -7,6 +7,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { createLogger } from "@crewhaus/logging";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
+import { JUSTIFICATION_FIELD_DESCRIPTION } from "@crewhaus/tool-catalog";
 import { z } from "zod";
 import { replayMessageHistory, resolveAuth, runChatLoop, sanitizeOrphanToolUses } from "./index";
 
@@ -2086,6 +2087,437 @@ describe("runChatLoop justification gate (FR-004)", () => {
     });
     // Reaching here without a thrown rejection is the assertion.
     expect(true).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #386 — the justification contract is ADVERTISED, not just enforced.
+// ---------------------------------------------------------------------------
+
+/**
+ * Mirrors `makeJustifiedToolUseAdapter`, with two additions: the tool name +
+ * input are parameterized, and every request's advertised `tools` array is
+ * captured so tests can assert what the MODEL was actually shown (#386 — the
+ * gate reads `input["justification"]`, so the advertised schema must declare
+ * it or models never supply it).
+ */
+function makeToolAdvertisementAdapter(
+  toolName: string,
+  input: Record<string, unknown>,
+  capturedToolSets: Array<ReadonlyArray<{ readonly name: string; readonly input_schema: unknown }>>,
+): import("@crewhaus/adapter-anthropic").ProviderAdapter {
+  let i = 0;
+  return {
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
+    },
+    estimateTokens: () => 0,
+    stream: (req) => {
+      capturedToolSets.push(req.tools ?? []);
+      const isFirst = i === 0;
+      i += 1;
+      return (async function* () {
+        yield { kind: "message_start", usage: { input: 10, output: 0 } } as const;
+        if (isFirst) {
+          yield {
+            kind: "content_block_start",
+            index: 0,
+            block: { type: "tool_use", id: "toolu_adv", name: toolName, input: {} },
+          } as const;
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: { type: "input_json_delta", partial_json: JSON.stringify(input) },
+          } as const;
+          yield { kind: "content_block_stop", index: 0 } as const;
+          yield {
+            kind: "message_delta",
+            stopReason: "tool_use",
+            usage: { input: 10, output: 5 },
+          } as const;
+        } else {
+          yield {
+            kind: "content_block_start",
+            index: 0,
+            block: { type: "text", text: "" },
+          } as const;
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "done" },
+          } as const;
+          yield { kind: "content_block_stop", index: 0 } as const;
+          yield {
+            kind: "message_delta",
+            stopReason: "end_turn",
+            usage: { input: 10, output: 5 },
+          } as const;
+        }
+        yield { kind: "message_stop" } as const;
+      })();
+    },
+  };
+}
+
+const allowAllJudge: import("@crewhaus/permission-engine").JustificationJudge = async () => ({
+  allow: true,
+  reason: "consistent with the session goal",
+  judgeModel: "test-judge",
+});
+
+describe("runChatLoop justification schema advertisement (#386)", () => {
+  test("advertises a required justification property for gated tools whose schema lacks it", async () => {
+    const gated = buildTool({
+      name: "sendmessage",
+      description: "send a message (justification-gated)",
+      inputSchema: z.object({ body: z.string() }),
+      requireJustification: true,
+      execute: async () => "sent",
+    });
+    const plain = buildTool({
+      name: "lookup",
+      description: "read-only lookup",
+      inputSchema: z.object({ q: z.string() }),
+      readOnly: true,
+      execute: async () => "found",
+    });
+
+    const capturedToolSets: Array<
+      ReadonlyArray<{ readonly name: string; readonly input_schema: unknown }>
+    > = [];
+    await runChatLoop({
+      model: "test-model",
+      instructions: "Acknowledge support tickets the user points you at.",
+      _adapter: makeToolAdvertisementAdapter(
+        "sendmessage",
+        { body: "ack", justification: "acknowledge the user's ticket per the goal" },
+        capturedToolSets,
+      ),
+      runContext: createRunContext(),
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "ack the ticket" }],
+      tools: [gated, plain],
+      permissionMode: "bypass",
+      justificationJudge: allowAllJudge,
+    });
+
+    expect(capturedToolSets.length).toBeGreaterThan(0);
+    const advertised = capturedToolSets[0] ?? [];
+    const gatedSchema = advertised.find((t) => t.name === "sendmessage")?.input_schema as Record<
+      string,
+      unknown
+    >;
+    const gatedProps = gatedSchema["properties"] as Record<string, unknown>;
+    expect(gatedProps["justification"]).toEqual({
+      type: "string",
+      description: JUSTIFICATION_FIELD_DESCRIPTION,
+    });
+    expect(gatedSchema["required"]).toContain("justification");
+    // The tool's own declared fields survive the augmentation.
+    expect(gatedProps["body"]).toBeDefined();
+    // Ungated tools are untouched.
+    const plainSchema = advertised.find((t) => t.name === "lookup")?.input_schema as Record<
+      string,
+      unknown
+    >;
+    const plainProps = plainSchema["properties"] as Record<string, unknown>;
+    expect(plainProps["justification"]).toBeUndefined();
+  });
+
+  test("strips the runtime-injected justification before an MCP-style tool executes — while the judge and audit sink still see it in full", async () => {
+    const received: unknown[] = [];
+    // MCP shape: permissive zod validator + verbatim remote JSON schema that
+    // does NOT allow extra fields — exactly the case where forwarding the
+    // injected field would make the remote server reject the call.
+    const wikiWrite = buildTool({
+      name: "thredz__wiki_write",
+      description: "write a wiki page",
+      inputSchema: z.unknown(),
+      jsonSchema: {
+        type: "object",
+        properties: { page: { type: "string" } },
+        required: ["page"],
+        additionalProperties: false,
+      },
+      requireJustification: true,
+      execute: async (input) => {
+        received.push(input);
+        return "written";
+      },
+    });
+
+    const JUSTIFICATION = "record the runbook update per the session goal";
+    // Capturing judge: proves the gate hands the judge the FULL justification
+    // even though the tool later receives the stripped input.
+    const judgeSaw: Array<{ justification: string; input: unknown }> = [];
+    const capturingJudge: import("@crewhaus/permission-engine").JustificationJudge = async (
+      input,
+    ) => {
+      judgeSaw.push({ justification: input.justification, input: input.input });
+      return { allow: true, reason: "consistent with the session goal", judgeModel: "test-judge" };
+    };
+    const appended: Array<{ kind: string; payload: Record<string, unknown> }> = [];
+    const sink: import("./index").JustificationAuditSink = {
+      async append(record) {
+        appended.push(record as { kind: string; payload: Record<string, unknown> });
+        return record;
+      },
+    };
+
+    const capturedToolSets: Array<
+      ReadonlyArray<{ readonly name: string; readonly input_schema: unknown }>
+    > = [];
+    const runContext = createRunContext();
+    const seen: import("@crewhaus/trace-event-bus").TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => {
+      seen.push(e);
+    });
+    await runChatLoop({
+      model: "test-model",
+      instructions: "Maintain the team wiki.",
+      _adapter: makeToolAdvertisementAdapter(
+        "thredz__wiki_write",
+        { page: "runbook", justification: JUSTIFICATION },
+        capturedToolSets,
+      ),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "save the runbook" }],
+      tools: [wikiWrite],
+      permissionMode: "bypass",
+      justificationJudge: capturingJudge,
+      justificationAuditSink: sink,
+    });
+
+    // The advertised (model-facing) schema demanded the field…
+    const advertised = capturedToolSets[0]?.find((t) => t.name === "thredz__wiki_write");
+    const advertisedSchema = advertised?.input_schema as Record<string, unknown>;
+    expect(advertisedSchema["required"]).toContain("justification");
+    // …the gate saw and allowed it…
+    const decision = seen.find(
+      (
+        e,
+      ): e is Extract<
+        import("@crewhaus/trace-event-bus").TraceEvent,
+        { kind: "permission_decision" }
+      > =>
+        e.kind === "permission_decision" &&
+        e.toolName === "thredz__wiki_write" &&
+        (e.reason?.startsWith("justification:") ?? false),
+    );
+    expect(decision?.decision).toBe("allow");
+    // …the judge received the FULL justification (and full input)…
+    expect(judgeSaw).toEqual([
+      {
+        justification: JUSTIFICATION,
+        input: { page: "runbook", justification: JUSTIFICATION },
+      },
+    ]);
+    // …the audit sink recorded it verbatim…
+    expect(appended.length).toBe(1);
+    expect(appended[0]?.payload["justification"]).toBe(JUSTIFICATION);
+    // …and the tool itself received the input WITHOUT the injected field.
+    expect(received).toEqual([{ page: "runbook" }]);
+  });
+
+  test("denies with a field-naming remediation when the model still omits the justification", async () => {
+    const received: unknown[] = [];
+    const sendMessage = buildTool({
+      name: "sendmessage",
+      description: "send a message (justification-gated)",
+      inputSchema: z.object({ body: z.string() }),
+      requireJustification: true,
+      execute: async (input) => {
+        received.push(input);
+        return "sent";
+      },
+    });
+
+    // Capture full requests so the tool_result the model is shown after the
+    // deny can be asserted (the deny text is the model's only recovery signal
+    // when it ignores the advertised schema).
+    const requests: Array<import("@crewhaus/adapter-anthropic").ProviderRequest> = [];
+    const base = makeToolAdvertisementAdapter("sendmessage", { body: "ack" }, []);
+    const adapter: import("@crewhaus/adapter-anthropic").ProviderAdapter = {
+      ...base,
+      stream: (req) => {
+        requests.push(req);
+        return base.stream(req);
+      },
+    };
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "Acknowledge support tickets the user points you at.",
+      _adapter: adapter,
+      runContext: createRunContext(),
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "ack the ticket" }],
+      tools: [sendMessage],
+      permissionMode: "bypass",
+      // No judge override: the default rule-based judge denies 0 chars.
+    });
+
+    // The tool never ran…
+    expect(received).toEqual([]);
+    // …and the tool_result fed back to the model names the input field.
+    const toolResults = (requests[1]?.messages ?? [])
+      .flatMap((m) => (Array.isArray(m.content) ? m.content : []))
+      .filter(
+        (b): b is Extract<typeof b, { type: "tool_result" }> =>
+          typeof b === "object" && b !== null && b.type === "tool_result",
+      );
+    expect(toolResults.length).toBe(1);
+    const denyText = typeof toolResults[0]?.content === "string" ? toolResults[0].content : "";
+    expect(denyText).toContain("[justification denied]");
+    expect(denyText).toContain("`justification` string field in the tool input");
+  });
+
+  test("arg-scoped alwaysAllow rules match the operative input, not the injected justification", async () => {
+    const received: unknown[] = [];
+    const sendMessage = buildTool({
+      name: "sendmessage",
+      description: "send a message (justification-gated)",
+      inputSchema: z.object({ body: z.string() }),
+      requireJustification: true,
+      execute: async (input) => {
+        received.push(input);
+        return "sent";
+      },
+    });
+
+    const result = await runChatLoop({
+      model: "test-model",
+      instructions: "Acknowledge support tickets the user points you at.",
+      _adapter: makeToolAdvertisementAdapter(
+        "sendmessage",
+        // The justification deliberately does NOT match the arg glob below:
+        // `sendmessage` has no OPERATIVE_ARG_FIELDS entry, so the matcher
+        // requires EVERY string in the matched input to satisfy the glob —
+        // pre-fix the full input (justification included) broke the rule.
+        { body: "ack", justification: "explain to the user per the session goal" },
+        [],
+      ),
+      runContext: createRunContext(),
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "ack the ticket" }],
+      tools: [sendMessage],
+      permissionMode: "default",
+      settingsDir: null,
+      permissionRules: {
+        flag: [],
+        settings: [],
+        yaml: [{ type: "alwaysAllow", pattern: "sendmessage(ack*)", source: "yaml" }],
+        hooks: [],
+        builtin: [],
+      },
+      justificationJudge: allowAllJudge,
+    });
+
+    // Rule matched on the operative input → allow → the tool ran. Pre-fix
+    // this collapsed to a headless deny (rule miss → default-mode "ask").
+    expect(result).toBe("done");
+    expect(received).toEqual([{ body: "ack" }]);
+  });
+
+  test("the egress classifier scans the operative payload for injected-justification tools", async () => {
+    const { _clearEgressCache } = await import("@crewhaus/egress-classifier");
+    _clearEgressCache();
+
+    const payloads: string[] = [];
+    const spyMatcher: import("@crewhaus/egress-classifier").EgressMatcher = {
+      name: "spy-386-operative-payload",
+      match: (input) => {
+        payloads.push(input.payload);
+        return { originsFound: [], matchCount: 0 };
+      },
+    };
+
+    const JUSTIFICATION = "post the digest to the channel per the session goal";
+    const post = buildTool({
+      name: "postdigest",
+      description: "post a digest to an external channel",
+      inputSchema: z.object({ body: z.string() }),
+      scope: "external",
+      requireJustification: true,
+      execute: async () => "posted",
+    });
+
+    const runContext = createRunContext();
+    // Non-empty lineage so classifyEgress actually consults the matcher.
+    runContext.dataLineage = new Map<string, import("@crewhaus/run-context").TrustOrigin>([
+      ["some-tagged-content-not-in-the-payload", "subagent"],
+    ]);
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "Post the daily digest.",
+      _adapter: makeToolAdvertisementAdapter(
+        "postdigest",
+        { body: "digest: all green", justification: JUSTIFICATION },
+        [],
+      ),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "post it" }],
+      tools: [post],
+      permissionMode: "bypass",
+      justificationJudge: allowAllJudge,
+      egressMatcher: spyMatcher,
+    });
+
+    // The classifier scanned exactly what the tool transmits: the operative
+    // payload, with the injected gate metadata stripped.
+    expect(payloads.length).toBe(1);
+    expect(payloads[0]).toContain("digest: all green");
+    expect(payloads[0]).not.toContain(JUSTIFICATION);
+  });
+
+  test("forwards the justification to tools that declare the field in their own schema", async () => {
+    const received: unknown[] = [];
+    const sendMessage = buildTool({
+      name: "sendmessage",
+      description: "send a message (justification-gated)",
+      inputSchema: z.object({ body: z.string(), justification: z.string().optional() }),
+      requireJustification: true,
+      execute: async (input) => {
+        received.push(input);
+        return "sent";
+      },
+    });
+
+    const capturedToolSets: Array<
+      ReadonlyArray<{ readonly name: string; readonly input_schema: unknown }>
+    > = [];
+    await runChatLoop({
+      model: "test-model",
+      instructions: "Acknowledge support tickets the user points you at.",
+      _adapter: makeToolAdvertisementAdapter(
+        "sendmessage",
+        { body: "ack", justification: "acknowledge the user's ticket per the goal" },
+        capturedToolSets,
+      ),
+      runContext: createRunContext(),
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "ack the ticket" }],
+      tools: [sendMessage],
+      permissionMode: "bypass",
+      justificationJudge: allowAllJudge,
+    });
+
+    // Declared field ⇒ schema passes through untouched (required not forced)…
+    const advertisedSchema = capturedToolSets[0]?.find((t) => t.name === "sendmessage")
+      ?.input_schema as Record<string, unknown>;
+    expect(advertisedSchema["required"]).toEqual(["body"]);
+    // …and the tool receives the field verbatim — it owns the contract.
+    expect(received).toEqual([
+      { body: "ack", justification: "acknowledge the user's ticket per the goal" },
+    ]);
   });
 });
 
