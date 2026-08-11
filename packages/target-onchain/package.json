@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-onchain",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "type": "module",
   "description": "Codegen for the §47 `onchain` event-driven daemon. Emits a self-contained agent.ts that subscribes to chain triggers, classifies inbound events, dedupes by tx-hash + log-index, and runs one agent turn per event.",
   "main": "src/index.ts",

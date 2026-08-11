@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-executor",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "type": "module",
   "description": "Execute a single tool: validate → permission-check → invoke → format result",
   "main": "src/index.ts",

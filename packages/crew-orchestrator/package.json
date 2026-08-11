@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/crew-orchestrator",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "type": "module",
   "description": "Role-based dispatcher for the CRW shape — runs runChatLoop per role, threads handoffs + A2A messages (Section 22)",
   "main": "src/index.ts",

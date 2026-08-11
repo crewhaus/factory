@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/federation-discovery",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "type": "module",
   "description": "Federation peer lookup: DNS SRV + .well-known/crewhaus.json with TTL caching (Section 34)",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/single-binary-cli",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "type": "module",
   "description": "bun build --compile wrapper producing self-contained crewhaus binaries for linux/macos/windows × x64/arm64; auto-generated Homebrew/apt/Scoop/Winget manifests (Section 32)",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-memory",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "type": "module",
   "description": "M4.2 — Remember and Recall tools wrapping @crewhaus/memory-store for cross-session persistent memory.",
   "main": "src/index.ts",
