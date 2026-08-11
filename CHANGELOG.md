@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`requireJustification` tools no longer deny every call: the justification
+  contract is now advertised in the tool's model-facing schema** (#386). The
+  Pillar 3 intent gate reads `input["justification"]`, but nothing told the
+  model that field existed — tool-mcp forwards remote schemas verbatim and
+  first-party gated tools don't declare it — and models conform tightly to
+  advertised schemas, so every gated call was denied
+  `justification too brief (0 chars)` (for MCP-registered gated tools such as
+  the Thredz wiki aliases, the gate was effectively a hard-off switch). At
+  request-build time `runChatLoop` now augments each gated tool's advertised
+  input schema with a required, described `justification` string property
+  (`withJustificationField` in `@crewhaus/tool-catalog`) unless the tool's
+  own schema already declares one. For exactly those runtime-injected tools,
+  every surface that reasons about what the tool DOES consumes the OPERATIVE
+  input (justification stripped via `stripJustificationField`): the tool's
+  validator/executor (remote MCP servers with `additionalProperties: false`
+  and strict zod schemas never see a field their schema doesn't allow),
+  arg-scoped permission-rule matching (`Tool(argGlob)` rules keep matching
+  the way they did before the field existed), the headless approval
+  `inputHash` (a one-shot grant stays consumable by a regenerated call whose
+  re-worded justification would otherwise hash it apart), tool-loop-detection
+  history (re-worded justifications can't hide a loop of identical calls),
+  and the egress classifier (scans what is actually transmitted). Surfaces
+  that record what the model DID keep the full input: the event log, trace
+  bus, pre-tool hooks, the parked approval's display record, the
+  justification gate itself, and the justification audit sink. Tools that
+  declare the field in their own schema are untouched on every surface — for
+  them the field is genuine tool input. The gate's deny message now also
+  names the `justification` input field so a model that still omits it can
+  recover.
+
 ## [0.5.2] - 2026-08-10
 
 ### Added

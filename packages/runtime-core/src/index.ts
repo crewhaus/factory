@@ -111,6 +111,7 @@ import { executeStreaming } from "@crewhaus/streaming-tool-executor";
 import { currentTenantContext } from "@crewhaus/tenancy";
 import { TokenBudget, estimateTokens } from "@crewhaus/token-budget";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { stripJustificationField, withJustificationField } from "@crewhaus/tool-catalog";
 import { executeTool } from "@crewhaus/tool-executor";
 import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
 import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
@@ -264,6 +265,36 @@ function toAnthropicInputSchema(t: RegisteredTool): Anthropic.Tool.InputSchema {
   }
   // Degenerate (no object type, no union): coerce to an empty object schema.
   return { type: "object", properties: converted.properties ?? {} } as Anthropic.Tool.InputSchema;
+}
+
+// Pillar 3 intent gate (#386) — the advertised (model-facing) schema for one
+// registered tool. For `requireJustification` tools the gate reads
+// `input["justification"]`, but models conform tightly to advertised schemas
+// and never invent undeclared fields — so unless the contract is IN the
+// schema, every gated call is denied `justification too brief (0 chars)` and
+// the gate degrades into a hard-off switch (verified live: 12/12 wiki_write
+// calls schema-exact with the field absent even after spec instructions
+// taught it). `withJustificationField` injects a required, described
+// `justification` string property unless the tool's own schema already
+// declares one; `justificationInjected` tells the execute path whether to
+// strip the field back out before the input reaches the tool (remote MCP
+// servers validate against THEIR schema, which may set
+// `additionalProperties: false`). Augmentation runs on the COERCED object
+// schema (after `toAnthropicInputSchema`), so MCP verbatim schemas, flattened
+// unions, and degenerate schemas are all covered, and it copies rather than
+// mutates — `t.jsonSchema` may pass through `toAnthropicInputSchema` by
+// reference and is hashed elsewhere for schema-drift detection.
+function toAdvertisedTool(t: RegisteredTool): {
+  readonly inputSchema: Anthropic.Tool.InputSchema;
+  readonly justificationInjected: boolean;
+} {
+  const base = toAnthropicInputSchema(t);
+  if (t.requireJustification !== true) return { inputSchema: base, justificationInjected: false };
+  const { schema, injected } = withJustificationField(base as Record<string, unknown>);
+  return {
+    inputSchema: schema as Anthropic.Tool.InputSchema,
+    justificationInjected: injected,
+  };
 }
 
 // Merge a top-level union of object branches into a single object schema.
@@ -3098,14 +3129,44 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   }
 
   const tools = effectiveTools;
+  // (#386) — advertise each tool's model-facing schema, with the intent
+  // gate's `justification` contract injected for `requireJustification`
+  // tools whose own schema doesn't declare it (see `toAdvertisedTool`).
+  const advertisedTools = tools.map((t) => ({ tool: t, advertised: toAdvertisedTool(t) }));
   const anthropicTools: Anthropic.Tool[] | undefined =
-    tools.length > 0
-      ? tools.map((t) => ({
-          name: t.name,
-          description: t.description,
-          input_schema: toAnthropicInputSchema(t),
+    advertisedTools.length > 0
+      ? advertisedTools.map(({ tool, advertised }) => ({
+          name: tool.name,
+          description: tool.description,
+          input_schema: advertised.inputSchema,
         }))
       : undefined;
+  // (#386) — tools whose advertised schema carries a RUNTIME-INJECTED
+  // justification property. For exactly these, the field is gate metadata
+  // rather than tool input — the underlying validator/server never declared
+  // it (a remote MCP server with `additionalProperties: false` would reject
+  // the call) — so every surface that reasons about WHAT THE TOOL DOES
+  // consumes the OPERATIVE input (justification stripped) while the
+  // surfaces that reason about WHAT THE MODEL DID keep the full input.
+  // Operative-input consumers: permission-rule matching (arg-scoped
+  // `Tool(argGlob)` rules must keep matching the way they did before the
+  // field existed), the headless approval `inputHash` (a one-shot grant must
+  // be consumable by a regenerated call whose operative args are identical
+  // even though the re-worded justification is not), tool-loop detection
+  // history (re-worded justifications must not make identical calls hash
+  // apart), the egress classifier (scan what is actually transmitted), and
+  // the tool executor itself. Full-input consumers: the event log, trace
+  // bus, pre-tool hooks, the approval record's display `input`, the
+  // justification gate, and the justification audit sink. Tools that
+  // declare the field in their own schema are NOT in this set — for them
+  // the field is genuine tool input everywhere.
+  const justificationInjectedTools: ReadonlySet<string> = new Set(
+    advertisedTools
+      .filter(({ advertised }) => advertised.justificationInjected)
+      .map(({ tool }) => tool.name),
+  );
+  const operativeToolInput = (name: string, input: unknown): unknown =>
+    justificationInjectedTools.has(name) ? stripJustificationField(input) : input;
   const toolByName = new Map(tools.map((t) => [t.name, t]));
 
   // G17 — per-tool rate limiter, built once at loop start from the lowered
@@ -3387,10 +3448,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       });
     }
 
+    // (#386) — the operative input for this call: for tools whose advertised
+    // schema carries a runtime-injected justification, the field is stripped
+    // here once and every surface below that reasons about what the tool
+    // DOES (rule matching, approval hashing, egress, execution) consumes
+    // this; surfaces that record what the model DID keep `tu.input`. See the
+    // `justificationInjectedTools` comment at loop start for the full split.
+    const operativeInput = operativeToolInput(tu.name, tu.input);
+
     const decisionDetails = evaluateWithReason(
       {
         toolName: tu.name,
-        input: tu.input,
+        input: operativeInput,
         readOnly: tool.readOnly,
         destructive: tool.destructive,
         requiresSandbox: tool.requiresSandbox,
@@ -3419,8 +3488,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         if (!approved) denialMessage = "tool denied by user";
       } else if (approvals !== undefined && askMode === "pause") {
         // G11 headless parking/resume. Consult the store for a prior decision
-        // on this exact (toolName, inputHash).
-        const inputHash = hashApprovalInput(tu.name, tu.input);
+        // on this exact (toolName, inputHash). The hash keys on the OPERATIVE
+        // input (#386): a runtime-injected justification is re-worded by the
+        // model on every regeneration, so hashing it would make a granted
+        // approval unconsumable — the rerun would park a fresh approval
+        // forever. The persisted record still carries the full `tu.input`
+        // below so the approving operator SEES the justification.
+        const inputHash = hashApprovalInput(tu.name, operativeInput);
         const existing = await approvals.store.get(tu.name, inputHash);
         if (existing?.decision === "grant") {
           // One-shot allow: consume the grant so a later identical call
@@ -3600,7 +3674,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         return finish({
           type: "tool_result",
           tool_use_id: tu.id,
-          content: `[justification denied] ${verdict.reason}. Reformulate the call with a justification that ties to the session's declared goal, or omit this tool from the call.`,
+          content: `[justification denied] ${verdict.reason}. Reformulate the call with a \`justification\` string field in the tool input that ties to the session's declared goal, or omit this tool from the call.`,
           is_error: true,
         });
       }
@@ -3618,7 +3692,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // `"external-configured"` (warn). Callers can override via
     // `opts.resolveSinkScope` to mark federation-joined or other dynamic sinks.
     if (tool.scope === "external") {
-      const payload = JSON.stringify(tu.input ?? null);
+      // (#386) — scan the OPERATIVE payload: for injected-justification
+      // tools this is what `executeTool` actually transmits to the sink.
+      const payload = JSON.stringify(operativeInput ?? null);
       const sinkScope = (opts.resolveSinkScope ?? defaultSinkScope)(tu.name);
       const egress = await classifyEgress(payload, runContext, {
         sinkId: tu.name,
@@ -3767,7 +3843,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // every gate (permission/justification/egress) so it never overlaps the
     // approval prompt, and torn down in `.finally` on success or throw.
     beginToolWork(tu.name);
-    const raw = await executeTool(tool, tu.input, {
+    const raw = await executeTool(tool, operativeInput, {
       toolUseId: tu.id,
       signal: toolAbort.signal,
       // #160 follow-up — the bridge (built on every run, above) carries
@@ -4580,7 +4656,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // Item 26 — accrue this turn's tool_use count (next-turn tier signal).
               thisTurnToolUseCount += toolUses.length;
               for (const tu of toolUses) {
-                toolUseHistory.push({ id: tu.id, name: tu.name, input: tu.input });
+                // (#386) — loop detection compares OPERATIVE inputs: a
+                // runtime-injected justification is re-worded every call, so
+                // recording it would make identical gated calls hash apart
+                // and hide exactly the loops the detector exists to catch.
+                toolUseHistory.push({
+                  id: tu.id,
+                  name: tu.name,
+                  input: operativeToolInput(tu.name, tu.input),
+                });
               }
               messages.push({ role: "user", content: [...toolResults] });
               await logEvent("user_message", { content: [...toolResults] });
@@ -4737,7 +4821,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 name: t.name,
                 input: t.input,
               }));
-              for (const tu of tsmBlocks) toolUseHistory.push(tu);
+              // (#386) — history records the OPERATIVE input (injected
+              // justification stripped) so re-worded justifications don't
+              // hide loops; `tsmBlocks` itself stays full-input because it
+              // flows on to `executeOneToolUse`, whose gate reads the field.
+              for (const tu of tsmBlocks) {
+                toolUseHistory.push({ ...tu, input: operativeToolInput(tu.name, tu.input) });
+              }
               // Item 7 — the response fully drained (usage known) before these
               // calls dispatch in `NeedTools`, so the split IS computable here:
               // split the priceable response cost evenly across its tool_use
