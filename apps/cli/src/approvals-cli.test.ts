@@ -295,6 +295,44 @@ describe("crewhaus approvals (CLI)", () => {
     expect(settings.permissions.rules[0]?.pattern).toBe("Bash");
   });
 
+  test("#383 — --always with a CREWHAUS_SESSION_DIR-located store fails closed (needs --dir)", async () => {
+    // Seed the store in a RELOCATED root — the env var finds it, but the
+    // operator's cwd is no longer provably the harness root.
+    const relocated = mkdtempSync(join(tmpdir(), "approvals-relocated-"));
+    try {
+      const { createPendingApprovalStore, hashApprovalInput } = await import(
+        "@crewhaus/session-store"
+      );
+      const relocatedStore = createPendingApprovalStore({ rootDir: relocated });
+      await relocatedStore.persist({
+        id: ID,
+        toolName: "log_knowledge_gap",
+        inputHash: hashApprovalInput("log_knowledge_gap", { gap: "x" }),
+        input: { gap: "x" },
+        runId: "run_1",
+        sessionId: "sess_00000000deadbeef",
+        surface: "channel",
+        createdAt: new Date().toISOString(),
+      });
+      const proc = Bun.spawn([process.execPath, CLI_PATH, "approvals", "grant", ID, "--always"], {
+        cwd,
+        env: { PATH: process.env["PATH"] ?? "", CREWHAUS_SESSION_DIR: relocated },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain("--dir <harness root>");
+      // Fails BEFORE recording anything: still pending, and no rule written.
+      const record = (await relocatedStore.list()).find((a) => a.id === ID);
+      expect(record?.decision).toBeUndefined();
+      expect(existsSync(join(cwd, ".crewhaus", "settings.json"))).toBe(false);
+    } finally {
+      rmSync(relocated, { recursive: true, force: true });
+    }
+  });
+
   test("#383 — deny --always is rejected", async () => {
     await seedApproval(ID);
     const { exitCode, stderr } = await runCli(["approvals", "deny", ID, "--always"]);

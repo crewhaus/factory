@@ -25,18 +25,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     allow"** button on the Slack approval message) records the grant AND
     persists `{ type: alwaysAllow, pattern: <toolName> }` into the harness's
     `.crewhaus/settings.json` — the `settings` rule source, which outranks the
-    spec's `yaml` rules and needs no recompile. The record carries
-    `always: true` (`approvals list` shows `granted-always`), the runtime
-    leaves it unconsumed, and the `approval_resolved` trace/audit records
-    carry the flag. In the Slack flow the rule is written before the resume
-    re-drives the parked turn, so the re-driven run already loads it.
+    spec's `yaml` rules and needs no recompile. The RULE carries the standing
+    behavior; the grant record itself stays one-shot (consumed on use like
+    any grant), so deleting the rule fully revokes the allow. The record
+    carries `always: true` for provenance (`approvals list` and the Hangar
+    inbox show `granted-always`), and the `approval_resolved` trace/audit
+    records carry the flag. In the Slack flow the rule is written before the
+    resume re-drives the parked turn, so the re-driven run already loads it.
+    When the approvals store was located via `CREWHAUS_SESSION_DIR`/a tenant
+    scope, `--always` refuses to guess the harness root and asks for an
+    explicit `--dir` (fail closed, before anything is recorded).
   - **`runChatLoop` now loads `.crewhaus/settings.json` permission rules on
     every surface** (new `settingsDir` option, defaulting to the working
     directory). Compiled bundles previously hardcoded `settings: []`, so the
     settings layer only existed for `crewhaus run`/`serve`; now a standing
     allow reaches a running daemon on its next turn. Rules the caller already
     passed are deduped on `(type, pattern)`; a malformed settings file fails
-    closed, exactly like the CLI's own reader.
+    closed, exactly like the CLI's own reader. Sub-agent child loops pass
+    `settingsDir: null` and skip the load: a child's RuleSet is already
+    narrowed from the parent's merged rules by `resolveChildPermissions`, and
+    re-merging the harness file would let a standing allow (settings source)
+    outrank a replace-mode child's explicit deny (yaml source).
   - **`BUILTIN_DEFAULT_RULES` now pre-allows the runtime's bookkeeping
     toolset** (new `BUILTIN_BOOKKEEPING_RULES`: `Skill`, `FocusRead`,
     `FocusWrite`, `PlanRead`, `PlanUpdate`, `PlanComplete`, `GoalWrite`,

@@ -616,7 +616,7 @@ describe("G11 — boot-time approvals retention", () => {
 // ---------------------------------------------------------------------------
 
 describe("#383 — standing grants and .crewhaus/settings.json rules", () => {
-  test("an always grant approves WITHOUT consuming the record", async () => {
+  test("an always grant is consumed one-shot like any grant — the RULE carries the standing allow", async () => {
     // Phase 1 — park.
     const first = await runSingleTurn({
       _adapter: scriptedAdapter([[use("tu_1", "danger", { x: 4 })], [text("done")]]).adapter,
@@ -627,6 +627,8 @@ describe("#383 — standing grants and .crewhaus/settings.json rules", () => {
     if (req?.kind !== "approval_requested") throw new Error("expected a park");
 
     // Out-of-band STANDING grant (`crewhaus approvals grant <id> --always`).
+    // The surface would ALSO write the settings rule; here we deliberately
+    // omit it to pin the record's own semantics.
     await store.resolve(req.approvalId, "grant", "max", { always: true });
 
     // Phase 2 — the re-driven run executes pre-approved…
@@ -639,17 +641,37 @@ describe("#383 — standing grants and .crewhaus/settings.json rules", () => {
     expect(second.caught).toBeUndefined();
     expect(executed).toEqual([{ x: 4 }]);
 
-    // …and the grant is NOT consumed: a third identical call is still
-    // pre-approved instead of re-parking (contrast with the one-shot test).
-    expect(await store.get("danger", hashApprovalInput("danger", { x: 4 }))).not.toBeNull();
-    const third = await runSingleTurn({
-      _adapter: scriptedAdapter([[use("tu_1", "danger", { x: 4 })], [text("done")]]).adapter,
+    // …and the record is consumed exactly like a plain grant (uniform
+    // one-shot: deleting the settings rule fully revokes a standing allow —
+    // no unconsumed record lingers to pre-approve the parked input). The
+    // consumed record keeps `always` for display/audit provenance.
+    expect(await store.get("danger", hashApprovalInput("danger", { x: 4 }))).toBeNull();
+    const consumed = (await store.list()).find((a) => a.id === req.approvalId);
+    expect(consumed?.consumedAt).toBeDefined();
+    expect(consumed?.always).toBe(true);
+  });
+
+  test("a harness standing allow must NOT re-widen a narrowed child loop (settingsDir: null)", async () => {
+    // The harness file carries a standing allow for the tool…
+    appendSettingsRule(root, { type: "alwaysAllow", pattern: "danger" });
+    // …but this loop receives a replace-mode-style CHILD RuleSet whose yaml
+    // explicitly denies it (the shape resolveChildPermissions produces for
+    // `permissions: { allow: [...], deny: ["danger"] }`).
+    const executed: unknown[] = [];
+    const { caught, result } = await runSingleTurn({
+      _adapter: scriptedAdapter([[use("tu_1", "danger", { x: 1 })], [text("done")]]).adapter,
       tools: [dangerTool((i) => executed.push(i))],
-      approvals: { store },
+      permissionRules: {
+        ...emptyRuleSet,
+        yaml: [{ type: "alwaysDeny", pattern: "danger", source: "yaml" }],
+      },
+      // The sub-agent spawner passes null: the child's narrowed rules are
+      // authoritative; the disk merge would let settings outrank the deny.
+      settingsDir: null,
     });
-    expect(third.caught).toBeUndefined();
-    expect(executed).toEqual([{ x: 4 }, { x: 4 }]);
-    expect(third.events.some((e) => e.kind === "approval_requested")).toBe(false);
+    expect(caught).toBeUndefined();
+    expect(result).toBe("done");
+    expect(executed).toEqual([]);
   });
 
   test("settings.json rules merge into the settings layer via settingsDir", async () => {

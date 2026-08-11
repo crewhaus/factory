@@ -207,6 +207,11 @@ export async function spawnSubAgent(
       tools: opts.childTools,
       permissionMode: opts.permissionMode,
       permissionRules: opts.permissionRules,
+      // #383 — NEVER re-load the harness settings file in a child loop: the
+      // child's RuleSet was narrowed by resolveChildPermissions from the
+      // parent's already-merged rules, and a re-merged standing allow in the
+      // `settings` layer would outrank a replace-mode child's `yaml` deny.
+      settingsDir: null,
       installSigintHandler: false,
       maxTokens: parent.maxTokens,
       ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),

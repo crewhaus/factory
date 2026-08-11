@@ -998,8 +998,15 @@ export type RunChatLoopOptions = {
    * allow" button) reach compiled daemons without a recompile. Defaults to
    * `process.cwd()` — the standalone-harness convention. A malformed
    * settings file throws (fail closed, matching the CLI's own reader).
+   *
+   * `null` DISABLES the load. Sub-agent child loops pass `null`: a child's
+   * RuleSet arrives already narrowed by `resolveChildPermissions` from the
+   * parent's MERGED rules (the bridge hands the disk-inclusive set to the
+   * Task tool), and re-merging the harness file here would let a standing
+   * allow in `settings` outrank a replace-mode child's explicit `yaml`
+   * deny — widening a deliberately narrowed child.
    */
-  settingsDir?: string;
+  settingsDir?: string | null;
   /**
    * Install a SIGINT handler that aborts the current turn on first press
    * and exits on the second. Defaults to true in REPL mode when stdin is
@@ -2879,11 +2886,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // could never reach a daemon; interpreter paths (the CLI) already read the
   // same file themselves, which the (type, pattern) dedupe absorbs. Loaded
   // once per run — a park ends the run, so the re-driven run re-reads it.
+  // `settingsDir: null` (sub-agent child loops) skips the load entirely.
   const permissionRules: RuleSet = (() => {
     const base = opts.permissionRules ?? {
       ...emptyRuleSet,
       builtin: BUILTIN_DEFAULT_RULES,
     };
+    if (opts.settingsDir === null) return base;
     const diskSettings = loadSettingsRules(opts.settingsDir ?? process.cwd());
     if (diskSettings.length === 0) return base;
     const seen = new Set(base.settings.map((r: PermissionRule) => `${r.type} ${r.pattern}`));
@@ -3414,18 +3423,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         const inputHash = hashApprovalInput(tu.name, tu.input);
         const existing = await approvals.store.get(tu.name, inputHash);
         if (existing?.decision === "grant") {
+          // One-shot allow: consume the grant so a later identical call
+          // re-asks. A STANDING grant (#383, `existing.always`) is consumed
+          // the same way — its standing behavior rides the settings-source
+          // `alwaysAllow` rule the resolving surface persisted, which
+          // pre-decides future calls before this store is ever consulted.
+          // Keeping consumption uniform means deleting that rule fully
+          // revokes the standing allow (no unconsumed record lingers to
+          // pre-approve the parked input until the TTL sweep).
           approved = true;
-          if (existing.always === true) {
-            // #383 — a STANDING grant (`approvals grant --always` / Slack
-            // "Always allow"): the resolving surface persisted a
-            // settings-source `alwaysAllow` rule for this tool, so future
-            // calls are pre-decided by the rules and never reach this store.
-            // Leave the record UNCONSUMED so identical calls stay
-            // pre-approved even if that settings write failed.
-          } else {
-            // One-shot allow: consume the grant so a later identical call re-asks.
-            await approvals.store.persist({ ...existing, consumedAt: new Date().toISOString() });
-          }
+          await approvals.store.persist({ ...existing, consumedAt: new Date().toISOString() });
         } else if (existing?.decision === "deny") {
           approved = false;
           denialMessage = `tool denied: \`${tu.name}\` approval was denied${

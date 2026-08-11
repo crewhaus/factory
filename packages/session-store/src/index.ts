@@ -588,11 +588,12 @@ export type PendingApproval = {
    * #383 — set when a `grant` was recorded as a STANDING allow
    * (`crewhaus approvals grant <id> --always`, the Slack "Always allow"
    * button). The resolving surface also persists an `alwaysAllow` rule for
-   * the tool into the harness's `.crewhaus/settings.json`, so future calls
-   * are pre-decided by the permission rules and never consult this store;
-   * the runtime additionally leaves an `always` grant UNCONSUMED (no
-   * `consumedAt` stamp) so identical calls stay pre-approved even if that
-   * settings write failed. Absent on plain one-shot grants and denies.
+   * the tool into the harness's `.crewhaus/settings.json` — THAT rule
+   * carries the standing behavior, pre-deciding future calls before this
+   * store is consulted. The grant record itself stays one-shot (consumed on
+   * use like any grant), so removing the rule fully revokes the standing
+   * allow; the flag exists for display and audit provenance. Absent on
+   * plain one-shot grants and denies.
    */
   always?: boolean;
 };

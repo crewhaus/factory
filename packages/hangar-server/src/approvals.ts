@@ -56,9 +56,12 @@ export type ApprovalRow = {
   readonly inputHash: string;
   readonly surface: string;
   readonly createdAt: string;
-  readonly status: "pending" | "granted" | "denied" | "consumed";
+  readonly status: "pending" | "granted" | "granted-always" | "denied" | "consumed";
   readonly decidedBy: string | null;
   readonly decidedAt: string | null;
+  /** #383 — the grant was recorded as a standing allow (an `alwaysAllow`
+   *  rule in the harness's `.crewhaus/settings.json` covers the tool). */
+  readonly always?: boolean;
   /** The run that parked on this approval — the grant-and-resume link. */
   readonly runId: string;
   readonly sessionId: string;
@@ -92,6 +95,9 @@ function isApprovalShape(value: unknown): value is PendingApproval {
 }
 
 function statusOf(a: PendingApproval): ApprovalRow["status"] {
+  // #383 — a standing allow is the terminal state whether or not the parked
+  // call was since consumed (mirrors the CLI's approvalStatus).
+  if (a.decision === "grant" && a.always === true) return "granted-always";
   if (a.consumedAt !== undefined) return "consumed";
   if (a.decision === "grant") return "granted";
   if (a.decision === "deny") return "denied";
@@ -154,6 +160,7 @@ export function approvalsInbox(
         status,
         decidedBy: a.decidedBy ?? null,
         decidedAt: a.decidedAt ?? null,
+        ...(a.always === true ? { always: true } : {}),
         runId: a.runId,
         sessionId: a.sessionId,
         parkedRun: { harnessId: harness.id, runId: a.runId, sessionId: a.sessionId },

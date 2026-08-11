@@ -13767,6 +13767,15 @@ async function runApprovals(args: ParsedArgs, action: string): Promise<void> {
   // #383 — a standing allow: grant + persist an alwaysAllow rule for the tool.
   const always = args.flags["always"] === true;
   if (always && decision !== "grant") die("--always applies only to `approvals grant`");
+  // Fail CLOSED before recording anything when --always cannot know the
+  // harness root: with the store located via CREWHAUS_SESSION_DIR or a
+  // tenant scope (not --dir, not cwd), the current directory may not be the
+  // daemon's harness, and a rule written here would never be loaded.
+  if (always && typeof dirFlag !== "string" && resolveSessionRootDir(undefined) !== undefined) {
+    die(
+      `--always writes .crewhaus/settings.json under the HARNESS root, but the approvals store was located via CREWHAUS_SESSION_DIR/tenant scope (${resolveSessionRootDir(undefined)}), so the harness owning settings.json cannot be inferred from the current directory. Re-run with --dir <harness root>.`,
+    );
+  }
   let updated: PendingApproval | null;
   try {
     updated = await store.resolve(id, decision, by, always ? { always: true } : undefined);

@@ -18,9 +18,10 @@ import type { PendingApproval } from "@crewhaus/session-store";
  * The operator-facing lifecycle state of a parked approval, derived from the
  * store record. `consumed` is a spent one-shot grant (a later identical call
  * re-asks under a fresh id); `granted`/`denied` are recorded-but-not-yet-spent
- * decisions; `granted-always` is a standing allow (#383 — never consumed; an
- * `alwaysAllow` rule in `.crewhaus/settings.json` covers the tool from now
- * on); `pending` still awaits one.
+ * decisions; `granted-always` is a standing allow (#383 — the terminal state
+ * whether or not the parked call was since consumed, because the standing
+ * behavior rides the `alwaysAllow` rule in `.crewhaus/settings.json`, not
+ * this record); `pending` still awaits one.
  */
 export type ApprovalDisplayStatus =
   | "pending"
@@ -31,8 +32,9 @@ export type ApprovalDisplayStatus =
 
 /** Derive the display status from the record's `decision` + `consumedAt`. */
 export function approvalStatus(a: PendingApproval): ApprovalDisplayStatus {
+  if (a.decision === "grant" && a.always === true) return "granted-always";
   if (a.consumedAt !== undefined) return "consumed";
-  if (a.decision === "grant") return a.always === true ? "granted-always" : "granted";
+  if (a.decision === "grant") return "granted";
   if (a.decision === "deny") return "denied";
   return "pending";
 }
