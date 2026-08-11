@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+  BUILTIN_BOOKKEEPING_RULES,
   BUILTIN_DEFAULT_RULES,
   type JustificationJudge,
   PermissionConfigError,
@@ -8,10 +12,12 @@ import {
   type RuleSet,
   type ToolCallContext,
   __resetRuleBasedJudgeWarningForTests,
+  appendSettingsRule,
   emptyRuleSet,
   evaluate,
   evaluateJustification,
   evaluateWithReason,
+  loadSettingsRules,
   parsePermissionsConfig,
   ruleBasedJustificationJudge,
   tagRules,
@@ -642,5 +648,151 @@ describe("Pillar 3 — rule-based judge weakness warning (#161)", () => {
       input: {},
     });
     expect(warnings).toHaveLength(0);
+  });
+});
+
+describe("#383 — builtin bookkeeping rules", () => {
+  const bookkeepingCall = (toolName: string): ToolCallContext => ({
+    toolName,
+    input: {},
+    readOnly: false,
+    destructive: false,
+  });
+
+  test("BUILTIN_BOOKKEEPING_RULES are folded into BUILTIN_DEFAULT_RULES", () => {
+    for (const r of BUILTIN_BOOKKEEPING_RULES) {
+      expect(BUILTIN_DEFAULT_RULES).toContainEqual(r);
+      expect(r.type).toBe("alwaysAllow");
+      expect(r.source).toBe("builtin");
+    }
+  });
+
+  test("Skill and the continuity tools allow in default mode with only builtin rules", () => {
+    const rs: RuleSet = { ...emptyRuleSet, builtin: [...BUILTIN_DEFAULT_RULES] };
+    for (const name of [
+      "Skill",
+      "FocusRead",
+      "FocusWrite",
+      "PlanRead",
+      "PlanUpdate",
+      "PlanComplete",
+      "GoalWrite",
+      "GoalUpdate",
+      "GoalList",
+    ]) {
+      expect(evaluate(bookkeepingCall(name), "default", rs)).toBe("allow");
+    }
+  });
+
+  test("MemoryClear is deliberately NOT pre-allowed (destructive bookkeeping)", () => {
+    const rs: RuleSet = { ...emptyRuleSet, builtin: [...BUILTIN_DEFAULT_RULES] };
+    expect(evaluate(bookkeepingCall("MemoryClear"), "default", rs)).toBe("ask");
+  });
+
+  test("a spec-level alwaysAsk still outranks the builtin bookkeeping allow", () => {
+    const rs: RuleSet = {
+      ...emptyRuleSet,
+      yaml: [rule("alwaysAsk", "Skill")],
+      builtin: [...BUILTIN_DEFAULT_RULES],
+    };
+    expect(evaluate(bookkeepingCall("Skill"), "default", rs)).toBe("ask");
+  });
+});
+
+describe("#383 — settings file helpers", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "permission-engine-settings-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const settingsPath = (): string => join(dir, ".crewhaus", "settings.json");
+  const writeSettings = (root: unknown): void => {
+    mkdirSync(join(dir, ".crewhaus"), { recursive: true });
+    writeFileSync(settingsPath(), typeof root === "string" ? root : JSON.stringify(root));
+  };
+
+  test("loadSettingsRules: missing file → []", () => {
+    expect(loadSettingsRules(dir)).toEqual([]);
+  });
+
+  test("loadSettingsRules: reads permissions.rules tagged with the settings source", () => {
+    writeSettings({
+      permissions: { rules: [{ type: "alwaysAllow", pattern: "Skill" }] },
+      hooks: { "pre-tool": [] },
+    });
+    expect(loadSettingsRules(dir)).toEqual([
+      { type: "alwaysAllow", pattern: "Skill", source: "settings" },
+    ]);
+  });
+
+  test("loadSettingsRules: a settings root without a permissions key → []", () => {
+    writeSettings({ hooks: {} });
+    expect(loadSettingsRules(dir)).toEqual([]);
+  });
+
+  test("loadSettingsRules: malformed JSON fails closed", () => {
+    writeSettings("{not json");
+    expect(() => loadSettingsRules(dir)).toThrow(PermissionConfigError);
+  });
+
+  test("loadSettingsRules: mode bypass is rejected from settings", () => {
+    writeSettings({ permissions: { mode: "bypass" } });
+    expect(() => loadSettingsRules(dir)).toThrow(/bypass mode cannot be set from settings/);
+  });
+
+  test("appendSettingsRule: creates .crewhaus/settings.json when absent", () => {
+    const res = appendSettingsRule(dir, { type: "alwaysAllow", pattern: "Skill" });
+    expect(res.added).toBe(true);
+    expect(res.path).toBe(settingsPath());
+    expect(loadSettingsRules(dir)).toEqual([
+      { type: "alwaysAllow", pattern: "Skill", source: "settings" },
+    ]);
+    // Pretty-printed with a trailing newline, like `permissions suggest --apply`.
+    expect(readFileSync(settingsPath(), "utf8")).toEndWith("\n");
+  });
+
+  test("appendSettingsRule: dedupes on (type, pattern)", () => {
+    expect(appendSettingsRule(dir, { type: "alwaysAllow", pattern: "Skill" }).added).toBe(true);
+    expect(appendSettingsRule(dir, { type: "alwaysAllow", pattern: "Skill" }).added).toBe(false);
+    expect(loadSettingsRules(dir)).toHaveLength(1);
+    // A different type for the same pattern is a distinct rule.
+    expect(appendSettingsRule(dir, { type: "alwaysAsk", pattern: "Skill" }).added).toBe(true);
+    expect(loadSettingsRules(dir)).toHaveLength(2);
+  });
+
+  test("appendSettingsRule: preserves unrelated settings keys and permissions.mode", () => {
+    writeSettings({
+      permissions: { mode: "auto", rules: [{ type: "alwaysDeny", pattern: "Bash(rm**)" }] },
+      hooks: { "pre-tool": [{ match: "*", command: "echo hi" }] },
+    });
+    appendSettingsRule(dir, { type: "alwaysAllow", pattern: "log_knowledge_gap" });
+    const root = JSON.parse(readFileSync(settingsPath(), "utf8")) as {
+      permissions: { mode: string; rules: unknown[] };
+      hooks: unknown;
+    };
+    expect(root.permissions.mode).toBe("auto");
+    expect(root.hooks).toEqual({ "pre-tool": [{ match: "*", command: "echo hi" }] });
+    expect(root.permissions.rules).toEqual([
+      { type: "alwaysDeny", pattern: "Bash(rm**)" },
+      { type: "alwaysAllow", pattern: "log_knowledge_gap" },
+    ]);
+  });
+
+  test("appendSettingsRule: refuses to clobber a file it cannot parse", () => {
+    writeSettings("{broken");
+    expect(() => appendSettingsRule(dir, { type: "alwaysAllow", pattern: "Skill" })).toThrow(
+      PermissionConfigError,
+    );
+    expect(readFileSync(settingsPath(), "utf8")).toBe("{broken");
+  });
+
+  test("appendSettingsRule: refuses when the existing permissions config is invalid", () => {
+    writeSettings({ permissions: { rules: [{ type: "allowAll", pattern: "*" }] } });
+    expect(() => appendSettingsRule(dir, { type: "alwaysAllow", pattern: "Skill" })).toThrow(
+      PermissionConfigError,
+    );
   });
 });

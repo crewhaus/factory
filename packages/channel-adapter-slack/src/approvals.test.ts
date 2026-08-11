@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import {
   APPROVAL_BLOCK_ID_PREFIX,
   APPROVE_ACTION_ID,
+  APPROVE_ALWAYS_ACTION_ID,
   DENY_ACTION_ID,
+  buildApprovalAckMessage,
   buildApprovalMessage,
   createSlackAdapter,
   parseSlackInteraction,
@@ -69,7 +71,7 @@ describe("buildApprovalMessage (block-kit)", () => {
     expect(types).toEqual(["section", "actions", "context"]);
   });
 
-  test("both buttons carry the approvalId in value; block_id carries it too", () => {
+  test("all three buttons carry the approvalId in value; block_id carries it too", () => {
     const id = "appr_deadbeef";
     const msg = buildApprovalMessage({
       approvalId: id,
@@ -80,11 +82,29 @@ describe("buildApprovalMessage (block-kit)", () => {
     const actions = (msg.blocks as Any[]).find((b) => b.type === "actions");
     expect(actions.block_id).toBe(`${APPROVAL_BLOCK_ID_PREFIX}${id}`);
     const ids = actions.elements.map((e: Any) => e.action_id);
-    expect(ids).toEqual([APPROVE_ACTION_ID, DENY_ACTION_ID]);
+    expect(ids).toEqual([APPROVE_ACTION_ID, APPROVE_ALWAYS_ACTION_ID, DENY_ACTION_ID]);
     for (const el of actions.elements) expect(el.value).toBe(id);
-    // Approve is primary/green, Deny is danger/red.
+    // Approve is primary/green, Always allow is neutral, Deny is danger/red.
     expect(actions.elements[0].style).toBe("primary");
-    expect(actions.elements[1].style).toBe("danger");
+    expect(actions.elements[1].style).toBeUndefined();
+    expect(actions.elements[2].style).toBe("danger");
+    // The Always button names the tool it will pre-approve.
+    expect(actions.elements[1].text.text).toBe("Always allow t");
+  });
+
+  test("#383 — a long tool name is truncated on the Always button, not the block", () => {
+    const longName = `mcp__thredz__${"x".repeat(80)}`;
+    const msg = buildApprovalMessage({
+      approvalId: "appr_x",
+      toolName: longName,
+      inputPreview: "{}",
+      surface: "s",
+    });
+    const actions = (msg.blocks as Any[]).find((b) => b.type === "actions");
+    const label: string = actions.elements[1].text.text;
+    expect(label.startsWith("Always allow ")).toBe(true);
+    // Slack rejects plain_text over 75 chars — stay under it.
+    expect(label.length).toBeLessThanOrEqual(75);
   });
 
   test("a triple-backtick in the preview cannot break the code fence", () => {
@@ -122,6 +142,21 @@ describe("parseSlackInteraction — button payload round-trip", () => {
       expect(parsed.decision).toBe("deny");
       expect(parsed.approvalId).toBe("appr_round2");
     }
+  });
+
+  test("#383 — an Always allow click maps to grant + always: true", () => {
+    const parsed = parseSlackInteraction(
+      slackButtonClickBody("appr_round3", APPROVE_ALWAYS_ACTION_ID),
+    );
+    expect(parsed.kind).toBe("approval_action");
+    if (parsed.kind === "approval_action") {
+      expect(parsed.decision).toBe("grant");
+      expect(parsed.always).toBe(true);
+      expect(parsed.approvalId).toBe("appr_round3");
+    }
+    // A plain Approve carries NO always key (wire back-compat).
+    const plain = parseSlackInteraction(slackButtonClickBody("appr_round4", APPROVE_ACTION_ID));
+    expect(plain).not.toHaveProperty("always");
   });
 
   test("recovers the approvalId from block_id when value is absent", () => {
@@ -301,5 +336,26 @@ describe("createSlackAdapter — approval methods", () => {
       body: slackButtonClickBody("appr_deleg", APPROVE_ACTION_ID),
     });
     expect(parsed?.kind === "approval_action" && parsed.approvalId).toBe("appr_deleg");
+  });
+});
+
+describe("#383 — always-allow ack rendering", () => {
+  test("an always grant acks as 'Approved (always)' with the standing-allow note", () => {
+    const msg = buildApprovalAckMessage({
+      decision: "grant",
+      by: "slack:U9",
+      toolName: "log_knowledge_gap",
+      always: true,
+    });
+    expect(msg.text).toBe(
+      "✅ Approved (always) `log_knowledge_gap` by slack:U9 — future calls run pre-approved",
+    );
+  });
+
+  test("a plain grant and a deny render unchanged", () => {
+    expect(buildApprovalAckMessage({ decision: "grant", by: "x" }).text).toBe("✅ Approved by x");
+    expect(buildApprovalAckMessage({ decision: "deny", by: "x", always: true }).text).toBe(
+      "🚫 Denied by x",
+    );
   });
 });

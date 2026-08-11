@@ -2071,6 +2071,23 @@ describe("emitChannelBot — G11 pending-approval channel surface (ask_mode paus
     expect(gateway).toContain("auditSink?: ApprovalAuditSink;");
   });
 
+  test("#383 — gateway persists a standing settings rule on an always grant, pre-resume", () => {
+    const gateway = fileMap(MIN_IR).get("gateway.ts") ?? "";
+    expect(gateway).toContain('import { appendSettingsRule } from "@crewhaus/permission-engine";');
+    // always threads into the store resolution…
+    expect(gateway).toContain("...(interaction.always === true ? { always: true } : {}),");
+    // …and writes the rule for the RESOLVED tool before the resume re-drives.
+    expect(gateway).toContain(
+      'appendSettingsRule(process.cwd(), { type: "alwaysAllow", pattern: resolved.toolName })',
+    );
+    const writeAt = gateway.indexOf("appendSettingsRule(process.cwd()");
+    const resumeAt = gateway.indexOf("config.sessionRouter.resumeApproval(");
+    expect(writeAt).toBeGreaterThan(-1);
+    expect(writeAt).toBeLessThan(resumeAt);
+    // Best-effort: a write failure must not fail the resolution.
+    expect(gateway).toContain("standing-allow settings write failed");
+  });
+
   test("session-router parks on approval_pending and re-drives on resume", () => {
     const router = fileMap(MIN_IR).get("session-router.ts") ?? "";
     expect(router).toContain(

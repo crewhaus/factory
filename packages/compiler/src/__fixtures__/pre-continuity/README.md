@@ -73,6 +73,20 @@ so it appears on a memory-free `continuity: false` bundle too. The
 branch; the continuity opt-out contract is unchanged (no
 `wireMemory`/continuity wiring appears), and every other pin is untouched.
 
+**#383 standing-allow delta — `channel.gateway.ts` only.** The gateway's
+approval actions route gained the "Always allow" leg: it threads
+`interaction.always` into `resolveApproval` and, on an always grant, persists
+a standing `alwaysAllow` rule for the resolved tool into
+`.crewhaus/settings.json` (via `@crewhaus/permission-engine`'s
+`appendSettingsRule`) before the resume re-drives the parked turn. The block
+is guarded at runtime on `interaction.always === true` — a plain
+Approve/Deny click behaves exactly as before — and it rides the
+always-emitted approvals route, NOT memory/continuity, so it appears on a
+memory-free `continuity: false` bundle too. The `channel.gateway.ts` pin was
+regenerated to its prior bytes **plus** that leg; the continuity opt-out
+contract is unchanged (no `wireMemory`/continuity wiring appears), and every
+other pin is untouched.
+
 **Adapter-construction-inside-main delta — `channel.daemon.ts` only.** The
 channel daemon now constructs (and registers) its channel adapters as the first
 statements of `main()` rather than at module scope. Adapter factories can refuse

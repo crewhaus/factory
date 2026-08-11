@@ -542,6 +542,14 @@ export type ApprovalResolvedEvent = TraceEventEnvelope & {
   approvalId: string;
   decision: "grant" | "deny";
   by: string;
+  /**
+   * #383 — true when the grant was recorded as a STANDING allow
+   * (`crewhaus approvals grant --always` / the Slack "Always allow" button):
+   * the resolving surface also persisted a settings-source `alwaysAllow`
+   * rule for the tool, so future calls never re-ask. Absent on one-shot
+   * grants and denies.
+   */
+  always?: boolean;
 };
 
 /**

@@ -22,6 +22,8 @@
  * References: claude-code/utils/permissions/ (24 files); AI-Harness-Systems
  * §Policy engine.
  */
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import {
   type CompiledPattern,
@@ -108,10 +110,37 @@ export const emptyRuleSet: RuleSet = {
 };
 
 /**
+ * #383 — the runtime's own bookkeeping toolset: the `Skill` loader plus the
+ * non-destructive continuity tools (`@crewhaus/tool-plan`'s focus/plan/goal
+ * family). Continuity is default-on, and the agent loop calls these
+ * autonomously on every fresh session — with varying input, so on a headless
+ * surface (`ask_mode: pause`) an unruled loop parks on its OWN bookkeeping
+ * and a one-shot `(toolName, inputHash)` grant can never satisfy the next
+ * call. These are local-only reads/writes to the harness's continuity store
+ * (no network, no process boundary), so they get a builtin `alwaysAllow` —
+ * the same reasoning that already allows `Read`/`Glob`/`Grep`. `MemoryClear`
+ * is deliberately EXCLUDED: it erases continuity state, so it keeps the
+ * mode-default behavior unless a spec rule allows it. A spec can still
+ * override any of these (the `yaml` source outranks `builtin`).
+ */
+export const BUILTIN_BOOKKEEPING_RULES: ReadonlyArray<PermissionRule> = [
+  { type: "alwaysAllow", pattern: "Skill", source: "builtin" },
+  { type: "alwaysAllow", pattern: "FocusRead", source: "builtin" },
+  { type: "alwaysAllow", pattern: "FocusWrite", source: "builtin" },
+  { type: "alwaysAllow", pattern: "PlanRead", source: "builtin" },
+  { type: "alwaysAllow", pattern: "PlanUpdate", source: "builtin" },
+  { type: "alwaysAllow", pattern: "PlanComplete", source: "builtin" },
+  { type: "alwaysAllow", pattern: "GoalWrite", source: "builtin" },
+  { type: "alwaysAllow", pattern: "GoalUpdate", source: "builtin" },
+  { type: "alwaysAllow", pattern: "GoalList", source: "builtin" },
+];
+
+/**
  * Reasonable starting defaults. The CLI seeds these into the `builtin` source.
- * Intentionally small — just dangerous bash forms get an `alwaysAsk`, and a
- * few obviously-safe read-only tools get `alwaysAllow`. Everything else falls
- * through to mode-specific behavior (default → ask).
+ * Intentionally small — just dangerous bash forms get an `alwaysAsk`, a
+ * few obviously-safe read-only tools get `alwaysAllow`, and the runtime's own
+ * bookkeeping toolset rides along via {@link BUILTIN_BOOKKEEPING_RULES}.
+ * Everything else falls through to mode-specific behavior (default → ask).
  */
 export const BUILTIN_DEFAULT_RULES: ReadonlyArray<PermissionRule> = [
   // `**` (vs `*`) matches across path separators — necessary to catch `rm -rf /tmp/foo`.
@@ -120,6 +149,7 @@ export const BUILTIN_DEFAULT_RULES: ReadonlyArray<PermissionRule> = [
   { type: "alwaysAllow", pattern: "Read", source: "builtin" },
   { type: "alwaysAllow", pattern: "Glob", source: "builtin" },
   { type: "alwaysAllow", pattern: "Grep", source: "builtin" },
+  ...BUILTIN_BOOKKEEPING_RULES,
 ];
 
 function ruleTypeToDecision(t: RuleType): Decision {
@@ -541,4 +571,112 @@ export function tagRules(
   source: RuleSource,
 ): ReadonlyArray<PermissionRule> {
   return rules.map((r) => ({ type: r.type, pattern: r.pattern, source }));
+}
+
+// ---------------------------------------------------------------------------
+// #383 — the `settings`-source file. `<harnessDir>/.crewhaus/settings.json`'s
+// `permissions` sub-object is the operator-owned rule layer that outranks the
+// spec's `yaml` rules without touching the spec: the CLI has always read it
+// for `crewhaus run`/`serve`, runtime-core now loads it for every surface
+// (so compiled daemons honor it too), and the approval surfaces persist
+// standing allows into it (`crewhaus approvals grant --always`, the Slack
+// "Always allow" button).
+// ---------------------------------------------------------------------------
+
+/** The settings file's path relative to a harness root. */
+export const SETTINGS_RELATIVE_PATH = join(".crewhaus", "settings.json");
+
+/** Absolute settings path for a harness root. */
+export function settingsFilePath(dir: string): string {
+  return join(dir, SETTINGS_RELATIVE_PATH);
+}
+
+/**
+ * Parse the top-level JSON of a settings file, keeping the whole root so
+ * unrelated keys (`hooks`, …) survive a write-back. Throws
+ * {@link PermissionConfigError} on malformed JSON or a non-object root —
+ * fail closed: a file that cannot be read must not silently drop an
+ * operator's `alwaysDeny`, and a write-back must never clobber a file it
+ * could not understand.
+ */
+function readSettingsRoot(path: string): Record<string, unknown> | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new PermissionConfigError(`cannot read settings file ${path}`, err);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new PermissionConfigError(`settings file ${path} is not valid JSON`, err);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new PermissionConfigError(`settings file ${path} must hold a JSON object at the root`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+/**
+ * Load the `settings`-source permission rules from
+ * `<dir>/.crewhaus/settings.json`. Missing file → `[]`. Only the
+ * `permissions` sub-object is consulted (so `hooks` and other settings keys
+ * never trip the strict validator); its shape is the same
+ * `{ mode?, rules? }` the spec's `permissions:` block uses, and
+ * `mode: bypass` is rejected here exactly as it is for yaml. Malformed JSON
+ * or an invalid permissions config THROWS {@link PermissionConfigError} —
+ * fail closed, matching the CLI's behavior when it reads the same file.
+ */
+export function loadSettingsRules(dir: string): ReadonlyArray<PermissionRule> {
+  const root = readSettingsRoot(settingsFilePath(dir));
+  if (root === undefined) return [];
+  const parsed = parsePermissionsConfig(root["permissions"], "settings");
+  return tagRules(parsed.rules, "settings");
+}
+
+/**
+ * Append one permission rule to `<dir>/.crewhaus/settings.json`'s
+ * `permissions.rules`, creating the file (and `.crewhaus/`) when absent and
+ * preserving every unrelated key on write-back. Deduped on
+ * `(type, pattern)` — re-appending an existing rule is a no-op. The write is
+ * atomic (tmp + rename) so a concurrently-booting run never reads a torn
+ * file. This is the persistence half of a standing allow: the approval
+ * surfaces call it with `{ type: "alwaysAllow", pattern: <toolName> }` when
+ * an operator grants an approval with `--always`.
+ *
+ * Throws {@link PermissionConfigError} when the existing file is malformed —
+ * never overwrite a file we could not parse.
+ */
+export function appendSettingsRule(
+  dir: string,
+  rule: { readonly type: RuleType; readonly pattern: string },
+): { readonly added: boolean; readonly path: string } {
+  const path = settingsFilePath(dir);
+  const root = readSettingsRoot(path) ?? {};
+  // Validate what is already there before writing next to it.
+  const existing = parsePermissionsConfig(root["permissions"], "settings");
+  if (existing.rules.some((r) => r.type === rule.type && r.pattern === rule.pattern)) {
+    return { added: false, path };
+  }
+  const permissionsRoot =
+    typeof root["permissions"] === "object" && root["permissions"] !== null
+      ? (root["permissions"] as Record<string, unknown>)
+      : {};
+  const next = {
+    ...root,
+    permissions: {
+      ...permissionsRoot,
+      rules: [
+        ...existing.rules.map((r) => ({ type: r.type, pattern: r.pattern })),
+        { type: rule.type, pattern: rule.pattern },
+      ],
+    },
+  };
+  mkdirSync(dirname(path), { recursive: true });
+  const tmpPath = `${path}.tmp`;
+  writeFileSync(tmpPath, `${JSON.stringify(next, null, 2)}\n`);
+  renameSync(tmpPath, path);
+  return { added: true, path };
 }

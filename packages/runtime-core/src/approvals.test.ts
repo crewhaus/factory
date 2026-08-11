@@ -13,7 +13,7 @@
  *    absent when unpriceable or under streaming (split not computable).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -21,6 +21,11 @@ import type Anthropic from "@anthropic-ai/sdk";
 import type { ProviderAdapter, ProviderRequest } from "@crewhaus/adapter-anthropic";
 import { DEFAULT_PRICING, computeCostMicros, resolvePricing } from "@crewhaus/cost-tracker";
 import { RunFailedError } from "@crewhaus/errors";
+import {
+  BUILTIN_DEFAULT_RULES,
+  appendSettingsRule,
+  emptyRuleSet,
+} from "@crewhaus/permission-engine";
 import { createRunContext } from "@crewhaus/run-context";
 import {
   type PendingApproval,
@@ -603,5 +608,136 @@ describe("G11 — boot-time approvals retention", () => {
       _adapter: scriptedAdapter([[text("fine")]]).adapter,
     });
     expect(out).toBe("fine");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #383 — standing (always) grants + settings-source rules.
+// ---------------------------------------------------------------------------
+
+describe("#383 — standing grants and .crewhaus/settings.json rules", () => {
+  test("an always grant approves WITHOUT consuming the record", async () => {
+    // Phase 1 — park.
+    const first = await runSingleTurn({
+      _adapter: scriptedAdapter([[use("tu_1", "danger", { x: 4 })], [text("done")]]).adapter,
+      tools: [dangerTool()],
+      approvals: { store },
+    });
+    const req = first.events.find((e) => e.kind === "approval_requested");
+    if (req?.kind !== "approval_requested") throw new Error("expected a park");
+
+    // Out-of-band STANDING grant (`crewhaus approvals grant <id> --always`).
+    await store.resolve(req.approvalId, "grant", "max", { always: true });
+
+    // Phase 2 — the re-driven run executes pre-approved…
+    const executed: unknown[] = [];
+    const second = await runSingleTurn({
+      _adapter: scriptedAdapter([[use("tu_1", "danger", { x: 4 })], [text("done")]]).adapter,
+      tools: [dangerTool((i) => executed.push(i))],
+      approvals: { store },
+    });
+    expect(second.caught).toBeUndefined();
+    expect(executed).toEqual([{ x: 4 }]);
+
+    // …and the grant is NOT consumed: a third identical call is still
+    // pre-approved instead of re-parking (contrast with the one-shot test).
+    expect(await store.get("danger", hashApprovalInput("danger", { x: 4 }))).not.toBeNull();
+    const third = await runSingleTurn({
+      _adapter: scriptedAdapter([[use("tu_1", "danger", { x: 4 })], [text("done")]]).adapter,
+      tools: [dangerTool((i) => executed.push(i))],
+      approvals: { store },
+    });
+    expect(third.caught).toBeUndefined();
+    expect(executed).toEqual([{ x: 4 }, { x: 4 }]);
+    expect(third.events.some((e) => e.kind === "approval_requested")).toBe(false);
+  });
+
+  test("settings.json rules merge into the settings layer via settingsDir", async () => {
+    // The standing allow an approval surface would have persisted.
+    appendSettingsRule(root, { type: "alwaysAllow", pattern: "danger" });
+
+    const executed: unknown[] = [];
+    const { events, caught, result } = await runSingleTurn({
+      _adapter: scriptedAdapter([
+        // Two calls with DIFFERENT inputs — the class-level rule covers both,
+        // which is exactly what a one-shot (toolName, inputHash) grant cannot do.
+        [use("tu_1", "danger", { x: 1 }), use("tu_2", "danger", { x: 2 })],
+        [text("done")],
+      ]).adapter,
+      tools: [dangerTool((i) => executed.push(i))],
+      approvals: { store },
+      settingsDir: root,
+    });
+
+    expect(caught).toBeUndefined();
+    expect(result).toBe("done");
+    expect(executed).toEqual([{ x: 1 }, { x: 2 }]);
+    // Decided by the RULES layer: allow decisions, no ask, no park, store untouched.
+    expect(
+      events.filter((e) => e.kind === "permission_decision" && e.decision === "allow").length,
+    ).toBe(2);
+    expect(events.some((e) => e.kind === "approval_requested")).toBe(false);
+    expect(await store.list()).toEqual([]);
+  });
+
+  test("caller-supplied settings rules are deduped against the disk load", async () => {
+    appendSettingsRule(root, { type: "alwaysAllow", pattern: "danger" });
+    const executed: unknown[] = [];
+    const { caught } = await runSingleTurn({
+      _adapter: scriptedAdapter([[use("tu_1", "danger", { x: 1 })], [text("done")]]).adapter,
+      tools: [dangerTool((i) => executed.push(i))],
+      permissionRules: {
+        ...emptyRuleSet,
+        settings: [{ type: "alwaysAllow", pattern: "danger", source: "settings" }],
+        builtin: BUILTIN_DEFAULT_RULES,
+      },
+      settingsDir: root,
+    });
+    expect(caught).toBeUndefined();
+    expect(executed).toEqual([{ x: 1 }]);
+  });
+
+  test("a malformed settings.json fails the run closed", async () => {
+    mkdirSync(join(root, ".crewhaus"), { recursive: true });
+    writeFileSync(join(root, ".crewhaus", "settings.json"), "{not json");
+    const { caught } = await runSingleTurn({
+      _adapter: scriptedAdapter([[text("fine")]]).adapter,
+      settingsDir: root,
+    });
+    expect(caught).toBeInstanceOf(Error);
+    expect(String((caught as Error).message)).toContain("settings");
+  });
+
+  test("bookkeeping tools (Skill/continuity family) run headless with NO rules configured", async () => {
+    // A non-read-only tool named like the continuity family would ask in
+    // default mode — the builtin bookkeeping allow (#383) pre-decides it, so
+    // an unruled headless daemon no longer parks on its own bookkeeping.
+    const executed: unknown[] = [];
+    const focusWrite = buildTool({
+      name: "FocusWrite",
+      description: "continuity bookkeeping stand-in",
+      inputSchema: z.object({ note: z.string() }).strict(),
+      readOnly: false,
+      destructive: false,
+      concurrencySafe: false,
+      execute: async (i) => {
+        executed.push(i);
+        return "ok";
+      },
+    });
+    const { events, caught, result } = await runSingleTurn({
+      _adapter: scriptedAdapter([[use("tu_1", "FocusWrite", { note: "a" })], [text("done")]])
+        .adapter,
+      tools: [focusWrite],
+      approvals: { store },
+    });
+    expect(caught).toBeUndefined();
+    expect(result).toBe("done");
+    expect(executed).toEqual([{ note: "a" }]);
+    expect(events.some((e) => e.kind === "approval_requested")).toBe(false);
+    // MemoryClear stays gated: not in the builtin allows.
+    expect(
+      BUILTIN_DEFAULT_RULES.some((r) => r.pattern === "MemoryClear" && r.type === "alwaysAllow"),
+    ).toBe(false);
   });
 });

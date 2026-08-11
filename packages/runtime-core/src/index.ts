@@ -66,10 +66,12 @@ import {
   BUILTIN_DEFAULT_RULES,
   type JustificationJudge,
   type PermissionMode,
+  type PermissionRule,
   type RuleSet,
   emptyRuleSet,
   evaluateJustification,
   evaluateWithReason,
+  loadSettingsRules,
   ruleBasedJustificationJudge,
 } from "@crewhaus/permission-engine";
 import { manage as manageCacheMarkers } from "@crewhaus/prompt-cache-manager";
@@ -987,6 +989,17 @@ export type RunChatLoopOptions = {
   permissionMode?: PermissionMode;
   /** Layered rule sources. Defaults to `{ ..., builtin: BUILTIN_DEFAULT_RULES }`. */
   permissionRules?: RuleSet;
+  /**
+   * #383 — the harness root whose `.crewhaus/settings.json` supplies the
+   * `settings`-source permission rules. Every run loads that file at loop
+   * start and merges its rules into the `settings` layer (deduped against
+   * any settings rules the caller already passed), so operator-persisted
+   * standing allows (`crewhaus approvals grant --always`, the Slack "Always
+   * allow" button) reach compiled daemons without a recompile. Defaults to
+   * `process.cwd()` — the standalone-harness convention. A malformed
+   * settings file throws (fail closed, matching the CLI's own reader).
+   */
+  settingsDir?: string;
   /**
    * Install a SIGINT handler that aborts the current turn on first press
    * and exits on the second. Defaults to true in REPL mode when stdin is
@@ -2860,10 +2873,28 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     ...(curateConfig !== undefined ? { curate: curateConfig, onCurate: publishCurate } : {}),
   });
   const permissionMode: PermissionMode = opts.permissionMode ?? "default";
-  const permissionRules: RuleSet = opts.permissionRules ?? {
-    ...emptyRuleSet,
-    builtin: BUILTIN_DEFAULT_RULES,
-  };
+  // #383 — merge the harness's `.crewhaus/settings.json` rules into the
+  // `settings` layer. Compiled bundles emit `settings: []`, so without this
+  // load an operator-persisted standing allow (`approvals grant --always`)
+  // could never reach a daemon; interpreter paths (the CLI) already read the
+  // same file themselves, which the (type, pattern) dedupe absorbs. Loaded
+  // once per run — a park ends the run, so the re-driven run re-reads it.
+  const permissionRules: RuleSet = (() => {
+    const base = opts.permissionRules ?? {
+      ...emptyRuleSet,
+      builtin: BUILTIN_DEFAULT_RULES,
+    };
+    const diskSettings = loadSettingsRules(opts.settingsDir ?? process.cwd());
+    if (diskSettings.length === 0) return base;
+    const seen = new Set(base.settings.map((r: PermissionRule) => `${r.type} ${r.pattern}`));
+    return {
+      ...base,
+      settings: [
+        ...base.settings,
+        ...diskSettings.filter((r) => !seen.has(`${r.type} ${r.pattern}`)),
+      ],
+    };
+  })();
 
   const userInstructions: Anthropic.TextBlockParam = {
     type: "text",
@@ -3383,9 +3414,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         const inputHash = hashApprovalInput(tu.name, tu.input);
         const existing = await approvals.store.get(tu.name, inputHash);
         if (existing?.decision === "grant") {
-          // One-shot allow: consume the grant so a later identical call re-asks.
           approved = true;
-          await approvals.store.persist({ ...existing, consumedAt: new Date().toISOString() });
+          if (existing.always === true) {
+            // #383 — a STANDING grant (`approvals grant --always` / Slack
+            // "Always allow"): the resolving surface persisted a
+            // settings-source `alwaysAllow` rule for this tool, so future
+            // calls are pre-decided by the rules and never reach this store.
+            // Leave the record UNCONSUMED so identical calls stay
+            // pre-approved even if that settings write failed.
+          } else {
+            // One-shot allow: consume the grant so a later identical call re-asks.
+            await approvals.store.persist({ ...existing, consumedAt: new Date().toISOString() });
+          }
         } else if (existing?.decision === "deny") {
           approved = false;
           denialMessage = `tool denied: \`${tu.name}\` approval was denied${
@@ -3435,7 +3475,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             class: "approval_pending",
             title: "awaiting tool approval",
             detail: `\`${tu.name}\` requires approval on a non-interactive surface (${approvalSurface}); the run is parked as approval ${pending.id}`,
-            remediation: `grant or deny approval ${pending.id} out of band (e.g. \`crewhaus approvals grant ${pending.id}\`), then rerun`,
+            remediation: `grant or deny approval ${pending.id} out of band (e.g. \`crewhaus approvals grant ${pending.id}\`; add \`--always\` to allow \`${tu.name}\` from now on), then rerun`,
             exitCode: EXIT_CODES.approval_pending,
           });
         }

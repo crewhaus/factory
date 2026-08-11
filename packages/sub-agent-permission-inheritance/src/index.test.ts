@@ -130,8 +130,12 @@ describe("resolveChildPermissions — modes", () => {
     expect(yamlRules).toHaveLength(3);
     expect(yamlRules.filter((r) => r.type === "alwaysAllow")).toHaveLength(2);
     expect(yamlRules.filter((r) => r.type === "alwaysDeny")).toHaveLength(1);
-    // Permissive defaults stay in builtin as a narrow-only fallback.
-    expect(out.rules.builtin.map((r) => r.pattern)).toEqual(["Read", "Glob", "Grep"]);
+    // Permissive defaults stay in builtin as a narrow-only fallback — the
+    // floor's alwaysAllow set verbatim (Read/Glob/Grep plus the #383
+    // bookkeeping allows), never its guards.
+    expect(out.rules.builtin.map((r) => r.pattern)).toEqual(
+      BUILTIN_DEFAULT_RULES.filter((r) => r.type === "alwaysAllow").map((r) => r.pattern),
+    );
     expect(out.rules.builtin.every((r) => r.type === "alwaysAllow")).toBe(true);
   });
 });
