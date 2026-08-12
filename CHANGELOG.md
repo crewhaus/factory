@@ -5,7 +5,102 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.3] - 2026-08-12
+
+### Added
+
+- **Shared env files for a fleet** (#391). `loadEnvChain` read exactly
+  `<harness>/.env` then `.env.local`, so sibling harnesses sharing one
+  provider key had no first-class way to keep ONE env file — the working
+  pattern was a `.env → ../.env` symlink per member, which works but is
+  invisible convention (`harness show` and preflight reported the chain as
+  if it were local, a copied harness silently carried a dangling symlink,
+  and Windows symlinks are their own adventure). A harness now declares
+  shared files in its own `.crewhaus/settings.json`
+  (`{"manager": {"envFiles": ["../.env"]}}`); they load UNDER the
+  harness-local chain, so precedence is unchanged (shared < harness-local <
+  `process.env` < caller extras). The declaration is harness-local rather
+  than a registry field because all harness state is cwd-local: an
+  UNREGISTERED harness — the standalone-harness convention, and what
+  `crewhaus daemon start` in a fresh directory is — behaves identically, and
+  the declaration travels when the directory is copied. Resolution happens
+  inside `loadEnvChain`, the one function `buildSpawnPlan` and the preflight
+  gate both go through, so the env preflight checks stays the env the spawn
+  receives by construction. A new `env` preflight area names every file in
+  the chain (shared ones with the absolute path they resolved to) and WARNS
+  — never blocks — on a declared file that is absent; `crewhaus daemon
+  status` and `crewhaus harness show` render the same chain, in `--json`
+  too, as files only and never a value; and the console's credential
+  presence panel reads the same chain, so a key a fleet keeps in `../.env`
+  no longer reads as "not set" while the daemon has had it all along.
+- **Per-harness prep: opt-in recompile and operator hooks** (#388, #389).
+  Two things a supervised fleet lost that the standalone `run.sh` wrappers
+  it replaced already had. Nothing recompiled for you, and a stale bundle
+  was only ever REPORTED — forget one recompile after a spec edit and the
+  daemon restarts on the OLD bundle with no error. `crewhaus daemon
+  start|restart|submit --compile` now recompiles IF the spec is newer than
+  the bundle (the same spec-hash verdict the fleet views show, into the
+  directory the current bundle lives in), runs `bun install --cwd <bundle>`,
+  and only then preflights and spawns; `manager.autoCompile: true` makes it
+  a harness's default so the console's Restart button gets it too. An
+  inexact (`unstamped`/`unknown`) verdict never triggers a recompile. And
+  there was no hook point at all: `daemon start` spawned the existing bundle
+  directly, a console compile job silently discarded whatever the operator
+  had patched into it, and `restart` rebuilt the spawn plan but never re-ran
+  operator prep. Harnesses now declare their own steps —
+  `manager.hooks.postCompile` / `manager.hooks.preSpawn` — run in the order
+  `compile → postCompile → preflight → preSpawn → spawn`, inside the start
+  slot so two managers cannot recompile one bundle at once. A hook that
+  exits non-zero or times out REFUSES the start exactly like a blocking
+  preflight finding, carrying the step's own output, scrubbed at the capture
+  like the run log. A string declaration is one command and is NOT
+  word-split; arrays are argv vectors; nothing goes through a shell. A new
+  `hooks` preflight area discloses the commands a start will run (and warns
+  when one failed last time, or has never run on a harness that HAS runs);
+  `daemon status` reports the prep contract and each hook's last run, and
+  `harness show` names the hooks. The console's compile job now runs
+  `postCompile` too, so a manager-initiated compile and `start --compile`
+  leave the same bundle — and a compile whose hook fails is a failed job,
+  not a green row over an unpatched bundle.
+- **`crewhaus daemon submit --brief-file` — crew targets under supervision**
+  (#390). The supervisor classed `target: crew` as `daemon` and launched it
+  detached with no stdin, but a compiled crew bundle REQUIRES its brief
+  there and exits 2 without one — and 2 is not in the terminal code set, so
+  the supervisor read that instant exit as a crash and walked the backoff
+  ladder to `crash-looping`. With `crewhaus run` also refusing the shape, no
+  supervised path could run a crew at all. The class was wrong (the emitted
+  `daemon.ts` calls itself a one-shot in its own comment): `crew` is now the
+  `one-shot` class — ledgered as a job, never restarted, no runfile — and
+  `buildSpawnPlan` REFUSES a crew with no brief (remedy `submit-brief`), so
+  nothing is spawned and the crash-loop is unreachable from either head.
+  `crewhaus daemon submit <dir> --brief-file brief.md` runs one pipeline
+  with the brief on stdin, tracked in the same run ledger with the same
+  scrubbed capture. The brief travels as a PATH: `SpawnRequest.stdinFile`
+  hands the child a read-only fd, so it never appears in argv and a detached
+  run keeps its input after the manager exits. `submit` on a shape whose
+  input is not a brief names the verb that harness does take, and the
+  emitted bundle's own no-stdin message now carries the remediation.
+- **Group-ordered bulk lifecycle** (#392). Fleets have dependency order —
+  the secretary whose A2A door every other spec mounts boots first, the
+  chief that supervises the rest last, and stops go the other way — and
+  bringing one up was N commands or N clicks in an order the operator had to
+  remember, with nothing recording it. Members now carry a boot order
+  (`crewhaus harness group crew --add ./secretary --member-order 1`, with
+  `--list` to print the walk), stored on the registry entry as
+  `groupOrder[<group>]` and keyed by name so a group rename or a member
+  removal cannot leave a dangling ordering. Undeclared members sort after
+  the declared ones, each tier by spec name, so the walk is reproducible on
+  every machine. `crewhaus daemon start|restart|stop --group <name>
+  [--parallel]` walks it (REVERSED for stop), keeps going past a member that
+  refuses, prints a per-member summary, and exits non-zero if any member
+  failed; interactive and one-shot members are skipped WITH A NOTE rather
+  than silently dropped, as is a member whose directory has vanished. The
+  console gets the same thing plan-first: `GET
+  /api/registry/groups/:name/proc/:verb` returns the walk without touching
+  anything, `POST` runs it (207 when some members failed), `PUT
+  /api/h/:id/groups {group, order}` sets a position, and the Runs board's
+  new Groups strip renders the planned order and only acts on a second
+  click.
 
 ### Fixed
 
@@ -38,6 +133,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them the field is genuine tool input. The gate's deny message now also
   names the `justification` input field so a model that still omits it can
   recover.
+- **`crewhaus harness preflight` checked `process.env` alone** (#391). A
+  credential the daemon reads from the harness `.env` chain was reported as
+  missing — preflight disagreeing with the spawn, in the direction that
+  cries wolf. It now evaluates the merged spawn env, like every other gate.
 
 ## [0.5.2] - 2026-08-10
 

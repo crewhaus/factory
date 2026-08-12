@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/deployment-controller",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "type": "module",
   "description": "Version pinning + promotion: promote(name, fromEnv, toEnv) / rollback. Records every action to audit-log.",
   "main": "src/index.ts",

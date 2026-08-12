@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-schema-sanitizer",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "type": "module",
   "description": "Provider-neutral JSON-Schema sanitizer for tool input schemas (inline $refs, project onto Gemini/Bedrock subsets, OpenAI strict-mode upgrade)",
   "main": "src/index.ts",
