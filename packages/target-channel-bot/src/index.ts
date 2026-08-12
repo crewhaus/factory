@@ -2135,7 +2135,7 @@ registerChannelAdapter("imessage", imessageAdapter);`);
   // exactly once per session.
   const exposeMcp = exposesMcpOverHttp(ir);
   const exposeMcpImport = exposeMcp
-    ? 'import { randomBytes, timingSafeEqual } from "node:crypto";\n' +
+    ? 'import { createHash, randomBytes, timingSafeEqual } from "node:crypto";\n' +
       'import { chmodSync, mkdirSync, writeFileSync } from "node:fs";\n' +
       'import { createMcpServer } from "@crewhaus/mcp-server";\n'
     : "";
@@ -2191,9 +2191,16 @@ registerChannelAdapter("imessage", imessageAdapter);`);
       // The MCP transport's own session id when it gave us one, else a single
       // shared conversation — never a fresh session per call, which would
       // make every MCP turn amnesiac.
+      //
+      // DERIVED, not concatenated: the session store validates ids against
+      // /^sess_[0-9a-f]{16}\$/ and THROWS on anything else, so a raw
+      // \`mcp_<uuid>\` would fail on the first call. Same derivation the
+      // channel router uses for a thread key.
       const __key = ctx?.sessionId ?? "mcp";
       const __existing = __mcpSessions.get(__key);
-      const __sessionId = __existing ?? \`mcp_\${__key}\`;
+      const __sessionId =
+        __existing ??
+        "sess_" + createHash("sha256").update("mcp:" + __key).digest("hex").slice(0, 16);
       __mcpSessions.set(__key, __sessionId);
       return await agent.runTurn({
         sessionId: __sessionId,

@@ -374,6 +374,25 @@ function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning> {
       ].join(" "),
     });
   }
+  // #394 — `transport: stdio` on a DAEMON shape mounts nothing: stdio is the
+  // `crewhaus serve --mcp` projection, where the CLI owns the process's stdio.
+  // A daemon has no such channel, so the block is inert — which is precisely
+  // the silence this whole change exists to end, so it says so.
+  if (
+    (spec.target === "channel" || spec.target === "managed") &&
+    spec.expose?.mcp?.transport === "stdio"
+  ) {
+    out.push({
+      code: "accepted-but-unwired",
+      path: "expose.mcp.transport",
+      message: [
+        'expose.mcp.transport: "stdio" mounts nothing on a daemon — stdio is the',
+        "`crewhaus serve --mcp` projection, which needs a process whose stdio is the",
+        'protocol channel. Use `transport: "sse"` to self-expose from the compiled',
+        "bundle (channel), or project a cli spec with `crewhaus serve --mcp`.",
+      ].join(" "),
+    });
+  }
   // #394 — `per-subagent` cannot be honoured on channel: the projected tools
   // are meant to ROUTE to a sub-agent, and the channel turn function takes no
   // routing argument, so every projected tool would land in the same

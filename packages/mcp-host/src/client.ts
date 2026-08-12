@@ -236,6 +236,13 @@ export class McpClient {
           ),
       );
     } catch (err) {
+      // DETACH BEFORE CLOSING (#394). `close()` fires `onclose`, which routes
+      // into `handleTransportClose` — the reconnect scheduler. On the probe
+      // path that is actively wrong: the FIRST candidate failing is the normal
+      // way a legacy-SSE peer is discovered, and letting it arm a reconnect
+      // leaves a phantom timer racing the candidate that is about to succeed.
+      // A failed attempt must leave no scheduling behind it.
+      transport.onclose = undefined;
       // Best-effort cleanup: SDK's connect may have partially started the
       // transport. Closing it (and ignoring secondary errors) prevents
       // leaked subprocesses.

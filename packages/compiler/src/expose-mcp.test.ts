@@ -114,9 +114,34 @@ describe("expose.mcp — what is NOT emitted", () => {
   });
 
   test("`transport: stdio` mounts nothing — stdio is the `serve --mcp` projection", () => {
-    const files = bundleOf(SPEC("expose:\n  mcp:\n    transport: stdio\n"));
+    const spec = SPEC("expose:\n  mcp:\n    transport: stdio\n");
+    const files = bundleOf(spec);
     expect(files.get("gateway.ts") ?? "").not.toContain('url.pathname === "/mcp"');
     expect(files.get("daemon.ts") ?? "").not.toContain("createMcpServer");
+    // …and it SAYS so, rather than being one more silently-inert block.
+    const warnings = compile(spec, { readme: false }).warnings.map((w) => w.path);
+    expect(warnings).toContain("expose.mcp.transport");
+  });
+
+  test("`expose.mcp` on MANAGED warns that it is carried-but-unwired", () => {
+    const managed = `name: exposed-managed
+target: managed
+agent:
+  model: anthropic/claude-sonnet-4
+  instructions: |
+    You are a fixture.
+tenants:
+  - id: tenant-a
+    budget:
+      maxInputTokens: 100000
+      maxOutputTokens: 20000
+expose:
+  mcp:
+    transport: sse
+`;
+    const warnings = compile(managed, { readme: false }).warnings;
+    expect(warnings.map((w) => w.path)).toContain("expose.mcp");
+    expect(warnings.find((w) => w.path === "expose.mcp")?.message).toContain("tenant");
   });
 
   test("`per-subagent` projects `chat` — the channel turn takes no routing arg", () => {
