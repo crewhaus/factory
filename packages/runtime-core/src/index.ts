@@ -651,6 +651,14 @@ export {
 } from "@crewhaus/session-store";
 
 /**
+ * How long after an operator's DECISION a grant may still satisfy a call the
+ * model has re-worded. Generous enough for a resume (which follows the grant
+ * within seconds on every surface), short enough that an unspent grant cannot
+ * be replayed onto an unrelated turn an hour later.
+ */
+export const REPLAYABLE_GRANT_MAX_AGE_MS = 15 * 60 * 1000;
+
+/**
  * #400 — find the grant an operator made for a call this run has since
  * REGENERATED differently.
  *
@@ -682,7 +690,15 @@ export {
 export async function findReplayableGrant(
   store: Pick<PendingApprovalStore, "persist" | "get" | "resolve"> &
     Partial<Pick<PendingApprovalStore, "list">>,
-  where: { readonly toolName: string; readonly sessionId: string; readonly runId: string },
+  where: {
+    readonly toolName: string;
+    readonly sessionId: string;
+    readonly runId: string;
+    /** Epoch ms; the freshness window is measured from the DECISION. */
+    readonly now?: number;
+    /** Override the window (tests). */
+    readonly maxAgeMs?: number;
+  },
 ): Promise<PendingApproval | undefined> {
   if (typeof store.list !== "function") return undefined;
   let all: readonly PendingApproval[];
@@ -692,15 +708,33 @@ export async function findReplayableGrant(
     // A read that fails must not fail the tool call: park as before.
     return undefined;
   }
-  const matches = all.filter(
-    (a) =>
-      a.toolName === where.toolName &&
-      a.sessionId === where.sessionId &&
-      a.decision === "grant" &&
-      a.consumedAt === undefined &&
-      a.runId !== where.runId &&
-      a.input !== undefined,
-  );
+  const now = where.now ?? Date.now();
+  const maxAgeMs = where.maxAgeMs ?? REPLAYABLE_GRANT_MAX_AGE_MS;
+  const matches = all.filter((a) => {
+    if (a.toolName !== where.toolName) return false;
+    if (a.sessionId !== where.sessionId) return false;
+    if (a.decision !== "grant") return false;
+    if (a.consumedAt !== undefined) return false;
+    if (a.runId === where.runId) return false;
+    if (a.input === undefined) return false;
+    // FRESHNESS, measured from the DECISION — not from the park.
+    //
+    // Without it a grant that was never spent sits in a long-lived session
+    // forever and is replayed onto an unrelated later turn: the operator
+    // asked for X an hour ago, approved it, the resume happened not to call
+    // the tool, and now an unrelated request runs X. Bounding from
+    // `decidedAt` is what makes the window track the approve→resume gap
+    // (seconds: the Slack button resumes immediately, and a CLI grant is
+    // followed by `runs resume`) rather than the park→approve gap, which is
+    // human-paced and may be hours.
+    //
+    // A grant older than this is not discarded — it stays a valid record for
+    // the EXACT-hash path, which is unbounded. Only the fuzzy replay is
+    // time-boxed.
+    const decidedAt = a.decidedAt !== undefined ? Date.parse(a.decidedAt) : Number.NaN;
+    if (!Number.isFinite(decidedAt)) return false;
+    return now - decidedAt <= maxAgeMs;
+  });
   // `list()` is newest-first by contract, but sort defensively rather than
   // trust the ordering of a store a caller injected.
   return [...matches].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
@@ -3220,6 +3254,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // justification gate, and the justification audit sink. Tools that
   // declare the field in their own schema are NOT in this set — for them
   // the field is genuine tool input everywhere.
+  // #400 — approval ids this RUN has already replayed. Claimed synchronously
+  // so two concurrent tool calls cannot both spend one one-shot grant.
+  const replayedApprovalIds = new Set<string>();
   const justificationInjectedTools: ReadonlySet<string> = new Set(
     advertisedTools
       .filter(({ advertised }) => advertised.justificationInjected)
@@ -3460,11 +3497,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // model asked for, so without this the model would reason about an
       // action that did not happen — and might "correct" itself by re-issuing
       // the call it thinks failed.
-      if (replayedFrom !== undefined && typeof result.content === "string") {
-        result = {
-          ...result,
-          content: `[approval ${replayedFrom.id} was granted for a different wording of this call; the APPROVED input was executed, not the one you just sent. Read the result as the outcome of the approved action.]\n${result.content}`,
-        };
+      if (replayedFrom !== undefined) {
+        const notice = `[approval ${replayedFrom.id} was granted for a different wording of this call; the APPROVED input was executed, not the one you just sent. Read the result as the outcome of the approved action.]`;
+        // Block content (images, structured blocks) is just as capable of
+        // misleading the model as a string, so the notice rides both shapes —
+        // prepended as its own text block when the content is an array.
+        result =
+          typeof result.content === "string"
+            ? { ...result, content: `${notice}\n${result.content}` }
+            : {
+                ...result,
+                content: [{ type: "text" as const, text: notice }, ...(result.content ?? [])],
+              };
       }
       await logEvent("tool_result", {
         toolUseId: tu.id,
@@ -3607,8 +3651,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             toolName: tu.name,
             sessionId,
             runId: bus.runId,
+            now: Date.now(),
           });
-          if (replay !== undefined) {
+          // CLAIM IT SYNCHRONOUSLY. The lookup reads and the consuming
+          // `persist` writes, and up to `maxConcurrentTools` ask-gated calls
+          // run through this gate at once — so without a claim two parallel
+          // calls both find the same unconsumed grant and both execute. The
+          // set is per-run and in-process, which is where that race is;
+          // across processes the store's `consumedAt` remains the authority.
+          if (replay !== undefined && !replayedApprovalIds.has(replay.id)) {
+            replayedApprovalIds.add(replay.id);
             replayedFrom = replay;
             existing = replay;
           }
@@ -3623,7 +3675,6 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // revokes the standing allow (no unconsumed record lingers to
           // pre-approve the parked input until the TTL sweep).
           approved = true;
-          await approvals.store.persist({ ...existing, consumedAt: new Date().toISOString() });
           if (replayedFrom !== undefined) {
             // Run WHAT WAS APPROVED. `tu.input` is the model's regenerated
             // wording; the record carries the input the operator saw and said
@@ -3652,10 +3703,35 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               denialMessage =
                 `tool denied: approval ${replayedFrom.id} was granted, but \`${tu.name}\` is now denied by permission policy` +
                 `${recheck.reason !== undefined ? ` (${recheck.reason})` : ""}.`;
+              // The grant is NOT spent on a call that never ran, and the
+              // result must not claim an approved input executed.
+              replayedFrom = undefined;
             } else {
               tu = { ...tu, input: approvedInput };
               operativeInput = approvedOperative;
+              // The `pre-tool` hook already judged the input the MODEL sent,
+              // several steps above. A hook that can deny must judge what will
+              // actually RUN, so re-fire it against the substituted input.
+              const replayHook = await fireHook("pre-tool", {
+                id: tu.id,
+                name: tu.name,
+                input: tu.input,
+              });
+              if (!replayHook.allowed) {
+                approved = false;
+                denialMessage = `[blocked by hook] ${replayHook.reason ?? "denied"}`;
+                replayedFrom = undefined;
+              }
             }
+          }
+          if (approved) {
+            // Consume only once the call is really going to run: a replay the
+            // policy or a hook then refused must leave the operator's grant
+            // unspent, or they have to approve the same action twice.
+            await approvals.store.persist({
+              ...existing,
+              consumedAt: new Date().toISOString(),
+            });
           }
           if (replayedFrom !== undefined && approved) {
             bus.publish({
@@ -3671,6 +3747,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               toolName: tu.name,
               detail:
                 "the resumed turn regenerated a different input; the operator-approved input was executed instead",
+            });
+            // The durable `tool_use` record holds what the MODEL asked for —
+            // correct, that is what the model did — but nothing yet recorded
+            // what RAN, and an audit trail showing only the discarded input is
+            // worse than one showing both.
+            await logEvent("tool_use", {
+              id: tu.id,
+              name: tu.name,
+              input: replayedFrom.input,
+              approvalReplayedFrom: replayedFrom.id,
+              requestedInput: tuAsRequested.input,
             });
           }
         } else if (existing?.decision === "deny") {

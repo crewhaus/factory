@@ -15,7 +15,7 @@
  * G11 tests it corrects, in `approvals.test.ts`.
  */
 import { describe, expect, test } from "bun:test";
-import { findReplayableGrant } from "./index";
+import { REPLAYABLE_GRANT_MAX_AGE_MS, findReplayableGrant } from "./index";
 
 describe("#400 — the guards that keep a replay from becoming a standing allow", () => {
   const base = {
@@ -28,8 +28,10 @@ describe("#400 — the guards that keep a replay from becoming a standing allow"
     surface: "headless",
     createdAt: "2026-08-12T00:00:00.000Z",
     decision: "grant" as const,
+    decidedAt: "2026-08-12T00:00:05.000Z",
   };
-  const where = { toolName: "notify", sessionId: "sess_a", runId: "run_now" };
+  const NOW = Date.parse("2026-08-12T00:00:30.000Z");
+  const where = { toolName: "notify", sessionId: "sess_a", runId: "run_now", now: NOW };
   const listing = (...records: Array<Record<string, unknown>>) =>
     ({
       persist: async () => {},
@@ -106,5 +108,33 @@ describe("#400 — the guards that keep a replay from becoming a standing allow"
       },
     } as unknown as Parameters<typeof findReplayableGrant>[0];
     expect(await findReplayableGrant(broken, where)).toBeUndefined();
+  });
+  test("a grant decided LONG ago is not replayed onto an unrelated later turn", async () => {
+    // The window tracks the approve→resume gap (seconds on every surface),
+    // not the park→approve gap (human-paced). An unspent grant must not sit
+    // in a long-lived session and substitute its old input into whatever the
+    // user asks next.
+    const stale = { ...base, decidedAt: "2026-08-11T00:00:00.000Z" };
+    expect(await findReplayableGrant(listing(stale), where)).toBeUndefined();
+    // …and one decided just now still is.
+    expect((await findReplayableGrant(listing(base), where))?.id).toBe(base.id);
+  });
+
+  test("the window is measured from decidedAt, and its edge is inclusive", async () => {
+    const atEdge = {
+      ...base,
+      decidedAt: new Date(NOW - REPLAYABLE_GRANT_MAX_AGE_MS).toISOString(),
+    };
+    expect((await findReplayableGrant(listing(atEdge), where))?.id).toBe(base.id);
+    const pastEdge = {
+      ...base,
+      decidedAt: new Date(NOW - REPLAYABLE_GRANT_MAX_AGE_MS - 1_000).toISOString(),
+    };
+    expect(await findReplayableGrant(listing(pastEdge), where)).toBeUndefined();
+  });
+
+  test("a grant with no decidedAt is never replayed — freshness is unknowable", async () => {
+    const { decidedAt: _dropped, ...noDecidedAt } = base;
+    expect(await findReplayableGrant(listing(noDecidedAt), where)).toBeUndefined();
   });
 });
