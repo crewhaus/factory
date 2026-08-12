@@ -66,6 +66,7 @@ import {
 import {
   type GateDecision,
   SpawnPlanError,
+  type StartResult,
   type StopResult,
   cliTwin,
   isUnforceable,
@@ -108,6 +109,7 @@ import { foldHarnessCosts } from "./costs";
 import { deploymentsView } from "./deployments";
 import { mergedSpawnEnv } from "./env-file";
 import { evalHealth, evalRunView, evalSampleView, evalsView, isRunId } from "./evals";
+import { GROUP_VERBS, groupPlan, isGroupVerb, runGroup } from "./group-ops";
 import {
   type HealthPreflightItem,
   type HealthResult,
@@ -931,6 +933,21 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     };
   };
 
+  /** One member's refusal, as one line — the same vocabulary the per-harness
+   *  routes use, flattened so a sweep's summary reads as a list. */
+  function groupRefusalMessage(result: StartResult & { readonly ok: false }): string {
+    switch (result.reason) {
+      case "already-running":
+        return "already running (the runfile is the lock)";
+      case "preflight-blocked":
+        return `preflight refused: ${result.gate.refused.map((i) => i.message).join("; ")}`;
+      case "prepare-refused":
+        return result.refusal.message;
+      case "plan-failed":
+        return result.error.message;
+    }
+  }
+
   const startProc = async (
     entry: HangarHarnessEntry,
     body: Record<string, unknown>,
@@ -1195,8 +1212,24 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     if (method === "PUT" && tail.length === 0) {
       const body = await readBody(req);
       if (head === "groups") {
+        // `{group, order}` sets this member's BOOT position inside one
+        // group — distinct from `{groups}`, which sets membership. Both on
+        // one route because they are the same field's two halves, and a
+        // caller that sends neither gets told which it meant to send.
+        const groupName = body["group"];
+        if (typeof groupName === "string" && groupName !== "") {
+          const raw = body["order"];
+          if (raw !== null && (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1)) {
+            throw new HttpError(400, '"order" must be a positive integer, or null to clear it');
+          }
+          return jsonMasked({
+            entry: registry.setGroupOrder(entry.id, groupName, raw === null ? undefined : raw),
+          });
+        }
         const groups = asStringArray(body["groups"]);
-        if (groups === undefined) throw new HttpError(400, 'missing "groups" string array');
+        if (groups === undefined) {
+          throw new HttpError(400, 'missing "groups" string array (or {group, order})');
+        }
         return jsonMasked({ entry: registry.setGroups(entry.id, groups) });
       }
       if (head === "tags") {
@@ -1689,6 +1722,71 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       throw new HttpError(405, "method not allowed");
     }
 
+    // GET  /api/registry/groups/:name/proc/:verb  — the PLAN, in walk order
+    // POST /api/registry/groups/:name/proc/:verb  — do it
+    //
+    // Plan-then-act on purpose: a fleet sweep is the one lifecycle action an
+    // operator should be able to READ before authorizing, and the plan is
+    // the same object the walk consumes, so what is shown is what runs.
+    if (head === "registry" && rest[0] === "groups" && rest[2] === "proc" && rest.length === 4) {
+      const groupName = rest[1] as string;
+      const verb = rest[3] as string;
+      if (!isGroupVerb(verb)) {
+        throw new HttpError(
+          400,
+          `unknown group verb "${verb}" (expected: ${GROUP_VERBS.join(" | ")})`,
+        );
+      }
+      if (registry.listGroups().every((g) => g.name !== groupName)) {
+        throw new HttpError(404, `no group "${groupName}"`);
+      }
+      const plan = groupPlan(registry, groupName, verb, { live: (dir) => existsSync(dir) });
+      if (method === "GET") return json({ plan });
+      if (method !== "POST") throw new HttpError(405, "method not allowed");
+      if (plan.members.length === 0) {
+        throw new HttpError(409, `group "${groupName}" has no members`);
+      }
+      const body = await readBody(req);
+      const acknowledge = asStringArray(body["acknowledge"]);
+      const gateOptions = {
+        ...(body["force"] === true ? { force: true } : {}),
+        ...(acknowledge !== undefined ? { acknowledge } : {}),
+      };
+      const result = await runGroup(
+        plan,
+        async (member) => {
+          const entry = registry.get(member.id);
+          if (entry === undefined) return { ok: false, message: "no longer registered" };
+          const handle = await processFor(entry);
+          if (verb === "stop") {
+            const stopped = await handle.supervisor.stop();
+            handle.clearDraining();
+            return stopped.stopped
+              ? { ok: true, message: `stopped${stopped.forced ? " (SIGKILL)" : ""}` }
+              : {
+                  ok: false,
+                  message:
+                    "NOT stopped — a live daemon holds the runfile but was not adopted; nothing was signalled",
+                  reason: "not-adopted",
+                };
+          }
+          const started =
+            verb === "restart"
+              ? await handle.supervisor.restart(gateOptions)
+              : await handle.supervisor.start(gateOptions);
+          if (started.ok) {
+            handle.clearDraining();
+            return { ok: true, message: `${verb}ed ${started.runId}`, runId: started.runId };
+          }
+          return { ok: false, message: groupRefusalMessage(started), reason: started.reason };
+        },
+        { parallel: body["parallel"] === true },
+      );
+      // 207: some members succeeded and some did not, which is the normal
+      // outcome of a sweep and must not read as a total failure.
+      return json({ result }, result.failed === 0 ? 200 : 207);
+    }
+
     if (head === "registry" && rest[0] === "scan-roots" && rest.length === 1) {
       if (method === "GET") return json({ scanRoots: registry.listScanRoots() });
       if (method === "POST") {
@@ -1958,6 +2056,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       "GET  /api/version",
       "GET  /api/harnesses[?hydrate=1]   POST /api/harnesses {dir}",
       "GET|POST|PUT|DELETE /api/registry/groups",
+      "GET|POST /api/registry/groups/:name/proc/{start,stop,restart}",
       "GET|POST|DELETE /api/registry/scan-roots",
       "POST /api/scan",
       "GET  /api/costs",

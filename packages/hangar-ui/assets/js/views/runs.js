@@ -19,7 +19,7 @@
  */
 
 import { api, streamRunEvents } from "../api.js";
-import { clear, collapsible, dot, el, emptyState, jsonPre, skeleton } from "../dom.js";
+import { clear, collapsible, dot, el, emptyState, jsonPre, skeleton, toast } from "../dom.js";
 import { hrefHarness } from "../router.js";
 import { shapeAccent, shapeLabel } from "../shapes.js";
 import {
@@ -65,6 +65,13 @@ export async function renderRunsBoard(root) {
     root.appendChild(emptyState("No harnesses registered yet", "crewhaus harness add <dir>"));
     return;
   }
+
+  // Groups first: a fleet is brought up as a fleet, in the order its members
+  // declare, and doing that a row at a time was N clicks in an order the
+  // operator had to remember.
+  const groupsCard = el("section", { class: "card" });
+  root.appendChild(groupsCard);
+  void renderGroupStrip(groupsCard, () => renderRunsBoard(root));
 
   const tbody = el("tbody");
   const table = el("div", { class: "table-scroll" }, [
@@ -156,6 +163,119 @@ export async function renderRunsBoard(root) {
       );
     }
   }
+}
+
+/**
+ * The group strip — group-ordered bulk lifecycle, PLAN FIRST.
+ *
+ * A fleet has dependency order (the secretary everyone's A2A door mounts
+ * boots first; the chief that supervises the rest last), and the board was
+ * per-row Start/Stop, so bringing one up was N clicks in an order the
+ * operator had to remember. Clicking a verb here does NOT act: it fetches
+ * the walk and renders it, in order, with every skip named — and only the
+ * second click runs it. A sweep that touches a whole fleet should be
+ * readable before it is authorized.
+ */
+async function renderGroupStrip(card, reload) {
+  clear(card).appendChild(el("h3", { class: "card-title", text: "Groups" }));
+  let groups = [];
+  try {
+    groups = (await api.groups())?.groups ?? [];
+  } catch {
+    // The board is the point; a registry read that fails leaves the strip
+    // out rather than taking the page down.
+    card.remove();
+    return;
+  }
+  if (groups.length === 0) {
+    card.appendChild(
+      emptyState("No groups yet", "crewhaus harness group <name> --add <dir> --member-order <n>"),
+    );
+    return;
+  }
+  for (const group of groups) {
+    const body = el("div", { class: "muted", text: "pick a verb to see the planned order" });
+    card.appendChild(
+      el("div", { class: "group-row" }, [
+        el("div", { class: "row-head" }, [
+          el("strong", { text: group.name }),
+          el("span", { class: "muted", text: `order ${group.order}` }),
+          ...["start", "restart", "stop"].map((verb) =>
+            el("button", {
+              class: "btn",
+              text: verb,
+              onclick: () => void showGroupPlan(body, group.name, verb, reload),
+            }),
+          ),
+        ]),
+        body,
+      ]),
+    );
+  }
+}
+
+/** Render the walk a verb WOULD take, with a confirm that runs it. */
+async function showGroupPlan(body, name, verb, reload) {
+  clear(body).appendChild(el("p", { class: "muted", text: "planning…" }));
+  let plan = null;
+  try {
+    plan = (await api.groupProcPlan(name, verb))?.plan ?? null;
+  } catch (err) {
+    clear(body).appendChild(el("p", { class: "error", text: String(err?.message ?? err) }));
+    return;
+  }
+  if (plan === null || plan.members.length === 0) {
+    clear(body).appendChild(el("p", { class: "muted", text: `group ${name} has no members` }));
+    return;
+  }
+  clear(body);
+  body.appendChild(
+    el("p", {
+      text: `${verb} would walk ${plan.actionable} member(s)${
+        verb === "stop" ? " in REVERSE boot order" : " in boot order"
+      }${plan.skipped > 0 ? `, skipping ${plan.skipped}` : ""}:`,
+    }),
+  );
+  body.appendChild(
+    el(
+      "ol",
+      { class: "plan-list" },
+      plan.members.map((m) =>
+        el("li", null, [
+          el("span", { text: `${m.specName} (${m.target})` }),
+          m.declaredOrder === null
+            ? el("span", { class: "muted", text: " no declared order" })
+            : null,
+          m.skip === null ? null : el("span", { class: "muted", text: ` — skipped: ${m.skip}` }),
+        ]),
+      ),
+    ),
+  );
+  const run = el("button", {
+    class: "btn btn-primary",
+    text: `run ${verb} on ${plan.actionable} member(s)`,
+    onclick: async () => {
+      run.disabled = true;
+      run.textContent = `${verb}ing…`;
+      try {
+        const result = (await api.groupProc(name, verb))?.result ?? null;
+        toast(
+          result === null
+            ? `${verb} ${name}: no result`
+            : `${verb} ${name}: ${result.ok} ok, ${result.failed} failed${
+                result.skipped > 0 ? `, ${result.skipped} skipped` : ""
+              }`,
+          result !== null && result.failed === 0 ? "ok" : "error",
+        );
+        reload();
+      } catch (err) {
+        toast(String(err?.message ?? err), "error");
+        run.disabled = false;
+        run.textContent = `run ${verb} on ${plan.actionable} member(s)`;
+      }
+    },
+  });
+  body.appendChild(run);
 }
 
 function boardRow(feedRow, proc, nowMs, reload) {

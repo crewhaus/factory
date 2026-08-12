@@ -40,6 +40,22 @@ export type HangarHarnessEntry = {
   readonly lastSeen: string;
   /** User-managed; never clobbered by an upsert refresh. */
   readonly groups: readonly string[];
+  /**
+   * Per-group boot order for this member, keyed by group name (1-based,
+   * lower boots first). Absent for a member with no declared order, which
+   * sorts after every ordered one.
+   *
+   * This is a MEMBER's order INSIDE a group, distinct from `GroupDef.order`
+   * (the groups' order relative to each other). A fleet has dependency
+   * order — a secretary whose A2A door every other spec mounts has to be up
+   * before them, and the chief that supervises the rest comes last — and
+   * that order lives per member, not per group.
+   *
+   * Keyed by name rather than held as a list on the group so that renaming
+   * a group (which rewrites `groups` on every entry) and removing a member
+   * cannot leave a dangling ordering behind.
+   */
+  readonly groupOrder?: Readonly<Record<string, number>>;
   /** User-managed; never clobbered by an upsert refresh. */
   readonly tags: readonly string[];
   /** User-managed; pinned entries survive prune prompts. */

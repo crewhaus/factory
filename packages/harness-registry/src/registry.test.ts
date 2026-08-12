@@ -643,6 +643,68 @@ describe("groups", () => {
     expect(reg.listGroups().map((g) => g.name)).toEqual(["prod", "dev"]);
   });
 
+  test("members walk in DECLARED order, undeclared ones last and stable by name", () => {
+    const root = newRoot();
+    const reg = openReg(root);
+    // Registered in the opposite order on purpose: a walk that follows
+    // insertion order would pass a weaker test and fail a real fleet.
+    for (const [name, order] of [
+      ["chief", 3],
+      ["zulu", undefined],
+      ["archivist", 2],
+      ["alpha", undefined],
+      ["secretary", 1],
+    ] as const) {
+      const dir = newHarnessDir(root, name);
+      reg.upsert({ dir, specName: name, target: "channel" });
+      reg.setGroups(dir, ["crew"]);
+      if (order !== undefined) reg.setGroupOrder(dir, "crew", order);
+    }
+    expect(reg.groupMembers("crew").map((e) => e.specName)).toEqual([
+      "secretary",
+      "archivist",
+      "chief",
+      "alpha",
+      "zulu",
+    ]);
+  });
+
+  test("an order is per GROUP, and clearing it removes the key rather than nulling it", () => {
+    const root = newRoot();
+    const dir = newHarnessDir(root, "member");
+    const reg = openReg(root);
+    reg.upsert({ dir, specName: "m", target: "channel" });
+    reg.setGroups(dir, ["crew", "canary"]);
+    reg.setGroupOrder(dir, "crew", 2);
+    reg.setGroupOrder(dir, "canary", 1);
+    expect(reg.get(dir)?.groupOrder).toEqual({ crew: 2, canary: 1 });
+
+    reg.setGroupOrder(dir, "crew", undefined);
+    expect(reg.get(dir)?.groupOrder).toEqual({ canary: 1 });
+    reg.setGroupOrder(dir, "canary", undefined);
+    // The whole field goes, so an entry that never used ordering does not
+    // grow an empty object in the file.
+    expect(reg.get(dir)?.groupOrder).toBeUndefined();
+  });
+
+  test("an order survives a reread — it is registry state, not a session value", () => {
+    const root = newRoot();
+    const dir = newHarnessDir(root, "member");
+    openReg(root).upsert({ dir, specName: "m", target: "channel" });
+    openReg(root).setGroups(dir, ["crew"]);
+    openReg(root).setGroupOrder(dir, "crew", 4);
+    expect(openReg(root).get(dir)?.groupOrder).toEqual({ crew: 4 });
+  });
+
+  test("a non-member's order is stored but never consulted", () => {
+    const root = newRoot();
+    const dir = newHarnessDir(root, "member");
+    const reg = openReg(root);
+    reg.upsert({ dir, specName: "m", target: "channel" });
+    reg.setGroupOrder(dir, "crew", 1);
+    expect(reg.groupMembers("crew")).toEqual([]);
+  });
+
   test("updateGroup renames the def and rewrites entry membership", () => {
     const root = newRoot();
     const harness = newHarnessDir(root, "member");
