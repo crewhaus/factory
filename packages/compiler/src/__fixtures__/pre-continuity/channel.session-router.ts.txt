@@ -104,10 +104,24 @@ export function createSessionRouter(config: SessionRouterConfig): SessionRouter 
       const event = __resumeContexts.get(approval.id);
       __resumeContexts.delete(approval.id);
       // Only a granted approval re-drives the turn; a denial's in-thread ACK
-      // already recorded the outcome, and a resume with no captured event
-      // (resolved by the CLI verb, or after a restart) waits for the next
-      // inbound message.
-      if (approval.status !== "grant" || event === undefined) return;
+      // already recorded the outcome.
+      if (approval.status !== "grant") return;
+      // A grant with no captured event — resolved by `crewhaus approvals
+      // grant` from a terminal, or arriving after a restart cleared this
+      // in-memory map — cannot re-drive the turn here, because the inbound
+      // message that started it was never persisted. SAY SO. Returning
+      // silently is why an operator who granted from the CLI saw nothing
+      // happen at all and had no way to tell a working grant from a broken
+      // one; the parked call is released and the NEXT inbound message
+      // re-drives it pre-approved.
+      if (event === undefined) {
+        process.stdout.write(
+          "[session-router] approval " + approval.id + " granted, but this process has no captured" +
+            " inbound event for it (granted out of band, or the daemon restarted) — the grant is" +
+            " live and the next message in that conversation runs pre-approved\n",
+        );
+        return;
+      }
       try {
         const reply = await config.agent.runTurn({
           sessionId: approval.sessionId,

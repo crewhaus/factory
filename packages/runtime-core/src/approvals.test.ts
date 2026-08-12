@@ -176,10 +176,18 @@ afterEach(() => {
 
 /** Single-turn run capturing the trace bus + session log + any throw. */
 async function runSingleTurn(
-  opts: Omit<Parameters<typeof runChatLoop>[0], "model" | "instructions"> & { model?: string },
+  opts: Omit<Parameters<typeof runChatLoop>[0], "model" | "instructions"> & {
+    model?: string;
+    /** #400 — resume INTO an existing session, the way a channel daemon's
+     *  `resumeApproval` and `crewhaus runs resume` both do. The approval gate
+     *  keys a replay on the session, so a fresh one each turn would never
+     *  exercise it. */
+    _sessionId?: string;
+  },
 ): Promise<{ events: TraceEvent[]; logged: LoggedLine[]; caught: unknown; result?: string }> {
   const sessionDir = mkdtempSync(join(root, "sess-"));
-  const runContext = createRunContext();
+  const { _sessionId, ...loopOpts } = opts;
+  const runContext = createRunContext(_sessionId !== undefined ? { sessionId: _sessionId } : {});
   const events: TraceEvent[] = [];
   runContext.eventBus.subscribe((ev) => events.push(ev));
   let caught: unknown;
@@ -193,7 +201,7 @@ async function runSingleTurn(
       singleTurn: true,
       seedMessages: [{ role: "user", content: "go" }],
       permissionMode: "default",
-      ...opts,
+      ...loopOpts,
     });
   } catch (err) {
     caught = err;
@@ -830,5 +838,151 @@ describe("#383 — standing grants and .crewhaus/settings.json rules", () => {
     expect(
       BUILTIN_DEFAULT_RULES.some((r) => r.pattern === "MemoryClear" && r.type === "alwaysAllow"),
     ).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #400 — the resumed call is not the parked call.
+// ---------------------------------------------------------------------------
+
+describe("#400 — a one-shot grant satisfies a REGENERATED call", () => {
+  /** A gated tool whose input the model can legitimately re-word. */
+  const notifyTool = (onCall?: (input: unknown) => void) =>
+    buildTool({
+      name: "notify",
+      description: "message a peer",
+      inputSchema: z.object({ to: z.string(), body: z.string() }).strict(),
+      readOnly: false,
+      destructive: false,
+      concurrencySafe: false,
+      execute: async (i) => {
+        onCall?.(i);
+        return `sent to ${i.to}`;
+      },
+    });
+
+  /** Park a call, grant it, and hand back the parked ids. */
+  async function parkAndGrant(
+    input: Record<string, unknown>,
+  ): Promise<{ approvalId: string; sessionId: string }> {
+    const first = await runSingleTurn({
+      _adapter: scriptedAdapter([[use("tu_1", "notify", input)], [text("done")]]).adapter,
+      tools: [notifyTool()],
+      approvals: { store },
+    });
+    const req = first.events.find((e) => e.kind === "approval_requested");
+    if (req?.kind !== "approval_requested") throw new Error("expected a park");
+    const parked = await store.get("notify", hashApprovalInput("notify", input));
+    if (parked === null) throw new Error("expected a persisted record");
+    await store.resolve(req.approvalId, "grant", "tester");
+    return { approvalId: req.approvalId, sessionId: parked.sessionId };
+  }
+
+  test("the APPROVED input is what runs, not the model's new wording", async () => {
+    // THE REGRESSION PIN. Pre-#400 this parks again under a fresh id and the
+    // tool never runs: the re-worded `body` moves the hash, `get` misses.
+    const approved = { to: "archivist", body: "please file the Q3 notes" };
+    const { sessionId } = await parkAndGrant(approved);
+
+    const executed: unknown[] = [];
+    const second = await runSingleTurn({
+      _adapter: scriptedAdapter([
+        [use("tu_1", "notify", { to: "archivist", body: "kindly file the third-quarter notes" })],
+        [text("done")],
+      ]).adapter,
+      tools: [notifyTool((i) => executed.push(i))],
+      approvals: { store },
+      _sessionId: sessionId,
+    });
+
+    expect(second.caught).toBeUndefined();
+    expect(second.events.some((e) => e.kind === "approval_requested")).toBe(false);
+    // The operator authorized a SPECIFIC action; that action is what ran.
+    expect(executed).toEqual([approved]);
+  });
+
+  test("the model is TOLD the approved input ran, so it does not re-issue", async () => {
+    const { approvalId, sessionId } = await parkAndGrant({ to: "peer", body: "first wording" });
+    const second = await runSingleTurn({
+      _adapter: scriptedAdapter([
+        [use("tu_1", "notify", { to: "peer", body: "second wording" })],
+        [text("done")],
+      ]).adapter,
+      tools: [notifyTool()],
+      approvals: { store },
+      _sessionId: sessionId,
+    });
+    // The assistant message still shows what the model asked for, so without
+    // the note it would reason about an action that never happened.
+    const results = second.logged
+      .filter((l) => l.kind === "tool_result")
+      .map((l) => JSON.stringify(l))
+      .join("\n");
+    expect(results).toContain("the APPROVED input was executed");
+    expect(results).toContain(approvalId);
+  });
+
+  test("the grant is CONSUMED — a replay is one shot, not a licence", async () => {
+    const { sessionId } = await parkAndGrant({ to: "peer", body: "one" });
+    const executed: unknown[] = [];
+    await runSingleTurn({
+      _adapter: scriptedAdapter([
+        [use("tu_1", "notify", { to: "peer", body: "two" })],
+        [text("done")],
+      ]).adapter,
+      tools: [notifyTool((i) => executed.push(i))],
+      approvals: { store },
+      _sessionId: sessionId,
+    });
+    expect(executed).toHaveLength(1);
+
+    // A third wording must PARK: the grant is spent.
+    const third = await runSingleTurn({
+      _adapter: scriptedAdapter([
+        [use("tu_1", "notify", { to: "peer", body: "three" })],
+        [text("done")],
+      ]).adapter,
+      tools: [notifyTool((i) => executed.push(i))],
+      approvals: { store },
+      _sessionId: sessionId,
+    });
+    expect(third.caught).toBeInstanceOf(RunFailedError);
+    expect(executed).toHaveLength(1);
+  });
+
+  test("an IDENTICAL re-issue still takes the untouched exact-hash path", async () => {
+    // The normal path must not change: same input, same hash, plain consume —
+    // no replay, and therefore no note in the result.
+    const same = { to: "peer", body: "identical" };
+    const { sessionId } = await parkAndGrant(same);
+    const executed: unknown[] = [];
+    const second = await runSingleTurn({
+      _adapter: scriptedAdapter([[use("tu_1", "notify", same)], [text("done")]]).adapter,
+      tools: [notifyTool((i) => executed.push(i))],
+      approvals: { store },
+      _sessionId: sessionId,
+    });
+    expect(executed).toEqual([same]);
+    const results = second.logged
+      .filter((l) => l.kind === "tool_result")
+      .map((l) => JSON.stringify(l))
+      .join("\n");
+    expect(results).not.toContain("the APPROVED input was executed");
+  });
+
+  test("a grant never crosses into ANOTHER session", async () => {
+    await parkAndGrant({ to: "peer", body: "session A wording" });
+    const executed: unknown[] = [];
+    // No `resume` → a fresh session. The grant must not reach it.
+    const other = await runSingleTurn({
+      _adapter: scriptedAdapter([
+        [use("tu_1", "notify", { to: "peer", body: "session B wording" })],
+        [text("done")],
+      ]).adapter,
+      tools: [notifyTool((i) => executed.push(i))],
+      approvals: { store },
+    });
+    expect(other.caught).toBeInstanceOf(RunFailedError);
+    expect(executed).toEqual([]);
   });
 });
