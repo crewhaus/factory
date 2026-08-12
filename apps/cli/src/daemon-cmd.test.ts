@@ -23,6 +23,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { openHangarRegistry } from "@crewhaus/harness-registry";
 import type { Clock, ProcessOps, SpawnRequest, SpawnedProcess } from "@crewhaus/harness-supervisor";
 import { hashSpecSource } from "@crewhaus/harness-supervisor";
 import { runDaemonCommand } from "./daemon-cmd";
@@ -33,6 +34,9 @@ type FakeChild = {
   pid: number;
   request: SpawnRequest;
   signals: string[];
+  /** Monotonic order this child was FIRST signalled, so a test can assert
+   *  the order a walk stopped a fleet in rather than the order it spawned it. */
+  signalSeq?: number;
   exit(code: number | null, signal?: string | null): void;
   writeLog(text: string): void;
 };
@@ -41,6 +45,7 @@ type FakeOps = ProcessOps & { children: FakeChild[]; last(): FakeChild | undefin
 
 function fakeOps(now: () => number): FakeOps {
   let nextPid = 9_001;
+  let signalSeq = 0;
   const children: FakeChild[] = [];
   const live = new Map<number, { startTimeMs: number; commandLine: string }>();
   const childFor = (pid: number): FakeChild | undefined => children.find((c) => c.pid === pid);
@@ -81,12 +86,16 @@ function fakeOps(now: () => number): FakeOps {
     startTimeMs: (pid) => live.get(pid)?.startTimeMs,
     commandLine: (pid) => live.get(pid)?.commandLine,
     terminate: (pid) => {
-      childFor(pid)?.signals.push("SIGTERM");
-      childFor(pid)?.exit(null, "SIGTERM");
+      const child = childFor(pid);
+      if (child !== undefined && child.signalSeq === undefined) child.signalSeq = ++signalSeq;
+      child?.signals.push("SIGTERM");
+      child?.exit(null, "SIGTERM");
     },
     forceKill: (pid) => {
-      childFor(pid)?.signals.push("SIGKILL");
-      childFor(pid)?.exit(null, "SIGKILL");
+      const child = childFor(pid);
+      if (child !== undefined && child.signalSeq === undefined) child.signalSeq = ++signalSeq;
+      child?.signals.push("SIGKILL");
+      child?.exit(null, "SIGKILL");
     },
   };
 }
@@ -153,6 +162,75 @@ function crewFixture(): Fixture {
     "  instructions: |",
     "    You are a fixture.",
   ]);
+}
+
+type GroupFixture = {
+  readonly ops: FakeOps;
+  readonly opts: { env: Record<string, string | undefined>; ops: ProcessOps; cwd: string };
+  dirOf(name: string): string;
+  /** Member names in the order their daemons were SPAWNED. */
+  spawnedNames(): string[];
+  /** Member names in the order they were SIGNALLED. */
+  signalledNames(): string[];
+  cleanup(): void;
+};
+
+/**
+ * A three-member fleet with a declared boot order, registered in a temp
+ * registry: secretary first (everyone mounts its door), archivist second
+ * (owns the shared space), chief last (it supervises the rest).
+ *
+ * Deliberately REGISTERED in the opposite order, so a walk that happens to
+ * follow registry insertion order fails the test.
+ */
+function groupFixture(options: { withCli?: boolean } = {}): GroupFixture {
+  const root = mkdtempSync(join(tmpdir(), "daemon-group-"));
+  const registryRoot = join(root, "registry");
+  const ops = fakeOps(() => Date.now());
+  const dirs = new Map<string, string>();
+
+  const member = (name: string, target: string, order: number | undefined): void => {
+    const dir = join(root, name);
+    mkdirSync(join(dir, "dist"), { recursive: true });
+    writeFileSync(join(dir, "dist", target === "cli" ? "agent.ts" : "daemon.ts"), "// bundle\n");
+    writeFileSync(
+      join(dir, "crewhaus.yaml"),
+      [
+        `name: ${name}`,
+        `target: ${target}`,
+        "agent:",
+        "  model: anthropic/claude-sonnet-4",
+        "  instructions: |",
+        "    A fixture.",
+      ].join("\n"),
+    );
+    dirs.set(name, dir);
+    const reg = openHangarRegistry({ root: registryRoot, env: {} });
+    reg.upsert({ dir, specName: name, target, origin: "manual", originDetail: "test" });
+    reg.addGroup({ name: "crew" });
+    reg.setGroups(dir, ["crew"]);
+    if (order !== undefined) reg.setGroupOrder(dir, "crew", order);
+  };
+  member("chief", "channel", 3);
+  member("archivist", "channel", 2);
+  member("secretary", "channel", 1);
+  if (options.withCli === true) member("scratch", "cli", 4);
+
+  const nameOf = (path: string): string =>
+    [...dirs.entries()].find(([, dir]) => path.startsWith(dir))?.[0] ?? path;
+
+  return {
+    ops,
+    opts: { env: { CREWHAUS_REGISTRY_ROOT: registryRoot }, ops, cwd: root },
+    dirOf: (name) => dirs.get(name) as string,
+    spawnedNames: () => ops.children.map((c) => nameOf(c.request.cwd)),
+    signalledNames: () =>
+      ops.children
+        .filter((c) => c.signalSeq !== undefined)
+        .sort((a, b) => (a.signalSeq as number) - (b.signalSeq as number))
+        .map((c) => nameOf(c.request.cwd)),
+    cleanup: () => rmSync(root, { recursive: true, force: true }),
+  };
 }
 
 /**
@@ -387,6 +465,92 @@ describe("crewhaus daemon", () => {
       ]);
     } finally {
       f.cleanup();
+    }
+  });
+
+  test("--group starts every member in boot order, and stop reverses it", async () => {
+    const g = groupFixture();
+    try {
+      const started = await runDaemonCommand(
+        ["start", "--group", "crew", "--no-preflight"],
+        g.opts,
+      );
+      expect(started.exitCode).toBe(0);
+      // secretary (1) → archivist (2) → chief (3): the dependency order the
+      // group declares, not registry insertion order (which is reversed).
+      expect(g.spawnedNames()).toEqual(["secretary", "archivist", "chief"]);
+      expect(started.lines.join("\n")).toContain("start 3 member(s): 3 ok, 0 failed");
+
+      const stopped = await runDaemonCommand(["stop", "--group", "crew"], g.opts);
+      expect(stopped.exitCode).toBe(0);
+      expect(g.signalledNames()).toEqual(["chief", "archivist", "secretary"]);
+    } finally {
+      g.cleanup();
+    }
+  });
+
+  test("a member that refuses does not strand the ones behind it, and the walk exits 1", async () => {
+    const g = groupFixture();
+    try {
+      // The middle member is already running, so its start refuses.
+      await runDaemonCommand(["start", "--no-preflight"], {
+        ...g.opts,
+        cwd: g.dirOf("archivist"),
+      });
+      const out = await runDaemonCommand(["start", "--group", "crew", "--no-preflight"], g.opts);
+      expect(out.exitCode).toBe(1);
+      const text = out.lines.join("\n");
+      expect(text).toContain("already running");
+      expect(text).toContain("start 3 member(s): 2 ok, 1 failed");
+      expect(text).toContain("failed: archivist");
+      // The member AFTER the refusal still started.
+      expect(g.spawnedNames()).toContain("chief");
+    } finally {
+      g.cleanup();
+    }
+  });
+
+  test("shapes with no daemon are skipped WITH A NOTE, never silently dropped", async () => {
+    const g = groupFixture({ withCli: true });
+    try {
+      const out = await runDaemonCommand(["start", "--group", "crew", "--no-preflight"], g.opts);
+      const text = out.lines.join("\n");
+      expect(text).toContain("skipped — cli is the interactive class");
+      expect(text).toContain("1 skipped");
+      // A skip is not a failure.
+      expect(out.exitCode).toBe(0);
+      expect(g.spawnedNames()).not.toContain("scratch");
+    } finally {
+      g.cleanup();
+    }
+  });
+
+  test("--group refuses alongside a harness argument, and names unknown groups", async () => {
+    const g = groupFixture();
+    try {
+      await expect(
+        runDaemonCommand(["start", "--group", "crew", g.dirOf("chief")], g.opts),
+      ).rejects.toThrow(/mutually exclusive/);
+      await expect(runDaemonCommand(["start", "--group", "nope"], g.opts)).rejects.toThrow(
+        /has no members.*known groups: crew/s,
+      );
+    } finally {
+      g.cleanup();
+    }
+  });
+
+  test("flags ride along to each member, even one whose value equals the group name", async () => {
+    const g = groupFixture();
+    try {
+      // `--ack crew` would be eaten by a naive argv string-filter.
+      const out = await runDaemonCommand(
+        ["start", "--group", "crew", "--no-preflight", "--ack", "crew"],
+        g.opts,
+      );
+      expect(out.exitCode).toBe(0);
+      expect(g.spawnedNames()).toHaveLength(3);
+    } finally {
+      g.cleanup();
     }
   });
 

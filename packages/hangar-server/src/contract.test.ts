@@ -1648,6 +1648,27 @@ describe("UI route contract", () => {
       expect(afterWrites["notes"]).toBe("contract note");
       expect(afterWrites["groups"]).toEqual(["prod"]);
 
+      // -- group-ordered bulk lifecycle: order, PLAN, then the walk --------
+      await drive("setGroupOrder", { id }, { body: { group: "prod", order: 1 } });
+      expect(
+        ((await t.api(`/api/h/${id}`)).body["entry"] as { groupOrder?: Record<string, number> })
+          .groupOrder,
+      ).toEqual({ prod: 1 });
+      const plan = (await drive("groupProcPlan", { name: "prod", verb: "start" }))["plan"] as {
+        members: Array<{ specName: string; position: number }>;
+        verb: string;
+      };
+      expect(plan.verb).toBe("start");
+      expect(plan.members).toHaveLength(1);
+      expect(plan.members[0]?.position).toBe(1);
+      // The walk itself: this fixture is a cli shape, so the one member is
+      // SKIPPED WITH A NOTE — which is the contract, not a failure.
+      const swept = (await drive("groupProc", { name: "prod", verb: "start" }, { body: {} }))[
+        "result"
+      ] as { skipped: number; failed: number };
+      expect(swept.skipped).toBe(1);
+      expect(swept.failed).toBe(0);
+
       // -- M2 reads ---------------------------------------------------------
       const proc0 = await drive("proc", { id }, { readsKey: "proc" });
       expect(proc0["state"]).toBe("stopped");

@@ -75,8 +75,11 @@ const HARNESS_USAGE_LINES: readonly string[] = [
   "  crewhaus harness relocate <hrn_id> <newDir>       point an entry at a moved directory",
   "                                                    (same id)",
   "  crewhaus harness group <name> [--add <dir|id>] [--remove <dir|id>] [--color <c>] [--order <n>]",
-  "                                                    bare form creates the group; --add/--remove",
-  "                                                    manage membership",
+  "       [--member-order <n>] [--list]                bare form creates the group; --add/--remove",
+  "                                                    manage membership. --order is the GROUP's",
+  "                                                    order among groups; --member-order (with",
+  "                                                    --add) is one MEMBER's boot order inside it.",
+  "                                                    --list prints the boot order.",
   "  crewhaus harness tag <dir|id> (--add <tag> | --remove <tag>)",
   "  crewhaus harness pin <dir|id> [--off]             pinned entries survive prune prompts",
   "  crewhaus harness scan [--root <dir>]              discover harnesses (dirs carrying a",
@@ -158,6 +161,16 @@ function requirePositional(verb: string, args: VerbArgs, index: number, what: st
   const v = args.positional[index];
   if (v === undefined) throw new Error(`harness ${verb}: a ${what} argument is required`);
   return v;
+}
+
+/** A 1-based position flag. Rejects `0`, negatives, and `3abc` — a silently
+ *  coerced order is one an operator would never find. */
+function positiveInt(flag: string, raw: string): number {
+  const n = Number.parseInt(raw, 10);
+  if (Number.isNaN(n) || n < 1 || String(n) !== raw.trim()) {
+    throw new Error(`harness group: ${flag} must be a positive integer (got "${raw}")`);
+  }
+  return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -481,15 +494,25 @@ function harnessGroup(reg: HangarRegistry, argv: readonly string[]): HarnessComm
     remove: "value",
     color: "value",
     order: "value",
+    "member-order": "value",
+    list: "boolean",
   });
   const name = requirePositional("group", args, 0, "<name>");
   const addKey = strFlag(args, "add");
   const removeKey = strFlag(args, "remove");
   const color = strFlag(args, "color");
   const orderFlag = strFlag(args, "order");
+  const memberOrderFlag = strFlag(args, "member-order");
   if (addKey !== undefined && removeKey !== undefined) {
     throw new Error("harness group: --add and --remove are mutually exclusive");
   }
+  if (memberOrderFlag !== undefined && addKey === undefined) {
+    throw new Error(
+      "harness group: --member-order names ONE member's boot order, so it needs --add <dir|id> (--order is the GROUP's order among groups)",
+    );
+  }
+  const memberOrder =
+    memberOrderFlag !== undefined ? positiveInt("--member-order", memberOrderFlag) : undefined;
 
   const lines: string[] = [];
   // The bare form creates; every other form ensures the definition exists
@@ -527,6 +550,12 @@ function harnessGroup(reg: HangarRegistry, argv: readonly string[]): HarnessComm
       reg.setGroups(entry.id, [...entry.groups, name]);
       lines.push(`added ${entry.specName} (${entry.id}) to group ${name}`);
     }
+    // `--add` on an existing member is how an order is CHANGED — there is no
+    // second verb to remember, and re-adding is already idempotent.
+    if (memberOrder !== undefined) {
+      reg.setGroupOrder(entry.id, name, memberOrder);
+      lines.push(`  boots at position ${memberOrder} in ${name}`);
+    }
   }
   if (removeKey !== undefined) {
     const entry = requireEntry(reg, removeKey);
@@ -537,7 +566,30 @@ function harnessGroup(reg: HangarRegistry, argv: readonly string[]): HarnessComm
         entry.id,
         entry.groups.filter((g) => g !== name),
       );
+      // Leaving the order behind would resurrect it if the member is ever
+      // re-added, with a number nobody chose this time.
+      reg.setGroupOrder(entry.id, name, undefined);
       lines.push(`removed ${entry.specName} (${entry.id}) from group ${name}`);
+    }
+  }
+
+  // `--list` prints the BOOT ORDER — the walk `daemon start --group` will
+  // take — rather than membership, because the order is the thing an
+  // operator cannot otherwise see.
+  if (boolFlag(args, "list")) {
+    const members = reg.groupMembers(name);
+    if (members.length === 0) {
+      lines.push(`group ${name} has no members`);
+    } else {
+      lines.push(`group ${name} boots in this order (stop reverses it):`);
+      members.forEach((m, index) => {
+        const declared = m.groupOrder?.[name];
+        lines.push(
+          `  ${index + 1}. ${m.specName} (${m.target})  ${
+            declared !== undefined ? `order ${declared}` : "no declared order"
+          }  ${m.dir}`,
+        );
+      });
     }
   }
 

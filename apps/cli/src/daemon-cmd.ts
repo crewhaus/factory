@@ -122,6 +122,11 @@ const DAEMON_USAGE_LINES: readonly string[] = [
   "       --lane heartbeat|schedule [--reason R] path, via crewhaus.control.v1",
   "  crewhaus daemon drain [<dir|hrn_id>]        stop intake, finish in-flight work, exit 0",
   "",
+  "  start | stop | restart also take --group <name> [--parallel] instead of a",
+  "  harness: every member in the group's boot order (REVERSED for stop), set with",
+  "  `crewhaus harness group <name> --add <dir> --member-order <n>`. The walk keeps",
+  "  going past a member that refuses, skips shapes with no daemon (with a note),",
+  "  prints a per-member summary, and exits non-zero if any member failed.",
   "",
   "  Per-harness prep lives in <harness>/.crewhaus/settings.json under `manager`:",
   "  `autoCompile: true` makes every start recompile a stale bundle, and",
@@ -433,9 +438,25 @@ async function daemonStart(
     "no-preflight": "boolean",
     compile: "boolean",
     "no-compile": "boolean",
+    group: "value",
+    parallel: "boolean",
   });
   if (args.flags.get("compile") === true && args.flags.get("no-compile") === true) {
     throw new Error(`daemon ${verb}: --compile and --no-compile are mutually exclusive`);
+  }
+  const groupFlag = args.flags.get("group");
+  if (typeof groupFlag === "string") {
+    if (args.positional[0] !== undefined) {
+      throw new Error(`daemon ${verb}: --group and a harness argument are mutually exclusive`);
+    }
+    // The group's own BOOT order for start/restart. Members walk it as
+    // written; a restart is a start of each member, not a stop-then-start of
+    // the whole group, so the order that matters is the boot order.
+    const members = resolveGroup(groupFlag, opts);
+    const rest = passthroughFlags(args);
+    return await walkGroup(members, verb, args.flags.get("parallel") === true, (member) =>
+      daemonStart([member.harness.dir, ...rest], opts, restart),
+    );
   }
   const harness = resolveHarness(args.positional[0], opts);
   const ackFlag = args.flags.get("ack");
@@ -519,6 +540,179 @@ async function daemonStart(
   } finally {
     supervisor.close();
   }
+}
+
+// ---------------------------------------------------------------------------
+// --group — the whole fleet, in dependency order
+// ---------------------------------------------------------------------------
+
+/**
+ * A group member and what a lifecycle verb should do with it.
+ *
+ * Fleets have dependency order: a secretary whose A2A door every other spec
+ * mounts has to be up first, the archivist that owns the shared wiki space
+ * second, the chief that supervises the rest last — and stops go the other
+ * way. Before this that was N terminal commands or N console clicks in an
+ * order the operator had to remember, with nothing recording it.
+ */
+type GroupMember = {
+  readonly harness: ResolvedHarness;
+  readonly entryId: string;
+  /** Why this member is skipped, when it is. */
+  readonly skip?: string;
+};
+
+/**
+ * Resolve a group to its members in BOOT order, each already classified.
+ *
+ * Interactive and one-shot members are SKIPPED WITH A NOTE rather than
+ * failed: a fleet legitimately contains a `cli` shape and a crew, and
+ * neither has a daemon to start — but silently dropping them from a
+ * `--group` walk would leave an operator believing the group is up when a
+ * third of it was never considered.
+ */
+function resolveGroup(name: string, opts: DaemonCommandOptions): readonly GroupMember[] {
+  const registry = openRegistrySafe(opts);
+  if (registry === undefined) {
+    throw new Error(
+      "daemon --group: no registry available (CREWHAUS_NO_REGISTRY, or an unreadable registry root) — --group resolves membership through it",
+    );
+  }
+  const entries = registry.groupMembers(name);
+  if (entries.length === 0) {
+    const known = registry
+      .listGroups()
+      .map((g) => g.name)
+      .join(", ");
+    throw new Error(
+      `daemon --group: group "${name}" has no members${known !== "" ? ` (known groups: ${known})` : ""} — add some with \`crewhaus harness group ${name} --add <dir> --member-order <n>\``,
+    );
+  }
+  return entries.map((entry): GroupMember => {
+    // A vanished directory is reported, never silently walked past: it is
+    // the difference between "the fleet is up" and "the fleet is up except
+    // the one whose checkout someone moved".
+    if (entry.missingSince !== null || !existsSync(entry.dir)) {
+      return {
+        harness: { dir: entry.dir, target: entry.target, specName: entry.specName },
+        entryId: entry.id,
+        skip: `directory is missing (since ${entry.missingSince ?? "now"}) — relocate or remove it`,
+      };
+    }
+    let harness: ResolvedHarness;
+    try {
+      harness = resolveHarness(entry.dir, opts);
+    } catch (err) {
+      return {
+        harness: { dir: entry.dir, target: entry.target, specName: entry.specName },
+        entryId: entry.id,
+        skip: err instanceof Error ? err.message : String(err),
+      };
+    }
+    const runClass = runClassFor(harness.target);
+    if (runClass !== "daemon" && runClass !== "worker") {
+      return {
+        harness,
+        entryId: entry.id,
+        skip: `${harness.target} is the ${runClass} class — it has no daemon to start${
+          readsBriefOnStdin(harness.target) ? " (use `crewhaus daemon submit --brief-file`)" : ""
+        }`,
+      };
+    }
+    return { harness, entryId: entry.id };
+  });
+}
+
+/**
+ * The flags to re-issue against each member of a group, rebuilt from the
+ * PARSED arguments rather than by filtering the raw argv.
+ *
+ * Filtering strings would drop the wrong token the moment a flag's VALUE
+ * happened to equal the group name (`--group ops --ack ops`), which is the
+ * kind of bug that shows up once, in production, on someone else's fleet.
+ */
+function passthroughFlags(args: VerbArgs): string[] {
+  const out: string[] = [];
+  for (const [name, value] of args.flags) {
+    if (name === "group" || name === "parallel") continue;
+    if (value === true) out.push(`--${name}`);
+    else out.push(`--${name}`, value);
+  }
+  return out;
+}
+
+/** One member's outcome inside a group walk. */
+type MemberOutcome = {
+  readonly member: GroupMember;
+  readonly lines: readonly string[];
+  readonly exitCode: 0 | 1;
+  readonly skipped: boolean;
+};
+
+/**
+ * Walk a group through one lifecycle verb.
+ *
+ * Two rules the issue asks for, and both matter:
+ *
+ *   - **keep going past individual refusals.** A member that will not start
+ *     must not strand the six behind it — an operator brings up what can
+ *     come up and fixes the one that cannot;
+ *   - **a non-zero exit if ANY member failed**, so a shell script that
+ *     brings a fleet up still fails loudly.
+ *
+ * `--parallel` is opt-in and exists for the groups where order genuinely
+ * does not matter; it cannot be the default, because the ordering is the
+ * entire point of the feature.
+ */
+async function walkGroup(
+  members: readonly GroupMember[],
+  verb: "start" | "stop" | "restart",
+  parallel: boolean,
+  run: (member: GroupMember) => Promise<DaemonCommandResult>,
+): Promise<DaemonCommandResult> {
+  const runnable = members.filter((m) => m.skip === undefined);
+  const skipped = members.filter((m) => m.skip !== undefined);
+  const one = async (member: GroupMember): Promise<MemberOutcome> => {
+    try {
+      const result = await run(member);
+      return { member, lines: result.lines, exitCode: result.exitCode, skipped: false };
+    } catch (err) {
+      // A thrown argument/resolution error is THIS member's failure, not the
+      // walk's: the remaining members still get their turn.
+      return {
+        member,
+        lines: [`${member.harness.specName}: ${err instanceof Error ? err.message : String(err)}`],
+        exitCode: 1,
+        skipped: false,
+      };
+    }
+  };
+
+  let outcomes: MemberOutcome[];
+  if (parallel) {
+    outcomes = await Promise.all(runnable.map(one));
+  } else {
+    outcomes = [];
+    for (const member of runnable) outcomes.push(await one(member));
+  }
+
+  const lines: string[] = [];
+  for (const outcome of outcomes) lines.push(...outcome.lines);
+  for (const member of skipped) {
+    lines.push(`${member.harness.specName}: skipped — ${member.skip}`);
+  }
+
+  const failed = outcomes.filter((o) => o.exitCode !== 0);
+  lines.push("");
+  lines.push(
+    `${verb} ${runnable.length} member(s)${parallel ? " in parallel" : ""}: ${
+      outcomes.length - failed.length
+    } ok, ${failed.length} failed${skipped.length > 0 ? `, ${skipped.length} skipped` : ""}`,
+  );
+  if (failed.length > 0) {
+    lines.push(`  failed: ${failed.map((o) => o.member.harness.specName).join(", ")}`);
+  }
+  return { lines, exitCode: failed.length > 0 ? 1 : 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -653,7 +847,26 @@ async function daemonStop(
   argv: readonly string[],
   opts: DaemonCommandOptions,
 ): Promise<DaemonCommandResult> {
-  const args = parseVerbArgs("stop", argv, { grace: "value" });
+  const args = parseVerbArgs("stop", argv, {
+    grace: "value",
+    group: "value",
+    parallel: "boolean",
+  });
+  const groupFlag = args.flags.get("group");
+  if (typeof groupFlag === "string") {
+    if (args.positional[0] !== undefined) {
+      throw new Error("daemon stop: --group and a harness argument are mutually exclusive");
+    }
+    // REVERSED. A fleet boots dependencies-first, so it stops
+    // dependents-first: stopping the secretary while the six specs that
+    // mount its A2A door are still live is how a clean shutdown turns into
+    // six connection errors.
+    const members = [...resolveGroup(groupFlag, opts)].reverse();
+    const rest = passthroughFlags(args);
+    return await walkGroup(members, "stop", args.flags.get("parallel") === true, (member) =>
+      daemonStop([member.harness.dir, ...rest], opts),
+    );
+  }
   const harness = resolveHarness(args.positional[0], opts);
   const supervisor = supervisorFor(harness, opts, { enabled: false });
   try {

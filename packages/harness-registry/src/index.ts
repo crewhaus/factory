@@ -19,6 +19,7 @@ export {
   openHangarRegistry,
   registerHarnessHook,
   resolveRegistryRoot,
+  sortGroupMembers,
   type HangarRegistry,
   type ListOptions,
   type OpenHangarRegistryOptions,

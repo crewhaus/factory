@@ -121,6 +121,33 @@ export type RegisterHookResult = {
   readonly error?: string;
 };
 
+/**
+ * A group's members in BOOT order.
+ *
+ * Two tiers, because a fleet is rarely fully ordered: everything with a
+ * declared `groupOrder[group]` first, ascending, then everything without
+ * one. Inside a tier the sort is by spec name — an arbitrary but STABLE
+ * choice, so the same fleet walks the same way on every machine and a
+ * `--group` start is reproducible rather than registry-insertion-ordered.
+ */
+export function sortGroupMembers(
+  group: string,
+  entries: readonly HangarHarnessEntry[],
+): HangarHarnessEntry[] {
+  return entries
+    .filter((e) => e.groups.includes(group))
+    .sort((a, b) => {
+      const ao = a.groupOrder?.[group];
+      const bo = b.groupOrder?.[group];
+      if (ao !== bo) {
+        if (ao === undefined) return 1;
+        if (bo === undefined) return -1;
+        return ao - bo;
+      }
+      return a.specName.localeCompare(b.specName) || a.dir.localeCompare(b.dir);
+    });
+}
+
 export type HangarRegistry = {
   /** Absolute path of the registry file. */
   readonly path: string;
@@ -145,6 +172,18 @@ export type HangarRegistry = {
    *  Throws if `newDir` is already registered to a different entry. */
   relocate(id: string, newDir: string): HangarHarnessEntry | undefined;
   setGroups(dirOrId: string, groups: readonly string[]): HangarHarnessEntry | undefined;
+  /** Set (or, with `undefined`, clear) this member's boot order INSIDE one
+   *  group. Independent of membership: an order for a group the entry does
+   *  not belong to is simply never consulted. */
+  setGroupOrder(
+    dirOrId: string,
+    group: string,
+    order: number | undefined,
+  ): HangarHarnessEntry | undefined;
+  /** The members of a group in BOOT order: declared orders ascending first,
+   *  then the undeclared ones, each tier by spec name so the walk is stable
+   *  across machines. `stop` is this list reversed. */
+  groupMembers(group: string, opts?: ListOptions): HangarHarnessEntry[];
   setTags(dirOrId: string, tags: readonly string[]): HangarHarnessEntry | undefined;
   setPinned(dirOrId: string, pinned: boolean): HangarHarnessEntry | undefined;
   setNotes(dirOrId: string, notes: string): HangarHarnessEntry | undefined;
@@ -796,6 +835,21 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
     remove,
     relocate,
     setGroups: (dirOrId, groups) => patchEntry(dirOrId, (e) => ({ ...e, groups: [...groups] })),
+    setGroupOrder: (dirOrId, group, order) =>
+      patchEntry(dirOrId, (e) => {
+        const next: Record<string, number> = { ...(e.groupOrder ?? {}) };
+        // An absent key, not a key holding undefined: this object is written
+        // to JSON, where the two are the same thing on read and different on
+        // write.
+        if (order === undefined) delete next[group];
+        else next[group] = order;
+        if (Object.keys(next).length === 0) {
+          const { groupOrder: _dropped, ...rest } = e;
+          return rest as HangarHarnessEntry;
+        }
+        return { ...e, groupOrder: next };
+      }),
+    groupMembers: (group, opts) => sortGroupMembers(group, list(opts)),
     setTags: (dirOrId, tags) => patchEntry(dirOrId, (e) => ({ ...e, tags: [...tags] })),
     setPinned: (dirOrId, pinned) => patchEntry(dirOrId, (e) => ({ ...e, pinned })),
     setNotes: (dirOrId, notes) => patchEntry(dirOrId, (e) => ({ ...e, notes })),

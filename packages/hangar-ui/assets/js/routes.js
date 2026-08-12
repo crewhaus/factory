@@ -46,10 +46,21 @@ export const ROUTES = {
   scan: { method: "POST", path: "/api/scan", body: "Empty" }, // {}
   groups: { method: "GET", path: "/api/registry/groups" },
   addGroup: { method: "POST", path: "/api/registry/groups", body: "GroupCreate" }, // {name, color?}
+  // Group-ordered bulk lifecycle. PLAN first, then act: a fleet sweep is the
+  // one lifecycle action an operator should read before authorizing, and the
+  // plan is the same object the walk consumes.
+  groupProcPlan: { method: "GET", path: "/api/registry/groups/:name/proc/:verb" },
+  groupProc: {
+    method: "POST",
+    path: "/api/registry/groups/:name/proc/:verb",
+    body: "GroupProc", // {force?, acknowledge?, parallel?}
+  },
   addScanRoot: { method: "POST", path: "/api/registry/scan-roots", body: "ScanRootCreate" }, // {dir}
   removeHarness: { method: "DELETE", path: "/api/h/:id" },
   relocate: { method: "POST", path: "/api/h/:id/relocate", body: "Relocate" }, // {newDir}
   setGroups: { method: "PUT", path: "/api/h/:id/groups", body: "SetGroups" }, // {groups}
+  // One member's BOOT position inside a group; `order: null` clears it.
+  setGroupOrder: { method: "PUT", path: "/api/h/:id/groups", body: "SetGroupOrder" }, // {group, order}
   setTags: { method: "PUT", path: "/api/h/:id/tags", body: "SetTags" }, // {tags}
   setPin: { method: "PUT", path: "/api/h/:id/pin", body: "SetPin" }, // {pinned}
   setNotes: { method: "PUT", path: "/api/h/:id/notes", body: "SetNotes" }, // {notes}

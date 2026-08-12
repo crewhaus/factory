@@ -258,6 +258,62 @@ describe("harness relocate", () => {
   });
 });
 
+describe("harness group member ordering", () => {
+  test("--member-order declares a boot position, and --list prints the walk", async () => {
+    const chief = seedHarness("chief", "chief");
+    const secretary = seedHarness("secretary", "secretary");
+    await run(["add", chief]);
+    await run(["add", secretary]);
+    await run(["group", "crew", "--add", chief, "--member-order", "2"]);
+    await run(["group", "crew", "--add", secretary, "--member-order", "1"]);
+
+    const listed = (await run(["group", "crew", "--list"])).lines.join("\n");
+    expect(listed).toContain("boots in this order (stop reverses it)");
+    expect(listed.indexOf("secretary")).toBeLessThan(listed.indexOf("chief"));
+    expect(listed).toContain("order 1");
+  });
+
+  test("--add on an existing member CHANGES its order — no second verb to learn", async () => {
+    const dir = seedHarness("alpha");
+    await run(["add", dir]);
+    await run(["group", "crew", "--add", dir, "--member-order", "5"]);
+    const out = await run(["group", "crew", "--add", dir, "--member-order", "1"]);
+    expect(out.lines.join("\n")).toContain("boots at position 1");
+    expect((await run(["group", "crew", "--list"])).lines.join("\n")).toContain("order 1");
+  });
+
+  test("removing a member drops its order, so a re-add does not resurrect it", async () => {
+    const dir = seedHarness("alpha");
+    await run(["add", dir]);
+    await run(["group", "crew", "--add", dir, "--member-order", "3"]);
+    await run(["group", "crew", "--remove", dir]);
+    await run(["group", "crew", "--add", dir]);
+    expect((await run(["group", "crew", "--list"])).lines.join("\n")).toContain(
+      "no declared order",
+    );
+  });
+
+  test("--member-order needs --add, and rejects a non-positive value", async () => {
+    const dir = seedHarness("alpha");
+    await run(["add", dir]);
+    await expect(run(["group", "crew", "--member-order", "1"])).rejects.toThrow(
+      /needs --add <dir\|id>/,
+    );
+    await expect(run(["group", "crew", "--add", dir, "--member-order", "0"])).rejects.toThrow(
+      /must be a positive integer/,
+    );
+    await expect(run(["group", "crew", "--add", dir, "--member-order", "2x"])).rejects.toThrow(
+      /must be a positive integer/,
+    );
+  });
+
+  test("an empty group says so rather than printing an empty list", async () => {
+    expect((await run(["group", "crew", "--list"])).lines.join("\n")).toContain(
+      "group crew has no members",
+    );
+  });
+});
+
 describe("harness group / tag / pin", () => {
   test("bare group creates; membership add/remove; list --group filters", async () => {
     const dirA = seedHarness("alpha");

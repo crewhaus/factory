@@ -158,6 +158,15 @@ const DRIVERS: Record<
   removeHarness: { call: () => api.removeHarness(ID), params: { id: ID } },
   relocate: { call: () => api.relocateHarness(ID, "/new"), params: { id: ID } },
   setGroups: { call: () => api.setGroups(ID, []), params: { id: ID } },
+  setGroupOrder: { call: () => api.setGroupOrder(ID, "prod", 1), params: { id: ID } },
+  groupProcPlan: {
+    call: () => api.groupProcPlan("prod", "start"),
+    params: { name: "prod", verb: "start" },
+  },
+  groupProc: {
+    call: () => api.groupProc("prod", "start"),
+    params: { name: "prod", verb: "start" },
+  },
   setTags: { call: () => api.setTags(ID, []), params: { id: ID } },
   setPin: { call: () => api.setPin(ID, true), params: { id: ID } },
   setNotes: { call: () => api.setNotes(ID, "n"), params: { id: ID } },
