@@ -63,15 +63,50 @@ export const THREDZ_GOAL_TOOL_NAMES = [
  *  `missing` list and `connectThredz` warns — never a hard failure. */
 export const THREDZ_SPACE_TOOL_NAMES: readonly string[] = ["wiki_space_list", "wiki_space_create"];
 
+/**
+ * Item 5 (G44) / #401 — the nine agent-to-agent messaging tools thredz-mcp
+ * v0.3.0 advertises.
+ *
+ * OPT-IN, and that is the whole design: `thredz:` is the MEMORY knob, and
+ * turning memory on must never silently widen the outward surface — an agent
+ * that can message peers can be made to exfiltrate through them. So these
+ * register only when the spec says `thredz.messaging: true`, which the spec
+ * and IR have carried since Batch G. What was missing was the wiring: the
+ * flag lowered to `IrThredz.messaging` and nothing ever read it, so the
+ * documented opt-in was a no-op and a fleet's only A2A fabric was invisible.
+ *
+ * Against a pre-0.3.0 server these come back in `registerMcpToolAliases`'
+ * `missing` list and `connectThredz` warns — never a hard failure.
+ */
+export const THREDZ_MESSAGING_TOOL_NAMES: readonly string[] = [
+  "agent_register",
+  "agent_update",
+  "agent_list",
+  "message_send",
+  "inbox_poll",
+  "message_ack",
+  "thread_get",
+  "agent_block",
+  "agent_unblock",
+];
+
 /** Every bare name the Thredz backend aliases onto the catalog (§4.3): the
  *  ten wiki-vocabulary tools + the six goal/task tools + the two space tools.
- *  Messaging tools are deliberately NOT exposed — the memory knob never widens
- *  the outward surface beyond the memory vocabulary. */
+ *  The nine messaging tools are NOT here — they are opt-in per spec
+ *  (`thredz.messaging: true`) and appended by {@link thredzAliasToolNames}. */
 export const THREDZ_ALIAS_TOOL_NAMES: readonly string[] = [
   ...THREDZ_WIKI_TOOL_NAMES,
   ...THREDZ_GOAL_TOOL_NAMES,
   ...THREDZ_SPACE_TOOL_NAMES,
 ];
+
+/** The alias vocabulary for one connection: the memory set always, plus the
+ *  messaging set when the spec opted in. */
+export function thredzAliasToolNames(messaging = false): readonly string[] {
+  return messaging
+    ? [...THREDZ_ALIAS_TOOL_NAMES, ...THREDZ_MESSAGING_TOOL_NAMES]
+    : THREDZ_ALIAS_TOOL_NAMES;
+}
 
 /**
  * Per-alias tool flags — mirrors of the LOCAL twins' flags in
@@ -101,6 +136,26 @@ export const THREDZ_ALIAS_TOOL_FLAGS: Readonly<Record<string, McpToolFlags>> = {
   goal_update: { destructive: true },
   task_list: { readOnly: true },
   task_complete: { destructive: true },
+  // Item 5 (G44) / #401 — the messaging set. Reads are reads; everything
+  // that mutates the agent directory or a mailbox is destructive.
+  //
+  // `message_send` additionally carries the Pillar 3 intent gate, exactly as
+  // the built-in `SendMessage` does and exactly as the spec's own
+  // `thredz.messaging` docblock promises ("the send-side tools are
+  // destructive + justification-gated"): it puts text in front of another
+  // agent, which is the visible-side-effect class the gate exists for, and
+  // it is the one tool here an injection could aim outward. The other
+  // mutations are directory bookkeeping scoped to this agent's own handle,
+  // so gating them would only train operators to wave the gate through.
+  agent_list: { readOnly: true },
+  inbox_poll: { readOnly: true },
+  thread_get: { readOnly: true },
+  agent_register: { destructive: true },
+  agent_update: { destructive: true },
+  message_ack: { destructive: true },
+  agent_block: { destructive: true },
+  agent_unblock: { destructive: true },
+  message_send: { destructive: true, requireJustification: true },
 };
 
 /** Structural mirror of mcp-host's `McpCallResult`. */
@@ -218,6 +273,10 @@ export type ConnectThredzOptions = {
    *  not carry THROWS, which this function catches into a `null` return — i.e.
    *  a wrong name is not a crash but a silent degrade to local files. */
   readonly serverName?: string;
+  /** Item 5 (G44) / #401 — also alias the nine agent-to-agent messaging
+   *  tools. Default FALSE: memory must never silently grant outward
+   *  messaging. Set from the spec's `thredz.messaging: true`. */
+  readonly messaging?: boolean;
 };
 
 /**
@@ -242,7 +301,7 @@ export async function connectThredz(
       host,
       serverName,
       catalog,
-      THREDZ_ALIAS_TOOL_NAMES,
+      thredzAliasToolNames(opts.messaging === true),
       {
         perTool: THREDZ_ALIAS_TOOL_FLAGS,
         onRegister: ({ fullName }) => opts.log?.(`[${serverName}] registered ${fullName}\n`),

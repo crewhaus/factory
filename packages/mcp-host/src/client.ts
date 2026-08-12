@@ -7,6 +7,7 @@ import {
   StdioClientTransport,
   getDefaultEnvironment,
 } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   CallToolResultSchema,
@@ -82,7 +83,14 @@ export class McpClient {
   private readonly config: McpServerConfig;
   private readonly logger: Logger | undefined;
   private readonly clientFactory: (info: { name: string; version: string }) => Client;
-  private readonly transportFactory: (config: McpServerConfig) => McpClientLikeTransport;
+  /** Test/escape-hatch override. Undefined ⇒ this client builds its own
+   *  transports and, for `sse`, probes the HTTP wire candidates. */
+  private readonly injectedTransportFactory:
+    | ((config: McpServerConfig) => McpClientLikeTransport)
+    | undefined;
+  /** Which HTTP wire this endpoint turned out to speak, once one handshake
+   *  has succeeded — so reconnects skip the probe (#394). */
+  private httpWire: HttpMcpWire | undefined;
   private readonly connectTimeoutMs: number;
   private readonly callTimeoutMs: number;
   private readonly setTimer: (cb: () => void, ms: number) => unknown;
@@ -104,7 +112,7 @@ export class McpClient {
     this.config = config;
     this.logger = opts.logger;
     this.clientFactory = opts.clientFactory ?? defaultClientFactory;
-    this.transportFactory = opts.transportFactory ?? defaultTransportFactory;
+    this.injectedTransportFactory = opts.transportFactory;
     this.connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
     this.callTimeoutMs = opts.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
     this.setTimer = opts.setTimer ?? ((cb, ms) => setTimeout(cb, ms));
@@ -136,13 +144,62 @@ export class McpClient {
   /**
    * Build transport + SDK Client, run the initialize handshake. Single
    * attempt — reconnect orchestration lives in `scheduleReconnect`.
+   *
+   * For `transport: "sse"` this walks the HTTP wire candidates (Streamable
+   * HTTP, then legacy HTTP+SSE — see {@link httpTransportCandidates}) until
+   * one completes the handshake, and REMEMBERS the winner so reconnects and
+   * every later attempt go straight to it. An injected `transportFactory`
+   * (tests) is always honoured verbatim and never probed.
    */
   private async tryConnect(): Promise<void> {
     const attempt = this.reconnectAttempt;
     this.state = { kind: "connecting", attempt };
     this.logger?.debug("mcp.connecting", { server: this.name, attempt });
 
-    const transport = this.transportFactory(this.config);
+    const candidates = this.transportCandidates();
+    let lastError: unknown;
+    for (const candidate of candidates) {
+      try {
+        await this.connectWith(candidate.build(), attempt);
+        if (candidate.wire !== undefined && this.httpWire === undefined) {
+          this.httpWire = candidate.wire;
+          this.logger?.debug("mcp.http-wire", { server: this.name, wire: candidate.wire });
+        }
+        return;
+      } catch (err) {
+        lastError = err;
+        // Keep probing only while another candidate remains: the LAST
+        // failure is the one the operator sees, and for a genuinely
+        // unreachable peer that is the legacy transport's error, which is
+        // the same message this client has always produced.
+      }
+    }
+    throw lastError;
+  }
+
+  /** The transports to try, in order, for this config. */
+  private transportCandidates(): ReadonlyArray<{
+    readonly wire?: HttpMcpWire;
+    readonly build: () => McpClientLikeTransport;
+  }> {
+    // An injected factory is the test seam AND an escape hatch; probing past
+    // it would call it twice and defeat both.
+    if (this.injectedTransportFactory !== undefined) {
+      const factory = this.injectedTransportFactory;
+      return [{ build: () => factory(this.config) }];
+    }
+    if (this.config.transport !== "sse") {
+      return [{ build: () => defaultTransportFactory(this.config) }];
+    }
+    const all = httpTransportCandidates(this.config);
+    // Already know which wire this endpoint speaks — go straight to it.
+    const known = this.httpWire;
+    return known === undefined ? all : all.filter((c) => c.wire === known);
+  }
+
+  /** One handshake attempt against one built transport. */
+  private async connectWith(transport: McpClientLikeTransport, attempt: number): Promise<void> {
+    void attempt;
     const sdk = this.clientFactory({
       name: "@crewhaus/mcp-host",
       version: "0.0.0",
@@ -481,6 +538,56 @@ function defaultTransportFactory(config: McpServerConfig): McpClientLikeTranspor
     sseOpts.requestInit = { headers: { ...config.headers } };
   }
   return new SSEClientTransport(new URL(config.url), sseOpts);
+}
+
+/**
+ * `transport: "sse"` names an HTTP-mounted MCP endpoint, NOT one wire
+ * protocol — so it is resolved by PROBING, newest first (#394).
+ *
+ * MCP has two HTTP transports. The 2024-11-05 revision's **HTTP+SSE** opens
+ * with `GET` → `text/event-stream` and receives an `endpoint` event naming a
+ * POST URL; the 2025-03-26 revision's **Streamable HTTP** POSTs JSON-RPC to
+ * one URL and upgrades to a stream only when the server chooses. They share
+ * a URL shape and nothing else, and a client aimed at the wrong one fails
+ * with a content-type error rather than anything that names the mismatch.
+ *
+ * This mattered because our own two halves disagreed: `@crewhaus/mcp-server`
+ * serves Streamable HTTP (`WebStandardStreamableHTTPServerTransport`) while
+ * this client spoke only legacy HTTP+SSE — so a CrewHaus daemon exposed over
+ * `expose.mcp.transport: sse` could not be consumed by a CrewHaus peer
+ * declaring `mcp_servers: { peer: { transport: sse } }`. The legacy client's
+ * opening GET got `400 application/json` from our own server, surfacing to
+ * the operator as `SSE error: Invalid content type`.
+ *
+ * Order is Streamable HTTP first because it is the current revision and the
+ * one our own emit serves; the legacy fallback is what keeps a third-party
+ * 2024-11-05 server — the reason this config value existed at all — working
+ * unchanged. Nothing about the spec surface changes: `sse` simply now means
+ * "HTTP, either revision" instead of "HTTP, the old one only".
+ */
+export function httpTransportCandidates(
+  config: Extract<McpServerConfig, { transport: "sse" }>,
+): ReadonlyArray<{ readonly wire: HttpMcpWire; readonly build: () => McpClientLikeTransport }> {
+  return [
+    { wire: "streamable-http", build: () => streamableHttpTransport(config) },
+    { wire: "http-sse", build: () => defaultTransportFactory(config) },
+  ];
+}
+
+/** Which HTTP wire protocol a connected `sse` server turned out to speak. */
+export type HttpMcpWire = "streamable-http" | "http-sse";
+
+function streamableHttpTransport(
+  config: Extract<McpServerConfig, { transport: "sse" }>,
+): McpClientLikeTransport {
+  const opts: ConstructorParameters<typeof StreamableHTTPClientTransport>[1] = {};
+  if (config.headers !== undefined) {
+    // One `requestInit` covers every request this transport makes (the POST
+    // and the optional GET stream), so unlike the legacy transport there is
+    // no separate EventSource fetch to patch.
+    opts.requestInit = { headers: { ...config.headers } };
+  }
+  return new StreamableHTTPClientTransport(new URL(config.url), opts);
 }
 
 /**

@@ -756,6 +756,10 @@ function renderMcpServers(ir: IrChannelV0): {
         ir.thredz?.agentName !== undefined
           ? `, agentName: ${escapeJsonString(ir.thredz.agentName)}`
           : ""
+      }${
+        // Item 5 (G44) / #401 — the spec's messaging opt-in reaches the
+        // bridge. Absent ⇒ the memory vocabulary only, byte-identical.
+        ir.thredz?.messaging === true ? ", messaging: true" : ""
       } });`
     : undefined;
   const bootBlock = [
@@ -1588,6 +1592,23 @@ ${approvalsCatch}
 // File 3: gateway.ts — channel-generic HTTP request handler.
 // ---------------------------------------------------------------------------
 
+/**
+ * Item 1 (G30) / #394 — the path a bundle's `expose.mcp` endpoint mounts at
+ * on the daemon's PUBLIC port.
+ *
+ * `@crewhaus/mcp-server`'s SSE handle ignores the request path entirely
+ * (it dispatches on the `mcp-session-id` header), so the choice is ours;
+ * `/mcp` is the ecosystem convention and cannot collide with the adapter
+ * routes, which are all `/<adapter>/…`.
+ */
+export const EXPOSE_MCP_PATH = "/mcp";
+
+/** Does this bundle self-expose an HTTP MCP endpoint? `stdio` is the
+ *  `crewhaus serve --mcp` projection, not something a daemon can mount. */
+function exposesMcpOverHttp(ir: IrChannelV0): boolean {
+  return ir.expose?.mcp?.transport === "sse";
+}
+
 function renderGateway(ir: IrChannelV0): string {
   const feedbackReactions = ir.feedback?.channelReactions === true;
   // A reaction always parses to `{ kind: "reaction" }` in the adapter; the
@@ -1612,6 +1633,56 @@ function renderGateway(ir: IrChannelV0): string {
         '        return new Response("ok", { status: 200 });',
         "      }",
       ].join("\n");
+
+  // Item 1 (G30) / #394 — `expose.mcp.transport: sse` mounts the bundle's own
+  // MCP endpoint on the PUBLIC port, ahead of the adapter routes. The spec
+  // block was carried through spec→IR since Batch G but no emitter ever read
+  // it, so a channel daemon could not be reached as an MCP tool at all while
+  // `serve --mcp`'s refusal pointed operators at exactly this path.
+  //
+  // The handler is injected rather than built here: the daemon owns the
+  // agent's `runTurn` (the thing an MCP `chat` tool delegates to) and the
+  // server's lifecycle (it must be closed on shutdown), and `gateway.ts` is
+  // emitted without either.
+  const mcpExposed = exposesMcpOverHttp(ir);
+  const gatewayMcpConfig = mcpExposed
+    ? `
+  /**
+   * Item 1 (G30) — the bundle's own MCP endpoint, served at
+   * \\\`${EXPOSE_MCP_PATH}\\\` on this port (\\\`expose.mcp\\\` in the spec). Built by the
+   * daemon from \\\`@crewhaus/mcp-server\\\` over the agent's turn function.
+   */
+  mcpFetch: (req: Request) => Promise<Response>;
+  /** Constant-time-ish bearer check for the MCP route. */
+  mcpAuthorize: (presented: string) => boolean;`
+    : "";
+  const gatewayMcpBlock = mcpExposed
+    ? `      // Item 1 (G30) — the MCP projection of this agent. Ahead of the
+      // adapter match because the adapter routes are all \`/<adapter>/…\`
+      // and this one is not; the MCP transport does its own method and
+      // content negotiation, so every method is handed through.
+      //
+      // AUTHENTICATED, unlike everything else on this port. The adapter
+      // routes are signature-verified per platform and \`/healthz\` is
+      // deliberately public, but an MCP endpoint is a REMOTE-CONTROL surface:
+      // it drives whole agent turns with this bundle's tools and credentials.
+      // Serving that unauthenticated on the public webhook port would hand
+      // the agent to anyone who can reach it. Same bearer contract as
+      // crewhaus.control.v1 — \`CREWHAUS_MCP_TOKEN\`, else a 32-byte token
+      // minted 0600 at boot and printed once.
+      if (url.pathname === ${JSON.stringify(EXPOSE_MCP_PATH)}) {
+        const __auth = req.headers.get("authorization") ?? "";
+        const __presented = __auth.startsWith("Bearer ") ? __auth.slice(7) : "";
+        if (!config.mcpAuthorize(__presented)) {
+          return new Response(
+            JSON.stringify({ error: "unauthorized — send Authorization: Bearer <expose.mcp token>" }),
+            { status: 401, headers: { "content-type": "application/json" } },
+          );
+        }
+        return config.mcpFetch(req);
+      }
+`
+    : "";
 
   // G11 — the interactivity (button-click) route + shared approval store, wired
   // whenever `permissions.ask_mode` is not "deny".
@@ -1699,7 +1770,7 @@ import type { SessionRouter } from "./session-router.js";
 
 export type GatewayConfig = {
   adapters: ReadonlyMap<string, ChannelAdapter>;
-  sessionRouter: SessionRouter;${gatewayApprovalConfig}
+  sessionRouter: SessionRouter;${gatewayApprovalConfig}${gatewayMcpConfig}
   /** Maximum number of inbound idempotency keys remembered before LRU eviction (in-memory store only). */
   dedupCapacity?: number;
   /**
@@ -1725,7 +1796,7 @@ export function createGateway(config: GatewayConfig): Gateway {
   return {
     async handle(req: Request): Promise<Response> {
       const url = new URL(req.url);
-${gatewayActionsBlock}      // Match adapter by path prefix: /slack/events → "slack".
+${gatewayActionsBlock}${gatewayMcpBlock}      // Match adapter by path prefix: /slack/events → "slack".
       const match = url.pathname.match(/^\\/([^/]+)\\/events$/);
       if (!match || match[1] === undefined) return new Response("not found", { status: 404 });
       const adapter = config.adapters.get(match[1]);
@@ -2052,6 +2123,100 @@ registerChannelAdapter("imessage", imessageAdapter);`);
     ? `\n  // MCP servers\n  ${mcp.bootBlock.split("\n").join("\n  ")}\n`
     : "";
   const mcpCleanup = mcp.hasAny ? `\n    ${mcp.cleanupBlock}` : "";
+
+  // Item 1 (G30) / #394 — this bundle's OWN MCP endpoint (`expose.mcp`), as
+  // distinct from `mcp_servers` above, which are peers this bundle CONSUMES.
+  //
+  // The `chat` tool delegates to the same `agent.runTurn` the channel
+  // adapters drive, so an MCP caller reaches the identical loop — memory
+  // fabric, boundary classifier, permissions and all. Each MCP caller gets
+  // its own session id (`sess_` is minted by the session store on first use)
+  // so one caller's transcript never lands in another's, and `isNew` is true
+  // exactly once per session.
+  const exposeMcp = exposesMcpOverHttp(ir);
+  const exposeMcpImport = exposeMcp
+    ? 'import { randomBytes, timingSafeEqual } from "node:crypto";\n' +
+      'import { chmodSync, mkdirSync, writeFileSync } from "node:fs";\n' +
+      'import { createMcpServer } from "@crewhaus/mcp-server";\n'
+    : "";
+  // ALWAYS `chat` on this shape. `per-subagent` is structurally unhonourable
+  // here: it projects one tool per sub-agent, and the projected tool is
+  // expected to ROUTE to that sub-agent — but the channel `Agent.runTurn`
+  // takes only `{sessionId, isNew, message}` and has no routing parameter, so
+  // every projected tool would land in the same undirected turn. Advertising
+  // nine differently-named tools that all do the same thing is worse than
+  // advertising one honest one, so the emit projects `chat` and the compiler
+  // WARNS when a channel spec asked for `per-subagent` (see the
+  // `expose.mcp.tools` row in the compiler's carried-with-note table).
+  const exposeMcpToolsMode = "chat";
+  const exposeMcpSubAgents = "";
+  const exposeMcpBoot = exposeMcp
+    ? `  // Item 1 (G30) — the MCP endpoint's bearer. Same contract as
+  // crewhaus.control.v1: \`CREWHAUS_MCP_TOKEN\` wins, else a fresh 32-byte
+  // token is minted 0600 under .crewhaus/run/ at every boot (a token left by
+  // a dead daemon must not authenticate against its replacement).
+  const __mcpToken = (() => {
+    const __fromEnv = process.env["CREWHAUS_MCP_TOKEN"];
+    if (__fromEnv !== undefined && __fromEnv !== "") return __fromEnv;
+    const __dir = \`\${process.cwd()}/.crewhaus/run\`;
+    const __path = \`\${__dir}/mcp-token\`;
+    const __minted = randomBytes(32).toString("hex");
+    mkdirSync(__dir, { recursive: true });
+    writeFileSync(__path, \`\${__minted}\\n\`, { mode: 0o600 });
+    chmodSync(__path, 0o600);
+    return __minted;
+  })();
+  // Length-independent compare so a wrong token cannot be narrowed by timing.
+  const __mcpAuthorize = (presented: string): boolean => {
+    const __a = Buffer.from(presented);
+    const __b = Buffer.from(__mcpToken);
+    return __a.length === __b.length && timingSafeEqual(__a, __b);
+  };
+  // Item 1 (G30) — project this agent as an MCP server on the public port.
+  // One session per MCP caller: the map keys the MCP session onto a stable
+  // harness session so a multi-turn MCP conversation resumes its own
+  // transcript rather than starting fresh on every call.
+  const __mcpSessions = new Map<string, string>();
+  const __mcpServer = createMcpServer({
+    transport: "sse",
+    tools: ${JSON.stringify(exposeMcpToolsMode)},${exposeMcpSubAgents}
+    name: ${escapeJsonString(ir.name)},
+    instructions: ${escapeJsonString(
+      `Calls the "${ir.name}" CrewHaus agent. Each tool call runs one agent turn and returns its final reply.`,
+    )},
+    chatToolDescription: ${escapeJsonString(
+      `Send a message to the "${ir.name}" agent and get its reply.`,
+    )},
+    invoke: async (message: string, ctx?: { readonly sessionId?: string }) => {
+      // The MCP transport's own session id when it gave us one, else a single
+      // shared conversation — never a fresh session per call, which would
+      // make every MCP turn amnesiac.
+      const __key = ctx?.sessionId ?? "mcp";
+      const __existing = __mcpSessions.get(__key);
+      const __sessionId = __existing ?? \`mcp_\${__key}\`;
+      __mcpSessions.set(__key, __sessionId);
+      return await agent.runTurn({
+        sessionId: __sessionId,
+        isNew: __existing === undefined,
+        message,
+      });
+    },
+  });
+  if (__mcpServer.transport !== "sse") {
+    throw new Error("expose.mcp: expected an sse server handle");
+  }
+`
+    : "";
+  const gatewayMcpField = exposeMcp
+    ? "\n    mcpFetch: (req) => __mcpServer.fetch(req),\n    mcpAuthorize: __mcpAuthorize,"
+    : "";
+  // Boot line, so an operator can SEE the endpoint (issue #394 asks for it
+  // by name) rather than inferring it from the spec.
+  const exposeMcpBanner = exposeMcp
+    ? `  process.stdout.write(\`[mcp] serving this agent at http://localhost:\${server.port}${EXPOSE_MCP_PATH} (expose.mcp, tools: ${exposeMcpToolsMode})\\n\`);
+  process.stdout.write(\`[mcp] bearer: \${process.env["CREWHAUS_MCP_TOKEN"] ? "CREWHAUS_MCP_TOKEN" : ".crewhaus/run/mcp-token (minted this boot, 0600)"}\\n\`);\n`
+    : "";
+  const exposeMcpCleanup = exposeMcp ? "\n      await __mcpServer.close();" : "";
 
   // Loop contract 0.4 (Batch E, G22) — the RAG corpus ingests at daemon boot
   // (async) and registers the Retrieve tool on defaultCatalog before
@@ -2462,7 +2627,7 @@ import { formatRunFailure, ${ir.heartbeat || ir.schedule ? "isRunFailedError, " 
 ${extensionImports}
 ${adapterImports.join("\n")}
 import { registerChannelAdapter } from "@crewhaus/tool-message-channel";
-${heartbeatImport}${scheduleImport}${builtinImportBlock}${mcpImportBlock}${knowledgeImportBlock}${subAgentImportBlock}import { createAgent${dreamOn ? ", createDreamStep" : ""} } from "./agent.js";
+${heartbeatImport}${scheduleImport}${builtinImportBlock}${mcpImportBlock}${exposeMcpImport}${knowledgeImportBlock}${subAgentImportBlock}import { createAgent${dreamOn ? ", createDreamStep" : ""} } from "./agent.js";
 import { createSessionRouter } from "./session-router.js";
 import { createGateway } from "./gateway.js";
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
@@ -2498,10 +2663,10 @@ ${gatewayCounters}  const sessionRouter = createSessionRouter({ agent${sessionRo
   // CREWHAUS_DEDUP_STORE=sqlite:<path> so seen webhook ids survive restarts
   // and are shared by every daemon process on this host.
   const __dedupStore = createDedupStore(process.env["CREWHAUS_DEDUP_STORE"] ?? "memory");
-  const gateway = createGateway({
+${exposeMcpBoot}  const gateway = createGateway({
     adapters: ${adapterMapLiteral},
     sessionRouter,${gatewayApprovalsFields}
-    dedupStore: __dedupStore,
+    dedupStore: __dedupStore,${gatewayMcpField}
   });
 
   // Boot-time self-heal janitor (ops item 36): evicts expired sessions on a
@@ -2553,7 +2718,7 @@ ${controlJanitorTimer}
     fetch: ${renderPublicGateFetch({ innerExpr: "(req: Request) => gateway.handle(req)" })},
   });
   process.stdout.write(\`[daemon] listening on http://localhost:\${server.port}\\n\`);
-${gatewayBoot}${heartbeatBoot}${scheduleBoot}${controlDrain}${controlStart}
+${exposeMcpBanner}${gatewayBoot}${heartbeatBoot}${scheduleBoot}${controlDrain}${controlStart}
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
@@ -2561,7 +2726,7 @@ ${gatewayBoot}${heartbeatBoot}${scheduleBoot}${controlDrain}${controlStart}
     process.stdout.write(\`[daemon] received \${signal}, shutting down...\\n\`);
     __janitor.stop();
     try {
-      await server.stop(true);${gatewayShutdown}${heartbeatShutdown}${scheduleShutdown}${mcpCleanup}
+      await server.stop(true);${gatewayShutdown}${heartbeatShutdown}${scheduleShutdown}${mcpCleanup}${exposeMcpCleanup}
     } catch (err) {
       process.stderr.write(\`[daemon] shutdown error: \${(err as Error).message}\\n\`);
     }

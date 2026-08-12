@@ -807,11 +807,15 @@ function renderRoleThredz(ir: IrCrewV0): {
   const connectLines = [...servers].map(([name, r]) => {
     const id = ident(name);
     const agent = r.thredz?.agentName;
+    // Item 5 (G44) / #401 — per-role messaging opt-in. A crew role that owns
+    // its own Thredz key is exactly the case A2A messaging exists for, and
+    // the flag is per-role because the keys are.
+    const messaging = r.thredz?.messaging === true;
     return `  const __thredzCat_${id} = new ToolCatalog();
   const __thredz_${id} = await connectThredz(mcpHost, __thredzCat_${id}, {
     serverName: ${escapeJsonString(name)},${
       agent !== undefined ? `\n    agentName: ${escapeJsonString(agent)},` : ""
-    }
+    }${messaging ? "\n    messaging: true," : ""}
     log: (line) => process.stderr.write(line),
   });`;
   });

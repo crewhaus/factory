@@ -106,7 +106,13 @@ export function resolveServePort(
 export function assertServeTargetSupported(target: string): void {
   if (target !== SERVE_MCP_SUPPORTED_TARGET) {
     throw new ServeMcpError(
-      `crewhaus serve --mcp supports target: ${SERVE_MCP_SUPPORTED_TARGET} (got "${target}"). Only the cli agent's turn function projects as an MCP server through \`serve\`; a channel/managed daemon self-exposes from its compiled bundle (expose.mcp.transport: sse).`,
+      // #394 — this sentence used to promise a capability the emit did not
+      // produce: `expose.mcp` was carried through spec→IR and read by no
+      // emitter, so "self-exposes from its compiled bundle" was true of
+      // nothing. The channel emit now really does mount it, so the pointer is
+      // honest — and it names the endpoint rather than leaving an operator to
+      // guess, which is what made the original text circular.
+      `crewhaus serve --mcp supports target: ${SERVE_MCP_SUPPORTED_TARGET} (got "${target}"). Only the cli agent's turn function projects as an MCP server through \`serve\`. A CHANNEL bundle self-exposes instead: set \`expose.mcp.transport: sse\`, compile, and the daemon serves MCP at \`/mcp\` on its public port (PORT, default 3000) behind a bearer — it prints the URL and the token source at boot. A MANAGED bundle does NOT self-expose yet; compile warns that \`expose.mcp\` is carried-but-unwired there.`,
     );
   }
 }

@@ -80,7 +80,11 @@ describe("createMcpServer — sse fetch handler", () => {
         arguments: { message: "over-http" },
       })) as CallToolResult;
       expect(firstText(result)).toBe("served:over-http");
-      expect(rec.calls[0]?.context).toEqual({ toolName: CHAT_TOOL_NAME });
+      // The context carries this SESSION's id (#394): a projected bundle keys
+      // its own conversation state on it, so two callers never collapse onto
+      // one transcript. Absent on stdio, where there is one conversation.
+      expect(rec.calls[0]?.context.toolName).toBe(CHAT_TOOL_NAME);
+      expect(rec.calls[0]?.context.sessionId).toMatch(/^[0-9a-f-]{36}$/);
     } finally {
       await client.close();
     }
@@ -108,7 +112,9 @@ describe("createMcpServer — sse fetch handler", () => {
         arguments: { message: "sum" },
       })) as CallToolResult;
       expect(firstText(result)).toBe("analyst:sum");
-      expect(rec.calls[0]?.context).toEqual({ toolName: "analyst", subAgent: "analyst" });
+      expect(rec.calls[0]?.context.toolName).toBe("analyst");
+      expect(rec.calls[0]?.context.subAgent).toBe("analyst");
+      expect(rec.calls[0]?.context.sessionId).toMatch(/^[0-9a-f-]{36}$/);
     } finally {
       await client.close();
     }

@@ -83,10 +83,15 @@ function createSseServer(opts: CreateMcpServerOptions): SseMcpServer {
   };
 
   const openSession = async (request: Request): Promise<Response> => {
-    const { server } = buildConfiguredServer(opts);
+    // The id is minted HERE rather than by the transport's generator so the
+    // per-session server can be built with it: a projected bundle keys its
+    // own conversation state on this, and a server built before the id
+    // existed could only ever hand every caller the same one.
+    const sessionId = randomUUID();
+    const { server } = buildConfiguredServer(opts, sessionId);
     const transport: WebStandardStreamableHTTPServerTransport =
       new WebStandardStreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
+        sessionIdGenerator: () => sessionId,
         onsessioninitialized: (id) => {
           sessions.set(id, { server, transport });
         },
