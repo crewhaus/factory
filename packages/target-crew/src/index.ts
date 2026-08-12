@@ -999,7 +999,14 @@ ${controlPlaneBoot}${controlDrain}${controlStart}  const crew = buildCrew();
   const input = await readAllStdin();
   const trimmed = input.trim();
   if (trimmed.length === 0) {
-    process.stderr.write("[crew] no input on stdin\\n");
+    // Say what to do, not just what happened. A supervisor that spawned this
+    // with no stdin used to read the bare exit 2 as a crash and restart it,
+    // and the operator's only clue was this line in a log.
+    process.stderr.write(
+      "[crew] no input on stdin — a crew bundle reads its BRIEF there.\\n" +
+        "[crew] run it with \`bun daemon.ts < brief.md\`, or under supervision with\\n" +
+        "[crew] \`crewhaus daemon submit <harness-dir> --brief-file brief.md\`.\\n",
+    );
     process.exit(2);
   }${mcp.bootBlock}${roleThredz.bootBlock}${memBoot}
   const opts: Parameters<typeof crew.run>[1] = {${permField}${approvalFields}${taxonomyField}${crewCapsFields}${loopLimitsField}${budgetField}${hooksField}${spawnField}${extraToolsField}${roleThredz.roleExtraToolsField}${roleThredz.roleMemoryField}${memOptsFields}

@@ -5,9 +5,9 @@
  * | Run class    | Shapes                                   | Launch |
  * |--------------|------------------------------------------|--------|
  * | interactive  | cli, browser                             | `crewhaus run <spec>` when a crewhaus bin resolves (harness `node_modules/.bin` first, then PATH), else `bun dist/agent.ts`. Attached, piped stdio (stdin carries submit/approve), tee'd to the run log. |
- * | daemon       | channel, managed, crew, voice            | `bun dist/daemon.ts`, DETACHED, stdio redirected to the log FILE (fds, never pipes — pipes die with the manager). Singleton per harness. |
+ * | daemon       | channel, managed, voice                  | `bun dist/daemon.ts`, DETACHED, stdio redirected to the log FILE (fds, never pipes — pipes die with the manager). Singleton per harness. |
  * | worker       | batch                                    | `bun dist/agent.ts` with daemon-class supervision. |
- * | one-shot job | workflow, graph, pipeline, research, eval, onchain, onchain-game | compile-if-stale → `bun dist/agent.ts`. Tracked as jobs; NEVER restarted. |
+ * | one-shot job | workflow, graph, pipeline, research, eval, onchain, onchain-game, crew | compile-if-stale → `bun dist/agent.ts` (crew: `dist/daemon.ts` with a BRIEF on stdin). Tracked as jobs; NEVER restarted. |
  * | mcp-server   | cli-shape projections / `expose:`        | `crewhaus serve --mcp <spec> [--sse --port N]`, port-tracked. |
  * | serverless   | cf-worker emits                          | not a process — a deployment record. |
  * | export       | claude-plugin emits                      | inspector only. |
@@ -39,6 +39,21 @@ import type { EnvOverride, RunClass, RunKind } from "./types";
 // Shape table
 // ---------------------------------------------------------------------------
 
+/**
+ * Shapes whose compiled bundle takes its INPUT as a document on stdin —
+ * a brief — rather than as messages, a schedule, or a prompt.
+ *
+ * Crew is the only one today, and it is why `crewhaus daemon submit` exists:
+ * these cannot be started like a daemon, because "start" for them means
+ * "run this piece of work".
+ */
+export const BRIEF_TARGETS: ReadonlySet<string> = new Set(["crew"]);
+
+/** True when this shape's compiled bundle reads a brief on stdin. */
+export function readsBriefOnStdin(target: string): boolean {
+  return BRIEF_TARGETS.has(target);
+}
+
 /** Shapes whose compiled bundle entry is `daemon.ts`. Batch's entry is
  *  `agent.ts` even though it gets daemon-class supervision. */
 export const DAEMON_ENTRY_TARGETS: ReadonlySet<string> = new Set([
@@ -53,7 +68,14 @@ const RUN_CLASS_BY_TARGET: Readonly<Record<string, RunClass>> = {
   browser: "interactive",
   channel: "daemon",
   managed: "daemon",
-  crew: "daemon",
+  // A crew bundle is a ONE-SHOT and always was: its emitted `daemon.ts` reads
+  // a brief on stdin, runs the pipeline and exits — the emitter's own comment
+  // says so. Classing it `daemon` launched it detached with no stdin, where
+  // it exited 2 immediately ("no input on stdin"); 2 is not in the terminal
+  // set, so the supervisor read that as a crash and walked the backoff ladder
+  // into `crash-looping`. A crew harness was effectively unsupervisable.
+  // See `crewhaus daemon submit --brief-file`.
+  crew: "one-shot",
   voice: "daemon",
   batch: "worker",
   workflow: "one-shot",
@@ -431,6 +453,16 @@ export type SpawnPlanInput = {
     readonly gatewayPort?: number;
     readonly controlPort?: number;
   };
+  /**
+   * The brief a crew run consumes on stdin, as a file path.
+   *
+   * Crew is the one shape whose INPUT is a document rather than a message:
+   * its compiled bundle reads stdin and exits 2 without it. Passing a path
+   * (not the text) keeps a brief out of argv, which every process on this
+   * machine can read, and lets a detached run keep reading after the manager
+   * that started it has gone.
+   */
+  readonly briefFile?: string;
   /** control.v1 bearer. Stamped into the ENV — never into argv, which every
    *  process on the machine can read. */
   readonly controlToken?: string;
@@ -456,6 +488,8 @@ export type SpawnPlan = {
   readonly detached: boolean;
   /** `pipe` for attached runs, `file` for detached daemons. */
   readonly stdio: "pipe" | "file";
+  /** File the child's stdin is read from — a crew brief. */
+  readonly stdinFile?: string;
   readonly launchMode: "interpreter" | "compiled" | "cli-verb";
   /** True only for interpreter launches — the compiled bundle cannot resume,
    *  and the Run controls must say Fresh rather than pretend. */
@@ -475,8 +509,8 @@ export type SpawnPlan = {
 /** Raised when a plan cannot be built (no bundle, no spec). Carries a
  *  `remedy` the UI turns into a button rather than an error toast. */
 export class SpawnPlanError extends Error {
-  readonly remedy: "compile" | "add-spec" | "install-cli";
-  constructor(message: string, remedy: "compile" | "add-spec" | "install-cli") {
+  readonly remedy: "compile" | "add-spec" | "install-cli" | "submit-brief";
+  constructor(message: string, remedy: "compile" | "add-spec" | "install-cli" | "submit-brief") {
     super(message);
     this.name = "SpawnPlanError";
     this.remedy = remedy;
@@ -583,11 +617,23 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
       "compile",
     );
   }
+  // Crew reads a BRIEF on stdin and exits 2 without one. Refusing at plan
+  // time is what stops a supervised start from spawning a process that is
+  // guaranteed to die — which, before the class was corrected, walked the
+  // crash-backoff ladder into `crash-looping` and made a crew harness
+  // effectively unsupervisable.
+  if (readsBriefOnStdin(input.target) && input.briefFile === undefined) {
+    throw new SpawnPlanError(
+      "a crew bundle reads its brief on stdin — start it with `crewhaus daemon submit <dir> --brief-file <file>` (or run `bun dist/daemon.ts < brief.md` by hand)",
+      "submit-brief",
+    );
+  }
   const detached = runClass !== "interactive";
   return {
     ...base,
     argv: [bunBin, bundle.entryPath],
     detached,
+    ...(input.briefFile !== undefined ? { stdinFile: input.briefFile } : {}),
     // Detached children write straight into the log fd; an attached run is
     // piped so the manager can carry stdin, and tees to the log itself.
     stdio: detached ? "file" : "pipe",

@@ -186,6 +186,19 @@ wiring appears), and every other pin is untouched — the fixture specs declare 
 false` on the managed/batch wake lanes, `sanitizeControlText` on the emitted turn
 previews) do not reach any pin.
 
+**0.5.3 delta — `crew.daemon.ts` only.** The crew bundle's no-stdin refusal
+gained its remediation: `[crew] no input on stdin` became three lines naming
+`bun daemon.ts < brief.md` and `crewhaus daemon submit --brief-file`. That
+matters because `crew` moved from the supervisor's `daemon` run class to
+`one-shot` in the same release — it was being launched detached with no stdin,
+where the bare exit 2 read as a crash and walked the backoff ladder — and the
+operator's only clue was this line in a log. The message rides the always-
+emitted stdin gate, not memory/continuity, so it appears on a memory-free
+`continuity: false` bundle too; that one pin was regenerated to its prior bytes
+**plus** those three lines, and the diff against the previous pin is exactly
+that hunk. The continuity opt-out contract is unchanged, and every other pin is
+untouched.
+
 ## Regenerating
 
 Only regenerate when a LATER release deliberately changes emitted bundles;

@@ -66,8 +66,9 @@ const CLI_DISPATCH: Readonly<Record<string, Readonly<Record<string, readonly str
     preflight: ["json"],
   },
   daemon: {
-    start: ["force", "ack", "no-preflight"],
-    restart: ["force", "ack", "no-preflight"],
+    start: ["force", "ack", "no-preflight", "compile", "no-compile"],
+    submit: ["brief-file", "force", "ack", "no-preflight", "compile", "no-compile"],
+    restart: ["force", "ack", "no-preflight", "compile", "no-compile"],
     stop: ["grace"],
     status: ["json"],
     logs: ["tail", "follow", "run"],

@@ -937,6 +937,9 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
           cwd: plan.cwd,
           env: plan.env,
           stdio: plan.stdio === "file" ? { mode: "file", path: logFile } : { mode: "pipe" },
+          // A crew brief: the kernel feeds it, so a detached run keeps its
+          // input after this manager exits.
+          ...(plan.stdinFile !== undefined ? { stdinFile: plan.stdinFile } : {}),
           detached: plan.detached,
         });
         pid = child.pid;
