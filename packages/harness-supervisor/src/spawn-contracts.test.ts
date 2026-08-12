@@ -47,7 +47,10 @@ describe("the shape table", () => {
       browser: "interactive",
       channel: "daemon",
       managed: "daemon",
-      crew: "daemon",
+      // A crew bundle consumes a brief on stdin and exits — a JOB, not a
+      // daemon. Classing it `daemon` launched it with no stdin, where its
+      // exit 2 read as a crash and walked the backoff ladder.
+      crew: "one-shot",
       voice: "daemon",
       batch: "worker",
       workflow: "one-shot",
@@ -81,6 +84,51 @@ describe("the shape table", () => {
     expect(runKindFor("one-shot")).toBe("job");
     expect(runKindFor("interactive")).toBe("interactive");
     expect(runKindFor("mcp-server")).toBe("mcp-server");
+  });
+});
+
+describe("crew: a brief is the input, not a message", () => {
+  function crewHarness(): string {
+    const dir = mkdtempSync(join(tmpdir(), "chsup-crew-"));
+    roots.push(dir);
+    writeFileSync(join(dir, "crewhaus.yaml"), "name: pipeline\ntarget: crew\n");
+    mkdirSync(join(dir, "dist"), { recursive: true });
+    writeFileSync(join(dir, "dist", "daemon.ts"), "// bundle\n");
+    return dir;
+  }
+
+  test("planning a crew WITHOUT a brief refuses, with the remedy the caller needs", () => {
+    const dir = crewHarness();
+    let thrown: unknown;
+    try {
+      buildSpawnPlan({ harnessDir: dir, target: "crew", processEnv: {} });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(SpawnPlanError);
+    expect((thrown as SpawnPlanError).remedy).toBe("submit-brief");
+    expect((thrown as Error).message).toContain("daemon submit");
+  });
+
+  test("a brief becomes the child's stdin FILE — never argv, which anyone can read", () => {
+    const dir = crewHarness();
+    const brief = join(dir, "brief.md");
+    writeFileSync(brief, "# ship the thing\n");
+    const plan = buildSpawnPlan({
+      harnessDir: dir,
+      target: "crew",
+      processEnv: {},
+      briefFile: brief,
+    });
+    expect(plan.stdinFile).toBe(brief);
+    expect(plan.argv.join(" ")).not.toContain(brief);
+    expect(plan.entry).toBe("daemon.ts");
+  });
+
+  test("a crew run is a JOB: never restarted, ledgered as one", () => {
+    expect(runClassFor("crew")).toBe("one-shot");
+    expect(isSupervisedClass(runClassFor("crew"))).toBe(false);
+    expect(runKindFor(runClassFor("crew"))).toBe("job");
   });
 });
 

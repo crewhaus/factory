@@ -60,6 +60,15 @@ export type SpawnRequest = {
   readonly cwd: string;
   readonly env: Readonly<Record<string, string>>;
   readonly stdio: SpawnStdio;
+  /**
+   * Feed the child's stdin from this file, read-only.
+   *
+   * For the shapes whose INPUT is a document: a compiled crew bundle reads
+   * its brief on stdin and exits 2 without one. A pipe would not do — the
+   * run is detached and outlives the manager that started it, so the writer
+   * must be the kernel, exactly as it is for the log fd on the other end.
+   */
+  readonly stdinFile?: string;
   /** Own process group (POSIX) / `CREATE_NEW_PROCESS_GROUP` (Windows). */
   readonly detached: boolean;
 };
@@ -211,14 +220,18 @@ function nodeSpawnAdapter(req: SpawnRequest, windowsHide: boolean): SpawnedProce
   const [cmd, ...args] = req.argv;
   if (cmd === undefined) throw new Error("spawn: empty argv");
   let fd: number | undefined;
+  // The child reads this one; opened read-only and handed over the same way
+  // the log fd is, so a detached run keeps its input after we exit.
+  let inFd: number | undefined;
+  if (req.stdinFile !== undefined) inFd = openSync(req.stdinFile, "r");
   let stdio: Array<"pipe" | "ignore" | number>;
   if (req.stdio.mode === "pipe") {
-    stdio = ["pipe", "pipe", "pipe"];
+    stdio = [inFd ?? "pipe", "pipe", "pipe"];
   } else {
     // Append + create, 0600: two runs never truncate each other's log, and
     // the fd survives the manager because the CHILD holds it.
     fd = openSync(req.stdio.path, "a", 0o600);
-    stdio = ["ignore", fd, fd];
+    stdio = [inFd ?? "ignore", fd, fd];
   }
   const child = nodeSpawn(cmd, args, {
     cwd: req.cwd,
@@ -227,10 +240,12 @@ function nodeSpawnAdapter(req: SpawnRequest, windowsHide: boolean): SpawnedProce
     detached: req.detached,
     windowsHide,
   });
-  // The parent's copy of the log fd is not needed once the child owns it.
-  if (fd !== undefined) {
+  // The parent's copies of the handed-over fds are not needed once the child
+  // owns them.
+  for (const handedOver of [fd, inFd]) {
+    if (handedOver === undefined) continue;
     try {
-      closeSync(fd);
+      closeSync(handedOver);
     } catch {
       // Already closed by a failed spawn — nothing to clean up.
     }

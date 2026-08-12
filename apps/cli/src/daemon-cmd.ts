@@ -63,6 +63,7 @@ import {
   readLogTail,
   readManagerSettings,
   readRunfile,
+  readsBriefOnStdin,
   recentRuns,
   resolveCrewhausBin,
   runClassFor,
@@ -106,6 +107,10 @@ const DAEMON_USAGE_LINES: readonly string[] = [
   "       [--compile] [--no-compile]             channel secrets can NEVER be forced. --compile",
   "                                              recompiles first IF the spec is newer than the",
   "                                              bundle (default: manager.autoCompile).",
+  "  crewhaus daemon submit [<dir|hrn_id>]       run ONE pipeline with a brief on stdin — the",
+  "       --brief-file <path>                    supervised path for crew, whose input is a",
+  "       [--force] [--ack <id,id>]              document. Tracked in the run ledger like any",
+  "       [--no-preflight] [--compile]           job, and NEVER restarted.",
   "  crewhaus daemon stop [<dir|hrn_id>]         SIGTERM, then SIGKILL after a 15 s grace",
   "  crewhaus daemon restart [<dir|hrn_id>]      stop, then start (the plan is rebuilt, so a",
   "       [--compile] [--no-compile]             recompile between the two is picked up)",
@@ -242,6 +247,7 @@ export function supervisorFor(
   opts: DaemonCommandOptions,
   gate: { readonly enabled: boolean; readonly force?: boolean; readonly acknowledge?: string[] },
   prep: { readonly compile?: boolean } = {},
+  run: { readonly briefFile?: string } = {},
 ): HarnessSupervisor {
   const env = opts.env ?? process.env;
   const ops = opts.ops ?? createProcessOps();
@@ -261,6 +267,9 @@ export function supervisorFor(
         ports: { controlPort: 0 },
         // The PATH only. A token in argv is readable by every process here.
         controlTokenPath: controlTokenPath(harness.dir),
+        // A crew brief, as a PATH: never in argv, and readable by the child
+        // for as long as it needs it.
+        ...(run.briefFile !== undefined ? { briefFile: run.briefFile } : {}),
       }),
     // Built per start, like the plan: `.crewhaus/settings.json` is edited
     // between starts exactly as the spec is.
@@ -487,6 +496,130 @@ async function daemonStart(
                 : ""
             } — the runfile is the lock`,
           ],
+          exitCode: 1,
+        };
+      case "preflight-blocked":
+        return {
+          lines: [
+            ...formatGateRefusal(result.gate),
+            "",
+            "  re-run with --force to wave through the forceable items,",
+            "  or --ack <id,id> to wave specific ones through by id.",
+          ],
+          exitCode: 1,
+        };
+      case "prepare-refused":
+        return {
+          lines: [`${harness.specName}:`, ...formatPrepareRefusal(result.refusal)],
+          exitCode: 1,
+        };
+      case "plan-failed":
+        return { lines: [`${harness.specName}: ${result.error.message}`], exitCode: 1 };
+    }
+  } finally {
+    supervisor.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// submit — one crew pipeline, with a brief
+// ---------------------------------------------------------------------------
+
+/**
+ * `crewhaus daemon submit <dir> --brief-file brief.md`
+ *
+ * The supervised path for the shapes whose INPUT is a document. Crew is the
+ * motivating one: its compiled bundle reads a brief on stdin and exits 2
+ * without one, so `daemon start` — which spawns detached with no stdin —
+ * could only ever produce an instant exit, and 2 is not in the terminal
+ * code set, so the supervisor walked the backoff ladder into
+ * `crash-looping`. A crew harness was effectively unsupervisable, and the
+ * remedy in every fleet README was "do not daemon start this one".
+ *
+ * A submit is a JOB, not a daemon: one run, tracked in the same run ledger
+ * with the same scrubbed log capture, and NEVER restarted. That is what
+ * matches how crews are actually used — on demand, per piece.
+ */
+async function daemonSubmit(
+  argv: readonly string[],
+  opts: DaemonCommandOptions,
+): Promise<DaemonCommandResult> {
+  const args = parseVerbArgs("submit", argv, {
+    "brief-file": "value",
+    "no-preflight": "boolean",
+    force: "boolean",
+    ack: "value",
+    compile: "boolean",
+    "no-compile": "boolean",
+  });
+  const harness = resolveHarness(args.positional[0], opts);
+  if (!readsBriefOnStdin(harness.target)) {
+    // Only the brief-taking shapes have an input document. Saying which verb
+    // this harness DOES take is more useful than "unsupported".
+    throw new Error(
+      `daemon submit: ${harness.specName} is a ${harness.target} harness, whose input is not a brief on stdin — use \`crewhaus daemon start\` (class ${runClassFor(harness.target)})`,
+    );
+  }
+  const briefFlag = args.flags.get("brief-file");
+  if (typeof briefFlag !== "string") {
+    throw new Error(
+      "daemon submit: --brief-file <path> is required — the brief is the run's input",
+    );
+  }
+  // Resolved against the CALLER's cwd, not the harness: an operator submits
+  // a brief they are looking at, which is rarely inside the harness.
+  const briefFile = resolve(opts.cwd ?? process.cwd(), briefFlag);
+  if (!existsSync(briefFile)) {
+    throw new Error(`daemon submit: no brief at ${briefFile}`);
+  }
+  if (statSync(briefFile).size === 0) {
+    // The bundle would exit 2 on an empty brief exactly as it does on none;
+    // saying so here is one round trip shorter than reading the log.
+    throw new Error(`daemon submit: ${briefFile} is empty — a crew brief must have content`);
+  }
+  const ackFlag = args.flags.get("ack");
+  const supervisor = supervisorFor(
+    harness,
+    opts,
+    {
+      enabled: args.flags.get("no-preflight") !== true,
+      force: args.flags.get("force") === true,
+      ...(typeof ackFlag === "string"
+        ? {
+            acknowledge: ackFlag
+              .split(",")
+              .map((s) => s.trim())
+              .filter((s) => s !== ""),
+          }
+        : {}),
+    },
+    args.flags.get("compile") === true
+      ? { compile: true }
+      : args.flags.get("no-compile") === true
+        ? { compile: false }
+        : {},
+    { briefFile },
+  );
+  try {
+    const result = await supervisor.start();
+    if (result.ok) {
+      return {
+        lines: [
+          `${harness.specName}: submitted ${result.runId}${
+            result.pid !== undefined ? ` (pid ${result.pid})` : ""
+          }`,
+          ...(result.prepared ?? []).map((note) => `  ${note}`),
+          `  brief: ${briefFile}`,
+          `  class ${runClassFor(harness.target)} — one run, never restarted`,
+          `  logs: crewhaus daemon logs ${harness.dir} --run ${result.runId}`,
+        ],
+        exitCode: 0,
+      };
+    }
+    switch (result.reason) {
+      case "already-running":
+        return {
+          lines: [`${harness.specName}: a run is already in flight for this harness`],
           exitCode: 1,
         };
       case "preflight-blocked":
@@ -1038,6 +1171,7 @@ function latestRun(harnessDir: string): string | undefined {
 
 export const DAEMON_VERBS = [
   "start",
+  "submit",
   "stop",
   "restart",
   "status",
@@ -1072,6 +1206,8 @@ export async function runDaemonCommand(
   switch (verb) {
     case "start":
       return await daemonStart(rest, opts, false);
+    case "submit":
+      return await daemonSubmit(rest, opts);
     case "restart":
       return await daemonStart(rest, opts, true);
     case "stop":
