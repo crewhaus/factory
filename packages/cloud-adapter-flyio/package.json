@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/cloud-adapter-flyio",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "type": "module",
   "description": "One-click deploy adapter for Fly.io — generates a fly.toml + a Fly-tuned Dockerfile and wraps the Machines API for daemon target shapes (Section 44)",
   "main": "src/index.ts",

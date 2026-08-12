@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/regression-runner",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "type": "module",
   "description": "Diff-based pass/fail flip detection between two eval-runner outputs",
   "main": "src/index.ts",

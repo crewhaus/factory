@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-image-generation",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "type": "module",
   "description": "M4.1 — image-generation tool (DALL-E 3, Replicate, future Flux/SD). Calls remote API; no host writes; non-destructive.",
   "main": "src/index.ts",

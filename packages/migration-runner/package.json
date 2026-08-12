@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/migration-runner",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "type": "module",
   "description": "Batch-migrate every spec in a registry: dry-run + write, idempotent re-runs",
   "main": "src/index.ts",

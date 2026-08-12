@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-result-store",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "type": "module",
   "description": "Persist large tool results to disk and return a preview the model can re-read",
   "main": "src/index.ts",

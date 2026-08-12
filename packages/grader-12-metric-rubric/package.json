@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/grader-12-metric-rubric",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "type": "module",
   "description": "Pillar-2 canonical eval rubric — 12 named graders with industry-validated thresholds derived from Towards Data Science's 100+ enterprise deployments framework (2026-05)",
   "main": "src/index.ts",
