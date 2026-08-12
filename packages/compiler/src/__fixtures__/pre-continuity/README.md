@@ -199,6 +199,16 @@ emitted stdin gate, not memory/continuity, so it appears on a memory-free
 that hunk. The continuity opt-out contract is unchanged, and every other pin is
 untouched.
 
+**0.5.4 delta — `channel.session-router.ts` only (#400).** The emitted
+`resumeApproval` used to return SILENTLY when a granted approval had no captured
+inbound event — the state a `crewhaus approvals grant` from a terminal, or any
+grant arriving after a restart, always lands in (the resume map is in-memory).
+An operator saw nothing happen and had no way to tell a working grant from a
+broken one. It now prints why, and says the grant is live for the next message.
+Comment + one branch; no behaviour outside that path changes, and the continuity
+opt-out contract is untouched. That one pin was regenerated to its prior bytes
+plus that hunk; every other pin is unchanged.
+
 ## Regenerating
 
 Only regenerate when a LATER release deliberately changes emitted bundles;

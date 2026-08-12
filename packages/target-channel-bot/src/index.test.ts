@@ -2100,7 +2100,13 @@ describe("emitChannelBot — G11 pending-approval channel surface (ask_mode paus
     expect(router).toContain("postInteractive: (approval) => __postApproval({ event, approval })");
     expect(router).toContain("resumeApproval(approval: PendingApproval, adapter: ChannelAdapter)");
     expect(router).toContain("const __resumeContexts = new Map<string, InboundEvent>();");
-    expect(router).toContain('if (approval.status !== "grant" || event === undefined) return;');
+    // #400 — a denial still returns early, but a grant with no captured
+    // inbound event now SAYS SO instead of returning silently: an operator who
+    // granted from `crewhaus approvals grant` saw nothing happen and could not
+    // tell a working grant from a broken one.
+    expect(router).toContain('if (approval.status !== "grant") return;');
+    expect(router).toContain("if (event === undefined) {");
+    expect(router).toContain("granted, but this process has no captured");
   });
 });
 
