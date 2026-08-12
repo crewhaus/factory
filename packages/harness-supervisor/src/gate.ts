@@ -17,10 +17,41 @@
  * The env the gate checks MUST be the env the spawn receives — pass the
  * merged spawn env, not `process.env`.
  */
-import type { PreflightItem, PreflightReport } from "@crewhaus/preflight";
+import type { HookDisclosure, PreflightItem, PreflightReport } from "@crewhaus/preflight";
 import { runPreflight } from "@crewhaus/preflight";
 import type { PortRequest } from "@crewhaus/preflight";
+import { MANAGER_HOOK_NAMES, readManagerSettings } from "./manager-settings";
+import { readHookRunLog } from "./prepare";
+import { recentRuns } from "./runfiles";
 import { type EnvFileRef, loadEnvChain } from "./spawn-contracts";
+
+/**
+ * What preflight should say about this harness's operator hooks.
+ *
+ * "Never ran, but the harness HAS run" is the one that earns a warning: it
+ * is the shape of a fleet whose operator believes prep is happening and
+ * whose daemon has never had it — the failure the hook contract replaced a
+ * `prep.sh` convention to prevent.
+ */
+export function harnessHookDisclosures(harnessDir: string): HookDisclosure[] {
+  const hooks = readManagerSettings(harnessDir).hooks;
+  const declared = MANAGER_HOOK_NAMES.filter((name) => hooks[name] !== undefined);
+  if (declared.length === 0) return [];
+  const runs = readHookRunLog(harnessDir);
+  const harnessHasRun = recentRuns(harnessDir, 1).length > 0;
+  return declared.map((name) => {
+    const record = runs[name];
+    return {
+      name,
+      declaredAs: hooks[name]?.declaredAs ?? "",
+      ...(record !== undefined
+        ? { lastRunAt: record.at, lastRunOk: record.ok }
+        : harnessHasRun
+          ? { neverRanDespiteRuns: true }
+          : {}),
+    };
+  });
+}
 
 /** Blocking items in these areas can never be waved through. */
 export const UNFORCEABLE_AREAS: ReadonlySet<string> = new Set(["channels"]);
@@ -81,6 +112,10 @@ export type RunGateOptions = GateOptions & {
    *  chain — including the shared files `manager.envFiles` declares — so the
    *  report NAMES the files behind the env it just checked. */
   readonly envFiles?: readonly EnvFileRef[];
+  /** Operator hooks this spawn will run. Defaults to reading the harness's
+   *  own `manager.hooks` + its last-run record, so the report DISCLOSES the
+   *  commands a start is about to run from `.crewhaus/settings.json`. */
+  readonly hooks?: readonly HookDisclosure[];
   readonly compileWarnings?: readonly string[];
   readonly ports?: readonly PortRequest[];
   /** Seam for tests and for managers with their own preflight composition. */
@@ -94,6 +129,7 @@ export async function runPreflightGate(options: RunGateOptions): Promise<GateDec
     harnessDir: options.harnessDir,
     env: options.env,
     envFiles: options.envFiles ?? loadEnvChain(options.harnessDir).refs,
+    hooks: options.hooks ?? harnessHookDisclosures(options.harnessDir),
     ...(options.compileWarnings !== undefined ? { compileWarnings: options.compileWarnings } : {}),
     ...(options.ports !== undefined ? { ports: options.ports } : {}),
   });

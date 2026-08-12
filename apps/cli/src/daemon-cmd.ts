@@ -47,15 +47,21 @@ import { type HangarRegistry, openHangarRegistry } from "@crewhaus/harness-regis
 import {
   type Clock,
   type HarnessSupervisor,
+  MANAGER_HOOK_NAMES,
   type ProcessOps,
   buildSpawnPlan,
+  bundleStaleness,
   cliTwin,
   controlTokenPath,
   createHarnessSupervisor,
+  createPrepareRunner,
   createProcessOps,
   formatGateRefusal,
+  formatPrepareRefusal,
   loadEnvChain,
+  readHookRunLog,
   readLogTail,
+  readManagerSettings,
   readRunfile,
   recentRuns,
   resolveCrewhausBin,
@@ -97,10 +103,12 @@ const DAEMON_USAGE_LINES: readonly string[] = [
   "  crewhaus daemon start [<dir|hrn_id>]        supervise this harness: preflight, then spawn",
   "       [--force] [--ack <id,id>]              --force waves through forceable blocking items;",
   "       [--no-preflight]                       --ack waves specific ones through by id. Missing",
-  "                                              channel secrets can NEVER be forced.",
+  "       [--compile] [--no-compile]             channel secrets can NEVER be forced. --compile",
+  "                                              recompiles first IF the spec is newer than the",
+  "                                              bundle (default: manager.autoCompile).",
   "  crewhaus daemon stop [<dir|hrn_id>]         SIGTERM, then SIGKILL after a 15 s grace",
   "  crewhaus daemon restart [<dir|hrn_id>]      stop, then start (the plan is rebuilt, so a",
-  "                                              recompile between the two is picked up)",
+  "       [--compile] [--no-compile]             recompile between the two is picked up)",
   "  crewhaus daemon status [<dir|hrn_id>]       runfile / liveness / control port / recent runs",
   "       [--json]",
   "  crewhaus daemon logs [<dir|hrn_id>]         the SCRUBBED captured output of a run",
@@ -108,6 +116,12 @@ const DAEMON_USAGE_LINES: readonly string[] = [
   "  crewhaus daemon wake [<dir|hrn_id>]         one synthetic tick down the daemon's OWN timer",
   "       --lane heartbeat|schedule [--reason R] path, via crewhaus.control.v1",
   "  crewhaus daemon drain [<dir|hrn_id>]        stop intake, finish in-flight work, exit 0",
+  "",
+  "",
+  "  Per-harness prep lives in <harness>/.crewhaus/settings.json under `manager`:",
+  "  `autoCompile: true` makes every start recompile a stale bundle, and",
+  "  `hooks.postCompile` / `hooks.preSpawn` run an operator step between compile",
+  "  and spawn. A hook that exits non-zero refuses the start, like preflight.",
   "",
   "  With no <dir|hrn_id>, the harness is the current directory (the standalone-",
   "  harness convention). These verbs drive the supervisor DIRECTLY, so they work",
@@ -227,12 +241,14 @@ export function supervisorFor(
   harness: ResolvedHarness,
   opts: DaemonCommandOptions,
   gate: { readonly enabled: boolean; readonly force?: boolean; readonly acknowledge?: string[] },
+  prep: { readonly compile?: boolean } = {},
 ): HarnessSupervisor {
   const env = opts.env ?? process.env;
+  const ops = opts.ops ?? createProcessOps();
   return createHarnessSupervisor({
     harnessDir: harness.dir,
     target: harness.target,
-    ops: opts.ops ?? createProcessOps(),
+    ops,
     clock: opts.clock ?? systemClock,
     managerVersion: cliVersion() ?? "0.0.0",
     plan: () =>
@@ -245,6 +261,21 @@ export function supervisorFor(
         ports: { controlPort: 0 },
         // The PATH only. A token in argv is readable by every process here.
         controlTokenPath: controlTokenPath(harness.dir),
+      }),
+    // Built per start, like the plan: `.crewhaus/settings.json` is edited
+    // between starts exactly as the spec is.
+    prepare: () =>
+      createPrepareRunner({
+        harnessDir: harness.dir,
+        target: harness.target,
+        ops,
+        // The env the SPAWN receives — a prep step patching the bundle needs
+        // the same credentials the daemon will run with, which is what the
+        // `run.sh` wrapper it replaces has today.
+        env: mergedSpawnEnv(env, harness.dir).env as Record<string, string>,
+        crewhausBin: resolveCrewhausBin(harness.dir),
+        ...(opts.clock !== undefined ? { clock: opts.clock } : {}),
+        ...(prep.compile !== undefined ? { compile: prep.compile } : {}),
       }),
     ...(gate.enabled
       ? {
@@ -391,7 +422,12 @@ async function daemonStart(
     force: "boolean",
     ack: "value",
     "no-preflight": "boolean",
+    compile: "boolean",
+    "no-compile": "boolean",
   });
+  if (args.flags.get("compile") === true && args.flags.get("no-compile") === true) {
+    throw new Error(`daemon ${verb}: --compile and --no-compile are mutually exclusive`);
+  }
   const harness = resolveHarness(args.positional[0], opts);
   const ackFlag = args.flags.get("ack");
   const acknowledge =
@@ -401,11 +437,22 @@ async function daemonStart(
           .map((s) => s.trim())
           .filter((s) => s !== "")
       : undefined;
-  const supervisor = supervisorFor(harness, opts, {
-    enabled: args.flags.get("no-preflight") !== true,
-    force: args.flags.get("force") === true,
-    ...(acknowledge !== undefined ? { acknowledge } : {}),
-  });
+  const supervisor = supervisorFor(
+    harness,
+    opts,
+    {
+      enabled: args.flags.get("no-preflight") !== true,
+      force: args.flags.get("force") === true,
+      ...(acknowledge !== undefined ? { acknowledge } : {}),
+    },
+    // Neither flag ⇒ the harness's own `manager.autoCompile` decides, so the
+    // console's Restart button and this verb agree without a flag.
+    args.flags.get("compile") === true
+      ? { compile: true }
+      : args.flags.get("no-compile") === true
+        ? { compile: false }
+        : {},
+  );
   try {
     // A restart from the terminal is by construction a restart of a daemon
     // THIS process did not spawn, so it has to adopt off the runfile first:
@@ -420,6 +467,10 @@ async function daemonStart(
           `${harness.specName}: ${restart ? "restarted" : "started"} ${result.runId}${
             result.pid !== undefined ? ` (pid ${result.pid})` : ""
           }`,
+          // An operator who asked for a recompile is told it happened —
+          // "nothing recompiled and nobody said so" is the failure this
+          // whole path exists to end.
+          ...(result.prepared ?? []).map((note) => `  ${note}`),
           `  class ${runClassFor(harness.target)} · state ${plan.state}`,
           `  logs: crewhaus daemon logs ${harness.dir} --run ${result.runId}`,
         ],
@@ -446,6 +497,11 @@ async function daemonStart(
             "  re-run with --force to wave through the forceable items,",
             "  or --ack <id,id> to wave specific ones through by id.",
           ],
+          exitCode: 1,
+        };
+      case "prepare-refused":
+        return {
+          lines: [`${harness.specName}:`, ...formatPrepareRefusal(result.refusal)],
           exitCode: 1,
         };
       case "plan-failed":
@@ -681,6 +737,9 @@ async function daemonStatus(
   // when a key resolves from a shared fleet file rather than a local one,
   // and a harness with no bundle yet still answers it.
   const envChain = loadEnvChain(harness.dir);
+  const settings = readManagerSettings(harness.dir);
+  const hookRuns = readHookRunLog(harness.dir);
+  const freshness = bundleStaleness(harness.dir, harness.target);
 
   if (args.flags.get("json") === true) {
     return {
@@ -695,6 +754,21 @@ async function daemonStatus(
           controlPort: controlPort ?? null,
           recentRuns: runs,
           envFiles: envChain.refs,
+          bundle: freshness,
+          prep: {
+            autoCompile: settings.autoCompile,
+            hooks: Object.fromEntries(
+              MANAGER_HOOK_NAMES.filter((name) => settings.hooks[name] !== undefined).map(
+                (name) => [
+                  name,
+                  {
+                    declaredAs: settings.hooks[name]?.declaredAs ?? "",
+                    lastRun: hookRuns[name] ?? null,
+                  },
+                ],
+              ),
+            ),
+          },
           plan: plan ?? null,
           planError: planError ?? null,
         },
@@ -737,8 +811,44 @@ async function daemonStatus(
     }
   }
   lines.push(...envChainLines(envChain.refs));
+  lines.push(...prepLines(settings, hookRuns, freshness));
   lines.push(planError !== undefined ? `  plan: ${planError}` : `  would run: ${plan}`);
   return { lines, exitCode: 0 };
+}
+
+/**
+ * The prep contract, as `status` reports it: whether a start would
+ * recompile, which hooks exist, and when each last ran.
+ *
+ * A hook that exists but has never fired is the state worth naming — that is
+ * a harness whose operator believes prep is happening and whose daemon has
+ * never had it. A hook whose recorded run names a DIFFERENT declaration than
+ * the current one is named too: the record is of the command that ran, not
+ * of the command that would run now.
+ */
+function prepLines(
+  settings: ReturnType<typeof readManagerSettings>,
+  hookRuns: ReturnType<typeof readHookRunLog>,
+  freshness: ReturnType<typeof bundleStaleness>,
+): string[] {
+  const declared = MANAGER_HOOK_NAMES.filter((name) => settings.hooks[name] !== undefined);
+  if (!settings.autoCompile && declared.length === 0) return [];
+  const lines = ["  prep (.crewhaus/settings.json → manager):"];
+  if (settings.autoCompile) {
+    lines.push(`    autoCompile: on · bundle: ${freshness.label}`);
+  }
+  for (const name of declared) {
+    const hook = settings.hooks[name];
+    const run = hookRuns[name];
+    const last =
+      run === undefined
+        ? "never run"
+        : `last ${run.ok ? "ok" : `FAILED${run.exitCode !== undefined ? ` (exit ${run.exitCode})` : ""}`} at ${run.at}${
+            run.declaredAs !== hook?.declaredAs ? ` — as \`${run.declaredAs}\`, since edited` : ""
+          }`;
+    lines.push(`    ${name}: \`${hook?.declaredAs}\` · ${last}`);
+  }
+  return lines;
 }
 
 // ---------------------------------------------------------------------------

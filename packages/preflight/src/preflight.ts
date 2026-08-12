@@ -4,7 +4,7 @@
  * before spawning a harness process.
  *
  * Area order (and therefore item order): spec → env → credentials →
- * channels → mcp → ports → bundle → durability.
+ * channels → mcp → ports → bundle → durability → hooks.
  *
  * Classification stances, chosen to match what the spawn would actually do:
  *
@@ -34,6 +34,7 @@ import { channelItems, lowerSpecChannels } from "./channels";
 import { collectSpecModels, hasLiveProviderCredentials, modelCredentialItems } from "./credentials";
 import { durabilityItems } from "./durability";
 import { type EnvChainFile, envChainItems } from "./env-chain";
+import { type HookDisclosure, hookItems } from "./hooks";
 import { type McpServersSpec, mcpDryRunItems } from "./mcp";
 import { type PortChecker, type PortRequest, checkPortFree, portItems } from "./ports";
 import {
@@ -66,6 +67,9 @@ export type RunPreflightOptions = {
    *  has no opinion about where a harness keeps env files); omitted, the
    *  env area is simply empty. */
   readonly envFiles?: readonly EnvChainFile[];
+  /** Operator hooks this spawn will run, supplied by the caller that owns
+   *  `.crewhaus/settings.json`. Disclosure, not validation. */
+  readonly hooks?: readonly HookDisclosure[];
   /** Freshness comparator; defaults to the approximate mtime heuristic.
    *  Swap in a spec-hash comparator once bundle manifests record one. */
   readonly freshness?: FreshnessComparator;
@@ -217,6 +221,9 @@ export async function runPreflight(opts: RunPreflightOptions): Promise<Preflight
       opts.env,
     ),
   );
+
+  // hooks — LAST: what will run after everything above has passed.
+  items.push(...hookItems(opts.hooks ?? []));
 
   return buildReport(items);
 }

@@ -955,9 +955,27 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         runId: result.runId,
         pid: result.pid ?? null,
         state: handle.snapshot().state,
+        // "recompiled dist/", "postCompile hook ok" — the console says what
+        // it did on the way in rather than leaving a recompile invisible.
+        prepared: result.prepared ?? [],
       });
     }
     switch (result.reason) {
+      case "prepare-refused":
+        // 409 like the gate: well-formed request, refused by a fact about
+        // the harness. The step's own output is what makes it actionable.
+        return json(
+          {
+            ok: false,
+            reason: "prepare-refused",
+            stage: result.refusal.stage,
+            message: result.refusal.message,
+            exitCode: result.refusal.exitCode ?? null,
+            // Already scrubbed at the capture (`runPrepareCommand`).
+            output: result.refusal.output,
+          },
+          409,
+        );
       case "already-running":
         return json(
           {

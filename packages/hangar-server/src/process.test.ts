@@ -12,7 +12,7 @@
  * what the console renders.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -734,6 +734,71 @@ describe("a console-submitted job is cancellable (the seam, not just the ledger)
         }
       }
     }
+  }, 20_000);
+
+  test("a compile job runs the harness's postCompile hook, so console and CLI agree", async () => {
+    // A manager-initiated compile REPLACES the bundle, which silently
+    // discarded whatever the operator's post-compile step had patched into
+    // it — the reason fleets had a "never use console compile jobs" rule.
+    if (process.platform === "win32") return; // /bin/sh
+    const dir = makeFixtureHarness(join(mkdtempSync(join(tmpdir(), "hangar-jobhook-")), "h"), {
+      specName: "hooked",
+    });
+    const marker = join(dir, "patched.txt");
+    mkdirSync(join(dir, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(dir, ".crewhaus", "settings.json"),
+      JSON.stringify({
+        manager: { hooks: { postCompile: ["/bin/sh", "-c", `echo patched > "${marker}"`] } },
+      }),
+    );
+    const ops = createProcessOps();
+    const runner = defaultJobRunner(ops, () => "/bin/sh");
+    const job = {
+      jobId: "job_00000000000000c3",
+      harnessDir: dir,
+      kind: "compile",
+      argv: ["-c", "true"],
+      mutating: true,
+      state: "running",
+      enqueuedAt: new Date(NOW).toISOString(),
+    } as Parameters<typeof runner>[0];
+    const result = await runner(job, {
+      register: () => {},
+      isCancelled: () => false,
+    } as Parameters<typeof runner>[1]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(marker)).toBe(true);
+  }, 20_000);
+
+  test("a compile whose postCompile hook FAILS is a failed job, not a green one", async () => {
+    if (process.platform === "win32") return; // /bin/sh
+    const dir = makeFixtureHarness(join(mkdtempSync(join(tmpdir(), "hangar-jobhookfail-")), "h"), {
+      specName: "hooked-fail",
+    });
+    mkdirSync(join(dir, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(dir, ".crewhaus", "settings.json"),
+      JSON.stringify({
+        manager: { hooks: { postCompile: ["/bin/sh", "-c", "echo nope >&2; exit 7"] } },
+      }),
+    );
+    const runner = defaultJobRunner(createProcessOps(), () => "/bin/sh");
+    const result = await runner(
+      {
+        jobId: "job_00000000000000c4",
+        harnessDir: dir,
+        kind: "compile",
+        argv: ["-c", "true"],
+        mutating: true,
+        state: "running",
+        enqueuedAt: new Date(NOW).toISOString(),
+      } as Parameters<typeof runner>[0],
+      { register: () => {}, isCancelled: () => false } as Parameters<typeof runner>[1],
+    );
+    // Reporting 0 here would leave a bundle nobody patched behind a green row.
+    expect(result.exitCode).toBe(7);
+    expect(result.error).toContain("nope");
   }, 20_000);
 });
 

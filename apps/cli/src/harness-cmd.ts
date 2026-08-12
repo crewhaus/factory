@@ -43,7 +43,7 @@ import {
   type HangarRegistry,
   openHangarRegistry,
 } from "@crewhaus/harness-registry";
-import { buildSpawnEnv, loadEnvChain } from "@crewhaus/harness-supervisor";
+import { buildSpawnEnv, harnessHookDisclosures, loadEnvChain } from "@crewhaus/harness-supervisor";
 import { preflightHarness } from "@crewhaus/preflight";
 import { createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { envChainLines } from "./env-chain-view";
@@ -374,6 +374,10 @@ async function harnessShow(
   // files declared in `manager.envFiles`, which resolve outside the harness
   // and are otherwise invisible from here.
   const envFiles = alive ? loadEnvChain(entry.dir).refs : [];
+  // The operator steps a supervised start of this harness will run, and how
+  // each last went — a hook that exists is a fact about the harness, not
+  // something you should have to open settings.json to discover.
+  const hooks = alive ? harnessHookDisclosures(entry.dir) : [];
   if (boolFlag(args, "json")) {
     return {
       lines: jsonLines({
@@ -381,6 +385,7 @@ async function harnessShow(
         inventory: inventory ?? null,
         health: health ?? null,
         envFiles,
+        hooks,
       }),
       exitCode: 0,
     };
@@ -389,6 +394,15 @@ async function harnessShow(
   if (inventory !== undefined) lines.push(...inventoryRowLines(inventory));
   if (health !== undefined) lines.push(...healthLines(health));
   lines.push(...envChainLines(envFiles, "    "));
+  for (const hook of hooks) {
+    const last =
+      hook.lastRunAt === undefined
+        ? hook.neverRanDespiteRuns === true
+          ? "never run (this harness HAS runs — they did not get it)"
+          : "never run"
+        : `last ${hook.lastRunOk === true ? "ok" : "FAILED"} ${hook.lastRunAt}`;
+    lines.push(`    hook ${hook.name}: \`${hook.declaredAs}\` · ${last}`);
+  }
   lines.push(`    registered ${entry.registeredAt}  last seen ${entry.lastSeen}`);
   if (entry.notes !== "") lines.push(`    notes: ${entry.notes}`);
   return { lines, exitCode: 0 };
@@ -679,6 +693,9 @@ async function harnessPreflight(
   const report = await preflightHarness(dir, {
     env: spawnEnv.env,
     envFiles: spawnEnv.envFileRefs,
+    // The same disclosures the supervisor's gate makes, so reading this verb
+    // and reading a refused start tell you the same things about a harness.
+    hooks: harnessHookDisclosures(dir),
   });
   const exitCode: 0 | 1 = report.ok ? 0 : 1;
   if (boolFlag(args, "json")) return { lines: jsonLines(report), exitCode };

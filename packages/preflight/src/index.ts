@@ -2,7 +2,7 @@
  * @crewhaus/preflight — typed pre-spawn health checks for harnesses.
  *
  * "Will not boot: SLACK_SIGNING_SECRET unset" instead of a relayed stack
- * trace. The package composes eight areas into one report:
+ * trace. The package composes nine areas into one report:
  *
  *   - spec        — `parseSpecIssues` lint (+ injected compiler warnings)
  *   - env         — the env-file chain the injected `env` was merged from,
@@ -23,6 +23,8 @@
  *                   with a comparator seam for an exact spec-hash check)
  *   - durability  — warn-level footguns (no dedup store on a channel
  *                   daemon, live credentials without a budget cap)
+ *   - hooks       — the operator steps (`manager.hooks`) this spawn will
+ *                   run, and whether the last run of each succeeded
  *
  * Every core function takes an explicit `env` — no `process.env` reads —
  * so checks run against the MERGED environment a spawn would receive and
@@ -88,6 +90,9 @@ export {
 
 export type { EnvChainFile } from "./env-chain";
 export { envChainItems } from "./env-chain";
+
+export type { HookDisclosure } from "./hooks";
+export { hookItems } from "./hooks";
 
 export type { McpServersSpec } from "./mcp";
 export { mcpDryRunItems } from "./mcp";

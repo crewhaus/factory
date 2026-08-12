@@ -146,12 +146,55 @@ export type {
   SpawnPlan,
   SpawnPlanInput,
 } from "./spawn-contracts";
-export type { ManagerSettings } from "./manager-settings";
+export type {
+  ManagerHook,
+  ManagerHookName,
+  ManagerHooks,
+  ManagerSettings,
+} from "./manager-settings";
 export {
+  DEFAULT_HOOK_TIMEOUT_MS,
+  MANAGER_HOOK_NAMES,
   MANAGER_SETTINGS_SEGMENTS,
+  parseManagerHook,
   readManagerBlock,
   readManagerSettings,
 } from "./manager-settings";
+
+export type { BundleFreshness } from "./bundle-freshness";
+export {
+  BUNDLE_MANIFEST_NAME,
+  BUNDLE_STAMP_KEY,
+  bundleFreshness,
+  hashSpecSource,
+} from "./bundle-freshness";
+
+export type {
+  CommandOutcome,
+  HookRunLog,
+  HookRunRecord,
+  PrepareDeps,
+  PrepareOutcome,
+  PrepareRefusal,
+  PrepareRunner,
+  PrepareRunnerOptions,
+  PrepareStage,
+  RunCommandInput,
+} from "./prepare";
+export {
+  bundleStaleness,
+  compileIfStale,
+  compileOutDir,
+  createPrepareRunner,
+  formatPrepareRefusal,
+  HOOK_OUTPUT_LINES,
+  hookLogPath,
+  readHookRunLog,
+  recordHookRun,
+  resolveHookCommand,
+  runManagerHook,
+  runPrepareCommand,
+} from "./prepare";
 export {
   BUNDLE_DIR_CANDIDATES,
   buildSpawnEnv,
@@ -210,6 +253,7 @@ export type { GateDecision, GateOptions, RunGateOptions } from "./gate";
 export {
   evaluateGate,
   formatGateRefusal,
+  harnessHookDisclosures,
   isUnforceable,
   runPreflightGate,
   UNFORCEABLE_AREAS,

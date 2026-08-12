@@ -11,6 +11,12 @@
  *   - **Preflight before every spawn.** A blocking finding refuses the
  *     spawn and returns the typed report; missing channel secrets can never
  *     be forced (the compiled daemon exits 2 on exactly that set).
+ *   - **Operator prep is part of the start, not a convention beside it.**
+ *     The optional `prepare` seam runs compile-if-stale and the harness's
+ *     own `postCompile` hook inside the start slot (so preflight sees the
+ *     bundle that will be spawned), and its `preSpawn` hook immediately
+ *     before the spawn. Either refusing stops the start exactly like a
+ *     blocking preflight finding, with the step's own output attached.
  *   - **Singleton daemons.** Two claims, because one is not enough: a
  *     `daemon.lock` (O_EXCL) is held from before preflight until the runfile
  *     exists, and the runfile itself is the claim from then on. A
@@ -51,6 +57,7 @@ import {
   createRestartWindow,
 } from "./policy";
 import { type PortLedger, runfilePortClaims } from "./ports";
+import type { PrepareRefusal, PrepareRunner } from "./prepare";
 import { type ProcessOps, type SpawnedProcess, argvFingerprint } from "./process-ops";
 import {
   acquireStartLock,
@@ -146,9 +153,25 @@ export type SupervisorEvent =
     };
 
 export type StartResult =
-  | { readonly ok: true; readonly runId: string; readonly pid: number | undefined }
+  | {
+      readonly ok: true;
+      readonly runId: string;
+      readonly pid: number | undefined;
+      /** What the prepare seams did on the way in ("recompiled dist/",
+       *  "preSpawn hook ok") — nothing to act on, but an operator who asked
+       *  for a recompile deserves to be told it happened. */
+      readonly prepared?: readonly string[];
+    }
   | { readonly ok: false; readonly reason: "already-running"; readonly runfile?: DaemonRunfile }
   | { readonly ok: false; readonly reason: "preflight-blocked"; readonly gate: GateDecision }
+  | {
+      /** A compile or an operator hook refused. Blocking exactly like a
+       *  preflight finding: a prep step that cannot run must not be waved
+       *  past into a spawn that misbehaves in a way nobody connects back. */
+      readonly ok: false;
+      readonly reason: "prepare-refused";
+      readonly refusal: PrepareRefusal;
+    }
   | {
       readonly ok: false;
       readonly reason: "plan-failed";
@@ -185,6 +208,17 @@ export type SupervisorOptions = {
   /** The preflight gate. Omit to skip preflight (tests, and the explicit
    *  `crewhaus daemon start --no-preflight` escape hatch). */
   readonly gate?: (options: GateOptions) => Promise<GateDecision>;
+  /**
+   * The prepare seams: compile-if-stale + the operator's hooks. Built fresh
+   * per start by the caller (`createPrepareRunner`), because the settings
+   * they read are edited between starts like the spec is.
+   *
+   * `prepare` runs after the start slot is claimed and BEFORE preflight, so
+   * preflight sees the bundle that will actually be spawned; `preSpawn` runs
+   * after preflight, immediately before the spawn. Either refusing stops the
+   * start with the step's own output attached.
+   */
+  readonly prepare?: () => PrepareRunner;
   readonly clock?: Clock;
   readonly managerVersion?: string;
   /** Built from the spawn env when omitted — every captured byte is
@@ -828,6 +862,33 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       currentKind = plan.kind;
       currentPorts = plan.ports;
 
+      const prepared: string[] = [];
+      const runner = options.prepare?.();
+      if (runner !== undefined) {
+        // Inside the start slot, so two managers cannot recompile the same
+        // bundle at once — a half-written `dist/` is exactly the state a
+        // spawn must never meet.
+        const outcome = await runner.prepare();
+        if (!outcome.ok) {
+          setState("stopped");
+          return { ok: false, reason: "prepare-refused", refusal: outcome.refusal };
+        }
+        prepared.push(...outcome.notes);
+        if (outcome.replan) {
+          // The bundle moved. Re-resolve it, or the spawn launches the entry
+          // that was resolved BEFORE the compile — the silent staleness the
+          // recompile was asked for to prevent, one level down.
+          try {
+            plan = await options.plan();
+          } catch (err) {
+            return { ok: false, reason: "plan-failed", stage: "plan", error: toError(err) };
+          }
+          currentPlan = plan;
+          currentKind = plan.kind;
+          currentPorts = plan.ports;
+        }
+      }
+
       if (options.gate !== undefined) {
         setState("preflight");
         const decision = await options.gate(gateOptions);
@@ -835,6 +896,18 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
           setState("stopped");
           return { ok: false, reason: "preflight-blocked", gate: decision };
         }
+      }
+
+      if (runner !== undefined) {
+        // LAST. Everything the operator's own step depends on — the fresh
+        // bundle, a passed preflight — is true by now, and nothing else
+        // happens between this and the spawn.
+        const outcome = await runner.preSpawn();
+        if (!outcome.ok) {
+          setState("stopped");
+          return { ok: false, reason: "prepare-refused", refusal: outcome.refusal };
+        }
+        prepared.push(...outcome.notes);
       }
 
       // Mint BEFORE announcing `starting`: the entry guard treats that state
@@ -934,7 +1007,12 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         // for the exit of the run it was made against, not the next one.
         operatorStop = false;
         setState("running");
-        return { ok: true, runId: id, pid };
+        return {
+          ok: true,
+          runId: id,
+          pid,
+          ...(prepared.length > 0 ? { prepared } : {}),
+        };
       } catch (err) {
         return abandonStart(id, child, ledgerOpened, err);
       }

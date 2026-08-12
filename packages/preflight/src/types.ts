@@ -22,7 +22,8 @@ export type PreflightArea =
   | "mcp"
   | "ports"
   | "bundle"
-  | "durability";
+  | "durability"
+  | "hooks";
 
 /**
  * Severity of one item.

@@ -14,6 +14,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   appendFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -23,6 +24,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Clock, ProcessOps, SpawnRequest, SpawnedProcess } from "@crewhaus/harness-supervisor";
+import { hashSpecSource } from "@crewhaus/harness-supervisor";
 import { runDaemonCommand } from "./daemon-cmd";
 
 // --- seams -----------------------------------------------------------------
@@ -371,6 +373,121 @@ describe("crewhaus daemon", () => {
         ["../.env", "shared", true],
         [".env", "harness", true],
       ]);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a preSpawn hook that fails REFUSES the start, quoting its own output", async () => {
+    const f = fixture();
+    try {
+      mkdirSync(join(f.dir, ".crewhaus"), { recursive: true });
+      writeFileSync(
+        join(f.dir, ".crewhaus", "settings.json"),
+        JSON.stringify({ manager: { hooks: { preSpawn: "./prep.sh" } } }),
+      );
+      // The fake ops answer every spawn with exit 0 by default, so make the
+      // hook the thing that fails: a command that cannot be launched.
+      const out = await runDaemonCommand(["start", "--no-preflight"], {
+        ...f.opts,
+        ops: {
+          ...f.ops,
+          spawn: (request) => {
+            if (request.argv[0] === join(f.dir, "prep.sh")) throw new Error("ENOENT");
+            return f.ops.spawn(request);
+          },
+        },
+      });
+      expect(out.exitCode).toBe(1);
+      const text = out.lines.join("\n");
+      expect(text).toContain("preSpawn refused the start");
+      expect(text).toContain("ENOENT");
+      // Refused means refused: no daemon, no runfile.
+      expect(existsSync(join(f.dir, ".crewhaus", "run", "daemon.json"))).toBe(false);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("--compile and --no-compile are mutually exclusive", async () => {
+    const f = fixture();
+    try {
+      await expect(
+        runDaemonCommand(["start", "--compile", "--no-compile"], f.opts),
+      ).rejects.toThrow(/mutually exclusive/);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("--compile on a bundle that is NOT stale compiles nothing", async () => {
+    const f = fixture();
+    try {
+      // A spec-hash stamp matching the spec ⇒ EXACTLY fresh. `--compile` is
+      // safe to leave on in a wrapper script precisely because of this.
+      writeFileSync(
+        join(f.dir, "dist", "package.json"),
+        JSON.stringify({
+          name: "crewhaus-compiled-bundle",
+          crewhaus: {
+            specHash: hashSpecSource(readFileSync(join(f.dir, "crewhaus.yaml"), "utf8")),
+            compiledWith: "0.5.2",
+          },
+        }),
+      );
+      const out = await runDaemonCommand(["start", "--compile", "--no-preflight"], f.opts);
+      expect(out.exitCode).toBe(0);
+      // One spawn: the daemon. A compile would have been a second.
+      expect(f.ops.children).toHaveLength(1);
+      expect(f.ops.children[0]?.request.argv[0]).toBe("bun");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("--no-compile beats manager.autoCompile on a stale bundle", async () => {
+    const f = fixture();
+    try {
+      mkdirSync(join(f.dir, ".crewhaus"), { recursive: true });
+      writeFileSync(
+        join(f.dir, ".crewhaus", "settings.json"),
+        JSON.stringify({ manager: { autoCompile: true } }),
+      );
+      // The fixture writes the bundle BEFORE the spec, so the mtime
+      // heuristic reads approximate-stale — exactly the case autoCompile
+      // fires on, and exactly the case --no-compile must suppress.
+      const out = await runDaemonCommand(["start", "--no-compile", "--no-preflight"], f.opts);
+      expect(out.exitCode).toBe(0);
+      expect(f.ops.children).toHaveLength(1);
+      expect(f.ops.children[0]?.request.argv[0]).toBe("bun");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("status names the prep contract: autoCompile, the hooks, and when each last ran", async () => {
+    const f = fixture();
+    try {
+      mkdirSync(join(f.dir, ".crewhaus"), { recursive: true });
+      writeFileSync(
+        join(f.dir, ".crewhaus", "settings.json"),
+        JSON.stringify({
+          manager: { autoCompile: true, hooks: { postCompile: "./patch.ts" } },
+        }),
+      );
+      const text = (await runDaemonCommand(["status"], f.opts)).lines.join("\n");
+      expect(text).toContain("prep (.crewhaus/settings.json → manager):");
+      expect(text).toContain("autoCompile: on");
+      expect(text).toContain("postCompile: `./patch.ts` · never run");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a harness with no prep configured grows no prep section", async () => {
+    const f = fixture();
+    try {
+      expect((await runDaemonCommand(["status"], f.opts)).lines.join("\n")).not.toContain("prep (");
     } finally {
       f.cleanup();
     }
