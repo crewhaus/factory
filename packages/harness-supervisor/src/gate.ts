@@ -20,6 +20,7 @@
 import type { PreflightItem, PreflightReport } from "@crewhaus/preflight";
 import { runPreflight } from "@crewhaus/preflight";
 import type { PortRequest } from "@crewhaus/preflight";
+import { type EnvFileRef, loadEnvChain } from "./spawn-contracts";
 
 /** Blocking items in these areas can never be waved through. */
 export const UNFORCEABLE_AREAS: ReadonlySet<string> = new Set(["channels"]);
@@ -76,6 +77,10 @@ export type RunGateOptions = GateOptions & {
   readonly harnessDir: string;
   /** The MERGED env the spawn will receive. */
   readonly env: Readonly<Record<string, string | undefined>>;
+  /** The chain `env` was merged from. Defaults to reading the harness's own
+   *  chain — including the shared files `manager.envFiles` declares — so the
+   *  report NAMES the files behind the env it just checked. */
+  readonly envFiles?: readonly EnvFileRef[];
   readonly compileWarnings?: readonly string[];
   readonly ports?: readonly PortRequest[];
   /** Seam for tests and for managers with their own preflight composition. */
@@ -88,6 +93,7 @@ export async function runPreflightGate(options: RunGateOptions): Promise<GateDec
   const report = await run({
     harnessDir: options.harnessDir,
     env: options.env,
+    envFiles: options.envFiles ?? loadEnvChain(options.harnessDir).refs,
     ...(options.compileWarnings !== undefined ? { compileWarnings: options.compileWarnings } : {}),
     ...(options.ports !== undefined ? { ports: options.ports } : {}),
   });

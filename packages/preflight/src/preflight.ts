@@ -3,8 +3,8 @@
  * injected environment and returns the typed report a manager renders
  * before spawning a harness process.
  *
- * Area order (and therefore item order): spec → credentials → channels →
- * mcp → ports → bundle → durability.
+ * Area order (and therefore item order): spec → env → credentials →
+ * channels → mcp → ports → bundle → durability.
  *
  * Classification stances, chosen to match what the spawn would actually do:
  *
@@ -33,6 +33,7 @@ import {
 import { channelItems, lowerSpecChannels } from "./channels";
 import { collectSpecModels, hasLiveProviderCredentials, modelCredentialItems } from "./credentials";
 import { durabilityItems } from "./durability";
+import { type EnvChainFile, envChainItems } from "./env-chain";
 import { type McpServersSpec, mcpDryRunItems } from "./mcp";
 import { type PortChecker, type PortRequest, checkPortFree, portItems } from "./ports";
 import {
@@ -60,6 +61,11 @@ export type RunPreflightOptions = {
   /** Extra ports to check (e.g. the allocator's chosen PORT and control
    *  port) beyond what the spec/env declare. */
   readonly ports?: readonly PortRequest[];
+  /** The resolved env-file chain `env` was merged from, lowest precedence
+   *  first. Supplied by the caller that performed the merge (this package
+   *  has no opinion about where a harness keeps env files); omitted, the
+   *  env area is simply empty. */
+  readonly envFiles?: readonly EnvChainFile[];
   /** Freshness comparator; defaults to the approximate mtime heuristic.
    *  Swap in a spec-hash comparator once bundle manifests record one. */
   readonly freshness?: FreshnessComparator;
@@ -171,6 +177,11 @@ export async function runPreflight(opts: RunPreflightOptions): Promise<Preflight
   items.push(...specAreaItems(specYaml, readError, opts.compileWarnings ?? []));
 
   const spec = specYaml !== undefined ? tolerantParse(specYaml) : undefined;
+
+  // env chain — WHICH files the injected `env` was merged from. Before the
+  // credentials area, because "the key is missing" and "the file that holds
+  // the key is missing" read very differently in that order.
+  items.push(...envChainItems(opts.envFiles ?? []));
 
   // credentials
   const models = collectSpecModels(spec);

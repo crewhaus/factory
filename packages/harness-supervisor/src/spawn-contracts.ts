@@ -32,6 +32,7 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { readManagerSettings } from "./manager-settings";
 import type { EnvOverride, RunClass, RunKind } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -220,30 +221,95 @@ export function parseEnvText(text: string): Record<string, string> {
   return out;
 }
 
-/** The harness env-file chain, in precedence order (later wins). */
+/** The harness-LOCAL env-file chain, in precedence order (later wins). */
 export const ENV_FILENAMES = [".env", ".env.local"] as const;
+
+/** One file in the chain, whether or not it exists. */
+export type EnvFileRef = {
+  /** As declared: a chain filename (`.env`) or a `manager.envFiles` entry
+   *  (`../.env`) verbatim. This is what an operator recognizes. */
+  readonly declaredAs: string;
+  /** Resolved absolute path — what was actually read. */
+  readonly path: string;
+  /** `shared` files come from `manager.envFiles` and load UNDER the local
+   *  chain; `harness` files are `<harness>/.env{,.local}`. */
+  readonly scope: "shared" | "harness";
+  /** False for a declared file that is absent or unreadable. A declared
+   *  file that is not there is REPORTED, never silently skipped: that is
+   *  the whole failure mode of the `.env → ../.env` symlink it replaces. */
+  readonly present: boolean;
+};
 
 export type EnvChain = {
   readonly vars: Record<string, string>;
-  /** Chain files that existed, in read order. */
+  /** Files that existed, in read order, named as declared. */
   readonly files: readonly string[];
+  /** Every file in the chain including declared-but-absent ones, in read
+   *  order — the merged-spawn-env story a manager can render. */
+  readonly refs: readonly EnvFileRef[];
 };
 
-/** Read `<harness>/.env` then `<harness>/.env.local`. */
-export function loadEnvChain(harnessRoot: string): EnvChain {
+export type LoadEnvChainOptions = {
+  /** Shared files to load UNDER the harness-local chain, in order. Defaults
+   *  to `manager.envFiles` from `<harness>/.crewhaus/settings.json`; pass
+   *  `[]` to read the harness-local chain alone. */
+  readonly sharedFiles?: readonly string[];
+};
+
+/**
+ * Read the env chain a spawn from this harness sees, LOWEST precedence
+ * first: every declared shared file (`manager.envFiles`), then
+ * `<harness>/.env`, then `<harness>/.env.local`.
+ *
+ * Shared files exist for the fleet case: sibling harnesses that share one
+ * Anthropic key, one search provider, one set of opt-ins. Before this the
+ * only way to do that was a `.env → ../.env` symlink per member — which
+ * works (readFile follows it) but is invisible convention: `harness show`
+ * and preflight reported the chain as if it were local, a copied harness
+ * silently carried a dangling symlink, and Windows symlinks are their own
+ * adventure. A declaration is visible to the tooling, travels with the
+ * harness, and degrades to a REPORTED absence rather than a silent one.
+ *
+ * Precedence is unchanged by all of this: shared < harness-local <
+ * `process.env` < caller extras (see {@link buildSpawnEnv}).
+ *
+ * A shared entry is resolved against the harness ROOT when relative, and
+ * taken verbatim when absolute. No `~` expansion and no shell — the string
+ * is a path, not a command. The harness directory is already the trust
+ * boundary for supervision (`run.sh` and `.crewhaus/settings.json` both
+ * live there), so an entry may point outside the harness — which is the
+ * point, `../.env` is the motivating case — and every entry is reported so
+ * "what does this daemon actually read" is answerable without guessing.
+ */
+export function loadEnvChain(harnessRoot: string, options: LoadEnvChainOptions = {}): EnvChain {
   const vars: Record<string, string> = {};
   const files: string[] = [];
-  for (const name of ENV_FILENAMES) {
-    const path = join(harnessRoot, name);
-    if (!existsSync(path)) continue;
+  const refs: EnvFileRef[] = [];
+
+  const read = (declaredAs: string, path: string, scope: EnvFileRef["scope"]): void => {
+    if (!existsSync(path)) {
+      // A shared file is DECLARED, so its absence is a fact worth carrying.
+      // A local chain file is optional by construction — most harnesses have
+      // no `.env.local` — so an absent one is simply not part of the chain.
+      if (scope === "shared") refs.push({ declaredAs, path, scope, present: false });
+      return;
+    }
     try {
       Object.assign(vars, parseEnvText(readFileSync(path, "utf8")));
-      files.push(name);
+      files.push(declaredAs);
+      refs.push({ declaredAs, path, scope, present: true });
     } catch {
       // Unreadable env file — presence degrades, never throws.
+      refs.push({ declaredAs, path, scope, present: false });
     }
+  };
+
+  const shared = options.sharedFiles ?? readManagerSettings(harnessRoot).envFiles;
+  for (const declared of shared) {
+    read(declared, isAbsolute(declared) ? declared : resolve(harnessRoot, declared), "shared");
   }
-  return { vars, files };
+  for (const name of ENV_FILENAMES) read(name, join(harnessRoot, name), "harness");
+  return { vars, files, refs };
 }
 
 /** Variables whose value relocates a harness data root. Reported so the UI
@@ -269,6 +335,8 @@ export type SpawnEnvInput = {
 export type SpawnEnv = {
   readonly env: Record<string, string>;
   readonly envFiles: readonly string[];
+  /** The full chain including declared-but-absent shared files. */
+  readonly envFileRefs: readonly EnvFileRef[];
   readonly overrides: readonly EnvOverride[];
 };
 
@@ -301,7 +369,7 @@ export function buildSpawnEnv(input: SpawnEnvInput): SpawnEnv {
           : "env-file";
     overrides.push({ name, value, source });
   }
-  return { env, envFiles: chain.files, overrides };
+  return { env, envFiles: chain.files, envFileRefs: chain.refs, overrides };
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +449,9 @@ export type SpawnPlan = {
   readonly cwd: string;
   readonly env: Record<string, string>;
   readonly envFiles: readonly string[];
+  /** The full chain including declared-but-absent shared files, so a manager
+   *  can render the merged-spawn-env story rather than a bare filename list. */
+  readonly envFileRefs: readonly EnvFileRef[];
   readonly overrides: readonly EnvOverride[];
   readonly detached: boolean;
   /** `pipe` for attached runs, `file` for detached daemons. */
@@ -441,7 +512,7 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
   if (input.controlToken !== undefined && input.controlToken !== "") {
     extra["CREWHAUS_CONTROL_TOKEN"] = input.controlToken;
   }
-  const { env, envFiles, overrides } = buildSpawnEnv({
+  const { env, envFiles, envFileRefs, overrides } = buildSpawnEnv({
     harnessRoot,
     processEnv: input.processEnv,
     ...(input.envChain !== undefined ? { envChain: input.envChain } : {}),
@@ -454,6 +525,7 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
     cwd: harnessRoot,
     env,
     envFiles,
+    envFileRefs,
     overrides,
     supervised: isSupervisedClass(runClass),
     ports: input.ports ?? {},

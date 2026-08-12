@@ -6,9 +6,7 @@
  * (2) reporting KEY presence booleans. Raw values never leave the server —
  * no route serializes them, and the masking tests enforce that byte-level.
  */
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { buildSpawnEnv } from "@crewhaus/harness-supervisor";
+import { type EnvFileRef, buildSpawnEnv, loadEnvChain } from "@crewhaus/harness-supervisor";
 
 const ENV_LINE_RE = /^(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(.*)$/;
 
@@ -36,31 +34,26 @@ export function parseEnvText(text: string): Record<string, string> {
   return out;
 }
 
-/** The harness env-file chain, in precedence order (later wins). */
-const ENV_FILENAMES = [".env", ".env.local"] as const;
-
 export type HarnessEnvFiles = {
   /** Folded key → value map across the chain (later files win). */
   readonly vars: Record<string, string>;
-  /** Which chain files actually existed, in read order. */
+  /** Which chain files actually existed, in read order, named as declared. */
   readonly files: readonly string[];
+  /** Every file in the chain including declared-but-absent shared ones. */
+  readonly refs: readonly EnvFileRef[];
 };
 
-/** Read the harness's own env-file chain from its root dir. */
+/**
+ * Read the env-file chain this harness resolves — the shared files
+ * `manager.envFiles` declares, then `<harness>/.env`, then `.env.local`.
+ *
+ * Delegates to `loadEnvChain` rather than walking the two local filenames
+ * itself: a console that only looked at the harness-local pair reported
+ * "not set" for every key a fleet keeps in its shared file, while the daemon
+ * started from that same directory had them the whole time.
+ */
 export function readHarnessEnvFiles(harnessDir: string): HarnessEnvFiles {
-  const vars: Record<string, string> = {};
-  const files: string[] = [];
-  for (const name of ENV_FILENAMES) {
-    const path = join(harnessDir, name);
-    if (!existsSync(path)) continue;
-    try {
-      Object.assign(vars, parseEnvText(readFileSync(path, "utf8")));
-      files.push(name);
-    } catch {
-      // unreadable env file — presence checks degrade, never throw
-    }
-  }
-  return { vars, files };
+  return loadEnvChain(harnessDir);
 }
 
 /**
@@ -80,7 +73,14 @@ export function readHarnessEnvFiles(harnessDir: string): HarnessEnvFiles {
 export function mergedSpawnEnv(
   baseEnv: Readonly<Record<string, string | undefined>>,
   harnessDir: string,
-): { env: Record<string, string | undefined>; envFiles: readonly string[] } {
-  const { env, envFiles } = buildSpawnEnv({ harnessRoot: harnessDir, processEnv: baseEnv });
-  return { env, envFiles };
+): {
+  env: Record<string, string | undefined>;
+  envFiles: readonly string[];
+  envFileRefs: readonly EnvFileRef[];
+} {
+  const { env, envFiles, envFileRefs } = buildSpawnEnv({
+    harnessRoot: harnessDir,
+    processEnv: baseEnv,
+  });
+  return { env, envFiles, envFileRefs };
 }

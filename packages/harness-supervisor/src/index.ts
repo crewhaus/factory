@@ -138,12 +138,20 @@ export type {
   BinResolverDeps,
   BundleLocation,
   EnvChain,
+  EnvFileRef,
+  LoadEnvChainOptions,
   RunOptions,
   SpawnEnv,
   SpawnEnvInput,
   SpawnPlan,
   SpawnPlanInput,
 } from "./spawn-contracts";
+export type { ManagerSettings } from "./manager-settings";
+export {
+  MANAGER_SETTINGS_SEGMENTS,
+  readManagerBlock,
+  readManagerSettings,
+} from "./manager-settings";
 export {
   BUNDLE_DIR_CANDIDATES,
   buildSpawnEnv,
