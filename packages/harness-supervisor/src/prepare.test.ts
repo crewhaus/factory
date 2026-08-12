@@ -11,7 +11,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { hashSpecSource } from "./bundle-freshness";
 import { readManagerSettings } from "./manager-settings";
 import {
@@ -248,13 +248,17 @@ describe("compileIfStale", () => {
 
 describe("resolveHookCommand", () => {
   test("path-shaped declarations resolve against the harness root", () => {
-    expect(resolveHookCommand("/h", "./prep.sh")).toBe("/h/prep.sh");
-    expect(resolveHookCommand("/h/x", "../prep.sh")).toBe("/h/prep.sh");
-    expect(resolveHookCommand("/h", "/opt/prep.sh")).toBe("/opt/prep.sh");
+    // `resolve`, not string paths: on Windows these become `D:\h\prep.sh`,
+    // and hardcoding POSIX separators would test the test.
+    const root = resolve("/h");
+    expect(resolveHookCommand(root, "./prep.sh")).toBe(join(root, "prep.sh"));
+    expect(resolveHookCommand(join(root, "x"), "../prep.sh")).toBe(join(root, "prep.sh"));
+    const absolute = resolve("/opt/prep.sh");
+    expect(resolveHookCommand(root, absolute)).toBe(absolute);
   });
 
   test("a bare name is left for the OS to resolve on PATH", () => {
-    expect(resolveHookCommand("/h", "make")).toBe("make");
+    expect(resolveHookCommand(resolve("/h"), "make")).toBe("make");
   });
 });
 
