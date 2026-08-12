@@ -91,6 +91,10 @@ export class McpClient {
   /** Which HTTP wire this endpoint turned out to speak, once one handshake
    *  has succeeded — so reconnects skip the probe (#394). */
   private httpWire: HttpMcpWire | undefined;
+  /** True while walking the HTTP wire candidates. A candidate failing is the
+   *  EXPECTED way the other wire is discovered, so its close must not arm the
+   *  reconnect ladder (#394). */
+  private probing = false;
   private readonly connectTimeoutMs: number;
   private readonly callTimeoutMs: number;
   private readonly setTimer: (cb: () => void, ms: number) => unknown;
@@ -158,9 +162,13 @@ export class McpClient {
 
     const candidates = this.transportCandidates();
     let lastError: unknown;
+    // While probing, a candidate's close must not schedule anything: the
+    // whole point is that failures here are EXPECTED.
+    this.probing = candidates.length > 1;
     for (const candidate of candidates) {
       try {
         await this.connectWith(candidate.build(), attempt);
+        this.probing = false;
         if (candidate.wire !== undefined && this.httpWire === undefined) {
           this.httpWire = candidate.wire;
           this.logger?.debug("mcp.http-wire", { server: this.name, wire: candidate.wire });
@@ -174,6 +182,7 @@ export class McpClient {
         // the same message this client has always produced.
       }
     }
+    this.probing = false;
     throw lastError;
   }
 
@@ -206,7 +215,7 @@ export class McpClient {
     });
 
     transport.onclose = () => {
-      this.handleTransportClose();
+      this.handleTransportClose(transport);
     };
 
     // Loop contract 0.4 (Batch G, G74) — subscribe to the server's
@@ -259,6 +268,13 @@ export class McpClient {
     this.transport = transport;
     this.state = { kind: "connected" };
     this.reconnectAttempt = 0;
+    // A timer armed before this handshake landed (a probe candidate's close
+    // racing the candidate that succeeded) would reconnect a healthy client
+    // and orphan this very transport. Cancel it.
+    if (this.reconnectTimer !== null) {
+      this.clearTimer(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     const deferred = this.connectedDeferred;
     this.connectedDeferred = createDeferred();
     void this.connectedDeferred.promise.catch(() => undefined);
@@ -271,7 +287,23 @@ export class McpClient {
    * deliberately we're in `closed` state and do nothing. Otherwise we drop
    * to `disconnected` and schedule a reconnect.
    */
-  private handleTransportClose(): void {
+  /**
+   * A transport closed. Only the CURRENT one may drive the reconnect ladder.
+   *
+   * The guard is not defensive dressing (#394): the SDK's own
+   * `Client.connect` catch calls `void this.close()` on a failed handshake,
+   * which fires `onclose` BEFORE our catch can detach it — so on the
+   * `transport: "sse"` probe path, the first candidate failing (the normal
+   * way a legacy HTTP+SSE peer is discovered) armed a reconnect timer that
+   * then raced the candidate about to succeed. The result was a healthy
+   * connection spontaneously reconnecting, each phantom attempt orphaning a
+   * live stream and a server-side session.
+   */
+  private handleTransportClose(closed?: McpClientLikeTransport): void {
+    // A close from a transport we have already replaced — or from a probe
+    // candidate we never adopted — says nothing about the live connection.
+    if (closed !== undefined && this.transport !== null && closed !== this.transport) return;
+    if (this.probing && (closed === undefined || closed !== this.transport)) return;
     if (this.state.kind === "closed") return;
     this.logger?.warn("mcp.transport_closed", { server: this.name });
     this.sdk = null;

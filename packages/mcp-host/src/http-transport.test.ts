@@ -17,7 +17,9 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 import { McpClient, httpTransportCandidates } from "./client";
@@ -138,4 +140,63 @@ describe("the probe does not change the other paths", () => {
     clients.push(client);
     await expect(client.connect()).rejects.toThrow(/mcp connect to "peer" failed|timed out/);
   }, 20_000);
+});
+
+describe("falling back to a LEGACY server leaves no phantom reconnects", () => {
+  test("a probe candidate's failure arms no reconnect timer, and opens one stream", async () => {
+    // The SDK's own `Client.connect` catch calls `void this.close()` on a
+    // failed handshake, firing `onclose` BEFORE this client can detach it —
+    // so the first candidate failing (the NORMAL way a legacy peer is
+    // discovered) used to arm reconnect timers that raced the candidate about
+    // to succeed. Each phantom attempt orphaned a live stream and a
+    // server-side session on a connection that was perfectly healthy.
+    const server = new McpServer({ name: "legacy", version: "0.0.0" });
+    server.tool("chat", { message: z.string() }, async ({ message }) => ({
+      content: [{ type: "text" as const, text: `echo:${message}` }],
+    }));
+    let streams = 0;
+    let sse: SSEServerTransport | undefined;
+    const http = createServer(async (req, res) => {
+      const url = new URL(req.url ?? "/", "http://localhost");
+      if (req.method === "GET" && url.pathname === "/mcp") {
+        streams += 1;
+        sse = new SSEServerTransport("/messages", res);
+        await server.connect(sse);
+        return;
+      }
+      if (req.method === "POST" && url.pathname.startsWith("/messages")) {
+        await sse?.handlePostMessage(req, res);
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((r) => http.listen(0, "127.0.0.1", () => r()));
+    const port = (http.address() as { port: number }).port;
+
+    let armed = 0;
+    const client = new McpClient(
+      "peer",
+      { transport: "sse", url: `http://127.0.0.1:${port}/mcp` },
+      {
+        connectTimeoutMs: 8_000,
+        setTimer: (cb, ms) => {
+          armed += 1;
+          return setTimeout(cb, ms);
+        },
+        clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+      },
+    );
+    clients.push(client);
+    try {
+      await client.connect();
+      expect((await client.listTools()).map((t) => t.name)).toEqual(["chat"]);
+      // Long enough for a phantom timer (backoff starts under a second) to
+      // have fired and opened a second stream.
+      await new Promise((r) => setTimeout(r, 2_500));
+      expect(`timers:${armed}`).toBe("timers:0");
+      expect(`streams:${streams}`).toBe("streams:1");
+    } finally {
+      http.close();
+    }
+  }, 30_000);
 });
