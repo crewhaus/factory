@@ -197,6 +197,23 @@ describe("harness show", () => {
     expect(json.envFiles.map((r) => r.declaredAs)).toEqual(["../.env", ".env"]);
   });
 
+  test("names the operator hooks a supervised start will run", async () => {
+    const dir = seedHarness("alpha");
+    mkdirSync(join(dir, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(dir, ".crewhaus", "settings.json"),
+      JSON.stringify({ manager: { hooks: { preSpawn: "./prep.sh" } } }),
+    );
+    await run(["add", dir]);
+    const text = (await run(["show", dir])).lines.join("\n");
+    expect(text).toContain("hook preSpawn: `./prep.sh` · never run");
+
+    const json = JSON.parse((await run(["show", dir, "--json"])).lines.join("\n")) as {
+      hooks: Array<{ name: string; declaredAs: string }>;
+    };
+    expect(json.hooks).toEqual([{ name: "preSpawn", declaredAs: "./prep.sh" }]);
+  });
+
   test("a harness with no env files grows no env section", async () => {
     const dir = seedHarness("alpha");
     await run(["add", dir]);
@@ -391,6 +408,19 @@ describe("harness preflight", () => {
     const out = await run(["preflight", dir]);
     expect(out.exitCode).toBe(0);
     expect(out.lines.join("\n")).toMatch(/⚠ shared env file "\.\.\/\.env" is declared/);
+  });
+
+  test("discloses the operator hooks the spawn will run", async () => {
+    const dir = seedHarness("alpha");
+    env["ANTHROPIC_API_KEY"] = "unit-test-credential";
+    mkdirSync(join(dir, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(dir, ".crewhaus", "settings.json"),
+      JSON.stringify({ manager: { hooks: { preSpawn: ["bun", "run", "prep.ts"] } } }),
+    );
+    const out = await run(["preflight", dir]);
+    expect(out.exitCode).toBe(0);
+    expect(out.lines.join("\n")).toContain("preSpawn hook will run: `bun run prep.ts`");
   });
 
   test("an unregistered key that is not a directory throws", () => {

@@ -6,6 +6,7 @@ import { EXIT_CODES } from "@crewhaus/errors";
 import { buildReport } from "@crewhaus/preflight";
 import type { GateDecision } from "./gate";
 import { createPortLedger } from "./ports";
+import type { PrepareOutcome, PrepareRunner } from "./prepare";
 import type { ProcessOps } from "./process-ops";
 import {
   acquireStartLock,
@@ -77,6 +78,8 @@ type SetupOptions = {
   /** The manager pid recorded in the start lock. */
   ownerPid?: number;
   newRunId?: () => string;
+  /** The prepare seams (compile-if-stale + operator hooks). */
+  prepare?: () => PrepareRunner;
 };
 
 function setup(target: string, options: SetupOptions = {}): Harness {
@@ -105,6 +108,7 @@ function setup(target: string, options: SetupOptions = {}): Harness {
     ...(options.maxRestarts !== undefined ? { maxRestarts: options.maxRestarts } : {}),
     ...(options.ports !== undefined ? { ports: options.ports } : {}),
     ...(options.ownerPid !== undefined ? { ownerPid: options.ownerPid } : {}),
+    ...(options.prepare !== undefined ? { prepare: options.prepare } : {}),
   });
   const events: SupervisorEvent[] = [];
   supervisor.subscribe((event) => events.push(event));
@@ -268,6 +272,115 @@ describe("start", () => {
     expect(result.reason).toBe("plan-failed");
     expect(ops.children).toHaveLength(0);
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("a refused prepare step stops the start — nothing is spawned, no runfile", async () => {
+    const refuse = async (): Promise<PrepareOutcome> => ({
+      ok: false,
+      refusal: { stage: "postCompile", message: "patch.ts exited 3", exitCode: 3, output: ["no"] },
+    });
+    const h = setup("channel", {
+      prepare: () => ({
+        prepare: refuse,
+        preSpawn: async () => ({ ok: true, replan: false, notes: [] }),
+        configured: { compile: false, hooks: ["postCompile"] },
+      }),
+    });
+    const result = await h.supervisor.start();
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.reason).toBe("prepare-refused");
+    expect(h.ops.children).toHaveLength(0);
+    expect(readRunfile(h.dir)).toBeUndefined();
+    // The slot is free again: a refused prep must not wedge the harness shut.
+    expect(readStartLock(h.dir)).toBeUndefined();
+    expect(h.supervisor.snapshot().state).toBe("stopped");
+  });
+
+  test("a refused preSpawn hook stops the start AFTER preflight passed", async () => {
+    const gateCalls: number[] = [];
+    const h = setup("channel", {
+      gate: async () => {
+        gateCalls.push(1);
+        return allowGate();
+      },
+      prepare: () => ({
+        prepare: async () => ({ ok: true, replan: false, notes: [] }),
+        preSpawn: async () => ({
+          ok: false,
+          refusal: { stage: "preSpawn", message: "warm.ts exited 1", output: [] },
+        }),
+        configured: { compile: false, hooks: ["preSpawn"] },
+      }),
+    });
+    const result = await h.supervisor.start();
+    expect(result.ok).toBe(false);
+    // Preflight DID run: preSpawn is the last gate, not a replacement.
+    expect(gateCalls).toHaveLength(1);
+    expect(h.ops.children).toHaveLength(0);
+  });
+
+  test("prepare runs BEFORE preflight, so preflight sees the fresh bundle", async () => {
+    const order: string[] = [];
+    const h = setup("channel", {
+      gate: async () => {
+        order.push("gate");
+        return allowGate();
+      },
+      prepare: () => ({
+        prepare: async () => {
+          order.push("prepare");
+          return { ok: true, replan: false, notes: ["recompiled dist/"] };
+        },
+        preSpawn: async () => {
+          order.push("preSpawn");
+          return { ok: true, replan: false, notes: [] };
+        },
+        configured: { compile: true, hooks: ["preSpawn"] },
+      }),
+    });
+    const result = await h.supervisor.start();
+    expect(order).toEqual(["prepare", "gate", "preSpawn"]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(result.prepared).toEqual(["recompiled dist/"]);
+  });
+
+  test("`replan` rebuilds the plan, so the spawn launches the RECOMPILED entry", async () => {
+    // The whole point of the recompile: without the rebuild the spawn uses
+    // the entry resolved before the compile — silent staleness one level
+    // down from the one `--compile` exists to end.
+    const dir = tempHarness("channel");
+    const clock = createFakeClock();
+    const ops = createFakeProcessOps({ now: clock.now });
+    let planCalls = 0;
+    const supervisor = createHarnessSupervisor({
+      harnessDir: dir,
+      target: "channel",
+      ops,
+      clock,
+      gate: allowGate,
+      plan: () => {
+        planCalls += 1;
+        return buildSpawnPlan({
+          harnessDir: dir,
+          target: "channel",
+          processEnv: { PLAN_CALL: String(planCalls) },
+        });
+      },
+      prepare: () => ({
+        prepare: async () => ({ ok: true, replan: true, notes: [] }),
+        preSpawn: async () => ({ ok: true, replan: false, notes: [] }),
+        configured: { compile: true, hooks: [] },
+      }),
+    });
+    try {
+      await supervisor.start();
+      expect(planCalls).toBe(2);
+      expect(ops.last()?.request.env["PLAN_CALL"]).toBe("2");
+    } finally {
+      supervisor.close();
+    }
   });
 
   test("the port ledger records the run's ports and releases them on exit", async () => {

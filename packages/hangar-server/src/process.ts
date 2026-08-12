@@ -64,14 +64,17 @@ import {
   createHarnessSupervisor,
   createJobQueue,
   createPortLedger,
+  createPrepareRunner,
   createProcessOps,
   ensureRunDir,
   isReadOnlyJob,
   processOpsChild,
+  readManagerSettings,
   readRunfile,
   resolveCrewhausBin,
   runClassFor,
   runLogPath,
+  runManagerHook,
   runPreflightGate,
   systemClock,
   writeRunfile,
@@ -261,7 +264,32 @@ export function defaultJobRunner(
     // the orphan M4 exists to stop, reintroduced through the console path.
     ctx.register(processOpsChild(ops, child.pid));
     const { code } = await child.exited;
-    return { exitCode: code ?? 1 };
+    if (code !== 0 || job.kind !== "compile") return { exitCode: code ?? 1 };
+
+    // A manager-initiated compile replaces the bundle, which SILENTLY
+    // discarded whatever the operator's post-compile step had patched into
+    // it — the reason fleets had a "never use console compile jobs" rule.
+    // Running the harness's own `postCompile` hook here closes that: the
+    // console's compile and `daemon start --compile` leave the same bundle.
+    const outcome = await runManagerHook(
+      "postCompile",
+      readManagerSettings(job.harnessDir).hooks.postCompile,
+      {
+        harnessDir: job.harnessDir,
+        target: liveTarget(job.harnessDir) ?? "cli",
+        ops,
+        env: mergedSpawnEnv(process.env, job.harnessDir).env as Record<string, string>,
+        crewhausBin: bin,
+      },
+      readManagerSettings(job.harnessDir).hooks.timeoutMs,
+    );
+    if (outcome.ok) return { exitCode: 0 };
+    // The compile itself succeeded; the job did not. Reporting 0 here would
+    // leave a bundle nobody patched behind a green job row.
+    return {
+      exitCode: outcome.refusal.exitCode ?? 1,
+      error: [outcome.refusal.message, ...outcome.refusal.output].join("\n"),
+    };
   };
 }
 
@@ -310,6 +338,20 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
       ports,
       managerVersion: options.managerVersion,
       plan,
+      // The SAME prep the terminal head runs, built per start because
+      // `.crewhaus/settings.json` is edited between starts like the spec is.
+      // Without this the console's Restart button rebuilt the spawn plan and
+      // skipped operator prep entirely — the asymmetry that made "never use
+      // console compile jobs" a rule fleets had to remember.
+      prepare: () =>
+        createPrepareRunner({
+          harnessDir,
+          target,
+          ops,
+          env: mergedSpawnEnv(options.env, harnessDir).env as Record<string, string>,
+          crewhausBin: resolveCrewhausBin(harnessDir),
+          clock,
+        }),
       ...(options.pumpIntervalMs !== undefined ? { pumpIntervalMs: options.pumpIntervalMs } : {}),
       ...(options.noPreflight === true
         ? {}
