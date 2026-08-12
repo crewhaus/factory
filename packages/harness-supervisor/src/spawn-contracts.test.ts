@@ -176,6 +176,100 @@ describe("the env chain", () => {
   });
 });
 
+describe("shared fleet env files (manager.envFiles)", () => {
+  /** A harness inside a fleet dir that holds the shared `.env`. */
+  function fleetHarness(options: {
+    shared?: string;
+    local?: string;
+    declare?: readonly string[];
+  }): { fleet: string; dir: string } {
+    const fleet = mkdtempSync(join(tmpdir(), "chsup-fleet-"));
+    roots.push(fleet);
+    const dir = join(fleet, "member");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "crewhaus.yaml"), "name: member\ntarget: channel\n");
+    if (options.shared !== undefined) writeFileSync(join(fleet, ".env"), options.shared);
+    if (options.local !== undefined) writeFileSync(join(dir, ".env"), options.local);
+    if (options.declare !== undefined) {
+      mkdirSync(join(dir, ".crewhaus"), { recursive: true });
+      writeFileSync(
+        join(dir, ".crewhaus", "settings.json"),
+        JSON.stringify({ manager: { envFiles: options.declare } }),
+      );
+    }
+    return { fleet, dir };
+  }
+
+  test("a declared shared file loads UNDER the harness-local chain", () => {
+    const { dir } = fleetHarness({
+      shared: "ANTHROPIC_API_KEY=fleet-key\nSHARED_ONLY=yes\nBOTH=shared\n",
+      local: "BOTH=local\n",
+      declare: ["../.env"],
+    });
+    const chain = loadEnvChain(dir);
+    expect(chain.vars).toEqual({
+      ANTHROPIC_API_KEY: "fleet-key",
+      SHARED_ONLY: "yes",
+      BOTH: "local",
+    });
+    expect(chain.files).toEqual(["../.env", ".env"]);
+  });
+
+  test("the full chain is reported, shared entries resolved to absolute paths", () => {
+    const { fleet, dir } = fleetHarness({ shared: "A=1\n", declare: ["../.env"] });
+    expect(loadEnvChain(dir).refs).toEqual([
+      { declaredAs: "../.env", path: join(fleet, ".env"), scope: "shared", present: true },
+    ]);
+  });
+
+  test("a declared-but-absent shared file is REPORTED, not silently skipped", () => {
+    const { fleet, dir } = fleetHarness({ declare: ["../.env"] });
+    const chain = loadEnvChain(dir);
+    expect(chain.vars).toEqual({});
+    expect(chain.files).toEqual([]);
+    expect(chain.refs).toEqual([
+      { declaredAs: "../.env", path: join(fleet, ".env"), scope: "shared", present: false },
+    ]);
+  });
+
+  test("absolute declarations are taken verbatim; relative ones resolve against the root", () => {
+    const { fleet, dir } = fleetHarness({ shared: "A=abs\n" });
+    const chain = loadEnvChain(dir, { sharedFiles: [join(fleet, ".env")] });
+    expect(chain.vars).toEqual({ A: "abs" });
+    expect(chain.refs[0]?.path).toBe(join(fleet, ".env"));
+  });
+
+  test("declaration order is precedence order among shared files", () => {
+    const { fleet, dir } = fleetHarness({});
+    writeFileSync(join(fleet, "base.env"), "K=base\nONLY_BASE=b\n");
+    writeFileSync(join(fleet, "over.env"), "K=over\n");
+    const chain = loadEnvChain(dir, { sharedFiles: ["../base.env", "../over.env"] });
+    expect(chain.vars).toEqual({ K: "over", ONLY_BASE: "b" });
+  });
+
+  test("`sharedFiles: []` reads the harness-local chain alone", () => {
+    const { dir } = fleetHarness({ shared: "A=1\n", declare: ["../.env"] });
+    expect(loadEnvChain(dir, { sharedFiles: [] }).vars).toEqual({});
+  });
+
+  test("the shared file reaches the SPAWN env, still under process.env", () => {
+    const { dir } = fleetHarness({
+      shared: "ANTHROPIC_API_KEY=fleet-key\nOVERRIDDEN=file\n",
+      declare: ["../.env"],
+    });
+    const plan = buildSpawnPlan({
+      harnessDir: dir,
+      target: "channel",
+      processEnv: { OVERRIDDEN: "process" },
+      bundle: { bundleDir: dir, entry: "daemon.ts", entryPath: join(dir, "daemon.ts") },
+    });
+    expect(plan.env["ANTHROPIC_API_KEY"]).toBe("fleet-key");
+    expect(plan.env["OVERRIDDEN"]).toBe("process");
+    expect(plan.envFiles).toEqual(["../.env"]);
+    expect(plan.envFileRefs.map((r) => r.scope)).toEqual(["shared"]);
+  });
+});
+
 describe("buildSpawnPlan", () => {
   test("cli with a resolvable CLI takes the interpreter path and CAN resume", () => {
     const dir = tempHarness({ bundle: "agent.ts" });

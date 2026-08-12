@@ -175,6 +175,34 @@ describe("harness show", () => {
     expect(json.health?.evalHealthy).toBe(true);
   });
 
+  test("names the env files the harness reads, shared ones with their resolved path", async () => {
+    const dir = seedHarness("fleet/member", "member");
+    writeFileSync(join(root, "fleet", ".env"), "SHARED=1\n");
+    writeFileSync(join(dir, ".env"), "LOCAL=1\n");
+    mkdirSync(join(dir, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(dir, ".crewhaus", "settings.json"),
+      JSON.stringify({ manager: { envFiles: ["../.env"] } }),
+    );
+    await run(["add", dir]);
+    const text = (await run(["show", dir])).lines.join("\n");
+    expect(text).toContain("env files (lowest precedence first");
+    expect(text).toContain(`../.env → ${join(root, "fleet", ".env")}  [shared]`);
+    // The file list, never a value.
+    expect(text).not.toContain("SHARED=1");
+
+    const json = JSON.parse((await run(["show", dir, "--json"])).lines.join("\n")) as {
+      envFiles: Array<{ declaredAs: string; scope: string }>;
+    };
+    expect(json.envFiles.map((r) => r.declaredAs)).toEqual(["../.env", ".env"]);
+  });
+
+  test("a harness with no env files grows no env section", async () => {
+    const dir = seedHarness("alpha");
+    await run(["add", dir]);
+    expect((await run(["show", dir])).lines.join("\n")).not.toContain("env files (");
+  });
+
   test("a missing-dir entry shows without inventory/health", async () => {
     const dir = seedHarness("gone", "gone");
     await run(["add", dir]);
@@ -326,6 +354,43 @@ describe("harness preflight", () => {
     };
     expect(json.ok).toBe(true);
     expect(json.blocking).toHaveLength(0);
+  });
+
+  test("checks the MERGED spawn env: a credential in the harness .env satisfies it", async () => {
+    // The verb used to check `process.env` alone, so a key the daemon reads
+    // from `.env` was reported as missing — preflight disagreeing with the
+    // spawn, in the direction that cries wolf.
+    const dir = seedHarness("alpha");
+    writeFileSync(join(dir, ".env"), "ANTHROPIC_API_KEY=from-env-file\n");
+    const out = await run(["preflight", dir]);
+    expect(out.exitCode).toBe(0);
+    expect(out.lines.join("\n")).toContain("harness env file .env");
+  });
+
+  test("a shared fleet env file satisfies credentials and is named in the report", async () => {
+    const dir = seedHarness("fleet/member", "member");
+    writeFileSync(join(root, "fleet", ".env"), "ANTHROPIC_API_KEY=fleet-key\n");
+    mkdirSync(join(dir, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(dir, ".crewhaus", "settings.json"),
+      JSON.stringify({ manager: { envFiles: ["../.env"] } }),
+    );
+    const out = await run(["preflight", dir]);
+    expect(out.exitCode).toBe(0);
+    expect(out.lines.join("\n")).toContain('shared env file "../.env"');
+  });
+
+  test("a declared-but-absent shared env file warns without blocking the spawn", async () => {
+    const dir = seedHarness("fleet/member", "member");
+    env["ANTHROPIC_API_KEY"] = "unit-test-credential";
+    mkdirSync(join(dir, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(dir, ".crewhaus", "settings.json"),
+      JSON.stringify({ manager: { envFiles: ["../.env"] } }),
+    );
+    const out = await run(["preflight", dir]);
+    expect(out.exitCode).toBe(0);
+    expect(out.lines.join("\n")).toMatch(/⚠ shared env file "\.\.\/\.env" is declared/);
   });
 
   test("an unregistered key that is not a directory throws", () => {

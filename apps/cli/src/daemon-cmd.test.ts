@@ -341,6 +341,56 @@ describe("crewhaus daemon", () => {
     }
   });
 
+  test("status names the SHARED env files a fleet member reads, and where they resolved", async () => {
+    const f = fixture();
+    try {
+      // The fleet layout the declaration exists for: one `.env` beside the
+      // harness dir, declared rather than symlinked.
+      const fleetRoot = join(f.dir, "..");
+      writeFileSync(join(fleetRoot, ".env"), "SHARED_KEY=x\n");
+      mkdirSync(join(f.dir, ".crewhaus"), { recursive: true });
+      writeFileSync(
+        join(f.dir, ".crewhaus", "settings.json"),
+        JSON.stringify({ manager: { envFiles: ["../.env"] } }),
+      );
+      writeFileSync(join(f.dir, ".env"), "LOCAL_KEY=y\n");
+
+      const out = await runDaemonCommand(["status"], f.opts);
+      const text = out.lines.join("\n");
+      expect(text).toContain("env files (lowest precedence first");
+      expect(text).toContain("../.env →");
+      expect(text).toContain("[shared]");
+      expect(text).toContain("  .env");
+      // A file list, never a value — status is piped and screen-shared.
+      expect(text).not.toContain("SHARED_KEY");
+
+      const json = JSON.parse(
+        (await runDaemonCommand(["status", "--json"], f.opts)).lines.join("\n"),
+      ) as { envFiles: Array<{ declaredAs: string; scope: string; present: boolean }> };
+      expect(json.envFiles.map((r) => [r.declaredAs, r.scope, r.present])).toEqual([
+        ["../.env", "shared", true],
+        [".env", "harness", true],
+      ]);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("status reports a declared shared env file that is NOT there", async () => {
+    const f = fixture();
+    try {
+      mkdirSync(join(f.dir, ".crewhaus"), { recursive: true });
+      writeFileSync(
+        join(f.dir, ".crewhaus", "settings.json"),
+        JSON.stringify({ manager: { envFiles: ["../fleet.env"] } }),
+      );
+      const text = (await runDaemonCommand(["status"], f.opts)).lines.join("\n");
+      expect(text).toContain("MISSING — nothing is read from it");
+    } finally {
+      f.cleanup();
+    }
+  });
+
   test("logs render the SCRUBBED capture — a credential value from .env never prints", async () => {
     const f = fixture();
     try {

@@ -2,9 +2,12 @@
  * @crewhaus/preflight — typed pre-spawn health checks for harnesses.
  *
  * "Will not boot: SLACK_SIGNING_SECRET unset" instead of a relayed stack
- * trace. The package composes seven areas into one report:
+ * trace. The package composes eight areas into one report:
  *
  *   - spec        — `parseSpecIssues` lint (+ injected compiler warnings)
+ *   - env         — the env-file chain the injected `env` was merged from,
+ *                   including shared fleet files declared in
+ *                   `manager.envFiles` (warn when a declared one is absent)
  *   - credentials — provider env-var matrix for the UNION of every model
  *                   the spec can route to (agent.model, model_fallbacks,
  *                   model_tiers, model_pool candidates, the evaluation
@@ -82,6 +85,9 @@ export {
   lowerSpecChannels,
   platformSecretRefs,
 } from "./channels";
+
+export type { EnvChainFile } from "./env-chain";
+export { envChainItems } from "./env-chain";
 
 export type { McpServersSpec } from "./mcp";
 export { mcpDryRunItems } from "./mcp";

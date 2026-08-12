@@ -43,8 +43,10 @@ import {
   type HangarRegistry,
   openHangarRegistry,
 } from "@crewhaus/harness-registry";
+import { buildSpawnEnv, loadEnvChain } from "@crewhaus/harness-supervisor";
 import { preflightHarness } from "@crewhaus/preflight";
 import { createFileBackedRegistry } from "@crewhaus/spec-registry";
+import { envChainLines } from "./env-chain-view";
 
 /** What a verb returns: lines for stdout + the process exit code. */
 export type HarnessCommandResult = {
@@ -368,15 +370,25 @@ async function harnessShow(
     );
     health = await buildHarnessHealth(inventory, readEvalHealth);
   }
+  // The env chain the daemon would really read — including shared fleet
+  // files declared in `manager.envFiles`, which resolve outside the harness
+  // and are otherwise invisible from here.
+  const envFiles = alive ? loadEnvChain(entry.dir).refs : [];
   if (boolFlag(args, "json")) {
     return {
-      lines: jsonLines({ entry, inventory: inventory ?? null, health: health ?? null }),
+      lines: jsonLines({
+        entry,
+        inventory: inventory ?? null,
+        health: health ?? null,
+        envFiles,
+      }),
       exitCode: 0,
     };
   }
   const lines = entryLines(entry, inventory?.header ?? lenientHeader(entry.dir));
   if (inventory !== undefined) lines.push(...inventoryRowLines(inventory));
   if (health !== undefined) lines.push(...healthLines(health));
+  lines.push(...envChainLines(envFiles, "    "));
   lines.push(`    registered ${entry.registeredAt}  last seen ${entry.lastSeen}`);
   if (entry.notes !== "") lines.push(`    notes: ${entry.notes}`);
   return { lines, exitCode: 0 };
@@ -658,7 +670,16 @@ async function harnessPreflight(
     dir = asDir;
     label = asDir;
   }
-  const report = await preflightHarness(dir, { env: opts.env ?? process.env });
+  // The MERGED spawn env, not `process.env` — the harness `.env` chain (and
+  // any shared fleet file it declares) UNDER the process env, which is the
+  // record a spawn from this directory really receives. Checking anything
+  // else is how "passed preflight, died on a missing key" happens, inverted:
+  // this verb used to report a missing credential that `.env` supplies.
+  const spawnEnv = buildSpawnEnv({ harnessRoot: dir, processEnv: opts.env ?? process.env });
+  const report = await preflightHarness(dir, {
+    env: spawnEnv.env,
+    envFiles: spawnEnv.envFileRefs,
+  });
   const exitCode: 0 | 1 = report.ok ? 0 : 1;
   if (boolFlag(args, "json")) return { lines: jsonLines(report), exitCode };
   const lines: string[] = [`preflight ${label} (${dir}):`, ""];

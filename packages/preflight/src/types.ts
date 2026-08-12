@@ -16,6 +16,7 @@
 /** Which subsystem a preflight item belongs to. */
 export type PreflightArea =
   | "spec"
+  | "env"
   | "credentials"
   | "channels"
   | "mcp"

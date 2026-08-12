@@ -54,6 +54,7 @@ import {
   createHarnessSupervisor,
   createProcessOps,
   formatGateRefusal,
+  loadEnvChain,
   readLogTail,
   readRunfile,
   recentRuns,
@@ -63,6 +64,7 @@ import {
   systemClock,
 } from "@crewhaus/harness-supervisor";
 import { readBundleSpecStamp } from "./bundle-manifest";
+import { envChainLines } from "./env-chain-view";
 import { cliVersion } from "./version";
 
 /** What a verb returns: lines for stdout + the process exit code. */
@@ -674,6 +676,11 @@ async function daemonStatus(
   } catch (err) {
     planError = err instanceof Error ? err.message : String(err);
   }
+  // The chain is reported whether or not a plan could be built: "which env
+  // files does this daemon read" is exactly the question an operator has
+  // when a key resolves from a shared fleet file rather than a local one,
+  // and a harness with no bundle yet still answers it.
+  const envChain = loadEnvChain(harness.dir);
 
   if (args.flags.get("json") === true) {
     return {
@@ -687,6 +694,7 @@ async function daemonStatus(
           runfile: runfile ?? null,
           controlPort: controlPort ?? null,
           recentRuns: runs,
+          envFiles: envChain.refs,
           plan: plan ?? null,
           planError: planError ?? null,
         },
@@ -728,6 +736,7 @@ async function daemonStatus(
       );
     }
   }
+  lines.push(...envChainLines(envChain.refs));
   lines.push(planError !== undefined ? `  plan: ${planError}` : `  would run: ${plan}`);
   return { lines, exitCode: 0 };
 }
