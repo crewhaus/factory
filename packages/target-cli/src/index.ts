@@ -286,6 +286,10 @@ function renderMcpServers(ir: IrV0): {
         ir.thredz?.agentName !== undefined
           ? `, agentName: ${escapeJsonString(ir.thredz.agentName)}`
           : ""
+      }${
+        // Item 5 (G44) / #401 — the spec's messaging opt-in reaches the
+        // bridge. Absent ⇒ the memory vocabulary only, byte-identical.
+        ir.thredz?.messaging === true ? ", messaging: true" : ""
       } });`
     : undefined;
   const bootBlock = [

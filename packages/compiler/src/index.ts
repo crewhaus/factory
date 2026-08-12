@@ -355,6 +355,61 @@ function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning> {
       out.push({ code: "accepted-but-unwired", path: row.path, message: row.message });
     }
   }
+  // Item 1 (G30) / #394 — `expose:` is wired on cli (via `crewhaus serve
+  // --mcp`) and, from 0.5.4, on channel (the bundle mounts its own endpoint).
+  // MANAGED still carries it unwired, and the gap is not incidental: the
+  // managed daemon's turn function requires a `tenantId` that only the
+  // JWT-authenticated request plane resolves, so an MCP mount there needs a
+  // tenancy decision this emit does not make. Saying so beats letting the
+  // block look live — which is exactly how #394 was found.
+  if (spec.target === "managed" && spec.expose?.mcp !== undefined) {
+    out.push({
+      code: "accepted-but-unwired",
+      path: "expose.mcp",
+      message: [
+        "expose.mcp is accepted on managed but NOT wired: the emitted daemon mounts no MCP",
+        "endpoint (its turn function is tenant-scoped, and which tenant an MCP caller drives",
+        "is undecided). Project this agent with `crewhaus serve --mcp` against a cli spec, or",
+        "use the channel shape, which does self-expose.",
+      ].join(" "),
+    });
+  }
+  // #394 — `transport: stdio` on a DAEMON shape mounts nothing: stdio is the
+  // `crewhaus serve --mcp` projection, where the CLI owns the process's stdio.
+  // A daemon has no such channel, so the block is inert — which is precisely
+  // the silence this whole change exists to end, so it says so.
+  if (
+    (spec.target === "channel" || spec.target === "managed") &&
+    spec.expose?.mcp?.transport === "stdio"
+  ) {
+    out.push({
+      code: "accepted-but-unwired",
+      path: "expose.mcp.transport",
+      message: [
+        'expose.mcp.transport: "stdio" mounts nothing on a daemon — stdio is the',
+        "`crewhaus serve --mcp` projection, which needs a process whose stdio is the",
+        'protocol channel. Use `transport: "sse"` to self-expose from the compiled',
+        "bundle (channel), or project a cli spec with `crewhaus serve --mcp`.",
+      ].join(" "),
+    });
+  }
+  // #394 — `per-subagent` cannot be honoured on channel: the projected tools
+  // are meant to ROUTE to a sub-agent, and the channel turn function takes no
+  // routing argument, so every projected tool would land in the same
+  // undirected turn. The emit projects `chat` and says so here rather than
+  // advertising N identical tools under N names.
+  if (spec.target === "channel" && spec.expose?.mcp?.tools === "per-subagent") {
+    out.push({
+      code: "accepted-but-unwired",
+      path: "expose.mcp.tools",
+      message: [
+        'expose.mcp.tools: "per-subagent" is accepted on channel but projects as "chat":',
+        "the channel turn function has no sub-agent routing parameter, so per-sub-agent tools",
+        "would all drive the same undirected turn. The bundle exposes one `chat` tool;",
+        "sub-agents still run inside it exactly as they do for an inbound message.",
+      ].join(" "),
+    });
+  }
   // Item 1 — a compiled cli bundle DOES capture ratings (the runtime asks the
   // exit rating prompt and appends the same `user_feedback` events
   // `crewhaus rate` writes), but it does NOT auto-distill them: registering a

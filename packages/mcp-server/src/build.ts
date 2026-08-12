@@ -119,6 +119,7 @@ async function runInvoke(
 export function registerAgentTools(
   server: McpServer,
   opts: CreateMcpServerOptions,
+  sessionId?: string,
 ): readonly string[] {
   const agentName = opts.name ?? DEFAULT_NAME;
   const names: string[] = [];
@@ -132,7 +133,11 @@ export function registerAgentTools(
         `Send a message to the ${agentName} agent and receive its final response.`,
       inputSchema: { message: z.string().describe("The message to send to the agent.") },
     },
-    ({ message }) => runInvoke(opts.invoke, message, { toolName: CHAT_TOOL_NAME }),
+    ({ message }) =>
+      runInvoke(opts.invoke, message, {
+        toolName: CHAT_TOOL_NAME,
+        ...(sessionId !== undefined ? { sessionId } : {}),
+      }),
   );
   names.push(CHAT_TOOL_NAME);
 
@@ -148,7 +153,11 @@ export function registerAgentTools(
           },
         },
         ({ message }) =>
-          runInvoke(opts.invoke, message, { toolName: tool.toolName, subAgent: tool.subAgent }),
+          runInvoke(opts.invoke, message, {
+            toolName: tool.toolName,
+            subAgent: tool.subAgent,
+            ...(sessionId !== undefined ? { sessionId } : {}),
+          }),
       );
       names.push(tool.toolName);
     }
@@ -157,8 +166,18 @@ export function registerAgentTools(
   return names;
 }
 
-/** Mint a fresh SDK server with the projected tools registered. */
-export function buildConfiguredServer(opts: CreateMcpServerOptions): {
+/**
+ * Mint a fresh SDK server with the projected tools registered.
+ *
+ * `sessionId` is threaded into every {@link McpInvokeContext} this server's
+ * tools build. The SSE path mints one server PER SESSION and passes that
+ * session's id, so a projected bundle can key its own conversation state per
+ * caller; stdio passes nothing (one process, one conversation).
+ */
+export function buildConfiguredServer(
+  opts: CreateMcpServerOptions,
+  sessionId?: string,
+): {
   readonly server: McpServer;
   readonly toolNames: readonly string[];
 } {
@@ -166,6 +185,6 @@ export function buildConfiguredServer(opts: CreateMcpServerOptions): {
     { name: opts.name ?? DEFAULT_NAME, version: opts.version ?? DEFAULT_VERSION },
     opts.instructions === undefined ? undefined : { instructions: opts.instructions },
   );
-  const toolNames = registerAgentTools(server, opts);
+  const toolNames = registerAgentTools(server, opts, sessionId);
   return { server, toolNames };
 }

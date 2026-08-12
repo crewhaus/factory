@@ -7,6 +7,7 @@ import {
   StdioClientTransport,
   getDefaultEnvironment,
 } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   CallToolResultSchema,
@@ -82,7 +83,18 @@ export class McpClient {
   private readonly config: McpServerConfig;
   private readonly logger: Logger | undefined;
   private readonly clientFactory: (info: { name: string; version: string }) => Client;
-  private readonly transportFactory: (config: McpServerConfig) => McpClientLikeTransport;
+  /** Test/escape-hatch override. Undefined ⇒ this client builds its own
+   *  transports and, for `sse`, probes the HTTP wire candidates. */
+  private readonly injectedTransportFactory:
+    | ((config: McpServerConfig) => McpClientLikeTransport)
+    | undefined;
+  /** Which HTTP wire this endpoint turned out to speak, once one handshake
+   *  has succeeded — so reconnects skip the probe (#394). */
+  private httpWire: HttpMcpWire | undefined;
+  /** True while walking the HTTP wire candidates. A candidate failing is the
+   *  EXPECTED way the other wire is discovered, so its close must not arm the
+   *  reconnect ladder (#394). */
+  private probing = false;
   private readonly connectTimeoutMs: number;
   private readonly callTimeoutMs: number;
   private readonly setTimer: (cb: () => void, ms: number) => unknown;
@@ -104,7 +116,7 @@ export class McpClient {
     this.config = config;
     this.logger = opts.logger;
     this.clientFactory = opts.clientFactory ?? defaultClientFactory;
-    this.transportFactory = opts.transportFactory ?? defaultTransportFactory;
+    this.injectedTransportFactory = opts.transportFactory;
     this.connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
     this.callTimeoutMs = opts.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
     this.setTimer = opts.setTimer ?? ((cb, ms) => setTimeout(cb, ms));
@@ -136,20 +148,74 @@ export class McpClient {
   /**
    * Build transport + SDK Client, run the initialize handshake. Single
    * attempt — reconnect orchestration lives in `scheduleReconnect`.
+   *
+   * For `transport: "sse"` this walks the HTTP wire candidates (Streamable
+   * HTTP, then legacy HTTP+SSE — see {@link httpTransportCandidates}) until
+   * one completes the handshake, and REMEMBERS the winner so reconnects and
+   * every later attempt go straight to it. An injected `transportFactory`
+   * (tests) is always honoured verbatim and never probed.
    */
   private async tryConnect(): Promise<void> {
     const attempt = this.reconnectAttempt;
     this.state = { kind: "connecting", attempt };
     this.logger?.debug("mcp.connecting", { server: this.name, attempt });
 
-    const transport = this.transportFactory(this.config);
+    const candidates = this.transportCandidates();
+    let lastError: unknown;
+    // While probing, a candidate's close must not schedule anything: the
+    // whole point is that failures here are EXPECTED.
+    this.probing = candidates.length > 1;
+    for (const candidate of candidates) {
+      try {
+        await this.connectWith(candidate.build(), attempt);
+        this.probing = false;
+        if (candidate.wire !== undefined && this.httpWire === undefined) {
+          this.httpWire = candidate.wire;
+          this.logger?.debug("mcp.http-wire", { server: this.name, wire: candidate.wire });
+        }
+        return;
+      } catch (err) {
+        lastError = err;
+        // Keep probing only while another candidate remains: the LAST
+        // failure is the one the operator sees, and for a genuinely
+        // unreachable peer that is the legacy transport's error, which is
+        // the same message this client has always produced.
+      }
+    }
+    this.probing = false;
+    throw lastError;
+  }
+
+  /** The transports to try, in order, for this config. */
+  private transportCandidates(): ReadonlyArray<{
+    readonly wire?: HttpMcpWire;
+    readonly build: () => McpClientLikeTransport;
+  }> {
+    // An injected factory is the test seam AND an escape hatch; probing past
+    // it would call it twice and defeat both.
+    if (this.injectedTransportFactory !== undefined) {
+      const factory = this.injectedTransportFactory;
+      return [{ build: () => factory(this.config) }];
+    }
+    if (this.config.transport !== "sse") {
+      return [{ build: () => defaultTransportFactory(this.config) }];
+    }
+    const all = httpTransportCandidates(this.config);
+    // Already know which wire this endpoint speaks — go straight to it.
+    const known = this.httpWire;
+    return known === undefined ? all : all.filter((c) => c.wire === known);
+  }
+
+  /** One handshake attempt against one built transport. */
+  private async connectWith(transport: McpClientLikeTransport, attempt: number): Promise<void> {
+    void attempt;
     const sdk = this.clientFactory({
       name: "@crewhaus/mcp-host",
       version: "0.0.0",
     });
 
     transport.onclose = () => {
-      this.handleTransportClose();
+      this.handleTransportClose(transport);
     };
 
     // Loop contract 0.4 (Batch G, G74) — subscribe to the server's
@@ -179,6 +245,13 @@ export class McpClient {
           ),
       );
     } catch (err) {
+      // DETACH BEFORE CLOSING (#394). `close()` fires `onclose`, which routes
+      // into `handleTransportClose` — the reconnect scheduler. On the probe
+      // path that is actively wrong: the FIRST candidate failing is the normal
+      // way a legacy-SSE peer is discovered, and letting it arm a reconnect
+      // leaves a phantom timer racing the candidate that is about to succeed.
+      // A failed attempt must leave no scheduling behind it.
+      transport.onclose = undefined;
       // Best-effort cleanup: SDK's connect may have partially started the
       // transport. Closing it (and ignoring secondary errors) prevents
       // leaked subprocesses.
@@ -195,6 +268,13 @@ export class McpClient {
     this.transport = transport;
     this.state = { kind: "connected" };
     this.reconnectAttempt = 0;
+    // A timer armed before this handshake landed (a probe candidate's close
+    // racing the candidate that succeeded) would reconnect a healthy client
+    // and orphan this very transport. Cancel it.
+    if (this.reconnectTimer !== null) {
+      this.clearTimer(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     const deferred = this.connectedDeferred;
     this.connectedDeferred = createDeferred();
     void this.connectedDeferred.promise.catch(() => undefined);
@@ -207,7 +287,23 @@ export class McpClient {
    * deliberately we're in `closed` state and do nothing. Otherwise we drop
    * to `disconnected` and schedule a reconnect.
    */
-  private handleTransportClose(): void {
+  /**
+   * A transport closed. Only the CURRENT one may drive the reconnect ladder.
+   *
+   * The guard is not defensive dressing (#394): the SDK's own
+   * `Client.connect` catch calls `void this.close()` on a failed handshake,
+   * which fires `onclose` BEFORE our catch can detach it — so on the
+   * `transport: "sse"` probe path, the first candidate failing (the normal
+   * way a legacy HTTP+SSE peer is discovered) armed a reconnect timer that
+   * then raced the candidate about to succeed. The result was a healthy
+   * connection spontaneously reconnecting, each phantom attempt orphaning a
+   * live stream and a server-side session.
+   */
+  private handleTransportClose(closed?: McpClientLikeTransport): void {
+    // A close from a transport we have already replaced — or from a probe
+    // candidate we never adopted — says nothing about the live connection.
+    if (closed !== undefined && this.transport !== null && closed !== this.transport) return;
+    if (this.probing && (closed === undefined || closed !== this.transport)) return;
     if (this.state.kind === "closed") return;
     this.logger?.warn("mcp.transport_closed", { server: this.name });
     this.sdk = null;
@@ -481,6 +577,56 @@ function defaultTransportFactory(config: McpServerConfig): McpClientLikeTranspor
     sseOpts.requestInit = { headers: { ...config.headers } };
   }
   return new SSEClientTransport(new URL(config.url), sseOpts);
+}
+
+/**
+ * `transport: "sse"` names an HTTP-mounted MCP endpoint, NOT one wire
+ * protocol — so it is resolved by PROBING, newest first (#394).
+ *
+ * MCP has two HTTP transports. The 2024-11-05 revision's **HTTP+SSE** opens
+ * with `GET` → `text/event-stream` and receives an `endpoint` event naming a
+ * POST URL; the 2025-03-26 revision's **Streamable HTTP** POSTs JSON-RPC to
+ * one URL and upgrades to a stream only when the server chooses. They share
+ * a URL shape and nothing else, and a client aimed at the wrong one fails
+ * with a content-type error rather than anything that names the mismatch.
+ *
+ * This mattered because our own two halves disagreed: `@crewhaus/mcp-server`
+ * serves Streamable HTTP (`WebStandardStreamableHTTPServerTransport`) while
+ * this client spoke only legacy HTTP+SSE — so a CrewHaus daemon exposed over
+ * `expose.mcp.transport: sse` could not be consumed by a CrewHaus peer
+ * declaring `mcp_servers: { peer: { transport: sse } }`. The legacy client's
+ * opening GET got `400 application/json` from our own server, surfacing to
+ * the operator as `SSE error: Invalid content type`.
+ *
+ * Order is Streamable HTTP first because it is the current revision and the
+ * one our own emit serves; the legacy fallback is what keeps a third-party
+ * 2024-11-05 server — the reason this config value existed at all — working
+ * unchanged. Nothing about the spec surface changes: `sse` simply now means
+ * "HTTP, either revision" instead of "HTTP, the old one only".
+ */
+export function httpTransportCandidates(
+  config: Extract<McpServerConfig, { transport: "sse" }>,
+): ReadonlyArray<{ readonly wire: HttpMcpWire; readonly build: () => McpClientLikeTransport }> {
+  return [
+    { wire: "streamable-http", build: () => streamableHttpTransport(config) },
+    { wire: "http-sse", build: () => defaultTransportFactory(config) },
+  ];
+}
+
+/** Which HTTP wire protocol a connected `sse` server turned out to speak. */
+export type HttpMcpWire = "streamable-http" | "http-sse";
+
+function streamableHttpTransport(
+  config: Extract<McpServerConfig, { transport: "sse" }>,
+): McpClientLikeTransport {
+  const opts: ConstructorParameters<typeof StreamableHTTPClientTransport>[1] = {};
+  if (config.headers !== undefined) {
+    // One `requestInit` covers every request this transport makes (the POST
+    // and the optional GET stream), so unlike the legacy transport there is
+    // no separate EventSource fetch to patch.
+    opts.requestInit = { headers: { ...config.headers } };
+  }
+  return new StreamableHTTPClientTransport(new URL(config.url), opts);
 }
 
 /**

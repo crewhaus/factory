@@ -54,6 +54,19 @@ export const CHAT_TOOL_NAME = "chat";
 export interface McpInvokeContext {
   readonly toolName: string;
   readonly subAgent?: string;
+  /**
+   * The MCP transport's session id, on the `sse` transport once the client
+   * has initialized one. Absent on `stdio` (one process, one conversation)
+   * and on the very first request of an SSE session.
+   *
+   * It exists so a bundle that projects itself can key its OWN conversation
+   * state per CALLER: a channel daemon exposing `expose.mcp` maps this onto
+   * a harness session id, so two IDEs driving the same daemon do not write
+   * into one transcript. Without it every caller collapses onto a single
+   * shared session — which is not a subtle wrong, it is one user reading
+   * another's conversation.
+   */
+  readonly sessionId?: string;
 }
 
 /**

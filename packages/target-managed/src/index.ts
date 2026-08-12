@@ -793,6 +793,11 @@ const __thredz = await connectThredz(__thredzHost, defaultCatalog, { log: (line)
         ir.thredz?.agentName !== undefined
           ? `, agentName: ${escapeJsonString(ir.thredz.agentName)}`
           : ""
+      }${
+        // Item 5 (G44) / #401 — managed wires thredz like channel does, so it
+        // honours the same messaging opt-in. Omitting it here would have left
+        // exactly the silently-unwired flag this change exists to end.
+        ir.thredz?.messaging === true ? ", messaging: true" : ""
       } });`
     : "";
   const embedderBootBlock =
