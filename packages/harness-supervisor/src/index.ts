@@ -196,6 +196,7 @@ export {
   runPrepareCommand,
 } from "./prepare";
 export {
+  BRIEF_TARGETS,
   BUNDLE_DIR_CANDIDATES,
   buildSpawnEnv,
   buildSpawnPlan,
@@ -210,6 +211,7 @@ export {
   loadEnvChain,
   OVERRIDE_ENV_KEYS,
   parseEnvText,
+  readsBriefOnStdin,
   resolveBundle,
   resolveCrewhausBin,
   runClassFor,

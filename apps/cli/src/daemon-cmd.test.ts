@@ -143,6 +143,18 @@ function fixture(specLines?: readonly string[]): Fixture {
   };
 }
 
+/** A compiled crew harness — the shape whose INPUT is a document. */
+function crewFixture(): Fixture {
+  return fixture([
+    "name: crew-fixture",
+    "target: crew",
+    "agent:",
+    "  model: anthropic/claude-sonnet-4",
+    "  instructions: |",
+    "    You are a fixture.",
+  ]);
+}
+
 /**
  * What a control-serving daemon writes at bind: the announcement on stdout
  * (the ONLY place a kernel-assigned port exists) plus the 0600 token file it
@@ -373,6 +385,79 @@ describe("crewhaus daemon", () => {
         ["../.env", "shared", true],
         [".env", "harness", true],
       ]);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("submit runs a crew with a brief on stdin, tracked as a job", async () => {
+    const f = crewFixture();
+    try {
+      const brief = join(f.dir, "..", "brief.md");
+      writeFileSync(brief, "# ship the newsletter\n");
+      const out = await runDaemonCommand(
+        ["submit", "--brief-file", brief, "--no-preflight"],
+        f.opts,
+      );
+      expect(out.exitCode).toBe(0);
+      const text = out.lines.join("\n");
+      expect(text).toContain("submitted run_");
+      expect(text).toContain("one run, never restarted");
+
+      const child = f.ops.last();
+      // The brief reaches the child as a FILE the kernel feeds, never argv.
+      expect(child?.request.stdinFile).toBe(brief);
+      expect(child?.request.argv.join(" ")).not.toContain(brief);
+      // A job, not a daemon: no runfile, so nothing claims the daemon slot.
+      expect(existsSync(join(f.dir, ".crewhaus", "run", "daemon.json"))).toBe(false);
+      const ledger = readFileSync(join(f.dir, ".crewhaus", "run", "runs.jsonl"), "utf8");
+      expect(JSON.parse(ledger.split("\n")[0] as string).kind).toBe("job");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("submit without --brief-file, or with a missing/empty one, refuses up front", async () => {
+    const f = crewFixture();
+    try {
+      await expect(runDaemonCommand(["submit"], f.opts)).rejects.toThrow(/--brief-file/);
+      await expect(runDaemonCommand(["submit", "--brief-file", "nope.md"], f.opts)).rejects.toThrow(
+        /no brief at/,
+      );
+      const empty = join(f.dir, "empty.md");
+      writeFileSync(empty, "");
+      await expect(runDaemonCommand(["submit", "--brief-file", empty], f.opts)).rejects.toThrow(
+        /is empty/,
+      );
+      expect(f.ops.children).toHaveLength(0);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("submit on a shape whose input is NOT a brief points at the verb that is", async () => {
+    const f = fixture(); // channel
+    try {
+      const brief = join(f.dir, "brief.md");
+      writeFileSync(brief, "hello\n");
+      await expect(runDaemonCommand(["submit", "--brief-file", brief], f.opts)).rejects.toThrow(
+        /is a channel harness.*crewhaus daemon start/s,
+      );
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("`daemon start` on a crew harness refuses with the remedy, and spawns NOTHING", async () => {
+    // Before this it spawned a bundle guaranteed to exit 2 ("no input on
+    // stdin"), which is not a terminal code — so the supervisor read a crash
+    // and walked the backoff ladder into crash-looping.
+    const f = crewFixture();
+    try {
+      const out = await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      expect(out.exitCode).toBe(1);
+      expect(out.lines.join("\n")).toContain("crewhaus daemon submit");
+      expect(f.ops.children).toHaveLength(0);
     } finally {
       f.cleanup();
     }
