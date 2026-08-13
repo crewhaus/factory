@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/routing-store",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "type": "module",
   "description": "Durable per-(route-key, model) reward scoreboard that makes model_pool routing improve with usage (Section 17)",
   "main": "src/index.ts",

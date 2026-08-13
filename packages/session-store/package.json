@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/session-store",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "type": "module",
   "description": "File-backed session metadata store with TTL eviction",
   "main": "src/index.ts",

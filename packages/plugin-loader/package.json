@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/plugin-loader",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "type": "module",
   "description": "Runtime activation of third-party plugins — path allow-list, Ed25519 signature verification, capability gating, sandboxed import (Section 41)",
   "main": "src/index.ts",

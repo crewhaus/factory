@@ -5,6 +5,98 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] - 2026-08-12
+
+### Fixed
+
+- **`expose.mcp` on a channel bundle now actually emits an MCP endpoint**
+  (#394). A channel spec declaring `expose: { mcp: { transport: sse } }`
+  lint-passed, compiled and booted, and served no MCP endpoint anywhere: the
+  block was parsed, lowered to `IrExpose`, and read by NO emitter. Meanwhile
+  `serve --mcp`'s refusal told operators a "channel/managed daemon
+  self-exposes from its compiled bundle", the Hangar console computed a
+  `"self"` projection state from the same unwired block, and the roadmap
+  marked Batch G's `expose:` shipped — it was shipped for `cli` only, through
+  `crewhaus serve --mcp`. A channel bundle now mounts its own endpoint at
+  `/mcp` on the public port, delegating to the SAME `agent.runTurn` the
+  adapters drive, so an MCP caller reaches the identical loop, memory fabric
+  and permissions; boot prints the URL, the server closes on shutdown, and a
+  spec without `expose` compiles byte-identically. The endpoint is
+  AUTHENTICATED, unlike everything else on that port: the adapter routes are
+  signature-verified per platform and `/healthz` is deliberately public, but
+  MCP drives whole agent turns with the bundle's tools and credentials, so it
+  takes the same bearer contract as `crewhaus.control.v1` —
+  `CREWHAUS_MCP_TOKEN`, else a 32-byte token minted 0600 at boot, compared
+  length-independently. Each MCP session maps to its own harness session, so
+  two IDEs driving one daemon never share a transcript. Still honest about
+  what is not wired: `expose.mcp` on MANAGED (its turn function is
+  tenant-scoped, and which tenant an MCP caller drives is undecided),
+  `transport: stdio` on a daemon, and `tools: "per-subagent"` on channel (the
+  channel turn takes no routing argument, so N per-sub-agent tools would all
+  drive the same undirected turn) now each WARN at compile time instead of
+  looking live.
+- **`mcp_servers: { … transport: sse }` reaches both HTTP MCP revisions**
+  (#394). Our own two halves never agreed on the wire: `@crewhaus/mcp-server`
+  serves MCP's 2025-03-26 **Streamable HTTP**, while the client built for
+  `transport: "sse"` spoke only the 2024-11-05 **HTTP+SSE** revision — so a
+  CrewHaus peer could never consume a CrewHaus `expose.mcp` endpoint. The
+  legacy client's opening GET got `400 application/json`, which surfaced as
+  `SSE error: Invalid content type` and made any A2A topology over MCP
+  impossible. `sse` now means "HTTP, either revision": the client probes
+  Streamable HTTP first, falls back to legacy, and remembers the winner so
+  reconnects skip the probe. Third-party legacy servers — the reason the
+  config value existed — are unaffected. A probe candidate's failure is the
+  EXPECTED way the other wire is discovered, so it can no longer arm a
+  reconnect that races the candidate about to succeed (the SDK fires
+  `onclose` on a failed handshake before a caller can detach it, which left a
+  healthy connection spontaneously reconnecting and orphaning live streams).
+- **A one-shot approval grant can now satisfy a model-driven tool call**
+  (#400). Grants are keyed on whole-input equality, which assumes the resumed
+  run re-issues a BYTE-IDENTICAL call. It does not: resume re-drives the
+  turn, `sanitizeOrphanToolUses` has stripped the parked `tool_use` from the
+  replayed transcript, and the model generates the call fresh — so one
+  re-worded argument moved the hash, the lookup missed, and the run parked
+  again under a new id. Approve → regenerate → re-park, forever, which left
+  `--always` (a STANDING allow on exactly the quota-spending and irreversible
+  tools operators least want standing) as the only thing that landed a single
+  call. When the exact key misses, the gate now runs THE INPUT THE OPERATOR
+  APPROVED rather than the regenerated one — which is also what keeps the
+  security property: an operator authorized a specific action shown to them,
+  and that action is what executes. Guarded to the same session and tool, a
+  grant from a PRIOR run, an unconsumed record that actually carries its
+  input, and a decision made recently (the window tracks the approve→resume
+  gap, so an unspent grant cannot be replayed onto an unrelated turn an hour
+  later); approval ids are claimed synchronously so two concurrent calls
+  cannot spend one grant; policy and the `pre-tool` hook are re-evaluated
+  against the substituted input, and a deny wins. Both parties are told — the
+  operator through a `permission_decision` event and a log line, the model
+  through a note in the tool result, without which it would reason about an
+  action that never happened. The exact-hash path is untouched.
+- **A channel daemon no longer swallows an out-of-band grant** (#400). The
+  emitted `resumeApproval` returned early with NO output when a granted
+  approval had no captured inbound event — the state every `crewhaus
+  approvals grant` and every post-restart grant lands in, since the resume
+  map is in-memory. An operator saw nothing happen and could not tell a
+  working grant from a broken one; it now says so, and states that the grant
+  is live for the next message.
+
+### Added
+
+- **The nine Thredz agent-to-agent messaging tools, opt-in** (#401).
+  thredz-mcp v0.3.0 advertises 27 tools and promises agent-to-agent
+  messaging; `connectThredz` aliased 18, so an agent carrying `thredz:`
+  reported `message_send` / `inbox_poll` / `agent_register` and the rest as
+  absent — and with `expose.mcp` also unwired, a daemon fleet had no A2A
+  fabric at all. The opt-in `thredz.messaging: true` had existed in the spec
+  AND the IR since Batch G and nothing read it. The nine now register when
+  the spec asks, and only then: `thredz:` is the MEMORY knob, and turning
+  memory on must never silently widen the outward surface. Reads are
+  readOnly, directory and mailbox mutations destructive, and `message_send`
+  alone carries the Pillar 3 intent gate — it puts text in front of another
+  agent, which is the visible-side-effect class the gate exists for, and
+  gating the bookkeeping too would only train operators to wave it through.
+  Wired on channel, managed, cli, and per-role on crew.
+
 ## [0.5.3] - 2026-08-12
 
 ### Added

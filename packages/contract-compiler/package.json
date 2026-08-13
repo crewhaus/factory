@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/contract-compiler",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "type": "module",
   "description": "Track G / §58 — two-pass contract compilation (completeness + scope/ambiguity). Source: Meta-Engineering Harnesses (arxiv 2605.25665, §4.2).",
   "main": "src/index.ts",
