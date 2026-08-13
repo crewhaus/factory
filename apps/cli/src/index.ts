@@ -197,7 +197,7 @@ import { renderBanner, shouldPrintBanner } from "@crewhaus/target-cli";
 import { DEFAULT_TEMPLATE_REGISTRY_URL } from "@crewhaus/template-marketplace-client";
 import { buildTool } from "@crewhaus/tool-builder";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
-import { registerMcpServer } from "@crewhaus/tool-mcp";
+import { registerMcpServer, registerOptionalMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
 // "Watch me" (design/watch-me.md §2) — the durable per-harness digest store,
@@ -4019,6 +4019,11 @@ async function runRunCli(
     for (const [name, cfg] of Object.entries(ir.mcp_servers)) {
       // 0.3.0 — env/header values are IrSecretRef; resolve them from the
       // interpreter process's environment (fail-fast, names the variable).
+      // #406 — optional servers are NOT added here: their config resolution
+      // + addServer run inside registerOptionalMcpServer's never-throw
+      // boundary below (an unset env var on an optional peer must degrade,
+      // not kill the run).
+      if (cfg.required === false && !(thredzWired && name === "thredz")) continue;
       host.addServer(name, resolveMcpServerConfig(cfg, { name }));
     }
     const tempCatalog = new ToolCatalog();
@@ -4029,15 +4034,28 @@ async function runRunCli(
         ...(ir.thredz?.agentName !== undefined ? { agentName: ir.thredz.agentName } : {}),
       });
     }
+    // #406 — `required: false` servers degrade instead of failing the run.
+    // The interpreter's tool list freezes right below, so the optional path
+    // is degrade-only (retry: false): tools absent for this run.
     await Promise.all(
-      Object.keys(ir.mcp_servers)
-        .filter((name) => !(thredzWired && name === "thredz"))
-        .map((name) =>
+      Object.entries(ir.mcp_servers)
+        .filter(([name, cfg]) => !(thredzWired && name === "thredz") && cfg.required !== false)
+        .map(([name]) =>
           registerMcpServer(host, name, tempCatalog, {
             onRegister: ({ fullName }) => process.stdout.write(`[mcp] registered ${fullName}\n`),
           }),
         ),
     );
+    for (const [name, cfg] of Object.entries(ir.mcp_servers)) {
+      if ((thredzWired && name === "thredz") || cfg.required !== false) continue;
+      const { required: _requiredFlag, ...wireCfg } = cfg as typeof cfg & { required?: false };
+      await registerOptionalMcpServer(host, name, tempCatalog, {
+        retry: false,
+        config: () => resolveMcpServerConfig(wireCfg, { name }),
+        log: (line) => process.stdout.write(line),
+        onRegister: ({ fullName }) => process.stdout.write(`[mcp] registered ${fullName}\n`),
+      }).firstAttempt;
+    }
     tools = tempCatalog.list().slice();
 
     // Item 38 — runtime auto-quarantine. `crewhaus mcp doctor` persists the set
@@ -5588,6 +5606,10 @@ async function buildServeRuntime(
     const host = new McpHost({ logger });
     mcpHost = host;
     for (const [name, cfg] of Object.entries(ir.mcp_servers)) {
+      // #406 — optional servers are NOT added here: their config resolution
+      // + addServer run inside registerOptionalMcpServer's never-throw
+      // boundary below.
+      if (cfg.required === false && !(thredzWired && name === "thredz")) continue;
       host.addServer(name, resolveMcpServerConfig(cfg, { name }));
     }
     const tempCatalog = new ToolCatalog();
@@ -5598,15 +5620,27 @@ async function buildServeRuntime(
         ...(ir.thredz?.agentName !== undefined ? { agentName: ir.thredz.agentName } : {}),
       });
     }
+    // #406 — `required: false` servers degrade instead of failing the run;
+    // the tool list freezes right below, so degrade-only (retry: false).
     await Promise.all(
-      Object.keys(ir.mcp_servers)
-        .filter((name) => !(thredzWired && name === "thredz"))
-        .map((name) =>
+      Object.entries(ir.mcp_servers)
+        .filter(([name, cfg]) => !(thredzWired && name === "thredz") && cfg.required !== false)
+        .map(([name]) =>
           registerMcpServer(host, name, tempCatalog, {
             onRegister: ({ fullName }) => process.stdout.write(`[mcp] registered ${fullName}\n`),
           }),
         ),
     );
+    for (const [name, cfg] of Object.entries(ir.mcp_servers)) {
+      if ((thredzWired && name === "thredz") || cfg.required !== false) continue;
+      const { required: _requiredFlag, ...wireCfg } = cfg as typeof cfg & { required?: false };
+      await registerOptionalMcpServer(host, name, tempCatalog, {
+        retry: false,
+        config: () => resolveMcpServerConfig(wireCfg, { name }),
+        log: (line) => process.stdout.write(line),
+        onRegister: ({ fullName }) => process.stdout.write(`[mcp] registered ${fullName}\n`),
+      }).firstAttempt;
+    }
     tools = tempCatalog.list().slice();
   }
 

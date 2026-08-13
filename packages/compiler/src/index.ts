@@ -651,6 +651,9 @@ function lowerMcpServers(specMcp: Record<string, SpecMcpServerConfig> | undefine
   if (specMcp === undefined) return Object.freeze({}) as IrMcpServers;
   const out: Record<string, IrMcpServerConfig> = {};
   for (const [name, cfg] of Object.entries(specMcp)) {
+    // #406 — carried ONLY when the spec opted out of fail-fast, so a spec
+    // without the key lowers byte-identically.
+    const optional = cfg.required === false ? ({ required: false } as const) : {};
     if (cfg.transport === "stdio") {
       out[name] = {
         transport: "stdio",
@@ -659,6 +662,7 @@ function lowerMcpServers(specMcp: Record<string, SpecMcpServerConfig> | undefine
         ...(cfg.env !== undefined
           ? { env: lowerMcpSecretMap(cfg.env, `mcp_servers.${name}`, "env") }
           : {}),
+        ...optional,
       };
     } else {
       out[name] = {
@@ -667,6 +671,7 @@ function lowerMcpServers(specMcp: Record<string, SpecMcpServerConfig> | undefine
         ...(cfg.headers !== undefined
           ? { headers: lowerMcpSecretMap(cfg.headers, `mcp_servers.${name}`, "headers") }
           : {}),
+        ...optional,
       };
     }
   }

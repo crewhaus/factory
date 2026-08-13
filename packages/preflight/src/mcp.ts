@@ -44,11 +44,15 @@ export type McpServersSpec = Readonly<
         readonly command: string;
         readonly args?: readonly string[];
         readonly env?: Readonly<Record<string, string>>;
+        /** #406 — `required: false` marks the server optional. */
+        readonly required?: boolean;
       }
     | {
         readonly transport: "sse";
         readonly url: string;
         readonly headers?: Readonly<Record<string, string>>;
+        /** #406 — `required: false` marks the server optional. */
+        readonly required?: boolean;
       }
   >
 >;
@@ -66,6 +70,7 @@ function dryRunValue(
   key: string,
   raw: string,
   env: PreflightEnv,
+  optional: boolean,
 ): PreflightItem | undefined {
   const id = `mcp.${server}.${kind}.${key}`;
   const what = `mcp server ${JSON.stringify(server)} ${kind} ${key}`;
@@ -96,6 +101,19 @@ function dryRunValue(
       };
     } catch (err) {
       const message = err instanceof ConfigError ? err.message : String(err);
+      // #406 — an OPTIONAL server's unresolvable ref DEGRADES at boot
+      // (registerOptionalMcpServer warns and skips the server) instead of
+      // killing the process, so the finding is a warn, not a blocker.
+      if (optional) {
+        return {
+          id,
+          area: "mcp",
+          level: "warn",
+          message: `optional server will be skipped: ${message}`,
+          remediation: `export ${ref.name}=… before launching`,
+          envVar: ref.name,
+        };
+      }
       return {
         id,
         area: "mcp",
@@ -141,14 +159,26 @@ export function mcpDryRunItems(
   if (mcpServers === undefined) return [];
   const items: PreflightItem[] = [];
   for (const [server, config] of Object.entries(mcpServers)) {
+    // #406 — surface the optional contract where the operator reads boot
+    // predictions: a failed boot (unreachable peer or unresolvable config)
+    // degrades, and the server's tools are absent until it connects.
+    const optional = config.required === false;
+    if (optional) {
+      items.push({
+        id: `mcp.${server}.optional`,
+        area: "mcp",
+        level: "info",
+        message: `mcp server ${JSON.stringify(server)} is optional (required: false) — a failed boot degrades: the run continues without its tools until the server connects`,
+      });
+    }
     if (config.transport === "stdio") {
       for (const [key, raw] of Object.entries(config.env ?? {})) {
-        const item = dryRunValue(server, "env", key, raw, env);
+        const item = dryRunValue(server, "env", key, raw, env, optional);
         if (item !== undefined) items.push(item);
       }
     } else {
       for (const [key, raw] of Object.entries(config.headers ?? {})) {
-        const item = dryRunValue(server, "header", key, raw, env);
+        const item = dryRunValue(server, "header", key, raw, env, optional);
         if (item !== undefined) items.push(item);
       }
     }

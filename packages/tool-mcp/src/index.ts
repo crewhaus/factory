@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { McpError } from "@crewhaus/errors";
-import type { McpClient, McpHost, McpToolDefinition } from "@crewhaus/mcp-host";
+import type { McpClient, McpHost, McpServerConfig, McpToolDefinition } from "@crewhaus/mcp-host";
+import { nextBackoffMs } from "@crewhaus/mcp-host";
 import { type RunContext, tagContent } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolCatalog, ToolExecuteContext } from "@crewhaus/tool-catalog";
@@ -371,6 +372,196 @@ export async function watchMcpServer(
     void runReconcile();
   });
   return { stop: unsubscribe };
+}
+
+// ---------------------------------------------------------------------------
+// #406 — optional MCP peers: degrade at boot, retry in the background,
+// register on arrival.
+// ---------------------------------------------------------------------------
+
+export type OptionalMcpServerOptions = WatchMcpServerOptions & {
+  /** Boot/retry banner sink (the daemon's stdout writer). */
+  readonly log?: (line: string) => void;
+  /** Timer seams so tests drive the retry ladder without sleeping. */
+  readonly setTimer?: (cb: () => void, ms: number) => unknown;
+  readonly clearTimer?: (handle: unknown) => void;
+  /** Backoff schedule; defaults to mcp-host's ladder (1 s → 30 s, jittered). */
+  readonly backoffMs?: (attempt: number) => number;
+  /** Background retry after a failed first attempt. Defaults to true (the
+   *  daemon contract). One-shot surfaces (a cli run, a crew run, a workflow)
+   *  pass false: their tool list is frozen for the process, so a peer that
+   *  connects mid-run could never reach the model anyway — the honest
+   *  behaviour is "absent for this run", not a retry banner mid-turn. */
+  readonly retry?: boolean;
+  /** Deferred config resolution + `host.addServer`, run INSIDE the
+   *  never-throw boundary. An optional peer must not be able to take the
+   *  boot down through ANY path — including `resolveMcpServerConfig`
+   *  throwing on an unset env var (the dev machine that deliberately omits
+   *  the optional peer's key). A config failure warns and gives up
+   *  permanently (no retry — env vars do not appear mid-process); a connect
+   *  failure follows the retry contract. When absent, the caller already
+   *  added the server to the host. */
+  readonly config?: () => McpServerConfig;
+};
+
+export type OptionalMcpServerHandle = {
+  /** Resolves once the FIRST attempt has settled (connected or warned), so a
+   *  boot sequence can log deterministically without blocking on eventual
+   *  success. Never rejects. */
+  readonly firstAttempt: Promise<boolean>;
+  /** True once the server has connected and its tools are on the catalog. */
+  connected(): boolean;
+  /** Cancel the retry ladder and (when connected) stop the live re-diff.
+   *  Registered tools stay on the catalog — stopping the WATCH must not
+   *  yank tools out from under a running turn. */
+  stop(): void;
+};
+
+/**
+ * Register an OPTIONAL server: one whose absence must not stop the boot.
+ *
+ * The default contract stays fail-fast — a required peer that cannot connect
+ * exits the daemon, because an agent whose instructions assume a tool behaves
+ * worse when it silently vanishes than when it refuses to start. This is the
+ * spec-opted alternative (`mcp_servers.<name>.required: false`) for the peers
+ * where absence is a normal state: the A2A neighbour that boots after us —
+ * two daemons that mount each other otherwise cannot both start first, which
+ * turns every peer topology into a boot-order problem (and, past the
+ * supervisor's restart window, into `crash-looping`).
+ *
+ * Behaviour:
+ *   - with `opts.config`, config resolution + `host.addServer` run inside
+ *     the never-throw boundary too: an unset env var WARNS and gives up
+ *     permanently instead of taking the boot down (or retrying a failure
+ *     that cannot heal);
+ *   - the first connect attempt happens immediately; failure WARNS through
+ *     `log` (naming the server and that the daemon continues without its
+ *     tools) instead of throwing;
+ *   - retries follow mcp-host's backoff ladder indefinitely — a peer that
+ *     appears an hour later is still picked up, with no restart (unless the
+ *     caller passed `retry: false`, the one-shot-surface mode);
+ *   - on connect the server's tools register through {@link watchMcpServer},
+ *     so the catalog additionally stays reconciled with later
+ *     `tools/list_changed` notifications (the first production consumer of
+ *     the G74 machinery);
+ *   - which SURFACES see late-registered tools is the caller's contract:
+ *     shapes that re-read the catalog per message/job (channel with an
+ *     optional peer, managed, batch) advertise them on the next turn; a
+ *     one-shot crew or a single long cli loop keeps its boot snapshot.
+ *
+ * Never throws: an optional peer must not be able to take the boot down
+ * through this path at all.
+ */
+export function registerOptionalMcpServer(
+  host: McpHost,
+  serverName: string,
+  catalog: ToolCatalog,
+  opts: OptionalMcpServerOptions = {},
+): OptionalMcpServerHandle {
+  const log = opts.log ?? (() => {});
+  const setTimer = opts.setTimer ?? ((cb: () => void, ms: number) => setTimeout(cb, ms));
+  const clearTimer =
+    opts.clearTimer ?? ((h: unknown) => clearTimeout(h as ReturnType<typeof setTimeout>));
+  const backoffMs = opts.backoffMs ?? nextBackoffMs;
+  const retry = opts.retry !== false;
+
+  let stopped = false;
+  let isConnected = false;
+  let attempt = 0;
+  let timer: unknown = null;
+  let watch: McpServerWatch | undefined;
+  // Config resolution is deferred into the first run when `opts.config` is
+  // given; a throw there is PERMANENT (no retry) — see the option's doc.
+  let added = opts.config === undefined;
+  let configFailed = false;
+
+  const tryOnce = async (): Promise<boolean> => {
+    if (!added && opts.config !== undefined) {
+      try {
+        host.addServer(serverName, opts.config());
+        added = true;
+      } catch (err) {
+        configFailed = true;
+        log(
+          `[mcp] optional server "${serverName}" not configured (${firstLineOf(err)}) — continuing without its tools\n`,
+        );
+        return false;
+      }
+    }
+    const client: McpClient = host.getClient(serverName);
+    try {
+      await client.connect();
+    } catch (err) {
+      const rest = retry
+        ? "continuing without its tools; retrying in the background"
+        : "continuing without its tools for this run";
+      log(`[mcp] optional server "${serverName}" unreachable (${firstLineOf(err)}) — ${rest}\n`);
+      return false;
+    }
+    let registered = 0;
+    watch = await watchMcpServer(host, serverName, catalog, {
+      ...opts,
+      onRegister: (info) => {
+        registered += 1;
+        opts.onRegister?.(info);
+      },
+      onError: (err) => {
+        log(`[mcp] optional server "${serverName}" reconcile failed: ${firstLineOf(err)}\n`);
+        opts.onError?.(err);
+      },
+    });
+    isConnected = true;
+    log(
+      `[mcp] optional server "${serverName}" connected — ${registered} tool(s) registered` +
+        `${attempt > 0 ? ` after ${attempt} retr${attempt === 1 ? "y" : "ies"}` : ""}\n`,
+    );
+    return true;
+  };
+
+  const scheduleNext = (): void => {
+    if (stopped || !retry || configFailed) return;
+    attempt += 1;
+    timer = setTimer(() => {
+      timer = null;
+      void run();
+    }, backoffMs(attempt));
+  };
+
+  const run = async (): Promise<boolean> => {
+    if (stopped) return false;
+    const ok = await tryOnce().catch((err) => {
+      // getClient on an unregistered name, or a watch failure — still not a
+      // reason an OPTIONAL peer may take the boot down.
+      log(`[mcp] optional server "${serverName}" failed: ${firstLineOf(err)}\n`);
+      return false;
+    });
+    if (!ok) scheduleNext();
+    return ok;
+  };
+
+  const firstAttempt = run();
+
+  return {
+    firstAttempt: firstAttempt.then(
+      (ok) => ok,
+      () => false,
+    ),
+    connected: () => isConnected,
+    stop: () => {
+      stopped = true;
+      if (timer !== null) {
+        clearTimer(timer);
+        timer = null;
+      }
+      watch?.stop();
+    },
+  };
+}
+
+/** The first line of an error's message — boot banners are one line each. */
+function firstLineOf(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.split("\n")[0] ?? message;
 }
 
 // ---------------------------------------------------------------------------

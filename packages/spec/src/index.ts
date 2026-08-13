@@ -93,12 +93,26 @@ const permissionsBlock = z
 // MCP servers block (Section 9). Discriminated on `transport` so unknown
 // configs surface as a clear "Invalid literal value" error rather than a
 // confusing union-of-rejections.
+/**
+ * #406 — `required: false` marks a server this harness can run WITHOUT.
+ *
+ * Default (absent or true) keeps the fail-fast contract: a peer that cannot
+ * connect at boot exits the daemon, because an agent whose instructions
+ * assume a tool behaves worse when it silently vanishes than when it refuses
+ * to start. `required: false` is the opt-out for genuinely optional peers —
+ * an A2A neighbour that may boot after us, a nice-to-have enrichment server:
+ * a failed initial connect warns, the daemon serves, and the connection
+ * retries in the background, registering the peer's tools when it lands.
+ */
+const mcpRequiredField = z.boolean().optional();
+
 const stdioMcpConfig = z
   .object({
     transport: z.literal("stdio"),
     command: z.string().min(1),
     args: z.array(z.string()).optional(),
     env: z.record(z.string()).optional(),
+    required: mcpRequiredField,
   })
   .strict();
 
@@ -107,6 +121,7 @@ const sseMcpConfig = z
     transport: z.literal("sse"),
     url: z.string().url(),
     headers: z.record(z.string()).optional(),
+    required: mcpRequiredField,
   })
   .strict();
 

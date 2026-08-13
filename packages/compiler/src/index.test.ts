@@ -3394,3 +3394,202 @@ budget:
     expect(agentTs).not.toContain("budget:");
   });
 });
+
+describe("mcp_servers.<name>.required: false (#406) — optional MCP peers", () => {
+  const cliSpec = (required: string) => `
+name: peer-cli
+target: cli
+agent:
+  model: m
+  instructions: i
+mcp_servers:
+  peer:
+    transport: sse
+    url: https://peer.example/sse${required}
+`;
+
+  test("spec accepts required: false and required: true; rejects non-booleans", () => {
+    expect(() => compile(cliSpec("\n    required: false"))).not.toThrow();
+    expect(() => compile(cliSpec("\n    required: true"))).not.toThrow();
+    expect(() => compile(cliSpec('\n    required: "yes"'))).toThrow();
+  });
+
+  test("required: true is the default spelled out — bundles are byte-identical", () => {
+    const dflt = compile(cliSpec("")).files;
+    const spelled = compile(cliSpec("\n    required: true")).files;
+    expect(spelled).toEqual(dflt);
+  });
+
+  test("cli: optional server registers through the never-throw boundary, degrade-only", () => {
+    const content = compile(cliSpec("\n    required: false")).files[0]?.content ?? "";
+    expect(content).toContain('import { registerOptionalMcpServer } from "@crewhaus/tool-mcp";');
+    // No eager addServer — config resolution happens inside the boundary.
+    expect(content).not.toContain('mcpHost.addServer("peer",');
+    expect(content).toContain(
+      'await registerOptionalMcpServer(mcpHost, "peer", defaultCatalog, { retry: false, config: () => resolveMcpServerConfig(',
+    );
+    // The embedded wire config never carries the emit-time flag.
+    expect(content).not.toContain('"required"');
+    // No required servers → no Promise.all pass at all.
+    expect(content).not.toContain("registerMcpServer(mcpHost,");
+  });
+
+  test("cli: required and optional servers split into their two passes", () => {
+    const content =
+      compile(`
+name: peer-cli
+target: cli
+agent:
+  model: m
+  instructions: i
+mcp_servers:
+  fs:
+    transport: stdio
+    command: npx
+  peer:
+    transport: sse
+    url: https://peer.example/sse
+    required: false
+`).files[0]?.content ?? "";
+    expect(content).toContain(
+      'import { registerMcpServer, registerOptionalMcpServer } from "@crewhaus/tool-mcp";',
+    );
+    expect(content).toContain('mcpHost.addServer("fs",');
+    expect(content).toContain('registerMcpServer(mcpHost, "fs", defaultCatalog,');
+    expect(content).not.toContain('mcpHost.addServer("peer",');
+    expect(content).toContain('registerOptionalMcpServer(mcpHost, "peer", defaultCatalog,');
+  });
+
+  const channelSpec = (required: string) => `
+name: peer-channel
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+mcp_servers:
+  peer:
+    transport: sse
+    url: https://peer.example/sse${required}
+`;
+
+  test("channel: optional server wires background retry + the live catalog read", () => {
+    const bundle = compile(channelSpec("\n    required: false"));
+    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    const agent = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    // Daemon: optional registration, retry ON (default), first attempt awaited.
+    expect(daemon).toContain(
+      'const __mcpOptional_0 = registerOptionalMcpServer(mcpHost, "peer", defaultCatalog, {',
+    );
+    expect(daemon).toContain("await __mcpOptional_0.firstAttempt;");
+    expect(daemon).not.toContain("retry: false");
+    expect(daemon).not.toContain('mcpHost.addServer("peer",');
+    // Agent: per-message catalog re-read replaces the boot snapshot, so the
+    // peer's late-registered tools reach the model without a restart.
+    expect(agent).toContain('import { defaultCatalog } from "@crewhaus/tool-catalog";');
+    expect(agent).toContain("const __liveTools = defaultCatalog.list();");
+  });
+
+  test("channel: without the opt-in the boot snapshot stays (byte-safety)", () => {
+    const bundle = compile(channelSpec(""));
+    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    const agent = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(daemon).not.toContain("registerOptionalMcpServer");
+    expect(agent).not.toContain("__liveTools");
+    expect(agent).not.toContain("import { defaultCatalog }");
+  });
+
+  test("workflow: optional server is degrade-only (frozen step tools)", () => {
+    const bundle = compile(`
+name: peer-flow
+target: workflow
+model: m
+steps:
+  - name: one
+    instructions: i
+    tools:
+      - bash
+mcp_servers:
+  peer:
+    transport: sse
+    url: https://peer.example/sse
+    required: false
+`);
+    const content = bundle.files.map((f) => f.content).join("\n");
+    expect(content).toContain(
+      'registerOptionalMcpServer(__mcpHost, "peer", __mcpCatalog, { retry: false,',
+    );
+    expect(content).not.toContain('__mcpHost.addServer("peer",');
+  });
+
+  test("crew: optional server is degrade-only (wire-once boot snapshot)", () => {
+    const bundle = compile(`
+name: peer-crew
+target: crew
+model: m
+entry: a
+roles:
+  a:
+    instructions: do a
+mcp_servers:
+  peer:
+    transport: sse
+    url: https://peer.example/sse
+    required: false
+`);
+    const content = bundle.files.map((f) => f.content).join("\n");
+    expect(content).toContain(
+      'registerOptionalMcpServer(mcpHost, "peer", __mcpCatalog, { retry: false,',
+    );
+    expect(content).not.toContain('mcpHost.addServer("peer",');
+  });
+
+  test("research: optional server keeps background retry (per-branch catalog re-read)", () => {
+    const bundle = compile(`
+name: peer-research
+target: research
+agent:
+  model: m
+  instructions: i
+goal: find things
+mcp_servers:
+  peer:
+    transport: sse
+    url: https://peer.example/sse
+    required: false
+`);
+    const content = bundle.files.map((f) => f.content).join("\n");
+    expect(content).toContain(
+      'registerOptionalMcpServer(mcpHost, "peer", defaultCatalog, { config:',
+    );
+    expect(content).not.toContain("retry: false");
+    expect(content).not.toContain('mcpHost.addServer("peer",');
+  });
+
+  test("batch: optional server keeps background retry (per-job catalog re-read)", () => {
+    const bundle = compile(`
+name: peer-batch
+target: batch
+agent:
+  model: m
+  instructions: i
+queue:
+  adapter: in-memory
+mcp_servers:
+  peer:
+    transport: sse
+    url: https://peer.example/sse
+    required: false
+`);
+    const content = bundle.files.map((f) => f.content).join("\n");
+    expect(content).toContain(
+      'registerOptionalMcpServer(mcpHost, "peer", defaultCatalog, { config:',
+    );
+    expect(content).not.toContain("retry: false");
+  });
+});

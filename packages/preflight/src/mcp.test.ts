@@ -110,3 +110,59 @@ describe("mcpDryRunItems", () => {
     ).toEqual([]);
   });
 });
+
+describe("mcpDryRunItems — optional servers (#406)", () => {
+  test("required: false surfaces the optional contract as info", () => {
+    const items = mcpDryRunItems(
+      {
+        peer: { transport: "sse", url: "https://peer.example/sse", required: false },
+      },
+      {},
+    );
+    expect(items).toHaveLength(1);
+    expect(items[0]?.id).toBe("mcp.peer.optional");
+    expect(items[0]?.level).toBe("info");
+    expect(items[0]?.message).toContain("optional (required: false)");
+    expect(items[0]?.message).toContain("degrades");
+  });
+
+  test("an unset env ref on an OPTIONAL server warns instead of blocking", () => {
+    const items = mcpDryRunItems(
+      {
+        peer: {
+          transport: "sse",
+          url: "https://peer.example/sse",
+          headers: { Authorization: "$PEER_TOKEN" },
+          required: false,
+        },
+      },
+      {},
+    );
+    const ref = items.find((i) => i.id === "mcp.peer.header.Authorization");
+    expect(ref?.level).toBe("warn");
+    expect(ref?.message).toContain("optional server will be skipped");
+    expect(ref?.message).toContain("PEER_TOKEN");
+    // The same ref on a required server stays blocking.
+    const blocking = mcpDryRunItems(
+      {
+        peer: {
+          transport: "sse",
+          url: "https://peer.example/sse",
+          headers: { Authorization: "$PEER_TOKEN" },
+        },
+      },
+      {},
+    );
+    expect(blocking.find((i) => i.id === "mcp.peer.header.Authorization")?.level).toBe("blocking");
+  });
+
+  test("required: true is not flagged as optional", () => {
+    const items = mcpDryRunItems(
+      {
+        peer: { transport: "sse", url: "https://peer.example/sse", required: true },
+      },
+      {},
+    );
+    expect(items.find((i) => i.id === "mcp.peer.optional")).toBeUndefined();
+  });
+});
