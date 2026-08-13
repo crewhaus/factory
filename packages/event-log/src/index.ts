@@ -101,6 +101,20 @@ export type EventKind =
   // a conversational message, so `replayMessageHistory` ignores it and resume
   // is unaffected.
   | "cost_accrual"
+  // #405 — the toolset advertised to the model on a run, recorded so a
+  // RESUMED session can tell whether its capabilities changed while it was
+  // parked. Payload `{ toolNames: string[] }` (sorted). Written by
+  // runtime-core at loop start ONLY when the set differs from the last
+  // recorded one (or none was recorded), so an unchanged fleet writes one
+  // line per session, not one per turn. The consumer is the resume path:
+  // a difference injects a synthetic "toolset changed" user message, which
+  // is what stops a long session politely denying tools it gained mid-life
+  // — the transcript's own stale enumeration otherwise beats the live
+  // schema, forever. Non-conversational: `replayMessageHistory` ignores it,
+  // so `--resume` replay is unaffected, and readers written before this
+  // kind existed keep parsing (every session-log reader branches on the
+  // kinds it knows and skips the rest).
+  | "toolset"
   // A human rating on a specific assistant turn — a thumbs up/down, a
   // star/scale score, and/or a free-text comment or correction. Written by
   // the `crewhaus rate`/`feedback` capture surfaces and read back by

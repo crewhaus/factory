@@ -133,6 +133,11 @@ export const BUILTIN_BOOKKEEPING_RULES: ReadonlyArray<PermissionRule> = [
   { type: "alwaysAllow", pattern: "GoalWrite", source: "builtin" },
   { type: "alwaysAllow", pattern: "GoalUpdate", source: "builtin" },
   { type: "alwaysAllow", pattern: "GoalList", source: "builtin" },
+  // #405 — the toolset-introspection tool. Read-only and side-effect-free,
+  // and its whole purpose is breaking the stale-transcript deadlock in a
+  // HEADLESS session — an introspection tool that parks on approval there
+  // is useless for exactly the case it exists for.
+  { type: "alwaysAllow", pattern: "ListTools", source: "builtin" },
 ];
 
 /**

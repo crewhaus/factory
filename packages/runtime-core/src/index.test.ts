@@ -3513,7 +3513,12 @@ describe("runChatLoop plugins option (Item 3 / G32)", () => {
       permissionMode: "bypass",
     });
 
-    expect(capturedTools()[0]?.map((t) => t.name)).toEqual(["first-party", "plugin-tool"]);
+    expect(capturedTools()[0]?.map((t) => t.name)).toEqual([
+      "first-party",
+      "plugin-tool",
+      // #405 — the runtime's own introspection tool, appended after the merge.
+      "ListTools",
+    ]);
   });
 
   test("a plugin tool cannot shadow a first-party tool of the same name", async () => {
@@ -3543,7 +3548,8 @@ describe("runChatLoop plugins option (Item 3 / G32)", () => {
     });
 
     const advertised = capturedTools()[0] ?? [];
-    expect(advertised.map((t) => t.name)).toEqual(["dup"]);
+    // #405 — ListTools rides every tool-carrying loop, after the caller's own.
+    expect(advertised.map((t) => t.name)).toEqual(["dup", "ListTools"]);
     expect(advertised[0]?.description).toBe("FIRST PARTY");
   });
 
@@ -3566,6 +3572,7 @@ describe("runChatLoop plugins option (Item 3 / G32)", () => {
       permissionMode: "bypass",
     });
 
-    expect(capturedTools()[0]?.map((t) => t.name)).toEqual(["only"]);
+    // #405 — plus the runtime's own introspection tool, appended last.
+    expect(capturedTools()[0]?.map((t) => t.name)).toEqual(["only", "ListTools"]);
   });
 });

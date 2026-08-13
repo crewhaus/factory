@@ -742,6 +742,9 @@ const WATCHME_MIRRORED_KIND_RECORD: Readonly<Record<EventKind, true>> = {
   assistant_message: true,
   tool_use: true,
   tool_result: true,
+  // #405 — the per-run toolset record. Durable metadata (names only), and
+  // exactly the kind of runtime fact watch-me mirrors should carry.
+  toolset: true,
   error: true,
   run_failed: true,
   context_evicted: true,
