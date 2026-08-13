@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/default-skills",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "type": "module",
   "description": "Shipped default skills (continuity, learning-loop, dream) and builtin slash commands",
   "main": "src/index.ts",
