@@ -136,6 +136,7 @@ import {
 } from "./cli-markdown";
 import { type ExitRatingFeedback, FEEDBACK_EVENT_KIND, runExitRating } from "./exit-rating";
 import { attachIncidentCollector } from "./incident-collector";
+import { type AdvertisedToolSummary, LIST_TOOLS_NAME, buildListToolsTool } from "./list-tools";
 import {
   type AlertSink,
   type AttachedAdvisorPersistence,
@@ -1178,6 +1179,16 @@ export type RunChatLoopOptions = {
    */
   sessionTarget?: string;
   /**
+   * #405 — identifies the AGENT CONTEXT that owns this run's toolset within a
+   * session several contexts share. A crew is the case that forces it: every
+   * role activation appends to ONE session log and each role carries its own
+   * tools, so a cross-role comparison would report a "toolset changed"
+   * that never happened. Records are written and read per scope; single-
+   * context sessions (cli, channel, managed) leave it unset and compare
+   * against their own unscoped history exactly as before.
+   */
+  toolsetScope?: string;
+  /**
    * Resume an existing session: load its metadata, replay its event log
    * into the message history (only `user_message` + `assistant_message`
    * events; tool_use/tool_result are audit-only and already nested inside
@@ -2090,7 +2101,19 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Item 3 (G32) — resolve the advertised tool set ONCE, up front, folding in
   // any plugin-contributed tools so the tool-capable-model feature gate and the
   // per-turn advertisement below read the same list.
-  const effectiveTools = mergeEffectiveTools(opts.tools ?? [], opts.plugins?.tools);
+  const mergedTools = mergeEffectiveTools(opts.tools ?? [], opts.plugins?.tools);
+  // #405 — the runtime's own toolset-introspection tool rides every
+  // TOOL-CARRYING loop. Late-bound: it is part of the list it reports, so it
+  // reads the advertised summaries assigned after that list is built below.
+  // A ZERO-tool loop stays zero-tool (the tool-capable-model gate reads this
+  // list, and a chat-only spec must not become tool-requiring), and a caller
+  // that brings its own tool under the same name wins — the same
+  // first-party-wins posture the plugin merge takes.
+  let listToolsSummaries: ReadonlyArray<AdvertisedToolSummary> = [];
+  const effectiveTools =
+    mergedTools.length === 0 || mergedTools.some((t) => t.name === LIST_TOOLS_NAME)
+      ? mergedTools
+      : [...mergedTools, buildListToolsTool(() => listToolsSummaries)];
   // Pillar 3 — make the model-backed Layer-3 classifier reachable at EVERY
   // trust boundary (MCP / sub-agent / channel / federation / skill /
   // compaction / chain / orchestrator). Boundary call sites don't thread an
@@ -2438,6 +2461,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
   let sessionId: string;
   let resumedMessages: Anthropic.MessageParam[] | undefined;
+  // #405 — the toolset recorded by this session's LAST run (undefined when
+  // the session predates the record, or on a fresh session).
+  let resumedToolNames: readonly string[] | undefined;
   // §2.3 — on resume, the requirements ledger rebuilds DETERMINISTICALLY
   // from the `context_evicted` events already on disk (dedup against
   // re-evictions happens at fold time): a resumed session recovers every
@@ -2453,17 +2479,47 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     sessionId = existing.id;
     const replayLog = await openEventLog(sessionId, { rootDir: sessionRootDir });
     resumedMessages = await replayMessageHistory(replayLog);
-    if (opts.continuity !== undefined && opts.continuity.ledger !== false) {
-      for await (const ev of replayLog.read()) {
-        if (ev.kind !== "context_evicted") continue;
-        const p = ev.payload as { role?: unknown; text?: unknown; turnNumber?: unknown };
-        if (p.role === "user" && typeof p.text === "string") {
-          resumedLedgerSeed.push({
-            role: "user",
-            text: p.text,
-            ...(typeof p.turnNumber === "number" ? { turnNumber: p.turnNumber } : {}),
-          });
+    // One pass gathers both resume-time reads: the continuity ledger seed
+    // (conditional) and the LAST recorded toolset (#405 — unconditional, so
+    // the marker below can tell a resumed session its capabilities changed
+    // while it was parked).
+    const wantLedger = opts.continuity !== undefined && opts.continuity.ledger !== false;
+    // Mirror `replayMessageHistory` / the janitor's orphan scan: events nested
+    // inside a2a_turn_start / sub_agent_start brackets belong to a PEER's or a
+    // sub-agent's transcript — their toolsets are legitimately different and
+    // must not be mistaken for this context's previous one.
+    let nestDepth = 0;
+    for await (const ev of replayLog.read()) {
+      if (ev.kind === "a2a_turn_start" || ev.kind === "sub_agent_start") {
+        nestDepth += 1;
+        continue;
+      }
+      if (ev.kind === "a2a_turn_end" || ev.kind === "sub_agent_end") {
+        nestDepth = Math.max(0, nestDepth - 1);
+        continue;
+      }
+      if (ev.kind === "toolset") {
+        if (nestDepth > 0) continue;
+        const p = ev.payload as { toolNames?: unknown; scope?: unknown };
+        // Records from a DIFFERENT agent context in the same session (crew
+        // roles share one log) describe a different toolset by design.
+        const recordScope = typeof p.scope === "string" ? p.scope : undefined;
+        if (recordScope !== opts.toolsetScope) continue;
+        if (Array.isArray(p.toolNames) && p.toolNames.every((n) => typeof n === "string")) {
+          resumedToolNames = p.toolNames as string[];
         }
+        continue;
+      }
+      // NOTE: the ledger seed below deliberately keeps its pre-#405 behaviour
+      // (no depth filter) — the guard above applies to `toolset` only.
+      if (!wantLedger || ev.kind !== "context_evicted") continue;
+      const p = ev.payload as { role?: unknown; text?: unknown; turnNumber?: unknown };
+      if (p.role === "user" && typeof p.text === "string") {
+        resumedLedgerSeed.push({
+          role: "user",
+          text: p.text,
+          ...(typeof p.turnNumber === "number" ? { turnNumber: p.turnNumber } : {}),
+        });
       }
     }
     await replayLog.close();
@@ -2682,6 +2738,52 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   };
 
   const eventLog: EventLog = await openEventLog(sessionId, { rootDir: sessionRootDir });
+
+  // #405 — reconcile the session's recorded toolset with THIS run's.
+  //
+  // The failure this closes: a session parked on build N enumerates its
+  // toolset into the conversation; the daemon is rebuilt with tools added and
+  // the session resumes with the new definitions attached to every request —
+  // yet the transcript's own stale enumeration beats the live schema, and the
+  // agent politely denies the new tools forever. A synthetic user message is
+  // the established runtime-injected-turn convention (the control-plane poke
+  // marker): the MODEL sees it on this and every later replay, while every
+  // turn-deriving reader (feedback distill, eval digests, summarizers) skips
+  // `synthetic: true`.
+  //
+  // The record is written only when the set CHANGED (or was never recorded),
+  // so an unchanged fleet costs one `toolset` line per session, not one per
+  // turn. Sessions from before this record exist get no marker on their first
+  // resume — there is nothing to compare against — and are covered from then
+  // on.
+  {
+    const currentToolNames = [...effectiveTools.map((t) => t.name)].sort();
+    const prior = resumedToolNames === undefined ? undefined : [...resumedToolNames].sort();
+    const changed =
+      prior !== undefined &&
+      (prior.length !== currentToolNames.length ||
+        prior.some((name, i) => name !== currentToolNames[i]));
+    if (changed && resumedMessages !== undefined) {
+      const added = currentToolNames.filter((n) => !prior.includes(n));
+      const removed = prior.filter((n) => !currentToolNames.includes(n));
+      const delta = [...added.map((n) => `+${n}`), ...removed.map((n) => `−${n}`)].join(", ");
+      const marker = `[system] The toolset changed while this session was idle: ${delta}. The tool schema attached to this request is the authoritative list — any toolset enumerated earlier in this conversation is stale. Call ListTools to verify.`;
+      resumedMessages.push({ role: "user", content: marker });
+      await eventLog.append({
+        kind: "user_message",
+        payload: { content: marker, synthetic: true, toolset: { added, removed } },
+      });
+    }
+    if (prior === undefined || changed) {
+      await eventLog.append({
+        kind: "toolset",
+        payload: {
+          toolNames: currentToolNames,
+          ...(opts.toolsetScope !== undefined ? { scope: opts.toolsetScope } : {}),
+        },
+      });
+    }
+  }
 
   // Section 27 — mirror per-call cost_accrual events from the trace bus into
   // the session JSONL so `crewhaus cost-summary --session <id>` can sum spend
@@ -3227,6 +3329,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // gate's `justification` contract injected for `requireJustification`
   // tools whose own schema doesn't declare it (see `toAdvertisedTool`).
   const advertisedTools = tools.map((t) => ({ tool: t, advertised: toAdvertisedTool(t) }));
+  // #405 — what ListTools reports: the exact list advertised on this request,
+  // with the gate flag reflecting the ADVERTISED contract (a runtime-injected
+  // justification is part of that contract even though the tool's own schema
+  // never declared it).
+  listToolsSummaries = advertisedTools.map(({ tool, advertised }) => ({
+    name: tool.name,
+    description: tool.description,
+    readOnly: tool.readOnly,
+    destructive: tool.destructive,
+    gated: tool.requireJustification === true || advertised.justificationInjected === true,
+  }));
   const anthropicTools: Anthropic.Tool[] | undefined =
     advertisedTools.length > 0
       ? advertisedTools.map(({ tool, advertised }) => ({

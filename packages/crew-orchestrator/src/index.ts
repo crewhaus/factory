@@ -551,6 +551,10 @@ async function* driveCrew(
           runContext,
           sessionName: args.crewName,
           sessionTarget: "crew",
+          // #405 — every role appends to ONE crew session log with its own
+          // tools; scoping the toolset record per role is what keeps a
+          // handoff from reading as "your capabilities changed".
+          toolsetScope: toRole,
           ...(args.opts.sessionRootDir !== undefined
             ? { sessionRootDir: args.opts.sessionRootDir }
             : {}),
@@ -650,6 +654,9 @@ async function* driveCrew(
           runContext,
           sessionName: args.crewName,
           sessionTarget: "crew",
+          // #405 — see the A2A site: per-role scope, so a handoff between
+          // roles with different tools is not reported as a toolset change.
+          toolsetScope: currentRoleName,
           ...(args.opts.sessionRootDir !== undefined
             ? { sessionRootDir: args.opts.sessionRootDir }
             : {}),
