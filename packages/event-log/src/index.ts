@@ -103,10 +103,16 @@ export type EventKind =
   | "cost_accrual"
   // #405 — the toolset advertised to the model on a run, recorded so a
   // RESUMED session can tell whether its capabilities changed while it was
-  // parked. Payload `{ toolNames: string[] }` (sorted). Written by
-  // runtime-core at loop start ONLY when the set differs from the last
-  // recorded one (or none was recorded), so an unchanged fleet writes one
-  // line per session, not one per turn. The consumer is the resume path:
+  // parked. Payload `{ toolNames: string[], scope?: string }` (sorted).
+  // `scope` names the agent context that owns the set when several share one
+  // session — a crew's roles each carry their own tools and append to one
+  // log, so records are matched by scope and records nested inside
+  // a2a_turn_start / sub_agent_start brackets are skipped entirely; without
+  // both, a handoff between two roles reads as a capability change. Written
+  // by runtime-core at loop start ONLY when the set differs from the last
+  // recorded one for that scope (or none was recorded), so an unchanged
+  // fleet writes one line per session, not one per turn. The consumer is the
+  // resume path:
   // a difference injects a synthetic "toolset changed" user message, which
   // is what stops a long session politely denying tools it gained mid-life
   // — the transcript's own stale enumeration otherwise beats the live

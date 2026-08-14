@@ -147,6 +147,7 @@ async function turn(opts: {
   tools: ReturnType<typeof aTool>[];
   adapter: ProviderAdapter;
   sessionId?: string;
+  toolsetScope?: string;
 }): Promise<{ sessionId: string; result: string }> {
   const runContext = createRunContext(
     opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {},
@@ -161,6 +162,7 @@ async function turn(opts: {
     permissionMode: "default",
     tools: opts.tools,
     _adapter: opts.adapter,
+    ...(opts.toolsetScope !== undefined ? { toolsetScope: opts.toolsetScope } : {}),
     ...(opts.sessionId !== undefined ? { resume: { sessionId: opts.sessionId } } : {}),
   } as Parameters<typeof runChatLoop>[0]);
   return { sessionId: runContext.sessionId, result };
@@ -333,5 +335,79 @@ describe("the resumed-session toolset marker", () => {
     // Nothing to compare against ⇒ no marker; but the record now exists.
     expect(JSON.stringify(rec.requests[0]?.messages ?? [])).not.toContain("toolset changed");
     expect(sessionEvents(first.sessionId).some((e) => e.kind === "toolset")).toBe(true);
+  });
+
+  // A CREW is the shape that forces per-context scoping: every role
+  // activation resumes the SAME session log and carries its own tools, so an
+  // unscoped comparison would announce a "change" on every single handoff.
+  test("crew roles sharing one session do not read each other's toolsets", async () => {
+    const first = await turn({
+      tools: [aTool("writer_tool")],
+      adapter: answer().adapter,
+      toolsetScope: "writer",
+    });
+    // Role 2 activates on the same session with entirely different tools.
+    const critic = answer();
+    await turn({
+      tools: [aTool("critic_tool")],
+      adapter: critic.adapter,
+      sessionId: first.sessionId,
+      toolsetScope: "critic",
+    });
+    expect(JSON.stringify(critic.requests[0]?.messages ?? [])).not.toContain("toolset changed");
+    // Handing back to role 1 — still unchanged FOR THAT ROLE.
+    const back = answer();
+    await turn({
+      tools: [aTool("writer_tool")],
+      adapter: back.adapter,
+      sessionId: first.sessionId,
+      toolsetScope: "writer",
+    });
+    expect(JSON.stringify(back.requests[0]?.messages ?? [])).not.toContain("toolset changed");
+    // Each role owns exactly one record, tagged with its scope.
+    const records = sessionEvents(first.sessionId).filter((e) => e.kind === "toolset");
+    expect(records.map((r) => (r.payload as { scope?: string }).scope).sort()).toEqual([
+      "critic",
+      "writer",
+    ]);
+  });
+
+  test("a scoped role still hears about its OWN toolset changing", async () => {
+    const first = await turn({
+      tools: [aTool("writer_tool")],
+      adapter: answer().adapter,
+      toolsetScope: "writer",
+    });
+    const rec = answer();
+    await turn({
+      tools: [aTool("writer_tool"), aTool("wiki_write")],
+      adapter: rec.adapter,
+      sessionId: first.sessionId,
+      toolsetScope: "writer",
+    });
+    const texts = JSON.stringify(rec.requests[0]?.messages ?? []);
+    expect(texts).toContain("toolset changed while this session was idle");
+    expect(texts).toContain("+wiki_write");
+  });
+
+  test("a toolset recorded inside an A2A bracket is not mistaken for this context's", async () => {
+    const first = await turn({ tools: [aTool("alpha")], adapter: answer().adapter });
+    // Splice in a nested peer's record, exactly as a crew A2A turn writes it:
+    // bracketed by a2a_turn_start / a2a_turn_end.
+    const dir = join(root, "sessions");
+    const file = readdirSync(dir, { recursive: true, encoding: "utf8" })
+      .filter((f) => f.includes(first.sessionId) && f.endsWith(".jsonl"))
+      .map((f) => join(dir, f))[0] as string;
+    const nested = [
+      JSON.stringify({ kind: "a2a_turn_start", payload: { from: "a", to: "b" } }),
+      JSON.stringify({ kind: "toolset", payload: { toolNames: ["ListTools", "peer_only"] } }),
+      JSON.stringify({ kind: "a2a_turn_end", payload: { from: "a", to: "b" } }),
+    ].join("\n");
+    await Bun.write(file, `${readFileSync(file, "utf8").trimEnd()}\n${nested}\n`);
+
+    const rec = answer();
+    await turn({ tools: [aTool("alpha")], adapter: rec.adapter, sessionId: first.sessionId });
+    // Compared against OUR last record (alpha), not the peer's.
+    expect(JSON.stringify(rec.requests[0]?.messages ?? [])).not.toContain("toolset changed");
   });
 });

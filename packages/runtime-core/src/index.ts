@@ -1179,6 +1179,16 @@ export type RunChatLoopOptions = {
    */
   sessionTarget?: string;
   /**
+   * #405 — identifies the AGENT CONTEXT that owns this run's toolset within a
+   * session several contexts share. A crew is the case that forces it: every
+   * role activation appends to ONE session log and each role carries its own
+   * tools, so a cross-role comparison would report a "toolset changed"
+   * that never happened. Records are written and read per scope; single-
+   * context sessions (cli, channel, managed) leave it unset and compare
+   * against their own unscoped history exactly as before.
+   */
+  toolsetScope?: string;
+  /**
    * Resume an existing session: load its metadata, replay its event log
    * into the message history (only `user_message` + `assistant_message`
    * events; tool_use/tool_result are audit-only and already nested inside
@@ -2474,14 +2484,34 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // the marker below can tell a resumed session its capabilities changed
     // while it was parked).
     const wantLedger = opts.continuity !== undefined && opts.continuity.ledger !== false;
+    // Mirror `replayMessageHistory` / the janitor's orphan scan: events nested
+    // inside a2a_turn_start / sub_agent_start brackets belong to a PEER's or a
+    // sub-agent's transcript — their toolsets are legitimately different and
+    // must not be mistaken for this context's previous one.
+    let nestDepth = 0;
     for await (const ev of replayLog.read()) {
+      if (ev.kind === "a2a_turn_start" || ev.kind === "sub_agent_start") {
+        nestDepth += 1;
+        continue;
+      }
+      if (ev.kind === "a2a_turn_end" || ev.kind === "sub_agent_end") {
+        nestDepth = Math.max(0, nestDepth - 1);
+        continue;
+      }
       if (ev.kind === "toolset") {
-        const p = ev.payload as { toolNames?: unknown };
+        if (nestDepth > 0) continue;
+        const p = ev.payload as { toolNames?: unknown; scope?: unknown };
+        // Records from a DIFFERENT agent context in the same session (crew
+        // roles share one log) describe a different toolset by design.
+        const recordScope = typeof p.scope === "string" ? p.scope : undefined;
+        if (recordScope !== opts.toolsetScope) continue;
         if (Array.isArray(p.toolNames) && p.toolNames.every((n) => typeof n === "string")) {
           resumedToolNames = p.toolNames as string[];
         }
         continue;
       }
+      // NOTE: the ledger seed below deliberately keeps its pre-#405 behaviour
+      // (no depth filter) — the guard above applies to `toolset` only.
       if (!wantLedger || ev.kind !== "context_evicted") continue;
       const p = ev.payload as { role?: unknown; text?: unknown; turnNumber?: unknown };
       if (p.role === "user" && typeof p.text === "string") {
@@ -2745,7 +2775,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       });
     }
     if (prior === undefined || changed) {
-      await eventLog.append({ kind: "toolset", payload: { toolNames: currentToolNames } });
+      await eventLog.append({
+        kind: "toolset",
+        payload: {
+          toolNames: currentToolNames,
+          ...(opts.toolsetScope !== undefined ? { scope: opts.toolsetScope } : {}),
+        },
+      });
     }
   }
 
