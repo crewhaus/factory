@@ -1113,12 +1113,20 @@ describe("runChatLoop — Section 8 orchestrator", () => {
     const elapsed = Date.now() - t0;
 
     expect(callCount()).toBe(2);
-    // Two 60ms tools running in parallel finish in ~60ms total, not 120ms.
-    expect(elapsed).toBeLessThan(105);
-    // Both starts come before either finish.
+    // OVERLAP is the claim, and these three assertions prove it outright:
+    // both tools had started before either finished, which serial execution
+    // cannot produce at any speed.
     expect(startedAt.length).toBe(2);
     expect(finishedAt.length).toBe(2);
     expect(Math.max(...startedAt)).toBeLessThan(Math.min(...finishedAt));
+    // The wall-clock check is kept only as a coarse backstop against a
+    // regression that serializes the pair (which would take >= 120 ms).
+    // Its old 105 ms budget left ~45 ms of headroom over the 60 ms of tool
+    // work and failed routinely on a loaded runner — verified by running it
+    // under CPU contention on the pre-#405 tree, where it failed 6/6. A
+    // timing budget that tight measures the CI machine, not the runtime, and
+    // it has blocked a release.
+    expect(elapsed).toBeLessThan(120);
   });
 });
 
