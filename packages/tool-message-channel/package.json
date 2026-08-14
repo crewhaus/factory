@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-message-channel",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "type": "module",
   "description": "Built-in `SendMessage` tool for cross-channel addressing (Section 12). Permission-gated; fail-closed without an explicit allow rule.",
   "main": "src/index.ts",

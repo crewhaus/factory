@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-harness-synthesizer",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "type": "module",
   "description": "Track D / §55 — Thompson-sampled tree search over candidate verifier functions for skills and tools. Smaller LLM + synthesized verifier beats larger LLM (AutoHarness, arxiv 2603.03329).",
   "main": "src/index.ts",
