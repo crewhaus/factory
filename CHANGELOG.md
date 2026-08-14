@@ -9,14 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`@crewhaus/runtime-core` declares `zod` as a runtime dependency** —
-  0.5.5 is unusable from npm without this. 0.5.5 shipped `list-tools.ts`, the
-  first runtime-core source file to `import { z } from "zod"`, while `zod` sat
-  in `devDependencies`. Inside the monorepo every import resolved through the
-  workspace root, so the full suite and every release gate passed; installed
-  from the registry the runtime dies on load with `ENOENT while resolving
-  package 'zod'`. runtime-core imports `list-tools` unconditionally, so this
-  broke every compiled bundle that installs its dependencies from npm. Two
+- **`@crewhaus/runtime-core` declares `zod` as a runtime dependency.** 0.5.5
+  shipped `list-tools.ts`, the first runtime-core source file to
+  `import { z } from "zod"`, while `zod` sat in `devDependencies`. Inside the
+  monorepo every import resolved through the workspace root, so the full suite
+  and every release gate passed. `dist/index.js` imports `./list-tools`
+  eagerly, so the gap bites wherever resolution honours a package's DECLARED
+  dependencies: Bun's auto-install cache — the path a compiled bundle takes
+  when it runs from a directory with no manifest — fails on load with
+  `ENOENT while resolving package 'zod'`, and strict/isolated layouts fail the
+  same way. A conventional hoisted `npm install` happens to survive it, because
+  sibling packages (`tool-catalog`, `tool-builder`, `spec`) declare `zod` and
+  hoist it to the top level; that is luck, not correctness. Two
   guards keep the class from recurring: a manifest test asserting that every
   external module runtime-core imports at runtime is a declared dependency,
   and a fix to the eval-bridge smoke so it resolves the IN-TREE packages the
