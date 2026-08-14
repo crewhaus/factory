@@ -227,10 +227,15 @@ describe("the ListTools tool", () => {
       inputSchema: z.object({}).strict(),
       execute: async () => "caller wins",
     });
-    const { adapter, requests } = answer();
-    await turn({ tools: [mine], adapter });
+    const { adapter, requests } = callThen(LIST_TOOLS_NAME);
+    const { sessionId } = await turn({ tools: [mine], adapter });
     const names = (requests[0]?.tools ?? []).map((t) => t.name);
     expect(names.filter((n) => n === LIST_TOOLS_NAME)).toHaveLength(1);
+    // Counting names proves only that nothing was double-registered. WHICH
+    // implementation answered is the actual claim, so call it and read the
+    // result: the builtin would have rendered the advertised list instead.
+    const result = sessionEvents(sessionId).find((e) => e.kind === "tool_result");
+    expect(String((result?.payload as { content?: unknown })?.content)).toBe("caller wins");
   });
 
   test("the late-bound thunk sees the final list, including ListTools itself", async () => {
