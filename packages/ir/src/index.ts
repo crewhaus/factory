@@ -46,12 +46,18 @@ export type IrMcpStdioConfig = {
   readonly command: string;
   readonly args: readonly string[];
   readonly env?: Readonly<Record<string, IrSecretRef>>;
+  /** #406 — present (false) ONLY when the spec opted out of fail-fast
+   *  (`required: false`): a failed boot connect degrades + retries instead
+   *  of exiting. Absent = required, byte-identical to pre-#406. */
+  readonly required?: false;
 };
 
 export type IrMcpSseConfig = {
   readonly transport: "sse";
   readonly url: string;
   readonly headers?: Readonly<Record<string, IrSecretRef>>;
+  /** #406 — see {@link IrMcpStdioConfig.required}. */
+  readonly required?: false;
 };
 
 export type IrMcpServerConfig = IrMcpStdioConfig | IrMcpSseConfig;

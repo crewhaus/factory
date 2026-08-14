@@ -29,6 +29,7 @@ import {
   type EmitReadmeOptions,
   type IrCrewRole,
   type IrCrewV0,
+  type IrMcpServerConfig,
   type IrSubAgentDefinition,
   renderBundleReadme,
 } from "@crewhaus/ir";
@@ -390,32 +391,58 @@ function renderMcpServers(ir: IrCrewV0): {
   if (entries.length === 0) {
     return { imports: [], bootBlock: "", hasAny: false };
   }
+  // #406 — servers the spec marked `required: false` degrade at boot instead
+  // of exiting. The crew's tool list (`__mcpTools`) is frozen at wire-once
+  // boot, so the optional path is degrade-only (`retry: false`): tools absent
+  // until restart, no background banner mid-run.
+  const requiredEntries = entries.filter(([, cfg]) => cfg.required !== false);
+  const optionalEntries = entries.filter(([, cfg]) => cfg.required === false);
   const imports = [
     `import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";`,
-    `import { registerMcpServer } from "@crewhaus/tool-mcp";`,
+    `import { ${[
+      ...(requiredEntries.length > 0 ? ["registerMcpServer"] : []),
+      ...(optionalEntries.length > 0 ? ["registerOptionalMcpServer"] : []),
+    ].join(", ")} } from "@crewhaus/tool-mcp";`,
   ];
-  const addLines = entries
+  // Optional entries are NOT added here: their config resolution + addServer
+  // run inside registerOptionalMcpServer's never-throw boundary (an unset env
+  // var on an optional peer must degrade, not kill the boot).
+  const addLines = requiredEntries
     .map(
       ([name, cfg]) =>
         `  mcpHost.addServer(${escapeJsonString(name)}, resolveMcpServerConfig(${JSON.stringify(cfg)}, { name: ${escapeJsonString(name)} }));`,
     )
     .join("\n");
-  const registerLines = entries
+  const registerLines = requiredEntries
     .map(
       ([name]) =>
         `    registerMcpServer(mcpHost, ${escapeJsonString(name)}, __mcpCatalog, { onRegister: ({ fullName }) => process.stderr.write(\`[mcp] registered \${fullName}\\n\`) }),`,
     )
     .join("\n");
+  const optionalLines = optionalEntries
+    .map(([name, cfg]) => {
+      // The wire config only — `required` is an EMIT-time decision (which
+      // registration call), not something mcp-host's config knows.
+      const { required: _requiredFlag, ...wireCfg } = cfg as IrMcpServerConfig & {
+        required?: false;
+      };
+      return `\n  await registerOptionalMcpServer(mcpHost, ${escapeJsonString(name)}, __mcpCatalog, { retry: false, config: () => resolveMcpServerConfig(${JSON.stringify(wireCfg)}, { name: ${escapeJsonString(name)} }), log: (line) => process.stderr.write(line), onRegister: ({ fullName }) => process.stderr.write(\`[mcp] registered \${fullName}\\n\`) }).firstAttempt;`;
+    })
+    .join("");
+  const registerBlock =
+    requiredEntries.length > 0
+      ? `
+  await Promise.all([
+${registerLines}
+  ]);`
+      : "";
   const bootBlock = `
   // Loop contract 0.4 (Batch A, G05) — MCP servers, wired ONCE: every
   // role's turns see the remote tools through the orchestrator's crew-wide
   // extraTools; the daemon disconnects the shared host on shutdown.
   const mcpHost = new McpHost();
 ${addLines}
-  const __mcpCatalog = new ToolCatalog();
-  await Promise.all([
-${registerLines}
-  ]);
+  const __mcpCatalog = new ToolCatalog();${registerBlock}${optionalLines}
   const __mcpTools = __mcpCatalog.list();`;
   return { imports, bootBlock, hasAny: true };
 }

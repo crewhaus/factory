@@ -19,6 +19,7 @@ import {
   type IrSubAgentDefinition,
   renderBundleReadme,
 } from "@crewhaus/ir";
+import type { IrMcpServerConfig } from "@crewhaus/ir";
 import { memoryFragmentFromIr, renderStudyRotationPreamble } from "@crewhaus/memory-service";
 import { type ParsedModelString, parseModelString } from "@crewhaus/model-router";
 
@@ -719,16 +720,33 @@ function renderMcpServers(ir: IrChannelV0): {
   // falls back to local files with a warning) instead of failing the daemon.
   // Mirror of target-cli's renderMcpServers; keep the two in sync.
   const thredzOn = ir.thredz !== undefined;
+  // #406 — servers the spec marked `required: false` degrade at boot instead
+  // of exiting: a failed connect warns and retries in the background, and the
+  // peer's tools register when it arrives. Everything else keeps fail-fast.
+  const isOptional = (name: string, cfg: IrMcpServerConfig): boolean =>
+    cfg.required === false && !(thredzOn && name === "thredz");
+  const namespacedAll = entries.filter(([name]) => !(thredzOn && name === "thredz"));
+  const requiredEntries = namespacedAll.filter(([name, cfg]) => !isOptional(name, cfg));
+  const optionalEntries = namespacedAll.filter(([name, cfg]) => isOptional(name, cfg));
   const imports = [
     `import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";`,
     ...(thredzOn ? [`import { connectThredz } from "@crewhaus/memory-service";`] : []),
-    ...(entries.some(([name]) => !(thredzOn && name === "thredz"))
-      ? [`import { registerMcpServer } from "@crewhaus/tool-mcp";`]
+    ...(requiredEntries.length > 0 || optionalEntries.length > 0
+      ? [
+          `import { ${[
+            ...(requiredEntries.length > 0 ? ["registerMcpServer"] : []),
+            ...(optionalEntries.length > 0 ? ["registerOptionalMcpServer"] : []),
+          ].join(", ")} } from "@crewhaus/tool-mcp";`,
+        ]
       : []),
   ];
   // 0.3.0 — embed the UNRESOLVED IrSecretRef-valued config and resolve at
   // daemon boot (mirror of target-cli's renderMcpServers; keep in sync).
+  // #406 — optional entries are NOT added here: their config resolution +
+  // addServer run inside registerOptionalMcpServer's never-throw boundary
+  // (an unset env var on an optional peer must degrade, not kill the boot).
   const addLines = entries
+    .filter(([name, cfg]) => !isOptional(name, cfg))
     .map(([name, cfg]) => {
       const add = `mcpHost.addServer(${escapeJsonString(name)}, resolveMcpServerConfig(${JSON.stringify(cfg)}, { name: ${escapeJsonString(name)} }));`;
       // §4.4 — a missing THREDZ_API_KEY is a CONFIG failure: render the one
@@ -741,13 +759,33 @@ function renderMcpServers(ir: IrChannelV0): {
       return add;
     })
     .join("\n");
-  const namespacedEntries = entries.filter(([name]) => !(thredzOn && name === "thredz"));
-  const registerLines = namespacedEntries
+  const registerLines = requiredEntries
     .map(
       ([name]) =>
         `  registerMcpServer(mcpHost, ${escapeJsonString(name)}, defaultCatalog, { onRegister: ({ fullName }) => process.stdout.write(\`[mcp] registered \${fullName}\\n\`) }),`,
     )
     .join("\n");
+  // Optional servers are NOT awaited: a peer that is down answers its
+  // connect slowly (a TCP timeout, a stdio child that never speaks), and
+  // blocking the daemon's boot on it is precisely the failure `required:
+  // false` exists to remove. The attempt runs in the background; the
+  // per-message catalog re-read picks the tools up whenever they land.
+  const optionalLines = optionalEntries.map(([name, cfg], i) => {
+    // The wire config only — `required` is an EMIT-time decision (which
+    // registration call), not something mcp-host's config knows.
+    const { required: _requiredFlag, ...wireCfg } = cfg as IrMcpServerConfig & {
+      required?: false;
+    };
+    const handle = `__mcpOptional_${i}`;
+    return [
+      `const ${handle} = registerOptionalMcpServer(mcpHost, ${escapeJsonString(name)}, defaultCatalog, {`,
+      `  config: () => resolveMcpServerConfig(${JSON.stringify(wireCfg)}, { name: ${escapeJsonString(name)} }),`,
+      "  log: (line) => process.stdout.write(line),",
+      "  onRegister: ({ fullName }) => process.stdout.write(`[mcp] registered ${fullName}\\n`),",
+      "});",
+      `void ${handle}.firstAttempt;`,
+    ].join("\n");
+  });
   // The thredz alias vocabulary must land on the catalog BEFORE any namespaced
   // MCP server registers (the collision guard wants an empty slot), so
   // connectThredz runs between the addServer calls and the Promise.all.
@@ -766,7 +804,8 @@ function renderMcpServers(ir: IrChannelV0): {
     "const mcpHost = new McpHost();",
     addLines,
     ...(thredzBoot !== undefined ? [thredzBoot] : []),
-    ...(namespacedEntries.length > 0 ? ["await Promise.all([", registerLines, "]);"] : []),
+    ...(requiredEntries.length > 0 ? ["await Promise.all([", registerLines, "]);"] : []),
+    ...optionalLines,
   ].join("\n");
   return {
     imports,
@@ -965,6 +1004,12 @@ function renderAgent(ir: IrChannelV0, evalEntry = false): string {
   // over THIS conversation's sessionId. The heartbeat override (`spec`
   // scope) only exists when both continuity and a heartbeat are configured.
   const fabric = memoryFabric(ir);
+  // #406 — a spec with an OPTIONAL MCP peer re-reads the catalog PER MESSAGE:
+  // the peer's tools register in the background when it finally connects, and
+  // this re-read is what makes them reach the model without a restart. Specs
+  // without the opt-in keep the boot snapshot, byte-identically.
+  const liveCatalog = Object.values(ir.mcp_servers).some((c) => c.required === false);
+  const baseToolsExpr = liveCatalog ? "__liveTools" : "config.tools";
   const hbScopeOverride = fabric.continuityOn && ir.heartbeat !== undefined;
   const dreamOn = dreamConfigured(ir);
   // Loop contract 0.4 (Batch E, G23) — the live Thredz connection threads from
@@ -1038,15 +1083,15 @@ function __memFragment(scope?: "spec" | "session"): MemoryWiringFragment {
         fabric.continuityOn
           ? `
       const __skills = __memWired.options.skills ?? config.skills;
-      const __tools = [...config.tools, ...__memTools];
+      const __tools = [...${baseToolsExpr}, ...__memTools];
       if (__skills.length > 0) __tools.push(createSkillTool(__skills));`
           : ""
       }`;
   const toolsExpr = !fabric.wired
-    ? "config.tools"
+    ? baseToolsExpr
     : fabric.continuityOn
       ? "__tools"
-      : "[...config.tools, ...__memTools]";
+      : `[...${baseToolsExpr}, ...__memTools]`;
   const skillsExpr = fabric.continuityOn ? "__skills" : "config.skills";
   const slashCommandsExpr = fabric.continuityOn
     ? "__memWired.options.slashCommands ?? config.slashCommands"
@@ -1126,7 +1171,9 @@ import { classifyInbound } from "@crewhaus/channel-adapter-base";
 ${permImport}${approvalTypeImport}${subAgentTypeImport}${memImport}${evalImport}import type { HookDef } from "@crewhaus/hooks-engine";
 import type { SkillRef } from "@crewhaus/skills-registry";
 import type { SlashCommand } from "@crewhaus/slash-commands";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool } from "@crewhaus/tool-catalog";${
+    liveCatalog ? '\nimport { defaultCatalog } from "@crewhaus/tool-catalog";' : ""
+  }
 import type { PromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
 ${fragmentBlock}${memEmbedderBlock}${evaluationBlock}
 export type AgentConfig = {
@@ -1161,7 +1208,15 @@ export type Agent = {
 export function createAgent(config: AgentConfig): Agent {
   return {
     async runTurn(args: RunTurnArgs): Promise<string> {
-      const runContext = createRunContext({ sessionId: args.sessionId });
+      const runContext = createRunContext({ sessionId: args.sessionId });${
+        liveCatalog
+          ? `
+      // #406 — the live catalog read. An optional MCP peer that connected
+      // after boot registered its tools here; the boot snapshot in
+      // config.tools would never show them.
+      const __liveTools = defaultCatalog.list();`
+          : ""
+      }
       // Pillar 3 channel boundary — classify the inbound message at
       // TrustOrigin "channel" BEFORE it seeds a model turn. The gateway
       // already verified the webhook signature (who); this verifies what

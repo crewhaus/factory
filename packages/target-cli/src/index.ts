@@ -4,6 +4,7 @@ import {
   type Bundle,
   type EmitReadmeOptions,
   type IrKnowledge,
+  type IrMcpServerConfig,
   type IrSubAgentDefinition,
   type IrV0,
   renderBundleReadme,
@@ -254,14 +255,32 @@ function renderMcpServers(ir: IrV0): {
   // backends) and a boot failure DEGRADES (`__thredz` = null → wireMemory
   // falls back to local files with a warning) instead of failing the run.
   const thredzOn = ir.thredz !== undefined;
+  // #406 — servers the spec marked `required: false` degrade at boot instead
+  // of exiting. A cli run is one-shot: the tool list is frozen for the
+  // process, so the optional path here is degrade-only (`retry: false`) —
+  // tools absent for this run, no background banner mid-turn.
+  const isOptional = (name: string, cfg: IrMcpServerConfig): boolean =>
+    cfg.required === false && !(thredzOn && name === "thredz");
+  const namespacedEntries = entries.filter(([name]) => !(thredzOn && name === "thredz"));
+  const requiredEntries = namespacedEntries.filter(([name, cfg]) => !isOptional(name, cfg));
+  const optionalEntries = namespacedEntries.filter(([name, cfg]) => isOptional(name, cfg));
   const imports = [
     `import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";`,
     ...(thredzOn ? [`import { connectThredz } from "@crewhaus/memory-service";`] : []),
-    ...(entries.some(([name]) => !(thredzOn && name === "thredz"))
-      ? [`import { registerMcpServer } from "@crewhaus/tool-mcp";`]
+    ...(requiredEntries.length > 0 || optionalEntries.length > 0
+      ? [
+          `import { ${[
+            ...(requiredEntries.length > 0 ? ["registerMcpServer"] : []),
+            ...(optionalEntries.length > 0 ? ["registerOptionalMcpServer"] : []),
+          ].join(", ")} } from "@crewhaus/tool-mcp";`,
+        ]
       : []),
   ];
+  // Optional entries are NOT added here: their config resolution + addServer
+  // run inside registerOptionalMcpServer's never-throw boundary (an unset env
+  // var on an optional peer must degrade, not kill the run).
   const addLines = entries
+    .filter(([name, cfg]) => !isOptional(name, cfg))
     .map(([name, cfg]) => {
       const add = `mcpHost.addServer(${escapeJsonString(name)}, resolveMcpServerConfig(${JSON.stringify(cfg)}, { name: ${escapeJsonString(name)} }));`;
       // §4.4 — a missing THREDZ_API_KEY is a CONFIG failure: render the one
@@ -274,13 +293,22 @@ function renderMcpServers(ir: IrV0): {
       return add;
     })
     .join("\n");
-  const namespacedEntries = entries.filter(([name]) => !(thredzOn && name === "thredz"));
-  const registerLines = namespacedEntries
+  const registerLines = requiredEntries
     .map(
       ([name]) =>
         `  registerMcpServer(mcpHost, ${escapeJsonString(name)}, defaultCatalog, { onRegister: ({ fullName }) => process.stdout.write(\`[mcp] registered \${fullName}\\n\`) }),`,
     )
     .join("\n");
+  // Optional servers, awaited in sequence: firstAttempt settles (connected or
+  // warned) before the run proceeds, so a degraded boot logs deterministically.
+  const optionalLines = optionalEntries.map(([name, cfg]) => {
+    // The wire config only — `required` is an EMIT-time decision (which
+    // registration call), not something mcp-host's config knows.
+    const { required: _requiredFlag, ...wireCfg } = cfg as IrMcpServerConfig & {
+      required?: false;
+    };
+    return `await registerOptionalMcpServer(mcpHost, ${escapeJsonString(name)}, defaultCatalog, { retry: false, config: () => resolveMcpServerConfig(${JSON.stringify(wireCfg)}, { name: ${escapeJsonString(name)} }), log: (line) => process.stdout.write(line), onRegister: ({ fullName }) => process.stdout.write(\`[mcp] registered \${fullName}\\n\`) }).firstAttempt;`;
+  });
   const thredzBoot = thredzOn
     ? `const __thredz = await connectThredz(mcpHost, defaultCatalog, { log: (line) => process.stdout.write(line)${
         ir.thredz?.agentName !== undefined
@@ -296,7 +324,8 @@ function renderMcpServers(ir: IrV0): {
     "const mcpHost = new McpHost();",
     addLines,
     ...(thredzBoot !== undefined ? [thredzBoot] : []),
-    ...(namespacedEntries.length > 0 ? ["await Promise.all([", registerLines, "]);"] : []),
+    ...(requiredEntries.length > 0 ? ["await Promise.all([", registerLines, "]);"] : []),
+    ...optionalLines,
   ].join("\n");
   return {
     imports,
