@@ -51,9 +51,7 @@ export type AdvertisedToolSummary = {
 export function renderToolList(tools: ReadonlyArray<AdvertisedToolSummary>): string {
   const sorted = [...tools].sort((a, b) => a.name.localeCompare(b.name));
   const lines = [
-    `This is the runtime's live toolset — the ${sorted.length} tool(s) advertised on THIS request. ` +
-      "It is read from the bound tool catalog, not from conversation history; " +
-      "if the conversation says otherwise, the conversation is stale.",
+    `This is the runtime's live toolset — the ${sorted.length} tool(s) advertised on THIS request. It is read from the bound tool catalog, not from conversation history; if the conversation says otherwise, the conversation is stale.`,
     "",
   ];
   for (const t of sorted) {

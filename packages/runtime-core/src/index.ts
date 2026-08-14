@@ -2737,11 +2737,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const added = currentToolNames.filter((n) => !prior.includes(n));
       const removed = prior.filter((n) => !currentToolNames.includes(n));
       const delta = [...added.map((n) => `+${n}`), ...removed.map((n) => `−${n}`)].join(", ");
-      const marker =
-        `[system] The toolset changed while this session was idle: ${delta}. ` +
-        "The tool schema attached to this request is the authoritative list — " +
-        "any toolset enumerated earlier in this conversation is stale. " +
-        "Call ListTools to verify.";
+      const marker = `[system] The toolset changed while this session was idle: ${delta}. The tool schema attached to this request is the authoritative list — any toolset enumerated earlier in this conversation is stale. Call ListTools to verify.`;
       resumedMessages.push({ role: "user", content: marker });
       await eventLog.append({
         kind: "user_message",
