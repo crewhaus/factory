@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/turn-state-machine",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "type": "module",
   "description": "Pure finite state machine for a single agent turn cycle",
   "main": "src/index.ts",

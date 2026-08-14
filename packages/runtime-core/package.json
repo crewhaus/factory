@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/runtime-core",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "type": "module",
   "description": "Minimal runtime imported by generated harness bundles",
   "main": "src/index.ts",
@@ -26,7 +26,9 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/event-log": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
+    "@crewhaus/metrics-collector": "workspace:*",
     "@crewhaus/model-router": "workspace:*",
+    "@crewhaus/otel-exporter": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
     "@crewhaus/prompt-cache-manager": "workspace:*",
     "@crewhaus/prompt-injection-detector": "workspace:*",
@@ -38,6 +40,8 @@
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*",
     "@crewhaus/state-store": "workspace:*",
+    "@crewhaus/streaming-tool-executor": "workspace:*",
+    "@crewhaus/structured-event-printer": "workspace:*",
     "@crewhaus/tenancy": "workspace:*",
     "@crewhaus/token-budget": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
@@ -45,20 +49,16 @@
     "@crewhaus/tool-loop-detection": "workspace:*",
     "@crewhaus/tool-orchestrator": "workspace:*",
     "@crewhaus/tool-result-store": "workspace:*",
-    "@crewhaus/streaming-tool-executor": "workspace:*",
-    "@crewhaus/turn-state-machine": "workspace:*",
     "@crewhaus/trace-event-bus": "workspace:*",
+    "@crewhaus/turn-state-machine": "workspace:*",
     "@crewhaus/worker-runtime": "workspace:*",
-    "@crewhaus/structured-event-printer": "workspace:*",
-    "@crewhaus/metrics-collector": "workspace:*",
-    "@crewhaus/otel-exporter": "workspace:*",
+    "zod": "^3.23.8",
     "zod-to-json-schema": "^3.23.5"
   },
   "devDependencies": {
     "@crewhaus/logging": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
-    "@crewhaus/tool-plan": "workspace:*",
-    "zod": "^3.23.8"
+    "@crewhaus/tool-plan": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

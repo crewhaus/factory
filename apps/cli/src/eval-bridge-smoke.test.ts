@@ -29,9 +29,17 @@
  * to the same file from either cwd.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
 const CLI_PATH = join(SRC_DIR, "index.ts");
@@ -69,12 +77,51 @@ const HERMETIC_REGISTRY: Record<string, string> = {
   CREWHAUS_WATCHME_ROOT: join(REGISTRY_ROOT, "watchme"),
 };
 
+/**
+ * Link the in-tree `@crewhaus/*` packages into the spawn sandbox, so the
+ * driven bundle resolves THIS working tree.
+ *
+ * The header above promises "the in-tree packages, not published ones", and
+ * until now nothing delivered it: an out-of-tree bundle in a manifest-free
+ * tmp dir resolved nothing, so Bun's auto-install quietly fetched
+ * `@crewhaus/*` from npm and the smoke measured the last RELEASE. That is how
+ * 0.5.5 shipped a `runtime-core` that could not resolve `zod` with every gate
+ * green — and it also meant a release could never be verified before it was
+ * published, because the newest thing on npm was always the previous cut.
+ *
+ * Symlinks (not copies) so external deps still resolve: a symlink resolves to
+ * its real path under `packages/`, and the lookup then walks up to the repo
+ * root's `node_modules` for `zod`, the Anthropic SDK, and friends. Paired
+ * with `--no-install` on the spawn, which makes a MISSING link fail loudly
+ * instead of silently reaching for the registry.
+ */
+function linkWorkspacePackages(sandbox: string): void {
+  const nodeModules = join(sandbox, "node_modules");
+  for (const entry of readdirSync(join(REPO_ROOT, "packages"), { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const dir = join(REPO_ROOT, "packages", entry.name);
+    const manifest = join(dir, "package.json");
+    if (!existsSync(manifest)) continue;
+    const { name } = JSON.parse(readFileSync(manifest, "utf8")) as { name?: string };
+    if (name === undefined || !name.startsWith("@crewhaus/")) continue;
+    const dest = join(nodeModules, name);
+    mkdirSync(dirname(dest), { recursive: true });
+    if (!existsSync(dest)) symlinkSync(dir, dest, "dir");
+  }
+}
+
 async function spawnBun(args: ReadonlyArray<string>): Promise<{
   exitCode: number;
   stdout: string;
   stderr: string;
 }> {
-  const proc = Bun.spawn([process.execPath, ...args], {
+  // `--no-install` enforces what this file's header already promised: the
+  // smoke drives the IN-TREE packages. Without it, the sandbox cwd has no
+  // node_modules, so Bun's auto-install silently fetches @crewhaus/* from
+  // npm and the smoke measures the last PUBLISHED release instead of the
+  // working tree — which is how 0.5.5 shipped a runtime-core that could not
+  // resolve `zod` with every gate green. It also makes the smoke offline.
+  const proc = Bun.spawn([process.execPath, "--no-install", ...args], {
     cwd: SPAWN_CWD,
     env: { PATH: process.env["PATH"] ?? "", ...HERMETIC_REGISTRY },
     stdout: "pipe",
@@ -104,6 +151,9 @@ async function compileBridged(fixture: string): Promise<string> {
   if (r.exitCode !== 0) throw new Error(`compile failed (${r.exitCode}): ${r.stdout}\n${r.stderr}`);
   rmSync(join(out, "package.json"), { force: true });
   rmSync(join(out, "eval", "package.json"), { force: true });
+  // Bun resolves a bare import from the IMPORTING FILE's directory upward, so
+  // the links belong beside the bundle, not beside the spawn cwd.
+  linkWorkspacePackages(out);
   return out;
 }
 

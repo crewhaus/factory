@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/skills-registry",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "type": "module",
   "description": "Lazy-loaded SKILL.md catalog with frontmatter parsing and a Skill(name) tool",
   "main": "src/index.ts",

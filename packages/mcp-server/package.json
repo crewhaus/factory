@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/mcp-server",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "type": "module",
   "description": "Project a compiled bundle's turn function as an MCP server (stdio + SSE) — a chat/invoke tool plus optional per-sub-agent tools delegating to an injected invoke fn, built on @modelcontextprotocol/sdk",
   "main": "src/index.ts",

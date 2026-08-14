@@ -1101,7 +1101,6 @@ describe("runChatLoop — Section 8 orchestrator", () => {
     input.write("read both\n");
     input.end();
 
-    const t0 = Date.now();
     await runChatLoop({
       model: "test-model",
       instructions: "test",
@@ -1110,15 +1109,22 @@ describe("runChatLoop — Section 8 orchestrator", () => {
       tools: [slowRead],
       permissionMode: "bypass",
     });
-    const elapsed = Date.now() - t0;
 
     expect(callCount()).toBe(2);
-    // Two 60ms tools running in parallel finish in ~60ms total, not 120ms.
-    expect(elapsed).toBeLessThan(105);
-    // Both starts come before either finish.
+    // OVERLAP is the claim, and these three assertions prove it outright:
+    // both tools had started before either finished, which serial execution
+    // cannot produce at any speed.
     expect(startedAt.length).toBe(2);
     expect(finishedAt.length).toBe(2);
     expect(Math.max(...startedAt)).toBeLessThan(Math.min(...finishedAt));
+    // Deliberately NO wall-clock bound. The original `elapsed < 105` (over
+    // 60 ms of tool work) measured the machine, not the runtime: it failed
+    // 6/6 under CPU contention on the pre-0.5.5 tree, and it failed the
+    // v0.5.5 release run. Widening it to 120 ms — the cost of SERIAL
+    // execution, i.e. the loosest bound that could still mean anything —
+    // failed on CI too, which settles it: on a loaded runner concurrent
+    // execution already costs what serial would, so no wall-clock number can
+    // separate the two. The start/finish ordering above can, on any machine.
   });
 });
 

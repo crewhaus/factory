@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/grader-semantic-similarity",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "type": "module",
   "description": "Embedding-cosine semantic-similarity grader with ROUGE-L fallback. Pluggable via @crewhaus/grader-registry (Section 38)",
   "main": "src/index.ts",

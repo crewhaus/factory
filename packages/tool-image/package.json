@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-image",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "type": "module",
   "description": "ReadImage tool — validates magic bytes and returns Anthropic base64 image content blocks",
   "main": "src/index.ts",

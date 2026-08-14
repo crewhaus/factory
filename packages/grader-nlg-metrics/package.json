@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/grader-nlg-metrics",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "type": "module",
   "description": "NLG-metric graders: ROUGE-1/2/L, BLEU-1..4, METEOR. Pure-TS; pluggable into @crewhaus/grader-registry (Section 38)",
   "main": "src/index.ts",

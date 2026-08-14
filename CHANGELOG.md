@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.6] - 2026-08-14
+
+### Fixed
+
+- **`@crewhaus/runtime-core` declares `zod` as a runtime dependency** —
+  0.5.5 is unusable from npm without this. 0.5.5 shipped `list-tools.ts`, the
+  first runtime-core source file to `import { z } from "zod"`, while `zod` sat
+  in `devDependencies`. Inside the monorepo every import resolved through the
+  workspace root, so the full suite and every release gate passed; installed
+  from the registry the runtime dies on load with `ENOENT while resolving
+  package 'zod'`. runtime-core imports `list-tools` unconditionally, so this
+  broke every compiled bundle that installs its dependencies from npm. Two
+  guards keep the class from recurring: a manifest test asserting that every
+  external module runtime-core imports at runtime is a declared dependency,
+  and a fix to the eval-bridge smoke so it resolves the IN-TREE packages the
+  way its own documentation always claimed. It never did — an out-of-tree
+  bundle in a manifest-free tmp dir resolved nothing, so Bun's auto-install
+  quietly fetched `@crewhaus/*` from npm and the smoke measured the previous
+  RELEASE instead of the working tree. That is both why 0.5.5 shipped green
+  and why no release could be verified before it was published. The smoke now
+  links the workspace beside each bundle and spawns with `--no-install`, so a
+  missing link fails loudly instead of reaching for the registry; it is
+  offline as a side effect.
+
+- **The tool-concurrency test no longer measures the CI machine.** It budgeted
+  105 ms of wall clock over 60 ms of tool work and failed routinely under
+  load — 6/6 failures under CPU contention on the pre-0.5.5 tree, and it
+  failed the v0.5.5 release run, which published nothing until the jobs were
+  re-run. Widening the bound to 120 ms (the cost of SERIAL execution, the
+  loosest bound that could still mean anything) failed on CI too, which
+  settles it: on a loaded runner the concurrent path already costs what serial
+  would, so no wall-clock number separates them. The assertions that prove
+  overlap directly — both tools started before either finished — hold on any
+  machine and are what the test keeps.
+
 ## [0.5.5] - 2026-08-14
 
 ### Added
