@@ -30,7 +30,7 @@ import { type SkillRef, createSkillTool, discoverSkills } from "@crewhaus/skills
 import { type SlashCommand, loadCommands } from "@crewhaus/slash-commands";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
-import { registerMcpServer } from "@crewhaus/tool-mcp";
+import { registerMcpServer, registerOptionalMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { RunnerError } from "./errors";
 
@@ -79,13 +79,30 @@ export async function wireRunOnce(ir: IrV0, opts: { cwd?: string } = {}): Promis
     // 0.3.0 — env/header values are IrSecretRef; resolve from the eval
     // process's environment (fail-fast, names the variable).
     for (const [name, cfg] of Object.entries(ir.mcp_servers)) {
+      // #406 — an optional peer's config resolution + addServer happen inside
+      // registerOptionalMcpServer's never-throw boundary below, so an unset
+      // env var on one degrades instead of failing the whole eval run.
+      if (cfg.required === false) continue;
       host.addServer(name, resolveMcpServerConfig(cfg, { name }));
     }
     const tempCatalog = new ToolCatalog();
     for (const t of tools) tempCatalog.register(t);
     await Promise.all(
-      Object.keys(ir.mcp_servers).map((name) => registerMcpServer(host, name, tempCatalog)),
+      Object.entries(ir.mcp_servers)
+        .filter(([, cfg]) => cfg.required !== false)
+        .map(([name]) => registerMcpServer(host, name, tempCatalog)),
     );
+    // #406 — optional peers degrade instead of failing the run. Wire-once
+    // freezes this tool list for every sample, so degrade-only (retry: false).
+    for (const [name, cfg] of Object.entries(ir.mcp_servers)) {
+      if (cfg.required !== false) continue;
+      const { required: _requiredFlag, ...wireCfg } = cfg as typeof cfg & { required?: false };
+      await registerOptionalMcpServer(host, name, tempCatalog, {
+        retry: false,
+        config: () => resolveMcpServerConfig(wireCfg, { name }),
+        log: (line) => process.stdout.write(line),
+      }).firstAttempt;
+    }
     tools = tempCatalog.list().slice();
   }
 

@@ -317,7 +317,7 @@ function renderMcpServers(ir: IrBatchV0): {
     const { required: _requiredFlag, ...wireCfg } = cfg as IrMcpServerConfig & {
       required?: false;
     };
-    return `await registerOptionalMcpServer(mcpHost, ${escapeJsonString(name)}, defaultCatalog, { config: () => resolveMcpServerConfig(${JSON.stringify(wireCfg)}, { name: ${escapeJsonString(name)} }), log: (line) => process.stdout.write(line), onRegister: ({ fullName }) => process.stdout.write(\`[mcp] registered \${fullName}\\n\`) }).firstAttempt;`;
+    return `void registerOptionalMcpServer(mcpHost, ${escapeJsonString(name)}, defaultCatalog, { config: () => resolveMcpServerConfig(${JSON.stringify(wireCfg)}, { name: ${escapeJsonString(name)} }), log: (line) => process.stdout.write(line), onRegister: ({ fullName }) => process.stdout.write(\`[mcp] registered \${fullName}\\n\`) }).firstAttempt;`;
   });
   const bootBlock = [
     "const mcpHost = new McpHost();",

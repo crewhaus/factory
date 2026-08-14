@@ -765,8 +765,11 @@ function renderMcpServers(ir: IrChannelV0): {
         `  registerMcpServer(mcpHost, ${escapeJsonString(name)}, defaultCatalog, { onRegister: ({ fullName }) => process.stdout.write(\`[mcp] registered \${fullName}\\n\`) }),`,
     )
     .join("\n");
-  // Optional servers: first attempt awaited (so the boot banner is ordered),
-  // eventual success NOT awaited — that is the point.
+  // Optional servers are NOT awaited: a peer that is down answers its
+  // connect slowly (a TCP timeout, a stdio child that never speaks), and
+  // blocking the daemon's boot on it is precisely the failure `required:
+  // false` exists to remove. The attempt runs in the background; the
+  // per-message catalog re-read picks the tools up whenever they land.
   const optionalLines = optionalEntries.map(([name, cfg], i) => {
     // The wire config only — `required` is an EMIT-time decision (which
     // registration call), not something mcp-host's config knows.
@@ -780,7 +783,7 @@ function renderMcpServers(ir: IrChannelV0): {
       "  log: (line) => process.stdout.write(line),",
       "  onRegister: ({ fullName }) => process.stdout.write(`[mcp] registered ${fullName}\\n`),",
       "});",
-      `await ${handle}.firstAttempt;`,
+      `void ${handle}.firstAttempt;`,
     ].join("\n");
   });
   // The thredz alias vocabulary must land on the catalog BEFORE any namespaced

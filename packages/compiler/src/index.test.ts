@@ -3486,7 +3486,11 @@ mcp_servers:
     expect(daemon).toContain(
       'const __mcpOptional_0 = registerOptionalMcpServer(mcpHost, "peer", defaultCatalog, {',
     );
-    expect(daemon).toContain("await __mcpOptional_0.firstAttempt;");
+    // NOT awaited: an unreachable peer answers its connect slowly, and
+    // blocking the daemon's boot on it is the failure `required: false`
+    // exists to remove.
+    expect(daemon).toContain("void __mcpOptional_0.firstAttempt;");
+    expect(daemon).not.toContain("await __mcpOptional_0.firstAttempt;");
     expect(daemon).not.toContain("retry: false");
     expect(daemon).not.toContain('mcpHost.addServer("peer",');
     // Agent: per-message catalog re-read replaces the boot snapshot, so the

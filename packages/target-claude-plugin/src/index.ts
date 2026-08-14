@@ -288,7 +288,11 @@ function renderMcpJson(ir: IrNode): string | undefined {
   // Claude Code resolves it on the user's machine); literals render as
   // their plain string.
   const rendered: Record<string, unknown> = {};
-  for (const [name, cfg] of entries) {
+  for (const [name, entry] of entries) {
+    // #406 — `required` is a CrewHaus emit-time decision (which registration
+    // call a bundle makes); Claude Code's .mcp.json has no such field, so it
+    // must not ride along into the exported artifact.
+    const { required: _requiredFlag, ...cfg } = entry as typeof entry & { required?: false };
     rendered[name] =
       cfg.transport === "stdio"
         ? { ...cfg, ...(cfg.env !== undefined ? { env: renderSecretMap(cfg.env) } : {}) }

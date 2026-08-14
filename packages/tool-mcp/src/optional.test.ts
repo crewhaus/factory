@@ -9,6 +9,9 @@
  * throws like an unset-env-var ConfigError would.
  */
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { McpError } from "@crewhaus/errors";
 import type { McpHost, McpServerConfig, McpToolDefinition } from "@crewhaus/mcp-host";
 import { ToolCatalog } from "@crewhaus/tool-catalog";
@@ -36,6 +39,8 @@ function makeFlakyHost(serverName: string, opts: { registered?: boolean } = {}) 
   let tools: ReadonlyArray<McpToolDefinition> = [TOOL_A];
   let failuresLeft = 0;
   let connects = 0;
+  let up = false;
+  let disconnects = 0;
   const handlers = new Set<() => void>();
   const added: Array<{ name: string; config: McpServerConfig }> = [];
   let known = opts.registered !== false;
@@ -47,6 +52,7 @@ function makeFlakyHost(serverName: string, opts: { registered?: boolean } = {}) 
         failuresLeft -= 1;
         throw new McpError("connect ECONNREFUSED 127.0.0.1:9\nsecond line");
       }
+      up = true;
     },
     async listTools() {
       return tools;
@@ -61,9 +67,14 @@ function makeFlakyHost(serverName: string, opts: { registered?: boolean } = {}) 
     async callTool(_n: string, args: Record<string, unknown>) {
       return { content: JSON.stringify(args), isError: false };
     },
-    async disconnect() {},
+    async disconnect() {
+      disconnects += 1;
+      up = false;
+    },
     getState() {
-      return { kind: "connected" } as const;
+      return (up ? { kind: "connected" } : { kind: "disconnected" }) as {
+        kind: "connected" | "disconnected";
+      };
     },
   };
   const host = {
@@ -87,6 +98,11 @@ function makeFlakyHost(serverName: string, opts: { registered?: boolean } = {}) 
       failuresLeft = n;
     },
     connectCount: () => connects,
+    disconnectCount: () => disconnects,
+    /** Model mcp-host's OWN reconnect landing in the background. */
+    bringUp: () => {
+      up = true;
+    },
     setTools: (t: ReadonlyArray<McpToolDefinition>) => {
       tools = t;
     },
@@ -139,12 +155,12 @@ describe("registerOptionalMcpServer", () => {
     expect(lines.join("")).toContain('optional server "peer" connected — 1 tool(s) registered');
   });
 
-  test("failed first attempt warns, then a background retry connects", async () => {
+  test("a failed first attempt warns, then ADOPTS when mcp-host's own reconnect lands", async () => {
     const flaky = makeFlakyHost("peer");
     const catalog = new ToolCatalog();
     const lines: string[] = [];
     const timers = makeTimers();
-    flaky.failNextConnects(2);
+    flaky.failNextConnects(1);
     const handle = registerOptionalMcpServer(flaky.host, "peer", catalog, {
       log: (l) => lines.push(l),
       setTimer: timers.setTimer,
@@ -161,16 +177,26 @@ describe("registerOptionalMcpServer", () => {
     expect(warned).not.toContain("second line");
     expect(warned).toContain("retrying in the background");
     expect(catalog.list()).toHaveLength(0);
-    // Ladder: attempt 1 scheduled at 10ms; still failing → attempt 2 at 20ms.
+    // A one-shot surface would have been disconnected; a retrying one must
+    // NOT be — mcp-host's ladder is the retry.
+    expect(flaky.disconnectCount()).toBe(0);
+
+    // Still down at the first check ⇒ another check is scheduled. Crucially
+    // the check does NOT issue its own connect(): mcp-host is already
+    // reconnecting, and a second ladder would double the connect rate and
+    // race its transport.
+    const whileDown = flaky.connectCount();
     expect(timers.delays()).toEqual([10]);
     await timers.fire();
     expect(handle.connected()).toBe(false);
+    expect(flaky.connectCount()).toBe(whileDown);
     expect(timers.delays()).toEqual([20]);
-    // Peer comes up; the next retry lands the tools.
+
+    // mcp-host reconnects in the background; the next check adopts the peer.
+    flaky.bringUp();
     await timers.fire();
     expect(handle.connected()).toBe(true);
     expect(catalog.list().map((t) => t.name)).toContain("peer__ping");
-    expect(lines.join("")).toContain("after 2 retries");
     expect(timers.pending()).toBe(0);
   });
 
@@ -190,6 +216,9 @@ describe("registerOptionalMcpServer", () => {
     expect(timers.pending()).toBe(0);
     expect(lines.join("")).toContain("continuing without its tools for this run");
     expect(lines.join("")).not.toContain("retrying in the background");
+    // mcp-host arms its OWN ref'd reconnect ladder off the transport close;
+    // a one-shot surface must cancel it or the finished run never exits.
+    expect(flaky.disconnectCount()).toBe(1);
   });
 
   test("config thunk: resolution + addServer run inside the boundary", async () => {
@@ -272,26 +301,76 @@ describe("registerOptionalMcpServer", () => {
     expect(catalog.list().map((t) => t.name)).toContain("peer__echo");
   });
 
-  test("the default retry timer is unref'd — it never holds a process open", async () => {
-    const flaky = makeFlakyHost("peer");
-    const catalog = new ToolCatalog();
-    flaky.failNextConnects(1);
-    // No injected timer seams: this exercises the REAL setTimeout path. The
-    // research shape ends by returning from main(), so a ref'd retry timer
-    // would hang the process forever after the run finished.
-    const handle = registerOptionalMcpServer(flaky.host, "peer", catalog, {
-      backoffMs: () => 60_000,
+  test("a one-shot surface's failed peer never holds the process open (real subprocess)", async () => {
+    // The property that matters is "the process EXITS", so assert exactly
+    // that. mcp-host arms its own REF'D reconnect ladder off the failed
+    // connect's transport close; `retry: false` must cancel it, or a
+    // finished cli/crew/workflow run hangs forever with its work done.
+    const dir = mkdtempSync(join(tmpdir(), "optional-exit-"));
+    const script = join(dir, "run.ts");
+    await Bun.write(
+      script,
+      `import { McpHost } from "@crewhaus/mcp-host";
+import { ToolCatalog } from "@crewhaus/tool-catalog";
+import { registerOptionalMcpServer } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};
+const host = new McpHost();
+const h = registerOptionalMcpServer(host, "peer", new ToolCatalog(), {
+  retry: false,
+  config: () => ({ transport: "stdio", command: "/nonexistent/mcp-server-binary" }),
+  log: () => {},
+});
+await h.firstAttempt;
+`,
+    );
+    const proc = Bun.spawn(["bun", script], {
+      cwd: join(import.meta.dir, ".."),
+      stdout: "ignore",
+      stderr: "ignore",
     });
-    await handle.firstAttempt;
-    // Bun/Node expose the handle count; an unref'd timer is not counted.
-    const refCount = (
-      process as unknown as { _getActiveHandles?: () => unknown[] }
-    )._getActiveHandles?.();
-    if (refCount !== undefined) {
-      expect(refCount.some((h) => String(h).includes("Timeout"))).toBe(false);
-    }
-    handle.stop();
-  });
+    const exited = await Promise.race([
+      proc.exited,
+      new Promise<"hung">((r) => setTimeout(() => r("hung"), 20_000)),
+    ]);
+    if (exited === "hung") proc.kill();
+    rmSync(dir, { recursive: true, force: true });
+    expect(exited).not.toBe("hung");
+  }, 30_000);
+
+  test("a retrying surface exits once its host disconnects (the shape's own cleanup)", async () => {
+    // A retrying peer deliberately leaves mcp-host's ladder running — that
+    // IS the retry. The shapes that use it either run forever (channel,
+    // batch) or call disconnectAll() when their work ends (research); this
+    // pins the second, which is the one that could otherwise hang.
+    const dir = mkdtempSync(join(tmpdir(), "optional-cleanup-"));
+    const script = join(dir, "run.ts");
+    await Bun.write(
+      script,
+      `import { McpHost } from "@crewhaus/mcp-host";
+import { ToolCatalog } from "@crewhaus/tool-catalog";
+import { registerOptionalMcpServer } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};
+const host = new McpHost();
+const h = registerOptionalMcpServer(host, "peer", new ToolCatalog(), {
+  config: () => ({ transport: "stdio", command: "/nonexistent/mcp-server-binary" }),
+  log: () => {},
+});
+await h.firstAttempt;
+h.stop();
+await host.disconnectAll();
+`,
+    );
+    const proc = Bun.spawn(["bun", script], {
+      cwd: join(import.meta.dir, ".."),
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    const exited = await Promise.race([
+      proc.exited,
+      new Promise<"hung">((r) => setTimeout(() => r("hung"), 20_000)),
+    ]);
+    if (exited === "hung") proc.kill();
+    rmSync(dir, { recursive: true, force: true });
+    expect(exited).not.toBe("hung");
+  }, 30_000);
 
   test("never throws: an unknown server name degrades and retries", async () => {
     const flaky = makeFlakyHost("peer", { registered: false });

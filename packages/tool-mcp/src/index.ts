@@ -488,6 +488,54 @@ export function registerOptionalMcpServer(
   let added = opts.config === undefined;
   let configFailed = false;
 
+  /** Register the connected peer's tools + banner. Returns false when the
+   *  connection is up but its tool LISTING failed (see below). */
+  const adopt = async (): Promise<boolean> => {
+    let registered = 0;
+    // `watchMcpServer` SWALLOWS a reconcile failure into `onError` — its
+    // initial pass resolves even when `tools/list` failed. Treating that as
+    // success would leave the peer with zero tools AND the watch disarmed
+    // forever: connected in name only.
+    let initialError: unknown;
+    const w = await watchMcpServer(host, serverName, catalog, {
+      ...opts,
+      onRegister: (info) => {
+        registered += 1;
+        opts.onRegister?.(info);
+      },
+      onError: (err) => {
+        // Before `isConnected` this is the INITIAL listing failing; after, a
+        // mid-run drift hiccup the watch retries on its own.
+        if (isConnected) {
+          log(`[mcp] optional server "${serverName}" reconcile failed: ${firstLineOf(err)}\n`);
+        } else {
+          initialError = err;
+        }
+        opts.onError?.(err);
+      },
+    });
+    if (initialError !== undefined) {
+      w.stop();
+      log(
+        `[mcp] optional server "${serverName}" connected but its tool list failed (${firstLineOf(initialError)})\n`,
+      );
+      return false;
+    }
+    // A stop() that landed while we were connecting must not leave a live
+    // subscription behind: honour it here, where the watch first exists.
+    if (stopped) {
+      w.stop();
+      return false;
+    }
+    watch = w;
+    isConnected = true;
+    log(
+      `[mcp] optional server "${serverName}" connected — ${registered} tool(s) registered` +
+        `${attempt > 0 ? ` after ${attempt} check${attempt === 1 ? "" : "s"}` : ""}\n`,
+    );
+    return true;
+  };
+
   const tryOnce = async (): Promise<boolean> => {
     if (!added && opts.config !== undefined) {
       try {
@@ -505,38 +553,44 @@ export function registerOptionalMcpServer(
     try {
       await client.connect();
     } catch (err) {
+      // IMPORTANT: mcp-host owns reconnection. A failed connect that got as
+      // far as opening a transport arms the client's OWN backoff ladder
+      // (handleTransportClose → scheduleReconnect), which runs indefinitely
+      // on REF'd timers. Two consequences drive the branches below:
+      //   - a one-shot surface must CANCEL it: those timers would keep the
+      //     process alive long after the run finished, and a run that is
+      //     already over has no use for a reconnect;
+      //   - a long-lived surface must NOT stack a second ladder on top of it
+      //     (that is a doubled connect/subprocess storm). We watch instead.
+      if (!retry) await client.disconnect().catch(() => {});
       const rest = retry
         ? "continuing without its tools; retrying in the background"
         : "continuing without its tools for this run";
       log(`[mcp] optional server "${serverName}" unreachable (${firstLineOf(err)}) — ${rest}\n`);
       return false;
     }
-    let registered = 0;
-    watch = await watchMcpServer(host, serverName, catalog, {
-      ...opts,
-      onRegister: (info) => {
-        registered += 1;
-        opts.onRegister?.(info);
-      },
-      onError: (err) => {
-        log(`[mcp] optional server "${serverName}" reconcile failed: ${firstLineOf(err)}\n`);
-        opts.onError?.(err);
-      },
-    });
-    isConnected = true;
-    log(
-      `[mcp] optional server "${serverName}" connected — ${registered} tool(s) registered` +
-        `${attempt > 0 ? ` after ${attempt} retr${attempt === 1 ? "y" : "ies"}` : ""}\n`,
-    );
-    return true;
+    return adopt();
   };
 
-  const scheduleNext = (): void => {
+  /** Poll for mcp-host's OWN reconnect to land, then adopt. Deliberately does
+   *  not call connect(): the client is already retrying, and a concurrent
+   *  attempt would race its transport. */
+  const checkLater = (): void => {
     if (stopped || !retry || configFailed) return;
     attempt += 1;
     timer = setTimer(() => {
       timer = null;
-      void run();
+      void (async () => {
+        if (stopped) return;
+        let up = false;
+        try {
+          up = host.getClient(serverName).getState().kind === "connected";
+        } catch {
+          up = false;
+        }
+        if (up && (await adopt().catch(() => false))) return;
+        checkLater();
+      })();
     }, backoffMs(attempt));
   };
 
@@ -548,7 +602,7 @@ export function registerOptionalMcpServer(
       log(`[mcp] optional server "${serverName}" failed: ${firstLineOf(err)}\n`);
       return false;
     });
-    if (!ok) scheduleNext();
+    if (!ok) checkLater();
     return ok;
   };
 
