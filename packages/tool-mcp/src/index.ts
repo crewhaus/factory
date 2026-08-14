@@ -459,7 +459,20 @@ export function registerOptionalMcpServer(
   opts: OptionalMcpServerOptions = {},
 ): OptionalMcpServerHandle {
   const log = opts.log ?? (() => {});
-  const setTimer = opts.setTimer ?? ((cb: () => void, ms: number) => setTimeout(cb, ms));
+  const setTimer =
+    opts.setTimer ??
+    ((cb: () => void, ms: number) => {
+      const t = setTimeout(cb, ms);
+      // An optional peer must never be the reason a process stays alive. A
+      // pending retry keeps the event loop open, which on the shapes that
+      // end by RETURNING from main() (research) would hang the process
+      // forever after the work finished. unref'd, the ladder still fires
+      // for as long as something else holds the loop open — which on the
+      // long-lived shapes (channel daemon, batch worker) is exactly the
+      // server or consumer whose lifetime the retry is meant to track.
+      (t as unknown as { unref?: () => void }).unref?.();
+      return t;
+    });
   const clearTimer =
     opts.clearTimer ?? ((h: unknown) => clearTimeout(h as ReturnType<typeof setTimeout>));
   const backoffMs = opts.backoffMs ?? nextBackoffMs;

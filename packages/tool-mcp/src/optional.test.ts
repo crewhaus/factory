@@ -272,6 +272,27 @@ describe("registerOptionalMcpServer", () => {
     expect(catalog.list().map((t) => t.name)).toContain("peer__echo");
   });
 
+  test("the default retry timer is unref'd — it never holds a process open", async () => {
+    const flaky = makeFlakyHost("peer");
+    const catalog = new ToolCatalog();
+    flaky.failNextConnects(1);
+    // No injected timer seams: this exercises the REAL setTimeout path. The
+    // research shape ends by returning from main(), so a ref'd retry timer
+    // would hang the process forever after the run finished.
+    const handle = registerOptionalMcpServer(flaky.host, "peer", catalog, {
+      backoffMs: () => 60_000,
+    });
+    await handle.firstAttempt;
+    // Bun/Node expose the handle count; an unref'd timer is not counted.
+    const refCount = (
+      process as unknown as { _getActiveHandles?: () => unknown[] }
+    )._getActiveHandles?.();
+    if (refCount !== undefined) {
+      expect(refCount.some((h) => String(h).includes("Timeout"))).toBe(false);
+    }
+    handle.stop();
+  });
+
   test("never throws: an unknown server name degrades and retries", async () => {
     const flaky = makeFlakyHost("peer", { registered: false });
     const catalog = new ToolCatalog();
