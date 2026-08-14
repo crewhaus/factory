@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/context-bundle",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "type": "module",
   "description": "Builds a single-markdown manifest of CrewHaus docs + recipes + schema. Consumed by `crewhaus context --bundle` and the cloud demo prompt builder.",
   "main": "src/index.ts",

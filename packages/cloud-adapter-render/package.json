@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/cloud-adapter-render",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "type": "module",
   "description": "One-click deploy adapter for Render — generates a render.yaml blueprint + a Render-tuned Dockerfile and wraps the Render Deploy API for daemon target shapes (Section 44)",
   "main": "src/index.ts",

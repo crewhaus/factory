@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.5] - 2026-08-14
+
+### Added
+
+- **`ListTools` — the runtime's live toolset, on demand** (#405). A session
+  that enumerated its tools on one build, was parked, and resumed on a build
+  with tools ADDED kept denying the new ones forever: the transcript's own
+  stale enumeration beat the live schema attached to every request, and an
+  agent declining to "fabricate" calls to tools it believes absent is
+  behaviour we want, so arguing with it could not fix it. Two mechanisms break
+  that deadlock. Every tool-carrying loop now advertises a builtin, read-only
+  `ListTools` whose result is rendered from the tools bound to THAT request —
+  names, read-only/destructive/gated flags, one-line descriptions, and a
+  header stating outright that the conversation is the stale source, not this
+  list. It joins the PascalCase bookkeeping family (`Skill`, `FocusRead`,
+  `GoalList`) with a builtin `alwaysAllow`, so a headless run cannot park on
+  the very tool that exists to break a deadlock. And on resume, when the
+  advertised set differs from what the session last recorded, the runtime
+  injects one synthetic `[system]` line naming exactly what was added and
+  removed. The record is a new non-conversational `toolset` event written only
+  on change (one line per session, not per turn), scoped per agent context so
+  a crew's roles — which share one session log and legitimately carry
+  different tools — never read each other's sets as a change, and skipped
+  inside `a2a_turn_start`/`sub_agent_start` brackets for the same reason.
+  Sessions predating the record get no marker on their first resume and are
+  covered from then on. A zero-tool loop stays zero-tool, and a caller's own
+  `ListTools` wins the name.
+
+- **`mcp_servers.<name>.required: false` — optional MCP peers** (#406). A peer
+  that could not be reached at boot took the whole daemon down with exit 40,
+  which the supervisor's crash-backoff then escalated to `crash-looping`. That
+  is correct for a tool the agent's instructions assume, and wrong for the
+  peers whose absence is a normal state — above all two daemons that mount
+  each other over `expose.mcp`, a topology where somebody must start second
+  and therefore neither can start at all. Marking a server `required: false`
+  makes a failed boot DEGRADE: the run continues without its tools and says
+  so, naming the server. What follows depends on the shape, and the split is
+  the honest one — the shapes that re-read their tool catalog per message, job
+  or branch (channel daemons, batch workers, research runs) pick the peer's
+  tools up whenever it finally connects, with no restart; the one-shot shapes
+  (cli, crew, workflow, eval) freeze their tool list at boot, so they report
+  the peer absent for that run and tear the connection down rather than leave
+  it reconnecting behind finished work. Reconnection itself stays where it
+  already lived, in `mcp-host`: the optional path watches for it to land
+  instead of racing it with a second ladder. An unresolvable `$ENV` secret on
+  an optional server degrades the same way instead of failing the boot, and
+  preflight reports each optional server plus downgrades that secret from
+  blocking to a warning. The default is unchanged and still fail-fast, and a
+  spec without the opt-in compiles byte-identically.
+
 ## [0.5.4] - 2026-08-12
 
 ### Fixed

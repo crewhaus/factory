@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/meta-harness-optimizer",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "type": "module",
   "description": "Track E / §56 — Meta-Harness-style optimizer (arxiv 2603.28052). Coding-agent proposer with filesystem-backed full history. BREAKING: opt-in mutator that can rewrite the bundle directly, sidestepping the spec-as-source-of-truth invariant.",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/feedback-distill",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "type": "module",
   "description": "Human-rating distillation: FeedbackRecords + session turns to eval samples, the auto-distill watermark, and the daemon janitor step that keeps a <spec>-ratings registry dataset current",
   "main": "src/index.ts",

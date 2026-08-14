@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/call-session",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "type": "module",
   "description": "Call lifecycle state machine — idle | dialing | connected | on-hold | transferred | terminated (Section 24 VOICE)",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/idempotency-keys",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "type": "module",
   "description": "Idempotency-key dedup store for the BATCH consumer (Section 23 BATCH)",
   "main": "src/index.ts",

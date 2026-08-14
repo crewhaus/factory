@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/state-store",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "type": "module",
   "description": "Zustand-style in-process state container with referential-equality selectors",
   "main": "src/index.ts",
