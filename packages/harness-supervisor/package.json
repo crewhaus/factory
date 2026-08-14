@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/harness-supervisor",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "type": "module",
   "description": "The harness process layer: runfiles + adoption, per-shape spawn contracts, exit classification and restart policy, durable log capture with a TraceEvent pump, port ledger, and the mutating-job queue",
   "main": "src/index.ts",

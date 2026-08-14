@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/eval-runner",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "type": "module",
   "description": "Eval runner — per-sample isolation, concurrency, grading, persistence",
   "main": "src/index.ts",

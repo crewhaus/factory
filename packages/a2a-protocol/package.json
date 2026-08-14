@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/a2a-protocol",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "type": "module",
   "description": "In-crew agent-to-agent SendMessage tool with traceparent envelopes (Section 22)",
   "main": "src/index.ts",

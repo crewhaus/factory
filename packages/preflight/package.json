@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/preflight",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "type": "module",
   "description": "Typed pre-spawn health checks for harnesses: spec lint, provider-credential matrix, channel boot-gate env refs, MCP secret-ref dry-run, port availability, bundle freshness, and durability warnings",
   "main": "src/index.ts",

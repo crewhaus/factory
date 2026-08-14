@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-builder",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "type": "module",
   "description": "buildTool() factory with fail-closed safety defaults",
   "main": "src/index.ts",

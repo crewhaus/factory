@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/eval-judge",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "type": "module",
   "description": "LLM-as-judge grader with prompt-injection defense and structured tool-use output",
   "main": "src/index.ts",

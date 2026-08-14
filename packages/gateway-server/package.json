@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/gateway-server",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "type": "module",
   "description": "Bun.serve daemon speaking gateway-protocol — JWT auth + per-tenant routing + budget enforcement",
   "main": "src/index.ts",
