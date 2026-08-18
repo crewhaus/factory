@@ -4,11 +4,13 @@ The publish-surface view of the factory workspace — what's on npm, how it's ve
 
 ## Status
 
-**0.4.0 — the loop-contract release (current factory cut 0.4.0).** Every `@crewhaus/*` library package in `packages/` is published to the npm registry under the **public** `@crewhaus` scope, and the flagship CLI ships as the bare, unscoped [`crewhaus`](https://www.npmjs.com/package/crewhaus) package (the old `@crewhaus/cli` name is deprecated and now just points at `crewhaus`). The root `factory` workspace is intentionally private and stays that way (`"private": true`); only the inner packages are publishable.
+**0.5.7 (current factory cut).** Every `@crewhaus/*` library package in `packages/` is published to the npm registry under the **public** `@crewhaus` scope, and the flagship CLI ships as the bare, unscoped [`crewhaus`](https://www.npmjs.com/package/crewhaus) package (the old `@crewhaus/cli` name is deprecated and now just points at `crewhaus`). The root `factory` workspace is intentionally private and stays that way (`"private": true`); only the inner packages are publishable.
 
-The sibling [crewhaus/utilities](https://github.com/crewhaus/utilities) workspace (13 packages — Studio, IDE extensions, the browser playground, trace-viewer, graph-visualizer, wizard, scaffold-templates, spec-forms, studio-plugin-sdk) versions in its own lockstep, currently at 0.1.5. The factory workspace itself publishes **213 packages** (212 `@crewhaus/*` libraries under `packages/` plus the unscoped `crewhaus` CLI); together, **226 packages** on the public registry.
+The sibling [crewhaus/utilities](https://github.com/crewhaus/utilities) workspace (13 packages — Studio, IDE extensions, the browser playground, trace-viewer, graph-visualizer, wizard, scaffold-templates, spec-forms, studio-plugin-sdk) versions in its own lockstep, currently at 0.1.5 (`spec-forms` has since point-released to 0.1.6). The factory workspace itself publishes **220 packages** (219 `@crewhaus/*` libraries under `packages/` plus the unscoped `crewhaus` CLI); together, **233 packages** on the public registry.
 
-> **Why we skipped v0.1.0.** A first publish at v0.1.0 went out with broken inter-package dependency ranges — `bun publish` resolved `workspace:*` against a stale `bun.lock` that still recorded the pre-release `0.0.0` versions, leaving every published package pointing at non-existent `@crewhaus/<dep>@0.0.0`. v0.1.1 regenerates `bun.lock` after the version bump so workspace:* resolves to the actual `0.1.1` cut. If you're authoring a new release on this workspace, delete `bun.lock` before `bun install` after a version bump — the `scripts/publish-workspace.ts` flow does this automatically.
+> **Why we skipped v0.1.0.** A first publish at v0.1.0 went out with broken inter-package dependency ranges — `bun publish` resolved `workspace:*` against a stale `bun.lock` that still recorded the pre-release `0.0.0` versions, leaving every published package pointing at non-existent `@crewhaus/<dep>@0.0.0`.
+>
+> **The lockfile is no longer part of that answer — do not delete or regenerate it when cutting a release.** `scripts/release-prep.ts --for-publish` resolves every `workspace:*` from the version being cut rather than from `bun.lock`, which is what actually retired this bug class; the lockfile's recorded versions are allowed to lag and `bun install --frozen-lockfile` stays green in CI. A release commit touches the 220 `package.json` files and `CHANGELOG.md` and nothing else, so a `bun.lock` in the diff means something went wrong. (Earlier revisions of this page told release authors to delete `bun.lock` first; that advice predates the `--for-publish` resolution and now only adds churn.)
 
 The launch checklist below records the now-completed flip from `restricted` → `public`. The npm install commands in user-facing docs did not change across the flip.
 
@@ -43,7 +45,7 @@ cd my-agent
 crewhaus compile && crewhaus run
 ```
 
-`crewhaus --version` prints the build, e.g. `0.4.0`.
+`crewhaus --version` prints the build, e.g. `0.5.7`.
 
 The `crewhaus` package transitively pulls in everything else via versioned npm deps (the workspace `workspace:*` references resolve to concrete versions at publish time), so users don't install the rest individually. A generated bundle imports a shape-dependent set of `@crewhaus/*` runtime packages directly (`runtime-core`, the tool packages, queue/mcp/memory modules, …) — `crewhaus compile` writes a `package.json` beside the bundle pinning exactly that set to the CLI's own version, so `bun install` in the out-dir is all a standalone consumer runs.
 
