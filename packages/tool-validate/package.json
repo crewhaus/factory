@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-validate",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "type": "module",
   "description": "Pre-permission input validation per tool using the tool's Zod schema",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/eval-report",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "type": "module",
   "description": "Render eval-runner output to HTML + JSON, with diff mode",
   "main": "src/index.ts",

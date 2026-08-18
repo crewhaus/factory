@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/prompt-optimizer-claude",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "type": "module",
   "description": "Pillar-2 model-driven MutationProvider — asks Claude to rewrite the prompt given dev-set failures. Closes the v0 prompt-optimizer's L91 'rule-based-only' gap.",
   "main": "src/index.ts",

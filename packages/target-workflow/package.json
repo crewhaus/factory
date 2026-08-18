@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-workflow",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "type": "module",
   "description": "Codegen backend for workflow target (sequential multi-step agents)",
   "main": "src/index.ts",

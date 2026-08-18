@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/event-log",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "type": "module",
   "description": "Append-only JSONL transcript log per session",
   "main": "src/index.ts",

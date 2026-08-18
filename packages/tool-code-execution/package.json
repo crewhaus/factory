@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-code-execution",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "type": "module",
   "description": "Sandboxed Python/JavaScript/Shell tools — production code execution gated by @crewhaus/sandbox",
   "main": "src/index.ts",
