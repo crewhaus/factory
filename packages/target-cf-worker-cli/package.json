@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-cf-worker-cli",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "type": "module",
   "description": "Codegen backend for CLI target emitted as a Cloudflare Worker. Sibling of target-cli; reads the same IrV0 variant, emits a Worker bundle.",
   "main": "src/index.ts",

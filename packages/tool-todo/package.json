@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-todo",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "type": "module",
   "description": "Built-in TodoWrite tool: per-session todo list rendered as a markdown checklist",
   "main": "src/index.ts",

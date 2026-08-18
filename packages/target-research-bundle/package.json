@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-research-bundle",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "type": "module",
   "description": "Codegen for the RES target — emits a resumable daemon that drives planner → branches → report (Section 23 RES)",
   "main": "src/index.ts",

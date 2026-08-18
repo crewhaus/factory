@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/justification-judge-claude",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "type": "module",
   "description": "Pillar-3 model-backed JustificationJudge — asks Claude whether a tool call's justification is genuinely consistent with the compile-time session goal. Ships the production judge the intent gate's footnote promised; fails closed on model error.",
   "main": "src/index.ts",
