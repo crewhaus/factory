@@ -14,6 +14,7 @@
 
 import {
   EFFORT_THINKING_BUDGET_TOKENS,
+  claudeRejectsTemperature,
   rawEventToCanonical,
   toAnthropicMessages,
   toAnthropicSystem,
@@ -92,10 +93,15 @@ export function buildAnthropicBedrockBody(req: ProviderRequest): AnthropicBedroc
   // extended thinking is (or will be) enabled: the Anthropic API rejects an
   // explicit temperature alongside `thinking` (mirrors
   // adapter-anthropic/translate.ts).
+  // #413 — and EXCEPT for Claude models that reject the parameter outright
+  // (Opus 4.7+ and the Claude 5 family) — Bedrock forwards the same 400.
+  // `req.model` is the Bedrock id (`anthropic.…` / regional prefix); the
+  // predicate matches by search, so the prefix doesn't defeat it.
   if (
     req.temperature !== undefined &&
     req.thinking === undefined &&
-    req.reasoningEffort === undefined
+    req.reasoningEffort === undefined &&
+    !claudeRejectsTemperature(req.model)
   ) {
     body.temperature = req.temperature;
   }

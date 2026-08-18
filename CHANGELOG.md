@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The default `llm_judge` works against the live Anthropic API again: the
+  judge's pinned `temperature: 0` is no longer sent to models that reject
+  the parameter** (#413). Claude 5-family models reject an explicit
+  temperature with 400 `` `temperature` is deprecated for this model ``
+  (Sonnet 5 rejects any non-default value; Opus 4.7+/Opus 5/Fable 5 reject
+  the parameter outright), and `DEFAULT_JUDGE_MODEL` has been
+  `claude-sonnet-5` since v0.4.2 — so every `crewhaus eval` with an
+  `llm_judge` grader and no `--judge-model` override errored on ALL samples
+  and read infrastructure-failed, masked in CI because judge tests use stub
+  adapters. Three layers, mirroring the treatment `adapter-openai` already
+  gives its reasoning models: `adapter-anthropic` gains
+  `claudeRejectsTemperature(model)` (Opus ≥ 4.7 and the whole Claude 5
+  family; search-matched so Bedrock `anthropic.`/regional prefixes survive,
+  datestamps are never read as minor versions) and omits the mapping for
+  those models — which also fixes the other pinned callers, e.g. the
+  eval-runner's vision-OCR transcriber; the Anthropic-on-Bedrock body
+  builder applies the same gate; and eval-judge adds a last line of defense
+  for providers the gates don't know — on an error naming temperature as
+  deprecated/unsupported, every judge path (scalar, categorical, pairwise)
+  retries ONCE with the field omitted. The NEW-HUNT-2 pin is unchanged for
+  every model that accepts it; on a model that rejects it there is no
+  determinism to preserve — the parameter no longer exists there.
+
 ## [0.5.6] - 2026-08-14
 
 ### Fixed

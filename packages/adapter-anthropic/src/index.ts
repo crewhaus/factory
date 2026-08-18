@@ -97,6 +97,7 @@ export {
 export type { ConsumeStreamCallbacks } from "./helpers.js";
 
 export {
+  claudeRejectsTemperature,
   rawEventToCanonical,
   toAnthropicMessages,
   toAnthropicParams,

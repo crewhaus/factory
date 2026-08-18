@@ -67,10 +67,16 @@ export function toAnthropicParams(
   // NEW-HUNT-2 — map the pinned sampling temperature, EXCEPT when extended
   // thinking is (or will be) enabled: the Anthropic API rejects any explicit
   // temperature alongside `thinking`, so the thinking branches below win.
+  // #413 — and EXCEPT for models that reject the parameter outright (Opus
+  // 4.7+ and the Claude 5 family): sending the pin there fails the whole
+  // call with 400 "`temperature` is deprecated for this model", and there
+  // is no determinism to preserve on a model where the parameter no longer
+  // exists. Same treatment adapter-openai gives its reasoning models.
   if (
     req.temperature !== undefined &&
     req.thinking === undefined &&
-    req.reasoningEffort === undefined
+    req.reasoningEffort === undefined &&
+    !claudeRejectsTemperature(req.model)
   ) {
     params.temperature = req.temperature;
   }
@@ -92,6 +98,32 @@ export function toAnthropicParams(
   }
 
   return params;
+}
+
+/**
+ * #413 — TRUE for Claude models whose API REJECTS an explicit
+ * `temperature`: Opus 4.7 and later, and the whole Claude 5 family —
+ * Opus 5, Sonnet 5, Fable 5, Mythos 5 (Sonnet 5 rejects any NON-DEFAULT
+ * value, which includes the judge's pinned 0). Sonnet ≤ 4.6, Opus ≤ 4.6,
+ * and Haiku 4.5 still accept the pin.
+ *
+ * Matched as a SEARCH so Bedrock's `anthropic.` / regional prefixes
+ * survive (adapter-bedrock imports this for its Converse mapping), with a
+ * digit lookahead so a datestamp is never read as a minor version
+ * (`claude-opus-4-20250514` is Opus 4.0, not Opus 4.<date>). Legacy
+ * number-first ids (`claude-3-5-sonnet-…`) don't match the family-first
+ * shape and keep the pin. Unknown/non-Claude ids return false — the
+ * caller sends the pin and eval-judge's #413 retry catches any provider
+ * this table doesn't know yet.
+ */
+export function claudeRejectsTemperature(model: string): boolean {
+  const m = /claude-(opus|sonnet|haiku|fable|mythos)-(\d{1,2})(?:-(\d{1,2}))?(?!\d)/.exec(model);
+  if (m === null) return false;
+  const family = m[1] as string;
+  if (family === "fable" || family === "mythos") return true;
+  const major = Number(m[2]);
+  if (major >= 5) return true;
+  return family === "opus" && major === 4 && m[3] !== undefined && Number(m[3]) >= 7;
 }
 
 function toolChoiceToAnthropic(

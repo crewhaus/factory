@@ -13,16 +13,12 @@
  * `submit_comparison` tool call with a strict schema — `winner` is the
  * closed enum a | b | tie.
  */
-import {
-  type ProviderAdapter,
-  collectFinalMessage,
-  extractToolUse,
-} from "@crewhaus/adapter-anthropic";
+import { type ProviderAdapter, extractToolUse } from "@crewhaus/adapter-anthropic";
 import { resolveModel } from "@crewhaus/model-router";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { JudgeError } from "./errors";
-import { DEFAULT_JUDGE_MODEL } from "./judge";
+import { DEFAULT_JUDGE_MODEL, collectWithTemperatureRetry } from "./judge";
 
 const SubmitComparisonSchema = z.object({
   winner: z
@@ -155,27 +151,26 @@ export async function judgePair(opts: JudgePairOptions): Promise<PairwiseCallVer
     outputB: opts.outputB,
   });
 
-  const final = await collectFinalMessage(
-    adapter.stream({
-      model: wireModelId,
-      system: [{ type: "text", text: system }],
-      messages: [{ role: "user", content: user }],
-      tools: [
-        {
-          name: "submit_comparison",
-          description:
-            "Submit the pairwise verdict: which response better addresses the input ('a', 'b', " +
-            "or 'tie'), with a brief rationale. The judge MUST call this tool — never reply in plain text.",
-          input_schema: submitComparisonInputSchema,
-        },
-      ],
-      toolChoice: { type: "tool", name: "submit_comparison" },
-      maxTokens: opts.maxTokens ?? 1024,
-      // Pinned decoding, mirroring judge() — a pairwise verdict that flips
-      // with provider-default sampling is not a measurement.
-      temperature: opts.temperature ?? 0,
-    }),
-  );
+  const final = await collectWithTemperatureRetry(adapter, {
+    model: wireModelId,
+    system: [{ type: "text", text: system }],
+    messages: [{ role: "user", content: user }],
+    tools: [
+      {
+        name: "submit_comparison",
+        description:
+          "Submit the pairwise verdict: which response better addresses the input ('a', 'b', " +
+          "or 'tie'), with a brief rationale. The judge MUST call this tool — never reply in plain text.",
+        input_schema: submitComparisonInputSchema,
+      },
+    ],
+    toolChoice: { type: "tool", name: "submit_comparison" },
+    maxTokens: opts.maxTokens ?? 1024,
+    // Pinned decoding, mirroring judge() — a pairwise verdict that flips
+    // with provider-default sampling is not a measurement. Models that
+    // reject the pin get it omitted / retried without it (#413).
+    temperature: opts.temperature ?? 0,
+  });
 
   const toolUse = extractToolUse(final, "submit_comparison");
   if (!toolUse) {
