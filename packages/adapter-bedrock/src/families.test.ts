@@ -117,4 +117,24 @@ describe("anthropic-on-bedrock body — temperature (NEW-HUNT-2)", () => {
   test("omits temperature entirely when the request carries none", () => {
     expect("temperature" in buildAnthropicBedrockBody(baseReq)).toBe(false);
   });
+
+  test("drops temperature for Bedrock Claude ids that reject the parameter (#413)", () => {
+    for (const model of [
+      "anthropic.claude-sonnet-5",
+      "anthropic.claude-opus-5",
+      "us.anthropic.claude-opus-4-7",
+    ]) {
+      expect(
+        buildAnthropicBedrockBody({ ...baseReq, model, temperature: 0 }).temperature,
+      ).toBeUndefined();
+    }
+    // Pre-4.7 Claude ids keep the pin — the constraint starts at Opus 4.7.
+    expect(
+      buildAnthropicBedrockBody({
+        ...baseReq,
+        model: "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        temperature: 0,
+      }).temperature,
+    ).toBe(0);
+  });
 });

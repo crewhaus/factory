@@ -1,5 +1,7 @@
 import {
   type ProviderAdapter,
+  type ProviderMessage,
+  type ProviderRequest,
   collectFinalMessage,
   extractToolUse,
 } from "@crewhaus/adapter-anthropic";
@@ -19,6 +21,46 @@ import { renderTranscriptDigest } from "./transcript-digest";
 export const DEFAULT_JUDGE_MODEL = "claude-sonnet-5";
 
 const logger = createLogger({ bindings: { module: "eval-judge" } });
+
+/**
+ * #413 — TRUE when a provider error says the model rejects an explicit
+ * sampling temperature. The Anthropic API phrases it "`temperature` is
+ * deprecated for this model" (Claude 5 family, Opus 4.7+);
+ * OpenAI-compatible servers say "Unsupported parameter" / "not
+ * supported". Matched loosely on purpose: this is the LAST line of
+ * defense behind the adapters' model gates (which already omit the pin
+ * for the models they know about), so it only ever sees providers the
+ * gates don't cover, and a false positive costs one retry without the
+ * pin — on a model that was refusing the pin anyway.
+ */
+export function isTemperatureRejectionError(err: unknown): boolean {
+  const text = err instanceof Error ? err.message : String(err);
+  return (
+    /temperature/i.test(text) && /deprecated|unsupported|not supported|does not support/i.test(text)
+  );
+}
+
+/**
+ * #413 — run one judge model call, retrying ONCE with the temperature
+ * field omitted when the provider rejects the parameter outright. The
+ * NEW-HUNT-2 pin stays for every model that accepts it; on a model that
+ * rejects it there is no determinism to preserve — the parameter does
+ * not exist there, so the retry is the only call shape that can succeed.
+ * Any other error (and any error on a pin-free request) rethrows as-is.
+ */
+export async function collectWithTemperatureRetry(
+  adapter: ProviderAdapter,
+  request: ProviderRequest,
+): Promise<ProviderMessage> {
+  try {
+    return await collectFinalMessage(adapter.stream(request));
+  } catch (err) {
+    if (request.temperature === undefined || !isTemperatureRejectionError(err)) throw err;
+    logger.warn("judge.temperature_pin_rejected", { model: request.model });
+    const { temperature: _dropped, ...withoutTemperature } = request;
+    return await collectFinalMessage(adapter.stream(withoutTemperature));
+  }
+}
 
 /**
  * C35 — judge token metering sink. Judge calls are model calls the eval
@@ -137,30 +179,30 @@ export async function judge(opts: JudgeOptions): Promise<JudgeResult> {
     ...(opts.target !== undefined ? { target: opts.target } : {}),
   });
 
-  const final = await collectFinalMessage(
-    adapter.stream({
-      model: wireModelId,
-      system: [{ type: "text", text: system }],
-      messages: [{ role: "user", content: user }],
-      tools: [
-        {
-          name: "submit_score",
-          description:
-            "Submit the overall 1–5 score, a brief rationale, and the per-criterion scores. " +
-            "Set `abstain: true` (still filling every required field) when the evidence is " +
-            "insufficient to score honestly. " +
-            "The judge MUST call this tool — never reply in plain text.",
-          input_schema: submitScoreInputSchema,
-        },
-      ],
-      toolChoice: { type: "tool", name: "submit_score" },
-      maxTokens: opts.maxTokens ?? 1024,
-      // NEW-HUNT-2 — judge decoding is PINNED to temperature 0 unless the
-      // rubric overrides it. Adapters without a native temperature control
-      // ignore the field (capability-dependent, like `thinking`).
-      temperature: opts.temperature ?? 0,
-    }),
-  );
+  const final = await collectWithTemperatureRetry(adapter, {
+    model: wireModelId,
+    system: [{ type: "text", text: system }],
+    messages: [{ role: "user", content: user }],
+    tools: [
+      {
+        name: "submit_score",
+        description:
+          "Submit the overall 1–5 score, a brief rationale, and the per-criterion scores. " +
+          "Set `abstain: true` (still filling every required field) when the evidence is " +
+          "insufficient to score honestly. " +
+          "The judge MUST call this tool — never reply in plain text.",
+        input_schema: submitScoreInputSchema,
+      },
+    ],
+    toolChoice: { type: "tool", name: "submit_score" },
+    maxTokens: opts.maxTokens ?? 1024,
+    // NEW-HUNT-2 — judge decoding is PINNED to temperature 0 unless the
+    // rubric overrides it. Adapters without a native temperature control
+    // ignore the field (capability-dependent, like `thinking`), adapters
+    // whose models REJECT it omit it (#413), and a provider the gates
+    // don't know gets one pin-free retry (collectWithTemperatureRetry).
+    temperature: opts.temperature ?? 0,
+  });
 
   // C35 — meter BEFORE validating the response: a judge call that answered
   // in the wrong shape still burned the tokens it burned.
@@ -279,28 +321,27 @@ export async function judgeCategorical(
     $refStrategy: "none",
   }) as Record<string, unknown>;
 
-  const final = await collectFinalMessage(
-    adapter.stream({
-      model: wireModelId,
-      system: [{ type: "text", text: system }],
-      messages: [{ role: "user", content: user }],
-      tools: [
-        {
-          name: "submit_label",
-          description:
-            "Submit the single label that best classifies the agent's response, with a brief " +
-            "rationale. Set `abstain: true` (still picking the closest label) when the evidence " +
-            "is insufficient to classify honestly. " +
-            "The judge MUST call this tool — never reply in plain text.",
-          input_schema: submitLabelInputSchema,
-        },
-      ],
-      toolChoice: { type: "tool", name: "submit_label" },
-      maxTokens: opts.maxTokens ?? 1024,
-      // NEW-HUNT-2 — pinned decoding, identical to the scalar judge.
-      temperature: opts.temperature ?? 0,
-    }),
-  );
+  const final = await collectWithTemperatureRetry(adapter, {
+    model: wireModelId,
+    system: [{ type: "text", text: system }],
+    messages: [{ role: "user", content: user }],
+    tools: [
+      {
+        name: "submit_label",
+        description:
+          "Submit the single label that best classifies the agent's response, with a brief " +
+          "rationale. Set `abstain: true` (still picking the closest label) when the evidence " +
+          "is insufficient to classify honestly. " +
+          "The judge MUST call this tool — never reply in plain text.",
+        input_schema: submitLabelInputSchema,
+      },
+    ],
+    toolChoice: { type: "tool", name: "submit_label" },
+    maxTokens: opts.maxTokens ?? 1024,
+    // NEW-HUNT-2 — pinned decoding, identical to the scalar judge
+    // (#413 retry semantics included).
+    temperature: opts.temperature ?? 0,
+  });
 
   // C35 — meter every judge model call, validation outcome notwithstanding.
   opts.onUsage?.({ model, input: final.usage.input, output: final.usage.output });

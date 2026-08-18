@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_CODE_SYSTEM_PREFIX } from "./client.js";
 import {
+  claudeRejectsTemperature,
   rawEventToCanonical,
   toAnthropicMessages,
   toAnthropicParams,
@@ -102,6 +103,87 @@ describe("toAnthropicParams", () => {
       false,
     );
     expect("temperature" in viaEffort).toBe(false);
+  });
+
+  test("drops temperature for models that reject the parameter (#413)", () => {
+    for (const model of [
+      "claude-sonnet-5",
+      "claude-opus-5",
+      "claude-fable-5",
+      "claude-mythos-5",
+      "claude-opus-4-7",
+      "claude-opus-4-8",
+    ]) {
+      const params = toAnthropicParams({ ...baseReq, model, temperature: 0 }, false);
+      expect("temperature" in params).toBe(false);
+    }
+  });
+
+  test("keeps the pin for models that still accept it (#413)", () => {
+    for (const model of [
+      "claude-sonnet-4-6",
+      "claude-sonnet-4-5-20250929",
+      "claude-haiku-4-5-20251001",
+      "claude-opus-4-6",
+      "claude-opus-4-5-20251101",
+    ]) {
+      expect(toAnthropicParams({ ...baseReq, model, temperature: 0 }, false).temperature).toBe(0);
+    }
+  });
+});
+
+describe("claudeRejectsTemperature (#413)", () => {
+  test("rejects: Opus 4.7+, the whole Claude 5 family, and future majors", () => {
+    for (const model of [
+      "claude-opus-4-7",
+      "claude-opus-4-8",
+      "claude-opus-5",
+      "claude-sonnet-5",
+      "claude-fable-5",
+      "claude-mythos-5",
+      // Future family members inherit the constraint, not the pin.
+      "claude-haiku-5",
+      "claude-sonnet-5-1",
+    ]) {
+      expect(claudeRejectsTemperature(model)).toBe(true);
+    }
+  });
+
+  test("accepts: pre-4.7 Opus, Sonnet ≤ 4.6, Haiku 4.5 — dated ids included", () => {
+    for (const model of [
+      "claude-opus-4-6",
+      "claude-opus-4-5-20251101",
+      "claude-opus-4-1-20250805",
+      "claude-sonnet-4-6",
+      "claude-sonnet-4-5-20250929",
+      "claude-haiku-4-5-20251001",
+    ]) {
+      expect(claudeRejectsTemperature(model)).toBe(false);
+    }
+  });
+
+  test("a datestamp is not a minor version: claude-opus-4-20250514 is Opus 4.0", () => {
+    expect(claudeRejectsTemperature("claude-opus-4-20250514")).toBe(false);
+    expect(claudeRejectsTemperature("claude-sonnet-4-20250514")).toBe(false);
+  });
+
+  test("Bedrock prefixes and suffixes don't defeat the match", () => {
+    expect(claudeRejectsTemperature("anthropic.claude-sonnet-5")).toBe(true);
+    expect(claudeRejectsTemperature("us.anthropic.claude-opus-5")).toBe(true);
+    expect(claudeRejectsTemperature("anthropic.claude-sonnet-4-5-20250929-v1:0")).toBe(false);
+  });
+
+  test("legacy number-first ids and non-Claude models keep the pin", () => {
+    for (const model of [
+      "claude-3-5-sonnet-20241022",
+      "claude-3-7-sonnet-20250219",
+      "claude-2.1",
+      "gpt-4o-mini",
+      "gemini-2.0-flash",
+      "meta.llama3-1-70b-instruct-v1:0",
+    ]) {
+      expect(claudeRejectsTemperature(model)).toBe(false);
+    }
   });
 
   test("omits tools key entirely when empty", () => {
