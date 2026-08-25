@@ -326,14 +326,19 @@ Scan (which registers everything) stays as the labeled bulk fallback.
 
 ## Testing
 
-`bun test src` — the embed-map completeness/hygiene suite plus unit tests
-for the pure browser modules (`util.js`, `supervision.js`, `markdown.js`,
-`router.js`, `routes.js`, `shapes.js`) and the `api.js` client under a
-stubbed `fetch` (every wrapper asserted against the route map's
-method/path/body). All DOM-free at import time and imported directly by
-bun. Deterministic: clocks are injected, no network, no subprocesses. The
-server side of the same contract runs in `@crewhaus/hangar-server`'s
-`contract.test.ts`.
+`bun run test` — two `bun test` invocations, DELIBERATELY two processes:
+`bun test src` runs the unit tests for the pure browser modules
+(`util.js`, `supervision.js`, `markdown.js`, `router.js`, `routes.js`,
+`shapes.js`, the view decisions) and the `api.js` client under a stubbed
+`fetch` (every wrapper asserted against the route map's method/path/body);
+`bun test ./src/embed-suite.ts` then runs the embed-map
+completeness/hygiene suite alone. The split is load-bearing, not taste:
+the embed suite imports every asset as TEXT while the view tests import
+the same files as ES modules, and bun's module registry keys a module by
+path alone — in one process whichever load lands first poisons the other.
+All DOM-free at import time and imported directly by bun. Deterministic:
+clocks are injected, no network, no subprocesses. The server side of the
+same contract runs in `@crewhaus/hangar-server`'s `contract.test.ts`.
 
 The M2 screens stay testable without a browser by keeping the decisions —
 state → row, envelope → disabled-with-reason, SSE frame → feed item,

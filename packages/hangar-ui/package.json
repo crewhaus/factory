@@ -9,7 +9,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "bun test src"
+    "test": "bun test src && bun test ./src/embed-suite.ts"
   },
   "license": "Apache-2.0",
   "author": {

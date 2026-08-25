@@ -10,7 +10,7 @@
  * nobody can get to. This closes that gap for this area.
  *
  * DOM behaviour is covered by the server-side suite's payload assertions
- * plus `index.test.ts`'s embed scans (no markup-string assignment, valid
+ * plus `embed-suite.ts`'s embed scans (no markup-string assignment, valid
  * syntax, closed import graph) — this file adds no headless-DOM machinery to
  * a package that deliberately has none.
  */
