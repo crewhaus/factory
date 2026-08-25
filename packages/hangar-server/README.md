@@ -335,6 +335,55 @@ origin and a CSP built from its `net` allow-list. Visibility is decided by
 `@crewhaus/plugin-loader`'s own fail-closed `isFsAllowed`, so a plugin that
 may not read a harness neither draws a tab on it nor sees its trace events.
 
+### M5 — the Advisor + Library curation
+
+```
+# advisor — the unified alert/suggestion feed and its loops
+GET  /api/advisor                          GET  /api/h/:id/advisor
+POST /api/h/:id/advisor/:itemId/{act,dismiss,reopen}
+GET  /api/h/:id/advisor/trend
+GET|POST /api/h/:id/advisor/reports        GET /api/h/:id/advisor/reports/:reportId
+GET|POST /api/h/:id/advisor/issues
+
+# library curation — visibility + discovery-without-registration
+PUT  /api/h/:id/visibility {hidden}        GET /api/registry/discover
+```
+
+The advisor routes ride the same grouped dispatch table as M3 (group
+`"advisor"`, `src/advisor.ts`), so they inherit every guard uniformly. Three
+rules bound the module:
+
+1. **Nothing is invented.** Every feed item is derived from a signal another
+   panel already reads — preflight, the spec lint, eval health vs the pinned
+   baseline, the cost fold vs the declared budget, incidents, parked
+   approvals, overdue dreams, the advice feed. `deriveAdvisorItems` is pure
+   and unit-tested; the feed's empty state IS the goal state ("running
+   optimally"), not an error.
+2. **A suggestion is never an application.** A quick action queues a CLI
+   verb through the job queue with argv from a CLOSED vocabulary
+   (`ADVISOR_JOB_ARGV`) or deep-links the owning screen; spec writes stay on
+   the spec write path. The issue inbox is the same covenant pointed the
+   other way: a submitted issue queues `optimize` (the eval→patch loop whose
+   artifact is a reviewable spec patch), `eval`/`doctor`/`compile`/`advise`,
+   or records a `note` — the issue text never reaches a command line.
+3. **A decision is a record, not a deletion.** Act (optional comment) and
+   dismiss (REQUIRED reason) append to
+   `<harness>/.crewhaus/advisor/decisions.jsonl`; reopen appends a
+   superseding record. Reports persist under `.crewhaus/advisor/reports/`;
+   issues under `.crewhaus/advisor/issues.jsonl`. All reads are capped and
+   torn-line tolerant, and the feed GET derives without writing — the trend
+   is folded from durable sources (the eval index, the cost ledger, the
+   decisions ledger), never from snapshots a read would have to persist.
+
+Library curation: `hidden` is a first-class registry field
+(`setHidden` in `@crewhaus/harness-registry`; upsert refreshes never clobber
+it), surfaced on every `/api/harnesses` row so the console can fold hidden
+entries out of the default view — curation, not removal. `GET
+/api/registry/discover` walks the scan roots and reports the harnesses NOT
+yet registered as candidates, registering nothing: the "find harnesses on
+this machine" flow, distinct from `POST /api/scan` (which registers
+everything it finds).
+
 ## Library use
 
 ```ts

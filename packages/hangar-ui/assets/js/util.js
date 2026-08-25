@@ -180,6 +180,7 @@ export function normalizeRows(feed) {
       groups: Array.isArray(src.groups) ? src.groups.map(String) : [],
       tags: Array.isArray(src.tags) ? src.tags.map(String) : [],
       pinned: src.pinned === true,
+      hidden: src.hidden === true,
       notes: typeof src.notes === "string" ? src.notes : "",
       missingSince: typeof src.missingSince === "string" ? src.missingSince : null,
       lastSeen: typeof src.lastSeen === "string" ? src.lastSeen : null,

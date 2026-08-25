@@ -92,6 +92,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["harnesses[].groups", "array"],
     ["harnesses[].tags", "array"],
     ["harnesses[].pinned", "boolean"],
+    ["harnesses[].hidden", "boolean"],
     ["harnesses[].notes", "string"],
     ["harnesses[].missingSince", "string|null"],
     ["harnesses[].lastSeen", "string"],
@@ -491,6 +492,16 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["panes", "array"],
     ["traceObservers", "array"],
     ["deferred", "object"],
+  ],
+  // views/library.js findPanel — discovery without registration
+  discover: [
+    ["roots", "number"],
+    ["candidates[].dir", "string"],
+    ["candidates[].specName", "string"],
+    ["candidates[].target", "string"],
+    ["alreadyRegistered", "number"],
+    ["errors", "array"],
+    ["note", "string|null"],
   ],
 };
 
@@ -1116,6 +1127,49 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["text", "string|null"],
     ["truncated", "boolean"],
   ),
+  // ---- M5 · advisor (owner: the Advisor implementer) --------------------
+  // Arrays are asserted as arrays, never with a `[]` element path: an
+  // optimally-running harness has an EMPTY feed by design, and the fixture's
+  // exact item set is this area's own suite's business (advisor.test.ts).
+  advisor: m3Read(
+    ["items", "array"],
+    ["dismissed", "array"],
+    ["open", "number"],
+    ["optimal", "boolean"],
+    ["counts.critical", "number"],
+    ["counts.warn", "number"],
+    ["counts.suggestion", "number"],
+    ["counts.dismissed", "number"],
+    ["guidance", "string"],
+    ["asOf", "string"],
+  ),
+  advisorTrend: m3Read(
+    ["evalSeries", "array"],
+    ["spendDays", "array"],
+    ["decisions.total", "number"],
+    ["decisions.acted", "number"],
+    ["decisions.dismissed", "number"],
+    ["summary", "string"],
+    ["baselines", "object"],
+  ),
+  advisorReports: m3Read(["reports", "array"], ["kinds", "array"]),
+  // Driven with a reportId that does not exist, so the absent envelope is
+  // the asserted shape — nothing about the request is malformed.
+  advisorReport: m3Read(
+    ["reportId", "string"],
+    ["kind", "string|null"],
+    ["generatedAt", "string|null"],
+    ["report", "object|null"],
+  ),
+  advisorIssues: m3Read(["issues", "array"], ["kinds", "array"]),
+  advisorFleet: m3Read(
+    ["harnesses", "array"],
+    ["totals.harnesses", "number"],
+    ["totals.open", "number"],
+    ["totals.critical", "number"],
+    ["totals.optimal", "number"],
+  ),
+
   // Both runtime reads carry `supervision`, which is how the console knows
   // whether Stop is a button or a disabled control with a reason.
   mcpServers: m3Read(
@@ -1184,6 +1238,8 @@ const M3_PARAMS: Record<string, string> = {
   dashboardId: "dash_1",
   keyId: "key_1",
   store: "settings",
+  itemId: "adv-x",
+  reportId: "20260803T000000Z-costs",
 };
 
 /**
@@ -1276,6 +1332,11 @@ const M3_BODIES: Record<string, unknown> = {
   thredzKeyCreate: { label: "hangar" },
   thredzKeyRotate: { confirm: true },
   settingsWrite: { settings: {}, confirmName: "contract-harness" },
+  advisorAct: { comment: "queued per the on-call note" },
+  advisorDismiss: { reason: "accepted risk: contract fixture" },
+  advisorReopen: {},
+  advisorReportRun: { kind: "costs" },
+  advisorIssueSubmit: { title: "answers drift off-topic", detail: "tighten it", kind: "optimize" },
   mcpServerStart: { transport: "stdio" },
   mcpServerStop: {},
   devStart: { checkOnly: true },
@@ -1636,6 +1697,18 @@ describe("UI route contract", () => {
       await drive("setTags", { id }, { body: { tags: ["blue", "canary"] } });
       await drive("setNotes", { id }, { body: { notes: "contract note" } });
 
+      // Visibility is curation, not removal: the flag lands on the feed row
+      // (the Library folds hidden rows out client-side) and the entry keeps
+      // every other field. Lifted again so the rest of the drive sees the
+      // default posture.
+      await drive("setHidden", { id }, { body: { hidden: true } });
+      const hiddenFeed = (await drive("harnesses", {}))["harnesses"] as Array<{
+        id: string;
+        hidden: boolean;
+      }>;
+      expect(hiddenFeed.find((r) => r.id === id)?.hidden).toBe(true);
+      await drive("setHidden", { id }, { body: { hidden: false } });
+
       const groupBody = await drive("addGroup", {}, { body: { name: "prod" }, expectStatus: 201 });
       expect((groupBody["group"] as { name: string }).name).toBe("prod");
       const groups = await drive("groups", {});
@@ -1891,8 +1964,20 @@ describe("UI route contract", () => {
       expect((panes["panes"] as Array<{ id: string }>).map((p) => p.id)).toEqual(["spend"]);
       expect(panes["traceObservers"]).toEqual(["cost-lens"]);
 
-      // -- scan root + scan (effect: the root is scanned, entries refresh) --
+      // -- scan root + discover + scan ---------------------------------------
       await drive("addScanRoot", {}, { body: { dir: t.harnessesRoot }, expectStatus: 201 });
+      // Discovery WITHOUT registration: an unregistered harness under the
+      // root is a CANDIDATE (an Add away), and stays out of the registry
+      // until someone adds it — the "don't show unless added" half.
+      const findMe = join(t.harnessesRoot, "discover-me");
+      mkdirSync(findMe, { recursive: true });
+      writeFileSync(join(findMe, "crewhaus.yaml"), "name: discover-me\ntarget: cli\n");
+      const discovered = await drive("discover", {}, { readsKey: "discover" });
+      expect(
+        (discovered["candidates"] as Array<{ dir: string }>).some((c) => c.dir === findMe),
+      ).toBe(true);
+      const feedBeforeScan = (await drive("harnesses", {}))["harnesses"] as Array<{ dir: string }>;
+      expect(feedBeforeScan.some((r) => r.dir === findMe)).toBe(false);
       const scanned = await drive("scan", {}, { body: {} });
       expect(scanned["roots"]).toBe(1);
       expect(scanned["discovered"]).toBeGreaterThanOrEqual(1);

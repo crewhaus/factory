@@ -27,6 +27,19 @@
  */
 
 import {
+  advisorAct,
+  advisorDismiss,
+  advisorFeed,
+  advisorFleet,
+  advisorIssueSubmit,
+  advisorIssues,
+  advisorReopen,
+  advisorReport,
+  advisorReportRun,
+  advisorReports,
+  advisorTrend,
+} from "./advisor";
+import {
   datasetBuilder,
   datasetBuilderStep,
   graderCatalog,
@@ -223,8 +236,9 @@ import {
   wikiWrite,
 } from "./wiki-ops";
 
-/** The eleven M3 groups. A route's group is its owning module's area, and
- *  the console's left rail / tab wiring reads the same field. */
+/** The M3 groups (eleven M3 areas plus M5's advisor). A route's group is its
+ *  owning module's area, and the console's left rail / tab wiring reads the
+ *  same field. */
 export const M3_GROUPS = [
   "spec",
   "memory",
@@ -237,6 +251,7 @@ export const M3_GROUPS = [
   "thredz",
   "inspect",
   "runtime",
+  "advisor",
 ] as const;
 
 export type M3Group = (typeof M3_GROUPS)[number];
@@ -675,6 +690,19 @@ export const M3_ROUTES: readonly M3Route[] = [
   route("inspectStore", "GET", "/api/h/:id/inspect/:store", "inspect", inspectStore),
   route("inspectEntry", "GET", "/api/h/:id/inspect/:store/:name", "inspect", inspectEntry),
   route("settingsWrite", "PUT", "/api/h/:id/inspect/settings", "inspect", settingsWrite),
+
+  // ---- advisor: the unified alert/suggestion feed + its loops (M5) -------
+  route("advisor", "GET", "/api/h/:id/advisor", "advisor", advisorFeed),
+  route("advisorAct", "POST", "/api/h/:id/advisor/:itemId/act", "advisor", advisorAct),
+  route("advisorDismiss", "POST", "/api/h/:id/advisor/:itemId/dismiss", "advisor", advisorDismiss),
+  route("advisorReopen", "POST", "/api/h/:id/advisor/:itemId/reopen", "advisor", advisorReopen),
+  route("advisorTrend", "GET", "/api/h/:id/advisor/trend", "advisor", advisorTrend),
+  route("advisorReports", "GET", "/api/h/:id/advisor/reports", "advisor", advisorReports),
+  route("advisorReportRun", "POST", "/api/h/:id/advisor/reports", "advisor", advisorReportRun),
+  route("advisorReport", "GET", "/api/h/:id/advisor/reports/:reportId", "advisor", advisorReport),
+  route("advisorIssues", "GET", "/api/h/:id/advisor/issues", "advisor", advisorIssues),
+  route("advisorIssueSubmit", "POST", "/api/h/:id/advisor/issues", "advisor", advisorIssueSubmit),
+  route("advisorFleet", "GET", "/api/advisor", "advisor", advisorFleet),
 
   // ---- runtime: the mcp-server + dev run classes -------------------------
   route("mcpServers", "GET", "/api/h/:id/mcp-servers", "runtime", mcpServers),

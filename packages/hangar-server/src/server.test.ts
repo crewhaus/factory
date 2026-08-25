@@ -464,6 +464,7 @@ describe("/api/harnesses rows + rollup cache", () => {
       groups: [],
       tags: [],
       pinned: false,
+      hidden: false,
       notes: "",
       kind: "local",
       registeredAt: iso(NOW),

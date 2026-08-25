@@ -262,7 +262,9 @@ export const api = {
   groupProc: (name, verb, body = {}) => call(ROUTES.groupProc, { name, verb }, body),
   setTags: (id, tags) => call(ROUTES.setTags, { id }, { tags }),
   setPin: (id, pinned) => call(ROUTES.setPin, { id }, { pinned }),
+  setHidden: (id, hidden) => call(ROUTES.setHidden, { id }, { hidden }),
   setNotes: (id, notes) => call(ROUTES.setNotes, { id }, { notes }),
+  discover: () => call(ROUTES.discover, {}),
   relocateHarness: (id, newDir) => call(ROUTES.relocate, { id }, { newDir }),
   removeHarness: (id) => call(ROUTES.removeHarness, { id }),
 

@@ -60,6 +60,14 @@ export type HangarHarnessEntry = {
   readonly tags: readonly string[];
   /** User-managed; pinned entries survive prune prompts. */
   readonly pinned: boolean;
+  /**
+   * User-managed; hidden entries stay registered (their state, groups and
+   * history survive) but the manager's Library omits them from the default
+   * view. "Don't show all harnesses unless added": a scan may register a
+   * whole tree, and hiding is how an operator keeps the shown set curated
+   * without losing the registration. Never clobbered by an upsert refresh.
+   */
+  readonly hidden: boolean;
   /** User-managed free text; never clobbered by an upsert refresh. */
   readonly notes: string;
   readonly kind: HarnessKind;

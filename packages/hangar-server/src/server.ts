@@ -47,7 +47,7 @@
  */
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { readRunIndex } from "@crewhaus/eval-report";
 import {
   type BuildInventoryDeps,
@@ -494,6 +494,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         groups: entry.groups,
         tags: entry.tags,
         pinned: entry.pinned,
+        // Curation, not removal: the Library folds hidden rows out of the
+        // default view; everything else about the entry keeps flowing.
+        hidden: entry.hidden === true,
         notes: entry.notes,
         kind: entry.kind,
         registeredAt: entry.registeredAt,
@@ -551,6 +554,58 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       envFiles: merged.envFiles,
       memory: { facts, articles },
       rollup: cache.get(entry.id, dir, now()),
+    };
+  };
+
+  /**
+   * Discovery WITHOUT registration: walk the scan roots and report the
+   * harnesses that are NOT yet registered, each one an add away. This is the
+   * "find harnesses on this machine" flow — the operator picks which to add,
+   * so a big checkout does not flood the Library the way a blanket scan
+   * (which registers everything it finds) would.
+   */
+  const discoverView = (): unknown => {
+    const registered = new Set(registry.list().map((e) => e.dir));
+    const roots = registry.listScanRoots();
+    const errors: string[] = [];
+    const seen = new Set<string>();
+    const candidates: Array<{ dir: string; specName: string; target: string }> = [];
+    let alreadyRegistered = 0;
+    for (const scanRoot of roots) {
+      let found: ReturnType<typeof discoverHarnesses>;
+      try {
+        found = discoverHarnesses(scanRoot.dir);
+      } catch (err) {
+        errors.push(err instanceof Error ? err.message : String(err));
+        continue;
+      }
+      for (const h of found) {
+        if (seen.has(h.dir)) continue;
+        seen.add(h.dir);
+        if (registered.has(h.dir)) {
+          alreadyRegistered += 1;
+          continue;
+        }
+        const header = readHeaderSafe(h.dir);
+        candidates.push({
+          dir: h.dir,
+          specName: header.name ?? basename(h.dir),
+          target: header.target ?? "unknown",
+        });
+      }
+    }
+    candidates.sort((a, b) => a.dir.localeCompare(b.dir));
+    return {
+      roots: roots.length,
+      candidates,
+      alreadyRegistered,
+      errors,
+      note:
+        roots.length === 0
+          ? "no scan roots configured — add one and discovery can search this machine"
+          : candidates.length === 0
+            ? "every harness under the scan roots is already registered"
+            : null,
     };
   };
 
@@ -1242,6 +1297,14 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           throw new HttpError(400, 'missing "pinned" boolean');
         return jsonMasked({ entry: registry.setPinned(entry.id, body["pinned"]) });
       }
+      if (head === "visibility") {
+        // Hide from (or return to) the Library's default view. The entry
+        // stays registered with all its state — "don't show all harnesses
+        // unless added" is curation, and curation must be reversible.
+        if (typeof body["hidden"] !== "boolean")
+          throw new HttpError(400, 'missing "hidden" boolean');
+        return jsonMasked({ entry: registry.setHidden(entry.id, body["hidden"]) });
+      }
       if (head === "notes") {
         if (typeof body["notes"] !== "string") throw new HttpError(400, 'missing "notes" string');
         return jsonMasked({ entry: registry.setNotes(entry.id, body["notes"]) });
@@ -1810,6 +1873,11 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       throw new HttpError(405, "method not allowed");
     }
 
+    if (head === "registry" && rest[0] === "discover" && rest.length === 1) {
+      if (method !== "GET") throw new HttpError(405, "method not allowed");
+      return json(discoverView());
+    }
+
     if (head === "scan" && rest.length === 0) {
       if (method !== "POST") throw new HttpError(405, "method not allowed");
       return json(scanAll());
@@ -2058,7 +2126,10 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       "GET|POST|PUT|DELETE /api/registry/groups",
       "GET|POST /api/registry/groups/:name/proc/{start,stop,restart}",
       "GET|POST|DELETE /api/registry/scan-roots",
+      "GET  /api/registry/discover",
       "POST /api/scan",
+      "PUT  /api/h/:id/visibility",
+      "GET  /api/advisor    GET|POST /api/h/:id/advisor/…",
       "GET  /api/costs",
       "GET|DELETE /api/h/:id    POST /api/h/:id/relocate",
       "PUT  /api/h/:id/{groups,tags,pin,notes}",

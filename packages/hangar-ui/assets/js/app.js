@@ -37,6 +37,7 @@ import {
 import { shapeAccent, shapeLabel } from "./shapes.js";
 import { procRow } from "./supervision.js";
 import { renderActivity } from "./views/activity.js";
+import { renderAdvisor, renderAdvisorBoard } from "./views/advisor.js";
 import { renderApprovals } from "./views/approvals.js";
 import { renderChannels } from "./views/channels.js";
 import { renderCosts } from "./views/costs.js";
@@ -68,6 +69,7 @@ import { renderTokenScreen } from "./views/token.js";
 const THEME_KEY = "hangar.theme";
 const TAB_LABELS = {
   overview: "Overview",
+  advisor: "Advisor",
   spec: "Spec",
   runs: "Runs",
   schedulers: "Schedulers",
@@ -94,6 +96,7 @@ const NAV = [
   { view: "review", label: "Review" },
   { view: "activity", label: "Activity" },
   { view: "health", label: "Health" },
+  { view: "advisor", label: "Advisor" },
   { view: "credentials", label: "Credentials" },
   { view: "feedback", label: "Feedback" },
   { view: "thredz", label: "Thredz" },
@@ -352,6 +355,8 @@ async function dispatch(route) {
       await renderThredzGlobal(viewRoot);
     } else if (route.view === "health") {
       await renderHealthBoard(viewRoot);
+    } else if (route.view === "advisor") {
+      await renderAdvisorBoard(viewRoot);
     } else if (route.view === "settings") {
       await renderSettings(viewRoot);
     } else {
@@ -423,7 +428,8 @@ async function renderHarnessPage(root, route) {
   if (route.tab === "spec") {
     await renderSpec(tabRoot, ctx);
     await renderSpecEdit(section(tabRoot), ctx);
-  } else if (route.tab === "runs") await renderRuns(tabRoot, ctx);
+  } else if (route.tab === "advisor") await renderAdvisor(tabRoot, ctx);
+  else if (route.tab === "runs") await renderRuns(tabRoot, ctx);
   else if (route.tab === "schedulers") await renderSchedulers(tabRoot, ctx);
   else if (route.tab === "sessions") await renderSessions(tabRoot, ctx);
   else if (route.tab === "evals") {
