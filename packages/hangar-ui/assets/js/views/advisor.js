@@ -499,13 +499,20 @@ function issuesCard(issues, ctx, reload) {
   for (const kind of kinds) {
     kindSel.appendChild(el("option", { value: String(kind), text: String(kind) }));
   }
-  kindSel.addEventListener("change", () => {
-    withTip(kindSel, ISSUE_KIND_TIPS[kindSel.value] ?? "");
-    kindSel.dataset.tip = ISSUE_KIND_TIPS[kindSel.value] ?? "";
-  });
+  // The kind's tooltip follows the selection: `withTip` seeds the class and
+  // the initial text; the change listener rewrites BOTH faces of the tip
+  // (the hover bubble reads data-tip, assistive tech reads title).
+  const retip = () => {
+    const tipText = ISSUE_KIND_TIPS[kindSel.value] ?? "";
+    kindSel.dataset.tip = tipText;
+    kindSel.setAttribute("title", tipText);
+  };
+  kindSel.addEventListener("change", retip);
   withTip(kindSel, ISSUE_KIND_TIPS[String(kinds[0] ?? "optimize")] ?? "");
+  // Field order = tab order: title, details, then the kind and the submit.
   const form = el("form", { class: "adv-form" }, [
     title,
+    detail,
     kindSel,
     el("button", {
       class: "btn btn-primary",
@@ -513,7 +520,6 @@ function issuesCard(issues, ctx, reload) {
       text: "Submit → update ready to run",
     }),
   ]);
-  form.appendChild(detail);
   form.addEventListener("submit", (e) => {
     e.preventDefault();
     if (title.value.trim() === "") return;
