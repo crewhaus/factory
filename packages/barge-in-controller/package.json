@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/barge-in-controller",
-  "version": "0.5.7",
+  "version": "0.5.8",
   "type": "module",
   "description": "Barge-in coordinator: watches inbound audio via vad-engine, fires interrupt() on adapter when user speaks during agent playback (Section 24 VOICE)",
   "main": "src/index.ts",

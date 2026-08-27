@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/spec-registry",
-  "version": "0.5.7",
+  "version": "0.5.8",
   "type": "module",
   "description": "Versioned spec storage with environment pinning + tenant overlays. File-backed default; pluggable for SQLite/Postgres/S3.",
   "main": "src/index.ts",

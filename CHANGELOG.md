@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.8] - 2026-08-27
+
+### Added
+
+- **The Hangar Advisor — every alert, suggestion, and optimization signal on
+  one actionable surface** (#417). Each harness gains an Advisor tab and the
+  fleet gains an Advisor board (worst-first: critical count, then open count,
+  ties by name). The feed is derived, never invented: pure
+  `deriveAdvisorItems` folds the signals other panels already read —
+  preflight, the spec lint, eval health vs the pinned baseline, the cost
+  fold vs the declared budget, incidents, parked approvals, overdue dreams,
+  the advice feed — and its empty state IS the goal state ("running
+  optimally"), not an error. Every item carries a hover tooltip saying what
+  it means and when to act, plus a quick action: either a job queued through
+  the existing job queue with argv from a CLOSED vocabulary
+  (`ADVISOR_JOB_ARGV`), shown alongside its CLI twin, or a deep link to the
+  screen that owns the fix — a suggestion is never an application, and spec
+  writes stay on the spec write path. Decisions are records, not deletions:
+  acting takes an optional comment, dismissing REQUIRES a reason, and both
+  append to `<harness>/.crewhaus/advisor/decisions.jsonl` (reopen appends a
+  superseding record). A trend strip folds the eval index so improvement
+  toward optimal is visible at a glance; on-demand reports (model-usage,
+  costs, usefulness, optimization) persist under
+  `.crewhaus/advisor/reports/`; and an issue inbox turns a submitted issue
+  into an update ready to run — queueing `optimize` (the eval→patch loop
+  whose artifact is a reviewable spec patch), `eval`, `doctor`, `compile`,
+  `advise`, or recording a `note` — with the issue text never reaching a
+  command line. Routes ride the M3 grouped dispatch table (group
+  `"advisor"`), inheriting every auth/id/body guard uniformly.
+
+- **Library curation: the Hangar shows the harnesses you've added, not
+  everything on disk** (#417). `hidden` is a first-class registry field
+  (`setHidden` in `@crewhaus/harness-registry`; upsert refreshes never
+  clobber it), surfaced on every `/api/harnesses` row and settable via
+  `PUT /api/h/:id/visibility`, so the console folds hidden entries out of
+  the default view — curation, not removal. `GET /api/registry/discover`
+  walks the scan roots and reports harnesses NOT yet registered as
+  candidates, registering nothing: the "find harnesses on this machine"
+  flow, distinct from `POST /api/scan` (which registers everything it
+  finds). Adding remains the default posture; discovery makes it a
+  one-click one.
+
+### Fixed
+
+- **CI and the release path pin bun 1.3.11.** bun 1.4.0 (released
+  2026-08-19) wedges `bun run --filter` on ubuntu-latest: every package
+  suite completes and the parent process then never exits, idling until the
+  6-hour job timeout while runner cleanup reports orphaned bun processes.
+  ci.yml, release.yml, and smoke-runtime.yml — the PR bar and both release
+  gates — now pin the last line this repo demonstrably completes under,
+  re-floating together once a 1.4.x fixes the parent-exit hang.
+
+- **hangar-ui's embedded-asset suite runs in its own test process.** bun's
+  module registry keys modules by path and ignores import attributes, so a
+  file first imported `with { type: "text" }` (the embed map) poisons a
+  later plain-ESM import of the same path with its text stringification —
+  and vice versa — in whichever order the suites load. The embed suite
+  (renamed `src/embed-suite.ts`, off the default test glob) now runs as a
+  second `bun test` invocation so neither import shape can see the other's
+  cache.
+
 ## [0.5.7] - 2026-08-17
 
 ### Fixed

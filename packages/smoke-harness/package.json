@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/smoke-harness",
-  "version": "0.5.7",
+  "version": "0.5.8",
   "type": "module",
   "description": "Compile-time smoke matrix: drives one minimal spec per target shape through compile() and asserts the emitted bundle has the imports/registrations/event-kinds the shape is supposed to wire.",
   "main": "src/index.ts",
