@@ -6,7 +6,7 @@
  */
 
 import { api } from "../api.js";
-import { asOf, clear, copyBtn, dot, el, emptyState, skeleton, toast } from "../dom.js";
+import { asOf, clear, copyBtn, dot, el, emptyState, skeleton, toast, withTip } from "../dom.js";
 import { hrefHarness } from "../router.js";
 import { shapeAccent, shapeLabel } from "../shapes.js";
 import { procStatePill } from "../supervision.js";
@@ -27,7 +27,8 @@ import { renderOnboarding, shouldOnboard } from "./onboarding.js";
 const state = {
   sortKey: "name",
   sortDir: "asc",
-  filter: { kind: "all" }, // {kind:"all"} | {kind:"group",name} | {kind:"smart",id}
+  // {kind:"all"} | {kind:"group",name} | {kind:"smart",id} | {kind:"hidden"}
+  filter: { kind: "all" },
   query: "",
 };
 
@@ -122,13 +123,19 @@ function normalizeGroups(payload, rows) {
 }
 
 function applyFilter(rows, nowMs) {
-  let out = rows;
+  // Hidden rows are curation, not data loss: they stay registered but stay
+  // OUT of every view except the explicit Hidden bucket — "don't show all
+  // harnesses unless added".
+  let out =
+    state.filter.kind === "hidden"
+      ? rows.filter((r) => r.hidden === true)
+      : rows.filter((r) => r.hidden !== true);
   if (state.filter.kind === "group") {
     const name = state.filter.name;
     out = out.filter((r) => r.groups.includes(name));
   } else if (state.filter.kind === "smart") {
     const smart = deriveSmartGroups(rows, nowMs).find((g) => g.id === state.filter.id);
-    out = smart ? smart.rows : [];
+    out = smart ? smart.rows.filter((r) => r.hidden !== true) : [];
   }
   if (state.query !== "") {
     const q = state.query.toLowerCase();
@@ -200,16 +207,28 @@ function renderRail(rows, groups, nowMs, redraw, reload) {
     );
     return btn;
   };
+  const hiddenCount = rows.filter((r) => r.hidden === true).length;
   rail.appendChild(
-    item("All harnesses", rows.length, state.filter.kind === "all", null, () => {
+    item("All harnesses", rows.length - hiddenCount, state.filter.kind === "all", null, () => {
       state.filter = { kind: "all" };
       redraw();
     }),
   );
+  // The curated-out entries get their own bucket rather than vanishing:
+  // hiding is reversible, and a bucket with a count is how you find them.
+  if (hiddenCount > 0) {
+    rail.appendChild(
+      item("Hidden", hiddenCount, state.filter.kind === "hidden", null, () => {
+        state.filter = { kind: "hidden" };
+        redraw();
+      }),
+    );
+  }
 
+  const shown = rows.filter((r) => r.hidden !== true);
   if (groups.length > 0) rail.appendChild(el("div", { class: "rail-head", text: "Groups" }));
   for (const g of groups) {
-    const count = rows.filter((r) => r.groups.includes(g.name)).length;
+    const count = shown.filter((r) => r.groups.includes(g.name)).length;
     const active = state.filter.kind === "group" && state.filter.name === g.name;
     rail.appendChild(
       item(g.name, count, active, g.color || null, () => {
@@ -229,7 +248,7 @@ function renderRail(rows, groups, nowMs, redraw, reload) {
   rail.appendChild(newBtn);
 
   rail.appendChild(el("div", { class: "rail-head", text: "Smart groups" }));
-  for (const g of deriveSmartGroups(rows, nowMs)) {
+  for (const g of deriveSmartGroups(shown, nowMs)) {
     const active = state.filter.kind === "smart" && state.filter.id === g.id;
     rail.appendChild(
       item(g.label, g.rows.length, active, null, () => {
@@ -307,10 +326,104 @@ function renderToolbar(reload) {
     dirInput.focus();
   };
 
-  const scanBtn = el("button", { class: "btn", type: "button", text: "Scan" });
+  const findBtn = withTip(
+    el("button", { class: "btn", type: "button", text: "Find harnesses…" }),
+    "Discovery WITHOUT registration: walks the scan roots and lists the harnesses that are not yet added, each one an Add away — the Library only shows what you add.",
+  );
+  const scanBtn = withTip(
+    el("button", { class: "btn btn-ghost", type: "button", text: "Scan (add all)" }),
+    "The bulk fallback: registers EVERY harness found under the scan roots. Prefer Find harnesses to pick which ones join the Library.",
+  );
   const rootBtn = el("button", { class: "btn", type: "button", text: "Add scan root…" });
-  const addBtn = el("button", { class: "btn", type: "button", text: "Add harness…" });
-  const bar = el("div", { class: "toolbar" }, [search, scanBtn, rootBtn, addBtn]);
+  const addBtn = withTip(
+    el("button", { class: "btn btn-primary", type: "button", text: "Add harness…" }),
+    "Register one harness by its directory — the default gesture.",
+  );
+  const bar = el("div", { class: "toolbar" }, [search, addBtn, findBtn, rootBtn, scanBtn]);
+
+  // The find panel: candidates from GET /api/registry/discover, each with an
+  // Add. Only one open at a time, sharing the openedForm slot with the two
+  // dir forms.
+  findBtn.addEventListener("click", async () => {
+    if (openedForm !== null) openedForm.remove();
+    findBtn.disabled = true;
+    let found = null;
+    try {
+      found = await api.discover();
+    } catch (err) {
+      toast(`Find failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      findBtn.disabled = false;
+    }
+    if (found === null) return;
+    const panel = el("div", { class: "card" });
+    const candidates = Array.isArray(found.candidates) ? found.candidates : [];
+    if (found.roots === 0) {
+      toast("No scan roots configured — add one and discovery can search this machine", "info");
+      panel.remove();
+      rootBtn.click();
+      return;
+    }
+    panel.appendChild(
+      el("div", { class: "rollup" }, [
+        el("strong", {
+          text: `Found ${candidates.length} unregistered harness${candidates.length === 1 ? "" : "es"}`,
+        }),
+        el("span", {
+          class: "muted",
+          text: ` under ${found.roots} scan root${found.roots === 1 ? "" : "s"} (${Number(found.alreadyRegistered ?? 0)} already added)`,
+        }),
+        el("button", {
+          class: "btn btn-ghost",
+          type: "button",
+          text: "Close",
+          onClick: () => panel.remove(),
+        }),
+      ]),
+    );
+    if (candidates.length === 0) {
+      panel.appendChild(emptyState(String(found.note ?? "Nothing new under the scan roots")));
+    }
+    for (const candidate of candidates) {
+      const addOne = el("button", { class: "btn btn-primary", type: "button", text: "Add" });
+      addOne.addEventListener("click", () => {
+        addOne.disabled = true;
+        tryWrite("Add harness", () => api.addHarness(candidate.dir), reload);
+      });
+      panel.appendChild(
+        el("div", { class: "find-row" }, [
+          el("strong", { text: String(candidate.specName ?? "") }),
+          el("span", { class: "chip", text: String(candidate.target ?? "unknown") }),
+          el("span", {
+            class: "mono muted",
+            title: String(candidate.dir ?? ""),
+            text: String(candidate.dir ?? ""),
+          }),
+          addOne,
+        ]),
+      );
+    }
+    if (candidates.length > 1) {
+      const addAll = el("button", {
+        class: "btn",
+        type: "button",
+        text: `Add all ${candidates.length}`,
+      });
+      addAll.addEventListener("click", () => {
+        addAll.disabled = true;
+        tryWrite(
+          "Add all",
+          async () => {
+            for (const candidate of candidates) await api.addHarness(candidate.dir);
+          },
+          reload,
+        );
+      });
+      panel.appendChild(el("div", { class: "missing-actions" }, [addAll]));
+    }
+    bar.after(panel);
+    openedForm = panel;
+  });
 
   scanBtn.addEventListener("click", async () => {
     scanBtn.disabled = true;
@@ -567,9 +680,21 @@ function editorRow(row, groups, reload) {
     cb.checked = row.groups.includes(g.name);
     return { name: g.name, cb };
   });
+  const hiddenCb = el("input", { type: "checkbox", "aria-label": "hide from the library" });
+  hiddenCb.checked = row.hidden === true;
   const form = el("form", { class: "row-editor" }, [
     el("label", { class: "field" }, [el("span", { text: "Tags" }), tags]),
     el("label", { class: "field" }, [el("span", { text: "Notes" }), notes]),
+    el("div", { class: "field" }, [
+      el("span", { text: "Visibility" }),
+      withTip(
+        el("label", { class: "check" }, [
+          hiddenCb,
+          el("span", { text: "Hidden — keep registered, out of the default view" }),
+        ]),
+        "Hiding is curation, not removal: state, groups and history survive, and the Hidden bucket in the rail lists it until you bring it back.",
+      ),
+    ]),
     el("div", { class: "field" }, [
       el("span", { text: groups.length > 0 ? "Groups" : "Groups (none defined yet)" }),
       el(
@@ -589,13 +714,16 @@ function editorRow(row, groups, reload) {
       .map((t) => t.trim())
       .filter((t) => t !== "");
     const groupList = checks.filter((c) => c.cb.checked).map((c) => c.name);
-    // The server's registry writes are per-field PUTs; save all three.
+    // The server's registry writes are per-field PUTs; save all four.
     tryWrite(
       "Save",
       async () => {
         await api.setTags(row.id, tagList);
         await api.setNotes(row.id, notes.value);
         await api.setGroups(row.id, groupList);
+        if (hiddenCb.checked !== (row.hidden === true)) {
+          await api.setHidden(row.id, hiddenCb.checked);
+        }
       },
       reload,
     );

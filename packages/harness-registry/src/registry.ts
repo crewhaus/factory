@@ -186,6 +186,9 @@ export type HangarRegistry = {
   groupMembers(group: string, opts?: ListOptions): HangarHarnessEntry[];
   setTags(dirOrId: string, tags: readonly string[]): HangarHarnessEntry | undefined;
   setPinned(dirOrId: string, pinned: boolean): HangarHarnessEntry | undefined;
+  /** Hide from (or return to) the manager's default Library view. The entry
+   *  stays registered with all its state — hiding is curation, not removal. */
+  setHidden(dirOrId: string, hidden: boolean): HangarHarnessEntry | undefined;
   setNotes(dirOrId: string, notes: string): HangarHarnessEntry | undefined;
   listGroups(): GroupDef[];
   /** Idempotent by name; new groups append at the end of the order. */
@@ -506,6 +509,7 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
           groups: [...(fields.groups ?? [])],
           tags: [...(fields.tags ?? [])],
           pinned: fields.pinned ?? false,
+          hidden: false,
           notes: fields.notes ?? "",
           kind: fields.kind ?? "local",
           watchme: { share: fields.watchme?.share ?? false },
@@ -807,6 +811,7 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
           groups: [],
           tags: [],
           pinned: false,
+          hidden: false,
           notes: "",
           kind: "local",
           watchme: { share: src.share === true },
@@ -852,6 +857,7 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
     groupMembers: (group, opts) => sortGroupMembers(group, list(opts)),
     setTags: (dirOrId, tags) => patchEntry(dirOrId, (e) => ({ ...e, tags: [...tags] })),
     setPinned: (dirOrId, pinned) => patchEntry(dirOrId, (e) => ({ ...e, pinned })),
+    setHidden: (dirOrId, hidden) => patchEntry(dirOrId, (e) => ({ ...e, hidden })),
     setNotes: (dirOrId, notes) => patchEntry(dirOrId, (e) => ({ ...e, notes })),
     listGroups,
     addGroup,

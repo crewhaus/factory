@@ -104,6 +104,7 @@ function normalizeEntry(
     groups: asStringArray(raw["groups"]),
     tags: asStringArray(raw["tags"]),
     pinned: raw["pinned"] === true,
+    hidden: raw["hidden"] === true,
     notes: asString(raw["notes"]) ?? "",
     kind: raw["kind"] === "remote" ? "remote" : "local",
     watchme: { ...watchmeRaw, share },

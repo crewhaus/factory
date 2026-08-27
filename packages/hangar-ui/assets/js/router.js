@@ -40,6 +40,9 @@
 
 export const HARNESS_TABS = [
   "overview",
+  // M5: the unified alert/suggestion feed — right after Overview because it
+  // is the "what needs doing" screen; the strip order is the triage order.
+  "advisor",
   "spec",
   "runs",
   "schedulers",
@@ -77,6 +80,9 @@ export const M3_TABS = [
   "thredz",
   "inspect",
   "dev",
+  // M5: the advisor's sub-screens (a saved report, say) are the view's to
+  // name — the same generic `rest` capture the M3 tabs use.
+  "advisor",
 ];
 
 /** The global (fleet-wide) screens, in nav order. `#/` is the Library. */
@@ -92,6 +98,9 @@ export const GLOBAL_VIEWS = [
   // notification rules, read-only mode, the plugin inventory).
   "health",
   "settings",
+  // M5: the fleet advisor board — every harness's open alerts/suggestions,
+  // worst first.
+  "advisor",
 ];
 
 /**

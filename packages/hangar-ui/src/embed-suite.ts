@@ -1,3 +1,18 @@
+/**
+ * The embed-map completeness + asset-hygiene suite.
+ *
+ * DELIBERATELY NOT NAMED `*.test.ts`: this suite must run in its OWN
+ * process (`bun test ./src/embed-suite.ts`, the second half of the package
+ * test script). Importing `./index` loads every asset file as TEXT
+ * (`with { type: "text" }`), and bun's module registry keys a module by
+ * path alone — the import attribute is not part of the key — so in a
+ * process that ALSO imports an asset as an ES module (every view test),
+ * whichever load happens first poisons the other: the ESM side dies with
+ * "Export not found", or this side with "Missing 'default' export",
+ * depending on nothing but file order. Two processes, two registries, no
+ * collision — and `bun test src` skips this file because the name is off
+ * the test glob.
+ */
 import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";

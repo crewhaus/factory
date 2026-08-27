@@ -285,16 +285,60 @@ origin — never part of this one. The asset-hygiene suite pins the exception
 to that single module, and `paneSandbox` strips `allow-same-origin` even if a
 payload asks for it.
 
+## M5 — the Advisor
+
+`views/advisor.js` draws one more harness tab (`#/h/<id>/advisor`, right
+after Overview — the strip order is the triage order) and one more fleet
+screen (`#/advisor`):
+
+- **The feed** — every alert, suggestion and optimization signal the manager
+  can derive about the harness, in one severity-ranked list. Every item
+  carries a hover TOOLTIP (`withTip`/`tipIcon` in `dom.js`: a `data-tip`
+  attribute the stylesheet renders via `attr()` — text only, so the
+  injection ban holds) explaining why it matters, the fact it was derived
+  from, guidance on what to do, and a quick action: an executable button for
+  a queued CLI verb (with its CLI twin beside it) or a deep link into the
+  tab that owns the fix. Acting opens an inline confirm where a COMMENT can
+  be attached — it is recorded in the harness-local decisions ledger next to
+  the queued job. Dismissing REQUIRES a reason (the server refuses without
+  one), dismissed items keep their recorded reasoning in a collapsible fold,
+  and every dismissal can be reopened. Zero open items renders as a
+  first-class "running optimally" state, never as an empty screen.
+- **The trend** — "is it improving?": the eval pass-rate bars, the decision
+  counts, and a one-line verdict, all folded from durable sources.
+- **Reports** — generate model-usage / costs / usefulness / optimization
+  reports (each button tooltipped with what it measures); saved reports are
+  listed and re-readable in place.
+- **Issues** — describe a problem and it is tuned into an update ready to
+  run: the kind selector (tooltipped per kind) picks what gets queued, with
+  `optimize` — the eval→patch loop whose artifact is a reviewable spec
+  patch — as the default.
+- **The fleet board** (`#/advisor`) — every harness's rollup, worst first,
+  each row deep-linking its Advisor tab.
+
+The Library also becomes curatable (M5): harness rows carry a `hidden` flag
+(the row editor's Visibility checkbox), hidden rows fold out of every view
+except an explicit **Hidden** rail bucket, and a **Find harnesses…** panel
+lists the unregistered harnesses under the scan roots (via
+`GET /api/registry/discover`) with per-candidate Add buttons — discovery
+without registration, so the Library only shows what you add. The blanket
+Scan (which registers everything) stays as the labeled bulk fallback.
+
 ## Testing
 
-`bun test src` — the embed-map completeness/hygiene suite plus unit tests
-for the pure browser modules (`util.js`, `supervision.js`, `markdown.js`,
-`router.js`, `routes.js`, `shapes.js`) and the `api.js` client under a
-stubbed `fetch` (every wrapper asserted against the route map's
-method/path/body). All DOM-free at import time and imported directly by
-bun. Deterministic: clocks are injected, no network, no subprocesses. The
-server side of the same contract runs in `@crewhaus/hangar-server`'s
-`contract.test.ts`.
+`bun run test` — two `bun test` invocations, DELIBERATELY two processes:
+`bun test src` runs the unit tests for the pure browser modules
+(`util.js`, `supervision.js`, `markdown.js`, `router.js`, `routes.js`,
+`shapes.js`, the view decisions) and the `api.js` client under a stubbed
+`fetch` (every wrapper asserted against the route map's method/path/body);
+`bun test ./src/embed-suite.ts` then runs the embed-map
+completeness/hygiene suite alone. The split is load-bearing, not taste:
+the embed suite imports every asset as TEXT while the view tests import
+the same files as ES modules, and bun's module registry keys a module by
+path alone — in one process whichever load lands first poisons the other.
+All DOM-free at import time and imported directly by bun. Deterministic:
+clocks are injected, no network, no subprocesses. The server side of the
+same contract runs in `@crewhaus/hangar-server`'s `contract.test.ts`.
 
 The M2 screens stay testable without a browser by keeping the decisions —
 state → row, envelope → disabled-with-reason, SSE frame → feed item,

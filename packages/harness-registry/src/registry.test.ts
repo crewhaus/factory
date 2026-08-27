@@ -110,6 +110,7 @@ describe("upsert + minting", () => {
     reg.setGroups(harness, ["prod"]);
     reg.setTags(harness, ["slack"]);
     reg.setPinned(harness, true);
+    reg.setHidden(harness, true);
     reg.setNotes(harness, "keep me");
 
     const refreshed = reg.upsert({
@@ -126,6 +127,7 @@ describe("upsert + minting", () => {
     expect(refreshed.groups).toEqual(["prod"]);
     expect(refreshed.tags).toEqual(["slack"]);
     expect(refreshed.pinned).toBe(true);
+    expect(refreshed.hidden).toBe(true);
     expect(refreshed.notes).toBe("keep me");
     expect(refreshed.origin).toBe("scan");
     expect(refreshed.originDetail).toBe("boot");

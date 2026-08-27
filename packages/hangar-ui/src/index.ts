@@ -37,6 +37,7 @@ import shapesJs from "../assets/js/shapes.js" with { type: "text" };
 import supervisionJs from "../assets/js/supervision.js" with { type: "text" };
 import utilJs from "../assets/js/util.js" with { type: "text" };
 import activityViewJs from "../assets/js/views/activity.js" with { type: "text" };
+import advisorViewJs from "../assets/js/views/advisor.js" with { type: "text" };
 import approvalsViewJs from "../assets/js/views/approvals.js" with { type: "text" };
 import channelsViewJs from "../assets/js/views/channels.js" with { type: "text" };
 import controlViewJs from "../assets/js/views/control.js" with { type: "text" };
@@ -121,6 +122,7 @@ export const hangarAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/supervision.js": asset(supervisionJs, "supervision.js"),
   "/assets/js/util.js": asset(utilJs, "util.js"),
   "/assets/js/views/activity.js": asset(activityViewJs, "activity.js"),
+  "/assets/js/views/advisor.js": asset(advisorViewJs, "advisor.js"),
   "/assets/js/views/approvals.js": asset(approvalsViewJs, "approvals.js"),
   "/assets/js/views/channels.js": asset(channelsViewJs, "channels.js"),
   "/assets/js/views/control.js": asset(controlViewJs, "control.js"),

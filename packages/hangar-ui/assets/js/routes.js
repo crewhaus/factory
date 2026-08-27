@@ -56,7 +56,15 @@ export const ROUTES = {
     body: "GroupProc", // {force?, acknowledge?, parallel?}
   },
   addScanRoot: { method: "POST", path: "/api/registry/scan-roots", body: "ScanRootCreate" }, // {dir}
+  // Discovery WITHOUT registration: the harnesses under the scan roots that
+  // are NOT yet registered, each one an Add away — the "find harnesses on
+  // this machine" flow. Adding stays the default gesture; a blanket scan
+  // (which registers everything) is the bulk fallback, not the front door.
+  discover: { method: "GET", path: "/api/registry/discover" },
   removeHarness: { method: "DELETE", path: "/api/h/:id" },
+  // Curation, not removal: hidden entries stay registered (state, groups,
+  // history intact) but the Library's default view omits them.
+  setHidden: { method: "PUT", path: "/api/h/:id/visibility", body: "SetVisibility" }, // {hidden}
   relocate: { method: "POST", path: "/api/h/:id/relocate", body: "Relocate" }, // {newDir}
   setGroups: { method: "PUT", path: "/api/h/:id/groups", body: "SetGroups" }, // {groups}
   // One member's BOOT position inside a group; `order: null` clears it.
@@ -741,6 +749,60 @@ export const ROUTES = {
     group: "inspect",
   },
 
+  // ---- group "advisor": the unified alert/suggestion feed + its loops ----
+  // M5. Every alert, suggestion and optimization signal the manager can read
+  // about a harness, in ONE feed: each item carries its severity, the fact it
+  // came from, a tooltip-grade explanation, guidance, the screen that owns
+  // the fix, and a quick action (a queued CLI verb from a closed vocabulary,
+  // or a deep link — a suggestion is never an application). Acting takes an
+  // optional operator comment; dismissing REQUIRES a reason; both append to
+  // a harness-local ledger and reopen supersedes rather than deletes.
+  advisor: { method: "GET", path: "/api/h/:id/advisor", group: "advisor" },
+  advisorAct: {
+    method: "POST",
+    path: "/api/h/:id/advisor/:itemId/act",
+    body: "AdvisorAct", // {comment?}
+    group: "advisor",
+  },
+  advisorDismiss: {
+    method: "POST",
+    path: "/api/h/:id/advisor/:itemId/dismiss",
+    body: "AdvisorDismiss", // {reason}
+    group: "advisor",
+  },
+  advisorReopen: {
+    method: "POST",
+    path: "/api/h/:id/advisor/:itemId/reopen",
+    body: "Empty", // {}
+    group: "advisor",
+  },
+  // Improvement over time, folded from durable sources only (the eval index,
+  // the cost ledger, the decisions ledger) — a read never stores a snapshot.
+  advisorTrend: { method: "GET", path: "/api/h/:id/advisor/trend", group: "advisor" },
+  advisorReports: { method: "GET", path: "/api/h/:id/advisor/reports", group: "advisor" },
+  advisorReportRun: {
+    method: "POST",
+    path: "/api/h/:id/advisor/reports",
+    body: "AdvisorReportRun", // {kind: model-usage|costs|usefulness|optimization}
+    group: "advisor",
+  },
+  advisorReport: {
+    method: "GET",
+    path: "/api/h/:id/advisor/reports/:reportId",
+    group: "advisor",
+  },
+  // The issue inbox: a complaint submitted here is tuned into an update
+  // ready to run — `optimize` queues the eval→patch loop whose artifact is a
+  // reviewable spec patch; `note` records without queueing anything.
+  advisorIssues: { method: "GET", path: "/api/h/:id/advisor/issues", group: "advisor" },
+  advisorIssueSubmit: {
+    method: "POST",
+    path: "/api/h/:id/advisor/issues",
+    body: "AdvisorIssue", // {title, detail?, kind?}
+    group: "advisor",
+  },
+  advisorFleet: { method: "GET", path: "/api/advisor", group: "advisor" },
+
   // ---- group "runtime": the mcp-server + dev run classes -----------------
   // Both are PROCESSES: they get runfiles, ledger rows and ledger-claimed
   // ports, and their live output rides the ONE existing SSE feed
@@ -763,8 +825,9 @@ export const ROUTES = {
   devStop: { method: "POST", path: "/api/h/:id/dev/stop", body: "Empty", group: "runtime" },
 };
 
-/** The M3 area groups, in tab order. A route's `group` names the module that
- *  owns it on the server and the view that renders it in the console. */
+/** The grouped areas, in tab order (the M3 areas plus M5's advisor). A
+ *  route's `group` names the module that owns it on the server and the view
+ *  that renders it in the console. */
 export const M3_GROUPS = [
   "spec",
   "memory",
@@ -777,6 +840,7 @@ export const M3_GROUPS = [
   "thredz",
   "inspect",
   "runtime",
+  "advisor",
 ];
 
 /** Every route key belonging to `group`, in map order. The views render

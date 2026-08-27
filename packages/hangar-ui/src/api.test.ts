@@ -169,7 +169,9 @@ const DRIVERS: Record<
   },
   setTags: { call: () => api.setTags(ID, []), params: { id: ID } },
   setPin: { call: () => api.setPin(ID, true), params: { id: ID } },
+  setHidden: { call: () => api.setHidden(ID, true), params: { id: ID } },
   setNotes: { call: () => api.setNotes(ID, "n"), params: { id: ID } },
+  discover: { call: () => api.discover() },
   harness: { call: () => api.harness(ID), params: { id: ID } },
   spec: { call: () => api.spec(ID), params: { id: ID } },
   preflight: { call: () => api.preflight(ID), params: { id: ID } },
@@ -263,6 +265,8 @@ const M3_PARAM_VALUES: Record<string, string> = {
   dashboardId: "dash_1",
   keyId: "key_1",
   store: "settings",
+  itemId: "adv-x",
+  reportId: "20260803T000000Z-costs",
 };
 
 function m3Params(path: string): Record<string, string> {

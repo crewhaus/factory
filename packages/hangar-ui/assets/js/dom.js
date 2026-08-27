@@ -161,6 +161,36 @@ export function copyBtn(value, label = "copy") {
   return btn;
 }
 
+/**
+ * Attach a rich hover tooltip. The text rides a `data-tip` attribute the
+ * stylesheet renders via `attr()` — always text, never markup, so the
+ * injection ban holds — with the native `title` kept as the fallback for
+ * assistive tech and anything that never hovers. Returns the node.
+ */
+export function withTip(node, tipText) {
+  const value = String(tipText ?? "");
+  if (value === "") return node;
+  node.classList.add("has-tip");
+  node.dataset.tip = value;
+  if (!node.getAttribute("title")) node.setAttribute("title", value);
+  return node;
+}
+
+/** A small "?" affordance carrying only its tooltip — guidance on rows where
+ *  a whole sentence inline would drown the content. Keyboard-focusable, so
+ *  the tip is reachable without a pointer. */
+export function tipIcon(tipText) {
+  return withTip(
+    el("span", {
+      class: "tip-icon",
+      tabindex: "0",
+      "aria-label": String(tipText ?? ""),
+      text: "?",
+    }),
+    tipText,
+  );
+}
+
 /** A native collapsible (<details>) card. */
 export function collapsible(summaryChildren, bodyChildren, open = false) {
   return el("details", { class: "fold", open: open || null }, [
