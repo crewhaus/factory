@@ -24,20 +24,17 @@ Homebrew, Scoop, winget, and apt — see [Install](#install).
 ## Install
 
 Install with [chvm](https://github.com/crewhaus/chvm), the CrewHaus version
-manager — the path we recommend and support. It needs [Bun](https://bun.sh),
-on macOS, Linux, or Windows:
+manager — the path we recommend and support, on macOS, Linux, and Windows:
 
 ```bash
-git clone https://github.com/crewhaus/chvm
-cd chvm && bun install && bun src/index.ts setup
+npm install -g @crewhaus/chvm
 chvm use latest
 ```
 
-`setup` writes a `crewhaus` shim and puts it on your PATH — one line in your
-shell profile on macOS and Linux, your user PATH on Windows; `chvm use latest`
-installs the newest release from npm. The extra step buys
-what a package manager cannot: `chvm use 0.5.4` pins a project to the release
-it was built against, `chvm use local [path]` runs a checkout of this repo
+The first `chvm use` puts a `crewhaus` shim on your PATH — one line in your
+shell profile, or your user PATH on Windows — and tells you what it changed.
+It buys what a plain package install cannot: `chvm use 0.5.4` pins a project to
+the release it was built against, `chvm use local [path]` runs a checkout of this repo
 straight from source, and a switch takes effect immediately in every open
 shell — the shim re-reads `~/.chvm/version` on each run.
 

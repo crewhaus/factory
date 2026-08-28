@@ -10,19 +10,16 @@ CrewHaus compiles one spec into the shape each situation calls for — a CLI age
 
 The path we recommend is [chvm](https://github.com/crewhaus/chvm), the CrewHaus
 version manager. It puts `crewhaus` on your PATH and switches which version your
-shell runs, the way nvm switches Node. Needs [Bun](https://bun.sh); macOS, Linux,
-and Windows:
+shell runs, the way nvm switches Node. macOS, Linux, and Windows:
 
 ```sh
-git clone https://github.com/crewhaus/chvm
-cd chvm && bun install && bun src/index.ts setup
+npm install -g @crewhaus/chvm
 chvm use latest
 ```
 
-It buys what a package manager cannot: `chvm use 0.5.4` pins a project to the
-release it was built against, and a switch takes effect immediately in every open
-shell. chvm is not published on npm — that name there belongs to an unrelated
-package — so clone it rather than `npm i -g`.
+It buys what a plain package install cannot: `chvm use 0.5.4` pins a project to
+the release it was built against, and a switch takes effect immediately in every
+open shell. Mind the scope — the bare `chvm` on npm is an unrelated package.
 
 For a self-contained binary on a box with no Bun, take a package channel:
 
