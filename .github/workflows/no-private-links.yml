@@ -37,7 +37,7 @@ jobs:
       - name: Fail on links to non-public crewhaus repos
         env:
           # Every PUBLIC repo in the crewhaus org. Keep sorted; add on publish.
-          PUBLIC_REPOS: '\.github|apt|awesome-bun|demo-driver|demos|docs|factory|homebrew-tap|scoop-bucket|thredz-mcp|ui|utilities|winget-pkgs'
+          PUBLIC_REPOS: '\.github|apt|awesome-bun|chvm|demo-driver|demos|docs|factory|homebrew-tap|scoop-bucket|thredz-mcp|ui|utilities|winget-pkgs'
         run: |
           set -uo pipefail
           hits=$(grep -rnI -oE 'github\.com/crewhaus/[A-Za-z0-9._-]+' \
