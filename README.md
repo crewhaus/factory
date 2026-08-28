@@ -23,7 +23,28 @@ Homebrew, Scoop, winget, and apt — see [Install](#install).
 
 ## Install
 
-The fastest path is the self-contained binary — one file, no Bun/Node required:
+Install with [chvm](https://github.com/StudioMaxIO/chvm), the CrewHaus version
+manager — the path we recommend and support. It needs [Bun](https://bun.sh),
+on macOS or Linux:
+
+```bash
+git clone https://github.com/StudioMaxIO/chvm
+cd chvm && bun install && bun src/index.ts setup
+chvm use latest
+```
+
+`setup` writes a `crewhaus` shim and adds one line to your shell profile;
+`chvm use latest` installs the newest release from npm. The extra step buys
+what a package manager cannot: `chvm use 0.5.4` pins a project to the release
+it was built against, `chvm use local [path]` runs a checkout of this repo
+straight from source, and a switch takes effect immediately in every open
+shell — the shim re-reads `~/.chvm/version` on each run.
+
+### Other channels
+
+All still supported and still current. Reach for one on Windows, which chvm
+does not cover, or when you want a self-contained binary — these need no Bun
+or Node runtime at all:
 
 ```bash
 # macOS / Linux (Homebrew)
@@ -48,6 +69,9 @@ Prefer npm? The `crewhaus` package runs on [Bun](https://bun.sh) ≥ 1.2:
 npm install -g crewhaus        # global
 bun add -d crewhaus            # project-local dev dependency
 ```
+
+The two coexist: `chvm use system` hands control back to whichever of those
+you have installed, and `chvm use latest` takes it again.
 
 Then confirm your install:
 

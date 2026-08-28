@@ -16,7 +16,17 @@ The launch checklist below records the now-completed flip from `restricted` → 
 
 ## Using the CLI
 
-The flagship CLI ships as the unscoped **`crewhaus`** package across **five channels**. The Homebrew, Scoop, winget, and apt builds are self-contained binaries — no Bun or Node runtime needed; only the npm/Bun package requires Bun (>= 1.2).
+The flagship CLI ships as the unscoped **`crewhaus`** package. The recommended way to install it is **[chvm](https://github.com/StudioMaxIO/chvm)**, the CrewHaus version manager — a git-clone install (chvm itself is not on npm) needing [Bun](https://bun.sh), on macOS or Linux:
+
+```bash
+git clone https://github.com/StudioMaxIO/chvm
+cd chvm && bun install && bun src/index.ts setup
+chvm use latest
+```
+
+`setup` writes a `crewhaus` shim onto your PATH; `chvm use latest` installs the newest published release. What it buys over a package-manager install: pinned side-by-side versions (`chvm use 0.5.4`, partial versions resolve), an instant switch in every open shell, and `chvm use local [path]` to run a factory checkout from source.
+
+The CLI also ships through **five package channels**, all supported and all current. Take one of these on Windows, which chvm does not cover, or when you want a self-contained binary — the Homebrew, Scoop, winget, and apt builds need no Bun or Node runtime; only the npm/Bun package requires Bun (>= 1.2).
 
 ```bash
 # npm / Bun (requires Bun >= 1.2)
@@ -36,6 +46,8 @@ curl -fsSL https://crewhaus.github.io/apt/key.gpg | sudo gpg --dearmor -o /usr/s
 echo "deb [signed-by=/usr/share/keyrings/crewhaus.gpg] https://crewhaus.github.io/apt stable main" | sudo tee /etc/apt/sources.list.d/crewhaus.list
 sudo apt update && sudo apt install crewhaus
 ```
+
+`chvm use system` hands control back to whichever of those you have installed, so the two coexist.
 
 Then drive it the same way regardless of channel:
 
@@ -85,7 +97,7 @@ alias crewhaus="bun $(pwd)/factory/apps/cli/src/index.ts"
 crewhaus init my-agent
 ```
 
-[`GETTING-STARTED.md`](https://github.com/crewhaus/docs/blob/main/GETTING-STARTED.md) walks the development workflow end-to-end and assumes the npm install for first-time users.
+[`GETTING-STARTED.md`](https://github.com/crewhaus/docs/blob/main/GETTING-STARTED.md) walks the development workflow end-to-end, installing through chvm for first-time users.
 
 ## The publishable surface
 
