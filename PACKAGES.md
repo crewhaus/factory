@@ -42,7 +42,7 @@ Then drive it the same way regardless of channel:
 ```bash
 crewhaus init my-agent
 cd my-agent
-crewhaus compile && crewhaus run
+crewhaus compile crewhaus.yaml -o build && crewhaus run crewhaus.yaml
 ```
 
 `crewhaus --version` prints the build, e.g. `0.5.8`.
