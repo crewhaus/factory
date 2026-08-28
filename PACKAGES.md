@@ -4,7 +4,7 @@ The publish-surface view of the factory workspace — what's on npm, how it's ve
 
 ## Status
 
-**0.5.7 (current factory cut).** Every `@crewhaus/*` library package in `packages/` is published to the npm registry under the **public** `@crewhaus` scope, and the flagship CLI ships as the bare, unscoped [`crewhaus`](https://www.npmjs.com/package/crewhaus) package (the old `@crewhaus/cli` name is deprecated and now just points at `crewhaus`). The root `factory` workspace is intentionally private and stays that way (`"private": true`); only the inner packages are publishable.
+**0.5.8 (current factory cut).** Every `@crewhaus/*` library package in `packages/` is published to the npm registry under the **public** `@crewhaus` scope, and the flagship CLI ships as the bare, unscoped [`crewhaus`](https://www.npmjs.com/package/crewhaus) package (the old `@crewhaus/cli` name is deprecated and now just points at `crewhaus`). The root `factory` workspace is intentionally private and stays that way (`"private": true`); only the inner packages are publishable.
 
 The sibling [crewhaus/utilities](https://github.com/crewhaus/utilities) workspace (13 packages — Studio, IDE extensions, the browser playground, trace-viewer, graph-visualizer, wizard, scaffold-templates, spec-forms, studio-plugin-sdk) versions in its own lockstep, currently at 0.1.5 (`spec-forms` has since point-released to 0.1.6). The factory workspace itself publishes **220 packages** (219 `@crewhaus/*` libraries under `packages/` plus the unscoped `crewhaus` CLI); together, **233 packages** on the public registry.
 
@@ -42,10 +42,10 @@ Then drive it the same way regardless of channel:
 ```bash
 crewhaus init my-agent
 cd my-agent
-crewhaus compile && crewhaus run
+crewhaus compile crewhaus.yaml -o build && crewhaus run crewhaus.yaml
 ```
 
-`crewhaus --version` prints the build, e.g. `0.5.7`.
+`crewhaus --version` prints the build, e.g. `0.5.8`.
 
 The `crewhaus` package transitively pulls in everything else via versioned npm deps (the workspace `workspace:*` references resolve to concrete versions at publish time), so users don't install the rest individually. A generated bundle imports a shape-dependent set of `@crewhaus/*` runtime packages directly (`runtime-core`, the tool packages, queue/mcp/memory modules, …) — `crewhaus compile` writes a `package.json` beside the bundle pinning exactly that set to the CLI's own version, so `bun install` in the out-dir is all a standalone consumer runs.
 
