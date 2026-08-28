@@ -41,7 +41,30 @@ jobs:
         run: bun run typecheck
 
       - name: Test
-        run: bun run test
+        # Say WHICH package failed. `bun run --filter` over 220 packages prints
+        # `<pkg> test: Exited with code 1` inline, the moment that package
+        # finishes, and prints no summary at the end — so on a red job the tail
+        # of the log shows only the slowest package (apps/cli, ~7 min) finishing
+        # green, followed by a bare `error: script "test" exited with code 1`.
+        # The failing package is thousands of lines up, past what the Actions
+        # logs API will hand back, which makes a red run undiagnosable without
+        # downloading the full archive. Reprint the offenders, with their
+        # output, at the END of the step where they can actually be read.
+        run: |
+          set -o pipefail
+          if bun run test 2>&1 | tee "${RUNNER_TEMP}/test-output.log"; then
+            exit 0
+          fi
+          echo "::group::Packages that exited non-zero"
+          grep -E "test: Exited with code [1-9]" "${RUNNER_TEMP}/test-output.log" \
+            || echo "(no package did — the failure is in the post-fan-out step, bun test scripts)"
+          echo "::endgroup::"
+          for pkg in $(grep -oE "^[^ ]+ test: Exited with code [1-9]" "${RUNNER_TEMP}/test-output.log" | awk '{print $1}' | sort -u); do
+            echo "::group::${pkg} — last 80 lines"
+            grep -F "${pkg} test:" "${RUNNER_TEMP}/test-output.log" | tail -80
+            echo "::endgroup::"
+          done
+          exit 1
 
       - name: Lint
         run: bun run lint
