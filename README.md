@@ -23,18 +23,19 @@ Homebrew, Scoop, winget, and apt — see [Install](#install).
 
 ## Install
 
-Install with [chvm](https://github.com/StudioMaxIO/chvm), the CrewHaus version
+Install with [chvm](https://github.com/crewhaus/chvm), the CrewHaus version
 manager — the path we recommend and support. It needs [Bun](https://bun.sh),
-on macOS or Linux:
+on macOS, Linux, or Windows:
 
 ```bash
-git clone https://github.com/StudioMaxIO/chvm
+git clone https://github.com/crewhaus/chvm
 cd chvm && bun install && bun src/index.ts setup
 chvm use latest
 ```
 
-`setup` writes a `crewhaus` shim and adds one line to your shell profile;
-`chvm use latest` installs the newest release from npm. The extra step buys
+`setup` writes a `crewhaus` shim and puts it on your PATH — one line in your
+shell profile on macOS and Linux, your user PATH on Windows; `chvm use latest`
+installs the newest release from npm. The extra step buys
 what a package manager cannot: `chvm use 0.5.4` pins a project to the release
 it was built against, `chvm use local [path]` runs a checkout of this repo
 straight from source, and a switch takes effect immediately in every open
@@ -42,9 +43,8 @@ shell — the shim re-reads `~/.chvm/version` on each run.
 
 ### Other channels
 
-All still supported and still current. Reach for one on Windows, which chvm
-does not cover, or when you want a self-contained binary — these need no Bun
-or Node runtime at all:
+All still supported and still current. Reach for one when you want a
+self-contained binary — these need no Bun or Node runtime at all:
 
 ```bash
 # macOS / Linux (Homebrew)

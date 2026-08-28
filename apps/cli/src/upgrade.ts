@@ -254,7 +254,7 @@ export function formatUpgradePlan(plan: UpgradePlan, write: boolean): string {
     case "up-to-date":
       return `upgrade: spec is already at the current version (v${plan.toVersion}) — nothing to do.\n${formatUpgradeNotes(plan.notes)}`;
     case "ahead":
-      return `upgrade: spec version v${plan.fromVersion} is NEWER than this CLI supports (v${plan.toVersion}).\n  Upgrade the CLI (\`brew upgrade crewhaus\` / \`npm i -g crewhaus\`) rather than downgrading the spec.\n`;
+      return `upgrade: spec version v${plan.fromVersion} is NEWER than this CLI supports (v${plan.toVersion}).\n  Upgrade the CLI (\`chvm use latest\` / \`brew upgrade crewhaus\` / \`npm i -g crewhaus\`) rather than downgrading the spec.\n`;
     case "validate-fail":
       return `upgrade: cannot migrate — ${plan.error}\n`;
     case "upgrade": {

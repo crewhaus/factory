@@ -8,7 +8,23 @@ CrewHaus compiles one spec into the shape each situation calls for — a CLI age
 
 ## Install
 
-The fastest path is the self-contained binary — one file, no Bun/Node required:
+The path we recommend is [chvm](https://github.com/crewhaus/chvm), the CrewHaus
+version manager. It puts `crewhaus` on your PATH and switches which version your
+shell runs, the way nvm switches Node. Needs [Bun](https://bun.sh); macOS, Linux,
+and Windows:
+
+```sh
+git clone https://github.com/crewhaus/chvm
+cd chvm && bun install && bun src/index.ts setup
+chvm use latest
+```
+
+It buys what a package manager cannot: `chvm use 0.5.4` pins a project to the
+release it was built against, and a switch takes effect immediately in every open
+shell. chvm is not published on npm — that name there belongs to an unrelated
+package — so clone it rather than `npm i -g`.
+
+For a self-contained binary on a box with no Bun, take a package channel:
 
 ```bash
 brew tap crewhaus/tap && brew install crewhaus          # macOS / Linux (Homebrew)
@@ -17,12 +33,14 @@ winget install CrewHaus.CLI                   # Windows (winget)
 # Debian / Ubuntu (apt): signed repo at https://crewhaus.github.io/apt
 ```
 
-Or install from npm — this package runs on [Bun](https://bun.sh) ≥ 1.2:
+Or install this package from npm — it runs on [Bun](https://bun.sh) ≥ 1.2:
 
 ```bash
 npm install -g crewhaus        # global
 bun add -d crewhaus            # project-local dev dependency
 ```
+
+`chvm use system` hands control back to whichever of those you have installed.
 
 Confirm it:
 
