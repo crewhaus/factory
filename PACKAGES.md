@@ -16,15 +16,14 @@ The launch checklist below records the now-completed flip from `restricted` → 
 
 ## Using the CLI
 
-The flagship CLI ships as the unscoped **`crewhaus`** package. The recommended way to install it is **[chvm](https://github.com/crewhaus/chvm)**, the CrewHaus version manager — a git-clone install needing [Bun](https://bun.sh), on macOS, Linux, or Windows. chvm is not published on npm, and that name there belongs to an unrelated package, so clone it rather than `npm i -g`:
+The flagship CLI ships as the unscoped **`crewhaus`** package. The recommended way to install it is **[chvm](https://github.com/crewhaus/chvm)**, the CrewHaus version manager, published as [`@crewhaus/chvm`](https://www.npmjs.com/package/@crewhaus/chvm) — on macOS, Linux, and Windows. Mind the scope: the bare `chvm` on npm is an unrelated package.
 
 ```bash
-git clone https://github.com/crewhaus/chvm
-cd chvm && bun install && bun src/index.ts setup
+npm install -g @crewhaus/chvm
 chvm use latest
 ```
 
-`setup` writes a `crewhaus` shim onto your PATH; `chvm use latest` installs the newest published release. What it buys over a package-manager install: pinned side-by-side versions (`chvm use 0.5.4`, partial versions resolve), an instant switch in every open shell, and `chvm use local [path]` to run a factory checkout from source.
+The first `chvm use` puts a `crewhaus` shim onto your PATH and installs the newest published release. chvm itself runs on Node; [Bun](https://bun.sh) is what runs `crewhaus`. What it buys over a package-manager install: pinned side-by-side versions (`chvm use 0.5.4`, partial versions resolve), an instant switch in every open shell, and `chvm use local [path]` to run a factory checkout from source.
 
 The CLI also ships through **five package channels**, all supported and all current. Take one of these when you want a self-contained binary — the Homebrew, Scoop, winget, and apt builds need no Bun or Node runtime; only the npm/Bun package requires Bun (>= 1.2).
 
