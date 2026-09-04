@@ -5,9 +5,13 @@
  * `circuitBreaker`/`modelTiers`/`modelPool`) is emitted onto the role's
  * `RoleDefinition` literal, mirroring the cli agent block. The crew
  * orchestrator forwards a RoleDefinition's config into this role's
- * `runChatLoop` turns (the cross-package forwarding — see the return notes),
- * so the PolicyRouter decision per role shares the `@crewhaus/routing-store`
- * scoreboard. Absent routing keeps the role file byte-identical.
+ * `runChatLoop` turns (0.6.0 PR 3 — `@crewhaus/crew-orchestrator`'s
+ * `composeLoopTuning`, covered by its own `index.test.ts` "per-role model
+ * routing" suite, which drives a pooled role end to end and reads the
+ * `model_route` line back), so the PolicyRouter decision per role shares the
+ * `@crewhaus/routing-store` scoreboard. This file pins the EMIT half: the
+ * four field names rendered here are the cross-package contract with
+ * `RoleDefinition`. Absent routing keeps the role file byte-identical.
  */
 import { describe, expect, test } from "bun:test";
 import type { IrCrewRole, IrCrewV0, IrModelPool } from "@crewhaus/ir";

@@ -266,8 +266,15 @@ export function compile(yamlText: string, opts: CompileOptions = {}): CompileRes
  * `thredz.messaging` (G44) a sub-key of the `thredz` block; both are nested
  * paths the top-level-only mechanism does not track, and both are wired this
  * batch regardless. Item 9's per-role/step `model_pool`/`model_tiers`/
- * `model_fallbacks` are nested under `roles`/`steps` and wired at lower time,
- * so they carry no row either.
+ * `model_fallbacks` are nested under `roles`/`steps`, so the top-level-only
+ * mechanism cannot carry a row for them. They lower onto `IrWorkflowStep` /
+ * `IrCrewRole` and are emit-wired: per step since 0.4 (target-workflow spreads
+ * them into the step's `runChatLoop`), per role since 0.6.0 — target-crew has
+ * rendered them onto the role's `RoleDefinition` literal since 0.4, but
+ * `@crewhaus/crew-orchestrator` only gained the fields and started forwarding
+ * them into each role turn in 0.6.0 (PR 3), so on 0.4–0.5 bundles the role's
+ * routing was emitted-but-dead config. Lowering alone never wires anything;
+ * the consumer does.
  */
 type UnwiredKey = {
   readonly path: string;
