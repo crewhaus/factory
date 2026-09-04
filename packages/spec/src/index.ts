@@ -568,13 +568,25 @@ const failureTaxonomyBlock = z.array(failureTaxonomyEntrySchema).optional();
  * Item 27 — run-level spend cap with a degradation ladder. Generalizes the
  * optimizer's `--budget-usd` to normal runs. `usd` is the dollar ceiling;
  * when the run's accrued spend reaches it, `on_exceed` decides:
- *   - `{ action: "stop" }`      — end the run cleanly before the next turn.
+ *   - `{ action: "stop" }`      — end the run. 0.6.0 (§7.12): the cap is
+ *     checked before EVERY model call, tool iterations included, so a
+ *     runaway tool loop stops at the cap with a classified
+ *     `crewhaus_budget` failure (the REPL's pre-turn check still ends an
+ *     idle run cleanly before the next turn opens).
  *   - `{ action: "degrade", model }` — re-resolve the primary model to the
  *     cheaper `model` (one rung) and continue; a later breach on the
- *     degraded model stops the run.
- * The check is PRE-TURN (beside compaction), so an in-flight turn always
- * completes. Carried on the same interactive shapes as the failover chain
- * (cli, channel, managed). `on_exceed.model` follows the agent.model
+ *     degraded model stops the run. Under a `model_pool` the rung does not
+ *     swap the adapter: it becomes the FORCED pool candidate (`model_route`
+ *     policy `forced`, reason `budget_degrade`). A `model` outside the pool
+ *     roster is a compile WARNING (`budget-degrade-outside-pool`) plus an
+ *     extra always-eligible rung — never a parse error.
+ * `scope` (0.6.0, default `run`) decides what the cap bounds: `run` meters
+ * this process's spend only; `session` also seeds the meter on `--resume`
+ * (and the channel/managed resume-per-message pattern) from the
+ * `cost_accrual` lines the session log already persists, so the cap bounds
+ * the whole conversation rather than one inbound message. Carried on the
+ * same interactive shapes as the failover chain (cli, channel, managed)
+ * plus the single-turn shapes. `on_exceed.model` follows the agent.model
  * grammar. Defaults to `{ action: "stop" }` when `on_exceed` is omitted.
  */
 const budgetBlock = z
@@ -586,6 +598,9 @@ const budgetBlock = z
         z.object({ action: z.literal("degrade"), model: z.string().min(1) }).strict(),
       ])
       .default({ action: "stop" }),
+    // 0.6.0 — optional, NO zod default: an absent key stays absent on the
+    // parsed spec and the IR, so pre-0.6.0 specs lower byte-identically.
+    scope: z.enum(["run", "session"]).optional(),
   })
   .strict()
   .optional();

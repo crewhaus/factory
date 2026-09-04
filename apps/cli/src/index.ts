@@ -3695,8 +3695,9 @@ async function runRun(args: ParsedArgs): Promise<void> {
         "  Cost tracking is ON by default (accrues per-call spend; set observability.cost.enabled: false to disable, CREWHAUS_COST_INLINE=1 to print a per-call line, `crewhaus cost-summary --session <id>` to total it after the run)\n" +
         "  --budget-usd <n> caps this run's model spend in dollars: it sets/overrides the spec budget.usd ceiling and keeps the spec's on_exceed ladder (stop when the spec has none).\n" +
         "    Interplay with the spec's limits: block — the budget cap and the limits ceilings (max_tool_iterations, max_concurrent_tools, context_limit, deadline_ms, turn_timeout_ms,\n" +
-        "    model_call_timeout_ms, loop_detection) are enforced INDEPENDENTLY; whichever bound trips first governs. The budget check gates the NEXT turn (an in-flight turn is never\n" +
-        "    severed mid-tool-call), while the limits ceilings bound the CURRENT turn/run. --budget-usd never widens a limit and limits: never raises the spend cap.\n" +
+        "    model_call_timeout_ms, loop_detection) are enforced INDEPENDENTLY; whichever bound trips first governs. The budget check gates EVERY model call (tool iterations\n" +
+        "    included — a breach mid-turn ends the run with the classified crewhaus_budget failure at a request boundary; the REPL's pre-turn check still ends an idle run cleanly),\n" +
+        "    while the limits ceilings bound the CURRENT turn/run. --budget-usd never widens a limit and limits: never raises the spend cap. budget.scope: session seeds the meter on --resume.\n" +
         "  A spec with a feedback: block asks `rate this session? [g]ood / [b]ad / [enter] skip`\n" +
         "  on clean REPL exit (one keystroke, 10s timeout, TTY only — never when piped; the prompt\n" +
         "  lives in the runtime, so a COMPILED bundle asks it too). Opt out with\n" +
@@ -4136,6 +4137,9 @@ async function runRunCli(
     runBudget = {
       usdMicros: Math.round(usd * 1_000_000),
       onExceed: ir.target === "cli" ? (ir.budget?.onExceed ?? { kind: "stop" }) : { kind: "stop" },
+      // 0.6.0 — the flag overrides the ceiling only; the spec's `scope`
+      // (when declared) rides along like its `on_exceed` ladder does.
+      ...(ir.target === "cli" && ir.budget?.scope !== undefined ? { scope: ir.budget.scope } : {}),
     };
   } else if (ir.target === "cli" && ir.budget !== undefined) {
     runBudget = ir.budget;

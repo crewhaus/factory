@@ -353,15 +353,22 @@ export type IrFailureTaxonomy = readonly IrFailureTaxonomyEntry[];
  * spec's `budget` block. `usdMicros` is the dollar ceiling in USD-micros
  * (1 USD = 1_000_000) — the unit the runtime meters in. `onExceed` decides
  * the behaviour when accrued spend reaches the cap: `stop` ends the run
- * before the next turn; `degrade` re-resolves the primary model to `model`
- * (one cheaper rung) and continues. Carried on the interactive shapes that
- * loop (cli, channel, managed); absent when the spec omits the block.
+ * (0.6.0 §7.12: checked before every model call, tool iterations included);
+ * `degrade` re-resolves the primary model to `model` (one cheaper rung) and
+ * continues — under a `modelPool` the rung is the forced candidate rather
+ * than an adapter swap. `scope` (0.6.0) is carried ONLY when the spec
+ * declares it (absent ⇒ the runtime's `run` default, byte-identical for
+ * older specs): `session` seeds the meter on resume from the session log's
+ * persisted `cost_accrual` lines so the cap bounds the conversation.
+ * Carried on the shapes that run the shared loop; absent when the spec
+ * omits the block.
  */
 export type IrBudget = {
   readonly usdMicros: number;
   readonly onExceed:
     | { readonly kind: "stop" }
     | { readonly kind: "degrade"; readonly model: string };
+  readonly scope?: "run" | "session";
 };
 
 /**

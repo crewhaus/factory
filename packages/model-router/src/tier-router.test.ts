@@ -129,3 +129,41 @@ describe("createTierRouter — boot holder", () => {
     expect(router.route({ ...EASY, turnIndex: 0 }).tier).toBe("fast");
   });
 });
+
+/**
+ * 0.6.0 §4.4 pin — `toolsInPlay` is the RUN-WIDE UNION advertisement.
+ * runtime-core derives it as `anthropicTools.length > 0` over the single
+ * tool list every request carries, before any model is chosen. `TierSignals`
+ * carries exactly that one boolean — no per-model toolset — so when later
+ * releases narrow the advertised set per candidate, the tier decision (and
+ * the pool band that reuses `pickTier`) stays a function of the union.
+ */
+describe("pickTier — toolsInPlay is the union advertisement (0.6.0 §4.4 pin)", () => {
+  const unionSignal = (toolsets: ReadonlyArray<readonly string[]>): TierSignals => ({
+    ...EASY,
+    toolsInPlay: toolsets.flat().length > 0,
+  });
+
+  test("one tool on ANY member of the union escalates to default", () => {
+    expect(pickTier(unionSignal([[], ["grep"], []])).tier).toBe("default");
+    expect(pickTier(unionSignal([["read"]])).tier).toBe("default");
+  });
+
+  test("only an empty union stays on fast", () => {
+    expect(pickTier(unionSignal([[], [], []])).tier).toBe("fast");
+    expect(pickTier(unionSignal([])).tier).toBe("fast");
+  });
+
+  test("the signal set is the closed four-field shape — no per-model toolset field", () => {
+    // If a future change adds a per-candidate tools field to the signals, this
+    // pin forces the author to revisit §4.4 (the union is the contract).
+    expect(Object.keys(EASY).sort()).toEqual(
+      ["contextTokens", "priorTurnToolUseCount", "toolsInPlay", "turnIndex"].sort(),
+    );
+    expect(typeof unionSignal([["read"]]).toolsInPlay).toBe("boolean");
+  });
+
+  test("the union flag is symmetric with the disabled escalator (config governs, not the toolset owner)", () => {
+    expect(pickTier(unionSignal([["read"], []]), { toolsToDefault: false }).tier).toBe("fast");
+  });
+});

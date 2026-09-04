@@ -3,7 +3,12 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
-import { type PoolCandidate, type ScoreLookup, createPolicyRouter } from "./policy-router";
+import {
+  type PolicyDecision,
+  type PoolCandidate,
+  type ScoreLookup,
+  createPolicyRouter,
+} from "./policy-router";
 import type { TierSignals } from "./tier-router";
 
 const EASY: TierSignals = {
@@ -408,5 +413,91 @@ describe("PolicyRouter — learned Thompson sampling", () => {
     const d = r.route(turn(9), "run-A");
     expect(d.candidate.modelString).toBe("claude-sonnet-5");
     expect(d.reason).toContain("under-sampled");
+  });
+});
+
+/**
+ * 0.6.0 §4.4 pin — `toolsInPlay` is the RUN-WIDE UNION advertisement.
+ *
+ * runtime-core computes the signal as `anthropicTools.length > 0` over the
+ * one tool list every candidate is sent, BEFORE a candidate is chosen. Later
+ * releases give candidates their own toolsets (§5); the routing signal must
+ * stay the union — "any tool advertised on this request" — so a per-candidate
+ * subset can never change which band a turn lands in, and a candidate cannot
+ * make itself look "easy" by carrying fewer tools. These tests pin that the
+ * router (a) treats the flag as a single boolean, (b) never consults a
+ * candidate-level tool list, and (c) yields identical decisions whether the
+ * union came from one candidate's tools or several.
+ */
+describe("PolicyRouter — toolsInPlay is the union advertisement (0.6.0 §4.4 pin)", () => {
+  const unionSignal = (toolsets: ReadonlyArray<readonly string[]>): TierSignals => ({
+    ...EASY,
+    // exactly how runtime-core derives it: any advertised tool, run-wide
+    toolsInPlay: toolsets.flat().length > 0,
+  });
+
+  test("any advertised tool routes the turn HARD, regardless of which candidate could serve it", () => {
+    const r = createPolicyRouter({ candidates: POOL, policy: "heuristic" });
+    // The cheap candidate owns the only tool; the union still says "tools in play".
+    const d = r.route(unionSignal([["read"], [], []]));
+    expect(d.routeKey).toBe("hard");
+    expect(d.candidate.modelString).toBe("claude-opus-4-8");
+    expect(d.reason).toContain("tools in play");
+    // An empty union is the only way to land on the easy band.
+    expect(r.route(unionSignal([[], [], []])).routeKey).toBe("easy");
+  });
+
+  test("a candidate-level tool list is NOT a routing input (unknown candidate fields are ignored)", () => {
+    // Candidates decorated with a hypothetical per-candidate `tools` field —
+    // the shape later releases add. The router must not read it: the
+    // decision is a function of the signals alone.
+    const decorated: PoolCandidate[] = POOL.map((c, i) => ({
+      ...c,
+      ...({ tools: i === 0 ? ["read", "grep"] : [] } as Record<string, unknown>),
+    }));
+    const plain = createPolicyRouter({ candidates: POOL, policy: "heuristic" });
+    const withTools = createPolicyRouter({ candidates: decorated, policy: "heuristic" });
+    for (const signals of [EASY, HARD, { ...EASY, turnIndex: 0 }]) {
+      const a = plain.route(signals);
+      const b = withTools.route(signals);
+      expect(b.candidate.modelString).toBe(a.candidate.modelString);
+      expect(b.routeKey).toBe(a.routeKey);
+      expect(b.reason).toBe(a.reason);
+    }
+  });
+
+  test("the learned band key is the union flag too (hard/easy arms never split per candidate)", () => {
+    const seen: string[] = [];
+    const r = createPolicyRouter({
+      candidates: POOL,
+      policy: "learned",
+      learning: { minSamplesPerArm: 1 },
+      score: (routeKey) => {
+        seen.push(routeKey);
+        return undefined;
+      },
+    });
+    r.route(unionSignal([["read"], []]));
+    r.route(unionSignal([[], []]));
+    // Exactly the two bands, keyed on the union — no per-candidate band.
+    expect(new Set(seen)).toEqual(new Set(["hard", "easy"]));
+  });
+
+  test("a forced decision keeps the router's band: `forced` is a loop-side substitution, never a router output", () => {
+    // The router's own policies are the only values `route()` returns; the
+    // loop (budget degrade, §7.12) substitutes the candidate into the decision
+    // it produced and stamps `policy: "forced"` while keeping `routeKey`.
+    const r = createPolicyRouter({ candidates: POOL, policy: "heuristic" });
+    const base = r.route(HARD);
+    expect(["static", "heuristic", "learned"]).toContain(base.policy);
+    const forced: PolicyDecision = {
+      ...base,
+      candidate: HAIKU,
+      policy: "forced",
+      reason: "budget_degrade",
+      explored: false,
+    };
+    expect(forced.routeKey).toBe(base.routeKey);
+    expect(forced.policy).toBe("forced");
   });
 });

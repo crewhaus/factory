@@ -3301,6 +3301,53 @@ budget:
     expect("budget" in ir).toBe(false);
   });
 
+  // 0.6.0 §7.12 — `budget.scope` lowers only when declared.
+  test("lowers budget.scope verbatim when declared, and never adds the key when absent", () => {
+    const session = lower(
+      parseSpec(
+        "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 1\n  scope: session\n",
+      ),
+    );
+    if (session.target !== "cli") throw new Error("unexpected target");
+    expect(session.budget).toEqual({
+      usdMicros: 1_000_000,
+      onExceed: { kind: "stop" },
+      scope: "session",
+    });
+    const run = lower(
+      parseSpec(
+        "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 1\n  scope: run\n",
+      ),
+    );
+    if (run.target !== "cli") throw new Error("unexpected target");
+    expect(run.budget?.scope).toBe("run");
+    // Byte-identity for pre-0.6.0 specs: no `scope` key on the IR (the
+    // emitters stringify `ir.budget` verbatim) and the same key ORDER.
+    const absent = lower(
+      parseSpec("name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 1\n"),
+    );
+    if (absent.target !== "cli") throw new Error("unexpected target");
+    expect("scope" in (absent.budget ?? {})).toBe(false);
+    expect(JSON.stringify(absent.budget)).toBe('{"usdMicros":1000000,"onExceed":{"kind":"stop"}}');
+  });
+
+  test("compiled cli bundle threads budget.scope into runChatLoop only when declared", () => {
+    const withScope = compile(
+      "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 1\n  scope: session\n",
+    );
+    const entry = withScope.files.find((f) => f.path.endsWith(".ts"))?.content ?? "";
+    expect(entry).toContain('"scope":"session"');
+    const without = compile(
+      "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 1\n",
+    );
+    const plain = without.files.find((f) => f.path.endsWith(".ts"))?.content ?? "";
+    // The budget literal is byte-identical to a 0.5.x bundle (the continuity
+    // block's own `"scope":"spec"` is unrelated and unchanged).
+    expect(plain).toContain('budget: {"usdMicros":1000000,"onExceed":{"kind":"stop"}},');
+    expect(plain).not.toContain('"scope":"session"');
+    expect(plain).not.toContain('"scope":"run"');
+  });
+
   test("channel + managed agent shapes accept the budget block", () => {
     const channel = lower(
       parseSpec(`

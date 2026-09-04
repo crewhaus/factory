@@ -67,6 +67,23 @@ describe("projectLoop — ring basics", () => {
     );
   });
 
+  // 0.6.0 §7.12 — `budget.scope` shows in the stop summary only when declared.
+  test("budget.scope: session is named in the stop summary; absent scope renders as before", () => {
+    const scoped = projectLoop(
+      minimalCli({
+        budget: { usdMicros: 500_000, onExceed: { kind: "stop" }, scope: "session" },
+      }),
+    );
+    const stop = scoped.ring?.segments.find((s) => s.id === "stop");
+    expect(stop?.summary).toBe("budget $0.5 (on exceed: stop; scope: session)");
+    const plain = projectLoop(
+      minimalCli({ budget: { usdMicros: 500_000, onExceed: { kind: "stop" } } }),
+    );
+    expect(plain.ring?.segments.find((s) => s.id === "stop")?.summary).toBe(
+      "budget $0.5 (on exceed: stop)",
+    );
+  });
+
   test("RING_TARGETS members are exactly the shapes that get the stop warning", () => {
     expect([...RING_TARGETS]).toEqual(["cli", "channel", "managed"]);
   });

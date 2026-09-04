@@ -691,7 +691,13 @@ export type ModelRouteEvent = TraceEventEnvelope & {
   routeKey: string;
   /** Wire model id the chosen candidate resolved to. */
   model: string;
-  policy: "static" | "heuristic" | "learned";
+  /**
+   * The configured pool policy, or `"forced"` (0.6.0 §7.12) when the loop
+   * substituted a candidate outside the router's choice — today a
+   * `budget.on_exceed: degrade` breach forcing the degrade rung
+   * (`reason: "budget_degrade"`).
+   */
+  policy: "static" | "heuristic" | "learned" | "forced";
   reason: string;
   /** True when the learned policy is exploring an under-sampled arm. */
   explored?: boolean;

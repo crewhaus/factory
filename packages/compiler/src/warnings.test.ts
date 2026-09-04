@@ -422,3 +422,92 @@ describe("G45 — validating ir-passes run unconditionally in compile()", () => 
     expect(optimizedTs).not.toContain('"two"');
   });
 });
+
+// 0.6.0 §7.12 — `budget.on_exceed.degrade.model` outside the `model_pool`
+// roster is a WARNING (plus an extra runtime rung), never a parse error: no
+// refine forbids `budget` beside `model_pool`, and such specs compile today.
+describe("compile() warnings — budget-degrade-outside-pool", () => {
+  const pooled = (degradeModel: string | undefined, extra: string[] = []): string =>
+    [
+      "name: p",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: i",
+      "  model_pool:",
+      "    candidates:",
+      "      - { model: claude-sonnet-4-6, tags: [cheap] }",
+      "      - { model: claude-opus-4-1, tags: [strong] }",
+      "budget:",
+      "  usd: 1",
+      ...(degradeModel !== undefined
+        ? ["  on_exceed:", "    action: degrade", `    model: ${degradeModel}`]
+        : []),
+      ...extra,
+    ].join("\n");
+
+  test("an off-roster degrade model warns with a stable code and the roster in the message", () => {
+    const result = compile(pooled("claude-haiku-4-5"));
+    expect(result.files.length).toBeGreaterThan(0); // it still compiles
+    expect(result.warnings).toHaveLength(1);
+    const w = result.warnings[0];
+    expect(w?.code).toBe("budget-degrade-outside-pool");
+    expect(w?.path).toBe("budget.on_exceed.model");
+    expect(w?.message).toContain("claude-haiku-4-5");
+    expect(w?.message).toContain("claude-sonnet-4-6, claude-opus-4-1");
+    expect(w?.message).toContain("EXTRA pool rung");
+    // The compiled bundle still carries the degrade ladder verbatim — the
+    // runtime pre-resolves the rung and forces it on a breach.
+    const entry = result.files.find((f) => f.path.endsWith(".ts"))?.content ?? "";
+    expect(entry).toContain('"onExceed":{"kind":"degrade","model":"claude-haiku-4-5"}');
+  });
+
+  test("a roster-member degrade model, a stop ladder, or no pool → no warning", () => {
+    expect(compile(pooled("claude-sonnet-4-6")).warnings).toEqual([]);
+    expect(compile(pooled(undefined)).warnings).toEqual([]);
+    const noPool = compile(
+      [
+        "name: s",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: i",
+        "budget:",
+        "  usd: 1",
+        "  on_exceed:",
+        "    action: degrade",
+        "    model: claude-haiku-4-5",
+      ].join("\n"),
+    );
+    expect(noPool.warnings).toEqual([]);
+  });
+
+  test("the warning fires on the other pool-carrying shapes too (channel)", () => {
+    const result = compile(
+      [
+        "name: ch",
+        "target: channel",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: i",
+        "  model_pool:",
+        "    candidates:",
+        "      - { model: claude-sonnet-4-6, tags: [cheap] }",
+        "      - { model: claude-opus-4-1, tags: [strong] }",
+        "channels:",
+        "  slack:",
+        "    botToken: $SLACK_BOT_TOKEN",
+        "    signingSecret: $SLACK_SIGNING_SECRET",
+        "routing:",
+        "  sessionKey: thread",
+        "budget:",
+        "  usd: 1",
+        "  scope: session",
+        "  on_exceed:",
+        "    action: degrade",
+        "    model: claude-haiku-4-5",
+      ].join("\n"),
+    );
+    expect(result.warnings.map((w) => w.code)).toEqual(["budget-degrade-outside-pool"]);
+  });
+});

@@ -33,7 +33,14 @@
 export type RouteObservation = {
   /** Did the model call complete without a terminal error this turn? */
   readonly success: boolean;
-  /** Wall-clock latency of the model call, in milliseconds. */
+  /**
+   * Latency of the model call, in milliseconds. 0.6.0 §7.9 (latency
+   * hygiene): on runtime-core's STREAMING path this is the model's own
+   * latency — request open → `message_stop`, minus the union of the
+   * mid-stream `runTool` spans — so a tool-heavy cheap arm is not penalised
+   * for tool time it did not cause. The non-streaming path measured the
+   * model call alone already. Wall time stays on the turn (`turn_end`).
+   */
   readonly latencyMs: number;
   /**
    * USD cost of the call, when cost accounting is available (runtime-core
