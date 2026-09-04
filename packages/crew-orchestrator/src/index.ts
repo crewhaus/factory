@@ -86,6 +86,27 @@ export type RoleDefinition = {
    *  this role's `Task` tool. Forwarded to the role's runChatLoop together
    *  with the run-level `spawnSubAgent` injection (see RunOptions). */
   readonly subAgents?: ReadonlyMap<string, SubAgentDefinition>;
+  /**
+   * 0.6.0 (PR 3, design §7.7) — per-role model routing, the runtime twins of
+   * the spec's `roles.<r>.{model_fallbacks, circuit_breaker, model_tiers,
+   * model_pool}`. `@crewhaus/target-crew` has emitted these onto the role
+   * literal since 0.4 (item 9 / G37), but until 0.6.0 this type had no such
+   * fields and `composeLoopTuning` never forwarded them, so per-role routing
+   * was dead config: every role turn ran on `model` alone. They now ride the
+   * same `composeLoopTuning` fragment as `thinking`/`subAgents` into BOTH the
+   * primary activation and the inline A2A peer turn, so runtime-core builds
+   * the failover chain / tier router / PolicyRouter per role exactly as it
+   * does for a cli agent. Typed by indexing `RunChatLoopOptions` rather than
+   * mirrored locally so the emitted literal is checked against what the
+   * runtime actually accepts — a drift there fails this package's compile,
+   * not a generated bundle's. Today's IR carries `{model, tags}` candidates
+   * and an unscoped `routeKey`; per-candidate profiles and the per-role
+   * `scope` land with the IR widening (PR 7 / 7b).
+   */
+  readonly modelFallbacks?: RunChatLoopOptions["modelFallbacks"];
+  readonly circuitBreaker?: RunChatLoopOptions["circuitBreaker"];
+  readonly modelTiers?: RunChatLoopOptions["modelTiers"];
+  readonly modelPool?: RunChatLoopOptions["modelPool"];
 };
 
 export type RouterArgs = {
@@ -239,6 +260,19 @@ export type RunOptions = {
   readonly sessionRootDir?: string;
   /** Test injection backdoor: scripted ProviderAdapter shared by every role. */
   readonly _adapter?: ProviderAdapter;
+  /**
+   * 0.6.0 (PR 3) — test injection backdoors for the per-role routing seams,
+   * mirroring runtime-core's own (`_failoverAdapters` / `_tierAdapters` /
+   * `_poolAdapters`, keyed by spec model string; `_scoreboard`, the pool's
+   * reward store). Forwarded verbatim to every role turn beside `_adapter`
+   * so a test can prove a role's `modelPool`/`modelTiers`/`modelFallbacks`
+   * reach the loop without resolving real credentials or touching
+   * `.crewhaus/routing`. Production callers leave all four undefined.
+   */
+  readonly _failoverAdapters?: RunChatLoopOptions["_failoverAdapters"];
+  readonly _tierAdapters?: RunChatLoopOptions["_tierAdapters"];
+  readonly _poolAdapters?: RunChatLoopOptions["_poolAdapters"];
+  readonly _scoreboard?: RunChatLoopOptions["_scoreboard"];
 };
 
 export type RunnableCrew = {
@@ -601,7 +635,7 @@ async function* driveCrew(
           // A2A is in-band: treat every call after the first as a resume
           // so the peer sees the prior crew transcript.
           ...(firstTurn ? {} : { resume: { sessionId: runContext.sessionId } }),
-          ...(args.opts._adapter !== undefined ? { _adapter: args.opts._adapter } : {}),
+          ...composeAdapterSeams(args.opts),
         });
         firstTurn = false;
         return reply;
@@ -697,7 +731,7 @@ async function* driveCrew(
           maxTokens: def.maxTokens ?? DEFAULT_MAX_TOKENS,
           crewMailbox: mailbox,
           ...(firstTurn ? {} : { resume: { sessionId: runContext.sessionId } }),
-          ...(args.opts._adapter !== undefined ? { _adapter: args.opts._adapter } : {}),
+          ...composeAdapterSeams(args.opts),
         });
 
         firstTurn = false;
@@ -917,10 +951,12 @@ async function buildHandoffSeed(
 /**
  * Loop contract 0.4 (Batch A) — fold the run-level ceilings (`opts.limits`,
  * `opts.budget`, `opts.hooks`, the `spawnSubAgent` injection) and the
- * role-level selectors (`thinking`, `subAgents`) into one runChatLoop
- * options fragment, applied IDENTICALLY to primary role activations and
- * inline A2A peer turns. Only declared fields are present — the runtime
- * owns every default, so a knob-less run stays byte-identical to pre-0.4.
+ * role-level selectors (`thinking`, `subAgents`, and — 0.6.0 PR 3 — the
+ * per-role routing quartet `modelFallbacks`/`circuitBreaker`/`modelTiers`/
+ * `modelPool`) into one runChatLoop options fragment, applied IDENTICALLY
+ * to primary role activations and inline A2A peer turns. Only declared
+ * fields are present — the runtime owns every default, so a knob-less run
+ * stays byte-identical to pre-0.4.
  *
  * The returned fragment is spread into each call site behind a
  * `Partial<RunChatLoopOptions>` cast: `maxToolIterations`/
@@ -945,6 +981,10 @@ export type LoopTuningFragment = Pick<
   | "hooks"
   | "subAgents"
   | "spawnSubAgent"
+  | "modelFallbacks"
+  | "circuitBreaker"
+  | "modelTiers"
+  | "modelPool"
 > & {
   readonly deadlineMs?: number;
   readonly turnTimeoutMs?: number;
@@ -974,6 +1014,38 @@ export function composeLoopTuning(def: RoleDefinition, opts: RunOptions): LoopTu
     ...(def.thinking !== undefined ? { thinking: def.thinking } : {}),
     ...(def.subAgents !== undefined ? { subAgents: def.subAgents } : {}),
     ...(opts.spawnSubAgent !== undefined ? { spawnSubAgent: opts.spawnSubAgent } : {}),
+    // 0.6.0 (PR 3, §7.7) — per-role model routing. Presence-gated like every
+    // other selector: a role without routing hands runtime-core exactly the
+    // options it got before, so the single-model path is untouched.
+    ...(def.modelFallbacks !== undefined ? { modelFallbacks: def.modelFallbacks } : {}),
+    ...(def.circuitBreaker !== undefined ? { circuitBreaker: def.circuitBreaker } : {}),
+    ...(def.modelTiers !== undefined ? { modelTiers: def.modelTiers } : {}),
+    ...(def.modelPool !== undefined ? { modelPool: def.modelPool } : {}),
+  };
+}
+
+/**
+ * 0.6.0 (PR 3) — the test-injection seams, folded once and spread at BOTH
+ * role call sites (primary activation + inline A2A peer turn). One helper
+ * rather than two hand copies: the 0.5.5 `toolsetScope` lesson was that a
+ * per-turn option added to only one of the two sites silently splits crew
+ * behaviour between a handoff and a peer ask. Presence-gated so a run with
+ * no injection passes runtime-core no `_`-keys at all. The router consult
+ * (`RouterArgs._adapter`) is a different seam and keeps its own forward.
+ * Exported for direct unit coverage.
+ */
+export function composeAdapterSeams(
+  opts: RunOptions,
+): Pick<
+  RunChatLoopOptions,
+  "_adapter" | "_failoverAdapters" | "_tierAdapters" | "_poolAdapters" | "_scoreboard"
+> {
+  return {
+    ...(opts._adapter !== undefined ? { _adapter: opts._adapter } : {}),
+    ...(opts._failoverAdapters !== undefined ? { _failoverAdapters: opts._failoverAdapters } : {}),
+    ...(opts._tierAdapters !== undefined ? { _tierAdapters: opts._tierAdapters } : {}),
+    ...(opts._poolAdapters !== undefined ? { _poolAdapters: opts._poolAdapters } : {}),
+    ...(opts._scoreboard !== undefined ? { _scoreboard: opts._scoreboard } : {}),
   };
 }
 
