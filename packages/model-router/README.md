@@ -112,7 +112,8 @@ Introspection: `plan()` (predicted next candidate), `lastServed()`,
 `createTierRouter({ fast, default, config? })` holds two boot-resolved tiers
 (`ResolvedTier` = adapter + wire model id + spec string). runtime-core calls
 `route(signals)` each turn, streams through the returned tier's adapter, and
-publishes a `model_tier_route` trace event. The decision (`pickTier`) is
+publishes a `model_tier_route` trace event (persisted to the session log as the
+event-log kind of the same name since 0.6.0). The decision (`pickTier`) is
 deterministic — no probe calls, fully reproducible from the transcript. Any
 single hard-turn signal escalates the turn to the `default` tier:
 
@@ -186,7 +187,11 @@ crewhaus route reset               # wipe the scoreboard (kill switch)
 `route explain` reads the durable `model_route` events runtime-core persists to
 the session log each routing decision (a turn that runs tools re-routes as the
 difficulty band shifts, so a `turnNumber` can repeat), showing band, model,
-policy, explore/exploit, and reason per turn.
+policy, explore/exploit, and reason per turn. Since 0.6.0 the line also carries
+the derived `signals` the decision was made from and, when it differs from the
+wire id, the candidate's `specModel` (the string scoreboard arms key on); the
+chain's `model_failover` events are mirrored into the same log as a durable
+`model_failover` kind.
 
 Exports: `createPolicyRouter`, `PolicyRouter`, `PolicyDecision`, `PoolCandidate`,
 `PoolPolicy`, `PoolRoutingConfig`, `PoolLearningConfig`, `ScoreLookup`.

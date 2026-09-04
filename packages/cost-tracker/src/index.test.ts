@@ -39,6 +39,10 @@ function modelResponse(
     cacheRead?: number;
     cacheCreate?: number;
     runId?: string;
+    attribution?: Pick<
+      ModelResponseEvent,
+      "role" | "stage" | "profile" | "paramsFingerprint" | "effectiveParams"
+    >;
   },
 ): ModelResponseEvent {
   return {
@@ -47,6 +51,7 @@ function modelResponse(
     kind: "model_response",
     model: opts.model,
     ...(opts.specModel !== undefined ? { specModel: opts.specModel } : {}),
+    ...(opts.attribution ?? {}),
     provider: opts.provider,
     stopReason: "end_turn",
     usage: {
@@ -261,6 +266,58 @@ describe("cost-tracker — T3 trace bus integration", () => {
     expect(accruals[0]?.specModel).toBe("bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0");
     // anthropic.claude-sonnet-4 row: 100 × $3/M + 10 × $15/M = 450 micros
     expect(accruals[0]?.costUsdMicros).toBe(450);
+  });
+
+  test("0.6.0 attribution (role/stage/profile/paramsFingerprint/effectiveParams) copies verbatim onto cost_accrual", () => {
+    const bus = makeBus();
+    const accruals: CostAccrualEvent[] = [];
+    bus.subscribe((e) => {
+      if (e.kind === "cost_accrual") accruals.push(e);
+    });
+    createCostTracker(bus);
+    const effectiveParams = {
+      model: "claude-sonnet-4-5",
+      maxTokens: 4096,
+      temperature: 0,
+      dropped: [],
+    };
+    bus.publish(
+      modelResponse(bus, {
+        model: "claude-sonnet-4-5",
+        provider: "anthropic",
+        inputTokens: 100,
+        outputTokens: 10,
+        attribution: {
+          role: "judge",
+          stage: "verify",
+          profile: "checker",
+          paramsFingerprint: "fp-1",
+          effectiveParams,
+        },
+      }),
+    );
+    // An unattributed response yields an accrual WITHOUT any of the fields.
+    bus.publish(
+      modelResponse(bus, {
+        model: "claude-sonnet-4-5",
+        provider: "anthropic",
+        inputTokens: 100,
+        outputTokens: 10,
+      }),
+    );
+    expect(accruals).toHaveLength(2);
+    expect(accruals[0]).toMatchObject({
+      role: "judge",
+      stage: "verify",
+      profile: "checker",
+      paramsFingerprint: "fp-1",
+      effectiveParams,
+    });
+    for (const field of ["role", "stage", "profile", "paramsFingerprint", "effectiveParams"]) {
+      expect(accruals[1]).not.toHaveProperty(field);
+    }
+    // Attribution never changes the price.
+    expect(accruals[0]?.costUsdMicros).toBe(accruals[1]?.costUsdMicros);
   });
 
   test("usage.cacheCreate threads into cost_accrual.cacheCreationTokens and is priced at the write premium", () => {

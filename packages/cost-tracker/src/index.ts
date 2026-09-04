@@ -202,6 +202,17 @@ export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions =
         provider,
         modelId: resp.model,
         ...(resp.specModel !== undefined ? { specModel: resp.specModel } : {}),
+        // 0.6.0 (design §8.1) — attribution rides from the response onto the
+        // accrual VERBATIM, and only when present, so `cost-summary`, Hangar
+        // and `budget.judge_share` can split spend by role/stage/profile while
+        // an unattributed response yields a byte-identical accrual.
+        ...(resp.role !== undefined ? { role: resp.role } : {}),
+        ...(resp.stage !== undefined ? { stage: resp.stage } : {}),
+        ...(resp.profile !== undefined ? { profile: resp.profile } : {}),
+        ...(resp.paramsFingerprint !== undefined
+          ? { paramsFingerprint: resp.paramsFingerprint }
+          : {}),
+        ...(resp.effectiveParams !== undefined ? { effectiveParams: resp.effectiveParams } : {}),
         inputTokens,
         outputTokens,
         cachedReadTokens,

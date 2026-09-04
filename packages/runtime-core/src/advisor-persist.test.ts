@@ -351,7 +351,17 @@ describe("advisor signal persistence (item 14 groundwork)", () => {
     });
     const meta = linesOf("model_meta");
     expect(meta.length).toBe(1);
-    expect(meta[0]?.payload).toEqual({ stopReason: "end_turn", model: "test-model" });
+    // 0.6.0 (design §8.4) — the line carries exact per-turn attribution
+    // (usage, whole-ms duration, turnNumber); `role`/`profile` appear only
+    // when the response carried them, so an unattributed run has neither.
+    expect(meta[0]?.payload).toEqual({
+      stopReason: "end_turn",
+      model: "test-model",
+      usage: { input: 100, output: 10 },
+      durationMs: expect.any(Number),
+      turnNumber: 1,
+    });
+    expect(Number.isInteger(meta[0]?.payload?.["durationMs"])).toBe(true);
   });
 
   test("CREWHAUS_ADVISOR_EVENTS=0 disables all advisor lines", async () => {

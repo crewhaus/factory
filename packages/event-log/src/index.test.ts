@@ -95,6 +95,78 @@ describe("event-log — round-trip", () => {
     expect(all[2]?.payload).toEqual({ toolName: "Bash", decision: "ask", askOutcome: "approved" });
   });
 
+  test("0.6.0 routing kinds (model_tier_route, model_failover, model_stage, model_directive, judge_verdict) round-trip", async () => {
+    const rootDir = newTempRoot();
+    const log = await openEventLog(TEST_ID, { rootDir });
+    await log.append({
+      kind: "model_tier_route",
+      payload: { turnNumber: 2, tier: "fast", model: "claude-haiku-4-5", reason: "easy turn" },
+    });
+    await log.append({
+      kind: "model_failover",
+      payload: {
+        turnNumber: 2,
+        from: "claude-opus-4-7",
+        to: "openai/gpt-4o-mini",
+        reason: "breaker_open",
+      },
+    });
+    await log.append({
+      kind: "model_stage",
+      payload: {
+        turnNumber: 3,
+        stage: "draft",
+        strategy: "cascade",
+        role: "draft",
+        model: "claude-haiku-4-5",
+        outcome: "done",
+      },
+    });
+    await log.append({
+      kind: "model_directive",
+      payload: {
+        turnNumber: 3,
+        source: "repl",
+        requested: "fast",
+        resolved: "fast",
+        accepted: true,
+      },
+    });
+    await log.append({
+      kind: "judge_verdict",
+      payload: {
+        turnNumber: 3,
+        stepOrNode: "gate",
+        verdict: "pass",
+        score: 0.9,
+        judgeModel: "claude-sonnet-5",
+      },
+    });
+    await log.close();
+
+    const all = await collect(log.read());
+    expect(all.map((e) => e.kind)).toEqual([
+      "model_tier_route",
+      "model_failover",
+      "model_stage",
+      "model_directive",
+      "judge_verdict",
+    ]);
+    expect(all[1]?.payload).toEqual({
+      turnNumber: 2,
+      from: "claude-opus-4-7",
+      to: "openai/gpt-4o-mini",
+      reason: "breaker_open",
+    });
+    expect(all[3]?.payload).toEqual({
+      turnNumber: 3,
+      source: "repl",
+      requested: "fast",
+      resolved: "fast",
+      accepted: true,
+    });
+  });
+
   test("run_failed (v0.3.0 Goal 6 terminal failure record) round-trips its report payload", async () => {
     const rootDir = newTempRoot();
     const log = await openEventLog(TEST_ID, { rootDir });
