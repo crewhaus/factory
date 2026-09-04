@@ -44,6 +44,7 @@ import type {
   TurnStartEvent,
 } from "@crewhaus/trace-event-bus";
 import {
+  type AbandonedModelCause,
   type StartedMcp,
   type StartedModel,
   type StartedRole,
@@ -51,6 +52,7 @@ import {
   type StartedTool,
   type StartedTurn,
   buildA2AMessageSpan,
+  buildAbandonedModelSpan,
   buildAlertRaisedSpan,
   buildApprovalRequestedSpan,
   buildApprovalResolvedSpan,
@@ -88,6 +90,20 @@ function isoToNano(iso: string): string {
   return `${BigInt(Date.parse(iso))}000000`;
 }
 
+/**
+ * Belt for third-party publishers: runtime-core keeps at most a handful of
+ * model calls in flight (a draft, a judge, a compaction side-call), so a Map
+ * past this size means requests are being minted without responses. The
+ * oldest entry is abandoned first.
+ */
+const MAX_IN_FLIGHT_MODEL_CALLS = 32;
+/**
+ * How many abandoned spanIds to remember so a response that arrives AFTER its
+ * call was abandoned is dropped instead of LIFO-pairing with whatever request
+ * is in flight by then.
+ */
+const MAX_REMEMBERED_ABANDONED = 64;
+
 export class SpanTracker {
   private turn: StartedTurn | undefined;
   /**
@@ -101,6 +117,11 @@ export class SpanTracker {
    * fresh envelope for the response (an older or third-party publisher).
    */
   private readonly models = new Map<string, StartedModel>();
+  /**
+   * spanIds of model calls closed by `abandonModelCall`, insertion-ordered so
+   * the oldest is forgotten first once `MAX_REMEMBERED_ABANDONED` is reached.
+   */
+  private readonly abandonedModelKeys = new Set<string>();
   private readonly tools = new Map<string, StartedTool>();
   /** server::toolName key — MCP can have one in flight per server. */
   private readonly mcps = new Map<string, StartedMcp>();
@@ -130,12 +151,43 @@ export class SpanTracker {
     return key !== undefined ? this.models.get(key) : undefined;
   }
 
+  /**
+   * Close an in-flight model call that will never see its `model_response`.
+   * runtime-core publishes `model_response` on its two success paths only; a
+   * stream that throws (abort, provider error, breaker trip, max_output_tokens
+   * continue-recovery) leaves its `model_request` unpaired. Before this the
+   * entry — and every stream-token event it had collected — stayed in the Map
+   * for the life of the process. Emits an ERROR-status `gen_ai.chat` span so
+   * the failure is visible in the backend rather than silently dropped.
+   */
+  private abandonModelCall(key: string, endIso: string, cause: AbandonedModelCause): void {
+    const started = this.models.get(key);
+    if (!started) return;
+    this.models.delete(key);
+    this.abandonedModelKeys.add(key);
+    if (this.abandonedModelKeys.size > MAX_REMEMBERED_ABANDONED) {
+      const oldest = this.abandonedModelKeys.values().next().value;
+      if (oldest !== undefined) this.abandonedModelKeys.delete(oldest);
+    }
+    this.emit(buildAbandonedModelSpan(started, endIso, cause));
+  }
+
+  private abandonAllModelCalls(endIso: string, cause: AbandonedModelCause): void {
+    for (const key of [...this.models.keys()]) this.abandonModelCall(key, endIso, cause);
+  }
+
   ingest(ev: TraceEvent): void {
     switch (ev.kind) {
       case "turn_start":
         this.turn = { startNano: isoToNano(ev.timestamp), ev: ev as TurnStartEvent };
         return;
       case "turn_end":
+        // Nothing can still be streaming once the turn closes (single-writer
+        // bus, no parallel `runOneTurn`; side calls run on their own child
+        // bus and re-publish as `cost_accrual`), so whatever is still in the
+        // Map is a call whose stream threw. Close those first so the turn
+        // span is the last thing emitted for the turn.
+        this.abandonAllModelCalls(ev.timestamp, "turn_end");
         if (this.turn) {
           this.emit(buildTurnSpan(this.turn, ev as TurnEndEvent));
           this.turn = undefined;
@@ -147,6 +199,11 @@ export class SpanTracker {
           ev: ev as ModelRequestEvent,
           streamEvents: [],
         });
+        while (this.models.size > MAX_IN_FLIGHT_MODEL_CALLS) {
+          const oldest = this.models.keys().next().value;
+          if (oldest === undefined) break;
+          this.abandonModelCall(oldest, ev.timestamp, "in_flight_cap");
+        }
         return;
       case "model_stream_token": {
         // Stream tokens are published with their own fresh envelope, so they
@@ -163,6 +220,14 @@ export class SpanTracker {
         // Exact pairing on the request's spanId; LIFO fallback when the
         // response was published under a fresh envelope (never the case for
         // runtime-core, but the tracker used to tolerate it and still does).
+        // A response for a call already closed by `abandonModelCall` is
+        // dropped outright: its span was emitted (with ERROR status) when it
+        // was abandoned, and letting it fall through to the LIFO fallback
+        // would pair it with an unrelated in-flight request.
+        if (!this.models.has(ev.spanId) && this.abandonedModelKeys.has(ev.spanId)) {
+          this.abandonedModelKeys.delete(ev.spanId);
+          return;
+        }
         const key = this.models.has(ev.spanId) ? ev.spanId : this.latestModelKey();
         const started = key !== undefined ? this.models.get(key) : undefined;
         if (started && key !== undefined) {
@@ -228,6 +293,18 @@ export class SpanTracker {
         this.emit(buildResponseRatedSpan(ev as ResponseRatedEvent));
         return;
       case "error_recovered":
+        // Published (under a fresh envelope) from the run loop's NeedRecovery
+        // state, i.e. after the turn's model call threw and unwound — the
+        // call still in the Map is the one that failed, and the retry will
+        // publish a new `model_request`. Close it here so the retry path does
+        // not leak an entry per attempt.
+        //
+        // Deliberately NOT done on `model_failover`: the failover chain
+        // publishes that from inside `stream()` (model-router/failover.ts,
+        // `selectCandidate`), after the call's `model_request` and before its
+        // `model_response`, for a call that then completes on the next rung
+        // under the same spanId. Abandoning there would drop a live call.
+        this.abandonAllModelCalls(ev.timestamp, "error_recovered");
         this.emit(buildErrorRecoveredSpan(ev as ErrorRecoveredEvent));
         return;
       case "sub_agent_start": {
