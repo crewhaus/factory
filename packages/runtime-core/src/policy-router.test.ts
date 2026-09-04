@@ -26,7 +26,9 @@ import type {
 } from "@crewhaus/adapter-anthropic";
 import { type Scoreboard, openScoreboard } from "@crewhaus/routing-store";
 import { createRunContext } from "@crewhaus/run-context";
+import { buildTool } from "@crewhaus/tool-builder";
 import type { ModelRouteEvent, TraceEvent } from "@crewhaus/trace-event-bus";
+import { z } from "zod";
 import { runChatLoop } from "./index";
 
 const SHARED_SESSION_ROOT = mkdtempSync(join(tmpdir(), "crewhaus-pool-tests-"));
@@ -350,5 +352,51 @@ describe("runChatLoop — model_route persistence + online exploration", () => {
     const routes = persistedRoutes(runContext.sessionId);
     expect(routes[0]).toMatchObject({ routeKey: "hard", model: OPUS, explored: true });
     expect(String(routes[0]?.reason)).toContain("ε-greedy explore");
+  });
+});
+
+/**
+ * 0.6.0 §4.4 pin — the loop feeds the router `toolsInPlay` as the RUN-WIDE
+ * union advertisement (`anthropicTools.length > 0`), computed BEFORE a
+ * candidate is chosen. Registering one tool makes every non-first turn
+ * "hard" for every candidate, whichever of them could serve the tool. Later
+ * per-candidate toolsets (§5) must not change this band.
+ */
+describe("runChatLoop — toolsInPlay routes on the union advertisement (0.6.0 §4.4 pin)", () => {
+  test("one registered tool → a non-first turn lands in the hard band (strong candidate)", async () => {
+    const cheap = okAdapter("cheap");
+    const strong = okAdapter("strong");
+    const runContext = createRunContext();
+    runContext.turnNumber = 2; // non-first: only the tool signal can make it hard
+    const seen: TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => seen.push(e));
+    const probe = buildTool({
+      name: "probe",
+      description: "never called",
+      inputSchema: z.object({}),
+      readOnly: true,
+      execute: async () => "unused",
+    });
+    await runChatLoop({
+      model: "claude-sonnet-5",
+      instructions: "test",
+      _adapter: okAdapter("primary"),
+      modelPool: { candidates: POOL_CANDIDATES, policy: "heuristic" },
+      _poolAdapters: poolAdapters(cheap, strong),
+      _scoreboard: tmpScoreboard(),
+      tools: [probe],
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "hello" }],
+    });
+    const route = seen.find((e): e is ModelRouteEvent => e.kind === "model_route");
+    expect(route?.routeKey).toBe("hard");
+    expect(route?.reason).toContain("tools in play");
+    expect(route?.model).toBe(OPUS);
+    expect(strong.requests).toHaveLength(1);
+    expect(cheap.requests).toHaveLength(0);
+    // The request carried the union list — every candidate is sent the same
+    // advertisement, which is exactly what the band was computed from.
+    expect(strong.requests[0]?.tools?.map((t) => t.name)).toContain("probe");
   });
 });

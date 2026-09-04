@@ -1110,10 +1110,14 @@ describe("crewhaus run", () => {
     expect(result.stdout).toContain("--streaming");
     expect(result.stdout).toContain("--budget-usd");
     // The interplay contract: independent bounds, first to trip governs,
-    // budget gates the NEXT turn while limits bound the current one.
+    // budget gates EVERY model call (0.6.0 §7.12 — tool iterations included,
+    // a mid-turn breach is the classified crewhaus_budget stop) while limits
+    // bound the current turn/run.
     expect(result.stdout).toContain("limits:");
     expect(result.stdout).toContain("INDEPENDENTLY");
-    expect(result.stdout).toContain("NEXT turn");
+    expect(result.stdout).toContain("EVERY model call");
+    expect(result.stdout).toContain("crewhaus_budget");
+    expect(result.stdout).toContain("budget.scope: session");
   });
 });
 

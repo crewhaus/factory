@@ -43,6 +43,18 @@ export type PoolCandidate = {
 export type PoolPolicy = "static" | "heuristic" | "learned";
 
 /**
+ * 0.6.0 §7.12 — the policy stamped on a {@link PolicyDecision}. Every
+ * configured {@link PoolPolicy}, plus `"forced"`: a decision the loop made
+ * OUTSIDE the router (today: a `budget.on_exceed: degrade` breach restricting
+ * the pool to its degrade rung, reason `budget_degrade`). `route()` itself
+ * never returns `"forced"` — the router stays a pure selector over the
+ * roster; the loop substitutes the forced candidate into the decision the
+ * router produced, keeping the band (`routeKey`) so the scoreboard arm is
+ * still keyed on the turn's difficulty.
+ */
+export type PolicyDecisionPolicy = PoolPolicy | "forced";
+
+/**
  * Difficulty thresholds (shared verbatim with the tier router) plus the tag
  * preferences the heuristic routes on. All optional — sensible defaults apply.
  */
@@ -107,7 +119,7 @@ export type PolicyDecision = {
   readonly routeKey: string;
   /** Human-readable trigger for the `model_route` trace event / logs. */
   readonly reason: string;
-  readonly policy: PoolPolicy;
+  readonly policy: PolicyDecisionPolicy;
   /** True when the learned policy chose an under-sampled arm to explore it. */
   readonly explored: boolean;
 };
