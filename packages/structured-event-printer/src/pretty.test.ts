@@ -849,6 +849,203 @@ describe("formatBody — every kind + optional-field branches", () => {
     } satisfies TraceEvent;
     expect(formatLine(ev)).toBe(`${prefix("judge_verdict")}at=gate verdict=pass score=0.95`);
   });
+
+  // ---- 0.6.0 (design §8.1) — role/stage/profile attribution + the two new kinds.
+
+  test("model_request WITH attribution appends role/stage/profile/params/dropped", () => {
+    const ev = {
+      ...envelope,
+      kind: "model_request",
+      model: "claude-haiku-4-5",
+      messageCount: 4,
+      toolCount: 2,
+      streaming: true,
+      role: "draft",
+      stage: "draft",
+      profile: "fast",
+      paramsFingerprint: "p1a2b3",
+      effectiveParams: { model: "claude-haiku-4-5", maxTokens: 4096, dropped: ["temperature"] },
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("model_request")}model=claude-haiku-4-5 messages=4 tools=2 streaming role=draft stage=draft profile=fast params=p1a2b3 dropped=temperature`,
+    );
+  });
+
+  test("model_response WITH role only appends just role", () => {
+    const ev = {
+      ...envelope,
+      kind: "model_response",
+      model: "claude-sonnet-5",
+      stopReason: "end_turn",
+      usage: { input: 10, output: 5 },
+      durationMs: 12,
+      role: "judge",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("model_response")}model=claude-sonnet-5 stop=end_turn in=10 out=5 duration=12ms role=judge`,
+    );
+  });
+
+  test("cost_accrual WITH attribution appends role/profile after the 0.5.x fields", () => {
+    const ev = {
+      ...envelope,
+      kind: "cost_accrual",
+      provider: "anthropic",
+      modelId: "claude-sonnet-5",
+      inputTokens: 10,
+      outputTokens: 5,
+      cachedReadTokens: 0,
+      costUsdMicros: 105,
+      role: "judge",
+      profile: "checker",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("cost_accrual")}provider=anthropic model=claude-sonnet-5 in=10 out=5 cached=0 micros=105 role=judge profile=checker`,
+    );
+  });
+
+  test("model_route WITH the 0.6.0 attribution renders every optional facet before reason", () => {
+    const ev = {
+      ...envelope,
+      kind: "model_route",
+      routeKey: "main/hard",
+      model: "claude-opus-5",
+      policy: "heuristic",
+      reason: "rule matched",
+      specModel: "anthropic/claude-opus-5",
+      profile: "strong",
+      stage: "escalation",
+      strategy: "cascade",
+      scope: "main",
+      ruleId: "code-goes-strong",
+      hint: { source: "rule", evidence: "code-goes-strong" },
+      eligible: ["fast", "strong"],
+      classifierVerdict: { label: "strong" },
+      signals: { contextTokens: 1200, toolsInPlay: true },
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("model_route")}routeKey=main/hard model=claude-opus-5 policy=heuristic spec=anthropic/claude-opus-5 profile=strong stage=escalation strategy=cascade scope=main rule=code-goes-strong hint=rule eligible=fast,strong label=strong reason=rule matched`,
+    );
+  });
+
+  test("model_stage renders stage/strategy/role/model/outcome with optional profile/cause/micros", () => {
+    const done = {
+      ...envelope,
+      kind: "model_stage",
+      stage: "draft",
+      strategy: "cascade",
+      role: "draft",
+      model: "claude-haiku-4-5",
+      profile: "fast",
+      outcome: "done",
+      costUsdMicros: 120,
+    } satisfies TraceEvent;
+    expect(formatLine(done)).toBe(
+      `${prefix("model_stage")}stage=draft strategy=cascade role=draft model=claude-haiku-4-5 profile=fast outcome=done micros=120`,
+    );
+    const skipped = {
+      ...envelope,
+      kind: "model_stage",
+      stage: "escalate",
+      strategy: "cascade",
+      role: "escalation",
+      model: "claude-opus-5",
+      outcome: "skipped",
+      cause: "max_escalations",
+    } satisfies TraceEvent;
+    expect(formatLine(skipped)).toBe(
+      `${prefix("model_stage")}stage=escalate strategy=cascade role=escalation model=claude-opus-5 outcome=skipped cause=max_escalations`,
+    );
+  });
+
+  test("model_directive renders source/requested/accepted with optional resolved/reason", () => {
+    const accepted = {
+      ...envelope,
+      kind: "model_directive",
+      source: "repl",
+      requested: "fast",
+      resolved: "fast",
+      accepted: true,
+    } satisfies TraceEvent;
+    expect(formatLine(accepted)).toBe(
+      `${prefix("model_directive")}source=repl requested=fast resolved=fast accepted=true`,
+    );
+    const refused = {
+      ...envelope,
+      kind: "model_directive",
+      source: "none",
+      requested: "turbo",
+      accepted: false,
+      reason: "unknown arm",
+    } satisfies TraceEvent;
+    expect(formatLine(refused)).toBe(
+      `${prefix("model_directive")}source=none requested=turbo accepted=false reason=unknown arm`,
+    );
+  });
+
+  test("eval_graded WITH attribution appends model/judge/judgeMicros/escalatedTo", () => {
+    const ev = {
+      ...envelope,
+      kind: "eval_graded",
+      score: 0.4,
+      threshold: 0.7,
+      verdict: "fail",
+      graderType: "llm_judge",
+      retryIndex: 0,
+      model: "claude-haiku-4-5",
+      profile: "fast",
+      judgeModel: "claude-sonnet-5",
+      judgeCostUsdMicros: 900,
+      escalatedTo: "claude-opus-5",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("eval_graded")}grader=llm_judge score=0.40 threshold=0.70 verdict=fail retry=0 model=claude-haiku-4-5 profile=fast judge=claude-sonnet-5 judgeMicros=900 escalatedTo=claude-opus-5`,
+    );
+  });
+
+  test("judge_verdict WITH judge/panel/micros renders them before the rationale", () => {
+    const ev = {
+      ...envelope,
+      kind: "judge_verdict",
+      stepOrNode: "gate",
+      verdict: "pass",
+      score: 0.9,
+      judgeModel: "claude-sonnet-5",
+      panel: ["claude-sonnet-5", "claude-opus-5"],
+      costUsdMicros: 900,
+      rationale: "both sources present",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("judge_verdict")}at=gate verdict=pass score=0.90 judge=claude-sonnet-5 panel=claude-sonnet-5,claude-opus-5 micros=900 rationale=both sources present`,
+    );
+  });
+
+  test("sub_agent_start and role_start WITH model/profile append them", () => {
+    const sub = {
+      ...envelope,
+      kind: "sub_agent_start",
+      name: "researcher",
+      childRunId: "run_c",
+      childSessionId: "sess_c",
+      toolCount: 3,
+      promptBytes: 40,
+      model: "claude-haiku-4-5",
+      profile: "fast",
+    } satisfies TraceEvent;
+    expect(formatLine(sub)).toBe(
+      `${prefix("sub_agent_start")}name=researcher childRun=run_c tools=3 prompt=40B model=claude-haiku-4-5 profile=fast`,
+    );
+    const role = {
+      ...envelope,
+      kind: "role_start",
+      role: "writer",
+      activation: 2,
+      model: "claude-sonnet-5",
+    } satisfies TraceEvent;
+    expect(formatLine(role)).toBe(
+      `${prefix("role_start")}role=writer activation=2 model=claude-sonnet-5`,
+    );
+  });
 });
 
 describe("formatJsonLine — JSON Lines", () => {

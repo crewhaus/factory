@@ -621,6 +621,99 @@ describe("SSE parsing + the run feed", () => {
     expect(sup.sseFrameToFeed("nonsense", {})).toEqual([]);
   });
 
+  test("the model_route card reads the fields the event actually carries (0.6.0 §8.3)", () => {
+    // 0.5.x read `modelId`/`band`, which no route event ever had, so the
+    // detail rendered empty. The event carries `model` + `routeKey`.
+    const plain = sup.traceCard({
+      kind: "model_route",
+      routeKey: "hard",
+      model: "claude-opus-5",
+      policy: "heuristic",
+      reason: "tools in play",
+    });
+    expect(plain.title).toBe("model route");
+    expect(plain.detail).toBe("claude-opus-5 · band=hard · policy=heuristic · tools in play");
+    const hybrid = sup.traceCard({
+      kind: "model_route",
+      routeKey: "main/easy",
+      model: "claude-haiku-4-5",
+      policy: "learned",
+      explored: true,
+      profile: "fast",
+      stage: "draft",
+      ruleId: "cheap-when-broke",
+      reason: "ε-greedy explore",
+    });
+    expect(hybrid.title).toBe("model route · draft");
+    expect(hybrid.detail).toBe(
+      "claude-haiku-4-5 · profile=fast · band=main/easy · policy=learned (exploring) · rule=cheap-when-broke · ε-greedy explore",
+    );
+  });
+
+  test("model_tier_route, model_failover, model_stage and model_directive cards render a sentence", () => {
+    expect(
+      sup.traceCard({
+        kind: "model_tier_route",
+        tier: "default",
+        model: "claude-sonnet-4-5",
+        escalated: true,
+        reason: "escalated after fast-tier failure",
+      }),
+    ).toMatchObject({
+      title: "model tier",
+      detail: "claude-sonnet-4-5 · tier=default (escalated) · escalated after fast-tier failure",
+    });
+    expect(
+      sup.traceCard({
+        kind: "model_failover",
+        from: "claude-opus-4-7",
+        to: "openai/gpt-4o-mini",
+        reason: "breaker_open",
+      }),
+    ).toMatchObject({
+      dot: "warn",
+      title: "model failover",
+      detail: "claude-opus-4-7 → openai/gpt-4o-mini · breaker_open",
+    });
+    expect(
+      sup.traceCard({
+        kind: "model_stage",
+        stage: "escalate",
+        strategy: "cascade",
+        role: "escalation",
+        model: "claude-opus-5",
+        outcome: "failed",
+        cause: "judge_share_exhausted",
+      }),
+    ).toMatchObject({
+      dot: "warn",
+      title: "stage escalate failed",
+      detail: "claude-opus-5 · role=escalation · strategy=cascade · cause=judge_share_exhausted",
+    });
+    expect(
+      sup.traceCard({
+        kind: "model_directive",
+        source: "repl",
+        requested: "fast",
+        resolved: "fast",
+        accepted: true,
+      }),
+    ).toMatchObject({ dot: null, title: "/model fast accepted", detail: "→ fast · source=repl" });
+    expect(
+      sup.traceCard({
+        kind: "model_directive",
+        source: "none",
+        requested: "turbo",
+        accepted: false,
+        reason: "unknown arm",
+      }),
+    ).toMatchObject({
+      dot: "warn",
+      title: "/model turbo refused",
+      detail: "source=none · unknown arm",
+    });
+  });
+
   test("an unknown trace kind still renders (tolerant reader)", () => {
     const card = sup.traceCard({ kind: "brand_new_kind", payload: { a: 1 } });
     expect(card.title).toBe("brand_new_kind");

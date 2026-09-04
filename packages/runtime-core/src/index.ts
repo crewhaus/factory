@@ -118,6 +118,7 @@ import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
 import { storeAndPreview } from "@crewhaus/tool-result-store";
 import {
   type CostAccrualEvent,
+  type ModelRole,
   type ModelUsage,
   TraceEventBus,
   type Unsubscribe,
@@ -144,6 +145,7 @@ import {
   attachAdvisorPersistence,
   attachDefaultSubscribers,
   attachMcpStatsPersistence,
+  attachRoutingPersistence,
   attachWatchmeCapture,
 } from "./observability";
 import { loadProjectMemory } from "./project-memory";
@@ -1188,6 +1190,24 @@ export type RunChatLoopOptions = {
    * against their own unscoped history exactly as before.
    */
   toolsetScope?: string;
+  /**
+   * 0.6.0 (design §8.1) — the ROLE every model call this loop publishes is
+   * attributed with (`model_request` / `model_response`, and therefore the
+   * `cost_accrual` cost-tracker derives and the `model_meta` session line).
+   * Left unset by the main agent loop — an absent role reads as `"primary"`
+   * — and set by the nested single-turn loops a hybrid strategy runs
+   * (`"consult"`, `"guide"`, `"committee"`, `"shadow"`, …) and by sub-agent
+   * children (`"subagent"`), so a budget meter or cost fold on the run can
+   * split spend by purpose. Pass-through only: the runtime stamps what it is
+   * handed and never infers a role.
+   */
+  modelRole?: ModelRole;
+  /**
+   * 0.6.0 (design §8.1) — the hybrid-strategy STAGE name every model call
+   * this loop publishes belongs to (`"draft"`, `"verify"`, `"plan"`, …).
+   * Pass-through like `modelRole`; absent on the main loop.
+   */
+  modelStage?: string;
   /**
    * Resume an existing session: load its metadata, replay its event log
    * into the message history (only `user_message` + `assistant_message`
@@ -2600,11 +2620,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   });
 
   // Item 22 — surface each failover on stderr so an operator watching a
-  // plain (non-CREWHAUS_TRACE) run still sees provider switches. NOTE: the
-  // advisor-events session-log subscriber pattern has NOT landed on main
-  // (packages/event-log has no advisor kind) — when it does, failovers
-  // should ALSO persist into the session JSONL through it; until then the
-  // trace event + this stderr note are the observable surfaces.
+  // plain (non-CREWHAUS_TRACE) run still sees provider switches. The durable
+  // half landed in 0.6.0 (design §8.1): `attachRoutingPersistence` below
+  // mirrors every `model_failover` into the session JSONL as the event-log
+  // kind of the same name, so this note is the live surface and the JSONL
+  // line is the offline one.
   let failoverNoteUnsubscribe: Unsubscribe | undefined;
   if (failoverChain !== undefined) {
     failoverNoteUnsubscribe = bus.subscribe((event): void => {
@@ -2816,6 +2836,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               : {}),
             costUsdMicros: ev.costUsdMicros,
             ...(ev.tenantId !== undefined ? { tenantId: ev.tenantId } : {}),
+            // 0.6.0 (design §8.1) — attribution persists only when present,
+            // so an unattributed run's cost lines stay byte-identical.
+            ...(ev.role !== undefined ? { role: ev.role } : {}),
+            ...(ev.stage !== undefined ? { stage: ev.stage } : {}),
+            ...(ev.profile !== undefined ? { profile: ev.profile } : {}),
+            ...(ev.paramsFingerprint !== undefined
+              ? { paramsFingerprint: ev.paramsFingerprint }
+              : {}),
+            ...(ev.effectiveParams !== undefined ? { effectiveParams: ev.effectiveParams } : {}),
           },
         })
         .catch((err) => {
@@ -2839,6 +2868,23 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // score per-server MCP health offline. Shares the advisor's DEFAULT-ON gate
   // (CREWHAUS_ADVISOR_EVENTS=0 disables both). See observability.ts.
   const mcpStatsPersist = attachMcpStatsPersistence(bus, eventLog, runContext);
+
+  // 0.6.0 (design §8.1) — persist the routing decisions that were bus-only
+  // (`model_failover` from the chain or a budget degrade, and the new
+  // `model_stage` / `model_directive` / `judge_verdict` kinds) into the same
+  // session JSONL as the `model_route` line, ungated, so `route explain` and
+  // `--resume` read them offline. See observability.ts.
+  const routingPersist = attachRoutingPersistence(bus, eventLog, runContext);
+
+  // 0.6.0 (design §8.1) — the attribution stamped on every model_request /
+  // model_response this loop publishes: pass-through of the caller's
+  // `modelRole` / `modelStage` (a nested consult/guide/committee/shadow loop
+  // or a sub-agent child); empty — and therefore byte-identical — on the
+  // main loop, whose absent role reads as "primary".
+  const modelAttribution = {
+    ...(opts.modelRole !== undefined ? { role: opts.modelRole } : {}),
+    ...(opts.modelStage !== undefined ? { stage: opts.modelStage } : {}),
+  };
 
   // "Watch me" — live capture tap (CREWHAUS_WATCHME-gated, off by default):
   // append the bus-only TraceEvent kinds to the `sessions/<id>.events.jsonl`
@@ -4724,13 +4770,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // scoreboard post-turn. Takes precedence over the tier router (the
             // two are mutually exclusive in the spec).
             if (poolRouter !== undefined) {
+              // 0.6.0 (design §8.1) — the four deterministic signals are also
+              // persisted on the route line (derived values only, never user
+              // text) so `route explain` can show WHY, not just what.
+              const routeSignals = {
+                contextTokens: contextTokenSignal(messages),
+                toolsInPlay: (anthropicTools?.length ?? 0) > 0,
+                turnIndex: Math.max(0, runContext.turnNumber - 1),
+                priorTurnToolUseCount,
+              };
               const base = poolRouter.route(
-                {
-                  contextTokens: contextTokenSignal(messages),
-                  toolsInPlay: (anthropicTools?.length ?? 0) > 0,
-                  turnIndex: Math.max(0, runContext.turnNumber - 1),
-                  priorTurnToolUseCount,
-                },
+                routeSignals,
                 poolSeed,
                 // Monotonic exploration sequence: the transcript length keeps
                 // advancing across `--resume` (and a channel-bot's resume-per-
@@ -4755,6 +4805,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 modelString: decision.candidate.modelString,
                 routeKey: decision.routeKey,
               };
+              // 0.6.0 (design §8.1) — `specModel` (when it differs from the
+              // wire id) closes the wire/spec identity split: scoreboard arms
+              // key on the SPEC string, so this is what lets `route explain`
+              // name the same arm `route status` shows.
+              const routeSpecModel =
+                decision.candidate.modelString !== decision.candidate.modelId
+                  ? { specModel: decision.candidate.modelString }
+                  : {};
               bus.publish({
                 ...bus.envelope(),
                 kind: "model_route",
@@ -4764,6 +4822,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 reason: decision.reason,
                 ...(decision.explored ? { explored: true } : {}),
                 ...(poolPolicyVersion !== undefined ? { policyVersion: poolPolicyVersion } : {}),
+                ...routeSpecModel,
+                signals: routeSignals,
               });
               // Persist the decision so `crewhaus route explain <session>` can
               // replay per-turn routing after the fact. Non-conversational, so
@@ -4776,6 +4836,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 reason: decision.reason,
                 explored: decision.explored,
                 ...(poolPolicyVersion !== undefined ? { policyVersion: poolPolicyVersion } : {}),
+                ...routeSpecModel,
+                signals: routeSignals,
               });
             } else if (tierRouter !== undefined) {
               // Item 26 — two-tier turn-difficulty router. Pick a tier from
@@ -4809,6 +4871,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 reason: decision.reason,
                 ...(escalateTier ? { escalated: true } : {}),
               });
+              // 0.6.0 (design §8.1) — the tier twin of the durable
+              // `model_route` line: persisted beside the publish so `route
+              // explain` covers tiers too. Non-conversational, so
+              // `replayMessageHistory` ignores it and `--resume` is unaffected.
+              await logEvent("model_tier_route", {
+                turnNumber: runContext.turnNumber,
+                tier: decision.tier,
+                model: chosen.modelId,
+                reason: decision.reason,
+                ...(escalateTier ? { escalated: true } : {}),
+              });
             }
             bus.publish({
               ...modelStartEnv,
@@ -4819,6 +4892,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               messageCount: messages.length,
               toolCount: anthropicTools?.length ?? 0,
               streaming: opts.streaming === true,
+              ...modelAttribution,
             });
             const t0Model = performance.now();
             modelCallStartMs = t0Model;
@@ -4987,6 +5061,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 stopReason: stopReason ?? "end_turn",
                 usage,
                 durationMs: performance.now() - t0Model,
+                ...modelAttribution,
               });
               // Item 4 / G28 — record the provider's real input_tokens for the
               // next pre-turn compaction trigger + routing signal. A response
@@ -5108,6 +5183,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               stopReason: final.stopReason,
               usage: final.usage,
               durationMs: performance.now() - t0Model,
+              ...modelAttribution,
             });
             // Item 4 / G28 — record the provider's real input_tokens for the
             // next pre-turn compaction trigger + routing signal. A response that
@@ -5742,6 +5818,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       await subscribers.shutdownAll();
       costPersistUnsubscribe?.();
       failoverNoteUnsubscribe?.();
+      routingPersist.unsubscribe();
       incidentCollector?.unsubscribe();
       budgetMeter?.unsubscribe();
       advisorPersist?.unsubscribe();
@@ -6028,6 +6105,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     await subscribers.shutdownAll();
     costPersistUnsubscribe?.();
     failoverNoteUnsubscribe?.();
+    routingPersist.unsubscribe();
     incidentCollector?.unsubscribe();
     budgetMeter?.unsubscribe();
     advisorPersist?.unsubscribe();

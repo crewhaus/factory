@@ -14,6 +14,7 @@
  */
 import type {
   A2AMessageEvent,
+  AlertRaisedEvent,
   ApprovalRequestedEvent,
   ApprovalResolvedEvent,
   CircuitStateChangedEvent,
@@ -31,6 +32,7 @@ import type {
   ModelFailoverEvent,
   ModelRequestEvent,
   ModelResponseEvent,
+  ModelRouteEvent,
   ModelStreamTokenEvent,
   ModelTierRouteEvent,
   PermissionDecisionEvent,
@@ -50,14 +52,6 @@ import type {
   TurnEndEvent,
   TurnStartEvent,
 } from "@crewhaus/trace-event-bus";
-
-// `AlertRaisedEvent` and `ModelRouteEvent` are defined in trace-event-bus's
-// types.ts and are members of the exported `TraceEvent` union, but the
-// package's index barrel does not re-export them by name (see cross-package
-// note in the return). Derive them from the union so we depend only on the
-// exported surface rather than editing the keystone package.
-type AlertRaisedEvent = Extract<TraceEvent, { kind: "alert_raised" }>;
-type ModelRouteEvent = Extract<TraceEvent, { kind: "model_route" }>;
 import {
   type Attribute,
   type OtelSpan,
@@ -181,6 +175,13 @@ export const ATTR = {
   CREWHAUS_ROUTE_ESCALATED: "crewhaus.route.escalated",
   CREWHAUS_ROUTE_EXPLORED: "crewhaus.route.explored",
   CREWHAUS_ROUTE_POLICY_VERSION: "crewhaus.route.policy_version",
+  // 0.6.0 (design §8.4) — per-call attribution on the gen_ai.chat span, set
+  // only when the response carries the field (absent role ⇒ primary).
+  CREWHAUS_MODEL_SPEC: "crewhaus.model.spec",
+  CREWHAUS_MODEL_ROLE: "crewhaus.model.role",
+  CREWHAUS_MODEL_PROFILE: "crewhaus.model.profile",
+  CREWHAUS_MODEL_STAGE: "crewhaus.model.stage",
+  CREWHAUS_MODEL_PARAMS_FINGERPRINT: "crewhaus.model.params_fingerprint",
   // G58 — janitor.
   CREWHAUS_JANITOR_STEP: "crewhaus.janitor.step",
   CREWHAUS_JANITOR_STATUS: "crewhaus.janitor.status",
@@ -356,6 +357,21 @@ export function buildModelSpan(start: StartedModel, end: ModelResponseEvent): Ot
   }
   if (end.usage.cacheCreate !== undefined) {
     attrs.push(attrInt(ATTR.GEN_AI_USAGE_CACHE_CREATE_TOKENS, end.usage.cacheCreate));
+  }
+  // 0.6.0 (design §8.4) — attribution, response-first with the request as
+  // the fallback (a nested loop stamps both identically; a chain-wrapped
+  // candidate can only know the served identity on the response).
+  const specModel = end.specModel ?? start.ev.specModel;
+  if (specModel !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_SPEC, specModel));
+  const role = end.role ?? start.ev.role;
+  if (role !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_ROLE, role));
+  const profile = end.profile ?? start.ev.profile;
+  if (profile !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_PROFILE, profile));
+  const stage = end.stage ?? start.ev.stage;
+  if (stage !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_STAGE, stage));
+  const paramsFingerprint = end.paramsFingerprint ?? start.ev.paramsFingerprint;
+  if (paramsFingerprint !== undefined) {
+    attrs.push(attrStr(ATTR.CREWHAUS_MODEL_PARAMS_FINGERPRINT, paramsFingerprint));
   }
   return {
     traceId: end.traceId,

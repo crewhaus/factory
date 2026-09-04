@@ -6,6 +6,7 @@
  */
 import type {
   A2AMessageEvent,
+  AlertRaisedEvent,
   ApprovalRequestedEvent,
   ApprovalResolvedEvent,
   CircuitStateChangedEvent,
@@ -23,6 +24,7 @@ import type {
   ModelFailoverEvent,
   ModelRequestEvent,
   ModelResponseEvent,
+  ModelRouteEvent,
   ModelStreamTokenEvent,
   ModelTierRouteEvent,
   PermissionDecisionEvent,
@@ -41,11 +43,6 @@ import type {
   TurnEndEvent,
   TurnStartEvent,
 } from "@crewhaus/trace-event-bus";
-
-// See gen-ai-mapping.ts: these two union members are not re-exported by name
-// from the trace-event-bus index barrel, so derive them from `TraceEvent`.
-type AlertRaisedEvent = Extract<TraceEvent, { kind: "alert_raised" }>;
-type ModelRouteEvent = Extract<TraceEvent, { kind: "model_route" }>;
 import {
   type StartedMcp,
   type StartedModel,
@@ -93,7 +90,17 @@ function isoToNano(iso: string): string {
 
 export class SpanTracker {
   private turn: StartedTurn | undefined;
-  private model: StartedModel | undefined;
+  /**
+   * 0.6.0 (design §8.4) — in-flight model calls keyed by the request's
+   * `spanId`. runtime-core publishes each `model_response` with the SAME
+   * spanId as its `model_request` (`modelStartEnv.spanId`), which is the
+   * pairing key; a hybrid turn can have a draft, a judge and a shadow call in
+   * flight at once, and the single-slot tracker this replaced would have
+   * paired a draft's request with a shadow's response. Insertion order is
+   * preserved so the LIFO fallback below can serve publishers that mint a
+   * fresh envelope for the response (an older or third-party publisher).
+   */
+  private readonly models = new Map<string, StartedModel>();
   private readonly tools = new Map<string, StartedTool>();
   /** server::toolName key — MCP can have one in flight per server. */
   private readonly mcps = new Map<string, StartedMcp>();
@@ -105,6 +112,22 @@ export class SpanTracker {
 
   constructor(emit: (span: OtelSpan) => void) {
     this.emit = emit;
+  }
+
+  /** Number of model calls awaiting their `model_response` (diagnostic). */
+  inFlightModelCalls(): number {
+    return this.models.size;
+  }
+
+  private latestModelKey(): string | undefined {
+    let last: string | undefined;
+    for (const key of this.models.keys()) last = key;
+    return last;
+  }
+
+  private latestModel(): StartedModel | undefined {
+    const key = this.latestModelKey();
+    return key !== undefined ? this.models.get(key) : undefined;
   }
 
   ingest(ev: TraceEvent): void {
@@ -119,23 +142,35 @@ export class SpanTracker {
         }
         return;
       case "model_request":
-        this.model = {
+        this.models.set(ev.spanId, {
           startNano: isoToNano(ev.timestamp),
           ev: ev as ModelRequestEvent,
           streamEvents: [],
-        };
+        });
         return;
-      case "model_stream_token":
-        if (this.model) {
-          this.model.streamEvents.push(buildStreamTokenEvent(ev as ModelStreamTokenEvent));
+      case "model_stream_token": {
+        // Stream tokens are published with their own fresh envelope, so they
+        // attach to the most recent in-flight call — the only one that can be
+        // streaming on a single-writer bus (runtime-core never runs two
+        // `runOneTurn`s in parallel; side calls are non-streaming).
+        const started = this.latestModel();
+        if (started) {
+          started.streamEvents.push(buildStreamTokenEvent(ev as ModelStreamTokenEvent));
         }
         return;
-      case "model_response":
-        if (this.model) {
-          this.emit(buildModelSpan(this.model, ev as ModelResponseEvent));
-          this.model = undefined;
+      }
+      case "model_response": {
+        // Exact pairing on the request's spanId; LIFO fallback when the
+        // response was published under a fresh envelope (never the case for
+        // runtime-core, but the tracker used to tolerate it and still does).
+        const key = this.models.has(ev.spanId) ? ev.spanId : this.latestModelKey();
+        const started = key !== undefined ? this.models.get(key) : undefined;
+        if (started && key !== undefined) {
+          this.emit(buildModelSpan(started, ev as ModelResponseEvent));
+          this.models.delete(key);
         }
         return;
+      }
       case "tool_call_start":
         this.tools.set((ev as ToolCallStartEvent).toolUseId, {
           startNano: isoToNano(ev.timestamp),

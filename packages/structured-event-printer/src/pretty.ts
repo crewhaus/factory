@@ -9,6 +9,34 @@ import type { TraceEvent } from "@crewhaus/trace-event-bus";
 
 const KIND_WIDTH = 22;
 
+/**
+ * 0.6.0 (design §8.1) — the optional attribution suffix shared by the model
+ * and cost lines: ` role=… stage=… profile=… params=…`, each part present
+ * only when the event carries it, so unattributed events render exactly as
+ * they did before the fields existed.
+ */
+function attribution(ev: {
+  role?: string;
+  stage?: string;
+  profile?: string;
+  paramsFingerprint?: string;
+  effectiveParams?: { dropped: ReadonlyArray<string> };
+}): string {
+  const dropped = ev.effectiveParams?.dropped ?? [];
+  return `${ev.role !== undefined ? ` role=${ev.role}` : ""}${
+    ev.stage !== undefined ? ` stage=${ev.stage}` : ""
+  }${ev.profile !== undefined ? ` profile=${ev.profile}` : ""}${
+    ev.paramsFingerprint !== undefined ? ` params=${ev.paramsFingerprint}` : ""
+  }${dropped.length > 0 ? ` dropped=${dropped.join(",")}` : ""}`;
+}
+
+/** 0.6.0 (design §7.7) — ` model=… profile=…` for the sub-agent and crew-role lifecycle lines. */
+function modelSuffix(ev: { model?: string; profile?: string }): string {
+  return `${ev.model !== undefined ? ` model=${ev.model}` : ""}${
+    ev.profile !== undefined ? ` profile=${ev.profile}` : ""
+  }`;
+}
+
 export function formatLine(ev: TraceEvent): string {
   const time = ev.timestamp;
   const kind = `[${ev.kind}]`.padEnd(KIND_WIDTH);
@@ -27,10 +55,10 @@ function formatBody(ev: TraceEvent): string {
     case "model_request":
       return `model=${ev.model}${ev.specModel !== undefined ? ` spec=${ev.specModel}` : ""} messages=${ev.messageCount} tools=${ev.toolCount}${
         ev.streaming ? " streaming" : ""
-      }`;
+      }${attribution(ev)}`;
     case "model_response": {
       const usage = `in=${ev.usage.input} out=${ev.usage.output}`;
-      return `model=${ev.model}${ev.specModel !== undefined ? ` spec=${ev.specModel}` : ""} stop=${ev.stopReason} ${usage} duration=${ev.durationMs.toFixed(0)}ms`;
+      return `model=${ev.model}${ev.specModel !== undefined ? ` spec=${ev.specModel}` : ""} stop=${ev.stopReason} ${usage} duration=${ev.durationMs.toFixed(0)}ms${attribution(ev)}`;
     }
     case "model_stream_token":
       return `chunk=${ev.chunkIndex} chars=${ev.deltaChars}`;
@@ -84,13 +112,13 @@ function formatBody(ev: TraceEvent): string {
         exitCode: ev.exitCode,
       });
     case "sub_agent_start":
-      return `name=${ev.name} childRun=${ev.childRunId} tools=${ev.toolCount} prompt=${ev.promptBytes}B`;
+      return `name=${ev.name} childRun=${ev.childRunId} tools=${ev.toolCount} prompt=${ev.promptBytes}B${modelSuffix(ev)}`;
     case "sub_agent_end":
-      return `name=${ev.name} childRun=${ev.childRunId} ${ev.isError ? "ERROR " : ""}toolCalls=${ev.toolCallCount} finalMsg=${ev.finalMessageBytes}B duration=${ev.durationMs.toFixed(0)}ms`;
+      return `name=${ev.name} childRun=${ev.childRunId} ${ev.isError ? "ERROR " : ""}toolCalls=${ev.toolCallCount} finalMsg=${ev.finalMessageBytes}B duration=${ev.durationMs.toFixed(0)}ms${modelSuffix(ev)}`;
     case "role_start":
-      return `role=${ev.role} activation=${ev.activation}`;
+      return `role=${ev.role} activation=${ev.activation}${modelSuffix(ev)}`;
     case "role_end":
-      return `role=${ev.role} activation=${ev.activation} finalMsg=${ev.finalMessageBytes}B duration=${ev.durationMs.toFixed(0)}ms`;
+      return `role=${ev.role} activation=${ev.activation} finalMsg=${ev.finalMessageBytes}B duration=${ev.durationMs.toFixed(0)}ms${modelSuffix(ev)}`;
     case "handoff":
       return `from=${ev.from} to=${ev.to} depth=${ev.depth}${
         ev.reason ? ` reason=${ev.reason}` : ""
@@ -101,7 +129,7 @@ function formatBody(ev: TraceEvent): string {
       return `finalRole=${ev.finalRole} activations=${ev.totalActivations} duration=${ev.durationMs.toFixed(0)}ms`;
     case "cost_accrual": {
       const t = ev.tenantId !== undefined ? ` tenant=${ev.tenantId}` : "";
-      return `provider=${ev.provider} model=${ev.modelId}${t} in=${ev.inputTokens} out=${ev.outputTokens} cached=${ev.cachedReadTokens} micros=${ev.costUsdMicros}`;
+      return `provider=${ev.provider} model=${ev.modelId}${t} in=${ev.inputTokens} out=${ev.outputTokens} cached=${ev.cachedReadTokens} micros=${ev.costUsdMicros}${attribution(ev)}`;
     }
     case "circuit_state_changed":
       return `adapter=${ev.adapter} ${ev.fromState}→${ev.toState}${
@@ -112,7 +140,30 @@ function formatBody(ev: TraceEvent): string {
     case "model_tier_route":
       return `tier=${ev.tier} model=${ev.model}${ev.escalated ? " escalated" : ""} reason=${ev.reason}`;
     case "model_route":
-      return `routeKey=${ev.routeKey} model=${ev.model} policy=${ev.policy}${ev.explored ? " explored" : ""} reason=${ev.reason}`;
+      // 0.6.0 (design §8.1) — the additive routing attribution renders as
+      // optional suffixes AFTER the 0.5.x fields, so an unenriched decision
+      // prints exactly as before.
+      return `routeKey=${ev.routeKey} model=${ev.model} policy=${ev.policy}${ev.explored ? " explored" : ""}${
+        ev.specModel !== undefined ? ` spec=${ev.specModel}` : ""
+      }${ev.profile !== undefined ? ` profile=${ev.profile}` : ""}${
+        ev.stage !== undefined ? ` stage=${ev.stage}` : ""
+      }${ev.strategy !== undefined ? ` strategy=${ev.strategy}` : ""}${
+        ev.scope !== undefined ? ` scope=${ev.scope}` : ""
+      }${ev.ruleId !== undefined ? ` rule=${ev.ruleId}` : ""}${
+        ev.hint !== undefined ? ` hint=${ev.hint.source}` : ""
+      }${ev.eligible !== undefined ? ` eligible=${ev.eligible.join(",")}` : ""}${
+        ev.classifierVerdict !== undefined ? ` label=${ev.classifierVerdict.label}` : ""
+      } reason=${ev.reason}`;
+    case "model_stage":
+      return `stage=${ev.stage} strategy=${ev.strategy} role=${ev.role} model=${ev.model}${
+        ev.profile !== undefined ? ` profile=${ev.profile}` : ""
+      } outcome=${ev.outcome}${ev.cause !== undefined ? ` cause=${ev.cause}` : ""}${
+        ev.costUsdMicros !== undefined ? ` micros=${ev.costUsdMicros}` : ""
+      }`;
+    case "model_directive":
+      return `source=${ev.source} requested=${ev.requested}${
+        ev.resolved !== undefined ? ` resolved=${ev.resolved}` : ""
+      } accepted=${ev.accepted}${ev.reason !== undefined ? ` reason=${ev.reason}` : ""}`;
     case "janitor_action":
       return `step=${ev.step} status=${ev.status}${ev.count !== undefined ? ` count=${ev.count}` : ""}${
         ev.detail ? ` detail=${ev.detail}` : ""
@@ -140,10 +191,18 @@ function formatBody(ev: TraceEvent): string {
     case "alert_raised":
       return `metric=${ev.metric} observed=${ev.observed} threshold=${ev.threshold} baseline=${ev.baselineSessions}sess — ${ev.detail}`;
     case "eval_graded":
-      return `grader=${ev.graderType} score=${ev.score.toFixed(2)} threshold=${ev.threshold.toFixed(2)} verdict=${ev.verdict} retry=${ev.retryIndex}`;
+      return `grader=${ev.graderType} score=${ev.score.toFixed(2)} threshold=${ev.threshold.toFixed(2)} verdict=${ev.verdict} retry=${ev.retryIndex}${
+        ev.model !== undefined ? ` model=${ev.model}` : ""
+      }${ev.profile !== undefined ? ` profile=${ev.profile}` : ""}${
+        ev.judgeModel !== undefined ? ` judge=${ev.judgeModel}` : ""
+      }${ev.judgeCostUsdMicros !== undefined ? ` judgeMicros=${ev.judgeCostUsdMicros}` : ""}${
+        ev.escalatedTo !== undefined ? ` escalatedTo=${ev.escalatedTo}` : ""
+      }`;
     case "judge_verdict":
       return `at=${ev.stepOrNode} verdict=${ev.verdict} score=${ev.score.toFixed(2)}${
-        ev.rationale ? ` rationale=${ev.rationale}` : ""
-      }`;
+        ev.judgeModel !== undefined ? ` judge=${ev.judgeModel}` : ""
+      }${ev.panel !== undefined ? ` panel=${ev.panel.join(",")}` : ""}${
+        ev.costUsdMicros !== undefined ? ` micros=${ev.costUsdMicros}` : ""
+      }${ev.rationale ? ` rationale=${ev.rationale}` : ""}`;
   }
 }

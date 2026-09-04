@@ -7,7 +7,11 @@
  * persistence subscriber's de-dupe in runtime-core/observability.ts.
  */
 import { describe, expect, test } from "bun:test";
-import type { PermissionDecisionEvent } from "@crewhaus/trace-event-bus";
+import type {
+  ModelRequestEvent,
+  ModelResponseEvent,
+  PermissionDecisionEvent,
+} from "@crewhaus/trace-event-bus";
 import { SpanTracker } from "./span-tracker";
 import type { OtelSpan } from "./types";
 
@@ -104,6 +108,85 @@ describe("SpanTracker permission_decision de-dupe", () => {
 
     expect(spans).toHaveLength(2);
     expect(spans.map((s) => s.name).sort()).toEqual(["permission.allow", "permission.deny"]);
+  });
+});
+
+describe("SpanTracker model pairing keyed by spanId (0.6.0 §8.4)", () => {
+  const request = (spanId: string, model: string, role?: ModelRequestEvent["role"]) =>
+    ({
+      ...env({ spanId }),
+      kind: "model_request",
+      model,
+      messageCount: 1,
+      toolCount: 0,
+      streaming: false,
+      ...(role !== undefined ? { role } : {}),
+    }) satisfies ModelRequestEvent;
+  const response = (spanId: string, model: string, role?: ModelResponseEvent["role"]) =>
+    ({
+      ...env({ spanId, timestamp: "2026-05-07T12:00:01.000Z" }),
+      kind: "model_response",
+      model,
+      stopReason: "end_turn",
+      usage: { input: 10, output: 5 },
+      durationMs: 1000,
+      ...(role !== undefined ? { role } : {}),
+    }) satisfies ModelResponseEvent;
+  const attr = (span: OtelSpan, key: string) =>
+    span.attributes.find((a) => a.key === key)?.value as { stringValue?: string } | undefined;
+
+  test("a draft and a shadow call in flight together pair request↔response by spanId, not by order", () => {
+    const { tracker, spans } = tracked();
+    const DRAFT = `${"0".repeat(15)}a`;
+    const SHADOW = `${"0".repeat(15)}b`;
+    tracker.ingest(request(DRAFT, "claude-haiku-4-5", "draft"));
+    tracker.ingest(request(SHADOW, "claude-sonnet-5", "shadow"));
+    expect(tracker.inFlightModelCalls()).toBe(2);
+    // The SHADOW response arrives first — the single-slot tracker this
+    // replaced would have paired it with whichever request came last and
+    // dropped the other.
+    tracker.ingest(response(SHADOW, "claude-sonnet-5", "shadow"));
+    tracker.ingest(response(DRAFT, "claude-haiku-4-5", "draft"));
+    expect(spans).toHaveLength(2);
+    expect(tracker.inFlightModelCalls()).toBe(0);
+    const bySpan = new Map(spans.map((s) => [s.spanId, s]));
+    const shadow = bySpan.get(SHADOW);
+    const draft = bySpan.get(DRAFT);
+    expect(shadow?.name).toBe("gen_ai.chat");
+    expect(attr(shadow as OtelSpan, "gen_ai.request.model")?.stringValue).toBe("claude-sonnet-5");
+    expect(attr(shadow as OtelSpan, "crewhaus.model.role")?.stringValue).toBe("shadow");
+    expect(attr(draft as OtelSpan, "gen_ai.request.model")?.stringValue).toBe("claude-haiku-4-5");
+    expect(attr(draft as OtelSpan, "crewhaus.model.role")?.stringValue).toBe("draft");
+  });
+
+  test("a response under a fresh envelope still pairs with the latest in-flight request (LIFO fallback)", () => {
+    const { tracker, spans } = tracked();
+    tracker.ingest(request(`${"0".repeat(15)}a`, "claude-haiku-4-5"));
+    tracker.ingest(response(`${"0".repeat(15)}f`, "claude-haiku-4-5"));
+    expect(spans).toHaveLength(1);
+    expect(tracker.inFlightModelCalls()).toBe(0);
+    // An unattributed pair carries none of the attribution attributes.
+    const keys = spans[0]?.attributes.map((a) => a.key) ?? [];
+    expect(keys).not.toContain("crewhaus.model.role");
+    expect(keys).not.toContain("crewhaus.model.profile");
+    expect(keys).not.toContain("crewhaus.model.stage");
+  });
+
+  test("stream tokens attach to the latest in-flight call; an orphan response emits nothing", () => {
+    const { tracker, spans } = tracked();
+    tracker.ingest(response(`${"0".repeat(15)}9`, "claude-haiku-4-5"));
+    expect(spans).toHaveLength(0);
+    const A = `${"0".repeat(15)}a`;
+    tracker.ingest(request(A, "claude-haiku-4-5"));
+    tracker.ingest({
+      ...env({ spanId: `${"0".repeat(15)}c` }),
+      kind: "model_stream_token",
+      chunkIndex: 0,
+      deltaChars: 3,
+    });
+    tracker.ingest(response(A, "claude-haiku-4-5"));
+    expect(spans).toHaveLength(1);
+    expect(spans[0]?.events).toHaveLength(1);
   });
 });
 

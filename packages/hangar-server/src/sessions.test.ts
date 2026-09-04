@@ -233,7 +233,18 @@ describe("transcript envelope", () => {
             logLine("assistant_message", { content: "it is sunny" }),
             logLine("user_message", { content: "thanks", synthetic: true }),
             logLine("cost_accrual", { provider: "anthropic", modelId: "m", costUsdMicros: 42 }),
-            logLine("model_route", { chosen: "m", reason: "static" }),
+            // The payload runtime-core's pool router actually writes (0.6.0 adds
+            // the derived `signals`); the pre-0.6.0 fixture wrote `{chosen,
+            // reason}`, a shape no publisher ever produced.
+            logLine("model_route", {
+              turnNumber: 1,
+              routeKey: "easy",
+              model: "m",
+              policy: "static",
+              reason: "static: first declared candidate",
+              explored: false,
+              signals: { contextTokens: 12, toolsInPlay: false, turnIndex: 0 },
+            }),
             logLine("user_feedback", feedbackRecord(sess, 1, "up", iso(NOW - DAY))),
             logLine("compaction", { dropped: 3 }),
             logLine("permission", { tool: "fs_read", decision: "allow" }),

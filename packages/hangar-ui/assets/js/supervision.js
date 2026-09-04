@@ -700,6 +700,15 @@ function shortJson(value, max = 120) {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 }
 
+/** `model` first, then the optional facets, then the router's reason — joined with dots. */
+function routeDetail(e, parts) {
+  const head = parts
+    .filter((part) => part !== null && part !== undefined && part !== "")
+    .map(String);
+  const reason = typeof e.reason === "string" && e.reason !== "" ? e.reason : null;
+  return [...head, ...(reason ? [reason] : [])].join(" · ");
+}
+
 /**
  * One TraceEvent → its feed card. Known kinds get a written line; unknown
  * kinds still render (tolerant-reader contract) with a clipped payload
@@ -763,8 +772,68 @@ export function traceCard(event) {
         remediation: typeof e.remediation === "string" ? e.remediation : null,
       };
     case "model_route":
+      // 0.6.0 (design §8.3) — the event carries `model` (wire id) and
+      // `routeKey`, never `modelId`/`band`; the 0.5.x card read the latter
+      // and rendered an empty detail. Profile, policy and reason follow when
+      // present so a hybrid decision reads as a sentence.
+      return {
+        ...base,
+        title: `model route${e.stage ? ` · ${String(e.stage)}` : ""}`,
+        detail: routeDetail(e, [
+          e.model,
+          e.profile ? `profile=${String(e.profile)}` : null,
+          e.routeKey ? `band=${String(e.routeKey)}` : null,
+          e.policy
+            ? `policy=${String(e.policy)}${e.explored === true ? " (exploring)" : ""}`
+            : null,
+          e.ruleId ? `rule=${String(e.ruleId)}` : null,
+        ]),
+      };
     case "model_tier_route":
-      return { ...base, title: "model route", detail: String(e.modelId ?? e.band ?? "") };
+      return {
+        ...base,
+        title: "model tier",
+        detail: routeDetail(e, [
+          e.model,
+          e.tier ? `tier=${String(e.tier)}${e.escalated === true ? " (escalated)" : ""}` : null,
+        ]),
+      };
+    case "model_failover":
+      return {
+        ...base,
+        title: "model failover",
+        detail: `${String(e.from ?? "?")} → ${String(e.to ?? "?")}${
+          e.reason ? ` · ${String(e.reason)}` : ""
+        }`,
+      };
+    case "model_stage":
+      return {
+        ...base,
+        dot: e.outcome === "failed" ? "warn" : base.dot,
+        title: `stage ${String(e.stage ?? "?")} ${String(e.outcome ?? "")}`.trim(),
+        detail: [
+          e.model ? String(e.model) : null,
+          e.profile ? `profile=${String(e.profile)}` : null,
+          e.role ? `role=${String(e.role)}` : null,
+          e.strategy ? `strategy=${String(e.strategy)}` : null,
+          e.cause ? `cause=${String(e.cause)}` : null,
+        ]
+          .filter((part) => part !== null)
+          .join(" · "),
+      };
+    case "model_directive":
+      return {
+        ...base,
+        dot: e.accepted === false ? "warn" : base.dot,
+        title: `/model ${String(e.requested ?? "?")} ${e.accepted === false ? "refused" : "accepted"}`,
+        detail: [
+          e.resolved ? `→ ${String(e.resolved)}` : null,
+          e.source ? `source=${String(e.source)}` : null,
+          e.reason ? String(e.reason) : null,
+        ]
+          .filter((part) => part !== null)
+          .join(" · "),
+      };
     case "janitor_action":
       return { ...base, title: "janitor", detail: String(e.action ?? "") };
     default:
