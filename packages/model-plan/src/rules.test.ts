@@ -97,7 +97,21 @@ describe("evaluateRules", () => {
     ]);
   });
 
-  test("guard 2 — the text is length-capped before matching", () => {
+  test("guard 1 — a polynomial pattern is rejected before it runs; an accepted one completes on 1024 adversarial chars", () => {
+    const rules: RouteRule[] = [
+      { id: "poly", when: { message_matches: "^.*a.*a.*X$" }, use: "strong" },
+      { id: "ok", when: { message_matches: ".*X" }, use: "cheap" },
+    ];
+    // Assert on the verdict, never on timing: the adversarial text has no X,
+    // so the one accepted wildcard must run to a clean miss.
+    const miss = evaluateRules(rules, { ...BASE, userText: "a".repeat(1024) });
+    expect(miss.match).toBeUndefined();
+    expect(miss.skipped).toEqual([{ ruleId: "poly", reason: "rule_skipped:invalid-regex" }]);
+    const hit = evaluateRules(rules, { ...BASE, userText: `${"a".repeat(1000)}X` });
+    expect(hit.match?.ruleId).toBe("ok");
+  });
+
+  test("guard 2 — the text is length-capped before matching (default 1024)", () => {
     const rules: RouteRule[] = [
       { id: "tail", when: { message_matches: "NEEDLE$" }, use: "strong" },
     ];
@@ -106,6 +120,10 @@ describe("evaluateRules", () => {
     expect(
       evaluateRules(rules, { ...BASE, userText: text }, { maxTextChars: 50 }).match,
     ).toBeUndefined();
+    // The default cap: a needle ending exactly at 1024 is seen, one past it is cut.
+    const fits = `${"x".repeat(1024 - "NEEDLE".length)}NEEDLE`;
+    expect(evaluateRules(rules, { ...BASE, userText: fits }).match?.ruleId).toBe("tail");
+    expect(evaluateRules(rules, { ...BASE, userText: `x${fits}` }).match).toBeUndefined();
   });
 
   test("guard 3 — once the time budget is spent, later text rules are skipped (injected clock)", () => {
@@ -136,6 +154,37 @@ describe("validateRuleRegex", () => {
     expect(validateRuleRegex("(a+)?b")).toBeUndefined();
     expect(validateRuleRegex("[+*]+")).toBeUndefined();
     expect(validateRuleRegex("a\\++")).toBeUndefined();
+  });
+
+  test("accepts one unbounded quantifier alongside bounded ones, lazy modifiers and exact counts", () => {
+    expect(validateRuleRegex("\\berror\\b.*\\bstack\\b")).toBeUndefined();
+    expect(validateRuleRegex("https?://\\S+")).toBeUndefined();
+    expect(validateRuleRegex("\\d{3}-\\d{4}")).toBeUndefined();
+    expect(validateRuleRegex("a+?b")).toBeUndefined();
+    expect(validateRuleRegex("colou?r|flavou?r|neighbou?r")).toBeUndefined();
+    // A `{` that is not a well-formed quantifier is a literal, as it is to the engine.
+    expect(validateRuleRegex("a{b.*")).toBeUndefined();
+    // Exactly the cap: 12 optional groups, and lazy `??` does not count twice.
+    expect(validateRuleRegex(`${"(?:a|b)?".repeat(12)}c`)).toBeUndefined();
+    expect(validateRuleRegex(`${"(?:a|b)??".repeat(12)}c`)).toBeUndefined();
+  });
+
+  test("rejects two or more unbounded quantifiers — the polynomial shape, wildcard or not", () => {
+    expect(validateRuleRegex("^.*a.*X$")).toMatch(/2 unbounded quantifiers/);
+    expect(validateRuleRegex("^.*a.*a.*a.*X$")).toMatch(/4 unbounded quantifiers/);
+    expect(validateRuleRegex("a+a+a+X")).toMatch(/unbounded quantifiers/);
+    expect(validateRuleRegex("a+.*X")).toMatch(/unbounded quantifiers/);
+    expect(validateRuleRegex("[ab]+b+X")).toMatch(/unbounded quantifiers/);
+    expect(validateRuleRegex(".{0,600}.{0,600}X")).toMatch(/unbounded quantifiers/);
+    expect(validateRuleRegex("\\w{2,}\\s*")).toMatch(/unbounded quantifiers/);
+    // A documented false rejection: disjoint atoms would have been linear,
+    // but the validator does not do overlap analysis.
+    expect(validateRuleRegex("\\w+\\s+\\w+")).toMatch(/unbounded quantifiers/);
+  });
+
+  test("rejects more than 12 quantifiers of any kind — the optional-chain shape", () => {
+    expect(validateRuleRegex(`${"(?:a|b)?".repeat(13)}c`)).toMatch(/13 quantifiers — at most 12/);
+    expect(validateRuleRegex(`${"a?".repeat(20)}a{20}`)).toMatch(/quantifiers — at most 12/);
   });
 
   test("rejects nested quantifiers and alternation under a quantifier", () => {

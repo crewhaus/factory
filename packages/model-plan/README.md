@@ -49,11 +49,14 @@ enforces, so the subset holds in execution, not only in the advertisement.
 ## Routing
 
 - `evaluateRules(rules, signals)` — first-match rule routing over
-  `RouteSignals`, with three guards on `message_matches`: nested
-  quantifiers are rejected at validation (`validateRuleRegex`), the text is
-  length-capped, and a per-turn time budget skips later text rules with a
-  `rule_skipped` reason. `deriveSignalRecord` is the persistable
-  projection — derived values only, never the user's text.
+  `RouteSignals`, with three guards on `message_matches`: validation
+  (`validateRuleRegex`) rejects nested quantifiers, more than one unbounded
+  quantifier (`.*a.*X` and `a+a+X` backtrack polynomially) and more than 12
+  quantifiers of any kind; the text is length-capped at 1024 characters, so
+  the worst accepted pattern is quadratic over the cap; and a per-turn time
+  budget skips later text rules with a `rule_skipped` reason.
+  `deriveSignalRecord` is the persistable projection — derived values only,
+  never the user's text.
 - `parseModelDirective("/model fast", roster)` — the per-message steering
   token, allow-list validated against the roster; a miss is refused with the
   roster listed.
