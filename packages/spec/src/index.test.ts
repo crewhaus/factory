@@ -1750,6 +1750,48 @@ describe("run-level budget cap block (item 27)", () => {
     expect(() => parseSpec(cli("budget:\n  usd: 1\n  on_exceed:\n    action: degrade"))).toThrow();
   });
 
+  // 0.6.0 §7.12 — `budget.scope: run | session`.
+  test("parses budget.scope (run | session); absent stays absent on the parsed spec", () => {
+    const session = parseSpec(cli("budget:\n  usd: 1\n  scope: session"));
+    if (session.target !== "cli") throw new Error("unexpected target");
+    expect(session.budget?.scope).toBe("session");
+    const run = parseSpec(cli("budget:\n  usd: 1\n  scope: run"));
+    if (run.target !== "cli") throw new Error("unexpected target");
+    expect(run.budget?.scope).toBe("run");
+    // No zod default: a pre-0.6.0 spec parses to the same object as before.
+    const absent = parseSpec(cli("budget:\n  usd: 1"));
+    if (absent.target !== "cli") throw new Error("unexpected target");
+    expect("scope" in (absent.budget ?? {})).toBe(false);
+    expect(absent.budget).toEqual({ usd: 1, on_exceed: { action: "stop" } });
+  });
+
+  test("rejects an unknown budget.scope", () => {
+    expect(() => parseSpec(cli("budget:\n  usd: 1\n  scope: turn"))).toThrow();
+  });
+
+  test("budget.scope parses on every budget-carrying shape (channel + managed daemons are its point)", () => {
+    const channel = parseSpec(
+      [
+        "name: ch",
+        "target: channel",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "channels:",
+        "  slack:",
+        "    botToken: $SLACK_BOT_TOKEN",
+        "    signingSecret: $SLACK_SIGNING_SECRET",
+        "routing:",
+        "  sessionKey: thread",
+        "budget:",
+        "  usd: 2",
+        "  scope: session",
+      ].join("\n"),
+    );
+    if (channel.target !== "channel") throw new Error("unexpected target");
+    expect(channel.budget?.scope).toBe("session");
+  });
+
   // Loop contract 0.4 (Batch A) — budget joined workflow/graph/crew/research/
   // batch/browser, so the strict-rejection canary moved to voice (still
   // outside the budget-carrying set).

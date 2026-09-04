@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type Anthropic from "@anthropic-ai/sdk";
-import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
+import type { ProviderAdapter, ProviderRequest, StreamEvent } from "@crewhaus/adapter-anthropic";
 import type {
   CrewMailbox,
   RuntimeBridge,
@@ -22,6 +22,7 @@ import {
   HandoffRefusedError,
   type RoleDefinition,
   type RunOptions,
+  composeAdapterSeams,
   composeLoopTuning,
 } from "./index.js";
 
@@ -1012,6 +1013,86 @@ describe("composeLoopTuning (loop contract 0.4)", () => {
     );
     expect(tuned).toEqual({ maxToolIterations: 3 });
   });
+
+  // 0.6.0 PR 3 (design §7.7) — the per-role routing quartet target-crew has
+  // emitted onto the role literal since 0.4 now reaches the fragment 1:1.
+  // Before this, `RoleDefinition` had no such fields and the emitted config
+  // was dead: every role turn ran on `model` alone.
+  test("forwards the per-role routing quartet 1:1 (0.6.0 PR 3)", () => {
+    const def: RoleDefinition = {
+      model: "claude-sonnet-4-6",
+      instructions: "i",
+      modelFallbacks: ["openai/gpt-4o-mini", "groq/llama-3.3-70b"],
+      circuitBreaker: { failureThreshold: 3, windowMs: 30_000, cooldownMs: 60_000 },
+      modelTiers: { fast: "claude-haiku-4-5", default: "claude-sonnet-4-6" },
+      modelPool: {
+        candidates: [
+          { model: "claude-haiku-4-5", tags: ["cheap"] },
+          { model: "claude-opus-4-8", tags: ["strong"] },
+        ],
+        policy: "learned",
+        learning: { seed: "fixed", minSamplesPerArm: 2 },
+      },
+    };
+    expect(composeLoopTuning(def, {})).toEqual({
+      modelFallbacks: ["openai/gpt-4o-mini", "groq/llama-3.3-70b"],
+      circuitBreaker: { failureThreshold: 3, windowMs: 30_000, cooldownMs: 60_000 },
+      modelTiers: { fast: "claude-haiku-4-5", default: "claude-sonnet-4-6" },
+      modelPool: {
+        candidates: [
+          { model: "claude-haiku-4-5", tags: ["cheap"] },
+          { model: "claude-opus-4-8", tags: ["strong"] },
+        ],
+        policy: "learned",
+        learning: { seed: "fixed", minSamplesPerArm: 2 },
+      },
+    });
+    // Presence-gated: a role declaring only a pool hands the runtime ONLY a
+    // pool — no `undefined`-valued keys that would read as "declared".
+    expect(
+      Object.keys(
+        composeLoopTuning({ model: "m", instructions: "i", modelPool: def.modelPool }, {}),
+      ),
+    ).toEqual(["modelPool"]);
+  });
+});
+
+describe("composeAdapterSeams (0.6.0 PR 3)", () => {
+  const adapter = makeProgrammableAdapter(() => [{ type: "text", text: "x" }]);
+  const scoreboard: NonNullable<RunOptions["_scoreboard"]> = {
+    path: "<memory>",
+    score: () => undefined,
+    record: () => {},
+    snapshot: () => [],
+    compact: () => {},
+  };
+
+  test("forwards every injected seam and nothing else", () => {
+    const failover = new Map([["openai/gpt-4o-mini", adapter]]);
+    const tiers = new Map([["claude-haiku-4-5", adapter]]);
+    const pool = new Map([["claude-opus-4-8", adapter]]);
+    expect(
+      composeAdapterSeams({
+        _adapter: adapter,
+        _failoverAdapters: failover,
+        _tierAdapters: tiers,
+        _poolAdapters: pool,
+        _scoreboard: scoreboard,
+        maxActivations: 3,
+      }),
+    ).toEqual({
+      _adapter: adapter,
+      _failoverAdapters: failover,
+      _tierAdapters: tiers,
+      _poolAdapters: pool,
+      _scoreboard: scoreboard,
+    });
+  });
+
+  test("a production run (no injection) contributes no `_` keys at all", () => {
+    expect(composeAdapterSeams({})).toEqual({});
+    expect(composeAdapterSeams({ _adapter: adapter })).toEqual({ _adapter: adapter });
+  });
 });
 
 describe("sub-agent forwarding to the role bridge (Section 13, G34)", () => {
@@ -1297,6 +1378,327 @@ describe("headless ask parking (loop contract 0.4, G11)", () => {
       // supplied. Blaming `ask_mode: "deny"` (rather than "no approvals store
       // wired") is the only observable proof the store arrived under deny.
       expect(toolResults.join("\n")).toContain('ask_mode: "deny"');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 PR 3 (design §7.7, sanctioned behaviour change §14(1)) — per-role
+// model routing reaches the role loop. Drives the ORCHESTRATOR (not
+// runtime-core in isolation) with the same injection seams runtime-core's own
+// pool tests use, and reads the durable `model_route` line back from the
+// crew's shared session JSONL — the same line `crewhaus route explain`
+// consumes — so the proof is "a role turn published a routing decision", not
+// "an option was set".
+// ---------------------------------------------------------------------------
+
+const HAIKU = "claude-haiku-4-5";
+const OPUS = "claude-opus-4-8";
+
+/** Text-only adapter that counts how often the loop streamed through it. */
+function servingAdapter(text: string): ProviderAdapter & { calls: () => number } {
+  let n = 0;
+  const inner = makeProgrammableAdapter(() => [{ type: "text", text }]);
+  return {
+    ...inner,
+    calls: () => n,
+    stream: (req: ProviderRequest) => {
+      n += 1;
+      return inner.stream(req);
+    },
+  };
+}
+
+/**
+ * Primary that fails with a max_output_tokens-shaped error while `down()` —
+ * the class recovery-engine re-calls without backoff, so a
+ * `failureThreshold: 1` breaker reroutes the SAME turn onto the failover
+ * chain (mirrors runtime-core's failover.test.ts `failingAdapter`).
+ */
+function failingAdapter(down: () => boolean): ProviderAdapter & { calls: () => number } {
+  let n = 0;
+  const inner = makeProgrammableAdapter(() => [{ type: "text", text: "primary recovered" }]);
+  return {
+    ...inner,
+    calls: () => n,
+    stream: (req: ProviderRequest) => {
+      n += 1;
+      return (async function* () {
+        if (down()) {
+          const err = new Error("scripted primary outage") as Error & { error: { type: string } };
+          err.error = { type: "max_output_tokens" };
+          throw err;
+        }
+        yield* inner.stream(req);
+      })();
+    },
+  };
+}
+
+type LoggedLine = { kind: string; payload: Record<string, unknown> };
+
+/** Every line of every session JSONL under `root` (the crew writes one). */
+function readSessionLines(root: string): LoggedLine[] {
+  const out: LoggedLine[] = [];
+  for (const name of readdirSync(root)) {
+    if (!name.endsWith(".jsonl")) continue;
+    for (const raw of readFileSync(join(root, name), "utf8").split("\n")) {
+      if (raw.trim().length === 0) continue;
+      out.push(JSON.parse(raw) as LoggedLine);
+    }
+  }
+  return out;
+}
+
+/** In-memory Scoreboard: records every fold so a test can assert the served arm. */
+function memoryScoreboard(): NonNullable<RunOptions["_scoreboard"]> & {
+  records: Array<{ routeKey: string; model: string; reward: number }>;
+} {
+  const records: Array<{ routeKey: string; model: string; reward: number }> = [];
+  return {
+    records,
+    path: "<memory>",
+    score: () => undefined,
+    record: (routeKey, model, reward) => {
+      records.push({ routeKey, model, reward });
+    },
+    snapshot: () => [],
+    compact: () => {},
+  };
+}
+
+const POOL: NonNullable<RoleDefinition["modelPool"]> = {
+  candidates: [
+    { model: HAIKU, tags: ["cheap"] },
+    { model: OPUS, tags: ["strong"] },
+  ],
+  policy: "heuristic",
+};
+
+describe("per-role model routing reaches the role loop (0.6.0 PR 3, §7.7)", () => {
+  test("a role's modelPool routes its PRIMARY activation and publishes model_route", async () => {
+    const root = newTempRoot();
+    try {
+      const primary = servingAdapter("primary served");
+      const cheap = servingAdapter("cheap served");
+      const strong = servingAdapter("strong served");
+      const scoreboard = memoryScoreboard();
+
+      const crew = Crew()
+        .setName("pooled-solo")
+        .addRole("solo", { model: "claude-sonnet-4-6", instructions: "Solo.", modelPool: POOL })
+        .setEntry("solo")
+        .compile();
+
+      const events = await collect(
+        crew.run("hello", {
+          sessionRootDir: root,
+          _adapter: primary,
+          _poolAdapters: new Map([
+            [HAIKU, cheap],
+            [OPUS, strong],
+          ]),
+          _scoreboard: scoreboard,
+          maxActivations: 2,
+        }),
+      );
+
+      // The first turn is a "hard" band (task framing) → the strong-tagged
+      // candidate served; the boot-time primary never streamed.
+      const done = events[events.length - 1];
+      expect(done?.kind).toBe("crew_done");
+      if (done?.kind !== "crew_done") throw new Error("crew_done missing");
+      expect(done.finalOutput).toBe("strong served");
+      expect(strong.calls()).toBe(1);
+      expect(cheap.calls()).toBe(0);
+      expect(primary.calls()).toBe(0);
+
+      // The decision is durable on the crew session — what `route explain` reads.
+      const routes = readSessionLines(root).filter((l) => l.kind === "model_route");
+      expect(routes).toHaveLength(1);
+      expect(routes[0]?.payload).toMatchObject({
+        model: OPUS,
+        policy: "heuristic",
+        routeKey: "hard",
+        explored: false,
+      });
+      expect(typeof routes[0]?.payload["policyVersion"]).toBe("string");
+
+      // …and the outcome was folded into the injected scoreboard for that arm.
+      expect(scoreboard.records).toHaveLength(1);
+      expect(scoreboard.records[0]).toMatchObject({ routeKey: "hard", model: OPUS });
+      expect(scoreboard.records[0]?.reward).toBeGreaterThan(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a role's modelPool routes its inline A2A PEER turn too (both call sites)", async () => {
+    const root = newTempRoot();
+    try {
+      // critic: un-pooled, runs on the boot primary; asks researcher via SendMessage.
+      const primary = makeProgrammableAdapter(({ previousToolResults }) => {
+        if (previousToolResults.length > 0) {
+          return [{ type: "text", text: `Final critique: ${previousToolResults[0]}` }];
+        }
+        return [
+          {
+            type: "tool_use",
+            id: "tool_1",
+            name: "SendMessage",
+            input: { target: "researcher", payload: "where did the data come from?" },
+          },
+        ];
+      });
+      // researcher: pooled — its peer turn must route through the pool, not `_adapter`.
+      const cheap = servingAdapter("cheap peer");
+      const strong = servingAdapter("strong peer");
+      const scoreboard = memoryScoreboard();
+
+      const crew = Crew()
+        .setName("pooled-peer")
+        .addRole("critic", { model: "claude-sonnet-4-6", instructions: "Critic." })
+        .addRole("researcher", {
+          model: "claude-sonnet-4-6",
+          instructions: "Researcher.",
+          modelPool: POOL,
+        })
+        .setEntry("critic")
+        .compile();
+
+      const events = await collect(
+        crew.run("review the post", {
+          sessionRootDir: root,
+          _adapter: primary,
+          _poolAdapters: new Map([
+            [HAIKU, cheap],
+            [OPUS, strong],
+          ]),
+          _scoreboard: scoreboard,
+          maxActivations: 2,
+        }),
+      );
+
+      expect(events.some((e) => e.kind === "a2a_message")).toBe(true);
+      const done = events[events.length - 1];
+      expect(done?.kind).toBe("crew_done");
+      if (done?.kind !== "crew_done") throw new Error("crew_done missing");
+      // The critic's final text quotes the peer reply that came off the pool.
+      expect(done.finalOutput).toBe("Final critique: strong peer");
+      expect(strong.calls()).toBe(1);
+      expect(cheap.calls()).toBe(0);
+
+      // Exactly ONE routed turn in the whole crew: the peer's. The critic's
+      // two model calls (tool_use, then the final text) are un-pooled.
+      const routes = readSessionLines(root).filter((l) => l.kind === "model_route");
+      expect(routes).toHaveLength(1);
+      expect(routes[0]?.payload).toMatchObject({ model: OPUS, policy: "heuristic" });
+      expect(scoreboard.records.map((r) => r.model)).toEqual([OPUS]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a role's modelTiers picks the tier adapter for its turn", async () => {
+    const root = newTempRoot();
+    try {
+      const primary = servingAdapter("primary served");
+      const fast = servingAdapter("fast served");
+      const dflt = servingAdapter("default served");
+
+      const crew = Crew()
+        .setName("tiered-solo")
+        .addRole("solo", {
+          model: "claude-sonnet-4-6",
+          instructions: "Solo.",
+          modelTiers: { fast: HAIKU, default: OPUS },
+        })
+        .setEntry("solo")
+        .compile();
+
+      const events = await collect(
+        crew.run("hello", {
+          sessionRootDir: root,
+          _adapter: primary,
+          _tierAdapters: new Map([
+            [HAIKU, fast],
+            [OPUS, dflt],
+          ]),
+          maxActivations: 2,
+        }),
+      );
+
+      // First turn → `default` tier (task framing), served by the tier adapter.
+      const done = events[events.length - 1];
+      if (done?.kind !== "crew_done") throw new Error("crew_done missing");
+      expect(done.finalOutput).toBe("default served");
+      expect(dflt.calls()).toBe(1);
+      expect(fast.calls()).toBe(0);
+      expect(primary.calls()).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a role's modelFallbacks + circuitBreaker fail the turn over to the fallback", async () => {
+    const root = newTempRoot();
+    const stderrWrite = process.stderr.write.bind(process.stderr);
+    // The chain prints a `[failover]` stderr note; keep the test output clean.
+    process.stderr.write = (() => true) as typeof process.stderr.write;
+    try {
+      const primary = failingAdapter(() => true);
+      const fallback = servingAdapter("fallback served");
+
+      const crew = Crew()
+        .setName("failover-solo")
+        .addRole("solo", {
+          model: "claude-sonnet-4-6",
+          instructions: "Solo.",
+          modelFallbacks: ["openai/gpt-4o-mini"],
+          circuitBreaker: { failureThreshold: 1, cooldownMs: 60_000 },
+        })
+        .setEntry("solo")
+        .compile();
+
+      const events = await collect(
+        crew.run("hello", {
+          sessionRootDir: root,
+          _adapter: primary,
+          _failoverAdapters: new Map([["openai/gpt-4o-mini", fallback]]),
+          maxActivations: 2,
+        }),
+      );
+
+      const done = events[events.length - 1];
+      if (done?.kind !== "crew_done") throw new Error("crew_done missing");
+      expect(done.finalOutput).toBe("fallback served");
+      expect(primary.calls()).toBe(1);
+      expect(fallback.calls()).toBe(1);
+    } finally {
+      process.stderr.write = stderrWrite;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a role WITHOUT routing publishes no model_route and streams the primary (byte-identical path)", async () => {
+    const root = newTempRoot();
+    try {
+      const primary = servingAdapter("primary served");
+      const crew = Crew()
+        .setName("plain-solo")
+        .addRole("solo", { model: "claude-sonnet-4-6", instructions: "Solo." })
+        .setEntry("solo")
+        .compile();
+      const events = await collect(
+        crew.run("hello", { sessionRootDir: root, _adapter: primary, maxActivations: 2 }),
+      );
+      const done = events[events.length - 1];
+      if (done?.kind !== "crew_done") throw new Error("crew_done missing");
+      expect(done.finalOutput).toBe("primary served");
+      expect(primary.calls()).toBe(1);
+      expect(readSessionLines(root).some((l) => l.kind === "model_route")).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

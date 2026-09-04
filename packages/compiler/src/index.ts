@@ -166,7 +166,7 @@ export type CompileOptions = {
  * compile diagnostic. `code` is a stable machine key
  * (`"accepted-but-unwired"`, `"edge-unsafe-tool"`,
  * `"channel-reactions-join"`, `"cli-autodistill-toolchain"`,
- * `"managed-feedback-unsupported"`), `path` the spec
+ * `"managed-feedback-unsupported"`, `"budget-degrade-outside-pool"`), `path` the spec
  * key it concerns (dot-joined),
  * `message` the human explanation. Additive: every existing `compile()`
  * consumer that only reads `.files` keeps working unchanged.
@@ -266,8 +266,15 @@ export function compile(yamlText: string, opts: CompileOptions = {}): CompileRes
  * `thredz.messaging` (G44) a sub-key of the `thredz` block; both are nested
  * paths the top-level-only mechanism does not track, and both are wired this
  * batch regardless. Item 9's per-role/step `model_pool`/`model_tiers`/
- * `model_fallbacks` are nested under `roles`/`steps` and wired at lower time,
- * so they carry no row either.
+ * `model_fallbacks` are nested under `roles`/`steps`, so the top-level-only
+ * mechanism cannot carry a row for them. They lower onto `IrWorkflowStep` /
+ * `IrCrewRole` and are emit-wired: per step since 0.4 (target-workflow spreads
+ * them into the step's `runChatLoop`), per role since 0.6.0 — target-crew has
+ * rendered them onto the role's `RoleDefinition` literal since 0.4, but
+ * `@crewhaus/crew-orchestrator` only gained the fields and started forwarding
+ * them into each role turn in 0.6.0 (PR 3), so on 0.4–0.5 bundles the role's
+ * routing was emitted-but-dead config. Lowering alone never wires anything;
+ * the consumer does.
  */
 type UnwiredKey = {
   readonly path: string;
@@ -471,7 +478,61 @@ function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning> {
       });
     }
   }
+  // 0.6.0 §7.12 — `budget.on_exceed.degrade.model` outside the `model_pool`
+  // roster. No refine forbids `budget` beside `model_pool` (the mutual-
+  // exclusion refine sees only the `agent` sub-object; `budget` is a
+  // top-level sibling), and such specs parse, compile and run today — so
+  // this is a WARNING, never a parse error. The runtime pre-resolves the
+  // degrade model as one extra, always-eligible pool rung and forces it on a
+  // breach (`model_route` policy `forced`, reason `budget_degrade`). This
+  // code is NOT in the `compile --strict` failure class: strict fails only
+  // the tool-scope audit, and a deliberate off-roster cheap rung is a valid
+  // configuration the author may want.
+  const degradeOutsidePool = budgetDegradeOutsidePool(spec);
+  if (degradeOutsidePool !== undefined) {
+    out.push({
+      code: "budget-degrade-outside-pool",
+      path: "budget.on_exceed.model",
+      message: [
+        `budget.on_exceed.model "${degradeOutsidePool.model}" is not one of the agent.model_pool`,
+        `candidates (${degradeOutsidePool.roster.join(", ")}) — on a budget breach the runtime`,
+        "forces this model as an EXTRA pool rung (routing restricted to it), outside the pool's",
+        "declared roster and its learned arms. Add it to model_pool.candidates to make the rung",
+        "part of the roster, or point degrade.model at an existing candidate.",
+      ].join(" "),
+    });
+  }
   return out;
+}
+
+/**
+ * 0.6.0 §7.12 — the `budget.on_exceed: degrade` model vs. the pool roster.
+ * Returns the offending model + roster when a spec declares BOTH a degrade
+ * ladder and an `agent.model_pool` whose candidates do not include the
+ * degrade model; `undefined` otherwise (no budget, `stop`, no pool, or a
+ * roster member). Structural read over the union so every pool-carrying
+ * shape (cli / channel / managed / research / batch / browser) is covered.
+ */
+function budgetDegradeOutsidePool(
+  spec: Spec,
+): { readonly model: string; readonly roster: readonly string[] } | undefined {
+  const view = spec as unknown as {
+    readonly budget?: {
+      readonly on_exceed?: { readonly action: string; readonly model?: string };
+    };
+    readonly agent?: {
+      readonly model_pool?: { readonly candidates?: ReadonlyArray<{ readonly model: string }> };
+    };
+  };
+  const onExceed = view.budget?.on_exceed;
+  if (onExceed === undefined || onExceed.action !== "degrade" || onExceed.model === undefined) {
+    return undefined;
+  }
+  const candidates = view.agent?.model_pool?.candidates;
+  if (candidates === undefined) return undefined;
+  const roster = candidates.map((c) => c.model);
+  if (roster.includes(onExceed.model)) return undefined;
+  return { model: onExceed.model, roster };
 }
 
 /**
@@ -1162,6 +1223,7 @@ type SpecWithBudget = {
     readonly on_exceed:
       | { readonly action: "stop" }
       | { readonly action: "degrade"; readonly model: string };
+    readonly scope?: "run" | "session";
   };
 };
 
@@ -1173,7 +1235,10 @@ function lowerBudget(spec: SpecWithBudget): { budget?: IrBudget } {
     b.on_exceed.action === "degrade"
       ? { kind: "degrade", model: b.on_exceed.model }
       : { kind: "stop" };
-  return { budget: { usdMicros, onExceed } };
+  // 0.6.0 §7.12 — `scope` is spread ONLY when declared: every emitter writes
+  // `JSON.stringify(ir.budget)` verbatim, so an absent key keeps pre-0.6.0
+  // bundles byte-identical while the runtime defaults to `run`.
+  return { budget: { usdMicros, onExceed, ...(b.scope !== undefined ? { scope: b.scope } : {}) } };
 }
 
 /**
