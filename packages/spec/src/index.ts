@@ -574,8 +574,11 @@ const failureTaxonomyBlock = z.array(failureTaxonomyEntrySchema).optional();
  *     `crewhaus_budget` failure (the REPL's pre-turn check still ends an
  *     idle run cleanly before the next turn opens).
  *   - `{ action: "degrade", model }` — re-resolve the primary model to the
- *     cheaper `model` (one rung) and continue; a later breach on the
- *     degraded model stops the run. Under a `model_pool` the rung does not
+ *     cheaper `model` (one rung) and continue: the rung serves every
+ *     remaining model call of the turn in which the degrade fired (a
+ *     mid-turn degrade finishes its tool loop; a single-turn host gets one
+ *     complete degraded reply), and the run ends cleanly at the next turn
+ *     boundary. Under a `model_pool` the rung does not
  *     swap the adapter: it becomes the FORCED pool candidate (`model_route`
  *     policy `forced`, reason `budget_degrade`). A `model` outside the pool
  *     roster is a compile WARNING (`budget-degrade-outside-pool`) plus an

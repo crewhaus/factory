@@ -7,7 +7,9 @@
  *                            turn runs (the in-flight turn always completes).
  *   - `on_exceed: degrade` → the primary model is re-resolved to the cheaper
  *                            rung once (a `model_failover` reason
- *                            `budget_degrade`), and a later breach stops.
+ *                            `budget_degrade`); the rung serves the rest of
+ *                            the turn it fired in, and the run stops at the
+ *                            next turn boundary.
  *
  * These drive the real loop with a scripted-adapter primary whose usage is
  * priced by cost-tracker's real DEFAULT_PRICING table, and feed input over
@@ -477,6 +479,101 @@ describe("runChatLoop — per-model-call budget gate (0.6.0 §7.12, sanctioned c
     // The turn never completed (no turn_end) — the loop was severed at the
     // request boundary before its 4th model call.
     expect(seen.filter((e) => e.kind === "turn_end")).toHaveLength(0);
+  });
+});
+
+describe("runChatLoop — degrade mid-turn: the rung serves the rest of the turn (0.6.0 §7.12)", () => {
+  // Sonnet 450/call, haiku rung 150/call, cap 1000. Calls 1–3 on sonnet
+  // (450, 900, 1350); the gate before call 4 reads 1350 ≥ 1000 and degrades.
+  // The second breach is defined at a TURN boundary, not an accrual
+  // boundary: every remaining call of the turn in which the degrade fired is
+  // the rung's, however far past the cap it accrues. (Under the accrual
+  // definition the rung's first priced response tripped the gate before
+  // call 5 and severed the turn — degrade collapsed to one call, then the
+  // classified stop, indistinguishable from `stop` on any tool-using turn.)
+  test("singleTurn: a tool loop that degrades mid-turn finishes on the rung — turn_end published, no run_failed", async () => {
+    const primary = scriptedToolLoopAdapter("anthropic", USAGE, []); // always tool_use
+    const rung = scriptedToolLoopAdapter("anthropic", USAGE, ["tool", "text"]);
+    const runContext = createRunContext();
+    const seen: TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => {
+      seen.push(e);
+    });
+    const stderr = captureStderr();
+    let text: string;
+    try {
+      text = await runChatLoop({
+        model: SONNET,
+        instructions: "test",
+        _adapter: primary,
+        _budgetDegradeAdapter: rung,
+        tools: [noopTool()],
+        permissionMode: "bypass",
+        budget: { usdMicros: 1000, onExceed: { kind: "degrade", model: HAIKU } },
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "loop until told to stop" }],
+        installSigintHandler: false,
+        spinner: false,
+        runContext,
+      });
+    } finally {
+      stderr.restore();
+    }
+    expect(text).toBe("done");
+    // Three primary calls, then EVERY remaining call of the turn on the rung
+    // (call 4 tool_use at 1500 ≥ cap, call 5 the text at 1650 ≥ cap).
+    expect(primary.requests).toHaveLength(3);
+    expect(rung.requests).toHaveLength(2);
+    const responses = seen.filter((e): e is ModelResponseEvent => e.kind === "model_response");
+    expect(responses.map((r) => r.model)).toEqual([SONNET, SONNET, SONNET, HAIKU, HAIKU]);
+    const failovers = seen.filter((e): e is ModelFailoverEvent => e.kind === "model_failover");
+    expect(failovers).toHaveLength(1);
+    expect(failovers[0]).toMatchObject({ from: SONNET, to: HAIKU, reason: "budget_degrade" });
+    // The turn completed: turn_end on the bus, no classified failure.
+    expect(seen.filter((e) => e.kind === "turn_end")).toHaveLength(1);
+    expect(seen.some((e) => e.kind === "run_failed")).toBe(false);
+    const lines = stderr.lines();
+    expect(lines.some((l) => l.includes(`degrading ${SONNET}`))).toBe(true);
+    expect(lines.some((l) => l.includes("ending the run"))).toBe(false);
+  });
+
+  test("REPL: the degraded turn completes on the rung, then the pre-turn gate stops cleanly (no run_failed)", async () => {
+    const primary = scriptedToolLoopAdapter("anthropic", USAGE, []); // always tool_use
+    const rung = scriptedToolLoopAdapter("anthropic", USAGE, ["tool", "text"]);
+    const runContext = createRunContext();
+    const seen: TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => {
+      seen.push(e);
+    });
+    const stderr = captureStderr();
+    try {
+      await runChatLoop({
+        model: SONNET,
+        instructions: "test",
+        _adapter: primary,
+        _budgetDegradeAdapter: rung,
+        tools: [noopTool()],
+        permissionMode: "bypass",
+        budget: { usdMicros: 1000, onExceed: { kind: "degrade", model: HAIKU } },
+        input: interactiveStdin(runContext.eventBus, ["one", "two"]),
+        installSigintHandler: false,
+        spinner: false,
+        runContext,
+      });
+    } finally {
+      stderr.restore();
+    }
+    // Turn 1 ran to completion on the rung; the pre-turn gate for turn 2 read
+    // the over-cap spend on the degraded rung and ended the run cleanly —
+    // the pre-0.6.0 REPL contract ("the degraded turn completes, clean stop
+    // before the next turn"), now also true when the degrade fires mid-turn.
+    expect(primary.requests).toHaveLength(3);
+    expect(rung.requests).toHaveLength(2);
+    expect(seen.filter((e) => e.kind === "turn_end")).toHaveLength(1);
+    expect(seen.some((e) => e.kind === "run_failed")).toBe(false);
+    expect(runContext.turnNumber).toBe(1);
+    const lines = stderr.lines();
+    expect(lines.some((l) => l.includes("degraded model also reached the cap"))).toBe(true);
   });
 });
 

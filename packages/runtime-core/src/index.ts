@@ -1694,8 +1694,12 @@ export type RunChatLoopOptions = {
    *     becomes the FORCED candidate — `model_route` policy `forced`,
    *     reason `budget_degrade` — instead of swapping the closed-over
    *     adapter the pool overwrote on every call (dead config before
-   *     0.6.0). If spend later crosses the cap AGAIN on the degraded rung,
-   *     the run stops (the ladder has one rung in v1).
+   *     0.6.0). The second breach is defined at a TURN boundary, not an
+   *     accrual boundary: the rung serves EVERY remaining model call of the
+   *     turn in which the degrade fired (a mid-turn degrade finishes its
+   *     tool loop; a single-turn host gets one complete degraded reply),
+   *     and the first gate of the NEXT turn — the REPL's pre-turn check —
+   *     ends the run cleanly (exit 0). The ladder has one rung in v1.
    *   - `scope` (0.6.0, default `"run"`): `"session"` seeds the meter on
    *     `resume` from the `cost_accrual` lines persisted in the session log
    *     (and persists them for this run even without
@@ -2701,7 +2705,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // cost-tracker. The pre-turn check (`enforceBudget`, below) reads
   // `budgetMeter.getRunCost(runId).totalUsdMicros`. `budgetDegraded` gates
   // the ladder to a single rung: once we degrade, we never degrade again —
-  // a second breach stops the run.
+  // the run stops at the next turn boundary.
   // 0.6.0 — `budget.scope: "session"` needs the per-call spend ON DISK so the
   // next resume can seed from it. When an env-attached cost-tracker already
   // publishes `cost_accrual` (persisted below) the meter stays silent as
@@ -2713,12 +2717,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       ? createCostTracker(bus, { suppressEvents: !budgetSessionPersist })
       : undefined;
   let budgetDegraded = false;
-  // 0.6.0 — the spend at which the degrade fired. Spend never falls back
-  // under the cap, so "a later breach on the degraded rung" is defined as ANY
-  // further accrual past this mark: the gate that fired the degrade and the
-  // per-call gate immediately after it (same spend, nothing accrued yet) both
-  // let the rung serve; the first gate after the rung has accrued stops.
-  let budgetDegradedAtMicros = 0;
+  // 0.6.0 — the turn in which the degrade fired. Spend never falls back
+  // under the cap, so "a later breach on the degraded rung" cannot be an
+  // accrual boundary (the rung's first priced response would trip the very
+  // next per-call gate and sever the turn — degrade would collapse to one
+  // model call). It is a TURN boundary: every gate of this turn lets the
+  // rung serve; the first gate of the next turn stops the run.
+  let budgetDegradedAtTurn = 0;
 
   /**
    * Item 27 / 0.6.0 §7.12 — the budget gate. Returns "stop" when the run
@@ -2727,9 +2732,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    * the per-model-call gate at the top of `NeedModel`, so a tool loop that
    * keeps calling the model is stopped at the cap on every host. `spent`
    * is this run's metered spend plus, under `scope: "session"`, the spend
-   * the session log persisted before this resume.
+   * the session log persisted before this resume. `turn` is the 1-based
+   * number of the turn being gated: the per-call gate passes the current
+   * `runContext.turnNumber`; the pre-turn gate runs BEFORE the increment,
+   * so it passes `turnNumber + 1` (the turn about to open).
    *
-   * On a `degrade` breach (once):
+   * On a `degrade` breach (once), the rung serves the rest of `turn`:
    *   - single-model / `modelTiers` runs re-resolve the primary to the
    *     cheaper rung IN PLACE (mutating `adapter`, `providerId`,
    *     `wireModelId`; the tier router is bypassed from here on so the swap
@@ -2740,15 +2748,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    *     the pool branch then forces the pre-resolved `budgetDegradeRung`
    *     (`model_route` policy `forced`, reason `budget_degrade`). No
    *     `model_failover` is published — nothing failed over.
+   * Every gate of that turn returns "continue" however far past the cap the
+   * rung accrues; the first gate of the next turn stops (on the REPL that is
+   * the pre-turn gate — a clean exit 0; a singleTurn run has no next turn,
+   * so the rung serves the rest of the run).
    * Never throws — a re-resolution failure logs and stops.
    */
-  const enforceBudget = async (): Promise<"continue" | "stop"> => {
+  const enforceBudget = async (turn: number): Promise<"continue" | "stop"> => {
     if (opts.budget === undefined || budgetMeter === undefined) return "continue";
     const spent = resumedCostUsdMicros + budgetMeter.getRunCost(bus.runId).totalUsdMicros;
     if (spent < opts.budget.usdMicros) return "continue";
-    // Degraded and nothing accrued since the degrade fired: the rung has not
-    // served yet — let it (the two gates read the same spend back to back).
-    if (budgetDegraded && spent <= budgetDegradedAtMicros) return "continue";
+    // Degraded in THIS turn: the rung serves every remaining call of it.
+    if (budgetDegraded && turn === budgetDegradedAtTurn) return "continue";
     const spentUsd = (spent / 1_000_000).toFixed(4);
     const capUsd = (opts.budget.usdMicros / 1_000_000).toFixed(4);
     if (opts.budget.onExceed.kind === "stop" || budgetDegraded) {
@@ -2771,7 +2782,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         return "stop";
       }
       budgetDegraded = true;
-      budgetDegradedAtMicros = spent;
+      budgetDegradedAtTurn = turn;
       process.stderr.write(
         `[budget] $${spentUsd} spent ≥ $${capUsd} cap — restricting model_pool to ${target} (budget_degrade).\n`,
       );
@@ -2805,7 +2816,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // chain). Null it so the request/response stamping stops consulting it.
       failoverChain = undefined;
       budgetDegraded = true;
-      budgetDegradedAtMicros = spent;
+      budgetDegradedAtTurn = turn;
       bus.publish({
         ...bus.envelope(),
         kind: "model_failover",
@@ -4789,9 +4800,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // here is the classified `crewhaus_budget` stop: it lands BEFORE
           // the request opens, so every tool result already obtained is
           // committed and no `tool_use` is left unanswered — the transcript
-          // stays resumable. A `degrade` breach latches the rung and the
-          // call below serves on it. (Sanctioned change §14(2).)
-          if ((await enforceBudget()) === "stop") {
+          // stays resumable. A `degrade` breach latches the rung, and the
+          // call below AND every remaining call of this turn serve on it —
+          // the second breach is the next turn boundary, so a degraded tool
+          // loop finishes and a single-turn host gets one complete degraded
+          // reply. (Sanctioned change §14(2).)
+          if ((await enforceBudget(runContext.turnNumber)) === "stop") {
             const spentMicros =
               resumedCostUsdMicros + (budgetMeter?.getRunCost(bus.runId).totalUsdMicros ?? 0);
             const report: FailureReport = {
@@ -4898,8 +4912,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               );
               // 0.6.0 §7.12 — forced lane first (§7.2 ordering): a budget
               // degrade restricts the pool to its rung for the rest of the
-              // run, outranking the misroute-escalation latch (escalating to
-              // the strongest candidate would defeat the cap). The band
+              // turn it fired in (the run stops at the next turn boundary, so
+              // on a single-turn host that is the rest of the run), outranking
+              // the misroute-escalation latch (escalating to the strongest
+              // candidate would defeat the cap). The band
               // (`routeKey`) is kept so the rung's arm is still keyed on the
               // turn's difficulty.
               const decision =
@@ -6102,10 +6118,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // never runs, and the REPL ends cleanly (exit 0). On a `degrade`
       // breach `enforceBudget` has already swapped the primary adapter (or,
       // under a pool, latched the forced rung), so this turn runs on the
-      // cheaper model. (0.6.0 §7.12 — a breach MID-turn is caught by the
-      // per-model-call gate inside `runOneTurn`, which ends the run with the
-      // classified `crewhaus_budget` failure instead.)
-      if ((await enforceBudget()) === "stop") break;
+      // cheaper model. (0.6.0 §7.12 — a `stop` breach MID-turn is caught by
+      // the per-model-call gate inside `runOneTurn`, which ends the run with
+      // the classified `crewhaus_budget` failure instead; a `degrade` that
+      // fired mid-turn finished that turn on the rung, and THIS gate is the
+      // one that then ends the run cleanly.) `turnNumber` is incremented
+      // just below, so the turn being gated is `turnNumber + 1`.
+      if ((await enforceBudget(runContext.turnNumber + 1)) === "stop") break;
 
       messages.push({ role: "user", content: effectiveInput });
       await logEvent("user_message", { content: effectiveInput });
