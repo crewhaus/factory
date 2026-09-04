@@ -109,6 +109,26 @@ export type ToolScope = "internal" | "external";
  */
 export type ToolIoCapability = "network" | "process";
 
+/**
+ * 0.6.0 §5.1 — the model features a tool needs from the model that calls
+ * it. Structurally the `Partial<ProviderFeatures>` of
+ * `@crewhaus/adapter-anthropic` (kept as a local twin so the tool contract
+ * does not pull a provider SDK); `@crewhaus/cost-tracker`'s
+ * `CapabilityRequirement` is the same shape, so one declaration serves
+ * both the runtime gate (`adapter.features`) and the offline
+ * `compile --strict` twin (`satisfiesCapabilities`). Semantics per key: a
+ * `true` boolean requires the feature; `caching: "explicit"` requires
+ * explicit caching, `"automatic"` accepts either kind; `false` / absent is a
+ * don't-care.
+ */
+export type ModelFeatureRequirement = {
+  readonly caching?: "explicit" | "automatic" | false;
+  readonly tool_use?: boolean;
+  readonly vision?: boolean;
+  readonly thinking?: boolean;
+  readonly web_search?: boolean;
+};
+
 export interface ToolDefinition<TInput = unknown> {
   name: string;
   description: string;
@@ -180,6 +200,18 @@ export interface ToolDefinition<TInput = unknown> {
    */
   requireJustification?: boolean;
   /**
+   * 0.6.0 §5.1 — tools declare REQUIREMENTS, not model maps. When set, a
+   * model whose `features` do not satisfy this requirement never has the
+   * tool advertised to it (`@crewhaus/model-plan`'s `buildAdvertisement`
+   * derives `toolsFor(candidate) = profile.tools ∩ tools.filter(t ⊨
+   * candidate.features)`), and `compile --strict` checks the same
+   * requirement offline against the capability table. A tool that returns
+   * image blocks declares `{ vision: true }`; a tool that only makes sense
+   * with function calling declares `{ tool_use: true }`. Omitted ⇒ no
+   * requirement (advertised to every candidate, the prior behavior).
+   */
+  requiresModelFeatures?: ModelFeatureRequirement;
+  /**
    * Authoritative JSON Schema for the tool's input. When set, runtime-core
    * forwards this verbatim to the model instead of running
    * `zodToJsonSchema(inputSchema)`. Used by tools whose canonical schema is
@@ -238,6 +270,12 @@ export interface RegisteredTool {
    * `ToolDefinition.requireJustification`.
    */
   requireJustification: boolean;
+  /**
+   * 0.6.0 §5.1 — see `ToolDefinition.requiresModelFeatures`. Optional and
+   * passed through verbatim by `buildTool` (like `ioCapability`); absent ⇒
+   * the tool is advertised to every candidate.
+   */
+  requiresModelFeatures?: ModelFeatureRequirement;
   /** See ToolDefinition.jsonSchema. Optional; runtime-core falls back to
    *  zodToJsonSchema(inputSchema) when absent. */
   jsonSchema?: unknown;

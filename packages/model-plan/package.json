@@ -1,0 +1,36 @@
+{
+  "name": "@crewhaus/model-plan",
+  "version": "0.5.8",
+  "type": "module",
+  "description": "Pure, fs-free per-model plan primitives: profile refs, request params, subset-only tool advertisement, route rules, capability eligibility, directives, fingerprints, eval-seeded priors and the quality floor (0.6.0)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/adapter-anthropic": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/model-plan"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/model-plan#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

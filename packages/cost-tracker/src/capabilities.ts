@@ -29,6 +29,15 @@
  *   tool_use, vision, thinking, web_search: boolean
  * Kept structurally identical so a capability requirement can be expressed
  * as a partial of this shape.
+ *
+ * 0.6.0 §7.11 (N1) adds two SIZE facts the adapters' feature flags cannot
+ * carry — `contextWindow` and `maxOutputTokens` — because a heterogeneous
+ * roster's most likely production failure is a transcript that outgrows a
+ * small local context window, or a candidate `max_tokens` above what the
+ * model can emit. Capability-eligibility routing reads them per turn; the
+ * plan builder clamps a candidate's `max_tokens` to `maxOutputTokens`. Both
+ * are conservative published limits for the family (the SHARED subset where
+ * members differ, like the flags) — never a beta or long-context tier.
  */
 import type { ProviderId } from "@crewhaus/trace-event-bus";
 
@@ -39,6 +48,15 @@ export type ModelCapabilities = {
   readonly vision: boolean;
   readonly thinking: boolean;
   readonly web_search: boolean;
+  /**
+   * 0.6.0 N1 — input context window in tokens (conservative published
+   * limit for the family). Optional in the TYPE so a declared
+   * `capabilities:` override on a non-table provider may omit it; every
+   * row of `DEFAULT_CAPABILITIES` carries it (pinned by test).
+   */
+  readonly contextWindow?: number;
+  /** 0.6.0 N1 — maximum output tokens per response (conservative published limit). */
+  readonly maxOutputTokens?: number;
 };
 
 export type CapabilityTable = {
@@ -72,6 +90,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: true,
+        contextWindow: 200000,
+        maxOutputTokens: 32000,
       },
       "claude-sonnet-5": {
         caching: "explicit",
@@ -79,6 +99,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: true,
+        contextWindow: 200000,
+        maxOutputTokens: 64000,
       },
       "claude-sonnet-4": {
         caching: "explicit",
@@ -86,6 +108,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: true,
+        contextWindow: 200000,
+        maxOutputTokens: 64000,
       },
       "claude-haiku-4": {
         caching: "explicit",
@@ -93,6 +117,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: true,
+        contextWindow: 200000,
+        maxOutputTokens: 64000,
       },
       "claude-fable-5": {
         caching: "explicit",
@@ -100,6 +126,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: true,
+        contextWindow: 200000,
+        maxOutputTokens: 64000,
       },
       "claude-opus": {
         caching: "explicit",
@@ -107,6 +135,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: true,
+        contextWindow: 200000,
+        maxOutputTokens: 32000,
       },
       "claude-sonnet": {
         caching: "explicit",
@@ -114,6 +144,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: true,
+        contextWindow: 200000,
+        maxOutputTokens: 64000,
       },
       "claude-haiku": {
         caching: "explicit",
@@ -121,6 +153,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: true,
+        contextWindow: 200000,
+        maxOutputTokens: 64000,
       },
       "claude-fable": {
         caching: "explicit",
@@ -128,6 +162,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: true,
+        contextWindow: 200000,
+        maxOutputTokens: 64000,
       },
       "claude-3-7-sonnet": {
         caching: "explicit",
@@ -135,6 +171,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: true,
+        contextWindow: 200000,
+        maxOutputTokens: 64000,
       },
       "claude-3-5-haiku": {
         caching: "explicit",
@@ -142,6 +180,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: false,
         web_search: true,
+        contextWindow: 200000,
+        maxOutputTokens: 8192,
       },
     },
     openai: {
@@ -154,6 +194,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: false,
         web_search: false,
+        contextWindow: 128000,
+        maxOutputTokens: 16384,
       },
       "gpt-4.1": {
         caching: "automatic",
@@ -161,6 +203,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: false,
         web_search: false,
+        contextWindow: 1047576,
+        maxOutputTokens: 32768,
       },
       "gpt-5.1": {
         caching: "automatic",
@@ -168,6 +212,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: false,
         web_search: false,
+        contextWindow: 400000,
+        maxOutputTokens: 128000,
       },
       "gpt-5": {
         caching: "automatic",
@@ -175,6 +221,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: false,
         web_search: false,
+        contextWindow: 400000,
+        maxOutputTokens: 128000,
       },
       // o-series: tools yes, vision no on the mini reasoning models.
       o1: {
@@ -183,6 +231,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: false,
         web_search: false,
+        contextWindow: 200000,
+        maxOutputTokens: 100000,
       },
       "o3-mini": {
         caching: "automatic",
@@ -190,6 +240,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: false,
         thinking: false,
         web_search: false,
+        contextWindow: 200000,
+        maxOutputTokens: 100000,
       },
     },
     gemini: {
@@ -201,6 +253,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: false,
+        contextWindow: 1048576,
+        maxOutputTokens: 65536,
       },
       "gemini-2.5-pro": {
         caching: "automatic",
@@ -208,6 +262,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: false,
+        contextWindow: 1048576,
+        maxOutputTokens: 65536,
       },
       "gemini-2.5-flash": {
         caching: "automatic",
@@ -215,6 +271,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: false,
+        contextWindow: 1048576,
+        maxOutputTokens: 65536,
       },
       "gemini-2.0-flash": {
         caching: "automatic",
@@ -222,6 +280,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: false,
         web_search: false,
+        contextWindow: 1048576,
+        maxOutputTokens: 8192,
       },
       "gemini-1.5-pro": {
         caching: "automatic",
@@ -229,6 +289,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: false,
         web_search: false,
+        contextWindow: 2097152,
+        maxOutputTokens: 8192,
       },
       "gemini-1.5-flash": {
         caching: "automatic",
@@ -236,6 +298,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: false,
         web_search: false,
+        contextWindow: 1048576,
+        maxOutputTokens: 8192,
       },
     },
     bedrock: {
@@ -248,6 +312,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: false,
+        contextWindow: 200000,
+        maxOutputTokens: 32000,
       },
       "anthropic.claude-opus-4-8": {
         caching: "explicit",
@@ -255,6 +321,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: false,
+        contextWindow: 200000,
+        maxOutputTokens: 32000,
       },
       "anthropic.claude-sonnet-5": {
         caching: "explicit",
@@ -262,6 +330,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: false,
+        contextWindow: 200000,
+        maxOutputTokens: 64000,
       },
       "anthropic.claude-opus-4": {
         caching: "explicit",
@@ -269,6 +339,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: false,
+        contextWindow: 200000,
+        maxOutputTokens: 32000,
       },
       "anthropic.claude-sonnet-4": {
         caching: "explicit",
@@ -276,6 +348,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: false,
+        contextWindow: 200000,
+        maxOutputTokens: 64000,
       },
       // Split to match the pricing table's granularity. As a single
       // `meta.llama3-1` family base this key resolved to NO pricing row —
@@ -289,6 +363,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: false,
         thinking: false,
         web_search: false,
+        contextWindow: 128000,
+        maxOutputTokens: 4096,
       },
       "meta.llama3-1-8b": {
         caching: false,
@@ -296,6 +372,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: false,
         thinking: false,
         web_search: false,
+        contextWindow: 128000,
+        maxOutputTokens: 4096,
       },
       "mistral.mistral-large": {
         caching: false,
@@ -303,6 +381,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: false,
         thinking: false,
         web_search: false,
+        contextWindow: 32000,
+        maxOutputTokens: 8192,
       },
     },
   },
@@ -334,8 +414,23 @@ export function resolveCapabilities(
   return undefined;
 }
 
-/** A capability requirement: any subset of the flags a slot must satisfy. */
-export type CapabilityRequirement = Partial<ModelCapabilities>;
+/**
+ * A capability requirement: any subset of the flags a slot must satisfy,
+ * plus (0.6.0 N1) two size floors. The size keys are spelled as FLOORS
+ * (`…Gte`) rather than reusing the table's field names, because a bare
+ * `contextWindow: 200000` on a requirement would read as equality. The spec
+ * surface `requires: { context_window_gte, max_output_gte }` lowers to these.
+ * Structurally a superset of `ToolDefinition.requiresModelFeatures`
+ * (`@crewhaus/tool-catalog`), so a tool's requirement is accepted verbatim.
+ */
+export type CapabilityRequirement = Partial<
+  Omit<ModelCapabilities, "contextWindow" | "maxOutputTokens">
+> & {
+  /** The model's context window must be KNOWN and at least this many tokens. */
+  readonly contextWindowGte?: number;
+  /** The model's max output must be KNOWN and at least this many tokens. */
+  readonly maxOutputTokensGte?: number;
+};
 
 /**
  * Does `caps` satisfy `req`? Booleans: a required `true` needs `caps` true
@@ -343,6 +438,9 @@ export type CapabilityRequirement = Partial<ModelCapabilities>;
  * `"explicit"` needs explicit; a required `"automatic"` accepts explicit OR
  * automatic (explicit is a superset — anything that caches at all satisfies
  * an automatic requirement); a required `false`/absent is a don't-care.
+ * Size floors (`contextWindowGte` / `maxOutputTokensGte`): the table value
+ * must be present AND `>=` the floor — an unknown size never satisfies a
+ * floor (never over-promise, the same rule as an unknown family).
  */
 export function satisfiesCapabilities(
   caps: ModelCapabilities,
@@ -353,5 +451,17 @@ export function satisfiesCapabilities(
   }
   if (req.caching === "explicit" && caps.caching !== "explicit") return false;
   if (req.caching === "automatic" && caps.caching === false) return false;
+  if (
+    req.contextWindowGte !== undefined &&
+    (caps.contextWindow === undefined || caps.contextWindow < req.contextWindowGte)
+  ) {
+    return false;
+  }
+  if (
+    req.maxOutputTokensGte !== undefined &&
+    (caps.maxOutputTokens === undefined || caps.maxOutputTokens < req.maxOutputTokensGte)
+  ) {
+    return false;
+  }
   return true;
 }

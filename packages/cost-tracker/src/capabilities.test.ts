@@ -78,3 +78,52 @@ describe("satisfiesCapabilities", () => {
     expect(satisfiesCapabilities(llama, {})).toBe(true);
   });
 });
+
+describe("0.6.0 N1 — contextWindow / maxOutputTokens", () => {
+  test("every table row carries both size facts", () => {
+    for (const [provider, table] of Object.entries(DEFAULT_CAPABILITIES.providers)) {
+      for (const [prefix, caps] of Object.entries(table ?? {})) {
+        expect(typeof caps.contextWindow, `${provider}/${prefix} contextWindow`).toBe("number");
+        expect(typeof caps.maxOutputTokens, `${provider}/${prefix} maxOutputTokens`).toBe("number");
+        expect(caps.contextWindow ?? 0).toBeGreaterThan(caps.maxOutputTokens ?? 0);
+      }
+    }
+  });
+
+  test("the conservative shared-subset values resolve by longest prefix", () => {
+    expect(
+      resolveCapabilities(DEFAULT_CAPABILITIES, "anthropic", "claude-3-5-haiku")?.maxOutputTokens,
+    ).toBe(8192);
+    expect(
+      resolveCapabilities(DEFAULT_CAPABILITIES, "anthropic", "claude-sonnet-4-5")?.contextWindow,
+    ).toBe(200000);
+    expect(resolveCapabilities(DEFAULT_CAPABILITIES, "openai", "gpt-4o")?.contextWindow).toBe(
+      128000,
+    );
+    expect(
+      resolveCapabilities(DEFAULT_CAPABILITIES, "bedrock", "meta.llama3-1-70b")?.maxOutputTokens,
+    ).toBe(4096);
+  });
+
+  test("size floors: known-and-at-least satisfies, unknown never does", () => {
+    const haiku = must(resolveCapabilities(DEFAULT_CAPABILITIES, "anthropic", "claude-3-5-haiku"));
+    expect(satisfiesCapabilities(haiku, { contextWindowGte: 200000 })).toBe(true);
+    expect(satisfiesCapabilities(haiku, { contextWindowGte: 200001 })).toBe(false);
+    expect(satisfiesCapabilities(haiku, { maxOutputTokensGte: 8192 })).toBe(true);
+    expect(satisfiesCapabilities(haiku, { maxOutputTokensGte: 16000 })).toBe(false);
+    const unknownSizes = { ...haiku, contextWindow: undefined, maxOutputTokens: undefined };
+    expect(satisfiesCapabilities(unknownSizes, { contextWindowGte: 1 })).toBe(false);
+    expect(satisfiesCapabilities(unknownSizes, { maxOutputTokensGte: 1 })).toBe(false);
+    expect(satisfiesCapabilities(unknownSizes, { tool_use: true })).toBe(true);
+  });
+
+  test("a tool's requiresModelFeatures is accepted verbatim as a requirement", () => {
+    const req: { vision?: boolean; tool_use?: boolean } = { vision: true };
+    const sonnet = must(
+      resolveCapabilities(DEFAULT_CAPABILITIES, "anthropic", "claude-sonnet-4-5"),
+    );
+    const llama = must(resolveCapabilities(DEFAULT_CAPABILITIES, "bedrock", "meta.llama3-1-70b"));
+    expect(satisfiesCapabilities(sonnet, req)).toBe(true);
+    expect(satisfiesCapabilities(llama, req)).toBe(false);
+  });
+});

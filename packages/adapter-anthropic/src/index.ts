@@ -28,6 +28,8 @@ export type {
   CanonicalToolResultBlockParam,
   CanonicalToolResultContent,
   CanonicalToolUseBlockParam,
+  DroppedRequestParam,
+  EffectiveParams,
   ProviderAdapter,
   ProviderFeatures,
   ProviderId,
@@ -97,6 +99,7 @@ export {
 export type { ConsumeStreamCallbacks } from "./helpers.js";
 
 export {
+  anthropicEffectiveParams,
   claudeRejectsTemperature,
   rawEventToCanonical,
   toAnthropicMessages,
