@@ -502,7 +502,13 @@ function renderRoleTuningFields(role: IrCrewRole): string {
  * cli/pipeline shapes use — runtime-core owns the router; the orchestrator
  * forwards the RoleDefinition's config into this role's `runChatLoop` turns
  * (primary activations AND inline A2A peer turns) exactly as it already
- * forwards `maxTokens`/`thinking`. The four fields are mutually exclusive in
+ * forwards `maxTokens`/`thinking`. That forwarding is real as of 0.6.0
+ * (PR 3, design §7.7): `RoleDefinition` gained the four fields — typed by
+ * indexing runtime-core's `RunChatLoopOptions`, so the literal rendered here
+ * is checked against what the loop accepts — and `composeLoopTuning` spreads
+ * them; on 0.4–0.5 the literal compiled but was dead config. The field NAMES
+ * below are the contract with the orchestrator; a rename on either side must
+ * move both. The four fields are mutually exclusive in
  * the spec (`model_pool` ⊥ `model_tiers` ⊥ `model_fallbacks`, with
  * `circuit_breaker` riding `model_fallbacks`), so at most one clause fires
  * per role. Model strings pass through `escapeJsonString` (user-controlled
