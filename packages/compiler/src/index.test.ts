@@ -3348,6 +3348,76 @@ budget:
     expect(plain).not.toContain('"scope":"run"');
   });
 
+  // 0.6.0 §6.2 — `budget.judge_share` → `IrBudget.judgeShare`, only when declared.
+  test("lowers budget.judge_share → judgeShare when declared, and never adds the key when absent", () => {
+    const declared = lower(
+      parseSpec(
+        "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 1\n  judge_share: 0.5\n",
+      ),
+    );
+    if (declared.target !== "cli") throw new Error("unexpected target");
+    expect(declared.budget).toEqual({
+      usdMicros: 1_000_000,
+      onExceed: { kind: "stop" },
+      judgeShare: 0.5,
+    });
+    // Key ORDER is part of the byte contract: scope before judgeShare, both
+    // after onExceed, so a spec declaring either keeps a stable literal.
+    const both = lower(
+      parseSpec(
+        "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 1\n  judge_share: 0.5\n  scope: session\n",
+      ),
+    );
+    if (both.target !== "cli") throw new Error("unexpected target");
+    expect(JSON.stringify(both.budget)).toBe(
+      '{"usdMicros":1000000,"onExceed":{"kind":"stop"},"scope":"session","judgeShare":0.5}',
+    );
+    const absent = lower(
+      parseSpec("name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 1\n"),
+    );
+    if (absent.target !== "cli") throw new Error("unexpected target");
+    expect("judgeShare" in (absent.budget ?? {})).toBe(false);
+    expect(JSON.stringify(absent.budget)).toBe('{"usdMicros":1000000,"onExceed":{"kind":"stop"}}');
+  });
+
+  test("compiled workflow bundle opens ONE run-spanning budget meter and hands it to every step", () => {
+    const wf = compile(
+      [
+        "name: wf",
+        "target: workflow",
+        "model: m",
+        "steps:",
+        "  - name: draft",
+        "    instructions: write",
+        "  - name: polish",
+        "    instructions: polish",
+        "budget:",
+        "  usd: 2",
+        "  judge_share: 0.25",
+      ].join("\n"),
+      { readme: false },
+    );
+    const agent = wf.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agent).toContain('import { createCostTracker } from "@crewhaus/cost-tracker";');
+    expect(agent).toContain('import { createRunContext } from "@crewhaus/run-context";');
+    expect(agent).toContain("const __runContext = createRunContext();");
+    expect(agent).toContain(
+      "const __budgetMeter = createCostTracker(__runContext.eventBus, { suppressEvents: true });",
+    );
+    expect(agent.match(/budgetMeter: __budgetMeter,/g) ?? []).toHaveLength(2);
+    expect(agent.match(/runContext: __runContext,/g) ?? []).toHaveLength(2);
+    expect(agent).toContain('"judgeShare":0.25');
+    // A budget-free workflow carries none of it (byte-identity guard).
+    const plain = compile(
+      "name: wf\ntarget: workflow\nmodel: m\nsteps:\n  - name: draft\n    instructions: write\n",
+      { readme: false },
+    );
+    const plainAgent = plain.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(plainAgent).not.toContain("__budgetMeter");
+    expect(plainAgent).not.toContain("cost-tracker");
+    expect(plainAgent).not.toContain("__runContext");
+  });
+
   test("channel + managed agent shapes accept the budget block", () => {
     const channel = lower(
       parseSpec(`

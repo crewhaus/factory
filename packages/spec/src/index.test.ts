@@ -1769,6 +1769,44 @@ describe("run-level budget cap block (item 27)", () => {
     expect(() => parseSpec(cli("budget:\n  usd: 1\n  scope: turn"))).toThrow();
   });
 
+  // 0.6.0 §6.2 — `budget.judge_share`: the auxiliary-role sub-cap.
+  test("parses budget.judge_share (0..1); absent stays absent on the parsed spec (no zod default)", () => {
+    const declared = parseSpec(cli("budget:\n  usd: 1\n  judge_share: 0.5"));
+    if (declared.target !== "cli") throw new Error("unexpected target");
+    expect(declared.budget?.judge_share).toBe(0.5);
+    const edges = parseSpec(cli("budget:\n  usd: 1\n  judge_share: 0"));
+    if (edges.target !== "cli") throw new Error("unexpected target");
+    expect(edges.budget?.judge_share).toBe(0);
+    const absent = parseSpec(cli("budget:\n  usd: 1"));
+    if (absent.target !== "cli") throw new Error("unexpected target");
+    expect("judge_share" in (absent.budget ?? {})).toBe(false);
+    expect(absent.budget).toEqual({ usd: 1, on_exceed: { action: "stop" } });
+  });
+
+  test("rejects a judge_share outside 0..1 and a non-numeric one", () => {
+    expect(() => parseSpec(cli("budget:\n  usd: 1\n  judge_share: 1.5"))).toThrow();
+    expect(() => parseSpec(cli("budget:\n  usd: 1\n  judge_share: -0.1"))).toThrow();
+    expect(() => parseSpec(cli("budget:\n  usd: 1\n  judge_share: most"))).toThrow();
+  });
+
+  test("budget.judge_share parses on the workflow shape (the run-spanning meter's home)", () => {
+    const wf = parseSpec(
+      [
+        "name: wf",
+        "target: workflow",
+        "model: m",
+        "steps:",
+        "  - name: draft",
+        "    instructions: write",
+        "budget:",
+        "  usd: 2",
+        "  judge_share: 0.25",
+      ].join("\n"),
+    );
+    if (wf.target !== "workflow") throw new Error("unexpected target");
+    expect(wf.budget?.judge_share).toBe(0.25);
+  });
+
   test("budget.scope parses on every budget-carrying shape (channel + managed daemons are its point)", () => {
     const channel = parseSpec(
       [

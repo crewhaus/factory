@@ -15,7 +15,8 @@
     "@anthropic-ai/sdk": "^0.96.0",
     "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/boundary-classifier": "workspace:*",
-    "@crewhaus/errors": "workspace:*"
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

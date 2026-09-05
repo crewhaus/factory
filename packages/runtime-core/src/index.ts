@@ -28,10 +28,12 @@ import {
 } from "@crewhaus/compaction-curator";
 import { snip } from "@crewhaus/compaction-snip";
 import {
+  type CostTracker,
   DEFAULT_PRICING,
   computeCostMicros,
   createCostTracker,
   resolvePricing,
+  sumRoleCost,
 } from "@crewhaus/cost-tracker";
 import {
   type EgressMatcher,
@@ -118,6 +120,7 @@ import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
 import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
 import { storeAndPreview } from "@crewhaus/tool-result-store";
 import {
+  AUXILIARY_MODEL_ROLES,
   type CostAccrualEvent,
   type ModelRole,
   type ModelUsage,
@@ -371,6 +374,25 @@ export const CONTINUITY_LEDGER_MAX_CHARS = 16 * 1024;
  * first consumer.
  */
 export const PLAN_DIRTY_STATE_KEY = "plan.dirty";
+
+/**
+ * 0.6.0 (design §6.2) — the default `budget.judge_share`: the fraction of
+ * `budget.usd` the auxiliary roles (`AUXILIARY_MODEL_ROLES` from
+ * `@crewhaus/trace-event-bus`) may spend before the runtime raises the
+ * `judge_share_exhausted` signal. Applied when the spec's `budget` block
+ * omits `judge_share`.
+ */
+export const DEFAULT_JUDGE_SHARE = 0.3;
+
+/**
+ * 0.6.0 (design §6.2, §7.12) — the budget meters whose `judge_share` notice
+ * has already printed. Keyed on the METER rather than the loop so a
+ * caller-supplied run-spanning meter (the workflow bundle's `__budgetMeter`,
+ * shared by every step's `runChatLoop` call) prints the notice once per RUN,
+ * while a per-loop meter is one entry that dies with its loop. A WeakSet, so
+ * nothing recorded here outlives the meter it describes.
+ */
+const judgeShareNoticedMeters = new WeakSet<CostTracker>();
 
 /** Role attribution on an evicted-content record (§2.3): `"user"` for user
  *  text, `"assistant"` for assistant text, `"tool"` for tool_result content
@@ -977,6 +999,15 @@ export type EvaluationTurn = {
    * invocation sees the usage of exactly the attempt it is grading.
    */
   readonly usage: ModelUsage;
+  /**
+   * 0.6.0 (design §6.2) — the RUN's trace bus. The injected grader hands it
+   * to its judge (`judge({ …, bus })`) so the judge's model calls publish
+   * `model_request` / `model_response` with `role: "judge"` on the same bus
+   * the run's cost meter subscribes to — that is what makes judge spend
+   * priced, visible in `cost-summary`, and counted toward `budget.usd`
+   * (bounded by `budget.judge_share`). Deterministic graders ignore it.
+   */
+  readonly bus: TraceEventBus;
 };
 
 /** The injected grader's verdict for one graded attempt. */
@@ -986,6 +1017,17 @@ export type EvaluationResult = {
   readonly score: number;
   /** Grader explanation; appended to the retry nudge when `onFail: "retry"`. */
   readonly rationale?: string;
+  /**
+   * 0.6.0 (design §6.2, §8.1) — the judge that produced the score, when the
+   * grader is model-backed: the WIRE model id and the call's priced spend
+   * (absent when the model has no pricing row). Stamped verbatim onto the
+   * `eval_graded` event as `judgeModel` / `judgeCostUsdMicros`. Deterministic
+   * graders leave it undefined.
+   */
+  readonly judge?: {
+    readonly model: string;
+    readonly costUsdMicros?: number;
+  };
 };
 
 /**
@@ -1725,6 +1767,26 @@ export type RunChatLoopOptions = {
    *     (and persists them for this run even without
    *     `CREWHAUS_COST_TRACKING`), so a channel/managed cap bounds the
    *     conversation, not one inbound message.
+   *   - `judgeShare` (0.6.0 §6.2, default {@link DEFAULT_JUDGE_SHARE} = 0.3):
+   *     the fraction of `usdMicros` the AUXILIARY roles
+   *     (`AUXILIARY_MODEL_ROLES` — judge, compaction, guide, classifier,
+   *     consult, committee, shadow) may spend between them. Those calls now
+   *     ride the run bus with a `role`, so the always-on meter counts them
+   *     toward the cap like any other call; the share is the sub-cap inside
+   *     it. Crossing it is an ACCOUNTING signal in this release: the share is
+   *     re-read at every budget gate (`enforceBudget` — the per-model-call
+   *     gate and the REPL's pre-turn gate) and after every in-loop grade, so
+   *     once auxiliary spend reaches it the runtime prints one `[budget]`
+   *     notice per METER (once per run on a shared `budgetMeter`) whether or
+   *     not the run declares `evaluation:` — a compaction-only run, or a
+   *     workflow whose `kind: judge` gates run between steps, raises it from
+   *     the next per-call gate — and every `eval_graded` published while the
+   *     share stands exhausted carries `reason: "judge_share_exhausted"` (the
+   *     workflow bundle stamps the same `reason` on `judge_verdict` from its
+   *     shared meter). The judge keeps judging under the TOTAL cap (the
+   *     in-loop retry path is unchanged); the cascade that consumes the
+   *     signal — serving its strong rung directly instead of spending more on
+   *     judging — lands with the hybrid strategies.
    * `usdMicros` is the ceiling in USD-micros (1 USD = 1_000_000). Absent →
    * no cap (zero behaviour change for existing callers). A model the
    * pricing table can't price accrues $0, so an all-unpriced run degrades
@@ -1736,7 +1798,24 @@ export type RunChatLoopOptions = {
       | { readonly kind: "stop" }
       | { readonly kind: "degrade"; readonly model: string };
     readonly scope?: "run" | "session";
+    readonly judgeShare?: number;
   };
+  /**
+   * 0.6.0 §7.12 — a caller-owned, RUN-spanning budget meter. The loop's own
+   * meter is created per `runChatLoop` call and reads `getRunCost(bus.runId)`,
+   * so a shape that runs several loops per run (the workflow target: one
+   * `singleTurn` loop per step) had `budget.usd` bounding each STEP — N steps
+   * could spend N× the cap. The compiled workflow bundle now creates ONE
+   * `createCostTracker(__runContext.eventBus, { suppressEvents: true })` on
+   * the shared run context and hands it to every step through this option
+   * (together with `runContext`, so every step publishes on the meter's
+   * bus under one `runId`); the gates then read the accumulated run spend.
+   * When supplied, the loop neither creates its own meter nor unsubscribes
+   * this one — its lifetime is the caller's. Absent (every other shape) →
+   * the per-loop meter, byte-identical to before. Meaningful only alongside
+   * `budget`.
+   */
+  budgetMeter?: CostTracker;
   /**
    * Loop contract 0.4 (G10) — whole-run wall-clock ceiling in ms (spec
    * `limits.deadline_ms`). Armed once at loop start; on fire it aborts the
@@ -2314,6 +2393,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // chars/4 heuristic. `undefined` before the first response — the heuristic
   // is used only pre-first-call.
   let lastModelInputTokens: number | undefined;
+  // 0.6.0 §8.1 — the WIRE model id of the most recent main-turn
+  // `model_response`, i.e. the arm that produced the text an in-loop
+  // evaluation grades; stamped as `eval_graded.model`.
+  let lastResponseWireModel: string | undefined;
   /** The context-size signal for routing/compaction: the provider's real
    *  last-call input_tokens once available, else the chars/4 estimate. */
   const contextTokenSignal = (msgs: ReadonlyArray<Anthropic.MessageParam>): number =>
@@ -2732,10 +2815,52 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // before; otherwise the meter itself publishes, and the persist subscriber
   // below is armed for it. `run`-scoped budgets are byte-identical to 0.5.x.
   const budgetSessionPersist = budgetSessionScoped && subscribers.costTracker === undefined;
-  const budgetMeter =
-    opts.budget !== undefined
+  // 0.6.0 §7.12 — a caller-supplied meter (the workflow bundle's run-spanning
+  // tracker) is used as-is and outlives this loop; otherwise the per-loop
+  // meter, exactly as before.
+  const ownBudgetMeter =
+    opts.budgetMeter === undefined && opts.budget !== undefined
       ? createCostTracker(bus, { suppressEvents: !budgetSessionPersist })
       : undefined;
+  const budgetMeter: CostTracker | undefined = opts.budgetMeter ?? ownBudgetMeter;
+  // 0.6.0 §6.2 — `budget.judge_share`: the sub-cap on AUXILIARY-role spend
+  // (judge, compaction, guide, classifier, consult, committee, shadow) inside
+  // the run cap. The meter already splits priced spend by `role`, so the
+  // share is a read over `byRole`. Exhaustion is an accounting signal here —
+  // one stderr notice per meter, plus `reason: "judge_share_exhausted"` on
+  // every `eval_graded` published while the share stands exhausted — never a
+  // stop (the total cap is the stop); the cascade behaviour consuming it
+  // lands with the hybrid strategies. The read rides EVERY budget gate (see
+  // `enforceBudget`), not only the in-loop grade, so a run without
+  // `evaluation:` still surfaces the signal.
+  const judgeShareMicros =
+    opts.budget !== undefined
+      ? Math.round(opts.budget.usdMicros * (opts.budget.judgeShare ?? DEFAULT_JUDGE_SHARE))
+      : undefined;
+  const auxiliarySpentMicros = (): number =>
+    budgetMeter === undefined
+      ? 0
+      : sumRoleCost(budgetMeter.getRunCost(bus.runId), AUXILIARY_MODEL_ROLES);
+  /** True once auxiliary spend has reached the share. Re-read on demand so a
+   *  reader (every budget gate and the eval gate today, the cascade later)
+   *  sees the live state; the notice prints once per meter. */
+  const judgeShareExhausted = (): boolean => {
+    if (judgeShareMicros === undefined || budgetMeter === undefined) return false;
+    const aux = auxiliarySpentMicros();
+    if (aux < judgeShareMicros) return false;
+    if (!judgeShareNoticedMeters.has(budgetMeter)) {
+      judgeShareNoticedMeters.add(budgetMeter);
+      const share = opts.budget?.judgeShare ?? DEFAULT_JUDGE_SHARE;
+      process.stderr.write(
+        `[budget] auxiliary spend $${(aux / 1_000_000).toFixed(4)} ≥ judge_share $${(
+          judgeShareMicros / 1_000_000
+        ).toFixed(4)} (${share} of the $${((opts.budget?.usdMicros ?? 0) / 1_000_000).toFixed(
+          4,
+        )} cap) — judge_share_exhausted; judging continues under the total cap.\n`,
+      );
+    }
+    return true;
+  };
   let budgetDegraded = false;
   // 0.6.0 — the turn in which the degrade fired. Spend never falls back
   // under the cap, so "a later breach on the degraded rung" cannot be an
@@ -2776,6 +2901,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    */
   const enforceBudget = async (turn: number): Promise<"continue" | "stop"> => {
     if (opts.budget === undefined || budgetMeter === undefined) return "continue";
+    // 0.6.0 §6.2 — the judge_share read rides every gate, so the one-time
+    // notice fires on ANY budgeted run once auxiliary spend crosses the
+    // share — a compaction-only run, or a workflow whose `kind: judge` gates
+    // run between steps on the shared meter — not only when an in-loop
+    // `evaluation:` grade happens to read it. Accounting only: the share
+    // never stops or degrades; the total cap below does.
+    judgeShareExhausted();
     const spent = resumedCostUsdMicros + budgetMeter.getRunCost(bus.runId).totalUsdMicros;
     if (spent < opts.budget.usdMicros) return "continue";
     // Degraded in THIS turn: the rung serves every remaining call of it.
@@ -3287,9 +3419,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   };
   /** The extra `maybeCompact` args (Item 1 curation + Item 4 real tokens),
    *  recomputed per call so `realInputTokens` reflects the newest response. */
-  const compactionExtras = (): Pick<CompactArgs, "realInputTokens" | "curate" | "onCurate"> => ({
+  // 0.6.0 §6.2 — the compaction slot's SPEC string, for the `specModel`
+  // attribution on its metered side-calls (the wire id is
+  // `compactionWireModelId`). With no explicit `compactionModel` the slot IS
+  // the agent's own model.
+  const compactionSpecModel = opts.compactionModel ?? opts.model;
+  const compactionExtras = (): Pick<
+    CompactArgs,
+    "realInputTokens" | "curate" | "onCurate" | "bus" | "compactionSpecModel"
+  > => ({
     ...(lastModelInputTokens !== undefined ? { realInputTokens: lastModelInputTokens } : {}),
     ...(curateConfig !== undefined ? { curate: curateConfig, onCurate: publishCurate } : {}),
+    // 0.6.0 §6.2 — the pre-turn autocompact summary publishes on the run bus
+    // with role "compaction", so it is priced and counted toward `budget`.
+    bus,
+    compactionSpecModel,
   });
   const permissionMode: PermissionMode = opts.permissionMode ?? "default";
   // #383 — merge the harness's `.crewhaus/settings.json` rules into the
@@ -5273,6 +5417,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // of reading the context as empty and silently disabling compaction.
               const reportedInputTokens = responseInputTokens(usage);
               if (reportedInputTokens > 0) lastModelInputTokens = reportedInputTokens;
+              lastResponseWireModel = respModelIdS;
               // Adaptive model routing — fold this successful turn into the
               // reward scoreboard so the learned policy improves next run.
               if (poolTurn !== undefined) {
@@ -5397,6 +5542,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // context as empty and silently disabling compaction.
             const reportedInputTokens = responseInputTokens(final.usage);
             if (reportedInputTokens > 0) lastModelInputTokens = reportedInputTokens;
+            lastResponseWireModel = respWireModelId;
             // Adaptive model routing — fold this successful turn into the
             // reward scoreboard so the learned policy improves next run.
             if (poolTurn !== undefined) {
@@ -5637,6 +5783,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 logger: runContext.logger,
                 onEvict: externalizeEvicted,
                 getLedgerText: ledgerAnchorText,
+                // 0.6.0 §6.2 — the reactive summary is metered too.
+                bus,
+                compactionSpecModel,
               }).finally(() => out.spinner.stop());
               // §2.3 — persist the summary text alongside the counts (the
               // reactive path always ends in autocompact's [marker, summary]).
@@ -5847,6 +5996,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           finalText: terminalText(attempt.terminalContent),
           messages,
           usage: attempt.usage,
+          // 0.6.0 §6.2 — the judge publishes its model calls on THIS bus, so
+          // the budget meter above (and any attached cost-tracker) sees them.
+          bus,
         });
       } catch (err) {
         // Grading INFRASTRUCTURE failure (judge model down, evaluator bug)
@@ -5869,6 +6021,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const score = Number.isFinite(graded.score) ? graded.score : 0;
       const rationale = graded.rationale;
       const verdict: "pass" | "fail" = score >= evaluation.threshold ? "pass" : "fail";
+      // 0.6.0 §6.2 — read AFTER the grade so the judge call that just ran is
+      // in the meter: the signal says "this grade was produced past the share".
+      const shareExhausted = judgeShareExhausted();
       bus.publish({
         ...bus.envelope(),
         kind: "eval_graded",
@@ -5881,6 +6036,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         // (`dataset mine`'s eval-fail signal) cannot distinguish a ladder that
         // was fully spent from one cut short, and over-claims "exhausted".
         maxRetries,
+        // 0.6.0 §8.1 — attribution: the arm that produced the graded text, the
+        // judge that scored it and what that judge call cost (grader-reported,
+        // absent for deterministic graders), and the judge-share signal.
+        ...(lastResponseWireModel !== undefined ? { model: lastResponseWireModel } : {}),
+        ...(graded.judge !== undefined ? { judgeModel: graded.judge.model } : {}),
+        ...(graded.judge?.costUsdMicros !== undefined
+          ? { judgeCostUsdMicros: graded.judge.costUsdMicros }
+          : {}),
+        ...(shareExhausted ? { reason: "judge_share_exhausted" as const } : {}),
       });
       if (verdict === "pass" || evaluation.onFail === "note") return attempt;
       const rationaleNote =
@@ -6024,7 +6188,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       failoverNoteUnsubscribe?.();
       routingPersist.unsubscribe();
       incidentCollector?.unsubscribe();
-      budgetMeter?.unsubscribe();
+      ownBudgetMeter?.unsubscribe();
       advisorPersist?.unsubscribe();
       mcpStatsPersist?.unsubscribe();
       watchmeCapture?.unsubscribe();
@@ -6318,7 +6482,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     failoverNoteUnsubscribe?.();
     routingPersist.unsubscribe();
     incidentCollector?.unsubscribe();
-    budgetMeter?.unsubscribe();
+    ownBudgetMeter?.unsubscribe();
     advisorPersist?.unsubscribe();
     mcpStatsPersist?.unsubscribe();
     watchmeCapture?.unsubscribe();
@@ -6713,6 +6877,15 @@ type CompactArgs = {
   /** Item 1 / G19 — reports one curation pass so the caller publishes the
    *  `curate` trace event (mirrors `onCompaction`). */
   onCurate?: (info: CurateInfo) => Promise<void>;
+  /** 0.6.0 §6.2 — the run bus the autocompact summariser publishes its
+   *  `model_request`/`model_response` (role `"compaction"`) on, so the
+   *  side-call is priced and budget-metered. Absent → unmetered (the
+   *  pre-0.6.0 behaviour, kept for direct callers). */
+  bus?: TraceEventBus;
+  /** 0.6.0 — the SPEC model string of the compaction slot (`compaction.model`
+   *  or the agent's own), stamped as `specModel` when it differs from the
+   *  wire `model`. */
+  compactionSpecModel?: string;
 };
 
 type OnCompaction = (info: CompactionInfo) => Promise<void>;
@@ -6769,6 +6942,8 @@ async function maybeCompact(
     realInputTokens,
     curate: curateCfg,
     onCurate,
+    bus,
+    compactionSpecModel,
   } = args;
 
   // Item 4 / G28 — real-token calibration. The initial array's real size is
@@ -6850,12 +7025,11 @@ async function maybeCompact(
   // step's evictions are part of it.
   if (onEvict !== undefined && snipped.length > 0) await onEvict(snipped);
   const ledgerText = getLedgerText?.();
-  const after = await autoCompact(
-    snipped,
-    adapter,
-    model,
-    ledgerText !== undefined ? { ledgerText } : {},
-  );
+  const after = await autoCompact(snipped, adapter, model, {
+    ...(ledgerText !== undefined ? { ledgerText } : {}),
+    ...(bus !== undefined ? { bus } : {}),
+    ...(compactionSpecModel !== undefined ? { specModel: compactionSpecModel } : {}),
+  });
   if (onCompaction !== undefined) {
     const summary = summaryTextOf(after);
     await onCompaction({
@@ -6879,6 +7053,10 @@ type ForceCompactArgs = {
   onEvict?: (evicted: ReadonlyArray<Anthropic.MessageParam>) => Promise<void>;
   /** See CompactArgs.getLedgerText. */
   getLedgerText?: () => string | undefined;
+  /** See CompactArgs.bus. */
+  bus?: TraceEventBus;
+  /** See CompactArgs.compactionSpecModel. */
+  compactionSpecModel?: string;
 };
 
 /**
@@ -6888,8 +7066,18 @@ type ForceCompactArgs = {
  * largest blob).
  */
 async function forceCompact(args: ForceCompactArgs): Promise<Anthropic.MessageParam[]> {
-  const { messages, adapter, model, snipKeepHead, snipKeepTail, logger, onEvict, getLedgerText } =
-    args;
+  const {
+    messages,
+    adapter,
+    model,
+    snipKeepHead,
+    snipKeepTail,
+    logger,
+    onEvict,
+    getLedgerText,
+    bus,
+    compactionSpecModel,
+  } = args;
   const snipped = snip(messages, snipKeepHead, snipKeepTail);
   // §2.3 — same externalize-before-drop contract as the pre-turn ladder:
   // the snip diff first, then the full remaining history autocompact is
@@ -6901,5 +7089,9 @@ async function forceCompact(args: ForceCompactArgs): Promise<Anthropic.MessagePa
   logger.info("reactive snip applied", { before: messages.length, after: snipped.length });
   if (onEvict !== undefined && snipped.length > 0) await onEvict(snipped);
   const ledgerText = getLedgerText?.();
-  return await autoCompact(snipped, adapter, model, ledgerText !== undefined ? { ledgerText } : {});
+  return await autoCompact(snipped, adapter, model, {
+    ...(ledgerText !== undefined ? { ledgerText } : {}),
+    ...(bus !== undefined ? { bus } : {}),
+    ...(compactionSpecModel !== undefined ? { specModel: compactionSpecModel } : {}),
+  });
 }

@@ -23,6 +23,7 @@
 import type {
   CostAccrualEvent,
   ModelResponseEvent,
+  ModelRole,
   ProviderId,
   TraceEvent,
   TraceEventBus,
@@ -102,6 +103,14 @@ export type RunCostSummary = {
   readonly totalUsdMicros: number;
   /** Stable order: providers sorted alphabetically. */
   readonly byProvider: { readonly [P in ProviderId]?: number };
+  /**
+   * 0.6.0 (design §6.2, §7.12) — priced spend split by the `role` the
+   * `model_response` carried (an absent role folds under `"primary"`). This
+   * is what `budget.judge_share` reads: the runtime sums the auxiliary roles
+   * (`AUXILIARY_MODEL_ROLES`) against the share of the run cap. Stable order:
+   * roles sorted alphabetically; only roles that accrued appear.
+   */
+  readonly byRole: { readonly [R in ModelRole]?: number };
 };
 
 export type CostTrackerOptions = {
@@ -138,7 +147,12 @@ export interface CostTracker {
 type RunRecord = {
   totalUsdMicros: number;
   byProvider: Map<ProviderId, number>;
+  byRole: Map<ModelRole, number>;
 };
+
+function emptyRecord(): RunRecord {
+  return { totalUsdMicros: 0, byProvider: new Map(), byRole: new Map() };
+}
 
 export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions = {}): CostTracker {
   const pricing = opts.pricing ?? DEFAULT_PRICING;
@@ -149,20 +163,25 @@ export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions =
   let observed = 0;
   let pricingMisses = 0;
 
+  function fold(rec: RunRecord, provider: ProviderId, role: ModelRole, micros: number): void {
+    rec.totalUsdMicros += micros;
+    rec.byProvider.set(provider, (rec.byProvider.get(provider) ?? 0) + micros);
+    rec.byRole.set(role, (rec.byRole.get(role) ?? 0) + micros);
+  }
+
   function recordCost(
     runId: string,
     provider: ProviderId,
+    role: ModelRole,
     micros: number,
     forTenantId: string | undefined,
   ): void {
-    const run = runs.get(runId) ?? { totalUsdMicros: 0, byProvider: new Map() };
-    run.totalUsdMicros += micros;
-    run.byProvider.set(provider, (run.byProvider.get(provider) ?? 0) + micros);
+    const run = runs.get(runId) ?? emptyRecord();
+    fold(run, provider, role, micros);
     runs.set(runId, run);
     if (forTenantId !== undefined) {
-      const t = tenants.get(forTenantId) ?? { totalUsdMicros: 0, byProvider: new Map() };
-      t.totalUsdMicros += micros;
-      t.byProvider.set(provider, (t.byProvider.get(provider) ?? 0) + micros);
+      const t = tenants.get(forTenantId) ?? emptyRecord();
+      fold(t, provider, role, micros);
       tenants.set(forTenantId, t);
     }
   }
@@ -199,7 +218,8 @@ export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions =
         cachedReadTokens,
         cacheCreationTokens,
       );
-      recordCost(resp.runId, provider, costUsdMicros, tenantId);
+      // 0.6.0 — an absent role is the main-turn call, i.e. `"primary"`.
+      recordCost(resp.runId, provider, resp.role ?? "primary", costUsdMicros, tenantId);
     } else {
       pricingMisses++;
       unpriced = true;
@@ -240,12 +260,12 @@ export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions =
   return {
     getRunCost(runId): RunCostSummary {
       const r = runs.get(runId);
-      if (!r) return { totalUsdMicros: 0, byProvider: {} };
+      if (!r) return { totalUsdMicros: 0, byProvider: {}, byRole: {} };
       return summarize(r);
     },
     getTenantCost(t): RunCostSummary {
       const r = tenants.get(t);
-      if (!r) return { totalUsdMicros: 0, byProvider: {} };
+      if (!r) return { totalUsdMicros: 0, byProvider: {}, byRole: {} };
       return summarize(r);
     },
     unsubscribe(): void {
@@ -269,7 +289,22 @@ function summarize(r: RunRecord): RunCostSummary {
   for (const k of keys) {
     out[k] = r.byProvider.get(k);
   }
-  return { totalUsdMicros: r.totalUsdMicros, byProvider: out };
+  const byRole: { [R in ModelRole]?: number } = {};
+  for (const k of [...r.byRole.keys()].sort() as ModelRole[]) {
+    byRole[k] = r.byRole.get(k);
+  }
+  return { totalUsdMicros: r.totalUsdMicros, byProvider: out, byRole };
+}
+
+/**
+ * 0.6.0 (design §6.2, §7.12) — sum the priced spend of the given roles from a
+ * {@link RunCostSummary}. `budget.judge_share` calls this with
+ * `AUXILIARY_MODEL_ROLES`; `cost-summary` can call it with any slice.
+ */
+export function sumRoleCost(summary: RunCostSummary, roles: ReadonlyArray<ModelRole>): number {
+  let total = 0;
+  for (const role of roles) total += summary.byRole[role] ?? 0;
+  return total;
 }
 
 /** Format a USD-micros total as `"$0.0042"` (4 fractional digits). */

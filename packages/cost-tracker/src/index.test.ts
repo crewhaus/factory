@@ -19,6 +19,7 @@ import {
   createCostTracker,
   formatUsdMicros,
   resolvePricing,
+  sumRoleCost,
 } from "./index";
 
 const RUN_ID = "run_test_0001";
@@ -641,5 +642,77 @@ describe("cost-tracker — T9 associative aggregation property", () => {
     // associativity: sum-of-providers === total
     const sumA = Object.values(a.byProvider).reduce((acc, v) => acc + (v ?? 0), 0);
     expect(sumA).toBe(a.totalUsdMicros);
+  });
+});
+
+// 0.6.0 (design §6.2, §7.12) — per-role aggregation for `budget.judge_share`.
+describe("cost-tracker — byRole aggregation (0.6.0 §6.2)", () => {
+  test("splits priced spend by the response's role; an absent role folds under primary", () => {
+    const bus = makeBus();
+    const tracker = createCostTracker(bus, { suppressEvents: true });
+    // 1000 in × 15 = 15_000 micros each (opus-4, no output).
+    bus.publish(
+      modelResponse(bus, {
+        model: "claude-opus-4",
+        provider: "anthropic",
+        inputTokens: 1000,
+        outputTokens: 0,
+      }),
+    );
+    bus.publish(
+      modelResponse(bus, {
+        model: "claude-opus-4",
+        provider: "anthropic",
+        inputTokens: 1000,
+        outputTokens: 0,
+        attribution: { role: "judge" },
+      }),
+    );
+    bus.publish(
+      modelResponse(bus, {
+        model: "claude-opus-4",
+        provider: "anthropic",
+        inputTokens: 2000,
+        outputTokens: 0,
+        attribution: { role: "compaction" },
+      }),
+    );
+    const summary = tracker.getRunCost(RUN_ID);
+    expect(summary.totalUsdMicros).toBe(60_000);
+    expect(summary.byRole).toEqual({ compaction: 30_000, judge: 15_000, primary: 15_000 });
+    // Stable, alphabetical key order.
+    expect(Object.keys(summary.byRole)).toEqual(["compaction", "judge", "primary"]);
+    // The auxiliary slice a judge_share meter reads.
+    expect(sumRoleCost(summary, ["judge", "compaction"])).toBe(45_000);
+    expect(sumRoleCost(summary, ["guide"])).toBe(0);
+    // Sum of roles === total (associativity, like byProvider).
+    expect(Object.values(summary.byRole).reduce((a, v) => a + (v ?? 0), 0)).toBe(60_000);
+    tracker.unsubscribe();
+  });
+
+  test("an unobserved run reports an empty byRole", () => {
+    const tracker = createCostTracker(makeBus(), { suppressEvents: true });
+    expect(tracker.getRunCost("run_never")).toEqual({
+      totalUsdMicros: 0,
+      byProvider: {},
+      byRole: {},
+    });
+    tracker.unsubscribe();
+  });
+
+  test("tenant totals split by role too", () => {
+    const bus = makeBus();
+    const tracker = createCostTracker(bus, { suppressEvents: true, tenantId: "t1" });
+    bus.publish(
+      modelResponse(bus, {
+        model: "claude-opus-4",
+        provider: "anthropic",
+        inputTokens: 1000,
+        outputTokens: 0,
+        attribution: { role: "judge" },
+      }),
+    );
+    expect(tracker.getTenantCost("t1").byRole).toEqual({ judge: 15_000 });
+    tracker.unsubscribe();
   });
 });

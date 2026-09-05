@@ -85,6 +85,33 @@ export type ModelRole =
   | "subagent";
 
 /**
+ * 0.6.0 (design §6.2, §7.12) — the AUXILIARY roles: model calls made in
+ * service of the run's answer rather than as the answer itself. This is the
+ * set `budget.judge_share` bounds (the sub-cap on judge, guide, classifier,
+ * consult, committee, shadow and compaction spend inside `budget.usd`), and
+ * the set the eval runner keeps OUT of `--budget-usd` (which bounds agent
+ * spend). `primary`, `draft` and `escalation` are the answer's own rungs;
+ * `subagent` is a child's re-published answer work — none of those is
+ * auxiliary. Exported as a frozen array so every consumer (runtime-core's
+ * meter, eval-runner's token fold, `cost-summary`) shares one definition.
+ */
+export const AUXILIARY_MODEL_ROLES: ReadonlyArray<ModelRole> = Object.freeze([
+  "judge",
+  "guide",
+  "classifier",
+  "consult",
+  "committee",
+  "shadow",
+  "compaction",
+]);
+
+/** True when `role` is one of {@link AUXILIARY_MODEL_ROLES}. An absent role
+ *  (`undefined`) reads as `"primary"` and is therefore NOT auxiliary. */
+export function isAuxiliaryModelRole(role: ModelRole | undefined): boolean {
+  return role !== undefined && AUXILIARY_MODEL_ROLES.includes(role);
+}
+
+/**
  * 0.6.0 (design §8.1) — what the adapter ACTUALLY sent after its own
  * parameter gating (Claude 5 drops `temperature`, OpenAI reasoning models
  * swap `max_tokens` for `max_completion_tokens`, …). Filled by the optional
@@ -971,6 +998,16 @@ export type EvalGradedEvent = TraceEventEnvelope & {
   judgeCostUsdMicros?: number;
   /** Under `on_fail: escalate`, the SPEC model string the turn was handed to after this failing grade. */
   escalatedTo?: string;
+  /**
+   * 0.6.0 (design §6.2, §7.12) — budget signal stamped on the grade: the
+   * run's auxiliary-role spend (see {@link AUXILIARY_MODEL_ROLES}) had already
+   * reached `budget.judge_share` × `budget.usd` when this grading pass ran.
+   * The judge still ran — the existing retry path keeps judging under the
+   * TOTAL cap — so this is the accounting signal a cascade consumes to serve
+   * the strong rung directly instead of spending more on judging. Absent when
+   * no budget is declared or the share is not yet spent.
+   */
+  reason?: "judge_share_exhausted";
 };
 
 /**
@@ -998,6 +1035,18 @@ export type JudgeVerdictEvent = TraceEventEnvelope & {
   panel?: ReadonlyArray<string>;
   /** The gate's priced judge spend, when the grader reported usage. */
   costUsdMicros?: number;
+  /**
+   * 0.6.0 (design §6.2, §7.12) — budget signal stamped on the gate's verdict:
+   * the run's auxiliary-role spend (see {@link AUXILIARY_MODEL_ROLES}) had
+   * already reached `budget.judge_share` × `budget.usd` when this scoring pass
+   * ran, read over the shape's run-spanning meter (the workflow bundle's
+   * `__budgetMeter`). The judge still ran and the gate applies its `on_fail`
+   * as declared — this is the accounting signal the cascade consumes. Absent
+   * when no budget is declared, the share is not yet spent, or the shape has
+   * no run-spanning meter (the graph target, whose per-node meters are torn
+   * down before a judge node runs).
+   */
+  reason?: "judge_share_exhausted";
 };
 
 export type TraceEvent =

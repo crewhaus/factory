@@ -1224,6 +1224,7 @@ type SpecWithBudget = {
       | { readonly action: "stop" }
       | { readonly action: "degrade"; readonly model: string };
     readonly scope?: "run" | "session";
+    readonly judge_share?: number;
   };
 };
 
@@ -1235,10 +1236,18 @@ function lowerBudget(spec: SpecWithBudget): { budget?: IrBudget } {
     b.on_exceed.action === "degrade"
       ? { kind: "degrade", model: b.on_exceed.model }
       : { kind: "stop" };
-  // 0.6.0 §7.12 — `scope` is spread ONLY when declared: every emitter writes
-  // `JSON.stringify(ir.budget)` verbatim, so an absent key keeps pre-0.6.0
-  // bundles byte-identical while the runtime defaults to `run`.
-  return { budget: { usdMicros, onExceed, ...(b.scope !== undefined ? { scope: b.scope } : {}) } };
+  // 0.6.0 §7.12 / §6.2 — `scope` and `judgeShare` are spread ONLY when
+  // declared: every emitter writes `JSON.stringify(ir.budget)` verbatim, so
+  // an absent key keeps pre-0.6.0 bundles byte-identical while the runtime
+  // defaults to `run` / 0.3.
+  return {
+    budget: {
+      usdMicros,
+      onExceed,
+      ...(b.scope !== undefined ? { scope: b.scope } : {}),
+      ...(b.judge_share !== undefined ? { judgeShare: b.judge_share } : {}),
+    },
+  };
 }
 
 /**

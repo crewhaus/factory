@@ -45,11 +45,14 @@ import {
  *     captured BEFORE the first run, so a retry replays the exact same
  *     user content (not the step's own output).
  *
- * v0 honesty notes (mirrors the per-step `budget` meter caveat): judge
- * model calls ride OUTSIDE the per-step budget meter and the runtime
- * deadline timers (eval-judge drives the provider adapter directly), and
- * in a judge CHAIN a retry re-scores only the retrying judge — earlier
- * judges' verdicts refer to the previous attempt.
+ * 0.6.0 §7.12 / §6.2 — the `budget` meter now spans the RUN (one
+ * `createCostTracker` on the shared `__runContext`, handed to every step as
+ * `budgetMeter`), and judge calls publish on that same bus with
+ * `role: "judge"`, so they are inside the cap. Remaining v0 honesty notes:
+ * judge model calls still ride OUTSIDE the runtime deadline timers
+ * (eval-judge drives the provider adapter directly), and in a judge CHAIN a
+ * retry re-scores only the retrying judge — earlier judges' verdicts refer
+ * to the previous attempt.
  *
  * Future expansion: parallel/conditional steps, fan-out — this v0 emits
  * strictly sequential execution.
@@ -200,6 +203,10 @@ type StepShared = {
   readonly failureTaxonomyField: string;
   readonly limitsFields: string;
   readonly budgetField: string;
+  /** 0.6.0 §6.2 — a `budget:` is declared, so the run body carries the
+   *  shared `__budgetMeter` and the `__judgeShareExhausted()` read the judge
+   *  steps stamp `reason: "judge_share_exhausted"` from. */
+  readonly hasBudget: boolean;
   readonly hooksExpr: string;
   readonly deadlineMs: number | undefined;
   readonly mcpWired: boolean;
@@ -381,6 +388,7 @@ ${deadlineGuard}  process.stdout.write(${escapeJsonString(`\n[step ${stepNum}/${
       `${i}  model: ${escapeJsonString(step.model)},`,
       `${i}  gatedTask: ${escapeJsonString(gated.instructions)},`,
       `${i}  output: priorOutput,`,
+      `${i}  bus: __runContext.eventBus,`,
       `${i}});`,
       `${i}const __pass = __result.score >= ${gate.threshold};`,
       `${i}const __bus = __runContext.eventBus;`,
@@ -391,6 +399,17 @@ ${deadlineGuard}  process.stdout.write(${escapeJsonString(`\n[step ${stepNum}/${
       `${i}  verdict: __pass ? "pass" : "fail",`,
       `${i}  score: __result.score,`,
       `${i}  ...(__result.rationale.length > 0 ? { rationale: __result.rationale } : {}),`,
+      `${i}  judgeModel: __result.judgeModel,`,
+      `${i}  ...(__result.costUsdMicros !== undefined ? { costUsdMicros: __result.costUsdMicros } : {}),`,
+      // 0.6.0 §6.2 — read AFTER the scoring pass so the judge call that just
+      // ran is in the shared meter: the signal says "this verdict was
+      // produced past budget.judge_share". Budget-free workflows have no
+      // meter to read, so the line is absent there (byte-identical).
+      ...(shared.hasBudget
+        ? [
+            `${i}  ...(__judgeShareExhausted() ? { reason: "judge_share_exhausted" as const } : {}),`,
+          ]
+        : []),
       `${i}});`,
       `${i}process.stdout.write(${escapeJsonString(`[judge ${step.name}] `)} + "verdict=" + (__pass ? "pass" : "fail") + " score=" + __result.score.toFixed(2) + ${escapeJsonString(` threshold=${gate.threshold}\n`)});`,
     ].join("\n");
@@ -624,16 +643,19 @@ function renderFailureTaxonomyField(ir: IrWorkflowV0): string {
 
 /**
  * Item 27 (Batch A extends the block to this shape) — render the `budget`
- * runChatLoop field, threaded into EVERY step's call. Each step runs its
- * own loop with its own cost meter, so in v0 the cap bounds each step
- * independently (a run-spanning meter needs a runtime-core seam that does
- * not exist yet). `JSON.stringify` safely quotes the degrade `model`
- * string. Empty when the spec omits it. Mirror: target-cli +
- * target-channel-bot + target-managed render the same field.
+ * runChatLoop field, threaded into EVERY step's call. 0.6.0 §7.12 — the cap
+ * bounds the RUN, not each step: alongside the block every step receives
+ * `budgetMeter: __budgetMeter`, the ONE `createCostTracker` the bundle opens
+ * on the shared `__runContext` bus (see {@link renderAgent}); runtime-core
+ * uses a supplied meter instead of minting a per-loop one, so the per-call
+ * gate in step N reads the spend of steps 1..N. `JSON.stringify` safely
+ * quotes the degrade `model` string. Empty when the spec omits it. Mirror:
+ * target-cli + target-channel-bot + target-managed render the block alone
+ * (one loop per run there).
  */
 function renderBudgetField(ir: IrWorkflowV0): string {
   if (ir.budget === undefined) return "";
-  return `\n    budget: ${JSON.stringify(ir.budget)},`;
+  return `\n    budget: ${JSON.stringify(ir.budget)},\n    budgetMeter: __budgetMeter,`;
 }
 
 /**
@@ -846,14 +868,18 @@ const JUDGE_GATE_HELPER = `
  * Loop contract 0.4 (G02) — score \`output\` in [0,1] against free-text
  * judge criteria: eval-judge's forced-tool scorer over a single-criterion
  * rubric (generic 1–5 anchors), mapped down via (n - 1) / 4. The judge
- * model resolves through the model-router, so any provider can judge.
+ * model resolves through the model-router, so any provider can judge; its
+ * calls publish on the run bus with role "judge", so judge spend is priced
+ * and metered into the run budget, and the verdict carries the judge's
+ * wire model + priced spend for the judge_verdict event.
  */
 async function __judgeGate(opts: {
   criteria: string;
   model: string;
   gatedTask: string;
   output: string;
-}): Promise<{ score: number; rationale: string }> {
+  bus: TraceEventBus;
+}): Promise<{ score: number; rationale: string; judgeModel: string; costUsdMicros?: number }> {
   const result = await judge({
     rubric: {
       criteria: [
@@ -874,8 +900,16 @@ async function __judgeGate(opts: {
     sample: { id: "judge-gate", input: opts.gatedTask },
     agentOutput: opts.output,
     model: opts.model,
+    // Judge spend rides the run bus (role "judge") so it is priced and
+    // counted toward budget.usd under budget.judge_share.
+    bus: opts.bus,
   });
-  return { score: (result.score - 1) / 4, rationale: result.rationale };
+  return {
+    score: (result.score - 1) / 4,
+    rationale: result.rationale,
+    judgeModel: result.usage.model,
+    ...(result.usage.costUsdMicros !== undefined ? { costUsdMicros: result.usage.costUsdMicros } : {}),
+  };
 }
 `;
 
@@ -917,6 +951,10 @@ function renderAgent(ir: IrWorkflowV0, evalEntry = false): string {
   const hasThrowingJudges = ir.steps.some(
     (s) => isJudgeStep(s) && s.judge !== undefined && s.judge.onFail !== "continue",
   );
+  // 0.6.0 §7.12 — a `budget` needs the shared RunContext too: the
+  // run-spanning meter subscribes to ITS bus, and every step must publish
+  // there for the meter to see the whole run.
+  const hasBudget = ir.budget !== undefined;
   const gatedIdx = new Set<number>();
   for (let i = 0; i < ir.steps.length; i += 1) {
     const s = ir.steps[i];
@@ -935,13 +973,14 @@ function renderAgent(ir: IrWorkflowV0, evalEntry = false): string {
     failureTaxonomyField,
     limitsFields,
     budgetField,
+    hasBudget,
     hooksExpr: hasSpecHooks ? "__allHooks" : "__hooks",
     deadlineMs,
     mcpWired: mcp.wired,
     // Cluster S — the eval-entry variant threads the (caller-supplied or
     // fresh) RunContext into EVERY step call so step traces land on the eval
     // runner's per-sample bus; the plain emission keeps the judge-only line.
-    runContextLine: hasJudges || evalEntry ? "\n    runContext: __runContext," : "",
+    runContextLine: hasJudges || evalEntry || hasBudget ? "\n    runContext: __runContext," : "",
     durable,
     evalEntry,
     evalFields: evalEntry
@@ -1053,12 +1092,52 @@ const __durableStep = (name: string, fn: () => Promise<string>): Promise<string>
     ? `import { ${errorsMembers} } from "@crewhaus/errors";
 import { judge } from "@crewhaus/eval-judge";
 import { createRunContext } from "@crewhaus/run-context";
+import type { TraceEventBus } from "@crewhaus/trace-event-bus";
 `
     : "";
   // Cluster S — the eval-entry variant always mints/accepts a RunContext, so
-  // the import must exist even on judge-free workflows.
+  // the import must exist even on judge-free workflows (0.6.0: a budget
+  // needs it too, for the run-spanning meter).
   const evalEntryImports =
-    evalEntry && !hasJudges ? `import { createRunContext } from "@crewhaus/run-context";\n` : "";
+    (evalEntry || hasBudget) && !hasJudges
+      ? `import { createRunContext } from "@crewhaus/run-context";\n`
+      : "";
+  // 0.6.0 §7.12 — the run-spanning budget meter: one cost tracker on the
+  // shared bus, silent (no `cost_accrual` of its own beside an env-attached
+  // tracker — which also means a judge GATE's spend, published between steps
+  // after step N's loop has torn its env-attached tracker down, is counted
+  // by this meter but reaches no `cost_accrual` line and so no
+  // `cost-summary`; closing that is follow-up work recorded in the 0.6.0
+  // PR train), handed to every step through `budgetMeter`. §6.2 — with judge
+  // steps present the boot also derives the `judge_share` sub-cap from the
+  // same meter so each gate can stamp `reason: "judge_share_exhausted"`.
+  const budgetMeterImport = hasBudget
+    ? hasJudges
+      ? `import { createCostTracker, sumRoleCost } from "@crewhaus/cost-tracker";\nimport { DEFAULT_JUDGE_SHARE } from "@crewhaus/runtime-core";\nimport { AUXILIARY_MODEL_ROLES } from "@crewhaus/trace-event-bus";\n`
+      : `import { createCostTracker } from "@crewhaus/cost-tracker";\n`
+    : "";
+  const budgetMeterBoot =
+    ir.budget !== undefined
+      ? [
+          "",
+          "  // 0.6.0 §7.12 — ONE budget meter for the whole run: every step's",
+          "  // model calls (and its judge/compaction side-calls) publish on the",
+          "  // shared bus, so budget.usd bounds the run, not each step.",
+          "  const __budgetMeter = createCostTracker(__runContext.eventBus, { suppressEvents: true });",
+          ...(hasJudges
+            ? [
+                "  // 0.6.0 §6.2 — budget.judge_share over that meter: once the run's",
+                "  // auxiliary-role spend (judge, compaction, …) has reached the share,",
+                '  // every judge_verdict below carries reason "judge_share_exhausted"',
+                "  // (the runtime prints the one [budget] notice from its next per-call",
+                "  // gate). The share never stops the run; budget.usd does.",
+                `  const __judgeShareMicros = Math.round(${ir.budget.usdMicros} * ${ir.budget.judgeShare ?? "DEFAULT_JUDGE_SHARE"});`,
+                "  const __judgeShareExhausted = (): boolean =>",
+                "    sumRoleCost(__budgetMeter.getRunCost(__runContext.runId), AUXILIARY_MODEL_ROLES) >= __judgeShareMicros;",
+              ]
+            : []),
+        ].join("\n")
+      : "";
   const judgeHelperBlock = hasJudges
     ? `${JUDGE_GATE_HELPER}${hasThrowingJudges ? EVAL_EXIT_CONST : ""}`
     : "";
@@ -1070,7 +1149,7 @@ import { createRunContext } from "@crewhaus/run-context";
         "  // traces AND judge verdicts land on this bus.",
         "  const __runContext = __evalOpts.runContext ?? createRunContext();",
       ].join("\n")
-    : hasJudges
+    : hasJudges || hasBudget
       ? [
           "",
           "  // G02 — one shared RunContext: every step's trace events and the",
@@ -1105,7 +1184,7 @@ ${plainInvocation
   // Cluster S — the run body: identical statements either way, wrapped as
   // main() on a plain compile and as the exported runForEval entry (with a
   // thin stdin-reading main) on the eval-entry variant.
-  const runBody = `  let priorOutput = "";${deadlineBoot}${runContextBoot}
+  const runBody = `  let priorOutput = "";${deadlineBoot}${runContextBoot}${budgetMeterBoot}
   const __cwd = process.cwd();
   const [__hooks, __skills, __slashCommands] = await Promise.all([
     loadHooks({ cwd: __cwd }),
@@ -1153,7 +1232,7 @@ ${runBody}}`;
 // Source spec: ${escapeJsonString(ir.name)} (target: workflow, ir version: ${ir.version}, ${ir.steps.length} step(s))
 ${mcp.note}${continuityWarning}import { runChatLoop } from "@crewhaus/runtime-core";
 import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
-${judgeImports}${evalEntryImports}${permImport}${durableImport}${extensionImports}${importBlock}${mcpImportBlock}${APPROVAL_STORE_BOOT}
+${judgeImports}${evalEntryImports}${budgetMeterImport}${permImport}${durableImport}${extensionImports}${importBlock}${mcpImportBlock}${APPROVAL_STORE_BOOT}
 async function readStdinToEnd(): Promise<string> {
   // No piped input — don't block waiting on an interactive TTY.
   if (process.stdin.isTTY) return "";

@@ -6,7 +6,12 @@
 import { describe, expect, test } from "bun:test";
 import { TraceEventBus } from "./event-bus";
 import { formatTraceparent, isValidSpanId, isValidTraceId, parseTraceparent } from "./traceparent";
-import type { TraceEvent } from "./types";
+import {
+  AUXILIARY_MODEL_ROLES,
+  type ModelRole,
+  type TraceEvent,
+  isAuxiliaryModelRole,
+} from "./types";
 
 const baseEnvelope = (bus: TraceEventBus, overrides: Partial<TraceEvent> = {}) => ({
   runId: bus.runId,
@@ -293,5 +298,20 @@ describe("TraceEventBus — Batch C approval events round-trip the ring", () => 
     expect(parked).toHaveLength(1);
     const only = parked[0];
     expect(only?.kind === "approval_requested" && only.approvalId).toBe("appr_1");
+  });
+});
+
+// 0.6.0 (design §6.2, §7.12) — the auxiliary-role set `budget.judge_share` bounds.
+describe("AUXILIARY_MODEL_ROLES / isAuxiliaryModelRole", () => {
+  test("names exactly the side-call roles; the answer's own rungs and children are not auxiliary", () => {
+    expect([...AUXILIARY_MODEL_ROLES].sort()).toEqual(
+      ["classifier", "committee", "compaction", "consult", "guide", "judge", "shadow"].sort(),
+    );
+    expect(Object.isFrozen(AUXILIARY_MODEL_ROLES)).toBe(true);
+    const notAux: ModelRole[] = ["primary", "draft", "escalation", "subagent"];
+    for (const role of notAux) expect(isAuxiliaryModelRole(role)).toBe(false);
+    for (const role of AUXILIARY_MODEL_ROLES) expect(isAuxiliaryModelRole(role)).toBe(true);
+    // An absent role reads as primary.
+    expect(isAuxiliaryModelRole(undefined)).toBe(false);
   });
 });

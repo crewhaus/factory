@@ -209,6 +209,30 @@ Comment + one branch; no behaviour outside that path changes, and the continuity
 opt-out contract is untouched. That one pin was regenerated to its prior bytes
 plus that hunk; every other pin is unchanged.
 
+**0.6.0 PR 2 delta — judge metering; NO pin moved.** Three emitter strings
+changed in this PR: the three `renderEvaluation` copies (cli / channel /
+managed) now hand the run bus to `judge()` and return the judge's wire model +
+priced spend on the verdict; the two `JUDGE_GATE_HELPER`s (workflow / graph)
+take a `bus` and stamp `judgeModel` / `costUsdMicros` on `judge_verdict`; and a
+workflow with a `budget:` block opens one run-spanning `createCostTracker` on
+the shared `__runContext` and threads `budgetMeter: __budgetMeter` +
+`runContext: __runContext` into every step. Every one of those strings is
+emitted ONLY when the spec declares `evaluation:`, a `kind: judge` step/node, or
+a workflow `budget:` — and none of the pinned specs here does (the `managed`
+pin's `budget` is the per-tenant token table, not the run-level block), so the
+byte-restore test passes against the existing pins unchanged. The continuity
+opt-out contract is untouched; recorded here so the next regeneration knows the
+zero delta was checked, not skipped.
+
+**0.6.0 PR 2 review follow-up (§6.2 / §7.12): zero delta, again checked.** The
+workflow emitter now derives the `judge_share` sub-cap from the shared
+`__budgetMeter` (`__judgeShareMicros` / `__judgeShareExhausted()`, two extra
+import lines) and stamps `reason: "judge_share_exhausted"` on `judge_verdict`;
+the graph emitter's `__judgeGate` docblock was reworded. Both strings are emitted
+only when the spec declares a `kind: judge` step/node (the workflow one also
+needs a run-level `budget:`), which none of the pinned specs does — the
+byte-restore test passes against the existing pins unchanged.
+
 ## Regenerating
 
 Only regenerate when a LATER release deliberately changes emitted bundles;

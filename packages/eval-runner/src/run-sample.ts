@@ -312,7 +312,10 @@ function computeMetrics(
   const modelCallLatenciesMs: number[] = [];
   for (const ev of events) {
     if (ev.kind === "model_response") {
-      modelCallLatenciesMs.push((ev as ModelResponseEvent).durationMs);
+      // 0.6.0 — a judge gate's call is not an agent model call.
+      if (isAgentModelResponse(ev as ModelResponseEvent)) {
+        modelCallLatenciesMs.push((ev as ModelResponseEvent).durationMs);
+      }
     } else if (ev.kind === "permission_decision") {
       const e = ev as PermissionDecisionEvent;
       if (e.askOutcome !== undefined) interventions += 1;
@@ -446,12 +449,30 @@ function extractToolCalls(events: ReadonlyArray<TraceEvent>): ToolCall[] {
   return calls.map(({ ts: _ts, ...rest }) => rest);
 }
 
+/**
+ * 0.6.0 (design §6.2, §17) — is this `model_response` the AGENT's own spend?
+ * From 0.6.0 judge calls publish on the run bus with `role: "judge"` — the
+ * workflow/graph eval-entry bundles' `kind: judge` gates run on the sample's
+ * RunContext, so their calls land in `events` — and `--budget-usd` bounds
+ * AGENT spend by contract (see `RunEvalOptions.budgetUsd`). Judge-class
+ * roles (`judge`, `committee`, `shadow`: grading and audition, never the
+ * answer) are excluded from the token fold and the latency percentiles;
+ * every other role (the main turn, a draft/escalation rung, compaction,
+ * guide, classifier, consult) is work done to produce the answer and stays
+ * in. An absent role is the main-turn call.
+ */
+const GRADING_ROLES: ReadonlySet<string> = new Set(["judge", "committee", "shadow"]);
+export function isAgentModelResponse(ev: ModelResponseEvent): boolean {
+  return ev.role === undefined || !GRADING_ROLES.has(ev.role);
+}
+
 function sumTokens(events: ReadonlyArray<TraceEvent>): { input: number; output: number } {
   let input = 0;
   let output = 0;
   for (const ev of events) {
     if (ev.kind === "model_response") {
       const e = ev as ModelResponseEvent;
+      if (!isAgentModelResponse(e)) continue;
       input += e.usage.input;
       output += e.usage.output;
     }

@@ -689,7 +689,12 @@ export type RunEvalOptions = {
    * are deliberately EXCLUDED from this cap: the budget bounds AGENT spend,
    * the quantity a spec's `budget.usd` block declares, so wiring a judge
    * into a rubric can never silently shrink the sample budget of an existing
-   * run. A model without a pricing row disables enforcement with a warning.
+   * run. 0.6.0 (design §6.2, §17) — judge calls now publish on the run bus
+   * with `role: "judge"` (a workflow/graph bundle's `kind: judge` gate runs
+   * on the sample's own RunContext), so the per-sample token fold this cap
+   * is priced from filters them out BY ROLE (`isAgentModelResponse`); the
+   * exclusion is a role filter, not an absence. A model without a pricing
+   * row disables enforcement with a warning.
    */
   readonly budgetUsd?: number;
   /**

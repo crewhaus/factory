@@ -68,6 +68,7 @@ export type {
   Unsubscribe,
 } from "./types";
 
+export { AUXILIARY_MODEL_ROLES, isAuxiliaryModelRole } from "./types";
 export { RingBuffer } from "./ring-buffer";
 export {
   formatTraceparent,
