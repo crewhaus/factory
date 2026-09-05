@@ -2,7 +2,7 @@
   "name": "@crewhaus/compiler",
   "version": "0.5.8",
   "type": "module",
-  "description": "Compiler core: parse → validate → lower → emit",
+  "description": "Compiler core: parse \u2192 validate \u2192 lower \u2192 emit",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -34,6 +34,9 @@
     "@crewhaus/target-voice": "workspace:*",
     "@crewhaus/target-workflow": "workspace:*",
     "@crewhaus/worker-runtime": "workspace:*"
+  },
+  "devDependencies": {
+    "@crewhaus/model-plan": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

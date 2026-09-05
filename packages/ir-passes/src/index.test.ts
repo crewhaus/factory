@@ -13,6 +13,7 @@ import {
   applyPasses,
   deadToolElimination,
   memoryIntegrityPass,
+  modelPlanIntegrity,
   permissionRuleCanonicalize,
   promptCachePrefixSort,
   redundantMcpServerCollapse,
@@ -332,8 +333,8 @@ describe("ir-passes — applyPasses + idempotence (T9)", () => {
     expect(calls).toEqual(["a", "b"]);
   });
 
-  test("DEFAULT_PIPELINE has 7 passes (+ memoryIntegrityPass from v0.3.0 PR 11)", () => {
-    expect(DEFAULT_PIPELINE.length).toBe(7);
+  test("DEFAULT_PIPELINE has 8 passes (+ memoryIntegrityPass from v0.3.0 PR 11, + modelPlanIntegrity from 0.6.0 PR 7)", () => {
+    expect(DEFAULT_PIPELINE.length).toBe(8);
   });
 
   // G45 (loop contract 0.4) — the validating/rewriting split. The compiler
@@ -346,6 +347,7 @@ describe("ir-passes — applyPasses + idempotence (T9)", () => {
       transactionPolicyEnforcement,
       wellFormednessCheck,
       memoryIntegrityPass,
+      modelPlanIntegrity,
     ]);
     const start = DEFAULT_PIPELINE.indexOf(
       VALIDATING_PASSES[0] as (typeof DEFAULT_PIPELINE)[number],
@@ -649,5 +651,304 @@ describe("ir-passes — memoryIntegrityPass (v0.3.0 PR 11)", () => {
       compaction: {},
     } as unknown as IrNode;
     expect(memoryIntegrityPass(graph)).toBe(graph);
+  });
+});
+
+describe("ir-passes — modelPlanIntegrity (0.6.0 PR 7)", () => {
+  const POOL = {
+    candidates: [
+      { model: "claude-haiku-4-5", tags: ["cheap"], profile: "fast", tools: ["read"] },
+      { model: "claude-opus-4-8", tags: ["strong"] },
+    ],
+    policy: "heuristic" as const,
+  };
+
+  test("no models / pools → returns input unchanged (byte-identity)", () => {
+    const ir = makeCli();
+    expect(modelPlanIntegrity(ir)).toBe(ir);
+  });
+
+  test("a well-formed registry + pool passes through unchanged", () => {
+    const ir = makeCli({
+      models: { fast: { profile: "fast", model: "claude-haiku-4-5", tags: ["cheap"] } },
+      tools: ["read", "bash"],
+      agent: {
+        model: "m",
+        instructions: "i",
+        modelPool: {
+          ...POOL,
+          strategy: { cascade: { draft: "cheap", escalateTo: "fast" } },
+          rules: [{ id: "r", when: { has_images: true }, use: "strong" }],
+          reward: { floor: { arm: "strong" } },
+        },
+      },
+    });
+    expect(modelPlanIntegrity(ir)).toBe(ir);
+  });
+
+  test("candidate tools must be a subset of the block's tools (case-insensitive)", () => {
+    const ir = makeCli({
+      tools: ["Read"],
+      agent: { model: "m", instructions: "i", modelPool: POOL },
+    });
+    expect(modelPlanIntegrity(ir)).toBe(ir);
+    const bad = makeCli({
+      tools: ["bash"],
+      agent: { model: "m", instructions: "i", modelPool: POOL },
+    });
+    expect(() => modelPlanIntegrity(bad)).toThrow(IrPassError);
+    expect(() => modelPlanIntegrity(bad)).toThrow(
+      /candidates\[0\]\.tools\[0\]: "read" is not one of the block's tools/,
+    );
+  });
+
+  test("MCP selectors must name a declared server; Consult / Escalate need strategy.modelDirected", () => {
+    const mcp = {
+      candidates: [
+        { model: "a", tags: ["x"], tools: ["mcp__github__*"] },
+        { model: "b", tags: ["y"] },
+      ],
+      policy: "static" as const,
+    };
+    const ok = makeCli({
+      mcp_servers: { github: { transport: "stdio", command: "npx", args: [] } },
+      agent: { model: "m", instructions: "i", modelPool: mcp },
+    });
+    expect(modelPlanIntegrity(ok)).toBe(ok);
+    expect(() =>
+      modelPlanIntegrity(makeCli({ agent: { model: "m", instructions: "i", modelPool: mcp } })),
+    ).toThrow(/names MCP server "github", which mcp_servers does not declare/);
+    const consult = {
+      candidates: [
+        { model: "a", tags: ["x"], tools: ["Escalate"] },
+        { model: "b", tags: ["y"] },
+      ],
+      policy: "static" as const,
+    };
+    expect(() =>
+      modelPlanIntegrity(makeCli({ agent: { model: "m", instructions: "i", modelPool: consult } })),
+    ).toThrow(/registered only when a model_pool declares strategy\.model_directed/);
+    const directed = makeCli({
+      agent: {
+        model: "m",
+        instructions: "i",
+        modelPool: { ...consult, strategy: { modelDirected: true } },
+      },
+    });
+    expect(modelPlanIntegrity(directed)).toBe(directed);
+  });
+
+  test("a block without a tool catalog (pipeline) admits no candidate tools", () => {
+    const pipeline = {
+      version: 0,
+      name: "p",
+      target: "pipeline",
+      agent: { model: "m", instructions: "i", modelPool: POOL },
+      retrieve: { embedderModel: "e", vectorBackend: "in-memory", defaultK: 3 },
+      indexing: { chunkStrategy: "fixed", chunkSize: 400, chunkOverlap: 0, documents: [] },
+      permissions: { rules: [] },
+      compaction: {},
+    } as unknown as IrNode;
+    expect(() => modelPlanIntegrity(pipeline)).toThrow(/registers no tool catalog/);
+  });
+
+  test("profile permissions are deny / ask ONLY", () => {
+    const bad = makeCli({
+      agent: {
+        model: "m",
+        instructions: "i",
+        modelPool: {
+          candidates: [
+            {
+              model: "a",
+              tags: ["x"],
+              permissions: { alwaysAllow: ["Bash(*)"] } as unknown as { deny?: string[] },
+            },
+            { model: "b", tags: ["y"] },
+          ],
+          policy: "static",
+        },
+      },
+    });
+    expect(() => modelPlanIntegrity(bad)).toThrow(
+      /permissions\.alwaysAllow: a model profile's permissions may only NARROW/,
+    );
+  });
+
+  test("enabled: false must leave a routable candidate", () => {
+    const bad = makeCli({
+      agent: {
+        model: "m",
+        instructions: "i",
+        modelPool: {
+          candidates: [
+            { model: "a", tags: ["x"], enabled: false },
+            { model: "b", tags: ["y"], enabled: false },
+          ],
+          policy: "static",
+        },
+      },
+    });
+    expect(() => modelPlanIntegrity(bad)).toThrow(/every candidate is enabled: false/);
+  });
+
+  test("strategy / rule / floor role slots name a declared tag or arm id; classifier ⇔ policy", () => {
+    const withStrategy = (strategy: unknown, extra: Record<string, unknown> = {}): IrV0 =>
+      makeCli({
+        tools: ["read"],
+        agent: {
+          model: "m",
+          instructions: "i",
+          modelPool: { ...POOL, strategy, ...extra } as unknown as IrV0["agent"]["modelPool"],
+        },
+      });
+    expect(() =>
+      modelPlanIntegrity(withStrategy({ cascade: { draft: "cheap", escalateTo: "huge" } })),
+    ).toThrow(/strategy\.cascade\.escalateTo: "huge" is neither a candidate tag/);
+    expect(() =>
+      modelPlanIntegrity(withStrategy({ committee: { members: ["cheap", "nope"] } })),
+    ).toThrow(/committee\.members\[1\]/);
+    expect(() =>
+      modelPlanIntegrity(withStrategy(undefined, { reward: { floor: { arm: "ghost" } } })),
+    ).toThrow(/reward\.floor\.arm/);
+    expect(() =>
+      modelPlanIntegrity(
+        withStrategy(undefined, { rules: [{ id: "r", when: { has_images: true }, use: "ghost" }] }),
+      ),
+    ).toThrow(/rules\[0\]\.use/);
+    expect(() => modelPlanIntegrity(withStrategy(undefined, { policy: "classifier" }))).toThrow(
+      /requires a classifier block/,
+    );
+    expect(() =>
+      modelPlanIntegrity(
+        withStrategy(undefined, { classifier: { model: "c", labels: { nope: "x" } } }),
+      ),
+    ).toThrow(/classifier is declared but policy is "heuristic"/);
+    expect(() =>
+      modelPlanIntegrity(
+        withStrategy(undefined, {
+          policy: "classifier",
+          classifier: { model: "c", labels: { nope: "x" } },
+        }),
+      ),
+    ).toThrow(/classifier\.labels\["nope"\]/);
+    // An arm id (the candidate's profile name) is a legal role-slot target.
+    const arm = withStrategy({ cascade: { draft: "fast", escalateTo: "claude-opus-4-8" } });
+    expect(modelPlanIntegrity(arm)).toBe(arm);
+  });
+
+  test("an unresolved $ref on a candidate or profile is refused (the compiler resolves every ref)", () => {
+    expect(() =>
+      modelPlanIntegrity(
+        makeCli({
+          agent: {
+            model: "m",
+            instructions: "i",
+            modelPool: {
+              candidates: [
+                { model: "$fast", tags: [] },
+                { model: "b", tags: [] },
+              ],
+              policy: "static",
+            },
+          },
+        }),
+      ),
+    ).toThrow(/unresolved profile reference/);
+    expect(() => modelPlanIntegrity(makeCli({ models: { Fast: { model: "m" } } }))).toThrow(
+      /profile names must match/,
+    );
+  });
+
+  test("the pool blob must survive a JSON round-trip (emitters stringify it)", () => {
+    const bad = makeCli({
+      agent: {
+        model: "m",
+        instructions: "i",
+        modelPool: {
+          candidates: [
+            { model: "a", tags: ["x"], maxTokens: Number.NaN },
+            { model: "b", tags: ["y"] },
+          ],
+          policy: "static",
+        },
+      },
+    });
+    expect(() => modelPlanIntegrity(bad)).toThrow(/not JSON-serializable/);
+  });
+
+  test("workflow steps, graph nodes, crew roles and sub-agents are all checked", () => {
+    const step = {
+      version: 0,
+      name: "w",
+      target: "workflow",
+      steps: [
+        {
+          name: "draft",
+          instructions: "x",
+          model: "m",
+          tools: ["read"],
+          toolConfigs: {},
+          modelPool: {
+            candidates: [
+              { model: "a", tags: ["x"], tools: ["bash"] },
+              { model: "b", tags: ["y"] },
+            ],
+            policy: "static",
+          },
+        },
+      ],
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    } as unknown as IrNode;
+    expect(() => modelPlanIntegrity(step)).toThrow(
+      /steps\[0\]\.model_pool\.candidates\[0\]\.tools\[0\]/,
+    );
+    const sub = makeCli({
+      tools: ["read", "bash"],
+      subAgents: [
+        {
+          name: "helper",
+          description: "d",
+          instructions: "i",
+          tools: ["read"],
+          permissions: "inherit",
+          inheritBypass: false,
+          modelPool: {
+            candidates: [
+              { model: "a", tags: ["x"], tools: ["bash"] },
+              { model: "b", tags: ["y"] },
+            ],
+            policy: "static",
+          },
+        },
+      ],
+    });
+    expect(() => modelPlanIntegrity(sub)).toThrow(
+      /agent\.sub_agents\.helper\.model_pool\.candidates\[0\]\.tools\[0\]/,
+    );
+  });
+});
+
+describe("ir-passes — deadToolElimination counts pool-candidate tools (0.6.0 PR 7)", () => {
+  test("a tool only a candidate names survives elimination", () => {
+    const ir = makeCli({
+      tools: ["Read", "Write", "Bash"],
+      permissions: { rules: [{ type: "alwaysAllow", pattern: "Read" }] },
+      agent: {
+        model: "m",
+        instructions: "i",
+        modelPool: {
+          candidates: [
+            { model: "a", tags: ["x"], tools: ["Bash"] },
+            { model: "b", tags: ["y"] },
+          ],
+          policy: "static",
+        },
+      },
+    });
+    const out = deadToolElimination(ir) as IrV0;
+    expect([...out.tools].sort()).toEqual(["Bash", "Read"]);
   });
 });

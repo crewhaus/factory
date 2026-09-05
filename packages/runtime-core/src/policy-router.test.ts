@@ -400,3 +400,57 @@ describe("runChatLoop — toolsInPlay routes on the union advertisement (0.6.0 �
     expect(strong.requests[0]?.tools?.map((t) => t.name)).toContain("probe");
   });
 });
+
+describe("runChatLoop — 0.6.0 PR 7 pool widening (enabled: false, policy: classifier)", () => {
+  test("a candidate declared enabled: false never becomes an arm", async () => {
+    const cheap = okAdapter("cheap served");
+    const strong = okAdapter("strong served");
+    const runContext = createRunContext();
+    const seen: TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => seen.push(e));
+    // A hard (first) turn would route to the strong candidate — but it is withdrawn.
+    const finalText = await runChatLoop({
+      model: "claude-sonnet-5",
+      instructions: "test",
+      _adapter: okAdapter("primary"),
+      modelPool: {
+        candidates: [
+          { model: HAIKU, tags: ["cheap"] },
+          { model: OPUS, tags: ["strong"], enabled: false },
+        ],
+        policy: "heuristic",
+      },
+      _poolAdapters: poolAdapters(cheap, strong),
+      _scoreboard: tmpScoreboard(),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "hello" }],
+    });
+    expect(finalText).toBe("cheap served");
+    expect(strong.requests).toHaveLength(0);
+    const routes = seen.filter((e): e is ModelRouteEvent => e.kind === "model_route");
+    expect(routes[0]?.model).toBe(HAIKU);
+  });
+
+  test("policy: classifier is accepted and routes heuristically until the preRoute phase lands (PR 9b)", async () => {
+    const cheap = okAdapter("cheap served");
+    const strong = okAdapter("strong served");
+    const runContext = createRunContext();
+    const seen: TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => seen.push(e));
+    const finalText = await runChatLoop({
+      model: "claude-sonnet-5",
+      instructions: "test",
+      _adapter: okAdapter("primary"),
+      modelPool: { candidates: POOL_CANDIDATES, policy: "classifier" },
+      _poolAdapters: poolAdapters(cheap, strong),
+      _scoreboard: tmpScoreboard(),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "hello" }],
+    });
+    expect(finalText).toBe("strong served");
+    const routes = seen.filter((e): e is ModelRouteEvent => e.kind === "model_route");
+    expect(routes[0]).toMatchObject({ routeKey: "hard", model: OPUS, policy: "heuristic" });
+  });
+});

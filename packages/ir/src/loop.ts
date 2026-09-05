@@ -54,6 +54,7 @@ import type {
   IrMcpServers,
   IrMemory,
   IrModelPool,
+  IrModelProfiles,
   IrModelTiers,
   IrNode,
   IrPermissions,
@@ -242,6 +243,13 @@ function describeModelPool(pool: IrModelPool): string {
   return `adaptive model pool (${pool.candidates.length} candidates, policy: ${pool.policy})`;
 }
 
+/** 0.6.0 §4.3 — "2 model profiles (fast, strong) · primary profile: fast". */
+function describeModelProfiles(models: IrModelProfiles, primaryProfile?: string): string {
+  const names = Object.keys(models);
+  const summary = countList(names.length, "model profile", names);
+  return primaryProfile !== undefined ? `${summary} · primary profile: ${primaryProfile}` : summary;
+}
+
 // --- the seven ring segments -------------------------------------------------------
 
 /**
@@ -263,6 +271,9 @@ type RingView = {
   readonly thinking?: IrThinking;
   readonly modelTiers?: IrModelTiers;
   readonly modelPool?: IrModelPool;
+  /** 0.6.0 §4.3 — the `models:` registry and the primary slot's profile. */
+  readonly models?: IrModelProfiles;
+  readonly modelProfile?: string;
   readonly evaluation?: IrEvaluation;
   readonly learning?: IrLearning;
   readonly security?: IrSecurity;
@@ -318,6 +329,13 @@ function ringSegmentsFromView(view: RingView): LoopSegment[] {
   if (view.modelPool !== undefined) {
     reasonKeys.push("agent.model_pool");
     reasonParts.push(describeModelPool(view.modelPool));
+  }
+  // 0.6.0 §4.3 — the `models:` registry surfaces as `models.<name>` keys (the
+  // YAML the operator jumps to), and the primary's profile provenance names
+  // the profile it resolved from.
+  if (view.models !== undefined) {
+    for (const name of Object.keys(view.models)) reasonKeys.push(`models.${name}`);
+    reasonParts.push(describeModelProfiles(view.models, view.modelProfile));
   }
   const reason = segment(
     "reason",
@@ -480,6 +498,8 @@ function ringSegmentsFromView(view: RingView): LoopSegment[] {
 /** The normalized per-node view a canvas node's mini is built from. */
 type MiniView = {
   readonly model?: string;
+  /** 0.6.0 §4.3 — the slot's `models:` profile provenance. */
+  readonly modelProfile?: string;
   readonly thinking?: IrThinking;
   readonly modelPool?: IrModelPool;
   readonly tools?: readonly string[];
@@ -504,6 +524,10 @@ function miniSegments(view: MiniView): LoopSegment[] {
   if (view.model !== undefined) {
     reasonKeys.push("model");
     reasonParts.push(`model: ${view.model}`);
+  }
+  if (view.modelProfile !== undefined) {
+    reasonKeys.push(`models.${view.modelProfile}`);
+    reasonParts.push(`profile: ${view.modelProfile}`);
   }
   if (view.thinking !== undefined) {
     reasonKeys.push("thinking");
@@ -593,6 +617,7 @@ function workflowCanvas(
         ? { model: step.model, ...(step.judge !== undefined ? { judge: step.judge } : {}) }
         : {
             model: step.model,
+            ...(step.modelProfile !== undefined ? { modelProfile: step.modelProfile } : {}),
             ...(step.thinking !== undefined ? { thinking: step.thinking } : {}),
             // Item 9 (G37) — per-step model pool surfaces in the reason segment.
             ...(step.modelPool !== undefined ? { modelPool: step.modelPool } : {}),
@@ -649,7 +674,10 @@ function graphCanvas(ir: Extract<IrNode, { target: "graph" }>, warnings: string[
         ? { model: node.model, ...(node.judge !== undefined ? { judge: node.judge } : {}) }
         : {
             model: node.model,
+            ...(node.modelProfile !== undefined ? { modelProfile: node.modelProfile } : {}),
             ...(node.thinking !== undefined ? { thinking: node.thinking } : {}),
+            // 0.6.0 §7.7 — per-node model pool surfaces in the reason segment.
+            ...(node.modelPool !== undefined ? { modelPool: node.modelPool } : {}),
             tools: node.tools,
             ...(node.hitlPrompt !== undefined ? { hitlPrompt: node.hitlPrompt } : {}),
           },
@@ -694,6 +722,7 @@ function crewCanvas(ir: Extract<IrNode, { target: "crew" }>, warnings: string[])
     kind: "role" as const,
     mini: miniSegments({
       model: role.model,
+      ...(role.modelProfile !== undefined ? { modelProfile: role.modelProfile } : {}),
       ...(role.thinking !== undefined ? { thinking: role.thinking } : {}),
       // Item 9 (G37) — per-role model pool surfaces in the reason segment.
       ...(role.modelPool !== undefined ? { modelPool: role.modelPool } : {}),
@@ -817,6 +846,8 @@ function cliRingView(ir: IrV0): RingView {
     ...(ir.agent.thinking !== undefined ? { thinking: ir.agent.thinking } : {}),
     ...(ir.agent.modelTiers !== undefined ? { modelTiers: ir.agent.modelTiers } : {}),
     ...(ir.agent.modelPool !== undefined ? { modelPool: ir.agent.modelPool } : {}),
+    ...(ir.models !== undefined ? { models: ir.models } : {}),
+    ...(ir.agent.modelProfile !== undefined ? { modelProfile: ir.agent.modelProfile } : {}),
     ...(ir.evaluation !== undefined ? { evaluation: ir.evaluation } : {}),
     ...(ir.learning !== undefined ? { learning: ir.learning } : {}),
     ...(ir.security !== undefined ? { security: ir.security } : {}),
@@ -848,6 +879,8 @@ function channelRingView(ir: IrChannelV0): RingView {
     ...(ir.agent.thinking !== undefined ? { thinking: ir.agent.thinking } : {}),
     ...(ir.agent.modelTiers !== undefined ? { modelTiers: ir.agent.modelTiers } : {}),
     ...(ir.agent.modelPool !== undefined ? { modelPool: ir.agent.modelPool } : {}),
+    ...(ir.models !== undefined ? { models: ir.models } : {}),
+    ...(ir.agent.modelProfile !== undefined ? { modelProfile: ir.agent.modelProfile } : {}),
     ...(ir.evaluation !== undefined ? { evaluation: ir.evaluation } : {}),
     ...(ir.learning !== undefined ? { learning: ir.learning } : {}),
     ...(ir.memory !== undefined ? { memory: ir.memory } : {}),
@@ -869,6 +902,8 @@ function managedRingView(ir: IrManagedV0): RingView {
     ...(ir.agent.thinking !== undefined ? { thinking: ir.agent.thinking } : {}),
     ...(ir.agent.modelTiers !== undefined ? { modelTiers: ir.agent.modelTiers } : {}),
     ...(ir.agent.modelPool !== undefined ? { modelPool: ir.agent.modelPool } : {}),
+    ...(ir.models !== undefined ? { models: ir.models } : {}),
+    ...(ir.agent.modelProfile !== undefined ? { modelProfile: ir.agent.modelProfile } : {}),
     ...(ir.evaluation !== undefined ? { evaluation: ir.evaluation } : {}),
     ...(ir.learning !== undefined ? { learning: ir.learning } : {}),
     ...(ir.memory !== undefined ? { memory: ir.memory } : {}),

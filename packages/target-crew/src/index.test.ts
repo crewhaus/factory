@@ -578,3 +578,20 @@ describe("emitCrew — crewhaus.control.v1", () => {
     expect(d.split("__control.counters.turns++;").length - 1).toBe(1);
   });
 });
+
+describe("emitCrew — llm router model (0.6.0 §7.7)", () => {
+  test("routing.model runs the classify turn; absent, the entry role's model keeps its byte-identical default", () => {
+    const withModel: IrCrewV0 = {
+      ...minimalIr,
+      routing: { kind: "llm", model: "claude-opus-4-8", modelProfile: "strong" },
+    };
+    const orch = emitCrew(withModel).files.find((f) => f.path === "orchestrator.ts")?.content ?? "";
+    expect(orch).toContain('model: "claude-opus-4-8",');
+    expect(orch).not.toContain('model: "claude-sonnet-4-6",');
+    const plain =
+      emitCrew({ ...minimalIr, routing: { kind: "llm" } }).files.find(
+        (f) => f.path === "orchestrator.ts",
+      )?.content ?? "";
+    expect(plain).toContain('model: "claude-sonnet-4-6",');
+  });
+});

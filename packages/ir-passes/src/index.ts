@@ -26,6 +26,12 @@
  *  - `memoryIntegrityPass` — v0.3.0 validating pass: memory/continuity
  *    block integrity (wiki.recallK bounds, ttl floor, session-scope only
  *    on session-routed shapes, fragment JSON-serializability).
+ *  - `modelPlanIntegrity` — 0.6.0 validating pass: the `models:` registry
+ *    and every `model_pool` (candidate `tools ⊆ block tools`, restricted
+ *    profile permissions, `enabled` leaves a routable candidate, strategy /
+ *    rule / floor role slots name declared tags or arms, classifier ⇔
+ *    policy, pool blob JSON round-trip). Returns the IR untouched when no
+ *    model keys are present.
  *  - `promptCachePrefixSort` — TODO: re-orders system-block segments so
  *    the cache prefix is maximised. v0 stub returns IR unchanged so the
  *    pipeline contract holds; v1 follow-up wires this once we land
@@ -34,11 +40,12 @@
  * Pipeline order in `applyPasses` (the safe default):
  *   deadToolElimination → redundantMcpServerCollapse →
  *   permissionRuleCanonicalize → transactionPolicyEnforcement →
- *   wellFormednessCheck → memoryIntegrityPass → promptCachePrefixSort
+ *   wellFormednessCheck → memoryIntegrityPass → modelPlanIntegrity →
+ *   promptCachePrefixSort
  *
  * G45 (loop contract 0.4) — the passes split into two families:
  *   - VALIDATING (transactionPolicyEnforcement, wellFormednessCheck,
- *     memoryIntegrityPass): pure pass-throughs that throw `IrPassError` on
+ *     memoryIntegrityPass, modelPlanIntegrity): pure pass-throughs that throw `IrPassError` on
  *     a violation. Exported as `VALIDATING_PASSES`; the compiler runs them
  *     UNCONDITIONALLY inside `compile()` (they cannot drift bundle bytes).
  *   - REWRITING (deadToolElimination, redundantMcpServerCollapse,
@@ -58,6 +65,10 @@ import type {
   IrMcpServerConfig,
   IrMcpServers,
   IrMemory,
+  IrModelPool,
+  IrModelPoolCandidate,
+  IrModelProfile,
+  IrModelProfiles,
   IrNode,
   IrPermissionRule,
   IrPermissions,
@@ -116,6 +127,14 @@ export function deadToolElimination(ir: IrNode): IrNode {
   const subAgentRefs = cli.subAgents ?? [];
   for (const sa of subAgentRefs) {
     for (const t of sa.tools) used.add(t);
+    // 0.6.0 §4.3 — a sub-agent's own pool candidates may subset its tools.
+    for (const c of sa.modelPool?.candidates ?? []) for (const t of c.tools ?? []) used.add(t);
+  }
+  // 0.6.0 §4.3 — a pool candidate's `tools` subset is a reference too:
+  // dropping a tool only a candidate names would silently shrink that
+  // candidate's advertised toolset.
+  for (const c of cli.agent.modelPool?.candidates ?? []) {
+    for (const t of c.tools ?? []) used.add(t);
   }
   // Always-allow defaults: if any rule references a tool by exact name we
   // count it; otherwise the original tool list serves as the
@@ -661,6 +680,326 @@ export function memoryIntegrityPass(ir: IrNode): IrNode {
 }
 
 /**
+ * 0.6.0 §4.3 — model-plan integrity check. VALIDATION-ONLY (no structural
+ * rewrite), mirroring `memoryIntegrityPass`'s posture, appended LAST in
+ * `VALIDATING_PASSES` so it runs unconditionally through `compile()` and in
+ * `crewhaus lint` via `DEFAULT_PIPELINE`. It returns the IR untouched when
+ * no model keys are present, so it cannot drift bytes. For every routed
+ * block that carries a `modelPool` (the agent block, workflow steps, graph
+ * nodes, crew roles, and the sub-agents hanging off any of them) and for
+ * the `models:` registry:
+ *
+ *   - every candidate `tools` entry is SUBSET-ONLY: a builtin key must be
+ *     one of the block's own `tools` (case-insensitive — tool registration
+ *     lowercases), an `mcp__<server>__<tool|*>` selector must name a server
+ *     the shape's `mcp_servers` declares, and `Consult` / `Escalate` exist
+ *     only when some pool declares `strategy.modelDirected`; a block that
+ *     carries no tool catalog admits no candidate `tools` at all;
+ *   - candidate / profile `permissions` carry ONLY `deny` / `ask` (the §5.4
+ *     restricted schema — a profile can narrow the shape's decisions, never
+ *     widen them; the runtime's `narrowRuleSet` implements the decision-level
+ *     meet, this pass pins the shape it is fed);
+ *   - `enabled: false` leaves at least one routable candidate;
+ *   - every strategy / rule / floor ROLE slot (`cascade.draft`,
+ *     `cascade.escalateTo`, `committee.members[]`,
+ *     `committee.escalateOnDisagreement`, `rules[].use`, `reward.floor.arm`)
+ *     names a declared candidate tag or a candidate's arm id (its profile
+ *     name, else its model string); `classifier.labels` keys are candidate
+ *     tags; `policy: "classifier"` and a `classifier` block go together;
+ *   - profile names match the registry grammar and every profile / pool
+ *     blob survives a JSON round-trip UNCHANGED (emitters `JSON.stringify`
+ *     the pool into bundles — the `memoryIntegrityPass` template).
+ *
+ * The "judge ≠ serving arm" check is deliberately NOT here (it is a
+ * `compile()` warning scoped to specs that opt into `models:` or a pool
+ * `strategy`, silenced by `allow_self_judge`), so a 0.5.8-valid
+ * self-judging pooled spec still compiles.
+ */
+const MODEL_PLAN_PROFILE_NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
+const MODEL_DIRECTED_TOOLS: ReadonlySet<string> = new Set(["Consult", "Escalate"]);
+const MCP_TOOL_SELECTOR_RE = /^mcp__([^_].*?)__(.+)$/;
+
+/** A routed block as this pass sees it: its tools and its optional pool. */
+type ModelPlanBlock = {
+  readonly tools: readonly string[] | undefined;
+  readonly toolCatalog: boolean;
+  readonly modelPool?: IrModelPool;
+  readonly subAgents?: ReadonlyArray<{
+    readonly name: string;
+    readonly tools: readonly string[];
+    readonly modelPool?: IrModelPool;
+  }>;
+};
+
+function modelPlanBlocks(ir: IrNode): ReadonlyArray<readonly [string, ModelPlanBlock]> {
+  const out: Array<readonly [string, ModelPlanBlock]> = [];
+  const withSubAgents = (path: string, block: ModelPlanBlock): void => {
+    out.push([path, block]);
+    for (const sa of block.subAgents ?? []) {
+      out.push([
+        `${path}.sub_agents.${sa.name}`,
+        { tools: sa.tools, toolCatalog: true, modelPool: sa.modelPool },
+      ]);
+    }
+  };
+  switch (ir.target) {
+    case "cli":
+      withSubAgents("agent", {
+        tools: ir.tools,
+        toolCatalog: true,
+        modelPool: ir.agent.modelPool,
+        subAgents: ir.subAgents,
+      });
+      break;
+    case "channel":
+      withSubAgents("agent", {
+        tools: ir.tools,
+        toolCatalog: true,
+        modelPool: ir.agent.modelPool,
+        subAgents: ir.subAgents,
+      });
+      break;
+    case "managed":
+      withSubAgents("agent", {
+        tools: ir.tools ?? [],
+        toolCatalog: true,
+        modelPool: ir.agent.modelPool,
+      });
+      break;
+    case "pipeline":
+      withSubAgents("agent", {
+        tools: undefined,
+        toolCatalog: false,
+        modelPool: ir.agent.modelPool,
+      });
+      break;
+    case "research":
+    case "batch":
+    case "browser":
+      withSubAgents("agent", { tools: ir.tools, toolCatalog: true, modelPool: ir.agent.modelPool });
+      break;
+    case "workflow":
+      ir.steps.forEach((s, i) =>
+        withSubAgents(`steps[${i}]`, { tools: s.tools, toolCatalog: true, modelPool: s.modelPool }),
+      );
+      break;
+    case "graph":
+      for (const n of ir.nodes) {
+        withSubAgents(`nodes.${n.name}`, {
+          tools: n.tools,
+          toolCatalog: true,
+          modelPool: n.modelPool,
+        });
+      }
+      break;
+    case "crew":
+      for (const r of ir.roles) {
+        withSubAgents(`roles.${r.name}`, {
+          tools: r.tools,
+          toolCatalog: true,
+          modelPool: r.modelPool,
+          subAgents: r.subAgents,
+        });
+      }
+      break;
+    default:
+      break;
+  }
+  return out;
+}
+
+/** A candidate's arm identity: its profile name, else its model string (§7.9). */
+function armIdOf(c: IrModelPoolCandidate): string {
+  return c.profile ?? c.model;
+}
+
+function checkProfilePermissions(path: string, permissions: IrModelProfile["permissions"]): void {
+  if (permissions === undefined) return;
+  for (const key of Object.keys(permissions)) {
+    if (key !== "deny" && key !== "ask") {
+      throw new IrPassError(
+        `${path}.permissions.${key}: a model profile's permissions may only NARROW the shape's — deny and ask lists only (a profile can never widen what the shape allows)`,
+      );
+    }
+  }
+}
+
+function checkCandidateTools(
+  path: string,
+  tools: readonly string[] | undefined,
+  block: ModelPlanBlock,
+  mcpServers: ReadonlySet<string>,
+  modelDirected: boolean,
+): void {
+  if (tools === undefined) return;
+  if (!block.toolCatalog) {
+    throw new IrPassError(
+      `${path}.tools: this block registers no tool catalog, so a per-model tools list has nothing to narrow`,
+    );
+  }
+  const blockTools = new Set((block.tools ?? []).map((t) => t.toLowerCase()));
+  for (const [i, tool] of tools.entries()) {
+    if (tool.startsWith("mcp__")) {
+      const server = tool.match(MCP_TOOL_SELECTOR_RE)?.[1];
+      if (server === undefined) {
+        throw new IrPassError(
+          `${path}.tools[${i}]: "${tool}" is not a valid MCP tool selector — use mcp__<server>__<tool> or mcp__<server>__*`,
+        );
+      }
+      if (!mcpServers.has(server)) {
+        throw new IrPassError(
+          `${path}.tools[${i}]: "${tool}" names MCP server "${server}", which mcp_servers does not declare`,
+        );
+      }
+      continue;
+    }
+    if (MODEL_DIRECTED_TOOLS.has(tool)) {
+      if (!modelDirected) {
+        throw new IrPassError(
+          `${path}.tools[${i}]: "${tool}" is registered only when a model_pool declares strategy.model_directed: true — no pool on this IR does`,
+        );
+      }
+      continue;
+    }
+    if (!blockTools.has(tool.toLowerCase())) {
+      throw new IrPassError(
+        `${path}.tools[${i}]: "${tool}" is not one of the block's tools (${(block.tools ?? []).join(", ") || "none"}) — a per-model tools list can only narrow the block's toolset, never add to it`,
+      );
+    }
+  }
+}
+
+function checkRoleSlot(
+  path: string,
+  value: string,
+  tags: ReadonlySet<string>,
+  arms: ReadonlySet<string>,
+): void {
+  if (tags.has(value) || arms.has(value)) return;
+  throw new IrPassError(
+    `${path}: "${value}" is neither a candidate tag (${[...tags].join(", ") || "none"}) nor a candidate arm id (${[...arms].join(", ")}) of this model_pool`,
+  );
+}
+
+function checkModelPool(
+  path: string,
+  pool: IrModelPool,
+  block: ModelPlanBlock,
+  mcpServers: ReadonlySet<string>,
+  modelDirected: boolean,
+): void {
+  const poolPath = `${path}.model_pool`;
+  if (!pool.candidates.some((c) => c.enabled !== false)) {
+    throw new IrPassError(
+      `${poolPath}.candidates: every candidate is enabled: false — at least one must stay routable`,
+    );
+  }
+  const tags = new Set<string>();
+  const arms = new Set<string>();
+  pool.candidates.forEach((c, i) => {
+    const cpath = `${poolPath}.candidates[${i}]`;
+    for (const t of c.tags) tags.add(t);
+    arms.add(armIdOf(c));
+    checkCandidateTools(cpath, c.tools, block, mcpServers, modelDirected);
+    checkProfilePermissions(cpath, c.permissions);
+    if (c.model.startsWith("$")) {
+      throw new IrPassError(
+        `${cpath}.model: "${c.model}" is an unresolved profile reference — the compiler resolves every $ref at lower time; a direct-IR builder must carry the concrete model`,
+      );
+    }
+  });
+  if (pool.policy === "classifier" && pool.classifier === undefined) {
+    throw new IrPassError(
+      `${poolPath}.policy: "classifier" requires a classifier block (model + labels) on the same model_pool`,
+    );
+  }
+  if (pool.classifier !== undefined) {
+    if (pool.policy !== "classifier") {
+      throw new IrPassError(
+        `${poolPath}.classifier is declared but policy is "${pool.policy}" — the classifier runs only under policy: "classifier"`,
+      );
+    }
+    for (const label of Object.keys(pool.classifier.labels)) {
+      if (!tags.has(label)) {
+        throw new IrPassError(
+          `${poolPath}.classifier.labels["${label}"]: every label must be a candidate tag (${[...tags].join(", ") || "none declared"})`,
+        );
+      }
+    }
+  }
+  for (const [i, rule] of (pool.rules ?? []).entries()) {
+    if (typeof rule.use === "string") {
+      checkRoleSlot(`${poolPath}.rules[${i}].use`, rule.use, tags, arms);
+    }
+  }
+  const st = pool.strategy;
+  if (st !== undefined) {
+    const sp = `${poolPath}.strategy`;
+    if (st.cascade !== undefined) {
+      checkRoleSlot(`${sp}.cascade.draft`, st.cascade.draft, tags, arms);
+      checkRoleSlot(`${sp}.cascade.escalateTo`, st.cascade.escalateTo, tags, arms);
+    }
+    if (st.committee !== undefined) {
+      st.committee.members.forEach((m, i) =>
+        checkRoleSlot(`${sp}.committee.members[${i}]`, m, tags, arms),
+      );
+      if (st.committee.escalateOnDisagreement !== undefined) {
+        checkRoleSlot(
+          `${sp}.committee.escalateOnDisagreement`,
+          st.committee.escalateOnDisagreement,
+          tags,
+          arms,
+        );
+      }
+    }
+  }
+  if (pool.reward?.floor?.arm !== undefined) {
+    checkRoleSlot(`${poolPath}.reward.floor.arm`, pool.reward.floor.arm, tags, arms);
+  }
+  if (!jsonRoundTrips(pool)) {
+    throw new IrPassError(
+      `${poolPath} is not JSON-serializable — emitters stringify the pool into bundles, so it must survive a JSON round-trip unchanged`,
+    );
+  }
+}
+
+export function modelPlanIntegrity(ir: IrNode): IrNode {
+  const registry = (ir as { readonly models?: IrModelProfiles }).models;
+  const blocks = modelPlanBlocks(ir);
+  const pooled = blocks.filter(([, b]) => b.modelPool !== undefined);
+  if (registry === undefined && pooled.length === 0) return ir;
+
+  if (registry !== undefined) {
+    for (const [name, profile] of Object.entries(registry)) {
+      if (!MODEL_PLAN_PROFILE_NAME_RE.test(name)) {
+        throw new IrPassError(`models.${name}: profile names must match /^[a-z][a-z0-9_-]{0,63}$/`);
+      }
+      checkProfilePermissions(`models.${name}`, profile.permissions);
+      if (profile.model.startsWith("$")) {
+        throw new IrPassError(
+          `models.${name}.model: "${profile.model}" is an unresolved profile reference — profiles do not inherit from profiles`,
+        );
+      }
+      if (!jsonRoundTrips(profile)) {
+        throw new IrPassError(
+          `models.${name} is not JSON-serializable — it must survive a JSON round-trip unchanged`,
+        );
+      }
+    }
+  }
+  const mcpServers = new Set(
+    Object.keys((ir as { readonly mcp_servers?: IrMcpServers }).mcp_servers ?? {}),
+  );
+  const modelDirected = pooled.some(([, b]) => b.modelPool?.strategy?.modelDirected === true);
+  for (const [path, block] of pooled) {
+    if (block.modelPool !== undefined) {
+      checkModelPool(path, block.modelPool, block, mcpServers, modelDirected);
+    }
+  }
+  return ir;
+}
+
+/**
  * G45 (loop contract 0.4) — the VALIDATING passes: pure pass-throughs that
  * throw `IrPassError` on a violation and never rewrite the IR. The compiler
  * runs these UNCONDITIONALLY inside `compile()` (between `lower()` and the
@@ -673,6 +1012,7 @@ export const VALIDATING_PASSES: ReadonlyArray<IrPass> = Object.freeze([
   transactionPolicyEnforcement,
   wellFormednessCheck,
   memoryIntegrityPass,
+  modelPlanIntegrity,
 ]);
 
 export const DEFAULT_PIPELINE: ReadonlyArray<IrPass> = Object.freeze([

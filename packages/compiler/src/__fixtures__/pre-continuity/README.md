@@ -245,3 +245,21 @@ never to paper over an accidental diff.
    source, not a published `@crewhaus/compiler`** — and writes each bundle
    file to `<key>.<file>.txt`.
 3. Return to your branch and re-run the byte-restore test.
+
+**0.6.0 PR 7 delta — model-plan lowering; NO pin moved.** The compiler now
+resolves every model slot through `resolveModelRef` (`$profile` / `cheapest` /
+`strongest`), lowers the whole §11.1 delta into the widened IR (`IrModelProfile`,
+per-candidate settings, pool `rules` / `strategy` / `reward` / …, per-node and
+per-sub-agent routing, judge panels), and two emitter strings changed:
+target-graph renders a node's `modelFallbacks` / `circuitBreaker` /
+`modelTiers` / `modelPool` onto its `runChatLoop` call (mirroring the workflow
+step), and target-crew's llm router reads `routing.model ?? entryRole.model`.
+Both are emitted ONLY when the spec declares the corresponding key — none of the
+pinned specs declares `models:`, a pool, node routing or `routing: { kind: llm,
+model }` — so every pin passes unchanged. The pool blob's key order is the byte
+contract for specs that DO declare a pool: `model` then `tags` are inserted
+first and every 0.6.0 key spreads after them (pinned by the key-order guard in
+`models-lowering.test.ts`). The generated README (`readme: true`, not pinned
+here) now lists every model a run can route to (candidates, tiers, fallbacks,
+aux slots) and a "Model profiles" section when a registry is declared. The
+continuity opt-out contract is untouched.

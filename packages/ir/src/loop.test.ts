@@ -312,3 +312,83 @@ describe("projectLoop — fallback family", () => {
     }
   });
 });
+
+describe("projectLoop — 0.6.0 models: registry (§4.3)", () => {
+  test("the cli ring surfaces models.<name> keys and the primary's profile in the reason segment", () => {
+    const projection = projectLoop({
+      version: 0,
+      name: "p",
+      target: "cli",
+      models: {
+        fast: { profile: "fast", model: "claude-haiku-4-5" },
+        strong: { profile: "strong", model: "claude-opus-4-8" },
+      },
+      agent: { model: "claude-haiku-4-5", instructions: "i", modelProfile: "fast" },
+      tools: [],
+      toolConfigs: {},
+      mcp_servers: {},
+      permissions: { rules: [] },
+      subAgents: [],
+      compaction: {},
+    });
+    const reason = projection.ring?.segments.find((s) => s.id === "reason");
+    expect(reason?.active).toBe(true);
+    expect(reason?.keys).toEqual(["models.fast", "models.strong"]);
+    expect(reason?.summary).toContain(
+      "2 model profiles (fast, strong) · primary profile: fast on claude-haiku-4-5",
+    );
+  });
+
+  test("a step's profile provenance and a graph node's pool surface in the node minis", () => {
+    const wf = projectLoop({
+      version: 0,
+      name: "w",
+      target: "workflow",
+      steps: [
+        {
+          name: "draft",
+          instructions: "x",
+          model: "claude-haiku-4-5",
+          modelProfile: "fast",
+          tools: [],
+          toolConfigs: {},
+        },
+      ],
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    });
+    const reason = wf.canvas?.nodes[0]?.mini.find((s) => s.id === "reason");
+    expect(reason?.keys).toEqual(["model", "models.fast"]);
+    expect(reason?.summary).toContain("profile: fast");
+
+    const graph = projectLoop({
+      version: 0,
+      name: "g",
+      target: "graph",
+      entry: "a",
+      nodes: [
+        {
+          name: "a",
+          instructions: "x",
+          model: "m",
+          tools: [],
+          toolConfigs: {},
+          modelPool: {
+            candidates: [
+              { model: "a1", tags: ["cheap"] },
+              { model: "a2", tags: ["strong"] },
+            ],
+            policy: "learned",
+          },
+        },
+      ],
+      edges: [],
+      permissions: { rules: [] },
+      compaction: {},
+    });
+    const nodeReason = graph.canvas?.nodes[0]?.mini.find((s) => s.id === "reason");
+    expect(nodeReason?.keys).toContain("model_pool");
+    expect(nodeReason?.summary).toContain("adaptive model pool (2 candidates, policy: learned)");
+  });
+});

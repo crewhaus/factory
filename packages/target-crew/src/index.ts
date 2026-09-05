@@ -676,7 +676,7 @@ function __pickNextRole(reply: string, lastRole: string): string {
         ? \`…\${input.slice(-${LLM_ROUTER_INPUT_MAX_CHARS})}\`
         : input;
     const reply = await runChatLoop({
-      model: ${escapeJsonString(entryRole.model)},
+      model: ${escapeJsonString(ir.routing?.model ?? entryRole.model)},
       instructions: ${escapeJsonString(classifierInstructions)},
       sessionName: ${escapeJsonString(`${ir.name} (llm-router)`)},
       sessionTarget: "crew",

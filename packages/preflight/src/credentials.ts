@@ -54,15 +54,47 @@ export function anthropicAuthMode(env: PreflightEnv): "oauth" | "api-key" | "non
  * undefined when the spec doesn't parse or carries no agent.model (e.g.
  * workflow shapes with per-step models) — callers then fall back to the
  * legacy Anthropic-first behaviour.
+ *
+ * 0.6.0 §4.3 — the seventh reference-resolution case, OUTSIDE the compiler:
+ * this reads spec text, and its result feeds `selectedProvider`, which
+ * picks the provider whose credentials `crewhaus doctor` and the `run`
+ * preflight demand. A `$profile` reference is resolved against the same
+ * spec's `models:` block before it is returned; left alone, `$fast` would
+ * reach `parseModelString`, throw, and give every spec that adopts the
+ * registry a wrong credential verdict. The tolerant contract is kept:
+ * `undefined` on anything that cannot be resolved (an unknown profile, a
+ * profile whose own model is a compile-time sentinel).
  */
 export function extractSpecModel(yamlText: string): string | undefined {
   try {
-    const spec = parseSpec(yamlText) as unknown as { agent?: { model?: unknown } };
-    const m = spec.agent?.model;
-    return typeof m === "string" && m.length > 0 ? m : undefined;
+    const spec = parseSpec(yamlText) as unknown as {
+      agent?: { model?: unknown };
+      models?: Record<string, { model?: unknown }>;
+    };
+    const m = resolveProfileRef(spec.agent?.model, spec.models);
+    return typeof m === "string" && m.length > 0 && !isModelSentinel(m) ? m : undefined;
   } catch {
     return undefined;
   }
+}
+
+/** The compile-time sentinels a slot may carry instead of a grammar string. */
+function isModelSentinel(value: string): boolean {
+  return value === "cheapest" || value === "strongest";
+}
+
+/**
+ * Follow a `$<profile>` reference to the profile's model string; a non-ref
+ * passes through; an unresolvable ref yields `undefined` (tolerant).
+ */
+function resolveProfileRef(
+  value: unknown,
+  models: Record<string, { model?: unknown }> | undefined,
+): string | undefined {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  if (!value.startsWith("$")) return value;
+  const resolved = models?.[value.slice(1)]?.model;
+  return typeof resolved === "string" && resolved.length > 0 ? resolved : undefined;
 }
 
 /**
@@ -343,23 +375,34 @@ function asString(v: unknown): string | undefined {
  * Collect the union of model strings a parsed spec can route a call to:
  * `agent.model`, every `agent.model_fallbacks` entry, both `model_tiers`
  * tiers, every `model_pool` candidate, the in-loop `evaluation` judge model
- * (`llm_judge` grader), and the `budget.on_exceed.degrade` model. Works on
- * the loosely-typed parsed spec object so a single walker serves every
- * target shape; unknown/absent blocks contribute nothing. Deduped by model
- * string with sources merged.
+ * (`llm_judge` grader) and judge panel, and the `budget.on_exceed.degrade`
+ * model. Works on the loosely-typed parsed spec object so a single walker
+ * serves every target shape; unknown/absent blocks contribute nothing.
+ * Deduped by model string with sources merged.
+ *
+ * 0.6.0 §4.3 — a `$<profile>` reference at any of those slots is followed
+ * to the profile's model (its source keeps the slot path, so the credential
+ * item still names where the model came from), and every `models:` profile
+ * contributes its own model under `models.<name>`. An unresolvable ref
+ * contributes nothing (the spec layer owns that error).
  */
 export function collectSpecModels(spec: unknown): SpecModelRef[] {
   const found = new Map<string, string[]>();
+  const root = asRecord(spec);
+  if (root === undefined) return [];
+  const registry = asRecord(root["models"]) ?? {};
   const add = (model: unknown, source: string): void => {
-    const m = asString(model);
+    const raw = asString(model);
+    if (raw === undefined) return;
+    const m = raw.startsWith("$") ? asString(asRecord(registry[raw.slice(1)])?.["model"]) : raw;
     if (m === undefined) return;
     const sources = found.get(m);
     if (sources === undefined) found.set(m, [source]);
     else if (!sources.includes(source)) sources.push(source);
   };
-
-  const root = asRecord(spec);
-  if (root === undefined) return [];
+  for (const [name, profile] of Object.entries(registry)) {
+    add(asRecord(profile)?.["model"], `models.${name}`);
+  }
 
   const agent = asRecord(root["agent"]);
   if (agent !== undefined) {
@@ -386,6 +429,10 @@ export function collectSpecModels(spec: unknown): SpecModelRef[] {
   const grader = asRecord(evaluation?.["grader"]);
   if (grader !== undefined && grader["type"] === "llm_judge") {
     add(grader["model"], "evaluation.grader.model");
+    const judges = grader["judges"];
+    if (Array.isArray(judges)) {
+      judges.forEach((m, i) => add(m, `evaluation.grader.judges[${i}]`));
+    }
   }
 
   const budget = asRecord(root["budget"]);

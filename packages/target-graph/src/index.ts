@@ -602,6 +602,40 @@ function renderNodeLoopFields(node: IrGraphNode): string {
 }
 
 /**
+ * 0.6.0 §7.7 — render the per-node model-routing fields onto the node's
+ * `runChatLoop` call, mirroring `@crewhaus/target-workflow`'s
+ * `renderStepModelFailoverFields` (graph nodes carried NO routing before
+ * 0.6.0). The four fields are mutually exclusive in the spec (`model_pool` ⊥
+ * `model_tiers` ⊥ `model_fallbacks`, with `circuit_breaker` riding
+ * `model_fallbacks`), so at most one clause fires per node. Model strings
+ * pass through `escapeJsonString` (user-controlled spec values in generated
+ * source); the breaker/tiers/pool blocks are validated numbers/strings/
+ * closed-literal unions safe to `JSON.stringify`. Only NON-JUDGE nodes carry
+ * these (a judge node scores through eval-judge on its own resolved model).
+ * Empty when the node declares none, keeping pre-existing bundles
+ * byte-identical.
+ */
+function renderNodeModelFailoverFields(node: IrGraphNode): string {
+  const pieces: string[] = [];
+  const fallbacks = node.modelFallbacks;
+  if (fallbacks !== undefined && fallbacks.length > 0) {
+    pieces.push(
+      `\n        modelFallbacks: [${fallbacks.map((m) => escapeJsonString(m)).join(", ")}],`,
+    );
+  }
+  if (node.circuitBreaker !== undefined) {
+    pieces.push(`\n        circuitBreaker: ${JSON.stringify(node.circuitBreaker)},`);
+  }
+  if (node.modelTiers !== undefined) {
+    pieces.push(`\n        modelTiers: ${JSON.stringify(node.modelTiers)},`);
+  }
+  if (node.modelPool !== undefined) {
+    pieces.push(`\n        modelPool: ${JSON.stringify(node.modelPool)},`);
+  }
+  return pieces.join("");
+}
+
+/**
  * Item 27 (Batch A extends it to this shape) — render the `budget`
  * runChatLoop field, indented for the generated node body. Graph-level:
  * every node's call carries the same cap (same scope as failureTaxonomy).
@@ -810,7 +844,7 @@ function renderNodeBody(
         sessionName: ${escapeJsonString(node.name)} + "-" + ctx.graphRunId,
         sessionTarget: "graph-node",
         seedMessages: __seed,
-        singleTurn: true,${renderNodeLoopFields(node)}${toolsField}${graphLevelFields}
+        singleTurn: true,${renderNodeLoopFields(node)}${renderNodeModelFailoverFields(node)}${toolsField}${graphLevelFields}
         runContext: ctx.runContext,${evalAdapterLine}
       });
       const __next = { ...prev, [${nameJs}]: __reply };${hitlRecordBlock}

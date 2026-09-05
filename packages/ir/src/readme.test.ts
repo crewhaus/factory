@@ -496,3 +496,57 @@ describe("renderBundleReadme — structure (item 42)", () => {
     expect(md).toContain("| Models | `claude-sonnet-4-6`, `claude-haiku-4-5` |");
   });
 });
+
+describe("renderBundleReadme — 0.6.0 model plan (§4.3)", () => {
+  test("the Models row lists every model a run can route to: candidates, tiers, fallbacks and the aux slots", () => {
+    const md = renderBundleReadme(
+      baseCliIr({
+        agent: {
+          model: "claude-sonnet-4-6",
+          instructions: "x",
+          modelPool: {
+            candidates: [
+              { model: "claude-haiku-4-5", tags: ["cheap"], fallbacks: ["openai/gpt-5-mini"] },
+              { model: "claude-opus-4-8", tags: ["strong"] },
+            ],
+            policy: "heuristic",
+          },
+        },
+        compaction: { model: "claude-haiku-4-5" },
+        evaluation: {
+          grader: { type: "llm_judge", criteria: "c", judges: ["gemini/gemini-2.5-pro"] },
+          threshold: 0.7,
+          onFail: "retry",
+          maxRetries: 1,
+        },
+        budget: { usdMicros: 1, onExceed: { kind: "degrade", model: "local/llama3" } },
+      }),
+    );
+    expect(md).toContain(
+      "| Models | `claude-sonnet-4-6`, `claude-haiku-4-5`, `openai/gpt-5-mini`, `claude-opus-4-8`, `gemini/gemini-2.5-pro`, `local/llama3` |",
+    );
+  });
+
+  test("a models: registry renders a Model profiles section; a registry-less IR renders none", () => {
+    const md = renderBundleReadme(
+      baseCliIr({
+        models: {
+          fast: {
+            profile: "fast",
+            model: "claude-haiku-4-5",
+            tags: ["cheap"],
+            maxTokens: 4096,
+            tools: ["read"],
+          },
+          strong: { profile: "strong", model: "claude-opus-4-8" },
+        },
+        agent: { model: "claude-haiku-4-5", instructions: "x", modelProfile: "fast" },
+      }),
+    );
+    expect(md).toContain("## Model profiles");
+    expect(md).toContain("| Profile | Model | Tags | Pins |");
+    expect(md).toContain("| `fast` | `claude-haiku-4-5` | `cheap` | `maxTokens`, `tools` |");
+    expect(md).toContain("| `strong` | `claude-opus-4-8` | — | — |");
+    expect(renderBundleReadme(baseCliIr())).not.toContain("Model profiles");
+  });
+});
