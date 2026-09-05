@@ -46,6 +46,12 @@ const PALETTE: Record<TraceEventKind, string> = {
   model_tier_route: "\x1b[94m", // bright blue — a routing decision, in the model family
   // model_pool — the PolicyRouter picked a candidate this turn
   model_route: "\x1b[94m", // bright blue — a routing decision, in the model family
+  // 0.6.0 (design §8.1) — a hybrid-strategy stage transition (draft → judge →
+  // escalation …): a routing-shaped event, so it sits in the same family.
+  model_stage: "\x1b[94m", // bright blue
+  // 0.6.0 (design §7.2.1) — a per-message `/model` directive parsed at an
+  // input seam. Human steering of the route, in the model family.
+  model_directive: "\x1b[94m", // bright blue
   // Human feedback channel — a user rating on an assistant turn.
   response_rated: "\x1b[92m", // bright green — a human signal worth spotting
   // Loop contract 0.4 (Batch C, G11) — pending-approval lifecycle. A parked

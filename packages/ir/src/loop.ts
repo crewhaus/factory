@@ -417,9 +417,12 @@ function ringSegmentsFromView(view: RingView): LoopSegment[] {
     const usd = view.budget.usdMicros / 1_000_000;
     const onExceed =
       view.budget.onExceed.kind === "degrade"
-        ? ` (on exceed: degrade → ${view.budget.onExceed.model})`
-        : " (on exceed: stop)";
-    stopParts.push(`budget $${usd}${onExceed}`);
+        ? `on exceed: degrade → ${view.budget.onExceed.model}`
+        : "on exceed: stop";
+    // 0.6.0 — `scope` is only carried when declared, so the rendered summary
+    // is byte-identical for every pre-0.6.0 IR.
+    const scope = view.budget.scope !== undefined ? `; scope: ${view.budget.scope}` : "";
+    stopParts.push(`budget $${usd} (${onExceed}${scope})`);
   }
   if (view.limits !== undefined) {
     stopKeys.push("limits");

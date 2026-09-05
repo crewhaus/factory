@@ -98,6 +98,55 @@ describe("gen_ai mapping — model span", () => {
   });
 });
 
+describe("gen_ai mapping — model span attribution (0.6.0 §8.4)", () => {
+  test("role/profile/stage/spec/params ride the gen_ai.chat span when the pair carries them", () => {
+    const start = {
+      startNano: "1746619200000000000",
+      ev: {
+        ...env(),
+        kind: "model_request",
+        model: "claude-haiku-4-5",
+        specModel: "anthropic/claude-haiku-4-5",
+        messageCount: 3,
+        toolCount: 1,
+        streaming: false,
+        role: "draft",
+        profile: "fast",
+        stage: "draft",
+        paramsFingerprint: "fp-1",
+      } as ModelRequestEvent,
+      streamEvents: [],
+    };
+    const end: ModelResponseEvent = {
+      ...env(),
+      kind: "model_response",
+      model: "claude-haiku-4-5",
+      stopReason: "end_turn",
+      usage: { input: 100, output: 50 },
+      durationMs: 1000,
+      // The response's own attribution wins over the request's.
+      role: "draft",
+      profile: "fast",
+    };
+    const span = buildModelSpan(start, end);
+    expect(findAttr(span.attributes, ATTR.CREWHAUS_MODEL_ROLE)?.value).toEqual({
+      stringValue: "draft",
+    });
+    expect(findAttr(span.attributes, ATTR.CREWHAUS_MODEL_PROFILE)?.value).toEqual({
+      stringValue: "fast",
+    });
+    expect(findAttr(span.attributes, ATTR.CREWHAUS_MODEL_STAGE)?.value).toEqual({
+      stringValue: "draft",
+    });
+    expect(findAttr(span.attributes, ATTR.CREWHAUS_MODEL_SPEC)?.value).toEqual({
+      stringValue: "anthropic/claude-haiku-4-5",
+    });
+    expect(findAttr(span.attributes, ATTR.CREWHAUS_MODEL_PARAMS_FINGERPRINT)?.value).toEqual({
+      stringValue: "fp-1",
+    });
+  });
+});
+
 describe("gen_ai mapping — tool span", () => {
   test("uses code.function and crewhaus.tool.* extension keys", () => {
     const start = {

@@ -11,7 +11,8 @@
  *  - `model_response` (the cost-tracker pricing key) carries the SERVING
  *    candidate's wire model id + provider + specModel — pricing follows the
  *    switch;
- *  - the stderr failover note (advisor-events persistence has not landed);
+ *  - the stderr failover note (the durable `model_failover` session line is
+ *    covered in routing-persist.test.ts);
  *  - a missing-credential fallback warns at boot without failing the run.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";

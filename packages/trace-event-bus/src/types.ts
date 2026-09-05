@@ -52,28 +52,105 @@ export type TurnEndEvent = TraceEventEnvelope & {
  */
 export type ProviderId = "anthropic" | "openai" | "gemini" | "bedrock";
 
-export type ModelRequestEvent = TraceEventEnvelope & {
-  kind: "model_request";
-  /**
-   * WIRE model id — the stripped form the provider was actually called
-   * with (`"bedrock/us.anthropic.claude-…"` spec → `"us.anthropic.claude-…"`).
-   * This is the id cost-tracker pricing keys and the OTel
-   * `gen_ai.request.model` attribute expect; `provider` carries the
-   * routing half. The original spec string lives in `specModel`.
-   */
-  model: string;
-  /**
-   * Original spec model string (`"bedrock/us.anthropic.claude-…"`,
-   * `"groq/llama-3.3-70b"`, …) when it differs from `model`. Preserves
-   * grammar-only routing detail the (provider, model) pair can't recover
-   * — e.g. which OpenAI-compatible host or azure deployment was hit.
-   */
-  specModel?: string;
-  provider?: ProviderId;
-  messageCount: number;
-  toolCount: number;
-  streaming: boolean;
+/**
+ * 0.6.0 (design §8.1) — WHY a model call was made. Every hybrid topology
+ * (cascade, draft-verify, plan-execute, guide, consult, committee, shadow)
+ * and every auxiliary slot (judge, compaction, sub-agent) publishes its
+ * calls on the run bus with a role, so `budget`, `cost-summary`, Hangar and
+ * OTel can split spend by purpose instead of by model alone.
+ *
+ *   primary     — the main-turn call (absent `role` on an event means this)
+ *   draft       — a cascade's cheap first attempt
+ *   judge       — an in-loop `evaluation:` grader or a `kind: judge` gate
+ *   escalation  — the strong re-run after a failed draft / an `Escalate`
+ *   consult     — a `Consult` tool side call
+ *   guide       — a `strategy.guide` planning call
+ *   classifier  — a `policy: classifier` label call
+ *   committee   — one committee member's call
+ *   shadow      — an audition-lane replay whose text never reaches the user
+ *   compaction  — a summarisation side call
+ *   subagent    — a Task/sub-agent child's spend re-published on the parent
+ */
+export type ModelRole =
+  | "primary"
+  | "draft"
+  | "judge"
+  | "escalation"
+  | "consult"
+  | "guide"
+  | "classifier"
+  | "committee"
+  | "shadow"
+  | "compaction"
+  | "subagent";
+
+/**
+ * 0.6.0 (design §8.1) — what the adapter ACTUALLY sent after its own
+ * parameter gating (Claude 5 drops `temperature`, OpenAI reasoning models
+ * swap `max_tokens` for `max_completion_tokens`, …). Filled by the optional
+ * `ProviderAdapter.effectiveParams?(req)` SPI projection; `dropped` names the
+ * requested knobs the adapter silently omitted — the first time that drop
+ * is visible anywhere. Absent when the serving adapter does not implement
+ * the projection.
+ */
+export type EffectiveParams = {
+  readonly model: string;
+  readonly maxTokens: number;
+  readonly thinking?: { readonly budgetTokens: number };
+  readonly reasoningEffort?: string;
+  readonly temperature?: number;
+  /** Requested parameter names the adapter dropped before sending. */
+  readonly dropped: ReadonlyArray<string>;
 };
+
+/**
+ * 0.6.0 (design §8.1) — the attribution fields shared by `model_request`,
+ * `model_response` and `cost_accrual`. Every field is OPTIONAL so events and
+ * persisted JSONL written before this release keep parsing; readers treat an
+ * absent `role` as `"primary"`. cost-tracker copies them verbatim from the
+ * response onto the accrual, and runtime-core's session mirror persists them
+ * only when present, so an unattributed run stays byte-identical.
+ */
+export type ModelAttributionFields = {
+  /** Purpose of the call. Absent ⇒ `"primary"`. */
+  role?: ModelRole;
+  /** Hybrid-strategy stage name (e.g. `"draft"`, `"verify"`, `"plan"`) when the call belongs to one. */
+  stage?: string;
+  /** `models:` profile name the serving candidate was declared under, when any. */
+  profile?: string;
+  /**
+   * Fingerprint of the request parameters (max tokens, thinking, temperature,
+   * timeout) the serving plan resolved for this call — lets two calls on the
+   * same model be told apart when their settings differ.
+   */
+  paramsFingerprint?: string;
+  /** The adapter's own echo of what it sent — see {@link EffectiveParams}. */
+  effectiveParams?: EffectiveParams;
+};
+
+export type ModelRequestEvent = TraceEventEnvelope &
+  ModelAttributionFields & {
+    kind: "model_request";
+    /**
+     * WIRE model id — the stripped form the provider was actually called
+     * with (`"bedrock/us.anthropic.claude-…"` spec → `"us.anthropic.claude-…"`).
+     * This is the id cost-tracker pricing keys and the OTel
+     * `gen_ai.request.model` attribute expect; `provider` carries the
+     * routing half. The original spec string lives in `specModel`.
+     */
+    model: string;
+    /**
+     * Original spec model string (`"bedrock/us.anthropic.claude-…"`,
+     * `"groq/llama-3.3-70b"`, …) when it differs from `model`. Preserves
+     * grammar-only routing detail the (provider, model) pair can't recover
+     * — e.g. which OpenAI-compatible host or azure deployment was hit.
+     */
+    specModel?: string;
+    provider?: ProviderId;
+    messageCount: number;
+    toolCount: number;
+    streaming: boolean;
+  };
 
 export type ModelUsage = {
   input: number;
@@ -82,17 +159,18 @@ export type ModelUsage = {
   cacheCreate?: number;
 };
 
-export type ModelResponseEvent = TraceEventEnvelope & {
-  kind: "model_response";
-  /** WIRE model id — see `ModelRequestEvent.model`. Pricing resolves on this. */
-  model: string;
-  /** Original spec model string when it differs — see `ModelRequestEvent.specModel`. */
-  specModel?: string;
-  provider?: ProviderId;
-  stopReason: string;
-  usage: ModelUsage;
-  durationMs: number;
-};
+export type ModelResponseEvent = TraceEventEnvelope &
+  ModelAttributionFields & {
+    kind: "model_response";
+    /** WIRE model id — see `ModelRequestEvent.model`. Pricing resolves on this. */
+    model: string;
+    /** Original spec model string when it differs — see `ModelRequestEvent.specModel`. */
+    specModel?: string;
+    provider?: ProviderId;
+    stopReason: string;
+    usage: ModelUsage;
+    durationMs: number;
+  };
 
 export type ModelStreamTokenEvent = TraceEventEnvelope & {
   kind: "model_stream_token";
@@ -303,6 +381,10 @@ export type SubAgentStartEvent = TraceEventEnvelope & {
   childSessionId: string;
   toolCount: number;
   promptBytes: number;
+  /** 0.6.0 (design §7.7) — the child's SPEC model string, when known. Optional: absent on events published before this field existed. */
+  model?: string;
+  /** 0.6.0 (design §7.7) — the `models:` profile the child was started under (a Task `profile` argument validated against `allowed_profiles`). */
+  profile?: string;
 };
 
 export type SubAgentEndEvent = TraceEventEnvelope & {
@@ -314,6 +396,10 @@ export type SubAgentEndEvent = TraceEventEnvelope & {
   toolCallCount: number;
   finalMessageBytes: number;
   durationMs: number;
+  /** 0.6.0 (design §7.7) — see `SubAgentStartEvent.model`. */
+  model?: string;
+  /** 0.6.0 (design §7.7) — see `SubAgentStartEvent.profile`. */
+  profile?: string;
 };
 
 /**
@@ -326,6 +412,10 @@ export type RoleStartEvent = TraceEventEnvelope & {
   role: string;
   /** Position in the crew's role-activation sequence (0 = entry role). */
   activation: number;
+  /** 0.6.0 (design §7.7) — the role's SPEC model string, when known. Optional: absent on events published before this field existed. */
+  model?: string;
+  /** 0.6.0 (design §7.7) — the `models:` profile the role's model resolved from, when any. */
+  profile?: string;
 };
 
 export type RoleEndEvent = TraceEventEnvelope & {
@@ -334,6 +424,10 @@ export type RoleEndEvent = TraceEventEnvelope & {
   activation: number;
   finalMessageBytes: number;
   durationMs: number;
+  /** 0.6.0 (design §7.7) — see `RoleStartEvent.model`. */
+  model?: string;
+  /** 0.6.0 (design §7.7) — see `RoleStartEvent.profile`. */
+  profile?: string;
 };
 
 export type HandoffEvent = TraceEventEnvelope & {
@@ -370,57 +464,58 @@ export type CrewDoneEvent = TraceEventEnvelope & {
  * (`audit-log`, `gateway-server` budgeter, `studio-server` cost dashboard)
  * read this field for historical reproducibility.
  */
-export type CostAccrualEvent = TraceEventEnvelope & {
-  kind: "cost_accrual";
-  provider: ProviderId;
-  /**
-   * WIRE model id (copied from `ModelResponseEvent.model`) — together
-   * with `provider` this is exactly the `resolvePricing` lookup key, so
-   * a historical re-aggregation reprices deterministically.
-   */
-  modelId: string;
-  /** Original spec model string when it differs — see `ModelRequestEvent.specModel`. */
-  specModel?: string;
-  inputTokens: number;
-  outputTokens: number;
-  cachedReadTokens: number;
-  /**
-   * Prompt-cache WRITE tokens (Anthropic `cache_creation_input_tokens`,
-   * Bedrock `cacheWriteInputTokens` — the canonical `usage.cacheCreate`),
-   * billed at a premium over the input rate. Optional so `cost_accrual`
-   * records persisted before this field existed keep parsing; absent means
-   * "not tracked", and emitters that do track it write 0 when no cache
-   * segment was created.
-   */
-  cacheCreationTokens?: number;
-  costUsdMicros: number;
-  /**
-   * True when the `(provider, modelId)` pair had NO row in the pricing table,
-   * so `costUsdMicros` is 0 not because the call was free but because it could
-   * not be priced. `cost-tracker` still publishes the accrual (carrying the
-   * REAL `inputTokens`/`outputTokens`) so a downstream token tally survives an
-   * unpriced model, and so the alert-watchdog's pricing-miss detector fires.
-   * Absent (falsy) on every priced accrual — a genuinely-$0 priced call (e.g.
-   * a rounds-to-zero token count) is distinguishable from an unpriced one by
-   * this flag rather than only by the `costUsdMicros === 0 && tokens > 0`
-   * heuristic.
-   */
-  unpriced?: boolean;
-  tenantId?: string;
-  /**
-   * FR-003 — when true, this event is an *aggregate* run total rather than a
-   * single model call: the `eval-optimizer-orchestrator` publishes one such
-   * terminal accrual at the end of a budget-gated `crewhaus optimize` run so
-   * the spend summary (total $ + token totals) lands on the trace bus, not
-   * only on the result/report.json. Its token/cost fields are the sums over
-   * the run's per-call accruals. Subscribers that aggregate per-call spend
-   * (`cost-tracker`) ignore externally-published `cost_accrual` events
-   * entirely — they only sum the ones they emit from `model_response` — so a
-   * terminal total never double-counts. Absent (falsy) on ordinary per-call
-   * accruals, including every `cost-tracker`-emitted one.
-   */
-  summary?: boolean;
-};
+export type CostAccrualEvent = TraceEventEnvelope &
+  ModelAttributionFields & {
+    kind: "cost_accrual";
+    provider: ProviderId;
+    /**
+     * WIRE model id (copied from `ModelResponseEvent.model`) — together
+     * with `provider` this is exactly the `resolvePricing` lookup key, so
+     * a historical re-aggregation reprices deterministically.
+     */
+    modelId: string;
+    /** Original spec model string when it differs — see `ModelRequestEvent.specModel`. */
+    specModel?: string;
+    inputTokens: number;
+    outputTokens: number;
+    cachedReadTokens: number;
+    /**
+     * Prompt-cache WRITE tokens (Anthropic `cache_creation_input_tokens`,
+     * Bedrock `cacheWriteInputTokens` — the canonical `usage.cacheCreate`),
+     * billed at a premium over the input rate. Optional so `cost_accrual`
+     * records persisted before this field existed keep parsing; absent means
+     * "not tracked", and emitters that do track it write 0 when no cache
+     * segment was created.
+     */
+    cacheCreationTokens?: number;
+    costUsdMicros: number;
+    /**
+     * True when the `(provider, modelId)` pair had NO row in the pricing table,
+     * so `costUsdMicros` is 0 not because the call was free but because it could
+     * not be priced. `cost-tracker` still publishes the accrual (carrying the
+     * REAL `inputTokens`/`outputTokens`) so a downstream token tally survives an
+     * unpriced model, and so the alert-watchdog's pricing-miss detector fires.
+     * Absent (falsy) on every priced accrual — a genuinely-$0 priced call (e.g.
+     * a rounds-to-zero token count) is distinguishable from an unpriced one by
+     * this flag rather than only by the `costUsdMicros === 0 && tokens > 0`
+     * heuristic.
+     */
+    unpriced?: boolean;
+    tenantId?: string;
+    /**
+     * FR-003 — when true, this event is an *aggregate* run total rather than a
+     * single model call: the `eval-optimizer-orchestrator` publishes one such
+     * terminal accrual at the end of a budget-gated `crewhaus optimize` run so
+     * the spend summary (total $ + token totals) lands on the trace bus, not
+     * only on the result/report.json. Its token/cost fields are the sums over
+     * the run's per-call accruals. Subscribers that aggregate per-call spend
+     * (`cost-tracker`) ignore externally-published `cost_accrual` events
+     * entirely — they only sum the ones they emit from `model_response` — so a
+     * terminal total never double-counts. Absent (falsy) on ordinary per-call
+     * accruals, including every `cost-tracker`-emitted one.
+     */
+    summary?: boolean;
+  };
 
 /**
  * Track F (Section 57) — runtime feedback channel: test verdict.
@@ -691,12 +786,145 @@ export type ModelRouteEvent = TraceEventEnvelope & {
   routeKey: string;
   /** Wire model id the chosen candidate resolved to. */
   model: string;
-  policy: "static" | "heuristic" | "learned";
+  /**
+   * The configured pool policy, or `"forced"` (0.6.0 §7.12) when the loop
+   * substituted a candidate outside the router's choice — today a
+   * `budget.on_exceed: degrade` breach forcing the degrade rung
+   * (`reason: "budget_degrade"`).
+   */
+  policy: "static" | "heuristic" | "learned" | "forced";
   reason: string;
   /** True when the learned policy is exploring an under-sampled arm. */
   explored?: boolean;
   /** Fingerprint of the pool config that produced this decision. */
   policyVersion?: string;
+  // ---- 0.6.0 (design §7.2, §8.1) — additive routing attribution. Every
+  // field is optional so `model_route` lines persisted by 0.5.x keep parsing.
+  /** Hybrid-strategy stage this decision serves (`"draft"`, `"escalation"`, …). */
+  stage?: string;
+  /** The `model_pool.strategy` member that owns the turn (`"cascade"`, `"committee"`, …). */
+  strategy?: string;
+  /** `model_pool.rules[].id` of the first-match rule that steered this decision, when one did. */
+  ruleId?: string;
+  /** `models:` profile name of the chosen candidate, when it is a profile. */
+  profile?: string;
+  /**
+   * SPEC model string of the chosen candidate when it differs from `model`
+   * (the wire id). Scoreboard arms key on this string, so it is what
+   * `route explain` needs to name the same arm `route status` shows.
+   */
+  specModel?: string;
+  /** Derived per-turn signals the decision was made from — never user text. */
+  signals?: ModelRouteSignals;
+  /** The `preRoute` hint that constrained the policy, when one applied. */
+  hint?: ModelRouteHint;
+  /** Arm ids (profile name or spec model string) eligible after capability/breaker/cap filtering. */
+  eligible?: ReadonlyArray<string>;
+  /** Fingerprint of the toolset advertised to the chosen candidate. */
+  toolsetFingerprint?: string;
+  /** `model_pool.scope` — the step/role/node/sub-agent the pool belongs to; `"main"` for the agent's own pool. */
+  scope?: string;
+  /** Persisted verdict of a `policy: classifier` label call, so replay stays exact. */
+  classifierVerdict?: ModelClassifierVerdict;
+};
+
+/**
+ * 0.6.0 (design §7.2.2) — the DERIVED routing signals persisted on a
+ * `model_route` line: counts, flags, names and hashes only. The user's text
+ * itself is never carried, because on a channel shape it is attacker-
+ * controlled and a route line lands in session logs and the Hangar timeline.
+ * The first four are the 0.5.x router inputs; the rest arrive with rules.
+ */
+export type ModelRouteSignals = {
+  readonly contextTokens?: number;
+  readonly toolsInPlay?: boolean;
+  readonly turnIndex?: number;
+  readonly priorTurnToolUseCount?: number;
+  readonly userTextChars?: number;
+  readonly hasImages?: boolean;
+  readonly toolNamesLastTurn?: ReadonlyArray<string>;
+  readonly budgetSpentRatio?: number;
+  readonly channelHint?: string;
+  /** Hash of the user text a `message_matches` rule ran against — for replay, never the text. */
+  readonly textHash?: string;
+};
+
+/**
+ * 0.6.0 (design §7.2) — the `preRoute` phase's output as persisted on the
+ * route line. `source` names which lane produced it (`"forced"` for budget /
+ * cascade / escalation, `"directive"`, `"rule"`, `"classifier"`, `"none"`).
+ */
+export type ModelRouteHint = {
+  readonly source: string;
+  /** Arm id the hint pinned, when it forced one. */
+  readonly forcedArm?: string;
+  /** Arm ids the hint removed from eligibility. */
+  readonly excludedArms?: ReadonlyArray<string>;
+  /** Suffix appended to the learning bucket (`routeKey`) by the hint. */
+  readonly routeKeySuffix?: string;
+  /** Human-readable evidence for the hint (rule id, directive text class, …). */
+  readonly evidence?: string;
+};
+
+/** 0.6.0 (design §7.2.3) — a `policy: classifier` label call's persisted verdict. */
+export type ModelClassifierVerdict = {
+  /** The chosen tag — constrained to the pool's declared tags. */
+  readonly label: string;
+  /** Wire model id of the classifier call. */
+  readonly model?: string;
+  readonly costUsdMicros?: number;
+};
+
+/**
+ * 0.6.0 (design §7.3–§7.8) — one hybrid-strategy stage transition. Published
+ * by runtime-core around each cascade / draft-verify / guide / consult /
+ * committee / shadow stage, so `route explain`, Hangar and OTel can show the
+ * shape of a turn (draft → judge → escalation) rather than a flat list of
+ * model calls. `outcome` is the stage's lifecycle verdict; `cause` explains a
+ * `skipped` / `failed` outcome (`"max_escalations"`, `"self"` for a
+ * model-directed `Escalate`, `"judge_share_exhausted"`, …). `costUsdMicros`
+ * is the stage's own spend when known at publish time (a `done` stage).
+ * Mirrored into the session JSONL as the durable `model_stage` event-log kind.
+ */
+export type ModelStageEvent = TraceEventEnvelope & {
+  kind: "model_stage";
+  /** Stage name (`"draft"`, `"verify"`, `"escalate"`, `"plan"`, `"guide"`, `"shadow"`, `"member"`, …). */
+  stage: string;
+  /** The `model_pool.strategy` member that owns the stage. */
+  strategy: string;
+  /** The role the stage's model call(s) carry. */
+  role: ModelRole;
+  /** Wire model id serving the stage. */
+  model: string;
+  /** `models:` profile of the serving candidate, when any. */
+  profile?: string;
+  outcome: "started" | "done" | "failed" | "skipped";
+  cause?: string;
+  costUsdMicros?: number;
+};
+
+/**
+ * 0.6.0 (design §7.2.1) — a per-message `/model …` directive parsed at a
+ * typed INPUT seam (the REPL input loop or the singleTurn seed message —
+ * never the transcript, whose synthetic user messages can echo a grader's
+ * rationale). Published once per parse so `route explain` and `--resume`
+ * reconstruct the session pin from a typed event instead of re-scanning
+ * prose. `source` is where the directive was read (`"repl"`, `"seed"`, or
+ * `"session"` for a pin restored from session metadata); `"none"` records
+ * that a candidate string was seen somewhere directives are NOT honoured.
+ * `requested` is the arm the user named (`"fast"`, `"auto"`, …); `resolved`
+ * is the roster arm it mapped to; `accepted` is false when the request was
+ * refused (unknown arm, directives off, a forced lane outranked it) with
+ * `reason` saying why. Mirrored into the session JSONL as the durable
+ * `model_directive` event-log kind.
+ */
+export type ModelDirectiveEvent = TraceEventEnvelope & {
+  kind: "model_directive";
+  source: "repl" | "seed" | "session" | "none";
+  requested: string;
+  resolved?: string;
+  accepted: boolean;
+  reason?: string;
 };
 
 /**
@@ -708,8 +936,9 @@ export type ModelRouteEvent = TraceEventEnvelope & {
  * `max_retries`. `verdict` is `"pass"` when `score >= threshold` (for the
  * deterministic `contains`/`regex` graders score is 1 or 0 against a
  * threshold of 1). Judge/model grading calls are metered into the run
- * budget as ordinary `cost_accrual` events — this event carries only the
- * verdict.
+ * budget as ordinary `cost_accrual` events (carrying `role: "judge"`) — this
+ * event carries the verdict plus, from 0.6.0, the attribution needed to tie
+ * it to the graded arm and the judge that scored it.
  */
 export type EvalGradedEvent = TraceEventEnvelope & {
   kind: "eval_graded";
@@ -730,6 +959,18 @@ export type EvalGradedEvent = TraceEventEnvelope & {
    * (readers treat absence as "exhaustion unknown", never as "exhausted").
    */
   maxRetries?: number;
+  // ---- 0.6.0 (design §7.3, §8.1) — additive attribution. All optional so
+  // sidecars recorded before this release keep parsing.
+  /** Wire model id of the GRADED response (the draft or primary arm). */
+  model?: string;
+  /** `models:` profile of the graded arm, when any. */
+  profile?: string;
+  /** Wire model id of the judge that produced `score`; absent for deterministic graders. */
+  judgeModel?: string;
+  /** The judge call's priced spend, when the grader reported usage. */
+  judgeCostUsdMicros?: number;
+  /** Under `on_fail: escalate`, the SPEC model string the turn was handed to after this failing grade. */
+  escalatedTo?: string;
 };
 
 /**
@@ -749,6 +990,14 @@ export type JudgeVerdictEvent = TraceEventEnvelope & {
   score: number;
   /** Judge-model explanation, when it supplied one. */
   rationale?: string;
+  // ---- 0.6.0 (design §6.2, §8.1) — additive attribution. All optional so
+  // events published by 0.5.x gate helpers keep parsing.
+  /** Wire model id of the judge (or the panel's first member) that scored the gate. */
+  judgeModel?: string;
+  /** Wire model ids of every panel member when the gate ran a `judges: [..]` panel. */
+  panel?: ReadonlyArray<string>;
+  /** The gate's priced judge spend, when the grader reported usage. */
+  costUsdMicros?: number;
 };
 
 export type TraceEvent =
@@ -781,6 +1030,8 @@ export type TraceEvent =
   | ModelFailoverEvent
   | ModelTierRouteEvent
   | ModelRouteEvent
+  | ModelStageEvent
+  | ModelDirectiveEvent
   | JanitorActionEvent
   | ResponseRatedEvent
   | ApprovalRequestedEvent

@@ -33,6 +33,10 @@ import {
 } from "@crewhaus/structured-event-printer";
 import type {
   CostAccrualEvent,
+  JudgeVerdictEvent,
+  ModelDirectiveEvent,
+  ModelFailoverEvent,
+  ModelStageEvent,
   TraceEvent,
   TraceEventBus,
   Unsubscribe,
@@ -524,7 +528,16 @@ const CLEAN_STOP_REASONS = new Set(["end_turn", "tool_use", "stop_sequence"]);
  *   error_recovered      → `recovery`   { errorName, action, depth }
  *   tool_call_end        → `tool_stats` { toolName, durationMs, isError }
  *   permission_decision  → `permission` { toolName, decision, askOutcome }
- *   model_response       → `model_meta` { stopReason, model }
+ *   model_response       → `model_meta` { stopReason, model, role?, profile?,
+ *                                         usage, durationMs, turnNumber }
+ *
+ * 0.6.0 (design §8.4) — `model_meta` carries exact per-turn attribution
+ * (`usage`, whole-ms `durationMs`, the envelope `turnNumber`, and the
+ * `role` / `profile` the response was published with) so `watchme report`'s
+ * `attributeModels` can be `exact` from the session log alone, without the
+ * opt-in `CREWHAUS_WATCHME` sidecar. `role`/`profile` are written only when
+ * the response carries them (absent role ⇒ primary), and readers that
+ * predate the enrichment keep reading `stopReason`/`model` unchanged.
  *
  * Unlike the other `attach*IfEnvSet` subscribers this one is DEFAULT-ON:
  * the lines are tiny (see the granularity note on the `tool_stats` kind in
@@ -616,7 +629,17 @@ export function attachAdvisorPersistence(
       case "model_response": {
         responses += 1;
         if (!CLEAN_STOP_REASONS.has(event.stopReason)) anomalousStops += 1;
-        persist("model_meta", { stopReason: event.stopReason, model: event.model });
+        persist("model_meta", {
+          stopReason: event.stopReason,
+          model: event.model,
+          ...(event.role !== undefined ? { role: event.role } : {}),
+          ...(event.profile !== undefined ? { profile: event.profile } : {}),
+          usage: event.usage,
+          // Whole milliseconds — performance.now() floats add line bytes
+          // without adding attribution signal.
+          durationMs: Math.round(event.durationMs),
+          turnNumber: event.turnNumber,
+        });
         return;
       }
       case "compaction_fired": {
@@ -707,6 +730,116 @@ export function attachMcpStatsPersistence(
   return { unsubscribe };
 }
 
+// -------- routing decision persistence (0.6.0 design §8.1) --------
+
+export type AttachedRoutingPersistence = {
+  unsubscribe: Unsubscribe;
+};
+
+/**
+ * 0.6.0 (design §8.1) — mirror the routing decisions that were trace-bus-only
+ * in 0.5.x into the session JSONL, as the durable event-log kinds of the same
+ * name, so `crewhaus route explain`, `sessions tail`, Hangar's session gutter
+ * and `--resume` read them offline:
+ *
+ *   model_failover   → `model_failover`   { turnNumber, from, to, reason }
+ *   model_stage      → `model_stage`      { turnNumber, stage, strategy, role, model, profile?, outcome, cause?, costUsdMicros? }
+ *   model_directive  → `model_directive`  { turnNumber, source, requested, resolved?, accepted, reason? }
+ *   judge_verdict    → `judge_verdict`    { turnNumber, stepOrNode, verdict, score, rationale?, judgeModel?, panel?, costUsdMicros? }
+ *
+ * A bus subscriber rather than a `logEvent` at each publish site because two
+ * of these are published OUTSIDE runtime-core: the failover chain in
+ * `@crewhaus/model-router` (which has no event log) and the `kind: judge`
+ * gate helpers emitted into workflow/graph bundles. `model_tier_route` is
+ * the exception — its only publisher is runtime-core's own tier branch, which
+ * writes the durable line directly beside the publish, exactly as
+ * `model_route` does.
+ *
+ * UNGATED, like the `model_route` line and unlike the advisor mirrors: these
+ * records are what replay reads (`--resume` reconstructs a directive pin from
+ * `model_directive`; `route explain` reconstructs a turn's stages), so an env
+ * flag that dropped them would make replay diverge from the run. The lines
+ * are small and fire once per decision, not per token. `append()` failures
+ * are logged, never thrown — a persistence hiccup must not abort a turn.
+ */
+export function attachRoutingPersistence(
+  bus: TraceEventBus,
+  eventLog: EventLog,
+  runContext: RunContext,
+): AttachedRoutingPersistence {
+  const persist = (
+    kind: "model_failover" | "model_stage" | "model_directive" | "judge_verdict",
+    payload: unknown,
+  ): void => {
+    void eventLog.append({ kind, payload }).catch((err) => {
+      runContext.logger.error("routing_event.persist_failed", {
+        kind,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    });
+  };
+
+  const unsubscribe = bus.subscribe((event: TraceEvent): void => {
+    switch (event.kind) {
+      case "model_failover": {
+        const e = event as ModelFailoverEvent;
+        persist("model_failover", {
+          turnNumber: e.turnNumber,
+          from: e.from,
+          to: e.to,
+          reason: e.reason,
+        });
+        return;
+      }
+      case "model_stage": {
+        const e = event as ModelStageEvent;
+        persist("model_stage", {
+          turnNumber: e.turnNumber,
+          stage: e.stage,
+          strategy: e.strategy,
+          role: e.role,
+          model: e.model,
+          ...(e.profile !== undefined ? { profile: e.profile } : {}),
+          outcome: e.outcome,
+          ...(e.cause !== undefined ? { cause: e.cause } : {}),
+          ...(e.costUsdMicros !== undefined ? { costUsdMicros: e.costUsdMicros } : {}),
+        });
+        return;
+      }
+      case "model_directive": {
+        const e = event as ModelDirectiveEvent;
+        persist("model_directive", {
+          turnNumber: e.turnNumber,
+          source: e.source,
+          requested: e.requested,
+          ...(e.resolved !== undefined ? { resolved: e.resolved } : {}),
+          accepted: e.accepted,
+          ...(e.reason !== undefined ? { reason: e.reason } : {}),
+        });
+        return;
+      }
+      case "judge_verdict": {
+        const e = event as JudgeVerdictEvent;
+        persist("judge_verdict", {
+          turnNumber: e.turnNumber,
+          stepOrNode: e.stepOrNode,
+          verdict: e.verdict,
+          score: e.score,
+          ...(e.rationale !== undefined ? { rationale: e.rationale } : {}),
+          ...(e.judgeModel !== undefined ? { judgeModel: e.judgeModel } : {}),
+          ...(e.panel !== undefined ? { panel: e.panel } : {}),
+          ...(e.costUsdMicros !== undefined ? { costUsdMicros: e.costUsdMicros } : {}),
+        });
+        return;
+      }
+      default:
+        return;
+    }
+  });
+
+  return { unsubscribe };
+}
+
 // -------- "watch me" live capture tap (design/watch-me.md §6.1) --------
 
 /**
@@ -766,6 +899,14 @@ const WATCHME_MIRRORED_KIND_RECORD: Readonly<Record<EventKind, true>> = {
   model_meta: true,
   mcp_stats: true,
   model_route: true,
+  // 0.6.0 (design §8.1) — the routing decisions made durable in this release:
+  // the tier twin of model_route (written beside its publish) and the four
+  // kinds `attachRoutingPersistence` mirrors from the bus.
+  model_tier_route: true,
+  model_failover: true,
+  model_stage: true,
+  model_directive: true,
+  judge_verdict: true,
   wiki_write: true,
   plan_update: true,
   goal_update: true,

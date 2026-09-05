@@ -30,6 +30,7 @@ export { createTierRouter, pickTier } from "./tier-router.js";
 export type {
   ArmScore,
   PolicyDecision,
+  PolicyDecisionPolicy,
   PolicyRouter,
   PolicyRouterOptions,
   PoolCandidate,

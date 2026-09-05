@@ -14,6 +14,7 @@
  */
 import type {
   A2AMessageEvent,
+  AlertRaisedEvent,
   ApprovalRequestedEvent,
   ApprovalResolvedEvent,
   CircuitStateChangedEvent,
@@ -31,6 +32,7 @@ import type {
   ModelFailoverEvent,
   ModelRequestEvent,
   ModelResponseEvent,
+  ModelRouteEvent,
   ModelStreamTokenEvent,
   ModelTierRouteEvent,
   PermissionDecisionEvent,
@@ -50,14 +52,6 @@ import type {
   TurnEndEvent,
   TurnStartEvent,
 } from "@crewhaus/trace-event-bus";
-
-// `AlertRaisedEvent` and `ModelRouteEvent` are defined in trace-event-bus's
-// types.ts and are members of the exported `TraceEvent` union, but the
-// package's index barrel does not re-export them by name (see cross-package
-// note in the return). Derive them from the union so we depend only on the
-// exported surface rather than editing the keystone package.
-type AlertRaisedEvent = Extract<TraceEvent, { kind: "alert_raised" }>;
-type ModelRouteEvent = Extract<TraceEvent, { kind: "model_route" }>;
 import {
   type Attribute,
   type OtelSpan,
@@ -181,6 +175,13 @@ export const ATTR = {
   CREWHAUS_ROUTE_ESCALATED: "crewhaus.route.escalated",
   CREWHAUS_ROUTE_EXPLORED: "crewhaus.route.explored",
   CREWHAUS_ROUTE_POLICY_VERSION: "crewhaus.route.policy_version",
+  // 0.6.0 (design §8.4) — per-call attribution on the gen_ai.chat span, set
+  // only when the response carries the field (absent role ⇒ primary).
+  CREWHAUS_MODEL_SPEC: "crewhaus.model.spec",
+  CREWHAUS_MODEL_ROLE: "crewhaus.model.role",
+  CREWHAUS_MODEL_PROFILE: "crewhaus.model.profile",
+  CREWHAUS_MODEL_STAGE: "crewhaus.model.stage",
+  CREWHAUS_MODEL_PARAMS_FINGERPRINT: "crewhaus.model.params_fingerprint",
   // G58 — janitor.
   CREWHAUS_JANITOR_STEP: "crewhaus.janitor.step",
   CREWHAUS_JANITOR_STATUS: "crewhaus.janitor.status",
@@ -357,6 +358,21 @@ export function buildModelSpan(start: StartedModel, end: ModelResponseEvent): Ot
   if (end.usage.cacheCreate !== undefined) {
     attrs.push(attrInt(ATTR.GEN_AI_USAGE_CACHE_CREATE_TOKENS, end.usage.cacheCreate));
   }
+  // 0.6.0 (design §8.4) — attribution, response-first with the request as
+  // the fallback (a nested loop stamps both identically; a chain-wrapped
+  // candidate can only know the served identity on the response).
+  const specModel = end.specModel ?? start.ev.specModel;
+  if (specModel !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_SPEC, specModel));
+  const role = end.role ?? start.ev.role;
+  if (role !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_ROLE, role));
+  const profile = end.profile ?? start.ev.profile;
+  if (profile !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_PROFILE, profile));
+  const stage = end.stage ?? start.ev.stage;
+  if (stage !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_STAGE, stage));
+  const paramsFingerprint = end.paramsFingerprint ?? start.ev.paramsFingerprint;
+  if (paramsFingerprint !== undefined) {
+    attrs.push(attrStr(ATTR.CREWHAUS_MODEL_PARAMS_FINGERPRINT, paramsFingerprint));
+  }
   return {
     traceId: end.traceId,
     spanId: end.spanId,
@@ -368,6 +384,60 @@ export function buildModelSpan(start: StartedModel, end: ModelResponseEvent): Ot
     attributes: attrs,
     events: start.streamEvents.length > 0 ? start.streamEvents : undefined,
     status: { code: STATUS_OK },
+  };
+}
+
+/**
+ * Why a call is being closed without its `model_response`.
+ * - `turn_end`: the turn closed with the call still open — runtime-core only
+ *   publishes `model_response` on its success paths, so a thrown stream
+ *   (abort, provider error, breaker trip, max_output_tokens recovery) leaves
+ *   the request unpaired.
+ * - `error_recovered`: the recovery engine took over after the turn's model
+ *   call threw; the retry publishes a fresh `model_request`.
+ * - `in_flight_cap`: a publisher minted more requests than responses and the
+ *   tracker evicted the oldest to stay bounded.
+ */
+export type AbandonedModelCause = "turn_end" | "error_recovered" | "in_flight_cap";
+
+/**
+ * A `gen_ai.chat` span for a model call whose `model_response` never arrived.
+ * Built from the request alone (no usage, no finish reason) with an ERROR
+ * status naming the cause, so a failed call is visible in the trace backend
+ * instead of vanishing — and so the SpanTracker can drop the entry.
+ */
+export function buildAbandonedModelSpan(
+  start: StartedModel,
+  endIso: string,
+  cause: AbandonedModelCause,
+): OtelSpan {
+  const req = start.ev;
+  const attrs: Attribute[] = [
+    ...envelopeAttrs(req),
+    attrStr(ATTR.GEN_AI_SYSTEM, genAiSystem(req.provider)),
+    attrStr(ATTR.GEN_AI_OPERATION_NAME, "chat"),
+    attrStr(ATTR.GEN_AI_REQUEST_MODEL, req.model),
+    attrBool(ATTR.GEN_AI_REQUEST_STREAMING, req.streaming),
+    attrStr(ATTR.CREWHAUS_ERROR_NAME, "model_response_missing"),
+  ];
+  if (req.specModel !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_SPEC, req.specModel));
+  if (req.role !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_ROLE, req.role));
+  if (req.profile !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_PROFILE, req.profile));
+  if (req.stage !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_STAGE, req.stage));
+  if (req.paramsFingerprint !== undefined) {
+    attrs.push(attrStr(ATTR.CREWHAUS_MODEL_PARAMS_FINGERPRINT, req.paramsFingerprint));
+  }
+  return {
+    traceId: req.traceId,
+    spanId: req.spanId,
+    ...(req.parentSpanId ? { parentSpanId: req.parentSpanId } : {}),
+    name: "gen_ai.chat",
+    kind: SPAN_KIND_CLIENT,
+    startTimeUnixNano: start.startNano,
+    endTimeUnixNano: isoToNano(endIso),
+    attributes: attrs,
+    events: start.streamEvents.length > 0 ? start.streamEvents : undefined,
+    status: { code: STATUS_ERROR, message: `no model_response before ${cause}` },
   };
 }
 

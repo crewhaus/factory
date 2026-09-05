@@ -181,6 +181,46 @@ export type EventKind =
   // route explain <session>`. Non-conversational, so `replayMessageHistory`
   // ignores it and `--resume` is unaffected.
   | "model_route"
+  // 0.6.0 (design §8.1) — the four routing decisions that were trace-bus-only
+  // in 0.5.x, made durable so `crewhaus route explain`, `sessions tail`,
+  // Hangar's session gutter and `--resume` can read them from the session
+  // JSONL rather than the in-process bus. All are non-conversational:
+  // `replayMessageHistory` ignores them, so `--resume` is unaffected, and
+  // readers written before these kinds existed keep parsing (every
+  // session-log reader branches on the kinds it knows and skips the rest).
+  //
+  // One line per two-tier router decision when `agent.model_tiers` is
+  // active (payload `{ turnNumber, tier, model, reason, escalated? }`),
+  // written by runtime-core beside its `model_tier_route` bus publish — the
+  // tier twin of `model_route`, so `route explain` no longer covers pools
+  // only.
+  | "model_tier_route"
+  // One line per serving-candidate change (payload `{ from, to, reason }`,
+  // SPEC model strings — the routing identity, matching the spec's
+  // `model` / `model_fallbacks`), mirrored from the `model_failover` trace
+  // event by runtime-core's routing subscriber. Covers both publishers: the
+  // failover chain (`breaker_open` / `probe_restore` / `candidate_error`)
+  // and the budget degrade (`budget_degrade`).
+  | "model_failover"
+  // One line per hybrid-strategy stage transition (payload mirrors the
+  // `model_stage` trace event minus its envelope, plus `turnNumber`: `{
+  // turnNumber, stage, strategy, role, model, profile?, outcome, cause?,
+  // costUsdMicros? }`), so the shape of a turn — draft → judge → escalation —
+  // survives the run.
+  | "model_stage"
+  // One line per `/model …` directive parsed at a typed input seam (payload
+  // mirrors the `model_directive` trace event minus its envelope, plus
+  // `turnNumber`: `{ turnNumber, source, requested, resolved?, accepted,
+  // reason? }`). `--resume` reconstructs the session pin from this typed
+  // record rather than by re-scanning prose, which is the whole point of
+  // persisting it.
+  | "model_directive"
+  // One line per `kind: judge` gate verdict (payload mirrors the
+  // `judge_verdict` trace event minus its envelope, plus `turnNumber`: `{
+  // turnNumber, stepOrNode, verdict, score, rationale?, judgeModel?, panel?,
+  // costUsdMicros? }`), mirrored by runtime-core's routing subscriber when
+  // the verdict is published on a live run bus.
+  | "judge_verdict"
   // 0.3.0 memory release (design §9) — one line per wiki mutation (payload
   // `WikiWriteEventPayload`), emitted by @crewhaus/tool-wiki through its
   // injected append seam (the emitter / memory-service composition root
