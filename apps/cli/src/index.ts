@@ -1060,6 +1060,8 @@ import {
   META_HARNESS_EXPERIMENTAL_NOTICE,
   createMetaHarnessMutatorForSpec,
 } from "./meta-harness-mutator";
+// 0.6.0 §10.1 — the spec-level model-plan checks lint and doctor share.
+import { auditModelPlan } from "./model-plan-lint";
 // Item 24 — market scan + doctor --models + pricing sync core, in a
 // side-effect-free module (this entry file runs an argv switch on import).
 import {
@@ -1301,8 +1303,10 @@ import { auditSpecToolNames, auditToolScopes, collectToolNames } from "./scope-a
 // side-effect-free module so it is unit-testable (this entry file runs an
 // argv switch on import).
 import {
+  BOUNDARY_SITES,
   type PhilosophyFinding,
   ScopeAuditBaselineError,
+  auditBoundarySite,
   buildScopeAuditSnapshot,
   detectBoundaryDrift,
   diffScopeAuditSnapshots,
@@ -6387,6 +6391,43 @@ async function runDoctorFix(opts: {
  * (class, file, symbol) identity so the drift watch can persist/diff them,
  * and added the boundary-drift detector on top of the six-site check.
  */
+/**
+ * 0.6.0 §10.1 — run `auditModelPlan` over `<cwd>/crewhaus.yaml` when present.
+ * A spec that does not parse or lower is not this audit's concern (doctor's
+ * spec checks and `crewhaus lint` report that), so it yields no finding.
+ */
+function collectModelPlanFindings(cwd: string): PhilosophyFinding[] {
+  const specPath = join(cwd, "crewhaus.yaml");
+  if (!existsSync(specPath)) return [];
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(readFileSync(specPath, "utf8")));
+  } catch {
+    return [];
+  }
+  const findings = auditModelPlan(ir);
+  if (findings.length === 0) {
+    return [
+      {
+        class: "model-plan",
+        file: "crewhaus.yaml",
+        symbol: "model-plan-checks",
+        label: "Pillar 2/3 — crewhaus.yaml: judge independence, profile tools, roster references",
+        pass: true,
+      },
+    ];
+  }
+  return findings.map((f) => ({
+    class: "model-plan",
+    file: "crewhaus.yaml",
+    symbol: `${f.rule}:${f.path}`,
+    label: `Pillar 2/3 — crewhaus.yaml ${f.rule} at ${f.path}`,
+    pass: f.severity !== "error",
+    ...(f.severity === "warning" ? { warn: true } : {}),
+    reason: f.message,
+  }));
+}
+
 async function collectPhilosophyFindings(): Promise<PhilosophyFinding[]> {
   const findings: PhilosophyFinding[] = [];
 
@@ -6466,69 +6507,19 @@ async function collectPhilosophyFindings(): Promise<PhilosophyFinding[]> {
     ...(existsSync(boundaryPkg) ? {} : { reason: "Workstream C did not land" }),
   });
 
-  const boundarySites: ReadonlyArray<{ name: string; path: string; requireTag?: true }> = [
-    { name: "tool-mcp", path: "packages/tool-mcp/src/index.ts" },
-    { name: "sub-agent-spawner", path: "packages/sub-agent-spawner/src/index.ts" },
-    { name: "skills-registry", path: "packages/skills-registry/src/index.ts" },
-    { name: "compaction-autocompact", path: "packages/compaction-autocompact/src/index.ts" },
-    { name: "federation-router", path: "packages/federation-router/src/index.ts" },
-    { name: "channel-adapter-base", path: "packages/channel-adapter-base/src/index.ts" },
-    // 0.3.0 memory release: recalled wiki bodies re-enter the model context
-    // across a session boundary — classified at the "memory" origin.
-    { name: "tool-wiki", path: "packages/tool-wiki/src/index.ts" },
-    // 0.6.0 model-plan release (§7.5, §10.1): a Consult reply — a roster
-    // sibling's model output — re-enters the parent's context; classified
-    // at the "consult" origin AND lineage-tagged inside the tool (the runtime
-    // skips its own pass for this tool, so the tag must live here too).
-    {
-      name: "tool-consult",
-      path: "packages/tool-consult/src/index.ts",
-      requireTag: true,
-    },
-  ];
-  for (const site of boundarySites) {
+  for (const site of BOUNDARY_SITES) {
     const filePath = join(process.cwd(), site.path);
-    if (!existsSync(filePath)) {
-      findings.push({
-        class: "boundary-site",
-        file: site.path,
-        symbol: site.name,
-        label: `Pillar 3 — ${site.name} source present`,
-        pass: false,
-        reason: `${site.path} not found`,
-      });
-      continue;
-    }
-    const body = readFileSync(filePath, "utf8");
-    const classifies = body.includes("classifyBoundary") || body.includes("boundary-classifier");
-    findings.push({
-      class: "boundary-site",
-      file: site.path,
-      symbol: site.name,
-      label: `Pillar 3 — ${site.name} calls classifyBoundary`,
-      pass: classifies,
-      ...(classifies
-        ? {}
-        : { reason: `no reference to classifyBoundary in ${site.path} — security regression` }),
-    });
-    if (site.requireTag === true) {
-      // §10.1 — a reply path that classifies but never tags leaves the
-      // egress fabric blind to the content it admitted.
-      const tags = body.includes("tagContent");
-      findings.push({
-        class: "boundary-site",
-        file: site.path,
-        symbol: `${site.name}-lineage`,
-        label: `Pillar 3 — ${site.name} calls tagContent after a non-blocked verdict`,
-        pass: tags,
-        ...(tags
-          ? {}
-          : {
-              reason: `no reference to tagContent in ${site.path} — the reply reaches the model without lineage`,
-            }),
-      });
-    }
+    findings.push(
+      ...auditBoundarySite(site, existsSync(filePath) ? readFileSync(filePath, "utf8") : undefined),
+    );
   }
+
+  // 0.6.0 §10.1 — the spec-level model-plan checks (shared with `crewhaus
+  // lint`, see model-plan-lint.ts) over the cwd spec when one is present:
+  // judge independence on pooled / strategy blocks, profile tools ⊆ the
+  // shape's toolset, roster references. Warnings are warn-tier; a roster
+  // reference that names no roster member is a hard finding.
+  findings.push(...collectModelPlanFindings(process.cwd()));
 
   // Item 49 — boundary-site DRIFT. The six-site list above only re-checks
   // KNOWN sites; this scans every package for cross-trust ingress signals

@@ -3940,6 +3940,11 @@ function lowerObservability(spec: SpecWithObservability): { observability?: IrOb
       ...(slo.ttft_ms !== undefined ? { ttftMs: slo.ttft_ms } : {}),
       ...(slo.cost_per_hour_usd !== undefined ? { costPerHourUsd: slo.cost_per_hour_usd } : {}),
       ...(slo.egress_block_rate !== undefined ? { egressBlockRate: slo.egress_block_rate } : {}),
+      // 0.6.0 (design §8.4) — the hybrid-routing rate targets, spread-in so
+      // an absent key stays absent (byte-identical pre-0.6.0 bundles).
+      ...(slo.escalation_rate !== undefined ? { escalationRate: slo.escalation_rate } : {}),
+      ...(slo.judge_fail_rate !== undefined ? { judgeFailRate: slo.judge_fail_rate } : {}),
+      ...(slo.floor_block_rate !== undefined ? { floorBlockRate: slo.floor_block_rate } : {}),
       ...(slo.window_seconds !== undefined ? { windowMs: slo.window_seconds * 1000 } : {}),
       mitigation: slo.mitigation !== undefined ? [...slo.mitigation] : ["alert"],
     };

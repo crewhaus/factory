@@ -53,6 +53,7 @@ import {
   type SpecEdit,
   applySpecEdits,
   diffSpecYaml,
+  isOptimizable,
 } from "@crewhaus/spec-patch";
 import type {
   WatchmeAggregate,
@@ -543,11 +544,12 @@ export function diffPathSegments(path: string): Array<string | number> {
   return out;
 }
 
-/** True when a path is inside this target's `OPTIMIZABLE_PATHS` whitelist. */
+/** True when a path is inside this target's `OPTIMIZABLE_PATHS` whitelist —
+ *  through spec-patch's own matcher (wildcard + structural rule), the one
+ *  `applySpecEdits({ restrictToOptimizable })` enforces on write. */
 export function isAutoTunable(target: string, segments: ReadonlyArray<string | number>): boolean {
-  const paths = (OPTIMIZABLE_PATHS as Record<string, ReadonlyArray<ReadonlyArray<string>>>)[target];
-  if (paths === undefined) return false;
-  return paths.some((allowed) => allowed.every((seg, i) => String(segments[i] ?? "") === seg));
+  if (!(target in OPTIMIZABLE_PATHS)) return false;
+  return isOptimizable(target as keyof typeof OPTIMIZABLE_PATHS, segments);
 }
 
 /**

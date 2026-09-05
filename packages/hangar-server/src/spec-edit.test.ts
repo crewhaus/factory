@@ -158,6 +158,58 @@ describe("trust tiers", () => {
     expect(row.reason).toContain("auto-tunable");
   });
 
+  // 0.6.0 (design §8.3) — the hybrid-model surfaces demand the interstitial
+  // on EVERY host the block hangs off, and a wildcard covers the dynamic key.
+  test("models, model_pool.{rules,strategy,reward} and sub_agents.*.allowed_profiles are SECURITY surfaces on every host", () => {
+    for (const [target, path] of [
+      ["cli", ["models"]],
+      ["cli", ["models", "fast", "model"]],
+      ["cli", ["models", "fast", "max_tokens"]], // an optimizer dial — still gated for a console click
+      ["cli", ["agent", "model_pool", "rules", "0", "use"]],
+      ["cli", ["agent", "model_pool", "strategy", "cascade", "escalate_to"]],
+      ["cli", ["agent", "model_pool", "reward", "floor", "arm"]],
+      ["workflow", ["steps", "0", "model_pool", "rules", "0", "enabled"]],
+      ["graph", ["nodes", "draft", "model_pool", "strategy", "shadow", "sample_rate"]],
+      ["crew", ["roles", "lead", "model_pool", "reward"]],
+      ["cli", ["agent", "sub_agents", "helper", "allowed_profiles"]],
+      ["crew", ["roles", "lead", "sub_agents", "helper", "allowed_profiles", "0"]],
+    ] as const) {
+      const row = classifyPath(target, [...path]);
+      expect(`${target}:${path.join(".")}:${row.tier}:${row.securitySurface}`).toBe(
+        `${target}:${path.join(".")}:human-owned:true`,
+      );
+    }
+    // The dial rows say the optimizer may tune them, but the console still confirms.
+    expect(classifyPath("cli", ["models", "fast", "max_tokens"]).reason).toContain(
+      "typed confirmation",
+    );
+    // A sibling key outside the listed surfaces is NOT swept in by the wildcard.
+    expect(
+      classifyPath("cli", ["agent", "sub_agents", "helper", "description"]).securitySurface,
+    ).toBe(false);
+  });
+
+  // 0.6.0 (design §10.3) — the badge runs spec-patch's OWN matcher, so it
+  // honours the wildcard segment and the structural rule the write gate does.
+  test("isAutoTunable agrees with the optimizer's matcher: wildcard dials yes, structural prefix reach no", () => {
+    expect(isAutoTunable("cli", ["models", "fast", "max_tokens"])).toBe(true);
+    expect(isAutoTunable("workflow", ["steps", "0", "model_pool", "rules", "1", "enabled"])).toBe(
+      true,
+    );
+    expect(isAutoTunable("workflow", ["steps", "0", "temperature"])).toBe(true);
+    expect(isAutoTunable("graph", ["nodes", "a", "judge", "repeats"])).toBe(true);
+    // The hand-rolled prefix copy used to say YES to these and the write then
+    // refused them; the structural rule says no to both, consistently.
+    expect(isAutoTunable("workflow", ["steps", "0", "model_pool", "candidates"])).toBe(false);
+    expect(isAutoTunable("crew", ["roles", "lead", "sub_agents", "helper", "tools"])).toBe(false);
+    expect(isAutoTunable("cli", ["models", "fast", "tools"])).toBe(false);
+    expect(classifyPath("workflow", ["steps", "0", "model_pool", "candidates"]).tier).toBe(
+      "human-owned",
+    );
+    // Unknown target → never auto-tunable.
+    expect(isAutoTunable("not-a-target", ["agent", "instructions"])).toBe(false);
+  });
+
   test("an unknown target has no auto-tunable paths (never a permissive default)", () => {
     expect(isAutoTunable("some-future-target", ["agent", "instructions"])).toBe(false);
   });

@@ -9,8 +9,10 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  BOUNDARY_SITES,
   type PhilosophyFinding,
   ScopeAuditBaselineError,
+  auditBoundarySite,
   buildScopeAuditSnapshot,
   detectBoundaryDrift,
   diffScopeAuditSnapshots,
@@ -299,5 +301,97 @@ describe("detectBoundaryDrift", () => {
     expect(keys.find((k) => k.startsWith("packages/tool-mcp/"))).toBeUndefined();
     expect(keys.find((k) => k.startsWith("packages/federation-router/"))).toBeUndefined();
     expect(keys.find((k) => k.startsWith("packages/channel-adapter-base/"))).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §10.1 — the reply-path drift guard (Consult / guide / verifier)
+// ---------------------------------------------------------------------------
+
+describe("auditBoundarySite — anchored reply paths", () => {
+  const anchored = {
+    name: "guide",
+    path: "packages/x/src/index.ts",
+    requireTag: true as const,
+    anchor: "<guide>",
+    window: 200,
+  };
+
+  test("a whole-file site passes on either fabric reference and fails without one", () => {
+    const site = { name: "tool-x", path: "packages/tool-x/src/index.ts" };
+    expect(auditBoundarySite(site, "await classifyBoundary(x, { origin: 'mcp' })")[0]?.pass).toBe(
+      true,
+    );
+    expect(auditBoundarySite(site, 'import "@crewhaus/boundary-classifier"')[0]?.pass).toBe(true);
+    const bad = auditBoundarySite(site, "return raw;");
+    expect(bad[0]?.pass).toBe(false);
+    expect(bad[0]?.reason).toContain("security regression");
+    expect(auditBoundarySite(site, undefined)[0]?.reason).toContain("not found");
+  });
+
+  test("an anchored site reads only the window BEFORE the injection literal", () => {
+    // Classification far away in the same file does not count ...
+    const far = `classifyBoundary(); tagContent();${"x".repeat(500)}const b = "<guide>";`;
+    const findings = auditBoundarySite(anchored, far);
+    expect(findings.map((f) => `${f.symbol}:${f.pass}`)).toEqual([
+      "guide:false",
+      "guide-lineage:false",
+    ]);
+    expect(findings[0]?.reason).toContain('before "<guide>"');
+    // ... classification right before it does, and the tag is checked separately.
+    const near = `${"x".repeat(500)}const v = await classifyBoundary(t, { origin: "consult" }); const b = "<guide>";`;
+    const nearFindings = auditBoundarySite(anchored, near);
+    expect(nearFindings.map((f) => `${f.symbol}:${f.pass}`)).toEqual([
+      "guide:true",
+      "guide-lineage:false",
+    ]);
+    expect(nearFindings[1]?.reason).toContain("without lineage");
+    const both = `${"x".repeat(500)}classifyBoundary(); tagContent(ctx, t, "consult"); const b = "<guide>";`;
+    expect(auditBoundarySite(anchored, both).every((f) => f.pass)).toBe(true);
+  });
+
+  test("a missing anchor is a hard finding unless the site is pending, which is warn-tier", () => {
+    const hard = auditBoundarySite(anchored, "nothing here");
+    expect(hard).toHaveLength(1);
+    expect(hard[0]?.pass).toBe(false);
+    expect(hard[0]?.reason).toContain("re-anchor");
+    const pending = { ...anchored, pending: "owned by PR 9c" };
+    const soft = auditBoundarySite(pending, "nothing here");
+    expect(soft[0]?.pass).toBe(true);
+    expect(soft[0]?.warn).toBe(true);
+    expect(soft[0]?.reason).toContain("owned by PR 9c");
+    // Pending + anchor present but unclassified: warn-tier on both checks ...
+    const unclassified = auditBoundarySite(pending, `${"x".repeat(50)}<guide>`);
+    expect(unclassified.map((f) => `${f.pass}:${f.warn}`)).toEqual(["true:true", "true:true"]);
+    // ... and a pending site that IS classified passes cleanly (no warn), so the
+    // moment the owning PR lands the check is a real guard.
+    const classified = auditBoundarySite(pending, "classifyBoundary(); tagContent(); <guide>");
+    expect(classified.map((f) => `${f.pass}:${f.warn ?? false}`)).toEqual([
+      "true:false",
+      "true:false",
+    ]);
+  });
+
+  test("the shipped sites hold against this tree: Consult and the guide reply path are classified and tagged", () => {
+    const root = join(import.meta.dir, "..", "..", "..");
+    for (const name of ["tool-consult", "runtime-core-guide-reply"]) {
+      const site = BOUNDARY_SITES.find((s) => s.name === name);
+      if (site === undefined) throw new Error(`site ${name} missing`);
+      // runtime-core's source carries a NUL byte; a JS string is unaffected.
+      const findings = auditBoundarySite(site, readFileSync(join(root, site.path), "utf8"));
+      expect(findings.map((f) => `${f.symbol}:${f.pass}:${f.warn ?? false}`)).toEqual([
+        `${name}:true:false`,
+        `${name}-lineage:true:false`,
+      ]);
+    }
+    // The verifier seam is declared pending and present in the tree.
+    const verifier = BOUNDARY_SITES.find((s) => s.name === "runtime-core-verifier-reply");
+    if (verifier === undefined) throw new Error("verifier site missing");
+    expect(verifier.pending).toBeDefined();
+    const src = readFileSync(join(root, verifier.path), "utf8");
+    expect(src.includes(verifier.anchor ?? " ")).toBe(true);
+    for (const f of auditBoundarySite(verifier, src)) {
+      expect(f.pass).toBe(true); // never fails plain doctor while pending
+    }
   });
 });

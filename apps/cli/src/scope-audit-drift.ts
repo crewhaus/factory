@@ -50,7 +50,9 @@ export type PhilosophyFindingClass =
   | "boundary-site"
   | "tool-scope"
   | "contributor-doc"
-  | "boundary-drift";
+  | "boundary-drift"
+  /** 0.6.0 §10.1 — the spec-level model-plan checks run over the cwd spec. */
+  | "model-plan";
 
 export type PhilosophyFinding = {
   readonly class: PhilosophyFindingClass;
@@ -238,6 +240,144 @@ const CLASSIFICATION_MARKERS = [
   "classifyInbound",
   "chain-adapter-base",
 ] as const;
+
+/**
+ * One canonical boundary site the six-site check (Pillar 3) audits: a source
+ * file that ingests cross-trust content and must reference `classifyBoundary`
+ * (and, for the reply paths, `tagContent`). 0.6.0 §10.1 added the anchored
+ * form: `anchor` is the literal marking where a Consult / guide / verifier
+ * reply is injected into the parent's context, and BOTH calls must appear
+ * within `window` characters BEFORE it — a whole-file substring test on
+ * runtime-core would pass trivially (it classifies tool results), so the
+ * reply-path drift guard reads only the injection site's neighbourhood.
+ * `pending` marks a seam another PR owns: an unclassified reply path is then
+ * a warn-tier finding (plain doctor keeps exiting 0), and it flips to a hard
+ * finding the moment the classification lands and later regresses.
+ */
+export type BoundarySite = {
+  readonly name: string;
+  readonly path: string;
+  readonly requireTag?: true;
+  readonly anchor?: string;
+  readonly window?: number;
+  readonly pending?: string;
+};
+
+export const BOUNDARY_SITES: ReadonlyArray<BoundarySite> = [
+  { name: "tool-mcp", path: "packages/tool-mcp/src/index.ts" },
+  { name: "sub-agent-spawner", path: "packages/sub-agent-spawner/src/index.ts" },
+  { name: "skills-registry", path: "packages/skills-registry/src/index.ts" },
+  { name: "compaction-autocompact", path: "packages/compaction-autocompact/src/index.ts" },
+  { name: "federation-router", path: "packages/federation-router/src/index.ts" },
+  { name: "channel-adapter-base", path: "packages/channel-adapter-base/src/index.ts" },
+  // 0.3.0 memory release: recalled wiki bodies re-enter the model context
+  // across a session boundary — classified at the "memory" origin.
+  { name: "tool-wiki", path: "packages/tool-wiki/src/index.ts" },
+  // 0.6.0 model-plan release (§7.5, §10.1): a Consult reply — a roster
+  // sibling's model output — re-enters the parent's context; classified
+  // at the "consult" origin AND lineage-tagged inside the tool (the runtime
+  // skips its own pass for this tool, so the tag must live here too).
+  { name: "tool-consult", path: "packages/tool-consult/src/index.ts", requireTag: true },
+  // 0.6.0 §7.4 / §10.1 — the GUIDE reply path: the guide model's text is
+  // appended to the parent's own system region as `<guide>`; it is
+  // classified at TrustOrigin "consult" and lineage-tagged right before.
+  {
+    name: "runtime-core-guide-reply",
+    path: "packages/runtime-core/src/index.ts",
+    requireTag: true,
+    // The template literal that builds the block — the bare `<guide>` token
+    // also appears in doc comments elsewhere in the file.
+    anchor: "text: `<guide>",
+    window: 2500,
+  },
+  // 0.6.0 §7.3 / §10.1 — the VERIFIER reply path: on a failing in-loop grade
+  // the judge's rationale (a model output) is interpolated into a synthetic
+  // user message ("Grader feedback: …"). The cascade PR (9c) owns this seam.
+  {
+    name: "runtime-core-verifier-reply",
+    path: "packages/runtime-core/src/index.ts",
+    requireTag: true,
+    anchor: "Grader feedback:",
+    window: 2500,
+    pending:
+      "the verifier (grader rationale) reply path is classified by the 0.6.0 cascade PR (9c); until it lands this is a drift watch, not a failure",
+  },
+];
+
+/**
+ * Audit one boundary site against its source text (`undefined` when the file
+ * is absent). Pure: the caller owns the filesystem.
+ */
+export function auditBoundarySite(
+  site: BoundarySite,
+  source: string | undefined,
+): PhilosophyFinding[] {
+  const findings: PhilosophyFinding[] = [];
+  if (source === undefined) {
+    findings.push({
+      class: "boundary-site",
+      file: site.path,
+      symbol: site.name,
+      label: `Pillar 3 — ${site.name} source present`,
+      pass: false,
+      reason: `${site.path} not found`,
+    });
+    return findings;
+  }
+  const softFail = site.pending !== undefined;
+  // Anchored sites read only the window before the injection literal.
+  let body = source;
+  if (site.anchor !== undefined) {
+    const at = source.indexOf(site.anchor);
+    if (at < 0) {
+      findings.push({
+        class: "boundary-site",
+        file: site.path,
+        symbol: site.name,
+        label: `Pillar 3 — ${site.name} reply path present`,
+        pass: softFail,
+        ...(softFail ? { warn: true } : {}),
+        reason: `anchor ${JSON.stringify(site.anchor)} not found in ${site.path}${softFail ? ` — ${site.pending}` : " — the reply path moved; re-anchor the doctor check"}`,
+      });
+      return findings;
+    }
+    body = source.slice(Math.max(0, at - (site.window ?? 2000)), at);
+  }
+  const where = site.anchor !== undefined ? `before ${JSON.stringify(site.anchor)} in` : "in";
+  const classifies = body.includes("classifyBoundary") || body.includes("boundary-classifier");
+  findings.push({
+    class: "boundary-site",
+    file: site.path,
+    symbol: site.name,
+    label: `Pillar 3 — ${site.name} calls classifyBoundary`,
+    pass: classifies || softFail,
+    ...(classifies ? {} : softFail ? { warn: true } : {}),
+    ...(classifies
+      ? {}
+      : {
+          reason: `no reference to classifyBoundary ${where} ${site.path} — ${softFail ? site.pending : "security regression"}`,
+        }),
+  });
+  if (site.requireTag === true) {
+    // §10.1 — a reply path that classifies but never tags leaves the egress
+    // fabric blind to the content it admitted.
+    const tags = body.includes("tagContent");
+    findings.push({
+      class: "boundary-site",
+      file: site.path,
+      symbol: `${site.name}-lineage`,
+      label: `Pillar 3 — ${site.name} calls tagContent after a non-blocked verdict`,
+      pass: tags || softFail,
+      ...(tags ? {} : softFail ? { warn: true } : {}),
+      ...(tags
+        ? {}
+        : {
+            reason: `no reference to tagContent ${where} ${site.path} — ${softFail ? site.pending : "the reply reaches the model without lineage"}`,
+          }),
+    });
+  }
+  return findings;
+}
 
 type DriftSignal = {
   /** Stable symbol for the finding id. */
