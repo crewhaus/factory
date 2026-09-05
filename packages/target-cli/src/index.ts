@@ -5,12 +5,11 @@ import {
   type EmitReadmeOptions,
   type IrKnowledge,
   type IrMcpServerConfig,
-  type IrSubAgentDefinition,
   type IrV0,
   renderBundleReadme,
 } from "@crewhaus/ir";
 import { memoryFragmentFromIr } from "@crewhaus/memory-service";
-import { renderModelWiringFields } from "@crewhaus/model-service";
+import { renderModelWiringFields, renderSubAgentDef } from "@crewhaus/model-service";
 import { renderBannerBoot } from "./banner";
 
 // Phase 3 §3.3 — the banner contract is shared with the interpreter path
@@ -554,25 +553,6 @@ const __evaluation: RunEvaluation = {
   },
 };`;
   return { imports: [typeImport], bootBlock, field };
-}
-
-/** Render one IrSubAgentDefinition as a TypeScript object literal. */
-function renderSubAgentDef(d: IrSubAgentDefinition): string {
-  const lines: string[] = [];
-  lines.push(`name: ${escapeJsonString(d.name)}`);
-  lines.push(`description: ${escapeJsonString(d.description)}`);
-  lines.push(`instructions: ${escapeJsonString(d.instructions)}`);
-  lines.push(`tools: ${JSON.stringify(d.tools)}`);
-  if (d.model !== undefined) lines.push(`model: ${escapeJsonString(d.model)}`);
-  if (typeof d.permissions === "string") {
-    lines.push(`permissions: ${escapeJsonString(d.permissions)}`);
-  } else {
-    lines.push(
-      `permissions: { allow: ${JSON.stringify(d.permissions.allow)}, deny: ${JSON.stringify(d.permissions.deny)} }`,
-    );
-  }
-  lines.push(`inherit_bypass: ${d.inheritBypass}`);
-  return `{ ${lines.join(", ")} }`;
 }
 
 /**

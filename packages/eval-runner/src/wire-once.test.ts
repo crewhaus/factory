@@ -37,6 +37,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "b
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { lower, parseSpec } from "@crewhaus/compiler";
 import type { HookDef } from "@crewhaus/hooks-engine";
 import type { IrSubAgentDefinition, IrV0 } from "@crewhaus/ir";
 import type { SkillRef } from "@crewhaus/skills-registry";
@@ -379,6 +380,52 @@ describe("wireRunOnce — sub-agents", () => {
     expect(deps.spawnSubAgent).toBe(realSpawner.spawnSubAgent);
     expect(calls.createTaskTool).toHaveLength(1);
     expect(deps.tools.some((t) => t.name === "task")).toBe(true);
+  });
+
+  test("a LOWERED spec's 0.6.0 sub-agent keys reach the eval map — eval measures the same child `crewhaus run` spawns (§7.7)", async () => {
+    const ir = lower(
+      parseSpec(
+        [
+          "name: routed",
+          "target: cli",
+          "models:",
+          "  fast: { model: claude-haiku-4-5, tags: [cheap], instructions: You are the fast lane. }",
+          "  strong: { model: claude-opus-4-8, tags: [strong], thinking: { budget_tokens: 4096 } }",
+          "agent:",
+          "  model: claude-sonnet-4-6",
+          "  instructions: be helpful",
+          "  sub_agents:",
+          "    helper:",
+          "      description: helps",
+          "      instructions: help",
+          "      tools: [read]",
+          "      model: $fast",
+          "      model_tiers: { fast: $fast, default: $strong }",
+          "      budget_share: 0.25",
+          "      inherit_routing: true",
+          "      allowed_profiles: [$fast, $strong]",
+          "tools: [read]",
+        ].join("\n"),
+      ),
+      { today: "2026-09-05" },
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    const deps = await wireRunOnce(ir, { cwd: newCwd() });
+    const helper = deps.subAgents?.get("helper");
+    expect(helper).toMatchObject({
+      name: "helper",
+      instructions: "help",
+      model: "claude-haiku-4-5",
+      modelProfile: "fast",
+      overlay: "You are the fast lane.",
+      inherit_bypass: false,
+      modelTiers: { fast: "claude-haiku-4-5", default: "claude-opus-4-8" },
+      budgetShare: 0.25,
+      inheritRouting: true,
+    });
+    // The allowlist is what a Task({profile}) is checked against: without it
+    // under eval, a `strong` pin that `crewhaus run` accepts would be refused.
+    expect(helper?.allowedProfiles?.map((o) => o.profile)).toEqual(["fast", "strong"]);
   });
 });
 

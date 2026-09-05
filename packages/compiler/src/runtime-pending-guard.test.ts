@@ -47,9 +47,10 @@ const cliCandidate = (fields: string): string =>
 
 /**
  * PR 9a — [row, spec, the blob probe, emitted?]: every candidate narrowing
- * knob compiles through and rides the pool blob verbatim. `emitted` is false
- * for the sub-agent rows: a sub-agent's pool is lowered but not rendered into
- * a bundle until the spawner consumes it (PR 11), so those probe the IR only.
+ * knob compiles through and rides the pool blob verbatim. Since PR 11 the
+ * sub-agent rows are emitted too (the `__subAgents` literal carries the child's
+ * `modelPool`), so every row probes the bundle; the optional fourth element is
+ * kept for a future IR-only row.
  */
 const HONOURED: ReadonlyArray<
   | readonly [string, string, (json: string) => boolean]
@@ -177,7 +178,6 @@ const HONOURED: ReadonlyArray<
       "tools: [read]",
     ].join("\n"),
     (j) => j.includes('"profile":"fast","tools":[]'),
-    false,
   ],
   [
     "sub_agents.<n>.model_pool candidate tools",
@@ -194,7 +194,6 @@ const HONOURED: ReadonlyArray<
       "tools: [read]",
     ),
     (j) => j.includes('"tools":["read"]'),
-    false,
   ],
 ];
 

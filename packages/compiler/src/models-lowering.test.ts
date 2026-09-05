@@ -461,12 +461,15 @@ describe("$profile / sentinels on every auxiliary slot (the six that bypassed re
       temperature: 0,
       params: { maxTokens: 512 },
     });
-    // The sub-agent slot is a serving slot: full expansion.
+    // The sub-agent slot is a serving slot: full expansion — except the
+    // overlay, which rides RAW: a Task call may pin an `allowed_profiles`
+    // entry whose overlay replaces it, so the spawner folds, not the compiler.
     expect(ir.subAgents[0]).toMatchObject({
       name: "helper",
       model: "claude-haiku-4-5",
       modelProfile: "fast",
-      instructions: "You are the fast lane.\n\nhelp",
+      instructions: "help",
+      overlay: "You are the fast lane.",
       maxTokens: 4096,
       thinking: { effort: "low" },
       modelFallbacks: ["claude-sonnet-4-6"],
@@ -1126,7 +1129,7 @@ describe("graph nodes and sub-agents gain routing (§7.7)", () => {
     expect(agentTs).toContain('circuitBreaker: {"failureThreshold":2},');
   });
 
-  test("a sub-agent's routing, params, budget_share, inherit_routing and allowed_profiles lower (pending PR 11)", () => {
+  test("a sub-agent's routing, params, budget_share, inherit_routing and RESOLVED allowed_profiles lower; nothing pends (PR 11 landed)", () => {
     const { ir, warnings } = lowerWithWarnings(
       parseSpec(
         cli(
@@ -1155,17 +1158,98 @@ describe("graph nodes and sub-agents gain routing (§7.7)", () => {
       temperature: 0.2,
       budgetShare: 0.25,
       inheritRouting: true,
-      allowedProfiles: ["fast", "strong"],
     });
-    const pending = warnings.filter((w) => w.path.startsWith("agent.sub_agents.helper."));
-    expect(pending.map((w) => w.path).sort()).toEqual([
-      "agent.sub_agents.helper.allowed_profiles",
-      "agent.sub_agents.helper.budget_share",
-      "agent.sub_agents.helper.inherit_routing",
-      "agent.sub_agents.helper.model_tiers",
-      "agent.sub_agents.helper.temperature",
+    // §7.7 — each allowed profile is the serving slot `model: $<profile>` would
+    // lower to on this child: model, params, overlay (carried, not folded),
+    // and the profile's failover chain. Nothing downstream ever sees a `$`.
+    expect(ir.subAgents[0]?.allowedProfiles).toEqual([
+      {
+        profile: "fast",
+        model: "claude-haiku-4-5",
+        thinking: { effort: "low" },
+        maxTokens: 4096,
+        overlay: "You are the fast lane.",
+        modelFallbacks: ["claude-sonnet-4-6"],
+        circuitBreaker: { failureThreshold: 3 },
+      },
+      { profile: "strong", model: "claude-opus-4-8", thinking: { budgetTokens: 4096 } },
     ]);
-    for (const w of pending) expect(w.message).toContain("PR 11");
+    // The spawner consumes every one of these keys now: no pending warning.
+    const pending = warnings.filter(
+      (w) => w.code === "model-plan-pending-runtime" && w.path.startsWith("agent.sub_agents."),
+    );
+    expect(pending).toEqual([]);
+    // …and the emitted bundle carries them into the `__subAgents` literal.
+    const agentTs =
+      compile(
+        cli(
+          ...REGISTRY,
+          "agent:",
+          "  model: claude-sonnet-4-6",
+          "  instructions: i",
+          "  sub_agents:",
+          "    helper:",
+          "      description: helps",
+          "      instructions: help",
+          "      tools: [read]",
+          "      model_tiers: { fast: $fast, default: $strong }",
+          "      budget_share: 0.25",
+          "      inherit_routing: true",
+          "      allowed_profiles: [$strong]",
+          "tools: [read]",
+        ),
+        opts,
+      ).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain(
+      'modelTiers: {"fast":"claude-haiku-4-5","default":"claude-opus-4-8"}, budgetShare: 0.25, inheritRouting: true, allowedProfiles: [{"profile":"strong","model":"claude-opus-4-8","thinking":{"budgetTokens":4096}}] }',
+    );
+  });
+
+  test("a sub-agent on `model: $<profile>` keeps its instructions RAW and carries the profile overlay separately, into the IR and the bundle", () => {
+    const yaml = cli(
+      ...REGISTRY,
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: i",
+      "  sub_agents:",
+      "    helper:",
+      "      description: helps",
+      "      instructions: help",
+      "      tools: [read]",
+      "      model: $fast",
+      "      allowed_profiles: [$strong]",
+      "tools: [read]",
+    );
+    const ir = cliIr(yaml);
+    expect(ir.subAgents[0]?.instructions).toBe("help");
+    expect(ir.subAgents[0]?.overlay).toBe("You are the fast lane.");
+    // A profile with no `instructions` yields no `overlay` key at all.
+    const strongOnly = cliIr(yaml.replace("model: $fast", "model: $strong"));
+    expect(strongOnly.subAgents[0]?.instructions).toBe("help");
+    expect("overlay" in (strongOnly.subAgents[0] ?? {})).toBe(false);
+    // The emitted literal carries it right after the provenance key.
+    const agentTs = compile(yaml, opts).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain(
+      'instructions: "help", tools: ["read"], model: "claude-haiku-4-5", permissions: "inherit", inherit_bypass: false, modelProfile: "fast", overlay: "You are the fast lane.", thinking: {"effort":"low"}, maxTokens: 4096,',
+    );
+  });
+
+  test("a sub-agent carrying only today's fields emits a byte-identical __subAgents literal (no 0.6.0 key leaks)", () => {
+    const yaml = cli(
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: i",
+      "  sub_agents:",
+      "    helper:",
+      "      description: helps",
+      "      instructions: help",
+      "      tools: [read]",
+      "tools: [read]",
+    );
+    const agentTs = compile(yaml, opts).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain(
+      '["helper", { name: "helper", description: "helps", instructions: "help", tools: ["read"], permissions: "inherit", inherit_bypass: false }],',
+    );
   });
 });
 

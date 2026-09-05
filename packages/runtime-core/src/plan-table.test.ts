@@ -47,6 +47,7 @@ import type {
   ProviderRequest,
   StreamEvent,
 } from "@crewhaus/adapter-anthropic";
+import type { RuntimeBridge } from "@crewhaus/agent-context-isolation";
 import { emptyRuleSet, evaluate } from "@crewhaus/permission-engine";
 import { openScoreboard } from "@crewhaus/routing-store";
 import { createRunContext } from "@crewhaus/run-context";
@@ -213,6 +214,9 @@ type BridgeProbe = {
   readonly toolNames: ReadonlyArray<string>;
   readonly permissionRules: Parameters<typeof resolveChildPermissions>[0]["rules"];
   readonly permissionMode: Parameters<typeof resolveChildPermissions>[0]["mode"];
+  /** 0.6.0 PR 11 — the declared primary and the routing projection (§4.4 / §10.2). */
+  readonly model: string;
+  readonly routing: RuntimeBridge["routing"];
 };
 const bridgeProbes: BridgeProbe[] = [];
 const taskProbe = buildTool({
@@ -223,18 +227,14 @@ const taskProbe = buildTool({
   destructive: false,
   concurrencySafe: true,
   execute: async (_input, ctx) => {
-    const bridge = ctx?.bridge as
-      | {
-          tools: ReadonlyArray<RegisteredTool>;
-          permissionRules: BridgeProbe["permissionRules"];
-          permissionMode: BridgeProbe["permissionMode"];
-        }
-      | undefined;
+    const bridge = ctx?.bridge as RuntimeBridge | undefined;
     if (bridge !== undefined) {
       bridgeProbes.push({
         toolNames: bridge.tools.map((t) => t.name),
         permissionRules: bridge.permissionRules,
         permissionMode: bridge.permissionMode,
+        model: bridge.model,
+        routing: bridge.routing,
       });
     }
     return "child done";
@@ -674,6 +674,52 @@ describe("plan table — per-candidate permissions, tool_config, rate limits (§
         yamlAllowBashAndTask,
       ),
     ).toBe("allow");
+    // 0.6.0 PR 11 (§4.4) — `bridge.model` STAYS the declared primary while a
+    // pool candidate served; the SERVED arm is projected separately, so a child
+    // inherits it only behind `inheritRouting: true`.
+    expect(probe.model).toBe("claude-sonnet-4-6");
+    expect(probe.routing?.served).toEqual({
+      model: FAST,
+      wireModelId: FAST,
+      profile: "fast",
+      armId: "fast",
+      fromPool: true,
+    });
+    expect(probe.routing?.budgetUsdMicros).toBeUndefined();
+  });
+
+  test("0.6.0 PR 11 — without a pool the projection is the primary (fromPool: false) and carries the run cap when a budget is declared", async () => {
+    bridgeProbes.length = 0;
+    const runContext = createRunContext();
+    const primary = scriptedAdapter([{ tool: "Task", input: { prompt: "go" } }, { text: "ok" }]);
+    await runChatLoop({
+      model: "claude-sonnet-4-6",
+      instructions: "test harness",
+      _adapter: primary,
+      tools: [taskProbe],
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "hello" }],
+      permissionMode: "bypass",
+      installSigintHandler: false,
+      spinner: false,
+      stdout: () => {},
+      settingsDir: null,
+      budget: { usdMicros: 2_000_000, onExceed: { kind: "stop" } },
+    });
+    expect(bridgeProbes).toHaveLength(1);
+    const probe = bridgeProbes[0];
+    if (probe === undefined) throw new Error("unreachable");
+    expect(probe.model).toBe("claude-sonnet-4-6");
+    expect(probe.routing).toEqual({
+      served: {
+        model: "claude-sonnet-4-6",
+        wireModelId: "claude-sonnet-4-6",
+        armId: "claude-sonnet-4-6",
+        fromPool: false,
+      },
+      budgetUsdMicros: 2_000_000,
+    });
   });
 });
 

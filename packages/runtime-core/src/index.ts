@@ -15,6 +15,7 @@ import {
 } from "@crewhaus/adapter-anthropic";
 import type {
   CrewMailbox,
+  ParentServedArm,
   RuntimeBridge,
   SpawnSubAgentFn,
   SubAgentDefinition,
@@ -3321,8 +3322,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         continue;
       }
       if (ev.kind === "cost_accrual") {
-        if (nestDepth > 0 || !budgetSessionScoped) continue;
-        const p = ev.payload as { costUsdMicros?: unknown };
+        if (!budgetSessionScoped) continue;
+        const p = ev.payload as { costUsdMicros?: unknown; summary?: unknown; role?: unknown };
+        // 0.6.0 §10.2 — a child's role-bearing roll-up sits INSIDE its
+        // sub_agent bracket but was published on THIS bus and counted by this
+        // run's meter, so it seeds the resumed meter too; a peer's per-call
+        // lines inside a bracket stay skipped as before.
+        const childRollup = p.summary === true && typeof p.role === "string";
+        if (nestDepth > 0 && !childRollup) continue;
         if (typeof p.costUsdMicros === "number" && Number.isFinite(p.costUsdMicros)) {
           resumedCostUsdMicros += Math.max(0, p.costUsdMicros);
         }
@@ -3807,22 +3814,26 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // the session JSONL so `crewhaus cost-summary --session <id>` can sum spend
   // after the run. Gated on the same switch that attaches the cost-tracker
   // (CREWHAUS_COST_TRACKING): no tracker → no accruals to persist, and the
-  // message-only transcript stays unchanged by default. Per-call accruals only
-  // — skip the FR-003 terminal `summary` aggregate so a run total never
-  // double-counts. `append()` writes synchronously, and a persist failure must
-  // never abort a turn, so the result is logged rather than thrown.
+  // message-only transcript stays unchanged by default. Per-call accruals plus
+  // (0.6.0 §10.2) the ROLE-bearing `summary` roll-ups a nested run re-publishes
+  // on this bus (a sub-agent's `role: "subagent"` total — spend this log has no
+  // per-call lines for); the FR-003 terminal role-less `summary` aggregate is
+  // still skipped so a run total never double-counts. `append()` writes
+  // synchronously, and a persist failure must never abort a turn, so the
+  // result is logged rather than thrown.
   let costPersistUnsubscribe: Unsubscribe | undefined;
   if (subscribers.costTracker !== undefined || budgetSessionPersist) {
     costPersistUnsubscribe = bus.subscribe((event): void => {
       if (event.kind !== "cost_accrual") return;
       const ev = event as CostAccrualEvent;
-      if (ev.summary === true) return;
+      if (ev.summary === true && ev.role === undefined) return;
       void eventLog
         .append({
           kind: "cost_accrual",
           payload: {
             provider: ev.provider,
             modelId: ev.modelId,
+            ...(ev.summary === true ? { summary: true } : {}),
             ...(ev.specModel !== undefined ? { specModel: ev.specModel } : {}),
             inputTokens: ev.inputTokens,
             outputTokens: ev.outputTokens,
@@ -4595,6 +4606,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const planFor = (candidate: PoolCandidate): CandidatePlan =>
     planByCandidate.get(candidate) ?? buildPlan(candidate, poolCandidateConfigs.get(candidate));
   let servingPlan: CandidatePlan = primaryPlan;
+  // 0.6.0 §4.4 / §7.7 — the arm that SERVED the last model call, as projected
+  // onto the bridge for children (`ParentRunHandle.routing.served`). Set beside
+  // `servingPlan` on every model call; until the first call it is the primary.
+  // A child inherits it only behind `inheritRouting: true` — `bridge.model`
+  // stays the declared primary.
+  let servedArm: ParentServedArm = {
+    model: primaryPlan.modelString,
+    wireModelId: primaryPlan.wireModelId,
+    armId: primaryPlan.armId,
+    fromPool: false,
+  };
   for (const plan of planByCandidate.values()) {
     if (plan.excludedTools.length === 0 && plan.permissionRules === permissionRules) continue;
     runContext.logger.info("model_pool candidate plan", {
@@ -5600,6 +5622,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       model: opts.model,
       maxTokens,
       ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
+      // 0.6.0 §4.4 / §10.2 — the routing projection for children: the arm
+      // that served this call (a child runs on it only behind
+      // `inheritRouting: true`) and the run cap (`budgetShare` takes a share
+      // of it). `model` above stays `opts.model`, the declared primary.
+      routing: {
+        served: servedArm,
+        ...(opts.budget !== undefined ? { budgetUsdMicros: opts.budget.usdMicros } : {}),
+      },
       hooks,
       // v0.3.0 §2.5 — the per-run state-store, so plan-mutating tools can
       // set PLAN_DIRTY_STATE_KEY and the loop re-renders the plan tail
@@ -6866,6 +6896,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // read for every tool call this model call produces.
             const plan: CandidatePlan = poolTurn?.plan ?? primaryPlan;
             servingPlan = plan;
+            // The served arm for children: the pool candidate's identity when
+            // one serves, else whatever this call is going to (a tier, the
+            // degrade rung, or the primary — `reqSpecModel` is that model).
+            servedArm = {
+              model: reqSpecModel,
+              wireModelId: reqWireModelId,
+              ...(plan.profile !== undefined ? { profile: plan.profile } : {}),
+              armId: plan.fromPool ? plan.armId : reqSpecModel,
+              fromPool: plan.fromPool,
+            };
             listToolsSummaries = plan.listToolsSummaries;
             const t0Model = performance.now();
             modelCallStartMs = t0Model;

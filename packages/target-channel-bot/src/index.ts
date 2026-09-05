@@ -16,13 +16,12 @@ import {
   type IrKnowledge,
   type IrSchedule,
   type IrSecretRef,
-  type IrSubAgentDefinition,
   renderBundleReadme,
 } from "@crewhaus/ir";
 import type { IrMcpServerConfig } from "@crewhaus/ir";
 import { memoryFragmentFromIr, renderStudyRotationPreamble } from "@crewhaus/memory-service";
 import { type ParsedModelString, parseModelString } from "@crewhaus/model-router";
-import { renderModelWiringFields } from "@crewhaus/model-service";
+import { renderModelWiringFields, renderSubAgentDef } from "@crewhaus/model-service";
 
 /**
  * Emit a self-contained channel-bot bundle for a channel-target IR.
@@ -566,25 +565,6 @@ function renderPermissionsField(ir: IrChannelV0): string {
     );
   }
   return `\n${lines.join("\n")}`;
-}
-
-/** Render one IrSubAgentDefinition as a TS object literal — mirrors target-cli. */
-function renderSubAgentDef(d: IrSubAgentDefinition): string {
-  const lines: string[] = [];
-  lines.push(`name: ${escapeJsonString(d.name)}`);
-  lines.push(`description: ${escapeJsonString(d.description)}`);
-  lines.push(`instructions: ${escapeJsonString(d.instructions)}`);
-  lines.push(`tools: ${JSON.stringify(d.tools)}`);
-  if (d.model !== undefined) lines.push(`model: ${escapeJsonString(d.model)}`);
-  if (typeof d.permissions === "string") {
-    lines.push(`permissions: ${escapeJsonString(d.permissions)}`);
-  } else {
-    lines.push(
-      `permissions: { allow: ${JSON.stringify(d.permissions.allow)}, deny: ${JSON.stringify(d.permissions.deny)} }`,
-    );
-  }
-  lines.push(`inherit_bypass: ${d.inheritBypass}`);
-  return `{ ${lines.join(", ")} }`;
 }
 
 function renderSubAgents(ir: IrChannelV0): {

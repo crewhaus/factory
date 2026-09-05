@@ -17,7 +17,7 @@
  *       devDependency here, never imported from `src/`).
  */
 import { describe, expect, test } from "bun:test";
-import type { IrModelPool } from "@crewhaus/ir";
+import type { IrModelPool, IrSubAgentDefinition } from "@crewhaus/ir";
 import type { RunChatLoopOptions } from "@crewhaus/runtime-core";
 import {
   MODEL_WIRING_KEYS,
@@ -25,6 +25,7 @@ import {
   type ModelWiringRunOptions,
   modelWiringFragmentFromIr,
   renderModelWiringFields,
+  renderSubAgentDef,
   wireModels,
 } from "./index";
 
@@ -288,5 +289,59 @@ describe("runtime-core assignability pin", () => {
     expect(picked.modelTiers).toBe(TIERS);
     expect(roundTrip).toBe(POOL);
     expect(Object.keys(wired)).toEqual([...MODEL_WIRING_KEYS]);
+  });
+});
+
+// 0.6.0 PR 11 (§7.7) — the ONE sub-agent literal renderer the three Task-tool
+// emitters (cli, channel-bot, crew) share.
+describe("renderSubAgentDef — one renderer for the three __subAgents literals", () => {
+  const legacy: IrSubAgentDefinition = {
+    name: "digger",
+    description: "Deep-dive researcher",
+    instructions: "Dig deep.",
+    tools: ["read", "grep"],
+    permissions: "inherit",
+    inheritBypass: false,
+  };
+
+  test("today's fields render EXACTLY the retired per-emitter string (the byte oracle)", () => {
+    expect(renderSubAgentDef(legacy)).toBe(
+      '{ name: "digger", description: "Deep-dive researcher", instructions: "Dig deep.", tools: ["read","grep"], permissions: "inherit", inherit_bypass: false }',
+    );
+    expect(
+      renderSubAgentDef({
+        ...legacy,
+        model: "claude-haiku-4-5",
+        permissions: { allow: ["Read"], deny: ["Bash(*)"] },
+        inheritBypass: true,
+      }),
+    ).toBe(
+      '{ name: "digger", description: "Deep-dive researcher", instructions: "Dig deep.", tools: ["read","grep"], model: "claude-haiku-4-5", permissions: { allow: ["Read"], deny: ["Bash(*)"] }, inherit_bypass: true }',
+    );
+  });
+
+  test("every 0.6.0 key is appended AFTER the legacy fields, only when present, under the runtime names", () => {
+    const pool = { candidates: [{ model: "a", tags: ["cheap"] }], policy: "static" as const };
+    const rendered = renderSubAgentDef({
+      ...legacy,
+      model: "claude-sonnet-4-6",
+      modelProfile: "mid",
+      overlay: 'Take the "mid" lane.',
+      thinking: { effort: "low" },
+      maxTokens: 512,
+      temperature: 0.2,
+      modelFallbacks: ["claude-haiku-4-5"],
+      circuitBreaker: { failureThreshold: 2 },
+      modelTiers: { fast: "a", default: "b" },
+      modelPool: pool,
+      budgetShare: 0.25,
+      inheritRouting: true,
+      allowedProfiles: [{ profile: "fast", model: "a", overlay: "Be quick." }],
+    });
+    expect(rendered).toBe(
+      '{ name: "digger", description: "Deep-dive researcher", instructions: "Dig deep.", tools: ["read","grep"], model: "claude-sonnet-4-6", permissions: "inherit", inherit_bypass: false, modelProfile: "mid", overlay: "Take the \\"mid\\" lane.", thinking: {"effort":"low"}, maxTokens: 512, temperature: 0.2, modelFallbacks: ["claude-haiku-4-5"], circuitBreaker: {"failureThreshold":2}, modelTiers: {"fast":"a","default":"b"}, modelPool: {"candidates":[{"model":"a","tags":["cheap"]}],"policy":"static"}, budgetShare: 0.25, inheritRouting: true, allowedProfiles: [{"profile":"fast","model":"a","overlay":"Be quick."}] }',
+    );
+    // An EMPTY modelFallbacks is treated as absent (the emitters' length guard).
+    expect(renderSubAgentDef({ ...legacy, modelFallbacks: [] })).toBe(renderSubAgentDef(legacy));
   });
 });

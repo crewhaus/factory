@@ -274,6 +274,28 @@ describe("emitClaudePlugin — channel shape", () => {
     expect(agent?.content).toContain("name: triage");
     expect(agent?.content).toContain("Sort by urgency");
   });
+
+  test("a sub-agent's profile overlay (carried raw on the IR) heads the agent body", () => {
+    const withOverlay: IrChannelV0 = {
+      ...baseChannel,
+      subAgents: [
+        {
+          name: "triage",
+          description: "Triage incoming messages",
+          instructions: "Sort by urgency",
+          tools: [],
+          permissions: "inherit",
+          inheritBypass: false,
+          model: "claude-haiku-4-5",
+          modelProfile: "fast",
+          overlay: "You are the fast lane.",
+        },
+      ],
+    };
+    const b = emitClaudePlugin(withOverlay, { author: { name: "x" } });
+    const agent = b.files.find((f) => f.path === "agents/triage.md");
+    expect(agent?.content).toContain("---\n\nYou are the fast lane.\n\nSort by urgency\n");
+  });
 });
 
 describe("emitClaudePlugin — eval shape", () => {
