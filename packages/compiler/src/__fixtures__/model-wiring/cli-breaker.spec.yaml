@@ -1,0 +1,9 @@
+name: wiring-cli-breaker
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Model-wiring pin fixture for the CLI shape (breaker alone). Reply concisely.
+  circuit_breaker:
+    failureThreshold: 3
+tools: [read]

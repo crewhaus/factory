@@ -1,0 +1,16 @@
+name: wiring-channel-pool
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Model-wiring pin fixture for the channel shape. Reply briefly.
+  model_pool:
+    candidates:
+      - { model: claude-haiku-4-5, tags: [cheap] }
+      - { model: claude-opus-4-8, tags: [strong] }
+channels:
+  slack:
+    botToken: $PIN_SLACK_BOT_TOKEN
+    signingSecret: $PIN_SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread

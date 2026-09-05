@@ -4,6 +4,11 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }, { "path": "../infra-utils" }, { "path": "../ir" }],
+  "references": [
+    { "path": "../errors" },
+    { "path": "../infra-utils" },
+    { "path": "../ir" },
+    { "path": "../model-service" }
+  ],
   "include": ["src/**/*"]
 }

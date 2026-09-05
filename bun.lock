@@ -72,6 +72,7 @@
         "@crewhaus/migration-engine": "workspace:*",
         "@crewhaus/migration-runner": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
+        "@crewhaus/model-service": "workspace:*",
         "@crewhaus/module-marketplace-client": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/pii-redactor": "workspace:*",
@@ -473,6 +474,7 @@
       },
       "devDependencies": {
         "@crewhaus/model-plan": "workspace:*",
+        "@crewhaus/model-service": "workspace:*",
       },
     },
     "packages/compiler-worker": {
@@ -1205,6 +1207,17 @@
         "@crewhaus/adapter-openai": "workspace:*",
       },
     },
+    "packages/model-service": {
+      "name": "@crewhaus/model-service",
+      "version": "0.5.8",
+      "dependencies": {
+        "@crewhaus/infra-utils": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/runtime-core": "workspace:*",
+      },
+    },
     "packages/module-marketplace-client": {
       "name": "@crewhaus/module-marketplace-client",
       "version": "0.5.8",
@@ -1706,6 +1719,7 @@
         "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/model-service": "workspace:*",
       },
     },
     "packages/target-browser-driver": {
@@ -1715,6 +1729,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/model-service": "workspace:*",
       },
     },
     "packages/target-cf-worker-cli": {
@@ -1769,6 +1784,7 @@
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
+        "@crewhaus/model-service": "workspace:*",
       },
       "peerDependencies": {
         "@crewhaus/audit-log": "workspace:*",
@@ -1808,6 +1824,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
+        "@crewhaus/model-service": "workspace:*",
       },
       "peerDependencies": {
         "@crewhaus/egress-matcher-semantic": "workspace:*",
@@ -1832,6 +1849,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
+        "@crewhaus/model-service": "workspace:*",
       },
     },
     "packages/target-eval-bundle": {
@@ -1855,6 +1873,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/model-service": "workspace:*",
       },
     },
     "packages/target-managed": {
@@ -1866,6 +1885,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
+        "@crewhaus/model-service": "workspace:*",
       },
     },
     "packages/target-onchain": {
@@ -1893,6 +1913,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/model-service": "workspace:*",
       },
     },
     "packages/target-research-bundle": {
@@ -1903,6 +1924,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
+        "@crewhaus/model-service": "workspace:*",
       },
     },
     "packages/target-voice": {
@@ -1922,6 +1944,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/model-service": "workspace:*",
       },
       "peerDependencies": {
         "@crewhaus/hooks-engine": "workspace:*",
@@ -2720,6 +2743,8 @@
     "@crewhaus/model-plan": ["@crewhaus/model-plan@workspace:packages/model-plan"],
 
     "@crewhaus/model-router": ["@crewhaus/model-router@workspace:packages/model-router"],
+
+    "@crewhaus/model-service": ["@crewhaus/model-service@workspace:packages/model-service"],
 
     "@crewhaus/module-marketplace-client": ["@crewhaus/module-marketplace-client@workspace:packages/module-marketplace-client"],
 

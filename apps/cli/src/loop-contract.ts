@@ -22,6 +22,12 @@
 import type { CompileWarning } from "@crewhaus/compiler";
 import type { HookDef } from "@crewhaus/hooks-engine";
 import type { IrCompaction, IrHook, IrLimits, IrRateLimits, IrThinking } from "@crewhaus/ir";
+import {
+  type ModelWiringFragment,
+  type ModelWiringRunOptions,
+  modelWiringFragmentFromIr,
+  wireModels,
+} from "@crewhaus/model-service";
 import type { RunChatLoopOptions } from "@crewhaus/runtime-core";
 
 /**
@@ -115,6 +121,33 @@ export function loopContractRunOptions(ir: LoopContractIrSlice): LoopContractRun
     ...(compaction?.snipKeepHead !== undefined ? { snipKeepHead: compaction.snipKeepHead } : {}),
     ...(compaction?.snipKeepTail !== undefined ? { snipKeepTail: compaction.snipKeepTail } : {}),
   };
+}
+
+/**
+ * 0.6.0 PR 8a (plan §2 stance 4, §4.4 "interpreter parity") — the primary
+ * agent's model-routing fragment (`model_fallbacks` + `circuit_breaker`,
+ * `model_tiers`, `model_pool`) for `runChatLoop(...)`, through THE composition
+ * root: `@crewhaus/model-service`'s `wireModels`. A compiled cli bundle's
+ * rendered routing fields evaluate to exactly this object (pinned in
+ * model-service), so `crewhaus run` and the bundle are one code path rather
+ * than a mirror. Both interpreter sites (the REPL run and the `serve`
+ * single-turn runtime) spread this same call.
+ *
+ * `modelOverride` is the raw `--model` flag value: a string is an explicit
+ * routing decision authored against a different primary, so the spec's
+ * chain, tiers and pool are dropped (the breaker stays — declared alone it
+ * wraps whichever primary serves); anything else (absent, a bare flag) is
+ * not an override. Spread-return-`{}` like every helper here: a spec with no
+ * routing spreads NOTHING.
+ */
+export function modelRoutingRunOptions(
+  agent: ModelWiringFragment,
+  modelOverride: unknown,
+): ModelWiringRunOptions {
+  return wireModels(
+    modelWiringFragmentFromIr(agent),
+    typeof modelOverride === "string" ? { modelOverride } : {},
+  );
 }
 
 /**

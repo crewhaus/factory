@@ -17,7 +17,8 @@
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*",
     "@crewhaus/memory-service": "workspace:*",
-    "@crewhaus/model-router": "workspace:*"
+    "@crewhaus/model-router": "workspace:*",
+    "@crewhaus/model-service": "workspace:*"
   },
   "peerDependencies": {
     "@crewhaus/audit-log": "workspace:*",

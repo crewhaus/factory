@@ -12,7 +12,8 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*",
-    "@crewhaus/memory-service": "workspace:*"
+    "@crewhaus/memory-service": "workspace:*",
+    "@crewhaus/model-service": "workspace:*"
   },
   "peerDependencies": {
     "@crewhaus/egress-matcher-semantic": "workspace:*",

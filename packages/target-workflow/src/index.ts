@@ -8,6 +8,7 @@ import {
   type IrWorkflowV0,
   renderBundleReadme,
 } from "@crewhaus/ir";
+import { renderModelWiringFields } from "@crewhaus/model-service";
 
 /**
  * Emit a self-contained workflow agent bundle. The generated agent.ts
@@ -230,7 +231,15 @@ function renderStep(step: IrWorkflowStep, idx: number, total: number, shared: St
   const stepNum = idx + 1;
   const toolsField = renderStepToolsField(step.tools, shared.mcpWired);
   const stepTuningFields = renderStepTuningFields(step);
-  const modelFailoverFields = renderStepModelFailoverFields(step);
+  // Loop contract 0.4 (Batch G, item 9 / G37) — the step's model-routing
+  // quartet, rendered by `@crewhaus/model-service`'s `renderModelWiringFields`
+  // (the one renderer every emitter shares): a PolicyRouter decision per step
+  // rides the same `@crewhaus/routing-store` scoreboard the cli shape uses —
+  // runtime-core owns the router, the emitter only forwards the lowered
+  // config. Only the plain and gated step bodies render it: a judge step
+  // scores through eval-judge on its own resolved model and never runs the
+  // primary loop.
+  const modelFailoverFields = renderModelWiringFields(step, "    ");
   const deadlineGuard = renderDeadlineGuard(
     shared.deadlineMs,
     stepNum,
@@ -299,7 +308,7 @@ function renderGatedStep(
   const stepNum = idx + 1;
   const toolsField = renderStepToolsField(step.tools, shared.mcpWired);
   const stepTuningFields = renderStepTuningFields(step);
-  const modelFailoverFields = renderStepModelFailoverFields(step);
+  const modelFailoverFields = renderModelWiringFields(step, "    ");
   const deadlineGuard = renderDeadlineGuard(
     shared.deadlineMs,
     stepNum,
@@ -500,41 +509,6 @@ function renderStepTuningFields(step: IrWorkflowStep): string {
   }
   if (step.thinking !== undefined) {
     pieces.push(`\n    thinking: ${JSON.stringify(step.thinking)},`);
-  }
-  return pieces.join("");
-}
-
-/**
- * Loop contract 0.4 (Batch G, item 9 / G37) — render the per-step model-
- * routing fields onto the step's `runChatLoop` call. The pooled pattern is
- * adopted verbatim from the cli agent block (`@crewhaus/target-cli`'s
- * `renderModelFailoverFields`) so a PolicyRouter decision per step shares
- * the same `@crewhaus/routing-store` scoreboard the cli/pipeline shapes use
- * — runtime-core owns the router; the emitter only forwards the resolved
- * config. The four fields are mutually exclusive in the spec
- * (`model_pool` ⊥ `model_tiers` ⊥ `model_fallbacks`, with `circuit_breaker`
- * riding `model_fallbacks`), so at most one clause fires per step. Model
- * strings pass through `escapeJsonString` (user-controlled spec values in
- * generated source); the breaker/tiers/pool blocks are validated
- * numbers/strings/closed-literal unions safe to `JSON.stringify`. Only
- * NON-JUDGE steps carry these — a judge step scores through eval-judge on
- * its own resolved model and never runs the primary loop. Empty when the
- * step declares none, keeping pre-existing bundles byte-identical.
- */
-function renderStepModelFailoverFields(step: IrWorkflowStep): string {
-  const pieces: string[] = [];
-  const fallbacks = step.modelFallbacks;
-  if (fallbacks !== undefined && fallbacks.length > 0) {
-    pieces.push(`\n    modelFallbacks: [${fallbacks.map((m) => escapeJsonString(m)).join(", ")}],`);
-  }
-  if (step.circuitBreaker !== undefined) {
-    pieces.push(`\n    circuitBreaker: ${JSON.stringify(step.circuitBreaker)},`);
-  }
-  if (step.modelTiers !== undefined) {
-    pieces.push(`\n    modelTiers: ${JSON.stringify(step.modelTiers)},`);
-  }
-  if (step.modelPool !== undefined) {
-    pieces.push(`\n    modelPool: ${JSON.stringify(step.modelPool)},`);
   }
   return pieces.join("");
 }

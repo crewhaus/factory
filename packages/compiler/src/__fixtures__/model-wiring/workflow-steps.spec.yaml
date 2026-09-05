@@ -1,0 +1,23 @@
+name: wiring-workflow-steps
+target: workflow
+model: claude-sonnet-4-6
+steps:
+  - name: draft
+    instructions: |
+      Draft one paragraph about X.
+    model_pool:
+      candidates:
+        - { model: claude-haiku-4-5, tags: [cheap] }
+        - { model: claude-opus-4-8, tags: [strong] }
+  - name: polish
+    instructions: |
+      Polish the draft.
+    model_tiers:
+      fast: claude-haiku-4-5
+      default: claude-sonnet-4-6
+  - name: check
+    instructions: |
+      Check the polished draft for errors.
+    model_fallbacks: [openai/gpt-4o-mini]
+    circuit_breaker:
+      failureThreshold: 2

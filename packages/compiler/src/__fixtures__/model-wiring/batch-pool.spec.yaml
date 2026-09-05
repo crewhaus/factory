@@ -1,0 +1,12 @@
+name: wiring-batch-pool
+target: batch
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Model-wiring pin fixture for the batch shape.
+  model_pool:
+    candidates:
+      - { model: claude-haiku-4-5, tags: [cheap] }
+      - { model: claude-opus-4-8, tags: [strong] }
+queue:
+  adapter: in-memory

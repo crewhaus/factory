@@ -1,0 +1,11 @@
+name: wiring-cli-fallbacks
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Model-wiring pin fixture for the CLI shape (failover chain). Reply concisely.
+  model_fallbacks: [openai/gpt-4o-mini, claude-haiku-4-5]
+  circuit_breaker:
+    failureThreshold: 2
+    cooldownMs: 60000
+tools: [read]

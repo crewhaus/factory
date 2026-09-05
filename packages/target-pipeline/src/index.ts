@@ -7,6 +7,7 @@ import {
   type IrSecretRef,
   renderBundleReadme,
 } from "@crewhaus/ir";
+import { renderModelWiringFields } from "@crewhaus/model-service";
 
 /**
  * Emit a RAG/pipeline bundle.
@@ -92,19 +93,6 @@ function renderApprovalFields(ir: IrPipelineV0, indent: string): string {
 }
 
 /**
- * Adaptive model routing — render the `modelPool` runChatLoop field.
- * JSON.stringify safely quotes the validated pool object (a plain object
- * literal, mirroring target-cli's renderModelFailoverFields; keep the
- * pipeline/research/batch/browser copies in sync). Empty when the spec omits
- * `model_pool`, keeping bundles byte-identical.
- */
-function poolField(ir: IrPipelineV0, indent: string): string {
-  return ir.agent.modelPool !== undefined
-    ? `\n${indent}modelPool: ${JSON.stringify(ir.agent.modelPool)},`
-    : "";
-}
-
-/**
  * Section 55 / item 23 — render the `failureTaxonomy` runChatLoop field.
  * Empty when the spec omits the block (mirror: target-cli +
  * target-channel-bot render the same field; keep the pipeline/research/
@@ -174,7 +162,7 @@ function renderAgent(ir: IrPipelineV0, evalEntry = false): string {
   // the eval-entry's single-turn call so the two paths can never drift.
   const replCall = `runChatLoop({
   model: ${escapeJsonString(ir.agent.model)},
-  instructions: ${escapeJsonString(ir.agent.instructions)},${poolField(ir, "  ")}${taxonomyField(ir, "  ")}
+  instructions: ${escapeJsonString(ir.agent.instructions)},${renderModelWiringFields(ir.agent, "  ")}${taxonomyField(ir, "  ")}
   sessionName: ${escapeJsonString(ir.name)},
   sessionTarget: "pipeline",
   tools: defaultCatalog.list(),${permField}
@@ -203,7 +191,7 @@ export async function runForEval(
 ): Promise<string> {
   return runChatLoop({
     model: ${escapeJsonString(ir.agent.model)},
-    instructions: ${escapeJsonString(ir.agent.instructions)},${poolField(ir, "    ")}${taxonomyField(ir, "    ")}
+    instructions: ${escapeJsonString(ir.agent.instructions)},${renderModelWiringFields(ir.agent, "    ")}${taxonomyField(ir, "    ")}
     sessionName: ${escapeJsonString(ir.name)},
     sessionTarget: "pipeline",
     tools: defaultCatalog.list(),${permField

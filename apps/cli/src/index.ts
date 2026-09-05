@@ -987,6 +987,7 @@ import {
   isValidAskMode,
   loopContractRunOptions,
   mergeSpecHooks,
+  modelRoutingRunOptions,
   resolveAskMode,
   resolveStreaming,
 } from "./loop-contract";
@@ -4668,37 +4669,15 @@ async function runRunCli(
       // Loop contract 0.4 (Batch A) — streaming tool dispatch
       // (--streaming flag > spec agent.streaming > absent).
       ...(streaming !== undefined ? { streaming } : {}),
-      // Item 22 — provider failover chain: thread `agent.model_fallbacks` +
-      // `agent.circuit_breaker` through to the runtime, mirroring the
-      // target-cli codegen path. Skipped when `--model` overrides the
-      // primary — a flag-forced model is an explicit routing decision and
-      // the spec's fallback chain was authored against the spec's primary.
-      ...(ir.target === "cli" &&
-      typeof modelOverride !== "string" &&
-      ir.agent.modelFallbacks !== undefined &&
-      ir.agent.modelFallbacks.length > 0
-        ? { modelFallbacks: ir.agent.modelFallbacks }
-        : {}),
-      ...(ir.target === "cli" && ir.agent.circuitBreaker !== undefined
-        ? { circuitBreaker: ir.agent.circuitBreaker }
-        : {}),
-      // Item 26 — two-tier turn-difficulty router. A `--model` override
-      // forces a single model, so tiers apply only without an override.
-      ...(ir.target === "cli" &&
-      typeof modelOverride !== "string" &&
-      ir.agent.modelTiers !== undefined
-        ? { modelTiers: ir.agent.modelTiers }
-        : {}),
-      // Adaptive model routing — thread `agent.model_pool` so `crewhaus run`
-      // routes (and learns) exactly like the compiled cli bundle, not just the
-      // single primary. Mutually exclusive with tiers/fallbacks in the spec;
-      // a `--model` override forces a single model, so the pool applies only
-      // without an override.
-      ...(ir.target === "cli" &&
-      typeof modelOverride !== "string" &&
-      ir.agent.modelPool !== undefined
-        ? { modelPool: ir.agent.modelPool }
-        : {}),
+      // Item 22 / item 26 / adaptive model routing — the primary agent's
+      // routing quartet (`model_fallbacks` + `circuit_breaker`, `model_tiers`,
+      // `model_pool`) through the 0.6.0 composition root
+      // (`@crewhaus/model-service`'s `wireModels`, plan §2 stance 4) — the
+      // SAME call the compiled cli bundle's rendered fields evaluate to, so
+      // `crewhaus run` routes (and learns) exactly like the bundle. A `--model`
+      // override is an explicit routing decision authored against a different
+      // primary, so it drops the chain, tiers and pool (the breaker stays).
+      ...modelRoutingRunOptions(ir.agent, modelOverride),
       // Section 55 / item 23 — thread the spec's failure_taxonomy so
       // recovery-engine consults the user's named error classes (including
       // the `switch-model` verdict) before its built-in flow.
@@ -5807,21 +5786,11 @@ async function buildServeRuntime(
     ...(egressMatcher !== undefined ? { egressMatcher } : {}),
   };
 
-  // Primary-agent model routing (failover / tiers / pool) — only without a
-  // `--model` override, exactly as runRunCli threads it.
-  const primaryModelRouting =
-    typeof modelOverride === "string"
-      ? {}
-      : {
-          ...(ir.agent.modelFallbacks !== undefined && ir.agent.modelFallbacks.length > 0
-            ? { modelFallbacks: ir.agent.modelFallbacks }
-            : {}),
-          ...(ir.agent.circuitBreaker !== undefined
-            ? { circuitBreaker: ir.agent.circuitBreaker }
-            : {}),
-          ...(ir.agent.modelTiers !== undefined ? { modelTiers: ir.agent.modelTiers } : {}),
-          ...(ir.agent.modelPool !== undefined ? { modelPool: ir.agent.modelPool } : {}),
-        };
+  // Primary-agent model routing (failover / tiers / pool) — the same
+  // `wireModels` call runRunCli spreads, so the two interpreter paths cannot
+  // drift (0.6.0 PR 8a; before it this copy dropped `circuitBreaker` under
+  // `--model` while runRunCli kept it).
+  const primaryModelRouting = modelRoutingRunOptions(ir.agent, modelOverride);
 
   const primaryOptions = {
     ...commonOptions,

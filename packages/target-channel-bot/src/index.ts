@@ -22,6 +22,7 @@ import {
 import type { IrMcpServerConfig } from "@crewhaus/ir";
 import { memoryFragmentFromIr, renderStudyRotationPreamble } from "@crewhaus/memory-service";
 import { type ParsedModelString, parseModelString } from "@crewhaus/model-router";
+import { renderModelWiringFields } from "@crewhaus/model-service";
 
 /**
  * Emit a self-contained channel-bot bundle for a channel-target IR.
@@ -232,6 +233,11 @@ function requiredEnvNames(ir: IrChannelV0): string[] {
  * A model string outside the router grammar contributes NO group — the
  * spec layer does not enforce the grammar here, and runtime-core's
  * `resolveModel` raises the authoritative ConfigError at run time.
+ *
+ * NOTE (item 22): the check intentionally covers ONLY the primary model.
+ * `model_fallbacks` candidates — rendered onto the `runChatLoop` call by
+ * `@crewhaus/model-service`'s `renderModelWiringFields` — resolve their
+ * credentials lazily, and a missing one warns at boot instead of failing it.
  */
 function providerEnvGroups(model: string): string[][] {
   let parsed: ParsedModelString;
@@ -252,37 +258,6 @@ function providerEnvGroups(model: string): string[][] {
     case "bedrock":
       return [];
   }
-}
-
-/**
- * Item 22 — render the failover-chain runChatLoop fields from the IR agent
- * block, indented for the generated `createAgent` body. Empty when the spec
- * declared neither field so existing bundles stay byte-identical. NOTE: the
- * startup env check (`providerEnvGroups`) intentionally covers ONLY the
- * primary model — fallback credentials resolve lazily and a missing one
- * warns at boot instead of failing it. Mirror: target-cli + target-managed
- * render the same fields — keep the three in sync.
- */
-function renderModelFailoverFields(ir: IrChannelV0): string {
-  const pieces: string[] = [];
-  const fallbacks = ir.agent.modelFallbacks;
-  if (fallbacks !== undefined && fallbacks.length > 0) {
-    pieces.push(
-      `\n        modelFallbacks: [${fallbacks.map((m) => escapeJsonString(m)).join(", ")}],`,
-    );
-  }
-  if (ir.agent.circuitBreaker !== undefined) {
-    pieces.push(`\n        circuitBreaker: ${JSON.stringify(ir.agent.circuitBreaker)},`);
-  }
-  // Item 26 — two-tier router (mirror of target-cli). Absent when unset.
-  if (ir.agent.modelTiers !== undefined) {
-    pieces.push(`\n        modelTiers: ${JSON.stringify(ir.agent.modelTiers)},`);
-  }
-  // Adaptive model routing — the N-candidate pool (mirror of target-cli).
-  if (ir.agent.modelPool !== undefined) {
-    pieces.push(`\n        modelPool: ${JSON.stringify(ir.agent.modelPool)},`);
-  }
-  return pieces.join("");
 }
 
 /**
@@ -1239,7 +1214,7 @@ export function createAgent(config: AgentConfig): Agent {
       const __inbound = await classifyInbound(args.message, runContext, { origin: "channel" });${memTurnBlock}
       return await runChatLoop({
         model: ${escapeJsonString(ir.agent.model)},
-        instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentTuningFields(ir)}${renderModelFailoverFields(ir)}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderCompactionFields(ir)}
+        instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentTuningFields(ir)}${renderModelWiringFields(ir.agent, "        ")}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderCompactionFields(ir)}
         sessionName: ${escapeJsonString(ir.name)},
         sessionTarget: "channel",
         ...(config.sessionRootDir !== undefined ? { sessionRootDir: config.sessionRootDir } : {}),

@@ -14,7 +14,8 @@
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
-    "@crewhaus/ir": "workspace:*"
+    "@crewhaus/ir": "workspace:*",
+    "@crewhaus/model-service": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

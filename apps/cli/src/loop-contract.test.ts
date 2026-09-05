@@ -1,13 +1,80 @@
 import { describe, expect, test } from "bun:test";
 import type { HookDef } from "@crewhaus/hooks-engine";
+import type { IrModelPool } from "@crewhaus/ir";
+import { modelWiringFragmentFromIr, wireModels } from "@crewhaus/model-service";
 import {
   formatCompileWarning,
   isValidAskMode,
   loopContractRunOptions,
   mergeSpecHooks,
+  modelRoutingRunOptions,
   resolveAskMode,
   resolveStreaming,
 } from "./loop-contract";
+
+describe("modelRoutingRunOptions (0.6.0 PR 8a — the interpreter's wireModels call)", () => {
+  const POOL: IrModelPool = {
+    candidates: [
+      { model: "claude-haiku-4-5", tags: ["cheap"], temperature: 0.2 },
+      { model: "claude-sonnet-4-6", tags: ["mid"], enabled: false },
+      { model: "claude-opus-4-8", tags: ["strong"] },
+    ],
+    policy: "heuristic",
+    rules: [{ id: "r1", when: { has_images: true }, use: "strong" }],
+  };
+  const TIERS = { fast: "claude-haiku-4-5", default: "claude-sonnet-4-6" } as const;
+  const BREAKER = { failureThreshold: 2 } as const;
+
+  test("an agent block without routing spreads NOTHING", () => {
+    expect(modelRoutingRunOptions({ model: "m", instructions: "i" } as never, undefined)).toEqual(
+      {},
+    );
+    expect(modelRoutingRunOptions({ modelFallbacks: [] }, undefined)).toEqual({});
+  });
+
+  test("it IS the composition root's call — same object as wireModels over the same fragment", () => {
+    const agent = {
+      modelFallbacks: ["openai/gpt-4o-mini"],
+      circuitBreaker: BREAKER,
+      modelTiers: TIERS,
+      modelPool: POOL,
+    };
+    expect(modelRoutingRunOptions(agent, undefined)).toEqual(
+      wireModels(modelWiringFragmentFromIr(agent), {}),
+    );
+    expect(Object.keys(modelRoutingRunOptions(agent, undefined))).toEqual([
+      "modelFallbacks",
+      "circuitBreaker",
+      "modelTiers",
+      "modelPool",
+    ]);
+  });
+
+  test("the pool reaches the option object by reference, every 0.6.0 key intact (plan §17)", () => {
+    const out = modelRoutingRunOptions({ modelPool: POOL }, undefined);
+    expect(out.modelPool).toBe(POOL);
+    const pool = out.modelPool as unknown as Record<string, unknown>;
+    const candidates = pool["candidates"] as ReadonlyArray<Record<string, unknown>>;
+    expect(candidates[0]?.["temperature"]).toBe(0.2);
+    expect(candidates[1]?.["enabled"]).toBe(false);
+    expect(pool["rules"]).toEqual([{ id: "r1", when: { has_images: true }, use: "strong" }]);
+  });
+
+  test("a --model string drops the chain, tiers and pool but keeps the breaker", () => {
+    const agent = {
+      modelFallbacks: ["openai/gpt-4o-mini"],
+      circuitBreaker: BREAKER,
+      modelTiers: TIERS,
+      modelPool: POOL,
+    };
+    expect(modelRoutingRunOptions(agent, "claude-opus-4-8")).toEqual({ circuitBreaker: BREAKER });
+  });
+
+  test("a bare --model flag (parses as true) or an absent flag is NOT an override", () => {
+    expect(modelRoutingRunOptions({ modelPool: POOL }, true)).toEqual({ modelPool: POOL });
+    expect(modelRoutingRunOptions({ modelTiers: TIERS }, undefined)).toEqual({ modelTiers: TIERS });
+  });
+});
 
 describe("resolveAskMode (loop contract 0.4, Batch C — G11)", () => {
   test('defaults to "pause" — the documented safe direction', () => {

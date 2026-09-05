@@ -1,0 +1,12 @@
+name: wiring-cli-pool
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Model-wiring pin fixture for the CLI shape (pool). Reply concisely.
+  model_pool:
+    candidates:
+      - { model: claude-haiku-4-5, tags: [cheap] }
+      - { model: claude-opus-4-8, tags: [strong] }
+    policy: heuristic
+tools: [read, bash]
