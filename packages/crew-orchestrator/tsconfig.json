@@ -11,6 +11,7 @@
     { "path": "../boundary-classifier" },
     { "path": "../errors" },
     { "path": "../event-log" },
+    { "path": "../model-plan" },
     { "path": "../permission-engine" },
     { "path": "../run-context" },
     { "path": "../runtime-core" },

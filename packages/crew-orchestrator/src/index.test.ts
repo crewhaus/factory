@@ -21,9 +21,11 @@ import {
   type CrewEvent,
   HandoffRefusedError,
   type RoleDefinition,
+  type RoleModelPool,
   type RunOptions,
   composeAdapterSeams,
   composeLoopTuning,
+  scopeRolePool,
 } from "./index.js";
 
 function newTempRoot(): string {
@@ -986,7 +988,7 @@ describe("composeLoopTuning (loop contract 0.4)", () => {
       hooks: [{ event: "session-start", command: "echo hi" }],
       spawnSubAgent: spawnStub,
     };
-    expect(composeLoopTuning(def, opts)).toEqual({
+    expect(composeLoopTuning(def, opts, "solo")).toEqual({
       maxToolIterations: 12,
       maxConcurrentTools: 2,
       contextLimit: 100000,
@@ -1003,13 +1005,14 @@ describe("composeLoopTuning (loop contract 0.4)", () => {
   });
 
   test("declares nothing when the run + role declare nothing (runtime owns defaults)", () => {
-    expect(composeLoopTuning({ model: "m", instructions: "i" }, {})).toEqual({});
+    expect(composeLoopTuning({ model: "m", instructions: "i" }, {}, "solo")).toEqual({});
   });
 
   test("crew-level caps never leak into the per-turn fragment", () => {
     const tuned = composeLoopTuning(
       { model: "m", instructions: "i" },
       { maxActivations: 5, refusalDepth: 1, maxA2ADepth: 2, limits: { maxToolIterations: 3 } },
+      "solo",
     );
     expect(tuned).toEqual({ maxToolIterations: 3 });
   });
@@ -1034,7 +1037,7 @@ describe("composeLoopTuning (loop contract 0.4)", () => {
         learning: { seed: "fixed", minSamplesPerArm: 2 },
       },
     };
-    expect(composeLoopTuning(def, {})).toEqual({
+    expect(composeLoopTuning(def, {}, "solo")).toEqual({
       modelFallbacks: ["openai/gpt-4o-mini", "groq/llama-3.3-70b"],
       circuitBreaker: { failureThreshold: 3, windowMs: 30_000, cooldownMs: 60_000 },
       modelTiers: { fast: "claude-haiku-4-5", default: "claude-sonnet-4-6" },
@@ -1045,13 +1048,15 @@ describe("composeLoopTuning (loop contract 0.4)", () => {
         ],
         policy: "learned",
         learning: { seed: "fixed", minSamplesPerArm: 2 },
+        // 0.6.0 PR 7b — the pool arrives scoped to its role (§7.9).
+        scope: "solo",
       },
     });
     // Presence-gated: a role declaring only a pool hands the runtime ONLY a
     // pool — no `undefined`-valued keys that would read as "declared".
     expect(
       Object.keys(
-        composeLoopTuning({ model: "m", instructions: "i", modelPool: def.modelPool }, {}),
+        composeLoopTuning({ model: "m", instructions: "i", modelPool: def.modelPool }, {}, "solo"),
       ),
     ).toEqual(["modelPool"]);
   });
@@ -1699,6 +1704,211 @@ describe("per-role model routing reaches the role loop (0.6.0 PR 3, §7.7)", () 
       expect(done.finalOutput).toBe("primary served");
       expect(primary.calls()).toBe(1);
       expect(readSessionLines(root).some((l) => l.kind === "model_route")).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 PR 7b (design §4.2, §7.7, §7.9) — per-candidate profile enrichment on
+// roles. PR 3 made a role's `{model, tags}` pool reach the loop; PR 7 widened
+// the IR so a candidate carries its profile settings and the pool a `scope`.
+// This suite proves (a) the WIDENED candidate survives RoleDefinition →
+// composeLoopTuning → runChatLoop intact — the fragment IS the role loop's
+// options, spread verbatim at both call sites — and arrives scoped to its
+// role; and (b) end to end, that a 0.6.0 per-candidate key runtime-core
+// already consumes (`enabled: false`, read at pool boot) is honoured on BOTH
+// role call sites when it rides the role literal. `maxTokens` / `thinking` /
+// `overlay` ride the same object; their consumer (the per-candidate plan
+// table) lands with PR 9a, so their proof here is "reaches the options
+// verbatim", never "changes the request".
+// ---------------------------------------------------------------------------
+
+const ENRICHED_POOL: RoleModelPool = {
+  candidates: [
+    {
+      model: HAIKU,
+      tags: ["cheap"],
+      profile: "fast",
+      maxTokens: 512,
+      thinking: { effort: "low" },
+      overlay: "You are the fast lane.",
+    },
+    {
+      model: OPUS,
+      tags: ["strong"],
+      profile: "strong",
+      thinking: { budgetTokens: 4096 },
+      enabled: false,
+    },
+  ],
+  policy: "heuristic",
+};
+
+describe("per-candidate profile enrichment reaches the role loop (0.6.0 PR 7b, §7.7/§7.9)", () => {
+  test("a role-level per-candidate setting (candidate maxTokens) reaches the role loop options verbatim, scoped to the role", () => {
+    const def: RoleDefinition = {
+      model: "claude-sonnet-4-6",
+      instructions: "Planner.",
+      modelPool: ENRICHED_POOL,
+    };
+    const tuned = composeLoopTuning(def, {}, "planner");
+    expect(tuned).toEqual({ modelPool: { ...ENRICHED_POOL, scope: "planner" } });
+    // Candidates are forwarded by reference — nothing re-shapes or drops a key.
+    expect(tuned.modelPool?.candidates).toBe(ENRICHED_POOL.candidates);
+    expect(tuned.modelPool?.candidates[0]).toMatchObject({
+      profile: "fast",
+      maxTokens: 512,
+      thinking: { effort: "low" },
+      overlay: "You are the fast lane.",
+    });
+    expect(tuned.modelPool?.candidates[1]?.enabled).toBe(false);
+    // Key order is the compiler's (model, tags first) — the byte-identity premise.
+    expect(Object.keys(tuned.modelPool?.candidates[0] ?? {}).slice(0, 2)).toEqual([
+      "model",
+      "tags",
+    ]);
+    // The same role name scopes the fragment whichever call site spreads it.
+    expect(composeLoopTuning(def, {}, "worker").modelPool?.scope).toBe("worker");
+  });
+
+  test("a declared scope wins over the role name; a pool-less role gets nothing stamped", () => {
+    const declared: RoleModelPool = { ...ENRICHED_POOL, scope: "shared-workers" };
+    // Identity kept when nothing is stamped.
+    expect(scopeRolePool(declared, "planner")).toBe(declared);
+    expect(
+      composeLoopTuning({ model: "m", instructions: "i", modelPool: declared }, {}, "planner")
+        .modelPool?.scope,
+    ).toBe("shared-workers");
+    expect(composeLoopTuning({ model: "m", instructions: "i" }, {}, "planner")).toEqual({});
+  });
+
+  test("the hybrid siblings (rules / directives / strategy / reward) ride the fragment verbatim", () => {
+    const hybrid: RoleModelPool = {
+      ...ENRICHED_POOL,
+      directives: false,
+      rules: [{ id: "code-goes-strong", when: { message_matches: "refactor" }, use: "strong" }],
+      strategy: { cascade: { draft: "cheap", escalateTo: "strong" } },
+      reward: { qualitySource: "none" },
+    };
+    const tuned = composeLoopTuning(
+      { model: "m", instructions: "i", modelPool: hybrid },
+      {},
+      "planner",
+    );
+    expect(tuned.modelPool).toEqual({ ...hybrid, scope: "planner" });
+    expect(tuned.modelPool?.rules).toBe(hybrid.rules);
+    expect(tuned.modelPool?.strategy).toBe(hybrid.strategy);
+  });
+
+  test("a withdrawn candidate (enabled: false) on a role's pool never serves its PRIMARY activation", async () => {
+    const root = newTempRoot();
+    try {
+      const primary = servingAdapter("primary served");
+      const cheap = servingAdapter("cheap served");
+      const strong = servingAdapter("strong served");
+      const scoreboard = memoryScoreboard();
+
+      const crew = Crew()
+        .setName("enriched-solo")
+        .addRole("solo", {
+          model: "claude-sonnet-4-6",
+          instructions: "Solo.",
+          modelPool: ENRICHED_POOL,
+        })
+        .setEntry("solo")
+        .compile();
+
+      const events = await collect(
+        crew.run("hello", {
+          sessionRootDir: root,
+          _adapter: primary,
+          _poolAdapters: new Map([
+            [HAIKU, cheap],
+            [OPUS, strong],
+          ]),
+          _scoreboard: scoreboard,
+          maxActivations: 2,
+        }),
+      );
+
+      // PR 3's un-enriched pool served this same "hard" first turn on the
+      // strong arm. With `enabled: false` riding the role literal, runtime-core
+      // withdraws that arm at boot and the cheap candidate — carrying its
+      // per-candidate `maxTokens` / `thinking` / `overlay` intact — serves.
+      const done = events[events.length - 1];
+      if (done?.kind !== "crew_done") throw new Error("crew_done missing");
+      expect(done.finalOutput).toBe("cheap served");
+      expect(cheap.calls()).toBe(1);
+      expect(strong.calls()).toBe(0);
+      expect(primary.calls()).toBe(0);
+
+      const routes = readSessionLines(root).filter((l) => l.kind === "model_route");
+      expect(routes).toHaveLength(1);
+      expect(routes[0]?.payload).toMatchObject({ model: HAIKU, policy: "heuristic" });
+      expect(scoreboard.records.map((r) => r.model)).toEqual([HAIKU]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a withdrawn candidate on a role's pool never serves its inline A2A PEER turn either (both call sites)", async () => {
+    const root = newTempRoot();
+    try {
+      // critic: un-pooled, runs on the boot primary; asks researcher via SendMessage.
+      const primary = makeProgrammableAdapter(({ previousToolResults }) => {
+        if (previousToolResults.length > 0) {
+          return [{ type: "text", text: `Final critique: ${previousToolResults[0]}` }];
+        }
+        return [
+          {
+            type: "tool_use",
+            id: "tool_1",
+            name: "SendMessage",
+            input: { target: "researcher", payload: "where did the data come from?" },
+          },
+        ];
+      });
+      const cheap = servingAdapter("cheap peer");
+      const strong = servingAdapter("strong peer");
+      const scoreboard = memoryScoreboard();
+
+      const crew = Crew()
+        .setName("enriched-peer")
+        .addRole("critic", { model: "claude-sonnet-4-6", instructions: "Critic." })
+        .addRole("researcher", {
+          model: "claude-sonnet-4-6",
+          instructions: "Researcher.",
+          modelPool: ENRICHED_POOL,
+        })
+        .setEntry("critic")
+        .compile();
+
+      const events = await collect(
+        crew.run("review the post", {
+          sessionRootDir: root,
+          _adapter: primary,
+          _poolAdapters: new Map([
+            [HAIKU, cheap],
+            [OPUS, strong],
+          ]),
+          _scoreboard: scoreboard,
+          maxActivations: 2,
+        }),
+      );
+
+      expect(events.some((e) => e.kind === "a2a_message")).toBe(true);
+      const done = events[events.length - 1];
+      if (done?.kind !== "crew_done") throw new Error("crew_done missing");
+      expect(done.finalOutput).toBe("Final critique: cheap peer");
+      expect(cheap.calls()).toBe(1);
+      expect(strong.calls()).toBe(0);
+
+      const routes = readSessionLines(root).filter((l) => l.kind === "model_route");
+      expect(routes).toHaveLength(1);
+      expect(routes[0]?.payload).toMatchObject({ model: HAIKU, policy: "heuristic" });
+      expect(scoreboard.records.map((r) => r.model)).toEqual([HAIKU]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
