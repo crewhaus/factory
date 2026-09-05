@@ -13,6 +13,13 @@
  * `allowRuntimePendingKeys` carries it into the IR with a
  * `model-plan-pending-runtime` warning — the lowering the runtime PR will
  * consume is exercised, not dead. The landing PR deletes its row here.
+ *
+ * The guard acts on the MERGED candidate, not only on the keys a candidate
+ * spells inline: a `$profile` candidate inherits the profile's narrowing
+ * knobs in `lowerPoolCandidate`, and the runtime reads only `model` / `tags`
+ * / `enabled` off the pool blob until PR 9a — so `models.fast: { tools: [] }`
+ * behind `candidates: [{ model: $fast }]` is refused on every pool-bearing
+ * slot (agent, step, node, role, sub-agent) exactly like an inline `tools: []`.
  */
 import { describe, expect, test } from "bun:test";
 import { CompilerError } from "@crewhaus/errors";
@@ -90,6 +97,108 @@ const REFUSED: ReadonlyArray<readonly [string, string, RegExp, (json: string) =>
     ].join("\n"),
     /^models\.fast\.tools \(referenced from agent\.model\)/,
     (j) => j.includes('"modelProfile":"fast"'),
+  ],
+  [
+    "a $profile candidate inheriting the profile's tools / permissions (agent pool)",
+    [
+      "name: hello",
+      "target: cli",
+      "models:",
+      "  fast: { model: claude-haiku-4-5, tools: [], permissions: { deny: ['Bash(*)'] } }",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: i",
+      "  model_pool:",
+      "    candidates:",
+      "      - { model: $fast, tags: [cheap] }",
+      "      - { model: claude-opus-4-8, tags: [strong] }",
+      "tools: [read, fetch]",
+    ].join("\n"),
+    /^agent\.model_pool\.candidates\[0\]\.model → models\.fast\.tools/,
+    (j) => j.includes('"profile":"fast","tools":[],"permissions":{"deny":["Bash(*)"]}'),
+  ],
+  [
+    "a $profile candidate inheriting the profile's rate_limits (workflow step pool)",
+    [
+      "name: w",
+      "target: workflow",
+      "models:",
+      "  fast: { model: claude-haiku-4-5, rate_limits: { '*': { rpm: 60 } } }",
+      "model: m",
+      "steps:",
+      "  - name: draft",
+      "    instructions: write it",
+      "    model_pool:",
+      "      candidates:",
+      "        - { model: $fast, tags: [cheap] }",
+      "        - { model: m2, tags: [strong] }",
+    ].join("\n"),
+    /^steps\[0\]\.model_pool\.candidates\[0\]\.model → models\.fast\.rate_limits/,
+    (j) => j.includes('"profile":"fast","rateLimits":{"*":{"rpm":60}}'),
+  ],
+  [
+    "a $profile candidate inheriting the profile's cost cap (graph node pool)",
+    [
+      "name: g",
+      "target: graph",
+      "models:",
+      "  fast: { model: claude-haiku-4-5, cost: { max_usd: 0.5 } }",
+      "model: m",
+      "entry: a",
+      "nodes:",
+      "  a:",
+      "    instructions: x",
+      "    model_pool:",
+      "      candidates:",
+      "        - { model: $fast, tags: [cheap] }",
+      "        - { model: m2, tags: [strong] }",
+    ].join("\n"),
+    /^nodes\.a\.model_pool\.candidates\[0\]\.model → models\.fast\.cost/,
+    (j) => j.includes('"profile":"fast","costCapUsdMicros":500000'),
+  ],
+  [
+    "a $profile candidate inheriting the profile's tool_config (crew role pool)",
+    [
+      "name: c",
+      "target: crew",
+      "models:",
+      "  fast: { model: claude-haiku-4-5, tool_config: { fetch: { timeoutMs: 8000 } } }",
+      "model: m",
+      "entry: lead",
+      "roles:",
+      "  lead:",
+      "    instructions: go",
+      "    model_pool:",
+      "      candidates:",
+      "        - { model: $fast, tags: [cheap] }",
+      "        - { model: m2, tags: [strong] }",
+    ].join("\n"),
+    /^roles\.lead\.model_pool\.candidates\[0\]\.model → models\.fast\.tool_config/,
+    (j) => j.includes('"profile":"fast","toolConfigs":{"fetch":{"timeoutMs":8000}}'),
+  ],
+  [
+    "a $profile candidate inheriting the profile's tools: [] (sub-agent pool)",
+    [
+      "name: hello",
+      "target: cli",
+      "models:",
+      "  fast: { model: claude-haiku-4-5, tools: [] }",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: i",
+      "  sub_agents:",
+      "    helper:",
+      "      description: helps",
+      "      instructions: help",
+      "      tools: [read]",
+      "      model_pool:",
+      "        candidates:",
+      "          - { model: $fast, tags: [cheap] }",
+      "          - { model: m2, tags: [strong] }",
+      "tools: [read]",
+    ].join("\n"),
+    /^agent\.sub_agents\.helper\.model_pool\.candidates\[0\]\.model → models\.fast\.tools/,
+    (j) => j.includes('"profile":"fast","tools":[]'),
   ],
   [
     "evaluation.on_fail: escalate",

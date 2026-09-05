@@ -1073,14 +1073,14 @@ describe("in-loop evaluation (§6.2 / §7.3)", () => {
       opts,
     );
     expect(legacy.warnings).toEqual([]);
-    // Opted in (a `models:` registry): the same self-judge is a warning …
+    // Opted in (a `models:` registry): an EXPLICIT self-judge is a warning …
     const optedIn = compile(
       cli(
         "models:",
         "  x: { model: claude-haiku-4-5 }",
         ...base,
         "evaluation:",
-        "  grader: { type: llm_judge, criteria: helpful, repeats: 3, target: output }",
+        "  grader: { type: llm_judge, criteria: helpful, model: claude-haiku-4-5, repeats: 3, target: output }",
       ),
       opts,
     );
@@ -1095,7 +1095,7 @@ describe("in-loop evaluation (§6.2 / §7.3)", () => {
           "  x: { model: claude-haiku-4-5 }",
           ...base,
           "evaluation:",
-          "  grader: { type: llm_judge, criteria: helpful }",
+          "  grader: { type: llm_judge, criteria: helpful, model: claude-haiku-4-5 }",
           "  allow_self_judge: true",
         ),
       ),
@@ -1123,6 +1123,135 @@ describe("in-loop evaluation (§6.2 / §7.3)", () => {
       repeats: 3,
     });
     expect("allowSelfJudge" in (lowered.evaluation ?? {})).toBe(false);
+  });
+
+  test("the judge default flips to `strongest` ONLY on an opted-in spec (§6.2 / §14); the 0.5.x default is unchanged", () => {
+    const pooled = [
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: i",
+      "  model_pool:",
+      "    candidates:",
+      "      - { model: claude-haiku-4-5, tags: [cheap] }",
+      "      - { model: claude-opus-4-8, tags: [strong] }",
+    ];
+    const grader = ["evaluation:", "  grader: { type: llm_judge, criteria: helpful }"];
+    // 0.5.x-shaped: no judge model on the IR — the emitters keep defaulting
+    // to `agent.model`, so the bundle is byte-identical.
+    const legacy = lowerWithWarnings(parseSpec(cli(...pooled, ...grader)), opts);
+    if (legacy.ir.target !== "cli") throw new Error("unexpected target");
+    expect(legacy.ir.evaluation?.grader).toEqual({ type: "llm_judge", criteria: "helpful" });
+    expect(legacy.warnings).toEqual([]);
+    // Opted in via a `models:` registry: the default is the strongest ROSTER
+    // member — the strong-tagged profile, carrying its provenance.
+    const viaRegistry = lowerWithWarnings(
+      parseSpec(
+        cli(
+          "models:",
+          "  strong: { model: claude-opus-4-8, tags: [strong] }",
+          "agent:",
+          "  model: claude-haiku-4-5",
+          "  instructions: i",
+          ...grader,
+        ),
+      ),
+      opts,
+    );
+    if (viaRegistry.ir.target !== "cli") throw new Error("unexpected target");
+    expect(viaRegistry.ir.evaluation?.grader).toEqual({
+      type: "llm_judge",
+      criteria: "helpful",
+      model: "claude-opus-4-8",
+      modelProfile: "strong",
+    });
+    // Opted in via a pool `strategy`: the strong-tagged candidate. The
+    // compiler-chosen default is never reported as a self-judge, even though
+    // it is also a serving arm of the pool.
+    const viaStrategy = lowerWithWarnings(
+      parseSpec(
+        cli(
+          ...pooled,
+          "    strategy:",
+          "      cascade: { draft: cheap, escalate_to: strong }",
+          ...grader,
+        ),
+      ),
+      opts,
+    );
+    if (viaStrategy.ir.target !== "cli") throw new Error("unexpected target");
+    expect(viaStrategy.ir.evaluation?.grader).toMatchObject({ model: "claude-opus-4-8" });
+    expect(codes(viaStrategy.warnings)).not.toContain("model-plan-self-judge");
+    // The flip reaches the emitted bundle through the IR (interpreter parity).
+    const agentTs =
+      compile(
+        cli(
+          "models:",
+          "  strong: { model: claude-opus-4-8, tags: [strong] }",
+          "agent:",
+          "  model: claude-haiku-4-5",
+          "  instructions: i",
+          ...grader,
+        ),
+        opts,
+      ).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('"claude-opus-4-8"');
+  });
+
+  test("a workflow / graph judge step without `model` defaults to `strongest` on an opted-in spec, and to the top-level model otherwise", () => {
+    const steps = [
+      "steps:",
+      "  - { name: draft, instructions: write it }",
+      "  - { name: gate, kind: judge, judge: { criteria: c } }",
+    ];
+    const legacy = lower(
+      parseSpec(["name: w", "target: workflow", "model: m", ...steps].join("\n")),
+      opts,
+    );
+    if (legacy.target !== "workflow") throw new Error("unexpected target");
+    expect(legacy.steps[1]?.model).toBe("m");
+    expect(legacy.steps[1]?.judge?.modelProfile).toBeUndefined();
+
+    const optedIn = lowerWithWarnings(
+      parseSpec(
+        [
+          "name: w",
+          "target: workflow",
+          "models:",
+          "  strong: { model: claude-opus-4-8, tags: [strong] }",
+          "model: claude-haiku-4-5",
+          ...steps,
+        ].join("\n"),
+      ),
+      opts,
+    );
+    if (optedIn.ir.target !== "workflow") throw new Error("unexpected target");
+    expect(optedIn.ir.steps[1]?.model).toBe("claude-opus-4-8");
+    expect(optedIn.ir.steps[1]?.judge?.modelProfile).toBe("strong");
+    expect(codes(optedIn.warnings)).not.toContain("model-plan-self-judge");
+
+    const graph = lower(
+      parseSpec(
+        [
+          "name: g",
+          "target: graph",
+          "models:",
+          "  strong: { model: claude-opus-4-8, tags: [strong] }",
+          "model: claude-haiku-4-5",
+          "entry: a",
+          "nodes:",
+          "  a: { instructions: x }",
+          "  gate: { kind: judge, judge: { criteria: c } }",
+          "edges:",
+          "  - { from: a, to: gate }",
+        ].join("\n"),
+      ),
+      opts,
+    );
+    if (graph.target !== "graph") throw new Error("unexpected target");
+    expect(graph.nodes.find((n) => n.name === "gate")).toMatchObject({
+      model: "claude-opus-4-8",
+      judge: { modelProfile: "strong" },
+    });
   });
 });
 

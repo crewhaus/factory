@@ -1322,6 +1322,12 @@ type LowerContext = {
   readonly target: Spec["target"];
   readonly registry: IrModelProfiles;
   readonly hasRegistry: boolean;
+  /**
+   * 0.6.0 §6.2 / §14 — TRUE when the spec opted into the hybrid surface (a
+   * `models:` registry or a pool `strategy`); gates the judge-default flip
+   * and the judge-independence lint.
+   */
+  readonly optedIn: boolean;
   /** The primary grammar string (never a `$ref`, never a sentinel) — `undefined` on a spec without one. */
   readonly primary: string | undefined;
   readonly roster: readonly RosterMember[];
@@ -1787,6 +1793,7 @@ function createLowerContext(spec: Spec, opts: LowerOptions): LowerContext {
     target: spec.target,
     registry: {},
     hasRegistry,
+    optedIn: hasRegistry || specDeclaresStrategy(spec),
     primary,
     roster: [],
     today: opts.today ?? todayIso(),
@@ -2092,6 +2099,27 @@ function resolveAuxSlot(value: string, ctx: LowerContext, slotLabel: string): Si
   return r;
 }
 
+/**
+ * 0.6.0 §6.2 — the GATED judge-default flip. On a spec that opted into the
+ * hybrid surface (a `models:` registry or a pool `strategy`), an in-loop
+ * judge or judge gate that names no model defaults to `strongest`
+ * (roster-first, so it lands on the strong profile or candidate) instead of
+ * the serving model; a 0.5.x-shaped spec keeps the serving-model default
+ * (the emitters' `grader.model ?? agent.model`), so its bundle stays
+ * byte-identical (§14). Implemented here rather than in the three
+ * `renderEvaluation` copies so the interpreter reads the same IR. Returns
+ * `undefined` when the spec did not opt in, or when `strongest` has nothing
+ * to rank against (an empty registry beside a non-table primary) — the
+ * serving-model default then stands.
+ */
+function defaultJudgeSlot(ctx: LowerContext, slotLabel: string): SingleSlotResult | undefined {
+  if (!ctx.optedIn) return undefined;
+  if (resolveStrongestForSlot(ctx.primary ?? "", { roster: ctx.roster }) === undefined) {
+    return undefined;
+  }
+  return resolveAuxSlot(STRONGEST_SENTINEL, ctx, slotLabel);
+}
+
 /** Resolve a model-only slot (tier / fallback / strategy model): the model string plus provenance. */
 function resolveModelOnly(
   value: string,
@@ -2170,6 +2198,27 @@ function lowerPoolCandidate(
     ...(c.enabled === false ? { enabled: false as const } : {}),
   };
   validateModelMember(candidate, ctx, cpath, "candidate");
+  // The residual guard (deviation 1) acts on the MERGED candidate: a
+  // `$profile` candidate inherits the profile's narrowing knobs, and the
+  // runtime reads only `model` / `tags` / `enabled` off the pool blob until
+  // PR 9a, so an inherited `tools: []` would serve with the shape's full
+  // toolset. Inline keys were already refused by `assertCandidatesLowerable`.
+  if (!ctx.allowPending) {
+    for (const [field, value] of [
+      ["tools", candidate.tools],
+      ["tool_config", candidate.toolConfigs],
+      ["permissions", candidate.permissions],
+      ["rate_limits", candidate.rateLimits],
+      ["cost", candidate.costCapUsdMicros],
+    ] as const) {
+      if (value === undefined) continue;
+      throw runtimePending(
+        `${cpath}.model → models.${ref.profile ?? "?"}.${field}`,
+        LANDING_PLAN_TABLE,
+        "a candidate inheriting a profile declared narrower than the shape would serve with the shape's full toolset and permissions until the dispatch gate lands — declare the narrowing on the shape for now",
+      );
+    }
+  }
   // Every 0.6.0 per-candidate setting is carried for the plan table; until it
   // lands the candidate serves on the run's settings.
   for (const [irKey, specKey, landing] of [
@@ -2872,7 +2921,7 @@ function lowerEvaluation(
     const slot =
       e.grader.model !== undefined
         ? resolveAuxSlot(e.grader.model, ctx, "evaluation.grader.model")
-        : undefined;
+        : defaultJudgeSlot(ctx, "evaluation.grader.model");
     grader = {
       type: "llm_judge",
       criteria: e.grader.criteria,
@@ -4110,8 +4159,11 @@ function registryField(ctx: LowerContext): { models?: IrModelProfiles } {
 /**
  * 0.6.0 §4.3 — the judge-independence lint: on a spec that opted into the
  * 0.6.0 surface (a `models:` registry or a pool `strategy`), warn when an
- * in-loop judge is the SAME model as an arm it grades (the serving agent, a
- * pool candidate, or — for a `kind: judge` step/node — the gated block's).
+ * EXPLICITLY declared judge model (or panel member) is the SAME model as an
+ * arm it grades (the serving agent, a pool candidate, or — for a `kind:
+ * judge` step/node — the gated block's). The compiler-chosen default
+ * (`strongest`, see {@link defaultJudgeSlot}) is never reported — a warning
+ * about a default the compiler itself picked would be unactionable.
  * `evaluation.allow_self_judge: true` silences it. A 0.5.x-shaped
  * self-judging pooled spec stays warning-free, so nothing that compiled
  * quietly before compiles noisily now.
@@ -4125,8 +4177,11 @@ function specDeclaresStrategy(value: unknown): boolean {
 }
 
 function noteSelfJudge(spec: Spec, ir: IrNode, ctx: LowerContext): void {
-  const optedIn = ctx.hasRegistry || specDeclaresStrategy(spec);
-  if (!optedIn) return;
+  if (!ctx.optedIn) return;
+  const s = spec as unknown as LooseBlock;
+  /** TRUE when the spec itself names the judge model at `block.judge.model` / `grader.model`. */
+  const declaredJudge = (block: unknown, key: "judge" | "grader"): boolean =>
+    asLooseBlock(asLooseBlock(block)?.[key])?.["model"] !== undefined;
   const arms = (block: {
     readonly model: string;
     readonly modelPool?: IrModelPool;
@@ -4151,7 +4206,10 @@ function noteSelfJudge(spec: Spec, ir: IrNode, ctx: LowerContext): void {
     const ev = ir.evaluation;
     if (ev === undefined || ev.grader.type !== "llm_judge" || ev.allowSelfJudge === true) return;
     const serving = arms(ir.agent);
-    const judges = [ev.grader.model ?? ir.agent.model, ...(ev.grader.judges ?? [])];
+    const explicit = declaredJudge(s["evaluation"], "grader")
+      ? [ev.grader.model ?? ir.agent.model]
+      : [];
+    const judges = [...explicit, ...(ev.grader.judges ?? [])];
     for (const judgeModel of judges) {
       if (serving.has(judgeModel)) {
         report("evaluation.grader.model", judgeModel, "a serving arm of agent.model / model_pool");
@@ -4166,7 +4224,9 @@ function noteSelfJudge(spec: Spec, ir: IrNode, ctx: LowerContext): void {
       const gated = ir.steps[i - 1];
       if (gated === undefined || gated.kind === "judge") return;
       const serving = arms(gated);
-      for (const judgeModel of [step.model, ...(step.judge?.judges ?? [])]) {
+      const specSteps = Array.isArray(s["steps"]) ? s["steps"] : [];
+      const explicit = declaredJudge(specSteps[i], "judge") ? [step.model] : [];
+      for (const judgeModel of [...explicit, ...(step.judge?.judges ?? [])]) {
         if (serving.has(judgeModel)) {
           report(
             `steps[${i}].judge.model`,
@@ -4187,7 +4247,10 @@ function noteSelfJudge(spec: Spec, ir: IrNode, ctx: LowerContext): void {
       for (const gated of upstream) {
         if (gated === undefined || gated.kind === "judge") continue;
         const serving = arms(gated);
-        for (const judgeModel of [node.model, ...(node.judge?.judges ?? [])]) {
+        const explicit = declaredJudge(asLooseBlock(s["nodes"])?.[node.name], "judge")
+          ? [node.model]
+          : [];
+        for (const judgeModel of [...explicit, ...(node.judge?.judges ?? [])]) {
           if (serving.has(judgeModel)) {
             report(
               `nodes.${node.name}.judge.model`,
@@ -4336,7 +4399,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
             const judgeSlot =
               s.judge.model !== undefined
                 ? resolveAuxSlot(s.judge.model, ctx, `steps[${i}].judge.model`)
-                : undefined;
+                : defaultJudgeSlot(ctx, `steps[${i}].judge.model`);
             return {
               name: s.name,
               kind: "judge" as const,
@@ -4500,7 +4563,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
             const judgeSlot =
               node.judge.model !== undefined
                 ? resolveAuxSlot(node.judge.model, ctx, `nodes.${name}.judge.model`)
-                : undefined;
+                : defaultJudgeSlot(ctx, `nodes.${name}.judge.model`);
             return {
               name,
               kind: "judge" as const,

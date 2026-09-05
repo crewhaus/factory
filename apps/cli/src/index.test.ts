@@ -602,6 +602,43 @@ describe("crewhaus compile", () => {
     expect(existsSync(join(outDir, "session-router.ts"))).toBe(true);
   });
 
+  // 0.6.0 PR 7 — the model-plan notices that no spec edit can properly clear
+  // are informational too: model-plan-pending-runtime fires on a key the plan
+  // tells authors to adopt (its runtime lands in a later PR-train row), and
+  // model-sunset is a wall-clock notice on a 0.5.x pool that compiled under
+  // --strict yesterday. Both print; neither fails --strict.
+  test("compile --strict does NOT escalate the informational model-plan-pending-runtime / model-sunset notices", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      [
+        "name: pooled",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: route it",
+        "  model_pool:",
+        "    candidates:",
+        "      - { model: claude-haiku-4-5, tags: [cheap], max_tokens: 2048 }",
+        "      - { model: claude-opus-4-1, tags: [strong] }",
+        "",
+      ].join("\n"),
+    );
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--strict", "--no-register", "-o", outDir], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain(
+      "crewhaus: warning[model-plan-pending-runtime] agent.model_pool.candidates[0].max_tokens:",
+    );
+    expect(result.stderr).toContain(
+      "crewhaus: warning[model-sunset] agent.model_pool.candidates[1]",
+    );
+    expect(result.stderr).not.toContain("escalated to errors");
+    expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
+  });
+
   // Item 1 — the cli emitter used to DROP the spec's `feedback:` block, so a
   // compiled bundle had no rating prompt and no user_feedback capture at all
   // while `crewhaus run` had both. The bundle now threads the block into

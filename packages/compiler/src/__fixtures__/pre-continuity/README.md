@@ -256,10 +256,24 @@ target-graph renders a node's `modelFallbacks` / `circuitBreaker` /
 step), and target-crew's llm router reads `routing.model ?? entryRole.model`.
 Both are emitted ONLY when the spec declares the corresponding key — none of the
 pinned specs declares `models:`, a pool, node routing or `routing: { kind: llm,
-model }` — so every pin passes unchanged. The pool blob's key order is the byte
-contract for specs that DO declare a pool: `model` then `tags` are inserted
+model }` — so every pin here passes unchanged. The pool blob's key order is the
+byte contract for specs that DO declare a pool: `model` then `tags` are inserted
 first and every 0.6.0 key spreads after them (pinned by the key-order guard in
-`models-lowering.test.ts`). The generated README (`readme: true`, not pinned
-here) now lists every model a run can route to (candidates, tiers, fallbacks,
-aux slots) and a "Model profiles" section when a registry is declared. The
-continuity opt-out contract is untouched.
+`models-lowering.test.ts`). The continuity opt-out contract is untouched.
+
+**0.6.0 PR 7 — ONE sanctioned delta outside these pins: the generated
+`README.md`.** These pins cover the code files only (`readme: false`), so they
+did not see it: `collectModels` now lists every model a run can route to
+(pool candidates and their fallbacks, tiers, `model_fallbacks`, the judge /
+compaction / degrade / security / watchme slots, judge panels) and renders a
+"Model profiles" section when a registry is declared. That changes `README.md`
+— and ONLY `README.md`; `agent.ts` and every other file are byte-identical —
+for every 0.5.x spec that declares a pool, tiers, a failover chain or an
+auxiliary model (64 of the 252 demos-corpus bundles when the PR was measured).
+Plan §4.3 sanctions closing this gap. The new README output is pinned under
+`__fixtures__/model-readme/` (`model-readme-pin.test.ts`) so the next change is
+caught. The other gated change of this PR, the §6.2 judge-default flip (an
+in-loop judge or judge gate without a `model` defaults to `strongest`), fires
+ONLY on a spec that declares `models:` or a pool `strategy`, which no 0.5.x spec
+can — the emitters' `grader.model ?? agent.model` default is unchanged for
+everything else.

@@ -1,0 +1,10 @@
+name: pooled-readme-pin
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: Answer briefly.
+  model_pool:
+    candidates:
+      - { model: claude-haiku-4-5, tags: [cheap] }
+      - { model: claude-opus-4-8, tags: [strong] }
+tools: [read]
