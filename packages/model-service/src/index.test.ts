@@ -11,13 +11,18 @@
  *       returns — the bundle and the interpreter are one code path;
  *   (e) one NEW key per level (profile → candidate → pool) is observable on
  *       the option object handed to `runChatLoop`, so a later PR cannot
- *       silently drop a key between the IR and the loop.
+ *       silently drop a key between the IR and the loop;
+ *   (f) the option object is assignable to runtime-core's `RunChatLoopOptions`
+ *       (the `@crewhaus/memory-service` test pin — runtime-core is a
+ *       devDependency here, never imported from `src/`).
  */
 import { describe, expect, test } from "bun:test";
 import type { IrModelPool } from "@crewhaus/ir";
+import type { RunChatLoopOptions } from "@crewhaus/runtime-core";
 import {
   MODEL_WIRING_KEYS,
   type ModelWiringFragment,
+  type ModelWiringRunOptions,
   modelWiringFragmentFromIr,
   renderModelWiringFields,
   wireModels,
@@ -261,5 +266,27 @@ describe("one new IR key per level is observable at the runtime consumer (plan �
     // The key-order byte contract: `model` then `tags` first, 0.6.0 keys after.
     expect(rendered).toContain('{"model":"claude-haiku-4-5","tags":["cheap"],"profile":"fast"');
     expect(parseFields(rendered, "  ")).toEqual({ modelPool: NEW_KEYS_POOL });
+  });
+});
+
+describe("runtime-core assignability pin", () => {
+  test("wireModels(...) spreads into RunChatLoopOptions under runtime-core's own option names", () => {
+    const wired = wireModels(
+      { modelFallbacks: FALLBACKS, circuitBreaker: BREAKER, modelTiers: TIERS, modelPool: POOL },
+      {},
+    );
+    // The load-bearing assertions are the ASSIGNMENTS typechecking: the
+    // structural mirror this package exports must stay assignable to
+    // runtime-core's option types, and every key it names must be a
+    // `runChatLoop` option (the `Pick` constraint). `tsc -b` excludes test
+    // files, so the build-time twin of this pin is `ModelRoutingRunOptions`
+    // in the cli's `loop-contract.ts`, where runtime-core is a dependency.
+    const opts: RunChatLoopOptions = { model: "claude-sonnet-4-6", instructions: "pin", ...wired };
+    const picked: Pick<RunChatLoopOptions, keyof ModelWiringRunOptions> = wired;
+    const roundTrip: RunChatLoopOptions["modelPool"] = wired.modelPool;
+    expect(opts.modelPool).toBe(POOL);
+    expect(picked.modelTiers).toBe(TIERS);
+    expect(roundTrip).toBe(POOL);
+    expect(Object.keys(wired)).toEqual([...MODEL_WIRING_KEYS]);
   });
 });

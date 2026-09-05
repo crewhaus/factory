@@ -139,11 +139,21 @@ export function loopContractRunOptions(ir: LoopContractIrSlice): LoopContractRun
  * wraps whichever primary serves); anything else (absent, a bare flag) is
  * not an override. Spread-return-`{}` like every helper here: a spec with no
  * routing spreads NOTHING.
+ *
+ * The return type is the `LoopContractRunOptions` discipline applied to the
+ * routing seam: `Pick<RunChatLoopOptions, keyof ModelWiringRunOptions>`.
+ * model-service mirrors the four options structurally (it does not depend
+ * on runtime-core — a `Pick` there would be a publish-only break for tarball
+ * consumers), so THIS is the `tsc -b`-checked pin that every `wireModels`
+ * key is a `runChatLoop` option with an assignable value type: a rename or
+ * reshaping in runtime-core fails the build here.
  */
+export type ModelRoutingRunOptions = Pick<RunChatLoopOptions, keyof ModelWiringRunOptions>;
+
 export function modelRoutingRunOptions(
   agent: ModelWiringFragment,
   modelOverride: unknown,
-): ModelWiringRunOptions {
+): ModelRoutingRunOptions {
   return wireModels(
     modelWiringFragmentFromIr(agent),
     typeof modelOverride === "string" ? { modelOverride } : {},

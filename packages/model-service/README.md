@@ -76,11 +76,26 @@ catalog join the deps as the root starts constructing them.
 
 ### The output
 
-A `Pick<RunChatLoopOptions, "modelFallbacks" | "circuitBreaker" | "modelTiers"
-| "modelPool">` — runtime-core's own option names, so a rename there fails the
-build here. Spread-return-`{}`: an empty fragment yields `{}`, values are
-carried by reference, keys come out in the order every emitter has always
-written them (`MODEL_WIRING_KEYS`).
+```ts
+type ModelWiringRunOptions = {
+  modelFallbacks?: readonly string[];
+  circuitBreaker?: IrCircuitBreaker;
+  modelTiers?: IrModelTiers;
+  modelPool?: IrModelPool;
+};
+```
+
+The `runChatLoop` options fragment under runtime-core's own option names,
+mirrored structurally from the IR types. This package does **not** depend on
+`@crewhaus/runtime-core` (only its tests do), so it cannot `Pick` off
+`RunChatLoopOptions` without breaking every consumer of the published tarball;
+instead the cli's `modelRoutingRunOptions` returns
+`Pick<RunChatLoopOptions, keyof ModelWiringRunOptions>`, where runtime-core is
+a declared dependency and `tsc -b` checks it — a rename or reshaping in
+runtime-core fails the build there, and the package's own tests carry the same
+assignability pin `@crewhaus/memory-service`'s do. Spread-return-`{}`: an empty
+fragment yields `{}`, values are carried by reference, keys come out in the
+order every emitter has always written them (`MODEL_WIRING_KEYS`).
 
 ## `renderModelWiringFields(fragment, indent)` — the codegen twin
 

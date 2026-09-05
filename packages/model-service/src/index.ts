@@ -28,7 +28,6 @@
  */
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import type { IrCircuitBreaker, IrModelPool, IrModelTiers } from "@crewhaus/ir";
-import type { RunChatLoopOptions } from "@crewhaus/runtime-core";
 
 // ---------------------------------------------------------------------------
 // The fragment — the serializable slice of a lowered agent / step / role /
@@ -63,16 +62,27 @@ export type ModelWiringFragment = {
 };
 
 /**
- * The `runChatLoop(...)` options fragment `wireModels` returns — a `Pick`
- * over runtime-core's own option names, so a rename there fails the build
- * here (the `LoopContractRunOptions` discipline in `apps/cli`). Later PRs
- * widen this pick (`_poolAdapters`, `_scoreboard`, …) as the root starts
- * constructing them.
+ * The `runChatLoop(...)` options fragment `wireModels` returns — the four
+ * routing options under runtime-core's own option names, mirrored
+ * STRUCTURALLY from the IR types rather than `Pick`ed off
+ * `RunChatLoopOptions`. This package publishes `src/` as its types and does
+ * not depend on `@crewhaus/runtime-core` (only its tests do), so a type
+ * import here would resolve in the workspace and fail (TS2307) for every
+ * consumer of the published tarball — the 0.5.5 publish-only break class.
+ * Assignability to `Pick<RunChatLoopOptions, keyof ModelWiringRunOptions>`
+ * is pinned where runtime-core IS a declared dependency and `tsc -b` checks
+ * it: `apps/cli/src/loop-contract.ts`'s `modelRoutingRunOptions` returns
+ * that `Pick`, so a rename in runtime-core still fails the build (the
+ * `LoopContractRunOptions` discipline); `index.test.ts` carries the same
+ * pin the `@crewhaus/memory-service` tests do. Later PRs widen this type
+ * (`_poolAdapters`, `_scoreboard`, …) as the root starts constructing them.
  */
-export type ModelWiringRunOptions = Pick<
-  RunChatLoopOptions,
-  "modelFallbacks" | "circuitBreaker" | "modelTiers" | "modelPool"
->;
+export type ModelWiringRunOptions = {
+  readonly modelFallbacks?: readonly string[];
+  readonly circuitBreaker?: IrCircuitBreaker;
+  readonly modelTiers?: IrModelTiers;
+  readonly modelPool?: IrModelPool;
+};
 
 /**
  * The runtime dependencies `wireModels` composes over. PR 8a needs only the
