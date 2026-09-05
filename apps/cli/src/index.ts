@@ -14572,7 +14572,7 @@ async function runSessions(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus sessions summarize [--before <date>] [--evicted] [--ttl-days N]\n" +
         "       crewhaus sessions export --format trajectories [--out <file.jsonl>]\n" +
-        "       crewhaus sessions tail [<session>] [--dir <root>] [--no-follow] [--interval <ms>]\n" +
+        "       crewhaus sessions tail [<session>] [--dir <root>] [--no-follow] [--interval <ms>] [--transcript-only]\n" +
         "  summarize: fold sessions (outcome, tools, ratings, key facts) into the durable\n" +
         "  .crewhaus/sessions-index/ before their transcripts expire (30-day TTL).\n" +
         "  --evicted runs a TTL eviction pass and indexes each session just before it is deleted.\n" +
@@ -14580,9 +14580,12 @@ async function runSessions(args: ParsedArgs): Promise<void> {
         "  tail: follow a session's transcript live (a `tail -f` for a running agent —\n" +
         "  the per-turn view `crewhaus dev` points at). With no <session>, tails the\n" +
         "  most-recently-updated one under .crewhaus/sessions. Each user/assistant turn,\n" +
-        "  tool call + result, and failure prints one line as it lands. --no-follow dumps\n" +
-        "  the current transcript and exits (scriptable/CI); --interval sets the poll ms\n" +
-        "  (default 500). --dir points at a session store other than cwd/.crewhaus/sessions.\n" +
+        "  tool call + result, and failure prints one line as it lands, and so does each\n" +
+        "  routing decision (⇢), cost accrual ($), judge verdict (⚖) and hybrid-strategy\n" +
+        "  stage (◇) the session recorded — the shape of a hybrid turn beside its text.\n" +
+        "  --transcript-only hides those. --no-follow dumps the current transcript and\n" +
+        "  exits (scriptable/CI); --interval sets the poll ms (default 500). --dir points\n" +
+        "  at a session store other than cwd/.crewhaus/sessions.\n" +
         "\n" +
         "  export --format trajectories: one JSONL line per agent step — a\n" +
         "  (state, action, observation, reward) tuple — assembled from every session\n" +
@@ -14595,8 +14598,11 @@ async function runSessions(args: ParsedArgs): Promise<void> {
         "  every step except the session's last, which carries: the last eval_graded\n" +
         "  score when the session has one, else the latest user rating normalized to\n" +
         "  [0,1] (thumbs up→1/down→0, stars (n-1)/4 — the distill convention), else\n" +
-        "  null. rewardSource says which rung fired. --out writes the JSONL to a file;\n" +
-        "  omitted, it streams to stdout (the summary line then goes to stderr).\n" +
+        "  null. rewardSource says which rung fired. Each step also carries model (and\n" +
+        "  profile, when a models: profile served) — the wire model that produced the\n" +
+        "  action, from the session's model_meta lines — so a hybrid session's cheap\n" +
+        "  drafts and strong re-runs are distinguishable. --out writes the JSONL to a\n" +
+        "  file; omitted, it streams to stdout (the summary line then goes to stderr).\n" +
         "\n" +
         "  G53 posture — trajectory RL is EXPERIMENTAL: inference-time scaffolding\n" +
         "  (eval → optimize → flywheel) is the mature improvement lane, and published\n" +
@@ -14768,13 +14774,16 @@ async function runSessionsTail(args: ParsedArgs): Promise<void> {
     if (intervalFlag < 50) die("--interval must be >= 50 (ms)");
     intervalMs = intervalFlag;
   }
+  // 0.6.0 (design §8.2) — route / cost / eval / stage lines render by default;
+  // --transcript-only restores the conversational-only view.
+  const tailOpts = { transcriptOnly: args.flags["transcript-only"] === true } as const;
 
   // Initial dump (also seeds the follow cursor so live updates don't re-print
   // the backlog). `advanceSessionTail` counts source lines, so it stays correct
   // even across the side-channel events that render to nothing.
   let cursor: SessionTailCursor = { lineCount: 0 };
   {
-    const initial = advanceSessionTail(readLog(), cursor);
+    const initial = advanceSessionTail(readLog(), cursor, tailOpts);
     for (const line of initial.lines) process.stdout.write(`${line}\n`);
     cursor = initial.cursor;
   }
@@ -14791,7 +14800,7 @@ async function runSessionsTail(args: ParsedArgs): Promise<void> {
     let stopped = false;
     const tick = (): void => {
       if (stopped) return;
-      const advanced = advanceSessionTail(readLog(), cursor);
+      const advanced = advanceSessionTail(readLog(), cursor, tailOpts);
       for (const line of advanced.lines) process.stdout.write(`${line}\n`);
       cursor = advanced.cursor;
     };

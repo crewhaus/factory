@@ -65,10 +65,37 @@ export class EventToMetrics {
         // events it sums over. `unpriced` accruals carry a real token tally
         // but `costUsdMicros: 0`, so incrementing is a harmless no-op.
         if (ev.summary) return;
+        // 0.6.0 (design §8.4) — labeled by the call's role too (absent ⇒
+        // primary), so judge / shadow / compaction spend is separable.
         this.registry.costUsdMicrosTotal.inc(
-          { provider: ev.provider, model: ev.modelId },
+          { provider: ev.provider, model: ev.modelId, role: ev.role ?? "primary" },
           ev.costUsdMicros,
         );
+        return;
+      // 0.6.0 (design §8.4) — one increment per pool routing decision. The
+      // label set is fixed (`-` stands in for an absent scope/profile) so a
+      // Prometheus `sum by (profile)` never splits on label presence.
+      case "model_route":
+        this.registry.modelRouteTotal.inc({
+          scope: ev.scope ?? "-",
+          routeKey: ev.routeKey,
+          profile: ev.profile ?? "-",
+          policy: ev.policy,
+          explored: ev.explored === true ? "true" : "false",
+        });
+        return;
+      // 0.6.0 (design §8.4) — escalations. A hybrid-strategy escalation stage
+      // counts once, when it STARTS (its `done`/`failed` twin is the same
+      // escalation); a fast-tier misroute recovery counts on its route.
+      case "model_stage":
+        if (ev.role === "escalation" && ev.outcome === "started") {
+          this.registry.modelEscalationsTotal.inc({ source: "stage", strategy: ev.strategy });
+        }
+        return;
+      case "model_tier_route":
+        if (ev.escalated === true) {
+          this.registry.modelEscalationsTotal.inc({ source: "tier", strategy: "tiers" });
+        }
         return;
       // NEW-E-2 — in-loop quality. The `evaluation:` block emits one
       // `eval_graded` per grading pass (retries included) on cli / channel /

@@ -29,10 +29,12 @@ import type {
   JudgeVerdictEvent,
   McpCallEndEvent,
   McpCallStartEvent,
+  ModelDirectiveEvent,
   ModelFailoverEvent,
   ModelRequestEvent,
   ModelResponseEvent,
   ModelRouteEvent,
+  ModelStageEvent,
   ModelStreamTokenEvent,
   ModelTierRouteEvent,
   PermissionDecisionEvent,
@@ -101,6 +103,11 @@ export const ATTR = {
   GEN_AI_USAGE_CACHE_READ_TOKENS: "gen_ai.usage.cache_read_input_tokens",
   GEN_AI_USAGE_CACHE_CREATE_TOKENS: "gen_ai.usage.cache_creation_input_tokens",
   GEN_AI_RESPONSE_FINISH_REASON: "gen_ai.response.finish_reason",
+  // 0.6.0 (design §8.4) — the model that actually SERVED the call. Differs
+  // from `gen_ai.request.model` when a failover chain rewrote the model
+  // mid-call or a pool served a candidate other than the declared primary;
+  // OTel's GenAI conventions define both keys for exactly this reason.
+  GEN_AI_RESPONSE_MODEL: "gen_ai.response.model",
   GEN_AI_REQUEST_STREAMING: "gen_ai.request.streaming",
   CODE_FUNCTION: "code.function",
   MCP_SERVER_NAME: "mcp.server.name",
@@ -182,6 +189,30 @@ export const ATTR = {
   CREWHAUS_MODEL_PROFILE: "crewhaus.model.profile",
   CREWHAUS_MODEL_STAGE: "crewhaus.model.stage",
   CREWHAUS_MODEL_PARAMS_FINGERPRINT: "crewhaus.model.params_fingerprint",
+  // 0.6.0 (design §8.4) — the `model_stage` / `model_directive` kinds and the
+  // additive `model_route` attribution (§8.1). `crewhaus.model.strategy` is
+  // the `model_pool.strategy` member owning a stage or a route; the rest are
+  // the stage lifecycle and the routing lanes.
+  CREWHAUS_MODEL_STRATEGY: "crewhaus.model.strategy",
+  CREWHAUS_MODEL_STAGE_OUTCOME: "crewhaus.model.stage_outcome",
+  CREWHAUS_MODEL_STAGE_CAUSE: "crewhaus.model.stage_cause",
+  CREWHAUS_MODEL_DIRECTIVE_SOURCE: "crewhaus.model.directive_source",
+  CREWHAUS_MODEL_DIRECTIVE_REQUESTED: "crewhaus.model.directive_requested",
+  CREWHAUS_MODEL_DIRECTIVE_RESOLVED: "crewhaus.model.directive_resolved",
+  CREWHAUS_MODEL_DIRECTIVE_ACCEPTED: "crewhaus.model.directive_accepted",
+  CREWHAUS_MODEL_DIRECTIVE_REASON: "crewhaus.model.directive_reason",
+  CREWHAUS_ROUTE_SCOPE: "crewhaus.route.scope",
+  CREWHAUS_ROUTE_RULE_ID: "crewhaus.route.rule_id",
+  CREWHAUS_ROUTE_HINT_SOURCE: "crewhaus.route.hint_source",
+  CREWHAUS_ROUTE_ELIGIBLE: "crewhaus.route.eligible",
+  CREWHAUS_ROUTE_TOOLSET_FINGERPRINT: "crewhaus.route.toolset_fingerprint",
+  CREWHAUS_ROUTE_CLASSIFIER_LABEL: "crewhaus.route.classifier_label",
+  // 0.6.0 (design §8.1) — judge attribution on `eval_graded` / `judge_verdict`.
+  CREWHAUS_JUDGE_MODEL: "crewhaus.judge.model",
+  CREWHAUS_JUDGE_PANEL: "crewhaus.judge.panel",
+  CREWHAUS_JUDGE_COST_USD_MICROS: "crewhaus.judge.cost_usd_micros",
+  CREWHAUS_EVAL_ESCALATED_TO: "crewhaus.eval.escalated_to",
+  CREWHAUS_EVAL_REASON: "crewhaus.eval.reason",
   // G58 — janitor.
   CREWHAUS_JANITOR_STEP: "crewhaus.janitor.step",
   CREWHAUS_JANITOR_STATUS: "crewhaus.janitor.status",
@@ -346,7 +377,13 @@ export function buildModelSpan(start: StartedModel, end: ModelResponseEvent): Ot
     ...envelopeAttrs(end),
     attrStr(ATTR.GEN_AI_SYSTEM, genAiSystem(end.provider ?? start.ev.provider)),
     attrStr(ATTR.GEN_AI_OPERATION_NAME, "chat"),
-    attrStr(ATTR.GEN_AI_REQUEST_MODEL, end.model),
+    // 0.6.0 (design §8.4) — request.model is what the loop ASKED for (the
+    // request's wire id); response.model is what SERVED. They agree on every
+    // plain call and diverge when a failover chain rewrote the model
+    // mid-call, which is the case a dashboard splitting spend by served model
+    // needs to see.
+    attrStr(ATTR.GEN_AI_REQUEST_MODEL, start.ev.model),
+    attrStr(ATTR.GEN_AI_RESPONSE_MODEL, end.model),
     attrInt(ATTR.GEN_AI_USAGE_INPUT_TOKENS, end.usage.input),
     attrInt(ATTR.GEN_AI_USAGE_OUTPUT_TOKENS, end.usage.output),
     attrStr(ATTR.GEN_AI_RESPONSE_FINISH_REASON, end.stopReason),
@@ -385,6 +422,39 @@ export function buildModelSpan(start: StartedModel, end: ModelResponseEvent): Ot
     events: start.streamEvents.length > 0 ? start.streamEvents : undefined,
     status: { code: STATUS_OK },
   };
+}
+
+/**
+ * 0.6.0 (design §8.4) — cost on the model span. `cost_accrual` is published by
+ * cost-tracker under a FRESH envelope (its own spanId) synchronously inside
+ * the `model_response` dispatch, so it cannot be joined to the model span by
+ * spanId; the SpanTracker instead remembers each completed `gen_ai.chat` span
+ * until its accrual arrives and stamps the microdollar total onto it through
+ * this helper. The exporter buffers span OBJECTS until the batch flush, so a
+ * stamp that lands before the flush ships with the span. Mutates in place and
+ * is idempotent per span (a second accrual for the same span is refused).
+ */
+export function stampModelSpanCost(span: OtelSpan, accrual: CostAccrualEvent): boolean {
+  if (span.attributes.some((a) => a.key === ATTR.CREWHAUS_COST_USD_MICROS)) return false;
+  span.attributes.push(attrInt(ATTR.CREWHAUS_COST_USD_MICROS, accrual.costUsdMicros));
+  if (accrual.unpriced) span.attributes.push(attrBool(ATTR.CREWHAUS_COST_UNPRICED, true));
+  return true;
+}
+
+/**
+ * The join key a `cost_accrual` must match to be stamped onto a completed
+ * model span: same trace, same served wire model and the same role (an
+ * absent role is `primary` on both sides — cost-tracker copies the response's
+ * `role` verbatim, so the two agree by construction). Turn number is NOT part
+ * of the key: a side call re-published on the parent bus can carry a
+ * different `turnNumber` than the response it prices.
+ */
+export function modelCostJoinKey(ev: {
+  traceId: string;
+  model: string;
+  role?: string | undefined;
+}): string {
+  return `${ev.traceId}|${ev.model}|${ev.role ?? "primary"}`;
 }
 
 /**
@@ -700,6 +770,12 @@ export function buildCostAccrualSpan(ev: CostAccrualEvent): OtelSpan {
   }
   if (ev.unpriced) attrs.push(attrBool(ATTR.CREWHAUS_COST_UNPRICED, true));
   if (ev.tenantId !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_COST_TENANT_ID, ev.tenantId));
+  // 0.6.0 (design §8.1) — attribution copied verbatim from the response by
+  // cost-tracker; set only when present so an unattributed accrual is unchanged.
+  if (ev.specModel !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_SPEC, ev.specModel));
+  if (ev.role !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_ROLE, ev.role));
+  if (ev.profile !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_PROFILE, ev.profile));
+  if (ev.stage !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_STAGE, ev.stage));
   return pointSpan(ev, ev.summary ? "cost_accrual.summary" : "cost_accrual", attrs, {
     code: STATUS_OK,
   });
@@ -776,7 +852,73 @@ export function buildModelRouteSpan(ev: ModelRouteEvent): OtelSpan {
   if (ev.policyVersion !== undefined) {
     attrs.push(attrStr(ATTR.CREWHAUS_ROUTE_POLICY_VERSION, ev.policyVersion));
   }
+  // 0.6.0 (design §8.1) — the additive routing attribution, each set only
+  // when the decision carries it so a 0.5.x route span is byte-identical.
+  if (ev.specModel !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_SPEC, ev.specModel));
+  if (ev.profile !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_PROFILE, ev.profile));
+  if (ev.stage !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_STAGE, ev.stage));
+  if (ev.strategy !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_STRATEGY, ev.strategy));
+  if (ev.scope !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_ROUTE_SCOPE, ev.scope));
+  if (ev.ruleId !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_ROUTE_RULE_ID, ev.ruleId));
+  if (ev.hint !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_ROUTE_HINT_SOURCE, ev.hint.source));
+  if (ev.eligible !== undefined) {
+    attrs.push(attrStr(ATTR.CREWHAUS_ROUTE_ELIGIBLE, ev.eligible.join(",")));
+  }
+  if (ev.toolsetFingerprint !== undefined) {
+    attrs.push(attrStr(ATTR.CREWHAUS_ROUTE_TOOLSET_FINGERPRINT, ev.toolsetFingerprint));
+  }
+  if (ev.classifierVerdict !== undefined) {
+    attrs.push(attrStr(ATTR.CREWHAUS_ROUTE_CLASSIFIER_LABEL, ev.classifierVerdict.label));
+  }
   return pointSpan(ev, `model_route.${ev.routeKey}`, attrs, { code: STATUS_OK });
+}
+
+/**
+ * 0.6.0 (design §7.3–§7.8, §8.4) — one hybrid-strategy stage transition
+ * (`draft` → `verify` → `escalate`, a guide call, a shadow replay, a committee
+ * member) as a point-in-time span named `model_stage.<stage>`. ERROR status on
+ * a `failed` outcome so the shape of a turn is alertable, not just visible;
+ * `skipped` is a normal lifecycle verdict (e.g. `max_escalations` reached) and
+ * stays OK. The stage's own spend rides as `crewhaus.cost.usd_micros` when the
+ * publisher knew it.
+ */
+export function buildModelStageSpan(ev: ModelStageEvent): OtelSpan {
+  const attrs: Attribute[] = [
+    attrStr(ATTR.CREWHAUS_MODEL_STAGE, ev.stage),
+    attrStr(ATTR.CREWHAUS_MODEL_STRATEGY, ev.strategy),
+    attrStr(ATTR.CREWHAUS_MODEL_ROLE, ev.role),
+    attrStr(ATTR.GEN_AI_REQUEST_MODEL, ev.model),
+    attrStr(ATTR.CREWHAUS_MODEL_STAGE_OUTCOME, ev.outcome),
+  ];
+  if (ev.profile !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_PROFILE, ev.profile));
+  if (ev.cause !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_STAGE_CAUSE, ev.cause));
+  if (ev.costUsdMicros !== undefined) {
+    attrs.push(attrInt(ATTR.CREWHAUS_COST_USD_MICROS, ev.costUsdMicros));
+  }
+  const failed = ev.outcome === "failed";
+  return pointSpan(ev, `model_stage.${ev.stage}`, attrs, {
+    code: failed ? STATUS_ERROR : STATUS_OK,
+    ...(failed ? { message: ev.cause ?? `stage ${ev.stage} failed` } : {}),
+  });
+}
+
+/**
+ * 0.6.0 (design §7.2.1) — a `/model …` directive parsed at a typed input seam,
+ * as a point-in-time span. A refused directive (`accepted: false`) is a
+ * routing fact, not a failure, so the status stays OK and the refusal reason
+ * rides as an attribute.
+ */
+export function buildModelDirectiveSpan(ev: ModelDirectiveEvent): OtelSpan {
+  const attrs: Attribute[] = [
+    attrStr(ATTR.CREWHAUS_MODEL_DIRECTIVE_SOURCE, ev.source),
+    attrStr(ATTR.CREWHAUS_MODEL_DIRECTIVE_REQUESTED, ev.requested),
+    attrBool(ATTR.CREWHAUS_MODEL_DIRECTIVE_ACCEPTED, ev.accepted),
+  ];
+  if (ev.resolved !== undefined) {
+    attrs.push(attrStr(ATTR.CREWHAUS_MODEL_DIRECTIVE_RESOLVED, ev.resolved));
+  }
+  if (ev.reason !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_DIRECTIVE_REASON, ev.reason));
+  return pointSpan(ev, "model_directive", attrs, { code: STATUS_OK });
 }
 
 // ---------------------------------------------------------------------------
@@ -852,6 +994,18 @@ export function buildEvalGradedSpan(ev: EvalGradedEvent): OtelSpan {
   if (ev.maxRetries !== undefined) {
     attrs.push(attrInt(ATTR.CREWHAUS_EVAL_MAX_RETRIES, ev.maxRetries));
   }
+  // 0.6.0 (design §7.3, §8.1) — which arm was graded, which judge scored it,
+  // what the judge cost, and where a failing draft was escalated to.
+  if (ev.model !== undefined) attrs.push(attrStr(ATTR.GEN_AI_REQUEST_MODEL, ev.model));
+  if (ev.profile !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_MODEL_PROFILE, ev.profile));
+  if (ev.judgeModel !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_JUDGE_MODEL, ev.judgeModel));
+  if (ev.judgeCostUsdMicros !== undefined) {
+    attrs.push(attrInt(ATTR.CREWHAUS_JUDGE_COST_USD_MICROS, ev.judgeCostUsdMicros));
+  }
+  if (ev.escalatedTo !== undefined) {
+    attrs.push(attrStr(ATTR.CREWHAUS_EVAL_ESCALATED_TO, ev.escalatedTo));
+  }
+  if (ev.reason !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_EVAL_REASON, ev.reason));
   const failed = ev.verdict === "fail";
   return pointSpan(ev, `eval_graded.${ev.verdict}`, attrs, {
     code: failed ? STATUS_ERROR : STATUS_OK,
@@ -877,6 +1031,14 @@ export function buildJudgeVerdictSpan(ev: JudgeVerdictEvent): OtelSpan {
   if (ev.rationale !== undefined) {
     attrs.push(attrStr(ATTR.CREWHAUS_JUDGE_RATIONALE, ev.rationale));
   }
+  // 0.6.0 (design §6.2, §8.1) — the judge (or panel) that scored the gate and
+  // what it cost; set only when the gate helper reported them.
+  if (ev.judgeModel !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_JUDGE_MODEL, ev.judgeModel));
+  if (ev.panel !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_JUDGE_PANEL, ev.panel.join(",")));
+  if (ev.costUsdMicros !== undefined) {
+    attrs.push(attrInt(ATTR.CREWHAUS_JUDGE_COST_USD_MICROS, ev.costUsdMicros));
+  }
+  if (ev.reason !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_EVAL_REASON, ev.reason));
   const failed = ev.verdict === "fail";
   return pointSpan(ev, `judge_verdict.${ev.verdict}`, attrs, {
     code: failed ? STATUS_ERROR : STATUS_OK,

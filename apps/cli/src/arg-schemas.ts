@@ -1067,6 +1067,9 @@ export const SESSIONS_SCHEMA: ParseArgsSchema = {
     { name: "dir", takesValue: true },
     { name: "interval", takesValue: true },
     { name: "no-follow", takesValue: false },
+    // 0.6.0 (design §8.2) — `sessions tail` renders route / cost / eval /
+    // stage lines by default; this restores the transcript-only view.
+    { name: "transcript-only", takesValue: false },
     { name: "help", short: "h" },
   ],
 };

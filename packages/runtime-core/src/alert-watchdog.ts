@@ -58,6 +58,34 @@ export const BASELINE_WINDOW = 50;
 export const MAX_METRICS_HISTORY_LINES = Math.max(BASELINE_WINDOW * 4, 200);
 
 /**
+ * 0.6.0 (design §7.10) — the `model_route.reason` the learned policy records
+ * when no non-floor arm is exploitable and it serves the floor arm instead.
+ * The watchdog, the SLO monitor and metrics-collector all key `floor_block_rate`
+ * on this string, so the router (PR 10) must publish it verbatim.
+ */
+export const FLOOR_BLOCKED_ROUTE_REASON = "floor-blocked";
+
+/** True for a `model_route` decision the quality floor forced onto the floor arm. */
+export function isFloorBlockedRoute(ev: { readonly reason: string }): boolean {
+  return ev.reason === FLOOR_BLOCKED_ROUTE_REASON;
+}
+
+/**
+ * 0.6.0 (design §8.4) — the events that count as ONE escalation, shared by the
+ * watchdog's `escalation_rate` and the SLO monitor's: a hybrid-strategy stage
+ * whose role is `escalation` counts when it STARTS (its `done`/`failed` twin is
+ * the same escalation), and a two-tier fast→default misroute recovery counts
+ * on its `model_tier_route`. `eval_graded.escalatedTo` is deliberately NOT a
+ * third source: under `on_fail: escalate` the strong re-run publishes its own
+ * escalation stage, and counting both would double every cascade escalation.
+ */
+export function isEscalationEvent(ev: TraceEvent): boolean {
+  if (ev.kind === "model_stage") return ev.role === "escalation" && ev.outcome === "started";
+  if (ev.kind === "model_tier_route") return ev.escalated === true;
+  return false;
+}
+
+/**
  * The compact per-session snapshot persisted to `sessions.jsonl` and read back
  * to derive baselines. Percentiles are computed from the per-session samples
  * at session end so the stored line is small and directly comparable.
@@ -89,6 +117,25 @@ export type SessionMetricsSnapshot = {
   readonly egressBlocked: number;
   /** Justification-gate / policy denials (permission_decision decision "deny"). */
   readonly permissionDenials: number;
+  // ---- 0.6.0 (design §8.4) — hybrid-routing signals. All OPTIONAL so the
+  // snapshot lines persisted by 0.5.x keep parsing; readers fold an absent
+  // field as 0 (no routing activity), never as "unknown".
+  /** Escalations (see {@link isEscalationEvent}). */
+  readonly escalations?: number;
+  /** escalations / max(turns,1). */
+  readonly escalationRate?: number;
+  /** In-loop grades (`eval_graded`) plus judge-gate verdicts (`judge_verdict`). */
+  readonly judgeVerdicts?: number;
+  /** The failing subset of `judgeVerdicts`. */
+  readonly judgeFails?: number;
+  /** judgeFails / max(judgeVerdicts,1). */
+  readonly judgeFailRate?: number;
+  /** Pool routing decisions (`model_route`). */
+  readonly routeDecisions?: number;
+  /** Decisions the quality floor forced onto the floor arm ({@link isFloorBlockedRoute}). */
+  readonly floorBlocks?: number;
+  /** floorBlocks / max(routeDecisions,1). */
+  readonly floorBlockRate?: number;
 };
 
 /** A single threshold breach found by {@link detectBreaches}. */
@@ -108,6 +155,10 @@ export type DerivedThresholds = {
   readonly pricingMissRate: number;
   readonly circuitOpens: number;
   readonly egressBlocked: number;
+  // 0.6.0 (design §8.4) — hybrid-routing rate thresholds.
+  readonly escalationRate: number;
+  readonly judgeFailRate: number;
+  readonly floorBlockRate: number;
   /** How many historical sessions the thresholds were derived from (0 = bootstrap). */
   readonly baselineSessions: number;
 };
@@ -131,6 +182,11 @@ export class SessionMetricsAccumulator {
   private circuitOpens = 0;
   private egressBlocked = 0;
   private permissionDenials = 0;
+  private escalations = 0;
+  private judgeVerdicts = 0;
+  private judgeFails = 0;
+  private routeDecisions = 0;
+  private floorBlocks = 0;
   private firstTs: number | undefined;
   private lastTs: number | undefined;
   private readonly requestStarts = new Map<string, number>();
@@ -190,14 +246,26 @@ export class SessionMetricsAccumulator {
         if (ev.outcome === "egress-blocked") this.egressBlocked += 1;
         else if (ev.outcome === undefined && ev.decision === "deny") this.permissionDenials += 1;
         return;
+      // ---- 0.6.0 (design §8.4) — hybrid-routing signals. ----
+      case "model_stage":
+      case "model_tier_route":
+        if (isEscalationEvent(ev)) this.escalations += 1;
+        return;
+      case "eval_graded":
+      case "judge_verdict":
+        // Every in-loop grade and judge-gate verdict is one judge verdict; the
+        // `fail` subset is the numerator of `judge_fail_rate`. (This closes the
+        // NEW-E-2 gap the old default branch documented: quality verdicts now
+        // do fold into the watchdog — as a FAIL RATE against the session's own
+        // history, not as a score threshold.) `response_rated` still stays out.
+        this.judgeVerdicts += 1;
+        if (ev.verdict === "fail") this.judgeFails += 1;
+        return;
+      case "model_route":
+        this.routeDecisions += 1;
+        if (isFloorBlockedRoute(ev)) this.floorBlocks += 1;
+        return;
       default:
-        // NEW-E-2 is PARTIAL by decision, not by omission: `eval_graded`,
-        // `judge_verdict` and `response_rated` fold into metrics-collector
-        // (crewhaus_eval_verdicts_total / _score / crewhaus_response_ratings_total)
-        // but deliberately NOT into this accumulator, so there is no
-        // "judge score dropped below baseline" breach yet. Adding one means
-        // new persisted snapshot fields + a `detectBreaches` rule; see the
-        // Wave 5 amendments in EVALS-CAMPAIGN-0.4.md before closing the gap.
         return;
     }
   }
@@ -223,6 +291,14 @@ export class SessionMetricsAccumulator {
       circuitOpens: this.circuitOpens,
       egressBlocked: this.egressBlocked,
       permissionDenials: this.permissionDenials,
+      escalations: this.escalations,
+      escalationRate: this.escalations / Math.max(this.turns, 1),
+      judgeVerdicts: this.judgeVerdicts,
+      judgeFails: this.judgeFails,
+      judgeFailRate: this.judgeFails / Math.max(this.judgeVerdicts, 1),
+      routeDecisions: this.routeDecisions,
+      floorBlocks: this.floorBlocks,
+      floorBlockRate: this.floorBlocks / Math.max(this.routeDecisions, 1),
     };
   }
 }
@@ -265,6 +341,12 @@ export function deriveThresholds(
       pricingMissRate: 0.5,
       circuitOpens: 1,
       egressBlocked: 1,
+      // 0.6.0 — a cascade that escalates every other turn, a judge that fails
+      // half its grades, or a floor that blocks half the decisions is a
+      // hybrid setup that is not paying for itself; below that, normal.
+      escalationRate: 0.5,
+      judgeFailRate: 0.5,
+      floorBlockRate: 0.5,
       baselineSessions: window.length,
     };
   }
@@ -288,6 +370,12 @@ export function deriveThresholds(
       p95((s) => s.egressBlocked),
       1,
     ),
+    // 0.6.0 — rates over history with the same 5% floor `errorRate` has, so a
+    // baseline of zero escalations does not make the first one a breach on its
+    // own; an absent field (a 0.5.x snapshot line) reads as no activity.
+    escalationRate: Math.max(p95((s) => s.escalationRate ?? 0) * HEADROOM_FACTOR, 0.05),
+    judgeFailRate: Math.max(p95((s) => s.judgeFailRate ?? 0) * HEADROOM_FACTOR, 0.05),
+    floorBlockRate: Math.max(p95((s) => s.floorBlockRate ?? 0) * HEADROOM_FACTOR, 0.05),
     baselineSessions: window.length,
   };
 }
@@ -316,6 +404,11 @@ export function detectBreaches(
   add("pricing_miss_rate", missRate, thresholds.pricingMissRate, "");
   add("circuit_opens", snapshot.circuitOpens, thresholds.circuitOpens, "");
   add("egress_blocked", snapshot.egressBlocked, thresholds.egressBlocked, "");
+  // 0.6.0 (design §8.4) — hybrid-routing rates. A session with no routing
+  // activity reports 0 (or an absent field) and can never breach.
+  add("escalation_rate", snapshot.escalationRate ?? 0, thresholds.escalationRate, "");
+  add("judge_fail_rate", snapshot.judgeFailRate ?? 0, thresholds.judgeFailRate, "");
+  add("floor_block_rate", snapshot.floorBlockRate ?? 0, thresholds.floorBlockRate, "");
   return breaches;
 }
 

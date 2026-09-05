@@ -42,6 +42,7 @@
  * Side-effect-free (the CLI entry file runs an argv switch on import), so
  * assembly is unit-testable without spawning a subprocess.
  */
+import { type ModelRole, isAuxiliaryModelRole } from "@crewhaus/trace-event-bus";
 import { extractFeedbackRecords, mergeFeedback, normalizeRating } from "./feedback";
 
 /** A parsed event-log line, duck-typed (see session-store's parseSessionLog). */
@@ -86,7 +87,107 @@ export type TrajectoryStep = {
   readonly observation: TrajectoryObservation;
   readonly reward: number | null;
   readonly rewardSource?: TrajectoryRewardSource;
+  /**
+   * 0.6.0 (design §8.1, §8.2) — the WIRE model id that produced this action,
+   * read from the default-on `model_meta` mirror line beside the assistant
+   * message (see {@link pairModelMeta}). Absent when the session predates the
+   * mirror or ran with `CREWHAUS_ADVISOR_EVENTS=0`. A trainer consuming a
+   * hybrid session needs this to tell a cheap draft's step from the strong
+   * re-run's; without it every step of a pooled run looks like one policy.
+   */
+  readonly model?: string;
+  /** `models:` profile of the serving candidate, when the mirror line carried one. */
+  readonly profile?: string;
 };
+
+/**
+ * 0.6.0 — the `model_meta` line runtime-core's advisor mirror appends per
+ * `model_response`. Only ANSWER-producing responses commit an assistant
+ * message: `primary` (or an absent role), a cascade's `draft` and its strong
+ * `escalation` re-run, and a sub-agent child's own `subagent` turns (which
+ * land in the CHILD's log beside the child's `assistant_message`). The
+ * auxiliary roles — judge, guide, classifier, consult, committee, shadow,
+ * compaction — are calls made in service of the answer and never commit one,
+ * so their metas are skipped. The deny-list is `AUXILIARY_MODEL_ROLES`, the
+ * codebase's single definition of "not the answer", rather than a local
+ * allow-list of `primary`: the export exists so a hybrid session's cheap
+ * draft and strong re-run are distinguishable, and both carry a non-primary
+ * role (design §8.1).
+ */
+type ModelMetaLine = { readonly model: string; readonly profile?: string };
+
+function answerModelMeta(payload: unknown): ModelMetaLine | undefined {
+  const p = asRecord(payload);
+  if (p === undefined || typeof p["model"] !== "string") return undefined;
+  const role = p["role"];
+  // An unknown role string is not auxiliary by the shared definition and is
+  // treated as answer-producing; a non-string role is a malformed line.
+  if (role !== undefined && typeof role !== "string") return undefined;
+  if (isAuxiliaryModelRole(role as ModelRole | undefined)) return undefined;
+  const profile = p["profile"];
+  return {
+    model: p["model"],
+    ...(typeof profile === "string" ? { profile } : {}),
+  };
+}
+
+/**
+ * Pair each assistant action with the `model_meta` line that priced it. The
+ * two land in EITHER order: the streaming path logs `assistant_message` before
+ * it publishes `model_response` (so the mirror line follows), the
+ * non-streaming path publishes first (so the mirror line precedes). A meta
+ * seen before its action is held as `pending`; an action seen before its meta
+ * is left `awaiting` and claims the next answer-role meta. One action ↔ one
+ * meta, in log order — a tool loop commits one assistant message per response.
+ *
+ * Both slots are single and newest-wins, deliberately not FIFO: in a healthy
+ * log an action and its meta are adjacent (event-log appends synchronously
+ * and the mirror persists inside the `model_response` dispatch), so a second
+ * entry arriving while one is held means the held one was orphaned — a
+ * response whose committed content was empty (no `assistant_message`) or a
+ * mirror line the append dropped. Displacing the orphan keeps the rest of the
+ * turn correctly attributed; queueing it would shift every later pairing.
+ *
+ * Both slots are also cleared at a turn boundary — a `user_message` that
+ * carries text (the tool_result echo round carries none and is not a
+ * boundary). No response's mirror can land after the next turn's prompt, so
+ * an orphan held at that point can never be attributed to the next turn's
+ * action: the action goes unattributed rather than taking a stale meta.
+ */
+export function pairModelMeta(events: ReadonlyArray<LoggedEvent>): Map<number, ModelMetaLine> {
+  const byActionIndex = new Map<number, ModelMetaLine>();
+  let pending: ModelMetaLine | undefined;
+  let awaiting: number | undefined;
+  events.forEach((ev, index) => {
+    if (ev.kind === "user_message") {
+      if (userText(ev.payload) !== undefined) {
+        pending = undefined;
+        awaiting = undefined;
+      }
+      return;
+    }
+    if (ev.kind === "assistant_message") {
+      if (assistantAction(ev.payload) === undefined) return;
+      if (pending !== undefined) {
+        byActionIndex.set(index, pending);
+        pending = undefined;
+      } else {
+        awaiting = index;
+      }
+      return;
+    }
+    if (ev.kind !== "model_meta") return;
+    const meta = answerModelMeta(ev.payload);
+    if (meta === undefined) return;
+    if (awaiting !== undefined) {
+      byActionIndex.set(awaiting, meta);
+      awaiting = undefined;
+    } else {
+      pending = meta;
+    }
+  });
+  return byActionIndex;
+}
 
 // -------- tolerant payload parsing --------
 
@@ -227,7 +328,11 @@ export function assembleTrajectory(
     readonly state: TrajectoryMessage[];
     readonly action: TrajectoryAction;
     readonly results: Array<{ tool?: string; text: string; isError: boolean }>;
+    readonly meta?: ModelMetaLine;
   };
+
+  // 0.6.0 — served-model attribution per action, from the `model_meta` mirror.
+  const metaByActionIndex = pairModelMeta(events);
 
   const steps: Array<Omit<TrajectoryStep, "reward">> = [];
   const history: TrajectoryMessage[] = [];
@@ -241,26 +346,34 @@ export function assembleTrajectory(
       state: pending.state,
       action: pending.action,
       observation: pending.results.length > 0 ? { results: pending.results } : null,
+      ...(pending.meta !== undefined ? { model: pending.meta.model } : {}),
+      ...(pending.meta?.profile !== undefined ? { profile: pending.meta.profile } : {}),
     });
     pending = undefined;
   };
 
-  for (const ev of events) {
+  events.forEach((ev, index) => {
     if (ev.kind === "user_message") {
       const text = userText(ev.payload);
-      if (text === undefined) continue; // tool_result round — consumed granularly
+      if (text === undefined) return; // tool_result round — consumed granularly
       flush();
       const synthetic = asRecord(ev.payload)?.["synthetic"] === true;
       history.push({ role: "user", text, ...(synthetic ? { synthetic: true } : {}) });
     } else if (ev.kind === "assistant_message") {
       const action = assistantAction(ev.payload);
-      if (action === undefined) continue;
+      if (action === undefined) return;
       flush();
-      pending = { state: [...history], action, results: [] };
+      const meta = metaByActionIndex.get(index);
+      pending = {
+        state: [...history],
+        action,
+        results: [],
+        ...(meta !== undefined ? { meta } : {}),
+      };
       history.push({ role: "assistant", ...action });
     } else if (ev.kind === "tool_result") {
       const p = asRecord(ev.payload);
-      if (p === undefined) continue;
+      if (p === undefined) return;
       const toolUseId = p["toolUseId"];
       const tool = typeof toolUseId === "string" ? toolNameById.get(toolUseId) : undefined;
       const entry = {
@@ -275,9 +388,10 @@ export function assembleTrajectory(
         ...(entry.isError ? { isError: true } : {}),
       });
     }
-    // Every other kind (cost_accrual, permission, model_meta, compaction,
-    // wiki_write, …) is non-conversational — skipped by contract.
-  }
+    // Every other kind (cost_accrual, permission, compaction, wiki_write, …)
+    // is non-conversational — skipped by contract. `model_meta` was consumed
+    // above by `pairModelMeta` for per-step attribution.
+  });
   flush();
 
   if (steps.length === 0) return [];

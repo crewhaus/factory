@@ -21,10 +21,12 @@ import type {
   JudgeVerdictEvent,
   McpCallEndEvent,
   McpCallStartEvent,
+  ModelDirectiveEvent,
   ModelFailoverEvent,
   ModelRequestEvent,
   ModelResponseEvent,
   ModelRouteEvent,
+  ModelStageEvent,
   ModelStreamTokenEvent,
   ModelTierRouteEvent,
   PermissionDecisionEvent,
@@ -68,9 +70,11 @@ import {
   buildJanitorActionSpan,
   buildJudgeVerdictSpan,
   buildMcpSpan,
+  buildModelDirectiveSpan,
   buildModelFailoverSpan,
   buildModelRouteSpan,
   buildModelSpan,
+  buildModelStageSpan,
   buildModelTierRouteSpan,
   buildPermissionSpan,
   buildProgramOutputSpan,
@@ -83,6 +87,8 @@ import {
   buildTestVerdictSpan,
   buildToolSpan,
   buildTurnSpan,
+  modelCostJoinKey,
+  stampModelSpanCost,
 } from "./gen-ai-mapping";
 import type { OtelSpan } from "./types";
 
@@ -103,6 +109,15 @@ const MAX_IN_FLIGHT_MODEL_CALLS = 32;
  * is in flight by then.
  */
 const MAX_REMEMBERED_ABANDONED = 64;
+/**
+ * 0.6.0 (design §8.4) — how many completed `gen_ai.chat` spans to keep
+ * waiting for their `cost_accrual`. cost-tracker publishes the accrual
+ * synchronously inside the `model_response` dispatch, so in a run with cost
+ * tracking on the queue holds at most one entry per join key; with cost
+ * tracking OFF no accrual ever arrives, and this cap is what keeps the wait
+ * list from growing for the life of the process.
+ */
+const MAX_AWAITING_COST = 64;
 
 export class SpanTracker {
   private turn: StartedTurn | undefined;
@@ -122,6 +137,16 @@ export class SpanTracker {
    * the oldest is forgotten first once `MAX_REMEMBERED_ABANDONED` is reached.
    */
   private readonly abandonedModelKeys = new Set<string>();
+  /**
+   * 0.6.0 (design §8.4) — completed `gen_ai.chat` spans awaiting their
+   * `cost_accrual`, keyed by {@link modelCostJoinKey} (trace|model|role), FIFO
+   * per key. The span object has ALREADY been handed to `emit` — the exporter
+   * buffers objects until its batch flush, so stamping the cost onto the
+   * attributes array in place lands before the span ships. Insertion-ordered
+   * so the oldest waiter is forgotten first at {@link MAX_AWAITING_COST}.
+   */
+  private readonly awaitingCost = new Map<string, OtelSpan[]>();
+  private awaitingCostCount = 0;
   private readonly tools = new Map<string, StartedTool>();
   /** server::toolName key — MCP can have one in flight per server. */
   private readonly mcps = new Map<string, StartedMcp>();
@@ -174,6 +199,54 @@ export class SpanTracker {
 
   private abandonAllModelCalls(endIso: string, cause: AbandonedModelCause): void {
     for (const key of [...this.models.keys()]) this.abandonModelCall(key, endIso, cause);
+  }
+
+  /** Number of completed model spans still waiting for a `cost_accrual` (diagnostic). */
+  awaitingCostCalls(): number {
+    return this.awaitingCostCount;
+  }
+
+  /**
+   * Remember a just-emitted model span so the accrual cost-tracker publishes
+   * for it can be stamped on. Bounded: past {@link MAX_AWAITING_COST} the
+   * oldest waiter (across keys) is dropped — its span already shipped without
+   * a cost attribute, which is exactly what a run without cost tracking gets.
+   */
+  private rememberForCost(end: ModelResponseEvent, span: OtelSpan): void {
+    const key = modelCostJoinKey(end);
+    const queue = this.awaitingCost.get(key);
+    if (queue === undefined) this.awaitingCost.set(key, [span]);
+    else queue.push(span);
+    this.awaitingCostCount += 1;
+    while (this.awaitingCostCount > MAX_AWAITING_COST) {
+      const oldestKey = this.awaitingCost.keys().next().value;
+      if (oldestKey === undefined) break;
+      const oldest = this.awaitingCost.get(oldestKey);
+      if (oldest === undefined || oldest.length === 0) {
+        this.awaitingCost.delete(oldestKey);
+        continue;
+      }
+      oldest.shift();
+      this.awaitingCostCount -= 1;
+      if (oldest.length === 0) this.awaitingCost.delete(oldestKey);
+    }
+  }
+
+  /**
+   * Stamp a per-call accrual onto the oldest completed model span with the
+   * same (trace, served model, role). Returns false when no span is waiting —
+   * an accrual from a publisher that never emitted a `model_response` on this
+   * bus (the optimizer's `summary: true` totals, a re-published child's
+   * `subagent` accrual) still gets its own `cost_accrual` point span.
+   */
+  private stampCost(ev: CostAccrualEvent): boolean {
+    const key = modelCostJoinKey({ traceId: ev.traceId, model: ev.modelId, role: ev.role });
+    const queue = this.awaitingCost.get(key);
+    const span = queue?.shift();
+    if (queue !== undefined && queue.length === 0) this.awaitingCost.delete(key);
+    if (span === undefined) return false;
+    this.awaitingCostCount -= 1;
+    return stampModelSpanCost(span, ev);
   }
 
   ingest(ev: TraceEvent): void {
@@ -231,8 +304,14 @@ export class SpanTracker {
         const key = this.models.has(ev.spanId) ? ev.spanId : this.latestModelKey();
         const started = key !== undefined ? this.models.get(key) : undefined;
         if (started && key !== undefined) {
-          this.emit(buildModelSpan(started, ev as ModelResponseEvent));
+          const end = ev as ModelResponseEvent;
+          const span = buildModelSpan(started, end);
+          this.emit(span);
           this.models.delete(key);
+          // 0.6.0 (design §8.4) — cost lands on this span when cost-tracker's
+          // accrual for it arrives (synchronously, inside this same dispatch,
+          // when cost tracking is on).
+          this.rememberForCost(end, span);
         }
         return;
       }
@@ -351,8 +430,23 @@ export class SpanTracker {
       case "a2a_message":
         this.emit(buildA2AMessageSpan(ev as A2AMessageEvent));
         return;
-      case "cost_accrual":
-        this.emit(buildCostAccrualSpan(ev as CostAccrualEvent));
+      case "cost_accrual": {
+        const e = ev as CostAccrualEvent;
+        // 0.6.0 (design §8.4) — a per-call accrual is stamped onto the model
+        // span it prices (cost ON the gen_ai.chat span, the plan's wording),
+        // and STILL emitted as its own point span so a backend that sums
+        // `cost_accrual` spans — the pre-0.6.0 dashboards — keeps working.
+        if (e.summary !== true) this.stampCost(e);
+        this.emit(buildCostAccrualSpan(e));
+        return;
+      }
+      // 0.6.0 (design §8.4) — the two new trace kinds, previously reaching the
+      // generic `crewhaus.<kind>` fallback with an untyped scalar dump.
+      case "model_stage":
+        this.emit(buildModelStageSpan(ev as ModelStageEvent));
+        return;
+      case "model_directive":
+        this.emit(buildModelDirectiveSpan(ev as ModelDirectiveEvent));
         return;
       case "run_failed":
         this.emit(buildRunFailedSpan(ev as RunFailedEvent));
