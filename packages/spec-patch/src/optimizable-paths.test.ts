@@ -15,7 +15,13 @@
 import { describe, expect, test } from "bun:test";
 import { type Spec, parseSpec } from "@crewhaus/spec";
 import { parse } from "yaml";
-import { OPTIMIZABLE_PATHS, applySpecEdits, diffSpecYaml, specHasPath } from "./index";
+import {
+  OPTIMIZABLE_PATHS,
+  STRUCTURAL_SEGMENTS,
+  applySpecEdits,
+  diffSpecYaml,
+  specHasPath,
+} from "./index";
 
 const CHAIN_BLOCKS = `
 chains:
@@ -475,5 +481,177 @@ describe("Item 9 (G37) — role/step model_pool rides the whole-block optimizabl
     const step = result.spec.steps[0];
     if (step === undefined || "kind" in step) throw new Error("expected a regular step");
     expect(step.model_pool?.policy).toBe("heuristic");
+  });
+});
+
+/**
+ * 0.6.0 (plan §10.3, mechanism 2) — the STRUCTURAL rule. The whole-block
+ * entries `["steps"]` (workflow), `["nodes"]` (graph) and `["roles"]` (crew)
+ * admit sub-paths by PREFIX, and from 0.6.0 every routed block carries the
+ * hybrid `model_pool` container, `temperature`, a `kind: judge` gate's
+ * `escalate_to` and sub-agent routing — all human-owned per the §10.3 verdict
+ * table. Without the rule they were optimizer-reachable on these three
+ * shapes the moment the spec accepted them. Per target: the structural paths
+ * are rejected, the exact entries and the plain prefix paths keep working.
+ */
+describe("§10.3 structural rule — model_pool / judge / sub_agents / temperature are never admitted by prefix", () => {
+  const WORKFLOW = [
+    "name: w",
+    "target: workflow",
+    "model: base-model",
+    "steps:",
+    "  - name: draft",
+    "    instructions: write it",
+    "    model_pool:",
+    "      candidates:",
+    "        - { model: m1, tags: [cheap] }",
+    "        - { model: m2, tags: [strong] }",
+    "  - name: gate",
+    "    kind: judge",
+    "    judge: { criteria: c }",
+  ].join("\n");
+  const GRAPH = [
+    "name: g",
+    "target: graph",
+    "model: base-model",
+    "entry: a",
+    "nodes:",
+    "  a:",
+    "    instructions: x",
+    "  gate:",
+    "    kind: judge",
+    "    judge: { criteria: c }",
+    "edges: [{from: a, to: gate}]",
+  ].join("\n");
+  const CREW = [
+    "name: cr",
+    "target: crew",
+    "model: base-model",
+    "entry: lead",
+    "roles:",
+    "  lead:",
+    "    instructions: lead it",
+    "    sub_agents:",
+    "      helper: { description: helps, instructions: help }",
+  ].join("\n");
+
+  const POOL_LEAVES = [
+    "strategy",
+    "rules",
+    "reward",
+    "directives",
+    "classifier",
+    "candidates",
+    "scope",
+  ];
+
+  const rejected = (yaml: string, path: ReadonlyArray<string | number>): void => {
+    expect(
+      () =>
+        applySpecEdits(yaml, [{ path: [...path], value: true }], { restrictToOptimizable: true }),
+      `[${path.join(", ")}] must NOT be optimizer-reachable`,
+    ).toThrow(/not listed in OPTIMIZABLE_PATHS/);
+  };
+
+  test("workflow: steps[*].model_pool.*, temperature and judge.* are rejected", () => {
+    for (const leaf of POOL_LEAVES) rejected(WORKFLOW, ["steps", 0, "model_pool", leaf]);
+    rejected(WORKFLOW, ["steps", 0, "model_pool", "strategy", "model_directed"]);
+    rejected(WORKFLOW, ["steps", 0, "model_pool", "rules", 0, "use"]);
+    rejected(WORKFLOW, ["steps", 0, "model_pool", "reward", "floor", "arm"]);
+    // The pre-0.6.0 roster leak the in-code comment already claimed closed.
+    rejected(WORKFLOW, ["steps", 0, "model_pool", "candidates", 0, "model"]);
+    rejected(WORKFLOW, ["steps", 0, "temperature"]);
+    rejected(WORKFLOW, ["steps", 1, "judge", "escalate_to"]);
+    rejected(WORKFLOW, ["steps", 1, "judge", "judges"]);
+    rejected(WORKFLOW, ["steps", 1, "judge", "repeats"]);
+  });
+
+  test("graph: nodes.<n>.model_pool.*, temperature and judge.* are rejected", () => {
+    for (const leaf of POOL_LEAVES) rejected(GRAPH, ["nodes", "a", "model_pool", leaf]);
+    rejected(GRAPH, ["nodes", "a", "model_pool"]);
+    rejected(GRAPH, ["nodes", "a", "temperature"]);
+    rejected(GRAPH, ["nodes", "gate", "judge", "escalate_to"]);
+    rejected(GRAPH, ["nodes", "gate", "judge", "judges"]);
+  });
+
+  test("crew: roles.<r>.model_pool.*, temperature and sub_agents.* are rejected", () => {
+    for (const leaf of POOL_LEAVES) rejected(CREW, ["roles", "lead", "model_pool", leaf]);
+    rejected(CREW, ["roles", "lead", "model_pool"]);
+    rejected(CREW, ["roles", "lead", "temperature"]);
+    rejected(CREW, ["roles", "lead", "sub_agents", "helper", "allowed_profiles"]);
+    rejected(CREW, ["roles", "lead", "sub_agents", "helper", "budget_share"]);
+    rejected(CREW, ["roles", "lead", "sub_agents", "helper", "inherit_routing"]);
+    rejected(CREW, ["roles", "lead", "sub_agents", "helper", "model_pool"]);
+    // Pre-0.6.0 sub-agent keys are identity / security surface too.
+    rejected(CREW, ["roles", "lead", "sub_agents", "helper", "permissions"]);
+    rejected(CREW, ["roles", "lead", "sub_agents", "helper", "tools"]);
+  });
+
+  test("the exact entries and the plain prefix paths keep working on the same shapes", () => {
+    const wf = applySpecEdits(
+      WORKFLOW,
+      [{ path: ["steps", 0, "instructions"], value: "write it with citations" }],
+      { restrictToOptimizable: true },
+    );
+    expect(wf.applied).toBe(1);
+    // Whole-block replacement carries no structural SEGMENT in its path, so it
+    // is unchanged (the G37 tests above pin that a pool-bearing block rides it).
+    const cr = applySpecEdits(
+      CREW,
+      [{ path: ["roles", "lead", "instructions"], value: "lead harder" }],
+      {
+        restrictToOptimizable: true,
+      },
+    );
+    expect(cr.applied).toBe(1);
+    const g = applySpecEdits(GRAPH, [{ path: ["nodes", "a", "instructions"], value: "y" }], {
+      restrictToOptimizable: true,
+    });
+    expect(g.applied).toBe(1);
+    // The cli pool's exact POLICY entries are exact matches, not prefix ones.
+    const cli = [
+      "name: c",
+      "target: cli",
+      "agent:",
+      "  model: m",
+      "  instructions: hi",
+      "  model_pool:",
+      "    candidates:",
+      "      - { model: m1, tags: [cheap] }",
+      "      - { model: m2, tags: [strong] }",
+    ].join("\n");
+    const pooled = applySpecEdits(
+      cli,
+      [{ path: ["agent", "model_pool", "policy"], value: "learned" }],
+      {
+        restrictToOptimizable: true,
+      },
+    );
+    expect(pooled.applied).toBe(1);
+    // … and a sub-path UNDER an exact pool entry is exact-only too.
+    rejected(cli, ["agent", "model_pool", "routing", "strongTag"]);
+    rejected(cli, ["agent", "model_pool", "candidates", 0, "enabled"]);
+  });
+
+  test("every structural segment is a spec key on at least one routed block (no phantom rule)", () => {
+    // If the spec ever renames one of these, the rule silently stops biting;
+    // pin the four names against the parsed shapes they guard.
+    const wf = parseSpec(WORKFLOW);
+    if (wf.target !== "workflow") throw new Error("unexpected target");
+    const draft = wf.steps[0];
+    const gate = wf.steps[1];
+    if (draft === undefined || "kind" in draft) throw new Error("expected a regular step");
+    if (gate === undefined || !("kind" in gate)) throw new Error("expected a judge step");
+    expect("model_pool" in draft && draft.model_pool !== undefined).toBe(true);
+    expect("judge" in gate).toBe(true);
+    const cr = parseSpec(CREW);
+    if (cr.target !== "crew") throw new Error("unexpected target");
+    expect(cr.roles.lead?.sub_agents?.helper).toBeDefined();
+    expect(STRUCTURAL_SEGMENTS).toEqual(["model_pool", "judge", "sub_agents", "temperature"]);
+    expect(
+      parseSpec(
+        `${WORKFLOW.replace("    instructions: write it", "    instructions: write it\n    temperature: 0")}`,
+      ),
+    ).toBeDefined();
   });
 });

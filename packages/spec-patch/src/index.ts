@@ -692,6 +692,46 @@ export const OPTIMIZABLE_PATHS: Readonly<
   ]),
 });
 
+/**
+ * 0.6.0 (plan §10.3, mechanism 2) — the STRUCTURAL rule: a path that passes
+ * through any of these segments is optimizable only by EXACT match against a
+ * listed entry, never by prefix. The whole-block entries `["steps"]`,
+ * `["nodes"]` and `["roles"]` exist because the step index / node name / role
+ * name is positional, and whole-block replacement was meant to span
+ * `model`/`instructions` — not the human-owned structure that now hangs off
+ * every routed block:
+ *
+ *   - `model_pool` — the candidate ROSTER (mirroring the standing
+ *     `["agent","model"]` exclusion), and from 0.6.0 the hybrid container:
+ *     `rules.*.use` (rule targets), `strategy.*` role slots and
+ *     `model_directed` (registers the `Escalate`/`Consult` tool surface),
+ *     `reward.*` (the floor), `directives` (admits user-directed input),
+ *     `classifier.{model,labels}` (judge identity), `scope`. The plan's
+ *     verdict table classifies every one of these as excluded.
+ *   - `judge` — a `kind: judge` gate's `escalate_to` (a routing target),
+ *     `judges` (judge identity), `temperature`/`target`.
+ *   - `sub_agents` — a sub-agent definition is a tool-surface / identity block
+ *     (`tools`, `permissions`, `model`, `inherit_bypass`, and from 0.6.0
+ *     `allowed_profiles`, `budget_share`, `inherit_routing`, its own routing).
+ *   - `temperature` — a quality dial the plan lists as optimizable, but ONLY
+ *     via an exact `["agent","temperature"]` entry (PR 19); until the
+ *     compiler lowers it, a prefix-reached patch would write a spec the
+ *     compiler refuses.
+ *
+ * One rule, no negative-list semantics: the exact entries
+ * `["agent","model_pool",{policy,routing,learning}]` keep working, and a
+ * whole-block `["steps"]` replacement (whose PATH carries none of these
+ * segments) is unchanged. PR 19 adds the wildcard segment and the exact
+ * entries the §10.3 table promises; this rule is what makes that table true
+ * for the positional shapes.
+ */
+export const STRUCTURAL_SEGMENTS: ReadonlyArray<string> = Object.freeze([
+  "model_pool",
+  "judge",
+  "sub_agents",
+  "temperature",
+]);
+
 function isOptimizable(target: Spec["target"], path: ReadonlyArray<SpecEditPathSegment>): boolean {
   const allowed = OPTIMIZABLE_PATHS[target];
   for (const ok of allowed) {
@@ -704,6 +744,12 @@ function isOptimizable(target: Spec["target"], path: ReadonlyArray<SpecEditPathS
       }
     }
     if (match) return true;
+  }
+  // The structural rule (see STRUCTURAL_SEGMENTS): past this point only a
+  // PREFIX match can admit the path, and a path through a human-owned
+  // structural block is never admitted by prefix.
+  if (path.some((seg) => typeof seg === "string" && STRUCTURAL_SEGMENTS.includes(seg))) {
+    return false;
   }
   // Allow patches with a prefix that matches an optimizable path
   // (e.g. `["nodes", "0", "instructions"]` if `["nodes"]` is whitelisted)

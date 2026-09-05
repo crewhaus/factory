@@ -1060,6 +1060,224 @@ type SpecAgentWithFailover = {
   };
 };
 
+// ---------------------------------------------------------------------------
+// 0.6.0 PR 6 (spec surface) — ONE interim guard, deleted wholesale by PR 7.
+//
+// Every key of the plan's §11.1 spec delta parses from this release, and none
+// of it is lowered until the IR widening (PR 7). The posture is uniform: a
+// spec that declares any pending key is a LOUD, path-precise `CompilerError`
+// — never a silently dropped key. The alternative (accept-and-drop) is a
+// hazard on the security-relevant keys: a candidate declared with
+// `tools: [read]` + `permissions.deny` would serve with the full toolset, a
+// grader declared with `judges: [...]` and no `model` would become the
+// serving model judging itself (the exact failure §6.2 exists to prevent),
+// and `enabled: false` would keep a withdrawn candidate serving.
+//
+// `assertNoPending060Keys` walks the parsed spec ONCE from `lower()`. It is
+// a loose-typed walk on purpose: the pending keys live on eight routed
+// blocks across seven shapes and this code has a one-release lifetime, so
+// it stays independent of the per-shape structural types the real lowering
+// functions carry. Absent config passes straight through — the lowering
+// below is byte-identical to 0.5.x (the `pre-continuity` byte-pin fixtures
+// pin that).
+//
+// The two narrowing throws inside `lowerModelFailover` and `lowerEvaluation`
+// (`policy: classifier`, `on_fail: escalate`) are the SAME error and are
+// unreachable once this walk has run: they exist only because the compiler's
+// local structural types widened with the spec and the IR enums they feed
+// have not — `tsc -b` needs the narrowing. PR 7 removes this whole section
+// and those two lines together.
+// ---------------------------------------------------------------------------
+
+const PENDING_060_SUFFIX =
+  " is accepted by the spec but not yet lowered by this compiler — it lands with the 0.6.0 IR widening (PR 7); remove it from the spec for now";
+
+function pending060(path: string, hint?: string): CompilerError {
+  return new CompilerError(`${path}${PENDING_060_SUFFIX}${hint !== undefined ? ` (${hint})` : ""}`);
+}
+
+type LooseBlock = Readonly<Record<string, unknown>>;
+
+function asLooseBlock(value: unknown): LooseBlock | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as LooseBlock)
+    : undefined;
+}
+
+/** The first of `keys` that is DECLARED (not undefined) on `block`, if any. */
+function firstDeclaredKey(block: LooseBlock, keys: readonly string[]): string | undefined {
+  for (const key of keys) {
+    if (block[key] !== undefined) return key;
+  }
+  return undefined;
+}
+
+/** `model_pool` siblings of `routing`/`learning` added by §7.1. */
+const PENDING_060_POOL_KEYS = [
+  "directives",
+  "rules",
+  "classifier",
+  "strategy",
+  "reward",
+  "scope",
+] as const;
+/** What a pool candidate lowers as today (`lowerModelFailover`); everything else is §7.1 inline profile fields + `enabled`. */
+const LOWERED_CANDIDATE_KEYS: ReadonlySet<string> = new Set(["model", "tags"]);
+/** `kind: judge` gate panel fields (§6.2) + the cascade target (§7.3). */
+const PENDING_060_JUDGE_GATE_KEYS = [
+  "judges",
+  "repeats",
+  "temperature",
+  "target",
+  "escalate_to",
+] as const;
+/** In-loop `llm_judge` grader panel fields (§6.2). */
+const PENDING_060_GRADER_KEYS = ["judges", "repeats", "temperature", "target"] as const;
+/** §7.7 sub-agent routing + params (sub-agents carried none of these before 0.6.0). */
+const PENDING_060_SUB_AGENT_KEYS = [
+  "model_pool",
+  "model_tiers",
+  "model_fallbacks",
+  "circuit_breaker",
+  "thinking",
+  "max_tokens",
+  "temperature",
+  "budget_share",
+  "inherit_routing",
+  "allowed_profiles",
+] as const;
+/** §7.7 graph-node routing (graph nodes carried NO routing before 0.6.0). */
+const PENDING_060_NODE_ROUTING_KEYS = [
+  "model_pool",
+  "model_tiers",
+  "model_fallbacks",
+  "circuit_breaker",
+] as const;
+
+function assertPoolLowerable(path: string, pool: LooseBlock): void {
+  if (pool["policy"] === "classifier") {
+    throw pending060(`${path}.policy: classifier`, "use static | heuristic | learned");
+  }
+  const sibling = firstDeclaredKey(pool, PENDING_060_POOL_KEYS);
+  if (sibling !== undefined) throw pending060(`${path}.${sibling}`);
+  const candidates = Array.isArray(pool["candidates"]) ? pool["candidates"] : [];
+  for (const [i, raw] of candidates.entries()) {
+    const candidate = asLooseBlock(raw);
+    if (candidate === undefined) continue;
+    for (const key of Object.keys(candidate)) {
+      if (!LOWERED_CANDIDATE_KEYS.has(key) && candidate[key] !== undefined) {
+        throw pending060(
+          `${path}.candidates[${i}].${key}`,
+          "a pool candidate lowers as { model, tags } today",
+        );
+      }
+    }
+  }
+}
+
+function assertRoutedBlockLowerable(
+  path: string,
+  block: LooseBlock,
+  opts: { readonly nodeRouting: boolean },
+): void {
+  if (block["temperature"] !== undefined) throw pending060(`${path}.temperature`);
+  if (opts.nodeRouting) {
+    const routingKey = firstDeclaredKey(block, PENDING_060_NODE_ROUTING_KEYS);
+    if (routingKey !== undefined) {
+      throw pending060(`${path}.${routingKey}`, "graph nodes carry no model routing before 0.6.0");
+    }
+  }
+  const pool = asLooseBlock(block["model_pool"]);
+  if (pool !== undefined) assertPoolLowerable(`${path}.model_pool`, pool);
+  const judge = asLooseBlock(block["judge"]);
+  if (judge !== undefined) {
+    const judgeKey = firstDeclaredKey(judge, PENDING_060_JUDGE_GATE_KEYS);
+    if (judgeKey !== undefined) throw pending060(`${path}.judge.${judgeKey}`);
+  }
+  const subAgents = asLooseBlock(block["sub_agents"]);
+  if (subAgents !== undefined) {
+    for (const [name, raw] of Object.entries(subAgents)) {
+      const def = asLooseBlock(raw);
+      if (def === undefined) continue;
+      const subKey = firstDeclaredKey(def, PENDING_060_SUB_AGENT_KEYS);
+      if (subKey !== undefined) throw pending060(`${path}.sub_agents.${name}.${subKey}`);
+    }
+  }
+}
+
+/**
+ * Throw a path-precise `CompilerError` on the FIRST pending 0.6.0 spec key
+ * the spec declares; return silently on a 0.5.x-shaped spec. Runs once from
+ * `lower()`, before the per-shape switch.
+ */
+function assertNoPending060Keys(spec: Spec): void {
+  const s = spec as unknown as LooseBlock;
+  // §4.1 — the registry. The spec rejects any `$profile` reference without
+  // one, so this single check also keeps a literal `$fast` out of the
+  // model-router grammar until `resolveModelRef` lands.
+  if (s["models"] !== undefined) {
+    throw pending060(
+      "models: (the model-profile registry)",
+      "inline the profile's settings on the slot",
+    );
+  }
+  // §5 item 5 — narrowing-only trust flags on MCP tools.
+  const mcpServers = asLooseBlock(s["mcp_servers"]);
+  if (mcpServers !== undefined) {
+    for (const [name, raw] of Object.entries(mcpServers)) {
+      if (asLooseBlock(raw)?.["tool_flags"] !== undefined) {
+        throw pending060(`mcp_servers.${name}.tool_flags`);
+      }
+    }
+  }
+  // §6.2 / §7.3 — in-loop evaluation.
+  const evaluation = asLooseBlock(s["evaluation"]);
+  if (evaluation !== undefined) {
+    if (evaluation["on_fail"] === "escalate") {
+      throw pending060("evaluation.on_fail: escalate", "use retry | halt | note");
+    }
+    if (evaluation["allow_self_judge"] !== undefined)
+      throw pending060("evaluation.allow_self_judge");
+    const grader = asLooseBlock(evaluation["grader"]);
+    if (grader !== undefined) {
+      const graderKey = firstDeclaredKey(grader, PENDING_060_GRADER_KEYS);
+      if (graderKey !== undefined) throw pending060(`evaluation.grader.${graderKey}`);
+    }
+  }
+  // §7.7 — the crew llm router's model slot.
+  if (spec.target === "crew" && asLooseBlock(s["routing"])?.["model"] !== undefined) {
+    throw pending060("routing.model", "the kind: llm router runs on the entry role's model today");
+  }
+  // The routed blocks: the agent block (cli/channel/managed and the pooled
+  // single-agent shapes), workflow steps, graph nodes, crew roles — and the
+  // sub-agents hanging off any of them.
+  const agent = asLooseBlock(s["agent"]);
+  if (agent !== undefined) assertRoutedBlockLowerable("agent", agent, { nodeRouting: false });
+  if (Array.isArray(s["steps"])) {
+    for (const [i, raw] of s["steps"].entries()) {
+      const step = asLooseBlock(raw);
+      if (step !== undefined)
+        assertRoutedBlockLowerable(`steps[${i}]`, step, { nodeRouting: false });
+    }
+  }
+  const nodes = asLooseBlock(s["nodes"]);
+  if (nodes !== undefined) {
+    for (const [name, raw] of Object.entries(nodes)) {
+      const node = asLooseBlock(raw);
+      if (node !== undefined)
+        assertRoutedBlockLowerable(`nodes.${name}`, node, { nodeRouting: true });
+    }
+  }
+  const roles = asLooseBlock(s["roles"]);
+  if (roles !== undefined) {
+    for (const [name, raw] of Object.entries(roles)) {
+      const role = asLooseBlock(raw);
+      if (role !== undefined)
+        assertRoutedBlockLowerable(`roles.${name}`, role, { nodeRouting: false });
+    }
+  }
+}
+
 function lowerModelFailover(agent: SpecAgentWithFailover): {
   modelFallbacks?: readonly string[];
   circuitBreaker?: IrCircuitBreaker;
@@ -1117,13 +1335,10 @@ function lowerModelFailover(agent: SpecAgentWithFailover): {
   // defaults), so only defined optional blocks are attached.
   const mp = agent.model_pool;
   if (mp !== undefined) {
-    // 0.6.0 — the spec accepts `policy: classifier` (§7.2.3); the IR/router
-    // gain the policy with the model-plan lowering (PR 7). Until then it is
-    // a loud compile error rather than a silently downgraded pool.
+    // 0.6.0 — tsc narrowing only (`assertNoPending060Keys` already ran in
+    // `lower()`): the IR policy enum has not widened yet (PR 7).
     if (mp.policy === "classifier") {
-      throw new CompilerError(
-        "model_pool.policy: classifier is accepted by the spec but not yet lowered by this compiler — the classifier policy lands with the 0.6.0 IR widening; use static | heuristic | learned for now",
-      );
+      throw pending060("model_pool.policy: classifier", "use static | heuristic | learned");
     }
     const objective = mp.objective;
     const routing = mp.routing;
@@ -1453,13 +1668,10 @@ type SpecWithEvaluation = SpecWithPermissions & {
 function lowerEvaluation(spec: SpecWithEvaluation): { evaluation?: IrEvaluation } {
   const e = spec.evaluation;
   if (e === undefined) return {};
-  // 0.6.0 — the spec accepts `on_fail: escalate` (§7.3); `IrEvaluation.onFail`
-  // gains the variant with the model-plan lowering (PR 7). Until then it is a
-  // loud compile error rather than a silently substituted `retry`.
+  // 0.6.0 — tsc narrowing only (`assertNoPending060Keys` already ran in
+  // `lower()`): `IrEvaluation.onFail` has not widened yet (PR 7).
   if (e.on_fail === "escalate") {
-    throw new CompilerError(
-      "evaluation.on_fail: escalate is accepted by the spec but not yet lowered by this compiler — the cascade lands with the 0.6.0 IR widening; use retry | halt | note for now",
-    );
+    throw pending060("evaluation.on_fail: escalate", "use retry | halt | note");
   }
   const grader: IrEvaluation["grader"] =
     e.grader.type === "llm_judge"
@@ -2605,18 +2817,10 @@ export function assertChainGameLowered(
 }
 
 export function lower(spec: Spec): IrNode {
-  // 0.6.0 §4.1 — the `models:` profile registry parses on every shape from
-  // this release, and every `$profile` reference REQUIRES it (the spec's
-  // cross-field check rejects a ref without a registry). Reference
-  // resolution (`resolveModelRef`) lands with the IR widening (PR 7); until
-  // then a declared registry is a loud compile error, so no bundle can ever
-  // carry a literal `$fast` into the model-router grammar. Absent ⇒ the
-  // lowering below is byte-identical to 0.5.x.
-  if (spec.models !== undefined) {
-    throw new CompilerError(
-      "models: (the 0.6.0 model-profile registry) is accepted by the spec but not yet lowered by this compiler — profile resolution lands with the 0.6.0 IR widening; inline the profile's settings on the slot for now",
-    );
-  }
+  // 0.6.0 PR 6 — every §11.1 spec key parses, none is lowered until PR 7:
+  // refuse the whole delta loudly and path-precisely (see the guard section
+  // above `lowerModelFailover`). Absent ⇒ byte-identical to 0.5.x.
+  assertNoPending060Keys(spec);
   switch (spec.target) {
     case "cli": {
       // v0.3.0 Goal 1 — DEFAULT-ON continuity (the release's one sanctioned
