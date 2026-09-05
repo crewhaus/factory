@@ -26,7 +26,8 @@ import { join } from "node:path";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import type { Clock, ProcessOps, SpawnRequest, SpawnedProcess } from "@crewhaus/harness-supervisor";
 import { hashSpecSource } from "@crewhaus/harness-supervisor";
-import { runDaemonCommand } from "./daemon-cmd";
+import { createFileBackedRegistry } from "@crewhaus/spec-registry";
+import { registryPinFreshness, runDaemonCommand } from "./daemon-cmd";
 
 // --- seams -----------------------------------------------------------------
 
@@ -999,6 +1000,95 @@ describe("crewhaus daemon", () => {
       expect(f.ops.children.length).toBe(2);
       expect(f.ops.last()?.request.argv.join(" ")).toBe(firstArgv as string);
       expect(out.lines[0]).toContain("restarted run_");
+    } finally {
+      f.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §9.4 — `daemon status` pin freshness (the restart-to-serve-pin signal)
+// ---------------------------------------------------------------------------
+
+describe("crewhaus daemon status — registry pin freshness", () => {
+  /** Stamp the fixture's bundle as compiled from `specYaml` (what `compile` writes). */
+  function stampBundle(dir: string, specYaml: string): void {
+    writeFileSync(
+      join(dir, "dist", "package.json"),
+      `${JSON.stringify({
+        name: "crewhaus-compiled-bundle",
+        crewhaus: { specHash: hashSpecSource(specYaml), compiledWith: "0.6.0" },
+      })}\n`,
+    );
+  }
+
+  test("no registry, no pins → not a word about pins (the common case adds no output)", async () => {
+    const f = fixture();
+    try {
+      const out = await runDaemonCommand(["status"], f.opts);
+      expect(out.lines.join("\n")).not.toContain("pins (");
+      const json = JSON.parse(
+        (await runDaemonCommand(["status", "--json"], f.opts)).lines.join("\n"),
+      ) as Record<string, unknown>;
+      expect(json["pins"]).toBeNull();
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a pin the running bundle was compiled from is `served`; a newer pin says restart-to-serve-pin", async () => {
+    const f = fixture();
+    try {
+      const specYaml = readFileSync(join(f.dir, "crewhaus.yaml"), "utf8");
+      stampBundle(f.dir, specYaml);
+      const reg = createFileBackedRegistry({ rootDir: join(f.dir, ".crewhaus", "specs") });
+      await reg.put("daemon-fixture", "v1", specYaml);
+      await reg.put("daemon-fixture", "v2", `${specYaml}budget:\n  usd: 1\n`);
+      await reg.pin("daemon-fixture", "staging", "v1");
+      await reg.pin("daemon-fixture", "prod", "v2");
+
+      const text = (await runDaemonCommand(["status"], f.opts)).lines.join("\n");
+      expect(text).toContain("pins (");
+      expect(text).toContain("staging → v1 · served by the compiled bundle");
+      expect(text).toContain("prod → v2 · NOT served");
+      expect(text).toContain("restart-to-serve-pin");
+      expect(text).toContain("crewhaus daemon restart");
+
+      const json = JSON.parse(
+        (await runDaemonCommand(["status", "--json"], f.opts)).lines.join("\n"),
+      ) as { pins: { entries: Array<{ env: string; version: string; state: string }> } };
+      expect(json.pins.entries).toEqual([
+        expect.objectContaining({ env: "prod", version: "v2", state: "not-served" }),
+        expect.objectContaining({ env: "staging", version: "v1", state: "served" }),
+      ]);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("an unstamped bundle cannot be compared, and says so instead of guessing", async () => {
+    const f = fixture();
+    try {
+      const specYaml = readFileSync(join(f.dir, "crewhaus.yaml"), "utf8");
+      const reg = createFileBackedRegistry({ rootDir: join(f.dir, ".crewhaus", "specs") });
+      await reg.put("daemon-fixture", "v1", specYaml);
+      await reg.pin("daemon-fixture", "prod", "v1");
+      const text = (await runDaemonCommand(["status"], f.opts)).lines.join("\n");
+      expect(text).toContain("prod → v1 · cannot compare");
+      expect(text).toContain("no spec-hash stamp");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("registryPinFreshness is undefined for a registry that holds versions but pins nothing", async () => {
+    const f = fixture();
+    try {
+      const reg = createFileBackedRegistry({ rootDir: join(f.dir, ".crewhaus", "specs") });
+      await reg.put("daemon-fixture", "v1", "name: daemon-fixture\n");
+      expect(
+        await registryPinFreshness({ dir: f.dir, target: "channel", specName: "daemon-fixture" }),
+      ).toBeUndefined();
     } finally {
       f.cleanup();
     }

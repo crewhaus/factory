@@ -1608,7 +1608,17 @@ export const INCIDENT_SCHEMA: ParseArgsSchema = {
 // current CLI's spec version, run the migration chain (validated), show a diff.
 // --dry-run (default) previews; --write applies.
 export const UPGRADE_SCHEMA: ParseArgsSchema = {
-  flags: [{ name: "dry-run" }, { name: "write" }, { name: "help", short: "h" }],
+  flags: [
+    { name: "dry-run" },
+    { name: "write" },
+    // 0.6.0 §9.2 — lift repeated {model, thinking, max_tokens} triples into
+    // models: profiles (proposal by default; --write applies).
+    { name: "hoist-models" },
+    // With --write --hoist-models: re-key arms.jsonl lines whose candidate
+    // became a profile, instead of printing the learned-history reset note.
+    { name: "rewrite-arms" },
+    { name: "help", short: "h" },
+  ],
 };
 
 export const BUILD_IMAGE_SCHEMA: ParseArgsSchema = {

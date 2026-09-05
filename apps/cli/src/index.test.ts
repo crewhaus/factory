@@ -3199,3 +3199,63 @@ describe("crewhaus dev (item 2)", () => {
     expect(result.stderr).toContain("dev:");
   });
 });
+
+describe("crewhaus upgrade --hoist-models — arm identity on this runtime (0.6.0 §7.9, §9.2)", () => {
+  const POOLED_SPEC = [
+    "name: pooled",
+    "target: cli",
+    "agent:",
+    "  model: claude-opus-4-8",
+    "  thinking: { effort: high }",
+    "  instructions: Help.",
+    "  model_pool:",
+    "    candidates:",
+    "      - { model: claude-haiku-4-5, tags: [cheap] }",
+    "      - { model: claude-opus-4-8, tags: [strong], thinking: { effort: high } }",
+    "    policy: learned",
+    "",
+  ].join("\n");
+  const ARM_LINE = JSON.stringify({ v: 1, k: "hard", m: "claude-opus-4-8", r: 0.5, s: 1, l: 10 });
+
+  function seedHarness(): { spec: string; arms: string } {
+    const spec = join(tmp, "crewhaus.yaml");
+    writeFileSync(spec, POOLED_SPEC);
+    const routing = join(tmp, ".crewhaus", "routing");
+    mkdirSync(routing, { recursive: true });
+    const arms = join(routing, "arms.jsonl");
+    writeFileSync(arms, `${ARM_LINE}\n`);
+    return { spec, arms };
+  }
+
+  test("--rewrite-arms is REFUSED: the runtime records arms under the model string, so nothing is touched", async () => {
+    const { spec, arms } = seedHarness();
+    const result = await runCli(["upgrade", spec, "--hoist-models", "--write", "--rewrite-arms"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("--rewrite-arms needs the profile-keyed scoreboard");
+    expect(result.stderr).toContain("records pool arms under the model string");
+    // Refused BEFORE any work: the spec and the arms file are byte-identical.
+    expect(readFileSync(spec, "utf-8")).toBe(POOLED_SPEC);
+    expect(readFileSync(arms, "utf-8")).toBe(`${ARM_LINE}\n`);
+  });
+
+  test("--rewrite-arms without --hoist-models keeps its usage error", async () => {
+    const { spec } = seedHarness();
+    const result = await runCli(["upgrade", spec, "--rewrite-arms"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("--rewrite-arms requires --hoist-models");
+  });
+
+  test("--hoist-models --write leaves arms.jsonl alone and says the arm id stays the model string today", async () => {
+    const { spec, arms } = seedHarness();
+    const result = await runCli(["upgrade", spec, "--hoist-models", "--write"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("hoist-models: 1 profile(s)");
+    expect(result.stdout).toContain("records pool arms under the model string");
+    expect(result.stdout).toContain("claude-opus-4-8 → $default (1 line(s) recorded)");
+    expect(result.stdout).toContain("--rewrite-arms is refused on this runtime");
+    expect(result.stdout).not.toContain("arm id becomes the profile name");
+    // The spec was hoisted; the learned history was not re-keyed.
+    expect(readFileSync(spec, "utf-8")).toContain("model: $default");
+    expect(readFileSync(arms, "utf-8")).toBe(`${ARM_LINE}\n`);
+  });
+});
