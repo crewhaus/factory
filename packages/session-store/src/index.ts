@@ -50,8 +50,32 @@ export type Session = {
   updatedAt: string;
   name: string;
   target: string;
+  /**
+   * The declared primary model — a plain string, and it STAYS one:
+   * `isSessionShape` requires it (`--resume` and every channel-thread resume
+   * would break otherwise), so the 0.6.0 hybrid fields below are additive.
+   */
   model: string;
   lastTurnIndex: number;
+  // ---- 0.6.0 (design §7.2.1, §8.1) — additive, both OPTIONAL. Session files
+  // written before this release keep parsing; readers that build rows from an
+  // explicit key list (hangar-server's `listSessions`) are unaffected. ----
+  /**
+   * A per-session `/model <arm>` directive pin: the roster arm id (profile
+   * name or spec model string) the user asked to stick to. Written by the
+   * directive seam (`/model auto` clears it); read back through
+   * {@link resolveSessionPin}, which treats the on-disk value as UNTRUSTED
+   * (type check + roster membership) rather than trusting it because it came
+   * off disk.
+   */
+  pin?: string;
+  /**
+   * Every wire model id that has SERVED this session, in first-seen order —
+   * the durable answer to "which models did this conversation actually use"
+   * when a pool, tiers or a failover chain make `model` only the declared
+   * primary. Maintained through {@link mergeSessionModels}.
+   */
+  models?: string[];
 };
 
 export type SessionStoreOptions = {
@@ -67,7 +91,56 @@ export type CreateOpts = {
   readonly model: string;
 };
 
-export type SessionPatch = Partial<Pick<Session, "name" | "target" | "model" | "lastTurnIndex">>;
+/**
+ * What `update()` accepts. 0.6.0 widens the `Pick` with the two additive
+ * fields: `pin` also accepts `null`, which REMOVES the key (the `/model auto`
+ * clear) — `undefined` in a patch means "leave as is", so a distinct clear
+ * value is needed.
+ */
+export type SessionPatch = Partial<
+  Pick<Session, "name" | "target" | "model" | "lastTurnIndex" | "models">
+> & { pin?: string | null };
+
+/**
+ * 0.6.0 (design §7.2.1) — read a session's `/model` pin as UNTRUSTED input.
+ * Returns the pin only when it is a string AND names an arm in `roster` (the
+ * spec's declared profile names / candidate model strings); otherwise falls
+ * back to auto (`pin: undefined`) with a recorded `reason`, so a hand-edited
+ * or stale session file can never steer routing to an arm the spec does not
+ * declare. An absent pin is auto with no reason.
+ */
+export function resolveSessionPin(
+  session: Pick<Session, "pin">,
+  roster: ReadonlyArray<string>,
+): { readonly pin: string | undefined; readonly reason?: string } {
+  const raw: unknown = session.pin;
+  if (raw === undefined) return { pin: undefined };
+  if (typeof raw !== "string" || raw.length === 0) {
+    return { pin: undefined, reason: "session pin is not a string — falling back to auto" };
+  }
+  if (!roster.includes(raw)) {
+    return {
+      pin: undefined,
+      reason: `session pin "${raw}" is not in the roster — falling back to auto`,
+    };
+  }
+  return { pin: raw };
+}
+
+/**
+ * 0.6.0 (design §8.1) — fold a served wire model id into a session's
+ * `models` list: first-seen order, no duplicates, the input never mutated.
+ * Returns the same array instance when nothing changed so a writer can skip
+ * the `update()` round-trip.
+ */
+export function mergeSessionModels(
+  existing: ReadonlyArray<string> | undefined,
+  served: string,
+): string[] {
+  const base = existing ?? [];
+  if (base.includes(served)) return base as string[];
+  return [...base, served];
+}
 
 export interface SessionStore {
   create(opts: CreateOpts): Promise<Session>;
@@ -267,7 +340,7 @@ export function createSessionStore(opts: SessionStoreOptions = {}): SessionStore
     if (!isSessionShape(parsed)) {
       throw new RuntimeError(`session-store: unexpected JSON shape for "${id}"`);
     }
-    return parsed;
+    return normalizeAdditiveFields(parsed);
   }
 
   return {
@@ -318,9 +391,16 @@ export function createSessionStore(opts: SessionStoreOptions = {}): SessionStore
       if (current === null) {
         throw new RuntimeError(`session-store: cannot update missing session "${id}"`);
       }
+      const { pin, ...rest } = patch;
+      // 0.6.0 — `pin: null` clears (the key is OMITTED, not set to undefined,
+      // so a cleared file is byte-identical to one never pinned); a string
+      // sets; `undefined`/absent leaves the current pin alone.
+      const { pin: currentPin, ...currentWithoutPin } = current;
+      const nextPin = pin === null ? undefined : pin === undefined ? currentPin : pin;
       const next: Session = {
-        ...current,
-        ...patch,
+        ...currentWithoutPin,
+        ...rest,
+        ...(nextPin !== undefined ? { pin: nextPin } : {}),
         updatedAt: now().toISOString(),
       };
       await writeAtomic(next);
@@ -531,6 +611,9 @@ export function summarizeSessionIntoIndex(
 function isSessionShape(value: unknown): value is Session {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
+  // 0.6.0 — `pin` / `models` are deliberately NOT part of the shape check: a
+  // malformed additive field must never make a session unreadable (which
+  // would break `--resume`); `normalizeAdditiveFields` drops it instead.
   return (
     typeof v["id"] === "string" &&
     typeof v["createdAt"] === "string" &&
@@ -540,6 +623,24 @@ function isSessionShape(value: unknown): value is Session {
     typeof v["model"] === "string" &&
     typeof v["lastTurnIndex"] === "number"
   );
+}
+
+/**
+ * 0.6.0 — coerce the two additive fields on load: a non-string `pin` is
+ * dropped, a `models` that is not an array of strings is dropped (a mixed
+ * array keeps its string members). Everything else passes through untouched,
+ * so a 0.5.x file round-trips byte-identically through `update()`.
+ */
+function normalizeAdditiveFields(session: Session): Session {
+  const { pin, models, ...rest } = session as Record<string, unknown> & Session;
+  const hasPin = "pin" in session;
+  const hasModels = "models" in session;
+  if (!hasPin && !hasModels) return session;
+  const validPin = typeof pin === "string" ? { pin } : {};
+  const validModels = Array.isArray(models)
+    ? { models: (models as unknown[]).filter((m): m is string => typeof m === "string") }
+    : {};
+  return { ...rest, ...validPin, ...validModels } as Session;
 }
 
 // ===========================================================================

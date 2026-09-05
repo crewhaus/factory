@@ -184,9 +184,28 @@ export class Registry {
   // the same unit `CostAccrualEvent.costUsdMicros` and audit-log carry, so a
   // dashboard divides by 1e6 once. Per-call accruals only: the aggregate
   // run-total accrual (`summary: true`) is skipped so it never double-counts.
+  // 0.6.0 (design §8.4) — the `role` label (absent on the accrual ⇒
+  // `primary`) splits spend by PURPOSE, so a judge's or a shadow lane's spend
+  // is visible beside the answer's own. Existing `sum by (provider, model)`
+  // queries are unaffected; a `sum by (role)` becomes possible.
   readonly costUsdMicrosTotal = new Counter(
     "crewhaus_cost_usd_micros_total",
-    "Total model spend in microdollars (1e-6 USD) by provider and model",
+    "Total model spend in microdollars (1e-6 USD) by provider, model and role",
+  );
+  // 0.6.0 (design §8.4) — routing decisions and escalations. One
+  // `model_route` per pool decision, labeled by the pool's scope, learning
+  // bucket, chosen profile (or `-` for an inline candidate), policy and
+  // whether the learned policy was exploring. Escalations count every
+  // `model_stage` an `escalation`-role stage STARTS plus every
+  // `model_tier_route` marked `escalated` (a fast→default misroute
+  // recovery), labeled by `source` so the two lanes stay distinguishable.
+  readonly modelRouteTotal = new Counter(
+    "crewhaus_model_route_total",
+    "Model-pool routing decisions by scope, routeKey, profile, policy and explored",
+  );
+  readonly modelEscalationsTotal = new Counter(
+    "crewhaus_model_escalations_total",
+    "Model escalations by source (stage: a hybrid-strategy escalation stage; tier: a fast-tier misroute recovery)",
   );
   readonly turnDurationSeconds = new Histogram(
     "crewhaus_turn_duration_seconds",
@@ -274,6 +293,8 @@ export class Registry {
       this.tokensTotal,
       this.errorsTotal,
       this.costUsdMicrosTotal,
+      this.modelRouteTotal,
+      this.modelEscalationsTotal,
       this.evalVerdictsTotal,
       this.responseRatingsTotal,
       this.evalRunsTotal,
