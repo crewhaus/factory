@@ -20,6 +20,34 @@ const safeName = z
   );
 
 /**
+ * 0.6.0 §4.1 — the `models:` profile-name grammar. Deliberately NARROWER
+ * than `safeName`: a profile name becomes an arm id in `arms.jsonl`, a key
+ * in generated source and the `$<name>` reference sigil every model slot
+ * accepts, so the charset is lowercase-first `[a-z][a-z0-9_-]{0,63}` —
+ * first-character-disjoint from the documented `$UPPER_SNAKE` env-ref
+ * convention (`ENV_REF_RE` in the compiler), so a profile ref can never read
+ * as a secret ref and vice versa.
+ *
+ * DUPLICATED from `PROFILE_NAME_RE` in `@crewhaus/model-plan` (the runtime
+ * resolver's source of truth) because the spec package stays
+ * dependency-light — it must not import runtime packages. Keep in sync; the
+ * compiler PR that depends on both packages pins the two literals equal.
+ */
+export const SPEC_PROFILE_NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
+
+const profileName = z
+  .string()
+  .regex(
+    SPEC_PROFILE_NAME_RE,
+    "profile name must be lowercase-first: letters, digits, '_' and '-' only, at most 64 characters (/^[a-z][a-z0-9_-]{0,63}$/)",
+  );
+
+/** The `$<profile>` reference form every model slot accepts (0.6.0 §4.1). */
+function profileRefName(value: string): string | undefined {
+  return value.startsWith("$") ? value.slice(1) : undefined;
+}
+
+/**
  * v0 spec schema — a discriminated union over `target`.
  *
  * - `cli`: a single streaming-chat agent (Section 1–5).
@@ -106,6 +134,40 @@ const permissionsBlock = z
  */
 const mcpRequiredField = z.boolean().optional();
 
+/**
+ * 0.6.0 §5.5 — MCP tool trust flags, NARROWING-ONLY. Every MCP tool is
+ * `readOnly: false` today and therefore asks in default mode; `tool_flags`
+ * lets a spec tighten what the runtime knows about a server's tools
+ * (`defaults` for every tool on the server, `per_tool` for named ones).
+ *
+ * SECURITY: the enumerated key set is `{readOnly: true, destructive: true,
+ * requireJustification: true}` and each value is the literal `true` — a spec
+ * may never clear `requireJustification`, never set `scope: internal` on an
+ * `mcp__*` tool and never touch `ioCapability`. Loosening any of those would
+ * punch straight through the egress chokepoint, which keys on
+ * `scope === "external"`, so the schema rejects the loosening direction at
+ * parse time (defense in depth, mirroring `permissions.mode: bypass`).
+ */
+const MCP_TOOL_FLAG_FORBIDDEN_KEYS = ["scope", "ioCapability", "classifyOutput"] as const;
+
+const mcpToolFlagsEntrySchema = z
+  .object({
+    readOnly: z.literal(true).optional(),
+    destructive: z.literal(true).optional(),
+    requireJustification: z.literal(true).optional(),
+  })
+  .strict(
+    `mcp_servers.<name>.tool_flags may only TIGHTEN a tool's trust flags (readOnly: true, destructive: true, requireJustification: true); ${MCP_TOOL_FLAG_FORBIDDEN_KEYS.join(", ")} and every other RegisteredTool property are tool-author facts a spec cannot override`,
+  );
+
+const mcpToolFlagsBlock = z
+  .object({
+    defaults: mcpToolFlagsEntrySchema.optional(),
+    per_tool: z.record(z.string().min(1), mcpToolFlagsEntrySchema).optional(),
+  })
+  .strict()
+  .optional();
+
 const stdioMcpConfig = z
   .object({
     transport: z.literal("stdio"),
@@ -113,6 +175,7 @@ const stdioMcpConfig = z
     args: z.array(z.string()).optional(),
     env: z.record(z.string()).optional(),
     required: mcpRequiredField,
+    tool_flags: mcpToolFlagsBlock,
   })
   .strict();
 
@@ -122,6 +185,7 @@ const sseMcpConfig = z
     url: z.string().url(),
     headers: z.record(z.string()).optional(),
     required: mcpRequiredField,
+    tool_flags: mcpToolFlagsBlock,
   })
   .strict();
 
@@ -129,43 +193,10 @@ const mcpServerConfigSchema = z.discriminatedUnion("transport", [stdioMcpConfig,
 
 const mcpServersBlock = z.record(z.string().min(1), mcpServerConfigSchema).optional();
 
-// Section 13 — sub-agent definitions. Inline on the agent block (cli +
-// channel today; workflow has no agent block). The map's key is the
-// `subagent_type` users pass to the Task tool. Permissions field mirrors
-// the runtime's resolution shape.
-const subAgentDefinitionSchema = z
-  .object({
-    description: z.string().min(1),
-    instructions: z.string().min(1),
-    tools: z.array(z.string().min(1)).optional(),
-    model: z.string().min(1).optional(),
-    permissions: z
-      .union([
-        z.enum(["inherit", "scoped"]),
-        z
-          .object({
-            allow: z.array(z.string().min(1)),
-            deny: z.array(z.string().min(1)),
-          })
-          .strict(),
-      ])
-      .optional(),
-    inherit_bypass: z.boolean().optional(),
-    /**
-     * Item 2 (G31 — A2A federation) — wire this sub-agent to a REMOTE peer
-     * instead of spawning it locally. `url` is the peer deployment's base
-     * URL; the spawner routes the Task call through `@crewhaus/federation-
-     * router` to the peer's inbound A2A handler (whose Agent Card lives at
-     * `<url>/.well-known/agent-card.json`), mapping the federation envelope
-     * onto A2A message/task semantics. Present ⇒ the entry is a federated
-     * peer reference; `description`/`instructions` still describe it to the
-     * parent's Task tool (the remote peer owns its own prompt).
-     */
-    federation: z.object({ url: z.string().url() }).strict().optional(),
-  })
-  .strict();
-
-const subAgentsBlock = z.record(safeName, subAgentDefinitionSchema).optional();
+// Section 13 — sub-agent definitions (`subAgentDefinitionSchema` /
+// `subAgentsBlock`) are declared below the model-profile section: from
+// 0.6.0 a sub-agent carries the same routing blocks as an agent (§7.7), so
+// its schema depends on `modelPoolBlock` and `thinkingBlock`.
 
 /**
  * Section 14 — per-tool runtime config map. Tool-specific schemas live
@@ -343,62 +374,15 @@ const modelTiersBlock = z
  *     floor and the cost/latency reward references.
  *
  * Omitted entirely → single-model behaviour, byte-identical bundles.
+ *
+ * 0.6.0 §7.1 — the pool is ALSO the hybrid container: `rules`, `directives`,
+ * `classifier`, `strategy`, `reward` and `scope` are declared as SIBLINGS of
+ * `routing`/`learning` (the optimizer whitelists those two wholesale, and
+ * none of the new blocks is optimizer-tunable), and every candidate may
+ * carry the per-model profile fields inline (`modelPoolCandidateSchema`).
+ * The block itself is declared below the model-profile section it depends
+ * on; see `modelPoolBlock` there.
  */
-const modelPoolBlock = z
-  .object({
-    candidates: z
-      .array(
-        z
-          .object({
-            model: z.string().min(1),
-            tags: z.array(z.string().min(1)).default([]),
-          })
-          .strict(),
-      )
-      .min(2),
-    policy: z.enum(["static", "heuristic", "learned"]).default("heuristic"),
-    objective: z
-      .object({
-        quality: z.number().min(0).optional(),
-        cost: z.number().min(0).optional(),
-        latency: z.number().min(0).optional(),
-      })
-      .strict()
-      .optional(),
-    routing: z
-      .object({
-        contextTokenThreshold: z.number().int().positive().optional(),
-        toolsToDefault: z.boolean().optional(),
-        firstTurnToDefault: z.boolean().optional(),
-        priorToolDensityThreshold: z.number().int().positive().optional(),
-        strongTag: z.string().min(1).optional(),
-        cheapTag: z.string().min(1).optional(),
-      })
-      .strict()
-      .optional(),
-    learning: z
-      .object({
-        minSamplesPerArm: z.number().int().positive().optional(),
-        costRefUsd: z.number().positive().optional(),
-        latencyRefMs: z.number().int().positive().optional(),
-        // ε for ε-greedy online exploration once every arm clears the sample
-        // floor (fraction of exploit-phase turns that try a non-best model).
-        // Default 0 → deterministic explore-then-exploit, no RNG.
-        explorationRate: z.number().min(0).max(1).optional(),
-        // Fixed exploration seed for reproducible-across-runs behaviour (e.g.
-        // tests). Omitted → the runtime seeds from the sessionId, so each run
-        // explores differently while still replaying from its own transcript.
-        seed: z.string().min(1).optional(),
-        // Exploit-phase exploration strategy. "epsilon-greedy" (default) uses
-        // explorationRate; "thompson" draws each arm from its reward posterior
-        // and self-balances (explorationRate is then ignored).
-        bandit: z.enum(["epsilon-greedy", "thompson"]).optional(),
-      })
-      .strict()
-      .optional(),
-  })
-  .strict()
-  .optional();
 
 /**
  * Mutual-exclusion refine shared by every agent block that carries model
@@ -406,15 +390,23 @@ const modelPoolBlock = z
  * ordered failover chain, so declaring it alongside either is an error rather
  * than an ambiguous double-route. (Per-candidate failover chains compose in a
  * later release; this release keeps precedence unambiguous.)
+ *
+ * 0.6.0 §4.1 — the same refine rejects `temperature` beside `thinking` on
+ * one block: the Anthropic API returns 400 for an explicit temperature
+ * alongside extended thinking (`adapter-anthropic`'s translate documents the
+ * silent drop), so the pair is a parse error rather than a surprise.
  */
 function refineModelSelection(
   agent: {
     model_pool?: unknown;
     model_tiers?: unknown;
     model_fallbacks?: unknown;
+    temperature?: unknown;
+    thinking?: unknown;
   },
   ctx: z.RefinementCtx,
 ): void {
+  refineTemperatureThinking(agent, ctx);
   if (agent.model_pool === undefined) return;
   if (agent.model_tiers !== undefined) {
     ctx.addIssue({
@@ -430,6 +422,26 @@ function refineModelSelection(
       message:
         "agent.model_pool and agent.model_fallbacks are mutually exclusive in this release — per-candidate failover chains are a future addition",
       path: ["model_fallbacks"],
+    });
+  }
+}
+
+/**
+ * 0.6.0 §4.1 — `temperature` and `thinking` on ONE block (agent / step /
+ * node / role / sub-agent / profile / pool candidate) is a parse error: the
+ * Anthropic API rejects an explicit temperature alongside extended thinking
+ * with a 400, and the adapter would otherwise drop the pin silently.
+ */
+function refineTemperatureThinking(
+  block: { temperature?: unknown; thinking?: unknown },
+  ctx: z.RefinementCtx,
+): void {
+  if (block.temperature !== undefined && block.thinking !== undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "temperature and thinking are mutually exclusive on one block — the Anthropic API rejects an explicit temperature alongside extended thinking (400); declare one or the other",
+      path: ["temperature"],
     });
   }
 }
@@ -655,6 +667,64 @@ const budgetBlock = z
  * it with a deterministic grader is a parse error. `.strict()` throughout
  * so a typo'd sub-key fails the build.
  */
+/**
+ * 0.6.0 §6.2 — the judge-panel knobs shared by the in-loop `evaluation.grader`
+ * (`llm_judge`) and the `kind: judge` gate. They map one-to-one onto
+ * `createJudgeGrader(rubric, {judges, repeats, temperature, target})` in
+ * `@crewhaus/eval-judge`:
+ *   - `judges`  — a PANEL of judge models (each a grammar string or a
+ *     `$profile`); mutually exclusive with the single `model`.
+ *   - `repeats` — k repeat verdicts per judge, folded by median (odd counts
+ *     avoid ties).
+ *   - `temperature` — the judge's pinned sampling temperature (0 is the
+ *     judge-bias literature's recommendation).
+ *   - `target` — `output` (default) grades the final text; `transcript`
+ *     grades the run trajectory digest.
+ * Categorical rubrics still reject panels and repeats (documented in
+ * eval-grader, not changed here).
+ */
+const judgePanelFields = {
+  judges: z
+    .array(z.string().min(1))
+    .min(1)
+    .optional()
+    .describe(
+      "judge PANEL: model ids (or $profile refs) whose verdicts are folded; mutually exclusive with model",
+    ),
+  repeats: z
+    .number()
+    .int()
+    .min(1)
+    .max(9)
+    .optional()
+    .describe("repeat verdicts per judge, folded by median (default 1)"),
+  temperature: z
+    .number()
+    .min(0)
+    .max(2)
+    .optional()
+    .describe("pinned judge sampling temperature (0 recommended for stable verdicts)"),
+  target: z
+    .enum(["output", "transcript"])
+    .optional()
+    .describe("what the judge grades: the final text (output, default) or the run trajectory"),
+} as const;
+
+/** `judges` (a panel) and `model` (one judge) name the same slot twice. */
+function refineJudgePanel(
+  block: { judges?: readonly string[]; model?: string },
+  ctx: z.RefinementCtx,
+  label: string,
+): void {
+  if (block.judges !== undefined && block.model !== undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["judges"],
+      message: `${label}.judges (a judge panel) and ${label}.model (one judge) are mutually exclusive — declare the panel OR the single judge`,
+    });
+  }
+}
+
 const evaluationGraderSchema = z.discriminatedUnion("type", [
   z
     .object({
@@ -664,7 +734,7 @@ const evaluationGraderSchema = z.discriminatedUnion("type", [
         .min(1)
         .optional()
         .describe(
-          "judge model id; defaults to the shape's primary model (the cheapest sentinel resolves at compile time)",
+          "judge model id or $profile ref; defaults to the shape's primary model (the cheapest sentinel resolves at compile time)",
         ),
       criteria: z
         .string()
@@ -672,6 +742,8 @@ const evaluationGraderSchema = z.discriminatedUnion("type", [
         .describe(
           "what a passing reply must satisfy — the judge scores the final text against this",
         ),
+      // 0.6.0 §6.2 — judge panels, repeats, pinned temperature, target.
+      ...judgePanelFields,
     })
     .strict()
     .describe("model-scored grader: an LLM judges the final text in [0,1] against criteria"),
@@ -701,10 +773,10 @@ const evaluationBlock = z
       .optional()
       .describe("passing score in 0..1 (default 0.7); llm_judge grader only"),
     on_fail: z
-      .enum(["retry", "halt", "note"])
+      .enum(["retry", "halt", "note", "escalate"])
       .optional()
       .describe(
-        "below-threshold behaviour: retry re-prompts with the judge rationale (default), halt aborts the turn classified, note emits a trace event only",
+        "below-threshold behaviour: retry re-prompts with the judge rationale (default), halt aborts the turn classified, note emits a trace event only, escalate (0.6.0) re-runs the turn on the pool's strategy.cascade.escalate_to candidate (else the strongest candidate)",
       ),
     max_retries: z
       .number()
@@ -713,9 +785,24 @@ const evaluationBlock = z
       .max(5)
       .optional()
       .describe("hard cap on evaluation-triggered retries per turn (default 1)"),
+    /**
+     * 0.6.0 §4.3 — silences the judge-independence lint (`crewhaus lint` /
+     * `doctor --philosophy-alignment` warn when a pooled or strategy spec's
+     * judge is the serving arm itself). Never optimizer-tunable: it is a
+     * measurement-integrity waiver, not a quality knob.
+     */
+    allow_self_judge: z
+      .boolean()
+      .optional()
+      .describe(
+        "0.6.0: accept a judge that is also a serving arm (silences the judge-independence lint)",
+      ),
   })
   .strict()
   .superRefine((e, ctx) => {
+    if (e.grader.type === "llm_judge") {
+      refineJudgePanel(e.grader, ctx, "evaluation.grader");
+    }
     if (e.threshold !== undefined && e.grader.type !== "llm_judge") {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -768,7 +855,7 @@ const judgeGateBlock = z
       .string()
       .min(1)
       .optional()
-      .describe("judge model id; defaults to the shape's top-level model"),
+      .describe("judge model id or $profile ref; defaults to the shape's top-level model"),
     threshold: z.number().min(0).max(1).optional().describe("passing score in 0..1 (default 0.7)"),
     on_fail: z
       .enum(["retry_previous", "halt", "continue"])
@@ -783,8 +870,24 @@ const judgeGateBlock = z
       .max(5)
       .optional()
       .describe("hard cap on judge-triggered re-runs of the gated step/node (default 1)"),
+    // 0.6.0 §6.2 — judge panels, repeats, pinned temperature, target.
+    ...judgePanelFields,
+    /**
+     * 0.6.0 §7.3 — the candidate a `retry_previous` re-run is FORCED onto:
+     * a tag or `$profile` from the gated step's/node's `model_pool` (the
+     * cascade's strong rung). Absent ⇒ the re-run keeps the gated block's
+     * own routing policy (today's behaviour).
+     */
+    escalate_to: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "0.6.0: pool tag or $profile the retry_previous re-run is forced onto (the gated step's/node's model_pool must declare it)",
+      ),
   })
   .strict()
+  .superRefine((j, ctx) => refineJudgePanel(j, ctx, "judge"))
   .describe("judge gate config for kind: judge workflow steps and graph nodes");
 
 /**
@@ -818,6 +921,22 @@ const thinkingBlock = z
     }
   })
   .optional();
+
+/**
+ * 0.6.0 §4.1 — the sampling-temperature knob, carried on the agent / step /
+ * node / role / sub-agent blocks and on every model profile and pool
+ * candidate. Mutually exclusive with `thinking` on the same block
+ * (`refineTemperatureThinking`). The range is the widest any in-tree
+ * provider accepts (OpenAI 0–2; Anthropic 0–1, and the Claude 5 family
+ * rejects the parameter outright — the adapter reports the drop through
+ * `effectiveParams`). OPTIMIZABLE at `agent.temperature` (0.6.0 §10.3, PR 19).
+ */
+const temperatureField = z
+  .number()
+  .min(0)
+  .max(2)
+  .optional()
+  .describe("sampling temperature (0–2); mutually exclusive with thinking on the same block");
 
 /**
  * Loop contract 0.4 (Batch A) — runaway-loop detection tuning inside the
@@ -947,6 +1066,491 @@ const rateLimitsBlock = z
       .strict(),
   )
   .optional();
+
+// ---------------------------------------------------------------------------
+// 0.6.0 — per-model settings and hybrid setups (design plan §4, §5, §7).
+//
+// A `models:` registry declares everything that can differ per model ONCE;
+// any model slot then references a profile as `$<name>`. A `model_pool`
+// candidate may carry the same fields inline. The spec layer carries the
+// declarations VERBATIM (no zod defaults on any new key, so a spec that omits
+// them parses — and lowers — byte-identically to 0.5.x); the compiler resolves
+// `$refs`, merges profile defaults field-by-field and validates the roster
+// at lower time.
+// ---------------------------------------------------------------------------
+
+/**
+ * 0.6.0 §5.4 — per-profile permissions, a RESTRICTED schema: `deny` and `ask`
+ * ONLY. `permissionsBlock` admits `alwaysAllow` rules, a `mode` and an
+ * `ask_mode`, and a yaml-tier `alwaysAllow` outranks the builtin floor
+ * guards in the permission engine — exactly the escalation the sub-agent
+ * permission inheritance was written to contain. A profile can therefore
+ * NARROW the shape's permissions (decision-level meet: deny < ask < allow),
+ * never widen them; the runtime proves the narrowing through `evaluate()`.
+ */
+const PROFILE_PERMISSION_FORBIDDEN_KEYS = [
+  "alwaysAllow",
+  "allow",
+  "mode",
+  "ask_mode",
+  "rules",
+] as const;
+
+const profilePermissionsBlock = z
+  .object({
+    deny: z.array(z.string().min(1)).optional(),
+    ask: z.array(z.string().min(1)).optional(),
+  })
+  .strict(
+    `a model profile's permissions may only NARROW the shape's: deny and ask lists only (${PROFILE_PERMISSION_FORBIDDEN_KEYS.join(", ")} are rejected — a profile can never widen what the shape allows)`,
+  )
+  .optional();
+
+/**
+ * 0.6.0 §7.11 (N1) — what a profile REQUIRES of its own model. The four
+ * feature booleans mirror `ProviderFeatures` in `@crewhaus/adapter-anthropic`
+ * (`tool_use`, `vision`, `thinking`, `web_search`); the two size floors are
+ * spelled as floors because a requirement is unambiguously one
+ * (`context_window_gte`, `max_output_tokens_gte` ↔ the capability table's
+ * `contextWindowGte` / `maxOutputTokensGte`). Validated at compile time for
+ * table-backed providers and re-checked per turn as an eligibility filter.
+ */
+const modelRequiresObject = z
+  .object({
+    tool_use: z.boolean().optional(),
+    vision: z.boolean().optional(),
+    thinking: z.boolean().optional(),
+    web_search: z.boolean().optional(),
+    context_window_gte: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("the model's context window must be KNOWN and at least this many tokens"),
+    max_output_tokens_gte: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("the model's max output must be KNOWN and at least this many tokens"),
+  })
+  .strict();
+
+const modelRequiresBlock = modelRequiresObject.optional();
+
+/**
+ * 0.6.0 §4.1 — a DECLARED capability override for models the capability
+ * table does not know (local / azure / named hosts): the same feature
+ * booleans plus the two size facts. Table-backed models never need it; a
+ * non-table model without it gets a compile warning that `adapter.features`
+ * is the only gate.
+ */
+const modelCapabilitiesBlock = z
+  .object({
+    tool_use: z.boolean().optional(),
+    vision: z.boolean().optional(),
+    thinking: z.boolean().optional(),
+    web_search: z.boolean().optional(),
+    caching: z.union([z.enum(["explicit", "automatic"]), z.literal(false)]).optional(),
+    context_window: z.number().int().positive().optional(),
+    max_output_tokens: z.number().int().positive().optional(),
+  })
+  .strict()
+  .optional();
+
+/**
+ * 0.6.0 §4.1 — the per-model settings a `models:` profile (and a pool
+ * candidate, inline) may declare. Everything is optional; a profile supplies
+ * DEFAULTS and slot-local fields override field-by-field at lower time
+ * (`tags` REPLACE the profile's tags when the slot declares any — they are
+ * the routing identity, not an accumulation).
+ */
+const modelProfileFields = {
+  /** Routing identity tags (`cheap`, `strong`, …). */
+  tags: z.array(z.string().min(1)).optional(),
+  /** Model max OUTPUT tokens for one call on this model. */
+  max_tokens: z.number().int().positive().optional(),
+  thinking: thinkingBlock,
+  temperature: temperatureField,
+  /**
+   * Per-model instructions OVERLAY: appended in the volatile region of the
+   * system prompt when this candidate serves (never busts the cached
+   * prefix); folded into `instructions` on a single-model slot.
+   */
+  instructions: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("per-model instructions overlay, appended when this model serves"),
+  /**
+   * SUBSET-ONLY tool selection — never additive. Builtin keys, server-scoped
+   * MCP globs (`mcp__<server>__*`), `Consult` / `Escalate` (only with
+   * `strategy.model_directed: true`). `[]` means ZERO shape tools (the
+   * auto-registered loop tools survive unless denied via `permissions`).
+   */
+  tools: z
+    .array(z.string().min(1))
+    .optional()
+    .describe("subset of the shape's tools this model may see; [] = no shape tools"),
+  /** Same `toolConfigBlock` superRefine ⇒ the sandbox-override guard applies per profile. */
+  tool_config: toolConfigBlock,
+  permissions: profilePermissionsBlock,
+  rate_limits: rateLimitsBlock,
+  limits: z
+    .object({
+      model_call_timeout_ms: z.number().int().positive().optional(),
+    })
+    .strict()
+    .optional(),
+  /** `prefer` (default) keeps prompt-cache markers; `off` strips them for this model. */
+  caching: z.enum(["prefer", "off"]).optional(),
+  /** Per-profile spend cap INSIDE a run: ineligible when spent, never ends the run. */
+  cost: z
+    .object({
+      max_usd: z.number().positive(),
+    })
+    .strict()
+    .optional(),
+  requires: modelRequiresBlock,
+  capabilities: modelCapabilitiesBlock,
+  /** Per-profile failover chain (same grammar as `model_fallbacks`). */
+  fallbacks: z.array(z.string().min(1)).min(1).optional(),
+  circuit_breaker: circuitBreakerBlock,
+} as const;
+
+/**
+ * 0.6.0 §4.1 — one `models:` profile. `model` is required and is a
+ * model-router grammar string or a sentinel (`cheapest` | `strongest`) —
+ * NEVER a `$ref` (a profile referencing a profile would be circular; the
+ * cross-field check rejects it). Sentinels inside a profile resolve by price
+ * rank against the primary only.
+ */
+const modelProfileSchema = z
+  .object({
+    model: z
+      .string()
+      .min(1)
+      .describe("model-router grammar string, or cheapest | strongest (never a $ref)"),
+    ...modelProfileFields,
+  })
+  .strict()
+  .superRefine(refineTemperatureThinking)
+  .describe("one model profile: everything that can differ per model, declared once");
+
+/**
+ * 0.6.0 §4.1 — the top-level `models:` profile registry, attached to ALL 14
+ * strict schemas (the `version` precedent: an optional field absent from any
+ * union member would be rejected on that target). Keys are profile names
+ * (`SPEC_PROFILE_NAME_RE`), values are profiles. Every model slot in the
+ * spec accepts `$<name>` beside a grammar string; the compiler resolves the
+ * reference at lower time. Absent ⇒ byte-identical bundles.
+ */
+const modelsBlock = z
+  .record(profileName, modelProfileSchema)
+  .optional()
+  .describe("0.6.0: the model-profile registry; any model slot may reference a profile as $<name>");
+
+/**
+ * 0.6.0 §7.1 — one pool candidate: `model` (grammar string or `$profile`),
+ * `tags` (defaulted to `[]` for 0.5.x parity; on a `$profile` candidate an
+ * empty list means "inherit the profile's tags"), `enabled: false` to
+ * withdraw the candidate from routing without deleting its learned history,
+ * plus every profile field inline.
+ */
+const modelPoolCandidateSchema = z
+  .object({
+    model: z.string().min(1),
+    ...modelProfileFields,
+    tags: z.array(z.string().min(1)).default([]),
+    /** `false` withdraws the candidate from routing; its arms survive. */
+    enabled: z.literal(false).optional(),
+  })
+  .strict()
+  .superRefine(refineTemperatureThinking);
+
+/**
+ * 0.6.0 §7.2.2 — one rule-directed routing rule. Rules are pure, evaluated
+ * first-match in `preRoute` before the policy; the matched `id` is
+ * persisted on the `model_route` line. `when` must carry at least one
+ * condition; `message_matches` must compile (the runtime additionally
+ * validates it against catastrophic-backtracking shapes, length-caps the
+ * input and time-budgets the evaluation, because on a channel shape the
+ * regex runs against attacker-controlled text). `use` is a tag, a
+ * `$profile` from the roster, or a capability requirement the turn's
+ * candidates must satisfy. `enabled: false` disables the rule without
+ * deleting it (the optimizer's switch).
+ */
+const modelPoolRuleWhenSchema = z
+  .object({
+    has_images: z.boolean().optional(),
+    message_matches: z.string().min(1).optional(),
+    user_text_chars_gt: z.number().int().nonnegative().optional(),
+    context_tokens_gt: z.number().int().nonnegative().optional(),
+    tool_in_play: z.boolean().optional(),
+    channel: z.string().min(1).optional(),
+    budget_spent_ratio_gt: z.number().min(0).max(1).optional(),
+    turn_index_lt: z.number().int().positive().optional(),
+  })
+  .strict()
+  .superRefine((w, ctx) => {
+    if (Object.values(w).every((v) => v === undefined)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "rule when: requires at least one condition (has_images | message_matches | user_text_chars_gt | context_tokens_gt | tool_in_play | channel | budget_spent_ratio_gt | turn_index_lt)",
+      });
+    }
+    if (w.message_matches !== undefined) {
+      try {
+        new RegExp(w.message_matches);
+      } catch (err) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["message_matches"],
+          message: `rule when.message_matches is not a valid regular expression: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    }
+  });
+
+const modelPoolRuleSchema = z
+  .object({
+    id: safeName,
+    when: modelPoolRuleWhenSchema,
+    use: z.union([
+      z.string().min(1).describe("a candidate tag or a $profile from the roster"),
+      z
+        .object({ requires: modelRequiresObject })
+        .strict()
+        .describe("route to a candidate satisfying this capability requirement"),
+    ]),
+    enabled: z.boolean().optional(),
+  })
+  .strict();
+
+/**
+ * 0.6.0 §7.2.3 — `policy: classifier`: a forced-tool single call on
+ * `model` whose label is constrained to the declared candidate tags (an
+ * enum-constrained verdict — no free text, so no new content boundary).
+ * `labels` maps each tag to the description the classifier chooses among;
+ * `max_tokens` bounds the call (default 16). Falls back to `heuristic` on
+ * any error.
+ */
+const modelPoolClassifierSchema = z
+  .object({
+    model: z.string().min(1),
+    labels: z.record(z.string().min(1), z.string().min(1)),
+    max_tokens: z.number().int().positive().optional(),
+  })
+  .strict()
+  .superRefine((c, ctx) => {
+    if (Object.keys(c.labels).length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["labels"],
+        message: "classifier.labels requires at least one <tag>: <description> entry",
+      });
+    }
+  });
+
+/**
+ * 0.6.0 §7.3–§7.8 — the hybrid strategy block. Role slots (`draft`,
+ * `escalate_to`, `members`, `escalate_on_disagreement`) name a candidate TAG
+ * or a `$profile` in the roster; model slots (`guide.model`, `grade_with`,
+ * `committee.judge`, `shadow.candidate`) accept a grammar string or a
+ * `$profile`. `clean_prompt` is declared ONCE, here on `cascade` (the
+ * `evaluation` block does not carry it). `committee` is legal on
+ * single-turn hosts only (workflow steps, graph nodes, crew roles).
+ * `model_directed: true` registers the `Escalate` + `Consult` tools.
+ */
+const modelPoolStrategySchema = z
+  .object({
+    cascade: z
+      .object({
+        draft: z.string().min(1),
+        escalate_to: z.string().min(1),
+        clean_prompt: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
+    guide: z
+      .object({
+        model: z.string().min(1),
+        every: z.enum(["first_turn", "turn"]).optional(),
+        max_tokens: z.number().int().positive().optional(),
+        budget_usd: z.number().positive().optional(),
+      })
+      .strict()
+      .optional(),
+    shadow: z
+      .object({
+        candidate: z.string().min(1),
+        sample_rate: z.number().min(0).max(1).optional(),
+        grade_with: z.string().min(1).optional(),
+      })
+      .strict()
+      .optional(),
+    committee: z
+      .object({
+        members: z.array(z.string().min(1)).min(2),
+        judge: z.string().min(1).optional(),
+        escalate_on_disagreement: z.string().min(1).optional(),
+      })
+      .strict()
+      .optional(),
+    model_directed: z.boolean().optional(),
+    max_escalations: z.number().int().nonnegative().optional(),
+  })
+  .strict();
+
+/**
+ * 0.6.0 §6.3, §7.10 — the reward block, a SIBLING of `learning` (which the
+ * optimizer whitelists wholesale; nothing here is optimizer-tunable).
+ * `quality_source` (runtime default `none`) decides whether graded quality
+ * reaches the live reward; `in_loop` REQUIRES a `floor` and an in-loop
+ * grader on the same shape (cross-field). `floor` bounds learned
+ * exploitation: an arm is exploitable only while its Wilson lower bound at
+ * `confidence` stays within `tolerance` of the floor arm's judged mean.
+ */
+const modelPoolRewardSchema = z
+  .object({
+    quality_source: z.enum(["none", "in_loop", "shadow", "promoted"]).optional(),
+    priors: z.enum(["none", "eval"]).optional(),
+    floor: z
+      .object({
+        arm: z.string().min(1).optional(),
+        confidence: z.number().gt(0).lt(1).optional(),
+        tolerance: z.number().min(0).max(1).optional(),
+      })
+      .strict()
+      .optional(),
+    reset_on_profile_change: z.boolean().optional(),
+  })
+  .strict();
+
+const modelPoolBlock = z
+  .object({
+    candidates: z.array(modelPoolCandidateSchema).min(2),
+    policy: z.enum(["static", "heuristic", "learned", "classifier"]).default("heuristic"),
+    objective: z
+      .object({
+        quality: z.number().min(0).optional(),
+        cost: z.number().min(0).optional(),
+        latency: z.number().min(0).optional(),
+      })
+      .strict()
+      .optional(),
+    routing: z
+      .object({
+        contextTokenThreshold: z.number().int().positive().optional(),
+        toolsToDefault: z.boolean().optional(),
+        firstTurnToDefault: z.boolean().optional(),
+        priorToolDensityThreshold: z.number().int().positive().optional(),
+        strongTag: z.string().min(1).optional(),
+        cheapTag: z.string().min(1).optional(),
+      })
+      .strict()
+      .optional(),
+    learning: z
+      .object({
+        minSamplesPerArm: z.number().int().positive().optional(),
+        costRefUsd: z.number().positive().optional(),
+        latencyRefMs: z.number().int().positive().optional(),
+        // ε for ε-greedy online exploration once every arm clears the sample
+        // floor (fraction of exploit-phase turns that try a non-best model).
+        // Default 0 → deterministic explore-then-exploit, no RNG.
+        explorationRate: z.number().min(0).max(1).optional(),
+        // Fixed exploration seed for reproducible-across-runs behaviour (e.g.
+        // tests). Omitted → the runtime seeds from the sessionId, so each run
+        // explores differently while still replaying from its own transcript.
+        seed: z.string().min(1).optional(),
+        // Exploit-phase exploration strategy. "epsilon-greedy" (default) uses
+        // explorationRate; "thompson" draws each arm from its reward posterior
+        // and self-balances (explorationRate is then ignored).
+        bandit: z.enum(["epsilon-greedy", "thompson"]).optional(),
+      })
+      .strict()
+      .optional(),
+    // ---- 0.6.0 §7.1 — the hybrid container. Optional, NO zod defaults:
+    // an absent key stays absent on the parsed spec (byte-identical
+    // lowering); the runtime owns `directives: false` and
+    // `reward.quality_source: none`.
+    /** Per-message `/model` steering; default OFF on every shape (§7.2.1). */
+    directives: z
+      .boolean()
+      .optional()
+      .describe("0.6.0: accept per-message /model directives (default false on every shape)"),
+    rules: z.array(modelPoolRuleSchema).min(1).optional(),
+    classifier: modelPoolClassifierSchema.optional(),
+    strategy: modelPoolStrategySchema.optional(),
+    reward: modelPoolRewardSchema.optional(),
+    /** Scoped routeKey prefix; the compiler stamps the step/role/node/sub-agent name when absent. */
+    scope: safeName.optional(),
+  })
+  .strict()
+  .optional();
+
+// Section 13 — sub-agent definitions. Inline on the agent block (cli +
+// channel today; workflow has no agent block). The map's key is the
+// `subagent_type` users pass to the Task tool. Permissions field mirrors
+// the runtime's resolution shape.
+//
+// 0.6.0 §7.7 — a sub-agent carries the same routing blocks as an agent
+// (`model_pool` / `model_tiers` / `model_fallbacks` / `circuit_breaker`,
+// sharing `refineModelSelection`), its own `thinking` / `max_tokens` /
+// `temperature`, a `budget_share` of the parent's cap, `inherit_routing`
+// (children inherit the SERVED arm only behind it — default false keeps
+// today's declared-primary behaviour) and `allowed_profiles` (the
+// `$profile` allowlist the Task tool's model-filled `profile` argument is
+// validated against).
+const subAgentDefinitionSchema = z
+  .object({
+    description: z.string().min(1),
+    instructions: z.string().min(1),
+    tools: z.array(z.string().min(1)).optional(),
+    model: z.string().min(1).optional(),
+    permissions: z
+      .union([
+        z.enum(["inherit", "scoped"]),
+        z
+          .object({
+            allow: z.array(z.string().min(1)),
+            deny: z.array(z.string().min(1)),
+          })
+          .strict(),
+      ])
+      .optional(),
+    inherit_bypass: z.boolean().optional(),
+    /**
+     * Item 2 (G31 — A2A federation) — wire this sub-agent to a REMOTE peer
+     * instead of spawning it locally. `url` is the peer deployment's base
+     * URL; the spawner routes the Task call through `@crewhaus/federation-
+     * router` to the peer's inbound A2A handler (whose Agent Card lives at
+     * `<url>/.well-known/agent-card.json`), mapping the federation envelope
+     * onto A2A message/task semantics. Present ⇒ the entry is a federated
+     * peer reference; `description`/`instructions` still describe it to the
+     * parent's Task tool (the remote peer owns its own prompt).
+     */
+    federation: z.object({ url: z.string().url() }).strict().optional(),
+    // 0.6.0 §7.7 — per-sub-agent routing and params.
+    model_fallbacks: modelFallbacksBlock,
+    circuit_breaker: circuitBreakerBlock,
+    model_tiers: modelTiersBlock,
+    model_pool: modelPoolBlock,
+    thinking: thinkingBlock,
+    max_tokens: z.number().int().positive().optional(),
+    temperature: temperatureField,
+    /** Fraction of the parent's `budget.usd` this child may spend. */
+    budget_share: z.number().gt(0).max(1).optional(),
+    /** Inherit the parent's SERVED arm instead of the declared primary (default false). */
+    inherit_routing: z.boolean().optional(),
+    /** `$profile` refs the Task tool's `profile` argument may name. */
+    allowed_profiles: z.array(z.string().min(1)).min(1).optional(),
+  })
+  .strict()
+  .superRefine(refineModelSelection);
+
+const subAgentsBlock = z.record(safeName, subAgentDefinitionSchema).optional();
 
 /**
  * Response-feedback block — declares that a harness collects human ratings on
@@ -1852,6 +2456,8 @@ const cliSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("cli"),
+    // 0.6.0 §4.1 — the model-profile registry (all 14 shapes).
+    models: modelsBlock,
     agent: z
       .object({
         model: z.string().min(1),
@@ -1862,6 +2468,8 @@ const cliSchema = z
         max_tokens: z.number().int().positive().optional(),
         // Loop contract 0.4 (Batch A) — extended-thinking selector.
         thinking: thinkingBlock,
+        // 0.6.0 §4.1 — sampling temperature (exclusive with thinking).
+        temperature: temperatureField,
         // Loop contract 0.4 (Batch A) — stream partial output tokens.
         // Optional; absent means false (the cli-shape default).
         streaming: z.boolean().optional(),
@@ -1922,6 +2530,8 @@ const workflowStepSchema = z
     max_tokens: z.number().int().positive().optional(),
     // Loop contract 0.4 (Batch A) — per-step extended-thinking selector.
     thinking: thinkingBlock,
+    // 0.6.0 §4.1 — sampling temperature (exclusive with thinking).
+    temperature: temperatureField,
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
     // Item 9 (G37) — per-step model routing, adopting the cli agent block's
@@ -1962,6 +2572,7 @@ const workflowSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("workflow"),
+    models: modelsBlock,
     model: z.string().min(1),
     steps: z.array(workflowAnyStepSchema).min(1),
     mcp_servers: mcpServersBlock,
@@ -2080,6 +2691,8 @@ const channelAgentSchema = z
     max_tokens: z.number().int().positive().optional(),
     // Loop contract 0.4 (Batch A) — extended-thinking selector.
     thinking: thinkingBlock,
+    // 0.6.0 §4.1 — sampling temperature (exclusive with thinking).
+    temperature: temperatureField,
     // Loop contract 0.4 (Batch A) — per-tool rate limits.
     rate_limits: rateLimitsBlock,
     // Item 22 — provider failover chain (see modelFallbacksBlock docs).
@@ -2101,6 +2714,7 @@ const channelSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("channel"),
+    models: modelsBlock,
     agent: channelAgentSchema,
     channels: channelsBlock,
     routing: routingBlock,
@@ -2151,8 +2765,19 @@ const graphNodeSchema = z
     max_tokens: z.number().int().positive().optional(),
     // Loop contract 0.4 (Batch A) — per-node extended-thinking selector.
     thinking: thinkingBlock,
+    // 0.6.0 §4.1 — sampling temperature (exclusive with thinking).
+    temperature: temperatureField,
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
+    // 0.6.0 §7.7 — per-node model routing (graph nodes carried NO routing
+    // before 0.6.0): the cli agent block's pooled pattern verbatim, sharing
+    // the one mutual-exclusion rule via `refineModelSelection`. Omitted →
+    // the node's single (`node.model ?? graph.model`) model, byte-identical
+    // bundles.
+    model_fallbacks: modelFallbacksBlock,
+    circuit_breaker: circuitBreakerBlock,
+    model_tiers: modelTiersBlock,
+    model_pool: modelPoolBlock,
     /**
      * A human approval gate on this node, and a PRE-condition: the node
      * calls `ctx.requestApproval(prompt)` BEFORE its model turn, so the
@@ -2184,7 +2809,8 @@ const graphNodeSchema = z
       .strict()
       .optional(),
   })
-  .strict();
+  .strict()
+  .superRefine(refineModelSelection);
 
 /**
  * Loop contract 0.4 (Batch B, G02) — the `kind: "judge"` graph-node
@@ -2261,6 +2887,7 @@ const graphSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("graph"),
+    models: modelsBlock,
     model: z.string().min(1),
     entry: z.string().min(1),
     nodes: z.record(safeName, graphAnyNodeSchema),
@@ -2312,6 +2939,8 @@ const managedAgentSchema = z
     max_tokens: z.number().int().positive().optional(),
     // Loop contract 0.4 (Batch A) — extended-thinking selector.
     thinking: thinkingBlock,
+    // 0.6.0 §4.1 — sampling temperature (exclusive with thinking).
+    temperature: temperatureField,
     // Loop contract 0.4 (Batch A) — per-tool rate limits.
     rate_limits: rateLimitsBlock,
     // Item 22 — provider failover chain (see modelFallbacksBlock docs).
@@ -2335,6 +2964,7 @@ const managedSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("managed"),
+    models: modelsBlock,
     agent: managedAgentSchema,
     tenants: z.array(managedTenantSchema).min(1),
     permissions: permissionsBlock,
@@ -2412,6 +3042,9 @@ const pooledSingleAgentObject = z
     instructions: z.string().min(1),
     // Adaptive model routing — N-candidate pool with a selection policy.
     model_pool: modelPoolBlock,
+    // 0.6.0 §4.1 — sampling temperature (no thinking on this block, so no
+    // exclusivity case arises here).
+    temperature: temperatureField,
   })
   .strict();
 
@@ -2436,6 +3069,7 @@ const pipelineSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("pipeline"),
+    models: modelsBlock,
     agent: pooledSingleAgentSchema,
     retrieve: z
       .object({
@@ -2481,6 +3115,8 @@ const crewRoleSchema = z
     max_tokens: z.number().int().positive().optional(),
     // Loop contract 0.4 (Batch A) — per-role extended-thinking selector.
     thinking: thinkingBlock,
+    // 0.6.0 §4.1 — sampling temperature (exclusive with thinking).
+    temperature: temperatureField,
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
     sub_agents: subAgentsBlock,
@@ -2509,6 +3145,17 @@ const crewRoutingSchema = z
   .object({
     kind: z.enum(["match", "llm"]),
     match: z.record(z.string().min(1), z.array(crewRoutingMatchEntrySchema).min(1)).optional(),
+    /**
+     * 0.6.0 §7.7 — the model the `kind: llm` router runs on (grammar string
+     * or `$profile`). Today the router is hard-wired to the entry role's
+     * model; this slot makes it declarable. Only meaningful with
+     * `kind: llm` (cross-field).
+     */
+    model: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("0.6.0: the model (or $profile) the kind: llm router runs on"),
   })
   .strict();
 
@@ -2517,6 +3164,7 @@ const crewSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("crew"),
+    models: modelsBlock,
     /** Crew-wide model fallback used by any role that omits `role.model`. */
     model: z.string().min(1),
     entry: z.string().min(1),
@@ -2571,6 +3219,7 @@ const researchSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("research"),
+    models: modelsBlock,
     agent: pooledSingleAgentWithMaxTokensSchema,
     goal: z.string().min(1),
     branchingFactor: z.number().int().min(1).max(8).default(3),
@@ -2615,6 +3264,7 @@ const batchSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("batch"),
+    models: modelsBlock,
     agent: pooledSingleAgentWithMaxTokensSchema,
     queue: batchQueueSchema,
     concurrency: z.number().int().min(1).max(64).default(4),
@@ -2663,6 +3313,7 @@ const voiceSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("voice"),
+    models: modelsBlock,
     agent: z
       .object({
         model: z.string().min(1),
@@ -2719,6 +3370,7 @@ const browserSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("browser"),
+    models: modelsBlock,
     agent: pooledSingleAgentWithMaxTokensSchema,
     driver: browserDriverSchema.default({}),
     /** Vision-grounding model. Defaults to the agent's primary model. */
@@ -2751,6 +3403,7 @@ const evalSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("eval"),
+    models: modelsBlock,
     agent: z
       .object({
         model: z.string().min(1),
@@ -2820,6 +3473,7 @@ const onchainSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("onchain"),
+    models: modelsBlock,
     agent: z
       .object({
         model: z.string().min(1),
@@ -2856,6 +3510,7 @@ const onchainGameSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("onchain-game"),
+    models: modelsBlock,
     agent: z
       .object({
         model: z.string().min(1),
@@ -2888,22 +3543,50 @@ const onchainGameSchema = z
   })
   .strict();
 
-export const Spec = z.discriminatedUnion("target", [
-  cliSchema,
-  workflowSchema,
-  channelSchema,
-  graphSchema,
-  managedSchema,
-  pipelineSchema,
-  crewSchema,
-  researchSchema,
-  batchSchema,
-  voiceSchema,
-  browserSchema,
-  evalSchema,
-  onchainSchema,
-  onchainGameSchema,
-]);
+/**
+ * The 14 target schemas, as the tuple `z.discriminatedUnion` consumes. Named
+ * so `Spec` can carry an EXPLICIT type annotation: from 0.6.0 the union's
+ * inferred type (every shape now nests the full `model_pool` hybrid block
+ * through agents, steps, nodes, roles AND sub-agents) exceeds what `tsc`
+ * will serialize into the package's `.d.ts` (TS7056); annotating through
+ * `typeof` keeps the declaration a reference rather than an expansion.
+ */
+type SpecTargetSchemas = [
+  typeof cliSchema,
+  typeof workflowSchema,
+  typeof channelSchema,
+  typeof graphSchema,
+  typeof managedSchema,
+  typeof pipelineSchema,
+  typeof crewSchema,
+  typeof researchSchema,
+  typeof batchSchema,
+  typeof voiceSchema,
+  typeof browserSchema,
+  typeof evalSchema,
+  typeof onchainSchema,
+  typeof onchainGameSchema,
+];
+
+export const Spec: z.ZodDiscriminatedUnion<"target", SpecTargetSchemas> = z.discriminatedUnion(
+  "target",
+  [
+    cliSchema,
+    workflowSchema,
+    channelSchema,
+    graphSchema,
+    managedSchema,
+    pipelineSchema,
+    crewSchema,
+    researchSchema,
+    batchSchema,
+    voiceSchema,
+    browserSchema,
+    evalSchema,
+    onchainSchema,
+    onchainGameSchema,
+  ],
+);
 
 export type Spec = z.infer<typeof Spec>;
 export type SpecCli = z.infer<typeof cliSchema>;
@@ -2946,6 +3629,28 @@ export type SpecModelFallbacks = z.infer<typeof modelFallbacksBlock>;
 export type SpecCircuitBreakerBlock = z.infer<typeof circuitBreakerBlock>;
 export type SpecModelTiersBlock = z.infer<typeof modelTiersBlock>;
 export type SpecModelPoolBlock = z.infer<typeof modelPoolBlock>;
+/** 0.6.0 §4.1 — the top-level `models:` profile registry (profile name → profile). */
+export type SpecModelsBlock = z.infer<typeof modelsBlock>;
+/** 0.6.0 §4.1 — one `models:` profile. */
+export type SpecModelProfile = z.infer<typeof modelProfileSchema>;
+/** 0.6.0 §5.4 — the RESTRICTED per-profile permissions (`deny` / `ask` only). */
+export type SpecProfilePermissions = z.infer<typeof profilePermissionsBlock>;
+/** 0.6.0 §7.11 — a profile's `requires:` capability floor. */
+export type SpecModelRequires = z.infer<typeof modelRequiresObject>;
+/** 0.6.0 §4.1 — a profile's declared `capabilities:` override. */
+export type SpecModelCapabilities = z.infer<typeof modelCapabilitiesBlock>;
+/** 0.6.0 §7.1 — one `model_pool.candidates[]` entry (profile fields inline + `tags` + `enabled`). */
+export type SpecModelPoolCandidate = z.infer<typeof modelPoolCandidateSchema>;
+/** 0.6.0 §7.2.2 — one `model_pool.rules[]` entry. */
+export type SpecModelPoolRule = z.infer<typeof modelPoolRuleSchema>;
+/** 0.6.0 §7.2.3 — the `model_pool.classifier` block. */
+export type SpecModelPoolClassifier = z.infer<typeof modelPoolClassifierSchema>;
+/** 0.6.0 §7.3–§7.8 — the `model_pool.strategy` block. */
+export type SpecModelPoolStrategy = z.infer<typeof modelPoolStrategySchema>;
+/** 0.6.0 §6.3 — the `model_pool.reward` block. */
+export type SpecModelPoolReward = z.infer<typeof modelPoolRewardSchema>;
+/** 0.6.0 §5.5 — `mcp_servers.<n>.tool_flags` (narrowing-only trust flags). */
+export type SpecMcpToolFlags = z.infer<typeof mcpToolFlagsBlock>;
 /** Item 1 (G30) — the `expose:` block (MCP-server projection of the bundle). */
 export type SpecExposeBlock = z.infer<typeof exposeBlock>;
 /** Item 3 (G32) — the `plugins:` list (marketplace plugin names loaded at boot). */
@@ -3265,7 +3970,746 @@ function crossFieldIssues(data: Spec): SpecIssue[] {
       );
     }
   }
+  // 0.6.0 §4.1 / §7.1 — the model-profile registry, `$profile` references
+  // and the hybrid pool blocks (appended last: check order is load-bearing).
+  modelSurfaceIssues(data, custom);
   return issues;
+}
+
+// ---------------------------------------------------------------------------
+// 0.6.0 — cross-field checks for `models:`, `$profile` refs and the hybrid
+// `model_pool` blocks (design plan §4.1 "Cross-field checks", §7.1, §7.7).
+// Everything here is a DATA check over the parsed spec so every union member
+// stays a plain ZodObject. The compiler's lowering and the `modelPlanIntegrity`
+// ir-pass repeat the roster checks against the RESOLVED IR; this layer catches
+// what is decidable from the spec text alone, with paths a studio can point at.
+// ---------------------------------------------------------------------------
+
+type SpecModelsRegistry = NonNullable<SpecModelsBlock>;
+type SpecModelPool = NonNullable<SpecModelPoolBlock>;
+type SpecAddIssue = (path: (string | number)[], message: string) => void;
+
+/** The fields a `models:` profile and an inline pool candidate share. */
+type SpecProfileLike = {
+  readonly model: string;
+  readonly tags?: readonly string[];
+  readonly thinking?: unknown;
+  readonly temperature?: number;
+  readonly tools?: readonly string[];
+  readonly fallbacks?: readonly string[];
+};
+
+/** The routing surface every agent-like block (agent / step / node / role / sub-agent) carries. */
+type SpecRoutedBlock = {
+  readonly model?: string;
+  readonly model_fallbacks?: readonly string[];
+  readonly model_tiers?: { readonly fast: string; readonly default: string };
+  readonly model_pool?: SpecModelPool;
+  readonly tools?: readonly string[];
+  readonly sub_agents?: Readonly<Record<string, SpecSubAgentDefinition>>;
+};
+
+/**
+ * Where a routed block runs, for the checks that depend on the host:
+ *   - `committee` — `strategy.committee` is legal on single-turn hosts ONLY
+ *     (workflow steps, graph nodes, crew roles): every REPL / per-message
+ *     turn is one the user is waiting on (§7.6).
+ *   - `shapeTools` — the tool list a profile/candidate `tools` must be a
+ *     subset of; `undefined` when the block declares none (the default
+ *     toolset is resolved by the emitter, so the subset check waits for the
+ *     ir-pass) — EXCEPT on a tool-less shape (`toolLess`), where any profile
+ *     `tools` is an error.
+ */
+type SpecRoutedHost = {
+  readonly committee: boolean;
+  readonly shapeTools: readonly string[] | undefined;
+  readonly toolLess: boolean;
+};
+
+type SpecModelCheckContext = {
+  readonly custom: SpecAddIssue;
+  readonly registry: SpecModelsRegistry;
+  readonly mcpServers: ReadonlySet<string>;
+  /** Some pool in the spec declares `strategy.model_directed: true` (registers Consult/Escalate). */
+  readonly modelDirected: boolean;
+  /** An in-loop grader exists on this shape (`evaluation:` / a `kind: judge` step or node). */
+  readonly gradedInLoop: boolean;
+};
+
+const MODEL_DIRECTED_TOOLS = new Set(["Consult", "Escalate"]);
+const MCP_TOOL_SELECTOR_RE = /^mcp__([^_].*?)__(.+)$/;
+
+/** Levenshtein distance — the did-you-mean helper for unknown `$refs` / tags. */
+function editDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(
+        (prev[j] as number) + 1,
+        (cur[j - 1] as number) + 1,
+        (prev[j - 1] as number) + cost,
+      );
+    }
+    prev = cur;
+  }
+  return prev[b.length] as number;
+}
+
+function nearestOf(target: string, declared: readonly string[]): string | undefined {
+  let best: string | undefined;
+  let bestDistance = 4;
+  for (const candidate of declared) {
+    const d = editDistance(target, candidate);
+    if (d < bestDistance) {
+      best = candidate;
+      bestDistance = d;
+    }
+  }
+  return best;
+}
+
+/**
+ * Does a spec-wide scan for `strategy.model_directed: true` on ANY pool —
+ * the `Consult` / `Escalate` tools exist only when some pool registers them,
+ * so a profile naming them elsewhere would advertise tools that never exist.
+ */
+function specDeclaresModelDirected(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(specDeclaresModelDirected);
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  const pool = record["model_pool"];
+  if (typeof pool === "object" && pool !== null) {
+    const strategy = (pool as { strategy?: { model_directed?: unknown } }).strategy;
+    if (strategy?.model_directed === true) return true;
+  }
+  return Object.values(record).some(specDeclaresModelDirected);
+}
+
+/** A model slot: grammar string, sentinel, or `$profile` — the ref must resolve. */
+function checkModelSlot(
+  ctx: SpecModelCheckContext,
+  path: (string | number)[],
+  value: string | undefined,
+): void {
+  if (value === undefined) return;
+  const name = profileRefName(value);
+  if (name === undefined) return;
+  const declared = Object.keys(ctx.registry);
+  if (!SPEC_PROFILE_NAME_RE.test(name)) {
+    ctx.custom(
+      path,
+      `${path.join(".")}: "${value}" is not a valid profile reference — profile names match /^[a-z][a-z0-9_-]{0,63}$/`,
+    );
+    return;
+  }
+  if (ctx.registry[name] !== undefined) return;
+  const nearest = nearestOf(name, declared);
+  const hint =
+    declared.length === 0
+      ? "this spec declares no models: block"
+      : nearest !== undefined
+        ? `did you mean "$${nearest}"? declared: ${declared.map((d) => `$${d}`).join(", ")}`
+        : `declared: ${declared.map((d) => `$${d}`).join(", ")}`;
+  ctx.custom(path, `${path.join(".")}: unknown profile "${value}" — ${hint}`);
+}
+
+/**
+ * The effective routing tags of one candidate: its own when it declares any,
+ * else the referenced profile's (an empty list on a `$profile` candidate means
+ * "inherit", since the spec defaults `tags` to `[]`).
+ */
+function candidateTags(ctx: SpecModelCheckContext, candidate: SpecModelPoolCandidate): string[] {
+  if (candidate.tags.length > 0) return [...candidate.tags];
+  const name = profileRefName(candidate.model);
+  const profile = name !== undefined ? ctx.registry[name] : undefined;
+  return profile?.tags !== undefined ? [...profile.tags] : [];
+}
+
+/**
+ * A role slot names a candidate TAG or a `$profile` that is a roster member
+ * (a forced arm must be a roster `PoolCandidate`, §7.2.4; a strategy role
+ * naming an absent candidate could never be served).
+ */
+function checkRoleSlot(
+  ctx: SpecModelCheckContext,
+  path: (string | number)[],
+  value: string,
+  pool: SpecModelPool,
+  tags: ReadonlySet<string>,
+): void {
+  const name = profileRefName(value);
+  if (name !== undefined) {
+    checkModelSlot(ctx, path, value);
+    if (ctx.registry[name] !== undefined && !pool.candidates.some((c) => c.model === value)) {
+      ctx.custom(
+        path,
+        `${path.join(".")}: "${value}" is a declared profile but not one of this model_pool's candidates (${pool.candidates.map((c) => c.model).join(", ")}) — a strategy role must name a roster member`,
+      );
+    }
+    return;
+  }
+  if (tags.has(value)) return;
+  const declared = [...tags];
+  const nearest = nearestOf(value, declared);
+  const hint =
+    declared.length === 0
+      ? "no candidate declares tags"
+      : nearest !== undefined
+        ? `did you mean "${nearest}"? candidate tags: ${declared.join(", ")}`
+        : `candidate tags: ${declared.join(", ")}`;
+  ctx.custom(
+    path,
+    `${path.join(".")}: "${value}" is neither a candidate tag nor a $profile in this model_pool — ${hint}`,
+  );
+}
+
+/**
+ * A profile's / candidate's `tools` is SUBSET-ONLY (§5.2): builtin keys must
+ * be among the shape's declared tools; `mcp__<server>__<tool|*>` must name a
+ * declared MCP server; `Consult` / `Escalate` exist only under
+ * `strategy.model_directed: true`; and a tool-less shape admits no `tools` at
+ * all.
+ */
+function checkProfileTools(
+  ctx: SpecModelCheckContext,
+  path: (string | number)[],
+  tools: readonly string[] | undefined,
+  host: SpecRoutedHost,
+): void {
+  if (tools === undefined) return;
+  if (host.toolLess) {
+    ctx.custom(
+      path,
+      `${path.join(".")}: this shape registers no tool catalog, so a per-model tools list has nothing to narrow — remove it`,
+    );
+    return;
+  }
+  for (const [i, tool] of tools.entries()) {
+    if (tool.startsWith("mcp__")) {
+      const server = tool.match(MCP_TOOL_SELECTOR_RE)?.[1];
+      if (server === undefined) {
+        ctx.custom(
+          [...path, i],
+          `${path.join(".")}[${i}]: "${tool}" is not a valid MCP tool selector — use mcp__<server>__<tool> or the server-scoped glob mcp__<server>__*`,
+        );
+      } else if (!ctx.mcpServers.has(server)) {
+        ctx.custom(
+          [...path, i],
+          `${path.join(".")}[${i}]: "${tool}" names MCP server "${server}", which mcp_servers does not declare${ctx.mcpServers.size > 0 ? ` (declared: ${[...ctx.mcpServers].join(", ")})` : ""}`,
+        );
+      }
+      continue;
+    }
+    if (MODEL_DIRECTED_TOOLS.has(tool)) {
+      if (!ctx.modelDirected) {
+        ctx.custom(
+          [...path, i],
+          `${path.join(".")}[${i}]: "${tool}" is registered only when a model_pool declares strategy.model_directed: true — no pool in this spec does`,
+        );
+      }
+      continue;
+    }
+    if (host.shapeTools !== undefined && !host.shapeTools.includes(tool)) {
+      ctx.custom(
+        [...path, i],
+        `${path.join(".")}[${i}]: "${tool}" is not one of the shape's tools (${host.shapeTools.join(", ")}) — a per-model tools list can only narrow the shape's toolset, never add to it`,
+      );
+    }
+  }
+}
+
+/** The checks a `models:` profile and an inline pool candidate share. */
+function checkProfileBody(
+  ctx: SpecModelCheckContext,
+  path: (string | number)[],
+  body: SpecProfileLike,
+  host: SpecRoutedHost,
+  opts: { readonly isProfile: boolean },
+): void {
+  if (opts.isProfile) {
+    // A profile's own `model` / `fallbacks` are grammar strings or sentinels,
+    // never `$refs` — a profile referencing a profile would be circular.
+    if (profileRefName(body.model) !== undefined) {
+      ctx.custom(
+        [...path, "model"],
+        `${path.join(".")}.model: a profile's model must be a model string or a sentinel (cheapest | strongest), not another profile reference ("${body.model}") — profiles do not inherit from profiles`,
+      );
+    }
+    for (const [i, fallback] of (body.fallbacks ?? []).entries()) {
+      if (profileRefName(fallback) !== undefined) {
+        ctx.custom(
+          [...path, "fallbacks", i],
+          `${path.join(".")}.fallbacks[${i}]: a profile's fallback chain names model strings, not profile references ("${fallback}")`,
+        );
+      }
+    }
+  } else {
+    for (const [i, fallback] of (body.fallbacks ?? []).entries()) {
+      checkModelSlot(ctx, [...path, "fallbacks", i], fallback);
+    }
+  }
+  checkProfileTools(ctx, [...path, "tools"], body.tools, host);
+}
+
+/** The whole `models:` registry against the shape it is declared on. */
+function checkProfiles(ctx: SpecModelCheckContext, host: SpecRoutedHost): void {
+  for (const [name, profile] of Object.entries(ctx.registry)) {
+    checkProfileBody(ctx, ["models", name], profile, host, { isProfile: true });
+  }
+}
+
+/** One `model_pool` block — candidates, rules, classifier, strategy, reward. */
+function checkModelPool(
+  ctx: SpecModelCheckContext,
+  path: (string | number)[],
+  pool: SpecModelPool,
+  host: SpecRoutedHost,
+): void {
+  const tags = new Set<string>();
+  for (const [i, candidate] of pool.candidates.entries()) {
+    const cpath = [...path, "candidates", i];
+    checkModelSlot(ctx, [...cpath, "model"], candidate.model);
+    checkProfileBody(ctx, cpath, candidate, host, { isProfile: false });
+    for (const tag of candidateTags(ctx, candidate)) tags.add(tag);
+  }
+  if (pool.candidates.every((c) => c.enabled === false)) {
+    ctx.custom(
+      [...path, "candidates"],
+      `${path.join(".")}.candidates: every candidate is enabled: false — at least one must stay routable`,
+    );
+  }
+  // §7.2.3 — `policy: classifier` and the `classifier` block go together.
+  if (pool.policy === "classifier" && pool.classifier === undefined) {
+    ctx.custom(
+      [...path, "policy"],
+      `${path.join(".")}.policy: classifier requires a classifier block (model + labels) on the same model_pool`,
+    );
+  }
+  if (pool.classifier !== undefined) {
+    if (pool.policy !== "classifier") {
+      ctx.custom(
+        [...path, "classifier"],
+        `${path.join(".")}.classifier is declared but policy is "${pool.policy}" — the classifier runs only under policy: classifier (declare it, or drop the block)`,
+      );
+    }
+    checkModelSlot(ctx, [...path, "classifier", "model"], pool.classifier.model);
+    for (const label of Object.keys(pool.classifier.labels)) {
+      if (!tags.has(label)) {
+        ctx.custom(
+          [...path, "classifier", "labels", label],
+          `${path.join(".")}.classifier.labels["${label}"]: every label must be a candidate tag (the verdict is constrained to the roster's tags: ${[...tags].join(", ") || "none declared"})`,
+        );
+      }
+    }
+  }
+  // §7.2.2 — rules: unique ids; `use` is a tag / $profile / requirement.
+  if (pool.rules !== undefined) {
+    const seen = new Set<string>();
+    for (const [i, rule] of pool.rules.entries()) {
+      if (seen.has(rule.id)) {
+        ctx.custom(
+          [...path, "rules", i, "id"],
+          `${path.join(".")}.rules[${i}].id "${rule.id}" is declared twice — rule ids are persisted on the model_route line and must be unique`,
+        );
+      }
+      seen.add(rule.id);
+      if (typeof rule.use === "string") {
+        checkRoleSlot(ctx, [...path, "rules", i, "use"], rule.use, pool, tags);
+      }
+    }
+  }
+  // §7.3–§7.8 — strategy role and model slots.
+  const strategy = pool.strategy;
+  if (strategy !== undefined) {
+    const spath = [...path, "strategy"];
+    if (strategy.cascade !== undefined) {
+      checkRoleSlot(ctx, [...spath, "cascade", "draft"], strategy.cascade.draft, pool, tags);
+      checkRoleSlot(
+        ctx,
+        [...spath, "cascade", "escalate_to"],
+        strategy.cascade.escalate_to,
+        pool,
+        tags,
+      );
+      if (strategy.cascade.draft === strategy.cascade.escalate_to) {
+        ctx.custom(
+          [...spath, "cascade", "escalate_to"],
+          `${spath.join(".")}.cascade: draft and escalate_to both name "${strategy.cascade.draft}" — a cascade escalates to a DIFFERENT rung`,
+        );
+      }
+    }
+    if (strategy.guide !== undefined) {
+      checkModelSlot(ctx, [...spath, "guide", "model"], strategy.guide.model);
+    }
+    if (strategy.shadow !== undefined) {
+      checkModelSlot(ctx, [...spath, "shadow", "candidate"], strategy.shadow.candidate);
+      checkModelSlot(ctx, [...spath, "shadow", "grade_with"], strategy.shadow.grade_with);
+    }
+    if (strategy.committee !== undefined) {
+      if (!host.committee) {
+        ctx.custom(
+          [...spath, "committee"],
+          `${spath.join(".")}.committee is legal on single-turn hosts only (workflow steps, graph nodes, crew roles) — a REPL or per-message turn is one the user is waiting on`,
+        );
+      }
+      const members = new Set<string>();
+      for (const [i, member] of strategy.committee.members.entries()) {
+        checkRoleSlot(ctx, [...spath, "committee", "members", i], member, pool, tags);
+        if (members.has(member)) {
+          ctx.custom(
+            [...spath, "committee", "members", i],
+            `${spath.join(".")}.committee.members[${i}] "${member}" is listed twice`,
+          );
+        }
+        members.add(member);
+      }
+      checkModelSlot(ctx, [...spath, "committee", "judge"], strategy.committee.judge);
+      if (strategy.committee.escalate_on_disagreement !== undefined) {
+        checkRoleSlot(
+          ctx,
+          [...spath, "committee", "escalate_on_disagreement"],
+          strategy.committee.escalate_on_disagreement,
+          pool,
+          tags,
+        );
+      }
+    }
+  }
+  // §6.3 — reward: `in_loop` needs a floor AND an in-loop grader.
+  const reward = pool.reward;
+  if (reward !== undefined) {
+    if (reward.floor?.arm !== undefined) {
+      checkRoleSlot(ctx, [...path, "reward", "floor", "arm"], reward.floor.arm, pool, tags);
+    }
+    if (reward.quality_source === "in_loop") {
+      if (reward.floor === undefined) {
+        ctx.custom(
+          [...path, "reward", "quality_source"],
+          `${path.join(".")}.reward.quality_source: in_loop requires reward.floor — learned exploitation must be bounded by a floor arm when graded quality steers routing`,
+        );
+      }
+      if (!ctx.gradedInLoop) {
+        ctx.custom(
+          [...path, "reward", "quality_source"],
+          `${path.join(".")}.reward.quality_source: in_loop requires an in-loop grader on this shape (an evaluation: block, or a kind: judge step/node) — without one every observation would default to perfect quality`,
+        );
+      }
+    }
+  }
+}
+
+/** One sub-agent definition (recurses through its own routing surface). */
+function checkSubAgent(
+  ctx: SpecModelCheckContext,
+  path: (string | number)[],
+  def: SpecSubAgentDefinition,
+): void {
+  for (const [i, entry] of (def.allowed_profiles ?? []).entries()) {
+    if (profileRefName(entry) === undefined) {
+      ctx.custom(
+        [...path, "allowed_profiles", i],
+        `${path.join(".")}.allowed_profiles[${i}]: "${entry}" must be a $profile reference — the Task tool's profile argument is validated against declared profiles`,
+      );
+      continue;
+    }
+    checkModelSlot(ctx, [...path, "allowed_profiles", i], entry);
+  }
+  checkRoutedBlock(ctx, path, def, {
+    committee: false,
+    shapeTools: def.tools,
+    toolLess: false,
+  });
+}
+
+/** Every model slot and pool on an agent-like block, plus its sub-agents. */
+function checkRoutedBlock(
+  ctx: SpecModelCheckContext,
+  path: (string | number)[],
+  block: SpecRoutedBlock,
+  host: SpecRoutedHost,
+): void {
+  checkModelSlot(ctx, [...path, "model"], block.model);
+  for (const [i, fallback] of (block.model_fallbacks ?? []).entries()) {
+    checkModelSlot(ctx, [...path, "model_fallbacks", i], fallback);
+  }
+  if (block.model_tiers !== undefined) {
+    checkModelSlot(ctx, [...path, "model_tiers", "fast"], block.model_tiers.fast);
+    checkModelSlot(ctx, [...path, "model_tiers", "default"], block.model_tiers.default);
+  }
+  if (block.model_pool !== undefined) {
+    checkModelPool(ctx, [...path, "model_pool"], block.model_pool, host);
+  }
+  if (block.sub_agents !== undefined) {
+    for (const [name, def] of Object.entries(block.sub_agents)) {
+      checkSubAgent(ctx, [...path, "sub_agents", name], def);
+    }
+  }
+}
+
+/** The judge-gate model slots plus `escalate_to` against the gated block's pool. */
+function checkJudgeGate(
+  ctx: SpecModelCheckContext,
+  path: (string | number)[],
+  judge: SpecJudgeGate,
+  gatedPool: SpecModelPool | undefined,
+  gatedLabel: string,
+): void {
+  checkModelSlot(ctx, [...path, "model"], judge.model);
+  for (const [i, member] of (judge.judges ?? []).entries()) {
+    checkModelSlot(ctx, [...path, "judges", i], member);
+  }
+  if (judge.escalate_to === undefined) return;
+  if (gatedPool === undefined) {
+    ctx.custom(
+      [...path, "escalate_to"],
+      `${path.join(".")}.escalate_to forces the retry_previous re-run onto a pool candidate, but ${gatedLabel} declares no model_pool`,
+    );
+    checkModelSlot(ctx, [...path, "escalate_to"], judge.escalate_to);
+    return;
+  }
+  const tags = new Set<string>();
+  for (const candidate of gatedPool.candidates) {
+    for (const tag of candidateTags(ctx, candidate)) tags.add(tag);
+  }
+  checkRoleSlot(ctx, [...path, "escalate_to"], judge.escalate_to, gatedPool, tags);
+}
+
+/** The top-level auxiliary model slots the interactive shapes share. */
+function checkAuxSlots(
+  ctx: SpecModelCheckContext,
+  spec: {
+    readonly compaction?: { readonly model?: string };
+    readonly security?: { readonly justification?: { readonly model?: string } };
+    readonly budget?: { readonly on_exceed?: { readonly action: string; readonly model?: string } };
+    readonly evaluation?: SpecEvaluationBlock;
+    readonly watchme?: { readonly judge?: { readonly model: string } };
+    readonly agent?: { readonly model?: string; readonly model_pool?: unknown };
+  },
+): void {
+  checkModelSlot(ctx, ["compaction", "model"], spec.compaction?.model);
+  checkModelSlot(ctx, ["security", "justification", "model"], spec.security?.justification?.model);
+  if (spec.budget?.on_exceed?.action === "degrade") {
+    checkModelSlot(ctx, ["budget", "on_exceed", "model"], spec.budget.on_exceed.model);
+  }
+  checkModelSlot(ctx, ["watchme", "judge", "model"], spec.watchme?.judge?.model);
+  const evaluation = spec.evaluation;
+  if (evaluation !== undefined) {
+    if (evaluation.grader.type === "llm_judge") {
+      checkModelSlot(ctx, ["evaluation", "grader", "model"], evaluation.grader.model);
+      for (const [i, member] of (evaluation.grader.judges ?? []).entries()) {
+        checkModelSlot(ctx, ["evaluation", "grader", "judges", i], member);
+      }
+    }
+    // §7.3 — `escalate` re-runs the turn on a FORCED roster candidate, so it
+    // needs a roster (forcing on a non-pool run is a compile-time error).
+    if (evaluation.on_fail === "escalate" && spec.agent?.model_pool === undefined) {
+      ctx.custom(
+        ["evaluation", "on_fail"],
+        "evaluation.on_fail: escalate re-runs a failing turn on a stronger pool candidate (strategy.cascade.escalate_to, else the strongest candidate), so agent.model_pool must be declared",
+      );
+    }
+  }
+}
+
+function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
+  const registry: SpecModelsRegistry = data.models ?? {};
+  const mcpServers = new Set(
+    Object.keys((data as { mcp_servers?: Record<string, unknown> }).mcp_servers ?? {}),
+  );
+  const modelDirected = specDeclaresModelDirected(data);
+  switch (data.target) {
+    case "cli":
+    case "channel":
+    case "managed": {
+      const ctx: SpecModelCheckContext = {
+        custom,
+        registry,
+        mcpServers,
+        modelDirected,
+        gradedInLoop: data.evaluation !== undefined,
+      };
+      const shapeTools = data.target === "cli" ? data.tools : data.agent.tools;
+      const host: SpecRoutedHost = { committee: false, shapeTools, toolLess: false };
+      checkProfiles(ctx, host);
+      checkRoutedBlock(ctx, ["agent"], data.agent, host);
+      checkAuxSlots(ctx, data);
+      return;
+    }
+    case "workflow": {
+      const ctx: SpecModelCheckContext = {
+        custom,
+        registry,
+        mcpServers,
+        modelDirected,
+        gradedInLoop: data.steps.some((s) => "kind" in s && s.kind === "judge"),
+      };
+      const declaredTools = data.steps.flatMap((s) => ("tools" in s ? (s.tools ?? []) : []));
+      const anyStepDeclaresTools = data.steps.some((s) => "tools" in s && s.tools !== undefined);
+      checkProfiles(ctx, {
+        committee: true,
+        shapeTools: anyStepDeclaresTools ? declaredTools : undefined,
+        toolLess: false,
+      });
+      checkModelSlot(ctx, ["model"], data.model);
+      checkAuxSlots(ctx, data);
+      for (const [i, step] of data.steps.entries()) {
+        // `kind` exists ONLY on the judge variant, so the `in` check is the
+        // discriminator in BOTH branches (a `=== "judge"` conjunct would
+        // narrow the single remaining member's property, not the union).
+        if ("kind" in step) {
+          const previous = data.steps[i - 1];
+          const gatedPool =
+            previous !== undefined && "model_pool" in previous ? previous.model_pool : undefined;
+          checkJudgeGate(
+            ctx,
+            ["steps", i, "judge"],
+            step.judge,
+            gatedPool,
+            previous !== undefined ? `the gated step "${previous.name}"` : "the gated step",
+          );
+          continue;
+        }
+        checkRoutedBlock(ctx, ["steps", i], step, {
+          committee: true,
+          shapeTools: step.tools,
+          toolLess: false,
+        });
+      }
+      return;
+    }
+    case "graph": {
+      const nodes = Object.entries(data.nodes);
+      const ctx: SpecModelCheckContext = {
+        custom,
+        registry,
+        mcpServers,
+        modelDirected,
+        gradedInLoop: nodes.some(([, n]) => "kind" in n && n.kind === "judge"),
+      };
+      const declaredTools = nodes.flatMap(([, n]) => ("tools" in n ? (n.tools ?? []) : []));
+      const anyNodeDeclaresTools = nodes.some(([, n]) => "tools" in n && n.tools !== undefined);
+      checkProfiles(ctx, {
+        committee: true,
+        shapeTools: anyNodeDeclaresTools ? declaredTools : undefined,
+        toolLess: false,
+      });
+      checkModelSlot(ctx, ["model"], data.model);
+      checkAuxSlots(ctx, data);
+      for (const [name, node] of nodes) {
+        if ("kind" in node) {
+          // The upstream node is an edge-time fact, so `escalate_to` is
+          // checked against the UNION of the graph's node pools: any tag or
+          // roster $profile declared on some node is accepted here; the
+          // ir-pass pins it to the actual upstream node once edges resolve.
+          const pools = nodes.flatMap(([, n]) =>
+            "model_pool" in n && n.model_pool !== undefined ? [n.model_pool] : [],
+          );
+          const union: SpecModelPool | undefined =
+            pools.length > 0
+              ? { ...(pools[0] as SpecModelPool), candidates: pools.flatMap((p) => p.candidates) }
+              : undefined;
+          checkJudgeGate(ctx, ["nodes", name, "judge"], node.judge, union, "no graph node");
+          continue;
+        }
+        checkRoutedBlock(ctx, ["nodes", name], node, {
+          committee: true,
+          shapeTools: node.tools,
+          toolLess: false,
+        });
+      }
+      return;
+    }
+    case "crew": {
+      const ctx: SpecModelCheckContext = {
+        custom,
+        registry,
+        mcpServers,
+        modelDirected,
+        gradedInLoop: false,
+      };
+      const roles = Object.entries(data.roles);
+      const declaredTools = roles.flatMap(([, r]) => r.tools ?? []);
+      const anyRoleDeclaresTools = roles.some(([, r]) => r.tools !== undefined);
+      checkProfiles(ctx, {
+        committee: true,
+        shapeTools: anyRoleDeclaresTools ? declaredTools : undefined,
+        toolLess: false,
+      });
+      checkModelSlot(ctx, ["model"], data.model);
+      checkAuxSlots(ctx, data);
+      for (const [name, role] of roles) {
+        checkRoutedBlock(ctx, ["roles", name], role, {
+          committee: true,
+          shapeTools: role.tools,
+          toolLess: false,
+        });
+      }
+      if (data.routing?.model !== undefined) {
+        if (data.routing.kind !== "llm") {
+          custom(
+            ["routing", "model"],
+            `crew.routing.model is the model the kind: llm router runs on — routing.kind is "${data.routing.kind}", which never calls a model`,
+          );
+        }
+        checkModelSlot(ctx, ["routing", "model"], data.routing.model);
+      }
+      return;
+    }
+    case "pipeline":
+    case "research":
+    case "batch":
+    case "browser": {
+      const ctx: SpecModelCheckContext = {
+        custom,
+        registry,
+        mcpServers,
+        modelDirected,
+        gradedInLoop: false,
+      };
+      const toolLess = data.target === "pipeline";
+      const host: SpecRoutedHost = {
+        committee: false,
+        shapeTools: toolLess ? undefined : data.tools,
+        toolLess,
+      };
+      checkProfiles(ctx, host);
+      checkRoutedBlock(ctx, ["agent"], data.agent, host);
+      checkAuxSlots(ctx, data);
+      if (data.target === "browser") {
+        checkModelSlot(ctx, ["groundingModel"], data.groundingModel);
+      }
+      return;
+    }
+    case "voice":
+    case "eval":
+    case "onchain":
+    case "onchain-game": {
+      // Profile → model/params only on these shapes (§11.3); the other
+      // profile fields are reported as field-precise warnings at lower time.
+      const ctx: SpecModelCheckContext = {
+        custom,
+        registry,
+        mcpServers,
+        modelDirected,
+        gradedInLoop: false,
+      };
+      checkProfiles(ctx, {
+        committee: false,
+        shapeTools: data.target === "eval" ? data.agent.tools : data.tools,
+        toolLess: false,
+      });
+      checkModelSlot(ctx, ["agent", "model"], data.agent.model);
+      checkAuxSlots(ctx, data);
+      return;
+    }
+    default:
+      return;
+  }
 }
 
 export function parseSpec(yamlText: string): Spec {

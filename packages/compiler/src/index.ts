@@ -1035,7 +1035,7 @@ type SpecAgentWithFailover = {
       readonly model: string;
       readonly tags: readonly string[];
     }>;
-    readonly policy: "static" | "heuristic" | "learned";
+    readonly policy: "static" | "heuristic" | "learned" | "classifier";
     readonly objective?: {
       readonly quality?: number;
       readonly cost?: number;
@@ -1117,6 +1117,14 @@ function lowerModelFailover(agent: SpecAgentWithFailover): {
   // defaults), so only defined optional blocks are attached.
   const mp = agent.model_pool;
   if (mp !== undefined) {
+    // 0.6.0 — the spec accepts `policy: classifier` (§7.2.3); the IR/router
+    // gain the policy with the model-plan lowering (PR 7). Until then it is
+    // a loud compile error rather than a silently downgraded pool.
+    if (mp.policy === "classifier") {
+      throw new CompilerError(
+        "model_pool.policy: classifier is accepted by the spec but not yet lowered by this compiler — the classifier policy lands with the 0.6.0 IR widening; use static | heuristic | learned for now",
+      );
+    }
     const objective = mp.objective;
     const routing = mp.routing;
     const learning = mp.learning;
@@ -1437,7 +1445,7 @@ type SpecWithEvaluation = SpecWithPermissions & {
       | { readonly type: "contains"; readonly value: string }
       | { readonly type: "regex"; readonly value: string };
     readonly threshold?: number;
-    readonly on_fail?: "retry" | "halt" | "note";
+    readonly on_fail?: "retry" | "halt" | "note" | "escalate";
     readonly max_retries?: number;
   };
 };
@@ -1445,6 +1453,14 @@ type SpecWithEvaluation = SpecWithPermissions & {
 function lowerEvaluation(spec: SpecWithEvaluation): { evaluation?: IrEvaluation } {
   const e = spec.evaluation;
   if (e === undefined) return {};
+  // 0.6.0 — the spec accepts `on_fail: escalate` (§7.3); `IrEvaluation.onFail`
+  // gains the variant with the model-plan lowering (PR 7). Until then it is a
+  // loud compile error rather than a silently substituted `retry`.
+  if (e.on_fail === "escalate") {
+    throw new CompilerError(
+      "evaluation.on_fail: escalate is accepted by the spec but not yet lowered by this compiler — the cascade lands with the 0.6.0 IR widening; use retry | halt | note for now",
+    );
+  }
   const grader: IrEvaluation["grader"] =
     e.grader.type === "llm_judge"
       ? {
@@ -2589,6 +2605,18 @@ export function assertChainGameLowered(
 }
 
 export function lower(spec: Spec): IrNode {
+  // 0.6.0 §4.1 — the `models:` profile registry parses on every shape from
+  // this release, and every `$profile` reference REQUIRES it (the spec's
+  // cross-field check rejects a ref without a registry). Reference
+  // resolution (`resolveModelRef`) lands with the IR widening (PR 7); until
+  // then a declared registry is a loud compile error, so no bundle can ever
+  // carry a literal `$fast` into the model-router grammar. Absent ⇒ the
+  // lowering below is byte-identical to 0.5.x.
+  if (spec.models !== undefined) {
+    throw new CompilerError(
+      "models: (the 0.6.0 model-profile registry) is accepted by the spec but not yet lowered by this compiler — profile resolution lands with the 0.6.0 IR widening; inline the profile's settings on the slot for now",
+    );
+  }
   switch (spec.target) {
     case "cli": {
       // v0.3.0 Goal 1 — DEFAULT-ON continuity (the release's one sanctioned
