@@ -48,10 +48,25 @@ function num(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 
+/**
+ * A string payload field rendered into a transcript line: whitespace
+ * collapsed and capped at `maxChars` via {@link truncate}, exactly like the
+ * transcript text is. Every routing-line field goes through this — `requested`
+ * is the user's `/model …` text (attacker-controlled on channel shapes) and
+ * `reason` / `cause` carry provider error text, so an un-truncated field could
+ * embed a newline and print what looks like a second, forged transcript line.
+ */
+function field(v: unknown, maxChars: number): string | undefined {
+  const s = str(v);
+  if (s === undefined) return undefined;
+  const t = truncate(s, maxChars);
+  return t.length > 0 ? t : undefined;
+}
+
 /** `model[profile]` when the line names a profile, else the bare model. */
-function modelWithProfile(payload: Record<string, unknown>): string {
-  const model = str(payload["model"]) ?? str(payload["modelId"]) ?? "?";
-  const profile = str(payload["profile"]);
+function modelWithProfile(payload: Record<string, unknown>, maxChars: number): string {
+  const model = field(payload["model"], maxChars) ?? field(payload["modelId"], maxChars) ?? "?";
+  const profile = field(payload["profile"], maxChars);
   return profile !== undefined ? `${model}[${profile}]` : model;
 }
 
@@ -60,52 +75,59 @@ function modelWithProfile(payload: Record<string, unknown>): string {
  * lines the session JSONL now carries, one indented line each, so `sessions
  * tail` shows the shape of a hybrid turn beside its transcript. Every field
  * is duck-typed and optional (0.5.x lines carry fewer of them); a payload
- * that names nothing renderable still yields a line naming the kind.
+ * that names nothing renderable still yields a line naming the kind. Every
+ * string field is passed through {@link field} (one line, capped at
+ * `maxChars`) — the same discipline the transcript lines follow.
  */
-function formatRoutingEvent(kind: string, payload: Record<string, unknown>): string | undefined {
+function formatRoutingEvent(
+  kind: string,
+  payload: Record<string, unknown>,
+  maxChars: number,
+): string | undefined {
+  const f = (v: unknown): string | undefined => field(v, maxChars);
   switch (kind) {
     case "model_route": {
-      const parts = [`  ⇢ route ${modelWithProfile(payload)}`];
-      const policy = str(payload["policy"]);
+      const parts = [`  ⇢ route ${modelWithProfile(payload, maxChars)}`];
+      const policy = f(payload["policy"]);
       if (policy !== undefined) parts.push(`policy=${policy}`);
-      const band = str(payload["routeKey"]);
+      const band = f(payload["routeKey"]);
       if (band !== undefined) parts.push(`band=${band}`);
-      const stage = str(payload["stage"]);
+      const stage = f(payload["stage"]);
       if (stage !== undefined) parts.push(`stage=${stage}`);
-      const rule = str(payload["ruleId"]);
+      const rule = f(payload["ruleId"]);
       if (rule !== undefined) parts.push(`rule=${rule}`);
       if (payload["explored"] === true) parts.push("explored");
-      const reason = str(payload["reason"]);
+      const reason = f(payload["reason"]);
       if (reason !== undefined) parts.push(`— ${reason}`);
       return parts.join(" ");
     }
     case "model_tier_route": {
-      const parts = [`  ⇢ tier ${str(payload["tier"]) ?? "?"} ${str(payload["model"]) ?? "?"}`];
+      const parts = [`  ⇢ tier ${f(payload["tier"]) ?? "?"} ${f(payload["model"]) ?? "?"}`];
       if (payload["escalated"] === true) parts.push("escalated");
-      const reason = str(payload["reason"]);
+      const reason = f(payload["reason"]);
       if (reason !== undefined) parts.push(`— ${reason}`);
       return parts.join(" ");
     }
     case "model_failover":
-      return `  ⇢ failover ${str(payload["from"]) ?? "?"} → ${str(payload["to"]) ?? "?"}${
-        str(payload["reason"]) !== undefined ? ` — ${str(payload["reason"])}` : ""
+      return `  ⇢ failover ${f(payload["from"]) ?? "?"} → ${f(payload["to"]) ?? "?"}${
+        f(payload["reason"]) !== undefined ? ` — ${f(payload["reason"])}` : ""
       }`;
     case "model_directive": {
-      const requested = str(payload["requested"]) ?? "?";
-      const resolved = str(payload["resolved"]);
+      const requested = f(payload["requested"]) ?? "?";
+      const resolved = f(payload["resolved"]);
       const accepted = payload["accepted"] === true ? "pinned" : "refused";
-      const reason = str(payload["reason"]);
+      const reason = f(payload["reason"]);
       return `  ⇢ /model ${requested}${resolved !== undefined && resolved !== requested ? ` → ${resolved}` : ""} ${accepted}${
         reason !== undefined ? ` — ${reason}` : ""
       }`;
     }
     case "cost_accrual": {
       const parts = [
-        `  $ ${formatUsdMicros(payload["costUsdMicros"])} ${modelWithProfile(payload)}`,
+        `  $ ${formatUsdMicros(payload["costUsdMicros"])} ${modelWithProfile(payload, maxChars)}`,
       ];
-      const role = str(payload["role"]);
+      const role = f(payload["role"]);
       if (role !== undefined) parts.push(`role=${role}`);
-      const stage = str(payload["stage"]);
+      const stage = f(payload["stage"]);
       if (stage !== undefined) parts.push(`stage=${stage}`);
       const inTok = num(payload["inputTokens"]);
       const outTok = num(payload["outputTokens"]);
@@ -115,13 +137,13 @@ function formatRoutingEvent(kind: string, payload: Record<string, unknown>): str
     }
     case "model_stage": {
       const parts = [
-        `  ◇ stage ${str(payload["stage"]) ?? "?"}/${str(payload["strategy"]) ?? "?"} ${modelWithProfile(payload)}`,
+        `  ◇ stage ${f(payload["stage"]) ?? "?"}/${f(payload["strategy"]) ?? "?"} ${modelWithProfile(payload, maxChars)}`,
       ];
-      const role = str(payload["role"]);
+      const role = f(payload["role"]);
       if (role !== undefined) parts.push(`role=${role}`);
-      const outcome = str(payload["outcome"]);
+      const outcome = f(payload["outcome"]);
       if (outcome !== undefined) parts.push(outcome);
-      const cause = str(payload["cause"]);
+      const cause = f(payload["cause"]);
       if (cause !== undefined) parts.push(`— ${cause}`);
       const micros = num(payload["costUsdMicros"]);
       if (micros !== undefined) parts.push(formatUsdMicros(micros));
@@ -129,20 +151,20 @@ function formatRoutingEvent(kind: string, payload: Record<string, unknown>): str
     }
     case "eval_graded":
     case "judge_verdict": {
-      const verdict = str(payload["verdict"]) ?? "?";
+      const verdict = f(payload["verdict"]) ?? "?";
       const score = num(payload["score"]);
-      const at = kind === "judge_verdict" ? str(payload["stepOrNode"]) : undefined;
+      const at = kind === "judge_verdict" ? f(payload["stepOrNode"]) : undefined;
       const parts = [
         `  ⚖ ${kind === "judge_verdict" ? "judge" : "eval"}${at !== undefined ? ` ${at}` : ""} ${verdict}`,
       ];
       if (score !== undefined) parts.push(score.toFixed(2));
       const threshold = num(payload["threshold"]);
       if (threshold !== undefined) parts.push(`(bar ${threshold.toFixed(2)})`);
-      const judgeModel = str(payload["judgeModel"]);
+      const judgeModel = f(payload["judgeModel"]);
       if (judgeModel !== undefined) parts.push(`by ${judgeModel}`);
-      const graded = str(payload["model"]);
+      const graded = f(payload["model"]);
       if (graded !== undefined) parts.push(`of ${graded}`);
-      const escalatedTo = str(payload["escalatedTo"]);
+      const escalatedTo = f(payload["escalatedTo"]);
       if (escalatedTo !== undefined) parts.push(`→ escalate ${escalatedTo}`);
       const retry = num(payload["retryIndex"]);
       if (retry !== undefined && retry > 0) parts.push(`retry ${retry}`);
@@ -283,7 +305,7 @@ export function formatSessionEvent(
       }
       default:
         if (opts.transcriptOnly === true || ev.kind === undefined) return undefined;
-        return formatRoutingEvent(ev.kind, payload);
+        return formatRoutingEvent(ev.kind, payload, maxChars);
     }
   })();
   if (body === undefined) return undefined;

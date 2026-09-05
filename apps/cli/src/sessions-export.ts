@@ -42,6 +42,7 @@
  * Side-effect-free (the CLI entry file runs an argv switch on import), so
  * assembly is unit-testable without spawning a subprocess.
  */
+import { type ModelRole, isAuxiliaryModelRole } from "@crewhaus/trace-event-bus";
 import { extractFeedbackRecords, mergeFeedback, normalizeRating } from "./feedback";
 
 /** A parsed event-log line, duck-typed (see session-store's parseSessionLog). */
@@ -101,16 +102,28 @@ export type TrajectoryStep = {
 
 /**
  * 0.6.0 — the `model_meta` line runtime-core's advisor mirror appends per
- * `model_response`. Only PRIMARY-role responses produce an action (a judge's
- * or a compaction call's `model_meta` carries `role`); those are skipped.
+ * `model_response`. Only ANSWER-producing responses commit an assistant
+ * message: `primary` (or an absent role), a cascade's `draft` and its strong
+ * `escalation` re-run, and a sub-agent child's own `subagent` turns (which
+ * land in the CHILD's log beside the child's `assistant_message`). The
+ * auxiliary roles — judge, guide, classifier, consult, committee, shadow,
+ * compaction — are calls made in service of the answer and never commit one,
+ * so their metas are skipped. The deny-list is `AUXILIARY_MODEL_ROLES`, the
+ * codebase's single definition of "not the answer", rather than a local
+ * allow-list of `primary`: the export exists so a hybrid session's cheap
+ * draft and strong re-run are distinguishable, and both carry a non-primary
+ * role (design §8.1).
  */
 type ModelMetaLine = { readonly model: string; readonly profile?: string };
 
-function primaryModelMeta(payload: unknown): ModelMetaLine | undefined {
+function answerModelMeta(payload: unknown): ModelMetaLine | undefined {
   const p = asRecord(payload);
   if (p === undefined || typeof p["model"] !== "string") return undefined;
   const role = p["role"];
-  if (role !== undefined && role !== "primary") return undefined;
+  // An unknown role string is not auxiliary by the shared definition and is
+  // treated as answer-producing; a non-string role is a malformed line.
+  if (role !== undefined && typeof role !== "string") return undefined;
+  if (isAuxiliaryModelRole(role as ModelRole | undefined)) return undefined;
   const profile = p["profile"];
   return {
     model: p["model"],
@@ -124,14 +137,35 @@ function primaryModelMeta(payload: unknown): ModelMetaLine | undefined {
  * it publishes `model_response` (so the mirror line follows), the
  * non-streaming path publishes first (so the mirror line precedes). A meta
  * seen before its action is held as `pending`; an action seen before its meta
- * is left `awaiting` and claims the next primary meta. One action ↔ one meta,
- * in log order — a tool loop commits one assistant message per response.
+ * is left `awaiting` and claims the next answer-role meta. One action ↔ one
+ * meta, in log order — a tool loop commits one assistant message per response.
+ *
+ * Both slots are single and newest-wins, deliberately not FIFO: in a healthy
+ * log an action and its meta are adjacent (event-log appends synchronously
+ * and the mirror persists inside the `model_response` dispatch), so a second
+ * entry arriving while one is held means the held one was orphaned — a
+ * response whose committed content was empty (no `assistant_message`) or a
+ * mirror line the append dropped. Displacing the orphan keeps the rest of the
+ * turn correctly attributed; queueing it would shift every later pairing.
+ *
+ * Both slots are also cleared at a turn boundary — a `user_message` that
+ * carries text (the tool_result echo round carries none and is not a
+ * boundary). No response's mirror can land after the next turn's prompt, so
+ * an orphan held at that point can never be attributed to the next turn's
+ * action: the action goes unattributed rather than taking a stale meta.
  */
 export function pairModelMeta(events: ReadonlyArray<LoggedEvent>): Map<number, ModelMetaLine> {
   const byActionIndex = new Map<number, ModelMetaLine>();
   let pending: ModelMetaLine | undefined;
   let awaiting: number | undefined;
   events.forEach((ev, index) => {
+    if (ev.kind === "user_message") {
+      if (userText(ev.payload) !== undefined) {
+        pending = undefined;
+        awaiting = undefined;
+      }
+      return;
+    }
     if (ev.kind === "assistant_message") {
       if (assistantAction(ev.payload) === undefined) return;
       if (pending !== undefined) {
@@ -143,7 +177,7 @@ export function pairModelMeta(events: ReadonlyArray<LoggedEvent>): Map<number, M
       return;
     }
     if (ev.kind !== "model_meta") return;
-    const meta = primaryModelMeta(ev.payload);
+    const meta = answerModelMeta(ev.payload);
     if (meta === undefined) return;
     if (awaiting !== undefined) {
       byActionIndex.set(awaiting, meta);

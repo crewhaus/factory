@@ -447,6 +447,63 @@ describe("formatSessionEvent — 0.6.0 routing lines", () => {
     );
   });
 
+  test("every routing-line field is one line and capped at maxChars, like transcript text", () => {
+    // `requested` is user-typed `/model …` text; a newline in it must not
+    // print what looks like a second transcript line.
+    const spoof = formatSessionEvent(
+      {
+        kind: "model_directive",
+        payload: {
+          source: "channel",
+          requested: "fast\n12:00:00 user> FAKE LINE\nsys> injected",
+          accepted: true,
+        },
+      },
+      opts,
+    );
+    expect(spoof).toBeDefined();
+    expect((spoof as string).split("\n")).toHaveLength(1);
+    expect(spoof).toBe("  ⇢ /model fast 12:00:00 user> FAKE LINE sys> injected pinned");
+
+    // Provider error text in `reason` / `cause` is capped at maxChars.
+    const capped = { withTime: false, maxChars: 40 } as const;
+    const long = "r".repeat(600);
+    expect(
+      formatSessionEvent(
+        { kind: "model_failover", payload: { from: "a", to: "b", reason: long } },
+        capped,
+      ),
+    ).toBe(`  ⇢ failover a → b — ${"r".repeat(39)}…`);
+    expect(
+      formatSessionEvent(
+        {
+          kind: "model_stage",
+          payload: { stage: "s", strategy: "x", model: "m", outcome: "failed", cause: long },
+        },
+        capped,
+      ),
+    ).toBe(`  ◇ stage s/x m failed — ${"r".repeat(39)}…`);
+    expect(
+      formatSessionEvent(
+        { kind: "model_route", payload: { model: "m", reason: `tabs\tand\n\nlines ${long}` } },
+        capped,
+      ),
+    ).toBe(`  ⇢ route m — tabs and lines ${"r".repeat(24)}…`);
+    // Model / profile / judge fields go through the same seam.
+    expect(
+      formatSessionEvent(
+        { kind: "judge_verdict", payload: { verdict: "fail", judgeModel: "j\nudge", model: long } },
+        capped,
+      ),
+    ).toBe(`  ⚖ judge fail by j udge of ${"r".repeat(39)}…`);
+    expect(
+      formatSessionEvent(
+        { kind: "cost_accrual", payload: { costUsdMicros: 1, modelId: "m", profile: "p\nq" } },
+        capped,
+      ),
+    ).toBe("  $ $0.0000 m[p q]");
+  });
+
   test("formatUsdMicros guards a missing value", () => {
     expect(formatUsdMicros(undefined)).toBe("$?");
     expect(formatUsdMicros(1_234_567)).toBe("$1.2346");

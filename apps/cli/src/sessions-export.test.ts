@@ -281,6 +281,104 @@ describe("assembleTrajectory — served model per step (0.6.0)", () => {
     expect(steps[0]?.profile).toBeUndefined();
   });
 
+  test("a cascade's draft and escalation metas both attribute; an interleaved judge is skipped", () => {
+    // Design §7.3 / §8.1 — cheap draft, judge fails it, strong re-run under
+    // `on_fail: escalate`. The committed answers carry the `draft` and
+    // `escalation` roles, not `primary`; the judge's meta commits no message.
+    const steps = assembleTrajectory(SESSION, [
+      { kind: "user_message", payload: { content: "q" } },
+      asst("cheap draft"),
+      meta("claude-haiku-4-5", { role: "draft", profile: "fast" }),
+      meta("claude-sonnet-5", { role: "judge", profile: "checker" }),
+      {
+        kind: "user_message",
+        payload: { content: "[evaluation failed: scored 0.40] please revise", synthetic: true },
+      },
+      asst("strong answer"),
+      meta("claude-opus-5", { role: "escalation", profile: "strong" }),
+    ]);
+    expect(steps.map((s) => [s.model, s.profile])).toEqual([
+      ["claude-haiku-4-5", "fast"],
+      ["claude-opus-5", "strong"],
+    ]);
+  });
+
+  test("a sub-agent child's own `subagent`-role meta attributes its action", () => {
+    // The child's model_response lands on the child's bus and log, beside the
+    // child's own assistant_message — answer work, not auxiliary.
+    const steps = assembleTrajectory(SESSION, [
+      { kind: "user_message", payload: { content: "child prompt" } },
+      meta("claude-haiku-4-5", { role: "subagent" }),
+      asst("child answer"),
+    ]);
+    expect(steps.map((s) => s.model)).toEqual(["claude-haiku-4-5"]);
+  });
+
+  test("every auxiliary role is skipped; an unknown role string is not", () => {
+    for (const role of [
+      "judge",
+      "guide",
+      "classifier",
+      "consult",
+      "committee",
+      "shadow",
+      "compaction",
+    ]) {
+      const steps = assembleTrajectory(SESSION, [
+        { kind: "user_message", payload: { content: "q" } },
+        asst("a"),
+        meta("aux-model", { role }),
+      ]);
+      expect(steps[0]?.model).toBeUndefined();
+    }
+    const future = assembleTrajectory(SESSION, [
+      { kind: "user_message", payload: { content: "q" } },
+      asst("a"),
+      meta("m", { role: "some-future-answer-role" }),
+    ]);
+    expect(future[0]?.model).toBe("m");
+  });
+
+  test("an orphaned meta or action never crosses a turn boundary", () => {
+    // Streaming path, empty committed content: the response's meta lands with
+    // no assistant_message. The next turn's action must not inherit it.
+    const orphanMeta = assembleTrajectory(SESSION, [
+      { kind: "user_message", payload: { content: "q1" } },
+      meta("claude-haiku-4-5"),
+      { kind: "user_message", payload: { content: "q2" } },
+      asst("answer"),
+      meta("claude-opus-5"),
+    ]);
+    expect(orphanMeta.map((s) => s.model)).toEqual(["claude-opus-5"]);
+
+    // A dropped mirror line: the unattributed action must not take the next
+    // turn's meta, even when that turn logs meta-first.
+    const orphanAction = assembleTrajectory(SESSION, [
+      { kind: "user_message", payload: { content: "q1" } },
+      asst("unpriced"),
+      { kind: "user_message", payload: { content: "q2" } },
+      meta("claude-opus-5"),
+      asst("priced"),
+    ]);
+    expect(orphanAction.map((s) => s.model)).toEqual([undefined, "claude-opus-5"]);
+
+    // The tool_result echo round is not a boundary: a meta held across it
+    // (or an action awaiting across it) still pairs within the turn.
+    const echoRound = assembleTrajectory(SESSION, [
+      { kind: "user_message", payload: { content: "q" } },
+      {
+        kind: "assistant_message",
+        payload: { content: [{ type: "tool_use", id: "tu_1", name: "bash", input: {} }] },
+      },
+      {
+        kind: "user_message",
+        payload: { content: [{ type: "tool_result", tool_use_id: "tu_1", content: "ok" }] },
+      },
+      meta("claude-haiku-4-5"),
+    ]);
+    expect(echoRound.map((s) => s.model)).toEqual(["claude-haiku-4-5"]);
+  });
+
   test("a tool loop pairs one meta per committed assistant message, in order", () => {
     const steps = assembleTrajectory(SESSION, [
       { kind: "user_message", payload: { content: "list" } },
