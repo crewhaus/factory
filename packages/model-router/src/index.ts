@@ -31,13 +31,25 @@ export type {
   ArmScore,
   PolicyDecision,
   PolicyDecisionPolicy,
+  PolicyFloorVerdict,
   PolicyRouter,
   PolicyRouteHint,
   PolicyRouterOptions,
   PoolCandidate,
+  PoolCandidateServed,
+  PoolFloorConfig,
   PoolLearningConfig,
   PoolPolicy,
   PoolRoutingConfig,
+  RouteSignals,
   ScoreLookup,
 } from "./policy-router.js";
-export { createPolicyRouter, poolCandidateArmId } from "./policy-router.js";
+export {
+  FLOOR_BLOCKED_ROUTE_REASON,
+  ROUTE_SCOPE_SEPARATOR,
+  createPolicyRouter,
+  poolCandidateArmId,
+  scopedRouteKey,
+  splitRouteKey,
+  unscopedRouteKey,
+} from "./policy-router.js";

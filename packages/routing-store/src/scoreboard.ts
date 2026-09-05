@@ -9,18 +9,35 @@
  *   - an AGGREGATE snapshot `{v:1,agg:1,k,m,n,mr,m2,ml,mc?,cn}` (written by
  *     `compact()` so the file can be shrunk to one line per arm).
  *
- * 0.6.0 §7.9 / §7.10 (PR 9c) — additive `v:2` fields, all optional:
+ * 0.6.0 §7.9 / §7.10 (PR 9c, completed in PR 10) — additive `v:2` fields,
+ * all optional:
  *   - a delta line carrying a judged quality or hybrid-strategy attribution
  *     adds `q` (quality in [0,1]), `st` (stage), `sg` (strategy), `at`
- *     (attributedTo) and `wp` (wouldPass) and is stamped `v:2`; a 0.5.x reader
- *     folds it as a plain delta (it reads only `k`/`m`/`r`/`l`/`c`), a 0.6.0
- *     reader also folds `q` into the arm's quality mean.
+ *     (attributedTo), `wp` (wouldPass), `pv` (policyVersion), `sc` (scope),
+ *     `h` (harness) and `pf` (the arm's profile-lineage fingerprint) and is
+ *     stamped `v:2`; a 0.5.x reader folds it as a plain delta (it reads only
+ *     `k`/`m`/`r`/`l`/`c`), a 0.6.0 reader also folds `q` into the arm's
+ *     quality mean / M2 (Welford — `qN` / `qMean` / `qM2` on the arm).
  *   - an `ungraded()` increment is persisted as an AGGREGATE line with `n:0`
  *     and `ug:1` — never as a phantom delta (a line with `m` and no `r` would
  *     fold as reward 0 on any reader); a 0.5.x reader's parallel-combine
  *     returns early on `n <= 0`, so the line is invisible to it.
- *   - `compact()` carries `qs`/`qn`/`ug` through (only when non-zero, so a
- *     store that never recorded quality compacts byte-identically).
+ *   - `compact()` carries `qs`/`qn`/`qm2`/`ug`/`pf` through (only when
+ *     present, so a store that never recorded quality compacts
+ *     byte-identically). `pv` / `sc` / `h` are per-observation provenance,
+ *     not arm state: an aggregate cannot carry one value for N lines, and
+ *     `sc` is already embedded in the arm's routeKey (`<scope>/<band>`), so
+ *     they are the one class of `v:2` field an aggregate legitimately drops.
+ *   - **arm identity** (§7.9): `m` is the ARM ID — the `models:` profile name
+ *     when the candidate is a profile, else the spec model string. No
+ *     migration: unprofiled arms keep their key, profiled arms are new.
+ *   - **lineage** (§6.3 item 4, `reward.reset_on_profile_change`): when the
+ *     store is opened with a `lineage` map (arm id → fingerprint of the
+ *     candidate's profile + quality source + judge identity) every line
+ *     stamped `pf` with a DIFFERENT fingerprint for that arm is stale history
+ *     from a profile that no longer exists and is skipped on load (default;
+ *     `resetOnProfileChange: false` folds it anyway). Lines with no `pf`
+ *     (pre-lineage) are always kept.
  *
  * Append-only + load-time replay is what makes the store correct under
  * CONCURRENT harness processes: every run only ever appends its own new
@@ -59,6 +76,8 @@ export type ArmStats = {
   readonly costCount: number;
   /** 0.6.0 §7.10 — running mean of the JUDGED quality across observations that carried one; 0 when none did. */
   readonly meanQuality: number;
+  /** Sample variance of the judged quality (0 when fewer than two observations carried one). */
+  readonly varQuality: number;
   /** How many observations carried a judged quality (denominator for `meanQuality`). */
   readonly qualityCount: number;
   /**
@@ -80,9 +99,13 @@ type Arm = {
   latSum: number;
   costSum: number;
   costCount: number;
-  qSum: number;
+  /** Welford accumulator over the judged quality (`qN` / `qMean` / `qM2`). */
   qN: number;
+  qMean: number;
+  qM2: number;
   ungraded: number;
+  /** The `pf` lineage fingerprint the arm's folded lines carried (last seen), for `compact()`. */
+  lineage?: string;
 };
 
 export type ScoreboardOptions = {
@@ -92,6 +115,17 @@ export type ScoreboardOptions = {
    * debugging) and never affect aggregation.
    */
   readonly now?: () => number;
+  /**
+   * 0.6.0 §6.3 item 4 — the per-arm LINEAGE: arm id → a fingerprint of what
+   * the arm's observations were made under (the candidate's profile, the
+   * pool's `quality_source`, the judge identity — runtime-core composes it).
+   * Stamped as `pf` on every line the store writes for that arm; on load, a
+   * line whose `pf` differs is stale history and is skipped unless
+   * `resetOnProfileChange` is `false`. Absent → nothing is stamped or skipped.
+   */
+  readonly lineage?: Readonly<Record<string, string>>;
+  /** `reward.reset_on_profile_change` — default `true`. */
+  readonly resetOnProfileChange?: boolean;
 };
 
 /** The reader half handed to a `PolicyRouter` — a pure lookup, no I/O. */
@@ -132,8 +166,9 @@ function emptyArm(routeKey: string, model: string): Arm {
     latSum: 0,
     costSum: 0,
     costCount: 0,
-    qSum: 0,
     qN: 0,
+    qMean: 0,
+    qM2: 0,
     ungraded: 0,
   };
 }
@@ -182,21 +217,50 @@ function toStats(arm: Arm): ArmStats {
     meanLatencyMs: arm.n > 0 ? arm.latSum / arm.n : 0,
     meanCostUsd: arm.costCount > 0 ? arm.costSum / arm.costCount : 0,
     costCount: arm.costCount,
-    meanQuality: arm.qN > 0 ? arm.qSum / arm.qN : 0,
+    meanQuality: arm.qN > 0 ? arm.qMean : 0,
+    varQuality: arm.qN > 1 ? arm.qM2 / (arm.qN - 1) : 0,
     qualityCount: arm.qN,
     ungraded: arm.ungraded,
   };
 }
 
-/** Fold a `v:2` delta's optional judged quality into the arm. */
+/** Fold a `v:2` delta's optional judged quality into the arm (Welford). */
 function foldQuality(arm: Arm, quality: unknown): void {
   if (typeof quality !== "number" || !Number.isFinite(quality)) return;
-  arm.qSum += Math.min(1, Math.max(0, quality));
+  const q = Math.min(1, Math.max(0, quality));
   arm.qN += 1;
+  const delta = q - arm.qMean;
+  arm.qMean += delta / arm.qN;
+  arm.qM2 += delta * (q - arm.qMean);
 }
 
-/** Parse one JSONL line into the in-memory arm map. Malformed lines are skipped. */
-function applyLine(arms: Map<string, Arm>, line: string): void {
+/** Chan parallel-combine for the quality accumulator (an aggregate line's `qs`/`qn`/`qm2`). */
+function combineQuality(arm: Arm, bN: number, bSum: number, bM2: number): void {
+  if (bN <= 0) return;
+  const bMean = bSum / bN;
+  const aN = arm.qN;
+  const n = aN + bN;
+  const delta = bMean - arm.qMean;
+  arm.qMean = arm.qMean + (delta * bN) / n;
+  arm.qM2 = arm.qM2 + bM2 + (delta * delta * aN * bN) / n;
+  arm.qN = n;
+}
+
+/** The lineage stamp on a line, if any. */
+function lineLineage(rec: Record<string, unknown>): string | undefined {
+  return typeof rec["pf"] === "string" ? rec["pf"] : undefined;
+}
+
+/**
+ * Parse one JSONL line into the in-memory arm map. Malformed lines are
+ * skipped; so is a line whose `pf` lineage differs from the arm's current
+ * one when `lineage` is given (`reset_on_profile_change`).
+ */
+function applyLine(
+  arms: Map<string, Arm>,
+  line: string,
+  lineage?: Readonly<Record<string, string>>,
+): void {
   const trimmed = line.trim();
   if (trimmed.length === 0) return;
   let rec: Record<string, unknown>;
@@ -208,12 +272,18 @@ function applyLine(arms: Map<string, Arm>, line: string): void {
   const routeKey = typeof rec["k"] === "string" ? rec["k"] : undefined;
   const model = typeof rec["m"] === "string" ? rec["m"] : undefined;
   if (routeKey === undefined || model === undefined) return;
+  const pf = lineLineage(rec);
+  // §6.3 item 4 — a line stamped with a lineage this arm no longer has is
+  // history from a profile that changed underneath the arm id: skip it.
+  const current = lineage?.[model];
+  if (pf !== undefined && current !== undefined && pf !== current) return;
   const key = armKey(routeKey, model);
   let arm = arms.get(key);
   if (arm === undefined) {
     arm = emptyArm(routeKey, model);
     arms.set(key, arm);
   }
+  if (pf !== undefined) arm.lineage = pf;
   if (rec["agg"] === 1) {
     // `ls`/`cs` are raw SUMS (not means) so parallel-combine can add them.
     combineAggregate(
@@ -228,8 +298,7 @@ function applyLine(arms: Map<string, Arm>, line: string): void {
     // 0.6.0 — the quality sums and the ungraded counter ride aggregate lines
     // (a compacted store, or an `ungraded()` increment with `n:0`).
     if (typeof rec["qs"] === "number" && typeof rec["qn"] === "number" && rec["qn"] > 0) {
-      arm.qSum += rec["qs"];
-      arm.qN += rec["qn"];
+      combineQuality(arm, rec["qn"], rec["qs"], typeof rec["qm2"] === "number" ? rec["qm2"] : 0);
     }
     if (typeof rec["ug"] === "number" && rec["ug"] > 0) arm.ungraded += rec["ug"];
     return;
@@ -254,10 +323,24 @@ export function openScoreboard(rootDir: string, opts: ScoreboardOptions = {}): S
   const path = join(rootDir, "routing", "arms.jsonl");
   const now = opts.now ?? Date.now;
   const arms = new Map<string, Arm>();
+  const lineage = opts.lineage;
+  const resetOnProfileChange = opts.resetOnProfileChange ?? true;
+  const lineageFilter = resetOnProfileChange ? lineage : undefined;
+  /**
+   * The CURRENT lineage stamp for an arm's new lines (from the option map —
+   * never inherited from loaded history, so a store opened without a map
+   * writes exactly what 0.5.x wrote). Also remembered on the arm for its
+   * `compact()` aggregate.
+   */
+  const stampLineage = (arm: Arm): string | undefined => {
+    const pf = lineage?.[arm.model];
+    if (pf !== undefined) arm.lineage = pf;
+    return pf;
+  };
 
   if (existsSync(path)) {
     const text = readFileSync(path, "utf8");
-    for (const line of text.split("\n")) applyLine(arms, line);
+    for (const line of text.split("\n")) applyLine(arms, line, lineageFilter);
   }
 
   const ensureDir = (): void => {
@@ -280,14 +363,20 @@ export function openScoreboard(rootDir: string, opts: ScoreboardOptions = {}): S
       }
       foldReward(arm, reward);
       arm.latSum += Math.max(0, obs.latencyMs);
-      // 0.6.0 — a line carrying quality or strategy attribution is `v:2`; a
-      // plain observation keeps the exact `v:1` shape (byte-identical store).
+      const pf = stampLineage(arm);
+      // 0.6.0 — a line carrying quality, strategy attribution or routing
+      // provenance is `v:2`; a plain observation keeps the exact `v:1` shape
+      // (byte-identical store).
       const enriched =
         obs.quality !== undefined ||
         obs.stage !== undefined ||
         obs.strategy !== undefined ||
         obs.attributedTo !== undefined ||
-        obs.wouldPass !== undefined;
+        obs.wouldPass !== undefined ||
+        obs.policyVersion !== undefined ||
+        obs.scope !== undefined ||
+        obs.harness !== undefined ||
+        pf !== undefined;
       const line: Record<string, unknown> = {
         v: enriched ? 2 : 1,
         k: routeKey,
@@ -311,6 +400,10 @@ export function openScoreboard(rootDir: string, opts: ScoreboardOptions = {}): S
       if (obs.strategy !== undefined) line["sg"] = obs.strategy;
       if (obs.attributedTo !== undefined) line["at"] = obs.attributedTo;
       if (obs.wouldPass !== undefined) line["wp"] = obs.wouldPass ? 1 : 0;
+      if (obs.policyVersion !== undefined) line["pv"] = obs.policyVersion;
+      if (obs.scope !== undefined) line["sc"] = obs.scope;
+      if (obs.harness !== undefined) line["h"] = obs.harness;
+      if (pf !== undefined) line["pf"] = pf;
       ensureDir();
       appendFileSync(path, `${JSON.stringify(line)}\n`, { mode: 0o600 });
     },
@@ -322,9 +415,19 @@ export function openScoreboard(rootDir: string, opts: ScoreboardOptions = {}): S
         arms.set(key, arm);
       }
       arm.ungraded += 1;
+      const pf = stampLineage(arm);
       // An aggregate line with `n:0`: a 0.5.x reader's parallel-combine
       // returns early on `n <= 0`, so the increment never reads as a reward.
-      const line = { v: 2, agg: 1, k: routeKey, m: model, n: 0, ug: 1, t: now() };
+      const line = {
+        v: 2,
+        agg: 1,
+        k: routeKey,
+        m: model,
+        n: 0,
+        ug: 1,
+        t: now(),
+        ...(pf !== undefined ? { pf } : {}),
+      };
       ensureDir();
       appendFileSync(path, `${JSON.stringify(line)}\n`, { mode: 0o600 });
     },
@@ -340,7 +443,7 @@ export function openScoreboard(rootDir: string, opts: ScoreboardOptions = {}): S
         .sort((a, b) => a.routeKey.localeCompare(b.routeKey) || a.model.localeCompare(b.model))
         .map((a) =>
           JSON.stringify({
-            v: a.qN > 0 || a.ungraded > 0 ? 2 : 1,
+            v: a.qN > 0 || a.ungraded > 0 || a.lineage !== undefined ? 2 : 1,
             agg: 1,
             k: a.routeKey,
             m: a.model,
@@ -354,8 +457,9 @@ export function openScoreboard(rootDir: string, opts: ScoreboardOptions = {}): S
             cn: a.costCount,
             // 0.6.0 — carried only when present, so a store that never
             // recorded quality compacts byte-identically to 0.5.x.
-            ...(a.qN > 0 ? { qs: a.qSum, qn: a.qN } : {}),
+            ...(a.qN > 0 ? { qs: a.qMean * a.qN, qn: a.qN, qm2: a.qM2 } : {}),
             ...(a.ungraded > 0 ? { ug: a.ungraded } : {}),
+            ...(a.lineage !== undefined ? { pf: a.lineage } : {}),
           }),
         );
       // Write-then-rename for an atomic swap: a concurrent reader sees either

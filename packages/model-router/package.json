@@ -15,6 +15,7 @@
     "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/circuit-breaker": "workspace:*",
     "@crewhaus/errors": "workspace:*",
+    "@crewhaus/model-plan": "workspace:*",
     "@crewhaus/trace-event-bus": "workspace:*"
   },
   "optionalDependencies": {

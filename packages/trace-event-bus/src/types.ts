@@ -896,6 +896,23 @@ export type ModelRouteEvent = TraceEventEnvelope & {
   scope?: string;
   /** Persisted verdict of a `policy: classifier` label call, so replay stays exact. */
   classifierVerdict?: ModelClassifierVerdict;
+  /**
+   * 0.6.0 §7.10 — the quality floor's verdict on a learned exploit-phase
+   * decision: `blocked` means nothing but the floor arm was exploitable and it
+   * served (`reason: "floor-blocked"`); `unavailable` means the check was
+   * suspended for the turn (no judged quality on the floor arm, or the floor
+   * arm ineligible).
+   */
+  floor?: ModelRouteFloor;
+  /** 0.6.0 §7.9 — the unscoped route key a scoped arm's statistics were read from while it was under-sampled. */
+  backedOffTo?: string;
+};
+
+/** 0.6.0 §7.10 — the floor check as persisted on a `model_route` line. */
+export type ModelRouteFloor = {
+  readonly arm: string;
+  readonly status: "ok" | "blocked" | "unavailable";
+  readonly blocked?: ReadonlyArray<string>;
 };
 
 /**

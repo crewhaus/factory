@@ -34,6 +34,7 @@ import {
   type CostTracker,
   DEFAULT_CAPABILITIES,
   DEFAULT_PRICING,
+  type PricingTable,
   computeCostMicros,
   createCostTracker,
   resolveCapabilities,
@@ -66,24 +67,33 @@ import {
   buildAdvertisement,
   buildRequestParams,
   deriveSignalRecord,
+  loadPriors,
   parseModelDirective,
   planFingerprint,
+  priorsFingerprint,
+  seededScoreLookup,
   stripDirectiveToken,
   toolConfigFor,
 } from "@crewhaus/model-plan";
 import {
   type FailoverChain,
+  type PolicyDecision,
   type PolicyDecisionPolicy,
   type PolicyRouter,
   type PoolCandidate,
+  type PoolCandidateServed,
+  type PoolFloorConfig,
   type PoolPolicy,
   type ResolvedTier,
+  type ScoreLookup,
   type TierRouter,
   createFailoverChain,
   createPolicyRouter,
   createTierRouter,
   parseModelString,
+  poolCandidateArmId,
   resolveModel,
+  unscopedRouteKey,
 } from "@crewhaus/model-router";
 import {
   BUILTIN_DEFAULT_RULES,
@@ -117,7 +127,11 @@ import {
   type RouteObservation,
   type Scoreboard,
   computeReward,
+  freezeScoreboard,
   openScoreboard,
+  readRouteFreeze,
+  readRoutingPriorsRaw,
+  routingPriorsPath,
   shadowLaneQuality,
   shadowRouteKey,
 } from "@crewhaus/routing-store";
@@ -2205,16 +2219,37 @@ export type RunChatLoopOptions = {
       readonly maxEscalations?: number;
     };
     /**
-     * 0.6.0 §6.3 — the reward block. `qualitySource: "in_loop"` lets a cascade
-     * turn's judged quality reach the REWARD (`computeReward`); under the
-     * default `none` the quality is still persisted on the `v:2` arm line
-     * (`route status` shows it) but the reward is computed without it —
-     * byte-identical to a 0.5.x reward.
+     * 0.6.0 §6.3 / §7.10 / §7.11 — the reward block. `qualitySource: "in_loop"`
+     * lets a cascade turn's judged quality reach the REWARD (`computeReward`);
+     * under the default `none` the quality is still persisted on the `v:2`
+     * arm line (`route status` shows it) but the reward is computed without
+     * it — byte-identical to a 0.5.x reward. `priors: "eval"` seeds the
+     * learned policy from `<root>/routing/priors.json` (N2 — a malformed or
+     * stale file is ignored with a boot warning). `floor` bounds learned
+     * exploitation to arms whose judged-quality lower bound clears the floor
+     * arm's mean (`reason: "floor-blocked"` otherwise). `resetOnProfileChange`
+     * (default true) discards a profiled arm's lines recorded under a
+     * different profile / quality-source lineage.
      */
     readonly reward?: {
       readonly qualitySource?: "none" | "in_loop" | "shadow" | "promoted";
+      readonly priors?: "none" | "eval";
+      readonly floor?: {
+        readonly arm?: string;
+        readonly confidence?: number;
+        readonly tolerance?: number;
+      };
+      readonly resetOnProfileChange?: boolean;
     };
   };
+  /**
+   * 0.6.0 §7.9 — the pricing table the pool's reward and the per-tool cost
+   * attribution price with: the INSTALLED feed (`crewhaus pricing sync`,
+   * `loadUserPricing` on the CLI) injected by the host, so the learned
+   * policy's cost term and `cost_accrual` agree. Absent → the compiled-in
+   * `DEFAULT_PRICING`, exactly as before.
+   */
+  pricing?: PricingTable;
   /**
    * 0.6.0 §7.2.3 — the `policy: classifier` label call (see
    * {@link RouteClassifierFn}). Wired by `@crewhaus/model-service` when the
@@ -2726,8 +2761,10 @@ function bestEffortWireModelId(modelString: string): string {
  * `max_tokens` or `tools` edit must change `policyVersion`, or a learned
  * decision could be attributed to a policy that no longer exists.
  */
-function poolFingerprint(pool: unknown): string {
-  return `pool-${planFingerprint(pool)}`;
+function poolFingerprint(pool: unknown, priorsDigest?: string): string {
+  // §7.11 — the accepted priors file is part of the policy: fold its digest
+  // in only when one was loaded, so a pool without priors keeps its version.
+  return `pool-${planFingerprint(priorsDigest === undefined ? pool : { pool, priors: priorsDigest })}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -3251,33 +3288,115 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // 0.6.0 §7.1 — a withdrawn candidate never becomes an arm.
       if (c.enabled === false) continue;
       const injected = opts._poolAdapters?.get(c.model);
-      // §7.9 — the arm identity the preRoute hint names the candidate by:
-      // the profile name when it is a profile, else the model string.
+      // §7.9 — the ARM IDENTITY (what the scoreboard keys on and the preRoute
+      // hint names the candidate by): the profile name when it is a profile,
+      // else the model string.
       const armId = c.profile ?? c.model;
-      const resolved: PoolCandidate =
+      const base: { readonly adapter: ProviderAdapter; readonly modelId: string } =
         injected !== undefined
-          ? {
-              adapter: injected,
-              modelId: bestEffortWireModelId(c.model),
-              modelString: c.model,
-              tags: c.tags,
-              armId,
-            }
+          ? { adapter: injected, modelId: bestEffortWireModelId(c.model) }
           : await (async () => {
               const r = await resolveModel(c.model);
-              return {
-                adapter: r.adapter,
-                modelId: r.modelId,
-                modelString: c.model,
-                tags: c.tags,
-                armId,
-              };
+              return { adapter: r.adapter, modelId: r.modelId };
             })();
+      let resolved: PoolCandidate;
+      if (c.fallbacks !== undefined && c.fallbacks.length > 0) {
+        // §4.4 — a per-profile failover chain: the candidate's adapter IS the
+        // chain (itself a ProviderAdapter, every member breaker-wrapped inside
+        // it). Seeded with the already-resolved primary plus any injected
+        // pool adapters, mirroring the run-level chain above. The chain
+        // rewrites `model` internally, so `lastServed()` names the member
+        // that actually served — what both attribution sites read.
+        const chainAdapters = new Map<string, ProviderAdapter>();
+        chainAdapters.set(c.model, base.adapter);
+        for (const [modelString, a] of opts._poolAdapters ?? []) {
+          if (!chainAdapters.has(modelString)) chainAdapters.set(modelString, a);
+        }
+        const chain = await createFailoverChain({
+          model: c.model,
+          fallbacks: c.fallbacks,
+          ...(c.circuitBreaker !== undefined ? { breaker: c.circuitBreaker } : {}),
+          getBus: () => observabilityBus,
+          adapters: chainAdapters,
+        });
+        for (const warning of chain.warnings()) {
+          process.stderr.write(`[model_pool] ${armId}: ${warning}\n`);
+        }
+        resolved = {
+          adapter: chain,
+          modelId: base.modelId,
+          modelString: c.model,
+          tags: c.tags,
+          armId,
+          // The chain is "open" only when every member's breaker is (a chain
+          // with one closed member can still serve).
+          breaker: {
+            state: () => {
+              const members = chain.candidates();
+              return members.length > 0 && members.every((m) => m.breakerState === "open")
+                ? "open"
+                : "closed";
+            },
+          },
+          lastServed: (): PoolCandidateServed => chain.lastServed(),
+        };
+      } else {
+        // §4.4 — every candidate is breaker-wrapped; `state() !== "open"` is
+        // the eligibility filter (preRoute's N1 check and the router both
+        // read it). The profile's `circuit_breaker` tunes it; package
+        // defaults apply otherwise.
+        const wrapped = wrapWithCircuitBreaker(base.adapter, {
+          ...(c.circuitBreaker ?? {}),
+          adapterName: armId,
+          bus: opts.runContext?.eventBus,
+        });
+        resolved = {
+          adapter: wrapped,
+          modelId: base.modelId,
+          modelString: c.model,
+          tags: c.tags,
+          armId,
+          breaker: wrapped,
+        };
+      }
       candidates.push(resolved);
       poolCandidateConfigs.set(resolved, c);
     }
     const routingRoot = sessionRootDir !== undefined ? pathDirname(sessionRootDir) : ".crewhaus";
-    scoreboard = opts._scoreboard ?? openScoreboard(routingRoot);
+    const rewardBlock = pool.reward;
+    // §6.3 item 4 — the per-arm LINEAGE: a PROFILED arm's lines are stamped
+    // with a fingerprint of its profile + the pool's quality source + the
+    // grader kind; a line stamped under a different lineage is history from a
+    // profile that changed under the same arm id and is skipped on load
+    // (`reset_on_profile_change`, default true). Unprofiled arms (arm id =
+    // model string) are not stamped, so a bare 0.5.x pool writes 0.5.x lines.
+    // The judge MODEL is closed over by `evaluation.evaluate` and not visible
+    // here; the grader kind is the judge identity this seam can see.
+    const lineage: Record<string, string> = {};
+    for (const candidate of candidates) {
+      const cfg = poolCandidateConfigs.get(candidate);
+      if (cfg?.profile === undefined) continue;
+      lineage[cfg.profile] = planFingerprint({
+        candidate: cfg,
+        qualitySource: rewardBlock?.qualitySource ?? "none",
+        grader: opts.evaluation?.graderType,
+      });
+    }
+    const liveScoreboard =
+      opts._scoreboard ??
+      openScoreboard(routingRoot, {
+        ...(Object.keys(lineage).length > 0 ? { lineage } : {}),
+        ...(rewardBlock?.resetOnProfileChange !== undefined
+          ? { resetOnProfileChange: rewardBlock.resetOnProfileChange }
+          : {}),
+      });
+    // §10.1 — `crewhaus route freeze <policyVersion>`: the kill switch. While
+    // the marker exists the scoreboard is read-only for this run and every
+    // decision reports the FROZEN policyVersion.
+    const routeFreeze = readRouteFreeze(routingRoot, (detail) =>
+      process.stderr.write(`[model_pool] route freeze marker ignored: ${detail}\n`),
+    );
+    scoreboard = routeFreeze !== undefined ? freezeScoreboard(liveScoreboard) : liveScoreboard;
     const sb = scoreboard;
     rewardConfig = {
       ...(pool.objective !== undefined ? { objective: pool.objective } : {}),
@@ -3286,14 +3405,89 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         ? { latencyRefMs: pool.learning.latencyRefMs }
         : {}),
     };
-    poolPolicyVersion = poolFingerprint(pool);
+    // §7.11 N2 — eval-seeded priors. Read beside the arms, validated against
+    // the ROSTER fingerprint, and composed over the live lookup so a seeded
+    // arm skips warm-up. Any problem is a boot warning and cold warm-up —
+    // never a silently wrong prior. The accepted file's digest is folded into
+    // `policyVersion`, so a new leaderboard is a new policy.
+    let liveLookup: ScoreLookup = (rk, m) => sb.score(rk, m);
+    let priorsDigest: string | undefined;
+    if (rewardBlock?.priors === "eval") {
+      const raw = readRoutingPriorsRaw(routingRoot);
+      const warnPriors = (detail: string): void => {
+        process.stderr.write(
+          `[model_pool] reward.priors: eval — priors ignored (${detail}); the learned policy warms up cold.\n`,
+        );
+      };
+      if (raw === undefined) {
+        warnPriors(`no ${routingPriorsPath(routingRoot)} — run eval leaderboard --export-priors`);
+      } else if (!raw.ok) {
+        warnPriors(raw.error);
+      } else {
+        const loaded = loadPriors(raw.raw, {
+          expectFingerprint: priorsFingerprint(pool.candidates),
+        });
+        if (loaded.ok) {
+          priorsDigest = loaded.priors.digest;
+          liveLookup = seededScoreLookup(liveLookup, loaded.priors);
+        } else {
+          warnPriors(`${loaded.reason}: ${loaded.detail}`);
+        }
+      }
+    }
+    const computedPolicyVersion = poolFingerprint(pool, priorsDigest);
+    if (routeFreeze !== undefined) {
+      poolPolicyVersion = routeFreeze.policyVersion;
+      process.stderr.write(
+        `[model_pool] routing is FROZEN at policyVersion ${routeFreeze.policyVersion}${
+          routeFreeze.policyVersion !== computedPolicyVersion
+            ? ` (the current pool would be ${computedPolicyVersion})`
+            : ""
+        } — no new observations are recorded; \`crewhaus route freeze --clear\` lifts it.\n`,
+      );
+    } else {
+      poolPolicyVersion = computedPolicyVersion;
+    }
     // 0.6.0 §7.2.3 — under `classifier` the router itself stays the heuristic
     // selector: the classifier's verdict arrives as the preRoute hint's forced
     // arm, and the heuristic is the documented fallback when it does not.
     const routerPolicy: PoolPolicy = pool.policy === "classifier" ? "heuristic" : pool.policy;
+    // §7.10 — `reward.floor.arm` is a ROLE SLOT (a candidate tag, a
+    // `$profile` the compiler has already lowered to its bare name, or a
+    // model string); the router compares the floor arm to arm IDS by strict
+    // equality, so resolve the slot against the booted roster HERE. An
+    // unresolvable floor is a boot error, never a silently `unavailable`
+    // check — the floor is the acceptance guarantee (§1) that a learned
+    // policy cannot exploit below a pinned arm.
+    let routerFloor: PoolFloorConfig | undefined;
+    if (rewardBlock?.floor !== undefined) {
+      const declared = rewardBlock.floor.arm;
+      if (declared === undefined) {
+        routerFloor = rewardBlock.floor;
+      } else {
+        const wanted = declared.startsWith("$") ? declared.slice(1) : declared;
+        const floorCandidate =
+          candidates.find((c) => c.modelString === declared) ??
+          candidates.find((c) => poolCandidateConfigs.get(c)?.profile === wanted) ??
+          candidates.find((c) => c.tags.includes(wanted));
+        if (floorCandidate === undefined) {
+          const roster = candidates
+            .map((c) => poolCandidateConfigs.get(c)?.profile ?? c.modelString)
+            .join(", ");
+          throw new RuntimeError(
+            `model_pool.reward.floor.arm "${declared}" is not a roster arm (declared: ${roster}) — name a candidate's model, its profile or a tag`,
+          );
+        }
+        routerFloor = { ...rewardBlock.floor, arm: poolCandidateArmId(floorCandidate) };
+      }
+    }
     poolRouter = createPolicyRouter({
       candidates,
       policy: routerPolicy,
+      // §7.9 — scoped arms (`<scope>/<band>`, backing off to the band while
+      // under-sampled); §7.10 — the floor the learned policy exploits above.
+      ...(poolScope !== undefined ? { scope: poolScope } : {}),
+      ...(routerFloor !== undefined ? { floor: routerFloor } : {}),
       ...(pool.routing !== undefined ? { routing: pool.routing } : {}),
       ...(pool.learning !== undefined
         ? {
@@ -3308,8 +3502,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             },
           }
         : {}),
-      // The learned policy reads the live scoreboard; static/heuristic ignore it.
-      ...(pool.policy === "learned" ? { score: (rk, m) => sb.score(rk, m) } : {}),
+      // The learned policy reads the live scoreboard (seeded by the priors
+      // when declared); static/heuristic ignore it.
+      ...(pool.policy === "learned" ? { score: liveLookup } : {}),
     });
   }
   // 0.6.0 §7.12 — under a pool, `budget.on_exceed: degrade` is an ELIGIBILITY
@@ -3361,23 +3556,37 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   let lastPoolOutcome:
     | {
         readonly modelString: string;
+        /** §7.9 — the arm id the outcome was recorded under. */
+        readonly armId: string;
         readonly routeKey: string;
         readonly latencyMs: number;
         readonly costUsd?: number;
       }
     | undefined;
+  /** §7.9 — the routing provenance every arm line carries (`pv` / `sc` / `h`). */
+  const routeProvenance = (): Pick<RouteObservation, "policyVersion" | "scope" | "harness"> => ({
+    ...(poolPolicyVersion !== undefined ? { policyVersion: poolPolicyVersion } : {}),
+    ...(poolScope !== undefined ? { scope: poolScope } : {}),
+    ...(opts.sessionName !== undefined ? { harness: opts.sessionName } : {}),
+  });
   // Fold one turn's observed outcome into the scoreboard (no-op without a pool).
+  // The arm is `turn.armId` (the profile name for a profiled candidate, §7.9),
+  // falling back to the model string for the strategy arm and bare candidates.
   const recordPoolOutcome = (
-    turn: { readonly modelString: string; readonly routeKey: string } | undefined,
+    turn:
+      | { readonly modelString: string; readonly routeKey: string; readonly armId?: string }
+      | undefined,
     obs: RouteObservation,
   ): void => {
     // Capture into consts so the narrowing survives (they are closed-over lets).
     const sb = scoreboard;
     const rc = rewardConfig;
     if (turn === undefined || sb === undefined || rc === undefined) return;
+    const arm = turn.armId ?? turn.modelString;
     if (obs.success) {
       lastPoolOutcome = {
         modelString: turn.modelString,
+        armId: arm,
         routeKey: turn.routeKey,
         latencyMs: obs.latencyMs,
         ...(obs.costUsd !== undefined ? { costUsd: obs.costUsd } : {}),
@@ -3390,16 +3599,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // is counted `ungraded` instead of recorded. Failed calls still record —
     // the reward short-circuits on `!success` before reading quality.
     if (qualityIntoReward && obs.success && obs.quality === undefined) {
-      sb.ungraded(turn.routeKey, turn.modelString);
+      sb.ungraded(turn.routeKey, arm);
       return;
     }
     const { quality: _quality, ...withoutQuality } = obs;
-    sb.record(
-      turn.routeKey,
-      turn.modelString,
-      computeReward(qualityIntoReward ? obs : withoutQuality, rc),
-      obs,
-    );
+    sb.record(turn.routeKey, arm, computeReward(qualityIntoReward ? obs : withoutQuality, rc), {
+      ...obs,
+      ...routeProvenance(),
+    });
   };
   /** 0.6.0 §7.3 — resolve a roster arm by spec model string, profile name (`$` optional) or tag. */
   const resolveRosterArm = (value: string): PoolCandidate | undefined => {
@@ -3441,7 +3648,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     wireModelId: string,
     usage: { input: number; output: number; cacheRead?: number; cacheCreate?: number },
   ): number | undefined => {
-    const row = resolvePricing(DEFAULT_PRICING, provider, wireModelId);
+    // §7.9 — the INSTALLED feed when the host injected one, else the table.
+    const row = resolvePricing(opts.pricing ?? DEFAULT_PRICING, provider, wireModelId);
     if (row === undefined) return undefined;
     return (
       computeCostMicros(
@@ -5127,7 +5335,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     wireModelId: string,
     usage: { input: number; output: number; cacheRead?: number; cacheCreate?: number },
   ): number | undefined => {
-    const row = resolvePricing(DEFAULT_PRICING, provider, wireModelId);
+    const row = resolvePricing(opts.pricing ?? DEFAULT_PRICING, provider, wireModelId);
     if (row === undefined) return undefined;
     return computeCostMicros(
       row,
@@ -6336,7 +6544,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     readonly fallible?: boolean;
   };
   type PendingPoolObservation = {
-    readonly turn: { readonly modelString: string; readonly routeKey: string };
+    readonly turn: {
+      readonly modelString: string;
+      readonly routeKey: string;
+      readonly armId?: string;
+    };
     readonly obs: RouteObservation;
   };
   type TurnAttempt = {
@@ -6521,7 +6733,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       model: shadow.candidate,
       ...(shadow.profile !== undefined ? { profile: shadow.profile } : {}),
     };
-    if (served !== undefined && served.modelString === shadow.candidate) {
+    // §7.9 — the shadow arm records under its ARM ID (the profile name when
+    // the shadow candidate is a profile, else its model string), like every
+    // live arm.
+    const shadowArm = shadow.profile ?? shadow.candidate;
+    if (
+      served !== undefined &&
+      (served.armId === shadowArm || served.modelString === shadow.candidate)
+    ) {
       publishStage({ ...stage, outcome: "skipped", cause: "same-as-primary" });
       return;
     }
@@ -6562,7 +6781,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         const sb = scoreboard;
         const rc = rewardConfig;
         if (served !== undefined && sb !== undefined && rc !== undefined) {
-          const key = shadowRouteKey(served.routeKey, poolScope);
+          // The primary's key is already `<scope>/<band>` under a scoped pool
+          // (§7.9); the lane re-scopes the bare band as `shadow:<scope>/<band>`.
+          const key = shadowRouteKey(unscopedRouteKey(served.routeKey), poolScope);
           const q = shadowLaneQuality(v.verdict);
           const shadowObs = {
             success: true,
@@ -6576,8 +6797,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             ...(served.costUsd !== undefined ? { costUsd: served.costUsd } : {}),
             quality: q.primary,
           };
-          sb.record(key, shadow.candidate, computeReward(shadowObs, rc), shadowObs);
-          sb.record(key, served.modelString, computeReward(primaryObs, rc), primaryObs);
+          sb.record(key, shadowArm, computeReward(shadowObs, rc), {
+            ...shadowObs,
+            ...routeProvenance(),
+          });
+          sb.record(key, served.armId, computeReward(primaryObs, rc), {
+            ...primaryObs,
+            ...routeProvenance(),
+          });
         }
         publishStage({
           ...stage,
@@ -6623,12 +6850,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     let attemptServedProfile: string | undefined;
     /** §7.10 — defer a successful pool observation to the strategy-turn boundary, or fold it now. */
     const foldOutcome = (
-      turn: { readonly modelString: string; readonly routeKey: string },
+      turn: { readonly modelString: string; readonly routeKey: string; readonly armId?: string },
       obs: RouteObservation,
     ): void => {
       if (turnOpts.defer === true && obs.success) {
         pendingObservations.push({
-          turn: { modelString: turn.modelString, routeKey: turn.routeKey },
+          turn: {
+            modelString: turn.modelString,
+            routeKey: turn.routeKey,
+            ...(turn.armId !== undefined ? { armId: turn.armId } : {}),
+          },
           obs,
         });
         return;
@@ -6758,8 +6989,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           let poolTurn:
             | {
                 readonly modelString: string;
+                /** §7.9 — the arm id (profile name, else the model string). */
+                readonly armId: string;
                 readonly routeKey: string;
                 readonly plan: CandidatePlan;
+                readonly candidate: PoolCandidate;
               }
             | undefined;
           let modelCallStartMs = performance.now();
@@ -6886,10 +7120,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 const contextWindow = cfg?.capabilities?.contextWindow ?? table?.contextWindow;
                 const maxOutputTokens =
                   cfg?.capabilities?.maxOutputTokens ?? table?.maxOutputTokens;
+                const breakerState = c.breaker?.state();
                 return {
                   armId: armIdOf(c),
                   modelString: c.modelString,
                   tags: c.tags,
+                  ...(breakerState !== undefined ? { breakerState } : {}),
                   capabilities: {
                     features: plan.features,
                     ...(contextWindow !== undefined ? { contextWindow } : {}),
@@ -7034,13 +7270,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                       ? roster.find((c) => armIdOf(c) === pre.forcedIneligible?.served)
                       : undefined) ??
                     (forced.lane === "budget" ? budgetDegradeRung : escalationTarget));
-              let decision: {
-                readonly candidate: PoolCandidate;
-                readonly routeKey: string;
-                readonly reason: string;
-                readonly policy: PolicyDecisionPolicy;
-                readonly explored: boolean;
-              } =
+              let decision: PolicyDecision =
                 forced?.lane === "budget" && forcedCandidate !== undefined
                   ? {
                       ...base,
@@ -7102,8 +7332,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               reqSpecModel = decision.candidate.modelString;
               poolTurn = {
                 modelString: decision.candidate.modelString,
+                armId: armIdOf(decision.candidate),
                 routeKey: decision.routeKey,
                 plan: poolPlan,
+                candidate: decision.candidate,
               };
               // §5.3 / §8.1 — the routing attribution every route line gains:
               // the candidate's profile, its advertised-toolset fingerprint,
@@ -7150,6 +7382,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 decision.candidate.modelString !== decision.candidate.modelId
                   ? { specModel: decision.candidate.modelString }
                   : {};
+              // §7.10 / §7.9 — the floor verdict and the scoped-arm backoff
+              // (each present only when the learned policy produced one).
+              const learnedAttribution = {
+                ...(decision.floor !== undefined ? { floor: decision.floor } : {}),
+                ...(decision.backedOffTo !== undefined
+                  ? { backedOffTo: decision.backedOffTo }
+                  : {}),
+              };
               bus.publish({
                 ...bus.envelope(),
                 kind: "model_route",
@@ -7162,6 +7402,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 ...routeSpecModel,
                 signals: persistedSignals,
                 ...routeAttribution,
+                ...learnedAttribution,
               });
               // Persist the decision so `crewhaus route explain <session>` can
               // replay per-turn routing after the fact. Non-conversational, so
@@ -7177,6 +7418,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 ...routeSpecModel,
                 signals: persistedSignals,
                 ...routeAttribution,
+                ...learnedAttribution,
               });
             } else if (tierRouter !== undefined && !budgetDegraded) {
               // Item 26 — two-tier turn-difficulty router. Pick a tier from
@@ -7454,17 +7696,23 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // Item 22 — lastServed() is exact: the candidate that actually
               // streamed this response. Cost-tracker prices off this pair.
               const servedStreaming = failoverChain?.lastServed();
-              // With a pool, the served identity is the chosen candidate (no
-              // failover chain when pooling), so cost-tracker prices on it.
+              // With a pool, the served identity is the chosen candidate — or,
+              // when the candidate is a per-profile failover chain (§4.4), the
+              // chain member `lastServed()` names, so cost-tracker prices the
+              // member that streamed and never bills a fallback's tokens to
+              // the profile's primary. The ARM stays the candidate.
+              const poolServedS = poolTurn?.candidate.lastServed?.();
               const respModelIdS =
-                poolTurn !== undefined ? reqWireModelId : (servedStreaming?.modelId ?? wireModelId);
+                poolTurn !== undefined
+                  ? (poolServedS?.modelId ?? reqWireModelId)
+                  : (servedStreaming?.modelId ?? wireModelId);
               const respSpecModelS =
                 poolTurn !== undefined
-                  ? poolTurn.modelString
+                  ? (poolServedS?.modelString ?? poolTurn.modelString)
                   : (servedStreaming?.modelString ?? degradedSpecModel ?? opts.model);
               const respProviderS =
                 poolTurn !== undefined
-                  ? reqProviderId
+                  ? (poolServedS?.providerId ?? reqProviderId)
                   : (servedStreaming?.providerId ?? providerId);
               bus.publish({
                 ...bus.envelope(),
@@ -7591,15 +7839,22 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // Item 22 — lastServed() is exact: the candidate that actually
             // streamed this response. Cost-tracker prices off this pair.
             const servedCandidate = failoverChain?.lastServed();
-            // With a pool, the served identity is the chosen candidate.
+            // With a pool, the served identity is the chosen candidate — or the
+            // member its per-profile chain actually served (§4.4, see the
+            // streaming site above).
+            const poolServed = poolTurn?.candidate.lastServed?.();
             const respWireModelId =
-              poolTurn !== undefined ? reqWireModelId : (servedCandidate?.modelId ?? wireModelId);
+              poolTurn !== undefined
+                ? (poolServed?.modelId ?? reqWireModelId)
+                : (servedCandidate?.modelId ?? wireModelId);
             const respSpecModel =
               poolTurn !== undefined
-                ? poolTurn.modelString
+                ? (poolServed?.modelString ?? poolTurn.modelString)
                 : (servedCandidate?.modelString ?? degradedSpecModel ?? opts.model);
             const respProvider =
-              poolTurn !== undefined ? reqProviderId : (servedCandidate?.providerId ?? providerId);
+              poolTurn !== undefined
+                ? (poolServed?.providerId ?? reqProviderId)
+                : (servedCandidate?.providerId ?? providerId);
             bus.publish({
               ...bus.envelope(),
               spanId: modelStartEnv.spanId,
@@ -8188,7 +8443,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   /** §7.13 — the grader threw: the attempt's arms served but cannot be graded. */
   const discardUngraded = (attempt: TurnAttempt): void => {
     for (const { turn } of attempt.observations) {
-      scoreboard?.ungraded(turn.routeKey, turn.modelString);
+      scoreboard?.ungraded(turn.routeKey, turn.armId ?? turn.modelString);
     }
   };
   /**
@@ -8592,6 +8847,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    * the plain evaluated turn when the committee cannot decide at all
    * (§7.13). Without `sideCalls.committee` this IS `runEvaluatedTurn`.
    */
+  // §7.10 (PR 10 decision) — committee MEMBER arms do NOT fold into the live
+  // scoreboard, and neither do shadow member arms until `route promote`
+  // (PR 14). The committee's judge PICKS a winner: that is a pairwise
+  // preference between members, not a per-member judged score on the same
+  // instrument the floor and the live arms read, and "agreement" is an
+  // acceptor signal that is never a reward (§7.6). So a committee turn
+  // records no `model_route` and no arm line — its members carry cost only,
+  // like the judge, guide, classifier and consult calls (§7.10). The winner's
+  // identity rides the committee `model_stage` line for attribution.
   async function runCommitteeOrTurn(
     messages: Anthropic.MessageParam[],
   ): Promise<{ terminalContent: Anthropic.ContentBlock[]; usage: ModelUsage }> {
