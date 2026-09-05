@@ -60,6 +60,7 @@ export {
 
 export {
   classifyPricingStaleness,
+  effectiveSunsets,
   findSunset,
   KNOWN_PROVIDERS,
   KNOWN_SUNSETS,
@@ -70,6 +71,7 @@ export {
   PricingFeedError,
   type PricingStaleness,
   type SunsetEntry,
+  type SunsetTable,
 } from "./feed";
 
 export {

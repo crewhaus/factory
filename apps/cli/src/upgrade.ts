@@ -1,4 +1,5 @@
-import type { MigrationEngine, SpecObject } from "@crewhaus/migration-engine";
+import { type MigrationEngine, type SpecObject, findModelPools } from "@crewhaus/migration-engine";
+import { migrateSpecYaml } from "@crewhaus/migration-runner";
 import { type SpecDiffEntry, diffSpecYaml, specHasPath } from "@crewhaus/spec-patch";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
@@ -14,13 +15,17 @@ import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
  * migrated spec was written UNCHECKED; here every migrated spec must parse
  * before it can be written.
  *
- * v0.3.0 (PR 20) — the assistant also carries RELEASE notes: informational,
- * per-spec 0.2.x→0.3.0 prompts (see {@link collect030UpgradeNotes}). They are
- * deliberately NOT `Migration` entries on the engine: 0.3.0 changes zero spec
- * SYNTAX (old specs parse unchanged — no schema-version bump to migrate), it
- * changes compile-time BEHAVIOR (default-on continuity, MCP env/header secret
- * lowering) and store formats (`crewhaus migrate memories`). Notes never
- * mutate the spec; each one tells the author the exact line or command.
+ * 0.6.0 (§9.2) — the migration is now COMMENT-PRESERVING: each step's
+ * `edits()` is applied through the spec-patch CST writer (shared with
+ * `migrate-all` via `migrateSpecYaml`), so `upgrade --write` no longer
+ * flattens the author's comments and key order. Only a step that supplies no
+ * edits falls back to re-serialising the object, and the plan says so.
+ *
+ * The assistant also carries RELEASE notes: informational, per-spec prompts
+ * about behaviour a release changed WITHOUT a spec-syntax change (see
+ * {@link UPGRADE_NOTES_TABLE} — one row per release since 0.3.0). They are
+ * deliberately NOT `Migration` entries on the engine: a note tells the author
+ * the exact line or command; it never mutates the spec.
  *
  * Side-effect-free: `planUpgrade` is a pure function over the spec text + an
  * injected engine + validator. The CLI wrapper reads/writes the file and prints.
@@ -28,10 +33,12 @@ import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 export type UpgradeAction = "up-to-date" | "upgrade" | "ahead" | "validate-fail";
 
-/** One informational 0.2.x→0.3.0 prompt for the spec being upgraded. */
+/** One informational release note for the spec being upgraded. */
 export type UpgradeNote = {
   /** Stable identity for tests/tooling (`continuity-default-on`, …). */
   readonly id: string;
+  /** The release whose behaviour change this note describes (`0.3.0`, `0.6.0`). */
+  readonly release: string;
   /** One-line headline. */
   readonly title: string;
   /** Follow-up lines, rendered indented under the headline. */
@@ -46,6 +53,21 @@ const CONTINUITY_DEFAULT_ON_TARGETS: ReadonlySet<string> = new Set([
   "research",
   "crew",
 ]);
+
+function parseSpecObject(yamlText: string): Record<string, unknown> | undefined {
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(yamlText);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  return parsed as Record<string, unknown>;
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
 
 /**
  * v0.3.0 (PR 20) — collect the 0.2.x→0.3.0 release notes that apply to THIS
@@ -65,20 +87,16 @@ const CONTINUITY_DEFAULT_ON_TARGETS: ReadonlySet<string> = new Set([
  *     keys failing compilation (behavior note, no spec change needed).
  */
 export function collect030UpgradeNotes(yamlText: string): ReadonlyArray<UpgradeNote> {
-  let parsed: unknown;
-  try {
-    parsed = parseYaml(yamlText);
-  } catch {
-    return [];
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return [];
-  const spec = parsed as Record<string, unknown>;
+  const spec = parseSpecObject(yamlText);
+  if (spec === undefined) return [];
+  const release = "0.3.0";
   const target = typeof spec["target"] === "string" ? spec["target"] : "";
   const notes: UpgradeNote[] = [];
 
   if (CONTINUITY_DEFAULT_ON_TARGETS.has(target) && !specHasPath(yamlText, ["continuity"])) {
     notes.push({
       id: "continuity-default-on",
+      release,
       title: "0.3.0 recompiles this spec with continuity ON by default",
       body: [
         "Persistent focus/plans/goals, the requirements ledger, and teardown",
@@ -92,6 +110,7 @@ export function collect030UpgradeNotes(yamlText: string): ReadonlyArray<UpgradeN
   if (specHasPath(yamlText, ["memory"])) {
     notes.push({
       id: "migrate-memories",
+      release,
       title: "existing fact stores can take the optional v2 backfill",
       body: [
         "0.3.0 memory entries carry provenance/TTL/status fields; old stores keep",
@@ -102,17 +121,17 @@ export function collect030UpgradeNotes(yamlText: string): ReadonlyArray<UpgradeN
   }
 
   const mcpServers = spec["mcp_servers"];
-  if (typeof mcpServers === "object" && mcpServers !== null && !Array.isArray(mcpServers)) {
-    const affected = Object.entries(mcpServers as Record<string, unknown>)
+  if (isRecord(mcpServers)) {
+    const affected = Object.entries(mcpServers)
       .filter(([, cfg]) => {
-        if (typeof cfg !== "object" || cfg === null || Array.isArray(cfg)) return false;
-        const c = cfg as Record<string, unknown>;
-        return c["env"] !== undefined || c["headers"] !== undefined;
+        if (!isRecord(cfg)) return false;
+        return cfg["env"] !== undefined || cfg["headers"] !== undefined;
       })
       .map(([name]) => name);
     if (affected.length > 0) {
       notes.push({
         id: "mcp-secret-lowering",
+        release,
         title: `mcp_servers env/headers are now secret-lowered (${affected.join(", ")})`,
         body: [
           "Values route through the $UPPER_SNAKE secret machinery: `$VAR` resolves",
@@ -128,6 +147,162 @@ export function collect030UpgradeNotes(yamlText: string): ReadonlyArray<UpgradeN
   return notes;
 }
 
+/** Does any workflow step / graph node run a `kind: judge` gate? */
+function hasJudgeGate(spec: Record<string, unknown>): boolean {
+  const steps = spec["steps"];
+  if (Array.isArray(steps) && steps.some((s) => isRecord(s) && s["kind"] === "judge")) return true;
+  const nodes = spec["nodes"];
+  if (isRecord(nodes) && Object.values(nodes).some((n) => isRecord(n) && n["kind"] === "judge")) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 0.6.0 (§9.2, §14) — the 0.5.x→0.6.0 release notes. The release's SANCTIONED
+ * behaviour changes are all bug fixes, and each one gets a note on exactly the
+ * specs it touches:
+ *
+ *   - `crew-role-pools-live`: a crew role's `model_pool` / `model_tiers` /
+ *     `model_fallbacks` used to be emitted and never read; it is live now.
+ *   - `budget-every-call`: `budget` now gates every model call — tool
+ *     iterations included, and on single-turn hosts — instead of one REPL
+ *     turn boundary; `budget.scope: session` is the daemon-shaped option.
+ *   - `judge-spend-metered`: in-loop and gate judge spend rides the run bus
+ *     with `role: judge`, so it counts against `budget` under `judge_share`
+ *     (default 0.3 of the cap) and appears in `cost-summary`.
+ *   - `degrade-under-pool`: `budget.on_exceed.degrade` under a pool restricts
+ *     eligibility instead of swapping an adapter the pool overwrote.
+ *   - `route-reset-learned-pool` (§6.3): MIGRATION_1_TO_2 states a learned
+ *     pool's `reward.quality_source: none` explicitly; changing the source
+ *     later is a lineage change, and `crewhaus route reset` is the reset.
+ */
+export function collect060UpgradeNotes(yamlText: string): ReadonlyArray<UpgradeNote> {
+  const spec = parseSpecObject(yamlText);
+  if (spec === undefined) return [];
+  const release = "0.6.0";
+  const target = typeof spec["target"] === "string" ? spec["target"] : "";
+  const notes: UpgradeNote[] = [];
+  const pools = findModelPools(spec as SpecObject);
+
+  if (target === "crew" && isRecord(spec["roles"])) {
+    const routed = Object.entries(spec["roles"])
+      .filter(
+        ([, role]) =>
+          isRecord(role) &&
+          (role["model_pool"] !== undefined ||
+            role["model_tiers"] !== undefined ||
+            role["model_fallbacks"] !== undefined),
+      )
+      .map(([name]) => name);
+    if (routed.length > 0) {
+      notes.push({
+        id: "crew-role-pools-live",
+        release,
+        title: `crew per-role model routing is LIVE for roles ${routed.join(", ")}`,
+        body: [
+          "Before 0.6.0 a role's model_pool / model_tiers / model_fallbacks was",
+          "emitted into the bundle and never read — every role served on its",
+          "declared model. The orchestrator now routes each role through its own",
+          "block. Remove the block from a role to keep its previous behaviour.",
+        ],
+      });
+    }
+  }
+
+  const budget = spec["budget"];
+  if (budget !== undefined) {
+    notes.push({
+      id: "budget-every-call",
+      release,
+      title: "budget is now enforced on every model call, single-turn hosts included",
+      body: [
+        "0.5.x checked the cap once per REPL turn, so a one-turn run (channel,",
+        "managed, workflow step) and a long tool loop were never stopped. 0.6.0",
+        "gates each model call — tool iterations too — and severs an in-flight",
+        "tool loop at the cap (a classified crewhaus_budget failure). Daemons that",
+        "want the cap to span a conversation set `budget.scope: session`.",
+      ],
+    });
+  }
+
+  if (spec["evaluation"] !== undefined || hasJudgeGate(spec)) {
+    notes.push({
+      id: "judge-spend-metered",
+      release,
+      title: "judge spend is now metered into budget under judge_share",
+      body: [
+        "In-loop `evaluation` graders and `kind: judge` gates publish their usage",
+        "on the run bus (role: judge), so it is priced, counted against `budget`",
+        "(bounded by `budget.judge_share`, default 0.3 of the cap) and listed in",
+        "`crewhaus cost-summary`. Tune the share if a judge-heavy spec now trips.",
+      ],
+    });
+  }
+
+  if (
+    isRecord(budget) &&
+    isRecord(budget["on_exceed"]) &&
+    budget["on_exceed"]["degrade"] !== undefined &&
+    pools.length > 0
+  ) {
+    notes.push({
+      id: "degrade-under-pool",
+      release,
+      title: "budget.on_exceed.degrade under a model_pool now takes effect",
+      body: [
+        "0.5.x swapped an adapter the pool overwrote on the very next call (and",
+        "logged a model_failover that never happened). 0.6.0 makes the degrade",
+        "rung the forced candidate once the cap is breached (policy: forced,",
+        "reason: budget_degrade). Drop `degrade` to keep the pool unconstrained.",
+      ],
+    });
+  }
+
+  const learned = pools.filter((site) => site.pool["policy"] === "learned");
+  if (learned.length > 0) {
+    notes.push({
+      id: "route-reset-learned-pool",
+      release,
+      title: "learned pools: reward.quality_source is now stated explicitly (none)",
+      body: [
+        "The v2 migration writes `reward: { quality_source: none }` on each learned",
+        "pool so the default steering the reward is visible. `none` keeps every",
+        "arm in .crewhaus/routing/arms.jsonl valid; switching to in_loop / shadow /",
+        "promoted later is a lineage change — run `crewhaus route reset` then.",
+      ],
+    });
+  }
+
+  return notes;
+}
+
+/** One row of the per-release upgrade-notes table. */
+export type UpgradeNotesRelease = {
+  /** The release the notes describe. */
+  readonly release: string;
+  /** The version range being upgraded FROM, for the rendered header. */
+  readonly from: string;
+  /** Collects the notes that apply to a spec (pure over its YAML text). */
+  readonly collect: (yamlText: string) => ReadonlyArray<UpgradeNote>;
+};
+
+/**
+ * 0.6.0 §9.2 — the per-release upgrade-notes table, generalising the 0.3.0
+ * collector: one row per release whose behaviour changed without a
+ * spec-syntax change. Rendered oldest-first so an author two releases behind
+ * reads the notes in the order the changes shipped.
+ */
+export const UPGRADE_NOTES_TABLE: ReadonlyArray<UpgradeNotesRelease> = Object.freeze([
+  { release: "0.3.0", from: "0.2.x", collect: collect030UpgradeNotes },
+  { release: "0.6.0", from: "0.5.x", collect: collect060UpgradeNotes },
+]);
+
+/** Every release's notes that apply to this spec, oldest release first. */
+export function collectUpgradeNotes(yamlText: string): ReadonlyArray<UpgradeNote> {
+  return UPGRADE_NOTES_TABLE.flatMap((row) => row.collect(yamlText));
+}
+
 export type UpgradePlan = {
   readonly action: UpgradeAction;
   /** The spec's current schema version (`version ?? 0`). */
@@ -138,13 +313,18 @@ export type UpgradePlan = {
   readonly migratedYaml?: string;
   /** Field-level diff (old → migrated) — present for `action: "upgrade"`. */
   readonly diff?: ReadonlyArray<SpecDiffEntry>;
+  /**
+   * 0.6.0 — whether `migratedYaml` kept the source's comments and key order
+   * (every step declared `edits()`). Present for `action: "upgrade"`.
+   */
+  readonly commentsPreserved?: boolean;
   /** Failure detail for `action: "validate-fail"`. */
   readonly error?: string;
   /**
-   * v0.3.0 — the informational 0.2.x→0.3.0 release notes that apply to this
-   * spec (see {@link collect030UpgradeNotes}). Present for every parseable
-   * spec, INCLUDING `up-to-date`: the schema-version stamp is orthogonal to
-   * the release's behavior changes.
+   * The informational release notes that apply to this spec (see
+   * {@link collectUpgradeNotes}). Present for every parseable spec,
+   * INCLUDING `up-to-date`: the schema-version stamp is orthogonal to a
+   * release's behavior changes.
    */
   readonly notes?: ReadonlyArray<UpgradeNote>;
 };
@@ -155,7 +335,7 @@ export type UpgradePlan = {
  *   - `up-to-date`  : the spec is already at the current version → no-op.
  *   - `ahead`       : the spec's version is HIGHER than the CLI supports
  *                     (a newer-CLI-authored spec) → refuse, don't downgrade.
- *   - `upgrade`     : migrate up, validate, and produce the diff.
+ *   - `upgrade`     : migrate up (comment-preserving), validate, and diff.
  *   - `validate-fail`: the migrated spec failed the injected validator (the
  *                     migration produced an invalid spec) — never written.
  *
@@ -181,7 +361,7 @@ export function planUpgrade(
     };
   }
   const fromVersion = (parsed?.version ?? 0) | 0;
-  const notes = collect030UpgradeNotes(yamlText);
+  const notes = collectUpgradeNotes(yamlText);
 
   if (fromVersion === toVersion) {
     return { action: "up-to-date", fromVersion, toVersion, notes };
@@ -190,9 +370,9 @@ export function planUpgrade(
     return { action: "ahead", fromVersion, toVersion, notes };
   }
 
-  let migrated: SpecObject;
+  let migrated: ReturnType<typeof migrateSpecYaml>;
   try {
-    migrated = engine.migrate(parsed, toVersion);
+    migrated = migrateSpecYaml(yamlText, engine, toVersion);
   } catch (err) {
     return {
       action: "validate-fail",
@@ -202,9 +382,10 @@ export function planUpgrade(
     };
   }
   // Validate the migrated spec BEFORE offering it for write (the fix for the
-  // "migrated specs written unchecked" gap).
+  // "migrated specs written unchecked" gap). The CST path already re-parsed
+  // the text through the live union; this is the caller's own gate on top.
   try {
-    validate(migrated);
+    validate(migrated.spec);
   } catch (err) {
     return {
       action: "validate-fail",
@@ -213,9 +394,16 @@ export function planUpgrade(
       error: `migrated spec failed validation: ${(err as Error).message}`,
     };
   }
-  const migratedYaml = stringifyYaml(migrated);
-  const diff = diffSpecYaml(yamlText, migratedYaml);
-  return { action: "upgrade", fromVersion, toVersion, migratedYaml, diff, notes };
+  const diff = diffSpecYaml(yamlText, migrated.yaml);
+  return {
+    action: "upgrade",
+    fromVersion,
+    toVersion,
+    migratedYaml: migrated.yaml,
+    diff,
+    commentsPreserved: migrated.commentsPreserved,
+    notes,
+  };
 }
 
 /**
@@ -231,20 +419,65 @@ export function makeSpecValidator(parse: (yaml: string) => unknown): (spec: Spec
   };
 }
 
-/** Render the 0.2.x→0.3.0 notes block (empty string when no notes apply). */
+/**
+ * 0.6.0 §9.2 — the `crewhaus doctor` drift signal. A 0.5.x CLI parses and
+ * compiles a `version: 2` spec with 0.5.x semantics rather than refusing it
+ * (`versionField` is a plain optional int), so `upgrade`'s `ahead` message
+ * was the only place a spec/CLI mismatch ever surfaced. Doctor now reads the
+ * same drift through `planUpgrade` and reports it as a WARN — never a
+ * failure: a spec behind the CLI still compiles and runs.
+ */
+export function buildSpecVersionCheck(
+  yamlText: string,
+  engine: MigrationEngine,
+): { readonly label: string; readonly pass: true; readonly warn?: true; readonly reason?: string } {
+  const plan = planUpgrade(yamlText, engine, () => undefined);
+  switch (plan.action) {
+    case "up-to-date":
+      return { label: `spec schema version (v${plan.toVersion}, current)`, pass: true };
+    case "upgrade":
+      return {
+        label: "spec schema version",
+        pass: true,
+        warn: true,
+        reason: `spec is BEHIND this CLI (v${plan.fromVersion} → v${plan.toVersion}) — run \`crewhaus upgrade\` (dry-run) then \`crewhaus upgrade --write\`; the migration keeps comments and key order`,
+      };
+    case "ahead":
+      return {
+        label: "spec schema version",
+        pass: true,
+        warn: true,
+        reason: `spec is AHEAD of this CLI (v${plan.fromVersion} > v${plan.toVersion}) — it compiles with this CLI's older semantics; upgrade the CLI (\`chvm use latest\`) to honour it`,
+      };
+    case "validate-fail":
+      return {
+        label: "spec schema version",
+        pass: true,
+        warn: true,
+        reason: `could not determine drift — ${plan.error ?? "the spec did not migrate cleanly"}`,
+      };
+  }
+}
+
+/** Render the release-notes block (empty string when no notes apply). */
 function formatUpgradeNotes(notes: ReadonlyArray<UpgradeNote> | undefined): string {
   if (notes === undefined || notes.length === 0) return "";
-  const lines: string[] = [
-    "",
-    "  0.2.x → 0.3.0 notes for this spec (informational — nothing is rewritten):",
-  ];
-  for (const note of notes) {
-    lines.push(`  • ${note.title}`);
-    for (const bodyLine of note.body) {
-      lines.push(`      ${bodyLine}`);
+  const lines: string[] = [];
+  for (const row of UPGRADE_NOTES_TABLE) {
+    const own = notes.filter((n) => n.release === row.release);
+    if (own.length === 0) continue;
+    lines.push(
+      "",
+      `  ${row.from} → ${row.release} notes for this spec (informational — nothing is rewritten):`,
+    );
+    for (const note of own) {
+      lines.push(`  • ${note.title}`);
+      for (const bodyLine of note.body) {
+        lines.push(`      ${bodyLine}`);
+      }
     }
   }
-  return `${lines.join("\n")}\n`;
+  return lines.length === 0 ? "" : `${lines.join("\n")}\n`;
 }
 
 /** Render an upgrade plan as the human-readable report. `write` toggles the
@@ -270,6 +503,11 @@ export function formatUpgradePlan(plan: UpgradePlan, write: boolean): string {
           else lines.push(`  ~ ${d.path}: ${d.before} → ${d.after}`);
         }
       }
+      lines.push(
+        plan.commentsPreserved === false
+          ? "  note: a migration step in this chain supplies no edit list — comments and key order are re-serialised."
+          : "  comments and key order are preserved.",
+      );
       lines.push("");
       lines.push(
         write

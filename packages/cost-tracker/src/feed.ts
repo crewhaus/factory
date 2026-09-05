@@ -11,7 +11,15 @@
  * filesystem reader — so the merge/validation/freshness logic is unit
  * testable without touching `~`.
  */
-import { DEFAULT_PRICING, type PricingRow, type PricingTable } from "./pricing";
+import {
+  DEFAULT_PRICING,
+  type PricingRow,
+  type PricingTable,
+  type SunsetEntry,
+  type SunsetTable,
+} from "./pricing";
+
+export type { SunsetEntry, SunsetTable } from "./pricing";
 
 /** Parse-and-validate a pricing feed JSON string into a `PricingTable`.
  *  Throws `PricingFeedError` on a malformed document (so a corrupt feed is a
@@ -101,6 +109,7 @@ export function parsePricingFeed(json: string, opts: ParsePricingFeedOptions = {
       }
     }
   }
+  if (d["sunsets"] !== undefined) validateFeedSunsets(d["sunsets"]);
   if (opts.partial !== true) {
     const missing = KNOWN_PROVIDERS.filter((p) => {
       const t = providers[p];
@@ -113,6 +122,83 @@ export function parsePricingFeed(json: string, opts: ParsePricingFeedOptions = {
     }
   }
   return doc as PricingTable;
+}
+
+const SUNSET_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * 0.6.0 §9.1 — structural validation of a feed's optional `sunsets` section:
+ * `{ <provider>: [{ modelIdPrefix, retiresOn: YYYY-MM-DD, replacement, note? }] }`.
+ * Same loudness policy as the rows — a malformed entry rejects the whole
+ * feed, because a sunset that silently failed to install is exactly the
+ * surprise 404 the table exists to prevent.
+ */
+function validateFeedSunsets(raw: unknown): void {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new PricingFeedError('pricing feed: "sunsets" must map providers to entry arrays');
+  }
+  for (const [provider, entries] of Object.entries(raw as Record<string, unknown>)) {
+    if (!(KNOWN_PROVIDERS as readonly string[]).includes(provider)) {
+      throw new PricingFeedError(
+        `pricing feed: sunsets names unknown provider "${provider}" (expected ${KNOWN_PROVIDERS.join("/")})`,
+      );
+    }
+    if (!Array.isArray(entries)) {
+      throw new PricingFeedError(`pricing feed: sunsets["${provider}"] must be an array`);
+    }
+    entries.forEach((e, i) => {
+      const at = `sunsets["${provider}"][${i}]`;
+      if (typeof e !== "object" || e === null || Array.isArray(e)) {
+        throw new PricingFeedError(`pricing feed: ${at} must be an object`);
+      }
+      const r = e as Record<string, unknown>;
+      if (typeof r["modelIdPrefix"] !== "string" || r["modelIdPrefix"].length === 0) {
+        throw new PricingFeedError(`pricing feed: ${at} needs a non-empty "modelIdPrefix"`);
+      }
+      if (typeof r["retiresOn"] !== "string" || !SUNSET_DATE_RE.test(r["retiresOn"])) {
+        throw new PricingFeedError(`pricing feed: ${at} needs "retiresOn" as YYYY-MM-DD`);
+      }
+      if (typeof r["replacement"] !== "string" || r["replacement"].length === 0) {
+        throw new PricingFeedError(`pricing feed: ${at} needs a non-empty "replacement"`);
+      }
+      if (r["note"] !== undefined && typeof r["note"] !== "string") {
+        throw new PricingFeedError(`pricing feed: ${at} "note" must be a string when present`);
+      }
+    });
+  }
+}
+
+/**
+ * 0.6.0 §9.1 — the sunset table `doctor --models` (and later `models audit`)
+ * consults: the compiled-in {@link KNOWN_SUNSETS} plus whatever `sunsets` the
+ * installed pricing feed carries. Feed entries ADD new families and may
+ * refresh the date / replacement / note of a compiled-in family, but a family
+ * the compiled-in table knows keeps `source: "builtin"` — so a feed can never
+ * demote a gate-bearing sunset to advisory, and only ever widens the watch.
+ * Every entry is stamped with its `source`.
+ */
+export function effectiveSunsets(
+  table: PricingTable | undefined,
+  builtin: SunsetTable = KNOWN_SUNSETS,
+): SunsetTable {
+  const out: Record<string, SunsetEntry[]> = {};
+  for (const [provider, entries] of Object.entries(builtin)) {
+    out[provider] = entries.map((e) => ({ ...e, source: "builtin" as const }));
+  }
+  for (const [provider, entries] of Object.entries(table?.sunsets ?? {})) {
+    const list = out[provider] ?? [];
+    for (const e of entries) {
+      const i = list.findIndex((b) => b.modelIdPrefix === e.modelIdPrefix);
+      if (i >= 0) {
+        const existing = list[i] as SunsetEntry;
+        list[i] = { ...existing, ...e, source: existing.source ?? "builtin" };
+      } else {
+        list.push({ ...e, source: "feed" });
+      }
+    }
+    out[provider] = list;
+  }
+  return out;
 }
 
 /**
@@ -177,14 +263,7 @@ export function classifyPricingStaleness(
  * against those two tables as well (and vice versa — adding a new family to
  * pricing/capabilities is a good moment to check it isn't already sunset).
  */
-export type SunsetEntry = {
-  readonly modelIdPrefix: string;
-  readonly retiresOn: string;
-  readonly replacement: string;
-  readonly note?: string;
-};
-
-export const KNOWN_SUNSETS: Readonly<Record<string, readonly SunsetEntry[]>> = {
+export const KNOWN_SUNSETS: SunsetTable = {
   anthropic: [
     {
       modelIdPrefix: "claude-3-5-haiku",
@@ -234,7 +313,7 @@ export const KNOWN_SUNSETS: Readonly<Record<string, readonly SunsetEntry[]>> = {
 export function findSunset(
   provider: string,
   modelId: string,
-  table: Readonly<Record<string, readonly SunsetEntry[]>> = KNOWN_SUNSETS,
+  table: SunsetTable = KNOWN_SUNSETS,
 ): SunsetEntry | undefined {
   const entries = table[provider];
   if (entries === undefined) return undefined;

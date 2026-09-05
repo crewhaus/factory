@@ -65,12 +65,14 @@ import {
   readRunfile,
   readsBriefOnStdin,
   recentRuns,
+  resolveBundle,
   resolveCrewhausBin,
   runClassFor,
   runPreflightGate,
   systemClock,
 } from "@crewhaus/harness-supervisor";
-import { readBundleSpecStamp } from "./bundle-manifest";
+import { createFileBackedRegistry } from "@crewhaus/spec-registry";
+import { hashSpecSource, readBundleSpecStamp } from "./bundle-manifest";
 import { envChainLines } from "./env-chain-view";
 import { cliVersion } from "./version";
 
@@ -1086,6 +1088,7 @@ async function daemonStatus(
   const settings = readManagerSettings(harness.dir);
   const hookRuns = readHookRunLog(harness.dir);
   const freshness = bundleStaleness(harness.dir, harness.target);
+  const pins = await registryPinFreshness(harness);
 
   if (args.flags.get("json") === true) {
     return {
@@ -1101,6 +1104,7 @@ async function daemonStatus(
           recentRuns: runs,
           envFiles: envChain.refs,
           bundle: freshness,
+          pins: pins ?? null,
           prep: {
             autoCompile: settings.autoCompile,
             hooks: Object.fromEntries(
@@ -1158,8 +1162,130 @@ async function daemonStatus(
   }
   lines.push(...envChainLines(envChain.refs));
   lines.push(...prepLines(settings, hookRuns, freshness));
+  lines.push(...pinLines(pins, alive));
   lines.push(planError !== undefined ? `  plan: ${planError}` : `  would run: ${plan}`);
   return { lines, exitCode: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// pin freshness (0.6.0 §9.4 — the "restart-to-serve-pin" signal)
+// ---------------------------------------------------------------------------
+
+/** One registry pin compared against the bundle this daemon serves. */
+export type PinFreshness = {
+  readonly env: string;
+  readonly version: string;
+  /**
+   * `served`: the running bundle was compiled from exactly the pinned spec
+   * text (spec-hash stamp match). `not-served`: the pin names a different
+   * spec — the daemon keeps serving its own bundle until someone recompiles
+   * and restarts. `unstamped`: the bundle carries no spec-hash stamp (compiled
+   * by an older crewhaus, or no bundle yet), so nothing can be compared.
+   * `unreadable`: the pinned version is missing from the registry on disk.
+   */
+  readonly state: "served" | "not-served" | "unstamped" | "unreadable";
+  readonly detail: string;
+};
+
+export type PinFreshnessReport = {
+  /** The harness-local registry consulted. */
+  readonly registryDir: string;
+  readonly entries: readonly PinFreshness[];
+};
+
+/**
+ * Nothing propagates a registry pin to a running daemon: a local daemon
+ * serves the harness directory's own bundle, and `.crewhaus/deployments.json`
+ * has no writer. So `status` names the gap instead of hiding it — for every
+ * env pinned in `<harness>/.crewhaus/specs/<name>/manifest.json`, hash the
+ * pinned spec text and compare it with the running bundle's spec-hash stamp
+ * (the compile path writes `hashSpecSource(crewhaus.yaml)` into the bundle
+ * manifest; the two sides are different types, so this IS the comparison).
+ * `undefined` when the harness keeps no registry or pins nothing — the
+ * common case, which must add no output.
+ */
+export async function registryPinFreshness(
+  harness: ResolvedHarness,
+): Promise<PinFreshnessReport | undefined> {
+  const registryDir = join(harness.dir, ".crewhaus", "specs");
+  if (!existsSync(join(registryDir, harness.specName, "manifest.json"))) return undefined;
+  const registry = createFileBackedRegistry({ rootDir: registryDir });
+  let manifest: Awaited<ReturnType<typeof registry.manifest>>;
+  try {
+    manifest = await registry.manifest(harness.specName);
+  } catch {
+    return undefined;
+  }
+  const pinned = Object.entries(manifest.pins).sort(([a], [b]) => a.localeCompare(b));
+  if (pinned.length === 0) return undefined;
+  const bundle = resolveBundle(harness.dir, harness.target);
+  const stamp = bundle === undefined ? undefined : readBundleSpecStamp(bundle.bundleDir);
+  const entries: PinFreshness[] = [];
+  for (const [env, version] of pinned) {
+    let yaml: string;
+    try {
+      yaml = await registry.get(harness.specName, version);
+    } catch {
+      entries.push({
+        env,
+        version,
+        state: "unreadable",
+        detail: `pinned version ${version} is not in the registry on disk`,
+      });
+      continue;
+    }
+    if (stamp === undefined) {
+      entries.push({
+        env,
+        version,
+        state: "unstamped",
+        detail:
+          bundle === undefined
+            ? "no compiled bundle to compare against"
+            : "the bundle carries no spec-hash stamp (compiled by an older crewhaus) — recompile to compare",
+      });
+      continue;
+    }
+    const matches = hashSpecSource(yaml) === stamp.specHash;
+    entries.push({
+      env,
+      version,
+      state: matches ? "served" : "not-served",
+      detail: matches
+        ? "the running bundle was compiled from this pinned spec"
+        : "the bundle this daemon serves was compiled from a DIFFERENT spec than the pin",
+    });
+  }
+  return { registryDir, entries };
+}
+
+/**
+ * Render the pin report under the prep block. A pin that is not served is
+ * the actionable line: a pin flip (canary promote, `crewhaus spec pin`) ends
+ * at the registry, and only a recompile + restart makes the daemon serve it.
+ */
+function pinLines(report: PinFreshnessReport | undefined, running: boolean): string[] {
+  if (report === undefined) return [];
+  const lines = [`  pins (${report.registryDir}):`];
+  for (const p of report.entries) {
+    switch (p.state) {
+      case "served":
+        lines.push(
+          `    ${p.env} → ${p.version} · served by the ${running ? "running" : "compiled"} bundle`,
+        );
+        break;
+      case "not-served":
+        lines.push(
+          `    ${p.env} → ${p.version} · NOT served — ${p.detail}; restart-to-serve-pin: \`crewhaus spec get <name> ${p.version} > crewhaus.yaml && crewhaus compile crewhaus.yaml && crewhaus daemon restart\``,
+        );
+        break;
+      case "unstamped":
+      case "unreadable":
+        lines.push(`    ${p.env} → ${p.version} · cannot compare — ${p.detail}`);
+        break;
+    }
+  }
+  return lines;
 }
 
 /**

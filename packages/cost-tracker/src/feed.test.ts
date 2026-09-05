@@ -147,3 +147,122 @@ describe("pickNewestPricing", () => {
     expect(pickNewestPricing([a, b, c]).version).toBe("2026-07-01");
   });
 });
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §9.1 — feed `sunsets`: installed by `pricing sync`, no release needed
+// ---------------------------------------------------------------------------
+
+import { KNOWN_SUNSETS, effectiveSunsets, findSunset as findSunsetIn } from "./feed";
+
+const FULL_FEED = {
+  version: "2026-09-01",
+  providers: {
+    anthropic: { "claude-sonnet-4-5": { inputPer1M: 3, outputPer1M: 15 } },
+    openai: { "gpt-5": { inputPer1M: 1, outputPer1M: 4 } },
+    gemini: { "gemini-2.5-pro": { inputPer1M: 1, outputPer1M: 4 } },
+    bedrock: { "anthropic.claude": { inputPer1M: 3, outputPer1M: 15 } },
+  },
+};
+
+describe("pricing feed sunsets (0.6.0)", () => {
+  test("a well-formed sunsets section parses and rides the table", () => {
+    const table = parsePricingFeed(
+      JSON.stringify({
+        ...FULL_FEED,
+        sunsets: {
+          anthropic: [
+            {
+              modelIdPrefix: "claude-sonnet-4-5",
+              retiresOn: "2027-03-01",
+              replacement: "claude-sonnet-5",
+            },
+          ],
+        },
+      }),
+    );
+    expect(table.sunsets?.["anthropic"]?.[0]?.replacement).toBe("claude-sonnet-5");
+  });
+
+  test("a feed without sunsets is unchanged (the key is optional)", () => {
+    expect(parsePricingFeed(JSON.stringify(FULL_FEED)).sunsets).toBeUndefined();
+  });
+
+  test.each([
+    ["not an object", { sunsets: [] }, /must map providers/],
+    ["unknown provider", { sunsets: { mistral: [] } }, /unknown provider "mistral"/],
+    ["non-array provider", { sunsets: { anthropic: {} } }, /must be an array/],
+    [
+      "missing prefix",
+      { sunsets: { anthropic: [{ retiresOn: "2027-01-01", replacement: "x" }] } },
+      /modelIdPrefix/,
+    ],
+    [
+      "bad date",
+      { sunsets: { anthropic: [{ modelIdPrefix: "a", retiresOn: "soon", replacement: "x" }] } },
+      /YYYY-MM-DD/,
+    ],
+    [
+      "missing replacement",
+      { sunsets: { anthropic: [{ modelIdPrefix: "a", retiresOn: "2027-01-01" }] } },
+      /replacement/,
+    ],
+    [
+      "non-string note",
+      {
+        sunsets: {
+          anthropic: [{ modelIdPrefix: "a", retiresOn: "2027-01-01", replacement: "x", note: 3 }],
+        },
+      },
+      /note/,
+    ],
+  ])("a malformed sunsets section rejects the whole feed: %s", (_label, extra, re) => {
+    expect(() => parsePricingFeed(JSON.stringify({ ...FULL_FEED, ...extra }))).toThrow(re);
+  });
+
+  test("effectiveSunsets adds feed families as source: feed and keeps compiled-in ones as builtin", () => {
+    const merged = effectiveSunsets({
+      ...FULL_FEED,
+      sunsets: {
+        anthropic: [
+          // a brand-new family
+          {
+            modelIdPrefix: "claude-sonnet-4-5",
+            retiresOn: "2027-03-01",
+            replacement: "claude-sonnet-5",
+          },
+          // a refresh of a compiled-in family: the date moves, the source does NOT
+          {
+            modelIdPrefix: "claude-3-5-haiku",
+            retiresOn: "2026-12-01",
+            replacement: "claude-haiku-4-5",
+          },
+        ],
+        bedrock: [
+          {
+            modelIdPrefix: "anthropic.claude-v2",
+            retiresOn: "2026-10-01",
+            replacement: "anthropic.claude-sonnet-4-5",
+          },
+        ],
+      },
+    });
+    const added = findSunsetIn("anthropic", "claude-sonnet-4-5-20260101", merged);
+    expect(added).toMatchObject({ replacement: "claude-sonnet-5", source: "feed" });
+    const refreshed = findSunsetIn("anthropic", "claude-3-5-haiku", merged);
+    expect(refreshed).toMatchObject({ retiresOn: "2026-12-01", source: "builtin" });
+    expect(findSunsetIn("bedrock", "anthropic.claude-v2", merged)?.source).toBe("feed");
+    // Compiled-in entries all carry their source; untouched providers survive.
+    expect(merged["openai"]?.every((e) => e.source === "builtin")).toBe(true);
+    // The compiled-in table itself is not mutated.
+    expect(
+      KNOWN_SUNSETS["anthropic"]?.find((e) => e.modelIdPrefix === "claude-3-5-haiku")?.retiresOn,
+    ).toBe("2026-10-01");
+  });
+
+  test("effectiveSunsets over the built-in table (no feed) is the compiled-in table, stamped", () => {
+    const merged = effectiveSunsets(undefined);
+    expect(Object.keys(merged).sort()).toEqual(Object.keys(KNOWN_SUNSETS).sort());
+    expect(merged["anthropic"]?.length).toBe(KNOWN_SUNSETS["anthropic"]?.length);
+    expect(merged["anthropic"]?.[0]?.source).toBe("builtin");
+  });
+});

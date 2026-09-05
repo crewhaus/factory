@@ -231,3 +231,41 @@ agent:
     expect(() => writeModelField(SPEC, "cli", ["agent", "model"], "")).toThrow();
   });
 });
+
+// 0.6.0 §9.1 — a sunset installed by the pricing feed reaches doctor --models.
+describe("buildModelChecks — feed-sourced sunsets", () => {
+  test("a sunset carried by the installed pricing feed warns, and says where it came from", () => {
+    const checks = buildModelChecks("claude-sonnet-4-5", {
+      pricing: {
+        version: "2026-09-01",
+        providers: { anthropic: { "claude-sonnet-4-5": { inputPer1M: 3, outputPer1M: 15 } } },
+        sunsets: {
+          anthropic: [
+            {
+              modelIdPrefix: "claude-sonnet-4-5",
+              retiresOn: "2027-03-01",
+              replacement: "claude-sonnet-5",
+            },
+          ],
+        },
+      },
+      now: new Date("2026-09-05"),
+    });
+    const sunset = checks.find((c) => c.label.includes("sunset"));
+    expect(sunset?.pass).toBe(true);
+    expect(sunset?.warn).toBe(true);
+    expect(sunset?.reason).toContain("claude-sonnet-5");
+    expect(sunset?.reason).toContain("from the installed pricing feed");
+  });
+
+  test("a compiled-in sunset is not attributed to the feed", () => {
+    const checks = buildModelChecks("claude-3-5-haiku", {
+      pricing: {
+        version: "2026-05-08",
+        providers: { anthropic: { "claude-3-5-haiku": { inputPer1M: 0.8, outputPer1M: 4 } } },
+      },
+      now: new Date("2026-06-01"),
+    });
+    expect(checks.find((c) => c.label.includes("sunset"))?.reason).not.toContain("pricing feed");
+  });
+});
