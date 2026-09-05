@@ -4,9 +4,9 @@
  * on the single-turn hosts (workflow, graph, crew) the bundle constructs
  * them at boot, so nothing pends; on a compiled cli/channel/managed bundle
  * guide/shadow reach the interpreter only until the emitters' boot-time
- * `wireModels` row, and the warning says exactly that; the cascade still
- * pends on the whole-block path (PR 9c). Byte-identity: a pool without the
- * strategy keys renders no side-call field and no model-service import.
+ * `wireModels` row, and the warning says exactly that; the cascade (PR 9c)
+ * compiles through beside them. Byte-identity: a pool without the strategy
+ * keys renders no side-call field and no model-service import.
  */
 import { describe, expect, test } from "bun:test";
 import { parseSpecIssues } from "@crewhaus/spec";
@@ -100,10 +100,10 @@ describe("side-call strategies on single-turn hosts compile through (PR 9d)", ()
     }
   });
 
-  test("the cascade still pends on the whole-block path (PR 9c) beside a wired guide", () => {
+  test("the cascade (PR 9c) compiles through beside a wired guide — nothing pends", () => {
     const yaml = workflow(
       "{ cascade: { draft: cheap, escalate_to: strong }, guide: { model: claude-opus-4-8 } }",
     );
-    expect(pendingPaths(yaml)).toEqual(["steps[0].model_pool.strategy"]);
+    expect(pendingPaths(yaml)).toEqual([]);
   });
 });

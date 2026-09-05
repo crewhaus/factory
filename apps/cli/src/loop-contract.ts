@@ -209,9 +209,10 @@ export type EvaluationIrSlice = {
  *     `lastIndex` is reset per call so a global flag cannot flip verdicts.
  *
  * `threshold`, `onFail` and `maxRetries` are the IR's resolved values,
- * threaded verbatim (`onFail: "escalate"` included — runtime-core treats it
- * as `retry` until PR 9c lands the forced re-run, as the bundle already
- * does). Spread-return-`{}`: a spec without `evaluation:` spreads NOTHING.
+ * threaded verbatim, and so is the cascade's lower-time-resolved `escalateTo`
+ * under `onFail: "escalate"` (PR 9c — runtime-core re-runs the failing turn on
+ * that rung through `runOneTurn(messages, { force })`). Spread-return-`{}`: a
+ * spec without `evaluation:` spreads NOTHING.
  */
 export function evaluationRunOptions(
   ir: EvaluationIrSlice,
@@ -223,6 +224,9 @@ export function evaluationRunOptions(
 
 function buildRunEvaluation(ev: IrEvaluation, primaryModel: string): RunEvaluation {
   const grader = ev.grader;
+  // 0.6.0 §7.3 (PR 9c) — the cascade's escalation rung, resolved at lower
+  // time; spread only under `on_fail: escalate`, exactly as the bundle renders it.
+  const escalate = ev.escalateTo !== undefined ? { escalateTo: ev.escalateTo } : {};
   if (grader.type === "llm_judge") {
     const model = grader.model ?? primaryModel;
     const criteria = grader.criteria;
@@ -231,6 +235,7 @@ function buildRunEvaluation(ev: IrEvaluation, primaryModel: string): RunEvaluati
       threshold: ev.threshold ?? 0.7,
       onFail: ev.onFail,
       maxRetries: ev.maxRetries,
+      ...escalate,
       evaluate: async ({ finalText, bus }) => {
         const verdict = await judge({
           rubric: {
@@ -280,6 +285,7 @@ function buildRunEvaluation(ev: IrEvaluation, primaryModel: string): RunEvaluati
       threshold: 1,
       onFail: ev.onFail,
       maxRetries: ev.maxRetries,
+      ...escalate,
       evaluate: async ({ finalText }) =>
         finalText.includes(value)
           ? { score: 1, rationale: `output contains "${value}"` }
@@ -292,6 +298,7 @@ function buildRunEvaluation(ev: IrEvaluation, primaryModel: string): RunEvaluati
     threshold: 1,
     onFail: ev.onFail,
     maxRetries: ev.maxRetries,
+    ...escalate,
     evaluate: async ({ finalText }) => {
       regex.lastIndex = 0;
       return regex.test(finalText)

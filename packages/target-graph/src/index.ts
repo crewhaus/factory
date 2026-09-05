@@ -749,6 +749,9 @@ function renderNodeBody(
   toolsArrayLiteral: string | undefined,
   nudgeJudges: readonly string[] = [],
   evalEntry = false,
+  /** 0.6.0 §7.3 — judge name → `escalate_to` for the nudge judges that force
+   *  the re-run onto a roster arm; a currently-failing one sets `__force`. */
+  escalateByJudge: ReadonlyMap<string, string> = new Map(),
 ): string {
   const instructionsJs = escapeJsonString(node.instructions);
   const modelJs = escapeJsonString(node.model);
@@ -801,6 +804,23 @@ function renderNodeBody(
       }
       const __nudge = __nudges.length === 0 ? "" : "\\n\\n" + __nudges.join("\\n\\n");`
       : "";
+  // 0.6.0 §7.3 — a retry_previous judge with `escalate_to` forces the re-run
+  // onto that roster arm: read like the nudge, off the checkpointed state.
+  const forcing = nudgeJudges.filter((j) => escalateByJudge.has(j));
+  const forceBlock =
+    forcing.length > 0
+      ? `
+      let __force: string | undefined;
+      for (const [__j, __arm] of [${forcing
+        .map((j) => `[${escapeJsonString(j)}, ${escapeJsonString(escalateByJudge.get(j) ?? "")}]`)
+        .join(", ")}] as const) {
+        if (__judgeState[__j] === "fail") __force = __arm;
+      }`
+      : "";
+  const forceField =
+    forcing.length > 0
+      ? "\n        ...(__force !== undefined ? { forcedCandidate: __force } : {}),"
+      : "";
   const instructionsExpr = nudgeJudges.length > 0 ? `${instructionsJs} + __nudge` : instructionsJs;
   // Cluster S — the eval-entry variant reads THIS invocation's eval seams off
   // the per-run lookup keyed by the RunContext the caller passed (never a
@@ -816,7 +836,7 @@ function renderNodeBody(
       "\n        ...(__evalSeam?._adapter !== undefined ? { _adapter: __evalSeam._adapter } : {}),"
     : "";
   return `
-    async (ctx, prev) => {${evalSeamBlock}${hitlPreBlock}${nudgeBlock}
+    async (ctx, prev) => {${evalSeamBlock}${hitlPreBlock}${nudgeBlock}${forceBlock}
       const __seed = [
         { role: "user", content: \`Upstream state:\\n\\\`\\\`\\\`json\\n\${JSON.stringify(prev, null, 2)}\\n\\\`\\\`\\\`\` },
       ];
@@ -826,7 +846,7 @@ function renderNodeBody(
         sessionName: ${escapeJsonString(node.name)} + "-" + ctx.graphRunId,
         sessionTarget: "graph-node",
         seedMessages: __seed,
-        singleTurn: true,${renderNodeLoopFields(node)}${renderModelWiringFields(scopedModelWiringFragment(node, node.name), "        ")}${renderSideCallWiringFields(scopedModelWiringFragment(node, node.name), "        ", node.name)}${toolsField}${graphLevelFields}
+        singleTurn: true,${renderNodeLoopFields(node)}${renderModelWiringFields(scopedModelWiringFragment(node, node.name), "        ")}${renderSideCallWiringFields(scopedModelWiringFragment(node, node.name), "        ", node.name)}${forceField}${toolsField}${graphLevelFields}
         runContext: ctx.runContext,${evalAdapterLine}
       });
       const __next = { ...prev, [${nameJs}]: __reply };${hitlRecordBlock}
@@ -985,12 +1005,16 @@ function renderAgent(ir: IrGraphV0, evalEntry = false): string {
     judgeNodes.filter((n) => n.judge?.onFail !== "continue").map((n) => n.name),
   );
   const nudgeJudgesByNode = new Map<string, string[]>();
+  // 0.6.0 §7.3 — judge name → `escalate_to` for the retry judges that force
+  // the re-run onto a roster arm.
+  const escalateByJudge = new Map<string, string>();
   for (const j of judgeNodes) {
     if (j.judge?.onFail !== "retry_previous") continue;
     const target = gatedUpstreams(ir, j.name)[0] as string; // validateGraph pinned length === 1
     const list = nudgeJudgesByNode.get(target) ?? [];
     list.push(j.name);
     nudgeJudgesByNode.set(target, list);
+    if (j.judge.escalateTo !== undefined) escalateByJudge.set(j.name, j.judge.escalateTo);
   }
 
   // G61 — durable exactly-once wrapping applies only to acyclic,
@@ -1011,6 +1035,7 @@ function renderAgent(ir: IrGraphV0, evalEntry = false): string {
             tools.toolsArrayByNode.get(n.name),
             nudgeJudgesByNode.get(n.name) ?? [],
             evalEntry,
+            escalateByJudge,
           );
       const nameJs = escapeJsonString(n.name);
       return isDurable(n)
@@ -1074,8 +1099,25 @@ function renderAgent(ir: IrGraphV0, evalEntry = false): string {
     ? `\nimport { wireSideCalls } from "@crewhaus/model-service";`
     : "";
   const judgeImport = hasJudges
-    ? `\nimport { judge } from "@crewhaus/eval-judge";\nimport type { TraceEventBus } from "@crewhaus/trace-event-bus";`
+    ? `\nimport { judge } from "@crewhaus/eval-judge";\nimport { attachRunEventSink } from "@crewhaus/runtime-core";\nimport type { TraceEventBus } from "@crewhaus/trace-event-bus";`
     : "";
+  // 0.6.0 §7.3 (PR 9c) — the judge nodes publish `judge_verdict` on the shared
+  // bus between node loops, when no node's runChatLoop is live to mirror it
+  // into the session JSONL; this sink appends those lines to the run's session
+  // log (every node runs on `ctx.runContext`, so they share its session id).
+  const runEventSinkBoot = hasJudges
+    ? "\n// 0.6.0 PR 9c — durable sink for the between-node judge_verdict lines.\nconst __runEventSink = await attachRunEventSink(__runContext, {});\nvoid __runEventSink;"
+    : "";
+  const evalRunEventSinkBoot = hasJudges
+    ? `
+  const __evalRunEventSink =
+    __evalOpts.runContext !== undefined
+      ? await attachRunEventSink(__evalRunContext, {
+          ...(__evalOpts.sessionRootDir !== undefined ? { sessionRootDir: __evalOpts.sessionRootDir } : {}),
+        })
+      : undefined;`
+    : "";
+  const evalRunEventSinkClose = hasJudges ? "\n  await __evalRunEventSink?.close();" : "";
   const judgeHelperBlock = hasJudges
     ? `${JUDGE_GATE_HELPER}${hasThrowingJudges ? EVAL_EXIT_CONST : ""}`
     : "";
@@ -1159,7 +1201,7 @@ export async function runForEval(
   __evalSeams.set(__evalRunContext, {
     ...(__evalOpts.sessionRootDir !== undefined ? { sessionRootDir: __evalOpts.sessionRootDir } : {}),
     ...(__evalOpts._adapter !== undefined ? { _adapter: __evalOpts._adapter } : {}),
-  });
+  });${evalRunEventSinkBoot}
   const stream = __graph.run({ input: __evalInput }, { runContext: __evalRunContext });
   let __finalState: unknown;
   let __paused: { nodeName: string; prompt: string } | undefined;
@@ -1171,7 +1213,7 @@ export async function runForEval(
     if (ev.kind === "run_done") {
       __finalState = ev.state;
     }
-  }
+  }${evalRunEventSinkClose}
   if (__paused !== undefined) {
     throw new Error(\`graph paused for HITL approval at node "\${__paused.nodeName}" ("\${__paused.prompt}") — HITL gates cannot resolve inside a headless eval sample; remove hitl: from the node or eval a non-gated path\`);
   }
@@ -1221,7 +1263,7 @@ const __approvals = createPendingApprovalStore(
   __approvalRoot !== undefined ? { rootDir: __approvalRoot } : {},
 );
 const __store = createCheckpointStore();
-const __runContext = createRunContext();
+const __runContext = createRunContext();${runEventSinkBoot}
 const __graph = createGraph({ checkpointStore: __store })
   .setInputAdapter((input) => ({ input }))
 ${nodeRegistrations}

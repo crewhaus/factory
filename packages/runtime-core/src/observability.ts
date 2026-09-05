@@ -765,15 +765,24 @@ export type AttachedRoutingPersistence = {
  * are small and fire once per decision, not per token. `append()` failures
  * are logged, never thrown — a persistence hiccup must not abort a turn.
  */
+export type RoutingPersistedKind =
+  | "model_failover"
+  | "model_stage"
+  | "model_directive"
+  | "judge_verdict";
+
 export function attachRoutingPersistence(
   bus: TraceEventBus,
   eventLog: EventLog,
   runContext: RunContext,
+  opts: {
+    /** 0.6.0 PR 9c — persist only these kinds (a host's between-loop sink
+     *  passes `["judge_verdict"]` so it never duplicates the lines the live
+     *  loop's own subscriber writes). Absent → every routing kind. */
+    readonly kinds?: ReadonlyArray<RoutingPersistedKind>;
+  } = {},
 ): AttachedRoutingPersistence {
-  const persist = (
-    kind: "model_failover" | "model_stage" | "model_directive" | "judge_verdict",
-    payload: unknown,
-  ): void => {
+  const persist = (kind: RoutingPersistedKind, payload: unknown): void => {
     void eventLog.append({ kind, payload }).catch((err) => {
       runContext.logger.error("routing_event.persist_failed", {
         kind,
@@ -782,7 +791,9 @@ export function attachRoutingPersistence(
     });
   };
 
+  const wanted = opts.kinds;
   const unsubscribe = bus.subscribe((event: TraceEvent): void => {
+    if (wanted !== undefined && !wanted.includes(event.kind as RoutingPersistedKind)) return;
     switch (event.kind) {
       case "model_failover": {
         const e = event as ModelFailoverEvent;

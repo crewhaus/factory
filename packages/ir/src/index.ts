@@ -719,6 +719,17 @@ export type IrEvaluation = {
   readonly onFail: "retry" | "halt" | "note" | "escalate";
   /** Resolved retry hard-cap (spec `max_retries`, default 1). */
   readonly maxRetries: number;
+  /**
+   * 0.6.0 §7.3 — present iff `onFail === "escalate"`: the roster arm the
+   * failing turn is re-run on, RESOLVED at lower time from
+   * `model_pool.strategy.cascade.escalate_to` (a candidate tag, or a
+   * `$profile` lowered to its arm id), else the pool's strongest candidate —
+   * its `routing.strongTag` (default `strong`) when a candidate carries it,
+   * else the last declared candidate's arm id (the router's `escalation()`
+   * convention). The runtime resolves it against the booted roster; it never
+   * names a model outside the spec.
+   */
+  readonly escalateTo?: string;
   /** 0.6.0 §4.3 — the judge-independence lint waiver; carried only when true. */
   readonly allowSelfJudge?: true;
 };
