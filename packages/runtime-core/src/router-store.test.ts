@@ -396,6 +396,81 @@ describe("the floor and route freeze (§7.10, §10.1 — acceptance item 7)", ()
     expect(routes()[0]?.reason).toContain("best arm");
   });
 
+  test("floor.arm is a ROLE SLOT: a tag on an UNPROFILED roster resolves to the arm id (the model string) and the floor is enforced", async () => {
+    // Arm ids are the model strings here; `floor.arm: strong` is a TAG, which
+    // the router's strict arm-id comparison could never match unresolved.
+    const UNPROFILED = [
+      { model: HAIKU, tags: ["cheap"] },
+      { model: OPUS, tags: ["strong"] },
+    ];
+    const root = freshRoot();
+    const sb = openScoreboard(root, { now: NOW });
+    seed(sb, "hard", HAIKU, 30, 0.9, 0.85);
+    seed(sb, "hard", OPUS, 30, 0.5, 0.86);
+    const { runContext, routes } = watch();
+    const text = await runChatLoop({
+      model: SONNET,
+      instructions: "test",
+      _adapter: okAdapter("primary"),
+      modelPool: { ...POOL, candidates: UNPROFILED },
+      _poolAdapters: adapters(),
+      _scoreboard: sb,
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "hello" }],
+    });
+    expect(text).toBe("strong");
+    expect(routes()[0]).toMatchObject({
+      model: OPUS,
+      policy: "learned",
+      reason: FLOOR_BLOCKED_ROUTE_REASON,
+      floor: { arm: OPUS, status: "blocked", blocked: [HAIKU] },
+    });
+  });
+
+  test("floor.arm spelled as a $profile or a model string resolves too", async () => {
+    for (const arm of ["$strong", OPUS]) {
+      const root = freshRoot();
+      const sb = openScoreboard(root, { now: NOW });
+      seed(sb, "hard", "fast", 30, 0.9, 0.85);
+      seed(sb, "hard", "strong", 30, 0.5, 0.86);
+      const { runContext, routes } = watch();
+      await runChatLoop({
+        model: SONNET,
+        instructions: "test",
+        _adapter: okAdapter("primary"),
+        modelPool: { ...POOL, reward: { floor: { ...POOL.reward.floor, arm } } },
+        _poolAdapters: adapters(),
+        _scoreboard: sb,
+        runContext,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "hello" }],
+      });
+      expect(routes()[0]).toMatchObject({
+        reason: FLOOR_BLOCKED_ROUTE_REASON,
+        floor: { arm: "strong", status: "blocked", blocked: ["fast"] },
+      });
+    }
+  });
+
+  test("a floor.arm that names nothing on the roster is refused at boot, never a silently `unavailable` check", async () => {
+    const root = freshRoot();
+    const sb = openScoreboard(root, { now: NOW });
+    await expect(
+      runChatLoop({
+        model: SONNET,
+        instructions: "test",
+        _adapter: okAdapter("primary"),
+        modelPool: { ...POOL, reward: { floor: { arm: "nonesuch" } } },
+        _poolAdapters: adapters(),
+        _scoreboard: sb,
+        runContext: watch().runContext,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "hello" }],
+      }),
+    ).rejects.toThrow(/floor\.arm "nonesuch" is not a roster arm \(declared: fast, strong\)/);
+  });
+
   test("route freeze pins the policyVersion: decisions report the frozen version and no observation is recorded", async () => {
     const root = freshRoot();
     const sb = openScoreboard(root, { now: NOW });
@@ -489,6 +564,55 @@ describe("eval-seeded priors (§7.11 N2)", () => {
     // Declaring `priors: eval` without a file changes nothing but a warning.
     const noFile = await run(freshRoot(), "eval");
     expect(noFile?.explored).toBe(true);
+  });
+
+  test("a seeded arm stays out of warm-up after its first live observation: the prior blends with live history", async () => {
+    const root = freshRoot();
+    mkdirSync(join(root, "routing"), { recursive: true });
+    writeFileSync(
+      join(root, "routing", "priors.json"),
+      JSON.stringify({
+        version: 1,
+        fingerprint: priorsFingerprint(POOL.candidates),
+        arms: [
+          { routeKey: "hard", arm: "fast", n: 10, meanReward: 0.3 },
+          { routeKey: "hard", arm: "strong", n: 10, meanReward: 0.8 },
+        ],
+      }),
+    );
+    // ONE shared scoreboard across turns, so turn 1's observation is live for turn 2.
+    const sb = openScoreboard(root, { now: NOW });
+    const turn = async () => {
+      const { runContext, routes } = watch();
+      await runChatLoop({
+        model: SONNET,
+        instructions: "test",
+        _adapter: okAdapter("primary"),
+        modelPool: { ...POOL, reward: { priors: "eval" as const } },
+        _poolAdapters: adapters(),
+        _scoreboard: sb,
+        runContext,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "hello" }],
+      });
+      return routes()[0];
+    };
+    const first = await turn();
+    expect(first).toMatchObject({ model: OPUS, policy: "learned" });
+    expect(first?.explored).toBeUndefined();
+    expect(first?.reason).toContain("(n=10)");
+    // The turn recorded a live observation on strong.
+    expect(sb.score("hard", "strong")?.n).toBe(1);
+    // Turn 2 still exploits: the seeded arm did not fall back into cold
+    // warm-up ("exploring under-sampled arm (n=1 < 25)").
+    const second = await turn();
+    expect(second).toMatchObject({ model: OPUS, policy: "learned" });
+    expect(second?.explored).toBeUndefined();
+    expect(second?.reason).toContain("best arm");
+    expect(second?.reason).toContain("(n=11)");
+    const third = await turn();
+    expect(third?.explored).toBeUndefined();
+    expect(third?.reason).toContain("(n=12)");
   });
 
   test("a priors file for a different roster is ignored: cold warm-up, unchanged policyVersion", async () => {

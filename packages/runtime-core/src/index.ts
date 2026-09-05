@@ -82,6 +82,7 @@ import {
   type PolicyRouter,
   type PoolCandidate,
   type PoolCandidateServed,
+  type PoolFloorConfig,
   type PoolPolicy,
   type ResolvedTier,
   type ScoreLookup,
@@ -90,6 +91,7 @@ import {
   createPolicyRouter,
   createTierRouter,
   parseModelString,
+  poolCandidateArmId,
   resolveModel,
   unscopedRouteKey,
 } from "@crewhaus/model-router";
@@ -3450,13 +3452,42 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // selector: the classifier's verdict arrives as the preRoute hint's forced
     // arm, and the heuristic is the documented fallback when it does not.
     const routerPolicy: PoolPolicy = pool.policy === "classifier" ? "heuristic" : pool.policy;
+    // §7.10 — `reward.floor.arm` is a ROLE SLOT (a candidate tag, a
+    // `$profile` the compiler has already lowered to its bare name, or a
+    // model string); the router compares the floor arm to arm IDS by strict
+    // equality, so resolve the slot against the booted roster HERE. An
+    // unresolvable floor is a boot error, never a silently `unavailable`
+    // check — the floor is the acceptance guarantee (§1) that a learned
+    // policy cannot exploit below a pinned arm.
+    let routerFloor: PoolFloorConfig | undefined;
+    if (rewardBlock?.floor !== undefined) {
+      const declared = rewardBlock.floor.arm;
+      if (declared === undefined) {
+        routerFloor = rewardBlock.floor;
+      } else {
+        const wanted = declared.startsWith("$") ? declared.slice(1) : declared;
+        const floorCandidate =
+          candidates.find((c) => c.modelString === declared) ??
+          candidates.find((c) => poolCandidateConfigs.get(c)?.profile === wanted) ??
+          candidates.find((c) => c.tags.includes(wanted));
+        if (floorCandidate === undefined) {
+          const roster = candidates
+            .map((c) => poolCandidateConfigs.get(c)?.profile ?? c.modelString)
+            .join(", ");
+          throw new RuntimeError(
+            `model_pool.reward.floor.arm "${declared}" is not a roster arm (declared: ${roster}) — name a candidate's model, its profile or a tag`,
+          );
+        }
+        routerFloor = { ...rewardBlock.floor, arm: poolCandidateArmId(floorCandidate) };
+      }
+    }
     poolRouter = createPolicyRouter({
       candidates,
       policy: routerPolicy,
       // §7.9 — scoped arms (`<scope>/<band>`, backing off to the band while
       // under-sampled); §7.10 — the floor the learned policy exploits above.
       ...(poolScope !== undefined ? { scope: poolScope } : {}),
-      ...(rewardBlock?.floor !== undefined ? { floor: rewardBlock.floor } : {}),
+      ...(routerFloor !== undefined ? { floor: routerFloor } : {}),
       ...(pool.routing !== undefined ? { routing: pool.routing } : {}),
       ...(pool.learning !== undefined
         ? {

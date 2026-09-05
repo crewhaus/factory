@@ -266,7 +266,12 @@ export type ScoreLookup = (routeKey: string, armId: string) => ArmScore | undefi
 
 /** 0.6.0 §7.10 — `model_pool.reward.floor`. */
 export type PoolFloorConfig = {
-  /** The floor arm id; default the roster's strongest (`strongTag`, else last declared). */
+  /**
+   * The floor ARM ID (`poolCandidateArmId`), compared by strict equality;
+   * default the roster's strongest (`strongTag`, else last declared). The
+   * spec's `reward.floor.arm` is a role slot (tag / `$profile` / model), so
+   * the caller resolves it against the booted roster before handing it here.
+   */
   readonly arm?: string;
   /** Confidence for the Wilson lower bound. Default 0.9. */
   readonly confidence?: number;

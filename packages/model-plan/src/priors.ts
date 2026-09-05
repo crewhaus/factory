@@ -132,10 +132,17 @@ export function loadPriors(raw: unknown, opts: LoadPriorsOptions = {}): LoadPrio
 }
 
 /**
- * Compose a scoreboard lookup with priors: a live arm with observations wins;
- * an arm the live scoreboard has never seen reads its prior, so warm-up
- * (`minSamplesPerArm`) is skipped for seeded arms. The result is the
- * `ScoreLookup` shape `@crewhaus/model-router` consumes.
+ * Compose a scoreboard lookup with priors. An arm the live scoreboard has
+ * never seen reads its prior verbatim; an arm with live history reads the
+ * prior BLENDED with that history (Chan et al. parallel combine — the same
+ * fold `@crewhaus/routing-store`'s scoreboard uses), so the prior acts as a
+ * pseudo-count that fades as live observations accumulate and never
+ * outweighs `MAX_PRIOR_PSEUDO_COUNT` of them. Either way the score is marked
+ * `seeded`, so warm-up (`minSamplesPerArm`) stays skipped for the arm — a
+ * seeded arm must not drop back into cold round-robin after its first live
+ * observation (§7.11 N2). Live-only fields (judged quality) pass through
+ * untouched. The result is the `ScoreLookup` shape `@crewhaus/model-router`
+ * consumes.
  */
 export function seededScoreLookup(
   live: (routeKey: string, arm: string) => ArmPrior | undefined,
@@ -144,14 +151,36 @@ export function seededScoreLookup(
   if (priors === undefined) return live;
   return (routeKey, arm) => {
     const observed = live(routeKey, arm);
-    if (observed !== undefined && observed.n > 0) return observed;
     const prior = priors.arms.get(priorKey(routeKey, arm));
     if (prior === undefined) return observed;
-    // The prior stands in for the missing live history; `seeded` tells the
-    // router to skip warm-up for it (a pseudo-count ≤ 10 would otherwise sit
-    // under the 25-sample floor and the arm would be explored as if cold).
-    return { ...prior, seeded: true };
+    if (observed === undefined || observed.n <= 0) {
+      // The prior stands in for the missing live history; `seeded` tells the
+      // router to skip warm-up for it (a pseudo-count ≤ 10 would otherwise sit
+      // under the 25-sample floor and the arm would be explored as if cold).
+      return { ...prior, seeded: true };
+    }
+    return { ...observed, ...blendPrior(prior, observed), seeded: true };
   };
+}
+
+/**
+ * Chan parallel combine of a prior (pseudo-observations) with live
+ * observations: pooled count, count-weighted mean, and the pooled sample
+ * variance (M2 of each half plus the between-means term).
+ */
+export function blendPrior(
+  prior: ArmPrior,
+  live: ArmPrior,
+): { readonly n: number; readonly meanReward: number; readonly varReward: number } {
+  const n = prior.n + live.n;
+  if (n <= 0) return { n: 0, meanReward: 0, varReward: 0 };
+  const meanReward = (prior.n * prior.meanReward + live.n * live.meanReward) / n;
+  const delta = live.meanReward - prior.meanReward;
+  const m2 =
+    (prior.varReward ?? 0) * Math.max(0, prior.n - 1) +
+    (live.varReward ?? 0) * Math.max(0, live.n - 1) +
+    (delta * delta * prior.n * live.n) / n;
+  return { n, meanReward, varReward: n > 1 ? m2 / (n - 1) : 0 };
 }
 
 /**

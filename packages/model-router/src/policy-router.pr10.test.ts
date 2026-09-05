@@ -7,7 +7,12 @@
 import { describe, expect, test } from "bun:test";
 import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
 import type { CircuitState } from "@crewhaus/circuit-breaker";
-import { normalQuantile, wilsonLowerBound } from "@crewhaus/model-plan";
+import {
+  loadPriors,
+  normalQuantile,
+  seededScoreLookup,
+  wilsonLowerBound,
+} from "@crewhaus/model-plan";
 import {
   type ArmScore,
   FLOOR_BLOCKED_ROUTE_REASON,
@@ -405,6 +410,61 @@ describe("eval-seeded priors skip warm-up (§7.11 N2)", () => {
     expect(d.candidate).toBe(STRONG);
     expect(d.explored).toBe(false);
     expect(d.reason).toContain("best arm meanReward=0.800 (n=6)");
+  });
+
+  test("a seeded arm STAYS out of warm-up after live observations land: the prior blends with live history", () => {
+    // Priors for both arms (pseudo-count 10 < minSamples 25) over a LIVE
+    // scoreboard that starts empty and fills as decisions are recorded.
+    const loaded = loadPriors({
+      version: 1,
+      fingerprint: "f",
+      arms: [
+        { routeKey: "hard", arm: "fast", n: 10, meanReward: 0.3 },
+        { routeKey: "hard", arm: "strong", n: 10, meanReward: 0.8 },
+      ],
+    });
+    if (!loaded.ok) throw new Error("expected ok");
+    const live = new Map<string, { n: number; sum: number }>();
+    const liveLookup: ScoreLookup = (rk, arm) => {
+      const a = live.get(`${rk}|${arm}`);
+      return a === undefined ? undefined : { n: a.n, meanReward: a.n > 0 ? a.sum / a.n : 0 };
+    };
+    const record = (arm: string, reward: number): void => {
+      const a = live.get(`hard|${arm}`) ?? { n: 0, sum: 0 };
+      live.set(`hard|${arm}`, { n: a.n + 1, sum: a.sum + reward });
+    };
+    const r = createPolicyRouter({
+      candidates: ROSTER,
+      policy: "learned",
+      score: seededScoreLookup(liveLookup, loaded.priors),
+      learning: { explorationRate: 0 },
+    });
+    // Turn 0: exploited on the prior.
+    const d0 = r.route(HARD, "s", 0);
+    expect(d0.candidate).toBe(STRONG);
+    expect(d0.explored).toBe(false);
+    expect(d0.reason).toContain("(n=10)");
+    // ONE live observation on the seeded winner: the next decision must NOT
+    // fall back into cold warm-up ("exploring under-sampled arm (n=1 < 25)").
+    record("strong", 0.9);
+    const d1 = r.route(HARD, "s", 1);
+    expect(d1.candidate).toBe(STRONG);
+    expect(d1.explored).toBe(false);
+    expect(d1.reason).toContain("(n=11)");
+    // One on each arm: still exploiting, on the blended means.
+    record("fast", 0.2);
+    const d2 = r.route(HARD, "s", 2);
+    expect(d2.candidate).toBe(STRONG);
+    expect(d2.explored).toBe(false);
+    // Live history can overturn the prior: 20 poor live samples on strong (mean
+    // 0.1 → blended ≈ 0.35) against fast's blended 0.29 keeps strong; fifteen
+    // more (blend ≈ 0.27) hand the band to fast — the prior FADES, it never pins.
+    for (let i = 0; i < 20; i++) record("strong", 0.1);
+    expect(r.route(HARD, "s", 3).candidate).toBe(STRONG);
+    for (let i = 0; i < 15; i++) record("strong", 0.1);
+    const d3 = r.route(HARD, "s", 4);
+    expect(d3.candidate).toBe(FAST);
+    expect(d3.explored).toBe(false);
   });
 
   test("a seeded unscoped arm also serves the scoped backoff", () => {

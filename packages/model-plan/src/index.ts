@@ -82,6 +82,7 @@ export { canonicalJson, fnv1a64, planFingerprint, profileFingerprint } from "./f
 
 export {
   MAX_PRIOR_PSEUDO_COUNT,
+  blendPrior,
   loadPriors,
   priorKey,
   priorsFingerprint,
