@@ -31,9 +31,11 @@ import {
 import { snip } from "@crewhaus/compaction-snip";
 import {
   type CostTracker,
+  DEFAULT_CAPABILITIES,
   DEFAULT_PRICING,
   computeCostMicros,
   createCostTracker,
+  resolveCapabilities,
   resolvePricing,
   sumRoleCost,
 } from "@crewhaus/cost-tracker";
@@ -58,13 +60,19 @@ import {
   type Advertisement,
   type ModelProfile,
   type RequestParams,
+  type RouteRule,
+  type RouteSignals,
   buildAdvertisement,
   buildRequestParams,
+  deriveSignalRecord,
+  parseModelDirective,
   planFingerprint,
+  stripDirectiveToken,
   toolConfigFor,
 } from "@crewhaus/model-plan";
 import {
   type FailoverChain,
+  type PolicyDecisionPolicy,
   type PolicyRouter,
   type PoolCandidate,
   type PoolPolicy,
@@ -121,6 +129,7 @@ import {
   generateApprovalId,
   hashApprovalInput,
   mergeSessionModels,
+  resolveSessionPin,
 } from "@crewhaus/session-store";
 import { type SkillRef, formatSkillsForPrompt } from "@crewhaus/skills-registry";
 import { type SlashCommand, expand as expandSlash } from "@crewhaus/slash-commands";
@@ -170,6 +179,17 @@ import {
   attachRoutingPersistence,
   attachWatchmeCapture,
 } from "./observability";
+import {
+  type PreRouteArm,
+  type PreRouteClassifierVerdict,
+  type PreRouteForced,
+  describeHintEvidence,
+  latestHumanUserMessage,
+  markSynthetic,
+  messageText,
+  preRoute,
+  stripDirectiveFromMessage,
+} from "./pre-route";
 import { loadProjectMemory } from "./project-memory";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
@@ -677,6 +697,27 @@ export {
   agentFingerprint,
   loadOrCreateAgentIdentity,
 } from "./identity";
+
+// 0.6.0 §7.2 / §7.11 — the preRoute decision phase (pure) and the synthetic-
+// message marker it relies on. Re-exported so `route explain`'s offline replay
+// and tests can reproduce a decision from the persisted line alone.
+export {
+  describeHintEvidence,
+  isSyntheticMessage,
+  latestHumanUserMessage,
+  markSynthetic,
+  messageHasImages,
+  messageText,
+  preRoute,
+  stripDirectiveFromMessage,
+} from "./pre-route";
+export type {
+  PreRouteArm,
+  PreRouteClassifierVerdict,
+  PreRouteContext,
+  PreRouteForced,
+  PreRouteResult,
+} from "./pre-route";
 export type { AgentIdentityFile } from "./identity";
 
 // Loop contract 0.4 (Batch C, G11) — the pending-approval persistence seam is
@@ -926,8 +967,29 @@ export async function replayMessageHistory(log: EventLog): Promise<Anthropic.Mes
     }
     if (depth > 0) continue;
     if (ev.kind === "user_message") {
-      const p = ev.payload as { content: Anthropic.MessageParam["content"] };
-      messages.push({ role: "user", content: p.content });
+      const p = ev.payload as {
+        content: Anthropic.MessageParam["content"];
+        synthetic?: boolean;
+        directive?: boolean;
+      };
+      // 0.6.0 §7.2.1 — honour the logged `synthetic: true` flag on replay so
+      // a resumed transcript's runtime-injected user messages stay marked
+      // (the rules and the classifier read only HUMAN text).
+      let replayed: Anthropic.MessageParam = { role: "user", content: p.content };
+      if (p.directive === true) {
+        // §7.2.1 — the persisted line keeps the `/model …` token; the REQUEST
+        // copy never carries it, on the first turn or on any resumed one. A
+        // directive-only input ran no turn (the acknowledgement was the reply,
+        // no assistant message follows), so replaying it would leave two
+        // adjacent user messages — it is dropped from the request copy.
+        const rest = stripDirectiveToken(messageText(replayed));
+        const hasOtherBlocks =
+          typeof replayed.content !== "string" &&
+          replayed.content.some((block) => block.type !== "text");
+        if (rest.length === 0 && !hasOtherBlocks) continue;
+        replayed = stripDirectiveFromMessage(replayed, rest);
+      }
+      messages.push(p.synthetic === true ? markSynthetic(replayed) : replayed);
     } else if (ev.kind === "assistant_message") {
       const p = ev.payload as { content: Anthropic.MessageParam["content"] };
       messages.push({ role: "assistant", content: p.content });
@@ -1268,6 +1330,23 @@ export type HybridSideCalls = {
   readonly shadow?: ShadowSideCall;
   readonly committee?: CommitteeSideCall;
 };
+
+/**
+ * 0.6.0 §7.2.3 — the injected `policy: classifier` label call. Built by
+ * `@crewhaus/model-service`'s `wireModels` over `@crewhaus/eval-judge`'s
+ * `classifyRouteLabel` (an enum-constrained forced-tool call metered with
+ * `role: "classifier"`); runtime-core only calls it, inside `preRoute`, with
+ * the latest HUMAN user text, and falls back to the heuristic policy on any
+ * throw (`reason: "classifier failed"`). Publish on `bus` so the run's
+ * budget meter counts the call under `judge_share`.
+ */
+export type RouteClassifierFn = (input: {
+  readonly userText: string;
+  /** The pool's declared tags — the closed vocabulary the verdict must come from. */
+  readonly labels: readonly string[];
+  readonly bus: TraceEventBus;
+  readonly signal: AbortSignal;
+}) => Promise<PreRouteClassifierVerdict>;
 
 export type RunChatLoopOptions = {
   model: string;
@@ -1979,12 +2058,42 @@ export type RunChatLoopOptions = {
      */
     readonly scope?: string;
     /**
-     * 0.6.0 §7.2.3 — `classifier` is accepted so the interpreter can thread
-     * the IR's pool verbatim (`IrModelPool.policy`); until the preRoute
-     * decision phase lands (PR 9b) it routes as `heuristic`, the classifier's
-     * documented fallback.
+     * 0.6.0 §7.2.3 — `classifier` runs the injected {@link RouteClassifierFn}
+     * (`routeClassifier`) inside the `preRoute` phase on every model call and
+     * serves the arm its label names; without a wired classifier, past the
+     * `judge_share`, or on any classifier error the turn routes as
+     * `heuristic` with `reason: "classifier failed"` — the documented
+     * fallback, never a stop.
      */
     readonly policy: "static" | "heuristic" | "learned" | "classifier";
+    /**
+     * 0.6.0 §7.2.1 — per-message `/model <$profile|tag>` / `/model auto`
+     * steering, parsed at the typed INPUT seams (the REPL input, the
+     * single-turn seed message — never the transcript) and sticky per
+     * session through the additive session-metadata `pin`. Default OFF on
+     * every shape: a channel shape has no sender allowlist and inbound text
+     * is untrusted.
+     */
+    readonly directives?: boolean;
+    /**
+     * 0.6.0 §7.2.2 — rule-directed routing, first match wins, evaluated in
+     * `preRoute` before the policy over the turn's `RouteSignals`
+     * (`@crewhaus/model-plan`'s `evaluateRules`). The matched `ruleId` is
+     * persisted on the `model_route` line. Carried verbatim from the IR.
+     */
+    readonly rules?: readonly RouteRule[];
+    /**
+     * 0.6.0 §7.2.3 — the `policy: classifier` block (model, its declared
+     * labels — one per routable tag — and the label call's output cap).
+     * Consumed by the composition root that builds `routeClassifier`; the
+     * loop reads `labels` as the closed verdict vocabulary.
+     */
+    readonly classifier?: {
+      readonly model: string;
+      readonly modelProfile?: string;
+      readonly labels: Readonly<Record<string, string>>;
+      readonly maxTokens?: number;
+    };
     readonly objective?: {
       readonly quality?: number;
       readonly cost?: number;
@@ -2007,6 +2116,21 @@ export type RunChatLoopOptions = {
       readonly bandit?: "epsilon-greedy" | "thompson";
     };
   };
+  /**
+   * 0.6.0 §7.2.3 — the `policy: classifier` label call (see
+   * {@link RouteClassifierFn}). Wired by `@crewhaus/model-service` when the
+   * pool declares `policy: classifier` + `classifier:`; meaningful only with
+   * such a pool. Absent under `policy: classifier` → every turn routes
+   * heuristically with `reason: "classifier failed: no classifier wired"`.
+   */
+  routeClassifier?: RouteClassifierFn;
+  /**
+   * 0.6.0 §7.2.2 — a host-supplied routing hint for the `channel` rule
+   * condition (a Slack channel name, a Telegram chat kind, …). Carried on
+   * `RouteSignals.channelHint` and persisted on the route line; never
+   * user-controlled text.
+   */
+  channelHint?: string;
   /**
    * Test injection for the pool candidate adapters, keyed by their spec model
    * string (mirrors `_tierAdapters`). Production callers leave it undefined.
@@ -2826,6 +2950,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Item 26 — tool_use blocks the PREVIOUS turn produced (a tier-routing
   // signal). Persists across `runOneTurn` calls; 0 on the first turn.
   let priorTurnToolUseCount = 0;
+  // 0.6.0 §7.2.2 — the names behind that count (the `toolNamesLastTurn`
+  // routing signal a rule can read).
+  let priorTurnToolNames: readonly string[] = [];
 
   // Item 4 / G28 — the provider's ACTUAL input_tokens (input + cache read +
   // cache create) from the MOST RECENT `model_response`. Updated after every
@@ -2985,6 +3112,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // 0.6.0 §7.1 — a withdrawn candidate never becomes an arm.
       if (c.enabled === false) continue;
       const injected = opts._poolAdapters?.get(c.model);
+      // §7.9 — the arm identity the preRoute hint names the candidate by:
+      // the profile name when it is a profile, else the model string.
+      const armId = c.profile ?? c.model;
       const resolved: PoolCandidate =
         injected !== undefined
           ? {
@@ -2992,10 +3122,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               modelId: bestEffortWireModelId(c.model),
               modelString: c.model,
               tags: c.tags,
+              armId,
             }
           : await (async () => {
               const r = await resolveModel(c.model);
-              return { adapter: r.adapter, modelId: r.modelId, modelString: c.model, tags: c.tags };
+              return {
+                adapter: r.adapter,
+                modelId: r.modelId,
+                modelString: c.model,
+                tags: c.tags,
+                armId,
+              };
             })();
       candidates.push(resolved);
       poolCandidateConfigs.set(resolved, c);
@@ -3011,7 +3148,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         : {}),
     };
     poolPolicyVersion = poolFingerprint(pool);
-    // 0.6.0 — `classifier` routes heuristically until PR 9b (see the option docblock).
+    // 0.6.0 §7.2.3 — under `classifier` the router itself stays the heuristic
+    // selector: the classifier's verdict arrives as the preRoute hint's forced
+    // arm, and the heuristic is the documented fallback when it does not.
     const routerPolicy: PoolPolicy = pool.policy === "classifier" ? "heuristic" : pool.policy;
     poolRouter = createPolicyRouter({
       candidates,
@@ -3132,6 +3271,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // (`recordServedModel`), so `sessions tail` can name the arms a pooled
   // conversation actually used without replaying its event log.
   let sessionModels: string[] | undefined;
+  // 0.6.0 §7.2.1 — the resumed session's `/model` pin, read back UNTRUSTED
+  // (type + roster check against the pool once it is resolved below).
+  let resumedPin: string | undefined;
   // #405 — the toolset recorded by this session's LAST run (undefined when
   // the session predates the record, or on a fresh session).
   let resumedToolNames: readonly string[] | undefined;
@@ -3156,6 +3298,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     }
     sessionId = existing.id;
     sessionModels = existing.models;
+    resumedPin = existing.pin;
     const replayLog = await openEventLog(sessionId, { rootDir: sessionRootDir });
     resumedMessages = await replayMessageHistory(replayLog);
     // One pass gathers both resume-time reads: the continuity ledger seed
@@ -3631,7 +3774,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const removed = prior.filter((n) => !currentToolNames.includes(n));
       const delta = [...added.map((n) => `+${n}`), ...removed.map((n) => `−${n}`)].join(", ");
       const marker = `[system] The toolset changed while this session was idle: ${delta}. The tool schema attached to this request is the authoritative list — any toolset enumerated earlier in this conversation is stale. Call ListTools to verify.`;
-      resumedMessages.push({ role: "user", content: marker });
+      resumedMessages.push(markSynthetic({ role: "user", content: marker }));
       await eventLog.append({
         kind: "user_message",
         payload: { content: marker, synthetic: true, toolset: { added, removed } },
@@ -4491,6 +4634,125 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         error: (err as Error).message,
       });
     });
+  };
+
+  // -------------------------------------------------------------------------
+  // 0.6.0 §7.2.1 — user-directed routing: `/model <$profile|tag>` and
+  // `/model auto`, parsed at the two typed INPUT seams (never from the
+  // transcript) and sticky per session through the additive `pin` field.
+  // -------------------------------------------------------------------------
+  const directivesOn = poolRouter !== undefined && opts.modelPool?.directives === true;
+  /** The roster a directive may name: arm id (profile or model string), model string, tags. */
+  const directiveRoster = (poolRouter?.candidates() ?? []).map((c) => ({
+    armId: armIdOf(c),
+    model: c.modelString,
+    tags: c.tags,
+  }));
+  /** The run's live pin — an arm id on the roster, or none (automatic routing). */
+  let directivePin: string | undefined;
+  /** Publish + persist one `model_directive` (the typed event `route explain` reconstructs the pin from). */
+  const recordDirective = async (ev: {
+    readonly source: "repl" | "seed" | "session" | "none";
+    readonly requested: string;
+    readonly resolved?: string;
+    readonly accepted: boolean;
+    readonly reason?: string;
+  }): Promise<void> => {
+    bus.publish({ ...bus.envelope(), kind: "model_directive", ...ev });
+    await logEvent("model_directive", ev);
+  };
+  const writePin = async (pin: string | null): Promise<void> => {
+    await sessionStore.update(sessionId, { pin }).catch((err) => {
+      runContext.logger.warn("session-store: pin update failed", {
+        error: (err as Error).message,
+      });
+    });
+  };
+  // A resumed session's pin is UNTRUSTED input: honoured only when directives
+  // are on for this harness AND it names a roster arm; otherwise routing is
+  // automatic and the reason is recorded.
+  if (resumedPin !== undefined && poolRouter !== undefined) {
+    const restored = resolveSessionPin(
+      { pin: resumedPin },
+      directiveRoster.map((a) => a.armId),
+    );
+    if (!directivesOn) {
+      await recordDirective({
+        source: "session",
+        requested: String(resumedPin),
+        accepted: false,
+        reason: "session pin ignored — model_pool.directives is off for this harness",
+      });
+    } else if (restored.pin !== undefined) {
+      directivePin = restored.pin;
+      await recordDirective({
+        source: "session",
+        requested: String(resumedPin),
+        resolved: restored.pin,
+        accepted: true,
+      });
+    } else {
+      await recordDirective({
+        source: "session",
+        requested: String(resumedPin),
+        accepted: false,
+        ...(restored.reason !== undefined ? { reason: restored.reason } : {}),
+      });
+    }
+  }
+  /**
+   * Parse a typed input for a `/model …` directive and apply it. `undefined`
+   * when the input carries none (or the run has no pool — then it is prose).
+   * Otherwise the pin is written / cleared, a `model_directive` is recorded,
+   * and the caller gets the input with the token removed plus a one-line
+   * acknowledgement to print. A target outside the roster is REFUSED with
+   * the roster listed; with `directives: false` the token is left in the
+   * text as prose and only the refusal is recorded.
+   */
+  const applyDirective = async (
+    text: string,
+    source: "repl" | "seed",
+  ): Promise<
+    { readonly rest: string; readonly ack: string; readonly stripped: boolean } | undefined
+  > => {
+    if (poolRouter === undefined) return undefined;
+    const d = parseModelDirective(text, directiveRoster);
+    if (d === undefined) return undefined;
+    if (!directivesOn) {
+      const reason =
+        "per-message /model directives are off for this harness (model_pool.directives: false)";
+      await recordDirective({ source, requested: d.requested, accepted: false, reason });
+      return { rest: text, ack: reason, stripped: false };
+    }
+    if (d.kind === "clear") {
+      directivePin = undefined;
+      await writePin(null);
+      await recordDirective({ source, requested: "auto", accepted: true });
+      return {
+        rest: d.rest,
+        ack: "model pin cleared — routing is automatic again",
+        stripped: true,
+      };
+    }
+    if (!d.accepted) {
+      await recordDirective({
+        source,
+        requested: d.requested,
+        accepted: false,
+        ...(d.reason !== undefined ? { reason: d.reason } : {}),
+      });
+      return { rest: d.rest, ack: d.reason ?? "directive refused", stripped: true };
+    }
+    const resolved = d.resolved;
+    if (resolved === undefined) return undefined;
+    directivePin = resolved;
+    await writePin(resolved);
+    await recordDirective({ source, requested: d.requested, resolved, accepted: true });
+    return {
+      rest: d.rest,
+      ack: `model pinned to "${resolved}" for this session — "/model auto" clears it`,
+      stripped: true,
+    };
   };
 
   // Root abort tree for the whole run; each turn gets a child.
@@ -6081,6 +6343,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // records whether the LAST attempt streamed on the fast tier, so the
     // error catch only escalates a genuine fast-tier misroute.
     let thisTurnToolUseCount = 0;
+    const thisTurnToolNames: string[] = [];
     let escalateTier = false;
     let servedFastTier = false;
     // Adaptive model routing — once a pool candidate fails, stick with the
@@ -6090,6 +6353,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // 0.6.0 §7.2.4 — the model's own `Escalate` request, once consumed: the
     // latch above is armed and the decision below names its target + receipt.
     let selfEscalation: HybridEscalationRequest | undefined;
+    // 0.6.0 §7.2.3 — the classifier is budgeted as ONE model call per TURN:
+    // every inner model call of a tool loop re-runs `preRoute` over the same
+    // human message, so the verdict is memoised on that message object for
+    // the rest of the turn (a new turn, or a new human message, classifies
+    // afresh). Persisted on every route line either way.
+    let turnClassifierVerdict:
+      | {
+          readonly message: Anthropic.MessageParam | undefined;
+          readonly verdict: PreRouteClassifierVerdict;
+        }
+      | undefined;
 
     while (state.kind !== "Done") {
       if (turnAbort.signal.aborted) {
@@ -6127,6 +6401,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             streaming: opts.streaming === true,
             messageCount: messages.length,
           });
+          // 0.6.0 §7.4 — the hook's `mutate.systemAppend` is HONOURED: a
+          // string is appended to this call's system prompt in the volatile
+          // region (after the cache-marked prefix, beside the candidate
+          // overlay), so the same seam a guide model would use is open to a
+          // hook. Accepted-then-discarded before this release.
+          const hookSystemAppend =
+            typeof preModel.mutate?.["systemAppend"] === "string" &&
+            preModel.mutate["systemAppend"].length > 0
+              ? (preModel.mutate["systemAppend"] as string)
+              : undefined;
           if (!preModel.allowed) {
             const blockedText = `[blocked by hook] ${preModel.reason ?? "denied"}`;
             out.write(`${blockedText}\n`);
@@ -6214,15 +6498,161 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               }
             }
             if (poolRouter !== undefined) {
-              // 0.6.0 (design §8.1) — the four deterministic signals are also
-              // persisted on the route line (derived values only, never user
-              // text) so `route explain` can show WHY, not just what.
-              const routeSignals = {
+              // 0.6.0 §7.2 — the preRoute decision phase. The deterministic
+              // signals (the tier router's four, plus the 0.6.0 additions:
+              // the latest HUMAN user text — input only, never persisted —
+              // image presence, last turn's tool names, the budget ratio and
+              // the host's channel hint) feed the forced → directive → rules →
+              // classifier → eligibility ladder; the resulting hint goes INTO
+              // the synchronous `route()` and is persisted on the route line.
+              const humanMessage = latestHumanUserMessage(messages);
+              const humanText = humanMessage !== undefined ? messageText(humanMessage) : undefined;
+              const budgetSpentRatio =
+                opts.budget !== undefined && budgetMeter !== undefined && opts.budget.usdMicros > 0
+                  ? Math.min(
+                      1,
+                      (resumedCostUsdMicros + budgetMeter.getRunCost(bus.runId).totalUsdMicros) /
+                        opts.budget.usdMicros,
+                    )
+                  : undefined;
+              const turnHasImages = transcriptHasImages(messages);
+              const toolsInPlay = (anthropicTools?.length ?? 0) > 0;
+              const routeSignals: RouteSignals = {
                 contextTokens: contextTokenSignal(messages),
-                toolsInPlay: (anthropicTools?.length ?? 0) > 0,
+                toolsInPlay,
                 turnIndex: Math.max(0, runContext.turnNumber - 1),
                 priorTurnToolUseCount,
+                ...(humanText !== undefined && humanText.length > 0 ? { userText: humanText } : {}),
+                hasImages: turnHasImages,
+                ...(priorTurnToolNames.length > 0 ? { toolNamesLastTurn: priorTurnToolNames } : {}),
+                ...(budgetSpentRatio !== undefined ? { budgetSpentRatio } : {}),
+                ...(opts.channelHint !== undefined ? { channelHint: opts.channelHint } : {}),
               };
+              const roster = poolRouter.candidates();
+              // N1 — each arm's eligibility inputs: the plan's (declared-
+              // override-folded) features, the declared or table-known
+              // context window / output cap, its own `requires`, and the
+              // per-profile cost cap against what this run has spent on it.
+              const preRouteArmOf = (c: PoolCandidate): PreRouteArm => {
+                const plan = planFor(c);
+                const cfg = poolCandidateConfigs.get(c);
+                const table = resolveCapabilities(
+                  DEFAULT_CAPABILITIES,
+                  c.adapter.providerId,
+                  c.modelId,
+                );
+                const contextWindow = cfg?.capabilities?.contextWindow ?? table?.contextWindow;
+                const maxOutputTokens =
+                  cfg?.capabilities?.maxOutputTokens ?? table?.maxOutputTokens;
+                return {
+                  armId: armIdOf(c),
+                  modelString: c.modelString,
+                  tags: c.tags,
+                  capabilities: {
+                    features: plan.features,
+                    ...(contextWindow !== undefined ? { contextWindow } : {}),
+                    ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+                  },
+                  ...(cfg?.requires !== undefined ? { requires: cfg.requires } : {}),
+                  ...(plan.costCapUsdMicros !== undefined
+                    ? {
+                        costCapUsdMicros: plan.costCapUsdMicros,
+                        spentUsdMicros: plan.spentUsdMicros,
+                      }
+                    : {}),
+                };
+              };
+              const preRouteArms: PreRouteArm[] = roster.map(preRouteArmOf);
+              // The forced lane (§7.12 / §7.2.4) — a budget degrade restricts
+              // the pool to its rung for the rest of the turn it fired in
+              // (outranking the escalation latch: escalating to the strongest
+              // would defeat the cap); the escalation latch — a prior pool
+              // failure or the model's own `Escalate` — names its target. An
+              // off-roster rung hands `preRoute` its own eligibility inputs so
+              // the N1 check covers it too (§7.11).
+              const escalationTarget: PoolCandidate | undefined = escalatePool
+                ? ((selfEscalation !== undefined
+                    ? roster.find((c) => c.modelString === selfEscalation?.target.modelString)
+                    : undefined) ?? poolRouter.escalation())
+                : undefined;
+              const forced: PreRouteForced | undefined =
+                budgetDegraded && budgetDegradeRung !== undefined
+                  ? {
+                      ...(roster.includes(budgetDegradeRung)
+                        ? { armId: armIdOf(budgetDegradeRung) }
+                        : { candidate: preRouteArmOf(budgetDegradeRung) }),
+                      lane: "budget",
+                      reason: "budget_degrade",
+                    }
+                  : escalationTarget !== undefined
+                    ? {
+                        armId: armIdOf(escalationTarget),
+                        lane: "escalation",
+                        reason:
+                          selfEscalation !== undefined
+                            ? `Escalate receipt ${selfEscalation.receipt}`
+                            : "pool failure",
+                      }
+                    : undefined;
+              const pool = opts.modelPool;
+              const classifierLabels = Object.keys(pool?.classifier?.labels ?? {});
+              const routeClassifier = opts.routeClassifier;
+              const classifierSkipReason =
+                pool?.policy === "classifier" && judgeShareExhausted()
+                  ? "judge_share_exhausted"
+                  : undefined;
+              const pre = await preRoute({
+                roster: preRouteArms,
+                signals: routeSignals,
+                turn: {
+                  hasImages: turnHasImages,
+                  contextTokens: routeSignals.contextTokens,
+                  toolsInPlay,
+                },
+                policy: pool?.policy ?? "static",
+                ...(forced !== undefined ? { forced } : {}),
+                ...(directivePin !== undefined ? { pin: directivePin } : {}),
+                ...(pool?.rules !== undefined ? { rules: pool.rules } : {}),
+                ...(pool?.policy === "classifier" && routeClassifier !== undefined
+                  ? {
+                      classifier: async (): Promise<PreRouteClassifierVerdict> => {
+                        // Once per turn: a later inner call of the same turn
+                        // (a tool iteration) reuses the verdict for the same
+                        // human message instead of re-classifying it.
+                        if (
+                          turnClassifierVerdict !== undefined &&
+                          turnClassifierVerdict.message === humanMessage
+                        ) {
+                          return turnClassifierVerdict.verdict;
+                        }
+                        // The classifier is its own metered model call: it
+                        // takes the run's model-call limiter like the main
+                        // call (§7.2.3) and publishes on the run bus under
+                        // `role: "classifier"` so `judge_share` counts it.
+                        if (
+                          opts.rateLimiter &&
+                          opts.rateLimitKeys &&
+                          opts.rateLimitKeys.length > 0
+                        ) {
+                          await opts.rateLimiter.acquire(opts.rateLimitKeys, 1);
+                        }
+                        const verdict = await routeClassifier({
+                          userText: humanText ?? "",
+                          labels: classifierLabels,
+                          bus,
+                          signal: turnAbort.signal,
+                        });
+                        turnClassifierVerdict = { message: humanMessage, verdict };
+                        return verdict;
+                      },
+                      classifierLabels,
+                    }
+                  : {}),
+                ...(classifierSkipReason !== undefined ? { classifierSkipReason } : {}),
+                ...(pool?.routing?.strongTag !== undefined
+                  ? { strongTag: pool.routing.strongTag }
+                  : {}),
+              });
               const base = poolRouter.route(
                 routeSignals,
                 poolSeed,
@@ -6232,37 +6662,41 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 // of freezing on the reset-to-0 turnIndex. Deterministic on
                 // replay (the same transcript reconstructs the same length).
                 messages.length,
+                pre.hint,
               );
-              // 0.6.0 §7.12 — forced lane first (§7.2 ordering): a budget
-              // degrade restricts the pool to its rung for the rest of the
-              // turn it fired in (the run stops at the next turn boundary, so
-              // on a single-turn host that is the rest of the run), outranking
-              // the misroute-escalation latch (escalating to the strongest
-              // candidate would defeat the cap). The band
-              // (`routeKey`) is kept so the rung's arm is still keyed on the
-              // turn's difficulty.
-              const routed =
-                budgetDegraded && budgetDegradeRung !== undefined
+              // The loop substitutes the forced lanes itself (the degrade rung
+              // may sit outside the roster); everything else the router
+              // already applied from the hint. The band (`routeKey`) is kept
+              // so the arm is still keyed on the turn's difficulty. When
+              // `preRoute` found the forced arm ineligible, its result names
+              // the eligible roster arm served in its place (§7.11).
+              const forcedCandidate: PoolCandidate | undefined =
+                forced === undefined
+                  ? undefined
+                  : ((pre.forcedIneligible?.served !== undefined
+                      ? roster.find((c) => armIdOf(c) === pre.forcedIneligible?.served)
+                      : undefined) ??
+                    (forced.lane === "budget" ? budgetDegradeRung : escalationTarget));
+              let decision: {
+                readonly candidate: PoolCandidate;
+                readonly routeKey: string;
+                readonly reason: string;
+                readonly policy: PolicyDecisionPolicy;
+                readonly explored: boolean;
+              } =
+                forced?.lane === "budget" && forcedCandidate !== undefined
                   ? {
                       ...base,
-                      candidate: budgetDegradeRung,
+                      candidate: forcedCandidate,
                       reason: "budget_degrade",
                       policy: "forced" as const,
                       explored: false,
                     }
-                  : escalatePool
+                  : forced?.lane === "escalation" && forcedCandidate !== undefined
                     ? {
                         ...base,
-                        // A self-escalation names its target (the cascade's
-                        // `escalate_to`, else the strongest) — served when it is
-                        // a roster candidate, else the router's strongest; a
-                        // misroute escalation always goes to the strongest.
-                        candidate:
-                          (selfEscalation !== undefined
-                            ? poolRouter
-                                .candidates()
-                                .find((c) => c.modelString === selfEscalation?.target.modelString)
-                            : undefined) ?? poolRouter.escalation(),
+                        candidate: forcedCandidate,
+                        policy: "escalation" as const,
                         reason:
                           selfEscalation !== undefined
                             ? `escalated on the model's own Escalate request (receipt ${selfEscalation.receipt}: ${selfEscalation.reason}; was: ${base.reason})`
@@ -6270,57 +6704,26 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                         explored: false,
                       }
                     : base;
-              // 0.6.0 §4.4 / §7.11 — the per-candidate capability and cost
-              // gate. A candidate is INELIGIBLE for this call when its
-              // features say `vision: false` and the request TRANSCRIPT
-              // carries image blocks anywhere — not just the last user
-              // message: the tool_result pushed after every tool call is a
-              // user message too, and the seeded image stays in `messages`
-              // (the request would 400 or silently drop the image),
-              // or when its per-profile `cost.max_usd` is spent (ineligible,
-              // never ends the run). An ineligible pick is replaced by the
-              // first eligible candidate in declared order; when none is,
-              // the pick stands with the reason recorded and a warning. The
-              // eligible set is persisted on the route line so replay stays
-              // exact. (The full preRoute phase — rules, directives,
-              // classifier, breaker state — lands with PR 9b on this seam.)
-              const turnHasImages = transcriptHasImages(messages);
-              const ineligibleReason = (candidate: PoolCandidate): string | undefined => {
-                const plan = planFor(candidate);
-                if (
-                  plan.costCapUsdMicros !== undefined &&
-                  plan.spentUsdMicros >= plan.costCapUsdMicros
-                ) {
-                  return "cost-cap-spent";
-                }
-                if (turnHasImages && plan.features.vision === false) return "requires:vision";
-                return undefined;
-              };
-              const roster = poolRouter.candidates();
-              const eligibleArms = roster
-                .filter((c) => ineligibleReason(c) === undefined)
-                .map((c) => armIdOf(c));
-              const pickedReason = ineligibleReason(routed.candidate);
-              let decision = routed;
-              if (pickedReason !== undefined) {
-                const replacement = roster.find((c) => ineligibleReason(c) === undefined);
-                if (replacement !== undefined) {
-                  decision = {
-                    ...routed,
-                    candidate: replacement,
-                    explored: false,
-                    reason: `${armIdOf(routed.candidate)} ineligible (${pickedReason}); served ${armIdOf(replacement)} instead (was: ${routed.reason})`,
-                  };
-                } else {
-                  decision = {
-                    ...routed,
-                    reason: `${routed.reason}; no-eligible-candidate (${armIdOf(routed.candidate)}: ${pickedReason})`,
-                  };
-                  runContext.logger.warn("model_pool: no eligible candidate for this turn", {
-                    picked: armIdOf(routed.candidate),
-                    reason: pickedReason,
-                  });
-                }
+              // §7.13 — an empty eligible set: the pick stands, the reason
+              // says so, and a warning fires (the primary is always the
+              // router's fallback here, so the run never halts on it). Under
+              // a forced lane the same applies when the forced arm itself is
+              // ineligible and no eligible arm remained to serve instead.
+              const exclusionNotes = pre.excluded.map((e) => `${e.armId} ineligible (${e.reason})`);
+              const reasonNotes = [...pre.notes, ...exclusionNotes];
+              const nothingEligible =
+                forced === undefined
+                  ? pre.eligible.length === 0
+                  : pre.forcedIneligible !== undefined && pre.forcedIneligible.served === undefined;
+              if (nothingEligible) {
+                reasonNotes.push(`no-eligible-candidate (served ${armIdOf(decision.candidate)})`);
+                runContext.logger.warn("model_pool: no eligible candidate for this turn", {
+                  picked: armIdOf(decision.candidate),
+                  excluded: pre.excluded,
+                });
+              }
+              if (reasonNotes.length > 0) {
+                decision = { ...decision, reason: `${decision.reason}; ${reasonNotes.join("; ")}` };
               }
               const poolPlan = planFor(decision.candidate);
               turnAdapter = decision.candidate.adapter;
@@ -6334,15 +6737,40 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               };
               // §5.3 / §8.1 — the routing attribution every route line gains:
               // the candidate's profile, its advertised-toolset fingerprint,
-              // the eligible arms and the pool's scope (each absent when the
+              // the eligible arms, the preRoute hint, the matched rule, the
+              // classifier verdict and the pool's scope (each absent when the
               // pool declares nothing of the kind, so a bare pool's route
-              // events keep their pre-0.6.0 shape — `eligible` is the one
-              // field always present, since the gate always runs).
+              // events keep their pre-0.6.0 shape — `eligible` and `hint` are
+              // the two always present, since the phase always runs).
+              const signalRecord = deriveSignalRecord(routeSignals);
+              const { userTextHash, ...signalRest } = signalRecord;
               const routeAttribution = {
                 ...(poolPlan.profile !== undefined ? { profile: poolPlan.profile } : {}),
                 ...(poolPlan.fromPool ? { toolsetFingerprint: poolPlan.toolsetFingerprint } : {}),
-                eligible: eligibleArms,
+                eligible: pre.eligible,
+                hint: {
+                  source: pre.hint.source,
+                  ...(pre.hint.forcedArm !== undefined ? { forcedArm: pre.hint.forcedArm } : {}),
+                  ...(pre.hint.excludedArms !== undefined
+                    ? { excludedArms: pre.hint.excludedArms }
+                    : {}),
+                  ...(pre.hint.routeKeySuffix !== undefined
+                    ? { routeKeySuffix: pre.hint.routeKeySuffix }
+                    : {}),
+                  ...(Object.keys(pre.hint.evidence).length > 0
+                    ? { evidence: describeHintEvidence(pre.hint.evidence) }
+                    : {}),
+                },
+                ...(pre.ruleId !== undefined ? { ruleId: pre.ruleId } : {}),
+                ...(pre.classifierVerdict !== undefined
+                  ? { classifierVerdict: pre.classifierVerdict }
+                  : {}),
                 ...(poolScope !== undefined ? { scope: poolScope } : {}),
+              };
+              // Derived values only — never the user's text (§7.2.2).
+              const persistedSignals = {
+                ...signalRest,
+                ...(userTextHash !== undefined ? { textHash: userTextHash } : {}),
               };
               // 0.6.0 (design §8.1) — `specModel` (when it differs from the
               // wire id) closes the wire/spec identity split: scoreboard arms
@@ -6362,7 +6790,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 ...(decision.explored ? { explored: true } : {}),
                 ...(poolPolicyVersion !== undefined ? { policyVersion: poolPolicyVersion } : {}),
                 ...routeSpecModel,
-                signals: routeSignals,
+                signals: persistedSignals,
                 ...routeAttribution,
               });
               // Persist the decision so `crewhaus route explain <session>` can
@@ -6377,7 +6805,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 explored: decision.explored,
                 ...(poolPolicyVersion !== undefined ? { policyVersion: poolPolicyVersion } : {}),
                 ...routeSpecModel,
-                signals: routeSignals,
+                signals: persistedSignals,
                 ...routeAttribution,
               });
             } else if (tierRouter !== undefined && !budgetDegraded) {
@@ -6509,6 +6937,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 // only the tail and the frozen system prefix stays cached.
                 ...(plan.overlayBlock !== undefined
                   ? [{ type: "text" as const, text: plan.overlayBlock.text }]
+                  : []),
+                // 0.6.0 §7.4 — the `pre-model` hook's `mutate.systemAppend`,
+                // volatile like the overlay (never cache-marked).
+                ...(hookSystemAppend !== undefined
+                  ? [{ type: "text" as const, text: hookSystemAppend }]
                   : []),
               ],
               messages: reqMessages as Parameters<ProviderAdapter["stream"]>[0]["messages"],
@@ -6708,6 +7141,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
               // Item 26 — accrue this turn's tool_use count (next-turn tier signal).
               thisTurnToolUseCount += toolUses.length;
+              for (const tu of toolUses) thisTurnToolNames.push(tu.name);
               for (const tu of toolUses) {
                 // (#386) — loop detection compares OPERATIVE inputs: a
                 // runtime-injected justification is re-worded every call, so
@@ -6723,7 +7157,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               await logEvent("user_message", { content: [...toolResults] });
               const loopOutcome = evaluateToolLoop();
               if (loopOutcome.kind === "message") {
-                messages.push(loopOutcome.message);
+                messages.push(markSynthetic(loopOutcome.message));
                 await logEvent("user_message", {
                   content: loopOutcome.message.content,
                   synthetic: true,
@@ -6962,6 +7396,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // Item 26 — accrue this turn's tool_use count (a next-turn tier
           // signal): a dense tool turn marks an active multi-step task.
           thisTurnToolUseCount += state.toolUses.length;
+          for (const tu of state.toolUses) thisTurnToolNames.push(tu.name);
           let toolResults: Anthropic.ToolResultBlockParam[];
           try {
             toolResults = await runToolBatch(state.toolUses);
@@ -6983,7 +7418,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           await logEvent("user_message", { content: toolResults });
           const loopOutcome = evaluateToolLoop();
           if (loopOutcome.kind === "message") {
-            messages.push(loopOutcome.message);
+            messages.push(markSynthetic(loopOutcome.message));
             await logEvent("user_message", {
               content: loopOutcome.message.content,
               synthetic: true,
@@ -7098,7 +7533,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // runContext.turnNumber — and `crewhaus distill`'s deriveTurns
               // skips them so its turn ordinal matches the runtime + web UI.
               const continueMsg = "Please continue from where you left off.";
-              messages.push({ role: "user", content: continueMsg });
+              messages.push(markSynthetic({ role: "user", content: continueMsg }));
               await logEvent("user_message", { content: continueMsg, synthetic: true });
               state = transition(state, { kind: "RecoveryDone" });
               break;
@@ -7128,7 +7563,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               }
               const tombstoneMsg =
                 "[previous assistant turn was rejected as invalid; please retry]";
-              messages.push({ role: "user", content: tombstoneMsg });
+              messages.push(markSynthetic({ role: "user", content: tombstoneMsg }));
               await logEvent("user_message", { content: tombstoneMsg, synthetic: true });
               state = transition(state, { kind: "RecoveryDone" });
               break;
@@ -7194,6 +7629,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // Item 26 — hand this turn's tool_use count to the next turn's tier
     // decision (the prior-tool-density signal).
     priorTurnToolUseCount = thisTurnToolUseCount;
+    priorTurnToolNames = [...new Set(thisTurnToolNames)];
 
     // G10 — the turn wound down through the Aborted transition; if a
     // wall-clock timer (not a SIGINT) is what aborted it, classify the stop.
@@ -7337,7 +7773,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           ? ` Grader feedback: ${rationale.trim()}`
           : "";
       const correction = `[evaluation failed: scored ${score.toFixed(2)}, threshold ${evaluation.threshold}]${feedback}\nPlease revise your previous answer to address the feedback, then give the corrected answer in full.`;
-      messages.push({ role: "user", content: correction });
+      messages.push(markSynthetic({ role: "user", content: correction }));
       await logEvent("user_message", { content: correction, synthetic: true });
       attempt = await runOneTurn(messages);
     }
@@ -7429,12 +7865,28 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // seed IS the entire turn and is logged through.
       const replayed = resumedMessages ?? [];
       let messages: Anthropic.MessageParam[] = [...replayed, ...seed];
+      // 0.6.0 §7.2.1 — the single-turn directive seam: ONLY the last seed
+      // message (the new inbound input) is parsed, never the replayed prefix.
+      const seedDirective = await applyDirective(messageText(last), "seed");
       for (const m of seed) {
         if (m.role === "user") {
-          await logEvent("user_message", { content: m.content });
+          await logEvent("user_message", {
+            content: m.content,
+            ...(m === last && seedDirective?.stripped === true ? { directive: true } : {}),
+          });
         } else if (m.role === "assistant") {
           await logEvent("assistant_message", { content: m.content });
         }
+      }
+      if (seedDirective?.stripped === true) {
+        const hasOtherBlocks =
+          typeof last.content !== "string" && last.content.some((b) => b.type !== "text");
+        if (seedDirective.rest.length === 0 && !hasOtherBlocks) {
+          // A directive-only message: the acknowledgement IS the reply; no
+          // model call, no turn.
+          return seedDirective.ack;
+        }
+        messages[messages.length - 1] = stripDirectiveFromMessage(last, seedDirective.rest);
       }
       runContext.turnNumber += 1;
       bus.setTurnNumber(runContext.turnNumber);
@@ -7722,8 +8174,28 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // just below, so the turn being gated is `turnNumber + 1`.
       if ((await enforceBudget(runContext.turnNumber + 1)) === "stop") break;
 
-      messages.push({ role: "user", content: effectiveInput });
-      await logEvent("user_message", { content: effectiveInput });
+      // 0.6.0 §7.2.1 — the `/model …` directive seam: parsed HERE, from the
+      // typed input, before it joins the transcript. The persisted
+      // `user_message` keeps the token (so replay reproduces the session);
+      // the request copy carries the rest. A directive-only input runs no
+      // turn — the acknowledgement is the reply.
+      let requestInput = effectiveInput;
+      const directive = await applyDirective(effectiveInput, "repl");
+      if (directive !== undefined) {
+        out.write(`[model] ${directive.ack}\n`);
+        if (directive.stripped) {
+          if (directive.rest.length === 0) {
+            await logEvent("user_message", { content: effectiveInput, directive: true });
+            continue;
+          }
+          requestInput = directive.rest;
+        }
+      }
+      messages.push({ role: "user", content: requestInput });
+      await logEvent("user_message", {
+        content: effectiveInput,
+        ...(directive?.stripped === true ? { directive: true } : {}),
+      });
       runContext.turnNumber += 1;
       bus.setTurnNumber(runContext.turnNumber);
       const t0Turn = performance.now();

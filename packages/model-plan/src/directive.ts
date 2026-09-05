@@ -43,6 +43,20 @@ export type ModelDirective =
 const DIRECTIVE_RE = /^\/model(?:\s+(\S+))?(?:\s+|$)/;
 
 /**
+ * Remove a leading `/model <token>` from typed text WITHOUT resolving it
+ * against a roster — the REQUEST-copy strip a resumed transcript needs when
+ * it replays a `user_message` logged `directive: true` (§7.2.1: the persisted
+ * line keeps the token, the request copy never carries it). Returns the text
+ * unchanged when it carries no directive; `""` for a directive-only input.
+ */
+export function stripDirectiveToken(input: string): string {
+  const trimmed = input.trimStart();
+  const m = trimmed.match(DIRECTIVE_RE);
+  if (m === null) return input;
+  return trimmed.slice(m[0].length).trim();
+}
+
+/**
  * Parse a `/model <target>` or `/model auto` directive at the START of the
  * typed input (leading whitespace tolerated). Returns `undefined` when the
  * input carries no directive — including when `/model` appears anywhere but

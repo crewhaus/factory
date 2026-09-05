@@ -838,12 +838,25 @@ export type ModelRouteEvent = TraceEventEnvelope & {
   /** Wire model id the chosen candidate resolved to. */
   model: string;
   /**
-   * The configured pool policy, or `"forced"` (0.6.0 §7.12) when the loop
-   * substituted a candidate outside the router's choice — today a
+   * The configured pool policy, or the `preRoute` lane that decided the turn
+   * before the policy ran (0.6.0 §7.2 ordering: forced → directive → rules →
+   * classifier → policy over `eligible[]`): `"forced"` for a
    * `budget.on_exceed: degrade` breach forcing the degrade rung
-   * (`reason: "budget_degrade"`).
+   * (`reason: "budget_degrade"`), `"escalation"` for the misroute latch or
+   * the model's own `Escalate`, `"directive"` for a `/model` pin, `"rule"`
+   * for a first-match `model_pool.rules[]` hit (`ruleId` names it),
+   * `"classifier"` for a `policy: classifier` verdict (`classifierVerdict`
+   * carries the label).
    */
-  policy: "static" | "heuristic" | "learned" | "forced";
+  policy:
+    | "static"
+    | "heuristic"
+    | "learned"
+    | "classifier"
+    | "rule"
+    | "directive"
+    | "escalation"
+    | "forced";
   reason: string;
   /** True when the learned policy is exploring an under-sampled arm. */
   explored?: boolean;

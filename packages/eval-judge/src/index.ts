@@ -58,6 +58,14 @@ export type {
   JudgeBusOptions,
   JudgeCallUsage,
 } from "./judge";
+// 0.6.0 §7.2.3 — the `policy: classifier` route classifier: an enum-
+// constrained forced-tool call metered with `role: "classifier"`.
+export {
+  ROUTE_CLASSIFIER_TOOL,
+  buildRouteClassifierPrompt,
+  classifyRouteLabel,
+} from "./route-classifier";
+export type { RouteClassifierOptions, RouteClassifierResult } from "./route-classifier";
 export {
   loadRubric,
   loadCategoricalRubric,

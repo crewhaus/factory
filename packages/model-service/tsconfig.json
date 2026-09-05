@@ -6,6 +6,7 @@
   },
   "references": [
     { "path": "../adapter-anthropic" },
+    { "path": "../eval-judge" },
     { "path": "../infra-utils" },
     { "path": "../ir" },
     { "path": "../run-context" },
