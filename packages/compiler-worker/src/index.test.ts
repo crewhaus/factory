@@ -590,6 +590,44 @@ describe("compiler-worker GET /schema", () => {
     }
   });
 
+  test("0.6.0: every target definition served by GET /schema carries the models: registry", async () => {
+    const res = await worker.fetch(request("/schema"), env);
+    type Node = { $ref?: string; description?: string };
+    const body = (await res.json()) as {
+      schema: { definitions: Record<string, { properties?: Record<string, Node> }> };
+    };
+    // The first target carries the block inline; every later target `$ref`s
+    // it (`#/definitions/cli/properties/models`) — follow the local pointer.
+    const deref = (node: Node): Node => {
+      if (node.$ref === undefined) return node;
+      let cursor: unknown = body;
+      for (const segment of node.$ref.replace(/^#\//, "schema/").split("/")) {
+        cursor = (cursor as Record<string, unknown>)[segment];
+      }
+      return cursor as Node;
+    };
+    for (const target of [
+      "cli",
+      "workflow",
+      "channel",
+      "graph",
+      "managed",
+      "pipeline",
+      "crew",
+      "research",
+      "batch",
+      "voice",
+      "browser",
+      "eval",
+      "onchain",
+      "onchain-game",
+    ]) {
+      const models = body.schema.definitions[target]?.properties?.["models"];
+      expect(models).toBeDefined();
+      expect(deref(models as Node).description ?? "").toContain("model-profile registry");
+    }
+  });
+
   test("serves a long cache header and a stable ETag", async () => {
     const first = await worker.fetch(request("/schema"), env);
     const second = await worker.fetch(request("/schema"), env);

@@ -173,6 +173,78 @@ describe("specJsonSchema — document structure", () => {
     }
   });
 
+  test("0.6.0: models is a property of EVERY target definition, and the profile value is a strict object", () => {
+    // zod-to-json-schema emits the SAME zod object once and `$ref`s it from
+    // every later site (`#/definitions/cli/properties/models` on the other 13
+    // targets), so resolve a local ref before inspecting the node.
+    const deref = (node: Rec): Rec => {
+      const ref = node["$ref"];
+      if (typeof ref !== "string") return node;
+      expect(ref.startsWith("#/")).toBe(true);
+      let cursor: unknown = schema;
+      for (const segment of ref.slice(2).split("/")) cursor = asRec(cursor)[segment];
+      return asRec(cursor);
+    };
+    for (const target of Object.keys(FIXTURES)) {
+      const props = asRec(asRec(definitions[target])["properties"]);
+      const models = deref(asRec(props["models"]));
+      expect(String(models["description"] ?? "")).toContain("model-profile registry");
+      // A zod record renders as an object with `additionalProperties` = the
+      // value schema (and `propertyNames` carrying the key pattern).
+      expect(models["type"]).toBe("object");
+      const profile = asRec(models["additionalProperties"]);
+      expect(profile["type"]).toBe("object");
+      expect(profile["additionalProperties"]).toBe(false);
+      const profileProps = asRec(profile["properties"]);
+      for (const key of [
+        "model",
+        "tags",
+        "max_tokens",
+        "thinking",
+        "temperature",
+        "instructions",
+        "tools",
+        "tool_config",
+        "permissions",
+        "rate_limits",
+        "limits",
+        "caching",
+        "cost",
+        "requires",
+        "capabilities",
+        "fallbacks",
+        "circuit_breaker",
+      ]) {
+        expect(profileProps[key]).toBeDefined();
+      }
+      expect(profile["required"]).toEqual(["model"]);
+      const keyPattern = asRec(models["propertyNames"])["pattern"];
+      expect(keyPattern).toBe("^[a-z][a-z0-9_-]{0,63}$");
+    }
+  });
+
+  test("0.6.0: the cli agent's model_pool exposes the hybrid siblings and the widened policy enum", () => {
+    const cli = asRec(definitions["cli"]);
+    const agent = asRec(asRec(asRec(cli["properties"])["agent"])["properties"]);
+    const pool = asRec(asRec(agent["model_pool"])["properties"]);
+    for (const key of [
+      "candidates",
+      "policy",
+      "directives",
+      "rules",
+      "classifier",
+      "strategy",
+      "reward",
+      "scope",
+    ]) {
+      expect(pool[key]).toBeDefined();
+    }
+    expect(asRec(pool["policy"])["enum"]).toEqual(["static", "heuristic", "learned", "classifier"]);
+    const evaluation = asRec(asRec(asRec(cli["properties"])["evaluation"])["properties"]);
+    expect(asRec(evaluation["on_fail"])["enum"]).toEqual(["retry", "halt", "note", "escalate"]);
+    expect(evaluation["allow_self_judge"]).toBeDefined();
+  });
+
   test("key descriptions surface (Batch B blocks carry them)", () => {
     const cli = asRec(definitions["cli"]);
     const props = asRec(cli["properties"]);
