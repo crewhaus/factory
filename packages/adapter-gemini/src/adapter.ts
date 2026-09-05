@@ -34,6 +34,7 @@
 
 import type {
   CanonicalMessage,
+  EffectiveParams,
   ProviderAdapter,
   ProviderFeatures,
   ProviderRequest,
@@ -43,7 +44,7 @@ import { AdapterError, ProviderAuthError } from "@crewhaus/errors";
 import { estimateTokens as tokenBudgetEstimate } from "@crewhaus/token-budget";
 import { GoogleGenAI } from "@google/genai";
 import { translateGeminiStream } from "./stream.js";
-import { toGeminiParams } from "./translate.js";
+import { geminiEffectiveParams, toGeminiParams } from "./translate.js";
 
 type AnthropicMessageParamLike = Parameters<typeof tokenBudgetEstimate>[0][number];
 
@@ -86,6 +87,11 @@ export class GeminiAdapter implements ProviderAdapter {
 
   estimateTokens(messages: ReadonlyArray<CanonicalMessage>): number {
     return tokenBudgetEstimate(messages as readonly AnthropicMessageParamLike[]);
+  }
+
+  /** 0.6.0 §8.1 — see `geminiEffectiveParams`; pure, no network. */
+  effectiveParams(req: ProviderRequest): EffectiveParams {
+    return geminiEffectiveParams(req);
   }
 }
 

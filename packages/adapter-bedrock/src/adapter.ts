@@ -32,6 +32,7 @@ import {
 import type { ConverseStreamOutput } from "@aws-sdk/client-bedrock-runtime";
 import type {
   CanonicalMessage,
+  EffectiveParams,
   ProviderAdapter,
   ProviderFeatures,
   ProviderRequest,
@@ -39,8 +40,16 @@ import type {
 } from "@crewhaus/adapter-anthropic";
 import { AdapterError } from "@crewhaus/errors";
 import { estimateTokens as tokenBudgetEstimate } from "@crewhaus/token-budget";
-import { buildConverseRequest, translateConverseStream } from "./converse.js";
-import { buildAnthropicBedrockBody, decodeAnthropicBedrockChunk } from "./families/anthropic.js";
+import {
+  buildConverseRequest,
+  converseEffectiveParams,
+  translateConverseStream,
+} from "./converse.js";
+import {
+  anthropicBedrockEffectiveParams,
+  buildAnthropicBedrockBody,
+  decodeAnthropicBedrockChunk,
+} from "./families/anthropic.js";
 import type { BedrockFamily } from "./family.js";
 import { featuresForFamily } from "./family.js";
 
@@ -74,6 +83,16 @@ export class BedrockAdapter implements ProviderAdapter {
 
   estimateTokens(messages: ReadonlyArray<CanonicalMessage>): number {
     return tokenBudgetEstimate(messages as readonly AnthropicMessageParamLike[]);
+  }
+
+  /**
+   * 0.6.0 §8.1 — projects whichever marshaller `stream()` would run for
+   * this family (native Anthropic body vs Converse); pure, no network.
+   */
+  effectiveParams(req: ProviderRequest): EffectiveParams {
+    return this.family === "anthropic"
+      ? anthropicBedrockEffectiveParams(req)
+      : converseEffectiveParams(req);
   }
 
   /** Anthropic family: native InvokeModelWithResponseStream path. */

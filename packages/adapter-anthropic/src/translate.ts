@@ -18,7 +18,9 @@ import {
   type CanonicalContentDelta,
   type CanonicalMessage,
   type CanonicalTextBlockParam,
+  type DroppedRequestParam,
   EFFORT_THINKING_BUDGET_TOKENS,
+  type EffectiveParams,
   type ProviderRequest,
   type StreamEvent,
 } from "./types.js";
@@ -98,6 +100,45 @@ export function toAnthropicParams(
   }
 
   return params;
+}
+
+/**
+ * 0.6.0 §8.1 — project `toAnthropicParams` onto the params a route can differ
+ * on. Runs the SAME marshaller `stream()` runs (never a re-derived gate), then
+ * reads back what landed on the wire body: `temperature` is reported dropped
+ * when the request carried one and the body does not — because extended
+ * thinking is on (the API rejects the pair) or because the model rejects the
+ * parameter outright (#413, `claudeRejectsTemperature`). An effort preset is
+ * NOT a drop: it lowers to `thinking.budget_tokens` through the shared table
+ * and is reported as the resulting `thinking` plus a note.
+ */
+export function anthropicEffectiveParams(req: ProviderRequest, isOAuth: boolean): EffectiveParams {
+  const params = toAnthropicParams(req, isOAuth);
+  const dropped: DroppedRequestParam[] = [];
+  const notes: string[] = [];
+  if (req.temperature !== undefined && params.temperature === undefined) {
+    dropped.push("temperature");
+    notes.push(
+      req.thinking !== undefined || req.reasoningEffort !== undefined
+        ? "temperature dropped: the Anthropic API rejects an explicit temperature alongside extended thinking"
+        : `temperature dropped: model "${req.model}" rejects the temperature parameter (#413)`,
+    );
+  }
+  if (req.thinking === undefined && req.reasoningEffort !== undefined && params.thinking) {
+    notes.push(
+      `reasoningEffort "${req.reasoningEffort}" lowered to thinking.budget_tokens=${params.thinking.type === "enabled" ? params.thinking.budget_tokens : 0}`,
+    );
+  }
+  return {
+    model: params.model,
+    maxTokens: params.max_tokens,
+    ...(params.thinking !== undefined && params.thinking.type === "enabled"
+      ? { thinking: { type: "enabled" as const, budgetTokens: params.thinking.budget_tokens } }
+      : {}),
+    ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
+    dropped,
+    ...(notes.length > 0 ? { notes } : {}),
+  };
 }
 
 /**

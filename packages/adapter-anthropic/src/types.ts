@@ -235,6 +235,42 @@ export type ProviderMessage = {
   readonly usage: TokenUsage;
 };
 
+// ---------- Effective-parameter echo (0.6.0 §8.1) ---------- //
+
+/**
+ * A request parameter the adapter accepted on the `ProviderRequest` but did
+ * NOT send to the provider — the silent drops every marshaller performs
+ * (Claude 5 rejects `temperature`; OpenAI reasoning models reject it too;
+ * Bedrock Converse has no cross-vendor thinking control). Surfaced so the
+ * drop is visible on `model_request.effectiveParams` and in `models audit`
+ * instead of disappearing inside the adapter.
+ */
+export type DroppedRequestParam = "temperature" | "thinking" | "reasoningEffort";
+
+/**
+ * 0.6.0 §8.1 — what the adapter will actually send for a request: the
+ * projection of its own pure marshaller onto the params a route decision can
+ * differ on. `dropped` lists every `ProviderRequest` param the marshaller
+ * accepted but omitted from the wire body; `notes` explains conversions that
+ * are NOT drops (an effort preset lowered to a token budget, a budget mapped
+ * to the nearest effort bucket), so a consumer can tell "honoured
+ * differently" from "ignored".
+ *
+ * `thinking` / `reasoningEffort` / `temperature` are present only when the
+ * marshaller sends that native control. A budget-style provider that
+ * converts `reasoningEffort` therefore reports `thinking` and no
+ * `reasoningEffort`; a native-effort provider reports the inverse.
+ */
+export type EffectiveParams = {
+  readonly model: string;
+  readonly maxTokens: number;
+  readonly thinking?: { readonly type: "enabled"; readonly budgetTokens: number };
+  readonly reasoningEffort?: ReasoningEffort;
+  readonly temperature?: number;
+  readonly dropped: ReadonlyArray<DroppedRequestParam>;
+  readonly notes?: ReadonlyArray<string>;
+};
+
 // ---------- The interface every adapter implements ---------- //
 
 export interface ProviderAdapter {
@@ -242,4 +278,19 @@ export interface ProviderAdapter {
   readonly features: ProviderFeatures;
   stream(req: ProviderRequest): AsyncIterable<StreamEvent>;
   estimateTokens(messages: ReadonlyArray<CanonicalMessage>): number;
+  /**
+   * 0.6.0 §8.1 — OPTIONAL: predict the parameters `stream(req)` will put on
+   * the wire, by projecting the adapter's own pure marshaller (never by
+   * re-deriving the gate elsewhere — `usesMaxCompletionTokens` is private to
+   * adapter-openai for exactly this reason). Pure and network-free; safe to
+   * call offline (`models audit`) and before `model_request` is published.
+   *
+   * Wrappers forward it: the circuit breaker delegates to the wrapped
+   * adapter and a `FailoverChain` predicts against the candidate `plan()`
+   * names. Returns `undefined` when the serving adapter cannot project
+   * (a wrapper around an adapter that lacks the method) — consumers set the
+   * echoed field only when a value comes back. Absent on adapters that do
+   * not implement it; every in-tree adapter does.
+   */
+  effectiveParams?(req: ProviderRequest): EffectiveParams | undefined;
 }

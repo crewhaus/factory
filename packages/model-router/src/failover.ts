@@ -50,6 +50,7 @@
  */
 import type {
   CanonicalMessage,
+  EffectiveParams,
   ProviderAdapter,
   ProviderId,
   ProviderRequest,
@@ -170,6 +171,15 @@ export interface FailoverChain extends ProviderAdapter {
    * (`lastServed()` after the call is always exact).
    */
   plan(): FailoverActiveInfo;
+  /**
+   * 0.6.0 §8.1 — predict the effective params of the next `stream()` call:
+   * the request is rewritten for the candidate `plan()` names (its wire
+   * model id, cache markers stripped when it lacks explicit caching) and
+   * projected through THAT candidate's adapter, so a Claude-5 fallback
+   * behind a Claude-4.5 primary reports its own `temperature` drop.
+   * `undefined` when the planned candidate's adapter cannot project.
+   */
+  effectiveParams(req: ProviderRequest): EffectiveParams | undefined;
   /** The candidate that served (or is serving) the most recent stream. */
   lastServed(): FailoverActiveInfo;
   /**
@@ -467,6 +477,23 @@ export async function createFailoverChain(
     };
   }
 
+  /**
+   * The candidate `plan()` / `effectiveParams()` predict on: the first
+   * resolved, available candidate whose breaker admits traffic. A candidate
+   * that failed its last resolution attempt is not planned on (`stream()`
+   * still re-tries it — see `lastServed`). Exhausted → the primary (the next
+   * `stream()` will throw; the prediction still names something).
+   */
+  function plannedCandidate(): CandidateState {
+    for (const c of candidates) {
+      if (c.resolution === undefined) continue;
+      if (c.unavailableReason !== undefined) continue;
+      if (c.breaker !== undefined && c.breaker.state() === "open") continue;
+      return c;
+    }
+    return candidates[0] as CandidateState;
+  }
+
   async function* routeStream(req: ProviderRequest): AsyncIterable<StreamEvent> {
     const selected = await selectCandidate();
     const candidate = candidates[selected.index] as CandidateState;
@@ -486,16 +513,12 @@ export async function createFailoverChain(
       return routeStream(req);
     },
     plan(): FailoverActiveInfo {
-      for (const c of candidates) {
-        // A candidate that failed its last resolution attempt is not
-        // planned on (stream() still re-tries it — see `lastServed`).
-        if (c.resolution === undefined) continue;
-        if (c.unavailableReason !== undefined) continue;
-        if (c.breaker !== undefined && c.breaker.state() === "open") continue;
-        return infoFor(c);
-      }
-      // Exhausted — the next stream() will throw; report the primary.
-      return infoFor(candidates[0] as CandidateState);
+      return infoFor(plannedCandidate());
+    },
+    effectiveParams(req: ProviderRequest): EffectiveParams | undefined {
+      const c = plannedCandidate();
+      const adapter = (c.resolution as ModelResolution).adapter;
+      return adapter.effectiveParams?.(requestFor(req, c));
     },
     lastServed(): FailoverActiveInfo {
       return lastServedInfo;

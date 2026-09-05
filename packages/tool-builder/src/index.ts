@@ -133,6 +133,12 @@ export function buildTool<TInput>(def: ToolDefinition<TInput>): RegisteredTool {
     // that declares it crosses a boundary, not just the hardcoded outward
     // names. Omitted on the definition ⇒ omitted here.
     ...(def.ioCapability !== undefined ? { ioCapability: def.ioCapability } : {}),
+    // 0.6.0 §5.1 — pass the model-feature requirement through verbatim, like
+    // ioCapability. Omitted on the definition ⇒ omitted here, so the runtime
+    // advertises the tool to every candidate (the prior behavior).
+    ...(def.requiresModelFeatures !== undefined
+      ? { requiresModelFeatures: def.requiresModelFeatures }
+      : {}),
     // Per-call concurrency classifier (Task): passed through verbatim, like
     // jsonSchema/ioCapability. Omitted on the definition ⇒ omitted here, so
     // the orchestrator falls back to the static concurrency flags.

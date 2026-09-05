@@ -40,6 +40,7 @@ import {
   type CanonicalTool,
   type CanonicalToolResultContent,
   EFFORT_THINKING_BUDGET_TOKENS,
+  type EffectiveParams,
   type ProviderRequest,
   type ToolChoice,
 } from "@crewhaus/adapter-anthropic";
@@ -118,6 +119,36 @@ export function toGeminiParams(req: ProviderRequest): GenerateContentParameters 
     model: req.model,
     contents,
     config,
+  };
+}
+
+/**
+ * 0.6.0 §8.1 — project `toGeminiParams` onto the params a route can differ
+ * on. Gemini maps every canonical knob natively — `maxOutputTokens`,
+ * `thinkingConfig.thinkingBudget`, `temperature` — so `dropped` is empty;
+ * an effort preset lowered to a token budget is reported as a note. Runs the
+ * same marshaller `stream()` runs, so a Gemma request that carries tools
+ * raises the same `ConfigError` the call itself would.
+ */
+export function geminiEffectiveParams(req: ProviderRequest): EffectiveParams {
+  const params = toGeminiParams(req);
+  const config = params.config ?? {};
+  const notes: string[] = [];
+  const budget = config.thinkingConfig?.thinkingBudget;
+  if (req.thinking === undefined && req.reasoningEffort !== undefined && budget !== undefined) {
+    notes.push(
+      `reasoningEffort "${req.reasoningEffort}" lowered to thinkingConfig.thinkingBudget=${budget}`,
+    );
+  }
+  return {
+    model: typeof params.model === "string" ? params.model : req.model,
+    maxTokens: config.maxOutputTokens ?? req.maxTokens,
+    ...(budget !== undefined
+      ? { thinking: { type: "enabled" as const, budgetTokens: budget } }
+      : {}),
+    ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
+    dropped: [],
+    ...(notes.length > 0 ? { notes } : {}),
   };
 }
 

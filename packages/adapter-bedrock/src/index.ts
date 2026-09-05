@@ -9,9 +9,14 @@
 
 export { BedrockAdapter, createBedrockAdapter } from "./adapter.js";
 export type { BedrockAdapterOptions, CreateBedrockAdapterOptions } from "./adapter.js";
-export { buildConverseRequest, translateConverseStream } from "./converse.js";
+export {
+  buildConverseRequest,
+  converseEffectiveParams,
+  translateConverseStream,
+} from "./converse.js";
 export {
   ANTHROPIC_BEDROCK_VERSION,
+  anthropicBedrockEffectiveParams,
   buildAnthropicBedrockBody,
   decodeAnthropicBedrockChunk,
 } from "./families/anthropic.js";
