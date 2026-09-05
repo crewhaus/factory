@@ -124,6 +124,14 @@ const ANCHORS: ReadonlyArray<{ readonly at: "root" | "anywhere"; readonly segmen
   { at: "root", segments: ["evaluation", "allow_self_judge"] },
   { at: "root", segments: ["budget"] },
   { at: "anywhere", segments: ["sub_agents"] },
+  // §11.1 "graph nodes NEW": the pre-pool routing blocks land on `nodes.<n>`
+  // (and `sub_agents.<n>`) in 0.6.0. Anchored ANYWHERE so the same verdict is
+  // stated once for every positional host (`steps[i]`, `roles.<r>`) and for
+  // `agent` — the `["nodes"]` / `["steps"]` / `["roles"]` whole-block entries
+  // reached these by prefix until the structural rule named them.
+  { at: "anywhere", segments: ["model_tiers"] },
+  { at: "anywhere", segments: ["model_fallbacks"] },
+  { at: "anywhere", segments: ["circuit_breaker"] },
   { at: "root", segments: ["mcp_servers", WILDCARD_SEGMENT, "tool_flags"] },
   { at: "root", segments: ["routing", "model"] },
   { at: "root", segments: ["observability", "slo"] },
@@ -189,6 +197,9 @@ describe("§10.3 closing invariant — every 0.6.0 spec leaf is classified exact
     expect(joined.has("agent.model_pool.rules.*.enabled")).toBe(true);
     expect(joined.has("steps.*.judge.escalate_to")).toBe(true);
     expect(joined.has("observability.slo.floor_block_rate")).toBe(true);
+    expect(joined.has("nodes.*.circuit_breaker.failureThreshold")).toBe(true);
+    expect(joined.has("nodes.*.model_tiers.fast")).toBe(true);
+    expect(joined.has("nodes.*.model_fallbacks.*")).toBe(true);
   });
 
   for (const shape of shapes) {

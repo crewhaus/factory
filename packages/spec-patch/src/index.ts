@@ -679,11 +679,13 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["memory", "refreshEvery"]),
   ]),
   workflow: Object.freeze([
-    // Whole-step replacement — this ALSO reaches item 9's (G37) per-step
-    // model routing (model_pool policy/routing/learning, tiers, fallbacks):
-    // no narrower entry is possible (the roster/step index is positional) and
-    // whole-step replacement already spans model/instructions, so the policy
-    // knobs ride here rather than as standalone paths.
+    // Whole-step replacement — a whole-step VALUE may carry item 9's (G37)
+    // per-step model routing (a pool-bearing step round-trips, see the G37
+    // tests) because the path `["steps"]` crosses no structural segment.
+    // The sub-path route is narrower: the structural rule stops prefix reach
+    // at `model_pool` / `judge` / `temperature` / `model_tiers` /
+    // `model_fallbacks` / `circuit_breaker`, so `steps[i].model_tiers.fast`
+    // is refused and only the exact dials below are admitted under a step.
     Object.freeze(["steps"]),
     // 0.6.0 §10.3 — the structural rule closed prefix reach into a step's
     // `model_pool` / `judge` / `temperature`; these exact wildcard entries
@@ -781,11 +783,12 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["retrieve", "defaultK"]),
   ]),
   crew: Object.freeze([
-    // Whole-role replacement — this ALSO reaches item 9's (G37) per-role
-    // model routing (model_pool policy/routing/learning, tiers, fallbacks):
-    // the role name is a dynamic map key, so no static narrower path exists,
-    // and whole-role replacement already spans model/instructions, so the
-    // policy knobs ride here rather than as standalone paths.
+    // Whole-role replacement — a whole-role VALUE may carry item 9's (G37)
+    // per-role model routing (the role name is a dynamic map key; see the
+    // G37 tests). The sub-path route is narrower, as at the workflow entry:
+    // `roles.<r>.model_tiers` / `model_fallbacks` / `circuit_breaker` /
+    // `model_pool.*` are refused by the structural rule; only the exact
+    // dials below are admitted under a role.
     Object.freeze(["roles"]),
     // 0.6.0 §10.3 — per-role dials (`*` = one role name); see the workflow entry.
     ...poolDials(ROLE),
@@ -917,6 +920,16 @@ export const OPTIMIZABLE_PATHS: Readonly<
  *     `temperature` leaf — a candidate's, a sub-agent's, a judge's pinned
  *     sampling temperature — is human-owned, and a prefix-reached patch
  *     would land on one of those.
+ *   - `model_tiers`, `model_fallbacks`, `circuit_breaker` — the three
+ *     pre-pool routing blocks (§11.1 adds them to graph nodes and sub-agents
+ *     in 0.6.0; steps and roles carried them before). `model_tiers` is a
+ *     two-slot roster (`fast`/`default` are model identity, mirroring the
+ *     standing `agent.model` exclusion), `model_fallbacks` is the failover
+ *     chain and `circuit_breaker` decides when an arm is withdrawn from
+ *     service — the same verdicts the §10.3 table gives their `models.*`
+ *     twins. No exact entry names any of them, so the rule closes the
+ *     whole-block prefix route (`["nodes"]` → `nodes.a.circuit_breaker`)
+ *     without removing anything the table promises.
  *
  * One rule, no negative-list semantics: the exact entries
  * `["agent","model_pool",{policy,routing,learning}]` keep working, and a
@@ -933,6 +946,9 @@ export const STRUCTURAL_SEGMENTS: ReadonlyArray<string> = Object.freeze([
   "judge",
   "sub_agents",
   "temperature",
+  "model_tiers",
+  "model_fallbacks",
+  "circuit_breaker",
 ]);
 
 /**
@@ -972,6 +988,21 @@ export const HUMAN_OWNED_PATHS: ReadonlyArray<{
     pattern: ["model_pool", "objective"],
     reason:
       "the reward weights decide the quality/cost/latency trade-off the learner optimises — a spend policy, not a dial (sibling of reward)",
+  },
+  // -- the pre-pool routing blocks on every routed host (agent, steps[i],
+  //    nodes.<n>, roles.<r>, sub_agents.<n>): roster, failover, withdrawal --
+  {
+    pattern: ["model_tiers"],
+    reason:
+      "the two-tier router is a two-slot roster (fast/default are model identity) plus its thresholds — human-owned like agent.model; the pool's exact routing entry is the tunable generalisation",
+  },
+  {
+    pattern: ["model_fallbacks"],
+    reason: "the failover chain decides which model answers when the primary is down",
+  },
+  {
+    pattern: ["circuit_breaker"],
+    reason: "the breaker decides when an arm is withdrawn from service",
   },
   // -- models.<name>: identity, security surface, routing semantics, prompt --
   {

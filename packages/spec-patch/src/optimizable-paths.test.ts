@@ -814,6 +814,37 @@ describe("§10.3 structural rule — model_pool / judge / sub_agents / temperatu
     rejected(CREW, ["roles", "lead", "sub_agents", "helper", "tools"]);
   });
 
+  test("the pre-pool routing blocks (model_tiers / model_fallbacks / circuit_breaker) are refused on every positional host", () => {
+    // §11.1 adds the three to graph nodes in 0.6.0; steps and roles carried
+    // them before and were reached by the whole-block prefix. None is a
+    // listed dial, so every route is closed — the `models.*` twins already
+    // are (`fallbacks`, `circuit_breaker` in HUMAN_OWNED_PATHS).
+    rejected(WORKFLOW, ["steps", 0, "circuit_breaker"]);
+    rejected(WORKFLOW, ["steps", 0, "circuit_breaker", "failureThreshold"]);
+    rejected(WORKFLOW, ["steps", 0, "model_tiers", "fast"]);
+    rejected(WORKFLOW, ["steps", 0, "model_fallbacks"]);
+    rejected(GRAPH, ["nodes", "a", "model_fallbacks"]);
+    rejected(GRAPH, ["nodes", "a", "model_fallbacks", 0]);
+    rejected(GRAPH, ["nodes", "a", "circuit_breaker", "cooldownMs"]);
+    rejected(GRAPH, ["nodes", "a", "model_tiers", "routing", "contextTokenThreshold"]);
+    rejected(CREW, ["roles", "lead", "model_tiers"]);
+    rejected(CREW, ["roles", "lead", "model_tiers", "default"]);
+    rejected(CREW, ["roles", "lead", "model_fallbacks", 0]);
+    rejected(CREW, ["roles", "lead", "circuit_breaker", "windowMs"]);
+    for (const target of ["workflow", "graph", "crew"] as const) {
+      const host =
+        target === "workflow"
+          ? ["steps", 0]
+          : target === "graph"
+            ? ["nodes", "a"]
+            : ["roles", "lead"];
+      for (const block of ["model_tiers", "model_fallbacks", "circuit_breaker"]) {
+        expect(isOptimizable(target, [...host, block]), `${target}: ${block}`).toBe(false);
+        expect(humanOwnedReason([...host, block])).toBeDefined();
+      }
+    }
+  });
+
   test("the exact entries and the plain prefix paths keep working on the same shapes", () => {
     const wf = applySpecEdits(
       WORKFLOW,
@@ -874,12 +905,44 @@ describe("§10.3 structural rule — model_pool / judge / sub_agents / temperatu
     const cr = parseSpec(CREW);
     if (cr.target !== "crew") throw new Error("unexpected target");
     expect(cr.roles.lead?.sub_agents?.helper).toBeDefined();
-    expect(STRUCTURAL_SEGMENTS).toEqual(["model_pool", "judge", "sub_agents", "temperature"]);
+    expect(STRUCTURAL_SEGMENTS).toEqual([
+      "model_pool",
+      "judge",
+      "sub_agents",
+      "temperature",
+      "model_tiers",
+      "model_fallbacks",
+      "circuit_breaker",
+    ]);
     expect(
       parseSpec(
         `${WORKFLOW.replace("    instructions: write it", "    instructions: write it\n    temperature: 0")}`,
       ),
     ).toBeDefined();
+    // The three pre-pool routing blocks: a step carries the failover chain and
+    // breaker, a graph node the two-tier router (§11.1 "graph nodes NEW").
+    const failover = parseSpec(
+      [
+        "name: w",
+        "target: workflow",
+        "model: base-model",
+        "steps:",
+        "  - name: draft",
+        "    instructions: write it",
+        "    model_fallbacks: [m2]",
+        "    circuit_breaker: { failureThreshold: 2 }",
+      ].join("\n"),
+    );
+    if (failover.target !== "workflow") throw new Error("unexpected target");
+    const step = failover.steps[0];
+    if (step === undefined || "kind" in step) throw new Error("expected a regular step");
+    expect(step.model_fallbacks).toEqual(["m2"]);
+    expect(step.circuit_breaker?.failureThreshold).toBe(2);
+    const tiered = parseSpec(
+      `${GRAPH.replace("    instructions: x", "    instructions: x\n    model_tiers: { fast: m1, default: m2 }")}`,
+    );
+    if (tiered.target !== "graph") throw new Error("unexpected target");
+    expect(tiered.nodes.a?.model_tiers?.fast).toBe("m1");
   });
 });
 
