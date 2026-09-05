@@ -1484,7 +1484,10 @@ const modelPoolBlock = z
     classifier: modelPoolClassifierSchema.optional(),
     strategy: modelPoolStrategySchema.optional(),
     reward: modelPoolRewardSchema.optional(),
-    /** Scoped routeKey prefix; the compiler stamps the step/role/node/sub-agent name when absent. */
+    /** Scoped routeKey prefix (§7.9). Carried verbatim when declared; when absent the
+     *  compiler leaves it unstamped (pre-0.6.0 pool blobs stay byte-identical) and the
+     *  host defaults it at runtime — the crew orchestrator to the role name (PR 7b), the
+     *  composition root to the caller's toolset scope (PR 10). */
     scope: safeName.optional(),
   })
   .strict()
