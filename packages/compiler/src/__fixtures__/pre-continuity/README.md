@@ -297,3 +297,20 @@ unchanged. Two routed pins DID move, and live where routed specs are pinned:
 `__fixtures__/model-wiring/{workflow-steps,graph-nodes}.agent.ts.txt` — a
 pooled step's / node's `modelPool` literal gains `"scope":"<name>"` when the
 spec pinned none (see that directory's README for the note).
+
+**0.6.0 PR 11 delta — sub-agent routing end to end; NO pin moved.** The three
+`renderSubAgentDef` copies (target-cli, target-channel-bot, target-crew)
+collapsed onto ONE renderer, `@crewhaus/model-service`'s `renderSubAgentDef`,
+whose output for the seven 0.5.x fields (`name`, `description`, `instructions`,
+`tools`, `model`, `permissions`, `inherit_bypass`) is byte-identical to every
+copy it replaced (pinned by the legacy-oracle test in that package). The 0.6.0
+keys a sub-agent may now carry (`modelProfile`, `thinking`, `maxTokens`,
+`temperature`, `modelFallbacks`, `circuitBreaker`, `modelTiers`, `modelPool`,
+`budgetShare`, `inheritRouting`, `allowedProfiles`) are appended AFTER them and
+ONLY when the spec declares the corresponding key — none of the pinned specs
+does, so every pin here passes unchanged. Two other emitter-visible changes are
+runtime constructions, not emitted strings: the `RuntimeBridge` gains a
+`routing` projection (served arm + run cap) and the spawner re-publishes a
+child's spend on the parent bus. `IrSubAgentDefinition.allowedProfiles` changed
+shape (profile names → resolved `{ profile, model, params… }` options); no
+pinned spec declares `allowed_profiles`.

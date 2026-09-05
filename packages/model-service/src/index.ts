@@ -66,7 +66,12 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { IrCircuitBreaker, IrModelPool, IrModelTiers } from "@crewhaus/ir";
+import type {
+  IrCircuitBreaker,
+  IrModelPool,
+  IrModelTiers,
+  IrSubAgentDefinition,
+} from "@crewhaus/ir";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import { type RunChatLoopOptions, runChatLoop } from "@crewhaus/runtime-core";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -479,4 +484,56 @@ export function renderModelWiringFields(fragment: ModelWiringFragment, indent: s
     pieces.push(`\n${indent}modelPool: ${JSON.stringify(fragment.modelPool)},`);
   }
   return pieces.join("");
+}
+
+/**
+ * 0.6.0 §7.7 — render one `IrSubAgentDefinition` as the single-line TS object
+ * literal the emitted `__subAgents` Map holds (a runtime
+ * `SubAgentDefinition`). ONE renderer for the three emitters that register
+ * the Task tool (cli, channel-bot, crew) — until PR 11 each carried a
+ * hand-mirrored copy with a "keep the three in sync" comment.
+ *
+ * Byte contract: the seven fields a 0.5.x definition has (`name`,
+ * `description`, `instructions`, `tools`, `model`, `permissions`,
+ * `inherit_bypass`) render exactly as the copies did, in that order; every
+ * 0.6.0 key (`modelProfile`, the params, the routing quartet, `budgetShare`,
+ * `inheritRouting`, `allowedProfiles`) is appended AFTER them and ONLY when
+ * present, so a spec whose sub-agents carry only today's fields emits a
+ * byte-identical bundle. The 0.6.0 keys use the runtime `SubAgentDefinition`
+ * names (camelCase, identical to the IR's) — `inherit_bypass` keeps its
+ * legacy spelling.
+ */
+export function renderSubAgentDef(d: IrSubAgentDefinition): string {
+  const lines: string[] = [];
+  lines.push(`name: ${escapeJsonString(d.name)}`);
+  lines.push(`description: ${escapeJsonString(d.description)}`);
+  lines.push(`instructions: ${escapeJsonString(d.instructions)}`);
+  lines.push(`tools: ${JSON.stringify(d.tools)}`);
+  if (d.model !== undefined) lines.push(`model: ${escapeJsonString(d.model)}`);
+  if (typeof d.permissions === "string") {
+    lines.push(`permissions: ${escapeJsonString(d.permissions)}`);
+  } else {
+    lines.push(
+      `permissions: { allow: ${JSON.stringify(d.permissions.allow)}, deny: ${JSON.stringify(d.permissions.deny)} }`,
+    );
+  }
+  lines.push(`inherit_bypass: ${d.inheritBypass}`);
+  if (d.modelProfile !== undefined) lines.push(`modelProfile: ${escapeJsonString(d.modelProfile)}`);
+  if (d.thinking !== undefined) lines.push(`thinking: ${JSON.stringify(d.thinking)}`);
+  if (d.maxTokens !== undefined) lines.push(`maxTokens: ${d.maxTokens}`);
+  if (d.temperature !== undefined) lines.push(`temperature: ${d.temperature}`);
+  if (d.modelFallbacks !== undefined && d.modelFallbacks.length > 0) {
+    lines.push(`modelFallbacks: ${JSON.stringify(d.modelFallbacks)}`);
+  }
+  if (d.circuitBreaker !== undefined) {
+    lines.push(`circuitBreaker: ${JSON.stringify(d.circuitBreaker)}`);
+  }
+  if (d.modelTiers !== undefined) lines.push(`modelTiers: ${JSON.stringify(d.modelTiers)}`);
+  if (d.modelPool !== undefined) lines.push(`modelPool: ${JSON.stringify(d.modelPool)}`);
+  if (d.budgetShare !== undefined) lines.push(`budgetShare: ${d.budgetShare}`);
+  if (d.inheritRouting !== undefined) lines.push(`inheritRouting: ${d.inheritRouting}`);
+  if (d.allowedProfiles !== undefined) {
+    lines.push(`allowedProfiles: ${JSON.stringify(d.allowedProfiles)}`);
+  }
+  return `{ ${lines.join(", ")} }`;
 }

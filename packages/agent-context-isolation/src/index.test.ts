@@ -6,8 +6,17 @@ import { join } from "node:path";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type RuleSet, emptyRuleSet } from "@crewhaus/permission-engine";
 import { createRunContext } from "@crewhaus/run-context";
+import { createStore } from "@crewhaus/state-store";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { type ParentRunHandle, createIsolatedContext } from "./index.js";
+import {
+  type ParentRunHandle,
+  type RuntimeBridge,
+  type SubAgentDefinition,
+  createIsolatedContext,
+  projectParentHandle,
+  subAgentDefinitionFromIr,
+  subAgentProfileAllowlist,
+} from "./index.js";
 
 function newTempRoot(): string {
   return mkdtempSync(join(tmpdir(), "agent-context-isolation-"));
@@ -257,5 +266,181 @@ describe("createIsolatedContext", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 PR 11 — the ONE bridge → handle projection, the profile allowlist and
+// the IR → runtime definition mapping (plan §7.7, §10.2).
+// ---------------------------------------------------------------------------
+
+describe("projectParentHandle (0.6.0 §10.2)", () => {
+  test("copies every ParentRunHandle field — routing included — and none of the tool-only bridge fields", async () => {
+    const root = newTempRoot();
+    try {
+      const { parent, parentLog } = await makeParent(root);
+      const routing = {
+        served: {
+          model: "claude-haiku-4-5",
+          wireModelId: "claude-haiku-4-5",
+          profile: "fast",
+          armId: "fast",
+          fromPool: true,
+        },
+        budgetUsdMicros: 500_000,
+      } as const;
+      const approvals = {
+        store: { persist: async () => {}, get: async () => null, resolve: async () => null },
+      };
+      const bridge: RuntimeBridge = {
+        ...parent,
+        routing,
+        memory: { autoRecall: true },
+        skills: [],
+        failureTaxonomy: [],
+        continuity: { loadPlan: async () => null },
+        askMode: "pause",
+        approvals: approvals as unknown as NonNullable<ParentRunHandle["approvals"]>,
+        hooks: [],
+        subAgents: new Map(),
+        spawnSubAgent: async () => {
+          throw new Error("unused");
+        },
+        runState: createStore({}),
+      };
+      const handle = projectParentHandle(bridge);
+      expect(handle.routing).toBe(routing);
+      expect(handle.model).toBe(parent.model);
+      expect(handle.maxTokens).toBe(parent.maxTokens);
+      expect(handle.memory).toBe(bridge.memory);
+      expect(handle.skills).toBe(bridge.skills);
+      expect(handle.failureTaxonomy).toBe(bridge.failureTaxonomy);
+      expect(handle.continuity).toBe(bridge.continuity);
+      expect(handle.askMode).toBe("pause");
+      expect(handle.approvals).toBe(bridge.approvals);
+      expect(handle.sessionRootDir).toBe(root);
+      for (const toolOnly of ["hooks", "subAgents", "spawnSubAgent", "crewMailbox", "runState"]) {
+        expect(toolOnly in handle).toBe(false);
+      }
+      await parentLog.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a minimal bridge projects the minimal handle: optional fields are ABSENT, not undefined (the hand copy's key set)", async () => {
+    const root = newTempRoot();
+    try {
+      const { parent, parentLog } = await makeParent(root);
+      const handle = projectParentHandle({ ...parent, hooks: [] });
+      expect(Object.keys(handle).sort()).toEqual(
+        [
+          "eventLog",
+          "maxTokens",
+          "model",
+          "permissionMode",
+          "permissionRules",
+          "runContext",
+          "sessionRootDir",
+          "tools",
+        ].sort(),
+      );
+      await parentLog.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("subAgentProfileAllowlist (0.6.0 §7.7 / §10.1)", () => {
+  const base: SubAgentDefinition = { name: "h", description: "d", instructions: "i" };
+  test("an allowlist yields exactly its profile names", () => {
+    expect(
+      subAgentProfileAllowlist(
+        {
+          ...base,
+          model: "m",
+          allowedProfiles: [
+            { profile: "fast", model: "a" },
+            { profile: "strong", model: "b" },
+          ],
+        },
+        "parent",
+      ),
+    ).toEqual(["fast", "strong"]);
+  });
+  test("without one, the child's own identity: its profile name and model string", () => {
+    expect(subAgentProfileAllowlist({ ...base, model: "m", modelProfile: "fast" }, "p")).toEqual([
+      "fast",
+      "m",
+    ]);
+    expect(subAgentProfileAllowlist({ ...base, model: "m" }, "p")).toEqual(["m"]);
+  });
+  test("with no model of its own, only the parent's model (what the child runs on)", () => {
+    expect(subAgentProfileAllowlist(base, "parent-model")).toEqual(["parent-model"]);
+  });
+});
+
+describe("subAgentDefinitionFromIr (0.6.0 §7.7)", () => {
+  test("maps today's seven fields exactly as the interpreter did and copies every 0.6.0 key only when present", () => {
+    const legacy = subAgentDefinitionFromIr({
+      name: "s",
+      description: "d",
+      instructions: "i",
+      tools: ["read"],
+      permissions: "scoped",
+      inheritBypass: false,
+    });
+    expect(legacy).toEqual({
+      name: "s",
+      description: "d",
+      instructions: "i",
+      tools: ["read"],
+      permissions: "scoped",
+      inherit_bypass: false,
+    });
+    const pool = { candidates: [{ model: "a", tags: ["cheap"] }], policy: "static" as const };
+    const full = subAgentDefinitionFromIr({
+      name: "s",
+      description: "d",
+      instructions: "i",
+      tools: [],
+      model: "m",
+      permissions: { allow: ["Read"], deny: [] },
+      inheritBypass: true,
+      modelProfile: "fast",
+      thinking: { effort: "low" },
+      maxTokens: 10,
+      temperature: 0.1,
+      modelFallbacks: ["f"],
+      circuitBreaker: { failureThreshold: 2 },
+      modelTiers: { fast: "a", default: "b" },
+      modelPool: pool,
+      budgetShare: 0.5,
+      inheritRouting: true,
+      allowedProfiles: [{ profile: "fast", model: "a" }],
+      federation: { url: "https://peer.example" },
+    });
+    expect(full).toEqual({
+      name: "s",
+      description: "d",
+      instructions: "i",
+      tools: [],
+      model: "m",
+      permissions: { allow: ["Read"], deny: [] },
+      inherit_bypass: true,
+      modelProfile: "fast",
+      thinking: { effort: "low" },
+      maxTokens: 10,
+      temperature: 0.1,
+      modelFallbacks: ["f"],
+      circuitBreaker: { failureThreshold: 2 },
+      modelTiers: { fast: "a", default: "b" },
+      modelPool: pool,
+      budgetShare: 0.5,
+      inheritRouting: true,
+      allowedProfiles: [{ profile: "fast", model: "a" }],
+    });
+    expect(full.modelPool).toBe(pool);
   });
 });

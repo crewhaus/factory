@@ -716,3 +716,81 @@ describe("cost-tracker — byRole aggregation (0.6.0 §6.2)", () => {
     tracker.unsubscribe();
   });
 });
+
+// 0.6.0 PR 11 (design §7.6, §10.2) — a nested run's ROLE-bearing summary
+// roll-up is folded; the optimizer's role-less run total stays ignored.
+describe("cost-tracker — role-bearing summary roll-ups (0.6.0 §10.2)", () => {
+  function summaryAccrual(
+    bus: TraceEventBus,
+    opts: { role?: CostAccrualEvent["role"]; costUsdMicros: number; summary?: boolean },
+  ): CostAccrualEvent {
+    return {
+      ...bus.envelope(),
+      kind: "cost_accrual",
+      provider: "anthropic",
+      modelId: "claude-haiku-4-5",
+      inputTokens: 1000,
+      outputTokens: 100,
+      cachedReadTokens: 0,
+      cacheCreationTokens: 0,
+      costUsdMicros: opts.costUsdMicros,
+      ...(opts.role !== undefined ? { role: opts.role } : {}),
+      ...(opts.summary !== undefined ? { summary: opts.summary } : {}),
+    };
+  }
+
+  test("a child's cost_accrual{role: subagent, summary: true} folds into the run total and byRole", () => {
+    const bus = makeBus();
+    const tracker = createCostTracker(bus, { suppressEvents: true });
+    bus.publish(
+      modelResponse(bus, {
+        model: "claude-opus-4",
+        provider: "anthropic",
+        inputTokens: 1000,
+        outputTokens: 0,
+      }),
+    );
+    bus.publish(summaryAccrual(bus, { role: "subagent", summary: true, costUsdMicros: 7_000 }));
+    const summary = tracker.getRunCost(RUN_ID);
+    expect(summary.totalUsdMicros).toBe(15_000 + 7_000);
+    expect(summary.byRole).toEqual({ primary: 15_000, subagent: 7_000 });
+    expect(summary.byProvider).toEqual({ anthropic: 22_000 });
+    // A hybrid side call's roll-up (auxiliary role) folds the same way — the
+    // slice `budget.judge_share` reads sees it.
+    bus.publish(summaryAccrual(bus, { role: "guide", summary: true, costUsdMicros: 500 }));
+    expect(sumRoleCost(tracker.getRunCost(RUN_ID), ["guide"])).toBe(500);
+    tracker.unsubscribe();
+  });
+
+  test("the optimizer's ROLE-LESS summary total and an external per-call accrual are still ignored", () => {
+    const bus = makeBus();
+    const tracker = createCostTracker(bus, { suppressEvents: true });
+    bus.publish(summaryAccrual(bus, { summary: true, costUsdMicros: 999_999 }));
+    bus.publish(summaryAccrual(bus, { role: "subagent", costUsdMicros: 999_999 }));
+    expect(tracker.getRunCost(RUN_ID)).toEqual({ totalUsdMicros: 0, byProvider: {}, byRole: {} });
+    tracker.unsubscribe();
+  });
+
+  test("a folded roll-up is never re-published (no second accrual on the bus)", () => {
+    const bus = makeBus();
+    const seen: TraceEvent[] = [];
+    bus.subscribe((e) => {
+      if (e.kind === "cost_accrual") seen.push(e);
+    });
+    const tracker = createCostTracker(bus);
+    bus.publish(summaryAccrual(bus, { role: "subagent", summary: true, costUsdMicros: 7_000 }));
+    expect(seen).toHaveLength(1);
+    expect(tracker.getRunCost(RUN_ID).totalUsdMicros).toBe(7_000);
+    // Diagnostics: a roll-up is not a priced model_response.
+    expect(tracker.observed()).toBe(0);
+    tracker.unsubscribe();
+  });
+
+  test("tenant totals fold a roll-up too", () => {
+    const bus = makeBus();
+    const tracker = createCostTracker(bus, { suppressEvents: true, tenantId: "acme" });
+    bus.publish(summaryAccrual(bus, { role: "subagent", summary: true, costUsdMicros: 4_000 }));
+    expect(tracker.getTenantCost("acme").byRole).toEqual({ subagent: 4_000 });
+    tracker.unsubscribe();
+  });
+});

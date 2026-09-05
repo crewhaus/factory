@@ -445,3 +445,223 @@ describe("createTaskTool — concurrencyClassifier (per-call parallel eligibilit
     expect(classify(tool, { description: "x", subagent_type: "explorer" }, [read])).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 0.6.0 PR 11 — the `profile` argument (allowlist-validated), the shared
+// handle projection, and the frontmatter mirror (plan §7.7, §10.1, §10.2).
+// ---------------------------------------------------------------------------
+
+describe("createTaskTool — profile allowlist (0.6.0 §7.7 / §10.1)", () => {
+  const spawnRecording = (calls: SpawnSubAgentOptions[], parents: ParentRunHandle[]) =>
+    mock(async (parent: ParentRunHandle, opts: SpawnSubAgentOptions) => {
+      calls.push(opts);
+      parents.push(parent);
+      return {
+        finalMessage: "ok",
+        transcript: [],
+        toolCalls: [],
+        usage: { input_tokens: 0, output_tokens: 0 },
+      } satisfies SubAgentResult;
+    }) as SpawnSubAgentFn;
+
+  const PROFILED: SubAgentDefinition = {
+    name: "helper",
+    description: "h",
+    instructions: "i",
+    tools: [],
+    model: "claude-sonnet-4-6",
+    allowedProfiles: [
+      { profile: "fast", model: "claude-haiku-4-5" },
+      { profile: "strong", model: "claude-opus-4-8" },
+    ],
+  };
+
+  test("Task({profile: 'not-allowed'}) REJECTS (is_error through tool-executor) before spawning, naming the allowlist", async () => {
+    const root = newTempDir();
+    try {
+      const calls: SpawnSubAgentOptions[] = [];
+      const { bridge, close } = await makeBridge(root, spawnRecording(calls, []), []);
+      const tool = createTaskTool({ subAgents: new Map([["helper", PROFILED]]) });
+      await expect(
+        tool.execute(
+          { description: "d", prompt: "p", subagent_type: "helper", profile: "not-allowed" },
+          { bridge },
+        ),
+      ).rejects.toThrow(
+        /profile "not-allowed" is not allowed for sub-agent "helper" — allowed: fast, strong/,
+      );
+      expect(calls).toHaveLength(0);
+      await close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an allowed profile is threaded to the spawner verbatim", async () => {
+    const root = newTempDir();
+    try {
+      const calls: SpawnSubAgentOptions[] = [];
+      const { bridge, close } = await makeBridge(root, spawnRecording(calls, []), []);
+      const tool = createTaskTool({ subAgents: new Map([["helper", PROFILED]]) });
+      await tool.execute(
+        { description: "d", prompt: "p", subagent_type: "helper", profile: "strong" },
+        { bridge },
+      );
+      expect(calls[0]?.profile).toBe("strong");
+      // No profile → nothing threaded (the spawner's default plan).
+      await tool.execute({ description: "d", prompt: "p", subagent_type: "helper" }, { bridge });
+      expect("profile" in (calls[1] ?? {})).toBe(false);
+      await close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("without an allowlist the argument may only restate the child's own model (else the parent's)", async () => {
+    const root = newTempDir();
+    try {
+      const calls: SpawnSubAgentOptions[] = [];
+      const { bridge, close } = await makeBridge(root, spawnRecording(calls, []), []);
+      const own: SubAgentDefinition = {
+        ...PROFILED,
+        model: "claude-sonnet-4-6",
+        allowedProfiles: undefined,
+      };
+      const tool = createTaskTool({
+        subAgents: new Map([
+          ["helper", own],
+          ["bare", { ...own, model: undefined, name: "bare" }],
+        ]),
+      });
+      await tool.execute(
+        { description: "d", prompt: "p", subagent_type: "helper", profile: "claude-sonnet-4-6" },
+        { bridge },
+      );
+      expect(calls).toHaveLength(1);
+      await expect(
+        tool.execute(
+          { description: "d", prompt: "p", subagent_type: "helper", profile: "claude-haiku-4-5" },
+          { bridge },
+        ),
+      ).rejects.toThrow(/allowed: claude-sonnet-4-6/);
+      // A model-less child runs on the parent's model — the one restatable name.
+      await tool.execute(
+        { description: "d", prompt: "p", subagent_type: "bare", profile: "test-model" },
+        { bridge },
+      );
+      expect(calls).toHaveLength(2);
+      await close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the description advertises `profile` only when some definition declares an allowlist", () => {
+    const plain = createTaskTool({
+      subAgents: new Map([["helper", { ...PROFILED, allowedProfiles: undefined }]]),
+    });
+    expect(plain.description).not.toContain("profile");
+    const profiled = createTaskTool({ subAgents: new Map([["helper", PROFILED]]) });
+    expect(profiled.description).toContain("Pass `profile`");
+    expect(profiled.description).toContain("helper: fast/strong");
+    // The input schema always carries it (a rejected value is the guard).
+    expect(taskInputHasProfile(profiled)).toBe(true);
+  });
+
+  test("the spawner receives the ONE shared projection: the bridge's routing rides along, tool-only fields do not", async () => {
+    const root = newTempDir();
+    try {
+      const parents: ParentRunHandle[] = [];
+      const { bridge, close } = await makeBridge(root, spawnRecording([], parents), []);
+      const routing = {
+        served: { model: "m", wireModelId: "m", armId: "m", fromPool: false },
+        budgetUsdMicros: 10,
+      } as const;
+      const routed: RuntimeBridge = { ...bridge, routing, askMode: "pause" };
+      const tool = createTaskTool({ subAgents: new Map([["helper", PROFILED]]) });
+      await tool.execute(
+        { description: "d", prompt: "p", subagent_type: "helper" },
+        { bridge: routed },
+      );
+      const parent = parents[0];
+      if (parent === undefined) throw new Error("unreachable");
+      expect(parent.routing).toBe(routing);
+      expect(parent.askMode).toBe("pause");
+      expect(parent.model).toBe("test-model");
+      expect("spawnSubAgent" in parent).toBe(false);
+      expect("hooks" in parent).toBe(false);
+      await close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+/** True when the tool's model-facing input schema (zod) declares `profile`. */
+function taskInputHasProfile(tool: RegisteredTool): boolean {
+  const shape = (tool.inputSchema as unknown as { shape?: Record<string, unknown> }).shape;
+  return shape !== undefined && "profile" in shape;
+}
+
+describe("parseSubAgentFile — the 0.6.0 routing keys (frontmatter mirror)", () => {
+  test("routing quartet, params, budget_share, inherit_routing and resolved allowed_profiles map onto the runtime definition", () => {
+    const def = parseSubAgentFile(`---
+name: router
+description: routes itself
+model: claude-sonnet-4-6
+thinking: { effort: low }
+max_tokens: 2048
+model_fallbacks: [claude-haiku-4-5]
+circuit_breaker: { failureThreshold: 2 }
+model_pool:
+  candidates:
+    - { model: claude-haiku-4-5, tags: [cheap], tools: [] }
+    - { model: claude-opus-4-8, tags: [strong] }
+  policy: heuristic
+budget_share: 0.25
+inherit_routing: true
+allowed_profiles:
+  - { profile: fast, model: claude-haiku-4-5, temperature: 0.2 }
+  - { profile: strong, model: claude-opus-4-8, thinking: { budget_tokens: 4096 }, max_tokens: 8192 }
+---
+Route wisely.`);
+    expect(def.thinking).toEqual({ effort: "low" });
+    expect(def.maxTokens).toBe(2048);
+    expect(def.modelFallbacks).toEqual(["claude-haiku-4-5"]);
+    expect(def.circuitBreaker).toEqual({ failureThreshold: 2 });
+    expect(def.modelPool?.policy).toBe("heuristic");
+    expect(def.modelPool?.candidates[0]).toEqual({
+      model: "claude-haiku-4-5",
+      tags: ["cheap"],
+      tools: [],
+    });
+    expect(def.budgetShare).toBe(0.25);
+    expect(def.inheritRouting).toBe(true);
+    expect(def.allowedProfiles).toEqual([
+      { profile: "fast", model: "claude-haiku-4-5", temperature: 0.2 },
+      {
+        profile: "strong",
+        model: "claude-opus-4-8",
+        thinking: { budgetTokens: 4096 },
+        maxTokens: 8192,
+      },
+    ]);
+    // A file declaring none of them yields none of them (no undefined keys).
+    const legacy = parseSubAgentFile("---\nname: a\ndescription: b\n---\nbody");
+    expect(Object.keys(legacy).sort()).toEqual(["description", "instructions", "name"]);
+  });
+
+  test("malformed routing keys are rejected with the offending path", () => {
+    expect(() =>
+      parseSubAgentFile("---\nname: a\ndescription: b\nbudget_share: 2\n---\nbody"),
+    ).toThrow(/budget_share/);
+    expect(() =>
+      parseSubAgentFile("---\nname: a\ndescription: b\nthinking: { effort: extreme }\n---\nbody"),
+    ).toThrow(/thinking/);
+    expect(() =>
+      parseSubAgentFile(
+        "---\nname: a\ndescription: b\nallowed_profiles: [{ profile: fast }]\n---\nbody",
+      ),
+    ).toThrow(/allowed_profiles/);
+  });
+});

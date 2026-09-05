@@ -1,11 +1,14 @@
 /**
  * Catalog R4 `tool-task` — Section 13.
  *
- * The `Task(description, prompt, subagent_type?)` tool. When invoked, it
- * resolves the named sub-agent definition, builds the child's tool catalog,
- * resolves child permissions, and dispatches `bridge.spawnSubAgent`.
- * Returns the child's final assistant text as the tool result so the parent
- * model can react to the child's verdict.
+ * The `Task(description, prompt, subagent_type?, profile?)` tool. When
+ * invoked, it resolves the named sub-agent definition, builds the child's tool
+ * catalog, resolves child permissions, validates the optional `profile`
+ * against the definition's allowlist (0.6.0 §7.7 — a model-filled model
+ * argument that can never name a model outside the spec), and dispatches
+ * `bridge.spawnSubAgent` with the ONE shared `projectParentHandle(bridge)`
+ * projection. Returns the child's final assistant text as the tool result so
+ * the parent model can react to the child's verdict.
  *
  * Resolution order for `subagent_type`:
  *   1. `opts.subAgents.get(name)` — inline spec map (codegen-supplied).
@@ -37,10 +40,13 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type {
-  RuntimeBridge,
-  SubAgentDefinition,
-  SubAgentFailure,
+import {
+  type RuntimeBridge,
+  type SubAgentDefinition,
+  type SubAgentFailure,
+  type SubAgentProfileOption,
+  projectParentHandle,
+  subAgentProfileAllowlist,
 } from "@crewhaus/agent-context-isolation";
 import { CrewhausError } from "@crewhaus/errors";
 import { resolveChildPermissions } from "@crewhaus/sub-agent-permission-inheritance";
@@ -100,10 +106,55 @@ const taskInputSchema = z.object({
     .describe(
       "Name of the sub-agent definition to spawn. Falls back to 'general-purpose' if omitted.",
     ),
+  // 0.6.0 §7.7 — a model-filled MODEL argument. Validated in `execute` against
+  // the definition's allowlist (`allowed_profiles`, else the child's own
+  // model/profile) — never resolved, never passed through: it can only ever
+  // name a model the spec already declared for that child (§10.1).
+  profile: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Model profile to run the sub-agent on. Must be one of the sub-agent's allowed profiles; omit to use its default model.",
+    ),
 });
 
 export type TaskInput = z.infer<typeof taskInputSchema>;
 
+/** Frontmatter mirror of a `thinking` block (spec grammar: exactly one of the two). */
+const FRONTMATTER_THINKING = z.union([
+  z.object({ budget_tokens: z.number().int().min(1024) }).strict(),
+  z.object({ effort: z.enum(["low", "medium", "high"]) }).strict(),
+]);
+const FRONTMATTER_CIRCUIT_BREAKER = z
+  .object({
+    failureThreshold: z.number().int().positive().optional(),
+    windowMs: z.number().int().positive().optional(),
+    cooldownMs: z.number().int().positive().optional(),
+  })
+  .strict();
+const FRONTMATTER_TIER_ROUTING = z
+  .object({
+    contextTokenThreshold: z.number().int().positive().optional(),
+    toolsToDefault: z.boolean().optional(),
+    firstTurnToDefault: z.boolean().optional(),
+    priorToolDensityThreshold: z.number().nonnegative().optional(),
+  })
+  .strict();
+
+/**
+ * On-disk `<name>.md` frontmatter. Mirrors the spec's `sub_agents.<n>` keys
+ * (0.6.0 §7.7 adds the routing quartet, the params, `budget_share`,
+ * `inherit_routing` and `allowed_profiles`). Two honest differences from the
+ * spec form, because a file on disk has no `models:` registry to resolve
+ * against: `model` and every candidate are plain model strings (no `$ref`),
+ * and `allowed_profiles` entries name their model explicitly —
+ * `{ profile, model, thinking?, max_tokens?, temperature?, model_fallbacks?,
+ * circuit_breaker? }` — the already-resolved shape the compiler produces for a
+ * spec-declared sub-agent. `model_pool` is validated for its routing identity
+ * (`candidates[].{model, tags}`, `policy`) and otherwise passed through: the
+ * runtime owns the per-candidate settings grammar.
+ */
 const FRONTMATTER_SCHEMA = z.object({
   name: z.string().min(1),
   description: z.string().min(1),
@@ -116,7 +167,58 @@ const FRONTMATTER_SCHEMA = z.object({
     ])
     .optional(),
   inherit_bypass: z.boolean().optional(),
+  thinking: FRONTMATTER_THINKING.optional(),
+  max_tokens: z.number().int().positive().optional(),
+  temperature: z.number().min(0).max(2).optional(),
+  model_fallbacks: z.array(z.string().min(1)).min(1).optional(),
+  circuit_breaker: FRONTMATTER_CIRCUIT_BREAKER.optional(),
+  model_tiers: z
+    .object({
+      fast: z.string().min(1),
+      default: z.string().min(1),
+      routing: FRONTMATTER_TIER_ROUTING.optional(),
+    })
+    .strict()
+    .optional(),
+  model_pool: z
+    .object({
+      candidates: z
+        .array(
+          z.object({ model: z.string().min(1), tags: z.array(z.string().min(1)) }).passthrough(),
+        )
+        .min(1),
+      policy: z.enum(["static", "heuristic", "learned", "classifier"]).optional(),
+    })
+    .passthrough()
+    .optional(),
+  budget_share: z.number().gt(0).max(1).optional(),
+  inherit_routing: z.boolean().optional(),
+  allowed_profiles: z
+    .array(
+      z
+        .object({
+          profile: z.string().min(1),
+          model: z.string().min(1),
+          thinking: FRONTMATTER_THINKING.optional(),
+          max_tokens: z.number().int().positive().optional(),
+          temperature: z.number().min(0).max(2).optional(),
+          model_fallbacks: z.array(z.string().min(1)).min(1).optional(),
+          circuit_breaker: FRONTMATTER_CIRCUIT_BREAKER.optional(),
+        })
+        .strict(),
+    )
+    .min(1)
+    .optional(),
 });
+
+type FrontmatterThinking = z.infer<typeof FRONTMATTER_THINKING>;
+
+/** Spec-spelled thinking block → the runtime `IrThinking` shape. */
+function thinkingFromFrontmatter(
+  t: FrontmatterThinking,
+): NonNullable<SubAgentDefinition["thinking"]> {
+  return "budget_tokens" in t ? { budgetTokens: t.budget_tokens } : { effort: t.effort };
+}
 
 /**
  * Parse a `<dir>/<name>.md` sub-agent file. Same shape as SKILL.md: a
@@ -166,6 +268,44 @@ export function parseSubAgentFile(content: string, fallbackName?: string): SubAg
     ...(parsed.data.permissions !== undefined ? { permissions: parsed.data.permissions } : {}),
     ...(parsed.data.inherit_bypass !== undefined
       ? { inherit_bypass: parsed.data.inherit_bypass }
+      : {}),
+    // 0.6.0 §7.7 — routing + params, spelled as the runtime definition holds
+    // them (the IR's names). Every key is copied only when present.
+    ...(parsed.data.thinking !== undefined
+      ? { thinking: thinkingFromFrontmatter(parsed.data.thinking) }
+      : {}),
+    ...(parsed.data.max_tokens !== undefined ? { maxTokens: parsed.data.max_tokens } : {}),
+    ...(parsed.data.temperature !== undefined ? { temperature: parsed.data.temperature } : {}),
+    ...(parsed.data.model_fallbacks !== undefined
+      ? { modelFallbacks: parsed.data.model_fallbacks }
+      : {}),
+    ...(parsed.data.circuit_breaker !== undefined
+      ? { circuitBreaker: parsed.data.circuit_breaker }
+      : {}),
+    ...(parsed.data.model_tiers !== undefined ? { modelTiers: parsed.data.model_tiers } : {}),
+    ...(parsed.data.model_pool !== undefined
+      ? { modelPool: parsed.data.model_pool as NonNullable<SubAgentDefinition["modelPool"]> }
+      : {}),
+    ...(parsed.data.budget_share !== undefined ? { budgetShare: parsed.data.budget_share } : {}),
+    ...(parsed.data.inherit_routing !== undefined
+      ? { inheritRouting: parsed.data.inherit_routing }
+      : {}),
+    ...(parsed.data.allowed_profiles !== undefined
+      ? {
+          allowedProfiles: parsed.data.allowed_profiles.map(
+            (o): SubAgentProfileOption => ({
+              profile: o.profile,
+              model: o.model,
+              ...(o.thinking !== undefined
+                ? { thinking: thinkingFromFrontmatter(o.thinking) }
+                : {}),
+              ...(o.max_tokens !== undefined ? { maxTokens: o.max_tokens } : {}),
+              ...(o.temperature !== undefined ? { temperature: o.temperature } : {}),
+              ...(o.model_fallbacks !== undefined ? { modelFallbacks: o.model_fallbacks } : {}),
+              ...(o.circuit_breaker !== undefined ? { circuitBreaker: o.circuit_breaker } : {}),
+            }),
+          ),
+        }
       : {}),
   };
   return def;
@@ -253,10 +393,24 @@ function buildChildCatalog(
 
 export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool {
   const knownNames = opts.subAgents !== undefined ? [...opts.subAgents.keys()] : [];
+  // 0.6.0 §7.7 — advertise the `profile` argument only when some definition
+  // declares an allowlist, so a spec without `allowed_profiles` keeps the
+  // exact description it had (the tool list sits in the cached prefix).
+  const profileNote =
+    opts.subAgents !== undefined &&
+    [...opts.subAgents.values()].some((d) => d.allowedProfiles !== undefined)
+      ? ` Pass \`profile\` to run a sub-agent on one of its allowed model profiles (${[
+          ...opts.subAgents.values(),
+        ]
+          .filter((d) => d.allowedProfiles !== undefined)
+          .map((d) => `${d.name}: ${(d.allowedProfiles ?? []).map((o) => o.profile).join("/")}`)
+          .join("; ")}).`
+      : "";
   const description =
-    knownNames.length === 0
+    (knownNames.length === 0
       ? "Spawn a sub-agent to handle a delegated task. Pass a `description` (label) and a `prompt` (the task instructions). The sub-agent runs in an isolated context and returns a single final message."
-      : `Spawn a sub-agent to handle a delegated task. Pass a \`description\` (label), a \`prompt\` (the task instructions), and optionally a \`subagent_type\` to pick a specialist. Available subagent_type values: ${knownNames.join(", ")}. The sub-agent runs in an isolated context and returns a single final message.`;
+      : `Spawn a sub-agent to handle a delegated task. Pass a \`description\` (label), a \`prompt\` (the task instructions), and optionally a \`subagent_type\` to pick a specialist. Available subagent_type values: ${knownNames.join(", ")}. The sub-agent runs in an isolated context and returns a single final message.`) +
+    profileNote;
 
   return buildTool({
     name: "Task",
@@ -308,39 +462,32 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
         return `[Task error] ${(err as Error).message}`;
       }
 
+      // 0.6.0 §7.7 / §10.1 — the model-filled `profile` argument is checked
+      // against the definition's allowlist BEFORE anything is spawned. Thrown
+      // (not returned) so tool-executor renders it `is_error: true`: the
+      // parent model sees a refusal, not a result to build on.
+      if (input.profile !== undefined) {
+        const allowed = subAgentProfileAllowlist(def, bridge.model);
+        if (!allowed.includes(input.profile)) {
+          throw new SubAgentResolutionError(
+            `profile "${input.profile}" is not allowed for sub-agent "${def.name}" — allowed: ${allowed.join(", ")}`,
+          );
+        }
+      }
+
       const childTools = buildChildCatalog(bridge.tools, def);
       const childPerms = resolveChildPermissions(
         { mode: bridge.permissionMode, rules: bridge.permissionRules },
         def,
       );
 
-      const parentHandle = {
-        runContext: bridge.runContext,
-        eventLog: bridge.eventLog,
-        permissionMode: bridge.permissionMode,
-        permissionRules: bridge.permissionRules,
-        tools: bridge.tools,
-        model: bridge.model,
-        maxTokens: bridge.maxTokens,
-        ...(bridge.sessionRootDir !== undefined ? { sessionRootDir: bridge.sessionRootDir } : {}),
-        // v0.3.0 §7.1 — the four child seams, projected by runtime-core onto
-        // the bridge (recall-only memory, skills list, failure taxonomy,
-        // read-only continuity) and handed to the spawner verbatim.
-        ...(bridge.memory !== undefined ? { memory: bridge.memory } : {}),
-        ...(bridge.skills !== undefined ? { skills: bridge.skills } : {}),
-        ...(bridge.failureTaxonomy !== undefined
-          ? { failureTaxonomy: bridge.failureTaxonomy }
-          : {}),
-        ...(bridge.continuity !== undefined ? { continuity: bridge.continuity } : {}),
-        // Loop contract 0.4 (G11) — the parent's ask_mode + approval seam, so
-        // a child's headless `ask` parks against the same store instead of
-        // collapsing to a denial. THIS projection is the mechanism of the bug
-        // it fixes: `RuntimeBridge` extends `ParentRunHandle`, but the handle
-        // is hand-copied field by field and every seam field is optional — an
-        // omission type-checks perfectly and drops the capability silently.
-        ...(bridge.askMode !== undefined ? { askMode: bridge.askMode } : {}),
-        ...(bridge.approvals !== undefined ? { approvals: bridge.approvals } : {}),
-      };
+      // 0.6.0 §10.2 — ONE shared projection replaces the field-by-field hand
+      // copy this tool carried (and whose optional-seam omissions were the
+      // mechanism of the G11 approval bug): `projectParentHandle` lives beside
+      // `ParentRunHandle`, so a new handle field lands in the projection in
+      // the same file. The routing projection (served arm, budget cap) rides
+      // along for `inherit_routing` / `budget_share`.
+      const parentHandle = projectParentHandle(bridge);
 
       // A fatal child failure (billing/auth) makes `spawnSubAgent` throw
       // `RunFailedError`; it propagates through here and through
@@ -353,6 +500,7 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
         permissionRules: childPerms.rules,
         childTools,
         ...(bridge.sessionRootDir !== undefined ? { sessionRootDir: bridge.sessionRootDir } : {}),
+        ...(input.profile !== undefined ? { profile: input.profile } : {}),
       });
 
       if (result.failure !== undefined) {

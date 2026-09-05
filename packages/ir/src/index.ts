@@ -106,9 +106,36 @@ export type IrSubAgentDefinition = {
   /** 0.6.0 §7.7 — inherit the parent's SERVED arm instead of the declared
    *  primary (default false keeps today's declared-primary behaviour). */
   readonly inheritRouting?: boolean;
-  /** 0.6.0 §7.7 — profile names (no `$`) the Task tool's `profile` argument
-   *  may name for this child. */
-  readonly allowedProfiles?: readonly string[];
+  /**
+   * 0.6.0 §7.7 — the `models:` profiles the Task tool's `profile` argument
+   * may name for this child, each RESOLVED at lower time to the model and
+   * request params the child runs on when that profile is chosen (the same
+   * expansion a `model: $<profile>` slot gets). Resolving here — not at
+   * runtime — is what keeps the registry provenance-only downstream of the
+   * compiler: nothing at runtime ever sees a `$` or looks a profile up.
+   */
+  readonly allowedProfiles?: readonly IrSubAgentProfileOption[];
+};
+
+/**
+ * 0.6.0 §7.7 — one entry of {@link IrSubAgentDefinition.allowedProfiles}: the
+ * profile NAME (the allowlist the model-filled Task `profile` argument is
+ * checked against — it can never name a model outside the spec) plus the
+ * profile's resolved serving slot. When the Task call pins this profile the
+ * child runs single-model on `model` with these params and this failover
+ * chain; its own `model_pool` / `model_tiers` do not route that call. The
+ * profile's `instructions` overlay is carried so the spawner can fold it into
+ * the child's prompt for that call only.
+ */
+export type IrSubAgentProfileOption = {
+  readonly profile: string;
+  readonly model: string;
+  readonly thinking?: IrThinking;
+  readonly maxTokens?: number;
+  readonly temperature?: number;
+  readonly overlay?: string;
+  readonly modelFallbacks?: readonly string[];
+  readonly circuitBreaker?: IrCircuitBreaker;
 };
 
 /**

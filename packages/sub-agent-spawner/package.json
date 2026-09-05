@@ -16,12 +16,14 @@
     "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/agent-context-isolation": "workspace:*",
     "@crewhaus/boundary-classifier": "workspace:*",
+    "@crewhaus/cost-tracker": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/event-log": "workspace:*",
     "@crewhaus/federation-router": "workspace:*",
     "@crewhaus/recovery-engine": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
-    "@crewhaus/runtime-core": "workspace:*"
+    "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*"
   },
   "devDependencies": {
     "@crewhaus/federation-discovery": "workspace:*",

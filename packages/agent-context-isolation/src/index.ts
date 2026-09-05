@@ -26,6 +26,14 @@ import { type AbortTree, createAbortTree } from "@crewhaus/abort-controller";
 import type { FailureReport } from "@crewhaus/errors";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
 import type { HookDef } from "@crewhaus/hooks-engine";
+import type {
+  IrCircuitBreaker,
+  IrModelPool,
+  IrModelTiers,
+  IrSubAgentDefinition,
+  IrSubAgentProfileOption,
+  IrThinking,
+} from "@crewhaus/ir";
 import type { PermissionMode, RuleSet } from "@crewhaus/permission-engine";
 import type { NamedFailureClass } from "@crewhaus/recovery-engine";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
@@ -39,6 +47,16 @@ import { TraceEventBus } from "@crewhaus/trace-event-bus";
  * A sub-agent definition. The `name` field is set from the spec map's key at
  * lower-time so consumers always see it on the value. `permissions` defaults
  * to "inherit" when undefined; `inherit_bypass` to false.
+ *
+ * 0.6.0 §7.7 — the definition carries the child's own model routing and
+ * request params, mirroring `IrSubAgentDefinition` field-for-field under the
+ * IR's names (`inherit_bypass` keeps its legacy spelling). The spawner spreads
+ * `modelPool` / `modelTiers` / `modelFallbacks` / `circuitBreaker` /
+ * `thinking` / `maxTokens` / `temperature` into the child `runChatLoop`, so a
+ * child routes and tunes itself exactly as an agent block would. What a child
+ * INHERITS from its parent and what it never does is spelled out on
+ * {@link ParentRoutingProjection}. Every new field is optional: a definition
+ * built by a pre-0.6.0 caller behaves exactly as before.
  */
 export type SubAgentDefinition = {
   readonly name: string;
@@ -51,7 +69,100 @@ export type SubAgentDefinition = {
     | "scoped"
     | { readonly allow: ReadonlyArray<string>; readonly deny: ReadonlyArray<string> };
   readonly inherit_bypass?: boolean;
+  /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
+  readonly modelProfile?: string;
+  /** 0.6.0 §7.7 — the child's own request params. */
+  readonly thinking?: IrThinking;
+  readonly maxTokens?: number;
+  readonly temperature?: number;
+  /** 0.6.0 §7.7 — the child's own routing quartet (spread into its loop). */
+  readonly modelFallbacks?: ReadonlyArray<string>;
+  readonly circuitBreaker?: IrCircuitBreaker;
+  readonly modelTiers?: IrModelTiers;
+  readonly modelPool?: IrModelPool;
+  /**
+   * 0.6.0 §7.7 — fraction (0, 1] of the parent's `budget.usd` this child may
+   * spend: a SUB-CAP under the run cap. The child loop gets its own
+   * `budget: { usdMicros: share × parent cap, onExceed: stop }`, and because
+   * the child's spend is re-published on the parent bus the run cap still
+   * bounds the total. Inert when the parent declares no `budget`.
+   */
+  readonly budgetShare?: number;
+  /**
+   * 0.6.0 §7.7 / §4.4 — `true`: the child runs on the arm the parent's router
+   * SERVED for the turn that spawned it (the parent's `model_route` decision)
+   * instead of the declared primary. Default `false` keeps today's behaviour:
+   * `bridge.model` is the parent's declared `agent.model`.
+   */
+  readonly inheritRouting?: boolean;
+  /**
+   * 0.6.0 §7.7 — the `models:` profiles a Task call's `profile` argument may
+   * name for this child, resolved at lower time (see
+   * {@link SubAgentProfileOption}). Absent ⇒ the argument may only name the
+   * child's own model / profile.
+   */
+  readonly allowedProfiles?: ReadonlyArray<SubAgentProfileOption>;
 };
+
+/**
+ * 0.6.0 §7.7 — one allowed profile for a sub-agent, as the runtime holds it:
+ * structurally the IR's `IrSubAgentProfileOption`. `profile` is the allowlist
+ * entry the model-filled Task `profile` argument is checked against; the rest
+ * is the serving slot the child runs on when that profile is pinned.
+ */
+export type SubAgentProfileOption = IrSubAgentProfileOption;
+
+/**
+ * 0.6.0 §7.7 / §10.1 — the names a Task call's model-filled `profile` argument
+ * may take for `def`: `def.allowed_profiles ?? [def.model]` in the plan's
+ * words. With an allowlist declared, exactly its profile names. Without one,
+ * the child's OWN identity — its `models:` profile name when it resolved from
+ * one, its model string, else the parent's model (what the child runs on when
+ * it declares none) — so the argument can restate the model the spec already
+ * chose but can never name one outside it. Shared by the Task tool (which
+ * validates before spawning) and the spawner (which re-checks fail-closed).
+ */
+export function subAgentProfileAllowlist(
+  def: SubAgentDefinition,
+  parentModel: string,
+): readonly string[] {
+  if (def.allowedProfiles !== undefined) return def.allowedProfiles.map((o) => o.profile);
+  const own: string[] = [];
+  if (def.modelProfile !== undefined) own.push(def.modelProfile);
+  if (def.model !== undefined) own.push(def.model);
+  return own.length > 0 ? own : [parentModel];
+}
+
+/**
+ * 0.6.0 §7.7 — build a runtime {@link SubAgentDefinition} from its lowered IR
+ * form. The single mapping the `crewhaus run` interpreter uses (both its loop
+ * sites) so it stays in parity with the emitted `__subAgents` literal
+ * (`@crewhaus/model-service`'s `renderSubAgentDef`). `federation` is not
+ * carried — the interpreter never spawned federated peers and this keeps that
+ * unchanged; every 0.6.0 key is copied only when present.
+ */
+export function subAgentDefinitionFromIr(d: IrSubAgentDefinition): SubAgentDefinition {
+  return {
+    name: d.name,
+    description: d.description,
+    instructions: d.instructions,
+    tools: d.tools,
+    ...(d.model !== undefined ? { model: d.model } : {}),
+    permissions: d.permissions,
+    inherit_bypass: d.inheritBypass,
+    ...(d.modelProfile !== undefined ? { modelProfile: d.modelProfile } : {}),
+    ...(d.thinking !== undefined ? { thinking: d.thinking } : {}),
+    ...(d.maxTokens !== undefined ? { maxTokens: d.maxTokens } : {}),
+    ...(d.temperature !== undefined ? { temperature: d.temperature } : {}),
+    ...(d.modelFallbacks !== undefined ? { modelFallbacks: d.modelFallbacks } : {}),
+    ...(d.circuitBreaker !== undefined ? { circuitBreaker: d.circuitBreaker } : {}),
+    ...(d.modelTiers !== undefined ? { modelTiers: d.modelTiers } : {}),
+    ...(d.modelPool !== undefined ? { modelPool: d.modelPool } : {}),
+    ...(d.budgetShare !== undefined ? { budgetShare: d.budgetShare } : {}),
+    ...(d.inheritRouting !== undefined ? { inheritRouting: d.inheritRouting } : {}),
+    ...(d.allowedProfiles !== undefined ? { allowedProfiles: d.allowedProfiles } : {}),
+  };
+}
 
 /**
  * Token usage rolled up across a single sub-agent run. Section 13 leaves the
@@ -147,9 +258,16 @@ export type ParentRunHandle = {
   readonly permissionMode: PermissionMode;
   readonly permissionRules: RuleSet;
   readonly tools: ReadonlyArray<RegisteredTool>;
+  /** The parent's DECLARED primary model — unchanged by routing (0.6.0 §4.4). */
   readonly model: string;
   readonly maxTokens: number;
   readonly sessionRootDir?: string;
+  /**
+   * 0.6.0 §4.4 / §10.2 — the parent's routing state as projected for
+   * children. Optional: a handle built by a pre-0.6.0 caller has none, and
+   * every consumer falls back to `model`.
+   */
+  readonly routing?: ParentRoutingProjection;
   readonly memory?: SubAgentMemorySeam;
   readonly skills?: ReadonlyArray<SkillRef>;
   readonly failureTaxonomy?: ReadonlyArray<NamedFailureClass>;
@@ -176,6 +294,55 @@ export type ParentRunHandle = {
 };
 
 /**
+ * 0.6.0 §4.4 — the arm that SERVED the parent's model call whose tool_use
+ * spawned the child: the spec model string (what a child `runChatLoop` takes
+ * as `model`), the wire id, the `models:` profile name when the candidate was
+ * declared under one, the scoreboard arm id, and whether a pool candidate (as
+ * opposed to the run's primary) served. Without a pool it is the primary —
+ * `model === ParentRunHandle.model`.
+ */
+export type ParentServedArm = {
+  readonly model: string;
+  readonly wireModelId: string;
+  readonly profile?: string;
+  readonly armId: string;
+  readonly fromPool: boolean;
+};
+
+/**
+ * 0.6.0 §4.4 / §10.2 — what a child may inherit from its parent's routing,
+ * built ONCE by runtime-core onto the bridge and copied by
+ * {@link projectParentHandle}.
+ *
+ * What a child INHERITS (0.6.0):
+ *   - the parent's SERVED arm as its primary model — only when its definition
+ *     sets `inheritRouting: true` (`served`); otherwise `ParentRunHandle.model`,
+ *     the declared primary, exactly as before;
+ *   - a share of the parent's run cap — only when its definition sets
+ *     `budgetShare` (`budgetUsdMicros` × share becomes the child's own cap);
+ *   - unchanged from 0.5.x: the (narrowed) permission rule set, the (filtered)
+ *     tool catalog, `maxTokens` when the child declares none, the recall-only
+ *     memory seam, skills, the failure taxonomy, the read-only continuity seam,
+ *     `askMode` and the approval store, and `sessionRootDir`.
+ *
+ * What a child NEVER inherits: the parent's `model_pool` / `model_tiers` /
+ * `model_fallbacks` / `circuit_breaker` (a child routes only through the
+ * quartet on its OWN definition — `inheritRouting` pins the served arm's
+ * model, it does not hand the child the parent's router); the parent's
+ * `thinking` / `temperature`; the parent's per-candidate overlay, tool
+ * subset or rate buckets beyond what the bridge's catalog and rules already
+ * encode; the parent's `evaluation:` grader; the parent's whole budget (a
+ * child without `budgetShare` runs uncapped on its own bus, while its spend
+ * still counts against the parent's cap through the re-published
+ * `cost_accrual{role: "subagent", summary: true}`).
+ */
+export type ParentRoutingProjection = {
+  readonly served: ParentServedArm;
+  /** The parent's `budget.usd` in micro-USD, when the parent declares a cap. */
+  readonly budgetUsdMicros?: number;
+};
+
+/**
  * Spawner factory signature. Implemented by `@crewhaus/sub-agent-spawner`;
  * runtime-core injects an instance into the bridge so the Task tool can
  * spawn without runtime-core importing the spawner (which would cycle —
@@ -193,6 +360,13 @@ export type SpawnSubAgentOptions = {
   readonly permissionRules: RuleSet;
   readonly childTools: ReadonlyArray<RegisteredTool>;
   readonly sessionRootDir?: string;
+  /**
+   * 0.6.0 §7.7 — the Task call's `profile` argument, ALREADY validated by the
+   * Task tool against `def.allowedProfiles` (else the child's own model /
+   * profile). The spawner re-checks it fail-closed and runs the child on the
+   * named option; recorded on `sub_agent_start` / `sub_agent_end`.
+   */
+  readonly profile?: string;
   /**
    * Test-only escape hatch: an Anthropic SDK client to use for the child
    * `runChatLoop` instead of the env-resolved one. Production callers leave
@@ -267,6 +441,39 @@ export type RuntimeBridge = ParentRunHandle & {
    */
   readonly runState?: Store<Record<string, unknown>>;
 };
+
+/**
+ * 0.6.0 §10.2 — the ONE projection of a {@link RuntimeBridge} onto the
+ * {@link ParentRunHandle} the spawner takes. `RuntimeBridge` extends the
+ * handle, but the Task tool used to hand-copy the handle field by field, and
+ * every seam field is optional — an omission type-checked perfectly and
+ * dropped the capability silently (the G11 approval-seam bug was exactly that).
+ * Building the handle here, next to the type, means a field added to
+ * `ParentRunHandle` is added to the projection in the same file, and the
+ * tool-only fields (`hooks`, `subAgents`, `spawnSubAgent`, `crewMailbox`,
+ * `runState`) never leak into a child. Every optional field is copied only
+ * when present, so a handle from a minimal bridge has the same key set the
+ * hand copy produced.
+ */
+export function projectParentHandle(bridge: RuntimeBridge): ParentRunHandle {
+  return {
+    runContext: bridge.runContext,
+    eventLog: bridge.eventLog,
+    permissionMode: bridge.permissionMode,
+    permissionRules: bridge.permissionRules,
+    tools: bridge.tools,
+    model: bridge.model,
+    maxTokens: bridge.maxTokens,
+    ...(bridge.sessionRootDir !== undefined ? { sessionRootDir: bridge.sessionRootDir } : {}),
+    ...(bridge.routing !== undefined ? { routing: bridge.routing } : {}),
+    ...(bridge.memory !== undefined ? { memory: bridge.memory } : {}),
+    ...(bridge.skills !== undefined ? { skills: bridge.skills } : {}),
+    ...(bridge.failureTaxonomy !== undefined ? { failureTaxonomy: bridge.failureTaxonomy } : {}),
+    ...(bridge.continuity !== undefined ? { continuity: bridge.continuity } : {}),
+    ...(bridge.askMode !== undefined ? { askMode: bridge.askMode } : {}),
+    ...(bridge.approvals !== undefined ? { approvals: bridge.approvals } : {}),
+  };
+}
 
 /**
  * Per-child resources owned for the duration of one sub-agent run. The

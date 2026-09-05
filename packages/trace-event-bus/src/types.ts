@@ -559,11 +559,17 @@ export type CostAccrualEvent = TraceEventEnvelope &
      * terminal accrual at the end of a budget-gated `crewhaus optimize` run so
      * the spend summary (total $ + token totals) lands on the trace bus, not
      * only on the result/report.json. Its token/cost fields are the sums over
-     * the run's per-call accruals. Subscribers that aggregate per-call spend
-     * (`cost-tracker`) ignore externally-published `cost_accrual` events
-     * entirely — they only sum the ones they emit from `model_response` — so a
-     * terminal total never double-counts. Absent (falsy) on ordinary per-call
+     * the run's per-call accruals. Absent (falsy) on ordinary per-call
      * accruals, including every `cost-tracker`-emitted one.
+     *
+     * 0.6.0 (design §7.6, §10.2) — a `summary: true` accrual that ALSO carries
+     * a `role` is a NESTED run's roll-up re-published on this bus: a sub-agent
+     * child's `role: "subagent"` total (`@crewhaus/sub-agent-spawner`), a
+     * hybrid side call's total. Its `model_response` events happened on a
+     * child bus this bus never saw, so `cost-tracker` FOLDS it (that is how a
+     * parent's `budget` counts a child's spend) while still ignoring the
+     * role-less optimizer total, which sums per-call accruals the tracker
+     * already folded. The two are told apart by `role` alone.
      */
     summary?: boolean;
   };
