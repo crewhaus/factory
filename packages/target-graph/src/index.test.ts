@@ -1300,10 +1300,31 @@ describe("emitGraph — per-node model routing (0.6.0 §7.7)", () => {
           },
         }),
       ).files[0]?.content ?? "";
+    // 0.6.0 PR 9a — the pooled node's blob carries `scope: <node name>` when
+    // the spec pinned none (the runtime twin of the crew orchestrator's
+    // `scopeRolePool`); a declared scope rides verbatim instead.
     expect(c).toContain(
-      'modelPool: {"candidates":[{"model":"claude-haiku-4-5","tags":["cheap"]},{"model":"claude-opus-4-8","tags":["strong"]}],"policy":"heuristic"},',
+      'modelPool: {"candidates":[{"model":"claude-haiku-4-5","tags":["cheap"]},{"model":"claude-opus-4-8","tags":["strong"]}],"policy":"heuristic","scope":"plan"},',
     );
     expect((c.match(/modelPool:/g) ?? []).length).toBe(1);
+    const declared =
+      emitGraph(
+        routed({
+          modelPool: {
+            candidates: [{ model: "claude-haiku-4-5", tags: ["cheap"] }],
+            policy: "static",
+            scope: "planner-arms",
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(declared).toContain('"policy":"static","scope":"planner-arms"},');
+    expect(declared).not.toContain('"scope":"plan"');
+  });
+
+  test("0.6.0 PR 9a — a node-level temperature renders beside the node loop fields", () => {
+    const c = emitGraph(routed({ temperature: 0.1 })).files[0]?.content ?? "";
+    expect(c).toContain("\n        temperature: 0.1,");
+    expect((c.match(/temperature:/g) ?? []).length).toBe(1);
   });
 
   test("model_fallbacks + circuit_breaker and model_tiers emit onto the node call", () => {

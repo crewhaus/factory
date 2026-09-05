@@ -52,3 +52,17 @@ via `./src/index.ts` (the workspace source, not a published
 `@crewhaus/compiler`), write each bundle file to `<key>.<file>.txt`
 (non-`[A-Za-z0-9_.-]` path characters replaced by `_`), and append a delta
 note here saying what moved and why.
+
+## 0.6.0 PR 9a delta — `scope` stamped on pooled workflow steps and graph nodes
+
+`workflow-steps.agent.ts.txt` and `graph-nodes.agent.ts.txt` were regenerated
+on the PR 9a tree: a pooled step's / node's `modelPool` literal now carries
+`"scope":"<step or node name>"` when the spec pinned no `scope` (one line per
+pooled step / node; every other byte is unchanged, and un-pooled steps and
+nodes stay byte-identical). This is the emit-side twin of the crew
+orchestrator's `scopeRolePool` (PR 7b) — `@crewhaus/model-service`'s
+`scopedModelWiringFragment` — stamped where the loop options are assembled
+because the compiler deliberately leaves the IR blob unstamped (plan §7.9).
+runtime-core stamps the value on `model_route.scope`, and the routing store
+keys arms by it from PR 10 on. A declared `scope` always wins (the crew and
+cli fixtures are untouched).

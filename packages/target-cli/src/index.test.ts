@@ -938,6 +938,20 @@ describe("emitCli — agent.thinking (loop contract 0.4, Batch A)", () => {
   });
 });
 
+describe("emitCli — agent.temperature (0.6.0 §4.1, PR 9a)", () => {
+  test("emits the sampling temperature beside thinking; omitted when unset", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: { model: "claude-sonnet-4-6", instructions: "be helpful", temperature: 0.2 },
+        }),
+      ).files[0]?.content ?? "";
+    // The interactive call sits inside the generated try block (four-space indent).
+    expect(content).toContain("\n    temperature: 0.2,");
+    expect(emitCli(baseIr()).files[0]?.content ?? "").not.toContain("temperature:");
+  });
+});
+
 describe("emitCli — agent.streaming (loop contract 0.4, Batch A)", () => {
   test("emits streaming: true when declared", () => {
     const content =

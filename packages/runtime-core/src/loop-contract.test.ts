@@ -640,6 +640,90 @@ describe("G17 — per-tool rate limits (rateLimits option)", () => {
 // G01 — extended thinking on main-turn requests.
 // ---------------------------------------------------------------------------
 
+/**
+ * 0.6.0 §4.4 (PR 9a) — the G01 pins rewritten PER CANDIDATE: under a
+ * `model_pool`, the thinking fields and the thinking-aware ceiling are the
+ * SERVING candidate's plan, not the run's boot constants. A candidate that
+ * pins nothing inherits the run's `thinking`; one that pins its own
+ * `thinking` / `maxTokens` gets its own budget, effort and lifted ceiling.
+ * `policy: "static"` always serves the first declared candidate.
+ */
+describe("G01 per candidate — the serving plan's thinking lands on the request (0.6.0 §4.4)", () => {
+  const OPUS = "claude-opus-4-8";
+  const HAIKU = "claude-haiku-4-5";
+  function pooled(
+    first: {
+      model: string;
+      thinking?: { effort: "low" | "medium" | "high" } | { budgetTokens: number };
+      maxTokens?: number;
+    },
+    runThinking?: { effort: "low" | "medium" | "high" },
+  ) {
+    const served = scriptedAdapter([[text("ok")]]);
+    const other = scriptedAdapter([[text("other")]]);
+    return {
+      served,
+      run: () =>
+        runSingleTurnCollecting({
+          _adapter: scriptedAdapter([[text("primary")]]).adapter,
+          modelPool: {
+            candidates: [
+              {
+                model: first.model,
+                tags: ["a"],
+                ...(first.thinking !== undefined ? { thinking: first.thinking } : {}),
+                ...(first.maxTokens !== undefined ? { maxTokens: first.maxTokens } : {}),
+              },
+              { model: first.model === OPUS ? HAIKU : OPUS, tags: ["b"] },
+            ],
+            policy: "static",
+          },
+          _poolAdapters: new Map([
+            [first.model, served.adapter],
+            [first.model === OPUS ? HAIKU : OPUS, other.adapter],
+          ]),
+          settingsDir: null,
+          ...(runThinking !== undefined ? { thinking: runThinking } : {}),
+        }),
+    };
+  }
+
+  test("a bare candidate inherits the run's thinking and the run's lifted ceiling", async () => {
+    const { served, run } = pooled({ model: HAIKU }, { effort: "high" });
+    const { caught } = await run();
+    expect(caught).toBeUndefined();
+    expect(served.reqs[0]?.thinking).toEqual({ type: "enabled", budgetTokens: 24576 });
+    expect(served.reqs[0]?.reasoningEffort).toBe("high");
+    expect(served.reqs[0]?.maxTokens).toBe(24576 + 8192);
+  });
+
+  test("a candidate pinning its own effort + max_tokens serves on ITS plan, not the run's", async () => {
+    const { served, run } = pooled(
+      { model: HAIKU, thinking: { effort: "low" }, maxTokens: 4096 },
+      { effort: "high" },
+    );
+    const { caught } = await run();
+    expect(caught).toBeUndefined();
+    expect(served.reqs[0]?.thinking).toEqual({ type: "enabled", budgetTokens: 2048 });
+    expect(served.reqs[0]?.reasoningEffort).toBe("low");
+    // 2048 < 4096: no lift, the candidate's declared ceiling.
+    expect(served.reqs[0]?.maxTokens).toBe(4096);
+  });
+
+  test("a candidate budget that crowds out its max_tokens lifts ITS ceiling to budget + maxTokens", async () => {
+    const { served, run } = pooled({
+      model: OPUS,
+      thinking: { budgetTokens: 6000 },
+      maxTokens: 4096,
+    });
+    const { caught } = await run();
+    expect(caught).toBeUndefined();
+    expect(served.reqs[0]?.thinking).toEqual({ type: "enabled", budgetTokens: 6000 });
+    expect(served.reqs[0]?.reasoningEffort).toBeUndefined();
+    expect(served.reqs[0]?.maxTokens).toBe(6000 + 4096);
+  });
+});
+
 describe("G01 — thinking option lands on every main-turn ProviderRequest", () => {
   test("budgetTokens form maps verbatim; no reasoningEffort; ceiling untouched when budget fits", async () => {
     const { adapter, reqs } = scriptedAdapter([[text("ok")]]);

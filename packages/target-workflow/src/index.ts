@@ -8,7 +8,7 @@ import {
   type IrWorkflowV0,
   renderBundleReadme,
 } from "@crewhaus/ir";
-import { renderModelWiringFields } from "@crewhaus/model-service";
+import { renderModelWiringFields, scopedModelWiringFragment } from "@crewhaus/model-service";
 
 /**
  * Emit a self-contained workflow agent bundle. The generated agent.ts
@@ -238,8 +238,14 @@ function renderStep(step: IrWorkflowStep, idx: number, total: number, shared: St
   // runtime-core owns the router, the emitter only forwards the lowered
   // config. Only the plain and gated step bodies render it: a judge step
   // scores through eval-judge on its own resolved model and never runs the
-  // primary loop.
-  const modelFailoverFields = renderModelWiringFields(step, "    ");
+  // primary loop. 0.6.0 §7.9 — a pooled step's blob is rendered with `scope`
+  // defaulted to the STEP name when the spec pinned none (the runtime twin of
+  // the crew orchestrator's `scopeRolePool`), so `model_route.scope` names
+  // the step and the routing store can key its arms per step from PR 10 on.
+  const modelFailoverFields = renderModelWiringFields(
+    scopedModelWiringFragment(step, step.name),
+    "    ",
+  );
   const deadlineGuard = renderDeadlineGuard(
     shared.deadlineMs,
     stepNum,
@@ -308,7 +314,10 @@ function renderGatedStep(
   const stepNum = idx + 1;
   const toolsField = renderStepToolsField(step.tools, shared.mcpWired);
   const stepTuningFields = renderStepTuningFields(step);
-  const modelFailoverFields = renderModelWiringFields(step, "    ");
+  const modelFailoverFields = renderModelWiringFields(
+    scopedModelWiringFragment(step, step.name),
+    "    ",
+  );
   const deadlineGuard = renderDeadlineGuard(
     shared.deadlineMs,
     stepNum,
@@ -509,6 +518,10 @@ function renderStepTuningFields(step: IrWorkflowStep): string {
   }
   if (step.thinking !== undefined) {
     pieces.push(`\n    thinking: ${JSON.stringify(step.thinking)},`);
+  }
+  // 0.6.0 §4.1 — step-level sampling temperature (a validated number).
+  if (step.temperature !== undefined) {
+    pieces.push(`\n    temperature: ${step.temperature},`);
   }
   return pieces.join("");
 }

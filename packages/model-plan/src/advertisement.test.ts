@@ -8,6 +8,7 @@ import {
   buildAdvertisement,
   matchesToolPattern,
   satisfiesFeatures,
+  toolConfigFor,
   unmetRequirement,
 } from "./advertisement";
 
@@ -158,5 +159,45 @@ describe("matchesToolPattern", () => {
     expect(matchesToolPattern("mcp__gh__*", "mcp__linear__x")).toBe(false);
     expect(matchesToolPattern("a.b", "axb")).toBe(false);
     expect(matchesToolPattern("*", "anything")).toBe(true);
+  });
+
+  test("a builtin key in the SPEC spelling matches its RegisteredTool.name (PR 7 kept spec spelling)", () => {
+    expect(matchesToolPattern("read", "Read")).toBe(true);
+    expect(matchesToolPattern("webFetch", "WebFetch")).toBe(true);
+    expect(matchesToolPattern("javascript", "JavaScript")).toBe(true);
+    expect(matchesToolPattern("codegraphSearch", "CodeGraphSearch")).toBe(true);
+    expect(matchesToolPattern("read", "ReadImage")).toBe(false);
+    expect(matchesToolPattern("Consult", "Consult")).toBe(true);
+  });
+
+  test("buildAdvertisement honours the spec spelling — `tools: [read, grep]` keeps Read and Grep", () => {
+    const ad = buildAdvertisement(
+      TOOLS,
+      { tools: ["read", "grep"] },
+      { capabilities: { features: FULL }, retain: LOOP },
+    );
+    expect([...ad.names]).toEqual(["Read", "Grep", "ListTools", "Skill"]);
+    expect(ad.unmatched).toEqual([]);
+  });
+});
+
+describe("toolConfigFor", () => {
+  const cfg = {
+    fetch: { allowedOrigins: ["https://a.example"] },
+    WebFetch: { allowed_domains: ["example.com"] },
+    codeExecution: { defaultTimeoutMs: 5000 },
+  };
+  test("exact registered name, then the spec spelling, then the code-execution alias", () => {
+    expect(toolConfigFor(cfg, "WebFetch")).toEqual({ allowed_domains: ["example.com"] });
+    expect(toolConfigFor(cfg, "Fetch")).toEqual({ allowedOrigins: ["https://a.example"] });
+    expect(toolConfigFor(cfg, "Python")).toEqual({ defaultTimeoutMs: 5000 });
+    expect(toolConfigFor(cfg, "Shell")).toEqual({ defaultTimeoutMs: 5000 });
+    expect(toolConfigFor({ python: { x: 1 }, codeExecution: { y: 2 } }, "Python")).toEqual({
+      x: 1,
+    });
+  });
+  test("nothing declared for the tool (or no map at all) is undefined", () => {
+    expect(toolConfigFor(cfg, "Bash")).toBeUndefined();
+    expect(toolConfigFor(undefined, "Fetch")).toBeUndefined();
   });
 });

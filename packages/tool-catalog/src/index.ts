@@ -32,7 +32,34 @@ export interface ToolExecuteContext {
   readonly bridge?: unknown;
   readonly runContext?: RunContext;
   readonly onStreamChunk?: (stream: "stdout" | "stderr", chunk: string) => void;
+  /**
+   * 0.6.0 §4.4 — the model whose turn issued this call, when the run routes a
+   * `model_pool`: the scoreboard arm id (the `models:` profile name, else the
+   * spec model string), the wire model id and the spec string, plus the
+   * profile name when the candidate was declared under one. Absent on a
+   * single-model run and on bare unit calls, so a tool that reads it must
+   * treat "no model" as "the run's primary".
+   */
+  readonly model?: ToolExecuteModel;
+  /**
+   * 0.6.0 §4.4 — the serving candidate's `tool_config.<tool>` block for THIS
+   * tool, when its profile declares one. It REPLACES the process-global
+   * `register*Config(...)` block for the duration of the call (the same
+   * replace semantics the boot-time registration has); absent ⇒ the tool
+   * reads its registered config exactly as before. Opaque here — each tool
+   * package validates the shape it accepts, and the spec's `toolConfigBlock`
+   * superRefine already rejected sandbox-override keys per profile.
+   */
+  readonly toolConfig?: unknown;
 }
+
+/** 0.6.0 §4.4 — see `ToolExecuteContext.model`. */
+export type ToolExecuteModel = {
+  readonly armId: string;
+  readonly wireModelId: string;
+  readonly specModel: string;
+  readonly profile?: string;
+};
 
 /**
  * Section 14 — non-string tool result content. Mirrors the subset of

@@ -68,12 +68,32 @@ export type FetchConfigInput = {
  * are accepted so callers can pass the spec object verbatim.
  */
 export function registerFetchConfig(input: FetchConfigInput): void {
+  fetchConfig = buildFetchConfig(input);
+}
+
+/** Build a config from a spec-shaped block (pure; both key spellings accepted). */
+function buildFetchConfig(input: FetchConfigInput): FetchConfig {
   const raw = input.allowedOrigins ?? input.allowed_origins ?? [];
   const canonical = new Set<string>();
   for (const origin of raw) {
     canonical.add(canonicalizeOrigin(origin));
   }
-  fetchConfig = { allowedOrigins: canonical };
+  return { allowedOrigins: canonical };
+}
+
+/**
+ * 0.6.0 §4.4 — the config ONE call runs under: the serving candidate's
+ * `tool_config.fetch` block when its profile declares one
+ * (`ToolExecuteContext.toolConfig`, REPLACING the registered block for this
+ * call exactly as `registerFetchConfig` replaces it at boot), else the
+ * process-global registration. A non-object override is ignored, never
+ * widened: the allow-list only ever comes from a spec block.
+ */
+export function resolveFetchConfig(override: unknown): FetchConfig {
+  if (typeof override === "object" && override !== null && !Array.isArray(override)) {
+    return buildFetchConfig(override as FetchConfigInput);
+  }
+  return fetchConfig;
 }
 
 export function getFetchConfig(): FetchConfig {
@@ -303,14 +323,14 @@ function isPrivateIp(addr: string): boolean {
   return false;
 }
 
-function checkOriginAllowed(url: URL): void {
-  if (fetchConfig.allowedOrigins.size === 0) {
+function checkOriginAllowed(url: URL, cfg: FetchConfig): void {
+  if (cfg.allowedOrigins.size === 0) {
     throw new FetchPermissionError(
       `Fetch denied: origin "${url.origin}" is not in allowed_origins (empty allow-list = deny all)`,
     );
   }
   const canonical = canonicalizeOrigin(url.toString());
-  if (!fetchConfig.allowedOrigins.has(canonical)) {
+  if (!cfg.allowedOrigins.has(canonical)) {
     throw new FetchPermissionError(`Fetch denied: origin "${canonical}" is not in allowed_origins`);
   }
 }
@@ -431,6 +451,7 @@ async function performFetch(
   body: string | undefined,
   headers: Record<string, string> | undefined,
   signal: AbortSignal,
+  cfg: FetchConfig,
 ): Promise<Response> {
   let currentUrl = initialUrl;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
@@ -439,7 +460,7 @@ async function performFetch(
         `Fetch denied: scheme "${currentUrl.protocol}" — only http/https allowed`,
       );
     }
-    checkOriginAllowed(currentUrl);
+    checkOriginAllowed(currentUrl, cfg);
     // Re-validate every hop and pin the connection to the exact IP we just
     // vetted, so a rebinding resolver can't swap in a private address between
     // this check and the socket connect (CWE-367 TOCTOU).
@@ -513,6 +534,7 @@ export const fetch: RegisteredTool = buildTool({
         input.body,
         input.headers,
         ctrl.signal,
+        resolveFetchConfig(ctx?.toolConfig),
       );
       const body = await readBodyCapped(res);
       return formatResponse(res, body);

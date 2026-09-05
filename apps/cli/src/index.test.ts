@@ -604,9 +604,11 @@ describe("crewhaus compile", () => {
 
   // 0.6.0 PR 7 — the model-plan notices that no spec edit can properly clear
   // are informational too: model-plan-pending-runtime fires on a key the plan
-  // tells authors to adopt (its runtime lands in a later PR-train row), and
-  // model-sunset is a wall-clock notice on a 0.5.x pool that compiled under
-  // --strict yesterday. Both print; neither fails --strict.
+  // tells authors to adopt (its runtime lands in a later PR-train row — since
+  // PR 9a honours a candidate's params, the pending key here is the
+  // candidate's failover chain, PR 10), and model-sunset is a wall-clock
+  // notice on a 0.5.x pool that compiled under --strict yesterday. Both
+  // print; neither fails --strict.
   test("compile --strict does NOT escalate the informational model-plan-pending-runtime / model-sunset notices", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
     writeFileSync(
@@ -619,7 +621,7 @@ describe("crewhaus compile", () => {
         "  instructions: route it",
         "  model_pool:",
         "    candidates:",
-        "      - { model: claude-haiku-4-5, tags: [cheap], max_tokens: 2048 }",
+        "      - { model: claude-haiku-4-5, tags: [cheap], fallbacks: [claude-sonnet-4-6] }",
         "      - { model: claude-opus-4-1, tags: [strong] }",
         "",
       ].join("\n"),
@@ -630,7 +632,7 @@ describe("crewhaus compile", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toContain(
-      "crewhaus: warning[model-plan-pending-runtime] agent.model_pool.candidates[0].max_tokens:",
+      "crewhaus: warning[model-plan-pending-runtime] agent.model_pool.candidates[0].fallbacks:",
     );
     expect(result.stderr).toContain(
       "crewhaus: warning[model-sunset] agent.model_pool.candidates[1]",

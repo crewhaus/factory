@@ -255,6 +255,11 @@ describe("loopContractRunOptions (loop contract 0.4, Batch A)", () => {
     expect("loopDetection" in out).toBe(false);
   });
 
+  test("0.6.0 PR 9a — agent.temperature is carried; absent when the IR leaves it unset", () => {
+    expect(loopContractRunOptions({ agent: { temperature: 0.2 } })).toEqual({ temperature: 0.2 });
+    expect("temperature" in loopContractRunOptions({ agent: {} })).toBe(false);
+  });
+
   test("thinking is carried verbatim in both forms", () => {
     expect(loopContractRunOptions({ agent: { thinking: { budgetTokens: 2048 } } })).toEqual({
       thinking: { budgetTokens: 2048 },

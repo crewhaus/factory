@@ -201,6 +201,25 @@ function publishProgramOutput(
   });
 }
 
+/**
+ * 0.6.0 §4.4 — the per-call override a serving candidate's
+ * `tool_config.<python|javascript|shell|codeExecution>` block supplies
+ * (`ToolExecuteContext.toolConfig`). Only the NON-security knob the spec's
+ * `toolConfigBlock` superRefine lets a profile declare is honoured per call:
+ * `default_timeout_ms` / `defaultTimeoutMs`, applied when the model passed no
+ * explicit `timeout`. The sandbox boundary itself (backend, images, mounts,
+ * allow-lists) is process-global by design — it comes from trusted operator
+ * config, never from a spec block, so a per-call override cannot reach it.
+ */
+export function resolveCallTimeoutMs(override: unknown): number | undefined {
+  if (typeof override !== "object" || override === null || Array.isArray(override)) {
+    return undefined;
+  }
+  const o = override as { defaultTimeoutMs?: unknown; default_timeout_ms?: unknown };
+  const raw = o.defaultTimeoutMs ?? o.default_timeout_ms;
+  return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : undefined;
+}
+
 async function runInSandbox(
   language: "python" | "javascript" | "shell",
   argv: ReadonlyArray<string>,
@@ -208,6 +227,7 @@ async function runInSandbox(
   ctx?: ToolExecuteContext,
 ): Promise<string> {
   const sandbox = getOrCreateSandbox();
+  const callTimeoutMs = input.timeout ?? resolveCallTimeoutMs(ctx?.toolConfig);
   if (sandbox.backend === "noop") {
     // Allowed for tests, but emit a clear marker so misuse is obvious.
     // Production permission floor refuses requiresSandbox tools when the
@@ -219,7 +239,7 @@ async function runInSandbox(
   const result = await sandbox.exec({
     image,
     argv: [...argv, input.code],
-    ...(input.timeout !== undefined ? { timeoutMs: input.timeout } : {}),
+    ...(callTimeoutMs !== undefined ? { timeoutMs: callTimeoutMs } : {}),
     ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
     ...(mounts.length > 0 ? { mounts } : {}),
     onStdoutChunk: onStreamChunk ? (chunk) => onStreamChunk("stdout", chunk) : undefined,

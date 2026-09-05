@@ -147,6 +147,11 @@ export const readImage: RegisteredTool = buildTool({
     "Read an image file (PNG, JPEG, GIF, or WebP) from the workspace and return it as a base64 image block the model can see. Path is resolved relative to the project root; escaping the root is rejected. Per-image limit: 5 MB.",
   inputSchema: readImageSchema,
   readOnly: true,
+  // 0.6.0 §5.1 — the result is an image block the model must be able to SEE:
+  // a pool candidate without vision never gets this tool advertised (the
+  // plan table's capability filter), and `compile --strict` checks the same
+  // requirement offline against the capability table.
+  requiresModelFeatures: { vision: true },
   // Not concurrency-safe today: see deferred per-turn image counter above —
   // when that lands, parallel calls would race on the counter. Mark serial
   // until the runtime exposes a shared turn store.

@@ -210,6 +210,14 @@ export type ToolCallStartEvent = TraceEventEnvelope & {
   toolUseId: string;
   toolName: string;
   inputBytes: number;
+  /**
+   * 0.6.0 §5.6 — the serving model whose turn issued this call, stamped only
+   * when the run routes a `model_pool` (the wire model id) so every event
+   * a single-model run publishes stays byte-identical. `profile` is the
+   * `models:` name the candidate was declared under, when any.
+   */
+  model?: string;
+  profile?: string;
 };
 
 export type ToolCallEndEvent = TraceEventEnvelope & {
@@ -219,6 +227,14 @@ export type ToolCallEndEvent = TraceEventEnvelope & {
   isError: boolean;
   outputBytes: number;
   durationMs: number;
+  /**
+   * 0.6.0 §5.6 — the serving model whose turn issued this call, stamped only
+   * when the run routes a `model_pool` (the wire model id) so every event
+   * a single-model run publishes stays byte-identical. `profile` is the
+   * `models:` name the candidate was declared under, when any.
+   */
+  model?: string;
+  profile?: string;
 };
 
 /**
@@ -360,6 +376,14 @@ export type PermissionDecisionEvent = TraceEventEnvelope & {
    * persistence subscriber) key on its presence.
    */
   askOutcome?: "approved" | "denied";
+  /**
+   * 0.6.0 §5.6 — the serving model whose turn issued this call, stamped only
+   * when the run routes a `model_pool` (the wire model id) so every event
+   * a single-model run publishes stays byte-identical. `profile` is the
+   * `models:` name the candidate was declared under, when any.
+   */
+  model?: string;
+  profile?: string;
 };
 
 export type ErrorRecoveredEvent = TraceEventEnvelope & {

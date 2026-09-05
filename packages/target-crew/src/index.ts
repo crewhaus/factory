@@ -491,6 +491,11 @@ function renderRoleTuningFields(role: IrCrewRole): string {
   if (role.thinking !== undefined) {
     pieces.push(`\n    thinking: ${JSON.stringify(role.thinking)},`);
   }
+  // 0.6.0 §4.1 — role-level sampling temperature (a validated number); the
+  // orchestrator forwards it to the role's turns like `thinking`.
+  if (role.temperature !== undefined) {
+    pieces.push(`\n    temperature: ${role.temperature},`);
+  }
   return pieces.join("");
 }
 

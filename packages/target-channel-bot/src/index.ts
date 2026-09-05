@@ -331,6 +331,10 @@ function renderAgentTuningFields(ir: IrChannelV0): string {
   if (ir.agent.thinking !== undefined) {
     pieces.push(`\n        thinking: ${JSON.stringify(ir.agent.thinking)},`);
   }
+  // 0.6.0 §4.1 — sampling temperature (a validated number; unset → absent).
+  if (ir.agent.temperature !== undefined) {
+    pieces.push(`\n        temperature: ${ir.agent.temperature},`);
+  }
   if (ir.agent.rateLimits !== undefined) {
     pieces.push(`\n        rateLimits: ${JSON.stringify(ir.agent.rateLimits)},`);
   }

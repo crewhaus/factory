@@ -289,3 +289,11 @@ sites. No emitted string changed, so every pin here passes unchanged; the
 per-shape proof for specs that DO declare a pool / tiers / chain lives under
 `__fixtures__/model-wiring/` (`model-wiring-pin.test.ts`), whose pins were
 generated on the pre-refactor tree.
+
+**0.6.0 PR 9a delta — NO pin here moved.** The per-candidate plan table is a
+runtime construction (runtime-core builds it from the pool blob at boot), so
+no emitter string changed for a spec without a pool; every pin here passes
+unchanged. Two routed pins DID move, and live where routed specs are pinned:
+`__fixtures__/model-wiring/{workflow-steps,graph-nodes}.agent.ts.txt` — a
+pooled step's / node's `modelPool` literal gains `"scope":"<name>"` when the
+spec pinned none (see that directory's README for the note).
