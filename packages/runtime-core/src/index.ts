@@ -2996,6 +2996,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const sb = scoreboard;
     const rc = rewardConfig;
     if (turn === undefined || sb === undefined || rc === undefined) return;
+    // §6.3 item 1 / §7.13 — under `in_loop` an OMITTED quality is
+    // unrepresentable: `computeReward` reads it as a perfect 1.0, so a
+    // successful observation the judge never scored (a direct-served strong
+    // rung past the judge share, an aborted turn, a stage whose grader threw)
+    // is counted `ungraded` instead of recorded. Failed calls still record —
+    // the reward short-circuits on `!success` before reading quality.
+    if (qualityIntoReward && obs.success && obs.quality === undefined) {
+      sb.ungraded(turn.routeKey, turn.modelString);
+      return;
+    }
     const { quality: _quality, ...withoutQuality } = obs;
     sb.record(
       turn.routeKey,
@@ -5747,6 +5757,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     readonly role?: ModelRole;
     readonly stage?: string;
     readonly defer?: boolean;
+    /**
+     * §7.13 — the caller holds a standing answer to fall back to (the
+     * cascade's graded draft): a generic terminal `fail` verdict from the
+     * recovery ladder throws WITHOUT publishing `run_failed`, because the run
+     * is not failing — the caller recovers. Classified halts (billing, auth,
+     * a spent rate-limit budget) still publish and throw `RunFailedError`.
+     */
+    readonly fallible?: boolean;
   };
   type PendingPoolObservation = {
     readonly turn: { readonly modelString: string; readonly routeKey: string };
@@ -6954,12 +6972,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // leaves a structured `run_failed` behind, then throw the
               // byte-identical pre-0.3.0 RuntimeError (die()'s one-liner
               // for non-RunFailedError CrewhausErrors is unchanged).
-              await publishRunFailed({
-                class: "unknown",
-                title: "recovery failed",
-                detail: action.reason,
-                exitCode: EXIT_CODES.generic,
-              });
+              // §7.13 — a `fallible` turn (the cascade's escalation stage)
+              // has a caller that recovers with the draft: no `run_failed`.
+              if (turnOpts.fallible !== true) {
+                await publishRunFailed({
+                  class: "unknown",
+                  title: "recovery failed",
+                  detail: action.reason,
+                  exitCode: EXIT_CODES.generic,
+                });
+              }
               throw new RuntimeError(`recovery failed: ${action.reason}`);
             }
             case "halt":
@@ -7128,6 +7150,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     }
     const routeKey = stages.flatMap((st) => st.observations)[0]?.turn.routeKey;
     if (routeKey === undefined) return;
+    // §7.10 / §7.13 — the strategy line folds the turn's FINAL quality. A
+    // successful turn whose standing answer was never graded (its grader
+    // threw, or the strong rung served directly past the judge share) has no
+    // final quality to fold: no strategy line, rather than one an
+    // `in_loop` reader would score as a perfect 1.0.
+    if (final.success && final.score === undefined) return;
     const costUsd = stages.reduce((acc, st) => acc + st.costUsd, 0);
     recordPoolOutcome(
       { modelString: "strategy:cascade", routeKey },
@@ -7147,6 +7175,36 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       scoreboard?.ungraded(turn.routeKey, turn.modelString);
     }
   };
+  /**
+   * Pillar 3 — grader text about to enter the MAIN transcript (the
+   * draft-verify `correction`, else the rationale nudge) is model-generated
+   * by a side call that read the — possibly injected — draft. It crosses the
+   * same boundary as a consult reply: classified at TrustOrigin `consult`
+   * (§7.4 / §7.5 posture for side-call model text), lineage-tagged when
+   * admitted. A blocked verdict admits nothing — the nudge then carries the
+   * score alone (no fall-through to the same grader's rationale).
+   */
+  type AdmittedGraderText =
+    | { readonly kind: "admitted"; readonly text: string }
+    | { readonly kind: "blocked" }
+    | { readonly kind: "empty" };
+  const admitGraderText = async (
+    text: string | undefined,
+    field: "correction" | "rationale",
+  ): Promise<AdmittedGraderText> => {
+    const trimmed = text?.trim() ?? "";
+    if (trimmed.length === 0) return { kind: "empty" };
+    const boundary = await classifyBoundary(trimmed, { origin: "consult" });
+    if (boundary.action === "redact") {
+      runContext.logger.warn(
+        "evaluation: grader text blocked at the transcript boundary — nudging with the score alone",
+        { field, rules: [...new Set(boundary.verdict.hits.map((h) => h.rule))] },
+      );
+      return { kind: "blocked" };
+    }
+    tagContent(runContext, trimmed, "consult");
+    return { kind: "admitted", text: trimmed };
+  };
   /** Run one turn on a forced rung as an `escalate` stage (started → done | failed). */
   const runEscalationStage = async (
     messages: Anthropic.MessageParam[],
@@ -7154,6 +7212,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     cause: string | undefined,
     forceReason: string,
     defer: boolean,
+    fallible = false,
   ): Promise<TurnAttempt> => {
     publishStage({
       stage: "escalate",
@@ -7171,6 +7230,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         role: "escalation",
         stage: "escalate",
         defer,
+        ...(fallible ? { fallible } : {}),
       });
     } catch (err) {
       publishStage({
@@ -7200,18 +7260,44 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const evaluation = opts.evaluation;
     const cascade = resolveCascade();
     const turnStartMs = performance.now();
-    const preDraftLength = messages.length;
+    // The pre-draft snapshot is a COPY of the messages, not a length: the
+    // draft turn can rewrite `messages` in place (reactive compaction leaves
+    // `[marker, summary]`, the tombstone reconciliation rebuilds it), so a
+    // remembered length would extend a shorter array with holes instead of
+    // reproducing the prompt the strong rung is promised under `cleanPrompt`.
+    const preDraft = messages.slice();
+    // §6.3 item 2 — under `in_loop` EVERY evaluated turn defers its
+    // successful observations so the grade can be stamped on them; without
+    // a judge the line count is unchanged and nothing is deferred.
+    const deferForGrade = qualityIntoReward && evaluation !== undefined;
     // §6.2 — past the judge share a cascade serves the strong rung DIRECTLY:
     // the draft it cannot afford to grade is not drafted, the judge is not
     // skipped silently — the route reason and the stage cause both say why.
     if (cascade !== undefined && forcedRunCandidate === undefined && judgeShareExhausted()) {
-      return runEscalationStage(
+      const served = await runEscalationStage(
         messages,
         cascade.target,
         "judge_share_exhausted",
         "judge_share_exhausted",
-        false,
+        true,
       );
+      // §6.3 — folded through the same quality gate as every cascade line:
+      // the calls are un-judged, so under `in_loop` the strong arm is counted
+      // `ungraded` rather than credited a perfect 1.0 for the rest of the
+      // run; no strategy line (there is no final quality to fold).
+      flushCascade(
+        [
+          {
+            stage: "escalate",
+            attributedTo: "escalation",
+            observations: served.observations,
+            costUsd: served.costUsd,
+          },
+        ],
+        { success: true },
+        performance.now() - turnStartMs,
+      );
+      return served;
     }
     let attempt: TurnAttempt =
       forcedRunCandidate !== undefined
@@ -7220,13 +7306,23 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             forcedRunCandidate,
             "retry_previous",
             `forced onto ${armIdOf(forcedRunCandidate)} (forcedCandidate)`,
-            false,
+            cascade !== undefined || deferForGrade,
           )
         : await runOneTurn(
             messages,
-            cascade !== undefined ? { role: "draft", stage: "draft", defer: true } : {},
+            cascade !== undefined
+              ? { role: "draft", stage: "draft", defer: true }
+              : deferForGrade
+                ? { defer: true }
+                : {},
           );
     if (evaluation === undefined) return attempt;
+    /** Fold a non-cascade attempt's deferred lines with the grade it earned (none ⇒ the §6.3 gate). */
+    const foldGraded = (a: TurnAttempt, quality?: number): void => {
+      for (const { turn, obs } of a.observations) {
+        recordPoolOutcome(turn, quality !== undefined ? { ...obs, quality } : obs);
+      }
+    };
     const maxRetries = Math.max(0, Math.floor(evaluation.maxRetries));
     const stages: StageRecord[] = [];
     let current: StageRecord | undefined;
@@ -7247,9 +7343,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // a retry would fight the very signal that stopped it.
       if (turnAbort.signal.aborted || runAbort.signal.aborted) {
         // An abort is not a judge outage: the deferred lines fold without a
-        // quality (exactly what an un-deferred call would have recorded).
+        // quality (exactly what an un-deferred call would have recorded —
+        // under `in_loop` the §6.3 gate counts them `ungraded`).
         if (cascade !== undefined) {
           flushCascade(stages, { success: false }, performance.now() - turnStartMs);
+        } else {
+          foldGraded(attempt);
         }
         return attempt;
       }
@@ -7282,8 +7381,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           message,
         });
         await logEvent("error", { name, message: `evaluation grader failed: ${message}` });
+        // A no-op for an un-deferred attempt (its lines already folded).
+        discardUngraded(attempt);
         if (cascade !== undefined) {
-          discardUngraded(attempt);
+          // Stages already graded still fold; with no final quality the
+          // strategy line is withheld (see `flushCascade`).
           flushCascade(gradedStages(), { success: true }, performance.now() - turnStartMs);
         }
         return attempt;
@@ -7296,6 +7398,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const rationale = graded.rationale;
       const verdict: "pass" | "fail" = score >= evaluation.threshold ? "pass" : "fail";
       if (current !== undefined) current.score = score;
+      // §6.3 item 2 — a non-cascade attempt folds with ITS grade right here
+      // (each retry attempt is graded on its own); a cascade folds at the
+      // strategy-turn boundary through `flushCascade`.
+      if (cascade === undefined) foldGraded(attempt, score);
       // 0.6.0 §6.2 — read AFTER the grade so the judge call that just ran is
       // in the meter: the signal says "this grade was produced past the share".
       const shareExhausted = judgeShareExhausted();
@@ -7369,13 +7475,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // §7.3 draft-verify — the grader's own correction (a strong verifier's
       // `edits`) replaces the default rationale nudge; either way it is
       // APPENDED as a synthetic user message, never written into the draft.
+      // Pillar 3 — whichever grader text is about to enter the transcript is
+      // admitted through the `consult` boundary first; blocked ⇒ score-only.
+      const admittedCorrection = await admitGraderText(graded.correction, "correction");
+      const admittedRationale =
+        admittedCorrection.kind === "empty"
+          ? await admitGraderText(rationale, "rationale")
+          : { kind: "empty" as const };
       const feedback =
-        rationale !== undefined && rationale.trim().length > 0
-          ? ` Grader feedback: ${rationale.trim()}`
-          : "";
+        admittedRationale.kind === "admitted" ? ` Grader feedback: ${admittedRationale.text}` : "";
       const correction =
-        graded.correction !== undefined && graded.correction.trim().length > 0
-          ? `[evaluation failed: scored ${score.toFixed(2)}, threshold ${evaluation.threshold}]\nRequired correction: ${graded.correction.trim()}\nRevise your previous answer to apply the correction, then give the corrected answer in full.`
+        admittedCorrection.kind === "admitted"
+          ? `[evaluation failed: scored ${score.toFixed(2)}, threshold ${evaluation.threshold}]\nRequired correction: ${admittedCorrection.text}\nRevise your previous answer to apply the correction, then give the corrected answer in full.`
           : `[evaluation failed: scored ${score.toFixed(2)}, threshold ${evaluation.threshold}]${feedback}\nPlease revise your previous answer to address the feedback, then give the corrected answer in full.`;
       if (evaluation.onFail === "escalate" && cascade !== undefined) {
         if (!willEscalate) {
@@ -7391,12 +7502,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           return standing();
         }
         escalations += 1;
+        // The transcript as graded — restored should the escalation rung be
+        // unavailable (§7.13: the draft answer stands).
+        const draftTranscript = messages.slice();
         if (cascade.cleanPrompt) {
           // The pre-draft snapshot: the strong rung answers the ORIGINAL
           // prompt, never seeing the rejected draft. The session log keeps
           // the draft's lines (they are already on disk); the durable
           // `model_stage` line marks the cut for `route explain`.
-          messages.length = preDraftLength;
+          messages.splice(0, messages.length, ...preDraft);
         } else {
           messages.push({ role: "user", content: correction });
           await logEvent("user_message", { content: correction, synthetic: true });
@@ -7414,10 +7528,29 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             undefined,
             `cascade: escalated after a failing grade (${score.toFixed(2)} < ${evaluation.threshold})`,
             true,
+            true,
           );
         } catch (err) {
-          flushCascade(gradedStages(), { success: false }, performance.now() - turnStartMs);
-          throw err;
+          // A classified halt (billing, auth, a spent rate-limit budget, a
+          // fired run deadline) or an abort is terminal for the RUN, not for
+          // the rung: the graded stages fold and the error propagates.
+          if (isAbortError(err) || isRunFailedError(err)) {
+            flushCascade(gradedStages(), { success: false }, performance.now() - turnStartMs);
+            throw err;
+          }
+          // §7.13 — "cascade escalation target unavailable": fall back to
+          // the draft answer with its failing grade attached; `on_fail`
+          // behaves as `note`. The `model_stage{failed}` line already marks
+          // the attempt; the draft transcript is restored (a `cleanPrompt`
+          // cut re-appends the draft, the appended correction is withdrawn)
+          // and the draft's arms fold with the grade they earned.
+          const message = err instanceof Error ? err.message : String(err);
+          runContext.logger.warn(
+            "cascade: escalation rung unavailable — the draft answer stands with its failing grade (note semantics)",
+            { escalateTo: cascade.target.modelString, message },
+          );
+          messages.splice(0, messages.length, ...draftTranscript);
+          return standing();
         }
         stage.observations = attempt.observations;
         stage.costUsd = attempt.costUsd;
@@ -7430,7 +7563,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       if (retryIndex >= maxRetries) return attempt;
       messages.push({ role: "user", content: correction });
       await logEvent("user_message", { content: correction, synthetic: true });
-      attempt = await runOneTurn(messages);
+      attempt = await runOneTurn(messages, deferForGrade ? { defer: true } : {});
     }
   }
 
