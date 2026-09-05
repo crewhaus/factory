@@ -8,6 +8,7 @@
     { "path": "../adapter-anthropic" },
     { "path": "../agent-context-isolation" },
     { "path": "../boundary-classifier" },
+    { "path": "../cost-tracker" },
     { "path": "../errors" },
     { "path": "../event-log" },
     { "path": "../federation-discovery" },
@@ -21,7 +22,8 @@
     { "path": "../runtime-core" },
     { "path": "../tool-builder" },
     { "path": "../tool-catalog" },
-    { "path": "../tool-task" }
+    { "path": "../tool-task" },
+    { "path": "../trace-event-bus" }
   ],
   "include": ["src/**/*"]
 }

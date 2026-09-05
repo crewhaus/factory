@@ -2,7 +2,7 @@
   "name": "@crewhaus/model-service",
   "version": "0.5.8",
   "type": "module",
-  "description": "0.6.0 composition root (plan §2 stance 4, brief 308): wireModels(fragment, deps) turns the lowered model-routing IR into the runChatLoop options fragment — one stable call replacing the per-emitter routing codegen",
+  "description": "0.6.0 composition root (plan \u00a72 stance 4, brief 308): wireModels(fragment, deps) turns the lowered model-routing IR into the runChatLoop options fragment \u2014 one stable call replacing the per-emitter routing codegen",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@crewhaus/adapter-anthropic": "workspace:*",
+    "@crewhaus/cost-tracker": "workspace:*",
     "@crewhaus/eval-judge": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*",

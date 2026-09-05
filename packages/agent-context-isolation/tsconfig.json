@@ -9,6 +9,7 @@
     { "path": "../errors" },
     { "path": "../event-log" },
     { "path": "../hooks-engine" },
+    { "path": "../ir" },
     { "path": "../permission-engine" },
     { "path": "../recovery-engine" },
     { "path": "../run-context" },

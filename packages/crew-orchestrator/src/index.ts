@@ -31,6 +31,7 @@ import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { CrewhausError } from "@crewhaus/errors";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
 import type { ModelProfile, RouteRule } from "@crewhaus/model-plan";
+import { hasSideCallStrategy, wireSideCalls } from "@crewhaus/model-service";
 import {
   BUILTIN_DEFAULT_RULES,
   type PermissionMode,
@@ -348,6 +349,8 @@ export type RunOptions = {
   readonly _tierAdapters?: RunChatLoopOptions["_tierAdapters"];
   readonly _poolAdapters?: RunChatLoopOptions["_poolAdapters"];
   readonly _scoreboard?: RunChatLoopOptions["_scoreboard"];
+  /** 0.6.0 PR 9d — test injection for a role's shadow / committee judge. */
+  readonly _judgeAdapter?: ProviderAdapter;
 };
 
 export type RunnableCrew = {
@@ -705,6 +708,7 @@ async function* driveCrew(
           // cast is composeLoopTuning's documented forward-compat seam.
           // 0.6.0 (PR 7b) — the peer's pool is scoped to the PEER role.
           ...(composeLoopTuning(peerDef, args.opts, toRole) as Partial<RunChatLoopOptions>),
+          ...composeSideCalls(peerDef, args.opts, toRole, args.crewName),
           installSigintHandler: false,
           maxTokens: peerDef.maxTokens ?? DEFAULT_MAX_TOKENS,
           crewMailbox: mailbox,
@@ -804,6 +808,8 @@ async function* driveCrew(
           // cast is composeLoopTuning's documented forward-compat seam.
           // 0.6.0 (PR 7b) — this role's pool is scoped to this role.
           ...(composeLoopTuning(def, args.opts, currentRoleName) as Partial<RunChatLoopOptions>),
+          // 0.6.0 PR 9d — this role's guide / shadow / committee closures.
+          ...composeSideCalls(def, args.opts, currentRoleName, args.crewName),
           installSigintHandler: false,
           maxTokens: def.maxTokens ?? DEFAULT_MAX_TOKENS,
           crewMailbox: mailbox,
@@ -1088,6 +1094,30 @@ export type LoopTuningFragment = Pick<
  */
 export function scopeRolePool(pool: RoleModelPool, roleName: string): RoleModelPool {
   return pool.scope !== undefined ? pool : { ...pool, scope: roleName };
+}
+
+/**
+ * 0.6.0 PR 9d (§7.4, §7.6, §7.8) — a role's side-call closures, built by the
+ * composition root from the role's SCOPED pool at every activation (one
+ * activation is one single-turn run, so a committee is legal here) and
+ * spread at BOTH role call sites (primary activation + inline A2A peer turn,
+ * the 0.5.5 `toolsetScope` lesson). The test seams ride along: the role's
+ * `_poolAdapters` double as the nested side-call adapters, `_judgeAdapter`
+ * as the judge. Spread-return-`{}`: a role whose pool declares no guide /
+ * shadow / committee hands runtime-core exactly the options it got before.
+ */
+export function composeSideCalls(
+  def: RoleDefinition,
+  opts: RunOptions,
+  roleName: string,
+  crewName: string,
+): Pick<RunChatLoopOptions, "sideCalls"> {
+  if (def.modelPool === undefined || !hasSideCallStrategy(def.modelPool)) return {};
+  return wireSideCalls(scopeRolePool(def.modelPool, roleName), {
+    sessionName: crewName,
+    ...(opts._poolAdapters !== undefined ? { _consultAdapters: opts._poolAdapters } : {}),
+    ...(opts._judgeAdapter !== undefined ? { _judgeAdapter: opts._judgeAdapter } : {}),
+  });
 }
 
 export function composeLoopTuning(

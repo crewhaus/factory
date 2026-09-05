@@ -16,7 +16,11 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { Writable } from "node:stream";
-import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
+import {
+  type SubAgentDefinition,
+  foldSubAgentOverlay,
+  subAgentDefinitionFromIr,
+} from "@crewhaus/agent-context-isolation";
 // Type-only — the concrete factories are dynamically imported inside the
 // deploy/propose handlers (lazy boot); the approval gate helper needs the
 // registry/audit types for its signature.
@@ -4547,20 +4551,10 @@ async function runRunCli(
   // runtime can populate the bridge for framework-aware tools.
   let subAgents: ReadonlyMap<string, SubAgentDefinition> | undefined;
   if (ir.subAgents.length > 0) {
-    subAgents = new Map(
-      ir.subAgents.map((d) => [
-        d.name,
-        {
-          name: d.name,
-          description: d.description,
-          instructions: d.instructions,
-          tools: d.tools,
-          ...(d.model !== undefined ? { model: d.model } : {}),
-          permissions: d.permissions,
-          inherit_bypass: d.inheritBypass,
-        } satisfies SubAgentDefinition,
-      ]),
-    );
+    // 0.6.0 §7.7 — the ONE IR → runtime mapping (routing quartet, params,
+    // budget_share, inherit_routing, allowed_profiles ride along), in parity
+    // with the emitted `__subAgents` literal.
+    subAgents = new Map(ir.subAgents.map((d) => [d.name, subAgentDefinitionFromIr(d)]));
     tools.push(createTaskTool({ subAgents }));
     process.stdout.write(
       `[sub-agents] ${subAgents.size} available: ${[...subAgents.keys()].join(", ")}\n`,
@@ -5737,20 +5731,10 @@ async function buildServeRuntime(
   // Sub-agents — the Task tool (chat mode) + the routing map (per-subagent).
   let subAgents: ReadonlyMap<string, SubAgentDefinition> | undefined;
   if (ir.subAgents.length > 0) {
-    subAgents = new Map(
-      ir.subAgents.map((d) => [
-        d.name,
-        {
-          name: d.name,
-          description: d.description,
-          instructions: d.instructions,
-          tools: d.tools,
-          ...(d.model !== undefined ? { model: d.model } : {}),
-          permissions: d.permissions,
-          inherit_bypass: d.inheritBypass,
-        } satisfies SubAgentDefinition,
-      ]),
-    );
+    // 0.6.0 §7.7 — the ONE IR → runtime mapping (routing quartet, params,
+    // budget_share, inherit_routing, allowed_profiles ride along), in parity
+    // with the emitted `__subAgents` literal.
+    subAgents = new Map(ir.subAgents.map((d) => [d.name, subAgentDefinitionFromIr(d)]));
     tools.push(createTaskTool({ subAgents }));
   }
 
@@ -5771,10 +5755,22 @@ async function buildServeRuntime(
   );
   const sandboxAvailable = resolveSandboxAvailable();
 
+  // 0.6.0 §7.8 — serve hosts ONE single-turn run per inbound message, and a
+  // reply is one the caller is waiting on: the loop hands an in-flight shadow
+  // (the audition lane's re-run plus its judging) here instead of awaiting it
+  // at the run's teardown, so the reply returns as soon as the served text is
+  // final. Every drained shadow is awaited in `cleanup`, before the process
+  // exits — chained, so a long-lived server holds one promise, not a list.
+  let sideCallsSettled: Promise<void> = Promise.resolve();
+  const sideCallDrain = (settled: Promise<void>): void => {
+    sideCallsSettled = sideCallsSettled.then(() => settled);
+  };
+
   // The loop options shared by every turn (primary agent OR a routed sub-agent).
   const commonOptions = {
     permissionMode,
     permissionRules,
+    sideCallDrain,
     // G11 — the MCP daemon is the most headless surface there is (under stdio
     // transport stdout is even redirected to stderr), so an `ask` here has
     // never had anywhere to go. Threaded once here, covering the primary turn
@@ -5847,7 +5843,9 @@ async function buildServeRuntime(
         return runChatLoop({
           ...commonOptions,
           model: def.model ?? model,
-          instructions: def.instructions,
+          // An MCP-exposed sub-agent has no Task `profile` to pin: it runs on
+          // its declared plan, so the default profile's overlay heads its prompt.
+          instructions: foldSubAgentOverlay(def.instructions, def.overlay),
           // `def.tools` is the sub-agent's resolved allowlist (always concrete
           // from the IR; `?? []` only satisfies the optional runtime type).
           tools: filterChildTools(tools, def.tools ?? []),
@@ -5861,6 +5859,9 @@ async function buildServeRuntime(
     });
 
   const cleanup = async (): Promise<void> => {
+    // §7.8 — drained shadows settle (their verdicts are what the audition
+    // lane records) before the MCP peers this process opened go away.
+    await sideCallsSettled;
     if (mcpHost !== undefined) await mcpHost.disconnectAll();
   };
 

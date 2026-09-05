@@ -72,6 +72,7 @@ import type {
   IrSecurity,
   IrSlackConfig,
   IrSubAgentDefinition,
+  IrSubAgentProfileOption,
   IrTelegramConfig,
   IrThinking,
   IrThredz,
@@ -935,12 +936,15 @@ function lowerChannels(channels: SpecChannel["channels"]): IrChannels {
  *                   the same fallback for runtime resolution.)
  *
  * 0.6.0 §7.7 — a sub-agent's `model` resolves through the registry like any
- * serving slot (`agent-full`: a profile's params and failover chain apply, its
- * overlay folds into the child's instructions), and the child carries its own
+ * serving slot (`agent-full`: a profile's params and failover chain apply; its
+ * overlay is CARRIED on `overlay`, not folded — the spawner folds it for the
+ * declared / inherited plans and a pinned `allowed_profiles` entry replaces it
+ * with its own), and the child carries its own
  * routing quartet, params, `budget_share`, `inherit_routing` and
- * `allowed_profiles` (profile names — the `$` is resolved away). The spawner
- * consumes them from PR 11; until then every one of those keys is reported
- * `model-plan-pending-runtime`, and a spec that declares none of them lowers
+ * `allowed_profiles`. Each allowed profile is resolved HERE to the serving slot
+ * the child runs on when the Task call pins it (`IrSubAgentProfileOption`), so
+ * the registry stays provenance-only downstream. The spawner consumes every one
+ * of these keys (0.6.0 PR 11); a spec that declares none of them lowers
  * byte-identically.
  */
 function lowerSubAgents(
@@ -974,19 +978,39 @@ function lowerSubAgents(
           )
         : undefined;
     const routing = lowerModelFailover(def, ctx, p);
-    const allowedProfiles = def.allowed_profiles?.map((entry, i) => {
+    const allowedProfiles = def.allowed_profiles?.map((entry, i): IrSubAgentProfileOption => {
       const profile = profileRefName(entry);
       if (profile === undefined || ctx.registry[profile] === undefined) {
         throw new CompilerError(
           `${p}.allowed_profiles[${i}]: "${entry}" must name a declared models: profile (as $<name>)`,
         );
       }
-      return profile;
+      // The option is the profile applied to a serving slot with NO local
+      // overrides — exactly what `model: $<profile>` on this child would
+      // lower to — so a pinned Task call runs on the profile's own params and
+      // failover chain. The overlay is carried (not folded): it applies to
+      // the child's prompt only when this profile is the one chosen.
+      const optPath = `${p}.allowed_profiles[${i}]`;
+      const slot = applyProfileToSlot(
+        resolveModelRef(entry, ctx, optPath),
+        ctx,
+        optPath,
+        "agent-full",
+      );
+      return {
+        profile,
+        model: slot.model,
+        ...(slot.thinking !== undefined ? { thinking: slot.thinking } : {}),
+        ...(slot.maxTokens !== undefined ? { maxTokens: slot.maxTokens } : {}),
+        ...(slot.temperature !== undefined ? { temperature: slot.temperature } : {}),
+        ...(slot.overlay !== undefined ? { overlay: slot.overlay } : {}),
+        ...servingSlotFailover(slot),
+      };
     });
     const lowered: IrSubAgentDefinition = {
       name,
       description: def.description,
-      instructions: foldOverlay(def.instructions, slot?.overlay),
+      instructions: def.instructions,
       tools: def.tools ?? [],
       ...(slot !== undefined ? { model: slot.model } : {}),
       permissions: def.permissions ?? "inherit",
@@ -1002,32 +1026,16 @@ function lowerSubAgents(
             ...(local.maxTokens !== undefined ? { maxTokens: local.maxTokens } : {}),
             ...(local.temperature !== undefined ? { temperature: local.temperature } : {}),
           }),
+      // The default profile's overlay rides RAW: which overlay heads the child's
+      // prompt is a per-Task-call decision (`allowed_profiles`), so the spawner
+      // folds it, not the compiler. Absent ⇒ no key (0.5.x specs lower byte-identically).
+      ...(slot?.overlay !== undefined ? { overlay: slot.overlay } : {}),
       ...routing,
       ...(slot !== undefined ? servingSlotFailover(slot) : {}),
       ...(def.budget_share !== undefined ? { budgetShare: def.budget_share } : {}),
       ...(def.inherit_routing !== undefined ? { inheritRouting: def.inherit_routing } : {}),
       ...(allowedProfiles !== undefined ? { allowedProfiles } : {}),
     };
-    for (const [irKey, specKey] of [
-      ["thinking", "thinking"],
-      ["maxTokens", "max_tokens"],
-      ["temperature", "temperature"],
-      ["modelFallbacks", "model_fallbacks"],
-      ["circuitBreaker", "circuit_breaker"],
-      ["modelTiers", "model_tiers"],
-      ["modelPool", "model_pool"],
-      ["budgetShare", "budget_share"],
-      ["inheritRouting", "inherit_routing"],
-      ["allowedProfiles", "allowed_profiles"],
-    ] as const) {
-      if (lowered[irKey] === undefined) continue;
-      warn(
-        ctx,
-        "model-plan-pending-runtime",
-        `${p}.${specKey}`,
-        `${p}.${specKey} is lowered into the IR but the sub-agent spawner reads only model / tools / permissions today — it lands with 0.6.0 ${LANDING_SUBAGENTS}; until then it is inert`,
-      );
-    }
     return lowered;
   });
 }
@@ -1178,11 +1186,16 @@ function asLooseBlock(value: unknown): LooseBlock | undefined {
 const LANDING_SINGLE_SLOT =
   "a later 0.6.0 row (a single-model serving slot has no per-candidate plan carrier in the IR; the same profile honours it today as a model_pool candidate)";
 const LANDING_PREROUTE = "PR 9b (the preRoute decision phase)";
-const LANDING_SIDE_CALLS = "PR 9d (the guide / shadow / committee side-calls)";
+/** 0.6.0 PR 9d — the shapes whose hosts construct the guide / shadow /
+ *  committee side calls at boot (`@crewhaus/model-service`'s `wireSideCalls`:
+ *  rendered by the workflow and graph emitters, called by the crew
+ *  orchestrator). Every other compiled shape reaches them through the
+ *  `crewhaus run` / `serve` interpreter only, until the emitters' boot-time
+ *  `wireModels` row. */
+const SIDE_CALL_WIRED_TARGETS: ReadonlySet<Spec["target"]> = new Set(["workflow", "graph", "crew"]);
 const LANDING_MODEL_DIRECTED =
   "a later 0.6.0 row (the emitters' boot-time wireModels call — emitted bundles do not import @crewhaus/model-service, which depends on runtime-core)";
 const LANDING_ROUTER_STORE = "PR 10 (scoped arms, priors and the reward store)";
-const LANDING_SUBAGENTS = "PR 11 (sub-agent routing end to end)";
 const LANDING_JUDGE_PANEL = "the §6.2 judge-panel wiring (createJudgeGrader in every judge site)";
 const LANDING_AUX_PARAMS =
   "the §4.2 per-slot params consumers (the judge / compaction / degrade / security / watchme request builders)";
@@ -2413,10 +2426,19 @@ function lowerModelFailover(
     if (mp.classifier !== undefined) pending("classifier", LANDING_PREROUTE);
     if (mp.strategy !== undefined) {
       // 0.6.0 PR 9c consumes `cascade` (`evaluation.on_fail: escalate` re-runs
-      // on `escalate_to`, `clean_prompt` picks the snapshot) and
-      // `max_escalations`; the side-call closures are PR 9d's.
-      for (const key of ["guide", "shadow", "committee"] as const) {
-        if (mp.strategy[key] !== undefined) pending(`strategy.${key}`, LANDING_SIDE_CALLS);
+      // on `escalate_to`, `clean_prompt` picks the snapshot, `max_escalations`
+      // caps the rungs); PR 9d constructs guide / shadow / committee through
+      // `wireSideCalls` (model-service) and runtime-core consumes them.
+      if (!SIDE_CALL_WIRED_TARGETS.has(ctx.target)) {
+        for (const key of ["guide", "shadow"] as const) {
+          if (mp.strategy[key] === undefined) continue;
+          warn(
+            ctx,
+            "model-plan-pending-runtime",
+            `${poolPath}.strategy.${key}`,
+            `${poolPath}.strategy.${key} is honoured by the crewhaus run / serve interpreter and by compiled workflow / graph / crew bundles (wireSideCalls from @crewhaus/model-service), but a compiled ${ctx.target} bundle does not construct the side call yet — that lands with 0.6.0 ${LANDING_MODEL_DIRECTED}; until then the key is inert in this compiled target`,
+          );
+        }
       }
       if (mp.strategy.model_directed === true) {
         // 0.6.0 PR 8b landed the runtime half: `wireModels` constructs the

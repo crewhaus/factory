@@ -27,6 +27,26 @@
  * aggregated from the `model_response` events on its own bus and rolled into
  * `SubAgentResult.usage` (replacing the Section-13 zero placeholder), so the
  * parent's Task tool can fold child spend into its run accounting.
+ *
+ * 0.6.0 §7.7 / §10.2 — sub-agent routing end to end:
+ *   - the child's definition carries its own routing quartet and params, and
+ *     the spawner spreads them into the child `runChatLoop` (a child routes
+ *     itself exactly as an agent block would; it never inherits the parent's
+ *     router — see `ParentRoutingProjection` for the inherit / never list);
+ *   - `inheritRouting: true` runs the child on the arm the parent's router
+ *     SERVED for the spawning turn (the bridge's `routing.served`), default
+ *     off so `bridge.model` stays the declared primary;
+ *   - a Task call's `profile` argument (validated by the Task tool against the
+ *     definition's allowlist, re-checked here fail-closed) pins the child to
+ *     one of its resolved `allowedProfiles` options for that call;
+ *   - `budgetShare` gives the child its own `budget` — a sub-cap under the run
+ *     cap, `stop` on breach (a non-fatal classified child failure);
+ *   - the child's PRICED spend is re-published on the PARENT bus as ONE
+ *     `cost_accrual{role: "subagent", summary: true}` roll-up before the
+ *     spawn returns — today that spend was dropped between the child's bus
+ *     and the parent's, so `budget`, `cost-summary` and Hangar never saw it;
+ *   - `sub_agent_start` / `sub_agent_end` carry the child's `model` and
+ *     `profile`.
  */
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import {
@@ -40,8 +60,11 @@ import {
   type SubAgentResult,
   type ToolCallRecord,
   createIsolatedContext,
+  foldSubAgentOverlay,
+  subAgentProfileAllowlist,
 } from "@crewhaus/agent-context-isolation";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
+import { createCostTracker } from "@crewhaus/cost-tracker";
 import {
   type FailureReport,
   RunFailedError,
@@ -52,7 +75,8 @@ import { type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type FederationRouter, classifyRouterError } from "@crewhaus/federation-router";
 import { buildFailureReport, classify } from "@crewhaus/recovery-engine";
 import { tagContent } from "@crewhaus/run-context";
-import { runChatLoop } from "@crewhaus/runtime-core";
+import { type RunChatLoopOptions, runChatLoop } from "@crewhaus/runtime-core";
+import type { CostAccrualEvent, ModelResponseEvent, ProviderId } from "@crewhaus/trace-event-bus";
 
 /**
  * Item 2 (G31) — the federation extension to {@link SpawnSubAgentOptions}. A
@@ -105,6 +129,115 @@ function classifyChildFailure(err: unknown): SubAgentFailure {
 }
 
 /**
+ * 0.6.0 §7.7 — the model plan a child loop runs on, resolved from the
+ * definition, the parent's routing projection and the Task call's `profile`.
+ *
+ *   - `declared`  — the default: `def.model` (else the parent's declared
+ *                   primary), the child's own params and routing quartet, and
+ *                   its own profile's overlay (`def.overlay`) heading the prompt;
+ *   - `inherited` — `def.inheritRouting: true` and the bridge projected a
+ *                   served arm: that arm's spec model is the child's primary
+ *                   (its `profile` is stamped for attribution); the child's
+ *                   own params and quartet still apply — a child with its own
+ *                   `model_pool` routes itself, the inherited model is only its
+ *                   nominal primary;
+ *   - `pinned`    — the Task call named one of `def.allowedProfiles`: the child
+ *                   runs single-model on that option (its params, overlay and
+ *                   failover chain); the definition's `model_pool` /
+ *                   `model_tiers` do not route this call, and the option's
+ *                   overlay REPLACES the default profile's — a pinned prompt
+ *                   never carries both.
+ *
+ * `profile` is re-checked against the allowlist here even though the Task
+ * tool validated it first: a model-filled model argument fails closed at every
+ * layer (§10.1). A `profile` that restates the child's own identity (its
+ * profile name or model string) is accepted and yields the default plan.
+ */
+export type ChildLoopPlan = {
+  readonly source: "declared" | "inherited" | "pinned";
+  readonly model: string;
+  readonly profile?: string;
+  readonly instructions: string;
+  readonly maxTokens: number;
+  readonly loopOptions: Pick<
+    RunChatLoopOptions,
+    | "thinking"
+    | "temperature"
+    | "modelFallbacks"
+    | "circuitBreaker"
+    | "modelTiers"
+    | "modelPool"
+    | "budget"
+  >;
+};
+
+export function resolveChildLoopPlan(
+  parent: ParentRunHandle,
+  def: SubAgentDefinition,
+  profile: string | undefined,
+): ChildLoopPlan {
+  // §7.7 — `budget_share`: a sub-cap under the parent's run cap. Inert when the
+  // parent declares no budget (nothing to take a share of).
+  const parentCapMicros = parent.routing?.budgetUsdMicros;
+  const budget: Pick<RunChatLoopOptions, "budget"> =
+    def.budgetShare !== undefined && parentCapMicros !== undefined
+      ? {
+          budget: {
+            usdMicros: Math.max(0, Math.round(parentCapMicros * def.budgetShare)),
+            onExceed: { kind: "stop" },
+          },
+        }
+      : {};
+  if (profile !== undefined) {
+    const allowed = subAgentProfileAllowlist(def, parent.model);
+    if (!allowed.includes(profile)) {
+      throw new Error(
+        `sub-agent "${def.name}": profile "${profile}" is not allowed — allowed: ${allowed.join(", ")}`,
+      );
+    }
+    const option = def.allowedProfiles?.find((o) => o.profile === profile);
+    if (option !== undefined) {
+      return {
+        source: "pinned",
+        model: option.model,
+        profile: option.profile,
+        // Only the pinned option's overlay: `def.overlay` belongs to the
+        // profile the call chose NOT to run on.
+        instructions: foldSubAgentOverlay(def.instructions, option.overlay),
+        maxTokens: option.maxTokens ?? def.maxTokens ?? parent.maxTokens,
+        loopOptions: {
+          ...(option.thinking !== undefined ? { thinking: option.thinking } : {}),
+          ...(option.temperature !== undefined ? { temperature: option.temperature } : {}),
+          ...(option.modelFallbacks !== undefined ? { modelFallbacks: option.modelFallbacks } : {}),
+          ...(option.circuitBreaker !== undefined ? { circuitBreaker: option.circuitBreaker } : {}),
+          ...budget,
+        },
+      };
+    }
+    // The argument restated the child's own identity — the default plan.
+  }
+  const served = def.inheritRouting === true ? parent.routing?.served : undefined;
+  const model = served?.model ?? def.model ?? parent.model;
+  const label = served !== undefined ? served.profile : def.modelProfile;
+  return {
+    source: served !== undefined ? "inherited" : "declared",
+    model,
+    ...(label !== undefined ? { profile: label } : {}),
+    instructions: foldSubAgentOverlay(def.instructions, def.overlay),
+    maxTokens: def.maxTokens ?? parent.maxTokens,
+    loopOptions: {
+      ...(def.thinking !== undefined ? { thinking: def.thinking } : {}),
+      ...(def.temperature !== undefined ? { temperature: def.temperature } : {}),
+      ...(def.modelFallbacks !== undefined ? { modelFallbacks: def.modelFallbacks } : {}),
+      ...(def.circuitBreaker !== undefined ? { circuitBreaker: def.circuitBreaker } : {}),
+      ...(def.modelTiers !== undefined ? { modelTiers: def.modelTiers } : {}),
+      ...(def.modelPool !== undefined ? { modelPool: def.modelPool } : {}),
+      ...budget,
+    },
+  };
+}
+
+/**
  * Spawn one sub-agent run.
  *
  * Failure semantics (v0.3.0 §7.1):
@@ -136,11 +269,19 @@ export async function spawnSubAgent(
     return spawnFederatedSubAgent(parent, opts, federation);
   }
   const sessionRootDir = opts.sessionRootDir ?? parent.sessionRootDir;
+  // 0.6.0 §7.7 — resolve the child's model plan BEFORE minting anything: a
+  // disallowed `profile` fails closed with nothing spawned and no bracket
+  // opened (the Task tool already refused it; this is the second gate).
+  const plan = resolveChildLoopPlan(parent, opts.def, opts.profile);
+  const planAttribution = {
+    model: plan.model,
+    ...(plan.profile !== undefined ? { profile: plan.profile } : {}),
+  };
   const isoOpts: CreateIsolatedContextOptions = {
     name: opts.def.name,
-    instructions: opts.def.instructions,
+    instructions: plan.instructions,
     tools: opts.childTools,
-    ...(opts.def.model !== undefined ? { model: opts.def.model } : {}),
+    model: plan.model,
     ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
   };
   const child: IsolatedContext = await createIsolatedContext(parent, isoOpts);
@@ -154,6 +295,7 @@ export async function spawnSubAgent(
       prompt: opts.prompt,
       toolCount: opts.childTools.length,
       permissionMode: opts.permissionMode,
+      ...planAttribution,
     },
   });
 
@@ -169,6 +311,7 @@ export async function spawnSubAgent(
     childSessionId: child.sessionId,
     toolCount: opts.childTools.length,
     promptBytes: Buffer.byteLength(opts.prompt, "utf8"),
+    ...planAttribution,
   });
 
   // Loop contract 0.4 (Batch C, G57) — aggregate the child's real token usage
@@ -181,12 +324,29 @@ export async function spawnSubAgent(
   // token usage is never persisted to the child's JSONL by default.
   let childInputTokens = 0;
   let childOutputTokens = 0;
+  let childCacheReadTokens = 0;
+  let childCacheCreationTokens = 0;
+  let childCalls = 0;
+  let childLastProvider: ProviderId | undefined;
+  let childLastWireModel: string | undefined;
   const usageUnsubscribe = child.runContext.eventBus.subscribe((ev) => {
     if (ev.kind === "model_response") {
-      childInputTokens += ev.usage.input;
-      childOutputTokens += ev.usage.output;
+      const resp = ev as ModelResponseEvent;
+      childInputTokens += resp.usage.input;
+      childOutputTokens += resp.usage.output;
+      childCacheReadTokens += resp.usage.cacheRead ?? 0;
+      childCacheCreationTokens += resp.usage.cacheCreate ?? 0;
+      childCalls += 1;
+      childLastProvider = resp.provider ?? "anthropic";
+      childLastWireModel = resp.model;
     }
   });
+  // 0.6.0 §7.7 / §10.2 — PRICE the child's calls on its own bus (events
+  // suppressed: the child loop's own observability publishes its per-call
+  // accruals on the child bus already) so ONE roll-up can be re-published on
+  // the parent bus below. Priced with the same default table the parent's
+  // budget meter uses.
+  const childCostTracker = createCostTracker(child.runContext.eventBus, { suppressEvents: true });
 
   const t0SubAgent = performance.now();
   let finalMessage = "";
@@ -197,8 +357,11 @@ export async function spawnSubAgent(
 
   try {
     finalMessage = await runChatLoop({
-      model: opts.def.model ?? parent.model,
-      instructions: opts.def.instructions,
+      // 0.6.0 §7.7 — the resolved plan: declared primary / the parent's served
+      // arm (`inheritRouting`) / a pinned allowed profile, with the child's own
+      // params, routing quartet and `budget_share` sub-cap spread below.
+      model: plan.model,
+      instructions: plan.instructions,
       runContext: child.runContext,
       sessionName: opts.def.name,
       sessionTarget: "subagent",
@@ -213,7 +376,11 @@ export async function spawnSubAgent(
       // `settings` layer would outrank a replace-mode child's `yaml` deny.
       settingsDir: null,
       installSigintHandler: false,
-      maxTokens: parent.maxTokens,
+      maxTokens: plan.maxTokens,
+      // 0.6.0 (design §8.1) — every model event the child publishes on its own
+      // bus is attributed `role: "subagent"`, like the roll-up on the parent's.
+      modelRole: "subagent",
+      ...plan.loopOptions,
       ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
       // v0.3.0 §7.1 — thread the parent's seams into the child loop:
       //   - memory: recall ON (the parent's recall closure, so recalled
@@ -289,6 +456,44 @@ export async function spawnSubAgent(
   // The child loop has returned (or thrown) — every `model_response` it was
   // going to emit has been observed, so stop listening.
   usageUnsubscribe();
+  const childSpend = childCostTracker.getRunCost(child.runContext.runId);
+  const childPricingMisses = childCostTracker.pricingMisses();
+  childCostTracker.unsubscribe();
+
+  // 0.6.0 §7.6 / §10.2 — re-publish the child's spend on the PARENT bus as ONE
+  // summary accrual, so the parent's `budgetMeter` (keyed on the parent
+  // `bus.runId`) counts it, `cost-summary` totals it and Hangar / OTel see it
+  // under `role: "subagent"`. `summary: true` marks it a roll-up (never a
+  // per-call line); cost-tracker folds a role-bearing summary from another bus
+  // and still ignores the optimizer's role-less run total. Published BEFORE
+  // `sub_agent_end` so the accrual sits inside the child's bracket, and only
+  // when the child made a model call at all. `modelId` is the wire model that
+  // served the child's LAST call (a child pool may have served several — the
+  // child's own session log has the per-call lines).
+  if (childCalls > 0 && childLastProvider !== undefined && childLastWireModel !== undefined) {
+    const unpriced =
+      childSpend.totalUsdMicros === 0 &&
+      childPricingMisses > 0 &&
+      childInputTokens + childOutputTokens > 0;
+    const accrual: CostAccrualEvent = {
+      ...parentBus.envelope(),
+      spanId: subAgentEnvelope.spanId,
+      kind: "cost_accrual",
+      role: "subagent",
+      summary: true,
+      provider: childLastProvider,
+      modelId: childLastWireModel,
+      ...(plan.model !== childLastWireModel ? { specModel: plan.model } : {}),
+      ...(plan.profile !== undefined ? { profile: plan.profile } : {}),
+      inputTokens: childInputTokens,
+      outputTokens: childOutputTokens,
+      cachedReadTokens: childCacheReadTokens,
+      cacheCreationTokens: childCacheCreationTokens,
+      costUsdMicros: childSpend.totalUsdMicros,
+      ...(unpriced ? { unpriced: true } : {}),
+    };
+    parentBus.publish(accrual);
+  }
 
   // Read the child's event log back to assemble transcript + tool calls.
   // Use a fresh handle (the runtime closed its handle in its `finally`).
@@ -322,6 +527,7 @@ export async function spawnSubAgent(
       ...(childFailure !== undefined ? { failureClass: childFailure.failureClass } : {}),
       finalMessageLength: finalMessage.length,
       toolCallCount: toolCalls.length,
+      ...planAttribution,
     },
   });
 
@@ -337,6 +543,7 @@ export async function spawnSubAgent(
     toolCallCount: toolCalls.length,
     finalMessageBytes: Buffer.byteLength(finalMessage, "utf8"),
     durationMs: performance.now() - t0SubAgent,
+    ...planAttribution,
   });
 
   await child.close();

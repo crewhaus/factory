@@ -10,6 +10,7 @@
  */
 export {
   joinQualityToArms,
+  QUALITY_LANE_PREFIX,
   type QualityArmRow,
   type RouteDecision,
   type TurnQuality,

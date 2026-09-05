@@ -345,7 +345,14 @@ function emitCliShape(ir: IrV0): PluginFile[] {
   for (const sa of ir.subAgents ?? []) {
     files.push({
       path: `agents/${sa.name}.md`,
-      content: renderAgent(sa.name, sa.description, sa.instructions),
+      // 0.6.0 §7.7 — the IR carries the default profile's overlay raw (the
+      // spawner picks between it and a pinned option per Task call); a plugin
+      // agent file has no per-call choice, so its body is the declared prompt.
+      content: renderAgent(
+        sa.name,
+        sa.description,
+        sa.overlay !== undefined ? `${sa.overlay}\n\n${sa.instructions}` : sa.instructions,
+      ),
     });
   }
   return files;

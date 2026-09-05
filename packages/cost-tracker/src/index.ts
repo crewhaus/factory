@@ -189,6 +189,22 @@ export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions =
   }
 
   const handler = (event: TraceEvent): void => {
+    // 0.6.0 §7.6 / §10.2 — a ROLE-bearing `summary: true` accrual is a nested
+    // run's roll-up re-published on this bus (a sub-agent child's
+    // `role: "subagent"` total; a hybrid side call's `guide` / `shadow` /
+    // `committee` total): spend whose `model_response` events this tracker
+    // never saw, already priced by the publisher. Fold it — that is what lets
+    // the parent's budget meter count a child's spend at all. Every other
+    // externally published accrual stays ignored, including this tracker's
+    // own per-call output and the optimizer's ROLE-LESS run total (a sum over
+    // per-call accruals this tracker already folded — counting it would
+    // double-count). Never re-published: the roll-up is on the bus already.
+    if (event.kind === "cost_accrual") {
+      const accrual = event as CostAccrualEvent;
+      if (accrual.summary !== true || accrual.role === undefined) return;
+      recordCost(accrual.runId, accrual.provider, accrual.role, accrual.costUsdMicros, tenantId);
+      return;
+    }
     if (event.kind !== "model_response") return;
     const resp = event as ModelResponseEvent;
     const provider: ProviderId = resp.provider ?? "anthropic";

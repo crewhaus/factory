@@ -591,7 +591,31 @@ export type ContinuitySeam = {
   readonly onPlanDirty?: () => Promise<string | null>;
   readonly ledger?: boolean;
   readonly onHandoff?: (input: HandoffSeamInput) => Promise<void>;
+  /** 0.6.0 §7.4 — a guide-produced plan (`strategy.guide`, `every:
+   *  first_turn`) written into the plan store; see {@link guidePlanToStore}. */
+  readonly savePlan?: (planText: string) => Promise<void>;
 };
+
+/**
+ * 0.6.0 §7.4 (PR 9d) — project a guide's free-text plan onto the plan
+ * store's record shape: the first non-empty line is the title, every later
+ * non-empty line (list markers stripped) is a step; the new plan becomes the
+ * active one so `<current_plan>` re-renders from it on the next model call
+ * and on resume. Exported for direct unit coverage.
+ */
+export function guidePlanToStore(planText: string): { title: string; steps: string[] } {
+  const lines = planText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  const strip = (l: string): string => l.replace(/^(?:[-*•]|\d+[.)])\s+/, "").trim();
+  const title = strip(lines[0] ?? "Guide plan").slice(0, 120) || "Guide plan";
+  const steps = lines
+    .slice(1)
+    .map(strip)
+    .filter((l) => l.length > 0);
+  return { title, steps };
+}
 
 /**
  * Spread-ready `RunChatLoopOptions` slice: `runChatLoop({ ...base,
@@ -935,6 +959,17 @@ export function wireContinuity(
     loadPlan: () => renderPlanTail(store, plan),
     onPlanDirty: () => renderPlanTail(store, plan),
     ledger: cont.ledger !== false,
+    // 0.6.0 §7.4 — plan-execute: a first-turn guide's plan lands in the store
+    // (only when plans are on; `plan: false` keeps the store plan-free).
+    ...(plan
+      ? {
+          savePlan: async (planText: string) => {
+            const { title, steps } = guidePlanToStore(planText);
+            const record = await store.createPlan({ title, steps });
+            await store.setActivePlan(record.id);
+          },
+        }
+      : {}),
     ...(cont.handoff !== false
       ? {
           onHandoff: async (input: HandoffSeamInput) => {

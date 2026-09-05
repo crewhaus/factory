@@ -15,6 +15,7 @@ import {
 } from "@crewhaus/adapter-anthropic";
 import type {
   CrewMailbox,
+  ParentServedArm,
   RuntimeBridge,
   SpawnSubAgentFn,
   SubAgentDefinition,
@@ -117,6 +118,8 @@ import {
   type Scoreboard,
   computeReward,
   openScoreboard,
+  shadowLaneQuality,
+  shadowRouteKey,
 } from "@crewhaus/routing-store";
 import { type RunContext, createRunContext, tagContent } from "@crewhaus/run-context";
 import {
@@ -163,6 +166,7 @@ import {
   createCliMarkdownRenderer,
   isCliMarkdownEnabled,
 } from "./cli-markdown";
+import { createMemoryEventLog, createMemorySessionStore } from "./ephemeral";
 import { type ExitRatingFeedback, FEEDBACK_EVENT_KIND, runExitRating } from "./exit-rating";
 import { attachIncidentCollector } from "./incident-collector";
 import { type AdvertisedToolSummary, LIST_TOOLS_NAME, buildListToolsTool } from "./list-tools";
@@ -1223,6 +1227,165 @@ export type HybridEscalationRequest = {
 };
 
 /**
+ * 0.6.0 §7.4 / §7.6 / §7.8 (PR 9d) — the hybrid SIDE CALLS: closures the
+ * composition root (`@crewhaus/model-service`'s `wireModels`) builds from
+ * `model_pool.strategy` and hands the loop. Each runs as a nested single-turn
+ * `runChatLoop` on its OWN child `RunContext` and child bus — the side-call
+ * isolation contract (§7.6, §10.2): never a parallel `runOneTurn`, never the
+ * parent's turn counter, `turnAbort`, `lastErrorForRecovery` or watchdog
+ * slots — with the child's model events re-published on the PARENT bus so
+ * the parent's meter counts them under `budget.judge_share`, and with
+ * `persistSession: false` so no child session file is written (§16 Q6).
+ * runtime-core owns the LIFECYCLE (when a side call runs, what its text
+ * does, the `model_stage` events, the scoreboard fold); the closures own the
+ * model calls. Absent → byte-identical to a pre-0.6.0 runtime.
+ */
+export type SideCallTurnContext = {
+  /** The PARENT run's context — the closure mints its child from it. */
+  readonly runContext: RunContext;
+  /** The parent bus — the closure re-publishes its child's model events here. */
+  readonly bus: TraceEventBus;
+  readonly turnNumber: number;
+  /** The run's user instructions (the system prompt a side call may reuse). */
+  readonly instructions: string;
+  /**
+   * The transcript as of the side call — for a guide, before the turn's first
+   * model call; for a shadow, exactly the messages the primary answered (the
+   * turn's input last). A snapshot the closure may keep; the runtime's live
+   * array is never handed out.
+   */
+  readonly messages: ReadonlyArray<Anthropic.MessageParam>;
+  /** Aborting this signal aborts the side call (the turn's for guide and
+   *  committee, the run's for the post-response shadow). */
+  readonly signal: AbortSignal;
+  /** The pool's scope (step / node / role name), when any. */
+  readonly scope?: string;
+  /**
+   * §7.12 / §14(2) — the run's budget gate (`enforceBudget` for the current
+   * turn), so a closure that makes SEVERAL model calls (the committee's
+   * members and tie-breaker) can re-read the total cap between them: `"stop"`
+   * means the cap is reached — exclude every call not yet made (cause
+   * `budget`) rather than open it. Absent when the loop has no `budget`.
+   * The single-call closures (guide, shadow) are gated by the loop itself
+   * before they start.
+   */
+  readonly budgetGate?: () => Promise<"continue" | "stop">;
+};
+
+/** What a guide call produced: text to inject, or `null` with a `cause`. */
+export type GuideReply = {
+  readonly text: string | null;
+  readonly cause?: string;
+};
+
+/**
+ * §7.4 — the guide (plan-execute): a bounded single-turn call on the guide
+ * model whose text the loop appends in the VOLATILE system region as a
+ * `<guide>` block (after the continuity tail, before the candidate overlay),
+ * classified at TrustOrigin `consult` and lineage-tagged. `every: "first_turn"`
+ * IS plan-execute — the strong model plans once, the block stays for the rest
+ * of the run, and the plan is written to the continuity plan store when
+ * `continuity.savePlan` is wired; `every: "turn"` re-plans every turn (and
+ * re-writes the transcript cache entry every turn — the documented cost).
+ */
+export type GuideSideCall = {
+  readonly every: "first_turn" | "turn";
+  /** Spec model string of the guide (for `model_stage`). */
+  readonly model: string;
+  readonly profile?: string;
+  readonly run: (ctx: SideCallTurnContext) => Promise<GuideReply>;
+};
+
+/** The blind, order-swapped pairwise verdict of one shadow run. */
+export type ShadowVerdict = {
+  readonly verdict: "shadow" | "primary" | "tie";
+  /** True when both presentation orders agreed (a disagreement is a tie). */
+  readonly agreed: boolean;
+  /** Wire model id that served the shadow call, and its provider. */
+  readonly model: string;
+  readonly provider: ProviderId;
+  readonly usage: ModelUsage;
+  readonly latencyMs: number;
+  readonly judgeModel?: string;
+};
+
+/**
+ * §7.8 — the audition lane: the same request re-run on the shadow candidate
+ * AFTER the primary has answered, on a sampled share of turns, graded blind
+ * against the primary; both arms record into `shadow:<scope>/<band>`. The
+ * shadow's text never reaches the transcript — the closure returns only the
+ * verdict.
+ */
+export type ShadowSideCall = {
+  /** Spec model string of the shadow candidate — its arm id. */
+  readonly candidate: string;
+  readonly profile?: string;
+  /** Share of turns that run the shadow, in [0, 1]. */
+  readonly sampleRate: number;
+  readonly run: (
+    ctx: SideCallTurnContext & { readonly primaryText: string; readonly primaryModel: string },
+  ) => Promise<ShadowVerdict>;
+};
+
+export type CommitteeMemberOutcome = {
+  readonly modelString: string;
+  readonly profile?: string;
+  /** Wire model id that served (absent when the member failed before serving). */
+  readonly model?: string;
+  /** `skipped`: the member never ran — the budget gate stopped the committee
+   *  before its turn came (`cause: "budget"`). */
+  readonly outcome: "done" | "failed" | "skipped";
+  readonly latencyMs: number;
+  readonly usage?: ModelUsage;
+  /** The member's judged quality (1 won, 0 lost, 0.5 unresolved), when judged. */
+  readonly quality?: number;
+  readonly cause?: string;
+};
+
+/** The committee's decision for one single-turn host turn. */
+export type CommitteeVerdict = {
+  /** The served text — the judged winner's, or the tie-breaker's. */
+  readonly text: string;
+  readonly winner: {
+    readonly modelString: string;
+    readonly model: string;
+    readonly profile?: string;
+  };
+  /** True when the judge's two presentation orders agreed on the winner. */
+  readonly agreed: boolean;
+  /** True when the disagreement tie-breaker produced the served text. */
+  readonly escalated: boolean;
+  /** How the served text was chosen (`"agreed"`, `"escalated"`,
+   *  `"disagreement"`, `"single-member"`, `"judge-failed"`, …); stamped on
+   *  the committee's `model_stage` line. */
+  readonly cause?: string;
+  readonly members: ReadonlyArray<CommitteeMemberOutcome>;
+  /** Usage summed over every member call and the tie-breaker. */
+  readonly usage: ModelUsage;
+};
+
+/**
+ * §7.6 — the committee, legal on SINGLE-TURN hosts only (a workflow step, a
+ * graph node, a crew role): N tool-less nested side calls, then `decide:
+ * judge` picks; `escalateOnDisagreement` runs the strong tie-breaker only
+ * when the judge's orders disagree — agreement is an acceptor signal, never a
+ * reward. Replaces the host's primary turn: the served text is the verdict.
+ */
+export type CommitteeSideCall = {
+  readonly members: ReadonlyArray<{ readonly modelString: string; readonly profile?: string }>;
+  /** Spec model string of the deciding judge (for `model_stage`). */
+  readonly judge: string;
+  readonly escalateOnDisagreement?: { readonly modelString: string; readonly profile?: string };
+  readonly run: (ctx: SideCallTurnContext) => Promise<CommitteeVerdict>;
+};
+
+export type HybridSideCalls = {
+  readonly guide?: GuideSideCall;
+  readonly shadow?: ShadowSideCall;
+  readonly committee?: CommitteeSideCall;
+};
+
+/**
  * 0.6.0 §7.2.3 — the injected `policy: classifier` label call. Built by
  * `@crewhaus/model-service`'s `wireModels` over `@crewhaus/eval-judge`'s
  * `classifyRouteLabel` (an enum-constrained forced-tool call metered with
@@ -1355,6 +1518,32 @@ export type RunChatLoopOptions = {
    * pool-less run throws at boot rather than silently serving the primary.
    */
   forcedCandidate?: string;
+  /**
+   * 0.6.0 §7.4 / §7.6 / §7.8 — the guide / shadow / committee side calls
+   * (see {@link HybridSideCalls}), built by `wireModels` from the pool's
+   * `strategy` block. `committee` is legal in `singleTurn` mode only (a
+   * workflow step, a graph node, a crew role) — the spec rejects it on REPL
+   * hosts and the loop refuses it at boot as the second line of defence.
+   * Absent → byte-identical to a pre-0.6.0 runtime.
+   */
+  sideCalls?: HybridSideCalls;
+  /**
+   * §7.8 — the shadow is NON-BLOCKING: on the REPL it runs while the loop
+   * waits for the next line; on a `singleTurn` host the turn IS the run, so
+   * without this seam the loop awaits an in-flight shadow at teardown and
+   * the served text is not returned until the audition lane (the shadow call
+   * plus two judge calls) has settled. A host that serves MANY single turns
+   * from one process — `crewhaus serve`, a channel bot — supplies this: the
+   * loop hands it the shadow's settled promise (never rejects) and returns
+   * the served text at once; the host awaits every drained promise before it
+   * exits (serve does so in its cleanup). A one-shot host (a workflow step, a
+   * graph node, a crew role) leaves it undefined and keeps the inline await,
+   * so its process never exits under a running shadow. Stage lines the
+   * drained shadow publishes after the loop's teardown reach the parent
+   * bus's live subscribers only (the run's session mirror is closed by then);
+   * the scoreboard record — what the lane exists for — is unaffected.
+   */
+  sideCallDrain?: (settled: Promise<void>) => void;
   /** Per-run identity, abort signal, and logger. Defaults to a fresh `createRunContext()`. */
   runContext?: RunContext;
   /** Context-window limit in tokens. Defaults to 200_000 (Claude opus/sonnet 4.x). */
@@ -1443,6 +1632,17 @@ export type RunChatLoopOptions = {
    * event-log `.jsonl` files live. Defaults to `.crewhaus/sessions`.
    */
   sessionRootDir?: string;
+  /**
+   * 0.6.0 §16 Q6 — `false` keeps this run entirely IN MEMORY: no session
+   * `.json`, no event-log `.jsonl`, no watch-me sidecar, no TTL sweep of the
+   * sessions dir or the approvals log. Set by the nested single-turn side
+   * calls a hybrid strategy runs (consult, guide, shadow, committee members)
+   * so a run never writes one child session file per member per turn — their
+   * spend and stage transitions are re-published on the PARENT bus and land
+   * in the parent's log. Cannot be combined with `resume`. Default `true`,
+   * byte-identical to before.
+   */
+  persistSession?: boolean;
   /**
    * Human-readable label for new sessions; persisted to the session JSON.
    * Typically the spec `name`. Defaults to `(unnamed)`.
@@ -1645,6 +1845,14 @@ export type RunChatLoopOptions = {
     readonly ledger?: boolean;
     /** Deterministic teardown handoff write. */
     readonly onHandoff?: (input: HandoffInput) => Promise<void>;
+    /**
+     * 0.6.0 §7.4 — write a plan the GUIDE produced (`strategy.guide` with
+     * `every: first_turn`) into the continuity plan store, so plan-execute
+     * survives the run: the strong model plans once, the store re-renders it
+     * as `<current_plan>` on every later call and on resume. Best-effort — a
+     * store failure leaves the volatile `<guide>` block in place and warns.
+     */
+    readonly savePlan?: (planText: string) => Promise<void>;
   };
   /**
    * Item #56 — absolute paths to per-user preference files injected at run
@@ -2974,11 +3182,30 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Persistence boot: session create/resume + event log open. Runs first
   // so the run context's sessionId — possibly carried over from a prior
   // run — is the one the rest of the loop logs against.
+  // 0.6.0 §16 Q6 — `persistSession: false` swaps BOTH stores for in-memory
+  // twins and skips every disk sweep below: a nested side call leaves no
+  // file behind. There is then nothing to resume from, so `resume` is refused.
+  const persistSession = opts.persistSession !== false;
+  if (!persistSession && opts.resume !== undefined) {
+    throw new RuntimeError(
+      "runChatLoop: `persistSession: false` cannot be combined with `resume` — an in-memory run has no session file to resume from",
+    );
+  }
+  // 0.6.0 §7.6 — the committee replaces the host's ONE turn; on a REPL loop
+  // it would replace every turn the user is waiting on. The spec rejects it
+  // on cli / channel / managed; the loop refuses it here as the second gate.
+  if (opts.sideCalls?.committee !== undefined && opts.singleTurn !== true) {
+    throw new RuntimeError(
+      "runChatLoop: `sideCalls.committee` is legal in singleTurn mode only (a workflow step, a graph node, a crew role) — a REPL or per-message turn is one the user is waiting on",
+    );
+  }
   const sessionRootDir = resolveSessionRootDir(opts.sessionRootDir);
-  const sessionStore: SessionStore = createSessionStore({ rootDir: sessionRootDir });
+  const sessionStore: SessionStore = persistSession
+    ? createSessionStore({ rootDir: sessionRootDir })
+    : createMemorySessionStore();
   // Housekeeping side-effect: evicts any session whose mtime is older than
   // the TTL (default 30 days). The returned list is intentionally discarded.
-  await sessionStore.list();
+  if (persistSession) await sessionStore.list();
   // Loop contract 0.4 (G11) — the same sweep for the approvals log sitting
   // beside those sessions. It has no other unattended pruner: only `list()`
   // compacts it, and `list()`'s only production callers are the human-invoked
@@ -2991,9 +3218,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // `opts.approvals`) so a harness that has since switched to `ask_mode: deny`
   // still gets its old parks pruned; it costs one ENOENT when the file does
   // not exist. Best-effort, exactly like the session sweep above.
-  await evictExpiredApprovals({
-    ...(sessionRootDir !== undefined ? { rootDir: sessionRootDir } : {}),
-  }).catch(() => undefined);
+  if (persistSession) {
+    await evictExpiredApprovals({
+      ...(sessionRootDir !== undefined ? { rootDir: sessionRootDir } : {}),
+    }).catch(() => undefined);
+  }
 
   // Adaptive model routing (spec `agent.model_pool`). Resolve every candidate
   // adapter ONCE at boot (mirroring the tier router), open the durable reward
@@ -3126,6 +3355,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // `reward.quality_source: in_loop`; otherwise it is persisted on the `v:2`
   // line but the reward is computed without it (byte-identical to 0.5.x).
   const qualityIntoReward = opts.modelPool?.reward?.qualitySource === "in_loop";
+  // 0.6.0 §7.8 — the LAST successfully served pool call of the current turn
+  // (arm, band, latency, cost): what the shadow lane grades against and
+  // records beside the shadow arm. Undefined without a pool.
+  let lastPoolOutcome:
+    | {
+        readonly modelString: string;
+        readonly routeKey: string;
+        readonly latencyMs: number;
+        readonly costUsd?: number;
+      }
+    | undefined;
   // Fold one turn's observed outcome into the scoreboard (no-op without a pool).
   const recordPoolOutcome = (
     turn: { readonly modelString: string; readonly routeKey: string } | undefined,
@@ -3135,6 +3375,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const sb = scoreboard;
     const rc = rewardConfig;
     if (turn === undefined || sb === undefined || rc === undefined) return;
+    if (obs.success) {
+      lastPoolOutcome = {
+        modelString: turn.modelString,
+        routeKey: turn.routeKey,
+        latencyMs: obs.latencyMs,
+        ...(obs.costUsd !== undefined ? { costUsd: obs.costUsd } : {}),
+      };
+    }
     // §6.3 item 1 / §7.13 — under `in_loop` an OMITTED quality is
     // unrepresentable: `computeReward` reads it as a perfect 1.0, so a
     // successful observation the judge never scored (a direct-served strong
@@ -3264,8 +3512,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         continue;
       }
       if (ev.kind === "cost_accrual") {
-        if (nestDepth > 0 || !budgetSessionScoped) continue;
-        const p = ev.payload as { costUsdMicros?: unknown };
+        if (!budgetSessionScoped) continue;
+        const p = ev.payload as { costUsdMicros?: unknown; summary?: unknown; role?: unknown };
+        // 0.6.0 §10.2 — a child's role-bearing roll-up sits INSIDE its
+        // sub_agent bracket but was published on THIS bus and counted by this
+        // run's meter, so it seeds the resumed meter too; a peer's per-call
+        // lines inside a bracket stay skipped as before.
+        const childRollup = p.summary === true && typeof p.role === "string";
+        if (nestDepth > 0 && !childRollup) continue;
         if (typeof p.costUsdMicros === "number" && Number.isFinite(p.costUsdMicros)) {
           resumedCostUsdMicros += Math.max(0, p.costUsdMicros);
         }
@@ -3454,6 +3708,22 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // model call). It is a TURN boundary: every gate of this turn lets the
   // rung serve; the first gate of the next turn stops the run.
   let budgetDegradedAtTurn = 0;
+  /**
+   * 0.6.0 §7.12 — the READ-ONLY twin of `enforceBudget` for the post-answer
+   * shadow: true when the total cap is reached and this is not the turn a
+   * `degrade` fired in (the rung serves every remaining call of that turn).
+   * The shadow cannot call `enforceBudget` itself — a `degrade` breach is a
+   * TURN-BOUNDARY latch, and firing it from the audition lane after the
+   * answer would consume the degraded turn (the next pre-turn gate would
+   * then stop instead of serving one degraded turn). Auxiliary spend past
+   * the cap is skipped, never opened.
+   */
+  const totalCapReached = (turn: number): boolean => {
+    if (opts.budget === undefined || budgetMeter === undefined) return false;
+    const spent = resumedCostUsdMicros + budgetMeter.getRunCost(bus.runId).totalUsdMicros;
+    if (spent < opts.budget.usdMicros) return false;
+    return !(budgetDegraded && turn === budgetDegradedAtTurn);
+  };
 
   /**
    * Item 27 / 0.6.0 §7.12 — the budget gate. Returns "stop" when the run
@@ -3613,7 +3883,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     out.write("\n");
   };
 
-  const eventLog: EventLog = await openEventLog(sessionId, { rootDir: sessionRootDir });
+  const eventLog: EventLog = persistSession
+    ? await openEventLog(sessionId, { rootDir: sessionRootDir })
+    : createMemoryEventLog();
 
   // #405 — reconcile the session's recorded toolset with THIS run's.
   //
@@ -3732,22 +4004,26 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // the session JSONL so `crewhaus cost-summary --session <id>` can sum spend
   // after the run. Gated on the same switch that attaches the cost-tracker
   // (CREWHAUS_COST_TRACKING): no tracker → no accruals to persist, and the
-  // message-only transcript stays unchanged by default. Per-call accruals only
-  // — skip the FR-003 terminal `summary` aggregate so a run total never
-  // double-counts. `append()` writes synchronously, and a persist failure must
-  // never abort a turn, so the result is logged rather than thrown.
+  // message-only transcript stays unchanged by default. Per-call accruals plus
+  // (0.6.0 §10.2) the ROLE-bearing `summary` roll-ups a nested run re-publishes
+  // on this bus (a sub-agent's `role: "subagent"` total — spend this log has no
+  // per-call lines for); the FR-003 terminal role-less `summary` aggregate is
+  // still skipped so a run total never double-counts. `append()` writes
+  // synchronously, and a persist failure must never abort a turn, so the
+  // result is logged rather than thrown.
   let costPersistUnsubscribe: Unsubscribe | undefined;
   if (subscribers.costTracker !== undefined || budgetSessionPersist) {
     costPersistUnsubscribe = bus.subscribe((event): void => {
       if (event.kind !== "cost_accrual") return;
       const ev = event as CostAccrualEvent;
-      if (ev.summary === true) return;
+      if (ev.summary === true && ev.role === undefined) return;
       void eventLog
         .append({
           kind: "cost_accrual",
           payload: {
             provider: ev.provider,
             modelId: ev.modelId,
+            ...(ev.summary === true ? { summary: true } : {}),
             ...(ev.specModel !== undefined ? { specModel: ev.specModel } : {}),
             inputTokens: ev.inputTokens,
             outputTokens: ev.outputTokens,
@@ -3822,7 +4098,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // append the bus-only TraceEvent kinds to the `sessions/<id>.events.jsonl`
   // sibling that `sessions export` already reads. Mirrored/ephemeral kinds are
   // skipped, so the sibling stays metadata-grade. See observability.ts.
-  const watchmeCapture = attachWatchmeCapture(bus, sessionRootDir ?? DEFAULT_ROOT_DIR, sessionId);
+  const watchmeCapture = persistSession
+    ? attachWatchmeCapture(bus, sessionRootDir ?? DEFAULT_ROOT_DIR, sessionId)
+    : undefined;
 
   // Per-run state container — coordination surface for hooks/skills/tools.
   // Shipped as plumbing in Section 10; v0.3.0 Goal 1 (§2.5) lands its first
@@ -4527,6 +4805,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const planFor = (candidate: PoolCandidate): CandidatePlan =>
     planByCandidate.get(candidate) ?? buildPlan(candidate, poolCandidateConfigs.get(candidate));
   let servingPlan: CandidatePlan = primaryPlan;
+  // 0.6.0 §4.4 / §7.7 — the arm that SERVED the last model call, as projected
+  // onto the bridge for children (`ParentRunHandle.routing.served`). Set beside
+  // `servingPlan` on every model call; until the first call it is the primary.
+  // A child inherits it only behind `inheritRouting: true` — `bridge.model`
+  // stays the declared primary.
+  let servedArm: ParentServedArm = {
+    model: primaryPlan.modelString,
+    wireModelId: primaryPlan.wireModelId,
+    armId: primaryPlan.armId,
+    fromPool: false,
+  };
   for (const plan of planByCandidate.values()) {
     if (plan.excludedTools.length === 0 && plan.permissionRules === permissionRules) continue;
     runContext.logger.info("model_pool candidate plan", {
@@ -4557,28 +4846,38 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         }
       : {};
   /**
-   * 0.6.0 §7.3 — publish one hybrid-strategy stage transition (the shape
-   * metrics / alerts count: an `escalation`-role stage with `outcome:
-   * "started"` is ONE escalation — `isEscalationEvent`). Durable through the
-   * loop's `attachRoutingPersistence` mirror into the session JSONL.
+   * 0.6.0 §7.3 / §8.1 — publish one hybrid-strategy stage transition (the
+   * shape metrics / alerts count: an `escalation`-role stage with `outcome:
+   * "started"` is ONE escalation — `isEscalationEvent`). A roster stage (the
+   * cascade rung, a self-escalation) names its `candidate` and the profile is
+   * read off the pool; a side-call stage (guide / shadow / committee, PR 9d)
+   * names the wire `model` and its `profile` directly. Durable through the
+   * loop's `attachRoutingPersistence` mirror into the session JSONL, so no
+   * caller needs its own `logEvent`.
    */
   const publishStage = (stage: {
     readonly stage: string;
     readonly strategy: string;
     readonly role: ModelRole;
-    readonly candidate: PoolCandidate;
+    readonly candidate?: PoolCandidate;
+    readonly model?: string;
+    readonly profile?: string;
     readonly outcome: "started" | "done" | "failed" | "skipped";
     readonly cause?: string;
     readonly costUsdMicros?: number;
   }): void => {
-    const profile = poolCandidateConfigs.get(stage.candidate)?.profile;
+    const profile =
+      stage.profile ??
+      (stage.candidate !== undefined
+        ? poolCandidateConfigs.get(stage.candidate)?.profile
+        : undefined);
     bus.publish({
       ...bus.envelope(),
       kind: "model_stage",
       stage: stage.stage,
       strategy: stage.strategy,
       role: stage.role,
-      model: stage.candidate.modelId,
+      model: stage.candidate?.modelId ?? stage.model ?? "",
       ...(profile !== undefined ? { profile } : {}),
       outcome: stage.outcome,
       ...(stage.cause !== undefined ? { cause: stage.cause } : {}),
@@ -5561,6 +5860,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       model: opts.model,
       maxTokens,
       ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
+      // 0.6.0 §4.4 / §10.2 — the routing projection for children: the arm
+      // that served this call (a child runs on it only behind
+      // `inheritRouting: true`) and the run cap (`budgetShare` takes a share
+      // of it). `model` above stays `opts.model`, the declared primary.
+      routing: {
+        served: servedArm,
+        ...(opts.budget !== undefined ? { budgetUsdMicros: opts.budget.usdMicros } : {}),
+      },
       hooks,
       // v0.3.0 §2.5 — the per-run state-store, so plan-mutating tools can
       // set PLAN_DIRTY_STATE_KEY and the loop re-renders the plan tail
@@ -6045,10 +6352,265 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     profile?: string;
   };
 
+  // -------------------------------------------------------------------------
+  // 0.6.0 PR 9d — the side-call lifecycle (guide / shadow / committee). The
+  // closures in `opts.sideCalls` make the model calls; this block decides
+  // WHEN they run, what their text does, and publishes one `model_stage`
+  // event per lifecycle transition (`started` | `done` | `failed` |
+  // `skipped`, §8.1). `attachRoutingPersistence` mirrors every `model_stage`
+  // into the session JSONL, so nothing here needs its own `logEvent`.
+  // -------------------------------------------------------------------------
+  /**
+   * §7.12 / §14(2) — the classified `crewhaus_budget` stop, shared by the
+   * per-model-call gate inside `runOneTurn` and the committee gate (a
+   * committee REPLACES the primary turn, so nothing after it would gate the
+   * run). `where` names the call the cap stopped.
+   */
+  const failBudgetStop = async (where: string): Promise<never> => {
+    const spentMicros =
+      resumedCostUsdMicros + (budgetMeter?.getRunCost(bus.runId).totalUsdMicros ?? 0);
+    const report: FailureReport = {
+      class: BUILTIN_FAILURE_CLASSES.crewhaus_budget.class,
+      title: BUILTIN_FAILURE_CLASSES.crewhaus_budget.title,
+      detail: `$${(spentMicros / 1_000_000).toFixed(4)} spent ≥ $${(
+        (opts.budget?.usdMicros ?? 0) / 1_000_000
+      ).toFixed(4)} cap before ${where}${
+        budgetDegraded ? " (degraded rung also reached the cap)" : ""
+      }`,
+      remediation: BUILTIN_FAILURE_CLASSES.crewhaus_budget.remediation,
+      exitCode: BUILTIN_FAILURE_CLASSES.crewhaus_budget.exitCode,
+    };
+    await publishRunFailed(report);
+    throw new RunFailedError(report);
+  };
+  const sideCallContext = (
+    messages: ReadonlyArray<Anthropic.MessageParam>,
+    signal: AbortSignal,
+  ): SideCallTurnContext => ({
+    runContext,
+    bus,
+    turnNumber: runContext.turnNumber,
+    instructions: opts.instructions,
+    // A snapshot: the turn keeps appending to the live array after the side
+    // call returns (and the shadow runs while it does).
+    messages: [...messages],
+    signal,
+    ...(poolScope !== undefined ? { scope: poolScope } : {}),
+    // §7.12 — a multi-call closure re-reads the total cap between its calls.
+    ...(opts.budget !== undefined
+      ? { budgetGate: () => enforceBudget(runContext.turnNumber) }
+      : {}),
+  });
+
+  // §7.4 — the guide block. Runs ONCE per strategy turn (keyed on the turn
+  // number, so an evaluation retry or a cascade stage inside the same turn
+  // never re-plans), before the turn's first model call. `first_turn` keeps
+  // its block for the rest of the run (plan-execute); `turn` replaces it each
+  // turn — and a `turn` guide that fails, returns nothing, is skipped or is
+  // boundary-blocked leaves the turn UNGUIDED (§7.13): the previous turn's
+  // block is dropped before the call, never re-injected beside a stage line
+  // that says the guide did not run. Volatile by construction: never
+  // persisted, never replayed on resume.
+  let guideBlocks: Anthropic.TextBlockParam[] = [];
+  let guideRanForTurn = 0;
+  const maybeRunGuide = async (messages: ReadonlyArray<Anthropic.MessageParam>): Promise<void> => {
+    const guide = opts.sideCalls?.guide;
+    if (guide === undefined) return;
+    if (guideRanForTurn === runContext.turnNumber) return;
+    guideRanForTurn = runContext.turnNumber;
+    if (guide.every === "turn") guideBlocks = [];
+    if (guide.every === "first_turn" && runContext.turnNumber !== 1) return;
+    const stage = {
+      stage: "guide",
+      strategy: "guide",
+      role: "guide" as const,
+      model: guide.model,
+      ...(guide.profile !== undefined ? { profile: guide.profile } : {}),
+    };
+    // §6.2 — the guide is auxiliary spend: past the judge_share it is skipped
+    // (never silently — the stage line says so) and the turn runs unguided.
+    if (judgeShareExhausted()) {
+      publishStage({ ...stage, outcome: "skipped", cause: "judge_share_exhausted" });
+      return;
+    }
+    // §7.12 — the total cap gates every model call, the guide's included.
+    // Same gate, same turn as the primary's first `NeedModel` gate a moment
+    // later, so a `degrade` fired here is the one that gate would have fired;
+    // on "stop" the guide is skipped and that gate ends the run.
+    if ((await enforceBudget(runContext.turnNumber)) === "stop") {
+      publishStage({ ...stage, outcome: "skipped", cause: "budget" });
+      return;
+    }
+    publishStage({ ...stage, outcome: "started" });
+    out.spinner.start("guide");
+    let reply: GuideReply;
+    try {
+      reply = await guide.run(sideCallContext(messages, turnAbort.signal));
+    } catch (err) {
+      // §7.13 — a guide failure is non-fatal: the turn proceeds unguided.
+      const message = err instanceof Error ? err.message : String(err);
+      runContext.logger.warn("guide side call failed — turn proceeds unguided", { message });
+      publishStage({ ...stage, outcome: "failed", cause: message });
+      return;
+    } finally {
+      out.spinner.stop();
+    }
+    const text = reply.text?.trim() ?? "";
+    if (text.length === 0) {
+      publishStage({ ...stage, outcome: "skipped", cause: reply.cause ?? "empty" });
+      return;
+    }
+    // Pillar 3 — the guide text enters the parent's own system region, so it
+    // is classified HERE at TrustOrigin "consult" (the same tier as a Consult
+    // reply) and lineage-tagged for the egress fabric. A malicious verdict
+    // drops the block outright rather than injecting a redaction notice
+    // into the system prompt.
+    const boundary = await classifyBoundary(text, { origin: "consult" });
+    if (boundary.action === "redact") {
+      runContext.logger.warn(
+        "guide text blocked by the boundary classifier — turn proceeds unguided",
+      );
+      publishStage({ ...stage, outcome: "failed", cause: "boundary-blocked" });
+      return;
+    }
+    tagContent(runContext, text, "consult");
+    guideBlocks = [{ type: "text", text: `<guide>\n${text}\n</guide>` }];
+    publishStage({ ...stage, outcome: "done" });
+    // Plan-execute: the plan also lands in the continuity plan store when the
+    // seam is wired, and the `<current_plan>` tail re-renders from it.
+    if (guide.every === "first_turn" && opts.continuity?.savePlan !== undefined) {
+      try {
+        await opts.continuity.savePlan(text);
+        runState.set({ [PLAN_DIRTY_STATE_KEY]: true });
+      } catch (err) {
+        runContext.logger.warn("guide plan write to the continuity store failed", {
+          error: (err as Error).message,
+        });
+      }
+    }
+  };
+
+  // §7.8 — the shadow (audition) lane. Scheduled AFTER the turn's answer is
+  // final, so nothing the shadow does can change what the user gets; runs
+  // on a deterministic sampled share of turns (seeded by the pool seed and
+  // the turn number, so a replay samples the same turns); one shadow at a
+  // time; awaited at teardown so a singleTurn host never drops it.
+  let shadowInFlight: Promise<void> | undefined;
+  let shadowFailures = 0;
+  const sampleDraw = (turn: number): number => {
+    // FNV-1a over `<seed>|shadow|<turn>` → [0, 1). Deterministic per run.
+    let h = 0x811c9dc5;
+    for (const ch of `${poolSeed}|shadow|${turn}`) {
+      h ^= ch.charCodeAt(0);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h / 0x1_0000_0000;
+  };
+  const maybeScheduleShadow = (
+    messagesBefore: ReadonlyArray<Anthropic.MessageParam>,
+    primaryText: string,
+  ): void => {
+    const shadow = opts.sideCalls?.shadow;
+    if (shadow === undefined) return;
+    const turn = runContext.turnNumber;
+    const served = lastPoolOutcome;
+    const stage = {
+      stage: "shadow",
+      strategy: "shadow",
+      role: "shadow" as const,
+      model: shadow.candidate,
+      ...(shadow.profile !== undefined ? { profile: shadow.profile } : {}),
+    };
+    if (served !== undefined && served.modelString === shadow.candidate) {
+      publishStage({ ...stage, outcome: "skipped", cause: "same-as-primary" });
+      return;
+    }
+    if (sampleDraw(turn) >= shadow.sampleRate) {
+      publishStage({ ...stage, outcome: "skipped", cause: "sample_rate" });
+      return;
+    }
+    if (judgeShareExhausted()) {
+      publishStage({ ...stage, outcome: "skipped", cause: "judge_share_exhausted" });
+      return;
+    }
+    // §7.12 — the total cap gates the audition lane too (read-only: see
+    // `totalCapReached` for why the shadow never fires `enforceBudget`).
+    if (totalCapReached(turn)) {
+      publishStage({ ...stage, outcome: "skipped", cause: "budget" });
+      return;
+    }
+    if (primaryText.trim().length === 0) {
+      publishStage({ ...stage, outcome: "skipped", cause: "empty-primary" });
+      return;
+    }
+    const primaryModel = lastResponseWireModel ?? wireModelId;
+    const seed = [...messagesBefore];
+    publishStage({ ...stage, outcome: "started" });
+    const prior = shadowInFlight ?? Promise.resolve();
+    shadowInFlight = prior.then(async () => {
+      try {
+        const v = await shadow.run({
+          ...sideCallContext(seed, runAbort.signal),
+          turnNumber: turn,
+          primaryText,
+          primaryModel,
+        });
+        const shadowCost = poolCostUsd(v.provider, v.model, v.usage);
+        // Both arms record into the observe-only shadow lane under the
+        // primary's band: the router never reads `shadow:` keys, so this
+        // steers nothing until `route promote` folds it (PR 14).
+        const sb = scoreboard;
+        const rc = rewardConfig;
+        if (served !== undefined && sb !== undefined && rc !== undefined) {
+          const key = shadowRouteKey(served.routeKey, poolScope);
+          const q = shadowLaneQuality(v.verdict);
+          const shadowObs = {
+            success: true,
+            latencyMs: v.latencyMs,
+            ...(shadowCost !== undefined ? { costUsd: shadowCost } : {}),
+            quality: q.shadow,
+          };
+          const primaryObs = {
+            success: true,
+            latencyMs: served.latencyMs,
+            ...(served.costUsd !== undefined ? { costUsd: served.costUsd } : {}),
+            quality: q.primary,
+          };
+          sb.record(key, shadow.candidate, computeReward(shadowObs, rc), shadowObs);
+          sb.record(key, served.modelString, computeReward(primaryObs, rc), primaryObs);
+        }
+        publishStage({
+          ...stage,
+          model: v.model,
+          outcome: "done",
+          cause: v.agreed ? v.verdict : `${v.verdict} (orders disagreed)`,
+          ...(shadowCost !== undefined ? { costUsdMicros: Math.round(shadowCost * 1e6) } : {}),
+        });
+      } catch (err) {
+        // §7.13 — a shadow failure is silently dropped and counted.
+        shadowFailures += 1;
+        const message = err instanceof Error ? err.message : String(err);
+        runContext.logger.warn("shadow side call failed — dropped", { message, shadowFailures });
+        publishStage({ ...stage, outcome: "failed", cause: message });
+      }
+    });
+  };
+  const awaitShadow = async (): Promise<void> => {
+    if (shadowInFlight === undefined) return;
+    try {
+      await shadowInFlight;
+    } catch {
+      // Every failure is caught inside the chain; this only guards teardown.
+    }
+  };
+
   async function runOneTurn(
     messages: Anthropic.MessageParam[],
     turnOpts: TurnRunOptions = {},
   ): Promise<TurnAttempt> {
+    // 0.6.0 §7.4 — the guide runs once per strategy turn, before the turn's
+    // first model call (a no-op without `sideCalls.guide`).
+    await maybeRunGuide(messages);
     let state: TurnState = initialState;
     let terminalContent: Anthropic.ContentBlock[] = [];
     turnAttributionOverride = {
@@ -6147,23 +6709,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // loop finishes and a single-turn host gets one complete degraded
           // reply. (Sanctioned change §14(2).)
           if ((await enforceBudget(runContext.turnNumber)) === "stop") {
-            const spentMicros =
-              resumedCostUsdMicros + (budgetMeter?.getRunCost(bus.runId).totalUsdMicros ?? 0);
-            const report: FailureReport = {
-              class: BUILTIN_FAILURE_CLASSES.crewhaus_budget.class,
-              title: BUILTIN_FAILURE_CLASSES.crewhaus_budget.title,
-              detail: `$${(spentMicros / 1_000_000).toFixed(4)} spent ≥ $${(
-                (opts.budget?.usdMicros ?? 0) / 1_000_000
-              ).toFixed(
-                4,
-              )} cap before model call ${toolIterations + 1} of turn ${runContext.turnNumber}${
-                budgetDegraded ? " (degraded rung also reached the cap)" : ""
-              }`,
-              remediation: BUILTIN_FAILURE_CLASSES.crewhaus_budget.remediation,
-              exitCode: BUILTIN_FAILURE_CLASSES.crewhaus_budget.exitCode,
-            };
-            await publishRunFailed(report);
-            throw new RunFailedError(report);
+            await failBudgetStop(
+              `model call ${toolIterations + 1} of turn ${runContext.turnNumber}`,
+            );
           }
           out.write("agent> ");
           // Section 11 — pre-model hook. Deny short-circuits the turn with
@@ -6688,6 +7236,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // read for every tool call this model call produces.
             const plan: CandidatePlan = poolTurn?.plan ?? primaryPlan;
             servingPlan = plan;
+            // The served arm for children: the pool candidate's identity when
+            // one serves, else whatever this call is going to (a tier, the
+            // degrade rung, or the primary — `reqSpecModel` is that model).
+            servedArm = {
+              model: reqSpecModel,
+              wireModelId: reqWireModelId,
+              ...(plan.profile !== undefined ? { profile: plan.profile } : {}),
+              armId: plan.fromPool ? plan.armId : reqSpecModel,
+              fromPool: plan.fromPool,
+            };
             listToolsSummaries = plan.listToolsSummaries;
             const t0Model = performance.now();
             modelCallStartMs = t0Model;
@@ -6748,6 +7306,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 // the mutable tail so a swap never busts the frozen prefix.
                 ...volatileRecallBlocks.map((b) => ({ type: "text" as const, text: b.text })),
                 ...continuityTail.map((b) => ({ type: "text" as const, text: b.text })),
+                // 0.6.0 §7.4 — the `<guide>` block: volatile like the tail it
+                // follows (after the cache marker, so a per-turn guide re-writes
+                // only the transcript cache entry, never the frozen prefix),
+                // and before the candidate overlay.
+                ...guideBlocks.map((b) => ({ type: "text" as const, text: b.text })),
                 // 0.6.0 §4.4 — the candidate's instructions overlay: appended
                 // in the VOLATILE region after the continuity tail, never
                 // before the cache marker, so switching candidates re-writes
@@ -8020,6 +8583,73 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     }
   }
 
+  /**
+   * 0.6.0 §7.6 — a committee turn on a single-turn host. N tool-less nested
+   * member calls, a judge pick (order-controlled), and the strong tie-breaker
+   * only on disagreement — all inside the injected closure; this wrapper owns
+   * the lifecycle: the `judge_share` gate, the `model_stage` events, the
+   * transcript / event-log append of the served text, and the fall-back to
+   * the plain evaluated turn when the committee cannot decide at all
+   * (§7.13). Without `sideCalls.committee` this IS `runEvaluatedTurn`.
+   */
+  async function runCommitteeOrTurn(
+    messages: Anthropic.MessageParam[],
+  ): Promise<{ terminalContent: Anthropic.ContentBlock[]; usage: ModelUsage }> {
+    const committee = opts.sideCalls?.committee;
+    if (committee === undefined) return runEvaluatedTurn(messages);
+    const stage = {
+      stage: "committee",
+      strategy: "committee",
+      role: "committee" as const,
+      model: committee.judge,
+    };
+    if (judgeShareExhausted()) {
+      publishStage({ ...stage, outcome: "skipped", cause: "judge_share_exhausted" });
+      return runEvaluatedTurn(messages);
+    }
+    // §7.12 / §14(2) — the committee bypasses `runOneTurn`, so the total cap
+    // is gated HERE: a "stop" is the classified `crewhaus_budget` failure the
+    // per-model-call gate would have raised (a committee replaces the primary
+    // turn — no later gate would see the breach); a `degrade` latches the
+    // rung for this turn and the members run. The closure re-reads the gate
+    // between its members through `SideCallTurnContext.budgetGate`.
+    if ((await enforceBudget(runContext.turnNumber)) === "stop") {
+      publishStage({ ...stage, outcome: "skipped", cause: "budget" });
+      await failBudgetStop(`the committee of turn ${runContext.turnNumber}`);
+    }
+    publishStage({ ...stage, outcome: "started" });
+    out.spinner.start("committee");
+    let verdict: CommitteeVerdict;
+    try {
+      verdict = await committee.run(sideCallContext(messages, turnAbort.signal));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      runContext.logger.warn("committee side call failed — falling back to the primary turn", {
+        message,
+      });
+      publishStage({ ...stage, outcome: "failed", cause: message });
+      out.spinner.stop();
+      return runEvaluatedTurn(messages);
+    }
+    out.spinner.stop();
+    const block: Anthropic.TextBlock = { type: "text", text: verdict.text, citations: null };
+    messages.push({ role: "assistant", content: [block] });
+    await logEvent("assistant_message", { content: [block] });
+    out.write(`agent> ${verdict.text}\n`);
+    lastResponseWireModel = verdict.winner.model;
+    await recordServedModel(verdict.winner.model);
+    publishStage({
+      ...stage,
+      model: verdict.winner.model,
+      ...(verdict.winner.profile !== undefined ? { profile: verdict.winner.profile } : {}),
+      outcome: "done",
+      cause:
+        verdict.cause ??
+        (verdict.escalated ? "escalated" : verdict.agreed ? "agreed" : "disagreement"),
+    });
+    return { terminalContent: [block], usage: verdict.usage };
+  }
+
   // Single-shot path used by the workflow target and (Section 12) the
   // channel-bot session router. Runs one user→assistant turn (with the tool
   // inner-loop until Done), persists the transcript, returns the terminal
@@ -8122,8 +8752,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // attempts inside the same armed window: a retried turn is still ONE
       // turn against `turn_timeout_ms`.)
       armTurnTimer();
-      const { terminalContent } = await runEvaluatedTurn(messages);
+      // 0.6.0 §7.8 — the shadow re-runs exactly what the primary answered.
+      const shadowSeed = [...messages];
+      const { terminalContent } = await runCommitteeOrTurn(messages);
       clearTurnTimer();
+      maybeScheduleShadow(shadowSeed, terminalText(terminalContent));
       bus.publish({
         ...bus.envelope(),
         kind: "turn_end",
@@ -8132,6 +8765,24 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       });
       return terminalText(terminalContent);
     } finally {
+      // 0.6.0 §7.8 — the single turn IS the run. A per-message host
+      // (`sideCallDrain`) takes the in-flight shadow and the served text
+      // returns at once — the shadow is non-blocking there as on the REPL;
+      // a one-shot host lets it finish before the bus and stores tear down
+      // (its verdict is what the audition lane exists to record; the served
+      // text is already final either way).
+      if (opts.sideCallDrain !== undefined) {
+        if (shadowInFlight !== undefined) {
+          opts.sideCallDrain(
+            shadowInFlight.then(
+              () => undefined,
+              () => undefined,
+            ),
+          );
+        }
+      } else {
+        await awaitShadow();
+      }
       clearAllTimers();
       out.spinner.stop();
       await fireHook("stop", {
@@ -8405,10 +9056,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // RunFailedError, which the catch rethrows.
       armTurnTimer();
       try {
+        // 0.6.0 §7.8 — the shadow re-runs exactly what the primary answered.
+        const shadowSeed = [...messages];
         const { terminalContent } = await runEvaluatedTurn(messages);
         // Item 1 — the exit rating prompt's "worth rating" floor: count only
         // turns that ended in a real assistant answer.
         if (terminalText(terminalContent).trim() !== "") assistantAnswers += 1;
+        // Non-blocking: scheduled after the answer is final, runs while the
+        // REPL waits for the next input, awaited at teardown.
+        maybeScheduleShadow(shadowSeed, terminalText(terminalContent));
       } catch (err) {
         // Defensive: tear down any animation a thrown turn left spinning.
         out.spinner.stop();
@@ -8446,6 +9102,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     }
     replExitedCleanly = !runAbort.signal.aborted;
   } finally {
+    // 0.6.0 §7.8 — let an in-flight shadow finish before teardown.
+    await awaitShadow();
     clearAllTimers();
     out.spinner.stop();
     await fireHook("stop", {
