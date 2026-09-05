@@ -169,7 +169,11 @@ log. The Consult runner rides the same runner.
   `escalate_on_disagreement` member answers as the tie-breaker, else the
   strongest survivor's answer stands with the disagreement recorded; a failed
   member is excluded, a lone survivor stands, none surviving throws (runtime-
-  core then runs the plain turn).
+  core then runs the plain turn). The run's total cap gates every call the
+  committee makes: runtime-core gates the committee before it starts, and the
+  closure re-reads `SideCallTurnContext.budgetGate` before every member and
+  before the tie-breaker — past the cap the calls not yet made are excluded
+  (`skipped`, cause `budget`), never opened.
 
 The codegen twin `renderSideCallWiringFields(fragment, indent, sessionName)`
 renders `...wireSideCalls(<pool blob>, { sessionName }),` onto a pooled

@@ -527,6 +527,16 @@ export function buildCommitteeSideCall(
       // never a parallel `runOneTurn` (§7.6).
       const outcomes: CommitteeMemberOutcome[] = [];
       const answers: Array<{ target: RosterCandidate; text: string; usage: ModelUsage }> = [];
+      // §7.12 — the run's total cap, re-read before every nested call the
+      // committee makes: once reached, every call not yet made is excluded
+      // (cause `budget`), never opened. Latched so one "stop" is final.
+      let capReached = false;
+      const budgetStops = async (): Promise<boolean> => {
+        if (capReached) return true;
+        if (ctx.budgetGate === undefined) return false;
+        capReached = (await ctx.budgetGate()) === "stop";
+        return capReached;
+      };
       for (const member of members) {
         const t = asTarget(member);
         const stage = {
@@ -535,6 +545,11 @@ export function buildCommitteeSideCall(
           model: t.modelString,
           ...(t.profile !== undefined ? { profile: t.profile } : {}),
         };
+        if (await budgetStops()) {
+          outcomes.push({ ...t, outcome: "skipped", latencyMs: 0, cause: "budget" });
+          publishStage(ctx, { ...stage, outcome: "skipped", cause: "budget" });
+          continue;
+        }
         publishStage(ctx, { ...stage, outcome: "started" });
         try {
           const r = await runNestedSingleTurn({
@@ -644,46 +659,52 @@ export function buildCommitteeSideCall(
           model: t.modelString,
           ...(t.profile !== undefined ? { profile: t.profile } : {}),
         };
-        publishStage(ctx, { ...stage, outcome: "started", cause: "disagreement" });
-        try {
-          const r = await runNestedSingleTurn({
-            target: t,
-            instructions: ctx.instructions,
-            seedMessages: seed,
-            role: "escalation",
-            stage: "tie-break",
-            parent: ctx.runContext,
-            signal: ctx.signal,
-            sessionTarget: "committee",
-            deps,
-          });
-          publishStage(ctx, {
-            ...stage,
-            model: r.model,
-            outcome: "done",
-            ...(r.costUsd !== undefined ? { costUsdMicros: Math.round(r.costUsd * 1e6) } : {}),
-          });
-          const existing = outcomes.find((o) => o.modelString === t.modelString);
-          if (existing === undefined) {
-            outcomes.push({
-              ...t,
+        if (await budgetStops()) {
+          // The strong tie-breaker is the committee's most expensive call:
+          // past the cap the strongest survivor stands instead.
+          publishStage(ctx, { ...stage, outcome: "skipped", cause: "budget" });
+        } else {
+          publishStage(ctx, { ...stage, outcome: "started", cause: "disagreement" });
+          try {
+            const r = await runNestedSingleTurn({
+              target: t,
+              instructions: ctx.instructions,
+              seedMessages: seed,
+              role: "escalation",
+              stage: "tie-break",
+              parent: ctx.runContext,
+              signal: ctx.signal,
+              sessionTarget: "committee",
+              deps,
+            });
+            publishStage(ctx, {
+              ...stage,
               model: r.model,
               outcome: "done",
-              latencyMs: r.latencyMs,
-              usage: r.usage,
+              ...(r.costUsd !== undefined ? { costUsdMicros: Math.round(r.costUsd * 1e6) } : {}),
             });
+            const existing = outcomes.find((o) => o.modelString === t.modelString);
+            if (existing === undefined) {
+              outcomes.push({
+                ...t,
+                model: r.model,
+                outcome: "done",
+                latencyMs: r.latencyMs,
+                usage: r.usage,
+              });
+            }
+            return served(
+              { target: tieBreaker, text: r.text },
+              false,
+              true,
+              r.usage,
+              "escalated",
+              unresolved,
+            );
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            publishStage(ctx, { ...stage, outcome: "failed", cause: message });
           }
-          return served(
-            { target: tieBreaker, text: r.text },
-            false,
-            true,
-            r.usage,
-            "escalated",
-            unresolved,
-          );
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          publishStage(ctx, { ...stage, outcome: "failed", cause: message });
         }
       }
       const survivors: ConsultRoster = answers.map((a) => a.target);

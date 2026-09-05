@@ -1144,6 +1144,16 @@ export type SideCallTurnContext = {
   readonly signal: AbortSignal;
   /** The pool's scope (step / node / role name), when any. */
   readonly scope?: string;
+  /**
+   * §7.12 / §14(2) — the run's budget gate (`enforceBudget` for the current
+   * turn), so a closure that makes SEVERAL model calls (the committee's
+   * members and tie-breaker) can re-read the total cap between them: `"stop"`
+   * means the cap is reached — exclude every call not yet made (cause
+   * `budget`) rather than open it. Absent when the loop has no `budget`.
+   * The single-call closures (guide, shadow) are gated by the loop itself
+   * before they start.
+   */
+  readonly budgetGate?: () => Promise<"continue" | "stop">;
 };
 
 /** What a guide call produced: text to inject, or `null` with a `cause`. */
@@ -1206,7 +1216,9 @@ export type CommitteeMemberOutcome = {
   readonly profile?: string;
   /** Wire model id that served (absent when the member failed before serving). */
   readonly model?: string;
-  readonly outcome: "done" | "failed";
+  /** `skipped`: the member never ran — the budget gate stopped the committee
+   *  before its turn came (`cause: "budget"`). */
+  readonly outcome: "done" | "failed" | "skipped";
   readonly latencyMs: number;
   readonly usage?: ModelUsage;
   /** The member's judged quality (1 won, 0 lost, 0.5 unresolved), when judged. */
@@ -1364,6 +1376,23 @@ export type RunChatLoopOptions = {
    * Absent → byte-identical to a pre-0.6.0 runtime.
    */
   sideCalls?: HybridSideCalls;
+  /**
+   * §7.8 — the shadow is NON-BLOCKING: on the REPL it runs while the loop
+   * waits for the next line; on a `singleTurn` host the turn IS the run, so
+   * without this seam the loop awaits an in-flight shadow at teardown and
+   * the served text is not returned until the audition lane (the shadow call
+   * plus two judge calls) has settled. A host that serves MANY single turns
+   * from one process — `crewhaus serve`, a channel bot — supplies this: the
+   * loop hands it the shadow's settled promise (never rejects) and returns
+   * the served text at once; the host awaits every drained promise before it
+   * exits (serve does so in its cleanup). A one-shot host (a workflow step, a
+   * graph node, a crew role) leaves it undefined and keeps the inline await,
+   * so its process never exits under a running shadow. Stage lines the
+   * drained shadow publishes after the loop's teardown reach the parent
+   * bus's live subscribers only (the run's session mirror is closed by then);
+   * the scoreboard record — what the lane exists for — is unaffected.
+   */
+  sideCallDrain?: (settled: Promise<void>) => void;
   /** Per-run identity, abort signal, and logger. Defaults to a fresh `createRunContext()`. */
   runContext?: RunContext;
   /** Context-window limit in tokens. Defaults to 200_000 (Claude opus/sonnet 4.x). */
@@ -3339,6 +3368,22 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // model call). It is a TURN boundary: every gate of this turn lets the
   // rung serve; the first gate of the next turn stops the run.
   let budgetDegradedAtTurn = 0;
+  /**
+   * 0.6.0 §7.12 — the READ-ONLY twin of `enforceBudget` for the post-answer
+   * shadow: true when the total cap is reached and this is not the turn a
+   * `degrade` fired in (the rung serves every remaining call of that turn).
+   * The shadow cannot call `enforceBudget` itself — a `degrade` breach is a
+   * TURN-BOUNDARY latch, and firing it from the audition lane after the
+   * answer would consume the degraded turn (the next pre-turn gate would
+   * then stop instead of serving one degraded turn). Auxiliary spend past
+   * the cap is skipped, never opened.
+   */
+  const totalCapReached = (turn: number): boolean => {
+    if (opts.budget === undefined || budgetMeter === undefined) return false;
+    const spent = resumedCostUsdMicros + budgetMeter.getRunCost(bus.runId).totalUsdMicros;
+    if (spent < opts.budget.usdMicros) return false;
+    return !(budgetDegraded && turn === budgetDegradedAtTurn);
+  };
 
   /**
    * Item 27 / 0.6.0 §7.12 — the budget gate. Returns "stop" when the run
@@ -5742,6 +5787,29 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // `skipped`, §8.1). `attachRoutingPersistence` mirrors every `model_stage`
   // into the session JSONL, so nothing here needs its own `logEvent`.
   // -------------------------------------------------------------------------
+  /**
+   * §7.12 / §14(2) — the classified `crewhaus_budget` stop, shared by the
+   * per-model-call gate inside `runOneTurn` and the committee gate (a
+   * committee REPLACES the primary turn, so nothing after it would gate the
+   * run). `where` names the call the cap stopped.
+   */
+  const failBudgetStop = async (where: string): Promise<never> => {
+    const spentMicros =
+      resumedCostUsdMicros + (budgetMeter?.getRunCost(bus.runId).totalUsdMicros ?? 0);
+    const report: FailureReport = {
+      class: BUILTIN_FAILURE_CLASSES.crewhaus_budget.class,
+      title: BUILTIN_FAILURE_CLASSES.crewhaus_budget.title,
+      detail: `$${(spentMicros / 1_000_000).toFixed(4)} spent ≥ $${(
+        (opts.budget?.usdMicros ?? 0) / 1_000_000
+      ).toFixed(4)} cap before ${where}${
+        budgetDegraded ? " (degraded rung also reached the cap)" : ""
+      }`,
+      remediation: BUILTIN_FAILURE_CLASSES.crewhaus_budget.remediation,
+      exitCode: BUILTIN_FAILURE_CLASSES.crewhaus_budget.exitCode,
+    };
+    await publishRunFailed(report);
+    throw new RunFailedError(report);
+  };
   const publishStage = (fields: {
     readonly stage: string;
     readonly strategy: string;
@@ -5767,13 +5835,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     messages: [...messages],
     signal,
     ...(poolScope !== undefined ? { scope: poolScope } : {}),
+    // §7.12 — a multi-call closure re-reads the total cap between its calls.
+    ...(opts.budget !== undefined
+      ? { budgetGate: () => enforceBudget(runContext.turnNumber) }
+      : {}),
   });
 
   // §7.4 — the guide block. Runs ONCE per strategy turn (keyed on the turn
   // number, so an evaluation retry or a cascade stage inside the same turn
   // never re-plans), before the turn's first model call. `first_turn` keeps
   // its block for the rest of the run (plan-execute); `turn` replaces it each
-  // turn. Volatile by construction: never persisted, never replayed on resume.
+  // turn — and a `turn` guide that fails, returns nothing, is skipped or is
+  // boundary-blocked leaves the turn UNGUIDED (§7.13): the previous turn's
+  // block is dropped before the call, never re-injected beside a stage line
+  // that says the guide did not run. Volatile by construction: never
+  // persisted, never replayed on resume.
   let guideBlocks: Anthropic.TextBlockParam[] = [];
   let guideRanForTurn = 0;
   const maybeRunGuide = async (messages: ReadonlyArray<Anthropic.MessageParam>): Promise<void> => {
@@ -5781,6 +5857,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     if (guide === undefined) return;
     if (guideRanForTurn === runContext.turnNumber) return;
     guideRanForTurn = runContext.turnNumber;
+    if (guide.every === "turn") guideBlocks = [];
     if (guide.every === "first_turn" && runContext.turnNumber !== 1) return;
     const stage = {
       stage: "guide",
@@ -5793,6 +5870,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // (never silently — the stage line says so) and the turn runs unguided.
     if (judgeShareExhausted()) {
       publishStage({ ...stage, outcome: "skipped", cause: "judge_share_exhausted" });
+      return;
+    }
+    // §7.12 — the total cap gates every model call, the guide's included.
+    // Same gate, same turn as the primary's first `NeedModel` gate a moment
+    // later, so a `degrade` fired here is the one that gate would have fired;
+    // on "stop" the guide is skipped and that gate ends the run.
+    if ((await enforceBudget(runContext.turnNumber)) === "stop") {
+      publishStage({ ...stage, outcome: "skipped", cause: "budget" });
       return;
     }
     publishStage({ ...stage, outcome: "started" });
@@ -5885,6 +5970,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     }
     if (judgeShareExhausted()) {
       publishStage({ ...stage, outcome: "skipped", cause: "judge_share_exhausted" });
+      return;
+    }
+    // §7.12 — the total cap gates the audition lane too (read-only: see
+    // `totalCapReached` for why the shadow never fires `enforceBudget`).
+    if (totalCapReached(turn)) {
+      publishStage({ ...stage, outcome: "skipped", cause: "budget" });
       return;
     }
     if (primaryText.trim().length === 0) {
@@ -6022,23 +6113,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // loop finishes and a single-turn host gets one complete degraded
           // reply. (Sanctioned change §14(2).)
           if ((await enforceBudget(runContext.turnNumber)) === "stop") {
-            const spentMicros =
-              resumedCostUsdMicros + (budgetMeter?.getRunCost(bus.runId).totalUsdMicros ?? 0);
-            const report: FailureReport = {
-              class: BUILTIN_FAILURE_CLASSES.crewhaus_budget.class,
-              title: BUILTIN_FAILURE_CLASSES.crewhaus_budget.title,
-              detail: `$${(spentMicros / 1_000_000).toFixed(4)} spent ≥ $${(
-                (opts.budget?.usdMicros ?? 0) / 1_000_000
-              ).toFixed(
-                4,
-              )} cap before model call ${toolIterations + 1} of turn ${runContext.turnNumber}${
-                budgetDegraded ? " (degraded rung also reached the cap)" : ""
-              }`,
-              remediation: BUILTIN_FAILURE_CLASSES.crewhaus_budget.remediation,
-              exitCode: BUILTIN_FAILURE_CLASSES.crewhaus_budget.exitCode,
-            };
-            await publishRunFailed(report);
-            throw new RunFailedError(report);
+            await failBudgetStop(
+              `model call ${toolIterations + 1} of turn ${runContext.turnNumber}`,
+            );
           }
           out.write("agent> ");
           // Section 11 — pre-model hook. Deny short-circuits the turn with
@@ -7290,6 +7367,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       publishStage({ ...stage, outcome: "skipped", cause: "judge_share_exhausted" });
       return runEvaluatedTurn(messages);
     }
+    // §7.12 / §14(2) — the committee bypasses `runOneTurn`, so the total cap
+    // is gated HERE: a "stop" is the classified `crewhaus_budget` failure the
+    // per-model-call gate would have raised (a committee replaces the primary
+    // turn — no later gate would see the breach); a `degrade` latches the
+    // rung for this turn and the members run. The closure re-reads the gate
+    // between its members through `SideCallTurnContext.budgetGate`.
+    if ((await enforceBudget(runContext.turnNumber)) === "stop") {
+      publishStage({ ...stage, outcome: "skipped", cause: "budget" });
+      await failBudgetStop(`the committee of turn ${runContext.turnNumber}`);
+    }
     publishStage({ ...stage, outcome: "started" });
     out.spinner.start("committee");
     let verdict: CommitteeVerdict;
@@ -7422,10 +7509,24 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       });
       return terminalText(terminalContent);
     } finally {
-      // 0.6.0 §7.8 — the single turn IS the run: let an in-flight shadow
-      // finish before the bus and stores tear down (its verdict is what the
-      // audition lane exists to record; the served text is already final).
-      await awaitShadow();
+      // 0.6.0 §7.8 — the single turn IS the run. A per-message host
+      // (`sideCallDrain`) takes the in-flight shadow and the served text
+      // returns at once — the shadow is non-blocking there as on the REPL;
+      // a one-shot host lets it finish before the bus and stores tear down
+      // (its verdict is what the audition lane exists to record; the served
+      // text is already final either way).
+      if (opts.sideCallDrain !== undefined) {
+        if (shadowInFlight !== undefined) {
+          opts.sideCallDrain(
+            shadowInFlight.then(
+              () => undefined,
+              () => undefined,
+            ),
+          );
+        }
+      } else {
+        await awaitShadow();
+      }
       clearAllTimers();
       out.spinner.stop();
       await fireHook("stop", {

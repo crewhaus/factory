@@ -538,3 +538,127 @@ describe("textOnlyTranscript", () => {
     ]);
   });
 });
+
+describe("committee budget gate (§7.12)", () => {
+  const threePool: IrModelPool = {
+    candidates: [
+      { model: CHEAP, tags: ["cheap"], profile: "fast" },
+      { model: MID, tags: ["mid"] },
+      { model: STRONG, tags: ["strong"], profile: "strong" },
+    ],
+    policy: "heuristic",
+  };
+  /** A scripted gate: `continue` for the first `allow` reads, `stop` after. */
+  const gateAfter = (allow: number) => {
+    let reads = 0;
+    return {
+      reads: () => reads,
+      gate: async (): Promise<"continue" | "stop"> => {
+        reads += 1;
+        return reads <= allow ? "continue" : "stop";
+      },
+    };
+  };
+
+  test("the gate is re-read before every member: once it says stop the remaining members are excluded (skipped, cause budget) and the survivor stands", async () => {
+    const cheap = textAdapter("cheap answer");
+    const mid = textAdapter("mid answer");
+    const strong = textAdapter("strong answer");
+    const committee = buildCommitteeSideCall(
+      {
+        ...threePool,
+        strategy: { committee: { members: ["cheap", "mid", "strong"], judge: STRONG } },
+      },
+      {
+        _consultAdapters: new Map([
+          [CHEAP, cheap],
+          [MID, mid],
+          [STRONG, strong],
+        ]),
+        _judgeAdapter: judgeStub(selectContaining("never judged")),
+      },
+    );
+    const { parent, stages } = watch();
+    const g = gateAfter(1);
+    const v = await committee?.run({ ...ctxOf(parent), budgetGate: g.gate });
+    // At most one priced member ran.
+    expect(cheap.requests).toHaveLength(1);
+    expect(mid.requests).toHaveLength(0);
+    expect(strong.requests).toHaveLength(0);
+    expect(v?.text).toBe("cheap answer");
+    expect(v?.cause).toBe("single-member");
+    expect(v?.members.map((m) => [m.modelString, m.outcome, m.cause])).toEqual([
+      [CHEAP, "done", undefined],
+      [MID, "skipped", "budget"],
+      [STRONG, "skipped", "budget"],
+    ]);
+    // Latched: one "stop" is final — the third member never re-read the gate.
+    expect(g.reads()).toBe(2);
+    expect(stages().map((s) => [s.stage, s.model, s.outcome, s.cause])).toEqual([
+      ["member", CHEAP, "started", undefined],
+      ["member", CHEAP, "done", undefined],
+      ["member", MID, "skipped", "budget"],
+      ["member", STRONG, "skipped", "budget"],
+    ]);
+  });
+
+  test("past the cap the tie-breaker is skipped (cause budget): the strongest survivor stands with the disagreement recorded", async () => {
+    const tieBreak = textAdapter("the tie-breaker's answer");
+    const committee = buildCommitteeSideCall(
+      {
+        ...POOL,
+        candidates: [
+          ...POOL.candidates,
+          { model: "claude-opus-4-1", tags: ["arbiter"], profile: "arbiter" },
+        ],
+        strategy: {
+          committee: {
+            members: ["cheap", "strong"],
+            judge: STRONG,
+            escalateOnDisagreement: "arbiter",
+          },
+        },
+      },
+      {
+        _consultAdapters: new Map([
+          [CHEAP, textAdapter("cheap")],
+          [STRONG, textAdapter("strong")],
+          ["claude-opus-4-1", tieBreak],
+        ]),
+        // Position-biased: the orders disagree, so the tie-breaker is due.
+        _judgeAdapter: judgeStub(() => ({ winner: "1", rationale: "first" })),
+      },
+    );
+    const { parent, stages } = watch();
+    // Both members pass the gate; the tie-breaker's read is the "stop".
+    const v = await committee?.run({ ...ctxOf(parent), budgetGate: gateAfter(2).gate });
+    expect(tieBreak.requests).toHaveLength(0);
+    expect(v?.text).toBe("strong");
+    expect(v?.escalated).toBe(false);
+    expect(v?.cause).toBe("disagreement");
+    expect(
+      stages()
+        .filter((s) => s.stage === "tie-break")
+        .map((s) => [s.outcome, s.cause]),
+    ).toEqual([["skipped", "budget"]]);
+  });
+
+  test("without a budgetGate on the context nothing is gated (a run without `budget`)", async () => {
+    const cheap = textAdapter("cheap");
+    const strong = textAdapter("strong with because");
+    const committee = buildCommitteeSideCall(
+      { ...POOL, strategy: { committee: { members: ["cheap", "strong"], judge: STRONG } } },
+      {
+        _consultAdapters: new Map([
+          [CHEAP, cheap],
+          [STRONG, strong],
+        ]),
+        _judgeAdapter: judgeStub(selectContaining("because")),
+      },
+    );
+    const v = await committee?.run(ctxOf(watch().parent));
+    expect(cheap.requests).toHaveLength(1);
+    expect(strong.requests).toHaveLength(1);
+    expect(v?.members.map((m) => m.outcome)).toEqual(["done", "done"]);
+  });
+});

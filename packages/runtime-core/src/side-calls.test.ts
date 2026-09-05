@@ -21,15 +21,17 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import type {
   ProviderAdapter,
   ProviderId,
   ProviderRequest,
   StreamEvent,
 } from "@crewhaus/adapter-anthropic";
-import { RuntimeError } from "@crewhaus/errors";
+import { createCostTracker } from "@crewhaus/cost-tracker";
+import { EXIT_CODES, RunFailedError, RuntimeError } from "@crewhaus/errors";
 import { openScoreboard } from "@crewhaus/routing-store";
-import { createRunContext } from "@crewhaus/run-context";
+import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import type { ModelRouteEvent, ModelStageEvent, TraceEvent } from "@crewhaus/trace-event-bus";
 import {
   type CommitteeVerdict,
@@ -54,6 +56,8 @@ const STRONG = "claude-opus-4-1";
 function textAdapter(
   providerId: ProviderId,
   replies: readonly string[],
+  /** Per-response usage — sized up by the budget tests to cross a small cap. */
+  usage: { input: number; output: number } = { input: 10, output: 5 },
 ): ProviderAdapter & { requests: ProviderRequest[] } {
   const requests: ProviderRequest[] = [];
   let call = 0;
@@ -73,15 +77,41 @@ function textAdapter(
       const text = replies[Math.min(call, replies.length - 1)] ?? "done";
       call += 1;
       return (async function* () {
-        yield { kind: "message_start", usage: { input: 10, output: 0 } };
+        yield { kind: "message_start", usage: { input: usage.input, output: 0 } };
         yield { kind: "content_block_start", index: 0, block: { type: "text", text: "" } };
         yield { kind: "content_block_delta", index: 0, delta: { type: "text_delta", text } };
         yield { kind: "content_block_stop", index: 0 };
-        yield { kind: "message_delta", stopReason: "end_turn", usage: { input: 10, output: 5 } };
+        yield { kind: "message_delta", stopReason: "end_turn", usage };
         yield { kind: "message_stop" };
       })();
     },
   };
+}
+
+/**
+ * Interactive fake stdin for the REPL-mode tests: writes ONE line per
+ * completed turn (pumped by `turn_end`), then EOFs — Bun's readline over a
+ * pre-buffered, ended stream delivers only its first line (budget.test.ts).
+ */
+function interactiveStdin(
+  bus: { subscribe(fn: (e: TraceEvent) => void): () => void },
+  lines: readonly string[],
+): NodeJS.ReadableStream {
+  const stream = new PassThrough();
+  let i = 0;
+  const writeNext = (): void => {
+    if (i < lines.length) {
+      stream.write(`${lines[i]}\n`);
+      i += 1;
+    } else {
+      stream.end();
+    }
+  };
+  bus.subscribe((e) => {
+    if (e.kind === "turn_end") setImmediate(writeNext);
+  });
+  setImmediate(writeNext);
+  return stream;
 }
 
 function tmpScoreboard() {
@@ -566,5 +596,395 @@ describe("persistSession: false (§16 Q6)", () => {
     });
     expect(readdirSync(root).some((f) => f.endsWith(".json"))).toBe(true);
     rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe("guide every: turn on a multi-turn REPL — no stale block", () => {
+  test("a turn whose guide fails or returns nothing runs UNGUIDED: the previous turn's <guide> block is dropped, not re-injected", async () => {
+    const adapter = textAdapter("anthropic", ["one", "two", "three"]);
+    const { runContext, stages } = watch();
+    let call = 0;
+    await runChatLoop({
+      model: CHEAP,
+      instructions: "You are the executor.",
+      _adapter: adapter,
+      sideCalls: {
+        guide: {
+          every: "turn",
+          model: STRONG,
+          run: async () => {
+            call += 1;
+            if (call === 1) return { text: "plan one" };
+            if (call === 2) throw new Error("guide model down");
+            return { text: null, cause: "nothing to add" };
+          },
+        },
+      },
+      input: interactiveStdin(runContext.eventBus, ["first", "second", "third"]),
+      runContext,
+      installSigintHandler: false,
+      spinner: false,
+      stdout: () => {},
+    });
+    expect(adapter.requests).toHaveLength(3);
+    const guideBlocksOf = (i: number): string[] =>
+      (adapter.requests[i]?.system ?? [])
+        .filter((b) => b.text.startsWith("<guide>"))
+        .map((b) => b.text);
+    expect(guideBlocksOf(0)).toEqual(["<guide>\nplan one\n</guide>"]);
+    // Turn 2's guide failed, turn 3's returned nothing: both turns unguided.
+    expect(guideBlocksOf(1)).toEqual([]);
+    expect(guideBlocksOf(2)).toEqual([]);
+    const g = stages().filter((s) => s.stage === "guide");
+    expect(g.map((s) => s.outcome)).toEqual([
+      "started",
+      "done",
+      "started",
+      "failed",
+      "started",
+      "skipped",
+    ]);
+  });
+
+  test("first_turn keeps its block across turns (plan-execute) — the reset is `turn`-only", async () => {
+    const adapter = textAdapter("anthropic", ["one", "two"]);
+    const { runContext } = watch();
+    let call = 0;
+    await runChatLoop({
+      model: CHEAP,
+      instructions: "You are the executor.",
+      _adapter: adapter,
+      sideCalls: {
+        guide: {
+          every: "first_turn",
+          model: STRONG,
+          run: async () => {
+            call += 1;
+            return { text: "the plan" };
+          },
+        },
+      },
+      input: interactiveStdin(runContext.eventBus, ["first", "second"]),
+      runContext,
+      installSigintHandler: false,
+      spinner: false,
+      stdout: () => {},
+    });
+    expect(call).toBe(1);
+    expect(adapter.requests).toHaveLength(2);
+    for (const req of adapter.requests) {
+      expect(req.system.some((b) => b.text === "<guide>\nthe plan\n</guide>")).toBe(true);
+    }
+  });
+});
+
+describe("shadow drain (§7.8) — a per-message singleTurn host", () => {
+  const shadowVerdict: ShadowVerdict = {
+    verdict: "shadow",
+    agreed: true,
+    model: STRONG,
+    provider: "anthropic",
+    usage: { input: 10, output: 5 },
+    latencyMs: 42,
+  };
+
+  test("with sideCallDrain the served text returns BEFORE the shadow settles; the drained promise settles once the verdict is recorded", async () => {
+    const adapter = textAdapter("anthropic", ["served now"]);
+    const { runContext, stages } = watch();
+    let release: (() => void) | undefined;
+    const shadowGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let drained: Promise<void> | undefined;
+    const opts = base(
+      adapter,
+      {
+        shadow: {
+          candidate: STRONG,
+          sampleRate: 1,
+          run: async () => {
+            await shadowGate;
+            return shadowVerdict;
+          },
+        },
+      },
+      {
+        runContext,
+        sideCallDrain: (settled: Promise<void>) => {
+          drained = settled;
+        },
+      },
+    );
+    const result = await runChatLoop(opts);
+    // The loop resolved while the shadow closure is still blocked on its gate.
+    expect(result).toBe("served now");
+    expect(drained).toBeDefined();
+    expect(
+      stages()
+        .filter((s) => s.stage === "shadow")
+        .map((s) => s.outcome),
+    ).toEqual(["started"]);
+    release?.();
+    await drained;
+    expect(
+      stages()
+        .filter((s) => s.stage === "shadow")
+        .map((s) => s.outcome),
+    ).toEqual(["started", "done"]);
+    // The lane still records both arms after the loop's teardown.
+    const band = opts._scoreboard.snapshot().find((a) => a.routeKey.startsWith("shadow:"));
+    expect(band).toBeDefined();
+  });
+
+  test("a rejected shadow still settles the drained promise (never rejects into the host)", async () => {
+    const adapter = textAdapter("anthropic", ["served"]);
+    const { runContext, stages } = watch();
+    let drained: Promise<void> | undefined;
+    await runChatLoop(
+      base(
+        adapter,
+        {
+          shadow: {
+            candidate: STRONG,
+            sampleRate: 1,
+            run: async () => {
+              throw new Error("shadow down");
+            },
+          },
+        },
+        {
+          runContext,
+          sideCallDrain: (settled: Promise<void>) => {
+            drained = settled;
+          },
+        },
+      ),
+    );
+    await expect(drained).resolves.toBeUndefined();
+    expect(
+      stages()
+        .filter((s) => s.stage === "shadow")
+        .map((s) => s.outcome),
+    ).toEqual(["started", "failed"]);
+  });
+
+  test("without sideCallDrain a one-shot host awaits the shadow inline (unchanged)", async () => {
+    const adapter = textAdapter("anthropic", ["served"]);
+    const { runContext, stages } = watch();
+    await runChatLoop(
+      base(
+        adapter,
+        { shadow: { candidate: STRONG, sampleRate: 1, run: async () => shadowVerdict } },
+        { runContext },
+      ),
+    );
+    expect(
+      stages()
+        .filter((s) => s.stage === "shadow")
+        .map((s) => s.outcome),
+    ).toEqual(["started", "done"]);
+  });
+});
+
+describe("the budget cap gates every side call (§7.12 / §14(2))", () => {
+  const BUDGET = { usdMicros: 1000, onExceed: { kind: "stop" as const } };
+  /** A caller-supplied meter with $1 of haiku spend already on THIS run, so
+   *  the cap ($0.001) is reached before the run's first gate. */
+  const preAccruedMeter = (runContext: RunContext) => {
+    const meter = createCostTracker(runContext.eventBus, { suppressEvents: true });
+    runContext.eventBus.publish({
+      ...runContext.eventBus.envelope(),
+      kind: "model_response",
+      model: CHEAP,
+      provider: "anthropic",
+      stopReason: "end_turn",
+      usage: { input: 1_000_000, output: 0 },
+      durationMs: 1,
+    });
+    return meter;
+  };
+  const committeeVerdict: CommitteeVerdict = {
+    text: "the survivor's answer",
+    winner: { modelString: CHEAP, model: CHEAP },
+    agreed: false,
+    escalated: false,
+    cause: "single-member",
+    members: [{ modelString: CHEAP, model: CHEAP, outcome: "done", latencyMs: 5 }],
+    usage: { input: 10, output: 5 },
+  };
+
+  test("guide: cap already reached → skipped (cause budget), never run; the primary's own gate then ends the run", async () => {
+    const adapter = textAdapter("anthropic", ["never served"]);
+    const { runContext, stages } = watch();
+    const budgetMeter = preAccruedMeter(runContext);
+    let ran = 0;
+    let caught: unknown;
+    try {
+      await runChatLoop(
+        base(
+          adapter,
+          {
+            guide: {
+              every: "turn",
+              model: STRONG,
+              run: async () => {
+                ran += 1;
+                return { text: "plan" };
+              },
+            },
+          },
+          { runContext, budget: BUDGET, budgetMeter },
+        ),
+      );
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(RunFailedError);
+    if (!(caught instanceof RunFailedError)) return;
+    expect(caught.report.class).toBe("crewhaus_budget");
+    expect(ran).toBe(0);
+    expect(adapter.requests).toHaveLength(0);
+    expect(
+      stages()
+        .filter((s) => s.stage === "guide")
+        .map((s) => [s.outcome, s.cause]),
+    ).toEqual([["skipped", "budget"]]);
+  });
+
+  test("shadow: the primary's own spend reaches the cap → shadow skipped (cause budget), the served text unaffected", async () => {
+    // $1 of haiku input on the primary against a $0.001 cap.
+    const adapter = textAdapter("anthropic", ["served"], { input: 1_000_000, output: 0 });
+    const { runContext, stages } = watch();
+    let ran = 0;
+    const result = await runChatLoop(
+      base(
+        adapter,
+        {
+          shadow: {
+            candidate: STRONG,
+            sampleRate: 1,
+            run: async () => {
+              ran += 1;
+              return {
+                verdict: "tie",
+                agreed: true,
+                model: STRONG,
+                provider: "anthropic",
+                usage: { input: 1, output: 1 },
+                latencyMs: 1,
+              };
+            },
+          },
+        },
+        { runContext, budget: BUDGET },
+      ),
+    );
+    expect(result).toBe("served");
+    expect(ran).toBe(0);
+    expect(
+      stages()
+        .filter((s) => s.stage === "shadow")
+        .map((s) => [s.outcome, s.cause]),
+    ).toEqual([["skipped", "budget"]]);
+  });
+
+  test("committee: cap already reached → stage skipped (cause budget), the closure never runs, the run ends with the classified crewhaus_budget stop", async () => {
+    const adapter = textAdapter("anthropic", ["primary must not run"]);
+    const { runContext, seen, stages } = watch();
+    const budgetMeter = preAccruedMeter(runContext);
+    let ran = 0;
+    let caught: unknown;
+    try {
+      await runChatLoop(
+        base(
+          adapter,
+          {
+            committee: {
+              members: [{ modelString: CHEAP }, { modelString: STRONG }],
+              judge: STRONG,
+              run: async () => {
+                ran += 1;
+                return committeeVerdict;
+              },
+            },
+          },
+          { runContext, budget: BUDGET, budgetMeter },
+        ),
+      );
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(RunFailedError);
+    if (!(caught instanceof RunFailedError)) return;
+    expect(caught.report.class).toBe("crewhaus_budget");
+    expect(caught.report.exitCode).toBe(EXIT_CODES.crewhaus_budget);
+    expect(caught.report.detail).toContain("before the committee of turn 1");
+    expect(ran).toBe(0);
+    expect(adapter.requests).toHaveLength(0);
+    expect(
+      stages()
+        .filter((s) => s.stage === "committee")
+        .map((s) => [s.outcome, s.cause]),
+    ).toEqual([["skipped", "budget"]]);
+    expect(seen.some((e) => e.kind === "run_failed")).toBe(true);
+  });
+
+  test("committee: the closure's budgetGate re-reads the cap between members — 'continue' until the members' re-published spend reaches it, then 'stop'; the verdict it has is served", async () => {
+    const adapter = textAdapter("anthropic", ["primary must not run"]);
+    const { runContext } = watch();
+    const reads: Array<"continue" | "stop"> = [];
+    const result = await runChatLoop(
+      base(
+        adapter,
+        {
+          committee: {
+            members: [{ modelString: CHEAP }, { modelString: STRONG }, { modelString: STRONG }],
+            judge: STRONG,
+            run: async (ctx) => {
+              expect(ctx.budgetGate).toBeDefined();
+              const gate = ctx.budgetGate as () => Promise<"continue" | "stop">;
+              reads.push(await gate());
+              // The first member's call, re-published on the parent bus as the
+              // nested runner does: $1 of haiku against the $0.001 cap.
+              ctx.bus.publish({
+                ...ctx.bus.envelope(),
+                kind: "model_response",
+                model: CHEAP,
+                provider: "anthropic",
+                role: "committee",
+                stage: "member",
+                stopReason: "end_turn",
+                usage: { input: 1_000_000, output: 0 },
+                durationMs: 1,
+              });
+              reads.push(await gate());
+              return committeeVerdict;
+            },
+          },
+        },
+        { runContext, budget: BUDGET },
+      ),
+    );
+    expect(reads).toEqual(["continue", "stop"]);
+    expect(result).toBe("the survivor's answer");
+    expect(adapter.requests).toHaveLength(0);
+  });
+
+  test("without a budget the side-call context carries no budgetGate (nothing to read)", async () => {
+    const adapter = textAdapter("anthropic", ["x"]);
+    let gate: unknown = "unset";
+    await runChatLoop(
+      base(adapter, {
+        committee: {
+          members: [{ modelString: CHEAP }, { modelString: STRONG }],
+          judge: STRONG,
+          run: async (ctx) => {
+            gate = ctx.budgetGate;
+            return committeeVerdict;
+          },
+        },
+      }),
+    );
+    expect(gate).toBeUndefined();
   });
 });
