@@ -60,6 +60,7 @@ import {
   type SubAgentResult,
   type ToolCallRecord,
   createIsolatedContext,
+  foldSubAgentOverlay,
   subAgentProfileAllowlist,
 } from "@crewhaus/agent-context-isolation";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
@@ -132,7 +133,8 @@ function classifyChildFailure(err: unknown): SubAgentFailure {
  * definition, the parent's routing projection and the Task call's `profile`.
  *
  *   - `declared`  — the default: `def.model` (else the parent's declared
- *                   primary), the child's own params and routing quartet;
+ *                   primary), the child's own params and routing quartet, and
+ *                   its own profile's overlay (`def.overlay`) heading the prompt;
  *   - `inherited` — `def.inheritRouting: true` and the bridge projected a
  *                   served arm: that arm's spec model is the child's primary
  *                   (its `profile` is stamped for attribution); the child's
@@ -142,7 +144,9 @@ function classifyChildFailure(err: unknown): SubAgentFailure {
  *   - `pinned`    — the Task call named one of `def.allowedProfiles`: the child
  *                   runs single-model on that option (its params, overlay and
  *                   failover chain); the definition's `model_pool` /
- *                   `model_tiers` do not route this call.
+ *                   `model_tiers` do not route this call, and the option's
+ *                   overlay REPLACES the default profile's — a pinned prompt
+ *                   never carries both.
  *
  * `profile` is re-checked against the allowlist here even though the Task
  * tool validated it first: a model-filled model argument fails closed at every
@@ -197,10 +201,9 @@ export function resolveChildLoopPlan(
         source: "pinned",
         model: option.model,
         profile: option.profile,
-        instructions:
-          option.overlay !== undefined
-            ? `${option.overlay}\n\n${def.instructions}`
-            : def.instructions,
+        // Only the pinned option's overlay: `def.overlay` belongs to the
+        // profile the call chose NOT to run on.
+        instructions: foldSubAgentOverlay(def.instructions, option.overlay),
         maxTokens: option.maxTokens ?? def.maxTokens ?? parent.maxTokens,
         loopOptions: {
           ...(option.thinking !== undefined ? { thinking: option.thinking } : {}),
@@ -220,7 +223,7 @@ export function resolveChildLoopPlan(
     source: served !== undefined ? "inherited" : "declared",
     model,
     ...(label !== undefined ? { profile: label } : {}),
-    instructions: def.instructions,
+    instructions: foldSubAgentOverlay(def.instructions, def.overlay),
     maxTokens: def.maxTokens ?? parent.maxTokens,
     loopOptions: {
       ...(def.thinking !== undefined ? { thinking: def.thinking } : {}),

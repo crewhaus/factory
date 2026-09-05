@@ -649,6 +649,13 @@ Route wisely.`);
     // A file declaring none of them yields none of them (no undefined keys).
     const legacy = parseSubAgentFile("---\nname: a\ndescription: b\n---\nbody");
     expect(Object.keys(legacy).sort()).toEqual(["description", "instructions", "name"]);
+    // `overlay` mirrors the IR's raw default-profile prefix: carried, not folded
+    // into the body — the spawner picks it or a pinned option's per call.
+    const overlaid = parseSubAgentFile(
+      "---\nname: a\ndescription: b\noverlay: You are the fast lane.\n---\nbody",
+    );
+    expect(overlaid.overlay).toBe("You are the fast lane.");
+    expect(overlaid.instructions).toBe("body");
   });
 
   test("malformed routing keys are rejected with the offending path", () => {

@@ -91,6 +91,15 @@ export type IrSubAgentDefinition = {
   readonly federation?: { readonly url: string };
   /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
   readonly modelProfile?: string;
+  /**
+   * 0.6.0 §4.2 / §7.7 — the `instructions` overlay of the profile `model`
+   * resolved from, carried RAW (not folded into `instructions`) so the spawner
+   * folds it only for the declared / inherited plans: a Task call that pins one
+   * of `allowedProfiles` runs on THAT option's overlay instead. Every other
+   * serving slot folds its overlay at lower time; the sub-agent is the one slot
+   * whose prompt depends on a per-call choice.
+   */
+  readonly overlay?: string;
   /** 0.6.0 §7.7 — the child's own request params (spec `thinking` /
    *  `max_tokens` / `temperature`, or the referenced profile's). */
   readonly thinking?: IrThinking;

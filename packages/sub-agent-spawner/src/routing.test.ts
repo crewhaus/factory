@@ -269,6 +269,38 @@ describe("resolveChildLoopPlan (§7.7)", () => {
     expect(plan.loopOptions.modelTiers).toBeUndefined();
   });
 
+  test("`model: $fast` + `allowed_profiles: [$strong]`: the declared plan folds the fast overlay, a pinned plan folds ONLY the strong one", () => {
+    // What the compiler lowers for that spec: the default profile's overlay is
+    // carried RAW on `overlay`, `instructions` stays the spec's own text.
+    const def: SubAgentDefinition = {
+      ...HELPER,
+      model: FAST,
+      modelProfile: "fast",
+      overlay: "You are the fast lane.",
+      allowedProfiles: [
+        { profile: "strong", model: STRONG, overlay: "You are the strong lane." },
+        { profile: "plain", model: PRIMARY },
+      ],
+    };
+    const declared = resolveChildLoopPlan(parent, def, undefined);
+    expect(declared.source).toBe("declared");
+    expect(declared.instructions).toBe("You are the fast lane.\n\nhelp");
+    // With an allowlist declared it is EXACT (`allowed_profiles ?? [model]`):
+    // the child's own profile is not restatable unless listed.
+    expect(() => resolveChildLoopPlan(parent, def, "fast")).toThrow(/allowed: strong, plain/);
+    const pinned = resolveChildLoopPlan(parent, def, "strong");
+    expect(pinned.source).toBe("pinned");
+    expect(pinned.instructions).toBe("You are the strong lane.\n\nhelp");
+    expect(pinned.instructions).not.toContain("You are the fast lane.");
+    // A pinned option WITHOUT an overlay drops the default one too: the child
+    // is not running on the fast lane, so it must not be told it is.
+    expect(resolveChildLoopPlan(parent, def, "plain").instructions).toBe("help");
+    // `inherited` keeps the child's own profile overlay (its params still apply).
+    const inherited = resolveChildLoopPlan(parent, { ...def, inheritRouting: true }, undefined);
+    expect(inherited.source).toBe("inherited");
+    expect(inherited.instructions).toBe("You are the fast lane.\n\nhelp");
+  });
+
   test("a profile that restates the child's own identity is accepted and yields the default plan", () => {
     const def: SubAgentDefinition = { ...HELPER, model: STRONG, modelProfile: "strong" };
     expect(resolveChildLoopPlan(parent, def, "strong").source).toBe("declared");

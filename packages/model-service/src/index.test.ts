@@ -326,6 +326,7 @@ describe("renderSubAgentDef — one renderer for the three __subAgents literals"
       ...legacy,
       model: "claude-sonnet-4-6",
       modelProfile: "mid",
+      overlay: 'Take the "mid" lane.',
       thinking: { effort: "low" },
       maxTokens: 512,
       temperature: 0.2,
@@ -338,7 +339,7 @@ describe("renderSubAgentDef — one renderer for the three __subAgents literals"
       allowedProfiles: [{ profile: "fast", model: "a", overlay: "Be quick." }],
     });
     expect(rendered).toBe(
-      '{ name: "digger", description: "Deep-dive researcher", instructions: "Dig deep.", tools: ["read","grep"], model: "claude-sonnet-4-6", permissions: "inherit", inherit_bypass: false, modelProfile: "mid", thinking: {"effort":"low"}, maxTokens: 512, temperature: 0.2, modelFallbacks: ["claude-haiku-4-5"], circuitBreaker: {"failureThreshold":2}, modelTiers: {"fast":"a","default":"b"}, modelPool: {"candidates":[{"model":"a","tags":["cheap"]}],"policy":"static"}, budgetShare: 0.25, inheritRouting: true, allowedProfiles: [{"profile":"fast","model":"a","overlay":"Be quick."}] }',
+      '{ name: "digger", description: "Deep-dive researcher", instructions: "Dig deep.", tools: ["read","grep"], model: "claude-sonnet-4-6", permissions: "inherit", inherit_bypass: false, modelProfile: "mid", overlay: "Take the \\"mid\\" lane.", thinking: {"effort":"low"}, maxTokens: 512, temperature: 0.2, modelFallbacks: ["claude-haiku-4-5"], circuitBreaker: {"failureThreshold":2}, modelTiers: {"fast":"a","default":"b"}, modelPool: {"candidates":[{"model":"a","tags":["cheap"]}],"policy":"static"}, budgetShare: 0.25, inheritRouting: true, allowedProfiles: [{"profile":"fast","model":"a","overlay":"Be quick."}] }',
     );
     // An EMPTY modelFallbacks is treated as absent (the emitters' length guard).
     expect(renderSubAgentDef({ ...legacy, modelFallbacks: [] })).toBe(renderSubAgentDef(legacy));

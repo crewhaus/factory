@@ -71,6 +71,13 @@ export type SubAgentDefinition = {
   readonly inherit_bypass?: boolean;
   /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
   readonly modelProfile?: string;
+  /**
+   * 0.6.0 §7.7 — the default profile's `instructions` overlay, RAW. The
+   * spawner folds it in front of `instructions` for the declared / inherited
+   * plans ({@link foldSubAgentOverlay}); a pinned `allowedProfiles` option
+   * folds its own overlay instead, never both.
+   */
+  readonly overlay?: string;
   /** 0.6.0 §7.7 — the child's own request params. */
   readonly thinking?: IrThinking;
   readonly maxTokens?: number;
@@ -151,6 +158,7 @@ export function subAgentDefinitionFromIr(d: IrSubAgentDefinition): SubAgentDefin
     permissions: d.permissions,
     inherit_bypass: d.inheritBypass,
     ...(d.modelProfile !== undefined ? { modelProfile: d.modelProfile } : {}),
+    ...(d.overlay !== undefined ? { overlay: d.overlay } : {}),
     ...(d.thinking !== undefined ? { thinking: d.thinking } : {}),
     ...(d.maxTokens !== undefined ? { maxTokens: d.maxTokens } : {}),
     ...(d.temperature !== undefined ? { temperature: d.temperature } : {}),
@@ -162,6 +170,19 @@ export function subAgentDefinitionFromIr(d: IrSubAgentDefinition): SubAgentDefin
     ...(d.inheritRouting !== undefined ? { inheritRouting: d.inheritRouting } : {}),
     ...(d.allowedProfiles !== undefined ? { allowedProfiles: d.allowedProfiles } : {}),
   };
+}
+
+/**
+ * 0.6.0 §4.2 / §7.7 — fold a profile `instructions` overlay in front of a
+ * sub-agent's instructions: overlay first, blank-line separated (the same
+ * shape the compiler's `foldOverlay` gives every other serving slot). The ONE
+ * place the sub-agent prompt is assembled: the spawner calls it with the
+ * definition's own `overlay` for the declared / inherited plans and with the
+ * pinned option's `overlay` for a pinned plan; `undefined` ⇒ the instructions
+ * unchanged.
+ */
+export function foldSubAgentOverlay(instructions: string, overlay: string | undefined): string {
+  return overlay === undefined ? instructions : `${overlay}\n\n${instructions}`;
 }
 
 /**

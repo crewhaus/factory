@@ -167,6 +167,7 @@ const FRONTMATTER_SCHEMA = z.object({
     ])
     .optional(),
   inherit_bypass: z.boolean().optional(),
+  overlay: z.string().min(1).optional(),
   thinking: FRONTMATTER_THINKING.optional(),
   max_tokens: z.number().int().positive().optional(),
   temperature: z.number().min(0).max(2).optional(),
@@ -270,7 +271,10 @@ export function parseSubAgentFile(content: string, fallbackName?: string): SubAg
       ? { inherit_bypass: parsed.data.inherit_bypass }
       : {}),
     // 0.6.0 §7.7 — routing + params, spelled as the runtime definition holds
-    // them (the IR's names). Every key is copied only when present.
+    // them (the IR's names). Every key is copied only when present. `overlay`
+    // is the default-profile prompt prefix a pinned `allowed_profiles` entry
+    // replaces (the spawner folds whichever applies; the body stays raw).
+    ...(parsed.data.overlay !== undefined ? { overlay: parsed.data.overlay } : {}),
     ...(parsed.data.thinking !== undefined
       ? { thinking: thinkingFromFrontmatter(parsed.data.thinking) }
       : {}),

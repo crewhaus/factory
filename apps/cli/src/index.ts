@@ -18,6 +18,7 @@ import { createInterface } from "node:readline";
 import { Writable } from "node:stream";
 import {
   type SubAgentDefinition,
+  foldSubAgentOverlay,
   subAgentDefinitionFromIr,
 } from "@crewhaus/agent-context-isolation";
 // Type-only — the concrete factories are dynamically imported inside the
@@ -5830,7 +5831,9 @@ async function buildServeRuntime(
         return runChatLoop({
           ...commonOptions,
           model: def.model ?? model,
-          instructions: def.instructions,
+          // An MCP-exposed sub-agent has no Task `profile` to pin: it runs on
+          // its declared plan, so the default profile's overlay heads its prompt.
+          instructions: foldSubAgentOverlay(def.instructions, def.overlay),
           // `def.tools` is the sub-agent's resolved allowlist (always concrete
           // from the IR; `?? []` only satisfies the optional runtime type).
           tools: filterChildTools(tools, def.tools ?? []),

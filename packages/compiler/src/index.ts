@@ -935,8 +935,10 @@ function lowerChannels(channels: SpecChannel["channels"]): IrChannels {
  *                   the same fallback for runtime resolution.)
  *
  * 0.6.0 §7.7 — a sub-agent's `model` resolves through the registry like any
- * serving slot (`agent-full`: a profile's params and failover chain apply, its
- * overlay folds into the child's instructions), and the child carries its own
+ * serving slot (`agent-full`: a profile's params and failover chain apply; its
+ * overlay is CARRIED on `overlay`, not folded — the spawner folds it for the
+ * declared / inherited plans and a pinned `allowed_profiles` entry replaces it
+ * with its own), and the child carries its own
  * routing quartet, params, `budget_share`, `inherit_routing` and
  * `allowed_profiles`. Each allowed profile is resolved HERE to the serving slot
  * the child runs on when the Task call pins it (`IrSubAgentProfileOption`), so
@@ -1007,7 +1009,7 @@ function lowerSubAgents(
     const lowered: IrSubAgentDefinition = {
       name,
       description: def.description,
-      instructions: foldOverlay(def.instructions, slot?.overlay),
+      instructions: def.instructions,
       tools: def.tools ?? [],
       ...(slot !== undefined ? { model: slot.model } : {}),
       permissions: def.permissions ?? "inherit",
@@ -1023,6 +1025,10 @@ function lowerSubAgents(
             ...(local.maxTokens !== undefined ? { maxTokens: local.maxTokens } : {}),
             ...(local.temperature !== undefined ? { temperature: local.temperature } : {}),
           }),
+      // The default profile's overlay rides RAW: which overlay heads the child's
+      // prompt is a per-Task-call decision (`allowed_profiles`), so the spawner
+      // folds it, not the compiler. Absent ⇒ no key (0.5.x specs lower byte-identically).
+      ...(slot?.overlay !== undefined ? { overlay: slot.overlay } : {}),
       ...routing,
       ...(slot !== undefined ? servingSlotFailover(slot) : {}),
       ...(def.budget_share !== undefined ? { budgetShare: def.budget_share } : {}),

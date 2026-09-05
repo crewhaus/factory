@@ -461,12 +461,15 @@ describe("$profile / sentinels on every auxiliary slot (the six that bypassed re
       temperature: 0,
       params: { maxTokens: 512 },
     });
-    // The sub-agent slot is a serving slot: full expansion.
+    // The sub-agent slot is a serving slot: full expansion — except the
+    // overlay, which rides RAW: a Task call may pin an `allowed_profiles`
+    // entry whose overlay replaces it, so the spawner folds, not the compiler.
     expect(ir.subAgents[0]).toMatchObject({
       name: "helper",
       model: "claude-haiku-4-5",
       modelProfile: "fast",
-      instructions: "You are the fast lane.\n\nhelp",
+      instructions: "help",
+      overlay: "You are the fast lane.",
       maxTokens: 4096,
       thinking: { effort: "low" },
       modelFallbacks: ["claude-sonnet-4-6"],
@@ -1199,6 +1202,35 @@ describe("graph nodes and sub-agents gain routing (§7.7)", () => {
       ).files.find((f) => f.path === "agent.ts")?.content ?? "";
     expect(agentTs).toContain(
       'modelTiers: {"fast":"claude-haiku-4-5","default":"claude-opus-4-8"}, budgetShare: 0.25, inheritRouting: true, allowedProfiles: [{"profile":"strong","model":"claude-opus-4-8","thinking":{"budgetTokens":4096}}] }',
+    );
+  });
+
+  test("a sub-agent on `model: $<profile>` keeps its instructions RAW and carries the profile overlay separately, into the IR and the bundle", () => {
+    const yaml = cli(
+      ...REGISTRY,
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: i",
+      "  sub_agents:",
+      "    helper:",
+      "      description: helps",
+      "      instructions: help",
+      "      tools: [read]",
+      "      model: $fast",
+      "      allowed_profiles: [$strong]",
+      "tools: [read]",
+    );
+    const ir = cliIr(yaml);
+    expect(ir.subAgents[0]?.instructions).toBe("help");
+    expect(ir.subAgents[0]?.overlay).toBe("You are the fast lane.");
+    // A profile with no `instructions` yields no `overlay` key at all.
+    const strongOnly = cliIr(yaml.replace("model: $fast", "model: $strong"));
+    expect(strongOnly.subAgents[0]?.instructions).toBe("help");
+    expect("overlay" in (strongOnly.subAgents[0] ?? {})).toBe(false);
+    // The emitted literal carries it right after the provenance key.
+    const agentTs = compile(yaml, opts).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain(
+      'instructions: "help", tools: ["read"], model: "claude-haiku-4-5", permissions: "inherit", inherit_bypass: false, modelProfile: "fast", overlay: "You are the fast lane.", thinking: {"effort":"low"}, maxTokens: 4096,',
     );
   });
 

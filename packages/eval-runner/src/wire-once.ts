@@ -14,7 +14,10 @@ import { join } from "node:path";
  * assumes the agent's MCP usage is read-mostly. An `isolateMcpPerSample`
  * escape hatch is reserved for a future where this matters.
  */
-import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
+import {
+  type SubAgentDefinition,
+  subAgentDefinitionFromIr,
+} from "@crewhaus/agent-context-isolation";
 import { type HookDef, loadHooks } from "@crewhaus/hooks-engine";
 import type { IrV0 } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
@@ -120,20 +123,10 @@ export async function wireRunOnce(ir: IrV0, opts: { cwd?: string } = {}): Promis
   // Sub-agents.
   let subAgents: ReadonlyMap<string, SubAgentDefinition> | undefined;
   if (ir.subAgents.length > 0) {
-    subAgents = new Map(
-      ir.subAgents.map((d) => [
-        d.name,
-        {
-          name: d.name,
-          description: d.description,
-          instructions: d.instructions,
-          tools: d.tools,
-          ...(d.model !== undefined ? { model: d.model } : {}),
-          permissions: d.permissions,
-          inherit_bypass: d.inheritBypass,
-        } satisfies SubAgentDefinition,
-      ]),
-    );
+    // 0.6.0 §7.7 — the ONE IR → runtime mapping (shared with both `crewhaus
+    // run` loop sites), so `crewhaus eval` measures the same child routing,
+    // params, budget share and profile allowlist the shipped agent runs with.
+    subAgents = new Map(ir.subAgents.map((d) => [d.name, subAgentDefinitionFromIr(d)]));
     tools.push(createTaskTool({ subAgents }));
   }
 

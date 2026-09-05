@@ -496,8 +496,8 @@ export function renderModelWiringFields(fragment: ModelWiringFragment, indent: s
  * Byte contract: the seven fields a 0.5.x definition has (`name`,
  * `description`, `instructions`, `tools`, `model`, `permissions`,
  * `inherit_bypass`) render exactly as the copies did, in that order; every
- * 0.6.0 key (`modelProfile`, the params, the routing quartet, `budgetShare`,
- * `inheritRouting`, `allowedProfiles`) is appended AFTER them and ONLY when
+ * 0.6.0 key (`modelProfile`, `overlay`, the params, the routing quartet,
+ * `budgetShare`, `inheritRouting`, `allowedProfiles`) is appended AFTER them and ONLY when
  * present, so a spec whose sub-agents carry only today's fields emits a
  * byte-identical bundle. The 0.6.0 keys use the runtime `SubAgentDefinition`
  * names (camelCase, identical to the IR's) — `inherit_bypass` keeps its
@@ -519,6 +519,7 @@ export function renderSubAgentDef(d: IrSubAgentDefinition): string {
   }
   lines.push(`inherit_bypass: ${d.inheritBypass}`);
   if (d.modelProfile !== undefined) lines.push(`modelProfile: ${escapeJsonString(d.modelProfile)}`);
+  if (d.overlay !== undefined) lines.push(`overlay: ${escapeJsonString(d.overlay)}`);
   if (d.thinking !== undefined) lines.push(`thinking: ${JSON.stringify(d.thinking)}`);
   if (d.maxTokens !== undefined) lines.push(`maxTokens: ${d.maxTokens}`);
   if (d.temperature !== undefined) lines.push(`temperature: ${d.temperature}`);
