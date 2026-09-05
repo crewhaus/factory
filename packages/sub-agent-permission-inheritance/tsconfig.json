@@ -6,6 +6,7 @@
   },
   "references": [
     { "path": "../agent-context-isolation" },
+    { "path": "../errors" },
     { "path": "../permission-engine" },
     { "path": "../tool-permission-matcher" }
   ],

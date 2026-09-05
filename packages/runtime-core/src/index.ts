@@ -1050,8 +1050,17 @@ export type RunEvaluation = {
   /** Passing bar: `score >= threshold` passes. (The compiler resolves the
    *  spec default: 0.7 for llm_judge; deterministic graders use 1.) */
   readonly threshold: number;
-  /** What a failing verdict does — see the option docblock. */
-  readonly onFail: "retry" | "halt" | "note";
+  /**
+   * What a failing verdict does — see the option docblock. 0.6.0 §7.3 adds
+   * `"escalate"` (spec `on_fail: escalate`): re-run the failed turn on the
+   * pool's `strategy.cascade.escalateTo` candidate. The forced re-run
+   * (`runOneTurn(messages, { force })`, the clean-prompt snapshot) lands with
+   * the cascade (PR 9c); until then the runtime treats `"escalate"` exactly
+   * as `"retry"` — which is what a compiled bundle carrying the value has
+   * done since the spec admitted it, so the `crewhaus run` interpreter,
+   * which threads the IR's `onFail` verbatim, behaves identically.
+   */
+  readonly onFail: "retry" | "halt" | "note" | "escalate";
   /** Hard cap on evaluation-triggered re-runs (>= 0; resolved default 1). */
   readonly maxRetries: number;
   /**
@@ -1060,6 +1069,29 @@ export type RunEvaluation = {
    * caller knows what it built `evaluate` from).
    */
   readonly graderType: "llm_judge" | "contains" | "regex";
+};
+
+/**
+ * 0.6.0 §7.2.4 — the seam between the `Escalate` tool and the loop (the
+ * structural twin of `@crewhaus/tool-consult`'s `EscalationLatch`; kept
+ * structural so runtime-core does not depend on the tool package). The tool
+ * records a request when the serving model asks for a stronger sibling; the
+ * loop consumes it exactly once, at its next model call, snapshotting the
+ * transcript length onto the record.
+ */
+export type HybridEscalationLatch = {
+  /** The accepted, not-yet-consumed request, if any. */
+  pending(): HybridEscalationRequest | undefined;
+  /** Take the pending request (clearing it), stamping the loop's snapshot. */
+  consume(snapshot: { readonly transcriptLength: number }): HybridEscalationRequest | undefined;
+};
+
+export type HybridEscalationRequest = {
+  readonly receipt: number;
+  readonly reason: string;
+  /** The roster candidate the escalation targets (its spec model string). */
+  readonly target: { readonly modelString: string; readonly profile?: string };
+  readonly turnNumber: number;
 };
 
 export type RunChatLoopOptions = {
@@ -1127,6 +1159,29 @@ export type RunChatLoopOptions = {
    * byte-identical to a pre-G32 runtime.
    */
   plugins?: { readonly tools?: ReadonlyArray<RegisteredTool> };
+  /**
+   * 0.6.0 §7.2.4 / §5.2 — the hybrid-strategy tools the composition root
+   * (`@crewhaus/model-service`'s `wireModels`) registers when the pool declares
+   * `strategy.model_directed: true`: `Consult` and `Escalate` from
+   * `@crewhaus/tool-consult`. APPENDED to the effective tool list after the
+   * caller's own tools and the plugin tools, first-party winning any name
+   * collision (the plugin posture), and advertised like every other tool —
+   * they survive a profile's `tools: []` like the auto-registered loop tools
+   * and are dropped per profile through `permissions.deny`. Absent → the run
+   * is byte-identical to a pre-0.6.0 runtime.
+   */
+  hybridTools?: ReadonlyArray<RegisteredTool>;
+  /**
+   * 0.6.0 §7.2.4 — the `Escalate` tool's latch (built by `wireModels` beside
+   * the tool). When the serving model calls `Escalate`, the loop consumes the
+   * request at its next model call: it arms the pool's escalation latch (the
+   * same one a failed cheap pick arms) so the rest of the turn is served by
+   * the request's target when that is a roster candidate, else the strongest
+   * candidate. The clean-prompt re-run through `runOneTurn(messages, { force })`
+   * lands with the cascade (PR 9c) on this same seam. Meaningful only with
+   * `modelPool`; without one a request is consumed and logged, never served.
+   */
+  escalation?: HybridEscalationLatch;
   /** Per-run identity, abort signal, and logger. Defaults to a fresh `createRunContext()`. */
   runContext?: RunContext;
   /** Context-window limit in tokens. Defaults to 200_000 (Claude opus/sonnet 4.x). */
@@ -2246,7 +2301,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Item 3 (G32) — resolve the advertised tool set ONCE, up front, folding in
   // any plugin-contributed tools so the tool-capable-model feature gate and the
   // per-turn advertisement below read the same list.
-  const mergedTools = mergeEffectiveTools(opts.tools ?? [], opts.plugins?.tools);
+  // 0.6.0 — then the hybrid-strategy tools (`Consult` / `Escalate`) the
+  // composition root registered, same first-party-wins posture.
+  const mergedTools = mergeEffectiveTools(
+    mergeEffectiveTools(opts.tools ?? [], opts.plugins?.tools),
+    opts.hybridTools,
+  );
   // #405 — the runtime's own toolset-introspection tool rides every
   // TOOL-CARRYING loop. Late-bound: it is part of the list it reports, so it
   // reads the advertised summaries assigned after that list is built below.
@@ -4992,6 +5052,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // strongest candidate for the rest of the run (misroute recovery, mirroring
     // the tier router's fast→default escalation latch).
     let escalatePool = false;
+    // 0.6.0 §7.2.4 — the model's own `Escalate` request, once consumed: the
+    // latch above is armed and the decision below names its target + receipt.
+    let selfEscalation: HybridEscalationRequest | undefined;
 
     while (state.kind !== "Done") {
       if (turnAbort.signal.aborted) {
@@ -5103,6 +5166,26 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // chosen candidate; the outcome is folded into the reward
             // scoreboard post-turn. Takes precedence over the tier router (the
             // two are mutually exclusive in the spec).
+            // 0.6.0 §7.2.4 — the `Escalate` tool's request (recorded during the
+            // preceding tool iteration) is consumed HERE, exactly once, with the
+            // transcript length snapshotted onto the receipt. With a pool it
+            // arms the escalation latch so the rest of this turn is served by
+            // the request's target; without one there is nothing to escalate
+            // to — the request is consumed and logged, never silently kept.
+            if (opts.escalation !== undefined && opts.escalation.pending() !== undefined) {
+              const consumed = opts.escalation.consume({ transcriptLength: messages.length });
+              if (consumed !== undefined) {
+                if (poolRouter !== undefined) {
+                  escalatePool = true;
+                  selfEscalation = consumed;
+                } else {
+                  runContext.logger.warn(
+                    "Escalate requested but no model_pool is active — nothing to escalate to",
+                    { receipt: consumed.receipt, reason: consumed.reason },
+                  );
+                }
+              }
+            }
             if (poolRouter !== undefined) {
               // 0.6.0 (design §8.1) — the four deterministic signals are also
               // persisted on the route line (derived values only, never user
@@ -5143,8 +5226,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   : escalatePool
                     ? {
                         ...base,
-                        candidate: poolRouter.escalation(),
-                        reason: `escalated to strongest candidate after a pool failure (was: ${base.reason})`,
+                        // A self-escalation names its target (the cascade's
+                        // `escalate_to`, else the strongest) — served when it is
+                        // a roster candidate, else the router's strongest; a
+                        // misroute escalation always goes to the strongest.
+                        candidate:
+                          (selfEscalation !== undefined
+                            ? poolRouter
+                                .candidates()
+                                .find((c) => c.modelString === selfEscalation?.target.modelString)
+                            : undefined) ?? poolRouter.escalation(),
+                        reason:
+                          selfEscalation !== undefined
+                            ? `escalated on the model's own Escalate request (receipt ${selfEscalation.receipt}: ${selfEscalation.reason}; was: ${base.reason})`
+                            : `escalated to strongest candidate after a pool failure (was: ${base.reason})`,
                         explored: false,
                       }
                     : base;

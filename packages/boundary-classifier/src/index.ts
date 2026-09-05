@@ -57,8 +57,21 @@ export class BoundaryClassifierError extends CrewhausError {
 
 /**
  * Where the content originated. Use the strongest applicable label.
- * Adding a new origin? Update `OriginDefaultSeverity` and the §41 doctor
- * check at the same time.
+ *
+ * Adding a new origin is a SIX-site change that lands in one PR (0.6.0
+ * design §10.1; the `memory` and `consult` precedents prove the count):
+ *   1. this union;
+ *   2. `ORIGIN_DEFAULT_POLICY` below (a `Record<TrustOrigin, …>`, so omission
+ *      is a compile error — but the tier is a real decision);
+ *   3. the deliberately MIRRORED union in `@crewhaus/run-context` (it carries
+ *      the metadata and must not depend on this package) — the
+ *      `origin-mirror.test.ts` bridge fails `tsc -b` when the two drift;
+ *   4. `@crewhaus/egress-classifier`'s sink-side severity matrix;
+ *   5. the §41 `crewhaus doctor --philosophy-alignment` boundary-site list
+ *      (and a drift-signal row) in `apps/cli`;
+ *   6. factory's own `AGENTS.md` (the verbatim union + the source-site
+ *      table). The test arrays derive from {@link TRUST_ORIGINS}, so they
+ *      never need a hand edit.
  */
 export type TrustOrigin =
   | "user"
@@ -70,7 +83,8 @@ export type TrustOrigin =
   | "compaction"
   | "tool"
   | "chain"
-  | "memory";
+  | "memory"
+  | "consult";
 
 export type BoundarySeverity = "block" | "warn" | "pass";
 
@@ -109,7 +123,34 @@ const ORIGIN_DEFAULT_POLICY: Record<TrustOrigin, BoundarySeverity> = {
   // read time. Block by default, same tier as "skill" (both are
   // disk-persisted instructions-adjacent content).
   memory: "block",
+  // Consult content (0.6.0 design §7.5, §10.1): the reply of a nested
+  // single-turn side call on a roster sibling (`Consult`), and the `<guide>`
+  // text a plan-execute strategy injects. The sibling is a model the spec
+  // trusts to SERVE, not content the run may trust to READ: its reply was
+  // shaped by whatever the question carried (tool output, channel text) and
+  // re-enters the parent's context verbatim, so it is classified exactly
+  // once, here, at the tool. Block by default, the "skill" / "memory" tier.
+  consult: "block",
 };
+
+/**
+ * Every declared origin, in declaration order — derived from the policy
+ * table so it can never disagree with the union. Test arrays and the
+ * run-context mirror bridge read this instead of hand-listing origins.
+ */
+export const TRUST_ORIGINS: ReadonlyArray<TrustOrigin> = Object.keys(
+  ORIGIN_DEFAULT_POLICY,
+) as TrustOrigin[];
+
+/**
+ * The origin's default source-side severity — what `classifyBoundary`
+ * applies when the caller passes no `severity` override. Exposed read-only
+ * so tests and `doctor` can assert the tier of each origin without
+ * re-deriving the table.
+ */
+export function defaultBoundarySeverity(origin: TrustOrigin): BoundarySeverity {
+  return ORIGIN_DEFAULT_POLICY[origin];
+}
 
 export type ClassifyBoundaryOptions = {
   /** Required: where the content came from. Drives the default policy. */

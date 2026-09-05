@@ -27,8 +27,14 @@
  *                              `allow: ["Bash(**)"]`). The permissive defaults
  *                              (Read/Glob/Grep) stay in `builtin` as a
  *                              narrow-only fallback.
+ *
+ * `narrowRuleSet(base, deny, ask)` (0.6.0 design §4.4) is the second export:
+ * the per-candidate permission narrowing a `models:` profile's restricted
+ * `{deny, ask}` block applies to the run's RuleSet — a decision-level MEET
+ * (deny < ask < allow) that can only ever tighten. See its docblock.
  */
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
+import { CrewhausError } from "@crewhaus/errors";
 import {
   BUILTIN_DEFAULT_RULES,
   type PermissionMode,
@@ -134,4 +140,106 @@ export function resolveChildPermissions(
   }
   // perm = { allow, deny }
   return { mode, rules: buildReplaceRuleSet(perm.allow, perm.deny) };
+}
+
+/**
+ * 0.6.0 §4.4 — a malformed pattern in a profile's `deny` / `ask` list. Thrown
+ * at boot, not at call time: permission-engine fails CLOSED on an
+ * uncompilable guard rule (it treats the rule as matching every call), so a
+ * typo in a profile deny would silently deny the candidate every tool.
+ * Surfacing it as a config error is the honest failure.
+ */
+export class NarrowRuleSetError extends CrewhausError {
+  override readonly name = "NarrowRuleSetError";
+  constructor(message: string, cause?: unknown) {
+    super("config", message, cause);
+  }
+}
+
+function assertCompilable(patterns: ReadonlyArray<string>, kind: "deny" | "ask"): void {
+  for (const pattern of patterns) {
+    try {
+      compilePattern(pattern);
+    } catch (err) {
+      throw new NarrowRuleSetError(
+        `narrowRuleSet: profile ${kind} pattern ${JSON.stringify(pattern)} does not compile — ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        err,
+      );
+    }
+  }
+}
+
+/**
+ * 0.6.0 design §4.4 — narrow a run's RuleSet for ONE pool candidate whose
+ * `models:` profile declares the restricted `permissions: { deny, ask }`
+ * block (no `alwaysAllow`, no `mode` — `packages/spec` rejects both).
+ *
+ * Narrowing is defined as a **decision-level meet** (deny < ask < allow), not
+ * as rule-array surgery: for every call, `evaluate(narrowed)` is at most as
+ * permissive as `evaluate(base)`, and a profile rule can only move a
+ * decision DOWN the lattice. `evaluateWithReason` is first-match-wins across
+ * `flag > settings > yaml > hooks > builtin`, so the meet is realised by
+ * ORDERING inside the `settings` source (no new `RuleSource` is introduced):
+ *
+ *   settings = [ every `alwaysDeny` the base carries in ANY source,
+ *                the profile's denies, the profile's asks,
+ *                the base's own remaining settings rules ]
+ *
+ * — the shape's existing denies are re-sourced ahead of the profile's rules
+ * so a profile `ask` can never soften a shape `deny`, and the profile's
+ * rules sit ahead of the disk standing allows (`crewhaus approvals grant
+ * --always`, the Slack "Always allow" button live in `settings`) so a
+ * standing allow cannot defeat the profile. `yaml`, `hooks` and `builtin`
+ * are carried verbatim (their denies are shadowed by the hoisted copy —
+ * harmless). `flag` is carried verbatim too and keeps the engine's own top
+ * priority: a `--allow` flag is the operator's explicit invocation-time
+ * decision, and outranking it from a spec-authored profile would invert the
+ * engine's documented source order. Mode semantics are untouched: `plan`
+ * stays readOnly-only, `bypass` (CLI-only) stays bypass.
+ *
+ * Empty `deny` AND `ask` return `base` by reference — nothing to narrow, so
+ * the run stays byte-identical (the spread-return-`{}` discipline applied to
+ * a RuleSet). The property `evaluate(narrowed) ≤ evaluate(base)` is pinned by
+ * a randomised test in `index.test.ts`.
+ */
+export function narrowRuleSet(
+  base: RuleSet,
+  deny: ReadonlyArray<string>,
+  ask: ReadonlyArray<string>,
+): RuleSet {
+  if (deny.length === 0 && ask.length === 0) return base;
+  assertCompilable(deny, "deny");
+  assertCompilable(ask, "ask");
+  const hoistedDenies: PermissionRule[] = [];
+  for (const source of ["flag", "settings", "yaml", "hooks", "builtin"] as const) {
+    for (const rule of base[source]) {
+      if (rule.type === "alwaysDeny") {
+        hoistedDenies.push(rule.source === "settings" ? rule : { ...rule, source: "settings" });
+      }
+    }
+  }
+  const profileDenies: PermissionRule[] = deny.map((pattern) => ({
+    type: "alwaysDeny" as const,
+    pattern,
+    source: "settings" as const,
+  }));
+  const profileAsks: PermissionRule[] = ask.map((pattern) => ({
+    type: "alwaysAsk" as const,
+    pattern,
+    source: "settings" as const,
+  }));
+  return {
+    flag: [...base.flag],
+    settings: [
+      ...hoistedDenies,
+      ...profileDenies,
+      ...profileAsks,
+      ...base.settings.filter((r) => r.type !== "alwaysDeny"),
+    ],
+    yaml: [...base.yaml],
+    hooks: [...base.hooks],
+    builtin: [...base.builtin],
+  };
 }

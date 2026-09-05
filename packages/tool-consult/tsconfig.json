@@ -5,13 +5,13 @@
     "outDir": "dist"
   },
   "references": [
-    { "path": "../adapter-anthropic" },
-    { "path": "../infra-utils" },
-    { "path": "../ir" },
+    { "path": "../boundary-classifier" },
+    { "path": "../errors" },
+    { "path": "../permission-engine" },
     { "path": "../run-context" },
-    { "path": "../runtime-core" },
+    { "path": "../tool-builder" },
     { "path": "../tool-catalog" },
-    { "path": "../tool-consult" },
+    { "path": "../tool-executor" },
     { "path": "../trace-event-bus" }
   ],
   "include": ["src/**/*"]

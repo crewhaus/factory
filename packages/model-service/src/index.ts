@@ -19,15 +19,45 @@
  * lands HERE (PRs 8b, 9a–9d, 10), never in codegen. runtime-core keeps
  * receiving injected closures and stays store-free.
  *
- * PR 8a (this file's first cut) WRAPS what the emitters already rendered,
- * byte-identically: it constructs nothing at runtime yet, and
- * {@link renderModelWiringFields} reproduces the legacy emitter strings
- * exactly so every existing bundle is unchanged. `wireModels` and the
- * renderer are pinned equal by test (`index.test.ts`): evaluating the
- * rendered fields yields the same object `wireModels` returns.
+ * PR 8a (this file's first cut) WRAPPED what the emitters already rendered,
+ * byte-identically: {@link renderModelWiringFields} reproduces the legacy
+ * emitter strings exactly so every existing bundle is unchanged, and
+ * `wireModels` and the renderer are pinned equal by test (`index.test.ts`):
+ * evaluating the rendered fields yields the same object `wireModels` returns.
+ *
+ * PR 8b adds the first runtime CONSTRUCTION: under
+ * `model_pool.strategy.model_directed: true` the root builds the `Consult`
+ * and `Escalate` tools from `@crewhaus/tool-consult` and returns them as the
+ * `hybridTools` / `escalation` options (plan §7.2.4, §7.5). The Consult
+ * runner is a nested single-turn `runChatLoop` on the allowlisted roster
+ * sibling — through `runChatLoop`, never `adapter.stream`, so
+ * `model_request` / `model_response`, `cost_accrual` and budget metering all
+ * hold — minted with its OWN child `RunContext` and child `TraceEventBus`
+ * (the side-call isolation contract, §7.6) whose model events are re-published
+ * on the parent bus so the parent's meter counts them. The reply is classified
+ * at TrustOrigin "consult" (`classifyBoundary` + `tagContent`) INSIDE the tool
+ * package, exactly once; this root only builds the call. A pool without the
+ * strategy key, or any `--model` override, wires no hybrid tool — the
+ * pre-0.6.0 fragment stays byte-identical.
  */
+import { randomBytes, randomUUID } from "node:crypto";
+import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import type { IrCircuitBreaker, IrModelPool, IrModelTiers } from "@crewhaus/ir";
+import { type RunContext, createRunContext } from "@crewhaus/run-context";
+import { type RunChatLoopOptions, runChatLoop } from "@crewhaus/runtime-core";
+import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  type ConsultRunner,
+  type EscalationLatch,
+  createConsultTool,
+  createEscalateTool,
+  createEscalationLatch,
+  resolveRosterTarget,
+  rosterFromPool,
+  strongestOf,
+} from "@crewhaus/tool-consult";
+import { type TraceEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
 
 // ---------------------------------------------------------------------------
 // The fragment — the serializable slice of a lowered agent / step / role /
@@ -64,40 +94,85 @@ export type ModelWiringFragment = {
 /**
  * The `runChatLoop(...)` options fragment `wireModels` returns — the four
  * routing options under runtime-core's own option names, mirrored
- * STRUCTURALLY from the IR types rather than `Pick`ed off
- * `RunChatLoopOptions`. This package publishes `src/` as its types and does
- * not depend on `@crewhaus/runtime-core` (only its tests do), so a type
- * import here would resolve in the workspace and fail (TS2307) for every
- * consumer of the published tarball — the 0.5.5 publish-only break class.
- * Assignability to `Pick<RunChatLoopOptions, keyof ModelWiringRunOptions>`
- * is pinned where runtime-core IS a declared dependency and `tsc -b` checks
- * it: `apps/cli/src/loop-contract.ts`'s `modelRoutingRunOptions` returns
- * that `Pick`, so a rename in runtime-core still fails the build (the
- * `LoopContractRunOptions` discipline); `index.test.ts` carries the same
- * pin the `@crewhaus/memory-service` tests do. Later PRs widen this type
- * (`_poolAdapters`, `_scoreboard`, …) as the root starts constructing them.
+ * STRUCTURALLY from the IR types, plus (PR 8b) the two hybrid-tool options
+ * the root constructs under `strategy.model_directed`. Since PR 8b this
+ * package DOES depend on `@crewhaus/runtime-core` (the Consult runner is a
+ * nested `runChatLoop`), so the whole type is pinned assignable to
+ * `Pick<RunChatLoopOptions, keyof ModelWiringRunOptions>` right here
+ * ({@link _ModelWiringRunOptionsPin}) — a rename or reshaping in runtime-core
+ * fails `tsc -b` in this package, and `apps/cli/src/loop-contract.ts`'s
+ * `modelRoutingRunOptions` carries the same pin at the interpreter seam (the
+ * `LoopContractRunOptions` discipline). Later PRs widen this type
+ * (`_poolAdapters`, `_scoreboard`, …) as the root constructs more.
  */
 export type ModelWiringRunOptions = {
   readonly modelFallbacks?: readonly string[];
   readonly circuitBreaker?: IrCircuitBreaker;
   readonly modelTiers?: IrModelTiers;
   readonly modelPool?: IrModelPool;
+  /**
+   * 0.6.0 §7.2.4 — `Consult` + `Escalate`, present only when the (non-
+   * overridden) pool declares `strategy.model_directed: true`. runtime-core
+   * appends them to the effective tool list (first-party wins a collision).
+   */
+  readonly hybridTools?: ReadonlyArray<RegisteredTool>;
+  /** The `Escalate` tool's latch — the loop consumes it at its next model call. */
+  readonly escalation?: EscalationLatch;
 };
 
 /**
- * The runtime dependencies `wireModels` composes over. PR 8a needs only the
- * one run-context fact the interpreter already threads; the adapters,
- * scoreboard root, bus and tool catalog join as the root grows.
+ * The compile-time pin: every key of {@link ModelWiringRunOptions} is a
+ * `runChatLoop` option with an assignable value type. Never read.
+ */
+type _ModelWiringRunOptionsPin = ModelWiringRunOptions extends Pick<
+  RunChatLoopOptions,
+  keyof ModelWiringRunOptions
+>
+  ? true
+  : never;
+const _MODEL_WIRING_RUN_OPTIONS_PIN: _ModelWiringRunOptionsPin = true;
+void _MODEL_WIRING_RUN_OPTIONS_PIN;
+
+/**
+ * The runtime dependencies `wireModels` composes over: the interpreter's
+ * `--model` override, the session facts the nested consult loops persist
+ * under, and the test injection seams for the consult side call. The
+ * adapters, scoreboard root, bus and tool catalog join as the root grows.
  */
 export type WireModelsDeps = {
   /**
    * A caller-forced primary model (the interpreter's `--model` flag). A
    * flag-forced model is an explicit routing decision, and the spec's
    * fallback chain, tiers and pool were authored against the SPEC's primary
-   * — so they are dropped. `circuitBreaker` is kept: declared alone it
-   * breaker-wraps whichever single primary serves, override or not.
+   * — so they are dropped (and with the pool, its hybrid tools).
+   * `circuitBreaker` is kept: declared alone it breaker-wraps whichever
+   * single primary serves, override or not.
    */
   readonly modelOverride?: string;
+  /**
+   * The harness / spec name the nested consult loops label their sessions
+   * with (`<name>:consult`). Defaults to `"consult"`.
+   */
+  readonly sessionName?: string;
+  /**
+   * Root under which the nested consult loops persist their session and
+   * event-log files (a consult is its own single-turn run, like a Task
+   * child). Defaults to the runtime's default (`.crewhaus/sessions`, or
+   * `CREWHAUS_SESSION_DIR`).
+   */
+  readonly sessionRootDir?: string;
+  /**
+   * Test injection — pre-built adapters for consult targets keyed by their
+   * SPEC model string (the `_poolAdapters` contract), so a consult runs
+   * offline through `runChatLoop({ _adapter })`. Production callers leave it
+   * undefined: the nested loop resolves the target through the model-router.
+   */
+  readonly _consultAdapters?: ReadonlyMap<string, ProviderAdapter>;
+  /**
+   * Test injection — replace the nested-`runChatLoop` runner entirely with a
+   * scripted one. Production callers leave it undefined.
+   */
+  readonly _consultRunner?: ConsultRunner;
 };
 
 /** The routing keys, in the order every emitter and the interpreter have
@@ -109,6 +184,11 @@ export const MODEL_WIRING_KEYS = [
   "modelTiers",
   "modelPool",
 ] as const;
+
+/** The hybrid-tool keys `wireModels` appends after {@link MODEL_WIRING_KEYS}
+ *  when the pool declares `strategy.model_directed: true`. Never rendered by
+ *  {@link renderModelWiringFields}: they are runtime constructions. */
+export const HYBRID_WIRING_KEYS = ["hybridTools", "escalation"] as const;
 
 /**
  * Pick the routing slice out of a lowered block EXACTLY as the retired
@@ -138,14 +218,16 @@ export function modelWiringFragmentFromIr(block: ModelWiringFragment): ModelWiri
  * for a fragment: every key present only when the fragment declares it
  * (spread-return-`{}` discipline — an empty fragment yields `{}` and the
  * runtime defaults stay authoritative), values by reference, keys in
- * {@link MODEL_WIRING_KEYS} order.
+ * {@link MODEL_WIRING_KEYS} order, then {@link HYBRID_WIRING_KEYS} when the
+ * pool declares `strategy.model_directed: true`.
  *
- * Synchronous and construction-free in PR 8a by design (plan §13 row 8a,
- * §17): the runtime still resolves candidate adapters, opens the scoreboard
- * and builds the PolicyRouter inside `runChatLoop` from these four options,
- * exactly as it did when each emitter rendered them by hand. Moving that
- * construction here is PR 9a/10's job; landing the seam first, pinned
- * byte-identical, is this PR's.
+ * Still synchronous. The runtime resolves candidate adapters, opens the
+ * scoreboard and builds the PolicyRouter inside `runChatLoop` from the four
+ * routing options exactly as it did when each emitter rendered them by hand
+ * (moving that construction here is PR 9a/10's job). What this root DOES
+ * construct today is the model-directed pair: the `Consult` tool over a
+ * nested-`runChatLoop` runner on the roster, and the `Escalate` tool with the
+ * latch the loop consumes — see {@link wireModelDirected}.
  */
 export function wireModels(
   fragment: ModelWiringFragment,
@@ -153,6 +235,7 @@ export function wireModels(
 ): ModelWiringRunOptions {
   const overridden = typeof deps.modelOverride === "string";
   const fallbacks = fragment.modelFallbacks;
+  const pool = !overridden ? fragment.modelPool : undefined;
   return {
     ...(!overridden && fallbacks !== undefined && fallbacks.length > 0
       ? { modelFallbacks: fallbacks }
@@ -161,7 +244,148 @@ export function wireModels(
     ...(!overridden && fragment.modelTiers !== undefined
       ? { modelTiers: fragment.modelTiers }
       : {}),
-    ...(!overridden && fragment.modelPool !== undefined ? { modelPool: fragment.modelPool } : {}),
+    ...(pool !== undefined ? { modelPool: pool } : {}),
+    ...(pool !== undefined && pool.strategy?.modelDirected === true
+      ? wireModelDirected(pool, deps)
+      : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Model-directed: Consult + Escalate (plan §7.2.4, §7.5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the `Consult` / `Escalate` pair for a pool that declares
+ * `strategy.model_directed: true`. The roster is the pool's ENABLED
+ * candidates; the escalation target is `strategy.cascade.escalateTo`
+ * resolved against the roster (a tag, profile or model string), else the
+ * strongest candidate (first `routing.strongTag`-tagged, else the last
+ * declared — the router's `escalation()` convention); `strategy.
+ * max_escalations` bounds the latch (default 1). A pool the compiler let
+ * through with no enabled candidate wires nothing rather than throwing.
+ */
+export function wireModelDirected(
+  pool: IrModelPool,
+  deps: WireModelsDeps,
+): Pick<ModelWiringRunOptions, "hybridTools" | "escalation"> {
+  const roster = rosterFromPool(pool);
+  if (roster.length === 0) return {};
+  const strongTag = pool.routing?.strongTag;
+  const escalateTo = pool.strategy?.cascade?.escalateTo;
+  const target =
+    (escalateTo !== undefined ? resolveRosterTarget(roster, escalateTo, strongTag) : undefined) ??
+    strongestOf(roster, strongTag);
+  const latch = createEscalationLatch({
+    target,
+    ...(pool.strategy?.maxEscalations !== undefined
+      ? { maxEscalations: pool.strategy.maxEscalations }
+      : {}),
+  });
+  const run = deps._consultRunner ?? buildConsultRunner(deps);
+  const consult = createConsultTool({
+    roster,
+    run,
+    ...(strongTag !== undefined ? { strongTag } : {}),
+  });
+  const escalate = createEscalateTool({ latch });
+  return { hybridTools: [consult, escalate], escalation: latch };
+}
+
+/** The consulted model's system prompt — it sees the question, nothing else. */
+export const CONSULT_INSTRUCTIONS =
+  "You are being consulted by another model of the same harness on one question. Answer it directly and concisely, using only the question and the context you are given. You have no tools and cannot see the rest of the conversation; if the question cannot be answered from what you were given, say exactly what is missing.";
+
+/**
+ * The nested single-turn side call (plan §7.5 / §7.6). Runs the roster
+ * target through `runChatLoop({ singleTurn: true, tools: [], sessionTarget:
+ * "consult", modelRole: "consult" })` — never `adapter.stream` — on a CHILD
+ * run context whose bus inherits the parent's trace and whose
+ * `model_request` / `model_response` events are re-published on the PARENT
+ * bus under the parent's envelope, so the parent's cost-tracker prices them
+ * (`role: "consult"`), its `budgetMeter` counts them under `judge_share`, and
+ * its session mirror persists them. The child is minted (own runId /
+ * sessionId, the parent's abort signal, an origin stack ending in "consult")
+ * rather than reusing the parent's context because the singleTurn path
+ * mutates `runContext.turnNumber` — a shared context would inject phantom
+ * turns into the parent (§7.6). The child persists its own session file
+ * like a Task child does; whether side calls should persist at all is plan
+ * §16 Q6, decided with the other side-call closures in PR 9d.
+ *
+ * Returns the raw reply text — classification at TrustOrigin "consult"
+ * (`classifyBoundary` + `tagContent`) is the tool's job in
+ * `@crewhaus/tool-consult`, exactly once.
+ */
+export function buildConsultRunner(deps: WireModelsDeps): ConsultRunner {
+  return async ({ target, question, context, runContext: parent, signal }) => {
+    const childRunId = `run_${randomUUID().slice(0, 8)}`;
+    const childSessionId = `sess_${randomBytes(8).toString("hex")}`;
+    const childBus = new TraceEventBus({
+      runId: childRunId,
+      sessionId: childSessionId,
+      ...(parent !== undefined
+        ? {
+            inheritTraceId: parent.eventBus.traceId,
+            inheritParentSpanId: parent.eventBus.currentSpanId,
+            logger: parent.logger,
+          }
+        : {}),
+    });
+    const child: RunContext = createRunContext({
+      runId: childRunId,
+      sessionId: childSessionId,
+      ...(signal !== undefined
+        ? { abortSignal: signal }
+        : parent !== undefined
+          ? { abortSignal: parent.abortSignal }
+          : {}),
+      ...(parent !== undefined ? { logger: parent.logger } : {}),
+      eventBus: childBus,
+      originStack: [...(parent?.originStack ?? []), "consult"],
+    });
+    // Re-publish the child's model calls on the parent bus so the parent's
+    // meter, cost-tracker and session mirror see them (`role: "consult"` is
+    // stamped by the child loop's `modelRole`; re-stamped here defensively).
+    const unsubscribe =
+      parent !== undefined
+        ? childBus.subscribe((event: TraceEvent) => {
+            if (event.kind !== "model_request" && event.kind !== "model_response") return;
+            parent.eventBus.publish({ ...event, ...parent.eventBus.envelope(), role: "consult" });
+          })
+        : undefined;
+    const injected = deps._consultAdapters?.get(target.modelString);
+    const content =
+      context !== undefined && context.trim().length > 0
+        ? `${context.trim()}
+
+---
+
+Question: ${question}`
+        : question;
+    try {
+      const text = await runChatLoop({
+        model: target.modelString,
+        instructions: CONSULT_INSTRUCTIONS,
+        tools: [],
+        singleTurn: true,
+        seedMessages: [{ role: "user", content }],
+        runContext: child,
+        sessionName: `${deps.sessionName ?? "consult"}:consult`,
+        sessionTarget: "consult",
+        modelRole: "consult",
+        installSigintHandler: false,
+        spinner: false,
+        stdout: () => {},
+        // A child's rules are the parent's business, not the disk's: the
+        // consult runs no tools, so there is nothing to merge.
+        settingsDir: null,
+        ...(deps.sessionRootDir !== undefined ? { sessionRootDir: deps.sessionRootDir } : {}),
+        ...(injected !== undefined ? { _adapter: injected } : {}),
+      });
+      return { text };
+    } finally {
+      unsubscribe?.();
+    }
   };
 }
 

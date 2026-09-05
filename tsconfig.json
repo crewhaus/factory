@@ -34,6 +34,7 @@
     { "path": "./packages/tool-web" },
     { "path": "./packages/tool-image" },
     { "path": "./packages/tool-codegraph" },
+    { "path": "./packages/tool-consult" },
     { "path": "./packages/computer-use-driver" },
     { "path": "./packages/tool-screen-capture" },
     { "path": "./packages/tool-mouse-keyboard" },

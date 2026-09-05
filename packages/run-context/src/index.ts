@@ -16,6 +16,9 @@ import { TraceEventBus } from "@crewhaus/trace-event-bus";
  * `TrustOrigin` in `@crewhaus/boundary-classifier`. Kept as a string-literal
  * union here (instead of an import) so `run-context` does not depend on the
  * classifier — it carries the metadata; the classifier owns the policy.
+ * The two unions are pinned set-equal by the classifier's
+ * `origin-mirror.test.ts` bridge (a `tsc -b` failure when they drift), so
+ * adding an origin there without adding it here does not compile.
  */
 export type TrustOrigin =
   | "user"
@@ -27,7 +30,8 @@ export type TrustOrigin =
   | "compaction"
   | "tool"
   | "chain"
-  | "memory";
+  | "memory"
+  | "consult";
 
 export type RunContext = {
   readonly runId: string;

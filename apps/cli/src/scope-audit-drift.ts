@@ -285,6 +285,17 @@ const DRIFT_SIGNALS: ReadonlyArray<DriftSignal> = [
     description: "decodes chain RPC/event content",
     packagePattern: /^chain-adapter-(?!base$).+/,
   },
+  // 0.6.0 §10.1 — a nested model side call in the "consult" role (Consult,
+  // guide, verifier): its reply is a roster sibling's output shaped by
+  // whatever the question carried, and re-enters the parent's context. The
+  // needle is the option literal the nested `runChatLoop` is given.
+  {
+    symbol: "consult-reply-ingress",
+    origin: "consult",
+    description:
+      'runs a nested model side call in the "consult" role whose reply re-enters the parent context',
+    contentNeedle: 'modelRole: "consult"',
+  },
 ];
 
 /** Concatenate a package's non-test .ts sources (recursively under src/). */
