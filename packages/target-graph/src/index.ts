@@ -492,9 +492,13 @@ const JUDGE_GATE_HELPER = `
  * judge criteria: eval-judge's forced-tool scorer over a single-criterion
  * rubric (generic 1–5 anchors), mapped down via (n - 1) / 4. The judge
  * model resolves through the model-router, so any provider can judge; its
- * calls publish on the run bus with role "judge", so judge spend is priced
- * and metered into the run budget, and the verdict carries the judge's
- * wire model + priced spend for the judge_verdict event.
+ * calls publish on the run bus with role "judge", so any cost-tracker on that
+ * bus prices them and the verdict carries the judge's wire model + priced
+ * spend for the judge_verdict event. The graph shape has no run-spanning
+ * budget meter yet (each node's runChatLoop meter is torn down before a judge
+ * node runs), so budget.usd does not count a gate's spend here — the 0.6.0
+ * plan scopes the shared meter to the workflow target; mirroring it is
+ * follow-up work.
  */
 async function __judgeGate(opts: {
   criteria: string;
@@ -523,8 +527,9 @@ async function __judgeGate(opts: {
     sample: { id: "judge-gate", input: opts.gatedTask },
     agentOutput: opts.output,
     model: opts.model,
-    // Judge spend rides the run bus (role "judge") so it is priced and
-    // counted toward budget.usd under budget.judge_share.
+    // Judge spend rides the run bus (role "judge") so a tracker on that bus
+    // prices it; see the helper docblock for what the graph cap does not
+    // yet count.
     bus: opts.bus,
   });
   return {

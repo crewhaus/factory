@@ -386,6 +386,148 @@ describe("runChatLoop — eval_graded attribution + judge_share_exhausted (0.6.0
   });
 });
 
+describe("runChatLoop — judge_share is read at every budget gate, once per meter (0.6.0 §6.2, §7.12)", () => {
+  /** Publish one priced judge-role response on `runContext`'s bus — what a
+   *  workflow `kind: judge` gate running BETWEEN steps does on the shared
+   *  meter — without any `evaluation:` in play. */
+  const spendAsJudge = (runContext: ReturnType<typeof createRunContext>, inputTokens: number) => {
+    const bus = runContext.eventBus;
+    const env = bus.envelope();
+    bus.publish({
+      ...env,
+      kind: "model_request",
+      model: OPUS,
+      provider: "anthropic",
+      messageCount: 1,
+      toolCount: 1,
+      streaming: false,
+      role: "judge",
+    });
+    bus.publish({
+      ...bus.envelope(),
+      spanId: env.spanId,
+      kind: "model_response",
+      model: OPUS,
+      provider: "anthropic",
+      stopReason: "end_turn",
+      usage: { input: inputTokens, output: 0 },
+      durationMs: 1,
+      role: "judge",
+    });
+  };
+
+  test("a run WITHOUT evaluation: still prints the one [budget] notice from its per-call gate once auxiliary spend on the shared meter has crossed the share", async () => {
+    // Cap $10, default share 0.3 → $3. Judge spend of $4.50 lands on the
+    // shared meter before the step runs; the step's first per-call gate
+    // reads it and raises the notice. Total 4.5 + 1.5 < 10, so nothing stops.
+    const runContext = createRunContext();
+    const meter = createCostTracker(runContext.eventBus, { suppressEvents: true });
+    spendAsJudge(runContext, 300_000);
+    expect(meter.getRunCost(runContext.runId).byRole.judge).toBe(4_500_000);
+    const adapter = pricedAdapter("anthropic", { input: 100_000, output: 0 }, "step");
+    const stderr = captureStderr();
+    let caught: unknown;
+    try {
+      caught = await runAndCatch(() =>
+        runChatLoop({
+          model: OPUS,
+          instructions: "step",
+          _adapter: adapter,
+          permissionMode: "bypass",
+          budget: { usdMicros: 10_000_000, onExceed: { kind: "stop" } },
+          budgetMeter: meter,
+          singleTurn: true,
+          seedMessages: [{ role: "user", content: "go" }],
+          installSigintHandler: false,
+          spinner: false,
+          runContext,
+        }),
+      );
+    } finally {
+      stderr.restore();
+      meter.unsubscribe();
+    }
+    expect(caught).toBeUndefined();
+    expect(adapter.requests).toHaveLength(1);
+    const notices = stderr
+      .lines()
+      .filter((l) => l.includes("[budget]") && l.includes("judge_share_exhausted"));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("$4.5000 ≥ judge_share $3.0000");
+    expect(notices[0]).toContain("judging continues under the total cap");
+  });
+
+  test("the notice prints ONCE per shared meter across several loops (a workflow's steps), not once per loop", async () => {
+    const runContext = createRunContext();
+    const meter = createCostTracker(runContext.eventBus, { suppressEvents: true });
+    spendAsJudge(runContext, 300_000);
+    const step1 = pricedAdapter("anthropic", { input: 1_000, output: 0 }, "one");
+    const step2 = pricedAdapter("anthropic", { input: 1_000, output: 0 }, "two");
+    const budget = { usdMicros: 10_000_000, onExceed: { kind: "stop" as const } };
+    const stderr = captureStderr();
+    try {
+      for (const adapter of [step1, step2]) {
+        const caught = await runAndCatch(() =>
+          runChatLoop({
+            model: OPUS,
+            instructions: "step",
+            _adapter: adapter,
+            permissionMode: "bypass",
+            budget,
+            budgetMeter: meter,
+            singleTurn: true,
+            seedMessages: [{ role: "user", content: "go" }],
+            installSigintHandler: false,
+            spinner: false,
+            runContext,
+          }),
+        );
+        expect(caught).toBeUndefined();
+      }
+    } finally {
+      stderr.restore();
+      meter.unsubscribe();
+    }
+    expect(step1.requests).toHaveLength(1);
+    expect(step2.requests).toHaveLength(1);
+    const notices = stderr
+      .lines()
+      .filter((l) => l.includes("[budget]") && l.includes("judge_share_exhausted"));
+    expect(notices).toHaveLength(1);
+  });
+
+  test("control: under the share the gate prints nothing and the run is unaffected", async () => {
+    const runContext = createRunContext();
+    const meter = createCostTracker(runContext.eventBus, { suppressEvents: true });
+    spendAsJudge(runContext, 100_000); // $1.50 < $3 share
+    const adapter = pricedAdapter("anthropic", { input: 1_000, output: 0 }, "step");
+    const stderr = captureStderr();
+    let caught: unknown;
+    try {
+      caught = await runAndCatch(() =>
+        runChatLoop({
+          model: OPUS,
+          instructions: "step",
+          _adapter: adapter,
+          permissionMode: "bypass",
+          budget: { usdMicros: 10_000_000, onExceed: { kind: "stop" } },
+          budgetMeter: meter,
+          singleTurn: true,
+          seedMessages: [{ role: "user", content: "go" }],
+          installSigintHandler: false,
+          spinner: false,
+          runContext,
+        }),
+      );
+    } finally {
+      stderr.restore();
+      meter.unsubscribe();
+    }
+    expect(caught).toBeUndefined();
+    expect(stderr.lines().filter((l) => l.includes("judge_share_exhausted"))).toHaveLength(0);
+  });
+});
+
 describe("runChatLoop — compaction side-calls carry role compaction (0.6.0 §6.2)", () => {
   test("the pre-turn autocompact summary publishes model_request/model_response with role compaction on the run bus", async () => {
     // Force the pre-turn autocompact: many mid-size messages against a tiny

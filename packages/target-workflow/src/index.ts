@@ -203,6 +203,10 @@ type StepShared = {
   readonly failureTaxonomyField: string;
   readonly limitsFields: string;
   readonly budgetField: string;
+  /** 0.6.0 §6.2 — a `budget:` is declared, so the run body carries the
+   *  shared `__budgetMeter` and the `__judgeShareExhausted()` read the judge
+   *  steps stamp `reason: "judge_share_exhausted"` from. */
+  readonly hasBudget: boolean;
   readonly hooksExpr: string;
   readonly deadlineMs: number | undefined;
   readonly mcpWired: boolean;
@@ -397,6 +401,15 @@ ${deadlineGuard}  process.stdout.write(${escapeJsonString(`\n[step ${stepNum}/${
       `${i}  ...(__result.rationale.length > 0 ? { rationale: __result.rationale } : {}),`,
       `${i}  judgeModel: __result.judgeModel,`,
       `${i}  ...(__result.costUsdMicros !== undefined ? { costUsdMicros: __result.costUsdMicros } : {}),`,
+      // 0.6.0 §6.2 — read AFTER the scoring pass so the judge call that just
+      // ran is in the shared meter: the signal says "this verdict was
+      // produced past budget.judge_share". Budget-free workflows have no
+      // meter to read, so the line is absent there (byte-identical).
+      ...(shared.hasBudget
+        ? [
+            `${i}  ...(__judgeShareExhausted() ? { reason: "judge_share_exhausted" as const } : {}),`,
+          ]
+        : []),
       `${i}});`,
       `${i}process.stdout.write(${escapeJsonString(`[judge ${step.name}] `)} + "verdict=" + (__pass ? "pass" : "fail") + " score=" + __result.score.toFixed(2) + ${escapeJsonString(` threshold=${gate.threshold}\n`)});`,
     ].join("\n");
@@ -960,6 +973,7 @@ function renderAgent(ir: IrWorkflowV0, evalEntry = false): string {
     failureTaxonomyField,
     limitsFields,
     budgetField,
+    hasBudget,
     hooksExpr: hasSpecHooks ? "__allHooks" : "__hooks",
     deadlineMs,
     mcpWired: mcp.wired,
@@ -1090,19 +1104,40 @@ import type { TraceEventBus } from "@crewhaus/trace-event-bus";
       : "";
   // 0.6.0 §7.12 — the run-spanning budget meter: one cost tracker on the
   // shared bus, silent (no `cost_accrual` of its own beside an env-attached
-  // tracker), handed to every step through `budgetMeter`.
+  // tracker — which also means a judge GATE's spend, published between steps
+  // after step N's loop has torn its env-attached tracker down, is counted
+  // by this meter but reaches no `cost_accrual` line and so no
+  // `cost-summary`; closing that is follow-up work recorded in the 0.6.0
+  // PR train), handed to every step through `budgetMeter`. §6.2 — with judge
+  // steps present the boot also derives the `judge_share` sub-cap from the
+  // same meter so each gate can stamp `reason: "judge_share_exhausted"`.
   const budgetMeterImport = hasBudget
-    ? `import { createCostTracker } from "@crewhaus/cost-tracker";\n`
+    ? hasJudges
+      ? `import { createCostTracker, sumRoleCost } from "@crewhaus/cost-tracker";\nimport { DEFAULT_JUDGE_SHARE } from "@crewhaus/runtime-core";\nimport { AUXILIARY_MODEL_ROLES } from "@crewhaus/trace-event-bus";\n`
+      : `import { createCostTracker } from "@crewhaus/cost-tracker";\n`
     : "";
-  const budgetMeterBoot = hasBudget
-    ? [
-        "",
-        "  // 0.6.0 §7.12 — ONE budget meter for the whole run: every step's",
-        "  // model calls (and its judge/compaction side-calls) publish on the",
-        "  // shared bus, so budget.usd bounds the run, not each step.",
-        "  const __budgetMeter = createCostTracker(__runContext.eventBus, { suppressEvents: true });",
-      ].join("\n")
-    : "";
+  const budgetMeterBoot =
+    ir.budget !== undefined
+      ? [
+          "",
+          "  // 0.6.0 §7.12 — ONE budget meter for the whole run: every step's",
+          "  // model calls (and its judge/compaction side-calls) publish on the",
+          "  // shared bus, so budget.usd bounds the run, not each step.",
+          "  const __budgetMeter = createCostTracker(__runContext.eventBus, { suppressEvents: true });",
+          ...(hasJudges
+            ? [
+                "  // 0.6.0 §6.2 — budget.judge_share over that meter: once the run's",
+                "  // auxiliary-role spend (judge, compaction, …) has reached the share,",
+                '  // every judge_verdict below carries reason "judge_share_exhausted"',
+                "  // (the runtime prints the one [budget] notice from its next per-call",
+                "  // gate). The share never stops the run; budget.usd does.",
+                `  const __judgeShareMicros = Math.round(${ir.budget.usdMicros} * ${ir.budget.judgeShare ?? "DEFAULT_JUDGE_SHARE"});`,
+                "  const __judgeShareExhausted = (): boolean =>",
+                "    sumRoleCost(__budgetMeter.getRunCost(__runContext.runId), AUXILIARY_MODEL_ROLES) >= __judgeShareMicros;",
+              ]
+            : []),
+        ].join("\n")
+      : "";
   const judgeHelperBlock = hasJudges
     ? `${JUDGE_GATE_HELPER}${hasThrowingJudges ? EVAL_EXIT_CONST : ""}`
     : "";

@@ -384,6 +384,16 @@ export const PLAN_DIRTY_STATE_KEY = "plan.dirty";
  */
 export const DEFAULT_JUDGE_SHARE = 0.3;
 
+/**
+ * 0.6.0 (design §6.2, §7.12) — the budget meters whose `judge_share` notice
+ * has already printed. Keyed on the METER rather than the loop so a
+ * caller-supplied run-spanning meter (the workflow bundle's `__budgetMeter`,
+ * shared by every step's `runChatLoop` call) prints the notice once per RUN,
+ * while a per-loop meter is one entry that dies with its loop. A WeakSet, so
+ * nothing recorded here outlives the meter it describes.
+ */
+const judgeShareNoticedMeters = new WeakSet<CostTracker>();
+
 /** Role attribution on an evicted-content record (§2.3): `"user"` for user
  *  text, `"assistant"` for assistant text, `"tool"` for tool_result content
  *  (which the API carries inside user-role messages). */
@@ -1763,13 +1773,20 @@ export type RunChatLoopOptions = {
    *     consult, committee, shadow) may spend between them. Those calls now
    *     ride the run bus with a `role`, so the always-on meter counts them
    *     toward the cap like any other call; the share is the sub-cap inside
-   *     it. Crossing it is an ACCOUNTING signal in this release: the runtime
-   *     prints one `[budget]` notice, and every `eval_graded` published while
-   *     the share stands exhausted carries `reason: "judge_share_exhausted"`.
-   *     The judge keeps judging under the TOTAL cap (the in-loop retry path
-   *     is unchanged); the cascade that consumes the signal — serving its
-   *     strong rung directly instead of spending more on judging — lands
-   *     with the hybrid strategies.
+   *     it. Crossing it is an ACCOUNTING signal in this release: the share is
+   *     re-read at every budget gate (`enforceBudget` — the per-model-call
+   *     gate and the REPL's pre-turn gate) and after every in-loop grade, so
+   *     once auxiliary spend reaches it the runtime prints one `[budget]`
+   *     notice per METER (once per run on a shared `budgetMeter`) whether or
+   *     not the run declares `evaluation:` — a compaction-only run, or a
+   *     workflow whose `kind: judge` gates run between steps, raises it from
+   *     the next per-call gate — and every `eval_graded` published while the
+   *     share stands exhausted carries `reason: "judge_share_exhausted"` (the
+   *     workflow bundle stamps the same `reason` on `judge_verdict` from its
+   *     shared meter). The judge keeps judging under the TOTAL cap (the
+   *     in-loop retry path is unchanged); the cascade that consumes the
+   *     signal — serving its strong rung directly instead of spending more on
+   *     judging — lands with the hybrid strategies.
    * `usdMicros` is the ceiling in USD-micros (1 USD = 1_000_000). Absent →
    * no cap (zero behaviour change for existing callers). A model the
    * pricing table can't price accrues $0, so an all-unpriced run degrades
@@ -2810,10 +2827,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // (judge, compaction, guide, classifier, consult, committee, shadow) inside
   // the run cap. The meter already splits priced spend by `role`, so the
   // share is a read over `byRole`. Exhaustion is an accounting signal here —
-  // one stderr notice, plus `reason: "judge_share_exhausted"` on every
-  // `eval_graded` published while the share stands exhausted — never a stop
-  // (the total cap is the stop); the cascade behaviour consuming it lands
-  // with the hybrid strategies.
+  // one stderr notice per meter, plus `reason: "judge_share_exhausted"` on
+  // every `eval_graded` published while the share stands exhausted — never a
+  // stop (the total cap is the stop); the cascade behaviour consuming it
+  // lands with the hybrid strategies. The read rides EVERY budget gate (see
+  // `enforceBudget`), not only the in-loop grade, so a run without
+  // `evaluation:` still surfaces the signal.
   const judgeShareMicros =
     opts.budget !== undefined
       ? Math.round(opts.budget.usdMicros * (opts.budget.judgeShare ?? DEFAULT_JUDGE_SHARE))
@@ -2822,15 +2841,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     budgetMeter === undefined
       ? 0
       : sumRoleCost(budgetMeter.getRunCost(bus.runId), AUXILIARY_MODEL_ROLES);
-  let judgeShareNoticed = false;
   /** True once auxiliary spend has reached the share. Re-read on demand so a
-   *  reader (the eval gate today, the cascade later) sees the live state. */
+   *  reader (every budget gate and the eval gate today, the cascade later)
+   *  sees the live state; the notice prints once per meter. */
   const judgeShareExhausted = (): boolean => {
     if (judgeShareMicros === undefined || budgetMeter === undefined) return false;
     const aux = auxiliarySpentMicros();
     if (aux < judgeShareMicros) return false;
-    if (!judgeShareNoticed) {
-      judgeShareNoticed = true;
+    if (!judgeShareNoticedMeters.has(budgetMeter)) {
+      judgeShareNoticedMeters.add(budgetMeter);
       const share = opts.budget?.judgeShare ?? DEFAULT_JUDGE_SHARE;
       process.stderr.write(
         `[budget] auxiliary spend $${(aux / 1_000_000).toFixed(4)} ≥ judge_share $${(
@@ -2882,6 +2901,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    */
   const enforceBudget = async (turn: number): Promise<"continue" | "stop"> => {
     if (opts.budget === undefined || budgetMeter === undefined) return "continue";
+    // 0.6.0 §6.2 — the judge_share read rides every gate, so the one-time
+    // notice fires on ANY budgeted run once auxiliary spend crosses the
+    // share — a compaction-only run, or a workflow whose `kind: judge` gates
+    // run between steps on the shared meter — not only when an in-loop
+    // `evaluation:` grade happens to read it. Accounting only: the share
+    // never stops or degrades; the total cap below does.
+    judgeShareExhausted();
     const spent = resumedCostUsdMicros + budgetMeter.getRunCost(bus.runId).totalUsdMicros;
     if (spent < opts.budget.usdMicros) return "continue";
     // Degraded in THIS turn: the rung serves every remaining call of it.

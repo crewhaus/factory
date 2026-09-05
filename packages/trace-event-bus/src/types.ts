@@ -1035,6 +1035,18 @@ export type JudgeVerdictEvent = TraceEventEnvelope & {
   panel?: ReadonlyArray<string>;
   /** The gate's priced judge spend, when the grader reported usage. */
   costUsdMicros?: number;
+  /**
+   * 0.6.0 (design §6.2, §7.12) — budget signal stamped on the gate's verdict:
+   * the run's auxiliary-role spend (see {@link AUXILIARY_MODEL_ROLES}) had
+   * already reached `budget.judge_share` × `budget.usd` when this scoring pass
+   * ran, read over the shape's run-spanning meter (the workflow bundle's
+   * `__budgetMeter`). The judge still ran and the gate applies its `on_fail`
+   * as declared — this is the accounting signal the cascade consumes. Absent
+   * when no budget is declared, the share is not yet spent, or the shape has
+   * no run-spanning meter (the graph target, whose per-node meters are torn
+   * down before a judge node runs).
+   */
+  reason?: "judge_share_exhausted";
 };
 
 export type TraceEvent =

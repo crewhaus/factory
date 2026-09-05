@@ -484,9 +484,60 @@ describe("emitWorkflow — budget field (item 27, Batch A shape extension)", () 
     );
     // The meter is booted before the first step runs.
     expect(c.indexOf("const __budgetMeter")).toBeLessThan(c.indexOf("// ── Step 1/2"));
-    // No judge machinery leaks in on a judge-free budgeted workflow.
+    // No judge machinery leaks in on a judge-free budgeted workflow — and no
+    // judge_share read either: nothing here would stamp it.
     expect(c).not.toContain("__judgeGate");
     expect(c).not.toContain("@crewhaus/eval-judge");
+    expect(c).not.toContain("__judgeShareExhausted");
+    expect(c).not.toContain("judge_share_exhausted");
+    expect(c).not.toContain("sumRoleCost");
+    expect(c).not.toContain("AUXILIARY_MODEL_ROLES");
+    expect(c).not.toContain("DEFAULT_JUDGE_SHARE");
+  });
+
+  // 0.6.0 §6.2 — a budgeted workflow WITH judges reads judge_share over the
+  // shared meter and stamps the signal on every judge_verdict.
+  test("a budgeted workflow with judge steps derives judge_share from the shared meter and stamps reason judge_share_exhausted on judge_verdict", () => {
+    const ir: IrWorkflowV0 = {
+      ...RETRY_IR_SHARED,
+      budget: { usdMicros: 2_000_000, onExceed: { kind: "stop" } },
+    };
+    const c = emitWorkflow(ir).files[0]?.content ?? "";
+    expect(c).toContain('import { createCostTracker, sumRoleCost } from "@crewhaus/cost-tracker";');
+    expect(c).toContain('import { DEFAULT_JUDGE_SHARE } from "@crewhaus/runtime-core";');
+    expect(c).toContain('import { AUXILIARY_MODEL_ROLES } from "@crewhaus/trace-event-bus";');
+    // Spec omits judge_share → the runtime's default constant, not a literal.
+    expect(c).toContain("const __judgeShareMicros = Math.round(2000000 * DEFAULT_JUDGE_SHARE);");
+    expect(c).toContain(
+      "const __judgeShareExhausted = (): boolean =>\n    sumRoleCost(__budgetMeter.getRunCost(__runContext.runId), AUXILIARY_MODEL_ROLES) >= __judgeShareMicros;",
+    );
+    // Read AFTER the scoring pass, inside the judge_verdict publish, after the
+    // cost stamp.
+    expect(c).toContain(
+      '...(__result.costUsdMicros !== undefined ? { costUsdMicros: __result.costUsdMicros } : {}),\n      ...(__judgeShareExhausted() ? { reason: "judge_share_exhausted" as const } : {}),\n    });',
+    );
+    // The helper is booted after the meter and before the first step.
+    expect(c.indexOf("const __budgetMeter")).toBeLessThan(c.indexOf("const __judgeShareMicros"));
+    expect(c.indexOf("const __judgeShareExhausted")).toBeLessThan(c.indexOf("// ── Step 1/3"));
+  });
+
+  test("a declared judge_share is emitted as the literal fraction", () => {
+    const ir: IrWorkflowV0 = {
+      ...RETRY_IR_SHARED,
+      budget: { usdMicros: 2_000_000, onExceed: { kind: "stop" }, judgeShare: 0.5 },
+    };
+    const c = emitWorkflow(ir).files[0]?.content ?? "";
+    expect(c).toContain("const __judgeShareMicros = Math.round(2000000 * 0.5);");
+    expect(c).toContain('"judgeShare":0.5');
+  });
+
+  test("a budget-free workflow with judge steps carries no judge_share read (byte-identity guard)", () => {
+    const c = emitWorkflow(RETRY_IR_SHARED).files[0]?.content ?? "";
+    expect(c).toContain('kind: "judge_verdict",');
+    expect(c).not.toContain("__judgeShareExhausted");
+    expect(c).not.toContain("judge_share_exhausted");
+    expect(c).not.toContain("DEFAULT_JUDGE_SHARE");
+    expect(c).not.toContain("@crewhaus/cost-tracker");
   });
 
   test("a budget-free workflow carries no meter, no run-context boot, no cost-tracker import (byte-identity guard)", () => {
