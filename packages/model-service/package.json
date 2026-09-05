@@ -12,11 +12,14 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
-    "@crewhaus/ir": "workspace:*"
-  },
-  "devDependencies": {
-    "@crewhaus/runtime-core": "workspace:*"
+    "@crewhaus/ir": "workspace:*",
+    "@crewhaus/run-context": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-consult": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

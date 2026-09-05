@@ -114,6 +114,11 @@ const ORIGIN_DEFAULT_POLICY: SeverityMatrix = {
   // Same tier as "skill" — disk-persisted content whose exfiltration to an
   // unauthorised sink is the memory-poisoning lateral-move pattern.
   memory: { "external-configured": "warn", "external-dynamic": "block" },
+  // 0.6.0 §10.1: a Consult reply / guide text (a roster sibling's model
+  // output, classified at the tool). Same tier as "subagent" — a sibling's
+  // reply that reaches an unauthorised sink is the same lateral-move shape
+  // as a sub-agent's finalMessage reaching one.
+  consult: { "external-configured": "warn", "external-dynamic": "block" },
 };
 
 /**

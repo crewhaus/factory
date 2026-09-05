@@ -983,6 +983,7 @@ import {
 import {
   type AskMode,
   VALID_ASK_MODES,
+  evaluationRunOptions,
   formatCompileWarning,
   isValidAskMode,
   loopContractRunOptions,
@@ -4677,7 +4678,13 @@ async function runRunCli(
       // `crewhaus run` routes (and learns) exactly like the bundle. A `--model`
       // override is an explicit routing decision authored against a different
       // primary, so it drops the chain, tiers and pool (the breaker stays).
-      ...modelRoutingRunOptions(ir.agent, modelOverride),
+      ...modelRoutingRunOptions(ir.agent, modelOverride, { sessionName: ir.name }),
+      // 0.6.0 PR 8b (wave-1 carry-over) — the in-loop `evaluation:` block,
+      // built from the resolved IR exactly as the compiled cli bundle's
+      // `renderEvaluation` does (llm_judge on the run bus with role "judge",
+      // contains / regex pure), so `crewhaus run` grades, retries, halts and
+      // meters judge spend like the bundle. Absent block → spreads nothing.
+      ...evaluationRunOptions(ir),
       // Section 55 / item 23 — thread the spec's failure_taxonomy so
       // recovery-engine consults the user's named error classes (including
       // the `switch-model` verdict) before its built-in flow.
@@ -5786,22 +5793,33 @@ async function buildServeRuntime(
     ...(egressMatcher !== undefined ? { egressMatcher } : {}),
   };
 
-  // Primary-agent model routing (failover / tiers / pool) — the same
-  // `wireModels` call runRunCli spreads, so the two interpreter paths cannot
-  // drift (0.6.0 PR 8a; before it this copy dropped `circuitBreaker` under
-  // `--model` while runRunCli kept it).
-  const primaryModelRouting = modelRoutingRunOptions(ir.agent, modelOverride);
-
-  const primaryOptions = {
+  // The primary agent's per-RUN options. Built fresh for every MCP invocation
+  // rather than once per process because the model-routing fragment is no
+  // longer a bag of plain values: under `model_pool.strategy.model_directed`
+  // `wireModels` constructs the `Escalate` tool and its escalation latch,
+  // whose contract is "at most `max_escalations` per RUN". One `serve`
+  // process hosts many runs (one per inbound message), so a latch shared
+  // across them would let the first caller's escalation exhaust every later
+  // caller's allowance — and a request left pending by one invocation would
+  // be consumed by another caller's first model call. The fragment is cheap
+  // and synchronous; rebuilding it per message is the per-run seam.
+  //   - routing: the same `wireModels` call runRunCli spreads, so the two
+  //     interpreter paths cannot drift (0.6.0 PR 8a; before it this copy
+  //     dropped `circuitBreaker` under `--model` while runRunCli kept it).
+  //   - evaluation (0.6.0 PR 8b): the in-loop `evaluation:` block on the
+  //     primary agent only (sub-agent invocations are not graded by the
+  //     parent's evaluation), the same helper runRunCli spreads.
+  const primaryOptionsForRun = () => ({
     ...commonOptions,
     model,
     instructions: ir.agent.instructions,
     tools,
-    ...primaryModelRouting,
+    ...modelRoutingRunOptions(ir.agent, modelOverride, { sessionName: ir.name }),
+    ...evaluationRunOptions(ir),
     ...(subAgents !== undefined ? { subAgents, spawnSubAgent } : {}),
     ...(memoryRunOpt !== undefined ? { memory: memoryRunOpt } : {}),
     ...(continuityRunOpt !== undefined ? { continuity: continuityRunOpt } : {}),
-  };
+  });
 
   // One agent, one turn at a time.
   let queue: Promise<unknown> = Promise.resolve();
@@ -5832,7 +5850,7 @@ async function buildServeRuntime(
         });
       }
       return runChatLoop({
-        ...primaryOptions,
+        ...primaryOptionsForRun(),
         seedMessages: [{ role: "user" as const, content: message }],
       });
     });
@@ -6426,7 +6444,7 @@ async function collectPhilosophyFindings(): Promise<PhilosophyFinding[]> {
     ...(existsSync(boundaryPkg) ? {} : { reason: "Workstream C did not land" }),
   });
 
-  const boundarySites: ReadonlyArray<{ name: string; path: string }> = [
+  const boundarySites: ReadonlyArray<{ name: string; path: string; requireTag?: true }> = [
     { name: "tool-mcp", path: "packages/tool-mcp/src/index.ts" },
     { name: "sub-agent-spawner", path: "packages/sub-agent-spawner/src/index.ts" },
     { name: "skills-registry", path: "packages/skills-registry/src/index.ts" },
@@ -6436,6 +6454,15 @@ async function collectPhilosophyFindings(): Promise<PhilosophyFinding[]> {
     // 0.3.0 memory release: recalled wiki bodies re-enter the model context
     // across a session boundary — classified at the "memory" origin.
     { name: "tool-wiki", path: "packages/tool-wiki/src/index.ts" },
+    // 0.6.0 model-plan release (§7.5, §10.1): a Consult reply — a roster
+    // sibling's model output — re-enters the parent's context; classified
+    // at the "consult" origin AND lineage-tagged inside the tool (the runtime
+    // skips its own pass for this tool, so the tag must live here too).
+    {
+      name: "tool-consult",
+      path: "packages/tool-consult/src/index.ts",
+      requireTag: true,
+    },
   ];
   for (const site of boundarySites) {
     const filePath = join(process.cwd(), site.path);
@@ -6462,6 +6489,23 @@ async function collectPhilosophyFindings(): Promise<PhilosophyFinding[]> {
         ? {}
         : { reason: `no reference to classifyBoundary in ${site.path} — security regression` }),
     });
+    if (site.requireTag === true) {
+      // §10.1 — a reply path that classifies but never tags leaves the
+      // egress fabric blind to the content it admitted.
+      const tags = body.includes("tagContent");
+      findings.push({
+        class: "boundary-site",
+        file: site.path,
+        symbol: `${site.name}-lineage`,
+        label: `Pillar 3 — ${site.name} calls tagContent after a non-blocked verdict`,
+        pass: tags,
+        ...(tags
+          ? {}
+          : {
+              reason: `no reference to tagContent in ${site.path} — the reply reaches the model without lineage`,
+            }),
+      });
+    }
   }
 
   // Item 49 — boundary-site DRIFT. The six-site list above only re-checks

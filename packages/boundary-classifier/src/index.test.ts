@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import {
+  TRUST_ORIGINS,
   type TrustOrigin,
   boundaryCacheSize,
   buildRedactionNotice,
@@ -17,18 +18,10 @@ afterEach(() => clearBoundaryCache());
 
 describe("classifyBoundary — defaults per origin", () => {
   test("clean content always passes through unchanged regardless of origin", async () => {
-    const origins: ReadonlyArray<TrustOrigin> = [
-      "user",
-      "mcp",
-      "subagent",
-      "channel",
-      "federation",
-      "skill",
-      "compaction",
-      "tool",
-      "chain",
-      "memory",
-    ];
+    // Derived from the policy table (0.6.0 §10.1): a new origin joins this
+    // loop the moment it is declared, with no hand edit.
+    const origins: ReadonlyArray<TrustOrigin> = TRUST_ORIGINS;
+    expect(origins.length).toBeGreaterThanOrEqual(11);
     for (const origin of origins) {
       const res = await classifyBoundary(CLEAN, { origin, bypassCache: true });
       expect(res.action).toBe("pass");
@@ -39,18 +32,12 @@ describe("classifyBoundary — defaults per origin", () => {
   });
 
   test("malicious content is redacted at every block-default origin", async () => {
-    const blocking: ReadonlyArray<TrustOrigin> = [
-      "mcp",
-      "subagent",
-      "channel",
-      "federation",
-      "skill",
-      "compaction",
-      "tool",
-      "chain",
-      // 0.3.0: recalled wiki/fact content — same block tier as "skill".
-      "memory",
-    ];
+    // Every origin but the developer-trusted "user" one blocks by default —
+    // derived, so the 0.3.0 "memory" and 0.6.0 "consult" tiers are asserted
+    // without being hand-listed here.
+    const blocking: ReadonlyArray<TrustOrigin> = TRUST_ORIGINS.filter((o) => o !== "user");
+    expect(blocking).toContain("memory");
+    expect(blocking).toContain("consult");
     for (const origin of blocking) {
       const res = await classifyBoundary(MALICIOUS, { origin, bypassCache: true });
       expect(res.action).toBe("redact");

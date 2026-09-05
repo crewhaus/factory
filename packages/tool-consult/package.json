@@ -1,0 +1,46 @@
+{
+  "name": "@crewhaus/tool-consult",
+  "version": "0.5.8",
+  "type": "module",
+  "description": "Consult({question, to?}) and Escalate({reason}) — the model-directed hybrid tools (0.6.0 plan §7.2.4 / §7.5, brief 309): a nested single-turn side call on an allowlisted roster sibling whose reply is classified at TrustOrigin \"consult\", and the self-escalation receipt + latch the loop consumes",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/boundary-classifier": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/run-context": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/tool-executor": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/tool-consult"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-consult#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

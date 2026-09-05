@@ -4,6 +4,10 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }, { "path": "../run-context" }],
+  "references": [
+    { "path": "../boundary-classifier" },
+    { "path": "../errors" },
+    { "path": "../run-context" }
+  ],
   "include": ["src/**/*"]
 }

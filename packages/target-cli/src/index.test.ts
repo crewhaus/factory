@@ -1547,3 +1547,41 @@ describe("emitCli — plugin activation (Item 3 / G32)", () => {
     expect(c).not.toContain("pluginDirs: __plugins.skillDirs");
   });
 });
+
+describe("emitCli — model_directed hybrid tools (0.6.0 PR 8b: interpreter-only, deferred for bundles)", () => {
+  // PR 8b constructs Consult / Escalate in `wireModels` and the `crewhaus run`
+  // / `serve` interpreter spreads them; a COMPILED bundle does not register
+  // them yet — the emitter still renders the four routing fields through
+  // `renderModelWiringFields`, which never renders the hybrid pair, and the
+  // bundle imports nothing from @crewhaus/model-service at boot. This pins
+  // that deferred state honestly (the compiler warns about it on this exact
+  // key); PR 9a — every emitter's boot block calling `wireModels` — inverts
+  // these assertions.
+  const directed = {
+    model: "claude-haiku-4-5",
+    instructions: "be helpful",
+    modelPool: {
+      candidates: [
+        { model: "claude-haiku-4-5", tags: ["cheap"] },
+        { model: "claude-opus-4-8", tags: ["strong"] },
+      ],
+      policy: "heuristic" as const,
+      strategy: { modelDirected: true, maxEscalations: 1 },
+    },
+  } as unknown as IrV0["agent"];
+
+  test("the pool (strategy included) reaches the bundle as the modelPool blob", () => {
+    const c = emitCli(baseIr({ agent: directed })).files[0]?.content ?? "";
+    expect(c).toContain('"strategy":{"modelDirected":true,"maxEscalations":1}');
+  });
+
+  test("the bundle registers neither Consult nor Escalate and imports no composition root (deferred to PR 9a)", () => {
+    const c = emitCli(baseIr({ agent: directed })).files[0]?.content ?? "";
+    expect(c).not.toContain("hybridTools");
+    expect(c).not.toContain("escalation:");
+    expect(c).not.toContain("Consult");
+    expect(c).not.toContain("Escalate");
+    expect(c).not.toContain("@crewhaus/model-service");
+    expect(c).not.toContain("@crewhaus/tool-consult");
+  });
+});

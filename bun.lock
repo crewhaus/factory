@@ -270,6 +270,9 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/prompt-injection-detector": "workspace:*",
       },
+      "devDependencies": {
+        "@crewhaus/run-context": "workspace:*",
+      },
     },
     "packages/branch-history": {
       "name": "@crewhaus/branch-history",
@@ -670,6 +673,9 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
       },
     },
     "packages/egress-matcher-semantic": {
@@ -1212,11 +1218,14 @@
       "name": "@crewhaus/model-service",
       "version": "0.5.8",
       "dependencies": {
+        "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
-      },
-      "devDependencies": {
+        "@crewhaus/run-context": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-consult": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
     "packages/module-marketplace-client": {
@@ -1680,6 +1689,7 @@
       "version": "0.5.8",
       "dependencies": {
         "@crewhaus/agent-context-isolation": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
       },
@@ -2046,6 +2056,23 @@
       "optionalPeers": [
         "@colbymchenry/codegraph",
       ],
+    },
+    "packages/tool-consult": {
+      "name": "@crewhaus/tool-consult",
+      "version": "0.5.8",
+      "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/tool-executor": "workspace:*",
+      },
     },
     "packages/tool-contract-gateway": {
       "name": "@crewhaus/tool-contract-gateway",
@@ -2900,6 +2927,8 @@
     "@crewhaus/tool-code-execution": ["@crewhaus/tool-code-execution@workspace:packages/tool-code-execution"],
 
     "@crewhaus/tool-codegraph": ["@crewhaus/tool-codegraph@workspace:packages/tool-codegraph"],
+
+    "@crewhaus/tool-consult": ["@crewhaus/tool-consult@workspace:packages/tool-consult"],
 
     "@crewhaus/tool-contract-gateway": ["@crewhaus/tool-contract-gateway@workspace:packages/tool-contract-gateway"],
 

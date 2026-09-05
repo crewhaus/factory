@@ -17,18 +17,28 @@
  * `limits.loop_detection` → `loopDetection`, `agent.thinking` → `thinking`,
  * `agent.rate_limits` → `rateLimits`, `compaction.threshold` →
  * `compactionThreshold`, `compaction.snip_keep_head`/`snip_keep_tail` →
- * `snipKeepHead`/`snipKeepTail`.
+ * `snipKeepHead`/`snipKeepTail`, and (0.6.0 PR 8b) `evaluation:` →
+ * `evaluation` through {@link evaluationRunOptions}.
  */
 import type { CompileWarning } from "@crewhaus/compiler";
+import { judge } from "@crewhaus/eval-judge";
 import type { HookDef } from "@crewhaus/hooks-engine";
-import type { IrCompaction, IrHook, IrLimits, IrRateLimits, IrThinking } from "@crewhaus/ir";
+import type {
+  IrCompaction,
+  IrEvaluation,
+  IrHook,
+  IrLimits,
+  IrRateLimits,
+  IrThinking,
+} from "@crewhaus/ir";
 import {
   type ModelWiringFragment,
   type ModelWiringRunOptions,
+  type WireModelsDeps,
   modelWiringFragmentFromIr,
   wireModels,
 } from "@crewhaus/model-service";
-import type { RunChatLoopOptions } from "@crewhaus/runtime-core";
+import type { RunChatLoopOptions, RunEvaluation } from "@crewhaus/runtime-core";
 
 /**
  * The loop-contract fragment spread into `runChatLoop(...)` — a `Pick` over
@@ -49,6 +59,7 @@ export type LoopContractRunOptions = Pick<
   | "compactionThreshold"
   | "snipKeepHead"
   | "snipKeepTail"
+  | "evaluation"
 >;
 
 /** The IR slice `loopContractRunOptions` reads — structural, so both the
@@ -133,31 +144,156 @@ export function loopContractRunOptions(ir: LoopContractIrSlice): LoopContractRun
  * than a mirror. Both interpreter sites (the REPL run and the `serve`
  * single-turn runtime) spread this same call.
  *
+ * PR 8b: the same call now also yields the model-directed pair — the
+ * `hybridTools` (`Consult` / `Escalate`) and the `escalation` latch — when the
+ * pool declares `strategy.model_directed: true`; runtime-core appends the
+ * tools to the effective list and consumes the latch, so the interpreter
+ * spreads the fragment and adds nothing by hand. `deps` carries the session
+ * facts the nested consult loops persist under (the spec name).
+ *
  * `modelOverride` is the raw `--model` flag value: a string is an explicit
  * routing decision authored against a different primary, so the spec's
- * chain, tiers and pool are dropped (the breaker stays — declared alone it
- * wraps whichever primary serves); anything else (absent, a bare flag) is
- * not an override. Spread-return-`{}` like every helper here: a spec with no
- * routing spreads NOTHING.
+ * chain, tiers and pool (and with it the hybrid tools) are dropped (the
+ * breaker stays — declared alone it wraps whichever primary serves);
+ * anything else (absent, a bare flag) is not an override. Spread-return-`{}`
+ * like every helper here: a spec with no routing spreads NOTHING.
  *
  * The return type is the `LoopContractRunOptions` discipline applied to the
- * routing seam: `Pick<RunChatLoopOptions, keyof ModelWiringRunOptions>`.
- * model-service mirrors the four options structurally (it does not depend
- * on runtime-core — a `Pick` there would be a publish-only break for tarball
- * consumers), so THIS is the `tsc -b`-checked pin that every `wireModels`
- * key is a `runChatLoop` option with an assignable value type: a rename or
- * reshaping in runtime-core fails the build here.
+ * routing seam: `Pick<RunChatLoopOptions, keyof ModelWiringRunOptions>` —
+ * the `tsc -b`-checked pin that every `wireModels` key is a `runChatLoop`
+ * option with an assignable value type (model-service carries the same pin
+ * since PR 8b made runtime-core one of its dependencies).
  */
 export type ModelRoutingRunOptions = Pick<RunChatLoopOptions, keyof ModelWiringRunOptions>;
 
 export function modelRoutingRunOptions(
   agent: ModelWiringFragment,
   modelOverride: unknown,
+  deps: Omit<WireModelsDeps, "modelOverride"> = {},
 ): ModelRoutingRunOptions {
-  return wireModels(
-    modelWiringFragmentFromIr(agent),
-    typeof modelOverride === "string" ? { modelOverride } : {},
-  );
+  return wireModels(modelWiringFragmentFromIr(agent), {
+    ...deps,
+    ...(typeof modelOverride === "string" ? { modelOverride } : {}),
+  });
+}
+
+/** The IR slice {@link evaluationRunOptions} reads. */
+export type EvaluationIrSlice = {
+  readonly evaluation?: IrEvaluation;
+  readonly agent: { readonly model: string };
+};
+
+/**
+ * 0.6.0 PR 8b (plan §4.4 "interpreter parity"; the PR 2 wave-1 carry-over) —
+ * the in-loop `evaluation:` option for `runChatLoop(...)`, built from the
+ * RESOLVED IR exactly as `@crewhaus/target-cli`'s `renderEvaluation` renders
+ * it into a compiled bundle, so `crewhaus run` grades, retries, halts and
+ * meters like the bundle instead of silently skipping the block (which it
+ * did until this helper: the interpreter built no `RunEvaluation` at all).
+ *
+ *   - `llm_judge` rides `@crewhaus/eval-judge`'s `judge()` with the run bus
+ *     the runtime hands the grader, so every judge call publishes
+ *     `model_request` / `model_response` with `role: "judge"` and IS metered
+ *     (priced by cost-tracker, counted toward `budget.usd` under
+ *     `budget.judge_share`); the judge's wire model and priced spend come
+ *     back as `EvaluationResult.judge` for the `eval_graded` attribution. The
+ *     model defaults to the shape's primary when the spec omitted
+ *     `grader.model` (`cheapest` / `$profile` already resolved at lower
+ *     time). An abstaining judge scores 0 with a `judge abstained:` rationale.
+ *   - `contains` / `regex` are pure (score 1|0, no model spend); the regex's
+ *     `lastIndex` is reset per call so a global flag cannot flip verdicts.
+ *
+ * `threshold`, `onFail` and `maxRetries` are the IR's resolved values,
+ * threaded verbatim (`onFail: "escalate"` included — runtime-core treats it
+ * as `retry` until PR 9c lands the forced re-run, as the bundle already
+ * does). Spread-return-`{}`: a spec without `evaluation:` spreads NOTHING.
+ */
+export function evaluationRunOptions(
+  ir: EvaluationIrSlice,
+): Pick<RunChatLoopOptions, "evaluation"> {
+  const ev = ir.evaluation;
+  if (ev === undefined) return {};
+  return { evaluation: buildRunEvaluation(ev, ir.agent.model) };
+}
+
+function buildRunEvaluation(ev: IrEvaluation, primaryModel: string): RunEvaluation {
+  const grader = ev.grader;
+  if (grader.type === "llm_judge") {
+    const model = grader.model ?? primaryModel;
+    const criteria = grader.criteria;
+    return {
+      graderType: "llm_judge",
+      threshold: ev.threshold ?? 0.7,
+      onFail: ev.onFail,
+      maxRetries: ev.maxRetries,
+      evaluate: async ({ finalText, bus }) => {
+        const verdict = await judge({
+          rubric: {
+            criteria: [
+              {
+                name: "criteria",
+                description: criteria,
+                anchors: {
+                  "1": "fails the criteria entirely",
+                  "2": "mostly fails the criteria",
+                  "3": "partially meets the criteria",
+                  "4": "meets the criteria with minor gaps",
+                  "5": "fully meets the criteria",
+                },
+              },
+            ],
+            passing_score: 3,
+          },
+          sample: { id: "in-loop-evaluation", input: "" },
+          agentOutput: finalText,
+          model,
+          // Judge spend rides the run bus (role "judge") so it is priced and
+          // counted toward budget.usd under budget.judge_share.
+          bus,
+        });
+        const judgeInfo = {
+          model: verdict.usage.model,
+          ...(verdict.usage.costUsdMicros !== undefined
+            ? { costUsdMicros: verdict.usage.costUsdMicros }
+            : {}),
+        };
+        if (verdict.abstain) {
+          return {
+            score: 0,
+            rationale: `judge abstained: ${verdict.rationale}`,
+            judge: judgeInfo,
+          };
+        }
+        return { score: (verdict.score - 1) / 4, rationale: verdict.rationale, judge: judgeInfo };
+      },
+    };
+  }
+  const value = grader.value;
+  if (grader.type === "contains") {
+    return {
+      graderType: "contains",
+      threshold: 1,
+      onFail: ev.onFail,
+      maxRetries: ev.maxRetries,
+      evaluate: async ({ finalText }) =>
+        finalText.includes(value)
+          ? { score: 1, rationale: `output contains "${value}"` }
+          : { score: 0, rationale: `output missing "${value}"` },
+    };
+  }
+  const regex = new RegExp(value);
+  return {
+    graderType: "regex",
+    threshold: 1,
+    onFail: ev.onFail,
+    maxRetries: ev.maxRetries,
+    evaluate: async ({ finalText }) => {
+      regex.lastIndex = 0;
+      return regex.test(finalText)
+        ? { score: 1, rationale: `output matches /${value}/` }
+        : { score: 0, rationale: `output does not match /${value}/` };
+    },
+  };
 }
 
 /**

@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@crewhaus/agent-context-isolation": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
     "@crewhaus/tool-permission-matcher": "workspace:*"
   },

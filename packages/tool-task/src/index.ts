@@ -265,6 +265,13 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
     concurrencySafe: true,
     readOnly: false,
     destructive: false,
+    // Pillar 3 rule 6 (AGENTS.md): the sub-agent's `finalMessage` is already
+    // classified and lineage-tagged at the spawner boundary (origin
+    // "subagent"), so the runtime's post-tool pass at origin "tool" is
+    // skipped here — a second pass would double-warn and burn the cache.
+    // The rule documented this flag for years without a line setting it
+    // (0.6.0 plan §7.5 noted the gap); this is that line.
+    classifyOutput: false,
     // Per-call parallel eligibility (see the module header). A dispatch is
     // parallel-safe iff the resolved sub-agent's ENTIRE effective tool set
     // is read-only + concurrency-safe + non-destructive. Fail-closed: an

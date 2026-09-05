@@ -1079,9 +1079,16 @@ describe("model_pool candidates carry the merged profile (key order is the byte 
     ]) {
       expect(pendingPaths).toContain(`agent.model_pool.${key}`);
     }
-    expect(
-      warnings.find((w) => w.path === "agent.model_pool.strategy.model_directed")?.message,
-    ).toContain("PR 8b");
+    // PR 8b landed the interpreter half of model_directed; the warning is
+    // scoped to compiled targets until every emitter's boot block calls
+    // wireModels (PR 9a) — it must not claim "the runtime" ignores the key.
+    const directedWarning = warnings.find(
+      (w) => w.path === "agent.model_pool.strategy.model_directed",
+    )?.message;
+    expect(directedWarning).toContain("crewhaus run / serve interpreter");
+    expect(directedWarning).toContain("compiled bundle does not register the tools yet");
+    expect(directedWarning).toContain("PR 9a");
+    expect(directedWarning).not.toContain("the runtime does not honour it");
     const agentTs = compile(yaml, opts).files.find((f) => f.path === "agent.ts")?.content ?? "";
     expect(agentTs).toContain('"policy":"classifier"');
     expect(agentTs).toContain(

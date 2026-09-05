@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 import type { HookDef } from "@crewhaus/hooks-engine";
 import type { IrModelPool } from "@crewhaus/ir";
 import { modelWiringFragmentFromIr, wireModels } from "@crewhaus/model-service";
+import type { RunEvaluation } from "@crewhaus/runtime-core";
+import { TraceEventBus } from "@crewhaus/trace-event-bus";
 import {
+  evaluationRunOptions,
   formatCompileWarning,
   isValidAskMode,
   loopContractRunOptions,
@@ -11,6 +14,80 @@ import {
   resolveAskMode,
   resolveStreaming,
 } from "./loop-contract";
+
+describe("evaluationRunOptions (0.6.0 PR 8b — interpreter parity for the in-loop evaluation block)", () => {
+  const bus = new TraceEventBus({ runId: "run_test", sessionId: "sess_0123456789abcdef" });
+  const turn = (finalText: string) => ({
+    finalText,
+    messages: [],
+    usage: { input: 0, output: 0 },
+    bus,
+  });
+
+  test("a spec without evaluation: spreads NOTHING", () => {
+    expect(evaluationRunOptions({ agent: { model: "m" } })).toEqual({});
+    expect(Object.keys(evaluationRunOptions({ agent: { model: "m" } }))).toEqual([]);
+  });
+
+  test("contains: pure grader, threshold 1, resolved onFail / maxRetries threaded verbatim", async () => {
+    const out = evaluationRunOptions({
+      agent: { model: "m" },
+      evaluation: { grader: { type: "contains", value: "DONE" }, onFail: "halt", maxRetries: 2 },
+    });
+    const ev = out.evaluation as RunEvaluation;
+    expect(ev.graderType).toBe("contains");
+    expect(ev.threshold).toBe(1);
+    expect(ev.onFail).toBe("halt");
+    expect(ev.maxRetries).toBe(2);
+    expect(await ev.evaluate(turn("all DONE here"))).toEqual({
+      score: 1,
+      rationale: 'output contains "DONE"',
+    });
+    expect(await ev.evaluate(turn("nope"))).toEqual({
+      score: 0,
+      rationale: 'output missing "DONE"',
+    });
+  });
+
+  test("regex: lastIndex is reset per call so a global flag cannot flip verdicts", async () => {
+    const out = evaluationRunOptions({
+      agent: { model: "m" },
+      evaluation: { grader: { type: "regex", value: "ok" }, onFail: "note", maxRetries: 1 },
+    });
+    const ev = out.evaluation as RunEvaluation;
+    expect(ev.graderType).toBe("regex");
+    expect((await ev.evaluate(turn("ok"))).score).toBe(1);
+    expect((await ev.evaluate(turn("ok"))).score).toBe(1);
+    expect((await ev.evaluate(turn("ko"))).rationale).toBe("output does not match /ok/");
+  });
+
+  test("llm_judge: graderType, resolved threshold and onFail (escalate included) mirror the bundle", () => {
+    const out = evaluationRunOptions({
+      agent: { model: "claude-haiku-4-5" },
+      evaluation: {
+        grader: { type: "llm_judge", criteria: "is it correct?" },
+        threshold: 0.8,
+        onFail: "escalate",
+        maxRetries: 1,
+      },
+    });
+    const ev = out.evaluation as RunEvaluation;
+    expect(ev.graderType).toBe("llm_judge");
+    expect(ev.threshold).toBe(0.8);
+    expect(ev.onFail).toBe("escalate");
+    expect(typeof ev.evaluate).toBe("function");
+    // The lower-time default the bundle also falls back to.
+    const defaulted = evaluationRunOptions({
+      agent: { model: "m" },
+      evaluation: {
+        grader: { type: "llm_judge", criteria: "c" },
+        onFail: "retry",
+        maxRetries: 1,
+      },
+    });
+    expect((defaulted.evaluation as RunEvaluation).threshold).toBe(0.7);
+  });
+});
 
 describe("modelRoutingRunOptions (0.6.0 PR 8a — the interpreter's wireModels call)", () => {
   const POOL: IrModelPool = {
@@ -58,6 +135,44 @@ describe("modelRoutingRunOptions (0.6.0 PR 8a — the interpreter's wireModels c
     expect(candidates[0]?.["temperature"]).toBe(0.2);
     expect(candidates[1]?.["enabled"]).toBe(false);
     expect(pool["rules"]).toEqual([{ id: "r1", when: { has_images: true }, use: "strong" }]);
+  });
+
+  test("model_directed: true yields the Consult / Escalate tools and the latch through the same call", () => {
+    const directed: IrModelPool = { ...POOL, strategy: { modelDirected: true, maxEscalations: 1 } };
+    const out = modelRoutingRunOptions({ modelPool: directed }, undefined, { sessionName: "spec" });
+    expect(Object.keys(out)).toEqual(["modelPool", "hybridTools", "escalation"]);
+    expect(out.hybridTools?.map((t) => t.name)).toEqual(["Consult", "Escalate"]);
+    expect(out.escalation?.pending()).toBeUndefined();
+    // A --model override drops the pool and, with it, the hybrid pair.
+    expect(modelRoutingRunOptions({ modelPool: directed }, "claude-opus-4-8")).toEqual({});
+  });
+
+  test("every call mints a FRESH latch — the per-run seam `crewhaus serve` spreads per message", async () => {
+    // The latch's contract is "at most `max_escalations` per RUN". One serve
+    // process hosts one run per inbound MCP message, so buildServeRuntime
+    // calls this helper inside `invoke` rather than once per process; this
+    // pins that two sequential calls do not share a latch (or a tool): the
+    // first run exhausting its single escalation leaves the second run's
+    // `Escalate` accepted, and nothing the first left pending leaks across.
+    const directed: IrModelPool = { ...POOL, strategy: { modelDirected: true, maxEscalations: 1 } };
+    const first = modelRoutingRunOptions({ modelPool: directed }, undefined, { sessionName: "s" });
+    const second = modelRoutingRunOptions({ modelPool: directed }, undefined, { sessionName: "s" });
+    expect(first.escalation).toBeDefined();
+    expect(second.escalation).toBeDefined();
+    expect(first.escalation).not.toBe(second.escalation);
+    expect(first.hybridTools?.[1]).not.toBe(second.hybridTools?.[1]);
+
+    const escalateOf = (o: typeof first) => o.hybridTools?.find((t) => t.name === "Escalate");
+    const receipt = (raw: unknown) => JSON.parse(String(raw)) as { escalated: boolean };
+    // Run 1 uses its one escalation (and leaves it pending — the turn aborts
+    // before the next model call).
+    expect(receipt(await escalateOf(first)?.execute({ reason: "hard" })).escalated).toBe(true);
+    expect(receipt(await escalateOf(first)?.execute({ reason: "again" })).escalated).toBe(false);
+    expect(first.escalation?.pending()).toBeDefined();
+    // Run 2 starts clean: nothing pending, its own allowance intact.
+    expect(second.escalation?.pending()).toBeUndefined();
+    expect(second.escalation?.count).toBe(0);
+    expect(receipt(await escalateOf(second)?.execute({ reason: "hard" })).escalated).toBe(true);
   });
 
   test("a --model string drops the chain, tiers and pool but keeps the breaker", () => {

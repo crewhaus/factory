@@ -8,6 +8,7 @@
  * to 100% and pins the security-relevant invariants.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { TRUST_ORIGINS } from "@crewhaus/boundary-classifier";
 import { CrewhausError } from "@crewhaus/errors";
 import { type TrustOrigin, createRunContext, tagContent } from "@crewhaus/run-context";
 import {
@@ -98,17 +99,16 @@ describe("post-match (await) return paths with forced cache miss", () => {
 });
 
 describe("policy matrix — every TrustOrigin × SinkScope cell", () => {
-  // Every non-user origin: warn on configured, block on dynamic.
-  const nonUser: TrustOrigin[] = [
-    "mcp",
-    "subagent",
-    "channel",
-    "federation",
-    "skill",
-    "compaction",
-    "tool",
-    "chain",
-  ];
+  // Every non-user origin: warn on configured, block on dynamic. Derived from
+  // the classifier's declared origin list (0.6.0 §10.1) so a new origin is
+  // covered the moment it exists — this array used to be hand-written and
+  // had silently missed "memory".
+  const nonUser: TrustOrigin[] = TRUST_ORIGINS.filter((o) => o !== "user");
+  test("the derived list covers every origin the matrix declares", () => {
+    expect(nonUser).toContain("memory");
+    expect(nonUser).toContain("consult");
+    expect(nonUser.length).toBe(TRUST_ORIGINS.length - 1);
+  });
 
   for (const origin of nonUser) {
     test(`${origin}: configured → warn, dynamic → block`, async () => {

@@ -29,8 +29,8 @@ options. Every later routing feature lands here, not in codegen.
 
 | PR | This package gains |
 |---|---|
-| **8a (this cut)** | `wireModels`, the fragment, and `renderModelWiringFields` — wrapping today's emitted routing fragments **byte-identically**. Nothing is constructed at runtime yet: `runChatLoop` still resolves candidate adapters, opens the scoreboard and builds the `PolicyRouter` from these four options exactly as before. |
-| 8b | the `Consult` / `Escalate` tools (`@crewhaus/tool-consult`) registered under `strategy.model_directed` |
+| **8a** | `wireModels`, the fragment, and `renderModelWiringFields` — wrapping today's emitted routing fragments **byte-identically**. `runChatLoop` still resolves candidate adapters, opens the scoreboard and builds the `PolicyRouter` from these four options exactly as before. |
+| **8b (this cut)** | the `Consult` / `Escalate` tools (`@crewhaus/tool-consult`) constructed under `strategy.model_directed` and returned as the `hybridTools` / `escalation` options; the Consult runner is a nested single-turn `runChatLoop` on a child run context whose model events are re-published on the parent bus (see below) |
 | 9a–9d | per-candidate plans, the `preRoute` inputs, cascade wiring, the guide / shadow / committee side-call closures with their child buses |
 | 10 | candidate adapter resolution with per-profile chains and breakers, the scoreboard and priors, the router built with rules / classifier / eligibility, judge metering on the run bus |
 
@@ -64,15 +64,20 @@ observable on the option object, so a later PR cannot drop a key silently.
 
 ```ts
 type WireModelsDeps = {
-  modelOverride?: string;  // a caller-forced primary (the interpreter's --model)
+  modelOverride?: string;    // a caller-forced primary (the interpreter's --model)
+  sessionName?: string;      // label for the nested consult loops' sessions (<name>:consult)
+  sessionRootDir?: string;   // where those loops persist session / event-log files
+  _consultAdapters?: ReadonlyMap<string, ProviderAdapter>;  // test injection, keyed by spec model string
+  _consultRunner?: ConsultRunner;                           // test injection: a scripted side call
 };
 ```
 
 A flag-forced model is an explicit routing decision and the spec's chain,
 tiers and pool were authored against the spec's primary, so under an override
-they are dropped; `circuitBreaker` is kept — declared alone it breaker-wraps
-whichever primary serves. Adapters, the scoreboard root, the bus and the tool
-catalog join the deps as the root starts constructing them.
+they are dropped (and with the pool, its hybrid tools); `circuitBreaker` is
+kept — declared alone it breaker-wraps whichever primary serves. The
+adapters, the scoreboard root, the bus and the tool catalog join the deps as
+the root starts constructing them.
 
 ### The output
 
@@ -82,20 +87,52 @@ type ModelWiringRunOptions = {
   circuitBreaker?: IrCircuitBreaker;
   modelTiers?: IrModelTiers;
   modelPool?: IrModelPool;
+  hybridTools?: ReadonlyArray<RegisteredTool>;  // Consult + Escalate, under strategy.model_directed
+  escalation?: EscalationLatch;                 // the Escalate tool's latch the loop consumes
 };
 ```
 
-The `runChatLoop` options fragment under runtime-core's own option names,
-mirrored structurally from the IR types. This package does **not** depend on
-`@crewhaus/runtime-core` (only its tests do), so it cannot `Pick` off
-`RunChatLoopOptions` without breaking every consumer of the published tarball;
-instead the cli's `modelRoutingRunOptions` returns
-`Pick<RunChatLoopOptions, keyof ModelWiringRunOptions>`, where runtime-core is
-a declared dependency and `tsc -b` checks it — a rename or reshaping in
-runtime-core fails the build there, and the package's own tests carry the same
-assignability pin `@crewhaus/memory-service`'s do. Spread-return-`{}`: an empty
-fragment yields `{}`, values are carried by reference, keys come out in the
-order every emitter has always written them (`MODEL_WIRING_KEYS`).
+The `runChatLoop` options fragment under runtime-core's own option names.
+Since PR 8b this package depends on `@crewhaus/runtime-core` (the Consult
+runner is a nested `runChatLoop`), so the type is pinned assignable to
+`Pick<RunChatLoopOptions, keyof ModelWiringRunOptions>` right in `src/` — a
+rename or reshaping in runtime-core fails `tsc -b` here — and the cli's
+`modelRoutingRunOptions` carries the same pin at the interpreter seam.
+Spread-return-`{}`: an empty fragment yields `{}`, values are carried by
+reference, keys come out in the order every emitter has always written them
+(`MODEL_WIRING_KEYS`), followed by `HYBRID_WIRING_KEYS` when constructed.
+
+## The model-directed pair (`strategy.model_directed: true`)
+
+`wireModelDirected(pool, deps)` builds the two tools from
+[`@crewhaus/tool-consult`](../tool-consult):
+
+- the **roster** is the pool's enabled candidates (`enabled: false` never
+  becomes a Consult target);
+- the **escalation target** is `strategy.cascade.escalate_to` resolved
+  against the roster (a tag, a profile, or a model string), else the
+  strongest candidate (first `routing.strongTag`-tagged, else the last
+  declared — the router's `escalation()` convention); `strategy.
+  max_escalations` (default 1) bounds the latch;
+- the **Consult runner** (`buildConsultRunner`) runs the target through
+  `runChatLoop({ singleTurn: true, tools: [], sessionTarget: "consult",
+  modelRole: "consult" })` — never `adapter.stream` — on a **child**
+  `RunContext` whose `TraceEventBus` inherits the parent's trace, and whose
+  `model_request` / `model_response` events are re-published on the parent
+  bus under the parent's envelope with `role: "consult"`. That is what makes
+  the parent's cost-tracker price the call, its budget meter count it under
+  `budget.judge_share`, and its session mirror persist it. The child is
+  minted rather than shared because the singleTurn path mutates
+  `runContext.turnNumber`; sharing would inject phantom turns into the parent.
+  The reply text is returned raw — classification at TrustOrigin `"consult"`
+  (`classifyBoundary` + `tagContent`) happens exactly once, inside the tool.
+
+runtime-core appends `hybridTools` to the effective tool list (first-party
+wins a name collision) and consumes `escalation` at its next model call: the
+rest of the turn is served by the request's target when it is a roster
+candidate, else the strongest; the `model_route` line names the receipt. The
+clean-prompt re-run (`runOneTurn(messages, { force })`) lands with the
+cascade (PR 9c) on the same seam.
 
 ## `renderModelWiringFields(fragment, indent)` — the codegen twin
 
