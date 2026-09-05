@@ -437,6 +437,11 @@ function renderEvaluation(ir: IrChannelV0): {
   const field = "\n        evaluation: __evaluation,";
   const typeImport = `import type { RunEvaluation } from "@crewhaus/runtime-core";`;
   const onFail = escapeJsonString(ev.onFail);
+  // 0.6.0 §7.3 (PR 9c) — the cascade's escalation rung, resolved at lower
+  // time; rendered only under `on_fail: escalate` so every other bundle stays
+  // byte-identical.
+  const escalateField =
+    ev.escalateTo !== undefined ? `\n  escalateTo: ${escapeJsonString(ev.escalateTo)},` : "";
   if (ev.grader.type === "llm_judge") {
     const criteria = escapeJsonString(ev.grader.criteria);
     const model = escapeJsonString(ev.grader.model ?? ir.agent.model);
@@ -444,7 +449,7 @@ function renderEvaluation(ir: IrChannelV0): {
   graderType: "llm_judge",
   threshold: ${ev.threshold ?? 0.7},
   onFail: ${onFail},
-  maxRetries: ${ev.maxRetries},
+  maxRetries: ${ev.maxRetries},${escalateField}
   evaluate: async ({ finalText, bus }) => {
     const __verdict = await judge({
       rubric: {
@@ -493,7 +498,7 @@ function renderEvaluation(ir: IrChannelV0): {
   graderType: "contains",
   threshold: 1,
   onFail: ${onFail},
-  maxRetries: ${ev.maxRetries},
+  maxRetries: ${ev.maxRetries},${escalateField}
   evaluate: async ({ finalText }) =>
     finalText.includes(${valueLit})
       ? { score: 1, rationale: ${escapeJsonString(`output contains "${value}"`)} }
@@ -506,7 +511,7 @@ const __evaluation: RunEvaluation = {
   graderType: "regex",
   threshold: 1,
   onFail: ${onFail},
-  maxRetries: ${ev.maxRetries},
+  maxRetries: ${ev.maxRetries},${escalateField}
   evaluate: async ({ finalText }) => {
     __evalRegex.lastIndex = 0;
     return __evalRegex.test(finalText)

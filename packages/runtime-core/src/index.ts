@@ -105,6 +105,7 @@ import {
 } from "@crewhaus/recovery-engine";
 import {
   type RewardConfig,
+  type RouteObservation,
   type Scoreboard,
   computeReward,
   openScoreboard,
@@ -161,6 +162,7 @@ import {
   type AlertSink,
   type AttachedAdvisorPersistence,
   type AttachedMcpStatsPersistence,
+  type RoutingPersistedKind,
   attachAdvisorPersistence,
   attachDefaultSubscribers,
   attachMcpStatsPersistence,
@@ -1022,6 +1024,14 @@ export type EvaluationTurn = {
    * (bounded by `budget.judge_share`). Deterministic graders ignore it.
    */
   readonly bus: TraceEventBus;
+  /** 0.6.0 §7.3 — the WIRE model id that produced `finalText` (this attempt's
+   *  last main-turn response), when known. */
+  readonly servedModel?: string;
+  /** 0.6.0 §7.3 — the `models:` profile of the serving pool candidate, when any. */
+  readonly profile?: string;
+  /** 0.6.0 §7.3 — the cascade stage this attempt is (`"draft"` / `"escalate"`);
+   *  absent outside a cascade. */
+  readonly stage?: string;
 };
 
 /** The injected grader's verdict for one graded attempt. */
@@ -1042,6 +1052,18 @@ export type EvaluationResult = {
     readonly model: string;
     readonly costUsdMicros?: number;
   };
+  /**
+   * 0.6.0 §7.3 — draft-verify: the correction a strong verifier (`{ok, edits}`,
+   * `@crewhaus/eval-judge`'s `verifyDraft`) wants folded into the answer. On a
+   * failing verdict it REPLACES the default rationale nudge as the synthetic
+   * user message appended before the re-run (`retry`) or the escalation
+   * (`escalate` without `clean_prompt`). It is never written into the draft
+   * assistant message — a draft carrying `tool_use` blocks would orphan its
+   * `tool_result` pairs (the `isCuratableMessage` constraint) — and under
+   * `clean_prompt` it is not needed: the strong rung re-answers the original
+   * prompt from the pre-draft snapshot.
+   */
+  readonly correction?: string;
 };
 
 /**
@@ -1065,17 +1087,48 @@ export type RunEvaluation = {
   readonly threshold: number;
   /**
    * What a failing verdict does — see the option docblock. 0.6.0 §7.3 adds
-   * `"escalate"` (spec `on_fail: escalate`): re-run the failed turn on the
-   * pool's `strategy.cascade.escalateTo` candidate. The forced re-run
-   * (`runOneTurn(messages, { force })`, the clean-prompt snapshot) lands with
-   * the cascade (PR 9c); until then the runtime treats `"escalate"` exactly
-   * as `"retry"` — which is what a compiled bundle carrying the value has
-   * done since the spec admitted it, so the `crewhaus run` interpreter,
-   * which threads the IR's `onFail` verbatim, behaves identically.
+   * `"escalate"` (spec `on_fail: escalate`), the CASCADE: the graded attempt
+   * is the cheap DRAFT (its calls carry `role: "draft"`, `stage: "draft"`);
+   * a failing grade re-runs the turn on the escalation rung through
+   * `runOneTurn(messages, { force })` (`policy: "forced"`, `role:
+   * "escalation"`, a `model_stage{stage: "escalate"}` pair around it), from
+   * the PRE-DRAFT snapshot when `cleanPrompt` (the draft is truncated out of
+   * the request) or with the draft kept plus the synthetic correction
+   * otherwise; the escalation is re-graded, bounded by `maxEscalations`
+   * (default 1 — a spent cap leaves the last rung's answer standing with a
+   * `model_stage{outcome: "skipped", cause: "max_escalations"}`). The pool
+   * outcomes of a cascade turn are folded at the TURN boundary, after the
+   * grade, each member-arm line carrying its stage's judged quality
+   * (§7.10); a grader that throws records no line and increments the arm's
+   * `ungraded` counter. Past `budget.judge_share` the cascade serves the
+   * strong rung DIRECTLY (`reason: "judge_share_exhausted"` on the route,
+   * `cause: "judge_share_exhausted"` on the stage) instead of spending more
+   * on judging. Without a `modelPool` there is nothing to escalate to: the
+   * verdict is recorded and the draft stands (`note` semantics), with one
+   * warning.
    */
   readonly onFail: "retry" | "halt" | "note" | "escalate";
   /** Hard cap on evaluation-triggered re-runs (>= 0; resolved default 1). */
   readonly maxRetries: number;
+  /**
+   * 0.6.0 §7.3 — under `onFail: "escalate"`, the roster arm the failing turn
+   * is re-run on: a candidate's spec model string, its `models:` profile
+   * name (with or without the `$` sigil) or a tag (the first candidate
+   * carrying it). The compiler resolves it (`strategy.cascade.escalate_to`,
+   * else the pool's strongest); absent → the pool's `strategy.cascade.
+   * escalateTo`, else the router's strongest candidate. Never a model outside
+   * the roster: an unknown value falls back to the strongest, logged.
+   */
+  readonly escalateTo?: string;
+  /**
+   * 0.6.0 §7.3 — truncate the request to the pre-draft snapshot before the
+   * escalation (`strategy.cascade.clean_prompt`); absent → the pool blob's
+   * value, else false (the draft stays, followed by the synthetic correction).
+   */
+  readonly cleanPrompt?: boolean;
+  /** 0.6.0 §7.2 — escalations per turn (`strategy.max_escalations`); absent →
+   *  the pool blob's value, else 1. */
+  readonly maxEscalations?: number;
   /**
    * Which grader kind produced the score — stamped verbatim onto every
    * `eval_graded` trace event (the event field is required, and only the
@@ -1200,11 +1253,29 @@ export type RunChatLoopOptions = {
    * request at its next model call: it arms the pool's escalation latch (the
    * same one a failed cheap pick arms) so the rest of the turn is served by
    * the request's target when that is a roster candidate, else the strongest
-   * candidate. The clean-prompt re-run through `runOneTurn(messages, { force })`
-   * lands with the cascade (PR 9c) on this same seam. Meaningful only with
-   * `modelPool`; without one a request is consumed and logged, never served.
+   * candidate, publishes `model_stage{stage: "escalate", strategy:
+   * "model_directed", role: "escalation", cause: "self"}` and stamps the
+   * remaining calls of the turn `role: "escalation"`. The turn CONTINUES on
+   * the target rather than being re-run from a snapshot: the transcript
+   * already carries the `Escalate` tool_use / tool_result pair, and a
+   * truncating re-run would orphan it (the `isCuratableMessage` constraint);
+   * the cascade's clean-prompt re-run belongs to `evaluation.onFail:
+   * "escalate"`. Meaningful only with `modelPool`; without one a request is
+   * consumed and logged, never served.
    */
   escalation?: HybridEscalationLatch;
+  /**
+   * 0.6.0 §7.3 — force EVERY main-turn model call of this run onto one roster
+   * arm (a candidate's spec model string, its profile name, or a tag): the
+   * seam the workflow and graph `retry_previous` closures use when the gating
+   * judge declares `escalate_to`. The run publishes the same
+   * `model_stage{stage: "escalate", strategy: "cascade", role: "escalation"}`
+   * pair the in-loop cascade does around the forced turn, its `model_route`
+   * carries `policy: "forced"`, and its model events carry `role:
+   * "escalation"`. Requires a `modelPool`; a value outside the roster or a
+   * pool-less run throws at boot rather than silently serving the primary.
+   */
+  forcedCandidate?: string;
   /** Per-run identity, abort signal, and logger. Defaults to a fresh `createRunContext()`. */
   runContext?: RunContext;
   /** Context-window limit in tokens. Defaults to 200_000 (Claude opus/sonnet 4.x). */
@@ -1799,6 +1870,33 @@ export type RunChatLoopOptions = {
       readonly seed?: string;
       readonly bandit?: "epsilon-greedy" | "thompson";
     };
+    /**
+     * 0.6.0 §7.3 — the hybrid strategy block (structurally the IR's
+     * `IrModelPoolStrategy`; the pool blob carries it verbatim). The loop reads
+     * `cascade` (`escalateTo` / `cleanPrompt`, the fallbacks for the
+     * `evaluation` option's own fields) and `maxEscalations`; `guide` /
+     * `shadow` / `committee` are consumed by the side-call closures (PR 9d),
+     * `modelDirected` by the composition root that registers the tools.
+     */
+    readonly strategy?: {
+      readonly cascade?: {
+        readonly draft: string;
+        readonly escalateTo: string;
+        readonly cleanPrompt?: boolean;
+      };
+      readonly modelDirected?: boolean;
+      readonly maxEscalations?: number;
+    };
+    /**
+     * 0.6.0 §6.3 — the reward block. `qualitySource: "in_loop"` lets a cascade
+     * turn's judged quality reach the REWARD (`computeReward`); under the
+     * default `none` the quality is still persisted on the `v:2` arm line
+     * (`route status` shows it) but the reward is computed without it —
+     * byte-identical to a 0.5.x reward.
+     */
+    readonly reward?: {
+      readonly qualitySource?: "none" | "in_loop" | "shadow" | "promoted";
+    };
   };
   /**
    * Test injection for the pool candidate adapters, keyed by their spec model
@@ -2163,6 +2261,46 @@ export type RunChatLoopOptions = {
  * lets `session-store` apply its own non-tenant default). The env var and the
  * global default are only consulted OUTSIDE any tenant scope.
  */
+/**
+ * 0.6.0 §7.3 / §8.1 (PR 9c) — a durable sink for the routing kinds a HOST
+ * publishes on a shared `RunContext` bus BETWEEN loops, when no `runChatLoop`
+ * is live to mirror them into the session JSONL: the workflow / graph bundles'
+ * `kind: judge` gates publish `judge_verdict` between steps / nodes. Every
+ * step and node runs on the same `RunContext`, so they all persist into the
+ * session log named by its `sessionId`; this sink appends the between-loop
+ * lines to that same file (`<sessionRootDir>/<sessionId>.jsonl`), so `route
+ * explain`, `sessions tail` and Hangar read them from disk. Defaults to
+ * `judge_verdict` only: the `model_stage` / `model_failover` /
+ * `model_directive` lines are published INSIDE a loop, whose own
+ * `attachRoutingPersistence` already writes them to the same file — a second
+ * subscriber there would duplicate every line. `close()` unsubscribes.
+ */
+export type RunEventSink = {
+  readonly sessionId: string;
+  close(): Promise<void>;
+};
+
+export async function attachRunEventSink(
+  runContext: RunContext,
+  opts: {
+    readonly sessionRootDir?: string;
+    readonly kinds?: ReadonlyArray<RoutingPersistedKind>;
+  } = {},
+): Promise<RunEventSink> {
+  const rootDir = resolveSessionRootDir(opts.sessionRootDir);
+  const log = await openEventLog(runContext.sessionId, { rootDir });
+  const attached = attachRoutingPersistence(runContext.eventBus, log, runContext, {
+    kinds: opts.kinds ?? ["judge_verdict"],
+  });
+  return {
+    sessionId: runContext.sessionId,
+    async close(): Promise<void> {
+      attached.unsubscribe();
+      await log.close();
+    },
+  };
+}
+
 export function resolveSessionRootDir(optsRoot: string | undefined): string | undefined {
   if (optsRoot !== undefined) return optsRoot;
   const tenant = currentTenantContext()?.tenant;
@@ -2845,17 +2983,59 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       }
     }
   }
+  // 0.6.0 §6.3 — a judged quality reaches the REWARD only under
+  // `reward.quality_source: in_loop`; otherwise it is persisted on the `v:2`
+  // line but the reward is computed without it (byte-identical to 0.5.x).
+  const qualityIntoReward = opts.modelPool?.reward?.qualitySource === "in_loop";
   // Fold one turn's observed outcome into the scoreboard (no-op without a pool).
   const recordPoolOutcome = (
     turn: { readonly modelString: string; readonly routeKey: string } | undefined,
-    obs: { readonly success: boolean; readonly latencyMs: number; readonly costUsd?: number },
+    obs: RouteObservation,
   ): void => {
     // Capture into consts so the narrowing survives (they are closed-over lets).
     const sb = scoreboard;
     const rc = rewardConfig;
     if (turn === undefined || sb === undefined || rc === undefined) return;
-    sb.record(turn.routeKey, turn.modelString, computeReward(obs, rc), obs);
+    const { quality: _quality, ...withoutQuality } = obs;
+    sb.record(
+      turn.routeKey,
+      turn.modelString,
+      computeReward(qualityIntoReward ? obs : withoutQuality, rc),
+      obs,
+    );
   };
+  /** 0.6.0 §7.3 — resolve a roster arm by spec model string, profile name (`$` optional) or tag. */
+  const resolveRosterArm = (value: string): PoolCandidate | undefined => {
+    if (poolRouter === undefined) return undefined;
+    const roster = poolRouter.candidates();
+    const wanted = value.startsWith("$") ? value.slice(1) : value;
+    return (
+      roster.find((c) => c.modelString === value) ??
+      roster.find((c) => poolCandidateConfigs.get(c)?.profile === wanted) ??
+      roster.find((c) => c.tags.includes(wanted))
+    );
+  };
+  // 0.6.0 §7.3 — `forcedCandidate`: the workflow / graph retry closure's
+  // escalation rung, resolved against the booted roster ONCE. Refused loudly
+  // when nothing can honour it — forcing is only meaningful over a roster.
+  let forcedRunCandidate: PoolCandidate | undefined;
+  if (opts.forcedCandidate !== undefined) {
+    if (poolRouter === undefined) {
+      throw new RuntimeError(
+        `forcedCandidate "${opts.forcedCandidate}" requires a model_pool — this run declares none, so there is no roster arm to force the turn onto`,
+      );
+    }
+    forcedRunCandidate = resolveRosterArm(opts.forcedCandidate);
+    if (forcedRunCandidate === undefined) {
+      const declared = poolRouter
+        .candidates()
+        .map((c) => poolCandidateConfigs.get(c)?.profile ?? c.modelString)
+        .join(", ");
+      throw new RuntimeError(
+        `forcedCandidate "${opts.forcedCandidate}" is not a roster arm (declared: ${declared}) — name a candidate's model, its profile or a tag`,
+      );
+    }
+  }
   // Per-turn USD cost from token usage + the static pricing table. Undefined
   // when the served model isn't on the table (the reward then drops the cost
   // term and reweights over quality + latency).
@@ -3471,9 +3651,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // `modelRole` / `modelStage` (a nested consult/guide/committee/shadow loop
   // or a sub-agent child); empty — and therefore byte-identical — on the
   // main loop, whose absent role reads as "primary".
-  const modelAttribution = {
-    ...(opts.modelRole !== undefined ? { role: opts.modelRole } : {}),
-    ...(opts.modelStage !== undefined ? { stage: opts.modelStage } : {}),
+  // 0.6.0 §7.3 — a cascade turn overrides the role / stage per ATTEMPT
+  // (`draft` on the graded draft, `escalation` on the forced re-run and on the
+  // rest of a turn after a self-`Escalate`); `runOneTurn` sets it on entry
+  // and clears it on return, so the loop's own defaults stand otherwise.
+  let turnAttributionOverride: { readonly role?: ModelRole; readonly stage?: string } = {};
+  const modelAttribution = (): { role?: ModelRole; stage?: string } => {
+    const role = turnAttributionOverride.role ?? opts.modelRole;
+    const stage = turnAttributionOverride.stage ?? opts.modelStage;
+    return {
+      ...(role !== undefined ? { role } : {}),
+      ...(stage !== undefined ? { stage } : {}),
+    };
   };
 
   // "Watch me" — live capture tap (CREWHAUS_WATCHME-gated, off by default):
@@ -4209,11 +4398,40 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   ): { role?: ModelRole; profile?: string; paramsFingerprint?: string } =>
     plan.fromPool
       ? {
-          role: opts.modelRole ?? "primary",
+          role: turnAttributionOverride.role ?? opts.modelRole ?? "primary",
           ...(plan.profile !== undefined ? { profile: plan.profile } : {}),
           paramsFingerprint: plan.paramsFingerprint,
         }
       : {};
+  /**
+   * 0.6.0 §7.3 — publish one hybrid-strategy stage transition (the shape
+   * metrics / alerts count: an `escalation`-role stage with `outcome:
+   * "started"` is ONE escalation — `isEscalationEvent`). Durable through the
+   * loop's `attachRoutingPersistence` mirror into the session JSONL.
+   */
+  const publishStage = (stage: {
+    readonly stage: string;
+    readonly strategy: string;
+    readonly role: ModelRole;
+    readonly candidate: PoolCandidate;
+    readonly outcome: "started" | "done" | "failed" | "skipped";
+    readonly cause?: string;
+    readonly costUsdMicros?: number;
+  }): void => {
+    const profile = poolCandidateConfigs.get(stage.candidate)?.profile;
+    bus.publish({
+      ...bus.envelope(),
+      kind: "model_stage",
+      stage: stage.stage,
+      strategy: stage.strategy,
+      role: stage.role,
+      model: stage.candidate.modelId,
+      ...(profile !== undefined ? { profile } : {}),
+      outcome: stage.outcome,
+      ...(stage.cause !== undefined ? { cause: stage.cause } : {}),
+      ...(stage.costUsdMicros !== undefined ? { costUsdMicros: stage.costUsdMicros } : {}),
+    });
+  };
   /** Fold a served wire model into the session's `models` provenance (one update per new model). */
   const recordServedModel = async (served: string): Promise<void> => {
     const merged = mergeSessionModels(sessionModels, served);
@@ -5512,11 +5730,69 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     throw new RunFailedError(report);
   };
 
+  /**
+   * 0.6.0 §7.3 — the per-call options of one `runOneTurn`: `force` pins the
+   * pool decision to a roster candidate (`policy: "forced"`, the cascade's
+   * escalation rung or a `forcedCandidate` run); `role` / `stage` override
+   * the attribution on the turn's model events; `defer` buffers the turn's
+   * SUCCESSFUL pool observations onto the returned attempt instead of
+   * recording them, so the strategy turn can stamp its judged quality on
+   * them (§7.10). Failed calls are never deferred — `computeReward`
+   * short-circuits on `!success` before reading quality, and deferring them
+   * would disarm the misroute latch.
+   */
+  type TurnRunOptions = {
+    readonly force?: PoolCandidate;
+    readonly forceReason?: string;
+    readonly role?: ModelRole;
+    readonly stage?: string;
+    readonly defer?: boolean;
+  };
+  type PendingPoolObservation = {
+    readonly turn: { readonly modelString: string; readonly routeKey: string };
+    readonly obs: RouteObservation;
+  };
+  type TurnAttempt = {
+    terminalContent: Anthropic.ContentBlock[];
+    usage: ModelUsage;
+    /** The pool observations `defer` buffered (empty otherwise). */
+    observations: PendingPoolObservation[];
+    /** Priced spend of this attempt's main-turn calls, USD (0 when unpriced). */
+    costUsd: number;
+    /** Wire model id of the attempt's last main-turn response, when any. */
+    servedModel?: string;
+    /** The serving pool candidate's profile, when any. */
+    profile?: string;
+  };
+
   async function runOneTurn(
     messages: Anthropic.MessageParam[],
-  ): Promise<{ terminalContent: Anthropic.ContentBlock[]; usage: ModelUsage }> {
+    turnOpts: TurnRunOptions = {},
+  ): Promise<TurnAttempt> {
     let state: TurnState = initialState;
     let terminalContent: Anthropic.ContentBlock[] = [];
+    turnAttributionOverride = {
+      ...(turnOpts.role !== undefined ? { role: turnOpts.role } : {}),
+      ...(turnOpts.stage !== undefined ? { stage: turnOpts.stage } : {}),
+    };
+    const pendingObservations: PendingPoolObservation[] = [];
+    let attemptCostUsd = 0;
+    let attemptServedModel: string | undefined;
+    let attemptServedProfile: string | undefined;
+    /** §7.10 — defer a successful pool observation to the strategy-turn boundary, or fold it now. */
+    const foldOutcome = (
+      turn: { readonly modelString: string; readonly routeKey: string },
+      obs: RouteObservation,
+    ): void => {
+      if (turnOpts.defer === true && obs.success) {
+        pendingObservations.push({
+          turn: { modelString: turn.modelString, routeKey: turn.routeKey },
+          obs,
+        });
+        return;
+      }
+      recordPoolOutcome(turn, obs);
+    };
     // G02 — aggregate token usage across every MAIN-turn model call this
     // turn makes (each tool iteration streams once). Handed to the in-loop
     // evaluator so a judge can weigh cost/verbosity; side-calls (compaction,
@@ -5685,6 +5961,26 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 if (poolRouter !== undefined) {
                   escalatePool = true;
                   selfEscalation = consumed;
+                  // §7.2.4 — the self-escalation is a hybrid stage: one
+                  // `started` line (what metrics count as the escalation),
+                  // and the rest of the turn carries `role: "escalation"`.
+                  turnAttributionOverride = {
+                    ...turnAttributionOverride,
+                    role: "escalation",
+                    stage: "escalate",
+                  };
+                  publishStage({
+                    stage: "escalate",
+                    strategy: "model_directed",
+                    role: "escalation",
+                    candidate:
+                      poolRouter
+                        .candidates()
+                        .find((c) => c.modelString === consumed.target.modelString) ??
+                      poolRouter.escalation(),
+                    outcome: "started",
+                    cause: "self",
+                  });
                 } else {
                   runContext.logger.warn(
                     "Escalate requested but no model_pool is active — nothing to escalate to",
@@ -5730,26 +6026,37 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                       policy: "forced" as const,
                       explored: false,
                     }
-                  : escalatePool
+                  : turnOpts.force !== undefined
                     ? {
+                        // 0.6.0 §7.3 — the cascade's escalation rung (or a
+                        // `forcedCandidate` run): pinned for the whole turn,
+                        // outranking the misroute latch and the policy.
                         ...base,
-                        // A self-escalation names its target (the cascade's
-                        // `escalate_to`, else the strongest) — served when it is
-                        // a roster candidate, else the router's strongest; a
-                        // misroute escalation always goes to the strongest.
-                        candidate:
-                          (selfEscalation !== undefined
-                            ? poolRouter
-                                .candidates()
-                                .find((c) => c.modelString === selfEscalation?.target.modelString)
-                            : undefined) ?? poolRouter.escalation(),
-                        reason:
-                          selfEscalation !== undefined
-                            ? `escalated on the model's own Escalate request (receipt ${selfEscalation.receipt}: ${selfEscalation.reason}; was: ${base.reason})`
-                            : `escalated to strongest candidate after a pool failure (was: ${base.reason})`,
+                        candidate: turnOpts.force,
+                        reason: turnOpts.forceReason ?? "forced onto the cascade's escalation rung",
+                        policy: "forced" as const,
                         explored: false,
                       }
-                    : base;
+                    : escalatePool
+                      ? {
+                          ...base,
+                          // A self-escalation names its target (the cascade's
+                          // `escalate_to`, else the strongest) — served when it is
+                          // a roster candidate, else the router's strongest; a
+                          // misroute escalation always goes to the strongest.
+                          candidate:
+                            (selfEscalation !== undefined
+                              ? poolRouter
+                                  .candidates()
+                                  .find((c) => c.modelString === selfEscalation?.target.modelString)
+                              : undefined) ?? poolRouter.escalation(),
+                          reason:
+                            selfEscalation !== undefined
+                              ? `escalated on the model's own Escalate request (receipt ${selfEscalation.receipt}: ${selfEscalation.reason}; was: ${base.reason})`
+                              : `escalated to strongest candidate after a pool failure (was: ${base.reason})`,
+                          explored: false,
+                        }
+                      : base;
               // 0.6.0 §4.4 / §7.11 — the per-candidate capability and cost
               // gate. A candidate is INELIGIBLE for this call when its
               // features say `vision: false` and the request TRANSCRIPT
@@ -6019,7 +6326,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               messageCount: messages.length,
               toolCount: plan.anthropicTools?.length ?? 0,
               streaming: opts.streaming === true,
-              ...modelAttribution,
+              ...modelAttribution(),
               ...planAttribution(plan),
               ...(effectiveParams !== undefined ? { effectiveParams } : {}),
             });
@@ -6140,7 +6447,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 stopReason: stopReason ?? "end_turn",
                 usage,
                 durationMs: performance.now() - t0Model,
-                ...modelAttribution,
+                ...modelAttribution(),
                 ...planAttribution(plan),
               });
               await recordServedModel(respModelIdS);
@@ -6153,6 +6460,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               const reportedInputTokens = responseInputTokens(usage);
               if (reportedInputTokens > 0) lastModelInputTokens = reportedInputTokens;
               lastResponseWireModel = respModelIdS;
+              attemptServedModel = respModelIdS;
               // Adaptive model routing — fold this successful turn into the
               // reward scoreboard so the learned policy improves next run.
               if (poolTurn !== undefined) {
@@ -6160,7 +6468,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 // §4.4 — the arm's own spend, read by the per-profile cost cap.
                 if (costUsd !== undefined)
                   poolTurn.plan.spentUsdMicros += Math.round(costUsd * 1e6);
-                recordPoolOutcome(poolTurn, {
+                if (costUsd !== undefined) attemptCostUsd += costUsd;
+                attemptServedProfile = poolTurn.plan.profile;
+                foldOutcome(poolTurn, {
                   success: true,
                   // §7.9 — model latency excluding the runTool spans (the
                   // non-streaming fold below is already tool-free).
@@ -6270,7 +6580,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               stopReason: final.stopReason,
               usage: final.usage,
               durationMs: performance.now() - t0Model,
-              ...modelAttribution,
+              ...modelAttribution(),
               ...planAttribution(plan),
             });
             await recordServedModel(respWireModelId);
@@ -6283,13 +6593,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             const reportedInputTokens = responseInputTokens(final.usage);
             if (reportedInputTokens > 0) lastModelInputTokens = reportedInputTokens;
             lastResponseWireModel = respWireModelId;
+            attemptServedModel = respWireModelId;
             // Adaptive model routing — fold this successful turn into the
             // reward scoreboard so the learned policy improves next run.
             if (poolTurn !== undefined) {
               const costUsd = poolCostUsd(respProvider, respWireModelId, final.usage);
               // §4.4 — the arm's own spend, read by the per-profile cost cap.
               if (costUsd !== undefined) poolTurn.plan.spentUsdMicros += Math.round(costUsd * 1e6);
-              recordPoolOutcome(poolTurn, {
+              if (costUsd !== undefined) attemptCostUsd += costUsd;
+              attemptServedProfile = poolTurn.plan.profile;
+              foldOutcome(poolTurn, {
                 success: true,
                 latencyMs: performance.now() - t0Model,
                 ...(costUsd !== undefined ? { costUsd } : {}),
@@ -6689,7 +7002,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         message: `turn aborted: the configured ${TIMEOUT_SPEC_KEYS[timedOut.crewhausTimeout]} (${timedOut.limitMs}ms) elapsed`,
       });
     }
-    return { terminalContent, usage: turnUsage };
+    turnAttributionOverride = {};
+    return {
+      terminalContent,
+      usage: turnUsage,
+      observations: pendingObservations,
+      costUsd: attemptCostUsd,
+      ...(attemptServedModel !== undefined ? { servedModel: attemptServedModel } : {}),
+      ...(attemptServedProfile !== undefined ? { profile: attemptServedProfile } : {}),
+    };
   }
 
   /** Concatenated text of a terminal content-block array (the same
@@ -6718,19 +7039,220 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    * and throws; `note` and an exhausted retry cap leave the last attempt
    * standing. An ABORTED (SIGINT / wall-clock) attempt never completed —
    * it is returned un-graded.
+   *
+   * 0.6.0 §7.3 — the CASCADE (`onFail: "escalate"` over a pool): the first
+   * attempt is the DRAFT (`role: "draft"`, its pool observations DEFERRED);
+   * a failing grade re-runs the turn on the escalation rung through
+   * `runOneTurn(messages, { force })`, from the pre-draft snapshot under
+   * `cleanPrompt` (the draft is truncated out of the request) or after the
+   * synthetic correction otherwise, wrapped in a `model_stage{escalate}`
+   * `started` / `done` pair; the escalation is re-graded, bounded by
+   * `maxEscalations`. At the turn boundary every deferred member-arm line is
+   * recorded with its stage's judged quality (`attributedTo: "draft" |
+   * "escalation"`, the draft's `wouldPass` counterfactual) plus ONE
+   * `strategy:cascade` line (§7.10); a grader that throws records no line
+   * for the attempt it was grading and increments `ungraded` instead. Past
+   * `budget.judge_share` the strong rung serves directly, un-judged, with the
+   * reason on the route and the stage. A `forcedCandidate` run (the workflow
+   * / graph retry closure) runs its whole turn as the escalation stage.
    */
+  type CascadePlan = {
+    readonly target: PoolCandidate;
+    readonly cleanPrompt: boolean;
+    readonly maxEscalations: number;
+  };
+  type StageRecord = {
+    readonly stage: "draft" | "escalate";
+    readonly attributedTo: "draft" | "escalation";
+    observations: PendingPoolObservation[];
+    costUsd: number;
+    score?: number;
+  };
+  let warnedEscalateWithoutPool = false;
+  const resolveCascade = (): CascadePlan | undefined => {
+    const evaluation = opts.evaluation;
+    if (evaluation === undefined || evaluation.onFail !== "escalate") return undefined;
+    if (poolRouter === undefined) {
+      if (!warnedEscalateWithoutPool) {
+        warnedEscalateWithoutPool = true;
+        runContext.logger.warn(
+          "evaluation.on_fail: escalate needs a model_pool to escalate to — no pool is active, so a failing grade leaves the answer standing (note semantics)",
+        );
+      }
+      return undefined;
+    }
+    const declared = evaluation.escalateTo ?? opts.modelPool?.strategy?.cascade?.escalateTo;
+    const resolved = declared !== undefined ? resolveRosterArm(declared) : undefined;
+    if (declared !== undefined && resolved === undefined) {
+      runContext.logger.warn(
+        "evaluation.escalateTo names no roster arm — escalating to the strongest candidate",
+        { escalateTo: declared },
+      );
+    }
+    return {
+      target: resolved ?? poolRouter.escalation(),
+      cleanPrompt:
+        evaluation.cleanPrompt ?? opts.modelPool?.strategy?.cascade?.cleanPrompt ?? false,
+      maxEscalations: Math.max(
+        0,
+        Math.floor(evaluation.maxEscalations ?? opts.modelPool?.strategy?.maxEscalations ?? 1),
+      ),
+    };
+  };
+  /** §7.10 — fold a cascade turn's deferred observations, then the strategy-arm line. */
+  const flushCascade = (
+    stages: ReadonlyArray<StageRecord>,
+    final: { readonly success: boolean; readonly score?: number },
+    wallMs: number,
+  ): void => {
+    if (scoreboard === undefined) return;
+    const draft = stages.find((st) => st.stage === "draft");
+    const escalation = stages.find((st) => st.stage === "escalate");
+    // The draft's counterfactual: did it score at least as well as the
+    // escalation the judge then graded? (`true` ⇒ escalating bought nothing.)
+    const wouldPass =
+      draft?.score !== undefined && escalation?.score !== undefined
+        ? draft.score >= escalation.score
+        : undefined;
+    for (const st of stages) {
+      for (const { turn, obs } of st.observations) {
+        recordPoolOutcome(turn, {
+          ...obs,
+          ...(st.score !== undefined ? { quality: st.score } : {}),
+          stage: st.stage,
+          strategy: "cascade",
+          attributedTo: st.attributedTo,
+          ...(st.stage === "draft" && wouldPass !== undefined ? { wouldPass } : {}),
+        });
+      }
+    }
+    const routeKey = stages.flatMap((st) => st.observations)[0]?.turn.routeKey;
+    if (routeKey === undefined) return;
+    const costUsd = stages.reduce((acc, st) => acc + st.costUsd, 0);
+    recordPoolOutcome(
+      { modelString: "strategy:cascade", routeKey },
+      {
+        success: final.success,
+        latencyMs: wallMs,
+        ...(costUsd > 0 ? { costUsd } : {}),
+        ...(final.score !== undefined ? { quality: final.score } : {}),
+        strategy: "cascade",
+        attributedTo: "strategy",
+      },
+    );
+  };
+  /** §7.13 — the grader threw: the attempt's arms served but cannot be graded. */
+  const discardUngraded = (attempt: TurnAttempt): void => {
+    for (const { turn } of attempt.observations) {
+      scoreboard?.ungraded(turn.routeKey, turn.modelString);
+    }
+  };
+  /** Run one turn on a forced rung as an `escalate` stage (started → done | failed). */
+  const runEscalationStage = async (
+    messages: Anthropic.MessageParam[],
+    target: PoolCandidate,
+    cause: string | undefined,
+    forceReason: string,
+    defer: boolean,
+  ): Promise<TurnAttempt> => {
+    publishStage({
+      stage: "escalate",
+      strategy: "cascade",
+      role: "escalation",
+      candidate: target,
+      outcome: "started",
+      ...(cause !== undefined ? { cause } : {}),
+    });
+    let served: TurnAttempt;
+    try {
+      served = await runOneTurn(messages, {
+        force: target,
+        forceReason,
+        role: "escalation",
+        stage: "escalate",
+        defer,
+      });
+    } catch (err) {
+      publishStage({
+        stage: "escalate",
+        strategy: "cascade",
+        role: "escalation",
+        candidate: target,
+        outcome: "failed",
+        cause: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
+    publishStage({
+      stage: "escalate",
+      strategy: "cascade",
+      role: "escalation",
+      candidate: target,
+      outcome: "done",
+      ...(served.costUsd > 0 ? { costUsdMicros: Math.round(served.costUsd * 1e6) } : {}),
+    });
+    return served;
+  };
+
   async function runEvaluatedTurn(
     messages: Anthropic.MessageParam[],
   ): Promise<{ terminalContent: Anthropic.ContentBlock[]; usage: ModelUsage }> {
     const evaluation = opts.evaluation;
-    let attempt = await runOneTurn(messages);
+    const cascade = resolveCascade();
+    const turnStartMs = performance.now();
+    const preDraftLength = messages.length;
+    // §6.2 — past the judge share a cascade serves the strong rung DIRECTLY:
+    // the draft it cannot afford to grade is not drafted, the judge is not
+    // skipped silently — the route reason and the stage cause both say why.
+    if (cascade !== undefined && forcedRunCandidate === undefined && judgeShareExhausted()) {
+      return runEscalationStage(
+        messages,
+        cascade.target,
+        "judge_share_exhausted",
+        "judge_share_exhausted",
+        false,
+      );
+    }
+    let attempt: TurnAttempt =
+      forcedRunCandidate !== undefined
+        ? await runEscalationStage(
+            messages,
+            forcedRunCandidate,
+            "retry_previous",
+            `forced onto ${armIdOf(forcedRunCandidate)} (forcedCandidate)`,
+            false,
+          )
+        : await runOneTurn(
+            messages,
+            cascade !== undefined ? { role: "draft", stage: "draft", defer: true } : {},
+          );
     if (evaluation === undefined) return attempt;
     const maxRetries = Math.max(0, Math.floor(evaluation.maxRetries));
+    const stages: StageRecord[] = [];
+    let current: StageRecord | undefined;
+    if (cascade !== undefined) {
+      current = {
+        stage: "draft",
+        attributedTo: "draft",
+        observations: attempt.observations,
+        costUsd: attempt.costUsd,
+      };
+      stages.push(current);
+    }
+    let escalations = 0;
+    const gradedStages = (): StageRecord[] => stages.filter((st) => st.score !== undefined);
     for (let retryIndex = 0; ; retryIndex += 1) {
       // A turn the abort tree stopped (SIGINT, turn/model-call/run timer)
       // did not COMPLETE — grading its partial output would be noise, and
       // a retry would fight the very signal that stopped it.
-      if (turnAbort.signal.aborted || runAbort.signal.aborted) return attempt;
+      if (turnAbort.signal.aborted || runAbort.signal.aborted) {
+        // An abort is not a judge outage: the deferred lines fold without a
+        // quality (exactly what an un-deferred call would have recorded).
+        if (cascade !== undefined) {
+          flushCascade(stages, { success: false }, performance.now() - turnStartMs);
+        }
+        return attempt;
+      }
       let graded: EvaluationResult;
       out.spinner.start("evaluating");
       try {
@@ -6741,11 +7263,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // 0.6.0 §6.2 — the judge publishes its model calls on THIS bus, so
           // the budget meter above (and any attached cost-tracker) sees them.
           bus,
+          ...(attempt.servedModel !== undefined ? { servedModel: attempt.servedModel } : {}),
+          ...(attempt.profile !== undefined ? { profile: attempt.profile } : {}),
+          ...(current !== undefined ? { stage: current.stage } : {}),
         });
       } catch (err) {
         // Grading INFRASTRUCTURE failure (judge model down, evaluator bug)
         // is not a verdict. Fail open: record it and let the turn stand —
-        // a flaky judge must not kill an otherwise healthy run.
+        // a flaky judge must not kill an otherwise healthy run. §7.13 — a
+        // cascade records NO arm line for the ungraded attempt (an omitted
+        // quality would read as a perfect 1.0 through the reward) and counts
+        // it as `ungraded`; stages already graded still fold.
         const errObj = err as { name?: unknown; message?: unknown };
         const name = typeof errObj.name === "string" ? errObj.name : "EvaluationError";
         const message = typeof errObj.message === "string" ? errObj.message : String(err);
@@ -6754,6 +7282,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           message,
         });
         await logEvent("error", { name, message: `evaluation grader failed: ${message}` });
+        if (cascade !== undefined) {
+          discardUngraded(attempt);
+          flushCascade(gradedStages(), { success: true }, performance.now() - turnStartMs);
+        }
         return attempt;
       } finally {
         out.spinner.stop();
@@ -6763,9 +7295,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const score = Number.isFinite(graded.score) ? graded.score : 0;
       const rationale = graded.rationale;
       const verdict: "pass" | "fail" = score >= evaluation.threshold ? "pass" : "fail";
+      if (current !== undefined) current.score = score;
       // 0.6.0 §6.2 — read AFTER the grade so the judge call that just ran is
       // in the meter: the signal says "this grade was produced past the share".
       const shareExhausted = judgeShareExhausted();
+      // §7.3 — decided BEFORE the publish so the failing grade names the rung
+      // the turn is handed to (`escalatedTo`).
+      const willEscalate =
+        verdict === "fail" &&
+        evaluation.onFail === "escalate" &&
+        cascade !== undefined &&
+        escalations < cascade.maxEscalations;
       bus.publish({
         ...bus.envelope(),
         kind: "eval_graded",
@@ -6781,14 +7321,35 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         // 0.6.0 §8.1 — attribution: the arm that produced the graded text, the
         // judge that scored it and what that judge call cost (grader-reported,
         // absent for deterministic graders), and the judge-share signal.
-        ...(lastResponseWireModel !== undefined ? { model: lastResponseWireModel } : {}),
+        ...(attempt.servedModel !== undefined
+          ? { model: attempt.servedModel }
+          : lastResponseWireModel !== undefined
+            ? { model: lastResponseWireModel }
+            : {}),
+        ...(attempt.profile !== undefined ? { profile: attempt.profile } : {}),
         ...(graded.judge !== undefined ? { judgeModel: graded.judge.model } : {}),
         ...(graded.judge?.costUsdMicros !== undefined
           ? { judgeCostUsdMicros: graded.judge.costUsdMicros }
           : {}),
+        ...(willEscalate && cascade !== undefined
+          ? { escalatedTo: cascade.target.modelString }
+          : {}),
         ...(shareExhausted ? { reason: "judge_share_exhausted" as const } : {}),
       });
-      if (verdict === "pass" || evaluation.onFail === "note") return attempt;
+      const standing = (): typeof attempt => {
+        if (cascade !== undefined) {
+          flushCascade(
+            stages,
+            { success: verdict === "pass", score },
+            performance.now() - turnStartMs,
+          );
+        }
+        return attempt;
+      };
+      if (verdict === "pass" || evaluation.onFail === "note") return standing();
+      // `escalate` without a pool has nothing to escalate to (warned once at
+      // resolve time): the verdict stands, note semantics.
+      if (evaluation.onFail === "escalate" && cascade === undefined) return standing();
       const rationaleNote =
         rationale !== undefined && rationale.trim().length > 0 ? ` — ${rationale.trim()}` : "";
       if (evaluation.onFail === "halt") {
@@ -6801,17 +7362,72 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             "improve the agent (instructions/model), lower evaluation.threshold, or soften evaluation.on_fail to retry/note",
           exitCode: EXIT_CODES.evaluation,
         };
+        standing();
         await publishRunFailed(report);
         throw new RunFailedError(report);
       }
-      // onFail: "retry" — bounded by the resolved cap; when spent, the last
-      // attempt stands (the failing eval_graded trail tells the story).
-      if (retryIndex >= maxRetries) return attempt;
+      // §7.3 draft-verify — the grader's own correction (a strong verifier's
+      // `edits`) replaces the default rationale nudge; either way it is
+      // APPENDED as a synthetic user message, never written into the draft.
       const feedback =
         rationale !== undefined && rationale.trim().length > 0
           ? ` Grader feedback: ${rationale.trim()}`
           : "";
-      const correction = `[evaluation failed: scored ${score.toFixed(2)}, threshold ${evaluation.threshold}]${feedback}\nPlease revise your previous answer to address the feedback, then give the corrected answer in full.`;
+      const correction =
+        graded.correction !== undefined && graded.correction.trim().length > 0
+          ? `[evaluation failed: scored ${score.toFixed(2)}, threshold ${evaluation.threshold}]\nRequired correction: ${graded.correction.trim()}\nRevise your previous answer to apply the correction, then give the corrected answer in full.`
+          : `[evaluation failed: scored ${score.toFixed(2)}, threshold ${evaluation.threshold}]${feedback}\nPlease revise your previous answer to address the feedback, then give the corrected answer in full.`;
+      if (evaluation.onFail === "escalate" && cascade !== undefined) {
+        if (!willEscalate) {
+          // §7.13 — `max_escalations` reached: the last rung's answer stands.
+          publishStage({
+            stage: "escalate",
+            strategy: "cascade",
+            role: "escalation",
+            candidate: cascade.target,
+            outcome: "skipped",
+            cause: "max_escalations",
+          });
+          return standing();
+        }
+        escalations += 1;
+        if (cascade.cleanPrompt) {
+          // The pre-draft snapshot: the strong rung answers the ORIGINAL
+          // prompt, never seeing the rejected draft. The session log keeps
+          // the draft's lines (they are already on disk); the durable
+          // `model_stage` line marks the cut for `route explain`.
+          messages.length = preDraftLength;
+        } else {
+          messages.push({ role: "user", content: correction });
+          await logEvent("user_message", { content: correction, synthetic: true });
+        }
+        const stage: StageRecord = {
+          stage: "escalate",
+          attributedTo: "escalation",
+          observations: [],
+          costUsd: 0,
+        };
+        try {
+          attempt = await runEscalationStage(
+            messages,
+            cascade.target,
+            undefined,
+            `cascade: escalated after a failing grade (${score.toFixed(2)} < ${evaluation.threshold})`,
+            true,
+          );
+        } catch (err) {
+          flushCascade(gradedStages(), { success: false }, performance.now() - turnStartMs);
+          throw err;
+        }
+        stage.observations = attempt.observations;
+        stage.costUsd = attempt.costUsd;
+        stages.push(stage);
+        current = stage;
+        continue;
+      }
+      // onFail: "retry" — bounded by the resolved cap; when spent, the last
+      // attempt stands (the failing eval_graded trail tells the story).
+      if (retryIndex >= maxRetries) return attempt;
       messages.push({ role: "user", content: correction });
       await logEvent("user_message", { content: correction, synthetic: true });
       attempt = await runOneTurn(messages);

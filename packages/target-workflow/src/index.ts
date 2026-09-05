@@ -309,8 +309,17 @@ function renderGatedStep(
   idx: number,
   total: number,
   shared: StepShared,
+  /** 0.6.0 §7.3 — set when a gating judge declares `escalate_to`: the closure
+   *  gains a `__force` parameter the retry passes, forcing the re-run onto
+   *  that roster arm (`policy: "forced"`, role `escalation`). */
+  escalateTo?: string,
 ): string {
   const isFirst = idx === 0;
+  const forceParam = escalateTo !== undefined ? ", __force?: string" : "";
+  const forceField =
+    escalateTo !== undefined
+      ? "\n    ...(__force !== undefined ? { forcedCandidate: __force } : {}),"
+      : "";
   const stepNum = idx + 1;
   const toolsField = renderStepToolsField(step.tools, shared.mcpWired);
   const stepTuningFields = renderStepTuningFields(step);
@@ -340,11 +349,11 @@ ${deadlineGuard}${stdinReadLine}  process.stdout.write(${escapeJsonString(`\n[st
   // wrapped in a closure so the gate can re-run this step with the judge
   // rationale appended as a nudge (bounded by the judge's max_retries).
   const __step${stepNum}Input = ${inputExpr};
-  const __runStep${stepNum} = async (__nudge: string): Promise<string> => runChatLoop({
+  const __runStep${stepNum} = async (__nudge: string${forceParam}): Promise<string> => runChatLoop({
     model: ${escapeJsonString(step.model)},
     instructions: ${escapeJsonString(step.instructions)} + __nudge,
     singleTurn: true,
-    seedMessages: [{ role: "user", content: __step${stepNum}Input }],${toolsField}${stepTuningFields}${modelFailoverFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}
+    seedMessages: [{ role: "user", content: __step${stepNum}Input }],${toolsField}${stepTuningFields}${modelFailoverFields}${forceField}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}
     hooks: ${shared.hooksExpr},
     skills: __skills,
     slashCommands: __slashCommands,${shared.runContextLine}${shared.evalFields}
@@ -446,6 +455,9 @@ ${deadlineGuard}  process.stdout.write(${escapeJsonString(`\n[step ${stepNum}/${
 
   if (gate.onFail === "retry_previous") {
     const nudgeExpr = `${escapeJsonString(`\n\n[judge feedback — the previous attempt failed the "${step.name}" gate (score `)} + __result.score.toFixed(2) + ${escapeJsonString(` < threshold ${gate.threshold})]:\n`)} + __result.rationale`;
+    // 0.6.0 §7.3 — `escalate_to` forces the re-run onto the named roster arm
+    // (the gated step's closure gained the `__force` parameter for it).
+    const forceArg = gate.escalateTo !== undefined ? `, ${escapeJsonString(gate.escalateTo)}` : "";
     return `${header}  {
     let __retries = 0;
     for (;;) {
@@ -460,7 +472,7 @@ ${throwBlock(
       }
       __retries += 1;
       process.stdout.write(${escapeJsonString(`[judge ${step.name}] retry `)} + __retries + ${escapeJsonString(`/${gate.maxRetries} of step ${gatedNum}/${total}: ${gated.name}\n`)});
-      priorOutput = await __runStep${gatedNum}(${nudgeExpr});
+      priorOutput = await __runStep${gatedNum}(${nudgeExpr}${forceArg});
     }
   }
 `;
@@ -974,12 +986,22 @@ function renderAgent(ir: IrWorkflowV0, evalEntry = false): string {
       ? "\n    ...(__evalOpts.sessionRootDir !== undefined ? { sessionRootDir: __evalOpts.sessionRootDir } : {}),\n    ...(__evalOpts._adapter !== undefined ? { _adapter: __evalOpts._adapter } : {}),"
       : "",
   };
+  // 0.6.0 §7.3 — the escalation rung a gating judge forces a `retry_previous`
+  // re-run onto (the first gating judge that declares `escalate_to`).
+  const escalateToFor = (gated: number): string | undefined =>
+    ir.steps.find(
+      (j, jIdx) =>
+        isJudgeStep(j) &&
+        j.judge?.onFail === "retry_previous" &&
+        j.judge.escalateTo !== undefined &&
+        gatedStepIndex(ir.steps, jIdx) === gated,
+    )?.judge?.escalateTo;
   const stepBodies = ir.steps
     .map((s, i) =>
       isJudgeStep(s)
         ? renderJudgeStep(s, i, ir.steps, ir.steps.length, shared)
         : gatedIdx.has(i)
-          ? renderGatedStep(s, i, ir.steps.length, shared)
+          ? renderGatedStep(s, i, ir.steps.length, shared, escalateToFor(i))
           : renderStep(s, i, ir.steps.length, shared),
     )
     .join("");
@@ -1079,6 +1101,7 @@ const __durableStep = (name: string, fn: () => Promise<string>): Promise<string>
     ? `import { ${errorsMembers} } from "@crewhaus/errors";
 import { judge } from "@crewhaus/eval-judge";
 import { createRunContext } from "@crewhaus/run-context";
+import { attachRunEventSink } from "@crewhaus/runtime-core";
 import type { TraceEventBus } from "@crewhaus/trace-event-bus";
 `
     : "";
@@ -1171,7 +1194,30 @@ ${plainInvocation
   // Cluster S — the run body: identical statements either way, wrapped as
   // main() on a plain compile and as the exported runForEval entry (with a
   // thin stdin-reading main) on the eval-entry variant.
-  const runBody = `  let priorOutput = "";${deadlineBoot}${runContextBoot}${budgetMeterBoot}
+  // 0.6.0 §7.3 (PR 9c) — the judge gates publish `judge_verdict` on the shared
+  // bus BETWEEN steps, when no step loop is live to mirror it into the session
+  // JSONL; this sink appends those lines to the run's session log (every step
+  // runs on `__runContext`, so they all share its session id) so `route
+  // explain` / `sessions tail` / Hangar read them from disk. The `model_stage`
+  // lines a forced re-run publishes land inside the step loop, which already
+  // persists them into the same file.
+  const runEventSinkBoot = hasJudges
+    ? evalEntry
+      ? [
+          "",
+          "  // 0.6.0 PR 9c — durable sink for the between-step judge_verdict lines.",
+          "  const __runEventSink = await attachRunEventSink(__runContext, {",
+          "    ...(__evalOpts.sessionRootDir !== undefined ? { sessionRootDir: __evalOpts.sessionRootDir } : {}),",
+          "  });",
+        ].join("\n")
+      : [
+          "",
+          "  // 0.6.0 PR 9c — durable sink for the between-step judge_verdict lines.",
+          "  const __runEventSink = await attachRunEventSink(__runContext, {});",
+        ].join("\n")
+    : "";
+  const runEventSinkClose = hasJudges ? "  await __runEventSink.close();\n" : "";
+  const runBody = `  let priorOutput = "";${deadlineBoot}${runContextBoot}${runEventSinkBoot}${budgetMeterBoot}
   const __cwd = process.cwd();
   const [__hooks, __skills, __slashCommands] = await Promise.all([
     loadHooks({ cwd: __cwd }),
@@ -1180,7 +1226,7 @@ ${plainInvocation
   ]);
   const __skillTool = __skills.length > 0 ? createSkillTool(__skills) : null;
   void __skillTool;${specHooksBoot}${mcp.bootBlock}
-${stepsSection}`;
+${stepsSection}${runEventSinkClose}`;
   const evalRunIdLine =
     durable && evalEntry
       ? "  // Always FRESH (no CREWHAUS_RUN_ID override): each eval sample must own\n" +

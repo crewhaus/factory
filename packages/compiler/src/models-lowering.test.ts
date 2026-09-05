@@ -1070,9 +1070,15 @@ describe("model_pool candidates carry the merged profile (key order is the byte 
     const pendingPaths = warnings
       .filter((w) => w.code === "model-plan-pending-runtime")
       .map((w) => w.path);
-    for (const key of ["policy", "directives", "rules", "classifier", "strategy", "reward"]) {
+    for (const key of ["policy", "directives", "rules", "classifier", "reward"]) {
       expect(pendingPaths).toContain(`agent.model_pool.${key}`);
     }
+    // PR 9c consumes `strategy.cascade` + `max_escalations`; the side-call
+    // closures (guide / shadow / committee) pend field-precisely on PR 9d.
+    expect(pendingPaths).not.toContain("agent.model_pool.strategy");
+    expect(pendingPaths).not.toContain("agent.model_pool.strategy.cascade");
+    expect(pendingPaths).toContain("agent.model_pool.strategy.guide");
+    expect(pendingPaths).toContain("agent.model_pool.strategy.shadow");
     // PR 9a consumes `scope` (stamped on `model_route.scope`): never pending.
     expect(pendingPaths).not.toContain("agent.model_pool.scope");
     // PR 8b landed the interpreter half of model_directed; the warning is

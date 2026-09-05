@@ -15,7 +15,11 @@ import type { ModelRole, TraceEventBus } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { JudgeError } from "./errors";
-import { buildCategoricalJudgePrompt, buildJudgePrompt } from "./prompt-template";
+import {
+  buildCategoricalJudgePrompt,
+  buildJudgePrompt,
+  buildVerifyPrompt,
+} from "./prompt-template";
 import type { JudgeTarget } from "./prompt-template";
 import type { AnyRubric, CategoricalRubric, Rubric } from "./rubric";
 import { isCategoricalRubric } from "./rubric";
@@ -509,6 +513,131 @@ export async function judgeCategorical(
     score: chosen.score,
     rationale: parsed.data.rationale,
     abstain: parsed.data.abstain ?? false,
+    ...(parsed.data.confidence !== undefined ? { confidence: parsed.data.confidence } : {}),
+    sentinel,
+    usage,
+  };
+}
+
+/**
+ * 0.6.0 §7.3 (PR 9c) — the DRAFT-VERIFY grader: a stronger model checks a
+ * cheaper model's draft and answers `{ok, edits}` through a forced
+ * `submit_verification` call. This is the acceptor of a cascade whose judge is
+ * the strong model itself; the runtime folds it into the in-loop evaluation
+ * seam as `EvaluationResult { score: ok ? 1 : 0, correction: edits }` — the
+ * correction is APPENDED as a synthetic user message (or a clean-prompt re-run
+ * is triggered), never written into the draft assistant message.
+ */
+export type VerifyDraftOptions = {
+  /** The user's task the draft answers. */
+  readonly task: string;
+  /** What a correct answer must satisfy. */
+  readonly criteria: string;
+  /** The draft to verify. */
+  readonly draft: string;
+  readonly adapter?: ProviderAdapter;
+  readonly model?: string;
+  readonly maxTokens?: number;
+  /** Pinned to 0 by default, exactly like the judges. */
+  readonly temperature?: number;
+  /** C35 — per-call token metering sink (see {@link JudgeUsageSink}). */
+  readonly onUsage?: JudgeUsageSink;
+} & JudgeBusOptions;
+
+export type VerifyDraftResult = {
+  /** `true` when the verifier accepts the draft as written. */
+  readonly ok: boolean;
+  /** The verifier's correction for the drafting model, when it rejected the draft. */
+  readonly edits?: string;
+  readonly rationale: string;
+  readonly confidence?: number;
+  /** The sentinel used for this call's untrusted-block markers. */
+  readonly sentinel: string;
+  /** What this verifier call cost (see {@link JudgeCallUsage}). */
+  readonly usage: JudgeCallUsage;
+};
+
+const SubmitVerificationSchema = z.object({
+  ok: z.boolean().describe("true when the draft fully satisfies the task and criteria"),
+  rationale: z.string().min(1),
+  edits: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "When ok is false: the correction for the drafting model — what to change, add or remove. Never a rewritten answer.",
+    ),
+  confidence: z
+    .number()
+    .min(0)
+    .max(1)
+    .optional()
+    .describe("Self-reported confidence in this verdict, 0 (a guess) to 1 (certain)."),
+});
+const submitVerificationInputSchema = zodToJsonSchema(SubmitVerificationSchema, {
+  $refStrategy: "none",
+}) as Record<string, unknown>;
+
+export async function verifyDraft(opts: VerifyDraftOptions): Promise<VerifyDraftResult> {
+  const model = opts.model ?? DEFAULT_JUDGE_MODEL;
+  const resolution = opts.adapter
+    ? { adapter: opts.adapter, modelId: model }
+    : await resolveModel(model);
+  const adapter: ProviderAdapter = resolution.adapter;
+  const wireModelId: string = resolution.modelId;
+  const { system, user, sentinel } = buildVerifyPrompt({
+    task: opts.task,
+    criteria: opts.criteria,
+    draft: opts.draft,
+  });
+  const { final, usage } = await meteredJudgeCall(
+    adapter,
+    {
+      model: wireModelId,
+      system: [{ type: "text", text: system }],
+      messages: [{ role: "user", content: user }],
+      tools: [
+        {
+          name: "submit_verification",
+          description:
+            "Submit the verification verdict: ok (accept the draft as written) or not ok with a " +
+            "correction in `edits` for the drafting model. The verifier MUST call this tool — " +
+            "never reply in plain text.",
+          input_schema: submitVerificationInputSchema,
+        },
+      ],
+      toolChoice: { type: "tool", name: "submit_verification" },
+      maxTokens: opts.maxTokens ?? 1024,
+      temperature: opts.temperature ?? 0,
+    },
+    {
+      specModel: model,
+      // The verifier is the cascade's judge: role "judge" unless overridden,
+      // stage "verify" by default so the run's cost fold names the stage.
+      ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
+      ...(opts.role !== undefined ? { role: opts.role } : {}),
+      stage: opts.stage ?? "verify",
+      ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
+    },
+  );
+  const toolUse = extractToolUse(final, "submit_verification");
+  if (!toolUse) {
+    throw new JudgeError(
+      `verifier did not call submit_verification (stop_reason=${final.stopReason})`,
+    );
+  }
+  const parsed = SubmitVerificationSchema.safeParse(toolUse.input);
+  if (!parsed.success) {
+    throw new JudgeError(`verifier submit_verification had invalid shape: ${parsed.error.message}`);
+  }
+  return {
+    ok: parsed.data.ok,
+    // A rejected draft without edits still rejects; an accepted draft never
+    // carries edits (a stray correction on `ok: true` is dropped, not applied).
+    ...(parsed.data.ok === false && parsed.data.edits !== undefined
+      ? { edits: parsed.data.edits }
+      : {}),
+    rationale: parsed.data.rationale,
     ...(parsed.data.confidence !== undefined ? { confidence: parsed.data.confidence } : {}),
     sentinel,
     usage,

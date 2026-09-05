@@ -87,6 +87,26 @@ describe("evaluationRunOptions (0.6.0 PR 8b — interpreter parity for the in-lo
     });
     expect((defaulted.evaluation as RunEvaluation).threshold).toBe(0.7);
   });
+
+  test("0.6.0 PR 9c — the cascade's lower-time escalateTo is threaded verbatim under on_fail: escalate, and absent otherwise", () => {
+    for (const type of ["llm_judge", "contains", "regex"] as const) {
+      const grader =
+        type === "llm_judge"
+          ? ({ type, criteria: "c" } as const)
+          : ({ type, value: "ok" } as const);
+      const escalated = evaluationRunOptions({
+        agent: { model: "m" },
+        evaluation: { grader, onFail: "escalate", maxRetries: 1, escalateTo: "strong" },
+      }).evaluation as RunEvaluation;
+      expect(escalated.onFail).toBe("escalate");
+      expect(escalated.escalateTo).toBe("strong");
+      const plain = evaluationRunOptions({
+        agent: { model: "m" },
+        evaluation: { grader, onFail: "retry", maxRetries: 1 },
+      }).evaluation as RunEvaluation;
+      expect("escalateTo" in plain).toBe(false);
+    }
+  });
 });
 
 describe("modelRoutingRunOptions (0.6.0 PR 8a — the interpreter's wireModels call)", () => {

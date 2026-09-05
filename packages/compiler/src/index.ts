@@ -205,12 +205,13 @@ export type LowerOptions = {
   readonly today?: string;
   /**
    * 0.6.0 PR 7 — lower the keys whose runtime consumer has not landed
-   * instead of refusing them: `evaluation.on_fail: escalate` and
-   * `judge.escalate_to` (PR 9c), and a NARROWING profile (`tools` /
-   * `tool_config` / `permissions` / `rate_limits` / `cost`) referenced from a
-   * SINGLE-MODEL serving slot (no IR carrier yet — a `model_pool` candidate
-   * honours the same knobs since PR 9a). `compile()` and the `crewhaus run`
-   * interpreter never set this. Tests and IR-level tooling set it to
+   * instead of refusing them: a NARROWING profile (`tools` / `tool_config` /
+   * `permissions` / `rate_limits` / `cost`) referenced from a SINGLE-MODEL
+   * serving slot (no IR carrier yet — a `model_pool` candidate honours the
+   * same knobs since PR 9a) and `mcp_servers.<n>.tool_flags`. (PR 9c removed
+   * `evaluation.on_fail: escalate` and `judge.escalate_to` from the refused
+   * set — the cascade re-run consumes both.) `compile()` and the `crewhaus
+   * run` interpreter never set this. Tests and IR-level tooling set it to
    * exercise the lowering the runtime will consume.
    */
   readonly allowRuntimePendingKeys?: boolean;
@@ -1142,8 +1143,7 @@ function lowerCompaction(spec: SpecWithPermissions, ctx: LowerContext): IrCompac
 //     landing PR deletes the row, exactly the ACCEPTED_BUT_UNWIRED
 //     delete-when-wired contract applied at field level.
 //
-// One class is REFUSED rather than warned until its runtime lands:
-// `evaluation.on_fail: escalate` and `judge.escalate_to` (PR 9c), and the
+// One class is REFUSED rather than warned until its runtime lands: the
 // NARROWING knobs (`tools` / `tool_config` / `permissions` / `rate_limits` /
 // `cost`) of a profile referenced from a SINGLE-MODEL serving slot — the IR
 // has no per-candidate plan carrier for a slot that routes no pool, so the
@@ -1152,7 +1152,11 @@ function lowerCompaction(spec: SpecWithPermissions, ctx: LowerContext): IrCompac
 // `model_pool` CANDIDATE (inline or inherited from a `$profile`) lower and
 // compile through since PR 9a: runtime-core builds a per-candidate plan
 // (subset advertisement + dispatch gate, narrowed permissions, rate buckets,
-// per-call tool_config, spend cap) from the pool blob at boot.
+// per-call tool_config, spend cap) from the pool blob at boot. PR 9c landed
+// the cascade: `evaluation.on_fail: escalate` (with its resolved
+// `escalateTo`), `strategy.cascade`, `strategy.max_escalations` and
+// `judge.escalate_to` compile through and are consumed by runtime-core's
+// `runEvaluatedTurn` / the workflow and graph retry closures.
 // `LowerOptions.allowRuntimePendingKeys` lowers the refused keys anyway
 // (tests, IR tooling); `compile()` never sets it. `mcp_servers.<n>.tool_flags`
 // has no PR-train row for its IR + emit half yet and stays refused too.
@@ -1174,7 +1178,7 @@ function asLooseBlock(value: unknown): LooseBlock | undefined {
 const LANDING_SINGLE_SLOT =
   "a later 0.6.0 row (a single-model serving slot has no per-candidate plan carrier in the IR; the same profile honours it today as a model_pool candidate)";
 const LANDING_PREROUTE = "PR 9b (the preRoute decision phase)";
-const LANDING_STRATEGIES = "PR 9c/9d (cascade and the guide / shadow / committee side-calls)";
+const LANDING_SIDE_CALLS = "PR 9d (the guide / shadow / committee side-calls)";
 const LANDING_MODEL_DIRECTED =
   "a later 0.6.0 row (the emitters' boot-time wireModels call — emitted bundles do not import @crewhaus/model-service, which depends on runtime-core)";
 const LANDING_ROUTER_STORE = "PR 10 (scoped arms, priors and the reward store)";
@@ -1187,28 +1191,6 @@ function runtimePending(path: string, landing: string, hint?: string): CompilerE
   return new CompilerError(
     `${path} is accepted by the spec and lowered into the IR, but this runtime does not enforce it yet — it lands with 0.6.0 ${landing}; remove it from the spec for now${hint !== undefined ? ` (${hint})` : ""}`,
   );
-}
-
-function assertRoutedBlockLowerable(path: string, block: LooseBlock): void {
-  // 0.6.0 PR 9a — a pool candidate's narrowing knobs (`tools` / `tool_config`
-  // / `permissions` / `rate_limits` / `cost`) are honoured by runtime-core's
-  // per-candidate plan table and compile through; only the PR 9c keys below
-  // stay refused on a routed block.
-  const judge = asLooseBlock(block["judge"]);
-  if (judge?.["escalate_to"] !== undefined) {
-    throw runtimePending(
-      `${path}.judge.escalate_to`,
-      "PR 9c (the forced re-run of a failed gate on the escalation rung)",
-      "until then a retry_previous re-run keeps the gated block's own routing",
-    );
-  }
-  const subAgents = asLooseBlock(block["sub_agents"]);
-  if (subAgents !== undefined) {
-    for (const [name, raw] of Object.entries(subAgents)) {
-      const def = asLooseBlock(raw);
-      if (def !== undefined) assertRoutedBlockLowerable(`${path}.sub_agents.${name}`, def);
-    }
-  }
 }
 
 /**
@@ -1228,30 +1210,9 @@ function assertNoRuntimePendingKeys(spec: Spec): void {
       }
     }
   }
-  const evaluation = asLooseBlock(s["evaluation"]);
-  if (evaluation?.["on_fail"] === "escalate") {
-    throw runtimePending(
-      "evaluation.on_fail: escalate",
-      "PR 9c (the cascade re-run on the escalation rung)",
-      "use retry | halt | note",
-    );
-  }
-  const agent = asLooseBlock(s["agent"]);
-  if (agent !== undefined) assertRoutedBlockLowerable("agent", agent);
-  if (Array.isArray(s["steps"])) {
-    for (const [i, raw] of s["steps"].entries()) {
-      const step = asLooseBlock(raw);
-      if (step !== undefined) assertRoutedBlockLowerable(`steps[${i}]`, step);
-    }
-  }
-  for (const key of ["nodes", "roles"] as const) {
-    const map = asLooseBlock(s[key]);
-    if (map === undefined) continue;
-    for (const [name, raw] of Object.entries(map)) {
-      const block = asLooseBlock(raw);
-      if (block !== undefined) assertRoutedBlockLowerable(`${key}.${name}`, block);
-    }
-  }
+  // 0.6.0 PR 9c — `evaluation.on_fail: escalate` and `judge.escalate_to`
+  // compile through: the cascade re-run consumes both (runtime-core's
+  // `runEvaluatedTurn`, the workflow / graph retry closures).
 }
 
 /** The `$<profile>` reference form every model slot accepts (0.6.0 §4.1). */
@@ -2451,7 +2412,12 @@ function lowerModelFailover(
     if (mp.rules !== undefined) pending("rules", LANDING_PREROUTE);
     if (mp.classifier !== undefined) pending("classifier", LANDING_PREROUTE);
     if (mp.strategy !== undefined) {
-      pending("strategy", LANDING_STRATEGIES);
+      // 0.6.0 PR 9c consumes `cascade` (`evaluation.on_fail: escalate` re-runs
+      // on `escalate_to`, `clean_prompt` picks the snapshot) and
+      // `max_escalations`; the side-call closures are PR 9d's.
+      for (const key of ["guide", "shadow", "committee"] as const) {
+        if (mp.strategy[key] !== undefined) pending(`strategy.${key}`, LANDING_SIDE_CALLS);
+      }
       if (mp.strategy.model_directed === true) {
         // 0.6.0 PR 8b landed the runtime half: `wireModels` constructs the
         // Consult / Escalate pair under this key, and the `crewhaus run` /
@@ -2882,8 +2848,8 @@ function lowerJudgePanel(
  * resolve at compile time exactly like `compaction.model`).
  * Spread-return-{} discipline: the IR key stays absent when the spec omits
  * the block. 0.6.0 §6.2 / §7.3: the judge panel knobs, `on_fail: escalate`
- * (reachable only with `allowRuntimePendingKeys` until PR 9c) and the
- * `allow_self_judge` lint waiver (carried only when true).
+ * with its lower-time-resolved `escalateTo` (see {@link resolveCascadeTarget})
+ * and the `allow_self_judge` lint waiver (carried only when true).
  */
 function lowerEvaluation(
   spec: SpecWithEvaluation,
@@ -2909,23 +2875,74 @@ function lowerEvaluation(
   } else {
     grader = { type: "regex", value: e.grader.value };
   }
-  if (e.on_fail === "escalate") {
-    warn(
-      ctx,
-      "model-plan-pending-runtime",
-      "evaluation.on_fail",
-      "evaluation.on_fail: escalate is lowered into the IR but the runtime re-runs a failed turn on the same policy today — it lands with 0.6.0 PR 9c (the cascade re-run on the escalation rung)",
-    );
-  }
+  // 0.6.0 §7.3 — `escalate` resolves its target at lower time: the cascade's
+  // declared `escalate_to`, else the pool's strongest candidate, else a
+  // CompilerError (the spec's cross-field check already demands a pool).
+  const escalateTo = e.on_fail === "escalate" ? resolveCascadeTarget(spec, ctx) : undefined;
   return {
     evaluation: {
       grader,
       ...(e.grader.type === "llm_judge" ? { threshold: e.threshold ?? 0.7 } : {}),
       onFail: e.on_fail ?? "retry",
       maxRetries: e.max_retries ?? 1,
+      ...(escalateTo !== undefined ? { escalateTo } : {}),
       ...(e.allow_self_judge === true ? { allowSelfJudge: true as const } : {}),
     },
   };
+}
+
+/**
+ * 0.6.0 §7.3 — the roster arm an `on_fail: escalate` turn is re-run on. The
+ * cascade's `escalate_to` role slot when declared (a tag, or a `$profile`
+ * lowered to its arm id); else the pool's strongest candidate, spelled the way
+ * the runtime's `escalation()` finds it: the `routing.strongTag` (default
+ * `strong`) when an enabled candidate carries it (inline tags, else the
+ * `$ref` profile's), else the LAST enabled candidate's arm id — its profile
+ * name for a `$ref`, else its lowered model string. A spec with no
+ * `agent.model_pool` is a CompilerError here (`parseSpec` already refuses it
+ * cross-field; this guards direct `lower()` callers).
+ */
+function resolveCascadeTarget(spec: SpecWithEvaluation, ctx: LowerContext): string {
+  const agent = asLooseBlock((spec as unknown as LooseBlock)["agent"]);
+  const pool = asLooseBlock(agent?.["model_pool"]);
+  if (pool === undefined) {
+    throw new CompilerError(
+      "evaluation.on_fail: escalate re-runs a failing turn on a stronger pool candidate, so agent.model_pool must be declared (strategy.cascade.escalate_to names the rung; without it the strongest candidate serves)",
+    );
+  }
+  const cascade = asLooseBlock(asLooseBlock(pool["strategy"])?.["cascade"]);
+  const declared = cascade?.["escalate_to"];
+  if (typeof declared === "string") return lowerRoleSlot(declared);
+  const strongTag =
+    typeof asLooseBlock(pool["routing"])?.["strongTag"] === "string"
+      ? (asLooseBlock(pool["routing"])?.["strongTag"] as string)
+      : "strong";
+  const rawCandidates = Array.isArray(pool["candidates"]) ? pool["candidates"] : [];
+  const enabled = rawCandidates
+    .map((raw) => asLooseBlock(raw))
+    .filter(
+      (c): c is LooseBlock =>
+        c !== undefined && typeof c["model"] === "string" && c["enabled"] !== false,
+    );
+  for (const c of enabled) {
+    const localTags = Array.isArray(c["tags"]) ? (c["tags"] as unknown[]) : [];
+    const name = profileRefName(c["model"] as string);
+    const tags =
+      localTags.length > 0 ? localTags : (ctx.registry[name ?? ""]?.tags ?? ([] as unknown[]));
+    if (tags.includes(strongTag)) return strongTag;
+  }
+  const last = enabled[enabled.length - 1];
+  if (last === undefined) {
+    throw new CompilerError(
+      "evaluation.on_fail: escalate needs at least one enabled agent.model_pool candidate to escalate to",
+    );
+  }
+  const lastModel = last["model"] as string;
+  const profile = profileRefName(lastModel);
+  if (profile !== undefined) return profile;
+  return resolveModelRef(lastModel, ctx, "agent.model_pool.candidates[].model", {
+    inRoster: true,
+  }).model;
 }
 
 /**
@@ -2936,8 +2953,8 @@ function lowerEvaluation(
  * (`judge.model ?? <shape>.model`, an auxiliary slot — `$profile` /
  * `cheapest` / `strongest` supported) so emitters read one model slot per
  * step/node. 0.6.0 §6.2 / §7.3: the panel knobs, the profile's params and
- * provenance, and `escalate_to` (a pool tag or arm id; reachable only with
- * `allowRuntimePendingKeys` until PR 9c).
+ * provenance, and `escalate_to` (a pool tag or arm id the workflow / graph
+ * retry closure forces the `retry_previous` re-run onto, PR 9c).
  */
 type SpecJudgeGateBlock = {
   readonly criteria: string;
@@ -2958,14 +2975,6 @@ function lowerJudgeGate(
   ctx: LowerContext,
   path: string,
 ): IrJudge {
-  if (judge.escalate_to !== undefined) {
-    warn(
-      ctx,
-      "model-plan-pending-runtime",
-      `${path}.escalate_to`,
-      `${path}.escalate_to is lowered into the IR but a retry_previous re-run keeps the gated block's own routing today — it lands with 0.6.0 PR 9c (the forced re-run on the escalation rung)`,
-    );
-  }
   return {
     criteria: judge.criteria,
     threshold: judge.threshold ?? 0.7,
