@@ -98,8 +98,9 @@ describe("metrics-collector cost counter (G57)", () => {
 
     const text = metrics.registry.prometheus();
     expect(text).toContain("# TYPE crewhaus_cost_usd_micros_total counter");
+    // 0.6.0 — an accrual with no role folds under `primary`.
     expect(text).toContain(
-      'crewhaus_cost_usd_micros_total{model="claude-opus-4-7",provider="anthropic"} 6000',
+      'crewhaus_cost_usd_micros_total{model="claude-opus-4-7",provider="anthropic",role="primary"} 6000',
     );
 
     await metrics.shutdown();

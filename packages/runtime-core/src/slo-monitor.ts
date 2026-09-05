@@ -29,7 +29,7 @@
  */
 import type { RunContext } from "@crewhaus/run-context";
 import type { TraceEvent, TraceEventBus, Unsubscribe } from "@crewhaus/trace-event-bus";
-import { percentile } from "./alert-watchdog";
+import { isEscalationEvent, isFloorBlockedRoute, percentile } from "./alert-watchdog";
 
 /** A mitigation-ladder rung, in the order the monitor walks it on a breach. */
 export type SloMitigationRung = "alert" | "pause-intake" | "rollback";
@@ -42,6 +42,13 @@ export type SloTargets = {
   readonly ttftMs?: number;
   readonly costPerHourUsd?: number;
   readonly egressBlockRate?: number;
+  // ---- 0.6.0 (design §8.4) — hybrid-routing targets, each a 0..1 rate. ----
+  /** Escalations per turn (see alert-watchdog's `isEscalationEvent`). */
+  readonly escalationRate?: number;
+  /** Failing in-loop grades + judge-gate verdicts over all of them. */
+  readonly judgeFailRate?: number;
+  /** `model_route` decisions the quality floor forced onto the floor arm, over all decisions. */
+  readonly floorBlockRate?: number;
   /** Rolling window (ms) a breach must persist before the ladder fires. */
   readonly windowMs?: number;
   readonly mitigation: ReadonlyArray<SloMitigationRung>;
@@ -114,6 +121,12 @@ export class SloWindow {
   private readonly unrecoveredErrors: Sample[] = [];
   private readonly externalCalls: Sample[] = [];
   private readonly egressBlocks: Sample[] = [];
+  // 0.6.0 (design §8.4) — hybrid-routing samples.
+  private readonly escalations: Sample[] = [];
+  private readonly judgeVerdicts: Sample[] = [];
+  private readonly judgeFails: Sample[] = [];
+  private readonly routeDecisions: Sample[] = [];
+  private readonly floorBlocks: Sample[] = [];
   private readonly requestStarts = new Map<string, number>();
   private readonly ttftSeen = new Set<string>();
   /** Wall-clock time of the FIRST event ever folded — lets `evaluate` report how
@@ -176,6 +189,21 @@ export class SloWindow {
           if (ev.outcome === "egress-blocked") this.egressBlocks.push({ ts: t, value: 1 });
         }
         return;
+      // ---- 0.6.0 (design §8.4) — hybrid-routing signals, the same event
+      // vocabulary the alert watchdog folds. ----
+      case "model_stage":
+      case "model_tier_route":
+        if (isEscalationEvent(ev)) this.escalations.push({ ts: t, value: 1 });
+        return;
+      case "eval_graded":
+      case "judge_verdict":
+        this.judgeVerdicts.push({ ts: t, value: 1 });
+        if (ev.verdict === "fail") this.judgeFails.push({ ts: t, value: 1 });
+        return;
+      case "model_route":
+        this.routeDecisions.push({ ts: t, value: 1 });
+        if (isFloorBlockedRoute(ev)) this.floorBlocks.push({ ts: t, value: 1 });
+        return;
       default:
         return;
     }
@@ -198,8 +226,16 @@ export class SloWindow {
     prune(this.unrecoveredErrors);
     prune(this.externalCalls);
     prune(this.egressBlocks);
+    prune(this.escalations);
+    prune(this.judgeVerdicts);
+    prune(this.judgeFails);
+    prune(this.routeDecisions);
+    prune(this.floorBlocks);
 
     const modelCalls = this.modelCalls.length;
+    const turns = this.turnLatencies.length;
+    const judgeVerdicts = this.judgeVerdicts.length;
+    const routeDecisions = this.routeDecisions.length;
     const externalCalls = this.externalCalls.length;
     const costUsd = this.costMicros.reduce((s, x) => s + x.value, 0) / 1_000_000;
     // How long the monitor has actually been observing, capped at the rolling
@@ -234,6 +270,12 @@ export class SloWindow {
       windowElapsedMs: observedMs,
       egressBlockRate: externalCalls > 0 ? this.egressBlocks.length / externalCalls : 0,
       externalCalls,
+      escalationRate: turns > 0 ? this.escalations.length / turns : 0,
+      escalations: this.escalations.length,
+      judgeFailRate: judgeVerdicts > 0 ? this.judgeFails.length / judgeVerdicts : 0,
+      judgeVerdicts,
+      floorBlockRate: routeDecisions > 0 ? this.floorBlocks.length / routeDecisions : 0,
+      routeDecisions,
     };
   }
 }
@@ -252,6 +294,16 @@ export type SloWindowMetrics = {
   readonly windowElapsedMs: number;
   readonly egressBlockRate: number;
   readonly externalCalls: number;
+  // ---- 0.6.0 (design §8.4) — hybrid-routing rates and their denominators. ----
+  /** escalations / turns in the window (0 with no turns). */
+  readonly escalationRate: number;
+  readonly escalations: number;
+  /** failing verdicts / all in-loop + judge-gate verdicts in the window. */
+  readonly judgeFailRate: number;
+  readonly judgeVerdicts: number;
+  /** floor-blocked decisions / all `model_route` decisions in the window. */
+  readonly floorBlockRate: number;
+  readonly routeDecisions: number;
 };
 
 /**
@@ -340,6 +392,30 @@ export function detectSloBreaches(metrics: SloWindowMetrics, targets: SloTargets
     metrics.egressBlockRate,
     targets.egressBlockRate,
     metrics.externalCalls >= MIN_SLO_SAMPLES,
+    rate,
+  );
+  // 0.6.0 (design §8.4) — hybrid-routing rates, each gated on its own
+  // denominator reaching MIN_SLO_SAMPLES (one escalation on one turn is a
+  // 100% rate, not an SLO violation).
+  add(
+    "escalation_rate",
+    metrics.escalationRate,
+    targets.escalationRate,
+    metrics.turnSamples >= MIN_SLO_SAMPLES,
+    rate,
+  );
+  add(
+    "judge_fail_rate",
+    metrics.judgeFailRate,
+    targets.judgeFailRate,
+    metrics.judgeVerdicts >= MIN_SLO_SAMPLES,
+    rate,
+  );
+  add(
+    "floor_block_rate",
+    metrics.floorBlockRate,
+    targets.floorBlockRate,
+    metrics.routeDecisions >= MIN_SLO_SAMPLES,
     rate,
   );
   return breaches;

@@ -23,9 +23,147 @@ export type FormatSessionEventOptions = {
   readonly withTime?: boolean;
   /** Truncate rendered text/inputs to this many chars. Default 200. */
   readonly maxChars?: number;
+  /**
+   * 0.6.0 (design §8.2) — when true, render ONLY the conversational
+   * transcript (the 0.5.x behaviour): the route / cost / eval / stage lines
+   * below are skipped. Default false: a hybrid turn shows its shape — which
+   * candidate served, what it cost, how the judge graded it, which stage ran.
+   */
+  readonly transcriptOnly?: boolean;
 };
 
 const DEFAULT_MAX_CHARS = 200;
+
+/** `$0.0042` from microdollars; sub-cent spend keeps four decimals. */
+export function formatUsdMicros(micros: unknown): string {
+  if (typeof micros !== "number" || !Number.isFinite(micros)) return "$?";
+  return `$${(micros / 1_000_000).toFixed(4)}`;
+}
+
+function str(v: unknown): string | undefined {
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+function num(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/** `model[profile]` when the line names a profile, else the bare model. */
+function modelWithProfile(payload: Record<string, unknown>): string {
+  const model = str(payload["model"]) ?? str(payload["modelId"]) ?? "?";
+  const profile = str(payload["profile"]);
+  return profile !== undefined ? `${model}[${profile}]` : model;
+}
+
+/**
+ * 0.6.0 (design §8.2) — render the durable routing / cost / eval / stage
+ * lines the session JSONL now carries, one indented line each, so `sessions
+ * tail` shows the shape of a hybrid turn beside its transcript. Every field
+ * is duck-typed and optional (0.5.x lines carry fewer of them); a payload
+ * that names nothing renderable still yields a line naming the kind.
+ */
+function formatRoutingEvent(kind: string, payload: Record<string, unknown>): string | undefined {
+  switch (kind) {
+    case "model_route": {
+      const parts = [`  ⇢ route ${modelWithProfile(payload)}`];
+      const policy = str(payload["policy"]);
+      if (policy !== undefined) parts.push(`policy=${policy}`);
+      const band = str(payload["routeKey"]);
+      if (band !== undefined) parts.push(`band=${band}`);
+      const stage = str(payload["stage"]);
+      if (stage !== undefined) parts.push(`stage=${stage}`);
+      const rule = str(payload["ruleId"]);
+      if (rule !== undefined) parts.push(`rule=${rule}`);
+      if (payload["explored"] === true) parts.push("explored");
+      const reason = str(payload["reason"]);
+      if (reason !== undefined) parts.push(`— ${reason}`);
+      return parts.join(" ");
+    }
+    case "model_tier_route": {
+      const parts = [`  ⇢ tier ${str(payload["tier"]) ?? "?"} ${str(payload["model"]) ?? "?"}`];
+      if (payload["escalated"] === true) parts.push("escalated");
+      const reason = str(payload["reason"]);
+      if (reason !== undefined) parts.push(`— ${reason}`);
+      return parts.join(" ");
+    }
+    case "model_failover":
+      return `  ⇢ failover ${str(payload["from"]) ?? "?"} → ${str(payload["to"]) ?? "?"}${
+        str(payload["reason"]) !== undefined ? ` — ${str(payload["reason"])}` : ""
+      }`;
+    case "model_directive": {
+      const requested = str(payload["requested"]) ?? "?";
+      const resolved = str(payload["resolved"]);
+      const accepted = payload["accepted"] === true ? "pinned" : "refused";
+      const reason = str(payload["reason"]);
+      return `  ⇢ /model ${requested}${resolved !== undefined && resolved !== requested ? ` → ${resolved}` : ""} ${accepted}${
+        reason !== undefined ? ` — ${reason}` : ""
+      }`;
+    }
+    case "cost_accrual": {
+      const parts = [
+        `  $ ${formatUsdMicros(payload["costUsdMicros"])} ${modelWithProfile(payload)}`,
+      ];
+      const role = str(payload["role"]);
+      if (role !== undefined) parts.push(`role=${role}`);
+      const stage = str(payload["stage"]);
+      if (stage !== undefined) parts.push(`stage=${stage}`);
+      const inTok = num(payload["inputTokens"]);
+      const outTok = num(payload["outputTokens"]);
+      if (inTok !== undefined && outTok !== undefined) parts.push(`${inTok}→${outTok} tok`);
+      if (payload["unpriced"] === true) parts.push("(unpriced)");
+      return parts.join(" ");
+    }
+    case "model_stage": {
+      const parts = [
+        `  ◇ stage ${str(payload["stage"]) ?? "?"}/${str(payload["strategy"]) ?? "?"} ${modelWithProfile(payload)}`,
+      ];
+      const role = str(payload["role"]);
+      if (role !== undefined) parts.push(`role=${role}`);
+      const outcome = str(payload["outcome"]);
+      if (outcome !== undefined) parts.push(outcome);
+      const cause = str(payload["cause"]);
+      if (cause !== undefined) parts.push(`— ${cause}`);
+      const micros = num(payload["costUsdMicros"]);
+      if (micros !== undefined) parts.push(formatUsdMicros(micros));
+      return parts.join(" ");
+    }
+    case "eval_graded":
+    case "judge_verdict": {
+      const verdict = str(payload["verdict"]) ?? "?";
+      const score = num(payload["score"]);
+      const at = kind === "judge_verdict" ? str(payload["stepOrNode"]) : undefined;
+      const parts = [
+        `  ⚖ ${kind === "judge_verdict" ? "judge" : "eval"}${at !== undefined ? ` ${at}` : ""} ${verdict}`,
+      ];
+      if (score !== undefined) parts.push(score.toFixed(2));
+      const threshold = num(payload["threshold"]);
+      if (threshold !== undefined) parts.push(`(bar ${threshold.toFixed(2)})`);
+      const judgeModel = str(payload["judgeModel"]);
+      if (judgeModel !== undefined) parts.push(`by ${judgeModel}`);
+      const graded = str(payload["model"]);
+      if (graded !== undefined) parts.push(`of ${graded}`);
+      const escalatedTo = str(payload["escalatedTo"]);
+      if (escalatedTo !== undefined) parts.push(`→ escalate ${escalatedTo}`);
+      const retry = num(payload["retryIndex"]);
+      if (retry !== undefined && retry > 0) parts.push(`retry ${retry}`);
+      return parts.join(" ");
+    }
+    default:
+      return undefined;
+  }
+}
+
+/** The event-log kinds {@link formatRoutingEvent} renders. */
+export const ROUTING_TAIL_KINDS: ReadonlySet<string> = new Set([
+  "model_route",
+  "model_tier_route",
+  "model_failover",
+  "model_directive",
+  "cost_accrual",
+  "model_stage",
+  "eval_graded",
+  "judge_verdict",
+]);
 
 /** UTC HH:MM:SS for a session event's epoch-ms `ts` (deterministic across TZs). */
 export function formatSessionEventTime(ts: number | undefined): string {
@@ -86,10 +224,11 @@ function toolResultText(content: unknown): string {
 
 /**
  * Render one session-log event as a single pretty line, or `undefined` when the
- * event kind carries no user-facing transcript content (the advisor/metrics
- * side-channel kinds — `model_route`, `tool_stats`, `cost_accrual`, … — and the
- * tool-result echo `user_message` whose granular `tool_result` line already
- * shows it). Deterministic and side-effect-free.
+ * event kind carries no user-facing content (the advisor/metrics side-channel
+ * kinds — `tool_stats`, `model_meta`, `mcp_stats`, … — and the tool-result echo
+ * `user_message` whose granular `tool_result` line already shows it). The
+ * routing / cost / eval / stage kinds (see {@link ROUTING_TAIL_KINDS}) render
+ * unless `transcriptOnly` is set. Deterministic and side-effect-free.
  */
 export function formatSessionEvent(
   ev: SessionLogEvent,
@@ -143,7 +282,8 @@ export function formatSessionEvent(
         return `  ✗ run failed [${cls}] ${truncate(message, maxChars)}`;
       }
       default:
-        return undefined;
+        if (opts.transcriptOnly === true || ev.kind === undefined) return undefined;
+        return formatRoutingEvent(ev.kind, payload);
     }
   })();
   if (body === undefined) return undefined;
