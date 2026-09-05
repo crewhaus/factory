@@ -18,7 +18,13 @@
  *   - per-candidate `tool_config` and the serving model reach the tool's
  *     `ToolExecuteContext`;
  *   - a `vision: false` candidate is ineligible for an image turn and a
- *     vision-requiring tool is never advertised to it;
+ *     vision-requiring tool is never advertised to it — and the requirement
+ *     is TRANSCRIPT-wide: it holds on the second model call of the turn
+ *     (after a tool_result was pushed) and when the image sits two turns
+ *     back behind a plain-text last message;
+ *   - the `RuntimeBridge` a retained `Task` hands its child is built from the
+ *     SERVING plan: a `$fast` child cannot inherit `Bash` (catalog) or run it
+ *     (rules) when the profile denied it;
  *   - a spent per-profile `cost.max_usd` makes the candidate ineligible
  *     without ending the run;
  *   - the served wire models are written to the session's `models`;
@@ -41,12 +47,13 @@ import type {
   ProviderRequest,
   StreamEvent,
 } from "@crewhaus/adapter-anthropic";
-import { emptyRuleSet } from "@crewhaus/permission-engine";
+import { emptyRuleSet, evaluate } from "@crewhaus/permission-engine";
 import { openScoreboard } from "@crewhaus/routing-store";
 import { createRunContext } from "@crewhaus/run-context";
 import { createSessionStore } from "@crewhaus/session-store";
+import { resolveChildPermissions } from "@crewhaus/sub-agent-permission-inheritance";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { ToolExecuteContext } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import type {
   ModelRequestEvent,
   ModelRouteEvent,
@@ -195,6 +202,44 @@ const imageTool = buildTool({
   execute: async () => "image",
 });
 const TOOLS = [readTool, bashTool, cfgTool, imageTool];
+
+/**
+ * A `Task`-named probe: records the `RuntimeBridge` fields tool-task derives
+ * the child from (`buildChildCatalog(bridge.tools, def)` and
+ * `resolveChildPermissions({ rules: bridge.permissionRules }, def)`). Named
+ * `Task` so it rides RETAINED_LOOP_TOOL_NAMES through a profile's `tools`.
+ */
+type BridgeProbe = {
+  readonly toolNames: ReadonlyArray<string>;
+  readonly permissionRules: Parameters<typeof resolveChildPermissions>[0]["rules"];
+  readonly permissionMode: Parameters<typeof resolveChildPermissions>[0]["mode"];
+};
+const bridgeProbes: BridgeProbe[] = [];
+const taskProbe = buildTool({
+  name: "Task",
+  description: "Records the runtime bridge it is handed.",
+  inputSchema: z.object({ prompt: z.string().optional() }).strict(),
+  readOnly: true,
+  destructive: false,
+  concurrencySafe: true,
+  execute: async (_input, ctx) => {
+    const bridge = ctx?.bridge as
+      | {
+          tools: ReadonlyArray<RegisteredTool>;
+          permissionRules: BridgeProbe["permissionRules"];
+          permissionMode: BridgeProbe["permissionMode"];
+        }
+      | undefined;
+    if (bridge !== undefined) {
+      bridgeProbes.push({
+        toolNames: bridge.tools.map((t) => t.name),
+        permissionRules: bridge.permissionRules,
+        permissionMode: bridge.permissionMode,
+      });
+    }
+    return "child done";
+  },
+});
 
 function tmpScoreboard() {
   const dir = mkdtempSync(join(tmpdir(), "crewhaus-plan-sb-"));
@@ -568,6 +613,68 @@ describe("plan table — per-candidate permissions, tool_config, rate limits (§
     expect(toolResultsOf(fast.requests[1])[0]?.is_error).not.toBe(true);
     expect(toolResultsOf(fast.requests[2])[0]?.is_error).not.toBe(true);
   });
+
+  test("a retained Task under $fast (tools: [read], deny Bash) hands its child a bridge built from the SERVING plan: the catalog lacks Bash and the inherited rules deny it", async () => {
+    bridgeProbes.length = 0;
+    const fastRead: Candidate = {
+      ...FAST_PROFILE,
+      tools: ["read"],
+      permissions: { deny: ["Bash(*)"] },
+    };
+    // The RUN allows both Bash and Task (a headless `default` run needs an
+    // explicit allow for Task, which otherwise defaults to "ask").
+    const yamlAllowBashAndTask = {
+      ...emptyRuleSet,
+      yaml: [
+        { type: "alwaysAllow" as const, pattern: "Bash", source: "yaml" as const },
+        { type: "alwaysAllow" as const, pattern: "Task", source: "yaml" as const },
+      ],
+    };
+    const fast = scriptedAdapter([{ tool: "Task", input: { prompt: "go" } }, { text: "ok" }]);
+    const strong = scriptedAdapter([{ text: "strong" }]);
+    await run(fast, strong, [fastRead, STRONG_PROFILE], {
+      tools: [...TOOLS, taskProbe],
+      permissionMode: "default",
+      permissionRules: yamlAllowBashAndTask,
+    });
+    // `Task` rode the retained list through `tools: [read]`...
+    expect((fast.requests[0]?.tools ?? []).map((t) => t.name)).toEqual([
+      "Read",
+      "Task",
+      "ListTools",
+    ]);
+    expect(toolResultsOf(fast.requests[1])[0]?.is_error).not.toBe(true);
+    expect(bridgeProbes).toHaveLength(1);
+    const probe = bridgeProbes[0];
+    if (probe === undefined) throw new Error("unreachable");
+    // ...and the bridge it saw is the candidate's, not the run's: the catalog
+    // `buildChildCatalog` would inherit from lacks Bash (and every other
+    // un-advertised tool), in the run's declared order.
+    expect(probe.toolNames).toEqual(["Read", "Task", "ListTools"]);
+    expect(probe.toolNames).not.toContain("Bash");
+    // The rules `resolveChildPermissions` derives from the bridge under
+    // `permissions: "inherit"` deny Bash even though the run's yaml allows it.
+    const child = resolveChildPermissions(
+      { mode: probe.permissionMode, rules: probe.permissionRules },
+      { name: "helper", description: "d", instructions: "i", permissions: "inherit" },
+    );
+    expect(
+      evaluate(
+        { toolName: "Bash", input: { command: "ls" }, readOnly: false, destructive: true },
+        child.mode,
+        child.rules,
+      ),
+    ).toBe("deny");
+    // The same call under the RUN's rules is allowed — so it was the plan's
+    // narrowing, not the run, that the bridge carried.
+    expect(
+      evaluate(
+        { toolName: "Bash", input: { command: "ls" }, readOnly: false, destructive: true },
+        "default",
+        yamlAllowBashAndTask,
+      ),
+    ).toBe("allow");
+  });
 });
 
 describe("plan table — capability and cost eligibility (§4.4, §7.11)", () => {
@@ -614,6 +721,83 @@ describe("plan table — capability and cost eligibility (§4.4, §7.11)", () =>
     expect(routeB?.model).toBe(STRONG);
     expect(routeB?.eligible).toEqual(["strong"]);
     expect(routeB?.reason).toContain("fast ineligible (requires:vision)");
+  });
+
+  test("the vision requirement is transcript-wide: the SECOND model call of an image turn (after a tool_result) still excludes the blind candidate", async () => {
+    const NO_VISION: ProviderFeatures = { ...FULL, vision: false };
+    // Blind first (`policy: static` picks it), sighted second. Call 1 routes
+    // to strong, which calls Read; the loop pushes a `role: "user"`
+    // tool_result while the seeded image stays in `messages`, so call 2 must
+    // ALSO skip the blind candidate — a last-user-message check would not.
+    const blind = scriptedAdapter([{ text: "blind" }], { features: NO_VISION });
+    const strong = scriptedAdapter([{ tool: "Read" }, { text: "strong done" }]);
+    const { text, events } = await run(
+      blind,
+      strong,
+      [{ ...FAST_PROFILE, tools: undefined }, STRONG_PROFILE],
+      {},
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "read the file and describe the picture" },
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" },
+            },
+          ],
+        },
+      ],
+    );
+    expect(text).toBe("strong done");
+    expect(blind.requests).toHaveLength(0);
+    expect(strong.requests).toHaveLength(2);
+    // The image block is in the second request's transcript — the request
+    // the blind adapter must never see.
+    const secondFirstMsg = strong.requests[1]?.messages[0];
+    expect(
+      Array.isArray(secondFirstMsg?.content) &&
+        secondFirstMsg.content.some((b) => b.type === "image"),
+    ).toBe(true);
+    const routes = events.filter((e): e is ModelRouteEvent => e.kind === "model_route");
+    expect(routes).toHaveLength(2);
+    expect(routes.map((r) => r.model)).toEqual([STRONG, STRONG]);
+    expect(routes[1]?.eligible).toEqual(["strong"]);
+    expect(routes[1]?.eligible).not.toContain("fast");
+    expect(routes[1]?.reason).toContain("fast ineligible (requires:vision)");
+  });
+
+  test("the vision requirement is transcript-wide: an image two turns back behind a plain-text last message keeps the blind candidate ineligible", async () => {
+    const NO_VISION: ProviderFeatures = { ...FULL, vision: false };
+    const blind = scriptedAdapter([{ text: "blind" }], { features: NO_VISION });
+    const strong = scriptedAdapter([{ text: "strong recalls" }]);
+    const { text, events } = await run(
+      blind,
+      strong,
+      [{ ...FAST_PROFILE, tools: undefined }, STRONG_PROFILE],
+      {},
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this?" },
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" },
+            },
+          ],
+        },
+        { role: "assistant", content: [{ type: "text", text: "A cat on a keyboard." }] },
+        { role: "user", content: "and what colour is it?" },
+      ],
+    );
+    expect(text).toBe("strong recalls");
+    expect(blind.requests).toHaveLength(0);
+    expect(strong.requests).toHaveLength(1);
+    const route = events.find((e): e is ModelRouteEvent => e.kind === "model_route");
+    expect(route?.model).toBe(STRONG);
+    expect(route?.eligible).toEqual(["strong"]);
+    expect(route?.reason).toContain("fast ineligible (requires:vision)");
   });
 
   test("a spent per-profile cost cap makes the candidate ineligible for the next call without ending the run", async () => {

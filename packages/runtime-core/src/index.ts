@@ -2342,19 +2342,25 @@ export const RETAINED_LOOP_TOOL_NAMES: ReadonlyArray<string> = [
   "MemoryClear",
 ];
 
-/** Does the LAST user message carry an image block (directly or inside a tool_result)? */
-function lastUserMessageHasImages(messages: ReadonlyArray<Anthropic.MessageParam>): boolean {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m === undefined || m.role !== "user") continue;
-    if (typeof m.content === "string") return false;
+/**
+ * Does ANY user message in the request transcript carry an image block
+ * (directly or inside a `tool_result`)? Transcript-wide on purpose: the
+ * request sends the whole `messages` array, so an image seeded two turns
+ * back, or one a sighted candidate's `ReadImage` returned earlier in this
+ * turn, still reaches the provider on every later call — a `vision: false`
+ * candidate would 400 or silently drop it just the same. Recomputed per
+ * call from the live array, so compaction that summarises the image away
+ * re-admits the candidate naturally. Early-exits on the first hit.
+ */
+function transcriptHasImages(messages: ReadonlyArray<Anthropic.MessageParam>): boolean {
+  for (const m of messages) {
+    if (m.role !== "user" || typeof m.content === "string") continue;
     for (const block of m.content) {
       if (block.type === "image") return true;
       if (block.type === "tool_result" && Array.isArray(block.content)) {
         if (block.content.some((b) => b.type === "image")) return true;
       }
     }
-    return false;
   }
   return false;
 }
@@ -5037,12 +5043,31 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // coarse "tool" origin. The Task-tool-only fields (`spawnSubAgent`,
     // `crewMailbox`, `subAgents`) stay conditional — they're omitted when not
     // wired, and the Task tool already checks for undefined before using them.
+    //
+    // 0.6.0 §4.4 — the bridge is built from the SERVING plan, not the run:
+    // `permissionRules` is the candidate's narrowed meet and `tools` is the
+    // run catalog intersected with the candidate's advertisement. `Task`
+    // survives a profile's `tools: []` (RETAINED_LOOP_TOOL_NAMES), and
+    // tool-task derives the child's catalog (`buildChildCatalog(bridge.tools)`)
+    // and rules (`resolveChildPermissions({ rules: bridge.permissionRules })`)
+    // from exactly these two fields — so a `$fast` candidate denied `Bash`
+    // must not be able to reach it by spawning a child that inherits the
+    // run's un-narrowed catalog and rules ("a subset in the advertisement is
+    // not a subset in execution" applies to the one retained tool too).
+    // `resolveChildPermissions` narrows from what it is handed, never widens.
+    // Without a pool `servingPlan` is `primaryPlan`, whose rules ARE the run's
+    // and whose advertisement is the whole catalog, so the bridge is
+    // byte-identical to today's. (Full child routing — a child served by its
+    // own candidate — is PR 11's.)
+    const bridgeTools: ReadonlyArray<RegisteredTool> = servingPlan.fromPool
+      ? tools.filter((t) => servingPlan.advertisedNames.has(t.name))
+      : tools;
     const bridge: RuntimeBridge = {
       runContext,
       eventLog,
       permissionMode,
-      permissionRules,
-      tools,
+      permissionRules: servingPlan.permissionRules,
+      tools: bridgeTools,
       model: opts.model,
       maxTokens,
       ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
@@ -5727,8 +5752,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                     : base;
               // 0.6.0 §4.4 / §7.11 — the per-candidate capability and cost
               // gate. A candidate is INELIGIBLE for this call when its
-              // features say `vision: false` and the turn carries image
-              // blocks (the request would 400 or silently drop the image),
+              // features say `vision: false` and the request TRANSCRIPT
+              // carries image blocks anywhere — not just the last user
+              // message: the tool_result pushed after every tool call is a
+              // user message too, and the seeded image stays in `messages`
+              // (the request would 400 or silently drop the image),
               // or when its per-profile `cost.max_usd` is spent (ineligible,
               // never ends the run). An ineligible pick is replaced by the
               // first eligible candidate in declared order; when none is,
@@ -5736,7 +5764,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // eligible set is persisted on the route line so replay stays
               // exact. (The full preRoute phase — rules, directives,
               // classifier, breaker state — lands with PR 9b on this seam.)
-              const turnHasImages = lastUserMessageHasImages(messages);
+              const turnHasImages = transcriptHasImages(messages);
               const ineligibleReason = (candidate: PoolCandidate): string | undefined => {
                 const plan = planFor(candidate);
                 if (
