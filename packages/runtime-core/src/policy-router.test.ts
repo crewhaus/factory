@@ -432,7 +432,7 @@ describe("runChatLoop — 0.6.0 PR 7 pool widening (enabled: false, policy: clas
     expect(routes[0]?.model).toBe(HAIKU);
   });
 
-  test("policy: classifier is accepted and routes heuristically until the preRoute phase lands (PR 9b)", async () => {
+  test("policy: classifier with no classifier wired routes heuristically, recording `classifier failed`", async () => {
     const cheap = okAdapter("cheap served");
     const strong = okAdapter("strong served");
     const runContext = createRunContext();
@@ -452,5 +452,6 @@ describe("runChatLoop — 0.6.0 PR 7 pool widening (enabled: false, policy: clas
     expect(finalText).toBe("strong served");
     const routes = seen.filter((e): e is ModelRouteEvent => e.kind === "model_route");
     expect(routes[0]).toMatchObject({ routeKey: "hard", model: OPUS, policy: "heuristic" });
+    expect(routes[0]?.reason).toContain("classifier failed: no classifier wired");
   });
 });

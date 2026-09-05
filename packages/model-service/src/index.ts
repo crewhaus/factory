@@ -59,12 +59,19 @@
  * one-code-path contract without a boot-time import. What this root DOES add
  * in 9a is the emit-side scope twin {@link scopedModelWiringFragment}.
  *
+ * PR 9b adds the second runtime construction: under `policy: classifier`
+ * with a `classifier:` block the root builds the {@link RouteClassifierFn}
+ * (`routeClassifier`) runtime-core's `preRoute` phase calls each turn — see
+ * {@link buildRouteClassifier}. Like the hybrid tools it reaches the
+ * interpreter through `loop-contract.ts` and not (yet) a compiled bundle.
+ *
  * `wireModels` is per RUN, not per process: the escalation latch it returns
  * is bounded "per run", so a host that serves many runs from one process
  * (`crewhaus serve`) calls it once per run — never caches the fragment.
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
+import { classifyRouteLabel } from "@crewhaus/eval-judge";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import type {
   IrCircuitBreaker,
@@ -73,7 +80,11 @@ import type {
   IrSubAgentDefinition,
 } from "@crewhaus/ir";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
-import { type RunChatLoopOptions, runChatLoop } from "@crewhaus/runtime-core";
+import {
+  type RouteClassifierFn,
+  type RunChatLoopOptions,
+  runChatLoop,
+} from "@crewhaus/runtime-core";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
   type ConsultRunner,
@@ -146,6 +157,14 @@ export type ModelWiringRunOptions = {
   readonly hybridTools?: ReadonlyArray<RegisteredTool>;
   /** The `Escalate` tool's latch — the loop consumes it at its next model call. */
   readonly escalation?: EscalationLatch;
+  /**
+   * 0.6.0 §7.2.3 (PR 9b) — the `policy: classifier` label call, present only
+   * when the (non-overridden) pool declares `policy: classifier` AND a
+   * `classifier:` block. runtime-core's `preRoute` phase calls it with the
+   * latest human user text and falls back to the heuristic policy when it
+   * throws. Built over `@crewhaus/eval-judge`'s `classifyRouteLabel`.
+   */
+  readonly routeClassifier?: RouteClassifierFn;
 };
 
 /**
@@ -201,6 +220,12 @@ export type WireModelsDeps = {
    * scripted one. Production callers leave it undefined.
    */
   readonly _consultRunner?: ConsultRunner;
+  /**
+   * Test injection — a pre-built adapter for the `policy: classifier` label
+   * call, so it runs offline. Production callers leave it undefined: the
+   * classifier model resolves through the model-router on first call.
+   */
+  readonly _classifierAdapter?: ProviderAdapter;
 };
 
 /** The routing keys, in the order every emitter and the interpreter have
@@ -217,6 +242,11 @@ export const MODEL_WIRING_KEYS = [
  *  when the pool declares `strategy.model_directed: true`. Never rendered by
  *  {@link renderModelWiringFields}: they are runtime constructions. */
 export const HYBRID_WIRING_KEYS = ["hybridTools", "escalation"] as const;
+
+/** 0.6.0 §7.2.3 — the key `wireModels` appends LAST when the pool declares
+ *  `policy: classifier` with a `classifier:` block. A runtime construction,
+ *  never rendered by {@link renderModelWiringFields}. */
+export const CLASSIFIER_WIRING_KEYS = ["routeClassifier"] as const;
 
 /**
  * Pick the routing slice out of a lowered block EXACTLY as the retired
@@ -298,6 +328,49 @@ export function wireModels(
     ...(pool !== undefined && pool.strategy?.modelDirected === true
       ? wireModelDirected(pool, deps)
       : {}),
+    ...(pool !== undefined && pool.policy === "classifier" && pool.classifier !== undefined
+      ? { routeClassifier: buildRouteClassifier(pool.classifier, deps) }
+      : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Classifier-directed: the `policy: classifier` label call (plan §7.2.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the {@link RouteClassifierFn} for a pool's `classifier:` block: one
+ * enum-constrained forced-tool call on the classifier model per turn
+ * (`@crewhaus/eval-judge`'s `classifyRouteLabel`), published on the RUN bus
+ * the loop hands in with `role: "classifier"` — so cost-tracker prices it,
+ * the budget meter counts it under `judge_share`, and the session mirror
+ * persists it. The labels are the block's own (`tag → description`); the
+ * loop re-validates the verdict against the pool's tags. Any throw
+ * propagates: runtime-core's `preRoute` turns it into the heuristic fallback
+ * with `reason: "classifier failed"`. The model resolves through the
+ * model-router on first call unless a test injects `_classifierAdapter`.
+ */
+export function buildRouteClassifier(
+  classifier: NonNullable<IrModelPool["classifier"]>,
+  deps: WireModelsDeps,
+): RouteClassifierFn {
+  return async ({ userText, bus }) => {
+    const verdict = await classifyRouteLabel({
+      labels: classifier.labels,
+      userText,
+      model: classifier.model,
+      ...(classifier.maxTokens !== undefined ? { maxTokens: classifier.maxTokens } : {}),
+      ...(deps._classifierAdapter !== undefined ? { adapter: deps._classifierAdapter } : {}),
+      bus,
+      role: "classifier",
+    });
+    return {
+      label: verdict.label,
+      model: verdict.usage.model,
+      ...(verdict.usage.costUsdMicros !== undefined
+        ? { costUsdMicros: verdict.usage.costUsdMicros }
+        : {}),
+    };
   };
 }
 
