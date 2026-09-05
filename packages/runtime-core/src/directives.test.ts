@@ -35,7 +35,9 @@ import type {
 import { openScoreboard } from "@crewhaus/routing-store";
 import { createRunContext } from "@crewhaus/run-context";
 import { createSessionStore } from "@crewhaus/session-store";
+import { buildTool } from "@crewhaus/tool-builder";
 import type { ModelDirectiveEvent, ModelRouteEvent, TraceEvent } from "@crewhaus/trace-event-bus";
+import { z } from "zod";
 import { type RunChatLoopOptions, type RunEvaluation, runChatLoop } from "./index";
 
 const SESSION_ROOT = mkdtempSync(join(tmpdir(), "crewhaus-directives-tests-"));
@@ -78,6 +80,91 @@ function textAdapter(
         yield { kind: "message_delta", stopReason: "end_turn", usage: { input: 100, output: 10 } };
         yield { kind: "message_stop" };
       })();
+    },
+  };
+}
+
+/**
+ * A tool-loop adapter: each call follows `script` (`tool` emits one `noop`
+ * tool_use, `text` ends the turn), so one turn spans several model calls.
+ */
+function toolLoopAdapter(
+  script: ReadonlyArray<"tool" | "text">,
+  reply: string,
+  features: ProviderFeatures = FULL,
+): ProviderAdapter & { requests: ProviderRequest[] } {
+  const requests: ProviderRequest[] = [];
+  let call = 0;
+  return {
+    requests,
+    providerId: "anthropic",
+    features,
+    estimateTokens: () => 0,
+    stream(req: ProviderRequest): AsyncIterable<StreamEvent> {
+      requests.push(req);
+      const step = script[call] ?? "text";
+      const id = `tu_${call}`;
+      call += 1;
+      return (async function* () {
+        yield { kind: "message_start", usage: { input: 100, output: 0 } };
+        if (step === "tool") {
+          yield {
+            kind: "content_block_start",
+            index: 0,
+            block: { type: "tool_use", id, name: "noop", input: {} },
+          };
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: { type: "input_json_delta", partial_json: "{}" },
+          };
+          yield { kind: "content_block_stop", index: 0 };
+          yield {
+            kind: "message_delta",
+            stopReason: "tool_use",
+            usage: { input: 100, output: 10 },
+          };
+        } else {
+          yield { kind: "content_block_start", index: 0, block: { type: "text", text: "" } };
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: reply },
+          };
+          yield { kind: "content_block_stop", index: 0 };
+          yield {
+            kind: "message_delta",
+            stopReason: "end_turn",
+            usage: { input: 100, output: 10 },
+          };
+        }
+        yield { kind: "message_stop" };
+      })();
+    },
+  };
+}
+
+const noopTool = () =>
+  buildTool({
+    name: "noop",
+    description: "does nothing",
+    inputSchema: z.object({}),
+    readOnly: true,
+    execute: async () => "ok",
+  });
+
+/** Silence + collect the `[budget]` stderr lines a degrade prints. */
+function captureStderr(): { lines: () => string[]; restore: () => void } {
+  const chunks: string[] = [];
+  const original = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+    chunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return true;
+  }) as typeof process.stderr.write;
+  return {
+    lines: () => chunks.join("").split("\n"),
+    restore: () => {
+      process.stderr.write = original;
     },
   };
 }
@@ -149,6 +236,20 @@ const userText = (req: ProviderRequest | undefined): string => {
     .join("\n");
 };
 
+const roles = (req: ProviderRequest | undefined): string[] =>
+  req?.messages.map((m) => m.role) ?? [];
+const allText = (req: ProviderRequest | undefined): string =>
+  (req?.messages ?? [])
+    .map((m) =>
+      typeof m.content === "string"
+        ? m.content
+        : (m.content as Anthropic.ContentBlockParam[])
+            .filter((b): b is Anthropic.TextBlockParam => b.type === "text")
+            .map((b) => b.text)
+            .join("\n"),
+    )
+    .join("\n");
+
 describe("directives — /model steering (§7.2.1)", () => {
   test("/model strong routes the turn with policy directive; the request copy is stripped, the transcript keeps the token, the pin is written", async () => {
     const fast = textAdapter("fast");
@@ -205,6 +306,11 @@ describe("directives — /model steering (§7.2.1)", () => {
     expect(second.text).toBe("strong 2");
     expect(fast2.requests).toHaveLength(0);
     expect(second.routes[0]).toMatchObject({ policy: "directive", model: STRONG });
+    // The replayed prefix is the REQUEST copy: the persisted line keeps the
+    // token, the model never sees it — on this turn or any resumed one.
+    expect(strong2.requests[0]?.messages[0]?.content).toBe("hello");
+    expect(roles(strong2.requests[0])).toEqual(["user", "assistant", "user"]);
+    expect(allText(strong2.requests[0])).not.toContain("/model");
     expect(second.directives).toEqual([
       expect.objectContaining({ source: "session", resolved: "strong", accepted: true }),
     ]);
@@ -241,6 +347,20 @@ describe("directives — /model steering (§7.2.1)", () => {
     expect(fourth.text).toBe("fast 4");
     expect(fourth.routes[0]).toMatchObject({ policy: "heuristic", hint: { source: "none" } });
     expect(fourth.directives).toHaveLength(0);
+    // Message 3 (`/model auto` alone) ran no turn, so it has no assistant
+    // reply: replaying it would put two user messages side by side with the
+    // raw token in the model's context. It is persisted, but not replayed.
+    expect(roles(fast4.requests[0])).toEqual(["user", "assistant", "user", "assistant", "user"]);
+    expect(allText(fast4.requests[0])).not.toContain("/model");
+    expect(fast4.requests[0]?.messages[0]?.content).toBe("hello");
+    expect(userText(fast4.requests[0])).toBe("and 4+4?");
+    const userLines = sessionLines(first.sessionId).filter((l) => l.kind === "user_message");
+    expect(userLines.map((l) => l.payload?.["content"])).toEqual([
+      "/model $strong hello",
+      "and 3+3?",
+      "/model auto",
+      "and 4+4?",
+    ]);
   });
 
   test("a non-roster target is refused with the roster listed; the turn runs on the rest", async () => {
@@ -491,6 +611,91 @@ describe("rules + eligibility — the durable route line (§7.2.2, §7.11, §8.1
   });
 });
 
+describe("forced lane — the degrade rung passes the N1 check (§7.11, §7.12)", () => {
+  test("a vision-less degrade rung under an image transcript gives way to the cheapest eligible roster arm", async () => {
+    // Roster: sonnet (cheap) + opus (strong); the degrade rung is haiku, OFF
+    // the roster and declared vision-less. First turn → opus (2250 micros)
+    // breaches the 2000 cap after its tool_use call; the per-model-call gate
+    // latches the degrade for call 2. The transcript carries an image, so
+    // the rung would 400 — the forced lane serves the cheapest eligible
+    // roster arm instead and the route line says why.
+    const SONNET = "claude-sonnet-4-6";
+    const cheap = textAdapter("sonnet");
+    const strong = toolLoopAdapter(["tool", "text"], "opus");
+    const rung = textAdapter("haiku", { ...FULL, vision: false });
+    const runContext = createRunContext();
+    const events: TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => events.push(e));
+    const stderr = captureStderr();
+    let text: string;
+    try {
+      text = await runChatLoop({
+        model: STRONG,
+        instructions: "test harness",
+        _adapter: strong,
+        modelPool: {
+          candidates: [
+            { model: SONNET, tags: ["cheap"] },
+            { model: STRONG, tags: ["strong"] },
+          ],
+          policy: "heuristic",
+        },
+        _poolAdapters: new Map<string, ProviderAdapter>([
+          [SONNET, cheap],
+          [STRONG, strong],
+        ]),
+        _scoreboard: openScoreboard(mkdtempSync(join(tmpdir(), "crewhaus-directives-sb-"))),
+        _budgetDegradeAdapter: rung,
+        budget: { usdMicros: 2000, onExceed: { kind: "degrade", model: FAST } },
+        tools: [noopTool()],
+        runContext,
+        singleTurn: true,
+        seedMessages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "what is this?" },
+              {
+                type: "image",
+                source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" },
+              },
+            ],
+          },
+        ],
+        permissionMode: "bypass",
+        installSigintHandler: false,
+        spinner: false,
+        stdout: () => {},
+        settingsDir: null,
+      });
+    } finally {
+      stderr.restore();
+    }
+    expect(text).toBe("sonnet");
+    expect(strong.requests).toHaveLength(1);
+    expect(cheap.requests).toHaveLength(1);
+    expect(rung.requests).toHaveLength(0);
+    const routes = events.filter((e): e is ModelRouteEvent => e.kind === "model_route");
+    expect(routes.map((r) => [r.model, r.policy])).toEqual([
+      [STRONG, "heuristic"],
+      [SONNET, "forced"],
+    ]);
+    expect(routes[1]).toMatchObject({
+      hint: {
+        source: "forced",
+        forcedArm: SONNET,
+        evidence: `lane=budget, reason=budget_degrade, ineligible=${FAST}, served=${SONNET}`,
+      },
+    });
+    expect(routes[1]?.reason).toContain("budget_degrade");
+    expect(routes[1]?.reason).toContain(
+      `forced budget arm "${FAST}" ineligible this turn (requires:vision); served ${SONNET} instead`,
+    );
+    expect(routes[1]?.reason).not.toContain("no-eligible-candidate");
+    expect(stderr.lines().some((l) => l.includes(`restricting model_pool to ${FAST}`))).toBe(true);
+  });
+});
+
 describe("classifier — policy: classifier (§7.2.3)", () => {
   const CLASSIFIER: Pool["classifier"] = {
     model: FAST,
@@ -529,6 +734,44 @@ describe("classifier — policy: classifier (§7.2.3)", () => {
       policy: "classifier",
       classifierVerdict: { label: "cheap" },
     });
+  });
+
+  test("the classifier runs ONCE per turn: a tool loop's inner model calls reuse the verdict, persisted on every route line", async () => {
+    const fast = toolLoopAdapter(["tool", "text"], "fast");
+    const strong = textAdapter("strong");
+    let calls = 0;
+    const r = await singleTurn(
+      fast,
+      strong,
+      { policy: "classifier", classifier: CLASSIFIER },
+      [{ role: "user", content: "what time is it?" }],
+      {
+        tools: [noopTool()],
+        routeClassifier: async () => {
+          calls += 1;
+          return { label: "cheap", model: FAST, costUsdMicros: 7 };
+        },
+      },
+    );
+    expect(r.text).toBe("fast");
+    expect(fast.requests).toHaveLength(2);
+    expect(strong.requests).toHaveLength(0);
+    expect(calls).toBe(1);
+    expect(r.routes).toHaveLength(2);
+    for (const route of r.routes) {
+      expect(route).toMatchObject({
+        policy: "classifier",
+        model: FAST,
+        classifierVerdict: { label: "cheap", model: FAST, costUsdMicros: 7 },
+      });
+    }
+    const lines = sessionLines(r.sessionId).filter((l) => l.kind === "model_route");
+    expect(lines).toHaveLength(2);
+    expect(
+      lines.every(
+        (l) => (l.payload?.["classifierVerdict"] as { label?: string })?.label === "cheap",
+      ),
+    ).toBe(true);
   });
 
   test("a failing classifier falls back to heuristic with reason `classifier failed`", async () => {

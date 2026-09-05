@@ -15,7 +15,12 @@
  *      `requires` / breaker state / `enabled` / remaining per-profile cost
  *      cap → `eligible[]`, persisted;
  *   2. forced — a budget degrade or the escalation latch names the arm
- *      (substituted by the loop; the hint records the lane);
+ *      (substituted by the loop; the hint records the lane). The forced arm
+ *      is run through the SAME requirement check: an ineligible degrade rung
+ *      gives way to the cheapest eligible roster arm, an ineligible
+ *      escalation target to the strongest eligible one (§7.11: ineligible
+ *      rather than a request-time error), and when nothing eligible remains
+ *      the forced arm stands with `no-eligible-candidate` recorded;
  *   3. directive — the session's `/model` pin, when it is on the roster AND
  *      eligible this turn (an ineligible pin is noted and skipped);
  *   4. rules — first-match `model_pool.rules[]`; `use: <tag|arm>` forces that
@@ -50,6 +55,7 @@ import {
   eligibleCandidates,
   evaluateRules,
   resolveDirectiveTarget,
+  strongestArm,
 } from "@crewhaus/model-plan";
 
 // ---------------------------------------------------------------------------
@@ -139,6 +145,12 @@ export type PreRouteArm = EligibilityCandidate & {
 export type PreRouteForced = {
   /** The forced arm's id when it is on the roster (a non-roster degrade rung has none). */
   readonly armId?: string;
+  /**
+   * The eligibility inputs of a degrade rung that sits OFF the roster (a
+   * roster arm is checked through `roster`). Absent → the rung's
+   * eligibility is unknown and it is served as-is.
+   */
+  readonly candidate?: EligibilityCandidate;
   readonly lane: "budget" | "escalation";
   readonly reason: string;
 };
@@ -188,6 +200,18 @@ export type PreRouteResult = {
   readonly skippedRules: readonly RuleSkip[];
   readonly classifierVerdict?: PreRouteClassifierVerdict;
   /**
+   * Set when the forced lane's arm was INELIGIBLE this turn (§7.11): `served`
+   * names the eligible roster arm substituted for it — the cheapest for a
+   * budget degrade, the strongest for an escalation — and is absent when no
+   * eligible arm remained (the loop then keeps the forced arm, records
+   * `no-eligible-candidate` and warns).
+   */
+  readonly forcedIneligible?: {
+    readonly armId: string;
+    readonly reason: string;
+    readonly served?: string;
+  };
+  /**
    * Human-readable notes for the decision's `reason` — a pin that sat out,
    * a rule whose target was ineligible, a classifier failure. Never user text.
    */
@@ -220,15 +244,70 @@ export async function preRoute(ctx: PreRouteContext): Promise<PreRouteResult> {
   const excludedArms = (): { readonly excludedArms?: readonly string[] } =>
     excluded.length > 0 ? { excludedArms: excluded.map((e) => e.armId) } : {};
 
-  // 1. forced — first, so nothing below can disarm a safety lane.
+  // 1. forced — first, so nothing below can disarm a safety lane. The forced
+  //    arm still passes the N1 requirement check: a rung that cannot take
+  //    the turn's images (or its transcript, or its tools) would 400, so an
+  //    ineligible one gives way to an eligible roster arm — the cheapest for
+  //    the budget lane (the breach still wants the least spend), the
+  //    strongest for the escalation lane. With nothing eligible the forced
+  //    arm stands and the loop records `no-eligible-candidate`.
   if (ctx.forced !== undefined) {
-    return done({
-      source: "forced",
-      ...(ctx.forced.armId !== undefined ? { forcedArm: ctx.forced.armId } : {}),
-      ...excludedArms(),
-      eligible,
-      evidence: { lane: ctx.forced.lane, reason: ctx.forced.reason },
-    });
+    const forced = ctx.forced;
+    const forcedArmId = forced.armId ?? forced.candidate?.armId;
+    const evidence = { lane: forced.lane, reason: forced.reason };
+    const forcedReason: string | undefined =
+      forced.armId !== undefined
+        ? onRoster(forced.armId) && !isEligible(forced.armId)
+          ? exclusionOf(forced.armId)
+          : undefined
+        : forced.candidate !== undefined
+          ? eligibleCandidates([forced.candidate], ctx.turn).excluded[0]?.reason
+          : undefined;
+    if (forcedReason === undefined || forcedArmId === undefined) {
+      return done({
+        source: "forced",
+        ...(forced.armId !== undefined ? { forcedArm: forced.armId } : {}),
+        ...excludedArms(),
+        eligible,
+        evidence,
+      });
+    }
+    const served =
+      forced.lane === "budget"
+        ? cheapestEligible({ eligible, excluded: [] }, ctx.roster)
+        : strongestArm(
+            ctx.roster.filter((a) => eligible.includes(a.armId)),
+            ctx.strongTag,
+          )?.armId;
+    notes.push(
+      `forced ${forced.lane} arm "${forcedArmId}" ineligible this turn (${forcedReason})${
+        served !== undefined ? `; served ${served} instead` : ""
+      }`,
+    );
+    return done(
+      {
+        source: "forced",
+        ...(served !== undefined
+          ? { forcedArm: served }
+          : forced.armId !== undefined
+            ? { forcedArm: forced.armId }
+            : {}),
+        ...excludedArms(),
+        eligible,
+        evidence: {
+          ...evidence,
+          ineligible: forcedArmId,
+          ...(served !== undefined ? { served } : {}),
+        },
+      },
+      {
+        forcedIneligible: {
+          armId: forcedArmId,
+          reason: forcedReason,
+          ...(served !== undefined ? { served } : {}),
+        },
+      },
+    );
   }
 
   // 2. directive — the session pin, when it is on the roster and eligible.

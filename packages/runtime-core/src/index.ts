@@ -67,6 +67,7 @@ import {
   deriveSignalRecord,
   parseModelDirective,
   planFingerprint,
+  stripDirectiveToken,
   toolConfigFor,
 } from "@crewhaus/model-plan";
 import {
@@ -966,11 +967,25 @@ export async function replayMessageHistory(log: EventLog): Promise<Anthropic.Mes
       const p = ev.payload as {
         content: Anthropic.MessageParam["content"];
         synthetic?: boolean;
+        directive?: boolean;
       };
       // 0.6.0 §7.2.1 — honour the logged `synthetic: true` flag on replay so
       // a resumed transcript's runtime-injected user messages stay marked
       // (the rules and the classifier read only HUMAN text).
-      const replayed: Anthropic.MessageParam = { role: "user", content: p.content };
+      let replayed: Anthropic.MessageParam = { role: "user", content: p.content };
+      if (p.directive === true) {
+        // §7.2.1 — the persisted line keeps the `/model …` token; the REQUEST
+        // copy never carries it, on the first turn or on any resumed one. A
+        // directive-only input ran no turn (the acknowledgement was the reply,
+        // no assistant message follows), so replaying it would leave two
+        // adjacent user messages — it is dropped from the request copy.
+        const rest = stripDirectiveToken(messageText(replayed));
+        const hasOtherBlocks =
+          typeof replayed.content !== "string" &&
+          replayed.content.some((block) => block.type !== "text");
+        if (rest.length === 0 && !hasOtherBlocks) continue;
+        replayed = stripDirectiveFromMessage(replayed, rest);
+      }
       messages.push(p.synthetic === true ? markSynthetic(replayed) : replayed);
     } else if (ev.kind === "assistant_message") {
       const p = ev.payload as { content: Anthropic.MessageParam["content"] };
@@ -5804,6 +5819,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // 0.6.0 §7.2.4 — the model's own `Escalate` request, once consumed: the
     // latch above is armed and the decision below names its target + receipt.
     let selfEscalation: HybridEscalationRequest | undefined;
+    // 0.6.0 §7.2.3 — the classifier is budgeted as ONE model call per TURN:
+    // every inner model call of a tool loop re-runs `preRoute` over the same
+    // human message, so the verdict is memoised on that message object for
+    // the rest of the turn (a new turn, or a new human message, classifies
+    // afresh). Persisted on every route line either way.
+    let turnClassifierVerdict:
+      | {
+          readonly message: Anthropic.MessageParam | undefined;
+          readonly verdict: PreRouteClassifierVerdict;
+        }
+      | undefined;
 
     while (state.kind !== "Done") {
       if (turnAbort.signal.aborted) {
@@ -5987,7 +6013,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // override-folded) features, the declared or table-known
               // context window / output cap, its own `requires`, and the
               // per-profile cost cap against what this run has spent on it.
-              const preRouteArms: PreRouteArm[] = roster.map((c) => {
+              const preRouteArmOf = (c: PoolCandidate): PreRouteArm => {
                 const plan = planFor(c);
                 const cfg = poolCandidateConfigs.get(c);
                 const table = resolveCapabilities(
@@ -6015,12 +6041,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                       }
                     : {}),
                 };
-              });
+              };
+              const preRouteArms: PreRouteArm[] = roster.map(preRouteArmOf);
               // The forced lane (§7.12 / §7.2.4) — a budget degrade restricts
               // the pool to its rung for the rest of the turn it fired in
               // (outranking the escalation latch: escalating to the strongest
               // would defeat the cap); the escalation latch — a prior pool
-              // failure or the model's own `Escalate` — names its target.
+              // failure or the model's own `Escalate` — names its target. An
+              // off-roster rung hands `preRoute` its own eligibility inputs so
+              // the N1 check covers it too (§7.11).
               const escalationTarget: PoolCandidate | undefined = escalatePool
                 ? ((selfEscalation !== undefined
                     ? roster.find((c) => c.modelString === selfEscalation?.target.modelString)
@@ -6031,7 +6060,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   ? {
                       ...(roster.includes(budgetDegradeRung)
                         ? { armId: armIdOf(budgetDegradeRung) }
-                        : {}),
+                        : { candidate: preRouteArmOf(budgetDegradeRung) }),
                       lane: "budget",
                       reason: "budget_degrade",
                     }
@@ -6067,6 +6096,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 ...(pool?.policy === "classifier" && routeClassifier !== undefined
                   ? {
                       classifier: async (): Promise<PreRouteClassifierVerdict> => {
+                        // Once per turn: a later inner call of the same turn
+                        // (a tool iteration) reuses the verdict for the same
+                        // human message instead of re-classifying it.
+                        if (
+                          turnClassifierVerdict !== undefined &&
+                          turnClassifierVerdict.message === humanMessage
+                        ) {
+                          return turnClassifierVerdict.verdict;
+                        }
                         // The classifier is its own metered model call: it
                         // takes the run's model-call limiter like the main
                         // call (§7.2.3) and publishes on the run bus under
@@ -6078,12 +6116,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                         ) {
                           await opts.rateLimiter.acquire(opts.rateLimitKeys, 1);
                         }
-                        return routeClassifier({
+                        const verdict = await routeClassifier({
                           userText: humanText ?? "",
                           labels: classifierLabels,
                           bus,
                           signal: turnAbort.signal,
                         });
+                        turnClassifierVerdict = { message: humanMessage, verdict };
+                        return verdict;
                       },
                       classifierLabels,
                     }
@@ -6107,7 +6147,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // The loop substitutes the forced lanes itself (the degrade rung
               // may sit outside the roster); everything else the router
               // already applied from the hint. The band (`routeKey`) is kept
-              // so the arm is still keyed on the turn's difficulty.
+              // so the arm is still keyed on the turn's difficulty. When
+              // `preRoute` found the forced arm ineligible, its result names
+              // the eligible roster arm served in its place (§7.11).
+              const forcedCandidate: PoolCandidate | undefined =
+                forced === undefined
+                  ? undefined
+                  : ((pre.forcedIneligible?.served !== undefined
+                      ? roster.find((c) => armIdOf(c) === pre.forcedIneligible?.served)
+                      : undefined) ??
+                    (forced.lane === "budget" ? budgetDegradeRung : escalationTarget));
               let decision: {
                 readonly candidate: PoolCandidate;
                 readonly routeKey: string;
@@ -6115,18 +6164,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 readonly policy: PolicyDecisionPolicy;
                 readonly explored: boolean;
               } =
-                budgetDegraded && budgetDegradeRung !== undefined
+                forced?.lane === "budget" && forcedCandidate !== undefined
                   ? {
                       ...base,
-                      candidate: budgetDegradeRung,
+                      candidate: forcedCandidate,
                       reason: "budget_degrade",
                       policy: "forced" as const,
                       explored: false,
                     }
-                  : escalationTarget !== undefined
+                  : forced?.lane === "escalation" && forcedCandidate !== undefined
                     ? {
                         ...base,
-                        candidate: escalationTarget,
+                        candidate: forcedCandidate,
                         policy: "escalation" as const,
                         reason:
                           selfEscalation !== undefined
@@ -6137,10 +6186,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                     : base;
               // §7.13 — an empty eligible set: the pick stands, the reason
               // says so, and a warning fires (the primary is always the
-              // router's fallback here, so the run never halts on it).
+              // router's fallback here, so the run never halts on it). Under
+              // a forced lane the same applies when the forced arm itself is
+              // ineligible and no eligible arm remained to serve instead.
               const exclusionNotes = pre.excluded.map((e) => `${e.armId} ineligible (${e.reason})`);
               const reasonNotes = [...pre.notes, ...exclusionNotes];
-              if (pre.eligible.length === 0 && forced === undefined) {
+              const nothingEligible =
+                forced === undefined
+                  ? pre.eligible.length === 0
+                  : pre.forcedIneligible !== undefined && pre.forcedIneligible.served === undefined;
+              if (nothingEligible) {
                 reasonNotes.push(`no-eligible-candidate (served ${armIdOf(decision.candidate)})`);
                 runContext.logger.warn("model_pool: no eligible candidate for this turn", {
                   picked: armIdOf(decision.candidate),

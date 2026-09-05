@@ -142,6 +142,122 @@ describe("preRoute — lane order (§7.2)", () => {
   });
 });
 
+describe("preRoute — the forced arm passes the N1 check too (§7.11)", () => {
+  const STRONG_BLIND: PreRouteArm = {
+    ...STRONG,
+    capabilities: { features: BLIND, contextWindow: 200_000 },
+  };
+
+  test("an ineligible escalation target gives way to the strongest ELIGIBLE roster arm", async () => {
+    const r = await preRoute(
+      ctx({
+        roster: [FAST, MID, STRONG_BLIND],
+        forced: { armId: "strong", lane: "escalation", reason: "pool failure" },
+        turn: { hasImages: true },
+        pin: "fast",
+      }),
+    );
+    expect(r.hint).toEqual({
+      source: "forced",
+      forcedArm: "mid",
+      excludedArms: ["fast", "strong"],
+      eligible: ["mid"],
+      evidence: { lane: "escalation", reason: "pool failure", ineligible: "strong", served: "mid" },
+    });
+    expect(r.forcedIneligible).toEqual({
+      armId: "strong",
+      reason: "requires:vision",
+      served: "mid",
+    });
+    expect(r.notes).toEqual([
+      'forced escalation arm "strong" ineligible this turn (requires:vision); served mid instead',
+    ]);
+  });
+
+  test("an ineligible degrade rung — on or off the roster — gives way to the cheapest eligible arm; an eligible off-roster rung stands", async () => {
+    const onRoster = await preRoute(
+      ctx({
+        forced: { armId: "fast", lane: "budget", reason: "budget_degrade" },
+        turn: { hasImages: true },
+      }),
+    );
+    expect(onRoster.hint).toMatchObject({ source: "forced", forcedArm: "mid" });
+    expect(onRoster.forcedIneligible).toEqual({
+      armId: "fast",
+      reason: "requires:vision",
+      served: "mid",
+    });
+    expect(onRoster.notes[0]).toContain('forced budget arm "fast" ineligible this turn');
+
+    const offRoster = await preRoute(
+      ctx({
+        forced: {
+          candidate: { armId: "claude-haiku-4-5", capabilities: { features: BLIND } },
+          lane: "budget",
+          reason: "budget_degrade",
+        },
+        turn: { hasImages: true },
+      }),
+    );
+    expect(offRoster.hint).toMatchObject({
+      source: "forced",
+      forcedArm: "mid",
+      evidence: { ineligible: "claude-haiku-4-5", served: "mid" },
+    });
+    expect(offRoster.forcedIneligible).toEqual({
+      armId: "claude-haiku-4-5",
+      reason: "requires:vision",
+      served: "mid",
+    });
+
+    // A rung that CAN take the turn is served as before (no forcedArm — the
+    // loop substitutes the off-roster candidate itself).
+    const eligibleRung = await preRoute(
+      ctx({
+        forced: {
+          candidate: { armId: "rung", capabilities: { features: FULL } },
+          lane: "budget",
+          reason: "budget_degrade",
+        },
+        turn: { hasImages: true },
+      }),
+    );
+    expect(eligibleRung.hint.forcedArm).toBeUndefined();
+    expect(eligibleRung.forcedIneligible).toBeUndefined();
+    expect(eligibleRung.notes).toEqual([]);
+  });
+
+  test("nothing eligible: the forced arm stands, `served` is absent (the loop records no-eligible-candidate)", async () => {
+    const onRoster = await preRoute(
+      ctx({
+        roster: [FAST],
+        forced: { armId: "fast", lane: "budget", reason: "budget_degrade" },
+        turn: { hasImages: true },
+      }),
+    );
+    expect(onRoster.eligible).toEqual([]);
+    expect(onRoster.hint).toMatchObject({ source: "forced", forcedArm: "fast" });
+    expect(onRoster.forcedIneligible).toEqual({ armId: "fast", reason: "requires:vision" });
+    expect(onRoster.notes[0]).toBe(
+      'forced budget arm "fast" ineligible this turn (requires:vision)',
+    );
+
+    const offRoster = await preRoute(
+      ctx({
+        roster: [FAST],
+        forced: {
+          candidate: { armId: "rung", capabilities: { features: BLIND } },
+          lane: "escalation",
+          reason: "pool failure",
+        },
+        turn: { hasImages: true },
+      }),
+    );
+    expect(offRoster.hint.forcedArm).toBeUndefined();
+    expect(offRoster.forcedIneligible).toEqual({ armId: "rung", reason: "requires:vision" });
+  });
+});
+
 describe("preRoute — rules (§7.2.2)", () => {
   test("first match wins; a tag target resolves to the first arm carrying it; the ruleId is persisted", async () => {
     const r = await preRoute(
