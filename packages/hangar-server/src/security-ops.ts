@@ -1142,6 +1142,12 @@ const SLO_METRICS = [
   { key: "p95_latency_ms", field: "turnP95Seconds", scale: 1000, unit: "ms" },
   { key: "ttft_ms", field: "ttftP95Seconds", scale: 1000, unit: "ms" },
   { key: "cost_per_hour_usd", field: "costBurnUsdPerMin", scale: 60, unit: "usd/hour" },
+  // 0.6.0 (design §8.4) — the hybrid-routing rates: the spec keys landed in
+  // PR 19 beside PR 18's snapshot fields of the same name, so the SLO panel
+  // shows declared-vs-observed for them like any other target.
+  { key: "escalation_rate", field: "escalationRate", scale: 1, unit: "rate" },
+  { key: "judge_fail_rate", field: "judgeFailRate", scale: 1, unit: "rate" },
+  { key: "floor_block_rate", field: "floorBlockRate", scale: 1, unit: "rate" },
 ] as const;
 
 /** One threshold row: what was asked for, what was observed, and whether the

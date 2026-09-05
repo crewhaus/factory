@@ -2069,6 +2069,20 @@ const sloBlock = z
     cost_per_hour_usd: z.number().positive().optional(),
     /** Fractional egress-block rate ceiling (egress-blocked / external calls), e.g. 0.1. */
     egress_block_rate: z.number().min(0).max(1).optional(),
+    // ---- 0.6.0 (design §8.4) — hybrid-routing targets, each a 0..1 rate.
+    // The runtime `SloTargets` / alert watchdog gained them in PR 18; these
+    // are the spec keys that reach them (lowered by the compiler into
+    // `IrSlo`, passed through by `crewhaus run` as `sloTargets`). Same shape
+    // and validation as the existing rate targets. Like every other
+    // `observability.slo.*` key they are NOT in the optimizer whitelist: an
+    // SLO threshold decides when production is paused or rolled back, which
+    // is an operator's call, never an eval loop's.
+    /** Fractional escalation-rate ceiling (escalations / turns), e.g. 0.3. */
+    escalation_rate: z.number().min(0).max(1).optional(),
+    /** Fractional judge-fail-rate ceiling (failing verdicts / all in-loop + judge-gate verdicts), e.g. 0.5. */
+    judge_fail_rate: z.number().min(0).max(1).optional(),
+    /** Fractional floor-block-rate ceiling (floor-forced route decisions / all decisions), e.g. 0.2. */
+    floor_block_rate: z.number().min(0).max(1).optional(),
     /**
      * Rolling window (seconds) a breach must persist before the ladder fires.
      * A single blip never mitigates — the monitor only acts on a SUSTAINED
@@ -2092,7 +2106,10 @@ const sloBlock = z
       s.p95_latency_ms !== undefined ||
       s.ttft_ms !== undefined ||
       s.cost_per_hour_usd !== undefined ||
-      s.egress_block_rate !== undefined,
+      s.egress_block_rate !== undefined ||
+      s.escalation_rate !== undefined ||
+      s.judge_fail_rate !== undefined ||
+      s.floor_block_rate !== undefined,
     { message: "observability.slo must declare at least one target threshold" },
   );
 

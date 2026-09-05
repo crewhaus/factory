@@ -1140,6 +1140,15 @@ export type IrSlo = {
   readonly ttftMs?: number;
   readonly costPerHourUsd?: number;
   readonly egressBlockRate?: number;
+  // ---- 0.6.0 (design §8.4) — hybrid-routing targets, each a 0..1 rate,
+  // mirrored 1:1 by the runtime `SloTargets` (PR 18) so the CLI passes the
+  // lowered block through unchanged. Absent when the spec omits them.
+  /** Escalations per turn (spec `escalation_rate`). */
+  readonly escalationRate?: number;
+  /** Failing in-loop grades + judge-gate verdicts over all of them (spec `judge_fail_rate`). */
+  readonly judgeFailRate?: number;
+  /** Route decisions the quality floor forced onto the floor arm, over all decisions (spec `floor_block_rate`). */
+  readonly floorBlockRate?: number;
   readonly windowMs?: number;
   readonly mitigation: ReadonlyArray<IrSloMitigation>;
 };
