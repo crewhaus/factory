@@ -55,6 +55,28 @@ export type RouteObservation = {
    * byte-identical rewards to today.
    */
   readonly quality?: number;
+  // ---- 0.6.0 §7.9 / §7.10 — the hybrid-strategy attribution a cascade turn
+  // stamps on its member-arm and strategy-arm lines. All optional and never
+  // read by `computeReward`: a plain observation is persisted exactly as
+  // before (a `v: 1` delta line); a line carrying any of these is `v: 2`.
+  /** The strategy stage that produced the call (`"draft"`, `"escalate"`, …). */
+  readonly stage?: string;
+  /** The `model_pool.strategy` member the observation belongs to (`"cascade"`, …). */
+  readonly strategy?: string;
+  /**
+   * Who the line is attributed to: `"draft"` / `"escalation"` for a member
+   * arm's own calls, `"strategy"` for the once-per-turn strategy-arm line
+   * (`strategy:<name>`) that folds the whole turn's wall time, spend and
+   * final quality.
+   */
+  readonly attributedTo?: string;
+  /**
+   * The cascade counterfactual on a REJECTED draft: did the draft score at
+   * least as well as the escalation the judge then graded? (`true` means the
+   * escalation bought nothing — the signal a cascade needs to learn its
+   * threshold.) Absent when the escalation was not graded.
+   */
+  readonly wouldPass?: boolean;
 };
 
 /** Weights over the reward's component terms. Missing terms default sensibly. */

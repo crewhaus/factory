@@ -843,6 +843,9 @@ function arm(routeKey: string, model: string, n: number, meanReward: number) {
     meanLatencyMs: 500,
     meanCostUsd: 0.01,
     costCount: n,
+    meanQuality: 0,
+    qualityCount: 0,
+    ungraded: 0,
   };
 }
 

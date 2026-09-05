@@ -11,15 +11,21 @@
  * `HONOURED` rows pin that: each parses, `compile()` succeeds, the key rides
  * the emitted pool blob, and no `model-plan-pending-runtime` warning names it.
  *
- * What is STILL refused (the `REFUSED` rows): `evaluation.on_fail: escalate`
- * and `judge.escalate_to` (PR 9c), `mcp_servers.<n>.tool_flags` (no PR-train
- * row for its IR + emit half yet), and a narrowing profile referenced from a
- * SINGLE-MODEL serving slot — the IR has no per-candidate plan carrier for a
- * slot that routes no pool, so accepting `models.fast: { tools: [] }` behind
- * `agent.model: $fast` would serve with the full toolset. Every refused row
- * still parses, `compile()` refuses it naming the path and the landing row,
- * and `lower()` with `allowRuntimePendingKeys` carries it into the IR with a
- * `model-plan-pending-runtime` warning. The landing PR deletes its row here.
+ * PR 9c landed the cascade, so `evaluation.on_fail: escalate` (with its
+ * lower-time-resolved `escalateTo`) and `judge.escalate_to` now COMPILE
+ * THROUGH too (the `CASCADE` rows): runtime-core's `runEvaluatedTurn` re-runs
+ * a failing turn on the escalation rung, and the workflow / graph retry
+ * closures force the `retry_previous` re-run onto `escalate_to`.
+ *
+ * What is STILL refused (the `REFUSED` rows): `mcp_servers.<n>.tool_flags` (no
+ * PR-train row for its IR + emit half yet), and a narrowing profile referenced
+ * from a SINGLE-MODEL serving slot — the IR has no per-candidate plan carrier
+ * for a slot that routes no pool, so accepting `models.fast: { tools: [] }`
+ * behind `agent.model: $fast` would serve with the full toolset. Every refused
+ * row still parses, `compile()` refuses it naming the path and the landing
+ * row, and `lower()` with `allowRuntimePendingKeys` carries it into the IR
+ * with a `model-plan-pending-runtime` warning. The landing PR deletes its row
+ * here.
  */
 import { describe, expect, test } from "bun:test";
 import { CompilerError } from "@crewhaus/errors";
@@ -214,8 +220,35 @@ const REFUSED: ReadonlyArray<readonly [string, string, RegExp, (json: string) =>
     /^models\.fast\.tools \(referenced from agent\.model\)/,
     (j) => j.includes('"modelProfile":"fast"'),
   ],
+];
+
+/** PR 9c — [row, spec, the IR probe, the emitted-bundle probe]: the cascade keys compile through. */
+const CASCADE: ReadonlyArray<
+  readonly [string, string, (json: string) => boolean, (bundle: string) => boolean]
+> = [
   [
-    "evaluation.on_fail: escalate",
+    "evaluation.on_fail: escalate with a declared cascade escalate_to (a tag)",
+    cli(
+      "  model_pool:",
+      "    candidates:",
+      "      - { model: claude-haiku-4-5, tags: [cheap] }",
+      "      - { model: claude-opus-4-8, tags: [strong] }",
+      "    strategy:",
+      "      cascade: { draft: cheap, escalate_to: strong, clean_prompt: true }",
+      "      max_escalations: 2",
+      "evaluation:",
+      "  grader: { type: llm_judge, criteria: helpful }",
+      "  on_fail: escalate",
+    ),
+    (j) => j.includes('"onFail":"escalate","maxRetries":1,"escalateTo":"strong"'),
+    (b) =>
+      b.includes('onFail: "escalate",') &&
+      b.includes('escalateTo: "strong",') &&
+      b.includes('"cascade":{"draft":"cheap","escalateTo":"strong","cleanPrompt":true}') &&
+      b.includes('"maxEscalations":2'),
+  ],
+  [
+    "evaluation.on_fail: escalate without a cascade defaults escalateTo to the strong-tagged candidate",
     cli(
       "  model_pool:",
       "    candidates:",
@@ -225,11 +258,32 @@ const REFUSED: ReadonlyArray<readonly [string, string, RegExp, (json: string) =>
       "  grader: { type: llm_judge, criteria: helpful }",
       "  on_fail: escalate",
     ),
-    /^evaluation\.on_fail: escalate/,
-    (j) => j.includes('"onFail":"escalate"'),
+    (j) => j.includes('"escalateTo":"strong"'),
+    (b) => b.includes('escalateTo: "strong",'),
   ],
   [
-    "steps[].judge.escalate_to (workflow)",
+    "evaluation.on_fail: escalate with no strong tag defaults escalateTo to the LAST candidate's arm id ($profile → its name)",
+    [
+      "name: hello",
+      "target: cli",
+      "models:",
+      "  big: { model: claude-opus-4-8 }",
+      "agent:",
+      "  model: claude-haiku-4-5",
+      "  instructions: i",
+      "  model_pool:",
+      "    candidates:",
+      "      - { model: claude-haiku-4-5, tags: [cheap] }",
+      "      - { model: $big, tags: [heavy] }",
+      "evaluation:",
+      "  grader: { type: llm_judge, criteria: helpful }",
+      "  on_fail: escalate",
+    ].join("\n"),
+    (j) => j.includes('"escalateTo":"big"'),
+    (b) => b.includes('escalateTo: "big",'),
+  ],
+  [
+    "steps[].judge.escalate_to (workflow) rides the IR and forces the retry closure",
     [
       "name: w",
       "target: workflow",
@@ -245,10 +299,57 @@ const REFUSED: ReadonlyArray<readonly [string, string, RegExp, (json: string) =>
       "    kind: judge",
       "    judge: { criteria: c, escalate_to: strong }",
     ].join("\n"),
-    /^steps\[1\]\.judge\.escalate_to/,
     (j) => j.includes('"escalateTo":"strong"'),
+    (b) =>
+      b.includes("const __runStep1 = async (__nudge: string, __force?: string)") &&
+      b.includes("...(__force !== undefined ? { forcedCandidate: __force } : {}),") &&
+      b.includes('+ __result.rationale, "strong");'),
   ],
 ];
+
+describe("0.6.0 PR 9c — the cascade keys compile through to the runtime", () => {
+  for (const [name, yaml, irProbe, bundleProbe] of CASCADE) {
+    test(`${name}: parses, compile() succeeds, nothing pends, the IR and bundle carry it`, () => {
+      expect(parseSpecIssues(yaml)).toEqual([]);
+      const result = compile(yaml);
+      expect(result.files.length).toBeGreaterThan(0);
+      expect(irProbe(JSON.stringify(lower(parseSpec(yaml))))).toBe(true);
+      const bundle = result.files.map((f) => f.content).join("\n");
+      expect(bundleProbe(bundle)).toBe(true);
+      const pending = result.warnings.filter(
+        (w) =>
+          w.code === "model-plan-pending-runtime" &&
+          (w.path.includes("on_fail") ||
+            w.path.includes("escalate_to") ||
+            w.path.includes("strategy.cascade") ||
+            w.path.includes("max_escalations") ||
+            w.path === "agent.model_pool.strategy"),
+      );
+      expect(pending).toEqual([]);
+    });
+  }
+
+  test("on_fail: retry | halt | note lower without an escalateTo and render byte-identically to the pre-cascade shape", () => {
+    for (const onFail of ["retry", "halt", "note"] as const) {
+      const yaml = cli(
+        "  model_pool:",
+        "    candidates:",
+        "      - { model: claude-haiku-4-5, tags: [cheap] }",
+        "      - { model: claude-opus-4-8, tags: [strong] }",
+        "evaluation:",
+        "  grader: { type: llm_judge, criteria: helpful }",
+        `  on_fail: ${onFail}`,
+      );
+      const ir = lower(parseSpec(yaml));
+      if (ir.target !== "cli") throw new Error("unexpected target");
+      expect(ir.evaluation?.escalateTo).toBeUndefined();
+      expect("escalateTo" in (ir.evaluation ?? {})).toBe(false);
+      const agentTs = compile(yaml).files.find((f) => f.path === "agent.ts")?.content ?? "";
+      expect(agentTs).toContain(`onFail: "${onFail}",\n  maxRetries: 1,\n  evaluate:`);
+      expect(agentTs).not.toContain("escalateTo");
+    }
+  });
+});
 
 describe("0.6.0 PR 9a — a pool candidate's narrowing knobs compile through to the plan table", () => {
   for (const [name, yaml, probe, emitted] of HONOURED) {

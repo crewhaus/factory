@@ -41,6 +41,9 @@ export {
   judgeCategorical,
   createJudgeGrader,
   meteredJudgeCall,
+  // 0.6.0 §7.3 (PR 9c) — the draft-verify acceptor: a strong model returning
+  // `{ok, edits}` for a cheaper model's draft.
+  verifyDraft,
   DEFAULT_JUDGE_MODEL,
   PANEL_NEEDS_REVIEW_ENTROPY,
   normalizedVoteEntropy,
@@ -57,6 +60,8 @@ export type {
   // on every judge call, and the priced `usage` on every verdict.
   JudgeBusOptions,
   JudgeCallUsage,
+  VerifyDraftOptions,
+  VerifyDraftResult,
 } from "./judge";
 // 0.6.0 §7.2.3 — the `policy: classifier` route classifier: an enum-
 // constrained forced-tool call metered with `role: "classifier"`.
@@ -80,6 +85,7 @@ export { JudgeError } from "./errors";
 export {
   buildCategoricalJudgePrompt,
   buildJudgePrompt,
+  buildVerifyPrompt,
   type JudgeTarget,
   type PromptParts,
 } from "./prompt-template";
