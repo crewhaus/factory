@@ -188,8 +188,10 @@ describe("$profile on the serving agent slot (agent-full)", () => {
     if (ir.target !== "cli") throw new Error("unexpected target");
     expect(ir.agent.temperature).toBe(0.7);
     expect(ir.agent.maxTokens).toBe(512);
+    // PR 9a — the runtime request build applies the slot temperature, so it
+    // no longer pends (nothing else on this spec does either).
     const pending = warnings.filter((w) => w.code === "model-plan-pending-runtime");
-    expect(pending.map((w) => w.path)).toEqual(["agent.temperature"]);
+    expect(pending).toEqual([]);
   });
 
   test("the profile's failover chain is ignored (field-precise) when the slot routes itself", () => {
@@ -229,7 +231,10 @@ describe("$profile on the serving agent slot (agent-full)", () => {
     ]);
     for (const w of warnings) {
       expect(w.code).toBe("model-plan-pending-runtime");
-      expect(w.message).toContain("PR 9a");
+      // PR 9a honours these on a POOL CANDIDATE; a single-model serving slot
+      // has no per-candidate plan carrier in the IR yet.
+      expect(w.message).toContain("single-model serving slot");
+      expect(w.message).toContain("model_pool candidate");
     }
   });
 
@@ -650,12 +655,13 @@ describe("$profile / sentinels on every auxiliary slot (the six that bypassed re
     expect(mid).toEqual({ model: "claude-sonnet-4-6", tags: ["mid"], enabled: false });
     // The un-pooled sibling role is untouched.
     expect(ir.roles.find((r) => r.name === "helper")?.modelPool).toBeUndefined();
-    // Per-candidate settings are reported pending the plan table, per role path.
+    // PR 9a — the per-candidate settings the plan table honours lower
+    // silently; only the candidate's failover chain / breaker (PR 10) pend.
     const pending = warnings.filter((w) => w.code === "model-plan-pending-runtime");
-    expect(pending.map((w) => w.path)).toContain("roles.lead.model_pool.candidates[1].max_tokens");
-    expect(pending.map((w) => w.path)).toContain(
-      "roles.lead.model_pool.candidates[0].instructions",
-    );
+    expect(pending.map((w) => w.path)).toEqual([
+      "roles.lead.model_pool.candidates[0].fallbacks",
+      "roles.lead.model_pool.candidates[0].circuit_breaker",
+    ]);
 
     // The role literal carries the widened pool verbatim (what the
     // orchestrator's RoleModelPool accepts) — and no `$` reaches the bundle.
@@ -698,9 +704,9 @@ describe("$profile / sentinels on every auxiliary slot (the six that bypassed re
     const scoped = compile([...plain, "      scope: lead-arms"].join("\n"), opts);
     const scopedTs = scoped.files.find((f) => f.path === "agent_lead.ts")?.content ?? "";
     expect(scopedTs).toContain('"policy":"heuristic","scope":"lead-arms"}');
-    expect(scoped.warnings.map((w) => [w.code, w.path])).toEqual([
-      ["model-plan-pending-runtime", "roles.lead.model_pool.scope"],
-    ]);
+    // PR 9a consumes `scope` (stamped on `model_route.scope`), so a declared
+    // scope no longer pends.
+    expect(scoped.warnings).toEqual([]);
   });
 });
 
@@ -959,17 +965,13 @@ describe("model_pool candidates carry the merged profile (key order is the byte 
       thinking: { budgetTokens: 4096 },
     });
     expect(mid).toEqual({ model: "claude-sonnet-4-6", tags: ["mid"], enabled: false });
-    // Every carried per-candidate setting is reported pending the plan table.
+    // PR 9a — the plan table honours thinking / max_tokens / limits /
+    // instructions / caching per candidate, so only the per-candidate
+    // failover chain and breaker (PR 10) are still reported pending.
     const pending = warnings.filter((w) => w.code === "model-plan-pending-runtime");
     expect(pending.map((w) => w.path)).toEqual([
-      "agent.model_pool.candidates[0].thinking",
-      "agent.model_pool.candidates[0].max_tokens",
-      "agent.model_pool.candidates[0].limits.model_call_timeout_ms",
-      "agent.model_pool.candidates[0].instructions",
-      "agent.model_pool.candidates[0].caching",
       "agent.model_pool.candidates[0].fallbacks",
       "agent.model_pool.candidates[0].circuit_breaker",
-      "agent.model_pool.candidates[1].thinking",
     ]);
     // The compiled blob carries it all — every emitter writes the pool verbatim.
     const agentTs =
@@ -1068,26 +1070,22 @@ describe("model_pool candidates carry the merged profile (key order is the byte 
     const pendingPaths = warnings
       .filter((w) => w.code === "model-plan-pending-runtime")
       .map((w) => w.path);
-    for (const key of [
-      "policy",
-      "directives",
-      "rules",
-      "classifier",
-      "strategy",
-      "reward",
-      "scope",
-    ]) {
+    for (const key of ["policy", "directives", "rules", "classifier", "strategy", "reward"]) {
       expect(pendingPaths).toContain(`agent.model_pool.${key}`);
     }
+    // PR 9a consumes `scope` (stamped on `model_route.scope`): never pending.
+    expect(pendingPaths).not.toContain("agent.model_pool.scope");
     // PR 8b landed the interpreter half of model_directed; the warning is
-    // scoped to compiled targets until every emitter's boot block calls
-    // wireModels (PR 9a) — it must not claim "the runtime" ignores the key.
+    // scoped to compiled targets until the emitters gain a boot-time
+    // wireModels call (a later row — bundles cannot import model-service,
+    // which depends on runtime-core) — it must not claim "the runtime"
+    // ignores the key.
     const directedWarning = warnings.find(
       (w) => w.path === "agent.model_pool.strategy.model_directed",
     )?.message;
     expect(directedWarning).toContain("crewhaus run / serve interpreter");
     expect(directedWarning).toContain("compiled bundle does not register the tools yet");
-    expect(directedWarning).toContain("PR 9a");
+    expect(directedWarning).toContain("wireModels");
     expect(directedWarning).not.toContain("the runtime does not honour it");
     const agentTs = compile(yaml, opts).files.find((f) => f.path === "agent.ts")?.content ?? "";
     expect(agentTs).toContain('"policy":"classifier"');

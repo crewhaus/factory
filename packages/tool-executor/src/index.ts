@@ -1,5 +1,5 @@
 import { CrewhausError, isRunFailedError } from "@crewhaus/errors";
-import type { RegisteredTool, ToolExecuteResult } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteModel, ToolExecuteResult } from "@crewhaus/tool-catalog";
 import { compilePattern, matchesPattern } from "@crewhaus/tool-permission-matcher";
 import { validateToolInput } from "@crewhaus/tool-validate";
 
@@ -33,6 +33,14 @@ export type ExecutionContext = {
    * bus as `tool_stream_chunk` events.
    */
   readonly onStreamChunk?: (stream: "stdout" | "stderr", chunk: string) => void;
+  /**
+   * 0.6.0 §4.4 — the serving model (pool runs only) and this tool's
+   * per-candidate `tool_config` override, forwarded verbatim into the tool's
+   * `ToolExecuteContext.model` / `.toolConfig`. Both presence-gated: a call
+   * without them hands the tool the exact pre-0.6.0 context.
+   */
+  readonly model?: ToolExecuteModel;
+  readonly toolConfig?: unknown;
 };
 
 export class ToolPermissionError extends CrewhausError {
@@ -73,6 +81,8 @@ export async function executeTool(
       signal: context.signal,
       ...(context.bridge !== undefined ? { bridge: context.bridge } : {}),
       ...(context.onStreamChunk !== undefined ? { onStreamChunk: context.onStreamChunk } : {}),
+      ...(context.model !== undefined ? { model: context.model } : {}),
+      ...(context.toolConfig !== undefined ? { toolConfig: context.toolConfig } : {}),
     });
     return { toolUseId, content, isError: false };
   } catch (err) {

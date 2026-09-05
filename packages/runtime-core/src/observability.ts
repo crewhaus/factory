@@ -526,7 +526,7 @@ const CLEAN_STOP_REASONS = new Set(["end_turn", "tool_use", "stop_sequence"]);
  * `event-log` append path the run already writes its transcript with:
  *
  *   error_recovered      → `recovery`   { errorName, action, depth }
- *   tool_call_end        → `tool_stats` { toolName, durationMs, isError }
+ *   tool_call_end        → `tool_stats` { toolName, durationMs, isError, profile? }
  *   permission_decision  → `permission` { toolName, decision, askOutcome }
  *   model_response       → `model_meta` { stopReason, model, role?, profile?,
  *                                         usage, durationMs, turnNumber }
@@ -607,6 +607,9 @@ export function attachAdvisorPersistence(
           // without adding advisory signal.
           durationMs: Math.round(event.durationMs),
           isError: event.isError,
+          // 0.6.0 §5.6 — the serving profile, so `tools audit` can group
+          // failures by profile; absent (byte-identical) on a single-model run.
+          ...(event.profile !== undefined ? { profile: event.profile } : {}),
         });
         return;
       }

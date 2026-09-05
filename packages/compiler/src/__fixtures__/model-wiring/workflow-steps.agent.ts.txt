@@ -58,7 +58,7 @@ async function main(): Promise<void> {
     singleTurn: true,
     seedMessages: [{ role: "user", content: stdinInput || "begin" }],
     tools: __skillTool ? [__skillTool] : [],
-    modelPool: {"candidates":[{"model":"claude-haiku-4-5","tags":["cheap"]},{"model":"claude-opus-4-8","tags":["strong"]}],"policy":"heuristic"},
+    modelPool: {"candidates":[{"model":"claude-haiku-4-5","tags":["cheap"]},{"model":"claude-opus-4-8","tags":["strong"]}],"policy":"heuristic","scope":"draft"},
     askMode: "pause",
     approvals: { store: __approvals, surface: "workflow-step" },
     hooks: __hooks,

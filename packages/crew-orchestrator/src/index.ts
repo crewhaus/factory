@@ -149,6 +149,9 @@ export type RoleDefinition = {
   /** Loop contract 0.4 (Batch A) — extended-thinking selector forwarded to
    *  this role's turns (primary activations AND inline A2A peer turns). */
   readonly thinking?: RoleThinking;
+  /** 0.6.0 §4.1 — sampling temperature forwarded to this role's turns
+   *  (exclusive with `thinking` by spec construction). */
+  readonly temperature?: number;
   /** Section 13 (Batch A, G34) — inline sub-agent definitions surfaced to
    *  this role's `Task` tool. Forwarded to the role's runChatLoop together
    *  with the run-level `spawnSubAgent` injection (see RunOptions). */
@@ -1067,6 +1070,7 @@ export type LoopTuningFragment = Pick<
   readonly modelCallTimeoutMs?: number;
   readonly loopDetection?: CrewLoopLimits["loopDetection"];
   readonly thinking?: RoleThinking;
+  readonly temperature?: number;
   /** 0.6.0 (PR 7b) — the WIDENED pool, a structural subtype of runtime-core's
    *  option (per-candidate profiles + `scope` + hybrid siblings ride verbatim). */
   readonly modelPool?: RoleModelPool;
@@ -1109,6 +1113,8 @@ export function composeLoopTuning(
     ...(opts.budget !== undefined ? { budget: opts.budget } : {}),
     ...(opts.hooks !== undefined ? { hooks: opts.hooks } : {}),
     ...(def.thinking !== undefined ? { thinking: def.thinking } : {}),
+    // 0.6.0 §4.1 — the role's sampling temperature rides beside `thinking`.
+    ...(def.temperature !== undefined ? { temperature: def.temperature } : {}),
     ...(def.subAgents !== undefined ? { subAgents: def.subAgents } : {}),
     ...(opts.spawnSubAgent !== undefined ? { spawnSubAgent: opts.spawnSubAgent } : {}),
     // 0.6.0 (PR 3, §7.7) — per-role model routing. Presence-gated like every

@@ -141,14 +141,57 @@ export function satisfiesFeatures(
 }
 
 /**
- * A profile `tools:` entry matches a tool name exactly, or as a glob whose
- * only wildcard is `*` (one or more, matching any run of characters). The
- * MCP convention `mcp__<server>__*` is the intended shape; the compile-time
- * validator checks the shape, this matches it at connect time.
+ * A profile `tools:` entry matches a tool name exactly, as the SPEC spelling
+ * of a builtin key, or as a glob whose only wildcard is `*` (one or more,
+ * matching any run of characters). The MCP convention `mcp__<server>__*` is
+ * the intended glob shape; the compile-time validator checks the shape, this
+ * matches it at connect time.
+ *
+ * The spec-spelling rule (0.6.0 PR 7 ruled that candidate `tools` keep the
+ * spec's builtin keys — `read`, `webFetch`, `codegraphSearch` — rather than
+ * being renamed at lower time): every builtin key in codegen's
+ * `BUILTIN_TOOL_MAP` is its `RegisteredTool.name` with a different case
+ * (`read` → `Read`, `webFetch` → `WebFetch`, `javascript` → `JavaScript`,
+ * `codegraphSearch` → `CodeGraphSearch`), so a literal pattern matches
+ * case-insensitively. Tool names are unique per catalog regardless of case,
+ * so this cannot make one pattern match two tools.
  */
 export function matchesToolPattern(pattern: string, name: string): boolean {
-  if (!pattern.includes("*")) return pattern === name;
+  if (!pattern.includes("*"))
+    return pattern === name || pattern.toLowerCase() === name.toLowerCase();
   return globToRegExp(pattern).test(name);
+}
+
+/** The spec keys whose `tool_config` block every code-execution tool shares. */
+const CODE_EXECUTION_CONFIG_ALIASES = ["codeExecution", "code_execution"] as const;
+const CODE_EXECUTION_TOOL_NAMES = new Set(["python", "javascript", "shell"]);
+
+/**
+ * 0.6.0 §4.4 — the per-candidate `tool_config` block that applies to ONE
+ * tool: the entry keyed by the tool's registered name, else by its spec
+ * spelling (the same case-insensitive rule `matchesToolPattern` applies),
+ * else — for the code-execution family (`Python` / `JavaScript` / `Shell`)
+ * — the shared `codeExecution` / `code_execution` alias codegen's
+ * `resolveTools` honours for the boot-time registration. `undefined` when
+ * the candidate declares nothing for the tool, so the tool reads its
+ * registered config as before.
+ */
+export function toolConfigFor(
+  toolConfigs: Readonly<Record<string, unknown>> | undefined,
+  toolName: string,
+): unknown {
+  if (toolConfigs === undefined) return undefined;
+  if (toolConfigs[toolName] !== undefined) return toolConfigs[toolName];
+  const lower = toolName.toLowerCase();
+  for (const [key, value] of Object.entries(toolConfigs)) {
+    if (key.toLowerCase() === lower && value !== undefined) return value;
+  }
+  if (CODE_EXECUTION_TOOL_NAMES.has(lower)) {
+    for (const alias of CODE_EXECUTION_CONFIG_ALIASES) {
+      if (toolConfigs[alias] !== undefined) return toolConfigs[alias];
+    }
+  }
+  return undefined;
 }
 
 function globToRegExp(pattern: string): RegExp {

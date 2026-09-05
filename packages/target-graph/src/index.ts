@@ -8,7 +8,7 @@ import {
   type IrGraphV0,
   renderBundleReadme,
 } from "@crewhaus/ir";
-import { renderModelWiringFields } from "@crewhaus/model-service";
+import { renderModelWiringFields, scopedModelWiringFragment } from "@crewhaus/model-service";
 
 /**
  * Emit a single-file `agent.ts` bundle that builds the graph via
@@ -599,6 +599,10 @@ function renderNodeLoopFields(node: IrGraphNode): string {
   if (node.thinking !== undefined) {
     pieces.push(`\n        thinking: ${JSON.stringify(node.thinking)},`);
   }
+  // 0.6.0 §4.1 — node-level sampling temperature (a validated number).
+  if (node.temperature !== undefined) {
+    pieces.push(`\n        temperature: ${node.temperature},`);
+  }
   return pieces.join("");
 }
 
@@ -817,7 +821,7 @@ function renderNodeBody(
         sessionName: ${escapeJsonString(node.name)} + "-" + ctx.graphRunId,
         sessionTarget: "graph-node",
         seedMessages: __seed,
-        singleTurn: true,${renderNodeLoopFields(node)}${renderModelWiringFields(node, "        ")}${toolsField}${graphLevelFields}
+        singleTurn: true,${renderNodeLoopFields(node)}${renderModelWiringFields(scopedModelWiringFragment(node, node.name), "        ")}${toolsField}${graphLevelFields}
         runContext: ctx.runContext,${evalAdapterLine}
       });
       const __next = { ...prev, [${nameJs}]: __reply };${hitlRecordBlock}

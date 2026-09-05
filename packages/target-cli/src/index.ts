@@ -753,6 +753,11 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   // table `EFFORT_THINKING_BUDGET_TOKENS`). Empty when unset.
   const thinkingField =
     ir.agent.thinking !== undefined ? `\n  thinking: ${JSON.stringify(ir.agent.thinking)},` : "";
+  // 0.6.0 §4.1 — sampling temperature (spec `agent.temperature`, or the
+  // primary's `$profile`). A validated number; empty when unset so every
+  // pre-0.6.0 bundle keeps its pinned bytes.
+  const temperatureField =
+    ir.agent.temperature !== undefined ? `\n  temperature: ${ir.agent.temperature},` : "";
   // Loop contract 0.4 (Batch A) — stream partial output tokens (cli-only spec
   // key). Carried verbatim only when declared, so unset specs keep their
   // pinned bundle bytes and the runtime default (false) stays authoritative.
@@ -819,7 +824,7 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   model: ${escapeJsonString(ir.agent.model)},
   instructions: ${escapeJsonString(ir.agent.instructions)},
   sessionName: ${escapeJsonString(ir.name)},
-  sessionTarget: "cli",${maxTokensField}${thinkingField}${streamingField}${rateLimitsField}${compactionModelField}${compactionTuningFields}${limitsFields}${failoverFields}${failureTaxonomyField}${budgetField}${evaluation.field}${sloField}${toolsField}${permField}${sandboxField}
+  sessionTarget: "cli",${maxTokensField}${thinkingField}${temperatureField}${streamingField}${rateLimitsField}${compactionModelField}${compactionTuningFields}${limitsFields}${failoverFields}${failureTaxonomyField}${budgetField}${evaluation.field}${sloField}${toolsField}${permField}${sandboxField}
   hooks: ${specHooks.hooksExpr},
   skills: __skills,
   slashCommands: __slashCommands,${feedbackField}${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}${memory.field}

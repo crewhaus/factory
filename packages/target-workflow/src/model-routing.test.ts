@@ -88,6 +88,54 @@ describe("emitWorkflow — per-step model routing (item 9)", () => {
     expect(c).toContain('modelTiers: {"fast":"claude-haiku-4-5","default":"claude-sonnet-4-5"},');
   });
 
+  test("0.6.0 PR 9a — a pooled step's blob is stamped with `scope: <step name>` when the spec pinned none; a declared scope wins", () => {
+    const stamped = agentOf(
+      wf([
+        {
+          name: "draft",
+          instructions: "draft",
+          model: "claude-sonnet-4-5",
+          tools: [],
+          toolConfigs: {},
+          modelPool: POOL,
+        },
+      ]),
+    );
+    expect(stamped).toContain(
+      '\n    modelPool: {"candidates":[{"model":"claude-haiku-4-5","tags":["fast"]},{"model":"claude-sonnet-4-5","tags":["deep"]}],"policy":"heuristic","scope":"draft"},\n',
+    );
+    const declared = agentOf(
+      wf([
+        {
+          name: "draft",
+          instructions: "draft",
+          model: "claude-sonnet-4-5",
+          tools: [],
+          toolConfigs: {},
+          modelPool: { ...POOL, scope: "my-arms" },
+        },
+      ]),
+    );
+    expect(declared).toContain('"policy":"heuristic","scope":"my-arms"},');
+    expect(declared).not.toContain('"scope":"draft"');
+  });
+
+  test("0.6.0 PR 9a — a step-level temperature renders beside the tuning fields", () => {
+    const c = agentOf(
+      wf([
+        {
+          name: "draft",
+          instructions: "draft",
+          model: "m",
+          tools: [],
+          toolConfigs: {},
+          temperature: 0.4,
+        },
+      ]),
+    );
+    expect(c).toContain("\n    temperature: 0.4,");
+  });
+
   test("a step without routing stays byte-identical (no modelPool/tiers/fallbacks)", () => {
     const c = agentOf(
       wf([{ name: "draft", instructions: "draft", model: "m", tools: [], toolConfigs: {} }]),

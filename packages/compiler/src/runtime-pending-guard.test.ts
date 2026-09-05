@@ -1,25 +1,25 @@
 /**
- * 0.6.0 PR 7 — the residual runtime-pending guard. PR 6 refused the WHOLE
- * §11.1 spec delta at compile time; PR 7 lowers it, and keeps refusing only
- * the NARROWING knobs whose runtime consumer has not landed: a candidate's
- * (or a serving-slot profile's) `tools` / `tool_config` / `permissions` /
- * `rate_limits` / `cost` (PR 9a), `evaluation.on_fail: escalate` and
- * `judge.escalate_to` (PR 9c), and `mcp_servers.<n>.tool_flags` (no PR-train
- * row for its IR + emit half yet). Accepting them while the runtime ignores
- * them would serve a candidate declared `tools: []` with the full toolset.
+ * 0.6.0 PR 7 introduced the residual runtime-pending guard: PR 6 refused the
+ * WHOLE §11.1 spec delta at compile time, PR 7 lowered it and kept refusing
+ * the keys whose runtime consumer had not landed. PR 9a landed the
+ * per-candidate plan table, so a `model_pool` CANDIDATE's narrowing knobs —
+ * `tools` / `tool_config` / `permissions` / `rate_limits` / `cost`, inline or
+ * inherited from a `$profile` — now COMPILE THROUGH on every pool-bearing
+ * slot (agent, step, node, role, sub-agent): runtime-core builds one plan per
+ * candidate from the pool blob at boot (subset advertisement + dispatch gate,
+ * narrowed permissions, rate buckets, per-call tool_config, spend cap). The
+ * `HONOURED` rows pin that: each parses, `compile()` succeeds, the key rides
+ * the emitted pool blob, and no `model-plan-pending-runtime` warning names it.
  *
- * Every row PARSES (the guard is downstream of the spec), `compile()` refuses
- * it naming the path and the landing PR, and `lower()` with
- * `allowRuntimePendingKeys` carries it into the IR with a
- * `model-plan-pending-runtime` warning — the lowering the runtime PR will
- * consume is exercised, not dead. The landing PR deletes its row here.
- *
- * The guard acts on the MERGED candidate, not only on the keys a candidate
- * spells inline: a `$profile` candidate inherits the profile's narrowing
- * knobs in `lowerPoolCandidate`, and the runtime reads only `model` / `tags`
- * / `enabled` off the pool blob until PR 9a — so `models.fast: { tools: [] }`
- * behind `candidates: [{ model: $fast }]` is refused on every pool-bearing
- * slot (agent, step, node, role, sub-agent) exactly like an inline `tools: []`.
+ * What is STILL refused (the `REFUSED` rows): `evaluation.on_fail: escalate`
+ * and `judge.escalate_to` (PR 9c), `mcp_servers.<n>.tool_flags` (no PR-train
+ * row for its IR + emit half yet), and a narrowing profile referenced from a
+ * SINGLE-MODEL serving slot — the IR has no per-candidate plan carrier for a
+ * slot that routes no pool, so accepting `models.fast: { tools: [] }` behind
+ * `agent.model: $fast` would serve with the full toolset. Every refused row
+ * still parses, `compile()` refuses it naming the path and the landing row,
+ * and `lower()` with `allowRuntimePendingKeys` carries it into the IR with a
+ * `model-plan-pending-runtime` warning. The landing PR deletes its row here.
  */
 import { describe, expect, test } from "bun:test";
 import { CompilerError } from "@crewhaus/errors";
@@ -45,58 +45,41 @@ const cliCandidate = (fields: string): string =>
     "tools: [read, fetch]",
   );
 
-/** [row, spec, the refused path, the IR probe once lowered with the bypass] */
-const REFUSED: ReadonlyArray<readonly [string, string, RegExp, (json: string) => boolean]> = [
-  [
-    "candidate tools",
-    cliCandidate("tools: [read]"),
-    /^agent\.model_pool\.candidates\[0\]\.tools/,
-    (j) => j.includes('"tools":["read"]'),
-  ],
+/**
+ * PR 9a — [row, spec, the blob probe, emitted?]: every candidate narrowing
+ * knob compiles through and rides the pool blob verbatim. `emitted` is false
+ * for the sub-agent rows: a sub-agent's pool is lowered but not rendered into
+ * a bundle until the spawner consumes it (PR 11), so those probe the IR only.
+ */
+const HONOURED: ReadonlyArray<
+  | readonly [string, string, (json: string) => boolean]
+  | readonly [string, string, (json: string) => boolean, false]
+> = [
+  ["candidate tools", cliCandidate("tools: [read]"), (j) => j.includes('"tools":["read"]')],
   [
     "candidate tools: [] (zero shape tools)",
     cliCandidate("tools: []"),
-    /^agent\.model_pool\.candidates\[0\]\.tools/,
     (j) => j.includes('"tools":[]'),
   ],
   [
     "candidate tool_config",
     cliCandidate("tool_config: { fetch: { timeoutMs: 8000 } }"),
-    /^agent\.model_pool\.candidates\[0\]\.tool_config/,
     (j) => j.includes('"toolConfigs":{"fetch":{"timeoutMs":8000}}'),
   ],
   [
     "candidate permissions",
     cliCandidate("permissions: { deny: ['Bash(*)'] }"),
-    /^agent\.model_pool\.candidates\[0\]\.permissions/,
     (j) => j.includes('"permissions":{"deny":["Bash(*)"]}'),
   ],
   [
     "candidate rate_limits",
     cliCandidate("rate_limits: { '*': { rpm: 60 } }"),
-    /^agent\.model_pool\.candidates\[0\]\.rate_limits/,
     (j) => j.includes('"rateLimits":{"*":{"rpm":60}}'),
   ],
   [
     "candidate cost",
     cliCandidate("cost: { max_usd: 0.5 }"),
-    /^agent\.model_pool\.candidates\[0\]\.cost/,
     (j) => j.includes('"costCapUsdMicros":500000'),
-  ],
-  [
-    "a narrowing profile referenced from the serving agent slot",
-    [
-      "name: hello",
-      "target: cli",
-      "models:",
-      "  fast: { model: claude-haiku-4-5, tools: [read] }",
-      "agent:",
-      "  model: $fast",
-      "  instructions: i",
-      "tools: [read, fetch]",
-    ].join("\n"),
-    /^models\.fast\.tools \(referenced from agent\.model\)/,
-    (j) => j.includes('"modelProfile":"fast"'),
   ],
   [
     "a $profile candidate inheriting the profile's tools / permissions (agent pool)",
@@ -114,7 +97,6 @@ const REFUSED: ReadonlyArray<readonly [string, string, RegExp, (json: string) =>
       "      - { model: claude-opus-4-8, tags: [strong] }",
       "tools: [read, fetch]",
     ].join("\n"),
-    /^agent\.model_pool\.candidates\[0\]\.model → models\.fast\.tools/,
     (j) => j.includes('"profile":"fast","tools":[],"permissions":{"deny":["Bash(*)"]}'),
   ],
   [
@@ -133,7 +115,6 @@ const REFUSED: ReadonlyArray<readonly [string, string, RegExp, (json: string) =>
       "        - { model: $fast, tags: [cheap] }",
       "        - { model: m2, tags: [strong] }",
     ].join("\n"),
-    /^steps\[0\]\.model_pool\.candidates\[0\]\.model → models\.fast\.rate_limits/,
     (j) => j.includes('"profile":"fast","rateLimits":{"*":{"rpm":60}}'),
   ],
   [
@@ -153,7 +134,6 @@ const REFUSED: ReadonlyArray<readonly [string, string, RegExp, (json: string) =>
       "        - { model: $fast, tags: [cheap] }",
       "        - { model: m2, tags: [strong] }",
     ].join("\n"),
-    /^nodes\.a\.model_pool\.candidates\[0\]\.model → models\.fast\.cost/,
     (j) => j.includes('"profile":"fast","costCapUsdMicros":500000'),
   ],
   [
@@ -173,7 +153,6 @@ const REFUSED: ReadonlyArray<readonly [string, string, RegExp, (json: string) =>
       "        - { model: $fast, tags: [cheap] }",
       "        - { model: m2, tags: [strong] }",
     ].join("\n"),
-    /^roles\.lead\.model_pool\.candidates\[0\]\.model → models\.fast\.tool_config/,
     (j) => j.includes('"profile":"fast","toolConfigs":{"fetch":{"timeoutMs":8000}}'),
   ],
   [
@@ -197,8 +176,44 @@ const REFUSED: ReadonlyArray<readonly [string, string, RegExp, (json: string) =>
       "          - { model: m2, tags: [strong] }",
       "tools: [read]",
     ].join("\n"),
-    /^agent\.sub_agents\.helper\.model_pool\.candidates\[0\]\.model → models\.fast\.tools/,
     (j) => j.includes('"profile":"fast","tools":[]'),
+    false,
+  ],
+  [
+    "sub_agents.<n>.model_pool candidate tools",
+    cli(
+      "  sub_agents:",
+      "    helper:",
+      "      description: helps",
+      "      instructions: help",
+      "      tools: [read]",
+      "      model_pool:",
+      "        candidates:",
+      "          - { model: m1, tags: [cheap], tools: [read] }",
+      "          - { model: m2, tags: [strong] }",
+      "tools: [read]",
+    ),
+    (j) => j.includes('"tools":["read"]'),
+    false,
+  ],
+];
+
+/** [row, spec, the refused path, the IR probe once lowered with the bypass] */
+const REFUSED: ReadonlyArray<readonly [string, string, RegExp, (json: string) => boolean]> = [
+  [
+    "a narrowing profile referenced from the serving agent slot",
+    [
+      "name: hello",
+      "target: cli",
+      "models:",
+      "  fast: { model: claude-haiku-4-5, tools: [read] }",
+      "agent:",
+      "  model: $fast",
+      "  instructions: i",
+      "tools: [read, fetch]",
+    ].join("\n"),
+    /^models\.fast\.tools \(referenced from agent\.model\)/,
+    (j) => j.includes('"modelProfile":"fast"'),
   ],
   [
     "evaluation.on_fail: escalate",
@@ -234,26 +249,30 @@ const REFUSED: ReadonlyArray<readonly [string, string, RegExp, (json: string) =>
     /^steps\[1\]\.judge\.escalate_to/,
     (j) => j.includes('"escalateTo":"strong"'),
   ],
-  [
-    "sub_agents.<n>.model_pool candidate tools",
-    cli(
-      "  sub_agents:",
-      "    helper:",
-      "      description: helps",
-      "      instructions: help",
-      "      tools: [read]",
-      "      model_pool:",
-      "        candidates:",
-      "          - { model: m1, tags: [cheap], tools: [read] }",
-      "          - { model: m2, tags: [strong] }",
-      "tools: [read]",
-    ),
-    /^agent\.sub_agents\.helper\.model_pool\.candidates\[0\]\.tools/,
-    (j) => j.includes('"tools":["read"]'),
-  ],
 ];
 
-describe("0.6.0 PR 7 residual guard — narrowing knobs are refused until their runtime lands", () => {
+describe("0.6.0 PR 9a — a pool candidate's narrowing knobs compile through to the plan table", () => {
+  for (const [name, yaml, probe, emitted] of HONOURED) {
+    test(`${name}: parses, compile() succeeds, the key rides the pool blob, nothing pends on it`, () => {
+      expect(parseSpecIssues(yaml)).toEqual([]);
+      const result = compile(yaml);
+      expect(result.files.length).toBeGreaterThan(0);
+      const bundle = result.files.map((f) => f.content).join("\n");
+      // The key reaches the emitted pool blob (what runtime-core boots from).
+      if (emitted !== false) expect(probe(bundle)).toBe(true);
+      expect(probe(JSON.stringify(lower(parseSpec(yaml))))).toBe(true);
+      // No warning claims the narrowing knob is inert.
+      const inert = result.warnings.filter(
+        (w) =>
+          w.code === "model-plan-pending-runtime" &&
+          /\.(tools|tool_config|permissions|rate_limits|cost)\b/.test(w.path),
+      );
+      expect(inert).toEqual([]);
+    });
+  }
+});
+
+describe("0.6.0 PR 7 residual guard — the keys whose runtime has not landed stay refused", () => {
   for (const [name, yaml, path, probe] of REFUSED) {
     test(`${name}: parses, compile() refuses naming the path, lower({allowRuntimePendingKeys}) carries it`, () => {
       expect(parseSpecIssues(yaml)).toEqual([]);
@@ -269,9 +288,20 @@ describe("0.6.0 PR 7 residual guard — narrowing knobs are refused until their 
     });
   }
 
-  test("the error names the landing row and tells the author what to do", () => {
-    expect(() => compile(cliCandidate("tools: []"))).toThrow(/PR 9a/);
-    expect(() => compile(cliCandidate("tools: []"))).toThrow(/remove it from the spec for now/);
+  test("the single-slot refusal tells the author the pool candidate honours the same profile", () => {
+    const yaml = [
+      "name: hello",
+      "target: cli",
+      "models:",
+      "  fast: { model: claude-haiku-4-5, tools: [read] }",
+      "agent:",
+      "  model: $fast",
+      "  instructions: i",
+      "tools: [read, fetch]",
+    ].join("\n");
+    expect(() => compile(yaml)).toThrow(/single-model serving slot/);
+    expect(() => compile(yaml)).toThrow(/declare the profile as a model_pool candidate/);
+    expect(() => compile(yaml)).toThrow(/remove it from the spec for now/);
   });
 
   test("mcp_servers.<n>.tool_flags stays refused (no IR + emit row yet)", () => {

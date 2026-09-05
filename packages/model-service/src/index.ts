@@ -45,11 +45,19 @@
  * this call). A compiled bundle does NOT register it yet — every emitter
  * still renders {@link renderModelWiringFields}, which never renders
  * {@link HYBRID_WIRING_KEYS}, and no bundle imports this package at boot.
- * The emitters switch to a boot-time `wireModels` call with PR 9a (the first
- * PR whose constructions a bundle cannot evaluate from rendered literals);
- * until then the compiler's `model-plan-pending-runtime` warning on
- * `strategy.model_directed` says exactly that, and target-cli's test pins
- * the deferred state.
+ * Since 8b this package depends on `@crewhaus/runtime-core` (the nested
+ * Consult loop), so a bundle cannot import it at boot without a cycle; the
+ * compiler's `model-plan-pending-runtime` warning on `strategy.model_directed`
+ * says exactly that, and target-cli's test pins the deferred state.
+ *
+ * PR 9a (the per-candidate plan table) therefore builds the plans INSIDE
+ * runtime-core, at boot, from the widened `modelPool` option this root hands
+ * it — `@crewhaus/model-plan`'s pure `buildRequestParams` /
+ * `buildAdvertisement` do the derivation, runtime-core owns the selection —
+ * rather than constructing them here: the same blob a bundle renders and the
+ * interpreter spreads yields the same plans on both paths, which keeps the
+ * one-code-path contract without a boot-time import. What this root DOES add
+ * in 9a is the emit-side scope twin {@link scopedModelWiringFragment}.
  *
  * `wireModels` is per RUN, not per process: the escalation latch it returns
  * is bounded "per run", so a host that serves many runs from one process
@@ -222,6 +230,28 @@ export function modelWiringFragmentFromIr(block: ModelWiringFragment): ModelWiri
     ...(block.modelTiers !== undefined ? { modelTiers: block.modelTiers } : {}),
     ...(block.modelPool !== undefined ? { modelPool: block.modelPool } : {}),
   };
+}
+
+/**
+ * 0.6.0 §7.9 (PR 9a) — the emit-side twin of `@crewhaus/crew-orchestrator`'s
+ * `scopeRolePool`: a block's fragment with its pool's `scope` defaulted to
+ * the host's name (a workflow step, a graph node) when the spec pinned none.
+ * The compiler deliberately leaves `scope` unstamped at lower time (the IR
+ * blob is what README / loop projections read), so the emitter that knows
+ * which step or node a `runChatLoop` call belongs to stamps it where the
+ * loop options are assembled — runtime-core stamps the result on
+ * `model_route.scope`, and the routing store keys arms by it from PR 10 on.
+ * A declared `scope` always wins; a fragment without a pool is returned
+ * untouched (object identity kept), so un-pooled steps and nodes stay
+ * byte-identical.
+ */
+export function scopedModelWiringFragment(
+  block: ModelWiringFragment,
+  scope: string,
+): ModelWiringFragment {
+  const pool = block.modelPool;
+  if (pool === undefined || pool.scope !== undefined) return block;
+  return { ...modelWiringFragmentFromIr(block), modelPool: { ...pool, scope } };
 }
 
 // ---------------------------------------------------------------------------

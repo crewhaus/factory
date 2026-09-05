@@ -48,7 +48,7 @@ const __graph = createGraph({ checkpointStore: __store })
         sessionTarget: "graph-node",
         seedMessages: __seed,
         singleTurn: true,
-        modelPool: {"candidates":[{"model":"claude-haiku-4-5","tags":["cheap"]},{"model":"claude-opus-4-8","tags":["strong"]}],"policy":"heuristic"},
+        modelPool: {"candidates":[{"model":"claude-haiku-4-5","tags":["cheap"]},{"model":"claude-opus-4-8","tags":["strong"]}],"policy":"heuristic","scope":"plan"},
         askMode: "pause",
         approvals: { store: __approvals, surface: "graph-node" },
         runContext: ctx.runContext,

@@ -17,7 +17,8 @@
  * `limits.loop_detection` → `loopDetection`, `agent.thinking` → `thinking`,
  * `agent.rate_limits` → `rateLimits`, `compaction.threshold` →
  * `compactionThreshold`, `compaction.snip_keep_head`/`snip_keep_tail` →
- * `snipKeepHead`/`snipKeepTail`, and (0.6.0 PR 8b) `evaluation:` →
+ * `snipKeepHead`/`snipKeepTail`, (0.6.0 PR 9a) `agent.temperature` →
+ * `temperature`, and (0.6.0 PR 8b) `evaluation:` →
  * `evaluation` through {@link evaluationRunOptions}.
  */
 import type { CompileWarning } from "@crewhaus/compiler";
@@ -55,6 +56,7 @@ export type LoopContractRunOptions = Pick<
   | "modelCallTimeoutMs"
   | "loopDetection"
   | "thinking"
+  | "temperature"
   | "rateLimits"
   | "compactionThreshold"
   | "snipKeepHead"
@@ -68,6 +70,8 @@ export type LoopContractIrSlice = {
   readonly limits?: IrLimits;
   readonly agent?: {
     readonly thinking?: IrThinking;
+    /** 0.6.0 §4.1 — `agent.temperature` (or the primary's `$profile`). */
+    readonly temperature?: number;
     readonly rateLimits?: IrRateLimits;
   };
   readonly compaction?: Pick<IrCompaction, "threshold" | "snipKeepHead" | "snipKeepTail">;
@@ -127,6 +131,7 @@ export function loopContractRunOptions(ir: LoopContractIrSlice): LoopContractRun
       : {}),
     ...(limits?.loopDetection !== undefined ? { loopDetection: limits.loopDetection } : {}),
     ...(ir.agent?.thinking !== undefined ? { thinking: ir.agent.thinking } : {}),
+    ...(ir.agent?.temperature !== undefined ? { temperature: ir.agent.temperature } : {}),
     ...(rateLimits !== undefined && Object.keys(rateLimits).length > 0 ? { rateLimits } : {}),
     ...(compaction?.threshold !== undefined ? { compactionThreshold: compaction.threshold } : {}),
     ...(compaction?.snipKeepHead !== undefined ? { snipKeepHead: compaction.snipKeepHead } : {}),

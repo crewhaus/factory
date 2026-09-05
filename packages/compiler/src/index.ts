@@ -204,13 +204,13 @@ export type LowerOptions = {
   /** See {@link CompileOptions.today}. */
   readonly today?: string;
   /**
-   * 0.6.0 PR 7 — lower the per-model NARROWING knobs the runtime does not
-   * enforce yet (candidate `tools` / `tool_config` / `permissions` /
-   * `rate_limits` / `cost`, `evaluation.on_fail: escalate`,
-   * `judge.escalate_to`) instead of refusing them. `compile()` and the
-   * `crewhaus run` interpreter never set this: a candidate declared with
-   * `tools: []` must not serve with the full toolset because the dispatch
-   * gate (PR 9a) has not landed. Tests and IR-level tooling set it to
+   * 0.6.0 PR 7 — lower the keys whose runtime consumer has not landed
+   * instead of refusing them: `evaluation.on_fail: escalate` and
+   * `judge.escalate_to` (PR 9c), and a NARROWING profile (`tools` /
+   * `tool_config` / `permissions` / `rate_limits` / `cost`) referenced from a
+   * SINGLE-MODEL serving slot (no IR carrier yet — a `model_pool` candidate
+   * honours the same knobs since PR 9a). `compile()` and the `crewhaus run`
+   * interpreter never set this. Tests and IR-level tooling set it to
    * exercise the lowering the runtime will consume.
    */
   readonly allowRuntimePendingKeys?: boolean;
@@ -1142,16 +1142,20 @@ function lowerCompaction(spec: SpecWithPermissions, ctx: LowerContext): IrCompac
 //     landing PR deletes the row, exactly the ACCEPTED_BUT_UNWIRED
 //     delete-when-wired contract applied at field level.
 //
-// One class is REFUSED rather than warned until its runtime lands: the
-// NARROWING knobs on a serving slot — a candidate's (or a primary-slot
-// profile's) `tools` / `tool_config` / `permissions` / `rate_limits` / `cost`
-// (the PR 9a dispatch gate + plan table), `evaluation.on_fail: escalate` and
-// `judge.escalate_to` (PR 9c). Accepting them and letting the runtime ignore
-// them would serve a candidate declared `tools: []` with the full toolset —
-// the exact hazard the interim PR 6 guard existed to prevent.
-// `LowerOptions.allowRuntimePendingKeys` lowers them anyway (tests, IR
-// tooling); `compile()` never sets it. `mcp_servers.<n>.tool_flags` has no
-// PR-train row for its IR + emit half yet and stays refused too.
+// One class is REFUSED rather than warned until its runtime lands:
+// `evaluation.on_fail: escalate` and `judge.escalate_to` (PR 9c), and the
+// NARROWING knobs (`tools` / `tool_config` / `permissions` / `rate_limits` /
+// `cost`) of a profile referenced from a SINGLE-MODEL serving slot — the IR
+// has no per-candidate plan carrier for a slot that routes no pool, so the
+// runtime could not honour them and accepting them would serve a profile
+// declared `tools: []` with the full toolset. The same knobs on a
+// `model_pool` CANDIDATE (inline or inherited from a `$profile`) lower and
+// compile through since PR 9a: runtime-core builds a per-candidate plan
+// (subset advertisement + dispatch gate, narrowed permissions, rate buckets,
+// per-call tool_config, spend cap) from the pool blob at boot.
+// `LowerOptions.allowRuntimePendingKeys` lowers the refused keys anyway
+// (tests, IR tooling); `compile()` never sets it. `mcp_servers.<n>.tool_flags`
+// has no PR-train row for its IR + emit half yet and stays refused too.
 // ---------------------------------------------------------------------------
 
 type LooseBlock = Readonly<Record<string, unknown>>;
@@ -1162,28 +1166,17 @@ function asLooseBlock(value: unknown): LooseBlock | undefined {
     : undefined;
 }
 
-/** The first of `keys` that is DECLARED (not undefined) on `block`, if any. */
-function firstDeclaredKey(block: LooseBlock, keys: readonly string[]): string | undefined {
-  for (const key of keys) {
-    if (block[key] !== undefined) return key;
-  }
-  return undefined;
-}
-
-/** The narrowing knobs a serving candidate/profile may declare that the runtime cannot enforce before PR 9a. */
-const RUNTIME_PENDING_NARROWING_KEYS = [
-  "tools",
-  "tool_config",
-  "permissions",
-  "rate_limits",
-  "cost",
-] as const;
-
-const LANDING_PLAN_TABLE = "PR 9a (the per-candidate plan table and dispatch gate)";
+/**
+ * 0.6.0 PR 9a — the per-candidate plan table honours a pool CANDIDATE's
+ * settings; a profile's narrowing knobs on a single-model serving slot have
+ * no IR carrier and wait for a later row.
+ */
+const LANDING_SINGLE_SLOT =
+  "a later 0.6.0 row (a single-model serving slot has no per-candidate plan carrier in the IR; the same profile honours it today as a model_pool candidate)";
 const LANDING_PREROUTE = "PR 9b (the preRoute decision phase)";
 const LANDING_STRATEGIES = "PR 9c/9d (cascade and the guide / shadow / committee side-calls)";
 const LANDING_MODEL_DIRECTED =
-  "PR 9a (every emitter's boot block calls wireModels, which constructs the Consult / Escalate tools)";
+  "a later 0.6.0 row (the emitters' boot-time wireModels call — emitted bundles do not import @crewhaus/model-service, which depends on runtime-core)";
 const LANDING_ROUTER_STORE = "PR 10 (scoped arms, priors and the reward store)";
 const LANDING_SUBAGENTS = "PR 11 (sub-agent routing end to end)";
 const LANDING_JUDGE_PANEL = "the §6.2 judge-panel wiring (createJudgeGrader in every judge site)";
@@ -1196,25 +1189,11 @@ function runtimePending(path: string, landing: string, hint?: string): CompilerE
   );
 }
 
-function assertCandidatesLowerable(path: string, pool: LooseBlock): void {
-  const candidates = Array.isArray(pool["candidates"]) ? pool["candidates"] : [];
-  for (const [i, raw] of candidates.entries()) {
-    const candidate = asLooseBlock(raw);
-    if (candidate === undefined) continue;
-    const key = firstDeclaredKey(candidate, RUNTIME_PENDING_NARROWING_KEYS);
-    if (key !== undefined) {
-      throw runtimePending(
-        `${path}.candidates[${i}].${key}`,
-        LANDING_PLAN_TABLE,
-        "a candidate declared narrower than the shape would serve with the shape's full toolset and permissions until the dispatch gate lands",
-      );
-    }
-  }
-}
-
 function assertRoutedBlockLowerable(path: string, block: LooseBlock): void {
-  const pool = asLooseBlock(block["model_pool"]);
-  if (pool !== undefined) assertCandidatesLowerable(`${path}.model_pool`, pool);
+  // 0.6.0 PR 9a — a pool candidate's narrowing knobs (`tools` / `tool_config`
+  // / `permissions` / `rate_limits` / `cost`) are honoured by runtime-core's
+  // per-candidate plan table and compile through; only the PR 9c keys below
+  // stay refused on a routed block.
   const judge = asLooseBlock(block["judge"]);
   if (judge?.["escalate_to"] !== undefined) {
     throw runtimePending(
@@ -1984,16 +1963,17 @@ function applyProfileToSlot(
     }
   }
   if (settings.modelCallTimeoutMs !== undefined) {
-    if (isAgent) pending("limits.model_call_timeout_ms", LANDING_PLAN_TABLE);
+    if (isAgent) pending("limits.model_call_timeout_ms", LANDING_SINGLE_SLOT);
     else
       ignoredOnSlot("limits.model_call_timeout_ms", "the per-call timer applies to a serving slot");
   }
   if (settings.caching !== undefined) {
-    if (isAgent) pending("caching", LANDING_PLAN_TABLE);
+    if (isAgent) pending("caching", LANDING_SINGLE_SLOT);
     else ignoredOnSlot("caching", "prompt-cache markers apply to a serving slot");
   }
-  // The narrowing knobs: refused on a serving slot until the dispatch gate
-  // lands; meaningless on an auxiliary / model-only slot (a judge profile's
+  // The narrowing knobs: refused on a SINGLE-MODEL serving slot (no IR
+  // carrier — a pool candidate honours them, see the section header);
+  // meaningless on an auxiliary / model-only slot (a judge profile's
   // `tools: []` is the documented no-op and stays silent).
   const narrowing: ReadonlyArray<readonly [string, unknown]> = [
     ["tools", settings.tools],
@@ -2002,9 +1982,9 @@ function applyProfileToSlot(
     ["rate_limits", settings.rateLimits],
     ["cost", settings.costCapUsdMicros],
   ];
-  // A shape with a tool catalog (agent-full / agent-params) refuses them
-  // until PR 9a; a shape that can NEVER honour them (voice / eval / onchain /
-  // pipeline) reports them ignored-on-shape, permanently.
+  // A shape with a tool catalog (agent-full / agent-params) refuses them on
+  // a single-model slot; a shape that can NEVER honour them (voice / eval /
+  // onchain / pipeline) reports them ignored-on-shape, permanently.
   const narrowingRefused = kind === "agent-full" || kind === "agent-params";
   for (const [field, value] of narrowing) {
     if (value === undefined) continue;
@@ -2016,11 +1996,11 @@ function applyProfileToSlot(
       if (!ctx.allowPending) {
         throw runtimePending(
           `${at}.${field} (referenced from ${slotPath})`,
-          LANDING_PLAN_TABLE,
-          "a profile declared narrower than the shape would serve with the shape's full toolset and permissions until the dispatch gate lands — declare the narrowing on the shape for now",
+          LANDING_SINGLE_SLOT,
+          "a profile declared narrower than the shape would serve with the shape's full toolset and permissions on a single-model slot — declare the profile as a model_pool candidate (which honours it), or declare the narrowing on the shape",
         );
       }
-      pending(field, LANDING_PLAN_TABLE);
+      pending(field, LANDING_SINGLE_SLOT);
       continue;
     }
     if (field === "tools" && Array.isArray(value) && value.length === 0) continue;
@@ -2062,21 +2042,6 @@ function servingSlotFailover(r: SingleSlotResult): {
     ...(r.modelFallbacks !== undefined ? { modelFallbacks: r.modelFallbacks } : {}),
     ...(r.circuitBreaker !== undefined ? { circuitBreaker: r.circuitBreaker } : {}),
   };
-}
-
-/** 0.6.0 §4.1 — a slot-level `temperature` is inert until the plan table applies it (PR 9a). */
-function noteTemperaturePending(
-  ctx: LowerContext,
-  path: string,
-  temperature: number | undefined,
-): void {
-  if (temperature === undefined) return;
-  warn(
-    ctx,
-    "model-plan-pending-runtime",
-    path,
-    `${path} is lowered into the IR but the runtime request build does not apply a temperature yet — it lands with 0.6.0 ${LANDING_PLAN_TABLE}; until then it is inert`,
-  );
 }
 
 /** The `aux`-slot provenance + params spread every auxiliary consumer shares. */
@@ -2218,41 +2183,13 @@ function lowerPoolCandidate(
     ...(c.enabled === false ? { enabled: false as const } : {}),
   };
   validateModelMember(candidate, ctx, cpath, "candidate");
-  // The residual guard (deviation 1) acts on the MERGED candidate: a
-  // `$profile` candidate inherits the profile's narrowing knobs, and the
-  // runtime reads only `model` / `tags` / `enabled` off the pool blob until
-  // PR 9a, so an inherited `tools: []` would serve with the shape's full
-  // toolset. Inline keys were already refused by `assertCandidatesLowerable`.
-  if (!ctx.allowPending) {
-    for (const [field, value] of [
-      ["tools", candidate.tools],
-      ["tool_config", candidate.toolConfigs],
-      ["permissions", candidate.permissions],
-      ["rate_limits", candidate.rateLimits],
-      ["cost", candidate.costCapUsdMicros],
-    ] as const) {
-      if (value === undefined) continue;
-      throw runtimePending(
-        `${cpath}.model → models.${ref.profile ?? "?"}.${field}`,
-        LANDING_PLAN_TABLE,
-        "a candidate inheriting a profile declared narrower than the shape would serve with the shape's full toolset and permissions until the dispatch gate lands — declare the narrowing on the shape for now",
-      );
-    }
-  }
-  // Every 0.6.0 per-candidate setting is carried for the plan table; until it
-  // lands the candidate serves on the run's settings.
+  // 0.6.0 PR 9a — every per-candidate setting the plan table honours
+  // (`thinking` / `max_tokens` / `temperature` / `limits` / `instructions` /
+  // `tools` / `tool_config` / `permissions` / `rate_limits` / `caching` /
+  // `cost`) lowers silently: runtime-core builds one CandidatePlan per
+  // candidate from this blob at boot. Only the per-candidate failover chain
+  // and breaker (PR 10) are still reported pending.
   for (const [irKey, specKey, landing] of [
-    ["thinking", "thinking", LANDING_PLAN_TABLE],
-    ["maxTokens", "max_tokens", LANDING_PLAN_TABLE],
-    ["temperature", "temperature", LANDING_PLAN_TABLE],
-    ["modelCallTimeoutMs", "limits.model_call_timeout_ms", LANDING_PLAN_TABLE],
-    ["overlay", "instructions", LANDING_PLAN_TABLE],
-    ["tools", "tools", LANDING_PLAN_TABLE],
-    ["toolConfigs", "tool_config", LANDING_PLAN_TABLE],
-    ["permissions", "permissions", LANDING_PLAN_TABLE],
-    ["rateLimits", "rate_limits", LANDING_PLAN_TABLE],
-    ["caching", "caching", LANDING_PLAN_TABLE],
-    ["costCapUsdMicros", "cost", LANDING_PLAN_TABLE],
     ["fallbacks", "fallbacks", LANDING_ROUTER_STORE],
     ["circuitBreaker", "circuit_breaker", LANDING_ROUTER_STORE],
   ] as const) {
@@ -2429,12 +2366,15 @@ function lowerPoolReward(r: NonNullable<SpecModelPoolBlockValue["reward"]>): IrM
  * `classifier` / `strategy` / `reward` / `scope`) ride the pool blob, each
  * reported `model-plan-pending-runtime` until its consumer lands. `scope` is
  * carried verbatim only when declared — the compiler does NOT stamp the
- * step/role/node name (§7.9), because that would change the pool blob of
- * every pre-0.6.0 pooled step and role. The caller that knows the scope
- * stamps it at runtime instead: `@crewhaus/crew-orchestrator` hands each
- * role turn its pool with `scope` defaulted to the ROLE name (PR 7b,
- * `scopeRolePool`), and the runtime composition root (PR 10) defaults the
- * other hosts' from the caller's toolset scope at boot.
+ * step/role/node name (§7.9) at lower time, because the IR pool blob is what
+ * README / loop projections and every emitter read. The host that knows the
+ * scope stamps it where the loop options are assembled instead:
+ * `@crewhaus/crew-orchestrator` hands each role turn its pool with `scope`
+ * defaulted to the ROLE name (PR 7b, `scopeRolePool`); the workflow and
+ * graph emitters render each pooled step's / node's blob with `scope`
+ * defaulted to the step / node name (PR 9a, `@crewhaus/model-service`'s
+ * `scopedModelWiringFragment`); runtime-core falls back to the caller's
+ * `toolsetScope` and stamps the result on `model_route.scope`.
  */
 function lowerModelFailover(
   agent: SpecAgentWithFailover,
@@ -2528,7 +2468,8 @@ function lowerModelFailover(
       }
     }
     if (mp.reward !== undefined) pending("reward", LANDING_ROUTER_STORE);
-    if (mp.scope !== undefined) pending("scope", LANDING_ROUTER_STORE);
+    // `scope` is consumed since PR 9a (stamped on `model_route.scope`); the
+    // routing store keys arms by it from PR 10 on.
     out.modelPool = {
       candidates: mp.candidates.map((c, i) =>
         lowerPoolCandidate(c, ctx, `${poolPath}.candidates[${i}]`),
@@ -4181,7 +4122,6 @@ function resolveServingAgent(
         agent.model_fallbacks !== undefined,
     },
   );
-  noteTemperaturePending(ctx, `${path}.temperature`, slot.temperature);
   return slot;
 }
 
@@ -4460,7 +4400,6 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
                 s.model_fallbacks !== undefined,
             },
           );
-          noteTemperaturePending(ctx, `steps[${i}].temperature`, slot.temperature);
           return {
             name: s.name,
             instructions: foldOverlay(s.instructions, slot.overlay),
@@ -4624,7 +4563,6 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
                 node.model_fallbacks !== undefined,
             },
           );
-          noteTemperaturePending(ctx, `nodes.${name}.temperature`, slot.temperature);
           return {
             name,
             instructions: foldOverlay(node.instructions, slot.overlay),
@@ -5206,7 +5144,6 @@ function lowerCrewRole(
         role.model_fallbacks !== undefined,
     },
   );
-  noteTemperaturePending(ctx, `${path}.temperature`, slot.temperature);
   return {
     name,
     model: slot.model,

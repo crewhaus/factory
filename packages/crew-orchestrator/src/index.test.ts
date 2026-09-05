@@ -972,6 +972,9 @@ describe("composeLoopTuning (loop contract 0.4)", () => {
       model: "m",
       instructions: "i",
       thinking: { effort: "low" },
+      // 0.6.0 §4.1 — forwarded beside `thinking` (the spec forbids the pair on
+      // one role; the orchestrator forwards whatever the literal carries).
+      temperature: 0.5,
       subAgents,
     };
     const opts: RunOptions = {
@@ -999,6 +1002,7 @@ describe("composeLoopTuning (loop contract 0.4)", () => {
       budget: { usdMicros: 5000000, onExceed: { kind: "stop" } },
       hooks: [{ event: "session-start", command: "echo hi" }],
       thinking: { effort: "low" },
+      temperature: 0.5,
       subAgents,
       spawnSubAgent: spawnStub,
     });

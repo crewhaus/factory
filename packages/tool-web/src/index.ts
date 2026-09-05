@@ -73,8 +73,26 @@ export type WebFetchConfigInput = {
 };
 
 export function registerWebFetchConfig(input: WebFetchConfigInput): void {
+  webFetchConfig = buildWebFetchConfig(input);
+}
+
+function buildWebFetchConfig(input: WebFetchConfigInput): WebFetchConfig {
   const raw = input.allowedDomains ?? input.allowed_domains ?? [];
-  webFetchConfig = { allowedDomains: raw.map((d) => d.toLowerCase()) };
+  return { allowedDomains: raw.map((d) => d.toLowerCase()) };
+}
+
+/**
+ * 0.6.0 §4.4 — the config ONE call runs under: the serving candidate's
+ * `tool_config.webFetch` block when its profile declares one
+ * (`ToolExecuteContext.toolConfig`, REPLACING the registered block for this
+ * call exactly as `registerWebFetchConfig` replaces it at boot), else the
+ * process-global registration. A non-object override is ignored.
+ */
+export function resolveWebFetchConfig(override: unknown): WebFetchConfig {
+  if (typeof override === "object" && override !== null && !Array.isArray(override)) {
+    return buildWebFetchConfig(override as WebFetchConfigInput);
+  }
+  return webFetchConfig;
 }
 
 export function getWebFetchConfig(): WebFetchConfig {
@@ -85,12 +103,10 @@ export function _resetWebFetchConfig(): void {
   webFetchConfig = { allowedDomains: [] };
 }
 
-function isHostAllowed(host: string): boolean {
-  if (webFetchConfig.allowedDomains.length === 0) return true;
+function isHostAllowed(host: string, cfg: WebFetchConfig): boolean {
+  if (cfg.allowedDomains.length === 0) return true;
   const lower = host.toLowerCase();
-  return webFetchConfig.allowedDomains.some(
-    (entry) => lower === entry || lower.endsWith(`.${entry}`),
-  );
+  return cfg.allowedDomains.some((entry) => lower === entry || lower.endsWith(`.${entry}`));
 }
 
 // ─── SSRF guard ─────────────────────────────────────────────────────────
@@ -337,7 +353,11 @@ async function readBodyCapped(res: Response): Promise<string> {
   return new TextDecoder("utf-8", { fatal: false }).decode(merged);
 }
 
-async function performWebFetch(initialUrl: URL, signal: AbortSignal): Promise<Response> {
+async function performWebFetch(
+  initialUrl: URL,
+  signal: AbortSignal,
+  cfg: WebFetchConfig,
+): Promise<Response> {
   let currentUrl = initialUrl;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     if (currentUrl.protocol !== "http:" && currentUrl.protocol !== "https:") {
@@ -349,7 +369,7 @@ async function performWebFetch(initialUrl: URL, signal: AbortSignal): Promise<Re
     // The returned IP pins the socket so a rebinding resolver can't swap in a
     // private address between this check and connect.
     const pinnedIp = await assertNotSsrf(currentUrl.hostname);
-    if (!isHostAllowed(currentUrl.hostname)) {
+    if (!isHostAllowed(currentUrl.hostname, cfg)) {
       throw new WebFetchPermissionError(
         `WebFetch denied: host "${currentUrl.hostname}" is not in allowed_domains`,
       );
@@ -437,7 +457,7 @@ export const webFetch: RegisteredTool = buildTool({
     }
     let res: Response;
     try {
-      res = await performWebFetch(url, ctrl.signal);
+      res = await performWebFetch(url, ctrl.signal, resolveWebFetchConfig(ctx?.toolConfig));
     } finally {
       clearTimeout(timer);
     }

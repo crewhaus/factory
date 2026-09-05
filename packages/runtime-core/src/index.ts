@@ -6,7 +6,9 @@ import { type AbortTree, createAbortTree } from "@crewhaus/abort-controller";
 import {
   EFFORT_THINKING_BUDGET_TOKENS,
   type ProviderAdapter,
+  type ProviderFeatures,
   type ProviderId,
+  type ProviderRequest,
   type ReasoningEffort,
   collectFinalMessage,
   consumeStream,
@@ -52,6 +54,15 @@ import {
 } from "@crewhaus/errors";
 import { DEFAULT_ROOT_DIR, type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
+import {
+  type Advertisement,
+  type ModelProfile,
+  type RequestParams,
+  buildAdvertisement,
+  buildRequestParams,
+  planFingerprint,
+  toolConfigFor,
+} from "@crewhaus/model-plan";
 import {
   type FailoverChain,
   type PolicyRouter,
@@ -107,14 +118,16 @@ import {
   evictExpiredApprovals,
   generateApprovalId,
   hashApprovalInput,
+  mergeSessionModels,
 } from "@crewhaus/session-store";
 import { type SkillRef, formatSkillsForPrompt } from "@crewhaus/skills-registry";
 import { type SlashCommand, expand as expandSlash } from "@crewhaus/slash-commands";
 import { type Store, createStore } from "@crewhaus/state-store";
 import { executeStreaming } from "@crewhaus/streaming-tool-executor";
+import { narrowRuleSet } from "@crewhaus/sub-agent-permission-inheritance";
 import { currentTenantContext } from "@crewhaus/tenancy";
 import { TokenBudget, estimateTokens } from "@crewhaus/token-budget";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteModel } from "@crewhaus/tool-catalog";
 import { stripJustificationField, withJustificationField } from "@crewhaus/tool-catalog";
 import { executeTool } from "@crewhaus/tool-executor";
 import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
@@ -1099,6 +1112,16 @@ export type RunChatLoopOptions = {
   instructions: string;
   maxTokens?: number;
   /**
+   * 0.6.0 §4.1 — sampling temperature for every MAIN-turn request (spec
+   * `agent.temperature`, or the primary's `$profile`). Exclusive with
+   * `thinking` on one request — the compiler rejects the pair on a slot, and
+   * a pool candidate that pins one drops the run's other (see
+   * {@link CandidatePlan}). Absent → the request carries no temperature,
+   * byte-identical to a pre-0.6.0 runtime (`ProviderRequest.temperature`
+   * already existed; nothing set it on main-turn calls before).
+   */
+  temperature?: number;
+  /**
    * Section 17 — optional override for the model used by
    * `compaction-autocompact`. When undefined, compaction reuses
    * `opts.model` (and therefore the same adapter). Set to a different
@@ -1694,18 +1717,60 @@ export type RunChatLoopOptions = {
    * pool takes precedence if all are somehow set. Absent → single-model path.
    */
   modelPool?: {
-    readonly candidates: ReadonlyArray<{
-      readonly model: string;
-      readonly tags: readonly string[];
-      /**
-       * 0.6.0 §7.1 — `false` withdraws the candidate from routing without
-       * deleting its learned history: it is skipped at boot. The compiler
-       * and the `modelPlanIntegrity` pass guarantee at least one candidate
-       * stays routable. (The rest of a candidate's per-model settings ride
-       * the same object; the plan table that reads them lands with PR 9a.)
-       */
-      readonly enabled?: false;
-    }>;
+    /**
+     * 0.6.0 §4.2 / §4.4 — each candidate is a full {@link ModelProfile}
+     * (`@crewhaus/model-plan`, structurally the IR's `IrModelPoolCandidate`)
+     * plus its routing identity `tags`. At boot the loop builds ONE
+     * {@link CandidatePlan} per enabled candidate from these fields —
+     * request params (`thinking` / `maxTokens` / `temperature` /
+     * `limits.model_call_timeout_ms`), the subset-only tool advertisement
+     * (`tools`, capability-filtered), the narrowed permission rule set
+     * (`permissions.deny` / `.ask`), per-candidate rate buckets
+     * (`rate_limits`), per-call `tool_config`, the volatile `overlay`,
+     * `caching: off`, and the per-run spend cap (`cost`) — and selects that
+     * plan on every model call the candidate serves. A bare `{ model, tags }`
+     * candidate serves on the run's own settings, exactly as before.
+     * `fallbacks` / `circuitBreaker` / `requires` are carried for PR 10's
+     * per-candidate chains and breakers and the preRoute eligibility phase.
+     */
+    readonly candidates: ReadonlyArray<
+      Omit<ModelProfile, "capabilities"> & {
+        readonly tags: readonly string[];
+        /**
+         * The IR's FLAT declared-capability override (`IrModelCapabilities`:
+         * the four feature booleans, `caching`, `contextWindow`,
+         * `maxOutputTokens`) as the pool blob carries it — the plan table
+         * folds it over the adapter's `features`. (`@crewhaus/model-plan`'s
+         * `CandidateCapabilities` nests the features; the blob does not.)
+         */
+        readonly capabilities?: {
+          readonly tool_use?: boolean;
+          readonly vision?: boolean;
+          readonly thinking?: boolean;
+          readonly web_search?: boolean;
+          readonly caching?: "explicit" | "automatic" | false;
+          readonly contextWindow?: number;
+          readonly maxOutputTokens?: number;
+        };
+        /**
+         * 0.6.0 §7.1 — `false` withdraws the candidate from routing without
+         * deleting its learned history: it is skipped at boot. The compiler
+         * and the `modelPlanIntegrity` pass guarantee at least one candidate
+         * stays routable.
+         */
+        readonly enabled?: false;
+      }
+    >;
+    /**
+     * 0.6.0 §7.9 — the scoped `routeKey` prefix: the step / role / node /
+     * sub-agent the pool belongs to. The compiler never stamps it (that would
+     * change every pre-0.6.0 pooled blob); the host that knows the scope
+     * does — the crew orchestrator (role name), the workflow and graph
+     * emitters (step / node name). Absent → the caller's `toolsetScope`, else
+     * unscoped. Stamped on `model_route` as `scope`; the routing store keys
+     * arms by it from PR 10 on.
+     */
+    readonly scope?: string;
     /**
      * 0.6.0 §7.2.3 — `classifier` is accepted so the interpreter can thread
      * the IR's pool verbatim (`IrModelPool.policy`); until the preRoute
@@ -2183,27 +2248,115 @@ function bestEffortWireModelId(modelString: string): string {
 /**
  * A short, stable fingerprint of a `model_pool` config, stamped on every
  * `model_route` event as `policyVersion` so a learned decision can be tied back
- * to the exact policy that made it. Deterministic (djb2 over the candidate
- * roster + policy + objective) — no clock, no randomness.
+ * to the exact policy that made it. Deterministic — no clock, no randomness.
+ *
+ * 0.6.0 §4.4 — hashes the FULL pool (every per-candidate setting, rules,
+ * strategy, reward, scope …) through `@crewhaus/model-plan`'s canonical
+ * `planFingerprint`, not just `{policy, model, tags, objective}`: a profile's
+ * `max_tokens` or `tools` edit must change `policyVersion`, or a learned
+ * decision could be attributed to a policy that no longer exists.
  */
-function poolFingerprint(pool: {
-  readonly candidates: ReadonlyArray<{ readonly model: string; readonly tags: readonly string[] }>;
-  readonly policy: string;
-  readonly objective?: {
-    readonly quality?: number;
-    readonly cost?: number;
-    readonly latency?: number;
-  };
-}): string {
-  const canonical = JSON.stringify({
-    p: pool.policy,
-    c: pool.candidates.map((c) => [c.model, [...c.tags].sort()]),
-    o: pool.objective ?? null,
-  });
-  let hash = 5381;
-  for (let i = 0; i < canonical.length; i++)
-    hash = ((hash << 5) + hash + canonical.charCodeAt(i)) >>> 0;
-  return `pool-${hash.toString(36)}`;
+function poolFingerprint(pool: unknown): string {
+  return `pool-${planFingerprint(pool)}`;
+}
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §4.4 — the per-candidate plan table.
+// ---------------------------------------------------------------------------
+
+/**
+ * Everything the loop needs to serve ONE model — computed once per pool
+ * candidate at boot (plus one `primaryPlan` for the single-model path and
+ * any degrade rung) and SELECTED once per model call, after the routing
+ * if-else chain and before the request is built. Four hot paths read it: the
+ * request build (params, tools, overlay, cache mode), the dispatch gate in
+ * `executeOneToolUse` (`advertisedNames`, `permissionRules`, rate buckets,
+ * `toolConfigs`), `ListTools` (`listToolsSummaries`) and reporting
+ * (`model_request.toolCount`, `model_route.toolsetFingerprint`).
+ *
+ * `fromPool` is false only for the primary plan (and a non-roster degrade
+ * rung): those serve on the run's settings with NOTHING narrowed, so a run
+ * without a pool — or a pool of bare `{model, tags}` candidates — produces
+ * byte-identical requests and events.
+ */
+export type CandidatePlan = {
+  /** Scoreboard arm identity: the `models:` profile name, else the spec model string (§7.9). */
+  readonly armId: string;
+  readonly profile?: string;
+  readonly modelString: string;
+  readonly wireModelId: string;
+  readonly fromPool: boolean;
+  readonly params: RequestParams;
+  readonly paramsFingerprint: string;
+  readonly modelCallTimeoutMs?: number;
+  /** The subset advertised to this candidate, in the shape's declared order (justification contract injected). */
+  readonly anthropicTools: Anthropic.Tool[] | undefined;
+  /** `anthropicTools`' names — the dispatch gate's allow list. */
+  readonly advertisedNames: ReadonlySet<string>;
+  readonly listToolsSummaries: ReadonlyArray<AdvertisedToolSummary>;
+  /** Advertised tools by name — what the batch / streaming executors partition over. */
+  readonly toolByName: Map<string, RegisteredTool>;
+  readonly toolsetFingerprint: string;
+  /** Tool names the profile / capability filter removed, for the boot log. */
+  readonly excludedTools: ReadonlyArray<string>;
+  readonly permissionRules: RuleSet;
+  /** Per-candidate `rate_limits` buckets (`tool:<name>@<armId>`); absent → the run's limiter. */
+  readonly toolRateLimiter?: RateLimiter;
+  readonly hasToolRateBucket: (toolName: string) => boolean;
+  readonly toolConfigs?: Readonly<Record<string, unknown>>;
+  /** The per-model instructions overlay, appended in the VOLATILE region (never cache-marked). */
+  readonly overlayBlock?: Anthropic.TextBlockParam;
+  /** `off` strips every `cache_control` marker (system AND transcript) for this candidate. */
+  readonly cacheMode: "prefer" | "off";
+  /** The adapter's features, overridden by a declared `capabilities:` block. */
+  readonly features: ProviderFeatures;
+  readonly costCapUsdMicros?: number;
+  /** Priced spend attributed to this arm in this run (micro-USD); read by the cost-cap gate. */
+  spentUsdMicros: number;
+};
+
+/**
+ * The auto-registered loop tools that survive a profile's `tools: []` (§5.2):
+ * the runtime-bookkeeping family `BUILTIN_BOOKKEEPING_RULES` already allows
+ * (`Skill`, `ListTools`, the Focus / Plan / Goal tools), `Task`, and the
+ * memory tools. A judge profile that could not call `ListTools` would
+ * deadlock a headless run, so these are dropped only by an explicit
+ * `permissions.deny`. Hybrid tools (`Consult` / `Escalate`) join the list at
+ * boot from `opts.hybridTools`.
+ */
+export const RETAINED_LOOP_TOOL_NAMES: ReadonlyArray<string> = [
+  LIST_TOOLS_NAME,
+  "Skill",
+  "Task",
+  "FocusRead",
+  "FocusWrite",
+  "PlanRead",
+  "PlanUpdate",
+  "PlanComplete",
+  "GoalWrite",
+  "GoalUpdate",
+  "GoalList",
+  "Remember",
+  "Recall",
+  "MemoryForget",
+  "MemoryClear",
+];
+
+/** Does the LAST user message carry an image block (directly or inside a tool_result)? */
+function lastUserMessageHasImages(messages: ReadonlyArray<Anthropic.MessageParam>): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m === undefined || m.role !== "user") continue;
+    if (typeof m.content === "string") return false;
+    for (const block of m.content) {
+      if (block.type === "image") return true;
+      if (block.type === "tool_result" && Array.isArray(block.content)) {
+        if (block.content.some((b) => b.type === "image")) return true;
+      }
+    }
+    return false;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2582,6 +2735,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   let scoreboard: Scoreboard | undefined;
   let rewardConfig: RewardConfig | undefined;
   let poolPolicyVersion: string | undefined;
+  // 0.6.0 §4.4 — each resolved candidate's declared profile (the pool blob
+  // entry it was built from), keyed by the router's own candidate object so
+  // the plan table below and the per-turn selection agree on identity.
+  type PoolCandidateConfig = NonNullable<RunChatLoopOptions["modelPool"]>["candidates"][number];
+  const poolCandidateConfigs = new Map<PoolCandidate, PoolCandidateConfig>();
+  // §7.9 — the scoped routeKey prefix: declared on the pool, else the
+  // caller's toolset scope (the crew orchestrator / workflow / graph stamp the
+  // former; a cli agent has neither and stays unscoped).
+  const poolScope = opts.modelPool?.scope ?? opts.toolsetScope;
   if (opts.modelPool !== undefined) {
     const pool = opts.modelPool;
     const candidates: PoolCandidate[] = [];
@@ -2589,22 +2751,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // 0.6.0 §7.1 — a withdrawn candidate never becomes an arm.
       if (c.enabled === false) continue;
       const injected = opts._poolAdapters?.get(c.model);
-      if (injected !== undefined) {
-        candidates.push({
-          adapter: injected,
-          modelId: bestEffortWireModelId(c.model),
-          modelString: c.model,
-          tags: c.tags,
-        });
-      } else {
-        const r = await resolveModel(c.model);
-        candidates.push({
-          adapter: r.adapter,
-          modelId: r.modelId,
-          modelString: c.model,
-          tags: c.tags,
-        });
-      }
+      const resolved: PoolCandidate =
+        injected !== undefined
+          ? {
+              adapter: injected,
+              modelId: bestEffortWireModelId(c.model),
+              modelString: c.model,
+              tags: c.tags,
+            }
+          : await (async () => {
+              const r = await resolveModel(c.model);
+              return { adapter: r.adapter, modelId: r.modelId, modelString: c.model, tags: c.tags };
+            })();
+      candidates.push(resolved);
+      poolCandidateConfigs.set(resolved, c);
     }
     const routingRoot = sessionRootDir !== undefined ? pathDirname(sessionRootDir) : ".crewhaus";
     scoreboard = opts._scoreboard ?? openScoreboard(routingRoot);
@@ -2713,6 +2873,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
   let sessionId: string;
   let resumedMessages: Anthropic.MessageParam[] | undefined;
+  // 0.6.0 (design §8.1) — the session's `models` provenance: every wire model
+  // that served a main-turn response, first-seen order. Seeded from the
+  // resumed session and folded on every `model_response` below
+  // (`recordServedModel`), so `sessions tail` can name the arms a pooled
+  // conversation actually used without replaying its event log.
+  let sessionModels: string[] | undefined;
   // #405 — the toolset recorded by this session's LAST run (undefined when
   // the session predates the record, or on a fresh session).
   let resumedToolNames: readonly string[] | undefined;
@@ -2736,6 +2902,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       );
     }
     sessionId = existing.id;
+    sessionModels = existing.models;
     const replayLog = await openEventLog(sessionId, { rootDir: sessionRootDir });
     resumedMessages = await replayMessageHistory(replayLog);
     // One pass gathers both resume-time reads: the continuity ledger seed
@@ -3126,6 +3293,61 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // turn. Sessions from before this record exist get no marker on their first
   // resume — there is nothing to compare against — and are covered from then
   // on.
+  // 0.6.0 §4.4 / §5 — the subset-only advertisement per pool candidate:
+  // shape tools → profile `tools` subset → capability filter (a tool whose
+  // `requiresModelFeatures` the candidate cannot satisfy is dropped), with the
+  // auto-registered loop tools and the hybrid pair surviving `tools: []`
+  // unless the profile's `permissions.deny` names them. Computed once here —
+  // it depends only on the effective tool list, the candidate's profile and
+  // its adapter's features — and consumed twice: by the `toolset` record just
+  // below and by the plan table further down.
+  const retainedToolNames: ReadonlyArray<string> = [
+    ...RETAINED_LOOP_TOOL_NAMES,
+    ...(opts.hybridTools ?? []).map((t) => t.name),
+  ];
+  const candidateFeatures = (
+    candidate: PoolCandidate,
+    cfg: PoolCandidateConfig | undefined,
+  ): ProviderFeatures => {
+    const declared = cfg?.capabilities;
+    if (declared === undefined) return candidate.adapter.features;
+    return {
+      ...candidate.adapter.features,
+      ...(declared.tool_use !== undefined ? { tool_use: declared.tool_use } : {}),
+      ...(declared.vision !== undefined ? { vision: declared.vision } : {}),
+      ...(declared.thinking !== undefined ? { thinking: declared.thinking } : {}),
+      ...(declared.web_search !== undefined ? { web_search: declared.web_search } : {}),
+      ...(declared.caching !== undefined ? { caching: declared.caching } : {}),
+    };
+  };
+  const candidateAdvertisements = new Map<PoolCandidate, Advertisement<RegisteredTool>>();
+  for (const candidate of poolRouter?.candidates() ?? []) {
+    const cfg = poolCandidateConfigs.get(candidate);
+    candidateAdvertisements.set(
+      candidate,
+      buildAdvertisement(
+        effectiveTools,
+        {
+          ...(cfg?.tools !== undefined ? { tools: cfg.tools } : {}),
+          ...(cfg?.permissions !== undefined ? { permissions: cfg.permissions } : {}),
+        },
+        {
+          capabilities: {
+            features: candidateFeatures(candidate, cfg),
+            ...(cfg?.capabilities?.contextWindow !== undefined
+              ? { contextWindow: cfg.capabilities.contextWindow }
+              : {}),
+            ...(cfg?.capabilities?.maxOutputTokens !== undefined
+              ? { maxOutputTokens: cfg.capabilities.maxOutputTokens }
+              : {}),
+          },
+          retain: retainedToolNames,
+        },
+      ),
+    );
+  }
+  const armIdOf = (candidate: PoolCandidate): string =>
+    poolCandidateConfigs.get(candidate)?.profile ?? candidate.modelString;
   {
     const currentToolNames = [...effectiveTools.map((t) => t.name)].sort();
     const prior = resumedToolNames === undefined ? undefined : [...resumedToolNames].sort();
@@ -3145,11 +3367,23 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       });
     }
     if (prior === undefined || changed) {
+      // 0.6.0 §5.3 — the record is keyed on the UNION the run advertises, so a
+      // pool whose candidates see different subsets never fires "toolset
+      // changed" on resume just because a different candidate served. The
+      // per-candidate subsets ride along as `candidates` (arm id → sorted
+      // names) only when at least one candidate is narrower than the union,
+      // so a pool of bare candidates writes the pre-0.6.0 line byte-for-byte.
+      const narrowed: Record<string, readonly string[]> = {};
+      for (const [candidate, ad] of candidateAdvertisements) {
+        if (ad.names.size === currentToolNames.length) continue;
+        narrowed[armIdOf(candidate)] = [...ad.names].sort();
+      }
       await eventLog.append({
         kind: "toolset",
         payload: {
           toolNames: currentToolNames,
           ...(opts.toolsetScope !== undefined ? { scope: opts.toolsetScope } : {}),
+          ...(Object.keys(narrowed).length > 0 ? { candidates: narrowed } : {}),
         },
       });
     }
@@ -3741,6 +3975,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // with the gate flag reflecting the ADVERTISED contract (a runtime-injected
   // justification is part of that contract even though the tool's own schema
   // never declared it).
+  // 0.6.0 §4.4 — re-pointed at the SERVING candidate's summaries on every
+  // plan selection below, so `ListTools` under a narrowed profile lists
+  // exactly that profile's tools and never misreports.
   listToolsSummaries = advertisedTools.map(({ tool, advertised }) => ({
     name: tool.name,
     description: tool.description,
@@ -3816,6 +4053,173 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     opts.rateLimits !== undefined &&
     (opts.rateLimits[toolName] !== undefined || opts.rateLimits["*"] !== undefined);
 
+  // -------------------------------------------------------------------------
+  // 0.6.0 §4.4 — the per-candidate plan table. One plan per enabled pool
+  // candidate (plus the degrade rung when it sits outside the roster), built
+  // ONCE here from the run-level seams above; `primaryPlan` is the
+  // single-model path's plan and reproduces today's boot constants exactly.
+  // `servingPlan` is the turn-scoped selection every hot path below reads —
+  // set once per model call after the routing if-else chain.
+  // -------------------------------------------------------------------------
+  const namesFingerprint = (names: Iterable<string>): string => planFingerprint([...names].sort());
+  const buildPlan = (
+    candidate: PoolCandidate | undefined,
+    cfg: PoolCandidateConfig | undefined,
+  ): CandidatePlan => {
+    const fromPool = candidate !== undefined && cfg !== undefined;
+    const ad = candidate !== undefined ? candidateAdvertisements.get(candidate) : undefined;
+    const planAdvertised =
+      ad !== undefined
+        ? advertisedTools.filter(({ tool }) => ad.names.has(tool.name))
+        : advertisedTools;
+    const planAnthropicTools: Anthropic.Tool[] | undefined =
+      ad === undefined
+        ? anthropicTools
+        : planAdvertised.length > 0
+          ? planAdvertised.map(({ tool, advertised }) => ({
+              name: tool.name,
+              description: tool.description,
+              input_schema: advertised.inputSchema,
+            }))
+          : undefined;
+    // Exclusivity (§4.1): `temperature` and `thinking` never ride one
+    // request. A candidate that pins one drops the RUN's other; a candidate
+    // pinning neither inherits both run-level values as before.
+    const baseThinking =
+      cfg?.temperature !== undefined && cfg.thinking === undefined ? undefined : opts.thinking;
+    const baseTemperature =
+      cfg?.thinking !== undefined && cfg.temperature === undefined ? undefined : opts.temperature;
+    const params: RequestParams = fromPool
+      ? buildRequestParams(
+          cfg,
+          {
+            maxTokens,
+            ...(baseThinking !== undefined ? { thinking: baseThinking } : {}),
+            ...(baseTemperature !== undefined ? { temperature: baseTemperature } : {}),
+          },
+          cfg.capabilities?.maxOutputTokens !== undefined
+            ? { maxOutputTokens: cfg.capabilities.maxOutputTokens }
+            : {},
+        )
+      : {
+          maxTokens,
+          effectiveMaxTokens,
+          ...(thinkingRequest !== undefined ? thinkingRequest : {}),
+          ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+        };
+    const deny = cfg?.permissions?.deny ?? [];
+    const ask = cfg?.permissions?.ask ?? [];
+    const rateEntries = Object.entries(cfg?.rateLimits ?? {}) as ReadonlyArray<
+      readonly [string, { readonly rpm: number; readonly burst?: number }]
+    >;
+    const armId = fromPool ? (cfg.profile ?? cfg.model) : (candidate?.modelString ?? opts.model);
+    let planLimiter: RateLimiter | undefined;
+    if (rateEntries.length > 0) {
+      // Bucket ids `tool:<name>@<armId>` (the `"*"` entry becomes the
+      // limiter's per-dimension default, so every unlisted tool the profile
+      // caps still gets its OWN bucket keyed on `<name>@<armId>`).
+      const buckets = new Map<string, BucketConfig>();
+      for (const [name, limit] of rateEntries) {
+        buckets.set(name === "*" ? "tool:*" : `tool:${name}@${armId}`, {
+          kind: "token-bucket",
+          capacity: limit.burst ?? limit.rpm,
+          refillPerSec: limit.rpm / 60,
+        });
+      }
+      planLimiter = createRateLimiter({ buckets });
+    }
+    const planRateLimits = cfg?.rateLimits;
+    const names = new Set(planAdvertised.map(({ tool }) => tool.name));
+    return {
+      armId,
+      ...(cfg?.profile !== undefined ? { profile: cfg.profile } : {}),
+      modelString: candidate?.modelString ?? opts.model,
+      wireModelId: candidate?.modelId ?? wireModelId,
+      fromPool,
+      params,
+      paramsFingerprint: planFingerprint(params),
+      ...(cfg?.modelCallTimeoutMs !== undefined
+        ? { modelCallTimeoutMs: cfg.modelCallTimeoutMs }
+        : {}),
+      anthropicTools: planAnthropicTools,
+      advertisedNames: names,
+      listToolsSummaries: planAdvertised.map(({ tool, advertised }) => ({
+        name: tool.name,
+        description: tool.description,
+        readOnly: tool.readOnly,
+        destructive: tool.destructive,
+        gated: tool.requireJustification === true || advertised.justificationInjected === true,
+      })),
+      toolByName: new Map(planAdvertised.map(({ tool }) => [tool.name, tool])),
+      toolsetFingerprint: namesFingerprint(names),
+      excludedTools: ad?.excluded.map((e) => e.name) ?? [],
+      permissionRules: fromPool ? narrowRuleSet(permissionRules, deny, ask) : permissionRules,
+      ...(planLimiter !== undefined ? { toolRateLimiter: planLimiter } : {}),
+      hasToolRateBucket: (toolName: string): boolean =>
+        planRateLimits !== undefined &&
+        (planRateLimits[toolName] !== undefined || planRateLimits["*"] !== undefined),
+      ...(cfg?.toolConfigs !== undefined ? { toolConfigs: cfg.toolConfigs } : {}),
+      ...(cfg?.overlay !== undefined
+        ? { overlayBlock: { type: "text" as const, text: cfg.overlay } }
+        : {}),
+      cacheMode: cfg?.caching === "off" ? "off" : "prefer",
+      features: candidate !== undefined ? candidateFeatures(candidate, cfg) : adapter.features,
+      ...(cfg?.costCapUsdMicros !== undefined ? { costCapUsdMicros: cfg.costCapUsdMicros } : {}),
+      spentUsdMicros: 0,
+    };
+  };
+  const primaryPlan: CandidatePlan = buildPlan(undefined, undefined);
+  const planByCandidate = new Map<PoolCandidate, CandidatePlan>();
+  for (const candidate of poolRouter?.candidates() ?? []) {
+    planByCandidate.set(candidate, buildPlan(candidate, poolCandidateConfigs.get(candidate)));
+  }
+  if (budgetDegradeRung !== undefined && !planByCandidate.has(budgetDegradeRung)) {
+    planByCandidate.set(budgetDegradeRung, buildPlan(budgetDegradeRung, undefined));
+  }
+  const planFor = (candidate: PoolCandidate): CandidatePlan =>
+    planByCandidate.get(candidate) ?? buildPlan(candidate, poolCandidateConfigs.get(candidate));
+  let servingPlan: CandidatePlan = primaryPlan;
+  for (const plan of planByCandidate.values()) {
+    if (plan.excludedTools.length === 0 && plan.permissionRules === permissionRules) continue;
+    runContext.logger.info("model_pool candidate plan", {
+      arm: plan.armId,
+      model: plan.modelString,
+      advertised: [...plan.advertisedNames],
+      excluded: plan.excludedTools,
+      narrowedPermissions: plan.permissionRules !== permissionRules,
+    });
+  }
+  /** The `model` / `profile` attribution stamped on tool + permission events while a pool candidate serves. */
+  const toolAttribution = (): { model?: string; profile?: string } =>
+    servingPlan.fromPool
+      ? {
+          model: servingPlan.wireModelId,
+          ...(servingPlan.profile !== undefined ? { profile: servingPlan.profile } : {}),
+        }
+      : {};
+  /** The `role` / `profile` / `paramsFingerprint` attribution on model events while a pool candidate serves. */
+  const planAttribution = (
+    plan: CandidatePlan,
+  ): { role?: ModelRole; profile?: string; paramsFingerprint?: string } =>
+    plan.fromPool
+      ? {
+          role: opts.modelRole ?? "primary",
+          ...(plan.profile !== undefined ? { profile: plan.profile } : {}),
+          paramsFingerprint: plan.paramsFingerprint,
+        }
+      : {};
+  /** Fold a served wire model into the session's `models` provenance (one update per new model). */
+  const recordServedModel = async (served: string): Promise<void> => {
+    const merged = mergeSessionModels(sessionModels, served);
+    if (merged === sessionModels) return;
+    sessionModels = merged;
+    await sessionStore.update(sessionId, { models: merged }).catch((err) => {
+      runContext.logger.warn("session-store: models update failed", {
+        error: (err as Error).message,
+      });
+    });
+  };
+
   // Root abort tree for the whole run; each turn gets a child.
   const runAbort = createAbortTree(runContext.abortSignal);
   // Per-turn abort tree, replaced at the start of each turn so a SIGINT
@@ -3862,8 +4266,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   };
   let modelCallTimer: Timer | undefined;
   const armModelCallTimer = (): void => {
-    if (opts.modelCallTimeoutMs === undefined || opts.modelCallTimeoutMs <= 0) return;
-    modelCallTimer = armTimer(turnAbort, "model_call", opts.modelCallTimeoutMs);
+    // 0.6.0 §4.4 — the serving candidate's `limits.model_call_timeout_ms`
+    // wins over the run's when it declares one.
+    const limitMs = servingPlan.modelCallTimeoutMs ?? opts.modelCallTimeoutMs;
+    if (limitMs === undefined || limitMs <= 0) return;
+    modelCallTimer = armTimer(turnAbort, "model_call", limitMs);
   };
   const clearModelCallTimer = (): void => {
     if (modelCallTimer !== undefined) clearTimeout(modelCallTimer);
@@ -3988,11 +4395,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // Consume the entry so the map stays bounded across a long run.
     const attributedCostUsdMicros = toolCostAttribution.get(tu.id);
     if (attributedCostUsdMicros !== undefined) toolCostAttribution.delete(tu.id);
+    // 0.6.0 §5.6 — the serving model / profile ride every tool and permission
+    // event of this call (stamped only while a pool candidate serves, so a
+    // single-model run's events are byte-identical).
+    const callAttribution = toolAttribution();
     await logEvent("tool_use", {
       id: tu.id,
       name: tu.name,
       input: tu.input,
       ...(attributedCostUsdMicros !== undefined ? { attributedCostUsdMicros } : {}),
+      ...callAttribution,
     });
     const inputBytes = Buffer.byteLength(JSON.stringify(tu.input ?? null), "utf8");
     const toolStartEnvelope = bus.envelope();
@@ -4002,6 +4414,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       toolUseId: tu.id,
       toolName: tu.name,
       inputBytes,
+      ...callAttribution,
     });
     const t0Tool = performance.now();
     const tool = toolByName.get(tu.name);
@@ -4058,6 +4471,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         isError: result.is_error === true,
         outputBytes,
         durationMs: performance.now() - t0Tool,
+        ...callAttribution,
       });
       // Section 11 — fire post-tool after the result is captured. Decision
       // is observational here: a deny on post-tool logs a warning but does
@@ -4084,6 +4498,25 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         is_error: true,
       });
     }
+    // 0.6.0 §4.4 item 3 — the dispatch SUBSET gate, the security-load-bearing
+    // consumer of the plan. A subset in the advertisement is not a subset in
+    // execution: `toolByName` is the run-wide UNION, and a model can (and,
+    // steered by injected content, does) call a tool it was never shown. So
+    // a name outside the serving candidate's advertisement fails HERE — with
+    // an `is_error` result naming the profile — before permission, rate-limit
+    // and justification, which keep operating on the union.
+    if (!servingPlan.advertisedNames.has(tu.name)) {
+      const who =
+        servingPlan.profile !== undefined
+          ? `profile "${servingPlan.profile}" (${servingPlan.modelString})`
+          : `model "${servingPlan.modelString}"`;
+      return finish({
+        type: "tool_result",
+        tool_use_id: tu.id,
+        content: `tool "${tu.name}" is not available to the serving model ${who}: it was not advertised on this request (the candidate's toolset is a subset of the run's). Call ListTools to see the tools this model can use, or proceed without it.`,
+        is_error: true,
+      });
+    }
 
     // Section 11 — pre-tool hook: short-circuit with the hook's reason
     // when any matching hook returns deny/block.
@@ -4105,6 +4538,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // `justificationInjectedTools` comment at loop start for the full split.
     let operativeInput = operativeToolInput(tu.name, tu.input);
 
+    // 0.6.0 §4.4 — the SERVING candidate's rule set: the run's rules narrowed
+    // by the profile's `permissions.deny` / `.ask` through `narrowRuleSet`
+    // (a decision-level meet — a profile can only tighten). The primary plan
+    // carries the run's rules by reference, so a single-model run is unchanged.
     const decisionDetails = evaluateWithReason(
       {
         toolName: tu.name,
@@ -4114,7 +4551,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         requiresSandbox: tool.requiresSandbox,
       },
       permissionMode,
-      permissionRules,
+      servingPlan.permissionRules,
       { sandboxAvailable: opts.sandboxAvailable === true },
     );
     const decision = decisionDetails.decision;
@@ -4125,6 +4562,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       decision,
       mode: permissionMode,
       ...(decisionDetails.reason !== undefined ? { reason: decisionDetails.reason } : {}),
+      ...callAttribution,
     });
     let approved = decision === "allow";
     let denialMessage: string | undefined;
@@ -4207,6 +4645,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // rules are read fresh each loop and an operator may have tightened
             // them since — and a grant is permission from a human, not an
             // exemption from the spec. A rule that now DENIES wins.
+            // §10.1 — approval replay across candidates uses the SERVING
+            // candidate's rule set: a grant parked while the strong arm
+            // served does not run under a narrower arm's denies.
             const recheck = evaluateWithReason(
               {
                 toolName: tu.name,
@@ -4216,7 +4657,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 requiresSandbox: tool.requiresSandbox,
               },
               permissionMode,
-              permissionRules,
+              servingPlan.permissionRules,
               { sandboxAvailable: opts.sandboxAvailable === true },
             );
             if (recheck.decision === "deny") {
@@ -4262,6 +4703,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               decision: "allow",
               mode: permissionMode,
               reason: `approval ${replayedFrom.id} replayed: executing the APPROVED input, not the regenerated one`,
+              ...callAttribution,
             });
             runContext.logger.info("tool approval replayed", {
               approvalId: replayedFrom.id,
@@ -4356,6 +4798,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         decision: "ask",
         mode: permissionMode,
         askOutcome: approved ? "approved" : "denied",
+        ...callAttribution,
       });
     }
     if (!approved) {
@@ -4405,6 +4848,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         ...(verdict.confidence !== undefined
           ? { justificationConfidence: verdict.confidence }
           : {}),
+        ...callAttribution,
       });
       runContext.logger.info("justification evaluated", {
         toolUseId: tu.id,
@@ -4493,6 +4937,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         mode: permissionMode,
         outcome: egressOutcome,
         ...(egress.originsFound.length > 0 ? { reason: `egress: ${summarizeEgress(egress)}` } : {}),
+        ...callAttribution,
       });
       if (egress.verdict !== "pass") {
         runContext.logger.warn("egress classification non-clean", {
@@ -4552,9 +4997,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // keys, so the guard is what keeps unlisted tools ungated). Exhausting
     // the limiter's wait budget fails just THIS call with an `is_error`
     // result the model can adapt to — never the run.
-    if (toolRateLimiter !== undefined && hasToolRateBucket(tu.name)) {
+    // 0.6.0 §4.4 — the serving candidate's own bucket (`tool:<name>@<armId>`)
+    // wins when its profile declares `rate_limits` for the tool; otherwise
+    // the run-level `tool:<name>` bucket applies exactly as before.
+    const planLimiter = servingPlan.toolRateLimiter;
+    const planGated = planLimiter !== undefined && servingPlan.hasToolRateBucket(tu.name);
+    if (planGated || (toolRateLimiter !== undefined && hasToolRateBucket(tu.name))) {
       try {
-        await toolRateLimiter.acquire([{ dimension: "tool", id: tu.name }], 1);
+        if (planGated && planLimiter !== undefined) {
+          await planLimiter.acquire(
+            [{ dimension: "tool", id: `${tu.name}@${servingPlan.armId}` }],
+            1,
+          );
+        } else if (toolRateLimiter !== undefined) {
+          await toolRateLimiter.acquire([{ dimension: "tool", id: tu.name }], 1);
+        }
       } catch (err) {
         runContext.logger.warn("tool rate limit exhausted", {
           toolUseId: tu.id,
@@ -4617,9 +5074,23 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // every gate (permission/justification/egress) so it never overlaps the
     // approval prompt, and torn down in `.finally` on success or throw.
     beginToolWork(tu.name);
+    // 0.6.0 §4.4 — the serving model and this tool's per-candidate
+    // `tool_config` block, threaded through tool-executor into the tool's
+    // `ToolExecuteContext.model` / `.toolConfig`. Both presence-gated.
+    const planToolConfig = toolConfigFor(servingPlan.toolConfigs, tu.name);
+    const planModel: ToolExecuteModel | undefined = servingPlan.fromPool
+      ? {
+          armId: servingPlan.armId,
+          wireModelId: servingPlan.wireModelId,
+          specModel: servingPlan.modelString,
+          ...(servingPlan.profile !== undefined ? { profile: servingPlan.profile } : {}),
+        }
+      : undefined;
     const raw = await executeTool(tool, operativeInput, {
       toolUseId: tu.id,
       signal: toolAbort.signal,
+      ...(planModel !== undefined ? { model: planModel } : {}),
+      ...(planToolConfig !== undefined ? { toolConfig: planToolConfig } : {}),
       // #160 follow-up — the bridge (built on every run, above) carries
       // `runContext`, which boundary-site tools (tool-mcp, skills-registry)
       // read to tag their external content under the precise "mcp"/"skill"
@@ -4832,7 +5303,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // Pass the full catalog so per-call classifiers (Task) can resolve a
     // dispatch's child tool set; without it, classifier-based tools stay
     // serial (fail-closed).
-    const partition = partitionToolCalls(toolUses, (n) => toolByName.get(n), tools);
+    // 0.6.0 §4.4 — partition over the SERVING candidate's advertised tools; a
+    // name outside them resolves to nothing here and is refused by the
+    // dispatch gate inside `executeOneToolUse`.
+    const partition = partitionToolCalls(toolUses, (n) => servingPlan.toolByName.get(n), [
+      ...servingPlan.toolByName.values(),
+    ]);
     const maxConcurrentTools = opts.maxConcurrentTools ?? DEFAULT_MAX_CONCURRENT_TOOLS;
     runContext.logger.debug("tool partition", {
       concurrent: partition.concurrent.map((b) => b.length),
@@ -5128,7 +5604,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           out.spinner.start("thinking", { prefix: "agent> " });
           // Adaptive model routing — declared OUTSIDE the try so the catch can
           // read the chosen candidate + start time to record a failure reward.
-          let poolTurn: { readonly modelString: string; readonly routeKey: string } | undefined;
+          let poolTurn:
+            | {
+                readonly modelString: string;
+                readonly routeKey: string;
+                readonly plan: CandidatePlan;
+              }
+            | undefined;
           let modelCallStartMs = performance.now();
           try {
             // Section 27 — rate-limit the model call before opening the
@@ -5214,7 +5696,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // candidate would defeat the cap). The band
               // (`routeKey`) is kept so the rung's arm is still keyed on the
               // turn's difficulty.
-              const decision =
+              const routed =
                 budgetDegraded && budgetDegradeRung !== undefined
                   ? {
                       ...base,
@@ -5243,6 +5725,56 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                         explored: false,
                       }
                     : base;
+              // 0.6.0 §4.4 / §7.11 — the per-candidate capability and cost
+              // gate. A candidate is INELIGIBLE for this call when its
+              // features say `vision: false` and the turn carries image
+              // blocks (the request would 400 or silently drop the image),
+              // or when its per-profile `cost.max_usd` is spent (ineligible,
+              // never ends the run). An ineligible pick is replaced by the
+              // first eligible candidate in declared order; when none is,
+              // the pick stands with the reason recorded and a warning. The
+              // eligible set is persisted on the route line so replay stays
+              // exact. (The full preRoute phase — rules, directives,
+              // classifier, breaker state — lands with PR 9b on this seam.)
+              const turnHasImages = lastUserMessageHasImages(messages);
+              const ineligibleReason = (candidate: PoolCandidate): string | undefined => {
+                const plan = planFor(candidate);
+                if (
+                  plan.costCapUsdMicros !== undefined &&
+                  plan.spentUsdMicros >= plan.costCapUsdMicros
+                ) {
+                  return "cost-cap-spent";
+                }
+                if (turnHasImages && plan.features.vision === false) return "requires:vision";
+                return undefined;
+              };
+              const roster = poolRouter.candidates();
+              const eligibleArms = roster
+                .filter((c) => ineligibleReason(c) === undefined)
+                .map((c) => armIdOf(c));
+              const pickedReason = ineligibleReason(routed.candidate);
+              let decision = routed;
+              if (pickedReason !== undefined) {
+                const replacement = roster.find((c) => ineligibleReason(c) === undefined);
+                if (replacement !== undefined) {
+                  decision = {
+                    ...routed,
+                    candidate: replacement,
+                    explored: false,
+                    reason: `${armIdOf(routed.candidate)} ineligible (${pickedReason}); served ${armIdOf(replacement)} instead (was: ${routed.reason})`,
+                  };
+                } else {
+                  decision = {
+                    ...routed,
+                    reason: `${routed.reason}; no-eligible-candidate (${armIdOf(routed.candidate)}: ${pickedReason})`,
+                  };
+                  runContext.logger.warn("model_pool: no eligible candidate for this turn", {
+                    picked: armIdOf(routed.candidate),
+                    reason: pickedReason,
+                  });
+                }
+              }
+              const poolPlan = planFor(decision.candidate);
               turnAdapter = decision.candidate.adapter;
               reqWireModelId = decision.candidate.modelId;
               reqProviderId = decision.candidate.adapter.providerId;
@@ -5250,6 +5782,19 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               poolTurn = {
                 modelString: decision.candidate.modelString,
                 routeKey: decision.routeKey,
+                plan: poolPlan,
+              };
+              // §5.3 / §8.1 — the routing attribution every route line gains:
+              // the candidate's profile, its advertised-toolset fingerprint,
+              // the eligible arms and the pool's scope (each absent when the
+              // pool declares nothing of the kind, so a bare pool's route
+              // events keep their pre-0.6.0 shape — `eligible` is the one
+              // field always present, since the gate always runs).
+              const routeAttribution = {
+                ...(poolPlan.profile !== undefined ? { profile: poolPlan.profile } : {}),
+                ...(poolPlan.fromPool ? { toolsetFingerprint: poolPlan.toolsetFingerprint } : {}),
+                eligible: eligibleArms,
+                ...(poolScope !== undefined ? { scope: poolScope } : {}),
               };
               // 0.6.0 (design §8.1) — `specModel` (when it differs from the
               // wire id) closes the wire/spec identity split: scoreboard arms
@@ -5270,6 +5815,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 ...(poolPolicyVersion !== undefined ? { policyVersion: poolPolicyVersion } : {}),
                 ...routeSpecModel,
                 signals: routeSignals,
+                ...routeAttribution,
               });
               // Persist the decision so `crewhaus route explain <session>` can
               // replay per-turn routing after the fact. Non-conversational, so
@@ -5284,6 +5830,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 ...(poolPolicyVersion !== undefined ? { policyVersion: poolPolicyVersion } : {}),
                 ...routeSpecModel,
                 signals: routeSignals,
+                ...routeAttribution,
               });
             } else if (tierRouter !== undefined && !budgetDegraded) {
               // Item 26 — two-tier turn-difficulty router. Pick a tier from
@@ -5333,17 +5880,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 ...(escalateTier ? { escalated: true } : {}),
               });
             }
-            bus.publish({
-              ...modelStartEnv,
-              kind: "model_request",
-              model: reqWireModelId,
-              ...(reqSpecModel !== reqWireModelId ? { specModel: reqSpecModel } : {}),
-              provider: reqProviderId,
-              messageCount: messages.length,
-              toolCount: anthropicTools?.length ?? 0,
-              streaming: opts.streaming === true,
-              ...modelAttribution,
-            });
+            // 0.6.0 §4.4 — SELECT the plan: once per model call, after the
+            // whole routing if-else chain (pool / tier / default / degraded
+            // primary) and before the request is built. The pool branch chose
+            // its candidate's plan; every other branch serves on the primary
+            // plan, whose settings ARE the run's — so nothing below changes
+            // for a single-model run. `servingPlan` is what the dispatch
+            // gate, the permission / rate / tool_config seams and `ListTools`
+            // read for every tool call this model call produces.
+            const plan: CandidatePlan = poolTurn?.plan ?? primaryPlan;
+            servingPlan = plan;
+            listToolsSummaries = plan.listToolsSummaries;
             const t0Model = performance.now();
             modelCallStartMs = t0Model;
             let streamChunkIndex = 0;
@@ -5371,47 +5918,88 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // `[]` when the seam is absent — the request payload is then
             // byte-identical to a pre-0.3.0 runtime.
             const continuityTail = await buildContinuityTail();
-            // G10 — arm the per-model-call watchdog for exactly the stream's
-            // lifetime: cleared right after each drain below and (throw
-            // paths) at the top of the catch. G01 — every MAIN-turn request
-            // (and only these: compaction/judge side-calls build their own
-            // requests) carries the resolved thinking fields, and the token
-            // ceiling is the thinking-aware `effectiveMaxTokens`.
-            armModelCallTimer();
             // Item 9 / G79 — cache the settled transcript prefix when the
             // serving adapter supports explicit caching. A request-local copy;
             // the persisted `messages` array never carries the marker.
+            // 0.6.0 §4.4 — a candidate declared `caching: off` carries no
+            // marker anywhere (system markers are stripped below too).
+            const keepCacheMarkers = plan.cacheMode !== "off";
             const reqMessages =
-              turnAdapter.features.caching === "explicit"
+              turnAdapter.features.caching === "explicit" && keepCacheMarkers
                 ? withMessageCacheBreakpoint(messages)
                 : messages;
-            const reqStream = turnAdapter.stream({
+            // 0.6.0 §4.4 item 1 — the request is built from the SERVING plan
+            // and hoisted into a const so `model_request` can echo what the
+            // adapter will actually send (`effectiveParams`, PR 5's SPI).
+            // G01 — every MAIN-turn request (and only these: compaction /
+            // judge side-calls build their own requests) carries the plan's
+            // resolved thinking fields, and the token ceiling is the
+            // thinking-aware `effectiveMaxTokens` — per candidate now.
+            const req: ProviderRequest = {
               model: reqWireModelId,
               system: [
                 ...systemBlocks.map((b) => ({
                   type: "text" as const,
                   text: b.text,
-                  ...(b.cache_control !== undefined ? { cache_control: b.cache_control } : {}),
+                  ...(b.cache_control !== undefined && keepCacheMarkers
+                    ? { cache_control: b.cache_control }
+                    : {}),
                 })),
                 // Item 2 / G21 — the volatile recalled-memory block: rebuilt
                 // per-turn in per-turn recall mode, NO cache marker, sits in
                 // the mutable tail so a swap never busts the frozen prefix.
                 ...volatileRecallBlocks.map((b) => ({ type: "text" as const, text: b.text })),
                 ...continuityTail.map((b) => ({ type: "text" as const, text: b.text })),
+                // 0.6.0 §4.4 — the candidate's instructions overlay: appended
+                // in the VOLATILE region after the continuity tail, never
+                // before the cache marker, so switching candidates re-writes
+                // only the tail and the frozen system prefix stays cached.
+                ...(plan.overlayBlock !== undefined
+                  ? [{ type: "text" as const, text: plan.overlayBlock.text }]
+                  : []),
               ],
               messages: reqMessages as Parameters<ProviderAdapter["stream"]>[0]["messages"],
               tools:
-                anthropicTools !== undefined
-                  ? anthropicTools.map((t) => ({
+                plan.anthropicTools !== undefined
+                  ? plan.anthropicTools.map((t) => ({
                       name: t.name,
                       description: t.description ?? "",
                       input_schema: t.input_schema as Record<string, unknown>,
                     }))
                   : undefined,
-              maxTokens: effectiveMaxTokens,
-              ...(thinkingRequest !== undefined ? thinkingRequest : {}),
+              maxTokens: plan.params.effectiveMaxTokens,
+              ...(plan.params.thinking !== undefined ? { thinking: plan.params.thinking } : {}),
+              ...(plan.params.reasoningEffort !== undefined
+                ? { reasoningEffort: plan.params.reasoningEffort }
+                : {}),
+              ...(plan.params.temperature !== undefined
+                ? { temperature: plan.params.temperature }
+                : {}),
               signal: turnAbort.signal,
+            };
+            // The adapter's own echo of what it will send after its parameter
+            // gating (Claude 5 drops `temperature`, …) — set only when the
+            // serving adapter implements the projection and can project it
+            // (a wrapper reports `undefined` for "cannot project").
+            const effectiveParams = turnAdapter.effectiveParams?.(req);
+            bus.publish({
+              ...modelStartEnv,
+              kind: "model_request",
+              model: reqWireModelId,
+              ...(reqSpecModel !== reqWireModelId ? { specModel: reqSpecModel } : {}),
+              provider: reqProviderId,
+              messageCount: messages.length,
+              toolCount: plan.anthropicTools?.length ?? 0,
+              streaming: opts.streaming === true,
+              ...modelAttribution,
+              ...planAttribution(plan),
+              ...(effectiveParams !== undefined ? { effectiveParams } : {}),
             });
+            // G10 — arm the per-model-call watchdog for exactly the stream's
+            // lifetime: cleared right after each drain below and (throw
+            // paths) at the top of the catch.
+            armModelCallTimer();
+            const reqStream = turnAdapter.stream(req);
 
             if (opts.streaming) {
               // Streaming path: dispatch tools mid-stream via the
@@ -5437,7 +6025,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               const { finalContent, toolResults, stopReason, usage } = await executeStreaming(
                 reqStream,
                 {
-                  toolByName,
+                  // 0.6.0 §4.4 — the serving candidate's advertised tools; a
+                  // name outside them still reaches `runTool`, where the
+                  // dispatch gate refuses it naming the profile.
+                  toolByName: plan.toolByName,
                   abortSignal: turnAbort.signal,
                   onTextDelta,
                   // Honor the same concurrency bound as the non-streaming
@@ -5522,7 +6113,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 usage,
                 durationMs: performance.now() - t0Model,
                 ...modelAttribution,
+                ...planAttribution(plan),
               });
+              await recordServedModel(respModelIdS);
               // Item 4 / G28 — record the provider's real input_tokens for the
               // next pre-turn compaction trigger + routing signal. A response
               // that reports NO usage (sum 0) means "unknown", not "empty":
@@ -5536,6 +6129,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // reward scoreboard so the learned policy improves next run.
               if (poolTurn !== undefined) {
                 const costUsd = poolCostUsd(respProviderS, respModelIdS, usage);
+                // §4.4 — the arm's own spend, read by the per-profile cost cap.
+                if (costUsd !== undefined)
+                  poolTurn.plan.spentUsdMicros += Math.round(costUsd * 1e6);
                 recordPoolOutcome(poolTurn, {
                   success: true,
                   // §7.9 — model latency excluding the runTool spans (the
@@ -5647,7 +6243,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               usage: final.usage,
               durationMs: performance.now() - t0Model,
               ...modelAttribution,
+              ...planAttribution(plan),
             });
+            await recordServedModel(respWireModelId);
             // Item 4 / G28 — record the provider's real input_tokens for the
             // next pre-turn compaction trigger + routing signal. A response that
             // reports NO usage (sum 0) means "unknown", not "empty": keep the
@@ -5661,6 +6259,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // reward scoreboard so the learned policy improves next run.
             if (poolTurn !== undefined) {
               const costUsd = poolCostUsd(respProvider, respWireModelId, final.usage);
+              // §4.4 — the arm's own spend, read by the per-profile cost cap.
+              if (costUsd !== undefined) poolTurn.plan.spentUsdMicros += Math.round(costUsd * 1e6);
               recordPoolOutcome(poolTurn, {
                 success: true,
                 latencyMs: performance.now() - t0Model,

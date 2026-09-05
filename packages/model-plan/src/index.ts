@@ -8,7 +8,7 @@
  *
  *   - profile refs: `resolveProfileRef`, `applyProfileDefaults`, `PROFILE_NAME_RE`
  *   - request params: `buildRequestParams` (§4.4, N1 clamp)
- *   - subset-only advertisement: `buildAdvertisement`, `unmetRequirement` (§5)
+ *   - subset-only advertisement: `buildAdvertisement`, `unmetRequirement`, `toolConfigFor` (§5)
  *   - rule-directed routing: `evaluateRules`, `validateRuleRegex`, `deriveSignalRecord` (§7.2.2)
  *   - user-directed routing: `parseModelDirective` (§7.2.1)
  *   - N1 eligibility: `eligibleCandidates`, `cheapestEligible`, `strongestArm` (§7.11)
@@ -53,6 +53,7 @@ export {
   buildAdvertisement,
   matchesToolPattern,
   satisfiesFeatures,
+  toolConfigFor,
   unmetRequirement,
 } from "./advertisement.js";
 export type {

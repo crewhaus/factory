@@ -77,6 +77,20 @@ export function registerImageGenerationConfig(config: ImageGenerationConfig): vo
   registeredConfig = config;
 }
 
+/**
+ * 0.6.0 §4.4 — the config ONE call runs under: the serving candidate's
+ * `tool_config.imageGenerate` block when its profile declares one
+ * (`ToolExecuteContext.toolConfig`, REPLACING the registered block for this
+ * call exactly as `registerImageGenerationConfig` replaces it at boot), else
+ * the process-global registration (else `{}` — env-driven defaults).
+ */
+export function resolveImageGenerationConfig(override: unknown): ImageGenerationConfig {
+  if (typeof override === "object" && override !== null && !Array.isArray(override)) {
+    return override as ImageGenerationConfig;
+  }
+  return registeredConfig ?? {};
+}
+
 export const imageGenerate: RegisteredTool = buildTool({
   name: "ImageGenerate",
   description:
@@ -89,8 +103,8 @@ export const imageGenerate: RegisteredTool = buildTool({
   scope: "external",
   // FR-002 — declare the io-capability fact (remote image-gen API call).
   ioCapability: "network",
-  execute: async (input) => {
-    const cfg = registeredConfig ?? {};
+  execute: async (input, ctx) => {
+    const cfg = resolveImageGenerationConfig(ctx?.toolConfig);
     const provider = cfg.provider ?? defaultProvider(process.env);
     const responseFormat = input.responseFormat ?? "url";
     if (provider === "openai") {
