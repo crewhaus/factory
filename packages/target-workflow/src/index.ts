@@ -8,7 +8,12 @@ import {
   type IrWorkflowV0,
   renderBundleReadme,
 } from "@crewhaus/ir";
-import { renderModelWiringFields, scopedModelWiringFragment } from "@crewhaus/model-service";
+import {
+  hasSideCallStrategy,
+  renderModelWiringFields,
+  renderSideCallWiringFields,
+  scopedModelWiringFragment,
+} from "@crewhaus/model-service";
 
 /**
  * Emit a self-contained workflow agent bundle. The generated agent.ts
@@ -224,6 +229,8 @@ type StepShared = {
   /** Cluster S — per-step spread of the eval-entry seams
    *  (`sessionRootDir` / `_adapter`); empty when `evalEntry` is off. */
   readonly evalFields: string;
+  /** The spec name — the label the nested side calls (0.6.0 PR 9d) run under. */
+  readonly specName: string;
 };
 
 function renderStep(step: IrWorkflowStep, idx: number, total: number, shared: StepShared): string {
@@ -245,6 +252,14 @@ function renderStep(step: IrWorkflowStep, idx: number, total: number, shared: St
   const modelFailoverFields = renderModelWiringFields(
     scopedModelWiringFragment(step, step.name),
     "    ",
+  );
+  // 0.6.0 PR 9d — a pooled step whose strategy declares a guide / shadow /
+  // committee constructs the side-call closures at boot through
+  // `wireSideCalls` (the bundle imports it below); "" otherwise.
+  const sideCallFields = renderSideCallWiringFields(
+    scopedModelWiringFragment(step, step.name),
+    "    ",
+    shared.specName,
   );
   const deadlineGuard = renderDeadlineGuard(
     shared.deadlineMs,
@@ -287,7 +302,7 @@ ${deadlineGuard}${stdinReadLine}  process.stdout.write("\\n[step ${stepNum}/${to
     model: ${escapeJsonString(step.model)},
     instructions: ${escapeJsonString(step.instructions)},
     singleTurn: true,
-    seedMessages: [{ role: "user", content: ${userContent} }],${toolsField}${stepTuningFields}${modelFailoverFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}
+    seedMessages: [{ role: "user", content: ${userContent} }],${toolsField}${stepTuningFields}${modelFailoverFields}${sideCallFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}
     hooks: ${shared.hooksExpr},
     skills: __skills,
     slashCommands: __slashCommands,${shared.runContextLine}${shared.evalFields}
@@ -318,6 +333,11 @@ function renderGatedStep(
     scopedModelWiringFragment(step, step.name),
     "    ",
   );
+  const sideCallFields = renderSideCallWiringFields(
+    scopedModelWiringFragment(step, step.name),
+    "    ",
+    shared.specName,
+  );
   const deadlineGuard = renderDeadlineGuard(
     shared.deadlineMs,
     stepNum,
@@ -344,7 +364,7 @@ ${deadlineGuard}${stdinReadLine}  process.stdout.write(${escapeJsonString(`\n[st
     model: ${escapeJsonString(step.model)},
     instructions: ${escapeJsonString(step.instructions)} + __nudge,
     singleTurn: true,
-    seedMessages: [{ role: "user", content: __step${stepNum}Input }],${toolsField}${stepTuningFields}${modelFailoverFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}
+    seedMessages: [{ role: "user", content: __step${stepNum}Input }],${toolsField}${stepTuningFields}${modelFailoverFields}${sideCallFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}
     hooks: ${shared.hooksExpr},
     skills: __skills,
     slashCommands: __slashCommands,${shared.runContextLine}${shared.evalFields}
@@ -973,6 +993,7 @@ function renderAgent(ir: IrWorkflowV0, evalEntry = false): string {
     evalFields: evalEntry
       ? "\n    ...(__evalOpts.sessionRootDir !== undefined ? { sessionRootDir: __evalOpts.sessionRootDir } : {}),\n    ...(__evalOpts._adapter !== undefined ? { _adapter: __evalOpts._adapter } : {}),"
       : "",
+    specName: ir.name,
   };
   const stepBodies = ir.steps
     .map((s, i) =>
@@ -1098,6 +1119,11 @@ import type { TraceEventBus } from "@crewhaus/trace-event-bus";
   // PR train), handed to every step through `budgetMeter`. §6.2 — with judge
   // steps present the boot also derives the `judge_share` sub-cap from the
   // same meter so each gate can stamp `reason: "judge_share_exhausted"`.
+  // 0.6.0 PR 9d — the side-call composition root, imported only when a step's
+  // pool declares a guide / shadow / committee (pre-9d bundles byte-identical).
+  const sideCallImport = ir.steps.some((s) => hasSideCallStrategy(s.modelPool))
+    ? `import { wireSideCalls } from "@crewhaus/model-service";\n`
+    : "";
   const budgetMeterImport = hasBudget
     ? hasJudges
       ? `import { createCostTracker, sumRoleCost } from "@crewhaus/cost-tracker";\nimport { DEFAULT_JUDGE_SHARE } from "@crewhaus/runtime-core";\nimport { AUXILIARY_MODEL_ROLES } from "@crewhaus/trace-event-bus";\n`
@@ -1219,7 +1245,7 @@ ${runBody}}`;
 // Source spec: ${escapeJsonString(ir.name)} (target: workflow, ir version: ${ir.version}, ${ir.steps.length} step(s))
 ${mcp.note}${continuityWarning}import { runChatLoop } from "@crewhaus/runtime-core";
 import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
-${judgeImports}${evalEntryImports}${budgetMeterImport}${permImport}${durableImport}${extensionImports}${importBlock}${mcpImportBlock}${APPROVAL_STORE_BOOT}
+${judgeImports}${evalEntryImports}${budgetMeterImport}${sideCallImport}${permImport}${durableImport}${extensionImports}${importBlock}${mcpImportBlock}${APPROVAL_STORE_BOOT}
 async function readStdinToEnd(): Promise<string> {
   // No piped input — don't block waiting on an interactive TTY.
   if (process.stdin.isTTY) return "";

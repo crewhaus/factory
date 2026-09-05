@@ -569,6 +569,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/model-plan": "workspace:*",
+        "@crewhaus/model-service": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
@@ -1219,6 +1220,8 @@
       "version": "0.5.8",
       "dependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/cost-tracker": "workspace:*",
+        "@crewhaus/eval-judge": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/run-context": "workspace:*",

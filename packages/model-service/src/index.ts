@@ -63,12 +63,10 @@
  * is bounded "per run", so a host that serves many runs from one process
  * (`crewhaus serve`) calls it once per run — never caches the fragment.
  */
-import { randomBytes, randomUUID } from "node:crypto";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import type { IrCircuitBreaker, IrModelPool, IrModelTiers } from "@crewhaus/ir";
-import { type RunContext, createRunContext } from "@crewhaus/run-context";
-import { type RunChatLoopOptions, runChatLoop } from "@crewhaus/runtime-core";
+import type { HybridSideCalls, RunChatLoopOptions } from "@crewhaus/runtime-core";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
   type ConsultRunner,
@@ -80,7 +78,27 @@ import {
   rosterFromPool,
   strongestOf,
 } from "@crewhaus/tool-consult";
-import { type TraceEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
+import { hasSideCallStrategy, runNestedSingleTurn, wireSideCalls } from "./side-calls";
+
+export {
+  DEFAULT_GUIDE_MAX_TOKENS,
+  DEFAULT_SHADOW_SAMPLE_RATE,
+  GUIDE_INSTRUCTIONS,
+  type NestedSingleTurnArgs,
+  type NestedSingleTurnResult,
+  type NestedTarget,
+  type SideCallDeps,
+  type SideCallPool,
+  buildCommitteeSideCall,
+  buildGuideSideCall,
+  buildShadowSideCall,
+  hasSideCallStrategy,
+  latestUserText,
+  renderSideCallWiringFields,
+  runNestedSingleTurn,
+  textOnlyTranscript,
+  wireSideCalls,
+} from "./side-calls";
 
 // ---------------------------------------------------------------------------
 // The fragment — the serializable slice of a lowered agent / step / role /
@@ -141,6 +159,13 @@ export type ModelWiringRunOptions = {
   readonly hybridTools?: ReadonlyArray<RegisteredTool>;
   /** The `Escalate` tool's latch — the loop consumes it at its next model call. */
   readonly escalation?: EscalationLatch;
+  /**
+   * 0.6.0 §7.4 / §7.6 / §7.8 (PR 9d) — the guide / shadow / committee
+   * closures, present only when the (non-overridden) pool's `strategy`
+   * declares one of the three. Built by {@link wireSideCalls}; runtime-core
+   * owns their lifecycle.
+   */
+  readonly sideCalls?: HybridSideCalls;
 };
 
 /**
@@ -178,19 +203,23 @@ export type WireModelsDeps = {
    */
   readonly sessionName?: string;
   /**
-   * Root under which the nested consult loops persist their session and
-   * event-log files (a consult is its own single-turn run, like a Task
-   * child). Defaults to the runtime's default (`.crewhaus/sessions`, or
-   * `CREWHAUS_SESSION_DIR`).
+   * Retained for callers that passed it in 8b; since PR 9d the nested side
+   * calls run with `persistSession: false` (plan §16 Q6) and write NO
+   * session or event-log file of their own — their spend and stages are
+   * re-published on the parent bus and land in the parent's log — so this
+   * root is no longer read.
    */
   readonly sessionRootDir?: string;
   /**
-   * Test injection — pre-built adapters for consult targets keyed by their
-   * SPEC model string (the `_poolAdapters` contract), so a consult runs
+   * Test injection — pre-built adapters for every nested side-call target
+   * (consult, guide, shadow, committee members and tie-breaker), keyed by
+   * SPEC model string (the `_poolAdapters` contract), so a side call runs
    * offline through `runChatLoop({ _adapter })`. Production callers leave it
    * undefined: the nested loop resolves the target through the model-router.
    */
   readonly _consultAdapters?: ReadonlyMap<string, ProviderAdapter>;
+  /** Test injection — the shadow's and committee's judge adapter. */
+  readonly _judgeAdapter?: ProviderAdapter;
   /**
    * Test injection — replace the nested-`runChatLoop` runner entirely with a
    * scripted one. Production callers leave it undefined.
@@ -212,6 +241,12 @@ export const MODEL_WIRING_KEYS = [
  *  when the pool declares `strategy.model_directed: true`. Never rendered by
  *  {@link renderModelWiringFields}: they are runtime constructions. */
 export const HYBRID_WIRING_KEYS = ["hybridTools", "escalation"] as const;
+
+/** The side-call key `wireModels` appends last when the pool's strategy
+ *  declares a guide, a shadow or a committee (PR 9d). Rendered into a
+ *  single-turn bundle by `renderSideCallWiringFields`, never by
+ *  {@link renderModelWiringFields}. */
+export const SIDE_CALL_WIRING_KEYS = ["sideCalls"] as const;
 
 /**
  * Pick the routing slice out of a lowered block EXACTLY as the retired
@@ -293,6 +328,7 @@ export function wireModels(
     ...(pool !== undefined && pool.strategy?.modelDirected === true
       ? wireModelDirected(pool, deps)
       : {}),
+    ...(pool !== undefined && hasSideCallStrategy(pool) ? wireSideCalls(pool, deps) : {}),
   };
 }
 
@@ -342,20 +378,14 @@ export const CONSULT_INSTRUCTIONS =
   "You are being consulted by another model of the same harness on one question. Answer it directly and concisely, using only the question and the context you are given. You have no tools and cannot see the rest of the conversation; if the question cannot be answered from what you were given, say exactly what is missing.";
 
 /**
- * The nested single-turn side call (plan §7.5 / §7.6). Runs the roster
- * target through `runChatLoop({ singleTurn: true, tools: [], sessionTarget:
- * "consult", modelRole: "consult" })` — never `adapter.stream` — on a CHILD
- * run context whose bus inherits the parent's trace and whose
- * `model_request` / `model_response` events are re-published on the PARENT
- * bus under the parent's envelope, so the parent's cost-tracker prices them
- * (`role: "consult"`), its `budgetMeter` counts them under `judge_share`, and
- * its session mirror persists them. The child is minted (own runId /
- * sessionId, the parent's abort signal, an origin stack ending in "consult")
- * rather than reusing the parent's context because the singleTurn path
- * mutates `runContext.turnNumber` — a shared context would inject phantom
- * turns into the parent (§7.6). The child persists its own session file
- * like a Task child does; whether side calls should persist at all is plan
- * §16 Q6, decided with the other side-call closures in PR 9d.
+ * The Consult side call (plan §7.5 / §7.6) — one nested single-turn
+ * `runChatLoop` on the roster target through {@link runNestedSingleTurn}:
+ * own child `RunContext` and child bus (the singleTurn path mutates
+ * `runContext.turnNumber`, so a shared context would inject phantom turns),
+ * model events re-published on the PARENT bus under `role: "consult"` so the
+ * parent's cost-tracker prices them and its `budgetMeter` counts them under
+ * `judge_share`, and — since PR 9d, plan §16 Q6 — `persistSession: false`,
+ * so a consult no longer writes a child session file like a Task child.
  *
  * Returns the raw reply text — classification at TrustOrigin "consult"
  * (`classifyBoundary` + `tagContent`) is the tool's job in
@@ -363,42 +393,6 @@ export const CONSULT_INSTRUCTIONS =
  */
 export function buildConsultRunner(deps: WireModelsDeps): ConsultRunner {
   return async ({ target, question, context, runContext: parent, signal }) => {
-    const childRunId = `run_${randomUUID().slice(0, 8)}`;
-    const childSessionId = `sess_${randomBytes(8).toString("hex")}`;
-    const childBus = new TraceEventBus({
-      runId: childRunId,
-      sessionId: childSessionId,
-      ...(parent !== undefined
-        ? {
-            inheritTraceId: parent.eventBus.traceId,
-            inheritParentSpanId: parent.eventBus.currentSpanId,
-            logger: parent.logger,
-          }
-        : {}),
-    });
-    const child: RunContext = createRunContext({
-      runId: childRunId,
-      sessionId: childSessionId,
-      ...(signal !== undefined
-        ? { abortSignal: signal }
-        : parent !== undefined
-          ? { abortSignal: parent.abortSignal }
-          : {}),
-      ...(parent !== undefined ? { logger: parent.logger } : {}),
-      eventBus: childBus,
-      originStack: [...(parent?.originStack ?? []), "consult"],
-    });
-    // Re-publish the child's model calls on the parent bus so the parent's
-    // meter, cost-tracker and session mirror see them (`role: "consult"` is
-    // stamped by the child loop's `modelRole`; re-stamped here defensively).
-    const unsubscribe =
-      parent !== undefined
-        ? childBus.subscribe((event: TraceEvent) => {
-            if (event.kind !== "model_request" && event.kind !== "model_response") return;
-            parent.eventBus.publish({ ...event, ...parent.eventBus.envelope(), role: "consult" });
-          })
-        : undefined;
-    const injected = deps._consultAdapters?.get(target.modelString);
     const content =
       context !== undefined && context.trim().length > 0
         ? `${context.trim()}
@@ -407,30 +401,20 @@ export function buildConsultRunner(deps: WireModelsDeps): ConsultRunner {
 
 Question: ${question}`
         : question;
-    try {
-      const text = await runChatLoop({
-        model: target.modelString,
-        instructions: CONSULT_INSTRUCTIONS,
-        tools: [],
-        singleTurn: true,
-        seedMessages: [{ role: "user", content }],
-        runContext: child,
-        sessionName: `${deps.sessionName ?? "consult"}:consult`,
-        sessionTarget: "consult",
-        modelRole: "consult",
-        installSigintHandler: false,
-        spinner: false,
-        stdout: () => {},
-        // A child's rules are the parent's business, not the disk's: the
-        // consult runs no tools, so there is nothing to merge.
-        settingsDir: null,
-        ...(deps.sessionRootDir !== undefined ? { sessionRootDir: deps.sessionRootDir } : {}),
-        ...(injected !== undefined ? { _adapter: injected } : {}),
-      });
-      return { text };
-    } finally {
-      unsubscribe?.();
-    }
+    const result = await runNestedSingleTurn({
+      target: {
+        modelString: target.modelString,
+        ...(target.profile !== undefined ? { profile: target.profile } : {}),
+      },
+      instructions: CONSULT_INSTRUCTIONS,
+      seedMessages: [{ role: "user", content }],
+      role: "consult",
+      ...(parent !== undefined ? { parent } : {}),
+      ...(signal !== undefined ? { signal } : {}),
+      sessionTarget: "consult",
+      deps,
+    });
+    return { text: result.text, model: result.model };
   };
 }
 

@@ -12,6 +12,13 @@ export {
   type RouteObservation,
 } from "./reward.js";
 export {
+  isObserveOnlyLane,
+  QUALITY_LANE_PREFIX,
+  SHADOW_LANE_PREFIX,
+  shadowLaneQuality,
+  shadowRouteKey,
+} from "./lanes.js";
+export {
   openScoreboard,
   type ArmStats,
   type Scoreboard,

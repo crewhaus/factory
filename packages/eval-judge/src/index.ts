@@ -81,6 +81,15 @@ export {
   TRANSCRIPT_EVENT_MAX_CHARS,
 } from "./transcript-digest";
 export {
+  buildSelectPrompt,
+  judgeSelect,
+  type JudgeSelectOptions,
+  type SelectCandidate,
+  type SelectOrderVerdict,
+  type SelectPromptParts,
+  type SelectVerdict,
+} from "./select";
+export {
   buildPairwisePrompt,
   judgePair,
   judgePairwise,

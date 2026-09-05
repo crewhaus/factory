@@ -134,6 +134,49 @@ candidate, else the strongest; the `model_route` line names the receipt. The
 clean-prompt re-run (`runOneTurn(messages, { force })`) lands with the
 cascade (PR 9c) on the same seam.
 
+## The side calls (`strategy.guide` / `strategy.shadow` / `strategy.committee`) — PR 9d
+
+`wireSideCalls(pool, deps)` builds the closures runtime-core consumes through
+`RunChatLoopOptions.sideCalls` (plan §7.4, §7.6, §7.8); `wireModels` appends
+the `sideCalls` key after the routing and hybrid keys when the pool's strategy
+declares one of the three, and nothing otherwise. runtime-core owns each
+closure's **lifecycle** (when it runs, what its text does, the `model_stage`
+events, the scoreboard fold); this package owns the **model calls**, all of
+which go through one nested runner, `runNestedSingleTurn`: a tool-less
+`runChatLoop({ singleTurn: true })` on the target, on its own child
+`RunContext` and child bus, with its `model_request` / `model_response`
+re-published on the parent bus under the side call's `role` / `stage`, and
+with `persistSession: false` (§16 Q6) — no child session file, no child event
+log. The Consult runner rides the same runner.
+
+- **guide** — a bounded call on the guide model (`max_tokens`, default 400;
+  `budget_usd` caps the guide's own spend inside the run) that reads the
+  executor's instructions and the text-only transcript and returns guidance;
+  runtime-core appends it as a `<guide>` block in the volatile system region
+  (after the continuity tail, after the cache marker), classified at
+  TrustOrigin `"consult"` and lineage-tagged. `every: first_turn` is
+  plan-execute: the block stays for the run and the plan is written to the
+  continuity plan store when `continuity.savePlan` is wired.
+- **shadow** — the same request on the shadow candidate after the primary has
+  answered, graded blind with `judgePairwise` (order-swapped) against the
+  primary's text on `grade_with` (default: the strongest roster member);
+  returns only the verdict. runtime-core samples turns deterministically at
+  `sample_rate`, never changes the served text, and records both arms under
+  `shadow:<scope>/<band>` (`@crewhaus/routing-store`'s `shadowRouteKey`).
+- **committee** (single-turn hosts only) — members run one after another
+  (never a parallel `runOneTurn`), `judgeSelect` (`@crewhaus/eval-judge`, two
+  order-controlled calls for any N) picks; on disagreement the
+  `escalate_on_disagreement` member answers as the tie-breaker, else the
+  strongest survivor's answer stands with the disagreement recorded; a failed
+  member is excluded, a lone survivor stands, none surviving throws (runtime-
+  core then runs the plain turn).
+
+The codegen twin `renderSideCallWiringFields(fragment, indent, sessionName)`
+renders `...wireSideCalls(<pool blob>, { sessionName }),` onto a pooled
+workflow step or graph node whose strategy declares one of the three (the
+bundle imports this package); `""` otherwise. Crew roles reach the same
+closures through the orchestrator's `composeSideCalls`.
+
 ## `renderModelWiringFields(fragment, indent)` — the codegen twin
 
 What an emitter writes into a generated `runChatLoop({...})` call (or a crew
