@@ -5793,28 +5793,33 @@ async function buildServeRuntime(
     ...(egressMatcher !== undefined ? { egressMatcher } : {}),
   };
 
-  // Primary-agent model routing (failover / tiers / pool) — the same
-  // `wireModels` call runRunCli spreads, so the two interpreter paths cannot
-  // drift (0.6.0 PR 8a; before it this copy dropped `circuitBreaker` under
-  // `--model` while runRunCli kept it).
-  const primaryModelRouting = modelRoutingRunOptions(ir.agent, modelOverride, {
-    sessionName: ir.name,
-  });
-
-  const primaryOptions = {
+  // The primary agent's per-RUN options. Built fresh for every MCP invocation
+  // rather than once per process because the model-routing fragment is no
+  // longer a bag of plain values: under `model_pool.strategy.model_directed`
+  // `wireModels` constructs the `Escalate` tool and its escalation latch,
+  // whose contract is "at most `max_escalations` per RUN". One `serve`
+  // process hosts many runs (one per inbound message), so a latch shared
+  // across them would let the first caller's escalation exhaust every later
+  // caller's allowance — and a request left pending by one invocation would
+  // be consumed by another caller's first model call. The fragment is cheap
+  // and synchronous; rebuilding it per message is the per-run seam.
+  //   - routing: the same `wireModels` call runRunCli spreads, so the two
+  //     interpreter paths cannot drift (0.6.0 PR 8a; before it this copy
+  //     dropped `circuitBreaker` under `--model` while runRunCli kept it).
+  //   - evaluation (0.6.0 PR 8b): the in-loop `evaluation:` block on the
+  //     primary agent only (sub-agent invocations are not graded by the
+  //     parent's evaluation), the same helper runRunCli spreads.
+  const primaryOptionsForRun = () => ({
     ...commonOptions,
     model,
     instructions: ir.agent.instructions,
     tools,
-    ...primaryModelRouting,
-    // 0.6.0 PR 8b — the in-loop `evaluation:` block on the primary agent only
-    // (sub-agent invocations are not graded by the parent's evaluation), the
-    // same helper runRunCli spreads, so both interpreter paths grade alike.
+    ...modelRoutingRunOptions(ir.agent, modelOverride, { sessionName: ir.name }),
     ...evaluationRunOptions(ir),
     ...(subAgents !== undefined ? { subAgents, spawnSubAgent } : {}),
     ...(memoryRunOpt !== undefined ? { memory: memoryRunOpt } : {}),
     ...(continuityRunOpt !== undefined ? { continuity: continuityRunOpt } : {}),
-  };
+  });
 
   // One agent, one turn at a time.
   let queue: Promise<unknown> = Promise.resolve();
@@ -5845,7 +5850,7 @@ async function buildServeRuntime(
         });
       }
       return runChatLoop({
-        ...primaryOptions,
+        ...primaryOptionsForRun(),
         seedMessages: [{ role: "user" as const, content: message }],
       });
     });

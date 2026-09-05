@@ -288,6 +288,19 @@ export function createConsultTool(opts: CreateConsultToolOptions): RegisteredToo
       const runContext = runContextOf(ctx);
       const bus = runContext?.eventBus;
       const model = target.modelId ?? target.modelString;
+      // The one boundary pass for EVERYTHING this tool hands back — reply,
+      // empty-reply notice, failure message: classify at origin "consult",
+      // substitute the redaction notice on a malicious verdict, otherwise
+      // lineage-tag the exact content the parent will see. Exactly once per
+      // result (the runtime skips its own pass for this tool).
+      const admit = async (content: string): Promise<string> => {
+        const boundary = await classifyBoundary(content, { origin: "consult" });
+        if (boundary.action === "redact" && boundary.redacted !== undefined) {
+          return boundary.redacted;
+        }
+        if (runContext !== undefined) tagContent(runContext, content, "consult");
+        return content;
+      };
       const stage = {
         stage: "consult",
         strategy: MODEL_DIRECTED_STRATEGY,
@@ -307,11 +320,16 @@ export function createConsultTool(opts: CreateConsultToolOptions): RegisteredToo
         });
       } catch (err) {
         // §7.13 — consult failure / timeout: is_error, the parent continues.
+        // The error text is the nested loop's / provider's message — as
+        // attacker-shaped as a reply (a proxy's error body, a sibling's
+        // refusal text) and, because this tool sets `classifyOutput: false`,
+        // NOT re-scrubbed by the runtime's post-tool pass: it crosses the same
+        // boundary here before it becomes the is_error content.
         publishStage(bus, { ...stage, outcome: "failed", cause: "consult failed" });
-        throw new ConsultError(
+        const message = await admit(
           `Consult failed (${model}): ${err instanceof Error ? err.message : String(err)}`,
-          err,
         );
+        throw new ConsultError(message, err);
       }
       publishStage(bus, {
         ...stage,
@@ -321,18 +339,13 @@ export function createConsultTool(opts: CreateConsultToolOptions): RegisteredToo
       });
       const text = reply.text.trim();
       if (text.length === 0) {
-        return `[consult] ${model} returned no text.`;
+        return admit(`[consult] ${model} returned no text.`);
       }
       // Pillar 3 source side — the reply is a roster sibling's model output
       // shaped by whatever the question carried; it re-enters the parent's
       // context verbatim, so it is classified at origin "consult" (block on
       // malicious) and, when it passes, lineage-tagged for the egress fabric.
-      const boundary = await classifyBoundary(text, { origin: "consult" });
-      if (boundary.action === "redact" && boundary.redacted !== undefined) {
-        return boundary.redacted;
-      }
-      if (runContext !== undefined) tagContent(runContext, text, "consult");
-      return text;
+      return admit(text);
     },
   });
 }

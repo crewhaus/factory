@@ -39,6 +39,21 @@
  * package, exactly once; this root only builds the call. A pool without the
  * strategy key, or any `--model` override, wires no hybrid tool — the
  * pre-0.6.0 fragment stays byte-identical.
+ *
+ * REACH, stated honestly: in 8b the pair reaches the `crewhaus run` / `serve`
+ * interpreter (`apps/cli/src/loop-contract.ts`'s `modelRoutingRunOptions` IS
+ * this call). A compiled bundle does NOT register it yet — every emitter
+ * still renders {@link renderModelWiringFields}, which never renders
+ * {@link HYBRID_WIRING_KEYS}, and no bundle imports this package at boot.
+ * The emitters switch to a boot-time `wireModels` call with PR 9a (the first
+ * PR whose constructions a bundle cannot evaluate from rendered literals);
+ * until then the compiler's `model-plan-pending-runtime` warning on
+ * `strategy.model_directed` says exactly that, and target-cli's test pins
+ * the deferred state.
+ *
+ * `wireModels` is per RUN, not per process: the escalation latch it returns
+ * is bounded "per run", so a host that serves many runs from one process
+ * (`crewhaus serve`) calls it once per run — never caches the fragment.
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";

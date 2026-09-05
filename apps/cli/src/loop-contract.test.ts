@@ -147,6 +147,34 @@ describe("modelRoutingRunOptions (0.6.0 PR 8a — the interpreter's wireModels c
     expect(modelRoutingRunOptions({ modelPool: directed }, "claude-opus-4-8")).toEqual({});
   });
 
+  test("every call mints a FRESH latch — the per-run seam `crewhaus serve` spreads per message", async () => {
+    // The latch's contract is "at most `max_escalations` per RUN". One serve
+    // process hosts one run per inbound MCP message, so buildServeRuntime
+    // calls this helper inside `invoke` rather than once per process; this
+    // pins that two sequential calls do not share a latch (or a tool): the
+    // first run exhausting its single escalation leaves the second run's
+    // `Escalate` accepted, and nothing the first left pending leaks across.
+    const directed: IrModelPool = { ...POOL, strategy: { modelDirected: true, maxEscalations: 1 } };
+    const first = modelRoutingRunOptions({ modelPool: directed }, undefined, { sessionName: "s" });
+    const second = modelRoutingRunOptions({ modelPool: directed }, undefined, { sessionName: "s" });
+    expect(first.escalation).toBeDefined();
+    expect(second.escalation).toBeDefined();
+    expect(first.escalation).not.toBe(second.escalation);
+    expect(first.hybridTools?.[1]).not.toBe(second.hybridTools?.[1]);
+
+    const escalateOf = (o: typeof first) => o.hybridTools?.find((t) => t.name === "Escalate");
+    const receipt = (raw: unknown) => JSON.parse(String(raw)) as { escalated: boolean };
+    // Run 1 uses its one escalation (and leaves it pending — the turn aborts
+    // before the next model call).
+    expect(receipt(await escalateOf(first)?.execute({ reason: "hard" })).escalated).toBe(true);
+    expect(receipt(await escalateOf(first)?.execute({ reason: "again" })).escalated).toBe(false);
+    expect(first.escalation?.pending()).toBeDefined();
+    // Run 2 starts clean: nothing pending, its own allowance intact.
+    expect(second.escalation?.pending()).toBeUndefined();
+    expect(second.escalation?.count).toBe(0);
+    expect(receipt(await escalateOf(second)?.execute({ reason: "hard" })).escalated).toBe(true);
+  });
+
   test("a --model string drops the chain, tiers and pool but keeps the breaker", () => {
     const agent = {
       modelFallbacks: ["openai/gpt-4o-mini"],

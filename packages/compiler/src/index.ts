@@ -1182,7 +1182,8 @@ const RUNTIME_PENDING_NARROWING_KEYS = [
 const LANDING_PLAN_TABLE = "PR 9a (the per-candidate plan table and dispatch gate)";
 const LANDING_PREROUTE = "PR 9b (the preRoute decision phase)";
 const LANDING_STRATEGIES = "PR 9c/9d (cascade and the guide / shadow / committee side-calls)";
-const LANDING_MODEL_DIRECTED = "PR 8b (@crewhaus/tool-consult: the Consult / Escalate tools)";
+const LANDING_MODEL_DIRECTED =
+  "PR 9a (every emitter's boot block calls wireModels, which constructs the Consult / Escalate tools)";
 const LANDING_ROUTER_STORE = "PR 10 (scoped arms, priors and the reward store)";
 const LANDING_SUBAGENTS = "PR 11 (sub-agent routing end to end)";
 const LANDING_JUDGE_PANEL = "the §6.2 judge-panel wiring (createJudgeGrader in every judge site)";
@@ -2512,7 +2513,18 @@ function lowerModelFailover(
     if (mp.strategy !== undefined) {
       pending("strategy", LANDING_STRATEGIES);
       if (mp.strategy.model_directed === true) {
-        pending("strategy.model_directed", LANDING_MODEL_DIRECTED);
+        // 0.6.0 PR 8b landed the runtime half: `wireModels` constructs the
+        // Consult / Escalate pair under this key, and the `crewhaus run` /
+        // `crewhaus serve` interpreter reaches it. A COMPILED bundle does not
+        // yet — every emitter still renders the four routing fields through
+        // `renderModelWiringFields`, which never renders the hybrid pair —
+        // so the warning is scoped to compiled targets, not "the runtime".
+        warn(
+          ctx,
+          "model-plan-pending-runtime",
+          `${poolPath}.strategy.model_directed`,
+          `${poolPath}.strategy.model_directed is honoured by the crewhaus run / serve interpreter (Consult and Escalate are registered from @crewhaus/tool-consult), but a compiled bundle does not register the tools yet — that lands with 0.6.0 ${LANDING_MODEL_DIRECTED}; until then the key is inert in compiled targets`,
+        );
       }
     }
     if (mp.reward !== undefined) pending("reward", LANDING_ROUTER_STORE);

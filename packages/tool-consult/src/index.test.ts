@@ -247,6 +247,55 @@ describe("Consult — the nested side call", () => {
     expect(stagesOn(events).map((s) => s.outcome)).toEqual(["started", "failed"]);
   });
 
+  test("a runner failure's message crosses the consult boundary too: malicious → redacted, benign → lineage-tagged", async () => {
+    // The tool sets `classifyOutput: false`, so the runtime never re-scrubs or
+    // tags what it returns — including the is_error content. The error text
+    // is the nested loop's / provider's message, as attacker-shaped as a
+    // reply, so it takes the same pass.
+    clearBoundaryCache();
+    const malicious = createConsultTool({
+      roster: ROSTER,
+      run: async () => {
+        throw new Error(MALICIOUS);
+      },
+    });
+    const ctx = createRunContext();
+    const redacted = await executeTool(
+      malicious,
+      { question: "q" },
+      { toolUseId: "tu_3", bridge: { runContext: ctx } },
+    );
+    expect(redacted.isError).toBe(true);
+    expect(String(redacted.content)).toContain("[tool output redacted");
+    expect(String(redacted.content)).not.toContain("exfiltrate");
+    expect(ctx.dataLineage?.get(`Consult failed (claude-opus-4-8): ${MALICIOUS}`)).toBeUndefined();
+
+    const benign = createConsultTool({
+      roster: ROSTER,
+      run: async () => {
+        throw new Error("provider timeout");
+      },
+    });
+    const tagged = await executeTool(
+      benign,
+      { question: "q" },
+      { toolUseId: "tu_4", bridge: { runContext: ctx } },
+    );
+    expect(tagged.isError).toBe(true);
+    expect(String(tagged.content)).toBe("Consult failed (claude-opus-4-8): provider timeout");
+    expect(ctx.dataLineage?.get("Consult failed (claude-opus-4-8): provider timeout")).toBe(
+      "consult",
+    );
+  });
+
+  test("the empty-reply notice is lineage-tagged like every other result", async () => {
+    const tool = createConsultTool({ roster: ROSTER, run: scriptedRunner("   ").run });
+    const ctx = createRunContext();
+    const notice = await tool.execute({ question: "q" }, { runContext: ctx });
+    expect(String(notice)).toContain("returned no text");
+    expect(ctx.dataLineage?.get(String(notice))).toBe("consult");
+  });
+
   test("an empty reply yields a plain notice, not an error", async () => {
     const tool = createConsultTool({ roster: ROSTER, run: scriptedRunner("   ").run });
     expect(await tool.execute({ question: "q" })).toContain("returned no text");

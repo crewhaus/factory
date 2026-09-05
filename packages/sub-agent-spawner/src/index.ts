@@ -371,6 +371,13 @@ export async function spawnSubAgent(
       // warn/block depending on the sink scope.
       tagContent(parent.runContext, finalMessage, "subagent");
     }
+  } else if (childFailure !== undefined) {
+    // The classified-failure branch is a boundary too — see admitChildFailure.
+    ({ failure: childFailure, finalMessage } = await admitChildFailure(
+      parent,
+      childFailure,
+      "subagent",
+    ));
   }
 
   return {
@@ -516,9 +523,17 @@ async function spawnFederatedSubAgent(
   // Pillar 3 sink-side — the router already redacted a malicious peer reply at
   // origin "federation"; tag the (safe) reply into the parent's data-lineage so
   // a later external-scope tool call that smuggles it triggers the egress
-  // classifier. Skip on error (the JSON failure report isn't peer content).
+  // classifier. A failure's `report.detail` (the router's / peer's error text)
+  // goes through the same failure boundary as a local child's — see
+  // admitChildFailure.
   if (!isError && finalMessage.length > 0) {
     tagContent(parent.runContext, finalMessage, "federation");
+  } else if (childFailure !== undefined) {
+    ({ failure: childFailure, finalMessage } = await admitChildFailure(
+      parent,
+      childFailure,
+      "federation",
+    ));
   }
 
   return {
@@ -528,6 +543,53 @@ async function spawnFederatedSubAgent(
     usage: { input_tokens: 0, output_tokens: 0 },
     ...(childFailure !== undefined ? { failure: childFailure } : {}),
   };
+}
+
+/**
+ * Pillar 3 boundary site for the FAILURE branch of a spawn. `report.detail`
+ * is the child's raw error text — an MCP server's error string, a provider's
+ * message, a peer's protocol error, whatever the child's last step surfaced —
+ * so it is just as attacker-controllable as a final message, and the Task
+ * tool re-throws it verbatim (`SubAgentFailedError`) as the
+ * `{isError, failureClass, report}` content the parent model reads. Task sets
+ * `classifyOutput: false` (AGENTS.md rule 6: the spawner boundary is THE
+ * classification site), so the runtime's own post-tool pass at origin "tool"
+ * — which used to scrub AND lineage-tag error results as well — no longer
+ * runs for it; without this pass the failure path would reach the parent
+ * unclassified and untagged.
+ *
+ * Classifies the detail at the spawn's origin; on a malicious verdict the
+ * redaction notice replaces the detail in the report (and the re-serialised
+ * JSON) the parent sees; either way the content the parent WILL see — the
+ * structured JSON, which the Task tool re-serialises with the same key order,
+ * so the egress classifier's substring scan finds it and its detail line
+ * verbatim — is tagged for the sink-side fabric. The `sub_agent_end` record
+ * written before this keeps the raw detail: it is the operator's log, not
+ * model context.
+ */
+async function admitChildFailure(
+  parent: ParentRunHandle,
+  failure: SubAgentFailure,
+  origin: "subagent" | "federation",
+): Promise<{ failure: SubAgentFailure; finalMessage: string }> {
+  let admitted = failure;
+  const detail = failure.report.detail;
+  if (detail.length > 0) {
+    const boundary = await classifyBoundary(detail, { origin });
+    if (boundary.action === "redact" && boundary.redacted !== undefined) {
+      admitted = {
+        failureClass: failure.failureClass,
+        report: { ...failure.report, detail: boundary.redacted },
+      };
+    }
+  }
+  const finalMessage = JSON.stringify({
+    isError: true,
+    failureClass: admitted.failureClass,
+    report: admitted.report,
+  });
+  tagContent(parent.runContext, finalMessage, origin);
+  return { failure: admitted, finalMessage };
 }
 
 /** Discovery `deployment` id for a peer base URL — the hostname (no port; the
