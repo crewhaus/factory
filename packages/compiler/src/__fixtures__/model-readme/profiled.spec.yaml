@@ -1,0 +1,10 @@
+name: profiled-readme-pin
+target: cli
+models:
+  fast: { model: claude-haiku-4-5, tags: [cheap], max_tokens: 2048 }
+  strong: { model: claude-opus-4-8, tags: [strong] }
+agent:
+  model: $fast
+  instructions: Answer briefly.
+evaluation:
+  grader: { type: llm_judge, criteria: helpful }

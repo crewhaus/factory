@@ -1,4 +1,17 @@
-import { CHEAPEST_SENTINEL, resolveCheapestForSlot } from "@crewhaus/cost-tracker";
+import {
+  CHEAPEST_SENTINEL,
+  DEFAULT_CAPABILITIES,
+  type ModelCapabilities,
+  type RosterMember,
+  STRONGEST_SENTINEL,
+  crossesProvider,
+  findSunset,
+  providerOfSpecString,
+  resolveCapabilities,
+  resolveCheapestForSlot,
+  resolveStrongestForSlot,
+  satisfiesCapabilities,
+} from "@crewhaus/cost-tracker";
 import { CompilerError } from "@crewhaus/errors";
 import { assertNever } from "@crewhaus/infra-utils";
 import type {
@@ -36,12 +49,23 @@ import type {
   IrMcpServerConfig,
   IrMcpServers,
   IrMemory,
+  IrModelCapabilities,
+  IrModelParams,
   IrModelPool,
+  IrModelPoolCandidate,
+  IrModelPoolClassifier,
+  IrModelPoolReward,
+  IrModelPoolRule,
+  IrModelPoolStrategy,
+  IrModelProfile,
+  IrModelProfiles,
+  IrModelRequires,
   IrModelTiers,
   IrNode,
   IrObservability,
   IrPermissions,
   IrPipelineV0,
+  IrProfilePermissions,
   IrResearchV0,
   IrSchedule,
   IrSecretRef,
@@ -62,12 +86,16 @@ import type {
 } from "@crewhaus/ir";
 import { VALIDATING_PASSES, applyPasses as applyIrPassesFn } from "@crewhaus/ir-passes";
 import {
+  SPEC_PROFILE_NAME_RE,
   type Spec,
   type SpecChannel,
   type SpecCrewRole,
   type SpecDiscordChannel,
   type SpecIMessageChannel,
   type SpecMcpServerConfig,
+  type SpecModelPoolBlock,
+  type SpecModelProfile,
+  type SpecModelsBlock,
   type SpecObservabilityBlock,
   type SpecSlackChannel,
   type SpecSubAgentDefinition,
@@ -159,6 +187,32 @@ export type CompileOptions = {
    * runtime the eval then measures. Default: false.
    */
   readonly evalEntry?: boolean;
+  /**
+   * 0.6.0 §4.3 — the calendar date (`YYYY-MM-DD`) the model-sunset check
+   * compares `retiresOn` against. Defaults to today; tests pin it so a
+   * compile is deterministic. See {@link LowerOptions.today}.
+   */
+  readonly today?: string;
+};
+
+/**
+ * 0.6.0 — options for {@link lower}. Both are optional and default to the
+ * `compile()` posture.
+ */
+export type LowerOptions = {
+  /** See {@link CompileOptions.today}. */
+  readonly today?: string;
+  /**
+   * 0.6.0 PR 7 — lower the per-model NARROWING knobs the runtime does not
+   * enforce yet (candidate `tools` / `tool_config` / `permissions` /
+   * `rate_limits` / `cost`, `evaluation.on_fail: escalate`,
+   * `judge.escalate_to`) instead of refusing them. `compile()` and the
+   * `crewhaus run` interpreter never set this: a candidate declared with
+   * `tools: []` must not serve with the full toolset because the dispatch
+   * gate (PR 9a) has not landed. Tests and IR-level tooling set it to
+   * exercise the lowering the runtime will consume.
+   */
+  readonly allowRuntimePendingKeys?: boolean;
 };
 
 /**
@@ -166,10 +220,13 @@ export type CompileOptions = {
  * compile diagnostic. `code` is a stable machine key
  * (`"accepted-but-unwired"`, `"edge-unsafe-tool"`,
  * `"channel-reactions-join"`, `"cli-autodistill-toolchain"`,
- * `"managed-feedback-unsupported"`, `"budget-degrade-outside-pool"`), `path` the spec
- * key it concerns (dot-joined),
- * `message` the human explanation. Additive: every existing `compile()`
- * consumer that only reads `.files` keeps working unchanged.
+ * `"managed-feedback-unsupported"`, `"budget-degrade-outside-pool"`, and from
+ * 0.6.0 the field-precise model-plan notices `"model-plan-ignored-on-shape"`,
+ * `"model-plan-ignored-on-slot"`, `"model-plan-pending-runtime"`,
+ * `"model-plan-self-judge"`, `"model-sunset"`, `"model-capabilities-unknown"`,
+ * `"model-strongest-crosses-provider"`), `path` the spec key it concerns
+ * (dot-joined), `message` the human explanation. Additive: every existing
+ * `compile()` consumer that only reads `.files` keeps working unchanged.
  */
 export type CompileWarning = {
   readonly code: string;
@@ -188,7 +245,8 @@ export type CompileResult = Bundle & {
 
 export function compile(yamlText: string, opts: CompileOptions = {}): CompileResult {
   const spec = parseSpec(yamlText);
-  let ir = lower(spec);
+  const lowered = lowerWithWarnings(spec, opts.today !== undefined ? { today: opts.today } : {});
+  let ir = lowered.ir;
   if (opts.strict === true) {
     assertToolScopesStrict(ir);
   }
@@ -217,7 +275,7 @@ export function compile(yamlText: string, opts: CompileOptions = {}): CompileRes
       ? (emitSourceBundleWithEvalEntry(ir, { readme: opts.readme !== false }) ??
         emit(ir, { readme: opts.readme !== false }))
       : emit(ir, { readme: opts.readme !== false });
-  return { files: bundle.files, warnings: collectCompileWarnings(spec) };
+  return { files: bundle.files, warnings: [...collectCompileWarnings(spec), ...lowered.warnings] };
 }
 
 /**
@@ -873,25 +931,103 @@ function lowerChannels(channels: SpecChannel["channels"]): IrChannels {
  *   - tools ?? []  (codegen treats "no tools" as "no allowed tools" when
  *                   permissions !== "inherit"; tool-task itself encodes
  *                   the same fallback for runtime resolution.)
+ *
+ * 0.6.0 §7.7 — a sub-agent's `model` resolves through the registry like any
+ * serving slot (`agent-full`: a profile's params and failover chain apply, its
+ * overlay folds into the child's instructions), and the child carries its own
+ * routing quartet, params, `budget_share`, `inherit_routing` and
+ * `allowed_profiles` (profile names — the `$` is resolved away). The spawner
+ * consumes them from PR 11; until then every one of those keys is reported
+ * `model-plan-pending-runtime`, and a spec that declares none of them lowers
+ * byte-identically.
  */
 function lowerSubAgents(
   map: Record<string, SpecSubAgentDefinition> | undefined,
+  ctx: LowerContext,
+  path: string,
 ): IrSubAgentDefinition[] {
   if (map === undefined) return [];
   // Stable order: sort by name so generated bundles diff cleanly.
   const entries = Object.entries(map).sort(([a], [b]) => a.localeCompare(b));
-  return entries.map(([name, def]) => ({
-    name,
-    description: def.description,
-    instructions: def.instructions,
-    tools: def.tools ?? [],
-    ...(def.model !== undefined ? { model: def.model } : {}),
-    permissions: def.permissions ?? "inherit",
-    inheritBypass: def.inherit_bypass ?? false,
-    // Item 2 (G31) — federated-peer reference. Carried only when declared; the
-    // spawner routes through the federation-router when present.
-    ...(def.federation !== undefined ? { federation: { url: def.federation.url } } : {}),
-  }));
+  return entries.map(([name, def]) => {
+    const p = `${path}.sub_agents.${name}`;
+    const hasRouting =
+      def.model_pool !== undefined ||
+      def.model_tiers !== undefined ||
+      def.model_fallbacks !== undefined;
+    const local: SingleSlotLocal = {
+      ...lowerThinking(def.thinking),
+      ...(def.max_tokens !== undefined ? { maxTokens: def.max_tokens } : {}),
+      ...(def.temperature !== undefined ? { temperature: def.temperature } : {}),
+      hasRouting,
+    };
+    const slot =
+      def.model !== undefined
+        ? applyProfileToSlot(
+            resolveModelRef(def.model, ctx, `${p}.model`),
+            ctx,
+            `${p}.model`,
+            "agent-full",
+            local,
+          )
+        : undefined;
+    const routing = lowerModelFailover(def, ctx, p);
+    const allowedProfiles = def.allowed_profiles?.map((entry, i) => {
+      const profile = profileRefName(entry);
+      if (profile === undefined || ctx.registry[profile] === undefined) {
+        throw new CompilerError(
+          `${p}.allowed_profiles[${i}]: "${entry}" must name a declared models: profile (as $<name>)`,
+        );
+      }
+      return profile;
+    });
+    const lowered: IrSubAgentDefinition = {
+      name,
+      description: def.description,
+      instructions: foldOverlay(def.instructions, slot?.overlay),
+      tools: def.tools ?? [],
+      ...(slot !== undefined ? { model: slot.model } : {}),
+      permissions: def.permissions ?? "inherit",
+      inheritBypass: def.inherit_bypass ?? false,
+      // Item 2 (G31) — federated-peer reference. Carried only when declared; the
+      // spawner routes through the federation-router when present.
+      ...(def.federation !== undefined ? { federation: { url: def.federation.url } } : {}),
+      // 0.6.0 §7.7 — per-sub-agent params + routing (declared, or the profile's).
+      ...(slot !== undefined
+        ? servingSlotFields(slot)
+        : {
+            ...(local.thinking !== undefined ? { thinking: local.thinking } : {}),
+            ...(local.maxTokens !== undefined ? { maxTokens: local.maxTokens } : {}),
+            ...(local.temperature !== undefined ? { temperature: local.temperature } : {}),
+          }),
+      ...routing,
+      ...(slot !== undefined ? servingSlotFailover(slot) : {}),
+      ...(def.budget_share !== undefined ? { budgetShare: def.budget_share } : {}),
+      ...(def.inherit_routing !== undefined ? { inheritRouting: def.inherit_routing } : {}),
+      ...(allowedProfiles !== undefined ? { allowedProfiles } : {}),
+    };
+    for (const [irKey, specKey] of [
+      ["thinking", "thinking"],
+      ["maxTokens", "max_tokens"],
+      ["temperature", "temperature"],
+      ["modelFallbacks", "model_fallbacks"],
+      ["circuitBreaker", "circuit_breaker"],
+      ["modelTiers", "model_tiers"],
+      ["modelPool", "model_pool"],
+      ["budgetShare", "budget_share"],
+      ["inheritRouting", "inherit_routing"],
+      ["allowedProfiles", "allowed_profiles"],
+    ] as const) {
+      if (lowered[irKey] === undefined) continue;
+      warn(
+        ctx,
+        "model-plan-pending-runtime",
+        `${p}.${specKey}`,
+        `${p}.${specKey} is lowered into the IR but the sub-agent spawner reads only model / tools / permissions today — it lands with 0.6.0 ${LANDING_SUBAGENTS}; until then it is inert`,
+      );
+    }
+    return lowered;
+  });
 }
 
 /**
@@ -943,8 +1079,13 @@ function lowerToolConfigs(
  * an object so codegen can read `ir.compaction.model` safely. When the
  * spec omits the block entirely, the IR carries an empty object — runtime
  * resolves to "use the agent's primary model" in that case.
+ *
+ * 0.6.0 §4.3 — `compaction.model` is an AUXILIARY slot: `$profile`,
+ * `cheapest` and `strongest` all resolve through {@link resolveAuxSlot}; a
+ * profile's pinned request params ride `params` for the autocompact request
+ * builder, with the profile name beside them as provenance.
  */
-function lowerCompaction(spec: SpecWithPermissions): IrCompaction {
+function lowerCompaction(spec: SpecWithPermissions, ctx: LowerContext): IrCompaction {
   const c = spec.compaction;
   if (c === undefined) return {};
   // Propagate each defined field verbatim. Defaults belong at the
@@ -954,7 +1095,12 @@ function lowerCompaction(spec: SpecWithPermissions): IrCompaction {
   const out: {
     -readonly [K in keyof IrCompaction]: IrCompaction[K];
   } = {};
-  if (c.model !== undefined) out.model = resolveAuxModel(c.model, spec, "compaction.model");
+  if (c.model !== undefined) {
+    const slot = resolveAuxSlot(c.model, ctx, "compaction.model");
+    out.model = slot.model;
+    if (slot.modelProfile !== undefined) out.modelProfile = slot.modelProfile;
+    if (slot.params !== undefined) out.params = slot.params;
+  }
   // Loop contract 0.4 (Batch A) — threshold + snip window, snake_case spec
   // keys renamed to camelCase IR keys, carried verbatim only when declared.
   if (c.threshold !== undefined) out.threshold = c.threshold;
@@ -966,135 +1112,46 @@ function lowerCompaction(spec: SpecWithPermissions): IrCompaction {
   return out;
 }
 
-/**
- * Item 25 — the `cheapest` sentinel for an AUX model knob (compaction.model,
- * judge model, …). Resolved AT COMPILE TIME to the lowest-cost same-provider
- * model (as the primary's provider) whose capabilities satisfy the slot, so
- * the IR — and every emitted bundle — carries a concrete model id. An aux slot
- * summarizes / grades text, so its capability requirement is empty (any
- * same-provider family qualifies); `cheapest` therefore resolves to the
- * provider's cheapest family. A non-`cheapest` value passes through verbatim.
- *
- * The primary model lives in different places depending on target shape:
- * `cli`/`managed`/`pipeline`/`research`/… carry it under `agent.model`, while
- * `workflow`/`graph`/`crew` carry it as a required TOP-LEVEL `model` field
- * (no `agent` block at all). `lowerCompaction` runs for every target, so this
- * checks `agent.model` first and falls back to the top-level `model`.
- *
- * When the primary is a provider the pricing table doesn't cover (local/,
- * azure/, a named host) `cheapest` cannot be resolved offline — the sentinel
- * is a compile ERROR there (the operator must name a concrete model), because
- * silently leaving the literal string `"cheapest"` in the IR would fail later
- * at `resolveModel` with a far less actionable message.
- */
-function resolveAuxModel(value: string, spec: SpecWithPermissions, slotLabel: string): string {
-  if (value !== CHEAPEST_SENTINEL) return value;
-  const specLike = spec as { agent?: { model?: unknown }; model?: unknown };
-  const primary = specLike.agent?.model ?? specLike.model;
-  if (typeof primary !== "string") {
-    throw new CompilerError(
-      `${slotLabel}: "cheapest" needs a primary agent.model to resolve against, but this spec has none`,
-    );
-  }
-  const resolved = resolveCheapestForSlot(primary);
-  if (resolved === undefined) {
-    throw new CompilerError(
-      `${slotLabel}: "cheapest" cannot be resolved for primary model "${primary}" — its provider is not in the pricing table (local/azure/named-host). Name a concrete model instead.`,
-    );
-  }
-  return resolved;
-}
-
-/**
- * Item 22 — lower the optional failover-chain fields off an agent block
- * (`model_fallbacks` + `circuit_breaker`). Mirrors `lowerCompaction`'s
- * "propagate only defined fields" discipline: the breaker package owns the
- * per-knob defaults, so the IR carries the user's intent verbatim. Returns
- * a partial spread into the IR agent object so both fields stay ABSENT when
- * the spec omits them (emitters gate their codegen on presence).
- */
-type SpecAgentWithFailover = {
-  readonly model_fallbacks?: readonly string[];
-  readonly circuit_breaker?: {
-    readonly failureThreshold?: number;
-    readonly windowMs?: number;
-    readonly cooldownMs?: number;
-  };
-  readonly model_tiers?: {
-    readonly fast: string;
-    readonly default: string;
-    readonly routing?: {
-      readonly contextTokenThreshold?: number;
-      readonly toolsToDefault?: boolean;
-      readonly firstTurnToDefault?: boolean;
-      readonly priorToolDensityThreshold?: number;
-    };
-  };
-  readonly model_pool?: {
-    readonly candidates: ReadonlyArray<{
-      readonly model: string;
-      readonly tags: readonly string[];
-    }>;
-    readonly policy: "static" | "heuristic" | "learned" | "classifier";
-    readonly objective?: {
-      readonly quality?: number;
-      readonly cost?: number;
-      readonly latency?: number;
-    };
-    readonly routing?: {
-      readonly contextTokenThreshold?: number;
-      readonly toolsToDefault?: boolean;
-      readonly firstTurnToDefault?: boolean;
-      readonly priorToolDensityThreshold?: number;
-      readonly strongTag?: string;
-      readonly cheapTag?: string;
-    };
-    readonly learning?: {
-      readonly minSamplesPerArm?: number;
-      readonly costRefUsd?: number;
-      readonly latencyRefMs?: number;
-      readonly explorationRate?: number;
-      readonly seed?: string;
-      readonly bandit?: "epsilon-greedy" | "thompson";
-    };
-  };
-};
-
 // ---------------------------------------------------------------------------
-// 0.6.0 PR 6 (spec surface) — ONE interim guard, deleted wholesale by PR 7.
+// 0.6.0 §4.3 — model references, sentinels, profiles and the per-slot
+// contract.
 //
-// Every key of the plan's §11.1 spec delta parses from this release, and none
-// of it is lowered until the IR widening (PR 7). The posture is uniform: a
-// spec that declares any pending key is a LOUD, path-precise `CompilerError`
-// — never a silently dropped key. The alternative (accept-and-drop) is a
-// hazard on the security-relevant keys: a candidate declared with
-// `tools: [read]` + `permissions.deny` would serve with the full toolset, a
-// grader declared with `judges: [...]` and no `model` would become the
-// serving model judging itself (the exact failure §6.2 exists to prevent),
-// and `enabled: false` would keep a withdrawn candidate serving.
+// A `$<profile>` reference is a LOWER-TIME MACRO (design stance 1): on a
+// single-model slot it expands into the existing IR fields (`model`,
+// `thinking`, `maxTokens`, plus `temperature`) and a provenance-only
+// `modelProfile` name; an overlay folds into `instructions`; nothing
+// downstream of the compiler ever sees a `$`. Only a `model_pool` candidate
+// carries the whole profile to runtime, inside the one
+// `JSON.stringify(modelPool)` blob every emitter already writes. The
+// `cheapest` sentinel keeps its item-25 semantics; `strongest` (§4.3)
+// resolves ROSTER-FIRST — the first `strong`-tagged profile or candidate,
+// else the last declared — and by price rank only for a bare single-model
+// spec, never inside a roster member's own `model:` (the circularity rule).
 //
-// `assertNoPending060Keys` walks the parsed spec ONCE from `lower()`. It is
-// a loose-typed walk on purpose: the pending keys live on eight routed
-// blocks across seven shapes and this code has a one-release lifetime, so
-// it stays independent of the per-shape structural types the real lowering
-// functions carry. Absent config passes straight through — the lowering
-// below is byte-identical to 0.5.x (the `pre-continuity` byte-pin fixtures
-// pin that).
+// Everything a slot cannot honour is reported FIELD-PRECISELY as a
+// `compile()` warning (never an `ACCEPTED_BUT_UNWIRED` row — that table is a
+// top-level-key mechanism whose canned sentence would be false for a spec
+// whose model the registry supplied):
+//   - `model-plan-ignored-on-shape`  — the shape has no home for the field
+//     (voice registers no tool catalog, pipeline has no thinking, …);
+//   - `model-plan-ignored-on-slot`   — the field is pool-candidate / primary
+//     semantics and has no meaning on this slot (a judge, a tier, a fallback);
+//   - `model-plan-pending-runtime`   — lowered into the IR, but the runtime
+//     consumer lands with a later 0.6.0 PR-train row; inert until then. The
+//     landing PR deletes the row, exactly the ACCEPTED_BUT_UNWIRED
+//     delete-when-wired contract applied at field level.
 //
-// The two narrowing throws inside `lowerModelFailover` and `lowerEvaluation`
-// (`policy: classifier`, `on_fail: escalate`) are the SAME error and are
-// unreachable once this walk has run: they exist only because the compiler's
-// local structural types widened with the spec and the IR enums they feed
-// have not — `tsc -b` needs the narrowing. PR 7 removes this whole section
-// and those two lines together.
+// One class is REFUSED rather than warned until its runtime lands: the
+// NARROWING knobs on a serving slot — a candidate's (or a primary-slot
+// profile's) `tools` / `tool_config` / `permissions` / `rate_limits` / `cost`
+// (the PR 9a dispatch gate + plan table), `evaluation.on_fail: escalate` and
+// `judge.escalate_to` (PR 9c). Accepting them and letting the runtime ignore
+// them would serve a candidate declared `tools: []` with the full toolset —
+// the exact hazard the interim PR 6 guard existed to prevent.
+// `LowerOptions.allowRuntimePendingKeys` lowers them anyway (tests, IR
+// tooling); `compile()` never sets it. `mcp_servers.<n>.tool_flags` has no
+// PR-train row for its IR + emit half yet and stays refused too.
 // ---------------------------------------------------------------------------
-
-const PENDING_060_SUFFIX =
-  " is accepted by the spec but not yet lowered by this compiler — it lands with the 0.6.0 IR widening (PR 7); remove it from the spec for now";
-
-function pending060(path: string, hint?: string): CompilerError {
-  return new CompilerError(`${path}${PENDING_060_SUFFIX}${hint !== undefined ? ` (${hint})` : ""}`);
-}
 
 type LooseBlock = Readonly<Record<string, unknown>>;
 
@@ -1112,173 +1169,1255 @@ function firstDeclaredKey(block: LooseBlock, keys: readonly string[]): string | 
   return undefined;
 }
 
-/** `model_pool` siblings of `routing`/`learning` added by §7.1. */
-const PENDING_060_POOL_KEYS = [
-  "directives",
-  "rules",
-  "classifier",
-  "strategy",
-  "reward",
-  "scope",
-] as const;
-/** What a pool candidate lowers as today (`lowerModelFailover`); everything else is §7.1 inline profile fields + `enabled`. */
-const LOWERED_CANDIDATE_KEYS: ReadonlySet<string> = new Set(["model", "tags"]);
-/** `kind: judge` gate panel fields (§6.2) + the cascade target (§7.3). */
-const PENDING_060_JUDGE_GATE_KEYS = [
-  "judges",
-  "repeats",
-  "temperature",
-  "target",
-  "escalate_to",
-] as const;
-/** In-loop `llm_judge` grader panel fields (§6.2). */
-const PENDING_060_GRADER_KEYS = ["judges", "repeats", "temperature", "target"] as const;
-/** §7.7 sub-agent routing + params (sub-agents carried none of these before 0.6.0). */
-const PENDING_060_SUB_AGENT_KEYS = [
-  "model_pool",
-  "model_tiers",
-  "model_fallbacks",
-  "circuit_breaker",
-  "thinking",
-  "max_tokens",
-  "temperature",
-  "budget_share",
-  "inherit_routing",
-  "allowed_profiles",
-] as const;
-/** §7.7 graph-node routing (graph nodes carried NO routing before 0.6.0). */
-const PENDING_060_NODE_ROUTING_KEYS = [
-  "model_pool",
-  "model_tiers",
-  "model_fallbacks",
-  "circuit_breaker",
+/** The narrowing knobs a serving candidate/profile may declare that the runtime cannot enforce before PR 9a. */
+const RUNTIME_PENDING_NARROWING_KEYS = [
+  "tools",
+  "tool_config",
+  "permissions",
+  "rate_limits",
+  "cost",
 ] as const;
 
-function assertPoolLowerable(path: string, pool: LooseBlock): void {
-  if (pool["policy"] === "classifier") {
-    throw pending060(`${path}.policy: classifier`, "use static | heuristic | learned");
-  }
-  const sibling = firstDeclaredKey(pool, PENDING_060_POOL_KEYS);
-  if (sibling !== undefined) throw pending060(`${path}.${sibling}`);
+const LANDING_PLAN_TABLE = "PR 9a (the per-candidate plan table and dispatch gate)";
+const LANDING_PREROUTE = "PR 9b (the preRoute decision phase)";
+const LANDING_STRATEGIES = "PR 9c/9d (cascade and the guide / shadow / committee side-calls)";
+const LANDING_MODEL_DIRECTED = "PR 8b (@crewhaus/tool-consult: the Consult / Escalate tools)";
+const LANDING_ROUTER_STORE = "PR 10 (scoped arms, priors and the reward store)";
+const LANDING_SUBAGENTS = "PR 11 (sub-agent routing end to end)";
+const LANDING_JUDGE_PANEL = "the §6.2 judge-panel wiring (createJudgeGrader in every judge site)";
+const LANDING_AUX_PARAMS =
+  "the §4.2 per-slot params consumers (the judge / compaction / degrade / security / watchme request builders)";
+
+function runtimePending(path: string, landing: string, hint?: string): CompilerError {
+  return new CompilerError(
+    `${path} is accepted by the spec and lowered into the IR, but this runtime does not enforce it yet — it lands with 0.6.0 ${landing}; remove it from the spec for now${hint !== undefined ? ` (${hint})` : ""}`,
+  );
+}
+
+function assertCandidatesLowerable(path: string, pool: LooseBlock): void {
   const candidates = Array.isArray(pool["candidates"]) ? pool["candidates"] : [];
   for (const [i, raw] of candidates.entries()) {
     const candidate = asLooseBlock(raw);
     if (candidate === undefined) continue;
-    for (const key of Object.keys(candidate)) {
-      if (!LOWERED_CANDIDATE_KEYS.has(key) && candidate[key] !== undefined) {
-        throw pending060(
-          `${path}.candidates[${i}].${key}`,
-          "a pool candidate lowers as { model, tags } today",
-        );
-      }
+    const key = firstDeclaredKey(candidate, RUNTIME_PENDING_NARROWING_KEYS);
+    if (key !== undefined) {
+      throw runtimePending(
+        `${path}.candidates[${i}].${key}`,
+        LANDING_PLAN_TABLE,
+        "a candidate declared narrower than the shape would serve with the shape's full toolset and permissions until the dispatch gate lands",
+      );
     }
   }
 }
 
-function assertRoutedBlockLowerable(
-  path: string,
-  block: LooseBlock,
-  opts: { readonly nodeRouting: boolean },
-): void {
-  if (block["temperature"] !== undefined) throw pending060(`${path}.temperature`);
-  if (opts.nodeRouting) {
-    const routingKey = firstDeclaredKey(block, PENDING_060_NODE_ROUTING_KEYS);
-    if (routingKey !== undefined) {
-      throw pending060(`${path}.${routingKey}`, "graph nodes carry no model routing before 0.6.0");
-    }
-  }
+function assertRoutedBlockLowerable(path: string, block: LooseBlock): void {
   const pool = asLooseBlock(block["model_pool"]);
-  if (pool !== undefined) assertPoolLowerable(`${path}.model_pool`, pool);
+  if (pool !== undefined) assertCandidatesLowerable(`${path}.model_pool`, pool);
   const judge = asLooseBlock(block["judge"]);
-  if (judge !== undefined) {
-    const judgeKey = firstDeclaredKey(judge, PENDING_060_JUDGE_GATE_KEYS);
-    if (judgeKey !== undefined) throw pending060(`${path}.judge.${judgeKey}`);
+  if (judge?.["escalate_to"] !== undefined) {
+    throw runtimePending(
+      `${path}.judge.escalate_to`,
+      "PR 9c (the forced re-run of a failed gate on the escalation rung)",
+      "until then a retry_previous re-run keeps the gated block's own routing",
+    );
   }
   const subAgents = asLooseBlock(block["sub_agents"]);
   if (subAgents !== undefined) {
     for (const [name, raw] of Object.entries(subAgents)) {
       const def = asLooseBlock(raw);
-      if (def === undefined) continue;
-      const subKey = firstDeclaredKey(def, PENDING_060_SUB_AGENT_KEYS);
-      if (subKey !== undefined) throw pending060(`${path}.sub_agents.${name}.${subKey}`);
+      if (def !== undefined) assertRoutedBlockLowerable(`${path}.sub_agents.${name}`, def);
     }
   }
 }
 
 /**
- * Throw a path-precise `CompilerError` on the FIRST pending 0.6.0 spec key
- * the spec declares; return silently on a 0.5.x-shaped spec. Runs once from
- * `lower()`, before the per-shape switch.
+ * Throw a path-precise `CompilerError` on the FIRST runtime-pending narrowing
+ * key the spec declares; return silently otherwise. Runs once from `lower()`
+ * unless `allowRuntimePendingKeys` is set.
  */
-function assertNoPending060Keys(spec: Spec): void {
+function assertNoRuntimePendingKeys(spec: Spec): void {
   const s = spec as unknown as LooseBlock;
-  // §4.1 — the registry. The spec rejects any `$profile` reference without
-  // one, so this single check also keeps a literal `$fast` out of the
-  // model-router grammar until `resolveModelRef` lands.
-  if (s["models"] !== undefined) {
-    throw pending060(
-      "models: (the model-profile registry)",
-      "inline the profile's settings on the slot",
-    );
-  }
-  // §5 item 5 — narrowing-only trust flags on MCP tools.
   const mcpServers = asLooseBlock(s["mcp_servers"]);
   if (mcpServers !== undefined) {
     for (const [name, raw] of Object.entries(mcpServers)) {
       if (asLooseBlock(raw)?.["tool_flags"] !== undefined) {
-        throw pending060(`mcp_servers.${name}.tool_flags`);
+        throw new CompilerError(
+          `mcp_servers.${name}.tool_flags is accepted by the spec but not yet lowered by this compiler — its IR and emit wiring (registerMcpServer flags) has no 0.6.0 PR-train row yet; remove it from the spec for now`,
+        );
       }
     }
   }
-  // §6.2 / §7.3 — in-loop evaluation.
   const evaluation = asLooseBlock(s["evaluation"]);
-  if (evaluation !== undefined) {
-    if (evaluation["on_fail"] === "escalate") {
-      throw pending060("evaluation.on_fail: escalate", "use retry | halt | note");
-    }
-    if (evaluation["allow_self_judge"] !== undefined)
-      throw pending060("evaluation.allow_self_judge");
-    const grader = asLooseBlock(evaluation["grader"]);
-    if (grader !== undefined) {
-      const graderKey = firstDeclaredKey(grader, PENDING_060_GRADER_KEYS);
-      if (graderKey !== undefined) throw pending060(`evaluation.grader.${graderKey}`);
-    }
+  if (evaluation?.["on_fail"] === "escalate") {
+    throw runtimePending(
+      "evaluation.on_fail: escalate",
+      "PR 9c (the cascade re-run on the escalation rung)",
+      "use retry | halt | note",
+    );
   }
-  // §7.7 — the crew llm router's model slot.
-  if (spec.target === "crew" && asLooseBlock(s["routing"])?.["model"] !== undefined) {
-    throw pending060("routing.model", "the kind: llm router runs on the entry role's model today");
-  }
-  // The routed blocks: the agent block (cli/channel/managed and the pooled
-  // single-agent shapes), workflow steps, graph nodes, crew roles — and the
-  // sub-agents hanging off any of them.
   const agent = asLooseBlock(s["agent"]);
-  if (agent !== undefined) assertRoutedBlockLowerable("agent", agent, { nodeRouting: false });
+  if (agent !== undefined) assertRoutedBlockLowerable("agent", agent);
   if (Array.isArray(s["steps"])) {
     for (const [i, raw] of s["steps"].entries()) {
       const step = asLooseBlock(raw);
-      if (step !== undefined)
-        assertRoutedBlockLowerable(`steps[${i}]`, step, { nodeRouting: false });
+      if (step !== undefined) assertRoutedBlockLowerable(`steps[${i}]`, step);
     }
   }
-  const nodes = asLooseBlock(s["nodes"]);
-  if (nodes !== undefined) {
-    for (const [name, raw] of Object.entries(nodes)) {
-      const node = asLooseBlock(raw);
-      if (node !== undefined)
-        assertRoutedBlockLowerable(`nodes.${name}`, node, { nodeRouting: true });
-    }
-  }
-  const roles = asLooseBlock(s["roles"]);
-  if (roles !== undefined) {
-    for (const [name, raw] of Object.entries(roles)) {
-      const role = asLooseBlock(raw);
-      if (role !== undefined)
-        assertRoutedBlockLowerable(`roles.${name}`, role, { nodeRouting: false });
+  for (const key of ["nodes", "roles"] as const) {
+    const map = asLooseBlock(s[key]);
+    if (map === undefined) continue;
+    for (const [name, raw] of Object.entries(map)) {
+      const block = asLooseBlock(raw);
+      if (block !== undefined) assertRoutedBlockLowerable(`${key}.${name}`, block);
     }
   }
 }
 
-function lowerModelFailover(agent: SpecAgentWithFailover): {
+/** The `$<profile>` reference form every model slot accepts (0.6.0 §4.1). */
+function profileRefName(value: string): string | undefined {
+  return value.startsWith("$") ? value.slice(1) : undefined;
+}
+
+/** Nearest declared name within 3 edits — the did-you-mean helper. */
+function nearestName(target: string, declared: readonly string[]): string | undefined {
+  let best: string | undefined;
+  let bestDistance = 4;
+  for (const candidate of declared) {
+    const d = levenshtein(target, candidate);
+    if (d < bestDistance) {
+      best = candidate;
+      bestDistance = d;
+    }
+  }
+  return best;
+}
+
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(
+        (prev[j] as number) + 1,
+        (cur[j - 1] as number) + 1,
+        (prev[j - 1] as number) + cost,
+      );
+    }
+    prev = cur;
+  }
+  return prev[b.length] as number;
+}
+
+/**
+ * Everything `lower()` needs to resolve a model slot: the lowered `models:`
+ * registry, the primary model the sentinels rank against, the roster
+ * `strongest` searches first, the calendar date for the sunset check, and the
+ * warnings sink. Built once per `lower()` by {@link createLowerContext}.
+ */
+type LowerContext = {
+  readonly target: Spec["target"];
+  readonly registry: IrModelProfiles;
+  readonly hasRegistry: boolean;
+  /**
+   * 0.6.0 §6.2 / §14 — TRUE when the spec opted into the hybrid surface (a
+   * `models:` registry or a pool `strategy`); gates the judge-default flip
+   * and the judge-independence lint.
+   */
+  readonly optedIn: boolean;
+  /** The primary grammar string (never a `$ref`, never a sentinel) — `undefined` on a spec without one. */
+  readonly primary: string | undefined;
+  readonly roster: readonly RosterMember[];
+  readonly today: string;
+  readonly allowPending: boolean;
+  readonly warnings: CompileWarning[];
+};
+
+function todayIso(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function warn(ctx: LowerContext, code: string, path: string, message: string): void {
+  ctx.warnings.push({ code, path, message });
+}
+
+/** The raw (spec-side) registry a spec declares, `{}` when absent. */
+function specRegistry(spec: Spec): Readonly<Record<string, SpecModelProfile>> {
+  return (spec as { readonly models?: SpecModelsBlock }).models ?? {};
+}
+
+/**
+ * The PRIMARY model every sentinel ranks against: `agent.model` on the
+ * agent-carrying shapes, the top-level `model` on workflow/graph/crew,
+ * followed through a `$ref` to the profile's own grammar string. `undefined`
+ * when the spec has none, or when the primary is itself a sentinel — a
+ * sentinel cannot be the answer to its own question.
+ */
+function resolvePrimaryModel(spec: Spec): string | undefined {
+  const specLike = spec as { agent?: { model?: unknown }; model?: unknown };
+  const raw = specLike.agent?.model ?? specLike.model;
+  if (typeof raw !== "string") return undefined;
+  const name = profileRefName(raw);
+  const resolved = name !== undefined ? specRegistry(spec)[name]?.model : raw;
+  if (resolved === undefined || resolved === CHEAPEST_SENTINEL || resolved === STRONGEST_SENTINEL) {
+    return undefined;
+  }
+  return resolved;
+}
+
+/**
+ * The roster `strongest` searches before falling back to price rank (§4.3):
+ * every `models:` profile in declaration order, then every `model_pool`
+ * candidate anywhere in the spec (agent / steps / nodes / roles / sub-agents),
+ * each with its effective routing tags. Candidates spelled as `$refs` carry
+ * the profile's model and inherit its tags when they declare none.
+ */
+function collectRoster(spec: Spec, registry: IrModelProfiles): RosterMember[] {
+  const roster: RosterMember[] = [];
+  for (const [name, profile] of Object.entries(registry)) {
+    roster.push({
+      name,
+      model: profile.model,
+      ...(profile.tags !== undefined ? { tags: profile.tags } : {}),
+    });
+  }
+  const visitPool = (pool: unknown): void => {
+    const candidates = asLooseBlock(pool)?.["candidates"];
+    if (!Array.isArray(candidates)) return;
+    for (const raw of candidates) {
+      const c = asLooseBlock(raw);
+      if (c === undefined || typeof c["model"] !== "string") continue;
+      const name = profileRefName(c["model"]);
+      // A `$ref` candidate carries the LOWERED profile's model (its own
+      // sentinel already ranked); a raw member's own sentinel is skipped by
+      // `resolveStrongestFromRoster`.
+      const model = name !== undefined ? registry[name]?.model : c["model"];
+      if (model === undefined) continue;
+      const localTags = Array.isArray(c["tags"]) ? (c["tags"] as string[]) : [];
+      const tags = localTags.length > 0 ? localTags : (registry[name ?? ""]?.tags ?? []);
+      roster.push({ model, tags });
+    }
+  };
+  const visitBlock = (block: unknown): void => {
+    const b = asLooseBlock(block);
+    if (b === undefined) return;
+    visitPool(b["model_pool"]);
+    const subAgents = asLooseBlock(b["sub_agents"]);
+    if (subAgents !== undefined) for (const def of Object.values(subAgents)) visitBlock(def);
+  };
+  const s = spec as unknown as LooseBlock;
+  visitBlock(s["agent"]);
+  if (Array.isArray(s["steps"])) for (const step of s["steps"]) visitBlock(step);
+  for (const key of ["nodes", "roles"] as const) {
+    const map = asLooseBlock(s[key]);
+    if (map !== undefined) for (const block of Object.values(map)) visitBlock(block);
+  }
+  return roster;
+}
+
+/** One slot's resolution: the concrete model plus, for a `$ref`, its profile. */
+type ResolvedModelRef = {
+  readonly model: string;
+  readonly profile?: string;
+  readonly settings?: IrModelProfile;
+};
+
+/**
+ * 0.6.0 §4.3 — `resolveModelRef`: the ONE resolver every model slot goes
+ * through (the six that bypassed `resolveAuxModel` included). A `$ref`
+ * yields the registry profile's model and settings; `cheapest` keeps its
+ * item-25 same-provider price rank against the primary; `strongest`
+ * resolves roster-first (profiles, then candidates — first `strong`-tagged,
+ * else last declared), and by price rank only for a bare single-model spec.
+ * `inRoster` is the circularity rule: inside a profile's own `model:` or a
+ * candidate's `model:`, the sentinels rank against the primary only. A
+ * grammar string passes through verbatim.
+ */
+function resolveModelRef(
+  value: string,
+  ctx: LowerContext,
+  slotLabel: string,
+  opts: { readonly inRoster?: boolean } = {},
+): ResolvedModelRef {
+  const name = profileRefName(value);
+  if (name !== undefined) {
+    if (!SPEC_PROFILE_NAME_RE.test(name)) {
+      throw new CompilerError(
+        `${slotLabel}: "${value}" is not a valid profile reference — profile names match /^[a-z][a-z0-9_-]{0,63}$/`,
+      );
+    }
+    const settings = ctx.registry[name];
+    if (settings === undefined) {
+      const declared = Object.keys(ctx.registry);
+      const nearest = nearestName(name, declared);
+      const hint =
+        declared.length === 0
+          ? "this spec declares no models: block"
+          : nearest !== undefined
+            ? `did you mean "$${nearest}"? declared: ${declared.map((d) => `$${d}`).join(", ")}`
+            : `declared: ${declared.map((d) => `$${d}`).join(", ")}`;
+      throw new CompilerError(`${slotLabel}: unknown profile "${value}" — ${hint}`);
+    }
+    return { model: settings.model, profile: name, settings };
+  }
+  if (value === CHEAPEST_SENTINEL) {
+    if (ctx.primary === undefined) {
+      throw new CompilerError(
+        `${slotLabel}: "cheapest" needs a primary agent.model to resolve against, but this spec has none (or its primary is itself a sentinel)`,
+      );
+    }
+    const resolved = resolveCheapestForSlot(ctx.primary);
+    if (resolved === undefined) {
+      throw new CompilerError(
+        `${slotLabel}: "cheapest" cannot be resolved for primary model "${ctx.primary}" — its provider is not in the pricing table (local/azure/named-host). Name a concrete model instead.`,
+      );
+    }
+    return { model: resolved };
+  }
+  if (value === STRONGEST_SENTINEL) {
+    const resolved = resolveStrongestForSlot(ctx.primary ?? "", {
+      ...(opts.inRoster === true ? { inRoster: true } : { roster: ctx.roster }),
+    });
+    if (resolved === undefined) {
+      throw new CompilerError(
+        ctx.primary === undefined
+          ? `${slotLabel}: "strongest" needs a models: profile or model_pool roster, or a primary agent.model to rank against — this spec has neither`
+          : `${slotLabel}: "strongest" cannot be resolved for primary model "${ctx.primary}" — declare a models: profile or model_pool candidate to pick from, or name a concrete model (its provider is not in the pricing table)`,
+      );
+    }
+    if (ctx.primary !== undefined && crossesProvider(ctx.primary, resolved.modelString)) {
+      warn(
+        ctx,
+        "model-strongest-crosses-provider",
+        slotLabel,
+        `${slotLabel}: "strongest" resolved to "${resolved.modelString}" (${resolved.source}), a different provider from the primary "${ctx.primary}" — transcript content leaves the primary's box and a second credential is needed`,
+      );
+    }
+    const settings = resolved.profile !== undefined ? ctx.registry[resolved.profile] : undefined;
+    return {
+      model: resolved.modelString,
+      ...(resolved.profile !== undefined ? { profile: resolved.profile } : {}),
+      ...(settings !== undefined ? { settings } : {}),
+    };
+  }
+  return { model: value };
+}
+
+/** The spec-side shape a `models:` profile and an inline pool candidate share. */
+type SpecProfileFields = {
+  readonly tags?: readonly string[];
+  readonly max_tokens?: number;
+  readonly thinking?: SpecThinking;
+  readonly temperature?: number;
+  readonly instructions?: string;
+  readonly tools?: readonly string[];
+  readonly tool_config?: Record<string, unknown>;
+  readonly permissions?: { readonly deny?: readonly string[]; readonly ask?: readonly string[] };
+  readonly rate_limits?: SpecRateLimits;
+  readonly limits?: { readonly model_call_timeout_ms?: number };
+  readonly caching?: "prefer" | "off";
+  readonly cost?: { readonly max_usd: number };
+  readonly requires?: {
+    readonly tool_use?: boolean;
+    readonly vision?: boolean;
+    readonly thinking?: boolean;
+    readonly web_search?: boolean;
+    readonly context_window_gte?: number;
+    readonly max_output_tokens_gte?: number;
+  };
+  readonly capabilities?: {
+    readonly tool_use?: boolean;
+    readonly vision?: boolean;
+    readonly thinking?: boolean;
+    readonly web_search?: boolean;
+    readonly caching?: "explicit" | "automatic" | false;
+    readonly context_window?: number;
+    readonly max_output_tokens?: number;
+  };
+  readonly fallbacks?: readonly string[];
+  readonly circuit_breaker?: {
+    readonly failureThreshold?: number;
+    readonly windowMs?: number;
+    readonly cooldownMs?: number;
+  };
+};
+
+function lowerCircuitBreaker(
+  cb: NonNullable<SpecProfileFields["circuit_breaker"]>,
+): IrCircuitBreaker {
+  return {
+    ...(cb.failureThreshold !== undefined ? { failureThreshold: cb.failureThreshold } : {}),
+    ...(cb.windowMs !== undefined ? { windowMs: cb.windowMs } : {}),
+    ...(cb.cooldownMs !== undefined ? { cooldownMs: cb.cooldownMs } : {}),
+  };
+}
+
+/** §5.4 — the restricted `{deny, ask}` profile permissions, carried verbatim. */
+function lowerProfilePermissions(
+  p: NonNullable<SpecProfileFields["permissions"]>,
+): IrProfilePermissions {
+  return {
+    ...(p.deny !== undefined ? { deny: [...p.deny] } : {}),
+    ...(p.ask !== undefined ? { ask: [...p.ask] } : {}),
+  };
+}
+
+function lowerRequires(r: NonNullable<SpecProfileFields["requires"]>): IrModelRequires {
+  return {
+    ...(r.tool_use !== undefined ? { tool_use: r.tool_use } : {}),
+    ...(r.vision !== undefined ? { vision: r.vision } : {}),
+    ...(r.thinking !== undefined ? { thinking: r.thinking } : {}),
+    ...(r.web_search !== undefined ? { web_search: r.web_search } : {}),
+    ...(r.context_window_gte !== undefined ? { contextWindowGte: r.context_window_gte } : {}),
+    ...(r.max_output_tokens_gte !== undefined
+      ? { maxOutputTokensGte: r.max_output_tokens_gte }
+      : {}),
+  };
+}
+
+function lowerCapabilities(c: NonNullable<SpecProfileFields["capabilities"]>): IrModelCapabilities {
+  return {
+    ...(c.tool_use !== undefined ? { tool_use: c.tool_use } : {}),
+    ...(c.vision !== undefined ? { vision: c.vision } : {}),
+    ...(c.thinking !== undefined ? { thinking: c.thinking } : {}),
+    ...(c.web_search !== undefined ? { web_search: c.web_search } : {}),
+    ...(c.caching !== undefined ? { caching: c.caching } : {}),
+    ...(c.context_window !== undefined ? { contextWindow: c.context_window } : {}),
+    ...(c.max_output_tokens !== undefined ? { maxOutputTokens: c.max_output_tokens } : {}),
+  };
+}
+
+/** Every profile field except `model` / `tags` / `profile`, in the IR's canonical key order. */
+type LoweredProfileFields = Omit<IrModelProfile, "model" | "tags" | "profile">;
+
+/**
+ * Lower the per-model settings a profile or candidate declares — snake_case
+ * spec keys to camelCase IR keys, `cost.max_usd` to USD micros, `fallbacks`
+ * resolved through the registry (a candidate may name `$refs`; a profile's
+ * are grammar strings by cross-field rule). Declared-fields-only, so a body
+ * that declares nothing lowers to `{}`.
+ */
+function lowerProfileFields(
+  body: SpecProfileFields,
+  ctx: LowerContext,
+  path: string,
+): LoweredProfileFields {
+  return {
+    ...lowerThinking(body.thinking),
+    ...(body.max_tokens !== undefined ? { maxTokens: body.max_tokens } : {}),
+    ...(body.temperature !== undefined ? { temperature: body.temperature } : {}),
+    ...(body.limits?.model_call_timeout_ms !== undefined
+      ? { modelCallTimeoutMs: body.limits.model_call_timeout_ms }
+      : {}),
+    ...(body.instructions !== undefined ? { overlay: body.instructions } : {}),
+    ...(body.tools !== undefined ? { tools: [...body.tools] } : {}),
+    ...(body.tool_config !== undefined ? { toolConfigs: lowerToolConfigs(body.tool_config) } : {}),
+    ...(body.permissions !== undefined
+      ? { permissions: lowerProfilePermissions(body.permissions) }
+      : {}),
+    ...lowerRateLimits(body.rate_limits),
+    ...(body.caching !== undefined ? { caching: body.caching } : {}),
+    ...(body.cost !== undefined
+      ? { costCapUsdMicros: Math.round(body.cost.max_usd * 1_000_000) }
+      : {}),
+    ...(body.requires !== undefined ? { requires: lowerRequires(body.requires) } : {}),
+    ...(body.capabilities !== undefined
+      ? { capabilities: lowerCapabilities(body.capabilities) }
+      : {}),
+    ...(body.fallbacks !== undefined
+      ? {
+          fallbacks: body.fallbacks.map(
+            (f, i) => resolveModelRef(f, ctx, `${path}.fallbacks[${i}]`, { inRoster: true }).model,
+          ),
+        }
+      : {}),
+    ...(body.circuit_breaker !== undefined
+      ? { circuitBreaker: lowerCircuitBreaker(body.circuit_breaker) }
+      : {}),
+  };
+}
+
+/**
+ * The offline capability view of one roster member: the table row for a
+ * table-backed model with the declared `capabilities:` override merged over
+ * it, or the declared override alone (unknown flags read as `false` — never
+ * over-promise), or `undefined` when neither exists.
+ */
+function memberCapabilities(member: IrModelProfile): ModelCapabilities | undefined {
+  const parsed = providerOfSpecString(member.model);
+  const table =
+    parsed !== undefined
+      ? resolveCapabilities(DEFAULT_CAPABILITIES, parsed.provider, parsed.modelId)
+      : undefined;
+  const declared = member.capabilities;
+  if (table === undefined && declared === undefined) return undefined;
+  const base: ModelCapabilities = table ?? {
+    caching: false,
+    tool_use: false,
+    vision: false,
+    thinking: false,
+    web_search: false,
+  };
+  if (declared === undefined) return base;
+  return {
+    caching: declared.caching ?? base.caching,
+    tool_use: declared.tool_use ?? base.tool_use,
+    vision: declared.vision ?? base.vision,
+    thinking: declared.thinking ?? base.thinking,
+    web_search: declared.web_search ?? base.web_search,
+    ...((declared.contextWindow ?? base.contextWindow) !== undefined
+      ? { contextWindow: declared.contextWindow ?? base.contextWindow }
+      : {}),
+    ...((declared.maxOutputTokens ?? base.maxOutputTokens) !== undefined
+      ? { maxOutputTokens: declared.maxOutputTokens ?? base.maxOutputTokens }
+      : {}),
+  };
+}
+
+/**
+ * 0.6.0 §4.3 — compile-time capability + sunset validation of one roster
+ * member (a `models:` profile or a pool candidate). For a model the offline
+ * table knows (or one with a declared `capabilities:` override):
+ *   - `requires` must be satisfied (`satisfiesCapabilities`, the same twin
+ *     `enumerateCandidates` uses) — a CompilerError names the unmet key;
+ *   - a declared `thinking` on a model that cannot think, or a non-empty
+ *     `tools` on a model without tool use, is a CompilerError;
+ * A model neither table nor override describes gets ONE warning that
+ * `adapter.features` is the only gate. A `KNOWN_SUNSETS` family warns with
+ * its replacement; past `retiresOn` a `models:` profile (new 0.6.0 surface,
+ * so no deployed spec can be broken) is a CompilerError, while a bare pool
+ * candidate keeps the warning — a wall-clock error on a pre-0.6.0 surface
+ * would break a spec that compiled yesterday.
+ */
+function validateModelMember(
+  member: IrModelProfile,
+  ctx: LowerContext,
+  path: string,
+  kind: "profile" | "candidate",
+): void {
+  const caps = memberCapabilities(member);
+  if (caps === undefined) {
+    if (
+      member.requires !== undefined ||
+      member.thinking !== undefined ||
+      (member.tools !== undefined && member.tools.length > 0)
+    ) {
+      warn(
+        ctx,
+        "model-capabilities-unknown",
+        path,
+        `${path}: model "${member.model}" is not in the offline capability table and declares no capabilities: — its requires / thinking / tools cannot be validated at compile time, so adapter.features is the only gate`,
+      );
+    }
+  } else {
+    const req = member.requires;
+    if (req !== undefined && !satisfiesCapabilities(caps, req)) {
+      const unmet = (
+        [
+          ["tool_use", req.tool_use === true && !caps.tool_use],
+          ["vision", req.vision === true && !caps.vision],
+          ["thinking", req.thinking === true && !caps.thinking],
+          ["web_search", req.web_search === true && !caps.web_search],
+          [
+            "context_window_gte",
+            req.contextWindowGte !== undefined &&
+              (caps.contextWindow === undefined || caps.contextWindow < req.contextWindowGte),
+          ],
+          [
+            "max_output_tokens_gte",
+            req.maxOutputTokensGte !== undefined &&
+              (caps.maxOutputTokens === undefined || caps.maxOutputTokens < req.maxOutputTokensGte),
+          ],
+        ] as const
+      )
+        .filter(([, failed]) => failed)
+        .map(([key]) => key);
+      throw new CompilerError(
+        `${path}: model "${member.model}" cannot satisfy requires.${unmet.join(", requires.")} — the capability table says the model lacks it; pick a model that has it or drop the requirement`,
+      );
+    }
+    if (member.thinking !== undefined && !caps.thinking) {
+      throw new CompilerError(
+        `${path}: declares thinking, but model "${member.model}" does not support extended thinking (capability table) — drop thinking or pick a thinking-capable model`,
+      );
+    }
+    if (member.tools !== undefined && member.tools.length > 0 && !caps.tool_use) {
+      throw new CompilerError(
+        `${path}: declares tools, but model "${member.model}" does not support tool use (capability table) — use tools: [] or pick a tool-capable model`,
+      );
+    }
+  }
+  const parsed = providerOfSpecString(member.model);
+  if (parsed !== undefined) {
+    const sunset = findSunset(parsed.provider, parsed.modelId);
+    if (sunset !== undefined) {
+      const retired = ctx.today >= sunset.retiresOn;
+      const message = `${path}: model "${member.model}" ${retired ? "was retired on" : "is scheduled for retirement on"} ${sunset.retiresOn} — migrate to ${sunset.replacement}${sunset.note !== undefined ? ` (${sunset.note})` : ""}`;
+      if (retired && kind === "profile") throw new CompilerError(message);
+      warn(ctx, "model-sunset", path, message);
+    }
+  }
+}
+
+/**
+ * Lower one `models:` profile: the sentinel in its own `model:` resolves by
+ * price rank against the primary (the circularity rule — a roster member
+ * cannot be defined in terms of the roster), every other field through
+ * {@link lowerProfileFields}, then the member is validated.
+ */
+function lowerProfile(name: string, profile: SpecModelProfile, ctx: LowerContext): IrModelProfile {
+  const path = `models.${name}`;
+  const model = resolveModelRef(profile.model, ctx, `${path}.model`, { inRoster: true }).model;
+  const lowered: IrModelProfile = {
+    profile: name,
+    model,
+    ...(profile.tags !== undefined ? { tags: [...profile.tags] } : {}),
+    ...lowerProfileFields(profile, ctx, path),
+  };
+  validateModelMember(lowered, ctx, path, "profile");
+  return lowered;
+}
+
+function createLowerContext(spec: Spec, opts: LowerOptions): LowerContext {
+  const rawRegistry = specRegistry(spec);
+  const hasRegistry = (spec as { readonly models?: SpecModelsBlock }).models !== undefined;
+  const warnings: CompileWarning[] = [];
+  // Profiles lower in two phases: first a registry with only `model`
+  // resolved (so a profile's fallbacks can be checked and `strongest` has a
+  // roster), then the full field lowering + validation.
+  const primary = resolvePrimaryModel(spec);
+  const base: LowerContext = {
+    target: spec.target,
+    registry: {},
+    hasRegistry,
+    optedIn: hasRegistry || specDeclaresStrategy(spec),
+    primary,
+    roster: [],
+    today: opts.today ?? todayIso(),
+    allowPending: opts.allowRuntimePendingKeys === true,
+    warnings,
+  };
+  const registry: Record<string, IrModelProfile> = {};
+  for (const [name, profile] of Object.entries(rawRegistry)) {
+    registry[name] = lowerProfile(name, profile, base);
+  }
+  const frozen: IrModelProfiles = Object.freeze(registry);
+  return {
+    ...base,
+    registry: frozen,
+    roster: collectRoster(spec, frozen),
+  };
+}
+
+/**
+ * How a single-model slot honours a referenced profile — the per-shape
+ * contract of §11.3, spelled per slot kind:
+ *   - `agent-full`        — cli/channel/managed agent, workflow step, graph
+ *                           node, crew role, sub-agent: model, thinking,
+ *                           maxTokens, temperature, overlay, and (when the
+ *                           slot declares no routing block of its own) the
+ *                           profile's fallbacks + circuit breaker;
+ *   - `agent-params`      — research/batch/browser agent: model, maxTokens,
+ *                           temperature, overlay (no thinking / failover home);
+ *   - `agent-temperature` — pipeline agent: model, temperature, overlay;
+ *   - `agent-model`       — voice/eval/onchain/onchain-game: model, overlay;
+ *   - `aux`               — judge / compaction / degrade / security / watchme /
+ *                           grounding: model plus the pinned request params;
+ *   - `model-only`        — tiers, fallback entries, strategy model slots.
+ */
+type SingleSlotKind =
+  | "agent-full"
+  | "agent-params"
+  | "agent-temperature"
+  | "agent-model"
+  | "aux"
+  | "model-only";
+
+type SingleSlotLocal = {
+  readonly thinking?: IrThinking;
+  readonly maxTokens?: number;
+  readonly temperature?: number;
+  /** The slot declares its own `model_pool` / `model_tiers` / `model_fallbacks`. */
+  readonly hasRouting?: boolean;
+};
+
+type SingleSlotResult = {
+  readonly model: string;
+  readonly modelProfile?: string;
+  readonly thinking?: IrThinking;
+  readonly maxTokens?: number;
+  readonly temperature?: number;
+  /** The profile's overlay, for the caller to fold into `instructions`. */
+  readonly overlay?: string;
+  readonly modelFallbacks?: readonly string[];
+  readonly circuitBreaker?: IrCircuitBreaker;
+  /** `aux` slots: the profile's pinned params for the consumer's own request. */
+  readonly params?: IrModelParams;
+};
+
+const SHAPE_REASON: Readonly<Partial<Record<Spec["target"], string>>> = {
+  voice: "the realtime voice loop registers no tool catalog and takes no request params",
+  eval: "the eval bundle runs the agent through the eval-runner's own request path",
+  onchain: "the onchain daemon's agent-loop wiring takes no request params",
+  "onchain-game": "the onchain-game daemon's agent-loop wiring takes no request params",
+  pipeline: "the pipeline agent block carries no thinking or max_tokens",
+  research: "the research agent block carries no thinking or failover chain",
+  batch: "the batch agent block carries no thinking or failover chain",
+  browser: "the browser agent block carries no thinking or failover chain",
+};
+
+/**
+ * Apply a resolved `$profile` (or a bare model) to a single-model slot per
+ * {@link SingleSlotKind}. Slot-local params override the profile's
+ * field-by-field; because `temperature` and `thinking` are exclusive on one
+ * request, a slot that declares one of the pair drops the profile's other.
+ * Every profile field the slot cannot honour is reported field-precisely
+ * (see the section header); the narrowing knobs on a serving slot are
+ * REFUSED until PR 9a unless `allowRuntimePendingKeys` is set.
+ */
+function applyProfileToSlot(
+  ref: ResolvedModelRef,
+  ctx: LowerContext,
+  slotPath: string,
+  kind: SingleSlotKind,
+  local: SingleSlotLocal = {},
+): SingleSlotResult {
+  const settings = ref.settings;
+  const provenance = ref.profile !== undefined ? { modelProfile: ref.profile } : {};
+  if (settings === undefined) {
+    return {
+      model: ref.model,
+      ...provenance,
+      ...(local.thinking !== undefined ? { thinking: local.thinking } : {}),
+      ...(local.maxTokens !== undefined ? { maxTokens: local.maxTokens } : {}),
+      ...(local.temperature !== undefined ? { temperature: local.temperature } : {}),
+    };
+  }
+  const name = ref.profile ?? "?";
+  const at = `models.${name}`;
+  const ignoredOnShape = (field: string): void =>
+    warn(
+      ctx,
+      "model-plan-ignored-on-shape",
+      `${at}.${field}`,
+      `${at}.${field} (referenced from ${slotPath}) is ignored on the ${ctx.target} shape — ${SHAPE_REASON[ctx.target] ?? "this shape has no home for it"}`,
+    );
+  const ignoredOnSlot = (field: string, why: string): void =>
+    warn(
+      ctx,
+      "model-plan-ignored-on-slot",
+      `${at}.${field}`,
+      `${at}.${field} (referenced from ${slotPath}) has no meaning on this slot — ${why}; it is ignored`,
+    );
+  const pending = (field: string, landing: string): void =>
+    warn(
+      ctx,
+      "model-plan-pending-runtime",
+      `${at}.${field}`,
+      `${at}.${field} (referenced from ${slotPath}) is lowered but the runtime does not honour it yet — it lands with 0.6.0 ${landing}; until then it is inert`,
+    );
+  const isAgent = kind !== "aux" && kind !== "model-only";
+  const honoursThinking = kind === "agent-full";
+  const honoursMaxTokens = kind === "agent-full" || kind === "agent-params";
+  const honoursTemperature = isAgent && kind !== "agent-model";
+  const honoursFailover = kind === "agent-full";
+
+  // Exclusivity: a slot-local pin drops the profile's other half of the pair.
+  const profileThinking = local.temperature !== undefined ? undefined : settings.thinking;
+  const profileTemperature = local.thinking !== undefined ? undefined : settings.temperature;
+
+  const params: { -readonly [K in keyof IrModelParams]: IrModelParams[K] } = {};
+  const out: { -readonly [K in keyof SingleSlotResult]: SingleSlotResult[K] } = {
+    model: ref.model,
+    ...provenance,
+  };
+
+  const thinking = local.thinking ?? profileThinking;
+  if (thinking !== undefined) {
+    if (honoursThinking || local.thinking !== undefined) out.thinking = thinking;
+    else if (kind === "aux") params.thinking = thinking;
+    else if (isAgent) ignoredOnShape("thinking");
+    else ignoredOnSlot("thinking", "request params apply to serving and auxiliary slots");
+  }
+  const maxTokens = local.maxTokens ?? settings.maxTokens;
+  if (maxTokens !== undefined) {
+    if (honoursMaxTokens || local.maxTokens !== undefined) out.maxTokens = maxTokens;
+    else if (kind === "aux") params.maxTokens = maxTokens;
+    else if (isAgent) ignoredOnShape("max_tokens");
+    else ignoredOnSlot("max_tokens", "request params apply to serving and auxiliary slots");
+  }
+  const temperature = local.temperature ?? profileTemperature;
+  if (temperature !== undefined) {
+    if (honoursTemperature || local.temperature !== undefined) out.temperature = temperature;
+    else if (kind === "aux") params.temperature = temperature;
+    else if (isAgent) ignoredOnShape("temperature");
+    else ignoredOnSlot("temperature", "request params apply to serving and auxiliary slots");
+  }
+  if (settings.overlay !== undefined) {
+    if (isAgent) out.overlay = settings.overlay;
+    else ignoredOnSlot("instructions", "an overlay is appended to a serving agent's prompt");
+  }
+  if (settings.fallbacks !== undefined || settings.circuitBreaker !== undefined) {
+    if (honoursFailover && local.hasRouting !== true) {
+      if (settings.fallbacks !== undefined) out.modelFallbacks = settings.fallbacks;
+      if (settings.circuitBreaker !== undefined) out.circuitBreaker = settings.circuitBreaker;
+    } else {
+      for (const field of ["fallbacks", "circuit_breaker"] as const) {
+        const present = field === "fallbacks" ? settings.fallbacks : settings.circuitBreaker;
+        if (present === undefined) continue;
+        if (honoursFailover) {
+          ignoredOnSlot(
+            field,
+            "the slot declares its own model_pool / model_tiers / model_fallbacks",
+          );
+        } else if (isAgent) {
+          ignoredOnShape(field);
+        } else {
+          ignoredOnSlot(field, "a failover chain applies to a serving slot or a pool candidate");
+        }
+      }
+    }
+  }
+  if (settings.modelCallTimeoutMs !== undefined) {
+    if (isAgent) pending("limits.model_call_timeout_ms", LANDING_PLAN_TABLE);
+    else
+      ignoredOnSlot("limits.model_call_timeout_ms", "the per-call timer applies to a serving slot");
+  }
+  if (settings.caching !== undefined) {
+    if (isAgent) pending("caching", LANDING_PLAN_TABLE);
+    else ignoredOnSlot("caching", "prompt-cache markers apply to a serving slot");
+  }
+  // The narrowing knobs: refused on a serving slot until the dispatch gate
+  // lands; meaningless on an auxiliary / model-only slot (a judge profile's
+  // `tools: []` is the documented no-op and stays silent).
+  const narrowing: ReadonlyArray<readonly [string, unknown]> = [
+    ["tools", settings.tools],
+    ["tool_config", settings.toolConfigs],
+    ["permissions", settings.permissions],
+    ["rate_limits", settings.rateLimits],
+    ["cost", settings.costCapUsdMicros],
+  ];
+  // A shape with a tool catalog (agent-full / agent-params) refuses them
+  // until PR 9a; a shape that can NEVER honour them (voice / eval / onchain /
+  // pipeline) reports them ignored-on-shape, permanently.
+  const narrowingRefused = kind === "agent-full" || kind === "agent-params";
+  for (const [field, value] of narrowing) {
+    if (value === undefined) continue;
+    if (isAgent && !narrowingRefused) {
+      ignoredOnShape(field);
+      continue;
+    }
+    if (isAgent) {
+      if (!ctx.allowPending) {
+        throw runtimePending(
+          `${at}.${field} (referenced from ${slotPath})`,
+          LANDING_PLAN_TABLE,
+          "a profile declared narrower than the shape would serve with the shape's full toolset and permissions until the dispatch gate lands — declare the narrowing on the shape for now",
+        );
+      }
+      pending(field, LANDING_PLAN_TABLE);
+      continue;
+    }
+    if (field === "tools" && Array.isArray(value) && value.length === 0) continue;
+    ignoredOnSlot(
+      field,
+      "per-model tools, tool settings, permissions, rate limits and spend caps apply to serving slots",
+    );
+  }
+  if (Object.keys(params).length > 0) out.params = params;
+  return out;
+}
+
+/** Fold a profile overlay into a slot's instructions — overlay first, blank-line separated (§4.2). */
+function foldOverlay(instructions: string, overlay: string | undefined): string {
+  return overlay === undefined ? instructions : `${overlay}\n\n${instructions}`;
+}
+
+/** The IR fields a serving single-model slot gains from {@link applyProfileToSlot}. */
+function servingSlotFields(r: SingleSlotResult): {
+  modelProfile?: string;
+  maxTokens?: number;
+  thinking?: IrThinking;
+  temperature?: number;
+} {
+  return {
+    ...(r.modelProfile !== undefined ? { modelProfile: r.modelProfile } : {}),
+    ...(r.maxTokens !== undefined ? { maxTokens: r.maxTokens } : {}),
+    ...(r.thinking !== undefined ? { thinking: r.thinking } : {}),
+    ...(r.temperature !== undefined ? { temperature: r.temperature } : {}),
+  };
+}
+
+/** The failover fields a serving slot inherits from its profile (absent when it routes itself). */
+function servingSlotFailover(r: SingleSlotResult): {
+  modelFallbacks?: readonly string[];
+  circuitBreaker?: IrCircuitBreaker;
+} {
+  return {
+    ...(r.modelFallbacks !== undefined ? { modelFallbacks: r.modelFallbacks } : {}),
+    ...(r.circuitBreaker !== undefined ? { circuitBreaker: r.circuitBreaker } : {}),
+  };
+}
+
+/** 0.6.0 §4.1 — a slot-level `temperature` is inert until the plan table applies it (PR 9a). */
+function noteTemperaturePending(
+  ctx: LowerContext,
+  path: string,
+  temperature: number | undefined,
+): void {
+  if (temperature === undefined) return;
+  warn(
+    ctx,
+    "model-plan-pending-runtime",
+    path,
+    `${path} is lowered into the IR but the runtime request build does not apply a temperature yet — it lands with 0.6.0 ${LANDING_PLAN_TABLE}; until then it is inert`,
+  );
+}
+
+/** The `aux`-slot provenance + params spread every auxiliary consumer shares. */
+function auxSlotFields(r: SingleSlotResult): { modelProfile?: string; params?: IrModelParams } {
+  return {
+    ...(r.modelProfile !== undefined ? { modelProfile: r.modelProfile } : {}),
+    ...(r.params !== undefined ? { params: r.params } : {}),
+  };
+}
+
+/** Resolve an auxiliary model slot (judge / compaction / degrade / security / watchme / grounding). */
+function resolveAuxSlot(value: string, ctx: LowerContext, slotLabel: string): SingleSlotResult {
+  const r = applyProfileToSlot(resolveModelRef(value, ctx, slotLabel), ctx, slotLabel, "aux");
+  if (r.params !== undefined) {
+    warn(
+      ctx,
+      "model-plan-pending-runtime",
+      slotLabel,
+      `${slotLabel}: the profile's pinned request params are lowered but this consumer does not read them yet — they land with 0.6.0 ${LANDING_AUX_PARAMS}; until then they are inert`,
+    );
+  }
+  return r;
+}
+
+/**
+ * 0.6.0 §6.2 — the GATED judge-default flip. On a spec that opted into the
+ * hybrid surface (a `models:` registry or a pool `strategy`), an in-loop
+ * judge or judge gate that names no model defaults to `strongest`
+ * (roster-first, so it lands on the strong profile or candidate) instead of
+ * the serving model; a 0.5.x-shaped spec keeps the serving-model default
+ * (the emitters' `grader.model ?? agent.model`), so its bundle stays
+ * byte-identical (§14). Implemented here rather than in the three
+ * `renderEvaluation` copies so the interpreter reads the same IR. Returns
+ * `undefined` when the spec did not opt in, or when `strongest` has nothing
+ * to rank against (an empty registry beside a non-table primary) — the
+ * serving-model default then stands.
+ */
+function defaultJudgeSlot(ctx: LowerContext, slotLabel: string): SingleSlotResult | undefined {
+  if (!ctx.optedIn) return undefined;
+  if (resolveStrongestForSlot(ctx.primary ?? "", { roster: ctx.roster }) === undefined) {
+    return undefined;
+  }
+  return resolveAuxSlot(STRONGEST_SENTINEL, ctx, slotLabel);
+}
+
+/** Resolve a model-only slot (tier / fallback / strategy model): the model string plus provenance. */
+function resolveModelOnly(
+  value: string,
+  ctx: LowerContext,
+  slotLabel: string,
+): { readonly model: string; readonly profile?: string } {
+  const r = applyProfileToSlot(
+    resolveModelRef(value, ctx, slotLabel),
+    ctx,
+    slotLabel,
+    "model-only",
+  );
+  return { model: r.model, ...(r.modelProfile !== undefined ? { profile: r.modelProfile } : {}) };
+}
+
+/** A strategy / rule / floor ROLE slot: a candidate tag, or a `$profile` lowered to its arm id (the profile name). */
+function lowerRoleSlot(value: string): string {
+  return profileRefName(value) ?? value;
+}
+
+type SpecAgentWithFailover = {
+  readonly model_fallbacks?: readonly string[];
+  readonly circuit_breaker?: {
+    readonly failureThreshold?: number;
+    readonly windowMs?: number;
+    readonly cooldownMs?: number;
+  };
+  readonly model_tiers?: {
+    readonly fast: string;
+    readonly default: string;
+    readonly routing?: {
+      readonly contextTokenThreshold?: number;
+      readonly toolsToDefault?: boolean;
+      readonly firstTurnToDefault?: boolean;
+      readonly priorToolDensityThreshold?: number;
+    };
+  };
+  /** 0.6.0 — the spec's own pool type: candidates carry every profile field inline. */
+  readonly model_pool?: SpecModelPoolBlock;
+};
+
+type SpecModelPoolBlockValue = NonNullable<SpecModelPoolBlock>;
+type SpecModelPoolCandidateValue = SpecModelPoolBlockValue["candidates"][number];
+
+/**
+ * 0.6.0 §4.3 — lower one pool candidate. A `$profile` candidate takes the
+ * profile as its defaults and overrides field-by-field; its `tags` REPLACE
+ * the profile's when it declares any (they are the routing identity, not an
+ * accumulation). KEY ORDER IS THE BYTE CONTRACT (design stance 3): `model`
+ * then `tags` are inserted first and every 0.6.0 key spreads after them, so
+ * `JSON.stringify` of a plain 0.5.x candidate is unchanged.
+ */
+function lowerPoolCandidate(
+  c: SpecModelPoolCandidateValue,
+  ctx: LowerContext,
+  cpath: string,
+): IrModelPoolCandidate {
+  const isRef = profileRefName(c.model) !== undefined;
+  const ref = resolveModelRef(c.model, ctx, `${cpath}.model`, { inRoster: !isRef });
+  const local = lowerProfileFields(c, ctx, cpath);
+  const inherited: LoweredProfileFields =
+    ref.settings !== undefined ? stripIdentity(ref.settings) : {};
+  // Exclusivity across the merge: a local pin of one half drops the profile's other.
+  const merged: LoweredProfileFields = {
+    ...inherited,
+    ...(local.thinking !== undefined ? { temperature: undefined } : {}),
+    ...(local.temperature !== undefined ? { thinking: undefined } : {}),
+    ...local,
+  };
+  const tags = c.tags.length > 0 ? [...c.tags] : [...(ref.settings?.tags ?? [])];
+  const candidate: IrModelPoolCandidate = {
+    model: ref.model,
+    tags,
+    ...(ref.profile !== undefined ? { profile: ref.profile } : {}),
+    ...canonicalProfileFields(merged),
+    ...(c.enabled === false ? { enabled: false as const } : {}),
+  };
+  validateModelMember(candidate, ctx, cpath, "candidate");
+  // The residual guard (deviation 1) acts on the MERGED candidate: a
+  // `$profile` candidate inherits the profile's narrowing knobs, and the
+  // runtime reads only `model` / `tags` / `enabled` off the pool blob until
+  // PR 9a, so an inherited `tools: []` would serve with the shape's full
+  // toolset. Inline keys were already refused by `assertCandidatesLowerable`.
+  if (!ctx.allowPending) {
+    for (const [field, value] of [
+      ["tools", candidate.tools],
+      ["tool_config", candidate.toolConfigs],
+      ["permissions", candidate.permissions],
+      ["rate_limits", candidate.rateLimits],
+      ["cost", candidate.costCapUsdMicros],
+    ] as const) {
+      if (value === undefined) continue;
+      throw runtimePending(
+        `${cpath}.model → models.${ref.profile ?? "?"}.${field}`,
+        LANDING_PLAN_TABLE,
+        "a candidate inheriting a profile declared narrower than the shape would serve with the shape's full toolset and permissions until the dispatch gate lands — declare the narrowing on the shape for now",
+      );
+    }
+  }
+  // Every 0.6.0 per-candidate setting is carried for the plan table; until it
+  // lands the candidate serves on the run's settings.
+  for (const [irKey, specKey, landing] of [
+    ["thinking", "thinking", LANDING_PLAN_TABLE],
+    ["maxTokens", "max_tokens", LANDING_PLAN_TABLE],
+    ["temperature", "temperature", LANDING_PLAN_TABLE],
+    ["modelCallTimeoutMs", "limits.model_call_timeout_ms", LANDING_PLAN_TABLE],
+    ["overlay", "instructions", LANDING_PLAN_TABLE],
+    ["tools", "tools", LANDING_PLAN_TABLE],
+    ["toolConfigs", "tool_config", LANDING_PLAN_TABLE],
+    ["permissions", "permissions", LANDING_PLAN_TABLE],
+    ["rateLimits", "rate_limits", LANDING_PLAN_TABLE],
+    ["caching", "caching", LANDING_PLAN_TABLE],
+    ["costCapUsdMicros", "cost", LANDING_PLAN_TABLE],
+    ["fallbacks", "fallbacks", LANDING_ROUTER_STORE],
+    ["circuitBreaker", "circuit_breaker", LANDING_ROUTER_STORE],
+  ] as const) {
+    if (candidate[irKey] === undefined) continue;
+    warn(
+      ctx,
+      "model-plan-pending-runtime",
+      `${cpath}.${specKey}`,
+      `${cpath}.${specKey} is lowered into the pool blob but the runtime does not honour it yet — it lands with 0.6.0 ${landing}; until then the candidate serves on the run's settings`,
+    );
+  }
+  return candidate;
+}
+
+/** A profile's settings without its identity (`profile` / `model` / `tags`). */
+function stripIdentity(profile: IrModelProfile): LoweredProfileFields {
+  const { profile: _profile, model: _model, tags: _tags, ...rest } = profile;
+  return rest;
+}
+
+/** Re-spell a merged field bag in the IR's canonical key order, dropping `undefined`. */
+function canonicalProfileFields(f: LoweredProfileFields): LoweredProfileFields {
+  return {
+    ...(f.thinking !== undefined ? { thinking: f.thinking } : {}),
+    ...(f.maxTokens !== undefined ? { maxTokens: f.maxTokens } : {}),
+    ...(f.temperature !== undefined ? { temperature: f.temperature } : {}),
+    ...(f.modelCallTimeoutMs !== undefined ? { modelCallTimeoutMs: f.modelCallTimeoutMs } : {}),
+    ...(f.overlay !== undefined ? { overlay: f.overlay } : {}),
+    ...(f.tools !== undefined ? { tools: f.tools } : {}),
+    ...(f.toolConfigs !== undefined ? { toolConfigs: f.toolConfigs } : {}),
+    ...(f.permissions !== undefined ? { permissions: f.permissions } : {}),
+    ...(f.rateLimits !== undefined ? { rateLimits: f.rateLimits } : {}),
+    ...(f.caching !== undefined ? { caching: f.caching } : {}),
+    ...(f.costCapUsdMicros !== undefined ? { costCapUsdMicros: f.costCapUsdMicros } : {}),
+    ...(f.requires !== undefined ? { requires: f.requires } : {}),
+    ...(f.capabilities !== undefined ? { capabilities: f.capabilities } : {}),
+    ...(f.fallbacks !== undefined ? { fallbacks: f.fallbacks } : {}),
+    ...(f.circuitBreaker !== undefined ? { circuitBreaker: f.circuitBreaker } : {}),
+  };
+}
+
+function lowerPoolRules(
+  rules: NonNullable<SpecModelPoolBlockValue["rules"]>,
+): readonly IrModelPoolRule[] {
+  return rules.map((rule) => ({
+    id: rule.id,
+    when: {
+      ...(rule.when.has_images !== undefined ? { has_images: rule.when.has_images } : {}),
+      ...(rule.when.message_matches !== undefined
+        ? { message_matches: rule.when.message_matches }
+        : {}),
+      ...(rule.when.user_text_chars_gt !== undefined
+        ? { user_text_chars_gt: rule.when.user_text_chars_gt }
+        : {}),
+      ...(rule.when.context_tokens_gt !== undefined
+        ? { context_tokens_gt: rule.when.context_tokens_gt }
+        : {}),
+      ...(rule.when.tool_in_play !== undefined ? { tool_in_play: rule.when.tool_in_play } : {}),
+      ...(rule.when.channel !== undefined ? { channel: rule.when.channel } : {}),
+      ...(rule.when.budget_spent_ratio_gt !== undefined
+        ? { budget_spent_ratio_gt: rule.when.budget_spent_ratio_gt }
+        : {}),
+      ...(rule.when.turn_index_lt !== undefined ? { turn_index_lt: rule.when.turn_index_lt } : {}),
+    },
+    use:
+      typeof rule.use === "string"
+        ? lowerRoleSlot(rule.use)
+        : { requires: lowerRequires(rule.use.requires) },
+    ...(rule.enabled !== undefined ? { enabled: rule.enabled } : {}),
+  }));
+}
+
+function lowerPoolClassifier(
+  c: NonNullable<SpecModelPoolBlockValue["classifier"]>,
+  ctx: LowerContext,
+  path: string,
+): IrModelPoolClassifier {
+  const model = resolveModelOnly(c.model, ctx, `${path}.model`);
+  return {
+    model: model.model,
+    ...(model.profile !== undefined ? { modelProfile: model.profile } : {}),
+    labels: { ...c.labels },
+    ...(c.max_tokens !== undefined ? { maxTokens: c.max_tokens } : {}),
+  };
+}
+
+function lowerPoolStrategy(
+  st: NonNullable<SpecModelPoolBlockValue["strategy"]>,
+  ctx: LowerContext,
+  path: string,
+): IrModelPoolStrategy {
+  const out: { -readonly [K in keyof IrModelPoolStrategy]: IrModelPoolStrategy[K] } = {};
+  if (st.cascade !== undefined) {
+    out.cascade = {
+      draft: lowerRoleSlot(st.cascade.draft),
+      escalateTo: lowerRoleSlot(st.cascade.escalate_to),
+      ...(st.cascade.clean_prompt !== undefined ? { cleanPrompt: st.cascade.clean_prompt } : {}),
+    };
+  }
+  if (st.guide !== undefined) {
+    const model = resolveModelOnly(st.guide.model, ctx, `${path}.guide.model`);
+    out.guide = {
+      model: model.model,
+      ...(model.profile !== undefined ? { modelProfile: model.profile } : {}),
+      ...(st.guide.every !== undefined ? { every: st.guide.every } : {}),
+      ...(st.guide.max_tokens !== undefined ? { maxTokens: st.guide.max_tokens } : {}),
+      ...(st.guide.budget_usd !== undefined ? { budgetUsd: st.guide.budget_usd } : {}),
+    };
+  }
+  if (st.shadow !== undefined) {
+    const candidate = resolveModelOnly(st.shadow.candidate, ctx, `${path}.shadow.candidate`);
+    const gradeWith =
+      st.shadow.grade_with !== undefined
+        ? resolveModelOnly(st.shadow.grade_with, ctx, `${path}.shadow.grade_with`)
+        : undefined;
+    out.shadow = {
+      candidate: candidate.model,
+      ...(candidate.profile !== undefined ? { candidateProfile: candidate.profile } : {}),
+      ...(st.shadow.sample_rate !== undefined ? { sampleRate: st.shadow.sample_rate } : {}),
+      ...(gradeWith !== undefined ? { gradeWith: gradeWith.model } : {}),
+      ...(gradeWith?.profile !== undefined ? { gradeWithProfile: gradeWith.profile } : {}),
+    };
+  }
+  if (st.committee !== undefined) {
+    const judge =
+      st.committee.judge !== undefined
+        ? resolveModelOnly(st.committee.judge, ctx, `${path}.committee.judge`)
+        : undefined;
+    out.committee = {
+      members: st.committee.members.map(lowerRoleSlot),
+      ...(judge !== undefined ? { judge: judge.model } : {}),
+      ...(judge?.profile !== undefined ? { judgeProfile: judge.profile } : {}),
+      ...(st.committee.escalate_on_disagreement !== undefined
+        ? { escalateOnDisagreement: lowerRoleSlot(st.committee.escalate_on_disagreement) }
+        : {}),
+    };
+  }
+  if (st.model_directed !== undefined) out.modelDirected = st.model_directed;
+  if (st.max_escalations !== undefined) out.maxEscalations = st.max_escalations;
+  return out;
+}
+
+function lowerPoolReward(r: NonNullable<SpecModelPoolBlockValue["reward"]>): IrModelPoolReward {
+  return {
+    ...(r.quality_source !== undefined ? { qualitySource: r.quality_source } : {}),
+    ...(r.priors !== undefined ? { priors: r.priors } : {}),
+    ...(r.floor !== undefined
+      ? {
+          floor: {
+            ...(r.floor.arm !== undefined ? { arm: lowerRoleSlot(r.floor.arm) } : {}),
+            ...(r.floor.confidence !== undefined ? { confidence: r.floor.confidence } : {}),
+            ...(r.floor.tolerance !== undefined ? { tolerance: r.floor.tolerance } : {}),
+          },
+        }
+      : {}),
+    ...(r.reset_on_profile_change !== undefined
+      ? { resetOnProfileChange: r.reset_on_profile_change }
+      : {}),
+  };
+}
+
+/**
+ * Item 22 / item 26 / adaptive routing / 0.6.0 §7 — lower the model-routing
+ * fields off an agent-like block (`model_fallbacks` + `circuit_breaker`,
+ * `model_tiers`, `model_pool`). Mirrors `lowerCompaction`'s "propagate only
+ * defined fields" discipline: the breaker package owns the per-knob
+ * defaults, so the IR carries the user's intent verbatim. Returns a partial
+ * spread into the IR block so every field stays ABSENT when the spec omits
+ * it (emitters gate their codegen on presence).
+ *
+ * 0.6.0: every model slot here resolves through {@link resolveModelRef}
+ * (`$profile` / `cheapest` / `strongest`); candidates lower through
+ * {@link lowerPoolCandidate}; the hybrid siblings (`directives` / `rules` /
+ * `classifier` / `strategy` / `reward` / `scope`) ride the pool blob, each
+ * reported `model-plan-pending-runtime` until its consumer lands. `scope` is
+ * carried verbatim only when declared — the compiler does NOT stamp the
+ * step/role/node name (§7.9), because that would change the pool blob of
+ * every pre-0.6.0 pooled step and role; the runtime composition root (PR 10)
+ * defaults it from the caller's toolset scope at boot.
+ */
+function lowerModelFailover(
+  agent: SpecAgentWithFailover,
+  ctx: LowerContext,
+  path: string,
+): {
   modelFallbacks?: readonly string[];
   circuitBreaker?: IrCircuitBreaker;
   modelTiers?: IrModelTiers;
@@ -1291,24 +2430,20 @@ function lowerModelFailover(agent: SpecAgentWithFailover): {
     modelPool?: IrModelPool;
   } = {};
   if (agent.model_fallbacks !== undefined && agent.model_fallbacks.length > 0) {
-    out.modelFallbacks = [...agent.model_fallbacks];
+    out.modelFallbacks = agent.model_fallbacks.map(
+      (m, i) => resolveModelOnly(m, ctx, `${path}.model_fallbacks[${i}]`).model,
+    );
   }
   const cb = agent.circuit_breaker;
-  if (cb !== undefined) {
-    out.circuitBreaker = {
-      ...(cb.failureThreshold !== undefined ? { failureThreshold: cb.failureThreshold } : {}),
-      ...(cb.windowMs !== undefined ? { windowMs: cb.windowMs } : {}),
-      ...(cb.cooldownMs !== undefined ? { cooldownMs: cb.cooldownMs } : {}),
-    };
-  }
+  if (cb !== undefined) out.circuitBreaker = lowerCircuitBreaker(cb);
   // Item 26 — two-tier router. Only lowered when present; the routing knobs
   // carry the user's intent verbatim (runtime owns the per-knob defaults).
   const mt = agent.model_tiers;
   if (mt !== undefined) {
     const routing = mt.routing;
     out.modelTiers = {
-      fast: mt.fast,
-      default: mt.default,
+      fast: resolveModelOnly(mt.fast, ctx, `${path}.model_tiers.fast`).model,
+      default: resolveModelOnly(mt.default, ctx, `${path}.model_tiers.default`).model,
       ...(routing !== undefined
         ? {
             routing: {
@@ -1335,16 +2470,35 @@ function lowerModelFailover(agent: SpecAgentWithFailover): {
   // defaults), so only defined optional blocks are attached.
   const mp = agent.model_pool;
   if (mp !== undefined) {
-    // 0.6.0 — tsc narrowing only (`assertNoPending060Keys` already ran in
-    // `lower()`): the IR policy enum has not widened yet (PR 7).
-    if (mp.policy === "classifier") {
-      throw pending060("model_pool.policy: classifier", "use static | heuristic | learned");
-    }
+    const poolPath = `${path}.model_pool`;
     const objective = mp.objective;
     const routing = mp.routing;
     const learning = mp.learning;
+    const pending = (key: string, landing: string, extra = ""): void =>
+      warn(
+        ctx,
+        "model-plan-pending-runtime",
+        `${poolPath}.${key}`,
+        `${poolPath}.${key} is lowered into the pool blob but the runtime does not honour it yet — it lands with 0.6.0 ${landing}; until then it is inert${extra}`,
+      );
+    if (mp.policy === "classifier") {
+      pending("policy", LANDING_PREROUTE, " (the pool routes heuristically until then)");
+    }
+    if (mp.directives !== undefined) pending("directives", LANDING_PREROUTE);
+    if (mp.rules !== undefined) pending("rules", LANDING_PREROUTE);
+    if (mp.classifier !== undefined) pending("classifier", LANDING_PREROUTE);
+    if (mp.strategy !== undefined) {
+      pending("strategy", LANDING_STRATEGIES);
+      if (mp.strategy.model_directed === true) {
+        pending("strategy.model_directed", LANDING_MODEL_DIRECTED);
+      }
+    }
+    if (mp.reward !== undefined) pending("reward", LANDING_ROUTER_STORE);
+    if (mp.scope !== undefined) pending("scope", LANDING_ROUTER_STORE);
     out.modelPool = {
-      candidates: mp.candidates.map((c) => ({ model: c.model, tags: [...c.tags] })),
+      candidates: mp.candidates.map((c, i) =>
+        lowerPoolCandidate(c, ctx, `${poolPath}.candidates[${i}]`),
+      ),
       policy: mp.policy,
       ...(objective !== undefined
         ? {
@@ -1393,6 +2547,17 @@ function lowerModelFailover(agent: SpecAgentWithFailover): {
             },
           }
         : {}),
+      // 0.6.0 §7.1 — the hybrid container, each sibling only when declared.
+      ...(mp.directives !== undefined ? { directives: mp.directives } : {}),
+      ...(mp.rules !== undefined ? { rules: lowerPoolRules(mp.rules) } : {}),
+      ...(mp.classifier !== undefined
+        ? { classifier: lowerPoolClassifier(mp.classifier, ctx, `${poolPath}.classifier`) }
+        : {}),
+      ...(mp.strategy !== undefined
+        ? { strategy: lowerPoolStrategy(mp.strategy, ctx, `${poolPath}.strategy`) }
+        : {}),
+      ...(mp.reward !== undefined ? { reward: lowerPoolReward(mp.reward) } : {}),
+      ...(mp.scope !== undefined ? { scope: mp.scope } : {}),
     };
   }
   return out;
@@ -1451,14 +2616,20 @@ type SpecWithBudget = {
   };
 };
 
-function lowerBudget(spec: SpecWithBudget): { budget?: IrBudget } {
+function lowerBudget(spec: SpecWithBudget, ctx: LowerContext): { budget?: IrBudget } {
   const b = spec.budget;
   if (b === undefined) return {};
   const usdMicros = Math.round(b.usd * 1_000_000);
-  const onExceed: IrBudget["onExceed"] =
-    b.on_exceed.action === "degrade"
-      ? { kind: "degrade", model: b.on_exceed.model }
-      : { kind: "stop" };
+  let onExceed: IrBudget["onExceed"];
+  if (b.on_exceed.action === "degrade") {
+    // 0.6.0 §4.3 — the degrade rung is an auxiliary slot: `$profile` /
+    // `cheapest` / `strongest` resolve here (it bypassed `resolveAuxModel`
+    // before), with the profile's params beside the concrete model.
+    const slot = resolveAuxSlot(b.on_exceed.model, ctx, "budget.on_exceed.model");
+    onExceed = { kind: "degrade", model: slot.model, ...auxSlotFields(slot) };
+  } else {
+    onExceed = { kind: "stop" };
+  }
   // 0.6.0 §7.12 / §6.2 — `scope` and `judgeShare` are spread ONLY when
   // declared: every emitter writes `JSON.stringify(ir.budget)` verbatim, so
   // an absent key keeps pre-0.6.0 bundles byte-identical while the runtime
@@ -1656,41 +2827,128 @@ function lowerHooks(spec: SpecWithHooks): { hooks?: ReadonlyArray<IrHook> } {
 type SpecWithEvaluation = SpecWithPermissions & {
   readonly evaluation?: {
     readonly grader:
-      | { readonly type: "llm_judge"; readonly criteria: string; readonly model?: string }
+      | {
+          readonly type: "llm_judge";
+          readonly criteria: string;
+          readonly model?: string;
+          readonly judges?: readonly string[];
+          readonly repeats?: number;
+          readonly temperature?: number;
+          readonly target?: "output" | "transcript";
+        }
       | { readonly type: "contains"; readonly value: string }
       | { readonly type: "regex"; readonly value: string };
     readonly threshold?: number;
     readonly on_fail?: "retry" | "halt" | "note" | "escalate";
     readonly max_retries?: number;
+    readonly allow_self_judge?: boolean;
   };
 };
 
-function lowerEvaluation(spec: SpecWithEvaluation): { evaluation?: IrEvaluation } {
+/** The §6.2 judge-panel knobs a grader / gate shares, lowered + reported pending. */
+function lowerJudgePanel(
+  judge: {
+    readonly judges?: readonly string[];
+    readonly repeats?: number;
+    readonly temperature?: number;
+    readonly target?: "output" | "transcript";
+  },
+  slot: SingleSlotResult | undefined,
+  ctx: LowerContext,
+  path: string,
+): {
+  judges?: readonly string[];
+  repeats?: number;
+  temperature?: number;
+  target?: "output" | "transcript";
+  params?: IrModelParams;
+} {
+  const judges = judge.judges?.map(
+    (m, i) => resolveModelOnly(m, ctx, `${path}.judges[${i}]`).model,
+  );
+  // The judge's own pinned temperature wins over the profile's; the rest of
+  // the profile's params ride `params` for the request builder.
+  const temperature = judge.temperature ?? slot?.params?.temperature;
+  const rest: IrModelParams = {
+    ...(slot?.params?.thinking !== undefined ? { thinking: slot.params.thinking } : {}),
+    ...(slot?.params?.maxTokens !== undefined ? { maxTokens: slot.params.maxTokens } : {}),
+  };
+  for (const [key, present] of [
+    ["judges", judge.judges !== undefined],
+    ["repeats", judge.repeats !== undefined],
+    ["temperature", judge.temperature !== undefined],
+    ["target", judge.target !== undefined],
+  ] as const) {
+    if (!present) continue;
+    warn(
+      ctx,
+      "model-plan-pending-runtime",
+      `${path}.${key}`,
+      `${path}.${key} is lowered into the IR but the judge site still calls judge() with the single model — it lands with 0.6.0 ${LANDING_JUDGE_PANEL}; until then it is inert`,
+    );
+  }
+  return {
+    ...(judges !== undefined ? { judges } : {}),
+    ...(judge.repeats !== undefined ? { repeats: judge.repeats } : {}),
+    ...(temperature !== undefined ? { temperature } : {}),
+    ...(judge.target !== undefined ? { target: judge.target } : {}),
+    ...(Object.keys(rest).length > 0 ? { params: rest } : {}),
+  };
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — lower the top-level `evaluation:`
+ * block (cli/channel/managed). `on_fail`/`max_retries` RESOLVE here
+ * (defaults `"retry"` / 1) so emitters and the interpreter read one
+ * deterministic shape; `threshold` resolves to 0.7 for the `llm_judge`
+ * grader and stays ABSENT for the deterministic graders (they are
+ * pass/fail — the spec rejects a declared threshold there). The judge
+ * model is an auxiliary slot (`$profile` / `cheapest` / `strongest`
+ * resolve at compile time exactly like `compaction.model`).
+ * Spread-return-{} discipline: the IR key stays absent when the spec omits
+ * the block. 0.6.0 §6.2 / §7.3: the judge panel knobs, `on_fail: escalate`
+ * (reachable only with `allowRuntimePendingKeys` until PR 9c) and the
+ * `allow_self_judge` lint waiver (carried only when true).
+ */
+function lowerEvaluation(
+  spec: SpecWithEvaluation,
+  ctx: LowerContext,
+): { evaluation?: IrEvaluation } {
   const e = spec.evaluation;
   if (e === undefined) return {};
-  // 0.6.0 — tsc narrowing only (`assertNoPending060Keys` already ran in
-  // `lower()`): `IrEvaluation.onFail` has not widened yet (PR 7).
-  if (e.on_fail === "escalate") {
-    throw pending060("evaluation.on_fail: escalate", "use retry | halt | note");
+  let grader: IrEvaluation["grader"];
+  if (e.grader.type === "llm_judge") {
+    const slot =
+      e.grader.model !== undefined
+        ? resolveAuxSlot(e.grader.model, ctx, "evaluation.grader.model")
+        : defaultJudgeSlot(ctx, "evaluation.grader.model");
+    grader = {
+      type: "llm_judge",
+      criteria: e.grader.criteria,
+      ...(slot !== undefined ? { model: slot.model } : {}),
+      ...(slot?.modelProfile !== undefined ? { modelProfile: slot.modelProfile } : {}),
+      ...lowerJudgePanel(e.grader, slot, ctx, "evaluation.grader"),
+    };
+  } else if (e.grader.type === "contains") {
+    grader = { type: "contains", value: e.grader.value };
+  } else {
+    grader = { type: "regex", value: e.grader.value };
   }
-  const grader: IrEvaluation["grader"] =
-    e.grader.type === "llm_judge"
-      ? {
-          type: "llm_judge",
-          criteria: e.grader.criteria,
-          ...(e.grader.model !== undefined
-            ? { model: resolveAuxModel(e.grader.model, spec, "evaluation.grader.model") }
-            : {}),
-        }
-      : e.grader.type === "contains"
-        ? { type: "contains", value: e.grader.value }
-        : { type: "regex", value: e.grader.value };
+  if (e.on_fail === "escalate") {
+    warn(
+      ctx,
+      "model-plan-pending-runtime",
+      "evaluation.on_fail",
+      "evaluation.on_fail: escalate is lowered into the IR but the runtime re-runs a failed turn on the same policy today — it lands with 0.6.0 PR 9c (the cascade re-run on the escalation rung)",
+    );
+  }
   return {
     evaluation: {
       grader,
       ...(e.grader.type === "llm_judge" ? { threshold: e.threshold ?? 0.7 } : {}),
       onFail: e.on_fail ?? "retry",
       maxRetries: e.max_retries ?? 1,
+      ...(e.allow_self_judge === true ? { allowSelfJudge: true as const } : {}),
     },
   };
 }
@@ -1700,8 +2958,11 @@ function lowerEvaluation(spec: SpecWithEvaluation): { evaluation?: IrEvaluation 
  * (defaults: threshold 0.7, on_fail `"retry_previous"`, max_retries 1).
  * The judge MODEL is deliberately NOT part of `IrJudge`: the caller
  * resolves it into the judge step's/node's ordinary `model` field
- * (`judge.model ?? <shape>.model`, `cheapest` supported via
- * `resolveAuxModel`) so emitters read one model slot per step/node.
+ * (`judge.model ?? <shape>.model`, an auxiliary slot — `$profile` /
+ * `cheapest` / `strongest` supported) so emitters read one model slot per
+ * step/node. 0.6.0 §6.2 / §7.3: the panel knobs, the profile's params and
+ * provenance, and `escalate_to` (a pool tag or arm id; reachable only with
+ * `allowRuntimePendingKeys` until PR 9c).
  */
 type SpecJudgeGateBlock = {
   readonly criteria: string;
@@ -1709,14 +2970,35 @@ type SpecJudgeGateBlock = {
   readonly threshold?: number;
   readonly on_fail?: "retry_previous" | "halt" | "continue";
   readonly max_retries?: number;
+  readonly judges?: readonly string[];
+  readonly repeats?: number;
+  readonly temperature?: number;
+  readonly target?: "output" | "transcript";
+  readonly escalate_to?: string;
 };
 
-function lowerJudgeGate(judge: SpecJudgeGateBlock): IrJudge {
+function lowerJudgeGate(
+  judge: SpecJudgeGateBlock,
+  slot: SingleSlotResult | undefined,
+  ctx: LowerContext,
+  path: string,
+): IrJudge {
+  if (judge.escalate_to !== undefined) {
+    warn(
+      ctx,
+      "model-plan-pending-runtime",
+      `${path}.escalate_to`,
+      `${path}.escalate_to is lowered into the IR but a retry_previous re-run keeps the gated block's own routing today — it lands with 0.6.0 PR 9c (the forced re-run on the escalation rung)`,
+    );
+  }
   return {
     criteria: judge.criteria,
     threshold: judge.threshold ?? 0.7,
     onFail: judge.on_fail ?? "retry_previous",
     maxRetries: judge.max_retries ?? 1,
+    ...(slot?.modelProfile !== undefined ? { modelProfile: slot.modelProfile } : {}),
+    ...lowerJudgePanel(judge, slot, ctx, path),
+    ...(judge.escalate_to !== undefined ? { escalateTo: lowerRoleSlot(judge.escalate_to) } : {}),
   };
 }
 
@@ -1764,17 +3046,25 @@ type SpecWithSecurity = {
   };
 };
 
-function lowerSecurity(spec: SpecWithSecurity): { security?: IrSecurity } {
+function lowerSecurity(spec: SpecWithSecurity, ctx: LowerContext): { security?: IrSecurity } {
   const s = spec.security;
   if (s === undefined) return {};
   // FR-004 `justification` and FR-006 `egressMatcher` are independent
   // optional sub-fields of the same `security` block: carry whichever is
   // present. The block is dropped from the IR only when both are absent.
+  // 0.6.0 §4.3 — the justification judge model is an auxiliary slot
+  // (`$profile` / `cheapest` / `strongest`; it bypassed `resolveAuxModel`).
+  const judgeSlot =
+    s.justification?.model !== undefined
+      ? resolveAuxSlot(s.justification.model, ctx, "security.justification.model")
+      : undefined;
   const justification =
     s.justification !== undefined
       ? {
           judge: s.justification.judge,
-          ...(s.justification.model !== undefined ? { model: s.justification.model } : {}),
+          ...(judgeSlot !== undefined
+            ? { model: judgeSlot.model, ...auxSlotFields(judgeSlot) }
+            : {}),
         }
       : undefined;
   const egressMatcher = s.egressMatcher;
@@ -2672,14 +3962,20 @@ type SpecWithWatchme = { readonly watchme?: SpecWatchmeBlock };
  * defaults when `judge: {}` is declared), so emitters/runtimes never
  * re-derive them.
  */
-function lowerWatchme(spec: SpecWithWatchme): { watchme?: IrWatchme } {
+function lowerWatchme(spec: SpecWithWatchme, ctx: LowerContext): { watchme?: IrWatchme } {
   const w = spec.watchme;
   if (w === undefined) return {};
+  // 0.6.0 §4.3 — the judge model is an auxiliary slot (it used to be baked
+  // verbatim, so `$profile` / `cheapest` / `strongest` never resolved here).
+  // The schema-matching default keeps a profile-less spec byte-identical.
+  const judge = resolveAuxSlot(w.judge?.model ?? "claude-haiku-4-5", ctx, "watchme.judge.model");
   return {
     watchme: {
       enabled: w.enabled,
       capture: w.capture,
-      judgeModel: w.judge?.model ?? "claude-haiku-4-5",
+      judgeModel: judge.model,
+      ...(judge.modelProfile !== undefined ? { judgeProfile: judge.modelProfile } : {}),
+      ...(judge.params !== undefined ? { judgeParams: judge.params } : {}),
       judgeSampleRate: w.judge?.sample_rate ?? 0.15,
       judgeBudgetUsd: w.judge?.budget_usd ?? 0,
       scope: w.scope,
@@ -2816,11 +4112,184 @@ export function assertChainGameLowered(
   return { chain, wallet, contract };
 }
 
-export function lower(spec: Spec): IrNode {
-  // 0.6.0 PR 6 — every §11.1 spec key parses, none is lowered until PR 7:
-  // refuse the whole delta loudly and path-precisely (see the guard section
-  // above `lowerModelFailover`). Absent ⇒ byte-identical to 0.5.x.
-  assertNoPending060Keys(spec);
+/**
+ * 0.6.0 §4.3 — the serving agent slot of an agent-carrying shape: resolve
+ * `agent.model` (a `$profile`, a sentinel, or a grammar string), apply the
+ * profile per the shape's {@link SingleSlotKind}, and report a slot
+ * `temperature` as pending until the plan table applies it.
+ */
+function resolveServingAgent(
+  agent: {
+    readonly model: string;
+    readonly thinking?: SpecThinking;
+    readonly max_tokens?: number;
+    readonly temperature?: number;
+    readonly model_pool?: unknown;
+    readonly model_tiers?: unknown;
+    readonly model_fallbacks?: unknown;
+  },
+  ctx: LowerContext,
+  kind: SingleSlotKind,
+  path = "agent",
+): SingleSlotResult {
+  const slot = applyProfileToSlot(
+    resolveModelRef(agent.model, ctx, `${path}.model`),
+    ctx,
+    `${path}.model`,
+    kind,
+    {
+      ...lowerThinking(agent.thinking),
+      ...(agent.max_tokens !== undefined ? { maxTokens: agent.max_tokens } : {}),
+      ...(agent.temperature !== undefined ? { temperature: agent.temperature } : {}),
+      hasRouting:
+        agent.model_pool !== undefined ||
+        agent.model_tiers !== undefined ||
+        agent.model_fallbacks !== undefined,
+    },
+  );
+  noteTemperaturePending(ctx, `${path}.temperature`, slot.temperature);
+  return slot;
+}
+
+/** The `models` registry field, present only when the spec declared one. */
+function registryField(ctx: LowerContext): { models?: IrModelProfiles } {
+  return ctx.hasRegistry ? { models: ctx.registry } : {};
+}
+
+/**
+ * 0.6.0 §4.3 — the judge-independence lint: on a spec that opted into the
+ * 0.6.0 surface (a `models:` registry or a pool `strategy`), warn when an
+ * EXPLICITLY declared judge model (or panel member) is the SAME model as an
+ * arm it grades (the serving agent, a pool candidate, or — for a `kind:
+ * judge` step/node — the gated block's). The compiler-chosen default
+ * (`strongest`, see {@link defaultJudgeSlot}) is never reported — a warning
+ * about a default the compiler itself picked would be unactionable.
+ * `evaluation.allow_self_judge: true` silences it. A 0.5.x-shaped
+ * self-judging pooled spec stays warning-free, so nothing that compiled
+ * quietly before compiles noisily now.
+ */
+function specDeclaresStrategy(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(specDeclaresStrategy);
+  const block = asLooseBlock(value);
+  if (block === undefined) return false;
+  if (asLooseBlock(block["model_pool"])?.["strategy"] !== undefined) return true;
+  return Object.values(block).some(specDeclaresStrategy);
+}
+
+function noteSelfJudge(spec: Spec, ir: IrNode, ctx: LowerContext): void {
+  if (!ctx.optedIn) return;
+  const s = spec as unknown as LooseBlock;
+  /** TRUE when the spec itself names the judge model at `block.judge.model` / `grader.model`. */
+  const declaredJudge = (block: unknown, key: "judge" | "grader"): boolean =>
+    asLooseBlock(asLooseBlock(block)?.[key])?.["model"] !== undefined;
+  const arms = (block: {
+    readonly model: string;
+    readonly modelPool?: IrModelPool;
+    readonly modelTiers?: IrModelTiers;
+  }): Set<string> => {
+    const out = new Set<string>([block.model]);
+    for (const c of block.modelPool?.candidates ?? []) out.add(c.model);
+    if (block.modelTiers !== undefined) {
+      out.add(block.modelTiers.fast);
+      out.add(block.modelTiers.default);
+    }
+    return out;
+  };
+  const report = (path: string, judgeModel: string, gated: string): void =>
+    warn(
+      ctx,
+      "model-plan-self-judge",
+      path,
+      `${path}: the judge model "${judgeModel}" is also ${gated} — a model grading its own output is a measurement-integrity hazard; point the judge at a stronger, independent model (or set allow_self_judge: true to accept it)`,
+    );
+  if (ir.target === "cli" || ir.target === "channel" || ir.target === "managed") {
+    const ev = ir.evaluation;
+    if (ev === undefined || ev.grader.type !== "llm_judge" || ev.allowSelfJudge === true) return;
+    const serving = arms(ir.agent);
+    const explicit = declaredJudge(s["evaluation"], "grader")
+      ? [ev.grader.model ?? ir.agent.model]
+      : [];
+    const judges = [...explicit, ...(ev.grader.judges ?? [])];
+    for (const judgeModel of judges) {
+      if (serving.has(judgeModel)) {
+        report("evaluation.grader.model", judgeModel, "a serving arm of agent.model / model_pool");
+        return;
+      }
+    }
+    return;
+  }
+  if (ir.target === "workflow") {
+    ir.steps.forEach((step, i) => {
+      if (step.kind !== "judge") return;
+      const gated = ir.steps[i - 1];
+      if (gated === undefined || gated.kind === "judge") return;
+      const serving = arms(gated);
+      const specSteps = Array.isArray(s["steps"]) ? s["steps"] : [];
+      const explicit = declaredJudge(specSteps[i], "judge") ? [step.model] : [];
+      for (const judgeModel of [...explicit, ...(step.judge?.judges ?? [])]) {
+        if (serving.has(judgeModel)) {
+          report(
+            `steps[${i}].judge.model`,
+            judgeModel,
+            `a serving arm of the gated step "${gated.name}"`,
+          );
+          return;
+        }
+      }
+    });
+    return;
+  }
+  if (ir.target === "graph") {
+    const byName = new Map(ir.nodes.map((n) => [n.name, n]));
+    for (const node of ir.nodes) {
+      if (node.kind !== "judge") continue;
+      const upstream = ir.edges.filter((e) => e.to === node.name).map((e) => byName.get(e.from));
+      for (const gated of upstream) {
+        if (gated === undefined || gated.kind === "judge") continue;
+        const serving = arms(gated);
+        const explicit = declaredJudge(asLooseBlock(s["nodes"])?.[node.name], "judge")
+          ? [node.model]
+          : [];
+        for (const judgeModel of [...explicit, ...(node.judge?.judges ?? [])]) {
+          if (serving.has(judgeModel)) {
+            report(
+              `nodes.${node.name}.judge.model`,
+              judgeModel,
+              `a serving arm of the gated node "${gated.name}"`,
+            );
+            return;
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Lower a parsed spec to its IR variant AND return the compile warnings the
+ * lowering produced (0.6.0: the field-precise model-plan notices, sunset and
+ * capability notes). `compile()` merges them with the spec-level warnings;
+ * `lower()` is the same pipeline minus the warnings.
+ */
+export function lowerWithWarnings(
+  spec: Spec,
+  opts: LowerOptions = {},
+): { readonly ir: IrNode; readonly warnings: ReadonlyArray<CompileWarning> } {
+  // 0.6.0 PR 7 — the narrowing knobs whose runtime consumer has not landed
+  // are refused loudly and path-precisely (see the §4.3 section header);
+  // everything else in the §11.1 delta lowers. Absent ⇒ byte-identical.
+  if (opts.allowRuntimePendingKeys !== true) assertNoRuntimePendingKeys(spec);
+  const ctx = createLowerContext(spec, opts);
+  const ir = lowerWithContext(spec, ctx);
+  noteSelfJudge(spec, ir, ctx);
+  return { ir, warnings: ctx.warnings };
+}
+
+export function lower(spec: Spec, opts: LowerOptions = {}): IrNode {
+  return lowerWithWarnings(spec, opts).ir;
+}
+
+function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
   switch (spec.target) {
     case "cli": {
       // v0.3.0 Goal 1 — DEFAULT-ON continuity (the release's one sanctioned
@@ -2843,33 +4312,37 @@ export function lower(spec: Spec): IrNode {
         thredzLowered.memory !== undefined ? { memory: thredzLowered.memory } : {},
         learning.learning !== undefined,
       );
+      // 0.6.0 §4.3 — the serving slot resolves through the registry.
+      const agentSlot = resolveServingAgent(spec.agent, ctx, "agent-full");
       return {
         version: 0,
         name: spec.name,
         target: "cli",
+        ...registryField(ctx),
         agent: {
-          model: spec.agent.model,
-          instructions: spec.agent.instructions,
-          ...(spec.agent.max_tokens !== undefined ? { maxTokens: spec.agent.max_tokens } : {}),
-          // Loop contract 0.4 (Batch A) — thinking / streaming / rate limits.
-          ...lowerThinking(spec.agent.thinking),
+          model: agentSlot.model,
+          instructions: foldOverlay(spec.agent.instructions, agentSlot.overlay),
+          // 0.6.0 §4.3 — params (declared, or the profile's) + provenance;
+          // Loop contract 0.4 (Batch A) — streaming / rate limits.
+          ...servingSlotFields(agentSlot),
           ...(spec.agent.streaming !== undefined ? { streaming: spec.agent.streaming } : {}),
           ...lowerRateLimits(spec.agent.rate_limits),
-          ...lowerModelFailover(spec.agent),
+          ...lowerModelFailover(spec.agent, ctx, "agent"),
+          ...servingSlotFailover(agentSlot),
         },
         tools: spec.tools ?? [],
         toolConfigs: lowerToolConfigs(spec.tool_config),
         mcp_servers: thredzLowered.mcp_servers,
         permissions: lowerPermissions(spec),
-        subAgents: lowerSubAgents(spec.agent.sub_agents),
-        compaction: lowerCompaction(spec),
+        subAgents: lowerSubAgents(spec.agent.sub_agents, ctx, "agent"),
+        compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
-        ...lowerBudget(spec),
+        ...lowerBudget(spec, ctx),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
         // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
-        ...lowerEvaluation(spec),
-        ...lowerSecurity(spec),
+        ...lowerEvaluation(spec, ctx),
+        ...lowerSecurity(spec, ctx),
         ...lowerFeedback(spec),
         ...memoryLowered,
         // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
@@ -2879,7 +4352,7 @@ export function lower(spec: Spec): IrNode {
         ...learning,
         ...lowerObservability(spec),
         // "Watch me" — observe-and-learn (sibling of observability, §4.6).
-        ...lowerWatchme(spec),
+        ...lowerWatchme(spec, ctx),
         // Batch G — MCP-server projection (G30) + plugin activation (G32).
         ...lowerExpose(spec),
         ...lowerPlugins(spec),
@@ -2906,51 +4379,72 @@ export function lower(spec: Spec): IrNode {
         ...lowerChainSubsystem(spec),
       } satisfies IrV0;
     }
-    case "workflow":
+    case "workflow": {
+      // 0.6.0 §4.3 — the top-level `model` slot resolves once; a step without
+      // its own `model` inherits the resolved slot AND its profile.
+      const topRef = resolveModelRef(spec.model, ctx, "model");
       return {
         version: 0,
         name: spec.name,
         target: "workflow",
+        ...registryField(ctx),
         steps: spec.steps.map((s, i) => {
           // Loop contract 0.4 (Batch B, G02) — judge gate steps run no agent
           // turn of their own: instructions carry the criteria verbatim, the
           // judge model resolves into the ordinary `model` slot
-          // (`judge.model ?? workflow.model`, `cheapest` supported), and the
+          // (`judge.model ?? workflow.model`, an auxiliary slot), and the
           // gate knobs resolve in `lowerJudgeGate`. `kind` exists ONLY on
           // the judge variant, so the `in` check is the discriminator.
           if ("kind" in s) {
+            const judgeSlot =
+              s.judge.model !== undefined
+                ? resolveAuxSlot(s.judge.model, ctx, `steps[${i}].judge.model`)
+                : defaultJudgeSlot(ctx, `steps[${i}].judge.model`);
             return {
               name: s.name,
               kind: "judge" as const,
               instructions: s.judge.criteria,
-              model:
-                s.judge.model !== undefined
-                  ? resolveAuxModel(s.judge.model, spec, `steps[${i}].judge.model`)
-                  : spec.model,
+              model: judgeSlot?.model ?? topRef.model,
               tools: [],
               toolConfigs: lowerToolConfigs(undefined),
-              judge: lowerJudgeGate(s.judge),
+              judge: lowerJudgeGate(s.judge, judgeSlot, ctx, `steps[${i}].judge`),
             };
           }
+          const slotPath = s.model !== undefined ? `steps[${i}].model` : "model";
+          const slot = applyProfileToSlot(
+            s.model !== undefined ? resolveModelRef(s.model, ctx, slotPath) : topRef,
+            ctx,
+            slotPath,
+            "agent-full",
+            {
+              ...lowerThinking(s.thinking),
+              ...(s.max_tokens !== undefined ? { maxTokens: s.max_tokens } : {}),
+              ...(s.temperature !== undefined ? { temperature: s.temperature } : {}),
+              hasRouting:
+                s.model_pool !== undefined ||
+                s.model_tiers !== undefined ||
+                s.model_fallbacks !== undefined,
+            },
+          );
+          noteTemperaturePending(ctx, `steps[${i}].temperature`, slot.temperature);
           return {
             name: s.name,
-            instructions: s.instructions,
-            model: s.model ?? spec.model,
-            ...(s.max_tokens !== undefined ? { maxTokens: s.max_tokens } : {}),
-            // Loop contract 0.4 (Batch A) — per-step thinking selector.
-            ...lowerThinking(s.thinking),
+            instructions: foldOverlay(s.instructions, slot.overlay),
+            model: slot.model,
+            ...servingSlotFields(slot),
             tools: s.tools ?? [],
             toolConfigs: lowerToolConfigs(s.tool_config),
             // Item 9 (G37) — per-step model routing (failover/tiers/pool),
             // reusing the cli agent block's lowering verbatim.
-            ...lowerModelFailover(s),
+            ...lowerModelFailover(s, ctx, `steps[${i}]`),
+            ...servingSlotFailover(slot),
           };
         }),
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
-        compaction: lowerCompaction(spec),
+        compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
-        ...lowerBudget(spec),
+        ...lowerBudget(spec, ctx),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
         // v0.3.0 — carried only when declared (NOT default-on); the emitter
@@ -2958,6 +4452,7 @@ export function lower(spec: Spec): IrNode {
         ...lowerContinuity(spec, { defaultOn: false, autoScope: "spec" }),
         ...lowerChainSubsystem(spec),
       } satisfies IrWorkflowV0;
+    }
     case "channel": {
       const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "session" });
       // v0.3.0 Goal 2 — learning (validated + Sources-required wiki stamp).
@@ -2975,18 +4470,20 @@ export function lower(spec: Spec): IrNode {
         thredzLowered.memory !== undefined ? { memory: thredzLowered.memory } : {},
         learning.learning !== undefined,
       );
+      const agentSlot = resolveServingAgent(spec.agent, ctx, "agent-full");
       return {
         version: 0,
         name: spec.name,
         target: "channel",
+        ...registryField(ctx),
         agent: {
-          model: spec.agent.model,
-          instructions: spec.agent.instructions,
-          ...(spec.agent.max_tokens !== undefined ? { maxTokens: spec.agent.max_tokens } : {}),
-          // Loop contract 0.4 (Batch A) — thinking / rate limits.
-          ...lowerThinking(spec.agent.thinking),
+          model: agentSlot.model,
+          instructions: foldOverlay(spec.agent.instructions, agentSlot.overlay),
+          // 0.6.0 §4.3 — params + provenance; Loop contract 0.4 — rate limits.
+          ...servingSlotFields(agentSlot),
           ...lowerRateLimits(spec.agent.rate_limits),
-          ...lowerModelFailover(spec.agent),
+          ...lowerModelFailover(spec.agent, ctx, "agent"),
+          ...servingSlotFailover(agentSlot),
         },
         tools: spec.agent.tools ?? [],
         toolConfigs: lowerToolConfigs(spec.agent.tool_config),
@@ -2994,14 +4491,14 @@ export function lower(spec: Spec): IrNode {
         routing: { sessionKey: spec.routing.sessionKey },
         mcp_servers: thredzLowered.mcp_servers,
         permissions: lowerPermissions(spec),
-        subAgents: lowerSubAgents(spec.agent.sub_agents),
-        compaction: lowerCompaction(spec),
+        subAgents: lowerSubAgents(spec.agent.sub_agents, ctx, "agent"),
+        compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
-        ...lowerBudget(spec),
+        ...lowerBudget(spec, ctx),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
         // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
-        ...lowerEvaluation(spec),
+        ...lowerEvaluation(spec, ctx),
         ...lowerFeedback(spec),
         ...memoryLowered,
         // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
@@ -3016,7 +4513,7 @@ export function lower(spec: Spec): IrNode {
         ...learning,
         ...lowerObservability(spec),
         // "Watch me" — observe-and-learn (sibling of observability, §4.6).
-        ...lowerWatchme(spec),
+        ...lowerWatchme(spec, ctx),
         // Batch G — MCP-server projection (G30) + plugin activation (G32).
         ...lowerExpose(spec),
         ...lowerPlugins(spec),
@@ -3045,11 +4542,13 @@ export function lower(spec: Spec): IrNode {
         ...lowerChainSubsystem(spec),
       } satisfies IrChannelV0;
     }
-    case "graph":
+    case "graph": {
+      const topRef = resolveModelRef(spec.model, ctx, "model");
       return {
         version: 0,
         name: spec.name,
         target: "graph",
+        ...registryField(ctx),
         entry: spec.entry,
         // Preserve YAML insertion order — nodes appear in the bundle in
         // the same order the spec author wrote them.
@@ -3057,32 +4556,52 @@ export function lower(spec: Spec): IrNode {
           // Loop contract 0.4 (Batch B, G02) — judge gate nodes run no agent
           // turn of their own: instructions carry the criteria verbatim, the
           // judge model resolves into the ordinary `model` slot
-          // (`judge.model ?? graph.model`, `cheapest` supported), and the
+          // (`judge.model ?? graph.model`, an auxiliary slot), and the
           // gate knobs resolve in `lowerJudgeGate`. `kind` exists ONLY on
           // the judge variant, so the `in` check is the discriminator.
           if ("kind" in node) {
+            const judgeSlot =
+              node.judge.model !== undefined
+                ? resolveAuxSlot(node.judge.model, ctx, `nodes.${name}.judge.model`)
+                : defaultJudgeSlot(ctx, `nodes.${name}.judge.model`);
             return {
               name,
               kind: "judge" as const,
               instructions: node.judge.criteria,
-              model:
-                node.judge.model !== undefined
-                  ? resolveAuxModel(node.judge.model, spec, `nodes.${name}.judge.model`)
-                  : spec.model,
+              model: judgeSlot?.model ?? topRef.model,
               tools: [],
               toolConfigs: lowerToolConfigs(undefined),
-              judge: lowerJudgeGate(node.judge),
+              judge: lowerJudgeGate(node.judge, judgeSlot, ctx, `nodes.${name}.judge`),
             };
           }
+          const slotPath = node.model !== undefined ? `nodes.${name}.model` : "model";
+          const slot = applyProfileToSlot(
+            node.model !== undefined ? resolveModelRef(node.model, ctx, slotPath) : topRef,
+            ctx,
+            slotPath,
+            "agent-full",
+            {
+              ...lowerThinking(node.thinking),
+              ...(node.max_tokens !== undefined ? { maxTokens: node.max_tokens } : {}),
+              ...(node.temperature !== undefined ? { temperature: node.temperature } : {}),
+              hasRouting:
+                node.model_pool !== undefined ||
+                node.model_tiers !== undefined ||
+                node.model_fallbacks !== undefined,
+            },
+          );
+          noteTemperaturePending(ctx, `nodes.${name}.temperature`, slot.temperature);
           return {
             name,
-            instructions: node.instructions,
-            model: node.model ?? spec.model,
-            ...(node.max_tokens !== undefined ? { maxTokens: node.max_tokens } : {}),
-            // Loop contract 0.4 (Batch A) — per-node thinking selector.
-            ...lowerThinking(node.thinking),
+            instructions: foldOverlay(node.instructions, slot.overlay),
+            model: slot.model,
+            ...servingSlotFields(slot),
             tools: node.tools ?? [],
             toolConfigs: lowerToolConfigs(node.tool_config),
+            // 0.6.0 §7.7 — per-node model routing (graph nodes carried none
+            // before), the cli agent block's lowering verbatim.
+            ...lowerModelFailover(node, ctx, `nodes.${name}`),
+            ...servingSlotFailover(slot),
             ...(node.hitl !== undefined ? { hitlPrompt: node.hitl.prompt } : {}),
           };
         }),
@@ -3108,13 +4627,14 @@ export function lower(spec: Spec): IrNode {
           ? { parallel: spec.parallel.map((group) => [...group]) }
           : {}),
         permissions: lowerPermissions(spec),
-        compaction: lowerCompaction(spec),
+        compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
-        ...lowerBudget(spec),
+        ...lowerBudget(spec, ctx),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
         ...lowerChainSubsystem(spec),
       } satisfies IrGraphV0;
+    }
     case "managed": {
       const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
       // v0.3.0 Goal 2 — learning (validated + Sources-required wiki stamp).
@@ -3131,18 +4651,20 @@ export function lower(spec: Spec): IrNode {
         thredzLowered.memory !== undefined ? { memory: thredzLowered.memory } : {},
         learning.learning !== undefined,
       );
+      const agentSlot = resolveServingAgent(spec.agent, ctx, "agent-full");
       return {
         version: 0,
         name: spec.name,
         target: "managed",
+        ...registryField(ctx),
         agent: {
-          model: spec.agent.model,
-          instructions: spec.agent.instructions,
-          ...(spec.agent.max_tokens !== undefined ? { maxTokens: spec.agent.max_tokens } : {}),
-          // Loop contract 0.4 (Batch A) — thinking / rate limits.
-          ...lowerThinking(spec.agent.thinking),
+          model: agentSlot.model,
+          instructions: foldOverlay(spec.agent.instructions, agentSlot.overlay),
+          // 0.6.0 §4.3 — params + provenance; Loop contract 0.4 — rate limits.
+          ...servingSlotFields(agentSlot),
           ...lowerRateLimits(spec.agent.rate_limits),
-          ...lowerModelFailover(spec.agent),
+          ...lowerModelFailover(spec.agent, ctx, "agent"),
+          ...servingSlotFailover(agentSlot),
         },
         tenants: spec.tenants.map((t) => ({
           id: t.id,
@@ -3160,15 +4682,15 @@ export function lower(spec: Spec): IrNode {
           ? { toolConfigs: lowerToolConfigs(spec.agent.tool_config) }
           : {}),
         permissions: lowerPermissions(spec),
-        compaction: lowerCompaction(spec),
+        compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
-        ...lowerBudget(spec),
+        ...lowerBudget(spec, ctx),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
         // Loop contract 0.4 (Batch F) — cron/interval wake trigger.
         ...lowerSchedule(spec.schedule),
         // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
-        ...lowerEvaluation(spec),
+        ...lowerEvaluation(spec, ctx),
         // NEW-inloop-coverage — rating capture on the gateway shape.
         ...lowerFeedback(spec),
         ...memoryLowered,
@@ -3185,23 +4707,26 @@ export function lower(spec: Spec): IrNode {
         ...lowerObservability(spec),
         // "Watch me" — observe-and-learn, lowered but NOT runtime-wired on
         // managed in v1 (compile() emits the accepted-but-unwired warning).
-        ...lowerWatchme(spec),
+        ...lowerWatchme(spec, ctx),
         // Batch G — MCP-server projection (G30); SSE exposure rides this
         // shape's gateway tenancy. No plugins on managed (item 3 boot paths
         // cover cli + channel-bot codegen).
         ...lowerExpose(spec),
       } satisfies IrManagedV0;
     }
-    case "pipeline":
+    case "pipeline": {
+      const agentSlot = resolveServingAgent(spec.agent, ctx, "agent-temperature");
       return {
         version: 0,
         name: spec.name,
         target: "pipeline",
+        ...registryField(ctx),
         agent: {
-          model: spec.agent.model,
-          instructions: spec.agent.instructions,
+          model: agentSlot.model,
+          instructions: foldOverlay(spec.agent.instructions, agentSlot.overlay),
+          ...servingSlotFields(agentSlot),
           // Adaptive model routing — lowers model_pool when declared.
-          ...lowerModelFailover(spec.agent),
+          ...lowerModelFailover(spec.agent, ctx, "agent"),
         },
         retrieve: {
           embedderModel: spec.retrieve.embedderModel,
@@ -3228,9 +4753,10 @@ export function lower(spec: Spec): IrNode {
           })),
         },
         permissions: lowerPermissions(spec),
-        compaction: lowerCompaction(spec),
+        compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
       } satisfies IrPipelineV0;
+    }
     case "crew": {
       const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
       // v0.3.0 Goal 2 — learning (validated + Sources-required wiki stamp).
@@ -3243,16 +4769,24 @@ export function lower(spec: Spec): IrNode {
         mcpServers: lowerMcpServers(spec.mcp_servers),
         memory: lowerMemory(spec),
       });
+      // 0.6.0 §4.3 — the crew-wide `model` slot resolves once; a role without
+      // its own `model` inherits the resolved slot AND its profile.
+      const topRef = resolveModelRef(spec.model, ctx, "model");
+      const routerModel =
+        spec.routing?.model !== undefined
+          ? resolveModelOnly(spec.routing.model, ctx, "routing.model")
+          : undefined;
       return {
         version: 0,
         name: spec.name,
         target: "crew",
+        ...registryField(ctx),
         entry: spec.entry,
         // Stable order: sort by role name so generated bundles diff cleanly.
         roles: Object.entries(spec.roles)
           .sort(([a], [b]) => a.localeCompare(b))
           .map(([name, role]) => {
-            const lowered = lowerCrewRole(name, role, spec.model);
+            const lowered = lowerCrewRole(name, role, topRef, ctx);
             // 0.5.0 — attach this role's RESOLVED Thredz config and the
             // server it rides. Absent for a role with no hosted wiki.
             const wired = crewThredz.roleThredz.get(name);
@@ -3265,13 +4799,19 @@ export function lower(spec: Spec): IrNode {
               routing: {
                 kind: spec.routing.kind,
                 ...(spec.routing.match !== undefined ? { match: spec.routing.match } : {}),
+                // 0.6.0 §7.7 — the llm router's own model slot (was hard-wired
+                // to the entry role's model).
+                ...(routerModel !== undefined ? { model: routerModel.model } : {}),
+                ...(routerModel?.profile !== undefined
+                  ? { modelProfile: routerModel.profile }
+                  : {}),
               },
             }
           : {}),
         permissions: lowerPermissions(spec),
-        compaction: lowerCompaction(spec),
+        compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
-        ...lowerBudget(spec),
+        ...lowerBudget(spec, ctx),
         // Loop contract 0.4 (Batch A) — the crew limits block may carry the
         // crew-only `limits.crew` orchestration ceilings.
         ...lowerLimits(spec),
@@ -3300,16 +4840,18 @@ export function lower(spec: Spec): IrNode {
       const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
       // v0.3.0 Goal 2 — learning (validated + Sources-required wiki stamp).
       const learning = lowerLearning(spec);
+      const agentSlot = resolveServingAgent(spec.agent, ctx, "agent-params");
       return {
         version: 0,
         name: spec.name,
         target: "research",
+        ...registryField(ctx),
         agent: {
-          model: spec.agent.model,
-          instructions: spec.agent.instructions,
-          ...(spec.agent.max_tokens !== undefined ? { maxTokens: spec.agent.max_tokens } : {}),
+          model: agentSlot.model,
+          instructions: foldOverlay(spec.agent.instructions, agentSlot.overlay),
+          ...servingSlotFields(agentSlot),
           // Adaptive model routing — lowers model_pool when declared.
-          ...lowerModelFailover(spec.agent),
+          ...lowerModelFailover(spec.agent, ctx, "agent"),
         },
         goal: spec.goal,
         branchingFactor: spec.branchingFactor,
@@ -3325,9 +4867,9 @@ export function lower(spec: Spec): IrNode {
         toolConfigs: lowerToolConfigs(spec.tool_config),
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
-        compaction: lowerCompaction(spec),
+        compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
-        ...lowerBudget(spec),
+        ...lowerBudget(spec, ctx),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
         ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
@@ -3340,17 +4882,19 @@ export function lower(spec: Spec): IrNode {
         ...lowerChainSubsystem(spec),
       } satisfies IrResearchV0;
     }
-    case "batch":
+    case "batch": {
+      const agentSlot = resolveServingAgent(spec.agent, ctx, "agent-params");
       return {
         version: 0,
         name: spec.name,
         target: "batch",
+        ...registryField(ctx),
         agent: {
-          model: spec.agent.model,
-          instructions: spec.agent.instructions,
-          ...(spec.agent.max_tokens !== undefined ? { maxTokens: spec.agent.max_tokens } : {}),
+          model: agentSlot.model,
+          instructions: foldOverlay(spec.agent.instructions, agentSlot.overlay),
+          ...servingSlotFields(agentSlot),
           // Adaptive model routing — lowers model_pool when declared.
-          ...lowerModelFailover(spec.agent),
+          ...lowerModelFailover(spec.agent, ctx, "agent"),
         },
         queue: {
           adapter: spec.queue.adapter,
@@ -3367,9 +4911,9 @@ export function lower(spec: Spec): IrNode {
         toolConfigs: lowerToolConfigs(spec.tool_config),
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
-        compaction: lowerCompaction(spec),
+        compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
-        ...lowerBudget(spec),
+        ...lowerBudget(spec, ctx),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
         // v0.3.0 — carried only when declared (NOT default-on); the emitter
@@ -3379,12 +4923,19 @@ export function lower(spec: Spec): IrNode {
         ...lowerSchedule(spec.schedule),
         ...lowerChainSubsystem(spec),
       } satisfies IrBatchV0;
-    case "voice":
+    }
+    case "voice": {
+      const agentSlot = resolveServingAgent(spec.agent, ctx, "agent-model");
       return {
         version: 0,
         name: spec.name,
         target: "voice",
-        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        ...registryField(ctx),
+        agent: {
+          model: agentSlot.model,
+          instructions: foldOverlay(spec.agent.instructions, agentSlot.overlay),
+          ...(agentSlot.modelProfile !== undefined ? { modelProfile: agentSlot.modelProfile } : {}),
+        },
         voice: {
           provider: spec.voice.provider,
           voiceId: spec.voice.voiceId,
@@ -3399,23 +4950,32 @@ export function lower(spec: Spec): IrNode {
         toolConfigs: lowerToolConfigs(spec.tool_config),
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
-        compaction: lowerCompaction(spec),
+        compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
         // v0.3.0 — carried only when declared (NOT default-on); the emitter
         // prints the ignored-note comment.
         ...lowerContinuity(spec, { defaultOn: false, autoScope: "spec" }),
       } satisfies IrVoiceV0;
-    case "browser":
+    }
+    case "browser": {
+      const agentSlot = resolveServingAgent(spec.agent, ctx, "agent-params");
+      // 0.6.0 §4.3 — the vision-grounding model is an auxiliary slot (it
+      // bypassed `resolveAuxModel`); absent → the resolved agent model.
+      const grounding =
+        spec.groundingModel !== undefined
+          ? resolveAuxSlot(spec.groundingModel, ctx, "groundingModel")
+          : undefined;
       return {
         version: 0,
         name: spec.name,
         target: "browser",
+        ...registryField(ctx),
         agent: {
-          model: spec.agent.model,
-          instructions: spec.agent.instructions,
-          ...(spec.agent.max_tokens !== undefined ? { maxTokens: spec.agent.max_tokens } : {}),
+          model: agentSlot.model,
+          instructions: foldOverlay(spec.agent.instructions, agentSlot.overlay),
+          ...servingSlotFields(agentSlot),
           // Adaptive model routing — lowers model_pool when declared.
-          ...lowerModelFailover(spec.agent),
+          ...lowerModelFailover(spec.agent, ctx, "agent"),
         },
         driver: {
           backend: spec.driver.backend,
@@ -3425,29 +4985,36 @@ export function lower(spec: Spec): IrNode {
           // that leaves it at the default stays byte-identical to 0.4.1.
           ...(spec.driver.allowPrivateTargets ? { allowPrivateTargets: true } : {}),
         },
-        groundingModel: spec.groundingModel ?? spec.agent.model,
+        groundingModel: grounding?.model ?? agentSlot.model,
+        ...(grounding?.modelProfile !== undefined
+          ? { groundingModelProfile: grounding.modelProfile }
+          : {}),
         tools: spec.tools ?? [],
         toolConfigs: lowerToolConfigs(spec.tool_config),
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
-        compaction: lowerCompaction(spec),
+        compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
-        ...lowerBudget(spec),
+        ...lowerBudget(spec, ctx),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
         // v0.3.0 — carried only when declared (NOT default-on); the emitter
         // prints the ignored-note comment.
         ...lowerContinuity(spec, { defaultOn: false, autoScope: "spec" }),
       } satisfies IrBrowserV0;
-    case "eval":
+    }
+    case "eval": {
+      const agentSlot = resolveServingAgent(spec.agent, ctx, "agent-model");
       return {
         version: 0,
         name: spec.name,
         target: "eval",
+        ...registryField(ctx),
         agent: {
-          model: spec.agent.model,
-          instructions: spec.agent.instructions,
+          model: agentSlot.model,
+          instructions: foldOverlay(spec.agent.instructions, agentSlot.overlay),
           tools: spec.agent.tools ?? [],
+          ...(agentSlot.modelProfile !== undefined ? { modelProfile: agentSlot.modelProfile } : {}),
         },
         dataset: {
           name: spec.dataset.name,
@@ -3462,16 +5029,23 @@ export function lower(spec: Spec): IrNode {
         ...(spec.seed !== undefined ? { seed: spec.seed } : {}),
         ...lowerFailureTaxonomy(spec),
       } satisfies IrEvalV0;
+    }
     case "onchain": {
       const lowered = lowerChainSubsystem(spec);
       if (lowered.chains === undefined || lowered.chains.length === 0) {
         throw new Error("onchain target requires chains[] to be non-empty");
       }
+      const agentSlot = resolveServingAgent(spec.agent, ctx, "agent-model");
       return {
         version: 0,
         name: spec.name,
         target: "onchain",
-        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        ...registryField(ctx),
+        agent: {
+          model: agentSlot.model,
+          instructions: foldOverlay(spec.agent.instructions, agentSlot.overlay),
+          ...(agentSlot.modelProfile !== undefined ? { modelProfile: agentSlot.modelProfile } : {}),
+        },
         chains: lowered.chains,
         wallets: lowered.wallets ?? [],
         contracts: lowered.contracts ?? [],
@@ -3509,7 +5083,7 @@ export function lower(spec: Spec): IrNode {
         toolConfigs: lowerToolConfigs(spec.tool_config),
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
-        compaction: lowerCompaction(spec),
+        compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
       } satisfies IrChainV0;
     }
@@ -3530,11 +5104,17 @@ export function lower(spec: Spec): IrNode {
         lowered.wallets?.[0],
         lowered.contracts?.[0],
       );
+      const agentSlot = resolveServingAgent(spec.agent, ctx, "agent-model");
       return {
         version: 0,
         name: spec.name,
         target: "onchain-game",
-        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        ...registryField(ctx),
+        agent: {
+          model: agentSlot.model,
+          instructions: foldOverlay(spec.agent.instructions, agentSlot.overlay),
+          ...(agentSlot.modelProfile !== undefined ? { modelProfile: agentSlot.modelProfile } : {}),
+        },
         chain,
         wallet,
         game: {
@@ -3558,7 +5138,7 @@ export function lower(spec: Spec): IrNode {
         toolConfigs: lowerToolConfigs(spec.tool_config),
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
-        compaction: lowerCompaction(spec),
+        compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
       } satisfies IrChainGameV0;
     }
@@ -3567,20 +5147,44 @@ export function lower(spec: Spec): IrNode {
   }
 }
 
-function lowerCrewRole(name: string, role: SpecCrewRole, fallbackModel: string): IrCrewRole {
+function lowerCrewRole(
+  name: string,
+  role: SpecCrewRole,
+  topRef: ResolvedModelRef,
+  ctx: LowerContext,
+): IrCrewRole {
+  const path = `roles.${name}`;
+  const slotPath = role.model !== undefined ? `${path}.model` : "model";
+  // 0.6.0 §4.3 — the role's slot: its own `model` (a `$profile`, a sentinel
+  // or a grammar string) or the crew-wide resolved slot with its profile.
+  const slot = applyProfileToSlot(
+    role.model !== undefined ? resolveModelRef(role.model, ctx, slotPath) : topRef,
+    ctx,
+    slotPath,
+    "agent-full",
+    {
+      ...lowerThinking(role.thinking),
+      ...(role.max_tokens !== undefined ? { maxTokens: role.max_tokens } : {}),
+      ...(role.temperature !== undefined ? { temperature: role.temperature } : {}),
+      hasRouting:
+        role.model_pool !== undefined ||
+        role.model_tiers !== undefined ||
+        role.model_fallbacks !== undefined,
+    },
+  );
+  noteTemperaturePending(ctx, `${path}.temperature`, slot.temperature);
   return {
     name,
-    model: role.model ?? fallbackModel,
-    instructions: role.instructions,
-    ...(role.max_tokens !== undefined ? { maxTokens: role.max_tokens } : {}),
-    // Loop contract 0.4 (Batch A) — per-role thinking selector.
-    ...lowerThinking(role.thinking),
+    model: slot.model,
+    instructions: foldOverlay(role.instructions, slot.overlay),
+    ...servingSlotFields(slot),
     tools: role.tools ?? [],
     toolConfigs: lowerToolConfigs(role.tool_config),
-    subAgents: lowerSubAgents(role.sub_agents),
+    subAgents: lowerSubAgents(role.sub_agents, ctx, path),
     // Item 9 (G37) — per-role model routing (failover/tiers/pool), reusing the
     // cli agent block's lowering verbatim.
-    ...lowerModelFailover(role),
+    ...lowerModelFailover(role, ctx, path),
+    ...servingSlotFailover(slot),
   };
 }
 

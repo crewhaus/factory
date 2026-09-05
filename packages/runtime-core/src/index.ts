@@ -56,6 +56,7 @@ import {
   type FailoverChain,
   type PolicyRouter,
   type PoolCandidate,
+  type PoolPolicy,
   type ResolvedTier,
   type TierRouter,
   createFailoverChain,
@@ -1641,8 +1642,22 @@ export type RunChatLoopOptions = {
     readonly candidates: ReadonlyArray<{
       readonly model: string;
       readonly tags: readonly string[];
+      /**
+       * 0.6.0 §7.1 — `false` withdraws the candidate from routing without
+       * deleting its learned history: it is skipped at boot. The compiler
+       * and the `modelPlanIntegrity` pass guarantee at least one candidate
+       * stays routable. (The rest of a candidate's per-model settings ride
+       * the same object; the plan table that reads them lands with PR 9a.)
+       */
+      readonly enabled?: false;
     }>;
-    readonly policy: "static" | "heuristic" | "learned";
+    /**
+     * 0.6.0 §7.2.3 — `classifier` is accepted so the interpreter can thread
+     * the IR's pool verbatim (`IrModelPool.policy`); until the preRoute
+     * decision phase lands (PR 9b) it routes as `heuristic`, the classifier's
+     * documented fallback.
+     */
+    readonly policy: "static" | "heuristic" | "learned" | "classifier";
     readonly objective?: {
       readonly quality?: number;
       readonly cost?: number;
@@ -2511,6 +2526,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const pool = opts.modelPool;
     const candidates: PoolCandidate[] = [];
     for (const c of pool.candidates) {
+      // 0.6.0 §7.1 — a withdrawn candidate never becomes an arm.
+      if (c.enabled === false) continue;
       const injected = opts._poolAdapters?.get(c.model);
       if (injected !== undefined) {
         candidates.push({
@@ -2540,9 +2557,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         : {}),
     };
     poolPolicyVersion = poolFingerprint(pool);
+    // 0.6.0 — `classifier` routes heuristically until PR 9b (see the option docblock).
+    const routerPolicy: PoolPolicy = pool.policy === "classifier" ? "heuristic" : pool.policy;
     poolRouter = createPolicyRouter({
       candidates,
-      policy: pool.policy,
+      policy: routerPolicy,
       ...(pool.routing !== undefined ? { routing: pool.routing } : {}),
       ...(pool.learning !== undefined
         ? {

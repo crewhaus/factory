@@ -427,6 +427,7 @@
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
     "packages/compaction-curator": {
@@ -469,6 +470,9 @@
         "@crewhaus/target-workflow": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/worker-runtime": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/model-plan": "workspace:*",
       },
     },
     "packages/compiler-worker": {
@@ -712,11 +716,13 @@
       "version": "0.5.8",
       "dependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
         "zod-to-json-schema": "^3.23.5",

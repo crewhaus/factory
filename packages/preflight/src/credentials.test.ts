@@ -325,3 +325,49 @@ describe("hasLiveProviderCredentials", () => {
     ).toBe(false);
   });
 });
+
+describe("0.6.0 §4.3 — $profile references resolve against the spec's models: block", () => {
+  const registrySpec = (model: string): string =>
+    [
+      "name: t",
+      "target: cli",
+      "models:",
+      "  fast: { model: openai/gpt-4o-mini }",
+      "  tbd: { model: strongest }",
+      "agent:",
+      `  model: ${model}`,
+      "  instructions: hi",
+    ].join("\n");
+
+  test("extractSpecModel follows $fast to the profile's model, so selectedProvider gets a grammar string", () => {
+    expect(extractSpecModel(registrySpec("$fast"))).toBe("openai/gpt-4o-mini");
+    expect(selectedProvider(extractSpecModel(registrySpec("$fast")) ?? "")).toBe("openai");
+  });
+
+  test("the tolerant contract holds: a profile whose model is a compile-time sentinel yields undefined", () => {
+    expect(extractSpecModel(registrySpec("$tbd"))).toBeUndefined();
+  });
+
+  test("collectSpecModels follows $refs at every slot and lists each profile under models.<name>", () => {
+    const models = collectSpecModels({
+      models: { fast: { model: "openai/gpt-4o-mini" }, strong: { model: "claude-opus-4-8" } },
+      agent: {
+        model: "$fast",
+        model_pool: { candidates: [{ model: "$strong" }, { model: "gemini/gemini-2.5-flash" }] },
+      },
+      evaluation: { grader: { type: "llm_judge", judges: ["$strong"], criteria: "c" } },
+      budget: { on_exceed: { action: "degrade", model: "$nope" } },
+    });
+    const byModel = new Map(models.map((m) => [m.model, m.sources]));
+    expect(byModel.get("openai/gpt-4o-mini")).toEqual(["models.fast", "agent.model"]);
+    expect(byModel.get("claude-opus-4-8")).toEqual([
+      "models.strong",
+      "agent.model_pool.candidates[0]",
+      "evaluation.grader.judges[0]",
+    ]);
+    expect(byModel.has("gemini/gemini-2.5-flash")).toBe(true);
+    // An unresolvable ref contributes nothing (the spec layer owns that error).
+    expect(models.some((m) => m.model.startsWith("$"))).toBe(false);
+    expect(models).toHaveLength(3);
+  });
+});

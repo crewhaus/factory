@@ -16,7 +16,14 @@
  * `packages/compiler`), and the README must not widen the blast radius by
  * copying the value into a second, more-readable artifact.
  */
-import type { IrMcpServers, IrNode } from "./index";
+import type {
+  IrMcpServers,
+  IrModelPool,
+  IrModelProfile,
+  IrModelProfiles,
+  IrModelTiers,
+  IrNode,
+} from "./index";
 import { OPAQUE_TOKEN_RE, maskCredentialTokens } from "./redact";
 
 /**
@@ -243,18 +250,112 @@ function collectConfiguredToolNames(ir: unknown): ReadonlySet<string> {
   return configured;
 }
 
-/** Deduped models across variant shapes (agent / steps / nodes / roles). */
+/**
+ * Deduped models across variant shapes (agent / steps / nodes / roles), in
+ * declaration order: the primary slot(s) first, then — 0.6.0 §4.3 — every
+ * other model a run can route a call to: pool candidates, the two tiers,
+ * failover chains, and the auxiliary slots (compaction, the in-loop judge or
+ * judge panel, the budget degrade rung, the security judge, the watchme
+ * judge). The README used to list only the primary slot(s), so a pooled or
+ * judged harness under-reported the credentials it needs. A registry
+ * profile's model appears once like any other string; the profile names
+ * themselves render in the "Model profiles" section.
+ */
 function collectModels(ir: IrNode): readonly string[] {
+  const out: string[] = [];
+  const add = (model: string | undefined): void => {
+    if (model !== undefined && model.length > 0 && !out.includes(model)) out.push(model);
+  };
+  const addRouted = (block: {
+    readonly model: string;
+    readonly modelPool?: IrModelPool;
+    readonly modelTiers?: IrModelTiers;
+    readonly modelFallbacks?: readonly string[];
+  }): void => {
+    add(block.model);
+    for (const c of block.modelPool?.candidates ?? []) {
+      add(c.model);
+      for (const f of c.fallbacks ?? []) add(f);
+    }
+    if (block.modelTiers !== undefined) {
+      add(block.modelTiers.fast);
+      add(block.modelTiers.default);
+    }
+    for (const f of block.modelFallbacks ?? []) add(f);
+  };
   switch (ir.target) {
     case "workflow":
-      return [...new Set(ir.steps.map((s) => s.model))];
+      for (const s of ir.steps) {
+        addRouted(s);
+        for (const j of s.judge?.judges ?? []) add(j);
+      }
+      break;
     case "graph":
-      return [...new Set(ir.nodes.map((n) => n.model))];
+      for (const n of ir.nodes) {
+        addRouted(n);
+        for (const j of n.judge?.judges ?? []) add(j);
+      }
+      break;
     case "crew":
-      return [...new Set(ir.roles.map((r) => r.model))];
+      for (const r of ir.roles) {
+        addRouted(r);
+        for (const sa of r.subAgents)
+          if (sa.model !== undefined) addRouted({ ...sa, model: sa.model });
+      }
+      add(ir.routing?.model);
+      break;
     default:
-      return [ir.agent.model];
+      addRouted(ir.agent);
+      break;
   }
+  const aux = ir as {
+    readonly subAgents?: ReadonlyArray<{
+      readonly model?: string;
+      readonly modelPool?: IrModelPool;
+      readonly modelTiers?: IrModelTiers;
+      readonly modelFallbacks?: readonly string[];
+    }>;
+    readonly compaction?: { readonly model?: string };
+    readonly evaluation?: {
+      readonly grader: { readonly model?: string; readonly judges?: readonly string[] };
+    };
+    readonly budget?: { readonly onExceed: { readonly model?: string } };
+    readonly security?: { readonly justification?: { readonly model?: string } };
+    readonly watchme?: { readonly judgeModel: string };
+    readonly groundingModel?: string;
+  };
+  for (const sa of aux.subAgents ?? []) {
+    if (sa.model !== undefined) addRouted({ ...sa, model: sa.model });
+  }
+  add(aux.compaction?.model);
+  add(aux.evaluation?.grader.model);
+  for (const j of aux.evaluation?.grader.judges ?? []) add(j);
+  add(aux.budget?.onExceed.model);
+  add(aux.security?.justification?.model);
+  add(aux.watchme?.judgeModel);
+  add(aux.groundingModel);
+  return out;
+}
+
+/**
+ * 0.6.0 §4.3 — the "Model profiles" section: one row per `models:` profile
+ * with its model, tags and the settings it pins. Rendered only when the IR
+ * carries a registry, so profile-less bundles keep the same README.
+ */
+function renderModelProfilesSection(ir: IrNode): string | undefined {
+  const registry = (ir as { readonly models?: IrModelProfiles }).models;
+  if (registry === undefined) return undefined;
+  const names = Object.keys(registry).sort();
+  if (names.length === 0) return undefined;
+  const rows = names.map((name) => {
+    const profile = registry[name] as IrModelProfile;
+    const tags = (profile.tags ?? []).map((t) => `\`${escapeCell(t)}\``).join(", ") || "—";
+    const pinned = Object.keys(profile)
+      .filter((k) => k !== "profile" && k !== "model" && k !== "tags")
+      .sort();
+    return `| \`${escapeCell(name)}\` | \`${escapeCell(profile.model)}\` | ${tags} | ${pinned.length > 0 ? pinned.map((k) => `\`${k}\``).join(", ") : "—"} |`;
+  });
+  return ["| Profile | Model | Tags | Pins |", "| --- | --- | --- | --- |", ...rows].join("\n");
 }
 
 /**
@@ -456,6 +557,9 @@ export function renderBundleReadme(ir: IrNode, opts: BundleReadmeOptions = {}): 
   ].join("\n");
 
   const sections: BundleReadmeSection[] = [{ heading: "Harness", body: harnessRows }];
+  // 0.6.0 §4.3 — the `models:` registry, when the spec declared one.
+  const profiles = renderModelProfilesSection(ir);
+  if (profiles !== undefined) sections.push({ heading: "Model profiles", body: profiles });
   const tools = renderToolsSection(ir);
   if (tools !== undefined) sections.push({ heading: "Tools", body: tools });
   const mcp = renderMcpSection(ir);

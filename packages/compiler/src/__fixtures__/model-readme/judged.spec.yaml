@@ -1,0 +1,9 @@
+name: judged-readme-pin
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: Answer briefly.
+  model_tiers: { fast: claude-haiku-4-5, default: claude-sonnet-4-6 }
+evaluation:
+  grader: { type: llm_judge, criteria: helpful, model: claude-opus-4-8 }
+compaction: { model: claude-haiku-4-5 }

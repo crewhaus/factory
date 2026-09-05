@@ -437,7 +437,7 @@ describe("compile() warnings — budget-degrade-outside-pool", () => {
       "  model_pool:",
       "    candidates:",
       "      - { model: claude-sonnet-4-6, tags: [cheap] }",
-      "      - { model: claude-opus-4-1, tags: [strong] }",
+      "      - { model: claude-opus-4-8, tags: [strong] }",
       "budget:",
       "  usd: 1",
       ...(degradeModel !== undefined
@@ -454,7 +454,7 @@ describe("compile() warnings — budget-degrade-outside-pool", () => {
     expect(w?.code).toBe("budget-degrade-outside-pool");
     expect(w?.path).toBe("budget.on_exceed.model");
     expect(w?.message).toContain("claude-haiku-4-5");
-    expect(w?.message).toContain("claude-sonnet-4-6, claude-opus-4-1");
+    expect(w?.message).toContain("claude-sonnet-4-6, claude-opus-4-8");
     expect(w?.message).toContain("EXTRA pool rung");
     // The compiled bundle still carries the degrade ladder verbatim — the
     // runtime pre-resolves the rung and forces it on a breach.
@@ -493,7 +493,7 @@ describe("compile() warnings — budget-degrade-outside-pool", () => {
         "  model_pool:",
         "    candidates:",
         "      - { model: claude-sonnet-4-6, tags: [cheap] }",
-        "      - { model: claude-opus-4-1, tags: [strong] }",
+        "      - { model: claude-opus-4-8, tags: [strong] }",
         "channels:",
         "  slack:",
         "    botToken: $SLACK_BOT_TOKEN",

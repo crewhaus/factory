@@ -1277,3 +1277,55 @@ describe("emitGraph — hitl gate is a pre-condition (audit factory #4)", () => 
     expect(code).toContain("prompt: ev.prompt, state: ev.state");
   });
 });
+
+describe("emitGraph — per-node model routing (0.6.0 §7.7)", () => {
+  const routed = (extra: Partial<IrGraphV0["nodes"][number]>): IrGraphV0 => {
+    const [plan, execute, summarise] = baseIr.nodes;
+    if (plan === undefined || execute === undefined || summarise === undefined) {
+      throw new Error("baseIr is missing nodes");
+    }
+    return { ...baseIr, nodes: [{ ...plan, ...extra }, execute, summarise] };
+  };
+
+  test("a node's modelPool lands on THAT node's runChatLoop call only (mirrors the workflow step)", () => {
+    const c =
+      emitGraph(
+        routed({
+          modelPool: {
+            candidates: [
+              { model: "claude-haiku-4-5", tags: ["cheap"] },
+              { model: "claude-opus-4-8", tags: ["strong"] },
+            ],
+            policy: "heuristic",
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(c).toContain(
+      'modelPool: {"candidates":[{"model":"claude-haiku-4-5","tags":["cheap"]},{"model":"claude-opus-4-8","tags":["strong"]}],"policy":"heuristic"},',
+    );
+    expect((c.match(/modelPool:/g) ?? []).length).toBe(1);
+  });
+
+  test("model_fallbacks + circuit_breaker and model_tiers emit onto the node call", () => {
+    const c =
+      emitGraph(
+        routed({
+          modelFallbacks: ["openai/gpt-4o-mini"],
+          circuitBreaker: { failureThreshold: 2 },
+        }),
+      ).files[0]?.content ?? "";
+    expect(c).toContain('modelFallbacks: ["openai/gpt-4o-mini"],');
+    expect(c).toContain('circuitBreaker: {"failureThreshold":2},');
+    const t =
+      emitGraph(routed({ modelTiers: { fast: "claude-haiku-4-5", default: "claude-sonnet-4-6" } }))
+        .files[0]?.content ?? "";
+    expect(t).toContain('modelTiers: {"fast":"claude-haiku-4-5","default":"claude-sonnet-4-6"},');
+  });
+
+  test("a node without routing stays byte-identical", () => {
+    const c = emitGraph(baseIr).files[0]?.content ?? "";
+    for (const field of ["modelPool:", "modelTiers:", "modelFallbacks:", "circuitBreaker:"]) {
+      expect(c).not.toContain(field);
+    }
+  });
+});

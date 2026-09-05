@@ -89,6 +89,26 @@ export type IrSubAgentDefinition = {
    * sub-agent is spawned in-process as before.
    */
   readonly federation?: { readonly url: string };
+  /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
+  readonly modelProfile?: string;
+  /** 0.6.0 §7.7 — the child's own request params (spec `thinking` /
+   *  `max_tokens` / `temperature`, or the referenced profile's). */
+  readonly thinking?: IrThinking;
+  readonly maxTokens?: number;
+  readonly temperature?: number;
+  /** 0.6.0 §7.7 — per-sub-agent model routing (the agent block's quartet). */
+  readonly modelFallbacks?: readonly string[];
+  readonly circuitBreaker?: IrCircuitBreaker;
+  readonly modelTiers?: IrModelTiers;
+  readonly modelPool?: IrModelPool;
+  /** 0.6.0 §7.7 — fraction of the parent's `budget.usd` this child may spend. */
+  readonly budgetShare?: number;
+  /** 0.6.0 §7.7 — inherit the parent's SERVED arm instead of the declared
+   *  primary (default false keeps today's declared-primary behaviour). */
+  readonly inheritRouting?: boolean;
+  /** 0.6.0 §7.7 — profile names (no `$`) the Task tool's `profile` argument
+   *  may name for this child. */
+  readonly allowedProfiles?: readonly string[];
 };
 
 /**
@@ -109,6 +129,11 @@ export type IrToolConfigs = Readonly<Record<string, unknown>>;
  */
 export type IrCompaction = {
   readonly model?: string;
+  /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
+  readonly modelProfile?: string;
+  /** 0.6.0 §4.2 — the profile's pinned request params (autocompact builds its
+   *  own request). Present only when the profile declares any. */
+  readonly params?: IrModelParams;
   /** Loop contract 0.4 (Batch A) — context-window fill fraction that
    *  triggers autocompaction (spec `compaction.threshold`, 0.5–0.99).
    *  Runtime default applies when absent. */
@@ -173,24 +198,223 @@ export type IrModelTiers = {
   };
 };
 
-/** One declared candidate in a `model_pool`. */
-export type IrModelPoolCandidate = {
+/**
+ * 0.6.0 §4.2 — the per-model request parameters a `models:` profile can pin
+ * on an AUXILIARY slot (judge / compaction / degrade / security / watchme),
+ * where the consumer builds its own provider request. Carried ONLY when the
+ * slot resolved through a profile that declares them; absent otherwise.
+ */
+export type IrModelParams = {
+  readonly thinking?: IrThinking;
+  readonly maxTokens?: number;
+  readonly temperature?: number;
+};
+
+/**
+ * 0.6.0 §5.4 — the RESTRICTED per-profile permission schema: `deny` and
+ * `ask` ONLY. A profile can narrow the shape's permissions (decision-level
+ * meet: deny < ask < allow), never widen them — the spec rejects
+ * `alwaysAllow` / `mode` / `ask_mode`, and `modelPlanIntegrity` re-pins the
+ * shape for direct-IR builders.
+ */
+export type IrProfilePermissions = {
+  readonly deny?: readonly string[];
+  readonly ask?: readonly string[];
+};
+
+/**
+ * 0.6.0 §7.11 (N1) — what a profile REQUIRES of its own model. The four
+ * feature flags mirror `ProviderFeatures`; the two size floors are spelled
+ * as floors (`…Gte`). Structurally `@crewhaus/cost-tracker`'s
+ * `CapabilityRequirement` and `@crewhaus/model-plan`'s `FeatureRequirement`,
+ * so one value serves the compile-time twin and the runtime gate.
+ */
+export type IrModelRequires = {
+  readonly tool_use?: boolean;
+  readonly vision?: boolean;
+  readonly thinking?: boolean;
+  readonly web_search?: boolean;
+  readonly contextWindowGte?: number;
+  readonly maxOutputTokensGte?: number;
+};
+
+/**
+ * 0.6.0 §4.1 — a DECLARED capability override for a model the offline
+ * capability table does not know (local / azure / named hosts). Flat, every
+ * field optional: an unknown fact never satisfies a requirement on it.
+ */
+export type IrModelCapabilities = {
+  readonly tool_use?: boolean;
+  readonly vision?: boolean;
+  readonly thinking?: boolean;
+  readonly web_search?: boolean;
+  readonly caching?: "explicit" | "automatic" | false;
+  readonly contextWindow?: number;
+  readonly maxOutputTokens?: number;
+};
+
+/**
+ * 0.6.0 §4.2 — one resolved model profile: the lower-time expansion of a
+ * `models:` entry, and the settings a `model_pool` candidate carries inline.
+ * Every field but `model` is optional, and a profile-less candidate is a bare
+ * `{ model, tags }` with every key here absent — which is exactly why
+ * existing pools lower and emit byte-identically. `profile` is the registry
+ * name (provenance AND the scoreboard arm identity, §7.9); `overlay` is the
+ * per-model instructions overlay appended in the volatile prompt region when
+ * this candidate serves; `tools` is SUBSET-ONLY (builtin keys as the spec
+ * spells them, `mcp__<server>__*` globs, `Consult` / `Escalate`; `[]` means
+ * zero shape tools); `costCapUsdMicros` is the per-profile cap inside a run.
+ * `$` never appears in an IR model string — references are resolved here.
+ */
+export type IrModelProfile = {
+  readonly profile?: string;
   readonly model: string;
+  readonly tags?: readonly string[];
+  readonly thinking?: IrThinking;
+  readonly maxTokens?: number;
+  readonly temperature?: number;
+  readonly modelCallTimeoutMs?: number;
+  readonly overlay?: string;
+  readonly tools?: readonly string[];
+  readonly toolConfigs?: IrToolConfigs;
+  readonly permissions?: IrProfilePermissions;
+  readonly rateLimits?: IrRateLimits;
+  readonly caching?: "prefer" | "off";
+  readonly costCapUsdMicros?: number;
+  readonly requires?: IrModelRequires;
+  readonly capabilities?: IrModelCapabilities;
+  readonly fallbacks?: readonly string[];
+  readonly circuitBreaker?: IrCircuitBreaker;
+};
+
+/**
+ * 0.6.0 §4.2 — the `models:` registry as lowered: profile name → resolved
+ * profile (sentinels resolved by price rank, every snake_case key renamed).
+ * Present on a variant ONLY when the spec declares `models:`; emitters never
+ * read it (README / loop projection / `models explain` do), so an absent
+ * registry keeps every bundle byte-identical.
+ */
+export type IrModelProfiles = Readonly<Record<string, IrModelProfile>>;
+
+/**
+ * One declared candidate in a `model_pool`. 0.6.0 §4.2: a profile plus the
+ * routing identity `tags` (always present — the spec defaults them; a
+ * `$profile` candidate inherits the profile's tags when it declares none)
+ * and `enabled: false`, which withdraws the candidate from routing without
+ * deleting its learned history. The lowering inserts `model` then `tags`
+ * FIRST and spreads every 0.6.0 key after them, so `JSON.stringify` of a
+ * plain candidate is byte-identical to 0.5.x (the key-order guard).
+ */
+export type IrModelPoolCandidate = IrModelProfile & {
   readonly tags: readonly string[];
+  readonly enabled?: false;
+};
+
+/** 0.6.0 §7.2.2 — the `when:` clause of a route rule (spec keys verbatim — the
+ *  runtime's `evaluateRules` in `@crewhaus/model-plan` reads this shape). */
+export type IrModelPoolRuleWhen = {
+  readonly has_images?: boolean;
+  readonly message_matches?: string;
+  readonly user_text_chars_gt?: number;
+  readonly context_tokens_gt?: number;
+  readonly tool_in_play?: boolean;
+  readonly channel?: string;
+  readonly budget_spent_ratio_gt?: number;
+  readonly turn_index_lt?: number;
+};
+
+/**
+ * 0.6.0 §7.2.2 — one rule-directed routing rule, evaluated first-match in
+ * `preRoute` before the policy. `use` names a candidate tag, a roster arm id
+ * (a `$profile` reference lowers to its profile name — the arm identity), or
+ * a capability requirement the turn's candidates must satisfy.
+ */
+export type IrModelPoolRule = {
+  readonly id: string;
+  readonly when: IrModelPoolRuleWhen;
+  readonly use: string | { readonly requires: IrModelRequires };
+  readonly enabled?: boolean;
+};
+
+/** 0.6.0 §7.2.3 — `policy: classifier`: a forced-tool single call whose
+ *  verdict is constrained to the roster's tags. */
+export type IrModelPoolClassifier = {
+  readonly model: string;
+  readonly modelProfile?: string;
+  readonly labels: Readonly<Record<string, string>>;
+  readonly maxTokens?: number;
+};
+
+/**
+ * 0.6.0 §7.3–§7.8 — the hybrid strategy block. Role slots (`draft`,
+ * `escalateTo`, `members`, `escalateOnDisagreement`) name a candidate tag or
+ * a roster arm id; model slots (`guide.model`, `shadow.candidate`,
+ * `shadow.gradeWith`, `committee.judge`) are resolved model strings with
+ * their profile provenance beside them.
+ */
+export type IrModelPoolStrategy = {
+  readonly cascade?: {
+    readonly draft: string;
+    readonly escalateTo: string;
+    readonly cleanPrompt?: boolean;
+  };
+  readonly guide?: {
+    readonly model: string;
+    readonly modelProfile?: string;
+    readonly every?: "first_turn" | "turn";
+    readonly maxTokens?: number;
+    readonly budgetUsd?: number;
+  };
+  readonly shadow?: {
+    readonly candidate: string;
+    readonly candidateProfile?: string;
+    readonly sampleRate?: number;
+    readonly gradeWith?: string;
+    readonly gradeWithProfile?: string;
+  };
+  readonly committee?: {
+    readonly members: readonly string[];
+    readonly judge?: string;
+    readonly judgeProfile?: string;
+    readonly escalateOnDisagreement?: string;
+  };
+  readonly modelDirected?: boolean;
+  readonly maxEscalations?: number;
+};
+
+/** 0.6.0 §6.3, §7.10 — the reward block (a sibling of `learning`; nothing
+ *  here is optimizer-tunable). */
+export type IrModelPoolReward = {
+  readonly qualitySource?: "none" | "in_loop" | "shadow" | "promoted";
+  readonly priors?: "none" | "eval";
+  readonly floor?: {
+    readonly arm?: string;
+    readonly confidence?: number;
+    readonly tolerance?: number;
+  };
+  readonly resetOnProfileChange?: boolean;
 };
 
 /**
  * Adaptive model routing — the N-candidate `model_pool` with a per-turn
- * selection `policy` (`static` | `heuristic` | `learned`). Carried on the
- * agent blocks of the routing-capable shapes (cli, channel, managed), mutually
- * exclusive with `modelTiers`/`modelFallbacks` (enforced in the spec). Absent
- * when the spec omits `model_pool` — codegen gates on presence so an unset
- * block leaves bundles byte-identical. `policy` and each candidate's `tags` are
- * always present (spec defaults them); every other knob is carried verbatim.
+ * selection `policy` (`static` | `heuristic` | `learned` | `classifier`).
+ * Carried on the agent blocks of the routing-capable shapes (cli, channel,
+ * managed), on workflow steps, graph nodes (0.6.0), crew roles and
+ * sub-agents (0.6.0), mutually exclusive with `modelTiers`/`modelFallbacks`
+ * (enforced in the spec). Absent when the spec omits `model_pool` — codegen
+ * gates on presence so an unset block leaves bundles byte-identical. `policy`
+ * and each candidate's `tags` are always present (spec defaults them); every
+ * other knob is carried verbatim.
+ *
+ * 0.6.0 §7.1 — the pool IS the hybrid container: `rules` / `directives` /
+ * `classifier` / `strategy` / `reward` / `scope` are siblings of `routing`
+ * and `learning`, each present only when declared. The whole block travels
+ * to runtime inside the one `JSON.stringify(modelPool)` every emitter
+ * already writes, so every new key rides that blob without an emitter edit.
  */
 export type IrModelPool = {
   readonly candidates: readonly IrModelPoolCandidate[];
-  readonly policy: "static" | "heuristic" | "learned";
+  readonly policy: "static" | "heuristic" | "learned" | "classifier";
   readonly objective?: {
     readonly quality?: number;
     readonly cost?: number;
@@ -212,6 +436,14 @@ export type IrModelPool = {
     readonly seed?: string;
     readonly bandit?: "epsilon-greedy" | "thompson";
   };
+  /** 0.6.0 §7.2.1 — per-message `/model` steering (default off everywhere). */
+  readonly directives?: boolean;
+  readonly rules?: readonly IrModelPoolRule[];
+  readonly classifier?: IrModelPoolClassifier;
+  readonly strategy?: IrModelPoolStrategy;
+  readonly reward?: IrModelPoolReward;
+  /** 0.6.0 §7.9 — scoped routeKey prefix, carried verbatim when declared. */
+  readonly scope?: string;
 };
 
 /**
@@ -373,7 +605,13 @@ export type IrBudget = {
   readonly usdMicros: number;
   readonly onExceed:
     | { readonly kind: "stop" }
-    | { readonly kind: "degrade"; readonly model: string };
+    | {
+        readonly kind: "degrade";
+        readonly model: string;
+        /** 0.6.0 §4.2 — provenance + the degrade profile's request params. */
+        readonly modelProfile?: string;
+        readonly params?: IrModelParams;
+      };
   readonly scope?: "run" | "session";
   readonly judgeShare?: number;
 };
@@ -392,7 +630,23 @@ export type IrBudget = {
  *     on pass, 0 on fail; no model spend).
  */
 export type IrEvaluationGrader =
-  | { readonly type: "llm_judge"; readonly criteria: string; readonly model?: string }
+  | {
+      readonly type: "llm_judge";
+      readonly criteria: string;
+      readonly model?: string;
+      /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
+      readonly modelProfile?: string;
+      /** 0.6.0 §6.2 — a judge PANEL (resolved model strings); exclusive with `model`. */
+      readonly judges?: readonly string[];
+      /** 0.6.0 §6.2 — repeat verdicts per judge, folded by median. */
+      readonly repeats?: number;
+      /** 0.6.0 §6.2 — pinned judge sampling temperature. */
+      readonly temperature?: number;
+      /** 0.6.0 §6.2 — what the judge grades. */
+      readonly target?: "output" | "transcript";
+      /** 0.6.0 §4.2 — the judge profile's other pinned params (thinking / maxTokens). */
+      readonly params?: IrModelParams;
+    }
   | { readonly type: "contains"; readonly value: string }
   | { readonly type: "regex"; readonly value: string };
 
@@ -419,10 +673,14 @@ export type IrEvaluation = {
   readonly grader: IrEvaluationGrader;
   /** Present iff `grader.type === "llm_judge"` (resolved default 0.7). */
   readonly threshold?: number;
-  /** Resolved below-threshold behaviour (spec `on_fail`, default "retry"). */
-  readonly onFail: "retry" | "halt" | "note";
+  /** Resolved below-threshold behaviour (spec `on_fail`, default "retry").
+   *  0.6.0 §7.3 adds `escalate`: re-run the turn on the pool's
+   *  `strategy.cascade.escalateTo` candidate (else the strongest). */
+  readonly onFail: "retry" | "halt" | "note" | "escalate";
   /** Resolved retry hard-cap (spec `max_retries`, default 1). */
   readonly maxRetries: number;
+  /** 0.6.0 §4.3 — the judge-independence lint waiver; carried only when true. */
+  readonly allowSelfJudge?: true;
 };
 
 /**
@@ -452,6 +710,22 @@ export type IrJudge = {
   readonly onFail: "retry_previous" | "halt" | "continue";
   /** Resolved re-run hard-cap (spec `max_retries`, default 1). */
   readonly maxRetries: number;
+  /** 0.6.0 §4.2 — provenance of the judge model folded into the step's/node's
+   *  `model` slot, when it resolved through a `models:` profile. */
+  readonly modelProfile?: string;
+  /** 0.6.0 §6.2 — a judge PANEL (resolved model strings); exclusive with the
+   *  single judge model. */
+  readonly judges?: readonly string[];
+  /** 0.6.0 §6.2 — repeat verdicts per judge, folded by median. */
+  readonly repeats?: number;
+  /** 0.6.0 §6.2 — pinned judge sampling temperature. */
+  readonly temperature?: number;
+  /** 0.6.0 §6.2 — what the judge grades. */
+  readonly target?: "output" | "transcript";
+  /** 0.6.0 §7.3 — the pool tag / arm id a `retry_previous` re-run is forced onto. */
+  readonly escalateTo?: string;
+  /** 0.6.0 §4.2 — the judge profile's other pinned params (thinking / maxTokens). */
+  readonly params?: IrModelParams;
 };
 
 /**
@@ -473,6 +747,9 @@ export type IrSecurity = {
   readonly justification?: {
     readonly judge: "rule-based" | "claude";
     readonly model?: string;
+    /** 0.6.0 §4.2 — provenance + the judge profile's request params. */
+    readonly modelProfile?: string;
+    readonly params?: IrModelParams;
   };
   /**
    * Pillar 3 sink-side fabric (FR-006) — the egress-matching strategy.
@@ -887,6 +1164,9 @@ export type IrWatchme = {
   readonly capture: "full" | "mirrors";
   /** Phase-2 judge model — default resolved at lower time. */
   readonly judgeModel: string;
+  /** 0.6.0 §4.2 — provenance + the judge profile's request params. */
+  readonly judgeProfile?: string;
+  readonly judgeParams?: IrModelParams;
   readonly judgeSampleRate: number;
   readonly judgeBudgetUsd: number;
   readonly scope: "harness" | "user";
@@ -940,6 +1220,9 @@ export type IrV0 = {
   readonly version: 0;
   readonly name: string;
   readonly target: "cli";
+  /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
+   *  declares one; emitters never read it. */
+  readonly models?: IrModelProfiles;
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
@@ -966,6 +1249,13 @@ export type IrV0 = {
     readonly modelTiers?: IrModelTiers;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
+    /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from.
+     *  Absent unless the slot was declared as a `$profile` reference. */
+    readonly modelProfile?: string;
+    /** 0.6.0 §4.1 — sampling temperature (spec `temperature`, or the
+     *  referenced profile's). Exclusive with `thinking`. Absent when neither
+     *  declares it. */
+    readonly temperature?: number;
   };
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
@@ -1063,6 +1353,11 @@ export type IrWorkflowStep = {
    *  PolicyRouter decides per step against the shared routing-store
    *  scoreboard). Absent → single-model. */
   readonly modelPool?: IrModelPool;
+  /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
+  readonly modelProfile?: string;
+  /** 0.6.0 §4.1 — sampling temperature (spec `steps[].temperature`, or the
+   *  referenced profile's). Exclusive with `thinking`. */
+  readonly temperature?: number;
   /** Loop contract 0.4 (Batch B, G02) — `"judge"` marks a gate step over
    *  the previous step's output. ABSENT on regular agent steps. */
   readonly kind?: "judge";
@@ -1079,6 +1374,9 @@ export type IrWorkflowV0 = {
   readonly version: 0;
   readonly name: string;
   readonly target: "workflow";
+  /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
+   *  declares one; emitters never read it. */
+  readonly models?: IrModelProfiles;
   readonly steps: readonly IrWorkflowStep[];
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
@@ -1335,6 +1633,9 @@ export type IrChannelV0 = {
   readonly version: 0;
   readonly name: string;
   readonly target: "channel";
+  /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
+   *  declares one; emitters never read it. */
+  readonly models?: IrModelProfiles;
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
@@ -1355,6 +1656,13 @@ export type IrChannelV0 = {
     readonly modelTiers?: IrModelTiers;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
+    /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from.
+     *  Absent unless the slot was declared as a `$profile` reference. */
+    readonly modelProfile?: string;
+    /** 0.6.0 §4.1 — sampling temperature (spec `temperature`, or the
+     *  referenced profile's). Exclusive with `thinking`. Absent when neither
+     *  declares it. */
+    readonly temperature?: number;
   };
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
@@ -1436,6 +1744,9 @@ export type IrManagedV0 = {
   readonly version: 0;
   readonly name: string;
   readonly target: "managed";
+  /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
+   *  declares one; emitters never read it. */
+  readonly models?: IrModelProfiles;
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
@@ -1456,6 +1767,13 @@ export type IrManagedV0 = {
     readonly modelTiers?: IrModelTiers;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
+    /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from.
+     *  Absent unless the slot was declared as a `$profile` reference. */
+    readonly modelProfile?: string;
+    /** 0.6.0 §4.1 — sampling temperature (spec `temperature`, or the
+     *  referenced profile's). Exclusive with `thinking`. Absent when neither
+     *  declares it. */
+    readonly temperature?: number;
   };
   readonly tenants: readonly IrManagedTenant[];
   /** Loop contract 0.4 (Batch F, G81) — tool catalog for the managed daemon.
@@ -1533,6 +1851,19 @@ export type IrGraphNode = {
   readonly thinking?: IrThinking;
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
+  /** 0.6.0 §7.7 — per-node model routing (graph nodes carried NONE before
+   *  0.6.0): the agent block's quartet, lowered by the same
+   *  `lowerModelFailover` and rendered onto the node's `runChatLoop` call
+   *  exactly like a workflow step. Absent → the node's single resolved model. */
+  readonly modelFallbacks?: readonly string[];
+  readonly circuitBreaker?: IrCircuitBreaker;
+  readonly modelTiers?: IrModelTiers;
+  readonly modelPool?: IrModelPool;
+  /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
+  readonly modelProfile?: string;
+  /** 0.6.0 §4.1 — sampling temperature (spec `nodes.<n>.temperature`, or the
+   *  referenced profile's). Exclusive with `thinking`. */
+  readonly temperature?: number;
   /**
    * When set, the node calls `ctx.requestApproval(prompt)` BEFORE its LLM
    * turn and pauses the graph until `resume(checkpointId, decision)`. The
@@ -1584,6 +1915,9 @@ export type IrGraphV0 = {
   readonly version: 0;
   readonly name: string;
   readonly target: "graph";
+  /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
+   *  declares one; emitters never read it. */
+  readonly models?: IrModelProfiles;
   readonly entry: string;
   readonly nodes: readonly IrGraphNode[];
   readonly edges: readonly IrGraphEdge[];
@@ -1639,11 +1973,21 @@ export type IrPipelineV0 = {
   readonly version: 0;
   readonly name: string;
   readonly target: "pipeline";
+  /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
+   *  declares one; emitters never read it. */
+  readonly models?: IrModelProfiles;
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
+    /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from.
+     *  Absent unless the slot was declared as a `$profile` reference. */
+    readonly modelProfile?: string;
+    /** 0.6.0 §4.1 — sampling temperature (spec `temperature`, or the
+     *  referenced profile's). Exclusive with `thinking`. Absent when neither
+     *  declares it. */
+    readonly temperature?: number;
   };
   readonly retrieve: {
     readonly embedderModel: string;
@@ -1708,6 +2052,11 @@ export type IrCrewRole = {
    *  PolicyRouter decides per role against the shared routing-store
    *  scoreboard). Absent → single-model. */
   readonly modelPool?: IrModelPool;
+  /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
+  readonly modelProfile?: string;
+  /** 0.6.0 §4.1 — sampling temperature (spec `roles.<r>.temperature`, or the
+   *  referenced profile's). Exclusive with `thinking`. */
+  readonly temperature?: number;
   /** 0.5.0 — this role's RESOLVED Thredz config: the crew-wide defaults with
    *  the role's own `thredz.roles.<name>` overrides merged in, shorthands
    *  expanded and the credential lowered. Absent → this role has no hosted
@@ -1734,12 +2083,22 @@ export type IrCrewRouting = {
   readonly match?: Readonly<
     Record<string, ReadonlyArray<{ readonly contains: string; readonly to: string }>>
   >;
+  /**
+   * 0.6.0 §7.7 — the model the `kind: "llm"` router runs on (resolved; a
+   * `$profile` reference lowers here with its provenance beside it). Absent →
+   * the emitter keeps today's default, the entry role's model.
+   */
+  readonly model?: string;
+  readonly modelProfile?: string;
 };
 
 export type IrCrewV0 = {
   readonly version: 0;
   readonly name: string;
   readonly target: "crew";
+  /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
+   *  declares one; emitters never read it. */
+  readonly models?: IrModelProfiles;
   readonly entry: string;
   readonly roles: readonly IrCrewRole[];
   readonly routing?: IrCrewRouting;
@@ -1796,6 +2155,9 @@ export type IrResearchV0 = {
   readonly version: 0;
   readonly name: string;
   readonly target: "research";
+  /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
+   *  declares one; emitters never read it. */
+  readonly models?: IrModelProfiles;
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
@@ -1804,6 +2166,13 @@ export type IrResearchV0 = {
     readonly maxTokens?: number;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
+    /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from.
+     *  Absent unless the slot was declared as a `$profile` reference. */
+    readonly modelProfile?: string;
+    /** 0.6.0 §4.1 — sampling temperature (spec `temperature`, or the
+     *  referenced profile's). Exclusive with `thinking`. Absent when neither
+     *  declares it. */
+    readonly temperature?: number;
   };
   /** Default research goal. The daemon's `--goal "..."` flag overrides. */
   readonly goal: string;
@@ -1864,6 +2233,9 @@ export type IrBatchV0 = {
   readonly version: 0;
   readonly name: string;
   readonly target: "batch";
+  /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
+   *  declares one; emitters never read it. */
+  readonly models?: IrModelProfiles;
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
@@ -1872,6 +2244,13 @@ export type IrBatchV0 = {
     readonly maxTokens?: number;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
+    /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from.
+     *  Absent unless the slot was declared as a `$profile` reference. */
+    readonly modelProfile?: string;
+    /** 0.6.0 §4.1 — sampling temperature (spec `temperature`, or the
+     *  referenced profile's). Exclusive with `thinking`. Absent when neither
+     *  declares it. */
+    readonly temperature?: number;
   };
   readonly queue: {
     readonly adapter: IrBatchQueueAdapter;
@@ -1926,9 +2305,15 @@ export type IrVoiceV0 = {
   readonly version: 0;
   readonly name: string;
   readonly target: "voice";
+  /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
+   *  declares one; emitters never read it. */
+  readonly models?: IrModelProfiles;
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from
+     *  (profile → model only on this shape; every other field is warned). */
+    readonly modelProfile?: string;
   };
   readonly voice: {
     readonly provider: IrVoiceProvider;
@@ -1969,6 +2354,9 @@ export type IrBrowserV0 = {
   readonly version: 0;
   readonly name: string;
   readonly target: "browser";
+  /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
+   *  declares one; emitters never read it. */
+  readonly models?: IrModelProfiles;
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
@@ -1977,6 +2365,13 @@ export type IrBrowserV0 = {
     readonly maxTokens?: number;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
+    /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from.
+     *  Absent unless the slot was declared as a `$profile` reference. */
+    readonly modelProfile?: string;
+    /** 0.6.0 §4.1 — sampling temperature (spec `temperature`, or the
+     *  referenced profile's). Exclusive with `thinking`. Absent when neither
+     *  declares it. */
+    readonly temperature?: number;
   };
   readonly driver: {
     readonly backend: IrBrowserBackend;
@@ -1997,6 +2392,8 @@ export type IrBrowserV0 = {
   };
   /** Vision-grounding model. Defaults at lower-time to agent.model. */
   readonly groundingModel: string;
+  /** 0.6.0 §4.2 — provenance when `groundingModel` resolved through a profile. */
+  readonly groundingModelProfile?: string;
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
   readonly mcp_servers: IrMcpServers;
@@ -2026,10 +2423,15 @@ export type IrEvalV0 = {
   readonly version: 0;
   readonly name: string;
   readonly target: "eval";
+  /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
+   *  declares one; emitters never read it. */
+  readonly models?: IrModelProfiles;
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
     readonly tools: readonly string[];
+    /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
+    readonly modelProfile?: string;
   };
   readonly dataset: {
     readonly name: string;
@@ -2094,9 +2496,14 @@ export type IrChainV0 = {
   readonly version: 0;
   readonly name: string;
   readonly target: "onchain";
+  /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
+   *  declares one; emitters never read it. */
+  readonly models?: IrModelProfiles;
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
+    readonly modelProfile?: string;
   };
   readonly chains: readonly IrChainBinding[];
   readonly wallets: readonly IrWalletBinding[];
@@ -2130,9 +2537,14 @@ export type IrChainGameV0 = {
   readonly version: 0;
   readonly name: string;
   readonly target: "onchain-game";
+  /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
+   *  declares one; emitters never read it. */
+  readonly models?: IrModelProfiles;
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
+    readonly modelProfile?: string;
   };
   /** Games are bound to one chain at a time; multi-chain games are rare. */
   readonly chain: IrChainBinding;
