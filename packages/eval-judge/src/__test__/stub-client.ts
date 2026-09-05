@@ -126,6 +126,57 @@ export function makePairwiseStubClient(
 }
 
 /**
+ * 0.6.0 §7.6 — synthetic SELECTION judge for `judgeSelect`. The selector
+ * receives the exact prompt text the adapter sees and returns a
+ * `submit_selection` verdict (a positional response number as a string);
+ * tests use it to drive the order-reversal bookkeeping (position-biased
+ * "always 1", content-aware, …) without a network.
+ */
+export function makeSelectStubClient(
+  selector: (userText: string, systemText: string) => { winner: string; rationale: string },
+): ProviderAdapter {
+  return {
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
+    },
+    estimateTokens: () => 0,
+    stream(req) {
+      const userMsg = req.messages.find((m) => m.role === "user");
+      const userText =
+        typeof userMsg?.content === "string"
+          ? userMsg.content
+          : (userMsg?.content
+              ?.filter((b): b is { type: "text"; text: string } => b.type === "text")
+              .map((b) => b.text)
+              .join("\n") ?? "");
+      const systemText = req.system.map((b) => b.text).join("\n\n");
+      const verdict = selector(userText, systemText);
+      return (async function* (): AsyncIterable<StreamEvent> {
+        yield { kind: "message_start", usage: { input: 20, output: 0 } };
+        yield {
+          kind: "content_block_start",
+          index: 0,
+          block: { type: "tool_use", id: "tu_select", name: "submit_selection", input: {} },
+        };
+        yield {
+          kind: "content_block_delta",
+          index: 0,
+          delta: { type: "input_json_delta", partial_json: JSON.stringify(verdict) },
+        };
+        yield { kind: "content_block_stop", index: 0 };
+        yield { kind: "message_delta", stopReason: "tool_use", usage: { input: 20, output: 5 } };
+        yield { kind: "message_stop" };
+      })();
+    },
+  };
+}
+
+/**
  * NEW-graders-2 — synthetic categorical judge. The labeler receives the
  * exact prompt text the adapter sees and returns a `submit_label` verdict;
  * tests use it to drive label→score/passed mapping, abstention, and the

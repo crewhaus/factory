@@ -5755,10 +5755,22 @@ async function buildServeRuntime(
   );
   const sandboxAvailable = resolveSandboxAvailable();
 
+  // 0.6.0 §7.8 — serve hosts ONE single-turn run per inbound message, and a
+  // reply is one the caller is waiting on: the loop hands an in-flight shadow
+  // (the audition lane's re-run plus its judging) here instead of awaiting it
+  // at the run's teardown, so the reply returns as soon as the served text is
+  // final. Every drained shadow is awaited in `cleanup`, before the process
+  // exits — chained, so a long-lived server holds one promise, not a list.
+  let sideCallsSettled: Promise<void> = Promise.resolve();
+  const sideCallDrain = (settled: Promise<void>): void => {
+    sideCallsSettled = sideCallsSettled.then(() => settled);
+  };
+
   // The loop options shared by every turn (primary agent OR a routed sub-agent).
   const commonOptions = {
     permissionMode,
     permissionRules,
+    sideCallDrain,
     // G11 — the MCP daemon is the most headless surface there is (under stdio
     // transport stdout is even redirected to stderr), so an `ask` here has
     // never had anywhere to go. Threaded once here, covering the primary turn
@@ -5847,6 +5859,9 @@ async function buildServeRuntime(
     });
 
   const cleanup = async (): Promise<void> => {
+    // §7.8 — drained shadows settle (their verdicts are what the audition
+    // lane records) before the MCP peers this process opened go away.
+    await sideCallsSettled;
     if (mcpHost !== undefined) await mcpHost.disconnectAll();
   };
 
