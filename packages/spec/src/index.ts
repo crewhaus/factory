@@ -591,6 +591,17 @@ const failureTaxonomyBlock = z.array(failureTaxonomyEntrySchema).optional();
  * same interactive shapes as the failover chain (cli, channel, managed)
  * plus the single-turn shapes. `on_exceed.model` follows the agent.model
  * grammar. Defaults to `{ action: "stop" }` when `on_exceed` is omitted.
+ *
+ * `judge_share` (0.6.0 §6.2, default 0.3) is the fraction of `usd` the
+ * AUXILIARY model calls may spend between them — the in-loop `evaluation:`
+ * judge, `kind: judge` gates, compaction summaries, and (0.6.x) guide,
+ * classifier, consult, committee and shadow calls. Those calls ride the run
+ * bus with a `role` from 0.6.0, so they count toward `usd` like any other
+ * call; the share is the sub-cap inside it. Reaching the share records
+ * `reason: judge_share_exhausted` on the `eval_graded` event (the judge
+ * keeps judging under the total cap — a cascade consumes the signal to
+ * serve its strong rung directly). Deliberately EXCLUDED from the optimizer
+ * whitelist: a spend split is a human-owned policy, not a quality dial.
  */
 const budgetBlock = z
   .object({
@@ -604,6 +615,16 @@ const budgetBlock = z
     // 0.6.0 — optional, NO zod default: an absent key stays absent on the
     // parsed spec and the IR, so pre-0.6.0 specs lower byte-identically.
     scope: z.enum(["run", "session"]).optional(),
+    // 0.6.0 §6.2 — same discipline: optional, no zod default (the runtime
+    // owns the 0.3 default), so an absent key never reaches the bundle.
+    judge_share: z
+      .number()
+      .min(0)
+      .max(1)
+      .optional()
+      .describe(
+        "fraction of usd the auxiliary model calls (judge, compaction, guide, …) may spend; default 0.3",
+      ),
   })
   .strict()
   .optional();
@@ -624,7 +645,9 @@ const budgetBlock = z
  *   - `{ type: llm_judge, criteria, model? }` — a model scores the reply
  *     in [0,1] against `criteria`; `model` defaults to the shape's primary
  *     model (the `cheapest` sentinel resolves like `compaction.model`).
- *     Judge calls are METERED into the run budget.
+ *     Judge calls are METERED into the run budget: from 0.6.0 they ride the
+ *     run bus with `role: "judge"` and count toward `budget.usd` under
+ *     `budget.judge_share`.
  *   - `{ type: contains, value }` / `{ type: regex, value }` —
  *     deterministic pass/fail text checks (no threshold; no model spend).
  *
@@ -732,7 +755,8 @@ const evaluationBlock = z
  *
  * `model` defaults to the shape's top-level `model` (the `cheapest`
  * sentinel resolves like `compaction.model`). Judge calls are METERED into
- * the run budget.
+ * the run budget: from 0.6.0 they publish on the run bus with
+ * `role: "judge"` (the workflow shape's meter spans the whole run).
  */
 const judgeGateBlock = z
   .object({

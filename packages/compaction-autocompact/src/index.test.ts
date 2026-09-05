@@ -2,6 +2,12 @@ import { describe, expect, test } from "bun:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
 import { RuntimeError } from "@crewhaus/errors";
+import {
+  type ModelRequestEvent,
+  type ModelResponseEvent,
+  type TraceEvent,
+  TraceEventBus,
+} from "@crewhaus/trace-event-bus";
 import { autoCompact } from "./index";
 
 /**
@@ -185,5 +191,71 @@ describe("autoCompact", () => {
     const c = makeStubAdapter(() => streamWithText("x"));
     await autoCompact([], c.adapter, "m", { ledgerText: "" });
     expect(c.lastReq()?.messages.at(-1)?.content as string).toBe(withoutOpts);
+  });
+});
+
+// 0.6.0 (design §6.2, §7.12) — compaction spend on the run bus.
+describe("autoCompact — metered on the run bus (0.6.0 §6.2)", () => {
+  function makeBus(): { bus: TraceEventBus; events: TraceEvent[] } {
+    const bus = new TraceEventBus({ runId: "run_compact", sessionId: "sess_compact" });
+    const events: TraceEvent[] = [];
+    bus.subscribe((e) => {
+      events.push(e);
+    });
+    return { bus, events };
+  }
+
+  function streamWithUsage(text: string): AsyncIterable<StreamEvent> {
+    return (async function* () {
+      yield { kind: "message_start", usage: { input: 1200, output: 0 } };
+      yield { kind: "content_block_start", index: 0, block: { type: "text", text: "" } };
+      yield { kind: "content_block_delta", index: 0, delta: { type: "text_delta", text } };
+      yield { kind: "content_block_stop", index: 0 };
+      yield { kind: "message_delta", stopReason: "end_turn", usage: { input: 1200, output: 80 } };
+      yield { kind: "message_stop" };
+    })();
+  }
+
+  test("publishes model_request + model_response with role compaction, the wire model, provider and usage", async () => {
+    const { bus, events } = makeBus();
+    const { adapter } = makeStubAdapter(() => streamWithUsage("summary"));
+    await autoCompact([{ role: "user", content: "a" }], adapter, "claude-opus-4", { bus });
+    const req = events.filter((e): e is ModelRequestEvent => e.kind === "model_request");
+    const res = events.filter((e): e is ModelResponseEvent => e.kind === "model_response");
+    expect(req).toHaveLength(1);
+    expect(res).toHaveLength(1);
+    expect(req[0]?.role).toBe("compaction");
+    expect(req[0]?.model).toBe("claude-opus-4");
+    expect(req[0]?.provider).toBe("anthropic");
+    // history + the summarisation prompt
+    expect(req[0]?.messageCount).toBe(2);
+    expect(req[0]?.toolCount).toBe(0);
+    expect(res[0]?.role).toBe("compaction");
+    expect(res[0]?.model).toBe("claude-opus-4");
+    expect(res[0]?.usage).toEqual({ input: 1200, output: 80 });
+    expect(res[0]?.stopReason).toBe("end_turn");
+    expect(res[0]?.spanId).toBe(req[0]?.spanId as string);
+    expect("specModel" in (res[0] ?? {})).toBe(false);
+  });
+
+  test("specModel rides along only when it differs from the wire model", async () => {
+    const { bus, events } = makeBus();
+    const { adapter } = makeStubAdapter(() => streamWithUsage("summary"));
+    await autoCompact([], adapter, "us.anthropic.claude-opus-4-v1:0", {
+      bus,
+      specModel: "bedrock/us.anthropic.claude-opus-4-v1:0",
+    });
+    const res = events.find((e): e is ModelResponseEvent => e.kind === "model_response");
+    expect(res?.specModel).toBe("bedrock/us.anthropic.claude-opus-4-v1:0");
+    const same = makeBus();
+    await autoCompact([], adapter, "m", { bus: same.bus, specModel: "m" });
+    const sameRes = same.events.find((e): e is ModelResponseEvent => e.kind === "model_response");
+    expect(sameRes !== undefined && "specModel" in sameRes).toBe(false);
+  });
+
+  test("no bus = no publish (pre-0.6.0 callers are byte-identical)", async () => {
+    const { adapter } = makeStubAdapter(() => streamWithUsage("summary"));
+    const result = await autoCompact([], adapter, "m");
+    expect(result[1]).toEqual({ role: "assistant", content: "summary" });
   });
 });

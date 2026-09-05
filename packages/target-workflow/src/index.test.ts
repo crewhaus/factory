@@ -447,7 +447,7 @@ describe("emitWorkflow — per-step thinking + max_tokens (loop contract 0.4)", 
 });
 
 describe("emitWorkflow — budget field (item 27, Batch A shape extension)", () => {
-  test("threads the spend cap into every step's call (each step meters its own loop in v0)", () => {
+  test("threads the spend cap into every step's call", () => {
     const ir: IrWorkflowV0 = {
       ...TWO_STEP_IR,
       budget: { usdMicros: 5_000_000, onExceed: { kind: "degrade", model: "cheap-model" } },
@@ -461,7 +461,85 @@ describe("emitWorkflow — budget field (item 27, Batch A shape extension)", () 
   test("omits budget when the IR leaves it unset", () => {
     expect(emitWorkflow(TWO_STEP_IR).files[0]?.content ?? "").not.toContain("budget:");
   });
+
+  // 0.6.0 §7.12 — the cap bounds the RUN: one meter on the shared bus.
+  test("a budget opens ONE run-spanning cost meter on the shared RunContext and hands it to every step", () => {
+    const ir: IrWorkflowV0 = {
+      ...TWO_STEP_IR,
+      budget: { usdMicros: 5_000_000, onExceed: { kind: "stop" }, judgeShare: 0.25 },
+    };
+    const c = emitWorkflow(ir).files[0]?.content ?? "";
+    expect(c).toContain('import { createCostTracker } from "@crewhaus/cost-tracker";');
+    expect(c).toContain('import { createRunContext } from "@crewhaus/run-context";');
+    expect(c).toContain("const __runContext = createRunContext();");
+    expect(c).toContain(
+      "const __budgetMeter = createCostTracker(__runContext.eventBus, { suppressEvents: true });",
+    );
+    // Every step: the block, the shared meter, AND the shared context (the
+    // meter subscribes to that bus, so each step must publish there).
+    expect(c.match(/budgetMeter: __budgetMeter,/g) ?? []).toHaveLength(2);
+    expect(c.match(/runContext: __runContext,/g) ?? []).toHaveLength(2);
+    expect(c).toContain(
+      'budget: {"usdMicros":5000000,"onExceed":{"kind":"stop"},"judgeShare":0.25},',
+    );
+    // The meter is booted before the first step runs.
+    expect(c.indexOf("const __budgetMeter")).toBeLessThan(c.indexOf("// ── Step 1/2"));
+    // No judge machinery leaks in on a judge-free budgeted workflow.
+    expect(c).not.toContain("__judgeGate");
+    expect(c).not.toContain("@crewhaus/eval-judge");
+  });
+
+  test("a budget-free workflow carries no meter, no run-context boot, no cost-tracker import (byte-identity guard)", () => {
+    const c = emitWorkflow(TWO_STEP_IR).files[0]?.content ?? "";
+    expect(c).not.toContain("__budgetMeter");
+    expect(c).not.toContain("@crewhaus/cost-tracker");
+    expect(c).not.toContain("__runContext");
+    expect(c).not.toContain("@crewhaus/run-context");
+  });
+
+  test("a budgeted workflow WITH judges shares one RunContext and one import set (no duplicates)", () => {
+    const ir: IrWorkflowV0 = {
+      ...RETRY_IR_SHARED,
+      budget: { usdMicros: 1_000_000, onExceed: { kind: "stop" } },
+    };
+    const c = emitWorkflow(ir).files[0]?.content ?? "";
+    expect(c.match(/const __runContext = createRunContext\(\);/g) ?? []).toHaveLength(1);
+    expect(
+      c.match(/import \{ createRunContext \} from "@crewhaus\/run-context";/g) ?? [],
+    ).toHaveLength(1);
+    expect(c.match(/budgetMeter: __budgetMeter,/g) ?? []).toHaveLength(2);
+  });
 });
+
+/** A judge-bearing three-step IR shared with the budget tests above (the
+ *  judge describe below declares its own identical copy). */
+const RETRY_IR_SHARED: IrWorkflowV0 = {
+  ...TWO_STEP_IR,
+  steps: [
+    { name: "draft", instructions: "Write the report.", model: "m", tools: [], toolConfigs: {} },
+    {
+      name: "gate",
+      kind: "judge",
+      instructions: "cites at least two sources",
+      model: "j",
+      tools: [],
+      toolConfigs: {},
+      judge: {
+        criteria: "cites at least two sources",
+        threshold: 0.9,
+        onFail: "continue",
+        maxRetries: 1,
+      },
+    },
+    {
+      name: "publish",
+      instructions: "Format and publish.",
+      model: "m",
+      tools: [],
+      toolConfigs: {},
+    },
+  ],
+};
 
 describe("emitWorkflow — spec-declared hooks (loop contract 0.4)", () => {
   const HOOKS_IR: IrWorkflowV0 = {
@@ -645,7 +723,14 @@ describe("emitWorkflow — judge gate steps (loop contract 0.4, G02)", () => {
     );
     expect(c).toContain('import { judge } from "@crewhaus/eval-judge";');
     expect(c).toContain('import { createRunContext } from "@crewhaus/run-context";');
+    expect(c).toContain('import type { TraceEventBus } from "@crewhaus/trace-event-bus";');
     expect(c).toContain("async function __judgeGate(");
+    // 0.6.0 — the helper takes the bus and reports the judge's wire model + cost.
+    expect(c).toContain(
+      "  bus: TraceEventBus;\n}): Promise<{ score: number; rationale: string; judgeModel: string; costUsdMicros?: number }> {",
+    );
+    expect(c).toContain("    bus: opts.bus,\n  });");
+    expect(c).toContain("judgeModel: result.usage.model,");
     // createJudgeGrader's 1–5 → [0,1] mapping.
     expect(c).toContain("score: (result.score - 1) / 4");
     // Resilient classified exit: EXIT_CODES.evaluation with the 35 fallback.
@@ -713,6 +798,9 @@ describe("emitWorkflow — judge gate steps (loop contract 0.4, G02)", () => {
     expect(c).toContain('model: "claude-haiku-4-5",');
     expect(c).toContain('gatedTask: "Write the report.",');
     expect(c).toContain("output: priorOutput,");
+    // 0.6.0 §6.2 — the gate hands the run bus to the judge (role "judge" on
+    // the bus, priced + budget-metered) and stamps the judge attribution.
+    expect(c).toContain("bus: __runContext.eventBus,");
     expect(c).toContain("const __pass = __result.score >= 0.9;");
     expect(c).toContain('kind: "judge_verdict",');
     expect(c).toContain('stepOrNode: "gate",');
@@ -720,6 +808,10 @@ describe("emitWorkflow — judge gate steps (loop contract 0.4, G02)", () => {
     expect(c).toContain("score: __result.score,");
     expect(c).toContain(
       "...(__result.rationale.length > 0 ? { rationale: __result.rationale } : {}),",
+    );
+    expect(c).toContain("judgeModel: __result.judgeModel,");
+    expect(c).toContain(
+      "...(__result.costUsdMicros !== undefined ? { costUsdMicros: __result.costUsdMicros } : {}),",
     );
     // The observable verdict line.
     expect(c).toContain('"[judge gate] "');

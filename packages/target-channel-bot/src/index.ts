@@ -418,8 +418,14 @@ function renderLimitsFields(ir: IrChannelV0): string {
  *     eval-judge scoring path: single-criterion rubric from `criteria`, 1–5
  *     score mapped to [0,1] via (n-1)/4, prompt-injection-hardened
  *     sentinels). The judge model resolves through the SAME model-router
- *     adapter wiring the bundle's primary model uses, so judge spend is
- *     metered exactly like every other model call; the model defaults to
+ *     adapter wiring the bundle's primary model uses. 0.6.0 §6.2 — the
+ *     evaluate fn hands the run bus it receives to `judge()`, so every
+ *     judge call publishes `model_request`/`model_response` with
+ *     `role: "judge"` and IS metered exactly like every other model call
+ *     (priced by cost-tracker, counted toward `budget.usd` under
+ *     `budget.judge_share`), and reports the judge's wire model + priced
+ *     spend back as `EvaluationResult.judge` for the `eval_graded`
+ *     attribution; the model defaults to
  *     the shape's primary model when the spec omitted `grader.model`
  *     (`cheapest` already resolved at lower time). `threshold` was resolved
  *     at lower time (default 0.7) — the `?? 0.7` is a defensive floor for
@@ -460,7 +466,7 @@ function renderEvaluation(ir: IrChannelV0): {
   threshold: ${ev.threshold ?? 0.7},
   onFail: ${onFail},
   maxRetries: ${ev.maxRetries},
-  evaluate: async ({ finalText }) => {
+  evaluate: async ({ finalText, bus }) => {
     const __verdict = await judge({
       rubric: {
         criteria: [
@@ -481,11 +487,18 @@ function renderEvaluation(ir: IrChannelV0): {
       sample: { id: "in-loop-evaluation", input: "" },
       agentOutput: finalText,
       model: ${model},
+      // Judge spend rides the run bus (role "judge") so it is priced and
+      // counted toward budget.usd under budget.judge_share.
+      bus,
     });
+    const __judge = {
+      model: __verdict.usage.model,
+      ...(__verdict.usage.costUsdMicros !== undefined ? { costUsdMicros: __verdict.usage.costUsdMicros } : {}),
+    };
     if (__verdict.abstain) {
-      return { score: 0, rationale: "judge abstained: " + __verdict.rationale };
+      return { score: 0, rationale: "judge abstained: " + __verdict.rationale, judge: __judge };
     }
-    return { score: (__verdict.score - 1) / 4, rationale: __verdict.rationale };
+    return { score: (__verdict.score - 1) / 4, rationale: __verdict.rationale, judge: __judge };
   },
 };`;
     return {

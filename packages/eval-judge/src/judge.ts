@@ -1,14 +1,17 @@
 import {
   type ProviderAdapter,
+  type ProviderId,
   type ProviderMessage,
   type ProviderRequest,
   collectFinalMessage,
   extractToolUse,
 } from "@crewhaus/adapter-anthropic";
+import { DEFAULT_PRICING, computeCostMicros, resolvePricing } from "@crewhaus/cost-tracker";
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { GradeResult, Grader, RunResult } from "@crewhaus/eval-grader";
 import { createLogger } from "@crewhaus/logging";
 import { resolveModel } from "@crewhaus/model-router";
+import type { ModelRole, TraceEventBus } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { JudgeError } from "./errors";
@@ -82,6 +85,126 @@ export type JudgeUsageSink = (usage: {
   readonly output: number;
 }) => void;
 
+/**
+ * 0.6.0 (design §6.2) — the metering seam every judge call honours. When a
+ * `bus` is supplied, the call publishes a `model_request` before it opens
+ * the stream and a `model_response` (same span) when it finishes, both
+ * carrying `role` (default `"judge"`) and, when given, `stage`. That is the
+ * seam through which `cost-tracker` prices judge spend and the runtime's
+ * always-on budget meter counts it toward `budget.usd` (bounded by
+ * `budget.judge_share`) — the spec's long-standing "judge calls are metered
+ * into the run budget" promise, made true. The publish is observational:
+ * a bus-less call is byte-identical to before, and the verdict never
+ * depends on the bus.
+ */
+export type JudgeBusOptions = {
+  readonly bus?: TraceEventBus;
+  /** Attribution role stamped on the published events. Defaults to `"judge"`. */
+  readonly role?: ModelRole;
+  /** Hybrid-strategy stage the call belongs to (`"verify"`, `"member"`, …). */
+  readonly stage?: string;
+};
+
+/**
+ * 0.6.0 (design §6.2, §8.1) — what one judge model call cost, reported on
+ * every {@link JudgeResult} / {@link CategoricalJudgeResult} so the caller
+ * can stamp `eval_graded.judgeModel` / `judgeCostUsdMicros` and
+ * `judge_verdict.judgeModel` / `costUsdMicros` without a second pricing
+ * pass. `model` is the WIRE id the provider was called with (the pricing
+ * key); `specModel` is the string the caller named. `costUsdMicros` is
+ * priced off `DEFAULT_PRICING` — the same table the runtime's budget meter
+ * uses — and is ABSENT when the (provider, model) pair has no row, so an
+ * unpriced judge reads as "unknown", never as free.
+ */
+export type JudgeCallUsage = {
+  readonly model: string;
+  readonly specModel: string;
+  readonly provider: ProviderId;
+  readonly input: number;
+  readonly output: number;
+  readonly cacheRead?: number;
+  readonly cacheCreate?: number;
+  readonly durationMs: number;
+  readonly costUsdMicros?: number;
+};
+
+/**
+ * Run one judge model call through the metering seam: publish
+ * `model_request` / `model_response` on the bus (when any), time it, price
+ * it, and report to `onUsage` — BEFORE the caller validates the response's
+ * shape, because a judge that answered wrongly still burned the tokens.
+ * Shared by the scalar, categorical and pairwise judges so every judge
+ * call in the system meters identically.
+ */
+export async function meteredJudgeCall(
+  adapter: ProviderAdapter,
+  request: ProviderRequest,
+  meta: JudgeBusOptions & { readonly specModel: string; readonly onUsage?: JudgeUsageSink },
+): Promise<{ readonly final: ProviderMessage; readonly usage: JudgeCallUsage }> {
+  const bus = meta.bus;
+  const role: ModelRole = meta.role ?? "judge";
+  const attribution = { role, ...(meta.stage !== undefined ? { stage: meta.stage } : {}) };
+  const specModelField: { readonly specModel?: string } =
+    meta.specModel !== request.model ? { specModel: meta.specModel } : {};
+  const startEnvelope = bus?.envelope();
+  if (bus !== undefined && startEnvelope !== undefined) {
+    bus.publish({
+      ...startEnvelope,
+      kind: "model_request",
+      model: request.model,
+      ...specModelField,
+      provider: adapter.providerId,
+      messageCount: request.messages.length,
+      toolCount: request.tools?.length ?? 0,
+      streaming: false,
+      ...attribution,
+    });
+  }
+  const t0 = performance.now();
+  const final = await collectWithTemperatureRetry(adapter, request);
+  const durationMs = performance.now() - t0;
+  if (bus !== undefined && startEnvelope !== undefined) {
+    bus.publish({
+      ...bus.envelope(),
+      spanId: startEnvelope.spanId,
+      kind: "model_response",
+      model: request.model,
+      ...specModelField,
+      provider: adapter.providerId,
+      stopReason: final.stopReason,
+      usage: final.usage,
+      durationMs,
+      ...attribution,
+    });
+  }
+  const row = resolvePricing(DEFAULT_PRICING, adapter.providerId, request.model);
+  const usage: JudgeCallUsage = {
+    model: request.model,
+    specModel: meta.specModel,
+    provider: adapter.providerId,
+    input: final.usage.input,
+    output: final.usage.output,
+    ...(final.usage.cacheRead !== undefined ? { cacheRead: final.usage.cacheRead } : {}),
+    ...(final.usage.cacheCreate !== undefined ? { cacheCreate: final.usage.cacheCreate } : {}),
+    durationMs,
+    ...(row
+      ? {
+          costUsdMicros: computeCostMicros(
+            row,
+            final.usage.input,
+            final.usage.output,
+            final.usage.cacheRead ?? 0,
+            final.usage.cacheCreate ?? 0,
+          ),
+        }
+      : {}),
+  };
+  // C35 — meter BEFORE validating the response: a judge call that answered
+  // in the wrong shape still burned the tokens it burned.
+  meta.onUsage?.({ model: meta.specModel, input: final.usage.input, output: final.usage.output });
+  return { final, usage };
+}
+
 export type JudgeOptions = {
   readonly rubric: Rubric;
   readonly sample: Sample;
@@ -113,7 +236,7 @@ export type JudgeOptions = {
   readonly target?: JudgeTarget;
   /** C35 — per-call token metering sink (see {@link JudgeUsageSink}). */
   readonly onUsage?: JudgeUsageSink;
-};
+} & JudgeBusOptions;
 
 export type JudgeResult = {
   readonly score: 1 | 2 | 3 | 4 | 5;
@@ -128,6 +251,8 @@ export type JudgeResult = {
   readonly confidence?: number;
   /** The sentinel used for this call's untrusted-block markers. */
   readonly sentinel: string;
+  /** 0.6.0 — what this judge call cost (see {@link JudgeCallUsage}). */
+  readonly usage: JudgeCallUsage;
 };
 
 const SubmitScoreSchema = z.object({
@@ -179,34 +304,42 @@ export async function judge(opts: JudgeOptions): Promise<JudgeResult> {
     ...(opts.target !== undefined ? { target: opts.target } : {}),
   });
 
-  const final = await collectWithTemperatureRetry(adapter, {
-    model: wireModelId,
-    system: [{ type: "text", text: system }],
-    messages: [{ role: "user", content: user }],
-    tools: [
-      {
-        name: "submit_score",
-        description:
-          "Submit the overall 1–5 score, a brief rationale, and the per-criterion scores. " +
-          "Set `abstain: true` (still filling every required field) when the evidence is " +
-          "insufficient to score honestly. " +
-          "The judge MUST call this tool — never reply in plain text.",
-        input_schema: submitScoreInputSchema,
-      },
-    ],
-    toolChoice: { type: "tool", name: "submit_score" },
-    maxTokens: opts.maxTokens ?? 1024,
-    // NEW-HUNT-2 — judge decoding is PINNED to temperature 0 unless the
-    // rubric overrides it. Adapters without a native temperature control
-    // ignore the field (capability-dependent, like `thinking`), adapters
-    // whose models REJECT it omit it (#413), and a provider the gates
-    // don't know gets one pin-free retry (collectWithTemperatureRetry).
-    temperature: opts.temperature ?? 0,
-  });
-
-  // C35 — meter BEFORE validating the response: a judge call that answered
-  // in the wrong shape still burned the tokens it burned.
-  opts.onUsage?.({ model, input: final.usage.input, output: final.usage.output });
+  const { final, usage } = await meteredJudgeCall(
+    adapter,
+    {
+      model: wireModelId,
+      system: [{ type: "text", text: system }],
+      messages: [{ role: "user", content: user }],
+      tools: [
+        {
+          name: "submit_score",
+          description:
+            "Submit the overall 1–5 score, a brief rationale, and the per-criterion scores. " +
+            "Set `abstain: true` (still filling every required field) when the evidence is " +
+            "insufficient to score honestly. " +
+            "The judge MUST call this tool — never reply in plain text.",
+          input_schema: submitScoreInputSchema,
+        },
+      ],
+      toolChoice: { type: "tool", name: "submit_score" },
+      maxTokens: opts.maxTokens ?? 1024,
+      // NEW-HUNT-2 — judge decoding is PINNED to temperature 0 unless the
+      // rubric overrides it. Adapters without a native temperature control
+      // ignore the field (capability-dependent, like `thinking`), adapters
+      // whose models REJECT it omit it (#413), and a provider the gates
+      // don't know gets one pin-free retry (collectWithTemperatureRetry).
+      temperature: opts.temperature ?? 0,
+    },
+    // 0.6.0 — the metering seam: bus publish (role "judge" by default),
+    // pricing, and the C35 sink, all before the shape validation below.
+    {
+      specModel: model,
+      ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
+      ...(opts.role !== undefined ? { role: opts.role } : {}),
+      ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
+      ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
+    },
+  );
 
   const toolUse = extractToolUse(final, "submit_score");
   if (!toolUse) {
@@ -233,6 +366,7 @@ export async function judge(opts: JudgeOptions): Promise<JudgeResult> {
     abstain: parsed.data.abstain ?? false,
     ...(parsed.data.confidence !== undefined ? { confidence: parsed.data.confidence } : {}),
     sentinel,
+    usage,
   };
 }
 
@@ -252,7 +386,7 @@ export type CategoricalJudgeOptions = {
   readonly target?: JudgeTarget;
   /** C35 — per-call token metering sink (see {@link JudgeUsageSink}). */
   readonly onUsage?: JudgeUsageSink;
-};
+} & JudgeBusOptions;
 
 /** NEW-graders-2 — one categorical judge verdict. */
 export type CategoricalJudgeResult = {
@@ -271,6 +405,8 @@ export type CategoricalJudgeResult = {
   readonly confidence?: number;
   /** The sentinel used for this call's untrusted-block markers. */
   readonly sentinel: string;
+  /** 0.6.0 — what this judge call cost (see {@link JudgeCallUsage}). */
+  readonly usage: JudgeCallUsage;
 };
 
 /**
@@ -321,30 +457,39 @@ export async function judgeCategorical(
     $refStrategy: "none",
   }) as Record<string, unknown>;
 
-  const final = await collectWithTemperatureRetry(adapter, {
-    model: wireModelId,
-    system: [{ type: "text", text: system }],
-    messages: [{ role: "user", content: user }],
-    tools: [
-      {
-        name: "submit_label",
-        description:
-          "Submit the single label that best classifies the agent's response, with a brief " +
-          "rationale. Set `abstain: true` (still picking the closest label) when the evidence " +
-          "is insufficient to classify honestly. " +
-          "The judge MUST call this tool — never reply in plain text.",
-        input_schema: submitLabelInputSchema,
-      },
-    ],
-    toolChoice: { type: "tool", name: "submit_label" },
-    maxTokens: opts.maxTokens ?? 1024,
-    // NEW-HUNT-2 — pinned decoding, identical to the scalar judge
-    // (#413 retry semantics included).
-    temperature: opts.temperature ?? 0,
-  });
-
-  // C35 — meter every judge model call, validation outcome notwithstanding.
-  opts.onUsage?.({ model, input: final.usage.input, output: final.usage.output });
+  const { final, usage } = await meteredJudgeCall(
+    adapter,
+    {
+      model: wireModelId,
+      system: [{ type: "text", text: system }],
+      messages: [{ role: "user", content: user }],
+      tools: [
+        {
+          name: "submit_label",
+          description:
+            "Submit the single label that best classifies the agent's response, with a brief " +
+            "rationale. Set `abstain: true` (still picking the closest label) when the evidence " +
+            "is insufficient to classify honestly. " +
+            "The judge MUST call this tool — never reply in plain text.",
+          input_schema: submitLabelInputSchema,
+        },
+      ],
+      toolChoice: { type: "tool", name: "submit_label" },
+      maxTokens: opts.maxTokens ?? 1024,
+      // NEW-HUNT-2 — pinned decoding, identical to the scalar judge
+      // (#413 retry semantics included).
+      temperature: opts.temperature ?? 0,
+    },
+    // C35 + 0.6.0 — meter every judge model call (sink + bus + pricing),
+    // validation outcome notwithstanding.
+    {
+      specModel: model,
+      ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
+      ...(opts.role !== undefined ? { role: opts.role } : {}),
+      ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
+      ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
+    },
+  );
 
   const toolUse = extractToolUse(final, "submit_label");
   if (!toolUse) {
@@ -366,6 +511,7 @@ export async function judgeCategorical(
     abstain: parsed.data.abstain ?? false,
     ...(parsed.data.confidence !== undefined ? { confidence: parsed.data.confidence } : {}),
     sentinel,
+    usage,
   };
 }
 
@@ -561,8 +707,23 @@ export function createJudgeGrader(
      * receives that call's own model string, so a panel meters per model).
      */
     onUsage?: JudgeUsageSink;
+    /**
+     * 0.6.0 (design §6.2) — the run bus every judge call this grader makes
+     * publishes `model_request` / `model_response` on (role `"judge"` unless
+     * `role` overrides it; `stage` rides along when given), so the judge's
+     * spend is priced and budget-metered like any other model call.
+     */
+    bus?: TraceEventBus;
+    role?: ModelRole;
+    stage?: string;
   } = {},
 ): Grader {
+  // 0.6.0 — the bus/attribution fragment spread into every judge call.
+  const busOpts: JudgeBusOptions = {
+    ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
+    ...(opts.role !== undefined ? { role: opts.role } : {}),
+    ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
+  };
   const repeats = opts.repeats ?? 1;
   if (!Number.isInteger(repeats) || repeats < 1 || repeats % 2 === 0) {
     throw new JudgeError(`judge repeats must be an odd positive integer, got ${repeats}`);
@@ -594,6 +755,7 @@ export function createJudgeGrader(
         ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
         ...(opts.target !== undefined ? { target: opts.target } : {}),
         ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
+        ...busOpts,
       });
       if (result.abstain) {
         // A3 — same conservative-placeholder contract as the scalar path:
@@ -627,6 +789,7 @@ export function createJudgeGrader(
       ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
       ...(opts.target !== undefined ? { target: opts.target } : {}),
       ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
+      ...busOpts,
     });
   };
 

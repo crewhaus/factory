@@ -362,8 +362,12 @@ export type IrFailureTaxonomy = readonly IrFailureTaxonomyEntry[];
  * declares it (absent ⇒ the runtime's `run` default, byte-identical for
  * older specs): `session` seeds the meter on resume from the session log's
  * persisted `cost_accrual` lines so the cap bounds the conversation.
- * Carried on the shapes that run the shared loop; absent when the spec
- * omits the block.
+ * `judgeShare` (0.6.0 §6.2, spec `judge_share`) is likewise carried only
+ * when declared (absent ⇒ the runtime's 0.3 default): the fraction of
+ * `usdMicros` the auxiliary roles (judge, compaction, guide, classifier,
+ * consult, committee, shadow) may spend before the runtime raises the
+ * `judge_share_exhausted` signal. Carried on the shapes that run the shared
+ * loop; absent when the spec omits the block.
  */
 export type IrBudget = {
   readonly usdMicros: number;
@@ -371,6 +375,7 @@ export type IrBudget = {
     | { readonly kind: "stop" }
     | { readonly kind: "degrade"; readonly model: string };
   readonly scope?: "run" | "session";
+  readonly judgeShare?: number;
 };
 
 /**
@@ -381,7 +386,8 @@ export type IrBudget = {
  *     `criteria`. `model` is the judge model id; when ABSENT the runtime
  *     uses the shape's primary model (the `cheapest` sentinel was already
  *     resolved at lower time, like `compaction.model`). Judge calls are
- *     METERED into the run budget.
+ *     METERED into the run budget (0.6.0: on the run bus with
+ *     `role: "judge"`, bounded by `IrBudget.judgeShare`).
  *   - `contains` / `regex` — deterministic pass/fail text checks (score 1
  *     on pass, 0 on fail; no model spend).
  */

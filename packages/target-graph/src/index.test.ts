@@ -736,7 +736,14 @@ describe("emitGraph — judge gate nodes (loop contract 0.4, G02)", () => {
       'import { EXIT_CODES, RunFailedError, formatRunFailure, toFailureReport } from "@crewhaus/errors";',
     );
     expect(c).toContain('import { judge } from "@crewhaus/eval-judge";');
+    expect(c).toContain('import type { TraceEventBus } from "@crewhaus/trace-event-bus";');
     expect(c).toContain("async function __judgeGate(");
+    // 0.6.0 — the helper takes the bus and reports the judge's wire model + cost.
+    expect(c).toContain(
+      "  bus: TraceEventBus;\n}): Promise<{ score: number; rationale: string; judgeModel: string; costUsdMicros?: number }> {",
+    );
+    expect(c).toContain("    bus: opts.bus,\n  });");
+    expect(c).toContain("judgeModel: result.usage.model,");
     // createJudgeGrader's 1–5 → [0,1] mapping.
     expect(c).toContain("score: (result.score - 1) / 4");
     // Resilient classified exit: EXIT_CODES.evaluation with the 35 fallback.
@@ -758,6 +765,9 @@ describe("emitGraph — judge gate nodes (loop contract 0.4, G02)", () => {
     // The judge model is the node's resolved model slot, not the graph model.
     expect(c).toContain('model: "claude-haiku-4-5",');
     expect(c).toContain("const __pass = __result.score >= 0.9;");
+    // 0.6.0 §6.2 — the gate hands the node's run bus to the judge (role
+    // "judge" on the bus, priced + budget-metered).
+    expect(c).toContain("bus: ctx.runContext.eventBus,");
     // One judge_verdict per scoring pass, on the run's bus.
     expect(c).toContain("const __bus = ctx.runContext.eventBus;");
     expect(c).toContain('kind: "judge_verdict",');
@@ -765,6 +775,10 @@ describe("emitGraph — judge gate nodes (loop contract 0.4, G02)", () => {
     expect(c).toContain('verdict: __pass ? "pass" : "fail",');
     expect(c).toContain(
       "...(__result.rationale.length > 0 ? { rationale: __result.rationale } : {}),",
+    );
+    expect(c).toContain("judgeModel: __result.judgeModel,");
+    expect(c).toContain(
+      "...(__result.costUsdMicros !== undefined ? { costUsdMicros: __result.costUsdMicros } : {}),",
     );
     // Diagnostics ride the bundle's stderr stream like the [graph] events.
     expect(c).toContain('"[judge gate] "');

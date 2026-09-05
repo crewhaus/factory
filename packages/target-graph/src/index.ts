@@ -491,14 +491,18 @@ const JUDGE_GATE_HELPER = `
  * Loop contract 0.4 (G02) — score \`output\` in [0,1] against free-text
  * judge criteria: eval-judge's forced-tool scorer over a single-criterion
  * rubric (generic 1–5 anchors), mapped down via (n - 1) / 4. The judge
- * model resolves through the model-router, so any provider can judge.
+ * model resolves through the model-router, so any provider can judge; its
+ * calls publish on the run bus with role "judge", so judge spend is priced
+ * and metered into the run budget, and the verdict carries the judge's
+ * wire model + priced spend for the judge_verdict event.
  */
 async function __judgeGate(opts: {
   criteria: string;
   model: string;
   gatedTask: string;
   output: string;
-}): Promise<{ score: number; rationale: string }> {
+  bus: TraceEventBus;
+}): Promise<{ score: number; rationale: string; judgeModel: string; costUsdMicros?: number }> {
   const result = await judge({
     rubric: {
       criteria: [
@@ -519,8 +523,16 @@ async function __judgeGate(opts: {
     sample: { id: "judge-gate", input: opts.gatedTask },
     agentOutput: opts.output,
     model: opts.model,
+    // Judge spend rides the run bus (role "judge") so it is priced and
+    // counted toward budget.usd under budget.judge_share.
+    bus: opts.bus,
   });
-  return { score: (result.score - 1) / 4, rationale: result.rationale };
+  return {
+    score: (result.score - 1) / 4,
+    rationale: result.rationale,
+    judgeModel: result.usage.model,
+    ...(result.usage.costUsdMicros !== undefined ? { costUsdMicros: result.usage.costUsdMicros } : {}),
+  };
 }
 `;
 
@@ -867,6 +879,7 @@ function renderJudgeNodeBody(node: IrGraphNode, ir: IrGraphV0): string {
         model: ${escapeJsonString(node.model)},
         gatedTask: __task,
         output: __output,
+        bus: ctx.runContext.eventBus,
       });
       const __pass = __result.score >= ${gate.threshold};
       const __bus = ctx.runContext.eventBus;
@@ -877,6 +890,8 @@ function renderJudgeNodeBody(node: IrGraphNode, ir: IrGraphV0): string {
         verdict: __pass ? "pass" : "fail",
         score: __result.score,
         ...(__result.rationale.length > 0 ? { rationale: __result.rationale } : {}),
+        judgeModel: __result.judgeModel,
+        ...(__result.costUsdMicros !== undefined ? { costUsdMicros: __result.costUsdMicros } : {}),
       });
 ${verdictLine}`;
   const recordReturn = (retriesExpr: string): string =>
@@ -1032,7 +1047,9 @@ function renderAgent(ir: IrGraphV0, evalEntry = false): string {
   const errorsImport = hasThrowingJudges
     ? `import { EXIT_CODES, RunFailedError, formatRunFailure, toFailureReport } from "@crewhaus/errors";`
     : `import { formatRunFailure, toFailureReport } from "@crewhaus/errors";`;
-  const judgeImport = hasJudges ? `\nimport { judge } from "@crewhaus/eval-judge";` : "";
+  const judgeImport = hasJudges
+    ? `\nimport { judge } from "@crewhaus/eval-judge";\nimport type { TraceEventBus } from "@crewhaus/trace-event-bus";`
+    : "";
   const judgeHelperBlock = hasJudges
     ? `${JUDGE_GATE_HELPER}${hasThrowingJudges ? EVAL_EXIT_CONST : ""}`
     : "";

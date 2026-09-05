@@ -40,6 +40,7 @@ export {
   judge,
   judgeCategorical,
   createJudgeGrader,
+  meteredJudgeCall,
   DEFAULT_JUDGE_MODEL,
   PANEL_NEEDS_REVIEW_ENTROPY,
   normalizedVoteEntropy,
@@ -52,6 +53,10 @@ export type {
   // C35 — judge token metering: the runner meters `llm_judge` spend by
   // passing a sink into every grader it builds.
   JudgeUsageSink,
+  // 0.6.0 (design §6.2) — judge spend on the run bus: `bus`/`role`/`stage`
+  // on every judge call, and the priced `usage` on every verdict.
+  JudgeBusOptions,
+  JudgeCallUsage,
 } from "./judge";
 export {
   loadRubric,

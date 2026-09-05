@@ -18,7 +18,7 @@ import { resolveModel } from "@crewhaus/model-router";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { JudgeError } from "./errors";
-import { DEFAULT_JUDGE_MODEL, collectWithTemperatureRetry } from "./judge";
+import { DEFAULT_JUDGE_MODEL, type JudgeBusOptions, meteredJudgeCall } from "./judge";
 
 const SubmitComparisonSchema = z.object({
   winner: z
@@ -129,7 +129,7 @@ export type JudgePairOptions = {
   readonly maxTokens?: number;
   /** Pinned to 0 by default, mirroring `judge()` (NEW-HUNT-2). */
   readonly temperature?: number;
-};
+} & JudgeBusOptions;
 
 /**
  * One pairwise judge call: A vs B in the order given, fresh sentinel,
@@ -151,26 +151,37 @@ export async function judgePair(opts: JudgePairOptions): Promise<PairwiseCallVer
     outputB: opts.outputB,
   });
 
-  const final = await collectWithTemperatureRetry(adapter, {
-    model: wireModelId,
-    system: [{ type: "text", text: system }],
-    messages: [{ role: "user", content: user }],
-    tools: [
-      {
-        name: "submit_comparison",
-        description:
-          "Submit the pairwise verdict: which response better addresses the input ('a', 'b', " +
-          "or 'tie'), with a brief rationale. The judge MUST call this tool — never reply in plain text.",
-        input_schema: submitComparisonInputSchema,
-      },
-    ],
-    toolChoice: { type: "tool", name: "submit_comparison" },
-    maxTokens: opts.maxTokens ?? 1024,
-    // Pinned decoding, mirroring judge() — a pairwise verdict that flips
-    // with provider-default sampling is not a measurement. Models that
-    // reject the pin get it omitted / retried without it (#413).
-    temperature: opts.temperature ?? 0,
-  });
+  // 0.6.0 — the same metering seam as `judge()`: a bus (when given) sees
+  // `model_request` / `model_response` with role "judge" for each order.
+  const { final } = await meteredJudgeCall(
+    adapter,
+    {
+      model: wireModelId,
+      system: [{ type: "text", text: system }],
+      messages: [{ role: "user", content: user }],
+      tools: [
+        {
+          name: "submit_comparison",
+          description:
+            "Submit the pairwise verdict: which response better addresses the input ('a', 'b', " +
+            "or 'tie'), with a brief rationale. The judge MUST call this tool — never reply in plain text.",
+          input_schema: submitComparisonInputSchema,
+        },
+      ],
+      toolChoice: { type: "tool", name: "submit_comparison" },
+      maxTokens: opts.maxTokens ?? 1024,
+      // Pinned decoding, mirroring judge() — a pairwise verdict that flips
+      // with provider-default sampling is not a measurement. Models that
+      // reject the pin get it omitted / retried without it (#413).
+      temperature: opts.temperature ?? 0,
+    },
+    {
+      specModel: model,
+      ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
+      ...(opts.role !== undefined ? { role: opts.role } : {}),
+      ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
+    },
+  );
 
   const toolUse = extractToolUse(final, "submit_comparison");
   if (!toolUse) {
@@ -215,7 +226,7 @@ export type JudgePairwiseOptions = {
   readonly model?: string;
   readonly maxTokens?: number;
   readonly temperature?: number;
-};
+} & JudgeBusOptions;
 
 /**
  * A1 — the order-swap-controlled pairwise comparison for one sample: judge
@@ -232,6 +243,9 @@ export async function judgePairwise(opts: JudgePairwiseOptions): Promise<Pairwis
     ...(opts.model !== undefined ? { model: opts.model } : {}),
     ...(opts.maxTokens !== undefined ? { maxTokens: opts.maxTokens } : {}),
     ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+    ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
+    ...(opts.role !== undefined ? { role: opts.role } : {}),
+    ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
   };
   // Deterministic call order: prev-first, then the swap. Each judgePair
   // call mints its own fresh sentinel.

@@ -56,7 +56,12 @@ function toolEnd(
     durationMs: 1,
   };
 }
-function modelResponse(input: number, output: number, ts: string): ModelResponseEvent {
+function modelResponse(
+  input: number,
+  output: number,
+  ts: string,
+  role?: ModelResponseEvent["role"],
+): ModelResponseEvent {
   return {
     ...envelope(ts),
     kind: "model_response",
@@ -64,6 +69,7 @@ function modelResponse(input: number, output: number, ts: string): ModelResponse
     stopReason: "end_turn",
     usage: { input, output },
     durationMs: 1,
+    ...(role !== undefined ? { role } : {}),
   };
 }
 
@@ -114,6 +120,34 @@ describe("runSample — bus capture, token/tool extraction", () => {
     const meta = JSON.parse(readFileSync(join(outDir, "s1", "meta.json"), "utf-8"));
     expect(meta.tokens).toEqual({ input: 13, output: 7 });
     expect(result.grades.overall.passed).toBe(true);
+  });
+
+  // 0.6.0 (design §6.2, §17) — judge spend rides the sample bus with a role
+  // (a workflow/graph eval-entry judge gate runs on the sample's RunContext);
+  // `--budget-usd` bounds AGENT spend, so the token fold filters it by role.
+  test("model_response events with a grading role (judge) are excluded from tokens and latency; other roles stay in", async () => {
+    const outDir = newTempRoot();
+    const invoker: AgentInvoker = async ({ runContext }) => {
+      const bus = runContext.eventBus;
+      bus.publish(modelResponse(10, 5, "2026-01-01T00:00:01.000Z"));
+      bus.publish(modelResponse(1000, 500, "2026-01-01T00:00:02.000Z", "judge"));
+      bus.publish(modelResponse(7, 3, "2026-01-01T00:00:03.000Z", "compaction"));
+      bus.publish(modelResponse(2000, 900, "2026-01-01T00:00:04.000Z", "shadow"));
+      return { agentOutput: "ok" };
+    };
+    const result = await runSample({
+      sample: SAMPLE,
+      invoker,
+      graders: EXACT,
+      outDir,
+      model: "claude-test",
+    });
+    // main turn (10/5) + compaction (7/3); judge + shadow excluded.
+    expect(result.tokens).toEqual({ input: 17, output: 8 });
+    expect(result.metrics.modelCallLatenciesMs).toHaveLength(2);
+    // The events themselves are still persisted — the filter is on the fold, not the capture.
+    const eventsRaw = readFileSync(join(outDir, "s1", "events.jsonl"), "utf-8");
+    expect(eventsRaw.trim().split("\n")).toHaveLength(4);
   });
 
   test("stub-supplied transcript is written verbatim and turns counted", async () => {
