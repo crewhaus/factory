@@ -77,3 +77,15 @@ describe("joinQualityToArms", () => {
     ).toEqual([]);
   });
 });
+
+describe("QUALITY_LANE_PREFIX (0.6.0 §7.8)", () => {
+  test("the offline lane is exported for the online shadow twin to stay disjoint from", async () => {
+    const { QUALITY_LANE_PREFIX } = await import("./index.js");
+    expect(QUALITY_LANE_PREFIX).toBe("q:");
+    const rows = joinQualityToArms(
+      [{ sessionId: "s", turnNumber: 1, routeKey: "hard", model: "m", success: true }],
+      [{ sessionId: "s", turnNumber: 1, score: 1 }],
+    );
+    expect(rows[0]?.routeKey.startsWith(QUALITY_LANE_PREFIX)).toBe(true);
+  });
+});

@@ -206,3 +206,60 @@ describe("emitWorkflow — per-step model routing (item 9)", () => {
     expect(c).toContain('modelFallbacks: ["openai/gpt-4o-mini"],');
   });
 });
+
+describe("0.6.0 PR 9d — side-call strategies on a step", () => {
+  const COMMITTEE: IrModelPool = {
+    ...POOL,
+    strategy: { committee: { members: ["fast", "deep"], judge: "claude-opus-4-8" } },
+  };
+  const step = (modelPool?: IrModelPool): IrWorkflowStep => ({
+    name: "draft",
+    instructions: "draft",
+    model: "claude-sonnet-4-5",
+    tools: [],
+    toolConfigs: {},
+    ...(modelPool !== undefined ? { modelPool } : {}),
+  });
+
+  test("a step whose pool declares a committee renders the wireSideCalls spread after modelPool and imports the composition root", () => {
+    const c = agentOf(wf([step(COMMITTEE)]));
+    expect(c).toContain('import { wireSideCalls } from "@crewhaus/model-service";');
+    const pool = JSON.stringify({ ...COMMITTEE, scope: "draft" });
+    expect(c).toContain(
+      `\n    modelPool: ${pool},\n    ...wireSideCalls(${pool}, { sessionName: "routed" }),\n`,
+    );
+    expect((c.match(/wireSideCalls\(/g) ?? []).length).toBe(1);
+  });
+
+  test("a judge-gated step renders it on its re-invocable closure too", () => {
+    const c = agentOf(
+      wf([
+        step(COMMITTEE),
+        {
+          name: "gate",
+          instructions: "",
+          model: "claude-sonnet-4-5",
+          tools: [],
+          toolConfigs: {},
+          kind: "judge",
+          judge: {
+            criteria: "c",
+            model: "claude-sonnet-4-5",
+            threshold: 0.7,
+            onFail: "retry_previous",
+            maxRetries: 1,
+          },
+        } as IrWorkflowStep,
+      ]),
+    );
+    expect(c).toContain("const __runStep1 = async (__nudge: string)");
+    expect(c).toContain("...wireSideCalls(");
+  });
+
+  test("byte-identity: a pooled step without a side-call strategy renders neither the spread nor the import", () => {
+    const c = agentOf(wf([step(POOL)]));
+    expect(c).not.toContain("wireSideCalls");
+    expect(c).not.toContain("@crewhaus/model-service");
+    expect(agentOf(wf([step()]))).not.toContain("wireSideCalls");
+  });
+});

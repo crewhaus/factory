@@ -19,6 +19,7 @@ import {
   type MemoryWiringFragment,
   type WireMemoryDeps,
   createDreamJanitorStep,
+  guidePlanToStore,
   memoryFragmentFromIr,
   runDreamBootCatchUp,
   wireContinuity,
@@ -610,6 +611,32 @@ describe("granular entry points", () => {
     ).toBeNull();
     const wired = wireWiki({ specName: "gran-wiki", memory: { wiki: {} } }, d);
     expect(names(wired?.tools ?? [])).toEqual(WIKI_TOOLS);
+  });
+});
+
+describe("0.6.0 §7.4 — a guide plan lands in the continuity plan store (PR 9d)", () => {
+  test("guidePlanToStore: first line is the title, later lines (markers stripped) are steps", () => {
+    expect(guidePlanToStore("Ship the feature\n1. read the spec\n- implement\n* test\n\n")).toEqual(
+      {
+        title: "Ship the feature",
+        steps: ["read the spec", "implement", "test"],
+      },
+    );
+    expect(guidePlanToStore("   ")).toEqual({ title: "Guide plan", steps: [] });
+  });
+
+  test("wireContinuity exposes savePlan (plans on) that creates and activates the plan; plan: false wires none", async () => {
+    const { deps: d } = deps();
+    const wired = wireContinuity({ specName: "gran-guide", continuity: {} }, d);
+    expect(wired?.continuity.savePlan).toBeDefined();
+    await wired?.continuity.savePlan?.("Guide plan\n1. a\n2. b");
+    const active = await wired?.store.getActivePlan();
+    expect(active?.title).toBe("Guide plan");
+    expect(active?.steps.map((s) => s.text)).toEqual(["a", "b"]);
+    const tail = await wired?.continuity.loadPlan();
+    expect(tail).toContain("Guide plan");
+    const noPlan = wireContinuity({ specName: "gran-noplan", continuity: { plan: false } }, d);
+    expect(noPlan?.continuity.savePlan).toBeUndefined();
   });
 });
 

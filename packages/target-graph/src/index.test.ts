@@ -1350,3 +1350,38 @@ describe("emitGraph — per-node model routing (0.6.0 §7.7)", () => {
     }
   });
 });
+
+describe("0.6.0 PR 9d — side-call strategies on a node", () => {
+  const routed = (extra: Partial<IrGraphV0["nodes"][number]>): IrGraphV0 => {
+    const [plan, execute, summarise] = baseIr.nodes;
+    if (plan === undefined || execute === undefined || summarise === undefined) {
+      throw new Error("baseIr is missing nodes");
+    }
+    return { ...baseIr, nodes: [{ ...plan, ...extra }, execute, summarise] };
+  };
+  const GUIDED = {
+    candidates: [
+      { model: "claude-haiku-4-5", tags: ["cheap"] },
+      { model: "claude-opus-4-8", tags: ["strong"] },
+    ],
+    policy: "heuristic" as const,
+    strategy: { guide: { model: "claude-opus-4-8", every: "first_turn" as const } },
+  };
+
+  test("a node whose pool declares a guide renders the wireSideCalls spread on THAT node and imports the root once", () => {
+    const c = emitGraph(routed({ modelPool: GUIDED })).files[0]?.content ?? "";
+    expect(c).toContain('import { wireSideCalls } from "@crewhaus/model-service";');
+    const pool = JSON.stringify({ ...GUIDED, scope: "plan" });
+    expect(c).toContain(
+      `\n        modelPool: ${pool},\n        ...wireSideCalls(${pool}, { sessionName: "plan" }),\n`,
+    );
+    expect((c.match(/wireSideCalls\(/g) ?? []).length).toBe(1);
+  });
+
+  test("byte-identity: a pooled node without a side-call strategy renders neither the spread nor the import", () => {
+    const c =
+      emitGraph(routed({ modelPool: { ...GUIDED, strategy: undefined } })).files[0]?.content ?? "";
+    expect(c).not.toContain("wireSideCalls");
+    expect(c).not.toContain("@crewhaus/model-service");
+  });
+});

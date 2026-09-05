@@ -1174,7 +1174,14 @@ function asLooseBlock(value: unknown): LooseBlock | undefined {
 const LANDING_SINGLE_SLOT =
   "a later 0.6.0 row (a single-model serving slot has no per-candidate plan carrier in the IR; the same profile honours it today as a model_pool candidate)";
 const LANDING_PREROUTE = "PR 9b (the preRoute decision phase)";
-const LANDING_STRATEGIES = "PR 9c/9d (cascade and the guide / shadow / committee side-calls)";
+const LANDING_STRATEGIES = "PR 9c (the cascade re-run on the escalation rung)";
+/** 0.6.0 PR 9d — the shapes whose hosts construct the guide / shadow /
+ *  committee side calls at boot (`@crewhaus/model-service`'s `wireSideCalls`:
+ *  rendered by the workflow and graph emitters, called by the crew
+ *  orchestrator). Every other compiled shape reaches them through the
+ *  `crewhaus run` / `serve` interpreter only, until the emitters' boot-time
+ *  `wireModels` row. */
+const SIDE_CALL_WIRED_TARGETS: ReadonlySet<Spec["target"]> = new Set(["workflow", "graph", "crew"]);
 const LANDING_MODEL_DIRECTED =
   "a later 0.6.0 row (the emitters' boot-time wireModels call — emitted bundles do not import @crewhaus/model-service, which depends on runtime-core)";
 const LANDING_ROUTER_STORE = "PR 10 (scoped arms, priors and the reward store)";
@@ -2451,7 +2458,21 @@ function lowerModelFailover(
     if (mp.rules !== undefined) pending("rules", LANDING_PREROUTE);
     if (mp.classifier !== undefined) pending("classifier", LANDING_PREROUTE);
     if (mp.strategy !== undefined) {
-      pending("strategy", LANDING_STRATEGIES);
+      // 0.6.0 PR 9d — guide / shadow / committee are constructed by
+      // `wireSideCalls` (model-service) and consumed by runtime-core; only the
+      // cascade (PR 9c) still pends on the whole-block path.
+      if (mp.strategy.cascade !== undefined) pending("strategy", LANDING_STRATEGIES);
+      if (!SIDE_CALL_WIRED_TARGETS.has(ctx.target)) {
+        for (const key of ["guide", "shadow"] as const) {
+          if (mp.strategy[key] === undefined) continue;
+          warn(
+            ctx,
+            "model-plan-pending-runtime",
+            `${poolPath}.strategy.${key}`,
+            `${poolPath}.strategy.${key} is honoured by the crewhaus run / serve interpreter and by compiled workflow / graph / crew bundles (wireSideCalls from @crewhaus/model-service), but a compiled ${ctx.target} bundle does not construct the side call yet — that lands with 0.6.0 ${LANDING_MODEL_DIRECTED}; until then the key is inert in this compiled target`,
+          );
+        }
+      }
       if (mp.strategy.model_directed === true) {
         // 0.6.0 PR 8b landed the runtime half: `wireModels` constructs the
         // Consult / Escalate pair under this key, and the `crewhaus run` /

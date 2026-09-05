@@ -64,7 +64,7 @@ The fabric has **two symmetric halves**: a source side (classify content coming 
 | Tool results | `"tool"` | [packages/runtime-core](packages/runtime-core) |
 | On-chain payloads / receipts | `"chain"` | [packages/target-onchain](packages/target-onchain), [packages/target-onchain-game](packages/target-onchain-game), [packages/wallet-engine](packages/wallet-engine) |
 | Recalled wiki/fact bodies | `"memory"` | [packages/tool-wiki](packages/tool-wiki) |
-| Consult replies / guide text (a roster sibling's model output re-entering the parent context) | `"consult"` | [packages/tool-consult](packages/tool-consult) |
+| Consult replies / guide text (a roster sibling's model output re-entering the parent context) | `"consult"` | [packages/tool-consult](packages/tool-consult) (Consult replies, inside the tool); [packages/runtime-core](packages/runtime-core) (guide text, at the point it enters the parent's system region — `maybeRunGuide`) |
 
 **Sink-side chokepoint** — [packages/egress-classifier](packages/egress-classifier). On every external-scope tool call (`tool.scope === "external"`), `runtime-core` calls `classifyEgress(payload, ctx, { sinkId, sinkScope })`. The classifier scans `RunContext.dataLineage` for substring matches and folds the per-origin policy across all hits. The default policy is *permissive on `"user"` content, warn on configured sinks, block on dynamic sinks*. Three audit outcomes land in the trace bus and audit-log: `"egress-passed" | "egress-warned" | "egress-blocked"`.
 
