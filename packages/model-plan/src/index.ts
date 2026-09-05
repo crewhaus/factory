@@ -66,7 +66,7 @@ export type {
 export { deriveSignalRecord, evaluateRules, validateRuleRegex } from "./rules.js";
 export type { EvaluateRulesOptions, EvaluateRulesResult, RuleMatch, RuleSkip } from "./rules.js";
 
-export { parseModelDirective, resolveDirectiveTarget } from "./directive.js";
+export { parseModelDirective, resolveDirectiveTarget, stripDirectiveToken } from "./directive.js";
 export type { DirectiveRosterArm, ModelDirective } from "./directive.js";
 
 export { cheapestEligible, eligibleCandidates, strongestArm } from "./eligibility.js";

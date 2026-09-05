@@ -32,6 +32,7 @@ export type {
   PolicyDecision,
   PolicyDecisionPolicy,
   PolicyRouter,
+  PolicyRouteHint,
   PolicyRouterOptions,
   PoolCandidate,
   PoolLearningConfig,
@@ -39,4 +40,4 @@ export type {
   PoolRoutingConfig,
   ScoreLookup,
 } from "./policy-router.js";
-export { createPolicyRouter } from "./policy-router.js";
+export { createPolicyRouter, poolCandidateArmId } from "./policy-router.js";
