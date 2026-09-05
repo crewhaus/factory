@@ -48,6 +48,7 @@ import {
   type IrSchedule,
   renderBundleReadme,
 } from "@crewhaus/ir";
+import { renderModelWiringFields } from "@crewhaus/model-service";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -176,19 +177,6 @@ function renderApprovalFields(ir: IrBatchV0, indent: string): string {
     `\n${indent}askMode: ${escapeJsonString(ir.permissions.askMode ?? "pause")},` +
     `\n${indent}approvals: { store: __approvals, surface: "batch" },`
   );
-}
-
-/**
- * Adaptive model routing — render the `modelPool` runChatLoop field.
- * JSON.stringify safely quotes the validated pool object (mirroring
- * target-cli's renderModelFailoverFields; keep the pipeline/research/batch/
- * browser copies in sync). Empty when the spec omits `model_pool`, keeping
- * bundles byte-identical.
- */
-function poolField(ir: IrBatchV0, indent: string): string {
-  return ir.agent.modelPool !== undefined
-    ? `\n${indent}modelPool: ${JSON.stringify(ir.agent.modelPool)},`
-    : "";
 }
 
 /**
@@ -768,7 +756,7 @@ ${mcpBoot}  // G11 — a compiled bundle is NON-INTERACTIVE: a tool that lands o
       const runContext = createRunContext();
       const reply = await runChatLoop({
         model: SPEC_MODEL,
-        instructions: SPEC_INSTRUCTIONS,${poolField(ir, "        ")}${taxonomyField(ir, "        ")}
+        instructions: SPEC_INSTRUCTIONS,${renderModelWiringFields(ir.agent, "        ")}${taxonomyField(ir, "        ")}
         runContext,
         sessionName: SPEC_NAME,
         sessionTarget: "batch",

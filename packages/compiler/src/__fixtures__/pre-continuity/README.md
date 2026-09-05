@@ -277,3 +277,15 @@ in-loop judge or judge gate without a `model` defaults to `strongest`), fires
 ONLY on a spec that declares `models:` or a pool `strategy`, which no 0.5.x spec
 can — the emitters' `grader.model ?? agent.model` default is unchanged for
 everything else.
+
+**0.6.0 PR 8a delta — `wireModels` composition root; NO pin moved.** The ten
+emitters' hand-mirrored routing renderers (`renderModelFailoverFields`,
+`renderStepModelFailoverFields`, `renderRoleModelFailoverFields`,
+`renderNodeModelFailoverFields`, the four `poolField` copies) collapsed onto ONE
+codegen twin, `@crewhaus/model-service`'s `renderModelWiringFields`, whose
+output is byte-identical to every copy it replaced; the `crewhaus run`
+interpreter spreads the matching `wireModels` call at both of its routing
+sites. No emitted string changed, so every pin here passes unchanged; the
+per-shape proof for specs that DO declare a pool / tiers / chain lives under
+`__fixtures__/model-wiring/` (`model-wiring-pin.test.ts`), whose pins were
+generated on the pre-refactor tree.

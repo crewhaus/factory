@@ -1,0 +1,40 @@
+{
+  "name": "@crewhaus/model-service",
+  "version": "0.5.8",
+  "type": "module",
+  "description": "0.6.0 composition root (plan §2 stance 4, brief 308): wireModels(fragment, deps) turns the lowered model-routing IR into the runChatLoop options fragment — one stable call replacing the per-emitter routing codegen",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/infra-utils": "workspace:*",
+    "@crewhaus/ir": "workspace:*"
+  },
+  "devDependencies": {
+    "@crewhaus/runtime-core": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/model-service"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/model-service#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

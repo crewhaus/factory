@@ -1,0 +1,21 @@
+name: wiring-pipeline-pool
+target: pipeline
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Model-wiring pin fixture for the pipeline shape. Use Retrieve to ground answers.
+  model_pool:
+    candidates:
+      - { model: claude-haiku-4-5, tags: [cheap] }
+      - { model: claude-opus-4-8, tags: [strong] }
+retrieve:
+  embedderModel: mock/det
+  vectorBackend: in-memory
+  defaultK: 3
+indexing:
+  chunkStrategy: fixed
+  chunkSize: 200
+  chunkOverlap: 0
+  documents:
+    - id: doc-1
+      text: the quick brown fox jumps over the lazy dog

@@ -1,0 +1,14 @@
+name: wiring-managed-fallbacks
+target: managed
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Model-wiring pin fixture for the managed-daemon shape.
+  model_fallbacks: [claude-haiku-4-5]
+  circuit_breaker:
+    failureThreshold: 2
+tenants:
+  - id: tenant-pin
+    budget:
+      maxInputTokens: 100000
+      maxOutputTokens: 20000

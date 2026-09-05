@@ -1,0 +1,24 @@
+name: wiring-cli-new-keys
+target: cli
+models:
+  fast:
+    model: claude-haiku-4-5
+    tags: [cheap]
+    temperature: 0.2
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Model-wiring fixture carrying one NEW 0.6.0 key per level: a profile field
+    (temperature) on a candidate, a candidate-level key (enabled: false) and
+    pool-level keys (rules). Reply concisely.
+  model_pool:
+    candidates:
+      - { model: $fast, tags: [cheap] }
+      - { model: claude-sonnet-4-6, tags: [mid], enabled: false }
+      - { model: claude-opus-4-8, tags: [strong] }
+    policy: heuristic
+    rules:
+      - id: code-goes-strong
+        when: { message_matches: "refactor|stack ?trace" }
+        use: strong
+tools: [read]

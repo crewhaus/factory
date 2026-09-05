@@ -1,0 +1,23 @@
+name: wiring-graph-nodes
+target: graph
+model: claude-sonnet-4-6
+entry: plan
+nodes:
+  plan:
+    instructions: Plan the work.
+    model_pool:
+      candidates:
+        - { model: claude-haiku-4-5, tags: [cheap] }
+        - { model: claude-opus-4-8, tags: [strong] }
+  execute:
+    instructions: Execute the plan.
+    model_tiers:
+      fast: claude-haiku-4-5
+      default: claude-sonnet-4-6
+  summarise:
+    instructions: Summarise the result.
+edges:
+  - from: plan
+    to: execute
+  - from: execute
+    to: summarise

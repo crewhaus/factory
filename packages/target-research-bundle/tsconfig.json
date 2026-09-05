@@ -16,6 +16,9 @@
     },
     {
       "path": "../memory-service"
+    },
+    {
+      "path": "../model-service"
     }
   ],
   "include": ["src/**/*"]

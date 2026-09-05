@@ -11,6 +11,7 @@
     { "path": "../infra-utils" },
     { "path": "../ir" },
     { "path": "../memory-service" },
-    { "path": "../model-router" }
+    { "path": "../model-router" },
+    { "path": "../model-service" }
   ]
 }

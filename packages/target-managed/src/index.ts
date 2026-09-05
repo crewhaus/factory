@@ -16,6 +16,7 @@ import {
   renderBundleReadme,
 } from "@crewhaus/ir";
 import { memoryFragmentFromIr } from "@crewhaus/memory-service";
+import { renderModelWiringFields } from "@crewhaus/model-service";
 
 /**
  * Emit a managed-daemon bundle. Generates `daemon.ts` that wires:
@@ -180,33 +181,6 @@ function resolveManagedTools(
     imports.push(`import { ${symbols.join(", ")} } from "${pkg}";`);
   }
   return { imports, inits, registrations };
-}
-
-/**
- * Item 22 — render the failover-chain runChatLoop fields from the IR agent
- * block, indented for the generated `runOneTurn` body. Empty when the spec
- * declared neither field so existing bundles stay byte-identical. Mirror:
- * target-cli + target-channel-bot render the same fields — keep the three
- * in sync.
- */
-function renderModelFailoverFields(ir: IrManagedV0): string {
-  const pieces: string[] = [];
-  const fallbacks = ir.agent.modelFallbacks;
-  if (fallbacks !== undefined && fallbacks.length > 0) {
-    pieces.push(`\n    modelFallbacks: [${fallbacks.map((m) => escapeJsonString(m)).join(", ")}],`);
-  }
-  if (ir.agent.circuitBreaker !== undefined) {
-    pieces.push(`\n    circuitBreaker: ${JSON.stringify(ir.agent.circuitBreaker)},`);
-  }
-  // Item 26 — two-tier router (mirror of target-cli). Absent when unset.
-  if (ir.agent.modelTiers !== undefined) {
-    pieces.push(`\n    modelTiers: ${JSON.stringify(ir.agent.modelTiers)},`);
-  }
-  // Adaptive model routing — the N-candidate pool (mirror of target-cli).
-  if (ir.agent.modelPool !== undefined) {
-    pieces.push(`\n    modelPool: ${JSON.stringify(ir.agent.modelPool)},`);
-  }
-  return pieces.join("");
 }
 
 /**
@@ -916,7 +890,7 @@ export type ManagedAgentArgs = {
 export async function runOneTurn(args: ManagedAgentArgs): Promise<string> {
 ${memBlock}${approvalsBoot}  return await runChatLoop({
     model: ${escapeJsonString(ir.agent.model)},
-    instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentLoopFields(ir)}${renderModelFailoverFields(ir)}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderHooksField(ir)}${renderSloField(ir)}
+    instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentLoopFields(ir)}${renderModelWiringFields(ir.agent, "    ")}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderHooksField(ir)}${renderSloField(ir)}
     sessionName: args.sessionId,
     sessionTarget: "managed",
     seedMessages: [{ role: "user", content: args.input }],

@@ -36,6 +36,7 @@ import {
   renderBundleReadme,
 } from "@crewhaus/ir";
 import { memoryFragmentFromIr } from "@crewhaus/memory-service";
+import { renderModelWiringFields } from "@crewhaus/model-service";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -160,19 +161,6 @@ function renderApprovalFields(ir: IrResearchV0, indent: string): string {
     `\n${indent}askMode: ${escapeJsonString(ir.permissions.askMode ?? "pause")},` +
     `\n${indent}approvals: { store: __approvals, surface: "research" },`
   );
-}
-
-/**
- * Adaptive model routing — render the `modelPool` runChatLoop field.
- * JSON.stringify safely quotes the validated pool object (mirroring
- * target-cli's renderModelFailoverFields; keep the pipeline/research/batch/
- * browser copies in sync). Empty when the spec omits `model_pool`, keeping
- * bundles byte-identical.
- */
-function poolField(ir: IrResearchV0, indent: string): string {
-  return ir.agent.modelPool !== undefined
-    ? `\n${indent}modelPool: ${JSON.stringify(ir.agent.modelPool)},`
-    : "";
 }
 
 /**
@@ -566,7 +554,7 @@ async function runOneBranch(args: {
   const runContext = createRunContext();
   const finalText = await runChatLoop({
     model: SPEC_MODEL,
-    instructions: SPEC_INSTRUCTIONS,${poolField(ir, "    ")}${taxonomyField(ir, "    ")}
+    instructions: SPEC_INSTRUCTIONS,${renderModelWiringFields(ir.agent, "    ")}${taxonomyField(ir, "    ")}
     runContext,
     sessionName: ${escapeJsonString(ir.name)},
     sessionTarget: "research",

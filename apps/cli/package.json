@@ -79,6 +79,7 @@
     "@crewhaus/meta-harness-optimizer": "workspace:*",
     "@crewhaus/wiki-store": "workspace:*",
     "@crewhaus/model-router": "workspace:*",
+    "@crewhaus/model-service": "workspace:*",
     "@crewhaus/module-marketplace-client": "workspace:*",
     "@crewhaus/migration-engine": "workspace:*",
     "@crewhaus/migration-runner": "workspace:*",

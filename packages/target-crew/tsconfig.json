@@ -9,7 +9,8 @@
     { "path": "../gateway-protocol" },
     { "path": "../infra-utils" },
     { "path": "../ir" },
-    { "path": "../memory-service" }
+    { "path": "../memory-service" },
+    { "path": "../model-service" }
   ],
   "include": ["src/**/*"]
 }

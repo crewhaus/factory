@@ -55,6 +55,7 @@ import {
   type IrBrowserV0,
   renderBundleReadme,
 } from "@crewhaus/ir";
+import { renderModelWiringFields } from "@crewhaus/model-service";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -149,19 +150,6 @@ function resolveTools(
     imports.push(`import { ${symbols.join(", ")} } from "${pkg}";`);
   }
   return { imports, inits, registrations };
-}
-
-/**
- * Adaptive model routing — render the `modelPool` runChatLoop field.
- * JSON.stringify safely quotes the validated pool object (mirroring
- * target-cli's renderModelFailoverFields; keep the pipeline/research/batch/
- * browser copies in sync). Empty when the spec omits `model_pool`, keeping
- * bundles byte-identical.
- */
-function poolField(ir: IrBrowserV0, indent: string): string {
-  return ir.agent.modelPool !== undefined
-    ? `\n${indent}modelPool: ${JSON.stringify(ir.agent.modelPool)},`
-    : "";
 }
 
 /**
@@ -407,7 +395,7 @@ async function main(): Promise<void> {
   // context. limits/budget/max_tokens (Batch A) apply to each turn.
   const runOptions = {
     model: SPEC_MODEL,
-    instructions: SPEC_INSTRUCTIONS,${poolField(ir, "    ")}${taxonomyField(ir, "    ")}
+    instructions: SPEC_INSTRUCTIONS,${renderModelWiringFields(ir.agent, "    ")}${taxonomyField(ir, "    ")}
     runContext,
     sessionName: SPEC_NAME,
     sessionTarget: "browser" as const,

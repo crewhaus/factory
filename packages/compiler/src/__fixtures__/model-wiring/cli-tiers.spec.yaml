@@ -1,0 +1,12 @@
+name: wiring-cli-tiers
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Model-wiring pin fixture for the CLI shape (tiers). Reply concisely.
+  model_tiers:
+    fast: claude-haiku-4-5
+    default: claude-sonnet-4-6
+    routing:
+      contextTokenThreshold: 20000
+tools: [read]

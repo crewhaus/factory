@@ -36,7 +36,8 @@
     "@crewhaus/worker-runtime": "workspace:*"
   },
   "devDependencies": {
-    "@crewhaus/model-plan": "workspace:*"
+    "@crewhaus/model-plan": "workspace:*",
+    "@crewhaus/model-service": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

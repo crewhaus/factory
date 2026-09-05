@@ -10,6 +10,7 @@ import {
   renderBundleReadme,
 } from "@crewhaus/ir";
 import { memoryFragmentFromIr } from "@crewhaus/memory-service";
+import { renderModelWiringFields } from "@crewhaus/model-service";
 import { renderBannerBoot } from "./banner";
 
 // Phase 3 §3.3 — the banner contract is shared with the interpreter path
@@ -786,11 +787,14 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   // Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks, layered
   // BELOW the settings.json layers. Empty pieces when the spec has none.
   const specHooks = renderSpecHooks(ir);
-  // Item 22 — provider failover chain: thread `agent.model_fallbacks` +
-  // `agent.circuit_breaker` into the runtime, which constructs the
-  // breaker-driven meta-adapter (see @crewhaus/model-router). Emitted only
-  // when the spec declared them so existing bundles stay byte-identical.
-  const failoverFields = renderModelFailoverFields(ir);
+  // Item 22 / item 26 / adaptive routing — the model-routing quartet
+  // (`model_fallbacks` + `circuit_breaker`, `model_tiers`, `model_pool`),
+  // rendered by the 0.6.0 composition root's codegen twin
+  // (`@crewhaus/model-service`, plan §2 stance 4): one renderer for every
+  // emitter and the interpreter, byte-identical to the per-emitter copies it
+  // replaced. Empty when the spec declared none, keeping bundles
+  // byte-identical.
+  const failoverFields = renderModelWiringFields(ir.agent, "  ");
   // Section 55 / item 23 — thread the spec's failure_taxonomy so recovery-
   // engine consults the named error classes (incl. the `switch-model`
   // verdict) before its built-in flow. Empty when the spec omits it.
@@ -883,53 +887,6 @@ ${pluginsActivateBoot}${extensionBoot}${pluginsRegisterBoot}${specHooks.bootBloc
 
 ${bannerBoot}${subAgentsBoot}${egressBoot}${evaluationBoot}${bootBlocks}${knowledgeBoot}${wrapped}
 `;
-}
-
-/**
- * Item 22 — render the failover-chain runChatLoop fields from the IR agent
- * block. Model strings pass through `escapeJsonString` (they are
- * user-controlled spec values landing in generated source); the breaker
- * tuning is a numbers-only object safe to JSON.stringify. Returns "" when
- * the spec declared neither field, keeping pre-existing bundles
- * byte-identical. Mirror: target-channel-bot + target-managed render the
- * same fields — keep the three in sync.
- */
-function renderModelFailoverFields(ir: {
-  readonly agent: {
-    readonly modelFallbacks?: readonly string[];
-    readonly circuitBreaker?: {
-      readonly failureThreshold?: number;
-      readonly windowMs?: number;
-      readonly cooldownMs?: number;
-    };
-    readonly modelTiers?: {
-      readonly fast: string;
-      readonly default: string;
-      readonly routing?: Record<string, number | boolean>;
-    };
-    readonly modelPool?: unknown;
-  };
-}): string {
-  const pieces: string[] = [];
-  const fallbacks = ir.agent.modelFallbacks;
-  if (fallbacks !== undefined && fallbacks.length > 0) {
-    pieces.push(`\n  modelFallbacks: [${fallbacks.map((m) => escapeJsonString(m)).join(", ")}],`);
-  }
-  if (ir.agent.circuitBreaker !== undefined) {
-    pieces.push(`\n  circuitBreaker: ${JSON.stringify(ir.agent.circuitBreaker)},`);
-  }
-  // Item 26 — two-tier router. JSON.stringify safely quotes the fast/default
-  // model strings + numeric routing knobs (a plain object literal, no template
-  // escaping needed). Absent when unset, keeping bundles byte-identical.
-  if (ir.agent.modelTiers !== undefined) {
-    pieces.push(`\n  modelTiers: ${JSON.stringify(ir.agent.modelTiers)},`);
-  }
-  // Adaptive model routing — the N-candidate pool. Same JSON.stringify safety
-  // as modelTiers (a plain object literal of validated strings/numbers).
-  if (ir.agent.modelPool !== undefined) {
-    pieces.push(`\n  modelPool: ${JSON.stringify(ir.agent.modelPool)},`);
-  }
-  return pieces.join("");
 }
 
 /**

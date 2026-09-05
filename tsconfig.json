@@ -46,6 +46,7 @@
     { "path": "./packages/tool-schema-sanitizer" },
     { "path": "./packages/model-plan" },
     { "path": "./packages/model-router" },
+    { "path": "./packages/model-service" },
     { "path": "./packages/permission-engine" },
     { "path": "./packages/abort-controller" },
     { "path": "./packages/mcp-host" },
