@@ -563,6 +563,7 @@
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/model-plan": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/run-context": "workspace:*",

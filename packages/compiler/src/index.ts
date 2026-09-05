@@ -85,6 +85,7 @@ import type {
   IrWorkflowV0,
 } from "@crewhaus/ir";
 import { VALIDATING_PASSES, applyPasses as applyIrPassesFn } from "@crewhaus/ir-passes";
+import type { ModelProfile, RouteRule } from "@crewhaus/model-plan";
 import {
   SPEC_PROFILE_NAME_RE,
   type Spec,
@@ -2165,6 +2166,24 @@ type SpecModelPoolBlockValue = NonNullable<SpecModelPoolBlock>;
 type SpecModelPoolCandidateValue = SpecModelPoolBlockValue["candidates"][number];
 
 /**
+ * Compile-time pins (0.6.0 PR 7b, §7.7): the lowered pool candidate and rule
+ * are structurally `@crewhaus/model-plan`'s `ModelProfile` and `RouteRule`.
+ * `@crewhaus/crew-orchestrator` types the emitted role literal's `modelPool`
+ * as runtime-core's pool option intersected with those two model-plan types
+ * (it deliberately imports no `@crewhaus/ir`), so these two assertions are
+ * what make `JSON.stringify(role.modelPool)` typecheck against
+ * `RoleDefinition.modelPool` by construction. They live here — not in a test
+ * — because test files are excluded from `tsc -b`, and this is the one
+ * package that legitimately imports both sides. A drift in either IR type
+ * fails this compile.
+ */
+type AssertTrue<T extends true> = T;
+type _IrPoolCandidateIsModelProfile = AssertTrue<
+  IrModelPoolCandidate extends ModelProfile ? true : false
+>;
+type _IrPoolRuleIsRouteRule = AssertTrue<IrModelPoolRule extends RouteRule ? true : false>;
+
+/**
  * 0.6.0 §4.3 — lower one pool candidate. A `$profile` candidate takes the
  * profile as its defaults and overrides field-by-field; its `tags` REPLACE
  * the profile's when it declares any (they are the routing identity, not an
@@ -2410,8 +2429,11 @@ function lowerPoolReward(r: NonNullable<SpecModelPoolBlockValue["reward"]>): IrM
  * reported `model-plan-pending-runtime` until its consumer lands. `scope` is
  * carried verbatim only when declared — the compiler does NOT stamp the
  * step/role/node name (§7.9), because that would change the pool blob of
- * every pre-0.6.0 pooled step and role; the runtime composition root (PR 10)
- * defaults it from the caller's toolset scope at boot.
+ * every pre-0.6.0 pooled step and role. The caller that knows the scope
+ * stamps it at runtime instead: `@crewhaus/crew-orchestrator` hands each
+ * role turn its pool with `scope` defaulted to the ROLE name (PR 7b,
+ * `scopeRolePool`), and the runtime composition root (PR 10) defaults the
+ * other hosts' from the caller's toolset scope at boot.
  */
 function lowerModelFailover(
   agent: SpecAgentWithFailover,

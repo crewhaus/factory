@@ -593,6 +593,114 @@ describe("$profile / sentinels on every auxiliary slot (the six that bypassed re
     expect(ir.routing).toEqual({ kind: "llm", model: "claude-opus-4-8", modelProfile: "strong" });
     const orch = compile(yaml, opts).files.find((f) => f.path === "orchestrator.ts")?.content ?? "";
     expect(orch).toContain('model: "claude-opus-4-8",');
+    // The router model is a `model-only` slot: the profile's request params
+    // have no home on the fixed 128-token classify turn and say so.
+    expect(orch).not.toContain("$strong");
+  });
+
+  // 0.6.0 PR 7b (§4.2, §7.7, §7.9) — the crew half that needs the widened IR:
+  // a role's pool candidates carry their profile settings onto the role
+  // literal, which `@crewhaus/crew-orchestrator` forwards into the role's
+  // turns. The compiler stamps NO `scope` (the orchestrator defaults it to the
+  // role name at runtime), so a pre-0.6.0 pooled role stays byte-identical.
+  test("crew role model_pool: $profile candidates lower with their settings onto the role literal; the compiler stamps no scope", () => {
+    const yaml = [
+      "name: c",
+      "target: crew",
+      ...REGISTRY,
+      "model: claude-sonnet-4-6",
+      "entry: lead",
+      "roles:",
+      "  lead:",
+      "    instructions: go",
+      "    model_pool:",
+      "      candidates:",
+      "        - { model: $fast }",
+      "        - { model: $strong, max_tokens: 2048 }",
+      "        - { model: claude-sonnet-4-6, tags: [mid], enabled: false }",
+      "      policy: heuristic",
+      "  helper: { instructions: help }",
+    ].join("\n");
+    const { ir, warnings } = lowerWithWarnings(parseSpec(yaml), opts);
+    if (ir.target !== "crew") throw new Error("unexpected target");
+    const lead = ir.roles.find((r) => r.name === "lead");
+    const pool = lead?.modelPool;
+    expect(pool?.policy).toBe("heuristic");
+    expect(pool?.scope).toBeUndefined();
+    const [fast, strong, mid] = pool?.candidates ?? [];
+    expect(fast).toMatchObject({
+      model: "claude-haiku-4-5",
+      tags: ["cheap"],
+      profile: "fast",
+      thinking: { effort: "low" },
+      maxTokens: 4096,
+      overlay: "You are the fast lane.",
+      fallbacks: ["claude-sonnet-4-6"],
+    });
+    // model then tags FIRST — the premise of the role literal's byte-identity.
+    expect(Object.keys(fast ?? {}).slice(0, 3)).toEqual(["model", "tags", "profile"]);
+    // A slot-local pin overrides the profile's field.
+    expect(strong).toEqual({
+      model: "claude-opus-4-8",
+      tags: ["strong"],
+      profile: "strong",
+      thinking: { budgetTokens: 4096 },
+      maxTokens: 2048,
+    });
+    expect(mid).toEqual({ model: "claude-sonnet-4-6", tags: ["mid"], enabled: false });
+    // The un-pooled sibling role is untouched.
+    expect(ir.roles.find((r) => r.name === "helper")?.modelPool).toBeUndefined();
+    // Per-candidate settings are reported pending the plan table, per role path.
+    const pending = warnings.filter((w) => w.code === "model-plan-pending-runtime");
+    expect(pending.map((w) => w.path)).toContain("roles.lead.model_pool.candidates[1].max_tokens");
+    expect(pending.map((w) => w.path)).toContain(
+      "roles.lead.model_pool.candidates[0].instructions",
+    );
+
+    // The role literal carries the widened pool verbatim (what the
+    // orchestrator's RoleModelPool accepts) — and no `$` reaches the bundle.
+    const files = compile(yaml, opts).files;
+    const leadTs = files.find((f) => f.path === "agent_lead.ts")?.content ?? "";
+    expect(leadTs).toContain(`modelPool: ${JSON.stringify(pool)},`);
+    expect(leadTs).toContain(
+      '{"model":"claude-opus-4-8","tags":["strong"],"profile":"strong","thinking":{"budgetTokens":4096},"maxTokens":2048}',
+    );
+    expect(leadTs).toContain('"enabled":false');
+    expect(leadTs).not.toContain('"scope"');
+    expect(leadTs).not.toContain("$fast");
+    expect(files.find((f) => f.path === "agent_helper.ts")?.content ?? "").not.toContain(
+      "modelPool",
+    );
+  });
+
+  test("crew role model_pool without 0.6.0 keys emits the 0.5.x blob byte-for-byte; a declared scope rides verbatim", () => {
+    const plain = [
+      "name: c",
+      "target: crew",
+      "model: claude-sonnet-4-6",
+      "entry: lead",
+      "roles:",
+      "  lead:",
+      "    instructions: go",
+      "    model_pool:",
+      "      candidates:",
+      "        - { model: claude-haiku-4-5, tags: [cheap] }",
+      "        - { model: claude-opus-4-8, tags: [strong] }",
+      "      policy: heuristic",
+    ];
+    const plainOut = compile(plain.join("\n"), opts);
+    const leadTs = plainOut.files.find((f) => f.path === "agent_lead.ts")?.content ?? "";
+    expect(leadTs).toContain(
+      '\n    modelPool: {"candidates":[{"model":"claude-haiku-4-5","tags":["cheap"]},{"model":"claude-opus-4-8","tags":["strong"]}],"policy":"heuristic"},\n',
+    );
+    expect(plainOut.warnings).toEqual([]);
+
+    const scoped = compile([...plain, "      scope: lead-arms"].join("\n"), opts);
+    const scopedTs = scoped.files.find((f) => f.path === "agent_lead.ts")?.content ?? "";
+    expect(scopedTs).toContain('"policy":"heuristic","scope":"lead-arms"}');
+    expect(scoped.warnings.map((w) => [w.code, w.path])).toEqual([
+      ["model-plan-pending-runtime", "roles.lead.model_pool.scope"],
+    ]);
   });
 });
 

@@ -30,6 +30,7 @@ import type {
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { CrewhausError } from "@crewhaus/errors";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
+import type { ModelProfile, RouteRule } from "@crewhaus/model-plan";
 import {
   BUILTIN_DEFAULT_RULES,
   type PermissionMode,
@@ -70,6 +71,72 @@ export type RoleThinking =
   | { readonly budgetTokens: number }
   | { readonly effort: "low" | "medium" | "high" };
 
+/** The pool option runtime-core accepts today (`RunChatLoopOptions.modelPool`). */
+type RuntimeModelPool = NonNullable<RunChatLoopOptions["modelPool"]>;
+
+/**
+ * 0.6.0 §4.2 / §7.7 (PR 7b) — one candidate of a role's `model_pool` as the
+ * role literal carries it: the routing identity runtime-core reads at boot
+ * (`model` / `tags` / `enabled`) intersected with the per-candidate profile
+ * settings the compiler lowers from a `$profile` (or inline) candidate —
+ * `maxTokens`, `thinking`, `temperature`, `overlay`, `tools`, … (§4.1).
+ * `@crewhaus/model-plan`'s `ModelProfile` is structurally the IR's
+ * `IrModelPoolCandidate` by design (the compiler never imports it), so the
+ * emitted `JSON.stringify(role.modelPool)` typechecks against this field
+ * without a mirror to keep in sync — `@crewhaus/compiler` pins that
+ * assignability at compile time (see the note under {@link RoleModelPool}).
+ * runtime-core reads `model` / `tags` / `enabled` off a candidate today; the
+ * per-candidate plan table that applies the rest lands with PR 9a, and
+ * because the orchestrator forwards the candidate verbatim, nothing here
+ * changes when it does.
+ */
+export type RoleModelPoolCandidate = RuntimeModelPool["candidates"][number] & ModelProfile;
+
+/**
+ * 0.6.0 §7.1 / §7.9 (PR 7b) — a role's `model_pool` as the role literal
+ * carries it: runtime-core's pool option with per-candidate profiles
+ * ({@link RoleModelPoolCandidate}), the scoped `routeKey` prefix and the
+ * hybrid siblings the compiler lowers beside `routing` / `learning`.
+ *
+ * `scope` is the per-role arm namespace (§7.9): the spec may declare it, and
+ * when it does not, `composeLoopTuning` stamps the ROLE NAME — the compiler
+ * deliberately leaves `scope` unstamped at lower time so pre-0.6.0 pooled
+ * role literals stay byte-identical, and the orchestrator is the caller that
+ * knows which role a turn belongs to (the same name it already passes as
+ * `toolsetScope`). The routing store keys arms by it from PR 10 on; until
+ * then runtime-core ignores the key.
+ *
+ * `rules` is `@crewhaus/model-plan`'s `RouteRule` (its `evaluateRules` input,
+ * §7.2.2). `classifier` / `strategy` / `reward` are opaque records here on
+ * purpose: the orchestrator forwards them verbatim and never reads them, so
+ * runtime-core's own option type is the single authority for their shape
+ * once PRs 9b / 9d / 10 consume them — a second mirror would only drift.
+ */
+export type RoleModelPool = Omit<RuntimeModelPool, "candidates"> & {
+  readonly candidates: ReadonlyArray<RoleModelPoolCandidate>;
+  readonly scope?: string;
+  readonly directives?: boolean;
+  readonly rules?: ReadonlyArray<RouteRule>;
+  readonly classifier?: Readonly<Record<string, unknown>>;
+  readonly strategy?: Readonly<Record<string, unknown>>;
+  readonly reward?: Readonly<Record<string, unknown>>;
+};
+
+/**
+ * Compile-time pin (PR 7b): the widened pool stays a structural SUBTYPE of
+ * what runtime-core accepts, so the `Partial<RunChatLoopOptions>` cast at
+ * the two call sites never hides a shape the loop would reject. Test files
+ * are excluded from `tsc -b`, which is why this lives in source: a drift in
+ * either type fails this package's compile, not a generated bundle's run.
+ * (The other direction — the IR's `IrModelPool` being assignable to this
+ * type — is pinned in `@crewhaus/compiler`, the one package that legitimately
+ * imports both `@crewhaus/ir` and `@crewhaus/model-plan`.)
+ */
+type AssertTrue<T extends true> = T;
+type _RolePoolIsAcceptedByRuntime = AssertTrue<
+  RoleModelPool extends RuntimeModelPool ? true : false
+>;
+
 export type RoleDefinition = {
   readonly model: string;
   readonly instructions: string;
@@ -99,14 +166,19 @@ export type RoleDefinition = {
    * does for a cli agent. Typed by indexing `RunChatLoopOptions` rather than
    * mirrored locally so the emitted literal is checked against what the
    * runtime actually accepts — a drift there fails this package's compile,
-   * not a generated bundle's. Today's IR carries `{model, tags}` candidates
-   * and an unscoped `routeKey`; per-candidate profiles and the per-role
-   * `scope` land with the IR widening (PR 7 / 7b).
+   * not a generated bundle's.
+   *
+   * 0.6.0 (PR 7b) — `modelPool` is the WIDENED pool ({@link RoleModelPool}):
+   * each candidate carries its per-candidate profile settings (§4.2) and the
+   * pool its scoped `routeKey` prefix (§7.9), so a `$profile` candidate on a
+   * role reaches the role's turns with its settings intact instead of being
+   * flattened to `{model, tags}`. `composeLoopTuning` stamps `scope` with the
+   * role name when the spec declared none.
    */
   readonly modelFallbacks?: RunChatLoopOptions["modelFallbacks"];
   readonly circuitBreaker?: RunChatLoopOptions["circuitBreaker"];
   readonly modelTiers?: RunChatLoopOptions["modelTiers"];
-  readonly modelPool?: RunChatLoopOptions["modelPool"];
+  readonly modelPool?: RoleModelPool;
 };
 
 export type RouterArgs = {
@@ -628,7 +700,8 @@ async function* driveCrew(
           // Loop contract 0.4 (Batch A) — run-level ceilings + the peer
           // role's own selectors, identical to a primary activation; the
           // cast is composeLoopTuning's documented forward-compat seam.
-          ...(composeLoopTuning(peerDef, args.opts) as Partial<RunChatLoopOptions>),
+          // 0.6.0 (PR 7b) — the peer's pool is scoped to the PEER role.
+          ...(composeLoopTuning(peerDef, args.opts, toRole) as Partial<RunChatLoopOptions>),
           installSigintHandler: false,
           maxTokens: peerDef.maxTokens ?? DEFAULT_MAX_TOKENS,
           crewMailbox: mailbox,
@@ -726,7 +799,8 @@ async function* driveCrew(
           // Loop contract 0.4 (Batch A) — run-level ceilings (limits/budget/
           // hooks/spawner) + this role's selectors (thinking/subAgents); the
           // cast is composeLoopTuning's documented forward-compat seam.
-          ...(composeLoopTuning(def, args.opts) as Partial<RunChatLoopOptions>),
+          // 0.6.0 (PR 7b) — this role's pool is scoped to this role.
+          ...(composeLoopTuning(def, args.opts, currentRoleName) as Partial<RunChatLoopOptions>),
           installSigintHandler: false,
           maxTokens: def.maxTokens ?? DEFAULT_MAX_TOKENS,
           crewMailbox: mailbox,
@@ -956,7 +1030,10 @@ async function buildHandoffSeed(
  * `modelPool`) into one runChatLoop options fragment, applied IDENTICALLY
  * to primary role activations and inline A2A peer turns. Only declared
  * fields are present — the runtime owns every default, so a knob-less run
- * stays byte-identical to pre-0.4.
+ * stays byte-identical to pre-0.4. `roleName` is the role the turn belongs
+ * to (0.6.0 PR 7b): it becomes the pool's `scope` when the spec pinned none
+ * (see {@link scopeRolePool}) and is required precisely so neither call site
+ * can forget it — the 0.5.5 `toolsetScope` lesson.
  *
  * The returned fragment is spread into each call site behind a
  * `Partial<RunChatLoopOptions>` cast: `maxToolIterations`/
@@ -984,16 +1061,36 @@ export type LoopTuningFragment = Pick<
   | "modelFallbacks"
   | "circuitBreaker"
   | "modelTiers"
-  | "modelPool"
 > & {
   readonly deadlineMs?: number;
   readonly turnTimeoutMs?: number;
   readonly modelCallTimeoutMs?: number;
   readonly loopDetection?: CrewLoopLimits["loopDetection"];
   readonly thinking?: RoleThinking;
+  /** 0.6.0 (PR 7b) — the WIDENED pool, a structural subtype of runtime-core's
+   *  option (per-candidate profiles + `scope` + hybrid siblings ride verbatim). */
+  readonly modelPool?: RoleModelPool;
 };
 
-export function composeLoopTuning(def: RoleDefinition, opts: RunOptions): LoopTuningFragment {
+/**
+ * 0.6.0 §7.9 (PR 7b) — the pool a role turn hands runtime-core: the role's
+ * declared pool with `scope` defaulted to the ROLE NAME when the spec did
+ * not pin one. Stamped here (not at lower time) so a pre-0.6.0 pooled role
+ * literal stays byte-identical while every role's arms still get their own
+ * namespace once the routing store keys by scope (PR 10) — one shared
+ * `arms.jsonl` must not pool a crew's planner and workers into two arms. A
+ * declared `scope` always wins; the candidates and every other key are
+ * forwarded verbatim (object identity kept when nothing is stamped).
+ */
+export function scopeRolePool(pool: RoleModelPool, roleName: string): RoleModelPool {
+  return pool.scope !== undefined ? pool : { ...pool, scope: roleName };
+}
+
+export function composeLoopTuning(
+  def: RoleDefinition,
+  opts: RunOptions,
+  roleName: string,
+): LoopTuningFragment {
   const limits = opts.limits ?? {};
   return {
     ...(limits.maxToolIterations !== undefined
@@ -1020,7 +1117,9 @@ export function composeLoopTuning(def: RoleDefinition, opts: RunOptions): LoopTu
     ...(def.modelFallbacks !== undefined ? { modelFallbacks: def.modelFallbacks } : {}),
     ...(def.circuitBreaker !== undefined ? { circuitBreaker: def.circuitBreaker } : {}),
     ...(def.modelTiers !== undefined ? { modelTiers: def.modelTiers } : {}),
-    ...(def.modelPool !== undefined ? { modelPool: def.modelPool } : {}),
+    // 0.6.0 (PR 7b, §7.7/§7.9) — the widened pool, per-candidate profiles
+    // intact, scoped to this role when the spec pinned no scope.
+    ...(def.modelPool !== undefined ? { modelPool: scopeRolePool(def.modelPool, roleName) } : {}),
   };
 }
 

@@ -508,7 +508,14 @@ function renderRoleTuningFields(role: IrCrewRole): string {
  * is checked against what the loop accepts — and `composeLoopTuning` spreads
  * them; on 0.4–0.5 the literal compiled but was dead config. The field NAMES
  * below are the contract with the orchestrator; a rename on either side must
- * move both. The four fields are mutually exclusive in
+ * move both. 0.6.0 §4.2 / §7.7 (PR 7b): `modelPool` is the WIDENED
+ * `IrModelPool` — `JSON.stringify` carries every per-candidate profile
+ * setting (`profile` / `maxTokens` / `thinking` / `overlay` / `enabled` …),
+ * the hybrid siblings and a declared `scope` verbatim, `model` then `tags`
+ * first on each candidate so a plain candidate is byte-identical to 0.5.x;
+ * the orchestrator's `RoleModelPool` accepts that shape (pinned in
+ * `@crewhaus/compiler`) and stamps `scope` with the role name at runtime
+ * when the spec declared none. The four fields are mutually exclusive in
  * the spec (`model_pool` ⊥ `model_tiers` ⊥ `model_fallbacks`, with
  * `circuit_breaker` riding `model_fallbacks`), so at most one clause fires
  * per role. Model strings pass through `escapeJsonString` (user-controlled
@@ -614,10 +621,13 @@ function llmRouterDescription(instructions: string): string {
  * name or DONE — the exact-token output contract is what keeps the
  * decision stable at any sampling temperature. DONE (or re-picking the
  * finishing role) terminates the crew; an unparseable reply falls back to
- * the entry role. The turn runs on the entry role's model in its own
- * session (`<name> (llm-router)`) so the crew transcript stays clean, and
- * it rides the run's session root + `_adapter` test seam via the
- * orchestrator's RouterArgs passthroughs.
+ * the entry role. The turn runs on `routing.model` — 0.6.0 §7.7, the
+ * router's own slot (a `$profile` resolves at lower time, `IrCrewRouting.
+ * model`) — or, when the spec names none, on the entry role's model, the
+ * byte-identical pre-0.6.0 default. It runs in its own session
+ * (`<name> (llm-router)`) so the crew transcript stays clean, and it rides
+ * the run's session root + `_adapter` test seam via the orchestrator's
+ * RouterArgs passthroughs.
  */
 function renderLlmRouter(
   ir: IrCrewV0,

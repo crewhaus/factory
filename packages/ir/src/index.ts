@@ -442,7 +442,11 @@ export type IrModelPool = {
   readonly classifier?: IrModelPoolClassifier;
   readonly strategy?: IrModelPoolStrategy;
   readonly reward?: IrModelPoolReward;
-  /** 0.6.0 §7.9 — scoped routeKey prefix, carried verbatim when declared. */
+  /** 0.6.0 §7.9 — scoped routeKey prefix, carried verbatim when declared.
+   *  Never stamped at lower time (that would change every pre-0.6.0 pooled
+   *  step/role blob); the host that knows the scope defaults it at runtime —
+   *  the crew orchestrator to the role name (PR 7b), the composition root to
+   *  the caller's toolset scope (PR 10). */
   readonly scope?: string;
 };
 
@@ -2050,7 +2054,13 @@ export type IrCrewRole = {
   readonly modelTiers?: IrModelTiers;
   /** Item 9 (G37) — per-role N-candidate pool with a selection policy (a
    *  PolicyRouter decides per role against the shared routing-store
-   *  scoreboard). Absent → single-model. */
+   *  scoreboard). Absent → single-model. 0.6.0 §7.7 (PR 7b): the WIDENED
+   *  pool — each candidate carries its per-candidate profile settings
+   *  (`IrModelPoolCandidate`) — is emitted verbatim onto the role literal and
+   *  forwarded intact by `@crewhaus/crew-orchestrator` into the role's turns,
+   *  which stamp `scope` with the role name when the spec pinned none (the
+   *  compiler leaves `scope` unstamped so pre-0.6.0 pooled roles stay
+   *  byte-identical). */
   readonly modelPool?: IrModelPool;
   /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
   readonly modelProfile?: string;
