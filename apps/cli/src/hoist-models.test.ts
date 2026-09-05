@@ -13,6 +13,8 @@ import { join } from "node:path";
 import { lower } from "@crewhaus/compiler";
 import { parseSpec } from "@crewhaus/spec";
 import {
+  REWRITE_ARMS_UNAVAILABLE,
+  armModels,
   countArmLines,
   enumerateHoistSlots,
   formatArmNotes,
@@ -106,6 +108,38 @@ const POOLED = [
   "",
 ].join("\n");
 
+/**
+ * Two pools sharing a model string. `agent` + its opus candidate share
+ * {opus, effort high} and hoist; the sub-agent pool's bare opus candidate is
+ * a one-off and STAYS inline — so opus arm lines cannot be re-keyed (they
+ * carry no pool identity). Haiku appears on one candidate in each pool with
+ * the same (empty) settings, so every haiku candidate hoists to one profile.
+ */
+const TWO_POOLS = [
+  "name: two-pools",
+  "target: cli",
+  "agent:",
+  "  model: claude-opus-4-8",
+  "  thinking: { effort: high }",
+  "  instructions: Help.",
+  "  model_pool:",
+  "    candidates:",
+  "      - { model: claude-haiku-4-5, tags: [cheap] }",
+  "      - { model: claude-opus-4-8, tags: [strong], thinking: { effort: high } }",
+  "    policy: learned",
+  "  sub_agents:",
+  "    writer:",
+  "      description: writes",
+  "      instructions: write",
+  "      model: claude-sonnet-4-5",
+  "      model_pool:",
+  "        candidates:",
+  "          - { model: claude-opus-4-8, tags: [strong] }",
+  "          - { model: claude-haiku-4-5, tags: [cheap] }",
+  "        policy: learned",
+  "",
+].join("\n");
+
 describe("planHoistModels — what gets hoisted", () => {
   test("a triple repeated on agent + a sub-agent becomes ONE profile; a one-off slot stays inline", () => {
     const plan = planHoistModels(CLI_WITH_SUBAGENT);
@@ -151,9 +185,79 @@ describe("planHoistModels — what gets hoisted", () => {
       "agent",
       "agent.model_pool.candidates[1]",
     ]);
-    // Hoisting a candidate changes its arm id — reported, never silent.
+    // Hoisting a candidate changes its arm id — reported, never silent. The
+    // only opus candidate hoists, so its lines would be re-keyable one-to-one.
     expect(plan.armRewrites).toEqual([{ model: "claude-opus-4-8", profile: "default" }]);
+    expect(plan.armResets).toEqual([]);
     expect(plan.yaml).toContain("{ model: $default, tags: [ strong ] }");
+  });
+
+  test("a model string shared by two pools is a rewrite ONLY when every candidate carrying it hoists to one profile", () => {
+    const plan = planHoistModels(TWO_POOLS);
+    expect(plan.action).toBe("hoist");
+    expect(plan.profiles.map((p) => [p.name, p.model])).toEqual([
+      ["fast", "claude-haiku-4-5"],
+      ["strong", "claude-opus-4-8"],
+    ]);
+    // Both haiku candidates hoist to $fast → every `m: claude-haiku-4-5` line
+    // belongs to a hoisted arm → re-keyable. The writer pool's bare opus
+    // candidate stays inline while the agent pool's opus candidate hoists →
+    // NO rewrite for opus (it would re-key the writer's arms too), a reset.
+    expect(plan.armRewrites).toEqual([{ model: "claude-haiku-4-5", profile: "fast" }]);
+    expect(plan.armResets).toEqual([
+      {
+        model: "claude-opus-4-8",
+        profiles: ["strong"],
+        reason: "1 of 2 candidate(s) with this model stay inline",
+      },
+    ]);
+    expect(armModels(plan)).toEqual(["claude-haiku-4-5", "claude-opus-4-8"]);
+    expect(plan.yaml).toContain("- { model: claude-opus-4-8, tags: [ strong ] }");
+  });
+
+  test("a model string hoisting to TWO profiles is a reset, not a rewrite", () => {
+    // Two repeated opus triples: {opus, high} on agent + a candidate, and
+    // {opus, max_tokens} on two sub-agent candidates. Every opus candidate
+    // hoists, but to different profiles — the lines cannot be split.
+    const twoProfiles = [
+      "name: two-profiles",
+      "target: cli",
+      "agent:",
+      "  model: claude-opus-4-8",
+      "  thinking: { effort: high }",
+      "  instructions: Help.",
+      "  model_pool:",
+      "    candidates:",
+      "      - { model: claude-haiku-4-5 }",
+      "      - { model: claude-opus-4-8, thinking: { effort: high } }",
+      "    policy: learned",
+      "  sub_agents:",
+      "    writer:",
+      "      description: writes",
+      "      instructions: write",
+      "      model: claude-sonnet-4-5",
+      "      model_pool:",
+      "        candidates:",
+      "          - { model: claude-opus-4-8, max_tokens: 2048 }",
+      "          - { model: claude-haiku-4-5 }",
+      "        policy: learned",
+      "    editor:",
+      "      description: edits",
+      "      instructions: edit",
+      "      model: claude-sonnet-4-5",
+      "      model_pool:",
+      "        candidates:",
+      "          - { model: claude-opus-4-8, max_tokens: 2048 }",
+      "          - { model: claude-sonnet-4-5 }",
+      "        policy: learned",
+      "",
+    ].join("\n");
+    const plan = planHoistModels(twoProfiles);
+    expect(plan.action).toBe("hoist");
+    const opusReset = plan.armResets.find((r) => r.model === "claude-opus-4-8");
+    expect(opusReset?.profiles).toHaveLength(2);
+    expect(opusReset?.reason).toContain("hoists to 2 profiles");
+    expect(plan.armRewrites.some((r) => r.model === "claude-opus-4-8")).toBe(false);
   });
 
   test("nothing to hoist when no triple repeats, when a slot is already a $ref, or on a sentinel", () => {
@@ -205,6 +309,7 @@ describe("planHoistModels — IR equality (the contract)", () => {
     ["cli + sub-agents", CLI_WITH_SUBAGENT],
     ["workflow steps", WORKFLOW_TWO_TRIPLES],
     ["pooled agent + candidate", POOLED],
+    ["two pools sharing a model string", TWO_POOLS],
   ] as const) {
     test(`${label}: the hoisted spec lowers identically (modulo provenance)`, () => {
       const plan = planHoistModels(yaml);
@@ -302,25 +407,40 @@ describe("arms.jsonl handling — never silently orphaned", () => {
     }
   });
 
-  test("formatArmNotes prints the reset note without --rewrite-arms and the re-key line with it", () => {
+  test("formatArmNotes: the arm id stays the model string on this runtime; rewrites vs resets are told apart", () => {
     const dir = mkdtempSync(join(tmpdir(), "hoist-arms-"));
     try {
       const path = join(dir, "arms.jsonl");
-      writeFileSync(path, `${line("claude-opus-4-8")}\n`);
-      const plan = planHoistModels(POOLED);
-      const note = formatArmNotes(path, plan);
-      expect(note).toContain("claude-opus-4-8 → $default");
-      expect(note).toContain("(1 line(s) in");
-      expect(note).toContain("learned-history");
-      expect(note).toContain("--rewrite-arms");
-      const applied = formatArmNotes(path, plan, { rewritten: 1 });
-      expect(applied).toContain("re-keyed 1 arm line(s)");
+      writeFileSync(path, `${[line("claude-opus-4-8"), line("claude-haiku-4-5")].join("\n")}\n`);
+      const plan = planHoistModels(TWO_POOLS);
+      const note = formatArmNotes(path, plan, countArmLines(path, armModels(plan)));
+      // What the runtime does TODAY is stated, not the future identity.
+      expect(note).toContain("records pool arms under the model string");
+      expect(note).not.toContain("arm id becomes the profile name");
+      expect(note).toContain(
+        "claude-haiku-4-5 → $fast (1 line(s) recorded): re-keyable one-to-one then.",
+      );
+      expect(note).toContain("claude-opus-4-8 → $strong (1 line(s) recorded): 1 of 2 candidate(s)");
+      expect(note).toContain("learned-history reset");
+      // The flag is refused on this runtime — the note says so instead of offering it.
+      expect(note).toContain("--rewrite-arms is refused on this runtime");
+      expect(note).not.toContain("Add --write --rewrite-arms");
       // No candidate hoisted → nothing to say.
-      expect(formatArmNotes(path, planHoistModels(WORKFLOW_TWO_TRIPLES))).toBe("");
-      // No arms recorded → the identity note only.
-      expect(formatArmNotes(join(dir, "none.jsonl"), plan)).toContain("nothing to re-key");
+      const noPool = planHoistModels(WORKFLOW_TWO_TRIPLES);
+      expect(formatArmNotes(path, noPool, countArmLines(path, armModels(noPool)))).toBe("");
+      // No arms recorded → the identity lines only.
+      const none = join(dir, "none.jsonl");
+      expect(formatArmNotes(none, plan, countArmLines(none, armModels(plan)))).toContain(
+        "nothing to re-key",
+      );
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test("the --rewrite-arms refusal names the runtime gap and the remedy", () => {
+    expect(REWRITE_ARMS_UNAVAILABLE).toContain("profile-keyed scoreboard");
+    expect(REWRITE_ARMS_UNAVAILABLE).toContain("under the model string");
+    expect(REWRITE_ARMS_UNAVAILABLE).toContain("--hoist-models --write");
   });
 });

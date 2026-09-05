@@ -18215,9 +18215,10 @@ async function runUpgrade(args: ParsedArgs): Promise<void> {
         "                   more slots into models: profiles named by price rank and\n" +
         "                   rewrite the slots to $refs (a proposal; the lowered IR is\n" +
         "                   identical). Prints the diff; --write applies it.\n" +
-        "  --rewrite-arms   with --write --hoist-models: re-key .crewhaus/routing/arms.jsonl\n" +
-        "                   lines whose candidate became a profile (otherwise the note\n" +
-        "                   explains the learned-history reset for those arms).\n" +
+        "  --rewrite-arms   re-key .crewhaus/routing/arms.jsonl lines whose candidate became\n" +
+        "                   a profile. REFUSED on this runtime: pool arms are recorded under\n" +
+        "                   the model string until the profile-keyed scoreboard ships, so\n" +
+        "                   --hoist-models prints what each hoisted arm id will do instead.\n" +
         "  --write   apply in place (rewrites the spec file), then register the new\n" +
         "            version + changelog entry in .crewhaus/specs like `compile` does.\n",
     );
@@ -18227,6 +18228,12 @@ async function runUpgrade(args: ParsedArgs): Promise<void> {
   const hoistModels = args.flags["hoist-models"] === true;
   const rewriteArms = args.flags["rewrite-arms"] === true;
   if (rewriteArms && !hoistModels) die("--rewrite-arms requires --hoist-models");
+  if (rewriteArms) {
+    // §7.9: arm identity by profile name is the routing PR's; this runtime
+    // records arms under the model string, so re-keying would orphan them.
+    const { REWRITE_ARMS_UNAVAILABLE } = await import("./hoist-models");
+    die(REWRITE_ARMS_UNAVAILABLE);
+  }
   const specArg = args.positional[0];
   const absSpec = resolve(
     typeof specArg === "string" ? specArg : join(process.cwd(), "crewhaus.yaml"),
@@ -18262,9 +18269,8 @@ async function runUpgrade(args: ParsedArgs): Promise<void> {
         "hoist-models: skipped — resolve the schema-version problem above first.\n",
       );
     } else {
-      const { planHoistModels, formatHoistPlan, formatArmNotes, rewriteArmsFile } = await import(
-        "./hoist-models"
-      );
+      const { planHoistModels, formatHoistPlan, formatArmNotes, countArmLines, armModels } =
+        await import("./hoist-models");
       let hoist: ReturnType<typeof planHoistModels>;
       try {
         hoist = planHoistModels(finalYaml, { pricing: loadUserPricing() });
@@ -18276,13 +18282,12 @@ async function runUpgrade(args: ParsedArgs): Promise<void> {
       if (hoist.action === "hoist") {
         finalYaml = hoist.yaml;
         const armsPath = join(dirname(absSpec), ".crewhaus", "routing", "arms.jsonl");
-        // Arm identity: re-key under a single-writer swap when asked, else
-        // print the learned-history note. Read the counts BEFORE rewriting.
-        const outcome =
-          write && rewriteArms
-            ? { rewritten: rewriteArmsFile(armsPath, hoist.armRewrites).rewritten }
-            : {};
-        process.stdout.write(formatArmNotes(armsPath, hoist, outcome));
+        // Arm identity: the runtime keys arms by model string, so the file is
+        // never touched here — the note reports what each hoisted arm id will
+        // do once profile-keyed identity ships (`--rewrite-arms` was refused
+        // above). Counts are read once, before anything could rewrite them.
+        const counts = countArmLines(armsPath, armModels(hoist));
+        process.stdout.write(formatArmNotes(armsPath, hoist, counts));
       }
     }
   }

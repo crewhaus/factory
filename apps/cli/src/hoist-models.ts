@@ -22,13 +22,23 @@
  * that, `default` when only one triple repeats. Unpriceable models (local /
  * azure / named hosts) rank last in declaration order.
  *
- * ARM IDENTITY (§7.9, §9.2): a pool candidate's scoreboard arm id is the
- * model string today and the PROFILE NAME once it references one. Hoisting a
- * candidate therefore changes its arm id, and `arms.jsonl` history under the
- * old id would be orphaned. The plan reports every such rewrite; the CLI
- * wrapper either re-keys the lines (`--rewrite-arms`, a write-then-rename
- * single-writer swap via {@link rewriteArmsFile}) or prints the
- * "learned history reset" note — it never orphans arms silently.
+ * ARM IDENTITY (§7.9, §9.2): the runtime on this branch records and scores a
+ * pool candidate's scoreboard arm under its MODEL STRING
+ * (`sb.record(routeKey, modelString, …)` in runtime-core; the policy router's
+ * score lookup is `(routeKey, modelString)`). §7.9 makes the arm id the
+ * PROFILE NAME once a candidate references one — that lands with the routing
+ * PR, not here. So on this runtime a hoisted candidate keeps learning under
+ * the model string, and its arm id changes (orphaning `arms.jsonl` history
+ * under the old id) only when profile-keyed identity ships. The plan reports
+ * every candidate whose arm id WILL change, split into the ones whose lines
+ * could be re-keyed one-to-one ({@link HoistPlan.armRewrites}) and the ones
+ * that cannot ({@link HoistPlan.armResets}: the same model string also
+ * serves a candidate that stays inline, or two profiles, and `arms.jsonl`
+ * lines carry no pool identity to split on). The CLI prints the note; it
+ * REFUSES `--rewrite-arms` ({@link REWRITE_ARMS_UNAVAILABLE}) because
+ * re-keying `m` today would orphan exactly the history the flag exists to
+ * keep. {@link rewriteArmsFile} — the write-then-rename single-writer swap —
+ * is the machinery the routing PR wires in once the runtime keys by profile.
  *
  * The IR-equality contract — the hoisted spec lowers to the same IR as the
  * source, modulo the provenance the registry adds (`models`, `modelProfile`,
@@ -78,11 +88,31 @@ export type HoistProfile = {
   readonly slots: ReadonlyArray<HoistSlot>;
 };
 
+/**
+ * A model string whose `arms.jsonl` lines could be re-keyed one-to-one:
+ * EVERY inline candidate carrying it (across all pools in the spec) hoists to
+ * the same profile, so no line under `m: <model>` belongs to an arm that
+ * keeps the model string.
+ */
 export type HoistArmRewrite = {
   /** The candidate's model string — its arm id before hoisting. */
   readonly model: string;
-  /** The profile name — its arm id after hoisting. */
+  /** The profile name — its arm id once profile-keyed identity ships. */
   readonly profile: string;
+};
+
+/**
+ * A model string whose lines CANNOT be re-keyed: some candidate carrying it
+ * stays inline, or hoisted candidates went to different profiles. `arms.jsonl`
+ * lines carry the routeKey and the arm id only — no pool identity — so the
+ * history for that model string is a learned-history reset for the hoisted
+ * arms when profile-keyed identity ships.
+ */
+export type HoistArmReset = {
+  readonly model: string;
+  /** Profiles candidates with this model hoist to (declaration order). */
+  readonly profiles: ReadonlyArray<string>;
+  readonly reason: string;
 };
 
 export type HoistPlan = {
@@ -94,8 +124,10 @@ export type HoistPlan = {
   /** The rewritten YAML (comment- and key-order-preserving); the input when nothing was hoisted. */
   readonly yaml: string;
   readonly diff: ReadonlyArray<SpecDiffEntry>;
-  /** Candidate arm-id changes the caller must handle (rewrite or reset note). */
+  /** Hoisted candidates whose arm lines could be re-keyed one-to-one (see {@link HoistArmRewrite}). */
   readonly armRewrites: ReadonlyArray<HoistArmRewrite>;
+  /** Hoisted candidates whose arm lines cannot be re-keyed (see {@link HoistArmReset}). */
+  readonly armResets: ReadonlyArray<HoistArmReset>;
 };
 
 export type PlanHoistModelsOptions = {
@@ -236,14 +268,16 @@ export function planHoistModels(yamlText: string, opts: PlanHoistModelsOptions =
     yaml: yamlText,
     diff: [],
     armRewrites: [],
+    armResets: [],
   });
   const parsed = parseYaml(yamlText) as unknown;
   if (!isRecord(parsed)) return nothing("spec is not a YAML mapping");
   const spec = parsed as SpecObject;
 
   // Group by triple; keep only groups with two or more slots.
+  const slots = enumerateHoistSlots(spec);
   const groups = new Map<string, HoistSlot[]>();
-  for (const slot of enumerateHoistSlots(spec)) {
+  for (const slot of slots) {
     const key = signatureOf(slot);
     const g = groups.get(key) ?? [];
     g.push(slot);
@@ -281,8 +315,18 @@ export function planHoistModels(yamlText: string, opts: PlanHoistModelsOptions =
   }));
 
   const edits: SpecEdit[] = [];
-  const armRewrites: HoistArmRewrite[] = [];
-  const seenRewrite = new Set<string>();
+  // Arm coverage per model string: how many inline candidates carry it in the
+  // WHOLE spec (every pool) vs how many this plan hoists, and to which
+  // profiles. `arms.jsonl` lines are keyed by routeKey + arm id only, so a
+  // model string's lines can be re-keyed one-to-one only when every
+  // candidate carrying it hoists to one profile. Candidates already written
+  // as `$ref` are not counted: their arm id is the profile, not the model.
+  const candidateTotals = new Map<string, number>();
+  for (const slot of slots) {
+    if (slot.kind !== "candidate") continue;
+    candidateTotals.set(slot.model, (candidateTotals.get(slot.model) ?? 0) + 1);
+  }
+  const hoisted = new Map<string, { count: number; profiles: string[] }>();
   for (const p of profiles) {
     edits.push({
       path: ["models", p.name],
@@ -297,10 +341,27 @@ export function planHoistModels(yamlText: string, opts: PlanHoistModelsOptions =
       edits.push({ path: [...slot.path, "model"], value: `$${p.name}` });
       if (slot.thinking !== undefined) edits.push({ path: [...slot.path, "thinking"] });
       if (slot.max_tokens !== undefined) edits.push({ path: [...slot.path, "max_tokens"] });
-      if (slot.kind === "candidate" && !seenRewrite.has(slot.model)) {
-        seenRewrite.add(slot.model);
-        armRewrites.push({ model: slot.model, profile: p.name });
+      if (slot.kind === "candidate") {
+        const h = hoisted.get(slot.model) ?? { count: 0, profiles: [] };
+        h.count += 1;
+        if (!h.profiles.includes(p.name)) h.profiles.push(p.name);
+        hoisted.set(slot.model, h);
       }
+    }
+  }
+  const armRewrites: HoistArmRewrite[] = [];
+  const armResets: HoistArmReset[] = [];
+  for (const [model, h] of hoisted) {
+    const total = candidateTotals.get(model) ?? h.count;
+    const firstProfile = h.profiles[0] as string;
+    if (h.profiles.length === 1 && h.count === total) {
+      armRewrites.push({ model, profile: firstProfile });
+    } else {
+      const reason =
+        h.profiles.length > 1
+          ? `hoists to ${h.profiles.length} profiles (${h.profiles.map((n) => `$${n}`).join(", ")})`
+          : `${total - h.count} of ${total} candidate(s) with this model stay inline`;
+      armResets.push({ model, profiles: h.profiles, reason });
     }
   }
 
@@ -312,6 +373,7 @@ export function planHoistModels(yamlText: string, opts: PlanHoistModelsOptions =
     yaml,
     diff: diffSpecYaml(yamlText, yaml),
     armRewrites,
+    armResets,
   };
 }
 
@@ -342,9 +404,7 @@ export function formatHoistPlan(plan: HoistPlan, write: boolean): string {
   lines.push("  the hoisted spec lowers to the same IR (profiles are a lower-time macro).");
   lines.push("");
   lines.push(
-    write
-      ? "  applied — spec rewritten in place."
-      : "  dry-run — re-run with --write to apply (--write --rewrite-arms also re-keys learned history).",
+    write ? "  applied — spec rewritten in place." : "  dry-run — re-run with --write to apply.",
   );
   return `${lines.join("\n")}\n`;
 }
@@ -379,12 +439,35 @@ export function countArmLines(armsPath: string, models: ReadonlyArray<string>): 
 }
 
 /**
+ * Why the CLI refuses `--rewrite-arms` on this runtime. Re-keying `m` from
+ * the model string to the profile name is right only once the scoreboard
+ * records and reads arms under the profile name (§7.9, the routing PR);
+ * today it would move the lines out from under the arm that is still
+ * learning under the model string.
+ */
+export const REWRITE_ARMS_UNAVAILABLE =
+  "--rewrite-arms needs the profile-keyed scoreboard (0.6.0 routing PR); this runtime records " +
+  "pool arms under the model string, so re-keying arms.jsonl today would orphan the history it is " +
+  "meant to keep. Run upgrade --hoist-models --write without it (the pool keeps learning under the " +
+  "model string), and re-key after upgrading to a CLI whose arm id is the profile name.";
+
+/** Every model string whose arm lines the plan reports on (rewrites, then resets). */
+export function armModels(plan: HoistPlan): ReadonlyArray<string> {
+  return [...plan.armRewrites.map((r) => r.model), ...plan.armResets.map((r) => r.model)];
+}
+
+/**
  * Re-key `arms.jsonl` lines from a candidate's model string to its new
  * profile name (`m` on delta and aggregate lines alike; the routeKey `k`
  * does not embed the model). Write-then-rename — the `compact()` pattern —
  * so a concurrent reader sees the old file or the new one, never a torn
  * one. Lines that do not parse are carried through verbatim. Returns the
  * line counts; a no-op when the file is absent.
+ *
+ * NOT wired to the CLI on this runtime (see {@link REWRITE_ARMS_UNAVAILABLE});
+ * the routing PR connects it once arms are recorded under the profile name.
+ * Callers must pass only {@link HoistPlan.armRewrites} — never a reset — and
+ * read {@link countArmLines} BEFORE calling, since the counts move with `m`.
  */
 export function rewriteArmsFile(
   armsPath: string,
@@ -419,39 +502,39 @@ export function rewriteArmsFile(
 
 /**
  * The "learned history" lines the CLI prints for a hoist that touches pool
- * candidates: what each rewrite does to the scoreboard and how to keep the
- * history (`--rewrite-arms`) or accept the reset. Empty when no candidate
- * was hoisted; an absent arms file still gets the one-line identity note.
+ * candidates: on this runtime the arm id stays the model string, so nothing
+ * happens to the scoreboard now; the note says which arm ids WILL change once
+ * profile-keyed identity ships, which of those could be re-keyed one-to-one
+ * then, and which are a reset regardless. `counts` is the caller's
+ * {@link countArmLines} read — taken before any rewrite, so the numbers
+ * describe the file as the user knew it. Empty when no candidate was
+ * hoisted; an absent arms file still gets the identity lines.
  */
-export function formatArmNotes(
-  armsPath: string,
-  plan: HoistPlan,
-  outcome: { readonly rewritten?: number } = {},
-): string {
-  if (plan.armRewrites.length === 0) return "";
-  const lines: string[] = ["  learned history (scoreboard arm identity):"];
-  const counts = countArmLines(
-    armsPath,
-    plan.armRewrites.map((r) => r.model),
-  );
+export function formatArmNotes(armsPath: string, plan: HoistPlan, counts: ArmLineCounts): string {
+  if (plan.armRewrites.length === 0 && plan.armResets.length === 0) return "";
+  const lines: string[] = [
+    "  learned history (scoreboard arm identity):",
+    "    this runtime records pool arms under the model string — hoisting changes nothing in",
+    `    ${armsPath} today; the arm id WILL be the profile name once profile-keyed identity ships.`,
+  ];
+  const where = (model: string): string => {
+    const n = counts.get(model) ?? 0;
+    return n > 0 ? ` (${n} line(s) recorded)` : "";
+  };
   for (const r of plan.armRewrites) {
-    const n = counts.get(r.model) ?? 0;
+    lines.push(`    ${r.model} → $${r.profile}${where(r.model)}: re-keyable one-to-one then.`);
+  }
+  for (const r of plan.armResets) {
     lines.push(
-      `    ${r.model} → $${r.profile}: arm id becomes the profile name${
-        n > 0 ? ` (${n} line(s) in ${armsPath})` : ""
-      }`,
+      `    ${r.model} → ${r.profiles.map((n) => `$${n}`).join(", ")}${where(r.model)}: ${r.reason} — the`,
+      "    lines cannot be split by pool; a learned-history reset for the hoisted arm(s) then.",
     );
   }
   const any = [...counts.values()].some((n) => n > 0);
-  if (outcome.rewritten !== undefined) {
-    lines.push(`    re-keyed ${outcome.rewritten} arm line(s) in place (write-then-rename swap).`);
-  } else if (any) {
-    lines.push(
-      "    NOTE: without --rewrite-arms those lines stay under the old id — a learned-history",
-      "    reset for these arms (the pool re-learns them). Add --write --rewrite-arms to re-key.",
-    );
-  } else {
-    lines.push("    no recorded arms under those ids — nothing to re-key.");
-  }
+  lines.push(
+    any
+      ? "    --rewrite-arms is refused on this runtime (it would orphan those lines); re-key after upgrading."
+      : "    no recorded arms under those ids — nothing to re-key.",
+  );
   return `${lines.join("\n")}\n`;
 }
