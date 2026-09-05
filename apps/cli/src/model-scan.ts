@@ -6,6 +6,7 @@ import {
   type ModelCandidate,
   type PricingTable,
   classifyPricingStaleness,
+  effectiveSunsets,
   enumerateCandidates,
   findSunset,
   resolvePricing,
@@ -255,6 +256,9 @@ export function buildModelChecks(
   const models: Array<{ slot: string; model: string }> = [];
   if (agentModel !== undefined) models.push({ slot: "agent.model", model: agentModel });
   for (const aux of opts.auxModels ?? []) models.push({ slot: aux.slot, model: aux.model });
+  // 0.6.0 §9.1 — the compiled-in sunsets plus whatever the installed feed
+  // carries, so `pricing sync` installs a new sunset without a release.
+  const sunsets = effectiveSunsets(pricing);
 
   for (const { slot, model } of models) {
     const parsed = parsedModelForTables(model);
@@ -279,13 +283,13 @@ export function buildModelChecks(
       checks.push({ label: `${slot} pricing (${model})`, pass: true });
     }
     // Sunset watch.
-    const sunset = findSunset(parsed.provider, parsed.modelId);
+    const sunset = findSunset(parsed.provider, parsed.modelId, sunsets);
     if (sunset !== undefined) {
       checks.push({
         label: `${slot} sunset (${model})`,
         pass: true,
         warn: true,
-        reason: `retires ${sunset.retiresOn} — migrate to ${sunset.replacement}${sunset.note !== undefined ? ` (${sunset.note})` : ""}`,
+        reason: `retires ${sunset.retiresOn} — migrate to ${sunset.replacement}${sunset.note !== undefined ? ` (${sunset.note})` : ""}${sunset.source === "feed" ? " [from the installed pricing feed]" : ""}`,
       });
     }
   }

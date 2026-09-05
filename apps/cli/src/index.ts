@@ -1425,7 +1425,12 @@ import {
 // Item 43 — `crewhaus upgrade`: single-spec version-drift detection + validated
 // migration chain, in a side-effect-free module so this entry file stays
 // testable.
-import { formatUpgradePlan, makeSpecValidator, planUpgrade } from "./upgrade";
+import {
+  buildSpecVersionCheck,
+  formatUpgradePlan,
+  makeSpecValidator,
+  planUpgrade,
+} from "./upgrade";
 // The top-level `crewhaus` help text — pure string data (~31 KB), so it lives
 // beside this entry file rather than in it. `usage()`/`help()` below still own
 // the stream + exit code.
@@ -5974,6 +5979,14 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
     checks.push(...buildChannelEnvChecks(specText, process.env));
   }
 
+  // 0.6.0 §9.2 — the spec/CLI schema-version drift signal. A spec behind (or
+  // ahead of) this CLI still compiles — the check is a WARN with the exact
+  // `crewhaus upgrade` / `chvm use latest` remedy, never a failure.
+  if (specText !== undefined) {
+    const { createDefaultEngine } = await import("@crewhaus/migration-engine");
+    checks.push(buildSpecVersionCheck(specText, createDefaultEngine()));
+  }
+
   // v0.3.0 Goal 6 — `--probe`: opt-in ~1-token live call per configured
   // provider (the spec's model verbatim + cheap defaults for other
   // configured providers), catching unfunded/invalid keys pre-run. Failures
@@ -6190,6 +6203,14 @@ async function runPricing(args: ParsedArgs, action: string): Promise<void> {
   process.stdout.write(
     `  ${providers} provider table(s); the newest dated feed here now overrides DEFAULT_PRICING\n`,
   );
+  // 0.6.0 §9.1 — a feed may carry sunsets; they install with it and reach
+  // `doctor --models` through `effectiveSunsets` (advisory, never a gate).
+  const sunsetCount = Object.values(table.sunsets ?? {}).reduce((n, list) => n + list.length, 0);
+  if (sunsetCount > 0) {
+    process.stdout.write(
+      `  ${sunsetCount} sunset announcement(s) installed — \`crewhaus doctor --models\` now warns on them\n`,
+    );
+  }
 }
 
 /**
@@ -17850,7 +17871,12 @@ function createGitPrDriver(): GitPrDriver {
 async function runMigrateAll(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus migrate-all --from <ver> --to <ver> [--dry-run] [--root-dir <dir>]\n",
+      "usage: crewhaus migrate-all --from <ver> --to <ver> [--dry-run] [--root-dir <dir>]\n" +
+        "  Walk every spec in the registry (default .crewhaus/specs) to --to, writing a new\n" +
+        "  version per spec (old versions stay for rollback). Comment-preserving; each\n" +
+        "  migrated spec is validated via parseSpec before it is written.\n" +
+        "  --from > --to is a DOWNWARD run: specs above --to are walked down, and a step\n" +
+        "  marked irreversible is reported as validate-fail instead of skipped.\n",
     );
     return;
   }
@@ -17870,18 +17896,23 @@ async function runMigrateAll(args: ParsedArgs): Promise<void> {
   const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
   const { createDefaultEngine } = await import("@crewhaus/migration-engine");
   const { migrateAll } = await import("@crewhaus/migration-runner");
+  // 0.6.0 §9.2 — the fleet path finally validates: every migrated spec must
+  // parse through the LIVE Zod union before the runner writes it (the gap
+  // `upgrade` closed for single specs). The writer is comment-preserving too.
   const result = await migrateAll({
     registry: createFileBackedRegistry({ rootDir }),
     engine: createDefaultEngine(),
     fromVersion,
     toVersion,
     dryRun,
+    validate: makeSpecValidator(parseSpec),
   });
   for (const item of result.plan) {
     const arrow = item.newVersion ? ` → ${item.newVersion}` : "";
     const err = item.error ? `   ERROR: ${item.error}` : "";
+    const flattened = item.commentsPreserved === false ? "   (comments re-serialised)" : "";
     process.stdout.write(
-      `${item.action.padEnd(15)} ${item.name}@${item.latestVersion}${arrow}${err}\n`,
+      `${item.action.padEnd(15)} ${item.name}@${item.latestVersion}${arrow}${err}${flattened}\n`,
     );
   }
   const dryNote = dryRun ? " (dry-run)" : "";
@@ -18170,18 +18201,32 @@ async function runIncidentCollect(args: ParsedArgs): Promise<void> {
 async function runUpgrade(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus upgrade [spec.yaml] [--dry-run] [--write]\n" +
+      "usage: crewhaus upgrade [spec.yaml] [--dry-run] [--write] [--hoist-models [--rewrite-arms]]\n" +
         "  Detect the spec's schema-version drift vs this CLI's current spec version\n" +
         "  and run the migration chain (each migrated spec is validated via parseSpec\n" +
         "  before it can be written). Defaults to ./crewhaus.yaml and to a dry-run diff.\n" +
-        "  Also prints the 0.2.x → 0.3.0 release notes that apply to this spec\n" +
-        "  (default-on continuity + the `continuity: false` pin, `crewhaus migrate\n" +
-        "  memories`, MCP env/header secret lowering) — informational only.\n" +
-        "  --write   apply the migration in place (rewrites the spec file).\n",
+        "  The migration is comment- and key-order-preserving (0.6.0: each step is a\n" +
+        "  list of CST edits, not a re-serialised object).\n" +
+        "  Also prints the per-release notes that apply to this spec — 0.2.x → 0.3.0\n" +
+        "  (default-on continuity, `crewhaus migrate memories`, MCP secret lowering)\n" +
+        "  and 0.5.x → 0.6.0 (crew per-role pools live, budget on every model call,\n" +
+        "  judge spend under judge_share) — informational only.\n" +
+        "  --hoist-models   lift {model, thinking, max_tokens} triples repeated on two or\n" +
+        "                   more slots into models: profiles named by price rank and\n" +
+        "                   rewrite the slots to $refs (a proposal; the lowered IR is\n" +
+        "                   identical). Prints the diff; --write applies it.\n" +
+        "  --rewrite-arms   with --write --hoist-models: re-key .crewhaus/routing/arms.jsonl\n" +
+        "                   lines whose candidate became a profile (otherwise the note\n" +
+        "                   explains the learned-history reset for those arms).\n" +
+        "  --write   apply in place (rewrites the spec file), then register the new\n" +
+        "            version + changelog entry in .crewhaus/specs like `compile` does.\n",
     );
     return;
   }
   const write = args.flags["write"] === true;
+  const hoistModels = args.flags["hoist-models"] === true;
+  const rewriteArms = args.flags["rewrite-arms"] === true;
+  if (rewriteArms && !hoistModels) die("--rewrite-arms requires --hoist-models");
   const specArg = args.positional[0];
   const absSpec = resolve(
     typeof specArg === "string" ? specArg : join(process.cwd(), "crewhaus.yaml"),
@@ -18198,11 +18243,56 @@ async function runUpgrade(args: ParsedArgs): Promise<void> {
   // The validate callback the CLI's migrate-all never wired: a migrated spec
   // must parse through the LIVE Zod union before it can be written back.
   const plan = planUpgrade(yamlText, engine, makeSpecValidator(parseSpec));
-
-  if (plan.action === "upgrade" && write && plan.migratedYaml !== undefined) {
-    writeFileSync(absSpec, plan.migratedYaml);
-  }
   process.stdout.write(formatUpgradePlan(plan, write));
+
+  // The text every later stage builds on: the migrated YAML when a migration
+  // is pending, the file as-is when it is current. `ahead` / `validate-fail`
+  // leave nothing safe to build on.
+  let finalYaml: string | undefined =
+    plan.action === "upgrade"
+      ? plan.migratedYaml
+      : plan.action === "up-to-date"
+        ? yamlText
+        : undefined;
+
+  // 0.6.0 §9.2 — `--hoist-models`: a proposal by default, applied under --write.
+  if (hoistModels) {
+    if (finalYaml === undefined) {
+      process.stdout.write(
+        "hoist-models: skipped — resolve the schema-version problem above first.\n",
+      );
+    } else {
+      const { planHoistModels, formatHoistPlan, formatArmNotes, rewriteArmsFile } = await import(
+        "./hoist-models"
+      );
+      let hoist: ReturnType<typeof planHoistModels>;
+      try {
+        hoist = planHoistModels(finalYaml, { pricing: loadUserPricing() });
+      } catch (err) {
+        if (err instanceof CrewhausError) die(`hoist-models: ${err.message}`);
+        throw err;
+      }
+      process.stdout.write(formatHoistPlan(hoist, write));
+      if (hoist.action === "hoist") {
+        finalYaml = hoist.yaml;
+        const armsPath = join(dirname(absSpec), ".crewhaus", "routing", "arms.jsonl");
+        // Arm identity: re-key under a single-writer swap when asked, else
+        // print the learned-history note. Read the counts BEFORE rewriting.
+        const outcome =
+          write && rewriteArms
+            ? { rewritten: rewriteArmsFile(armsPath, hoist.armRewrites).rewritten }
+            : {};
+        process.stdout.write(formatArmNotes(armsPath, hoist, outcome));
+      }
+    }
+  }
+
+  if (write && finalYaml !== undefined && finalYaml !== yamlText) {
+    writeFileSync(absSpec, finalYaml);
+    // Register + changelog the rewritten spec exactly as `compile` does, so
+    // `spec log` shows the upgrade as a version rather than a silent edit.
+    await autoRegisterSpec(finalYaml);
+  }
   // A migration/validation failure is a non-zero exit so CI can gate on it.
   process.exit(plan.action === "validate-fail" ? 1 : 0);
 }

@@ -26,6 +26,25 @@ export type PricingRow = {
   readonly cacheWritePer1M?: number;
 };
 
+/**
+ * One known model SUNSET: `retiresOn` is the provider's announced end-of-life
+ * date (YYYY-MM-DD), `replacement` the recommended successor. Keyed on the
+ * same family-prefix grammar as the pricing rows. `source` says where the
+ * entry came from — the compiled-in `KNOWN_SUNSETS` table or an installed
+ * pricing feed's `sunsets` section (0.6.0 §9.1): feed-sourced sunsets are
+ * advisory only (they may warn, never fail a gate), so a fetched feed can
+ * never flip an exit code.
+ */
+export type SunsetEntry = {
+  readonly modelIdPrefix: string;
+  readonly retiresOn: string;
+  readonly replacement: string;
+  readonly note?: string;
+  readonly source?: "builtin" | "feed";
+};
+
+export type SunsetTable = Readonly<Record<string, readonly SunsetEntry[]>>;
+
 export type PricingTable = {
   readonly version: string;
   readonly providers: {
@@ -33,6 +52,13 @@ export type PricingTable = {
       readonly [modelIdPrefix: string]: PricingRow;
     };
   };
+  /**
+   * 0.6.0 §9.1 — optional per-provider sunset announcements carried by a
+   * pricing FEED, so `crewhaus pricing sync` installs new sunsets without a
+   * code release. Merged over the compiled-in table by
+   * {@link effectiveSunsets} (feed.ts). Absent on the built-in table.
+   */
+  readonly sunsets?: SunsetTable;
 };
 
 /**
