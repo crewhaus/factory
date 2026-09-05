@@ -11,4 +11,4 @@ export type {
   OpenAIAdapterOptions,
 } from "./adapter.js";
 export { translateOpenAIStream } from "./stream.js";
-export { toOpenAIChatParams } from "./translate.js";
+export { openAIEffectiveParams, toOpenAIChatParams } from "./translate.js";

@@ -30,7 +30,12 @@
  * empty account fails every call identically, so accruing five failures is
  * pure wasted latency. Tune via the `isFatal` option.
  */
-import type { ProviderAdapter, ProviderRequest, StreamEvent } from "@crewhaus/adapter-anthropic";
+import type {
+  EffectiveParams,
+  ProviderAdapter,
+  ProviderRequest,
+  StreamEvent,
+} from "@crewhaus/adapter-anthropic";
 import { CrewhausError } from "@crewhaus/errors";
 import type { CircuitStateChangedEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
 
@@ -228,6 +233,18 @@ export function wrap(adapter: ProviderAdapter, opts: CircuitBreakerOptions = {})
     providerId: adapter.providerId,
     features: adapter.features,
     estimateTokens: adapter.estimateTokens.bind(adapter),
+    // 0.6.0 §8.1 — forward the optional effective-params projection. The
+    // breaker never changes what goes on the wire (it only refuses to stream
+    // when open), so the wrapped adapter's prediction IS the wrapper's. Kept
+    // absent when the wrapped adapter lacks the method, so "the adapter
+    // provides it" stays observable through the wrap.
+    ...(adapter.effectiveParams !== undefined
+      ? {
+          effectiveParams(req: ProviderRequest): EffectiveParams | undefined {
+            return adapter.effectiveParams?.(req);
+          },
+        }
+      : {}),
 
     stream(req: ProviderRequest): AsyncIterable<StreamEvent> {
       checkCooldown();

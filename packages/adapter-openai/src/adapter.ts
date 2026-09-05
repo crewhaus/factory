@@ -20,6 +20,7 @@
 
 import type {
   CanonicalMessage,
+  EffectiveParams,
   ProviderAdapter,
   ProviderFeatures,
   ProviderRequest,
@@ -29,7 +30,7 @@ import { AdapterError, ProviderAuthError } from "@crewhaus/errors";
 import { estimateTokens as tokenBudgetEstimate } from "@crewhaus/token-budget";
 import OpenAI, { AzureOpenAI } from "openai";
 import { translateOpenAIStream } from "./stream.js";
-import { toOpenAIChatParams } from "./translate.js";
+import { openAIEffectiveParams, toOpenAIChatParams } from "./translate.js";
 
 // Local alias so we don't pull `@anthropic-ai/sdk` as a dep just for the
 // shape token-budget happens to accept (canonical message ≅ Anthropic).
@@ -94,6 +95,11 @@ export class OpenAIAdapter implements ProviderAdapter {
     // Heuristic only; canonical shape mirrors Anthropic's so the same
     // estimator applies.
     return tokenBudgetEstimate(messages as readonly AnthropicMessageParamLike[]);
+  }
+
+  /** 0.6.0 §8.1 — see `openAIEffectiveParams`; pure, no network. */
+  effectiveParams(req: ProviderRequest): EffectiveParams {
+    return openAIEffectiveParams(req);
   }
 }
 

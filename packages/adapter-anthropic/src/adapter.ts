@@ -16,9 +16,10 @@ import { AdapterError } from "@crewhaus/errors";
 import { estimateTokens as tokenBudgetEstimate } from "@crewhaus/token-budget";
 import { resolveAuth } from "./auth.js";
 import { createAnthropicClient } from "./client.js";
-import { rawEventToCanonical, toAnthropicParams } from "./translate.js";
+import { anthropicEffectiveParams, rawEventToCanonical, toAnthropicParams } from "./translate.js";
 import type {
   CanonicalMessage,
+  EffectiveParams,
   ProviderAdapter,
   ProviderFeatures,
   ProviderRequest,
@@ -94,6 +95,11 @@ export class AnthropicAdapter implements ProviderAdapter {
     // Canonical message shape is structurally compatible with Anthropic's;
     // token-budget walks the same fields either way.
     return tokenBudgetEstimate(messages as readonly Anthropic.MessageParam[]);
+  }
+
+  /** 0.6.0 §8.1 — see `anthropicEffectiveParams`; pure, no network. */
+  effectiveParams(req: ProviderRequest): EffectiveParams {
+    return anthropicEffectiveParams(req, this.isOAuth);
   }
 }
 

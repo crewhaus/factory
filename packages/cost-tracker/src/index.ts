@@ -75,19 +75,28 @@ export {
 export {
   blendedPer1M,
   CHEAPEST_SENTINEL,
+  crossesProvider,
   enumerateCandidates,
   familyPrefixOf,
+  isModelSentinel,
   providerOfSpecString,
   rankRightSizeProposals,
   resolveCheapest,
   resolveCheapestForSlot,
+  resolveStrongest,
+  resolveStrongestForSlot,
+  resolveStrongestFromRoster,
   specStringFor,
+  STRONGEST_SENTINEL,
   type CandidateProvider,
   type EnumerateCandidatesOptions,
   type ModelCandidate,
+  type ModelSentinel,
   type RankedRightSize,
   type RightSizeBaseline,
   type RightSizeProposal,
+  type RosterMember,
+  type StrongestResolution,
 } from "./candidates";
 
 export type RunCostSummary = {

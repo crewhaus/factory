@@ -7,4 +7,4 @@
 export { GeminiAdapter, createGeminiAdapter } from "./adapter.js";
 export type { GeminiAdapterOptions } from "./adapter.js";
 export { translateGeminiStream } from "./stream.js";
-export { toGeminiParams } from "./translate.js";
+export { geminiEffectiveParams, toGeminiParams } from "./translate.js";

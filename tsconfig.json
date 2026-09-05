@@ -44,6 +44,7 @@
     { "path": "./packages/adapter-gemini" },
     { "path": "./packages/adapter-bedrock" },
     { "path": "./packages/tool-schema-sanitizer" },
+    { "path": "./packages/model-plan" },
     { "path": "./packages/model-router" },
     { "path": "./packages/permission-engine" },
     { "path": "./packages/abort-controller" },

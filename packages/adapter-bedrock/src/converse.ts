@@ -40,6 +40,8 @@ import type {
   CanonicalImageBlockParam,
   CanonicalMessage,
   CanonicalToolResultBlockParam,
+  DroppedRequestParam,
+  EffectiveParams,
   ProviderRequest,
   StreamEvent,
   TokenUsage,
@@ -102,6 +104,34 @@ export function buildConverseRequest(req: ProviderRequest): ConverseStreamComman
   }
 
   return input;
+}
+
+/**
+ * 0.6.0 §8.1 — project `buildConverseRequest` onto the params a route can
+ * differ on. Converse maps `maxTokens` and `temperature` natively and has NO
+ * cross-vendor reasoning control (see the module header), so any
+ * `thinking` / `reasoningEffort` the request carries is reported dropped —
+ * the drop the header documents, now visible to the caller.
+ */
+export function converseEffectiveParams(req: ProviderRequest): EffectiveParams {
+  const input = buildConverseRequest(req);
+  const dropped: DroppedRequestParam[] = [];
+  const notes: string[] = [];
+  if (req.thinking !== undefined) dropped.push("thinking");
+  if (req.reasoningEffort !== undefined) dropped.push("reasoningEffort");
+  if (dropped.length > 0) {
+    notes.push(
+      "reasoning controls dropped: Bedrock Converse has no cross-vendor thinking budget or effort control",
+    );
+  }
+  const cfg = input.inferenceConfig;
+  return {
+    model: input.modelId ?? req.model,
+    maxTokens: cfg?.maxTokens ?? req.maxTokens,
+    ...(cfg?.temperature !== undefined ? { temperature: cfg.temperature } : {}),
+    dropped,
+    ...(notes.length > 0 ? { notes } : {}),
+  };
 }
 
 function toConverseToolChoice(tc: ToolChoice): ConverseToolChoice {

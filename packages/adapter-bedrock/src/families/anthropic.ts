@@ -21,6 +21,8 @@ import {
 } from "@crewhaus/adapter-anthropic";
 import type {
   CanonicalTextBlockParam,
+  DroppedRequestParam,
+  EffectiveParams,
   ProviderRequest,
   StreamEvent,
 } from "@crewhaus/adapter-anthropic";
@@ -106,6 +108,43 @@ export function buildAnthropicBedrockBody(req: ProviderRequest): AnthropicBedroc
     body.temperature = req.temperature;
   }
   return body as AnthropicBedrockBody;
+}
+
+/**
+ * 0.6.0 §8.1 — project `buildAnthropicBedrockBody` onto the params a route
+ * can differ on. Same drop rules as adapter-anthropic's projection (the body
+ * is the Messages API body): `temperature` is dropped alongside extended
+ * thinking or on a model that rejects the parameter (#413); an effort preset
+ * lowered to `thinking.budget_tokens` is a note, not a drop. `model` is the
+ * Bedrock modelId — the body carries `anthropic_version` instead.
+ */
+export function anthropicBedrockEffectiveParams(req: ProviderRequest): EffectiveParams {
+  const body = buildAnthropicBedrockBody(req);
+  const dropped: DroppedRequestParam[] = [];
+  const notes: string[] = [];
+  if (req.temperature !== undefined && body.temperature === undefined) {
+    dropped.push("temperature");
+    notes.push(
+      req.thinking !== undefined || req.reasoningEffort !== undefined
+        ? "temperature dropped: the Anthropic API rejects an explicit temperature alongside extended thinking"
+        : `temperature dropped: model "${req.model}" rejects the temperature parameter (#413)`,
+    );
+  }
+  if (req.thinking === undefined && req.reasoningEffort !== undefined && body.thinking) {
+    notes.push(
+      `reasoningEffort "${req.reasoningEffort}" lowered to thinking.budget_tokens=${body.thinking.budget_tokens}`,
+    );
+  }
+  return {
+    model: req.model,
+    maxTokens: body.max_tokens,
+    ...(body.thinking !== undefined
+      ? { thinking: { type: "enabled" as const, budgetTokens: body.thinking.budget_tokens } }
+      : {}),
+    ...(body.temperature !== undefined ? { temperature: body.temperature } : {}),
+    dropped,
+    ...(notes.length > 0 ? { notes } : {}),
+  };
 }
 
 /**

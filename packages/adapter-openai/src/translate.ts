@@ -38,7 +38,9 @@ import {
   type CanonicalTextBlockParam,
   type CanonicalTool,
   type CanonicalToolResultContent,
+  type DroppedRequestParam,
   EFFORT_THINKING_BUDGET_TOKENS,
+  type EffectiveParams,
   type ProviderRequest,
   type ReasoningEffort,
   type ToolChoice,
@@ -108,6 +110,54 @@ export function toOpenAIChatParams(
   }
 
   return params;
+}
+
+/**
+ * 0.6.0 §8.1 — project `toOpenAIChatParams` onto the params a route can
+ * differ on. Runs the SAME marshaller `stream()` runs and reads the wire body
+ * back, so the private `usesMaxCompletionTokens` gate is never re-derived
+ * outside this module. Drops: `temperature` on a reasoning model (the API
+ * 400s on a non-default value there); `thinking` / `reasoningEffort` on a
+ * NON-reasoning model (no reasoning control exists, both are ignored). A
+ * `thinking.budgetTokens` that a reasoning model honours as the nearest
+ * `reasoning_effort` bucket is a conversion, reported as a note.
+ */
+export function openAIEffectiveParams(req: ProviderRequest): EffectiveParams {
+  const params = toOpenAIChatParams(req);
+  const dropped: DroppedRequestParam[] = [];
+  const notes: string[] = [];
+  const reasoning = usesMaxCompletionTokens(req.model);
+  if (req.temperature !== undefined && params.temperature === undefined) {
+    dropped.push("temperature");
+    notes.push(
+      `temperature dropped: reasoning model "${req.model}" rejects a non-default temperature`,
+    );
+  }
+  if (!reasoning) {
+    if (req.thinking !== undefined) dropped.push("thinking");
+    if (req.reasoningEffort !== undefined) dropped.push("reasoningEffort");
+    if (req.thinking !== undefined || req.reasoningEffort !== undefined) {
+      notes.push(`reasoning controls dropped: "${req.model}" exposes no reasoning_effort`);
+    }
+  } else if (req.reasoningEffort === undefined && req.thinking !== undefined) {
+    notes.push(
+      `thinking.budgetTokens=${req.thinking.budgetTokens} mapped to the nearest reasoning_effort bucket "${params.reasoning_effort ?? ""}"`,
+    );
+  }
+  const maxTokens = params.max_completion_tokens ?? params.max_tokens ?? req.maxTokens;
+  const effort = params.reasoning_effort;
+  return {
+    model: params.model,
+    maxTokens,
+    ...(effort === "low" || effort === "medium" || effort === "high"
+      ? { reasoningEffort: effort }
+      : {}),
+    ...(params.temperature !== undefined && params.temperature !== null
+      ? { temperature: params.temperature }
+      : {}),
+    dropped,
+    ...(notes.length > 0 ? { notes } : {}),
+  };
 }
 
 /**
