@@ -14,9 +14,12 @@
  *
  * Decision shape: `{ decision: "allow" | "deny" | "block", reason?, mutate? }`.
  * Aggregation: any deny/block short-circuits with the first reason; allows
- * accumulate `mutate` via shallow-merge. v1 only honours `mutate` for the
- * `pre-slash` event (the `expanded` field) — other events log it but do
- * not apply it.
+ * accumulate `mutate` via shallow-merge. The runtime honours `mutate` for
+ * two events: `pre-slash` (the `expanded` field replaces the substituted
+ * text) and — since 0.6.0 §7.4 — `pre-model` (a string `systemAppend` is
+ * appended to that model call's system prompt in the volatile region, after
+ * the cache-marked prefix, so a hook can steer a call without a guide
+ * model). Other events log `mutate` but do not apply it.
  *
  * Loading layer order: user hooks first, project hooks last. Project hooks
  * therefore evaluate "later" — but since aggregation short-circuits on the

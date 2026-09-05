@@ -501,3 +501,106 @@ describe("PolicyRouter — toolsInPlay is the union advertisement (0.6.0 §4.4 p
     expect(forced.policy).toBe("forced");
   });
 });
+
+describe("PolicyRouter — the preRoute hint input (0.6.0 §7.2, §7.11)", () => {
+  const profiled = (modelString: string, tags: string[], armId: string): PoolCandidate => ({
+    ...candidate(modelString, tags),
+    armId,
+  });
+  const FAST = profiled("claude-haiku-4-5", ["cheap"], "fast");
+  const MID = profiled("claude-sonnet-5", ["balanced"], "mid");
+  const STRONG = profiled("claude-opus-4-8", ["strong"], "strong");
+  const ROSTER = [FAST, MID, STRONG];
+
+  test("route() without a hint is byte-identical to the 0.5.x decision", () => {
+    const r = createPolicyRouter({ candidates: ROSTER, policy: "heuristic" });
+    expect(r.route(HARD)).toEqual(r.route(HARD, "", HARD.turnIndex, undefined));
+    expect(r.route(EASY).candidate).toBe(FAST);
+  });
+
+  test("forcedArm on the roster is served and stamped with the lane's policy; the band is kept", () => {
+    const r = createPolicyRouter({ candidates: ROSTER, policy: "heuristic" });
+    const directive = r.route(EASY, "", 0, {
+      source: "directive",
+      forcedArm: "strong",
+      eligible: [],
+    });
+    expect(directive.candidate).toBe(STRONG);
+    expect(directive.policy).toBe("directive");
+    expect(directive.routeKey).toBe("easy");
+    expect(directive.explored).toBe(false);
+    const rule = r.route(HARD, "", 0, {
+      source: "rule",
+      forcedArm: "fast",
+      eligible: ["fast", "strong"],
+      evidence: { ruleId: "cheap-when-broke" },
+    });
+    expect(rule.candidate).toBe(FAST);
+    expect(rule.policy).toBe("rule");
+    expect(rule.reason).toBe("rule: fast (ruleId=cheap-when-broke)");
+    const classified = r.route(HARD, "", 0, { source: "classifier", forcedArm: "mid" });
+    expect(classified.policy).toBe("classifier");
+    expect(classified.candidate).toBe(MID);
+  });
+
+  test("a forcedArm the roster does not hold is ignored (the loop forces out-of-roster rungs itself)", () => {
+    const r = createPolicyRouter({ candidates: ROSTER, policy: "static" });
+    const d = r.route(HARD, "", 0, { source: "forced", forcedArm: "not-declared" });
+    expect(d.candidate).toBe(FAST);
+    expect(d.policy).toBe("static");
+  });
+
+  test("eligible[] narrows static / heuristic to the eligible arms; an empty set leaves the roster in play", () => {
+    const stat = createPolicyRouter({ candidates: ROSTER, policy: "static" });
+    expect(
+      stat.route(HARD, "", 0, { source: "eligibility", eligible: ["mid", "strong"] }),
+    ).toMatchObject({
+      candidate: MID,
+      reason: "static: first eligible candidate",
+    });
+    expect(stat.route(HARD, "", 0, { source: "none", eligible: [] }).candidate).toBe(FAST);
+    const heur = createPolicyRouter({ candidates: ROSTER, policy: "heuristic" });
+    // Hard turn, strong excluded → the last eligible (no strong tag left).
+    expect(
+      heur.route(HARD, "", 0, { source: "eligibility", eligible: ["fast", "mid"] }).candidate,
+    ).toBe(MID);
+    // Easy turn, cheap excluded → the first eligible.
+    expect(
+      heur.route(EASY, "", 0, { source: "eligibility", eligible: ["mid", "strong"] }).candidate,
+    ).toBe(MID);
+    // Every eligible id unknown → the roster (a stale hint never strands the turn).
+    expect(heur.route(EASY, "", 0, { source: "eligibility", eligible: ["ghost"] }).candidate).toBe(
+      FAST,
+    );
+  });
+
+  test("learned scores only the eligible arms (warm-up round-robins among them)", () => {
+    const seen: string[] = [];
+    const score: ScoreLookup = (_rk, m) => {
+      seen.push(m);
+      return undefined;
+    };
+    const r = createPolicyRouter({
+      candidates: ROSTER,
+      policy: "learned",
+      learning: { minSamplesPerArm: 1 },
+      score,
+    });
+    const d = r.route(HARD, "s", 0, { source: "eligibility", eligible: ["mid", "strong"] });
+    expect(d.candidate).toBe(MID);
+    expect(d.explored).toBe(true);
+    expect(seen).toEqual([MID.modelString, STRONG.modelString]);
+  });
+
+  test("routeKeySuffix appends to the band as <band>:<suffix>", () => {
+    const r = createPolicyRouter({ candidates: ROSTER, policy: "heuristic" });
+    expect(r.route(HARD, "", 0, { source: "none", routeKeySuffix: "x" }).routeKey).toBe("hard:x");
+  });
+
+  test("armId defaults to the model string for an unprofiled candidate", () => {
+    const r = createPolicyRouter({ candidates: POOL, policy: "static" });
+    const d = r.route(HARD, "", 0, { source: "directive", forcedArm: OPUS.modelString });
+    expect(d.candidate).toBe(OPUS);
+    expect(d.policy).toBe("directive");
+  });
+});

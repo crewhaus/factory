@@ -38,21 +38,72 @@ export type PoolCandidate = {
   readonly modelString: string;
   /** Free-form tags (e.g. `cheap`, `strong`) the heuristic routes on. */
   readonly tags: readonly string[];
+  /**
+   * 0.6.0 §7.9 — the arm id a {@link PolicyRouteHint} names this candidate
+   * by: the `models:` profile name when the candidate is a profile, else the
+   * spec model string. Defaults to `modelString`, so a bare 0.5.x candidate
+   * needs no change.
+   */
+  readonly armId?: string;
 };
 
 export type PoolPolicy = "static" | "heuristic" | "learned";
 
 /**
- * 0.6.0 §7.12 — the policy stamped on a {@link PolicyDecision}. Every
- * configured {@link PoolPolicy}, plus `"forced"`: a decision the loop made
- * OUTSIDE the router (today: a `budget.on_exceed: degrade` breach restricting
- * the pool to its degrade rung, reason `budget_degrade`). `route()` itself
- * never returns `"forced"` — the router stays a pure selector over the
- * roster; the loop substitutes the forced candidate into the decision the
- * router produced, keeping the band (`routeKey`) so the scoreboard arm is
- * still keyed on the turn's difficulty.
+ * 0.6.0 §7.2 / §7.12 — the policy stamped on a {@link PolicyDecision}. Every
+ * configured {@link PoolPolicy}, plus the lanes the `preRoute` phase decides
+ * BEFORE the policy (§7.2 ordering: forced → directive → rules → classifier →
+ * policy over `eligible[]`):
+ *
+ *   - `"forced"` — a budget degrade restricting the pool to its rung
+ *     (reason `budget_degrade`), substituted by the loop OUTSIDE the router
+ *     because the rung may sit outside the roster;
+ *   - `"escalation"` — the misroute-recovery latch or the model's own
+ *     `Escalate` request, likewise substituted by the loop;
+ *   - `"directive"` / `"rule"` / `"classifier"` — a {@link PolicyRouteHint}
+ *     whose `forcedArm` names a roster candidate; `route()` serves it and
+ *     stamps the hint's source, keeping the band (`routeKey`) so the
+ *     scoreboard arm is still keyed on the turn's difficulty.
+ *
+ * `route()` never returns `"forced"` or `"escalation"` itself — the router
+ * stays a pure selector over the roster.
  */
-export type PolicyDecisionPolicy = PoolPolicy | "forced";
+export type PolicyDecisionPolicy =
+  | PoolPolicy
+  | "classifier"
+  | "rule"
+  | "directive"
+  | "escalation"
+  | "forced";
+
+/**
+ * 0.6.0 §7.2 — the `preRoute` phase's output, handed INTO the synchronous
+ * `route()` (the router stays pure: the hint is an input like the signals).
+ * Structurally `@crewhaus/model-plan`'s `RouteHint` (whose `eligible` is
+ * required), declared here so the router keeps its zero dependency on the
+ * plan package.
+ *
+ *   - `forcedArm` — an arm the policy MUST serve when it is on the roster
+ *     (a directive pin, a rule's target, a classifier verdict); the decision
+ *     is stamped with the policy matching `source`. An arm the roster does
+ *     not hold is ignored (the loop handles out-of-roster forcing itself).
+ *   - `eligible` — the arms the policy may choose among this turn (N1,
+ *     §7.11): `static` takes the first eligible, `heuristic` its strongest /
+ *     cheapest among them, `learned` scores only them. An EMPTY or absent
+ *     set leaves the whole roster in play (the loop records
+ *     `no-eligible-candidate`).
+ *   - `routeKeySuffix` — appended to the band as `<band>:<suffix>` so a
+ *     hinted decision learns in its own bucket (unused by the loop until the
+ *     scoped-key grammar lands).
+ */
+export type PolicyRouteHint = {
+  readonly forcedArm?: string;
+  readonly excludedArms?: readonly string[];
+  readonly eligible?: readonly string[];
+  readonly routeKeySuffix?: string;
+  readonly source: "forced" | "directive" | "rule" | "classifier" | "eligibility" | "none";
+  readonly evidence?: Readonly<Record<string, unknown>>;
+};
 
 /**
  * Difficulty thresholds (shared verbatim with the tier router) plus the tag
@@ -139,7 +190,7 @@ export interface PolicyRouter {
    * defaults to `signals.turnIndex` for callers/tests that route a single run
    * without resume. Omitting `seed` is equivalent to `""`.
    */
-  route(signals: TierSignals, seed?: string, seq?: number): PolicyDecision;
+  route(signals: TierSignals, seed?: string, seq?: number, hint?: PolicyRouteHint): PolicyDecision;
   /** The resolved candidate set (declared order). */
   candidates(): readonly PoolCandidate[];
   /** Strongest candidate — the escalation target for a failed cheap pick. */
@@ -199,6 +250,33 @@ function firstTagged(candidates: readonly PoolCandidate[], tag: string): PoolCan
   return candidates.find((c) => c.tags.includes(tag));
 }
 
+/** Render hint evidence as `k=v` pairs for the decision's reason string. */
+function describeEvidence(evidence: Readonly<Record<string, unknown>>): string {
+  return Object.entries(evidence)
+    .filter(([, v]) => v !== undefined)
+    .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
+    .join(", ");
+}
+
+/** The arm id a hint names a candidate by (§7.9): profile name, else model string. */
+export function poolCandidateArmId(candidate: PoolCandidate): string {
+  return candidate.armId ?? candidate.modelString;
+}
+
+/** The decision policy a hint lane stamps (`forced` for anything the loop substitutes). */
+function policyForHintSource(source: PolicyRouteHint["source"]): PolicyDecisionPolicy {
+  switch (source) {
+    case "directive":
+      return "directive";
+    case "rule":
+      return "rule";
+    case "classifier":
+      return "classifier";
+    default:
+      return "forced";
+  }
+}
+
 export function createPolicyRouter(opts: PolicyRouterOptions): PolicyRouter {
   const candidates = opts.candidates;
   const firstCandidate = candidates[0];
@@ -219,15 +297,25 @@ export function createPolicyRouter(opts: PolicyRouterOptions): PolicyRouter {
     throw new Error("model-router: policy 'learned' requires an injected score lookup");
   }
 
+  /** Strongest of a (possibly narrowed) roster: first `strongTag` match, else the last. */
+  const strongestOf = (pool: readonly PoolCandidate[]): PoolCandidate =>
+    firstTagged(pool, strongTag) ?? pool[pool.length - 1] ?? lastCandidate;
+  /** Cheapest of a (possibly narrowed) roster: first `cheapTag` match, else the first. */
+  const cheapestOf = (pool: readonly PoolCandidate[]): PoolCandidate =>
+    firstTagged(pool, cheapTag) ?? pool[0] ?? firstCandidate;
   /** Strongest candidate: first `strongTag` match, else the last declared. */
-  const strongest = (): PoolCandidate => firstTagged(candidates, strongTag) ?? lastCandidate;
-  /** Cheapest candidate: first `cheapTag` match, else the first declared. */
-  const cheapest = (): PoolCandidate => firstTagged(candidates, cheapTag) ?? firstCandidate;
+  const strongest = (): PoolCandidate => strongestOf(candidates);
 
-  const decideLearned = (signals: TierSignals, seed: string, seq: number): PolicyDecision => {
+  const decideLearned = (
+    signals: TierSignals,
+    seed: string,
+    seq: number,
+    pool: readonly PoolCandidate[],
+  ): PolicyDecision => {
     const { band } = routeBand(signals, routing);
-    // Snapshot each candidate's sample count / mean reward for THIS band.
-    const arms = candidates.map((candidate) => {
+    // Snapshot each candidate's sample count / mean reward for THIS band
+    // (only the arms the hint left eligible, §7.11).
+    const arms = pool.map((candidate) => {
       const s = score?.(band, candidate.modelString);
       return {
         candidate,
@@ -309,29 +397,68 @@ export function createPolicyRouter(opts: PolicyRouterOptions): PolicyRouter {
   };
 
   return {
-    route(signals: TierSignals, seed = "", seq = signals.turnIndex): PolicyDecision {
+    route(
+      signals: TierSignals,
+      seed = "",
+      seq = signals.turnIndex,
+      hint?: PolicyRouteHint,
+    ): PolicyDecision {
+      // 0.6.0 §7.2 — the hint narrows the roster BEFORE the policy runs. An
+      // empty eligible set is not a veto here (the loop records it); the
+      // policy then runs over the full roster exactly as before.
+      const eligibleIds = hint?.eligible;
+      const narrowed =
+        eligibleIds !== undefined && eligibleIds.length > 0
+          ? candidates.filter((c) => eligibleIds.includes(poolCandidateArmId(c)))
+          : [];
+      const pool: readonly PoolCandidate[] = narrowed.length > 0 ? narrowed : candidates;
+      const withSuffix = (band: string): string =>
+        hint?.routeKeySuffix !== undefined ? `${band}:${hint.routeKeySuffix}` : band;
+      // A forced arm on the roster is served as-is, stamped with the lane
+      // that forced it; the band is still computed so the arm learns in the
+      // turn's difficulty bucket.
+      if (hint?.forcedArm !== undefined) {
+        const forced = candidates.find((c) => poolCandidateArmId(c) === hint.forcedArm);
+        if (forced !== undefined) {
+          const { band } = routeBand(signals, routing);
+          const evidence = hint.evidence !== undefined ? describeEvidence(hint.evidence) : "";
+          return {
+            candidate: forced,
+            routeKey: withSuffix(band),
+            reason: `${hint.source}: ${poolCandidateArmId(forced)}${evidence !== "" ? ` (${evidence})` : ""}`,
+            policy: policyForHintSource(hint.source),
+            explored: false,
+          };
+        }
+      }
       if (opts.policy === "static") {
         const { band } = routeBand(signals, routing);
         return {
-          candidate: firstCandidate,
-          routeKey: band,
-          reason: "static: first declared candidate",
+          candidate: pool[0] ?? firstCandidate,
+          routeKey: withSuffix(band),
+          reason:
+            pool.length === candidates.length
+              ? "static: first declared candidate"
+              : "static: first eligible candidate",
           policy: "static",
           explored: false,
         };
       }
       if (opts.policy === "heuristic") {
         const { band, reason } = routeBand(signals, routing);
-        const candidate = band === "hard" ? strongest() : cheapest();
+        const candidate = band === "hard" ? strongestOf(pool) : cheapestOf(pool);
         return {
           candidate,
-          routeKey: band,
+          routeKey: withSuffix(band),
           reason: `heuristic/${band}: ${reason}`,
           policy: "heuristic",
           explored: false,
         };
       }
-      return decideLearned(signals, seed, seq);
+      const learned = decideLearned(signals, seed, seq, pool);
+      return hint?.routeKeySuffix !== undefined
+        ? { ...learned, routeKey: withSuffix(learned.routeKey) }
+        : learned;
     },
     candidates(): readonly PoolCandidate[] {
       return candidates;

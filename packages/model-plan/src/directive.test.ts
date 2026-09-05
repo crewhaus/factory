@@ -3,7 +3,12 @@
  * allow-list validated against the roster, `/model auto` clears.
  */
 import { describe, expect, test } from "bun:test";
-import { type DirectiveRosterArm, parseModelDirective, resolveDirectiveTarget } from "./directive";
+import {
+  type DirectiveRosterArm,
+  parseModelDirective,
+  resolveDirectiveTarget,
+  stripDirectiveToken,
+} from "./directive";
 
 const ROSTER: DirectiveRosterArm[] = [
   { armId: "fast", model: "claude-haiku-4-5", tags: ["cheap"] },
@@ -63,5 +68,16 @@ describe("parseModelDirective", () => {
     const d = parseModelDirective("/model fast", []);
     expect(d?.accepted).toBe(false);
     if (d?.kind === "pin") expect(d.reason).toContain("no roster");
+  });
+});
+
+describe("stripDirectiveToken", () => {
+  test("removes a leading /model <token> without a roster; prose and mid-text mentions pass through", () => {
+    expect(stripDirectiveToken("/model $strong hello")).toBe("hello");
+    expect(stripDirectiveToken("  /model auto")).toBe("");
+    expect(stripDirectiveToken("/model turbo what is 2+2?")).toBe("what is 2+2?");
+    expect(stripDirectiveToken("hello")).toBe("hello");
+    expect(stripDirectiveToken("please /model fast this")).toBe("please /model fast this");
+    expect(stripDirectiveToken("/models fast")).toBe("/models fast");
   });
 });
