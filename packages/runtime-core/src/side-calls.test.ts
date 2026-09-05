@@ -378,19 +378,20 @@ describe("shadow (§7.8)", () => {
     expect(s.map((x) => x.outcome)).toEqual(["started", "done"]);
     expect(s[1]?.cause).toBe("shadow");
     expect(s[1]?.role).toBe("shadow");
-    // Both arms landed in the observe-only lane under the primary's band.
+    // Both arms landed in the observe-only lane under the primary's band —
+    // keyed by ARM ID (§7.9, PR 10): the profile names `strong` / `fast`.
     const band = routes()[0]?.routeKey;
     expect(band).toBeDefined();
     const key = `shadow:${band}`;
     const sb = opts._scoreboard;
-    expect(sb.score(key, STRONG)?.n).toBe(1);
-    expect(sb.score(key, CHEAP)?.n).toBe(1);
-    expect(sb.score(key, STRONG)?.meanReward ?? 0).toBeGreaterThan(
-      sb.score(key, CHEAP)?.meanReward ?? 1,
+    expect(sb.score(key, "strong")?.n).toBe(1);
+    expect(sb.score(key, "fast")?.n).toBe(1);
+    expect(sb.score(key, "strong")?.meanReward ?? 0).toBeGreaterThan(
+      sb.score(key, "fast")?.meanReward ?? 1,
     );
     // The live arm is untouched by the shadow (one primary observation only).
-    expect(sb.score(band as string, CHEAP)?.n).toBe(1);
-    expect(sb.score(band as string, STRONG)).toBeUndefined();
+    expect(sb.score(band as string, "fast")?.n).toBe(1);
+    expect(sb.score(band as string, "strong")).toBeUndefined();
   });
 
   test("sample_rate 0 skips every turn (stage skipped, cause sample_rate); a shadow equal to the served arm is skipped", async () => {

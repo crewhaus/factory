@@ -49,13 +49,51 @@ each other's updates. A torn final line from a crashed writer is tolerated.
 `ScoreReader` (just `score`) is the narrow interface handed to the
 `PolicyRouter`, keeping model-router itself fs-free.
 
+### Arm identity, scoped keys and the `v:2` line (0.6.0)
+
+- **Arm identity** (`m`) is the `models:` profile name when the candidate is a
+  profile, else the spec model string. No migration: unprofiled arms keep
+  their key, profiled arms are new (`upgrade --hoist-models --rewrite-arms`
+  re-keys deliberately).
+- **Scoped route keys**: a pool on a workflow step, crew role, graph node or
+  sub-agent records under `<scope>/<band>` (`support/hard`); the learned policy
+  backs off to the unscoped `<band>` arm while the scoped one is
+  under-sampled, so pre-0.6.0 history keeps steering. Observe-only lanes sit
+  beside them: `q:<key>` (offline join) and `shadow:<scope>/<band>` (audition).
+- **`v:2` delta line** — `{v:2,k,m,r,s,l,t,c?,q?,st?,sg?,at?,wp?,pv?,sc?,h?,pf?}`:
+  `q` judged quality, `st` stage, `sg` strategy, `at` attributedTo, `wp`
+  wouldPass, `pv` policyVersion, `sc` scope, `h` harness, `pf` the arm's
+  profile-lineage fingerprint. A 0.5.x reader folds it as a plain delta. A
+  plain observation is still written as the exact `v:1` line.
+- **Quality** folds with Welford (`meanQuality`, `varQuality`, `qualityCount`
+  on `ArmStats`); `compact()` carries `qs`/`qn`/`qm2`/`ug`/`pf` so the floor's
+  lower bound survives compaction. `pv`/`sc`/`h` are per-line provenance and
+  are not aggregated (`sc` is already the key prefix).
+- **Lineage** (`reward.reset_on_profile_change`, default on): open the store
+  with `lineage: { <armId>: <fingerprint> }` and a line whose `pf` differs from
+  the arm's current fingerprint is skipped on load — history from a profile
+  that changed under the same arm id. Lines with no `pf` are always kept.
+
+### Routing-state files beside the arms
+
+- `routing/priors.json` — eval-seeded priors (`readRoutingPriorsRaw`; validated
+  by `@crewhaus/model-plan`'s `loadPriors`).
+- `routing/freeze.json` — `crewhaus route freeze <policyVersion>`
+  (`readRouteFreeze` / `writeRouteFreeze` / `clearRouteFreeze`); while present
+  the runtime wraps the scoreboard in `freezeScoreboard` (reads pass through,
+  writes are dropped) and reports the frozen `policyVersion`.
+
 ## CLI
 
 `crewhaus route status` renders the scoreboard (per-band arms, best-per-bucket
-starred — what a `learned` policy exploits); `crewhaus route reset` wipes it.
+starred — what a `learned` policy exploits); `crewhaus route reset` wipes it;
+`crewhaus route freeze <policyVersion>` pins the learned policy
+(`--clear` lifts the pin).
 
 ## Exports
 
-`computeReward`, `DEFAULT_OBJECTIVE`, `openScoreboard`, and the types
+`computeReward`, `DEFAULT_OBJECTIVE`, `openScoreboard`, `freezeScoreboard`,
+`readRouteFreeze`, `writeRouteFreeze`, `clearRouteFreeze`, `routeFreezePath`,
+`readRoutingPriorsRaw`, `routingPriorsPath`, the lane helpers, and the types
 `RouteObservation`, `RouteObjective`, `RewardConfig`, `ArmStats`, `Scoreboard`,
-`ScoreboardOptions`, `ScoreReader`.
+`ScoreboardOptions`, `ScoreReader`, `RouteFreeze`.

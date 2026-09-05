@@ -145,8 +145,26 @@ export function seededScoreLookup(
   return (routeKey, arm) => {
     const observed = live(routeKey, arm);
     if (observed !== undefined && observed.n > 0) return observed;
-    return priors.arms.get(priorKey(routeKey, arm)) ?? observed;
+    const prior = priors.arms.get(priorKey(routeKey, arm));
+    if (prior === undefined) return observed;
+    // The prior stands in for the missing live history; `seeded` tells the
+    // router to skip warm-up for it (a pseudo-count ≤ 10 would otherwise sit
+    // under the 25-sample floor and the arm would be explored as if cold).
+    return { ...prior, seeded: true };
   };
+}
+
+/**
+ * The fingerprint a priors file is pinned to: the ROSTER (`model_pool.
+ * candidates`, every per-candidate setting included), not the whole pool.
+ * Priors describe arms, so a rule toggle or a `learning` edit must not
+ * invalidate them — but any change to what an arm IS (its model, its
+ * settings, its enabled flag) does. `eval leaderboard --export-priors`
+ * writes this value as `PriorsFile.fingerprint`; runtime-core passes it as
+ * `expectFingerprint` when it loads the file.
+ */
+export function priorsFingerprint(candidates: ReadonlyArray<unknown>): string {
+  return fnv1a64(canonicalJson(candidates));
 }
 
 function isFiniteNumber(v: unknown): v is number {

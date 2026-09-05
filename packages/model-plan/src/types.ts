@@ -235,4 +235,11 @@ export type ArmPrior = {
   readonly n: number;
   readonly meanReward: number;
   readonly varReward?: number;
+  /**
+   * N2 (§7.11) — set by `seededScoreLookup` on a score that came from the
+   * priors file rather than live observations: the router skips warm-up
+   * (`minSamplesPerArm`) for a seeded arm even though its pseudo-count is
+   * capped below the warm-up floor.
+   */
+  readonly seeded?: boolean;
 };

@@ -4678,6 +4678,10 @@ async function runRunCli(
       // override is an explicit routing decision authored against a different
       // primary, so it drops the chain, tiers and pool (the breaker stays).
       ...modelRoutingRunOptions(ir.agent, modelOverride, { sessionName: ir.name }),
+      // 0.6.0 §7.9 — the INSTALLED pricing feed (`crewhaus pricing sync`) so
+      // the pool's reward and the per-tool cost attribution price with the
+      // same table `cost-summary` and `doctor --models` read.
+      pricing: loadUserPricing(),
       // 0.6.0 PR 8b (wave-1 carry-over) — the in-loop `evaluation:` block,
       // built from the resolved IR exactly as the compiled cli bundle's
       // `renderEvaluation` does (llm_judge on the run bus with role "judge",
@@ -5787,6 +5791,8 @@ async function buildServeRuntime(
     ...(ir.compaction.model !== undefined ? { compactionModel: ir.compaction.model } : {}),
     ...loopContractRunOptions(ir),
     ...(streaming !== undefined ? { streaming } : {}),
+    // 0.6.0 §7.9 — the installed pricing feed for the pool's reward (see runRunCli).
+    pricing: loadUserPricing(),
     ...(ir.failureTaxonomy !== undefined && ir.failureTaxonomy.length > 0
       ? { failureTaxonomy: ir.failureTaxonomy }
       : {}),
@@ -21763,8 +21769,8 @@ switch (subcommand) {
     break;
   }
   case "route":
-    // Adaptive model routing — inspect/reset the reward scoreboard. `runRoute`
-    // throws a plain Error on a bad argument; surface it through die().
+    // Adaptive model routing — inspect/reset/freeze the reward scoreboard.
+    // `runRoute` throws a plain Error on a bad argument; surface it through die().
     try {
       process.stdout.write(`${runRoute(rest)}\n`);
     } catch (err) {

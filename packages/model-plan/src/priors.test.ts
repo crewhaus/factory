@@ -3,7 +3,13 @@
  * capped, never applied when stale or malformed.
  */
 import { describe, expect, test } from "bun:test";
-import { MAX_PRIOR_PSEUDO_COUNT, loadPriors, priorKey, seededScoreLookup } from "./priors";
+import {
+  MAX_PRIOR_PSEUDO_COUNT,
+  loadPriors,
+  priorKey,
+  priorsFingerprint,
+  seededScoreLookup,
+} from "./priors";
 
 const GOOD = {
   version: 1,
@@ -88,9 +94,29 @@ describe("seededScoreLookup", () => {
       routeKey === "easy" && arm === "fast" ? { n: 3, meanReward: 0.5 } : undefined;
     const seeded = seededScoreLookup(live, loaded.priors);
     expect(seeded("easy", "fast")).toEqual({ n: 3, meanReward: 0.5 });
-    expect(seeded("hard", "strong")).toEqual({ n: 4, meanReward: 0.91 });
+    // A prior stands in for the missing live history and is marked `seeded`
+    // so the router skips warm-up for it (its pseudo-count sits under the floor).
+    expect(seeded("hard", "strong")).toEqual({ n: 4, meanReward: 0.91, seeded: true });
     expect(seeded("hard", "fast")).toBeUndefined();
     expect(seededScoreLookup(live, undefined)).toBe(live);
+  });
+
+  test("priorsFingerprint keys on the roster alone: a rules/learning edit keeps it, a candidate edit changes it", () => {
+    const roster = [
+      { model: "claude-haiku-4-5", tags: ["cheap"], profile: "fast" },
+      { model: "claude-opus-4-8", tags: ["strong"], profile: "strong" },
+    ];
+    const a = priorsFingerprint(roster);
+    expect(a).toMatch(/^[0-9a-f]{16}$/);
+    // Same roster, spelled with a different key order → same fingerprint.
+    expect(
+      priorsFingerprint([
+        { profile: "fast", tags: ["cheap"], model: "claude-haiku-4-5" },
+        { tags: ["strong"], model: "claude-opus-4-8", profile: "strong" },
+      ]),
+    ).toBe(a);
+    expect(priorsFingerprint([roster[0], { ...roster[1], maxTokens: 2048 }])).not.toBe(a);
+    expect(priorsFingerprint([roster[0], { ...roster[1], enabled: false }])).not.toBe(a);
   });
 
   test("a live arm with n=0 still reads its prior", () => {
