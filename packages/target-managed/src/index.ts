@@ -16,7 +16,11 @@ import {
   renderBundleReadme,
 } from "@crewhaus/ir";
 import { memoryFragmentFromIr } from "@crewhaus/memory-service";
-import { renderModelWiringFields } from "@crewhaus/model-service";
+import {
+  HYBRID_WIRING_IMPORT,
+  renderHybridWiringFields,
+  renderModelWiringFields,
+} from "@crewhaus/model-service";
 
 /**
  * Emit a managed-daemon bundle. Generates `daemon.ts` that wires:
@@ -876,6 +880,11 @@ const __memEmbedder = createEmbedder({ model: ${escapeJsonString(memEmbedderMode
   );
 
 `;
+  // 0.6.0 PR 9e — the closure half of the pool (Consult / Escalate, the route
+  // classifier, guide / shadow). "" — and no import — when the pool declares
+  // none of them, so pre-0.6.0 managed bundles stay byte-identical.
+  const hybridFields = renderHybridWiringFields(ir.agent, "    ", ir.name);
+  const hybridImport = hybridFields.length > 0 ? `\n${HYBRID_WIRING_IMPORT}` : "";
   const permissionImports =
     permissionsField.length > 0
       ? `\nimport { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";${
@@ -887,7 +896,7 @@ const __memEmbedder = createEmbedder({ model: ${escapeJsonString(memEmbedderMode
 // Source spec: ${escapeJsonString(ir.name)} (target: managed, ir version: ${ir.version})
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
-import type { RunChatLoopOptions } from "@crewhaus/runtime-core";${permissionImports}${pcImport}${memImports}${thredzImports}${catalogImport}${toolImportBlock}${knowledgeImports}${embedderImport}${evalImport}${evaluationBlock}${toolBootBlock}${thredzBootBlock}${embedderBootBlock}${knowledgeBootBlock}${pcBootBlock}
+import type { RunChatLoopOptions } from "@crewhaus/runtime-core";${hybridImport}${permissionImports}${pcImport}${memImports}${thredzImports}${catalogImport}${toolImportBlock}${knowledgeImports}${embedderImport}${evalImport}${evaluationBlock}${toolBootBlock}${thredzBootBlock}${embedderBootBlock}${knowledgeBootBlock}${pcBootBlock}
 
 export type ManagedAgentArgs = {
   readonly tenantId: string;
@@ -899,7 +908,7 @@ export type ManagedAgentArgs = {
 export async function runOneTurn(args: ManagedAgentArgs): Promise<string> {
 ${memBlock}${approvalsBoot}  return await runChatLoop({
     model: ${escapeJsonString(ir.agent.model)},
-    instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentLoopFields(ir)}${renderModelWiringFields(ir.agent, "    ")}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderHooksField(ir)}${renderSloField(ir)}
+    instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentLoopFields(ir)}${renderModelWiringFields(ir.agent, "    ")}${hybridFields}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderHooksField(ir)}${renderSloField(ir)}
     sessionName: args.sessionId,
     sessionTarget: "managed",
     seedMessages: [{ role: "user", content: args.input }],

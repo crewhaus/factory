@@ -1562,15 +1562,13 @@ describe("emitCli — plugin activation (Item 3 / G32)", () => {
   });
 });
 
-describe("emitCli — model_directed hybrid tools (0.6.0 PR 8b: interpreter-only, deferred for bundles)", () => {
-  // PR 8b constructs Consult / Escalate in `wireModels` and the `crewhaus run`
-  // / `serve` interpreter spreads them; a COMPILED bundle does not register
-  // them yet — the emitter still renders the four routing fields through
-  // `renderModelWiringFields`, which never renders the hybrid pair, and the
-  // bundle imports nothing from @crewhaus/model-service at boot. This pins
-  // that deferred state honestly (the compiler warns about it on this exact
-  // key); PR 9a — every emitter's boot block calling `wireModels` — inverts
-  // these assertions.
+describe("emitCli — the pool's runtime closures reach the bundle (0.6.0 PR 9e)", () => {
+  // PR 8b built Consult / Escalate in `wireModels` and only the `crewhaus run`
+  // / `serve` interpreter spread them; a COMPILED bundle had the pool blob and
+  // none of the behaviour. PR 9e renders the composition root's `wireHybrid`
+  // call beside the literal routing fields, so the bundle constructs the same
+  // closures from the same blob. Absent = byte-identical: a pool that declares
+  // no closure-shaped key renders no call and imports nothing.
   const directed = {
     model: "claude-haiku-4-5",
     instructions: "be helpful",
@@ -1584,18 +1582,70 @@ describe("emitCli — model_directed hybrid tools (0.6.0 PR 8b: interpreter-only
     },
   } as unknown as IrV0["agent"];
 
+  const classifierAgent = {
+    model: "claude-haiku-4-5",
+    instructions: "be helpful",
+    modelPool: {
+      candidates: [
+        { model: "claude-haiku-4-5", tags: ["cheap"] },
+        { model: "claude-opus-4-8", tags: ["strong"] },
+      ],
+      policy: "classifier" as const,
+      classifier: { model: "claude-haiku-4-5", labels: { cheap: "easy", strong: "hard" } },
+    },
+  } as unknown as IrV0["agent"];
+
+  const guided = {
+    model: "claude-haiku-4-5",
+    instructions: "be helpful",
+    modelPool: {
+      candidates: [
+        { model: "claude-haiku-4-5", tags: ["cheap"] },
+        { model: "claude-opus-4-8", tags: ["strong"] },
+      ],
+      policy: "heuristic" as const,
+      strategy: { guide: { model: "claude-opus-4-8", every: "first_turn" as const } },
+    },
+  } as unknown as IrV0["agent"];
+
+  const plainPool = {
+    model: "claude-haiku-4-5",
+    instructions: "be helpful",
+    modelPool: {
+      candidates: [
+        { model: "claude-haiku-4-5", tags: ["cheap"] },
+        { model: "claude-opus-4-8", tags: ["strong"] },
+      ],
+      policy: "heuristic" as const,
+    },
+  } as unknown as IrV0["agent"];
+
   test("the pool (strategy included) reaches the bundle as the modelPool blob", () => {
     const c = emitCli(baseIr({ agent: directed })).files[0]?.content ?? "";
     expect(c).toContain('"strategy":{"modelDirected":true,"maxEscalations":1}');
   });
 
-  test("the bundle registers neither Consult nor Escalate and imports no composition root (deferred to PR 9a)", () => {
+  test("model_directed: the bundle imports the composition root and spreads wireHybrid", () => {
     const c = emitCli(baseIr({ agent: directed })).files[0]?.content ?? "";
-    expect(c).not.toContain("hybridTools");
-    expect(c).not.toContain("escalation:");
-    expect(c).not.toContain("Consult");
-    expect(c).not.toContain("Escalate");
+    expect(c).toContain('import { wireHybrid } from "@crewhaus/model-service";');
+    expect(c).toContain("...wireHybrid({");
+    expect(c).toContain('{ sessionName: "smoke" }),');
+    // The closure call carries the SAME blob the literal option carries.
+    expect(c).toContain('"strategy":{"modelDirected":true,"maxEscalations":1}}, { sessionName:');
+  });
+
+  test("policy: classifier and strategy.guide each wire the same call", () => {
+    for (const agent of [classifierAgent, guided]) {
+      const c = emitCli(baseIr({ agent })).files[0]?.content ?? "";
+      expect(c).toContain('import { wireHybrid } from "@crewhaus/model-service";');
+      expect(c).toContain("...wireHybrid({");
+    }
+  });
+
+  test("byte-identity: a pool with no closure-shaped key renders no call and no import", () => {
+    const c = emitCli(baseIr({ agent: plainPool })).files[0]?.content ?? "";
+    expect(c).toContain('modelPool: {"candidates":');
+    expect(c).not.toContain("wireHybrid");
     expect(c).not.toContain("@crewhaus/model-service");
-    expect(c).not.toContain("@crewhaus/tool-consult");
   });
 });

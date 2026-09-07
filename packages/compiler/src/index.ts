@@ -1185,16 +1185,27 @@ function asLooseBlock(value: unknown): LooseBlock | undefined {
  */
 const LANDING_SINGLE_SLOT =
   "a later 0.6.0 row (a single-model serving slot has no per-candidate plan carrier in the IR; the same profile honours it today as a model_pool candidate)";
-const LANDING_PREROUTE = "PR 9b (the preRoute decision phase)";
-/** 0.6.0 PR 9d — the shapes whose hosts construct the guide / shadow /
- *  committee side calls at boot (`@crewhaus/model-service`'s `wireSideCalls`:
- *  rendered by the workflow and graph emitters, called by the crew
- *  orchestrator). Every other compiled shape reaches them through the
- *  `crewhaus run` / `serve` interpreter only, until the emitters' boot-time
- *  `wireModels` row. */
-const SIDE_CALL_WIRED_TARGETS: ReadonlySet<Spec["target"]> = new Set(["workflow", "graph", "crew"]);
-const LANDING_MODEL_DIRECTED =
-  "a later 0.6.0 row (the emitters' boot-time wireModels call — emitted bundles do not import @crewhaus/model-service, which depends on runtime-core)";
+/**
+ * 0.6.0 PR 9e — the shapes whose compiled bundles construct the pool's
+ * runtime CLOSURES at boot through `@crewhaus/model-service`'s `wireHybrid`:
+ * `strategy.model_directed` (Consult + Escalate), `policy: classifier`, and
+ * `strategy.{guide,shadow,committee}`. The cli, channel and managed emitters
+ * render the call beside the literal routing fields; the workflow and graph
+ * emitters render it per pooled step / node; the crew orchestrator calls it
+ * per role activation. A bundle for any OTHER pool-bearing target still
+ * carries the blob without the closures and reaches them through the
+ * `crewhaus run` / `serve` interpreter only — the warning below says which.
+ */
+const HYBRID_WIRED_TARGETS: ReadonlySet<Spec["target"]> = new Set([
+  "cli",
+  "channel",
+  "managed",
+  "workflow",
+  "graph",
+  "crew",
+]);
+const LANDING_HYBRID_EMITTERS =
+  "a later 0.6.0 row (the wireHybrid call in this target's emitter — cli, channel, managed, workflow, graph and crew bundles construct it today)";
 const LANDING_ROUTER_STORE = "PR 10 (scoped arms, priors and the reward store)";
 const LANDING_JUDGE_PANEL = "the §6.2 judge-panel wiring (createJudgeGrader in every judge site)";
 const LANDING_AUX_PARAMS =
@@ -2418,41 +2429,37 @@ function lowerModelFailover(
         `${poolPath}.${key}`,
         `${poolPath}.${key} is lowered into the pool blob but the runtime does not honour it yet — it lands with 0.6.0 ${landing}; until then it is inert${extra}`,
       );
-    if (mp.policy === "classifier") {
-      pending("policy", LANDING_PREROUTE, " (the pool routes heuristically until then)");
-    }
-    if (mp.directives !== undefined) pending("directives", LANDING_PREROUTE);
-    if (mp.rules !== undefined) pending("rules", LANDING_PREROUTE);
-    if (mp.classifier !== undefined) pending("classifier", LANDING_PREROUTE);
+    // 0.6.0 PR 9e — the closure-shaped keys. `directives` and `rules` ride the
+    // pool blob and are consumed by runtime-core's `preRoute` on BOTH paths
+    // (PR 9b), so they pend nowhere. `policy: classifier`, `classifier:` and
+    // `strategy.{guide,shadow,committee,model_directed}` are runtime CLOSURES
+    // the blob cannot carry: the interpreter builds them through `wireModels`
+    // and a compiled bundle through `wireHybrid` — on the six targets whose
+    // emitters render that call. Anywhere else the key is still inert in the
+    // bundle, and the warning names the reach precisely rather than claiming
+    // "the runtime does not honour it".
+    const hybridWired = HYBRID_WIRED_TARGETS.has(ctx.target);
+    const closurePending = (key: string, what: string): void => {
+      if (hybridWired) return;
+      warn(
+        ctx,
+        "model-plan-pending-runtime",
+        `${poolPath}.${key}`,
+        `${poolPath}.${key} is honoured by the crewhaus run / serve interpreter and by compiled cli / channel / managed / workflow / graph / crew bundles (wireHybrid from @crewhaus/model-service), but a compiled ${ctx.target} bundle does not construct ${what} yet — that lands with 0.6.0 ${LANDING_HYBRID_EMITTERS}; until then the key is inert in this compiled target`,
+      );
+    };
+    if (mp.policy === "classifier") closurePending("policy", "the label call");
+    if (mp.classifier !== undefined) closurePending("classifier", "the label call");
     if (mp.strategy !== undefined) {
       // 0.6.0 PR 9c consumes `cascade` (`evaluation.on_fail: escalate` re-runs
       // on `escalate_to`, `clean_prompt` picks the snapshot, `max_escalations`
-      // caps the rungs); PR 9d constructs guide / shadow / committee through
-      // `wireSideCalls` (model-service) and runtime-core consumes them.
-      if (!SIDE_CALL_WIRED_TARGETS.has(ctx.target)) {
-        for (const key of ["guide", "shadow"] as const) {
-          if (mp.strategy[key] === undefined) continue;
-          warn(
-            ctx,
-            "model-plan-pending-runtime",
-            `${poolPath}.strategy.${key}`,
-            `${poolPath}.strategy.${key} is honoured by the crewhaus run / serve interpreter and by compiled workflow / graph / crew bundles (wireSideCalls from @crewhaus/model-service), but a compiled ${ctx.target} bundle does not construct the side call yet — that lands with 0.6.0 ${LANDING_MODEL_DIRECTED}; until then the key is inert in this compiled target`,
-          );
-        }
+      // caps the rungs) straight off the blob, so it pends nowhere.
+      for (const key of ["guide", "shadow", "committee"] as const) {
+        if (mp.strategy[key] === undefined) continue;
+        closurePending(`strategy.${key}`, "the side call");
       }
       if (mp.strategy.model_directed === true) {
-        // 0.6.0 PR 8b landed the runtime half: `wireModels` constructs the
-        // Consult / Escalate pair under this key, and the `crewhaus run` /
-        // `crewhaus serve` interpreter reaches it. A COMPILED bundle does not
-        // yet — every emitter still renders the four routing fields through
-        // `renderModelWiringFields`, which never renders the hybrid pair —
-        // so the warning is scoped to compiled targets, not "the runtime".
-        warn(
-          ctx,
-          "model-plan-pending-runtime",
-          `${poolPath}.strategy.model_directed`,
-          `${poolPath}.strategy.model_directed is honoured by the crewhaus run / serve interpreter (Consult and Escalate are registered from @crewhaus/tool-consult), but a compiled bundle does not register the tools yet — that lands with 0.6.0 ${LANDING_MODEL_DIRECTED}; until then the key is inert in compiled targets`,
-        );
+        closurePending("strategy.model_directed", "the Consult / Escalate pair");
       }
     }
     if (mp.reward !== undefined) pending("reward", LANDING_ROUTER_STORE);

@@ -27,7 +27,7 @@ import {
   buildGuideSideCall,
   buildShadowSideCall,
   hasSideCallStrategy,
-  renderSideCallWiringFields,
+  renderHybridWiringFields,
   textOnlyTranscript,
   wireModels,
   wireSideCalls,
@@ -221,15 +221,15 @@ describe("wireModels + wireSideCalls (spread-return-{}, key order)", () => {
     expect(MODEL_WIRING_KEYS).toHaveLength(4);
   });
 
-  test("renderSideCallWiringFields: '' without a guide/shadow/committee; the spread field with the pool blob otherwise", () => {
-    expect(renderSideCallWiringFields({ modelPool: POOL }, "    ", "wf")).toBe("");
-    expect(renderSideCallWiringFields({}, "    ", "wf")).toBe("");
+  test("renderHybridWiringFields: '' without a guide/shadow/committee; the spread field with the pool blob otherwise", () => {
+    expect(renderHybridWiringFields({ modelPool: POOL }, "    ", "wf")).toBe("");
+    expect(renderHybridWiringFields({}, "    ", "wf")).toBe("");
     const pool: IrModelPool = {
       ...POOL,
       strategy: { shadow: { candidate: MID, sampleRate: 0.5 } },
     };
-    expect(renderSideCallWiringFields({ modelPool: pool }, "    ", 'w"f')).toBe(
-      `\n    ...wireSideCalls(${JSON.stringify(pool)}, { sessionName: "w\\"f" }),`,
+    expect(renderHybridWiringFields({ modelPool: pool }, "    ", 'w"f')).toBe(
+      `\n    ...wireHybrid(${JSON.stringify(pool)}, { sessionName: "w\\"f" }),`,
     );
   });
 });

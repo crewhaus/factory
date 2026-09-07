@@ -305,9 +305,23 @@ spread field, `...wireSideCalls(<pool blob>, { sessionName }),` (plus the
 `@crewhaus/model-service` import), ONLY on a pooled step / node whose
 `strategy` declares a guide, a shadow or a committee — keys no 0.5.x spec can
 carry — so every pin here and every routed pin under `__fixtures__/model-wiring/`
-is byte-identical (`side-call-warnings.test.ts` pins the absence on a plain
+is byte-identical (`hybrid-wiring-warnings.test.ts` pins the absence on a plain
 pool). Crew roles reach the same closures through the orchestrator's
 `composeSideCalls`, not through codegen.
+
+**0.6.0 PR 9e delta — the closure half of a pool reaches every routed bundle;
+NO pin here moved.** `strategy.model_directed` (Consult + Escalate), `policy:
+classifier` and `strategy.{guide,shadow,committee}` are runtime CLOSURES, so
+they cannot ride the `JSON.stringify(modelPool)` blob — until this PR a
+compiled cli / channel / managed bundle carried the pool and none of the
+behaviour while `crewhaus run` had all of it. The cli, channel-bot and managed
+emitters now render ONE new spread field beside the literal routing fields,
+`...wireHybrid(<pool blob>, { sessionName }),` (plus the
+`@crewhaus/model-service` import), and the workflow / graph emitters' 9d field
+was RENAMED from `...wireSideCalls(…)` to the same `...wireHybrid(…)` call —
+one root for all three mechanisms. Every one of those fields is gated on a
+pool key no 0.5.x spec can carry, so every pin here and every routed pin under
+`__fixtures__/model-wiring/` is byte-identical.
 
 **0.6.0 PR 11 delta — sub-agent routing end to end; NO pin moved.** The three
 `renderSubAgentDef` copies (target-cli, target-channel-bot, target-crew)

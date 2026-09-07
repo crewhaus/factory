@@ -9,7 +9,12 @@ import {
   renderBundleReadme,
 } from "@crewhaus/ir";
 import { memoryFragmentFromIr } from "@crewhaus/memory-service";
-import { renderModelWiringFields, renderSubAgentDef } from "@crewhaus/model-service";
+import {
+  HYBRID_WIRING_IMPORT,
+  renderHybridWiringFields,
+  renderModelWiringFields,
+  renderSubAgentDef,
+} from "@crewhaus/model-service";
 import { renderBannerBoot } from "./banner";
 
 // Phase 3 §3.3 — the banner contract is shared with the interpreter path
@@ -785,6 +790,16 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   // replaced. Empty when the spec declared none, keeping bundles
   // byte-identical.
   const failoverFields = renderModelWiringFields(ir.agent, "  ");
+  // 0.6.0 PR 9e (§7.2.3, §7.2.4, §7.4, §7.8) — the CLOSURE half of the same
+  // config. `strategy.model_directed`, `policy: classifier` and
+  // `strategy.{guide,shadow}` cannot ride the pool blob (they are functions,
+  // not data), so a bundle that rendered only the literal fields silently
+  // dropped Consult / Escalate, routed a classifier pool heuristically and
+  // ran unguided while `crewhaus run` did all three. The bundle now calls the
+  // SAME composition root the interpreter calls. "" — and no import — when
+  // the pool declares none of them, so pre-0.6.0 bundles stay byte-identical.
+  const hybridFields = renderHybridWiringFields(ir.agent, "  ", ir.name);
+  const hybridImport = hybridFields.length > 0 ? `${HYBRID_WIRING_IMPORT}\n` : "";
   // Section 55 / item 23 — thread the spec's failure_taxonomy so recovery-
   // engine consults the named error classes (incl. the `switch-model`
   // verdict) before its built-in flow. Empty when the spec omits it.
@@ -809,7 +824,7 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   model: ${escapeJsonString(ir.agent.model)},
   instructions: ${escapeJsonString(ir.agent.instructions)},
   sessionName: ${escapeJsonString(ir.name)},
-  sessionTarget: "cli",${maxTokensField}${thinkingField}${temperatureField}${streamingField}${rateLimitsField}${compactionModelField}${compactionTuningFields}${limitsFields}${failoverFields}${failureTaxonomyField}${budgetField}${evaluation.field}${sloField}${toolsField}${permField}${sandboxField}
+  sessionTarget: "cli",${maxTokensField}${thinkingField}${temperatureField}${streamingField}${rateLimitsField}${compactionModelField}${compactionTuningFields}${limitsFields}${failoverFields}${hybridFields}${failureTaxonomyField}${budgetField}${evaluation.field}${sloField}${toolsField}${permField}${sandboxField}
   hooks: ${specHooks.hooksExpr},
   skills: __skills,
   slashCommands: __slashCommands,${feedbackField}${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}${memory.field}
@@ -871,7 +886,7 @@ ${catchBlock}${finallyBlock}`;
 // Source spec: ${escapeJsonString(ir.name)} (target: cli, ir version: ${ir.version})
 import { formatRunFailure, toFailureReport } from "@crewhaus/errors";
 import { runChatLoop } from "@crewhaus/runtime-core";
-${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${evaluationImportBlock}${memoryImportBlock}${knowledgeImportBlock}${pluginsImportBlock}${extensionImport}
+${hybridImport}${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${evaluationImportBlock}${memoryImportBlock}${knowledgeImportBlock}${pluginsImportBlock}${extensionImport}
 ${watchmeEnvStamp}${registerBlock}
 ${pluginsActivateBoot}${extensionBoot}${pluginsRegisterBoot}${specHooks.bootBlock}
 

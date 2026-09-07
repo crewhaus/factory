@@ -31,7 +31,7 @@ import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { CrewhausError } from "@crewhaus/errors";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
 import type { ModelProfile, RouteRule } from "@crewhaus/model-plan";
-import { hasSideCallStrategy, wireSideCalls } from "@crewhaus/model-service";
+import { poolNeedsHybridWiring, wireHybrid } from "@crewhaus/model-service";
 import {
   BUILTIN_DEFAULT_RULES,
   type PermissionMode,
@@ -351,6 +351,8 @@ export type RunOptions = {
   readonly _scoreboard?: RunChatLoopOptions["_scoreboard"];
   /** 0.6.0 PR 9d — test injection for a role's shadow / committee judge. */
   readonly _judgeAdapter?: ProviderAdapter;
+  /** 0.6.0 PR 9e — test injection for a role's `policy: classifier` label call. */
+  readonly _classifierAdapter?: ProviderAdapter;
 };
 
 export type RunnableCrew = {
@@ -1097,26 +1099,35 @@ export function scopeRolePool(pool: RoleModelPool, roleName: string): RoleModelP
 }
 
 /**
- * 0.6.0 PR 9d (§7.4, §7.6, §7.8) — a role's side-call closures, built by the
- * composition root from the role's SCOPED pool at every activation (one
- * activation is one single-turn run, so a committee is legal here) and
- * spread at BOTH role call sites (primary activation + inline A2A peer turn,
- * the 0.5.5 `toolsetScope` lesson). The test seams ride along: the role's
- * `_poolAdapters` double as the nested side-call adapters, `_judgeAdapter`
- * as the judge. Spread-return-`{}`: a role whose pool declares no guide /
- * shadow / committee hands runtime-core exactly the options it got before.
+ * 0.6.0 PR 9d/9e (§7.2.3, §7.2.4, §7.4, §7.6, §7.8) — a role's runtime
+ * CLOSURES, built by the composition root from the role's SCOPED pool at
+ * every activation (one activation is one single-turn run, so a committee is
+ * legal here) and spread at BOTH role call sites (primary activation +
+ * inline A2A peer turn, the 0.5.5 `toolsetScope` lesson). Since 9e this is
+ * `wireHybrid`, not `wireSideCalls`: the same call also yields the
+ * model-directed pair (`Consult` / `Escalate` + the escalation latch) and the
+ * `policy: classifier` route classifier, so a crew role reaches every hybrid
+ * mechanism the cli shape does. The test seams ride along: the role's
+ * `_poolAdapters` double as the nested side-call adapters, `_judgeAdapter` is
+ * the shadow / committee judge and `_classifierAdapter` the label call. Spread-return-`{}`: a role whose pool
+ * declares none of them hands runtime-core exactly the options it got before.
  */
 export function composeSideCalls(
   def: RoleDefinition,
   opts: RunOptions,
   roleName: string,
   crewName: string,
-): Pick<RunChatLoopOptions, "sideCalls"> {
-  if (def.modelPool === undefined || !hasSideCallStrategy(def.modelPool)) return {};
-  return wireSideCalls(scopeRolePool(def.modelPool, roleName), {
+): Pick<RunChatLoopOptions, "sideCalls" | "hybridTools" | "escalation" | "routeClassifier"> {
+  if (!poolNeedsHybridWiring(def.modelPool)) return {};
+  const pool = def.modelPool;
+  if (pool === undefined) return {};
+  return wireHybrid(scopeRolePool(pool, roleName), {
     sessionName: crewName,
     ...(opts._poolAdapters !== undefined ? { _consultAdapters: opts._poolAdapters } : {}),
     ...(opts._judgeAdapter !== undefined ? { _judgeAdapter: opts._judgeAdapter } : {}),
+    ...(opts._classifierAdapter !== undefined
+      ? { _classifierAdapter: opts._classifierAdapter }
+      : {}),
   });
 }
 
