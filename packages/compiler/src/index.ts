@@ -1206,7 +1206,6 @@ const HYBRID_WIRED_TARGETS: ReadonlySet<Spec["target"]> = new Set([
 ]);
 const LANDING_HYBRID_EMITTERS =
   "a later 0.6.0 row (the wireHybrid call in this target's emitter — cli, channel, managed, workflow, graph and crew bundles construct it today)";
-const LANDING_ROUTER_STORE = "PR 10 (scoped arms, priors and the reward store)";
 const LANDING_JUDGE_PANEL = "the §6.2 judge-panel wiring (createJudgeGrader in every judge site)";
 const LANDING_AUX_PARAMS =
   "the §4.2 per-slot params consumers (the judge / compaction / degrade / security / watchme request builders)";
@@ -2172,20 +2171,10 @@ function lowerPoolCandidate(
   // (`thinking` / `max_tokens` / `temperature` / `limits` / `instructions` /
   // `tools` / `tool_config` / `permissions` / `rate_limits` / `caching` /
   // `cost`) lowers silently: runtime-core builds one CandidatePlan per
-  // candidate from this blob at boot. Only the per-candidate failover chain
-  // and breaker (PR 10) are still reported pending.
-  for (const [irKey, specKey, landing] of [
-    ["fallbacks", "fallbacks", LANDING_ROUTER_STORE],
-    ["circuitBreaker", "circuit_breaker", LANDING_ROUTER_STORE],
-  ] as const) {
-    if (candidate[irKey] === undefined) continue;
-    warn(
-      ctx,
-      "model-plan-pending-runtime",
-      `${cpath}.${specKey}`,
-      `${cpath}.${specKey} is lowered into the pool blob but the runtime does not honour it yet — it lands with 0.6.0 ${landing}; until then the candidate serves on the run's settings`,
-    );
-  }
+  // candidate from this blob at boot. PR 10 consumes the last two —
+  // `fallbacks` (a per-profile failover chain is the candidate's adapter) and
+  // `circuit_breaker` (every candidate is breaker-wrapped; an open breaker is
+  // an eligibility filter) — so nothing on a candidate pends any more.
   return candidate;
 }
 
@@ -2462,9 +2451,10 @@ function lowerModelFailover(
         closurePending("strategy.model_directed", "the Consult / Escalate pair");
       }
     }
-    if (mp.reward !== undefined) pending("reward", LANDING_ROUTER_STORE);
-    // `scope` is consumed since PR 9a (stamped on `model_route.scope`); the
-    // routing store keys arms by it from PR 10 on.
+    // `reward` is consumed since PR 10 (`quality_source` by the deferred fold,
+    // `priors` / `floor` / `reset_on_profile_change` by the router and the
+    // routing store); `scope` since PR 9a (stamped on `model_route.scope`)
+    // and keyed on by the routing store since PR 10.
     out.modelPool = {
       candidates: mp.candidates.map((c, i) =>
         lowerPoolCandidate(c, ctx, `${poolPath}.candidates[${i}]`),

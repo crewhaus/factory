@@ -65,6 +65,9 @@ afterAll(() => {
 
 const CHEAP = "claude-haiku-4-5";
 const STRONG = "claude-opus-4-1";
+/** §7.9 (PR 10) — the scoreboard ARM IDS: the candidates' profile names. */
+const CHEAP_ARM = "fast";
+const STRONG_ARM = "strong";
 /** The judge's wire model (priced: $15/M input → 100_000 tokens = $1.50). */
 const JUDGE = "claude-opus-4";
 
@@ -287,8 +290,8 @@ describe("cascade — a failing cheap draft escalates to the strong rung (accept
     // one draft line with its judged quality (once), one escalation line, one
     // strategy line. The draft's counterfactual: 0.2 < 0.95 → wouldPass 0.
     const lines = armLines(root);
-    // Arms key on the SPEC model string (the profile name becomes the key in PR 10's scoped arms).
-    const draftLines = lines.filter((l) => l["m"] === CHEAP);
+    // Arms key on the ARM ID — the profile name for a profiled candidate (§7.9, PR 10).
+    const draftLines = lines.filter((l) => l["m"] === CHEAP_ARM);
     expect(draftLines).toHaveLength(1);
     expect(draftLines[0]).toMatchObject({
       v: 2,
@@ -298,7 +301,7 @@ describe("cascade — a failing cheap draft escalates to the strong rung (accept
       at: "draft",
       wp: 0,
     });
-    const escLines = lines.filter((l) => l["m"] === STRONG);
+    const escLines = lines.filter((l) => l["m"] === STRONG_ARM);
     expect(escLines).toHaveLength(1);
     expect(escLines[0]).toMatchObject({ v: 2, q: 0.95, st: "escalate", at: "escalation" });
     expect("wp" in (escLines[0] ?? {})).toBe(false);
@@ -426,7 +429,7 @@ describe("cascade — a failing cheap draft escalates to the strong rung (accept
     const lines = armLines(root);
     expect(lines.filter((l) => l["agg"] !== 1)).toHaveLength(0); // no reward line at all
     const routeKey = cap.routes[0]?.routeKey as string;
-    expect(sb.score(routeKey, CHEAP)).toMatchObject({ n: 0, ungraded: 1 });
+    expect(sb.score(routeKey, CHEAP_ARM)).toMatchObject({ n: 0, ungraded: 1 });
   });
 
   test("past budget.judge_share the strong rung serves DIRECTLY: reason judge_share_exhausted on the route and the stage, no grade, the judge is not skipped silently", async () => {
@@ -599,11 +602,11 @@ describe("cascade — review findings on PR 9c (§7.13 fall-back, snapshot copy,
     // arm carries only its failed call (reward 0); the strategy line records
     // the failing turn with the draft's quality.
     const lines = armLines(root);
-    const draftLines = lines.filter((l) => l["m"] === CHEAP);
+    const draftLines = lines.filter((l) => l["m"] === CHEAP_ARM);
     expect(draftLines).toHaveLength(1);
     expect(draftLines[0]).toMatchObject({ v: 2, s: 1, q: 0.2, st: "draft", at: "draft" });
     expect("wp" in (draftLines[0] ?? {})).toBe(false);
-    const strongLines = lines.filter((l) => l["m"] === STRONG);
+    const strongLines = lines.filter((l) => l["m"] === STRONG_ARM);
     expect(strongLines.length).toBeGreaterThan(0);
     expect(strongLines.every((l) => l["s"] === 0 && l["r"] === 0)).toBe(true);
     const strategyLines = lines.filter((l) => l["m"] === "strategy:cascade");
@@ -655,7 +658,7 @@ describe("cascade — review findings on PR 9c (§7.13 fall-back, snapshot copy,
     ).rejects.toThrow();
     expect(cap.seen.filter((e) => e.kind === "run_failed")).toHaveLength(1);
     expect(cap.stages.map((s) => s.outcome)).toEqual(["started", "failed"]);
-    const draftLines = armLines(root).filter((l) => l["m"] === CHEAP);
+    const draftLines = armLines(root).filter((l) => l["m"] === CHEAP_ARM);
     expect(draftLines).toHaveLength(1);
     expect(draftLines[0]).toMatchObject({ q: 0.1, st: "draft" });
   });
@@ -809,8 +812,8 @@ describe("cascade — review findings on PR 9c (§7.13 fall-back, snapshot copy,
       const root1 = tmpRoot();
       await baseRun({ ...common, _scoreboard: openScoreboard(root1, { now: () => 1 }) });
       const judgedLines = armLines(root1).filter((l) => l["agg"] !== 1);
-      const draft = judgedLines.find((l) => l["m"] === CHEAP);
-      const esc = judgedLines.find((l) => l["m"] === STRONG);
+      const draft = judgedLines.find((l) => l["m"] === CHEAP_ARM);
+      const esc = judgedLines.find((l) => l["m"] === STRONG_ARM);
       expect(draft).toMatchObject({ q: 0.1 });
       expect(esc).toMatchObject({ q: 0.9 });
       expect(draft?.["r"] as number).toBeLessThan(esc?.["r"] as number);
@@ -829,7 +832,7 @@ describe("cascade — review findings on PR 9c (§7.13 fall-back, snapshot copy,
       // Counted `ungraded`; no reward line at all (an omitted quality would
       // have read as a perfect 1.0), and no strategy line without a final
       // quality.
-      expect(sb2.score(routeKey, STRONG)).toMatchObject({ n: 0, ungraded: 1 });
+      expect(sb2.score(routeKey, STRONG_ARM)).toMatchObject({ n: 0, ungraded: 1 });
       const lines2 = armLines(root2);
       expect(lines2.filter((l) => l["agg"] !== 1)).toHaveLength(0);
       expect(lines2.filter((l) => l["m"] === "strategy:cascade")).toHaveLength(0);

@@ -2,10 +2,12 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openScoreboard } from "@crewhaus/routing-store";
+import { openScoreboard, readRouteFreeze, routeFreezePath } from "@crewhaus/routing-store";
 import {
+  formatRouteFreeze,
   formatRouteStatus,
   loadArms,
+  loadRouteFreeze,
   parseRouteArgs,
   readRouteDecisions,
   resetRouting,
@@ -191,5 +193,72 @@ describe("route explain", () => {
     );
     expect(() => readRouteDecisions(".crewhaus", "a/b")).toThrow(/invalid session/);
     expect(() => readRouteDecisions(".crewhaus", "")).toThrow(/invalid session/);
+  });
+});
+
+describe("route freeze — the learned policy's kill switch (0.6.0 §6.3 / §10.1)", () => {
+  test("arg parsing: a policyVersion positional, --reason, --clear; never both, never neither", () => {
+    expect(parseRouteArgs(["freeze", "pool-abc"])).toEqual({
+      sub: "freeze",
+      dir: ".crewhaus",
+      policyVersion: "pool-abc",
+    });
+    expect(
+      parseRouteArgs(["freeze", "pool-abc", "--reason", "incident 42", "--dir", "/tmp/x"]),
+    ).toEqual({ sub: "freeze", dir: "/tmp/x", policyVersion: "pool-abc", reason: "incident 42" });
+    expect(parseRouteArgs(["freeze", "--clear"])).toEqual({
+      sub: "freeze",
+      dir: ".crewhaus",
+      clear: true,
+    });
+    expect(() => parseRouteArgs(["freeze"])).toThrow(/policyVersion.*required/);
+    expect(() => parseRouteArgs(["freeze", "pool-abc", "--clear"])).toThrow(/not both/);
+    expect(() => parseRouteArgs(["freeze", "pool-abc", "--reason"])).toThrow(/requires a text/);
+    expect(() => parseRouteArgs(["freeze", "a", "b"])).toThrow(/unknown argument/);
+    // `status` still takes no positional, `--clear` is freeze-only.
+    expect(() => parseRouteArgs(["status", "--clear"])).toThrow(/unknown argument/);
+  });
+
+  test("freeze writes the marker the runtime reads, status shows it, --clear lifts it", () => {
+    const dir = seededRoot();
+    const msg = runRoute(["freeze", "pool-1234", "--reason", "roster audit", "--dir", dir]);
+    expect(msg).toContain("Froze routing at policyVersion pool-1234");
+    expect(msg).toContain(routeFreezePath(dir));
+    expect(readRouteFreeze(dir)).toMatchObject({
+      version: 1,
+      policyVersion: "pool-1234",
+      reason: "roster audit",
+    });
+    expect(loadRouteFreeze(dir)?.policyVersion).toBe("pool-1234");
+
+    const status = runRoute(["status", "--dir", dir]);
+    expect(status.split("\n")[0]).toContain("FROZEN at policyVersion pool-1234");
+    expect(status).toContain("roster audit");
+    expect(status).toContain("claude-opus-4-8"); // the table still renders below the banner
+
+    expect(runRoute(["freeze", "--clear", "--dir", dir])).toContain("Lifted the routing freeze");
+    expect(readRouteFreeze(dir)).toBeUndefined();
+    expect(runRoute(["freeze", "--clear", "--dir", dir])).toContain("nothing to lift");
+    expect(runRoute(["status", "--dir", dir])).not.toContain("FROZEN");
+  });
+
+  test("route reset removes the freeze marker along with the arms", () => {
+    const dir = seededRoot();
+    runRoute(["freeze", "pool-1234", "--dir", dir]);
+    expect(existsSync(routeFreezePath(dir))).toBe(true);
+    runRoute(["reset", "--dir", dir]);
+    expect(existsSync(routeFreezePath(dir))).toBe(false);
+    expect(loadArms(dir)).toEqual([]);
+  });
+
+  test("formatRouteFreeze renders nothing when unfrozen", () => {
+    expect(formatRouteFreeze(undefined)).toBe("");
+    expect(
+      formatRouteFreeze({
+        version: 1,
+        policyVersion: "pool-9",
+        frozenAt: "2026-09-05T00:00:00.000Z",
+      }),
+    ).toContain("since 2026-09-05T00:00:00.000Z");
   });
 });

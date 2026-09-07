@@ -32,6 +32,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { FLOOR_BLOCKED_ROUTE_REASON as ROUTER_FLOOR_BLOCKED_ROUTE_REASON } from "@crewhaus/model-router";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 
 /** Default location of the per-session metrics history, relative to cwd. */
@@ -61,13 +62,24 @@ export const MAX_METRICS_HISTORY_LINES = Math.max(BASELINE_WINDOW * 4, 200);
  * 0.6.0 (design §7.10) — the `model_route.reason` the learned policy records
  * when no non-floor arm is exploitable and it serves the floor arm instead.
  * The watchdog, the SLO monitor and metrics-collector all key `floor_block_rate`
- * on this string, so the router (PR 10) must publish it verbatim.
+ * on this string; the router publishes it verbatim and OWNS the constant
+ * (`@crewhaus/model-router`, PR 10) — re-exported here so every consumer
+ * imports one symbol instead of retyping the string.
  */
-export const FLOOR_BLOCKED_ROUTE_REASON = "floor-blocked";
+export const FLOOR_BLOCKED_ROUTE_REASON: typeof ROUTER_FLOOR_BLOCKED_ROUTE_REASON =
+  ROUTER_FLOOR_BLOCKED_ROUTE_REASON;
 
-/** True for a `model_route` decision the quality floor forced onto the floor arm. */
+/**
+ * True for a `model_route` decision the quality floor forced onto the floor
+ * arm. The router's reason is the bare constant; runtime-core may append its
+ * own `; `-separated notes (an eligibility exclusion, `no-eligible-candidate`)
+ * after it, so the match accepts that suffix too.
+ */
 export function isFloorBlockedRoute(ev: { readonly reason: string }): boolean {
-  return ev.reason === FLOOR_BLOCKED_ROUTE_REASON;
+  return (
+    ev.reason === FLOOR_BLOCKED_ROUTE_REASON ||
+    ev.reason.startsWith(`${FLOOR_BLOCKED_ROUTE_REASON}; `)
+  );
 }
 
 /**

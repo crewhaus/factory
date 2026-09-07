@@ -589,7 +589,8 @@ describe("PolicyRouter — the preRoute hint input (0.6.0 §7.2, §7.11)", () =>
     const d = r.route(HARD, "s", 0, { source: "eligibility", eligible: ["mid", "strong"] });
     expect(d.candidate).toBe(MID);
     expect(d.explored).toBe(true);
-    expect(seen).toEqual([MID.modelString, STRONG.modelString]);
+    // §7.9 (PR 10) — the scoreboard is read by ARM ID (the profile name).
+    expect(seen).toEqual(["mid", "strong"]);
   });
 
   test("routeKeySuffix appends to the band as <band>:<suffix>", () => {

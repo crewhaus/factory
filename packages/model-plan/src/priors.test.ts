@@ -3,7 +3,14 @@
  * capped, never applied when stale or malformed.
  */
 import { describe, expect, test } from "bun:test";
-import { MAX_PRIOR_PSEUDO_COUNT, loadPriors, priorKey, seededScoreLookup } from "./priors";
+import {
+  MAX_PRIOR_PSEUDO_COUNT,
+  blendPrior,
+  loadPriors,
+  priorKey,
+  priorsFingerprint,
+  seededScoreLookup,
+} from "./priors";
 
 const GOOD = {
   version: 1,
@@ -81,16 +88,83 @@ describe("loadPriors", () => {
 });
 
 describe("seededScoreLookup", () => {
-  test("live observations win; unseen arms read their prior; no priors → live passthrough", () => {
+  test("unseen arms read their prior; an arm with no prior passes through; no priors → live passthrough", () => {
     const loaded = loadPriors(GOOD);
     if (!loaded.ok) throw new Error("expected ok");
     const live = (routeKey: string, arm: string) =>
-      routeKey === "easy" && arm === "fast" ? { n: 3, meanReward: 0.5 } : undefined;
+      routeKey === "easy" && arm === "strong" ? { n: 3, meanReward: 0.5 } : undefined;
     const seeded = seededScoreLookup(live, loaded.priors);
-    expect(seeded("easy", "fast")).toEqual({ n: 3, meanReward: 0.5 });
-    expect(seeded("hard", "strong")).toEqual({ n: 4, meanReward: 0.91 });
+    // No prior for easy|strong → the live score, untouched.
+    expect(seeded("easy", "strong")).toEqual({ n: 3, meanReward: 0.5 });
+    // A prior stands in for the missing live history and is marked `seeded`
+    // so the router skips warm-up for it (its pseudo-count sits under the floor).
+    expect(seeded("hard", "strong")).toEqual({ n: 4, meanReward: 0.91, seeded: true });
     expect(seeded("hard", "fast")).toBeUndefined();
     expect(seededScoreLookup(live, undefined)).toBe(live);
+  });
+
+  test("a live arm with a prior reads the BLEND, still marked seeded, so one live observation does not re-open warm-up", () => {
+    const loaded = loadPriors(GOOD);
+    if (!loaded.ok) throw new Error("expected ok");
+    // One live observation on hard|strong (prior n=4, mean 0.91).
+    const seeded = seededScoreLookup(
+      (rk, arm) =>
+        rk === "hard" && arm === "strong"
+          ? { n: 1, meanReward: 0.5, varReward: 0, meanQuality: 0.7, qualityCount: 1 }
+          : undefined,
+      loaded.priors,
+    );
+    const s = seeded("hard", "strong");
+    expect(s?.seeded).toBe(true);
+    expect(s?.n).toBe(5);
+    expect(s?.meanReward).toBeCloseTo((4 * 0.91 + 0.5) / 5, 10);
+    // Live-only fields (judged quality) pass through untouched.
+    expect(s).toMatchObject({ meanQuality: 0.7, qualityCount: 1 });
+    // The prior fades: after many live observations the pooled mean sits at the live mean.
+    const many = seededScoreLookup(
+      () => ({ n: 1000, meanReward: 0.5, varReward: 0.01 }),
+      loaded.priors,
+    )("hard", "strong");
+    expect(many?.n).toBe(1004);
+    expect(many?.meanReward).toBeCloseTo(0.5, 2);
+    expect(many?.seeded).toBe(true);
+  });
+
+  test("blendPrior is the Chan parallel combine: pooled count, weighted mean, pooled variance", () => {
+    // prior: {0.8, 0.8, 1.0} → n=3, mean 0.8667, var 0.01333; live: {0.2, 0.4} → n=2, mean 0.3, var 0.02
+    const prior = { n: 3, meanReward: 0.8666666666666667, varReward: 0.013333333333333334 };
+    const live = { n: 2, meanReward: 0.3, varReward: 0.02 };
+    const b = blendPrior(prior, live);
+    expect(b.n).toBe(5);
+    expect(b.meanReward).toBeCloseTo(0.64, 10);
+    // Sample variance of {0.8, 0.8, 1.0, 0.2, 0.4} = 0.108
+    expect(b.varReward).toBeCloseTo(0.108, 10);
+    // Missing variances count as zero spread; n=1 each → var is just the between-means term.
+    const one = blendPrior({ n: 1, meanReward: 1 }, { n: 1, meanReward: 0 });
+    expect(one).toEqual({ n: 2, meanReward: 0.5, varReward: 0.5 });
+    expect(blendPrior({ n: 0, meanReward: 0 }, { n: 0, meanReward: 0 })).toEqual({
+      n: 0,
+      meanReward: 0,
+      varReward: 0,
+    });
+  });
+
+  test("priorsFingerprint keys on the roster alone: a rules/learning edit keeps it, a candidate edit changes it", () => {
+    const roster = [
+      { model: "claude-haiku-4-5", tags: ["cheap"], profile: "fast" },
+      { model: "claude-opus-4-8", tags: ["strong"], profile: "strong" },
+    ];
+    const a = priorsFingerprint(roster);
+    expect(a).toMatch(/^[0-9a-f]{16}$/);
+    // Same roster, spelled with a different key order → same fingerprint.
+    expect(
+      priorsFingerprint([
+        { profile: "fast", tags: ["cheap"], model: "claude-haiku-4-5" },
+        { tags: ["strong"], model: "claude-opus-4-8", profile: "strong" },
+      ]),
+    ).toBe(a);
+    expect(priorsFingerprint([roster[0], { ...roster[1], maxTokens: 2048 }])).not.toBe(a);
+    expect(priorsFingerprint([roster[0], { ...roster[1], enabled: false }])).not.toBe(a);
   });
 
   test("a live arm with n=0 still reads its prior", () => {

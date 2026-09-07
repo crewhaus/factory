@@ -1527,17 +1527,21 @@ describe("per-role model routing reaches the role loop (0.6.0 PR 3, §7.7)", () 
       // The decision is durable on the crew session — what `route explain` reads.
       const routes = readSessionLines(root).filter((l) => l.kind === "model_route");
       expect(routes).toHaveLength(1);
+      // §7.9 (PR 10) — the role's pool is SCOPED to the role, so the arm keys
+      // `<role>/<band>` (one shared arms file no longer pools every role's
+      // hard turns into one arm).
       expect(routes[0]?.payload).toMatchObject({
         model: OPUS,
         policy: "heuristic",
-        routeKey: "hard",
+        routeKey: "solo/hard",
+        scope: "solo",
         explored: false,
       });
       expect(typeof routes[0]?.payload["policyVersion"]).toBe("string");
 
       // …and the outcome was folded into the injected scoreboard for that arm.
       expect(scoreboard.records).toHaveLength(1);
-      expect(scoreboard.records[0]).toMatchObject({ routeKey: "hard", model: OPUS });
+      expect(scoreboard.records[0]).toMatchObject({ routeKey: "solo/hard", model: OPUS });
       expect(scoreboard.records[0]?.reward).toBeGreaterThan(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1851,7 +1855,8 @@ describe("per-candidate profile enrichment reaches the role loop (0.6.0 PR 7b, �
       const routes = readSessionLines(root).filter((l) => l.kind === "model_route");
       expect(routes).toHaveLength(1);
       expect(routes[0]?.payload).toMatchObject({ model: HAIKU, policy: "heuristic" });
-      expect(scoreboard.records.map((r) => r.model)).toEqual([HAIKU]);
+      // §7.9 (PR 10) — a profiled candidate's arm id is its profile name.
+      expect(scoreboard.records.map((r) => r.model)).toEqual(["fast"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1912,7 +1917,8 @@ describe("per-candidate profile enrichment reaches the role loop (0.6.0 PR 7b, �
       const routes = readSessionLines(root).filter((l) => l.kind === "model_route");
       expect(routes).toHaveLength(1);
       expect(routes[0]?.payload).toMatchObject({ model: HAIKU, policy: "heuristic" });
-      expect(scoreboard.records.map((r) => r.model)).toEqual([HAIKU]);
+      // §7.9 (PR 10) — a profiled candidate's arm id is its profile name.
+      expect(scoreboard.records.map((r) => r.model)).toEqual(["fast"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

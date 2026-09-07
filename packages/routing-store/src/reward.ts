@@ -77,6 +77,16 @@ export type RouteObservation = {
    * threshold.) Absent when the escalation was not graded.
    */
   readonly wouldPass?: boolean;
+  // ---- 0.6.0 §7.9 (PR 10) — routing provenance on the `v:2` line: which
+  // policy made the decision, under which pool scope, for which harness.
+  // Never read by `computeReward`; `route explain` / `watchme report` and the
+  // eval lineage join on them.
+  /** The `poolFingerprint` (`model_route.policyVersion`) in force when the arm was chosen. */
+  readonly policyVersion?: string;
+  /** `model_pool.scope` — the step / role / node the pool belongs to (also the routeKey prefix). */
+  readonly scope?: string;
+  /** The harness (spec name) that recorded the line — one shared store may serve several. */
+  readonly harness?: string;
 };
 
 /** Weights over the reward's component terms. Missing terms default sensibly. */
