@@ -4,6 +4,7 @@ import { DEFAULT_PIPELINE, type IrPass } from "@crewhaus/ir-passes";
 import { type Spec, SpecParseError, parseSpec } from "@crewhaus/spec";
 import { auditToolScopes } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { auditModelPlan } from "./model-plan-lint";
 import { auditSpecToolNames, collectToolNames } from "./scope-audit";
 
 /**
@@ -135,6 +136,15 @@ export function runLint(
       severity: "warning",
       rule: "thredz-override",
     });
+  }
+
+  // Stage 6 — 0.6.0 (design §10.1): the model-plan checks shared with
+  // `doctor --philosophy-alignment` — judge independence on pooled / strategy
+  // blocks (warning), profile tools ⊆ the shape's resolved toolset (warning),
+  // roster references that name no roster member (error, a drift guard behind
+  // the spec cross-field checks and the modelPlanIntegrity ir-pass).
+  for (const f of auditModelPlan(ir)) {
+    findings.push({ message: f.message, path: f.path, severity: f.severity, rule: f.rule });
   }
 
   // Warnings inform; only errors gate (`ok` drives the CLI exit code).

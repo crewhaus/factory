@@ -22,7 +22,7 @@
  * multi-stage run walks the flow the way an author reads it.
  */
 import type { Spec } from "@crewhaus/spec";
-import { OPTIMIZABLE_PATHS } from "@crewhaus/spec-patch";
+import { isOptimizable } from "@crewhaus/spec-patch";
 
 /** The stage noun each multi-stage shape uses in its spec + diagnostics. */
 export type StageKind = "step" | "node" | "role" | "agent";
@@ -133,26 +133,15 @@ export function findStage(
 
 /**
  * Guard rail for the enumeration above: every emitted path must be inside the
- * target's `OPTIMIZABLE_PATHS` whitelist by the same prefix rule `validatePatch`
- * applies. Exported so the CLI and the tests can assert it cheaply without
- * re-deriving spec-patch's matcher; `validatePatch` remains the authority on
- * the real patch.
+ * target's `OPTIMIZABLE_PATHS` whitelist by the SAME rule `validatePatch`
+ * applies — spec-patch's exported `isOptimizable` (exact match, the 0.6.0
+ * wildcard segment, the structural `model_pool` rule, then prefix). Exported
+ * so the CLI and the tests can assert it cheaply; `validatePatch` remains the
+ * authority on the real patch.
  */
 export function stagePathIsWhitelisted(
   target: Spec["target"],
   path: ReadonlyArray<string>,
 ): boolean {
-  const allowed = OPTIMIZABLE_PATHS[target];
-  for (const ok of allowed) {
-    if (path.length < ok.length) continue;
-    let match = true;
-    for (let i = 0; i < ok.length; i++) {
-      if (ok[i] !== path[i]) {
-        match = false;
-        break;
-      }
-    }
-    if (match) return true;
-  }
-  return false;
+  return isOptimizable(target, path);
 }

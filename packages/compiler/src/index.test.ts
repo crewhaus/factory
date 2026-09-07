@@ -1007,6 +1007,61 @@ observability:
     });
   });
 
+  // 0.6.0 (design §8.4, PR 19 carrying PR 18's runtime half) — the three
+  // hybrid-routing rate targets lower like the existing rates, and are the
+  // ONLY change to an otherwise pre-0.6.0 slo block (absent ⇒ absent).
+  test("0.6.0: escalation_rate / judge_fail_rate / floor_block_rate lower to camelCase rate targets", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-opus-4-6
+  instructions: i
+observability:
+  slo:
+    escalation_rate: 0.3
+    judge_fail_rate: 0.5
+    floor_block_rate: 0.2
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.observability?.slo).toEqual({
+      escalationRate: 0.3,
+      judgeFailRate: 0.5,
+      floorBlockRate: 0.2,
+      mitigation: ["alert"],
+    });
+    // A routing-only slo block satisfies the "at least one target" refine.
+    const routingOnly = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-opus-4-6
+  instructions: i
+observability:
+  slo:
+    floor_block_rate: 0.1
+`);
+    expect(lower(routingOnly)).toBeDefined();
+    // A pre-0.6.0 block never grows the new keys.
+    const legacy = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-opus-4-6
+  instructions: i
+observability:
+  slo:
+    error_rate: 0.05
+`);
+    const legacyIr = lower(legacy);
+    if (legacyIr.target !== "cli") throw new Error("unexpected target");
+    expect(Object.keys(legacyIr.observability?.slo ?? {}).sort()).toEqual([
+      "errorRate",
+      "mitigation",
+    ]);
+  });
+
   test("carries an explicit mitigation ladder verbatim", () => {
     const spec = parseSpec(`
 name: hello

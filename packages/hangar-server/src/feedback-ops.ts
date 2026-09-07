@@ -46,7 +46,12 @@ import {
   ratingsDatasetName,
   readDistillState,
 } from "@crewhaus/feedback-distill";
-import { OPTIMIZABLE_PATHS, applySpecEdits, diffSpecYaml } from "@crewhaus/spec-patch";
+import {
+  OPTIMIZABLE_PATHS,
+  applySpecEdits,
+  diffSpecYaml,
+  isOptimizable,
+} from "@crewhaus/spec-patch";
 import { MAX_JSONL_LINES, SESSION_JSONL_RE } from "./constants";
 import {
   absent,
@@ -507,22 +512,12 @@ type AdviceProposal = {
  *  would cost before the operator clicks. Enforced on the server either way —
  *  this is a label, not the gate. */
 function tierFor(target: string, path: readonly string[]): AdviceProposal["tier"] {
-  const allowed = (OPTIMIZABLE_PATHS as Record<string, ReadonlyArray<ReadonlyArray<string>>>)[
-    target
-  ];
-  if (allowed === undefined) return "human-owned";
-  for (const ok of allowed) {
-    if (path.length < ok.length) continue;
-    let match = true;
-    for (let i = 0; i < ok.length; i += 1) {
-      if (ok[i] !== path[i]) {
-        match = false;
-        break;
-      }
-    }
-    if (match) return "auto-tunable";
-  }
-  return "human-owned";
+  // spec-patch's own matcher (exact + wildcard + the structural rule), so the
+  // label can never disagree with the gate.
+  if (!(target in OPTIMIZABLE_PATHS)) return "human-owned";
+  return isOptimizable(target as keyof typeof OPTIMIZABLE_PATHS, path)
+    ? "auto-tunable"
+    : "human-owned";
 }
 
 function readProposals(ctx: M3Context): AdviceProposal[] {

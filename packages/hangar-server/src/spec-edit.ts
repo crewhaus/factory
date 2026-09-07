@@ -70,9 +70,11 @@ import {
   REDACTED_VALUE,
   type SpecDiffEntry,
   type SpecEdit,
+  WILDCARD_SEGMENT,
   applySpecEdits,
   diffSpecYaml,
   isCredentialKey,
+  isOptimizable,
   specHasPath,
 } from "@crewhaus/spec-patch";
 import { MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
@@ -362,8 +364,16 @@ export type SpecTrustRow = {
  * human-owned; it simply needs the confirmation without the interstitial.
  */
 export const SECURITY_SURFACES: ReadonlyArray<{
+  /** Segments matched from the ROOT of the path (`anywhere` widens this). */
   readonly prefix: readonly string[];
   readonly reason: string;
+  /**
+   * 0.6.0 — match the segments as a contiguous run ANYWHERE in the path
+   * (with `"*"` = any one segment), so one row covers a block that hangs
+   * off several hosts: `model_pool.rules` on `agent`, `steps[i]`, `nodes.x`,
+   * `roles.r` and every `sub_agents.<n>` alike.
+   */
+  readonly anywhere?: true;
 }> = [
   {
     prefix: ["permissions"],
@@ -421,11 +431,61 @@ export const SECURITY_SURFACES: ReadonlyArray<{
   { prefix: ["wallets"], reason: "wallets hold funds" },
   { prefix: ["chains"], reason: "chain bindings decide which network is written to" },
   { prefix: ["contracts"], reason: "contract bindings decide which addresses are called" },
+  // ---- 0.6.0 (design §8.3, §10.3) — the hybrid-model surfaces. The
+  // optimizer may tune a handful of DIALS inside these blocks (a profile's
+  // `max_tokens`, `rules[*].enabled`, `strategy.shadow.sample_rate`, …), but a
+  // console write to any of them takes the typed confirmation: the same block
+  // carries the roster, the rule targets, the judge identity and the floor.
+  {
+    prefix: ["models"],
+    reason:
+      "a model profile declares identity, tools, permissions and spend for every slot that references it — the roster is never edited by accident",
+  },
+  {
+    prefix: ["model_pool", "rules"],
+    anywhere: true,
+    reason: "routing rules decide which turns leave the cheap lane and which arm serves them",
+  },
+  {
+    prefix: ["model_pool", "strategy"],
+    anywhere: true,
+    reason:
+      "the hybrid strategy names the draft, escalation, guide, shadow and committee arms and registers the Escalate / Consult tools",
+  },
+  {
+    prefix: ["model_pool", "reward"],
+    anywhere: true,
+    reason:
+      "the reward block bounds what the learned policy may exploit (quality source, priors, the floor) — never tuned by the loop it bounds",
+  },
+  {
+    prefix: ["sub_agents", WILDCARD_SEGMENT, "allowed_profiles"],
+    anywhere: true,
+    reason:
+      "the profile allowlist is what a model-filled Task profile argument is validated against — a roster decision for the child",
+  },
 ];
 
+/** `prefix` matches the path from segment `start` (`"*"` = any one segment). */
+function matchesFrom(prefix: readonly string[], path: readonly string[], start: number): boolean {
+  if (path.length < start + prefix.length) return false;
+  return prefix.every((seg, i) => seg === WILDCARD_SEGMENT || path[start + i] === seg);
+}
+
 function isPrefix(prefix: readonly string[], path: readonly string[]): boolean {
-  if (path.length < prefix.length) return false;
-  return prefix.every((seg, i) => path[i] === seg);
+  return matchesFrom(prefix, path, 0);
+}
+
+/** A security-surface row matches a path root-anchored, or anywhere when the row says so. */
+function surfaceMatches(
+  surface: (typeof SECURITY_SURFACES)[number],
+  path: readonly string[],
+): boolean {
+  if (surface.anywhere !== true) return isPrefix(surface.prefix, path);
+  for (let start = 0; start + surface.prefix.length <= path.length; start++) {
+    if (matchesFrom(surface.prefix, path, start)) return true;
+  }
+  return false;
 }
 
 function optimizableFor(target: string): ReadonlyArray<readonly string[]> {
@@ -434,11 +494,15 @@ function optimizableFor(target: string): ReadonlyArray<readonly string[]> {
 }
 
 /** Auto-tunable ⇔ `applySpecEdits(…, { restrictToOptimizable: true })` would
- *  accept it: an exact whitelist hit, or a whitelisted prefix. The same rule
- *  the optimizer runs under, restated here so the badge and the server's
- *  refusal can never disagree. */
+ *  accept it. Delegates to spec-patch's own `isOptimizable` — the ONE matcher
+ *  the optimizer runs under (exact match, the wildcard segment, the
+ *  structural `model_pool` / `judge` / `sub_agents` / `temperature` rule,
+ *  then prefix) — so the badge and the server's refusal can never disagree.
+ *  A hand-rolled prefix copy here once said "auto-tunable" for
+ *  `steps[0].model_pool.candidates`, which the write then rejected. */
 export function isAutoTunable(target: string, path: readonly string[]): boolean {
-  return optimizableFor(target).some((entry) => isPrefix(entry, path));
+  if (!(target in OPTIMIZABLE_PATHS)) return false;
+  return isOptimizable(target as keyof typeof OPTIMIZABLE_PATHS, path);
 }
 
 /**
@@ -457,7 +521,7 @@ export function isAutoTunable(target: string, path: readonly string[]): boolean 
  */
 export function classifyPath(target: string, segments: readonly string[]): SpecTrustRow {
   const path = segments.join(".");
-  const surface = SECURITY_SURFACES.find((s) => isPrefix(s.prefix, segments));
+  const surface = SECURITY_SURFACES.find((s) => surfaceMatches(s, segments));
   if (surface !== undefined) {
     return {
       path,
