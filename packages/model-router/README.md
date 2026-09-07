@@ -193,5 +193,37 @@ wire id, the candidate's `specModel` (the string scoreboard arms key on); the
 chain's `model_failover` events are mirrored into the same log as a durable
 `model_failover` kind.
 
-Exports: `createPolicyRouter`, `PolicyRouter`, `PolicyDecision`, `PoolCandidate`,
-`PoolPolicy`, `PoolRoutingConfig`, `PoolLearningConfig`, `ScoreLookup`.
+### 0.6.0 — hint input, scoped keys, breakers, priors and the floor
+
+`route(signals, seed?, seq?, hint?)` takes `RouteSignals ⊇ TierSignals` (the
+0.6.0 additions — `userTextChars`, `hasImages`, `toolNamesLastTurn`,
+`budgetSpentRatio`, `channelHint` — are what `preRoute`'s rules read; the band
+still comes from the four tier signals) plus the `preRoute` phase's hint, and
+stays synchronous and pure. `PolicyDecision.policy` is
+`static | heuristic | learned | classifier | rule | directive | escalation | forced`.
+
+- **Arm identity** — every scoreboard read keys on `poolCandidateArmId(c)`: the
+  `models:` profile name when the candidate is a profile, else the model string.
+- **Scoped keys** — `createPolicyRouter({ scope })` mints `<scope>/<band>`
+  (`scopedRouteKey` / `splitRouteKey` / `unscopedRouteKey`); the learned
+  policy backs off to the unscoped band arm while the scoped one is under-
+  sampled (`PolicyDecision.backedOffTo`). No scope → the 0.5.x key.
+- **Breakers** — a `PoolCandidate.breaker.state() === "open"` removes the
+  candidate for the turn (an eligibility filter, never a veto); a candidate
+  whose adapter is a `FailoverChain` exposes `lastServed()` so runtime-core
+  attributes a fallback member's work to the member that served.
+- **Priors** — an `ArmScore` marked `seeded` (eval-seeded, `@crewhaus/model-plan`'s
+  `seededScoreLookup`) skips warm-up.
+- **The floor** — `createPolicyRouter({ floor: { arm?, confidence?, tolerance? } })`:
+  in the exploit phase an arm is exploitable only if the Wilson lower bound of
+  its judged quality clears the floor arm's judged mean minus `tolerance`; when
+  nothing but the floor arm is exploitable it serves with the verbatim reason
+  `FLOOR_BLOCKED_ROUTE_REASON` (`"floor-blocked"`, what the alert watchdog and
+  SLO monitor key `floor_block_rate` on). Exploration draws are unaffected.
+
+Exports: `createPolicyRouter`, `poolCandidateArmId`, `scopedRouteKey`,
+`splitRouteKey`, `unscopedRouteKey`, `FLOOR_BLOCKED_ROUTE_REASON`,
+`ROUTE_SCOPE_SEPARATOR`, and the types `PolicyRouter`, `PolicyDecision`,
+`PolicyDecisionPolicy`, `PolicyFloorVerdict`, `PolicyRouteHint`, `PoolCandidate`,
+`PoolCandidateServed`, `PoolFloorConfig`, `PoolPolicy`, `PoolRoutingConfig`,
+`PoolLearningConfig`, `RouteSignals`, `ScoreLookup`, `ArmScore`.

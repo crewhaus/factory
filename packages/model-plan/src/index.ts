@@ -80,7 +80,14 @@ export type {
 
 export { canonicalJson, fnv1a64, planFingerprint, profileFingerprint } from "./fingerprint.js";
 
-export { MAX_PRIOR_PSEUDO_COUNT, loadPriors, priorKey, seededScoreLookup } from "./priors.js";
+export {
+  MAX_PRIOR_PSEUDO_COUNT,
+  blendPrior,
+  loadPriors,
+  priorKey,
+  priorsFingerprint,
+  seededScoreLookup,
+} from "./priors.js";
 export type { LoadPriorsOptions, LoadPriorsResult, LoadedPriors, PriorsFile } from "./priors.js";
 
 export { checkFloor, normalQuantile, wilsonLowerBound } from "./floor.js";

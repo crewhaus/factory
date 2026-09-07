@@ -659,12 +659,10 @@ describe("$profile / sentinels on every auxiliary slot (the six that bypassed re
     // The un-pooled sibling role is untouched.
     expect(ir.roles.find((r) => r.name === "helper")?.modelPool).toBeUndefined();
     // PR 9a — the per-candidate settings the plan table honours lower
-    // silently; only the candidate's failover chain / breaker (PR 10) pend.
+    // silently; PR 10 consumed the candidate's failover chain / breaker, so
+    // nothing on a candidate pends any more.
     const pending = warnings.filter((w) => w.code === "model-plan-pending-runtime");
-    expect(pending.map((w) => w.path)).toEqual([
-      "roles.lead.model_pool.candidates[0].fallbacks",
-      "roles.lead.model_pool.candidates[0].circuit_breaker",
-    ]);
+    expect(pending.map((w) => w.path)).toEqual([]);
 
     // The role literal carries the widened pool verbatim (what the
     // orchestrator's RoleModelPool accepts) — and no `$` reaches the bundle.
@@ -969,13 +967,10 @@ describe("model_pool candidates carry the merged profile (key order is the byte 
     });
     expect(mid).toEqual({ model: "claude-sonnet-4-6", tags: ["mid"], enabled: false });
     // PR 9a — the plan table honours thinking / max_tokens / limits /
-    // instructions / caching per candidate, so only the per-candidate
-    // failover chain and breaker (PR 10) are still reported pending.
+    // instructions / caching per candidate; PR 10 consumed the per-candidate
+    // failover chain and breaker, so nothing on a candidate pends.
     const pending = warnings.filter((w) => w.code === "model-plan-pending-runtime");
-    expect(pending.map((w) => w.path)).toEqual([
-      "agent.model_pool.candidates[0].fallbacks",
-      "agent.model_pool.candidates[0].circuit_breaker",
-    ]);
+    expect(pending.map((w) => w.path)).toEqual([]);
     // The compiled blob carries it all — every emitter writes the pool verbatim.
     const agentTs =
       compile(
@@ -1073,9 +1068,11 @@ describe("model_pool candidates carry the merged profile (key order is the byte 
     const pendingPaths = warnings
       .filter((w) => w.code === "model-plan-pending-runtime")
       .map((w) => w.path);
-    for (const key of ["policy", "directives", "rules", "classifier", "reward"]) {
+    for (const key of ["policy", "directives", "rules", "classifier"]) {
       expect(pendingPaths).toContain(`agent.model_pool.${key}`);
     }
+    // PR 10 consumes `reward` (quality fold, priors, floor, lineage reset).
+    expect(pendingPaths).not.toContain("agent.model_pool.reward");
     // PR 9c consumes `strategy.cascade` + `max_escalations`; the side-call
     // closures (guide / shadow / committee) pend field-precisely on PR 9d.
     expect(pendingPaths).not.toContain("agent.model_pool.strategy");

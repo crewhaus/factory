@@ -11,6 +11,7 @@
     { "path": "../adapter-openai" },
     { "path": "../circuit-breaker" },
     { "path": "../errors" },
+    { "path": "../model-plan" },
     { "path": "../trace-event-bus" }
   ],
   "include": ["src/**/*"]

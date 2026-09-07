@@ -25,3 +25,19 @@ export {
   type ScoreboardOptions,
   type ScoreReader,
 } from "./scoreboard.js";
+export {
+  ROUTE_FREEZE_FILE,
+  type RouteFreeze,
+  type WriteRouteFreezeOptions,
+  clearRouteFreeze,
+  freezeScoreboard,
+  readRouteFreeze,
+  routeFreezePath,
+  writeRouteFreeze,
+} from "./freeze.js";
+export {
+  ROUTING_PRIORS_FILE,
+  type RawRoutingPriors,
+  readRoutingPriorsRaw,
+  routingPriorsPath,
+} from "./priors-file.js";
