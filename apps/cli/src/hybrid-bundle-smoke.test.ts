@@ -250,7 +250,11 @@ describe("a compiled hybrid bundle runs the closures it declares (PR 9e)", () =>
         new Response(proc.stderr).text(),
         proc.exited,
       ]);
-      expect(stderr).toBe("");
+      // The bundle must not fail — but stderr is not empty by contract: the
+      // adapter layer prints environment notices (a CI runner with no local
+      // `claude` CLI gets the OAuth-identity fallback line), so assert on the
+      // failure surface instead of on silence.
+      expect(stderr).not.toMatch(/Error|error:|Traceback|failed/i);
       expect(exitCode).toBe(0);
       expect(stdout).toContain("agent> stub(");
 
