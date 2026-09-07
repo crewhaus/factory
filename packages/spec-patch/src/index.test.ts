@@ -2,12 +2,14 @@ import { describe, expect, test } from "bun:test";
 import {
   DIFF_VALUE_MAX_LENGTH,
   OPTIMIZABLE_PATHS,
+  OPTIMIZER_REFUSED_LEAVES,
   SpecPatchError,
   applySpecEdits,
   applySpecPatch,
   diffSpecYaml,
   formatDiffValue,
   formatWriteBackHeader,
+  isOptimizable,
   parseWriteBackHeader,
   specHasPath,
   validatePatch,
@@ -652,6 +654,55 @@ agent:
       - { model: claude-haiku-4-5, tags: [cheap] }
       - { model: claude-opus-4-1, tags: [strong] }
 `;
+
+  // 0.6.0 §6.1 (PR 12) — a routed eval PINS `model_pool.learning.seed`, so an
+  // optimizer free to move it measures a guaranteed-zero delta. PR 19 shipped
+  // the exclusion as a documented gap; this pins it as behaviour.
+  test("learning.seed is refused as a leaf, and as a block patch that CHANGES it", () => {
+    const SEEDED = `${POOL_YAML}    policy: learned
+    learning: { seed: "s1", explorationRate: 0 }
+`;
+    const { spec } = applySpecPatch(SEEDED, {
+      target: "cli",
+      path: ["agent", "model_pool", "policy"],
+      op: "replace",
+      value: "learned",
+    });
+    expect(isOptimizable("cli", ["agent", "model_pool", "learning", "seed"])).toBe(false);
+    // …on every routed host, by the contiguous-subsequence match.
+    expect(isOptimizable("workflow", ["steps", 0, "model_pool", "learning", "seed"])).toBe(false);
+    // The BLOCK itself stays optimizable — `advise` patches it wholesale.
+    expect(isOptimizable("cli", ["agent", "model_pool", "learning"])).toBe(true);
+    expect(() =>
+      validatePatch(spec, {
+        target: "cli",
+        path: ["agent", "model_pool", "learning", "seed"],
+        op: "replace",
+        value: "s2",
+      }),
+    ).toThrow(/not listed in OPTIMIZABLE_PATHS/);
+    // A block patch that PRESERVES the seed (what advise's spread produces) is fine…
+    expect(() =>
+      validatePatch(spec, {
+        target: "cli",
+        path: ["agent", "model_pool", "learning"],
+        op: "replace",
+        value: { seed: "s1", explorationRate: 0.05 },
+      }),
+    ).not.toThrow();
+    // …while one that changes or drops it is refused around the leaf check.
+    for (const value of [{ seed: "s2" }, { explorationRate: 0.05 }]) {
+      expect(() =>
+        validatePatch(spec, {
+          target: "cli",
+          path: ["agent", "model_pool", "learning"],
+          op: "replace",
+          value,
+        }),
+      ).toThrow(/would change "agent.model_pool.learning.seed"/);
+    }
+    expect(OPTIMIZER_REFUSED_LEAVES).toEqual([["model_pool", "learning", "seed"]]);
+  });
 
   test("pool POLICY paths are whitelisted for cli/channel/managed; roster paths are not", () => {
     const { spec } = applySpecPatch(POOL_YAML, {

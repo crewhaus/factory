@@ -14,7 +14,7 @@
  * external assets — so a trends page survives being emailed, committed to a
  * CI artifact bucket, or opened from a file:// URL on a plane.
  */
-import type { RunIndexEntry } from "./history";
+import { type RunIndexEntry, baselineKeyFor, lineageOfEntry } from "./history";
 import { escapeHtml, shell } from "./render";
 
 /** One run on a trend line. */
@@ -35,10 +35,18 @@ export type TrendPoint = {
   readonly pinned?: boolean;
 };
 
-/** One (spec, dataset) lineage's runs, oldest first. */
+/** One lineage's runs, oldest first — (spec, dataset) and, from 0.6.0,
+ *  (spec, dataset, ARM): a routed run's series must not merge into the
+ *  primary's, or a cheap candidate's scores would drag the unrouted line. */
 export type TrendSeries = {
   readonly specName: string;
   readonly datasetName: string;
+  /** 0.6.0 §6.1 — the arm this series measured, when it is a per-arm lineage.
+   *  Absent on legacy (`routing: "static"`) series. */
+  readonly armId?: string;
+  /** 0.6.0 §6.1 — `"as-declared"` on the whole-roster routed series. Absent
+   *  on legacy series. */
+  readonly routing?: string;
   readonly points: ReadonlyArray<TrendPoint>;
 };
 
@@ -52,14 +60,28 @@ export function buildTrends(
   entries: ReadonlyArray<RunIndexEntry>,
   opts: { readonly pinnedRunIds?: ReadonlySet<string> } = {},
 ): TrendSeries[] {
-  const bySeries = new Map<string, { specName: string; datasetName: string; points: TrendPoint[] }>(
-    [],
-  );
+  const bySeries = new Map<
+    string,
+    {
+      specName: string;
+      datasetName: string;
+      armId?: string;
+      routing?: string;
+      points: TrendPoint[];
+    }
+  >([]);
   for (const e of entries) {
-    const key = `${e.specName}::${e.datasetName}`;
+    // 0.6.0 §6.1 — key on the run's LINEAGE, not on (spec, dataset): a routed
+    // run and the primary's unrouted runs are different measurements, and
+    // merging them into one series is exactly the mistake the per-arm
+    // baseline key exists to prevent. Unrouted entries key identically to
+    // before (`baselineKeyFor` returns the legacy two-segment key).
+    const key = baselineKeyFor(lineageOfEntry(e));
     const series = bySeries.get(key) ?? {
       specName: e.specName,
       datasetName: e.datasetName,
+      ...(e.armId !== undefined ? { armId: e.armId } : {}),
+      ...(e.routing !== undefined && e.routing !== "static" ? { routing: e.routing } : {}),
       points: [],
     };
     series.points.push({
@@ -79,8 +101,21 @@ export function buildTrends(
   return [...bySeries.values()].map((s) => ({
     specName: s.specName,
     datasetName: s.datasetName,
+    ...(s.armId !== undefined ? { armId: s.armId } : {}),
+    ...(s.routing !== undefined ? { routing: s.routing } : {}),
     points: stableSortByTs(s.points),
   }));
+}
+
+/**
+ * 0.6.0 §6.1 — the series LABEL: the dataset, plus the arm when the series is
+ * a per-arm lineage (`orders#fast`, `orders#routed`). Legacy series render
+ * exactly as before, so unrouted trend output is byte-identical.
+ */
+export function trendSeriesLabel(series: TrendSeries): string {
+  if (series.armId !== undefined) return `${series.datasetName}#${series.armId}`;
+  if (series.routing !== undefined) return `${series.datasetName}#routed`;
+  return series.datasetName;
 }
 
 function tsOf(p: TrendPoint): number {
@@ -119,7 +154,7 @@ export function trendTable(series: ReadonlyArray<TrendSeries>): {
     for (const p of s.points) {
       rows.push([
         s.specName,
-        s.datasetName,
+        trendSeriesLabel(s),
         p.ts,
         p.runId,
         `${(p.passRate * 100).toFixed(1)}%${p.partial === true ? "*" : ""}`,
@@ -143,7 +178,7 @@ export function trendTable(series: ReadonlyArray<TrendSeries>): {
  */
 export function formatTrendSummaryLines(series: ReadonlyArray<TrendSeries>): string[] {
   return series.map((s) => {
-    const head = `trends ${s.specName}/${s.datasetName}:`;
+    const head = `trends ${s.specName}/${trendSeriesLabel(s)}:`;
     const first = s.points[0];
     const last = s.points[s.points.length - 1];
     if (first === undefined || last === undefined) return `${head} no runs`;
@@ -350,7 +385,7 @@ export function renderTrends(series: ReadonlyArray<TrendSeries>): string {
         `${rows.map((r) => `<tr>${r.map((c) => `<td>${escapeHtml(c)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
       const summary = formatTrendSummaryLines([s])[0] ?? "";
       return (
-        `<section class="trend"><h2>${escapeHtml(`${s.specName} / ${s.datasetName}`)}</h2>` +
+        `<section class="trend"><h2>${escapeHtml(`${s.specName} / ${trendSeriesLabel(s)}`)}</h2>` +
         `<p class="meta">${escapeHtml(summary)}</p>${quality}${costChart}${table}</section>`
       );
     })

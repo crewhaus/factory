@@ -17,7 +17,7 @@
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { EvalRunSummary } from "@crewhaus/eval-runner";
+import type { EvalRoutingMode, EvalRunSummary } from "@crewhaus/eval-runner";
 import { ReportError } from "./errors";
 
 /** Default location of the run index + baselines, relative to the cwd. */
@@ -134,6 +134,30 @@ export type RunIndexEntry = {
    * written before the field existed.
    */
   readonly replayed?: boolean;
+  // ---- 0.6.0 §6.1 — per-arm eval lineage. All additive: absent on entries
+  // written before the fields existed and on every `routing: "static"` run,
+  // so an unrouted history reads exactly as it did.
+  /**
+   * The ARM this run measured — a `models:` profile name, else the spec model
+   * string (the router's `poolCandidateArmId`). Present only under
+   * `routing: "candidate:<…>"`; an `as-declared` run measures the whole
+   * roster and keys under the `routed` lineage instead.
+   */
+  readonly armId?: string;
+  /** How the run was routed (`RunEvalOptions.routing`). Absent ⇒ `"static"`. */
+  readonly routing?: EvalRoutingMode;
+  /**
+   * The pool fingerprint (`model_route.policyVersion`) the run's decisions
+   * carried, when they agreed on one. Part of the INSTRUMENT guard, not the
+   * key: a policy flip must re-baseline the lineage, never orphan it.
+   */
+  readonly policyVersion?: string;
+  /**
+   * Digest of the FROZEN arm snapshot the run routed off. The other half of
+   * the routed instrument guard — two different arm snapshots are two
+   * different instruments and are never gated against each other.
+   */
+  readonly armsDigest?: string;
   /** ISO-8601 completion timestamp. */
   readonly ts: string;
   /** Absolute path to the run's output directory. */
@@ -181,6 +205,13 @@ export type BaselineEntry = {
    * before the field existed and when the model had no pricing row.
    */
   readonly costUsd?: number;
+  // ---- 0.6.0 §6.1 — the per-arm lineage this pin belongs to. `armId` and
+  // `routing` are part of the KEY (see {@link baselineKeyV2}); `policyVersion`
+  // and `armsDigest` are the routed INSTRUMENT guard.
+  readonly armId?: string;
+  readonly routing?: EvalRoutingMode;
+  readonly policyVersion?: string;
+  readonly armsDigest?: string;
   /** ISO-8601 timestamp of when the pin was written. */
   readonly ts: string;
 };
@@ -188,9 +219,108 @@ export type BaselineEntry = {
 /** Shape of `baselines.json`: `<specName>::<datasetName>` → pinned run. */
 export type BaselinesFile = Record<string, BaselineEntry>;
 
-/** Composite key for the baselines map. */
+/** Composite key for the baselines map (the legacy two-segment lineage). */
 export function baselineKey(specName: string, datasetName: string): string {
   return `${specName}::${datasetName}`;
+}
+
+/**
+ * 0.6.0 §6.1 — the RESERVED prefix of a per-arm (V2) baseline key.
+ *
+ * Dataset names are not sanitised anywhere (registry refs carry `@`, `#` and
+ * arbitrary text), so a dataset literally named `a::b` would make the legacy
+ * key `spec::a::b` collide with an UNPREFIXED V2 key. `|` is excluded from
+ * the spec's `safeName`, so a spec name can never begin with `arm|` and the
+ * two namespaces provably cannot alias onto each other.
+ */
+export const BASELINE_KEY_V2_PREFIX = "arm|";
+
+/** The lineage segment an `as-declared` (whole-roster) run keys under. */
+export const ROUTED_LINEAGE_SEGMENT = "routed";
+
+/**
+ * 0.6.0 §6.1 — `baselineKeyV2 = spec::dataset::<armId | routed>`, under the
+ * reserved prefix. Per-arm and routed lineages key SEPARATELY from the legacy
+ * `spec::dataset` key, so a cheap candidate can never pin over the primary's
+ * baseline.
+ */
+export function baselineKeyV2(specName: string, datasetName: string, armId?: string): string {
+  return `${BASELINE_KEY_V2_PREFIX}${specName}::${datasetName}::${armId ?? ROUTED_LINEAGE_SEGMENT}`;
+}
+
+/**
+ * The (spec, dataset, arm) lineage one run belongs to. `routing` absent or
+ * `"static"` is the LEGACY lineage — the two-segment key every baselines.json
+ * on disk already uses — so nothing about an unrouted harness changes.
+ */
+export type BaselineLineage = {
+  readonly specName: string;
+  readonly datasetName: string;
+  readonly armId?: string;
+  readonly routing?: EvalRoutingMode;
+};
+
+/** True when the lineage keys on the legacy two-segment key. */
+export function isLegacyLineage(lineage: BaselineLineage): boolean {
+  return lineage.routing === undefined || lineage.routing === "static";
+}
+
+/** The baselines-map key a lineage pins under: legacy for `static`, V2 otherwise. */
+export function baselineKeyFor(lineage: BaselineLineage): string {
+  return isLegacyLineage(lineage)
+    ? baselineKey(lineage.specName, lineage.datasetName)
+    : baselineKeyV2(lineage.specName, lineage.datasetName, lineage.armId);
+}
+
+/** What {@link resolveBaseline} found for a lineage. */
+export type BaselineLookup = {
+  /** The key the lineage pins under. */
+  readonly key: string;
+  /** The pinned baseline, when one exists under that key. */
+  readonly entry?: BaselineEntry;
+  /**
+   * 0.6.0 §6.1 — a V2 lineage whose OWN key is absent while the legacy
+   * `spec::dataset` key IS pinned. Such a run is neither gated nor promotable:
+   * auto-pinning it as a "first run" would let the very run that CREATES a
+   * lineage satisfy `route promote --gate`, and gating it against the
+   * unrouted baseline would compare two different instruments.
+   */
+  readonly legacyPresent: boolean;
+};
+
+/**
+ * Resolve the pinned baseline for a lineage. The ONE reader every consumer
+ * shares (the CLI gate, Hangar's eval health, the fleet matcher), so a routed
+ * harness is never told "no baseline pinned" because its arm's key was looked
+ * up with the legacy spelling.
+ */
+export function resolveBaseline(
+  lineage: BaselineLineage,
+  evalsDir: string = DEFAULT_EVALS_DIR,
+): BaselineLookup {
+  const baselines = readBaselines(evalsDir);
+  const key = baselineKeyFor(lineage);
+  const entry = baselines[key];
+  if (entry !== undefined) return { key, entry, legacyPresent: false };
+  const legacyPresent =
+    !isLegacyLineage(lineage) &&
+    baselines[baselineKey(lineage.specName, lineage.datasetName)] !== undefined;
+  return { key, legacyPresent };
+}
+
+/** The lineage a recorded run (index entry or baseline pin) belongs to. */
+export function lineageOfEntry(entry: {
+  readonly specName: string;
+  readonly datasetName: string;
+  readonly armId?: string;
+  readonly routing?: EvalRoutingMode;
+}): BaselineLineage {
+  return {
+    specName: entry.specName,
+    datasetName: entry.datasetName,
+    ...(entry.armId !== undefined ? { armId: entry.armId } : {}),
+    ...(entry.routing !== undefined ? { routing: entry.routing } : {}),
+  };
 }
 
 /** sha256 hex digest of the dataset file bytes (content identity, not path). */
@@ -227,7 +357,40 @@ export type RecordEvalRunOptions = {
   /** Override `.crewhaus/evals` (tenant scopes, tests, standalone bundles
    *  whose run dir was rebased). */
   readonly evalsDir?: string;
+  /**
+   * 0.6.0 §6.1 — the per-arm lineage this run belongs to, when the CALLER
+   * knows it and the run's own manifest does not. A `--models` matrix cell is
+   * exactly that case: the cell pins a model by patching `agent.model`
+   * in-memory, so the runner routes `static` and records no routing block,
+   * yet the cell must still key its own `spec::dataset::<armId>` lineage or N
+   * cells would fight over one baseline. Supplied fields WIN over the ones
+   * derived from `summary.config.routing`.
+   */
+  readonly armId?: string;
+  readonly routing?: EvalRoutingMode;
 };
+
+/**
+ * 0.6.0 §6.1 — the routing columns of an index entry, derived from the run's
+ * OWN manifest (`summary.config.routing`) so every launcher records the same
+ * lineage without re-deriving it. Absent block ⇒ `{}` — an unrouted run's
+ * index line stays byte-identical.
+ */
+export function routingColumnsFromSummary(summary: EvalRunSummary): {
+  readonly armId?: string;
+  readonly routing?: EvalRoutingMode;
+  readonly policyVersion?: string;
+  readonly armsDigest?: string;
+} {
+  const routing = summary.config.routing;
+  if (routing === undefined || routing.mode === "static") return {};
+  return {
+    ...(routing.armId !== undefined ? { armId: routing.armId } : {}),
+    routing: routing.mode,
+    ...(routing.policyVersion !== undefined ? { policyVersion: routing.policyVersion } : {}),
+    ...(routing.armsDigest !== undefined ? { armsDigest: routing.armsDigest } : {}),
+  };
+}
 
 /**
  * Project a completed run onto its index entry. The ONE place the summary →
@@ -284,6 +447,11 @@ export function runIndexEntryFromSummary(
     // a recording, so this row is not a measurement of the live system.
     // (`mode: "record"` still hit the world — only replay is marked.)
     ...(summary.config.toolRecording?.mode === "replay" ? { replayed: true } : {}),
+    // 0.6.0 §6.1 — the per-arm lineage columns, straight off the run's own
+    // routing manifest. Absent on `routing: "static"` runs.
+    ...routingColumnsFromSummary(summary),
+    ...(opts.armId !== undefined ? { armId: opts.armId } : {}),
+    ...(opts.routing !== undefined ? { routing: opts.routing } : {}),
     ts: summary.endedAt,
     outDir: opts.outDir,
   };
@@ -377,7 +545,8 @@ export function readBaselines(evalsDir: string = DEFAULT_EVALS_DIR): BaselinesFi
   }
 }
 
-/** The pinned baseline for a (spec, dataset) key, or undefined if none. */
+/** The pinned baseline for a (spec, dataset) key, or undefined if none.
+ *  The LEGACY lineage only — routed runs resolve through {@link resolveBaseline}. */
 export function getBaseline(
   specName: string,
   datasetName: string,
@@ -386,10 +555,14 @@ export function getBaseline(
   return readBaselines(evalsDir)[baselineKey(specName, datasetName)];
 }
 
-/** Pin (or re-pin) the baseline for the entry's (spec, dataset) key. */
+/**
+ * Pin (or re-pin) the baseline for the entry's lineage: the legacy
+ * `spec::dataset` key when the entry carries no routing (every pre-0.6.0 pin,
+ * byte-identical), the V2 per-arm key otherwise.
+ */
 export function setBaseline(entry: BaselineEntry, evalsDir: string = DEFAULT_EVALS_DIR): void {
   mkdirSync(evalsDir, { recursive: true });
   const baselines = readBaselines(evalsDir);
-  baselines[baselineKey(entry.specName, entry.datasetName)] = entry;
+  baselines[baselineKeyFor(lineageOfEntry(entry))] = entry;
   writeFileSync(join(evalsDir, BASELINES_FILENAME), `${JSON.stringify(baselines, null, 2)}\n`);
 }

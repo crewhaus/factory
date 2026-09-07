@@ -33,6 +33,13 @@ export type MatrixPricingFn = (
  *  error that prevented it (`error` wins when both are somehow present). */
 export type MatrixCell = {
   readonly model: string;
+  /**
+   * 0.6.0 §6.1 — the ARM this cell measured: a `models:` profile name, else
+   * the spec model string. Present when the cell was pinned through
+   * `--models '$fast,$strong'` / `--models pool`; absent on a plain
+   * `--models <model,…>` matrix, keeping its rows byte-identical.
+   */
+  readonly armId?: string;
   /** Filesystem-safe directory name of the cell under the matrix root. */
   readonly slug: string;
   /** Absolute path to the cell's run directory. */
@@ -44,6 +51,8 @@ export type MatrixCell = {
 
 export type MatrixRow = {
   readonly model: string;
+  /** 0.6.0 §6.1 — the arm this row measured (see {@link MatrixCell.armId}). */
+  readonly armId?: string;
   readonly slug: string;
   readonly outDir: string;
   /** "ok" = the cell ran (even with failing samples); "error" = it crashed. */
@@ -78,12 +87,41 @@ export type MatrixBest = {
   readonly costPer1kSamplesUsd: ReadonlyArray<string>;
 };
 
+/**
+ * 0.6.0 §6.1 — the ADDITIVE verdict block `eval leaderboard` writes beside
+ * `best`. `best` itself is deliberately unchanged: it is a consumed artifact
+ * field (hangar-server's evals-ops reads it) whose `[]` already means "no
+ * candidate", so the honest-winner logic lands here instead. Absent on
+ * artifacts written by older CLIs and on a plain `eval --models` matrix —
+ * readers must tolerate absence.
+ *
+ * `decision` is the whole point of the block: `winner` only when the paired
+ * test clears the Holm-corrected level AND the top two intervals are
+ * disjoint; `tie` when the evidence does not separate them; `underpowered`
+ * below the comparable-pair floor. See `leaderboard.ts` for the math.
+ */
+export type MatrixVerdict = {
+  readonly leader: string;
+  readonly runnerUp?: string;
+  readonly decision: "winner" | "tie" | "underpowered";
+  readonly n: number;
+  readonly minN: number;
+  readonly pairedP?: number;
+  readonly holmP?: number;
+  readonly deltaCI95?: readonly [number, number];
+  readonly ciOverlap?: boolean;
+  readonly reason: string;
+};
+
 export type ModelMatrix = {
   readonly generatedAt: string;
   /** Dataset shared by every cell (from the first completed summary). */
   readonly datasetName?: string;
   readonly rows: ReadonlyArray<MatrixRow>;
   readonly best: MatrixBest;
+  /** 0.6.0 §6.1 — metric → {@link MatrixVerdict}. Written by
+   *  `eval leaderboard`; absent on every other matrix. */
+  readonly verdict?: Readonly<Record<string, MatrixVerdict>>;
 };
 
 export type BuildMatrixOptions = {
@@ -93,14 +131,23 @@ export type BuildMatrixOptions = {
 };
 
 function toRow(cell: MatrixCell, pricing?: MatrixPricingFn): MatrixRow {
-  const base = { model: cell.model, slug: cell.slug, outDir: cell.outDir };
+  const base = {
+    model: cell.model,
+    ...(cell.armId !== undefined ? { armId: cell.armId } : {}),
+    slug: cell.slug,
+    outDir: cell.outDir,
+  };
   if (cell.error !== undefined || cell.summary === undefined) {
     return { ...base, status: "error", error: cell.error ?? "cell produced no summary" };
   }
   const s = cell.summary;
   const a = s.aggregates;
   const sampleCount = s.samples.length;
-  const costMicros = pricing?.(cell.model, a.totalTokens);
+  // 0.6.0 §6.1 — cost basis aligned with `evalRunCost`: under `--repeats` the
+  // REAL spend is every trial's tokens, not trial 1's. Before this the matrix
+  // `est_$` column and the run's own printed `cost:` line disagreed by a
+  // factor of k on exactly the runs a comparison cares most about.
+  const costMicros = pricing?.(cell.model, a.totalTokensAllTrials ?? a.totalTokens);
   // costMicros is the whole run in micro-USD; per-1k-samples in plain USD is
   // 1000 × (costMicros / 1e6 / sampleCount) = costMicros / (1000 × samples).
   const costPer1kSamplesUsd =

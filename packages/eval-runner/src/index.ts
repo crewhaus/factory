@@ -142,6 +142,7 @@ import {
 import type { IrV0 } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { memoryFragmentFromIr, wireMemory } from "@crewhaus/memory-service";
+import { wireModels } from "@crewhaus/model-service";
 import { matchNamedFailure } from "@crewhaus/recovery-engine";
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { createSkillTool } from "@crewhaus/skills-registry";
@@ -152,6 +153,17 @@ import { warnUnconsumedCombinePolicy } from "./combine-warnings";
 import { defaultGraderRegistry, resolveRegistryGrader } from "./default-registry";
 import { RunnerError } from "./errors";
 import { assertResumeCompatible, loadCompletedSample, readRunManifest } from "./resume";
+import {
+  type EvalRoutingMode,
+  type FrozenScoreboard,
+  type ResolvedEvalRouting,
+  armsDigest,
+  freezeArmsSnapshot,
+  isStaticRouting,
+  parseEvalRoutingMode,
+  readLiveArms,
+  resolveEvalRouting,
+} from "./routing";
 import { runSample } from "./run-sample";
 import { createSampleOutputWriter } from "./sample-output";
 import { formatSemanticFallbackWarning } from "./semantic-fallback";
@@ -179,6 +191,8 @@ import type {
   EvalAggregates,
   EvalChatLoopFn,
   EvalPricingFn,
+  EvalRouteDecision,
+  EvalRoutingConfig,
   EvalRunPartial,
   EvalRunResumed,
   EvalRunSummary,
@@ -191,6 +205,7 @@ import type {
   SafetyViolationCounts,
   SampleMetrics,
   SampleResult,
+  ServedModel,
   SliceStats,
   TrialResult,
 } from "./types";
@@ -201,6 +216,8 @@ export type {
   EvalAggregates,
   EvalChatLoopFn,
   EvalPricingFn,
+  EvalRouteDecision,
+  EvalRoutingConfig,
   EvalRunPartial,
   EvalRunResumed,
   EvalRunSummary,
@@ -213,9 +230,33 @@ export type {
   SafetyViolationCounts,
   SampleMetrics,
   SampleResult,
+  ServedModel,
   SliceStats,
   TrialResult,
 };
+// 0.6.0 §6.1 (PR 12) — routed evals: the `routing` vocabulary, the frozen
+// arm snapshot behind runtime-core's `_scoreboard` seam and its instrument
+// digest, and the served-model / route-decision folds `run-sample` and
+// `aggregate` share. See `routing.ts`.
+export type { EvalRoutingMode, FrozenScoreboard, ResolvedEvalRouting };
+export {
+  DEFAULT_EVAL_LEARNING_SEED,
+  EVAL_ROUTING_CANDIDATE_PREFIX,
+  ROUTED_ARM_SEGMENT,
+  armsDigest,
+  candidateArmId,
+  evalRoutingCandidateRef,
+  foldRouteDecisions,
+  foldServedModels,
+  freezeArmsSnapshot,
+  isStaticRouting,
+  mergeServedModels,
+  parseEvalRoutingMode,
+  poolArmIds,
+  readLiveArms,
+  resolveEvalRouting,
+  rosterRefs,
+} from "./routing";
 export type { SharedAgentDeps };
 export { wireRunOnce };
 // B13 — metadata slice aggregation (runner-computed so bundles inherit it)
@@ -657,13 +698,45 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   // The default invoker calls runChatLoop with the per-sample fresh
   // runContext; the watchdog wraps WHICHEVER invoker runs (default or
   // caller-supplied) so a hung provider/tool loop can't stall a slot.
+  // 0.6.0 §6.1 — ROUTED EVALS. `static` (the default) resolves to nothing at
+  // all, so an un-flagged run is byte-identical: no wiring, no scoreboard, no
+  // `routing` block on the manifest. A routed run resolves the spec's own
+  // routing (or the pinned candidate), pins `learning.seed`, and freezes an
+  // arm snapshot the whole run reads from — see `routing.ts`.
+  const routingMode: EvalRoutingMode = isStaticRouting(opts.routing)
+    ? "static"
+    : parseEvalRoutingMode(opts.routing as string);
+  const routed = isStaticRouting(routingMode)
+    ? undefined
+    : resolveEvalRouting(ir, routingMode, opts.seed !== undefined ? { seed: opts.seed } : {});
+  const routingRootDir = opts.routingRootDir ?? join(opts.cwd ?? process.cwd(), ".crewhaus");
+  const warmArms = routed !== undefined && opts.warmArms === true;
+  const frozenScoreboard: FrozenScoreboard | undefined =
+    routed !== undefined
+      ? freezeArmsSnapshot(warmArms ? readLiveArms(routingRootDir) : [])
+      : undefined;
+  if (routed !== undefined) {
+    process.stdout.write(
+      `[eval] routing: ${routingMode}${routed.armId !== undefined ? ` (arm ${routed.armId})` : ""}` +
+        `${routed.learningSeed !== undefined ? ` seed=${routed.learningSeed}` : ""}` +
+        ` arms=${frozenScoreboard?.armsDigest ?? "-"}${warmArms ? " (warm)" : " (cold)"}\n`,
+    );
+  }
+
   const baseInvoker =
     opts.invoker ??
-    (await defaultInvoker(ir, opts, {
-      ...(toolRecorder !== undefined ? { recorder: toolRecorder } : {}),
-      ...(toolReplayer !== undefined ? { replayer: toolReplayer } : {}),
-      missPolicy: opts.replayMiss ?? "error",
-    }));
+    (await defaultInvoker(
+      ir,
+      opts,
+      {
+        ...(toolRecorder !== undefined ? { recorder: toolRecorder } : {}),
+        ...(toolReplayer !== undefined ? { replayer: toolReplayer } : {}),
+        missPolicy: opts.replayMiss ?? "error",
+      },
+      routed !== undefined && frozenScoreboard !== undefined
+        ? { routed, scoreboard: frozenScoreboard, specName: ir.name }
+        : undefined,
+    ));
   const invoker =
     sampleTimeoutMs !== undefined ? withSampleTimeout(baseInvoker, sampleTimeoutMs) : baseInvoker;
 
@@ -1078,6 +1151,44 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         }
       : undefined;
 
+  // 0.6.0 §6.1 — the routing manifest. `armsDigest` is the run's INSTRUMENT
+  // identity (two different arm snapshots are two different instruments); the
+  // live arms are re-read HERE so a concurrent harness mutating `arms.jsonl`
+  // mid-run is reported instead of silently changing what the digest names.
+  // The measurement itself is unaffected — the snapshot was frozen at start.
+  let routingConfig: { routing: EvalRoutingConfig } | Record<string, never> = {};
+  if (routed !== undefined && frozenScoreboard !== undefined) {
+    let armsMutated = false;
+    if (warmArms) {
+      try {
+        armsMutated = armsDigest(readLiveArms(routingRootDir)) !== frozenScoreboard.armsDigest;
+      } catch {
+        armsMutated = false; // an unreadable store is not evidence of a mutation
+      }
+      if (armsMutated) {
+        process.stderr.write(
+          `[eval] warning: ${join(routingRootDir, "routing", "arms.jsonl")} changed while this run was in flight — the run itself routed off the frozen snapshot (${frozenScoreboard.armsDigest}), but that digest no longer describes the harness on disk.\n`,
+        );
+      }
+    }
+    const policyVersions = new Set(
+      results
+        .flatMap((r) => (r.routes ?? []).map((d) => d.policyVersion))
+        .filter((v): v is string => v !== undefined),
+    );
+    routingConfig = {
+      routing: {
+        mode: routingMode,
+        ...(routed.armId !== undefined ? { armId: routed.armId } : {}),
+        armsDigest: frozenScoreboard.armsDigest,
+        ...(warmArms ? { warmArms: true } : {}),
+        ...(armsMutated ? { armsMutated: true } : {}),
+        ...(routed.learningSeed !== undefined ? { learningSeed: routed.learningSeed } : {}),
+        ...(policyVersions.size === 1 ? { policyVersion: [...policyVersions][0] as string } : {}),
+      },
+    };
+  }
+
   const summary: EvalRunSummary = {
     runId,
     startedAt,
@@ -1111,6 +1222,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
       // cassette (and which one), plus how often the replay had to reuse an
       // exhausted entry.
       ...finalToolRecordingConfig,
+      ...routingConfig,
     },
     outDir,
   };
@@ -1282,10 +1394,22 @@ type ToolCassette = {
   readonly missPolicy: ToolReplayMissPolicy;
 };
 
+/**
+ * 0.6.0 §6.1 — the routed half of the default invoker's wiring: the resolved
+ * routing plus the FROZEN scoreboard every sample reads from. Absent ⇒ the
+ * pre-0.6.0 single-model path, byte-identical.
+ */
+type EvalRoutingWiring = {
+  readonly routed: ResolvedEvalRouting;
+  readonly scoreboard: FrozenScoreboard;
+  readonly specName: string;
+};
+
 async function defaultInvoker(
   ir: IrV0,
   opts: RunEvalOptions,
   cassette: ToolCassette = { missPolicy: "error" },
+  routing?: EvalRoutingWiring,
 ): Promise<AgentInvoker> {
   const wired: SharedAgentDeps = await wireRunOnce(
     ir,
@@ -1319,6 +1443,38 @@ async function defaultInvoker(
   // flag > spec `limits.deadline_ms` (the same precedence as the runner's
   // outer watchdog, so the two timers agree on the ceiling).
   const sampleDeadlineMs = opts.sampleTimeoutMs ?? ir.limits?.deadlineMs;
+  // 0.6.0 §6.1 — the routing options the chat loop receives. `wireModels` is
+  // the SAME composition root `crewhaus run` and every emitter go through, so
+  // a routed eval measures the routing production serves rather than a
+  // hand-mirrored copy of it. The frozen scoreboard rides the `_scoreboard`
+  // seam (whose doc comment now names the eval runner as a production
+  // consumer) so the router reads statistics but records nothing.
+  const routingOptions: Partial<Parameters<typeof runChatLoop>[0]> =
+    routing === undefined
+      ? {}
+      : {
+          ...(routing.routed.fragment !== undefined
+            ? wireModels(routing.routed.fragment, { sessionName: routing.specName })
+            : {}),
+          ...(routing.routed.params?.thinking !== undefined
+            ? { thinking: routing.routed.params.thinking }
+            : {}),
+          ...(routing.routed.params?.maxTokens !== undefined
+            ? { maxTokens: routing.routed.params.maxTokens }
+            : {}),
+          ...(routing.routed.params?.temperature !== undefined
+            ? { temperature: routing.routed.params.temperature }
+            : {}),
+          _scoreboard: routing.scoreboard,
+        };
+  // A pinned candidate is measured on ITS model and ITS `instructions`
+  // overlay — the same expansion a `model: $<profile>` slot gets at lower
+  // time, applied here because the eval pins the slot after lowering.
+  const routedModel = routing?.routed.model ?? wired.model;
+  const routedInstructions =
+    routing?.routed.overlay !== undefined
+      ? `${routing.routed.overlay}\n\n${wired.instructions}`
+      : wired.instructions;
   return async (req) => {
     let tools: RegisteredTool[] = [...wired.tools];
     let skills = wired.skills;
@@ -1362,8 +1518,9 @@ async function defaultInvoker(
     const sampleOut = fanOut ? createSampleOutputWriter({ label: req.sample.id }) : undefined;
     try {
       const agentOutput = await chatLoop({
-        model: wired.model,
-        instructions: wired.instructions,
+        ...routingOptions,
+        model: routedModel,
+        instructions: routedInstructions,
         tools,
         hooks: wired.hooks,
         skills,

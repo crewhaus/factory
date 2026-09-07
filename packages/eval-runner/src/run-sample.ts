@@ -20,6 +20,7 @@ import type {
 } from "@crewhaus/trace-event-bus";
 import { RunnerError } from "./errors";
 import { sampleArtifactDirName } from "./resume";
+import { foldRouteDecisions, foldServedModels } from "./routing";
 import type { AgentInvoker, GraderEntry, SampleMetrics, SampleResult } from "./types";
 
 /**
@@ -142,6 +143,14 @@ export async function runSample(args: {
   const toolCalls = extractToolCalls(finalEvents);
   const tokens = sumTokens(finalEvents);
   const metrics = computeMetrics(sample, finalEvents, toolCalls);
+  // 0.6.0 §6.1 — served-model attribution. `model` (the CONFIGURED model)
+  // stays exactly as it was; these two say what actually answered and how it
+  // was chosen. Both are absent on a run that published no such events, so an
+  // unrouted sample's SampleResult / meta.json stay byte-identical.
+  const servedModelsFolded = foldServedModels(finalEvents);
+  const servedModels = servedModelsFolded.length > 0 ? servedModelsFolded : undefined;
+  const routesFolded = foldRouteDecisions(finalEvents);
+  const routes = routesFolded.length > 0 ? routesFolded : undefined;
 
   // Apply graders. `artifacts` is the PR-19 seam for artifact-reading
   // graders (grader-continuity): the sample's own directory — the primary
@@ -252,6 +261,8 @@ export async function runSample(args: {
     turns,
     tokens,
     model,
+    ...(servedModels !== undefined ? { servedModels } : {}),
+    ...(routes !== undefined ? { routes } : {}),
     agentOutput,
     // B13 — carry the sample's metadata into the result so slice
     // aggregation (and downstream results.json readers) can group without
@@ -276,6 +287,8 @@ export async function runSample(args: {
         turns,
         tokens,
         model,
+        ...(servedModels !== undefined ? { servedModels } : {}),
+        ...(routes !== undefined ? { routes } : {}),
         metrics,
         ...(error !== undefined ? { error } : {}),
         ...(graderError !== undefined ? { graderError } : {}),

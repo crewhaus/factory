@@ -8,14 +8,15 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getBaseline, readRunIndex } from "@crewhaus/eval-report";
-import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
+import { getBaseline, readBaselines, readRunIndex, resolveBaseline } from "@crewhaus/eval-report";
+import type { EvalRoutingMode, EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
 import {
   abstainedSampleIds,
   costGateReason,
   datasetFilterMatches,
   finishEvalRun,
   gateRuns,
+  routedInstrumentMismatch,
 } from "./eval-history";
 
 const TMP_ROOTS: string[] = [];
@@ -135,6 +136,8 @@ async function finish(
     judgeCostUsd?: number;
     maxP95LatencyMs?: number;
     maxCostUsd?: number;
+    armId?: string;
+    routing?: EvalRoutingMode;
   } = {},
 ) {
   return finishEvalRun({
@@ -153,6 +156,8 @@ async function finish(
     ...(opts.judgeCostUsd !== undefined ? { judgeCostUsd: opts.judgeCostUsd } : {}),
     ...(opts.maxP95LatencyMs !== undefined ? { maxP95LatencyMs: opts.maxP95LatencyMs } : {}),
     ...(opts.maxCostUsd !== undefined ? { maxCostUsd: opts.maxCostUsd } : {}),
+    ...(opts.armId !== undefined ? { armId: opts.armId } : {}),
+    ...(opts.routing !== undefined ? { routing: opts.routing } : {}),
   });
 }
 
@@ -393,7 +398,7 @@ describe("finishEvalRun — measurement-instrument guard (NEW-HUNT-1)", () => {
     const warned = ctx.warnings.join("\n");
     expect(warned).toContain("measurement instrument changed");
     expect(warned).toContain("g-hash-1 → g-hash-2");
-    expect(ctx.lines.join("\n")).toContain("graders/judge changed — starting new baseline lineage");
+    expect(ctx.lines.join("\n")).toContain("instrument changed — starting new baseline lineage");
     const pin = getBaseline("concierge", "smoke", ctx.evalsDir);
     expect(pin?.runId).toBe("run_bbbb2222bbbb2222");
     expect(pin?.gradersHash).toBe("g-hash-2");
@@ -1063,5 +1068,167 @@ describe("datasetFilterMatches (F10 — `eval-report history --dataset`)", () =>
     expect(datasetFilterMatches("smoke", "smoke2+regressions@v1")).toBe(false);
     expect(datasetFilterMatches("smoke+regressions@v1", "smoke+regressions@v1")).toBe(true);
     expect(datasetFilterMatches("smoke+regressions@v1", "smoke")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §6.1 — routed lineages, the arm-snapshot instrument guard, and the
+// promise that a cheap candidate can never pin over the primary's baseline.
+// ---------------------------------------------------------------------------
+
+const routedConfig = (
+  mode: EvalRoutingMode,
+  extra: { armId?: string; armsDigest?: string; policyVersion?: string } = {},
+): Partial<EvalRunSummary["config"]> => ({
+  routing: { mode, ...extra },
+});
+
+describe("finishEvalRun — per-arm lineages (§6.1)", () => {
+  test("acceptance: pool cells index lineages spec::dataset::fast and ::strong", async () => {
+    const ctx = newCtx();
+    // What `eval --models pool --record` does: one cell per roster arm, each
+    // recorded under its OWN lineage.
+    const fast = makeRun(ctx, "run_fast1111fast1111", [makeSample("a", false, 0)]);
+    await finish(ctx, fast, { armId: "fast", routing: "candidate:$fast" });
+    const strong = makeRun(ctx, "run_strg2222strg2222", [makeSample("a", true, 1)]);
+    await finish(ctx, strong, { armId: "strong", routing: "candidate:$strong" });
+
+    expect(Object.keys(readBaselines(ctx.evalsDir)).sort()).toEqual([
+      "arm|concierge::smoke::fast",
+      "arm|concierge::smoke::strong",
+    ]);
+    const rows = readRunIndex(ctx.evalsDir);
+    expect(rows.map((r) => r.armId)).toEqual(["fast", "strong"]);
+    expect(rows.map((r) => r.routing)).toEqual(["candidate:$fast", "candidate:$strong"]);
+    // The legacy key is untouched: nothing pinned over the primary.
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)).toBeUndefined();
+  });
+
+  test("a cheap candidate can never pin over the PRIMARY's existing baseline", async () => {
+    const ctx = newCtx();
+    // The primary's unrouted lineage, pinned first.
+    const primary = makeRun(ctx, "run_prim1111prim1111", [makeSample("a", true, 1)]);
+    await finish(ctx, primary);
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_prim1111prim1111");
+
+    // A cheap arm scoring WORSE. It neither gates against the primary's
+    // baseline nor replaces it — and it is not promotable on its first run.
+    const cheap = makeRun(ctx, "run_chp22222chp22222", [makeSample("a", false, 0)]);
+    const result = await finish(ctx, cheap, { armId: "fast", routing: "candidate:$fast" });
+    expect(result.gateFailed).toBe(false);
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_prim1111prim1111");
+    expect(
+      resolveBaseline(
+        { specName: "concierge", datasetName: "smoke", armId: "fast", routing: "candidate:$fast" },
+        ctx.evalsDir,
+      ).entry,
+    ).toBeUndefined();
+    expect(ctx.lines.join("\n")).toContain("new per-arm lineage concierge/smoke#fast");
+    expect(ctx.lines.join("\n")).toContain("not gated and not promotable");
+  });
+
+  test("with no legacy pin at all a routed first run pins normally", async () => {
+    const ctx = newCtx();
+    const run = makeRun(
+      ctx,
+      "run_asdc1111asdc1111",
+      [makeSample("a", true, 1)],
+      routedConfig("as-declared", { armsDigest: "aaaa" }),
+    );
+    await finish(ctx, run);
+    expect(ctx.lines.join("\n")).toContain("first run for concierge/smoke#routed");
+    const pin = resolveBaseline(
+      { specName: "concierge", datasetName: "smoke", routing: "as-declared" },
+      ctx.evalsDir,
+    ).entry;
+    expect(pin?.runId).toBe("run_asdc1111asdc1111");
+    expect(pin?.armsDigest).toBe("aaaa");
+  });
+
+  test("a CHANGED arm snapshot starts a new lineage instead of gating across it", async () => {
+    const ctx = newCtx();
+    const first = makeRun(
+      ctx,
+      "run_arm11111arm11111",
+      [makeSample("a", true, 1)],
+      routedConfig("as-declared", { armsDigest: "aaaa" }),
+    );
+    await finish(ctx, first);
+    const second = makeRun(
+      ctx,
+      "run_arm22222arm22222",
+      [makeSample("a", false, 0)],
+      routedConfig("as-declared", { armsDigest: "bbbb" }),
+    );
+    const result = await finish(ctx, second, { gateRequested: true });
+    // A pass-rate collapse that would normally FAIL the gate is not gated —
+    // the two runs measured with different instruments.
+    expect(result.gateFailed).toBe(false);
+    expect(ctx.warnings.join("\n")).toContain("armsDigest: aaaa → bbbb");
+    expect(ctx.lines.join("\n")).toContain("instrument changed — starting new baseline lineage");
+    expect(
+      resolveBaseline(
+        { specName: "concierge", datasetName: "smoke", routing: "as-declared" },
+        ctx.evalsDir,
+      ).entry?.runId,
+    ).toBe("run_arm22222arm22222");
+  });
+
+  test("an unchanged snapshot still gates the routed lineage normally", async () => {
+    const ctx = newCtx();
+    const first = makeRun(
+      ctx,
+      "run_same1111same1111",
+      [makeSample("a", true, 1)],
+      routedConfig("as-declared", { armsDigest: "aaaa" }),
+    );
+    await finish(ctx, first);
+    const second = makeRun(
+      ctx,
+      "run_same2222same2222",
+      [makeSample("a", false, 0)],
+      routedConfig("as-declared", { armsDigest: "aaaa" }),
+    );
+    const result = await finish(ctx, second, { gateRequested: true });
+    expect(result.gateFailed).toBe(true);
+  });
+});
+
+describe("routedInstrumentMismatch / gateRuns digest guard", () => {
+  const summaryWith = (
+    runId: string,
+    routing?: EvalRunSummary["config"]["routing"],
+  ): EvalRunSummary =>
+    makeSummary(runId, [makeSample("a", true, 1)], "/tmp/x", 100, routing ? { routing } : {});
+
+  test("an unrouted side never trips the guard", () => {
+    expect(routedInstrumentMismatch(summaryWith("a"), summaryWith("b"))).toBeUndefined();
+    expect(
+      routedInstrumentMismatch(
+        summaryWith("a"),
+        summaryWith("b", { mode: "as-declared", armsDigest: "z" }),
+      ),
+    ).toBeUndefined();
+  });
+
+  test("different digests (or policies) refuse the comparison outright", () => {
+    const reason = routedInstrumentMismatch(
+      summaryWith("a", { mode: "as-declared", armsDigest: "aaaa" }),
+      summaryWith("b", { mode: "as-declared", armsDigest: "bbbb" }),
+    );
+    expect(reason).toContain("different arm snapshots");
+    expect(
+      routedInstrumentMismatch(
+        summaryWith("a", { mode: "as-declared", armsDigest: "x", policyVersion: "p1" }),
+        summaryWith("b", { mode: "as-declared", armsDigest: "x", policyVersion: "p2" }),
+      ),
+    ).toContain("different routing policies");
+    // And gateRuns refuses rather than reporting a verdict nobody can act on.
+    const verdict = gateRuns(
+      summaryWith("a", { mode: "as-declared", armsDigest: "aaaa" }),
+      summaryWith("b", { mode: "as-declared", armsDigest: "bbbb" }),
+    );
+    expect(verdict.verdict).toBe("fail");
+    expect(verdict.reason).toContain("not comparable");
   });
 });

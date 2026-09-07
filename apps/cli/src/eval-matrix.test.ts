@@ -6,7 +6,9 @@
  */
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { lower } from "@crewhaus/compiler";
 import type { EvalRunSummary } from "@crewhaus/eval-runner";
+import { parseSpec } from "@crewhaus/spec";
 import {
   MatrixArgError,
   assertMatrixFlagsCompatible,
@@ -16,6 +18,7 @@ import {
   defaultMatrixPricing,
   modelSlug,
   parseModelsFlag,
+  resolveMatrixArms,
   runMatrixCells,
 } from "./eval-matrix";
 
@@ -105,14 +108,104 @@ describe("parseModelsFlag", () => {
 });
 
 describe("assertMatrixFlagsCompatible", () => {
-  test("rejects --gate and --no-promote; allows neither", () => {
+  test("rejects --gate and --no-promote WITHOUT --record; allows neither", () => {
     expect(() => assertMatrixFlagsCompatible({ gate: true, noPromote: false })).toThrow(
-      /--models is incompatible with --gate/,
+      /--models --gate needs --record/,
     );
     expect(() => assertMatrixFlagsCompatible({ gate: false, noPromote: true })).toThrow(
-      /--models is incompatible with --no-promote/,
+      /--models --no-promote needs --record/,
     );
     expect(() => assertMatrixFlagsCompatible({ gate: false, noPromote: false })).not.toThrow();
+  });
+
+  test("0.6.0 §6.1 — --record makes both legal: each cell keys its own lineage", () => {
+    expect(() =>
+      assertMatrixFlagsCompatible({ gate: true, noPromote: true, record: true }),
+    ).not.toThrow();
+  });
+});
+
+describe("parseModelsFlag — 0.6.0 spellings", () => {
+  test("$profile refs pass the parser without the model-router grammar", () => {
+    expect(parseModelsFlag("$fast,$strong")).toEqual(["$fast", "$strong"]);
+    expect(() => parseModelsFlag("$Fast")).toThrow(/not a valid profile reference/);
+  });
+
+  test("`pool` is accepted alone and refused in a mixed list", () => {
+    expect(parseModelsFlag("pool")).toEqual(["pool"]);
+    expect(() => parseModelsFlag("pool,$fast")).toThrow(/cannot be combined/);
+  });
+});
+
+describe("resolveMatrixArms", () => {
+  const POOL_SPEC = `name: matrix-arms
+target: cli
+models:
+  fast:
+    model: claude-haiku-4-5
+    tags: [cheap]
+  strong:
+    model: claude-opus-4-7
+    tags: [strong]
+agent:
+  model: $strong
+  instructions: hi
+  model_pool:
+    policy: heuristic
+    candidates:
+      - model: $fast
+      - model: $strong
+`;
+  const irOf = (spec: string) => {
+    const ir = lower(parseSpec(spec));
+    if (ir.target !== "cli") throw new Error("expected cli");
+    return ir;
+  };
+
+  test("`pool` expands every routable candidate to its own arm", () => {
+    expect(resolveMatrixArms(["pool"], irOf(POOL_SPEC))).toEqual([
+      { ref: "$fast", model: "claude-haiku-4-5", armId: "fast", routing: "candidate:$fast" },
+      { ref: "$strong", model: "claude-opus-4-7", armId: "strong", routing: "candidate:$strong" },
+    ]);
+  });
+
+  test("$profile refs resolve to the profile's model and keep the profile as the ARM", () => {
+    expect(resolveMatrixArms(["$fast"], irOf(POOL_SPEC))[0]).toEqual({
+      ref: "$fast",
+      model: "claude-haiku-4-5",
+      armId: "fast",
+      routing: "candidate:$fast",
+    });
+  });
+
+  test("a bare model in the roster keeps the roster's arm; one outside it routes static", () => {
+    const arms = resolveMatrixArms(["claude-haiku-4-5", "openai/gpt-4o"], irOf(POOL_SPEC));
+    expect(arms[0]).toMatchObject({ armId: "fast", routing: "candidate:claude-haiku-4-5" });
+    // Outside the roster: the cell still keys its own arm, but the runner is
+    // NOT asked to resolve a candidate that does not exist.
+    expect(arms[1]).toEqual({
+      ref: "openai/gpt-4o",
+      model: "openai/gpt-4o",
+      armId: "openai/gpt-4o",
+    });
+  });
+
+  test("an unknown $profile names what IS declared instead of guessing a model", () => {
+    expect(() => resolveMatrixArms(["$cheep"], irOf(POOL_SPEC))).toThrow(
+      /no models: profile or model_pool candidate named "cheep"/,
+    );
+  });
+
+  test("`pool` on a spec without a pool is a loud error", () => {
+    const noPool =
+      "name: no-pool\ntarget: cli\nagent:\n  model: claude-opus-4-7\n  instructions: hi\n";
+    expect(() => resolveMatrixArms(["pool"], irOf(noPool))).toThrow(/declares no model_pool/);
+  });
+
+  test("two entries resolving to the same arm are refused — each cell owns a lineage", () => {
+    expect(() => resolveMatrixArms(["$fast", "claude-haiku-4-5"], irOf(POOL_SPEC))).toThrow(
+      /resolve to the same arm "fast"/,
+    );
   });
 });
 

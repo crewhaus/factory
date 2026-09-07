@@ -11,9 +11,11 @@ import { join } from "node:path";
 import {
   type BaselinesFile,
   type RunIndexEntry,
+  lineageOfEntry,
   readBaselines,
   readRunIndex,
   readRunIndexLatest,
+  resolveBaseline,
 } from "@crewhaus/eval-report";
 import { MAX_JSONL_LINES, RUN_ID_RE, SAFE_SEGMENT_RE } from "./constants";
 import { MAX_TEXT_BYTES } from "./constants";
@@ -136,8 +138,11 @@ export function evalHealth(evalsDir: string, specName: string): { healthy: boole
     for (const e of all) {
       if (e.ts > latest.ts) latest = e;
     }
-    const baselines = readBaselines(evalsDir);
-    const base = baselines[`${specName}::${latest.datasetName}`];
+    // 0.6.0 §6.1 — resolve through the SHARED lineage reader: a routed or
+    // arm-pinned run keys `spec::dataset::<arm|routed>`, and hand-rolling the
+    // legacy two-segment key here would report "no baseline pinned" for every
+    // routed harness.
+    const base = resolveBaseline({ ...lineageOfEntry(latest), specName }, evalsDir).entry;
     if (base === undefined) return { healthy: true, note: "no baseline pinned" };
     const baseRun = all.find((e) => e.runId === base.runId);
     if (baseRun === undefined) {

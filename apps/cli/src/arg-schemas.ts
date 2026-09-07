@@ -669,6 +669,18 @@ export const EVAL_SCHEMA: ParseArgsSchema = {
     // model; each cell writes to <out>/<model-slug>/. Incompatible with
     // --gate/--no-promote (cells skip the run-history lineage entirely).
     { name: "models", takesValue: true },
+    // 0.6.0 §6.1 — ROUTE the eval: static (default) | as-declared |
+    // candidate:<$profile|model>. Every routed mode pins model_pool.learning
+    // .seed and routes off a FROZEN arm snapshot, so the run records nothing
+    // into the harness's learned policy and two runs of a seed agree.
+    { name: "routing", takesValue: true },
+    // 0.6.0 §6.1 — seed that frozen snapshot from the harness's live
+    // arms.jsonl instead of starting cold.
+    { name: "warm-arms", takesValue: false },
+    // 0.6.0 §6.1 — run --models cells through the run-history flow: each cell
+    // keys its OWN per-arm lineage (spec::dataset::<arm>), which is what makes
+    // --gate/--no-promote legal under --models.
+    { name: "record", takesValue: false },
     { name: "out", short: "o", takesValue: true },
     // Run-history item 3 — exit non-zero when the run regresses against the
     // pinned (spec, dataset) baseline (regression-runner gate, strict
@@ -830,6 +842,30 @@ export const EVAL_SUITE_SCHEMA: ParseArgsSchema = {
     { name: "out", short: "o", takesValue: true },
     // Exit non-zero when the tier verdict fails (report-only without it).
     { name: "gate", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// 0.6.0 §6.1 — `crewhaus eval leaderboard <matrix-dir>`: rank the arms of a
+// recorded `eval --models` matrix with Wilson intervals and a paired
+// sign-flip test, and REFUSE to name a winner the evidence cannot support.
+// Fully offline — it reads run directories, makes no model call.
+export const EVAL_LEADERBOARD_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Print every N-choose-2 paired comparison, not just the top pair.
+    { name: "pairwise", takesValue: false },
+    // Write .crewhaus/routing/priors.json (reward units, pseudo-count ≤ 10)
+    // so `model_pool.reward.priors: eval` can seed the learned policy.
+    { name: "export-priors", takesValue: true },
+    // The spec whose model_pool roster the priors file is fingerprinted
+    // against (default ./crewhaus.yaml). A priors file pinned to another
+    // roster is rejected at boot, so this is not optional detail.
+    { name: "spec", takesValue: true },
+    // Comparable-pair floor before a winner may be named (default 30).
+    { name: "min-n", takesValue: true },
+    // Pins the permutation test's Monte Carlo draw and the bootstrap CI.
+    { name: "seed", takesValue: true },
+    { name: "json", takesValue: false },
     { name: "help", short: "h" },
   ],
 };

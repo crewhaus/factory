@@ -1,5 +1,6 @@
 import { detectCalibrationAggregates } from "./calibration-abstention";
 import { detectParaphraseConsistency } from "./paraphrase-consistency";
+import { mergeServedModels } from "./routing";
 import { detectSemanticFallback } from "./semantic-fallback";
 import { sampleAbstained, sampleIsCanary, sampleNeedsReview } from "./slices";
 import { meanCI95, wilsonCI95 } from "./stats";
@@ -246,6 +247,14 @@ export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates 
   const calibration = detectCalibrationAggregates(samples);
   const paraphraseConsistency = detectParaphraseConsistency(samples);
 
+  // 0.6.0 §6.1 — the run-level served-model roll-up over the CANONICAL
+  // samples (trial 1), so a repeated run stays comparable with a single-trial
+  // one exactly as every other pre-existing field does. Absent when nothing
+  // published a `model_response` role/profile, keeping unrouted runs'
+  // results.json byte-identical.
+  const servedModelsFolded = mergeServedModels(samples.map((s) => s.servedModels));
+  const servedModels = servedModelsFolded.length > 0 ? servedModelsFolded : undefined;
+
   return {
     passRate: gradedTotal === 0 ? 0 : passed / gradedTotal,
     meanScore,
@@ -280,5 +289,6 @@ export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates 
     ...(semanticFallback !== undefined ? { semanticFallback } : {}),
     ...(calibration !== undefined ? { calibration } : {}),
     ...(paraphraseConsistency !== undefined ? { paraphraseConsistency } : {}),
+    ...(servedModels !== undefined ? { servedModels } : {}),
   };
 }

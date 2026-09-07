@@ -24,7 +24,12 @@
  */
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import { readBaselines, readRunIndexLatest } from "@crewhaus/eval-report";
+import {
+  baselineKeyFor,
+  lineageOfEntry,
+  readBaselines,
+  readRunIndexLatest,
+} from "@crewhaus/eval-report";
 import {
   type BuildInventoryDeps,
   type EvalHealthReader,
@@ -259,16 +264,23 @@ const readEvalHealth: EvalHealthReader = (evalsDir) => {
   let regressed = false;
   const notes: string[] = [];
   for (const b of baselineList) {
+    // 0.6.0 §6.1 — match on the run's full LINEAGE, not just (spec, dataset).
+    // A routed harness records one row per ARM; matching on the pair alone
+    // would compare the cheap arm's newest run against the strong arm's
+    // baseline and report a fleet-wide regression that never happened.
+    const baselineLineageKey = baselineKeyFor(lineageOfEntry(b));
     const forKey = runs
-      .filter((r) => r.specName === b.specName && r.datasetName === b.datasetName)
+      .filter((r) => baselineKeyFor(lineageOfEntry(r)) === baselineLineageKey)
       .sort((x, y) => (x.ts < y.ts ? -1 : 1));
     const latest = forKey[forKey.length - 1];
     const baselineRun = runs.find((r) => r.runId === b.runId);
     if (latest === undefined || baselineRun === undefined) continue;
     if (latest.passRate < baselineRun.passRate) {
       regressed = true;
+      const armSuffix =
+        b.armId !== undefined ? `#${b.armId}` : b.routing !== undefined ? "#routed" : "";
       notes.push(
-        `${b.datasetName} ${(latest.passRate * 100).toFixed(0)}% < baseline ${(baselineRun.passRate * 100).toFixed(0)}%`,
+        `${b.datasetName}${armSuffix} ${(latest.passRate * 100).toFixed(0)}% < baseline ${(baselineRun.passRate * 100).toFixed(0)}%`,
       );
     }
   }
