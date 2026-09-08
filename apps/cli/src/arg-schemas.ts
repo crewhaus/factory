@@ -459,6 +459,12 @@ export const MODEL_SCHEMA: ParseArgsSchema = {
     { name: "pass-rate-tolerance", takesValue: true },
     // Max candidates per slot (cheapest-first). Default 3.
     { name: "per-slot-limit", takesValue: true },
+    // 0.6.0 §9.1 (loop 4) — search ONE enumerated slot by its label.
+    { name: "slot", takesValue: true },
+    // 0.6.0 §9.1 (loop 4) — FIX the candidate set (comma-separated) instead
+    // of searching for cheaper siblings: the sunset gate measures a
+    // replacement, which is normally pricier than the model it retires.
+    { name: "candidates", takesValue: true },
     // Apply the winning downshift via a direct comment-preserving CST edit.
     { name: "write", takesValue: false },
     // Item 40 — `--detect`: read-only inventory of reachable providers, the

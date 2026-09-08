@@ -35,3 +35,42 @@ describe("CLI arg schemas", () => {
     expect(schema.flags.some((f) => f.name === "help")).toBe(true);
   });
 });
+
+/**
+ * §9.1 loop 4 — `models propose --source sunset` PRINTS the right-size gate
+ * command, and `parseArgs` rejects any flag a schema does not declare. A gate
+ * whose printed command dies with "unknown flag" is worse than no gate: it
+ * teaches an operator the verbs are decorative.
+ */
+describe("the sunset gate's flags are the flags `model right-size` accepts", () => {
+  test("--slot and --candidates parse, with their values", () => {
+    const parsed = parseArgs(
+      ["spec.yaml", "--slot", "agent.model", "--candidates", "claude-haiku-4-5,claude-sonnet-4-5"],
+      SCHEMAS.MODEL_SCHEMA,
+    );
+    expect(parsed.flags["slot"]).toBe("agent.model");
+    expect(parsed.flags["candidates"]).toBe("claude-haiku-4-5,claude-sonnet-4-5");
+    expect(parsed.positional[0]).toBe("spec.yaml");
+  });
+
+  test("the whole printed gate command parses", () => {
+    expect(() =>
+      parseArgs(
+        [
+          "crewhaus.yaml",
+          "--dataset",
+          "eval/dataset.jsonl",
+          "--graders",
+          "eval/graders.yaml",
+          "--slot",
+          "compaction.model",
+          "--candidates",
+          "claude-haiku-4-5",
+          "--min-cost-drop",
+          "-1",
+        ],
+        SCHEMAS.MODEL_SCHEMA,
+      ),
+    ).not.toThrow();
+  });
+});
