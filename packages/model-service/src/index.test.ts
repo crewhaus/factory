@@ -20,12 +20,20 @@ import { describe, expect, test } from "bun:test";
 import type { IrModelPool, IrSubAgentDefinition } from "@crewhaus/ir";
 import type { RunChatLoopOptions } from "@crewhaus/runtime-core";
 import {
+  ALL_HYBRID_WIRING_FAMILIES,
+  HYBRID_CONSTRUCTION_KEYS,
+  HYBRID_FAMILIES_BY_SHAPE,
+  HYBRID_WIRING_IMPORT,
   MODEL_WIRING_KEYS,
   type ModelWiringFragment,
   type ModelWiringRunOptions,
+  hybridWiringFamiliesForShape,
   modelWiringFragmentFromIr,
+  poolNeedsHybridWiring,
+  renderHybridWiringFields,
   renderModelWiringFields,
   renderSubAgentDef,
+  wireHybrid,
   wireModels,
 } from "./index";
 
@@ -343,5 +351,241 @@ describe("renderSubAgentDef — one renderer for the three __subAgents literals"
     );
     // An EMPTY modelFallbacks is treated as absent (the emitters' length guard).
     expect(renderSubAgentDef({ ...legacy, modelFallbacks: [] })).toBe(renderSubAgentDef(legacy));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 PR 9e — the closure half, and the codegen twin that puts it in a
+// bundle. The load-bearing claim: EVALUATING what an emitter renders yields
+// exactly the keys `wireModels` yields for the same pool, so `crewhaus run`
+// and a compiled bundle build one option set, not two.
+// ---------------------------------------------------------------------------
+
+const DIRECTED_POOL: IrModelPool = {
+  ...POOL,
+  strategy: { modelDirected: true, cascade: { draft: "cheap", escalateTo: "strong" } },
+};
+const CLASSIFIER_POOL: IrModelPool = {
+  ...POOL,
+  policy: "classifier",
+  classifier: { model: "claude-haiku-4-5", labels: { cheap: "easy", strong: "hard" } },
+};
+const GUIDE_POOL: IrModelPool = {
+  ...POOL,
+  strategy: { guide: { model: "claude-opus-4-8", every: "first_turn" } },
+};
+const EVERYTHING_POOL: IrModelPool = {
+  ...POOL,
+  policy: "classifier",
+  classifier: { model: "claude-haiku-4-5", labels: { cheap: "easy", strong: "hard" } },
+  strategy: {
+    modelDirected: true,
+    cascade: { draft: "cheap", escalateTo: "strong" },
+    guide: { model: "claude-opus-4-8" },
+    shadow: { candidate: "claude-opus-4-8", sampleRate: 0.1 },
+  },
+};
+
+describe("poolNeedsHybridWiring — the ONE gate codegen and the import share", () => {
+  test("false for an absent pool and for a pool with no closure-shaped key", () => {
+    expect(poolNeedsHybridWiring(undefined)).toBe(false);
+    expect(poolNeedsHybridWiring(POOL)).toBe(false);
+    // Rules, directives and a cascade ride the blob — no closure, no gate.
+    expect(poolNeedsHybridWiring(NEW_KEYS_POOL)).toBe(false);
+    expect(
+      poolNeedsHybridWiring({ ...POOL, strategy: { cascade: { draft: "a", escalateTo: "b" } } }),
+    ).toBe(false);
+    // `policy: classifier` WITHOUT a classifier block builds nothing.
+    expect(poolNeedsHybridWiring({ ...POOL, policy: "classifier" })).toBe(false);
+  });
+
+  test("true for each of the three closure families", () => {
+    for (const pool of [DIRECTED_POOL, CLASSIFIER_POOL, GUIDE_POOL, EVERYTHING_POOL]) {
+      expect(poolNeedsHybridWiring(pool)).toBe(true);
+    }
+  });
+});
+
+describe("wireHybrid IS what wireModels appends beyond the literal fields", () => {
+  for (const [label, pool] of [
+    ["model_directed", DIRECTED_POOL],
+    ["classifier", CLASSIFIER_POOL],
+    ["guide", GUIDE_POOL],
+    ["all three", EVERYTHING_POOL],
+    ["plain pool", POOL],
+  ] as ReadonlyArray<[string, IrModelPool]>) {
+    test(`${label}: wireModels' extra keys are exactly wireHybrid's keys`, () => {
+      const wired = wireModels({ modelPool: pool }, {});
+      const hybrid = wireHybrid(pool, {});
+      expect(Object.keys(wired)).toEqual(["modelPool", ...Object.keys(hybrid)]);
+    });
+  }
+
+  test("model_directed yields the Consult / Escalate pair and the latch", () => {
+    const hybrid = wireHybrid(DIRECTED_POOL, {});
+    expect(hybrid.hybridTools?.map((t) => t.name)).toEqual(["Consult", "Escalate"]);
+    expect(hybrid.escalation).toBeDefined();
+    expect(hybrid.routeClassifier).toBeUndefined();
+    expect(hybrid.sideCalls).toBeUndefined();
+  });
+
+  test("policy: classifier yields the label call only", () => {
+    const hybrid = wireHybrid(CLASSIFIER_POOL, {});
+    expect(typeof hybrid.routeClassifier).toBe("function");
+    expect(hybrid.hybridTools).toBeUndefined();
+    expect(hybrid.sideCalls).toBeUndefined();
+  });
+
+  test("strategy.guide yields the side calls only", () => {
+    const hybrid = wireHybrid(GUIDE_POOL, {});
+    expect(hybrid.sideCalls?.guide).toBeDefined();
+    expect(hybrid.hybridTools).toBeUndefined();
+    expect(hybrid.routeClassifier).toBeUndefined();
+  });
+
+  test("a pool with all three yields every key, in HYBRID_CONSTRUCTION_KEYS order", () => {
+    const hybrid = wireHybrid(EVERYTHING_POOL, {});
+    expect(Object.keys(hybrid)).toEqual([...HYBRID_CONSTRUCTION_KEYS]);
+  });
+
+  test("a plain pool constructs nothing (spread-return-{})", () => {
+    expect(wireHybrid(POOL, {})).toEqual({});
+  });
+});
+
+describe("renderHybridWiringFields ≡ wireHybrid — one code path, not a mirror", () => {
+  test("nothing is rendered — and so nothing is imported — for a plain pool", () => {
+    expect(renderHybridWiringFields({ modelPool: POOL }, "  ", "spec")).toBe("");
+    expect(renderHybridWiringFields({}, "  ", "spec")).toBe("");
+  });
+
+  for (const [label, pool] of [
+    ["model_directed", DIRECTED_POOL],
+    ["classifier", CLASSIFIER_POOL],
+    ["guide", GUIDE_POOL],
+    ["all three", EVERYTHING_POOL],
+  ] as ReadonlyArray<[string, IrModelPool]>) {
+    test(`${label}: the rendered call carries the SAME blob and builds the SAME keys`, () => {
+      const rendered = renderHybridWiringFields({ modelPool: pool }, "  ", "spec");
+      expect(rendered).toBe(`\n  ...wireHybrid(${JSON.stringify(pool)}, { sessionName: "spec" }),`);
+      // Evaluate what the bundle would run, with the same runtime function the
+      // interpreter calls, and compare key-for-key with `wireModels`.
+      const evaluated = new Function(
+        "wireHybrid",
+        `return {${renderModelWiringFields({ modelPool: pool }, "  ")}${rendered} };`,
+      )(wireHybrid) as Record<string, unknown>;
+      expect(Object.keys(evaluated)).toEqual(Object.keys(wireModels({ modelPool: pool }, {})));
+      expect(evaluated["modelPool"]).toEqual(pool);
+    });
+  }
+
+  test("the import line is a single constant, so the six emitters cannot drift", () => {
+    expect(HYBRID_WIRING_IMPORT).toBe('import { wireHybrid } from "@crewhaus/model-service";');
+  });
+});
+
+/**
+ * 0.6.0 PR 9f — plan §11.3 lives in this package as
+ * `HYBRID_FAMILIES_BY_SHAPE`, and both halves of the one code path
+ * (`wireHybrid` for the interpreter, `renderHybridWiringFields` for a compiled
+ * bundle) take that row. A shape the matrix marks `—` for a family constructs
+ * nothing for it on EITHER path, and the restriction travels into the bundle
+ * verbatim so the two cannot disagree.
+ */
+describe("the §11.3 family table (PR 9f)", () => {
+  test("every pool-bearing shape hosts the classifier and the side calls", () => {
+    const pooled = [
+      "cli",
+      "workflow",
+      "channel",
+      "graph",
+      "managed",
+      "pipeline",
+      "crew",
+      "research",
+      "batch",
+      "browser",
+    ] as const;
+    for (const shape of pooled) {
+      expect(hybridWiringFamiliesForShape(shape)).toContain("classifier");
+      expect(hybridWiringFamiliesForShape(shape)).toContain("sideCalls");
+    }
+  });
+
+  test("only pipeline declines the model-directed pair; the four pool-less shapes take none", () => {
+    expect(
+      Object.entries(HYBRID_FAMILIES_BY_SHAPE)
+        .filter(([, fams]) => fams.length > 0 && !fams.includes("modelDirected"))
+        .map(([shape]) => shape),
+    ).toEqual(["pipeline"]);
+    expect(
+      Object.entries(HYBRID_FAMILIES_BY_SHAPE)
+        .filter(([, fams]) => fams.length === 0)
+        .map(([shape]) => shape)
+        .sort(),
+    ).toEqual(["eval", "onchain", "onchain-game", "voice"]);
+  });
+
+  test("an unknown shape name hosts nothing rather than throwing", () => {
+    expect(hybridWiringFamiliesForShape("no-such-shape")).toEqual([]);
+  });
+
+  test("the gate narrows to the row: a model_directed-only pool needs no pipeline wiring", () => {
+    const families = HYBRID_FAMILIES_BY_SHAPE.pipeline;
+    expect(poolNeedsHybridWiring(DIRECTED_POOL, families)).toBe(false);
+    expect(poolNeedsHybridWiring(GUIDE_POOL, families)).toBe(true);
+    expect(poolNeedsHybridWiring(CLASSIFIER_POOL, families)).toBe(true);
+    // …and unrestricted (the interpreter's posture) it still needs wiring.
+    expect(poolNeedsHybridWiring(DIRECTED_POOL)).toBe(true);
+  });
+
+  test("wireHybrid declines a family the host does not list", () => {
+    const families = HYBRID_FAMILIES_BY_SHAPE.pipeline;
+    const restricted = wireHybrid(EVERYTHING_POOL, { hybridFamilies: families });
+    expect(Object.keys(restricted)).toEqual(["routeClassifier", "sideCalls"]);
+    expect(restricted.hybridTools).toBeUndefined();
+    expect(restricted.escalation).toBeUndefined();
+    // Unrestricted, the same pool builds every family.
+    expect(Object.keys(wireHybrid(EVERYTHING_POOL, {}))).toEqual([...HYBRID_CONSTRUCTION_KEYS]);
+    // A declined family with nothing else declared builds nothing at all.
+    expect(wireHybrid(DIRECTED_POOL, { hybridFamilies: families })).toEqual({});
+  });
+
+  test("the rendered call carries the restriction, so the bundle applies it too", () => {
+    const families = HYBRID_FAMILIES_BY_SHAPE.pipeline;
+    const rendered = renderHybridWiringFields(
+      { modelPool: EVERYTHING_POOL },
+      "  ",
+      "spec",
+      families,
+    );
+    expect(rendered).toBe(
+      `\n  ...wireHybrid(${JSON.stringify(EVERYTHING_POOL)}, { sessionName: "spec", hybridFamilies: ["classifier","sideCalls"] }),`,
+    );
+    // Evaluate it as the bundle would: the same keys `wireHybrid` gives the
+    // interpreter under the same row.
+    const evaluated = new Function("wireHybrid", `return {${rendered} };`)(wireHybrid) as Record<
+      string,
+      unknown
+    >;
+    expect(Object.keys(evaluated)).toEqual(
+      Object.keys(wireHybrid(EVERYTHING_POOL, { hybridFamilies: families })),
+    );
+    // A declined-only pool renders nothing, so the emitter imports nothing.
+    expect(renderHybridWiringFields({ modelPool: DIRECTED_POOL }, "  ", "spec", families)).toBe("");
+  });
+
+  test("byte-identity: a full-row shape renders exactly the PR 9e text", () => {
+    expect(
+      renderHybridWiringFields(
+        { modelPool: EVERYTHING_POOL },
+        "  ",
+        "spec",
+        ALL_HYBRID_WIRING_FAMILIES,
+      ),
+    ).toBe(renderHybridWiringFields({ modelPool: EVERYTHING_POOL }, "  ", "spec"));
+    expect(renderHybridWiringFields({ modelPool: EVERYTHING_POOL }, "  ", "spec")).not.toContain(
+      "hybridFamilies",
+    );
   });
 });

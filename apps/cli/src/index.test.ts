@@ -604,12 +604,16 @@ describe("crewhaus compile", () => {
 
   // 0.6.0 PR 7 — the model-plan notices that no spec edit can properly clear
   // are informational too: model-plan-pending-runtime fires on a key the plan
-  // tells authors to adopt (its runtime lands in a later PR-train row — since
-  // PR 10 honours a candidate's failover chain and breaker, the pending key
-  // here is a `strategy.guide` side call on a compiled cli bundle, which
-  // waits for the emitters' boot-time wireModels row), and model-sunset is a
-  // wall-clock notice on a 0.5.x pool that compiled under --strict yesterday.
-  // Both print; neither fails --strict.
+  // tells authors to adopt whose runtime lands in a later PR-train row, and
+  // model-sunset is a wall-clock notice on a 0.5.x pool that compiled under
+  // --strict yesterday. Both print; neither fails --strict.
+  //
+  // The pending key has moved twice as the train landed: PR 10 honoured a
+  // candidate's failover chain, and PR 9e wired `strategy.guide` (and the
+  // whole closure family) into the compiled cli bundle. What genuinely still
+  // pends on a cli spec is the §6.2 JUDGE PANEL — `evaluation.grader`'s
+  // `judges` / `repeats` / `temperature` / `target` lower into the IR while
+  // every judge site still calls `judge()` with the single model.
   test("compile --strict does NOT escalate the informational model-plan-pending-runtime / model-sunset notices", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
     writeFileSync(
@@ -622,10 +626,12 @@ describe("crewhaus compile", () => {
         "  instructions: route it",
         "  model_pool:",
         "    candidates:",
-        "      - { model: claude-haiku-4-5, tags: [cheap], fallbacks: [claude-sonnet-4-6] }",
+        "      - { model: claude-haiku-4-5, tags: [cheap] }",
         "      - { model: claude-opus-4-1, tags: [strong] }",
         "    strategy:",
         "      guide: { model: claude-opus-4-1, every: first_turn }",
+        "evaluation:",
+        "  grader: { type: llm_judge, criteria: helpful, repeats: 3 }",
         "",
       ].join("\n"),
     );
@@ -635,10 +641,12 @@ describe("crewhaus compile", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toContain(
-      "crewhaus: warning[model-plan-pending-runtime] agent.model_pool.strategy.guide:",
+      "crewhaus: warning[model-plan-pending-runtime] evaluation.grader.repeats:",
     );
-    // PR 10 honours the candidate's failover chain: nothing pends on it.
+    // PR 10 honours the candidate's failover chain and PR 9e constructs the
+    // guide side call in the compiled cli bundle: neither pends any more.
     expect(result.stderr).not.toContain("agent.model_pool.candidates[0].fallbacks");
+    expect(result.stderr).not.toContain("agent.model_pool.strategy.guide");
     expect(result.stderr).toContain(
       "crewhaus: warning[model-sunset] agent.model_pool.candidates[1]",
     );

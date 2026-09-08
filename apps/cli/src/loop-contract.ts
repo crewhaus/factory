@@ -156,6 +156,30 @@ export function loopContractRunOptions(ir: LoopContractIrSlice): LoopContractRun
  * spreads the fragment and adds nothing by hand. `deps` carries the session
  * facts the nested consult loops persist under (the spec name).
  *
+ * PR 9e closes the parity gap those constructions opened. `hybridTools` /
+ * `escalation`, `routeClassifier` (9b) and `sideCalls` (9d) are CLOSURES, so
+ * they cannot ride the pool blob a bundle renders — for two waves the
+ * interpreter had them and a compiled bundle did not. The emitters now render
+ * `...wireHybrid(<pool blob>, { sessionName })` beside the literal fields,
+ * which is precisely the slice `wireModels` appends here; `hybrid-parity.test.ts`
+ * evaluates the emitted text and compares the two option sets key for key.
+ *
+ * PR 9f finishes the reach: every pool-bearing shape renders that call, for
+ * every closure family plan §11.3 marks **E** on its row
+ * (`HYBRID_FAMILIES_BY_SHAPE` in model-service). The interpreter passes no
+ * `hybridFamilies` and so keeps building every family a pool declares — it
+ * serves whatever shape it is handed and is not the thing §11.3 constrains;
+ * an emitter passes its shape's row, and the ONE restriction that exists
+ * today (`pipeline` declines the Consult / Escalate pair) travels into the
+ * bundle verbatim, so the two paths stay comparable key for key.
+ *
+ * "The interpreter" is TWO call sites, and 9f fixed the second: `crewhaus
+ * run` accepts `cli` and `browser` (every other shape is compile-only, and
+ * `serve --mcp` is cli-only), and until this row the browser path spread none
+ * of this — a browser spec routed and consulted when compiled and did neither
+ * when run. Both `runRunCli` and `runRunBrowser` now spread this call, so the
+ * key-for-key claim above holds for every shape an interpreter accepts.
+ *
  * `modelOverride` is the raw `--model` flag value: a string is an explicit
  * routing decision authored against a different primary, so the spec's
  * chain, tiers and pool (and with it the hybrid tools) are dropped (the

@@ -21,7 +21,12 @@ import {
 import type { IrMcpServerConfig } from "@crewhaus/ir";
 import { memoryFragmentFromIr, renderStudyRotationPreamble } from "@crewhaus/memory-service";
 import { type ParsedModelString, parseModelString } from "@crewhaus/model-router";
-import { renderModelWiringFields, renderSubAgentDef } from "@crewhaus/model-service";
+import {
+  HYBRID_WIRING_IMPORT,
+  renderHybridWiringFields,
+  renderModelWiringFields,
+  renderSubAgentDef,
+} from "@crewhaus/model-service";
 
 /**
  * Emit a self-contained channel-bot bundle for a channel-target IR.
@@ -960,6 +965,11 @@ function renderAgent(ir: IrChannelV0, evalEntry = false): string {
   const evalImport = evaluation.imports.length > 0 ? `${evaluation.imports.join("\n")}\n` : "";
   const evaluationBlock = evaluation.bootBlock ? `\n${evaluation.bootBlock}\n` : "";
   const hasRules = ir.permissions.rules.length > 0;
+  // 0.6.0 PR 9e — the closure half of the pool (Consult / Escalate, the route
+  // classifier, guide / shadow). "" — and no import — when the pool declares
+  // none of them, so pre-0.6.0 channel bundles stay byte-identical.
+  const hybridFields = renderHybridWiringFields(ir.agent, "        ", ir.name);
+  const hybridImport = hybridFields.length > 0 ? `${HYBRID_WIRING_IMPORT}\n` : "";
   const permImport = hasRules
     ? `import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";\n`
     : "";
@@ -1151,7 +1161,7 @@ import { runChatLoop } from "@crewhaus/runtime-core";
 import type { EgressAuditSink, JustificationAuditSink } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { classifyInbound } from "@crewhaus/channel-adapter-base";
-${permImport}${approvalTypeImport}${subAgentTypeImport}${memImport}${evalImport}import type { HookDef } from "@crewhaus/hooks-engine";
+${hybridImport}${permImport}${approvalTypeImport}${subAgentTypeImport}${memImport}${evalImport}import type { HookDef } from "@crewhaus/hooks-engine";
 import type { SkillRef } from "@crewhaus/skills-registry";
 import type { SlashCommand } from "@crewhaus/slash-commands";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";${
@@ -1209,7 +1219,7 @@ export function createAgent(config: AgentConfig): Agent {
       const __inbound = await classifyInbound(args.message, runContext, { origin: "channel" });${memTurnBlock}
       return await runChatLoop({
         model: ${escapeJsonString(ir.agent.model)},
-        instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentTuningFields(ir)}${renderModelWiringFields(ir.agent, "        ")}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderCompactionFields(ir)}
+        instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentTuningFields(ir)}${renderModelWiringFields(ir.agent, "        ")}${hybridFields}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderCompactionFields(ir)}
         sessionName: ${escapeJsonString(ir.name)},
         sessionTarget: "channel",
         ...(config.sessionRootDir !== undefined ? { sessionRootDir: config.sessionRootDir } : {}),

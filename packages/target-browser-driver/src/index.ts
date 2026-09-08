@@ -55,7 +55,12 @@ import {
   type IrBrowserV0,
   renderBundleReadme,
 } from "@crewhaus/ir";
-import { renderModelWiringFields } from "@crewhaus/model-service";
+import {
+  HYBRID_FAMILIES_BY_SHAPE,
+  HYBRID_WIRING_IMPORT,
+  renderHybridWiringFields,
+  renderModelWiringFields,
+} from "@crewhaus/model-service";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -230,6 +235,18 @@ export function emitBrowserDriver(ir: IrBrowserV0, opts: EmitReadmeOptions = {})
 }
 
 function renderAgent(ir: IrBrowserV0): string {
+  // 0.6.0 PR 9f (§11.3) — the closure half of the pool: Consult / Escalate,
+  // the route classifier, the guide / shadow lanes. Rendered onto the shared
+  // `runOptions` both drives spread, so the REPL and the one-shot path carry
+  // the same closures. "" — and no import — when the pool declares none of
+  // them, so pre-0.6.0 browser bundles stay byte-identical.
+  const hybridFields = renderHybridWiringFields(
+    ir.agent,
+    "    ",
+    ir.name,
+    HYBRID_FAMILIES_BY_SHAPE.browser,
+  );
+  const hybridImport = hybridFields.length > 0 ? `${HYBRID_WIRING_IMPORT}\n` : "";
   const startUrl = ir.driver.startUrl;
   // SECURITY — `driver.allowPrivateTargets` relaxes BOTH SSRF layers together:
   // the chromium backend's DNS-pinning proxy and the Navigate tool's pre-goto
@@ -286,7 +303,7 @@ import { createFindElementTool } from "@crewhaus/tool-vision-grounding";
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
-import { defaultCatalog } from "@crewhaus/tool-catalog";
+${hybridImport}import { defaultCatalog } from "@crewhaus/tool-catalog";
 import { createSessionStore } from "@crewhaus/session-store";
 import { createInMemoryIdempotencyStore, idempotencyKey, withIdempotency } from "@crewhaus/idempotency-keys";
 ${toolImportBlock}${hooksImport}${permImport}${toolBootBlock}
@@ -395,7 +412,7 @@ async function main(): Promise<void> {
   // context. limits/budget/max_tokens (Batch A) apply to each turn.
   const runOptions = {
     model: SPEC_MODEL,
-    instructions: SPEC_INSTRUCTIONS,${renderModelWiringFields(ir.agent, "    ")}${taxonomyField(ir, "    ")}
+    instructions: SPEC_INSTRUCTIONS,${renderModelWiringFields(ir.agent, "    ")}${hybridFields}${taxonomyField(ir, "    ")}
     runContext,
     sessionName: SPEC_NAME,
     sessionTarget: "browser" as const,

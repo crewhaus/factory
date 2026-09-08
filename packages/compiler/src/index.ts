@@ -88,6 +88,12 @@ import type {
 import { VALIDATING_PASSES, applyPasses as applyIrPassesFn } from "@crewhaus/ir-passes";
 import type { ModelProfile, RouteRule } from "@crewhaus/model-plan";
 import {
+  HYBRID_FAMILIES_BY_SHAPE,
+  type HybridWiringFamily,
+  type HybridWiringShape,
+  hybridWiringFamiliesForShape,
+} from "@crewhaus/model-service";
+import {
   SPEC_PROFILE_NAME_RE,
   type Spec,
   type SpecChannel,
@@ -1185,16 +1191,71 @@ function asLooseBlock(value: unknown): LooseBlock | undefined {
  */
 const LANDING_SINGLE_SLOT =
   "a later 0.6.0 row (a single-model serving slot has no per-candidate plan carrier in the IR; the same profile honours it today as a model_pool candidate)";
-const LANDING_PREROUTE = "PR 9b (the preRoute decision phase)";
-/** 0.6.0 PR 9d — the shapes whose hosts construct the guide / shadow /
- *  committee side calls at boot (`@crewhaus/model-service`'s `wireSideCalls`:
- *  rendered by the workflow and graph emitters, called by the crew
- *  orchestrator). Every other compiled shape reaches them through the
- *  `crewhaus run` / `serve` interpreter only, until the emitters' boot-time
- *  `wireModels` row. */
-const SIDE_CALL_WIRED_TARGETS: ReadonlySet<Spec["target"]> = new Set(["workflow", "graph", "crew"]);
-const LANDING_MODEL_DIRECTED =
-  "a later 0.6.0 row (the emitters' boot-time wireModels call — emitted bundles do not import @crewhaus/model-service, which depends on runtime-core)";
+/**
+ * 0.6.0 PR 9e/9f — the closure families a compiled bundle constructs at boot
+ * through `@crewhaus/model-service`'s `wireHybrid`: `strategy.model_directed`
+ * (Consult + Escalate), `policy: classifier`, and
+ * `strategy.{guide,shadow,committee}`. The cli, channel, managed, pipeline,
+ * research, batch and browser emitters render the call beside the literal
+ * routing fields; the workflow and graph emitters render it per pooled step /
+ * node; the crew orchestrator calls it per role activation.
+ *
+ * The per-shape rows are NOT restated here. Plan §11.3 lives in
+ * `@crewhaus/model-service` as {@link HYBRID_FAMILIES_BY_SHAPE} — the one
+ * table the emitters gate their codegen on, so this warning block and the
+ * bundles it describes cannot disagree. PR 9e's KNOWN SHORTFALL (the four
+ * pool-bearing shapes whose emitters rendered nothing while §11.3 marked them
+ * **E**) is closed by 9f: every family a shape's row carries is emit-wired,
+ * and the only remaining gap is the family §11.3 declines on a row —
+ * `pipeline` × `modelDirected`, reported as `model-plan-ignored-on-shape`
+ * rather than as a pending row, because no later PR will change it. See
+ * {@link HYBRID_SHAPE_REASON}: that cell is a plan decision, not a limit of
+ * the shape.
+ */
+export const HYBRID_WIRED_TARGETS: ReadonlySet<Spec["target"]> = new Set(
+  (Object.keys(HYBRID_FAMILIES_BY_SHAPE) as Spec["target"][]).filter(
+    (t) => hybridWiringFamiliesForShape(t).length > 0,
+  ),
+);
+/**
+ * The two unions must stay identical: `@crewhaus/model-service` keys §11.3 by
+ * shape without depending on `@crewhaus/spec`, so a new `target:` literal has
+ * to gain a row there or this pin fails to compile. Never read.
+ */
+type _HybridShapePin = Spec["target"] extends HybridWiringShape
+  ? HybridWiringShape extends Spec["target"]
+    ? true
+    : never
+  : never;
+const _HYBRID_SHAPE_PIN: _HybridShapePin = true;
+void _HYBRID_SHAPE_PIN;
+/**
+ * §11.3 marks `Consult / Escalate` `—` on `pipeline`, and the TABLE is the
+ * only ground for it. The shape could host the pair mechanically:
+ * `wireModelDirected` builds Consult / Escalate from the POOL roster and
+ * returns them as ADDITIVE `hybridTools` — it narrows no shape toolset, and
+ * the emitted pipeline bundle has a tool catalog of its own (`retrieve`, the
+ * skill tool). `toolLess` in `@crewhaus/spec` says only that the pipeline
+ * SPEC has no `tools:` key, which is why a per-model `tools` list is refused
+ * there — a different fact. So this cell is a PLAN decision, open for the
+ * plan owner to revisit; not a pending row either, since no PR-train row
+ * changes it.
+ */
+const HYBRID_SHAPE_REASON: Readonly<Partial<Record<Spec["target"], string>>> = {
+  pipeline:
+    "the pair has not been sanctioned on this shape — it is built from the pool roster and ADDED to the tool list, so this is a plan decision rather than a mechanical limit",
+};
+/**
+ * The shapes an interpreter can run at all: `crewhaus run` accepts `cli` and
+ * `browser` and calls every other shape compile-only, and `crewhaus serve
+ * --mcp` is cli-only. So a key a compiled bundle declines on a compile-only
+ * shape is inert EVERYWHERE, and the warning must not point its author at a
+ * "run it instead" remediation that does not exist — the #394 defect class.
+ */
+const INTERPRETER_RUN_TARGETS: ReadonlySet<Spec["target"]> = new Set<Spec["target"]>([
+  "cli",
+  "browser",
+]);
 const LANDING_JUDGE_PANEL = "the §6.2 judge-panel wiring (createJudgeGrader in every judge site)";
 const LANDING_AUX_PARAMS =
   "the §4.2 per-slot params consumers (the judge / compaction / degrade / security / watchme request builders)";
@@ -2407,41 +2468,47 @@ function lowerModelFailover(
         `${poolPath}.${key}`,
         `${poolPath}.${key} is lowered into the pool blob but the runtime does not honour it yet — it lands with 0.6.0 ${landing}; until then it is inert${extra}`,
       );
-    if (mp.policy === "classifier") {
-      pending("policy", LANDING_PREROUTE, " (the pool routes heuristically until then)");
-    }
-    if (mp.directives !== undefined) pending("directives", LANDING_PREROUTE);
-    if (mp.rules !== undefined) pending("rules", LANDING_PREROUTE);
-    if (mp.classifier !== undefined) pending("classifier", LANDING_PREROUTE);
+    // 0.6.0 PR 9e/9f — the closure-shaped keys. `directives` and `rules` ride
+    // the pool blob and are consumed by runtime-core's `preRoute` on BOTH
+    // paths (PR 9b), so they pend nowhere. `policy: classifier`, `classifier:`
+    // and `strategy.{guide,shadow,committee,model_directed}` are runtime
+    // CLOSURES the blob cannot carry: the interpreter builds them through
+    // `wireModels` and a compiled bundle through `wireHybrid`. Since 9f every
+    // pool-bearing shape renders that call for every family its §11.3 row
+    // carries, so nothing PENDS any more — the one remaining `—` cell
+    // (`pipeline` × the Consult / Escalate pair) is a standing plan decision
+    // and is reported as `model-plan-ignored-on-shape` with the reason, not
+    // as a deferred row.
+    const wiredFamilies = hybridWiringFamiliesForShape(ctx.target);
+    const closureUnwired = (key: string, family: HybridWiringFamily, what: string): void => {
+      if (wiredFamilies.includes(family)) return;
+      const reason = HYBRID_SHAPE_REASON[ctx.target] ?? "this shape has no sanctioned home for it";
+      // The reach clause is conditional ON PURPOSE. Naming an interpreter
+      // that does not accept the shape would send the author after a
+      // remediation that does not exist; today the only cell that fires this
+      // is `pipeline`, which `crewhaus run` refuses outright.
+      const reach = INTERPRETER_RUN_TARGETS.has(ctx.target)
+        ? "crewhaus run still builds it — the interpreter serves whatever shape it is handed and is not what §11.3 constrains"
+        : `crewhaus run / serve do not accept target: ${ctx.target} either, so the key is inert everywhere, not just in the compiled bundle`;
+      warn(
+        ctx,
+        "model-plan-ignored-on-shape",
+        `${poolPath}.${key}`,
+        `${poolPath}.${key} is lowered into the pool blob, but nothing constructs the ${what} on a ${ctx.target} spec: plan §11.3 marks the cell "—" and ${reason}; ${reach}`,
+      );
+    };
+    if (mp.policy === "classifier") closureUnwired("policy", "classifier", "label call");
+    if (mp.classifier !== undefined) closureUnwired("classifier", "classifier", "label call");
     if (mp.strategy !== undefined) {
       // 0.6.0 PR 9c consumes `cascade` (`evaluation.on_fail: escalate` re-runs
       // on `escalate_to`, `clean_prompt` picks the snapshot, `max_escalations`
-      // caps the rungs); PR 9d constructs guide / shadow / committee through
-      // `wireSideCalls` (model-service) and runtime-core consumes them.
-      if (!SIDE_CALL_WIRED_TARGETS.has(ctx.target)) {
-        for (const key of ["guide", "shadow"] as const) {
-          if (mp.strategy[key] === undefined) continue;
-          warn(
-            ctx,
-            "model-plan-pending-runtime",
-            `${poolPath}.strategy.${key}`,
-            `${poolPath}.strategy.${key} is honoured by the crewhaus run / serve interpreter and by compiled workflow / graph / crew bundles (wireSideCalls from @crewhaus/model-service), but a compiled ${ctx.target} bundle does not construct the side call yet — that lands with 0.6.0 ${LANDING_MODEL_DIRECTED}; until then the key is inert in this compiled target`,
-          );
-        }
+      // caps the rungs) straight off the blob, so it pends nowhere.
+      for (const key of ["guide", "shadow", "committee"] as const) {
+        if (mp.strategy[key] === undefined) continue;
+        closureUnwired(`strategy.${key}`, "sideCalls", "side call");
       }
       if (mp.strategy.model_directed === true) {
-        // 0.6.0 PR 8b landed the runtime half: `wireModels` constructs the
-        // Consult / Escalate pair under this key, and the `crewhaus run` /
-        // `crewhaus serve` interpreter reaches it. A COMPILED bundle does not
-        // yet — every emitter still renders the four routing fields through
-        // `renderModelWiringFields`, which never renders the hybrid pair —
-        // so the warning is scoped to compiled targets, not "the runtime".
-        warn(
-          ctx,
-          "model-plan-pending-runtime",
-          `${poolPath}.strategy.model_directed`,
-          `${poolPath}.strategy.model_directed is honoured by the crewhaus run / serve interpreter (Consult and Escalate are registered from @crewhaus/tool-consult), but a compiled bundle does not register the tools yet — that lands with 0.6.0 ${LANDING_MODEL_DIRECTED}; until then the key is inert in compiled targets`,
-        );
+        closureUnwired("strategy.model_directed", "modelDirected", "Consult / Escalate pair");
       }
     }
     // `reward` is consumed since PR 10 (`quality_source` by the deferred fold,

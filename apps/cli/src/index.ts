@@ -4954,6 +4954,16 @@ async function runRunBrowser(
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
       ...(egressAuditSink !== undefined ? { egressAuditSink } : {}),
       ...(egressMatcher !== undefined ? { egressMatcher } : {}),
+      // 0.6.0 PR 9f — the routing quartet and the pool's runtime CLOSURES,
+      // through the same composition root the compiled browser bundle boots
+      // with (`renderModelWiringFields` + `...wireHybrid(...)` in
+      // target-browser-driver). Before this, `crewhaus run <browser spec>`
+      // passed NO routing options at all: the interpreter's other shape (cli)
+      // spread them and browser did not, so a browser spec with a
+      // `model_pool` routed and consulted when compiled and did neither when
+      // run — the exact parity gap this wave exists to close. A `--model`
+      // override drops the chain, tiers and pool exactly as on the cli path.
+      ...modelRoutingRunOptions(ir.agent, modelOverride, { sessionName: ir.name }),
       installSigintHandler: false,
       maxTokens: 4096,
     });

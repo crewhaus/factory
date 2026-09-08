@@ -9,9 +9,10 @@ import {
   renderBundleReadme,
 } from "@crewhaus/ir";
 import {
-  hasSideCallStrategy,
+  HYBRID_WIRING_IMPORT,
+  poolNeedsHybridWiring,
+  renderHybridWiringFields,
   renderModelWiringFields,
-  renderSideCallWiringFields,
   scopedModelWiringFragment,
 } from "@crewhaus/model-service";
 
@@ -253,10 +254,11 @@ function renderStep(step: IrWorkflowStep, idx: number, total: number, shared: St
     scopedModelWiringFragment(step, step.name),
     "    ",
   );
-  // 0.6.0 PR 9d — a pooled step whose strategy declares a guide / shadow /
-  // committee constructs the side-call closures at boot through
-  // `wireSideCalls` (the bundle imports it below); "" otherwise.
-  const sideCallFields = renderSideCallWiringFields(
+  // 0.6.0 PR 9d/9e — a pooled step that declares a closure-shaped feature
+  // (guide / shadow / committee, `strategy.model_directed`, `policy:
+  // classifier`) constructs those closures at boot through `wireHybrid` (the
+  // bundle imports it below); "" otherwise.
+  const hybridFields = renderHybridWiringFields(
     scopedModelWiringFragment(step, step.name),
     "    ",
     shared.specName,
@@ -302,7 +304,7 @@ ${deadlineGuard}${stdinReadLine}  process.stdout.write("\\n[step ${stepNum}/${to
     model: ${escapeJsonString(step.model)},
     instructions: ${escapeJsonString(step.instructions)},
     singleTurn: true,
-    seedMessages: [{ role: "user", content: ${userContent} }],${toolsField}${stepTuningFields}${modelFailoverFields}${sideCallFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}
+    seedMessages: [{ role: "user", content: ${userContent} }],${toolsField}${stepTuningFields}${modelFailoverFields}${hybridFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}
     hooks: ${shared.hooksExpr},
     skills: __skills,
     slashCommands: __slashCommands,${shared.runContextLine}${shared.evalFields}
@@ -342,7 +344,7 @@ function renderGatedStep(
     scopedModelWiringFragment(step, step.name),
     "    ",
   );
-  const sideCallFields = renderSideCallWiringFields(
+  const hybridFields = renderHybridWiringFields(
     scopedModelWiringFragment(step, step.name),
     "    ",
     shared.specName,
@@ -373,7 +375,7 @@ ${deadlineGuard}${stdinReadLine}  process.stdout.write(${escapeJsonString(`\n[st
     model: ${escapeJsonString(step.model)},
     instructions: ${escapeJsonString(step.instructions)} + __nudge,
     singleTurn: true,
-    seedMessages: [{ role: "user", content: __step${stepNum}Input }],${toolsField}${stepTuningFields}${modelFailoverFields}${sideCallFields}${forceField}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}
+    seedMessages: [{ role: "user", content: __step${stepNum}Input }],${toolsField}${stepTuningFields}${modelFailoverFields}${hybridFields}${forceField}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}
     hooks: ${shared.hooksExpr},
     skills: __skills,
     slashCommands: __slashCommands,${shared.runContextLine}${shared.evalFields}
@@ -1142,10 +1144,12 @@ import type { TraceEventBus } from "@crewhaus/trace-event-bus";
   // PR train), handed to every step through `budgetMeter`. §6.2 — with judge
   // steps present the boot also derives the `judge_share` sub-cap from the
   // same meter so each gate can stamp `reason: "judge_share_exhausted"`.
-  // 0.6.0 PR 9d — the side-call composition root, imported only when a step's
-  // pool declares a guide / shadow / committee (pre-9d bundles byte-identical).
-  const sideCallImport = ir.steps.some((s) => hasSideCallStrategy(s.modelPool))
-    ? `import { wireSideCalls } from "@crewhaus/model-service";\n`
+  // 0.6.0 PR 9d/9e — the composition root, imported only when a step's pool
+  // declares a closure-shaped feature (guide / shadow / committee, the
+  // model-directed pair, the route classifier); pre-0.6.0 bundles carry no
+  // import at all and stay byte-identical.
+  const hybridImport = ir.steps.some((s) => poolNeedsHybridWiring(s.modelPool))
+    ? `${HYBRID_WIRING_IMPORT}\n`
     : "";
   const budgetMeterImport = hasBudget
     ? hasJudges
@@ -1291,7 +1295,7 @@ ${runBody}}`;
 // Source spec: ${escapeJsonString(ir.name)} (target: workflow, ir version: ${ir.version}, ${ir.steps.length} step(s))
 ${mcp.note}${continuityWarning}import { runChatLoop } from "@crewhaus/runtime-core";
 import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
-${judgeImports}${evalEntryImports}${budgetMeterImport}${sideCallImport}${permImport}${durableImport}${extensionImports}${importBlock}${mcpImportBlock}${APPROVAL_STORE_BOOT}
+${judgeImports}${evalEntryImports}${budgetMeterImport}${hybridImport}${permImport}${durableImport}${extensionImports}${importBlock}${mcpImportBlock}${APPROVAL_STORE_BOOT}
 async function readStdinToEnd(): Promise<string> {
   // No piped input — don't block waiting on an interactive TTY.
   if (process.stdin.isTTY) return "";

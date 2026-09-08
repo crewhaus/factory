@@ -32,6 +32,8 @@ options. Every later routing feature lands here, not in codegen.
 | **8a** | `wireModels`, the fragment, and `renderModelWiringFields` — wrapping today's emitted routing fragments **byte-identically**. `runChatLoop` still resolves candidate adapters, opens the scoreboard and builds the `PolicyRouter` from these four options exactly as before. |
 | **8b (this cut)** | the `Consult` / `Escalate` tools (`@crewhaus/tool-consult`) constructed under `strategy.model_directed` and returned as the `hybridTools` / `escalation` options; the Consult runner is a nested single-turn `runChatLoop` on a child run context whose model events are re-published on the parent bus (see below) |
 | 9a–9d | per-candidate plans, the `preRoute` inputs, cascade wiring, the guide / shadow / committee side-call closures with their child buses |
+| **9e** | `wireHybrid` — every runtime CLOSURE a pool declares, in one call — and its codegen twin `renderHybridWiringFields`, so a COMPILED bundle constructs them too instead of carrying the blob without the behaviour |
+| **9f** | `HYBRID_FAMILIES_BY_SHAPE` — plan §11.3, the per-shape carry/emit/ignore matrix, in code — plus the `hybridFamilies` narrowing every emitter passes for its own shape, so the last four pool-bearing emitters (pipeline, research, batch, browser) wire the closures and a shape the table marks `—` for a family (today: `pipeline` × Consult / Escalate) constructs nothing for it on either path |
 | 10 | candidate adapter resolution with per-profile chains and breakers, the scoreboard and priors, the router built with rules / classifier / eligibility, judge metering on the run bus |
 
 ## `wireModels(fragment, deps)`
@@ -175,11 +177,40 @@ log. The Consult runner rides the same runner.
   before the tie-breaker — past the cap the calls not yet made are excluded
   (`skipped`, cause `budget`), never opened.
 
-The codegen twin `renderSideCallWiringFields(fragment, indent, sessionName)`
-renders `...wireSideCalls(<pool blob>, { sessionName }),` onto a pooled
-workflow step or graph node whose strategy declares one of the three (the
-bundle imports this package); `""` otherwise. Crew roles reach the same
-closures through the orchestrator's `composeSideCalls`.
+The side calls reach a bundle through `wireHybrid` (below), not through a
+renderer of their own. Crew roles reach them through the orchestrator's
+`composeSideCalls`.
+
+## `wireHybrid(pool, deps)` — the closures, and how they reach a bundle (PR 9e)
+
+Everything above — `Consult` / `Escalate`, the `policy: classifier` label
+call, the guide / shadow / committee — is a **function**, so none of it can
+ride the `JSON.stringify(modelPool)` blob every emitter writes. Until 9e that
+meant a compiled bundle had the pool and none of the behaviour: no Consult, a
+classifier pool routing heuristically with `reason: "classifier failed: no
+classifier wired"`, and no guide outside the workflow / graph / crew hosts,
+while `crewhaus run` had all three.
+
+`wireHybrid(pool, deps)` is exactly what `wireModels` appends beyond the four
+literal routing fields, factored out so a bundle can call it directly:
+
+```ts
+poolNeedsHybridWiring(pool)   // strategy.model_directed | policy: classifier
+                              // + classifier: | strategy.{guide,shadow,committee}
+wireHybrid(pool, deps)        // → { hybridTools?, escalation?, routeClassifier?, sideCalls? }
+renderHybridWiringFields(fragment, indent, sessionName)
+                              // → "\n<indent>...wireHybrid({…}, { sessionName: \"…\" }),"
+HYBRID_WIRING_IMPORT          // the one import line the six emitters render
+```
+
+The cli, channel-bot and managed emitters render the field beside the literal
+routing fields; the workflow and graph emitters render it per pooled step /
+node; the crew orchestrator calls `wireHybrid` per role activation. The
+emitted `dist/package.json` lists `@crewhaus/model-service` because the
+manifest is collected from the bundle's own import strings. Both the field and
+the import gate on the same `poolNeedsHybridWiring` predicate, so a pool that
+declares none of the closure-shaped keys renders nothing and imports nothing —
+pre-0.6.0 bundles stay byte-identical.
 
 ## `renderModelWiringFields(fragment, indent)` — the codegen twin
 

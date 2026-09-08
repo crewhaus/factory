@@ -40,15 +40,39 @@
  * strategy key, or any `--model` override, wires no hybrid tool — the
  * pre-0.6.0 fragment stays byte-identical.
  *
- * REACH, stated honestly: in 8b the pair reaches the `crewhaus run` / `serve`
- * interpreter (`apps/cli/src/loop-contract.ts`'s `modelRoutingRunOptions` IS
- * this call). A compiled bundle does NOT register it yet — every emitter
- * still renders {@link renderModelWiringFields}, which never renders
- * {@link HYBRID_WIRING_KEYS}, and no bundle imports this package at boot.
- * Since 8b this package depends on `@crewhaus/runtime-core` (the nested
- * Consult loop), so a bundle cannot import it at boot without a cycle; the
- * compiler's `model-plan-pending-runtime` warning on `strategy.model_directed`
- * says exactly that, and target-cli's test pins the deferred state.
+ * PR 9e closes the REACH gap. Everything above is a runtime CLOSURE, so it
+ * cannot ride the `JSON.stringify(modelPool)` blob every emitter writes —
+ * which is why, until 9e, a compiled bundle had the pool but none of the
+ * hybrid behaviour: no Consult / Escalate, a `policy: classifier` pool
+ * routing heuristically with `reason: "classifier failed: no classifier
+ * wired"`, and no guide / shadow / committee outside the workflow / graph /
+ * crew hosts. The fix is {@link wireHybrid} and its codegen twin
+ * {@link renderHybridWiringFields}: an emitter whose lowered pool declares
+ * `strategy.model_directed`, `policy: classifier` or
+ * `strategy.{guide,shadow,committee}` renders
+ * `...wireHybrid(<pool blob>, { sessionName })` beside the literal routing
+ * fields and imports THIS package at boot, so the bundle constructs exactly
+ * the closures the interpreter constructs. A bundle importing this package
+ * is not a cycle: the emitted bundle is a CONSUMER of the workspace, not a
+ * member of it (the workflow and graph emitters have imported it for the
+ * side calls since 9d, and the emitted `dist/package.json` lists it because
+ * the manifest is collected from the bundle's own import strings).
+ *
+ * Absent = byte-identical: a pool that declares none of the three renders
+ * nothing and imports nothing, so every pre-0.6.0 bundle is unchanged.
+ *
+ * PR 9f finishes the reach on the remaining four pool-bearing shapes
+ * (pipeline, research, batch, browser) and moves the plan's per-shape
+ * acceptance table INTO this package as {@link HYBRID_FAMILIES_BY_SHAPE} —
+ * §11.3 in code, so the published matrix and the emitters cannot drift. Each
+ * of the three closure FAMILIES ({@link HybridWiringFamily}) is wired per
+ * shape: every pool-bearing shape gets `classifier` and `sideCalls`, and
+ * every one but `pipeline` also gets `modelDirected`, because §11.3 marks
+ * `Consult / Escalate` `—` there. That cell is the PLAN's decision, not a
+ * property of the shape — see {@link HYBRID_FAMILIES_BY_SHAPE}.
+ * {@link wireHybrid} and {@link renderHybridWiringFields} both
+ * take that family set, so the interpreter, the bundle and the compiler's
+ * warning all read one table.
  *
  * PR 9a (the per-candidate plan table) therefore builds the plans INSIDE
  * runtime-core, at boot, from the widened `modelPool` option this root hands
@@ -63,7 +87,8 @@
  * with a `classifier:` block the root builds the {@link RouteClassifierFn}
  * (`routeClassifier`) runtime-core's `preRoute` phase calls each turn — see
  * {@link buildRouteClassifier}. Like the hybrid tools it reaches the
- * interpreter through `loop-contract.ts` and not (yet) a compiled bundle.
+ * interpreter through `loop-contract.ts` and — since PR 9e — a compiled
+ * bundle through {@link renderHybridWiringFields}.
  *
  * `wireModels` is per RUN, not per process: the escalation latch it returns
  * is bounded "per run", so a host that serves many runs from one process
@@ -75,6 +100,7 @@ import { escapeJsonString } from "@crewhaus/infra-utils";
 import type {
   IrCircuitBreaker,
   IrModelPool,
+  IrModelPoolClassifier,
   IrModelTiers,
   IrSubAgentDefinition,
 } from "@crewhaus/ir";
@@ -94,7 +120,12 @@ import {
   rosterFromPool,
   strongestOf,
 } from "@crewhaus/tool-consult";
-import { hasSideCallStrategy, runNestedSingleTurn, wireSideCalls } from "./side-calls";
+import {
+  type SideCallPool,
+  hasSideCallStrategy,
+  runNestedSingleTurn,
+  wireSideCalls,
+} from "./side-calls";
 
 export {
   DEFAULT_GUIDE_MAX_TOKENS,
@@ -110,7 +141,6 @@ export {
   buildShadowSideCall,
   hasSideCallStrategy,
   latestUserText,
-  renderSideCallWiringFields,
   runNestedSingleTurn,
   textOnlyTranscript,
   wireSideCalls,
@@ -255,6 +285,16 @@ export type WireModelsDeps = {
    * classifier model resolves through the model-router on first call.
    */
   readonly _classifierAdapter?: ProviderAdapter;
+  /**
+   * 0.6.0 §11.3 (PR 9f) — the closure families the HOST may construct. Omit
+   * (every interpreter caller) and {@link wireHybrid} builds every family the
+   * pool declares. An emitter passes its shape's row from
+   * {@link HYBRID_FAMILIES_BY_SHAPE} so a shape the matrix marks `—` for a
+   * family constructs nothing for it — today that is `pipeline` and
+   * `modelDirected`. The list is rendered verbatim into the bundle, so the
+   * bundle and the interpreter apply the SAME restriction.
+   */
+  readonly hybridFamilies?: readonly HybridWiringFamily[];
 };
 
 /** The routing keys, in the order every emitter and the interpreter have
@@ -269,7 +309,8 @@ export const MODEL_WIRING_KEYS = [
 
 /** The hybrid-tool keys `wireModels` appends after {@link MODEL_WIRING_KEYS}
  *  when the pool declares `strategy.model_directed: true`. Never rendered by
- *  {@link renderModelWiringFields}: they are runtime constructions. */
+ *  {@link renderModelWiringFields}: they are runtime constructions, carried
+ *  into a bundle by {@link renderHybridWiringFields}. */
 export const HYBRID_WIRING_KEYS = ["hybridTools", "escalation"] as const;
 
 /** 0.6.0 §7.2.3 — the key `wireModels` appends after the hybrid keys when
@@ -278,10 +319,20 @@ export const HYBRID_WIRING_KEYS = ["hybridTools", "escalation"] as const;
 export const CLASSIFIER_WIRING_KEYS = ["routeClassifier"] as const;
 
 /** The side-call key `wireModels` appends LAST when the pool's strategy
- *  declares a guide, a shadow or a committee (PR 9d). Rendered into a
- *  single-turn bundle by `renderSideCallWiringFields`, never by
+ *  declares a guide, a shadow or a committee (PR 9d). A runtime
+ *  construction: rendered into a bundle by
+ *  {@link renderHybridWiringFields}, never by
  *  {@link renderModelWiringFields}. */
 export const SIDE_CALL_WIRING_KEYS = ["sideCalls"] as const;
+
+/** Every key {@link wireHybrid} can add, in the order it adds them — the
+ *  runtime constructions {@link renderModelWiringFields} never renders and
+ *  {@link renderHybridWiringFields} carries into a bundle instead. */
+export const HYBRID_CONSTRUCTION_KEYS = [
+  ...HYBRID_WIRING_KEYS,
+  ...CLASSIFIER_WIRING_KEYS,
+  ...SIDE_CALL_WIRING_KEYS,
+] as const;
 
 /**
  * Pick the routing slice out of a lowered block EXACTLY as the retired
@@ -360,15 +411,235 @@ export function wireModels(
       ? { modelTiers: fragment.modelTiers }
       : {}),
     ...(pool !== undefined ? { modelPool: pool } : {}),
-    ...(pool !== undefined && pool.strategy?.modelDirected === true
-      ? wireModelDirected(pool, deps)
-      : {}),
-    ...(pool !== undefined && pool.policy === "classifier" && pool.classifier !== undefined
-      ? { routeClassifier: buildRouteClassifier(pool.classifier, deps) }
-      : {}),
-    ...(pool !== undefined && hasSideCallStrategy(pool) ? wireSideCalls(pool, deps) : {}),
+    ...(pool !== undefined ? wireHybrid(pool, deps) : {}),
   };
 }
+
+// ---------------------------------------------------------------------------
+// wireHybrid — the runtime CLOSURES, and the codegen twin that puts them in a
+// compiled bundle (PR 9e)
+// ---------------------------------------------------------------------------
+
+/**
+ * The pool slice {@link wireHybrid} reads — structural over `IrModelPool`, so
+ * the crew orchestrator's widened `RoleModelPool` and the IR pool both fit
+ * without a cast (the {@link SideCallPool} discipline, extended with the two
+ * keys the classifier and the model-directed pair need).
+ */
+export type HybridWiringPool = SideCallPool & {
+  readonly policy?: string;
+  readonly classifier?: IrModelPoolClassifier;
+};
+
+/** The slice of {@link ModelWiringRunOptions} {@link wireHybrid} constructs —
+ *  every key a runtime CLOSURE, none of them expressible in the pool blob. */
+export type HybridWiringRunOptions = Pick<
+  ModelWiringRunOptions,
+  "hybridTools" | "escalation" | "routeClassifier" | "sideCalls"
+>;
+
+/**
+ * 0.6.0 §11.3 (PR 9f) — the three CLOSURE families {@link wireHybrid} can
+ * construct, named so a host can decline one. `modelDirected` is the
+ * `Consult` + `Escalate` pair (§7.2.4, §7.5), `classifier` the `policy:
+ * classifier` label call (§7.2.3), `sideCalls` the guide / shadow / committee
+ * lanes (§7.4, §7.6, §7.8).
+ */
+export type HybridWiringFamily = "modelDirected" | "classifier" | "sideCalls";
+
+/** Every family, in the order {@link wireHybrid} constructs them. The default
+ *  when a caller passes no `hybridFamilies` — the interpreter's posture. */
+export const ALL_HYBRID_WIRING_FAMILIES: readonly HybridWiringFamily[] = [
+  "modelDirected",
+  "classifier",
+  "sideCalls",
+];
+
+/** The fourteen compile targets, as the spec's `target:` literal spells them.
+ *  Kept structurally identical to `@crewhaus/spec`'s `Spec["target"]` (the
+ *  compiler pins the two unions equal) without taking a dependency on it. */
+export type HybridWiringShape =
+  | "cli"
+  | "workflow"
+  | "channel"
+  | "graph"
+  | "managed"
+  | "pipeline"
+  | "crew"
+  | "research"
+  | "batch"
+  | "voice"
+  | "browser"
+  | "eval"
+  | "onchain"
+  | "onchain-game";
+
+/**
+ * **Plan §11.3, in code.** Shape → the closure families that shape's COMPILED
+ * bundle constructs, which since PR 9f is also exactly what its emitter
+ * renders and what the compiler declines to warn about. The table is
+ * published verbatim in crewhaus/docs `COMPILER-ARCHITECTURE.md` and the
+ * book's appendix D and printed per-shape by `models explain`, so it lives
+ * HERE — one table three consumers read — rather than being restated at each
+ * seam and drifting from the emitters (which is precisely what PR 9e's known
+ * shortfall was).
+ *
+ * Reading the matrix rows:
+ *
+ * - The ten pool-bearing shapes take `classifier` and `sideCalls`. `committee`
+ *   is a `sideCalls` member but the strict schema already refuses it anywhere
+ *   §11.3 marks it `—` (`SpecRoutedHost.committee`), so no shape needs to
+ *   decline the family for it.
+ * - `pipeline` declines `modelDirected`: §11.3 marks `Consult / Escalate` `—`
+ *   on that row, and the table is the only ground for it. Mechanically the
+ *   shape could host the pair: {@link wireModelDirected} builds Consult /
+ *   Escalate from the POOL roster and returns them as ADDITIVE `hybridTools`
+ *   — it narrows no shape toolset (the consulted model gets none at all), and
+ *   the emitted pipeline bundle registers a tool catalog of its own.
+ *   `toolLess` in `@crewhaus/spec` says only that the pipeline SPEC has no
+ *   `tools:` key, which is why a per-model `tools` list is refused there — a
+ *   different fact. So this row is a plan decision open to revision, not a
+ *   shape fact, and the compiler's warning says so.
+ * - The four shapes with no `model_pool` block at all (`voice`, `eval`,
+ *   `onchain`, `onchain-game` — `—` in the pool column) take no family; the
+ *   strict schema refuses the block before any of this is reached.
+ */
+export const HYBRID_FAMILIES_BY_SHAPE: Readonly<
+  Record<HybridWiringShape, readonly HybridWiringFamily[]>
+> = {
+  cli: ALL_HYBRID_WIRING_FAMILIES,
+  workflow: ALL_HYBRID_WIRING_FAMILIES,
+  channel: ALL_HYBRID_WIRING_FAMILIES,
+  graph: ALL_HYBRID_WIRING_FAMILIES,
+  managed: ALL_HYBRID_WIRING_FAMILIES,
+  pipeline: ["classifier", "sideCalls"],
+  crew: ALL_HYBRID_WIRING_FAMILIES,
+  research: ALL_HYBRID_WIRING_FAMILIES,
+  batch: ALL_HYBRID_WIRING_FAMILIES,
+  voice: [],
+  browser: ALL_HYBRID_WIRING_FAMILIES,
+  eval: [],
+  onchain: [],
+  "onchain-game": [],
+};
+
+/** The §11.3 row for a shape — {@link HYBRID_FAMILIES_BY_SHAPE} with a total
+ *  signature, so a caller holding a widened `string` gets `[]` (wires
+ *  nothing) rather than `undefined`. */
+export function hybridWiringFamiliesForShape(shape: string): readonly HybridWiringFamily[] {
+  return (
+    (
+      HYBRID_FAMILIES_BY_SHAPE as Readonly<
+        Record<string, readonly HybridWiringFamily[] | undefined>
+      >
+    )[shape] ?? []
+  );
+}
+
+/** Does a pool declare the given closure family? The per-family half of
+ *  {@link poolNeedsHybridWiring}, so the gate, the builder and the renderer
+ *  all ask one question. */
+export function poolDeclaresHybridFamily(
+  pool: HybridWiringPool,
+  family: HybridWiringFamily,
+): boolean {
+  switch (family) {
+    case "modelDirected":
+      return pool.strategy?.modelDirected === true;
+    case "classifier":
+      return pool.policy === "classifier" && pool.classifier !== undefined;
+    case "sideCalls":
+      return hasSideCallStrategy(pool);
+  }
+}
+
+/**
+ * True when a pool declares at least one closure-shaped feature the HOST can
+ * construct: `strategy.model_directed` (Consult + Escalate), `policy:
+ * classifier` with a `classifier:` block, or `strategy.{guide,shadow,
+ * committee}`. The gate every emitter's codegen and import both key on, so
+ * "wires nothing" and "renders nothing" can never disagree.
+ *
+ * `families` narrows the question to the shape's §11.3 row (PR 9f): a
+ * `pipeline` pool that declares ONLY `strategy.model_directed` needs no
+ * wiring, because that shape constructs no model-directed pair — so it also
+ * renders no call and imports nothing, and the compiler warns on the key
+ * instead. Omitted, every family counts (the interpreter's posture).
+ */
+export function poolNeedsHybridWiring(
+  pool: HybridWiringPool | undefined,
+  families: readonly HybridWiringFamily[] = ALL_HYBRID_WIRING_FAMILIES,
+): boolean {
+  if (pool === undefined) return false;
+  return families.some((f) => poolDeclaresHybridFamily(pool, f));
+}
+
+/**
+ * 0.6.0 §7.2.3 / §7.2.4 / §7.4 / §7.6 / §7.8 (PR 9e) — build every runtime
+ * closure a pool declares, in ONE call: the model-directed pair, the route
+ * classifier, and the guide / shadow / committee side calls. Spread-return-
+ * `{}` — a pool declaring none of them yields no keys at all.
+ *
+ * This is the whole of what `wireModels` appends beyond the four literal
+ * routing fields, factored out precisely so a compiled bundle can call it
+ * directly: {@link renderHybridWiringFields} renders
+ * `...wireHybrid(<pool blob>, { sessionName })` into the generated
+ * `runChatLoop({...})`, and the interpreter reaches the same code through
+ * `wireModels`. One code path, not a mirror — pinned by test.
+ */
+export function wireHybrid(pool: HybridWiringPool, deps: WireModelsDeps): HybridWiringRunOptions {
+  const families = deps.hybridFamilies ?? ALL_HYBRID_WIRING_FAMILIES;
+  const wires = (family: HybridWiringFamily): boolean =>
+    families.includes(family) && poolDeclaresHybridFamily(pool, family);
+  return {
+    ...(wires("modelDirected") ? wireModelDirected(pool, deps) : {}),
+    ...(wires("classifier") && pool.classifier !== undefined
+      ? { routeClassifier: buildRouteClassifier(pool.classifier, deps) }
+      : {}),
+    ...(wires("sideCalls") ? wireSideCalls(pool, deps) : {}),
+  };
+}
+
+/**
+ * The codegen twin of {@link wireHybrid}: the spread field an emitter renders
+ * onto a pooled block's `runChatLoop({...})` (or a channel `createAgent`
+ * body) when the pool declares a closure-shaped feature —
+ * `\n<indent>...wireHybrid(<pool blob>, { sessionName: "…" }),` — so the
+ * bundle constructs the closures at boot through THIS package. `""` for every
+ * other pool, which is what keeps pre-0.6.0 bundles byte-identical: no field,
+ * and (because the emitter gates its import on the same
+ * {@link poolNeedsHybridWiring} predicate) no `@crewhaus/model-service`
+ * import either.
+ *
+ * The pool blob is the same `JSON.stringify` {@link renderModelWiringFields}
+ * already writes for `modelPool`, so the closures and the literal option are
+ * built from byte-identical config. `sessionName` is the harness name the
+ * nested side calls label their spend with.
+ *
+ * `families` (PR 9f) is the emitter's §11.3 row —
+ * {@link hybridWiringFamiliesForShape} for its own target. A shape that
+ * declines a family renders `hybridFamilies: [...]` into the call, so the
+ * BUNDLE applies the same restriction the interpreter would; a shape that
+ * hosts every family renders exactly the 9e text, which is what keeps the six
+ * emitters wired then byte-identical now.
+ */
+export function renderHybridWiringFields(
+  fragment: { readonly modelPool?: HybridWiringPool },
+  indent: string,
+  sessionName: string,
+  families: readonly HybridWiringFamily[] = ALL_HYBRID_WIRING_FAMILIES,
+): string {
+  const pool = fragment.modelPool;
+  if (!poolNeedsHybridWiring(pool, families)) return "";
+  const restricted = ALL_HYBRID_WIRING_FAMILIES.every((f) => families.includes(f))
+    ? ""
+    : `, hybridFamilies: ${JSON.stringify(ALL_HYBRID_WIRING_FAMILIES.filter((f) => families.includes(f)))}`;
+  return `\n${indent}...wireHybrid(${JSON.stringify(pool)}, { sessionName: ${escapeJsonString(sessionName)}${restricted} }),`;
+}
+
+/** The import line a bundle carries when {@link renderHybridWiringFields}
+ *  rendered a field. One constant so the ten emitters cannot drift. */
+export const HYBRID_WIRING_IMPORT = 'import { wireHybrid } from "@crewhaus/model-service";';
 
 // ---------------------------------------------------------------------------
 // Classifier-directed: the `policy: classifier` label call (plan §7.2.3)
@@ -425,7 +696,7 @@ export function buildRouteClassifier(
  * through with no enabled candidate wires nothing rather than throwing.
  */
 export function wireModelDirected(
-  pool: IrModelPool,
+  pool: HybridWiringPool,
   deps: WireModelsDeps,
 ): Pick<ModelWiringRunOptions, "hybridTools" | "escalation"> {
   const roster = rosterFromPool(pool);
