@@ -1,8 +1,8 @@
 {
   "name": "@crewhaus/compiler",
-  "version": "0.5.8",
+  "version": "0.6.0",
   "type": "module",
-  "description": "Compiler core: parse \u2192 validate \u2192 lower \u2192 emit",
+  "description": "Compiler core: parse → validate → lower → emit",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {

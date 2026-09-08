@@ -5,6 +5,266 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-09-08
+
+**Per-model settings and hybrid setups.** A spec can now name every model it
+uses, give each one its own tools, parameters and permissions, and put several
+of them in one loop — a cheap model drafting, a strong one checking, a
+specialist consulted mid-turn. The evals, budgets, traces and console views
+that tell you whether that is actually working ship with it.
+
+### Added
+
+- **`models:` — one place to describe every model a harness uses, and
+  `$profile` wherever a model is named** (#425, #428, #429). A top-level
+  `models:` registry maps a profile name to that model's settings: request
+  parameters, a subset-only `tools` list, restricted `{deny, ask}`
+  `permissions`, `tool_config`, `rate_limits`, `cost` caps, `requires`,
+  `capabilities`, `fallbacks` and a `circuit_breaker`. A `$profile`
+  reference is accepted at every model slot on every target shape,
+  and resolution is a lower-time macro: `agent.model`, workflow steps, graph
+  nodes, crew roles, sub-agents, compaction, the in-loop judge and judge
+  gates, the budget degrade rung, the security and watchme judges, browser
+  grounding, pool candidates, tiers and fallbacks all resolve before the IR
+  leaves the compiler, so nothing downstream ever sees a `$`. `cheapest`
+  gains a roster-first sibling, `strongest`. Profiles are checked against the
+  offline capability and sunset tables, and anything a shape or slot cannot
+  honour is a field-precise `model-plan-*` warning rather than a silent drop.
+  A bundle's `README.md` now lists every model that run can route to. The
+  seam is the new `@crewhaus/model-plan` package plus `IrModelProfile` in
+  `@crewhaus/ir`.
+
+- **A pool candidate serves with its own tools, parameters, permissions and
+  tool settings** (#434). runtime-core builds one plan per `model_pool`
+  candidate at boot and selects it on every model call: the profile's
+  `thinking` / `max_tokens` / `temperature` / `limits` land on the request,
+  its `tools` subset is both advertised and **enforced at dispatch** (an
+  unadvertised call comes back as an error naming the profile), its
+  `permissions.deny` / `ask` narrow the run's rules, its `rate_limits` get
+  their own buckets, its `tool_config` reaches the tool per call, and its
+  `instructions` overlay lands in the volatile prompt region without moving
+  the cache marker. `agent.temperature` now reaches the request on every
+  shape, and every provider adapter can report the parameters that actually
+  reach the wire (`effectiveParams`), which makes the silent Claude-5
+  `temperature` drop visible for the first time (#425).
+
+- **Hybrid strategies: cascade, guide, shadow, committee, and a
+  model-directed pair** (#432, #435, #436, #437, #441, #444). Under
+  `model_pool.strategy` a pool can draft on a cheap candidate and escalate a
+  failing draft to a strong one (`evaluation.on_fail: escalate`, from a clean
+  pre-draft snapshot, bounded by `max_escalations`); brief the turn with a
+  `guide` model; audition a candidate in a `shadow` lane that never touches
+  the served text; or run a `committee` of members picked by an
+  order-controlled judge. `model_directed: true` registers two tools from the
+  new `@crewhaus/tool-consult`: `Consult`, which asks a roster sibling one
+  question through a metered nested run whose reply re-enters the context at
+  the new `consult` trust origin, and `Escalate`, which hands the rest of the
+  turn to a stronger candidate. Every side call is a nested single-turn loop
+  on its own bus, metered on the parent and persisting no child session. All
+  of it is composed in one place — `@crewhaus/model-service`'s `wireModels` /
+  `wireHybrid` — which both `crewhaus run` and every emitted bundle call, so
+  the interpreter and the compiled bundle cannot drift.
+
+- **A decision phase before every routed call: directives, rules,
+  eligibility, classifier** (#435). A pooled model call now runs a
+  deterministic `preRoute` phase — forced lanes (budget degrade, escalation),
+  then the user's `/model <profile|tag>` pin (sticky per session, cleared by
+  `/model auto`, a non-roster target refused with the roster listed), then
+  first-match `model_pool.rules`, then the opt-in `policy: classifier` label
+  call, then the policy over the eligible set (features, `requires`, cost
+  caps, context window). Each step is recorded, so `route explain` can replay
+  the decision from the session log.
+
+- **Sub-agents route and tune themselves** (#438). A `sub_agents.<name>`
+  block carries its own `model_pool` / `model_tiers` / `model_fallbacks` /
+  `circuit_breaker` / `thinking` / `max_tokens` / `temperature`;
+  `inherit_routing: true` runs a child on the arm the parent's router just
+  served; `budget_share` gives it a sub-cap; and the `Task` tool's new
+  `profile` argument picks from the child's `allowed_profiles`, so a
+  model-filled argument can never name a model outside the spec.
+
+- **Per-model evals: routed runs, per-arm baselines, and a leaderboard that
+  refuses to guess** (#442, #443, #448). `crewhaus eval --routing as-declared`
+  measures what production actually serves; `--routing candidate:$fast` pins
+  one roster member and measures it with that candidate's own settings. Every
+  routed run pins its seed and reads a frozen arm snapshot, so a measurement
+  is reproducible and can never move the harness's learned policy. Runs
+  record which models served and key their own baseline lineage
+  (`spec::dataset::<arm>`), so a cheap candidate cannot pin over the primary's
+  baseline. `crewhaus eval leaderboard` ranks arms with Wilson intervals and a
+  paired sign-flip test and declines to name a winner when the intervals
+  overlap — an honest "underpowered" beats a false leader — and
+  `--export-priors` hands the measurement back as routing priors.
+  `graders.yaml` gains a `per_model:` map so the arm that served a sample can
+  be graded by a different judge, cut and weight, with calibration keyed by
+  (arm, judge). Judge panels (`judges`, `repeats`, `temperature`, `target`)
+  now vote by strict majority over the median at every judge site.
+
+- **Learned routing gets identity, a floor, and a kill switch** (#440, #445).
+  Arms are keyed by profile name under `<scope>/<band>` route keys, backing
+  off to the unscoped band while a scoped arm is under-sampled; each candidate
+  gets its own failover chain and breaker. Arm lines carry judged quality,
+  stage attribution and a profile-lineage fingerprint, so
+  `reward.reset_on_profile_change` can drop history a profile edit
+  invalidated. `reward.priors: eval` starts a pool warm from a measurement,
+  `reward.floor` stops a learned policy exploiting an arm whose judged quality
+  sits below a named floor arm, and `crewhaus route freeze` pins the policy
+  and stops learning. `crewhaus route promote --gate` folds the observe-only
+  shadow and watch-me lanes into the live arms — but only behind a passing
+  routed eval, idempotently, and with a hash-chained `routing_promotion`
+  record that `crewhaus audit verify` covers.
+
+- **Budget learns a scope and an auxiliary sub-cap** (#423, #426).
+  `budget.scope: run | session` lets a channel or managed cap bound a whole
+  conversation instead of one run, seeded from the session log on resume.
+  `budget.judge_share` is the sub-cap inside `budget.usd` for judge,
+  classifier and compaction calls; crossing it is reported on the run and
+  recorded on the grading events rather than silently absorbed.
+
+- **Every routing decision is traceable, and the console can see it** (#424,
+  #427, #446). Model events carry `role` / `stage` / `profile` and the
+  parameters actually sent; two new event kinds, `model_stage` and
+  `model_directive`, record escalations and pins; and five decisions that were
+  in-memory only — tier routes, failovers, stages, directives, judge verdicts
+  — are now durable session-log lines, so `route explain`, `sessions tail`,
+  `--resume` and the Hangar read them offline. OpenTelemetry spans carry the
+  served model and the call's priced cost alongside `crewhaus.model.*`
+  attributes; new metrics count routes and escalations and label cost by role;
+  and `escalation_rate`, `judge_fail_rate` and `floor_block_rate` are
+  declarable SLO targets with matching alerts. The Hangar gains a read-only
+  **Models** tab rendering the registry, every declared pool at whatever host
+  declares it, spend split by role and profile, the learned scoreboard and one
+  run's route timeline — and the advisor gains routing items of its own.
+
+- **`crewhaus models` and a grown `crewhaus route`** (#447). `models
+  list|explain|audit|propose` walks every model-bearing slot of a spec through
+  one shared enumeration — the same one `doctor --models`, `model right-size`
+  and `model-scan` now use — printing each slot's resolved profile and the
+  per-shape verdict, checking pricing coverage and declared `requires:`
+  against the capability table, and exiting non-zero on a model past its
+  retirement date. `route explain --json` replays a run's whole routing
+  timeline, `route status --by profile|scope` regroups the arms, and `route
+  propose` mines the scoreboard into whitelisted spec patches that
+  `optimize --from-advice` eval-gates. `deploy canary --routing-gate` adds
+  escalation rate, cost per turn and quality-floor blocks to a ramp;
+  `flywheel init --model-plan` scaffolds the nightly job that opens a pull
+  request and never merges; and `init --hybrid` writes a commented
+  cheap-drafts/strong-checker setup. Every one of these verbs is offline and
+  proposal-only — the roster, the rule targets and the reward floor stay
+  behind the human gate.
+
+- **The optimizer learns the model surface, and only the safe half of it**
+  (#439). `OPTIMIZABLE_PATHS` gains the per-profile dials, `agent.temperature`,
+  the strategy cost dials and the judge-gate dials via a new wildcard segment —
+  and nothing else under `model_pool`, `judge`, `sub_agents`, `model_tiers`,
+  `model_fallbacks` or `circuit_breaker`, which are admitted only by exact
+  match. That structural rule also closes a pre-existing leak that let a
+  whole-block path reach a step's pool candidates. The excluded half is stated
+  in code as `HUMAN_OWNED_PATHS`, the Hangar gates the roster and rule blocks
+  behind a typed confirmation, and `lint` / `doctor` gain judge-independence,
+  profile-tools-subset and roster-reference checks.
+
+- **`crewhaus upgrade` actually rewrites your spec now** (#433). Migrations
+  apply as CST edits, so comments and key order survive; `MIGRATION_1_TO_2`
+  stamps `version: 2`; `migrate-all` validates through the live schema; and an
+  irreversible step is refused rather than silently reversed. `upgrade
+  --hoist-models` lifts repeated model/thinking/max_tokens triples into
+  price-ranked `models:` profiles with an IR-equality guarantee. Alongside it,
+  upgrade notes generalise to a per-release table, `doctor` reports a spec
+  behind or ahead of the CLI, `daemon status` prints registry-pin freshness,
+  and pricing feeds may carry `sunsets`.
+
+### Changed
+
+- **Crew per-role model pools are live.** A crew role's `model_pool`,
+  `model_tiers`, `model_fallbacks` and `circuit_breaker` have been emitted onto
+  the role literal since 0.4 and ignored by the orchestrator ever since. They
+  now reach the role's loop, so a role fails over, tiers and routes exactly as
+  a cli agent does, and its outcomes fold into the shared routing scoreboard
+  (#422). Per-candidate profile fields ride the role literal intact, and a role
+  without a pinned `scope` gets its own routing namespace named for the role
+  (#431). A role that declares none of these fields is unchanged.
+
+- **`budget:` is enforced on every host and before every model call.**
+  Single-turn hosts — workflow steps, channel messages, managed requests — now
+  honour the cap, and the cap is checked before each model call inside a tool
+  loop rather than only between turns. A runaway tool loop therefore stops at
+  the cap with the classified `crewhaus_budget` failure (exit 33) at a request
+  boundary: a stated change to the former "an in-flight tool loop is never
+  severed" contract. The workflow shape's cap now spans the whole run through
+  one shared meter instead of resetting per step (#423).
+
+- **Judge and compaction spend counts against `budget`.** In-loop
+  `evaluation:` judges, `kind: judge` gates and compaction summaries publish
+  their calls on the run bus with a `role`, so they are priced, metered under
+  `budget.judge_share`, and split by role in `cost-summary` — the spec's
+  long-standing "judge calls are metered" promise, made true. A sub-agent's
+  priced spend is re-published on the parent bus for the same reason; until now
+  it was dropped between the two buses and the run cap never saw it (#426,
+  #438).
+
+- **`on_exceed: degrade` under a pool restricts eligibility.** The degrade rung
+  now serves every remaining model call of the turn in which it fired and
+  routing is restricted to it, instead of the setting doing nothing under a
+  pool; and the path no longer emits a `model_failover` event for a failover
+  that never happened. A degrade model outside the roster compiles with a
+  warning (#423).
+
+- **Specs move to `version: 2`.** Run `crewhaus upgrade` to migrate: it stamps
+  the version and makes a learned pool's `reward.quality_source` explicit,
+  preserving comments and key order. A 0.5.x CLI will compile a v2 spec with
+  0.5.x semantics rather than refuse it, so `doctor` now reports the drift in
+  both directions (#433).
+
+- **On a spec that opts in, an unpinned judge defaults to the strongest model
+  rather than the serving one.** The flip needs `models:` or a pool `strategy`
+  in the spec; 0.5.x specs judge exactly as before (#429). Relatedly,
+  `evaluation.grader.repeats` must now be odd at parse time — the fold is a
+  median, and an even count previously became a mid-run throw that read as a
+  silently ungraded run (#448).
+
+- **Three new packages ship with the workspace**: `@crewhaus/model-plan` (the
+  pure plan primitives), `@crewhaus/model-service` (the composition root every
+  emitter and both interpreters call) and `@crewhaus/tool-consult` (the
+  `Consult` / `Escalate` pair). `PACKAGES.md` is recounted accordingly.
+
+### Fixed
+
+- **`crewhaus run` skipped the spec's `evaluation:` block**, so an interpreted
+  run was ungraded where the compiled bundle graded. It now grades exactly as
+  the bundle does (#432).
+
+- **`crewhaus serve` dropped the circuit breaker under `--model`**, which the
+  REPL path always kept (#430).
+
+- **The `pre-model` hook's `mutate.systemAppend` was never applied.** It is
+  honoured now (#435).
+
+- **Sub-agent cost read as zero.** A child's spend was dropped between the two
+  buses, so `budget` never saw it and `metrics-collector`'s `role="subagent"`
+  series was permanently zero; both now fold the child's roll-up (#438, #446).
+
+- **Concurrent model calls were mis-paired in OpenTelemetry.** The span tracker
+  now pairs by span id rather than by model name, so overlapping hybrid stages
+  no longer swap spans, and a call whose stream threw is closed as an
+  ERROR-status span at the next turn boundary instead of being held for the life
+  of the process (#424).
+
+- **Delayed quality was credited to the wrong arm.** `watchme report
+  --feed-routing` joined a turn's quality to that turn's FIRST route, so a
+  cascade credited the whole turn to the arm whose draft was rejected. The join
+  is now per stage, and a stage the join could not time records no latency
+  rather than a `0` the reward would read as infinitely fast (#445).
+
+- **A `target: transcript` judge could not tell a failed tool step from a
+  successful one**, and read the runtime's own injected messages — retry
+  nudges, cascade corrections — as user instructions. The projected transcript
+  now marks a failed tool result `isError` and flags injected messages
+  `synthetic`, so a judge on a retry no longer grades against its own previous
+  rationale. A judge panel's instrument id is likewise its DECLARED members in
+  declaration order rather than whichever call finished first, so the quality
+  lineage keyed on it is stable (#448).
+
 ## [0.5.8] - 2026-08-27
 
 ### Added

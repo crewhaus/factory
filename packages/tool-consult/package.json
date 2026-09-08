@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-consult",
-  "version": "0.5.8",
+  "version": "0.6.0",
   "type": "module",
   "description": "Consult({question, to?}) and Escalate({reason}) — the model-directed hybrid tools (0.6.0 plan §7.2.4 / §7.5, brief 309): a nested single-turn side call on an allowlisted roster sibling whose reply is classified at TrustOrigin \"consult\", and the self-escalation receipt + latch the loop consumes",
   "main": "src/index.ts",
