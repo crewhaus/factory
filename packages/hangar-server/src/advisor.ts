@@ -67,6 +67,7 @@ import {
   readArms,
   readPinServeStates,
   readPoolView,
+  readPoolViews,
   rosterSunsets,
 } from "./models";
 import { resolveInside } from "./safety";
@@ -240,9 +241,20 @@ export type AdvisorArm = {
 
 export type RoutingInputs = {
   readonly arms: readonly AdvisorArm[];
-  /** `agent.model_pool.policy` as declared (`static` when omitted). */
+  /**
+   * The declared pool policy (`static` when omitted). A spec that declares
+   * pools at more than one host with more than one policy reads `mixed` —
+   * the advisor never picks one host's answer and calls it the harness's.
+   */
   readonly policy: string;
   readonly candidates: number;
+  /**
+   * True when ANY declared pool is already `learned`. `policy-flip-ready`
+   * proposes a flip that has already happened otherwise: a crew harness's
+   * per-role pool is a pool this manager must not overlook. Absent reads as
+   * false, so a caller that knows only `policy` behaves as it always did.
+   */
+  readonly learnedAnywhere?: boolean;
 };
 
 export type RouteStatsInput = {
@@ -557,7 +569,7 @@ export function deriveAdvisorItems(inputs: AdvisorInputs): AdvisorItem[] {
   if (routing !== null) {
     const live = routing.arms.filter((a) => !a.shadow);
     const ready = live.length > 1 && live.every((a) => a.n >= ARM_SAMPLE_FLOOR);
-    if (ready && routing.policy !== "learned") {
+    if (ready && routing.policy !== "learned" && routing.learnedAnywhere !== true) {
       open({
         id: "policy-flip-ready",
         severity: "suggestion",
@@ -827,14 +839,22 @@ async function gatherInputs(ctx: M3Context, dir: string): Promise<AdvisorInputs>
   // 0.6.0 §8.3 — the routing signals. Each read is tolerant: an unreadable
   // scoreboard, an absent registry or a spec this manager cannot fully parse
   // produces NO item rather than a wrong one.
-  const pool = readPoolView(yamlText);
+  // Every pool the spec declares, not just `agent.model_pool`: a crew role's
+  // or a workflow step's pool routes turns too, and an advisor that reads one
+  // host proposes flips for a policy that is already flipped.
+  const pools = readPoolViews(yamlText);
   const arms = readArms(ctx).rows;
+  const policies = [...new Set(pools.map((p) => p.pool.policy ?? "static"))];
+  // One policy across every declared pool is the harness's policy; two
+  // different ones is `mixed`, never one host's answer spoken for all.
+  const policy = policies.length > 1 ? "mixed" : (policies[0] ?? "static");
   const routing =
-    pool.declared || arms.length > 0
+    pools.length > 0 || arms.length > 0
       ? {
           arms: arms.map(toAdvisorArm),
-          policy: pool.policy ?? "static",
-          candidates: pool.candidates.length,
+          policy,
+          candidates: pools.reduce((n, p) => n + p.pool.candidates.length, 0),
+          learnedAnywhere: policies.includes("learned"),
         }
       : null;
   const routeStats = foldRouteStats(dir);
@@ -1221,19 +1241,21 @@ function buildReport(ctx: M3Context, dir: string, kind: ReportKind): Record<stri
     case "routing": {
       const yamlText = readSpecYaml(dir);
       const pool = readPoolView(yamlText);
+      const pools = readPoolViews(yamlText);
       const arms = readArms(ctx).rows;
       const leaderboard = buildLeaderboard(arms);
       const best = leaderboard.filter((r) => r.best);
       const stats = foldRouteStats(dir);
       return {
         pool,
+        pools,
         arms,
         leaderboard,
         best,
         routeStats: stats,
         finding:
           !pool.declared && arms.length === 0
-            ? "no agent.model_pool and no recorded arms — this harness routes nothing"
+            ? "no model_pool declared anywhere and no recorded arms — this harness routes nothing"
             : arms.length === 0
               ? "a pool is declared but nothing has been observed yet — run the harness to accumulate arms"
               : `${arms.length} arm(s) across ${best.length} band(s); the leading arm in each band is what a \`learned\` policy would exploit`,

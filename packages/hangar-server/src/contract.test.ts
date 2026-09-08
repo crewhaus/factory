@@ -1178,6 +1178,9 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["pool.declared", "boolean"],
     ["pool.policy", "string|null"],
     ["pool.candidates", "array"],
+    // Every declared pool with its host path — a crew role's or a workflow
+    // step's pool is a pool, and the tab renders a card per entry.
+    ["pools", "array"],
     ["spend.totalUsdMicros", "number"],
     ["spend.calls", "number"],
     ["spend.rollups", "number"],
@@ -1594,8 +1597,9 @@ function contractHarness(t: TestServer): string {
             iso(NOW - DAY),
           ),
           // A nested run's roll-up, re-published on this bus by the sub-agent
-          // spawner: role-bearing + `summary: true`, so it FOLDS (the child's
-          // own tracker is suppressed and writes no per-call line anywhere).
+          // spawner: role-bearing + `summary: true`. The DIRECTORY-wide fold
+          // SKIPS it — the child's own session log (below) is a sibling file
+          // and carries the per-call lines this roll-up totals.
           logLine(
             "cost_accrual",
             {
@@ -1633,6 +1637,29 @@ function contractHarness(t: TestServer): string {
               model: "claude-haiku-4-5",
               profile: "fast",
               outcome: "done",
+            },
+            iso(NOW - DAY),
+          ),
+        ],
+      },
+      // The sub-agent CHILD's own session log — a sibling in the same session
+      // root (the child inherits the parent's `sessionRootDir`), carrying the
+      // per-call `role: "subagent"` lines the parent's roll-up totals.
+      {
+        id: "sess_00000000000000ab",
+        updatedAt: iso(NOW - DAY),
+        lastTurnIndex: 0,
+        log: [
+          logLine(
+            "cost_accrual",
+            {
+              provider: "anthropic",
+              modelId: "m-beta",
+              costUsdMicros: 900,
+              inputTokens: 40,
+              outputTokens: 8,
+              role: "subagent",
+              profile: "strong",
             },
             iso(NOW - DAY),
           ),
@@ -2009,14 +2036,17 @@ describe("UI route contract", () => {
 
       // -- 0.6.0 · models: the acceptance item, not just the shape ---------
       // "GET /api/h/:id/models returns registry + arms + leaderboard", and
-      // per-profile spend is FOLDED — including the sub-agent roll-up, whose
-      // per-call lines exist in no log at all.
+      // per-profile spend is FOLDED — the sub-agent's spend counted ONCE,
+      // from the child's own session log, with the parent's roll-up skipped.
       const modelsBody = await drive("models", { id }, { readsKey: "models" });
       expect((modelsBody["registry"] as Array<{ name: string }>).map((r) => r.name)).toEqual([
         "fast",
         "strong",
       ]);
       expect((modelsBody["pool"] as { declared: boolean }).declared).toBe(true);
+      expect((modelsBody["pools"] as Array<{ hostPath: string }>).map((p) => p.hostPath)).toEqual([
+        "agent.model_pool",
+      ]);
       expect(
         (modelsBody["pool"] as { candidates: Array<{ profile: string | null }> }).candidates.map(
           (c) => c.profile,

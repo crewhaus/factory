@@ -13266,8 +13266,10 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
         "             resolved no profile are grouped under (none)\n" +
         "\n" +
         "a `summary: true` accrual carrying a role is a NESTED run's roll-up\n" +
-        "(a sub-agent total re-published on the parent bus) and is counted; a\n" +
-        "role-less one is a run total over calls already counted, and is not.\n",
+        "(a sub-agent total re-published on the parent bus). This readout is\n" +
+        "one session file, so the child's own per-call lines are out of scope\n" +
+        "and the roll-up is counted; a role-less one is a run total over calls\n" +
+        "already counted here, and is not.\n",
     );
     return;
   }
@@ -13335,10 +13337,12 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
       // has already counted (the optimizer publishes those), so counting it
       // double-counts. A ROLE-BEARING one is a nested run's roll-up
       // re-published on the parent bus — a sub-agent's total, priced by its
-      // publisher over calls whose per-call lines exist in no log, because
-      // the child's tracker runs suppressed. That one IS the only record of
-      // that spend, and skipping it is how a hybrid harness under-reports.
-      // The same split `@crewhaus/cost-tracker` makes on the live bus.
+      // publisher over calls whose per-call lines live in the CHILD's own
+      // session file, which this SINGLE-session readout never opens. In this
+      // scope the roll-up is the only record of that spend, so it folds —
+      // the same split `@crewhaus/cost-tracker` makes on the live parent bus.
+      // Hangar's DIRECTORY-wide fold takes the opposite branch for exactly
+      // the same reason: there, the child's file is in scope.
       const role = e.payload?.role ?? e.role;
       const summary = (e.payload?.summary ?? e.summary) === true;
       if (summary && (typeof role !== "string" || role === "")) continue;

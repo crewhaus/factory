@@ -5,7 +5,8 @@
  * Four panels, in the order an operator asks the questions:
  *
  *   1. **Registry** — the `models:` profiles this spec declares, and the
- *      `agent.model_pool` candidates that reference them.
+ *      `model_pool` candidates that reference them (one card per pool: a
+ *      crew role or a workflow step declares one as readily as `agent:`).
  *   2. **Per-profile spend** — the same cost fold the Costs tab reads, split
  *      by `role` and by `profile` instead of by model. This is where a
  *      judge, an escalation or a sub-agent's spend becomes visible: those
@@ -50,6 +51,26 @@ export function profileSpendRows(payload) {
     usdMicros: typeof row?.usdMicros === "number" ? row.usdMicros : 0,
     share: spendShare(row?.usdMicros, total),
   }));
+}
+
+/**
+ * Payload → the declared pools, one row per host that declares one. Pure.
+ *
+ * `model_pool` is not an `agent:` field — a crew role, a workflow step, a
+ * graph node or a sub-agent declares one too — so the tab renders a card per
+ * pool. A manager one version behind serves only `pool`; that single view is
+ * used as the one row rather than claiming nothing is declared.
+ */
+export function declaredPools(payload) {
+  const rows = Array.isArray(payload?.pools) ? payload.pools : [];
+  const shaped = rows
+    .filter((row) => row && typeof row.pool === "object" && row.pool !== null)
+    .map((row) => ({ hostPath: String(row.hostPath ?? "model_pool"), pool: row.pool }));
+  if (shaped.length > 0) return shaped;
+  const single = payload?.pool;
+  return single && typeof single === "object" && single.declared === true
+    ? [{ hostPath: "model_pool", pool: single }]
+    : [];
 }
 
 /** The same shaping for the per-role split. Pure. */
@@ -169,7 +190,7 @@ export async function renderModels(root, ctx) {
   }
 
   const registry = Array.isArray(body.registry) ? body.registry : [];
-  const pool = body.pool && typeof body.pool === "object" ? body.pool : { declared: false };
+  const pools = declaredPools(body);
   const arms = Array.isArray(body.arms) ? body.arms : [];
   const leaderboard = Array.isArray(body.leaderboard) ? body.leaderboard : [];
   const sessions = Array.isArray(body.sessions) ? body.sessions : [];
@@ -209,20 +230,26 @@ export async function renderModels(root, ctx) {
     ),
   );
 
-  root.appendChild(
-    card(
-      "Routing pool",
-      pool.declared === true
-        ? `policy ${pool.policy ?? "static"}${pool.scope ? ` · scope ${pool.scope}` : ""}`
-        : "not declared",
-      pool.declared !== true
-        ? el("p", {
-            class: "muted",
-            text: "no agent.model_pool — every turn is served by the one declared model.",
-          })
-        : table(
+  if (pools.length === 0) {
+    root.appendChild(
+      card(
+        "Routing pool",
+        "not declared",
+        el("p", {
+          class: "muted",
+          text: "no model_pool anywhere in the spec — every turn is served by the one declared model.",
+        }),
+      ),
+    );
+  } else {
+    for (const { hostPath, pool: p } of pools) {
+      root.appendChild(
+        card(
+          `Routing pool · ${hostPath}`,
+          `policy ${p.policy ?? "static"}${p.scope ? ` · scope ${p.scope}` : ""}`,
+          table(
             ["Candidate", "Profile", "Tags", "Enabled"],
-            (Array.isArray(pool.candidates) ? pool.candidates : []).map((c) =>
+            (Array.isArray(p.candidates) ? p.candidates : []).map((c) =>
               el("tr", null, [
                 el("td", { class: "mono", text: String(c?.model ?? "—") }),
                 el("td", { class: "mono", text: String(c?.profile ?? "—") }),
@@ -234,8 +261,10 @@ export async function renderModels(root, ctx) {
               ]),
             ),
           ),
-    ),
-  );
+        ),
+      );
+    }
+  }
 
   // ---- 2. per-role and per-profile spend ---------------------------------
   const spendBody = [];
@@ -277,7 +306,7 @@ export async function renderModels(root, ctx) {
     spendBody.push(
       el("p", {
         class: "muted",
-        text: `${body.spend.rollups} of these lines are nested-run roll-ups (a sub-agent's total, priced once by its parent) — they count as one call each.`,
+        text: `${body.spend.rollups} nested-run roll-up line(s) were skipped — a sub-agent's spend is counted from the child's own session log, which is folded here too.`,
       }),
     );
   }

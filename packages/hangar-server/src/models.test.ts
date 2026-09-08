@@ -8,7 +8,7 @@
  * behaviour is covered here, against a fixture this area controls.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { hashSpecSource } from "./bundle-freshness";
 import { logLine, makeFixtureHarness } from "./fixture";
@@ -18,6 +18,7 @@ import {
   readModelRegistry,
   readPinServeStates,
   readPoolView,
+  readPoolViews,
   readRouteTimeline,
   rosterModels,
   rosterSunsets,
@@ -205,6 +206,54 @@ describe("the lenient spec readers", () => {
     expect(pool.strategies).toEqual(["cascade"]);
   });
 
+  test("a pool on a crew role is a declared pool — `model_pool` is not an agent: field", () => {
+    const yaml = [
+      "name: x",
+      "target: crew",
+      "crew:",
+      "  roles:",
+      "    researcher:",
+      "      model_pool:",
+      "        policy: learned",
+      "        candidates:",
+      "          - model: $fast",
+      "          - model: claude-opus-5",
+    ].join("\n");
+    const pools = readPoolViews(yaml);
+    expect(pools.map((p) => p.hostPath)).toEqual(["crew.roles.researcher.model_pool"]);
+    expect(pools[0]?.pool.policy).toBe("learned");
+    // The single-pool view must NOT report "not declared" and must not
+    // default the policy to static: the advisor derives `policy-flip-ready`
+    // from exactly this read.
+    const pool = readPoolView(yaml);
+    expect(pool.declared).toBe(true);
+    expect(pool.policy).toBe("learned");
+  });
+
+  test("readPoolViews finds a pool at every host, and prefers agent's for the single view", () => {
+    const yaml = [
+      "name: x",
+      "target: workflow",
+      "agent:",
+      "  model_pool:",
+      "    policy: heuristic",
+      "workflow:",
+      "  steps:",
+      "    - id: s1",
+      "      model_pool:",
+      "        policy: learned",
+      "    - id: s2",
+      "      model_pool:",
+      "        policy: static",
+    ].join("\n");
+    expect(readPoolViews(yaml).map((p) => p.hostPath)).toEqual([
+      "agent.model_pool",
+      "workflow.steps[0].model_pool",
+      "workflow.steps[1].model_pool",
+    ]);
+    expect(readPoolView(yaml).policy).toBe("heuristic");
+  });
+
   test("rosterModels finds every model slot at any depth and skips $refs", () => {
     const models = rosterModels(
       [
@@ -373,7 +422,59 @@ describe("GET /api/h/:id/models", () => {
     expect(body["registry"]).toEqual([]);
     expect((body["pool"] as { declared: boolean }).declared).toBe(false);
     expect(String(body["note"])).toContain("serves one declared model");
-    expect(String(body["guidance"])).toContain("declare agent.model_pool");
+    expect(String(body["guidance"])).toContain("declare a model_pool");
+  });
+
+  test("a pool declared off `agent:` reaches the tab instead of a false negative", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "subpool"), {
+      specName: "subpool",
+      specExtra: [
+        "  sub_agents:",
+        "    researcher:",
+        "      description: digs",
+        "      instructions: dig",
+        "      model_pool:",
+        "        policy: learned",
+        "        candidates:",
+        "          - model: claude-haiku-4-5",
+        "          - model: claude-opus-5",
+      ].join("\n"),
+    });
+    const id = await register(t, dir);
+    const { status, body } = await t.api(`/api/h/${id}/models`);
+    expect(status).toBe(200);
+    expect((body["pools"] as Array<{ hostPath: string }>).map((p) => p.hostPath)).toEqual([
+      "agent.sub_agents.researcher.model_pool",
+    ]);
+    expect((body["pool"] as { declared: boolean }).declared).toBe(true);
+    expect(JSON.stringify(body["note"] ?? "")).not.toContain("serves one declared model");
+  });
+
+  test("a symlinked freeze/priors file stays unread — containment is per FILE", async () => {
+    const t = boot();
+    const outside = join(t.workspace, "outside-routing");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(
+      join(outside, "freeze.json"),
+      JSON.stringify({ version: 1, policyVersion: "OUTSIDE-SECRET", frozenAt: iso(NOW) }),
+    );
+    writeFileSync(join(outside, "priors.json"), "{ not json OUTSIDE-SECRET");
+    const dir = hybridHarness(t);
+    const routing = join(dir, ".crewhaus", "routing");
+    mkdirSync(routing, { recursive: true });
+    symlinkSync(join(outside, "freeze.json"), join(routing, "freeze.json"));
+    symlinkSync(join(outside, "priors.json"), join(routing, "priors.json"));
+    const id = await register(t, dir);
+    for (const path of [`/api/h/${id}/models`, `/api/h/${id}/models/arms`]) {
+      const res = await t.fetchRaw(path, { headers: { authorization: `Bearer ${t.token}` } });
+      const text = await res.text();
+      expect(`${path}:${text.includes("OUTSIDE-SECRET")}`).toBe(`${path}:false`);
+      expect(`${path}:${text.includes(outside)}`).toBe(`${path}:false`);
+    }
+    const { body } = await t.api(`/api/h/${id}/models/arms`);
+    expect(body["freeze"]).toBeNull();
+    expect((body["priors"] as { present: boolean }).present).toBe(false);
   });
 
   test("reading the area never CREATES the scoreboard — reads never mutate", async () => {

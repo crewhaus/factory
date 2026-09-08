@@ -1,7 +1,7 @@
 /**
  * The cost fold's 0.6.0 half: role/profile attribution, and the `summary`
- * split that decides whether a line is a double-count or the only record of
- * a nested run's spend.
+ * rule — in a DIRECTORY-wide fold every roll-up is a double-count, because
+ * the nested run's own session log is one of the files being folded.
  *
  * The pre-0.6.0 fields (`totalUsdMicros`, `byModel`, `days`) are pinned
  * golden in `server.test.ts`; this file covers what was added.
@@ -17,17 +17,23 @@ const NOW = Date.parse("2026-08-03T00:00:00.000Z");
 const iso = (ms: number): string => new Date(ms).toISOString();
 const DAY = 86_400_000;
 
-function fold(lines: readonly unknown[]): ReturnType<typeof foldHarnessCosts> {
+function foldSessions(
+  sessions: ReadonlyArray<{ id: string; log: readonly unknown[] }>,
+): ReturnType<typeof foldHarnessCosts> {
   const root = mkdtempSync(join(tmpdir(), "hangar-costs-"));
   try {
     const dir = makeFixtureHarness(join(root, "h"), {
       specName: "cost-fixture",
-      sessions: [{ id: "sess_00000000000000aa", updatedAt: iso(NOW - DAY), log: lines }],
+      sessions: sessions.map((s) => ({ id: s.id, updatedAt: iso(NOW - DAY), log: s.log })),
     });
     return foldHarnessCosts(dir, NOW);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+}
+
+function fold(lines: readonly unknown[]): ReturnType<typeof foldHarnessCosts> {
+  return foldSessions([{ id: "sess_00000000000000aa", log: lines }]);
 }
 
 const accrual = (fields: Record<string, unknown>): unknown =>
@@ -79,7 +85,7 @@ describe("the `summary: true` split", () => {
     expect(costs.rollups).toBe(0);
   });
 
-  test("a role-BEARING roll-up folds — the child's own tracker writes no per-call line", () => {
+  test("a role-BEARING roll-up is skipped too — this fold is DIRECTORY-wide", () => {
     const costs = fold([
       accrual({ costUsdMicros: 100, role: "primary" }),
       accrual({
@@ -91,16 +97,16 @@ describe("the `summary: true` split", () => {
         summary: true,
       }),
     ]);
-    expect(costs.totalUsdMicros).toBe(350);
+    // The roll-up is a TOTAL, never a call: the child's own per-call lines
+    // are folded from the child's session file, a sibling in this very
+    // directory. `rollups` reports that one was seen and skipped.
+    expect(costs.totalUsdMicros).toBe(100);
     expect(costs.rollups).toBe(1);
-    expect(costs.byRole.map((r) => r.role)).toEqual(["subagent", "primary"]);
-    expect(costs.byProfile.find((p) => p.profile === "fast")?.usdMicros).toBe(250);
-    // One LINE is one call: the roll-up's real call count lives in the child's
-    // own log, and `rollups` is how a reader sees the approximation.
-    expect(costs.calls).toBe(2);
+    expect(costs.calls).toBe(1);
+    expect(costs.byRole.map((r) => r.role)).toEqual(["primary"]);
   });
 
-  test("a flat (non-enveloped) roll-up folds the same way", () => {
+  test("a flat (non-enveloped) roll-up is skipped the same way", () => {
     const costs = fold([
       { kind: "cost_accrual", provider: "anthropic", modelId: "m", costUsdMicros: 60 },
       {
@@ -112,7 +118,39 @@ describe("the `summary: true` split", () => {
         summary: true,
       },
     ]);
-    expect(costs.totalUsdMicros).toBe(100);
+    expect(costs.totalUsdMicros).toBe(60);
     expect(costs.rollups).toBe(1);
+  });
+
+  test("parent roll-up + the child's own log counts the sub-agent's spend ONCE", () => {
+    // The topology a sub-agent actually produces: the child runs with the
+    // parent's `sessionRootDir`, so its session file is a sibling here and
+    // runtime-core's cost mirror has already written its per-call
+    // `role: "subagent"` lines. Folding the parent's roll-up on top would
+    // report 2800 for 1900 of real spend.
+    const costs = foldSessions([
+      {
+        id: "sess_00000000000000aa",
+        log: [
+          accrual({ costUsdMicros: 1000, role: "primary" }),
+          accrual({ costUsdMicros: 900, role: "subagent", profile: "fast", summary: true }),
+        ],
+      },
+      {
+        id: "sess_00000000000000bb",
+        log: [
+          accrual({ costUsdMicros: 500, role: "subagent", profile: "fast" }),
+          accrual({ costUsdMicros: 400, role: "subagent", profile: "fast" }),
+        ],
+      },
+    ]);
+    expect(costs.totalUsdMicros).toBe(1900);
+    expect(costs.calls).toBe(3);
+    expect(costs.rollups).toBe(1);
+    expect(costs.byRole).toEqual([
+      { role: "primary", calls: 1, usdMicros: 1000, inputTokens: 0, outputTokens: 0 },
+      { role: "subagent", calls: 2, usdMicros: 900, inputTokens: 0, outputTokens: 0 },
+    ]);
+    expect(costs.byProfile.find((p) => p.profile === "fast")?.usdMicros).toBe(900);
   });
 });

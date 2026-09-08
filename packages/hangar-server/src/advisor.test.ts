@@ -440,6 +440,20 @@ describe("deriveAdvisorItems — routing (0.6.0 §8.3)", () => {
       },
     });
     expect(learned.map((i) => i.id)).not.toContain("policy-flip-ready");
+
+    // A spec with pools at more than one host reads `mixed`, and one of them
+    // is already learned: proposing "flip the policy" would be advice for a
+    // flip that has happened.
+    const mixed = deriveAdvisorItems({
+      ...CLEAN,
+      routing: {
+        policy: "mixed",
+        candidates: 4,
+        learnedAnywhere: true,
+        arms: [arm("easy", "a", 0.9, ARM_SAMPLE_FLOOR), arm("easy", "b", 0.85, ARM_SAMPLE_FLOOR)],
+      },
+    });
+    expect(mixed.map((i) => i.id)).not.toContain("policy-flip-ready");
   });
 
   test("candidate-underperforming names the worst arm in a band, once, and never the leader", () => {

@@ -5,26 +5,36 @@
  * both.
  *
  * ---------------------------------------------------------------------------
- * `summary: true` — two different lines wearing one flag (0.6.0 §8.3)
+ * `summary: true` — a roll-up, and why a DIRECTORY-wide fold skips it
  * ---------------------------------------------------------------------------
- * A ROLE-LESS `summary: true` accrual is a run TOTAL, a sum over per-call
- * accruals this fold has already counted; folding it would double-count, so
- * it stays skipped exactly as before.
+ * A `summary: true` accrual is never a call: it is a total over calls priced
+ * somewhere else. Two publishers emit one. A ROLE-LESS line is the optimizer
+ * orchestrator's run total, a sum over per-call accruals in this very file.
+ * A ROLE-BEARING one is a NESTED run's roll-up re-published on the parent bus
+ * (`@crewhaus/sub-agent-spawner` publishes `cost_accrual{role: "subagent",
+ * summary: true}` inside the sub-agent bracket).
  *
- * A ROLE-BEARING one is the opposite: it is a NESTED run's roll-up
- * re-published on the parent bus (`@crewhaus/sub-agent-spawner` publishes
- * `cost_accrual{role: "subagent", summary: true}` inside the sub-agent
- * bracket), priced by its publisher over calls this session never saw. The
- * child's own tracker is opened `suppressEvents: true`, so the child session
- * log carries NO per-call accrual line — skipping the parent's roll-up is the
- * only way this spend can be lost, and until 0.6.0 it was. Folding it is what
- * lets sub-agent spend reach the Costs and Models tabs at all. This is the
- * same split `@crewhaus/cost-tracker` makes on the live bus, and the CLI's
- * `cost-summary` now makes on the same files.
+ * This fold globs EVERY `sess_*.jsonl` under the harness's session root, and
+ * a sub-agent child runs with the parent's `sessionRootDir` — so the child's
+ * own session log is a sibling file in the very directory being folded, and
+ * runtime-core's cost mirror has already written the child's per-call
+ * `cost_accrual{role: "subagent"}` lines into it. Folding the parent's
+ * roll-up ON TOP of those lines would count that spend twice. So both kinds
+ * of roll-up are skipped here; nothing is lost, because the child's per-call
+ * lines carry the same `role` and `profile` the roll-up does and land in the
+ * same per-role / per-profile split.
  *
- * A roll-up counts as ONE call in `calls` — it is one line, priced once, over
- * a call count only the child's own log knows. `rollups` reports how many of
- * the folded lines were roll-ups so a reader can see the approximation.
+ * The single-file scope is the one that must fold a role-bearing roll-up:
+ * `crewhaus cost-summary --session <id>` reads the parent log ALONE and never
+ * sees the child's file, and `@crewhaus/cost-tracker` folds it on the live
+ * parent bus, where the child's per-call events were published on a different
+ * bus. Same flag, opposite answer, because the scope differs.
+ *
+ * `rollups` reports how many role-bearing roll-ups were SKIPPED, so a reader
+ * can see that a nested run happened and that its spend is counted from the
+ * child's own log rather than from the parent's summary line. (A child log
+ * evicted by the session TTL takes its spend with it — the honest cost of
+ * refusing to double-count.)
  *
  * The last-7-days window prefers the line's own `ts`; a ts-less line falls
  * back to its file's mtime (honest approximation, flagged nowhere because it
@@ -93,7 +103,12 @@ export type HarnessCosts = {
   readonly byRole: readonly RoleCostRow[];
   /** 0.6.0 — spend by `models:` profile, biggest first. */
   readonly byProfile: readonly ProfileCostRow[];
-  /** How many folded lines were role-bearing `summary: true` roll-ups. */
+  /**
+   * How many role-bearing `summary: true` roll-ups this fold SKIPPED. A
+   * nested run's per-call lines are in scope here (its session log is a
+   * sibling file), so the roll-up would double-count; the count is reported
+   * so a reader can see the nested run happened. See the module docblock.
+   */
   readonly rollups: number;
   /**
    * The last 7 UTC calendar days (oldest first, today last), zero-filled so
@@ -198,14 +213,16 @@ export function foldHarnessCosts(harnessDir: string, nowMs: number): HarnessCost
       const fields = (
         typeof top.payload === "object" && top.payload !== null ? top.payload : obj
       ) as AccrualFields;
-      // See the module docblock: a role-LESS roll-up is a run total already
-      // counted per call; a role-BEARING one is a nested run whose per-call
-      // lines live in another log (or, for a suppressed child tracker, in no
-      // log at all).
+      // See the module docblock: a `summary: true` line is a TOTAL, never a
+      // call. Role-less, it sums per-call lines in this very file; role-
+      // bearing, it sums a nested run whose own session log is a sibling in
+      // this same directory and is folded on its own turn. Either way,
+      // folding it here double-counts — so it is skipped, and a role-bearing
+      // one is counted into `rollups` so the reader sees it existed.
       const role = typeof fields.role === "string" && fields.role !== "" ? fields.role : undefined;
       if (fields.summary === true) {
-        if (role === undefined) continue;
-        rollups += 1;
+        if (role !== undefined) rollups += 1;
+        continue;
       }
       const micros = typeof fields.costUsdMicros === "number" ? fields.costUsdMicros : 0;
       const provider = typeof fields.provider === "string" ? fields.provider : "unknown";

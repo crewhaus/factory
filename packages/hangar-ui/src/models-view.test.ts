@@ -11,11 +11,38 @@ import { HARNESS_TABS, M3_TABS, parseRoute } from "../assets/js/router.js";
 import { ROUTES } from "../assets/js/routes.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import {
+  declaredPools,
   profileSpendRows,
   roleSpendRows,
   spendShare,
   timelineLine,
 } from "../assets/js/views/models.js";
+
+describe("declaredPools", () => {
+  test("every declared pool renders, whatever host declares it", () => {
+    const rows = declaredPools({
+      pool: { declared: true, policy: "heuristic" },
+      pools: [
+        { hostPath: "agent.model_pool", pool: { declared: true, policy: "heuristic" } },
+        { hostPath: "crew.roles.writer.model_pool", pool: { declared: true, policy: "learned" } },
+      ],
+    }) as Array<{ hostPath: string }>;
+    expect(rows.map((r) => r.hostPath)).toEqual([
+      "agent.model_pool",
+      "crew.roles.writer.model_pool",
+    ]);
+  });
+
+  test("no pool anywhere is the only empty answer; an older payload still renders one", () => {
+    expect(declaredPools({ pool: { declared: false } })).toEqual([]);
+    expect(declaredPools(null)).toEqual([]);
+    const legacy = declaredPools({
+      pool: { declared: true, policy: "learned" },
+    }) as Array<{ hostPath: string }>;
+    expect(legacy).toHaveLength(1);
+    expect(legacy[0]?.hostPath).toBe("model_pool");
+  });
+});
 
 describe("the models tab is routable", () => {
   test("it sits in the strip right after Costs, and deep-links resolve", () => {

@@ -32,6 +32,8 @@ import { join } from "node:path";
 import { KNOWN_SUNSETS, findSunset } from "@crewhaus/cost-tracker";
 import { resolveBundle } from "@crewhaus/harness-supervisor";
 import {
+  ROUTE_FREEZE_FILE,
+  ROUTING_PRIORS_FILE,
   isObserveOnlyLane,
   openScoreboard,
   readRouteFreeze,
@@ -167,20 +169,76 @@ export function readModelRegistry(yamlText: string): ModelProfileRow[] {
   return rows;
 }
 
-/** `agent.model_pool`, read leniently. */
+/** One declared pool plus the spec path of the host that declares it. */
+export type DeclaredPool = {
+  /** Dotted path to the pool, e.g. `agent.model_pool`, `crew.roles.writer.model_pool`. */
+  readonly hostPath: string;
+  readonly pool: PoolView;
+};
+
+/** The `PoolView` a harness with no `model_pool` anywhere gets. */
+const UNDECLARED_POOL: PoolView = {
+  declared: false,
+  policy: null,
+  scope: null,
+  candidates: [],
+  rules: 0,
+  strategies: [],
+  qualitySource: null,
+};
+
+/** The `agent.model_pool` path, and the pool a single-pool view prefers. */
+const AGENT_POOL_PATH = "agent.model_pool";
+
+/**
+ * Every `model_pool` the spec declares, at ANY host, in document order.
+ *
+ * `model_pool` is not an `agent:` field: the schema hangs one off workflow
+ * steps, graph nodes, crew roles, sub-agents, channel and managed agents and
+ * the batch pipeline too. Reading only `agent.model_pool` makes the console
+ * tell a crew or workflow operator "nothing is being routed" while a per-role
+ * pool routes every turn — so this walks for the key the same `anywhere`
+ * way `SECURITY_SURFACES` in spec-edit.ts already treats `model_pool.rules`.
+ * A pool's own subtree is not re-walked: what is under it is candidates and
+ * rules, never another pool.
+ */
+export function readPoolViews(yamlText: string): DeclaredPool[] {
+  const out: DeclaredPool[] = [];
+  const walk = (node: unknown, path: string): void => {
+    if (Array.isArray(node)) {
+      node.forEach((item, i) => walk(item, `${path}[${i}]`));
+      return;
+    }
+    const record = asRecord(node);
+    if (record === undefined) return;
+    for (const [key, value] of Object.entries(record)) {
+      const child = path === "" ? key : `${path}.${key}`;
+      if (key === "model_pool") {
+        const body = asRecord(value);
+        if (body !== undefined) out.push({ hostPath: child, pool: buildPoolView(body) });
+        continue;
+      }
+      walk(value, child);
+    }
+  };
+  walk(readYamlLoose(yamlText), "");
+  return out;
+}
+
+/**
+ * The one pool a single-pool view renders: `agent.model_pool` when it exists,
+ * otherwise the first pool declared anywhere. `declared: false` only when the
+ * spec declares no pool at all — never merely because the pool hangs off a
+ * role, a step or a node.
+ */
 export function readPoolView(yamlText: string): PoolView {
-  const pool = asRecord(at(readYamlLoose(yamlText), ["agent", "model_pool"]));
-  if (pool === undefined) {
-    return {
-      declared: false,
-      policy: null,
-      scope: null,
-      candidates: [],
-      rules: 0,
-      strategies: [],
-      qualitySource: null,
-    };
-  }
+  const pools = readPoolViews(yamlText);
+  const agent = pools.find((p) => p.hostPath === AGENT_POOL_PATH);
+  return agent?.pool ?? pools[0]?.pool ?? UNDECLARED_POOL;
+}
+
+/** One `model_pool` mapping, read leniently. */
+function buildPoolView(pool: Record<string, unknown>): PoolView {
   const rawCandidates = pool["candidates"];
   const candidates: PoolCandidateRow[] = Array.isArray(rawCandidates)
     ? rawCandidates.map((entry) => {
@@ -312,10 +370,19 @@ export function buildLeaderboard(rows: readonly ArmRow[]): LeaderboardRow[] {
   return out;
 }
 
-/** The freeze marker in force, or null. A malformed marker reads as absent. */
+/**
+ * The freeze marker in force, or null. A malformed marker reads as absent.
+ *
+ * The FILE is contained, not just `.crewhaus`: `readRouteFreeze` joins
+ * `<root>/routing/freeze.json` itself and reads it with no check of its own,
+ * so containing only the state dir would let a symlinked `freeze.json` pull
+ * an arbitrary file's shaped fields into the browser. Containment is per
+ * file (m3.ts) — a name inside a contained directory is not contained.
+ */
 function readFreeze(ctx: M3Context): unknown {
   const root = safeContain(ctx, [STATE_DIR]);
   if (root === undefined) return null;
+  if (safeContain(ctx, [STATE_DIR, ROUTING_SUBDIR, ROUTE_FREEZE_FILE]) === undefined) return null;
   try {
     return readRouteFreeze(root) ?? null;
   } catch {
@@ -331,6 +398,12 @@ function readPriors(ctx: M3Context): {
 } {
   const root = safeContain(ctx, [STATE_DIR]);
   if (root === undefined) return { present: false, error: null, arms: null };
+  // Per-FILE containment, for the reason `readFreeze` states: a symlinked
+  // `priors.json` would otherwise be read, and its absolute target path
+  // returned to the browser inside `raw.error`.
+  if (safeContain(ctx, [STATE_DIR, ROUTING_SUBDIR, ROUTING_PRIORS_FILE]) === undefined) {
+    return { present: false, error: null, arms: null };
+  }
   const raw = readRoutingPriorsRaw(root);
   if (raw === undefined) return { present: false, error: null, arms: null };
   if (!raw.ok) return { present: true, error: raw.error, arms: null };
@@ -433,6 +506,10 @@ export const modelsOverview: M3Handler = (ctx) => {
   const dir = requireDir(ctx);
   const yamlText = readSpecYaml(dir);
   const registry = readModelRegistry(yamlText);
+  // Every declared pool, at whatever host declares it — `pool` is the one a
+  // single-pool reader renders (agent's, else the first), `pools` is the set
+  // the tab lists so a crew/workflow/graph harness sees its per-role pools.
+  const pools = readPoolViews(yamlText);
   const pool = readPoolView(yamlText);
   const costs = foldHarnessCosts(dir, ctx.now());
   const { rows, path } = readArms(ctx);
@@ -447,7 +524,7 @@ export const modelsOverview: M3Handler = (ctx) => {
   };
   const note =
     registry.length === 0 && !pool.declared
-      ? "no models: registry and no agent.model_pool — this harness serves one declared model"
+      ? "no models: registry and no model_pool anywhere in the spec — this harness serves one declared model"
       : rows.length === 0 && pool.declared
         ? "a pool is declared but no arm has been observed yet — run the harness to accumulate learning"
         : null;
@@ -455,6 +532,7 @@ export const modelsOverview: M3Handler = (ctx) => {
     ...found(note, "crewhaus models list"),
     registry,
     pool,
+    pools,
     spend,
     arms: rows,
     leaderboard,
@@ -466,8 +544,8 @@ export const modelsOverview: M3Handler = (ctx) => {
       pool.declared && pool.policy === "learned"
         ? "the learned policy exploits the starred arm in each band; `crewhaus route freeze` pins it"
         : pool.declared
-          ? "flip agent.model_pool.policy to `learned` once every arm has enough samples — `crewhaus route propose` mines the scoreboard for that patch"
-          : "declare agent.model_pool to route a turn between candidates; profiles in models: are what each candidate carries",
+          ? "flip the pool's policy to `learned` once every arm has enough samples — `crewhaus route propose` mines the scoreboard for that patch"
+          : "declare a model_pool to route a turn between candidates; profiles in models: are what each candidate carries",
     asOf: new Date(ctx.now()).toISOString(),
   };
 };
@@ -498,7 +576,7 @@ export const modelRoutes: M3Handler = (ctx) => {
   if (timeline.entries.length === 0) {
     return {
       ...absent(
-        "this session recorded no routing decisions — only runs whose spec declares agent.model_pool, model_tiers or a hybrid strategy persist them",
+        "this session recorded no routing decisions — only runs whose spec declares a model_pool, model_tiers or a hybrid strategy persist them",
         "crewhaus route explain",
       ),
       sessionId,
