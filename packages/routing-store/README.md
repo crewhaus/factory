@@ -74,6 +74,24 @@ each other's updates. A torn final line from a crashed writer is tolerated.
   the arm's current fingerprint is skipped on load — history from a profile
   that changed under the same arm id. Lines with no `pf` are always kept.
 
+### Promotion — the one way out of an observe-only lane (0.6.0 §6.3)
+
+`q:` and `shadow:` lanes are namespaces the runtime router never mints and
+never reads, so recording into them observes quality without steering a single
+live decision — and committee/shadow **member** arms never fold into live arms
+on their own. `promoteLanes(rootDir, {dryRun?})` is the sanctioned fold, driven
+by `crewhaus route promote`, which refuses unless a routed (`as-declared`) eval
+with a pinned seed and a warm frozen arm snapshot passed its baseline gate and
+writes a `routing_promotion` audit record.
+
+The fold is a single-writer maintenance op, the same class as `compact()`:
+every not-yet-promoted lane line is **copied** under the live routeKey (the
+prefix stripped, stamped `pr: <lane key>`) and the original is stamped
+`pm: 1`. So the lane keeps its own history — a promoted audition stays visible
+in `route status` — and promotion is idempotent: re-running it folds nothing,
+and folds only the delta once the lane has accumulated more. `pm` / `pr` are
+unknown fields to every reader, 0.5.x included.
+
 ### Routing-state files beside the arms
 
 - `routing/priors.json` — eval-seeded priors (`readRoutingPriorsRaw`; validated
@@ -88,12 +106,14 @@ each other's updates. A torn final line from a crashed writer is tolerated.
 `crewhaus route status` renders the scoreboard (per-band arms, best-per-bucket
 starred — what a `learned` policy exploits); `crewhaus route reset` wipes it;
 `crewhaus route freeze <policyVersion>` pins the learned policy
-(`--clear` lifts the pin).
+(`--clear` lifts the pin); `crewhaus route promote [--gate] [--dry-run]` folds
+the observe-only lanes into live arms once a routed eval authorizes it.
 
 ## Exports
 
 `computeReward`, `DEFAULT_OBJECTIVE`, `openScoreboard`, `freezeScoreboard`,
 `readRouteFreeze`, `writeRouteFreeze`, `clearRouteFreeze`, `routeFreezePath`,
-`readRoutingPriorsRaw`, `routingPriorsPath`, the lane helpers, and the types
-`RouteObservation`, `RouteObjective`, `RewardConfig`, `ArmStats`, `Scoreboard`,
-`ScoreboardOptions`, `ScoreReader`, `RouteFreeze`.
+`readRoutingPriorsRaw`, `routingPriorsPath`, the lane helpers, `promoteLanes`,
+`liveRouteKeyOf`, and the types `RouteObservation`, `RouteObjective`,
+`RewardConfig`, `ArmStats`, `Scoreboard`, `ScoreboardOptions`, `ScoreReader`,
+`RouteFreeze`, `LanePromotion`, `PromoteOptions`, `PromoteResult`.

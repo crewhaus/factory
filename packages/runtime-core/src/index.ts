@@ -4306,7 +4306,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // (`draft` on the graded draft, `escalation` on the forced re-run and on the
   // rest of a turn after a self-`Escalate`); `runOneTurn` sets it on entry
   // and clears it on return, so the loop's own defaults stand otherwise.
-  let turnAttributionOverride: { readonly role?: ModelRole; readonly stage?: string } = {};
+  let turnAttributionOverride: {
+    readonly role?: ModelRole;
+    readonly stage?: string;
+    readonly strategy?: string;
+  } = {};
   const modelAttribution = (): { role?: ModelRole; stage?: string } => {
     const role = turnAttributionOverride.role ?? opts.modelRole;
     const stage = turnAttributionOverride.stage ?? opts.modelStage;
@@ -6547,6 +6551,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     readonly forceReason?: string;
     readonly role?: ModelRole;
     readonly stage?: string;
+    /**
+     * 0.6.0 §7.9 — the `model_pool.strategy` member the attempt belongs to
+     * (`"cascade"`, `"model_directed"`). Stamped beside `stage` on the
+     * attempt's `model_route` lines so `watchme report --feed-routing` can
+     * join delayed quality PER STAGE rather than to the turn's first route.
+     */
+    readonly strategy?: string;
     readonly defer?: boolean;
     /**
      * §7.13 — the caller holds a standing answer to fall back to (the
@@ -6857,6 +6868,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     turnAttributionOverride = {
       ...(turnOpts.role !== undefined ? { role: turnOpts.role } : {}),
       ...(turnOpts.stage !== undefined ? { stage: turnOpts.stage } : {}),
+      ...(turnOpts.strategy !== undefined ? { strategy: turnOpts.strategy } : {}),
     };
     const pendingObservations: PendingPoolObservation[] = [];
     let attemptCostUsd = 0;
@@ -7066,6 +7078,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                     ...turnAttributionOverride,
                     role: "escalation",
                     stage: "escalate",
+                    strategy: "model_directed",
                   };
                   publishStage({
                     stage: "escalate",
@@ -7360,7 +7373,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // the two always present, since the phase always runs).
               const signalRecord = deriveSignalRecord(routeSignals);
               const { userTextHash, ...signalRest } = signalRecord;
+              // §7.9 — the hybrid stage the decision serves. Present only on a
+              // cascade / self-escalation attempt or a nested side call, so a
+              // bare pool's route lines keep their pre-0.6.0 shape — and it is
+              // what lets `watchme report --feed-routing` fold one delayed
+              // quality onto EACH stage instead of the turn's first route.
+              const routeStage = turnAttributionOverride.stage ?? opts.modelStage;
+              const routeStrategy = turnAttributionOverride.strategy;
               const routeAttribution = {
+                ...(routeStage !== undefined ? { stage: routeStage } : {}),
+                ...(routeStrategy !== undefined ? { strategy: routeStrategy } : {}),
                 ...(poolPlan.profile !== undefined ? { profile: poolPlan.profile } : {}),
                 ...(poolPlan.fromPool ? { toolsetFingerprint: poolPlan.toolsetFingerprint } : {}),
                 eligible: pre.eligible,
@@ -8514,6 +8536,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         forceReason,
         role: "escalation",
         stage: "escalate",
+        strategy: "cascade",
         defer,
         ...(fallible ? { fallible } : {}),
       });
@@ -8596,7 +8619,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         : await runOneTurn(
             messages,
             cascade !== undefined
-              ? { role: "draft", stage: "draft", defer: true }
+              ? { role: "draft", stage: "draft", strategy: "cascade", defer: true }
               : deferForGrade
                 ? { defer: true }
                 : {},

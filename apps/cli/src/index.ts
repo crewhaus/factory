@@ -1257,7 +1257,7 @@ import {
   buildRightSizeReport,
   enumerateSlotCandidates,
 } from "./right-size";
-import { runRoute } from "./route";
+import { runRouteCommand } from "./route";
 // v0.3.0 Goal 6 — canonical terminal-failure rendering: die() and the
 // `crewhaus run` failure path both route through renderCliFailure so a
 // RunFailedError prints its structured report + coded exit while every
@@ -22040,10 +22040,14 @@ switch (subcommand) {
     break;
   }
   case "route":
-    // Adaptive model routing — inspect/reset/freeze the reward scoreboard.
-    // `runRoute` throws a plain Error on a bad argument; surface it through die().
+    // Adaptive model routing — inspect/reset/freeze the reward scoreboard,
+    // and (0.6.0 §6.3) promote the observe-only lanes into live arms.
+    // `runRouteCommand` throws a plain Error on a bad argument; surface it
+    // through die().
     try {
-      process.stdout.write(`${runRoute(rest)}\n`);
+      const outcome = await runRouteCommand(rest);
+      process.stdout.write(`${outcome.text}\n`);
+      if (outcome.exitCode !== 0) process.exit(outcome.exitCode);
     } catch (err) {
       if (err instanceof Error) die(err.message);
       throw err;

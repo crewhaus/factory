@@ -3,7 +3,18 @@
  *
  * Route decisions (durable `model_route` lines) and delayed quality scores
  * (phase-2 judgments or normalized ratings) meet per `(sessionId, turnNumber)`;
- * the model on the decision names the arm. Emitted rows carry SHADOW routeKeys
+ * the PROFILE on the decision names the arm when the candidate is a `models:`
+ * profile, else its spec model string — the same arm id the live scoreboard
+ * keys on (§7.9), so a profiled roster's arms are reachable from the join.
+ *
+ * 0.6.0 §7.9 — the join is PER STAGE, not per turn. A hybrid turn makes
+ * several routed decisions (a cascade drafts on the cheap arm, then escalates
+ * to the strong one), and each carries a `stage` on its durable line. Folding
+ * the turn's one delayed quality onto every stage is the same one-quality-to-
+ * N-decisions fan-out the in-loop path performs at the strategy-turn boundary;
+ * keeping only the FIRST decision, as this join used to, credited the whole
+ * turn to the drafting arm and made the escalation invisible. Emitted rows
+ * carry SHADOW routeKeys
  * — `"q:" + originalRouteKey` — a namespace the runtime router never mints or
  * reads, so recording them observes routing quality without steering it.
  * Rewards are computed by the CALLER via routing-store's `computeReward` with
@@ -23,7 +34,14 @@ export type RouteDecision = {
   sessionId: string;
   turnNumber: number;
   routeKey: string;
+  /** The scoreboard ARM id: the `models:` profile name, else the spec model string. */
   model: string;
+  /**
+   * 0.6.0 §7.9 — the hybrid stage this decision served (`"draft"`,
+   * `"escalate"`, …). Absent on an unstaged turn (every pre-0.6.0 line and
+   * every plain pooled turn), which is exactly one decision per turn.
+   */
+  stage?: string;
   latencyMs?: number;
   costUsd?: number;
   success: boolean;
@@ -40,7 +58,14 @@ export type TurnQuality = {
 export type QualityArmRow = {
   routeKey: string;
   model: string;
-  obs: { success: boolean; latencyMs: number; costUsd?: number; quality: number };
+  obs: {
+    success: boolean;
+    latencyMs: number;
+    costUsd?: number;
+    quality: number;
+    /** Carried onto the `v:2` line so a promoted observation says which stage produced it. */
+    stage?: string;
+  };
 };
 
 /** The offline quality lane prefix (its runtime twin is `shadow:`, see above). */
@@ -53,7 +78,9 @@ const clamp01 = (x: number): number => Math.min(1, Math.max(0, x));
  * Join route decisions to quality scores per `(sessionId, turnNumber)`.
  * Decisions without a quality score are dropped (nothing to learn from);
  * multiple scores for the same turn (a rating AND a judgment) average.
- * Row order follows `decisions` order.
+ * Row order follows `decisions` order — ONE ROW PER DECISION, so a hybrid
+ * turn's stages each get their own row (the caller decides which decisions
+ * to feed; this function never collapses them).
  */
 export function joinQualityToArms(
   decisions: ReadonlyArray<RouteDecision>,
@@ -77,6 +104,7 @@ export function joinQualityToArms(
       quality: clamp01(acc.sum / acc.n),
     };
     if (d.costUsd !== undefined) obs.costUsd = d.costUsd;
+    if (d.stage !== undefined) obs.stage = d.stage;
     rows.push({ routeKey: `${SHADOW_PREFIX}${d.routeKey}`, model: d.model, obs });
   }
   return rows;

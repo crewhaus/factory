@@ -26,6 +26,15 @@ export {
   type ScoreReader,
 } from "./scoreboard.js";
 export {
+  PROMOTED_FROM,
+  PROMOTED_MARKER,
+  type LanePromotion,
+  type PromoteOptions,
+  type PromoteResult,
+  liveRouteKeyOf,
+  promoteLanes,
+} from "./promote.js";
+export {
   ROUTE_FREEZE_FILE,
   type RouteFreeze,
   type WriteRouteFreezeOptions,

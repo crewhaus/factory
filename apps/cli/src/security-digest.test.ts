@@ -317,6 +317,31 @@ describe("buildSecurityDigest — audit rollup", () => {
     expect(DECLARED_AUDIT_KINDS).toContain("slo_mitigation");
   });
 
+  // 0.6.0 §6.3 / §9.1 — `crewhaus route promote`'s `routing_promotion` kind is
+  // a CLOSED-union member, so it needs registration here as well as in the
+  // package: a promotion changes which model serves, and the digest is where
+  // an operator sees that one happened.
+  test("a routing_promotion audit record is counted and not reported absent", async () => {
+    await seedAudit([
+      {
+        kind: "routing_promotion",
+        payload: {
+          rootDir: ".crewhaus",
+          lanes: [{ from: "shadow:hard", to: "hard", model: "strong", lines: 4, observations: 4 }],
+          lines: 4,
+          alreadyPromoted: 0,
+          dryRun: false,
+          gate: { passed: true, specName: "support", candidateRunId: "run_new" },
+        },
+        atMs: NOW - MS_PER_DAY,
+      },
+    ]);
+    const d = buildSecurityDigest({ rootDir: root, window: window(7), now: () => NOW });
+    expect(d.audit.countsByKind).toEqual({ routing_promotion: 1 });
+    expect(d.audit.absentDeclaredKinds).not.toContain("routing_promotion");
+    expect(DECLARED_AUDIT_KINDS).toContain("routing_promotion");
+  });
+
   test("F1 defense in depth: control chars in audit payload strings are stripped and clamped", async () => {
     await seedAudit([
       {

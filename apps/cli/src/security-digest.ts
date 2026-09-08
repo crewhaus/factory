@@ -125,6 +125,7 @@ export const DECLARED_AUDIT_KINDS = [
   "governance_proposal",
   "alert_raised",
   "slo_mitigation",
+  "routing_promotion",
 ] as const satisfies ReadonlyArray<AuditKind>;
 
 /** Thrown by `parseSinceFlag` on an unparseable `--since`. The CLI entry
