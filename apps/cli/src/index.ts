@@ -1841,13 +1841,14 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "  (informational — reaction feedback attributes to the exact turn\n" +
         "  only once the outbound-ts join file accumulates), and the 0.6.0\n" +
         "  model-plan-* / model-sunset / model-capabilities-unknown /\n" +
-        "  model-strongest-crosses-provider notices (a model slot the\n" +
-        "  shape, slot or current runtime cannot honour, or a model fact\n" +
-        "  worth knowing).\n" +
+        "  model-strongest-crosses-provider notices (a `models:` profile\n" +
+        "  field the shape or the slot does not serve — model-plan-\n" +
+        "  candidate-only names the ones a model_pool candidate serves —\n" +
+        "  or a model fact worth knowing).\n" +
         "  --strict   Escalate compile warnings to errors: any remediable\n" +
         "             warning fails the compile (exit 1) before files are\n" +
         "             written. Informational codes (channel-reactions-join,\n" +
-        "             cli-autodistill-toolchain, model-plan-pending-runtime,\n" +
+        "             cli-autodistill-toolchain, model-plan-candidate-only,\n" +
         "             model-capabilities-unknown, model-sunset,\n" +
         "             model-strongest-crosses-provider) still print but\n" +
         "             never fail --strict. (The FR-002 scope\n" +
@@ -2082,11 +2083,12 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // would be deleting a working spec key. The heads-up says which half of the
   // block a compiled bundle carries; it must never fail a strict compile.
   //
-  // 0.6.0 PR 7 — four model-plan codes are informational for the same reason:
-  // model-plan-pending-runtime fires on a key the 0.6.0 plan tells authors to
-  // adopt (its runtime consumer lands in a later PR-train row, so the only
-  // "fix" is deleting it); model-capabilities-unknown fires on any model the
-  // offline table does not know (a local / new model is not a spec defect);
+  // 0.6.0 — four model-plan codes are informational for the same reason:
+  // model-plan-candidate-only fires on a `models:` profile field that a
+  // model_pool CANDIDATE serves and a single-model slot does not (§4.2), so
+  // the spec is legal and the "fix" — moving the profile into a pool — is a
+  // topology change, not a defect repair; model-capabilities-unknown fires on
+  // any model the offline table does not know (a local / new model is not a spec defect);
   // model-strongest-crosses-provider is a heads-up about a second credential,
   // not a defect; and model-sunset is a wall-clock notice that would make a
   // 0.5.x pool that compiled under --strict yesterday fail today (past
@@ -2094,7 +2096,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   const INFORMATIONAL_WARNING_CODES = new Set([
     "channel-reactions-join",
     "cli-autodistill-toolchain",
-    "model-plan-pending-runtime",
+    "model-plan-candidate-only",
     "model-capabilities-unknown",
     "model-strongest-crosses-provider",
     "model-sunset",

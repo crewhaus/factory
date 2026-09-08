@@ -602,20 +602,18 @@ describe("crewhaus compile", () => {
     expect(existsSync(join(outDir, "session-router.ts"))).toBe(true);
   });
 
-  // 0.6.0 PR 7 — the model-plan notices that no spec edit can properly clear
-  // are informational too: model-plan-pending-runtime fires on a key the plan
-  // tells authors to adopt whose runtime lands in a later PR-train row, and
-  // model-sunset is a wall-clock notice on a 0.5.x pool that compiled under
-  // --strict yesterday. Both print; neither fails --strict.
+  // 0.6.0 — the model-plan notices that no spec edit can properly clear are
+  // informational too: model-plan-candidate-only fires on a `models:` profile
+  // field that only a model_pool CANDIDATE serves, and model-sunset is a
+  // wall-clock notice on a 0.5.x pool that compiled under --strict yesterday.
+  // Both print; neither fails --strict.
   //
-  // The pending key has moved three times as the train landed: PR 10
-  // honoured a candidate's failover chain, PR 9e wired `strategy.guide` (and
-  // the whole closure family) into the compiled cli bundle, and PR 13b wired
-  // the §6.2 judge panel and the §4.2 auxiliary-slot params. What genuinely
-  // still pends is a `models:` profile's SINGLE-SLOT narrowing knobs —
-  // `caching` (and `limits.model_call_timeout_ms`) on a serving slot that
-  // routes no pool, because the IR has no per-candidate plan carrier there.
-  test("compile --strict does NOT escalate the informational model-plan-pending-runtime / model-sunset notices", async () => {
+  // `caching` (and `limits.model_call_timeout_ms`) on a slot that routes no
+  // pool is the canonical candidate-only pair: §4.2 gives a single-model slot
+  // the profile's request params, provenance and overlay and nothing else, so
+  // the notice states a DESIGN boundary — it promises no later row, and the
+  // remediation it names is declaring the profile as a pool candidate.
+  test("compile --strict does NOT escalate the informational model-plan-candidate-only / model-sunset notices", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
     writeFileSync(
       specPath,
@@ -644,8 +642,13 @@ describe("crewhaus compile", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toContain(
-      "crewhaus: warning[model-plan-pending-runtime] models.primary.caching:",
+      "crewhaus: warning[model-plan-candidate-only] models.primary.caching:",
     );
+    // The message states the design and names the fix; it never promises a
+    // later row (the 0.6.0 train is complete).
+    expect(result.stderr).toContain("Name the profile as a model_pool candidate");
+    expect(result.stderr).not.toContain("0.6.0 row");
+    expect(result.stderr).not.toContain("until then it is inert");
     // PR 10 honours the candidate's failover chain, PR 9e constructs the
     // guide side call in the compiled cli bundle, and PR 13b grades through
     // `createJudgeGrader`: none of the three pends any more.
@@ -689,6 +692,10 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("accepted-but-unwired");
     expect(result.stdout).toContain("warning[<code>] <path>: <message>");
+    // The informational list names the candidate-only code, not the retired
+    // pending-runtime one.
+    expect(result.stdout).toContain("model-plan-candidate-only");
+    expect(result.stdout).not.toContain("model-plan-pending-runtime");
     expect(result.stdout).toContain("--strict");
     expect(result.stdout).toContain("Escalate compile warnings to errors");
   });
