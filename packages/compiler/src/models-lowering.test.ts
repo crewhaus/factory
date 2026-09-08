@@ -172,7 +172,7 @@ describe("$profile on the serving agent slot (agent-full)", () => {
     expect("thinking" in ir.agent).toBe(false);
   });
 
-  test("a profile temperature lands on the slot; a slot temperature is reported pending (PR 9a)", () => {
+  test("a profile temperature lands on the slot, and nothing about it is dropped", () => {
     const { ir, warnings } = lowerWithWarnings(
       parseSpec(
         cli(
@@ -188,10 +188,10 @@ describe("$profile on the serving agent slot (agent-full)", () => {
     if (ir.target !== "cli") throw new Error("unexpected target");
     expect(ir.agent.temperature).toBe(0.7);
     expect(ir.agent.maxTokens).toBe(512);
-    // PR 9a — the runtime request build applies the slot temperature, so it
-    // no longer pends (nothing else on this spec does either).
-    const pending = warnings.filter((w) => w.code === "model-plan-pending-runtime");
-    expect(pending).toEqual([]);
+    // The runtime request build applies the slot temperature, so nothing on
+    // this spec is dropped as a candidate-only setting.
+    const candidateOnly = warnings.filter((w) => w.code === "model-plan-candidate-only");
+    expect(candidateOnly).toEqual([]);
   });
 
   test("the profile's failover chain is ignored (field-precise) when the slot routes itself", () => {
@@ -220,7 +220,7 @@ describe("$profile on the serving agent slot (agent-full)", () => {
     expect(ignored[0]?.message).toContain("declares its own model_pool");
   });
 
-  test("the narrowing knobs (limits / caching) on a serving slot are reported pending, never dropped silently", () => {
+  test("the per-candidate knobs (limits / caching) on a serving slot are reported candidate-only, never dropped silently", () => {
     const { warnings } = lowerWithWarnings(
       parseSpec(cli(...REGISTRY, "agent:", "  model: $fast", "  instructions: i")),
       opts,
@@ -230,12 +230,55 @@ describe("$profile on the serving agent slot (agent-full)", () => {
       "models.fast.limits.model_call_timeout_ms",
     ]);
     for (const w of warnings) {
-      expect(w.code).toBe("model-plan-pending-runtime");
-      // PR 9a honours these on a POOL CANDIDATE; a single-model serving slot
-      // has no per-candidate plan carrier in the IR yet.
+      expect(w.code).toBe("model-plan-candidate-only");
+      // The PROFILE's copy of these is served out of the per-candidate plan
+      // built from the pool blob — a design boundary (§4.2), so the message
+      // states what a single-model slot DOES carry and names the
+      // pool-candidate route as a fix. It must promise no later row.
       expect(w.message).toContain("single-model serving slot");
-      expect(w.message).toContain("model_pool candidate");
+      expect(w.message).toContain("the profile as a model_pool candidate");
+      expect(w.message).not.toContain("0.6.0 row");
+      expect(w.message).not.toContain("until then it is inert");
+      expect(w.message).not.toContain("yet");
+      // What the sentence claims a bare slot DOES carry has to match
+      // `applyProfileToSlot`: it folds the profile's failover chain onto an
+      // agent-full slot too, so "params, provenance and overlay and nothing
+      // else" would be false here.
+      expect(w.message).toContain("its failover chain");
+      expect(w.message).not.toContain("nothing else");
     }
+  });
+
+  test("the timeout notice names the top-level `limits:` block, which a bare slot DOES honour", () => {
+    // `limits.model_call_timeout_ms` is the one candidate-only field with a
+    // second declaration site: the spec's top-level `limits:` block lowers
+    // onto a single-model slot and reaches the model call. Telling the author
+    // to restructure into a `model_pool` when a one-line key serves the field
+    // today would be the same defect this notice class exists to avoid, so
+    // the two fields carry DIFFERENT remediations.
+    const { ir, warnings } = lowerWithWarnings(
+      parseSpec(
+        cli(
+          ...REGISTRY,
+          "limits: { model_call_timeout_ms: 30000 }",
+          "agent:",
+          "  model: $fast",
+          "  instructions: i",
+        ),
+      ),
+      opts,
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.limits?.modelCallTimeoutMs).toBe(30000);
+    const byPath = new Map(warnings.map((w) => [w.path, w.message] as const));
+    const timeout = byPath.get("models.fast.limits.model_call_timeout_ms") ?? "";
+    const caching = byPath.get("models.fast.caching") ?? "";
+    expect(timeout).toContain("top-level limits: block");
+    expect(timeout).toContain("a single-model slot honours it there");
+    expect(timeout).toContain("model_pool candidate for a per-candidate one");
+    // `caching` has no shape-level home, so it keeps the pool-only sentence.
+    expect(caching).toContain("Name the profile as a model_pool candidate to have it served");
+    expect(caching).not.toContain("top-level limits:");
   });
 
   test("an unknown $ref is a CompilerError with a did-you-mean even when lower() is fed a hand-built spec", () => {
@@ -478,18 +521,18 @@ describe("$profile / sentinels on every auxiliary slot (the six that bypassed re
     expect(warnings.map((w) => w.path)).not.toContain("models.checker.tools");
     // 0.6.0 PR 13b — every one of those aux consumers READS the pinned params
     // now (judge / compaction / degrade / security / watchme / grounding), so
-    // the landing promise is gone: no pending-runtime warning survives.
+    // no notice claims a param is dropped.
     expect(
       warnings.filter(
         (w) =>
-          w.code === "model-plan-pending-runtime" && w.message.includes("pinned request params"),
+          w.code === "model-plan-candidate-only" && w.message.includes("pinned request params"),
       ),
     ).toEqual([]);
-    // What still pends is the SINGLE-SLOT row (a serving slot has no
-    // per-candidate plan carrier), never an auxiliary slot's params.
+    // The only candidate-only notices name a SERVING slot's per-candidate
+    // knobs, never an auxiliary slot's params.
     expect(
       warnings
-        .filter((w) => w.code === "model-plan-pending-runtime")
+        .filter((w) => w.code === "model-plan-candidate-only")
         .every((w) => w.message.includes("single-model serving slot")),
     ).toBe(true);
   });
@@ -585,7 +628,7 @@ describe("$profile / sentinels on every auxiliary slot (the six that bypassed re
     });
     // 0.6.0 PR 13b — the gate's `__judgeGate` goes through
     // `createJudgeGrader`, so the panel knobs no longer pend.
-    expect(codes(warnings)).not.toContain("model-plan-pending-runtime");
+    expect(codes(warnings)).not.toContain("model-plan-candidate-only");
   });
 
   test("crew routing.model lowers and the llm router runs on it", () => {
@@ -665,7 +708,7 @@ describe("$profile / sentinels on every auxiliary slot (the six that bypassed re
     // PR 9a — the per-candidate settings the plan table honours lower
     // silently; PR 10 consumed the candidate's failover chain / breaker, so
     // nothing on a candidate pends any more.
-    const pending = warnings.filter((w) => w.code === "model-plan-pending-runtime");
+    const pending = warnings.filter((w) => w.code === "model-plan-candidate-only");
     expect(pending.map((w) => w.path)).toEqual([]);
 
     // The role literal carries the widened pool verbatim (what the
@@ -973,7 +1016,7 @@ describe("model_pool candidates carry the merged profile (key order is the byte 
     // PR 9a — the plan table honours thinking / max_tokens / limits /
     // instructions / caching per candidate; PR 10 consumed the per-candidate
     // failover chain and breaker, so nothing on a candidate pends.
-    const pending = warnings.filter((w) => w.code === "model-plan-pending-runtime");
+    const pending = warnings.filter((w) => w.code === "model-plan-candidate-only");
     expect(pending.map((w) => w.path)).toEqual([]);
     // The compiled blob carries it all — every emitter writes the pool verbatim.
     const agentTs =
@@ -1070,7 +1113,7 @@ describe("model_pool candidates carry the merged profile (key order is the byte 
       resetOnProfileChange: true,
     });
     const pendingPaths = warnings
-      .filter((w) => w.code === "model-plan-pending-runtime")
+      .filter((w) => w.code === "model-plan-candidate-only")
       .map((w) => w.path);
     // PR 9b consumes `directives` and `rules` straight off the blob on BOTH
     // paths; PR 9c consumes `strategy.cascade` + `max_escalations`; PR 10
@@ -1183,7 +1226,7 @@ describe("graph nodes and sub-agents gain routing (§7.7)", () => {
     ]);
     // The spawner consumes every one of these keys now: no pending warning.
     const pending = warnings.filter(
-      (w) => w.code === "model-plan-pending-runtime" && w.path.startsWith("agent.sub_agents."),
+      (w) => w.code === "model-plan-candidate-only" && w.path.startsWith("agent.sub_agents."),
     );
     expect(pending).toEqual([]);
     // …and the emitted bundle carries them into the `__subAgents` literal.
@@ -1511,5 +1554,89 @@ describe("absent config is byte-identical (design stance 3)", () => {
 
   test("the spec surface parses every fixture above (a parse issue would mask a lowering hole)", () => {
     for (const yaml of SHAPES) expect(parseSpecIssues(yaml)).toEqual([]);
+  });
+});
+
+/**
+ * The 0.6.0 PR train is complete, so no model-plan notice may promise a
+ * further row. What a slot does not serve, it does not serve BY DESIGN — the
+ * sentence has to say which fact holds and name the route that does serve the
+ * field (a `model_pool` candidate), rather than tell an author to wait.
+ */
+describe("model-plan notices state the design, never a pending row", () => {
+  const DEFERRED =
+    /later 0\.6\.0 row|lands with 0\.6\.0|until then it is inert|does not honour it yet|does not enforce it yet|PR-train row/;
+
+  // One spec per notice class: a serving slot that routes no pool (the
+  // candidate-only pair), an auxiliary slot (ignored-on-slot), and a shape
+  // with no tool catalog (ignored-on-shape).
+  const NOTICING: ReadonlyArray<readonly [string, string]> = [
+    [
+      "a serving slot referencing a profile with per-candidate knobs",
+      cli(...REGISTRY, "agent:", "  model: $fast", "  instructions: i"),
+    ],
+    [
+      "an auxiliary slot referencing a narrowing profile",
+      cli(
+        "models:",
+        "  checker: { model: claude-sonnet-4-6, permissions: { deny: ['Bash(*)'] } }",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: i",
+        "compaction: { model: $checker }",
+      ),
+    ],
+    [
+      "a tool-less shape referencing a profile that narrows tools",
+      [
+        "name: v",
+        "target: voice",
+        "models:",
+        "  fast: { model: claude-haiku-4-5, tools: [] }",
+        "agent: { model: $fast, instructions: i }",
+        "voice: { provider: openai }",
+      ].join("\n"),
+    ],
+  ];
+
+  for (const [name, yaml] of NOTICING) {
+    test(`${name}: every notice is a design statement`, () => {
+      const { warnings } = compile(yaml, opts);
+      expect(warnings.filter((w) => w.code.startsWith("model-plan-")).length).toBeGreaterThan(0);
+      for (const w of warnings) expect(w.message).not.toMatch(DEFERRED);
+    });
+  }
+
+  test("the candidate-only notice names the pool-candidate route as the fix", () => {
+    const { warnings } = compile(
+      cli(...REGISTRY, "agent:", "  model: $fast", "  instructions: i"),
+      opts,
+    );
+    const candidateOnly = warnings.filter((w) => w.code === "model-plan-candidate-only");
+    expect(candidateOnly.map((w) => w.path).sort()).toEqual([
+      "models.fast.caching",
+      "models.fast.limits.model_call_timeout_ms",
+    ]);
+    for (const w of candidateOnly) {
+      expect(w.message).toContain("model_pool candidate setting");
+      expect(w.message).toContain("the profile as a model_pool candidate");
+    }
+  });
+
+  test("the same profile as a POOL CANDIDATE compiles clean — the notice's remediation works", () => {
+    const { warnings } = compile(
+      cli(
+        ...REGISTRY,
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: i",
+        "  model_pool:",
+        "    candidates:",
+        "      - { model: $fast }",
+        "      - { model: $strong }",
+      ),
+      opts,
+    );
+    expect(warnings.filter((w) => w.code === "model-plan-candidate-only")).toEqual([]);
   });
 });

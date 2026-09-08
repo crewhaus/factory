@@ -84,9 +84,9 @@ const pipeline = (strategy: string): string =>
     "    - { id: d1, text: hello }",
   ].join("\n");
 
-const pendingPaths = (yaml: string) =>
+const candidateOnlyPaths = (yaml: string) =>
   compile(yaml)
-    .warnings.filter((w) => w.code === "model-plan-pending-runtime")
+    .warnings.filter((w) => w.code === "model-plan-candidate-only")
     .map((w) => w.path);
 
 const agentOf = (yaml: string) =>
@@ -96,7 +96,7 @@ describe("the closure-shaped pool keys reach the wired targets' bundles (PR 9e)"
   test("a workflow step committee: no pending warning, the bundle constructs it via wireHybrid", () => {
     const yaml = workflow("{ committee: { members: [cheap, strong], judge: claude-opus-4-8 } }");
     expect(parseSpecIssues(yaml)).toEqual([]);
-    expect(pendingPaths(yaml)).toEqual([]);
+    expect(candidateOnlyPaths(yaml)).toEqual([]);
     const agent = agentOf(yaml);
     expect(agent).toContain('import { wireHybrid } from "@crewhaus/model-service";');
     expect(agent).toContain("...wireHybrid({");
@@ -108,7 +108,7 @@ describe("the closure-shaped pool keys reach the wired targets' bundles (PR 9e)"
     const yaml = workflow(
       "{ guide: { model: claude-opus-4-8, every: first_turn }, shadow: { candidate: claude-opus-4-8, sample_rate: 0.2 } }",
     );
-    expect(pendingPaths(yaml)).toEqual([]);
+    expect(candidateOnlyPaths(yaml)).toEqual([]);
     expect(agentOf(yaml)).toContain("wireHybrid");
   });
 
@@ -132,7 +132,7 @@ describe("the closure-shaped pool keys reach the wired targets' bundles (PR 9e)"
     const yaml = cli(
       "{ guide: { model: claude-opus-4-8 }, shadow: { candidate: claude-opus-4-8 }, model_directed: true }",
     );
-    expect(pendingPaths(yaml)).toEqual([]);
+    expect(candidateOnlyPaths(yaml)).toEqual([]);
     const agent = agentOf(yaml);
     expect(agent).toContain('import { wireHybrid } from "@crewhaus/model-service";');
     expect(agent).toContain("...wireHybrid({");
@@ -142,12 +142,12 @@ describe("the closure-shaped pool keys reach the wired targets' bundles (PR 9e)"
     const yaml = workflow(
       "{ cascade: { draft: cheap, escalate_to: strong }, guide: { model: claude-opus-4-8 } }",
     );
-    expect(pendingPaths(yaml)).toEqual([]);
+    expect(candidateOnlyPaths(yaml)).toEqual([]);
   });
 
   test("PR 9f: the last four pool-bearing shapes wire it too — nothing pends", () => {
     const yaml = research("{ guide: { model: claude-opus-4-8 }, model_directed: true }");
-    expect(pendingPaths(yaml)).toEqual([]);
+    expect(candidateOnlyPaths(yaml)).toEqual([]);
     expect(compile(yaml).warnings.filter((w) => w.code === "model-plan-ignored-on-shape")).toEqual(
       [],
     );
@@ -160,7 +160,7 @@ describe("the closure-shaped pool keys reach the wired targets' bundles (PR 9e)"
   test("the ONE §11.3 `—` cell: pipeline declines Consult / Escalate, precisely", () => {
     const yaml = pipeline("{ guide: { model: claude-opus-4-8 }, model_directed: true }");
     // Not a deferred row — no later PR changes it — so it is not `pending`.
-    expect(pendingPaths(yaml)).toEqual([]);
+    expect(candidateOnlyPaths(yaml)).toEqual([]);
     const ignored = compile(yaml).warnings.filter((w) => w.code === "model-plan-ignored-on-shape");
     expect(ignored.map((w) => w.path)).toEqual(["agent.model_pool.strategy.model_directed"]);
     const message = ignored[0]?.message ?? "";

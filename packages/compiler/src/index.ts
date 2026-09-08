@@ -211,15 +211,16 @@ export type LowerOptions = {
   /** See {@link CompileOptions.today}. */
   readonly today?: string;
   /**
-   * 0.6.0 PR 7 — lower the keys whose runtime consumer has not landed
-   * instead of refusing them: a NARROWING profile (`tools` / `tool_config` /
-   * `permissions` / `rate_limits` / `cost`) referenced from a SINGLE-MODEL
-   * serving slot (no IR carrier yet — a `model_pool` candidate honours the
-   * same knobs since PR 9a) and `mcp_servers.<n>.tool_flags`. (PR 9c removed
-   * `evaluation.on_fail: escalate` and `judge.escalate_to` from the refused
-   * set — the cascade re-run consumes both.) `compile()` and the `crewhaus
-   * run` interpreter never set this. Tests and IR-level tooling set it to
-   * exercise the lowering the runtime will consume.
+   * 0.6.0 — accept the keys `compile()` refuses instead of throwing on them:
+   * a NARROWING profile (`tools` / `tool_config` / `permissions` /
+   * `rate_limits` / `cost`) referenced from a SINGLE-MODEL serving slot,
+   * which is a `model_pool` CANDIDATE setting by design (§4.2) and is
+   * reported `model-plan-candidate-only` here rather than refused, and
+   * `mcp_servers.<n>.tool_flags`, which 0.6.0 does not lower at all. The name
+   * is historical — it dates from the PR train, when both classes were
+   * waiting on a runtime consumer. `compile()` and the `crewhaus run`
+   * interpreter never set this; tests and IR-level tooling set it to inspect
+   * the lowering.
    */
   readonly allowRuntimePendingKeys?: boolean;
 };
@@ -231,7 +232,7 @@ export type LowerOptions = {
  * `"channel-reactions-join"`, `"cli-autodistill-toolchain"`,
  * `"managed-feedback-unsupported"`, `"budget-degrade-outside-pool"`, and from
  * 0.6.0 the field-precise model-plan notices `"model-plan-ignored-on-shape"`,
- * `"model-plan-ignored-on-slot"`, `"model-plan-pending-runtime"`,
+ * `"model-plan-ignored-on-slot"`, `"model-plan-candidate-only"`,
  * `"model-plan-self-judge"`, `"model-sunset"`, `"model-capabilities-unknown"`,
  * `"model-strongest-crosses-provider"`), `path` the spec key it concerns
  * (dot-joined), `message` the human explanation. Additive: every existing
@@ -1152,28 +1153,41 @@ function lowerCompaction(spec: SpecWithPermissions, ctx: LowerContext): IrCompac
 //     (voice registers no tool catalog, pipeline has no thinking, …);
 //   - `model-plan-ignored-on-slot`   — the field is pool-candidate / primary
 //     semantics and has no meaning on this slot (a judge, a tier, a fallback);
-//   - `model-plan-pending-runtime`   — lowered into the IR, but the runtime
-//     consumer lands with a later 0.6.0 PR-train row; inert until then. The
-//     landing PR deletes the row, exactly the ACCEPTED_BUT_UNWIRED
-//     delete-when-wired contract applied at field level.
+//   - `model-plan-candidate-only`    — the PROFILE's copy of the field is
+//     served out of the PER-CANDIDATE PLAN runtime-core builds from the
+//     `model_pool` blob at boot, so it reaches a model call when the profile
+//     is a pool candidate and never from a bare single-model slot (`caching`,
+//     `limits.model_call_timeout_ms`). A design boundary (§4.2), not a
+//     deferred row — informational, never fails `--strict`. The remediation
+//     is PER FIELD, because a field can have a second declaration site that a
+//     bare slot does honour: `caching` has none, so naming the profile as a
+//     `model_pool` candidate is the only route; a per-call ceiling also has a
+//     shape-level home in the spec's top-level `limits:` block (lowered by
+//     {@link lowerLimits} into `runChatLoop({ modelCallTimeoutMs })`, which
+//     runtime-core reads as the fallback under a serving plan's own value),
+//     so that notice names the top-level block FIRST and the pool candidate
+//     as the way to get a per-candidate ceiling.
 //
-// One class is REFUSED rather than warned until its runtime lands: the
+// One class is REFUSED rather than warned, and this too is by design: the
 // NARROWING knobs (`tools` / `tool_config` / `permissions` / `rate_limits` /
-// `cost`) of a profile referenced from a SINGLE-MODEL serving slot — the IR
-// has no per-candidate plan carrier for a slot that routes no pool, so the
-// runtime could not honour them and accepting them would serve a profile
-// declared `tools: []` with the full toolset. The same knobs on a
-// `model_pool` CANDIDATE (inline or inherited from a `$profile`) lower and
-// compile through since PR 9a: runtime-core builds a per-candidate plan
-// (subset advertisement + dispatch gate, narrowed permissions, rate buckets,
-// per-call tool_config, spend cap) from the pool blob at boot. PR 9c landed
-// the cascade: `evaluation.on_fail: escalate` (with its resolved
-// `escalateTo`), `strategy.cascade`, `strategy.max_escalations` and
-// `judge.escalate_to` compile through and are consumed by runtime-core's
-// `runEvaluatedTurn` / the workflow and graph retry closures.
-// `LowerOptions.allowRuntimePendingKeys` lowers the refused keys anyway
-// (tests, IR tooling); `compile()` never sets it. `mcp_servers.<n>.tool_flags`
-// has no PR-train row for its IR + emit half yet and stays refused too.
+// `cost`) of a profile referenced from a SINGLE-MODEL serving slot. §4.2
+// gives a single-model slot the profile's request params its shape can honour
+// (`model`, `thinking`, `maxTokens`, `temperature`), a provenance-only
+// `modelProfile` name, its failover chain (`fallbacks` / `circuit_breaker`,
+// on a serving slot that routes nothing of its own) and a folded
+// `instructions` overlay — there is no per-candidate plan
+// carrier for a slot that routes no pool, so accepting a profile declared
+// `tools: []` behind `agent.model: $fast` would serve with the shape's full
+// toolset. The refusal is loud rather than silent for exactly that reason.
+// The same knobs on a `model_pool` CANDIDATE (inline or inherited from a
+// `$profile`) lower and compile through: runtime-core builds a per-candidate
+// plan (subset advertisement + dispatch gate, narrowed permissions, rate
+// buckets, per-call tool_config, spend cap) from the pool blob at boot — that
+// is the supported route, and the refusal names it.
+// `LowerOptions.allowRuntimePendingKeys` downgrades the refusal to the
+// `model-plan-candidate-only` warning (tests, IR tooling); `compile()` never
+// sets it. `mcp_servers.<n>.tool_flags` is the one genuinely unlowered key:
+// 0.6.0 ships no IR + emit wiring for it, so it stays refused too.
 // ---------------------------------------------------------------------------
 
 type LooseBlock = Readonly<Record<string, unknown>>;
@@ -1185,12 +1199,39 @@ function asLooseBlock(value: unknown): LooseBlock | undefined {
 }
 
 /**
- * 0.6.0 PR 9a — the per-candidate plan table honours a pool CANDIDATE's
- * settings; a profile's narrowing knobs on a single-model serving slot have
- * no IR carrier and wait for a later row.
+ * 0.6.0 §4.2 — the design boundary a single-model slot draws. A serving slot
+ * that routes no pool takes the profile's request params its shape can honour,
+ * its `modelProfile` provenance, its failover chain and circuit breaker, and
+ * its folded `instructions` overlay. What it does not take is the profile's
+ * PER-CANDIDATE knobs (`caching`, `limits.model_call_timeout_ms`, and the
+ * narrowing set): those are served out of the plan runtime-core builds from
+ * the `model_pool` blob, so the profile has to be a pool CANDIDATE for THAT
+ * copy of the field to reach a model call. Not a pending row: no later row
+ * changes this, and the sentence says so.
+ *
+ * The sentence is deliberately about the PROFILE's copy and says nothing about
+ * a field's other declaration sites — a per-call ceiling also lives in the
+ * spec's top-level `limits:` block, which a bare slot does honour. Those are
+ * per-field, so each notice carries its own remediation (see `candidateOnly`);
+ * this constant carries only the part that is true of every one of them.
  */
-const LANDING_SINGLE_SLOT =
-  "a later 0.6.0 row (a single-model serving slot has no per-candidate plan carrier in the IR; the same profile honours it today as a model_pool candidate)";
+const CANDIDATE_ONLY_REASON =
+  "a single-model serving slot carries the profile's request params its shape can honour, its modelProfile provenance, its failover chain and its instructions overlay; a profile's per-candidate settings reach a model call through the plan runtime-core builds out of the model_pool blob";
+/**
+ * The remediation every candidate-only notice can offer: carry the profile
+ * into a pool so runtime-core builds it a per-candidate plan.
+ */
+const CANDIDATE_ONLY_FIX = "Name the profile as a model_pool candidate to have it served";
+/**
+ * `limits.model_call_timeout_ms` is the one candidate-only field with a second
+ * declaration site a BARE slot honours: the spec's top-level `limits:` block
+ * lowers into `runChatLoop({ modelCallTimeoutMs })` and runtime-core reads it
+ * whenever a serving plan carries no ceiling of its own. Naming that route
+ * first keeps the notice actionable — a one-line `limits:` key, rather than a
+ * restructure into a `model_pool` the author may not want.
+ */
+const TIMEOUT_CANDIDATE_ONLY_FIX =
+  "Declare the ceiling in the spec's top-level limits: block — a single-model slot honours it there — or name the profile as a model_pool candidate for a per-candidate one";
 /**
  * 0.6.0 PR 9e/9f — the closure families a compiled bundle constructs at boot
  * through `@crewhaus/model-service`'s `wireHybrid`: `strategy.model_directed`
@@ -1257,16 +1298,16 @@ const INTERPRETER_RUN_TARGETS: ReadonlySet<Spec["target"]> = new Set<Spec["targe
   "browser",
 ]);
 
-function runtimePending(path: string, landing: string, hint?: string): CompilerError {
+function candidateOnlyRefusal(path: string, why: string): CompilerError {
   return new CompilerError(
-    `${path} is accepted by the spec and lowered into the IR, but this runtime does not enforce it yet — it lands with 0.6.0 ${landing}; remove it from the spec for now${hint !== undefined ? ` (${hint})` : ""}`,
+    `${path} is accepted by the spec but is a model_pool candidate setting — ${CANDIDATE_ONLY_REASON}. ${why}`,
   );
 }
 
 /**
- * Throw a path-precise `CompilerError` on the FIRST runtime-pending narrowing
- * key the spec declares; return silently otherwise. Runs once from `lower()`
- * unless `allowRuntimePendingKeys` is set.
+ * Throw a path-precise `CompilerError` on the FIRST key this compiler does not
+ * lower; return silently otherwise. Runs once from `lower()` unless
+ * `allowRuntimePendingKeys` is set.
  */
 function assertNoRuntimePendingKeys(spec: Spec): void {
   const s = spec as unknown as LooseBlock;
@@ -1275,7 +1316,7 @@ function assertNoRuntimePendingKeys(spec: Spec): void {
     for (const [name, raw] of Object.entries(mcpServers)) {
       if (asLooseBlock(raw)?.["tool_flags"] !== undefined) {
         throw new CompilerError(
-          `mcp_servers.${name}.tool_flags is accepted by the spec but not yet lowered by this compiler — its IR and emit wiring (registerMcpServer flags) has no 0.6.0 PR-train row yet; remove it from the spec for now`,
+          `mcp_servers.${name}.tool_flags is accepted by the spec but not lowered by this compiler — 0.6.0 ships no IR + emit wiring for it (registerMcpServer flags); remove it from the spec for now`,
         );
       }
     }
@@ -1887,8 +1928,9 @@ const SHAPE_REASON: Readonly<Partial<Record<Spec["target"], string>>> = {
  * field-by-field; because `temperature` and `thinking` are exclusive on one
  * request, a slot that declares one of the pair drops the profile's other.
  * Every profile field the slot cannot honour is reported field-precisely
- * (see the section header); the narrowing knobs on a serving slot are
- * REFUSED until PR 9a unless `allowRuntimePendingKeys` is set.
+ * (see the section header); the narrowing knobs on a serving slot are REFUSED
+ * by design — a bare slot has no per-candidate plan to enforce them — unless
+ * `allowRuntimePendingKeys` downgrades the refusal to a warning.
  */
 function applyProfileToSlot(
   ref: ResolvedModelRef,
@@ -1924,12 +1966,14 @@ function applyProfileToSlot(
       `${at}.${field}`,
       `${at}.${field} (referenced from ${slotPath}) has no meaning on this slot — ${why}; it is ignored`,
     );
-  const pending = (field: string, landing: string): void =>
+  // The remediation is per field: `caching` is served nowhere but a candidate
+  // plan, while a per-call ceiling has a shape-level home a bare slot honours.
+  const candidateOnly = (field: string, fix: string = CANDIDATE_ONLY_FIX): void =>
     warn(
       ctx,
-      "model-plan-pending-runtime",
+      "model-plan-candidate-only",
       `${at}.${field}`,
-      `${at}.${field} (referenced from ${slotPath}) is lowered but the runtime does not honour it yet — it lands with 0.6.0 ${landing}; until then it is inert`,
+      `${at}.${field} (referenced from ${slotPath}) is a model_pool candidate setting — ${CANDIDATE_ONLY_REASON}, so it is dropped here. ${fix}`,
     );
   const isAgent = kind !== "aux" && kind !== "model-only";
   const honoursThinking = kind === "agent-full";
@@ -1994,17 +2038,17 @@ function applyProfileToSlot(
     }
   }
   if (settings.modelCallTimeoutMs !== undefined) {
-    if (isAgent) pending("limits.model_call_timeout_ms", LANDING_SINGLE_SLOT);
+    if (isAgent) candidateOnly("limits.model_call_timeout_ms", TIMEOUT_CANDIDATE_ONLY_FIX);
     else
       ignoredOnSlot("limits.model_call_timeout_ms", "the per-call timer applies to a serving slot");
   }
   if (settings.caching !== undefined) {
-    if (isAgent) pending("caching", LANDING_SINGLE_SLOT);
+    if (isAgent) candidateOnly("caching");
     else ignoredOnSlot("caching", "prompt-cache markers apply to a serving slot");
   }
-  // The narrowing knobs: refused on a SINGLE-MODEL serving slot (no IR
-  // carrier — a pool candidate honours them, see the section header);
-  // meaningless on an auxiliary / model-only slot (a judge profile's
+  // The narrowing knobs: refused on a SINGLE-MODEL serving slot (candidate
+  // settings, and a bare slot has no plan to enforce them — see the section
+  // header); meaningless on an auxiliary / model-only slot (a judge profile's
   // `tools: []` is the documented no-op and stays silent).
   const narrowing: ReadonlyArray<readonly [string, unknown]> = [
     ["tools", settings.tools],
@@ -2014,8 +2058,9 @@ function applyProfileToSlot(
     ["cost", settings.costCapUsdMicros],
   ];
   // A shape with a tool catalog (agent-full / agent-params) refuses them on
-  // a single-model slot; a shape that can NEVER honour them (voice / eval /
-  // onchain / pipeline) reports them ignored-on-shape, permanently.
+  // a single-model slot — the pool candidate is the route that serves them; a
+  // shape that can NEVER honour them (voice / eval / onchain / pipeline)
+  // reports them ignored-on-shape, permanently.
   const narrowingRefused = kind === "agent-full" || kind === "agent-params";
   for (const [field, value] of narrowing) {
     if (value === undefined) continue;
@@ -2025,13 +2070,12 @@ function applyProfileToSlot(
     }
     if (isAgent) {
       if (!ctx.allowPending) {
-        throw runtimePending(
+        throw candidateOnlyRefusal(
           `${at}.${field} (referenced from ${slotPath})`,
-          LANDING_SINGLE_SLOT,
-          "a profile declared narrower than the shape would serve with the shape's full toolset and permissions on a single-model slot — declare the profile as a model_pool candidate (which honours it), or declare the narrowing on the shape",
+          "Accepting it here would serve the profile with the shape's full toolset and permissions, so it is refused rather than dropped: name the profile as a model_pool candidate, or declare the narrowing on the shape itself",
         );
       }
-      pending(field, LANDING_SINGLE_SLOT);
+      candidateOnly(field);
       continue;
     }
     if (field === "tools" && Array.isArray(value) && value.length === 0) continue;
@@ -2389,8 +2433,10 @@ function lowerPoolReward(r: NonNullable<SpecModelPoolBlockValue["reward"]>): IrM
  * 0.6.0: every model slot here resolves through {@link resolveModelRef}
  * (`$profile` / `cheapest` / `strongest`); candidates lower through
  * {@link lowerPoolCandidate}; the hybrid siblings (`directives` / `rules` /
- * `classifier` / `strategy` / `reward` / `scope`) ride the pool blob, each
- * reported `model-plan-pending-runtime` until its consumer lands. `scope` is
+ * `classifier` / `strategy` / `reward` / `scope`) ride the pool blob and every
+ * one of them has a consumer, so nothing on a pool is inert — the only notice
+ * left here is `model-plan-ignored-on-shape`, for the one §11.3 cell the plan
+ * declines (`pipeline` × the Consult / Escalate pair). `scope` is
  * carried verbatim only when declared — the compiler does NOT stamp the
  * step/role/node name (§7.9) at lower time, because the IR pool blob is what
  * README / loop projections and every emitter read. The host that knows the
@@ -2463,13 +2509,6 @@ function lowerModelFailover(
     const objective = mp.objective;
     const routing = mp.routing;
     const learning = mp.learning;
-    const pending = (key: string, landing: string, extra = ""): void =>
-      warn(
-        ctx,
-        "model-plan-pending-runtime",
-        `${poolPath}.${key}`,
-        `${poolPath}.${key} is lowered into the pool blob but the runtime does not honour it yet — it lands with 0.6.0 ${landing}; until then it is inert${extra}`,
-      );
     // 0.6.0 PR 9e/9f — the closure-shaped keys. `directives` and `rules` ride
     // the pool blob and are consumed by runtime-core's `preRoute` on BOTH
     // paths (PR 9b), so they pend nowhere. `policy: classifier`, `classifier:`

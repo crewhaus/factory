@@ -1,31 +1,31 @@
 /**
- * 0.6.0 PR 7 introduced the residual runtime-pending guard: PR 6 refused the
- * WHOLE §11.1 spec delta at compile time, PR 7 lowered it and kept refusing
- * the keys whose runtime consumer had not landed. PR 9a landed the
- * per-candidate plan table, so a `model_pool` CANDIDATE's narrowing knobs —
- * `tools` / `tool_config` / `permissions` / `rate_limits` / `cost`, inline or
- * inherited from a `$profile` — now COMPILE THROUGH on every pool-bearing
- * slot (agent, step, node, role, sub-agent): runtime-core builds one plan per
- * candidate from the pool blob at boot (subset advertisement + dispatch gate,
- * narrowed permissions, rate buckets, per-call tool_config, spend cap). The
- * `HONOURED` rows pin that: each parses, `compile()` succeeds, the key rides
- * the emitted pool blob, and no `model-plan-pending-runtime` warning names it.
+ * 0.6.0 — the guard over the keys `compile()` does not accept, and the far
+ * larger set it does. A `model_pool` CANDIDATE's narrowing knobs — `tools` /
+ * `tool_config` / `permissions` / `rate_limits` / `cost`, inline or inherited
+ * from a `$profile` — COMPILE THROUGH on every pool-bearing slot (agent, step,
+ * node, role, sub-agent): runtime-core builds one plan per candidate from the
+ * pool blob at boot (subset advertisement + dispatch gate, narrowed
+ * permissions, rate buckets, per-call tool_config, spend cap). The `HONOURED`
+ * rows pin that: each parses, `compile()` succeeds, the key rides the emitted
+ * pool blob, and no `model-plan-candidate-only` warning names it. The cascade
+ * keys — `evaluation.on_fail: escalate` with its lower-time-resolved
+ * `escalateTo`, and `judge.escalate_to` — compile through too (the `CASCADE`
+ * rows): runtime-core's `runEvaluatedTurn` re-runs a failing turn on the
+ * escalation rung, and the workflow / graph retry closures force the
+ * `retry_previous` re-run onto `escalate_to`.
  *
- * PR 9c landed the cascade, so `evaluation.on_fail: escalate` (with its
- * lower-time-resolved `escalateTo`) and `judge.escalate_to` now COMPILE
- * THROUGH too (the `CASCADE` rows): runtime-core's `runEvaluatedTurn` re-runs
- * a failing turn on the escalation rung, and the workflow / graph retry
- * closures force the `retry_previous` re-run onto `escalate_to`.
- *
- * What is STILL refused (the `REFUSED` rows): `mcp_servers.<n>.tool_flags` (no
- * PR-train row for its IR + emit half yet), and a narrowing profile referenced
- * from a SINGLE-MODEL serving slot — the IR has no per-candidate plan carrier
- * for a slot that routes no pool, so accepting `models.fast: { tools: [] }`
- * behind `agent.model: $fast` would serve with the full toolset. Every refused
- * row still parses, `compile()` refuses it naming the path and the landing
- * row, and `lower()` with `allowRuntimePendingKeys` carries it into the IR
- * with a `model-plan-pending-runtime` warning. The landing PR deletes its row
- * here.
+ * What is refused (the `REFUSED` rows) is refused BY DESIGN, not until some
+ * later row: a narrowing profile referenced from a SINGLE-MODEL serving slot.
+ * §4.2 gives a bare slot the profile's request params its shape can honour,
+ * its `modelProfile` provenance, its failover chain and its folded overlay —
+ * but no per-candidate plan, so there is nothing to enforce a narrowing on and
+ * accepting
+ * `models.fast: { tools: [] }` behind `agent.model: $fast` would serve with
+ * the shape's full toolset. The refusal names the pool-candidate route as the
+ * fix; `lower()` with `allowRuntimePendingKeys` carries the key into the IR
+ * with a `model-plan-candidate-only` warning instead. The one genuinely
+ * unlowered key is `mcp_servers.<n>.tool_flags`: 0.6.0 ships no IR + emit
+ * wiring for it.
  */
 import { describe, expect, test } from "bun:test";
 import { CompilerError } from "@crewhaus/errors";
@@ -318,7 +318,7 @@ describe("0.6.0 PR 9c — the cascade keys compile through to the runtime", () =
       expect(bundleProbe(bundle)).toBe(true);
       const pending = result.warnings.filter(
         (w) =>
-          w.code === "model-plan-pending-runtime" &&
+          w.code === "model-plan-candidate-only" &&
           (w.path.includes("on_fail") ||
             w.path.includes("escalate_to") ||
             w.path.includes("strategy.cascade") ||
@@ -364,7 +364,7 @@ describe("0.6.0 PR 9a — a pool candidate's narrowing knobs compile through to 
       // No warning claims the narrowing knob is inert.
       const inert = result.warnings.filter(
         (w) =>
-          w.code === "model-plan-pending-runtime" &&
+          w.code === "model-plan-candidate-only" &&
           /\.(tools|tool_config|permissions|rate_limits|cost)\b/.test(w.path),
       );
       expect(inert).toEqual([]);
@@ -372,23 +372,23 @@ describe("0.6.0 PR 9a — a pool candidate's narrowing knobs compile through to 
   }
 });
 
-describe("0.6.0 PR 7 residual guard — the keys whose runtime has not landed stay refused", () => {
+describe("0.6.0 — the by-design refusals, and the bypass that warns instead", () => {
   for (const [name, yaml, path, probe] of REFUSED) {
     test(`${name}: parses, compile() refuses naming the path, lower({allowRuntimePendingKeys}) carries it`, () => {
       expect(parseSpecIssues(yaml)).toEqual([]);
       expect(() => compile(yaml)).toThrow(CompilerError);
-      expect(() => compile(yaml)).toThrow(/does not enforce it yet/);
+      expect(() => compile(yaml)).toThrow(/is a model_pool candidate setting/);
       expect(() => compile(yaml)).toThrow(path);
       expect(() => lower(parseSpec(yaml))).toThrow(path);
       const { ir, warnings } = lowerWithWarnings(parseSpec(yaml), {
         allowRuntimePendingKeys: true,
       });
       expect(probe(JSON.stringify(ir))).toBe(true);
-      expect(warnings.some((w) => w.code === "model-plan-pending-runtime")).toBe(true);
+      expect(warnings.some((w) => w.code === "model-plan-candidate-only")).toBe(true);
     });
   }
 
-  test("the single-slot refusal tells the author the pool candidate honours the same profile", () => {
+  test("the single-slot refusal states the design and names the pool-candidate route", () => {
     const yaml = [
       "name: hello",
       "target: cli",
@@ -400,11 +400,15 @@ describe("0.6.0 PR 7 residual guard — the keys whose runtime has not landed st
       "tools: [read, fetch]",
     ].join("\n");
     expect(() => compile(yaml)).toThrow(/single-model serving slot/);
-    expect(() => compile(yaml)).toThrow(/declare the profile as a model_pool candidate/);
-    expect(() => compile(yaml)).toThrow(/remove it from the spec for now/);
+    expect(() => compile(yaml)).toThrow(/name the profile as a model_pool candidate/);
+    expect(() => compile(yaml)).toThrow(
+      /would serve the profile with the shape's full toolset and permissions/,
+    );
+    // It is a design boundary, so the sentence promises no later row.
+    expect(() => compile(yaml)).not.toThrow(/0\.6\.0 row|lands with|does not enforce it yet/);
   });
 
-  test("mcp_servers.<n>.tool_flags stays refused (no IR + emit row yet)", () => {
+  test("mcp_servers.<n>.tool_flags stays refused (0.6.0 lowers it nowhere)", () => {
     const yaml = cli(
       "mcp_servers:",
       "  fs:",

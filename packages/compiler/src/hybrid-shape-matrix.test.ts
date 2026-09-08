@@ -302,7 +302,7 @@ const bundleText = (yaml: string): string =>
 const noticePaths = (yaml: string): readonly string[] =>
   compile(yaml, { readme: false })
     .warnings.filter(
-      (w) => w.code === "model-plan-ignored-on-shape" || w.code === "model-plan-pending-runtime",
+      (w) => w.code === "model-plan-ignored-on-shape" || w.code === "model-plan-candidate-only",
     )
     .map((w) => w.path)
     .sort();

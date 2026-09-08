@@ -173,8 +173,8 @@ steps:
 
 describe("model-plan:profile-tools — a profile's tools ⊆ the shape's resolved toolset", () => {
   // The spec layer refuses a profile tool outside a DECLARED `tools:` list,
-  // and the compiler refuses profile tools on a single-model slot until the
-  // plan carrier lands; the lint-reachable case is therefore a pool candidate
+  // and the compiler refuses profile tools on a single-model slot by design
+  // (they are candidate settings); the lint-reachable case is therefore a pool candidate
   // profile on a shape that declares no `tools:` — its resolved toolset is
   // what the IR carries, and the spec layer had nothing to compare against.
   const POOLED_PROFILE = (tools: string): string => `

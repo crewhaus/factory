@@ -1,6 +1,6 @@
 /**
- * 0.6.0 §6.2 / §4.2 (PR 13b) — the LANDING of the last two
- * `model-plan-pending-runtime` classes.
+ * 0.6.0 §6.2 / §4.2 (PR 13b) — the LANDING of the last two classes that were
+ * reported inert while the PR train ran.
  *
  * Before this PR two promises were still outstanding on `main`:
  *
@@ -13,7 +13,7 @@
  *
  * Both are wired now, so the compiler emits neither landing promise. These
  * tests pin that: a spec that declares EVERY one of those keys compiles with
- * an empty pending-runtime warning set, the knobs reach the emitted bundle,
+ * no candidate-only notice at all, the knobs reach the emitted bundle,
  * and a spec declaring none of them emits the same bytes as before.
  */
 import { describe, expect, test } from "bun:test";
@@ -52,16 +52,20 @@ const EVERYTHING = [
   "    target: transcript",
 ].join("\n");
 
-describe("PR 13b — nothing this PR wires pends any more", () => {
-  test("a spec declaring every panel knob and every aux slot compiles with an EMPTY pending set", () => {
+describe("PR 13b — nothing this PR wires is dropped any more", () => {
+  test("a spec declaring every panel knob and every aux slot compiles with NO model-plan notice", () => {
     expect(parseSpecIssues(EVERYTHING)).toEqual([]);
     const result = compile(EVERYTHING, opts);
-    expect(result.warnings.filter((w) => w.code === "model-plan-pending-runtime")).toEqual([]);
+    expect(result.warnings.filter((w) => w.code === "model-plan-candidate-only")).toEqual([]);
     // …and the landing sentences themselves are gone from the compiler's
     // vocabulary, not merely unreachable on this spec.
     const messages = result.warnings.map((w) => w.message).join("\n");
     expect(messages).not.toContain("judge-panel wiring");
     expect(messages).not.toContain("per-slot params consumers");
+    // No compiler sentence promises a later 0.6.0 row: the train is complete,
+    // and what a slot does not serve is a design boundary it states outright.
+    expect(messages).not.toContain("0.6.0 row");
+    expect(messages).not.toContain("until then it is inert");
   });
 
   test("the panel knobs and the judge profile's params reach the emitted cli bundle", () => {
@@ -122,7 +126,7 @@ describe("PR 13b — the judge-gate shapes carry the same knobs", () => {
 
   test("a workflow judge gate renders the panel knobs onto its __judgeGate call", () => {
     const result = compile(WORKFLOW, opts);
-    expect(result.warnings.filter((w) => w.code === "model-plan-pending-runtime")).toEqual([]);
+    expect(result.warnings.filter((w) => w.code === "model-plan-candidate-only")).toEqual([]);
     const bundle = result.files.map((f) => f.content).join("\n");
     expect(bundle).toContain("const result = await gradeWithJudgePanel({");
     expect(bundle).toContain("repeats: 3,");
@@ -146,7 +150,7 @@ describe("PR 13b — the judge-gate shapes carry the same knobs", () => {
       "entry: draft",
     ].join("\n");
     const result = compile(graph, opts);
-    expect(result.warnings.filter((w) => w.code === "model-plan-pending-runtime")).toEqual([]);
+    expect(result.warnings.filter((w) => w.code === "model-plan-candidate-only")).toEqual([]);
     const bundle = result.files.map((f) => f.content).join("\n");
     expect(bundle).toContain('judges: ["claude-sonnet-4-6", "claude-opus-4-8"],');
     expect(bundle).toContain("temperature: 0.1,");
@@ -192,7 +196,7 @@ describe("PR 13b — browser grounding params", () => {
     if (ir.target !== "browser") throw new Error("unexpected target");
     expect(ir.groundingParams).toEqual({ thinking: { effort: "low" }, maxTokens: 512 });
     const result = compile(BROWSER, opts);
-    expect(result.warnings.filter((w) => w.code === "model-plan-pending-runtime")).toEqual([]);
+    expect(result.warnings.filter((w) => w.code === "model-plan-candidate-only")).toEqual([]);
     const bundle = result.files.map((f) => f.content).join("\n");
     expect(bundle).toContain(
       'const SPEC_GROUNDING_PARAMS = {"thinking":{"effort":"low"},"maxTokens":512};',
