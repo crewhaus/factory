@@ -115,8 +115,23 @@
  *   C35 — judge token METERING: every `llm_judge` call reports its provider
  *       usage through a sink threaded into the graders this runner builds,
  *       accumulating into `aggregates.judgeUsage` (per judge model, so the
- *       CLI can price a panel). Previously the judge wire discarded usage
+ *       CLI can price a panel, and — 0.6.0 §6.2 — per (judge model, agent
+ *       arm) on a routed run, so a hybrid setup can see what grading the
+ *       cheap arm cost). Previously the judge wire discarded usage
  *       entirely and `llm_judge` spend was invisible.
+ *
+ * 0.6.0 §6.2 — PER-MODEL GRADERS, THRESHOLDS AND JUDGES:
+ *   `graders.yaml` gains `per_model:` (per grader and file-wide) binding a
+ *       served ARM to its own judge, passing cut and weight, so a cheap
+ *       draft is checked by a strong model. Grader resolution is therefore a
+ *       function of the arm that served each SAMPLE (attributed in PR 12),
+ *       not a run-level constant; `gradersHash` covers `per_model`, so
+ *       introducing a map starts a new lineage by design.
+ *   Judge calibration is keyed by the (agent arm, judge model) PAIR
+ *       (`judge calibrate --by-model`), the loader falling back
+ *       pair → spec → default. The Youden cut per pair is the shipped
+ *       calibration; a false-accept-rate calibrator waits for 0.6.x, once
+ *       per-arm lineage has accumulated.
  *
  * Evals Wave 3 (data lifecycle, cluster A):
  *   B14 — multi-turn samples: a sample's optional `history` seeds the
@@ -132,7 +147,8 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Sample } from "@crewhaus/eval-dataset";
-import type { CompiledGrader, Grader } from "@crewhaus/eval-grader";
+import type { CompiledGrader, Grader, PerModelJudgeOverride } from "@crewhaus/eval-grader";
+import { perModelArmKey, perModelOverrideFor } from "@crewhaus/eval-grader";
 import {
   type JudgeUsageSink,
   createJudgeGrader,
@@ -169,6 +185,9 @@ import {
   poolArmIds,
   readLiveArms,
   resolveEvalRouting,
+  resolveJudgeModelRef,
+  rosterRefs,
+  sampleArmId,
 } from "./routing";
 import { runSample } from "./run-sample";
 import { createSampleOutputWriter } from "./sample-output";
@@ -261,7 +280,9 @@ export {
   poolArmIds,
   readLiveArms,
   resolveEvalRouting,
+  resolveJudgeModelRef,
   rosterRefs,
+  sampleArmId,
 } from "./routing";
 export type { SharedAgentDeps };
 export { wireRunOnce };
@@ -395,6 +416,36 @@ const logger = createLogger({ bindings: { module: "eval-runner" } });
 /** G47 — relative location of `judge calibrate --apply`'s output. */
 export const JUDGE_CALIBRATION_RELPATH = join(".crewhaus", "judge-calibration.json");
 
+/**
+ * 0.6.0 §6.2 — the key a calibration entry is filed under inside a spec's
+ * `byPair` map: the AGENT ARM the samples were served by and the JUDGE MODEL
+ * that graded them. One writer (`judge calibrate --by-model`) and one reader
+ * (this runner) share this function so a pair written on Monday is found on
+ * Tuesday; `::` is the separator because an arm id is a profile name or a
+ * model string, and neither contains one.
+ */
+export function judgeCalibrationPairKey(arm: string, judgeModel: string): string {
+  return `${arm}::${judgeModel}`;
+}
+
+/** The (judge model, agent arm) key {@link JudgeUsage.byPair} accumulates on. */
+function judgeUsagePairKey(judgeModel: string, arm: string): string {
+  return `${judgeModel}::${arm}`;
+}
+
+/**
+ * The parsed `.crewhaus/judge-calibration.json` entry in force for a run:
+ * the spec (or `default`) entry's own cut plus every (arm, judge) pair cut
+ * it carries. Resolution per grader happens in {@link calibrationForPair}.
+ */
+type LoadedJudgeCalibration = {
+  readonly specKey: string;
+  /** The spec-level cut ([0,1]); absent when the entry carries pairs only. */
+  readonly minScore?: number;
+  /** {@link judgeCalibrationPairKey} → that pair's cut ([0,1]). */
+  readonly pairs: ReadonlyMap<string, number>;
+};
+
 export type RunEvalArgs = {
   /** Lowered agent IR (target: cli). Caller is responsible for narrowing. */
   readonly ir: IrV0;
@@ -511,15 +562,36 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   // model string as the run NAMED it, so the CLI can price each judge model
   // through the same table as the matrix `est_$` column. Judge-less runs
   // never allocate an entry and their results.json stays byte-identical.
+  //
+  // 0.6.0 §6.2 — and, on a routed run, ALSO per (judge model, agent arm):
+  // "the judge cost $4" is the wrong unit once a cheap arm and a strong arm
+  // are graded by different judges — the question a hybrid setup asks is what
+  // the CHEAP arm's grading cost. `byModel` is unchanged (it is what the cost
+  // line prices with); the pair split is additive and absent when no metered
+  // call had a known arm.
   const judgeUsageByModel = new Map<string, { calls: number; input: number; output: number }>();
-  const meterJudgeUsage: JudgeUsageSink = ({ model, input, output }) => {
-    const acc = judgeUsageByModel.get(model) ?? { calls: 0, input: 0, output: 0 };
-    judgeUsageByModel.set(model, {
-      calls: acc.calls + 1,
-      input: acc.input + input,
-      output: acc.output + output,
-    });
-  };
+  const judgeUsageByPair = new Map<string, { calls: number; input: number; output: number }>();
+  const meterJudgeUsageFor =
+    (arm: string | undefined): JudgeUsageSink =>
+    ({ model, input, output }) => {
+      const acc = judgeUsageByModel.get(model) ?? { calls: 0, input: 0, output: 0 };
+      judgeUsageByModel.set(model, {
+        calls: acc.calls + 1,
+        input: acc.input + input,
+        output: acc.output + output,
+      });
+      if (arm === undefined) return;
+      const key = judgeUsagePairKey(model, arm);
+      const pair = judgeUsageByPair.get(key) ?? { calls: 0, input: 0, output: 0 };
+      judgeUsageByPair.set(key, {
+        calls: pair.calls + 1,
+        input: pair.input + input,
+        output: pair.output + output,
+      });
+    };
+  // The arm-less sink: the registry's judge-backed classifiers and every
+  // grader built for the base (no served arm) set meter through it.
+  const meterJudgeUsage = meterJudgeUsageFor(undefined);
   // C35 — registry graders can make judge calls too (`safety.toxicity` /
   // `safety.bias` classify through a categorical judge). Install the SAME
   // sink on the registry — whether this run built it or the caller passed
@@ -527,93 +599,184 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   // Registries without the optional hook are unaffected.
   graderRegistry?.setJudgeUsageSink?.(meterJudgeUsage);
 
+  // 0.6.0 §6.2 — resolve every `per_model.judge` reference ONCE, at run
+  // start, against the spec's roster. A `$profile` ref that names nothing is
+  // a loud error here rather than a silent fallback to the default judge:
+  // "the cheap arm was graded by the model it was supposed to be checked
+  // against" is precisely the failure per-model judging exists to prevent.
+  const resolvedJudgeRefs = new Map<string, string>();
+  // Every arm any `per_model:` block names (already normalized at parse), for
+  // the roster cross-check below.
+  const declaredPerModelArms = new Set<string>();
+  for (const g of compiledGraders) {
+    for (const [armKey, override] of Object.entries(g.judgeSpec?.perModel ?? {})) {
+      declaredPerModelArms.add(armKey);
+      if (override.judge === undefined) continue;
+      const resolved = resolveJudgeModelRef(ir, override.judge);
+      if (resolved === undefined) {
+        const known = rosterRefs(ir);
+        throw new RunnerError(
+          `graders per_model "${armKey}" names judge "${override.judge}", which is no roster member of spec "${ir.name}"${
+            known.length > 0
+              ? ` (declared: ${known.join(", ")})`
+              : " (it declares no models: registry and no model_pool)"
+          } — name a models: profile, a pool candidate, or a plain model string`,
+        );
+      }
+      resolvedJudgeRefs.set(override.judge, resolved);
+    }
+  }
+  /** The judge model an override names, with its `$profile` ref resolved. */
+  const resolvedPerModelJudge = (
+    override: PerModelJudgeOverride | undefined,
+  ): string | undefined =>
+    override?.judge !== undefined ? resolvedJudgeRefs.get(override.judge) : undefined;
+
+  // 0.6.0 §6.2 — the base cut each judge grader was built with, so an
+  // arm-specific build only RECORDS a calibration application when the pair
+  // actually moved the gate (otherwise every arm would repeat the run-level
+  // entry in `run.json`).
+  const baseCutByGrader = new Map<string, number>();
+
   // Resolve graders. Replace any `llm_judge` placeholder with a real judge
   // grader bound to the runner's judgeModel (or the per-grader override),
   // and any `registry` placeholder with the named grader from the grader
   // registry (PR 19 — loud at run start, not per-sample).
-  const graders: GraderEntry[] = compiledGraders.map((g) => {
-    if (g.judgeSpec) {
-      // NEW-graders-2 — categorical dispatch: validate through
-      // `loadCategoricalRubric` (same belt-and-braces re-validation the
-      // scalar path gets from `loadRubric`) and bind the label grader.
-      // No G47 calibration (no scalar cut), no repeats/judges (rejected at
-      // parse); temperature and target thread exactly like scalar.
-      if (g.judgeSpec.rubric.kind === "categorical") {
-        const categoricalRubric = loadCategoricalRubric(g.judgeSpec.rubric);
-        const categoricalModel = g.judgeSpec.model ?? opts.judgeModel;
-        const grader = createJudgeGrader(categoricalRubric, {
-          ...(categoricalModel !== undefined ? { model: categoricalModel } : {}),
+  //
+  // 0.6.0 §6.2 — the resolution is now a FUNCTION of the served arm. `arm`
+  // is `undefined` for the base set (every unrouted run, and any sample whose
+  // arm could not be attributed), in which case this resolves exactly as it
+  // did before: same judge, same cut, same weight, same arm-less usage sink.
+  // With an arm it applies that arm's `per_model:` override (judge / cut /
+  // weight) and the calibration entry pinned for the (arm, judge) pair.
+  const buildGraders = (arm: string | undefined): GraderEntry[] =>
+    compiledGraders.map((g) => {
+      if (g.judgeSpec) {
+        // 0.6.0 §6.2 — this arm's override, already merged (file-level under
+        // grader-level) at parse time. `undefined` for every arm the map does
+        // not name, and for an arm-less build.
+        // (never set on a categorical entry — those reject `per_model` at
+        // parse and are excluded from the file-level merge.)
+        const override = perModelOverrideFor(g.judgeSpec.perModel, arm);
+        const weight = override?.weight ?? g.weight;
+        // NEW-graders-2 — categorical dispatch: validate through
+        // `loadCategoricalRubric` (same belt-and-braces re-validation the
+        // scalar path gets from `loadRubric`) and bind the label grader.
+        // No G47 calibration (no scalar cut), no repeats/judges (rejected at
+        // parse); temperature and target thread exactly like scalar.
+        if (g.judgeSpec.rubric.kind === "categorical") {
+          const categoricalRubric = loadCategoricalRubric(g.judgeSpec.rubric);
+          const categoricalModel = g.judgeSpec.model ?? opts.judgeModel;
+          const grader = createJudgeGrader(categoricalRubric, {
+            ...(categoricalModel !== undefined ? { model: categoricalModel } : {}),
+            ...(g.judgeSpec.temperature !== undefined
+              ? { temperature: g.judgeSpec.temperature }
+              : {}),
+            ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
+            ...(opts.judgeAdapter !== undefined ? { adapter: opts.judgeAdapter } : {}),
+            // C35 — meter this grader's judge calls.
+            onUsage: meterJudgeUsageFor(arm),
+          });
+          return { name: g.name, grader, weight };
+        }
+        let rubric = loadRubric(g.judgeSpec.rubric);
+        // 0.6.0 §6.2 — the judge for THIS arm: the `per_model` override
+        // (a `$profile` ref already resolved against the roster) wins over
+        // the grader's own `model`, which wins over `--judge-model`.
+        const model = resolvedPerModelJudge(override) ?? g.judgeSpec.model ?? opts.judgeModel;
+        // G47 — an unspecified `passing_score` gates on the calibrated
+        // min-score instead of the schema default (3/5). The file's [0,1] cut
+        // projects onto the judge's 1–5 scale: gate = 1 + minScore·4 (the
+        // judge grader compares `score >= passing` where score is 1–5 and
+        // reports (score-1)/4, so this is exactly `(score-1)/4 >= minScore`).
+        //
+        // 0.6.0 §6.2 — the cut is now looked up for the (arm, judge) PAIR,
+        // falling back pair → spec → default inside the loader. An explicit
+        // per-arm `passing_score` outranks any calibration: a declared gate
+        // is a decision, not a default.
+        const pairCalibration =
+          calibration !== undefined ? calibrationForPair(calibration, arm, model) : undefined;
+        if (override?.passingScore !== undefined) {
+          rubric = { ...rubric, passing_score: override.passingScore };
+        } else if (
+          g.judgeSpec.rubric.passing_score === undefined &&
+          pairCalibration !== undefined
+        ) {
+          const passingScore = 1 + pairCalibration.minScore * 4;
+          rubric = { ...rubric, passing_score: passingScore };
+          const applied: JudgeCalibrationApplication = {
+            grader: g.name,
+            specKey: pairCalibration.specKey,
+            minScore: pairCalibration.minScore,
+            passingScore,
+            ...(pairCalibration.pairKey !== undefined ? { pairKey: pairCalibration.pairKey } : {}),
+            ...(arm !== undefined && pairCalibration.pairKey !== undefined ? { arm } : {}),
+          };
+          // Record the base build always; an arm build only when its pair cut
+          // differs from the base one.
+          if (arm === undefined) {
+            baseCutByGrader.set(g.name, passingScore);
+            calibrationApplied.push(applied);
+            logger.info("judge_calibration.applied", {
+              grader: g.name,
+              specKey: pairCalibration.specKey,
+              minScore: pairCalibration.minScore,
+              passingScore,
+              path: calibrationPath,
+            });
+          } else if (baseCutByGrader.get(g.name) !== passingScore) {
+            calibrationApplied.push(applied);
+            logger.info("judge_calibration.applied", {
+              grader: g.name,
+              arm,
+              specKey: pairCalibration.specKey,
+              minScore: pairCalibration.minScore,
+              passingScore,
+              path: calibrationPath,
+            });
+          }
+        }
+        // NEW-HUNT-2 — thread the rubric-level decoding controls through
+        // (temperature defaults to the pinned 0 inside `judge`; repeats
+        // defaults to a single call). A2 — a declared `judges` panel
+        // overrides the single model (and --judge-model) inside the grader.
+        // NEW-graders-3 — `target: transcript` makes every judge call read
+        // the bounded transcript digest instead of the final output.
+        const grader = createJudgeGrader(rubric, {
+          ...(model !== undefined ? { model } : {}),
+          ...(g.judgeSpec.judges !== undefined ? { judges: g.judgeSpec.judges } : {}),
+          ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
           ...(g.judgeSpec.temperature !== undefined
             ? { temperature: g.judgeSpec.temperature }
             : {}),
-          ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
+          ...(g.judgeSpec.repeats !== undefined ? { repeats: g.judgeSpec.repeats } : {}),
           ...(opts.judgeAdapter !== undefined ? { adapter: opts.judgeAdapter } : {}),
-          // C35 — meter this grader's judge calls.
-          onUsage: meterJudgeUsage,
+          // C35 — meter this grader's judge calls (repeats and panelists each
+          // report their own call, with their own model string), attributed to
+          // the arm this set grades.
+          onUsage: meterJudgeUsageFor(arm),
         });
-        return { name: g.name, grader, weight: g.weight };
+        return { name: g.name, grader, weight };
       }
-      let rubric = loadRubric(g.judgeSpec.rubric);
-      // G47 — an unspecified `passing_score` gates on the calibrated
-      // min-score instead of the schema default (3/5). The file's [0,1] cut
-      // projects onto the judge's 1–5 scale: gate = 1 + minScore·4 (the
-      // judge grader compares `score >= passing` where score is 1–5 and
-      // reports (score-1)/4, so this is exactly `(score-1)/4 >= minScore`).
-      if (g.judgeSpec.rubric.passing_score === undefined && calibration !== undefined) {
-        const passingScore = 1 + calibration.minScore * 4;
-        rubric = { ...rubric, passing_score: passingScore };
-        calibrationApplied.push({
-          grader: g.name,
-          specKey: calibration.specKey,
-          minScore: calibration.minScore,
-          passingScore,
-        });
-        logger.info("judge_calibration.applied", {
-          grader: g.name,
-          specKey: calibration.specKey,
-          minScore: calibration.minScore,
-          passingScore,
-          path: calibrationPath,
-        });
+      if (g.registrySpec) {
+        if (graderRegistry === undefined) {
+          // Unreachable through the public entrypoint (the default registry
+          // is constructed above) — kept for direct/partial callers.
+          throw new RunnerError(
+            `grader "${g.name}" resolves by registry name "${g.registrySpec.grader}" but no graderRegistry was supplied — pass RunEvalOptions.graderRegistry (and register the pack, e.g. registerContinuityGraders(registry))`,
+          );
+        }
+        // NEW-HUNT-7 — shared with `createExamRunner` (A11): entry `opts:`
+        // validate per pack / pass through to plugins; loud at run start.
+        return {
+          name: g.name,
+          grader: resolveRegistryGrader(graderRegistry, g.name, g.registrySpec),
+          weight: g.weight,
+        };
       }
-      const model = g.judgeSpec.model ?? opts.judgeModel;
-      // NEW-HUNT-2 — thread the rubric-level decoding controls through
-      // (temperature defaults to the pinned 0 inside `judge`; repeats
-      // defaults to a single call). A2 — a declared `judges` panel
-      // overrides the single model (and --judge-model) inside the grader.
-      // NEW-graders-3 — `target: transcript` makes every judge call read
-      // the bounded transcript digest instead of the final output.
-      const grader = createJudgeGrader(rubric, {
-        ...(model !== undefined ? { model } : {}),
-        ...(g.judgeSpec.judges !== undefined ? { judges: g.judgeSpec.judges } : {}),
-        ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
-        ...(g.judgeSpec.temperature !== undefined ? { temperature: g.judgeSpec.temperature } : {}),
-        ...(g.judgeSpec.repeats !== undefined ? { repeats: g.judgeSpec.repeats } : {}),
-        ...(opts.judgeAdapter !== undefined ? { adapter: opts.judgeAdapter } : {}),
-        // C35 — meter this grader's judge calls (repeats and panelists each
-        // report their own call, with their own model string).
-        onUsage: meterJudgeUsage,
-      });
-      return { name: g.name, grader, weight: g.weight };
-    }
-    if (g.registrySpec) {
-      if (graderRegistry === undefined) {
-        // Unreachable through the public entrypoint (the default registry
-        // is constructed above) — kept for direct/partial callers.
-        throw new RunnerError(
-          `grader "${g.name}" resolves by registry name "${g.registrySpec.grader}" but no graderRegistry was supplied — pass RunEvalOptions.graderRegistry (and register the pack, e.g. registerContinuityGraders(registry))`,
-        );
-      }
-      // NEW-HUNT-7 — shared with `createExamRunner` (A11): entry `opts:`
-      // validate per pack / pass through to plugins; loud at run start.
-      return {
-        name: g.name,
-        grader: resolveRegistryGrader(graderRegistry, g.name, g.registrySpec),
-        weight: g.weight,
-      };
-    }
-    return { name: g.name, grader: g.grader, weight: g.weight };
-  });
+      return { name: g.name, grader: g.grader, weight: g.weight };
+    });
+  const graders: GraderEntry[] = buildGraders(undefined);
 
   // A4/A5 — the graders config's top-level `combine:` policy rides on the
   // compiled entries (identical on each; absent = the pre-policy `all`).
@@ -743,6 +906,88 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
     );
   }
 
+  // 0.6.0 §6.2 — PER-MODEL GRADING. The graders a sample is scored by are
+  // resolved against the arm that SERVED it, so a cheap draft can be checked
+  // by a strong judge at its own cut. The per-arm sets are built EAGERLY,
+  // here, for every arm the run can route to (the pinned candidate, or the
+  // pool's roster) — so `run.json`'s calibration manifest is complete before
+  // the first sample runs, and so an unresolvable judge ref fails at run
+  // start rather than on whichever sample happens to route to that arm.
+  //
+  // The whole mechanism is skipped on an unrouted run — there is no arm to
+  // resolve against — so `gradersForSample` stays `undefined` and `runSample`
+  // grades with the one shared set, exactly as before.
+  const perModelDeclared = compiledGraders.some((g) => g.judgeSpec?.perModel !== undefined);
+  if (perModelDeclared && routed === undefined) {
+    process.stderr.write(
+      "[eval] warning: graders.yaml declares `per_model:` judge overrides, but this run is `--routing static` — a static run has no served arm to resolve them against, so every sample is graded by the base judge. Run with `--routing as-declared` (or `--routing candidate:<arm>`) to measure per-arm judging.\n",
+    );
+  }
+  // 0.6.0 §6.2 — a `per_model:` key naming an arm this run's roster does not
+  // declare is INERT: every sample keeps the base judge at the base cut while
+  // the operator believes the cheap arm is being checked by the strong one —
+  // exactly the failure per-arm judging exists to prevent, and the one the
+  // judge-ref resolution above is loud about. A warning rather than a throw:
+  // grader sets are built lazily for arms the roster did not predict (a
+  // failover-chain member, a hand-wired invoker), so an unlisted key can still
+  // be legitimate.
+  if (declaredPerModelArms.size > 0) {
+    const knownArmIds = [
+      ...(routed?.armId !== undefined ? [routed.armId] : []),
+      ...(ir.agent.modelPool !== undefined ? poolArmIds(ir.agent.modelPool) : []),
+    ];
+    const knownKeys = new Set(knownArmIds.map(perModelArmKey));
+    const unknown = [...declaredPerModelArms].filter((a) => !knownKeys.has(a)).sort();
+    if (unknown.length > 0) {
+      process.stderr.write(
+        `[eval] warning: graders.yaml \`per_model:\` names arm(s) ${unknown.join(", ")}, which this spec's roster does not declare${
+          knownArmIds.length > 0
+            ? ` (known arms: ${knownArmIds.join(", ")})`
+            : " (it declares no model_pool and pins no candidate)"
+        } — a typo or a renamed profile grades every sample with the base judge at the base cut. Unlisted arms still grade if one actually serves (a failover-chain member, a hand-wired invoker).\n`,
+      );
+    }
+  }
+  const gradersByArm = new Map<string, ReadonlyArray<GraderEntry>>();
+  // Only a ROUTED run has arms: a static one attributes nothing, so it must
+  // not pay for per-arm grader sets it can never select (and must not record
+  // their calibration applications in `run.json`).
+  const armAwareGrading = routed !== undefined;
+  if (armAwareGrading) {
+    const knownArms =
+      routed?.armId !== undefined
+        ? [routed.armId]
+        : ir.agent.modelPool !== undefined
+          ? poolArmIds(ir.agent.modelPool)
+          : [];
+    for (const arm of knownArms) gradersByArm.set(arm, buildGraders(arm));
+  }
+  /**
+   * The grader set for one sample: its served arm's, else the base set. Built
+   * on demand for an arm the roster did not predict (a failover chain member,
+   * a hand-wired invoker) so an unexpected arm still grades.
+   */
+  const gradersForSample = armAwareGrading
+    ? (sampleRouting: {
+        readonly routes?: ReadonlyArray<EvalRouteDecision>;
+        readonly servedModels?: ReadonlyArray<ServedModel>;
+      }): ReadonlyArray<GraderEntry> => {
+        // The PIN wins over the events: a `candidate:` run routes nothing
+        // (`resolveEvalRouting` builds a fragment from fallbacks/circuit
+        // breaker only), so `planAttribution` stamps no `profile` and the
+        // sample's served models can only name a model string — never the
+        // profile the `per_model:` map is keyed on. `routed.armId` is
+        // undefined under `as-declared`, so the pool path is unchanged.
+        const arm = routed?.armId ?? sampleArmId(sampleRouting);
+        if (arm === undefined) return graders;
+        const known = gradersByArm.get(arm);
+        if (known !== undefined) return known;
+        const built = buildGraders(arm);
+        gradersByArm.set(arm, built);
+        return built;
+      }
+    : undefined;
+
   const baseInvoker =
     opts.invoker ??
     (await defaultInvoker(
@@ -809,6 +1054,31 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
             // transcript-judged run is a different instrument; absent for
             // default output judging, keeping entries byte-identical).
             ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
+            // 0.6.0 §6.2 — record the per-arm judge map (already merged,
+            // file-level under grader-level) with its `$profile` judge refs
+            // RESOLVED: a run.json that says which model actually graded
+            // which arm is the point of the manifest. Absent without a
+            // `per_model:` block, so existing entries stay byte-identical.
+            ...(g.judgeSpec.perModel !== undefined
+              ? {
+                  perModel: Object.fromEntries(
+                    Object.entries(g.judgeSpec.perModel)
+                      .sort(([a], [b]) => a.localeCompare(b))
+                      .map(([arm, override]) => [
+                        arm,
+                        {
+                          ...(resolvedPerModelJudge(override) !== undefined
+                            ? { judge: resolvedPerModelJudge(override) }
+                            : {}),
+                          ...(override.passingScore !== undefined
+                            ? { passingScore: override.passingScore }
+                            : {}),
+                          ...(override.weight !== undefined ? { weight: override.weight } : {}),
+                        },
+                      ]),
+                  ),
+                }
+              : {}),
           },
         ]
       : [],
@@ -997,6 +1267,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
               sample,
               invoker,
               graders,
+              ...(gradersForSample !== undefined ? { gradersForSample } : {}),
               outDir,
               model: ir.agent.model,
               specName: ir.name,
@@ -1111,7 +1382,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   // in `aggregate()`) because it is RUN-ambient rather than per-sample: judge
   // graders are built once and shared across concurrently-running samples, so
   // the honest unit of attribution is the run.
-  const judgeUsage = summarizeJudgeUsage(judgeUsageByModel);
+  const judgeUsage = summarizeJudgeUsage(judgeUsageByModel, judgeUsageByPair);
   const aggregates: EvalAggregates = {
     ...aggregate(results),
     ...(judgeUsage !== undefined ? { judgeUsage } : {}),
@@ -1337,6 +1608,7 @@ async function amendRunManifest(
  */
 function summarizeJudgeUsage(
   byModel: ReadonlyMap<string, { calls: number; input: number; output: number }>,
+  byPair: ReadonlyMap<string, { calls: number; input: number; output: number }> = new Map(),
 ): JudgeUsage | undefined {
   if (byModel.size === 0) return undefined;
   let calls = 0;
@@ -1350,7 +1622,20 @@ function summarizeJudgeUsage(
     input += m.input;
     output += m.output;
   }
-  return { calls, tokens: { input, output }, byModel: sorted };
+  // 0.6.0 §6.2 — the (judge model, agent arm) split, sorted so two runs with
+  // the same spend produce byte-identical JSON, and ABSENT when no metered
+  // call carried an arm (every unrouted run).
+  const pairs = [...byPair.keys()].sort().map((key) => {
+    const [judgeModel = "", arm = ""] = key.split("::");
+    const u = byPair.get(key) as { calls: number; input: number; output: number };
+    return { judgeModel, arm, calls: u.calls, input: u.input, output: u.output };
+  });
+  return {
+    calls,
+    tokens: { input, output },
+    byModel: sorted,
+    ...(pairs.length > 0 ? { byPair: pairs } : {}),
+  };
 }
 
 /**
@@ -1379,7 +1664,7 @@ function loadJudgeCalibration(
   path: string,
   specName: string,
   read?: (path: string) => string | undefined,
-): { minScore: number; specKey: string } | undefined {
+): LoadedJudgeCalibration | undefined {
   const readFile = read ?? ((p: string) => (existsSync(p) ? readFileSync(p, "utf-8") : undefined));
   const text = readFile(path);
   if (text === undefined) return undefined;
@@ -1398,20 +1683,76 @@ function loadJudgeCalibration(
     logger.warn("judge_calibration.malformed", { path, error: "missing calibrations record" });
     return undefined;
   }
-  const record = calibrations as Record<string, { minScore?: unknown } | undefined>;
+  const record = calibrations as Record<
+    string,
+    { minScore?: unknown; byPair?: unknown } | undefined
+  >;
   const specKey = record[specName] !== undefined ? specName : "default";
   const entry = record[specKey];
   if (entry === undefined) return undefined;
-  const minScore = entry.minScore;
-  if (typeof minScore !== "number" || !Number.isFinite(minScore) || minScore < 0 || minScore > 1) {
-    logger.warn("judge_calibration.malformed", {
-      path,
-      specKey,
-      error: `minScore must be a number in [0,1], got ${JSON.stringify(minScore)}`,
-    });
-    return undefined;
+  // 0.6.0 §6.2 — the per-(arm, judge) cuts `judge calibrate --by-model`
+  // writes. Each is validated on its own: one malformed pair is skipped with
+  // a warning rather than discarding a whole file's calibration.
+  const pairs = new Map<string, number>();
+  const byPair = entry.byPair;
+  if (byPair !== null && typeof byPair === "object") {
+    for (const [pairKey, value] of Object.entries(byPair as Record<string, unknown>)) {
+      const pairMin = (value as { minScore?: unknown } | null)?.minScore;
+      if (!isCalibrationCut(pairMin)) {
+        logger.warn("judge_calibration.malformed", {
+          path,
+          specKey,
+          pairKey,
+          error: `minScore must be a number in [0,1], got ${JSON.stringify(pairMin)}`,
+        });
+        continue;
+      }
+      pairs.set(pairKey, pairMin);
+    }
   }
-  return { minScore, specKey };
+  const minScore = entry.minScore;
+  if (!isCalibrationCut(minScore)) {
+    // A spec-level cut that is present-but-broken (or missing with no pairs
+    // to fall back on) is the pre-0.6.0 no-calibration state, warned about.
+    if (pairs.size === 0) {
+      logger.warn("judge_calibration.malformed", {
+        path,
+        specKey,
+        error: `minScore must be a number in [0,1], got ${JSON.stringify(minScore)}`,
+      });
+      return undefined;
+    }
+    return { specKey, pairs };
+  }
+  return { specKey, minScore, pairs };
+}
+
+/** A calibration cut is a finite number in [0,1] — the file's own units. */
+function isCalibrationCut(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+/**
+ * 0.6.0 §6.2 — the cut in force for one (agent arm, judge model) pair,
+ * falling back **pair → spec → default**: the pair entry under the selected
+ * spec (or `default`) entry wins, then that entry's own spec-level cut. An
+ * arm-less build (every unrouted run) never matches a pair, so it resolves
+ * exactly as it did before this key existed.
+ */
+function calibrationForPair(
+  calibration: LoadedJudgeCalibration,
+  arm: string | undefined,
+  judgeModel: string | undefined,
+): { minScore: number; specKey: string; pairKey?: string } | undefined {
+  if (arm !== undefined && judgeModel !== undefined) {
+    const pairKey = judgeCalibrationPairKey(arm, judgeModel);
+    const pairMin = calibration.pairs.get(pairKey);
+    if (pairMin !== undefined) {
+      return { minScore: pairMin, specKey: calibration.specKey, pairKey };
+    }
+  }
+  if (calibration.minScore === undefined) return undefined;
+  return { minScore: calibration.minScore, specKey: calibration.specKey };
 }
 
 /**

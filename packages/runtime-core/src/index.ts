@@ -125,6 +125,8 @@ import {
 import {
   type RewardConfig,
   type RouteObservation,
+  SHADOW_LANE_PRIMARY_ARM,
+  SHADOW_LANE_SHADOW_ARM,
   type Scoreboard,
   computeReward,
   freezeScoreboard,
@@ -1215,6 +1217,21 @@ export type RunEvaluation = {
    * caller knows what it built `evaluate` from).
    */
   readonly graderType: "llm_judge" | "contains" | "regex";
+  /**
+   * 0.6.0 §6.2 (PR 13, the PR-10 carry-over) — the JUDGE MODEL `evaluate`
+   * calls, when it calls one. Purely declarative: the closure still owns the
+   * call, this states which model it makes it with, because the identity of
+   * the judge is part of the instrument a learned arm's quality was measured
+   * on. Under `reward.quality_source`, the per-arm lineage folds it beside
+   * `graderType` (§6.3 item 4 — `reset_on_profile_change`), so re-pointing
+   * `evaluation.grader.model` at a different judge starts a NEW lineage
+   * instead of averaging two instruments' verdicts into one arm.
+   *
+   * Emitted by the three `renderEvaluation` copies and the interpreter's
+   * `buildRunEvaluation` for `llm_judge` graders only — a `contains`/`regex`
+   * grader has no judge, and their bundles stay byte-identical.
+   */
+  readonly judgeModel?: string;
 };
 
 /**
@@ -3384,8 +3401,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // profile that changed under the same arm id and is skipped on load
     // (`reset_on_profile_change`, default true). Unprofiled arms (arm id =
     // model string) are not stamped, so a bare 0.5.x pool writes 0.5.x lines.
-    // The judge MODEL is closed over by `evaluation.evaluate` and not visible
-    // here; the grader kind is the judge identity this seam can see.
+    // 0.6.0 §6.2 (PR 13) — the JUDGE MODEL now folds in too. PR 10 could not
+    // see it: the judge was closed over by `evaluation.evaluate` and nothing
+    // at this seam knew which model graded. `RunEvaluation.judgeModel` states
+    // it declaratively (emitted for `llm_judge` graders by the three
+    // `renderEvaluation` copies and the interpreter), so re-pointing the
+    // judge at a different model starts a NEW lineage rather than averaging
+    // two instruments' verdicts into one arm's quality. Absent for
+    // deterministic graders and for hand-built IR — a `contains` grader has
+    // no judge — and `planFingerprint` drops `undefined` members, so a
+    // judge-less pool's lineage is byte-identical to PR 10's.
     const lineage: Record<string, string> = {};
     for (const candidate of candidates) {
       const cfg = poolCandidateConfigs.get(candidate);
@@ -3394,6 +3419,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         candidate: cfg,
         qualitySource: rewardBlock?.qualitySource ?? "none",
         grader: opts.evaluation?.graderType,
+        judge: opts.evaluation?.judgeModel,
       });
     }
     const liveScoreboard =
@@ -3573,7 +3599,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         /** §7.9 — the arm id the outcome was recorded under. */
         readonly armId: string;
         readonly routeKey: string;
-        readonly latencyMs: number;
+        /** Absent when nothing measured the call (see `RouteObservation`). */
+        readonly latencyMs?: number;
         readonly costUsd?: number;
       }
     | undefined;
@@ -3602,7 +3629,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         modelString: turn.modelString,
         armId: arm,
         routeKey: turn.routeKey,
-        latencyMs: obs.latencyMs,
+        ...(obs.latencyMs !== undefined ? { latencyMs: obs.latencyMs } : {}),
         ...(obs.costUsd !== undefined ? { costUsd: obs.costUsd } : {}),
       };
     }
@@ -4306,7 +4333,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // (`draft` on the graded draft, `escalation` on the forced re-run and on the
   // rest of a turn after a self-`Escalate`); `runOneTurn` sets it on entry
   // and clears it on return, so the loop's own defaults stand otherwise.
-  let turnAttributionOverride: { readonly role?: ModelRole; readonly stage?: string } = {};
+  let turnAttributionOverride: {
+    readonly role?: ModelRole;
+    readonly stage?: string;
+    readonly strategy?: string;
+  } = {};
   const modelAttribution = (): { role?: ModelRole; stage?: string } => {
     const role = turnAttributionOverride.role ?? opts.modelRole;
     const stage = turnAttributionOverride.stage ?? opts.modelStage;
@@ -6547,6 +6578,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     readonly forceReason?: string;
     readonly role?: ModelRole;
     readonly stage?: string;
+    /**
+     * 0.6.0 §7.9 — the `model_pool.strategy` member the attempt belongs to
+     * (`"cascade"`, `"model_directed"`). Stamped beside `stage` on the
+     * attempt's `model_route` lines so `watchme report --feed-routing` can
+     * join delayed quality PER STAGE rather than to the turn's first route.
+     */
+    readonly strategy?: string;
     readonly defer?: boolean;
     /**
      * §7.13 — the caller holds a standing answer to fall back to (the
@@ -6799,17 +6837,25 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // (§7.9); the lane re-scopes the bare band as `shadow:<scope>/<band>`.
           const key = shadowRouteKey(unscopedRouteKey(served.routeKey), poolScope);
           const q = shadowLaneQuality(v.verdict);
+          // §6.3 / §7.10 — each side of the audition is STAMPED, because the
+          // two lines are not the same kind of evidence: the shadow arm never
+          // served, while the primary already recorded this very turn live
+          // through `recordPoolOutcome`. `route promote` folds the shadow side
+          // and skips the primary one on this stamp; without it the promotion
+          // could not tell them apart even in principle.
           const shadowObs = {
             success: true,
             latencyMs: v.latencyMs,
             ...(shadowCost !== undefined ? { costUsd: shadowCost } : {}),
             quality: q.shadow,
+            attributedTo: SHADOW_LANE_SHADOW_ARM,
           };
           const primaryObs = {
             success: true,
-            latencyMs: served.latencyMs,
+            ...(served.latencyMs !== undefined ? { latencyMs: served.latencyMs } : {}),
             ...(served.costUsd !== undefined ? { costUsd: served.costUsd } : {}),
             quality: q.primary,
+            attributedTo: SHADOW_LANE_PRIMARY_ARM,
           };
           sb.record(key, shadowArm, computeReward(shadowObs, rc), {
             ...shadowObs,
@@ -6857,6 +6903,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     turnAttributionOverride = {
       ...(turnOpts.role !== undefined ? { role: turnOpts.role } : {}),
       ...(turnOpts.stage !== undefined ? { stage: turnOpts.stage } : {}),
+      ...(turnOpts.strategy !== undefined ? { strategy: turnOpts.strategy } : {}),
     };
     const pendingObservations: PendingPoolObservation[] = [];
     let attemptCostUsd = 0;
@@ -7066,6 +7113,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                     ...turnAttributionOverride,
                     role: "escalation",
                     stage: "escalate",
+                    strategy: "model_directed",
                   };
                   publishStage({
                     stage: "escalate",
@@ -7360,7 +7408,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // the two always present, since the phase always runs).
               const signalRecord = deriveSignalRecord(routeSignals);
               const { userTextHash, ...signalRest } = signalRecord;
+              // §7.9 — the hybrid stage the decision serves. Present only on a
+              // cascade / self-escalation attempt or a nested side call, so a
+              // bare pool's route lines keep their pre-0.6.0 shape — and it is
+              // what lets `watchme report --feed-routing` fold one delayed
+              // quality onto EACH stage instead of the turn's first route.
+              const routeStage = turnAttributionOverride.stage ?? opts.modelStage;
+              const routeStrategy = turnAttributionOverride.strategy;
               const routeAttribution = {
+                ...(routeStage !== undefined ? { stage: routeStage } : {}),
+                ...(routeStrategy !== undefined ? { strategy: routeStrategy } : {}),
                 ...(poolPlan.profile !== undefined ? { profile: poolPlan.profile } : {}),
                 ...(poolPlan.fromPool ? { toolsetFingerprint: poolPlan.toolsetFingerprint } : {}),
                 eligible: pre.eligible,
@@ -8514,6 +8571,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         forceReason,
         role: "escalation",
         stage: "escalate",
+        strategy: "cascade",
         defer,
         ...(fallible ? { fallible } : {}),
       });
@@ -8596,7 +8654,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         : await runOneTurn(
             messages,
             cascade !== undefined
-              ? { role: "draft", stage: "draft", defer: true }
+              ? { role: "draft", stage: "draft", strategy: "cascade", defer: true }
               : deferForGrade
                 ? { defer: true }
                 : {},

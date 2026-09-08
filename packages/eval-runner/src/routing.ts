@@ -44,6 +44,7 @@ import type { ModelWiringFragment } from "@crewhaus/model-service";
 import type { ArmStats, RouteObservation, Scoreboard } from "@crewhaus/routing-store";
 import { openScoreboard } from "@crewhaus/routing-store";
 import type { ModelResponseEvent, ModelRouteEvent, TraceEvent } from "@crewhaus/trace-event-bus";
+import { isAuxiliaryModelRole } from "@crewhaus/trace-event-bus";
 import { RunnerError } from "./errors";
 import type { EvalRouteDecision, ServedModel } from "./types";
 
@@ -221,6 +222,20 @@ export function resolveEvalRouting(
   };
 }
 
+/**
+ * 0.6.0 §6.2 — resolve a `per_model.judge` reference to a model string. A
+ * `$profile` ref resolves through the same roster a `candidate:` routing
+ * mode uses (pool candidates first, then the `models:` registry) and yields
+ * `undefined` when it names nothing — the caller turns that into a loud
+ * run-start error. A bare string is already a model id and passes through,
+ * so a judge that lives outside the roster (a hosted checker the agent never
+ * runs on) stays expressible.
+ */
+export function resolveJudgeModelRef(ir: IrV0, ref: string): string | undefined {
+  if (!ref.startsWith("$")) return ref;
+  return findRosterMember(ir, ref.slice(1))?.model;
+}
+
 /** Pool candidate by profile name or model string, else a `models:` profile. */
 function findRosterMember(ir: IrV0, ref: string): IrModelProfile | undefined {
   const candidates = ir.agent.modelPool?.candidates ?? [];
@@ -252,7 +267,8 @@ export type CapturedRouteObservation = {
   readonly arm: string;
   readonly reward: number;
   readonly success: boolean;
-  readonly latencyMs: number;
+  /** Absent when the observation carried no measured latency (see `RouteObservation`). */
+  readonly latencyMs?: number;
   readonly costUsd?: number;
   readonly quality?: number;
   readonly stage?: string;
@@ -322,7 +338,7 @@ export function freezeArmsSnapshot(stats: ReadonlyArray<ArmStats>): FrozenScoreb
         arm: model,
         reward,
         success: obs.success,
-        latencyMs: obs.latencyMs,
+        ...(obs.latencyMs !== undefined ? { latencyMs: obs.latencyMs } : {}),
         ...(obs.costUsd !== undefined ? { costUsd: obs.costUsd } : {}),
         ...(obs.quality !== undefined ? { quality: obs.quality } : {}),
         ...(obs.stage !== undefined ? { stage: obs.stage } : {}),
@@ -434,6 +450,35 @@ export function foldRouteDecisions(events: ReadonlyArray<TraceEvent>): EvalRoute
     });
   }
   return out;
+}
+
+/**
+ * 0.6.0 §6.2 — the ARM a sample was served by, for per-model grading.
+ *
+ * A cascade turn serves more than one arm, so "the" arm has to be defined:
+ * it is the arm that produced the answer being graded — the LAST primary
+ * route of the sample (a turn that runs tools re-routes as its difficulty
+ * band shifts, and the final rung is what wrote the final text). Route
+ * decisions are preferred over served models because they carry the SPEC
+ * model string, which is what the scoreboard keys arms on; served models are
+ * the fallback for a pinned `candidate:` run, which routes nothing.
+ *
+ * Side-call models never win: judge / guide / classifier calls carry a
+ * `role`, and a stage-carrying route (`draft`, `escalation`) only stands in
+ * when the sample has no unstaged route at all.
+ */
+export function sampleArmId(args: {
+  readonly routes?: ReadonlyArray<EvalRouteDecision>;
+  readonly servedModels?: ReadonlyArray<ServedModel>;
+}): string | undefined {
+  const routes = args.routes ?? [];
+  const primaryRoutes = routes.filter((r) => r.stage === undefined);
+  const lastRoute = (primaryRoutes.length > 0 ? primaryRoutes : routes).at(-1);
+  if (lastRoute !== undefined) return lastRoute.arm;
+  const served = (args.servedModels ?? []).filter((s) => !isAuxiliaryModelRole(s.role));
+  const last = served.at(-1);
+  if (last === undefined) return undefined;
+  return last.profile ?? last.specModel ?? last.wire;
 }
 
 /** Merge per-sample served-model entries into one run-level list. */

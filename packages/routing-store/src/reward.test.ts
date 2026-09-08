@@ -52,6 +52,33 @@ describe("computeReward", () => {
     expect(withoutCost).toBeCloseTo(0.9375, 6);
   });
 
+  test("an UNMEASURED latency drops the latency term — it is not a 0ms call", () => {
+    // 0.6.0 §7.9 — the offline join attributes a turn's latency to the turn's
+    // FIRST stage only, so a later stage has no latency at all. Coercing that
+    // to 0 would score it `latRef / (latRef + 0)` = a perfect 1: the strong,
+    // expensive escalation rung would be credited as infinitely fast.
+    const instant = computeReward({ success: true, latencyMs: 0, quality: 0.5 });
+    const unmeasured = computeReward({ success: true, quality: 0.5 });
+    // quality .7 + latency .1 → instant = (0.7*0.5 + 0.1*1) / 0.8 = 0.5625
+    expect(instant).toBeCloseTo(0.5625, 12);
+    // …with no latency the whole weight falls on quality: exactly 0.5.
+    expect(unmeasured).toBeCloseTo(0.5, 12);
+    expect(unmeasured).toBeLessThan(instant);
+  });
+
+  test("with neither latency nor cost the reward is the quality alone", () => {
+    for (const quality of [0, 0.25, 0.5, 1]) {
+      expect(computeReward({ success: true, quality })).toBeCloseTo(quality, 12);
+    }
+    // A zero objective still cannot produce NaN.
+    expect(
+      computeReward(
+        { success: true, quality: 0.5 },
+        { objective: { quality: 0, cost: 0, latency: 0 } },
+      ),
+    ).toBe(1);
+  });
+
   test("costRef/latencyRef put the sub-score at exactly 0.5 at the reference", () => {
     const r = computeReward(
       { success: true, latencyMs: 5000, costUsd: 0.01 },

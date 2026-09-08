@@ -33,7 +33,9 @@ import {
   poolArmIds,
   readLiveArms,
   resolveEvalRouting,
+  resolveJudgeModelRef,
   rosterRefs,
+  sampleArmId,
 } from "./routing";
 
 const TMP_ROOTS: string[] = [];
@@ -278,6 +280,77 @@ describe("served-model attribution", () => {
         policyVersion: "abc",
       },
     ]);
+  });
+});
+
+describe("sampleArmId (§6.2)", () => {
+  test("the LAST primary route wins; a staged route only stands in alone", () => {
+    expect(
+      sampleArmId({
+        routes: [
+          { routeKey: "hard", arm: "fast", model: "m1", policy: "learned", reason: "explore" },
+          { routeKey: "hard", arm: "strong", model: "m2", policy: "learned", reason: "exploit" },
+        ],
+      }),
+    ).toBe("strong");
+    // A cascade's rungs are staged; with no unstaged route the last rung is
+    // the arm that produced the graded answer.
+    expect(
+      sampleArmId({
+        routes: [
+          {
+            routeKey: "hard",
+            arm: "fast",
+            model: "m1",
+            policy: "learned",
+            reason: "draft",
+            stage: "draft",
+          },
+          {
+            routeKey: "hard",
+            arm: "strong",
+            model: "m2",
+            policy: "forced",
+            reason: "escalate",
+            stage: "escalation",
+          },
+        ],
+      }),
+    ).toBe("strong");
+  });
+
+  test("served models are the fallback, auxiliary roles never win", () => {
+    expect(
+      sampleArmId({
+        servedModels: [
+          {
+            wire: "claude-3-5-haiku-latest",
+            specModel: "claude-haiku-4-5",
+            profile: "fast",
+            calls: 1,
+            tokens: { input: 1, output: 1 },
+          },
+          {
+            wire: "claude-opus-4-7",
+            role: "judge",
+            calls: 1,
+            tokens: { input: 1, output: 1 },
+          },
+        ],
+      }),
+    ).toBe("fast");
+    // Nothing to attribute: an unrouted sample has no arm at all.
+    expect(sampleArmId({})).toBeUndefined();
+  });
+});
+
+describe("resolveJudgeModelRef (§6.2)", () => {
+  test("resolves $profile refs through the roster and passes plain models through", () => {
+    const ir = irOf(POOL_SPEC);
+    expect(resolveJudgeModelRef(ir, "$strong")).toBe("claude-opus-4-7");
+    expect(resolveJudgeModelRef(ir, "$fast")).toBe("claude-haiku-4-5");
+    expect(resolveJudgeModelRef(ir, "openai/gpt-4o")).toBe("openai/gpt-4o");
+    expect(resolveJudgeModelRef(ir, "$nonesuch")).toBeUndefined();
   });
 });
 

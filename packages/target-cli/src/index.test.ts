@@ -1322,6 +1322,9 @@ describe("emitCli — evaluation block (loop contract 0.4, Batch B, G02)", () =>
     expect(content).toContain('import { judge } from "@crewhaus/eval-judge";');
     expect(content).toContain("const __evaluation: RunEvaluation = {");
     expect(content).toContain('graderType: "llm_judge",');
+    // 0.6.0 §6.2 (PR 13) — the judge model is stated declaratively beside the
+    // closure so the pool's per-arm quality lineage can fold it.
+    expect(content).toContain('judgeModel: "claude-haiku-4-5",');
     expect(content).toContain("threshold: 0.8,");
     expect(content).toContain('onFail: "retry",');
     expect(content).toContain("maxRetries: 2,");

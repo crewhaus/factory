@@ -62,13 +62,18 @@ describe("joinQualityToArms", () => {
     expect(rows[1]?.obs.quality).toBe(0);
   });
 
-  test("costUsd is omitted when the decision carried none; latency defaults to 0", () => {
+  test("an unmeasured cost AND an unmeasured latency are both OMITTED, never zeroed", () => {
+    // 0.6.0 §7.9 — a turn's latency is a TURN total and goes to the turn's
+    // first stage only, so a later stage has none. `0` is not the same claim:
+    // `computeReward` reads it as `latRef / (latRef + 0)` = a perfect latency
+    // term, which would flatter the expensive escalation rung for free.
     const rows = joinQualityToArms(
       [{ ...decision, costUsd: undefined, latencyMs: undefined }],
       [{ sessionId: decision.sessionId, turnNumber: 1, score: 0.5 }],
     );
-    expect(rows[0]?.obs).toEqual({ success: true, latencyMs: 0, quality: 0.5 });
+    expect(rows[0]?.obs).toEqual({ success: true, quality: 0.5 });
     expect("costUsd" in (rows[0]?.obs ?? {})).toBe(false);
+    expect("latencyMs" in (rows[0]?.obs ?? {})).toBe(false);
   });
 
   test("no matches → empty result", () => {

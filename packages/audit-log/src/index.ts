@@ -163,7 +163,21 @@ export type AuditKind =
   // would double per-method request counts and read like a replay). Payload
   // shape (opaque JSON): { tenantId, sessionId, turnNumber, modality,
   //   recordId } — never the rater's free text.
-  | "feedback_recorded";
+  | "feedback_recorded"
+  // 0.6.0 §6.3 / §9.1 — `crewhaus route promote` appends one record per
+  // PROMOTION: the moment an observe-only routing lane's evidence (the
+  // offline `q:<band>` join, the online `shadow:<scope>/<band>` audition) is
+  // folded into the live arms a learned policy exploits. Promotion is the one
+  // sanctioned path out of those lanes and it changes which model serves, so
+  // the eval that authorized it rides in the same tamper-evident chain as the
+  // fold it authorized. Payload shape (opaque JSON; see
+  // apps/cli/src/route-promote.ts):
+  //   { rootDir, lanes: [{from, to, model, lines, observations, meanQuality?}],
+  //     lines, alreadyPromoted, dryRun,
+  //     gate: { passed, reason, specName?, datasetName?, candidateRunId?,
+  //             baselineRunId?, routing?, armsDigest?, policyVersion?,
+  //             learningSeed?, warnings } }
+  | "routing_promotion";
 
 export type AuditRecord = {
   readonly ts: number;

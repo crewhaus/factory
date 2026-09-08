@@ -17,6 +17,7 @@
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*",
     "@crewhaus/ir-passes": "workspace:*",
+    "@crewhaus/model-service": "workspace:*",
     "@crewhaus/spec": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/target-batch-worker": "workspace:*",
@@ -36,8 +37,7 @@
     "@crewhaus/worker-runtime": "workspace:*"
   },
   "devDependencies": {
-    "@crewhaus/model-plan": "workspace:*",
-    "@crewhaus/model-service": "workspace:*"
+    "@crewhaus/model-plan": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

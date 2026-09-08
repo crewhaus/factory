@@ -29,6 +29,7 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { Sample } from "@crewhaus/eval-dataset";
+import { judgeCalibrationPairKey } from "@crewhaus/eval-runner";
 
 /** Thrown on malformed flags / unusable inputs. The CLI entry file routes it
  *  through `die()`; tests assert on `.message`. */
@@ -56,6 +57,15 @@ export type CalibrationPair = {
   readonly judge: number;
   /** Per-criterion 1–5 judge scores, when the rubric had named criteria. */
   readonly criterionScores?: Readonly<Record<string, number>>;
+  /**
+   * 0.6.0 §6.2 — the AGENT ARM that produced the rated answer (a `models:`
+   * profile name, else the spec/wire model string), derived from the
+   * session's own `model_route` / `model_meta` lines by
+   * {@link deriveTurnArms}. `--by-model` calibrates one cut per (arm, judge)
+   * pair; absent on turns that predate routing attribution and on
+   * dataset-carried pairs, which fold into the spec-level cut only.
+   */
+  readonly arm?: string;
 };
 
 /** Normalize a 1–5 judge score to [0,1] — the same (n-1)/4 map GradeResult uses. */
@@ -169,6 +179,96 @@ export function dropDuplicateCandidates(
     }
   }
   return { kept, duplicates };
+}
+
+// -------- 0.6.0 §6.2: per-arm attribution --------
+
+/** A parsed session event-log line, as `readSessionEvents` yields them. */
+export type LoggedTurnEvent = { kind?: string; payload?: unknown };
+
+/**
+ * 0.6.0 §6.2 — the AGENT ARM behind each turn of one session, read from the
+ * durable routing lines the runtime already writes: `model_route` (the pool
+ * decision, carrying `profile` and the SPEC model string — the identity the
+ * scoreboard keys arms on) and, as a fallback for sessions that routed
+ * nothing, `model_meta` (one line per model response, carrying `profile`,
+ * `role` and `turnNumber`).
+ *
+ * The LAST qualifying line of a turn wins: a turn that runs tools re-routes
+ * as its difficulty band shifts, and the rung that wrote the final text is
+ * the one the human rated. Auxiliary calls never win — a judge or guide call
+ * is spend in service of the answer, not the answer's arm.
+ *
+ * Turns whose lines are absent (a pre-0.6.0 session, an un-instrumented
+ * host) simply have no entry: `--by-model` folds them into the spec-level
+ * cut rather than guessing an arm.
+ */
+export function deriveTurnArms(events: ReadonlyArray<LoggedTurnEvent>): Map<number, string> {
+  const fromRoutes = new Map<number, string>();
+  const fromMeta = new Map<number, string>();
+  for (const ev of events) {
+    if (ev.kind !== "model_route" && ev.kind !== "model_meta") continue;
+    const payload = ev.payload as
+      | {
+          turnNumber?: unknown;
+          model?: unknown;
+          specModel?: unknown;
+          profile?: unknown;
+          role?: unknown;
+        }
+      | undefined;
+    const turnNumber = payload?.turnNumber;
+    if (typeof turnNumber !== "number" || !Number.isInteger(turnNumber)) continue;
+    const profile = typeof payload?.profile === "string" ? payload.profile : undefined;
+    const specModel = typeof payload?.specModel === "string" ? payload.specModel : undefined;
+    const model = typeof payload?.model === "string" ? payload.model : undefined;
+    if (ev.kind === "model_route") {
+      const arm = profile ?? specModel ?? model;
+      if (arm !== undefined) fromRoutes.set(turnNumber, arm);
+      continue;
+    }
+    const role = payload?.role;
+    if (typeof role === "string" && AUXILIARY_TURN_ROLES.has(role)) continue;
+    const arm = profile ?? model;
+    if (arm !== undefined) fromMeta.set(turnNumber, arm);
+  }
+  const out = new Map<number, string>(fromMeta);
+  for (const [turn, arm] of fromRoutes) out.set(turn, arm);
+  return out;
+}
+
+/**
+ * Model-call roles that are spend in service of the answer rather than the
+ * answer itself (mirrors `AUXILIARY_MODEL_ROLES` in `@crewhaus/trace-event-bus`,
+ * duplicated as a literal set so this pure module keeps its dependency-free
+ * shape). A judge call's model is never the arm the human rated.
+ */
+const AUXILIARY_TURN_ROLES: ReadonlySet<string> = new Set([
+  "judge",
+  "guide",
+  "classifier",
+  "consult",
+  "committee",
+  "shadow",
+  "compaction",
+]);
+
+/**
+ * Group calibration pairs by the arm that served them, in first-seen order.
+ * Pairs with no arm are excluded — they belong to the spec-level cut, which
+ * is computed over ALL pairs regardless.
+ */
+export function groupPairsByArm(
+  pairs: ReadonlyArray<CalibrationPair>,
+): Map<string, CalibrationPair[]> {
+  const byArm = new Map<string, CalibrationPair[]>();
+  for (const p of pairs) {
+    if (p.arm === undefined) continue;
+    const bucket = byArm.get(p.arm) ?? [];
+    bucket.push(p);
+    byArm.set(p.arm, bucket);
+  }
+  return byArm;
 }
 
 // -------- agreement stats --------
@@ -377,19 +477,38 @@ function round(n: number): number {
   return Math.round(n * 1000) / 1000;
 }
 
+/** One calibrated cut on disk — the spec-level entry and each pair entry. */
+export type JudgeCalibrationEntry = {
+  readonly minScore: number;
+  readonly model?: string;
+  readonly correlation: number;
+  readonly bias: number;
+  readonly pairCount: number;
+  readonly updatedAt: string;
+};
+
 /** The on-disk `.crewhaus/judge-calibration.json` schema `--apply` writes. */
 export type JudgeCalibrationFile = {
   readonly version: 1;
   /** Per spec name → the calibrated recommended --min-score cut ([0,1]). */
   readonly calibrations: Record<
     string,
-    {
-      readonly minScore: number;
-      readonly model?: string;
-      readonly correlation: number;
-      readonly bias: number;
-      readonly pairCount: number;
-      readonly updatedAt: string;
+    JudgeCalibrationEntry & {
+      /**
+       * 0.6.0 §6.2 — per (AGENT ARM, JUDGE MODEL) cuts, written by
+       * `judge calibrate --by-model` and keyed by
+       * `judgeCalibrationPairKey(arm, judgeModel)`. The eval runner falls
+       * back **pair → spec → default**, so a file without this key gates
+       * exactly as it did before, and a 0.5.x reader ignores it and keeps
+       * using the spec-level cut.
+       *
+       * Why a pair and not just an arm: a cut is a property of the JUDGE as
+       * much as of the arm being judged — the same cheap arm graded by a
+       * strong checker and by itself needs two different gates, and one
+       * keyed on the arm alone would silently reuse the wrong one when the
+       * judge changed. `version` stays 1: the key is additive.
+       */
+      readonly byPair?: Record<string, JudgeCalibrationEntry & { readonly arm: string }>;
     }
   >;
 };
@@ -433,26 +552,73 @@ export function buildCalibrationFile(
   existing: JudgeCalibrationFile | undefined,
   card: CalibrationCard,
   now: string,
+  opts: { readonly pairs?: ReadonlyArray<PairCalibration> } = {},
 ): JudgeCalibrationFile {
   const specKey = card.specName ?? "default";
-  const minScore = card.recommendedCut?.cut ?? DEFAULT_JUDGE_CUT;
+  const priorEntry = existing?.calibrations[specKey];
+  // 0.6.0 §6.2 — `--by-model` REPLACES the pairs it just measured and keeps
+  // the ones it did not: an arm that saw no rated turns this time keeps its
+  // last cut rather than silently reverting to the spec-level one.
+  const byPair: Record<string, JudgeCalibrationEntry & { arm: string }> = {
+    ...(priorEntry?.byPair ?? {}),
+  };
+  for (const pair of opts.pairs ?? []) {
+    byPair[judgeCalibrationPairKey(pair.arm, pair.judgeModel)] = {
+      arm: pair.arm,
+      minScore: round(pair.card.recommendedCut?.cut ?? DEFAULT_JUDGE_CUT),
+      model: pair.judgeModel,
+      correlation: pair.card.correlation,
+      bias: pair.card.bias,
+      pairCount: pair.card.pairCount,
+      updatedAt: now,
+    };
+  }
   return {
     version: 1,
     calibrations: {
       ...(existing?.calibrations ?? {}),
       [specKey]: {
-        minScore: round(minScore),
+        minScore: round(card.recommendedCut?.cut ?? DEFAULT_JUDGE_CUT),
         ...(card.model !== undefined ? { model: card.model } : {}),
         correlation: card.correlation,
         bias: card.bias,
         pairCount: card.pairCount,
         updatedAt: now,
+        // Absent when nothing was ever calibrated by model, keeping a
+        // pre-0.6.0 file byte-identical through a plain `--apply`.
+        ...(Object.keys(byPair).length > 0 ? { byPair } : {}),
       },
     },
   };
 }
 
+/** One (agent arm, judge model) calibration `--by-model` measured. */
+export type PairCalibration = {
+  readonly arm: string;
+  readonly judgeModel: string;
+  readonly card: CalibrationCard;
+};
+
 // -------- rendering --------
+
+/**
+ * 0.6.0 §6.2 — render the per-(arm, judge) cuts under the main card. One
+ * line per pair, worst-separated first is meaningless here (the cuts are not
+ * comparable), so arms print in the order they were measured.
+ */
+export function renderPairCalibrations(pairs: ReadonlyArray<PairCalibration>): string {
+  if (pairs.length === 0) return "";
+  const lines: string[] = ["", "  by model (agent arm x judge):"];
+  for (const p of pairs) {
+    const cut = p.card.recommendedCut?.cut ?? DEFAULT_JUDGE_CUT;
+    const roc = p.card.recommendedCut !== undefined ? "" : " (default cut — no ROC separation)";
+    lines.push(
+      `    ${p.arm} x ${p.judgeModel}: cut ${cut.toFixed(3)}  ` +
+        `(${p.card.pairCount} pair(s), correlation ${p.card.correlation.toFixed(3)})${roc}`,
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
 
 /** Render the calibration card as a terminal report. */
 export function renderCalibrationCard(card: CalibrationCard): string {

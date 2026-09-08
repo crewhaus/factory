@@ -229,6 +229,48 @@ function seedExactSession(
   return id;
 }
 
+/**
+ * 0.6.0 §7.9 — one CASCADE turn: a graded draft on the `fast` profile arm,
+ * then a forced escalation onto `strong`, so turn 1 carries TWO durable
+ * `model_route` lines, each stamped with its stage.
+ */
+function seedCascadeSession(harness: Harness): string {
+  const id = freshSessionId();
+  const events: unknown[] = [
+    userMsg("How do I export my session data to CSV format?"),
+    assistantMsg("The export command writes session data to CSV files."),
+    ev("model_route", {
+      turnNumber: 1,
+      routeKey: "hard",
+      model: "wire-haiku",
+      specModel: "claude-haiku-4-5",
+      profile: "fast",
+      stage: "draft",
+      strategy: "cascade",
+      policy: "learned",
+      reason: "test",
+    }),
+    ev("model_route", {
+      turnNumber: 1,
+      routeKey: "hard",
+      model: "wire-opus",
+      specModel: "claude-opus-4-1",
+      profile: "strong",
+      stage: "escalate",
+      strategy: "cascade",
+      policy: "forced",
+      reason: "escalated after a failing grade",
+    }),
+    feedbackLine(id, 1, "up"),
+  ];
+  writeFileSync(join(harness.sessionsDir, `${id}.jsonl`), jsonl(events));
+  writeFileSync(
+    join(harness.sessionsDir, `${id}.events.jsonl`),
+    jsonl([siblingResponse(id, 1, "claude-opus-4-1", { input: 1000, output: 200 })]),
+  );
+  return id;
+}
+
 /** Seed one 2-turn "ordered" session: durable mirrors only, no sibling. */
 function seedOrderedSession(harness: Harness): string {
   const id = freshSessionId();
@@ -1094,6 +1136,61 @@ describe("--feed-routing", () => {
         .split("\n")
         .filter((l) => l.trim() !== ""),
     ).toHaveLength(1);
+  });
+
+  test("0.6.0 §7.9 — a HYBRID turn joins PER STAGE: one row per model_route line, keyed on the route's profile arm", async () => {
+    const harness = makeHarness();
+    const id = seedCascadeSession(harness);
+    const deps = makeDeps(harness);
+    const opts = baseOpts(harness, { sessionId: id, feedRouting: true });
+    const first = await runWatchmeReport(opts, deps);
+    // The turn made TWO routed decisions (draft, then escalation): the turn's
+    // one delayed quality folds onto BOTH, not just the drafting arm.
+    expect(first.report?.feedRouting?.recorded).toBe(2);
+
+    const lines = readFileSync(join(harness.crewhausDir, "routing", "arms.jsonl"), "utf8")
+      .split("\n")
+      .filter((l) => l.trim() !== "")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(lines).toHaveLength(2);
+    // The ARM is the route line's `profile` (§7.9), so a profiled roster's
+    // arms are reachable from the offline join — and each row names its stage.
+    expect(lines.map((l) => [l["k"], l["m"], l["st"]])).toEqual([
+      ["q:hard", "fast", "draft"],
+      ["q:hard", "strong", "escalate"],
+    ]);
+    // Per-turn latency and cost are TURN totals — not per-stage measurements —
+    // so only the turn's FIRST stage carries them; the rest record the quality
+    // alone rather than double-counting a number nobody measured per stage.
+    expect(lines[0]?.["l"]).toBe(1200);
+    // …and the later stage carries NO `l` at all. Writing `0` would score the
+    // escalation rung as infinitely fast (`latRef / (latRef + 0)` = 1) — a
+    // free perfect latency term landing on whichever arm served the extra
+    // iterations, which is the pathology §6.3 item 1 exists to prevent.
+    expect(lines[1]).not.toHaveProperty("l");
+    expect(lines[1]).not.toHaveProperty("c");
+    // With neither latency nor cost the escalation row's reward is its
+    // judged quality alone — no term it did not earn.
+    expect(lines[1]?.["r"]).toBeCloseTo(lines[1]?.["q"] as number, 12);
+
+    // Rerun: both per-stage keys are durably fed → nothing re-records.
+    const second = await runWatchmeReport(opts, deps);
+    expect(second.report?.feedRouting?.recorded).toBe(0);
+    expect(second.report?.feedRouting?.deduped).toBe(2);
+  });
+
+  test("an UNSTAGED turn keeps its bare `sessionId#turnNumber` watermark, so a pre-0.6.0 fed key still dedupes", async () => {
+    const harness = makeHarness();
+    const id = seedExactSession(harness, { rateTurn1: "up" });
+    // Pre-seed the watermark exactly as an older CLI wrote it.
+    harness.store.setState({ fedRoutingKeys: [`${id}#1`] });
+    const result = await runWatchmeReport(
+      baseOpts(harness, { sessionId: id, feedRouting: true }),
+      makeDeps(harness),
+    );
+    expect(result.report?.feedRouting?.recorded).toBe(0);
+    expect(result.report?.feedRouting?.deduped).toBe(1);
+    expect(existsSync(join(harness.crewhausDir, "routing", "arms.jsonl"))).toBe(false);
   });
 
   test("without --feed-routing no arms are written", async () => {

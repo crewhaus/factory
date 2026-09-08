@@ -56,13 +56,30 @@ rewritten by `register`/`deregister`, so reads never race writers.
 ## Quality join
 
 `joinQualityToArms(decisions, quality)` joins durable route decisions to
-delayed quality scores per `(sessionId, turnNumber)`; the decision's model
-names the arm. Emitted rows carry SHADOW routeKeys — `"q:" + routeKey`, a
-namespace the runtime router never mints or reads — so recording them
-observes routing quality without steering it. Scores clamp to `[0, 1]` and
-multiple scores for one turn average. Rewards are computed by the caller via
-routing-store's `computeReward` with `obs.quality` set; this module stays
-reward-free and fs-free.
+delayed quality scores per `(sessionId, turnNumber)`; the decision's `model`
+is the ARM id — the `models:` profile name when the candidate is a profile,
+else its spec model string, which is what the live scoreboard keys on. Emitted
+rows carry SHADOW routeKeys — `"q:" + routeKey`, a namespace the runtime router
+never mints or reads — so recording them observes routing quality without
+steering it, until `crewhaus route promote` folds the lane. Scores clamp to
+`[0, 1]` and multiple scores for one turn average. Rewards are computed by the
+caller via routing-store's `computeReward` with `obs.quality` set; this module
+stays reward-free and fs-free.
+
+**One row per decision (0.6.0 §7.9).** A hybrid turn routes more than once — a
+cascade drafts on the cheap arm, then escalates to the strong one — and each
+decision carries its own `stage`. `watchme report --feed-routing` feeds every
+stage's decision, so the turn's one delayed quality folds onto all of them
+(the same one-quality-to-N-decisions fan-out the in-loop path performs at the
+strategy-turn boundary). Keeping only the first decision credited the whole
+turn to the drafting arm and made the escalation invisible. Per-turn latency
+and cost are turn totals, so the caller attaches them to the turn's first
+stage only — and a later stage's row therefore carries **no** `latencyMs` at
+all. Do not coerce that gap to `0`: `computeReward` reads `0` as a perfect
+latency term, which would hand the expensive escalation rung a free score it
+did not earn. `RouteObservation.latencyMs` is optional for exactly this
+reason; the reward drops the term and redistributes its weight, as it already
+does for an unknown `costUsd`.
 
 ## Exports
 

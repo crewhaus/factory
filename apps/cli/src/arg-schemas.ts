@@ -1240,6 +1240,10 @@ export const JUDGE_SCHEMA: ParseArgsSchema = {
     { name: "model", takesValue: true },
     // Persist the calibrated --min-score default to .crewhaus/judge-calibration.json.
     { name: "apply", takesValue: false },
+    // 0.6.0 §6.2 — additionally calibrate one cut per (agent arm, judge
+    // model) pair, written under the spec's `byPair` map by --apply. The
+    // eval runner resolves pair → spec → default.
+    { name: "by-model", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
