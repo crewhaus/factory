@@ -99,6 +99,7 @@ import { classifyRouteLabel } from "@crewhaus/eval-judge";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import type {
   IrCircuitBreaker,
+  IrModelParams,
   IrModelPool,
   IrModelPoolClassifier,
   IrModelTiers,
@@ -865,4 +866,76 @@ export function renderSubAgentDef(d: IrSubAgentDefinition): string {
     lines.push(`allowedProfiles: ${JSON.stringify(d.allowedProfiles)}`);
   }
   return `{ ${lines.join(", ")} }`;
+}
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §6.2 — the IN-LOOP judge panel, rendered once for every judge site.
+// ---------------------------------------------------------------------------
+
+/**
+ * The §6.2 panel knobs an in-loop judge site carries, as
+ * `IrEvaluationGrader` (an `llm_judge` grader) and `IrJudge` both
+ * declare them. One structural type so the three `renderEvaluation` copies
+ * and the two `JUDGE_GATE_HELPER` call sites render ONE fragment — the
+ * `renderSubAgentDef` precedent, for the same reason: five hand-mirrored
+ * copies of a field list drift.
+ */
+export type JudgePanelIr = {
+  /** The single judge model (already resolved at lower time). */
+  readonly model?: string;
+  /** A panel of judge models; overrides `model` at the grader. */
+  readonly judges?: readonly string[];
+  readonly repeats?: number;
+  readonly temperature?: number;
+  readonly target?: "output" | "transcript";
+  /** 0.6.0 §4.2 — the judge profile's pinned request params. */
+  readonly params?: IrModelParams;
+};
+
+/** The import a judge site's bundle needs for {@link renderJudgePanelFields}. */
+export const JUDGE_PANEL_IMPORT =
+  'import { gradeWithJudgePanel, inLoopRunResult } from "@crewhaus/eval-judge";';
+
+/**
+ * Render the panel fields of a `gradeWithJudgePanel({ … })` call, in a fixed
+ * order (`model`, `judges`, `repeats`, `temperature`, `target`, `params`)
+ * and ONLY when present — a spec that declares none of the §6.2 knobs emits
+ * exactly `model: "…"`, so its judge behaves as the single-model `judge()`
+ * call did before this seam existed.
+ *
+ * Model strings and the `target` literal pass through `escapeJsonString`
+ * (they are user-controlled spec values); `params` is a plain lowered object
+ * and renders through `JSON.stringify`.
+ */
+export function renderJudgePanelFields(panel: JudgePanelIr, indent: string): string {
+  const pieces: string[] = [];
+  if (panel.model !== undefined) {
+    pieces.push(`\n${indent}model: ${escapeJsonString(panel.model)},`);
+  }
+  if (panel.judges !== undefined && panel.judges.length > 0) {
+    pieces.push(`\n${indent}judges: [${panel.judges.map((m) => escapeJsonString(m)).join(", ")}],`);
+  }
+  if (panel.repeats !== undefined) pieces.push(`\n${indent}repeats: ${panel.repeats},`);
+  if (panel.temperature !== undefined) {
+    pieces.push(`\n${indent}temperature: ${panel.temperature},`);
+  }
+  if (panel.target !== undefined) {
+    pieces.push(`\n${indent}target: ${escapeJsonString(panel.target)},`);
+  }
+  if (panel.params !== undefined) {
+    pieces.push(`\n${indent}params: ${JSON.stringify(panel.params)},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * The INSTRUMENT identity a judge site declares up front (`RunEvaluation.
+ * judgeModel`, and the `judge_verdict` fallback): the single judge model, or
+ * every panelist joined with `+` in declaration order. Two different panels
+ * are two different instruments, so a per-arm quality lineage keyed on this
+ * string re-baselines instead of averaging them (§6.3 item 4).
+ */
+export function judgeInstrumentId(panel: JudgePanelIr, fallbackModel: string): string {
+  if (panel.judges !== undefined && panel.judges.length > 0) return panel.judges.join("+");
+  return panel.model ?? fallbackModel;
 }

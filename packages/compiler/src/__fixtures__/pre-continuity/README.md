@@ -339,3 +339,40 @@ runtime constructions, not emitted strings: the `RuntimeBridge` gains a
 child's spend on the parent bus. `IrSubAgentDefinition.allowedProfiles` changed
 shape (profile names → resolved `{ profile, model, params… }` options); no
 pinned spec declares `allowed_profiles`.
+
+**0.6.0 PR 13b delta — the judge panel and the auxiliary-slot params; NO pin
+moved.** Six emitter strings changed. The three `renderEvaluation` copies
+(cli / channel / managed) and the two `JUDGE_GATE_HELPER`s (workflow / graph)
+now grade through `@crewhaus/eval-judge`'s `gradeWithJudgePanel` — one
+`createJudgeGrader` fan-out — instead of a bare `judge()` call, so a spec's
+`evaluation.grader.{judges,repeats,temperature,target}` (and a `kind: judge`
+gate's identical four) is honoured rather than inert; the import line changes
+from `import { judge } …` to `import { gradeWithJudgePanel, inLoopRunResult }
+…`, and the verdict shape becomes the grader's (`score` already projected to
+0..1, the fold's own rationale, `judgeModel` naming a panel by its members
+joined with `+`). The cli and channel-bot emitters additionally render
+`compactionParams` beside `compactionModel`, and the browser emitter a
+`SPEC_GROUNDING_PARAMS` const, when — and only when — the slot resolved
+through a `models:` profile that pins request params. Every one of those
+strings is emitted ONLY for a spec that declares `evaluation:`, a `kind: judge`
+step/node, or a params-bearing `$profile` on `compaction.model` /
+`groundingModel`; none of the pinned specs here declares any of them, so the
+byte-restore test passes against the existing pins unchanged. The continuity
+opt-out contract is untouched; recorded here so the next regeneration knows the
+zero delta was checked, not skipped.
+
+**0.6.0 PR 13b review follow-up — the judged transcript learns what the
+runtime already knew; NO pin moved.** Two of the six strings above changed
+again, in the same three `renderEvaluation` copies (cli / channel / managed):
+the evaluator closure destructures `isSynthetic` beside `finalText` /
+`messages` / `bus` and forwards it into `inLoopRunResult({ finalText,
+messages, isSynthetic })`. runtime-core marks its injected `role: "user"`
+messages (retry nudges, cascade corrections, continue/tombstone prompts) in a
+module-private WeakSet, so a `target: "transcript"` judge in another package
+could not tell them from human turns and on attempt 2+ read its own previous
+rationale as a user instruction; `EvaluationTurn.isSynthetic` carries the
+marker across the seam and the projected payload now sets `synthetic: true`,
+which `renderTranscriptDigest` has always skipped. Both strings remain emitted
+ONLY for a spec that declares `evaluation:` with an `llm_judge` grader, and no
+pinned spec here declares one — the byte-restore test passes against the
+existing pins unchanged.

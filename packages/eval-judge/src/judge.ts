@@ -10,6 +10,8 @@ import { DEFAULT_PRICING, computeCostMicros, resolvePricing } from "@crewhaus/co
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { GradeResult, Grader, RunResult } from "@crewhaus/eval-grader";
 import { createLogger } from "@crewhaus/logging";
+import { buildRequestParams } from "@crewhaus/model-plan";
+import type { ModelThinking } from "@crewhaus/model-plan";
 import { resolveModel } from "@crewhaus/model-router";
 import type { ModelRole, TraceEventBus } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
@@ -26,6 +28,60 @@ import { isCategoricalRubric } from "./rubric";
 import { renderTranscriptDigest } from "./transcript-digest";
 
 export const DEFAULT_JUDGE_MODEL = "claude-sonnet-5";
+
+/** The judge call's own output ceiling when nothing pins one. */
+const DEFAULT_JUDGE_MAX_TOKENS = 1024;
+
+/**
+ * 0.6.0 §4.2 — the request parameters a `models:` profile pins on the JUDGE
+ * auxiliary slot, lowered by the compiler as `IrModelParams` and threaded
+ * here verbatim. Structurally the profile half of `@crewhaus/model-plan`'s
+ * `buildRequestParams`, so `thinking: { effort }` converts through the one
+ * shared preset table every serving slot uses — a profile's `max_tokens` /
+ * `thinking` / `temperature` therefore mean exactly the same thing on a
+ * judge as on a serving model.
+ *
+ * Absent → the judge's own defaults (1024 output tokens, temperature pinned
+ * to 0), byte-identical to a pre-0.6.0 call.
+ */
+export type JudgeRequestParams = {
+  readonly thinking?: ModelThinking;
+  readonly maxTokens?: number;
+  readonly temperature?: number;
+};
+
+/**
+ * Fold {@link JudgeRequestParams} into the provider-request fields one judge
+ * call carries. The judge's own pins are the BASE (`maxTokens` default 1024,
+ * `temperature` default 0 — deterministic-as-possible judging); the profile
+ * overrides field-by-field. `thinking: { effort }` sets both `thinking` and
+ * `reasoningEffort` (budget-style and native-effort providers each read the
+ * one they support), and the request ceiling is lifted to
+ * `effectiveMaxTokens` so a thinking budget can never crowd out the answer.
+ */
+function judgeRequestParams(opts: {
+  readonly maxTokens?: number;
+  readonly temperature?: number;
+  readonly params?: JudgeRequestParams;
+}): {
+  readonly maxTokens: number;
+  readonly thinking?: { readonly type: "enabled"; readonly budgetTokens: number };
+  readonly reasoningEffort?: "low" | "medium" | "high";
+  readonly temperature?: number;
+} {
+  const resolved = buildRequestParams(opts.params ?? {}, {
+    maxTokens: opts.maxTokens ?? DEFAULT_JUDGE_MAX_TOKENS,
+    temperature: opts.temperature ?? 0,
+  });
+  return {
+    maxTokens: resolved.effectiveMaxTokens,
+    ...(resolved.thinking !== undefined ? { thinking: resolved.thinking } : {}),
+    ...(resolved.reasoningEffort !== undefined
+      ? { reasoningEffort: resolved.reasoningEffort }
+      : {}),
+    ...(resolved.temperature !== undefined ? { temperature: resolved.temperature } : {}),
+  };
+}
 
 const logger = createLogger({ bindings: { module: "eval-judge" } });
 
@@ -240,6 +296,9 @@ export type JudgeOptions = {
   readonly target?: JudgeTarget;
   /** C35 — per-call token metering sink (see {@link JudgeUsageSink}). */
   readonly onUsage?: JudgeUsageSink;
+  /** 0.6.0 §4.2 — the judge profile's pinned request params (see
+   *  {@link JudgeRequestParams}). Absent → the judge's own defaults. */
+  readonly params?: JudgeRequestParams;
 } & JudgeBusOptions;
 
 export type JudgeResult = {
@@ -326,13 +385,14 @@ export async function judge(opts: JudgeOptions): Promise<JudgeResult> {
         },
       ],
       toolChoice: { type: "tool", name: "submit_score" },
-      maxTokens: opts.maxTokens ?? 1024,
       // NEW-HUNT-2 — judge decoding is PINNED to temperature 0 unless the
       // rubric overrides it. Adapters without a native temperature control
       // ignore the field (capability-dependent, like `thinking`), adapters
       // whose models REJECT it omit it (#413), and a provider the gates
       // don't know gets one pin-free retry (collectWithTemperatureRetry).
-      temperature: opts.temperature ?? 0,
+      // 0.6.0 §4.2 — a judge profile's `max_tokens` / `thinking` /
+      // `temperature` override those pins through {@link judgeRequestParams}.
+      ...judgeRequestParams(opts),
     },
     // 0.6.0 — the metering seam: bus publish (role "judge" by default),
     // pricing, and the C35 sink, all before the shape validation below.
@@ -390,6 +450,8 @@ export type CategoricalJudgeOptions = {
   readonly target?: JudgeTarget;
   /** C35 — per-call token metering sink (see {@link JudgeUsageSink}). */
   readonly onUsage?: JudgeUsageSink;
+  /** 0.6.0 §4.2 — the judge profile's pinned request params. */
+  readonly params?: JudgeRequestParams;
 } & JudgeBusOptions;
 
 /** NEW-graders-2 — one categorical judge verdict. */
@@ -479,10 +541,10 @@ export async function judgeCategorical(
         },
       ],
       toolChoice: { type: "tool", name: "submit_label" },
-      maxTokens: opts.maxTokens ?? 1024,
       // NEW-HUNT-2 — pinned decoding, identical to the scalar judge
-      // (#413 retry semantics included).
-      temperature: opts.temperature ?? 0,
+      // (#413 retry semantics included); 0.6.0 §4.2 — overridden field-by-
+      // field by the judge profile's pinned request params.
+      ...judgeRequestParams(opts),
     },
     // C35 + 0.6.0 — meter every judge model call (sink + bus + pricing),
     // validation outcome notwithstanding.
@@ -845,6 +907,23 @@ export function createJudgeGrader(
     bus?: TraceEventBus;
     role?: ModelRole;
     stage?: string;
+    /**
+     * 0.6.0 §4.2 — the judge profile's pinned request params, threaded into
+     * EVERY call this grader makes (single verdicts, each repeat, each
+     * panelist), so a panel's members all judge under the profile's ceiling
+     * and thinking budget.
+     */
+    params?: JudgeRequestParams;
+    /**
+     * 0.6.0 §6.2 — per-CALL usage sink: fires once per judge model call with
+     * that call's wire model, tokens and priced spend ({@link JudgeCallUsage}).
+     * `onUsage` reports tokens only; this reports the priced call, which is
+     * what an in-loop caller needs to stamp `eval_graded.judgeCostUsdMicros`
+     * / `judge_verdict.costUsdMicros` for a PANEL (n calls, one verdict).
+     * Purely observational — a sink that throws would break judging, so
+     * callers must keep it total.
+     */
+    onCall?: (usage: JudgeCallUsage) => void;
   } = {},
 ): Grader {
   // 0.6.0 — the bus/attribution fragment spread into every judge call.
@@ -884,8 +963,10 @@ export function createJudgeGrader(
         ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
         ...(opts.target !== undefined ? { target: opts.target } : {}),
         ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
+        ...(opts.params !== undefined ? { params: opts.params } : {}),
         ...busOpts,
       });
+      opts.onCall?.(result.usage);
       if (result.abstain) {
         // A3 — same conservative-placeholder contract as the scalar path:
         // the closest-pick label is a guess, not a verdict.
@@ -907,9 +988,13 @@ export function createJudgeGrader(
   }
 
   const passing = rubric.passing_score;
-  const judgeOnce = (sample: Sample, run: RunResult, model?: string): Promise<JudgeResult> => {
+  const judgeOnce = async (
+    sample: Sample,
+    run: RunResult,
+    model?: string,
+  ): Promise<JudgeResult> => {
     const effectiveModel = model ?? opts.model;
-    return judge({
+    const result = await judge({
       rubric,
       sample,
       agentOutput: judgedText(run),
@@ -918,8 +1003,11 @@ export function createJudgeGrader(
       ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
       ...(opts.target !== undefined ? { target: opts.target } : {}),
       ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
+      ...(opts.params !== undefined ? { params: opts.params } : {}),
       ...busOpts,
     });
+    opts.onCall?.(result.usage);
+    return result;
   };
 
   // A2 — multi-model panel path (judges overrides model).

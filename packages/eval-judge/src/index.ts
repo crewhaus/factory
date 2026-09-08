@@ -62,7 +62,16 @@ export type {
   JudgeCallUsage,
   VerifyDraftOptions,
   VerifyDraftResult,
+  // 0.6.0 §4.2 — the judge slot's pinned request params (a `models:`
+  // profile's max_tokens / thinking / temperature on an aux slot).
+  JudgeRequestParams,
 } from "./judge";
+// 0.6.0 §6.2 — the IN-LOOP judge seam: one `createJudgeGrader` fan-out
+// shared by the three `renderEvaluation` copies, the two judge-gate helpers
+// and the `crewhaus run` interpreter, so a declared panel is honoured
+// everywhere instead of only in the eval runner.
+export { gradeWithJudgePanel, inLoopRunResult } from "./in-loop";
+export type { InLoopJudgeVerdict, JudgePanelKnobs } from "./in-loop";
 // 0.6.0 §7.2.3 — the `policy: classifier` route classifier: an enum-
 // constrained forced-tool call metered with `role: "classifier"`.
 export {

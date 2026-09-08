@@ -30,6 +30,25 @@ import type { EgressAuditSink, JustificationAuditSink } from "@crewhaus/runtime-
 
 export type JudgeChoice = "rule-based" | "claude";
 
+/**
+ * The lowered `security.justification` slice this module reads —
+ * `IrSecurity["justification"]` structurally. 0.6.0 §4.2 adds `params`: the
+ * request params a `models:` profile pinned on the security-judge slot,
+ * threaded into the model-backed judge's own request so a `$checker` profile
+ * means the same thing here as on a serving model.
+ */
+export type JustificationSlot = {
+  readonly judge?: JudgeChoice;
+  readonly model?: string;
+  readonly params?: {
+    readonly thinking?:
+      | { readonly budgetTokens: number }
+      | { readonly effort: "low" | "medium" | "high" };
+    readonly maxTokens?: number;
+    readonly temperature?: number;
+  };
+};
+
 const VALID_JUDGE_CHOICES: ReadonlyArray<JudgeChoice> = ["rule-based", "claude"];
 
 /** Thrown by `resolveJudgeChoice` on an unrecognised choice. The CLI entry
@@ -54,7 +73,7 @@ function isJudgeChoice(s: string): s is JudgeChoice {
  */
 export function resolveJudgeChoice(
   flagValue: string | undefined,
-  securityJustification: { judge?: JudgeChoice; model?: string } | undefined,
+  securityJustification: JustificationSlot | undefined,
 ): JudgeChoice {
   const raw = flagValue ?? securityJustification?.judge ?? "rule-based";
   if (!isJudgeChoice(raw)) throw new InvalidJudgeChoiceError(raw);
@@ -80,6 +99,7 @@ export function resolveJudgeChoice(
 export async function createJustificationJudge(
   choice: JudgeChoice,
   model: string | undefined,
+  params?: JustificationSlot["params"],
 ): Promise<JustificationJudge | undefined> {
   if (choice === "rule-based") return undefined;
   const { resolveModel } = await import("@crewhaus/model-router");
@@ -88,6 +108,8 @@ export async function createJustificationJudge(
   return createClaudeJustificationJudge({
     adapter: resolution.adapter,
     model: resolution.modelId,
+    // 0.6.0 §4.2 — the judge profile's pinned request params.
+    ...(params !== undefined ? { params } : {}),
   });
 }
 

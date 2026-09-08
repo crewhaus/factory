@@ -22,7 +22,7 @@
  * `evaluation` through {@link evaluationRunOptions}.
  */
 import type { CompileWarning } from "@crewhaus/compiler";
-import { judge } from "@crewhaus/eval-judge";
+import { gradeWithJudgePanel, inLoopRunResult } from "@crewhaus/eval-judge";
 import type { HookDef } from "@crewhaus/hooks-engine";
 import type {
   IrCompaction,
@@ -36,6 +36,7 @@ import {
   type ModelWiringFragment,
   type ModelWiringRunOptions,
   type WireModelsDeps,
+  judgeInstrumentId,
   modelWiringFragmentFromIr,
   wireModels,
 } from "@crewhaus/model-service";
@@ -59,6 +60,7 @@ export type LoopContractRunOptions = Pick<
   | "temperature"
   | "rateLimits"
   | "compactionThreshold"
+  | "compactionParams"
   | "snipKeepHead"
   | "snipKeepTail"
   | "evaluation"
@@ -74,7 +76,10 @@ export type LoopContractIrSlice = {
     readonly temperature?: number;
     readonly rateLimits?: IrRateLimits;
   };
-  readonly compaction?: Pick<IrCompaction, "threshold" | "snipKeepHead" | "snipKeepTail">;
+  readonly compaction?: Pick<
+    IrCompaction,
+    "threshold" | "snipKeepHead" | "snipKeepTail" | "params"
+  >;
 };
 
 /** Valid `--ask-mode` values, mirroring `VALID_PERMISSION_MODES`. */
@@ -134,6 +139,11 @@ export function loopContractRunOptions(ir: LoopContractIrSlice): LoopContractRun
     ...(ir.agent?.temperature !== undefined ? { temperature: ir.agent.temperature } : {}),
     ...(rateLimits !== undefined && Object.keys(rateLimits).length > 0 ? { rateLimits } : {}),
     ...(compaction?.threshold !== undefined ? { compactionThreshold: compaction.threshold } : {}),
+    // 0.6.0 §4.2 — the compaction profile's pinned request params, honoured
+    // by `@crewhaus/compaction-autocompact`'s summarisation call. Mirror:
+    // the cli / channel-bot emitters render `compactionParams` beside
+    // `compactionModel`.
+    ...(compaction?.params !== undefined ? { compactionParams: compaction.params } : {}),
     ...(compaction?.snipKeepHead !== undefined ? { snipKeepHead: compaction.snipKeepHead } : {}),
     ...(compaction?.snipKeepTail !== undefined ? { snipKeepTail: compaction.snipKeepTail } : {}),
   };
@@ -254,18 +264,23 @@ function buildRunEvaluation(ev: IrEvaluation, primaryModel: string): RunEvaluati
   if (grader.type === "llm_judge") {
     const model = grader.model ?? primaryModel;
     const criteria = grader.criteria;
+    // 0.6.0 §6.2 (PR 13b) — the declared panel, exactly the knob set the
+    // three `renderEvaluation` copies render into a compiled bundle.
+    const panel = { ...grader, model };
     return {
       graderType: "llm_judge",
-      // 0.6.0 §6.2 (PR 13) — state the judge model at the seam so the pool's
-      // per-arm quality lineage can fold it (`reset_on_profile_change`);
-      // the bundle's `renderEvaluation` copies emit the same field.
-      judgeModel: model,
+      // 0.6.0 §6.2 (PR 13) — state the judge INSTRUMENT at the seam so the
+      // pool's per-arm quality lineage can fold it
+      // (`reset_on_profile_change`); a panel is named by its members joined
+      // with `+`, because two panels are two instruments. The bundle's
+      // `renderEvaluation` copies emit the same field.
+      judgeModel: judgeInstrumentId(panel, primaryModel),
       threshold: ev.threshold ?? 0.7,
       onFail: ev.onFail,
       maxRetries: ev.maxRetries,
       ...escalate,
-      evaluate: async ({ finalText, bus }) => {
-        const verdict = await judge({
+      evaluate: async ({ finalText, messages, isSynthetic, bus }) => {
+        const verdict = await gradeWithJudgePanel({
           rubric: {
             criteria: [
               {
@@ -283,26 +298,28 @@ function buildRunEvaluation(ev: IrEvaluation, primaryModel: string): RunEvaluati
             passing_score: 3,
           },
           sample: { id: "in-loop-evaluation", input: "" },
-          agentOutput: finalText,
+          run: inLoopRunResult({ finalText, messages, isSynthetic }),
           model,
+          ...(grader.judges !== undefined ? { judges: grader.judges } : {}),
+          ...(grader.repeats !== undefined ? { repeats: grader.repeats } : {}),
+          ...(grader.temperature !== undefined ? { temperature: grader.temperature } : {}),
+          ...(grader.target !== undefined ? { target: grader.target } : {}),
+          ...(grader.params !== undefined ? { params: grader.params } : {}),
           // Judge spend rides the run bus (role "judge") so it is priced and
-          // counted toward budget.usd under budget.judge_share.
+          // counted toward budget.usd under budget.judge_share — every
+          // panelist and every repeat publishes its own model_request pair.
           bus,
         });
-        const judgeInfo = {
-          model: verdict.usage.model,
-          ...(verdict.usage.costUsdMicros !== undefined
-            ? { costUsdMicros: verdict.usage.costUsdMicros }
-            : {}),
+        return {
+          score: verdict.score,
+          rationale: verdict.rationale,
+          judge: {
+            model: verdict.judgeModel,
+            ...(verdict.costUsdMicros !== undefined
+              ? { costUsdMicros: verdict.costUsdMicros }
+              : {}),
+          },
         };
-        if (verdict.abstain) {
-          return {
-            score: 0,
-            rationale: `judge abstained: ${verdict.rationale}`,
-            judge: judgeInfo,
-          };
-        }
-        return { score: (verdict.score - 1) / 4, rationale: verdict.rationale, judge: judgeInfo };
       },
     };
   }

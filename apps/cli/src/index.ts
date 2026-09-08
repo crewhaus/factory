@@ -941,6 +941,7 @@ import {
 import {
   InvalidJudgeChoiceError,
   type JudgeChoice,
+  type JustificationSlot,
   asEgressAuditSink,
   createJustificationJudge,
   openSecurityAuditSink,
@@ -3821,7 +3822,7 @@ function openRunSessionStore(): ReturnType<typeof createSessionStore> {
  */
 async function resolveJustificationJudge(
   args: ParsedArgs,
-  securityJustification: { judge?: JudgeChoice; model?: string } | undefined,
+  securityJustification: JustificationSlot | undefined,
 ): Promise<JustificationJudge | undefined> {
   const flag = args.flags["justification-judge"];
   const flagValue = typeof flag === "string" ? flag : undefined;
@@ -3832,7 +3833,11 @@ async function resolveJustificationJudge(
     if (err instanceof InvalidJudgeChoiceError) die(err.message);
     throw err;
   }
-  return createJustificationJudge(choice, securityJustification?.model);
+  return createJustificationJudge(
+    choice,
+    securityJustification?.model,
+    securityJustification?.params,
+  );
 }
 
 /**
@@ -5055,6 +5060,9 @@ async function runRunBrowser(
     const findElement = visionGrounding.createFindElementTool({
       driver,
       model: ir.groundingModel,
+      // 0.6.0 §4.2 — the grounding profile's pinned request params. Mirror:
+      // the browser-driver emitter renders the same field.
+      ...(ir.groundingParams !== undefined ? { params: ir.groundingParams } : {}),
     });
     const allTools: RegisteredTool[] = [
       navigateTool,
@@ -21387,6 +21395,11 @@ function buildWatchmeJudgePhase(
   model: string,
   specName: string,
   crewhausDir: string,
+  /** 0.6.0 §4.2 — the judge profile's pinned request params
+   *  (`watchme.judge.model: $checker`), threaded onto the phase-2 judge's own
+   *  `runChatLoop` call so the profile means the same thing here as on a
+   *  serving slot. Absent → the loop's defaults, byte-identical. */
+  params?: NonNullable<WatchmeIrView["watchme"]>["judgeParams"],
 ): WatchmeJudgePhase {
   // Judge sessions live in an ISOLATED root the report NEVER enumerates
   // (enumeration is scoped to `<crewhausDir>/sessions`). This keeps judged-turn
@@ -21457,6 +21470,10 @@ function buildWatchmeJudgePhase(
       try {
         await runChatLoop({
           model,
+          // 0.6.0 §4.2 — the judge profile's pinned request params.
+          ...(params?.maxTokens !== undefined ? { maxTokens: params.maxTokens } : {}),
+          ...(params?.thinking !== undefined ? { thinking: params.thinking } : {}),
+          ...(params?.temperature !== undefined ? { temperature: params.temperature } : {}),
           instructions: system,
           runContext,
           singleTurn: true,
@@ -21499,6 +21516,14 @@ type WatchmeIrView = {
     readonly enabled: boolean;
     readonly capture: "full" | "mirrors";
     readonly judgeModel: string;
+    /** 0.6.0 §4.2 — the watchme judge profile's pinned request params. */
+    readonly judgeParams?: {
+      readonly thinking?:
+        | { readonly budgetTokens: number }
+        | { readonly effort: "low" | "medium" | "high" };
+      readonly maxTokens?: number;
+      readonly temperature?: number;
+    };
     readonly judgeSampleRate: number;
     readonly judgeBudgetUsd: number;
     readonly scope: "harness" | "user";
@@ -21566,7 +21591,14 @@ async function runWatchmeHarnessReport(opts: {
     capabilities: DEFAULT_CAPABILITIES,
     joinQualityToArms,
     ...(judge !== undefined && judge.budgetUsd > 0 && opts.noModel !== true
-      ? { judgePhase: buildWatchmeJudgePhase(judge.model, opts.ir.name, opts.crewhausDir) }
+      ? {
+          judgePhase: buildWatchmeJudgePhase(
+            judge.model,
+            opts.ir.name,
+            opts.crewhausDir,
+            opts.ir.watchme?.judgeParams,
+          ),
+        }
       : {}),
     warn: (message) => process.stderr.write(`[watchme] ${message}\n`),
   };

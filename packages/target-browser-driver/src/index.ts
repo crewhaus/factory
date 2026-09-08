@@ -313,7 +313,11 @@ const SESSION_ID_REGEX = /^sess_[0-9a-f]{16}$/;
 const SPEC_NAME = ${escapeJsonString(ir.name)};
 const SPEC_MODEL = ${escapeJsonString(ir.agent.model)};
 const SPEC_INSTRUCTIONS = ${escapeJsonString(ir.agent.instructions)};
-const SPEC_GROUNDING_MODEL = ${escapeJsonString(ir.groundingModel)};
+const SPEC_GROUNDING_MODEL = ${escapeJsonString(ir.groundingModel)};${
+    ir.groundingParams !== undefined
+      ? `\nconst SPEC_GROUNDING_PARAMS = ${JSON.stringify(ir.groundingParams)};`
+      : ""
+  }
 const SPEC_BACKEND: "host" | "chromium" | "remote" = ${escapeJsonString(ir.driver.backend)};
 const SPEC_VIEWPORT = { width: ${ir.driver.viewport.width}, height: ${ir.driver.viewport.height} };
 const SPEC_START_URL = ${startUrl !== undefined ? escapeJsonString(startUrl) : "undefined"};${hooksConst}
@@ -400,7 +404,9 @@ async function main(): Promise<void> {
   const navigateTool = createNavigateTool({ driver${allowPrivateNavField} });
   const screenshotTool = createScreenshotTool({ driver });
   const mk = createAllMouseKeyboardTools({ driver });
-  const findElement = createFindElementTool({ driver, model: SPEC_GROUNDING_MODEL });
+  const findElement = createFindElementTool({ driver, model: SPEC_GROUNDING_MODEL${
+    ir.groundingParams !== undefined ? ", params: SPEC_GROUNDING_PARAMS" : ""
+  } });
   const tools = [navigateTool, screenshotTool, mk.click, mk.type, mk.key, mk.scroll, findElement, ...defaultCatalog.list()];
 
   // On resume the run context must carry the resumed sessionId (runtime-core

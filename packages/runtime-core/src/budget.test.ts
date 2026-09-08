@@ -213,6 +213,81 @@ describe("runChatLoop — run-level budget cap (item 27)", () => {
     expect(responses.some((r) => r.model === "claude-haiku-4-5")).toBe(true);
   });
 
+  /**
+   * 0.6.0 §4.2 (PR 13b) — the degrade rung's PROFILE params. A
+   * `budget.on_exceed.degrade.model: $fast` lowers the profile's pinned
+   * request params beside the model; once the rung takes over, the serving
+   * plan's params ARE the profile's — otherwise the cheap rung would keep
+   * answering with the expensive model's output ceiling, the opposite of
+   * what a degrade is for.
+   */
+  test("degrade: the rung's pinned params serve every call after the swap", async () => {
+    const primary = pricedAdapter("anthropic", { input: 100, output: 10 }, "opus");
+    const degraded = pricedAdapter("anthropic", { input: 100, output: 10 }, "haiku");
+    const runContext = createRunContext();
+    const stderr = captureStderr();
+    try {
+      await runChatLoop({
+        model: "claude-opus-4-1",
+        instructions: "test",
+        maxTokens: 8192,
+        _adapter: primary,
+        _budgetDegradeAdapter: degraded,
+        budget: {
+          usdMicros: 2000,
+          onExceed: {
+            kind: "degrade",
+            model: "claude-haiku-4-5",
+            params: { maxTokens: 512, temperature: 0.1 },
+          },
+        },
+        input: interactiveStdin(runContext.eventBus, ["one", "two", "three", "four"]),
+        installSigintHandler: false,
+        spinner: false,
+        runContext,
+      });
+    } finally {
+      stderr.restore();
+    }
+    // The primary served on the RUN's params …
+    expect(primary.requests.length).toBeGreaterThan(0);
+    for (const r of primary.requests) {
+      expect(r.maxTokens).toBe(8192);
+      expect(r.temperature).toBeUndefined();
+    }
+    // … and every call after the swap on the rung's own.
+    expect(degraded.requests.length).toBeGreaterThan(0);
+    for (const r of degraded.requests) {
+      expect(r.maxTokens).toBe(512);
+      expect(r.temperature).toBe(0.1);
+    }
+  });
+
+  test("degrade without pinned params leaves the serving params untouched", async () => {
+    const primary = pricedAdapter("anthropic", { input: 100, output: 10 }, "opus");
+    const degraded = pricedAdapter("anthropic", { input: 100, output: 10 }, "haiku");
+    const runContext = createRunContext();
+    const stderr = captureStderr();
+    try {
+      await runChatLoop({
+        model: "claude-opus-4-1",
+        instructions: "test",
+        maxTokens: 8192,
+        _adapter: primary,
+        _budgetDegradeAdapter: degraded,
+        budget: { usdMicros: 2000, onExceed: { kind: "degrade", model: "claude-haiku-4-5" } },
+        input: interactiveStdin(runContext.eventBus, ["one", "two", "three", "four"]),
+        installSigintHandler: false,
+        spinner: false,
+        runContext,
+      });
+    } finally {
+      stderr.restore();
+    }
+    expect(degraded.requests.length).toBeGreaterThan(0);
+    for (const r of degraded.requests) expect(r.maxTokens).toBe(8192);
+  });
+
   test("no budget option leaves the loop untouched (all offered turns run)", async () => {
     const primary = pricedAdapter("anthropic", { input: 100, output: 10 }, "ok");
     const runContext = createRunContext();

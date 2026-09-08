@@ -61,6 +61,7 @@ import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@cre
 import {
   type Advertisement,
   type ModelProfile,
+  type ModelThinking,
   type RequestParams,
   type RouteRule,
   type RouteSignals,
@@ -203,6 +204,7 @@ import {
   type PreRouteClassifierVerdict,
   type PreRouteForced,
   describeHintEvidence,
+  isSyntheticMessage,
   latestHumanUserMessage,
   markSynthetic,
   messageText,
@@ -1090,6 +1092,17 @@ export type EvaluationTurn = {
    */
   readonly messages: ReadonlyArray<Anthropic.MessageParam>;
   /**
+   * 0.6.0 §6.2 — membership test for the runtime-INJECTED messages inside
+   * `messages` (retry nudges, cascade corrections, continue/tombstone
+   * prompts, the resumed-toolset marker). The marker lives in a
+   * module-private WeakSet, so nothing on the message object itself carries
+   * it and a grader in another package cannot recover it. A `target:
+   * "transcript"` judge MUST skip them: on attempt 2+ the retry nudge quotes
+   * the judge's own previous rationale, and grading that as a user
+   * instruction is the measurement-integrity hazard §7.2.1 exists to prevent.
+   */
+  readonly isSynthetic?: (message: Anthropic.MessageParam) => boolean;
+  /**
    * Aggregate token usage across every MAIN-turn model call this attempt
    * made (all tool iterations included; compaction/judge side-calls are
    * not main-turn calls and are excluded). On an evaluation-triggered
@@ -1146,6 +1159,21 @@ export type EvaluationResult = {
    * prompt from the pre-draft snapshot.
    */
   readonly correction?: string;
+};
+
+/**
+ * 0.6.0 §4.2 — the request parameters a `models:` profile pins on an
+ * AUXILIARY model slot (judge / compaction / degrade / security / watchme /
+ * grounding), lowered by the compiler as `IrModelParams`. Structurally the
+ * profile half of `@crewhaus/model-plan`'s `buildRequestParams`, so a
+ * profile's `max_tokens` / `thinking` / `temperature` mean the same thing on
+ * an auxiliary slot as on a serving one. Absent everywhere → byte-identical
+ * to a pre-0.6.0 run.
+ */
+export type AuxRequestParams = {
+  readonly thinking?: ModelThinking;
+  readonly maxTokens?: number;
+  readonly temperature?: number;
 };
 
 /**
@@ -1229,7 +1257,10 @@ export type RunEvaluation = {
    *
    * Emitted by the three `renderEvaluation` copies and the interpreter's
    * `buildRunEvaluation` for `llm_judge` graders only — a `contains`/`regex`
-   * grader has no judge, and their bundles stay byte-identical.
+   * grader has no judge, and their bundles stay byte-identical. 0.6.0 §6.2
+   * (PR 13b): under a declared `judges` PANEL this is every panelist joined
+   * with `+`, because two panels are two instruments and a per-arm lineage
+   * keyed on this string must re-baseline rather than average them.
    */
   readonly judgeModel?: string;
 };
@@ -1456,6 +1487,15 @@ export type RunChatLoopOptions = {
    * elsewhere.
    */
   compactionModel?: string;
+  /**
+   * 0.6.0 §4.2 — the request params a `models:` profile pins on the
+   * COMPACTION slot (`compaction.model: $summariser`), lowered as
+   * `IrCompaction.params` and handed verbatim to
+   * `@crewhaus/compaction-autocompact`, which folds them over the
+   * summariser's own ceiling through the shared `buildRequestParams`. Absent
+   * → the summariser's defaults, byte-identical to a pre-0.6.0 run.
+   */
+  compactionParams?: AuxRequestParams;
   /**
    * Test injection backdoor: pre-built ProviderAdapter that bypasses
    * the model-router. When set, `model` is still the user-facing
@@ -2427,7 +2467,11 @@ export type RunChatLoopOptions = {
     readonly usdMicros: number;
     readonly onExceed:
       | { readonly kind: "stop" }
-      | { readonly kind: "degrade"; readonly model: string };
+      /** 0.6.0 §4.2 — `params` is the degrade profile's pinned request
+       *  params: once the rung takes over, the serving plan's params ARE
+       *  the profile's, so a `$cheap` degrade target gets its own
+       *  `max_tokens` / `thinking` / `temperature` and not the primary's. */
+      | { readonly kind: "degrade"; readonly model: string; readonly params?: AuxRequestParams };
     readonly scope?: "run" | "session";
     readonly judgeShare?: number;
   };
@@ -2879,6 +2923,58 @@ export const RETAINED_LOOP_TOOL_NAMES: ReadonlyArray<string> = [
   "MemoryForget",
   "MemoryClear",
 ];
+
+/**
+ * 0.6.0 §4.2 — the SINGLE-MODEL degrade rung's plan. `budget.on_exceed:
+ * degrade` re-resolves the primary model to a cheaper rung mid-run; when
+ * that rung's slot resolved through a `models:` profile, the profile's
+ * pinned request params must serve from then on — otherwise the cheap rung
+ * would keep answering with the expensive model's thinking budget and output
+ * ceiling, which is the opposite of what a degrade is for.
+ *
+ * Everything except the model identity and the params is INHERITED from the
+ * primary plan: a degrade narrows spend, never the toolset, the permission
+ * rules or the rate buckets. Returns `undefined` when the rung pinned no
+ * params, so a degrade without a profile leaves the serving plan exactly as
+ * it was (byte-identical to a pre-0.6.0 run).
+ *
+ * Exclusivity (§4.1) is the pool's rule verbatim: a rung that pins
+ * `temperature` drops the run's `thinking`, and one that pins `thinking`
+ * drops the run's `temperature` — the two never ride one request.
+ */
+function degradePlanFrom(
+  base: CandidatePlan,
+  specModel: string,
+  wireModelId: string,
+  params: AuxRequestParams | undefined,
+): CandidatePlan | undefined {
+  if (params === undefined) return undefined;
+  const baseThinking: ModelThinking | undefined =
+    base.params.reasoningEffort !== undefined
+      ? { effort: base.params.reasoningEffort }
+      : base.params.thinking !== undefined
+        ? { budgetTokens: base.params.thinking.budgetTokens }
+        : undefined;
+  const keepThinking =
+    params.temperature !== undefined && params.thinking === undefined ? undefined : baseThinking;
+  const keepTemperature =
+    params.thinking !== undefined && params.temperature === undefined
+      ? undefined
+      : base.params.temperature;
+  const merged = buildRequestParams(params, {
+    maxTokens: base.params.maxTokens,
+    ...(keepThinking !== undefined ? { thinking: keepThinking } : {}),
+    ...(keepTemperature !== undefined ? { temperature: keepTemperature } : {}),
+  });
+  return {
+    ...base,
+    armId: specModel,
+    modelString: specModel,
+    wireModelId,
+    params: merged,
+    paramsFingerprint: planFingerprint(merged),
+  };
+}
 
 /**
  * Does ANY user message in the request transcript carry an image block
@@ -3950,6 +4046,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     return true;
   };
   let budgetDegraded = false;
+  /**
+   * 0.6.0 §4.2 — the SINGLE-MODEL degrade rung's plan, built once when the
+   * rung takes over (`enforceBudget`'s non-pool branch) and read by the
+   * per-call plan selection from then on, so the degrade profile's pinned
+   * request params serve instead of the primary's. Undefined until a degrade
+   * fires — and always undefined under a pool, where degrade is an
+   * ELIGIBILITY restriction and the rung's own candidate plan already serves.
+   */
+  let degradedPlan: CandidatePlan | undefined;
   // 0.6.0 — the turn in which the degrade fired. Spend never falls back
   // under the cap, so "a later breach on the degraded rung" cannot be an
   // accrual boundary (the rung's first priced response would trip the very
@@ -4067,6 +4172,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       providerId = degraded.providerId;
       wireModelId = degraded.modelId;
       degradedSpecModel = target;
+      // 0.6.0 §4.2 — the degrade rung serves on its OWN plan from here on:
+      // the profile's pinned params replace the primary's, exactly as a pool
+      // candidate's would. Built once (a degrade never re-enters), off the
+      // primary plan so the toolset, permissions and rate buckets stay the
+      // run's — only the model identity and the request params move.
+      degradedPlan = degradePlanFrom(
+        primaryPlan,
+        target,
+        degraded.modelId,
+        opts.budget.onExceed.params,
+      );
       // A degrade takes over from the failover chain: subsequent calls hit
       // the degraded adapter directly (v1 keeps one rung, no re-entry to the
       // chain). Null it so the request/response stamping stops consulting it.
@@ -4618,7 +4734,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const compactionSpecModel = opts.compactionModel ?? opts.model;
   const compactionExtras = (): Pick<
     CompactArgs,
-    "realInputTokens" | "curate" | "onCurate" | "bus" | "compactionSpecModel"
+    "realInputTokens" | "curate" | "onCurate" | "bus" | "compactionSpecModel" | "compactionParams"
   > => ({
     ...(lastModelInputTokens !== undefined ? { realInputTokens: lastModelInputTokens } : {}),
     ...(curateConfig !== undefined ? { curate: curateConfig, onCurate: publishCurate } : {}),
@@ -4626,6 +4742,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // with role "compaction", so it is priced and counted toward `budget`.
     bus,
     compactionSpecModel,
+    // 0.6.0 §4.2 — the compaction profile's pinned request params.
+    ...(opts.compactionParams !== undefined ? { compactionParams: opts.compactionParams } : {}),
   });
   const permissionMode: PermissionMode = opts.permissionMode ?? "default";
   // #383 — merge the harness's `.crewhaus/settings.json` rules into the
@@ -7547,7 +7665,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // for a single-model run. `servingPlan` is what the dispatch
             // gate, the permission / rate / tool_config seams and `ListTools`
             // read for every tool call this model call produces.
-            const plan: CandidatePlan = poolTurn?.plan ?? primaryPlan;
+            const plan: CandidatePlan = poolTurn?.plan ?? degradedPlan ?? primaryPlan;
             servingPlan = plan;
             // The served arm for children: the pool candidate's identity when
             // one serves, else whatever this call is going to (a tier, the
@@ -8200,6 +8318,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 // 0.6.0 §6.2 — the reactive summary is metered too.
                 bus,
                 compactionSpecModel,
+                // 0.6.0 §4.2 — and carries the profile's pinned params.
+                ...(opts.compactionParams !== undefined
+                  ? { compactionParams: opts.compactionParams }
+                  : {}),
               }).finally(() => out.spinner.stop());
               // §2.3 — persist the summary text alongside the counts (the
               // reactive path always ends in autocompact's [marker, summary]).
@@ -8701,6 +8823,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         graded = await evaluation.evaluate({
           finalText: terminalText(attempt.terminalContent),
           messages,
+          // The runtime owns the synthetic marker; a transcript judge that
+          // cannot see it grades its own retry nudge as a user turn.
+          isSynthetic: isSyntheticMessage,
           usage: attempt.usage,
           // 0.6.0 §6.2 — the judge publishes its model calls on THIS bus, so
           // the budget meter above (and any attached cost-tracker) sees them.
@@ -9860,6 +9985,8 @@ type CompactArgs = {
    *  or the agent's own), stamped as `specModel` when it differs from the
    *  wire `model`. */
   compactionSpecModel?: string;
+  /** 0.6.0 §4.2 — the compaction profile's pinned request params. */
+  compactionParams?: AuxRequestParams;
 };
 
 type OnCompaction = (info: CompactionInfo) => Promise<void>;
@@ -9918,6 +10045,7 @@ async function maybeCompact(
     onCurate,
     bus,
     compactionSpecModel,
+    compactionParams,
   } = args;
 
   // Item 4 / G28 — real-token calibration. The initial array's real size is
@@ -10003,6 +10131,7 @@ async function maybeCompact(
     ...(ledgerText !== undefined ? { ledgerText } : {}),
     ...(bus !== undefined ? { bus } : {}),
     ...(compactionSpecModel !== undefined ? { specModel: compactionSpecModel } : {}),
+    ...(compactionParams !== undefined ? { params: compactionParams } : {}),
   });
   if (onCompaction !== undefined) {
     const summary = summaryTextOf(after);
@@ -10031,6 +10160,8 @@ type ForceCompactArgs = {
   bus?: TraceEventBus;
   /** See CompactArgs.compactionSpecModel. */
   compactionSpecModel?: string;
+  /** See CompactArgs.compactionParams. */
+  compactionParams?: AuxRequestParams;
 };
 
 /**
@@ -10051,6 +10182,7 @@ async function forceCompact(args: ForceCompactArgs): Promise<Anthropic.MessagePa
     getLedgerText,
     bus,
     compactionSpecModel,
+    compactionParams,
   } = args;
   const snipped = snip(messages, snipKeepHead, snipKeepTail);
   // §2.3 — same externalize-before-drop contract as the pre-turn ladder:
@@ -10067,5 +10199,6 @@ async function forceCompact(args: ForceCompactArgs): Promise<Anthropic.MessagePa
     ...(ledgerText !== undefined ? { ledgerText } : {}),
     ...(bus !== undefined ? { bus } : {}),
     ...(compactionSpecModel !== undefined ? { specModel: compactionSpecModel } : {}),
+    ...(compactionParams !== undefined ? { params: compactionParams } : {}),
   });
 }

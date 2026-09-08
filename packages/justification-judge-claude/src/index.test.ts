@@ -246,3 +246,70 @@ describe("ClaudeJustificationJudgeError", () => {
     });
   });
 });
+
+/**
+ * 0.6.0 §4.2 (PR 13b) — the SECURITY judge slot's profile params. A
+ * `security.justification.model: $checker` lowers the profile's pinned
+ * `max_tokens` / `thinking` / `temperature` into
+ * `IrSecurity.justification.params`; the CLI threads them here and they must
+ * land on the verdict request, folded over the judge's own 512-token
+ * ceiling.
+ */
+describe("security judge profile params (0.6.0 §4.2)", () => {
+  const VERDICT = '{"allow":true,"reason":"consistent","confidence":0.9}';
+  const INPUT = {
+    toolName: "SendMessage",
+    justification: "notify the user",
+    sessionGoal: "notify the user when done",
+    input: {},
+  };
+
+  /** Capture the ProviderRequest the judge builds. */
+  function capturing(base: ProviderAdapter): {
+    adapter: ProviderAdapter;
+    // biome-ignore lint/suspicious/noExplicitAny: minimal mock capture
+    last: () => any;
+  } {
+    // biome-ignore lint/suspicious/noExplicitAny: minimal mock capture
+    let last: any;
+    return {
+      last: () => last,
+      adapter: {
+        ...base,
+        // biome-ignore lint/suspicious/noExplicitAny: minimal mock capture
+        stream(req: any) {
+          last = req;
+          return base.stream(req);
+        },
+      } as ProviderAdapter,
+    };
+  }
+
+  test("absent params keep the pre-0.6.0 512-token request", async () => {
+    const { adapter, last } = capturing(mockAdapter(VERDICT));
+    await createClaudeJustificationJudge({ adapter, model: "m" })(INPUT);
+    expect(last().maxTokens).toBe(512);
+    expect(last().thinking).toBeUndefined();
+    expect(last().temperature).toBeUndefined();
+  });
+
+  test("a profile's max_tokens / temperature / thinking reach the verdict request", async () => {
+    const { adapter, last } = capturing(mockAdapter(VERDICT));
+    await createClaudeJustificationJudge({
+      adapter,
+      model: "m",
+      params: { maxTokens: 2048, thinking: { effort: "medium" } },
+    })(INPUT);
+    expect(last().reasoningEffort).toBe("medium");
+    expect(last().thinking.type).toBe("enabled");
+    expect(last().maxTokens).toBeGreaterThan(last().thinking.budgetTokens);
+
+    const t = capturing(mockAdapter(VERDICT));
+    await createClaudeJustificationJudge({
+      adapter: t.adapter,
+      model: "m",
+      params: { temperature: 0.2 },
+    })(INPUT);
+    expect(t.last().temperature).toBe(0.2);
+  });
+});

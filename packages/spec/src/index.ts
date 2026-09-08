@@ -674,8 +674,15 @@ const budgetBlock = z
  * `@crewhaus/eval-judge`:
  *   - `judges`  — a PANEL of judge models (each a grammar string or a
  *     `$profile`); mutually exclusive with the single `model`.
- *   - `repeats` — k repeat verdicts per judge, folded by median (odd counts
- *     avoid ties).
+ *   - `repeats` — k repeat verdicts per judge, folded by median. It must be
+ *     ODD: an even count has no median without a tie-break, and
+ *     `createJudgeGrader` refuses one outright. The bound lives HERE rather
+ *     than in the emitters so the refusal lands at parse time — before 0.6.0
+ *     PR 13b these knobs were inert and an even count merely did nothing;
+ *     now every judge site honours them, so an unrefused `repeats: 2` would
+ *     throw mid-run (and `optimize` could patch one in, since
+ *     `evaluation.grader.repeats` / `steps[].judge.repeats` are optimizable
+ *     and applySpecPatch re-parses through this schema).
  *   - `temperature` — the judge's pinned sampling temperature (0 is the
  *     judge-bias literature's recommendation).
  *   - `target` — `output` (default) grades the final text; `transcript`
@@ -696,8 +703,12 @@ const judgePanelFields = {
     .int()
     .min(1)
     .max(9)
+    .refine((n) => n % 2 === 1, {
+      message:
+        "repeats must be odd — verdicts are folded by median, and an even count cannot break a tie",
+    })
     .optional()
-    .describe("repeat verdicts per judge, folded by median (default 1)"),
+    .describe("repeat verdicts per judge, folded by median; must be odd (default 1)"),
   temperature: z
     .number()
     .min(0)

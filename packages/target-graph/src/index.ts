@@ -10,8 +10,10 @@ import {
 } from "@crewhaus/ir";
 import {
   HYBRID_WIRING_IMPORT,
+  JUDGE_PANEL_IMPORT,
   poolNeedsHybridWiring,
   renderHybridWiringFields,
+  renderJudgePanelFields,
   renderModelWiringFields,
   scopedModelWiringFragment,
 } from "@crewhaus/model-service";
@@ -497,8 +499,14 @@ const JUDGE_GATE_HELPER = `
 /**
  * Loop contract 0.4 (G02) — score \`output\` in [0,1] against free-text
  * judge criteria: eval-judge's forced-tool scorer over a single-criterion
- * rubric (generic 1–5 anchors), mapped down via (n - 1) / 4. The judge
- * model resolves through the model-router, so any provider can judge; its
+ * rubric (generic 1–5 anchors), mapped down via (n - 1) / 4. 0.6.0 §6.2 —
+ * the call goes through \`createJudgeGrader\`, so the gate's declared
+ * \`judges\` panel / \`repeats\` (median fold, strict-majority pass),
+ * \`temperature\`, \`target\` and the judge profile's pinned request
+ * \`params\` are all honoured; a gate that declares none of them makes the
+ * same single call it always did.
+ *
+ * The judge model resolves through the model-router, so any provider can judge; its
  * calls publish on the run bus with role "judge", so any cost-tracker on that
  * bus prices them and the verdict carries the judge's wire model + priced
  * spend for the judge_verdict event. The graph shape has no run-spanning
@@ -510,11 +518,16 @@ const JUDGE_GATE_HELPER = `
 async function __judgeGate(opts: {
   criteria: string;
   model: string;
+  judges?: string[];
+  repeats?: number;
+  temperature?: number;
+  target?: "output" | "transcript";
+  params?: { thinking?: { budgetTokens: number } | { effort: "low" | "medium" | "high" }; maxTokens?: number; temperature?: number };
   gatedTask: string;
   output: string;
   bus: TraceEventBus;
 }): Promise<{ score: number; rationale: string; judgeModel: string; costUsdMicros?: number }> {
-  const result = await judge({
+  const result = await gradeWithJudgePanel({
     rubric: {
       criteria: [
         {
@@ -532,18 +545,26 @@ async function __judgeGate(opts: {
       passing_score: 3,
     },
     sample: { id: "judge-gate", input: opts.gatedTask },
-    agentOutput: opts.output,
+    // A gate sees the gated step's OUTPUT, not a captured transcript: under
+    // \`target: "transcript"\` the digest degrades to that output behind its
+    // own "(no transcript recorded)" marker rather than inventing evidence.
+    run: inLoopRunResult({ finalText: opts.output }),
     model: opts.model,
+    ...(opts.judges !== undefined ? { judges: opts.judges } : {}),
+    ...(opts.repeats !== undefined ? { repeats: opts.repeats } : {}),
+    ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+    ...(opts.target !== undefined ? { target: opts.target } : {}),
+    ...(opts.params !== undefined ? { params: opts.params } : {}),
     // Judge spend rides the run bus (role "judge") so a tracker on that bus
     // prices it; see the helper docblock for what the graph cap does not
     // yet count.
     bus: opts.bus,
   });
   return {
-    score: (result.score - 1) / 4,
+    score: result.score,
     rationale: result.rationale,
-    judgeModel: result.usage.model,
-    ...(result.usage.costUsdMicros !== undefined ? { costUsdMicros: result.usage.costUsdMicros } : {}),
+    judgeModel: result.judgeModel,
+    ...(result.costUsdMicros !== undefined ? { costUsdMicros: result.costUsdMicros } : {}),
   };
 }
 `;
@@ -917,8 +938,7 @@ function renderJudgeNodeBody(node: IrGraphNode, ir: IrGraphV0): string {
       const __output = __present.length === 1 ? String(__state[__first]) : __present.map((n) => "## " + n + "\\n" + String(__state[n])).join("\\n\\n");
       const __task = __present.length === 1 ? (__tasks[__first] ?? "") : __present.map((n) => "## " + n + "\\n" + (__tasks[n] ?? "")).join("\\n\\n");
       const __result = await __judgeGate({
-        criteria: ${escapeJsonString(gate.criteria)},
-        model: ${escapeJsonString(node.model)},
+        criteria: ${escapeJsonString(gate.criteria)},${renderJudgePanelFields({ ...gate, model: node.model }, "        ")}
         gatedTask: __task,
         output: __output,
         bus: ctx.runContext.eventBus,
@@ -1102,7 +1122,7 @@ function renderAgent(ir: IrGraphV0, evalEntry = false): string {
     ? `\n${HYBRID_WIRING_IMPORT}`
     : "";
   const judgeImport = hasJudges
-    ? `\nimport { judge } from "@crewhaus/eval-judge";\nimport { attachRunEventSink } from "@crewhaus/runtime-core";\nimport type { TraceEventBus } from "@crewhaus/trace-event-bus";`
+    ? `\n${JUDGE_PANEL_IMPORT}\nimport { attachRunEventSink } from "@crewhaus/runtime-core";\nimport type { TraceEventBus } from "@crewhaus/trace-event-bus";`
     : "";
   // 0.6.0 §7.3 (PR 9c) — the judge nodes publish `judge_verdict` on the shared
   // bus between node loops, when no node's runChatLoop is live to mirror it
