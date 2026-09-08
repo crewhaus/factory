@@ -20,6 +20,7 @@ import type {
 } from "@crewhaus/trace-event-bus";
 import { RunnerError } from "./errors";
 import { sampleArtifactDirName } from "./resume";
+import { foldRouteDecisions, foldServedModels } from "./routing";
 import type { AgentInvoker, GraderEntry, SampleMetrics, SampleResult } from "./types";
 
 /**
@@ -59,6 +60,15 @@ export async function runSample(args: {
    * `all`, today's exact semantics (AND of passed, unweighted mean score).
    */
   combine?: GraderCombinePolicy;
+  /**
+   * 0.6.0 §6.1 — this sample ran under a ROUTED eval (`--routing` ≠ static).
+   * Only then is served-model attribution folded onto the result: every run
+   * publishes `model_response` events, so folding unconditionally would add
+   * `servedModels` to every unrouted sample's `meta.json` and to
+   * `results.json`'s aggregates — the byte-identity an absent `--routing` is
+   * supposed to preserve. Absent ⇒ static, exactly as before.
+   */
+  routed?: boolean;
 }): Promise<SampleResult> {
   const { sample, invoker, graders, outDir, model } = args;
   const trialSuffix = args.trial !== undefined && args.trial > 1 ? `.trial${args.trial}` : "";
@@ -142,6 +152,17 @@ export async function runSample(args: {
   const toolCalls = extractToolCalls(finalEvents);
   const tokens = sumTokens(finalEvents);
   const metrics = computeMetrics(sample, finalEvents, toolCalls);
+  // 0.6.0 §6.1 — served-model attribution. `model` (the CONFIGURED model)
+  // stays exactly as it was; these two say what actually answered and how it
+  // was chosen. `servedModels` is folded only on a ROUTED run — every run
+  // publishes `model_response` events, so folding unconditionally would put
+  // the field on every unrouted sample too — and `routes` only exists when a
+  // pool actually routed. An unrouted sample's SampleResult / meta.json
+  // therefore stay byte-identical.
+  const servedModelsFolded = args.routed === true ? foldServedModels(finalEvents) : [];
+  const servedModels = servedModelsFolded.length > 0 ? servedModelsFolded : undefined;
+  const routesFolded = foldRouteDecisions(finalEvents);
+  const routes = routesFolded.length > 0 ? routesFolded : undefined;
 
   // Apply graders. `artifacts` is the PR-19 seam for artifact-reading
   // graders (grader-continuity): the sample's own directory — the primary
@@ -252,6 +273,8 @@ export async function runSample(args: {
     turns,
     tokens,
     model,
+    ...(servedModels !== undefined ? { servedModels } : {}),
+    ...(routes !== undefined ? { routes } : {}),
     agentOutput,
     // B13 — carry the sample's metadata into the result so slice
     // aggregation (and downstream results.json readers) can group without
@@ -276,6 +299,8 @@ export async function runSample(args: {
         turns,
         tokens,
         model,
+        ...(servedModels !== undefined ? { servedModels } : {}),
+        ...(routes !== undefined ? { routes } : {}),
         metrics,
         ...(error !== undefined ? { error } : {}),
         ...(graderError !== undefined ? { graderError } : {}),

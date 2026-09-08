@@ -172,6 +172,14 @@ export function pinBaseline(args: {
     ...(run.judgeModel !== undefined ? { judgeModel: run.judgeModel } : {}),
     ...(run.p95LatencyMs !== undefined ? { p95LatencyMs: run.p95LatencyMs } : {}),
     ...(run.costUsd !== undefined ? { costUsd: run.costUsd } : {}),
+    // 0.6.0 §6.1 — the per-arm lineage (`setBaseline` KEYS on armId/routing)
+    // plus the routed instrument guard. Rebuilding the pin field-by-field
+    // without these would re-pin a routed run under the legacy key and
+    // silently overwrite the primary's baseline.
+    ...(run.armId !== undefined ? { armId: run.armId } : {}),
+    ...(run.routing !== undefined ? { routing: run.routing } : {}),
+    ...(run.policyVersion !== undefined ? { policyVersion: run.policyVersion } : {}),
+    ...(run.armsDigest !== undefined ? { armsDigest: run.armsDigest } : {}),
     ts: args.nowIso,
   };
   setBaseline(entry, evalsDir);

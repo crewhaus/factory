@@ -73,11 +73,34 @@ export {
   type MatrixCell,
   type MatrixPricingFn,
   type MatrixRow,
+  type MatrixVerdict,
   type ModelMatrix,
   buildMatrix,
   formatUsd,
   renderMatrix,
 } from "./matrix";
+// 0.6.0 §6.1 — `eval leaderboard`: per-arm rows with Wilson intervals, paired
+// sign-flip significance with a Holm correction, and an explicit refusal to
+// name a winner the evidence does not support.
+export {
+  DEFAULT_LEADERBOARD_MIN_N,
+  LEADERBOARD_METRICS,
+  type Leaderboard,
+  type LeaderboardComparison,
+  type LeaderboardExclusion,
+  type LeaderboardMetric,
+  type LeaderboardOptions,
+  type LeaderboardVerdict,
+  type MatrixVerdicts,
+  buildLeaderboard,
+  formatLeaderboardLines,
+  holmAdjust,
+  intervalsOverlap,
+  pairedDeltas,
+  pairwiseTable,
+  rowArm,
+  withVerdict,
+} from "./leaderboard";
 // C31 — cross-run trends over the history index (text table + a
 // self-contained inline-SVG chart page).
 export {
@@ -86,6 +109,7 @@ export {
   buildTrends,
   formatTrendSummaryLines,
   renderTrends,
+  trendSeriesLabel,
   trendTable,
 } from "./trends";
 // C32 — flat per-sample × per-grader export across runs (csv / jsonl).
@@ -101,21 +125,31 @@ export {
 } from "./export";
 export { ReportError } from "./errors";
 export {
+  BASELINE_KEY_V2_PREFIX,
   BASELINES_FILENAME,
   type BaselineEntry,
+  type BaselineLineage,
+  type BaselineLookup,
   type BaselinesFile,
   DEFAULT_EVALS_DIR,
   INDEX_FILENAME,
+  ROUTED_LINEAGE_SEGMENT,
   type RecordEvalRunOptions,
   type RunIndexEntry,
   appendRunIndex,
   baselineKey,
+  baselineKeyFor,
+  baselineKeyV2,
   getBaseline,
   hashDatasetFile,
+  isLegacyLineage,
+  lineageOfEntry,
   readBaselines,
   readRunIndex,
   readRunIndexLatest,
   recordEvalRun,
+  resolveBaseline,
+  routingColumnsFromSummary,
   runIndexEntryFromSummary,
   setBaseline,
 } from "./history";

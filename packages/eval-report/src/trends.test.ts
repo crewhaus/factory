@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { RunIndexEntry } from "./history";
-import { buildTrends, formatTrendSummaryLines, renderTrends, trendTable } from "./trends";
+import {
+  buildTrends,
+  formatTrendSummaryLines,
+  renderTrends,
+  trendSeriesLabel,
+  trendTable,
+} from "./trends";
 
 function entry(overrides: Partial<RunIndexEntry> & { runId: string }): RunIndexEntry {
   return {
@@ -166,5 +172,59 @@ describe("renderTrends (self-contained HTML)", () => {
 
   test("an empty selection renders an honest empty page", () => {
     expect(renderTrends([])).toContain("No recorded runs match.");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §6.1 — per-arm trend series
+// ---------------------------------------------------------------------------
+
+describe("buildTrends — per-arm lineages", () => {
+  const routedEntry = (
+    runId: string,
+    ts: string,
+    passRate: number,
+    extra: Partial<RunIndexEntry> = {},
+  ): RunIndexEntry => ({
+    runId,
+    specName: "concierge",
+    specHash: "h",
+    datasetName: "smoke",
+    datasetHash: "d",
+    passRate,
+    meanScore: passRate,
+    sampleCount: 10,
+    ts,
+    outDir: `/abs/${runId}`,
+    ...extra,
+  });
+
+  test("routed arms get their OWN series instead of merging into the primary's", () => {
+    const series = buildTrends([
+      routedEntry("run_p1", "2026-07-01T00:00:00.000Z", 0.9),
+      routedEntry("run_f1", "2026-07-02T00:00:00.000Z", 0.4, {
+        armId: "fast",
+        routing: "candidate:$fast",
+      }),
+      routedEntry("run_f2", "2026-07-03T00:00:00.000Z", 0.45, {
+        armId: "fast",
+        routing: "candidate:$fast",
+      }),
+      routedEntry("run_r1", "2026-07-04T00:00:00.000Z", 0.8, { routing: "as-declared" }),
+    ]);
+    expect(series).toHaveLength(3);
+    expect(series.map(trendSeriesLabel)).toEqual(["smoke", "smoke#fast", "smoke#routed"]);
+    expect(series[1]?.points.map((p) => p.runId)).toEqual(["run_f1", "run_f2"]);
+    // The primary's line is untouched by the cheap arm's 40%.
+    expect(series[0]?.points).toHaveLength(1);
+  });
+
+  test("an unrouted history keys exactly as before", () => {
+    const series = buildTrends([
+      routedEntry("run_a", "2026-07-01T00:00:00.000Z", 0.9),
+      routedEntry("run_b", "2026-07-02T00:00:00.000Z", 0.95, { routing: "static" }),
+    ]);
+    expect(series).toHaveLength(1);
+    expect(trendSeriesLabel(series[0] as never)).toBe("smoke");
   });
 });

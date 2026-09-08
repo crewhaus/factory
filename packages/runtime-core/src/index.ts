@@ -2267,13 +2267,27 @@ export type RunChatLoopOptions = {
   channelHint?: string;
   /**
    * Test injection for the pool candidate adapters, keyed by their spec model
-   * string (mirrors `_tierAdapters`). Production callers leave it undefined.
+   * string (mirrors `_tierAdapters`). Production callers leave it undefined —
+   * including a routed `crewhaus eval`, which injects only `_scoreboard` and
+   * lets every candidate resolve through the normal router, so the eval
+   * measures the real providers.
    */
   _poolAdapters?: ReadonlyMap<string, ProviderAdapter>;
   /**
-   * Test injection for the reward scoreboard. Production callers leave it
-   * undefined (the runtime opens a file-backed scoreboard beside the sessions
-   * dir); tests inject an in-memory or tmp-dir instance to assert learning.
+   * The reward scoreboard the pool learns into. Production `run` / bundle
+   * callers leave it undefined (the runtime opens a file-backed scoreboard
+   * beside the sessions dir) and tests inject an in-memory or tmp-dir
+   * instance to assert learning.
+   *
+   * 0.6.0 §6.1 — `@crewhaus/eval-runner` is now a PRODUCTION consumer of this
+   * seam, not only a test one: a routed eval (`crewhaus eval --routing`)
+   * injects a FROZEN arm snapshot here, whose `score()` answers from
+   * statistics read once at run start and whose `record()` / `ungraded()` /
+   * `compact()` are no-op sinks. That is what makes a routed measurement
+   * reproducible (samples run four-wide, so a shared mutable scoreboard would
+   * race across them) AND safe (a measurement run can never move the
+   * harness's learned policy). The snapshot's digest is the eval's instrument
+   * identity — see `packages/eval-runner/src/routing.ts`.
    */
   _scoreboard?: Scoreboard;
   /**

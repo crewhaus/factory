@@ -85,6 +85,13 @@ export type ResumeManifest = {
    */
   readonly toolRecording?: ResumeToolRecording;
   /**
+   * 0.6.0 §6.1 — how the recorded run was ROUTED. Absent means `static` (the
+   * pre-0.6.0 single-model path), so absence is a known value here too: a
+   * static run resumed under `--routing as-declared` would finish its unpaid
+   * samples through a pool and splice two instruments into one measurement.
+   */
+  readonly routing?: ResumeRouting;
+  /**
    * Every attempt that re-opened this directory, oldest first (the run's own
    * first pass is not an attempt). Tolerates the legacy scalar form.
    */
@@ -106,6 +113,15 @@ export type ResumeToolRecording = {
   readonly mode: "record" | "replay";
   /** Replay only — sha256 of the cassette, so a DIFFERENT cassette is caught. */
   readonly recordingHash?: string;
+};
+
+/** The identity-relevant half of `run.json`'s `routing` block (§6.1): the
+ *  mode, the pinned arm, and the frozen snapshot the run scored against —
+ *  the same three fields the run entry treats as the routed instrument. */
+export type ResumeRouting = {
+  readonly mode?: string;
+  readonly armId?: string;
+  readonly armsDigest?: string;
 };
 
 /** Read `<runDir>/run.json`. Missing/malformed/id-less is a loud refusal. */
@@ -139,6 +155,7 @@ export function readRunManifest(
   }
   const resumedAt = normalizeResumedAt((obj as { resumedAt?: unknown }).resumedAt);
   const toolRecording = normalizeToolRecording((obj as { toolRecording?: unknown }).toolRecording);
+  const routing = normalizeResumeRouting((obj as { routing?: unknown }).routing);
   return {
     runId: obj.runId,
     ...(typeof obj.startedAt === "string" ? { startedAt: obj.startedAt } : {}),
@@ -149,6 +166,7 @@ export function readRunManifest(
     ...(typeof obj.repeats === "number" ? { repeats: obj.repeats } : {}),
     ...(typeof obj.seed === "number" ? { seed: obj.seed } : {}),
     ...(toolRecording !== undefined ? { toolRecording } : {}),
+    ...(routing !== undefined ? { routing } : {}),
     ...(resumedAt.length > 0 ? { resumedAt } : {}),
     ...(typeof obj.spentUsd === "number" && Number.isFinite(obj.spentUsd) && obj.spentUsd > 0
       ? { spentUsd: obj.spentUsd }
@@ -163,6 +181,20 @@ function normalizeToolRecording(value: unknown): ResumeToolRecording | undefined
   if (mode !== "record" && mode !== "replay") return undefined;
   const hash = (value as { recordingHash?: unknown }).recordingHash;
   return { mode, ...(typeof hash === "string" ? { recordingHash: hash } : {}) };
+}
+
+/** Read back `run.json`'s `routing` block, ignoring anything malformed. */
+function normalizeResumeRouting(value: unknown): ResumeRouting | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const mode = (value as { mode?: unknown }).mode;
+  const armId = (value as { armId?: unknown }).armId;
+  const armsDigest = (value as { armsDigest?: unknown }).armsDigest;
+  const out: ResumeRouting = {
+    ...(typeof mode === "string" ? { mode } : {}),
+    ...(typeof armId === "string" ? { armId } : {}),
+    ...(typeof armsDigest === "string" ? { armsDigest } : {}),
+  };
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**
@@ -189,6 +221,8 @@ export type ResumeIdentity = {
   readonly seed?: number;
   /** How THIS attempt treats tools; absent = live (see the manifest field). */
   readonly toolRecording?: EvalToolRecordingConfig;
+  /** How THIS attempt routes; absent = `static` (see the manifest field). */
+  readonly routing?: ResumeRouting;
 };
 
 /**
@@ -205,6 +239,19 @@ function toolRecordingLabel(
 }
 
 /**
+ * The comparable form of a routing block: `static` when the run took the
+ * pre-0.6.0 single-model path, else `<mode>[@<arm>][/<armsDigest>]`. Absent ⇒
+ * `static`, never "unknown".
+ */
+function routingLabel(value: ResumeRouting | undefined): string {
+  const mode = value?.mode ?? "static";
+  if (mode === "static") return "static";
+  const arm = value?.armId !== undefined ? `@${value.armId}` : "";
+  const digest = value?.armsDigest !== undefined ? `/${value.armsDigest}` : "";
+  return `${mode}${arm}${digest}`;
+}
+
+/**
  * Every identity field that moved since the run was recorded, as
  * human-readable lines. A field the manifest never recorded is skipped (it
  * cannot be compared); a field the CURRENT run does not carry while the
@@ -218,11 +265,12 @@ function toolRecordingLabel(
  * whether the samples faced the world or a cassette. Resuming across any of
  * them would splice two different measurements into one run.
  *
- * `repeats`, `seed` and `toolRecording` are NORMALIZED rather than
+ * `repeats`, `seed`, `toolRecording` and `routing` are NORMALIZED rather than
  * skipped-when-absent: run.json omits them only for the known defaults (1, no
- * seed, live tools), so an absent value is a KNOWN value — and ADDING
- * `--seed 7` or dropping `--repeats 3` on the resume is caught just like
- * editing the rubric is.
+ * seed, live tools, static routing), so an absent value is a KNOWN value —
+ * and ADDING `--seed 7`, dropping `--repeats 3`, or resuming a static run
+ * under `--routing as-declared` on the resume is caught just like editing the
+ * rubric is.
  */
 export function resumeMismatches(manifest: ResumeManifest, current: ResumeIdentity): string[] {
   const out: string[] = [];
@@ -257,6 +305,15 @@ export function resumeMismatches(manifest: ResumeManifest, current: ResumeIdenti
   const nowTools = toolRecordingLabel(current.toolRecording);
   if (wasTools !== nowTools) {
     out.push(`toolRecording: ${wasTools} (recorded) → ${nowTools} (this run)`);
+  }
+  // 0.6.0 §6.1 — same normalization once more: an absent block means `static`,
+  // so resuming a static run into a routed one (or across a different arm or a
+  // different `--warm-arms` snapshot) is a mismatch. `armsDigest` is the
+  // routed run's instrument identity everywhere else; it is one here too.
+  const wasRouting = routingLabel(manifest.routing);
+  const nowRouting = routingLabel(current.routing);
+  if (wasRouting !== nowRouting) {
+    out.push(`routing: ${wasRouting} (recorded) → ${nowRouting} (this run)`);
   }
   return out;
 }

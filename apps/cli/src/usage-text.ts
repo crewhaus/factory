@@ -594,9 +594,63 @@ export const EVAL_USAGE =
   "  (exact_match / expected_contains) have nothing to compare against — use\n" +
   "  contains/regex/llm_judge for content. Judge rubrics need judge credentials;\n" +
   "  without --graders the voice path stays credential-free.\n" +
+  "  --routing static|as-declared|candidate:<$profile|model> ROUTES the eval.\n" +
+  "  Default static: the configured agent.model, exactly as before. as-declared\n" +
+  "  wires the spec's own model_pool/model_tiers/model_fallbacks so you measure\n" +
+  "  what production serves; candidate:$fast pins one roster member and measures\n" +
+  "  that arm alone (with ITS request params and instructions overlay). Every\n" +
+  "  routed mode pins model_pool.learning.seed (a spec-declared seed wins, else\n" +
+  "  --seed) and routes off a FROZEN arm snapshot: the run reads arm statistics\n" +
+  "  but records nothing, so a measurement can never move the harness's learned\n" +
+  "  policy and two runs of the same seed make identical route decisions.\n" +
+  "  --warm-arms seeds that snapshot from the harness's live arms.jsonl instead of\n" +
+  "  starting cold; the file is re-read at the end and a mid-run change is\n" +
+  "  reported. The snapshot's digest is the run's INSTRUMENT identity: two runs\n" +
+  "  with different digests start a new baseline lineage instead of gating across\n" +
+  "  the difference. Routed runs key their own baseline lineage\n" +
+  "  (spec::dataset::<arm|routed>) beside the legacy spec::dataset one, so a cheap\n" +
+  "  candidate can never pin over the primary's baseline.\n" +
+  "  --models also accepts $profile refs and the word `pool`: --models '$fast,$strong'\n" +
+  "  runs one cell per models: profile, --models pool expands the whole model_pool\n" +
+  "  roster. QUOTE the $refs — an unquoted $fast is eaten by the shell. Adding\n" +
+  "  --record runs every cell through the run-history flow under its OWN per-arm\n" +
+  "  lineage, which is what makes --gate/--no-promote legal with --models.\n" +
   "  Read verbs: `crewhaus eval history|baseline|diff` alias the eval-report\n" +
   "  verbs (E52) — see `crewhaus eval-report --help`. Planning verb: `crewhaus eval\n" +
   "  plan --target-delta F` sizes the dataset BEFORE you spend on it. Suite verb:\n" +
   "  `crewhaus eval suite <suite.yaml> --tier fast|nightly|release` runs a whole CI\n" +
   "  tier of (dataset, graders) entries through this same path and aggregates ONE\n" +
-  "  verdict (NEW-HUNT-8) — see `crewhaus eval suite --help`.\n";
+  "  verdict (NEW-HUNT-8) — see `crewhaus eval suite --help`. Leaderboard verb:\n" +
+  "  `crewhaus eval leaderboard <matrix-dir>` ranks a recorded matrix's arms and\n" +
+  "  refuses to name a winner the evidence cannot support.\n";
+
+/**
+ * 0.6.0 §6.1 — `crewhaus eval leaderboard`. Offline by construction: it reads
+ * run directories, so it never spends and never needs credentials.
+ */
+export const EVAL_LEADERBOARD_USAGE =
+  "usage: crewhaus eval leaderboard <matrix-dir> [--pairwise] [--min-n N] [--seed N]\n" +
+  "                                 [--export-priors <file> [--spec <spec.yaml>]] [--json]\n" +
+  "  Rank the arms of an `eval --models` matrix. Each row carries the cell's\n" +
+  "  Wilson 95% interval on pass rate and Student-t interval on mean score; the\n" +
+  "  verdict is decided by a PAIRED sign-flip permutation test on the per-sample\n" +
+  "  deltas (every cell ran the identical sample set), Holm-corrected across the\n" +
+  "  N-choose-2 comparisons.\n" +
+  "  The verb REFUSES to name a winner it cannot support: UNDERPOWERED below the\n" +
+  "  comparable-pair floor (--min-n, default 30), TIE when the paired test is not\n" +
+  "  significant, and TIE when the top two intervals OVERLAP. An honest\n" +
+  "  'underpowered' beats a false leader. Cells graded with a different\n" +
+  "  gradersHash or judgeModel are excluded from the verdict rather than ranked\n" +
+  "  beside comparable ones. The verdict is written back into the matrix's\n" +
+  "  matrix.json as an additive `verdict` block (`best` is untouched).\n" +
+  "  --pairwise prints every head-to-head comparison with raw and Holm-adjusted\n" +
+  "  p-values. This is a STATISTICAL comparison of recorded runs — it makes no\n" +
+  "  judge calls (that is `eval-report diff --pairwise`).\n" +
+  "  --export-priors <file> writes routing priors in REWARD units: each arm's\n" +
+  "  measured quality folded with its expected cost and latency through the same\n" +
+  "  computeReward the live scoreboard maximises, pseudo-count capped at 10 so a\n" +
+  "  prior can never outweigh ten live observations. The file is fingerprinted\n" +
+  "  against --spec's model_pool roster (default ./crewhaus.yaml) — the same\n" +
+  "  fingerprint the runtime checks, so a roster edit invalidates it loudly\n" +
+  "  instead of seeding the wrong arms. Enable with model_pool.reward.priors: eval\n" +
+  "  and place the file at <harness>/.crewhaus/routing/priors.json.\n";

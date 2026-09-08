@@ -14,17 +14,23 @@ import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
 import { ReportError } from "./errors";
 import {
   BASELINES_FILENAME,
+  BASELINE_KEY_V2_PREFIX,
   type BaselineEntry,
   INDEX_FILENAME,
+  ROUTED_LINEAGE_SEGMENT,
   type RunIndexEntry,
   appendRunIndex,
   baselineKey,
+  baselineKeyFor,
+  baselineKeyV2,
   getBaseline,
   hashDatasetFile,
+  isLegacyLineage,
   readBaselines,
   readRunIndex,
   readRunIndexLatest,
   recordEvalRun,
+  resolveBaseline,
   runIndexEntryFromSummary,
   setBaseline,
 } from "./history";
@@ -450,5 +456,161 @@ describe("baselines (baselines.json)", () => {
 
   test("baselineKey separates spec and dataset", () => {
     expect(baselineKey("a", "b")).toBe("a::b");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §6.1 — per-arm baseline lineages (baselineKeyV2)
+// ---------------------------------------------------------------------------
+
+describe("baselineKeyV2 / lineage resolution", () => {
+  test("legacy and V2 namespaces provably cannot alias onto each other", () => {
+    // Nothing sanitises dataset names, so `a::b` is a legal one. Without the
+    // reserved prefix the legacy key `spec::a::b` and the V2 key
+    // `spec::a::b` would be the same string; `arm|` is excluded from the
+    // spec's `safeName`, so a spec name can never begin with it.
+    expect(baselineKey("spec", "a::b")).toBe("spec::a::b");
+    expect(baselineKeyV2("spec", "a", "b")).toBe(`${BASELINE_KEY_V2_PREFIX}spec::a::b`);
+    expect(baselineKeyV2("spec", "a", "b")).not.toBe(baselineKey("spec", "a::b"));
+  });
+
+  test("an as-declared run keys the `routed` segment; a pinned arm keys its own", () => {
+    expect(baselineKeyV2("s", "d")).toBe(
+      `${BASELINE_KEY_V2_PREFIX}s::d::${ROUTED_LINEAGE_SEGMENT}`,
+    );
+    expect(baselineKeyFor({ specName: "s", datasetName: "d", routing: "as-declared" })).toBe(
+      `${BASELINE_KEY_V2_PREFIX}s::d::routed`,
+    );
+    expect(
+      baselineKeyFor({
+        specName: "s",
+        datasetName: "d",
+        armId: "fast",
+        routing: "candidate:$fast",
+      }),
+    ).toBe(`${BASELINE_KEY_V2_PREFIX}s::d::fast`);
+  });
+
+  test("absent or static routing is the LEGACY key — every pin on disk still reads", () => {
+    expect(isLegacyLineage({ specName: "s", datasetName: "d" })).toBe(true);
+    expect(isLegacyLineage({ specName: "s", datasetName: "d", routing: "static" })).toBe(true);
+    expect(baselineKeyFor({ specName: "s", datasetName: "d", routing: "static" })).toBe("s::d");
+  });
+
+  test("setBaseline keys on the entry's lineage; getBaseline still reads the legacy pin", () => {
+    const evalsDir = join(newTempRoot(), ".crewhaus", "evals");
+    setBaseline(makePin("run_legacy0000000000"), evalsDir);
+    setBaseline(
+      makePin("run_fast00000000000", { armId: "fast", routing: "candidate:$fast" }),
+      evalsDir,
+    );
+    setBaseline(
+      makePin("run_strong0000000000", { armId: "strong", routing: "candidate:$strong" }),
+      evalsDir,
+    );
+    const file = readBaselines(evalsDir);
+    expect(Object.keys(file).sort()).toEqual([
+      `${BASELINE_KEY_V2_PREFIX}concierge::smoke::fast`,
+      `${BASELINE_KEY_V2_PREFIX}concierge::smoke::strong`,
+      "concierge::smoke",
+    ]);
+    // A cheap candidate can never pin over the primary's baseline.
+    expect(getBaseline("concierge", "smoke", evalsDir)?.runId).toBe("run_legacy0000000000");
+    expect(
+      resolveBaseline(
+        { specName: "concierge", datasetName: "smoke", armId: "fast", routing: "candidate:$fast" },
+        evalsDir,
+      ).entry?.runId,
+    ).toBe("run_fast00000000000");
+  });
+
+  test("resolveBaseline reports a V2 lineage that does not exist yet beside a legacy pin", () => {
+    const evalsDir = join(newTempRoot(), ".crewhaus", "evals");
+    setBaseline(makePin("run_legacy0000000000"), evalsDir);
+    const lookup = resolveBaseline(
+      { specName: "concierge", datasetName: "smoke", armId: "fast", routing: "candidate:$fast" },
+      evalsDir,
+    );
+    expect(lookup.entry).toBeUndefined();
+    expect(lookup.legacyPresent).toBe(true);
+    // With nothing pinned at all it is a genuine first run, not a refusal.
+    const empty = resolveBaseline(
+      { specName: "other", datasetName: "smoke", armId: "fast", routing: "candidate:$fast" },
+      evalsDir,
+    );
+    expect(empty.legacyPresent).toBe(false);
+  });
+
+  test("the index entry carries the run's routing manifest, and only when routed", () => {
+    const summary = makeSummary([], {});
+    const withSamples: EvalRunSummary = {
+      ...summary,
+      samples: [
+        {
+          sampleId: "q1",
+          sessionId: "s1",
+          startedAt: "2026-07-01T00:00:00.000Z",
+          endedAt: "2026-07-01T00:00:01.000Z",
+          latencyMs: 10,
+          turns: 1,
+          tokens: { input: 1, output: 1 },
+          model: "claude-opus-4-7",
+          agentOutput: "hi",
+          grades: {
+            overall: { passed: true, score: 1, rationale: "" },
+            perGrader: [{ name: "exact", passed: true, score: 1, rationale: "" }],
+          },
+        },
+      ],
+    };
+    const plain = runIndexEntryFromSummary(withSamples, {
+      specName: "concierge",
+      datasetHash: "d".repeat(64),
+      outDir: "/abs/out",
+    });
+    expect(plain.armId).toBeUndefined();
+    expect(plain.routing).toBeUndefined();
+
+    const routed = runIndexEntryFromSummary(
+      {
+        ...withSamples,
+        config: {
+          ...withSamples.config,
+          routing: {
+            mode: "candidate:$fast",
+            armId: "fast",
+            armsDigest: "deadbeefdeadbeef",
+            policyVersion: "pv1",
+          },
+        },
+      },
+      { specName: "concierge", datasetHash: "d".repeat(64), outDir: "/abs/out" },
+    );
+    expect(routed.armId).toBe("fast");
+    expect(routed.routing).toBe("candidate:$fast");
+    expect(routed.armsDigest).toBe("deadbeefdeadbeef");
+    expect(routed.policyVersion).toBe("pv1");
+
+    // A `static` routing block records nothing — byte-identical index line.
+    const staticRouted = runIndexEntryFromSummary(
+      {
+        ...withSamples,
+        config: { ...withSamples.config, routing: { mode: "static", armsDigest: "x" } },
+      },
+      { specName: "concierge", datasetHash: "d".repeat(64), outDir: "/abs/out" },
+    );
+    expect(staticRouted.routing).toBeUndefined();
+    expect(staticRouted.armsDigest).toBeUndefined();
+
+    // The caller's explicit claim (a matrix cell's pinned arm) WINS.
+    const cell = runIndexEntryFromSummary(withSamples, {
+      specName: "concierge",
+      datasetHash: "d".repeat(64),
+      outDir: "/abs/out",
+      armId: "haiku",
+      routing: "candidate:claude-haiku-4-5",
+    });
+    expect(cell.armId).toBe("haiku");
+    expect(cell.routing).toBe("candidate:claude-haiku-4-5");
   });
 });
