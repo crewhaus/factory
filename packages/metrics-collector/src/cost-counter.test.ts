@@ -1,8 +1,10 @@
 /**
  * Loop contract 0.4 (Batch C, G57) — the labeled cost counter fed by
  * `cost_accrual` trace events. Verifies the counter accrues microdollars
- * labeled by provider + model, skips the aggregate `summary` accrual (so it
- * never double-counts the per-call events it sums), and tolerates an
+ * labeled by provider + model, skips the ROLE-LESS aggregate `summary`
+ * accrual (so it never double-counts the per-call events it sums), counts a
+ * ROLE-bearing one (a nested run's roll-up, whose per-call events were
+ * published on a child bus this collector never saw), and tolerates an
  * `unpriced` (cost 0) accrual.
  */
 import { describe, expect, test } from "bun:test";
@@ -71,8 +73,8 @@ describe("metrics-collector cost counter (G57)", () => {
       costUsdMicros: 0,
       unpriced: true,
     });
-    // The aggregate run-total (summary: true) must NOT be counted — it would
-    // double the per-call spend it sums over.
+    // The ROLE-LESS aggregate run-total (summary: true) must NOT be counted —
+    // it would double the per-call spend it sums over.
     bus.publish({
       ...env(bus),
       kind: "cost_accrual",
@@ -102,6 +104,47 @@ describe("metrics-collector cost counter (G57)", () => {
     expect(text).toContain(
       'crewhaus_cost_usd_micros_total{model="claude-opus-4-7",provider="anthropic",role="primary"} 6000',
     );
+
+    await metrics.shutdown();
+  });
+
+  test("a ROLE-bearing summary roll-up IS counted — its per-call events were on a child bus", async () => {
+    const bus = new TraceEventBus({ runId: "run_b", sessionId: "sess_2" });
+    const metrics = await attachMetricsCollector(bus, {
+      sink: { kind: "stdout" },
+      stdoutWrite: () => {},
+    });
+
+    bus.publish({
+      ...env(bus),
+      kind: "cost_accrual",
+      provider: "anthropic",
+      modelId: "claude-opus-4-7",
+      inputTokens: 100,
+      outputTokens: 30,
+      cachedReadTokens: 0,
+      costUsdMicros: 4200,
+    });
+    // `@crewhaus/sub-agent-spawner` re-publishes a child run's total here.
+    // Nothing else on this bus records that spend, so skipping it would pin
+    // `role="subagent"` at zero while Hangar and `cost-summary` report it —
+    // the split `@crewhaus/cost-tracker` already makes on this same bus.
+    bus.publish({
+      ...env(bus),
+      kind: "cost_accrual",
+      provider: "anthropic",
+      modelId: "claude-haiku-4-5",
+      role: "subagent",
+      summary: true,
+      inputTokens: 40,
+      outputTokens: 8,
+      cachedReadTokens: 0,
+      costUsdMicros: 900,
+    });
+
+    const series = metrics.registry.jsonSnapshot().counters["crewhaus_cost_usd_micros_total"] ?? [];
+    expect(series.find((s) => s.labels.role === "subagent")?.value).toBe(900);
+    expect(series.find((s) => s.labels.role === "primary")?.value).toBe(4200);
 
     await metrics.shutdown();
   });

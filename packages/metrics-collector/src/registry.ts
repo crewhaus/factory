@@ -182,8 +182,10 @@ export class Registry {
   // Labeled by `provider` + `model` so a Prometheus scrape can break spend
   // down per provider/model. Microdollars (1e-6 USD) to stay integer-valued —
   // the same unit `CostAccrualEvent.costUsdMicros` and audit-log carry, so a
-  // dashboard divides by 1e6 once. Per-call accruals only: the aggregate
-  // run-total accrual (`summary: true`) is skipped so it never double-counts.
+  // dashboard divides by 1e6 once. Per-call accruals plus a nested run's
+  // ROLE-bearing `summary: true` roll-up (a sub-agent total re-published from
+  // a child bus — spend this bus saw no per-call event for); the optimizer's
+  // ROLE-LESS run total is skipped so it never double-counts.
   // 0.6.0 (design §8.4) — the `role` label (absent on the accrual ⇒
   // `primary`) splits spend by PURPOSE, so a judge's or a shadow lane's spend
   // is visible beside the answer's own. Existing `sum by (provider, model)`

@@ -38,6 +38,15 @@ const UNIVERSAL = [
   "evals",
   "data",
   "costs",
+  // 0.6.0 (design §8.3, §11.3) — `models:` is on ALL FOURTEEN strict
+  // schemas, so by this matrix's own rule ("a tab is on for a target when
+  // that target's schema admits at least one of the blocks the tab
+  // configures") the Models tab is universal. The routing HALF of the tab is
+  // narrower — voice / eval / onchain / onchain-game admit no `model_pool` —
+  // but the tab still answers honestly there: it renders the registry and
+  // the per-role spend, and says no pool is declared. A gate would claim the
+  // screen has nothing to show, which would be false.
+  "models",
   "creds",
   "security",
   "deploy",

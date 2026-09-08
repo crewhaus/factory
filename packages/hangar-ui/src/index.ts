@@ -55,6 +55,7 @@ import jobsViewJs from "../assets/js/views/jobs.js" with { type: "text" };
 import libraryViewJs from "../assets/js/views/library.js" with { type: "text" };
 import memoryFabricViewJs from "../assets/js/views/memory-fabric.js" with { type: "text" };
 import memoryViewJs from "../assets/js/views/memory.js" with { type: "text" };
+import modelsViewJs from "../assets/js/views/models.js" with { type: "text" };
 import onboardingViewJs from "../assets/js/views/onboarding.js" with { type: "text" };
 import overviewViewJs from "../assets/js/views/overview.js" with { type: "text" };
 import panesViewJs from "../assets/js/views/panes.js" with { type: "text" };
@@ -140,6 +141,7 @@ export const hangarAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/views/library.js": asset(libraryViewJs, "library.js"),
   "/assets/js/views/memory-fabric.js": asset(memoryFabricViewJs, "memory-fabric.js"),
   "/assets/js/views/memory.js": asset(memoryViewJs, "memory.js"),
+  "/assets/js/views/models.js": asset(modelsViewJs, "models.js"),
   "/assets/js/views/onboarding.js": asset(onboardingViewJs, "onboarding.js"),
   "/assets/js/views/overview.js": asset(overviewViewJs, "overview.js"),
   "/assets/js/views/panes.js": asset(panesViewJs, "panes.js"),

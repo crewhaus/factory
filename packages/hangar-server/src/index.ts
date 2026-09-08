@@ -90,7 +90,42 @@ export {
   type TranscriptTurn,
   type TranscriptView,
 } from "./sessions";
-export { foldHarnessCosts, type HarnessCosts, type ModelCostRow } from "./costs";
+export {
+  DEFAULT_COST_ROLE,
+  foldHarnessCosts,
+  NO_PROFILE,
+  type HarnessCosts,
+  type ModelCostRow,
+  type ProfileCostRow,
+  type RoleCostRow,
+} from "./costs";
+// 0.6.0 (design §8.3) — the Models area: the lenient spec readers, the
+// read-only scoreboard projection, and the routing signals the advisor folds.
+export {
+  buildLeaderboard,
+  foldRouteStats,
+  readArms,
+  readModelRegistry,
+  readPinServeStates,
+  readPoolView,
+  readPoolViews,
+  readRouteTimeline,
+  rosterModels,
+  rosterSunsets,
+  ROUTING_EVENT_KINDS,
+  splitModelString,
+  type ArmRow,
+  type DeclaredPool,
+  type LeaderboardRow,
+  type ModelProfileRow,
+  type PinServeState,
+  type PoolCandidateRow,
+  type PoolView,
+  type RosterSunset,
+  type RouteStats,
+  type RouteTimeline,
+  type TimelineEntry,
+} from "./models";
 export {
   computeRollup,
   computeRollupDigest,

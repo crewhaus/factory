@@ -249,6 +249,20 @@ describe("transcript envelope", () => {
             logLine("compaction", { dropped: 3 }),
             logLine("permission", { tool: "fs_read", decision: "allow" }),
             logLine("recovery", { attempt: 1 }),
+            // 0.6.0 §8.1/§8.3 — the hybrid kinds. They belong in the gutter
+            // only because they are EVENT-LOG kinds with durable logEvent
+            // calls; this reader walks the JSONL, never the trace bus.
+            logLine("model_stage", {
+              turnNumber: 1,
+              stage: "draft",
+              strategy: "cascade",
+              role: "draft",
+              model: "m",
+              outcome: "done",
+            }),
+            logLine("sub_agent_start", { name: "helper", model: "m" }),
+            logLine("sub_agent_end", { name: "helper", ok: true }),
+            logLine("judge_verdict", { turnNumber: 1, verdict: "pass", score: 0.9 }),
             logLine("model_meta", { context: 200000 }),
             logLine("error", { message: "transient" }),
             '{"kind":"assistant_message","payload":{"content":"torn', // torn line
@@ -286,6 +300,10 @@ describe("transcript envelope", () => {
       "compaction",
       "permission",
       "recovery",
+      "model_stage",
+      "sub_agent_start",
+      "sub_agent_end",
+      "judge_verdict",
     ]);
     expect(body["otherKinds"]).toEqual({ model_meta: 1, error: 1 });
     expect(body["tornCount"]).toBe(1);

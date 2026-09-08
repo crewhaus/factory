@@ -783,7 +783,7 @@ export const ROUTES = {
   advisorReportRun: {
     method: "POST",
     path: "/api/h/:id/advisor/reports",
-    body: "AdvisorReportRun", // {kind: model-usage|costs|usefulness|optimization}
+    body: "AdvisorReportRun", // {kind: model-usage|costs|usefulness|optimization|routing|hybrid}
     group: "advisor",
   },
   advisorReport: {
@@ -802,6 +802,19 @@ export const ROUTES = {
     group: "advisor",
   },
   advisorFleet: { method: "GET", path: "/api/advisor", group: "advisor" },
+
+  // ---- group "models": per-model settings, hybrid routing, the scoreboard -
+  // 0.6.0 (design §8.3). READ-ONLY, all four: the console renders the
+  // `models:` registry, the declared pool, per-role/per-profile spend, the
+  // learned arms and their leaderboard, and one run's route timeline — and
+  // it writes none of them. Hangar never touches an arm or a prior; the
+  // roster, the rules and the floor stay human-owned behind `propose`.
+  models: { method: "GET", path: "/api/h/:id/models", group: "models" },
+  // The route timeline for ONE session, read from the session JSONL (§8.1:
+  // Hangar reads the durable log, never the bus).
+  modelRoutes: { method: "GET", path: "/api/h/:id/models/routes/:sess", group: "models" },
+  modelArms: { method: "GET", path: "/api/h/:id/models/arms", group: "models" },
+  modelLeaderboard: { method: "GET", path: "/api/h/:id/models/leaderboard", group: "models" },
 
   // ---- group "runtime": the mcp-server + dev run classes -----------------
   // Both are PROCESSES: they get runfiles, ledger rows and ledger-claimed
@@ -841,6 +854,7 @@ export const M3_GROUPS = [
   "inspect",
   "runtime",
   "advisor",
+  "models",
 ];
 
 /** Every route key belonging to `group`, in map order. The views render
