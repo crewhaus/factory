@@ -16,9 +16,10 @@
  *
  * What is refused (the `REFUSED` rows) is refused BY DESIGN, not until some
  * later row: a narrowing profile referenced from a SINGLE-MODEL serving slot.
- * §4.2 gives a bare slot the profile's request params, its `modelProfile`
- * provenance and its folded overlay and nothing else, so there is no
- * per-candidate plan to enforce a narrowing there and accepting
+ * §4.2 gives a bare slot the profile's request params its shape can honour,
+ * its `modelProfile` provenance, its failover chain and its folded overlay —
+ * but no per-candidate plan, so there is nothing to enforce a narrowing on and
+ * accepting
  * `models.fast: { tools: [] }` behind `agent.model: $fast` would serve with
  * the shape's full toolset. The refusal names the pool-candidate route as the
  * fix; `lower()` with `allowRuntimePendingKeys` carries the key into the IR

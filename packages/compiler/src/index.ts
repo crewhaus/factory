@@ -1153,20 +1153,29 @@ function lowerCompaction(spec: SpecWithPermissions, ctx: LowerContext): IrCompac
 //     (voice registers no tool catalog, pipeline has no thinking, …);
 //   - `model-plan-ignored-on-slot`   — the field is pool-candidate / primary
 //     semantics and has no meaning on this slot (a judge, a tier, a fallback);
-//   - `model-plan-candidate-only`    — the field is served out of the
-//     PER-CANDIDATE PLAN runtime-core builds from the `model_pool` blob at
-//     boot, so it is honoured when the profile is a pool candidate and is not
-//     served by a bare single-model slot (`caching`,
+//   - `model-plan-candidate-only`    — the PROFILE's copy of the field is
+//     served out of the PER-CANDIDATE PLAN runtime-core builds from the
+//     `model_pool` blob at boot, so it reaches a model call when the profile
+//     is a pool candidate and never from a bare single-model slot (`caching`,
 //     `limits.model_call_timeout_ms`). A design boundary (§4.2), not a
-//     deferred row — informational, never fails `--strict`, and its
-//     remediation is naming the profile as a `model_pool` candidate.
+//     deferred row — informational, never fails `--strict`. The remediation
+//     is PER FIELD, because a field can have a second declaration site that a
+//     bare slot does honour: `caching` has none, so naming the profile as a
+//     `model_pool` candidate is the only route; a per-call ceiling also has a
+//     shape-level home in the spec's top-level `limits:` block (lowered by
+//     {@link lowerLimits} into `runChatLoop({ modelCallTimeoutMs })`, which
+//     runtime-core reads as the fallback under a serving plan's own value),
+//     so that notice names the top-level block FIRST and the pool candidate
+//     as the way to get a per-candidate ceiling.
 //
 // One class is REFUSED rather than warned, and this too is by design: the
 // NARROWING knobs (`tools` / `tool_config` / `permissions` / `rate_limits` /
 // `cost`) of a profile referenced from a SINGLE-MODEL serving slot. §4.2
-// gives a single-model slot the profile's request params (`model`,
-// `thinking`, `maxTokens`, `temperature`), a provenance-only `modelProfile`
-// name and a folded `instructions` overlay — there is no per-candidate plan
+// gives a single-model slot the profile's request params its shape can honour
+// (`model`, `thinking`, `maxTokens`, `temperature`), a provenance-only
+// `modelProfile` name, its failover chain (`fallbacks` / `circuit_breaker`,
+// on a serving slot that routes nothing of its own) and a folded
+// `instructions` overlay — there is no per-candidate plan
 // carrier for a slot that routes no pool, so accepting a profile declared
 // `tools: []` behind `agent.model: $fast` would serve with the shape's full
 // toolset. The refusal is loud rather than silent for exactly that reason.
@@ -1191,15 +1200,38 @@ function asLooseBlock(value: unknown): LooseBlock | undefined {
 
 /**
  * 0.6.0 §4.2 — the design boundary a single-model slot draws. A serving slot
- * that routes no pool takes the profile's request params, its `modelProfile`
- * provenance and its folded `instructions` overlay; every PER-CANDIDATE knob
- * (`caching`, `limits.model_call_timeout_ms`, and the narrowing set) is served
- * out of the plan runtime-core builds from the `model_pool` blob, so the
- * profile has to be a pool CANDIDATE for it to reach a model call. Not a
- * pending row: no later row changes this, and the sentence says so.
+ * that routes no pool takes the profile's request params its shape can honour,
+ * its `modelProfile` provenance, its failover chain and circuit breaker, and
+ * its folded `instructions` overlay. What it does not take is the profile's
+ * PER-CANDIDATE knobs (`caching`, `limits.model_call_timeout_ms`, and the
+ * narrowing set): those are served out of the plan runtime-core builds from
+ * the `model_pool` blob, so the profile has to be a pool CANDIDATE for THAT
+ * copy of the field to reach a model call. Not a pending row: no later row
+ * changes this, and the sentence says so.
+ *
+ * The sentence is deliberately about the PROFILE's copy and says nothing about
+ * a field's other declaration sites — a per-call ceiling also lives in the
+ * spec's top-level `limits:` block, which a bare slot does honour. Those are
+ * per-field, so each notice carries its own remediation (see `candidateOnly`);
+ * this constant carries only the part that is true of every one of them.
  */
 const CANDIDATE_ONLY_REASON =
-  "a single-model serving slot carries a profile's request params, its modelProfile provenance and its instructions overlay and nothing else; this field is served from the per-candidate plan runtime-core builds out of the model_pool blob";
+  "a single-model serving slot carries the profile's request params its shape can honour, its modelProfile provenance, its failover chain and its instructions overlay; a profile's per-candidate settings reach a model call through the plan runtime-core builds out of the model_pool blob";
+/**
+ * The remediation every candidate-only notice can offer: carry the profile
+ * into a pool so runtime-core builds it a per-candidate plan.
+ */
+const CANDIDATE_ONLY_FIX = "Name the profile as a model_pool candidate to have it served";
+/**
+ * `limits.model_call_timeout_ms` is the one candidate-only field with a second
+ * declaration site a BARE slot honours: the spec's top-level `limits:` block
+ * lowers into `runChatLoop({ modelCallTimeoutMs })` and runtime-core reads it
+ * whenever a serving plan carries no ceiling of its own. Naming that route
+ * first keeps the notice actionable — a one-line `limits:` key, rather than a
+ * restructure into a `model_pool` the author may not want.
+ */
+const TIMEOUT_CANDIDATE_ONLY_FIX =
+  "Declare the ceiling in the spec's top-level limits: block — a single-model slot honours it there — or name the profile as a model_pool candidate for a per-candidate one";
 /**
  * 0.6.0 PR 9e/9f — the closure families a compiled bundle constructs at boot
  * through `@crewhaus/model-service`'s `wireHybrid`: `strategy.model_directed`
@@ -1934,12 +1966,14 @@ function applyProfileToSlot(
       `${at}.${field}`,
       `${at}.${field} (referenced from ${slotPath}) has no meaning on this slot — ${why}; it is ignored`,
     );
-  const candidateOnly = (field: string): void =>
+  // The remediation is per field: `caching` is served nowhere but a candidate
+  // plan, while a per-call ceiling has a shape-level home a bare slot honours.
+  const candidateOnly = (field: string, fix: string = CANDIDATE_ONLY_FIX): void =>
     warn(
       ctx,
       "model-plan-candidate-only",
       `${at}.${field}`,
-      `${at}.${field} (referenced from ${slotPath}) is a model_pool candidate setting — ${CANDIDATE_ONLY_REASON}, so it is dropped here. Name the profile as a model_pool candidate to have it served`,
+      `${at}.${field} (referenced from ${slotPath}) is a model_pool candidate setting — ${CANDIDATE_ONLY_REASON}, so it is dropped here. ${fix}`,
     );
   const isAgent = kind !== "aux" && kind !== "model-only";
   const honoursThinking = kind === "agent-full";
@@ -2004,7 +2038,7 @@ function applyProfileToSlot(
     }
   }
   if (settings.modelCallTimeoutMs !== undefined) {
-    if (isAgent) candidateOnly("limits.model_call_timeout_ms");
+    if (isAgent) candidateOnly("limits.model_call_timeout_ms", TIMEOUT_CANDIDATE_ONLY_FIX);
     else
       ignoredOnSlot("limits.model_call_timeout_ms", "the per-call timer applies to a serving slot");
   }

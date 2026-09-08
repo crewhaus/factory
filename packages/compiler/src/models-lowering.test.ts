@@ -231,16 +231,54 @@ describe("$profile on the serving agent slot (agent-full)", () => {
     ]);
     for (const w of warnings) {
       expect(w.code).toBe("model-plan-candidate-only");
-      // These are served out of the per-candidate plan built from the pool
-      // blob — a design boundary (§4.2), so the message states what a
-      // single-model slot DOES carry and names the pool-candidate route as
-      // the fix. It must promise no later row.
+      // The PROFILE's copy of these is served out of the per-candidate plan
+      // built from the pool blob — a design boundary (§4.2), so the message
+      // states what a single-model slot DOES carry and names the
+      // pool-candidate route as a fix. It must promise no later row.
       expect(w.message).toContain("single-model serving slot");
       expect(w.message).toContain("the profile as a model_pool candidate");
       expect(w.message).not.toContain("0.6.0 row");
       expect(w.message).not.toContain("until then it is inert");
       expect(w.message).not.toContain("yet");
+      // What the sentence claims a bare slot DOES carry has to match
+      // `applyProfileToSlot`: it folds the profile's failover chain onto an
+      // agent-full slot too, so "params, provenance and overlay and nothing
+      // else" would be false here.
+      expect(w.message).toContain("its failover chain");
+      expect(w.message).not.toContain("nothing else");
     }
+  });
+
+  test("the timeout notice names the top-level `limits:` block, which a bare slot DOES honour", () => {
+    // `limits.model_call_timeout_ms` is the one candidate-only field with a
+    // second declaration site: the spec's top-level `limits:` block lowers
+    // onto a single-model slot and reaches the model call. Telling the author
+    // to restructure into a `model_pool` when a one-line key serves the field
+    // today would be the same defect this notice class exists to avoid, so
+    // the two fields carry DIFFERENT remediations.
+    const { ir, warnings } = lowerWithWarnings(
+      parseSpec(
+        cli(
+          ...REGISTRY,
+          "limits: { model_call_timeout_ms: 30000 }",
+          "agent:",
+          "  model: $fast",
+          "  instructions: i",
+        ),
+      ),
+      opts,
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.limits?.modelCallTimeoutMs).toBe(30000);
+    const byPath = new Map(warnings.map((w) => [w.path, w.message] as const));
+    const timeout = byPath.get("models.fast.limits.model_call_timeout_ms") ?? "";
+    const caching = byPath.get("models.fast.caching") ?? "";
+    expect(timeout).toContain("top-level limits: block");
+    expect(timeout).toContain("a single-model slot honours it there");
+    expect(timeout).toContain("model_pool candidate for a per-candidate one");
+    // `caching` has no shape-level home, so it keeps the pool-only sentence.
+    expect(caching).toContain("Name the profile as a model_pool candidate to have it served");
+    expect(caching).not.toContain("top-level limits:");
   });
 
   test("an unknown $ref is a CompilerError with a did-you-mean even when lower() is fed a hand-built spec", () => {

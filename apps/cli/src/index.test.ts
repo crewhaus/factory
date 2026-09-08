@@ -610,8 +610,9 @@ describe("crewhaus compile", () => {
   //
   // `caching` (and `limits.model_call_timeout_ms`) on a slot that routes no
   // pool is the canonical candidate-only pair: §4.2 gives a single-model slot
-  // the profile's request params, provenance and overlay and nothing else, so
-  // the notice states a DESIGN boundary — it promises no later row, and the
+  // the profile's request params, provenance, failover chain and overlay, but
+  // no per-candidate plan, so the notice states a DESIGN boundary — it
+  // promises no later row. `caching` is served nowhere else, so the
   // remediation it names is declaring the profile as a pool candidate.
   test("compile --strict does NOT escalate the informational model-plan-candidate-only / model-sunset notices", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
