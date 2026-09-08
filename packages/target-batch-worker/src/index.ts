@@ -48,7 +48,12 @@ import {
   type IrSchedule,
   renderBundleReadme,
 } from "@crewhaus/ir";
-import { renderModelWiringFields } from "@crewhaus/model-service";
+import {
+  HYBRID_FAMILIES_BY_SHAPE,
+  HYBRID_WIRING_IMPORT,
+  renderHybridWiringFields,
+  renderModelWiringFields,
+} from "@crewhaus/model-service";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -483,6 +488,18 @@ export function emitBatchWorker(ir: IrBatchV0, opts: EmitReadmeOptions = {}): Bu
 }
 
 function renderAgent(ir: IrBatchV0): string {
+  // 0.6.0 PR 9f (§11.3) — the closure half of the pool: Consult / Escalate,
+  // the route classifier, the guide / shadow lanes. Rendered onto the ONE
+  // per-job `runChatLoop`, so every pulled job gets the same closures the
+  // interpreter builds. "" — and no import — when the pool declares none of
+  // them, so pre-0.6.0 batch bundles stay byte-identical.
+  const hybridFields = renderHybridWiringFields(
+    ir.agent,
+    "        ",
+    ir.name,
+    HYBRID_FAMILIES_BY_SHAPE.batch,
+  );
+  const hybridImport = hybridFields.length > 0 ? `${HYBRID_WIRING_IMPORT}\n` : "";
   const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
   const importBlock = builtinImports.length > 0 ? `${builtinImports.join("\n")}\n` : "";
   const initLines = inits.length > 0 ? `${inits.join("\n")}\n` : "";
@@ -660,7 +677,7 @@ import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createJanitor, runChatLoop } from "@crewhaus/runtime-core";
 import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
-import { defaultCatalog } from "@crewhaus/tool-catalog";
+${hybridImport}import { defaultCatalog } from "@crewhaus/tool-catalog";
 ${permImport}${hooksImport}${scheduleImport}${mcpImportBlock}${importBlock}
 
 ${initLines}${registrationBlock}
@@ -756,7 +773,7 @@ ${mcpBoot}  // G11 — a compiled bundle is NON-INTERACTIVE: a tool that lands o
       const runContext = createRunContext();
       const reply = await runChatLoop({
         model: SPEC_MODEL,
-        instructions: SPEC_INSTRUCTIONS,${renderModelWiringFields(ir.agent, "        ")}${taxonomyField(ir, "        ")}
+        instructions: SPEC_INSTRUCTIONS,${renderModelWiringFields(ir.agent, "        ")}${hybridFields}${taxonomyField(ir, "        ")}
         runContext,
         sessionName: SPEC_NAME,
         sessionTarget: "batch",

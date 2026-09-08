@@ -164,6 +164,15 @@ export function loopContractRunOptions(ir: LoopContractIrSlice): LoopContractRun
  * which is precisely the slice `wireModels` appends here; `hybrid-parity.test.ts`
  * evaluates the emitted text and compares the two option sets key for key.
  *
+ * PR 9f finishes the reach: every pool-bearing shape renders that call, for
+ * every closure family plan §11.3 marks **E** on its row
+ * (`HYBRID_FAMILIES_BY_SHAPE` in model-service). The interpreter passes no
+ * `hybridFamilies` and so keeps building every family a pool declares — it
+ * serves whatever shape it is handed and is not the thing §11.3 constrains;
+ * an emitter passes its shape's row, and the ONE restriction that exists
+ * today (`pipeline` declines the Consult / Escalate pair) travels into the
+ * bundle verbatim, so the two paths stay comparable key for key.
+ *
  * `modelOverride` is the raw `--model` flag value: a string is an explicit
  * routing decision authored against a different primary, so the spec's
  * chain, tiers and pool (and with it the hybrid tools) are dropped (the

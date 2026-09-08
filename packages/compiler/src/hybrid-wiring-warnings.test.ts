@@ -1,13 +1,14 @@
 /**
- * 0.6.0 PR 9e — the pool's CLOSURE-shaped keys (`strategy.{guide,shadow,
+ * 0.6.0 PR 9e/9f — the pool's CLOSURE-shaped keys (`strategy.{guide,shadow,
  * committee}`, `strategy.model_directed`, `policy: classifier` + its
  * `classifier:` block) cannot ride the `JSON.stringify(modelPool)` blob, so
  * they reach a compiled bundle only where the emitter renders
- * `@crewhaus/model-service`'s `wireHybrid`. Since 9e that is cli, channel,
- * managed, workflow, graph and crew — nothing pends there, and the bundle
- * carries the import plus the spread. On any OTHER pool-bearing target the
- * key is still inert in the bundle and the warning says so with the reach
- * named precisely. `directives` / `rules` / `cascade` ride the blob and pend
+ * `@crewhaus/model-service`'s `wireHybrid`. PR 9e wired six shapes and left
+ * four (pipeline, research, batch, browser) warning that the key was inert in
+ * the bundle; 9f wires those four, so NOTHING pends any more. The one cell
+ * plan §11.3 marks `—` — `pipeline` × the Consult / Escalate pair — is a shape
+ * fact, not a deferred row, and is reported as `model-plan-ignored-on-shape`
+ * with the reason. `directives` / `rules` / `cascade` ride the blob and pend
  * nowhere. Byte-identity: a pool without a closure-shaped key renders no
  * call and no `@crewhaus/model-service` import at all.
  */
@@ -44,7 +45,7 @@ const cli = (strategy: string): string =>
     `    strategy: ${strategy}`,
   ].join("\n");
 
-/** A pool-bearing target whose emitter does NOT render `wireHybrid` yet. */
+/** A pool-bearing target wired by PR 9f (§11.3 marks every family `E`). */
 const research = (strategy: string): string =>
   [
     "name: r",
@@ -58,6 +59,26 @@ const research = (strategy: string): string =>
     "      - { model: claude-opus-4-8, tags: [strong] }",
     `    strategy: ${strategy}`,
     "goal: find out",
+  ].join("\n");
+
+/** The one shape §11.3 marks `—` for a family this PR otherwise wires. */
+const pipeline = (strategy: string): string =>
+  [
+    "name: p",
+    "target: pipeline",
+    "agent:",
+    "  model: claude-sonnet-4-6",
+    "  instructions: i",
+    "  model_pool:",
+    "    candidates:",
+    "      - { model: claude-haiku-4-5, tags: [cheap] }",
+    "      - { model: claude-opus-4-8, tags: [strong] }",
+    `    strategy: ${strategy}`,
+    "retrieve:",
+    "  embedderModel: mock/det",
+    "indexing:",
+    "  documents:",
+    "    - { id: d1, text: hello }",
   ].join("\n");
 
 const pendingPaths = (yaml: string) =>
@@ -121,19 +142,43 @@ describe("the closure-shaped pool keys reach the wired targets' bundles (PR 9e)"
     expect(pendingPaths(yaml)).toEqual([]);
   });
 
-  test("an UNWIRED pool-bearing target still warns, with the reach named precisely", () => {
+  test("PR 9f: the last four pool-bearing shapes wire it too — nothing pends", () => {
     const yaml = research("{ guide: { model: claude-opus-4-8 }, model_directed: true }");
-    const warnings = compile(yaml).warnings.filter((w) => w.code === "model-plan-pending-runtime");
-    expect(warnings.map((w) => w.path).sort()).toEqual([
-      "agent.model_pool.strategy.guide",
-      "agent.model_pool.strategy.model_directed",
-    ]);
-    for (const w of warnings) {
-      expect(w.message).toContain("crewhaus run / serve interpreter");
-      expect(w.message).toContain("wireHybrid");
-      expect(w.message).toContain("compiled research bundle does not construct");
-      expect(w.message).not.toContain("the runtime does not honour it");
-    }
-    expect(agentOf(yaml)).not.toContain("wireHybrid");
+    expect(pendingPaths(yaml)).toEqual([]);
+    expect(compile(yaml).warnings.filter((w) => w.code === "model-plan-ignored-on-shape")).toEqual(
+      [],
+    );
+    const agent = agentOf(yaml);
+    expect(agent).toContain('import { wireHybrid } from "@crewhaus/model-service";');
+    expect(agent).toContain("...wireHybrid({");
+    expect(agent).toContain('{ sessionName: "r" }),');
+  });
+
+  test("the ONE §11.3 `—` cell: pipeline declines Consult / Escalate, precisely", () => {
+    const yaml = pipeline("{ guide: { model: claude-opus-4-8 }, model_directed: true }");
+    // Not a deferred row — no later PR changes it — so it is not `pending`.
+    expect(pendingPaths(yaml)).toEqual([]);
+    const ignored = compile(yaml).warnings.filter((w) => w.code === "model-plan-ignored-on-shape");
+    expect(ignored.map((w) => w.path)).toEqual(["agent.model_pool.strategy.model_directed"]);
+    expect(ignored[0]?.message).toContain("compiled pipeline bundle constructs no");
+    expect(ignored[0]?.message).toContain("declares no tools of its own");
+    expect(ignored[0]?.message).toContain('plan §11.3 marks the cell "—"');
+    // The guide IS wired, and the declined family travels into the bundle.
+    const agent = agentOf(yaml);
+    expect(agent).toContain("...wireHybrid({");
+    expect(agent).toContain('hybridFamilies: ["classifier","sideCalls"]');
+  });
+
+  test("a pipeline pool declaring ONLY model_directed renders no call and no import", () => {
+    const yaml = pipeline("{ model_directed: true }");
+    expect(
+      compile(yaml)
+        .warnings.filter((w) => w.code === "model-plan-ignored-on-shape")
+        .map((w) => w.path),
+    ).toEqual(["agent.model_pool.strategy.model_directed"]);
+    const agent = agentOf(yaml);
+    expect(agent).toContain('modelPool: {"candidates":');
+    expect(agent).not.toContain("wireHybrid");
+    expect(agent).not.toContain("@crewhaus/model-service");
   });
 });

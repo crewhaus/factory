@@ -18,6 +18,11 @@
  *     IR, so a rendering bug cannot hide.
  * Key sets and the pool blob must match, on every shape whose emitter renders
  * the call, and both must be empty for a pool that declares no closure.
+ *
+ * PR 9f extends the shape list to the last four pool-bearing emitters
+ * (pipeline, research, batch, browser), which 9e left carrying the blob with
+ * none of the behaviour — see `packages/compiler/src/hybrid-shape-matrix.test.ts`
+ * for the per-shape §11.3 cells themselves.
  */
 import { describe, expect, test } from "bun:test";
 import { compile, lower } from "@crewhaus/compiler";
@@ -184,6 +189,56 @@ describe("every emitter the plan wires renders the call for its own pooled block
         "  a:",
         "    instructions: x",
         ...hybridPool("    "),
+      ].join("\n"),
+    ],
+    // PR 9f — the four shapes 9e left carrying the blob with none of the
+    // behaviour. Same assertion, same manifest consequence.
+    [
+      "pipeline",
+      [
+        "name: hybrid",
+        "target: pipeline",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: i",
+        ...HYBRID_POOL,
+        "retrieve: { embedderModel: mock/det }",
+        "indexing: { documents: [{ id: d1, text: hello }] }",
+      ].join("\n"),
+    ],
+    [
+      "research",
+      [
+        "name: hybrid",
+        "target: research",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: i",
+        ...HYBRID_POOL,
+        "goal: find out",
+      ].join("\n"),
+    ],
+    [
+      "batch",
+      [
+        "name: hybrid",
+        "target: batch",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: i",
+        ...HYBRID_POOL,
+        "queue: { adapter: in-memory }",
+      ].join("\n"),
+    ],
+    [
+      "browser",
+      [
+        "name: hybrid",
+        "target: browser",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: i",
+        ...HYBRID_POOL,
       ].join("\n"),
     ],
   ];

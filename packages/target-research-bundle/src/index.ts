@@ -36,7 +36,12 @@ import {
   renderBundleReadme,
 } from "@crewhaus/ir";
 import { memoryFragmentFromIr } from "@crewhaus/memory-service";
-import { renderModelWiringFields } from "@crewhaus/model-service";
+import {
+  HYBRID_FAMILIES_BY_SHAPE,
+  HYBRID_WIRING_IMPORT,
+  renderHybridWiringFields,
+  renderModelWiringFields,
+} from "@crewhaus/model-service";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -342,6 +347,19 @@ function memoryFabric(ir: IrResearchV0): { wired: boolean; fragmentJson: string 
 }
 
 function renderAgent(ir: IrResearchV0): string {
+  // 0.6.0 PR 9f (§11.3) — the closure half of the pool: Consult / Escalate,
+  // the route classifier, the guide / shadow lanes. The research row is `E`
+  // for every family the schema admits on this shape, so the emitter passes
+  // its own row and lets the one gate decide. "" — and no import — when the
+  // pool declares none of them, so pre-0.6.0 research bundles stay
+  // byte-identical.
+  const hybridFields = renderHybridWiringFields(
+    ir.agent,
+    "    ",
+    ir.name,
+    HYBRID_FAMILIES_BY_SHAPE.research,
+  );
+  const hybridImport = hybridFields.length > 0 ? `${HYBRID_WIRING_IMPORT}\n` : "";
   const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
   const importBlock = builtinImports.length > 0 ? `${builtinImports.join("\n")}\n` : "";
   const initLines = inits.length > 0 ? `${inits.join("\n")}\n` : "";
@@ -419,7 +437,7 @@ import { runChatLoop } from "@crewhaus/runtime-core";
 import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";
-import { defaultCatalog } from "@crewhaus/tool-catalog";
+${hybridImport}import { defaultCatalog } from "@crewhaus/tool-catalog";
 ${hooksImport}${memImportBlock}${mcpImportBlock}${importBlock}
 ${initLines}${registrationBlock}${memBootBlock}${mcpBootBlock}
 // G11 — a compiled bundle is NON-INTERACTIVE: a tool that lands on \`ask\`
@@ -554,7 +572,7 @@ async function runOneBranch(args: {
   const runContext = createRunContext();
   const finalText = await runChatLoop({
     model: SPEC_MODEL,
-    instructions: SPEC_INSTRUCTIONS,${renderModelWiringFields(ir.agent, "    ")}${taxonomyField(ir, "    ")}
+    instructions: SPEC_INSTRUCTIONS,${renderModelWiringFields(ir.agent, "    ")}${hybridFields}${taxonomyField(ir, "    ")}
     runContext,
     sessionName: ${escapeJsonString(ir.name)},
     sessionTarget: "research",

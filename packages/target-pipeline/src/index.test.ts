@@ -198,3 +198,108 @@ describe("emitPipeline — failureTaxonomy field (item 23)", () => {
     expect(emitPipeline(empty).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
   });
 });
+
+describe("emitPipeline — the pool's runtime closures reach the bundle (0.6.0 PR 9f)", () => {
+  // Plan §11.3 marks `guide / shadow` **E** on the pipeline row and
+  // `Consult / Escalate` **—** — the ONE cell in the four shapes 9f wires that
+  // is not emit-wired, because the pipeline shape declares no `tools:` of its
+  // own (`toolLess` in `@crewhaus/spec`, which is also why a per-model `tools`
+  // list is refused there) and so has no shape toolset for the model-directed
+  // pair to arbitrate over. The emitter therefore passes its own §11.3 row and
+  // a `model_directed`-only pool renders nothing at all; the compiler reports
+  // that key as `model-plan-ignored-on-shape` instead.
+  const candidates = [
+    { model: "claude-haiku-4-5", tags: ["cheap"] },
+    { model: "claude-opus-4-8", tags: ["strong"] },
+  ];
+  const code = (pool: unknown): string =>
+    emitPipeline({
+      ...baseIr,
+      agent: { ...baseIr.agent, modelPool: pool },
+    } as unknown as IrPipelineV0).files[0]?.content ?? "";
+
+  test("guide + shadow: the bundle imports the composition root and spreads wireHybrid", () => {
+    const c = code({
+      candidates,
+      policy: "heuristic",
+      strategy: {
+        guide: { model: "claude-opus-4-8", every: "first_turn" },
+        shadow: { candidate: "claude-opus-4-8", sampleRate: 0.2 },
+      },
+    });
+    expect(c).toContain('import { wireHybrid } from "@crewhaus/model-service";');
+    expect(c).toContain("...wireHybrid({");
+    // The declined family travels INTO the bundle, so the bundle applies the
+    // same §11.3 restriction the interpreter would.
+    expect(c).toContain(
+      '{ sessionName: "hello-rag", hybridFamilies: ["classifier","sideCalls"] }),',
+    );
+  });
+
+  test("the REPL call and the eval entry get the same wiring, at their own indents", () => {
+    const c =
+      emitPipeline(
+        {
+          ...baseIr,
+          agent: {
+            ...baseIr.agent,
+            modelPool: {
+              candidates,
+              policy: "heuristic",
+              strategy: { guide: { model: "claude-opus-4-8" } },
+            },
+          },
+        } as unknown as IrPipelineV0,
+        { evalEntry: true },
+      ).files[0]?.content ?? "";
+    const calls = c.split("\n").filter((l) => l.trim().startsWith("...wireHybrid("));
+    expect(calls).toHaveLength(2);
+    // Same call, same declined family, on both paths — they read one gate.
+    expect(new Set(calls.map((l) => l.trim())).size).toBe(1);
+    expect(calls[0]?.trim()).toContain('hybridFamilies: ["classifier","sideCalls"]');
+  });
+
+  test("policy: classifier wires the label call", () => {
+    const c = code({
+      candidates,
+      policy: "classifier",
+      classifier: { model: "claude-haiku-4-5", labels: { cheap: "easy", strong: "hard" } },
+    });
+    expect(c).toContain("...wireHybrid({");
+  });
+
+  test("model_directed alone: §11.3 marks the pair — on this shape, so nothing is rendered", () => {
+    const c = code({ candidates, policy: "heuristic", strategy: { modelDirected: true } });
+    expect(c).toContain('modelPool: {"candidates":');
+    expect(c).not.toContain("wireHybrid");
+    expect(c).not.toContain("@crewhaus/model-service");
+  });
+
+  test("model_directed BESIDE a guide: the call is rendered, the pair still declined", () => {
+    const c = code({
+      candidates,
+      policy: "heuristic",
+      strategy: { modelDirected: true, guide: { model: "claude-opus-4-8" } },
+    });
+    expect(c).toContain("...wireHybrid({");
+    // The BLOB is verbatim — the key is lowered and carried, as on every other
+    // shape — but the wiring call declines the family, so the bundle builds
+    // the guide and no Consult / Escalate pair.
+    expect(c).toContain('"strategy":{"modelDirected":true,"guide"');
+    expect(c).toContain('hybridFamilies: ["classifier","sideCalls"]');
+    expect(c).not.toContain('"modelDirected"]');
+  });
+
+  test("byte-identity: a pool with no closure-shaped key renders no call and no import", () => {
+    const c = code({ candidates, policy: "heuristic" });
+    expect(c).toContain('modelPool: {"candidates":');
+    expect(c).not.toContain("wireHybrid");
+    expect(c).not.toContain("@crewhaus/model-service");
+  });
+
+  test("byte-identity: no pool at all renders no call and no import", () => {
+    const c = emitPipeline(baseIr).files[0]?.content ?? "";
+    expect(c).not.toContain("wireHybrid");
+    expect(c).not.toContain("@crewhaus/model-service");
+  });
+});

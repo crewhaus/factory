@@ -33,6 +33,7 @@ options. Every later routing feature lands here, not in codegen.
 | **8b (this cut)** | the `Consult` / `Escalate` tools (`@crewhaus/tool-consult`) constructed under `strategy.model_directed` and returned as the `hybridTools` / `escalation` options; the Consult runner is a nested single-turn `runChatLoop` on a child run context whose model events are re-published on the parent bus (see below) |
 | 9a–9d | per-candidate plans, the `preRoute` inputs, cascade wiring, the guide / shadow / committee side-call closures with their child buses |
 | **9e** | `wireHybrid` — every runtime CLOSURE a pool declares, in one call — and its codegen twin `renderHybridWiringFields`, so a COMPILED bundle constructs them too instead of carrying the blob without the behaviour |
+| **9f** | `HYBRID_FAMILIES_BY_SHAPE` — plan §11.3, the per-shape carry/emit/ignore matrix, in code — plus the `hybridFamilies` narrowing every emitter passes for its own shape, so the last four pool-bearing emitters (pipeline, research, batch, browser) wire the closures and a shape the table marks `—` for a family (today: `pipeline` × Consult / Escalate) constructs nothing for it on either path |
 | 10 | candidate adapter resolution with per-profile chains and breakers, the scoreboard and priors, the router built with rules / classifier / eligibility, judge metering on the run bus |
 
 ## `wireModels(fragment, deps)`
