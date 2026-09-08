@@ -147,6 +147,42 @@ describe("route propose", () => {
     expect(windDown?.patch.value).toBe(0);
   });
 
+  /**
+   * §7.8 — the lane records the candidate AND the primary it was graded
+   * against, so summing the whole lane counts every graded turn twice and
+   * winds the audition down at half the evidence the rationale names.
+   */
+  test("the wind-down counts the candidate's TURNS, not both sides' observations", () => {
+    const withShadow = parseSpec(
+      `${POOL_YAML}    strategy:\n      shadow: { candidate: claude-sonnet-4-5, sample_rate: 0.1 }\n`,
+    );
+    const arms = [
+      ...SEPARATED,
+      arm({ routeKey: "shadow:hard", model: "claude-sonnet-4-5", n: 20, meanReward: 0.8 }),
+      arm({ routeKey: "shadow:hard", model: "claude-opus-4-1", n: 20, meanReward: 0.2 }),
+    ];
+    // 40 lane observations but only 20 audition turns — under the floor.
+    const result = buildRouteProposals({ spec: withShadow, arms, minAuditionN: 30 });
+    expect(result.proposals.map((p) => p.id)).not.toContain("route-audition-wind-down");
+  });
+
+  test("an unattributable two-sided lane is SKIPPED with its reason, never guessed", () => {
+    const withShadow = parseSpec(
+      `${POOL_YAML}    strategy:\n      shadow: { candidate: claude-sonnet-4-5, sample_rate: 0.1 }\n`,
+    );
+    // The lane's arm ids are PROFILE names (§7.9 arm identity), so the
+    // declared model string matches neither side and nothing attributes them.
+    const arms = [
+      ...SEPARATED,
+      arm({ routeKey: "shadow:hard", model: "challenger-profile", n: 40, meanReward: 0.8 }),
+      arm({ routeKey: "shadow:hard", model: "incumbent-profile", n: 40, meanReward: 0.2 }),
+    ];
+    const result = buildRouteProposals({ spec: withShadow, arms });
+    expect(result.proposals.map((p) => p.id)).not.toContain("route-audition-wind-down");
+    const skip = result.skipped.find((sk) => sk.id === "route-audition-wind-down");
+    expect(skip?.reason).toContain("cannot be attributed");
+  });
+
   test("rule toggles are deferred to `advise`, with the reason stated", () => {
     const withRules = parseSpec(
       `${POOL_YAML}    rules:\n      - { id: images-need-vision, when: { has_images: true }, use: strong }\n`,

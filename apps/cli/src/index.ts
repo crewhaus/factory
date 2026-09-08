@@ -1294,7 +1294,9 @@ import {
   type SlotEvalOutcome,
   buildRightSizeReport,
   enumerateSlotCandidates,
+  patchIrModelSlot,
   projectCostUsd,
+  rightSizeSlots,
 } from "./right-size";
 import { runRouteCommand } from "./route";
 // v0.3.0 Goal 6 — canonical terminal-failure rendering: die() and the
@@ -1439,6 +1441,15 @@ import {
 // follow-cursor diffing, and newest-session selection (unit-tested); the CLI
 // wraps them with the fs read + poll loop.
 import { type SessionTailCursor, advanceSessionTail, pickSessionToTail } from "./sessions-tail";
+// 0.6.0 §7.8 / §9.1 — the shadow lane holds BOTH sides of one audition under
+// the primary's routeKey; these read the candidate side apart from the
+// incumbent's instead of guessing by observation count.
+import {
+  declaredShadowCandidate,
+  liveArmsOf,
+  shadowLaneArmsOf,
+  splitShadowLane,
+} from "./shadow-lane";
 // Item 37 — SLO/TTFT doctor probe + mitigation-ladder sink, in side-effect-free
 // modules (this entry file runs an argv switch on import) mirroring
 // doctor-checks.ts / alert-sink.ts.
@@ -10795,28 +10806,25 @@ async function runModelScan(args: ParsedArgs): Promise<void> {
   }
 }
 
-/** Apply a single-slot model swap to a lowered CLI IR, in-memory. `path` is
- *  ["agent","model"], ["compaction","model"], or ["subAgents", i, "model"]. */
-function patchIrModelSlot(
-  ir: Extract<ReturnType<typeof lower>, { target: "cli" }>,
-  slot: ModelSlot,
-  model: string,
-): Extract<ReturnType<typeof lower>, { target: "cli" }> {
-  if (slot.label === "agent.model") {
-    return { ...ir, agent: { ...ir.agent, model } };
-  }
-  if (slot.label === "compaction.model") {
-    return { ...ir, compaction: { ...ir.compaction, model } };
-  }
-  if (slot.label.startsWith("sub-agent ") && ir.subAgents !== undefined) {
-    const subAgents = ir.subAgents.map((sa) =>
-      sa.model === slot.currentModel && `sub-agent ${sa.name}.model` === slot.label
-        ? { ...sa, model }
-        : sa,
-    );
-    return { ...ir, subAgents };
-  }
-  return ir;
+/**
+ * The optional provider adapters, each behind a named function holding a
+ * LITERAL import specifier — the `packages/model-router/src/router.ts`
+ * convention, and not a stylistic one: the CLI also ships as a compiled
+ * single binary (`packages/single-binary-cli`), and `bun build --compile`
+ * only embeds imports it can see statically. An `import(name)` whose
+ * specifier is a variable embeds nothing, so in the shipped binary all three
+ * would reject, the `catch` would swallow it, and `models audit` would report
+ * "does not project its request parameters offline" for every OpenAI, Gemini
+ * and Bedrock slot — invisible to the suite, which runs from source.
+ */
+function importOpenAIAdapter(): Promise<typeof import("@crewhaus/adapter-openai")> {
+  return import("@crewhaus/adapter-openai");
+}
+function importGeminiAdapter(): Promise<typeof import("@crewhaus/adapter-gemini")> {
+  return import("@crewhaus/adapter-gemini");
+}
+function importBedrockAdapter(): Promise<typeof import("@crewhaus/adapter-bedrock")> {
+  return import("@crewhaus/adapter-bedrock");
 }
 
 /**
@@ -10837,10 +10845,13 @@ function patchIrModelSlot(
 async function buildParamProjection(): Promise<ParamProjection> {
   const { anthropicEffectiveParams } = await import("@crewhaus/adapter-anthropic");
   const optional = new Map<string, (req: never) => unknown>();
-  const load = async (name: string, pick: (mod: never) => unknown): Promise<void> => {
+  const load = async (
+    name: string,
+    importer: () => Promise<unknown>,
+    pick: (mod: never) => unknown,
+  ): Promise<void> => {
     try {
-      // biome-ignore lint/suspicious/noExplicitAny: the optional-adapter import shape is checked by `pick`.
-      const mod = (await import(name as any)) as never;
+      const mod = (await importer()) as never;
       const fn = pick(mod);
       if (typeof fn === "function") optional.set(name, fn as (req: never) => unknown);
     } catch {
@@ -10850,14 +10861,17 @@ async function buildParamProjection(): Promise<ParamProjection> {
   await Promise.all([
     load(
       "@crewhaus/adapter-openai",
+      importOpenAIAdapter,
       (m) => (m as Record<string, unknown>)["openAIEffectiveParams"],
     ),
     load(
       "@crewhaus/adapter-gemini",
+      importGeminiAdapter,
       (m) => (m as Record<string, unknown>)["geminiEffectiveParams"],
     ),
     load(
       "@crewhaus/adapter-bedrock",
+      importBedrockAdapter,
       (m) => (m as Record<string, unknown>)["converseEffectiveParams"],
     ),
   ]);
@@ -10963,7 +10977,7 @@ async function runModelsCli(argv: readonly string[]): Promise<void> {
   });
 
   if (args.sub === "propose" && args.source === "audition") {
-    await runModelsProposeAudition(args, specPath);
+    await runModelsProposeAudition(args, specPath, ir);
     return;
   }
   if (args.sub === "propose" && args.source !== undefined && args.source !== "sunset") {
@@ -10997,10 +11011,29 @@ async function runModelsCli(argv: readonly string[]): Promise<void> {
         process.stdout.write(`[models] ${u.slot}: ${u.reason}\n`);
       }
       process.stdout.write(`[models] proposal: ${patchPath}\n`);
+      // §9.1 loop 4 — the gate, printed as the exact command that runs it.
+      // `--candidates` is load-bearing: it FIXES the candidate set to the
+      // replacement, which the plain downshift search could never enumerate
+      // (a replacement is normally pricier than the model it retires), and
+      // `--min-cost-drop -1` opens the cost gate so the run is ranked on the
+      // pass-rate delta — the only thing this gate is asking about. A slot
+      // right-size does not search (a judge, a roster candidate) gets no
+      // command rather than one that would exit non-zero.
+      // `model right-size` only searches `target: cli` harnesses, so a slot on
+      // any other shape gets the by-hand line too.
+      const searchable = new Set(
+        ir.target === "cli" ? rightSizeSlots(slots).map((sl) => sl.label) : [],
+      );
+      for (const p of proposal.patches) {
+        process.stdout.write(
+          searchable.has(p.slot)
+            ? `[models] gate it before it ships: \`crewhaus model right-size ${relative(process.cwd(), specPath)} --dataset <d> --graders <g> ` +
+                `--slot ${p.slot} --candidates ${p.replacement} --min-cost-drop -1\` — evals the replacement in that slot and reports the pass-rate delta\n`
+            : `[models] ${p.slot} is not a slot \`model right-size\` searches (judge identity and the roster are human-owned, §9.3; the loop runs on \`target: cli\` harnesses) — verify the replacement by hand before the PR\n`,
+        );
+      }
       process.stdout.write(
-        "[models] verify the replacement before it ships: `crewhaus model right-size <spec> --dataset <d> --graders <g>`\n" +
-          "         evals the candidate set (here, exactly the replacement) against the current spec. Model fields sit\n" +
-          "         outside OPTIMIZABLE_PATHS, so nothing applies this for you — `crewhaus propose --source sunset` opens the PR.\n",
+        "[models] model fields sit outside OPTIMIZABLE_PATHS, so nothing applies this for you — `crewhaus propose --source sunset` opens the PR.\n",
       );
     }
   }
@@ -11021,30 +11054,50 @@ async function runModelsCli(argv: readonly string[]): Promise<void> {
 async function runModelsProposeAudition(
   args: ReturnType<typeof parseModelsArgs>,
   specPath: string,
+  ir: ReturnType<typeof lower>,
 ): Promise<void> {
   const rootDir = resolve(args.dir ?? join(dirname(specPath), ".crewhaus"));
-  const { openScoreboard: open } = await import("@crewhaus/routing-store");
+  const { openScoreboard: open, readShadowLaneSides } = await import("@crewhaus/routing-store");
   const arms = open(rootDir).snapshot();
-  const shadowArms = arms.filter((a) => a.routeKey.startsWith("shadow:"));
-  if (shadowArms.length === 0) {
+  const laneArms = shadowLaneArmsOf(arms);
+  if (laneArms.length === 0) {
     die(
       `models propose --source audition: no shadow-lane arms under ${rootDir}. Declare \`model_pool.strategy.shadow\` and run the harness — the audition is what this proposes from.`,
     );
   }
-  const liveArms = arms.filter(
-    (a) => !a.routeKey.startsWith("shadow:") && !a.routeKey.startsWith("q:"),
-  );
+  const liveArms = liveArmsOf(arms);
   const minN = args.minN ?? DEFAULT_MIN_EXPERIMENT_N;
-  // The audition candidate is the shadow arm with the most evidence; the
-  // incumbent is the live arm it was graded against most often.
-  const byArm = new Map<string, number>();
-  for (const a of shadowArms) byArm.set(a.model, (byArm.get(a.model) ?? 0) + a.n);
-  const shadowArm = [...byArm.entries()].sort((x, y) => y[1] - x[1])[0]?.[0] as string;
+  // §7.8 — the lane holds BOTH sides of the comparison under the primary's
+  // routeKey, and only the `at` stamp separates them. Read the stamp (falling
+  // back to the spec's declared candidate) rather than guessing by evidence:
+  // each graded turn writes one observation per side, so "the arm with the
+  // most observations" picks the INCUMBENT as often as the challenger.
+  const declared = declaredShadowCandidate(
+    (ir as { agent?: { modelPool?: unknown } }).agent?.modelPool,
+  );
+  const split = splitShadowLane(arms, {
+    sides: readShadowLaneSides(rootDir),
+    ...(declared !== undefined ? { declaredCandidate: declared } : {}),
+  });
+  if (split.candidateArm === undefined) {
+    die(
+      `models propose --source audition: ${split.unattributedReason ?? "the lane cannot be attributed"}`,
+    );
+  }
+  const shadowArm = split.candidateArm;
   const liveByArm = new Map<string, number>();
   for (const a of liveArms) liveByArm.set(a.model, (liveByArm.get(a.model) ?? 0) + a.n);
   const primaryArm = [...liveByArm.entries()].sort((x, y) => y[1] - x[1])[0]?.[0] ?? "";
+  if (primaryArm === shadowArm) {
+    die(
+      `models propose --source audition: the audition candidate (${shadowArm}) is also the busiest LIVE arm — there is no incumbent to compare it against. An audition proposes a challenger, never an arm against itself.`,
+    );
+  }
   const verdict = auditionReadiness(
-    [...shadowArms.map((a) => ({ ...a })), ...liveArms.map((a) => ({ ...a }))],
+    {
+      shadowArms: split.candidateArms.map((a) => ({ ...a })),
+      liveArms: liveArms.map((a) => ({ ...a })),
+    },
     { shadowArm, primaryArm, minN },
   );
   process.stdout.write(
@@ -11118,16 +11171,24 @@ async function runModelRightSize(args: ParsedArgs): Promise<void> {
       "usage: crewhaus model right-size [<spec.yaml>] --dataset <data> --graders <graders.yaml>\n" +
         "                                 [--min-cost-drop 0.2] [--pass-rate-tolerance 0.0]\n" +
         "                                 [--per-slot-limit 3] [--concurrency N] [--seed N]\n" +
+        "                                 [--slot <label>] [--candidates <m1,m2>]\n" +
         "                                 [--judge-model <m>] [-o <dir>] [--write]\n" +
-        "  Enumerate → compile → eval downshift search: for each model slot (agent.model,\n" +
-        "  compaction.model, sub-agents[*].model) tries the cheaper same-provider pricing-\n" +
-        "  table siblings, evals each against the baseline spec on the dataset, projects\n" +
-        "  per-candidate USD from token totals, and ranks by score-retained-per-dollar-\n" +
-        "  saved. Recommends the biggest swap that HOLDS pass-rate (within\n" +
-        "  --pass-rate-tolerance, default 0) and cuts cost by >= --min-cost-drop\n" +
-        "  (default 0.2). Writes matrix.json/index.html + patch.json (the winner) to -o.\n" +
+        "  Enumerate → compile → eval downshift search: for each SERVING model slot\n" +
+        "  (agent.model, compaction.model, sub_agents.<name>.model) tries the cheaper\n" +
+        "  same-provider pricing-table siblings, evals each against the baseline spec on\n" +
+        "  the dataset, projects per-candidate USD from token totals, and ranks by\n" +
+        "  score-retained-per-dollar-saved. Recommends the biggest swap that HOLDS\n" +
+        "  pass-rate (within --pass-rate-tolerance, default 0) and cuts cost by >=\n" +
+        "  --min-cost-drop (default 0.2). Judge slots (evaluation.grader.model,\n" +
+        "  security.justification.model) and the candidate roster are NEVER searched:\n" +
+        "  nothing in an agent-pass-rate run measures a judge, and §9.3 keeps both\n" +
+        "  human-owned. Writes matrix.json/index.html + patch.json (the winner) to -o.\n" +
         "  --write applies the winner to the spec via a direct comment-preserving CST\n" +
-        "  edit (model fields are outside OPTIMIZABLE_PATHS; always human-initiated).\n",
+        "  edit (model fields are outside OPTIMIZABLE_PATHS; always human-initiated).\n" +
+        "  --slot <label> searches ONE enumerated slot; --candidates <m1,m2> FIXES the\n" +
+        "  candidate set to the models named instead of searching for cheaper siblings\n" +
+        "  — the sunset gate (§9.1 loop 4): a replacement is usually pricier than the\n" +
+        "  model it retires, so pass --min-cost-drop -1 and read the pass-rate delta.\n",
     );
     return;
   }
@@ -11151,21 +11212,46 @@ async function runModelRightSize(args: ParsedArgs): Promise<void> {
   if (ir.target !== "cli") die(`model right-size only supports target: cli (got "${ir.target}")`);
   const cliIr = ir;
 
-  // 0.6.0 §8.2 — the shared spec walk, filtered to what a downshift may
-  // rewrite. Roster membership (pool candidates, tiers, fallback chains) is
-  // enumerated by the walk but NOT swappable: §9.3 keeps the roster
-  // human-owned, so right-size must never propose a candidate edit. A slot
-  // with no spec path (a sub-agent model the IR resolves but the patch
-  // grammar cannot address) still searches — the report names it and says the
-  // apply is manual, exactly as before.
+  // 0.6.0 §8.2 — the shared spec walk, filtered by `rightSizeSlots` to the
+  // SERVING slots this loop's objective can actually rank (agent.model,
+  // compaction.model, sub-agents). Roster membership and judge identity are
+  // enumerated by the walk but never searched: §9.3 keeps the roster
+  // human-owned, and nothing in an agent-pass-rate run measures a judge, so a
+  // cheaper judge would always read as a free win. A slot with no spec path (a
+  // sub-agent model the IR resolves but the patch grammar cannot address)
+  // still searches — the report names it and says the apply is manual.
   const walked: ReadonlyArray<EnumeratedModelSlot> = enumerateModelSlots(cliIr);
-  const slots: ModelSlot[] = walked
-    .filter((sl) => sl.swappable || sl.kind === "sub-agent")
-    .map((sl) => ({
-      label: sl.label,
-      currentModel: sl.model,
-      ...(sl.path !== undefined && sl.swappable ? { path: sl.path } : {}),
-    }));
+  const slotFilter = args.flags["slot"];
+  const slots: ModelSlot[] = rightSizeSlots(walked).filter(
+    (sl) => typeof slotFilter !== "string" || sl.label === slotFilter,
+  );
+  if (slots.length === 0) {
+    die(
+      typeof slotFilter === "string"
+        ? `model right-size: --slot ${slotFilter} matches no searchable slot (searchable: ${rightSizeSlots(
+            walked,
+          )
+            .map((sl) => sl.label)
+            .join(", ")})`
+        : "model right-size: the spec declares no searchable model slot",
+    );
+  }
+
+  // §9.1 loop 4 — the sunset GATE. `--candidates` fixes the candidate set to
+  // the models named (the replacement `models propose --source sunset` chose)
+  // instead of searching for cheaper siblings, because a replacement is
+  // normally PRICIER than the model it retires and the downshift filter could
+  // never enumerate it.
+  const fixedCandidates = ((): ReadonlyArray<string> | undefined => {
+    const raw = args.flags["candidates"];
+    if (typeof raw !== "string") return undefined;
+    const list = raw
+      .split(",")
+      .map((m) => m.trim())
+      .filter((m) => m.length > 0);
+    if (list.length === 0) die("model right-size: --candidates needs at least one model string");
+    return list;
+  })();
 
   const pricing = loadUserPricing();
   const candidates = enumerateSlotCandidates(slots, {
@@ -11173,11 +11259,26 @@ async function runModelRightSize(args: ParsedArgs): Promise<void> {
     ...(typeof args.flags["per-slot-limit"] === "string"
       ? { perSlotLimit: Number.parseInt(args.flags["per-slot-limit"], 10) }
       : {}),
+    ...(fixedCandidates !== undefined ? { fixedCandidates } : {}),
   });
   if (candidates.length === 0) {
     die(
-      "model right-size: no cheaper same-provider downshift candidates for any slot (models may already be cheapest-in-class or off the pricing table)",
+      fixedCandidates === undefined
+        ? "model right-size: no cheaper same-provider downshift candidates for any slot (models may already be cheapest-in-class or off the pricing table)"
+        : `model right-size: --candidates ${fixedCandidates.join(", ")} names the model already in every searched slot — nothing to measure`,
     );
+  }
+  // Every candidate must be PATCHABLE before a single token is spent: a slot
+  // the patcher cannot address would eval the unchanged baseline and be
+  // ranked as a free downshift. `patchIrModelSlot` throws on one; do it here,
+  // loudly, rather than inside the per-candidate try/catch where it would be
+  // recorded as a crashed cell and skipped in silence.
+  for (const candidate of candidates) {
+    try {
+      patchIrModelSlot(cliIr, candidate.slot, candidate.candidateModel);
+    } catch (err) {
+      die(err instanceof Error ? err.message : String(err));
+    }
   }
 
   const gradersYaml = readFileSync(resolve(gradersPath), "utf-8");

@@ -1364,6 +1364,60 @@ describe("ruleAuditionReady", () => {
       ruleAuditionReady(buildAdviceContext([], [], fullCoverageArms(30)), { spec: POOL_SPEC }),
     ).toEqual([]);
   });
+
+  /**
+   * §7.8 — the lane records BOTH sides of every graded turn under the
+   * primary's routeKey. Folding it per arm id and calling each id a "shadow
+   * arm" reported the INCUMBENT as the challenger whenever it won the
+   * pairwise judging, which is exactly what a strong incumbent does.
+   */
+  it("never proposes the INCUMBENT as the audition candidate", () => {
+    const bothSides = buildAdviceContext(
+      [],
+      [],
+      [
+        ...fullCoverageArms(30),
+        // The incumbent won the blind judging (0.99 pairwise) and has the
+        // same lane count as the challenger — one observation per side.
+        arm("shadow:hard", "candidate-x", 60, 0.2),
+        arm("shadow:hard", "claude-sonnet-4-6", 60, 0.99),
+      ],
+    );
+    const declared = parseSpec(
+      [
+        "name: pooled",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: help",
+        "  model_pool:",
+        "    candidates:",
+        "      - { model: claude-haiku-4-5, tags: [cheap] }",
+        "      - { model: claude-sonnet-4-6, tags: [balanced] }",
+        "      - { model: claude-opus-4-1, tags: [strong] }",
+        "    strategy:",
+        "      shadow: { candidate: candidate-x, sample_rate: 0.1 }",
+      ].join("\n"),
+    );
+    const findings = ruleAuditionReady(bothSides, { spec: declared });
+    // candidate-x is the declared challenger and it LOST, so nothing fires —
+    // and the incumbent is never reported as a shadow arm.
+    expect(findings.map((f) => f.id)).not.toContain("audition-ready:claude-sonnet-4-6");
+    expect(findings).toEqual([]);
+  });
+
+  it("refuses to guess when a two-sided lane declares no candidate", () => {
+    const ambiguous = buildAdviceContext(
+      [],
+      [],
+      [
+        ...fullCoverageArms(30),
+        arm("shadow:hard", "candidate-x", 60, 0.99),
+        arm("shadow:hard", "claude-sonnet-4-6", 60, 0.01),
+      ],
+    );
+    expect(ruleAuditionReady(ambiguous, { spec: POOL_SPEC })).toEqual([]);
+  });
 });
 
 describe("rulePolicyFlipReady", () => {

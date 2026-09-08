@@ -7,6 +7,8 @@
  * on noise) — acceptance items 11 and 12 of §1's scenario.
  */
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { lower } from "@crewhaus/compiler";
 import type { PricingTable, SunsetTable } from "@crewhaus/cost-tracker";
 import { DEFAULT_PRICING } from "@crewhaus/cost-tracker";
@@ -340,45 +342,108 @@ describe("audition readiness (the n>=30 power floor)", () => {
     meanReward,
     varReward,
   });
+  const lane = (model: string, n: number, meanReward: number, varReward = 0.01) => ({
+    ...arm(model, n, meanReward, varReward),
+    routeKey: "shadow:hard",
+  });
 
   test("REFUSES below the floor, naming the count (acceptance item 11)", () => {
-    const verdict = auditionReadiness([arm("cand", 12, 0.9), arm("primary", 100, 0.5)], {
-      shadowArm: "cand",
-      primaryArm: "primary",
-      minN: 30,
-    });
+    const verdict = auditionReadiness(
+      { shadowArms: [lane("cand", 12, 0.9)], liveArms: [arm("primary", 100, 0.5)] },
+      { shadowArm: "cand", primaryArm: "primary", minN: 30 },
+    );
     expect(verdict.ready).toBe(false);
     expect(verdict.reason).toContain("12 observation(s)");
     expect(verdict.reason).toContain("power floor is 30");
   });
 
   test("REFUSES when the incumbent itself is under-measured", () => {
-    const verdict = auditionReadiness([arm("cand", 100, 0.9), arm("primary", 5, 0.5)], {
-      shadowArm: "cand",
-      primaryArm: "primary",
-      minN: 30,
-    });
+    const verdict = auditionReadiness(
+      { shadowArms: [lane("cand", 100, 0.9)], liveArms: [arm("primary", 5, 0.5)] },
+      { shadowArm: "cand", primaryArm: "primary", minN: 30 },
+    );
     expect(verdict.ready).toBe(false);
     expect(verdict.reason).toContain("Both sides must clear it");
   });
 
   test("ready when the shadow's lower bound clears the incumbent's mean", () => {
-    const verdict = auditionReadiness([arm("cand", 200, 0.9, 0.01), arm("primary", 200, 0.5)], {
-      shadowArm: "cand",
-      primaryArm: "primary",
-      minN: 30,
-    });
+    const verdict = auditionReadiness(
+      { shadowArms: [lane("cand", 200, 0.9, 0.01)], liveArms: [arm("primary", 200, 0.5)] },
+      { shadowArm: "cand", primaryArm: "primary", minN: 30 },
+    );
     expect(verdict.ready).toBe(true);
     expect(verdict.shadowLowerBound).toBeGreaterThan(0.5);
   });
 
   test("NOT ready on a lead the interval does not separate", () => {
-    const verdict = auditionReadiness([arm("cand", 40, 0.55, 0.25), arm("primary", 40, 0.5)], {
-      shadowArm: "cand",
-      primaryArm: "primary",
-      minN: 30,
-    });
+    const verdict = auditionReadiness(
+      { shadowArms: [lane("cand", 40, 0.55, 0.25)], liveArms: [arm("primary", 40, 0.5)] },
+      { shadowArm: "cand", primaryArm: "primary", minN: 30 },
+    );
     expect(verdict.ready).toBe(false);
     expect(verdict.reason).toContain("keep auditioning");
+  });
+
+  /**
+   * §7.10 "same-instrument is the rule". The incumbent's arm id ALWAYS
+   * appears in the shadow lane (the lane records both sides of every graded
+   * turn), so a flat arm list folded the incumbent's pairwise lane verdicts
+   * into its absolute live mean. Splitting the two sides is what stops it.
+   */
+  test("the incumbent is folded from the LIVE bands only — lane rows never mix in", () => {
+    const withLaneRows = auditionReadiness(
+      {
+        shadowArms: [lane("cand", 100, 0.9)],
+        liveArms: [arm("primary", 100, 0.5)],
+      },
+      { shadowArm: "cand", primaryArm: "primary", minN: 30 },
+    );
+    // The primary's own lane rows (it lost the pairwise judging: quality 0)
+    // are not part of `liveArms`, so they cannot drag its mean.
+    expect(withLaneRows.primaryMean).toBe(0.5);
+    expect(withLaneRows.primaryN).toBe(100);
+  });
+});
+
+/**
+ * §8.1 — the offline parameter projector loads three OPTIONAL adapters. The
+ * CLI also ships as a compiled single binary, and `bun build --compile` only
+ * embeds imports whose specifier it can see statically: an `import(name)`
+ * whose specifier is a variable embeds nothing, so in the shipped binary
+ * every one of those imports rejects, the `catch` swallows it, and `models
+ * audit` degrades to "does not project its request parameters offline" for
+ * every OpenAI / Gemini / Bedrock slot. The suite runs from source, so only a
+ * check on the SOURCE can see the difference — this is it.
+ */
+describe("the optional adapter imports are statically analysable (compiled-binary safety)", () => {
+  const source = readFileSync(join(import.meta.dir, "index.ts"), "utf-8");
+
+  test("each adapter is imported through a literal specifier", () => {
+    for (const pkg of [
+      "@crewhaus/adapter-openai",
+      "@crewhaus/adapter-gemini",
+      "@crewhaus/adapter-bedrock",
+    ]) {
+      expect(source.includes(`return import("${pkg}");`)).toBe(true);
+    }
+  });
+
+  test("no adapter is imported through a VARIABLE specifier", () => {
+    // Booleans, not the 22k-line source, so a failure prints a verdict.
+    expect(source.includes("await import(name as any)")).toBe(false);
+    expect(/await import\(\s*[A-Za-z_$]/.test(source)).toBe(false);
+  });
+
+  test("and each one is declared, so an installed CLI can resolve it", () => {
+    const manifest = JSON.parse(
+      readFileSync(join(import.meta.dir, "..", "package.json"), "utf-8"),
+    ) as { optionalDependencies?: Record<string, string> };
+    for (const pkg of [
+      "@crewhaus/adapter-openai",
+      "@crewhaus/adapter-gemini",
+      "@crewhaus/adapter-bedrock",
+    ]) {
+      expect(manifest.optionalDependencies?.[pkg]).toBeDefined();
+    }
   });
 });

@@ -2,14 +2,19 @@
  * Item 25 — right-size candidate enumeration + $/score ranking tests.
  */
 import { describe, expect, test } from "bun:test";
+import { lower } from "@crewhaus/compiler";
 import type { PricingTable } from "@crewhaus/cost-tracker";
+import { parseSpec } from "@crewhaus/spec";
+import { enumerateModelSlots } from "./model-slots";
 import {
   type BaselineEvalOutcome,
   type ModelSlot,
   type SlotEvalOutcome,
   buildRightSizeReport,
   enumerateSlotCandidates,
+  patchIrModelSlot,
   projectCostUsd,
+  rightSizeSlots,
 } from "./right-size";
 
 const PRICING: PricingTable = {
@@ -176,5 +181,138 @@ describe("buildRightSizeReport", () => {
     ];
     const report = buildRightSizeReport(baseline, outcomes, { minCostDropRatio: 0.2 });
     expect(report.ranked).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §8.2 / §9.1 — the slot set and the patcher have to AGREE.
+//
+// `model right-size` reads its slots from `enumerateModelSlots` and evals
+// `patchIrModelSlot(ir, slot, candidate)`. When the two drift apart the
+// failure is silent and WORSE than a no-op: the candidate run is the
+// unchanged baseline, so its pass rate and tokens equal the baseline's — and
+// the report prices those baseline tokens at the candidate's cheaper rate, so
+// the unmeasured candidate scores "identical quality, large cost drop" and is
+// ranked as the recommended downshift that `--write` then applies.
+// ---------------------------------------------------------------------------
+
+const SUB_AGENT_SPEC = `
+name: patcher
+target: cli
+agent:
+  model: claude-opus-5
+  instructions: hi
+  sub_agents:
+    helper: { description: helps, instructions: help, model: claude-opus-5 }
+compaction:
+  model: claude-opus-5
+evaluation:
+  grader: { type: llm_judge, criteria: good?, model: claude-opus-5 }
+  threshold: 0.7
+`;
+
+function cliIrOf(yaml: string) {
+  const ir = lower(parseSpec(yaml));
+  if (ir.target !== "cli") throw new Error("expected a cli spec");
+  return ir;
+}
+
+describe("rightSizeSlots", () => {
+  test("searches the serving slots and nothing else", () => {
+    const slots = rightSizeSlots(enumerateModelSlots(cliIrOf(SUB_AGENT_SPEC)));
+    expect(slots.map((s) => s.label).sort()).toEqual([
+      "agent.model",
+      "compaction.model",
+      "sub_agents.helper.model",
+    ]);
+  });
+
+  test("the judge is never searched — the objective does not measure it", () => {
+    const labels = rightSizeSlots(enumerateModelSlots(cliIrOf(SUB_AGENT_SPEC))).map((s) => s.label);
+    expect(labels).not.toContain("evaluation.grader.model");
+  });
+
+  test("a sub-agent slot searches, but carries no patch path (the apply is manual)", () => {
+    const sub = rightSizeSlots(enumerateModelSlots(cliIrOf(SUB_AGENT_SPEC))).find(
+      (s) => s.label === "sub_agents.helper.model",
+    );
+    expect(sub?.currentModel).toBe("claude-opus-5");
+    expect(sub?.path).toBeUndefined();
+  });
+});
+
+describe("patchIrModelSlot", () => {
+  test("the candidate IR DIFFERS from the baseline for every slot right-size enumerates", () => {
+    const ir = cliIrOf(SUB_AGENT_SPEC);
+    const slots = rightSizeSlots(enumerateModelSlots(ir));
+    expect(slots.length).toBeGreaterThan(0);
+    for (const slot of slots) {
+      const patched = patchIrModelSlot(ir, slot, "claude-haiku-4-5");
+      expect(JSON.stringify(patched)).not.toBe(JSON.stringify(ir));
+      // and the swap landed in THAT slot, not somewhere else.
+      const after = enumerateModelSlots(patched).find((s) => s.label === slot.label);
+      expect(after?.model).toBe("claude-haiku-4-5");
+    }
+  });
+
+  test("patches the sub-agent the walk NAMES (`sub_agents.<name>.model`)", () => {
+    const ir = cliIrOf(SUB_AGENT_SPEC);
+    const patched = patchIrModelSlot(
+      ir,
+      { label: "sub_agents.helper.model", currentModel: "claude-opus-5" },
+      "claude-haiku-4-5",
+    );
+    expect(patched.subAgents[0]?.model).toBe("claude-haiku-4-5");
+    expect(patched.agent.model).toBe("claude-opus-5");
+  });
+
+  test("THROWS on a slot it cannot address — an unpatched candidate must never be ranked", () => {
+    const ir = cliIrOf(SUB_AGENT_SPEC);
+    expect(() =>
+      patchIrModelSlot(
+        ir,
+        {
+          label: "evaluation.grader.model",
+          currentModel: "claude-opus-5",
+          path: ["evaluation", "grader", "model"],
+        },
+        "claude-haiku-4-5",
+      ),
+    ).toThrow(/cannot patch slot/);
+    expect(() =>
+      patchIrModelSlot(
+        ir,
+        { label: "sub_agents.ghost.model", currentModel: "claude-opus-5" },
+        "claude-haiku-4-5",
+      ),
+    ).toThrow(/cannot patch slot/);
+  });
+});
+
+describe("enumerateSlotCandidates --candidates (the sunset gate, §9.1 loop 4)", () => {
+  const slots: ModelSlot[] = [
+    { label: "agent.model", currentModel: "claude-haiku-4", path: ["agent", "model"] },
+  ];
+
+  test("a PRICIER replacement is enumerable when the candidate set is fixed", () => {
+    // The downshift search alone can never see it: a sunset replacement costs
+    // more than the model it retires.
+    expect(
+      enumerateSlotCandidates(slots, { pricing: PRICING }).map((c) => c.candidateModel),
+    ).not.toContain("claude-sonnet-4");
+    const fixed = enumerateSlotCandidates(slots, {
+      pricing: PRICING,
+      fixedCandidates: ["claude-sonnet-4"],
+    });
+    expect(fixed.map((c) => c.candidateModel)).toEqual(["claude-sonnet-4"]);
+  });
+
+  test("the model already in the slot is not a candidate", () => {
+    expect(
+      enumerateSlotCandidates(slots, {
+        pricing: PRICING,
+        fixedCandidates: ["claude-haiku-4"],
+      }),
+    ).toHaveLength(0);
   });
 });

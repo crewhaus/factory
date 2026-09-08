@@ -7,6 +7,9 @@
   "include": ["src/**/*"],
   "references": [
     { "path": "../../packages/adapter-anthropic" },
+    { "path": "../../packages/adapter-bedrock" },
+    { "path": "../../packages/adapter-gemini" },
+    { "path": "../../packages/adapter-openai" },
     { "path": "../../packages/agent-context-isolation" },
     { "path": "../../packages/eval-optimizer-orchestrator" },
     { "path": "../../packages/meta-harness-optimizer" },

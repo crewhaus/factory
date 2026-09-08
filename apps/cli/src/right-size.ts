@@ -1,3 +1,15 @@
+import {
+  type CandidateProvider,
+  DEFAULT_PRICING,
+  type PricingTable,
+  type RankedRightSize,
+  type RightSizeProposal,
+  computeCostMicros,
+  enumerateCandidates,
+  providerOfSpecString,
+  rankRightSizeProposals,
+  resolvePricing,
+} from "@crewhaus/cost-tracker";
 /**
  * Item 25 — `crewhaus model right-size <spec>`: an enumerate → compile → eval
  * loop that searches for a CHEAPER model in ONE slot that HOLDS quality.
@@ -18,29 +30,111 @@
  * (candidate enumeration + cost projection + ranking); the CLI wires the real
  * compile+eval.
  */
-import {
-  type CandidateProvider,
-  DEFAULT_PRICING,
-  type PricingTable,
-  type RankedRightSize,
-  type RightSizeProposal,
-  computeCostMicros,
-  enumerateCandidates,
-  providerOfSpecString,
-  rankRightSizeProposals,
-  resolvePricing,
-} from "@crewhaus/cost-tracker";
+import type { IrNode } from "@crewhaus/ir";
 
 /** A swappable model slot in the spec, addressed by its patch path. */
 export type ModelSlot = {
-  /** Human label (agent.model, compaction.model, sub-agent <name>.model, judge). */
+  /** The `enumerateModelSlots` label (`agent.model`, `compaction.model`,
+   *  `sub_agents.<name>.model`) — the SAME string the walk emits, because
+   *  {@link patchIrModelSlot} dispatches on it. */
   readonly label: string;
   /** The spec model string currently in the slot. */
   readonly currentModel: string;
-  /** The patch path (for the eventual CST edit); undefined for the judge (a
-   *  CLI flag, not a spec field). */
+  /** The patch path (for the eventual CST edit); undefined for a slot the
+   *  patch grammar cannot address (a sub-agent model, say), whose winning
+   *  swap is reported and applied by hand. */
   readonly path?: ReadonlyArray<string>;
 };
+
+/**
+ * The lowered `target: cli` IR — the only shape `model right-size` searches
+ * (its runner compiles and evals a cli harness).
+ */
+export type CliIr = Extract<IrNode, { target: "cli" }>;
+
+/**
+ * The slot kinds a right-size search may swap, and the reason the rest are
+ * out: the loop's objective is the AGENT's pass rate on a dataset, so it can
+ * only rank slots that objective actually measures.
+ *
+ *   - `primary` / `compaction` / `sub-agent` — every one of them serves the
+ *     turns the dataset scores, so a cheaper model there shows up as a
+ *     pass-rate change.
+ *   - `judge` — the instrument. Nothing in the run measures the judge, so a
+ *     cheaper judge always reads as a free win (§9.3 / §10.3 keep judge
+ *     identity human-owned; `["evaluation","grader","model"]` is in
+ *     `HUMAN_OWNED_PATHS` as "judge identity").
+ *   - `candidate` / `tier` / `fallback` / `classifier` / `strategy` — roster
+ *     membership, human-owned (§9.3).
+ *   - `aux` — the crew router's model, a degrade target, the grounding model:
+ *     roster decisions, or slots this dataset does not exercise.
+ */
+const RIGHT_SIZE_KINDS: ReadonlySet<string> = new Set(["primary", "compaction", "sub-agent"]);
+
+/** One enumerated slot as {@link rightSizeSlots} reads it (the walk's shape). */
+type WalkedSlot = {
+  readonly label: string;
+  readonly model: string;
+  readonly kind: string;
+  readonly path?: ReadonlyArray<string>;
+  readonly swappable: boolean;
+};
+
+/**
+ * The right-size view of `enumerateModelSlots`: the serving slots, in walk
+ * order. A slot must be BOTH a serving kind and `swappable` — the two
+ * conditions are independent (a `sub-agent` slot is not `swappable` because
+ * the patch grammar cannot address it, and a judge slot is not a serving
+ * kind), and requiring both is what keeps a future walk change from quietly
+ * widening the search.
+ */
+export function rightSizeSlots(walked: ReadonlyArray<WalkedSlot>): ModelSlot[] {
+  return walked
+    .filter((sl) => RIGHT_SIZE_KINDS.has(sl.kind) && (sl.swappable || sl.kind === "sub-agent"))
+    .map((sl) => ({
+      label: sl.label,
+      currentModel: sl.model,
+      ...(sl.path !== undefined && sl.swappable ? { path: sl.path } : {}),
+    }));
+}
+
+/** The `sub_agents.<name>.model` label `enumerateModelSlots` emits. */
+const SUB_AGENT_LABEL_RE = /^sub_agents\.(.+)\.model$/;
+
+/**
+ * Apply a single-slot model swap to a lowered cli IR, in memory — the
+ * candidate `model right-size` actually evals.
+ *
+ * It dispatches on the slot's PATCH PATH (and, for the sub-agents the patch
+ * grammar cannot address, on the walk's own label), never on a hand-copied
+ * label spelling: a patcher that silently fails to patch is the worst failure
+ * this loop can have. The candidate would run the BASELINE spec while the
+ * report priced its tokens at the candidate's rate, so an unmeasured downshift
+ * would score "identical pass rate, large cost drop" and be recommended —
+ * and `--write` would apply it. Hence the throw: a slot this cannot address
+ * must never be evaled and ranked.
+ */
+export function patchIrModelSlot(ir: CliIr, slot: ModelSlot, model: string): CliIr {
+  const key = slot.path?.join(".");
+  if (key === "agent.model") return { ...ir, agent: { ...ir.agent, model } };
+  if (key === "compaction.model") return { ...ir, compaction: { ...ir.compaction, model } };
+  const sub = SUB_AGENT_LABEL_RE.exec(slot.label);
+  if (sub !== null) {
+    const name = sub[1];
+    let patched = false;
+    const subAgents = ir.subAgents.map((sa) => {
+      if (sa.name !== name) return sa;
+      patched = true;
+      return { ...sa, model };
+    });
+    if (patched) return { ...ir, subAgents };
+  }
+  throw new Error(
+    `model right-size: cannot patch slot "${slot.label}"${
+      key === undefined ? "" : ` (${key})`
+    } in memory — refusing to eval a candidate that would run the unchanged baseline and be ranked as a free downshift. This is a bug: the slot walk and the patcher have drifted apart.`,
+  );
+}
 
 /** One candidate: the spec with `slot` swapped to `candidateModel`. */
 export type SlotCandidate = {
@@ -52,6 +146,17 @@ export type EnumerateSlotCandidatesOptions = {
   readonly pricing?: PricingTable;
   /** Cap the candidates per slot (cheapest-first). Default 3. */
   readonly perSlotLimit?: number;
+  /**
+   * 0.6.0 §9.1 (loop 4) — FIX the candidate set to these models instead of
+   * searching for cheaper siblings (`model right-size --candidates`). This is
+   * what makes the loop usable as the sunset GATE: a replacement model is
+   * normally MORE expensive than the model it retires (`claude-3-5-haiku`
+   * $0.8/$4 → `claude-haiku-4-5` $1/$5), so the downshift filter can never
+   * enumerate it and the sunset proposal would ship unmeasured. With this set
+   * the price filter is off — the eval still measures pass rate, and the
+   * recommend gate still applies (open it with `--min-cost-drop`).
+   */
+  readonly fixedCandidates?: ReadonlyArray<string>;
 };
 
 /**
@@ -68,6 +173,20 @@ export function enumerateSlotCandidates(
   const perSlotLimit = opts.perSlotLimit ?? 3;
   const out: SlotCandidate[] = [];
   const seen = new Set<string>();
+  // A FIXED candidate set skips the pricing walk entirely: the caller has
+  // already decided what to measure (the sunset gate's replacement).
+  if (opts.fixedCandidates !== undefined && opts.fixedCandidates.length > 0) {
+    for (const slot of slots) {
+      for (const candidateModel of opts.fixedCandidates) {
+        if (candidateModel === slot.currentModel) continue;
+        const key = `${slot.label}→${candidateModel}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({ slot, candidateModel });
+      }
+    }
+    return out;
+  }
   for (const slot of slots) {
     const parsed = providerOfSpecString(slot.currentModel);
     if (parsed === undefined) continue;

@@ -907,6 +907,16 @@ type ArmLike = {
 };
 
 /**
+ * The two sides of an audition, kept apart by construction. `shadowArms` are
+ * the CANDIDATE's shadow-lane rows (attributed by `splitShadowLane`, never
+ * the incumbent's half of the lane); `liveArms` are the live bands.
+ */
+export type AuditionArms = {
+  readonly shadowArms: ReadonlyArray<ArmLike>;
+  readonly liveArms: ReadonlyArray<ArmLike>;
+};
+
+/**
  * Wilson-style lower bound on an arm's mean reward. Reward lives in [0,1]
  * (`computeReward`'s contract), so the same normal-approximation floor the
  * experiment ledger uses applies: mean − z·sqrt(var/n).
@@ -926,19 +936,28 @@ export function armLowerBound(arm: ArmLike, z = 1.96): number {
  * than proposing on noise.
  */
 export function auditionReadiness(
-  arms: ReadonlyArray<ArmLike>,
+  arms: AuditionArms,
   opts: { readonly shadowArm: string; readonly primaryArm: string; readonly minN: number },
 ): AuditionVerdict {
-  const fold = (name: string): { n: number; mean: number; varSum: number } => {
-    const matching = arms.filter((a) => a.model === name);
+  const fold = (
+    rows: ReadonlyArray<ArmLike>,
+    name: string,
+  ): { n: number; mean: number; varSum: number } => {
+    const matching = rows.filter((a) => a.model === name);
     const n = matching.reduce((acc, a) => acc + a.n, 0);
     if (n === 0) return { n: 0, mean: 0, varSum: 0 };
     const mean = matching.reduce((acc, a) => acc + a.meanReward * a.n, 0) / n;
     const varSum = matching.reduce((acc, a) => acc + a.varReward * a.n, 0) / n;
     return { n, mean, varSum };
   };
-  const shadow = fold(opts.shadowArm);
-  const primary = fold(opts.primaryArm);
+  // §7.10 "same-instrument is the rule": the challenger is folded from the
+  // LANE rows only (a pairwise blind verdict) and the incumbent from the LIVE
+  // bands only (an absolute judged mean). Passing one flat array let a
+  // candidate that also serves live — or an incumbent whose id appears in the
+  // lane, which it always does, since the lane records both sides — mix the
+  // two instruments into a single mean.
+  const shadow = fold(arms.shadowArms, opts.shadowArm);
+  const primary = fold(arms.liveArms, opts.primaryArm);
   const base = {
     shadowArm: opts.shadowArm,
     primaryArm: opts.primaryArm,

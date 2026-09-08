@@ -145,6 +145,11 @@
     "@crewhaus/compliance-controls": "workspace:*",
     "yaml": "^2.6.0"
   },
+  "optionalDependencies": {
+    "@crewhaus/adapter-bedrock": "workspace:*",
+    "@crewhaus/adapter-gemini": "workspace:*",
+    "@crewhaus/adapter-openai": "workspace:*"
+  },
   "devDependencies": {
     "zod": "^3.23.8"
   },

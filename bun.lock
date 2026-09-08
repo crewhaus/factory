@@ -139,6 +139,11 @@
       "devDependencies": {
         "zod": "^3.23.8",
       },
+      "optionalDependencies": {
+        "@crewhaus/adapter-bedrock": "workspace:*",
+        "@crewhaus/adapter-gemini": "workspace:*",
+        "@crewhaus/adapter-openai": "workspace:*",
+      },
     },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",

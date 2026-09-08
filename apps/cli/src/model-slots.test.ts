@@ -8,6 +8,7 @@
 import { describe, expect, test } from "bun:test";
 import { lower } from "@crewhaus/compiler";
 import { parseSpec } from "@crewhaus/spec";
+import { humanOwnedReason } from "@crewhaus/spec-patch";
 import { auxModelsFor, enumerateModelSlots, primarySlot } from "./model-slots";
 
 function walk(yaml: string) {
@@ -118,5 +119,71 @@ agent:
 `);
     expect(slots.map((s) => s.label)).toEqual(["agent.model"]);
     expect(slots[0]?.profile).toBeUndefined();
+  });
+});
+
+/**
+ * §9.3 / §10.3 — what a downshift search is allowed to see. `swappable` is
+ * the ONLY gate `model right-size` reads, so a slot the plan classifies as
+ * human-owned must never carry it: an automated cost-minimising loop with
+ * `--write` would otherwise rewrite the judge that measures it.
+ */
+describe("swappable never covers a human-owned identity slot", () => {
+  const JUDGED = `
+name: judged
+target: cli
+agent:
+  model: claude-opus-5
+  instructions: hi
+evaluation:
+  grader: { type: llm_judge, criteria: is it good?, model: claude-opus-5 }
+  threshold: 0.7
+security:
+  justification:
+    judge: claude
+    model: claude-opus-5
+`;
+
+  test("the judge slots enumerate, with their patch path, but are NOT swappable", () => {
+    const slots = walk(JUDGED);
+    const grader = slots.find((s) => s.label === "evaluation.grader.model");
+    expect(grader?.kind).toBe("judge");
+    expect(grader?.path).toEqual(["evaluation", "grader", "model"]);
+    expect(grader?.swappable).toBe(false);
+    const justification = slots.find((s) => s.label === "security.justification.model");
+    expect(justification?.swappable).toBe(false);
+  });
+
+  test("no judge-kind slot of any shape is swappable", () => {
+    for (const yaml of [JUDGED, POOLED]) {
+      for (const s of walk(yaml)) {
+        if (s.kind === "judge") expect(s.swappable).toBe(false);
+      }
+    }
+  });
+
+  test("the crew router's model enumerates but is not swappable (§10.3)", () => {
+    const slots = walk(`
+name: crew
+target: crew
+model: claude-opus-5
+entry: writer
+roles:
+  writer: { instructions: write }
+  editor: { instructions: edit, model: claude-haiku-4-5 }
+routing: { kind: llm, model: claude-opus-5 }
+`);
+    const routing = slots.find((s) => s.label === "routing.model");
+    expect(routing?.model).toBe("claude-opus-5");
+    expect(routing?.swappable).toBe(false);
+  });
+
+  test("every swappable path is one the repo does not call judge identity", () => {
+    for (const yaml of [JUDGED, POOLED]) {
+      for (const s of walk(yaml)) {
+        if (!s.swappable || s.path === undefined) continue;
+        expect(humanOwnedReason(s.path)).not.toBe("judge identity");
+      }
+    }
   });
 });

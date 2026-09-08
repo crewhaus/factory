@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { lower } from "@crewhaus/compiler";
+import { compile, lower } from "@crewhaus/compiler";
 import { parseSpec } from "@crewhaus/spec";
 import {
   ASK_USER_TOOL,
@@ -184,6 +184,24 @@ describe("buildHybridSpec", () => {
       cascade: { draft: "cheap", escalateTo: "strong" },
     });
     expect(ir.evaluation?.onFail).toBe("escalate");
+  });
+
+  /**
+   * §9.2 — the flagship scaffold must not ship a configuration the compiler
+   * itself calls a hazard. The two-arm cascade's judge IS the strong serving
+   * arm, so `model-plan-self-judge` fires unless the template says it meant
+   * it; `allow_self_judge` (with the comment explaining the trade-off) is
+   * that statement. A future template edit that reintroduces a model-plan
+   * warning fails here.
+   */
+  test("the scaffold compiles with NO model-plan warning — not even the self-judge one", () => {
+    const warnings = compile(built.yaml).warnings ?? [];
+    expect(warnings.filter((w) => w.code.startsWith("model-plan"))).toEqual([]);
+  });
+
+  test("the self-judge waiver is DECLARED, and the comment says why", () => {
+    expect(built.yaml).toContain("allow_self_judge: true");
+    expect(built.yaml).toContain("the checker IS");
   });
 
   test("every block it writes carries the comment that explains it", () => {

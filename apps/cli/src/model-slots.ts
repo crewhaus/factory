@@ -67,6 +67,20 @@ export type EnumeratedModelSlot = {
    * Whether a right-size / sunset downshift may rewrite this slot. Roster
    * membership (`model_pool.candidates`, tiers, fallback chains) is
    * human-owned (§9.3), so those enumerate but never swap.
+   *
+   * JUDGE IDENTITY is not swappable either, for a different reason: a
+   * downshift search's objective is the AGENT's pass rate on a dataset, and
+   * nothing in it measures the judge. `evaluation.grader.model`,
+   * `security.justification.model` (the Pillar-3 intent gate's judge) and
+   * `watchme.judge.model` would therefore always read as a free win when made
+   * cheaper — the search would recommend weakening the instrument it is being
+   * measured with. `["evaluation","grader","model"]` is in the repo's own
+   * `HUMAN_OWNED_PATHS` as "judge identity" and §10.3 excludes the judge panel
+   * and the crew router's model; every one of those slots ENUMERATES (so
+   * `models audit` still checks its pricing, capabilities and parameters, and
+   * `models propose` can still name it in a sunset PR) but never enters a
+   * cost-minimising search. A judge downshift, if it is ever wanted, needs its
+   * own verb with a judge-AGREEMENT objective.
    */
   readonly swappable: boolean;
 };
@@ -257,12 +271,16 @@ export function enumerateModelSlots(ir: IrNode): EnumeratedModelSlot[] {
         }
       });
       if (ir.routing?.model !== undefined) {
+        // §10.3 excludes `crew.routing.model`: which model dispatches work to
+        // roles is a roster decision (`HUMAN_OWNED_PATHS`: "the crew llm
+        // router's model is a roster decision"), so it enumerates but never
+        // enters a downshift search.
         push({
           label: "routing.model",
           model: ir.routing.model,
           kind: "aux",
           path: ["routing", "model"],
-          swappable: true,
+          swappable: false,
         });
       }
       break;
@@ -325,7 +343,8 @@ export function enumerateModelSlots(ir: IrNode): EnumeratedModelSlot[] {
         ? { profile: aux.evaluation.grader.modelProfile }
         : {}),
       ...profileFields(profileOf(aux.evaluation.grader.modelProfile)),
-      swappable: true,
+      // Judge identity — enumerated, never swapped (see `swappable`).
+      swappable: false,
     });
   }
   (aux.evaluation?.grader.judges ?? []).forEach((j, i) => {
@@ -345,7 +364,8 @@ export function enumerateModelSlots(ir: IrNode): EnumeratedModelSlot[] {
       model: aux.security.justification.model,
       kind: "judge",
       path: ["security", "justification", "model"],
-      swappable: true,
+      // The intent gate's judge — enumerated, never swapped (see `swappable`).
+      swappable: false,
     });
   }
   if (aux.watchme?.judgeModel !== undefined) {

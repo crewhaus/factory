@@ -313,10 +313,17 @@ ${indent}    cascade: { draft: cheap, escalate_to: strong, clean_prompt: true }
 ${indent}    max_escalations: 1
 # The judge that grades each draft. \`on_fail: escalate\` is what turns the
 # grade into the cascade's trigger; \`strongest\` resolves to the strong arm.
+#
+# \`allow_self_judge\` is the honest part: in a two-arm cascade the checker IS
+# the strong arm, so the judge grades a model it also serves as. The compiler
+# calls that a measurement-integrity hazard and warns unless you say you meant
+# it — which here you do. Declare a THIRD profile and point the judge at it
+# the moment the grade is worth trusting on its own (an eval gate, a report).
 evaluation:
   grader: { type: llm_judge, criteria: "Does the answer fully and correctly address the user's request?", model: strongest }
   threshold: 0.7
   on_fail: escalate
+  allow_self_judge: true
 `;
 }
 

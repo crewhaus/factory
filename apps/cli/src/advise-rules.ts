@@ -18,6 +18,7 @@
 import type { ArmStats } from "@crewhaus/routing-store";
 import type { Spec } from "@crewhaus/spec";
 import { type SpecPatch, validatePatch } from "@crewhaus/spec-patch";
+import { declaredShadowCandidate, liveArmsOf, splitShadowLane } from "./shadow-lane";
 
 // -------- findings --------
 
@@ -1538,37 +1539,48 @@ export const ruleEscalationRecall: AdviceRule = (ctx, opts) => {
  */
 export const ruleAuditionReady: AdviceRule = (ctx, opts) => {
   const t = resolveThresholds(opts);
-  const lanes = ctx.routingArms.filter((a) => a.routeKey.startsWith("shadow:"));
-  if (lanes.length === 0) return [];
-  const byArm = new Map<string, { n: number; rewardSum: number; varSum: number }>();
-  for (const a of lanes) {
-    const acc = byArm.get(a.model) ?? { n: 0, rewardSum: 0, varSum: 0 };
-    acc.n += a.n;
-    acc.rewardSum += a.meanReward * a.n;
-    acc.varSum += a.varReward * a.n;
-    byArm.set(a.model, acc);
-  }
-  const findings: AdviceFinding[] = [];
-  for (const [arm, acc] of [...byArm.entries()].sort((x, y) => x[0].localeCompare(y[0]))) {
-    if (acc.n < t.auditionMinN) continue;
-    const mean = acc.rewardSum / acc.n;
-    const variance = acc.varSum / acc.n;
-    const lower = mean - 1.96 * Math.sqrt(Math.max(variance, 0) / acc.n);
-    // The incumbent is the same arm id in the LIVE bands (the lane strips to
-    // the band it audited); an arm with no live history is a pure newcomer,
-    // which is exactly the case worth proposing.
-    const live = ctx.routingArms.filter(
-      (a) => !a.routeKey.startsWith("shadow:") && !a.routeKey.startsWith("q:"),
-    );
-    const liveN = live.reduce((n, a) => n + a.n, 0);
-    const liveMean = liveN > 0 ? live.reduce((r, a) => r + a.meanReward * a.n, 0) / liveN : 0;
-    if (lower <= liveMean) continue;
-    findings.push({
+  // §7.8 — the lane records the CANDIDATE and the incumbent it was graded
+  // against under the same routeKey. Attribute the two sides before reading
+  // either: folding the whole lane per arm id and calling every id a "shadow
+  // arm" reports the incumbent as the challenger whenever it wins the
+  // pairwise judging. Without a discriminant (a declared
+  // `strategy.shadow.candidate`, or a single-armed lane) the honest answer is
+  // no finding at all.
+  const split = splitShadowLane(ctx.routingArms, {
+    ...((): { declaredCandidate?: string } => {
+      const declared = declaredShadowCandidate(agentModelPool(opts?.spec));
+      return declared !== undefined ? { declaredCandidate: declared } : {};
+    })(),
+  });
+  const arm = split.candidateArm;
+  if (arm === undefined) return [];
+  const acc = split.candidateArms.reduce(
+    (a, s) => ({
+      n: a.n + s.n,
+      rewardSum: a.rewardSum + s.meanReward * s.n,
+      varSum: a.varSum + s.varReward * s.n,
+    }),
+    { n: 0, rewardSum: 0, varSum: 0 },
+  );
+  if (acc.n < t.auditionMinN) return [];
+  const mean = acc.rewardSum / acc.n;
+  const variance = acc.varSum / acc.n;
+  const lower = mean - 1.96 * Math.sqrt(Math.max(variance, 0) / acc.n);
+  // The incumbent is the LIVE bands (the lane strips to the band it audited);
+  // an arm with no live history is a pure newcomer, which is exactly the case
+  // worth proposing. Live rows only — a lane row folded in here would mix a
+  // pairwise verdict into an absolute judged mean (§7.10).
+  const live = liveArmsOf(ctx.routingArms);
+  const liveN = live.reduce((n, a) => n + a.n, 0);
+  const liveMean = liveN > 0 ? live.reduce((r, a) => r + a.meanReward * a.n, 0) / liveN : 0;
+  if (lower <= liveMean) return [];
+  return [
+    {
       id: `audition-ready:${arm}`,
       severity: "info",
       summary: `shadow arm ${arm} has cleared the power floor and beats the live arms`,
       evidence: [
-        `${acc.n} shadow-lane observation(s) (floor ${t.auditionMinN})`,
+        `${acc.n} shadow-lane observation(s) for the audition candidate (floor ${t.auditionMinN})`,
         `95% lower bound ${lower.toFixed(4)} vs the live arms' mean reward ${liveMean.toFixed(4)} over ${liveN} observation(s)`,
         "the lane is observe-only: nothing this arm did has steered a live decision",
       ],
@@ -1577,9 +1589,8 @@ export const ruleAuditionReady: AdviceRule = (ctx, opts) => {
         kind: "advice",
         text: `\`crewhaus models propose --source audition\` turns this into a roster PR (it re-checks the same floor and writes the review bundle). The candidate roster is never patched automatically — §9.3 keeps it behind the PR door. \`crewhaus route promote --gate\` is the separate, eval-gated step that folds the lane's evidence into the live arms.`,
       },
-    });
-  }
-  return findings;
+    },
+  ];
 };
 
 /**

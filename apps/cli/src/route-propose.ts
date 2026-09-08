@@ -35,11 +35,12 @@
  * Pure: arms, priors and the spec come in; proposals go out.
  */
 import type { ArmStats } from "@crewhaus/routing-store";
-import { SHADOW_LANE_PREFIX, isObserveOnlyLane } from "@crewhaus/routing-store";
+import { isObserveOnlyLane } from "@crewhaus/routing-store";
 import type { Spec } from "@crewhaus/spec";
 import { type SpecPatch, validatePatch } from "@crewhaus/spec-patch";
 import type { AdviceFinding, SuggestionsFile } from "./advise-rules";
 import { buildSuggestionsFile } from "./advise-rules";
+import { declaredShadowCandidate, shadowCandidateN, splitShadowLane } from "./shadow-lane";
 
 /** One mined proposal: a whitelisted patch plus the evidence behind it. */
 export type RouteProposal = {
@@ -70,7 +71,9 @@ type PoolView = {
     readonly seed?: string;
   };
   readonly rules?: ReadonlyArray<{ readonly id: string; readonly enabled?: boolean }>;
-  readonly strategy?: { readonly shadow?: { readonly sample_rate?: number } };
+  readonly strategy?: {
+    readonly shadow?: { readonly sample_rate?: number; readonly candidate?: string };
+  };
 };
 
 /** The primary agent's `model_pool` block off a parsed spec, when it has one. */
@@ -288,10 +291,34 @@ export function buildRouteProposals(opts: BuildRouteProposalsOptions): RouteProp
   }
 
   // ---- 4. wind down an audition that has cleared the power floor.
-  const shadowArms = opts.arms.filter((a) => a.routeKey.startsWith(SHADOW_LANE_PREFIX));
-  const shadowN = shadowArms.reduce((acc, a) => acc + a.n, 0);
+  //
+  // §7.8 — the lane records BOTH sides of each graded turn (the candidate and
+  // the primary it was judged against), so summing the whole lane counts
+  // every turn twice and would fire the wind-down at half the evidence the
+  // rationale claims. Count the CANDIDATE side only, attributed by the
+  // declared `strategy.shadow.candidate` (or a single-armed lane); an
+  // unattributable lane is skipped with its reason rather than guessed at.
+  const split = splitShadowLane(opts.arms, {
+    ...((): { declaredCandidate?: string } => {
+      const declared = declaredShadowCandidate(pool);
+      return declared !== undefined ? { declaredCandidate: declared } : {};
+    })(),
+  });
+  const shadowArms = split.candidateArms;
+  const shadowN = shadowCandidateN(split);
   const minAudition = opts.minAuditionN ?? 30;
   const rate = pool.strategy?.shadow?.sample_rate;
+  if (
+    rate !== undefined &&
+    rate > 0 &&
+    split.candidateArm === undefined &&
+    split.laneArms.length > 0
+  ) {
+    into.skipped.push({
+      id: "route-audition-wind-down",
+      reason: `the shadow lane cannot be attributed to an audition candidate, so its evidence cannot be counted: ${split.unattributedReason ?? "no discriminant"}`,
+    });
+  }
   if (rate !== undefined && rate > 0 && shadowN >= minAudition) {
     const path = ["agent", "model_pool", "strategy", "shadow", "sample_rate"];
     keep(
@@ -307,7 +334,7 @@ export function buildRouteProposals(opts: BuildRouteProposalsOptions): RouteProp
         id: "route-audition-wind-down",
         summary: "the audition has enough evidence — stop sampling and read the verdict",
         evidence: [
-          `${shadowN} shadow-lane observation(s) across ${shadowArms.length} arm(s), floor ${minAudition}`,
+          `${shadowN} audition observation(s) for ${split.candidateArm} across ${shadowArms.length} lane arm(s), floor ${minAudition}`,
           "`crewhaus models propose --source audition` turns the verdict into a roster PR; the lane keeps its recorded history either way",
         ],
       },
