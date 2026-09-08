@@ -28,15 +28,20 @@ import type { AuditLog } from "@crewhaus/audit-log";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
 import {
+  type CapabilityRequirement,
   DEFAULT_CAPABILITIES,
   DEFAULT_PRICING,
   type PricingTable,
   classifyPricingStaleness,
   computeCacheSavingsMicros,
   createCostTracker,
+  effectiveSunsets,
   parsePricingFeed,
   pickNewestPricing,
+  providerOfSpecString,
+  resolveCheapest,
   resolvePricing,
+  resolveStrongest,
 } from "@crewhaus/cost-tracker";
 import {
   type DatasetRecord,
@@ -534,6 +539,7 @@ import {
   CanaryRampError,
   driveCanaryRamp,
   makeCanaryEvalGate,
+  makeRoutingAwareCanaryGate,
   makeTrafficSplitRecorder,
   parseTrafficSteps,
 } from "./deploy-canary";
@@ -713,7 +719,7 @@ import { attachEvalTelemetry, evalRunSummaryMetrics } from "./eval-telemetry";
 // E50 — `crewhaus experiment status`: per-version outcome/rating deltas with
 // Wilson intervals and a min-n refusal, in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
-import { runExperimentCommand } from "./experiment";
+import { DEFAULT_MIN_EXPERIMENT_N, runExperimentCommand } from "./experiment";
 // G63 — `crewhaus failures report`: cluster run_failed + incident records and
 // (optionally) draft failure_taxonomy entries. Pure transform (FS reads live
 // in the handler below).
@@ -795,7 +801,9 @@ import {
   type FlywheelGateSplit,
   type FlywheelKnobs,
   type FlywheelOptimizeOutcome,
+  MODEL_PLAN_WORKFLOW_RELPATH,
   buildFlywheelWorkflowYaml,
+  buildModelPlanWorkflowYaml,
   formatDatasetSourceLine,
   formatFlywheelKnobsGuide,
   formatFlywheelReport,
@@ -873,9 +881,13 @@ import {
   runConversationalInterview,
 } from "./init-conversation";
 import {
+  HYBRID_INTERVIEW_QUESTION,
+  type HybridPair,
   type ScriptedAnswers,
   type ScriptedShape,
+  buildHybridSpec,
   buildScriptedSpec,
+  isHybridYes,
   isScriptedShape,
 } from "./init-interactive";
 // Item 67 — `crewhaus intents`: cluster user_message inputs across sessions +
@@ -1094,6 +1106,24 @@ import {
   buildScanCandidates,
   writeModelField,
 } from "./model-scan";
+// 0.6.0 §8.2 — the ONE spec-walking model-slot enumeration `doctor --models`,
+// `models audit|explain|list`, `model right-size` and `model-scan` share.
+import { type EnumeratedModelSlot, auxModelsFor, enumerateModelSlots } from "./model-slots";
+// 0.6.0 §8.2 / §9.1 — `crewhaus models list|explain|audit|propose`, pure.
+import {
+  type ModelAuditFinding,
+  ModelsCliError,
+  type ModelsFailOn,
+  type ParamProjection,
+  auditModelSlots,
+  auditionReadiness,
+  buildSunsetProposal,
+  formatModelsAudit,
+  formatModelsExplain,
+  formatModelsList,
+  modelsAuditExitCode,
+  parseModelsArgs,
+} from "./models-cli";
 // Item 66 — `crewhaus onchain tune|sentinel`: mine wallet-engine receipt +
 // simulation history to propose a tuned transaction_policy and flag anomalous
 // spend. Side-effect-free (this entry file reads history + writes patch/report).
@@ -1164,6 +1194,7 @@ import {
 import {
   type GitPrDriver,
   type OpenedPr,
+  PROPOSE_SOURCES,
   ProposeError,
   type ProposeSource,
   assembleProposal,
@@ -1263,6 +1294,7 @@ import {
   type SlotEvalOutcome,
   buildRightSizeReport,
   enumerateSlotCandidates,
+  projectCostUsd,
 } from "./right-size";
 import { runRouteCommand } from "./route";
 // v0.3.0 Goal 6 — canonical terminal-failure rendering: die() and the
@@ -2592,6 +2624,39 @@ function resolveWorkflowRoot(
   return { root, harnessDir: rel.split(sep).join("/") };
 }
 
+/**
+ * 0.6.0 §9.2 — pick the fast/strong pair `init --hybrid` writes.
+ *
+ * The seed model BECOMES the strong arm, and the fast arm is its cheapest
+ * same-provider sibling from the installed pricing table. That is §1's
+ * motivating scenario read back as a scaffold: the harness declared a strong
+ * model because a few hard questions need it, and the hybrid setup exists to
+ * stop billing every easy turn at that rate.
+ *
+ * Deliberately NOT `resolveStrongest`: that ranks by price, and the most
+ * EXPENSIVE row in a provider's table is as likely to be a legacy family kept
+ * at its old rate as it is to be the best model. Price rank answers "which
+ * costs most", which is not the question a scaffold is asking.
+ *
+ * WITHIN ONE PROVIDER, always — a cross-provider pair needs a second
+ * credential and ships transcript content to a second vendor, which is a
+ * decision a person makes rather than a default a scaffold takes. Falls back
+ * to the shipped Claude pair when the seed model is off the table (a local
+ * endpoint, a named host) or is already the cheapest in its class, so the
+ * scaffold always produces a spec that compiles.
+ */
+function chooseHybridPair(seedModel: string): HybridPair {
+  const pricing = loadUserPricing();
+  const parsed = providerOfSpecString(seedModel);
+  if (parsed !== undefined) {
+    const cheapest = resolveCheapest(parsed, { pricing, capabilities: DEFAULT_CAPABILITIES });
+    if (cheapest !== undefined && cheapest.modelString !== seedModel) {
+      return { fast: cheapest.modelString, strong: seedModel };
+    }
+  }
+  return { fast: "claude-haiku-4-5", strong: "claude-opus-5" };
+}
+
 function runInit(args: ParsedArgs): void {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -2628,6 +2693,14 @@ function runInit(args: ParsedArgs): void {
         "           The path is harness-relative (the jobs' working-directory), and a\n" +
         "           manifest you have not written yet warns rather than failing init.\n" +
         "           Without --suite both scaffolds are byte-identical to before.\n" +
+        "  --hybrid  Scaffold the HYBRID setup instead of the single-model spec (0.6.0\n" +
+        "           §9.2): a three-line `models:` registry, a two-arm `model_pool`, the\n" +
+        "           cascade (cheap drafts → a stronger checker grades → the strong model\n" +
+        "           redoes it on failure), and the `evaluation.on_fail: escalate` judge\n" +
+        "           that triggers it — every line commented. The fast/strong pair is read\n" +
+        "           from the installed pricing table and is always WITHIN ONE PROVIDER (a\n" +
+        "           cross-provider pair needs a second credential and a second vendor\n" +
+        "           seeing your transcripts — that is your call, not a default).\n" +
         "  --force  Overwrite an existing scaffolded workflow or eval assets (never\n" +
         "           the spec).\n",
     );
@@ -2636,6 +2709,7 @@ function runInit(args: ParsedArgs): void {
   const ci = args.flags["ci"] === true;
   const withEvals = args.flags["with-evals"] === true;
   const sentinelInit = args.flags["sentinel"] === true;
+  const hybrid = args.flags["hybrid"] === true;
   const nameArg = args.positional[0];
   const targetDir = typeof nameArg === "string" ? resolve(nameArg) : process.cwd();
   // NEW-HUNT-8 — the optional suite manifest the scaffolded workflows drive.
@@ -2669,7 +2743,29 @@ function runInit(args: ParsedArgs): void {
     process.stdout.write(`kept ${targetFile} (already exists)\n`);
   } else {
     mkdirSync(targetDir, { recursive: true });
-    const yamlText = `name: ${specName}
+    const instructions =
+      "You are a helpful assistant. Replace these instructions with your\nagent's actual behavior, persona, and constraints.";
+    let yamlText: string;
+    if (hybrid) {
+      const pair = chooseHybridPair("claude-opus-5");
+      try {
+        yamlText = buildHybridSpec({
+          name: specName,
+          shape: "cli",
+          model: pair.fast,
+          instructions,
+          pair,
+        }).yaml;
+      } catch (err) {
+        // The scaffold is validated through `parseSpec`; a failure here is a
+        // bug in the template, not user input, so say so rather than dying
+        // with a bare schema error.
+        die(
+          `init --hybrid: the scaffolded spec did not validate (${(err as Error).message}) — please file this, the template is meant to be compile-clean`,
+        );
+      }
+    } else {
+      yamlText = `name: ${specName}
 target: cli
 agent:
   model: claude-opus-5
@@ -2677,8 +2773,17 @@ agent:
     You are a helpful assistant. Replace these instructions with your
     agent's actual behavior, persona, and constraints.
 `;
+    }
     writeFileSync(targetFile, yamlText);
     process.stdout.write(`wrote ${targetFile}\n`);
+    if (hybrid) {
+      process.stdout.write(
+        "hybrid: the spec declares a $fast/$strong registry, a two-arm pool and the cascade.\n" +
+          "    Inspect it with `crewhaus models explain` and `crewhaus models audit`; once the\n" +
+          "    harness has run, `crewhaus route status` shows what each arm earned and\n" +
+          "    `crewhaus route propose` says when the learned flip is provable.\n",
+      );
+    }
   }
 
   if (ci) {
@@ -3391,6 +3496,20 @@ async function runScriptedQuestionnaire(opts: {
     ...(tools.length > 0 ? { tools } : {}),
     ...(goal !== undefined ? { goal } : {}),
   };
+  // 0.6.0 §9.2 — the ONE hybrid question. Asked only where the scaffold can
+  // actually deliver it (the cli shape hosts the cascade; workflow/research
+  // do not carry `evaluation.on_fail: escalate`), and answered from the
+  // pricing table so the user never has to name two models.
+  if (shape === "cli") {
+    const wantsHybrid = isHybridYes(await ask(HYBRID_INTERVIEW_QUESTION));
+    if (wantsHybrid) {
+      const pair = chooseHybridPair(model);
+      process.stdout.write(
+        `  hybrid: $fast = ${pair.fast}, $strong = ${pair.strong} (one provider — a cross-provider pair needs a second credential).\n`,
+      );
+      return buildHybridSpec({ ...answers, pair });
+    }
+  }
   // buildScriptedSpec validates via parseSpec; a bad answer throws
   // SpecParseError, which the caller's CrewhausError catch routes through die().
   return buildScriptedSpec(answers);
@@ -6145,24 +6264,20 @@ function runDoctorModels(): void {
     try {
       const rawSpec = parseSpec(readFileSync(specPath, "utf-8"));
       const ir = lower(rawSpec);
-      const agent = (ir as { agent?: { model?: unknown } }).agent;
-      if (agent !== undefined && typeof agent.model === "string") agentModel = agent.model;
-      const compaction = (ir as { compaction?: { model?: unknown } }).compaction;
-      if (compaction !== undefined && typeof compaction.model === "string") {
-        auxModels.push({ slot: "compaction.model", model: compaction.model });
-        // Item 25 — surface what `cheapest` resolved to: the RAW spec said
-        // "cheapest", the lowered IR carries the concrete model.
-        const rawCompaction = (rawSpec as { compaction?: { model?: unknown } }).compaction;
-        if (rawCompaction?.model === "cheapest") {
-          sentinelResolutions.push({ slot: "compaction.model", resolved: compaction.model });
-        }
-      }
-      const subAgents = (ir as { subAgents?: ReadonlyArray<{ name?: string; model?: unknown }> })
-        .subAgents;
-      for (const sa of subAgents ?? []) {
-        if (typeof sa.model === "string") {
-          auxModels.push({ slot: `sub-agent ${sa.name ?? "?"}.model`, model: sa.model });
-        }
+      // 0.6.0 §8.2 — the SAME walk `models audit` and `model right-size` use.
+      // Before this, `doctor --models` saw agent/compaction/sub-agents only:
+      // a pool candidate, a judge, a per-step model or a degrade target was
+      // invisible, so an unpriced arm reported as "checks passed".
+      const slots = enumerateModelSlots(ir);
+      const primary = slots.find((sl) => sl.kind === "primary" && sl.label === "agent.model");
+      agentModel = primary?.model;
+      for (const aux of auxModelsFor(slots)) auxModels.push({ ...aux });
+      // Item 25 — surface what `cheapest` resolved to: the RAW spec said
+      // "cheapest", the lowered IR carries the concrete model.
+      const rawCompaction = (rawSpec as { compaction?: { model?: unknown } }).compaction;
+      const loweredCompaction = slots.find((sl) => sl.label === "compaction.model");
+      if (rawCompaction?.model === "cheapest" && loweredCompaction !== undefined) {
+        sentinelResolutions.push({ slot: "compaction.model", resolved: loweredCompaction.model });
       }
     } catch {
       // tolerant: a non-cli / unparseable spec still gets a table-freshness check
@@ -6187,6 +6302,15 @@ function runDoctorModels(): void {
   if (agentModel === undefined) {
     process.stdout.write(
       "~ no agent.model in the cwd crewhaus.yaml — only the pricing table was checked\n",
+    );
+  }
+  // 0.6.0 §8.2 — doctor's contract is unchanged: a warn NEVER fails here, so
+  // a sunset that passed on a calendar day cannot redden a pinned doctor beat.
+  // The gate lives in the new verb, and this says where.
+  if (checks.some((c) => c.warn === true && c.pass)) {
+    process.stdout.write(
+      "\n~ warnings never fail `doctor --models`. `crewhaus models audit` walks the same slots and\n" +
+        "  EXITS 1 on a model already past its retirement date (`--fail-on none` reports without failing).\n",
     );
   }
   process.stdout.write(anyFail ? "\nsome model checks failed.\n" : "\nmodel checks passed.\n");
@@ -7197,6 +7321,23 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   // graders/ratings resolution, the dev split, the run dirs) and nothing
   // below (no mutation search, no fitness fn, no mutator).
   if (fromAdviceFlag !== undefined) {
+    const routingFlagAdvice = strFlag(args, "routing");
+    let adviceRouting: EvalRoutingMode | undefined;
+    if (routingFlagAdvice !== undefined) {
+      try {
+        adviceRouting = parseEvalRoutingMode(routingFlagAdvice);
+      } catch (err) {
+        die(err instanceof Error ? err.message : String(err));
+      }
+    }
+    if (
+      args.flags["warm-arms"] === true &&
+      (adviceRouting === undefined || adviceRouting === "static")
+    ) {
+      die(
+        "--warm-arms seeds the frozen arm snapshot a ROUTED eval reads — pass --routing as-declared (or --routing candidate:<$profile|model>) with it",
+      );
+    }
     await runOptimizeFromAdvice({
       fromAdvicePath: fromAdviceFlag,
       absSpec,
@@ -7214,6 +7355,15 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       noRegister: args.flags["no-register"] === true,
       pinRegressions: args.flags["no-pin-regressions"] !== true,
       originalById,
+      // 0.6.0 §9.1 (loop 1) — a ROUTED apply. `route propose`'s patches change
+      // how the pool routes, so measuring them on a `static` eval would grade
+      // a spec nobody serves. `--routing as-declared` runs the baseline and
+      // every candidate through the real pool against ONE frozen arm snapshot
+      // (`--warm-arms` seeds it from the harness's live `arms.jsonl`), and
+      // `gateRuns` refuses the comparison outright if the two sides ever read
+      // different snapshots (`routedInstrumentMismatch`).
+      ...(adviceRouting !== undefined ? { routing: adviceRouting } : {}),
+      ...(args.flags["warm-arms"] === true ? { warmArms: true } : {}),
     });
     return;
   }
@@ -7780,6 +7930,10 @@ async function runOptimizeFromAdvice(opts: {
   readonly noRegister: boolean;
   readonly pinRegressions: boolean;
   readonly originalById: ReadonlyMap<string, Sample>;
+  /** 0.6.0 §6.1 / §9.1 — route the baseline and every candidate identically. */
+  readonly routing?: EvalRoutingMode;
+  /** Seed the frozen arm snapshot from the harness's live `arms.jsonl`. */
+  readonly warmArms?: boolean;
 }): Promise<void> {
   const pct = (rate: number): string => `${(rate * 100).toFixed(1)}%`;
 
@@ -7835,11 +7989,20 @@ async function runOptimizeFromAdvice(opts: {
         seed: opts.seed,
         retryErrors: opts.retryErrors,
         ...(opts.graderRegistry !== undefined ? { graderRegistry: opts.graderRegistry } : {}),
+        // 0.6.0 §6.1 — the SAME routing mode and the SAME frozen snapshot for
+        // the baseline and every candidate; anything else and `gateRuns`
+        // refuses the pair as two instruments.
+        ...(opts.routing !== undefined ? { routing: opts.routing } : {}),
+        ...(opts.warmArms === true ? { warmArms: true } : {}),
       },
     });
+    const routed = summary.config.routing;
     process.stdout.write(
-      `[optimize] ${label} eval: pass_rate=${pct(summary.aggregates.passRate)} ` +
-        `mean_score=${summary.aggregates.meanScore.toFixed(3)} errors=${summary.aggregates.errorCount}\n`,
+      `[optimize] ${label} eval: pass_rate=${pct(summary.aggregates.passRate)} mean_score=${summary.aggregates.meanScore.toFixed(3)} errors=${summary.aggregates.errorCount}${
+        routed !== undefined
+          ? ` routing=${routed.mode}${routed.armsDigest !== undefined ? ` arms=${routed.armsDigest.slice(0, 12)}` : ""}`
+          : ""
+      }\n`,
     );
     return summary;
   };
@@ -8101,6 +8264,29 @@ function runFlywheelInit(args: ParsedArgs): void {
       `flywheel: the same cron also runs \`crewhaus eval suite ${suiteRel} --tier nightly --gate\`\n`,
     );
     warnSuiteManifestGaps(process.cwd(), suiteRel, ["nightly"]);
+  }
+  // 0.6.0 §9.1 (loop 7) — the nightly MODEL-PLAN job, as a second workflow.
+  // Opt-in because it is a different loop with a different reviewer: the
+  // flywheel rewrites prompts, this one proposes roster and routing changes.
+  if (args.flags["model-plan"] === true) {
+    let modelPlan: ReturnType<typeof scaffoldWorkflowFile>;
+    try {
+      modelPlan = scaffoldWorkflowFile({
+        rootDir: wfRoot,
+        relPath: MODEL_PLAN_WORKFLOW_RELPATH,
+        content: buildModelPlanWorkflowYaml({ harnessDir }),
+        force: args.flags["force"] === true,
+      });
+    } catch (err) {
+      if (err instanceof FlywheelConfigError) die(err.message);
+      throw err;
+    }
+    process.stdout.write(`wrote ${modelPlan.path}\n`);
+    process.stdout.write(
+      "model-plan: set the MODEL_PLAN_GH_TOKEN repo secret. The job runs `models audit --propose`\n" +
+        "      and `route propose` nightly and opens a PR — it applies nothing and never merges.\n" +
+        "      No model credentials are needed: both verbs are offline.\n",
+    );
   }
   if (harnessDir !== "") {
     process.stdout.write(
@@ -10418,7 +10604,9 @@ async function runModelScan(args: ParsedArgs): Promise<void> {
         "                           [--same-provider] [--limit N] [--concurrency N] [--seed N]\n" +
         "                           [--judge-model <m>] [-o <dir>] [--write]\n" +
         "  Reads the cwd crewhaus.yaml's agent.model, enumerates capability-compatible\n" +
-        "  cheaper replacements from the pricing table (--same-provider restricts to\n" +
+        "  cheaper replacements from the pricing table (0.6.0: a `requires:` on the\n" +
+        "  slot's `models:` profile is PASSED to the enumeration, so a candidate that\n" +
+        "  cannot do what the profile demands is never evaled), (--same-provider restricts to\n" +
         "  same-provider siblings; --limit caps the count, default 6), evals current +\n" +
         "  each candidate on the dataset, and prints a proposal when a candidate beats\n" +
         "  current on mean score at lower projected cost. Writes matrix.json/index.html\n" +
@@ -10447,17 +10635,49 @@ async function runModelScan(args: ParsedArgs): Promise<void> {
   if (ir.target !== "cli") die(`model-scan only supports target: cli (got "${ir.target}")`);
   const currentModel = ir.agent.model;
 
+  // 0.6.0 §9.1 (loop 5) — model-scan is PROFILE-AWARE: when the slot resolved
+  // through a `models:` profile that declares `requires:`, the enumeration
+  // finally passes it, so a replacement that cannot do what the profile
+  // demands (vision, a 200k window, tool use) is never evaled and never
+  // proposed. Before this the requirement was declared and then ignored, and
+  // the scan happily proposed a model the compiler would reject.
+  const primarySlotWalked = enumerateModelSlots(ir).find(
+    (sl) => sl.label === "agent.model" && sl.kind === "primary",
+  );
+  const requires = primarySlotWalked?.requires;
+  const require: CapabilityRequirement | undefined =
+    requires === undefined
+      ? undefined
+      : {
+          ...(requires.tool_use !== undefined ? { tool_use: requires.tool_use } : {}),
+          ...(requires.vision !== undefined ? { vision: requires.vision } : {}),
+          ...(requires.thinking !== undefined ? { thinking: requires.thinking } : {}),
+          ...(requires.web_search !== undefined ? { web_search: requires.web_search } : {}),
+          ...(requires.contextWindowGte !== undefined
+            ? { contextWindowGte: requires.contextWindowGte }
+            : {}),
+          ...(requires.maxOutputTokensGte !== undefined
+            ? { maxOutputTokensGte: requires.maxOutputTokensGte }
+            : {}),
+        };
+  if (require !== undefined) {
+    process.stdout.write(
+      `[model-scan] profile ${primarySlotWalked?.profile !== undefined ? `$${primarySlotWalked.profile} ` : ""}requires ${JSON.stringify(requires)} — candidates that cannot satisfy it are excluded\n`,
+    );
+  }
+
   const pricing = loadUserPricing();
   const candidates = buildScanCandidates(currentModel, {
     pricing,
     sameProviderOnly: args.flags["same-provider"] === true,
+    ...(require !== undefined ? { require } : {}),
     ...(typeof args.flags["limit"] === "string"
       ? { limit: Number.parseInt(args.flags["limit"], 10) }
       : {}),
   });
   if (candidates.length === 0) {
     die(
-      `model-scan: no capability-compatible cheaper candidates for "${currentModel}" in the pricing table (it may be a local/named-host model, or already the cheapest in its class)`,
+      `model-scan: no capability-compatible cheaper candidates for "${currentModel}" in the pricing table${require !== undefined ? ` that also satisfy the profile's requires ${JSON.stringify(requires)}` : ""} (it may be a local/named-host model, or already the cheapest in its class)`,
     );
   }
 
@@ -10600,6 +10820,288 @@ function patchIrModelSlot(
 }
 
 /**
+ * 0.6.0 §8.1 — the OFFLINE parameter projector `models audit` reads.
+ *
+ * Each adapter exports its own pure marshaller projection; this resolves the
+ * right one per provider and never constructs an adapter, opens a socket or
+ * reads a credential. The optional adapters are imported dynamically (the
+ * `@crewhaus/model-router` convention) so a CLI installed without
+ * `@crewhaus/adapter-openai` still audits its Anthropic slots — the missing
+ * provider simply projects `undefined`, which the audit reports as "cannot
+ * be checked offline" rather than as a pass.
+ *
+ * §8.1's rule is why this delegates rather than re-deriving: the gates are
+ * per-provider and private (`usesMaxCompletionTokens` is not exported), so a
+ * second implementation here would eventually disagree with the wire.
+ */
+async function buildParamProjection(): Promise<ParamProjection> {
+  const { anthropicEffectiveParams } = await import("@crewhaus/adapter-anthropic");
+  const optional = new Map<string, (req: never) => unknown>();
+  const load = async (name: string, pick: (mod: never) => unknown): Promise<void> => {
+    try {
+      // biome-ignore lint/suspicious/noExplicitAny: the optional-adapter import shape is checked by `pick`.
+      const mod = (await import(name as any)) as never;
+      const fn = pick(mod);
+      if (typeof fn === "function") optional.set(name, fn as (req: never) => unknown);
+    } catch {
+      // Not installed — the audit says so per slot instead of failing.
+    }
+  };
+  await Promise.all([
+    load(
+      "@crewhaus/adapter-openai",
+      (m) => (m as Record<string, unknown>)["openAIEffectiveParams"],
+    ),
+    load(
+      "@crewhaus/adapter-gemini",
+      (m) => (m as Record<string, unknown>)["geminiEffectiveParams"],
+    ),
+    load(
+      "@crewhaus/adapter-bedrock",
+      (m) => (m as Record<string, unknown>)["converseEffectiveParams"],
+    ),
+  ]);
+  return (input) => {
+    const req = {
+      model: input.model,
+      system: [],
+      messages: [],
+      maxTokens: input.maxTokens,
+      ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
+      ...(input.thinking !== undefined ? { thinking: input.thinking } : {}),
+    } as never;
+    if (input.provider === "anthropic") return anthropicEffectiveParams(req, false);
+    const key =
+      input.provider === "openai"
+        ? "@crewhaus/adapter-openai"
+        : input.provider === "gemini"
+          ? "@crewhaus/adapter-gemini"
+          : input.provider === "bedrock"
+            ? "@crewhaus/adapter-bedrock"
+            : undefined;
+    if (key === undefined) return undefined;
+    const fn = optional.get(key);
+    return fn === undefined ? undefined : (fn(req) as ReturnType<ParamProjection>);
+  };
+}
+
+/** Lower the spec at `specPath`, dying cleanly on a parse/lower failure. */
+function lowerSpecAt(specPath: string, verb: string): ReturnType<typeof lower> {
+  if (!existsSync(specPath)) die(`${verb}: no spec at ${specPath}`);
+  try {
+    return lower(parseSpec(readFileSync(specPath, "utf-8")));
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+}
+
+/**
+ * 0.6.0 §8.2 / §9.1 — `crewhaus models list | explain | audit | propose`.
+ *
+ * Wiring only: `./models-cli` owns every judgement, `./model-slots` owns the
+ * walk, and this reads the spec, the installed pricing feed and the clock.
+ * `audit` is the only subcommand that can exit non-zero, under the `--fail-on`
+ * ladder documented in `./models-cli`.
+ */
+async function runModelsCli(argv: readonly string[]): Promise<void> {
+  if (argv[0] === "--help" || argv[0] === "-h" || argv.length === 0) {
+    process.stdout.write(
+      "usage: crewhaus models list | explain [<spec>] | audit [<spec>] | propose [<spec>]\n" +
+        "  list     the resolved `models:` profile registry.\n" +
+        "  explain  every model slot's resolved profile, the hybrid strategy in one\n" +
+        "           sentence, how `/model` directives are handled, and the per-shape\n" +
+        "           carry/emit/ignore verdict for this spec's own shape.\n" +
+        "  audit    walk every slot: pricing coverage, `requires:` against the capability\n" +
+        "           table, and per-(provider, knob) parameter acceptance projected through\n" +
+        "           each adapter's own marshaller (so a silently-dropped temperature is\n" +
+        "           visible offline). Exit codes:\n" +
+        "             --fail-on none     never non-zero (a report)\n" +
+        "             --fail-on pricing  (default) a pricing miss, an unsatisfiable\n" +
+        "                                `requires`, a rejected parameter, or a compiled-in\n" +
+        "                                sunset already past --today\n" +
+        "             --fail-on sunset   additionally an ANNOUNCED, not-yet-past sunset\n" +
+        "           Feed-installed sunsets are advisory at every level. --today YYYY-MM-DD\n" +
+        "           pins the clock; --propose writes a replacement patch per retired slot.\n" +
+        "  propose  --source sunset    the same replacement bundle, without the audit table\n" +
+        "           --source audition  a roster PR bundle for a shadow arm that has cleared\n" +
+        "                              the n>=30 power floor and beats the live arms\n" +
+        "           Nothing is ever applied: the roster is human-owned (§9.3).\n",
+    );
+    return;
+  }
+  let args: ReturnType<typeof parseModelsArgs>;
+  try {
+    args = parseModelsArgs(argv);
+  } catch (err) {
+    if (err instanceof ModelsCliError) die(err.message);
+    throw err;
+  }
+  const specPath =
+    args.spec !== undefined ? resolve(args.spec) : join(process.cwd(), "crewhaus.yaml");
+
+  if (args.sub === "list") {
+    const ir = lowerSpecAt(specPath, "models list");
+    process.stdout.write(`${formatModelsList(ir)}\n`);
+    return;
+  }
+  if (args.sub === "explain") {
+    const ir = lowerSpecAt(specPath, "models explain");
+    process.stdout.write(`${formatModelsExplain(ir, enumerateModelSlots(ir))}\n`);
+    return;
+  }
+
+  const ir = lowerSpecAt(specPath, `models ${args.sub}`);
+  const slots = enumerateModelSlots(ir);
+  const pricing = loadUserPricing();
+  const today = args.today !== undefined ? new Date(`${args.today}T12:00:00Z`) : new Date();
+  const findings = auditModelSlots(slots, {
+    pricing,
+    sunsets: effectiveSunsets(pricing),
+    today,
+    project: await buildParamProjection(),
+  });
+
+  if (args.sub === "propose" && args.source === "audition") {
+    await runModelsProposeAudition(args, specPath);
+    return;
+  }
+  if (args.sub === "propose" && args.source !== undefined && args.source !== "sunset") {
+    die(
+      `models propose: --source must be "sunset" or "audition" (got "${args.source}"). Roster changes from a right-size or route mining run are proposed by \`crewhaus model right-size\` / \`crewhaus route propose\`.`,
+    );
+  }
+
+  const wantsPropose = args.propose === true || args.sub === "propose";
+  if (args.sub === "audit" && args.json === true) {
+    process.stdout.write(`${JSON.stringify({ slots, findings }, null, 2)}\n`);
+  } else if (args.sub === "audit") {
+    process.stdout.write(`${formatModelsAudit(findings, args.failOn)}\n`);
+  }
+
+  if (wantsPropose) {
+    const proposal = buildSunsetProposal(findings);
+    if (proposal.patches.length === 0 && proposal.unaddressable.length === 0) {
+      process.stdout.write("[models] no retired model in any slot — nothing to propose.\n");
+    } else {
+      const outDir = resolve(args.out ?? join(".crewhaus", "models-propose"));
+      mkdirSync(outDir, { recursive: true });
+      const patchPath = join(outDir, "patch.json");
+      writeFileSync(patchPath, `${JSON.stringify(proposal, null, 2)}\n`, { mode: 0o600 });
+      for (const p of proposal.patches) {
+        process.stdout.write(
+          `[models] ${p.slot}: ${p.currentModel} retired ${p.retiresOn} → ${p.replacement}\n`,
+        );
+      }
+      for (const u of proposal.unaddressable) {
+        process.stdout.write(`[models] ${u.slot}: ${u.reason}\n`);
+      }
+      process.stdout.write(`[models] proposal: ${patchPath}\n`);
+      process.stdout.write(
+        "[models] verify the replacement before it ships: `crewhaus model right-size <spec> --dataset <d> --graders <g>`\n" +
+          "         evals the candidate set (here, exactly the replacement) against the current spec. Model fields sit\n" +
+          "         outside OPTIMIZABLE_PATHS, so nothing applies this for you — `crewhaus propose --source sunset` opens the PR.\n",
+      );
+    }
+  }
+  if (args.sub === "audit") {
+    const code = modelsAuditExitCode(findings, args.failOn);
+    if (code !== 0) process.exit(code);
+  }
+}
+
+/**
+ * 0.6.0 §9.1 (loop 2) — `models propose --source audition`. Reads the
+ * harness's arms, applies the shipped `DEFAULT_MIN_EXPERIMENT_N` power floor
+ * (overridable with `--min-n`), and writes a review bundle only when the
+ * shadow arm's lower bound beats the live arms. Below the floor it REFUSES,
+ * loudly, with the count — proposing a roster change on 12 observations is
+ * the failure mode the floor exists to prevent.
+ */
+async function runModelsProposeAudition(
+  args: ReturnType<typeof parseModelsArgs>,
+  specPath: string,
+): Promise<void> {
+  const rootDir = resolve(args.dir ?? join(dirname(specPath), ".crewhaus"));
+  const { openScoreboard: open } = await import("@crewhaus/routing-store");
+  const arms = open(rootDir).snapshot();
+  const shadowArms = arms.filter((a) => a.routeKey.startsWith("shadow:"));
+  if (shadowArms.length === 0) {
+    die(
+      `models propose --source audition: no shadow-lane arms under ${rootDir}. Declare \`model_pool.strategy.shadow\` and run the harness — the audition is what this proposes from.`,
+    );
+  }
+  const liveArms = arms.filter(
+    (a) => !a.routeKey.startsWith("shadow:") && !a.routeKey.startsWith("q:"),
+  );
+  const minN = args.minN ?? DEFAULT_MIN_EXPERIMENT_N;
+  // The audition candidate is the shadow arm with the most evidence; the
+  // incumbent is the live arm it was graded against most often.
+  const byArm = new Map<string, number>();
+  for (const a of shadowArms) byArm.set(a.model, (byArm.get(a.model) ?? 0) + a.n);
+  const shadowArm = [...byArm.entries()].sort((x, y) => y[1] - x[1])[0]?.[0] as string;
+  const liveByArm = new Map<string, number>();
+  for (const a of liveArms) liveByArm.set(a.model, (liveByArm.get(a.model) ?? 0) + a.n);
+  const primaryArm = [...liveByArm.entries()].sort((x, y) => y[1] - x[1])[0]?.[0] ?? "";
+  const verdict = auditionReadiness(
+    [...shadowArms.map((a) => ({ ...a })), ...liveArms.map((a) => ({ ...a }))],
+    { shadowArm, primaryArm, minN },
+  );
+  process.stdout.write(
+    `[models] audition ${shadowArm} vs ${primaryArm || "(no live arm)"} — ${verdict.reason}\n`,
+  );
+  if (!verdict.ready) {
+    die(
+      `models propose --source audition: refusing to propose. ${verdict.reason} Run the harness longer, or pass --min-n to state a different floor deliberately.`,
+    );
+  }
+  const outDir = resolve(args.out ?? join(".crewhaus", "models-propose"));
+  mkdirSync(outDir, { recursive: true });
+  const patchPath = join(outDir, "patch.json");
+  const bundle = {
+    kind: "model-audition-proposal" as const,
+    generatedAt: new Date().toISOString(),
+    spec: relative(process.cwd(), specPath),
+    verdict,
+    note:
+      "The candidate roster is human-owned (§9.3): this bundle is a PR body, not a patch the " +
+      "optimizer may apply. `crewhaus propose --source audition <proposed-spec.yaml>` opens the PR; " +
+      "`crewhaus route promote --gate` is the separate, eval-gated step that folds the lane's " +
+      "evidence into the live arms.",
+  };
+  writeFileSync(patchPath, `${JSON.stringify(bundle, null, 2)}\n`, { mode: 0o600 });
+  process.stdout.write(`[models] audition bundle: ${patchPath}\n`);
+  await appendRoutingPromotionAudit(dirname(rootDir), {
+    action: "audition_proposed",
+    shadowArm,
+    primaryArm,
+    shadowN: verdict.shadowN,
+    primaryN: verdict.primaryN,
+    minN,
+  });
+}
+
+/**
+ * 0.6.0 §9.1 — append the `routing_promotion` audit line a propose/promote
+ * action leaves behind. Best-effort: a proposal that could not be audited
+ * still stands (the bundle is on disk), but the failure is surfaced.
+ */
+async function appendRoutingPromotionAudit(
+  harnessDir: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  try {
+    const { openAuditLog } = await import("@crewhaus/audit-log");
+    const log = await openAuditLog({ rootDir: join(harnessDir, ".crewhaus", "audit") });
+    await log.append({ kind: "routing_promotion", payload: { ...payload, ts: Date.now() } });
+  } catch (err) {
+    process.stderr.write(
+      `[models] audit append skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
+}
+
+/**
  * Item 25 — `crewhaus model right-size <spec>`. A dedicated enumerate →
  * compile → eval loop (NOT the prompt mutator): each candidate is the spec
  * with ONE model slot (agent.model / sub-agent.model / compaction.model)
@@ -10649,23 +11151,21 @@ async function runModelRightSize(args: ParsedArgs): Promise<void> {
   if (ir.target !== "cli") die(`model right-size only supports target: cli (got "${ir.target}")`);
   const cliIr = ir;
 
-  // Collect the swappable slots off the LOWERED ir (compaction.model may be a
-  // resolved `cheapest` — right-size searches from wherever it landed).
-  const slots: ModelSlot[] = [
-    { label: "agent.model", currentModel: cliIr.agent.model, path: ["agent", "model"] },
-  ];
-  if (cliIr.compaction.model !== undefined) {
-    slots.push({
-      label: "compaction.model",
-      currentModel: cliIr.compaction.model,
-      path: ["compaction", "model"],
-    });
-  }
-  for (const sa of cliIr.subAgents ?? []) {
-    if (sa.model !== undefined) {
-      slots.push({ label: `sub-agent ${sa.name}.model`, currentModel: sa.model });
-    }
-  }
+  // 0.6.0 §8.2 — the shared spec walk, filtered to what a downshift may
+  // rewrite. Roster membership (pool candidates, tiers, fallback chains) is
+  // enumerated by the walk but NOT swappable: §9.3 keeps the roster
+  // human-owned, so right-size must never propose a candidate edit. A slot
+  // with no spec path (a sub-agent model the IR resolves but the patch
+  // grammar cannot address) still searches — the report names it and says the
+  // apply is manual, exactly as before.
+  const walked: ReadonlyArray<EnumeratedModelSlot> = enumerateModelSlots(cliIr);
+  const slots: ModelSlot[] = walked
+    .filter((sl) => sl.swappable || sl.kind === "sub-agent")
+    .map((sl) => ({
+      label: sl.label,
+      currentModel: sl.model,
+      ...(sl.path !== undefined && sl.swappable ? { path: sl.path } : {}),
+    }));
 
   const pricing = loadUserPricing();
   const candidates = enumerateSlotCandidates(slots, {
@@ -17884,8 +18384,33 @@ async function runDeployCanary(args: ParsedArgs): Promise<void> {
         }
       : evalVersion;
 
+  // 0.6.0 §9.1 (loop 6) — `--routing-gate` swaps in the ROUTING-AWARE
+  // evaluator through the same `RegressionGate` seam: pass rate and p95 as
+  // before, plus escalation rate, cost per turn and quality-floor blocks.
+  // It can only ever REFUSE a promotion the ordinary gate would have allowed,
+  // and it changes nothing about the approval quorum a protected env keeps.
+  const routingGate = args.flags["routing-gate"] === true;
+  if (routingGate) {
+    write(
+      "[canary] --routing-gate: escalation rate, cost/turn and quality-floor blocks are gated " +
+        "alongside pass rate and p95. Run the eval `--routing as-declared` or the routing deltas " +
+        "are vacuous (no routing decision is recorded on a static run).",
+    );
+  }
+  const canaryPricing = loadUserPricing();
   const gate = makeRegressionGate(
-    makeCanaryEvalGate({ evalVersion: evalVersionAccounted, thresholds: gateThresholds, write }),
+    routingGate
+      ? makeRoutingAwareCanaryGate({
+          evalVersion: evalVersionAccounted,
+          priceUsd: (model, tokens) => projectCostUsd(model, tokens, canaryPricing),
+          thresholds: gateThresholds,
+          write,
+        })
+      : makeCanaryEvalGate({
+          evalVersion: evalVersionAccounted,
+          thresholds: gateThresholds,
+          write,
+        }),
   );
 
   if (trafficSplit) {
@@ -18122,6 +18647,23 @@ async function runPropose(args: ParsedArgs): Promise<void> {
     );
     return;
   }
+  // 0.6.0 §9.1 — an unknown `--source` is an ERROR, not a silent downgrade to
+  // `manual`. The source is the proposal's provenance (it rides on patch.json
+  // AND the `governance_proposal` audit record), so a quietly rewritten one is
+  // a proposal a reviewer cannot trace back to the loop that made it.
+  // Validated FIRST: a flag typo should not cost a file read to discover.
+  const sourceFlag = args.flags["source"];
+  if (
+    typeof sourceFlag === "string" &&
+    !(PROPOSE_SOURCES as ReadonlyArray<string>).includes(sourceFlag)
+  ) {
+    die(
+      `propose: --source must be one of ${PROPOSE_SOURCES.join(" | ")} (got "${sourceFlag}") — the source is the proposal's provenance and is recorded in patch.json and the audit line`,
+    );
+  }
+  const source: ProposeSource =
+    typeof sourceFlag === "string" ? (sourceFlag as ProposeSource) : "manual";
+
   const proposedPathArg = args.positional[0];
   if (typeof proposedPathArg !== "string") die("missing <proposed-spec.yaml>");
   const proposedPath = resolve(proposedPathArg);
@@ -18156,12 +18698,6 @@ async function runPropose(args: ParsedArgs): Promise<void> {
     }
   }
 
-  const sourceFlag = args.flags["source"];
-  const validSources: ReadonlyArray<ProposeSource> = ["optimize", "advise", "model-scan", "manual"];
-  const source: ProposeSource =
-    typeof sourceFlag === "string" && (validSources as ReadonlyArray<string>).includes(sourceFlag)
-      ? (sourceFlag as ProposeSource)
-      : "manual";
   const runIdFlag = args.flags["run-id"];
   const runId = typeof runIdFlag === "string" ? runIdFlag : undefined;
   const asVersionFlag = args.flags["as-version"];
@@ -18653,9 +19189,12 @@ async function runUpgrade(args: ParsedArgs): Promise<void> {
         "                   rewrite the slots to $refs (a proposal; the lowered IR is\n" +
         "                   identical). Prints the diff; --write applies it.\n" +
         "  --rewrite-arms   re-key .crewhaus/routing/arms.jsonl lines whose candidate became\n" +
-        "                   a profile. REFUSED on this runtime: pool arms are recorded under\n" +
-        "                   the model string until the profile-keyed scoreboard ships, so\n" +
-        "                   --hoist-models prints what each hoisted arm id will do instead.\n" +
+        "                   a profile. The runtime now records pool arms under the PROFILE\n" +
+        "                   name, so this keeps the learned history instead of orphaning it.\n" +
+        "                   COVERAGE-GATED: only a model whose every inline candidate hoists\n" +
+        "                   to ONE profile is re-keyed — a model split across two profiles\n" +
+        "                   cannot be attributed line by line and is reported as a reset.\n" +
+        "                   Requires --write (it rewrites a file).\n" +
         "  --write   apply in place (rewrites the spec file), then register the new\n" +
         "            version + changelog entry in .crewhaus/specs like `compile` does.\n",
     );
@@ -18665,11 +19204,16 @@ async function runUpgrade(args: ParsedArgs): Promise<void> {
   const hoistModels = args.flags["hoist-models"] === true;
   const rewriteArms = args.flags["rewrite-arms"] === true;
   if (rewriteArms && !hoistModels) die("--rewrite-arms requires --hoist-models");
-  if (rewriteArms) {
-    // §7.9: arm identity by profile name is the routing PR's; this runtime
-    // records arms under the model string, so re-keying would orphan them.
-    const { REWRITE_ARMS_UNAVAILABLE } = await import("./hoist-models");
-    die(REWRITE_ARMS_UNAVAILABLE);
+  // 0.6.0 §9.2 — the refusal PR 16 shipped is LIFTED: PR 10 landed
+  // profile-name arm identity (`armId = profile ?? model`), so re-keying
+  // `arms.jsonl` now MOVES the history onto the arm that keeps learning it
+  // instead of orphaning it. The rewrite still needs `--write`: it edits a
+  // file, and a dry run that silently rewrote the scoreboard would be the
+  // worst possible surprise.
+  if (rewriteArms && !write) {
+    die(
+      "--rewrite-arms rewrites .crewhaus/routing/arms.jsonl — pass --write to apply it (a dry run never touches the scoreboard)",
+    );
   }
   const specArg = args.positional[0];
   const absSpec = resolve(
@@ -18719,12 +19263,26 @@ async function runUpgrade(args: ParsedArgs): Promise<void> {
       if (hoist.action === "hoist") {
         finalYaml = hoist.yaml;
         const armsPath = join(dirname(absSpec), ".crewhaus", "routing", "arms.jsonl");
-        // Arm identity: the runtime keys arms by model string, so the file is
-        // never touched here — the note reports what each hoisted arm id will
-        // do once profile-keyed identity ships (`--rewrite-arms` was refused
-        // above). Counts are read once, before anything could rewrite them.
+        // Counts are read ONCE, before anything could rewrite them, because
+        // the counts move with `m`.
         const counts = countArmLines(armsPath, armModels(hoist));
-        process.stdout.write(formatArmNotes(armsPath, hoist, counts));
+        process.stdout.write(formatArmNotes(armsPath, hoist, counts, rewriteArms));
+        if (rewriteArms && hoist.armRewrites.length > 0) {
+          const { rewriteArmsFile } = await import("./hoist-models");
+          const result = rewriteArmsFile(armsPath, hoist.armRewrites);
+          process.stdout.write(
+            `hoist-models: re-keyed ${result.rewritten}/${result.total} arm line(s) in ${armsPath} (write-then-rename, so a concurrent reader sees the old file or the new one, never a torn one).\n`,
+          );
+          if (hoist.armResets.length > 0) {
+            process.stdout.write(
+              `hoist-models: ${hoist.armResets.length} arm id(s) were NOT re-keyed — a model that hoists to more than one profile cannot be split line by line, so its history resets.\n`,
+            );
+          }
+        } else if (rewriteArms) {
+          process.stdout.write(
+            "hoist-models: --rewrite-arms had nothing to re-key (no hoisted candidate maps one-to-one onto a profile).\n",
+          );
+        }
       }
     }
   }
@@ -22196,10 +22754,23 @@ switch (subcommand) {
     await runPricing(parseFor(rest.slice(1), PRICING_SCHEMA), action);
     break;
   }
+  case "models":
+    // 0.6.0 §8.2 / §9.1 — the offline model-intelligence family. `audit` is
+    // the only subcommand that can exit non-zero (the `--fail-on` ladder).
+    try {
+      await runModelsCli(rest);
+    } catch (err) {
+      if (err instanceof ModelsCliError) die(err.message);
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
   case "model": {
     const action = rest[0] ?? "";
     if (action !== "right-size") {
-      die(`model action must be "right-size" (got "${action}")`);
+      die(
+        `model action must be "right-size" (got "${action}"). The registry verbs are \`crewhaus models list|explain|audit|propose\` (plural).`,
+      );
     }
     try {
       await runModelRightSize(parseFor(rest.slice(1), MODEL_SCHEMA));

@@ -802,6 +802,160 @@ function suiteFlywheelStep(suite: string | undefined): string {
 `;
 }
 
+/**
+ * 0.6.0 §9.1 (loop 7) — where the nightly MODEL-PLAN job is scaffolded. A
+ * second workflow beside `crewhaus-flywheel.yml` rather than another step
+ * inside it: the flywheel rewrites prompts and the model-plan job rewrites
+ * the roster, they have different failure modes and different reviewers, and
+ * a red audit must still be able to open the replacement PR.
+ */
+export const MODEL_PLAN_WORKFLOW_RELPATH = join(".github", "workflows", "crewhaus-model-plan.yml");
+
+/**
+ * 0.6.0 §9.1 (loop 7) — the nightly `models audit --propose` / `route propose`
+ * job. It OPENS A PR and never merges: the roster, the rule targets and the
+ * floor are human-owned (§9.3), so the last gate is a person every night.
+ *
+ * Three properties the file is written to guarantee, each asserted by a test
+ * in `flywheel.test.ts`:
+ *
+ *   1. NO `--merge`, no `gh pr merge`, no `auto-merge`, no `--admin`. The
+ *      grep test is the enforcement — a future edit that adds one fails CI
+ *      rather than shipping a loop that closes itself.
+ *   2. `continue-on-error` on the audit step. `models audit` EXITS 1 on a
+ *      retired model, and that is exactly the night the replacement PR is
+ *      most wanted: a red audit that aborted the job would suppress the fix
+ *      it just found.
+ *   3. `--today` is left UNSET. The audit reads the wall clock on purpose
+ *      here — a sunset that passed today should redden today's run. The flag
+ *      exists so TESTS can pin the clock, not so a schedule can freeze it.
+ *
+ * `harnessDir` (repo-root-relative, "" = the harness IS the root) points the
+ * job's working-directory and prefixes the artifact upload path — actions
+ * paths resolve from the repo root and do NOT honor
+ * `defaults.run.working-directory` (finding 7).
+ */
+export function buildModelPlanWorkflowYaml(opts: { readonly harnessDir?: string } = {}): string {
+  const sub = normalizeHarnessDir(opts.harnessDir);
+  const prefix = sub === "" ? "" : `${sub}/`;
+  const workingDirLine = sub === "" ? "" : `\n        working-directory: ${sub}`;
+  return `# crewhaus-model-plan.yml — scaffolded by \`crewhaus flywheel init --model-plan\`.
+#
+# The nightly MODEL-PLAN loop (0.6.0 §9.1):
+#   models audit --propose   -> a replacement patch for every slot whose model
+#                               has retired (the audit itself exits 1 on one,
+#                               which is why this step is continue-on-error:
+#                               a red audit is the night you most want the PR)
+#   route propose            -> whitelisted routing-policy patches mined from
+#                               the reward scoreboard, written as the same
+#                               suggestions.json \`optimize --from-advice\` eats
+#
+# Invariants (do not weaken):
+#   - it NEVER merges. No \`gh pr merge\`, no auto-merge, no --admin. The
+#     roster, the rule targets and the reward floor are human-owned (§9.3);
+#     the PR is the gate and a grep test in the CLI asserts this file has no
+#     merge verb in it.
+#   - nothing is applied here. \`models audit --propose\` writes patch.json and
+#     \`route propose\` writes suggestions.json; both are review artifacts.
+#     Applying a routing patch means \`crewhaus optimize --from-advice ...
+#     --routing as-declared --warm-arms\`, which eval-gates it first.
+#   - the audit reads the WALL CLOCK. \`--today\` is deliberately unset: a
+#     model that retired today should redden today's run.
+#
+# Required repo secrets:
+#   MODEL_PLAN_GH_TOKEN  — a PAT (or GitHub App token) with contents:write +
+#                          pull-requests:write. Passed explicitly instead of
+#                          the default GITHUB_TOKEN so the opened PR can
+#                          trigger downstream CI.
+#
+# No model credentials are needed: every verb in this job is OFFLINE (it reads
+# the pricing/capability tables, the spec and \`.crewhaus/routing/arms.jsonl\`).
+
+name: crewhaus-model-plan
+
+on:
+  schedule:
+    # Nightly, offset from the flywheel's 07:13 so the two never contend for
+    # the same checkout.
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: crewhaus-model-plan
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push the proposal branch
+  pull-requests: write # open the PR
+
+jobs:
+  model-plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash${workingDirLine}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: \${{ secrets.MODEL_PLAN_GH_TOKEN }}
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install crewhaus CLI
+        run: |
+          bun add -g crewhaus
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: Audit the model plan and propose replacements
+        # continue-on-error ON PURPOSE: \`models audit\` exits 1 when a slot's
+        # model is already past its retirement date, and that is precisely the
+        # night the replacement PR must still be opened.
+        continue-on-error: true
+        run: crewhaus models audit --propose -o .crewhaus/model-plan
+
+      - name: Mine the routing scoreboard
+        continue-on-error: true
+        run: crewhaus route propose -o .crewhaus/model-plan
+
+      - name: Open a PR when anything was proposed
+        env:
+          GH_TOKEN: \${{ secrets.MODEL_PLAN_GH_TOKEN }}
+        run: |
+          if [ ! -f .crewhaus/model-plan/patch.json ] && [ ! -f .crewhaus/model-plan/suggestions.json ]; then
+            echo "nothing proposed tonight — the roster is current and the scoreboard has no whitelisted change"
+            exit 0
+          fi
+          STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+          BRANCH="model-plan/\${STAMP}"
+          git config user.name "crewhaus-model-plan[bot]"
+          git config user.email "model-plan@crewhaus.ai"
+          git checkout -b "\${BRANCH}"
+          git add -f .crewhaus/model-plan
+          git commit -m "model-plan: nightly proposal \${STAMP}"
+          git push -u origin "\${BRANCH}"
+          # A human reads the proposal and decides. NEVER add an auto-merge
+          # step here — the roster and the reward floor are human-owned.
+          gh pr create \\
+            --title "model-plan: nightly proposal (\${STAMP})" \\
+            --body "Opened by the crewhaus model-plan job. NOTHING was applied. \\\`patch.json\\\` lists the replacement for every slot whose model has retired; \\\`suggestions.json\\\` lists the whitelisted routing changes mined from the reward scoreboard. Verify a replacement with \\\`crewhaus model right-size\\\`, and eval-gate a routing change with \\\`crewhaus optimize <spec> --from-advice .crewhaus/model-plan/suggestions.json --routing as-declared --warm-arms\\\`."
+
+      - name: Upload the proposal
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-plan-\${{ github.run_id }}
+          # Action paths resolve from the repo root — they do NOT honor
+          # defaults.run.working-directory, hence the explicit prefix.
+          path: ${prefix}.crewhaus/model-plan/
+          if-no-files-found: ignore
+          retention-days: 30
+`;
+}
+
 /** Printed after `flywheel init` (and folded into `flywheel --help`): the
  *  env knobs the scaffolded workflow steers the run with. */
 export function formatFlywheelKnobsGuide(): string[] {

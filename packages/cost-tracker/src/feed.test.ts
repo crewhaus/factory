@@ -9,6 +9,7 @@ import {
   parsePricingFeed,
   pickNewestPricing,
   pricingTableAgeDays,
+  sunsetRetired,
 } from "./feed";
 import { DEFAULT_PRICING, resolvePricing } from "./pricing";
 
@@ -264,5 +265,44 @@ describe("pricing feed sunsets (0.6.0)", () => {
     expect(Object.keys(merged).sort()).toEqual(Object.keys(KNOWN_SUNSETS).sort());
     expect(merged["anthropic"]?.length).toBe(KNOWN_SUNSETS["anthropic"]?.length);
     expect(merged["anthropic"]?.[0]?.source).toBe("builtin");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §8.2 — `sunsetRetired`, the clock `models audit --today` reads.
+// ---------------------------------------------------------------------------
+
+describe("sunsetRetired", () => {
+  const entry = {
+    modelIdPrefix: "claude-3-5-haiku",
+    retiresOn: "2026-10-01",
+    replacement: "claude-haiku-4-5",
+  };
+
+  test("the announced date is the LAST day the model serves, not the first day it is gone", () => {
+    expect(sunsetRetired(entry, new Date("2026-09-30T23:59:59Z"))).toBe(false);
+    // Any instant of the retirement day itself still counts as serving.
+    expect(sunsetRetired(entry, new Date("2026-10-01T00:00:00Z"))).toBe(false);
+    expect(sunsetRetired(entry, new Date("2026-10-01T23:59:59Z"))).toBe(false);
+    expect(sunsetRetired(entry, new Date("2026-10-02T00:00:00Z"))).toBe(true);
+  });
+
+  test("compares on the UTC calendar day, so a local-midnight clock cannot flip it", () => {
+    // 2026-10-01T20:00:00-08:00 is 2026-10-02T04:00Z — retired.
+    expect(sunsetRetired(entry, new Date("2026-10-01T20:00:00-08:00"))).toBe(true);
+    // 2026-10-02T02:00:00+09:00 is 2026-10-01T17:00Z — not yet.
+    expect(sunsetRetired(entry, new Date("2026-10-02T02:00:00+09:00"))).toBe(false);
+  });
+
+  test("a malformed date reads as NOT retired — over-failing on a bad row is the worse error", () => {
+    expect(sunsetRetired({ ...entry, retiresOn: "soon" }, new Date("2030-01-01T00:00:00Z"))).toBe(
+      false,
+    );
+  });
+
+  test("findSunset itself stays date-independent — it matches, the predicate judges", () => {
+    const table = { anthropic: [entry] };
+    expect(findSunset("anthropic", "claude-3-5-haiku-20241022", table)).toEqual(entry);
+    expect(findSunset("anthropic", "claude-haiku-4-5", table)).toBeUndefined();
   });
 });

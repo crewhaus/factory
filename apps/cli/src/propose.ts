@@ -44,7 +44,43 @@ export class ProposeError extends Error {
 /** Where a proposal's review bundle lands within the repo. */
 export const PROPOSALS_RELDIR = ".crewhaus/proposals";
 
-export type ProposeSource = "optimize" | "advise" | "model-scan" | "manual" | "watchme";
+/**
+ * Which loop produced a proposal. 0.6.0 §9.1 adds the four model-plan loops:
+ *
+ *   sunset      `models audit --propose` — a slot whose model has retired
+ *   right-size  `model right-size` — a cheaper slot that held quality
+ *   route       `route propose` — a mined routing-policy change
+ *   audition    `models propose --source audition` — a shadow arm that beat
+ *               the live roster past the power floor
+ *
+ * The union is CLOSED and the CLI validates against it (`PROPOSE_SOURCES`)
+ * rather than silently downgrading an unknown value to `manual`: a proposal
+ * whose provenance was quietly rewritten is a proposal a reviewer cannot
+ * trace back to the loop that made it.
+ */
+export type ProposeSource =
+  | "optimize"
+  | "advise"
+  | "model-scan"
+  | "manual"
+  | "watchme"
+  | "sunset"
+  | "right-size"
+  | "route"
+  | "audition";
+
+/** Every accepted `--source`, in help order. The CLI REFUSES anything else. */
+export const PROPOSE_SOURCES: ReadonlyArray<ProposeSource> = Object.freeze([
+  "optimize",
+  "advise",
+  "model-scan",
+  "watchme",
+  "sunset",
+  "right-size",
+  "route",
+  "audition",
+  "manual",
+]);
 
 /** sha256 hex of a spec's bytes — the patch identity carried into provenance. */
 export function specContentHash(yaml: string): string {

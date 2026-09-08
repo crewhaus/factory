@@ -3240,13 +3240,28 @@ describe("crewhaus upgrade --hoist-models — arm identity on this runtime (0.6.
     return { spec, arms };
   }
 
-  test("--rewrite-arms is REFUSED: the runtime records arms under the model string, so nothing is touched", async () => {
+  // 0.6.0 PR 15 — the PR-16 refusal is LIFTED (PR 10 landed profile-name arm
+  // identity), so `--rewrite-arms` now re-keys the history instead of
+  // orphaning it. These are the same three cases, re-pinned to the new
+  // behaviour.
+  test("--rewrite-arms re-keys arms.jsonl onto the profile arm under --write", async () => {
     const { spec, arms } = seedHarness();
     const result = await runCli(["upgrade", spec, "--hoist-models", "--write", "--rewrite-arms"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("re-keyed 1/1 arm line(s)");
+    expect(readFileSync(spec, "utf-8")).toContain("model: $default");
+    // The line moved from the model string onto the profile name — the arm
+    // the runtime now records under (`armId = profile ?? model`).
+    const rewritten = JSON.parse(readFileSync(arms, "utf-8").trim()) as { m: string; k: string };
+    expect(rewritten.m).toBe("default");
+    expect(rewritten.k).toBe("hard");
+  });
+
+  test("--rewrite-arms without --write is refused — a dry run never touches the scoreboard", async () => {
+    const { spec, arms } = seedHarness();
+    const result = await runCli(["upgrade", spec, "--hoist-models", "--rewrite-arms"]);
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("--rewrite-arms needs the profile-keyed scoreboard");
-    expect(result.stderr).toContain("records pool arms under the model string");
-    // Refused BEFORE any work: the spec and the arms file are byte-identical.
+    expect(result.stderr).toContain("pass --write to apply it");
     expect(readFileSync(spec, "utf-8")).toBe(POOLED_SPEC);
     expect(readFileSync(arms, "utf-8")).toBe(`${ARM_LINE}\n`);
   });
@@ -3258,17 +3273,227 @@ describe("crewhaus upgrade --hoist-models — arm identity on this runtime (0.6.
     expect(result.stderr).toContain("--rewrite-arms requires --hoist-models");
   });
 
-  test("--hoist-models --write leaves arms.jsonl alone and says the arm id stays the model string today", async () => {
+  test("--hoist-models --write alone leaves arms.jsonl untouched and names the remedy", async () => {
     const { spec, arms } = seedHarness();
     const result = await runCli(["upgrade", spec, "--hoist-models", "--write"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("hoist-models: 1 profile(s)");
-    expect(result.stdout).toContain("records pool arms under the model string");
+    expect(result.stdout).toContain("records pool arms under the PROFILE name");
     expect(result.stdout).toContain("claude-opus-4-8 → $default (1 line(s) recorded)");
-    expect(result.stdout).toContain("--rewrite-arms is refused on this runtime");
-    expect(result.stdout).not.toContain("arm id becomes the profile name");
-    // The spec was hoisted; the learned history was not re-keyed.
+    expect(result.stdout).toContain("Add --write --rewrite-arms");
+    // The spec was hoisted; without the flag the history is left where it is.
     expect(readFileSync(spec, "utf-8")).toContain("model: $default");
     expect(readFileSync(arms, "utf-8")).toBe(`${ARM_LINE}\n`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §8.2 / §9.1 / §9.2 — the CLI surfaces this PR adds, end to end.
+// ---------------------------------------------------------------------------
+
+describe("crewhaus models (CLI surface)", () => {
+  let tmp: string;
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "crewhaus-models-cli-"));
+  });
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const HYBRID_SPEC = [
+    "name: hybrid",
+    "target: cli",
+    "models:",
+    "  fast: { model: claude-haiku-4-5, tags: [cheap] }",
+    "  strong: { model: claude-opus-5, tags: [strong] }",
+    "agent:",
+    "  model: $fast",
+    "  instructions: help",
+    "  model_pool:",
+    "    candidates:",
+    "      - { model: $fast, tags: [cheap] }",
+    "      - { model: $strong, tags: [strong] }",
+    "",
+  ].join("\n");
+
+  /** A spec whose only model retired in 2026-04 (`claude-3-haiku`). */
+  const RETIRED_SPEC = [
+    "name: retired",
+    "target: cli",
+    "agent:",
+    "  model: claude-3-haiku-20240307",
+    "  instructions: help",
+    "",
+  ].join("\n");
+
+  function seed(yaml: string): string {
+    const spec = join(tmp, "crewhaus.yaml");
+    writeFileSync(spec, yaml);
+    return spec;
+  }
+
+  test("models list prints the resolved registry", async () => {
+    const spec = seed(HYBRID_SPEC);
+    const r = await runCli(["models", "list", spec]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("fast");
+    expect(r.stdout).toContain("claude-opus-5");
+  });
+
+  test("models explain prints every slot, the strategy sentence and this shape's row", async () => {
+    const spec = seed(HYBRID_SPEC);
+    const r = await runCli(["models", "explain", spec]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("agent.model_pool.candidates[1]");
+    expect(r.stdout).toContain("per-shape support (cli)");
+    expect(r.stdout).toContain("typed input seams");
+  });
+
+  test("models audit EXITS 1 on a retired model, and --fail-on none reports it without failing", async () => {
+    const spec = seed(RETIRED_SPEC);
+    const failed = await runCli(["models", "audit", spec, "--today", "2026-09-07"]);
+    expect(failed.exitCode).toBe(1);
+    expect(failed.stdout).toContain("RETIRED");
+    const reported = await runCli([
+      "models",
+      "audit",
+      spec,
+      "--today",
+      "2026-09-07",
+      "--fail-on",
+      "none",
+    ]);
+    expect(reported.exitCode).toBe(0);
+    expect(reported.stdout).toContain("RETIRED");
+  });
+
+  test("models audit --propose writes the replacement patch even though the audit failed", async () => {
+    const spec = seed(RETIRED_SPEC);
+    const out = join(tmp, "proposal");
+    const r = await runCli([
+      "models",
+      "audit",
+      spec,
+      "--today",
+      "2026-09-07",
+      "--propose",
+      "-o",
+      out,
+    ]);
+    // The audit still fails — the proposal is written first, so a nightly job
+    // with continue-on-error gets both.
+    expect(r.exitCode).toBe(1);
+    const patch = JSON.parse(readFileSync(join(out, "patch.json"), "utf-8")) as {
+      patches: Array<{ patch: { path: string[]; value: string } }>;
+    };
+    expect(patch.patches[0]?.patch.path).toEqual(["agent", "model"]);
+    expect(patch.patches[0]?.patch.value).toBe("claude-haiku-4-5");
+  });
+
+  test("a parameter the provider DROPS is a failure, projected through the real adapter", async () => {
+    // §8.1 — `anthropicEffectiveParams` is the adapter's own marshaller
+    // projection, so this is the wire truth, not a re-derived gate. Claude 5
+    // rejects `temperature` (#413), and before this the drop was silent.
+    const spec = seed(
+      [
+        "name: temp",
+        "target: cli",
+        "models:",
+        "  strong: { model: claude-opus-5, temperature: 0.3 }",
+        "agent:",
+        "  model: $strong",
+        "  instructions: help",
+        "",
+      ].join("\n"),
+    );
+    const r = await runCli(["models", "audit", spec, "--today", "2026-09-07"]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toContain("DROPS temperature");
+  });
+
+  test("a clean spec audits green", async () => {
+    const spec = seed(HYBRID_SPEC);
+    const r = await runCli(["models", "audit", spec, "--today", "2026-09-07"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("0 failing");
+  });
+
+  test("`crewhaus model` (singular) points at the plural registry verbs", async () => {
+    const r = await runCli(["model", "list"]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("crewhaus models list|explain|audit|propose");
+  });
+
+  test("models propose refuses an unknown --source", async () => {
+    const spec = seed(HYBRID_SPEC);
+    const r = await runCli(["models", "propose", spec, "--source", "vibes"]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain('--source must be "sunset" or "audition"');
+  });
+
+  test("models propose --source audition refuses without an audition lane", async () => {
+    const spec = seed(HYBRID_SPEC);
+    const r = await runCli(["models", "propose", spec, "--source", "audition"]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("no shadow-lane arms");
+  });
+});
+
+describe("crewhaus propose --source (0.6.0 §9.1)", () => {
+  test("an unknown source is REFUSED, not silently downgraded to manual", async () => {
+    const r = await runCli(["propose", "nope.yaml", "--source", "telepathy", "--dry-run"]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("--source must be one of");
+    expect(r.stderr).toContain("sunset");
+    expect(r.stderr).toContain("audition");
+  });
+});
+
+describe("crewhaus route propose (CLI surface)", () => {
+  test("reports honestly when there is no pool to propose against", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-route-propose-cli-"));
+    try {
+      const r = await runCli(["route", "propose", "--dir", join(dir, ".crewhaus")], { cwd: dir });
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain("No routing change is proposable");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("crewhaus init --hybrid (0.6.0 §9.2)", () => {
+  test("scaffolds a spec that COMPILES, with the registry, the pool and the cascade", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-init-hybrid-"));
+    try {
+      const r = await runCli(["init", "--hybrid"], { cwd: dir });
+      expect(r.exitCode).toBe(0);
+      const yaml = readFileSync(join(dir, "crewhaus.yaml"), "utf-8");
+      expect(yaml).toContain("models:");
+      expect(yaml).toContain("model: $fast");
+      expect(yaml).toContain("cascade:");
+      expect(yaml).toContain("on_fail: escalate");
+      // The seed model BECOMES the strong arm and its cheapest same-provider
+      // sibling drafts — §1's motivating scenario, read back as a scaffold.
+      expect(yaml).toContain("model: claude-opus-5");
+      expect(yaml).toContain("model: claude-haiku-4-5");
+      expect(yaml).not.toContain("openai/");
+      // The compile gate is the proof, not the grep.
+      const compiled = await runCli(
+        ["compile", join(dir, "crewhaus.yaml"), "-o", join(dir, "out")],
+        {
+          cwd: dir,
+        },
+      );
+      expect(compiled.exitCode).toBe(0);
+      // And the new verbs read it.
+      const explained = await runCli(["models", "explain", join(dir, "crewhaus.yaml")], {
+        cwd: dir,
+      });
+      expect(explained.exitCode).toBe(0);
+      expect(explained.stdout).toContain("escalating to `strong`");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

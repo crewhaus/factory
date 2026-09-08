@@ -35,7 +35,7 @@
  * that cannot ({@link HoistPlan.armResets}: the same model string also
  * serves a candidate that stays inline, or two profiles, and `arms.jsonl`
  * lines carry no pool identity to split on). The CLI prints the note; it
- * REFUSES `--rewrite-arms` ({@link REWRITE_ARMS_UNAVAILABLE}) because
+ * PR 15 lifted the `--rewrite-arms` refusal ({@link REWRITE_ARMS_UNAVAILABLE}), which existed because
  * re-keying `m` today would orphan exactly the history the flag exists to
  * keep. {@link rewriteArmsFile} — the write-then-rename single-writer swap —
  * is the machinery the routing PR wires in once the runtime keys by profile.
@@ -439,11 +439,16 @@ export function countArmLines(armsPath: string, models: ReadonlyArray<string>): 
 }
 
 /**
- * Why the CLI refuses `--rewrite-arms` on this runtime. Re-keying `m` from
- * the model string to the profile name is right only once the scoreboard
- * records and reads arms under the profile name (§7.9, the routing PR);
- * today it would move the lines out from under the arm that is still
- * learning under the model string.
+ * HISTORICAL. PR 16 shipped `--hoist-models` while the runtime still recorded
+ * pool arms under the model string, so `--rewrite-arms` was refused with this
+ * sentence: re-keying `m` to the profile name would have moved the lines out
+ * from under the arm that was still learning under the model string.
+ *
+ * PR 10 landed profile-name arm identity (`armId = profile ?? model`), so the
+ * refusal is LIFTED and {@link rewriteArmsFile} is wired. The constant stays
+ * exported and pinned by a test as the record of what changed and why — a
+ * reader who finds it in an older CLI's output should be able to search for
+ * it and land here.
  */
 export const REWRITE_ARMS_UNAVAILABLE =
   "--rewrite-arms needs the profile-keyed scoreboard (0.6.0 routing PR); this runtime records " +
@@ -464,8 +469,8 @@ export function armModels(plan: HoistPlan): ReadonlyArray<string> {
  * one. Lines that do not parse are carried through verbatim. Returns the
  * line counts; a no-op when the file is absent.
  *
- * NOT wired to the CLI on this runtime (see {@link REWRITE_ARMS_UNAVAILABLE});
- * the routing PR connects it once arms are recorded under the profile name.
+ * Wired to `crewhaus upgrade --hoist-models --write --rewrite-arms` (the
+ * refusal PR 16 shipped is lifted — see {@link REWRITE_ARMS_UNAVAILABLE}).
  * Callers must pass only {@link HoistPlan.armRewrites} — never a reset — and
  * read {@link countArmLines} BEFORE calling, since the counts move with `m`.
  */
@@ -510,31 +515,41 @@ export function rewriteArmsFile(
  * describe the file as the user knew it. Empty when no candidate was
  * hoisted; an absent arms file still gets the identity lines.
  */
-export function formatArmNotes(armsPath: string, plan: HoistPlan, counts: ArmLineCounts): string {
+export function formatArmNotes(
+  armsPath: string,
+  plan: HoistPlan,
+  counts: ArmLineCounts,
+  rewriting = false,
+): string {
   if (plan.armRewrites.length === 0 && plan.armResets.length === 0) return "";
   const lines: string[] = [
     "  learned history (scoreboard arm identity):",
-    "    this runtime records pool arms under the model string — hoisting changes nothing in",
-    `    ${armsPath} today; the arm id WILL be the profile name once profile-keyed identity ships.`,
+    "    the runtime records pool arms under the PROFILE name, so hoisting changes the arm id.",
+    `    ${armsPath} keeps its history when the change is one-to-one:`,
   ];
   const where = (model: string): string => {
     const n = counts.get(model) ?? 0;
     return n > 0 ? ` (${n} line(s) recorded)` : "";
   };
   for (const r of plan.armRewrites) {
-    lines.push(`    ${r.model} → $${r.profile}${where(r.model)}: re-keyable one-to-one then.`);
+    lines.push(
+      `    ${r.model} → $${r.profile}${where(r.model)}: re-keyed one-to-one${rewriting ? "." : " with --write --rewrite-arms."}`,
+    );
   }
   for (const r of plan.armResets) {
     lines.push(
       `    ${r.model} → ${r.profiles.map((n) => `$${n}`).join(", ")}${where(r.model)}: ${r.reason} — the`,
-      "    lines cannot be split by pool; a learned-history reset for the hoisted arm(s) then.",
+      "    lines cannot be split by pool, so this arm's learned history resets.",
     );
   }
   const any = [...counts.values()].some((n) => n > 0);
-  lines.push(
-    any
-      ? "    --rewrite-arms is refused on this runtime (it would orphan those lines); re-key after upgrading."
-      : "    no recorded arms under those ids — nothing to re-key.",
-  );
+  if (!any) {
+    lines.push("    no recorded arms under those ids — nothing to re-key.");
+  } else if (!rewriting && plan.armRewrites.length > 0) {
+    lines.push(
+      "    Add --write --rewrite-arms to move those lines onto the profile arm; without it the",
+      "    pool starts learning the profile arm from zero and the old lines are never read again.",
+    );
+  }
   return `${lines.join("\n")}\n`;
 }

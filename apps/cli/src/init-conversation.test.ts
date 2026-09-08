@@ -841,6 +841,10 @@ describe("crewhaus init --interactive — scripted fallback + non-TTY gating (su
       "model [claude-opus-5]: ",
       "one-line instructions for the agent: ",
       "tools (comma-separated names, or blank): ",
+      // 0.6.0 §9.2 — the ONE hybrid question, asked on the cli shape only.
+      // An empty answer is a NO, so the emitted spec is the historical
+      // single-model one.
+      "run cheap drafts with a stronger model checking them (a hybrid cascade)? [y/N]: ",
       `wrote ${targetFile}\n`,
       "next: cd scripted-bot && crewhaus run crewhaus.yaml\n",
     ];
@@ -849,6 +853,25 @@ describe("crewhaus init --interactive — scripted fallback + non-TTY gating (su
     expect(yaml).toContain("name: scripted-bot");
     expect(yaml).toContain("target: cli");
     expect(yaml).toContain("help users");
+    // Declining the hybrid question keeps the pre-0.6.0 single-model spec.
+    expect(yaml).not.toContain("models:");
+    expect(yaml).not.toContain("model_pool:");
+  });
+
+  test("0.6.0 §9.2 — answering the hybrid question YES emits the registry + cascade", async () => {
+    const root = newTargetDir("cli-hybrid");
+    mkdirSync(root, { recursive: true });
+    const { exitCode, stdout } = await runInitCli(["hybrid-bot"], {
+      cwd: root,
+      stdin: "\n\n\nhelp users\n\ny\n",
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("hybrid: $fast =");
+    const yaml = readFileSync(join(realpathSync(root), "hybrid-bot", "crewhaus.yaml"), "utf-8");
+    expect(yaml).toContain("models:");
+    expect(yaml).toContain("model: $fast");
+    expect(yaml).toContain("cascade:");
+    expect(yaml).toContain("on_fail: escalate");
   });
 
   test("credentials but no TTY → the conversational path is refused; the scripted questionnaire runs", async () => {

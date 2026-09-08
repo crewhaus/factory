@@ -140,12 +140,52 @@ export type AdviceContext = {
    */
   readonly routingArms: ReadonlyArray<ArmStats>;
   /**
+   * 0.6.0 §9.1 (loop 3) — the hybrid-strategy aggregate folded from the
+   * durable `model_stage` lines: how often an escalation STARTED, finished,
+   * failed, or was SUPPRESSED (skipped, with the cause that suppressed it),
+   * and how many cheap DRAFTS were served. Empty on any harness that never
+   * ran a cascade, so the escalation rules simply do not fire there.
+   */
+  readonly escalations: EscalationStats;
+  /**
+   * 0.6.0 §9.1 (loop 3) — per-rule routing attribution folded from the
+   * durable `model_route.ruleId` lines: how many turns each rule routed, and
+   * how many of those turns went on to escalate. This is the ONLY place the
+   * "which rule sent work to the arm that could not do it" question is
+   * answerable — the scoreboard records `(routeKey, armId)` and never the
+   * rule — which is why `route propose` defers the `rules[*].enabled` toggle
+   * to this file.
+   */
+  readonly routedTurnsByRule: ReadonlyMap<string, RuleRoutingStats>;
+  /**
    * "Watch me" — whether the harness is watched plus its recurring-intent
    * aggregates. Undefined when no watch-me data exists (an unwatched harness,
    * or an old-vintage fold) — the coverage rule then judges spec coverage
    * only and the low-satisfaction rule stays silent.
    */
   readonly watchme?: WatchmeAdviceSlice;
+};
+
+/** 0.6.0 §9.1 — cascade / self-escalation counters over `model_stage`. */
+export type EscalationStats = {
+  /** `role: "escalation"`, `outcome: "started"` — what metrics count as one. */
+  readonly started: number;
+  readonly done: number;
+  readonly failed: number;
+  /** `outcome: "skipped"` — an escalation the loop WANTED but did not serve. */
+  readonly suppressed: number;
+  /** Suppression `cause` → occurrences (`max_escalations`, `budget`, …). */
+  readonly suppressedCauses: ReadonlyMap<string, number>;
+  /** `stage: "draft"` starts — the denominator for "how often the cheap arm needed rescuing". */
+  readonly drafts: number;
+};
+
+/** 0.6.0 §9.1 — one routing rule's turn attribution. */
+export type RuleRoutingStats = {
+  /** Turns whose `model_route` line named this rule. */
+  readonly turns: number;
+  /** Of those, turns that went on to publish an escalation stage. */
+  readonly escalated: number;
 };
 
 export type SessionEvents = {
@@ -233,6 +273,14 @@ export function buildAdviceContext(
   const stopReasons = new Map<string, number>();
   const loopSignatures = new Map<string, number>();
   const perToolBytes = new Map<string, number>();
+  // 0.6.0 §9.1 — hybrid-stage + per-rule routing aggregates.
+  const suppressedCauses = new Map<string, number>();
+  const ruleTurns = new Map<string, { turns: number; escalated: number }>();
+  let escStarted = 0;
+  let escDone = 0;
+  let escFailed = 0;
+  let escSuppressed = 0;
+  let drafts = 0;
   let truncationContinues = 0;
   let modelResponses = 0;
   let totalToolBytes = 0;
@@ -247,7 +295,40 @@ export function buildAdviceContext(
     // the toolUseId (both live on separate lines). Per-session scope so ids
     // never collide across sessions.
     const toolUseNameById = new Map<string, string>();
+    // 0.6.0 §9.1 — the rule that routed each turn, and which turns escalated.
+    // Per-session scope so turn numbers never collide across sessions.
+    const ruleByTurn = new Map<number, string>();
+    const escalatedTurns = new Set<number>();
     for (const obj of session.objects) {
+      const route = payloadOf(obj, "model_route");
+      if (route !== undefined) {
+        if (typeof route["ruleId"] === "string" && typeof route["turnNumber"] === "number") {
+          ruleByTurn.set(route["turnNumber"], route["ruleId"]);
+        }
+        continue;
+      }
+      const stage = payloadOf(obj, "model_stage");
+      if (stage !== undefined) {
+        const outcome = stage["outcome"];
+        if (stage["stage"] === "draft" && outcome === "started") drafts += 1;
+        if (stage["role"] === "escalation") {
+          if (outcome === "started") {
+            escStarted += 1;
+            if (typeof stage["turnNumber"] === "number") {
+              escalatedTurns.add(stage["turnNumber"]);
+            }
+          } else if (outcome === "done") {
+            escDone += 1;
+          } else if (outcome === "failed") {
+            escFailed += 1;
+          } else if (outcome === "skipped") {
+            escSuppressed += 1;
+            const cause = typeof stage["cause"] === "string" ? stage["cause"] : "unknown";
+            suppressedCauses.set(cause, (suppressedCauses.get(cause) ?? 0) + 1);
+          }
+        }
+        continue;
+      }
       const tool = payloadOf(obj, "tool_stats");
       if (tool !== undefined && typeof tool["toolName"] === "string") {
         const s = toolStats.get(tool["toolName"]) ?? {
@@ -333,6 +414,14 @@ export function buildAdviceContext(
         stopReasons.set(meta["stopReason"], (stopReasons.get(meta["stopReason"]) ?? 0) + 1);
       }
     }
+    // The join is per session: a rule's turn counts as escalated only when
+    // THAT session's stage lines say so.
+    for (const [turn, ruleId] of ruleByTurn) {
+      const stats = ruleTurns.get(ruleId) ?? { turns: 0, escalated: 0 };
+      stats.turns += 1;
+      if (escalatedTurns.has(turn)) stats.escalated += 1;
+      ruleTurns.set(ruleId, stats);
+    }
   }
 
   const auditKindCounts = new Map<string, number>();
@@ -358,6 +447,15 @@ export function buildAdviceContext(
     totalToolBytes,
     auditKindCounts,
     routingArms,
+    escalations: {
+      started: escStarted,
+      done: escDone,
+      failed: escFailed,
+      suppressed: escSuppressed,
+      suppressedCauses,
+      drafts,
+    },
+    routedTurnsByRule: ruleTurns,
     ...(watchme !== undefined ? { watchme } : {}),
   };
 }
@@ -401,6 +499,21 @@ export type AdviceThresholds = {
   /** Adaptive routing — mean-reward gap below the band best at/above which a
    *  candidate is called consistently losing (demotion advice). */
   poolDemotionGap: number;
+  /** 0.6.0 §9.1 — escalations a harness must have served before the
+   *  precision/recall rules judge the cascade at all. */
+  escalationMinSamples: number;
+  /** 0.6.0 §9.1 — escalations/drafts at or above which the cascade is
+   *  rescuing the cheap arm so often that the ROUTE is the problem. */
+  escalationRateHigh: number;
+  /** 0.6.0 §9.1 — the share of one rule's turns that must escalate before
+   *  that rule is named as the mis-router. */
+  ruleEscalationShare: number;
+  /** 0.6.0 §9.1 — suppressed/(started+suppressed) at or above which the
+   *  cascade is being starved rather than tuned. */
+  escalationSuppressionRate: number;
+  /** 0.6.0 §9.1 — observations both sides of an audition need before it is
+   *  called ready (the shipped `DEFAULT_MIN_EXPERIMENT_N` power floor). */
+  auditionMinN: number;
   /** "Watch me" — sessions a harness must accumulate before an unwatched
    *  spec (no `watchme:` block, no active watch) draws the coverage nudge. */
   watchmeMinSessions: number;
@@ -433,6 +546,11 @@ export const DEFAULT_ADVICE_THRESHOLDS: AdviceThresholds = {
   toolByteMinTotal: 50_000,
   poolMinSamples: 25,
   poolDemotionGap: 0.3,
+  escalationMinSamples: 5,
+  escalationRateHigh: 0.3,
+  ruleEscalationShare: 0.5,
+  escalationSuppressionRate: 0.25,
+  auditionMinN: 30,
   watchmeMinSessions: 10,
   watchmeIntentMinSessions: 3,
   watchmeLowSatisfaction: 0.4,
@@ -1094,7 +1212,9 @@ export const ruleSubAgentSplit: AdviceRule = (ctx, opts) => {
 /** Typed view over the spec's `agent.model_pool`, when present. */
 type SpecModelPoolView = {
   readonly candidates: ReadonlyArray<{ readonly model: string }>;
-  readonly policy: "static" | "heuristic" | "learned";
+  readonly policy: "static" | "heuristic" | "learned" | "classifier";
+  /** 0.6.0 §7.2.2 — the deterministic pre-policy rules, when declared. */
+  readonly rules?: ReadonlyArray<{ readonly id: string; readonly enabled?: boolean }>;
   readonly learning?: {
     readonly minSamplesPerArm?: number;
     readonly costRefUsd?: number;
@@ -1270,6 +1390,255 @@ export const rulePoolStaleExploitation: AdviceRule = (ctx, opts) => {
   ];
 };
 
+// -------- 0.6.0 §9.1 — the four hybrid-routing rules --------
+
+/**
+ * 0.6.0 §9.1 (loop 3) — ESCALATION PRECISION: the cascade is rescuing the
+ * cheap draft so often that the decision to draft was wrong, not the draft.
+ *
+ * The finding is text by default (the fix is usually a `rules[].when` edit or
+ * a classifier label, both human-owned). It becomes a PATCH in exactly one
+ * case: when a single ENABLED rule accounts for most of the escalated turns.
+ * Then the rule itself is the mis-router, and `rules[*].enabled` — the one
+ * whitelisted switch in the whole rules block (§10.3) — turns it off so
+ * `optimize --from-advice` can eval-gate the change. The rule's `when` and
+ * `use` are never touched: a target is identity, a switch is a dial.
+ */
+export const ruleEscalationPrecision: AdviceRule = (ctx, opts) => {
+  const t = resolveThresholds(opts);
+  const esc = ctx.escalations;
+  if (esc.started < t.escalationMinSamples || esc.drafts === 0) return [];
+  const rate = esc.started / esc.drafts;
+  if (rate < t.escalationRateHigh) return [];
+  const spec = opts?.spec;
+  const pool = agentModelPool(spec);
+  const rules = pool?.rules ?? [];
+  // The dominant rule among ESCALATED turns, if any single one dominates.
+  let dominant: { id: string; index: number; turns: number; escalated: number } | undefined;
+  for (const [index, rule] of rules.entries()) {
+    if (rule.enabled === false) continue;
+    const stats = ctx.routedTurnsByRule.get(rule.id);
+    if (stats === undefined || stats.turns === 0) continue;
+    const share = stats.escalated / stats.turns;
+    if (share < t.ruleEscalationShare) continue;
+    if (dominant === undefined || stats.escalated > dominant.escalated) {
+      dominant = { id: rule.id, index, turns: stats.turns, escalated: stats.escalated };
+    }
+  }
+  const evidence = [
+    `${esc.started} escalation(s) across ${esc.drafts} draft(s) — ${pct(rate)} of cheap drafts had to be redone on the strong rung`,
+    `${esc.done} completed, ${esc.failed} failed`,
+  ];
+  if (dominant !== undefined) {
+    evidence.push(
+      `rule \`${dominant.id}\` routed ${dominant.turns} turn(s), ${dominant.escalated} of which escalated (${pct(dominant.escalated / dominant.turns)})`,
+    );
+  }
+  const adviceText =
+    dominant !== undefined
+      ? `The routing rule \`${dominant.id}\` sends work to an arm that then has to be rescued ${pct(dominant.escalated / dominant.turns)} of the time. Every escalation pays for BOTH rungs plus a judge, so a rule this imprecise costs more than routing straight to the strong arm. Disable it (\`enabled: false\`) and let the policy route those turns, or narrow its \`when:\` by hand — the target is human-owned.`
+      : `${pct(rate)} of cheap drafts escalate. A cascade earns its keep when most drafts stand; past that the draft, the judge and the re-run are three costs for one answer. Narrow what reaches the draft rung (a \`rules[].when\` clause, a classifier label, or a stronger \`cascade.draft\` arm).`;
+  const finding: AdviceFinding = {
+    id: dominant !== undefined ? `escalation-precision:${dominant.id}` : "escalation-precision",
+    severity: "warn",
+    summary:
+      dominant !== undefined
+        ? `routing rule ${dominant.id} escalates most of what it routes`
+        : "most cheap drafts escalate — the cascade is paying twice",
+    evidence,
+    counts: {
+      escalations: esc.started,
+      drafts: esc.drafts,
+      ...(dominant !== undefined ? { ruleEscalated: dominant.escalated } : {}),
+    },
+    suggestion:
+      dominant === undefined
+        ? { kind: "advice", text: adviceText }
+        : patchOrAdvice(
+            spec,
+            {
+              target: spec?.target ?? "cli",
+              path: ["agent", "model_pool", "rules", String(dominant.index), "enabled"],
+              op:
+                opts?.specHasPath?.([
+                  "agent",
+                  "model_pool",
+                  "rules",
+                  String(dominant.index),
+                  "enabled",
+                ]) === true
+                  ? "replace"
+                  : "add",
+              value: false,
+              rationale: `advise: rule ${dominant.id} routed ${dominant.turns} turn(s) and ${dominant.escalated} escalated — the rule's own target is the mis-route`,
+            },
+            adviceText,
+          ),
+  };
+  return [finding];
+};
+
+/**
+ * 0.6.0 §9.1 (loop 3) — ESCALATION RECALL: the loop WANTED to escalate and
+ * could not. Every `model_stage{role: "escalation", outcome: "skipped"}` is a
+ * turn whose draft the judge rejected and whose rescue was refused by a cap
+ * (`max_escalations`), by the run budget, or by `budget.judge_share`. Those
+ * turns ship the draft the judge already failed.
+ *
+ * Text-only: the fix is a spend decision (`strategy.max_escalations`,
+ * `budget.usd`, `budget.judge_share`), and two of those three are outside the
+ * whitelist by design. Naming the CAUSE is the whole value — "raise the cap"
+ * and "raise the budget" are different conversations.
+ */
+export const ruleEscalationRecall: AdviceRule = (ctx, opts) => {
+  const t = resolveThresholds(opts);
+  const esc = ctx.escalations;
+  const wanted = esc.started + esc.suppressed;
+  if (esc.suppressed === 0 || wanted < t.escalationMinSamples) return [];
+  const rate = esc.suppressed / wanted;
+  if (rate < t.escalationSuppressionRate) return [];
+  const causes = [...esc.suppressedCauses.entries()].sort((a, b) => b[1] - a[1]);
+  const top = causes[0]?.[0] ?? "unknown";
+  const remedy =
+    top === "max_escalations"
+      ? "`model_pool.strategy.max_escalations` is spent before the turn is right — raise it (it is a whitelisted dial, so `route propose` / `optimize --from-advice` can eval-gate the change)."
+      : top === "judge_share_exhausted"
+        ? "`budget.judge_share` is exhausted, so the cascade serves the strong rung without grading rather than escalating — raise the share or the run budget. Both are human-owned spend decisions."
+        : top === "budget"
+          ? "the run budget is exhausted before the escalation — raise `budget.usd`, or lower what the cheap rung is asked to do. A human-owned spend decision."
+          : `the loop reported \`${top}\` — read the \`model_stage\` lines in \`crewhaus route explain <session>\` for the turn that hit it.`;
+  return [
+    {
+      id: `escalation-recall:${top}`,
+      severity: "warn",
+      summary: `${pct(rate)} of wanted escalations were suppressed (${top})`,
+      evidence: [
+        `${esc.suppressed} suppressed vs ${esc.started} served`,
+        `causes: ${causes.map(([c, n]) => `${c}×${n}`).join(", ")}`,
+        "a suppressed escalation ships the draft the judge already failed — the cost was paid and the quality was not",
+      ],
+      counts: { suppressed: esc.suppressed, served: esc.started },
+      suggestion: {
+        kind: "advice",
+        text: `${esc.suppressed} of ${wanted} wanted escalation(s) never ran. ${remedy}`,
+      },
+    },
+  ];
+};
+
+/**
+ * 0.6.0 §9.1 (loop 2) — AUDITION READY: a `strategy.shadow` arm has cleared
+ * the shipped power floor and its 95% lower bound beats the arm it shadowed.
+ *
+ * Text-only, permanently: the roster is human-owned (§9.3), so the only
+ * sanctioned next step is the PR door — `crewhaus models propose --source
+ * audition`, which refuses below the same floor and writes a review bundle
+ * above it. The rule exists so nobody has to notice the readiness by reading
+ * `arms.jsonl`.
+ */
+export const ruleAuditionReady: AdviceRule = (ctx, opts) => {
+  const t = resolveThresholds(opts);
+  const lanes = ctx.routingArms.filter((a) => a.routeKey.startsWith("shadow:"));
+  if (lanes.length === 0) return [];
+  const byArm = new Map<string, { n: number; rewardSum: number; varSum: number }>();
+  for (const a of lanes) {
+    const acc = byArm.get(a.model) ?? { n: 0, rewardSum: 0, varSum: 0 };
+    acc.n += a.n;
+    acc.rewardSum += a.meanReward * a.n;
+    acc.varSum += a.varReward * a.n;
+    byArm.set(a.model, acc);
+  }
+  const findings: AdviceFinding[] = [];
+  for (const [arm, acc] of [...byArm.entries()].sort((x, y) => x[0].localeCompare(y[0]))) {
+    if (acc.n < t.auditionMinN) continue;
+    const mean = acc.rewardSum / acc.n;
+    const variance = acc.varSum / acc.n;
+    const lower = mean - 1.96 * Math.sqrt(Math.max(variance, 0) / acc.n);
+    // The incumbent is the same arm id in the LIVE bands (the lane strips to
+    // the band it audited); an arm with no live history is a pure newcomer,
+    // which is exactly the case worth proposing.
+    const live = ctx.routingArms.filter(
+      (a) => !a.routeKey.startsWith("shadow:") && !a.routeKey.startsWith("q:"),
+    );
+    const liveN = live.reduce((n, a) => n + a.n, 0);
+    const liveMean = liveN > 0 ? live.reduce((r, a) => r + a.meanReward * a.n, 0) / liveN : 0;
+    if (lower <= liveMean) continue;
+    findings.push({
+      id: `audition-ready:${arm}`,
+      severity: "info",
+      summary: `shadow arm ${arm} has cleared the power floor and beats the live arms`,
+      evidence: [
+        `${acc.n} shadow-lane observation(s) (floor ${t.auditionMinN})`,
+        `95% lower bound ${lower.toFixed(4)} vs the live arms' mean reward ${liveMean.toFixed(4)} over ${liveN} observation(s)`,
+        "the lane is observe-only: nothing this arm did has steered a live decision",
+      ],
+      counts: { auditionN: acc.n, liveN },
+      suggestion: {
+        kind: "advice",
+        text: `\`crewhaus models propose --source audition\` turns this into a roster PR (it re-checks the same floor and writes the review bundle). The candidate roster is never patched automatically — §9.3 keeps it behind the PR door. \`crewhaus route promote --gate\` is the separate, eval-gated step that folds the lane's evidence into the live arms.`,
+      },
+    });
+  }
+  return findings;
+};
+
+/**
+ * 0.6.0 §9.1 (loop 1) — POLICY FLIP READY: the pool is not `learned`, every
+ * candidate has cleared its sample floor in some band, AND that band's leader
+ * is SEPARATED from its runner-up (95% lower bound above the runner-up's
+ * mean).
+ *
+ * The weaker, coverage-only version of this signal already ships as
+ * `pool-policy-upgrade`, which emits the `policy` patch. This rule is the
+ * stronger one and is text-only on purpose: it says the flip is not merely
+ * allowed but PROVABLE, and points at the two verbs that prove it —
+ * `route propose` (which emits the same patch from the same evidence plus
+ * separation) and `optimize --from-advice` (which eval-gates it). Firing both
+ * is intended: one says "you may", this one says "and it will hold up".
+ */
+export const rulePolicyFlipReady: AdviceRule = (ctx, opts) => {
+  const t = resolveThresholds(opts);
+  const spec = opts?.spec;
+  const pool = agentModelPool(spec);
+  if (pool === undefined || pool.policy === "learned") return [];
+  if (pool.candidates.length < 2) return [];
+  const live = ctx.routingArms.filter(
+    (a) => !a.routeKey.startsWith("shadow:") && !a.routeKey.startsWith("q:"),
+  );
+  if (live.length === 0) return [];
+  const floor = pool.learning?.minSamplesPerArm ?? t.poolMinSamples;
+  const covered = bandsWithFullCoverage(live, pool.candidates, floor);
+  const separated: Array<{ band: string; leader: string; margin: number }> = [];
+  for (const band of covered) {
+    const inBand = live.filter((a) => a.routeKey === band && a.n > 0);
+    if (inBand.length < 2) continue;
+    const sorted = [...inBand].sort((x, y) => y.meanReward - x.meanReward);
+    const leader = sorted[0] as (typeof sorted)[number];
+    const runnerUp = sorted[1] as (typeof sorted)[number];
+    const lower = leader.meanReward - 1.96 * Math.sqrt(Math.max(leader.varReward, 0) / leader.n);
+    if (lower > runnerUp.meanReward) {
+      separated.push({ band, leader: leader.model, margin: lower - runnerUp.meanReward });
+    }
+  }
+  if (separated.length === 0) return [];
+  return [
+    {
+      id: "policy-flip-ready",
+      severity: "info",
+      summary: "the scoreboard separates a winner — the learned flip is provable, not just allowed",
+      evidence: separated.map(
+        (x) =>
+          `${x.band}: ${x.leader} clears the runner-up by ${x.margin.toFixed(4)} reward at the 95% lower bound`,
+      ),
+      counts: { separatedBands: separated.length, arms: live.length },
+      suggestion: {
+        kind: "advice",
+        text: "Run `crewhaus route propose` — it emits the `model_pool.policy: learned` patch from this same evidence — then eval-gate it with `crewhaus optimize <spec> --from-advice <suggestions.json> --routing as-declared --warm-arms`. The routed eval reads a FROZEN arm snapshot, so the before/after comparison is one instrument; `gateRuns` refuses it otherwise.",
+      },
+    },
+  ];
+};
+
 // -------- "watch me" coverage + low-satisfaction (text-only by design) --------
 
 /**
@@ -1362,6 +1731,10 @@ export const ADVICE_RULES: ReadonlyArray<AdviceRule> = [
   rulePoolPolicyUpgrade,
   rulePoolCandidateDemotion,
   rulePoolStaleExploitation,
+  ruleEscalationPrecision,
+  ruleEscalationRecall,
+  ruleAuditionReady,
+  rulePolicyFlipReady,
   ruleWatchmeCoverage,
 ];
 

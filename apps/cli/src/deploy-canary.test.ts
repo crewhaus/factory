@@ -19,11 +19,15 @@ import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
 import { createFileBackedRegistry } from "@crewhaus/spec-registry";
 import {
   CanaryRampError,
+  FLOOR_BLOCKED_REASON,
+  compareRoutingProfiles,
   driveCanaryRamp,
   experimentOutcomesFromEvalRun,
   makeCanaryEvalGate,
+  makeRoutingAwareCanaryGate,
   makeTrafficSplitRecorder,
   parseTrafficSteps,
+  routingProfileOf,
 } from "./deploy-canary";
 
 let tmpRoot = "";
@@ -642,5 +646,183 @@ describe("driveCanaryRamp — traffic-split assignment lifecycle (E50)", () => {
     });
     expect(result.promoted).toBe(true);
     expect(seen).toEqual([50, 100]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §9.1 (loop 6) — the routing-aware canary gate.
+// ---------------------------------------------------------------------------
+
+/** A graded sample carrying the routing facts a routed eval persists. */
+function routedSample(
+  id: string,
+  passed: boolean,
+  opts: {
+    readonly escalated?: boolean;
+    readonly outputTokens?: number;
+    readonly floorBlocked?: boolean;
+  } = {},
+): SampleResult {
+  const base = sample(id, passed, passed ? 1 : 0);
+  return {
+    ...base,
+    servedModels: [
+      {
+        wire: "claude-haiku-4-5",
+        role: "primary",
+        calls: 1,
+        tokens: { input: 100, output: opts.outputTokens ?? 100 },
+      },
+      ...(opts.escalated === true
+        ? [
+            {
+              wire: "claude-opus-5",
+              role: "escalation" as const,
+              stage: "escalate",
+              calls: 1,
+              tokens: { input: 100, output: 200 },
+            },
+          ]
+        : []),
+    ],
+    routes: [
+      {
+        routeKey: "hard",
+        arm: "fast",
+        model: "claude-haiku-4-5",
+        policy: "learned",
+        reason: opts.floorBlocked === true ? FLOOR_BLOCKED_REASON : "exploit",
+      },
+    ],
+  };
+}
+
+/** A flat $1-per-1k-output-token pricer, so the arithmetic is readable. */
+const flatPricer = (_model: string, tokens: { input: number; output: number }): number =>
+  tokens.output / 1000;
+
+describe("routingProfileOf", () => {
+  test("counts escalated SAMPLES, projects cost per TURN, and reads the floor reason", () => {
+    const run = summary([
+      routedSample("a", true, { escalated: true }),
+      routedSample("b", true),
+      routedSample("c", true, { floorBlocked: true }),
+      routedSample("d", true),
+    ]);
+    const profile = routingProfileOf(run, flatPricer);
+    expect(profile.escalationRate).toBeCloseTo(0.25, 5);
+    expect(profile.decisions).toBe(4);
+    expect(profile.floorBlockedRate).toBeCloseTo(0.25, 5);
+    expect(profile.turns).toBe(4);
+    // 4 primaries at 100 output tokens + one escalation at 200 = 600 / 1000
+    // over four turns.
+    expect(profile.costPerTurnUsd).toBeCloseTo(0.6 / 4, 6);
+  });
+
+  test("an unrouted run projects a vacuous profile rather than NaN", () => {
+    const profile = routingProfileOf(summary([sample("a", true, 1)]), flatPricer);
+    expect(profile.decisions).toBe(0);
+    expect(profile.escalationRate).toBe(0);
+    expect(profile.costPerTurnUsd).toBe(0);
+    expect(Number.isNaN(profile.floorBlockedRate)).toBe(false);
+  });
+});
+
+describe("compareRoutingProfiles", () => {
+  const flat = {
+    escalationRate: 0.1,
+    costPerTurnUsd: 0.01,
+    floorBlockedRate: 0.05,
+    decisions: 100,
+    turns: 100,
+  };
+
+  test("holds when nothing moved", () => {
+    expect(compareRoutingProfiles(flat, flat)).toBeUndefined();
+  });
+
+  test("fails on an escalation-rate rise past the threshold", () => {
+    const reason = compareRoutingProfiles(flat, { ...flat, escalationRate: 0.3 });
+    expect(reason).toContain("escalation rate rose");
+  });
+
+  test("fails on a cost-per-turn rise past the threshold", () => {
+    const reason = compareRoutingProfiles(flat, { ...flat, costPerTurnUsd: 0.02 });
+    expect(reason).toContain("cost per turn rose");
+  });
+
+  test("fails on a floor-block rise — the arms the policy wants are measurably worse", () => {
+    const reason = compareRoutingProfiles(flat, { ...flat, floorBlockedRate: 0.4 });
+    expect(reason).toContain("quality-floor blocks rose");
+  });
+
+  test("fails CLOSED when the baseline is unpriced but the candidate is not", () => {
+    const reason = compareRoutingProfiles(
+      { ...flat, costPerTurnUsd: 0 },
+      { ...flat, costPerTurnUsd: 0.05 },
+    );
+    expect(reason).toContain("not trustworthy");
+  });
+
+  test("an improvement never fails", () => {
+    expect(
+      compareRoutingProfiles(flat, {
+        ...flat,
+        escalationRate: 0,
+        costPerTurnUsd: 0.005,
+        floorBlockedRate: 0,
+      }),
+    ).toBeUndefined();
+  });
+});
+
+describe("makeRoutingAwareCanaryGate", () => {
+  const clean = summary([routedSample("a", true), routedSample("b", true)]);
+
+  test("passes when both the regression gate and the routing deltas hold", async () => {
+    const gate = makeRoutingAwareCanaryGate({
+      evalVersion: async () => clean,
+      priceUsd: flatPricer,
+    });
+    expect(await gate({ fromVersion: "v1", toVersion: "v2" })).toEqual({ verdict: "pass" });
+  });
+
+  test("fails on a routing regression the pass-rate gate cannot see", async () => {
+    // Identical pass rate and latency; only the escalation rate moved.
+    const noisy = summary([
+      routedSample("a", true, { escalated: true }),
+      routedSample("b", true, { escalated: true }),
+    ]);
+    const gate = makeRoutingAwareCanaryGate({
+      evalVersion: async (v) => (v === "v1" ? clean : noisy),
+      priceUsd: flatPricer,
+    });
+    const verdict = await gate({ fromVersion: "v1", toVersion: "v2" });
+    expect(verdict.verdict).toBe("fail");
+    expect(verdict.reason).toContain("routing regression");
+    expect(verdict.reason).toContain("escalation rate rose");
+  });
+
+  test("the ordinary regression gate still runs FIRST — it can only refuse, never grant", async () => {
+    const broken = summary([routedSample("a", false), routedSample("b", false)]);
+    const gate = makeRoutingAwareCanaryGate({
+      evalVersion: async (v) => (v === "v1" ? clean : broken),
+      priceUsd: flatPricer,
+    });
+    const verdict = await gate({ fromVersion: "v1", toVersion: "v2" });
+    expect(verdict.verdict).toBe("fail");
+    expect(verdict.reason).not.toContain("routing regression");
+  });
+
+  test("says so when neither run recorded a routing decision", async () => {
+    const unrouted = summary([sample("a", true, 1)]);
+    const lines: string[] = [];
+    const gate = makeRoutingAwareCanaryGate({
+      evalVersion: async () => unrouted,
+      priceUsd: flatPricer,
+      write: (l) => lines.push(l),
+    });
+    expect(await gate({ fromVersion: "v1", toVersion: "v2" })).toEqual({ verdict: "pass" });
+    expect(lines.join("\n")).toContain("--routing as-declared");
   });
 });

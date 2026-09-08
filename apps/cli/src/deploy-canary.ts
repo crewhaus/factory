@@ -351,3 +351,171 @@ export async function driveCanaryRamp(opts: {
   opts.recorder?.finish("promoted");
   return { promoted: true, steps: results };
 }
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §9.1 (loop 6) — the routing-aware canary gate
+// ---------------------------------------------------------------------------
+
+/**
+ * The routing shape of one version's eval run: the four facts a ROUTING
+ * change moves that a pass-rate/p95 gate cannot see.
+ *
+ * Derived entirely from what a routed eval already persists —
+ * `SampleResult.servedModels` (per role and stage) and `SampleResult.routes`
+ * — so nothing new has to be recorded for the gate to work.
+ */
+export type RoutingProfile = {
+  /** Samples that served at least one escalation-role call, over graded samples. */
+  readonly escalationRate: number;
+  /** Projected USD per TURN across every model that actually served. */
+  readonly costPerTurnUsd: number;
+  /** Share of routing decisions the quality floor blocked (`"floor-blocked"`). */
+  readonly floorBlockedRate: number;
+  /** Routing decisions observed (the denominator for `floorBlockedRate`). */
+  readonly decisions: number;
+  /** Turns observed (the denominator for `costPerTurnUsd`). */
+  readonly turns: number;
+};
+
+/** The reason string `model-router` stamps when the quality floor blocks a pick. */
+export const FLOOR_BLOCKED_REASON = "floor-blocked";
+
+/**
+ * Project one run's routing profile. `priceUsd` is injected (the CLI passes
+ * the installed pricing table's projection) so this stays pure and a missing
+ * pricing row contributes 0 rather than NaN — an unpriced model must never
+ * make a cost comparison silently pass.
+ */
+export function routingProfileOf(
+  summary: EvalRunSummary,
+  priceUsd: (model: string, tokens: { input: number; output: number }) => number | undefined,
+): RoutingProfile {
+  let escalated = 0;
+  let graded = 0;
+  let turns = 0;
+  let costUsd = 0;
+  let decisions = 0;
+  let floorBlocked = 0;
+  for (const sample of summary.samples) {
+    if (sampleAbstained(sample) || sampleIsCanary(sample)) continue;
+    graded += 1;
+    turns += sample.turns;
+    const served = sample.servedModels ?? [];
+    if (served.some((m) => m.role === "escalation" || m.stage === "escalate")) escalated += 1;
+    for (const m of served) costUsd += priceUsd(m.specModel ?? m.wire, m.tokens) ?? 0;
+    for (const r of sample.routes ?? []) {
+      decisions += 1;
+      if (r.reason === FLOOR_BLOCKED_REASON) floorBlocked += 1;
+    }
+  }
+  return {
+    escalationRate: graded > 0 ? escalated / graded : 0,
+    costPerTurnUsd: turns > 0 ? costUsd / turns : 0,
+    floorBlockedRate: decisions > 0 ? floorBlocked / decisions : 0,
+    decisions,
+    turns,
+  };
+}
+
+/** How far a routing profile may move before the canary rolls back. */
+export type RoutingGateThresholds = {
+  /** Absolute rise in escalation rate that fails. Default +0.10 (10 points). */
+  readonly escalationRateRise?: number;
+  /** Fractional rise in cost per turn that fails. Default +0.25 (25%). */
+  readonly costPerTurnRise?: number;
+  /** Absolute rise in floor-blocked rate that fails. Default +0.10. */
+  readonly floorBlockedRise?: number;
+};
+
+export const DEFAULT_ROUTING_GATE: Required<RoutingGateThresholds> = Object.freeze({
+  escalationRateRise: 0.1,
+  costPerTurnRise: 0.25,
+  floorBlockedRise: 0.1,
+});
+
+/** Why a routing comparison failed, or `undefined` when it held. */
+export function compareRoutingProfiles(
+  baseline: RoutingProfile,
+  candidate: RoutingProfile,
+  thresholds: RoutingGateThresholds = {},
+): string | undefined {
+  const t = { ...DEFAULT_ROUTING_GATE, ...thresholds };
+  const escDelta = candidate.escalationRate - baseline.escalationRate;
+  if (escDelta > t.escalationRateRise) {
+    return `escalation rate rose ${(escDelta * 100).toFixed(1)} points (${(baseline.escalationRate * 100).toFixed(1)}% → ${(candidate.escalationRate * 100).toFixed(1)}%, limit +${(t.escalationRateRise * 100).toFixed(1)}) — the candidate's cheap rung is being rescued more often, which costs both rungs plus a judge`;
+  }
+  if (baseline.costPerTurnUsd > 0) {
+    const ratio = candidate.costPerTurnUsd / baseline.costPerTurnUsd - 1;
+    if (ratio > t.costPerTurnRise) {
+      return `cost per turn rose ${(ratio * 100).toFixed(1)}% ($${baseline.costPerTurnUsd.toFixed(5)} → $${candidate.costPerTurnUsd.toFixed(5)}, limit +${(t.costPerTurnRise * 100).toFixed(0)}%)`;
+    }
+  } else if (candidate.costPerTurnUsd > 0) {
+    return `cost per turn rose from an unpriced baseline to $${candidate.costPerTurnUsd.toFixed(5)} — the comparison is not trustworthy, so the gate fails closed (add pricing rows with \`crewhaus models audit\`)`;
+  }
+  const floorDelta = candidate.floorBlockedRate - baseline.floorBlockedRate;
+  if (floorDelta > t.floorBlockedRise) {
+    return `quality-floor blocks rose ${(floorDelta * 100).toFixed(1)} points (${(baseline.floorBlockedRate * 100).toFixed(1)}% → ${(candidate.floorBlockedRate * 100).toFixed(1)}%) — the learned policy is being held back by the floor more often, which means the arms it wants to exploit are measurably worse`;
+  }
+  return undefined;
+}
+
+/**
+ * 0.6.0 §9.1 (loop 6) — `deploy canary --routing-gate`: the ROUTING-AWARE
+ * evaluator, injected through the same {@link RegressionGate} seam
+ * `makeCanaryEvalGate` uses.
+ *
+ * It runs the ordinary regression gate FIRST (pass rate + p95 latency), then
+ * adds the three deltas a routing change moves and a pass-rate gate cannot
+ * see: escalation rate, cost per turn, and how often the quality floor
+ * blocked the learned policy. A rise past any threshold is a `fail`, which
+ * the controller turns into an automatic rollback.
+ *
+ * Nothing about the approval quorum changes: `canary-controller` re-pins on
+ * this verdict exactly as before, and a protected environment still requires
+ * its quorum through the approval gate. This gate can only ever REFUSE a
+ * promotion — it never grants one that the ordinary gate refused.
+ */
+export function makeRoutingAwareCanaryGate(opts: {
+  readonly evalVersion: (version: string) => Promise<EvalRunSummary>;
+  readonly priceUsd: (
+    model: string,
+    tokens: { input: number; output: number },
+  ) => number | undefined;
+  readonly thresholds?: GateThresholds;
+  readonly routingThresholds?: RoutingGateThresholds;
+  readonly write?: (line: string) => void;
+}): RegressionGate {
+  const write = opts.write ?? (() => {});
+  return async ({ fromVersion, toVersion }) => {
+    write(`[canary] evaluating baseline ${fromVersion} and candidate ${toVersion} (routing-aware)`);
+    const baseline = await opts.evalVersion(fromVersion);
+    const candidate = await opts.evalVersion(toVersion);
+    const verdict = gate(baseline, candidate, opts.thresholds ?? {});
+    const before = routingProfileOf(baseline, opts.priceUsd);
+    const after = routingProfileOf(candidate, opts.priceUsd);
+    write(
+      `[canary]   baseline pass_rate=${(baseline.aggregates.passRate * 100).toFixed(1)}% ` +
+        `p95=${baseline.aggregates.p95LatencyMs}ms escalation=${(before.escalationRate * 100).toFixed(1)}% ` +
+        `$${before.costPerTurnUsd.toFixed(5)}/turn floor_blocked=${(before.floorBlockedRate * 100).toFixed(1)}%`,
+    );
+    write(
+      `[canary]   candidate pass_rate=${(candidate.aggregates.passRate * 100).toFixed(1)}% ` +
+        `p95=${candidate.aggregates.p95LatencyMs}ms escalation=${(after.escalationRate * 100).toFixed(1)}% ` +
+        `$${after.costPerTurnUsd.toFixed(5)}/turn floor_blocked=${(after.floorBlockedRate * 100).toFixed(1)}%`,
+    );
+    if (verdict.verdict === "fail") {
+      return { verdict: "fail", reason: verdict.reason ?? "regression gate failed" };
+    }
+    if (before.decisions === 0 && after.decisions === 0) {
+      write(
+        "[canary]   neither run recorded a routing decision — the routing deltas are vacuous; " +
+          "run the eval with `--routing as-declared` for the routing gate to mean anything",
+      );
+    }
+    const routingFailure = compareRoutingProfiles(before, after, opts.routingThresholds);
+    if (routingFailure !== undefined) {
+      return { verdict: "fail", reason: `routing regression: ${routingFailure}` };
+    }
+    return { verdict: "pass" };
+  };
+}

@@ -242,3 +242,121 @@ export function buildScriptedSpec(answers: ScriptedAnswers): { yaml: string; spe
   const spec = parseSpec(yaml);
   return { yaml, spec };
 }
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §9.2 — `crewhaus init --hybrid`
+// ---------------------------------------------------------------------------
+
+/**
+ * 0.6.0 §9.2 — the fast/strong pair `init --hybrid` writes into the registry.
+ *
+ * Both members come from ONE provider on purpose. A hybrid setup that spans
+ * providers needs a second credential and ships transcript content to a
+ * second vendor; that is a decision a person makes, not a default a scaffold
+ * takes. The scaffold's job is to make the shape obvious, not to be clever.
+ */
+export type HybridPair = {
+  readonly fast: string;
+  readonly strong: string;
+};
+
+export type HybridScaffoldAnswers = ScriptedAnswers & {
+  /** The pair the registry declares. */
+  readonly pair: HybridPair;
+};
+
+/**
+ * The three-line registry plus the cascade, WITH the comments that explain
+ * each line. The comments are the deliverable as much as the keys are: a
+ * spec whose reader cannot say what `escalate_to` does is a spec nobody will
+ * dare change.
+ *
+ * `cheap drafts → a stronger checker grades → the strong model redoes it on
+ * failure` is §1's motivating scenario, so the scaffold writes exactly that
+ * and nothing more: no learned policy (there is no scoreboard yet), no
+ * shadow lane (there is nothing to audition against), no rules (there is no
+ * traffic to write one from).
+ */
+export function renderHybridBlocks(pair: HybridPair): string {
+  return `# The model registry: per-model settings declared ONCE and referenced as
+# \`$name\` from any model slot. Slot-local keys override a profile field by
+# field; \`tags\` are the routing identity, so keep them meaningful.
+models:
+  fast:
+    model: ${yamlScalar(pair.fast)}
+    tags: [cheap]
+  strong:
+    model: ${yamlScalar(pair.strong)}
+    tags: [strong]
+
+`;
+}
+
+/** The `agent:` body `--hybrid` writes: a pool plus the cascade. */
+export function renderHybridAgentBody(instructions: string, indent = "  "): string {
+  return `${indent}model: $fast
+${yamlBlock("instructions", instructions, indent)}
+${indent}model_pool:
+${indent}  # The roster. Every arm is a \`models:\` profile, so the scoreboard
+${indent}  # records under the PROFILE name and survives a model-id change.
+${indent}  candidates:
+${indent}    - { model: $fast,   tags: [cheap] }
+${indent}    - { model: $strong, tags: [strong] }
+${indent}  # \`heuristic\` routes on deterministic per-turn signals. Move to
+${indent}  # \`learned\` once every arm has samples — \`crewhaus route propose\`
+${indent}  # tells you when, and eval-gates the flip.
+${indent}  policy: heuristic
+${indent}  strategy:
+${indent}    # The cascade: the cheap arm DRAFTS, the judge below grades it,
+${indent}    # and a failing grade re-runs the turn on the strong arm.
+${indent}    cascade: { draft: cheap, escalate_to: strong, clean_prompt: true }
+${indent}    max_escalations: 1
+# The judge that grades each draft. \`on_fail: escalate\` is what turns the
+# grade into the cascade's trigger; \`strongest\` resolves to the strong arm.
+evaluation:
+  grader: { type: llm_judge, criteria: "Does the answer fully and correctly address the user's request?", model: strongest }
+  threshold: 0.7
+  on_fail: escalate
+`;
+}
+
+/**
+ * Build a hybrid `target: cli` spec: the registry, a two-arm pool, the
+ * cascade, and the judge that drives it. Validated through `parseSpec` like
+ * every other scaffold, so `init --hybrid` cannot emit a spec that will not
+ * compile.
+ */
+export function buildHybridSpec(answers: HybridScaffoldAnswers): { yaml: string; spec: Spec } {
+  const toolsBlock =
+    answers.tools && answers.tools.length > 0
+      ? `tools:\n${answers.tools.map((t) => `  - ${yamlScalar(t)}`).join("\n")}\n`
+      : "";
+  const yaml = [
+    `name: ${yamlScalar(answers.name)}`,
+    "target: cli",
+    "",
+    renderHybridBlocks(answers.pair).trimEnd(),
+    "",
+    "agent:",
+    renderHybridAgentBody(answers.instructions).trimEnd(),
+    toolsBlock.trimEnd(),
+    "",
+  ]
+    .filter((l) => l !== "")
+    .join("\n");
+  const spec = parseSpec(yaml);
+  return { yaml, spec };
+}
+
+/**
+ * The ONE question `init --interactive` asks about hybrid setups (§9.2).
+ * One, deliberately: the answer that matters is "do you want a cheap worker
+ * with a strong checker", and everything else follows from the pricing table.
+ */
+export const HYBRID_INTERVIEW_QUESTION =
+  "run cheap drafts with a stronger model checking them (a hybrid cascade)? [y/N]: ";
+
+/** Is a free-text answer to {@link HYBRID_INTERVIEW_QUESTION} a yes? */
+export function isHybridYes(answer: string): boolean {
+  return /^\s*(y|yes)\s*$/i.test(answer);
+}

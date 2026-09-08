@@ -1,11 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { lower } from "@crewhaus/compiler";
 import { parseSpec } from "@crewhaus/spec";
 import {
   ASK_USER_TOOL,
   EMIT_SPEC_TOOL,
+  HYBRID_INTERVIEW_QUESTION,
   SHAPE_GUIDANCE,
+  buildHybridSpec,
   buildInterviewSystemPrompt,
   buildScriptedSpec,
+  isHybridYes,
   isScriptedShape,
 } from "./init-interactive";
 
@@ -140,5 +144,83 @@ describe("buildScriptedSpec — every draft is parseSpec-validated", () => {
         instructions: "hi",
       }),
     ).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §9.2 — `init --hybrid` and the ONE interview question.
+// ---------------------------------------------------------------------------
+
+describe("buildHybridSpec", () => {
+  const pair = { fast: "claude-haiku-4-5", strong: "claude-opus-5" };
+  const built = buildHybridSpec({
+    name: "support",
+    shape: "cli",
+    model: pair.fast,
+    instructions: "Answer support questions.",
+    pair,
+  });
+
+  test("the scaffolded hybrid spec COMPILES — the whole point of a scaffold", () => {
+    const ir = lower(built.spec);
+    expect(ir.target).toBe("cli");
+    // The registry lowered, so `$fast` resolved rather than reaching runtime.
+    const models = (ir as { models?: Record<string, { model: string }> }).models;
+    expect(models?.["fast"]?.model).toBe("claude-haiku-4-5");
+    expect(models?.["strong"]?.model).toBe("claude-opus-5");
+    expect((ir as { agent: { model: string } }).agent.model).toBe("claude-haiku-4-5");
+  });
+
+  test("writes §1's motivating topology: cheap drafts, a strong checker, escalate on failure", () => {
+    const ir = lower(built.spec) as {
+      agent: { modelPool?: { candidates: ReadonlyArray<{ model: string }>; strategy?: unknown } };
+      evaluation?: { onFail: string };
+    };
+    expect(ir.agent.modelPool?.candidates.map((c) => c.model)).toEqual([
+      "claude-haiku-4-5",
+      "claude-opus-5",
+    ]);
+    expect(ir.agent.modelPool?.strategy).toMatchObject({
+      cascade: { draft: "cheap", escalateTo: "strong" },
+    });
+    expect(ir.evaluation?.onFail).toBe("escalate");
+  });
+
+  test("every block it writes carries the comment that explains it", () => {
+    expect(built.yaml).toContain("# The model registry");
+    expect(built.yaml).toContain("# The roster.");
+    expect(built.yaml).toContain("# The cascade:");
+    expect(built.yaml).toContain("# The judge that grades each draft.");
+    expect(built.yaml).toContain("crewhaus route propose");
+  });
+
+  test("the pair stays within ONE provider — a cross-provider default is not the scaffold's call", () => {
+    expect(built.yaml).not.toContain("openai/");
+    expect(built.yaml).not.toContain("gemini/");
+  });
+
+  test("tools ride along when the interview collected any", () => {
+    const withTools = buildHybridSpec({
+      name: "support",
+      shape: "cli",
+      model: pair.fast,
+      instructions: "Answer support questions.",
+      tools: ["read", "grep"],
+      pair,
+    });
+    expect(withTools.yaml).toContain("tools:");
+    expect(() => lower(withTools.spec)).not.toThrow();
+  });
+});
+
+describe("the hybrid interview question", () => {
+  test("is exactly one question, and reads as a yes/no", () => {
+    expect(HYBRID_INTERVIEW_QUESTION).toContain("[y/N]");
+    expect(HYBRID_INTERVIEW_QUESTION.split("?").length).toBe(2);
+  });
+
+  test("only an explicit yes counts — the default is the single-model spec", () => {
+    for (const yes of ["y", "Y", "yes", " YES "]) expect(isHybridYes(yes)).toBe(true);
+    for (const no of ["", "n", "no", "maybe", "yep"]) expect(isHybridYes(no)).toBe(false);
   });
 });

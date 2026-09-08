@@ -18,10 +18,14 @@ import {
   loopSignatureOf,
   parseJsonlObjects,
   renderAdviceHtml,
+  ruleAuditionReady,
   ruleCompactionThrash,
+  ruleEscalationPrecision,
+  ruleEscalationRecall,
   ruleFailureTaxonomy,
   ruleLoopBreak,
   rulePermissionChurn,
+  rulePolicyFlipReady,
   rulePoolCandidateDemotion,
   rulePoolPolicyUpgrade,
   rulePoolStaleExploitation,
@@ -1168,5 +1172,258 @@ describe("ruleWatchmeCoverage", () => {
   it("is appended to ADVICE_RULES and ranks through runAdviceRules", () => {
     const findings = runAdviceRules(buildAdviceContext(emptySessions(10)), { spec: CLI_SPEC });
     expect(findings.map((f) => f.id)).toEqual(["watchme-coverage"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §9.1 — the four hybrid-routing rules.
+// ---------------------------------------------------------------------------
+
+/** A `model_stage` line as `attachRoutingPersistence` writes it. */
+function stageLine(
+  stage: string,
+  role: string,
+  outcome: string,
+  extra: Record<string, unknown> = {},
+): unknown {
+  return line("model_stage", { strategy: "cascade", stage, role, model: "m", outcome, ...extra });
+}
+
+/** A `model_route` line carrying the rule that forced the decision. */
+function routeLine(turnNumber: number, ruleId?: string): unknown {
+  return line("model_route", {
+    turnNumber,
+    routeKey: "hard",
+    model: "claude-haiku-4-5",
+    policy: ruleId !== undefined ? "rule" : "heuristic",
+    reason: "signals",
+    ...(ruleId !== undefined ? { ruleId } : {}),
+  });
+}
+
+const RULED_SPEC = parseSpec(
+  [
+    "name: pooled",
+    "target: cli",
+    "agent:",
+    "  model: claude-sonnet-4-6",
+    "  instructions: help",
+    "  model_pool:",
+    "    candidates:",
+    "      - { model: claude-haiku-4-5, tags: [cheap] }",
+    "      - { model: claude-opus-4-1, tags: [strong] }",
+    "    rules:",
+    '      - { id: code-goes-cheap, when: { message_matches: "code" }, use: cheap }',
+  ].join("\n"),
+);
+
+describe("buildAdviceContext — hybrid aggregates", () => {
+  it("folds escalation stages and joins routing rules to the turns that escalated", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [
+        routeLine(1, "code-goes-cheap"),
+        stageLine("draft", "draft", "started", { turnNumber: 1 }),
+        stageLine("escalate", "escalation", "started", { turnNumber: 1 }),
+        stageLine("escalate", "escalation", "done", { turnNumber: 1 }),
+        routeLine(2, "code-goes-cheap"),
+        stageLine("draft", "draft", "started", { turnNumber: 2 }),
+        stageLine("escalate", "escalation", "skipped", {
+          turnNumber: 2,
+          cause: "max_escalations",
+        }),
+      ]),
+    ]);
+    expect(ctx.escalations.started).toBe(1);
+    expect(ctx.escalations.done).toBe(1);
+    expect(ctx.escalations.drafts).toBe(2);
+    expect(ctx.escalations.suppressed).toBe(1);
+    expect(ctx.escalations.suppressedCauses.get("max_escalations")).toBe(1);
+    expect(ctx.routedTurnsByRule.get("code-goes-cheap")).toEqual({ turns: 2, escalated: 1 });
+  });
+
+  it("is empty on a harness that never ran a cascade (old-vintage logs included)", () => {
+    const ctx = buildAdviceContext([session(SESSION_A, OLD_VINTAGE)]);
+    expect(ctx.escalations.started).toBe(0);
+    expect(ctx.routedTurnsByRule.size).toBe(0);
+  });
+});
+
+describe("ruleEscalationPrecision", () => {
+  /** 8 drafts, 6 escalations, all routed by one rule. */
+  function noisyCascade(): SessionEvents[] {
+    const lines: unknown[] = [];
+    for (let turn = 1; turn <= 8; turn++) {
+      lines.push(routeLine(turn, "code-goes-cheap"));
+      lines.push(stageLine("draft", "draft", "started", { turnNumber: turn }));
+      if (turn <= 6) {
+        lines.push(stageLine("escalate", "escalation", "started", { turnNumber: turn }));
+        lines.push(stageLine("escalate", "escalation", "done", { turnNumber: turn }));
+      }
+    }
+    return [session(SESSION_A, lines)];
+  }
+
+  it("names the dominant rule and proposes rules[i].enabled: false — the ONE whitelisted switch", () => {
+    const ctx = buildAdviceContext(noisyCascade());
+    const findings = ruleEscalationPrecision(ctx, { spec: RULED_SPEC });
+    expect(findings).toHaveLength(1);
+    const f = findings[0] as AdviceFinding;
+    expect(f.id).toBe("escalation-precision:code-goes-cheap");
+    expect(f.severity).toBe("warn");
+    expect(f.suggestion.kind).toBe("spec-patch");
+    if (f.suggestion.kind !== "spec-patch") throw new Error("expected a patch");
+    expect(f.suggestion.patch.path).toEqual(["agent", "model_pool", "rules", "0", "enabled"]);
+    expect(f.suggestion.patch.value).toBe(false);
+    // The safety floor: the patch was pre-validated against the whitelist.
+    expect(() => validatePatch(RULED_SPEC, f.suggestion.patch)).not.toThrow();
+  });
+
+  it("stays ADVICE when no single rule dominates the escalated turns", () => {
+    const ctx = buildAdviceContext(noisyCascade());
+    const findings = ruleEscalationPrecision(ctx, { spec: POOL_SPEC });
+    expect(findings[0]?.id).toBe("escalation-precision");
+    expect(findings[0]?.suggestion.kind).toBe("advice");
+  });
+
+  it("stays silent below the sample floor and below the rate threshold", () => {
+    const few = buildAdviceContext([
+      session(SESSION_A, [
+        stageLine("draft", "draft", "started", { turnNumber: 1 }),
+        stageLine("escalate", "escalation", "started", { turnNumber: 1 }),
+      ]),
+    ]);
+    expect(ruleEscalationPrecision(few, { spec: RULED_SPEC })).toEqual([]);
+
+    const lines: unknown[] = [];
+    for (let turn = 1; turn <= 100; turn++) {
+      lines.push(stageLine("draft", "draft", "started", { turnNumber: turn }));
+      if (turn <= 5)
+        lines.push(stageLine("escalate", "escalation", "started", { turnNumber: turn }));
+    }
+    const healthy = buildAdviceContext([session(SESSION_A, lines)]);
+    expect(ruleEscalationPrecision(healthy, { spec: RULED_SPEC })).toEqual([]);
+  });
+});
+
+describe("ruleEscalationRecall", () => {
+  it("names the CAUSE that suppressed the escalations, and stays advice-only", () => {
+    const lines: unknown[] = [];
+    for (let turn = 1; turn <= 10; turn++) {
+      lines.push(
+        stageLine("escalate", "escalation", turn <= 4 ? "skipped" : "started", {
+          turnNumber: turn,
+          ...(turn <= 4 ? { cause: "judge_share_exhausted" } : {}),
+        }),
+      );
+    }
+    const ctx = buildAdviceContext([session(SESSION_A, lines)]);
+    const findings = ruleEscalationRecall(ctx, { spec: POOL_SPEC });
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.id).toBe("escalation-recall:judge_share_exhausted");
+    expect(findings[0]?.suggestion.kind).toBe("advice");
+    if (findings[0]?.suggestion.kind !== "advice") throw new Error("expected advice");
+    expect(findings[0].suggestion.text).toContain("budget.judge_share");
+  });
+
+  it("says nothing when every wanted escalation was served", () => {
+    const lines = Array.from({ length: 10 }, (_, i) =>
+      stageLine("escalate", "escalation", "started", { turnNumber: i + 1 }),
+    );
+    const ctx = buildAdviceContext([session(SESSION_A, lines)]);
+    expect(ruleEscalationRecall(ctx, { spec: POOL_SPEC })).toEqual([]);
+  });
+});
+
+describe("ruleAuditionReady", () => {
+  it("fires only past the power floor AND above the live arms, and never patches", () => {
+    const ready = buildAdviceContext(
+      [],
+      [],
+      [...fullCoverageArms(30), arm("shadow:hard", "candidate-x", 60, 0.99)],
+    );
+    const findings = ruleAuditionReady(ready, { spec: POOL_SPEC });
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.id).toBe("audition-ready:candidate-x");
+    // The roster is human-owned: never a patch, always the PR door.
+    expect(findings[0]?.suggestion.kind).toBe("advice");
+    if (findings[0]?.suggestion.kind !== "advice") throw new Error("expected advice");
+    expect(findings[0].suggestion.text).toContain("models propose --source audition");
+  });
+
+  it("refuses below the floor even when the lead looks large", () => {
+    const thin = buildAdviceContext(
+      [],
+      [],
+      [...fullCoverageArms(30), arm("shadow:hard", "candidate-x", 5, 0.99)],
+    );
+    expect(ruleAuditionReady(thin, { spec: POOL_SPEC })).toEqual([]);
+  });
+
+  it("says nothing when no audition lane exists", () => {
+    expect(
+      ruleAuditionReady(buildAdviceContext([], [], fullCoverageArms(30)), { spec: POOL_SPEC }),
+    ).toEqual([]);
+  });
+});
+
+describe("rulePolicyFlipReady", () => {
+  it("fires only when a band's leader is SEPARATED from its runner-up", () => {
+    // Covered but NOT separated: a lead the interval swallows (var 0.4 at
+    // n=30 puts the leader's 95% lower bound below the runner-up's mean).
+    const noisy = (routeKey: string, model: string, meanReward: number) => ({
+      ...arm(routeKey, model, 30, meanReward),
+      varReward: 0.4,
+    });
+    const overlapping = buildAdviceContext(
+      [],
+      [],
+      [
+        noisy("hard", "claude-opus-4-1", 0.55),
+        noisy("hard", "claude-sonnet-4-6", 0.5),
+        noisy("hard", "claude-haiku-4-5", 0.45),
+      ],
+    );
+    expect(rulePolicyFlipReady(overlapping, { spec: POOL_SPEC })).toEqual([]);
+
+    const separated = buildAdviceContext(
+      [],
+      [],
+      [
+        arm("hard", "claude-opus-4-1", 200, 0.95),
+        arm("hard", "claude-sonnet-4-6", 200, 0.4),
+        arm("hard", "claude-haiku-4-5", 200, 0.3),
+      ],
+    );
+    const findings = rulePolicyFlipReady(separated, { spec: POOL_SPEC });
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.id).toBe("policy-flip-ready");
+    // Text-only: `pool-policy-upgrade` owns the patch; this says it will hold.
+    expect(findings[0]?.suggestion.kind).toBe("advice");
+    if (findings[0]?.suggestion.kind !== "advice") throw new Error("expected advice");
+    expect(findings[0].suggestion.text).toContain("route propose");
+    expect(findings[0].suggestion.text).toContain("--warm-arms");
+  });
+
+  it("stays silent on a pool that is already learned", () => {
+    const learned = parseSpec(
+      [
+        "name: pooled",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: help",
+        "  model_pool:",
+        "    policy: learned",
+        "    candidates:",
+        "      - { model: claude-haiku-4-5, tags: [cheap] }",
+        "      - { model: claude-opus-4-1, tags: [strong] }",
+      ].join("\n"),
+    );
+    const ctx = buildAdviceContext(
+      [],
+      [],
+      [arm("hard", "claude-opus-4-1", 200, 0.95), arm("hard", "claude-haiku-4-5", 200, 0.3)],
+    );
+    expect(rulePolicyFlipReady(ctx, { spec: learned })).toEqual([]);
   });
 });

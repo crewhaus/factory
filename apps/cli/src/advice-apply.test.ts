@@ -7,7 +7,8 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
-import { parseWriteBackHeader } from "@crewhaus/spec-patch";
+import { parseSpec } from "@crewhaus/spec";
+import { parseWriteBackHeader, specHasPath } from "@crewhaus/spec-patch";
 import {
   AdviceApplyError,
   type AdviceApplyHooks,
@@ -21,6 +22,7 @@ import {
   patchLabel,
   stampAdviceWriteBack,
 } from "./advice-apply";
+import { buildRouteProposals, routeSuggestionsFile } from "./route-propose";
 
 // -------- fixtures --------
 
@@ -460,5 +462,157 @@ describe("advice artifacts", () => {
       reason: "r",
     });
     expect(removeLine).toContain("remove agent.max_tokens —");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §9.1 — acceptance item 10: `route propose` → `optimize --from-advice`.
+// ---------------------------------------------------------------------------
+
+describe("the route-propose → from-advice chain (acceptance item 10)", () => {
+  const POOLED_YAML = [
+    "name: pooled",
+    "target: cli",
+    "agent:",
+    "  model: claude-haiku-4-5",
+    "  instructions: help",
+    "  model_pool:",
+    "    candidates:",
+    "      - { model: claude-haiku-4-5, tags: [cheap] }",
+    "      - { model: claude-opus-5,    tags: [strong] }",
+    "    policy: heuristic",
+    "    learning: { minSamplesPerArm: 10, seed: s1 }",
+    "",
+  ].join("\n");
+
+  function arm(model: string, meanReward: number, varReward: number) {
+    return {
+      routeKey: "hard",
+      model,
+      n: 200,
+      meanReward,
+      varReward,
+      meanLatencyMs: 400,
+      meanCostUsd: 0.01,
+      costCount: 200,
+      meanQuality: 0,
+      varQuality: 0,
+      qualityCount: 0,
+      ungraded: 0,
+    };
+  }
+
+  /** What `crewhaus route propose` writes for a separated scoreboard. */
+  function proposedSuggestions(): string {
+    const result = buildRouteProposals({
+      spec: parseSpec(POOLED_YAML),
+      arms: [arm("claude-opus-5", 0.9, 0.001), arm("claude-haiku-4-5", 0.4, 0.001)],
+      // The CLI passes this too: a key the YAML already carries needs
+      // `replace`, an absent one needs `add`, and applySpecPatch refuses the
+      // wrong choice.
+      specHasPath: (path) => specHasPath(POOLED_YAML, path),
+    });
+    return `${JSON.stringify(routeSuggestionsFile(result, "2026-09-07T00:00:00.000Z"), null, 2)}\n`;
+  }
+
+  test("the mined file round-trips through parseSuggestionsFile", () => {
+    const patches = parseSuggestionsFile(proposedSuggestions());
+    expect(patches.length).toBeGreaterThan(0);
+    expect(patches[0]?.patch.path).toEqual(["agent", "model_pool", "policy"]);
+    expect(patches[0]?.findingId).toBe("route-policy-flip");
+  });
+
+  test("a gate-passing eval ACCEPTS the mined patch and composes it into the final YAML", async () => {
+    const log: string[] = [];
+    const result = await applyAdvicePatches({
+      sourceYaml: POOLED_YAML,
+      patches: parseSuggestionsFile(proposedSuggestions()),
+      hooks: makeHooks({ log }),
+    });
+    expect(result.accepted).toBe(1);
+    expect(result.decisions[0]?.status).toBe("accepted");
+    expect(result.finalYaml).toContain("policy: learned");
+    // Baseline once, candidate once — N patches cost N+1 evals.
+    expect(log).toEqual([
+      "compile:baseline",
+      "eval:baseline",
+      "compile:patch-001",
+      "eval:patch-001",
+    ]);
+  });
+
+  test("a regressing eval REJECTS it through gateRuns and leaves the spec untouched", async () => {
+    const result = await applyAdvicePatches({
+      sourceYaml: POOLED_YAML,
+      patches: parseSuggestionsFile(proposedSuggestions()),
+      hooks: makeHooks({
+        log: [],
+        summaries: {
+          baseline: makeSummary("baseline", ALL_PASS),
+          "patch-001": makeSummary("patch-001", ONE_FAIL),
+        },
+      }),
+    });
+    expect(result.accepted).toBe(0);
+    expect(result.decisions[0]?.status).toBe("rejected");
+    expect(result.finalYaml).toBe(POOLED_YAML);
+  });
+
+  test("two ROUTED runs on different arm snapshots are refused as two instruments", async () => {
+    // §6.1's instrument guard, reached through the from-advice acceptance
+    // gate: a mismatched `armsDigest` is not a regression verdict, it is a
+    // refusal to compare.
+    const routed = (runId: string, digest: string): EvalRunSummary => {
+      const base = makeSummary(runId, ALL_PASS);
+      return {
+        ...base,
+        config: { ...base.config, routing: { mode: "as-declared", armsDigest: digest } },
+      };
+    };
+    const result = await applyAdvicePatches({
+      sourceYaml: POOLED_YAML,
+      patches: parseSuggestionsFile(proposedSuggestions()),
+      hooks: makeHooks({
+        log: [],
+        summaries: {
+          baseline: routed("baseline", "digest-a"),
+          "patch-001": routed("patch-001", "digest-b"),
+        },
+      }),
+    });
+    expect(result.accepted).toBe(0);
+    expect(result.decisions[0]?.reason).toContain("different arm snapshots");
+  });
+
+  test("a hand-edited suggestions file naming a ROSTER path is rejected by the whitelist", async () => {
+    // The safety floor: `validatePatch` re-runs per patch inside the loop, so
+    // editing the mined file cannot smuggle a roster change past the gate.
+    const tampered = JSON.stringify({
+      generatedAt: "2026-09-07T00:00:00.000Z",
+      sessionIds: [],
+      suggestions: [
+        {
+          findingId: "tampered",
+          severity: "info",
+          summary: "swap the roster",
+          patch: {
+            target: "cli",
+            path: ["agent", "model_pool", "candidates"],
+            op: "replace",
+            value: [{ model: "claude-opus-5", tags: ["strong"] }],
+          },
+        },
+      ],
+    });
+    const log: string[] = [];
+    const result = await applyAdvicePatches({
+      sourceYaml: POOLED_YAML,
+      patches: parseSuggestionsFile(tampered),
+      hooks: makeHooks({ log }),
+    });
+    expect(result.accepted).toBe(0);
+    expect(result.decisions[0]?.reason).toContain("patch invalid");
+    // Rejected BEFORE the paid eval — only the baseline ran.
+    expect(log).toEqual(["compile:baseline", "eval:baseline"]);
   });
 });
