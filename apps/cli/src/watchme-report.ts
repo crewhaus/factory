@@ -1058,7 +1058,7 @@ export function renderWatchmeReportMd(report: WatchmeReportJson): string {
   if (report.feedRouting !== undefined) {
     lines.push("");
     lines.push(
-      `Shadow routing arms: ${report.feedRouting.recorded} \`q:*\` observation(s) recorded (${report.feedRouting.deduped} deduped). \`q:\`-prefixed routeKeys are watchme's SHADOW namespace — visible in \`route status\`, never minted or read by the runtime router.`,
+      `Shadow routing arms: ${report.feedRouting.recorded} \`q:*\` observation(s) recorded (${report.feedRouting.deduped} deduped), one per routed STAGE of each scored turn. \`q:\`-prefixed routeKeys are watchme's SHADOW namespace — visible in \`route status\`, never minted or read by the runtime router; \`crewhaus route promote\` is the one gated path that folds them into live arms.`,
     );
   }
 
@@ -1958,9 +1958,18 @@ function feedRoutingArms(input: {
   }
   const scoredKeys = new Set(quality.map((q) => `${q.sessionId}#${q.turnNumber}`));
 
-  // Route decisions per (sessionId#turnNumber). Current-window analyses carry
-  // full per-turn attribution (latency/cost); scored sessions NOT re-analyzed
-  // this window are recovered from their durable session log.
+  // 0.6.0 §7.9 — route decisions PER STAGE, keyed
+  // `sessionId#turnNumber[#stage]`. A hybrid turn emits one `model_route`
+  // line per stage (a cascade drafts, then escalates), and this join folds
+  // the turn's one delayed quality onto EACH of them — the same
+  // one-quality-to-N-decisions fan-out the in-loop path performs at the
+  // strategy-turn boundary. An unstaged line keeps the bare
+  // `sessionId#turnNumber` key it has always had, so every `fedRoutingKeys`
+  // watermark already on disk still dedupes exactly what it deduped before.
+  //
+  // Current-window analyses carry full per-turn attribution (latency/cost);
+  // scored sessions NOT re-analyzed this window are recovered from their
+  // durable session log.
   const routeByKey = new Map<string, RouteDecision>();
   const analyzed = new Set(input.analyses.map((a) => a.sessionId));
   const addRoutes = (
@@ -1969,21 +1978,40 @@ function feedRoutingArms(input: {
     attribution?: ModelAttribution,
   ): void => {
     const failed = events.some((e) => e.kind === "run_failed");
+    // Per-turn latency and cost are TURN totals: they belong to the turn, not
+    // to one of its stages, so only the turn's FIRST stage carries them and
+    // the rest record the quality alone. Splitting a turn total across stages
+    // would invent a per-stage measurement nothing measured.
+    const attributedTurns = new Set<number>();
     for (const ev of events) {
       if (ev.kind !== "model_route") continue;
       const p = payloadOf(ev);
       if (typeof p["turnNumber"] !== "number") continue;
       if (typeof p["routeKey"] !== "string" || typeof p["model"] !== "string") continue;
       const turnNumber = p["turnNumber"];
-      const key = `${sessionId}#${turnNumber}`;
+      const stage =
+        typeof p["stage"] === "string" && p["stage"].length > 0 ? p["stage"] : undefined;
+      const key =
+        stage === undefined ? `${sessionId}#${turnNumber}` : `${sessionId}#${turnNumber}#${stage}`;
       if (routeByKey.has(key)) continue;
-      const latencyMs = attribution?.perTurnLatencyMs?.get(turnNumber);
-      const costMicros = attribution?.perTurnCostUsdMicros?.get(turnNumber);
+      const first = !attributedTurns.has(turnNumber);
+      attributedTurns.add(turnNumber);
+      const latencyMs = first ? attribution?.perTurnLatencyMs?.get(turnNumber) : undefined;
+      const costMicros = first ? attribution?.perTurnCostUsdMicros?.get(turnNumber) : undefined;
+      // §7.9 — the ARM is the route line's `profile` when the candidate is a
+      // `models:` profile (that is what the live scoreboard keys on), else the
+      // spec model string behind the wire id.
+      const profile = typeof p["profile"] === "string" ? p["profile"] : undefined;
+      const specModel =
+        typeof p["specModel"] === "string"
+          ? p["specModel"]
+          : (attribution?.wireToSpec.get(p["model"]) ?? p["model"]);
       routeByKey.set(key, {
         sessionId,
         turnNumber,
         routeKey: p["routeKey"],
-        model: attribution?.wireToSpec.get(p["model"]) ?? p["model"],
+        model: profile ?? specModel,
+        ...(stage !== undefined ? { stage } : {}),
         success: !failed,
         ...(latencyMs !== undefined ? { latencyMs } : {}),
         ...(costMicros !== undefined ? { costUsd: costMicros / 1_000_000 } : {}),
@@ -2002,12 +2030,14 @@ function feedRoutingArms(input: {
     addRoutes(sid, parseSessionLog(text) as ReadonlyArray<LoggedEvent>);
   }
 
-  // Record shadow arms for scored, unfed keys that carry a route decision.
+  // Record shadow arms for every scored, unfed route decision — one row per
+  // STAGE, so a cascade's draft and escalation each land on their own arm.
   const decisions: RouteDecision[] = [];
   let deduped = 0;
-  for (const key of [...scoredKeys].sort()) {
+  for (const key of [...routeByKey.keys()].sort()) {
     const decision = routeByKey.get(key);
-    if (decision === undefined) continue; // scored turn with no route line
+    if (decision === undefined) continue;
+    if (!scoredKeys.has(`${decision.sessionId}#${decision.turnNumber}`)) continue;
     if (fed.has(key)) {
       deduped += 1;
       continue;

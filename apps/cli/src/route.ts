@@ -8,6 +8,10 @@
  *   route freeze  <policyVersion> [--reason <text>] [--dir <root>]
  *                                        pin the learned policy (kill switch #2)
  *   route freeze  --clear [--dir <root>] lift the pin
+ *   route promote [--gate] [--spec <n>] [--dry-run] [--json] [--dir <root>]
+ *                                        fold the observe-only `q:` / `shadow:`
+ *                                        lanes into live arms, once a routed
+ *                                        eval has authorized it (§6.3)
  *
  * `--dir` points at the `.crewhaus` root (default `.crewhaus`); the scoreboard
  * lives at `<root>/routing/arms.jsonl` and session logs at
@@ -19,9 +23,15 @@
  * `<root>/routing/freeze.json`; while it exists every pooled run in that root
  * routes off the frozen history, records no new observation and reports the
  * frozen `policyVersion` on its `model_route` lines. `route reset` removes the
- * marker too (it wipes the whole routing state). The verb family grows in a
- * later 0.6.0 row (`route explain --json`, `route status --by`, `route
- * propose`); this file carries the two kill switches only.
+ * marker too (it wipes the whole routing state).
+ *
+ * 0.6.0 §6.3 — `route promote` is the ONE sanctioned path out of the
+ * observe-only lanes: the offline `q:<band>` join and the online
+ * `shadow:<scope>/<band>` audition never steer a live decision on their own
+ * (PR 9d/PR 10 settled that committee and shadow member arms do not fold),
+ * so folding them is a deliberate, eval-gated, audited act. The gate itself
+ * lives in `./route-promote`. The verb family grows in a later 0.6.0 row
+ * (`route explain --json`, `route status --by`, `route propose`).
  */
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -33,9 +43,10 @@ import {
   readRouteFreeze,
   writeRouteFreeze,
 } from "@crewhaus/routing-store";
+import { type RoutePromoteOptions, runRoutePromote } from "./route-promote";
 
 export type RouteArgs = {
-  readonly sub: "status" | "reset" | "explain" | "freeze";
+  readonly sub: "status" | "reset" | "explain" | "freeze" | "promote";
   readonly dir: string;
   /** Session id — required for `explain`. */
   readonly session?: string;
@@ -45,6 +56,14 @@ export type RouteArgs = {
   readonly clear?: boolean;
   /** `freeze --reason <text>` — an operator note on the marker. */
   readonly reason?: string;
+  /** `promote --gate` — map a refused promotion to a non-zero exit. */
+  readonly gate?: boolean;
+  /** `promote --dry-run` — report the fold without writing anything. */
+  readonly dryRun?: boolean;
+  /** `promote --json` — machine-readable output. */
+  readonly json?: boolean;
+  /** `promote --spec <name>` — restrict the authorizing eval run to one spec. */
+  readonly spec?: string;
 };
 
 const DEFAULT_ROOT = ".crewhaus";
@@ -57,8 +76,12 @@ export function parseRouteArgs(argv: readonly string[]): RouteArgs {
   let policyVersion: string | undefined;
   let clear = false;
   let reason: string | undefined;
+  let gate = false;
+  let dryRun = false;
+  let json = false;
+  let spec: string | undefined;
   const USAGE =
-    "status | reset | explain <session> | freeze <policyVersion> [--reason <text>] | freeze --clear [--dir <root>]";
+    "status | reset | explain <session> | freeze <policyVersion> [--reason <text>] | freeze --clear | promote [--gate] [--spec <name>] [--dry-run] [--json] [--dir <root>]";
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === undefined) continue;
@@ -69,7 +92,7 @@ export function parseRouteArgs(argv: readonly string[]): RouteArgs {
       i++;
     } else if (
       sub === undefined &&
-      (a === "status" || a === "reset" || a === "explain" || a === "freeze")
+      (a === "status" || a === "reset" || a === "explain" || a === "freeze" || a === "promote")
     ) {
       // A subcommand keyword is only the subcommand when it comes FIRST; after
       // that the same word is a plain positional (so `route explain status`
@@ -86,6 +109,17 @@ export function parseRouteArgs(argv: readonly string[]): RouteArgs {
       i++;
     } else if (sub === "freeze" && policyVersion === undefined && !a.startsWith("--")) {
       policyVersion = a; // the policyVersion positional
+    } else if (sub === "promote" && a === "--gate") {
+      gate = true;
+    } else if (sub === "promote" && a === "--dry-run") {
+      dryRun = true;
+    } else if (sub === "promote" && a === "--json") {
+      json = true;
+    } else if (sub === "promote" && a === "--spec") {
+      const v = argv[i + 1];
+      if (v === undefined) throw new Error("route promote: --spec requires a spec name");
+      spec = v;
+      i++;
     } else {
       throw new Error(`route: unknown argument "${a}" (expected: ${USAGE})`);
     }
@@ -113,6 +147,10 @@ export function parseRouteArgs(argv: readonly string[]): RouteArgs {
     ...(policyVersion !== undefined ? { policyVersion } : {}),
     ...(clear ? { clear } : {}),
     ...(reason !== undefined ? { reason } : {}),
+    ...(gate ? { gate } : {}),
+    ...(dryRun ? { dryRun } : {}),
+    ...(json ? { json } : {}),
+    ...(spec !== undefined ? { spec } : {}),
   };
 }
 
@@ -270,9 +308,18 @@ export function formatRouteExplain(sessionId: string, decisions: readonly RouteD
   return lines.join("\n");
 }
 
-/** Run `crewhaus route …`, returning the text to print. */
+/**
+ * Run `crewhaus route …`, returning the text to print.
+ *
+ * SYNCHRONOUS subcommands only. `promote` reads the eval history and appends
+ * an audit record, both asynchronous, so it is served by
+ * {@link runRouteCommand} — the entry point the CLI dispatch calls.
+ */
 export function runRoute(argv: readonly string[]): string {
   const args = parseRouteArgs(argv);
+  if (args.sub === "promote") {
+    throw new Error("route promote is asynchronous — call runRouteCommand()");
+  }
   if (args.sub === "status") {
     const banner = formatRouteFreeze(loadRouteFreeze(args.dir));
     const table = formatRouteStatus(loadArms(args.dir));
@@ -294,4 +341,26 @@ export function runRoute(argv: readonly string[]): string {
   }
   const removed = resetRouting(args.dir);
   return `Reset routing scoreboard at ${join(args.dir, "routing", "arms.jsonl")} (${removed} arm${removed === 1 ? "" : "s"} removed).`;
+}
+
+/**
+ * The CLI dispatch entry: every `route` subcommand, including the
+ * asynchronous `promote`. Returns the text to print plus the process exit
+ * code (`promote --gate` is the only path that can make it non-zero).
+ */
+export async function runRouteCommand(
+  argv: readonly string[],
+  overrides: Partial<RoutePromoteOptions> = {},
+): Promise<{ readonly text: string; readonly exitCode: number }> {
+  const args = parseRouteArgs(argv);
+  if (args.sub !== "promote") return { text: runRoute(argv), exitCode: 0 };
+  const outcome = await runRoutePromote({
+    rootDir: args.dir,
+    gate: args.gate === true,
+    dryRun: args.dryRun === true,
+    json: args.json === true,
+    ...(args.spec !== undefined ? { specName: args.spec } : {}),
+    ...overrides,
+  });
+  return { text: outcome.text, exitCode: outcome.exitCode };
 }

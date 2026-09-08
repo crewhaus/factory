@@ -267,7 +267,8 @@ export type CapturedRouteObservation = {
   readonly arm: string;
   readonly reward: number;
   readonly success: boolean;
-  readonly latencyMs: number;
+  /** Absent when the observation carried no measured latency (see `RouteObservation`). */
+  readonly latencyMs?: number;
   readonly costUsd?: number;
   readonly quality?: number;
   readonly stage?: string;
@@ -337,7 +338,7 @@ export function freezeArmsSnapshot(stats: ReadonlyArray<ArmStats>): FrozenScoreb
         arm: model,
         reward,
         success: obs.success,
-        latencyMs: obs.latencyMs,
+        ...(obs.latencyMs !== undefined ? { latencyMs: obs.latencyMs } : {}),
         ...(obs.costUsd !== undefined ? { costUsd: obs.costUsd } : {}),
         ...(obs.quality !== undefined ? { quality: obs.quality } : {}),
         ...(obs.stage !== undefined ? { stage: obs.stage } : {}),

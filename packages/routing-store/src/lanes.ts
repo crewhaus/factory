@@ -48,6 +48,25 @@ export function isObserveOnlyLane(routeKey: string): boolean {
 }
 
 /**
+ * The `attributedTo` stamp on the SHADOW side of one audition — the candidate
+ * that re-ran the turn and never reached the user. `route promote` folds
+ * these into the live arm: they are evidence the live arm does not already
+ * hold.
+ */
+export const SHADOW_LANE_SHADOW_ARM = "shadow";
+
+/**
+ * The `attributedTo` stamp on the PRIMARY side of one audition — the arm that
+ * actually served the turn, and therefore already recorded it live through
+ * `recordPoolOutcome`. `route promote` SKIPS these: folding one would add a
+ * second observation for a turn the live arm counted once, and would mix a
+ * pairwise blind-judging verdict into an absolute judged-quality mean (§7.10:
+ * "same-instrument is the rule"). The stamp is what makes the two sides
+ * distinguishable at all — nothing else on the line separates them.
+ */
+export const SHADOW_LANE_PRIMARY_ARM = "primary";
+
+/**
  * The blind pairwise verdict folded into the two shadow-lane observations —
  * one for the shadow arm, one for the primary it was graded against. A win is
  * quality 1 for the winner and 0 for the loser; a tie (which order-swapped

@@ -15,6 +15,8 @@ export {
   isObserveOnlyLane,
   QUALITY_LANE_PREFIX,
   SHADOW_LANE_PREFIX,
+  SHADOW_LANE_PRIMARY_ARM,
+  SHADOW_LANE_SHADOW_ARM,
   shadowLaneQuality,
   shadowRouteKey,
 } from "./lanes.js";
@@ -25,6 +27,16 @@ export {
   type ScoreboardOptions,
   type ScoreReader,
 } from "./scoreboard.js";
+export {
+  PROMOTED_FROM,
+  PROMOTED_MARKER,
+  type LanePromotion,
+  type PromotedCarry,
+  type PromoteOptions,
+  type PromoteResult,
+  liveRouteKeyOf,
+  promoteLanes,
+} from "./promote.js";
 export {
   ROUTE_FREEZE_FILE,
   type RouteFreeze,
