@@ -362,7 +362,10 @@ export function openScoreboard(rootDir: string, opts: ScoreboardOptions = {}): S
         arms.set(key, arm);
       }
       foldReward(arm, reward);
-      arm.latSum += Math.max(0, obs.latencyMs);
+      // An UNMEASURED latency contributes nothing and emits no `l` — the
+      // line then reads back exactly as it was recorded rather than claiming
+      // a 0ms call (see `RouteObservation.latencyMs`).
+      if (obs.latencyMs !== undefined) arm.latSum += Math.max(0, obs.latencyMs);
       const pf = stampLineage(arm);
       // 0.6.0 — a line carrying quality, strategy attribution or routing
       // provenance is `v:2`; a plain observation keeps the exact `v:1` shape
@@ -383,7 +386,9 @@ export function openScoreboard(rootDir: string, opts: ScoreboardOptions = {}): S
         m: model,
         r: reward,
         s: obs.success ? 1 : 0,
-        l: Math.max(0, obs.latencyMs),
+        // Spread in place so a measured latency keeps its historical key
+        // position (the store stays byte-identical for every in-loop caller).
+        ...(obs.latencyMs !== undefined ? { l: Math.max(0, obs.latencyMs) } : {}),
         t: now(),
       };
       if (obs.costUsd !== undefined) {

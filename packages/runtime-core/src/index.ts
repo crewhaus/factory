@@ -125,6 +125,8 @@ import {
 import {
   type RewardConfig,
   type RouteObservation,
+  SHADOW_LANE_PRIMARY_ARM,
+  SHADOW_LANE_SHADOW_ARM,
   type Scoreboard,
   computeReward,
   freezeScoreboard,
@@ -3573,7 +3575,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         /** §7.9 — the arm id the outcome was recorded under. */
         readonly armId: string;
         readonly routeKey: string;
-        readonly latencyMs: number;
+        /** Absent when nothing measured the call (see `RouteObservation`). */
+        readonly latencyMs?: number;
         readonly costUsd?: number;
       }
     | undefined;
@@ -3602,7 +3605,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         modelString: turn.modelString,
         armId: arm,
         routeKey: turn.routeKey,
-        latencyMs: obs.latencyMs,
+        ...(obs.latencyMs !== undefined ? { latencyMs: obs.latencyMs } : {}),
         ...(obs.costUsd !== undefined ? { costUsd: obs.costUsd } : {}),
       };
     }
@@ -6810,17 +6813,25 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // (§7.9); the lane re-scopes the bare band as `shadow:<scope>/<band>`.
           const key = shadowRouteKey(unscopedRouteKey(served.routeKey), poolScope);
           const q = shadowLaneQuality(v.verdict);
+          // §6.3 / §7.10 — each side of the audition is STAMPED, because the
+          // two lines are not the same kind of evidence: the shadow arm never
+          // served, while the primary already recorded this very turn live
+          // through `recordPoolOutcome`. `route promote` folds the shadow side
+          // and skips the primary one on this stamp; without it the promotion
+          // could not tell them apart even in principle.
           const shadowObs = {
             success: true,
             latencyMs: v.latencyMs,
             ...(shadowCost !== undefined ? { costUsd: shadowCost } : {}),
             quality: q.shadow,
+            attributedTo: SHADOW_LANE_SHADOW_ARM,
           };
           const primaryObs = {
             success: true,
-            latencyMs: served.latencyMs,
+            ...(served.latencyMs !== undefined ? { latencyMs: served.latencyMs } : {}),
             ...(served.costUsd !== undefined ? { costUsd: served.costUsd } : {}),
             quality: q.primary,
+            attributedTo: SHADOW_LANE_PRIMARY_ARM,
           };
           sb.record(key, shadowArm, computeReward(shadowObs, rc), {
             ...shadowObs,

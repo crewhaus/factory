@@ -60,7 +60,14 @@ export type QualityArmRow = {
   model: string;
   obs: {
     success: boolean;
-    latencyMs: number;
+    /**
+     * 0.6.0 §7.9 — ABSENT when the decision carried no latency. Per-turn
+     * latency is a TURN total, so only a turn's first stage carries one; a
+     * later stage records the quality alone. Coercing the gap to `0` would
+     * hand the escalation arm a perfect latency term in `computeReward`,
+     * which is the flattery §6.3 item 1 exists to prevent.
+     */
+    latencyMs?: number;
     costUsd?: number;
     quality: number;
     /** Carried onto the `v:2` line so a promoted observation says which stage produced it. */
@@ -100,9 +107,9 @@ export function joinQualityToArms(
     if (acc === undefined || acc.n === 0) continue;
     const obs: QualityArmRow["obs"] = {
       success: d.success,
-      latencyMs: Math.max(0, d.latencyMs ?? 0),
       quality: clamp01(acc.sum / acc.n),
     };
+    if (d.latencyMs !== undefined) obs.latencyMs = Math.max(0, d.latencyMs);
     if (d.costUsd !== undefined) obs.costUsd = d.costUsd;
     if (d.stage !== undefined) obs.stage = d.stage;
     rows.push({ routeKey: `${SHADOW_PREFIX}${d.routeKey}`, model: d.model, obs });

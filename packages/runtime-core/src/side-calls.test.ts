@@ -18,7 +18,7 @@
  * side-call closures (the hybrid-tools.test.ts pattern).
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -30,7 +30,11 @@ import type {
 } from "@crewhaus/adapter-anthropic";
 import { createCostTracker } from "@crewhaus/cost-tracker";
 import { EXIT_CODES, RunFailedError, RuntimeError } from "@crewhaus/errors";
-import { openScoreboard } from "@crewhaus/routing-store";
+import {
+  SHADOW_LANE_PRIMARY_ARM,
+  SHADOW_LANE_SHADOW_ARM,
+  openScoreboard,
+} from "@crewhaus/routing-store";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import type { ModelRouteEvent, ModelStageEvent, TraceEvent } from "@crewhaus/trace-event-bus";
 import {
@@ -392,6 +396,19 @@ describe("shadow (§7.8)", () => {
     // The live arm is untouched by the shadow (one primary observation only).
     expect(sb.score(band as string, "fast")?.n).toBe(1);
     expect(sb.score(band as string, "strong")).toBeUndefined();
+    // §6.3 — the two lane lines are STAMPED with which side of the audition
+    // they are. Nothing else on the line separates them, and `route promote`
+    // has to skip the primary one: that arm already recorded this turn live,
+    // and its lane `quality` is a pairwise verdict, not an absolute score.
+    const laneLines = readFileSync(sb.path, "utf8")
+      .split("\n")
+      .filter((l) => l.trim() !== "")
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((l) => l["k"] === key);
+    expect(laneLines.map((l) => [l["m"], l["at"]])).toEqual([
+      ["strong", SHADOW_LANE_SHADOW_ARM],
+      ["fast", SHADOW_LANE_PRIMARY_ARM],
+    ]);
   });
 
   test("sample_rate 0 skips every turn (stage skipped, cause sample_rate); a shadow equal to the served arm is skipped", async () => {

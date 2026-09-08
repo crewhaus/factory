@@ -13,12 +13,12 @@
  * `crewhaus eval --gate`; the refusal itself is unconditional.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LoadedRun, RunIndexEntry } from "@crewhaus/eval-report";
 import type { EvalRunSummary } from "@crewhaus/eval-runner";
-import { openScoreboard } from "@crewhaus/routing-store";
+import { openScoreboard, writeRouteFreeze } from "@crewhaus/routing-store";
 import { parseRouteArgs, runRouteCommand } from "./route";
 import { type PromotionGate, resolveRoutePromotionGate, runRoutePromote } from "./route-promote";
 
@@ -324,9 +324,13 @@ describe("runRoutePromote — refuse without a gate, fold + audit with one", () 
     });
     expect(out.exitCode).toBe(0);
     expect(out.result?.lines).toBe(2);
-    // The lanes are now live arms.
+    // The lanes are now live arms — the `shadow:` audition whole, the `q:`
+    // re-observation as a quality back-fill that adds no second reward
+    // observation to the arm that already recorded the turn.
     const sb = openScoreboard(root);
-    expect(sb.score("hard", "fast")?.n).toBe(1);
+    expect(sb.score("hard", "fast")?.n).toBe(0);
+    expect(sb.score("hard", "fast")?.qualityCount).toBe(1);
+    expect(sb.score("hard", "strong")?.n).toBe(1);
     expect(sb.score("hard", "strong")?.meanQuality).toBeCloseTo(0.8, 12);
 
     expect(appended).toHaveLength(1);
@@ -344,6 +348,55 @@ describe("runRoutePromote — refuse without a gate, fold + audit with one", () 
     });
     expect((payload["lanes"] as unknown[]).length).toBe(2);
     expect(out.text).toContain("routing_promotion record (seq 7)");
+  });
+
+  test("`route freeze` refuses the promotion outright — the gate is never even consulted", async () => {
+    // §6.3 — `route freeze` and `route reset` are the kill switches for this
+    // feedback loop. A PASSING gate is exactly the case where a scheduled
+    // promotion would otherwise move the arms the operator pinned.
+    const root = seededRoot();
+    const before = readFileSync(join(root, "routing", "arms.jsonl"), "utf8");
+    writeRouteFreeze(root, { policyVersion: "pool-abc", reason: "bad routing incident" });
+    let gateResolved = false;
+    const out = await runRoutePromote({
+      rootDir: root,
+      gate: true,
+      dryRun: false,
+      json: false,
+      resolveGate: async () => {
+        gateResolved = true;
+        return { passed: true, reason: "should never be consulted", warnings: [] };
+      },
+      openAudit: async () => {
+        throw new Error("must not open the audit log under a freeze");
+      },
+    });
+    expect(gateResolved).toBe(false);
+    expect(out.exitCode).toBe(1);
+    expect(out.frozenPolicyVersion).toBe("pool-abc");
+    expect(out.text).toContain("routing is frozen");
+    expect(out.text).toContain("pool-abc");
+    expect(out.text).toContain("crewhaus route freeze --clear");
+    // The arms file is byte-identical and nothing reached a live arm.
+    expect(readFileSync(join(root, "routing", "arms.jsonl"), "utf8")).toBe(before);
+    expect(openScoreboard(root).score("hard", "fast")).toBeUndefined();
+    expect(openScoreboard(root).score("hard", "strong")).toBeUndefined();
+  });
+
+  test("a frozen root without --gate still refuses, and exits 0", async () => {
+    const root = seededRoot();
+    writeRouteFreeze(root, { policyVersion: "pool-xyz" });
+    const out = await runRoutePromote({
+      rootDir: root,
+      gate: false,
+      dryRun: false,
+      json: true,
+      resolveGate: passing,
+    });
+    expect(out.exitCode).toBe(0);
+    const parsed = JSON.parse(out.text) as Record<string, unknown>;
+    expect(parsed["promoted"]).toBe(false);
+    expect((parsed["frozen"] as Record<string, unknown>)["policyVersion"]).toBe("pool-xyz");
   });
 
   test("--dry-run under a passing gate folds nothing and appends nothing", async () => {

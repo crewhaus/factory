@@ -33,6 +33,15 @@
  * `--gate` mirrors `crewhaus eval --gate`: it only decides whether a refusal
  * maps to a non-zero EXIT. The fold itself is refused without a passing gate
  * either way — that is the safety property, not a flag.
+ *
+ * THE FREEZE COMES FIRST. §6.3 closes with `route reset` and `route freeze`
+ * as the kill switches for exactly this feedback loop, and a freeze means
+ * "no new observation moves an arm" — so an operator who pinned the policy
+ * after a routing incident must not have live arms moved underneath the pin
+ * by a scheduled promotion. `runRoutePromote` reads
+ * `<root>/routing/freeze.json` BEFORE it resolves the gate and refuses
+ * outright; `promoteLanes` refuses again beneath it, so a library caller
+ * cannot bypass the switch either.
  */
 import { join } from "node:path";
 import type { AuditKind } from "@crewhaus/audit-log";
@@ -46,7 +55,7 @@ import {
   resolveBaseline,
 } from "@crewhaus/eval-report";
 import type { EvalRoutingMode } from "@crewhaus/eval-runner";
-import { type PromoteResult, promoteLanes } from "@crewhaus/routing-store";
+import { type PromoteResult, promoteLanes, readRouteFreeze } from "@crewhaus/routing-store";
 import { gateRuns } from "./eval-history";
 
 /** The verdict on whether a promotion is authorized, and by which run. */
@@ -257,6 +266,8 @@ export type RoutePromoteOutcome = {
   readonly exitCode: number;
   readonly gate: PromotionGate;
   readonly result?: PromoteResult;
+  /** Set when the refusal came from `route freeze`, not from the eval gate. */
+  readonly frozenPolicyVersion?: string;
   /** Seq of the appended `routing_promotion` record, when one was written. */
   readonly auditSeq?: number;
 };
@@ -278,6 +289,29 @@ export async function runRoutePromote(opts: RoutePromoteOptions): Promise<RouteP
   const resolveGate = opts.resolveGate ?? resolveRoutePromotionGate;
   const promote = opts.promote ?? ((root, o) => promoteLanes(root, o));
   const openAudit = opts.openAudit ?? defaultOpenAudit;
+
+  // §6.3 / §10.1 — the kill switch outranks the gate: a frozen policy is
+  // refused before a routed eval is even consulted, because a PASSING gate is
+  // exactly the case where a scheduled promotion would otherwise move the
+  // arms the operator pinned.
+  const freeze = readRouteFreeze(opts.rootDir);
+  if (freeze !== undefined) {
+    const reason = `routing is FROZEN at policyVersion ${freeze.policyVersion}${freeze.frozenAt !== "" ? ` (since ${freeze.frozenAt})` : ""}${freeze.reason !== undefined ? ` — ${freeze.reason}` : ""}. A freeze means no new observation moves an arm, so no promotion may either; clear it with \`crewhaus route freeze --clear\` once the incident is closed`;
+    const frozenGate: PromotionGate = { passed: false, reason, warnings: [] };
+    const text = opts.json
+      ? JSON.stringify(
+          { promoted: false, frozen: freeze, gate: frozenGate, pending: null },
+          null,
+          2,
+        )
+      : ["route promote: REFUSED — routing is frozen.", `  ${reason}`].join("\n");
+    return {
+      text,
+      exitCode: opts.gate ? 1 : 0,
+      gate: frozenGate,
+      frozenPolicyVersion: freeze.policyVersion,
+    };
+  }
 
   const gate = await resolveGate({
     evalsDir,
@@ -373,15 +407,23 @@ export function formatPromotion(
     return lines.join("\n");
   }
   lines.push(
-    `${"from".padEnd(22)} ${"to".padEnd(14)} ${"arm".padEnd(26)} ${"obs".padStart(6)} ${"quality".padStart(8)}`,
+    `${"from".padEnd(22)} ${"to".padEnd(14)} ${"arm".padEnd(26)} ${"carried".padEnd(8)} ${"obs".padStart(6)} ${"quality".padStart(8)}`,
   );
   for (const p of result.promotions) {
     const q = p.meanQuality !== undefined ? p.meanQuality.toFixed(3) : "-";
     lines.push(
-      `${p.from.padEnd(22)} ${p.to.padEnd(14)} ${p.model.padEnd(26)} ${String(p.observations).padStart(6)} ${q.padStart(8)}`,
+      `${p.from.padEnd(22)} ${p.to.padEnd(14)} ${p.model.padEnd(26)} ${p.carried.padEnd(8)} ${String(p.observations).padStart(6)} ${q.padStart(8)}`,
     );
   }
   lines.push("");
+  // The `q:` lane re-observes turns the live arm already recorded, so it
+  // back-fills the judged quality alone; only `shadow:` carries a whole new
+  // observation. The column says which, so the audit trail is unambiguous.
+  if (result.promotions.some((p) => p.carried === "quality")) {
+    lines.push(
+      "carried=quality: the offline `q:` lane re-observed turns the live arm already recorded, so only the judged quality was folded (no second reward observation).",
+    );
+  }
   lines.push(
     result.dryRun
       ? `Would fold ${result.lines} lane line(s) into live arms (${result.alreadyPromoted} already promoted). Re-run without --dry-run to apply.`

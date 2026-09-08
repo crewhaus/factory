@@ -1163,7 +1163,15 @@ describe("--feed-routing", () => {
     // so only the turn's FIRST stage carries them; the rest record the quality
     // alone rather than double-counting a number nobody measured per stage.
     expect(lines[0]?.["l"]).toBe(1200);
-    expect(lines[1]?.["l"]).toBe(0);
+    // …and the later stage carries NO `l` at all. Writing `0` would score the
+    // escalation rung as infinitely fast (`latRef / (latRef + 0)` = 1) — a
+    // free perfect latency term landing on whichever arm served the extra
+    // iterations, which is the pathology §6.3 item 1 exists to prevent.
+    expect(lines[1]).not.toHaveProperty("l");
+    expect(lines[1]).not.toHaveProperty("c");
+    // With neither latency nor cost the escalation row's reward is its
+    // judged quality alone — no term it did not earn.
+    expect(lines[1]?.["r"]).toBeCloseTo(lines[1]?.["q"] as number, 12);
 
     // Rerun: both per-stage keys are durably fed → nothing re-records.
     const second = await runWatchmeReport(opts, deps);

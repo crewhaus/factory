@@ -74,7 +74,12 @@ stage's decision, so the turn's one delayed quality folds onto all of them
 strategy-turn boundary). Keeping only the first decision credited the whole
 turn to the drafting arm and made the escalation invisible. Per-turn latency
 and cost are turn totals, so the caller attaches them to the turn's first
-stage only.
+stage only — and a later stage's row therefore carries **no** `latencyMs` at
+all. Do not coerce that gap to `0`: `computeReward` reads `0` as a perfect
+latency term, which would hand the expensive escalation rung a free score it
+did not earn. `RouteObservation.latencyMs` is optional for exactly this
+reason; the reward drops the term and redistributes its weight, as it already
+does for an unknown `costUsd`.
 
 ## Exports
 

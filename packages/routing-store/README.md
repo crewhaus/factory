@@ -85,12 +85,40 @@ with a pinned seed and a warm frozen arm snapshot passed its baseline gate and
 writes a `routing_promotion` audit record.
 
 The fold is a single-writer maintenance op, the same class as `compact()`:
-every not-yet-promoted lane line is **copied** under the live routeKey (the
+every not-yet-promoted lane line is folded under the live routeKey (the
 prefix stripped, stamped `pr: <lane key>`) and the original is stamped
 `pm: 1`. So the lane keeps its own history — a promoted audition stays visible
 in `route status` — and promotion is idempotent: re-running it folds nothing,
 and folds only the delta once the lane has accumulated more. `pm` / `pr` are
 unknown fields to every reader, 0.5.x included.
+
+**The two lanes fold differently, because they are not the same evidence.**
+A promotion must never count one measurement twice (§7.10's lower bound reads
+`n` as independent evidence) and never mix instruments.
+
+- `shadow:` is new evidence for a candidate that never served live, so its
+  line carries **whole** (`carried: "full"` — reward, latency, cost, quality).
+  Its `primary` side does not: that arm already recorded the turn live, and
+  its lane quality is a pairwise blind verdict (0 / 0.5 / 1) rather than an
+  absolute judged score. Both sides are stamped `at` (`SHADOW_LANE_SHADOW_ARM`
+  / `SHADOW_LANE_PRIMARY_ARM`), which is the only thing that distinguishes
+  them; the primary line stays in the lane.
+- `q:` re-observes turns the live arm already recorded — the offline join keys
+  on the same `(routeKey, arm)` pair the runtime used at call time — so it
+  back-fills the judged quality alone (`carried: "quality"`): an `n: 0`
+  aggregate carrying `qs`/`qn`/`qm2`, which adds no second reward observation
+  and does not double the arm's latency or cost sums.
+
+The folded copy carries **no `pf`**. Lineage covers `reward.quality_source`,
+and the documented workflow is `shadow` → `route promote` →
+`quality_source: promoted`; a copy stamped with the lane's lineage would be
+discarded by that very flip, permanently. An unstamped line is always kept —
+the honest semantics for a gated, operator-authorized carry across a lineage
+boundary.
+
+`route freeze` stops promotion like every other write to an arm: `promoteLanes`
+refuses under a marker and reports `frozenPolicyVersion`, and `crewhaus route
+promote` refuses before it even resolves the eval gate.
 
 ### Routing-state files beside the arms
 
@@ -116,4 +144,5 @@ the observe-only lanes into live arms once a routed eval authorizes it.
 `readRoutingPriorsRaw`, `routingPriorsPath`, the lane helpers, `promoteLanes`,
 `liveRouteKeyOf`, and the types `RouteObservation`, `RouteObjective`,
 `RewardConfig`, `ArmStats`, `Scoreboard`, `ScoreboardOptions`, `ScoreReader`,
-`RouteFreeze`, `LanePromotion`, `PromoteOptions`, `PromoteResult`.
+`RouteFreeze`, `LanePromotion`, `PromoteOptions`, `PromoteResult`,
+`PromotedCarry`.

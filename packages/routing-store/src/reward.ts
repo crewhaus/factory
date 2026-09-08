@@ -21,7 +21,11 @@
  * quality = `obs.quality ?? 1`, clamped to `[0,1]`). The cost term is dropped
  * (and its weight redistributed) when `costUsd` is unknown — a run without
  * cost accounting still learns on quality + latency rather than pinning every
- * arm to the same cost score.
+ * arm to the same cost score. The LATENCY term is dropped the same way when
+ * `latencyMs` is unknown: an unmeasured latency is not a zero one, and
+ * `latRef / (latRef + 0) = 1` would hand a free perfect latency score to
+ * whichever arm nothing timed (0.6.0 §6.3 item 1 — the same pathology the
+ * `ungraded` path exists to keep out of the quality term).
  *
  * `quality = success` is the default proxy: the delayed grader/rating signals
  * are joined by `crewhaus watchme report --feed-routing` (asynchronously,
@@ -40,8 +44,15 @@ export type RouteObservation = {
    * mid-stream `runTool` spans — so a tool-heavy cheap arm is not penalised
    * for tool time it did not cause. The non-streaming path measured the
    * model call alone already. Wall time stays on the turn (`turn_end`).
+   *
+   * OMIT when nothing measured it — the offline `watchme report
+   * --feed-routing` join has one TURN total to attribute and gives it to the
+   * turn's first stage only. The reward then drops the latency term and
+   * redistributes its weight, exactly as it does for an unknown `costUsd`;
+   * recording `0` instead would score the unmeasured stage as infinitely
+   * fast. Every in-loop caller measures it and passes it.
    */
-  readonly latencyMs: number;
+  readonly latencyMs?: number;
   /**
    * USD cost of the call, when cost accounting is available (runtime-core
    * prices each turn from token usage). Omit when unknown — the reward then
@@ -128,13 +139,15 @@ export function computeReward(obs: RouteObservation, config: RewardConfig = {}):
   const costRef = config.costRefUsd ?? DEFAULT_COST_REF_USD;
   const latRef = config.latencyRefMs ?? DEFAULT_LATENCY_REF_MS;
 
-  const latencyScore = latRef / (latRef + Math.max(0, obs.latencyMs));
   const qualityScore = Math.min(1, Math.max(0, obs.quality ?? 1));
 
   const terms: Array<{ readonly w: number; readonly s: number }> = [
     { w: Math.max(0, obj.quality), s: qualityScore },
-    { w: Math.max(0, obj.latency), s: latencyScore },
   ];
+  if (obs.latencyMs !== undefined) {
+    const latencyScore = latRef / (latRef + Math.max(0, obs.latencyMs));
+    terms.push({ w: Math.max(0, obj.latency), s: latencyScore });
+  }
   if (obs.costUsd !== undefined) {
     const costScore = costRef / (costRef + Math.max(0, obs.costUsd));
     terms.push({ w: Math.max(0, obj.cost), s: costScore });
