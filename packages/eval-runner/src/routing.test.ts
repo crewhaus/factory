@@ -354,6 +354,14 @@ describe("runEval — routing", () => {
     expect(summary.config.routing).toBeUndefined();
     expect(calls[0]?.["modelPool"]).toBeUndefined();
     expect(calls[0]?.["_scoreboard"]).toBeUndefined();
+    // …and the run's ARTIFACTS stay byte-identical too. Every run publishes
+    // `model_response` events (this stub publishes one), so folding
+    // attribution unconditionally would put `servedModels` on every unrouted
+    // sample, in its meta.json, and in results.json's aggregates.
+    expect(summary.samples.every((s) => s.servedModels === undefined)).toBe(true);
+    expect(summary.aggregates.servedModels).toBeUndefined();
+    const meta = JSON.parse(readFileSync(join(outDir, "a", "meta.json"), "utf-8"));
+    expect(meta.servedModels).toBeUndefined();
   });
 
   test("as-declared threads the pool and a FROZEN scoreboard into the chat loop", async () => {
@@ -441,6 +449,81 @@ describe("runEval — routing", () => {
     const meta = JSON.parse(readFileSync(join(outDir, "a", "meta.json"), "utf-8"));
     expect(meta.servedModels[0].profile).toBe("fast");
     expect(meta.routes[0].arm).toBe("fast");
+  });
+
+  test("a run that routes every sample to ONE arm is flagged degenerate", async () => {
+    // The frozen board is cold by default, so `decideLearned` keeps the first
+    // under-sampled candidate for every sample and the exploration draw is
+    // keyed on the same turn index each time. The run then measures one
+    // candidate while keying its lineage as `…::routed` — say so.
+    const outDir = newTempRoot();
+    const summary = await runEval({
+      ir: irOf(POOL_SPEC),
+      dataset: { name: "d", samples: yieldSamples(SAMPLES) },
+      compiledGraders: GRADERS,
+      opts: {
+        outDir,
+        cwd: newTempRoot(),
+        concurrency: 1,
+        routing: "as-declared",
+        chatLoop: routingChatLoop([], "claude-haiku-4-5", "fast") as never,
+      },
+    });
+    expect(summary.config.routing?.degenerate).toBe(true);
+    expect(summary.config.routing?.degenerateArm).toBe("fast");
+  });
+
+  test("a run that spreads across the roster is NOT degenerate, and its captured writes are kept", async () => {
+    const outDir = newTempRoot();
+    // A stub that routes sample "a" to $fast and sample "b" to $strong, and
+    // records through the injected board exactly as a routed turn does.
+    const spreadingChatLoop = async (opts: ChatLoopCall) => {
+      const seed = opts["seedMessages"] as Array<{ content: string }>;
+      const input = seed[seed.length - 1]?.content ?? "";
+      const profile = input === "first" ? "fast" : "strong";
+      const model = profile === "fast" ? "claude-haiku-4-5" : "claude-opus-4-7";
+      const ctx = opts["runContext"] as {
+        eventBus: { envelope(): Record<string, unknown>; publish(e: unknown): void };
+      };
+      ctx.eventBus.publish({
+        ...ctx.eventBus.envelope(),
+        kind: "model_route",
+        routeKey: "hard",
+        model,
+        specModel: model,
+        profile,
+        policy: "learned",
+        reason: "explore",
+        policyVersion: "pv1",
+      });
+      const board = opts["_scoreboard"] as {
+        record(k: string, m: string, r: number, o: Record<string, unknown>): void;
+        ungraded(k: string, m: string): void;
+      };
+      board.record("hard", profile, 0.5, { success: true, latencyMs: 12, quality: 1 });
+      board.ungraded("hard", profile);
+      return `answer for ${input}`;
+    };
+    const summary = await runEval({
+      ir: irOf(POOL_SPEC),
+      dataset: { name: "d", samples: yieldSamples(SAMPLES) },
+      compiledGraders: GRADERS,
+      opts: {
+        outDir,
+        cwd: newTempRoot(),
+        concurrency: 1,
+        routing: "as-declared",
+        chatLoop: spreadingChatLoop as never,
+      },
+    });
+    expect(summary.config.routing?.degenerate).toBeUndefined();
+    // The frozen board's `record()` never touches the harness's live arms,
+    // but what it was handed is the run's own per-arm signal — kept, not
+    // thrown away.
+    const observations = summary.config.routing?.observations ?? [];
+    expect(observations.map((o) => o.arm).sort()).toEqual(["fast", "strong"]);
+    expect(observations[0]).toMatchObject({ routeKey: "hard", reward: 0.5, quality: 1 });
+    expect(summary.config.routing?.ungraded).toHaveLength(2);
   });
 
   test("--warm-arms seeds the snapshot from live arms and DETECTS a mid-run mutation", async () => {

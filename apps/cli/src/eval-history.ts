@@ -38,9 +38,14 @@
  *   readable and gates exactly as before), and `policyVersion` / `armsDigest`
  *   join the instrument guard rather than the key — a policy flip must
  *   RE-BASELINE a lineage, never orphan it. One rule is specific to V2: when
- *   the V2 key is absent but the legacy key is pinned, the run is neither
- *   gated nor promotable, because auto-pinning it as a "first run" would let
- *   the very run that CREATES a lineage satisfy `route promote --gate`.
+ *   the V2 key is absent but the legacy key is pinned, the run that CREATES
+ *   the lineage is neither gated nor pinned, because auto-pinning it as a
+ *   "first run" would let that very run satisfy `route promote --gate`. The
+ *   lineage's SECOND run pins (its first run is already a row in the index,
+ *   so the pin is no longer self-certifying) and is still ungated, flagged
+ *   `lineageSeeded` for the promote path — otherwise the condition could
+ *   never change and a per-arm lineage would be unestablishable on every
+ *   harness that ever ran a plain eval.
  * - NEW-HUNT-3 — a budget-aborted PARTIAL run is still appended to the
  *   index (marked `partial: true` so readers can tell its deflated
  *   passRate from a real one), but it is NEVER pinned or promoted as a
@@ -62,7 +67,9 @@ import {
   baselineKeyFor,
   diffReports,
   isLegacyLineage,
+  lineageOfEntry,
   loadRun,
+  readRunIndexLatest,
   recordEvalRun,
   resolveBaseline,
   setBaseline,
@@ -136,6 +143,14 @@ export type FinishEvalResult = {
   /** True only when `gateRequested` and the regression gate failed. */
   readonly gateFailed: boolean;
   readonly gateReason?: string;
+  /**
+   * 0.6.0 §6.1 — this run PINNED a per-arm lineage that had no baseline of
+   * its own (it is the lineage's second run, beside an older legacy pin). The
+   * lineage now exists and later runs gate against it normally, but nothing
+   * has yet been gated: `route promote --gate` must refuse a lineage whose
+   * baseline is its own only comparison.
+   */
+  readonly lineageSeeded?: boolean;
 };
 
 /**
@@ -387,14 +402,33 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
   if (baseline === undefined) {
     // The one V2-specific rule (§6.1): a per-arm lineage that does not exist
     // yet, alongside a legacy baseline that does, is NOT a "first run". Pinning
-    // it here would let the very run that creates the lineage satisfy
-    // `route promote --gate`, and gating it against the unrouted pin would
-    // compare two different instruments. Record the row, say so, do neither.
+    // the FIRST such run would let the very run that creates the lineage
+    // satisfy `route promote --gate`, and gating it against the unrouted pin
+    // would compare two different instruments.
+    //
+    // "Not a first run" is not "never a lineage", though: the rule refuses the
+    // run that CREATES the lineage, not the lineage itself. So the second run
+    // of the lineage pins — the index already holds the first run's row, so
+    // the pin is no longer self-certifying — while still returning
+    // `gateFailed: false` and flagging `lineageSeeded`, which the promote path
+    // reads to refuse a lineage whose baseline is its own only comparison.
+    // Without this the condition never changes (nothing else writes a V2 key),
+    // so `--gate` under `--record` would be a permanent no-op on every harness
+    // that ever ran a plain eval, and the "re-run" guidance would be false.
     if (lookup.legacyPresent) {
-      write(
-        `[eval] new per-arm lineage ${lineageLabel} — not gated and not promotable (the legacy ${specName}/${datasetName} baseline measures a different instrument). Re-run to establish this arm's own baseline.`,
+      const priorRuns = readRunIndexLatest(opts.evalsDir).filter(
+        (e) => e.runId !== summary.runId && baselineKeyFor(lineageOfEntry(e)) === lookup.key,
       );
-      return { gateFailed: false };
+      if (priorRuns.length === 0) {
+        write(
+          `[eval] new per-arm lineage ${lineageLabel} — recorded, not gated and not promotable (the legacy ${specName}/${datasetName} baseline measures a different instrument). Re-run to establish this arm's own baseline.`,
+        );
+        return { gateFailed: false };
+      }
+      pinCurrentRun(
+        `establishing ${lineageLabel} — run ${priorRuns.length + 1} of this lineage, not gated (the legacy ${specName}/${datasetName} baseline measures a different instrument)`,
+      );
+      return { gateFailed: false, lineageSeeded: true };
     }
     pinCurrentRun(`first run for ${lineageLabel}`);
     return { gateFailed: false };

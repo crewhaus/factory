@@ -762,7 +762,6 @@ import {
 import {
   type BuildInventoryDeps,
   type BulkRunResult,
-  type EvalHealthReader,
   FLEET_USAGE,
   FleetError,
   type FleetRunner,
@@ -11261,9 +11260,19 @@ function runEvalReportBaseline(args: ParsedArgs): void {
         );
         return;
       }
+      // 0.6.0 §6.1 — the `arm` column: baselines key on the LINEAGE, so a
+      // routed harness pins one row per arm beside the legacy pin. Without it
+      // two lineages of the same (spec, dataset) render as duplicate rows.
       writeTable(
-        ["spec", "dataset", "runId", "pinned_at", "outDir"],
-        pins.map((b) => [b.specName, b.datasetName, b.runId, b.ts, b.outDir]),
+        ["spec", "dataset", "arm", "runId", "pinned_at", "outDir"],
+        pins.map((b) => [
+          b.specName,
+          b.datasetName,
+          b.armId ?? (b.routing !== undefined && b.routing !== "static" ? "routed" : "-"),
+          b.runId,
+          b.ts,
+          b.outDir,
+        ]),
       );
       return;
     }
@@ -11298,10 +11307,24 @@ function runEvalReportBaseline(args: ParsedArgs): void {
         datasetHash: entry.datasetHash,
         ...(entry.gradersHash !== undefined ? { gradersHash: entry.gradersHash } : {}),
         ...(entry.judgeModel !== undefined ? { judgeModel: entry.judgeModel } : {}),
+        // 0.6.0 §6.1 — carry the LINEAGE columns forward too. `setBaseline`
+        // keys on `baselineKeyFor(lineageOfEntry(entry))`, so dropping them
+        // here would write a routed run's pin under the legacy
+        // `spec::dataset` key and clobber the primary's baseline with a cheap
+        // candidate's run. policyVersion/armsDigest ride along for the
+        // instrument guard, exactly as `finishEvalRun` and Hangar's pin do.
+        ...(entry.armId !== undefined ? { armId: entry.armId } : {}),
+        ...(entry.routing !== undefined ? { routing: entry.routing } : {}),
+        ...(entry.policyVersion !== undefined ? { policyVersion: entry.policyVersion } : {}),
+        ...(entry.armsDigest !== undefined ? { armsDigest: entry.armsDigest } : {}),
         ts: new Date().toISOString(),
       });
+      const armLabel =
+        entry.armId ?? (entry.routing !== undefined && entry.routing !== "static" ? "routed" : "");
       process.stdout.write(
-        `[eval-report] baseline set: ${entry.specName}/${entry.datasetName} → ${entry.runId}\n`,
+        `[eval-report] baseline set: ${entry.specName}/${entry.datasetName}${
+          armLabel === "" ? "" : `#${armLabel}`
+        } → ${entry.runId}\n`,
       );
       return;
     }
@@ -16194,39 +16217,14 @@ async function runFleet(args: ParsedArgs, action: string): Promise<void> {
         );
         return;
       }
-      // Eval health: the last run for a (spec, its pinned dataset) baseline
-      // held or beat the baseline's pass rate. No baseline yet → healthy (a
-      // fresh harness isn't "attention"); a last run below the pinned
-      // baseline → attention.
-      const readEvalHealth: EvalHealthReader = (evalsDir) => {
-        const runs = readEvalRunIndex(evalsDir);
-        if (runs.length === 0) return { healthy: true, note: "no runs recorded" };
-        const baselines = readBaselines(evalsDir);
-        const baselineList = Object.values(baselines);
-        if (baselineList.length === 0) {
-          return { healthy: true, note: `${runs.length} run(s), no baseline pinned` };
-        }
-        // Newest run per (spec, dataset), compared to the pinned baseline's run.
-        let regressed = false;
-        const notes: string[] = [];
-        for (const b of baselineList) {
-          const forKey = runs
-            .filter((r) => r.specName === b.specName && r.datasetName === b.datasetName)
-            .sort((x, y) => (x.ts < y.ts ? -1 : 1));
-          const latest = forKey[forKey.length - 1];
-          const baselineRun = runs.find((r) => r.runId === b.runId);
-          if (latest === undefined || baselineRun === undefined) continue;
-          if (latest.passRate < baselineRun.passRate) {
-            regressed = true;
-            notes.push(
-              `${b.datasetName} ${(latest.passRate * 100).toFixed(0)}% < baseline ${(baselineRun.passRate * 100).toFixed(0)}%`,
-            );
-          }
-        }
-        return regressed
-          ? { healthy: false, note: `below baseline: ${notes.join("; ")}` }
-          : { healthy: true, note: "all baselines held" };
-      };
+      // Eval health: the last run for a pinned baseline's LINEAGE held or beat
+      // that baseline's pass rate. No baseline yet → healthy (a fresh harness
+      // isn't "attention"); a last run below the pinned baseline → attention.
+      // 0.6.0 §6.1 — this file used to carry its own copy of the reader, which
+      // matched on (spec, dataset) alone and therefore graded a routed
+      // harness's cheap arm against the strong arm's baseline. There is one
+      // reader now, in `./harness-cmd`, and `harness list` wires the same one.
+      const { readEvalHealth } = await import("./harness-cmd");
       const health = [];
       for (const inv of rows) health.push(await buildHarnessHealth(inv, readEvalHealth));
       for (const line of formatHealth(health, root)) process.stdout.write(`${line}\n`);

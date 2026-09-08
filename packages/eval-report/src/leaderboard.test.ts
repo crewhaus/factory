@@ -71,7 +71,7 @@ function cellOf(
   } = {},
 ): MatrixCell {
   const summary: EvalRunSummary = {
-    runId: `run_${model}`,
+    runId: `run_${opts.armId ?? model}`,
     startedAt: "2026-09-01T00:00:00.000Z",
     endedAt: "2026-09-01T00:00:10.000Z",
     samples: [...samples],
@@ -90,8 +90,10 @@ function cellOf(
   return {
     model,
     ...(opts.armId !== undefined ? { armId: opts.armId } : {}),
-    slug: model,
-    outDir: `/tmp/${model}`,
+    // Cells are keyed by ARM, so two cells may share a model — the slug (the
+    // on-disk directory) is per-arm exactly as `eval --models` writes it.
+    slug: opts.armId ?? model,
+    outDir: `/tmp/${opts.armId ?? model}`,
     summary,
   };
 }
@@ -143,6 +145,29 @@ describe("buildLeaderboard", () => {
     expect(v?.runnerUp).toBe("fast");
     expect(v?.holmP).toBeLessThan(0.05);
     expect(v?.ciOverlap).toBeUndefined();
+  });
+
+  test("two arms sharing ONE model string are compared as two arms, not collapsed", () => {
+    // The canonical `models:` case: one model under two profiles differing only
+    // in thinking/max_tokens (`--models '$fast,$fast_think'`). Keying the cell
+    // lookup by MODEL would resolve both rows to the same summary, so the
+    // paired test would compare a run against itself and call a 60-point gap a
+    // tie. Keyed by ARM, the winner is named.
+    const think = cellOf("claude-haiku-4-5", run(40, 40), {
+      armId: "fastthink",
+      ci: [0.91, 1],
+    });
+    const cheap = cellOf("claude-haiku-4-5", run(40, 4), {
+      armId: "fastcheap",
+      ci: [0.04, 0.24],
+    });
+    const result = board([think, cheap]);
+    const v = result.verdict["passRate"];
+    expect(v?.decision).toBe("winner");
+    expect(v?.leader).toBe("fastthink");
+    expect(v?.runnerUp).toBe("fastcheap");
+    expect(v?.deltaCI95?.[0]).toBeGreaterThan(0);
+    expect(result.comparisons.map((c) => [c.a, c.b])).toContainEqual(["fastthink", "fastcheap"]);
   });
 
   test("UNDERPOWERED below the comparable-pair floor, whatever the gap", () => {

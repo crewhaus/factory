@@ -191,7 +191,13 @@ export function buildLeaderboard(
 ): Leaderboard {
   const minN = opts.minN ?? DEFAULT_LEADERBOARD_MIN_N;
   const alpha = opts.alpha ?? 0.05;
-  const byModel = new Map(cells.map((c) => [c.model, c]));
+  // Keyed by ARM, never by model string: two roster candidates may legitimately
+  // share one model and differ only in their `models:` profile settings
+  // (`--models '$fast,$fast_think'`), and `resolveMatrixArms` de-dupes armIds,
+  // not models. Keying on the model would collapse both rows onto ONE cell, so
+  // the paired test would compare a run against itself and report a real gap
+  // as noise.
+  const byArm = new Map(cells.map((c) => [rowArm(c), c]));
   const excluded: LeaderboardExclusion[] = [];
 
   const ok = matrix.rows.filter((r) => r.status === "ok");
@@ -199,7 +205,7 @@ export function buildLeaderboard(
   // other cell is excluded with the reason, never silently ranked beside it.
   const instruments = new Map<string, MatrixRow[]>();
   for (const row of ok) {
-    const summary = byModel.get(row.model)?.summary;
+    const summary = byArm.get(rowArm(row))?.summary;
     if (summary === undefined) continue;
     const key = instrumentOf(summary);
     instruments.set(key, [...(instruments.get(key) ?? []), row]);
@@ -250,8 +256,8 @@ export function buildLeaderboard(
       for (let j = i + 1; j < ranked.length; j++) {
         const ra = ranked[i] as MatrixRow;
         const rb = ranked[j] as MatrixRow;
-        const sa = byModel.get(ra.model)?.summary;
-        const sb = byModel.get(rb.model)?.summary;
+        const sa = byArm.get(rowArm(ra))?.summary;
+        const sb = byArm.get(rowArm(rb))?.summary;
         if (sa === undefined || sb === undefined) continue;
         const deltas = pairedDeltas(sa, sb, metric);
         const sig = computeDiffSignificance(

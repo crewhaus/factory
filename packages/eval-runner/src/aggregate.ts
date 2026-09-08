@@ -249,9 +249,9 @@ export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates 
 
   // 0.6.0 §6.1 — the run-level served-model roll-up over the CANONICAL
   // samples (trial 1), so a repeated run stays comparable with a single-trial
-  // one exactly as every other pre-existing field does. Absent when nothing
-  // published a `model_response` role/profile, keeping unrouted runs'
-  // results.json byte-identical.
+  // one exactly as every other pre-existing field does. Absent when no sample
+  // carries the attribution — `runSample` folds it on ROUTED runs only, which
+  // is what keeps unrouted runs' results.json byte-identical.
   const servedModelsFolded = mergeServedModels(samples.map((s) => s.servedModels));
   const servedModels = servedModelsFolded.length > 0 ? servedModelsFolded : undefined;
 

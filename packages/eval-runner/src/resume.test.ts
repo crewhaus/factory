@@ -117,6 +117,23 @@ describe("readRunManifest", () => {
     });
   });
 
+  test("reads back the routed run's instrument block, ignoring junk", () => {
+    const runDir = newTempRoot();
+    writeManifest(runDir, {
+      runId: "run_routed",
+      specHash: "sp",
+      routing: { mode: "candidate:$fast", armId: "fast", armsDigest: "aaaa", warmArms: true },
+    });
+    expect(readRunManifest(runDir).routing).toEqual({
+      mode: "candidate:$fast",
+      armId: "fast",
+      armsDigest: "aaaa",
+    });
+    const junk = newTempRoot();
+    writeManifest(junk, { runId: "run_junk", specHash: "sp", routing: 7 });
+    expect(readRunManifest(junk).routing).toBeUndefined();
+  });
+
   test("refuses a directory that is not a run directory", () => {
     const runDir = newTempRoot();
     expect(() => readRunManifest(runDir)).toThrow(/no run\.json there/);
@@ -223,6 +240,46 @@ describe("resume identity guard", () => {
         { ...base, toolRecording: { mode: "replay", dir: "/other", recordingHash: "h2" } },
       ),
     ).toEqual(["toolRecording: replay:h1 (recorded) → replay:h2 (this run)"]);
+  });
+
+  test("0.6.0 §6.1 — routing is part of the instrument, absent meaning static", () => {
+    const base = { specHash: "sp", datasetHash: "ds", gradersHash: "gr" } as const;
+    // The headline case: a STATIC run resumed under `--routing as-declared`
+    // would finish its unpaid samples through a pool and report the union as
+    // one measurement.
+    expect(
+      resumeMismatches(manifest, { ...base, routing: { mode: "as-declared", armsDigest: "aaaa" } }),
+    ).toEqual(["routing: static (recorded) → as-declared/aaaa (this run)"]);
+    // …and the reverse, since an absent block is a KNOWN value.
+    expect(
+      resumeMismatches({ ...manifest, routing: { mode: "as-declared", armsDigest: "aaaa" } }, base),
+    ).toEqual(["routing: as-declared/aaaa (recorded) → static (this run)"]);
+    // A different arm, and a different frozen snapshot, are each a different
+    // instrument.
+    expect(
+      resumeMismatches(
+        { ...manifest, routing: { mode: "candidate:$fast", armId: "fast", armsDigest: "aaaa" } },
+        {
+          ...base,
+          routing: { mode: "candidate:$strong", armId: "strong", armsDigest: "aaaa" },
+        },
+      ),
+    ).toEqual([
+      "routing: candidate:$fast@fast/aaaa (recorded) → candidate:$strong@strong/aaaa (this run)",
+    ]);
+    expect(
+      resumeMismatches(
+        { ...manifest, routing: { mode: "as-declared", armsDigest: "aaaa" } },
+        { ...base, routing: { mode: "as-declared", armsDigest: "bbbb" } },
+      ),
+    ).toEqual(["routing: as-declared/aaaa (recorded) → as-declared/bbbb (this run)"]);
+    // An unchanged routed instrument resumes cleanly.
+    expect(
+      resumeMismatches(
+        { ...manifest, routing: { mode: "as-declared", armsDigest: "aaaa" } },
+        { ...base, routing: { mode: "as-declared", armsDigest: "aaaa" } },
+      ),
+    ).toEqual([]);
   });
 
   test("the refusal names the run and every mismatch", () => {

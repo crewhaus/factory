@@ -8,7 +8,7 @@ import type { runChatLoop } from "@crewhaus/runtime-core";
 import type { ModelRole, TraceEvent } from "@crewhaus/trace-event-bus";
 import type { CalibrationAggregates } from "./calibration-abstention";
 import type { ParaphraseConsistencySummary } from "./paraphrase-consistency";
-import type { EvalRoutingMode } from "./routing";
+import type { CapturedRouteObservation, EvalRoutingMode } from "./routing";
 import type { SemanticFallbackSummary } from "./semantic-fallback";
 import type { ToolReplayMissPolicy } from "./tool-record";
 
@@ -193,6 +193,27 @@ export type EvalRoutingConfig = {
   readonly learningSeed?: string;
   /** The pool fingerprint the run's decisions carried, when they agreed on one. */
   readonly policyVersion?: string;
+  /**
+   * 0.6.0 §6.1 — every sample routed to the SAME arm on an `as-declared` run
+   * over a multi-arm roster, so the run measured one candidate rather than
+   * what production serves. A cold snapshot answers n=0 for every arm (the
+   * learned policy then keeps the first under-sampled candidate), and a warm
+   * one draws on `(seed, turnIndex, …)`, identical for every single-turn
+   * sample. Absent unless the degeneracy actually happened.
+   */
+  readonly degenerate?: boolean;
+  /** The single arm a {@link degenerate} run routed everything to. */
+  readonly degenerateArm?: string;
+  /**
+   * 0.6.0 §6.1 — what the run WOULD have written to the live scoreboard. The
+   * frozen board's `record()` is a no-op sink so a measurement can never move
+   * a production harness's learned policy; the observations it was handed are
+   * the run's per-arm reward/quality signal, and they are captured here
+   * rather than discarded.
+   */
+  readonly observations?: ReadonlyArray<CapturedRouteObservation>;
+  /** Arms the run tried to mark ungraded, captured the same way. */
+  readonly ungraded?: ReadonlyArray<{ readonly routeKey: string; readonly arm: string }>;
 };
 
 export type SampleResult = {

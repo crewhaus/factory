@@ -250,10 +250,13 @@ function inventoryDeps(): BuildInventoryDeps {
   };
 }
 
-/** The baseline-comparison eval-health reader `fleet status` wires: healthy
- *  unless the newest run for a pinned (spec, dataset) baseline fell below
- *  the baseline run's pass rate. */
-const readEvalHealth: EvalHealthReader = (evalsDir) => {
+/** The baseline-comparison eval-health reader `fleet status` and
+ *  `harness list` both wire: healthy unless the newest run for a pinned
+ *  LINEAGE fell below that baseline run's pass rate. Exported because the
+ *  entry file's `crewhaus fleet status` wires the very same reader — the two
+ *  copies drifted apart once already (one learned the 0.6.0 lineage key and
+ *  the other did not), so there is exactly one now. */
+export const readEvalHealth: EvalHealthReader = (evalsDir) => {
   const runs = readRunIndexLatest(evalsDir);
   if (runs.length === 0) return { healthy: true, note: "no runs recorded" };
   const baselines = readBaselines(evalsDir);

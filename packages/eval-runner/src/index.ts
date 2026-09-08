@@ -152,7 +152,12 @@ import { aggregate } from "./aggregate";
 import { warnUnconsumedCombinePolicy } from "./combine-warnings";
 import { defaultGraderRegistry, resolveRegistryGrader } from "./default-registry";
 import { RunnerError } from "./errors";
-import { assertResumeCompatible, loadCompletedSample, readRunManifest } from "./resume";
+import {
+  type ResumeRouting,
+  assertResumeCompatible,
+  loadCompletedSample,
+  readRunManifest,
+} from "./resume";
 import {
   type EvalRoutingMode,
   type FrozenScoreboard,
@@ -161,6 +166,7 @@ import {
   freezeArmsSnapshot,
   isStaticRouting,
   parseEvalRoutingMode,
+  poolArmIds,
   readLiveArms,
   resolveEvalRouting,
 } from "./routing";
@@ -368,6 +374,7 @@ export {
   type LoadCompletedSampleArgs,
   type ResumeIdentity,
   type ResumeManifest,
+  type ResumeRouting,
 } from "./resume";
 export { Semaphore };
 // Item 20 — the per-sample, line-buffered stdout writer concurrent runs use
@@ -715,6 +722,19 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
     routed !== undefined
       ? freezeArmsSnapshot(warmArms ? readLiveArms(routingRootDir) : [])
       : undefined;
+  // The routing half of the run's INSTRUMENT identity, spread into `run.json`
+  // and into the resume guard. Absent on a static run, so an unrouted
+  // `run.json` stays byte-identical (and reads back as `static`).
+  const resumeRoutingIdentity: { routing?: ResumeRouting } =
+    routed !== undefined
+      ? {
+          routing: {
+            mode: routingMode,
+            ...(routed.armId !== undefined ? { armId: routed.armId } : {}),
+            ...(frozenScoreboard !== undefined ? { armsDigest: frozenScoreboard.armsDigest } : {}),
+          },
+        }
+      : {};
   if (routed !== undefined) {
     process.stdout.write(
       `[eval] routing: ${routingMode}${routed.armId !== undefined ? ` (arm ${routed.armId})` : ""}` +
@@ -813,6 +833,11 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
       ...(repeats > 1 ? { repeats } : {}),
       ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
       ...toolRecordingConfig,
+      // 0.6.0 §6.1 — routing is part of the instrument: a static run resumed
+      // under `--routing as-declared` would finish its unpaid samples through
+      // a pool, and a routed run resumed against a different arm or a
+      // different frozen snapshot is measuring something else again.
+      ...resumeRoutingIdentity,
     });
   }
   await Bun.write(
@@ -842,6 +867,9 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         ...judgeCalibrationConfig,
         // NEW-HUNT-4 — how tool execution was treated (absent = live tools).
         ...toolRecordingConfig,
+        // 0.6.0 §6.1 — how the run was ROUTED (absent = static), so the resume
+        // identity guard can refuse a static→routed (or cross-arm) resume.
+        ...resumeRoutingIdentity,
         // NEW-HUNT-6 — this directory was resumed; `runId`/`startedAt` above
         // are the ORIGINAL run's. One ISO stamp per attempt, appended (the
         // typed round-trip lives in `ResumeManifest.resumedAt`), so a run
@@ -975,6 +1003,8 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
               ...(combine !== undefined ? { combine } : {}),
               ...(seed !== undefined ? { seed } : {}),
               ...(trial > 1 ? { trial } : {}),
+              // 0.6.0 §6.1 — served-model attribution is a ROUTED-run field.
+              ...(routed !== undefined ? { routed: true } : {}),
             });
             // NEW-HUNT-3 — accrue this attempt's agent-model spend toward
             // the budget cap (noise-retry attempts included — those tokens
@@ -1176,6 +1206,37 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         .flatMap((r) => (r.routes ?? []).map((d) => d.policyVersion))
         .filter((v): v is string => v !== undefined),
     );
+    // §6.1 — the frozen board's captured WRITES. `record()` is a no-op sink,
+    // but what it was handed is the run's per-arm reward/quality signal, and
+    // discarding it would throw away the only observation the routed run
+    // produced. Recorded on the manifest (the run-level home for a run-level
+    // capture) rather than per-sample `meta.json`, which carries the sample's
+    // own `routes` lines.
+    const observations = frozenScoreboard.observations();
+    const ungradedArms = frozenScoreboard.ungradedArms();
+    // §6.1 — DEGENERACY. A cold snapshot answers n=0 for every arm, so a
+    // `learned` policy keeps the first under-sampled candidate for every
+    // sample, and a warm one draws on `(seed, turnIndex, band, arm)` — the
+    // same tuple for every single-turn sample. Either way an `as-declared`
+    // run can route the WHOLE dataset to one arm, which does not measure what
+    // production serves. Say so, loudly and on the artifact, instead of
+    // shipping the number as if it were a routed measurement.
+    const decisions = results.flatMap((r) => r.routes ?? []);
+    const armsRouted = new Set(decisions.map((d) => d.arm));
+    const routableArms =
+      ir.agent.modelPool !== undefined ? poolArmIds(ir.agent.modelPool).length : 0;
+    const degenerateArm =
+      routingMode === "as-declared" &&
+      decisions.length > 0 &&
+      armsRouted.size === 1 &&
+      routableArms > 1
+        ? ([...armsRouted][0] as string)
+        : undefined;
+    if (degenerateArm !== undefined) {
+      process.stderr.write(
+        `[eval] warning: the frozen arm snapshot routed all ${decisions.length} decision(s) to "${degenerateArm}" — this run measured ONE arm, not the ${routableArms}-arm roster. Pass --warm-arms so the board has statistics to choose on, or measure each arm on its own with \`eval --models pool --record\`.\n`,
+      );
+    }
     routingConfig = {
       routing: {
         mode: routingMode,
@@ -1185,6 +1246,9 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         ...(armsMutated ? { armsMutated: true } : {}),
         ...(routed.learningSeed !== undefined ? { learningSeed: routed.learningSeed } : {}),
         ...(policyVersions.size === 1 ? { policyVersion: [...policyVersions][0] as string } : {}),
+        ...(degenerateArm !== undefined ? { degenerate: true, degenerateArm } : {}),
+        ...(observations.length > 0 ? { observations } : {}),
+        ...(ungradedArms.length > 0 ? { ungraded: ungradedArms } : {}),
       },
     };
   }

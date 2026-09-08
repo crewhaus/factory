@@ -1127,6 +1127,40 @@ describe("finishEvalRun — per-arm lineages (§6.1)", () => {
     expect(ctx.lines.join("\n")).toContain("not gated and not promotable");
   });
 
+  test("the lineage's SECOND run establishes it, still ungated, legacy pin untouched", async () => {
+    const ctx = newCtx();
+    const primary = makeRun(ctx, "run_prim1111prim1111", [makeSample("a", true, 1)]);
+    await finish(ctx, primary);
+
+    const arm = { armId: "fast", routing: "candidate:$fast" as EvalRoutingMode };
+    // Run 1 of the lineage: recorded, nothing pinned (it must not certify
+    // itself), and the guidance says to re-run.
+    const first = makeRun(ctx, "run_fst11111fst11111", [makeSample("a", false, 0)]);
+    await finish(ctx, first, arm);
+    const key = { specName: "concierge", datasetName: "smoke", ...arm };
+    expect(resolveBaseline(key, ctx.evalsDir).entry).toBeUndefined();
+
+    // Run 2: the guidance was true — the lineage now exists, keyed on the arm,
+    // and still nothing was gated.
+    ctx.lines.length = 0;
+    const second = makeRun(ctx, "run_fst22222fst22222", [makeSample("a", false, 0)]);
+    const seeded = await finish(ctx, second, { ...arm, gateRequested: true });
+    expect(seeded.gateFailed).toBe(false);
+    expect(seeded.lineageSeeded).toBe(true);
+    expect(resolveBaseline(key, ctx.evalsDir).entry?.runId).toBe("run_fst22222fst22222");
+    expect(resolveBaseline(key, ctx.evalsDir).entry?.armId).toBe("fast");
+    expect(ctx.lines.join("\n")).toContain("establishing concierge/smoke#fast");
+    // The primary's unrouted pin never moved.
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_prim1111prim1111");
+
+    // Run 3 gates against the arm's OWN baseline, not the primary's.
+    const third = makeRun(ctx, "run_fst33333fst33333", [makeSample("a", true, 1)]);
+    const gated = await finish(ctx, third, { ...arm, gateRequested: true });
+    expect(gated.gateFailed).toBe(false);
+    expect(gated.lineageSeeded).toBeUndefined();
+    expect(ctx.lines.join("\n")).toContain("vs baseline run_fst22222fst22222");
+  });
+
   test("with no legacy pin at all a routed first run pins normally", async () => {
     const ctx = newCtx();
     const run = makeRun(

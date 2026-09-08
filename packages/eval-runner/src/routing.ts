@@ -24,7 +24,9 @@
  * FROZEN snapshot through runtime-core's `_scoreboard` seam
  * ({@link freezeArmsSnapshot}): `score()` answers from statistics read ONCE
  * at run start, `record()` / `ungraded()` / `compact()` are no-op sinks whose
- * observations are captured for `meta.json` instead. The snapshot's
+ * observations are captured onto the run's `routing` manifest
+ * (`results.json`) instead — a run-level capture belongs on the run-level
+ * artifact; each sample's own `meta.json` carries its `routes` lines. The snapshot's
  * {@link armsDigest} is recorded on the run entry and guards cross-run
  * comparison — two different arm snapshots are two different instruments.
  * `--warm-arms` seeds the snapshot from the harness's live `arms.jsonl`; the
@@ -260,9 +262,11 @@ export type CapturedRouteObservation = {
 export type FrozenScoreboard = Scoreboard & {
   /** Digest of the frozen snapshot — the routed run's instrument identity. */
   readonly armsDigest: string;
-  /** Everything the run tried to record, in order. */
+  /** Everything the run tried to record, in order. Read by `runEval` into
+   *  `EvalRunSummary.config.routing.observations`. */
   observations(): ReadonlyArray<CapturedRouteObservation>;
-  /** Arms the run tried to mark ungraded, in order. */
+  /** Arms the run tried to mark ungraded, in order — likewise captured onto
+   *  the run's routing manifest as `routing.ungraded`. */
   ungradedArms(): ReadonlyArray<{ readonly routeKey: string; readonly arm: string }>;
 };
 
