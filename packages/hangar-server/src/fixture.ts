@@ -93,6 +93,19 @@ export type FixtureHarnessOptions = {
   readonly incidents?: readonly string[];
   /** `.crewhaus/specs/<name>/CHANGELOG.md` bodies. */
   readonly specChangelogs?: Readonly<Record<string, string>>;
+  /** 0.6.0 — `.crewhaus/routing/arms.jsonl` lines (the routing scoreboard's
+   *  append-only store), written verbatim so a test can seed a v1 or a v2
+   *  line without importing `@crewhaus/routing-store`. */
+  readonly routingArms?: readonly unknown[];
+  /** 0.6.0 — `.crewhaus/routing/freeze.json`. */
+  readonly routingFreeze?: unknown;
+  /** A spec registry under `.crewhaus/specs/<name>/`: the manifest (versions
+   *  + env pins) and one YAML per archived version. */
+  readonly specRegistry?: {
+    readonly dirName: string;
+    readonly manifest: unknown;
+    readonly versions?: Readonly<Record<string, string>>;
+  };
   /** A compiled bundle at `dist/`: the entry file plus, optionally, the
    *  F-5 spec-hash-stamped `package.json`. */
   readonly bundle?: {
@@ -270,6 +283,33 @@ export function makeFixtureHarness(dir: string, opts: FixtureHarnessOptions = {}
     }
     if (opts.watchmeObservations !== undefined) {
       writeFileSync(join(wmDir, "observations.jsonl"), jsonl(opts.watchmeObservations));
+    }
+  }
+
+  if (opts.routingArms !== undefined || opts.routingFreeze !== undefined) {
+    const routingDir = join(ch, "routing");
+    mkdirSync(routingDir, { recursive: true });
+    if (opts.routingArms !== undefined) {
+      writeFileSync(join(routingDir, "arms.jsonl"), jsonl(opts.routingArms), { mode: 0o600 });
+    }
+    if (opts.routingFreeze !== undefined) {
+      writeFileSync(
+        join(routingDir, "freeze.json"),
+        `${JSON.stringify(opts.routingFreeze, null, 2)}\n`,
+        { mode: 0o600 },
+      );
+    }
+  }
+
+  if (opts.specRegistry !== undefined) {
+    const specDir = join(ch, "specs", opts.specRegistry.dirName);
+    mkdirSync(specDir, { recursive: true });
+    writeFileSync(
+      join(specDir, "manifest.json"),
+      `${JSON.stringify(opts.specRegistry.manifest, null, 2)}\n`,
+    );
+    for (const [version, yaml] of Object.entries(opts.specRegistry.versions ?? {})) {
+      writeFileSync(join(specDir, `${version}.yaml`), yaml);
     }
   }
 

@@ -786,6 +786,36 @@ table.fleet {
   font-size: 10.5px;
 }
 
+/* 0.6.0 — the Models tab's share meter and its chip row. A share is always
+   rendered NEXT TO its number, never instead of one: the bar is the shape of
+   the split, the figure is the claim. */
+.meter {
+  min-width: 72px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--rule-2);
+  overflow: hidden;
+}
+.meter-fill {
+  height: 100%;
+  background: var(--accent);
+  opacity: 0.85;
+}
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-bottom: 8px;
+}
+.chips .chip {
+  cursor: pointer;
+  font-family: var(--mono);
+}
+tr.row-best td {
+  background: var(--accent-ghost);
+}
+
 /* preflight + folds */
 .fold {
   border: 1px solid var(--rule);

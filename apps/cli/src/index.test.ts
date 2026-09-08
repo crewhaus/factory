@@ -1794,6 +1794,147 @@ describe("crewhaus cost-summary", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("cachedReadTokens / (inputTokens + cachedReadTokens)");
     expect(result.stdout).toContain("cache-write premium");
+    // 0.6.0 §8.3 — the attribution splits and the summary rule are documented
+    // where an operator meets them.
+    expect(result.stdout).toContain("byRole");
+    expect(result.stdout).toContain("byProfile");
+  });
+
+  // ---- 0.6.0 §8.3 — role / profile attribution -----------------------------
+
+  test("json splits spend by role and by profile; an unattributed call is `primary` / (none)", async () => {
+    seedSession([
+      {
+        ts: 1,
+        version: 1,
+        kind: "cost_accrual",
+        payload: {
+          provider: "anthropic",
+          modelId: "claude-haiku-4-5",
+          costUsdMicros: 400,
+          role: "draft",
+          profile: "fast",
+        },
+      },
+      {
+        ts: 2,
+        version: 1,
+        kind: "cost_accrual",
+        payload: {
+          provider: "anthropic",
+          modelId: "claude-opus-5",
+          costUsdMicros: 1600,
+          role: "judge",
+          profile: "strong",
+        },
+      },
+      // No attribution at all: the pre-0.6.0 shape, and the main turn.
+      {
+        ts: 3,
+        version: 1,
+        kind: "cost_accrual",
+        payload: { provider: "anthropic", modelId: "claude-opus-5", costUsdMicros: 100 },
+      },
+    ]);
+    const result = await runCli(["cost-summary", "--session", SESSION_ID, "--format", "json"], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as {
+      totalUsdMicros: number;
+      byRole: Record<string, number>;
+      byProfile: Record<string, number>;
+    };
+    expect(out.totalUsdMicros).toBe(2100);
+    expect(out.byRole).toEqual({ draft: 400, judge: 1600, primary: 100 });
+    expect(out.byProfile).toEqual({ fast: 400, strong: 1600, "(none)": 100 });
+  });
+
+  test("a role-bearing `summary: true` roll-up is counted; a role-less run total is not", async () => {
+    seedSession([
+      {
+        ts: 1,
+        version: 1,
+        kind: "cost_accrual",
+        payload: { provider: "anthropic", modelId: "claude-opus-5", costUsdMicros: 1000 },
+      },
+      // The sub-agent spawner's roll-up: the child's tracker is suppressed, so
+      // this line is the ONLY record of that spend anywhere.
+      {
+        ts: 2,
+        version: 1,
+        kind: "cost_accrual",
+        payload: {
+          provider: "anthropic",
+          modelId: "claude-haiku-4-5",
+          costUsdMicros: 250,
+          role: "subagent",
+          profile: "fast",
+          summary: true,
+        },
+      },
+      // The optimizer's role-LESS run total: a sum over lines already folded.
+      {
+        ts: 3,
+        version: 1,
+        kind: "cost_accrual",
+        payload: {
+          provider: "anthropic",
+          modelId: "claude-opus-5",
+          costUsdMicros: 9999,
+          summary: true,
+        },
+      },
+    ]);
+    const result = await runCli(["cost-summary", "--session", SESSION_ID, "--format", "json"], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as {
+      count: number;
+      totalUsdMicros: number;
+      byRole: Record<string, number>;
+    };
+    expect(out.count).toBe(2);
+    expect(out.totalUsdMicros).toBe(1250);
+    expect(out.byRole).toEqual({ primary: 1000, subagent: 250 });
+  });
+
+  test("text format prints the role and profile splits, biggest first", async () => {
+    seedSession([
+      {
+        ts: 1,
+        version: 1,
+        kind: "cost_accrual",
+        payload: {
+          provider: "anthropic",
+          modelId: "claude-opus-5",
+          costUsdMicros: 2000,
+          role: "judge",
+          profile: "strong",
+        },
+      },
+      {
+        ts: 2,
+        version: 1,
+        kind: "cost_accrual",
+        payload: {
+          provider: "anthropic",
+          modelId: "claude-haiku-4-5",
+          costUsdMicros: 500,
+          role: "draft",
+          profile: "fast",
+        },
+      },
+    ]);
+    const result = await runCli(["cost-summary", "--session", SESSION_ID], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    const roleBlock = result.stdout.slice(result.stdout.indexOf("by role:"));
+    expect(roleBlock.indexOf("judge")).toBeLessThan(roleBlock.indexOf("draft"));
+    expect(result.stdout).toContain("  judge: $0.0020");
+    expect(result.stdout).toContain("  draft: $0.0005");
+    expect(result.stdout).toContain("  strong: $0.0020");
+    expect(result.stdout).toContain("  fast: $0.0005");
   });
 });
 

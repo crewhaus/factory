@@ -1170,6 +1170,48 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["totals.optimal", "number"],
   ),
 
+  // ---- 0.6.0 · models (design §8.3) --------------------------------------
+  // Arrays are asserted as arrays: a harness with no pool has an empty
+  // registry and no arms, and that IS a real answer this screen renders.
+  models: m3Read(
+    ["registry", "array"],
+    ["pool.declared", "boolean"],
+    ["pool.policy", "string|null"],
+    ["pool.candidates", "array"],
+    ["spend.totalUsdMicros", "number"],
+    ["spend.calls", "number"],
+    ["spend.rollups", "number"],
+    ["spend.byRole", "array"],
+    ["spend.byProfile", "array"],
+    ["spend.byModel", "array"],
+    ["arms", "array"],
+    ["leaderboard", "array"],
+    ["sessions", "array"],
+    ["armsPath", "string|null"],
+    ["priors.present", "boolean"],
+    ["guidance", "string"],
+    ["asOf", "string"],
+  ),
+  modelRoutes: m3Read(
+    ["sessionId", "string"],
+    ["entries", "array"],
+    ["counts", "object"],
+    ["truncated", "boolean"],
+    ["kinds", "array"],
+  ),
+  modelArms: m3Read(
+    ["arms", "array"],
+    ["armsPath", "string|null"],
+    ["bands", "array"],
+    ["priors.present", "boolean"],
+  ),
+  modelLeaderboard: m3Read(
+    ["leaderboard", "array"],
+    ["best", "array"],
+    ["bands", "array"],
+    ["guidance", "string"],
+  ),
+
   // Both runtime reads carry `supervision`, which is how the console knows
   // whether Stop is a button or a disabled control with a reason.
   mcpServers: m3Read(
@@ -1220,6 +1262,7 @@ const ALL_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> =
  */
 const M3_PARAMS: Record<string, string> = {
   runId: "run_00000000000000aa",
+  sess: "sess_00000000000000aa",
   optRunId: "run_00000000000000aa",
   sampleId: "s1",
   version: "1.0.0",
@@ -1424,6 +1467,23 @@ function contractHarness(t: TestServer): string {
   return makeFixtureHarness(join(t.harnessesRoot, "contract"), {
     specName: "contract-harness",
     specExtra: [
+      // 0.6.0 (design §8.3) — a two-candidate pool over two `models:`
+      // profiles, so the Models tab's registry, pool and leaderboard all
+      // have something real to answer with. Indented lines continue the
+      // `agent:` mapping the fixture opened; the column-0 blocks follow.
+      "  model_pool:",
+      "    policy: heuristic",
+      "    candidates:",
+      "      - model: $fast",
+      "        tags: [cheap]",
+      "      - model: $strong",
+      "        tags: [strong]",
+      "models:",
+      "  fast:",
+      "    model: claude-haiku-4-5",
+      "    max_tokens: 2048",
+      "  strong:",
+      "    model: claude-opus-5",
       "memory:",
       "  recall: true",
       "  dream:",
@@ -1528,10 +1588,71 @@ function contractHarness(t: TestServer): string {
               costUsdMicros: 1500,
               inputTokens: 10,
               outputTokens: 5,
+              role: "primary",
+              profile: "fast",
+            },
+            iso(NOW - DAY),
+          ),
+          // A nested run's roll-up, re-published on this bus by the sub-agent
+          // spawner: role-bearing + `summary: true`, so it FOLDS (the child's
+          // own tracker is suppressed and writes no per-call line anywhere).
+          logLine(
+            "cost_accrual",
+            {
+              provider: "anthropic",
+              modelId: "m-beta",
+              costUsdMicros: 900,
+              inputTokens: 40,
+              outputTokens: 8,
+              role: "subagent",
+              profile: "strong",
+              summary: true,
+            },
+            iso(NOW - DAY),
+          ),
+          // The durable routing lines the Models tab's timeline reads.
+          logLine(
+            "model_route",
+            {
+              turnNumber: 1,
+              routeKey: "easy",
+              model: "claude-haiku-4-5",
+              profile: "fast",
+              policy: "heuristic",
+              reason: "no tools in play",
+            },
+            iso(NOW - DAY),
+          ),
+          logLine(
+            "model_stage",
+            {
+              turnNumber: 1,
+              stage: "draft",
+              strategy: "cascade",
+              role: "draft",
+              model: "claude-haiku-4-5",
+              profile: "fast",
+              outcome: "done",
             },
             iso(NOW - DAY),
           ),
         ],
+      },
+    ],
+    // The learned scoreboard: two live arms plus one observe-only shadow
+    // lane, in the store's own append-only line grammar.
+    routingArms: [
+      { v: 1, k: "easy", m: "claude-haiku-4-5", r: 0.82, s: 1, l: 900, c: 0.0004, t: NOW - DAY },
+      { v: 1, k: "easy", m: "claude-opus-5", r: 0.61, s: 1, l: 2100, c: 0.004, t: NOW - DAY },
+      {
+        v: 2,
+        k: "shadow:easy",
+        m: "claude-sonnet-4-6",
+        r: 0.7,
+        s: 1,
+        l: 1200,
+        q: 0.7,
+        t: NOW - DAY,
       },
     ],
     memories: {
@@ -1885,6 +2006,62 @@ describe("UI route contract", () => {
         // section above — this loop proves it answered, not that it worked.
         if (route.method === "GET") assertViewReads(key, body);
       }
+
+      // -- 0.6.0 · models: the acceptance item, not just the shape ---------
+      // "GET /api/h/:id/models returns registry + arms + leaderboard", and
+      // per-profile spend is FOLDED — including the sub-agent roll-up, whose
+      // per-call lines exist in no log at all.
+      const modelsBody = await drive("models", { id }, { readsKey: "models" });
+      expect((modelsBody["registry"] as Array<{ name: string }>).map((r) => r.name)).toEqual([
+        "fast",
+        "strong",
+      ]);
+      expect((modelsBody["pool"] as { declared: boolean }).declared).toBe(true);
+      expect(
+        (modelsBody["pool"] as { candidates: Array<{ profile: string | null }> }).candidates.map(
+          (c) => c.profile,
+        ),
+      ).toEqual(["fast", "strong"]);
+      const modelSpend = modelsBody["spend"] as {
+        totalUsdMicros: number;
+        rollups: number;
+        byRole: Array<{ role: string; usdMicros: number }>;
+        byProfile: Array<{ profile: string; usdMicros: number }>;
+      };
+      expect(modelSpend.rollups).toBe(1);
+      expect(modelSpend.totalUsdMicros).toBe(2400);
+      expect(modelSpend.byRole).toEqual([
+        { role: "primary", calls: 1, usdMicros: 1500, inputTokens: 10, outputTokens: 5 },
+        { role: "subagent", calls: 1, usdMicros: 900, inputTokens: 40, outputTokens: 8 },
+      ] as unknown as Array<{ role: string; usdMicros: number }>);
+      expect(modelSpend.byProfile.map((p) => p.profile)).toEqual(["fast", "strong"]);
+      expect((modelsBody["arms"] as unknown[]).length).toBe(3);
+      const board = modelsBody["leaderboard"] as Array<{
+        band: string;
+        model: string;
+        best: boolean;
+        shadow: boolean;
+      }>;
+      // Bands sort alphabetically ("easy" before "shadow:easy"); inside a
+      // band the highest mean reward leads and is starred.
+      expect(board.filter((r) => r.best).map((r) => r.model)).toEqual([
+        "claude-haiku-4-5",
+        "claude-sonnet-4-6",
+      ]);
+      // `band`, never `routeKey`: `maskDeep` redacts a camel-case `…Key`
+      // field wholesale, so serving the durable name would paint every band
+      // `[redacted]`. This assertion is that regression's alarm.
+      expect(board.find((r) => r.band === "shadow:easy")?.shadow).toBe(true);
+
+      const timeline = await drive(
+        "modelRoutes",
+        { id, sess: "sess_00000000000000aa" },
+        { readsKey: "modelRoutes" },
+      );
+      expect((timeline["entries"] as Array<{ kind: string }>).map((e) => e.kind)).toEqual([
+        "model_route",
+        "model_stage",
+      ]);
 
       // -- M4: health, onboarding, ⌘K, notifications, read-only, plugins ---
       // Every one is a REAL handler (no `group`, so no 501 is acceptable);

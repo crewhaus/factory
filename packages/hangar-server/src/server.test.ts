@@ -488,6 +488,25 @@ describe("/api/harnesses rows + rollup cache", () => {
           totalUsdMicros: 2500,
           calls: 3,
           spend7dUsdMicros: 2000,
+          byRole: [
+            {
+              role: "primary",
+              calls: 3,
+              usdMicros: 2500,
+              inputTokens: 10,
+              outputTokens: 5,
+            },
+          ],
+          byProfile: [
+            {
+              profile: "(none)",
+              calls: 3,
+              usdMicros: 2500,
+              inputTokens: 10,
+              outputTokens: 5,
+            },
+          ],
+          rollups: 0,
           byModel: [
             {
               provider: "anthropic",
@@ -618,6 +637,29 @@ describe("cost routes", () => {
             outputTokens: 0,
           },
         ],
+        // 0.6.0 — the golden log carries no `role`/`profile` attribution, so
+        // every priced call folds under the main turn and the un-profiled
+        // bucket. The role-LESS `summary: true` line stays skipped: it is a
+        // run total over calls already counted (`rollups: 0` says so).
+        byRole: [
+          {
+            role: "primary",
+            calls: 3,
+            usdMicros: 2500,
+            inputTokens: 10,
+            outputTokens: 5,
+          },
+        ],
+        byProfile: [
+          {
+            profile: "(none)",
+            calls: 3,
+            usdMicros: 2500,
+            inputTokens: 10,
+            outputTokens: 5,
+          },
+        ],
+        rollups: 0,
         days: goldenDays(),
         truncatedFiles: 0,
       },

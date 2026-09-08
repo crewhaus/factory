@@ -13256,7 +13256,18 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
         "  hit      cache hit ratio = cachedReadTokens / (inputTokens + cachedReadTokens)\n" +
         "  savings  realized savings = (cached reads at the full input price)\n" +
         "           - (cached reads at the discounted rate)\n" +
-        "           - (cache-write premium paid above the normal input price)\n",
+        "           - (cache-write premium paid above the normal input price)\n" +
+        "\n" +
+        "attribution (0.6.0):\n" +
+        "  byRole     spend by the role each call carried (primary, draft, judge,\n" +
+        "             escalation, consult, guide, classifier, committee, shadow,\n" +
+        "             compaction, subagent); an unattributed call is `primary`\n" +
+        "  byProfile  spend by the models: profile that served; calls that\n" +
+        "             resolved no profile are grouped under (none)\n" +
+        "\n" +
+        "a `summary: true` accrual carrying a role is a NESTED run's roll-up\n" +
+        "(a sub-agent total re-published on the parent bus) and is counted; a\n" +
+        "role-less one is a run total over calls already counted, and is not.\n",
     );
     return;
   }
@@ -13273,6 +13284,9 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
     .filter((l) => l !== "");
   let totalMicros = 0;
   const byProvider: Record<string, number> = {};
+  /** 0.6.0 §8.3 — the attribution splits, mirrored by Hangar's cost fold. */
+  const byRole: Record<string, number> = {};
+  const byProfile: Record<string, number> = {};
   let count = 0;
   const totalCache: CacheStats = {
     inputTokens: 0,
@@ -13304,6 +13318,9 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
       type AccrualFields = {
         provider?: string;
         modelId?: string;
+        role?: string;
+        profile?: string;
+        summary?: boolean;
         costUsdMicros?: number;
         inputTokens?: number;
         outputTokens?: number;
@@ -13313,9 +13330,27 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
       const e = parsed as AccrualFields & { payload?: AccrualFields };
       const provider = e.payload?.provider ?? e.provider;
       const micros = e.payload?.costUsdMicros ?? e.costUsdMicros;
+      // 0.6.0 — `summary: true` wears one flag over two different lines. A
+      // ROLE-LESS one is a run TOTAL summed from per-call accruals this fold
+      // has already counted (the optimizer publishes those), so counting it
+      // double-counts. A ROLE-BEARING one is a nested run's roll-up
+      // re-published on the parent bus — a sub-agent's total, priced by its
+      // publisher over calls whose per-call lines exist in no log, because
+      // the child's tracker runs suppressed. That one IS the only record of
+      // that spend, and skipping it is how a hybrid harness under-reports.
+      // The same split `@crewhaus/cost-tracker` makes on the live bus.
+      const role = e.payload?.role ?? e.role;
+      const summary = (e.payload?.summary ?? e.summary) === true;
+      if (summary && (typeof role !== "string" || role === "")) continue;
       if (typeof provider === "string" && typeof micros === "number") {
         totalMicros += micros;
         byProvider[provider] = (byProvider[provider] ?? 0) + micros;
+        const roleKey = typeof role === "string" && role !== "" ? role : "primary";
+        byRole[roleKey] = (byRole[roleKey] ?? 0) + micros;
+        const profileRaw = e.payload?.profile ?? e.profile;
+        const profileKey =
+          typeof profileRaw === "string" && profileRaw !== "" ? profileRaw : "(none)";
+        byProfile[profileKey] = (byProfile[profileKey] ?? 0) + micros;
         count++;
         const modelId = e.payload?.modelId ?? e.modelId;
         const delta: CacheStats = {
@@ -13379,6 +13414,8 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
         count,
         totalUsdMicros: totalMicros,
         byProvider,
+        byRole,
+        byProfile,
         inputTokens: totalCache.inputTokens,
         outputTokens: totalCache.outputTokens,
         cachedReadTokens: totalCache.cachedReadTokens,
@@ -13394,6 +13431,24 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
     process.stdout.write(`total: $${totalDollars.toFixed(4)}\n`);
     for (const [p, m] of Object.entries(byProvider)) {
       process.stdout.write(`  ${p}: $${(m / 1_000_000).toFixed(4)}\n`);
+    }
+    // Biggest first, so "the judge is most of the bill" is the first line the
+    // eye lands on rather than something to be reconstructed.
+    const ranked = (bucket: Record<string, number>): Array<[string, number]> =>
+      Object.entries(bucket).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    const roleRows = ranked(byRole);
+    if (roleRows.length > 0) {
+      process.stdout.write("by role:\n");
+      for (const [role, m] of roleRows) {
+        process.stdout.write(`  ${role}: $${(m / 1_000_000).toFixed(4)}\n`);
+      }
+    }
+    const profileRows = ranked(byProfile);
+    if (profileRows.length > 0) {
+      process.stdout.write("by profile:\n");
+      for (const [profile, m] of profileRows) {
+        process.stdout.write(`  ${profile}: $${(m / 1_000_000).toFixed(4)}\n`);
+      }
     }
     process.stdout.write(`cache: ${formatCacheLine(totalCache, totalSavings)}\n`);
     for (const row of modelRows) {
