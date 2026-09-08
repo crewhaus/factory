@@ -207,7 +207,7 @@ describe("emitWorkflow — per-step model routing (item 9)", () => {
   });
 });
 
-describe("0.6.0 PR 9d — side-call strategies on a step", () => {
+describe("0.6.0 PR 9d — closure-shaped pool keys on a step", () => {
   const COMMITTEE: IrModelPool = {
     ...POOL,
     strategy: { committee: { members: ["fast", "deep"], judge: "claude-opus-4-8" } },
@@ -221,14 +221,14 @@ describe("0.6.0 PR 9d — side-call strategies on a step", () => {
     ...(modelPool !== undefined ? { modelPool } : {}),
   });
 
-  test("a step whose pool declares a committee renders the wireSideCalls spread after modelPool and imports the composition root", () => {
+  test("a step whose pool declares a committee renders the wireHybrid spread after modelPool and imports the composition root", () => {
     const c = agentOf(wf([step(COMMITTEE)]));
-    expect(c).toContain('import { wireSideCalls } from "@crewhaus/model-service";');
+    expect(c).toContain('import { wireHybrid } from "@crewhaus/model-service";');
     const pool = JSON.stringify({ ...COMMITTEE, scope: "draft" });
     expect(c).toContain(
-      `\n    modelPool: ${pool},\n    ...wireSideCalls(${pool}, { sessionName: "routed" }),\n`,
+      `\n    modelPool: ${pool},\n    ...wireHybrid(${pool}, { sessionName: "routed" }),\n`,
     );
-    expect((c.match(/wireSideCalls\(/g) ?? []).length).toBe(1);
+    expect((c.match(/wireHybrid\(/g) ?? []).length).toBe(1);
   });
 
   test("a judge-gated step renders it on its re-invocable closure too", () => {
@@ -253,13 +253,13 @@ describe("0.6.0 PR 9d — side-call strategies on a step", () => {
       ]),
     );
     expect(c).toContain("const __runStep1 = async (__nudge: string)");
-    expect(c).toContain("...wireSideCalls(");
+    expect(c).toContain("...wireHybrid(");
   });
 
   test("byte-identity: a pooled step without a side-call strategy renders neither the spread nor the import", () => {
     const c = agentOf(wf([step(POOL)]));
-    expect(c).not.toContain("wireSideCalls");
+    expect(c).not.toContain("wireHybrid");
     expect(c).not.toContain("@crewhaus/model-service");
-    expect(agentOf(wf([step()]))).not.toContain("wireSideCalls");
+    expect(agentOf(wf([step()]))).not.toContain("wireHybrid");
   });
 });

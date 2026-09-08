@@ -156,6 +156,14 @@ export function loopContractRunOptions(ir: LoopContractIrSlice): LoopContractRun
  * spreads the fragment and adds nothing by hand. `deps` carries the session
  * facts the nested consult loops persist under (the spec name).
  *
+ * PR 9e closes the parity gap those constructions opened. `hybridTools` /
+ * `escalation`, `routeClassifier` (9b) and `sideCalls` (9d) are CLOSURES, so
+ * they cannot ride the pool blob a bundle renders — for two waves the
+ * interpreter had them and a compiled bundle did not. The emitters now render
+ * `...wireHybrid(<pool blob>, { sessionName })` beside the literal fields,
+ * which is precisely the slice `wireModels` appends here; `hybrid-parity.test.ts`
+ * evaluates the emitted text and compares the two option sets key for key.
+ *
  * `modelOverride` is the raw `--model` flag value: a string is an explicit
  * routing decision authored against a different primary, so the spec's
  * chain, tiers and pool (and with it the hybrid tools) are dropped (the

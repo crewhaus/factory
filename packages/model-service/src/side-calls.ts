@@ -34,7 +34,6 @@ import { randomBytes, randomUUID } from "node:crypto";
 import type { ProviderAdapter, ProviderId } from "@crewhaus/adapter-anthropic";
 import { DEFAULT_PRICING, computeCostMicros, resolvePricing } from "@crewhaus/cost-tracker";
 import { judgePairwise, judgeSelect } from "@crewhaus/eval-judge";
-import { escapeJsonString } from "@crewhaus/infra-utils";
 import type { IrModelPoolStrategy } from "@crewhaus/ir";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import {
@@ -755,23 +754,4 @@ export function wireSideCalls(
     ...(committee !== undefined ? { committee } : {}),
   };
   return Object.keys(sideCalls).length > 0 ? { sideCalls } : {};
-}
-
-/**
- * The codegen twin of {@link wireSideCalls}: the spread field a single-turn
- * emitter (workflow step, graph node) renders onto a pooled block's
- * `runChatLoop({...})` when the pool declares a guide, a shadow or a
- * committee — `\n<indent>...wireSideCalls(<pool blob>, { sessionName }),` —
- * so the bundle constructs the closures at boot through THIS package. `""`
- * for every other pool, keeping pre-9d bundles byte-identical. The pool blob
- * is the same `JSON.stringify` every emitter already writes for `modelPool`.
- */
-export function renderSideCallWiringFields(
-  fragment: { readonly modelPool?: SideCallPool },
-  indent: string,
-  sessionName: string,
-): string {
-  const pool = fragment.modelPool;
-  if (pool === undefined || !hasSideCallStrategy(pool)) return "";
-  return `\n${indent}...wireSideCalls(${JSON.stringify(pool)}, { sessionName: ${escapeJsonString(sessionName)} }),`;
 }

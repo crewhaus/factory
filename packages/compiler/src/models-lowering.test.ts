@@ -1068,36 +1068,36 @@ describe("model_pool candidates carry the merged profile (key order is the byte 
     const pendingPaths = warnings
       .filter((w) => w.code === "model-plan-pending-runtime")
       .map((w) => w.path);
-    for (const key of ["policy", "directives", "rules", "classifier"]) {
-      expect(pendingPaths).toContain(`agent.model_pool.${key}`);
+    // PR 9b consumes `directives` and `rules` straight off the blob on BOTH
+    // paths; PR 9c consumes `strategy.cascade` + `max_escalations`; PR 10
+    // consumes `reward` (quality fold, priors, floor, lineage reset); PR 9e
+    // renders the closure call into the cli bundle, so the classifier, the
+    // side calls and the model-directed pair pend nowhere on this target —
+    // nothing on this pool is inert any more.
+    for (const key of [
+      "directives",
+      "rules",
+      "policy",
+      "classifier",
+      "reward",
+      "scope",
+      "strategy",
+      "strategy.cascade",
+      "strategy.guide",
+      "strategy.shadow",
+      "strategy.model_directed",
+    ]) {
+      expect(pendingPaths).not.toContain(`agent.model_pool.${key}`);
     }
-    // PR 10 consumes `reward` (quality fold, priors, floor, lineage reset).
-    expect(pendingPaths).not.toContain("agent.model_pool.reward");
-    // PR 9c consumes `strategy.cascade` + `max_escalations`; the side-call
-    // closures (guide / shadow / committee) pend field-precisely on PR 9d.
-    expect(pendingPaths).not.toContain("agent.model_pool.strategy");
-    expect(pendingPaths).not.toContain("agent.model_pool.strategy.cascade");
-    expect(pendingPaths).toContain("agent.model_pool.strategy.guide");
-    expect(pendingPaths).toContain("agent.model_pool.strategy.shadow");
-    // PR 9a consumes `scope` (stamped on `model_route.scope`): never pending.
-    expect(pendingPaths).not.toContain("agent.model_pool.scope");
-    // PR 8b landed the interpreter half of model_directed; the warning is
-    // scoped to compiled targets until the emitters gain a boot-time
-    // wireModels call (a later row — bundles cannot import model-service,
-    // which depends on runtime-core) — it must not claim "the runtime"
-    // ignores the key.
-    const directedWarning = warnings.find(
-      (w) => w.path === "agent.model_pool.strategy.model_directed",
-    )?.message;
-    expect(directedWarning).toContain("crewhaus run / serve interpreter");
-    expect(directedWarning).toContain("compiled bundle does not register the tools yet");
-    expect(directedWarning).toContain("wireModels");
-    expect(directedWarning).not.toContain("the runtime does not honour it");
+    // PR 9e — the bundle carries the pool blob AND the composition-root call
+    // that turns its closure-shaped keys into runtime closures.
     const agentTs = compile(yaml, opts).files.find((f) => f.path === "agent.ts")?.content ?? "";
     expect(agentTs).toContain('"policy":"classifier"');
     expect(agentTs).toContain(
       '"cascade":{"draft":"cheap","escalateTo":"strong","cleanPrompt":true}',
     );
+    expect(agentTs).toContain('import { wireHybrid } from "@crewhaus/model-service";');
+    expect(agentTs).toContain("...wireHybrid({");
     expect(agentTs).not.toContain('"$');
   });
 });
