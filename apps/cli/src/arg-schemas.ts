@@ -244,6 +244,10 @@ export const INIT_SCHEMA: ParseArgsSchema = {
     // Item 30 — also scaffold .github/workflows/sentinel-drift.yml, the nightly
     // model-drift sentinel cron. Composable with an existing harness like --ci.
     { name: "sentinel", takesValue: false },
+    // 0.6.0 §9.2 — scaffold the HYBRID spec instead of the single-model one:
+    // the three-line `models:` registry, a two-arm pool, the cascade and the
+    // judge that triggers it, every line commented.
+    { name: "hybrid", takesValue: false },
     // NEW-HUNT-8 — scaffold the TIERED workflow against a suite manifest:
     // --ci emits fast-tier-on-PR + nightly-tier-on-cron, --sentinel appends a
     // nightly tier step beside the drift probe. Without it both scaffolds are
@@ -455,6 +459,12 @@ export const MODEL_SCHEMA: ParseArgsSchema = {
     { name: "pass-rate-tolerance", takesValue: true },
     // Max candidates per slot (cheapest-first). Default 3.
     { name: "per-slot-limit", takesValue: true },
+    // 0.6.0 §9.1 (loop 4) — search ONE enumerated slot by its label.
+    { name: "slot", takesValue: true },
+    // 0.6.0 §9.1 (loop 4) — FIX the candidate set (comma-separated) instead
+    // of searching for cheaper siblings: the sunset gate measures a
+    // replacement, which is normally pricier than the model it retires.
+    { name: "candidates", takesValue: true },
     // Apply the winning downshift via a direct comment-preserving CST edit.
     { name: "write", takesValue: false },
     // Item 40 — `--detect`: read-only inventory of reachable providers, the
@@ -531,6 +541,12 @@ export const OPTIMIZE_SCHEMA: ParseArgsSchema = {
     // the same auto-register + changelog flow as `compile` runs; this is the
     // explicit opt-out (mirrors `compile --no-register`).
     { name: "no-register", takesValue: false },
+    // 0.6.0 §6.1 / §9.1 — route the from-advice baseline AND every candidate
+    // identically, off ONE frozen arm snapshot. A `route propose` patch
+    // changes how the pool routes, so a `static` eval would grade a spec
+    // nobody serves; `gateRuns` refuses a pair that read different snapshots.
+    { name: "routing", takesValue: true },
+    { name: "warm-arms", takesValue: false },
     { name: "out", short: "o", takesValue: true },
     { name: "help", short: "h" },
   ],
@@ -560,6 +576,12 @@ export const FLYWHEEL_SCHEMA: ParseArgsSchema = {
     { name: "allow-dirty", takesValue: false },
     // `flywheel init` — overwrite an existing workflow scaffold.
     { name: "force", takesValue: false },
+    // 0.6.0 §9.1 (loop 7) — `flywheel init --model-plan` also scaffolds
+    // `.github/workflows/crewhaus-model-plan.yml`: the nightly
+    // `models audit --propose` / `route propose` job that opens a PR and
+    // never merges. A second workflow, not another step: the two loops have
+    // different reviewers and a red audit must still open its PR.
+    { name: "model-plan", takesValue: false },
     // NEW-HUNT-8 — `flywheel init --suite <suite.yaml>` appends the nightly
     // TIER step to the scaffolded cron (the same wiring `init --ci|--sentinel
     // --suite` emit). Harness-relative, like every other path in the job.
@@ -1552,6 +1574,10 @@ export const DEPLOY_SCHEMA: ParseArgsSchema = {
     { name: "traffic-split", takesValue: false },
     { name: "experiment", takesValue: true },
     { name: "experiment-dir", takesValue: true },
+    // 0.6.0 §9.1 (loop 6) — the ROUTING-AWARE gate: pass rate and p95 as
+    // before, plus escalation rate, cost per turn and quality-floor blocks.
+    // It can only ever REFUSE a promotion; a protected env keeps its quorum.
+    { name: "routing-gate", takesValue: false },
     { name: "help", short: "h" },
   ],
 };

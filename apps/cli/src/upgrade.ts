@@ -274,6 +274,40 @@ export function collect060UpgradeNotes(yamlText: string): ReadonlyArray<UpgradeN
     });
   }
 
+  // 0.6.0 PR 15 — the CLI-surface changes a spec author feels. Both are
+  // gated on the spec actually carrying the thing they describe, so a plain
+  // single-model spec still prints nothing.
+  if (pools.length > 0) {
+    notes.push({
+      id: "arms-keyed-by-profile",
+      release,
+      title: "pool arms are recorded under the PROFILE name, not the model string",
+      body: [
+        "A candidate declared as `$fast` now learns under the arm id `fast`, so a",
+        "model-id change keeps its history. `crewhaus upgrade --hoist-models --write",
+        "--rewrite-arms` re-keys an existing .crewhaus/routing/arms.jsonl one-to-one",
+        "(a model that hoists to two profiles cannot be split, and resets instead).",
+        "`crewhaus route status --by profile` shows the arms under the new identity.",
+      ],
+    });
+  }
+  if (spec["models"] !== undefined || pools.length > 0) {
+    notes.push({
+      id: "models-verbs",
+      release,
+      title: "`crewhaus models list|explain|audit|propose` inspects the model plan offline",
+      body: [
+        "`models explain` prints every slot's resolved profile, the strategy in one",
+        "sentence and this shape's carry/emit/ignore verdict. `models audit` walks the",
+        "SAME slots as `doctor --models` (pool candidates, judges and per-step models",
+        "included, which the old partial list missed) and EXITS 1 on a model already",
+        "past its retirement date — `--fail-on none` reports without failing, and",
+        "`--propose` writes the replacement patch. `doctor --models` is unchanged: a",
+        "warn there still never fails.",
+      ],
+    });
+  }
+
   return notes;
 }
 

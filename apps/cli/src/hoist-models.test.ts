@@ -407,24 +407,28 @@ describe("arms.jsonl handling — never silently orphaned", () => {
     }
   });
 
-  test("formatArmNotes: the arm id stays the model string on this runtime; rewrites vs resets are told apart", () => {
+  test("formatArmNotes: the arm id IS the profile name now; rewrites vs resets are told apart", () => {
     const dir = mkdtempSync(join(tmpdir(), "hoist-arms-"));
     try {
       const path = join(dir, "arms.jsonl");
       writeFileSync(path, `${[line("claude-opus-4-8"), line("claude-haiku-4-5")].join("\n")}\n`);
       const plan = planHoistModels(TWO_POOLS);
       const note = formatArmNotes(path, plan, countArmLines(path, armModels(plan)));
-      // What the runtime does TODAY is stated, not the future identity.
-      expect(note).toContain("records pool arms under the model string");
-      expect(note).not.toContain("arm id becomes the profile name");
+      // 0.6.0 PR 15 — the runtime records under the PROFILE name (PR 10), so
+      // the note states the identity and OFFERS the re-key instead of
+      // refusing it.
+      expect(note).toContain("records pool arms under the PROFILE name");
+      expect(note).not.toContain("--rewrite-arms is refused on this runtime");
       expect(note).toContain(
-        "claude-haiku-4-5 → $fast (1 line(s) recorded): re-keyable one-to-one then.",
+        "claude-haiku-4-5 → $fast (1 line(s) recorded): re-keyed one-to-one with --write --rewrite-arms.",
       );
       expect(note).toContain("claude-opus-4-8 → $strong (1 line(s) recorded): 1 of 2 candidate(s)");
-      expect(note).toContain("learned-history reset");
-      // The flag is refused on this runtime — the note says so instead of offering it.
-      expect(note).toContain("--rewrite-arms is refused on this runtime");
-      expect(note).not.toContain("Add --write --rewrite-arms");
+      expect(note).toContain("learned history resets");
+      expect(note).toContain("Add --write --rewrite-arms");
+      // Under the flag the note drops the offer (the re-key is happening).
+      const rewriting = formatArmNotes(path, plan, countArmLines(path, armModels(plan)), true);
+      expect(rewriting).toContain("re-keyed one-to-one.");
+      expect(rewriting).not.toContain("Add --write --rewrite-arms");
       // No candidate hoisted → nothing to say.
       const noPool = planHoistModels(WORKFLOW_TWO_TRIPLES);
       expect(formatArmNotes(path, noPool, countArmLines(path, armModels(noPool)))).toBe("");
@@ -438,7 +442,10 @@ describe("arms.jsonl handling — never silently orphaned", () => {
     }
   });
 
-  test("the --rewrite-arms refusal names the runtime gap and the remedy", () => {
+  test("the historical --rewrite-arms refusal is kept verbatim as the record of what changed", () => {
+    // 0.6.0 PR 15 LIFTED the refusal; the constant stays exported (and pinned)
+    // so a reader who finds the sentence in an older CLI's output can search
+    // for it and land on the explanation.
     expect(REWRITE_ARMS_UNAVAILABLE).toContain("profile-keyed scoreboard");
     expect(REWRITE_ARMS_UNAVAILABLE).toContain("under the model string");
     expect(REWRITE_ARMS_UNAVAILABLE).toContain("--hoist-models --write");

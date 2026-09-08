@@ -309,6 +309,29 @@ export const KNOWN_SUNSETS: SunsetTable = {
   bedrock: [],
 };
 
+/**
+ * 0.6.0 §8.2 — has this sunset already PASSED, relative to `now`?
+ *
+ * `findSunset` stays a pure date-independent longest-prefix match (its
+ * callers — `doctor --models`, `model-scan`, the compiler capability
+ * validation and `models audit` — all want the entry, not a verdict), so the
+ * clock lands here instead: one exported predicate that `models audit
+ * --today` and any future gate read, rather than each re-parsing the date.
+ *
+ * The comparison is on the UTC calendar day: a model retiring on
+ * `2026-10-01` is NOT retired at any instant of 2026-10-01 (the announced
+ * date is the last day it serves) and IS retired from 2026-10-02Z. An
+ * unparseable `retiresOn` reads as NOT retired — over-failing on a malformed
+ * table entry would be the worse error.
+ */
+export function sunsetRetired(entry: SunsetEntry, now: Date): boolean {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(entry.retiresOn);
+  if (m === null) return false;
+  const retires = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  const day = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return day > retires;
+}
+
 /** Longest-prefix sunset lookup for `(provider, modelId)`; `undefined` when clean. */
 export function findSunset(
   provider: string,

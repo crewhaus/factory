@@ -20,6 +20,7 @@ export {
   shadowLaneQuality,
   shadowRouteKey,
 } from "./lanes.js";
+export { type ShadowLaneSides, readShadowLaneSides } from "./shadow-lane-read.js";
 export {
   openScoreboard,
   type ArmStats,

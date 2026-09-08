@@ -62,6 +62,7 @@ export {
   classifyPricingStaleness,
   effectiveSunsets,
   findSunset,
+  sunsetRetired,
   KNOWN_PROVIDERS,
   KNOWN_SUNSETS,
   parsePricingFeed,

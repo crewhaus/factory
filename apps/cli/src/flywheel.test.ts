@@ -13,10 +13,13 @@ import {
   CONVENTIONAL_GRADERS,
   FLYWHEEL_DEFAULT_KNOBS,
   FLYWHEEL_ENV_KNOBS,
+  FLYWHEEL_WORKFLOW_RELPATH,
   FlywheelConfigError,
   type FlywheelHooks,
   type FlywheelOptimizeOutcome,
+  MODEL_PLAN_WORKFLOW_RELPATH,
   buildFlywheelWorkflowYaml,
+  buildModelPlanWorkflowYaml,
   evaluateFlywheelAcceptance,
   formatDatasetSourceLine,
   formatFlywheelKnobsGuide,
@@ -1052,5 +1055,93 @@ describe("crewhaus flywheel (CLI surface)", () => {
     expect(res.exitCode).toBe(1);
     expect(res.stdout).toContain("(source: convention)");
     expect(res.stderr).not.toContain("shadows");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §9.1 (loop 7) — the nightly model-plan workflow.
+// ---------------------------------------------------------------------------
+
+describe("buildModelPlanWorkflowYaml", () => {
+  const yaml = buildModelPlanWorkflowYaml();
+  /**
+   * The document with every `#` comment line removed — what the runner
+   * ACTUALLY executes. The grep tests below run against this, not the raw
+   * text: a comment that says "never auto-merge" is the point, while a step
+   * that merges is the defect, and a naive grep cannot tell them apart.
+   */
+  const executable = yaml
+    .split("\n")
+    .filter((l) => !l.trimStart().startsWith("#"))
+    .join("\n");
+
+  test("runs the two OFFLINE proposal verbs and applies nothing", () => {
+    expect(yaml).toContain("crewhaus models audit --propose");
+    expect(yaml).toContain("crewhaus route propose");
+    // No apply verb may appear: the whole loop's output is review artifacts.
+    expect(executable).not.toContain("--write-back");
+    expect(executable).not.toContain("optimize --from-advice --write");
+  });
+
+  /**
+   * THE grep test §9.1 asks for. A merge verb here would close the loop the
+   * human gate is the point of, so this asserts on the RENDERED document —
+   * not on an intention stated in a comment.
+   */
+  test("NEVER merges: no --merge, no auto-merge, no --admin anywhere in the document", () => {
+    expect(yaml).toContain("gh pr create");
+    for (const forbidden of [
+      "gh pr merge",
+      "--merge",
+      "auto-merge",
+      "automerge",
+      "--admin",
+      "--squash",
+      "--rebase",
+      "peter-evans/enable-pull-request-automerge",
+    ]) {
+      expect(executable).not.toContain(forbidden);
+    }
+    // The invariant is also STATED where an editor will read it.
+    expect(yaml).toContain("NEVER add an auto-merge");
+  });
+
+  test("the audit step is continue-on-error — a red audit must still open its PR", () => {
+    // `models audit` EXITS 1 on a retired model, and that is exactly the night
+    // the replacement PR is most wanted.
+    const auditStep = yaml.slice(yaml.indexOf("Audit the model plan"));
+    expect(auditStep.slice(0, auditStep.indexOf("- name: Mine"))).toContain(
+      "continue-on-error: true",
+    );
+  });
+
+  test("leaves --today unset so a sunset that passed today reddens today's run", () => {
+    expect(executable).not.toContain("--today");
+    expect(yaml).toContain("`--today` is deliberately unset");
+  });
+
+  test("needs no model credentials — every verb in the job is offline", () => {
+    expect(executable).not.toContain("ANTHROPIC_API_KEY");
+    expect(yaml).toContain("MODEL_PLAN_GH_TOKEN");
+  });
+
+  test("a nested harness gets a working-directory AND a prefixed artifact path", () => {
+    const nested = buildModelPlanWorkflowYaml({ harnessDir: "harnesses/support" });
+    expect(nested).toContain("working-directory: harnesses/support");
+    expect(nested).toContain("path: harnesses/support/.crewhaus/model-plan/");
+    // Root scaffold stays unprefixed.
+    expect(yaml).not.toContain("working-directory:");
+    expect(yaml).toContain("path: .crewhaus/model-plan/");
+  });
+
+  test("single-flight, and offset from the flywheel's own cron", () => {
+    expect(yaml).toContain("cancel-in-progress: false");
+    expect(yaml).toContain('cron: "41 5 * * *"');
+    expect(buildFlywheelWorkflowYaml()).toContain('cron: "13 7 * * *"');
+  });
+
+  test("lands at its own path, beside the flywheel workflow", () => {
+    expect(MODEL_PLAN_WORKFLOW_RELPATH).toContain("crewhaus-model-plan.yml");
+    expect(MODEL_PLAN_WORKFLOW_RELPATH).not.toBe(FLYWHEEL_WORKFLOW_RELPATH);
   });
 });
