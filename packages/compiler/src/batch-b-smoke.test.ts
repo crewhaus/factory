@@ -53,7 +53,11 @@ describe("Batch B smoke — cli evaluation: compiles warning-free with wired eva
 
   test("bundle bytes contain the in-loop evaluate wiring", () => {
     expect(agent).toContain('import type { RunEvaluation } from "@crewhaus/runtime-core";');
-    expect(agent).toContain('import { judge } from "@crewhaus/eval-judge";');
+    // 0.6.0 PR 13b — every judge site grades through `createJudgeGrader`
+    // (via `gradeWithJudgePanel`), so a declared panel is honoured.
+    expect(agent).toContain(
+      'import { gradeWithJudgePanel, inLoopRunResult } from "@crewhaus/eval-judge";',
+    );
     expect(agent).toContain("const __evaluation: RunEvaluation = {");
     expect(agent).toContain('graderType: "llm_judge"');
     expect(agent).toContain("threshold: 0.8");

@@ -2460,6 +2460,9 @@ export type IrBrowserV0 = {
   readonly groundingModel: string;
   /** 0.6.0 §4.2 — provenance when `groundingModel` resolved through a profile. */
   readonly groundingModelProfile?: string;
+  /** 0.6.0 §4.2 — the grounding profile's pinned request params, honoured by
+   *  `@crewhaus/tool-vision-grounding`'s `FindElement` call. */
+  readonly groundingParams?: IrModelParams;
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
   readonly mcp_servers: IrMcpServers;

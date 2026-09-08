@@ -25,6 +25,8 @@ import {
 } from "@crewhaus/adapter-anthropic";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { RuntimeError } from "@crewhaus/errors";
+import { buildRequestParams } from "@crewhaus/model-plan";
+import type { ModelThinking } from "@crewhaus/model-plan";
 import type { TraceEventBus } from "@crewhaus/trace-event-bus";
 
 const SUMMARY_REQUEST =
@@ -64,6 +66,22 @@ export type AutoCompactOptions = {
    * `bus` is supplied.
    */
   readonly specModel?: string;
+  /**
+   * 0.6.0 §4.2 — the request params a `models:` profile pins on the
+   * COMPACTION slot (`compaction.model: $summariser`), lowered by the
+   * compiler as `IrCompaction.params` and threaded here verbatim. The
+   * summariser's own {@link SUMMARY_MAX_TOKENS} ceiling is the base; the
+   * profile overrides `max_tokens` / `thinking` / `temperature`
+   * field-by-field through the one shared `buildRequestParams` every serving
+   * slot uses, so `thinking: { effort: low }` means the same thing on a
+   * compaction model as on the agent's. Absent → byte-identical to a
+   * pre-0.6.0 call.
+   */
+  readonly params?: {
+    readonly thinking?: ModelThinking;
+    readonly maxTokens?: number;
+    readonly temperature?: number;
+  };
 };
 
 /**
@@ -87,13 +105,24 @@ export async function autoCompact(
     content: request,
   };
 
+  // 0.6.0 §4.2 — the compaction profile's pinned params, folded over the
+  // summariser's own ceiling. `effectiveMaxTokens` is the request ceiling so
+  // a declared thinking budget can never crowd the summary out.
+  const resolvedParams = buildRequestParams(opts.params ?? {}, { maxTokens: SUMMARY_MAX_TOKENS });
   const providerRequest = {
     model,
     system: [],
     messages: [...messages, summarizationPrompt] as Parameters<
       ProviderAdapter["stream"]
     >[0]["messages"],
-    maxTokens: SUMMARY_MAX_TOKENS,
+    maxTokens: resolvedParams.effectiveMaxTokens,
+    ...(resolvedParams.thinking !== undefined ? { thinking: resolvedParams.thinking } : {}),
+    ...(resolvedParams.reasoningEffort !== undefined
+      ? { reasoningEffort: resolvedParams.reasoningEffort }
+      : {}),
+    ...(resolvedParams.temperature !== undefined
+      ? { temperature: resolvedParams.temperature }
+      : {}),
   };
   // 0.6.0 — meter the side-call on the run bus (role "compaction") so the
   // summary's spend is priced and counted toward the budget; the shape

@@ -1256,9 +1256,6 @@ const INTERPRETER_RUN_TARGETS: ReadonlySet<Spec["target"]> = new Set<Spec["targe
   "cli",
   "browser",
 ]);
-const LANDING_JUDGE_PANEL = "the §6.2 judge-panel wiring (createJudgeGrader in every judge site)";
-const LANDING_AUX_PARAMS =
-  "the §4.2 per-slot params consumers (the judge / compaction / degrade / security / watchme request builders)";
 
 function runtimePending(path: string, landing: string, hint?: string): CompilerError {
   return new CompilerError(
@@ -2086,18 +2083,23 @@ function auxSlotFields(r: SingleSlotResult): { modelProfile?: string; params?: I
   };
 }
 
-/** Resolve an auxiliary model slot (judge / compaction / degrade / security / watchme / grounding). */
+/**
+ * Resolve an auxiliary model slot (judge / compaction / degrade / security /
+ * watchme / grounding).
+ *
+ * 0.6.0 PR 13b — a profile's pinned request params (`max_tokens` /
+ * `thinking` / `temperature`) ride `params` and every one of those consumers
+ * now READS them: the judge sites through `@crewhaus/eval-judge`'s
+ * `JudgeRequestParams`, compaction through `autoCompact({ params })`, the
+ * degrade rung through runtime-core's serving plan, the security judge
+ * through `@crewhaus/justification-judge-claude`, the watchme phase-2 judge
+ * through its own `runChatLoop` call, and browser grounding through
+ * `FindElement`. They are folded over each consumer's own base by the one
+ * shared `buildRequestParams`, so a profile means the same thing on an
+ * auxiliary slot as on a serving one.
+ */
 function resolveAuxSlot(value: string, ctx: LowerContext, slotLabel: string): SingleSlotResult {
-  const r = applyProfileToSlot(resolveModelRef(value, ctx, slotLabel), ctx, slotLabel, "aux");
-  if (r.params !== undefined) {
-    warn(
-      ctx,
-      "model-plan-pending-runtime",
-      slotLabel,
-      `${slotLabel}: the profile's pinned request params are lowered but this consumer does not read them yet — they land with 0.6.0 ${LANDING_AUX_PARAMS}; until then they are inert`,
-    );
-  }
-  return r;
+  return applyProfileToSlot(resolveModelRef(value, ctx, slotLabel), ctx, slotLabel, "aux");
 }
 
 /**
@@ -2865,7 +2867,13 @@ type SpecWithEvaluation = SpecWithPermissions & {
   };
 };
 
-/** The §6.2 judge-panel knobs a grader / gate shares, lowered + reported pending. */
+/**
+ * The §6.2 judge-panel knobs a grader / gate shares. 0.6.0 PR 13b — every
+ * judge site (the three `renderEvaluation` copies, the two judge-gate
+ * helpers and the `crewhaus run` interpreter) now grades through
+ * `@crewhaus/eval-judge`'s `gradeWithJudgePanel`, so these lower straight
+ * into the consumer instead of pending.
+ */
 function lowerJudgePanel(
   judge: {
     readonly judges?: readonly string[];
@@ -2893,20 +2901,6 @@ function lowerJudgePanel(
     ...(slot?.params?.thinking !== undefined ? { thinking: slot.params.thinking } : {}),
     ...(slot?.params?.maxTokens !== undefined ? { maxTokens: slot.params.maxTokens } : {}),
   };
-  for (const [key, present] of [
-    ["judges", judge.judges !== undefined],
-    ["repeats", judge.repeats !== undefined],
-    ["temperature", judge.temperature !== undefined],
-    ["target", judge.target !== undefined],
-  ] as const) {
-    if (!present) continue;
-    warn(
-      ctx,
-      "model-plan-pending-runtime",
-      `${path}.${key}`,
-      `${path}.${key} is lowered into the IR but the judge site still calls judge() with the single model — it lands with 0.6.0 ${LANDING_JUDGE_PANEL}; until then it is inert`,
-    );
-  }
   return {
     ...(judges !== undefined ? { judges } : {}),
     ...(judge.repeats !== undefined ? { repeats: judge.repeats } : {}),
@@ -5054,6 +5048,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         ...(grounding?.modelProfile !== undefined
           ? { groundingModelProfile: grounding.modelProfile }
           : {}),
+        ...(grounding?.params !== undefined ? { groundingParams: grounding.params } : {}),
         tools: spec.tools ?? [],
         toolConfigs: lowerToolConfigs(spec.tool_config),
         mcp_servers: lowerMcpServers(spec.mcp_servers),

@@ -93,6 +93,39 @@ describe("evaluationRunOptions (0.6.0 PR 8b — interpreter parity for the in-lo
     expect((defaulted.evaluation as RunEvaluation).threshold).toBe(0.7);
   });
 
+  test("0.6.0 PR 13b — a declared PANEL names the instrument by its members, joined with +", () => {
+    const out = evaluationRunOptions({
+      agent: { model: "claude-haiku-4-5" },
+      evaluation: {
+        grader: {
+          type: "llm_judge",
+          criteria: "is it correct?",
+          judges: ["claude-sonnet-4-6", "claude-opus-4-8"],
+          repeats: 3,
+          temperature: 0.2,
+          target: "transcript",
+          params: { maxTokens: 512 },
+        },
+        threshold: 0.8,
+        onFail: "retry",
+        maxRetries: 1,
+      },
+    });
+    const ev = out.evaluation as RunEvaluation;
+    // Two panels are two instruments: the lineage key must distinguish them
+    // from the single-judge default, which still reads as one model string.
+    expect(ev.judgeModel).toBe("claude-sonnet-4-6+claude-opus-4-8");
+    const single = evaluationRunOptions({
+      agent: { model: "claude-haiku-4-5" },
+      evaluation: {
+        grader: { type: "llm_judge", criteria: "c" },
+        onFail: "retry",
+        maxRetries: 1,
+      },
+    }).evaluation as RunEvaluation;
+    expect(single.judgeModel).toBe("claude-haiku-4-5");
+  });
+
   test("0.6.0 PR 9c — the cascade's lower-time escalateTo is threaded verbatim under on_fail: escalate, and absent otherwise", () => {
     for (const type of ["llm_judge", "contains", "regex"] as const) {
       const grader =

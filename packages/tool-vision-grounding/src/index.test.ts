@@ -160,3 +160,59 @@ describe("createFindElementTool", () => {
     expect(JSON.parse(r).confidence).toBe("medium");
   });
 });
+
+/**
+ * 0.6.0 §4.2 (PR 13b) — the GROUNDING slot's profile params. A
+ * `groundingModel: $vision` lowers the profile's pinned `max_tokens` /
+ * `thinking` / `temperature` into `IrBrowserV0.groundingParams`; the browser
+ * emitter and the `crewhaus run` interpreter thread them here and they must
+ * land on the grounding request, folded over the call's own 512-token
+ * ceiling.
+ */
+describe("grounding profile params (0.6.0 §4.2)", () => {
+  const BBOX = '```json\n{"bbox":{"x":1,"y":2,"width":3,"height":4},"confidence":"high"}\n```';
+
+  function capturing(): {
+    adapter: ProviderAdapter;
+    requests: Array<Parameters<ProviderAdapter["stream"]>[0]>;
+  } {
+    const base = scriptedAdapter(BBOX);
+    const requests: Array<Parameters<ProviderAdapter["stream"]>[0]> = [];
+    return {
+      requests,
+      adapter: {
+        ...base,
+        stream(req) {
+          requests.push(req);
+          return base.stream(req);
+        },
+      },
+    };
+  }
+
+  test("absent params keep the pre-0.6.0 512-token request", async () => {
+    const { adapter, requests } = capturing();
+    const tool = createFindElementTool({
+      driver: stubDriver(new Uint8Array([1])),
+      model: "claude-sonnet-4-6",
+      _adapter: adapter,
+    });
+    await tool.execute({ description: "the Submit button" }, {});
+    expect(requests[0]?.maxTokens).toBe(512);
+    expect(requests[0]?.thinking).toBeUndefined();
+    expect(requests[0]?.temperature).toBeUndefined();
+  });
+
+  test("a profile's params reach the grounding request", async () => {
+    const { adapter, requests } = capturing();
+    const tool = createFindElementTool({
+      driver: stubDriver(new Uint8Array([1])),
+      model: "claude-sonnet-4-6",
+      _adapter: adapter,
+      params: { maxTokens: 1024, temperature: 0.3 },
+    });
+    await tool.execute({ description: "the Submit button" }, {});
+    expect(requests[0]?.maxTokens).toBe(1024);
+    expect(requests[0]?.temperature).toBe(0.3);
+  });
+});

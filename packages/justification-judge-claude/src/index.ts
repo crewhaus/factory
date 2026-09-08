@@ -44,6 +44,8 @@ import {
   extractFirstText,
 } from "@crewhaus/adapter-anthropic";
 import { CrewhausError } from "@crewhaus/errors";
+import { buildRequestParams } from "@crewhaus/model-plan";
+import type { ModelThinking } from "@crewhaus/model-plan";
 import type { JustificationJudge, JustificationVerdict } from "@crewhaus/permission-engine";
 import { z } from "zod";
 
@@ -75,6 +77,20 @@ export type ClaudeJustificationJudgeOptions = {
   /** Override the judge's system block. Defaults to the production prompt
    *  above. Useful for domain-specific judging policy. */
   readonly systemOverride?: string;
+  /**
+   * 0.6.0 §4.2 — the request params a `models:` profile pins on the SECURITY
+   * judge slot (`security.justification.model: $checker`), lowered as
+   * `IrSecurity.justification.params`. The judge's own 512-token verdict
+   * ceiling is the base; the profile overrides `max_tokens` / `thinking` /
+   * `temperature` field-by-field through the shared `buildRequestParams`, so
+   * a profile means the same thing here as on a serving slot. Absent → the
+   * pre-0.6.0 request, byte-identical.
+   */
+  readonly params?: {
+    readonly thinking?: ModelThinking;
+    readonly maxTokens?: number;
+    readonly temperature?: number;
+  };
 };
 
 /**
@@ -88,13 +104,26 @@ export class ClaudeJustificationJudge {
   readonly name = "claude";
   private readonly adapter: ProviderAdapter;
   private readonly model: string;
-  private readonly maxTokens: number;
+  private readonly requestParams: {
+    readonly maxTokens: number;
+    readonly thinking?: { readonly type: "enabled"; readonly budgetTokens: number };
+    readonly reasoningEffort?: "low" | "medium" | "high";
+    readonly temperature?: number;
+  };
   private readonly systemBlock: string;
 
   constructor(opts: ClaudeJustificationJudgeOptions) {
     this.adapter = opts.adapter;
     this.model = opts.model;
-    this.maxTokens = opts.maxTokens ?? 512;
+    const resolved = buildRequestParams(opts.params ?? {}, { maxTokens: opts.maxTokens ?? 512 });
+    this.requestParams = {
+      maxTokens: resolved.effectiveMaxTokens,
+      ...(resolved.thinking !== undefined ? { thinking: resolved.thinking } : {}),
+      ...(resolved.reasoningEffort !== undefined
+        ? { reasoningEffort: resolved.reasoningEffort }
+        : {}),
+      ...(resolved.temperature !== undefined ? { temperature: resolved.temperature } : {}),
+    };
     this.systemBlock = opts.systemOverride ?? JUDGE_SYSTEM;
   }
 
@@ -111,7 +140,7 @@ export class ClaudeJustificationJudge {
           model: this.model,
           system: [{ type: "text", text: this.systemBlock }],
           messages: [{ role: "user", content: userMessage }],
-          maxTokens: this.maxTokens,
+          ...this.requestParams,
         }),
       );
       const rawText = extractFirstText(final);

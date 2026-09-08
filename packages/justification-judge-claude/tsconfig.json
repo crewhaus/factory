@@ -5,9 +5,18 @@
     "outDir": "dist"
   },
   "references": [
-    { "path": "../adapter-anthropic" },
-    { "path": "../errors" },
-    { "path": "../permission-engine" }
+    {
+      "path": "../adapter-anthropic"
+    },
+    {
+      "path": "../errors"
+    },
+    {
+      "path": "../model-plan"
+    },
+    {
+      "path": "../permission-engine"
+    }
   ],
   "include": ["src/**/*"]
 }

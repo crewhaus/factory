@@ -2,7 +2,7 @@
   "name": "@crewhaus/tool-vision-grounding",
   "version": "0.5.8",
   "type": "module",
-  "description": "FindElement(description) tool — vision-grounded bounding-box lookup (Section 25 BROW)",
+  "description": "FindElement(description) tool \u2014 vision-grounded bounding-box lookup (Section 25 BROW)",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -15,6 +15,7 @@
     "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/computer-use-driver": "workspace:*",
     "@crewhaus/errors": "workspace:*",
+    "@crewhaus/model-plan": "workspace:*",
     "@crewhaus/model-router": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",

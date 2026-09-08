@@ -476,17 +476,22 @@ describe("$profile / sentinels on every auxiliary slot (the six that bypassed re
     });
     // A judge profile's `tools: []` is the documented no-op — no warning for it.
     expect(warnings.map((w) => w.path)).not.toContain("models.checker.tools");
-    // The aux params are carried but pending their consumers.
-    const pendingAux = warnings.filter(
-      (w) => w.code === "model-plan-pending-runtime" && w.message.includes("pinned request params"),
-    );
-    expect(pendingAux.map((w) => w.path).sort()).toEqual([
-      "budget.on_exceed.model",
-      "compaction.model",
-      "evaluation.grader.model",
-      "security.justification.model",
-      "watchme.judge.model",
-    ]);
+    // 0.6.0 PR 13b — every one of those aux consumers READS the pinned params
+    // now (judge / compaction / degrade / security / watchme / grounding), so
+    // the landing promise is gone: no pending-runtime warning survives.
+    expect(
+      warnings.filter(
+        (w) =>
+          w.code === "model-plan-pending-runtime" && w.message.includes("pinned request params"),
+      ),
+    ).toEqual([]);
+    // What still pends is the SINGLE-SLOT row (a serving slot has no
+    // per-candidate plan carrier), never an auxiliary slot's params.
+    expect(
+      warnings
+        .filter((w) => w.code === "model-plan-pending-runtime")
+        .every((w) => w.message.includes("single-model serving slot")),
+    ).toBe(true);
   });
 
   test("`cheapest` now works on the slots that bypassed it (degrade, security, watchme, sub-agent, grounding)", () => {
@@ -578,10 +583,9 @@ describe("$profile / sentinels on every auxiliary slot (the six that bypassed re
       judges: ["claude-opus-4-8", "claude-haiku-4-5"],
       temperature: 0.1,
     });
-    expect(codes(warnings)).toContain("model-plan-pending-runtime");
-    expect(warnings.find((w) => w.path === "steps[1].judge.repeats")?.message).toContain(
-      "judge-panel wiring",
-    );
+    // 0.6.0 PR 13b — the gate's `__judgeGate` goes through
+    // `createJudgeGrader`, so the panel knobs no longer pend.
+    expect(codes(warnings)).not.toContain("model-plan-pending-runtime");
   });
 
   test("crew routing.model lowers and the llm router runs on it", () => {

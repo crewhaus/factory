@@ -23,7 +23,10 @@ import { memoryFragmentFromIr, renderStudyRotationPreamble } from "@crewhaus/mem
 import { type ParsedModelString, parseModelString } from "@crewhaus/model-router";
 import {
   HYBRID_WIRING_IMPORT,
+  JUDGE_PANEL_IMPORT,
+  judgeInstrumentId,
   renderHybridWiringFields,
+  renderJudgePanelFields,
   renderModelWiringFields,
   renderSubAgentDef,
 } from "@crewhaus/model-service";
@@ -302,6 +305,11 @@ function renderCompactionFields(ir: IrChannelV0): string {
   if (ir.compaction.model !== undefined) {
     pieces.push(`\n        compactionModel: ${escapeJsonString(ir.compaction.model)},`);
   }
+  // 0.6.0 §4.2 — the compaction profile's pinned request params, honoured by
+  // the summariser's own request. Mirror: target-cli renders the same field.
+  if (ir.compaction.params !== undefined) {
+    pieces.push(`\n        compactionParams: ${JSON.stringify(ir.compaction.params)},`);
+  }
   if (ir.compaction.threshold !== undefined) {
     pieces.push(`\n        compactionThreshold: ${ir.compaction.threshold},`);
   }
@@ -427,10 +435,14 @@ function renderLimitsFields(ir: IrChannelV0): string {
  * `graderType`/`threshold` are stamped verbatim onto every `eval_graded`
  * event (deterministic graders carry the documented threshold 1 — score is
  * 0|1 and `score >= threshold` is the pass rule).
- * 0.6.0 §6.2 (PR 13) — an `llm_judge` literal additionally
- * carries `judgeModel`, the model `evaluate` grades with, so the pool's
- * per-arm quality lineage folds the judge's identity beside the grader kind;
- * deterministic graders render no such field and stay byte-identical.
+ * 0.6.0 §6.2 (PR 13b) — the `llm_judge` literal grades through
+ * `@crewhaus/eval-judge`'s `gradeWithJudgePanel`, so a declared `judges`
+ * panel / `repeats` / `temperature` / `target` and the judge profile's pinned
+ * request `params` are honoured; it additionally carries `judgeModel`, the
+ * INSTRUMENT `evaluate` grades with (a panel is named by its members joined
+ * with `+`), so the pool's per-arm quality lineage folds the judge's identity
+ * beside the grader kind; deterministic graders render no such field and stay
+ * byte-identical.
  * Empty pieces when the
  * spec omits the block, keeping pre-existing bundles byte-identical.
  * Mirror: target-cli + target-managed render the same wiring — keep the
@@ -453,15 +465,16 @@ function renderEvaluation(ir: IrChannelV0): {
     ev.escalateTo !== undefined ? `\n  escalateTo: ${escapeJsonString(ev.escalateTo)},` : "";
   if (ev.grader.type === "llm_judge") {
     const criteria = escapeJsonString(ev.grader.criteria);
-    const model = escapeJsonString(ev.grader.model ?? ir.agent.model);
+    const panel = { ...ev.grader, model: ev.grader.model ?? ir.agent.model };
+    const instrument = escapeJsonString(judgeInstrumentId(panel, ir.agent.model));
     const bootBlock = `const __evaluation: RunEvaluation = {
   graderType: "llm_judge",
-  judgeModel: ${model},
+  judgeModel: ${instrument},
   threshold: ${ev.threshold ?? 0.7},
   onFail: ${onFail},
   maxRetries: ${ev.maxRetries},${escalateField}
-  evaluate: async ({ finalText, bus }) => {
-    const __verdict = await judge({
+  evaluate: async ({ finalText, messages, bus }) => {
+    const __verdict = await gradeWithJudgePanel({
       rubric: {
         criteria: [
           {
@@ -479,24 +492,24 @@ function renderEvaluation(ir: IrChannelV0): {
         passing_score: 3,
       },
       sample: { id: "in-loop-evaluation", input: "" },
-      agentOutput: finalText,
-      model: ${model},
+      run: inLoopRunResult({ finalText, messages }),${renderJudgePanelFields(panel, "      ")}
       // Judge spend rides the run bus (role "judge") so it is priced and
-      // counted toward budget.usd under budget.judge_share.
+      // counted toward budget.usd under budget.judge_share — every panelist
+      // and every repeat publishes its own model_request/model_response.
       bus,
     });
-    const __judge = {
-      model: __verdict.usage.model,
-      ...(__verdict.usage.costUsdMicros !== undefined ? { costUsdMicros: __verdict.usage.costUsdMicros } : {}),
+    return {
+      score: __verdict.score,
+      rationale: __verdict.rationale,
+      judge: {
+        model: __verdict.judgeModel,
+        ...(__verdict.costUsdMicros !== undefined ? { costUsdMicros: __verdict.costUsdMicros } : {}),
+      },
     };
-    if (__verdict.abstain) {
-      return { score: 0, rationale: "judge abstained: " + __verdict.rationale, judge: __judge };
-    }
-    return { score: (__verdict.score - 1) / 4, rationale: __verdict.rationale, judge: __judge };
   },
 };`;
     return {
-      imports: [typeImport, `import { judge } from "@crewhaus/eval-judge";`],
+      imports: [typeImport, JUDGE_PANEL_IMPORT],
       bootBlock,
       field,
     };

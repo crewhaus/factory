@@ -608,12 +608,13 @@ describe("crewhaus compile", () => {
   // model-sunset is a wall-clock notice on a 0.5.x pool that compiled under
   // --strict yesterday. Both print; neither fails --strict.
   //
-  // The pending key has moved twice as the train landed: PR 10 honoured a
-  // candidate's failover chain, and PR 9e wired `strategy.guide` (and the
-  // whole closure family) into the compiled cli bundle. What genuinely still
-  // pends on a cli spec is the §6.2 JUDGE PANEL — `evaluation.grader`'s
-  // `judges` / `repeats` / `temperature` / `target` lower into the IR while
-  // every judge site still calls `judge()` with the single model.
+  // The pending key has moved three times as the train landed: PR 10
+  // honoured a candidate's failover chain, PR 9e wired `strategy.guide` (and
+  // the whole closure family) into the compiled cli bundle, and PR 13b wired
+  // the §6.2 judge panel and the §4.2 auxiliary-slot params. What genuinely
+  // still pends is a `models:` profile's SINGLE-SLOT narrowing knobs —
+  // `caching` (and `limits.model_call_timeout_ms`) on a serving slot that
+  // routes no pool, because the IR has no per-candidate plan carrier there.
   test("compile --strict does NOT escalate the informational model-plan-pending-runtime / model-sunset notices", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
     writeFileSync(
@@ -621,8 +622,10 @@ describe("crewhaus compile", () => {
       [
         "name: pooled",
         "target: cli",
+        "models:",
+        "  primary: { model: claude-sonnet-4-6, caching: off }",
         "agent:",
-        "  model: claude-sonnet-4-6",
+        "  model: $primary",
         "  instructions: route it",
         "  model_pool:",
         "    candidates:",
@@ -641,12 +644,14 @@ describe("crewhaus compile", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toContain(
-      "crewhaus: warning[model-plan-pending-runtime] evaluation.grader.repeats:",
+      "crewhaus: warning[model-plan-pending-runtime] models.primary.caching:",
     );
-    // PR 10 honours the candidate's failover chain and PR 9e constructs the
-    // guide side call in the compiled cli bundle: neither pends any more.
+    // PR 10 honours the candidate's failover chain, PR 9e constructs the
+    // guide side call in the compiled cli bundle, and PR 13b grades through
+    // `createJudgeGrader`: none of the three pends any more.
     expect(result.stderr).not.toContain("agent.model_pool.candidates[0].fallbacks");
     expect(result.stderr).not.toContain("agent.model_pool.strategy.guide");
+    expect(result.stderr).not.toContain("evaluation.grader.repeats");
     expect(result.stderr).toContain(
       "crewhaus: warning[model-sunset] agent.model_pool.candidates[1]",
     );

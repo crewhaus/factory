@@ -31,6 +31,8 @@ import {
 } from "@crewhaus/adapter-anthropic";
 import type { Driver } from "@crewhaus/computer-use-driver";
 import { ConfigError, CrewhausError } from "@crewhaus/errors";
+import { buildRequestParams } from "@crewhaus/model-plan";
+import type { ModelThinking } from "@crewhaus/model-plan";
 import { resolveModel } from "@crewhaus/model-router";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -74,6 +76,19 @@ export type CreateFindElementToolOptions = {
   readonly model: string;
   /** Test injection: bypass the model-router. */
   readonly _adapter?: ProviderAdapter;
+  /**
+   * 0.6.0 §4.2 — the request params a `models:` profile pins on the
+   * GROUNDING slot (`groundingModel: $vision`), lowered as
+   * `IrBrowserV0.groundingParams`. The grounding call's own 512-token
+   * ceiling is the base; the profile overrides `max_tokens` / `thinking` /
+   * `temperature` field-by-field through the shared `buildRequestParams`.
+   * Absent → the pre-0.6.0 request, byte-identical.
+   */
+  readonly params?: {
+    readonly thinking?: ModelThinking;
+    readonly maxTokens?: number;
+    readonly temperature?: number;
+  };
 };
 
 const SYSTEM = `You are a vision-grounding assistant. Given a screenshot and a natural-language
@@ -154,11 +169,21 @@ async function callGrounding(
   modelId: string,
   description: string,
   pngBytes: Uint8Array,
+  params?: CreateFindElementToolOptions["params"],
 ): Promise<string> {
   const b64 = Buffer.from(pngBytes).toString("base64");
+  // 0.6.0 §4.2 — the grounding profile's pinned params over the call's own
+  // 512-token ceiling; `effectiveMaxTokens` keeps a thinking budget from
+  // crowding the bbox JSON out.
+  const resolved = buildRequestParams(params ?? {}, { maxTokens: 512 });
   const stream: AsyncIterable<StreamEvent> = adapter.stream({
     model: modelId,
-    maxTokens: 512,
+    maxTokens: resolved.effectiveMaxTokens,
+    ...(resolved.thinking !== undefined ? { thinking: resolved.thinking } : {}),
+    ...(resolved.reasoningEffort !== undefined
+      ? { reasoningEffort: resolved.reasoningEffort }
+      : {}),
+    ...(resolved.temperature !== undefined ? { temperature: resolved.temperature } : {}),
     system: [{ type: "text", text: SYSTEM }],
     messages: [
       {
@@ -216,6 +241,7 @@ export function createFindElementTool(opts: CreateFindElementToolOptions): Regis
             resolution.modelId,
             input.description,
             png,
+            opts.params,
           );
           const json = extractJson(text);
           const { bbox, confidence } = parseBbox(json);

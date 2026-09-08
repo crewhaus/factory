@@ -735,7 +735,11 @@ describe("emitGraph — judge gate nodes (loop contract 0.4, G02)", () => {
     expect(c).toContain(
       'import { EXIT_CODES, RunFailedError, formatRunFailure, toFailureReport } from "@crewhaus/errors";',
     );
-    expect(c).toContain('import { judge } from "@crewhaus/eval-judge";');
+    // 0.6.0 PR 13b — the gate grades through `createJudgeGrader` so a
+    // declared `judges` / `repeats` panel is honoured.
+    expect(c).toContain(
+      'import { gradeWithJudgePanel, inLoopRunResult } from "@crewhaus/eval-judge";',
+    );
     expect(c).toContain('import type { TraceEventBus } from "@crewhaus/trace-event-bus";');
     expect(c).toContain("async function __judgeGate(");
     // 0.6.0 — the helper takes the bus and reports the judge's wire model + cost.
@@ -743,9 +747,10 @@ describe("emitGraph — judge gate nodes (loop contract 0.4, G02)", () => {
       "  bus: TraceEventBus;\n}): Promise<{ score: number; rationale: string; judgeModel: string; costUsdMicros?: number }> {",
     );
     expect(c).toContain("    bus: opts.bus,\n  });");
-    expect(c).toContain("judgeModel: result.usage.model,");
+    expect(c).toContain("judgeModel: result.judgeModel,");
     // createJudgeGrader's 1–5 → [0,1] mapping.
-    expect(c).toContain("score: (result.score - 1) / 4");
+    // 0.6.0 PR 13b — the grader already returns the 0..1 projection.
+    expect(c).toContain("score: result.score,");
     // Resilient classified exit: EXIT_CODES.evaluation with the 35 fallback.
     expect(c).toContain(
       'const __EVAL_EXIT: number = (EXIT_CODES as Record<string, number>)["evaluation"] ?? 35;',

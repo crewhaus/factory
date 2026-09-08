@@ -6,11 +6,29 @@
   },
   "include": ["src/**/*"],
   "references": [
-    { "path": "../adapter-anthropic" },
-    { "path": "../errors" },
-    { "path": "../eval-dataset" },
-    { "path": "../eval-grader" },
-    { "path": "../logging" },
-    { "path": "../model-router" }
+    {
+      "path": "../adapter-anthropic"
+    },
+    {
+      "path": "../errors"
+    },
+    {
+      "path": "../eval-dataset"
+    },
+    {
+      "path": "../eval-grader"
+    },
+    {
+      "path": "../event-log"
+    },
+    {
+      "path": "../logging"
+    },
+    {
+      "path": "../model-plan"
+    },
+    {
+      "path": "../model-router"
+    }
   ]
 }

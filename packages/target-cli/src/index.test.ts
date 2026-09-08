@@ -1319,7 +1319,9 @@ describe("emitCli — evaluation block (loop contract 0.4, Batch B, G02)", () =>
         }),
       ).files[0]?.content ?? "";
     expect(content).toContain('import type { RunEvaluation } from "@crewhaus/runtime-core";');
-    expect(content).toContain('import { judge } from "@crewhaus/eval-judge";');
+    expect(content).toContain(
+      'import { gradeWithJudgePanel, inLoopRunResult } from "@crewhaus/eval-judge";',
+    );
     expect(content).toContain("const __evaluation: RunEvaluation = {");
     expect(content).toContain('graderType: "llm_judge",');
     // 0.6.0 §6.2 (PR 13) — the judge model is stated declaratively beside the
@@ -1328,25 +1330,27 @@ describe("emitCli — evaluation block (loop contract 0.4, Batch B, G02)", () =>
     expect(content).toContain("threshold: 0.8,");
     expect(content).toContain('onFail: "retry",');
     expect(content).toContain("maxRetries: 2,");
-    // the evaluate fn scores through judge() on the resolved judge model
+    // the evaluate fn scores through createJudgeGrader on the resolved judge model
     expect(content).toContain('model: "claude-haiku-4-5",');
     expect(content).toContain('description: "answers cite a source",');
     // 0.6.0 §6.2 — the evaluate fn receives the RUN bus and hands it to the
     // judge, so judge spend is priced and budget-metered; the judge's wire
     // model + priced spend ride back on the verdict for eval_graded.
-    expect(content).toContain("evaluate: async ({ finalText, bus }) => {");
-    expect(content).toContain("agentOutput: finalText,");
+    expect(content).toContain("evaluate: async ({ finalText, messages, bus }) => {");
+    expect(content).toContain("const __verdict = await gradeWithJudgePanel({");
+    // 0.6.0 PR 13b — the turn's own conversation becomes the graded
+    // `RunResult`, so `target: transcript` sees the trajectory.
+    expect(content).toContain("run: inLoopRunResult({ finalText, messages }),");
     expect(content).toContain("      bus,\n    });");
-    expect(content).toContain("model: __verdict.usage.model,");
+    expect(content).toContain("model: __verdict.judgeModel,");
     expect(content).toContain(
-      "...(__verdict.usage.costUsdMicros !== undefined ? { costUsdMicros: __verdict.usage.costUsdMicros } : {}),",
+      "...(__verdict.costUsdMicros !== undefined ? { costUsdMicros: __verdict.costUsdMicros } : {}),",
     );
-    expect(content).toContain("judge: __judge };");
-    expect(content).toContain("(__verdict.score - 1) / 4");
     // A3 — an abstaining judge scores 0 (never passes the threshold as a
-    // nominal best-estimate guess); onFail applies as for a failed grade.
-    expect(content).toContain("if (__verdict.abstain) {");
-    expect(content).toContain('"judge abstained: " + __verdict.rationale');
+    // nominal best-estimate guess); the grader already returns score 0 with a
+    // "judge abstained (…)" rationale, so the site returns it verbatim.
+    expect(content).toContain("score: __verdict.score,");
+    expect(content).toContain("rationale: __verdict.rationale,");
     // and the option is threaded into runChatLoop
     expect(content).toContain("evaluation: __evaluation,");
   });

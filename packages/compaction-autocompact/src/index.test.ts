@@ -259,3 +259,39 @@ describe("autoCompact — metered on the run bus (0.6.0 §6.2)", () => {
     expect(result[1]).toEqual({ role: "assistant", content: "summary" });
   });
 });
+
+/**
+ * 0.6.0 §4.2 (PR 13b) — the COMPACTION slot's profile params. A
+ * `compaction.model: $summariser` lowers the profile's pinned `max_tokens` /
+ * `thinking` / `temperature` into `IrCompaction.params`; runtime-core hands
+ * them here and they must land on the summarisation request, folded over the
+ * summariser's own 4096-token ceiling by the same `buildRequestParams` every
+ * serving slot uses.
+ */
+describe("compaction profile params (0.6.0 §4.2)", () => {
+  test("absent params leave the pre-0.6.0 request byte-identical", async () => {
+    const { adapter, lastReq } = makeStubAdapter(() => streamWithText("summary"));
+    await autoCompact([], adapter, "m");
+    expect(lastReq()?.maxTokens).toBe(4096);
+    expect(lastReq()?.thinking).toBeUndefined();
+    expect(lastReq()?.reasoningEffort).toBeUndefined();
+    expect(lastReq()?.temperature).toBeUndefined();
+  });
+
+  test("a pinned max_tokens / temperature reach the summarisation request", async () => {
+    const { adapter, lastReq } = makeStubAdapter(() => streamWithText("summary"));
+    await autoCompact([], adapter, "m", { params: { maxTokens: 1024, temperature: 0.1 } });
+    expect(lastReq()?.maxTokens).toBe(1024);
+    expect(lastReq()?.temperature).toBe(0.1);
+  });
+
+  test("a pinned thinking effort sets both controls and lifts the ceiling", async () => {
+    const { adapter, lastReq } = makeStubAdapter(() => streamWithText("summary"));
+    await autoCompact([], adapter, "m", { params: { thinking: { effort: "high" } } });
+    const req = lastReq();
+    expect(req?.reasoningEffort).toBe("high");
+    expect(req?.thinking?.type).toBe("enabled");
+    // The provider requires max_tokens > thinking.budget_tokens.
+    expect(req?.maxTokens).toBeGreaterThan(req?.thinking?.budgetTokens ?? 0);
+  });
+});

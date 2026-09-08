@@ -154,6 +154,54 @@ function judgingGate(
   return { evaluation, turns };
 }
 
+/**
+ * 0.6.0 §6.2 (PR 13b) — a grader that fans out like a real judge PANEL:
+ * `calls` role-judge request/response pairs, each reporting its own model,
+ * exactly as `gradeWithJudgePanel` does over `createJudgeGrader`.
+ */
+function panelGate(
+  calls: number,
+  judgeInputTokens: number,
+): { evaluation: RunEvaluation; turns: EvaluationTurn[] } {
+  const turns: EvaluationTurn[] = [];
+  const evaluation: RunEvaluation = {
+    threshold: 0.7,
+    onFail: "note",
+    maxRetries: 0,
+    graderType: "llm_judge",
+    judgeModel: `${OPUS}+${OPUS}`,
+    evaluate: async (turn) => {
+      turns.push(turn);
+      for (let i = 0; i < calls; i++) {
+        const env = turn.bus.envelope();
+        turn.bus.publish({
+          ...env,
+          kind: "model_request",
+          model: OPUS,
+          provider: "anthropic",
+          messageCount: 1,
+          toolCount: 1,
+          streaming: false,
+          role: "judge",
+        });
+        turn.bus.publish({
+          ...turn.bus.envelope(),
+          spanId: env.spanId,
+          kind: "model_response",
+          model: OPUS,
+          provider: "anthropic",
+          stopReason: "tool_use",
+          usage: { input: judgeInputTokens, output: 0 },
+          durationMs: 1,
+          role: "judge",
+        });
+      }
+      return { score: 1, rationale: "panel", judge: { model: `${OPUS}+${OPUS}` } };
+    },
+  };
+  return { evaluation, turns };
+}
+
 async function runAndCatch(fn: () => Promise<unknown>): Promise<unknown> {
   try {
     await fn();
@@ -327,6 +375,77 @@ describe("runChatLoop — eval_graded attribution + judge_share_exhausted (0.6.0
       .filter((l) => l.includes("[budget]") && l.includes("judge_share_exhausted"));
     expect(notices).toHaveLength(1);
     expect(notices[0]).toContain("0.3 of the $10.0000 cap");
+  });
+
+  /**
+   * 0.6.0 §6.2 (PR 13b) — a declared PANEL is inside `judge_share`, not
+   * beside it. `@crewhaus/eval-judge`'s `gradeWithJudgePanel` publishes ONE
+   * role-judge request/response pair per panelist per repeat (pinned in that
+   * package over a stub adapter); this pins the other half — the meter
+   * counts each of those calls separately, so three panelists reach the
+   * share where one judge of the same size would not.
+   */
+  test("every call of a judge PANEL counts against judge_share separately", async () => {
+    // Share 0.3 of $10 = $3. One panelist call = 40_000 opus tokens = $0.60:
+    // a single-judge grade stays under the share; a 3× panel with repeats
+    // (6 calls = $3.60) crosses it on the FIRST grade.
+    const single = pricedAdapter("anthropic", { input: 1000, output: 0 }, "draft");
+    const panelOfOne = judgingGate([1], 40_000, { maxRetries: 0 });
+    const runA = createRunContext();
+    const seenA: TraceEvent[] = [];
+    runA.eventBus.subscribe((e) => seenA.push(e));
+    let stderrA = captureStderr();
+    try {
+      await runChatLoop({
+        model: OPUS,
+        instructions: "test",
+        _adapter: single,
+        permissionMode: "bypass",
+        budget: { usdMicros: 10_000_000, onExceed: { kind: "stop" } },
+        evaluation: panelOfOne.evaluation,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "go" }],
+        installSigintHandler: false,
+        spinner: false,
+        runContext: runA,
+      });
+    } finally {
+      stderrA.restore();
+    }
+    expect("reason" in (graded(seenA)[0] ?? {})).toBe(false);
+
+    // The same grade, fanned out over six calls of the same size.
+    const panelAdapter = pricedAdapter("anthropic", { input: 1000, output: 0 }, "draft");
+    const panel = panelGate(6, 40_000);
+    const runB = createRunContext();
+    const seenB: TraceEvent[] = [];
+    runB.eventBus.subscribe((e) => seenB.push(e));
+    stderrA = captureStderr();
+    try {
+      await runChatLoop({
+        model: OPUS,
+        instructions: "test",
+        _adapter: panelAdapter,
+        permissionMode: "bypass",
+        budget: { usdMicros: 10_000_000, onExceed: { kind: "stop" } },
+        evaluation: panel.evaluation,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "go" }],
+        installSigintHandler: false,
+        spinner: false,
+        runContext: runB,
+      });
+    } finally {
+      stderrA.restore();
+    }
+    // Six role-judge pairs on the run bus, each metered …
+    expect(
+      seenB.filter(
+        (e): e is ModelResponseEvent => e.kind === "model_response" && e.role === "judge",
+      ),
+    ).toHaveLength(6);
+    // … and together they reach the share the single call stayed under.
+    expect(graded(seenB)[0]?.reason).toBe("judge_share_exhausted");
   });
 
   test("an explicit judgeShare lowers the bar", async () => {
