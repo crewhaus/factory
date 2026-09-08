@@ -711,3 +711,68 @@ describe("emitBatchWorker — crewhaus.control.v1", () => {
     expect(lane).not.toContain("__tick.sessionId");
   });
 });
+
+describe("emitBatchWorker — the pool's runtime closures reach the bundle (0.6.0 PR 9f)", () => {
+  // Plan §11.3 marks `guide / shadow` AND `Consult / Escalate` **E** on the
+  // batch row. PR 9e wired six emitters and left this one carrying the pool
+  // blob with none of the behaviour, so a declared `strategy.guide` ran under
+  // `crewhaus run` and did nothing in the compiled bundle. 9f renders
+  // `@crewhaus/model-service`'s `wireHybrid` at the same call site the literal
+  // routing fields use, from the SAME blob. Absent = byte-identical: a pool
+  // that declares no closure-shaped key renders no call and imports nothing.
+  const candidates = [
+    { model: "claude-haiku-4-5", tags: ["cheap"] },
+    { model: "claude-opus-4-8", tags: ["strong"] },
+  ];
+  const code = (pool: unknown): string =>
+    emitBatchWorker({
+      ...baseIr,
+      agent: { ...baseIr.agent, modelPool: pool },
+    } as unknown as IrBatchV0).files[0]?.content ?? "";
+
+  test("guide + shadow: the bundle imports the composition root and spreads wireHybrid", () => {
+    const c = code({
+      candidates,
+      policy: "heuristic",
+      strategy: {
+        guide: { model: "claude-opus-4-8", every: "first_turn" },
+        shadow: { candidate: "claude-opus-4-8", sampleRate: 0.2 },
+      },
+    });
+    expect(c).toContain('import { wireHybrid } from "@crewhaus/model-service";');
+    expect(c).toContain("...wireHybrid({");
+    expect(c).toContain('{ sessionName: "hello-batch" }),');
+  });
+
+  test("model_directed: §11.3 marks Consult / Escalate E here, so the pair is wired", () => {
+    const c = code({ candidates, policy: "heuristic", strategy: { modelDirected: true } });
+    expect(c).toContain("...wireHybrid({");
+    // The closure call carries the SAME blob the literal `modelPool` carries,
+    // and the shape declines no family, so no `hybridFamilies` restriction.
+    expect(c).toContain('"strategy":{"modelDirected":true}}, { sessionName: "hello-batch" }),');
+    expect(c).not.toContain("hybridFamilies");
+  });
+
+  test("policy: classifier wires the label call", () => {
+    const c = code({
+      candidates,
+      policy: "classifier",
+      classifier: { model: "claude-haiku-4-5", labels: { cheap: "easy", strong: "hard" } },
+    });
+    expect(c).toContain('import { wireHybrid } from "@crewhaus/model-service";');
+    expect(c).toContain("...wireHybrid({");
+  });
+
+  test("byte-identity: a pool with no closure-shaped key renders no call and no import", () => {
+    const c = code({ candidates, policy: "heuristic" });
+    expect(c).toContain('modelPool: {"candidates":');
+    expect(c).not.toContain("wireHybrid");
+    expect(c).not.toContain("@crewhaus/model-service");
+  });
+
+  test("byte-identity: no pool at all renders no call and no import", () => {
+    const c = emitBatchWorker(baseIr).files[0]?.content ?? "";
+    expect(c).not.toContain("wireHybrid");
+    expect(c).not.toContain("@crewhaus/model-service");
+  });
+});
