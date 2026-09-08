@@ -272,8 +272,24 @@ describe("graders.yaml per_model", () => {
         cwd: newTempRoot(),
         concurrency: 1,
         routing: "candidate:$fast",
-        // A pinned run routes nothing: no `model_route` line, no `profile`.
+        // A pinned run routes nothing: no `model_route` line, and the
+        // `model_response` carries no `profile` (attribution is gated on
+        // `plan.fromPool`, and a pin builds no pool). The events can therefore
+        // only ever name the MODEL STRING — never the `fast` profile the
+        // `per_model:` map is keyed on — which is why the pin has to win.
         chatLoop: (async (opts: Record<string, unknown>) => {
+          const ctx = opts["runContext"] as
+            | { eventBus: { envelope(): Record<string, unknown>; publish(e: unknown): void } }
+            | undefined;
+          ctx?.eventBus.publish({
+            ...ctx.eventBus.envelope(),
+            kind: "model_response",
+            model: "claude-haiku-4-5",
+            specModel: "claude-haiku-4-5",
+            stopReason: "end_turn",
+            usage: { input: 4, output: 2 },
+            durationMs: 3,
+          });
           const seed = opts["seedMessages"] as Array<{ content: string }>;
           return `answer for ${seed[seed.length - 1]?.content}`;
         }) as never,
@@ -282,6 +298,8 @@ describe("graders.yaml per_model", () => {
     });
 
     expect(summary.samples[0]?.grades.perGrader[0]?.rationale).toBe("judged with claude-opus-4-7");
+    // …and no THIRD set was built for the model-string arm the events name.
+    expect(bindings.map((b) => b.model)).toEqual(["claude-sonnet-5", "claude-opus-4-7"]);
   });
 
   test("an unresolvable $profile judge ref fails at run start", async () => {
@@ -306,6 +324,75 @@ describe("graders.yaml per_model", () => {
         },
       }),
     ).rejects.toThrow(/names judge "\$nonesuch".*declared: \$fast/s);
+  });
+
+  test("a per_model key naming no roster arm warns loudly", async () => {
+    // A typo (or a profile renamed in the spec but not in graders.yaml) used
+    // to be silently inert: every sample kept the base judge at the base cut
+    // while the operator believed the cheap arm was being checked.
+    const compiledGraders = parseGradersConfig(
+      gradersYaml(`    per_model:
+      $fst:
+        judge: $strong`),
+    ).compiled;
+    const written: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string) => {
+      written.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      await runEval({
+        ir: irOf(POOL_SPEC),
+        dataset: { name: "d", samples: yieldSamples(SAMPLES) },
+        compiledGraders,
+        opts: {
+          outDir: newTempRoot(),
+          cwd: newTempRoot(),
+          concurrency: 1,
+          routing: "as-declared",
+          chatLoop: routingChatLoop("claude-haiku-4-5", "fast") as never,
+          ...noCalibration,
+        },
+      });
+    } finally {
+      process.stderr.write = realWrite;
+    }
+    const stderr = written.join("");
+    expect(stderr).toContain("`per_model:` names arm(s) fst");
+    expect(stderr).toContain("known arms: fast, strong");
+  });
+
+  test("a per_model key naming a real roster arm warns about nothing", async () => {
+    const compiledGraders = parseGradersConfig(
+      gradersYaml(`    per_model:
+      $fast:
+        judge: $strong`),
+    ).compiled;
+    const written: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string) => {
+      written.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      await runEval({
+        ir: irOf(POOL_SPEC),
+        dataset: { name: "d", samples: yieldSamples(SAMPLES) },
+        compiledGraders,
+        opts: {
+          outDir: newTempRoot(),
+          cwd: newTempRoot(),
+          concurrency: 1,
+          routing: "as-declared",
+          chatLoop: routingChatLoop("claude-haiku-4-5", "fast") as never,
+          ...noCalibration,
+        },
+      });
+    } finally {
+      process.stderr.write = realWrite;
+    }
+    expect(written.join("")).not.toContain("names arm(s)");
   });
 
   test("a static run declaring per_model warns that no arm can resolve it", async () => {

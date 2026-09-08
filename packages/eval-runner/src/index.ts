@@ -148,7 +148,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { CompiledGrader, Grader, PerModelJudgeOverride } from "@crewhaus/eval-grader";
-import { perModelOverrideFor } from "@crewhaus/eval-grader";
+import { perModelArmKey, perModelOverrideFor } from "@crewhaus/eval-grader";
 import {
   type JudgeUsageSink,
   createJudgeGrader,
@@ -605,8 +605,12 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   // "the cheap arm was graded by the model it was supposed to be checked
   // against" is precisely the failure per-model judging exists to prevent.
   const resolvedJudgeRefs = new Map<string, string>();
+  // Every arm any `per_model:` block names (already normalized at parse), for
+  // the roster cross-check below.
+  const declaredPerModelArms = new Set<string>();
   for (const g of compiledGraders) {
     for (const [armKey, override] of Object.entries(g.judgeSpec?.perModel ?? {})) {
+      declaredPerModelArms.add(armKey);
       if (override.judge === undefined) continue;
       const resolved = resolveJudgeModelRef(ir, override.judge);
       if (resolved === undefined) {
@@ -919,6 +923,31 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
       "[eval] warning: graders.yaml declares `per_model:` judge overrides, but this run is `--routing static` — a static run has no served arm to resolve them against, so every sample is graded by the base judge. Run with `--routing as-declared` (or `--routing candidate:<arm>`) to measure per-arm judging.\n",
     );
   }
+  // 0.6.0 §6.2 — a `per_model:` key naming an arm this run's roster does not
+  // declare is INERT: every sample keeps the base judge at the base cut while
+  // the operator believes the cheap arm is being checked by the strong one —
+  // exactly the failure per-arm judging exists to prevent, and the one the
+  // judge-ref resolution above is loud about. A warning rather than a throw:
+  // grader sets are built lazily for arms the roster did not predict (a
+  // failover-chain member, a hand-wired invoker), so an unlisted key can still
+  // be legitimate.
+  if (declaredPerModelArms.size > 0) {
+    const knownArmIds = [
+      ...(routed?.armId !== undefined ? [routed.armId] : []),
+      ...(ir.agent.modelPool !== undefined ? poolArmIds(ir.agent.modelPool) : []),
+    ];
+    const knownKeys = new Set(knownArmIds.map(perModelArmKey));
+    const unknown = [...declaredPerModelArms].filter((a) => !knownKeys.has(a)).sort();
+    if (unknown.length > 0) {
+      process.stderr.write(
+        `[eval] warning: graders.yaml \`per_model:\` names arm(s) ${unknown.join(", ")}, which this spec's roster does not declare${
+          knownArmIds.length > 0
+            ? ` (known arms: ${knownArmIds.join(", ")})`
+            : " (it declares no model_pool and pins no candidate)"
+        } — a typo or a renamed profile grades every sample with the base judge at the base cut. Unlisted arms still grade if one actually serves (a failover-chain member, a hand-wired invoker).\n`,
+      );
+    }
+  }
   const gradersByArm = new Map<string, ReadonlyArray<GraderEntry>>();
   // Only a ROUTED run has arms: a static one attributes nothing, so it must
   // not pay for per-arm grader sets it can never select (and must not record
@@ -943,7 +972,13 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         readonly routes?: ReadonlyArray<EvalRouteDecision>;
         readonly servedModels?: ReadonlyArray<ServedModel>;
       }): ReadonlyArray<GraderEntry> => {
-        const arm = sampleArmId(sampleRouting) ?? routed?.armId;
+        // The PIN wins over the events: a `candidate:` run routes nothing
+        // (`resolveEvalRouting` builds a fragment from fallbacks/circuit
+        // breaker only), so `planAttribution` stamps no `profile` and the
+        // sample's served models can only name a model string — never the
+        // profile the `per_model:` map is keyed on. `routed.armId` is
+        // undefined under `as-declared`, so the pool path is unchanged.
+        const arm = routed?.armId ?? sampleArmId(sampleRouting);
         if (arm === undefined) return graders;
         const known = gradersByArm.get(arm);
         if (known !== undefined) return known;

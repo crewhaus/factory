@@ -144,6 +144,50 @@ describe("per_model grammar", () => {
     ).toThrow(/declares `per_model` with a categorical rubric/);
   });
 
+  test("a `judges:` panel plus a per_model `judge:` is a loud error", () => {
+    // `createJudgeGrader` takes the panel branch and never reads the single
+    // model, so the per-arm judge would be dropped while run.json reported it
+    // as the model that graded that arm.
+    expect(() =>
+      parseGradersConfig(
+        judgeConfig(`    judges: [claude-haiku-4-5, claude-sonnet-5, claude-opus-4-7]
+    per_model:
+      $fast:
+        judge: $strong
+`),
+      ),
+    ).toThrow(/declares a `judges:` panel and a `per_model` `judge:` for arm "fast"/);
+  });
+
+  test("a panel plus a per_model entry carrying no judge still compiles", () => {
+    // Only `judge:` collides with a panel — a per-arm cut and weight are
+    // honoured by the panel path unchanged.
+    const { compiled } = parseGradersConfig(
+      judgeConfig(`    judges: [claude-haiku-4-5, claude-sonnet-5, claude-opus-4-7]
+    per_model:
+      $fast:
+        passing_score: 4
+`),
+    );
+    expect(compiled[0]?.judgeSpec?.perModel).toEqual({ fast: { passingScore: 4 } });
+  });
+
+  test("a FILE-level judge reaching a panel grader is rejected too", () => {
+    // The file-level map merges onto every scalar llm_judge, the panel one
+    // included — where it would be just as silently ignored.
+    expect(() =>
+      parseGradersConfig(`graders:
+  - name: panel
+    type: llm_judge
+    judges: [claude-haiku-4-5, claude-sonnet-5, claude-opus-4-7]
+${RUBRIC}
+per_model:
+  $fast:
+    judge: $strong
+`),
+    ).toThrow(/move it onto the single-judge graders that consume it/);
+  });
+
   test("a file-level map with no scalar llm_judge to consume it is a loud error", () => {
     expect(() =>
       parseGradersConfig(`graders:

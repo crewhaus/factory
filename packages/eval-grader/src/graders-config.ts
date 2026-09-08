@@ -102,6 +102,10 @@ const WeightField = z.number().positive().optional();
  * weight under `combine: weighted`. Strict, so a typoed key (`judge_model:`,
  * `passing:`) fails at parse instead of grading the cheap arm with the
  * defaults while the user believes their override applied.
+ *
+ * `judge` and a grader-level `judges:` PANEL are mutually exclusive — a panel
+ * fixes the judge set for every arm, so the per-arm judge could only be
+ * ignored. Declaring both is a parse error rather than a silent drop.
  */
 const PerModelJudgeSpec = z
   .object({
@@ -575,6 +579,23 @@ export function parseGradersConfig(yamlText: string): {
       entry.judgeSpec !== undefined && entry.judgeSpec.rubric.kind !== "categorical"
         ? mergePerModel(topPerModel, entry.judgeSpec.perModel)
         : undefined;
+    // 0.6.0 §6.2 — a `judges:` PANEL fixes the judge set for the whole
+    // grader: `createJudgeGrader` takes the panel branch and never reads the
+    // single `model`, so a per-arm `judge:` would be dropped on the floor
+    // while `run.json`'s `judgeSampling[].perModel` reported it as the model
+    // that graded that arm. That is the silently-ignored-knob trap the rest
+    // of this file is strict about, applied to the one field that decides
+    // WHICH model produced a verdict — so reject the combination instead.
+    if (entry.judgeSpec?.judges !== undefined && perModel !== undefined) {
+      const armWithJudge = Object.entries(perModel).find(
+        ([, override]) => override.judge !== undefined,
+      )?.[0];
+      if (armWithJudge !== undefined) {
+        throw new GraderError(
+          `invalid graders config: grader "${spec.name}" declares a \`judges:\` panel and a \`per_model\` \`judge:\` for arm "${armWithJudge}" — a panel overrides the single judge model, so the per-arm judge would be silently ignored; drop one (a file-level \`per_model:\` block reaches this grader too — move it onto the single-judge graders that consume it)`,
+        );
+      }
+    }
     return {
       ...entry,
       ...(entry.judgeSpec !== undefined && perModel !== undefined
