@@ -495,6 +495,26 @@ export type JudgeUsage = {
   readonly byModel: Readonly<
     Record<string, { readonly calls: number; readonly input: number; readonly output: number }>
   >;
+  /**
+   * 0.6.0 §6.2 — the same spend split by (JUDGE MODEL, AGENT ARM): what it
+   * cost to grade each arm. Once `graders.yaml` binds a cheap arm to a strong
+   * judge, "the judge cost $4" stops being an answer — the hybrid question is
+   * whether the cheap arm's savings survive its grading bill, and only this
+   * split can say. Sorted by (judgeModel, arm).
+   *
+   * Present only when at least one metered judge call could be attributed to
+   * an arm — i.e. a routed run ({@link EvalRoutingConfig}). Unrouted runs, and
+   * the judge-backed registry classifiers (which meter through one run-level
+   * sink), contribute to {@link byModel} only, so an unrouted results.json
+   * stays byte-identical.
+   */
+  readonly byPair?: ReadonlyArray<{
+    readonly judgeModel: string;
+    readonly arm: string;
+    readonly calls: number;
+    readonly input: number;
+    readonly output: number;
+  }>;
 };
 
 /**
@@ -518,6 +538,15 @@ export type SliceStats = {
  */
 export type JudgeCalibrationApplication = {
   readonly grader: string;
+  /**
+   * 0.6.0 §6.2 — the AGENT ARM this application is for, present only when a
+   * (arm, judge) pair entry supplied the cut. The run-level entry (the spec's
+   * own cut, applied to every arm the pairs do not name) carries neither this
+   * nor {@link pairKey}, so an unrouted run's manifest is unchanged.
+   */
+  readonly arm?: string;
+  /** The `byPair` key the cut came from (`<arm>::<judgeModel>`). */
+  readonly pairKey?: string;
   /** Which calibration entry keyed the cut: the spec's name, or "default". */
   readonly specKey: string;
   readonly minScore: number;
@@ -683,6 +712,23 @@ export type EvalRunSummary = {
        *  the same measurement). Absent on default output-judged graders,
        *  keeping their entries byte-identical. */
       readonly target?: "output" | "transcript";
+      /**
+       * 0.6.0 §6.2 — the per-arm judge map in force (grader-level merged
+       * over the file-level one), keyed by arm with `$profile` judge refs
+       * RESOLVED to their model: a run.json that says which model actually
+       * graded which arm. Absent without a `per_model:` block, keeping
+       * existing entries byte-identical.
+       */
+      readonly perModel?: Readonly<
+        Record<
+          string,
+          {
+            readonly judge?: string;
+            readonly passingScore?: number;
+            readonly weight?: number;
+          }
+        >
+      >;
     }>;
     /** G47 — present when at least one `llm_judge` grader's gate came from
      *  the calibration file rather than a rubric-declared `passing_score`. */

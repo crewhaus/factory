@@ -29,6 +29,11 @@
  *                              # overrides model:; median score, majority pass,
  *                              # vote entropy; repeats then apply per panelist
  *       weight: 3              # any grader may declare a positive weight (default 1)
+ *       per_model:             # 0.6.0 §6.2 — per SERVED ARM judge overrides:
+ *         $fast:               # the cheap arm's samples are graded by the
+ *           judge: $strong     # strong model, at its own cut and weight
+ *           passing_score: 4   # (a routed eval supplies the arm; a static
+ *           weight: 1.2        #  run has none — the base judge grades all)
  *     - name: judge_label
  *       type: llm_judge
  *       rubric:                # NEW-graders-2 — categorical rubric: the judge
@@ -80,6 +85,37 @@ import type { Grader } from "./types";
 
 /** Positive per-grader weight for `combine: weighted` (default 1). */
 const WeightField = z.number().positive().optional();
+
+/**
+ * 0.6.0 §6.2 — one arm's judge override. Declared under `per_model:`, keyed
+ * by the roster arm the SAMPLE was served by (a `models:` profile name, with
+ * or without the `$` sigil, or a candidate's model string):
+ *
+ *   per_model:
+ *     $fast: { judge: $strong, passing_score: 4, weight: 1.2 }
+ *
+ * `judge` is the model that grades that arm's samples (a `$profile` ref
+ * resolves through the spec's roster at run start — an unknown ref is a loud
+ * error, never a silent fallback to the default judge); `passing_score` is
+ * that arm's cut on the judge's 1–5 scale (it also overrides the G47
+ * calibrated cut — an explicit gate always wins); `weight` is the entry's
+ * weight under `combine: weighted`. Strict, so a typoed key (`judge_model:`,
+ * `passing:`) fails at parse instead of grading the cheap arm with the
+ * defaults while the user believes their override applied.
+ *
+ * `judge` and a grader-level `judges:` PANEL are mutually exclusive — a panel
+ * fixes the judge set for every arm, so the per-arm judge could only be
+ * ignored. Declaring both is a parse error rather than a silent drop.
+ */
+const PerModelJudgeSpec = z
+  .object({
+    judge: z.string().min(1).optional(),
+    passing_score: z.number().min(1).max(5).optional(),
+    weight: z.number().positive().optional(),
+  })
+  .strict();
+
+const PerModelMap = z.record(z.string().min(1), PerModelJudgeSpec);
 
 const ExactMatchSpec = z.object({
   name: z.string(),
@@ -261,6 +297,13 @@ const LlmJudgeSpec = z
       .positive()
       .refine((n) => n % 2 === 1, { message: "repeats must be an odd positive integer" })
       .optional(),
+    // 0.6.0 §6.2 — PER-MODEL judging: bind the arm that served a sample to
+    // its own judge / cut / weight (see {@link PerModelJudgeSpec}). Absent ⇒
+    // one judge for every arm, exactly as before. Resolved per sample
+    // against the SERVED arm, so it is meaningful only on a routed eval
+    // (`--routing as-declared | candidate:…`); the runner warns when a
+    // static run declares one.
+    per_model: PerModelMap.optional(),
     weight: WeightField,
   })
   // NEW-HUNT-2 — strict: a typoed decoding key (`temperture: 0.5`,
@@ -321,6 +364,12 @@ export const GradersConfigSchema = z
     graders: z.array(GraderSpec).min(1),
     combine: z.enum(["all", "any", "weighted"]).optional(),
     passing_threshold: z.number().min(0).max(1).optional(),
+    // 0.6.0 §6.2 — the file-level per-model judge map: the same
+    // {@link PerModelJudgeSpec} vocabulary applied to EVERY scalar
+    // `llm_judge` entry, so a two-arm roster needs one block rather than one
+    // per grader. A grader's own `per_model` entry wins field-by-field over
+    // the file-level one for the same arm.
+    per_model: PerModelMap.optional(),
   })
   // A4/A5 hardening — a typoed top-level key (`combined:`, `passing_treshold:`)
   // must fail loudly at parse, not be silently stripped so the run proceeds in
@@ -340,6 +389,42 @@ export type GraderSpec = z.infer<typeof GraderSpec>;
 export type RubricSpec = z.infer<typeof RubricSpec>;
 
 export type GraderCombineMode = "all" | "any" | "weighted";
+
+/**
+ * 0.6.0 §6.2 — one resolved `per_model:` override (see
+ * {@link PerModelJudgeSpec}), in the compiled camelCase vocabulary the
+ * runner reads.
+ */
+export type PerModelJudgeOverride = {
+  /** The judge model (or an unresolved `$profile` ref) for this arm. */
+  readonly judge?: string;
+  /** This arm's cut on the judge's 1–5 scale — wins over the calibrated cut. */
+  readonly passingScore?: number;
+  /** This arm's weight under `combine: weighted`. */
+  readonly weight?: number;
+};
+
+/**
+ * The lookup key for a `per_model:` arm: the arm id with any `$` sigil
+ * stripped, so `$fast`, `fast` and a served arm reported as either all meet.
+ */
+export function perModelArmKey(arm: string): string {
+  return arm.startsWith("$") ? arm.slice(1) : arm;
+}
+
+/**
+ * 0.6.0 §6.2 — the override in force for a served arm, or `undefined` when
+ * the map declares none (and when the sample has no arm at all, which is
+ * every unrouted run). Pure, so the runner and any other consumer resolve
+ * per-model judging identically.
+ */
+export function perModelOverrideFor(
+  perModel: Readonly<Record<string, PerModelJudgeOverride>> | undefined,
+  arm: string | undefined,
+): PerModelJudgeOverride | undefined {
+  if (perModel === undefined || arm === undefined) return undefined;
+  return perModel[perModelArmKey(arm)];
+}
 
 /**
  * The config's top-level combination policy (`combine:` +
@@ -375,6 +460,14 @@ export type CompiledGrader = {
     /** NEW-HUNT-2 — odd judge-panel size; median score wins (default 1).
      *  With A2 `judges` declared too, repeats apply per panelist. */
     repeats?: number;
+    /**
+     * 0.6.0 §6.2 — per-arm judge overrides, the file-level `per_model:` map
+     * merged UNDER this grader's own (grader-level fields win, per arm and
+     * per field). Keys are NORMALIZED: the `$` sigil is stripped, so a
+     * served arm looks up with {@link perModelOverrideFor} whichever form
+     * the file used. Absent ⇒ one judge for every arm (byte-identical).
+     */
+    perModel?: Readonly<Record<string, PerModelJudgeOverride>>;
   };
   /** Present for `type: registry` entries — the runner resolves `grader`
    *  against its `graderRegistry` before invoking (see `RegistryGraderSpec`).
@@ -418,10 +511,18 @@ export function parseGradersConfig(yamlText: string): {
   // union's options must stay plain ZodObjects.
   for (const spec of config.graders) {
     if (spec.type !== "llm_judge" || spec.rubric.kind !== "categorical") continue;
-    for (const field of ["repeats", "judges"] as const) {
+    // 0.6.0 §6.2 — `per_model` joins the categorical rejection list for the
+    // same reason: its `passing_score` is a scalar cut a label-gated rubric
+    // does not have, and a silently-ignored per-arm judge map is exactly the
+    // trap this file's strictness exists to prevent.
+    for (const field of ["repeats", "judges", "per_model"] as const) {
       if (spec[field] !== undefined) {
         throw new GraderError(
-          `invalid graders config: grader "${spec.name}" declares \`${field}\` with a categorical rubric — not supported (no label-vote fold yet); drop the field or use a scalar rubric`,
+          `invalid graders config: grader "${spec.name}" declares \`${field}\` with a categorical rubric — not supported (${
+            field === "per_model"
+              ? "per-arm overrides gate on a scalar passing_score, which a label-gated rubric does not have"
+              : "no label-vote fold yet"
+          }); drop the field or use a scalar rubric`,
         );
       }
     }
@@ -453,11 +554,101 @@ export function parseGradersConfig(yamlText: string): {
             : {}),
         }
       : undefined;
-  const compiled: CompiledGrader[] = config.graders.map((spec) => ({
-    ...compile(spec),
-    ...(combine !== undefined ? { combine } : {}),
-  }));
+  // 0.6.0 §6.2 — the file-level `per_model:` map applies to every SCALAR
+  // `llm_judge` entry. Declaring one with no such grader would silently
+  // apply to nothing (the same trap the misplaced-`opts:` check closes), so
+  // say so instead.
+  const topPerModel = normalizePerModel(config.per_model, "per_model");
+  if (
+    topPerModel !== undefined &&
+    !config.graders.some((g) => g.type === "llm_judge" && g.rubric.kind !== "categorical")
+  ) {
+    throw new GraderError(
+      "invalid graders config: top-level `per_model:` declares per-arm judge overrides, but no scalar `type: llm_judge` grader can consume them — add one or remove the block",
+    );
+  }
+  const compiled: CompiledGrader[] = config.graders.map((spec) => {
+    const entry = compile(spec);
+    // The file-level map merges UNDER the grader's own, per arm and per
+    // field: a grader that names its own judge for `$fast` keeps the
+    // file-level `passing_score` for the same arm. CATEGORICAL judges are
+    // excluded — they reject `per_model` outright (a label-gated rubric has
+    // no scalar cut), and quietly handing them a map they cannot honour is
+    // the silently-ignored-knob trap this file exists to prevent.
+    const perModel =
+      entry.judgeSpec !== undefined && entry.judgeSpec.rubric.kind !== "categorical"
+        ? mergePerModel(topPerModel, entry.judgeSpec.perModel)
+        : undefined;
+    // 0.6.0 §6.2 — a `judges:` PANEL fixes the judge set for the whole
+    // grader: `createJudgeGrader` takes the panel branch and never reads the
+    // single `model`, so a per-arm `judge:` would be dropped on the floor
+    // while `run.json`'s `judgeSampling[].perModel` reported it as the model
+    // that graded that arm. That is the silently-ignored-knob trap the rest
+    // of this file is strict about, applied to the one field that decides
+    // WHICH model produced a verdict — so reject the combination instead.
+    if (entry.judgeSpec?.judges !== undefined && perModel !== undefined) {
+      const armWithJudge = Object.entries(perModel).find(
+        ([, override]) => override.judge !== undefined,
+      )?.[0];
+      if (armWithJudge !== undefined) {
+        throw new GraderError(
+          `invalid graders config: grader "${spec.name}" declares a \`judges:\` panel and a \`per_model\` \`judge:\` for arm "${armWithJudge}" — a panel overrides the single judge model, so the per-arm judge would be silently ignored; drop one (a file-level \`per_model:\` block reaches this grader too — move it onto the single-judge graders that consume it)`,
+        );
+      }
+    }
+    return {
+      ...entry,
+      ...(entry.judgeSpec !== undefined && perModel !== undefined
+        ? { judgeSpec: { ...entry.judgeSpec, perModel } }
+        : {}),
+      ...(combine !== undefined ? { combine } : {}),
+    };
+  });
   return { config, compiled };
+}
+
+/**
+ * 0.6.0 §6.2 — normalize a parsed `per_model:` map into the compiled
+ * camelCase vocabulary, keyed by {@link perModelArmKey}. Two keys that
+ * normalize to the same arm (`$fast` and `fast`) are a loud error: which one
+ * wins would be an invisible coin-flip on the judge a whole arm is graded by.
+ */
+function normalizePerModel(
+  raw: Record<string, { judge?: string; passing_score?: number; weight?: number }> | undefined,
+  where: string,
+): Record<string, PerModelJudgeOverride> | undefined {
+  if (raw === undefined) return undefined;
+  const out: Record<string, PerModelJudgeOverride> = {};
+  const seen = new Map<string, string>();
+  for (const [key, value] of Object.entries(raw)) {
+    const armKey = perModelArmKey(key);
+    const prior = seen.get(armKey);
+    if (prior !== undefined) {
+      throw new GraderError(
+        `invalid graders config: ${where} declares both "${prior}" and "${key}" — they name the same arm "${armKey}"; keep one`,
+      );
+    }
+    seen.set(armKey, key);
+    out[armKey] = {
+      ...(value.judge !== undefined ? { judge: value.judge } : {}),
+      ...(value.passing_score !== undefined ? { passingScore: value.passing_score } : {}),
+      ...(value.weight !== undefined ? { weight: value.weight } : {}),
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** File-level overrides merged UNDER grader-level ones, per arm and field. */
+function mergePerModel(
+  base: Record<string, PerModelJudgeOverride> | undefined,
+  own: Readonly<Record<string, PerModelJudgeOverride>> | undefined,
+): Record<string, PerModelJudgeOverride> | undefined {
+  if (base === undefined) return own !== undefined ? { ...own } : undefined;
+  const out: Record<string, PerModelJudgeOverride> = { ...base };
+  for (const [arm, override] of Object.entries(own ?? {})) {
+    out[arm] = { ...(out[arm] ?? {}), ...override };
+  }
+  return out;
 }
 
 function compile(spec: GraderSpec): CompiledGrader {
@@ -535,6 +726,12 @@ function compile(spec: GraderSpec): CompiledGrader {
           ...(spec.target !== undefined ? { target: spec.target } : {}),
           ...(spec.temperature !== undefined ? { temperature: spec.temperature } : {}),
           ...(spec.repeats !== undefined ? { repeats: spec.repeats } : {}),
+          // 0.6.0 §6.2 — normalized here; `parseGradersConfig` then merges
+          // the file-level map underneath it.
+          ...(() => {
+            const perModel = normalizePerModel(spec.per_model, `grader "${spec.name}" per_model`);
+            return perModel !== undefined ? { perModel } : {};
+          })(),
         },
       };
     case "registry":

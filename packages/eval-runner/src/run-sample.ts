@@ -21,7 +21,14 @@ import type {
 import { RunnerError } from "./errors";
 import { sampleArtifactDirName } from "./resume";
 import { foldRouteDecisions, foldServedModels } from "./routing";
-import type { AgentInvoker, GraderEntry, SampleMetrics, SampleResult } from "./types";
+import type {
+  AgentInvoker,
+  EvalRouteDecision,
+  GraderEntry,
+  SampleMetrics,
+  SampleResult,
+  ServedModel,
+} from "./types";
 
 /**
  * Per-sample logic. Mints a fresh runContext (and therefore a fresh
@@ -69,8 +76,21 @@ export async function runSample(args: {
    * supposed to preserve. Absent ⇒ static, exactly as before.
    */
   routed?: boolean;
+  /**
+   * 0.6.0 §6.2 — PER-MODEL grading. When present, the grader set is chosen
+   * AFTER the invocation, from the arm that actually served this sample
+   * (`graders.yaml`'s `per_model:` map binds an arm to its own judge, cut and
+   * weight, and judge calibration is keyed by the (arm, judge) pair). Absent
+   * ⇒ the shared `graders` array grades every sample, exactly as before — the
+   * runner only supplies this on a run that has something arm-specific to
+   * resolve.
+   */
+  gradersForSample?: (routing: {
+    readonly routes?: ReadonlyArray<EvalRouteDecision>;
+    readonly servedModels?: ReadonlyArray<ServedModel>;
+  }) => ReadonlyArray<GraderEntry>;
 }): Promise<SampleResult> {
-  const { sample, invoker, graders, outDir, model } = args;
+  const { sample, invoker, outDir, model } = args;
   const trialSuffix = args.trial !== undefined && args.trial > 1 ? `.trial${args.trial}` : "";
   const sampleDir = join(outDir, `${sampleArtifactDirName(sample.id)}${trialSuffix}`);
   mkdirSync(sampleDir, { recursive: true });
@@ -185,6 +205,14 @@ export async function runSample(args: {
       ...(args.specName !== undefined ? { specName: args.specName } : {}),
     },
   };
+
+  // 0.6.0 §6.2 — the graders THIS sample is scored by: its served arm's set
+  // when the runner supplied a resolver, else the shared one.
+  const graders =
+    args.gradersForSample?.({
+      ...(routes !== undefined ? { routes } : {}),
+      ...(servedModels !== undefined ? { servedModels } : {}),
+    }) ?? args.graders;
 
   const perGrader: Array<{ name: string } & GradeResult> = [];
   // A grader throwing is grader INFRA noise (judge 429/timeout), not a graded

@@ -256,6 +256,104 @@ describe("arm identity and v:2 provenance (§7.9)", () => {
   });
 });
 
+describe("the judge model in the per-arm lineage (§6.2, PR 13)", () => {
+  test("re-pointing evaluation.judgeModel stamps a NEW lineage under the same arm id", async () => {
+    const root = freshRoot();
+    const run = async (judgeModel: string): Promise<void> => {
+      await runChatLoop({
+        model: SONNET,
+        instructions: "test",
+        _adapter: okAdapter("primary"),
+        // The seam PR 10 could not see: the judge is called by `evaluate`, a
+        // closure, so the pool had only the grader KIND to fingerprint. The
+        // declarative `judgeModel` closes that hole.
+        evaluation: {
+          graderType: "llm_judge",
+          judgeModel,
+          threshold: 0.7,
+          onFail: "note",
+          maxRetries: 0,
+          evaluate: async () => ({ score: 1, rationale: "fine" }),
+        },
+        modelPool: {
+          candidates: [
+            { model: HAIKU, tags: ["cheap"], profile: "fast" },
+            { model: OPUS, tags: ["strong"], profile: "strong" },
+          ],
+          policy: "heuristic",
+        },
+        _poolAdapters: new Map([
+          [HAIKU, okAdapter("cheap")],
+          [OPUS, okAdapter("strong")],
+        ]),
+        runContext: createRunContext(),
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "hello" }],
+      });
+    };
+    await run("claude-sonnet-5");
+    await run("claude-sonnet-5");
+    await run("claude-opus-4-7"); // a DIFFERENT instrument graded this arm
+
+    const lines = armLines(root).filter((l) => l["m"] === "strong");
+    expect(lines).toHaveLength(3);
+    const pfs = lines.map((l) => l["pf"]);
+    expect(pfs[0]).toBe(pfs[1]);
+    expect(pfs[2]).not.toBe(pfs[0]);
+    // The third run's runtime reads only its own lineage back.
+    expect(
+      openScoreboard(root, { lineage: { strong: pfs[2] as string } }).score("hard", "strong")?.n,
+    ).toBe(1);
+  });
+
+  test("a deterministic grader carries no judge, so its lineage is unchanged", async () => {
+    const root = freshRoot();
+    const run = async (evaluation?: Parameters<typeof runChatLoop>[0]["evaluation"]) => {
+      await runChatLoop({
+        model: SONNET,
+        instructions: "test",
+        _adapter: okAdapter("primary"),
+        ...(evaluation !== undefined ? { evaluation } : {}),
+        modelPool: {
+          candidates: [
+            { model: HAIKU, tags: ["cheap"], profile: "fast" },
+            { model: OPUS, tags: ["strong"], profile: "strong" },
+          ],
+          policy: "heuristic",
+        },
+        _poolAdapters: new Map([
+          [HAIKU, okAdapter("cheap")],
+          [OPUS, okAdapter("strong")],
+        ]),
+        runContext: createRunContext(),
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "hello" }],
+      });
+    };
+    // A `contains` grader renders no `judgeModel`, so its fingerprint is the
+    // one PR 10 wrote — `planFingerprint` drops `undefined` members.
+    await run({
+      graderType: "contains",
+      threshold: 1,
+      onFail: "note",
+      maxRetries: 0,
+      evaluate: async () => ({ score: 1, rationale: "ok" }),
+    });
+    await run({
+      graderType: "contains",
+      threshold: 1,
+      onFail: "note",
+      maxRetries: 0,
+      evaluate: async () => ({ score: 1, rationale: "ok" }),
+    });
+    const pfs = armLines(root)
+      .filter((l) => l["m"] === "strong")
+      .map((l) => l["pf"]);
+    expect(pfs).toHaveLength(2);
+    expect(pfs[0]).toBe(pfs[1]);
+  });
+});
+
 describe("scoped route keys (§7.9)", () => {
   test("a scoped pool keys <scope>/<band>, stamps sc on the line, and the shadow-free store reads back under that key", async () => {
     const root = freshRoot();
