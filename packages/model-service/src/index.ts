@@ -68,10 +68,9 @@
  * of the three closure FAMILIES ({@link HybridWiringFamily}) is wired per
  * shape: every pool-bearing shape gets `classifier` and `sideCalls`, and
  * every one but `pipeline` also gets `modelDirected`, because §11.3 marks
- * `Consult / Escalate` `—` there (the pipeline shape declares no `tools:` of
- * its own — `toolLess` in `@crewhaus/spec` — so a per-model tools list has
- * nothing to narrow and the model-directed pair has no shape toolset to
- * arbitrate). {@link wireHybrid} and {@link renderHybridWiringFields} both
+ * `Consult / Escalate` `—` there. That cell is the PLAN's decision, not a
+ * property of the shape — see {@link HYBRID_FAMILIES_BY_SHAPE}.
+ * {@link wireHybrid} and {@link renderHybridWiringFields} both
  * take that family set, so the interpreter, the bundle and the compiler's
  * warning all read one table.
  *
@@ -492,10 +491,15 @@ export type HybridWiringShape =
  *   §11.3 marks it `—` (`SpecRoutedHost.committee`), so no shape needs to
  *   decline the family for it.
  * - `pipeline` declines `modelDirected`: §11.3 marks `Consult / Escalate` `—`
- *   on that row. The pipeline shape declares no `tools:` of its own
- *   (`toolLess` in `@crewhaus/spec`, which is why a per-model `tools` list is
- *   refused there), so the model-directed pair has no shape toolset to
- *   arbitrate over.
+ *   on that row, and the table is the only ground for it. Mechanically the
+ *   shape could host the pair: {@link wireModelDirected} builds Consult /
+ *   Escalate from the POOL roster and returns them as ADDITIVE `hybridTools`
+ *   — it narrows no shape toolset (the consulted model gets none at all), and
+ *   the emitted pipeline bundle registers a tool catalog of its own.
+ *   `toolLess` in `@crewhaus/spec` says only that the pipeline SPEC has no
+ *   `tools:` key, which is why a per-model `tools` list is refused there — a
+ *   different fact. So this row is a plan decision open to revision, not a
+ *   shape fact, and the compiler's warning says so.
  * - The four shapes with no `model_pool` block at all (`voice`, `eval`,
  *   `onchain`, `onchain-game` — `—` in the pool column) take no family; the
  *   strict schema refuses the block before any of this is reached.

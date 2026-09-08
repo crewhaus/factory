@@ -196,7 +196,8 @@ const ROWS: readonly Row[] = [
     shape: "pipeline",
     guideShadow: "E",
     committee: "—",
-    // §11.3's ONE `—` among the shapes 9f wires: no shape toolset to arbitrate.
+    // §11.3's ONE `—` among the shapes 9f wires — a plan decision, not a
+    // shape limit (the pair is additive; see HYBRID_SHAPE_REASON).
     consultEscalate: "—",
     classifier: "E",
     rendersCall: true,
@@ -355,7 +356,7 @@ describe("plan §11.3 — the per-shape hybrid matrix matches the compiler (PR 9
           expect(noticePaths(yaml)).toEqual([]);
           if (row.rendersCall) expect(bundleText(yaml)).toContain("...wireHybrid({");
         } else {
-          // Field-precise, and permanent: a shape fact, not a deferred row.
+          // Field-precise, and standing: a plan decision, not a deferred row.
           expect(noticePaths(yaml)).toEqual([`${row.poolPath}.strategy.model_directed`]);
           expect(bundleText(yaml)).not.toContain("wireHybrid");
         }

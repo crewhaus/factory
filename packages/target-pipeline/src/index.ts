@@ -134,9 +134,11 @@ function renderAgent(ir: IrPipelineV0, evalEntry = false): string {
   }
   const docsLiteral = JSON.stringify(ir.indexing.documents);
   // 0.6.0 PR 9f (§11.3) — the closure half of the pool. The pipeline row
-  // marks `Consult / Escalate` `—` (this shape declares no `tools:` of its
-  // own, so there is no shape toolset for the model-directed pair to
-  // arbitrate over), so the emitter passes the shape's family row and a pool
+  // marks `Consult / Escalate` `—`; that is the plan's decision and not a
+  // property of this shape (the pair is built from the pool roster and ADDED
+  // to the tool list below, which the bundle plainly has), so the compiler
+  // says so in its warning. The emitter passes the shape's family row and a
+  // pool
   // declaring ONLY `strategy.model_directed` renders nothing here — the
   // compiler warns on that key instead. Rendered onto BOTH the REPL call and
   // the eval entry, which share the one pool, so the two paths cannot drift.

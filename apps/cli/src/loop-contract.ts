@@ -173,6 +173,13 @@ export function loopContractRunOptions(ir: LoopContractIrSlice): LoopContractRun
  * today (`pipeline` declines the Consult / Escalate pair) travels into the
  * bundle verbatim, so the two paths stay comparable key for key.
  *
+ * "The interpreter" is TWO call sites, and 9f fixed the second: `crewhaus
+ * run` accepts `cli` and `browser` (every other shape is compile-only, and
+ * `serve --mcp` is cli-only), and until this row the browser path spread none
+ * of this — a browser spec routed and consulted when compiled and did neither
+ * when run. Both `runRunCli` and `runRunBrowser` now spread this call, so the
+ * key-for-key claim above holds for every shape an interpreter accepts.
+ *
  * `modelOverride` is the raw `--model` flag value: a string is an explicit
  * routing decision authored against a different primary, so the spec's
  * chain, tiers and pool (and with it the hybrid tools) are dropped (the

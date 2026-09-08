@@ -1206,9 +1206,11 @@ const LANDING_SINGLE_SLOT =
  * bundles it describes cannot disagree. PR 9e's KNOWN SHORTFALL (the four
  * pool-bearing shapes whose emitters rendered nothing while §11.3 marked them
  * **E**) is closed by 9f: every family a shape's row carries is emit-wired,
- * and the only remaining gap is a family a shape genuinely cannot host —
+ * and the only remaining gap is the family §11.3 declines on a row —
  * `pipeline` × `modelDirected`, reported as `model-plan-ignored-on-shape`
- * rather than as a pending row, because no later PR will change it.
+ * rather than as a pending row, because no later PR will change it. See
+ * {@link HYBRID_SHAPE_REASON}: that cell is a plan decision, not a limit of
+ * the shape.
  */
 export const HYBRID_WIRED_TARGETS: ReadonlySet<Spec["target"]> = new Set(
   (Object.keys(HYBRID_FAMILIES_BY_SHAPE) as Spec["target"][]).filter(
@@ -1228,15 +1230,32 @@ type _HybridShapePin = Spec["target"] extends HybridWiringShape
 const _HYBRID_SHAPE_PIN: _HybridShapePin = true;
 void _HYBRID_SHAPE_PIN;
 /**
- * §11.3 marks `Consult / Escalate` `—` on `pipeline`: that shape declares no
- * `tools:` of its own (`toolLess` in `@crewhaus/spec`, which is also why a
- * per-model `tools` list is refused there), so the model-directed pair has no
- * shape toolset to arbitrate over. Not a pending row — a shape fact.
+ * §11.3 marks `Consult / Escalate` `—` on `pipeline`, and the TABLE is the
+ * only ground for it. The shape could host the pair mechanically:
+ * `wireModelDirected` builds Consult / Escalate from the POOL roster and
+ * returns them as ADDITIVE `hybridTools` — it narrows no shape toolset, and
+ * the emitted pipeline bundle has a tool catalog of its own (`retrieve`, the
+ * skill tool). `toolLess` in `@crewhaus/spec` says only that the pipeline
+ * SPEC has no `tools:` key, which is why a per-model `tools` list is refused
+ * there — a different fact. So this cell is a PLAN decision, open for the
+ * plan owner to revisit; not a pending row either, since no PR-train row
+ * changes it.
  */
 const HYBRID_SHAPE_REASON: Readonly<Partial<Record<Spec["target"], string>>> = {
   pipeline:
-    "the pipeline shape declares no tools of its own, so there is no shape toolset for the Consult / Escalate pair to arbitrate over",
+    "the pair has not been sanctioned on this shape — it is built from the pool roster and ADDED to the tool list, so this is a plan decision rather than a mechanical limit",
 };
+/**
+ * The shapes an interpreter can run at all: `crewhaus run` accepts `cli` and
+ * `browser` and calls every other shape compile-only, and `crewhaus serve
+ * --mcp` is cli-only. So a key a compiled bundle declines on a compile-only
+ * shape is inert EVERYWHERE, and the warning must not point its author at a
+ * "run it instead" remediation that does not exist — the #394 defect class.
+ */
+const INTERPRETER_RUN_TARGETS: ReadonlySet<Spec["target"]> = new Set<Spec["target"]>([
+  "cli",
+  "browser",
+]);
 const LANDING_JUDGE_PANEL = "the §6.2 judge-panel wiring (createJudgeGrader in every judge site)";
 const LANDING_AUX_PARAMS =
   "the §4.2 per-slot params consumers (the judge / compaction / degrade / security / watchme request builders)";
@@ -2457,17 +2476,25 @@ function lowerModelFailover(
     // `wireModels` and a compiled bundle through `wireHybrid`. Since 9f every
     // pool-bearing shape renders that call for every family its §11.3 row
     // carries, so nothing PENDS any more — the one remaining `—` cell
-    // (`pipeline` × the Consult / Escalate pair) is a shape fact and is
-    // reported as `model-plan-ignored-on-shape` with the reason, not as a
-    // deferred row.
+    // (`pipeline` × the Consult / Escalate pair) is a standing plan decision
+    // and is reported as `model-plan-ignored-on-shape` with the reason, not
+    // as a deferred row.
     const wiredFamilies = hybridWiringFamiliesForShape(ctx.target);
     const closureUnwired = (key: string, family: HybridWiringFamily, what: string): void => {
       if (wiredFamilies.includes(family)) return;
+      const reason = HYBRID_SHAPE_REASON[ctx.target] ?? "this shape has no sanctioned home for it";
+      // The reach clause is conditional ON PURPOSE. Naming an interpreter
+      // that does not accept the shape would send the author after a
+      // remediation that does not exist; today the only cell that fires this
+      // is `pipeline`, which `crewhaus run` refuses outright.
+      const reach = INTERPRETER_RUN_TARGETS.has(ctx.target)
+        ? "crewhaus run still builds it — the interpreter serves whatever shape it is handed and is not what §11.3 constrains"
+        : `crewhaus run / serve do not accept target: ${ctx.target} either, so the key is inert everywhere, not just in the compiled bundle`;
       warn(
         ctx,
         "model-plan-ignored-on-shape",
         `${poolPath}.${key}`,
-        `${poolPath}.${key} is honoured by the crewhaus run / serve interpreter, but a compiled ${ctx.target} bundle constructs no ${what} — ${HYBRID_SHAPE_REASON[ctx.target] ?? "this shape has no home for it"} (plan §11.3 marks the cell "—"); the key is inert in this compiled target`,
+        `${poolPath}.${key} is lowered into the pool blob, but nothing constructs the ${what} on a ${ctx.target} spec: plan §11.3 marks the cell "—" and ${reason}; ${reach}`,
       );
     };
     if (mp.policy === "classifier") closureUnwired("policy", "classifier", "label call");

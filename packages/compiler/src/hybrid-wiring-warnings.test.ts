@@ -6,9 +6,12 @@
  * `@crewhaus/model-service`'s `wireHybrid`. PR 9e wired six shapes and left
  * four (pipeline, research, batch, browser) warning that the key was inert in
  * the bundle; 9f wires those four, so NOTHING pends any more. The one cell
- * plan §11.3 marks `—` — `pipeline` × the Consult / Escalate pair — is a shape
- * fact, not a deferred row, and is reported as `model-plan-ignored-on-shape`
- * with the reason. `directives` / `rules` / `cascade` ride the blob and pend
+ * plan §11.3 marks `—` — `pipeline` × the Consult / Escalate pair — is a
+ * standing plan decision, not a deferred row, and is reported as
+ * `model-plan-ignored-on-shape` with the reason. That message must NOT point
+ * at an interpreter: `crewhaus run` refuses a pipeline spec outright, so the
+ * key is inert everywhere and a "run it instead" pointer would be the #394
+ * defect class all over again. Pinned below, both halves. `directives` / `rules` / `cascade` ride the blob and pend
  * nowhere. Byte-identity: a pool without a closure-shaped key renders no
  * call and no `@crewhaus/model-service` import at all.
  */
@@ -160,9 +163,19 @@ describe("the closure-shaped pool keys reach the wired targets' bundles (PR 9e)"
     expect(pendingPaths(yaml)).toEqual([]);
     const ignored = compile(yaml).warnings.filter((w) => w.code === "model-plan-ignored-on-shape");
     expect(ignored.map((w) => w.path)).toEqual(["agent.model_pool.strategy.model_directed"]);
-    expect(ignored[0]?.message).toContain("compiled pipeline bundle constructs no");
-    expect(ignored[0]?.message).toContain("declares no tools of its own");
-    expect(ignored[0]?.message).toContain('plan §11.3 marks the cell "—"');
+    const message = ignored[0]?.message ?? "";
+    expect(message).toContain("nothing constructs the Consult / Escalate pair on a pipeline spec");
+    expect(message).toContain('plan §11.3 marks the cell "—"');
+    // The REAL reason: a plan decision, not a mechanical limit of the shape.
+    expect(message).toContain("has not been sanctioned on this shape");
+    expect(message).toContain("plan decision rather than a mechanical limit");
+    // And no interpreter reach is claimed — `crewhaus run` refuses this shape.
+    expect(message).toContain(
+      "crewhaus run / serve do not accept target: pipeline either, so the key is inert everywhere",
+    );
+    expect(message).not.toContain("is honoured by the crewhaus run");
+    expect(message).not.toMatch(/interpreter/);
+    expect(message).not.toContain("inert in this compiled target");
     // The guide IS wired, and the declined family travels into the bundle.
     const agent = agentOf(yaml);
     expect(agent).toContain("...wireHybrid({");

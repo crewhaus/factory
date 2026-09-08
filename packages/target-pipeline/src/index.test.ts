@@ -202,10 +202,9 @@ describe("emitPipeline — failureTaxonomy field (item 23)", () => {
 describe("emitPipeline — the pool's runtime closures reach the bundle (0.6.0 PR 9f)", () => {
   // Plan §11.3 marks `guide / shadow` **E** on the pipeline row and
   // `Consult / Escalate` **—** — the ONE cell in the four shapes 9f wires that
-  // is not emit-wired, because the pipeline shape declares no `tools:` of its
-  // own (`toolLess` in `@crewhaus/spec`, which is also why a per-model `tools`
-  // list is refused there) and so has no shape toolset for the model-directed
-  // pair to arbitrate over. The emitter therefore passes its own §11.3 row and
+  // is not emit-wired. The table is the only ground for it: the pair is built
+  // from the pool roster and ADDED to the tool list, so the shape could host
+  // it. The emitter therefore passes its own §11.3 row and
   // a `model_directed`-only pool renders nothing at all; the compiler reports
   // that key as `model-plan-ignored-on-shape` instead.
   const candidates = [
