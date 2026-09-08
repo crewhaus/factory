@@ -2,7 +2,7 @@
   "name": "@crewhaus/hangar-server",
   "version": "0.5.8",
   "type": "module",
-  "description": "The Hangar manager's local HTTP server: token-gated loopback API over the machine-wide harness registry — fleet rows with cached rollups, per-harness detail/spec/preflight/sessions/evals/memory/cost views, registry CRUD, and the M2 driver surface (supervised process control, a live SSE run feed, crewhaus.control.v1 wake/drain, the approvals + review inboxes, an activity digest, and a job queue)",
+  "description": "The Hangar manager's local HTTP server: token-gated loopback API over the machine-wide harness registry \u2014 fleet rows with cached rollups, per-harness detail/spec/preflight/sessions/evals/memory/cost views, registry CRUD, and the M2 driver surface (supervised process control, a live SSE run feed, crewhaus.control.v1 wake/drain, the approvals + review inboxes, an activity digest, and a job queue)",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -14,6 +14,7 @@
   "dependencies": {
     "@crewhaus/audit-log": "workspace:*",
     "@crewhaus/continuity-store": "workspace:*",
+    "@crewhaus/cost-tracker": "workspace:*",
     "@crewhaus/data-retention-engine": "workspace:*",
     "@crewhaus/dataset-registry": "workspace:*",
     "@crewhaus/eval-report": "workspace:*",
@@ -27,6 +28,7 @@
     "@crewhaus/plugin-loader": "workspace:*",
     "@crewhaus/plugin-sdk": "workspace:*",
     "@crewhaus/preflight": "workspace:*",
+    "@crewhaus/routing-store": "workspace:*",
     "@crewhaus/session-store": "workspace:*",
     "@crewhaus/spec": "workspace:*",
     "@crewhaus/spec-patch": "workspace:*",

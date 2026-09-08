@@ -9,7 +9,13 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { type AdvisorInputs, deriveAdvisorItems } from "./advisor";
+import {
+  ADVISOR_JOB_ARGV,
+  ARM_SAMPLE_FLOOR,
+  type AdvisorInputs,
+  REPORT_KINDS,
+  deriveAdvisorItems,
+} from "./advisor";
 import { makeFixtureHarness } from "./fixture";
 import { type TestServer, bootTestServer } from "./testkit";
 
@@ -31,6 +37,13 @@ const CLEAN: AdvisorInputs = {
   budget: { declaredUsd: 10, spentUsd: 1 },
   adviceProposals: 0,
   overdueDreams: [],
+  // 0.6.0 §8.3 — the routing axis, clean: no pool, no routed turns, no
+  // auxiliary spend, no sunset in the roster, no unserved pin.
+  routing: null,
+  routeStats: { decisions: 0, escalations: 0 },
+  roleSpend: { totalUsdMicros: 0, byRole: {} },
+  sunsets: [],
+  unservedPins: [],
 };
 
 describe("deriveAdvisorItems (pure)", () => {
@@ -379,4 +392,270 @@ describe("the advisor loops (feed → act/dismiss/reopen → trend/reports/issue
       await t.stop();
     }
   }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §8.3 — the hybrid-routing items
+// ---------------------------------------------------------------------------
+
+const arm = (band: string, model: string, meanReward: number, n: number) => ({
+  band,
+  model,
+  n,
+  meanReward,
+  shadow: band.startsWith("shadow:"),
+});
+
+describe("deriveAdvisorItems — routing (0.6.0 §8.3)", () => {
+  test("policy-flip-ready fires only when EVERY live arm has cleared the sample floor", () => {
+    const ready = deriveAdvisorItems({
+      ...CLEAN,
+      routing: {
+        policy: "heuristic",
+        candidates: 2,
+        arms: [arm("easy", "a", 0.9, ARM_SAMPLE_FLOOR), arm("easy", "b", 0.85, ARM_SAMPLE_FLOOR)],
+      },
+    });
+    expect(ready.map((i) => i.id)).toContain("policy-flip-ready");
+    expect(ready.find((i) => i.id === "policy-flip-ready")?.action?.jobKind).toBe("route-propose");
+
+    // One arm short: the claim is a coin toss, so no item.
+    const thin = deriveAdvisorItems({
+      ...CLEAN,
+      routing: {
+        policy: "heuristic",
+        candidates: 2,
+        arms: [arm("easy", "a", 0.9, ARM_SAMPLE_FLOOR), arm("easy", "b", 0.85, 3)],
+      },
+    });
+    expect(thin.map((i) => i.id)).not.toContain("policy-flip-ready");
+
+    // Already learned: nothing to flip.
+    const learned = deriveAdvisorItems({
+      ...CLEAN,
+      routing: {
+        policy: "learned",
+        candidates: 2,
+        arms: [arm("easy", "a", 0.9, ARM_SAMPLE_FLOOR), arm("easy", "b", 0.85, ARM_SAMPLE_FLOOR)],
+      },
+    });
+    expect(learned.map((i) => i.id)).not.toContain("policy-flip-ready");
+
+    // A spec with pools at more than one host reads `mixed`, and one of them
+    // is already learned: proposing "flip the policy" would be advice for a
+    // flip that has happened.
+    const mixed = deriveAdvisorItems({
+      ...CLEAN,
+      routing: {
+        policy: "mixed",
+        candidates: 4,
+        learnedAnywhere: true,
+        arms: [arm("easy", "a", 0.9, ARM_SAMPLE_FLOOR), arm("easy", "b", 0.85, ARM_SAMPLE_FLOOR)],
+      },
+    });
+    expect(mixed.map((i) => i.id)).not.toContain("policy-flip-ready");
+  });
+
+  test("candidate-underperforming names the worst arm in a band, once, and never the leader", () => {
+    const items = deriveAdvisorItems({
+      ...CLEAN,
+      routing: {
+        policy: "learned",
+        candidates: 3,
+        arms: [
+          arm("easy", "leader", 0.9, ARM_SAMPLE_FLOOR),
+          arm("easy", "middling", 0.85, ARM_SAMPLE_FLOOR),
+          arm("easy", "loser", 0.3, ARM_SAMPLE_FLOOR),
+        ],
+      },
+    });
+    const named = items.filter((i) => i.id.startsWith("candidate-underperforming"));
+    expect(named).toHaveLength(1);
+    expect(named[0]?.title).toContain("loser");
+    // The roster stays human-owned: the action shows the scoreboard, it does
+    // not remove a candidate.
+    expect(named[0]?.action?.jobKind).toBe("route-status");
+    expect(named[0]?.guidance).toContain("propose");
+  });
+
+  test("a thin or close band produces no candidate item", () => {
+    const close = deriveAdvisorItems({
+      ...CLEAN,
+      routing: {
+        policy: "learned",
+        candidates: 2,
+        arms: [arm("easy", "a", 0.9, ARM_SAMPLE_FLOOR), arm("easy", "b", 0.85, ARM_SAMPLE_FLOOR)],
+      },
+    });
+    expect(close.filter((i) => i.id.startsWith("candidate-underperforming"))).toEqual([]);
+    const thin = deriveAdvisorItems({
+      ...CLEAN,
+      routing: {
+        policy: "learned",
+        candidates: 2,
+        arms: [arm("easy", "a", 0.9, ARM_SAMPLE_FLOOR), arm("easy", "b", 0.1, 2)],
+      },
+    });
+    expect(thin.filter((i) => i.id.startsWith("candidate-underperforming"))).toEqual([]);
+  });
+
+  test("audition-ready fires on an observe-only lane with enough runs, and never on a live one", () => {
+    const items = deriveAdvisorItems({
+      ...CLEAN,
+      routing: {
+        policy: "learned",
+        candidates: 2,
+        arms: [
+          arm("easy", "a", 0.9, ARM_SAMPLE_FLOOR),
+          arm("shadow:easy", "challenger", 0.95, ARM_SAMPLE_FLOOR),
+        ],
+      },
+    });
+    const audition = items.filter((i) => i.id.startsWith("audition-ready"));
+    expect(audition).toHaveLength(1);
+    expect(audition[0]?.title).toContain("challenger");
+    expect(audition[0]?.guidance).toContain("route promote");
+    // A shadow arm is never ALSO judged as an underperforming candidate.
+    expect(items.filter((i) => i.id.startsWith("candidate-underperforming"))).toEqual([]);
+  });
+
+  test("escalation-rate-high fires past the ceiling and stays silent under it", () => {
+    const hot = deriveAdvisorItems({
+      ...CLEAN,
+      routeStats: { decisions: 10, escalations: 6 },
+    });
+    expect(hot.map((i) => i.id)).toContain("escalation-rate-high");
+    expect(hot.find((i) => i.id === "escalation-rate-high")?.severity).toBe("warn");
+    expect(hot.find((i) => i.id === "escalation-rate-high")?.action?.jobKind).toBe(
+      "models-explain",
+    );
+    const cool = deriveAdvisorItems({ ...CLEAN, routeStats: { decisions: 10, escalations: 1 } });
+    expect(cool.map((i) => i.id)).not.toContain("escalation-rate-high");
+    // No routed turns at all is not a 0% escalation rate — it is no signal.
+    expect(deriveAdvisorItems({ ...CLEAN, routeStats: { decisions: 0, escalations: 0 } })).toEqual(
+      [],
+    );
+  });
+
+  test("judge-spend-dominates fires when grading outweighs answering", () => {
+    const items = deriveAdvisorItems({
+      ...CLEAN,
+      roleSpend: {
+        totalUsdMicros: 10_000,
+        byRole: { primary: 4_000, judge: 5_000, committee: 1_000 },
+      },
+    });
+    const item = items.find((i) => i.id === "judge-spend-dominates");
+    expect(item?.severity).toBe("warn");
+    expect(item?.detail).toContain("grading rather than answering");
+    expect(
+      deriveAdvisorItems({
+        ...CLEAN,
+        roleSpend: { totalUsdMicros: 10_000, byRole: { primary: 9_000, judge: 1_000 } },
+      }).map((i) => i.id),
+    ).not.toContain("judge-spend-dominates");
+  });
+
+  test("sunset-in-roster warns once the date has passed and only suggests before it", () => {
+    const future = deriveAdvisorItems({
+      ...CLEAN,
+      sunsets: [
+        {
+          model: "claude-3-5-haiku",
+          retiresOn: "2027-01-01",
+          replacement: "claude-haiku-4-5",
+          past: false,
+        },
+      ],
+    });
+    expect(future[0]?.severity).toBe("suggestion");
+    expect(future[0]?.action?.jobKind).toBe("models-audit");
+    const past = deriveAdvisorItems({
+      ...CLEAN,
+      sunsets: [
+        { model: "claude-3-haiku", retiresOn: "2026-04-19", replacement: null, past: true },
+      ],
+    });
+    expect(past[0]?.severity).toBe("warn");
+    expect(past[0]?.title).toContain("past its retirement date");
+  });
+
+  test("restart-to-serve-pin names the env, the version and the recompile", () => {
+    const items = deriveAdvisorItems({
+      ...CLEAN,
+      unservedPins: [
+        {
+          env: "prod",
+          version: "1.4.0",
+          detail: "the bundle this harness serves was compiled from a DIFFERENT spec than the pin",
+        },
+      ],
+    });
+    const item = items.find((i) => i.id === "restart-to-serve-pin-prod");
+    expect(item?.severity).toBe("warn");
+    expect(item?.detail).toContain("1.4.0");
+    expect(item?.screen).toBe("deploy");
+    expect(item?.action?.jobKind).toBe("compile");
+  });
+
+  test("every routing item is route-segment safe and fully explained", () => {
+    const items = deriveAdvisorItems({
+      ...CLEAN,
+      routing: {
+        policy: "heuristic",
+        candidates: 2,
+        arms: [
+          arm("easy", "claude-haiku-4-5", 0.9, ARM_SAMPLE_FLOOR),
+          arm("easy", "claude-opus-5", 0.2, ARM_SAMPLE_FLOOR),
+          arm("shadow:easy", "claude-sonnet-4-6", 0.8, ARM_SAMPLE_FLOOR),
+        ],
+      },
+      routeStats: { decisions: 10, escalations: 9 },
+      roleSpend: { totalUsdMicros: 100, byRole: { judge: 90, primary: 10 } },
+      sunsets: [
+        {
+          model: "claude-3-7-sonnet",
+          retiresOn: "2026-11-01",
+          replacement: "claude-sonnet-4-5",
+          past: false,
+        },
+      ],
+      unservedPins: [{ env: "prod", version: "1.4.0", detail: "differs" }],
+    });
+    expect(items.length).toBeGreaterThanOrEqual(7);
+    for (const item of items) {
+      expect(item.id).toMatch(/^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/);
+      expect(item.explain.length).toBeGreaterThan(0);
+      expect(item.guidance.length).toBeGreaterThan(0);
+      expect(item.screen.length).toBeGreaterThan(0);
+      if (item.action?.kind === "job") expect(item.action.cliTwin).toContain("crewhaus ");
+    }
+  });
+});
+
+describe("the closed job vocabulary and the report kinds", () => {
+  test("every routing job kind is present, and no argv element is a flag from a body", () => {
+    for (const kind of ["route-status", "route-propose", "models-audit", "models-explain"]) {
+      const argv = ADVISOR_JOB_ARGV[kind];
+      expect(`${kind}:${argv !== undefined}`).toBe(`${kind}:true`);
+      for (const token of argv ?? []) expect(token.startsWith("-")).toBe(false);
+    }
+    // The exact argv, pinned: PR 15 lands these verbs, and the CLI twin the
+    // console shows must be the command the queue actually runs.
+    expect(ADVISOR_JOB_ARGV["route-status"]).toEqual(["route", "status"]);
+    expect(ADVISOR_JOB_ARGV["route-propose"]).toEqual(["route", "propose"]);
+    expect(ADVISOR_JOB_ARGV["models-audit"]).toEqual(["models", "audit", "crewhaus.yaml"]);
+    expect(ADVISOR_JOB_ARGV["models-explain"]).toEqual(["models", "explain", "crewhaus.yaml"]);
+  });
+
+  test("the report vocabulary gained routing and hybrid", () => {
+    expect([...REPORT_KINDS]).toEqual([
+      "model-usage",
+      "costs",
+      "usefulness",
+      "optimization",
+      "routing",
+      "hybrid",
+    ]);
+  });
 });

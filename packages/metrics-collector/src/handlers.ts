@@ -58,20 +58,29 @@ export class EventToMetrics {
       case "error_recovered":
         this.registry.errorsTotal.inc({ kind: ev.errorName });
         return;
-      case "cost_accrual":
-        // G57 — meter per-call spend labeled by provider + model. Skip the
-        // aggregate run-total accrual (`summary: true`, published by the
-        // optimizer orchestrator) so it never double-counts the per-call
-        // events it sums over. `unpriced` accruals carry a real token tally
-        // but `costUsdMicros: 0`, so incrementing is a harmless no-op.
-        if (ev.summary) return;
+      case "cost_accrual": {
+        // G57 / 0.6.0 §10.2 — meter per-call spend labeled by provider +
+        // model. `summary: true` wears one flag over two lines, and this
+        // collector rides ONE bus, so it makes the same split
+        // `@crewhaus/cost-tracker` makes on that bus. A ROLE-LESS roll-up is
+        // the optimizer orchestrator's run total over per-call events already
+        // metered here — skip it or it double-counts. A ROLE-BEARING one is a
+        // nested run's roll-up re-published from a CHILD bus (a sub-agent's
+        // `role: "subagent"` total): its per-call events were never published
+        // here, so skipping it is how `role="subagent"` stays permanently
+        // zero while Hangar and `cost-summary` report the spend.
+        // `unpriced` accruals carry a real token tally but
+        // `costUsdMicros: 0`, so incrementing is a harmless no-op.
+        const role = ev.role;
+        if (ev.summary === true && role === undefined) return;
         // 0.6.0 (design §8.4) — labeled by the call's role too (absent ⇒
         // primary), so judge / shadow / compaction spend is separable.
         this.registry.costUsdMicrosTotal.inc(
-          { provider: ev.provider, model: ev.modelId, role: ev.role ?? "primary" },
+          { provider: ev.provider, model: ev.modelId, role: role ?? "primary" },
           ev.costUsdMicros,
         );
         return;
+      }
       // 0.6.0 (design §8.4) — one increment per pool routing decision. The
       // label set is fixed (`-` stands in for an absent scope/profile) so a
       // Prometheus `sum by (profile)` never splits on label presence.

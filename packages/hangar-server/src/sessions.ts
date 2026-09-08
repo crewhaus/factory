@@ -171,7 +171,17 @@ export function listSessions(harnessDir: string, nowMs: number): SessionListing 
 // Transcript envelope
 // ---------------------------------------------------------------------------
 
-/** Session-log side-channel kinds surfaced in the metadata gutter. */
+/**
+ * Session-log side-channel kinds surfaced in the metadata gutter.
+ *
+ * 0.6.0 (design §8.1, §8.3) — the hybrid kinds join it. They can only join
+ * it because they are EVENT-LOG kinds with durable `logEvent` calls: this
+ * reader walks the session JSONL, never the trace bus, so a trace-only kind
+ * would silently never appear. `model_stage` is the shape of a hybrid turn
+ * (draft → verify → escalate), `sub_agent_start`/`sub_agent_end` bracket a
+ * child run whose spend re-appears as one roll-up accrual inside the
+ * bracket, and `judge_verdict` is the gate that decided between them.
+ */
 export const GUTTER_KINDS: ReadonlySet<string> = new Set([
   "cost_accrual",
   "model_route",
@@ -179,6 +189,10 @@ export const GUTTER_KINDS: ReadonlySet<string> = new Set([
   "user_feedback",
   "recovery",
   "compaction",
+  "model_stage",
+  "sub_agent_start",
+  "sub_agent_end",
+  "judge_verdict",
 ]);
 
 export type TranscriptTurn = {

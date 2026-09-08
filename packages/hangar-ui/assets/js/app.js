@@ -52,6 +52,7 @@ import { renderInspect } from "./views/inspect.js";
 import { renderLibrary } from "./views/library.js";
 import { renderMemoryFabric } from "./views/memory-fabric.js";
 import { renderMemory } from "./views/memory.js";
+import { renderModels } from "./views/models.js";
 import { renderOverview } from "./views/overview.js";
 import { renderPanes } from "./views/panes.js";
 import { renderReview } from "./views/review.js";
@@ -79,6 +80,7 @@ const TAB_LABELS = {
   data: "Datasets",
   feedback: "Feedback",
   costs: "Costs",
+  models: "Models",
   creds: "Credentials",
   channels: "Channels",
   security: "Security",
@@ -441,6 +443,7 @@ async function renderHarnessPage(root, route) {
   } else if (route.tab === "data") await renderData(tabRoot, ctx);
   else if (route.tab === "feedback") await renderFeedback(tabRoot, ctx);
   else if (route.tab === "costs") await renderCosts(tabRoot, ctx);
+  else if (route.tab === "models") await renderModels(tabRoot, ctx);
   else if (route.tab === "creds") await renderCreds(tabRoot, ctx);
   else if (route.tab === "channels") await renderChannels(tabRoot, ctx);
   else if (route.tab === "security") await renderSecurity(tabRoot, ctx);

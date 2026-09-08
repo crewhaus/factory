@@ -52,6 +52,9 @@ export const HARNESS_TABS = [
   "data",
   "feedback",
   "costs",
+  // 0.6.0 (design §8.3): the models tab sits after Costs because it answers
+  // the question Costs raises — WHICH model, under which settings, spent it.
+  "models",
   "creds",
   "channels",
   "security",
@@ -73,6 +76,10 @@ export const HARNESS_TABS = [
  *  state that tab renders is a real answer and a shared URL must not 404. */
 export const M3_TABS = [
   "data",
+  // 0.6.0: `models` takes trailing segments generically too — a route
+  // timeline is `#/h/<id>/models/routes/<sess>`, and naming that sub-screen
+  // is the view's business, not the router's.
+  "models",
   "feedback",
   "creds",
   "channels",

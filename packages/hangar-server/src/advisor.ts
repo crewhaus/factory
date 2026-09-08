@@ -60,6 +60,16 @@ import { HttpError } from "./http";
 import { readJsonlCapped } from "./jsonl";
 import type { M3Context, M3Handler } from "./m3";
 import { requireString } from "./m3";
+import {
+  type ArmRow,
+  buildLeaderboard,
+  foldRouteStats,
+  readArms,
+  readPinServeStates,
+  readPoolView,
+  readPoolViews,
+  rosterSunsets,
+} from "./models";
 import { resolveInside } from "./safety";
 import { declaredCadences, dreamStates, readSpecYaml } from "./schedulers";
 import { listSessions } from "./sessions";
@@ -131,6 +141,12 @@ export const ADVISOR_JOB_ARGV: Readonly<Record<string, readonly string[]>> = {
   "dream-run": ["dream", "run", "crewhaus.yaml"],
   optimize: ["optimize", "crewhaus.yaml"],
   advise: ["advise", "--all"],
+  // 0.6.0 (design §8.3) — the routing/model verbs the hybrid items name.
+  // Still a CLOSED vocabulary: an item picks a KEY, never an argv.
+  "route-status": ["route", "status"],
+  "route-propose": ["route", "propose"],
+  "models-audit": ["models", "audit", "crewhaus.yaml"],
+  "models-explain": ["models", "explain", "crewhaus.yaml"],
 };
 
 const CLI_TWIN: Readonly<Record<string, string>> = {
@@ -140,6 +156,10 @@ const CLI_TWIN: Readonly<Record<string, string>> = {
   "dream-run": "crewhaus dream run crewhaus.yaml",
   optimize: "crewhaus optimize crewhaus.yaml",
   advise: "crewhaus advise --all",
+  "route-status": "crewhaus route status",
+  "route-propose": "crewhaus route propose",
+  "models-audit": "crewhaus models audit crewhaus.yaml",
+  "models-explain": "crewhaus models explain crewhaus.yaml",
 };
 
 const jobAction = (jobKind: string, label: string): AdvisorAction => ({
@@ -196,7 +216,97 @@ export type AdvisorInputs = {
   readonly budget: { readonly declaredUsd: number | null; readonly spentUsd: number };
   readonly adviceProposals: number;
   readonly overdueDreams: readonly string[];
+  // ---- 0.6.0 (design §8.3) — the hybrid-routing signals -------------------
+  /** The learned scoreboard and the pool that feeds it. `null` = not pooled. */
+  readonly routing: RoutingInputs | null;
+  /** Folded from the session logs' durable routing lines. */
+  readonly routeStats: RouteStatsInput;
+  /** Priced spend by role, from the SAME cost fold the budget item reads. */
+  readonly roleSpend: RoleSpendInput;
+  /** Models named anywhere in the spec that carry a compiled-in sunset date. */
+  readonly sunsets: readonly SunsetInput[];
+  /** Registry pins the running (or compiled) bundle was NOT built from. */
+  readonly unservedPins: readonly UnservedPinInput[];
 };
+
+/** One arm, reduced to what the ranking needs. */
+export type AdvisorArm = {
+  /** The routing band (`easy`, `hard`, `shadow:easy`, …). */
+  readonly band: string;
+  readonly model: string;
+  readonly n: number;
+  readonly meanReward: number;
+  readonly shadow: boolean;
+};
+
+export type RoutingInputs = {
+  readonly arms: readonly AdvisorArm[];
+  /**
+   * The declared pool policy (`static` when omitted). A spec that declares
+   * pools at more than one host with more than one policy reads `mixed` —
+   * the advisor never picks one host's answer and calls it the harness's.
+   */
+  readonly policy: string;
+  readonly candidates: number;
+  /**
+   * True when ANY declared pool is already `learned`. `policy-flip-ready`
+   * proposes a flip that has already happened otherwise: a crew harness's
+   * per-role pool is a pool this manager must not overlook. Absent reads as
+   * false, so a caller that knows only `policy` behaves as it always did.
+   */
+  readonly learnedAnywhere?: boolean;
+};
+
+export type RouteStatsInput = {
+  /** `model_route` lines across the sessions read. */
+  readonly decisions: number;
+  /** `model_stage` lines whose stage is an escalation. */
+  readonly escalations: number;
+};
+
+export type RoleSpendInput = {
+  readonly totalUsdMicros: number;
+  /** role → priced micros, from `foldHarnessCosts().byRole`. */
+  readonly byRole: Readonly<Record<string, number>>;
+};
+
+export type SunsetInput = {
+  readonly model: string;
+  readonly retiresOn: string;
+  readonly replacement: string | null;
+  /** True once the retirement date has passed. */
+  readonly past: boolean;
+};
+
+export type UnservedPinInput = {
+  readonly env: string;
+  readonly version: string;
+  readonly detail: string;
+};
+
+/**
+ * How many observations an arm needs before "this candidate is losing" or
+ * "the policy is ready to flip" is a claim rather than a coin toss.
+ *
+ * It is the router's OWN exploration floor (`DEFAULT_MIN_SAMPLES` in
+ * `@crewhaus/model-router`'s policy router), so `policy-flip-ready` fires
+ * exactly when a `learned` policy would start exploiting rather than
+ * exploring. Restated rather than imported: the advisor ranks a snapshot
+ * read off disk and has no business pulling the router into the manager.
+ */
+export const ARM_SAMPLE_FLOOR = 25;
+
+/** Reward gap below the band leader that makes a candidate worth naming. */
+export const UNDERPERFORMING_GAP = 0.15;
+
+/** Auxiliary spend share above which the judge is the story, not the agent. */
+export const JUDGE_SPEND_SHARE = 0.4;
+
+/** Escalation share above which the cheap lane is not earning its place. */
+export const ESCALATION_RATE_CEILING = 0.3;
+
+/** Roles whose spend is auxiliary to the turn the user is waiting on. */
+const JUDGE_ROLES = ["judge", "committee"] as const;
 
 /**
  * Inputs → open items, worst first. Pure. The ordering inside a severity
@@ -450,6 +560,157 @@ export function deriveAdvisorItems(inputs: AdvisorInputs): AdvisorItem[] {
     });
   }
 
+  // --- is it routing well (0.6.0 §8.3) -------------------------------------
+  // Every item here is derived from a file another panel already reads: the
+  // routing scoreboard, the session logs' durable routing lines, the cost
+  // fold's per-role split, the compiled-in sunset table, and the spec
+  // registry's pins. The advisor still measures nothing new.
+  const routing = inputs.routing;
+  if (routing !== null) {
+    const live = routing.arms.filter((a) => !a.shadow);
+    const ready = live.length > 1 && live.every((a) => a.n >= ARM_SAMPLE_FLOOR);
+    if (ready && routing.policy !== "learned" && routing.learnedAnywhere !== true) {
+      open({
+        id: "policy-flip-ready",
+        severity: "suggestion",
+        title: "every routing arm has enough samples for a learned policy",
+        detail: `${live.length} arms, each with at least ${ARM_SAMPLE_FLOOR} observations, under policy "${routing.policy}"`,
+        explain:
+          "a static or heuristic policy picks the same way forever; the scoreboard now has enough evidence for the learned policy to exploit the arm that is actually winning each band",
+        guidance:
+          "run `route propose` — it mines the arms and emits a reviewable spec patch; the flip is never applied for you",
+        screen: "models",
+        source: "routing",
+        action: jobAction("route-propose", "Propose the policy flip"),
+      });
+    }
+    // Worst offender per band, so a four-candidate pool does not produce four
+    // near-identical rows for one decision.
+    const byBand = new Map<string, AdvisorArm[]>();
+    for (const arm of live) {
+      const group = byBand.get(arm.band) ?? [];
+      group.push(arm);
+      byBand.set(arm.band, group);
+    }
+    for (const band of [...byBand.keys()].sort()) {
+      const group = [...(byBand.get(band) ?? [])].sort((a, b) => b.meanReward - a.meanReward);
+      const leader = group[0];
+      const worst = group[group.length - 1];
+      if (leader === undefined || worst === undefined || leader === worst) continue;
+      if (worst.n < ARM_SAMPLE_FLOOR) continue;
+      const gap = leader.meanReward - worst.meanReward;
+      if (gap < UNDERPERFORMING_GAP) continue;
+      open({
+        id: safeId(`candidate-underperforming-${band}-${worst.model}`),
+        severity: "suggestion",
+        title: `"${worst.model}" is losing its band by ${gap.toFixed(2)} reward`,
+        detail: `band ${band}: ${worst.model} scores ${worst.meanReward.toFixed(3)} over ${worst.n} observations against ${leader.model} at ${leader.meanReward.toFixed(3)}`,
+        explain:
+          "reward folds success, cost and latency (and judged quality when a quality source is wired) — a candidate this far behind is spending turns to lose them",
+        guidance:
+          "the roster is human-owned: review the arm on the Models tab, then remove or re-tag the candidate through `crewhaus propose`",
+        screen: "models",
+        source: "routing",
+        action: jobAction("route-status", "Show the scoreboard"),
+      });
+    }
+    const auditionable = routing.arms.filter((a) => a.shadow && a.n >= ARM_SAMPLE_FLOOR);
+    for (const arm of auditionable) {
+      open({
+        id: safeId(`audition-ready-${arm.band}-${arm.model}`),
+        severity: "suggestion",
+        title: `the shadow audition of "${arm.model}" has enough runs to judge`,
+        detail: `${arm.n} observed turns on the observe-only lane ${arm.band}, mean reward ${arm.meanReward.toFixed(3)}`,
+        explain:
+          "a shadow lane serves nothing — it watches the primary and is graded beside it, so promoting it is the first moment its answers reach a user",
+        guidance:
+          "`route promote` gates the audition against its own eval runs before the candidate can serve; nothing promotes itself",
+        screen: "models",
+        source: "routing",
+        action: jobAction("route-status", "Show the audition lane"),
+      });
+    }
+  }
+
+  const decisions = inputs.routeStats.decisions;
+  if (decisions > 0) {
+    const rate = inputs.routeStats.escalations / decisions;
+    if (rate > ESCALATION_RATE_CEILING) {
+      open({
+        id: "escalation-rate-high",
+        severity: "warn",
+        title: `${Math.round(rate * 100)}% of routed turns escalated to a stronger model`,
+        detail: `${inputs.routeStats.escalations} escalations across ${decisions} routing decisions`,
+        explain:
+          "a cascade only saves money while the cheap draft usually passes; past that the harness pays for the draft AND the escalation, and answers arrive later than if the strong model had gone first",
+        guidance:
+          "tighten the draft's routing rules or move the band boundary — `models explain` prints which rule sent each turn to the cheap lane",
+        screen: "models",
+        source: "routing",
+        action: jobAction("models-explain", "Explain the routing"),
+      });
+    }
+  }
+
+  const spendTotal = inputs.roleSpend.totalUsdMicros;
+  if (spendTotal > 0) {
+    let auxiliary = 0;
+    for (const role of JUDGE_ROLES) auxiliary += inputs.roleSpend.byRole[role] ?? 0;
+    const share = auxiliary / spendTotal;
+    if (share > JUDGE_SPEND_SHARE) {
+      open({
+        id: "judge-spend-dominates",
+        severity: "warn",
+        title: `the judge is ${Math.round(share * 100)}% of this harness's spend`,
+        detail: `$${(auxiliary / 1_000_000).toFixed(4)} of $${(spendTotal / 1_000_000).toFixed(4)} went to grading rather than answering`,
+        explain:
+          "grading every turn with a strong judge can cost more than answering with one — which inverts the whole point of a cheap-worker topology",
+        guidance:
+          "cap it with budget.judge_share, sample the judge instead of grading every turn, or give the judge its own cheaper profile",
+        screen: "models",
+        source: "costs",
+        action: linkAction("Open the models tab", "crewhaus cost-summary --session <id>"),
+      });
+    }
+  }
+
+  for (const sunset of inputs.sunsets) {
+    open({
+      id: safeId(`sunset-in-roster-${sunset.model}`),
+      severity: sunset.past ? "warn" : "suggestion",
+      title: sunset.past
+        ? `"${sunset.model}" is past its retirement date`
+        : `"${sunset.model}" retires on ${sunset.retiresOn}`,
+      detail:
+        sunset.replacement !== null
+          ? `retires ${sunset.retiresOn}; the provider names ${sunset.replacement} as the replacement`
+          : `retires ${sunset.retiresOn}`,
+      explain:
+        "a retired model stops answering on the provider's schedule, not yours — the harness fails at boot or mid-run, whichever comes first",
+      guidance:
+        "swap the model on the Models tab through `crewhaus propose`; `models audit` names every slot that still references it",
+      screen: "models",
+      source: "routing",
+      action: jobAction("models-audit", "Audit the roster"),
+    });
+  }
+
+  for (const pin of inputs.unservedPins) {
+    open({
+      id: safeId(`restart-to-serve-pin-${pin.env}`),
+      severity: "warn",
+      title: `the ${pin.env} pin is newer than the bundle this harness serves`,
+      detail: `${pin.env} → ${pin.version}: ${pin.detail}`,
+      explain:
+        "nothing propagates a registry pin to a running daemon — a promote ends at the registry, and the daemon keeps serving the bundle it was started with until someone recompiles and restarts",
+      guidance:
+        "recompile from the pinned version and restart the daemon; the Deployments tab shows both sides of the comparison",
+      screen: "deploy",
+      source: "deployments",
+      action: jobAction("compile", "Recompile the bundle"),
+    });
+  }
+
   const rank: Record<AdvisorSeverity, number> = { critical: 0, warn: 1, suggestion: 2 };
   return items.sort((a, b) => rank[a.severity] - rank[b.severity]);
 }
@@ -575,6 +836,38 @@ async function gatherInputs(ctx: M3Context, dir: string): Promise<AdvisorInputs>
   } catch {
     health = null;
   }
+  // 0.6.0 §8.3 — the routing signals. Each read is tolerant: an unreadable
+  // scoreboard, an absent registry or a spec this manager cannot fully parse
+  // produces NO item rather than a wrong one.
+  // Every pool the spec declares, not just `agent.model_pool`: a crew role's
+  // or a workflow step's pool routes turns too, and an advisor that reads one
+  // host proposes flips for a policy that is already flipped.
+  const pools = readPoolViews(yamlText);
+  const arms = readArms(ctx).rows;
+  const policies = [...new Set(pools.map((p) => p.pool.policy ?? "static"))];
+  // One policy across every declared pool is the harness's policy; two
+  // different ones is `mixed`, never one host's answer spoken for all.
+  const policy = policies.length > 1 ? "mixed" : (policies[0] ?? "static");
+  const routing =
+    pools.length > 0 || arms.length > 0
+      ? {
+          arms: arms.map(toAdvisorArm),
+          policy,
+          candidates: pools.reduce((n, p) => n + p.pool.candidates.length, 0),
+          learnedAnywhere: policies.includes("learned"),
+        }
+      : null;
+  const routeStats = foldRouteStats(dir);
+  const byRole: Record<string, number> = {};
+  for (const row of costs.byRole) byRole[row.role] = row.usdMicros;
+  let unservedPins: ReturnType<typeof readPinServeStates> = [];
+  try {
+    unservedPins = readPinServeStates(ctx, dir, view.specName, view.target);
+  } catch (err) {
+    ctx.warn(
+      `hangar-server: advisor pin freshness failed for ${dir}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   return {
     preflight,
     specUnreadable: view.specUnreadable,
@@ -591,6 +884,24 @@ async function gatherInputs(ctx: M3Context, dir: string): Promise<AdvisorInputs>
     },
     adviceProposals: countAdviceProposals(ctx),
     overdueDreams,
+    routing,
+    routeStats: { decisions: routeStats.decisions, escalations: routeStats.escalations },
+    roleSpend: { totalUsdMicros: costs.totalUsdMicros, byRole },
+    sunsets: view.specUnreadable ? [] : rosterSunsets(yamlText, ctx.now()),
+    unservedPins: unservedPins
+      .filter((p) => p.state === "not-served")
+      .map((p) => ({ env: p.env, version: p.version, detail: p.detail })),
+  };
+}
+
+/** An `ArmRow` reduced to the fields the pure ranking reads. */
+function toAdvisorArm(row: ArmRow): AdvisorArm {
+  return {
+    band: row.band,
+    model: row.model,
+    n: row.n,
+    meanReward: row.meanReward,
+    shadow: row.shadow,
   };
 }
 
@@ -843,7 +1154,18 @@ export const advisorTrend: M3Handler = (ctx) => {
 // ---------------------------------------------------------------------------
 
 /** The closed report vocabulary. Anything else is a 400. */
-export const REPORT_KINDS = ["model-usage", "costs", "usefulness", "optimization"] as const;
+export const REPORT_KINDS = [
+  "model-usage",
+  "costs",
+  "usefulness",
+  "optimization",
+  // 0.6.0 (design §8.3) — the two hybrid reports. `routing` is about the
+  // LEARNING (arms, bands, the policy and its freeze); `hybrid` is about the
+  // SHAPE of a turn (which role and profile the money went to, how often the
+  // cheap lane escalated).
+  "routing",
+  "hybrid",
+] as const;
 export type ReportKind = (typeof REPORT_KINDS)[number];
 
 const isReportKind = (v: unknown): v is ReportKind =>
@@ -913,6 +1235,59 @@ function buildReport(ctx: M3Context, dir: string, kind: ReportKind): Record<stri
                 latest !== undefined
                   ? `${Math.round((num(latest.passRate) ?? 0) * 100)}%`
                   : "unmeasured"
+              }`,
+      };
+    }
+    case "routing": {
+      const yamlText = readSpecYaml(dir);
+      const pool = readPoolView(yamlText);
+      const pools = readPoolViews(yamlText);
+      const arms = readArms(ctx).rows;
+      const leaderboard = buildLeaderboard(arms);
+      const best = leaderboard.filter((r) => r.best);
+      const stats = foldRouteStats(dir);
+      return {
+        pool,
+        pools,
+        arms,
+        leaderboard,
+        best,
+        routeStats: stats,
+        finding:
+          !pool.declared && arms.length === 0
+            ? "no model_pool declared anywhere and no recorded arms — this harness routes nothing"
+            : arms.length === 0
+              ? "a pool is declared but nothing has been observed yet — run the harness to accumulate arms"
+              : `${arms.length} arm(s) across ${best.length} band(s); the leading arm in each band is what a \`learned\` policy would exploit`,
+      };
+    }
+    case "hybrid": {
+      const costs = foldHarnessCosts(dir, ctx.now());
+      const stats = foldRouteStats(dir);
+      const sunsets = rosterSunsets(readSpecYaml(dir), ctx.now());
+      const escalationRate = stats.decisions > 0 ? stats.escalations / stats.decisions : null;
+      const judgeUsdMicros =
+        (costs.byRole.find((r) => r.role === "judge")?.usdMicros ?? 0) +
+        (costs.byRole.find((r) => r.role === "committee")?.usdMicros ?? 0);
+      return {
+        byRole: costs.byRole,
+        byProfile: costs.byProfile,
+        totals: {
+          usdMicros: costs.totalUsdMicros,
+          calls: costs.calls,
+          rollups: costs.rollups,
+        },
+        routeStats: stats,
+        escalationRate,
+        judgeShare: costs.totalUsdMicros > 0 ? judgeUsdMicros / costs.totalUsdMicros : null,
+        sunsets,
+        finding:
+          costs.calls === 0
+            ? "no priced model calls recorded — the shape of a turn is unmeasured until the harness runs"
+            : `${costs.byRole.length} role(s) and ${costs.byProfile.length} profile bucket(s) on record; ${
+                escalationRate === null
+                  ? "no routed turns yet"
+                  : `${Math.round(escalationRate * 100)}% of routed turns escalated`
               }`,
       };
     }

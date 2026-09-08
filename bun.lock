@@ -1001,6 +1001,7 @@
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/continuity-store": "workspace:*",
+        "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
         "@crewhaus/dataset-registry": "workspace:*",
         "@crewhaus/eval-report": "workspace:*",
@@ -1014,6 +1015,7 @@
         "@crewhaus/plugin-loader": "workspace:*",
         "@crewhaus/plugin-sdk": "workspace:*",
         "@crewhaus/preflight": "workspace:*",
+        "@crewhaus/routing-store": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/spec-patch": "workspace:*",

@@ -147,6 +147,7 @@ import {
   memoryRecall,
   memorySweep,
 } from "./memory-ops";
+import { modelArms, modelLeaderboard, modelRoutes, modelsOverview } from "./models";
 import { dev, devStart, devStop, mcpServerStart, mcpServerStop, mcpServers } from "./runtime-ops";
 import {
   audit,
@@ -236,9 +237,9 @@ import {
   wikiWrite,
 } from "./wiki-ops";
 
-/** The M3 groups (eleven M3 areas plus M5's advisor). A route's group is its
- *  owning module's area, and the console's left rail / tab wiring reads the
- *  same field. */
+/** The M3 groups (eleven M3 areas, M5's advisor, and 0.6.0's models area). A
+ *  route's group is its owning module's area, and the console's left rail /
+ *  tab wiring reads the same field. */
 export const M3_GROUPS = [
   "spec",
   "memory",
@@ -252,6 +253,9 @@ export const M3_GROUPS = [
   "inspect",
   "runtime",
   "advisor",
+  // 0.6.0 (design §8.3) — per-model settings, hybrid routing and the
+  // learned scoreboard. Read-only: Hangar never writes an arm or a prior.
+  "models",
 ] as const;
 
 export type M3Group = (typeof M3_GROUPS)[number];
@@ -703,6 +707,12 @@ export const M3_ROUTES: readonly M3Route[] = [
   route("advisorIssues", "GET", "/api/h/:id/advisor/issues", "advisor", advisorIssues),
   route("advisorIssueSubmit", "POST", "/api/h/:id/advisor/issues", "advisor", advisorIssueSubmit),
   route("advisorFleet", "GET", "/api/advisor", "advisor", advisorFleet),
+
+  // ---- models: the registry, hybrid routing and the learned scoreboard ---
+  route("models", "GET", "/api/h/:id/models", "models", modelsOverview),
+  route("modelRoutes", "GET", "/api/h/:id/models/routes/:sess", "models", modelRoutes),
+  route("modelArms", "GET", "/api/h/:id/models/arms", "models", modelArms),
+  route("modelLeaderboard", "GET", "/api/h/:id/models/leaderboard", "models", modelLeaderboard),
 
   // ---- runtime: the mcp-server + dev run classes -------------------------
   route("mcpServers", "GET", "/api/h/:id/mcp-servers", "runtime", mcpServers),
