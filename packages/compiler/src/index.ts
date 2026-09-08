@@ -1195,6 +1195,18 @@ const LANDING_SINGLE_SLOT =
  * per role activation. A bundle for any OTHER pool-bearing target still
  * carries the blob without the closures and reaches them through the
  * `crewhaus run` / `serve` interpreter only — the warning below says which.
+ *
+ * KNOWN SHORTFALL against plan §11.3, carried as a follow-up row. That table
+ * marks `guide / shadow` **E** for pipeline, research, batch AND browser, and
+ * `Consult / Escalate` **E** for research, batch and browser — so those four
+ * shapes are meant to emit the call as well. They do not yet: this row wired
+ * the six the brief named. Wiring each is the same two lines at its existing
+ * `renderModelWiringFields` call site plus an entry in the set below. Until
+ * that lands, §11.3 cannot be published as-is (it goes verbatim into
+ * crewhaus/docs `COMPILER-ARCHITECTURE.md` and the book's appendix D, and
+ * `models explain` prints the row): those cells are **E** for the interpreter
+ * and inert in a compiled bundle, which is exactly what the warning below
+ * reports per key.
  */
 const HYBRID_WIRED_TARGETS: ReadonlySet<Spec["target"]> = new Set([
   "cli",
