@@ -1840,11 +1840,11 @@ describe("emitChannelBot — evaluation block (loop contract 0.4, Batch B, G02)"
     // 0.6.0 §6.2 — the evaluate fn receives the RUN bus and hands it to the
     // judge, so judge spend is priced and budget-metered; the judge's wire
     // model + priced spend ride back on the verdict for eval_graded.
-    expect(agent).toContain("evaluate: async ({ finalText, messages, bus }) => {");
+    expect(agent).toContain("evaluate: async ({ finalText, messages, isSynthetic, bus }) => {");
     expect(agent).toContain("const __verdict = await gradeWithJudgePanel({");
     // 0.6.0 PR 13b — the turn's own conversation becomes the graded
     // `RunResult`, so `target: transcript` sees the trajectory.
-    expect(agent).toContain("run: inLoopRunResult({ finalText, messages }),");
+    expect(agent).toContain("run: inLoopRunResult({ finalText, messages, isSynthetic }),");
     expect(agent).toContain("      bus,\n    });");
     expect(agent).toContain("model: __verdict.judgeModel,");
     expect(agent).toContain(

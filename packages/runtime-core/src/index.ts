@@ -204,6 +204,7 @@ import {
   type PreRouteClassifierVerdict,
   type PreRouteForced,
   describeHintEvidence,
+  isSyntheticMessage,
   latestHumanUserMessage,
   markSynthetic,
   messageText,
@@ -1090,6 +1091,17 @@ export type EvaluationTurn = {
    * evaluators must not mutate it; the runtime owns the array).
    */
   readonly messages: ReadonlyArray<Anthropic.MessageParam>;
+  /**
+   * 0.6.0 §6.2 — membership test for the runtime-INJECTED messages inside
+   * `messages` (retry nudges, cascade corrections, continue/tombstone
+   * prompts, the resumed-toolset marker). The marker lives in a
+   * module-private WeakSet, so nothing on the message object itself carries
+   * it and a grader in another package cannot recover it. A `target:
+   * "transcript"` judge MUST skip them: on attempt 2+ the retry nudge quotes
+   * the judge's own previous rationale, and grading that as a user
+   * instruction is the measurement-integrity hazard §7.2.1 exists to prevent.
+   */
+  readonly isSynthetic?: (message: Anthropic.MessageParam) => boolean;
   /**
    * Aggregate token usage across every MAIN-turn model call this attempt
    * made (all tool iterations included; compaction/judge side-calls are
@@ -8811,6 +8823,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         graded = await evaluation.evaluate({
           finalText: terminalText(attempt.terminalContent),
           messages,
+          // The runtime owns the synthetic marker; a transcript judge that
+          // cannot see it grades its own retry nudge as a user turn.
+          isSynthetic: isSyntheticMessage,
           usage: attempt.usage,
           // 0.6.0 §6.2 — the judge publishes its model calls on THIS bus, so
           // the budget meter above (and any attached cost-tracker) sees them.

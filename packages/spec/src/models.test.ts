@@ -1166,6 +1166,31 @@ describe("evaluation: on_fail: escalate, allow_self_judge, judge panels (0.6.0 �
       parseSpec(cli("evaluation:", "  grader: { type: contains, value: ok, repeats: 2 }")),
     ).toThrow(SpecParseError);
   });
+
+  // The fold is a MEDIAN, so an even repeat count has no tie-break and
+  // `createJudgeGrader` throws on one. PR 13b wired these knobs into every
+  // judge site, which turned a previously inert `repeats: 2` into a run-time
+  // throw; the refusal belongs at parse time, where `optimize`'s
+  // applySpecPatch re-parse also has to clear it.
+  test("repeats must be ODD, on the grader and on a judge gate alike", () => {
+    expect(
+      issuePaths(cli("evaluation:", "  grader: { type: llm_judge, criteria: c, repeats: 2 }")),
+    ).toEqual(["evaluation.grader.repeats"]);
+    expect(
+      parseSpecIssues(
+        cli("evaluation:", "  grader: { type: llm_judge, criteria: c, repeats: 2 }"),
+      )[0]?.message,
+    ).toMatch(/odd/);
+    expect(
+      issuePaths(cli("evaluation:", "  grader: { type: llm_judge, criteria: c, repeats: 3 }")),
+    ).toEqual([]);
+    expect(
+      issuePaths(workflow("  - { name: gate, kind: judge, judge: { criteria: c, repeats: 4 } }")),
+    ).toEqual(["steps.1.judge.repeats"]);
+    expect(
+      issuePaths(workflow("  - { name: gate, kind: judge, judge: { criteria: c, repeats: 5 } }")),
+    ).toEqual([]);
+  });
 });
 
 describe("kind: judge gates gain the panel fields and escalate_to (0.6.0 §6.2, §7.3)", () => {

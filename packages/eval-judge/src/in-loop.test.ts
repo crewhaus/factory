@@ -15,6 +15,7 @@ import type { ProviderAdapter, ProviderRequest, StreamEvent } from "@crewhaus/ad
 import { type TraceEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
 import { gradeWithJudgePanel, inLoopRunResult } from "./in-loop";
 import { loadRubric } from "./rubric";
+import { renderTranscriptDigest } from "./transcript-digest";
 
 const RUBRIC = loadRubric(`
 criteria:
@@ -350,5 +351,114 @@ describe("inLoopRunResult", () => {
       messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "hmm" }] }],
     });
     expect(run.transcript).toEqual([]);
+  });
+});
+
+describe("the instrument identity is the DECLARED panel (§6.2, §6.3)", () => {
+  /** A panel stub that makes `slowModel` finish LAST, whatever it was asked first. */
+  function racingStub(slowModel: string): ProviderAdapter {
+    return {
+      providerId: "anthropic",
+      features: {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+      },
+      estimateTokens: () => 0,
+      stream(req: ProviderRequest) {
+        return (async function* (): AsyncIterable<StreamEvent> {
+          if (req.model === slowModel) await new Promise((r) => setTimeout(r, 40));
+          yield { kind: "message_start", usage: { input: 10, output: 0 } };
+          yield {
+            kind: "content_block_start",
+            index: 0,
+            block: { type: "tool_use", id: "tu", name: "submit_score", input: {} },
+          };
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: {
+              type: "input_json_delta",
+              partial_json: JSON.stringify({
+                score: 4,
+                rationale: `verdict from ${req.model}`,
+                criterion_scores: { correctness: 4 },
+              }),
+            },
+          };
+          yield { kind: "content_block_stop", index: 0 };
+          yield { kind: "message_delta", stopReason: "tool_use", usage: { input: 10, output: 5 } };
+          yield { kind: "message_stop" };
+        })();
+      },
+    };
+  }
+
+  test("declaration order survives out-of-order completion", async () => {
+    const verdict = await gradeWithJudgePanel({
+      rubric: RUBRIC,
+      sample: SAMPLE,
+      run: inLoopRunResult({ finalText: "x" }),
+      adapter: racingStub("judge-a"),
+      judges: ["judge-a", "judge-b"],
+    });
+    // The fan-out is a `Promise.all`, so `judge-b` reports first — the id
+    // must still name the panel as DECLARED (it is the lineage key the
+    // emitters' `judgeInstrumentId` stamps on `RunEvaluation`).
+    expect(verdict.judgeModel).toBe("judge-a+judge-b");
+  });
+
+  test("a panel that names one model twice is two panelists, not one", async () => {
+    const { adapter } = panelStub({ "judge-a": 4 });
+    const verdict = await gradeWithJudgePanel({
+      rubric: RUBRIC,
+      sample: SAMPLE,
+      run: inLoopRunResult({ finalText: "x" }),
+      adapter,
+      judges: ["judge-a", "judge-a"],
+    });
+    expect(verdict.calls).toBe(2);
+    expect(verdict.judgeModel).toBe("judge-a+judge-a");
+  });
+});
+
+describe("inLoopRunResult — what the transcript digest is told", () => {
+  test("a failed tool result renders as an ERROR block", () => {
+    const digest = renderTranscriptDigest(
+      inLoopRunResult({
+        finalText: "done",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "tool_result", content: "command not found", is_error: true },
+              { type: "tool_result", content: "ok", is_error: false },
+            ],
+          },
+        ],
+      }),
+    );
+    // The digest reads the event-log key `isError`; projecting the Anthropic
+    // block's `is_error` verbatim would hide every silent mid-run failure the
+    // trajectory judge is explicitly told to weigh.
+    expect(digest).toContain("[tool_result ERROR] command not found");
+    expect(digest).toContain("[tool_result] ok");
+  });
+
+  test("runtime-injected messages are excluded from the judged trajectory", () => {
+    const nudge = { role: "user", content: "your answer scored 0.2: be more specific" };
+    const digest = renderTranscriptDigest(
+      inLoopRunResult({
+        finalText: "done",
+        messages: [{ role: "user", content: "summarize the log" }, nudge],
+        isSynthetic: (m) => m === nudge,
+      }),
+    );
+    expect(digest).toContain("[user] summarize the log");
+    // Without the marker the judge would read its OWN previous rationale as
+    // a user instruction on attempt 2+.
+    expect(digest).not.toContain("be more specific");
   });
 });

@@ -279,7 +279,7 @@ function buildRunEvaluation(ev: IrEvaluation, primaryModel: string): RunEvaluati
       onFail: ev.onFail,
       maxRetries: ev.maxRetries,
       ...escalate,
-      evaluate: async ({ finalText, messages, bus }) => {
+      evaluate: async ({ finalText, messages, isSynthetic, bus }) => {
         const verdict = await gradeWithJudgePanel({
           rubric: {
             criteria: [
@@ -298,7 +298,7 @@ function buildRunEvaluation(ev: IrEvaluation, primaryModel: string): RunEvaluati
             passing_score: 3,
           },
           sample: { id: "in-loop-evaluation", input: "" },
-          run: inLoopRunResult({ finalText, messages }),
+          run: inLoopRunResult({ finalText, messages, isSynthetic }),
           model,
           ...(grader.judges !== undefined ? { judges: grader.judges } : {}),
           ...(grader.repeats !== undefined ? { repeats: grader.repeats } : {}),

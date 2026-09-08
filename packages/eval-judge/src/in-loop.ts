@@ -131,17 +131,24 @@ export async function gradeWithJudgePanel(
 }
 
 /**
- * The instrument identity for a verdict: the wire model when one judge
- * served, else every DISTINCT wire model joined with `+` in first-call
- * order. Falls back to the declared strings when no call reported (a grader
- * that threw before its first call cannot reach here, but a stub adapter in
- * a test can report nothing).
+ * The instrument identity for a verdict: for a PANEL, its declared members
+ * joined with `+` — the DECLARATION is authoritative, not the calls. The
+ * fan-out runs `Promise.all`, so `onCall` fires in completion order (a race),
+ * and de-duplicating it would collapse a panel that deliberately names one
+ * model twice. Declaration order is also exactly what the emitters stamp on
+ * `RunEvaluation.judgeModel` (`judgeInstrumentId` in `@crewhaus/model-service`
+ * joins `panel.judges` the same way), and the §6.3 quality fingerprint is
+ * keyed on it — a run-to-run permutation would re-baseline the lineage.
+ *
+ * For a SINGLE judge the wire model the call actually reported wins (it is
+ * the router's resolution of the declared string), falling back to the
+ * declared `model` when nothing reported (a stub adapter in a test).
  */
 function judgeModelIdentity(calls: ReadonlyArray<JudgeCallUsage>, knobs: JudgePanelKnobs): string {
+  if (knobs.judges !== undefined && knobs.judges.length > 0) return knobs.judges.join("+");
   const seen: string[] = [];
   for (const c of calls) if (!seen.includes(c.model)) seen.push(c.model);
   if (seen.length > 0) return seen.join("+");
-  if (knobs.judges !== undefined && knobs.judges.length > 0) return knobs.judges.join("+");
   return knobs.model ?? "";
 }
 
@@ -169,18 +176,32 @@ function totalCostUsdMicros(calls: ReadonlyArray<JudgeCallUsage>): number | unde
  * `messages` is typed structurally (role + content) so this module does not
  * pull in the Anthropic SDK types; the runtime's `Anthropic.MessageParam[]`
  * satisfies it.
+ *
+ * `isSynthetic` carries the runtime's SYNTHETIC marker across this seam.
+ * runtime-core marks its injected `role: "user"` messages (retry nudges,
+ * cascade corrections, continue/tombstone prompts, the toolset marker) in a
+ * module-private WeakSet, so nothing on the message object itself says so and
+ * this package — which must not depend on runtime-core — cannot tell them
+ * from human turns. Left unset, a `target: "transcript"` judge on attempt 2+
+ * would read its OWN previous rationale presented as a user instruction; with
+ * it, the projected payload carries `synthetic: true` and
+ * `renderTranscriptDigest` skips those messages exactly as it does for real
+ * event-log lines.
  */
-export function inLoopRunResult(input: {
-  readonly finalText: string;
-  readonly messages?: ReadonlyArray<{
+export function inLoopRunResult<
+  M extends { readonly role: string; readonly content: unknown } = {
     readonly role: string;
     readonly content: unknown;
-  }>;
+  },
+>(input: {
+  readonly finalText: string;
+  readonly messages?: ReadonlyArray<M>;
+  readonly isSynthetic?: (message: M) => boolean;
 }): RunResult {
   return {
     agentOutput: input.finalText,
     events: [],
-    transcript: transcriptFromMessages(input.messages ?? []),
+    transcript: transcriptFromMessages(input.messages ?? [], input.isSynthetic),
     toolCalls: [],
     turns: 0,
     latencyMs: 0,
@@ -188,8 +209,9 @@ export function inLoopRunResult(input: {
 }
 
 /** Project conversation messages into event-log events, in block order. */
-function transcriptFromMessages(
-  messages: ReadonlyArray<{ readonly role: string; readonly content: unknown }>,
+function transcriptFromMessages<M extends { readonly role: string; readonly content: unknown }>(
+  messages: ReadonlyArray<M>,
+  isSynthetic?: (message: M) => boolean,
 ): TranscriptEvent[] {
   const out: TranscriptEvent[] = [];
   const push = (kind: TranscriptEvent["kind"], payload: unknown): void => {
@@ -197,8 +219,11 @@ function transcriptFromMessages(
   };
   for (const message of messages) {
     const messageKind = message.role === "user" ? "user_message" : "assistant_message";
+    // The digest's own skip rule keys on this payload flag (transcript-digest
+    // `messageText`), the same one the event log writes.
+    const synthetic = isSynthetic?.(message) === true ? { synthetic: true } : {};
     if (typeof message.content === "string") {
-      push(messageKind, { content: message.content });
+      push(messageKind, { content: message.content, ...synthetic });
       continue;
     }
     if (!Array.isArray(message.content)) continue;
@@ -208,7 +233,7 @@ function transcriptFromMessages(
     let texts: unknown[] = [];
     const flush = (): void => {
       if (texts.length === 0) return;
-      push(messageKind, { content: texts });
+      push(messageKind, { content: texts, ...synthetic });
       texts = [];
     };
     for (const raw of message.content) {
@@ -221,7 +246,11 @@ function transcriptFromMessages(
         push("tool_use", { name: block["name"], input: block["input"] });
       } else if (block["type"] === "tool_result") {
         flush();
-        push("tool_result", { content: block["content"], is_error: block["is_error"] });
+        // `isError` — the `@crewhaus/event-log` key `renderTranscriptDigest`
+        // reads (the runtime writes it as `isError: result.is_error === true`).
+        // Projecting the Anthropic block's own `is_error` would leave every
+        // failed tool result rendered as a successful one.
+        push("tool_result", { content: block["content"], isError: block["is_error"] === true });
       }
     }
     flush();

@@ -467,7 +467,7 @@ function renderEvaluation(ir: IrManagedV0): {
   threshold: ${ev.threshold ?? 0.7},
   onFail: ${onFail},
   maxRetries: ${ev.maxRetries},${escalateField}
-  evaluate: async ({ finalText, messages, bus }) => {
+  evaluate: async ({ finalText, messages, isSynthetic, bus }) => {
     const __verdict = await gradeWithJudgePanel({
       rubric: {
         criteria: [
@@ -486,7 +486,7 @@ function renderEvaluation(ir: IrManagedV0): {
         passing_score: 3,
       },
       sample: { id: "in-loop-evaluation", input: "" },
-      run: inLoopRunResult({ finalText, messages }),${renderJudgePanelFields(panel, "      ")}
+      run: inLoopRunResult({ finalText, messages, isSynthetic }),${renderJudgePanelFields(panel, "      ")}
       // Judge spend rides the run bus (role "judge") so it is priced and
       // counted toward budget.usd under budget.judge_share — every panelist
       // and every repeat publishes its own model_request/model_response.

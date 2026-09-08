@@ -95,7 +95,7 @@ describe("PR 13b — nothing this PR wires pends any more", () => {
     const agent = compile(plain, opts).files.find((f) => f.path === "agent.ts")?.content ?? "";
     // The panel call carries exactly one field beyond the run: the model.
     expect(agent).toContain(
-      '      run: inLoopRunResult({ finalText, messages }),\n      model: "claude-sonnet-4-6",\n      // Judge spend rides',
+      '      run: inLoopRunResult({ finalText, messages, isSynthetic }),\n      model: "claude-sonnet-4-6",\n      // Judge spend rides',
     );
     expect(agent).not.toContain("judges:");
     expect(agent).not.toContain("repeats:");

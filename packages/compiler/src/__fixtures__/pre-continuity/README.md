@@ -360,3 +360,19 @@ step/node, or a params-bearing `$profile` on `compaction.model` /
 byte-restore test passes against the existing pins unchanged. The continuity
 opt-out contract is untouched; recorded here so the next regeneration knows the
 zero delta was checked, not skipped.
+
+**0.6.0 PR 13b review follow-up — the judged transcript learns what the
+runtime already knew; NO pin moved.** Two of the six strings above changed
+again, in the same three `renderEvaluation` copies (cli / channel / managed):
+the evaluator closure destructures `isSynthetic` beside `finalText` /
+`messages` / `bus` and forwards it into `inLoopRunResult({ finalText,
+messages, isSynthetic })`. runtime-core marks its injected `role: "user"`
+messages (retry nudges, cascade corrections, continue/tombstone prompts) in a
+module-private WeakSet, so a `target: "transcript"` judge in another package
+could not tell them from human turns and on attempt 2+ read its own previous
+rationale as a user instruction; `EvaluationTurn.isSynthetic` carries the
+marker across the seam and the projected payload now sets `synthetic: true`,
+which `renderTranscriptDigest` has always skipped. Both strings remain emitted
+ONLY for a spec that declares `evaluation:` with an `llm_judge` grader, and no
+pinned spec here declares one — the byte-restore test passes against the
+existing pins unchanged.
