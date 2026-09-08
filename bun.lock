@@ -459,6 +459,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/ir-passes": "workspace:*",
+        "@crewhaus/model-service": "workspace:*",
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/target-batch-worker": "workspace:*",
         "@crewhaus/target-browser-driver": "workspace:*",
@@ -479,7 +480,6 @@
       },
       "devDependencies": {
         "@crewhaus/model-plan": "workspace:*",
-        "@crewhaus/model-service": "workspace:*",
       },
     },
     "packages/compiler-worker": {

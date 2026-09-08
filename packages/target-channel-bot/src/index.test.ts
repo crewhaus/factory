@@ -1827,6 +1827,9 @@ describe("emitChannelBot — evaluation block (loop contract 0.4, Batch B, G02)"
     expect(agent).toContain('import { judge } from "@crewhaus/eval-judge";');
     expect(agent).toContain("const __evaluation: RunEvaluation = {");
     expect(agent).toContain('graderType: "llm_judge",');
+    // 0.6.0 §6.2 (PR 13) — the judge model stated declaratively beside the
+    // closure, so the pool's per-arm quality lineage can fold it.
+    expect(agent).toContain('judgeModel: "claude-haiku-4-5",');
     expect(agent).toContain('model: "claude-haiku-4-5",');
     expect(agent).toContain('description: "answers cite a source",');
     expect(agent).toContain("threshold: 0.8,");

@@ -436,7 +436,9 @@ export const EVAL_USAGE =
   "  trials under --repeats); an unpriced model leaves cost unknown, so the cost\n" +
   "  gate warns instead of failing. JUDGE spend is now metered too (C35): every\n" +
   "  llm_judge call's token usage lands in results.json (aggregates.judgeUsage, per\n" +
-  "  judge model) and the run prints a `cost:` line breaking out agent vs judge vs\n" +
+  "  judge model — and, on a routed run, per (judge model, agent arm) so a hybrid\n" +
+  "  setup can see what grading the cheap arm cost) and the run prints a `cost:`\n" +
+  "  line breaking out agent vs judge vs\n" +
   "  total — judge grading often costs more than the agent run it grades. The gate\n" +
   "  thresholds themselves still compare AGENT cost, unchanged. Like the regression\n" +
   "  gate, the thresholds compare\n" +
@@ -612,7 +614,12 @@ export const EVAL_USAGE =
   "  with different digests start a new baseline lineage instead of gating across\n" +
   "  the difference. Routed runs key their own baseline lineage\n" +
   "  (spec::dataset::<arm|routed>) beside the legacy spec::dataset one, so a cheap\n" +
-  "  candidate can never pin over the primary's baseline.\n" +
+  "  candidate can never pin over the primary's baseline. On a routed run the\n" +
+  "  graders.yaml `per_model:` map binds each SERVED ARM to its own judge, passing\n" +
+  "  cut and weight (`$fast: {judge: $strong, passing_score: 4}`), and judge\n" +
+  "  calibration resolves per (arm, judge) pair — write those with\n" +
+  "  `crewhaus judge calibrate --by-model --apply`. A static run has no served arm,\n" +
+  "  so it grades with the base judge and warns that the map went unused.\n" +
   "  --models also accepts $profile refs and the word `pool`: --models '$fast,$strong'\n" +
   "  runs one cell per models: profile, --models pool expands the whole model_pool\n" +
   "  roster. QUOTE the $refs — an unquoted $fast is eaten by the shell. Adding\n" +

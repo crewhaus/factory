@@ -18,6 +18,14 @@
  *     IR, so a rendering bug cannot hide.
  * Key sets and the pool blob must match, on every shape whose emitter renders
  * the call, and both must be empty for a pool that declares no closure.
+ *
+ * PR 9f extends the shape list to the last four pool-bearing emitters
+ * (pipeline, research, batch, browser), which 9e left carrying the blob with
+ * none of the behaviour — see `packages/compiler/src/hybrid-shape-matrix.test.ts`
+ * for the per-shape §11.3 cells themselves. It also closes the mirror-image
+ * gap on the interpreter side: `crewhaus run` accepts `cli` and `browser`,
+ * and the browser path spread no routing options at all, so the key-for-key
+ * parity is now asserted on BOTH shapes an interpreter can run.
  */
 import { describe, expect, test } from "bun:test";
 import { compile, lower } from "@crewhaus/compiler";
@@ -84,11 +92,26 @@ function bundleRoutingOptions(agentTs: string): Record<string, unknown> {
   >;
 }
 
-function cliIr(yaml: string): IrV0 {
+const browserSpec = (pool: readonly string[]): string =>
+  [
+    "name: hybrid",
+    "target: browser",
+    "agent:",
+    "  model: claude-sonnet-4-6",
+    "  instructions: i",
+    ...pool,
+  ].join("\n");
+
+function irOf(yaml: string, target: IrV0["target"]): IrV0 {
   const ir = lower(parseSpec(yaml));
-  if (ir.target !== "cli") throw new Error("expected a cli IR");
+  if (ir.target !== target) throw new Error(`expected a ${target} IR`);
   return ir;
 }
+
+const cliIr = (yaml: string): IrV0 => irOf(yaml, "cli");
+
+const agentTsOf = (yaml: string): string =>
+  compile(yaml).files.find((f) => f.path === "agent.ts")?.content ?? "";
 
 describe("crewhaus run and the compiled bundle build the same option set (PR 9e)", () => {
   test("a hybrid cli spec: same keys, same pool blob, Consult advertised on both", () => {
@@ -122,6 +145,43 @@ describe("crewhaus run and the compiled bundle build the same option set (PR 9e)
     expect(agentTs).not.toContain("wireHybrid");
     expect(Object.keys(bundleRoutingOptions(agentTs))).toEqual(["modelPool"]);
     expect(Object.keys(interpreter)).toEqual(["modelPool"]);
+  });
+
+  /**
+   * PR 9f — "the interpreter" is TWO call sites, and browser was the odd one
+   * out: `runRunBrowser`'s `runChatLoop` spread NO routing options at all
+   * (`runRunCli` and `buildServeRuntime` were the only callers), so a hybrid
+   * browser spec routed, consulted and escalated when compiled and did none
+   * of it when run — the same class of gap 9e closed on the emit side. Both
+   * halves are now asserted the same way as cli.
+   */
+  test("a hybrid browser spec: same keys, same pool blob, on both paths", () => {
+    const yaml = browserSpec(HYBRID_POOL);
+    const ir = irOf(yaml, "browser");
+    const interpreter = modelRoutingRunOptions(ir.agent, undefined, { sessionName: ir.name });
+    const bundle = bundleRoutingOptions(agentTsOf(yaml));
+
+    expect(Object.keys(bundle)).toEqual(Object.keys(interpreter));
+    expect(bundle["modelPool"]).toEqual(interpreter.modelPool);
+    expect(typeof interpreter.routeClassifier).toBe("function");
+    expect(
+      (interpreter.hybridTools as ReadonlyArray<{ name: string }> | undefined)?.map((t) => t.name),
+    ).toEqual(["Consult", "Escalate"]);
+  });
+
+  test("`crewhaus run <browser spec>` really makes that call — both run paths do", async () => {
+    const source = await Bun.file(`${import.meta.dir}/index.ts`).text();
+    const body = (from: string, to: string): string =>
+      source.slice(source.indexOf(from), source.indexOf(to));
+    for (const [label, region] of [
+      ["runRunCli", body("async function runRunCli(", "async function runRunBrowser(")],
+      ["runRunBrowser", body("async function runRunBrowser(", "async function readAllStdin(")],
+    ] as const) {
+      expect(region.length).toBeGreaterThan(0);
+      expect(`${label}: ${region.includes("...modelRoutingRunOptions(ir.agent,")}`).toBe(
+        `${label}: true`,
+      );
+    }
   });
 
   test("the emitted dependency manifest lists @crewhaus/model-service — and only when wired", () => {
@@ -186,6 +246,46 @@ describe("every emitter the plan wires renders the call for its own pooled block
         ...hybridPool("    "),
       ].join("\n"),
     ],
+    // PR 9f — the four shapes 9e left carrying the blob with none of the
+    // behaviour. Same assertion, same manifest consequence.
+    [
+      "pipeline",
+      [
+        "name: hybrid",
+        "target: pipeline",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: i",
+        ...HYBRID_POOL,
+        "retrieve: { embedderModel: mock/det }",
+        "indexing: { documents: [{ id: d1, text: hello }] }",
+      ].join("\n"),
+    ],
+    [
+      "research",
+      [
+        "name: hybrid",
+        "target: research",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: i",
+        ...HYBRID_POOL,
+        "goal: find out",
+      ].join("\n"),
+    ],
+    [
+      "batch",
+      [
+        "name: hybrid",
+        "target: batch",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: i",
+        ...HYBRID_POOL,
+        "queue: { adapter: in-memory }",
+      ].join("\n"),
+    ],
+    ["browser", browserSpec(HYBRID_POOL)],
   ];
 
   for (const [label, yaml] of specs) {

@@ -17,13 +17,16 @@ import {
   buildCalibrationCard,
   buildCalibrationFile,
   confusionAt,
+  deriveTurnArms,
   dropDuplicateCandidates,
   extractDatasetCalibrationPairs,
   flagDisagreements,
+  groupPairsByArm,
   judgeBias,
   normalizeJudge,
   pearson,
   renderCalibrationCard,
+  renderPairCalibrations,
   rocOptimalCut,
 } from "./judge-calibrate";
 
@@ -188,6 +191,137 @@ describe("buildCalibrationCard + file", () => {
     const card = buildCalibrationCard([pair(1, 5), pair(1, 4)]);
     expect(card.recommendedCut).toBeUndefined();
     expect(renderCalibrationCard(card)).toContain("n/a");
+  });
+});
+
+// -------- 0.6.0 §6.2: --by-model (per (agent arm, judge model) cuts) --------
+
+describe("deriveTurnArms (0.6.0 §6.2)", () => {
+  it("takes the LAST primary route of each turn, preferring the profile name", () => {
+    const arms = deriveTurnArms([
+      { kind: "user_message", payload: { content: "hi" } },
+      {
+        kind: "model_route",
+        payload: { turnNumber: 1, model: "claude-3-5-haiku-latest", specModel: "claude-haiku-4-5" },
+      },
+      {
+        kind: "model_route",
+        payload: { turnNumber: 1, model: "claude-opus-x", profile: "strong" },
+      },
+      { kind: "model_route", payload: { turnNumber: 2, model: "m", profile: "fast" } },
+    ]);
+    // A tool-running turn re-routes; the rung that wrote the final text wins.
+    expect(arms.get(1)).toBe("strong");
+    expect(arms.get(2)).toBe("fast");
+  });
+
+  it("falls back to model_meta for sessions that routed nothing, skipping judge calls", () => {
+    const arms = deriveTurnArms([
+      {
+        kind: "model_meta",
+        payload: { turnNumber: 1, model: "claude-haiku-4-5", profile: "fast" },
+      },
+      // A judge call is spend in service of the answer, never the answer's arm.
+      { kind: "model_meta", payload: { turnNumber: 1, model: "claude-opus-4-7", role: "judge" } },
+    ]);
+    expect(arms.get(1)).toBe("fast");
+  });
+
+  it("prefers a route line over a meta line, and records nothing without either", () => {
+    const arms = deriveTurnArms([
+      { kind: "model_meta", payload: { turnNumber: 1, model: "wire-id" } },
+      { kind: "model_route", payload: { turnNumber: 1, model: "wire-id", specModel: "spec-id" } },
+      { kind: "assistant_message", payload: { content: "no routing here" } },
+    ]);
+    expect(arms.get(1)).toBe("spec-id");
+    expect(arms.get(2)).toBeUndefined();
+  });
+});
+
+describe("groupPairsByArm + byPair calibration file", () => {
+  const armPairs = [
+    pair(0, 1, { sessionId: "s1", turnNumber: 1, arm: "fast" }),
+    pair(0, 2, { sessionId: "s1", turnNumber: 2, arm: "fast" }),
+    pair(1, 4, { sessionId: "s1", turnNumber: 3, arm: "fast" }),
+    pair(1, 5, { sessionId: "s1", turnNumber: 4, arm: "fast" }),
+    // An unattributed turn (a pre-0.6.0 session) folds into the spec cut only.
+    pair(1, 5, { sessionId: "s2", turnNumber: 1 }),
+  ];
+
+  it("groups only the pairs that carry an arm", () => {
+    const grouped = groupPairsByArm(armPairs);
+    expect([...grouped.keys()]).toEqual(["fast"]);
+    expect(grouped.get("fast")).toHaveLength(4);
+  });
+
+  it("writes a (fast, sonnet) pair entry beside the spec-level cut", () => {
+    const card = buildCalibrationCard(armPairs, { specName: "helper", model: "claude-sonnet-5" });
+    const armCard = buildCalibrationCard(groupPairsByArm(armPairs).get("fast") ?? [], {
+      specName: "helper",
+      model: "claude-sonnet-5",
+    });
+    const file = buildCalibrationFile(undefined, card, "2026-09-07T00:00:00Z", {
+      pairs: [{ arm: "fast", judgeModel: "claude-sonnet-5", card: armCard }],
+    });
+    const entry = file.calibrations["helper"];
+    expect(entry?.minScore).toBe(card.recommendedCut?.cut ?? DEFAULT_JUDGE_CUT);
+    const byPair = entry?.byPair?.["fast::claude-sonnet-5"];
+    expect(byPair).toMatchObject({ arm: "fast", model: "claude-sonnet-5", pairCount: 4 });
+    expect(byPair?.minScore).toBe(armCard.recommendedCut?.cut ?? DEFAULT_JUDGE_CUT);
+  });
+
+  it("keeps pairs it did not re-measure, and never disturbs other specs", () => {
+    const existing: JudgeCalibrationFile = {
+      version: 1,
+      calibrations: {
+        other: {
+          minScore: 0.6,
+          correlation: 0.5,
+          bias: 0,
+          pairCount: 3,
+          updatedAt: "2026-06-01T00:00:00Z",
+        },
+        helper: {
+          minScore: 0.5,
+          correlation: 0.4,
+          bias: 0,
+          pairCount: 2,
+          updatedAt: "2026-06-01T00:00:00Z",
+          byPair: {
+            "slow::claude-sonnet-5": {
+              arm: "slow",
+              minScore: 0.9,
+              correlation: 0.7,
+              bias: 0,
+              pairCount: 6,
+              updatedAt: "2026-06-01T00:00:00Z",
+            },
+          },
+        },
+      },
+    };
+    const card = buildCalibrationCard(armPairs, { specName: "helper", model: "claude-sonnet-5" });
+    const file = buildCalibrationFile(existing, card, "2026-09-07T00:00:00Z", {
+      pairs: [{ arm: "fast", judgeModel: "claude-sonnet-5", card }],
+    });
+    expect(file.calibrations["other"]?.minScore).toBe(0.6);
+    // The arm that saw no rated turns this time keeps its last cut.
+    expect(file.calibrations["helper"]?.byPair?.["slow::claude-sonnet-5"]?.minScore).toBe(0.9);
+    expect(file.calibrations["helper"]?.byPair?.["fast::claude-sonnet-5"]).toBeDefined();
+  });
+
+  it("a plain --apply (no pairs) leaves a pre-0.6.0 entry without a byPair key", () => {
+    const card = buildCalibrationCard(armPairs, { specName: "helper" });
+    const file = buildCalibrationFile(undefined, card, "2026-09-07T00:00:00Z");
+    expect(Object.hasOwn(file.calibrations["helper"] ?? {}, "byPair")).toBe(false);
+  });
+
+  it("renders the per-pair cuts under the card", () => {
+    const card = buildCalibrationCard(armPairs, { specName: "helper", model: "claude-sonnet-5" });
+    const out = renderPairCalibrations([{ arm: "fast", judgeModel: "claude-sonnet-5", card }]);
+    expect(out).toContain("by model (agent arm x judge)");
+    expect(out).toContain("fast x claude-sonnet-5");
+    expect(renderPairCalibrations([])).toBe("");
   });
 });
 
@@ -413,6 +547,14 @@ describe("crewhaus judge calibrate (CLI, no credentials)", () => {
     expect(got.stdout).toContain("--dataset");
     expect(got.stdout).toContain("metadata.user_rating");
     expect(got.stdout).toContain("gold_refreshed");
+  });
+
+  it("documents --by-model and its pair → spec → default resolution", async () => {
+    const got = await runCli(["judge", "calibrate", "--help"], newTempRoot());
+    expect(got.exitCode).toBe(0);
+    expect(got.stdout).toContain("--by-model");
+    expect(got.stdout).toContain("(agent arm, judge");
+    expect(got.stdout).toContain("pair -> spec -> default");
   });
 
   it("dies loudly (contract explained) when --dataset yields zero usable pairs", async () => {

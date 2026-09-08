@@ -427,6 +427,10 @@ ${lines.join("\n")}
  * contract: `graderType`/`threshold` are stamped verbatim onto every
  * `eval_graded` event (deterministic graders carry the documented
  * threshold 1 — score is 0|1 and `score >= threshold` is the pass rule).
+ * 0.6.0 §6.2 (PR 13) — an `llm_judge` literal additionally
+ * carries `judgeModel`, the model `evaluate` grades with, so the pool's
+ * per-arm quality lineage folds the judge's identity beside the grader kind;
+ * deterministic graders render no such field and stay byte-identical.
  * Empty pieces when the spec omits the block, keeping pre-existing bundles
  * byte-identical. Mirror: target-cli + target-channel-bot render the same
  * wiring — keep the three in sync.
@@ -451,6 +455,7 @@ function renderEvaluation(ir: IrManagedV0): {
     const model = escapeJsonString(ev.grader.model ?? ir.agent.model);
     const bootBlock = `const __evaluation: RunEvaluation = {
   graderType: "llm_judge",
+  judgeModel: ${model},
   threshold: ${ev.threshold ?? 0.7},
   onFail: ${onFail},
   maxRetries: ${ev.maxRetries},${escalateField}

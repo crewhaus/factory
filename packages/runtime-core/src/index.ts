@@ -1217,6 +1217,21 @@ export type RunEvaluation = {
    * caller knows what it built `evaluate` from).
    */
   readonly graderType: "llm_judge" | "contains" | "regex";
+  /**
+   * 0.6.0 §6.2 (PR 13, the PR-10 carry-over) — the JUDGE MODEL `evaluate`
+   * calls, when it calls one. Purely declarative: the closure still owns the
+   * call, this states which model it makes it with, because the identity of
+   * the judge is part of the instrument a learned arm's quality was measured
+   * on. Under `reward.quality_source`, the per-arm lineage folds it beside
+   * `graderType` (§6.3 item 4 — `reset_on_profile_change`), so re-pointing
+   * `evaluation.grader.model` at a different judge starts a NEW lineage
+   * instead of averaging two instruments' verdicts into one arm.
+   *
+   * Emitted by the three `renderEvaluation` copies and the interpreter's
+   * `buildRunEvaluation` for `llm_judge` graders only — a `contains`/`regex`
+   * grader has no judge, and their bundles stay byte-identical.
+   */
+  readonly judgeModel?: string;
 };
 
 /**
@@ -3386,8 +3401,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // profile that changed under the same arm id and is skipped on load
     // (`reset_on_profile_change`, default true). Unprofiled arms (arm id =
     // model string) are not stamped, so a bare 0.5.x pool writes 0.5.x lines.
-    // The judge MODEL is closed over by `evaluation.evaluate` and not visible
-    // here; the grader kind is the judge identity this seam can see.
+    // 0.6.0 §6.2 (PR 13) — the JUDGE MODEL now folds in too. PR 10 could not
+    // see it: the judge was closed over by `evaluation.evaluate` and nothing
+    // at this seam knew which model graded. `RunEvaluation.judgeModel` states
+    // it declaratively (emitted for `llm_judge` graders by the three
+    // `renderEvaluation` copies and the interpreter), so re-pointing the
+    // judge at a different model starts a NEW lineage rather than averaging
+    // two instruments' verdicts into one arm's quality. Absent for
+    // deterministic graders and for hand-built IR — a `contains` grader has
+    // no judge — and `planFingerprint` drops `undefined` members, so a
+    // judge-less pool's lineage is byte-identical to PR 10's.
     const lineage: Record<string, string> = {};
     for (const candidate of candidates) {
       const cfg = poolCandidateConfigs.get(candidate);
@@ -3396,6 +3419,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         candidate: cfg,
         qualitySource: rewardBlock?.qualitySource ?? "none",
         grader: opts.evaluation?.graderType,
+        judge: opts.evaluation?.judgeModel,
       });
     }
     const liveScoreboard =

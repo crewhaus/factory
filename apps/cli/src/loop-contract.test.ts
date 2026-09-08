@@ -76,6 +76,11 @@ describe("evaluationRunOptions (0.6.0 PR 8b — interpreter parity for the in-lo
     expect(ev.threshold).toBe(0.8);
     expect(ev.onFail).toBe("escalate");
     expect(typeof ev.evaluate).toBe("function");
+    // 0.6.0 §6.2 (PR 13) — the judge model is stated at the seam (the bundle
+    // renders the same field) so the pool's per-arm quality lineage folds it;
+    // absent `grader.model` falls back to the shape's primary, as the bundle
+    // does.
+    expect(ev.judgeModel).toBe("claude-haiku-4-5");
     // The lower-time default the bundle also falls back to.
     const defaulted = evaluationRunOptions({
       agent: { model: "m" },
