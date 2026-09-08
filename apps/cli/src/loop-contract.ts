@@ -232,6 +232,10 @@ function buildRunEvaluation(ev: IrEvaluation, primaryModel: string): RunEvaluati
     const criteria = grader.criteria;
     return {
       graderType: "llm_judge",
+      // 0.6.0 §6.2 (PR 13) — state the judge model at the seam so the pool's
+      // per-arm quality lineage can fold it (`reset_on_profile_change`);
+      // the bundle's `renderEvaluation` copies emit the same field.
+      judgeModel: model,
       threshold: ev.threshold ?? 0.7,
       onFail: ev.onFail,
       maxRetries: ev.maxRetries,

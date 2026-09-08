@@ -160,8 +160,17 @@ export type SkippedGrader = {
 };
 
 export type ResolveTestGradersOptions = {
-  /** `--judge-model` — the runner-level judge default (per-grader `model`
-   *  / `judges` still win, exactly like `crewhaus eval`). */
+  /**
+   * `--judge-model` — the runner-level judge default. Precedence, exactly as
+   * `crewhaus eval` resolves it for an UNROUTED run: a grader's own `judges:`
+   * panel, else its `model:`, else this flag, else `DEFAULT_JUDGE_MODEL`.
+   *
+   * 0.6.0 §6.2 — a graders file's `per_model:` overrides deliberately do NOT
+   * apply here: they bind a judge to the ARM that served a sample, and a
+   * golden verdict is a recorded output with no route behind it. The
+   * meta-eval measures the base judge the file declares; per-arm judging is
+   * measured by `crewhaus eval --routing as-declared`.
+   */
   readonly judgeModel?: string;
   /** Credential visibility source (default `process.env`). */
   readonly env?: NodeJS.ProcessEnv;
@@ -180,8 +189,10 @@ export type ResolveTestGradersOptions = {
  * two meta-eval-specific skips for judge entries: `target: transcript`
  * (nothing to replay) and missing judge credentials (never fabricate).
  * Judge rubrics test at their DECLARED gate (`passing_score`, default 3/5);
- * the G47 calibrated-cut overlay deliberately does not apply here — the
- * meta-eval measures the graders file as written.
+ * neither the G47 calibrated-cut overlay (nor its 0.6.0 per-(arm, judge)
+ * pair cuts) nor the `per_model:` judge overrides apply here — a golden
+ * verdict carries no served arm, and the meta-eval measures the graders file
+ * as written.
  */
 export function resolveTestGraders(
   compiled: ReadonlyArray<CompiledGrader>,

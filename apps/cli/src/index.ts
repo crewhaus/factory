@@ -897,11 +897,15 @@ import {
   DEFAULT_JUDGE_CUT,
   type DatasetPairCandidate,
   type JudgeCalibrationFile,
+  type PairCalibration,
   buildCalibrationCard,
   buildCalibrationFile,
+  deriveTurnArms,
   dropDuplicateCandidates,
   extractDatasetCalibrationPairs,
+  groupPairsByArm,
   renderCalibrationCard,
+  renderPairCalibrations,
   writeCalibrationFileAtomic,
 } from "./judge-calibrate";
 // AUTOMATION-OPPORTUNITIES.md item 52 — `crewhaus justification calibrate` +
@@ -12952,7 +12956,8 @@ async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus judge calibrate [--dataset <file|registry:ref>] [--graders <graders.yaml>]\n" +
-        "                                [--sessions N|all] [--model <judge-model>] [--apply]\n" +
+        "                                [--sessions N|all] [--model <judge-model>] [--by-model]\n" +
+        "                                [--apply]\n" +
         "  Pair (human rating, llm_judge score) for turns that carry BOTH a human\n" +
         "  user_feedback rating AND can be judged (item 8): re-runs the llm_judge\n" +
         "  grader (from --graders, or a default rubric) over each rated transcript\n" +
@@ -12973,7 +12978,15 @@ async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
         "  metadata.gold_refreshed — `dataset refresh-goldens` replaced the gold\n" +
         "  after the rating); a sample already paired from the scanned sessions is\n" +
         "  skipped as a duplicate. registry:<name>[@version][#split] refs resolve\n" +
-        "  train+dev on a bare ref; the locked test split stays locked.\n",
+        "  train+dev on a bare ref; the locked test split stays locked.\n" +
+        "  --by-model (0.6.0) additionally calibrates ONE CUT PER (agent arm, judge\n" +
+        "  model) pair: rated turns are attributed to the arm that served them (the\n" +
+        "  session's own model_route / model_meta lines — a models: profile name,\n" +
+        "  else the model string), so a cheap arm checked by a strong judge gets its\n" +
+        "  own gate instead of inheriting the whole spec's. With --apply the pairs\n" +
+        "  are written under the spec's `byPair` map; the eval runner resolves\n" +
+        "  pair -> spec -> default, so unrouted runs are unaffected. Turns with no\n" +
+        "  routing lines (pre-0.6.0 sessions) fold into the spec-level cut only.\n",
     );
     return;
   }
@@ -12992,9 +13005,15 @@ async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
   const ids = sessionsWanted === "all" ? allIds : allIds.slice(0, sessionsWanted);
   const turns: SessionTurn[] = [];
   const records: FeedbackRecord[] = [];
+  // 0.6.0 §6.2 — `--by-model`: the arm that served each turn, keyed
+  // `<sessionId>#<turnNumber>` exactly like the turn index below.
+  const armByTurnKey = new Map<string, string>();
   for (const id of ids) {
     const events = readSessionEvents(id);
     for (const t of deriveTurns(events)) turns.push({ ...t, sessionId: id });
+    for (const [turnNumber, arm] of deriveTurnArms(events)) {
+      armByTurnKey.set(`${id}#${turnNumber}`, arm);
+    }
     records.push(...extractFeedbackRecords(events));
   }
   records.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
@@ -13003,14 +13022,16 @@ async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
   for (const t of turns) turnByKey.set(`${t.sessionId}#${t.turnNumber}`, t);
 
   // Rated turns with a numeric signal AND a non-empty answer to judge.
-  type RatedTurn = { turn: SessionTurn; human: number };
+  type RatedTurn = { turn: SessionTurn; human: number; arm?: string };
   const rated: RatedTurn[] = [];
   for (const fb of mergeFeedback(records)) {
     const human = normalizeRating(fb);
     if (human === undefined) continue; // comment-only, no numeric signal
-    const turn = turnByKey.get(`${fb.sessionId}#${fb.turnNumber}`);
+    const key = `${fb.sessionId}#${fb.turnNumber}`;
+    const turn = turnByKey.get(key);
     if (turn === undefined || turn.output.trim() === "") continue;
-    rated.push({ turn, human });
+    const arm = armByTurnKey.get(key);
+    rated.push({ turn, human, ...(arm !== undefined ? { arm } : {}) });
   }
 
   // NEW-graders-1 — `--dataset`: ADD calibration pairs from the golden
@@ -13111,7 +13132,7 @@ async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
   // call cannot abort the whole calibration.
   const pairs: CalibrationPair[] = [];
   let judgeFailures = 0;
-  for (const { turn, human } of rated) {
+  for (const { turn, human, arm } of rated) {
     try {
       const result = await judge({
         rubric,
@@ -13127,6 +13148,9 @@ async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
         ...(Object.keys(result.criterionScores).length > 0
           ? { criterionScores: result.criterionScores }
           : {}),
+        // 0.6.0 §6.2 — the arm that produced this answer, when the session
+        // recorded one.
+        ...(arm !== undefined ? { arm } : {}),
       });
     } catch {
       judgeFailures += 1;
@@ -13168,6 +13192,34 @@ async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
     model: judgeModel,
   });
   process.stdout.write(renderCalibrationCard(card));
+
+  // 0.6.0 §6.2 — `--by-model`: one cut per (agent arm, judge model) pair.
+  // The spec-level card above is still computed over ALL pairs and still
+  // written, so a run whose samples route to an un-calibrated arm keeps a
+  // gate; the pairs refine it where there is evidence.
+  const byModel = args.flags["by-model"] === true;
+  const pairCalibrations: PairCalibration[] = [];
+  if (byModel) {
+    for (const [arm, armPairs] of groupPairsByArm(pairs)) {
+      pairCalibrations.push({
+        arm,
+        judgeModel,
+        card: buildCalibrationCard(armPairs, {
+          ...(specName !== undefined ? { specName } : {}),
+          model: judgeModel,
+        }),
+      });
+    }
+    if (pairCalibrations.length === 0) {
+      process.stdout.write(
+        "[judge calibrate] --by-model: no rated turn carries a served arm — the scanned sessions " +
+          "recorded no model_route / model_meta lines (a pre-0.6.0 or single-model run), so only " +
+          "the spec-level cut was calibrated.\n",
+      );
+    } else {
+      process.stdout.write(renderPairCalibrations(pairCalibrations));
+    }
+  }
   if (datasetFlag !== undefined) {
     process.stdout.write(
       `[judge calibrate] pairs: ${sessionPairCount} from session ratings + ${pairs.length - sessionPairCount} from --dataset "${datasetLabel ?? datasetFlag}" (skipped: ${datasetSkipNote})\n`,
@@ -13189,7 +13241,9 @@ async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
         // A corrupt file is replaced.
       }
     }
-    const file = buildCalibrationFile(existing, card, new Date().toISOString());
+    const file = buildCalibrationFile(existing, card, new Date().toISOString(), {
+      ...(pairCalibrations.length > 0 ? { pairs: pairCalibrations } : {}),
+    });
     // Atomic (temp file + rename): the eval runner reads this file to gate
     // llm_judge graders, and a torn read silently mis-gates a whole run.
     writeCalibrationFileAtomic(path, file);
@@ -13197,6 +13251,11 @@ async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       `[judge calibrate] wrote calibrated --min-score ${cut.toFixed(3)} for "${specName ?? "default"}" → ${path}\n`,
     );
+    if (pairCalibrations.length > 0) {
+      process.stdout.write(
+        `[judge calibrate] wrote ${pairCalibrations.length} per-model cut(s) under "${specName ?? "default"}".byPair — the eval runner resolves pair → spec → default\n`,
+      );
+    }
   }
 }
 
@@ -15667,8 +15726,11 @@ async function runGradersTest(args: ParsedArgs): Promise<void> {
         "  credentials and are SKIPPED with a notice without them (the rest still\n" +
         "  test). target: transcript judges always skip — golden verdicts carry\n" +
         "  only the final output. Judge rubrics test at their DECLARED\n" +
-        "  passing_score (default 3/5); the judge-calibration overlay from\n" +
-        "  `judge calibrate --apply` is not applied here.\n" +
+        "  passing_score (default 3/5), judged by the grader's own judges:/model:,\n" +
+        "  else --judge-model, else the default judge model. Neither the\n" +
+        "  judge-calibration overlay from `judge calibrate --apply` nor a\n" +
+        "  graders.yaml `per_model:` override applies here — both key on the arm\n" +
+        "  that served a sample, and a golden verdict has no route behind it.\n" +
         "  Per grader: agreement rate + Cohen's kappa vs expected_passed, false\n" +
         "  positives/negatives with up to 5 exemplar ids each, abstained/error\n" +
         "  counts (excluded from agreement), and mean absolute score error when\n" +
