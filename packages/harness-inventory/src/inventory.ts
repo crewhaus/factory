@@ -210,6 +210,14 @@ export type LastEval = {
   readonly datasetName: string;
   readonly passRate: number;
   readonly ts: string;
+  /**
+   * 0.6.0 §6.1 — the ARM that run measured, when the harness routes a
+   * `model_pool` and the run pinned one (`eval --models pool --record`, or
+   * `--routing candidate:<…>`). A routed harness records one row per arm, so
+   * without this the fleet row silently reads "68% pass" off whichever arm
+   * happened to run last. Absent on every unrouted harness.
+   */
+  readonly armId?: string;
 };
 
 /** Minimal shape of an eval index entry the fleet row needs. */
@@ -217,6 +225,8 @@ export type LastEvalEntry = {
   readonly datasetName: string;
   readonly passRate: number;
   readonly ts: string;
+  /** 0.6.0 §6.1 — see {@link LastEval.armId}. */
+  readonly armId?: string;
 };
 
 /** One harness's rolled-up inventory row. */
@@ -335,7 +345,12 @@ export function lastEvalFor(evalEntries: ReadonlyArray<LastEvalEntry>): LastEval
     if (best === undefined || e.ts > best.ts) best = e;
   }
   if (best === undefined) return undefined;
-  return { datasetName: best.datasetName, passRate: best.passRate, ts: best.ts };
+  return {
+    datasetName: best.datasetName,
+    passRate: best.passRate,
+    ts: best.ts,
+    ...(best.armId !== undefined ? { armId: best.armId } : {}),
+  };
 }
 
 /**
@@ -442,7 +457,7 @@ export function formatInventory(
     lines.push(`    registry=${ver}  pins: ${pinStr}`);
     if (r.lastEval !== undefined) {
       lines.push(
-        `    last eval: ${(r.lastEval.passRate * 100).toFixed(1)}% pass (${r.lastEval.datasetName}, ${r.lastEval.ts})`,
+        `    last eval: ${(r.lastEval.passRate * 100).toFixed(1)}% pass (${r.lastEval.datasetName}${r.lastEval.armId !== undefined ? `#${r.lastEval.armId}` : ""}, ${r.lastEval.ts})`,
       );
     } else {
       lines.push("    last eval: none recorded");

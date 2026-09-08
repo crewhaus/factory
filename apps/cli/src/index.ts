@@ -108,10 +108,12 @@ import {
   trendTable,
 } from "@crewhaus/eval-report";
 import {
+  type EvalRoutingMode,
   type EvalRunSummary,
   type GraderLookup,
   createExamRunner,
   defaultGraderRegistry,
+  parseEvalRoutingMode,
   resolveRegistryGrader,
   runEval as runEvalLib,
   warnUnconsumedCombinePolicy,
@@ -148,6 +150,7 @@ import {
   wireMemory,
 } from "@crewhaus/memory-service";
 import { createMemoryStore } from "@crewhaus/memory-store";
+import { MAX_PRIOR_PSEUDO_COUNT } from "@crewhaus/model-plan";
 // Item 10 (G89) — the default public plugin registry (registry.crewhaus.ai)
 // `crewhaus plugins list/search` fall back to when no --registry / env is set.
 import { DEFAULT_MODULE_REGISTRY_URL } from "@crewhaus/module-marketplace-client";
@@ -291,6 +294,7 @@ import {
   DOCTOR_SCHEMA,
   EGRESS_SCHEMA,
   EVAL_COVERAGE_SCHEMA,
+  EVAL_LEADERBOARD_SCHEMA,
   EVAL_PLAN_SCHEMA,
   EVAL_REPORT_SCHEMA,
   EVAL_SCHEMA,
@@ -628,16 +632,28 @@ import {
 // in a side-effect-free module so it is unit-testable (this entry file runs
 // an argv switch on import).
 import { datasetFilterMatches, finishEvalRun } from "./eval-history";
+import {
+  buildPriorsFile,
+  discoverMatrixCells,
+  leaderboardLines,
+  leaderboardPairwiseTable,
+  leaderboardTable,
+  loadLeaderboard,
+  writeLeaderboardArtifacts,
+  writePriorsFile,
+} from "./eval-leaderboard";
 // Item 11 — `eval --models` benchmark matrix: flag parsing/validation, cell
 // slugs, the failure-isolated cell loop, and the cost-tracker pricing seam,
 // in a side-effect-free module so it is unit-testable (this entry file runs
 // an argv switch on import).
 import {
   MatrixArgError,
+  type MatrixArm,
   assertMatrixFlagsCompatible,
   assignCellSlugs,
   defaultMatrixPricing,
   parseModelsFlag,
+  resolveMatrixArms,
   runMatrixCells,
 } from "./eval-matrix";
 // Loop contract 0.4 (Batch B) — shared eval-loop CLI helpers: the G14
@@ -746,7 +762,6 @@ import {
 import {
   type BuildInventoryDeps,
   type BulkRunResult,
-  type EvalHealthReader,
   FLEET_USAGE,
   FleetError,
   type FleetRunner,
@@ -1442,7 +1457,7 @@ import {
 // The top-level `crewhaus` help text — pure string data (~31 KB), so it lives
 // beside this entry file rather than in it. `usage()`/`help()` below still own
 // the stream + exit code.
-import { EVAL_USAGE, usageText } from "./usage-text";
+import { EVAL_LEADERBOARD_USAGE, EVAL_USAGE, usageText } from "./usage-text";
 // CLI version resolution (embedded --define constant → package.json), shared
 // with bundle-manifest.ts's dependency pinning.
 import { cliVersion } from "./version";
@@ -9162,18 +9177,56 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   // model string (full router grammar) up front: a typo in model 3 must fail
   // before cell 1 burns tokens.
   const modelsFlag = args.flags["models"];
+  // 0.6.0 §6.1 — `--record` runs matrix cells through the run-history flow,
+  // each keying its OWN per-arm lineage. That is what makes --gate /
+  // --no-promote legal under --models.
+  const matrixRecord = args.flags["record"] === true;
   let matrixModels: string[] | undefined;
   if (typeof modelsFlag === "string") {
     try {
       assertMatrixFlagsCompatible({
         gate: gateRequested,
         noPromote: args.flags["no-promote"] === true,
+        record: matrixRecord,
       });
       matrixModels = parseModelsFlag(modelsFlag);
     } catch (err) {
       if (err instanceof MatrixArgError) die(err.message);
       throw err;
     }
+  } else if (matrixRecord) {
+    die(
+      "--record applies to `eval --models` matrix cells — a single-model eval is always recorded",
+    );
+  }
+
+  // 0.6.0 §6.1 — how to ROUTE the eval. Validated here (loudly, before any
+  // dataset load or spend) through the runner's own parser, so the CLI and
+  // the library can never disagree about the vocabulary.
+  const routingFlag = args.flags["routing"];
+  let evalRouting: EvalRoutingMode | undefined;
+  if (typeof routingFlag === "string") {
+    try {
+      evalRouting = parseEvalRoutingMode(routingFlag);
+    } catch (err) {
+      die(err instanceof Error ? err.message : String(err));
+    }
+  }
+  const warmArms = args.flags["warm-arms"] === true;
+  if (warmArms && (evalRouting === undefined || evalRouting === "static")) {
+    die(
+      "--warm-arms seeds the frozen arm snapshot a ROUTED eval reads — pass --routing as-declared or --routing candidate:<$profile|model> with it",
+    );
+  }
+  if (evalRouting !== undefined && evalRouting !== "static" && matrixModels !== undefined) {
+    die(
+      "--routing and --models are mutually exclusive — a matrix already pins one arm per cell (use --models '$fast,$strong' or --models pool)",
+    );
+  }
+  if (evalRouting !== undefined && evalRouting !== "static" && sentinel) {
+    die(
+      "--sentinel and --routing are mutually exclusive — a sentinel probes PROVIDER drift against a frozen baseline, so its routing must be identical to the baseline's",
+    );
   }
 
   const concurrencyFlag = args.flags["concurrency"];
@@ -9477,9 +9530,24 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   // finishEvalRun flow below — nor the item-7 triage (matrix cells are model
   // comparisons; per-cell verdicts/pins would write N conflicting triages).
   if (matrixModels !== undefined) {
+    // 0.6.0 §6.1 — resolve `$profile` refs and the `pool` spelling against the
+    // LOWERED ir (the flag parser ran before the spec was compiled, and the
+    // model-router grammar would have rejected `$fast` outright).
+    let matrixArms: MatrixArm[];
+    try {
+      matrixArms = resolveMatrixArms(matrixModels, ir);
+    } catch (err) {
+      if (err instanceof MatrixArgError) die(err.message);
+      throw err;
+    }
     return runEvalMatrixCommand({
       ir,
-      models: matrixModels,
+      models: matrixArms.map((a) => a.ref),
+      arms: matrixArms,
+      record: matrixRecord,
+      gateRequested,
+      promote,
+      specSource: absSpec,
       datasetName: dataset.name,
       samples: await collectSamples(dataset.samples),
       datasetHash,
@@ -9558,6 +9626,10 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
       // prices the --models est_$ column).
       ...(sampleTimeoutMs !== undefined ? { sampleTimeoutMs } : {}),
       ...(budgetUsd !== undefined ? { budgetUsd } : {}),
+      // 0.6.0 §6.1 — ROUTE the eval. Absent (or `static`) wires nothing at
+      // all, so an un-flagged run is byte-identical.
+      ...(evalRouting !== undefined ? { routing: evalRouting } : {}),
+      ...(warmArms ? { warmArms: true } : {}),
       pricing: defaultMatrixPricing(),
     },
   }).catch((err: unknown) => {
@@ -10022,6 +10094,16 @@ async function runEvalSuiteCommand(args: ParsedArgs): Promise<void> {
 async function runEvalMatrixCommand(opts: {
   readonly ir: Extract<ReturnType<typeof lower>, { target: "cli" }>;
   readonly models: ReadonlyArray<string>;
+  /** 0.6.0 §6.1 — the resolved arm behind each token (see `resolveMatrixArms`). */
+  readonly arms?: ReadonlyArray<MatrixArm>;
+  /** 0.6.0 §6.1 — `--record`: run every cell through `finishEvalRun` under its
+   *  OWN per-arm lineage (`spec::dataset::<armId>`). */
+  readonly record?: boolean;
+  /** `--gate` / `!--no-promote`, meaningful only under `--record`. */
+  readonly gateRequested?: boolean;
+  readonly promote?: boolean;
+  /** Resolved spec source path, for the recorded lineage's collision guard. */
+  readonly specSource?: string;
   readonly datasetName: string;
   readonly samples: ReadonlyArray<Sample>;
   readonly datasetHash: string;
@@ -10058,11 +10140,19 @@ async function runEvalMatrixCommand(opts: {
   // One pricing lookup for the cells' budget metering AND the est_$ column.
   const pricing = defaultMatrixPricing();
 
+  const armByRef = new Map((opts.arms ?? []).map((a) => [a.ref, a]));
+  // 0.6.0 §6.1 — under --record every cell keys its own per-arm lineage, so a
+  // gate failure in ANY cell must fail the command; collected here and raised
+  // after the matrix renders (a crashed cell is reported the same way).
+  const gateFailures: string[] = [];
+
   const cells = await runMatrixCells({
     models: opts.models,
     slugs: assignCellSlugs(opts.models),
+    ...(opts.arms !== undefined ? { arms: armByRef } : {}),
     rootDir,
-    runCell: async (model, cellOutDir) => {
+    runCell: async (token, cellOutDir, arm) => {
+      const model = arm?.model ?? token;
       const summary = await runEvalLib({
         ir: { ...opts.ir, agent: { ...opts.ir.agent, model } },
         dataset: { name: opts.datasetName, samples: makeAsyncIterable(opts.samples) },
@@ -10083,12 +10173,50 @@ async function runEvalMatrixCommand(opts: {
           // cell's budget cap meters through.
           ...(opts.sampleTimeoutMs !== undefined ? { sampleTimeoutMs: opts.sampleTimeoutMs } : {}),
           ...(opts.budgetUsd !== undefined ? { budgetUsd: opts.budgetUsd } : {}),
+          // 0.6.0 §6.1 — a cell pinned to a ROSTER member routes through the
+          // runner so it is measured with that candidate's own request params
+          // and `instructions` overlay. A bare model string that names nothing
+          // in the roster keeps the pre-0.6.0 path (the ir patch above is the
+          // whole pin) and its lineage is keyed per-arm by the recorder below.
+          ...(arm?.routing !== undefined ? { routing: arm.routing } : {}),
           pricing,
         },
       });
       // Same per-cell artifact set as a single-model run (results.json +
       // index.html), so `eval-report diff <cellA> <cellB>` works on any pair.
       writeFileSync(join(cellOutDir, "index.html"), renderReport(await loadRun(cellOutDir)).html);
+      // 0.6.0 §6.1 — `--record`: the cell joins the run-history index and its
+      // OWN baseline lineage. `baselineKeyV2` is what makes this safe — before
+      // it, N cells shared one `spec::dataset` key and the last one to finish
+      // owned the baseline.
+      if (opts.record === true) {
+        const cellCost = evalRunCost(summary, pricing);
+        const finish = await finishEvalRun({
+          summary,
+          specName: opts.ir.name,
+          ...(opts.specSource !== undefined ? { specSource: opts.specSource } : {}),
+          datasetHash: opts.datasetHash,
+          outDir: cellOutDir,
+          armId: arm?.armId ?? model,
+          routing: arm?.routing ?? (`candidate:${model}` as EvalRoutingMode),
+          gateRequested: opts.gateRequested === true,
+          promote: opts.promote !== false,
+          ...(cellCost.totalMicros !== undefined
+            ? { costUsd: cellCost.totalMicros / 1_000_000 }
+            : {}),
+          ...(cellCost.agentMicros !== undefined
+            ? { agentCostUsd: cellCost.agentMicros / 1_000_000 }
+            : {}),
+          ...(cellCost.judgeMicros !== undefined
+            ? { judgeCostUsd: cellCost.judgeMicros / 1_000_000 }
+            : {}),
+        });
+        if (finish.gateFailed) {
+          gateFailures.push(
+            `${arm?.armId ?? model}: ${finish.gateReason ?? "regression gate failed"}`,
+          );
+        }
+      }
       return summary;
     },
   });
@@ -10116,6 +10244,144 @@ async function runEvalMatrixCommand(opts: {
   if (crashed.length > 0) {
     const names = crashed.map((r) => r.model).join(", ");
     die(`eval --models: ${crashed.length}/${matrix.rows.length} cell(s) failed to run: ${names}`);
+  }
+  if (gateFailures.length > 0) {
+    die(`eval --models --gate: ${gateFailures.join("; ")}`);
+  }
+}
+
+/**
+ * 0.6.0 §6.1 (PR 12) — `crewhaus eval leaderboard <matrix-dir>`.
+ *
+ * The read-side companion to `eval --models … --record`: rank the arms, name
+ * a winner ONLY when the evidence supports one, and (optionally) export the
+ * measurement as routing priors. Entirely offline — it opens run directories
+ * and makes no model call — so it is safe to run in CI on every matrix.
+ *
+ * The refusal IS the feature (§16 Q7): `bestModels` takes a raw argmax, so a
+ * 61%-vs-60% split on twelve samples reads as a winner. This verb prints
+ * `TIE` or `UNDERPOWERED` with the reason instead, and writes the same
+ * verdict into `matrix.json`'s additive `verdict` block for whatever reads it
+ * next.
+ */
+async function runEvalLeaderboardCommand(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(EVAL_LEADERBOARD_USAGE);
+    return;
+  }
+  const rootArg = args.positional[0];
+  if (typeof rootArg !== "string") {
+    die(
+      "missing <matrix-dir> — the root of an `eval --models` run (the directory holding matrix.json)",
+    );
+  }
+  const rootDir = resolve(rootArg as string);
+  const minNFlag = args.flags["min-n"];
+  let minN: number | undefined;
+  if (typeof minNFlag === "string") {
+    const v = Number.parseInt(minNFlag, 10);
+    if (Number.isNaN(v) || v < 1) die(`invalid --min-n "${minNFlag}" — must be a positive integer`);
+    minN = v;
+  }
+  const seedFlag = args.flags["seed"];
+  let seed: number | undefined;
+  if (typeof seedFlag === "string") {
+    const v = Number.parseInt(seedFlag, 10);
+    if (Number.isNaN(v)) die(`invalid --seed "${seedFlag}" — must be an integer`);
+    seed = v;
+  }
+
+  const sources = discoverMatrixCells(rootDir);
+  const result = await loadLeaderboard(sources, {
+    loadRun,
+    pricing: defaultMatrixPricing(),
+    ...(minN !== undefined ? { minN } : {}),
+    ...(seed !== undefined ? { seed } : {}),
+  });
+
+  if (args.flags["json"] === true) {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          rows: result.rows,
+          verdict: result.board.verdict,
+          comparisons: result.board.comparisons,
+          excluded: result.board.excluded,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+  } else {
+    const table = leaderboardTable(result);
+    writeTable(table.header, table.rows);
+    for (const line of leaderboardLines(result)) process.stdout.write(`${line}\n`);
+    if (args.flags["pairwise"] === true) {
+      const pw = leaderboardPairwiseTable(result);
+      process.stdout.write("\n");
+      writeTable(pw.header, pw.rows);
+    }
+  }
+
+  // The verdict block rides back into the matrix artifacts, so whatever reads
+  // matrix.json next (Hangar, a dashboard, the next CLI) sees the same
+  // refusal the operator just read.
+  try {
+    writeLeaderboardArtifacts(rootDir, result);
+    process.stdout.write(`[eval] leaderboard verdict written to ${join(rootDir, "matrix.json")}\n`);
+  } catch (err) {
+    process.stderr.write(
+      `[eval] warning: could not update ${join(rootDir, "matrix.json")}: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
+
+  const exportPriors = args.flags["export-priors"];
+  if (typeof exportPriors === "string") {
+    const specFlag = args.flags["spec"];
+    const specFile = resolve(typeof specFlag === "string" ? specFlag : "crewhaus.yaml");
+    let ir: ReturnType<typeof lower>;
+    try {
+      ir = lower(parseSpec(readFileSync(specFile, "utf-8")));
+    } catch (err) {
+      if (err instanceof SpecParseError) die(err.message);
+      die(
+        `--export-priors needs the spec whose model_pool roster the priors are pinned to; could not read ${specFile}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+    const pool = ir.target === "cli" ? ir.agent.modelPool : undefined;
+    if (pool === undefined) {
+      die(
+        `--export-priors: ${specFile} declares no agent.model_pool — priors seed a POOL's learned policy, and a file pinned to no roster would be rejected at boot`,
+      );
+      return;
+    }
+    const priors = buildPriorsFile(result, {
+      candidates: pool.candidates,
+      ...(pool.objective !== undefined || pool.learning !== undefined
+        ? {
+            reward: {
+              ...(pool.objective !== undefined ? { objective: pool.objective } : {}),
+              ...(pool.learning?.costRefUsd !== undefined
+                ? { costRefUsd: pool.learning.costRefUsd }
+                : {}),
+              ...(pool.learning?.latencyRefMs !== undefined
+                ? { latencyRefMs: pool.learning.latencyRefMs }
+                : {}),
+            },
+          }
+        : {}),
+      generatedAt: new Date().toISOString(),
+      source: rootDir,
+    });
+    const priorsPath = resolve(exportPriors);
+    writePriorsFile(priorsPath, priors);
+    process.stdout.write(
+      `[eval] priors: ${priors.arms.length} arm entr(ies) → ${priorsPath} (reward units, pseudo-count <= ${MAX_PRIOR_PSEUDO_COUNT}, roster fingerprint ${priors.fingerprint})\n`,
+    );
+    process.stdout.write(
+      "[eval]   enable with `model_pool: { reward: { priors: eval } }` and copy the file to <harness>/.crewhaus/routing/priors.json\n",
+    );
   }
 }
 
@@ -10994,9 +11260,19 @@ function runEvalReportBaseline(args: ParsedArgs): void {
         );
         return;
       }
+      // 0.6.0 §6.1 — the `arm` column: baselines key on the LINEAGE, so a
+      // routed harness pins one row per arm beside the legacy pin. Without it
+      // two lineages of the same (spec, dataset) render as duplicate rows.
       writeTable(
-        ["spec", "dataset", "runId", "pinned_at", "outDir"],
-        pins.map((b) => [b.specName, b.datasetName, b.runId, b.ts, b.outDir]),
+        ["spec", "dataset", "arm", "runId", "pinned_at", "outDir"],
+        pins.map((b) => [
+          b.specName,
+          b.datasetName,
+          b.armId ?? (b.routing !== undefined && b.routing !== "static" ? "routed" : "-"),
+          b.runId,
+          b.ts,
+          b.outDir,
+        ]),
       );
       return;
     }
@@ -11031,10 +11307,24 @@ function runEvalReportBaseline(args: ParsedArgs): void {
         datasetHash: entry.datasetHash,
         ...(entry.gradersHash !== undefined ? { gradersHash: entry.gradersHash } : {}),
         ...(entry.judgeModel !== undefined ? { judgeModel: entry.judgeModel } : {}),
+        // 0.6.0 §6.1 — carry the LINEAGE columns forward too. `setBaseline`
+        // keys on `baselineKeyFor(lineageOfEntry(entry))`, so dropping them
+        // here would write a routed run's pin under the legacy
+        // `spec::dataset` key and clobber the primary's baseline with a cheap
+        // candidate's run. policyVersion/armsDigest ride along for the
+        // instrument guard, exactly as `finishEvalRun` and Hangar's pin do.
+        ...(entry.armId !== undefined ? { armId: entry.armId } : {}),
+        ...(entry.routing !== undefined ? { routing: entry.routing } : {}),
+        ...(entry.policyVersion !== undefined ? { policyVersion: entry.policyVersion } : {}),
+        ...(entry.armsDigest !== undefined ? { armsDigest: entry.armsDigest } : {}),
         ts: new Date().toISOString(),
       });
+      const armLabel =
+        entry.armId ?? (entry.routing !== undefined && entry.routing !== "static" ? "routed" : "");
       process.stdout.write(
-        `[eval-report] baseline set: ${entry.specName}/${entry.datasetName} → ${entry.runId}\n`,
+        `[eval-report] baseline set: ${entry.specName}/${entry.datasetName}${
+          armLabel === "" ? "" : `#${armLabel}`
+        } → ${entry.runId}\n`,
       );
       return;
     }
@@ -15875,6 +16165,10 @@ async function runFleet(args: ParsedArgs, action: string): Promise<void> {
       datasetName: e.datasetName,
       passRate: e.passRate,
       ts: e.ts,
+      // 0.6.0 §6.1 — a routed harness records one row per ARM; carry it so the
+      // fleet row says WHICH arm the last eval measured instead of reporting
+      // the cheap candidate's pass rate as the harness's.
+      ...(e.armId !== undefined ? { armId: e.armId } : {}),
     }));
 
   const deps: BuildInventoryDeps = { readManifest, readEvalIndex };
@@ -15923,39 +16217,14 @@ async function runFleet(args: ParsedArgs, action: string): Promise<void> {
         );
         return;
       }
-      // Eval health: the last run for a (spec, its pinned dataset) baseline
-      // held or beat the baseline's pass rate. No baseline yet → healthy (a
-      // fresh harness isn't "attention"); a last run below the pinned
-      // baseline → attention.
-      const readEvalHealth: EvalHealthReader = (evalsDir) => {
-        const runs = readEvalRunIndex(evalsDir);
-        if (runs.length === 0) return { healthy: true, note: "no runs recorded" };
-        const baselines = readBaselines(evalsDir);
-        const baselineList = Object.values(baselines);
-        if (baselineList.length === 0) {
-          return { healthy: true, note: `${runs.length} run(s), no baseline pinned` };
-        }
-        // Newest run per (spec, dataset), compared to the pinned baseline's run.
-        let regressed = false;
-        const notes: string[] = [];
-        for (const b of baselineList) {
-          const forKey = runs
-            .filter((r) => r.specName === b.specName && r.datasetName === b.datasetName)
-            .sort((x, y) => (x.ts < y.ts ? -1 : 1));
-          const latest = forKey[forKey.length - 1];
-          const baselineRun = runs.find((r) => r.runId === b.runId);
-          if (latest === undefined || baselineRun === undefined) continue;
-          if (latest.passRate < baselineRun.passRate) {
-            regressed = true;
-            notes.push(
-              `${b.datasetName} ${(latest.passRate * 100).toFixed(0)}% < baseline ${(baselineRun.passRate * 100).toFixed(0)}%`,
-            );
-          }
-        }
-        return regressed
-          ? { healthy: false, note: `below baseline: ${notes.join("; ")}` }
-          : { healthy: true, note: "all baselines held" };
-      };
+      // Eval health: the last run for a pinned baseline's LINEAGE held or beat
+      // that baseline's pass rate. No baseline yet → healthy (a fresh harness
+      // isn't "attention"); a last run below the pinned baseline → attention.
+      // 0.6.0 §6.1 — this file used to carry its own copy of the reader, which
+      // matched on (spec, dataset) alone and therefore graded a routed
+      // harness's cheap arm against the strong arm's baseline. There is one
+      // reader now, in `./harness-cmd`, and `harness list` wires the same one.
+      const { readEvalHealth } = await import("./harness-cmd");
       const health = [];
       for (const inv of rows) health.push(await buildHarnessHealth(inv, readEvalHealth));
       for (const line of formatHealth(health, root)) process.stdout.write(`${line}\n`);
@@ -21584,6 +21853,17 @@ switch (subcommand) {
       // named `plan.yaml` still runs an eval.
     } else if (evalFirst === "plan" && !isSpecFile(evalFirst)) {
       runEvalPlanCmd(parseFor(rest.slice(1), EVAL_PLAN_SCHEMA));
+      // 0.6.0 §6.1 — `eval leaderboard <matrix-dir>`: rank the arms of a
+      // recorded matrix and refuse a winner the evidence cannot support.
+      // Same is-it-a-spec-file guard, so a spec named `leaderboard.yaml`
+      // still runs an eval.
+    } else if (evalFirst === "leaderboard" && !isSpecFile(evalFirst)) {
+      try {
+        await runEvalLeaderboardCommand(parseFor(rest.slice(1), EVAL_LEADERBOARD_SCHEMA));
+      } catch (err) {
+        if (err instanceof CrewhausError) die(err.message);
+        throw err;
+      }
     } else if (aliasVerb !== undefined && !isSpecFile(evalFirst)) {
       process.stderr.write(
         `[eval] note: \`crewhaus eval ${evalFirst}\` is an alias for the canonical \`crewhaus eval-report ${aliasVerb}\`\n`,

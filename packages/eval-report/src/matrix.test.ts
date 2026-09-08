@@ -330,3 +330,60 @@ describe("formatUsd", () => {
     expect(formatUsd(0.00042)).toBe("$0.0004");
   });
 });
+
+// ---------------------------------------------------------------------------
+// 0.6.0 §6.1 — cost basis + the arm column
+// ---------------------------------------------------------------------------
+
+describe("buildMatrix — 0.6.0 additions", () => {
+  test("cost is projected from ALL trials, matching evalRunCost's basis", () => {
+    const base = makeRunSummary("run_aaaa1111aaaa1111", "m", [makeSampleResult("a", true, 1)]);
+    const repeated: EvalRunSummary = {
+      ...base,
+      aggregates: {
+        ...base.aggregates,
+        totalTokens: { input: 10, output: 20 },
+        // A --repeats 4 run: the REAL spend is four trials' tokens.
+        totalTokensAllTrials: { input: 40, output: 80 },
+      },
+    };
+    const seen: Array<{ input: number; output: number }> = [];
+    buildMatrix([{ model: "m", slug: "m", outDir: "/tmp/m", summary: repeated }], {
+      pricing: (_model, tokens) => {
+        seen.push(tokens);
+        return tokens.input + tokens.output;
+      },
+      now: () => new Date(0),
+    });
+    expect(seen).toEqual([{ input: 40, output: 80 }]);
+    // Without trials the basis is unchanged — a single-trial matrix is
+    // byte-identical to a pre-0.6.0 one.
+    const single: Array<{ input: number; output: number }> = [];
+    buildMatrix([{ model: "m", slug: "m", outDir: "/tmp/m", summary: base }], {
+      pricing: (_model, tokens) => {
+        single.push(tokens);
+        return 1;
+      },
+      now: () => new Date(0),
+    });
+    expect(single).toEqual([{ input: 10, output: 20 }]);
+  });
+
+  test("a cell's armId rides onto its row and is absent on a plain matrix", () => {
+    const summary = makeRunSummary("run_bbbb2222bbbb2222", "claude-haiku-4-5", [
+      makeSampleResult("a", true, 1),
+    ]);
+    const matrix = buildMatrix(
+      [
+        { model: "claude-haiku-4-5", armId: "fast", slug: "fast", outDir: "/tmp/f", summary },
+        { model: "claude-opus-4-7", slug: "opus", outDir: "/tmp/o", summary },
+      ],
+      { now: () => new Date(0) },
+    );
+    expect(matrix.rows[0]?.armId).toBe("fast");
+    expect(matrix.rows[1]?.armId).toBeUndefined();
+    // `best` is untouched — it stays the consumed artifact field it was.
+    expect(matrix.verdict).toBeUndefined();
+    expect(matrix.best.passRate).toEqual(["claude-haiku-4-5", "claude-opus-4-7"]);
+  });
+});

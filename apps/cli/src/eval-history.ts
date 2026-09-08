@@ -32,6 +32,20 @@
  *   sides of the diff would read the same file. That comparison is refused
  *   loudly (no gate verdict, no promotion) instead of reporting a vacuous
  *   `regressions=0 … gate: PASS`.
+ * - 0.6.0 §6.1 — ROUTED runs key their own lineage. `baselineKeyV2 =
+ *   spec::dataset::<armId | routed>` sits BESIDE the legacy `spec::dataset`
+ *   key (which `routing: static` keeps, so every baselines.json on disk stays
+ *   readable and gates exactly as before), and `policyVersion` / `armsDigest`
+ *   join the instrument guard rather than the key — a policy flip must
+ *   RE-BASELINE a lineage, never orphan it. One rule is specific to V2: when
+ *   the V2 key is absent but the legacy key is pinned, the run that CREATES
+ *   the lineage is neither gated nor pinned, because auto-pinning it as a
+ *   "first run" would let that very run satisfy `route promote --gate`. The
+ *   lineage's SECOND run pins (its first run is already a row in the index,
+ *   so the pin is no longer self-certifying) and is still ungated, flagged
+ *   `lineageSeeded` for the promote path — otherwise the condition could
+ *   never change and a per-arm lineage would be unestablishable on every
+ *   harness that ever ran a plain eval.
  * - NEW-HUNT-3 — a budget-aborted PARTIAL run is still appended to the
  *   index (marked `partial: true` so readers can tell its deflated
  *   passRate from a real one), but it is NEVER pinned or promoted as a
@@ -45,17 +59,22 @@
 import { resolve } from "node:path";
 import {
   type BaselineEntry,
+  type BaselineLineage,
   type LoadedRun,
   type ReportDiff,
   ReportError,
   type RunIndexEntry,
+  baselineKeyFor,
   diffReports,
-  getBaseline,
+  isLegacyLineage,
+  lineageOfEntry,
   loadRun,
+  readRunIndexLatest,
   recordEvalRun,
+  resolveBaseline,
   setBaseline,
 } from "@crewhaus/eval-report";
-import type { EvalRunSummary } from "@crewhaus/eval-runner";
+import type { EvalRoutingMode, EvalRunSummary } from "@crewhaus/eval-runner";
 import { type GateThresholds, type GateVerdict, gate } from "@crewhaus/regression-runner";
 
 export type FinishEvalOptions = {
@@ -99,6 +118,15 @@ export type FinishEvalOptions = {
   readonly maxCostUsd?: number;
   /** Absolute path to the new run's output directory. */
   readonly outDir: string;
+  /**
+   * 0.6.0 §6.1 — the ARM this run measured, when the caller knows it and the
+   * run's own manifest does not (a `--models` matrix cell pins its model by
+   * patching `agent.model`, so the runner routes `static`). Supplied fields
+   * win over `summary.config.routing`; absent ⇒ the run's own manifest
+   * decides, and an unrouted run keeps the legacy lineage.
+   */
+  readonly armId?: string;
+  readonly routing?: EvalRoutingMode;
   /** `--gate`: map a failing gate verdict to a non-zero exit. */
   readonly gateRequested: boolean;
   /** `!--no-promote`: allow baseline writes (initial pin + promotion). */
@@ -115,6 +143,14 @@ export type FinishEvalResult = {
   /** True only when `gateRequested` and the regression gate failed. */
   readonly gateFailed: boolean;
   readonly gateReason?: string;
+  /**
+   * 0.6.0 §6.1 — this run PINNED a per-arm lineage that had no baseline of
+   * its own (it is the lineage's second run, beside an older legacy pin). The
+   * lineage now exists and later runs gate against it normally, but nothing
+   * has yet been gated: `route promote --gate` must refuse a lineage whose
+   * baseline is its own only comparison.
+   */
+  readonly lineageSeeded?: boolean;
 };
 
 /**
@@ -144,6 +180,35 @@ export function abstainedSampleIds(prev: EvalRunSummary, next: EvalRunSummary): 
 }
 
 /**
+ * 0.6.0 §6.1 — the ROUTED instrument guard: the reason two runs cannot be
+ * compared because they routed off DIFFERENT arm snapshots (or under
+ * different pool policies), `undefined` when they are comparable.
+ *
+ * A side that carries no routing block never trips the guard — an unrouted
+ * history compares exactly as it did. Both halves are deliberately
+ * conservative: a missing digest on either side is "unknown", not "differs".
+ */
+export function routedInstrumentMismatch(
+  prev: EvalRunSummary,
+  next: EvalRunSummary,
+): string | undefined {
+  const a = prev.config.routing;
+  const b = next.config.routing;
+  if (a === undefined || b === undefined) return undefined;
+  if (a.armsDigest !== undefined && b.armsDigest !== undefined && a.armsDigest !== b.armsDigest) {
+    return `routed runs read different arm snapshots (armsDigest ${a.armsDigest} vs ${b.armsDigest}) — two arm snapshots are two different instruments, so these scores are not comparable`;
+  }
+  if (
+    a.policyVersion !== undefined &&
+    b.policyVersion !== undefined &&
+    a.policyVersion !== b.policyVersion
+  ) {
+    return `routed runs used different routing policies (policyVersion ${a.policyVersion} vs ${b.policyVersion}) — re-baseline the lineage instead of gating across the flip`;
+  }
+  return undefined;
+}
+
+/**
  * Strict gate between a baseline run and a new run. Wraps
  * `regression-runner`'s `gate()` with `regressionThreshold: 0` (any
  * pass-rate drop fails) and additionally fails on sample-level regressions
@@ -165,6 +230,30 @@ export function gateRuns(
   next: EvalRunSummary,
   thresholds: GateThresholds = {},
 ): GateVerdict {
+  // 0.6.0 §6.1 — two ROUTED runs that read different arm snapshots are two
+  // different instruments: the learned policy served different arms on
+  // different statistics, so a score delta between them says nothing about
+  // the agent. Refuse the comparison outright rather than reporting a verdict
+  // nobody can act on. `finishEvalRun`'s instrument guard normally catches
+  // this first and starts a new lineage; this is the belt for every other
+  // caller of the gate.
+  const digestMismatch = routedInstrumentMismatch(prev, next);
+  if (digestMismatch !== undefined) {
+    return {
+      verdict: "fail",
+      reason: digestMismatch,
+      report: {
+        passRateDelta: 0,
+        meanScoreDelta: 0,
+        p50LatencyDeltaMs: 0,
+        p95LatencyDeltaMs: 0,
+        regressions: [],
+        recoveries: [],
+        scoreShifts: [],
+        unchanged: 0,
+      },
+    };
+  }
   const abstained = abstainedSampleIds(prev, next);
   const stripAbstained = (run: EvalRunSummary): EvalRunSummary =>
     abstained.size === 0
@@ -238,6 +327,10 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     ...(opts.costUsd !== undefined ? { costUsd: opts.costUsd } : {}),
     ...(opts.agentCostUsd !== undefined ? { agentCostUsd: opts.agentCostUsd } : {}),
     ...(opts.judgeCostUsd !== undefined ? { judgeCostUsd: opts.judgeCostUsd } : {}),
+    // 0.6.0 §6.1 — the caller's lineage claim (a matrix cell's pinned arm),
+    // winning over whatever the run's own routing manifest says.
+    ...(opts.armId !== undefined ? { armId: opts.armId } : {}),
+    ...(opts.routing !== undefined ? { routing: opts.routing } : {}),
     outDir: absOut,
     ...(opts.evalsDir !== undefined ? { evalsDir: opts.evalsDir } : {}),
   });
@@ -278,15 +371,66 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
       // C30 — additive ops fields, mirroring the index entry.
       p95LatencyMs: summary.aggregates.p95LatencyMs,
       ...(opts.costUsd !== undefined ? { costUsd: opts.costUsd } : {}),
+      // 0.6.0 §6.1 — the lineage this pin belongs to (also what `setBaseline`
+      // keys on) plus the routed instrument guard, copied off the index entry
+      // so the pin and the row can never disagree about which arm they are.
+      ...(entry.armId !== undefined ? { armId: entry.armId } : {}),
+      ...(entry.routing !== undefined ? { routing: entry.routing } : {}),
+      ...(entry.policyVersion !== undefined ? { policyVersion: entry.policyVersion } : {}),
+      ...(entry.armsDigest !== undefined ? { armsDigest: entry.armsDigest } : {}),
       ts: entry.ts,
     };
     setBaseline(pin, opts.evalsDir);
     write(`[eval] baseline set: ${summary.runId} (${label})`);
   };
 
-  const baseline = getBaseline(specName, datasetName, opts.evalsDir);
+  // 0.6.0 §6.1 — resolve the baseline for THIS RUN'S lineage. An unrouted run
+  // resolves the legacy `spec::dataset` key exactly as before; a routed or
+  // arm-pinned run resolves `spec::dataset::<armId | routed>`, so a cheap
+  // candidate can never pin over the primary's baseline.
+  const lineage: BaselineLineage = {
+    specName,
+    datasetName,
+    ...(entry.armId !== undefined ? { armId: entry.armId } : {}),
+    ...(entry.routing !== undefined ? { routing: entry.routing } : {}),
+  };
+  const lineageLabel = isLegacyLineage(lineage)
+    ? `${specName}/${datasetName}`
+    : `${specName}/${datasetName}#${entry.armId ?? "routed"}`;
+  const lookup = resolveBaseline(lineage, opts.evalsDir);
+  const baseline = lookup.entry;
   if (baseline === undefined) {
-    pinCurrentRun(`first run for ${specName}/${datasetName}`);
+    // The one V2-specific rule (§6.1): a per-arm lineage that does not exist
+    // yet, alongside a legacy baseline that does, is NOT a "first run". Pinning
+    // the FIRST such run would let the very run that creates the lineage
+    // satisfy `route promote --gate`, and gating it against the unrouted pin
+    // would compare two different instruments.
+    //
+    // "Not a first run" is not "never a lineage", though: the rule refuses the
+    // run that CREATES the lineage, not the lineage itself. So the second run
+    // of the lineage pins — the index already holds the first run's row, so
+    // the pin is no longer self-certifying — while still returning
+    // `gateFailed: false` and flagging `lineageSeeded`, which the promote path
+    // reads to refuse a lineage whose baseline is its own only comparison.
+    // Without this the condition never changes (nothing else writes a V2 key),
+    // so `--gate` under `--record` would be a permanent no-op on every harness
+    // that ever ran a plain eval, and the "re-run" guidance would be false.
+    if (lookup.legacyPresent) {
+      const priorRuns = readRunIndexLatest(opts.evalsDir).filter(
+        (e) => e.runId !== summary.runId && baselineKeyFor(lineageOfEntry(e)) === lookup.key,
+      );
+      if (priorRuns.length === 0) {
+        write(
+          `[eval] new per-arm lineage ${lineageLabel} — recorded, not gated and not promotable (the legacy ${specName}/${datasetName} baseline measures a different instrument). Re-run to establish this arm's own baseline.`,
+        );
+        return { gateFailed: false };
+      }
+      pinCurrentRun(
+        `establishing ${lineageLabel} — run ${priorRuns.length + 1} of this lineage, not gated (the legacy ${specName}/${datasetName} baseline measures a different instrument)`,
+      );
+      return { gateFailed: false, lineageSeeded: true };
+    }
+    pinCurrentRun(`first run for ${lineageLabel}`);
     return { gateFailed: false };
   }
 
@@ -354,7 +498,19 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     judgeModel !== undefined &&
     baseline.judgeModel !== undefined &&
     baseline.judgeModel !== judgeModel;
-  if (gradersChanged || judgeChanged) {
+  // 0.6.0 §6.1 — the ROUTED half of the same guard: the arm snapshot the
+  // learned policy read, and the pool policy that read it. Both belong HERE
+  // and not in the key: a policy flip must re-baseline the lineage, never
+  // orphan it under a key nothing will ever pin again.
+  const armsChanged =
+    entry.armsDigest !== undefined &&
+    baseline.armsDigest !== undefined &&
+    baseline.armsDigest !== entry.armsDigest;
+  const policyChanged =
+    entry.policyVersion !== undefined &&
+    baseline.policyVersion !== undefined &&
+    baseline.policyVersion !== entry.policyVersion;
+  if (gradersChanged || judgeChanged || armsChanged || policyChanged) {
     warn(
       `[eval] warning: the measurement instrument changed since baseline ${baseline.runId} was pinned:`,
     );
@@ -364,10 +520,19 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     if (judgeChanged) {
       warn(`[eval]   judgeModel: ${baseline.judgeModel} → ${judgeModel}`);
     }
+    if (armsChanged) {
+      warn(`[eval]   armsDigest: ${baseline.armsDigest} → ${entry.armsDigest}`);
+      warn(
+        "[eval]   the two runs routed off DIFFERENT arm snapshots — two arm snapshots are two different instruments.",
+      );
+    }
+    if (policyChanged) {
+      warn(`[eval]   policyVersion: ${baseline.policyVersion} → ${entry.policyVersion}`);
+    }
     warn(
-      "[eval]   scores graded by different graders configs or judge models are not comparable — not gating this run against that baseline.",
+      "[eval]   scores graded by different graders configs or judge models, or routed off different arm snapshots or policies, are not comparable — not gating this run against that baseline.",
     );
-    write("[eval] graders/judge changed — starting new baseline lineage");
+    write("[eval] instrument changed — starting new baseline lineage");
     pinCurrentRun("new lineage");
     return { gateFailed: false };
   }

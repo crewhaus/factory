@@ -190,6 +190,57 @@ export function validatePatch(spec: Spec, patch: SpecPatch): void {
       `path ${formatPath(patch.path)} is not listed in OPTIMIZABLE_PATHS for target "${spec.target}"; add it to packages/spec-patch/src/index.ts if it's intended to be tunable`,
     );
   }
+  // 0.6.0 §6.1 — the block-level way around `OPTIMIZER_REFUSED_LEAVES`:
+  // `model_pool.learning` is whitelisted WHOLESALE (the advisor patches the
+  // block), so a patch at the block carrying a `seed` key would move a leaf
+  // the path check just refused. A routed eval pins that seed; a patch to it
+  // would produce a measured delta of guaranteed zero.
+  const moved = refusedBlockValueKey(spec, patch.path, patch.value);
+  if (moved !== undefined) {
+    throw new SpecPatchError(
+      `patch at ${formatPath(patch.path)} would change "${moved}", which is not optimizable: a routed eval PINS model_pool.learning.seed, so a patch to it measures a guaranteed-zero delta. Re-issue the block patch carrying the spec's existing seed (a block patch that PRESERVES it is fine).`,
+    );
+  }
+}
+
+/**
+ * The refused LEAF a block-level patch's value would CHANGE, when the patch
+ * lands on the parent block of an {@link OPTIMIZER_REFUSED_LEAVES} row.
+ *
+ * Deliberately "change", not "carry": `crewhaus advise`'s pool rules propose a
+ * whole-`learning`-block replace built by SPREADING the spec's current block,
+ * so a preserved seed must pass. Only adding, removing or altering the value
+ * is refused — the residual the path-level check cannot see.
+ */
+function refusedBlockValueKey(
+  spec: Spec,
+  path: ReadonlyArray<SpecEditPathSegment>,
+  value: unknown,
+): string | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const segs = path.map((s) => String(s));
+  for (const pattern of OPTIMIZER_REFUSED_LEAVES) {
+    const parent = pattern.slice(0, -1);
+    const leaf = pattern[pattern.length - 1] as string;
+    const endsWithParent =
+      segs.length >= parent.length &&
+      parent.every((p, i) => segs[segs.length - parent.length + i] === p);
+    if (!endsWithParent) continue;
+    const proposed = (value as Record<string, unknown>)[leaf];
+    const current = readSpecPath(spec, [...path, leaf]);
+    if (proposed !== current) return `${segs.join(".")}.${leaf}`;
+  }
+  return undefined;
+}
+
+/** Read a plain path out of a parsed spec. `undefined` for any missing segment. */
+function readSpecPath(spec: Spec, path: ReadonlyArray<SpecEditPathSegment>): unknown {
+  let cur: unknown = spec;
+  for (const seg of path) {
+    if (cur === null || typeof cur !== "object") return undefined;
+    cur = (cur as Record<string, unknown>)[String(seg)];
+  }
+  return cur;
 }
 
 function formatPath(path: ReadonlyArray<string>): string {
@@ -606,10 +657,11 @@ export const OPTIMIZABLE_PATHS: Readonly<
     // learning tunes selection within the declared set, never the set.
     // 0.6.0 §10.3 — the exact pool entries (policy/routing/learning plus the
     // hybrid dials); see `poolDials`. `["agent","model_pool","routing"]` and
-    // `["agent","model_pool","learning"]` stay WHOLESALE — the plan's
-    // `learning.seed` exclusion is therefore not enforced by this table (a
-    // narrower entry would break `advise`'s scoreboard mining); it is
-    // documented as an accepted gap until the eval runner (PR 12) needs it.
+    // `["agent","model_pool","learning"]` stay WHOLESALE — a narrower
+    // enumeration would break `advise`'s scoreboard mining, which patches the
+    // `learning` BLOCK. §6.1's `learning.seed` exclusion is therefore enforced
+    // beside this table rather than inside it: see OPTIMIZER_REFUSED_LEAVES
+    // (PR 12 closed the gap PR 19 documented).
     ...poolDials(AGENT),
     // 0.6.0 §10.3 — `agent.temperature`: a threshold-shaped leaf like the
     // existing params (exclusive with `thinking` on one block — the spec
@@ -1301,10 +1353,47 @@ export function wildcardPlacementIssues(
  * Exported so every consumer shares one matcher — a hand-rolled prefix copy
  * would neither honour the wildcard nor close the structural leak.
  */
+/**
+ * 0.6.0 §6.1 (PR 12) — the leaves the whitelist admits BY PREFIX but the
+ * optimizer must never move, matched as a contiguous sub-sequence anywhere in
+ * a path (the {@link HUMAN_OWNED_PATHS} matcher) and ENFORCED by
+ * {@link isOptimizable}.
+ *
+ * There is exactly one row, and it exists because `model_pool.learning` is
+ * deliberately whitelisted WHOLESALE: `crewhaus advise` mines the reward
+ * scoreboard into that block and patches it AS a block, so a narrower
+ * enumeration would break the advisor. PR 19 shipped the verdict table with
+ * the `learning.seed` exclusion documented as an accepted gap "until the eval
+ * runner (PR 12) needs it"; it needs it now — a routed eval PINS
+ * `learning.seed`, so an optimizer free to patch the seed could produce a
+ * measured delta of guaranteed zero, the one mutation that always "wins"
+ * because it changes nothing the measurement can see.
+ *
+ * This is an enforcement narrower than the whitelist, NOT a second
+ * classification: the `learning` BLOCK stays legitimately optimizable (which
+ * is what §10.3's verdict table and its closing-invariant test record), and
+ * `validatePatch` additionally refuses a block patch that would CHANGE the
+ * seed — a block patch that preserves it, as the advisor's spread does,
+ * passes.
+ */
+export const OPTIMIZER_REFUSED_LEAVES: ReadonlyArray<ReadonlyArray<string>> = Object.freeze([
+  Object.freeze(["model_pool", "learning", "seed"]),
+]);
+
+/** True when `path` contains one of {@link OPTIMIZER_REFUSED_LEAVES} as a contiguous run. */
+function isRefusedLeaf(path: ReadonlyArray<SpecEditPathSegment>): boolean {
+  const segs = path.map((s) => String(s));
+  return OPTIMIZER_REFUSED_LEAVES.some((pattern) =>
+    segs.some((_s, i) => pattern.every((p, j) => segs[i + j] === p)),
+  );
+}
+
 export function isOptimizable(
   target: Spec["target"],
   path: ReadonlyArray<SpecEditPathSegment>,
 ): boolean {
+  // 0.6.0 §6.1 — the enforced refusals win over every admission rule below.
+  if (isRefusedLeaf(path)) return false;
   const allowed = OPTIMIZABLE_PATHS[target];
   if (allowed === undefined || path.length === 0) return false;
   for (const ok of allowed) {

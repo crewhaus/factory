@@ -304,6 +304,44 @@ describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
     expect((await runCli(["eval-report", "baseline", "show"], root)).exitCode).toBe(0);
   });
 
+  test("baseline set pins a ROUTED run under its own lineage key, not the legacy one", async () => {
+    // 0.6.0 §6.1 — `setBaseline` keys on the entry's lineage, so a manual pin
+    // that dropped armId/routing would write a cheap arm's run under
+    // `concierge::smoke` and clobber the primary's baseline.
+    const root = newTempRoot();
+    const evalsDir = join(root, ".crewhaus", "evals");
+    mkdirSync(evalsDir, { recursive: true });
+    const routed = JSON.parse(indexEntry("run_fast1111fast1111")) as Record<string, unknown>;
+    writeFileSync(
+      join(evalsDir, "index.jsonl"),
+      `${indexEntry("run_prim1111prim1111")}${JSON.stringify({
+        ...routed,
+        armId: "fast",
+        routing: "candidate:$fast",
+        policyVersion: "pv_abc",
+        armsDigest: "aaaa",
+      })}\n`,
+    );
+    // The primary's legacy pin, written first.
+    expect(
+      (await runCli(["eval-report", "baseline", "set", "run_prim1111prim1111"], root)).exitCode,
+    ).toBe(0);
+    expect(
+      (await runCli(["eval-report", "baseline", "set", "run_fast1111fast1111"], root)).exitCode,
+    ).toBe(0);
+    const baselines = JSON.parse(readFileSync(join(evalsDir, "baselines.json"), "utf-8"));
+    expect(baselines["arm|concierge::smoke::fast"]).toMatchObject({
+      runId: "run_fast1111fast1111",
+      armId: "fast",
+      routing: "candidate:$fast",
+      policyVersion: "pv_abc",
+      armsDigest: "aaaa",
+    });
+    // The primary's baseline is exactly where it was.
+    expect(baselines["concierge::smoke"]?.runId).toBe("run_prim1111prim1111");
+    expect((await runCli(["eval-report", "baseline", "show"], root)).exitCode).toBe(0);
+  });
+
   test("baseline set rejects a runId absent from the index", async () => {
     const root = newTempRoot();
     const result = await runCli(["eval-report", "baseline", "set", "run_ffff9999ffff9999"], root);

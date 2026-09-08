@@ -5,9 +5,10 @@ import type { JudgeUsageSink } from "@crewhaus/eval-judge";
 import type { Event as TranscriptEvent } from "@crewhaus/event-log";
 import type { RunContext } from "@crewhaus/run-context";
 import type { runChatLoop } from "@crewhaus/runtime-core";
-import type { TraceEvent } from "@crewhaus/trace-event-bus";
+import type { ModelRole, TraceEvent } from "@crewhaus/trace-event-bus";
 import type { CalibrationAggregates } from "./calibration-abstention";
 import type { ParaphraseConsistencySummary } from "./paraphrase-consistency";
+import type { CapturedRouteObservation, EvalRoutingMode } from "./routing";
 import type { SemanticFallbackSummary } from "./semantic-fallback";
 import type { ToolReplayMissPolicy } from "./tool-record";
 
@@ -116,6 +117,105 @@ export type TrialResult = {
   readonly retried?: boolean;
 };
 
+/**
+ * 0.6.0 §6.1 — one model that ACTUALLY served during a sample, keyed by
+ * (wire model, spec model, profile, role, stage).
+ *
+ * `SampleResult.model` stays the CONFIGURED model for compatibility; this is
+ * what answered. The list is deliberately not collapsed to one entry per
+ * model: a cascade turn serves more than one model per sample (a draft rung
+ * and an escalation rung), and per-arm lineage must be able to count the
+ * draft arm's judged quality without double-counting the escalation. An
+ * absent `role` reads as `"primary"` (the main turn).
+ */
+export type ServedModel = {
+  /** WIRE model id the provider was called with. */
+  readonly wire: string;
+  /** Original spec model string when it differs from {@link wire}. */
+  readonly specModel?: string;
+  /** `models:` profile the serving candidate was declared under, when any. */
+  readonly profile?: string;
+  /** Purpose of the calls (absent ⇒ the main turn). */
+  readonly role?: ModelRole;
+  /** Hybrid-strategy stage (`"draft"`, `"escalation"`, …) when the calls belong to one. */
+  readonly stage?: string;
+  readonly calls: number;
+  readonly tokens: { readonly input: number; readonly output: number };
+};
+
+/**
+ * 0.6.0 §6.1 — one `model_route` decision a routed sample made, as persisted
+ * in `meta.json`. Only replayable fields ride along (nothing derived from
+ * wall-clock or a per-run id), so `eval --routing as-declared` twice with the
+ * same seed yields IDENTICAL route lines.
+ */
+export type EvalRouteDecision = {
+  readonly routeKey: string;
+  /** The scoreboard ARM id: the profile name, else the spec model string. */
+  readonly arm: string;
+  /** Wire model id the arm resolved to. */
+  readonly model: string;
+  readonly policy: string;
+  readonly reason: string;
+  readonly explored?: boolean;
+  readonly stage?: string;
+  readonly scope?: string;
+  readonly ruleId?: string;
+  readonly policyVersion?: string;
+  readonly backedOffTo?: string;
+};
+
+/**
+ * 0.6.0 §6.1 — how a run was ROUTED, recorded on `EvalRunSummary.config` so
+ * a results.json read on its own says which arm (and which arm snapshot) it
+ * measured. Absent on `routing: "static"` runs and on results persisted by
+ * older CLIs, so an unrouted run's manifest stays byte-identical.
+ */
+export type EvalRoutingConfig = {
+  readonly mode: EvalRoutingMode;
+  /** The arm this run measured; absent under `as-declared` (many arms serve). */
+  readonly armId?: string;
+  /**
+   * Digest of the FROZEN arm snapshot the run routed on — the instrument
+   * identity. Two runs with different digests are two different instruments
+   * and are never gated against each other.
+   */
+  readonly armsDigest?: string;
+  /** `--warm-arms`: the snapshot was seeded from the harness's live arms. */
+  readonly warmArms?: boolean;
+  /**
+   * The live `arms.jsonl` CHANGED while this run was in flight (re-read at
+   * run end). The measurement itself is unaffected — the snapshot was frozen
+   * — but the harness the digest names is no longer the harness on disk.
+   */
+  readonly armsMutated?: boolean;
+  /** The `model_pool.learning.seed` in force (spec-declared, else the eval seed). */
+  readonly learningSeed?: string;
+  /** The pool fingerprint the run's decisions carried, when they agreed on one. */
+  readonly policyVersion?: string;
+  /**
+   * 0.6.0 §6.1 — every sample routed to the SAME arm on an `as-declared` run
+   * over a multi-arm roster, so the run measured one candidate rather than
+   * what production serves. A cold snapshot answers n=0 for every arm (the
+   * learned policy then keeps the first under-sampled candidate), and a warm
+   * one draws on `(seed, turnIndex, …)`, identical for every single-turn
+   * sample. Absent unless the degeneracy actually happened.
+   */
+  readonly degenerate?: boolean;
+  /** The single arm a {@link degenerate} run routed everything to. */
+  readonly degenerateArm?: string;
+  /**
+   * 0.6.0 §6.1 — what the run WOULD have written to the live scoreboard. The
+   * frozen board's `record()` is a no-op sink so a measurement can never move
+   * a production harness's learned policy; the observations it was handed are
+   * the run's per-arm reward/quality signal, and they are captured here
+   * rather than discarded.
+   */
+  readonly observations?: ReadonlyArray<CapturedRouteObservation>;
+  /** Arms the run tried to mark ungraded, captured the same way. */
+  readonly ungraded?: ReadonlyArray<{ readonly routeKey: string; readonly arm: string }>;
+};
+
 export type SampleResult = {
   readonly sampleId: string;
   readonly sessionId: string;
@@ -125,6 +225,18 @@ export type SampleResult = {
   readonly turns: number;
   readonly tokens: { input: number; output: number };
   readonly model: string;
+  /**
+   * 0.6.0 §6.1 — the models that ACTUALLY served this sample, per role and
+   * stage (see {@link ServedModel}). Present only on routed runs that
+   * captured `model_response` events; absent on `routing: "static"` runs and
+   * on results persisted by older CLIs.
+   */
+  readonly servedModels?: ReadonlyArray<ServedModel>;
+  /**
+   * 0.6.0 §6.1 — the sample's `model_route` decisions, in order. Present
+   * only when the sample actually routed a pool.
+   */
+  readonly routes?: ReadonlyArray<EvalRouteDecision>;
   readonly agentOutput: string;
   /**
    * B13 — the dataset sample's `metadata`, carried verbatim into the result
@@ -347,6 +459,15 @@ export type EvalAggregates = {
    * judge-less runs byte-identical.
    */
   readonly judgeUsage?: JudgeUsage;
+  /**
+   * 0.6.0 §6.1 — every model that ACTUALLY served the run, folded across the
+   * canonical samples (per wire model / profile / role / stage — see
+   * {@link ServedModel}). The run-level answer to "what did this eval
+   * measure?" when the run routed a pool: `config.model` names what was
+   * CONFIGURED, this names what answered. Present only on routed runs,
+   * keeping unrouted runs' results.json byte-identical.
+   */
+  readonly servedModels?: ReadonlyArray<ServedModel>;
 };
 
 /**
@@ -573,6 +694,9 @@ export type EvalRunSummary = {
      *  `--record-tools` or `--replay-tools` was given (absent otherwise —
      *  see {@link EvalToolRecordingConfig}). */
     readonly toolRecording?: EvalToolRecordingConfig;
+    /** 0.6.0 §6.1 — how the run was routed (see {@link EvalRoutingConfig}).
+     *  Absent on `routing: "static"` runs. */
+    readonly routing?: EvalRoutingConfig;
   };
   readonly outDir: string;
 };
@@ -770,6 +894,33 @@ export type RunEvalOptions = {
    * adapter with no process-global `mock.module` involved.
    */
   readonly judgeAdapter?: ProviderAdapter;
+  /**
+   * 0.6.0 §6.1 — ROUTE the eval (`crewhaus eval --routing`). Default
+   * `"static"`: the configured `agent.model`, no pool, no scoreboard —
+   * byte-identical to a pre-0.6.0 run. `"as-declared"` wires the spec's own
+   * `model_pool` / `model_tiers` / `model_fallbacks` so the eval measures
+   * what production serves; `"candidate:<$profile|model>"` pins one roster
+   * member and measures that arm alone.
+   *
+   * EVERY routed mode pins `model_pool.learning.seed` (spec-declared wins,
+   * else the eval seed) and routes off a FROZEN arm snapshot injected
+   * through runtime-core's `_scoreboard` seam, so the run records nothing
+   * into the harness's learned policy and two runs of the same seed make
+   * identical draws. See `routing.ts`.
+   */
+  readonly routing?: EvalRoutingMode;
+  /**
+   * 0.6.0 §6.1 — seed the frozen arm snapshot from the harness's LIVE
+   * `arms.jsonl` (`--warm-arms`) instead of starting cold. The run still
+   * records nothing; the live file is re-read at run end so a mutation
+   * mid-run is reported rather than silently folded into the measurement.
+   */
+  readonly warmArms?: boolean;
+  /**
+   * Where `--warm-arms` reads `routing/arms.jsonl` from. Defaults to
+   * `<cwd>/.crewhaus`, the root a `crewhaus run` harness writes.
+   */
+  readonly routingRootDir?: string;
 };
 
 /** The chat-loop seam under {@link RunEvalOptions.chatLoop}. */

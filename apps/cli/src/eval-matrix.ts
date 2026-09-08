@@ -5,12 +5,20 @@
  * graders once per model, each cell writing a full run directory to
  * `<out>/<model-slug>/` so `eval-report diff` works on any pair of cells.
  *
- * Deliberate non-interactions with the item-3 run-history features:
- * matrix cells are model comparisons, not lineage runs — they never touch
- * `finishEvalRun` (index append / baseline pin / gate / promote), because a
- * shared (spec, dataset) baseline key across N models would corrupt the
- * lineage. `--gate` / `--no-promote` are rejected up front for the same
- * reason (see {@link assertMatrixFlagsCompatible}).
+ * 0.6.0 §6.1 (PR 12) — matrix cells BECOME recordable. Until now they never
+ * touched `finishEvalRun` (index append / baseline pin / gate / promote)
+ * because a shared `spec::dataset` baseline key across N models would corrupt
+ * the lineage — a real constraint, and `baselineKeyV2` is what removes it:
+ * with `--record`, each cell keys its own `spec::dataset::<armId>` lineage, so
+ * `--models pool --record` indexes `…::fast` and `…::strong` separately and a
+ * cheap candidate can never pin over the primary's baseline. `--gate` /
+ * `--no-promote` are therefore legal UNDER `--record` and rejected without it
+ * (see {@link assertMatrixFlagsCompatible}).
+ *
+ * `--models` also learns two 0.6.0 spellings, both resolved against the
+ * lowered IR AFTER the grammar validator (which would otherwise reject `$fast`
+ * outright): `$<profile>` names a `models:` registry entry, and the bare word
+ * `pool` expands to every routable `model_pool` candidate.
  *
  * Kept in a side-effect-free module (the CLI entry file runs an argv
  * switch on import) mirroring `eval-history.ts` / `datasets.ts`: the
@@ -21,7 +29,14 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { DEFAULT_PRICING, computeCostMicros, resolvePricing } from "@crewhaus/cost-tracker";
 import type { MatrixCell, MatrixPricingFn } from "@crewhaus/eval-report";
-import type { EvalRunSummary } from "@crewhaus/eval-runner";
+import {
+  type EvalRoutingMode,
+  type EvalRunSummary,
+  candidateArmId,
+  rosterRefs,
+} from "@crewhaus/eval-runner";
+import type { IrV0 } from "@crewhaus/ir";
+import { PROFILE_NAME_RE } from "@crewhaus/model-plan";
 import { parseModelString } from "@crewhaus/model-router";
 
 /** Thrown on a malformed `--models` value or an incompatible flag combo.
@@ -33,11 +48,26 @@ export class MatrixArgError extends Error {
 
 // -------- flag parsing / validation --------
 
+/** The `--models pool` spelling: expand the spec's own `model_pool` roster. */
+export const MATRIX_POOL_TOKEN = "pool";
+
 /**
  * Parse `--models m1,m2,...`: split on commas, trim whitespace, drop empty
- * segments (trailing-comma tolerance), reject duplicates, and validate
- * every entry against the model-router grammar UP FRONT — a typo must fail
- * before cell 1 burns a single token.
+ * segments (trailing-comma tolerance), reject duplicates, and validate every
+ * entry UP FRONT — a typo must fail before cell 1 burns a single token.
+ *
+ * Three token shapes are accepted. A plain model string is validated against
+ * the model-router grammar exactly as before. `$<profile>` is validated
+ * against the profile-name grammar ONLY — it names a `models:` registry entry
+ * and is resolved to a model later, against the lowered IR
+ * ({@link resolveMatrixArms}), because this parser runs before the spec is
+ * compiled and the grammar validator would reject `$fast` outright. The bare
+ * word `pool` expands to the whole roster and therefore cannot be mixed with
+ * anything else.
+ *
+ * Documentation must quote `$refs` on a shell command line
+ * (`--models '$fast,$strong'`) — an unquoted `$fast` is expanded away by the
+ * shell before the CLI ever sees it.
  */
 export function parseModelsFlag(value: string): string[] {
   const models = value
@@ -46,8 +76,16 @@ export function parseModelsFlag(value: string): string[] {
     .filter((m) => m.length > 0);
   if (models.length === 0) {
     throw new MatrixArgError(
-      "--models: expected a comma-separated list of model strings (e.g. claude-sonnet-5,openai/gpt-4o)",
+      "--models: expected a comma-separated list of model strings, $profile refs, or the word `pool` (e.g. claude-sonnet-5,openai/gpt-4o or '$fast,$strong')",
     );
+  }
+  if (models.includes(MATRIX_POOL_TOKEN)) {
+    if (models.length > 1) {
+      throw new MatrixArgError(
+        "--models pool expands to the spec's whole model_pool roster and cannot be combined with other entries",
+      );
+    }
+    return models;
   }
   const seen = new Set<string>();
   for (const model of models) {
@@ -55,6 +93,15 @@ export function parseModelsFlag(value: string): string[] {
       throw new MatrixArgError(`--models: duplicate model "${model}"`);
     }
     seen.add(model);
+    if (model.startsWith("$")) {
+      const name = model.slice(1);
+      if (!PROFILE_NAME_RE.test(name)) {
+        throw new MatrixArgError(
+          `--models: "${model}" is not a valid profile reference — a models: profile name is lowercase [a-z][a-z0-9_-]{0,63}`,
+        );
+      }
+      continue;
+    }
     try {
       parseModelString(model);
     } catch (err) {
@@ -66,22 +113,119 @@ export function parseModelsFlag(value: string): string[] {
 }
 
 /**
- * `--gate` / `--no-promote` steer the item-3 baseline lineage, which matrix
- * cells skip entirely — reject the combination instead of silently ignoring
- * the flags.
+ * One resolved matrix cell: which model runs, which ARM its history keys on,
+ * and how the runner should route it.
+ */
+export type MatrixArm = {
+  /** The `--models` token as typed (`$fast`, `claude-haiku-4-5`). */
+  readonly ref: string;
+  /** The model the cell's agent runs on. */
+  readonly model: string;
+  /** The arm the cell's lineage keys on: the profile name, else the model string. */
+  readonly armId: string;
+  /**
+   * The `RunEvalOptions.routing` value the cell runs under. Set only when the
+   * ref resolves to a ROSTER member, so the runner honours that candidate's
+   * own request params and `instructions` overlay; a bare model string that
+   * names nothing in the roster keeps the pre-0.6.0 path (the cell patches
+   * `agent.model` and the runner routes `static`), and its lineage is still
+   * keyed per-arm by the recorder.
+   */
+  readonly routing?: EvalRoutingMode;
+};
+
+/**
+ * Resolve parsed `--models` tokens against the lowered IR. `pool` expands the
+ * roster; `$profile` resolves through the pool's candidates first (so a
+ * profile used as a candidate keeps that candidate's settings) and then the
+ * `models:` registry. A ref that resolves to nothing is a loud error naming
+ * what IS declared — never a silent fall-through to "treat it as a model
+ * string", which would run the wrong model under the right-looking name.
+ */
+export function resolveMatrixArms(tokens: ReadonlyArray<string>, ir: IrV0): MatrixArm[] {
+  if (tokens.length === 1 && tokens[0] === MATRIX_POOL_TOKEN) {
+    const pool = ir.agent.modelPool;
+    const candidates = (pool?.candidates ?? []).filter((c) => c.enabled !== false);
+    if (candidates.length === 0) {
+      throw new MatrixArgError(
+        `--models pool: spec "${ir.name}" declares no model_pool candidates — name the models explicitly, or add a model_pool: block`,
+      );
+    }
+    return candidates.map((c) => {
+      const armId = candidateArmId(c);
+      const ref = c.profile !== undefined ? `$${c.profile}` : c.model;
+      return { ref, model: c.model, armId, routing: `candidate:${ref}` as EvalRoutingMode };
+    });
+  }
+  const arms: MatrixArm[] = [];
+  for (const token of tokens) {
+    if (!token.startsWith("$")) {
+      const candidate = (ir.agent.modelPool?.candidates ?? []).find(
+        (c) => c.model === token && c.enabled !== false,
+      );
+      arms.push({
+        ref: token,
+        model: token,
+        armId: candidate !== undefined ? candidateArmId(candidate) : token,
+        ...(candidate !== undefined ? { routing: `candidate:${token}` as EvalRoutingMode } : {}),
+      });
+      continue;
+    }
+    const name = token.slice(1);
+    const profile =
+      (ir.agent.modelPool?.candidates ?? []).find(
+        (c) => c.profile === name && c.enabled !== false,
+      ) ?? ir.models?.[name];
+    if (profile === undefined) {
+      const known = rosterRefs(ir);
+      throw new MatrixArgError(
+        `--models: no models: profile or model_pool candidate named "${name}" in spec "${ir.name}"${
+          known.length > 0 ? ` (declared: ${known.join(", ")})` : ""
+        }`,
+      );
+    }
+    arms.push({
+      ref: token,
+      model: profile.model,
+      armId: name,
+      routing: `candidate:${token}` as EvalRoutingMode,
+    });
+  }
+  const seenArms = new Set<string>();
+  for (const arm of arms) {
+    if (seenArms.has(arm.armId)) {
+      throw new MatrixArgError(
+        `--models: two entries resolve to the same arm "${arm.armId}" — each cell must key its own lineage`,
+      );
+    }
+    seenArms.add(arm.armId);
+  }
+  return arms;
+}
+
+/**
+ * `--gate` / `--no-promote` steer the run-history baseline lineage. Until
+ * 0.6.0 matrix cells skipped that lineage entirely, so both flags were
+ * rejected outright; `--record` (§6.1) is what makes them meaningful — each
+ * cell then keys its OWN `spec::dataset::<armId>` lineage through
+ * `finishEvalRun`, so gating and promotion mean exactly what they mean on a
+ * single-model run. Without `--record` the old refusal stands, reworded to
+ * name the flag that lifts it.
  */
 export function assertMatrixFlagsCompatible(flags: {
   readonly gate: boolean;
   readonly noPromote: boolean;
+  readonly record?: boolean;
 }): void {
+  if (flags.record === true) return;
   if (flags.gate) {
     throw new MatrixArgError(
-      "--models is incompatible with --gate — matrix cells are model comparisons and skip the (spec, dataset) baseline lineage; gate a single-model eval instead",
+      "--models --gate needs --record — without it matrix cells are one-off model comparisons that never touch a baseline lineage, so there is nothing to gate against. Add --record to key each cell its own per-arm lineage (spec::dataset::<arm>), or gate a single-model eval instead",
     );
   }
   if (flags.noPromote) {
     throw new MatrixArgError(
-      "--models is incompatible with --no-promote — matrix cells never touch the run index or baselines, so there is nothing to promote",
+      "--models --no-promote needs --record — without it matrix cells never touch the run index or baselines, so there is nothing to promote. Add --record to key each cell its own per-arm lineage",
     );
   }
 }
@@ -149,15 +293,27 @@ export function defaultMatrixPricing(): MatrixPricingFn {
 // -------- cell loop (failure isolation) --------
 
 export type RunMatrixCellsOptions = {
+  /**
+   * One entry per cell, in run order. These are the `--models` TOKENS: a
+   * plain model string, or (0.6.0) a `$profile` ref whose model comes from
+   * {@link arms}.
+   */
   readonly models: ReadonlyArray<string>;
-  /** model → cell directory name (see {@link assignCellSlugs}). */
+  /** token → cell directory name (see {@link assignCellSlugs}). */
   readonly slugs: ReadonlyMap<string, string>;
+  /**
+   * 0.6.0 §6.1 — token → the resolved {@link MatrixArm}: the model the cell
+   * runs and the ARM its lineage keys on. Absent (a plain `--models a,b`
+   * matrix) ⇒ every token IS its model and no cell carries an arm id, exactly
+   * as before.
+   */
+  readonly arms?: ReadonlyMap<string, MatrixArm>;
   /** Matrix root; each cell runs in `<rootDir>/<slug>`. */
   readonly rootDir: string;
   /** Execute one cell's eval and return its summary. Injected so tests can
    *  stub the runner; the CLI passes a `runEval` wrapper that patches the
    *  lowered ir's `agent.model` in-memory (mirroring `run --model`). */
-  readonly runCell: (model: string, cellOutDir: string) => Promise<EvalRunSummary>;
+  readonly runCell: (model: string, cellOutDir: string, arm?: MatrixArm) => Promise<EvalRunSummary>;
   /** Line sink; defaults to stdout. */
   readonly write?: (line: string) => void;
 };
@@ -262,19 +418,26 @@ export function cellCrashReason(summary: EvalRunSummary): string | undefined {
 export async function runMatrixCells(opts: RunMatrixCellsOptions): Promise<MatrixCell[]> {
   const write = opts.write ?? ((line: string) => process.stdout.write(`${line}\n`));
   const cells: MatrixCell[] = [];
-  for (const model of opts.models) {
-    const slug = opts.slugs.get(model) ?? modelSlug(model);
+  for (const token of opts.models) {
+    const arm = opts.arms?.get(token);
+    // The CELL's model is a real model string (pricing and the report key on
+    // it); the token is what the operator typed and what names the directory.
+    const model = arm?.model ?? token;
+    const armFields = arm !== undefined ? { armId: arm.armId } : {};
+    const slug = opts.slugs.get(token) ?? modelSlug(token);
     const outDir = join(opts.rootDir, slug);
-    write(`[eval] cell ${model} → ${outDir}`);
+    write(
+      `[eval] cell ${token}${arm !== undefined && arm.ref !== model ? ` (${model})` : ""} → ${outDir}`,
+    );
     try {
-      const summary = await opts.runCell(model, outDir);
+      const summary = await opts.runCell(token, outDir, arm);
       const crashed = cellCrashReason(summary);
       if (crashed !== undefined) {
-        cells.push({ model, slug, outDir, error: crashed });
+        cells.push({ model, ...armFields, slug, outDir, error: crashed });
         write(`[eval]   cell FAILED (${crashed}) — continuing with remaining models`);
         continue;
       }
-      cells.push({ model, slug, outDir, summary });
+      cells.push({ model, ...armFields, slug, outDir, summary });
       write(
         `[eval]   pass_rate=${(summary.aggregates.passRate * 100).toFixed(1)}% ` +
           `mean_score=${summary.aggregates.meanScore.toFixed(3)} ` +
@@ -282,7 +445,7 @@ export async function runMatrixCells(opts: RunMatrixCellsOptions): Promise<Matri
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      cells.push({ model, slug, outDir, error: msg });
+      cells.push({ model, ...armFields, slug, outDir, error: msg });
       write(`[eval]   cell FAILED (${msg}) — continuing with remaining models`);
     }
   }
