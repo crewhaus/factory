@@ -355,6 +355,7 @@ import {
   SECURITY_CORPUS_SCHEMA,
   SECURITY_SCHEMA,
   SERVE_SCHEMA,
+  SERVICES_SCHEMA,
   SESSIONS_SCHEMA,
   SPEC_SCHEMA,
   STATE_SCHEMA,
@@ -1421,6 +1422,28 @@ import {
   resolveMcpTransport,
   resolveServePort,
 } from "./serve-mcp";
+// `crewhaus services setup` — the OPERATOR-tier provisioner for a harness's
+// external services (a Slack app, a Cloudflare named tunnel, a Thredz wiki
+// space). Side-effect-free module so its flag parsing and plan rendering are
+// unit-testable without executing the CLI; the module header explains why it
+// is a separate tier from `channel provision` rather than a reversal of it.
+import {
+  InvalidServicesFlagError,
+  ServiceSetupError,
+  describePlan,
+  parsePortFlag,
+  parseServicesFlag,
+  parseSpaceTypeFlag,
+  portInUse,
+  readSetupTarget,
+  renderChanges,
+  resolveCredentials,
+  resolveEnvFile,
+  runServicesSetup,
+  selectedServices,
+  startResponder,
+  terminalIo,
+} from "./services-cmd";
 // Loop contract 0.4 (Batch B, G53) — `sessions export --format trajectories`
 // assembly ((state, action, observation, reward) tuples from session event
 // logs + trace events, terminal-sparse reward ladder), in a side-effect-free
@@ -16893,6 +16916,184 @@ async function runState(args: ParsedArgs, action: "backup" | "restore"): Promise
  *   doctor                 list configured secrets and report missing
  *   rotate <name>          rotate the named secret (file backend)
  */
+/** A flag's value when it takes one, else undefined — `parseArgs` yields
+ *  `true` for value-less flags, which is never a usable string. */
+function flagString(args: ParsedArgs, name: string): string | undefined {
+  const v = args.flags[name];
+  return typeof v === "string" && v !== "" ? v : undefined;
+}
+
+/**
+ * `crewhaus services setup <spec.yaml>` — provision the harness's external
+ * services in one pass.
+ *
+ * The three provisioning credentials (a Cloudflare API token, a Slack
+ * app-configuration token, a Thredz key) are resolved from flags, then the
+ * process env, then the harness `.env`, then a prompt — so a filled `.env`
+ * makes the command non-interactive, and a bare shell still works.
+ */
+async function runServices(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus services setup <spec.yaml> [--zone <domain>] [--port <n>]\n" +
+        "                                [--services slack,cloudflare,thredz]\n" +
+        "                                [--hostname <fqdn>] [--tunnel <name>] [--origin-host <h>]\n" +
+        "                                [--space-type shared|individual] [--space <slug>]\n" +
+        "                                [--app-id <id>] [--manual-install]\n" +
+        "                                [--env-file <path>] [--dry-run] [--yes]\n" +
+        "\n" +
+        "  Provisions what a spec asks for but cannot create itself:\n" +
+        "    cloudflare  find-or-create a NAMED tunnel, merge this harness's public\n" +
+        "                hostname into its ingress (read-merge-write — a plain PUT\n" +
+        "                would delete every other harness's rule), and point DNS at\n" +
+        "                it. The connector is NOT installed or restarted: setup\n" +
+        "                prints `cloudflared service install <token>` for you to run.\n" +
+        "    thredz      find-or-create the wiki space and write its slug into the\n" +
+        "                spec's `thredz.space` (the compiler bakes that in as a\n" +
+        "                literal, so it cannot live in .env).\n" +
+        "    slack       create the app from a manifest whose scopes and events are\n" +
+        "                derived from the adapter's real API usage, set BOTH request\n" +
+        "                URLs (events and actions — without the second, approval\n" +
+        "                cards render but clicks die), then install it and capture\n" +
+        "                the bot token. Setup stands in on the events port to answer\n" +
+        "                Slack's url_verification, because the daemon cannot boot\n" +
+        "                until it has the signing secret this step returns.\n" +
+        "  Credential variable NAMES come from the spec's own $VAR refs, so no\n" +
+        "  naming convention is assumed. Values are written to the harness .env at\n" +
+        "  0600; provisioning tokens are read once and never stored.\n" +
+        "  --port      the daemon's Slack events port. It is the PORT env var and has\n" +
+        "              NO spec field, so it cannot be derived — pass what the harness\n" +
+        "              launcher exports (default 3000)\n" +
+        "  --dry-run   print the plan and stop; no provider is contacted\n" +
+        "  --yes       skip the confirmation (required when stdin is not a TTY)\n",
+    );
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+
+  let services: readonly ServiceIdFlag[] | undefined;
+  let port: number | undefined;
+  let spaceType: "shared" | "individual" | undefined;
+  try {
+    services = parseServicesFlag(flagString(args, "services"));
+    port = parsePortFlag(flagString(args, "port"));
+    spaceType = parseSpaceTypeFlag(flagString(args, "space-type"));
+  } catch (err) {
+    if (err instanceof InvalidServicesFlagError) die(err.message);
+    throw err;
+  }
+
+  let target: ReturnType<typeof readSetupTarget>;
+  try {
+    target = readSetupTarget(specPath, port === undefined ? {} : { eventsPort: port });
+  } catch (err) {
+    if (err instanceof ServiceSetupError) die(renderSetupError(err));
+    throw err;
+  }
+
+  const options = {
+    ...(services === undefined ? {} : { services }),
+    ...(flagString(args, "zone") === undefined ? {} : { zone: flagString(args, "zone") as string }),
+    ...(flagString(args, "hostname") === undefined
+      ? {}
+      : { hostname: flagString(args, "hostname") as string }),
+    ...(flagString(args, "tunnel") === undefined
+      ? {}
+      : { tunnelName: flagString(args, "tunnel") as string }),
+    ...(flagString(args, "origin-host") === undefined
+      ? {}
+      : { originHost: flagString(args, "origin-host") as string }),
+    ...(spaceType === undefined ? {} : { spaceType }),
+    ...(flagString(args, "space") === undefined
+      ? {}
+      : { spaceSlug: flagString(args, "space") as string }),
+    ...(flagString(args, "app-id") === undefined
+      ? {}
+      : { slackAppId: flagString(args, "app-id") as string }),
+    manualInstall: args.flags["manual-install"] === true,
+  };
+
+  const envFile = resolveEnvFile(target, flagString(args, "env-file"));
+  const chosen = selectedServices(target, options);
+  if (chosen.length === 0) {
+    // Distinguish "the spec asks for nothing" from "--services filtered
+    // everything out" — they have completely different fixes, and conflating
+    // them sends the operator to edit a spec that was fine.
+    const { services: _filtered, ...unfiltered } = options;
+    const available = selectedServices(target, unfiltered);
+    die(
+      available.length === 0
+        ? "nothing to provision — the spec configures no Slack channel and no thredz block, " +
+            "and no --zone was given for a tunnel"
+        : `--services ${flagString(args, "services") ?? ""} selected nothing this spec configures ` +
+            `(available here: ${available.join(", ")})`,
+    );
+  }
+
+  for (const line of describePlan(target, options, envFile)) process.stdout.write(`${line}\n`);
+  process.stdout.write("\n");
+
+  if (args.flags["dry-run"]) {
+    process.stdout.write("dry run — nothing was contacted or written.\n");
+    return;
+  }
+
+  const interactive = process.stdin.isTTY === true;
+  const reader = interactive ? createLineReader() : undefined;
+  try {
+    if (args.flags["yes"] !== true) {
+      if (reader === undefined) {
+        die("refusing to provision without confirmation — re-run with --yes (stdin is not a TTY)");
+      }
+      const answer = await reader.ask("Provision these? [y/N] ");
+      if (!/^y(es)?$/i.test(answer)) {
+        process.stdout.write("aborted.\n");
+        return;
+      }
+    }
+
+    const io = terminalIo(
+      reader === undefined ? undefined : async (question: string) => reader.ask(`${question}\n> `),
+    );
+    const { credentials, missing } = await resolveCredentials(chosen, process.env, envFile, io, {});
+    if (missing.length > 0) {
+      die(
+        `missing provisioning credential(s): ${missing.join(", ")} — export them, put them in ` +
+          `${envFile}, or run interactively to be prompted`,
+      );
+    }
+
+    // Wire the real seams. Leaving `deps` empty silently disabled the whole
+    // stand-in-responder path: `applySlack` would find no `startResponder`,
+    // never bind the events port, never answer Slack's url_verification, and
+    // fall through to the manual-paste branch — while the plan the operator
+    // had just approved promised the automated install.
+    const result = await runServicesSetup(
+      { target, options, credentials, io, deps: { startResponder, portInUse } },
+      envFile,
+    );
+    process.stdout.write("\n");
+    for (const line of renderChanges(result.changes)) process.stdout.write(`${line}\n`);
+    if (result.followUp.length > 0) {
+      process.stdout.write("\nNext:\n");
+      for (const line of result.followUp) process.stdout.write(`  ${line}\n`);
+    }
+    if (result.failed) process.exitCode = 1;
+  } finally {
+    reader?.close();
+  }
+}
+
+/** The three service ids, mirrored so the entry file needs no type import. */
+type ServiceIdFlag = "cloudflare" | "slack" | "thredz";
+
+/** Render a ServiceSetupError as the repo's structured one-liner + fix. */
+function renderSetupError(err: ServiceSetupError): string {
+  const fix = err.options.fix;
+  return fix === undefined ? err.message : `${err.message}\n  Fix: ${fix}`;
+}
+
 async function runSecrets(args: ParsedArgs, action: string): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -23245,6 +23446,17 @@ switch (subcommand) {
       die(`state action must be "backup" or "restore" (got "${action}")`);
     }
     await runState(parseFor(rest.slice(1), STATE_SCHEMA), action);
+    break;
+  }
+  case "services": {
+    // Only `setup` exists. A `verify` was deliberately NOT added: the
+    // post-provision check is `crewhaus channel verify`, which already
+    // reports the boot-gate env refs and diffs the granted Slack scopes.
+    const action = rest[0] ?? "";
+    if (action !== "setup") {
+      die(`services action must be "setup" (got "${action}")`);
+    }
+    await runServices(parseFor(rest.slice(1), SERVICES_SCHEMA));
     break;
   }
   case "secrets": {

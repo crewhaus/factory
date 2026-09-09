@@ -1522,6 +1522,37 @@ export const CHANNEL_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+export const SERVICES_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Which of the three services to touch (default: every one the spec configures).
+    { name: "services", takesValue: true },
+    // Cloudflare: the zone the public hostname lives under, and overrides.
+    { name: "zone", takesValue: true },
+    { name: "hostname", takesValue: true },
+    { name: "tunnel", takesValue: true },
+    // Host written into the ingress rule's origin. `localhost` and `127.0.0.1`
+    // both reach a loopback listener — cloudflared falls through from ::1.
+    { name: "origin-host", takesValue: true },
+    // The daemon's Slack events port. It is the PORT env var and has NO spec
+    // field, so it cannot be derived — pass the value the launcher exports.
+    { name: "port", takesValue: true },
+    // Thredz: space shape and slug.
+    { name: "space-type", takesValue: true },
+    { name: "space", takesValue: true },
+    // Slack: update an existing app instead of creating one.
+    { name: "app-id", takesValue: true },
+    // Skip the browser round-trip; the operator pastes the bot token.
+    { name: "manual-install", takesValue: false },
+    // Where credentials are written (default: the .env beside the spec).
+    { name: "env-file", takesValue: true },
+    // Print the plan and stop — no provider call is made.
+    { name: "dry-run", takesValue: false },
+    // Skip the confirmation prompt (required when stdin is not a TTY).
+    { name: "yes", short: "y", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
 export const SECRETS_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "backend", takesValue: true },

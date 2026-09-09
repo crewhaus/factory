@@ -223,6 +223,7 @@
     { "path": "./packages/harness-supervisor" },
     { "path": "./packages/hangar-ui" },
     { "path": "./packages/hangar-server" },
+    { "path": "./packages/service-setup" },
     { "path": "./apps/cli" }
   ]
 }

@@ -92,6 +92,7 @@
         "@crewhaus/sandbox": "workspace:*",
         "@crewhaus/sandbox-image-registry": "workspace:*",
         "@crewhaus/secrets-manager": "workspace:*",
+        "@crewhaus/service-setup": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",
@@ -1601,6 +1602,16 @@
         "@crewhaus/logging": "workspace:*",
       },
     },
+    "packages/service-setup": {
+      "name": "@crewhaus/service-setup",
+      "version": "0.5.8",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/preflight": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
+        "yaml": "^2.6.0",
+      },
+    },
     "packages/session-store": {
       "name": "@crewhaus/session-store",
       "version": "0.5.8",
@@ -2870,6 +2881,8 @@
     "@crewhaus/sandbox-image-rust": ["@crewhaus/sandbox-image-rust@workspace:packages/sandbox-image-rust"],
 
     "@crewhaus/secrets-manager": ["@crewhaus/secrets-manager@workspace:packages/secrets-manager"],
+
+    "@crewhaus/service-setup": ["@crewhaus/service-setup@workspace:packages/service-setup"],
 
     "@crewhaus/session-store": ["@crewhaus/session-store@workspace:packages/session-store"],
 
