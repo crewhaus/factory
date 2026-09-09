@@ -97,6 +97,7 @@
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",
     "@crewhaus/secrets-manager": "workspace:*",
+    "@crewhaus/service-setup": "workspace:*",
     "@crewhaus/session-store": "workspace:*",
     "@crewhaus/spec-registry": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",

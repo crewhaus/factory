@@ -5,6 +5,89 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`crewhaus services setup` — the external services a harness needs, in one
+  command.** A spec declares *that* it wants a Slack channel, a public URL and
+  a hosted wiki; everything on the other side of those declarations has been a
+  click-path through three consoles, repeated per harness. The new
+  `@crewhaus/service-setup` package creates them: a Cloudflare named tunnel
+  with a public hostname and its DNS record, a Thredz wiki space, and a Slack
+  app built from a manifest, applied, and installed. Credentials land in the
+  harness's own `.env`; the wiki slug lands in the spec's `thredz.space`,
+  which the compiler bakes in as a literal and so cannot live in `.env`.
+
+  Everything is derived from the spec — including the credential variable
+  NAMES, which come from its own `$VAR` refs, because `channel-adapter-slack`
+  never reads a credential from the environment and the names are therefore
+  the author's choice. No naming convention is assumed.
+
+  This does not reverse `channel provision`'s deliberate emit-and-instruct
+  decision for Slack, it sits above it. That command is part of the runtime's
+  credential tier, which carries only what the daemon uses and cannot call the
+  manifest API. `services setup` is an operator command holding short-lived
+  provisioning credentials — a Slack app-configuration token, a Cloudflare API
+  token, a Thredz key — that are read once, used, and dropped. What lands in
+  the harness is still only what the daemon needs.
+
+  Three details are load-bearing. Setup **stands in on the events port** to
+  answer Slack's `url_verification` challenge, because the daemon refuses to
+  boot without the signing secret that only the app-creation response carries
+  — and skips standing in when something is already listening. The Cloudflare
+  ingress write is **read-merge-write with the catch-all pinned last**, since
+  `PUT …/configurations` replaces the whole configuration and a malformed list
+  is accepted with `success: true` while the connector silently keeps serving
+  the old one. And the Slack credentials are **persisted before the install
+  step runs**, because the signing secret is returned exactly once and no API
+  reads it back.
+
+  The Slack manifest now also sets `settings.interactivity`, closing a gap
+  that left approval cards rendering while their buttons did nothing.
+
+  Two more properties fall out of the same read-merge-write discipline. The
+  ingress round trip carries every field Cloudflare stored that this package
+  does not model — `originRequest` above all, which is where Cloudflare Access
+  lives — because not modelling a field is not a licence to delete it on a
+  full-replace PUT. And routes are keyed on hostname AND path, since
+  cloudflared matches both: a `{host, path}` rule beside a bare `{host}` one
+  is a normal two-route config, not a stale duplicate.
+
+  Setup never installs or restarts the cloudflared connector; it prints the
+  command, and re-offers it on any run where no connector is attached rather
+  than only on the run that created the tunnel. `--dry-run` renders the full
+  plan without contacting anything.
+
+### Fixed
+
+- **A `.env` value containing a `"` or a `\` no longer changes shape on a
+  write/read round trip.** `encodeEnvValue` escapes both characters whenever
+  it has to quote a value, but nothing reversed that: `upsertEnvVar(path, "K",
+  'a"b')` wrote `K="a\"b"` and read back `a\"b`. The asymmetry sat in two
+  places at once — the console's `readEnvFileFacts` and `parseEnvText`, which
+  builds the environment a spawned daemon actually receives — so a value could
+  in principle have survived the presence check and still reached the child
+  altered.
+
+  No credential in use was affected: provider tokens are all
+  `[A-Za-z0-9_.-]`, which never reaches the quoting path. The fix is
+  therefore latent correctness, and the reason it needed doing is that the
+  failure would first appear as an auth error nobody traces back to an env
+  file.
+
+  `@crewhaus/harness-supervisor` now owns the one `unquoteEnvValue`, and
+  `@crewhaus/hangar-server` re-exports its `parseEnvText` instead of keeping a
+  verbatim copy — the duplication is what let the same bug live in two places.
+  Round-trip tests cover a space, `#`, `"`, `\`, `=`, `$`, and the empty
+  string, through both readers.
+
+- **`crewhaus channel provision` sets the Slack manifest's interactivity
+  request URL.** The emitted manifest configured only Event Subscriptions, so
+  an app created from it rendered approval cards whose Approve/Deny buttons
+  reached nothing — the gateway routes clicks on `/<adapter>/actions`, a
+  separate webhook from `/<adapter>/events`.
+
 ## [0.6.0] - 2026-09-08
 
 **Per-model settings and hybrid setups.** A spec can now name every model it
