@@ -24,6 +24,7 @@ import {
   type SetupContext,
   type SetupIo,
   type SetupOptions,
+  applyAgentMail,
   applyCloudflare,
   applySlack,
   applyThredz,
@@ -1469,5 +1470,378 @@ describe("regression — applyThredz must not create a space it cannot record", 
       }),
     ).rejects.toThrow(/shorthand/);
     expect(posts).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// applyAgentMail
+// ---------------------------------------------------------------------------
+
+const AGENTMAIL_BASE = "https://agentmail.invalid/v0";
+const AGENTMAIL_PREFIX = "/v0";
+// Assembled at runtime so no `am_`-shaped literal ever lands in the repo.
+const ORG_KEY = ["am", "orgkeyplantest"].join("_");
+const SCOPED_KEY = ["am", "scopedkeyplantest"].join("_");
+
+/** The spec's own variable names — deliberately not any default this tool holds. */
+const SPEC_MAIL = `name: Secretary Bot
+target: channel
+mcp_servers:
+  sendmail:
+    command: npx
+    args:
+      - agentmail-mcp
+    env:
+      AGENTMAIL_API_KEY: $AGENTMAIL_API_KEY
+      CREW_SECRETARY_INBOX_ID: $CREW_SECRETARY_INBOX_ID
+`;
+
+/** The mail tier still in dry-run: the credential is live, the inbox is a comment. */
+const SPEC_MAIL_COMMENTED = `name: Secretary Bot
+target: channel
+mcp_servers:
+  sendmail:
+    command: npx
+    env:
+      AGENTMAIL_API_KEY: $AGENTMAIL_API_KEY
+      # CREW_SECRETARY_INBOX_ID: $CREW_SECRETARY_INBOX_ID
+`;
+
+/** A fleet that prefixes the credential per role, within what the regex allows. */
+const SPEC_MAIL_ROLE_KEY = `name: Secretary Bot
+target: channel
+mcp_servers:
+  sendmail:
+    env:
+      AGENTMAIL_SECRETARY_KEY: $AGENTMAIL_SECRETARY_KEY
+      CREW_SECRETARY_INBOX_ID: $CREW_SECRETARY_INBOX_ID
+`;
+
+const INBOX_WIRE = {
+  inbox_id: "inbox_9f3c1b",
+  email: "secretary@agentmail.to",
+  display_name: "Secretary Bot",
+  client_id: "crewhaus-Secretary-Bot",
+  created_at: "2026-09-01T10:00:00Z",
+};
+
+const VERIFY_ROUTE = `GET ${AGENTMAIL_PREFIX}/inboxes?limit=1`;
+const CREATE_ROUTE = `POST ${AGENTMAIL_PREFIX}/inboxes`;
+const SCOPED_KEY_ROUTE = `POST ${AGENTMAIL_PREFIX}/inboxes/${INBOX_WIRE.inbox_id}/api-keys`;
+
+const VERIFY_OK: Reply = { status: 200, body: { count: 0, inboxes: [] } };
+const SCOPED_KEY_OK: Reply = {
+  status: 201,
+  body: { api_key_id: "key_77", api_key: SCOPED_KEY, name: "crewhaus:Secretary Bot" },
+};
+
+/** Write a real spec into the temp harness dir, honouring the --inbox-var escape hatch. */
+function mailHarness(yamlText: string, inboxVar?: string): SetupTarget {
+  const specPath = join(dir, "crewhaus.yaml");
+  writeFileSync(specPath, yamlText, "utf8");
+  return readSetupTarget(specPath, inboxVar === undefined ? {} : { inboxVar });
+}
+
+function mailContext(
+  fetchImpl: typeof fetch,
+  options: SetupOptions,
+  io: TestIo,
+  target: SetupTarget,
+  apiKey: string | null = ORG_KEY,
+): SetupContext {
+  return {
+    target,
+    options,
+    credentials: apiKey === null ? {} : { agentMailApiKey: apiKey },
+    io,
+    deps: { agentmail: { fetchImpl, apiBase: AGENTMAIL_BASE } },
+  };
+}
+
+describe("applyAgentMail", () => {
+  test("verifies, creates, and records the id in the variable the SPEC named", async () => {
+    const { fetchImpl, calls } = router({
+      [VERIFY_ROUTE]: VERIFY_OK,
+      [CREATE_ROUTE]: { status: 201, body: INBOX_WIRE },
+    });
+    const io = testIo();
+    const out = await applyAgentMail(
+      mailContext(fetchImpl, {}, io, mailHarness(SPEC_MAIL)),
+      envPath(),
+    );
+
+    // Verify first: a 401 halfway through provisioning becomes "nothing
+    // happened, fix the key".
+    expect(calls.map((c) => `${c.method} ${c.path}${c.search}`)).toEqual([
+      `GET ${AGENTMAIL_PREFIX}/inboxes?limit=1`,
+      `POST ${AGENTMAIL_PREFIX}/inboxes`,
+    ]);
+    expect(calls[0]?.authorization).toBe(`Bearer ${ORG_KEY}`);
+    // `client_id` is the idempotency key, derived from the harness name so the
+    // same harness derives the same value on every machine and every run.
+    expect(calls[1]?.body).toEqual({
+      client_id: "crewhaus-Secretary-Bot",
+      display_name: "Secretary Bot",
+    });
+    expect(io.infos).toContain("AgentMail key verified");
+
+    expect(out.inboxId).toBe("inbox_9f3c1b");
+    expect(out.email).toBe("secretary@agentmail.to");
+    expect(out.needsUncomment).toBeUndefined();
+    expect(out.changes).toEqual([
+      {
+        service: "agentmail",
+        summary: "inbox secretary@agentmail.to",
+        outcome: "created",
+        // The write kind is surfaced, matching how Slack and Thredz report theirs.
+        detail: ["id → $CREW_SECRETARY_INBOX_ID (appended)"],
+      },
+    ]);
+
+    // The id lands in the spec's own variable — nothing here holds a default.
+    const values = readEnvFile(envPath()).values;
+    expect(Object.keys(values)).toEqual(["CREW_SECRETARY_INBOX_ID"]);
+    expect(values["CREW_SECRETARY_INBOX_ID"]).toBe("inbox_9f3c1b");
+    expect(readFileSync(envPath(), "utf8")).toContain("CREW_SECRETARY_INBOX_ID=inbox_9f3c1b");
+    // The id is what the send path takes; the address is only for humans.
+    expect(readFileSync(envPath(), "utf8")).not.toContain("secretary@agentmail.to");
+  });
+
+  test("the org key never reaches the harness", async () => {
+    // The whole reason the org key is classed as a PROVISIONING credential:
+    // it can read and send from every inbox on the account.
+    const { fetchImpl } = router({
+      [VERIFY_ROUTE]: VERIFY_OK,
+      [CREATE_ROUTE]: { status: 201, body: INBOX_WIRE },
+      [SCOPED_KEY_ROUTE]: SCOPED_KEY_OK,
+    });
+    const io = testIo();
+    const out = await applyAgentMail(
+      mailContext(
+        fetchImpl,
+        { scopedKeyVar: "SECRETARY_AGENTMAIL_KEY" },
+        io,
+        mailHarness(SPEC_MAIL),
+      ),
+      envPath(),
+    );
+
+    const text = readFileSync(envPath(), "utf8");
+    expect(text).not.toContain(ORG_KEY);
+    expect(readEnvFile(envPath()).values["AGENTMAIL_API_KEY"]).toBeUndefined();
+    // Nor into anything the operator sees.
+    expect(JSON.stringify(out.changes)).not.toContain(ORG_KEY);
+    expect(io.infos.join("\n")).not.toContain(ORG_KEY);
+    expect(io.warns.join("\n")).not.toContain(ORG_KEY);
+  });
+
+  test("--mail-username and --mail-domain are forwarded, and omitted otherwise", async () => {
+    const { fetchImpl, calls } = router({
+      [VERIFY_ROUTE]: VERIFY_OK,
+      [CREATE_ROUTE]: { status: 201, body: INBOX_WIRE },
+    });
+    await applyAgentMail(
+      mailContext(
+        fetchImpl,
+        { mailUsername: "secretary", mailDomain: "mail.example.com" },
+        testIo(),
+        mailHarness(SPEC_MAIL),
+      ),
+      envPath(),
+    );
+    expect(calls[1]?.body).toEqual({
+      client_id: "crewhaus-Secretary-Bot",
+      username: "secretary",
+      domain: "mail.example.com",
+      display_name: "Secretary Bot",
+    });
+  });
+
+  test("a 200 replay of the same client_id renders unchanged, not created", async () => {
+    // 201 = created now; 200 = the idempotent replay of an earlier create. The
+    // status is the only trustworthy signal, so it is not guessed at.
+    const { fetchImpl } = router({
+      [VERIFY_ROUTE]: VERIFY_OK,
+      [CREATE_ROUTE]: { status: 200, body: INBOX_WIRE },
+    });
+    const out = await applyAgentMail(
+      mailContext(fetchImpl, {}, testIo(), mailHarness(SPEC_MAIL)),
+      envPath(),
+    );
+    // Not "created": a 200 cannot prove one (the API answers 200 for both a
+    // create and an idempotent replay), so the step never claims it did. The
+    // env file DID change on this first run, though, and reporting
+    // "unchanged" there would be the wrong half of the truth.
+    expect(out.changes[0]?.outcome).not.toBe("created");
+    expect(out.changes[0]?.detail?.join(" ")).toContain("appended");
+    expect(out.inboxId).toBe("inbox_9f3c1b");
+    // The id is still recorded — a replay is a successful run, not a skip.
+    expect(readEnvFile(envPath()).values["CREW_SECRETARY_INBOX_ID"]).toBe("inbox_9f3c1b");
+  });
+
+  test("a commented-out tier is written, then handed back as an edit to make", async () => {
+    const { fetchImpl } = router({
+      [VERIFY_ROUTE]: VERIFY_OK,
+      [CREATE_ROUTE]: { status: 201, body: INBOX_WIRE },
+    });
+    const out = await applyAgentMail(
+      mailContext(
+        fetchImpl,
+        {},
+        testIo(),
+        mailHarness(SPEC_MAIL_COMMENTED, "CREW_SECRETARY_INBOX_ID"),
+      ),
+      envPath(),
+    );
+
+    // Setup writes .env and stops: uncommenting a `$VAR` under
+    // mcp_servers.*.env is an edit whose blast radius is "the daemon no longer
+    // starts", so the operator makes it knowing the value is now there.
+    // The message names the SERVER, not a wildcard — the operator has to find
+    // the line, and `mcp_servers.*.env` is not a place.
+    expect(out.needsUncomment).toBe(
+      "uncomment a ref to CREW_SECRETARY_INBOX_ID under mcp_servers.sendmail.env",
+    );
+    expect(readEnvFile(envPath()).values["CREW_SECRETARY_INBOX_ID"]).toBe("inbox_9f3c1b");
+  });
+
+  test("mints an inbox-scoped key into the named variable", async () => {
+    const { fetchImpl, calls } = router({
+      [VERIFY_ROUTE]: VERIFY_OK,
+      [CREATE_ROUTE]: { status: 201, body: INBOX_WIRE },
+      [SCOPED_KEY_ROUTE]: SCOPED_KEY_OK,
+    });
+    const out = await applyAgentMail(
+      mailContext(
+        fetchImpl,
+        { scopedKeyVar: "SECRETARY_AGENTMAIL_KEY" },
+        testIo(),
+        mailHarness(SPEC_MAIL),
+      ),
+      envPath(),
+    );
+
+    const mint = calls.find((c) => c.path.endsWith("/api-keys"));
+    expect(mint?.body).toEqual({ name: "crewhaus-Secretary-Bot" });
+    expect(out.changes[1]).toEqual({
+      service: "agentmail",
+      summary: "inbox-scoped key → $SECRETARY_AGENTMAIL_KEY",
+      outcome: "created",
+      detail: ["key id key_77", "scoped to this inbox only"],
+    });
+    // The secret is returned once and never again, so it is persisted at once.
+    expect(readEnvFile(envPath()).values["SECRETARY_AGENTMAIL_KEY"]).toBe(SCOPED_KEY);
+  });
+
+  test("an empty assignment counts as unset, so the key is still minted", async () => {
+    writeFileSync(envPath(), "SECRETARY_AGENTMAIL_KEY=\n", "utf8");
+    const { fetchImpl, calls } = router({
+      [VERIFY_ROUTE]: VERIFY_OK,
+      [CREATE_ROUTE]: { status: 201, body: INBOX_WIRE },
+      [SCOPED_KEY_ROUTE]: SCOPED_KEY_OK,
+    });
+    await applyAgentMail(
+      mailContext(
+        fetchImpl,
+        { scopedKeyVar: "SECRETARY_AGENTMAIL_KEY" },
+        testIo(),
+        mailHarness(SPEC_MAIL),
+      ),
+      envPath(),
+    );
+    expect(calls.some((c) => c.path.endsWith("/api-keys"))).toBe(true);
+    expect(readEnvFile(envPath()).values["SECRETARY_AGENTMAIL_KEY"]).toBe(SCOPED_KEY);
+  });
+
+  test("never mints a second key over a variable that already holds one", async () => {
+    // Minting is NOT idempotent — there is no client_id on that endpoint — so
+    // a re-run that minted again would strand live keys on the account.
+    const existing = ["am", "alreadyliveplantest"].join("_");
+    writeFileSync(envPath(), `SECRETARY_AGENTMAIL_KEY=${existing}\n`, "utf8");
+    const { fetchImpl, calls } = router({
+      [VERIFY_ROUTE]: VERIFY_OK,
+      [CREATE_ROUTE]: { status: 200, body: INBOX_WIRE },
+    });
+    const out = await applyAgentMail(
+      mailContext(
+        fetchImpl,
+        { scopedKeyVar: "SECRETARY_AGENTMAIL_KEY" },
+        testIo(),
+        mailHarness(SPEC_MAIL),
+      ),
+      envPath(),
+    );
+
+    expect(calls.some((c) => c.path.endsWith("/api-keys"))).toBe(false);
+    expect(out.changes[1]?.outcome).toBe("unchanged");
+    expect(out.changes[1]?.summary).toContain("not minting another");
+    expect(out.changes[1]?.detail?.join(" ")).toContain("not idempotent");
+    expect(readEnvFile(envPath()).values["SECRETARY_AGENTMAIL_KEY"]).toBe(existing);
+  });
+
+  test("falls back to the credential variable the spec itself declares", async () => {
+    // A fleet may prefix the key per role; the resolver only looks under the
+    // fixed AGENTMAIL_API_KEY, so the spec's own name is the second chance.
+    writeFileSync(envPath(), `AGENTMAIL_SECRETARY_KEY=${ORG_KEY}\n`, "utf8");
+    const { fetchImpl, calls } = router({
+      [VERIFY_ROUTE]: VERIFY_OK,
+      [CREATE_ROUTE]: { status: 201, body: INBOX_WIRE },
+    });
+    const out = await applyAgentMail(
+      mailContext(fetchImpl, {}, testIo(), mailHarness(SPEC_MAIL_ROLE_KEY), null),
+      envPath(),
+    );
+    expect(calls[0]?.authorization).toBe(`Bearer ${ORG_KEY}`);
+    expect(out.inboxId).toBe("inbox_9f3c1b");
+    expect(readEnvFile(envPath()).values["CREW_SECRETARY_INBOX_ID"]).toBe("inbox_9f3c1b");
+  });
+
+  test("throws when the spec declares no AgentMail inbox", async () => {
+    const { fetchImpl, calls } = router({});
+    const err = await caught(() =>
+      applyAgentMail(mailContext(fetchImpl, {}, testIo(), harness(SPEC_BARE)), envPath()),
+    );
+    expect(err.service).toBe("agentmail");
+    expect(err.message).toContain("declares no AgentMail inbox");
+    expect(err.options.fix).toContain("mcp_servers.<server>.env");
+    expect(err.options.fix).toContain("--inbox-var");
+    expect(calls).toEqual([]);
+  });
+
+  test("throws when there is no AgentMail key, naming the variable the spec declares", async () => {
+    const { fetchImpl, calls } = router({});
+    const err = await caught(() =>
+      applyAgentMail(
+        mailContext(fetchImpl, {}, testIo(), mailHarness(SPEC_MAIL_ROLE_KEY), null),
+        envPath(),
+      ),
+    );
+    expect(err.service).toBe("agentmail");
+    expect(err.message).toContain("no AgentMail API key");
+    expect(err.options.fix).toContain("AGENTMAIL_API_KEY");
+    expect(err.options.fix).toContain("$AGENTMAIL_SECRETARY_KEY");
+    expect(err.options.fix).toContain("which this spec declares");
+    expect(calls).toEqual([]);
+  });
+
+  test("throws before creating anything when the inbox id has nowhere to go", async () => {
+    // An inbox is remote state; one this tool cannot record has no local
+    // counterpart, and the check is free.
+    const literal = `name: Secretary Bot
+mcp_servers:
+  sendmail:
+    env:
+      AGENTMAIL_API_KEY: $AGENTMAIL_API_KEY
+      CREW_SECRETARY_INBOX_ID: inbox_pasted_by_hand
+`;
+    const { fetchImpl, calls } = router({});
+    const err = await caught(() =>
+      applyAgentMail(mailContext(fetchImpl, {}, testIo(), mailHarness(literal)), envPath()),
+    );
+    expect(err.service).toBe("agentmail");
+    expect(err.message).toContain("is not an env ref");
+    expect(err.message).toContain("mcp_servers.sendmail.env.CREW_SECRETARY_INBOX_ID");
+    expect(err.options.fix).toContain("--inbox-var");
+    expect(calls).toEqual([]);
   });
 });

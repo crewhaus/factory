@@ -30,10 +30,21 @@ export {
   ServiceSetupError,
 } from "./types";
 
+export type { AgentMailAuth, AgentMailDeps, Inbox, InboxApiKey, InboxInput } from "./agentmail";
+export {
+  AGENTMAIL_API_BASE,
+  AGENTMAIL_CONSOLE_URL,
+  createInboxApiKey,
+  ensureInbox,
+  inboxClientId,
+  listInboxes,
+} from "./agentmail";
+
 export type { JsonRequest, JsonResponse } from "./http";
 export { DEFAULT_TIMEOUT_MS, asRecord, readString, requestJson } from "./http";
 
 export type {
+  AgentMailTarget,
   CredentialSlot,
   ReadTargetOptions,
   SetupTarget,
@@ -117,6 +128,7 @@ export type { Responder, ResponderEvent, ResponderOptions } from "./responder";
 export { portInUse, readChallenge, startResponder } from "./responder";
 
 export type {
+  AgentMailOutcome,
   CloudflareOutcome,
   SetupContext,
   SetupCredentials,
@@ -127,6 +139,7 @@ export type {
   ThredzOutcome,
 } from "./plan";
 export {
+  applyAgentMail,
   applyCloudflare,
   applySlack,
   applyThredz,

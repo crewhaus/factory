@@ -34,6 +34,7 @@ import {
   type SetupIo,
   type SetupOptions,
   type SetupTarget,
+  applyAgentMail,
   applyCloudflare,
   applySlack,
   applyThredz,
@@ -44,6 +45,7 @@ import {
   resolveCredentials,
   selectedServices,
   slackScopes,
+  slotEnvName,
   startResponder,
 } from "@crewhaus/service-setup";
 
@@ -176,6 +178,29 @@ export function describePlan(target: SetupTarget, opts: SetupOptions, envFile: s
     );
     lines.push(`  → set thredz.space in ${basename(target.specPath)}`);
   }
+  if (services.includes("agentmail") && target.agentmail !== undefined) {
+    const inboxVar = slotEnvName(target.agentmail.inboxId);
+    lines.push("AgentMail");
+    lines.push(
+      `  → find-or-create inbox for "${target.name}"${opts.mailDomain === undefined ? "" : ` on ${opts.mailDomain}`}`,
+    );
+    lines.push(`  → inbox id → $${inboxVar ?? "(needs --inbox-var)"}`);
+    lines.push(
+      opts.scopedKeyVar === undefined
+        ? "  → the org key is NOT written to the harness (pass --scoped-key VAR for an inbox-scoped one)"
+        : `  → mint an inbox-scoped key → $${opts.scopedKeyVar}`,
+    );
+    if (target.agentmail.matchedByNameOnly) {
+      // The match rested on a variable name with no AgentMail credential
+      // beside it. Another provider's MCP child could carry the same name, so
+      // say so before anything is created rather than after.
+      lines.push(
+        `  ~ matched on the name "${target.agentmail.specInboxVar ?? "?"}" alone — no AgentMail`,
+        "    credential is declared in that env block. Skip with --services if this",
+        "    harness uses a different mail provider.",
+      );
+    }
+  }
   if (services.includes("slack") && target.slack !== undefined) {
     const scopes = slackScopes(target.slack.channelReactions);
     lines.push("Slack");
@@ -227,6 +252,33 @@ export async function runServicesSetup(
     if (services.includes("thredz")) {
       const th = await applyThredz(ctx);
       changes.push(...th.changes);
+    }
+    // AgentMail sits with Thredz rather than with Slack: it needs no public
+    // hostname, so it belongs in the cheap-to-fail-early group ahead of the
+    // one step that creates something unrecoverable.
+    if (services.includes("agentmail")) {
+      const am = await applyAgentMail(ctx, envFile);
+      changes.push(...am.changes);
+      followUp.push(`Mail sends as ${am.email} — that address is the harness's sender identity.`);
+      // Setup writes .env and stops there deliberately. Taking the mail tier
+      // live is the operator's second edit: a `$VAR` ref under
+      // mcp_servers.*.env is a HARD boot gate that treats empty as unset, so
+      // uncommenting one before its value exists kills the daemon at next
+      // start. That is the same reason setup prints the cloudflared command
+      // instead of running it.
+      if (am.needsUncomment !== undefined) {
+        followUp.push(
+          `Take the mail tier live: ${am.needsUncomment} in ${basename(ctx.target.specPath)}, then restart.`,
+        );
+        // The inbox id is only half of it. The AgentMail credential is
+        // usually commented out on the same block, and an MCP child missing
+        // it throws at the FIRST SEND rather than at boot — so a harness that
+        // looks healthy fails the first time it matters. Name both.
+        followUp.push(
+          "  Check the AgentMail key ref on that same env block is live too — a missing " +
+            "one fails at the first send, not at boot.",
+        );
+      }
     }
     if (services.includes("slack")) {
       if (hostname === undefined) {

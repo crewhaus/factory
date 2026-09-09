@@ -1,3 +1,10 @@
+import {
+  type AgentMailDeps,
+  createInboxApiKey,
+  ensureInbox,
+  inboxClientId,
+  verifyKey as verifyAgentMailKey,
+} from "./agentmail";
 /**
  * The orchestration: what setup does, in what order, and what it writes.
  *
@@ -121,6 +128,20 @@ export type SetupOptions = {
   readonly slackAppId?: string;
   /** Skip the browser OAuth round-trip; the operator pastes the bot token. */
   readonly manualInstall?: boolean;
+  /** AgentMail inbox local part. Omitted ⇒ AgentMail generates one. */
+  readonly mailUsername?: string;
+  /** AgentMail domain. Must be verified on the account. Omitted ⇒ agentmail.to. */
+  readonly mailDomain?: string;
+  /**
+   * Mint an inbox-scoped AgentMail key into THIS variable.
+   *
+   * Opt-in, and it takes a variable name rather than a boolean on purpose: an
+   * inbox-scoped key must never land in a shared one. A fleet with a single
+   * `AGENTMAIL_API_KEY` read by several harnesses would have that key
+   * silently narrowed to one inbox, and every other harness would start
+   * failing to send. Naming the variable makes that impossible by accident.
+   */
+  readonly scopedKeyVar?: string;
   /** `.env` to write. Defaults to `<harness dir>/.env`. */
   readonly envFile?: string;
   /** How long to wait for the browser install callback. */
@@ -132,6 +153,7 @@ export type SetupCredentials = {
   readonly cloudflareApiToken?: string;
   readonly slackConfigToken?: string;
   readonly thredzApiKey?: string;
+  readonly agentMailApiKey?: string;
 };
 
 /** Terminal seams, injected so the package prints nothing on its own. */
@@ -150,6 +172,7 @@ export type SetupDeps = {
   readonly cloudflare?: CloudflareDeps;
   readonly slack?: SlackDeps;
   readonly thredz?: ThredzDeps;
+  readonly agentmail?: AgentMailDeps;
   /** Starts the stand-in listener. Injected so tests never bind a port. */
   readonly startResponder?: typeof import("./responder").startResponder;
   readonly portInUse?: typeof import("./responder").portInUse;
@@ -161,6 +184,13 @@ export type SetupContext = {
   readonly credentials: SetupCredentials;
   readonly io: SetupIo;
   readonly deps?: SetupDeps;
+  /**
+   * The ambient environment, injected. Steps consult it only to answer "is
+   * this variable already set SOMEWHERE the harness will see" — a fleet may
+   * export a shared credential rather than write it into `.env`, and a step
+   * that looked only at the file would think the name was free.
+   */
+  readonly env?: Readonly<Record<string, string | undefined>>;
 };
 
 /** Which services this run will touch, given the spec and the flags. */
@@ -171,6 +201,7 @@ export function selectedServices(target: SetupTarget, options: SetupOptions): re
   if (target.slack !== undefined || options.zone !== undefined) available.push("cloudflare");
   if (target.slack !== undefined) available.push("slack");
   if (target.thredz !== undefined) available.push("thredz");
+  if (target.agentmail !== undefined) available.push("agentmail");
   const requested = options.services;
   return requested === undefined ? available : available.filter((s) => requested.includes(s));
 }
@@ -450,6 +481,177 @@ function assertSpecCanHoldSpace(specPath: string): void {
 
 /** A slug no space will have, used only to shape-check the spec. */
 const SPACE_PROBE_SLUG = "\u0000probe";
+
+// ---------------------------------------------------------------------------
+// AgentMail
+// ---------------------------------------------------------------------------
+
+export type AgentMailOutcome = {
+  readonly changes: readonly AppliedChange[];
+  readonly inboxId: string;
+  readonly email: string;
+  /**
+   * The env key the operator still has to uncomment, or undefined when the
+   * spec already declares a live ref. Setup does not perform that edit — see
+   * the note where this is set.
+   */
+  readonly needsUncomment: string | undefined;
+};
+
+/**
+ * Create the harness's inbox and record its id.
+ *
+ * The org key never reaches the harness. What the daemon needs to send is the
+ * inbox id — the sender identity in `POST /inboxes/{inbox_id}/messages/send`
+ * — plus a credential, and the credential it gets is either the operator's
+ * existing shared key (already in the env file, untouched here) or an
+ * inbox-scoped key minted on request. That split is the whole reason the org
+ * key is classed as a provisioning credential.
+ *
+ * Ordering: the inbox VARIABLE is resolved before anything is created. An
+ * inbox this tool cannot record is not as bad as a Thredz individual space —
+ * `client_id` makes create idempotent, so a re-run adopts it rather than
+ * making a second — but creating a mailbox nobody asked to name is still
+ * remote state with no local counterpart, and the check is free.
+ */
+export async function applyAgentMail(
+  ctx: SetupContext,
+  envFile: string,
+): Promise<AgentMailOutcome> {
+  const { target, options, io } = ctx;
+  const mail = target.agentmail;
+  if (mail === undefined) {
+    throw new ServiceSetupError("agentmail", "the spec declares no AgentMail inbox", {
+      fix:
+        "declare an inbox-id ref under mcp_servers.<server>.env (e.g. INBOX_ID: $MY_INBOX_ID), " +
+        "or name the variable with --inbox-var",
+    });
+  }
+  // The shared resolver looks under the fixed `AGENTMAIL_API_KEY`, but a
+  // fleet may prefix per role the way the crew prefixes its Thredz keys. The
+  // spec says which variable it actually uses, so fall back to that before
+  // giving up — the alternative is telling an operator their key is missing
+  // while it sits in the file under the name their own spec named.
+  const declaredKeyVar = mail.apiKey === undefined ? undefined : slotEnvName(mail.apiKey);
+  const apiKey =
+    ctx.credentials.agentMailApiKey ??
+    (declaredKeyVar === undefined ? undefined : readEnvFile(envFile).values[declaredKeyVar]);
+  if (apiKey === undefined || apiKey === "") {
+    throw new ServiceSetupError("agentmail", "no AgentMail API key", {
+      fix:
+        `export AGENTMAIL_API_KEY${declaredKeyVar === undefined ? "" : ` (or $${declaredKeyVar}, which this spec declares)`}` +
+        ", or put it in the harness .env",
+    });
+  }
+
+  const inboxVar = slotEnvName(mail.inboxId);
+  if (inboxVar === undefined) {
+    throw new ServiceSetupError(
+      "agentmail",
+      `${mail.inboxId.label} is not an env ref, so there is nowhere to record the inbox id`,
+      {
+        fix: "write it as a $UPPER_SNAKE ref (e.g. $SECRETARY_INBOX_ID), or pass --inbox-var",
+      },
+    );
+  }
+
+  const auth = { apiKey };
+  const deps = ctx.deps?.agentmail;
+  await verifyAgentMailKey(auth, deps);
+  io.info("AgentMail key verified");
+
+  const { inbox, created } = await ensureInbox(
+    auth,
+    {
+      clientId: inboxClientId(target.name),
+      displayName: target.name,
+      ...(options.mailUsername === undefined ? {} : { username: options.mailUsername }),
+      ...(options.mailDomain === undefined ? {} : { domain: options.mailDomain }),
+    },
+    deps,
+  );
+
+  // Resolve the ambiguous 200 against what we already recorded. The API
+  // cannot tell a create from an idempotent replay (see `ensureInbox`), but
+  // the env file can: if it already names this exact inbox, nothing changed.
+  // Reading first also stops a silent second inbox — a harness that was set
+  // up by hand, or renamed since, would otherwise get a new one while the old
+  // one kept receiving mail nobody reads.
+  const recorded = readEnvFile(envFile).values[inboxVar];
+  const write = upsertEnvVar(envFile, inboxVar, inbox.inboxId);
+  const changes: AppliedChange[] = [
+    {
+      service: "agentmail",
+      summary: `inbox ${inbox.email}`,
+      outcome:
+        created || (recorded !== undefined && recorded !== inbox.inboxId)
+          ? "created"
+          : write.how === "unchanged"
+            ? "unchanged"
+            : "updated",
+      detail: [
+        `id → $${inboxVar} (${write.how})`,
+        ...(recorded !== undefined && recorded !== inbox.inboxId
+          ? [`replaced a different recorded inbox — the previous one still exists: ${recorded}`]
+          : []),
+      ],
+    },
+  ];
+
+  // An inbox-scoped key, only when asked for and only when the target
+  // variable is empty. Minting is NOT idempotent — there is no client_id on
+  // that endpoint — so a re-run that minted again would leave a trail of live
+  // keys on the account, each one the tool immediately forgot.
+  const scopedVar = options.scopedKeyVar;
+  if (scopedVar !== undefined) {
+    // Check the ambient environment too, not just the file. A fleet whose
+    // shared org key is exported rather than written into `.env` would
+    // otherwise look "empty" here and have that shared variable overwritten
+    // with an inbox-scoped key — narrowing it for every harness that reads it.
+    const existing = readEnvFile(envFile).values[scopedVar] ?? ctx.env?.[scopedVar];
+    if (existing !== undefined && existing !== "") {
+      changes.push({
+        service: "agentmail",
+        summary: `$${scopedVar} already holds a key — not minting another`,
+        outcome: "unchanged",
+        detail: ["minting is not idempotent; clear the variable to force a fresh key"],
+      });
+    } else {
+      // PRE-FLIGHT THE WRITE. The secret is returned exactly once, so a mint
+      // followed by a failed write strands a live key on the account with no
+      // local record — and the next run mints another, unbounded. Proving the
+      // file is writable first costs one no-op write; the same reasoning
+      // pre-flights the spec edit before creating a Thredz space.
+      upsertEnvVar(envFile, scopedVar, "");
+      const key = await createInboxApiKey(auth, inbox.inboxId, inboxClientId(target.name), deps);
+      upsertEnvVar(envFile, scopedVar, key.apiKey);
+      changes.push({
+        service: "agentmail",
+        summary: `inbox-scoped key → $${scopedVar}`,
+        outcome: "created",
+        detail: [`key id ${key.apiKeyId}`, "scoped to this inbox only"],
+      });
+    }
+  }
+
+  return {
+    changes,
+    inboxId: inbox.inboxId,
+    email: inbox.email,
+    // The edit still owed, named precisely. Setup writes `.env` and stops: a
+    // `$VAR` ref under mcp_servers.*.env is a hard boot gate treating empty
+    // as unset, so making one live is an edit whose blast radius is "the
+    // daemon no longer starts". The operator makes it, knowing the value is
+    // now there. Two different situations reach here, and telling them apart
+    // matters — one is a comment to remove, the other a variable that does
+    // not match.
+    needsUncomment: mail.declared
+      ? undefined
+      : mail.specInboxVar === undefined
+        ? `uncomment a ref to ${inboxVar} under mcp_servers.${mail.server === "(not declared in the spec)" ? "<server>" : mail.server}.env`
+        : `point mcp_servers.${mail.server}.env at ${inboxVar} — it currently declares ${mail.specInboxVar}, which setup did not write`,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Slack

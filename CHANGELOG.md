@@ -46,6 +46,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The Slack manifest now also sets `settings.interactivity`, closing a gap
   that left approval cards rendering while their buttons did nothing.
 
+  **AgentMail** joins the three: setup finds or creates the harness's mail
+  inbox and records its id. It is declared differently from the others —
+  there is no `agentmail:` spec block, only the variables an MCP stdio child
+  receives — so setup matches those key names and writes the inbox id into
+  the variable the spec itself named. Creation is idempotent on a derived
+  `client_id`, which the API treats as a real idempotency key: a replay
+  returns the original inbox rather than making a second.
+
+  Two flags exist because of how that declaration works. A harness whose mail
+  tier is not live yet keeps those refs commented out — a live `$VAR` ref
+  there is a hard boot gate treating empty as unset, so uncommenting one
+  before its value exists stops the daemon — and a comment is invisible to a
+  parser, hence `--inbox-var`. And the org key can send from every inbox on
+  the account, so it is never written into the harness; `--scoped-key VAR`
+  mints a key scoped to that one inbox. It takes a variable name rather than
+  a boolean so a scoped key can never silently narrow a shared one.
+
   Two more properties fall out of the same read-merge-write discipline. The
   ingress round trip carries every field Cloudflare stored that this package
   does not model — `originRequest` above all, which is where Cloudflare Access

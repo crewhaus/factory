@@ -30,7 +30,7 @@ export type ServiceDeps = {
 };
 
 /** The three services this package provisions. */
-export const SERVICE_IDS = ["cloudflare", "slack", "thredz"] as const;
+export const SERVICE_IDS = ["cloudflare", "slack", "thredz", "agentmail"] as const;
 export type ServiceId = (typeof SERVICE_IDS)[number];
 
 /** Human titles, for plan and result rendering. */
@@ -38,6 +38,7 @@ export const SERVICE_TITLE: Record<ServiceId, string> = {
   cloudflare: "Cloudflare tunnel",
   slack: "Slack app",
   thredz: "Thredz wiki space",
+  agentmail: "AgentMail inbox",
 };
 
 /**
@@ -54,7 +55,12 @@ export type SetupScope = ServiceId | "harness";
  * so a `.env` or an exported shell var removes every prompt.
  */
 export type ProvisioningCredential = {
-  readonly id: "cloudflareApiToken" | "slackConfigToken" | "slackRefreshToken" | "thredzApiKey";
+  readonly id:
+    | "cloudflareApiToken"
+    | "slackConfigToken"
+    | "slackRefreshToken"
+    | "thredzApiKey"
+    | "agentMailApiKey";
   readonly envName: string;
   readonly service: ServiceId;
   /** Shown when prompting; says where to mint it. */
@@ -89,6 +95,16 @@ export const PROVISIONING_CREDENTIALS: readonly ProvisioningCredential[] = [
     service: "slack",
     prompt: "Slack app-configuration REFRESH token (shown beside the token above)",
     optional: true,
+  },
+  {
+    id: "agentMailApiKey",
+    envName: "AGENTMAIL_API_KEY",
+    service: "agentmail",
+    prompt:
+      'AgentMail ORG API key (console.agentmail.to → API Keys; starts "am_", shown once). ' +
+      "Used to create the inbox and is never written into the harness — the harness " +
+      "gets the inbox id, and an inbox-scoped key if you ask for one",
+    optional: false,
   },
   {
     id: "thredzApiKey",

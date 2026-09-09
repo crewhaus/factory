@@ -1541,6 +1541,15 @@ export const SERVICES_SCHEMA: ParseArgsSchema = {
     { name: "space", takesValue: true },
     // Slack: update an existing app instead of creating one.
     { name: "app-id", takesValue: true },
+    // AgentMail: inbox shape, and where its id goes.
+    { name: "mail-username", takesValue: true },
+    { name: "mail-domain", takesValue: true },
+    // Names the env var the inbox id belongs in, for a harness whose MCP env
+    // refs are still commented out (the dry-run default) and so invisible.
+    { name: "inbox-var", takesValue: true },
+    // Mint an inbox-scoped AgentMail key into this variable. Takes a NAME so
+    // a scoped key can never silently narrow a shared one.
+    { name: "scoped-key", takesValue: true },
     // Skip the browser round-trip; the operator pastes the bot token.
     { name: "manual-install", takesValue: false },
     // Where credentials are written (default: the .env beside the spec).

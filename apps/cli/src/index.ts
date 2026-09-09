@@ -16940,6 +16940,8 @@ async function runServices(args: ParsedArgs): Promise<void> {
         "                                [--hostname <fqdn>] [--tunnel <name>] [--origin-host <h>]\n" +
         "                                [--space-type shared|individual] [--space <slug>]\n" +
         "                                [--app-id <id>] [--manual-install]\n" +
+        "                                [--inbox-var <VAR>] [--mail-username <u>]\n" +
+        "                                [--mail-domain <d>] [--scoped-key <VAR>]\n" +
         "                                [--env-file <path>] [--dry-run] [--yes]\n" +
         "\n" +
         "  Provisions what a spec asks for but cannot create itself:\n" +
@@ -16951,6 +16953,12 @@ async function runServices(args: ParsedArgs): Promise<void> {
         "    thredz      find-or-create the wiki space and write its slug into the\n" +
         "                spec's `thredz.space` (the compiler bakes that in as a\n" +
         "                literal, so it cannot live in .env).\n" +
+        "    agentmail   find-or-create the harness's mail inbox (idempotent on a\n" +
+        "                derived client_id) and record its id in the env variable the\n" +
+        "                spec's MCP block names. The ORG key is never written to the\n" +
+        "                harness: pass --scoped-key VAR to mint a key scoped to just\n" +
+        "                this inbox. --inbox-var names the variable when the spec's\n" +
+        "                refs are still commented out, as a dry-run harness ships them.\n" +
         "    slack       create the app from a manifest whose scopes and events are\n" +
         "                derived from the adapter's real API usage, set BOTH request\n" +
         "                URLs (events and actions — without the second, approval\n" +
@@ -16986,7 +16994,12 @@ async function runServices(args: ParsedArgs): Promise<void> {
 
   let target: ReturnType<typeof readSetupTarget>;
   try {
-    target = readSetupTarget(specPath, port === undefined ? {} : { eventsPort: port });
+    target = readSetupTarget(specPath, {
+      ...(port === undefined ? {} : { eventsPort: port }),
+      ...(flagString(args, "inbox-var") === undefined
+        ? {}
+        : { inboxVar: flagString(args, "inbox-var") as string }),
+    });
   } catch (err) {
     if (err instanceof ServiceSetupError) die(renderSetupError(err));
     throw err;
@@ -17011,6 +17024,15 @@ async function runServices(args: ParsedArgs): Promise<void> {
     ...(flagString(args, "app-id") === undefined
       ? {}
       : { slackAppId: flagString(args, "app-id") as string }),
+    ...(flagString(args, "mail-username") === undefined
+      ? {}
+      : { mailUsername: flagString(args, "mail-username") as string }),
+    ...(flagString(args, "mail-domain") === undefined
+      ? {}
+      : { mailDomain: flagString(args, "mail-domain") as string }),
+    ...(flagString(args, "scoped-key") === undefined
+      ? {}
+      : { scopedKeyVar: flagString(args, "scoped-key") as string }),
     manualInstall: args.flags["manual-install"] === true,
   };
 
@@ -17070,7 +17092,7 @@ async function runServices(args: ParsedArgs): Promise<void> {
     // fall through to the manual-paste branch — while the plan the operator
     // had just approved promised the automated install.
     const result = await runServicesSetup(
-      { target, options, credentials, io, deps: { startResponder, portInUse } },
+      { target, options, credentials, io, env: process.env, deps: { startResponder, portInUse } },
       envFile,
     );
     process.stdout.write("\n");
@@ -17086,7 +17108,7 @@ async function runServices(args: ParsedArgs): Promise<void> {
 }
 
 /** The three service ids, mirrored so the entry file needs no type import. */
-type ServiceIdFlag = "cloudflare" | "slack" | "thredz";
+type ServiceIdFlag = "cloudflare" | "slack" | "thredz" | "agentmail";
 
 /** Render a ServiceSetupError as the repo's structured one-liner + fix. */
 function renderSetupError(err: ServiceSetupError): string {

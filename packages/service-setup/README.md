@@ -18,10 +18,38 @@ crewhaus services setup crewhaus.yaml --zone example.com --port 3000
 | Cloudflare | a named tunnel (found or created), a public hostname pointed at the daemon's events port, and the proxied DNS record | nothing — the tunnel is account state |
 | Thredz | a wiki space, `individual` by default so the harness's memory stays private to its key | `thredz.space` in the spec |
 | Slack | an app built from a manifest, with both request URLs set, then installed to the workspace | the bot token, signing secret, app id and OAuth client pair in the harness `.env` |
+| AgentMail | the harness's mail inbox, idempotent on a derived `client_id` | the inbox id in `.env` — and an inbox-scoped key, if you ask for one |
 
 Everything is derived from the spec. The credential variable **names** come from the spec's own
 `$VAR` refs, so a fleet that prefixes per role and a lone harness using bare defaults both work
 without this package knowing either convention exists.
+
+## AgentMail is declared differently, and that shapes its flags
+
+Slack and Thredz have first-class spec blocks. AgentMail does not — a harness reaches it through
+an MCP stdio child, so all the spec says is which variables that child receives:
+
+```yaml
+mcp_servers:
+  sendmail:
+    env:
+      AGENTMAIL_API_KEY: $AGENTMAIL_API_KEY
+      SUPPORT_INBOX_ID: $SUPPORT_INBOX_ID
+```
+
+Setup finds it by matching those key names and writes the inbox id into the variable the spec
+itself named. Two consequences:
+
+- **A harness whose mail tier is not live yet keeps those refs commented out**, deliberately: a
+  live `$VAR` ref there is a hard boot gate that treats empty as unset, so uncommenting one
+  before its value exists stops the daemon. A comment is invisible to a parser, so pass
+  `--inbox-var SUPPORT_INBOX_ID`. Setup writes the value and tells you to uncomment; that edit
+  stays yours, for the same reason it prints the `cloudflared` command instead of running it.
+- **The org key never enters the harness.** It can read and send from every inbox on the account,
+  so a fleet that pasted it everywhere would let each harness mail as any of the others. Pass
+  `--scoped-key SUPPORT_AGENTMAIL_KEY` for a key scoped to this inbox alone. It takes a variable
+  *name* on purpose: writing a scoped key into a shared variable would silently narrow it and
+  break every other harness reading that variable.
 
 ## Two things worth knowing
 
@@ -49,6 +77,7 @@ an argv line lands in shell history and in every process listing on the machine.
 | `CLOUDFLARE_API_TOKEN` | dash.cloudflare.com → API tokens. Needs *Account · Cloudflare Tunnel · Edit*, *Zone · DNS · Edit*, *Zone · Zone · Read* |
 | `SLACK_CONFIG_TOKEN` | api.slack.com/apps → Your App Configuration Tokens. Short-lived; there is no API to mint one |
 | `THREDZ_API_KEY` | thredz.crewhaus.ai → API keys, with a wiki read-write grant. One key per agent — a key owns at most one individual space |
+| `AGENTMAIL_API_KEY` | console.agentmail.to → API Keys. An **org** key (starts `am_`, shown once). It creates the inbox and is never written into the harness |
 
 ## Safety
 

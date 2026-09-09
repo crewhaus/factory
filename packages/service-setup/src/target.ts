@@ -73,6 +73,45 @@ export type ThredzTarget = {
   readonly visibility: "private" | "shared";
 };
 
+/**
+ * The AgentMail half of a target.
+ *
+ * AgentMail has NO first-class spec block, unlike `channels.slack` and
+ * `thredz:`. A harness reaches it through an MCP stdio child, and what the
+ * spec actually declares is the child's env: an AgentMail key and an inbox
+ * id, both as `$VAR` refs under `mcp_servers.<name>.env`. So this is the one
+ * target derived from a NAME heuristic rather than a structural field — see
+ * {@link readAgentMailTarget} for the exact rule and why an override exists.
+ */
+export type AgentMailTarget = {
+  /** The MCP server whose env declared it, named in messages. */
+  readonly server: string;
+  /** Where the inbox id goes — the spec's own ref, e.g. `$SECRETARY_INBOX_ID`. */
+  readonly inboxId: CredentialSlot;
+  /** The AgentMail key ref the spec declares, when it declares one. */
+  readonly apiKey: CredentialSlot | undefined;
+  /**
+   * False when the harness has no LIVE ref to the variable setup writes —
+   * either the mail tier is still commented out, or an override named a
+   * different variable than the spec declares. Either way the operator has
+   * an edit left to make before the daemon reads what setup wrote.
+   */
+  readonly declared: boolean;
+  /**
+   * The inbox variable the SPEC declares, when it declares one — which may
+   * differ from the one setup writes if an override was given. Present so a
+   * caller can say *which* mismatch it is rather than guessing.
+   */
+  readonly specInboxVar: string | undefined;
+  /**
+   * True when the match rested on an `*_INBOX_ID` name alone, with no
+   * AgentMail credential in the same env block. The identification is a
+   * guess at that point — another mail provider's MCP child could carry the
+   * same variable name — so callers surface it rather than acting silently.
+   */
+  readonly matchedByNameOnly: boolean;
+};
+
 /** Everything setup derives from one harness directory. */
 export type SetupTarget = {
   /** Absolute path to the spec file. */
@@ -89,6 +128,7 @@ export type SetupTarget = {
   readonly gatewayPort: number | undefined;
   readonly slack: SlackTarget | undefined;
   readonly thredz: ThredzTarget | undefined;
+  readonly agentmail: AgentMailTarget | undefined;
 };
 
 /** Options that override what the spec cannot say. */
@@ -99,6 +139,16 @@ export type ReadTargetOptions = {
    * harness's launcher exports as `PORT` is the whole contract.
    */
   readonly eventsPort?: number;
+  /**
+   * The env variable the inbox id belongs in, when the spec does not say.
+   *
+   * A harness whose mail tier is not live yet has those refs COMMENTED OUT —
+   * the crew ships them that way on purpose, since a `$VAR` ref under
+   * `mcp_servers.*.env` is a hard boot gate and an empty value fails the
+   * daemon. A comment is invisible to any parser, so the operator names the
+   * variable instead of the tool guessing it.
+   */
+  readonly inboxVar?: string;
 };
 
 /**
@@ -143,6 +193,7 @@ export function readSetupTarget(specPath: string, opts: ReadTargetOptions = {}):
     gatewayPort: readPort(asRecord(spec["gateway"])["port"]),
     slack: readSlackTarget(spec),
     thredz: readThredzTarget(spec),
+    agentmail: readAgentMailTarget(spec, opts.inboxVar),
   };
 }
 
@@ -188,6 +239,96 @@ function readThredzTarget(spec: Readonly<Record<string, unknown>>): ThredzTarget
     space: readString(block, "space"),
     visibility,
   };
+}
+
+/** An env key naming an inbox id: `INBOX_ID` or `<ROLE>_INBOX_ID`. */
+const INBOX_ID_KEY_RE = /(?:^|_)INBOX_ID$/;
+
+/**
+ * An env key naming an AgentMail credential — `AGENTMAIL` anywhere, so a
+ * fleet-prefixed `SECRETARY_AGENTMAIL_KEY` matches as readily as the bare
+ * `AGENTMAIL_API_KEY`. An earlier anchored form required the prefix and so
+ * missed exactly the per-role shape a fleet is most likely to use.
+ */
+const AGENTMAIL_KEY_RE = /(?:^|_)AGENTMAIL_[A-Z0-9_]*KEY$/;
+
+/**
+ * Find the AgentMail declaration, or undefined when the spec makes none.
+ *
+ * THE RULE: walk every `mcp_servers.<name>.env` block and take the first that
+ * declares an inbox-id key, or an AgentMail key alongside one. Both are
+ * matched by NAME, which is a compromise this file otherwise avoids — the
+ * Slack and Thredz targets read structural fields, so nothing about their
+ * naming has to be guessed. AgentMail has no such field to read: the spec's
+ * only statement about it is which variables an MCP child receives.
+ *
+ * `override` (from `--inbox-var`) wins outright and is the answer to the
+ * case the heuristic cannot reach. A harness whose mail tier is still in
+ * dry-run keeps these refs commented out — deliberately, because a declared
+ * ref is a hard boot gate and an unset one stops the daemon — and a comment
+ * is invisible to a parser. Rather than pattern-match YAML comments, which
+ * would make setup's behaviour depend on formatting, the operator names the
+ * variable and setup writes it.
+ */
+function readAgentMailTarget(
+  spec: Readonly<Record<string, unknown>>,
+  override: string | undefined,
+): AgentMailTarget | undefined {
+  const servers = asRecord(spec["mcp_servers"]);
+
+  for (const [server, config] of Object.entries(servers)) {
+    const env = asRecord(asRecord(config)["env"]);
+    const keys = Object.keys(env);
+    const inboxKey = keys.find((k) => INBOX_ID_KEY_RE.test(k));
+    const apiKeyKey = keys.find((k) => AGENTMAIL_KEY_RE.test(k));
+
+    if (inboxKey === undefined && apiKeyKey === undefined) continue;
+
+    // An AgentMail key with no inbox id is a half-declaration: the runtime
+    // can authenticate and has nothing to send AS. Report it against the
+    // override when given, so the message names a variable to fill.
+    const inboxVar = override ?? inboxKey;
+    if (inboxVar === undefined) continue;
+
+    // BOTH halves of the slot follow the override. An earlier version let the
+    // label take the override while the lowered ref kept the spec's key, so a
+    // run with `--inbox-var` wrote one variable and told the operator about
+    // another — the worst shape a mistake can take here, because the operator
+    // reaching for the flag is already correcting a wrong match.
+    return {
+      server,
+      inboxId: credentialSlot(
+        `mcp_servers.${server}.env.${inboxVar}`,
+        override !== undefined || inboxKey === undefined ? `$${inboxVar}` : env[inboxKey],
+      ),
+      apiKey:
+        apiKeyKey === undefined
+          ? undefined
+          : credentialSlot(`mcp_servers.${server}.env.${apiKeyKey}`, env[apiKeyKey]),
+      // "The spec has a LIVE ref to the variable setup writes." An override
+      // naming a different variable than the spec declares is not that: the
+      // harness would keep reading its own key while setup fills another, so
+      // the operator has an edit to make either way.
+      declared: inboxKey !== undefined && (override === undefined || override === inboxKey),
+      specInboxVar: inboxKey,
+      matchedByNameOnly: apiKeyKey === undefined,
+    };
+  }
+
+  // Nothing declared, but the operator named a variable — take them at their
+  // word. This is the commented-out case, and the only way through it.
+  if (override !== undefined) {
+    return {
+      server: "(not declared in the spec)",
+      inboxId: credentialSlot(`--inbox-var ${override}`, `$${override}`),
+      apiKey: undefined,
+      declared: false,
+      specInboxVar: undefined,
+      // The operator named the variable, so nothing was guessed.
+      matchedByNameOnly: false,
+    };
+  }
+  return undefined;
 }
 
 /**

@@ -384,3 +384,248 @@ describe("publicHostname", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// AgentMail
+// ---------------------------------------------------------------------------
+
+/**
+ * The AgentMail half is the one target derived from a NAME heuristic rather
+ * than a structural field: there is no `agentmail:` block, only whichever
+ * variables an MCP stdio child is handed. So these tests are mostly about the
+ * two regexes and the escape hatch — the harness whose mail tier is still
+ * commented out, which no parser can see and `--inbox-var` exists to reach.
+ */
+const SPEC_SENDMAIL = `name: secretary
+target: channel
+mcp_servers:
+  sendmail:
+    command: npx
+    args:
+      - agentmail-mcp
+    env:
+      AGENTMAIL_API_KEY: $AGENTMAIL_API_KEY
+      SUPPORT_INBOX_ID: $SUPPORT_INBOX_ID
+`;
+
+/** The crew's real shape: the credential is live, the inbox ref is a comment. */
+const SPEC_INBOX_COMMENTED = `name: secretary
+target: channel
+mcp_servers:
+  sendmail:
+    command: npx
+    env:
+      AGENTMAIL_API_KEY: $AGENTMAIL_API_KEY
+      # SECRETARY_INBOX_ID: $SECRETARY_INBOX_ID
+`;
+
+describe("the agentmail declaration", () => {
+  test("reads the inbox and credential refs out of an mcp child's env", () => {
+    const mail = present(readSetupTarget(writeSpec(SPEC_SENDMAIL)).agentmail, "agentmail");
+
+    expect(mail.server).toBe("sendmail");
+    expect(mail.inboxId).toEqual({
+      label: "mcp_servers.sendmail.env.SUPPORT_INBOX_ID",
+      ref: { kind: "env", name: "SUPPORT_INBOX_ID" },
+    });
+    expect(slotEnvName(mail.inboxId)).toBe("SUPPORT_INBOX_ID");
+    expect(present(mail.apiKey, "apiKey")).toEqual({
+      label: "mcp_servers.sendmail.env.AGENTMAIL_API_KEY",
+      ref: { kind: "env", name: "AGENTMAIL_API_KEY" },
+    });
+    // A live `$VAR` ref: the daemon already reads what setup is about to write.
+    expect(mail.declared).toBe(true);
+  });
+
+  test("readSetupTarget surfaces it beside the slack and thredz halves", () => {
+    const target = readSetupTarget(
+      writeSpec(`name: secretary
+channels:
+  slack:
+    botToken: $SECRETARY_SLACK_BOT_TOKEN
+    signingSecret: $SECRETARY_SLACK_SIGNING_SECRET
+thredz:
+  api_key: $SECRETARY_THREDZ_KEY
+mcp_servers:
+  sendmail:
+    env:
+      SECRETARY_INBOX_ID: $SECRETARY_INBOX_ID
+`),
+    );
+    expect(target.slack).toBeDefined();
+    expect(target.thredz).toBeDefined();
+    expect(present(target.agentmail, "agentmail").server).toBe("sendmail");
+    expect(slotEnvName(present(target.agentmail, "agentmail").inboxId)).toBe("SECRETARY_INBOX_ID");
+  });
+
+  test("a bare INBOX_ID matches too, and the credential may be absent", () => {
+    // The regex allows both halves of `(?:^|_)INBOX_ID$` — a lone harness using
+    // the bare name and a fleet prefixing per role are the same case.
+    const mail = present(
+      readSetupTarget(
+        writeSpec("name: n\nmcp_servers:\n  mail:\n    env:\n      INBOX_ID: $INBOX_ID\n"),
+      ).agentmail,
+      "agentmail",
+    );
+    expect(mail.server).toBe("mail");
+    expect(slotEnvName(mail.inboxId)).toBe("INBOX_ID");
+    expect(mail.apiKey).toBeUndefined();
+    expect(mail.declared).toBe(true);
+  });
+
+  test("INBOX_ID must start the key or follow an underscore", () => {
+    // `MYINBOX_ID` is somebody else's variable, not a role-prefixed inbox id.
+    expect(
+      readSetupTarget(
+        writeSpec("name: n\nmcp_servers:\n  m:\n    env:\n      MYINBOX_ID: $MYINBOX_ID\n"),
+      ).agentmail,
+    ).toBeUndefined();
+    // And the suffix has to end the key.
+    expect(
+      readSetupTarget(
+        writeSpec("name: n\nmcp_servers:\n  m:\n    env:\n      INBOX_IDS: $INBOX_IDS\n"),
+      ).agentmail,
+    ).toBeUndefined();
+  });
+
+  test("the credential regex spans AGENTMAIL_*KEY but stops at AGENTMAIL_API_KEY_ID", () => {
+    const bare = present(
+      readSetupTarget(
+        writeSpec(
+          "name: n\nmcp_servers:\n  m:\n    env:\n      AGENTMAIL_KEY: $AGENTMAIL_KEY\n      INBOX_ID: $INBOX_ID\n",
+        ),
+      ).agentmail,
+      "agentmail",
+    );
+    expect(slotEnvName(present(bare.apiKey, "apiKey"))).toBe("AGENTMAIL_KEY");
+
+    const idNotKey = present(
+      readSetupTarget(
+        writeSpec(
+          "name: n\nmcp_servers:\n  m:\n    env:\n      AGENTMAIL_API_KEY_ID: $AGENTMAIL_API_KEY_ID\n      INBOX_ID: $INBOX_ID\n",
+        ),
+      ).agentmail,
+      "agentmail",
+    );
+    expect(idNotKey.apiKey).toBeUndefined();
+  });
+
+  test("the first mcp server that declares an inbox wins", () => {
+    const mail = present(
+      readSetupTarget(
+        writeSpec(`name: n
+mcp_servers:
+  wiki:
+    env:
+      THREDZ_API_KEY: $THREDZ_API_KEY
+  sendmail:
+    env:
+      FIRST_INBOX_ID: $FIRST_INBOX_ID
+  backup-mail:
+    env:
+      SECOND_INBOX_ID: $SECOND_INBOX_ID
+`),
+      ).agentmail,
+      "agentmail",
+    );
+    expect(mail.server).toBe("sendmail");
+    expect(slotEnvName(mail.inboxId)).toBe("FIRST_INBOX_ID");
+  });
+
+  test("no mcp_servers, or none with a matching key, is no target", () => {
+    expect(readSetupTarget(writeSpec("name: n\n")).agentmail).toBeUndefined();
+    expect(readSetupTarget(writeSpec("name: n\nmcp_servers: {}\n")).agentmail).toBeUndefined();
+    expect(
+      readSetupTarget(writeSpec("name: n\nmcp_servers:\n  wiki:\n    command: npx\n")).agentmail,
+    ).toBeUndefined();
+    expect(
+      readSetupTarget(
+        writeSpec(
+          "name: n\nmcp_servers:\n  wiki:\n    env:\n      THREDZ_API_KEY: $THREDZ_API_KEY\n      THREDZ_DEFAULT_SPACE: docs\n",
+        ),
+      ).agentmail,
+    ).toBeUndefined();
+  });
+
+  test("a credential with no inbox id is a half-declaration, not a target", () => {
+    // The runtime could authenticate and would have nothing to send AS.
+    expect(readSetupTarget(writeSpec(SPEC_INBOX_COMMENTED)).agentmail).toBeUndefined();
+  });
+
+  test("--inbox-var reaches the commented-out tier the parser cannot see", () => {
+    // The spec's own env block is live — only the inbox ref is a comment,
+    // because a declared `$VAR` under mcp_servers.*.env is a hard boot gate.
+    const mail = present(
+      readSetupTarget(writeSpec(SPEC_INBOX_COMMENTED), { inboxVar: "SECRETARY_INBOX_ID" })
+        .agentmail,
+      "agentmail",
+    );
+    expect(mail.server).toBe("sendmail");
+    expect(mail.inboxId.label).toBe("mcp_servers.sendmail.env.SECRETARY_INBOX_ID");
+    expect(slotEnvName(mail.inboxId)).toBe("SECRETARY_INBOX_ID");
+    expect(slotEnvName(present(mail.apiKey, "apiKey"))).toBe("AGENTMAIL_API_KEY");
+    // The harness will not read what setup writes until the operator uncomments.
+    expect(mail.declared).toBe(false);
+  });
+
+  test("--inbox-var alone is a target even when the spec declares nothing", () => {
+    const mail = present(
+      readSetupTarget(writeSpec("name: n\ntarget: channel\n"), {
+        inboxVar: "SECRETARY_INBOX_ID",
+      }).agentmail,
+      "agentmail",
+    );
+    expect(mail.server).toBe("(not declared in the spec)");
+    expect(mail.inboxId.label).toBe("--inbox-var SECRETARY_INBOX_ID");
+    expect(slotEnvName(mail.inboxId)).toBe("SECRETARY_INBOX_ID");
+    expect(mail.apiKey).toBeUndefined();
+    expect(mail.declared).toBe(false);
+  });
+
+  test("--inbox-var wins over a spec-declared inbox key", () => {
+    // The override is documented to win OUTRIGHT: an operator who names a
+    // variable is correcting the heuristic, and the id has to land in the
+    // variable the message names.
+    const mail = present(
+      readSetupTarget(writeSpec(SPEC_SENDMAIL), { inboxVar: "SECRETARY_INBOX_ID" }).agentmail,
+      "agentmail",
+    );
+    expect(mail.inboxId.label).toBe("mcp_servers.sendmail.env.SECRETARY_INBOX_ID");
+    expect(slotEnvName(mail.inboxId)).toBe("SECRETARY_INBOX_ID");
+  });
+
+  test("a malformed inbox ref throws under the mcp_servers label", () => {
+    const err = caught(() =>
+      readSetupTarget(
+        writeSpec(
+          'name: n\nmcp_servers:\n  sendmail:\n    env:\n      SUPPORT_INBOX_ID: "${SUPPORT_INBOX_ID}"\n',
+        ),
+      ),
+    );
+    expect(err.service).toBe("harness");
+    expect(err.message).toContain("mcp_servers.sendmail.env.SUPPORT_INBOX_ID");
+    expect(err.options.fix).toContain("$UPPER_SNAKE");
+  });
+
+  test("an inlined literal inbox id leaves no variable to write", () => {
+    const mail = present(
+      readSetupTarget(
+        writeSpec("name: n\nmcp_servers:\n  m:\n    env:\n      INBOX_ID: inbox_already_known\n"),
+      ).agentmail,
+      "agentmail",
+    );
+    expect(mail.inboxId.ref).toEqual({ kind: "literal", value: "inbox_already_known" });
+    expect(slotEnvName(mail.inboxId)).toBeUndefined();
+    expect(mail.declared).toBe(true);
+  });
+
+  test("an empty inbox value is an env ref to nothing", () => {
+    const mail = present(
+      readSetupTarget(writeSpec("name: n\nmcp_servers:\n  m:\n    env:\n      INBOX_ID:\n"))
+        .agentmail,
+      "agentmail",
+    );
+    expect(mail.inboxId.ref).toEqual({ kind: "env", name: "" });
+    expect(slotEnvName(mail.inboxId)).toBeUndefined();
+  });
+});
