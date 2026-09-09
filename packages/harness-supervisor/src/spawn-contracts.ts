@@ -218,10 +218,20 @@ function defaultWhich(cmd: string): string | undefined {
 
 const ENV_LINE_RE = /^(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(.*)$/;
 
-/** Parse dotenv text: `KEY=VALUE`, optional `export `, surrounding quotes
- *  stripped, `#` comments skipped, no interpolation. Malformed lines are
- *  ignored, never fatal. Mirrors the tolerant parser the manager server
- *  uses for presence checks, so both see the same variables. */
+/**
+ * Parse dotenv text: `KEY=VALUE`, optional `export `, surrounding quotes
+ * stripped, `#` comments skipped, no interpolation. Malformed lines are
+ * ignored, never fatal.
+ *
+ * This is THE dotenv reader for the workspace — `@crewhaus/hangar-server`
+ * re-exports it rather than keeping a second copy, because this function
+ * decides what the spawned daemon actually receives and a divergent second
+ * reader would mean the console reporting one value and the child getting
+ * another.
+ *
+ * A DOUBLE-quoted value is unescaped (see {@link unquoteEnvValue}); a
+ * single-quoted one is taken literally.
+ */
 export function parseEnvText(text: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const rawLine of text.split("\n")) {
@@ -230,17 +240,38 @@ export function parseEnvText(text: string): Record<string, string> {
     const m = line.match(ENV_LINE_RE);
     if (m === null) continue;
     const key = m[1] as string;
-    let value = (m[2] ?? "").trim();
-    const quote = value.startsWith('"') ? '"' : value.startsWith("'") ? "'" : undefined;
-    if (quote !== undefined && value.length >= 2 && value.endsWith(quote)) {
-      value = value.slice(1, -1);
-    } else {
-      const hash = value.indexOf(" #");
-      if (hash !== -1) value = value.slice(0, hash).trim();
-    }
-    out[key] = value;
+    out[key] = unquoteEnvValue((m[2] ?? "").trim());
   }
   return out;
+}
+
+/**
+ * Turn one raw `.env` scalar back into its value.
+ *
+ * Inside DOUBLE quotes, `\\` and `\"` are unescaped — the exact reverse of
+ * the writer in `@crewhaus/hangar-server`'s `encodeEnvValue`, which escapes
+ * both when it has to quote. Without that step the two halves disagreed and
+ * a value containing a backslash or a double quote came back altered:
+ * `K="a\"b"` read as `a\"b`, not `a"b`. Nothing in the current credential
+ * set reaches the quoting path (tokens are all `[A-Za-z0-9_.-]`), so this
+ * was latent rather than live — but a secret that changes shape on a
+ * round trip is the worst possible thing for a file whose whole job is
+ * carrying secrets to a child process.
+ *
+ * Inside SINGLE quotes there is nothing to reverse: the writer never emits
+ * them, and every dotenv implementation treats them as literal.
+ *
+ * Unquoted, a trailing ` #` comment is stripped — which is why a value that
+ * contains one has to be quoted on the way out in the first place.
+ */
+export function unquoteEnvValue(raw: string): string {
+  const quote = raw.startsWith('"') ? '"' : raw.startsWith("'") ? "'" : undefined;
+  if (quote !== undefined && raw.length >= 2 && raw.endsWith(quote)) {
+    const inner = raw.slice(1, -1);
+    return quote === '"' ? inner.replace(/\\(["\\])/g, "$1") : inner;
+  }
+  const hash = raw.indexOf(" #");
+  return hash === -1 ? raw : raw.slice(0, hash).trim();
 }
 
 /** The harness-LOCAL env-file chain, in precedence order (later wins). */

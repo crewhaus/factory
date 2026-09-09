@@ -54,6 +54,7 @@
  */
 import { chmodSync, existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
+import { unquoteEnvValue as supervisorUnquoteEnvValue } from "@crewhaus/harness-supervisor";
 import {
   CHANNEL_ENV_PLATFORMS,
   type ChannelEnvPlatform,
@@ -243,12 +244,22 @@ export function readEnvFileFacts(
   return { files, assignedIn, values, stubs: [...stubs].sort() };
 }
 
-function unquoteEnvValue(raw: string): string {
-  const quote = raw.startsWith('"') ? '"' : raw.startsWith("'") ? "'" : undefined;
-  if (quote !== undefined && raw.length >= 2 && raw.endsWith(quote)) return raw.slice(1, -1);
-  const hash = raw.indexOf(" #");
-  return hash === -1 ? raw : raw.slice(0, hash).trim();
-}
+/**
+ * Turn one raw `.env` scalar back into its value — the exact inverse of
+ * {@link encodeEnvValue}, which is the property that matters here.
+ *
+ * It is the supervisor's `unquoteEnvValue`, imported rather than restated so
+ * the reader that answers "what is this variable set to?" cannot drift from
+ * the reader that decides what the spawned daemon actually receives.
+ *
+ * The two used to disagree with the WRITER instead: `encodeEnvValue` escapes
+ * `\\` and `\"` when it has to quote, and nothing reversed that, so
+ * `upsertEnvVar(path, "K", 'a"b')` wrote `K="a\"b"` and read back `a\"b`. No
+ * credential in use reaches the quoting path — tokens are all
+ * `[A-Za-z0-9_.-]` — so this never corrupted a live secret, but a file whose
+ * only job is carrying secrets must round-trip them byte for byte.
+ */
+const unquoteEnvValue = supervisorUnquoteEnvValue;
 
 // ---------------------------------------------------------------------------
 // The required set

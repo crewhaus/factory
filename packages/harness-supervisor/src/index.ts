@@ -211,6 +211,7 @@ export {
   loadEnvChain,
   OVERRIDE_ENV_KEYS,
   parseEnvText,
+  unquoteEnvValue,
   readsBriefOnStdin,
   resolveBundle,
   resolveCrewhausBin,

@@ -8,31 +8,19 @@
  */
 import { type EnvFileRef, buildSpawnEnv, loadEnvChain } from "@crewhaus/harness-supervisor";
 
-const ENV_LINE_RE = /^(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(.*)$/;
-
-/** Parse dotenv text: `KEY=VALUE` lines, optional `export `, surrounding
- *  single/double quotes stripped, `#` comment lines skipped, no
- *  interpolation. Malformed lines are ignored, never fatal. */
-export function parseEnvText(text: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const rawLine of text.split("\n")) {
-    const line = rawLine.trim();
-    if (line === "" || line.startsWith("#")) continue;
-    const m = ENV_LINE_RE.exec(line);
-    if (m === null) continue;
-    const key = m[1] as string;
-    let value = (m[2] ?? "").trim();
-    const quote = value.startsWith('"') ? '"' : value.startsWith("'") ? "'" : undefined;
-    if (quote !== undefined && value.length >= 2 && value.endsWith(quote)) {
-      value = value.slice(1, -1);
-    } else {
-      const hash = value.indexOf(" #");
-      if (hash !== -1) value = value.slice(0, hash).trim();
-    }
-    out[key] = value;
-  }
-  return out;
-}
+/**
+ * Parse dotenv text — the supervisor's parser, re-exported rather than
+ * reimplemented.
+ *
+ * It used to be a verbatim copy, and the copy is exactly what let a bug live
+ * in two places: both readers stripped surrounding quotes without reversing
+ * the `\\`/`\"` escapes the writer emits, so a value containing either came
+ * back altered. Worse than the bug itself, a second reader can disagree with
+ * the one that builds the spawn environment — the server would report one
+ * value and the child would receive another. One implementation makes that
+ * class of drift impossible.
+ */
+export { parseEnvText } from "@crewhaus/harness-supervisor";
 
 export type HarnessEnvFiles = {
   /** Folded key → value map across the chain (later files win). */
