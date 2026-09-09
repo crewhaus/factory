@@ -205,6 +205,14 @@ export function channelEventsPath(platform: ChannelPlatform): string {
   return `/${platform}/events`;
 }
 
+/** The daemon's INTERACTIVITY route — button clicks, not events. Same single
+ *  source: target-channel-bot's gateway matches `/^\/([^/]+)\/actions$/`
+ *  against the same adapter map. A platform app that sets only the events URL
+ *  renders approval cards whose Approve/Deny clicks reach nothing. */
+export function channelActionsPath(platform: ChannelPlatform): string {
+  return `/${platform}/actions`;
+}
+
 /**
  * Join `--base-url` with a daemon route. Validates the base URL parses and
  * is http(s); trailing slashes are normalized so `https://x/` and `https://x`
@@ -327,6 +335,13 @@ export type SlackAppManifest = {
       readonly request_url: string;
       readonly bot_events: ReadonlyArray<string>;
     };
+    /** Approve/Deny button clicks. Without this the generated gateway's
+     *  `/<adapter>/actions` route is never called: approval cards render and
+     *  their buttons do nothing. */
+    readonly interactivity: {
+      readonly is_enabled: boolean;
+      readonly request_url: string;
+    };
     readonly org_deploy_enabled: boolean;
     readonly socket_mode_enabled: boolean;
     readonly token_rotation_enabled: boolean;
@@ -364,6 +379,10 @@ export function buildSlackManifest(
       event_subscriptions: {
         request_url: joinBaseUrl(baseUrl, channelEventsPath("slack")),
         bot_events: deriveSlackBotEvents(reactions),
+      },
+      interactivity: {
+        is_enabled: true,
+        request_url: joinBaseUrl(baseUrl, channelActionsPath("slack")),
       },
       org_deploy_enabled: false,
       socket_mode_enabled: false,

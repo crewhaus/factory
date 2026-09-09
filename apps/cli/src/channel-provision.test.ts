@@ -14,6 +14,7 @@ import type { IrChannelV0 } from "@crewhaus/ir";
 import { parseSpec } from "@crewhaus/spec";
 import {
   CHANNEL_ENV_PLATFORMS,
+  CHANNEL_PLATFORMS,
   ChannelApiError,
   ChannelEnvRefError,
   DISCORD_PERMISSION_BITS,
@@ -24,6 +25,7 @@ import {
   buildDiscordProvision,
   buildSlackManifest,
   buildTelegramProvision,
+  channelActionsPath,
   channelEnvChecks,
   channelEventsPath,
   collectProvisionMissingEnv,
@@ -303,6 +305,28 @@ describe("Slack manifest generation", () => {
     expect(manifest.oauth_config.scopes.bot).toContain("reactions:read");
     // The daemon is a webhook server; the spec's appToken is reserved/unused.
     expect(manifest.settings.socket_mode_enabled).toBe(false);
+  });
+
+  test("sets the interactivity request URL — without it, approval buttons die", () => {
+    const ir = channelIr();
+    const manifest = buildSlackManifest({ name: ir.name, channelReactions: false }, BASE_URL);
+    // The gateway routes button clicks on /<adapter>/actions, a DIFFERENT
+    // webhook from /<adapter>/events. An app configured with only the events
+    // URL renders approval cards whose Approve/Deny clicks reach nothing.
+    expect(manifest.settings.interactivity.is_enabled).toBe(true);
+    expect(manifest.settings.interactivity.request_url).toBe(
+      "https://bot.example.com/slack/actions",
+    );
+    expect(manifest.settings.interactivity.request_url).not.toBe(
+      manifest.settings.event_subscriptions.request_url,
+    );
+  });
+
+  test("channelActionsPath mirrors channelEventsPath per platform", () => {
+    for (const platform of CHANNEL_PLATFORMS) {
+      expect(channelActionsPath(platform)).toBe(`/${platform}/actions`);
+      expect(channelEventsPath(platform)).toBe(`/${platform}/events`);
+    }
   });
 
   test("renders manifest YAML with quoted scalars and nested lists", () => {
