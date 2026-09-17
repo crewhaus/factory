@@ -872,6 +872,40 @@ export const channelSynthetic: M3Handler = async (ctx) => {
 // GET /api/h/:id/gateway
 // ---------------------------------------------------------------------------
 
+/**
+ * Where the daemon's own mini dashboard lives — `null` unless it is really
+ * being served (the spec asked for a UI, declared a port, and the daemon is
+ * up).
+ *
+ * The address is LOOPBACK BY DESIGN, not by omission. The control-UI port is
+ * the one port `service-setup` refuses to expose — its field is documented
+ * "Never tunnelled" (packages/service-setup/src/target.ts:88) and `crewhaus
+ * services setup` prints it as `(not tunnelled)` while pointing the public
+ * hostname at the events port instead. The `gateway:` block is `.strict()`
+ * with no bind field, so an operator cannot move it, and the surface carries
+ * no auth at all.
+ *
+ * (The emitted daemon's `Bun.serve` omits `hostname` and so currently binds
+ * the wildcard, which makes the port reachable across the LAN in fact. That
+ * is an omission, not a licence: this URL states the intended address, and
+ * nothing here should be rebuilt on top of the accident.)
+ *
+ * So the address is right for a viewer sitting at the machine and wrong for
+ * everyone else — and since `crewhaus hangar --lan`, "everyone else"
+ * includes a phone, on which `127.0.0.1` is the phone. The server cannot
+ * tell the two apart; only the browser knows the host it reached this
+ * console on. The URL therefore stays true and the client decides whether to
+ * OFFER it — see `dashboardReach` in hangar-ui's channels view.
+ *
+ * The port is the spec's, not the port ledger's `gatewayPort`: the emitted
+ * daemon bakes `const __gatewayPort = <spec port>` in at compile time, so
+ * the spec block is what actually gets bound and nothing can remap it.
+ */
+export function dashboardUrlFor(ui: boolean, port: number | null, running: boolean): string | null {
+  if (!ui || port === null || !running) return null;
+  return `http://127.0.0.1:${port}/`;
+}
+
 export const gateway: M3Handler = async (ctx) => {
   const dir = harnessDirOf(ctx);
   const spec = readHarnessSpec(dir);
@@ -927,8 +961,7 @@ export const gateway: M3Handler = async (ctx) => {
     turnCount: asNumber(record?.["turnCount"]) ?? null,
     heartbeatCount: asNumber(record?.["heartbeatCount"]) ?? null,
     channels: Array.isArray(statusChannels) ? statusChannels.map(String) : [],
-    // The daemon's own mini dashboard, when it is actually serving one.
-    dashboardUrl: ui && port !== null && live.running ? `http://127.0.0.1:${port}/` : null,
+    dashboardUrl: dashboardUrlFor(ui, port, live.running),
   };
 };
 
