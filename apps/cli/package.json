@@ -118,6 +118,7 @@
     "@crewhaus/target-cli": "workspace:*",
     "@crewhaus/target-eval-bundle": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-text": "workspace:*",
     "@crewhaus/tool-categories": "workspace:*",
     "@crewhaus/tool-code-execution": "workspace:*",
     "@crewhaus/tool-codegraph": "workspace:*",

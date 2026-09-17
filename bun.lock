@@ -129,6 +129,7 @@
         "@crewhaus/tool-retrieve": "workspace:*",
         "@crewhaus/tool-screen-capture": "workspace:*",
         "@crewhaus/tool-task": "workspace:*",
+        "@crewhaus/tool-text": "workspace:*",
         "@crewhaus/tool-todo": "workspace:*",
         "@crewhaus/tool-vision-grounding": "workspace:*",
         "@crewhaus/tool-web": "workspace:*",
@@ -2391,6 +2392,19 @@
         "@crewhaus/run-context": "workspace:*",
       },
     },
+    "packages/tool-text": {
+      "name": "@crewhaus/tool-text",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-todo": {
       "name": "@crewhaus/tool-todo",
       "version": "0.6.0",
@@ -3026,6 +3040,8 @@
     "@crewhaus/tool-screen-capture": ["@crewhaus/tool-screen-capture@workspace:packages/tool-screen-capture"],
 
     "@crewhaus/tool-task": ["@crewhaus/tool-task@workspace:packages/tool-task"],
+
+    "@crewhaus/tool-text": ["@crewhaus/tool-text@workspace:packages/tool-text"],
 
     "@crewhaus/tool-todo": ["@crewhaus/tool-todo@workspace:packages/tool-todo"],
 

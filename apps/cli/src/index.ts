@@ -3614,7 +3614,7 @@ async function detectDefaultModel(): Promise<string | undefined> {
  * `BUILTIN_TOOL_MAP` in packages/target-cli/src/index.ts — keep them in sync.
  */
 async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
-  const [fs, bash, todo, web, image, fetchPkg, imageGen, docIngest, codegraph, codeExec] =
+  const [fs, bash, todo, web, image, fetchPkg, imageGen, docIngest, codegraph, codeExec, text] =
     await Promise.all([
       import("@crewhaus/tool-fs"),
       import("@crewhaus/tool-bash"),
@@ -3626,6 +3626,7 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
       import("@crewhaus/tool-document-ingest"),
       import("@crewhaus/tool-codegraph"),
       import("@crewhaus/tool-code-execution"),
+      import("@crewhaus/tool-text"),
     ]);
   const map: Record<string, RegisteredTool> = {
     read: fs.read,
@@ -3656,6 +3657,25 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     codegraphCallers: codegraph.codegraphCallers,
     codegraphCallees: codegraph.codegraphCallees,
     codegraphImpact: codegraph.codegraphImpact,
+    // Deterministic text tools (@crewhaus/tool-text) — pure, no I/O.
+    compactLog: text.compactLog,
+    countTokens: text.countTokens,
+    escapeString: text.escapeString,
+    extractEntities: text.extractEntities,
+    extractKeywords: text.extractKeywords,
+    fuzzyMatch: text.fuzzyMatch,
+    glossaryReplace: text.glossaryReplace,
+    markdownOutline: text.markdownOutline,
+    markdownTable: text.markdownTable,
+    normalizeText: text.normalizeText,
+    regexExtract: text.regexExtract,
+    renderTemplate: text.renderTemplate,
+    ruleClassify: text.ruleClassify,
+    sortLines: text.sortLines,
+    textDiff: text.textDiff,
+    textSimilarity: text.textSimilarity,
+    truncateToBudget: text.truncateToBudget,
+    wrapText: text.wrapText,
   };
   // Item 18 map-sync floor: this map's keys ARE the canonical runtime tool
   // list. `CLI_RUNTIME_TOOL_KEYS` mirrors them (so the map-sync test can

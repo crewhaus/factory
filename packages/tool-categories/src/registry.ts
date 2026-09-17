@@ -47,6 +47,30 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     tools: ["readImage", "imageGenerate"],
   },
 
+  text: {
+    title: "Transform, measure, diff and classify text without a model call",
+    tools: [
+      "compactLog",
+      "countTokens",
+      "escapeString",
+      "extractEntities",
+      "extractKeywords",
+      "fuzzyMatch",
+      "glossaryReplace",
+      "markdownOutline",
+      "markdownTable",
+      "normalizeText",
+      "regexExtract",
+      "renderTemplate",
+      "ruleClassify",
+      "sortLines",
+      "textDiff",
+      "textSimilarity",
+      "truncateToBudget",
+      "wrapText",
+    ],
+  },
+
   // ---- leaf categories: execution ----
   process: {
     title: "Run shell commands and manage background processes",
@@ -90,7 +114,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   content: {
     title: "Everything that reads or produces documents and images",
-    includes: ["docs", "media"],
+    includes: ["docs", "media", "text"],
   },
 });
 
