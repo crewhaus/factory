@@ -17,6 +17,8 @@ import { canRunAction, omniRows } from "../assets/js/omnibox.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { GLOBAL_VIEWS, HARNESS_TABS, parseRoute } from "../assets/js/router.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
+import { dashboardReach, isLoopbackHostname } from "../assets/js/views/channels.js";
+// @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { healthScoreCard, rankHealthRows } from "../assets/js/views/health.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { shouldOnboard } from "../assets/js/views/onboarding.js";
@@ -420,5 +422,69 @@ describe("router — the M4 screens are deep-linkable", () => {
     expect(parseRoute("#/health")).toEqual({ view: "health" });
     expect(parseRoute("#/settings")).toEqual({ view: "settings" });
     expect(parseRoute("#/h/hrn_1/panes")).toEqual({ view: "harness", id: "hrn_1", tab: "panes" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The daemon dashboard link — honest about who can actually open it
+// ---------------------------------------------------------------------------
+
+describe("the daemon's dashboard link", () => {
+  const loopback = (host: string): boolean => isLoopbackHostname(host) as boolean;
+
+  test("recognises every spelling of this machine", () => {
+    for (const host of [
+      "localhost",
+      "LocalHost",
+      "127.0.0.1",
+      "127.0.0.2", // the whole /8 — a daemon on .2 is every bit as local
+      "127.255.255.254",
+      "::1",
+      "[::1]", // in case a browser hands the literal over bracketed
+      "0:0:0:0:0:0:0:1",
+      "  localhost  ",
+    ]) {
+      expect(`${host}=${loopback(host)}`).toBe(`${host}=true`);
+    }
+  });
+
+  test("everything else is somewhere else — including the wildcards", () => {
+    for (const host of [
+      "192.168.1.42", // the address `crewhaus hangar --lan` binds
+      "10.0.0.5",
+      "0.0.0.0", // a wildcard BINDS everywhere; as a viewer host it is not local
+      "::",
+      "128.0.0.1",
+      "127.0.0", // malformed — fail closed
+      "127.0.0.256",
+      "example.com",
+      "", // a file:// document has no hostname
+    ]) {
+      expect(`${host}=${loopback(host)}`).toBe(`${host}=false`);
+    }
+  });
+
+  test("non-string hostnames fail closed rather than throwing", () => {
+    expect(loopback(undefined as unknown as string)).toBe(false);
+    expect(loopback(null as unknown as string)).toBe(false);
+    expect(loopback(42 as unknown as string)).toBe(false);
+  });
+
+  test("offers the link at the machine, and only names the address from away", () => {
+    const url = "http://127.0.0.1:8787/";
+    // Sitting at the daemon's machine: a live link, exactly as before.
+    expect(dashboardReach(url, "127.0.0.1")).toEqual({ reachable: true, url });
+    expect(dashboardReach(url, "localhost")).toEqual({ reachable: true, url });
+    // On a phone over `crewhaus hangar --lan`: the URL is still the truth,
+    // but 127.0.0.1 is the PHONE, so the view must not offer it as a link.
+    expect(dashboardReach(url, "192.168.1.42")).toEqual({ reachable: false, url });
+  });
+
+  test("no dashboard means no row at all", () => {
+    // The server already gates on ui + a running daemon; null means "not
+    // serving one", which is not the same as "serving one you cannot reach".
+    expect(dashboardReach(null, "127.0.0.1")).toBe(null);
+    expect(dashboardReach(undefined, "127.0.0.1")).toBe(null);
+    expect(dashboardReach("", "127.0.0.1")).toBe(null);
   });
 });
