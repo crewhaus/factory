@@ -84,7 +84,7 @@ edit(
       out = out.replace(re, (_m, head: string, body: string, tail: string) =>
         body.includes(`"${manifest.category.name}"`)
           ? `${head}${body}${tail}`
-          : `${head}${body.trimEnd()} "${manifest.category.name}",${tail}`,
+          : `${head}${body.trimEnd().replace(/,$/, "")}, "${manifest.category.name}"${tail}`,
       );
     }
     return out;
@@ -97,7 +97,8 @@ edit(
   "packages/target-cli/src/index.ts",
   (s) => {
     if (s.includes(`package: "${scope}"`)) return undefined;
-    const anchor = '  codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },';
+    const anchor =
+      '  codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },';
     if (!s.includes(anchor)) throw new Error("target-cli BUILTIN_TOOL_MAP anchor moved");
     const add = keys.map((k) => `  ${k}: { package: "${scope}", export: "${k}" },`).join("\n");
     return s.replace(anchor, `${add}\n${anchor}`);
@@ -110,14 +111,25 @@ edit(
   "apps/cli/src/index.ts",
   (s) => {
     if (s.includes(`import("${scope}")`)) return undefined;
-    const local = pkgDir.replace(/^tool-/, "").replace(/-([a-z])/g, (_m, c: string) => c.toUpperCase());
+    const local = pkgDir
+      .replace(/^tool-/, "")
+      .replace(/-([a-z])/g, (_m, c: string) => c.toUpperCase());
+    // The import goes LAST in the Promise.all array and the binding goes LAST
+    // in the destructuring, so the two lists stay aligned. Inserting the
+    // import near the top while appending the binding at the end silently
+    // pairs every tool package with the wrong module.
     let out = s.replace(
-      '      import("@crewhaus/tool-code-execution"),',
-      `      import("@crewhaus/tool-code-execution"),\n      import("${scope}"),`,
+      /(\n(\s*)import\("@crewhaus\/tool-code-execution"\),[\s\S]*?)(\n\s*\]\);)/,
+      (_m, body: string, indent: string, close: string) =>
+        `${body}\n${indent}import("${scope}"),${close}`,
     );
-    // Widen the destructuring that receives those imports.
-    out = out.replace(/(const \[[^\]]*?)(\] =\s*await Promise\.all)/, (_m, head: string, tail: string) =>
-      head.trimEnd().endsWith(",") ? `${head} ${local}${tail}` : `${head}, ${local}${tail}`,
+    // Widen the destructuring that receives those imports, also at the end.
+    out = out.replace(
+      /(const \[[^\]]*?)(\s*\] =\s*await Promise\.all)/,
+      (_m, head: string, tail: string) =>
+        head.trimEnd().endsWith(",")
+          ? `${head}\n    ${local},${tail}`
+          : `${head},\n    ${local},${tail}`,
     );
     const anchor = "    codegraphImpact: codegraph.codegraphImpact,";
     if (!out.includes(anchor)) throw new Error("loadToolMap anchor moved");
@@ -132,10 +144,18 @@ edit(
   "apps/cli/src/tools-cli.ts",
   (s) => {
     if (keys.every((k) => s.includes(`  "${k}",`))) return undefined;
-    let out = s.replace(
-      '  "codegraphImpact",\n]);',
-      `  "codegraphImpact",\n${keys.map((k) => `  "${k}",`).join("\n")}\n]);`,
+    // Anchor on the array itself, not on whatever happens to be its last
+    // entry: the previous version keyed off "codegraphImpact" and silently
+    // did nothing once another package had appended below it.
+    const listRe =
+      /(export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object\.freeze\(\[)([\s\S]*?)(\n\]\);)/;
+    if (!listRe.test(s)) throw new Error("CLI_RUNTIME_TOOL_KEYS declaration moved");
+    const out = s.replace(
+      listRe,
+      (_m, head: string, body: string, close: string) =>
+        `${head}${body}\n${keys.map((k) => `  "${k}",`).join("\n")}${close}`,
     );
+    if (out === s) throw new Error("CLI_RUNTIME_TOOL_KEYS was not updated");
     const anchor = '  todoWrite: ["todo", "task list", "track tasks", "checklist"],';
     if (!out.includes(anchor)) throw new Error("TOOL_KEYWORDS anchor moved");
     const add = manifest.tools
@@ -179,7 +199,11 @@ for (const [pj, tc, rel] of [
     (s) =>
       s.includes(`"${rel}"`)
         ? undefined
-        : s.replace('{ "path": "../tool-builder" },', `{ "path": "../tool-builder" },\n    { "path": "${rel}" },`)
+        : s
+            .replace(
+              '{ "path": "../tool-builder" },',
+              `{ "path": "../tool-builder" },\n    { "path": "${rel}" },`,
+            )
             .replace(
               '{ "path": "../../packages/tool-builder" },',
               `{ "path": "../../packages/tool-builder" },\n    { "path": "${rel}" },`,
@@ -190,7 +214,9 @@ for (const [pj, tc, rel] of [
 
 const changed = edits.filter((e) => e.applied);
 for (const e of edits) {
-  console.log(`${e.applied ? (checkOnly ? "WOULD EDIT" : "edited   ") : "unchanged"}  ${e.file}  — ${e.why}`);
+  console.log(
+    `${e.applied ? (checkOnly ? "WOULD EDIT" : "edited   ") : "unchanged"}  ${e.file}  — ${e.why}`,
+  );
 }
 console.log(
   checkOnly
