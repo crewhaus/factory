@@ -631,3 +631,278 @@ export function diffToolMapKeys(
     onlyInB: [...setB].filter((k) => !setA.has(k)).sort(),
   };
 }
+
+// -------- tools categories / show / search (navigation) --------
+
+/**
+ * Navigation over the builtin catalogue. `tools list` answers "what exists";
+ * these answer the three questions that follow it — how is it grouped, what
+ * exactly does this one do, and which one do I want.
+ *
+ * All pure: the caller supplies the resolved tool map, so every function here
+ * is unit-testable without touching the filesystem or importing a tool.
+ */
+
+/** One row of `tools categories`. */
+export type CategoryRow = {
+  readonly name: string;
+  /** The selector an operator writes in a spec: `all-<name>`. */
+  readonly selector: string;
+  readonly title: string;
+  /** Leaf categories own tools; roll-ups own other categories. */
+  readonly kind: "leaf" | "roll-up";
+  /** Tool keys, resolved transitively for a roll-up. */
+  readonly tools: ReadonlyArray<string>;
+  /** For a roll-up, the categories it rolls up. */
+  readonly includes?: ReadonlyArray<string>;
+};
+
+/**
+ * Build the category table. `resolve` is `toolsInCategory` from
+ * `@crewhaus/tool-categories`, injected so this module stays dependency-free
+ * and the test can drive a fixture registry.
+ */
+export function buildCategoryRows(
+  categories: Readonly<
+    Record<
+      string,
+      { title: string; tools?: ReadonlyArray<string>; includes?: ReadonlyArray<string> }
+    >
+  >,
+  resolve: (name: string) => ReadonlyArray<string>,
+): CategoryRow[] {
+  return Object.entries(categories)
+    .map(([name, def]) => ({
+      name,
+      selector: `all-${name}`,
+      title: def.title,
+      kind: (def.tools !== undefined ? "leaf" : "roll-up") as "leaf" | "roll-up",
+      tools: resolve(name),
+      ...(def.includes !== undefined ? { includes: [...def.includes] } : {}),
+    }))
+    .sort((a, b) => {
+      // Leaves first, then roll-ups: an operator scanning for "what can I
+      // turn on" wants the concrete groups before the bundles of groups.
+      if (a.kind !== b.kind) return a.kind === "leaf" ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+}
+
+/** Render the category table for the terminal. */
+export function formatCategoryLines(rows: ReadonlyArray<CategoryRow>): string[] {
+  const lines: string[] = [];
+  const leaves = rows.filter((r) => r.kind === "leaf");
+  const rollUps = rows.filter((r) => r.kind === "roll-up");
+  if (leaves.length > 0) {
+    lines.push("categories:");
+    for (const r of leaves) {
+      lines.push(`  ${r.selector}  (${r.tools.length})  ${r.title}`);
+      lines.push(`    ${r.tools.join(", ")}`);
+    }
+  }
+  if (rollUps.length > 0) {
+    lines.push("");
+    lines.push("roll-ups:");
+    for (const r of rollUps) {
+      lines.push(`  ${r.selector}  (${r.tools.length})  ${r.title}`);
+      lines.push(`    = ${(r.includes ?? []).map((c) => `all-${c}`).join(" + ")}`);
+    }
+  }
+  lines.push("");
+  lines.push("use in a spec:  tools: [all-fs, -write]   # a category, minus one tool");
+  return lines;
+}
+
+/** Full detail for one tool — the `tools show` payload. */
+export type ToolDetail = {
+  readonly key: string;
+  readonly name: string;
+  readonly description: string;
+  readonly categories: ReadonlyArray<string>;
+  readonly readOnly: boolean;
+  readonly destructive: boolean;
+  readonly scope: string;
+  readonly ioCapability?: string;
+  readonly requiresSandbox: boolean;
+  readonly requireJustification: boolean;
+  readonly concurrencySafe: boolean;
+  /** Top-level input field names, derived from the tool's own JSON Schema. */
+  readonly inputFields: ReadonlyArray<string>;
+};
+
+/**
+ * Project one tool into its detail record. `key` is the camelCase spec key;
+ * `categoriesFor` is `categoriesForTool`, injected for the same reason as
+ * above. Returns undefined when the key names no builtin, so the caller can
+ * offer suggestions rather than printing an empty record.
+ */
+export function buildToolDetail(
+  key: string,
+  toolMap: Readonly<Record<string, ToolLike>>,
+  categoriesFor: (key: string) => ReadonlyArray<string>,
+): ToolDetail | undefined {
+  const tool = toolMap[key];
+  if (tool === undefined) return undefined;
+  return {
+    key,
+    name: tool.name,
+    description: tool.description,
+    categories: categoriesFor(key),
+    readOnly: tool.readOnly,
+    destructive: tool.destructive,
+    scope: tool.scope,
+    ...(tool.ioCapability !== undefined ? { ioCapability: tool.ioCapability } : {}),
+    requiresSandbox: tool.requiresSandbox,
+    requireJustification: tool.requireJustification ?? false,
+    concurrencySafe: tool.concurrencySafe ?? false,
+    inputFields: inputFieldNames(tool),
+  };
+}
+
+/**
+ * The structural subset of RegisteredTool this module reads. Declared
+ * locally so `tools-cli` keeps its "pure, no tool imports" property.
+ */
+export type ToolLike = {
+  readonly name: string;
+  readonly description: string;
+  readonly readOnly: boolean;
+  readonly destructive: boolean;
+  readonly scope: string;
+  readonly ioCapability?: string;
+  readonly requiresSandbox: boolean;
+  readonly requireJustification?: boolean;
+  readonly concurrencySafe?: boolean;
+  readonly inputSchema?: unknown;
+  readonly jsonSchema?: unknown;
+};
+
+/**
+ * Pull top-level input field names off a tool. Prefers the authoritative
+ * `jsonSchema` when the tool carries one (MCP tools do); otherwise reads the
+ * Zod schema's own `shape`, which is public API on a ZodObject. Returns an
+ * empty list rather than throwing when the schema is neither — `tools show`
+ * degrading to "no fields listed" beats it crashing on an exotic schema.
+ */
+export function inputFieldNames(tool: ToolLike): ReadonlyArray<string> {
+  const fromJson = (tool.jsonSchema as { properties?: Record<string, unknown> } | undefined)
+    ?.properties;
+  if (fromJson !== undefined && typeof fromJson === "object") {
+    return Object.keys(fromJson).sort();
+  }
+  const shape = (tool.inputSchema as { shape?: Record<string, unknown> } | undefined)?.shape;
+  if (shape !== undefined && typeof shape === "object") {
+    return Object.keys(shape).sort();
+  }
+  return [];
+}
+
+/** Render `tools show` for the terminal. */
+export function formatToolDetailLines(d: ToolDetail): string[] {
+  const flags = [
+    d.readOnly ? "read-only" : "mutating",
+    d.destructive ? "destructive" : undefined,
+    d.scope === "external" ? "external" : "internal",
+    d.ioCapability !== undefined ? `io:${d.ioCapability}` : undefined,
+    d.requiresSandbox ? "sandbox-required" : undefined,
+    d.requireJustification ? "justification-gated" : undefined,
+    d.concurrencySafe ? "concurrency-safe" : undefined,
+  ].filter((f): f is string => f !== undefined);
+  return [
+    `${d.key}  (${d.name})`,
+    `  ${d.description}`,
+    "",
+    `  flags       ${flags.join(", ")}`,
+    `  categories  ${d.categories.length > 0 ? d.categories.map((c) => `all-${c}`).join(", ") : "(uncategorized)"}`,
+    `  input       ${d.inputFields.length > 0 ? d.inputFields.join(", ") : "(no declared fields)"}`,
+    "",
+    `  enable with  tools: [${d.key}]`,
+  ];
+}
+
+/** One `tools search` hit, most relevant first. */
+export type SearchHit = {
+  readonly key: string;
+  readonly name: string;
+  readonly description: string;
+  /** Higher is better. Exposed so the test can pin the ranking. */
+  readonly score: number;
+  /** Which field matched, for the "why did this match" column. */
+  readonly matchedOn: ReadonlyArray<string>;
+};
+
+/**
+ * Rank builtins against a free-text query by exact/prefix/substring match on
+ * the key, the PascalCase name, the description, and the tool's categories.
+ * Deterministic and lexical — no model, no embeddings, same posture as
+ * `tools suggest`.
+ */
+export function searchTools(
+  query: string,
+  toolMap: Readonly<Record<string, ToolLike>>,
+  categoriesFor: (key: string) => ReadonlyArray<string>,
+): SearchHit[] {
+  const q = query.trim().toLowerCase();
+  if (q === "") return [];
+  const hits: SearchHit[] = [];
+  for (const [key, tool] of Object.entries(toolMap)) {
+    const keyL = key.toLowerCase();
+    const nameL = tool.name.toLowerCase();
+    const descL = tool.description.toLowerCase();
+    const cats = categoriesFor(key).map((c) => c.toLowerCase());
+    let score = 0;
+    const matchedOn: string[] = [];
+    if (keyL === q || nameL === q) {
+      score += 100;
+      matchedOn.push("name");
+    } else if (keyL.startsWith(q) || nameL.startsWith(q)) {
+      score += 50;
+      matchedOn.push("name");
+    } else if (keyL.includes(q) || nameL.includes(q)) {
+      score += 25;
+      matchedOn.push("name");
+    }
+    if (cats.some((c) => c === q)) {
+      score += 30;
+      matchedOn.push("category");
+    }
+    if (descL.includes(q)) {
+      score += 10;
+      matchedOn.push("description");
+    }
+    if (score > 0)
+      hits.push({ key, name: tool.name, description: tool.description, score, matchedOn });
+  }
+  return hits.sort((a, b) => b.score - a.score || a.key.localeCompare(b.key));
+}
+
+/** Render `tools search` for the terminal. */
+export function formatSearchLines(query: string, hits: ReadonlyArray<SearchHit>): string[] {
+  if (hits.length === 0) {
+    return [`no builtin tool matches "${query}" — try \`crewhaus tools categories\``];
+  }
+  const lines = [`${hits.length} match(es) for "${query}":`];
+  for (const h of hits) {
+    lines.push(`  ${h.key} (${h.name})  [${h.matchedOn.join("+")}]`);
+    lines.push(`    ${h.description}`);
+  }
+  return lines;
+}
+
+/**
+ * Suggest near-miss keys for an unknown `tools show` argument, so a typo
+ * gets a pointer instead of a bare "not found".
+ */
+export function nearestToolKeys(
+  key: string,
+  known: ReadonlyArray<string>,
+  limit = 3,
+): ReadonlyArray<string> {
+  const k = key.toLowerCase();
+  return known
+    .filter((candidate) => {
+      const c = candidate.toLowerCase();
+      return c.includes(k) || k.includes(c) || c.startsWith(k.slice(0, 3));
+    })
+    .slice(0, limit);
+}

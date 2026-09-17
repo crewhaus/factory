@@ -212,6 +212,7 @@ import { renderBanner, shouldPrintBanner } from "@crewhaus/target-cli";
 import { DEFAULT_TEMPLATE_REGISTRY_URL } from "@crewhaus/template-marketplace-client";
 import { buildTool } from "@crewhaus/tool-builder";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
+import { CATEGORIES, categoriesForTool, toolsInCategory } from "@crewhaus/tool-categories";
 import { registerMcpServer, registerOptionalMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
@@ -1501,11 +1502,18 @@ import { probeThredz, thredzProbeTarget, thredzProbeToCheck } from "./thredz-pro
 import {
   CLI_RUNTIME_TOOL_KEYS,
   auditTools,
+  buildCategoryRows,
+  buildToolDetail,
   buildToolList,
   buildToolUsage,
   formatAuditLines,
+  formatCategoryLines,
+  formatSearchLines,
   formatSuggestLines,
+  formatToolDetailLines,
   formatToolListLines,
+  nearestToolKeys,
+  searchTools,
   suggestTools,
 } from "./tools-cli";
 // Item 7 — failure-arbiter wiring: post-eval triage (verdicts.json + report
@@ -14457,9 +14465,12 @@ function parseSessionsLimit(args: ParsedArgs, dflt: number): number | "all" {
 async function runTools(action: string, args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus tools <list|suggest|audit>\n" +
+      "usage: crewhaus tools <list|categories|show|search|suggest|audit>\n" +
         "\n" +
-        "  list                     print every builtin tool + its metadata\n" +
+        "  categories               every tool category + what it turns on\n" +
+        "  show <tool>              one tool in full: flags, categories, inputs\n" +
+        "  search <query>           find a tool by name, description or category\n" +
+        "  list [--category NAME]   print every builtin tool + its metadata\n" +
         "  suggest [spec.yaml]      rank builtins against agent.instructions\n" +
         "                           (deterministic keyword match; default spec\n" +
         "                           is ./crewhaus.yaml)\n" +
@@ -14475,13 +14486,61 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
   const jsonMode = args.flags["json"] === true;
   const toolMap = await loadToolMap();
 
+  if (action === "categories") {
+    const rows = buildCategoryRows(CATEGORIES, toolsInCategory);
+    if (jsonMode) {
+      process.stdout.write(`${JSON.stringify({ categories: rows }, null, 2)}\n`);
+      return;
+    }
+    for (const line of formatCategoryLines(rows)) process.stdout.write(`${line}\n`);
+    return;
+  }
+
+  if (action === "show") {
+    const key = args.positional[0];
+    if (key === undefined) die("usage: crewhaus tools show <tool>");
+    const detail = buildToolDetail(key, toolMap, categoriesForTool);
+    if (detail === undefined) {
+      const near = nearestToolKeys(key, Object.keys(toolMap));
+      const hint = near.length > 0 ? ` — did you mean ${near.join(", ")}?` : "";
+      die(`no builtin tool named "${key}"${hint}\nrun \`crewhaus tools list\` to see them all`);
+    }
+    if (jsonMode) {
+      process.stdout.write(`${JSON.stringify(detail, null, 2)}\n`);
+      return;
+    }
+    for (const line of formatToolDetailLines(detail)) process.stdout.write(`${line}\n`);
+    return;
+  }
+
+  if (action === "search") {
+    const query = args.positional.join(" ");
+    if (query.trim() === "") die("usage: crewhaus tools search <query>");
+    const hits = searchTools(query, toolMap, categoriesForTool);
+    if (jsonMode) {
+      process.stdout.write(`${JSON.stringify({ query, hits }, null, 2)}\n`);
+      return;
+    }
+    for (const line of formatSearchLines(query, hits)) process.stdout.write(`${line}\n`);
+    return;
+  }
+
   if (action === "list") {
-    const rows = buildToolList(toolMap);
+    // `--category <name>` narrows the listing to one category, so a reader
+    // can go straight from `tools categories` to the tools inside one.
+    const category = args.flags["category"];
+    let map = toolMap;
+    if (typeof category === "string") {
+      const wanted = new Set(toolsInCategory(category.replace(/^all-/, "")));
+      map = Object.fromEntries(Object.entries(toolMap).filter(([k]) => wanted.has(k)));
+    }
+    const rows = buildToolList(map);
     if (jsonMode) {
       process.stdout.write(`${JSON.stringify({ tools: rows }, null, 2)}\n`);
       return;
     }
-    process.stdout.write(`${rows.length} builtin tool(s):\n`);
+    const scope = typeof category === "string" ? ` in all-${category.replace(/^all-/, "")}` : "";
+    process.stdout.write(`${rows.length} builtin tool(s)${scope}:\n`);
     for (const line of formatToolListLines(rows)) process.stdout.write(`${line}\n`);
     return;
   }
@@ -14556,7 +14615,9 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
     return;
   }
 
-  die(`tools action must be one of: list, suggest, audit (got "${action}")`);
+  die(
+    `tools action must be one of: list, categories, show, search, suggest, audit (got "${action}")`,
+  );
 }
 
 /** Default sessions the `tools audit` miner scans (mirrors context-pressure). */
@@ -23200,8 +23261,9 @@ switch (subcommand) {
     break;
   case "tools": {
     const action = rest[0] ?? "";
-    if (action !== "list" && action !== "suggest" && action !== "audit") {
-      die(`tools action must be one of: list, suggest, audit (got "${action}")`);
+    const TOOLS_ACTIONS = ["list", "categories", "show", "search", "suggest", "audit"];
+    if (!TOOLS_ACTIONS.includes(action)) {
+      die(`tools action must be one of: ${TOOLS_ACTIONS.join(", ")} (got "${action}")`);
     }
     await runTools(action, parseFor(rest.slice(1), TOOLS_SCHEMA));
     break;

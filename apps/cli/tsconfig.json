@@ -79,6 +79,7 @@
     { "path": "../../packages/tool-bash" },
     { "path": "../../packages/tool-builder" },
     { "path": "../../packages/tool-catalog" },
+    { "path": "../../packages/tool-categories" },
     { "path": "../../packages/tool-codegraph" },
     { "path": "../../packages/tool-fetch" },
     { "path": "../../packages/tool-fs" },

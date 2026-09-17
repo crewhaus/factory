@@ -944,7 +944,13 @@ export const ADVISE_SCHEMA: ParseArgsSchema = {
 };
 
 export const TOOLS_SCHEMA: ParseArgsSchema = {
-  flags: [{ name: "sessions", takesValue: true }, { name: "json" }, { name: "help", short: "h" }],
+  flags: [
+    { name: "sessions", takesValue: true },
+    // `tools list --category all-fs` narrows the listing to one category.
+    { name: "category", takesValue: true },
+    { name: "json" },
+    { name: "help", short: "h" },
+  ],
 };
 
 export const PERMISSIONS_SCHEMA: ParseArgsSchema = {

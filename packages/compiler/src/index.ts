@@ -127,6 +127,7 @@ import { emitResearchBundle } from "@crewhaus/target-research-bundle";
 import { emitVoice } from "@crewhaus/target-voice";
 import { emitWorkflow } from "@crewhaus/target-workflow";
 import { type ScopeFinding, isOutwardName } from "@crewhaus/tool-builder";
+import { ToolCategoryError, expandToolSelectors } from "@crewhaus/tool-categories";
 // Loop contract 0.4 (Batch F, G12/G83) — the cf-worker edge-safety tool policy
 // lives in `@crewhaus/worker-runtime` (the runtime that would execute the
 // tools on the edge). Imported via the `/tool-policy` SUBPATH so this offline
@@ -4371,6 +4372,56 @@ function noteSelfJudge(spec: Spec, ir: IrNode, ctx: LowerContext): void {
  * capability notes). `compile()` merges them with the spec-level warnings;
  * `lower()` is the same pipeline minus the warnings.
  */
+/**
+ * Expand the `all-<category>` / `-<tool>` grammar in every `tools:` list a
+ * spec carries, before anything is lowered.
+ *
+ * Done ONCE here rather than at each of the dozen sites that read a tools
+ * array (agent, steps, graph nodes, crew roles, sub-agents, model profiles)
+ * so a new site inherits the grammar for free, and so the IR only ever holds
+ * concrete tool names — Pillar 1 rule 2: an emitter receives its typed IR
+ * variant and must never have to know what a category is.
+ *
+ * The walk rewrites a value only when the key is `tools` AND the value is an
+ * array of strings. That guard is load-bearing: `expose.mcp.tools` is the
+ * string `"chat" | "per-subagent"`, not a tool list, and must pass through
+ * untouched.
+ *
+ * A spec that uses no category syntax is returned as-is, so bundles stay
+ * byte-identical for every spec written before this grammar existed.
+ */
+export function expandSpecToolCategories(spec: Spec): Spec {
+  let changed = false;
+  const visit = (node: unknown, path: string): unknown => {
+    if (Array.isArray(node)) {
+      return node.map((item, i) => visit(item, `${path}[${i}]`));
+    }
+    if (node === null || typeof node !== "object") return node;
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      const childPath = path === "" ? key : `${path}.${key}`;
+      if (key === "tools" && isStringArray(value)) {
+        const result = expandToolSelectors(value, { path: childPath });
+        if (result.expanded) {
+          changed = true;
+          out[key] = [...result.tools];
+          continue;
+        }
+        out[key] = value;
+        continue;
+      }
+      out[key] = visit(value, childPath);
+    }
+    return out;
+  };
+  const next = visit(spec, "") as Spec;
+  return changed ? next : spec;
+}
+
+function isStringArray(value: unknown): value is ReadonlyArray<string> {
+  return Array.isArray(value) && value.every((v) => typeof v === "string");
+}
+
 export function lowerWithWarnings(
   spec: Spec,
   opts: LowerOptions = {},
@@ -4379,9 +4430,20 @@ export function lowerWithWarnings(
   // are refused loudly and path-precisely (see the §4.3 section header);
   // everything else in the §11.1 delta lowers. Absent ⇒ byte-identical.
   if (opts.allowRuntimePendingKeys !== true) assertNoRuntimePendingKeys(spec);
-  const ctx = createLowerContext(spec, opts);
-  const ir = lowerWithContext(spec, ctx);
-  noteSelfJudge(spec, ir, ctx);
+  // Tool categories resolve here, before any variant is built, so the IR
+  // carries concrete tool names only. A bad category or a dead exclusion is
+  // a compile error, re-thrown as CompilerError so a CLI catch routes it
+  // through die() like every other spec mistake.
+  let expanded: Spec;
+  try {
+    expanded = expandSpecToolCategories(spec);
+  } catch (err) {
+    if (err instanceof ToolCategoryError) throw new CompilerError(err.message, err);
+    throw err;
+  }
+  const ctx = createLowerContext(expanded, opts);
+  const ir = lowerWithContext(expanded, ctx);
+  noteSelfJudge(expanded, ir, ctx);
   return { ir, warnings: ctx.warnings };
 }
 

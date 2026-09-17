@@ -13,6 +13,7 @@
     { "path": "../ir" },
     { "path": "../ir-passes" },
     { "path": "../tool-builder" },
+    { "path": "../tool-categories" },
     { "path": "../target-batch-worker" },
     { "path": "../target-browser-driver" },
     { "path": "../target-channel-bot" },
