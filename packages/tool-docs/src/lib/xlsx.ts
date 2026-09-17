@@ -98,8 +98,10 @@ export function serialToIso(serial: number, date1904: boolean): string | null {
   if (Number.isNaN(date.getTime())) return null;
   const iso = date.toISOString();
   // A serial with no fractional part is a date, not an instant; saying
-  // "2024-01-05" is truer than "2024-01-05T00:00:00.000Z".
-  return fraction === 0 && whole >= 1 ? (iso.slice(0, 10) as string) : iso.replace(".000Z", "Z");
+  // "2024-01-05" is truer than "2024-01-05T00:00:00.000Z". Serial 0 is a
+  // real date in the 1904 system and a placeholder in the 1900 one.
+  const isWholeDay = fraction === 0 && (date1904 ? whole >= 0 : whole >= 1);
+  return isWholeDay ? (iso.slice(0, 10) as string) : iso.replace(".000Z", "Z");
 }
 
 /** Number-format ids that are dates or times in every Excel locale. */
@@ -312,9 +314,16 @@ export function readXlsx(zip: ZipArchive, options: XlsxReadOptions): Workbook {
         }
         // `row/@r` is 1-based and may skip rows entirely; blank rows in
         // between are materialised so a caller's row index means something.
+        // A gap that runs past the row limit is where that guarantee breaks:
+        // padding stops, and this row's data would land at an index that is
+        // not its row number. Stop and SAY the sheet was cut short instead.
         const declared = Number.parseInt(row.attributes["r"] ?? "", 10);
         if (Number.isFinite(declared) && declared > rows.length + 1) {
-          while (rows.length < declared - 1 && rows.length < options.maxRowsPerSheet) rows.push([]);
+          if (declared > options.maxRowsPerSheet) {
+            truncated = true;
+            break;
+          }
+          while (rows.length < declared - 1) rows.push([]);
         }
         const cells: CellValue[] = [];
         for (const cell of row.children) {
@@ -419,7 +428,10 @@ function sheetXml(sheet: XlsxWriteSheet): string {
  */
 export function writeXlsx(sheets: ReadonlyArray<XlsxWriteSheet>): Uint8Array {
   if (sheets.length === 0) throw new ZipError("a workbook needs at least one sheet");
-  const sheetEntries = sheets.map((sheet, i) => ({ sheet, part: `xl/worksheets/sheet${i + 1}.xml` }));
+  const sheetEntries = sheets.map((sheet, i) => ({
+    sheet,
+    part: `xl/worksheets/sheet${i + 1}.xml`,
+  }));
 
   const workbookXml = `${XML_DECL}<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheetEntries
     .map(
@@ -433,7 +445,9 @@ export function writeXlsx(sheets: ReadonlyArray<XlsxWriteSheet>): Uint8Array {
       (_entry, i) =>
         `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`,
     )
-    .join("")}<Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`;
+    .join(
+      "",
+    )}<Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`;
 
   const stylesXml = `${XML_DECL}<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy\\-mm\\-dd"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs></styleSheet>`;
 

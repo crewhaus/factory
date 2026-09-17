@@ -429,6 +429,80 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     ],
   },
 
+  documents: {
+    title:
+      "Read and write real document formats: Word, Excel, PowerPoint, PDF, email, calendar and contacts",
+    tools: [
+      "docxRead",
+      "docxWrite",
+      "xlsxRead",
+      "xlsxWrite",
+      "pptxRead",
+      "pdfInfo",
+      "pdfText",
+      "pdfSplit",
+      "pdfMerge",
+      "emlParse",
+      "mboxSplit",
+      "icsParse",
+      "icsWrite",
+      "vcardParse",
+      "documentText",
+      "documentDiff",
+    ],
+  },
+
+  secure: {
+    title:
+      "Find and remove sensitive content, check policy, and sign evidence — every detector a stated heuristic",
+    tools: [
+      "piiScan",
+      "piiRedact",
+      "pseudonymize",
+      "depseudonymize",
+      "secretScan",
+      "entropyScore",
+      "promptInjectionScan",
+      "invisibleCharScan",
+      "homoglyphNormalize",
+      "urlSafetyCheck",
+      "allowlistCheck",
+      "contentPolicyCheck",
+      "hashChainVerify",
+      "signPayload",
+      "verifyPayload",
+      "redactForExport",
+    ],
+  },
+
+  math: {
+    title: "Arithmetic, statistics, exact money, units, and financial and geospatial formulas",
+    tools: [
+      "evaluate",
+      "statistics",
+      "percentile",
+      "correlation",
+      "linearRegression",
+      "histogram",
+      "outliers",
+      "moneyAdd",
+      "moneyMultiply",
+      "moneyAllocate",
+      "currencyConvert",
+      "unitConvert",
+      "round",
+      "numberFormat",
+      "numberParse",
+      "percent",
+      "amortize",
+      "npv",
+      "irr",
+      "geoDistance",
+      "geoBoundingBox",
+      "geoPointInPolygon",
+    ],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -456,17 +530,21 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     title: "Durable stores a harness reads and writes: SQL databases and harness state",
     includes: ["sql", "state"],
   },
+  safety: {
+    title: "Finding and removing what must not leave the system, and proving what did not change",
+    includes: ["secure"],
+  },
   network: {
     title: "Everything that reaches the network",
     includes: ["web", "http"],
   },
   compute: {
     title: "Everything a harness can do with no I/O at all — pure, in-process, zero tokens",
-    includes: ["text", "data", "encode", "datetime", "schema"],
+    includes: ["text", "data", "encode", "datetime", "schema", "math"],
   },
   content: {
     title: "Everything that reads or produces documents and images",
-    includes: ["docs", "media", "text"],
+    includes: ["docs", "media", "text", "documents"],
   },
 });
 

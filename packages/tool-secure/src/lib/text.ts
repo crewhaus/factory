@@ -84,7 +84,10 @@ export function lineStarts(text: string): number[] {
 }
 
 /** 1-based line and column for an offset, against a prepared `lineStarts`. */
-export function locate(starts: ReadonlyArray<number>, offset: number): {
+export function locate(
+  starts: ReadonlyArray<number>,
+  offset: number,
+): {
   line: number;
   column: number;
 } {
@@ -155,7 +158,10 @@ export function dedupeOverlaps(findings: ReadonlyArray<Finding>): Finding[] {
 export function sortFindings(findings: ReadonlyArray<Finding>): Finding[] {
   return [...findings].sort(
     (a, b) =>
-      a.start - b.start || a.end - b.end || compareStrings(a.type, b.type) || compareStrings(a.rule, b.rule),
+      a.start - b.start ||
+      a.end - b.end ||
+      compareStrings(a.type, b.type) ||
+      compareStrings(a.rule, b.rule),
   );
 }
 
@@ -203,12 +209,19 @@ export function countByType(findings: ReadonlyArray<Finding>): Record<string, nu
  *
  * The pattern is cloned so a caller's `lastIndex` cannot leak between calls,
  * and a zero-length match advances the cursor rather than spinning forever.
+ *
+ * The clone always carries `g` and `d`. `d` matters: a rule that captures the
+ * secret in a group needs the group's REAL offset, and searching the match
+ * text for the group's own text finds the wrong copy whenever the value also
+ * appears earlier in the match — `scheme://admin_hunter2:hunter2@host` is the
+ * shape that does it. `groupSpan` below is how a caller gets that offset.
  */
 export function* matchAll(
   text: string,
   pattern: RegExp,
 ): Generator<{ index: number; match: RegExpExecArray }> {
-  const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+  let flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+  if (!flags.includes("d")) flags = `${flags}d`;
   const re = new RegExp(pattern.source, flags);
   for (;;) {
     const m = re.exec(text);
@@ -216,4 +229,22 @@ export function* matchAll(
     yield { index: m.index, match: m };
     if (m[0].length === 0) re.lastIndex += 1;
   }
+}
+
+/**
+ * The absolute `[start, end)` of one capture group of a match produced by
+ * `matchAll`, or `undefined` when the group did not participate.
+ *
+ * Group 0 is the whole match. Any other group's offsets come from the `d`
+ * flag's indices, never from searching for the group's text inside the match.
+ */
+export function groupSpan(
+  match: RegExpExecArray,
+  group: number,
+): { start: number; end: number } | undefined {
+  const whole = match[0];
+  if (group === 0) return { start: match.index, end: match.index + whole.length };
+  const span = match.indices?.[group];
+  if (!span) return undefined;
+  return { start: span[0], end: span[1] };
 }

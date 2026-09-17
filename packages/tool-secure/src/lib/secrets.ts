@@ -29,8 +29,14 @@
  * hashes, UUIDs, base64 images and minified code are all high entropy, and a
  * scanner that cries wolf on them gets switched off.
  */
-import { type Charset, classifyCharset, looksHighEntropy, roundBits, shannonEntropy } from "./entropy";
-import { type Finding, matchAll, maskValue, sortFindings, withPositions } from "./text";
+import {
+  type Charset,
+  classifyCharset,
+  looksHighEntropy,
+  roundBits,
+  shannonEntropy,
+} from "./entropy";
+import { type Finding, groupSpan, maskValue, matchAll, sortFindings, withPositions } from "./text";
 
 export type Severity = "critical" | "high" | "medium" | "low";
 
@@ -109,7 +115,8 @@ export const SECRET_RULES: ReadonlyArray<SecretRule> = [
   {
     id: "stripe.publishable-key",
     kind: "vendor",
-    description: "Stripe publishable key — public by design, reported so it is not mistaken for a secret",
+    description:
+      "Stripe publishable key — public by design, reported so it is not mistaken for a secret",
     severity: "low",
     pattern: /\bpk_(?:live|test)_[A-Za-z0-9]{16,}\b/g,
   },
@@ -179,7 +186,8 @@ export const SECRET_RULES: ReadonlyArray<SecretRule> = [
   {
     id: "url.credentials",
     kind: "structural",
-    description: "Connection string or URL carrying a password in the authority (scheme://user:pass@host)",
+    description:
+      "Connection string or URL carrying a password in the authority (scheme://user:pass@host)",
     severity: "high",
     pattern: /\b[a-z][a-z0-9+.-]{1,20}:\/\/[^\s:@/]{1,64}:([^\s@/]{1,128})@[^\s/]{1,255}/gi,
     group: 1,
@@ -209,7 +217,8 @@ const RULES_BY_ID: ReadonlyMap<string, SecretRule> = new Map(SECRET_RULES.map((r
  * Values that match a rule but are placeholders, not credentials. Kept short
  * and literal; anything cleverer would start guessing.
  */
-const PLACEHOLDER = /^(?:x{3,}|\*{3,}|\.{3,}|<[^>]*>|\$\{[^}]*\}|\{\{[^}]*\}\}|(?:your|my|the|some|example|sample|dummy|fake|test|placeholder|redacted|changeme|insert)[_a-z0-9-]*)$/i;
+const PLACEHOLDER =
+  /^(?:x{3,}|\*{3,}|\.{3,}|<[^>]*>|\$\{[^}]*\}|\{\{[^}]*\}\}|(?:your|my|the|some|example|sample|dummy|fake|test|placeholder|redacted|changeme|insert)[_a-z0-9-]*)$/i;
 
 /** Context that makes a high-entropy string worth reporting. */
 const CREDENTIAL_CONTEXT =
@@ -250,6 +259,20 @@ export class SecretRuleError extends Error {
   override readonly name = "SecretRuleError";
 }
 
+/** The id the context-gated entropy heuristic reports under. */
+export const HIGH_ENTROPY_RULE = "generic.high-entropy";
+
+/**
+ * Every rule id a given options object will report under, including the
+ * entropy heuristic when it is enabled. `SecretScan` prints this so an empty
+ * result reads as a scope rather than a verdict, and `secretFindings` below
+ * runs exactly this set — the list and the scan cannot drift apart.
+ */
+export function rulesRunFor(options: SecretScanOptions = {}): string[] {
+  const ids = selectRules(options).map((r) => r.id);
+  return options.highEntropy === false ? ids : [...ids, HIGH_ENTROPY_RULE];
+}
+
 /** The rules a given options object will actually run, in scan order. */
 export function selectRules(options: SecretScanOptions = {}): SecretRule[] {
   if (options.rules === undefined) return [...SECRET_RULES];
@@ -262,27 +285,35 @@ export function selectRules(options: SecretScanOptions = {}): SecretRule[] {
   return SECRET_RULES.filter((r) => options.rules?.includes(r.id));
 }
 
-/** Scan text. The returned hits are already masked. */
-export function scanSecrets(text: string, options: SecretScanOptions = {}): SecretHit[] {
+/**
+ * Every located secret in the text, values included, in document order.
+ *
+ * This is the ONE implementation. `scanSecrets` masks it for a result and
+ * `secretSpans` hands it to a redactor unmasked; there is no second copy of
+ * the rule loop to fall out of step with this one, which is exactly what let
+ * `RedactForExport` report a high-entropy finding and then not remove it.
+ */
+export function secretFindings(text: string, options: SecretScanOptions = {}): Finding[] {
   const rules = selectRules(options);
   const raw: Array<Omit<Finding, "line" | "column">> = [];
 
   for (const rule of rules) {
-    for (const { index, match } of matchAll(text, rule.pattern)) {
+    for (const { match } of matchAll(text, rule.pattern)) {
       const group = rule.group ?? 0;
       const value = match[group];
       if (value === undefined || value.length === 0) continue;
       if (PLACEHOLDER.test(value)) continue;
-      // Offset of the captured group inside the whole match: the group text is
-      // unique enough in practice, and indexOf keeps this independent of the
-      // `d` flag, which would change the rule table's shape for one detail.
-      const offset = group === 0 ? 0 : Math.max(0, match[0].indexOf(value));
+      // The group's REAL offset. Searching the match for the group's own text
+      // finds the wrong copy when the value also appears earlier in the match,
+      // which puts the span on a username and leaves the password in place.
+      const span = groupSpan(match, group);
+      if (span === undefined) continue;
       raw.push({
         type: rule.id,
         rule: rule.id,
         confidence: rule.kind === "vendor" ? "likely" : "possible",
-        start: index + offset,
-        end: index + offset + value.length,
+        start: span.start,
+        end: span.end,
         value,
         detail: { severity: rule.severity },
       });
@@ -303,8 +334,8 @@ export function scanSecrets(text: string, options: SecretScanOptions = {}): Secr
       // A vendor rule already covering this span is the better finding.
       if (raw.some((f) => index < f.end && f.start < index + value.length)) continue;
       raw.push({
-        type: "generic.high-entropy",
-        rule: "generic.high-entropy",
+        type: HIGH_ENTROPY_RULE,
+        rule: HIGH_ENTROPY_RULE,
         confidence: "possible",
         start: index,
         end: index + value.length,
@@ -314,8 +345,12 @@ export function scanSecrets(text: string, options: SecretScanOptions = {}): Secr
     }
   }
 
-  const located = sortFindings(withPositions(text, raw));
-  return located.map((f) => {
+  return sortFindings(withPositions(text, raw));
+}
+
+/** Scan text. The returned hits are already masked. */
+export function scanSecrets(text: string, options: SecretScanOptions = {}): SecretHit[] {
+  return secretFindings(text, options).map((f) => {
     const rule = RULES_BY_ID.get(f.rule);
     const { bits } = shannonEntropy(f.value);
     return {
@@ -337,32 +372,15 @@ export function scanSecrets(text: string, options: SecretScanOptions = {}): Secr
 }
 
 /**
- * The spans a redactor should replace, derived from the same rules. Returned
- * as `Finding`s (value included) because the caller is about to remove them;
- * it is the scanner's OUTPUT that must never carry a value.
+ * The spans a redactor should replace. Same rules, same options, same spans
+ * as `scanSecrets` — including the entropy heuristic, so a document cannot be
+ * reported as holding a secret and handed back with that secret still in it.
+ *
+ * `Finding`s carry their value because the caller is about to remove them; it
+ * is the scanner's OUTPUT that must never carry one.
  */
 export function secretSpans(text: string, options: SecretScanOptions = {}): Finding[] {
-  const rules = selectRules(options);
-  const raw: Array<Omit<Finding, "line" | "column">> = [];
-  for (const rule of rules) {
-    for (const { index, match } of matchAll(text, rule.pattern)) {
-      const group = rule.group ?? 0;
-      const value = match[group];
-      if (value === undefined || value.length === 0) continue;
-      if (PLACEHOLDER.test(value)) continue;
-      const offset = group === 0 ? 0 : Math.max(0, match[0].indexOf(value));
-      raw.push({
-        type: rule.id,
-        rule: rule.id,
-        confidence: rule.kind === "vendor" ? "likely" : "possible",
-        start: index + offset,
-        end: index + offset + value.length,
-        value,
-        detail: { severity: rule.severity },
-      });
-    }
-  }
-  return withPositions(text, raw);
+  return secretFindings(text, options);
 }
 
 /** Summarize hits by severity, highest first, for a one-line verdict. */

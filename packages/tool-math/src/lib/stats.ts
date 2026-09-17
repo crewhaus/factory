@@ -155,11 +155,13 @@ export function percentileSorted(
   if (!(p >= 0 && p <= 1)) {
     throw new StatsError(`percentile fraction must be between 0 and 1, got ${p}`);
   }
-  if (n === 1) return sorted[0] as number;
   if (method === "nearestRank") {
     const rank = Math.max(1, Math.ceil(p * n));
     return sorted[rank - 1] as number;
   }
+  // The r6 domain check comes BEFORE the single-value shortcut: r6 is defined
+  // for n=1 only at p=0.5, and answering every p with the one observation would
+  // be a confident number under a convention that does not define it.
   const h = method === "r7" ? (n - 1) * p : (n + 1) * p - 1;
   if (method === "r6" && (h < 0 || h > n - 1)) {
     const lo = 1 / (n + 1);
@@ -168,6 +170,7 @@ export function percentileSorted(
       `the r6 convention leaves p=${p} undefined for n=${n}: it is only defined for p between ${lo.toFixed(6)} and ${hi.toFixed(6)}. Use r7 or nearestRank, or supply more data`,
     );
   }
+  if (n === 1) return sorted[0] as number;
   const lowIndex = Math.floor(h);
   const highIndex = Math.min(lowIndex + 1, n - 1);
   const low = sorted[lowIndex] as number;
@@ -369,6 +372,15 @@ export function histogram(
   if (options.bucketCount !== undefined && options.bucketWidth !== undefined) {
     throw new StatsError("give either bucketCount or bucketWidth, not both");
   }
+  // Infinity passes a `z.number()` schema, and an infinite origin or width makes
+  // every bucket edge NaN — which used to index past the end of the bucket array
+  // and throw a TypeError out of the tool instead of refusing.
+  if (options.origin !== undefined && !Number.isFinite(options.origin)) {
+    throw new StatsError(`origin is ${options.origin}; it must be a finite number`);
+  }
+  if (options.bucketWidth !== undefined && !Number.isFinite(options.bucketWidth)) {
+    throw new StatsError(`bucketWidth is ${options.bucketWidth}; it must be a finite number`);
+  }
   const sorted = sortedCopy(values);
   const min = sorted[0] as number;
   const max = sorted[sorted.length - 1] as number;
@@ -416,7 +428,7 @@ export function histogram(
   }
   for (const v of sorted) {
     let index = width === 0 ? 0 : Math.floor((v - lo) / width);
-    if (index >= count) index = count - 1;
+    if (!Number.isFinite(index) || index >= count) index = count - 1;
     if (index < 0) index = 0;
     const bucket = buckets[index] as Bucket;
     bucket.count++;
@@ -447,6 +459,13 @@ export type OutlierReport = {
   bounds: { lower: number; upper: number };
   count: number;
   cleanCount: number;
+  /**
+   * What an empty `outliers` list does and does not mean. A rule that flags
+   * nothing has found nothing BY THAT RULE at THAT THRESHOLD; it has not
+   * established that the data is clean, and a caller reading `count: 0` as a
+   * clean bill of health is the false confidence this field exists to deny.
+   */
+  finding: string;
 };
 
 /**
@@ -527,5 +546,9 @@ export function findOutliers(
     bounds,
     count: outliers.length,
     cleanCount: values.length - outliers.length,
+    finding:
+      outliers.length === 0
+        ? `no value fell outside the ${method} bounds at threshold ${threshold}. That is the absence of a flag under ONE rule, not evidence that the data is clean: this rule sees only single points far from the centre, and it cannot see a shifted distribution, a duplicated record, a wrong unit or a cluster of errors that moved the bounds along with the data.`
+        : `${outliers.length} of ${values.length} values fell outside the ${method} bounds at threshold ${threshold}. A flag is a candidate for review, not a verdict: an extreme value can be perfectly correct.`,
   };
 }

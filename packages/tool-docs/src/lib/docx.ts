@@ -341,19 +341,30 @@ export type DocxWriteOptions = {
   readonly created?: string;
 };
 
-function paragraphXml(text: string, style?: string, numId?: number, level = 0): string {
+type ParagraphOptions = {
+  readonly style?: string;
+  readonly numId?: number;
+  readonly level?: number;
+  /** Direct run formatting, used for a table's header row. */
+  readonly bold?: boolean;
+};
+
+function paragraphXml(text: string, options: ParagraphOptions = {}): string {
   const props: string[] = [];
-  if (style !== undefined) props.push(`<w:pStyle w:val="${escapeXml(style)}"/>`);
-  if (numId !== undefined) {
-    props.push(`<w:numPr><w:ilvl w:val="${level}"/><w:numId w:val="${numId}"/></w:numPr>`);
+  if (options.style !== undefined) props.push(`<w:pStyle w:val="${escapeXml(options.style)}"/>`);
+  if (options.numId !== undefined) {
+    props.push(
+      `<w:numPr><w:ilvl w:val="${options.level ?? 0}"/><w:numId w:val="${options.numId}"/></w:numPr>`,
+    );
   }
   const pPr = props.length > 0 ? `<w:pPr>${props.join("")}</w:pPr>` : "";
+  const rPr = options.bold === true ? "<w:rPr><w:b/></w:rPr>" : "";
   // Split on newlines so an embedded line break becomes a real `w:br`.
   const runs = text
     .split("\n")
     .map((line) => `<w:t xml:space="preserve">${escapeXml(line)}</w:t>`)
     .join("<w:br/>");
-  return `<w:p>${pPr}<w:r>${runs}</w:r></w:p>`;
+  return `<w:p>${pPr}<w:r>${rPr}${runs}</w:r></w:p>`;
 }
 
 const BORDER_SIDES = ["top", "left", "bottom", "right", "insideH", "insideV"] as const;
@@ -372,8 +383,8 @@ function tableXml(rows: ReadonlyArray<ReadonlyArray<string>>, header: boolean): 
     .map((row, rowIndex) => {
       const cells = Array.from({ length: width }, (_unused, i) => {
         const cellText = row[i] ?? "";
-        const style = header && rowIndex === 0 ? "Strong" : undefined;
-        return `<w:tc><w:tcPr><w:tcW w:w="${colWidth}" w:type="dxa"/></w:tcPr>${paragraphXml(cellText, style)}</w:tc>`;
+        const bold = header && rowIndex === 0;
+        return `<w:tc><w:tcPr><w:tcW w:w="${colWidth}" w:type="dxa"/></w:tcPr>${paragraphXml(cellText, { bold })}</w:tc>`;
       }).join("");
       return `<w:tr>${cells}</w:tr>`;
     })
@@ -425,7 +436,7 @@ export function writeDocx(
     switch (block.type) {
       case "heading": {
         const level = Math.min(6, Math.max(1, block.level ?? 1));
-        body.push(paragraphXml(block.text, `Heading${level}`));
+        body.push(paragraphXml(block.text, { style: `Heading${level}` }));
         break;
       }
       case "paragraph":
@@ -433,7 +444,12 @@ export function writeDocx(
         break;
       case "list":
         for (const item of block.items) {
-          body.push(paragraphXml(item, "ListParagraph", block.ordered === true ? 2 : 1));
+          body.push(
+            paragraphXml(item, {
+              style: "ListParagraph",
+              numId: block.ordered === true ? 2 : 1,
+            }),
+          );
         }
         break;
       case "table":

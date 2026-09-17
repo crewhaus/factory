@@ -51,8 +51,7 @@ export type Slide = {
 
 const PRESENTATION_REL =
   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
-const NOTES_REL =
-  "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide";
+const NOTES_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide";
 
 /** The text of one `a:p`, with `a:br` as a newline and `a:t` runs joined. */
 function paragraphText(paragraph: XmlElement): string {
@@ -104,7 +103,9 @@ function collectShapes(tree: XmlElement): SlideShape[] {
         // A table or embedded object: take whatever text it carries.
         const text = shapeText(child);
         if (text !== "") out.push({ role: "graphic", text });
-      } else if (child.name === "p:grpSp" || child.name === "p:spTree") {
+      } else {
+        // Everything else on the path to the shapes — `p:cSld`, `p:spTree`,
+        // `p:grpSp` — is a container, so recurse rather than enumerate them.
         walk(child);
       }
     }

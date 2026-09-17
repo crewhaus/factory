@@ -90,7 +90,13 @@ let otherOrigin = "";
 let blockedOrigin = "";
 
 /** Every request the fixture saw, so a test can assert what was sent. */
-let seen: Array<{ method: string; path: string; auth: string | null; body: string }> = [];
+let seen: Array<{
+  method: string;
+  path: string;
+  auth: string | null;
+  body: string;
+  host: string | null;
+}> = [];
 /** Whether the second origin ever received a credential header. */
 let otherSawCredential = false;
 
@@ -152,7 +158,7 @@ async function mainHandler(req: Request): Promise<Response> {
   const p = url.pathname;
   const auth = req.headers.get("authorization") ?? req.headers.get("private-token");
   const body = req.method === "GET" ? "" : await req.text();
-  seen.push({ method: req.method, path: p, auth, body });
+  seen.push({ method: req.method, path: p, auth, body, host: req.headers.get("host") });
 
   // --- GitLab dialect -----------------------------------------------------
   if (p.startsWith("/api/v4/")) return gitlabHandler(req, p, body);
@@ -827,14 +833,16 @@ describe("the gate refuses what it should", () => {
     expect(seen.filter((entry) => entry.path === "/repos/acme/loop")).toHaveLength(6);
   });
 
-  // 30s, not the 5s default: this is the one test that goes through the REAL
-  // system resolver (every other DNS path is injected), and under a full-repo
-  // run with hundreds of test files in flight that lookup has been measured
-  // taking over five seconds. The tool's own deadline is what bounds the call;
-  // this budget only stops a loaded machine reporting a flake as a failure.
   test("a hostname is dialled at the IP the gate vetted, keeping its Host header", async () => {
-    // 127.0.0.1 as a literal short-circuits the pinning path, so this is the
-    // only way to prove the pinned socket actually works.
+    // A 127.0.0.1 LITERAL short-circuits the pinning path, so the request has
+    // to name a host. Earlier this used the real system resolver for
+    // `localhost`, which is what the pinned socket would use in production —
+    // but under a full-repo run that lookup starved past thirty seconds and
+    // hung the suite. Injecting the resolver keeps exactly what this test is
+    // for (the gate vets an address, and the socket is then dialled AT that
+    // address while the Host header still says the name) and drops the only
+    // dependency on the machine's resolver under load.
+    _setDnsLookup(async () => ({ address: "127.0.0.1", family: 4 }));
     registerCodehostConfig({
       allowed_origins: [`http://localhost:${main.port}`],
       base_url: `http://localhost:${main.port}`,
@@ -843,7 +851,9 @@ describe("the gate refuses what it should", () => {
     const result = await run(repoGet, gh());
     expect(result.repository.fullName).toBe("acme/widget");
     expect(seen).toHaveLength(1);
-  }, 30_000);
+    // The Host header must carry the NAME, not the address it was dialled at.
+    expect(seen[0]?.host ?? "").toContain("localhost");
+  });
 
   test("a resolver that never answers cannot outlive the deadline", async () => {
     // node:dns takes neither a timeout nor a signal, so without the bound the

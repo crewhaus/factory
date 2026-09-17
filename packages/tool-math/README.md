@@ -60,7 +60,8 @@ p25 they give 3.25, 2.75 and 3:
 - `r7` (default) — linear interpolation, h=(n-1)p. R type 7, NumPy's default,
   Excel `PERCENTILE.INC`.
 - `r6` — h=(n+1)p. Excel `PERCENTILE.EXC`, Minitab, SPSS. **Refused** outside
-  the range where it is defined, rather than clamped.
+  the range [1/(n+1), n/(n+1)] where it is defined, rather than clamped — and
+  that includes a single observation, where the range collapses to p=0.5.
 - `nearestRank` — ceil(p·n), no interpolation, so the answer is always an
   observed value. ISO 2602.
 
@@ -74,7 +75,9 @@ Gulf dinars have 3 — and an unknown code is refused rather than assumed to hav
 2, because that assumption is a 100× error waiting for a yen invoice.
 `MoneyAllocate` uses the largest-remainder (Hamilton) method so the parts always
 sum to the whole; that invariant is asserted in the result *and* over 500
-generated cases in the tests.
+generated cases in the tests. An amount is capped at 1 000 digits, the same
+limit the decimal parser applies: no price is that long, and the bigint work
+behind an allocation grows faster than the input does.
 
 **NPV timing.** `cashflows[0]` sits at t=0 and is not discounted — the textbook
 definition. Excel's `NPV()` discounts its first argument one full period;
@@ -89,10 +92,12 @@ up to ~0.5%. Fine for logistics, not for surveying.
 
 **Units.** Definitional factors are exact (1 in = 0.0254 m, 1 lb =
 0.45359237 kg, 1 cal = 4.184 J) and marked `exact: true`; conventional ones
-(psi, mmHg, BTU) are marked `false`. Temperature converts **affinely** through
-kelvin, not by a scale factor. US and imperial volumes are separate units —
-there is no bare `gal`. Months and years are deliberately absent from the time
-units, because they have no fixed length.
+(psi, mmHg, BTU) are marked `false`. Temperature converts **affinely** — an
+offset and a ratio relative to kelvin, never a scale factor — and each pair is
+converted in one step rather than in two hops through kelvin, so 100 °C comes
+back as exactly 212 °F instead of 211.99999999999994. US and imperial volumes
+are separate units — there is no bare `gal`. Months and years are deliberately
+absent from the time units, because they have no fixed length.
 
 ## What is deliberately refused
 
@@ -103,7 +108,9 @@ why, not a thrown exception and not a confident number.
   tokenizer and precedence-climbing parser over a fixed grammar, and anything
   outside that grammar — a property access, a semicolon, a string literal, a
   hex literal — is refused with the character offset. Division by zero, and any
-  step producing `NaN` or `Infinity`, is refused rather than returned.
+  step producing `NaN` or `Infinity`, is refused rather than returned. Names
+  that exist only on `Object.prototype` (`__proto__`, `constructor`,
+  `toString`) are unknown names, not functions.
 - Percent change from zero, correlation of a constant series, a least-squares
   line through vertical points, an IRR for cashflows that never change sign, a
   temperature below absolute zero, a percentile the r6 convention does not
@@ -114,6 +121,24 @@ why, not a thrown exception and not a confident number.
   the answer depend on the minute it ran.
 - `GeoPointInPolygon` refuses a ring spanning more than 180° of longitude
   instead of reading it inside-out across the antimeridian.
+- A unit name that is not in the catalog, including one inherited from
+  `Object.prototype`, and a non-finite radius, origin or bucket width —
+  `Infinity` satisfies a plain number schema and would otherwise turn into a
+  `null` where a number belongs.
+- `NumberParse` refuses nested or unbalanced accounting parentheses; one pair
+  means a negative, and `((1,234.50))` is not a number.
+- `Percent` refuses an over-determined markup/margin square. Three of the four
+  values fix it twice over, and the extra one used to be dropped in silence.
+
+## What a detector can and cannot tell you
+
+`Outliers` is the only tool here that looks for something rather than computing
+it, so its result carries a `finding` sentence in both directions. An empty
+list means no value crossed that fence at that threshold — it is **not** a
+clean bill of health, because neither rule can see a shifted distribution, a
+duplicated record, a wrong unit, or a cluster of errors large enough to drag
+the bounds along with it. A flagged value is a candidate for review, not a
+verdict: extreme values are often correct.
 
 ## Precision, honestly
 

@@ -375,6 +375,10 @@ export function buildPdf(
  * than a silent omission.
  */
 export function parsePageRange(spec: string, pageCount: number): number[] {
+  // A selection may repeat pages, so its length is NOT bounded by the page
+  // count: `1-20000,1-20000,…` in a long enough spec selects arbitrarily
+  // many. Refused at a ceiling rather than expanded.
+  const maxSelected = 100_000;
   const out: number[] = [];
   for (const rawPart of spec.split(",")) {
     const part = rawPart.trim();
@@ -389,12 +393,18 @@ export function parsePageRange(spec: string, pageCount: number): number[] {
         throw new PdfError(`page ${page} is out of range (the document has ${pageCount})`);
       }
       out.push(page);
+      if (out.length > maxSelected) {
+        throw new PdfError(`a page selection of more than ${maxSelected} pages is refused`);
+      }
       continue;
     }
     const from = fromText === undefined ? 1 : Number.parseInt(fromText, 10);
     const to = toText === undefined ? pageCount : Number.parseInt(toText, 10);
     if (from < 1 || to > pageCount || from > to) {
       throw new PdfError(`range "${part}" is out of range (the document has ${pageCount} pages)`);
+    }
+    if (out.length + (to - from + 1) > maxSelected) {
+      throw new PdfError(`a page selection of more than ${maxSelected} pages is refused`);
     }
     for (let page = from; page <= to; page++) out.push(page);
   }

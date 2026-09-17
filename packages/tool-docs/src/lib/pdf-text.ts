@@ -53,6 +53,7 @@ import {
   latin1,
   numberOf,
 } from "./pdf";
+import type { PdfStream } from "./pdf";
 
 type Matrix = readonly [number, number, number, number, number, number];
 const IDENTITY: Matrix = [1, 0, 0, 1, 0, 0];
@@ -423,6 +424,12 @@ export function extractPageText(doc: PdfDocument, page: PdfPage): PageText {
   const notes = new Set<string>();
   const pieces: string[] = [];
   let drewGlyph = false;
+  // One `Do` costs six bytes of content stream and can decode a whole form
+  // XObject, so a stream full of them multiplies the decode cap by however
+  // many times it names one. The cache makes a repeat free, and the budget
+  // bounds what a stream naming many DISTINCT forms can cost.
+  const formCache = new Map<PdfStream, Uint8Array>();
+  let formBytes = 0;
   let lastY = Number.NaN;
   let lastEndX = 0;
 
@@ -478,7 +485,9 @@ export function extractPageText(doc: PdfDocument, page: PdfPage): PageText {
       let advance = 0;
       for (let i = 0; i + step <= bytes.length; i += step) {
         const code =
-          step === 2 ? ((bytes[i] as number) << 8) | (bytes[i + 1] as number) : (bytes[i] as number);
+          step === 2
+            ? ((bytes[i] as number) << 8) | (bytes[i + 1] as number)
+            : (bytes[i] as number);
         let glyph: string | undefined;
         if (font.toUnicode !== null) glyph = font.toUnicode.get(code);
         if (glyph === undefined && font.simpleEncoding !== null) {
@@ -623,10 +632,11 @@ export function extractPageText(doc: PdfDocument, page: PdfPage): PageText {
               if (isString(item)) showText(item.bytes);
               else if (typeof item === "number") {
                 // A negative adjustment moves the pen forward by item/1000
-                // of an em; that is how a PDF usually expresses a space.
+                // of an em; that is how a PDF usually expresses a space. The
+                // pen moves but the previous run's end does NOT, so the gap
+                // survives for `emit` to see and turn back into a space.
                 const shift = (-item / 1000) * current.fontSize * current.horizontalScale;
                 textMatrix = multiply([1, 0, 0, 1, shift, 0], textMatrix);
-                lastEndX += shift;
               }
             }
           }
@@ -641,12 +651,22 @@ export function extractPageText(doc: PdfDocument, page: PdfPage): PageText {
           if (!isStream(target)) break;
           if (!isName(doc.get(target.dict, "Subtype"), "Form")) break;
           let data: Uint8Array;
-          try {
-            data = doc.decode(target);
-          } catch (err) {
-            if (!(err instanceof PdfFilterError)) throw err;
-            notes.add(`form XObject /${name.name} could not be decoded: ${err.message}`);
-            break;
+          const cached = formCache.get(target);
+          if (cached !== undefined) data = cached;
+          else {
+            if (formBytes >= doc.limits.maxStreamBytes) {
+              notes.add("stopped following form XObjects at the decode budget");
+              break;
+            }
+            try {
+              data = doc.decode(target);
+            } catch (err) {
+              if (!(err instanceof PdfFilterError)) throw err;
+              notes.add(`form XObject /${name.name} could not be decoded: ${err.message}`);
+              break;
+            }
+            formCache.set(target, data);
+            formBytes += data.length;
           }
           const formResources = doc.get(target.dict, "Resources");
           const matrixValue = doc.get(target.dict, "Matrix");
@@ -665,7 +685,12 @@ export function extractPageText(doc: PdfDocument, page: PdfPage): PageText {
               ctm,
             );
           }
-          run(data, isDict(formResources) ? formResources : resources, { ...current, ctm }, depth + 1);
+          run(
+            data,
+            isDict(formResources) ? formResources : resources,
+            { ...current, ctm },
+            depth + 1,
+          );
           break;
         }
         case "BI":

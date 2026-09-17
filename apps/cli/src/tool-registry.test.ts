@@ -15,6 +15,7 @@ import { describe, expect, test } from "bun:test";
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import {
   CATEGORIES,
   allRegisteredTools,
@@ -120,6 +121,15 @@ describe("every exported tool is reachable from a spec", () => {
     "tool-git",
     "tool-fsx",
     "tool-proc",
+    "tool-http",
+    "tool-state",
+    "tool-crewhaus",
+    "tool-code",
+    "tool-codehost",
+    "tool-sql",
+    "tool-docs",
+    "tool-secure",
+    "tool-math",
   ];
 
   test("no package exports a tool that is not wired", () => {
@@ -130,9 +140,18 @@ describe("every exported tool is reachable from a spec", () => {
       if (!existsSync(source)) continue;
       const text = readFileSync(source, "utf-8");
       // Every `export const <name>: RegisteredTool` in the package entrypoint.
+      // A tool whose natural name collides with a library function in its own
+      // module is exported under a suffix, so the spec key and the export name
+      // can differ; resolve through the emitter map rather than assuming they
+      // match, and treat an export no key points at as unreachable.
+      const exportsWired = new Set(
+        Object.values(BUILTIN_TOOL_MAP).map((entry) => (entry as { export: string }).export),
+      );
       for (const m of text.matchAll(/^export const ([A-Za-z0-9_]+): RegisteredTool/gm)) {
-        const key = m[1] as string;
-        if (!CLI_RUNTIME_TOOL_KEYS.includes(key)) unreachable.push({ pkg, tool: key });
+        const name = m[1] as string;
+        if (!CLI_RUNTIME_TOOL_KEYS.includes(name) && !exportsWired.has(name)) {
+          unreachable.push({ pkg, tool: name });
+        }
       }
     }
     expect(unreachable).toEqual([]);

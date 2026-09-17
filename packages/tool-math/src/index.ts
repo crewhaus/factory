@@ -122,16 +122,22 @@ function refusal(err: unknown): string {
 }
 
 const roundingModeSchema = z.enum(ROUNDING_MODES);
-const numericString = z.union([z.number(), z.string()]);
+/**
+ * A number, or a decimal string for exactness. The string is length-capped to
+ * the same order as `parseDecimal`'s digit limit: a "number" of a hundred
+ * thousand digits is not a quantity anyone means, and the bigint arithmetic
+ * behind money and rounding is superlinear in its length.
+ */
+const numericString = z.union([z.number().finite(), z.string().min(1).max(1_100)]);
 const seriesSchema = z
-  .array(z.number())
+  .array(z.number().finite())
   .min(1)
   .max(MAX_SERIES)
   .describe("a series of finite numbers");
 const pointSchema = z
   .object({
-    lat: z.number().min(-90).max(90),
-    lon: z.number().min(-180).max(180),
+    lat: z.number().finite().min(-90).max(90),
+    lon: z.number().finite().min(-180).max(180),
   })
   .describe("degrees; {lat, lon} objects only — GeoJSON's [lon, lat] order is too easy to reverse");
 
@@ -156,7 +162,7 @@ export const evaluate: RegisteredTool = buildTool({
   inputSchema: z.object({
     expression: z.string().min(1).max(4_000).describe("the expression to evaluate"),
     variables: z
-      .record(z.number())
+      .record(z.number().finite())
       .optional()
       .describe("named finite values the expression may reference; shadows pi and e"),
   }),
@@ -214,7 +220,7 @@ export const statistics: RegisteredTool = buildTool({
 export const percentile: RegisteredTool = buildTool({
   name: "Percentile",
   description:
-    "Compute one or more percentiles of a series by an explicitly chosen convention. Use when the exact convention matters — r7 (linear interpolation, h=(n-1)p; NumPy/R default, Excel PERCENTILE.INC), r6 (h=(n+1)p; Excel PERCENTILE.EXC, refused where it is undefined rather than clamped) and nearestRank (ceil(p*n), always an observed value) give different answers on the same data, and the result says which was used.",
+    "Compute one or more percentiles of a series by an explicitly chosen convention. Use when the exact convention matters — r7 (linear interpolation, h=(n-1)p; NumPy/R default, Excel PERCENTILE.INC), r6 (h=(n+1)p; Excel PERCENTILE.EXC, refused outside [1/(n+1), n/(n+1)] where it is undefined rather than clamped, including for a single observation) and nearestRank (ceil(p*n), always an observed value) give different answers on the same data, and the result says which was used.",
   inputSchema: z.object({
     values: seriesSchema,
     percentiles: z
@@ -297,7 +303,7 @@ export const linearRegressionTool: RegisteredTool = buildTool({
     x: seriesSchema,
     y: seriesSchema,
     predictX: z
-      .array(z.number())
+      .array(z.number().finite())
       .max(1_000)
       .optional()
       .describe("x values to evaluate the fitted line at"),
@@ -330,9 +336,10 @@ export const histogram: RegisteredTool = buildTool({
   inputSchema: z.object({
     values: seriesSchema,
     bucketCount: z.number().int().min(1).max(10_000).optional().describe("defaults to 10"),
-    bucketWidth: z.number().positive().optional().describe("alternative to bucketCount"),
+    bucketWidth: z.number().finite().positive().optional().describe("alternative to bucketCount"),
     origin: z
       .number()
+      .finite()
       .optional()
       .describe("left edge of the first bucket; defaults to the minimum"),
   }),
@@ -359,7 +366,7 @@ export const histogram: RegisteredTool = buildTool({
 export const outliers: RegisteredTool = buildTool({
   name: "Outliers",
   description:
-    "Flag outliers by an explicitly named rule: the IQR rule (outside Q1-k*IQR or Q3+k*IQR, Tukey's fence, k=1.5 by default, what a box plot draws) or the z-score rule (more than k sample standard deviations from the mean, k=3 by default). Use the IQR rule unless the data is known to be near-normal — the z-score rule is computed from statistics the outliers themselves distort, and the result always states the rule, the threshold and the resulting bounds.",
+    "Flag outliers by an explicitly named rule: the IQR rule (outside Q1-k*IQR or Q3+k*IQR, Tukey's fence, k=1.5 by default, what a box plot draws) or the z-score rule (more than k sample standard deviations from the mean, k=3 by default). Use the IQR rule unless the data is known to be near-normal — the z-score rule is computed from statistics the outliers themselves distort, and the result always states the rule, the threshold and the resulting bounds. An empty result means nothing crossed THAT fence at THAT threshold; it is not a clean bill of health, and the returned `finding` says so, because neither rule can see a shifted distribution, a wrong unit or a cluster of errors that moved the bounds with it.",
   inputSchema: z.object({
     values: seriesSchema,
     method: z.enum(OUTLIER_METHODS).optional().describe("defaults to iqr"),
@@ -569,9 +576,9 @@ export const currencyConvert: RegisteredTool = buildTool({
 export const unitConvert: RegisteredTool = buildTool({
   name: "UnitConvert",
   description:
-    "Convert a value between units of length, mass, volume, temperature, time, area, speed, data size, pressure or energy. Use rather than recalling a factor: the definitional factors here are exact (1 in = 0.0254 m, 1 lb = 0.45359237 kg), temperature is converted AFFINELY through kelvin rather than by a factor, US and imperial volumes are distinct units (gal_us vs gal_uk), cross-dimension requests are refused, and months and years are deliberately absent because they have no fixed length. Pass list: true to see every supported unit.",
+    "Convert a value between units of length, mass, volume, temperature, time, area, speed, data size, pressure or energy. Use rather than recalling a factor: the definitional factors here are exact (1 in = 0.0254 m, 1 lb = 0.45359237 kg), temperature is converted AFFINELY (an offset and a ratio relative to kelvin, never a factor) in a single step, so 100 C is exactly 212 F, US and imperial volumes are distinct units (gal_us vs gal_uk), cross-dimension requests are refused, and months and years are deliberately absent because they have no fixed length. Pass list: true to see every supported unit.",
   inputSchema: z.object({
-    value: z.number().optional().describe("the quantity to convert"),
+    value: z.number().finite().optional().describe("the quantity to convert"),
     from: z.string().max(40).optional(),
     to: z.string().max(40).optional(),
     list: z.boolean().optional().describe("return the catalog of supported units instead"),
@@ -651,7 +658,7 @@ export const numberFormat: RegisteredTool = buildTool({
   description:
     "Format a number for a named locale with grouping, fraction digits, percent or currency, via Intl. Use to render a figure for a human without a model guessing at separators — the locale is required and an unsupported tag is refused rather than silently falling back to the machine's default. One caveat, unique in this package: the exact glyphs come from the runtime's ICU data, so they are stable for a given runtime but not guaranteed across runtime versions.",
   inputSchema: z.object({
-    value: z.number(),
+    value: z.number().finite(),
     locale: z.string().min(2).max(40).describe('a BCP 47 tag, e.g. "en-US", "de-DE", "ja-JP"'),
     style: z.enum(["decimal", "currency", "percent"]).optional().describe("defaults to decimal"),
     currency: z.string().length(3).optional().describe('required when style is "currency"'),
@@ -698,7 +705,7 @@ export const numberFormat: RegisteredTool = buildTool({
 export const numberParse: RegisteredTool = buildTool({
   name: "NumberParse",
   description:
-    'Parse a locale-formatted number back to a plain number, given the locale explicitly. Use on figures scraped from documents or spreadsheets: "1.234,56" is 1234.56 in de-DE and is REFUSED in en-US rather than guessed at, grouping is validated before separators are stripped (so "1234.56" under de-DE is refused, not read as 123456), accounting parentheses mean negative, and a percent sign is reported with both readings so neither is implicit.',
+    'Parse a locale-formatted number back to a plain number, given the locale explicitly. Use on figures scraped from documents or spreadsheets: "1.234,56" is 1234.56 in de-DE and is REFUSED in en-US rather than guessed at, grouping is validated before separators are stripped (so "1234.56" under de-DE is refused, not read as 123456), one pair of accounting parentheses means negative while nested or unbalanced ones are refused, and a percent sign is reported with both readings so neither is implicit.',
   inputSchema: z.object({
     text: z.string().min(1).max(1_000),
     locale: z.string().min(2).max(40).describe('the locale the text was written for, e.g. "de-DE"'),
@@ -721,17 +728,17 @@ export const numberParse: RegisteredTool = buildTool({
 export const percent: RegisteredTool = buildTool({
   name: "Percent",
   description:
-    "Compute a percent change, a share of a total, or the markup/margin square — the three that are routinely confused. Use it rather than doing the arithmetic loosely: change is (to-from)/|from|*100 and is undefined from zero; ofTotal is part/total*100; markup is profit over COST while margin is profit over PRICE, so a 50% markup is a 33.3% margin, and markupMargin completes all four values from any two and reports both definitions.",
+    "Compute a percent change, a share of a total, or the markup/margin square — the three that are routinely confused. Use it rather than doing the arithmetic loosely: change is (to-from)/|from|*100 and is undefined from zero; ofTotal is part/total*100; markup is profit over COST while margin is profit over PRICE, so a 50% markup is a 33.3% margin, and markupMargin completes all four values from EXACTLY two, refusing a third rather than ignoring it, and reports both definitions.",
   inputSchema: z.object({
     operation: z.enum(["change", "ofTotal", "markupMargin"]),
-    from: z.number().optional().describe("change: the starting value"),
-    to: z.number().optional().describe("change: the ending value"),
-    part: z.number().optional().describe("ofTotal: the part"),
-    total: z.number().optional().describe("ofTotal: the whole"),
-    cost: z.number().optional().describe("markupMargin"),
-    price: z.number().optional().describe("markupMargin"),
-    markupPercent: z.number().optional().describe("markupMargin"),
-    marginPercent: z.number().optional().describe("markupMargin"),
+    from: z.number().finite().optional().describe("change: the starting value"),
+    to: z.number().finite().optional().describe("change: the ending value"),
+    part: z.number().finite().optional().describe("ofTotal: the part"),
+    total: z.number().finite().optional().describe("ofTotal: the whole"),
+    cost: z.number().finite().optional().describe("markupMargin"),
+    price: z.number().finite().optional().describe("markupMargin"),
+    markupPercent: z.number().finite().optional().describe("markupMargin"),
+    marginPercent: z.number().finite().optional().describe("markupMargin"),
   }),
   readOnly: true,
   concurrencySafe: true,
@@ -829,9 +836,12 @@ export const npv: RegisteredTool = buildTool({
   description:
     "Net present value of a cashflow series at a given discount rate. Use for investment comparisons, and mind the timing convention: here cashflows[0] sits at t=0 and is NOT discounted, which is the textbook definition, while Excel's NPV() discounts its first argument one full period — pass firstPeriod: 1 to reproduce Excel. The rate is a PERCENT per period (5 means 5%), and the per-period discounted values are returned so the arithmetic is auditable.",
   inputSchema: z.object({
-    ratePercent: z.number().describe("discount rate per period as a PERCENT, e.g. 8 for 8%"),
+    ratePercent: z
+      .number()
+      .finite()
+      .describe("discount rate per period as a PERCENT, e.g. 8 for 8%"),
     cashflows: z
-      .array(z.number())
+      .array(z.number().finite())
       .min(1)
       .max(MAX_CASHFLOWS)
       .describe("one value per period; negative is an outflow"),
@@ -864,7 +874,7 @@ export const irr: RegisteredTool = buildTool({
     "Internal rate of return: the discount rate at which a cashflow series has zero NPV, found by bisection. Use when comparing returns rather than absolute values — bisection is used because it cannot diverge the way Newton-Raphson can, the tolerance and iteration cap are reported with the answer, the NPV at that rate is shown so you can see how close to zero it is, and a series that changes sign more than once is flagged, because it can have several IRRs and returning one silently would be a lie.",
   inputSchema: z.object({
     cashflows: z
-      .array(z.number())
+      .array(z.number().finite())
       .min(2)
       .max(MAX_CASHFLOWS)
       .describe("one value per period starting at t=0; must include both signs"),
@@ -910,6 +920,7 @@ export const geoDistance: RegisteredTool = buildTool({
     to: pointSchema,
     radiusMetres: z
       .number()
+      .finite()
       .positive()
       .optional()
       .describe("sphere radius; defaults to the Earth's mean radius 6371008.8 m"),
@@ -932,8 +943,8 @@ export const geoBoundingBox: RegisteredTool = buildTool({
   inputSchema: z.object({
     points: z.array(pointSchema).min(1).max(100_000).optional().describe("box around these points"),
     center: pointSchema.optional().describe("box around this centre, with radiusMetres"),
-    radiusMetres: z.number().positive().max(20_037_508).optional(),
-    earthRadiusMetres: z.number().positive().optional().describe("defaults to 6371008.8"),
+    radiusMetres: z.number().finite().positive().max(20_037_508).optional(),
+    earthRadiusMetres: z.number().finite().positive().optional().describe("defaults to 6371008.8"),
   }),
   readOnly: true,
   concurrencySafe: true,

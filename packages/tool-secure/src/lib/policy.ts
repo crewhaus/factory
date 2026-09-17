@@ -13,9 +13,21 @@
  * there for that: it is the rule kind that says "a person looks at this".
  *
  * A rule whose regular expression does not compile is reported as `error`
- * for that rule alone. The alternative — failing the whole evaluation, or
- * silently treating it as no-match — either blocks work over a typo or
- * quietly turns a policy off.
+ * for that rule alone, and an `error` outcome fails the check. The
+ * alternatives — refusing the whole evaluation, or silently treating the rule
+ * as no-match — either block work over a typo or quietly turn a policy off.
+ *
+ * ## The regex is the operator's, and it runs untimed
+ *
+ * `*_pattern` rules compile caller-supplied regex sources and run them over
+ * text up to the package's 2,000,000-character cap. JavaScript's engine
+ * backtracks, so a pattern like `(a+)+$` can take time exponential in the
+ * length of the text it fails on. There is no timeout here, because there is
+ * no way to interrupt a regex mid-match in this runtime. The rules are
+ * operator-written, not attacker-written, which is what makes this
+ * acceptable — but an operator who pastes a pattern from untrusted content
+ * has handed that content a stall. Write anchored patterns with no nested
+ * unbounded quantifier.
  */
 import { compareStrings, matchAll } from "./text";
 import { lineStarts, locate } from "./text";
@@ -55,7 +67,11 @@ export type PolicyOutcome = {
 };
 
 export type PolicyResult = {
-  /** True when no rule failed. `review` outcomes do not fail; they queue. */
+  /**
+   * True when no rule produced `fail` AND none produced `error`. A rule that
+   * did not compile was not evaluated, so the check cannot claim to have
+   * passed. `review` outcomes do not fail; they queue for a person.
+   */
   readonly pass: boolean;
   readonly outcomes: ReadonlyArray<PolicyOutcome>;
   readonly counts: Readonly<Record<PolicyOutcome["status"], number>>;

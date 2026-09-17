@@ -64,7 +64,12 @@ export type DistanceResult = {
 export function haversineDistance(a: Point, b: Point, radiusMetres: number): DistanceResult {
   assertPoint(a, "from");
   assertPoint(b, "to");
-  if (!(radiusMetres > 0)) throw new GeoError("the radius must be greater than zero");
+  // `> 0` alone lets Infinity through, and an infinite radius makes every
+  // distance Infinity — which JSON renders as `null`, a blank where a number
+  // should be rather than a refusal.
+  if (!(radiusMetres > 0) || !Number.isFinite(radiusMetres)) {
+    throw new GeoError("the radius must be a finite number greater than zero");
+  }
   const lat1 = toRadians(a.lat);
   const lat2 = toRadians(b.lat);
   const dLat = toRadians(b.lat - a.lat);
@@ -187,8 +192,12 @@ export function boundingBoxAround(
   earthRadius: number,
 ): RadiusBox {
   assertPoint(center, "center");
-  if (!(radiusMetres > 0)) throw new GeoError("the radius must be greater than zero");
-  if (!(earthRadius > 0)) throw new GeoError("the Earth radius must be greater than zero");
+  if (!(radiusMetres > 0) || !Number.isFinite(radiusMetres)) {
+    throw new GeoError("the radius must be a finite number greater than zero");
+  }
+  if (!(earthRadius > 0) || !Number.isFinite(earthRadius)) {
+    throw new GeoError("the Earth radius must be a finite number greater than zero");
+  }
   const angular = radiusMetres / earthRadius;
   if (angular >= Math.PI) {
     return {

@@ -106,10 +106,7 @@ function decodeEntities(raw: string, line: number): string {
 /** Parse a whole document into its top-level nodes (normally one element). */
 export function parseXml(text: string, limits: XmlLimits = DEFAULT_XML_LIMITS): XmlNode[] {
   if (text.length > limits.maxChars) {
-    throw new XmlError(
-      `xml is ${text.length} characters, over the ${limits.maxChars} limit`,
-      1,
-    );
+    throw new XmlError(`xml is ${text.length} characters, over the ${limits.maxChars} limit`, 1);
   }
   const src = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
   let i = 0;
@@ -217,40 +214,47 @@ export function parseXml(text: string, limits: XmlLimits = DEFAULT_XML_LIMITS): 
     const name = src.slice(i + 1, j);
     const attributes: Record<string, string> = {};
     let selfClosing = false;
+    // The line an error INSIDE this tag happened on. `line` itself is only
+    // advanced once, by the `advance(j)` at the end of this branch, which
+    // walks from `i` to `j`; incrementing it here as well would count every
+    // newline in the tag twice and report later errors on a line that does
+    // not exist.
+    const lineAt = (at: number): number => {
+      let n = line;
+      for (let k = i; k < at; k++) if (src[k] === "\n") n += 1;
+      return n;
+    };
     for (;;) {
-      while (j < src.length && /\s/.test(src[j] as string)) {
-        if (src[j] === "\n") line += 1;
-        j++;
-      }
+      while (j < src.length && /\s/.test(src[j] as string)) j++;
       const ch = src[j];
-      if (ch === undefined) throw new XmlError(`unterminated tag <${name}`, line);
+      if (ch === undefined) throw new XmlError(`unterminated tag <${name}`, lineAt(j));
       if (ch === ">") {
         j += 1;
         break;
       }
       if (ch === "/") {
-        if (src[j + 1] !== ">") throw new XmlError(`expected '/>' in <${name}>`, line);
+        if (src[j + 1] !== ">") throw new XmlError(`expected '/>' in <${name}>`, lineAt(j));
         selfClosing = true;
         j += 2;
         break;
       }
       if (!NAME_START.test(ch)) {
-        throw new XmlError(`unexpected character '${ch}' in <${name}>`, line);
+        throw new XmlError(`unexpected character '${ch}' in <${name}>`, lineAt(j));
       }
       const attrStart = j;
       while (j < src.length && NAME_CHAR.test(src[j] as string)) j++;
       const attrName = src.slice(attrStart, j);
       while (j < src.length && /\s/.test(src[j] as string)) j++;
-      if (src[j] !== "=") throw new XmlError(`attribute ${attrName} has no value`, line);
+      if (src[j] !== "=") throw new XmlError(`attribute ${attrName} has no value`, lineAt(j));
       j += 1;
       while (j < src.length && /\s/.test(src[j] as string)) j++;
       const quote = src[j];
       if (quote !== '"' && quote !== "'") {
-        throw new XmlError(`attribute ${attrName} value must be quoted`, line);
+        throw new XmlError(`attribute ${attrName} value must be quoted`, lineAt(j));
       }
       const valueEnd = src.indexOf(quote, j + 1);
-      if (valueEnd < 0) throw new XmlError(`unterminated value for ${attrName}`, line);
-      attributes[attrName] = decodeEntities(src.slice(j + 1, valueEnd), line);
+      if (valueEnd < 0) throw new XmlError(`unterminated value for ${attrName}`, lineAt(j));
+      attributes[attrName] = decodeEntities(src.slice(j + 1, valueEnd), lineAt(j));
       j = valueEnd + 1;
     }
     countNode();
@@ -258,7 +262,7 @@ export function parseXml(text: string, limits: XmlLimits = DEFAULT_XML_LIMITS): 
     current().push(element);
     if (!selfClosing) {
       if (stack.length + 1 > limits.maxDepth) {
-        throw new XmlError(`xml nests deeper than ${limits.maxDepth} elements`, line);
+        throw new XmlError(`xml nests deeper than ${limits.maxDepth} elements`, lineAt(j));
       }
       stack.push(element);
     }
@@ -278,7 +282,8 @@ export function rootElement(nodes: ReadonlyArray<XmlNode>): XmlElement {
 /** Direct element children with the given name. */
 export function childrenNamed(element: XmlElement, name: string): XmlElement[] {
   const out: XmlElement[] = [];
-  for (const child of element.children) if (isElement(child) && child.name === name) out.push(child);
+  for (const child of element.children)
+    if (isElement(child) && child.name === name) out.push(child);
   return out;
 }
 

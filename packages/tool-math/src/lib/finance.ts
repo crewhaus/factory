@@ -96,9 +96,15 @@ export function markupMargin(input: {
   marginPercent?: number;
 }): MarkupMargin {
   const given = Object.entries(input).filter(([, v]) => v !== undefined);
-  if (given.length < 2) {
+  if (given.length !== 2) {
+    // Exactly two, as the message has always said. One cannot determine the
+    // others; three or four over-determine them, and the code silently ignored
+    // the extras rather than checking that they agreed.
+    const names = given.map(([key]) => key).join(", ") || "none";
     throw new FinanceError(
-      "supply exactly two of cost, price, markupPercent, marginPercent — one value cannot determine the others",
+      given.length > 2
+        ? `supply exactly two of cost, price, markupPercent, marginPercent — ${given.length} were given (${names}), which over-determines the square; drop the ones you are not certain of rather than having them silently ignored`
+        : `supply exactly two of cost, price, markupPercent, marginPercent — ${given.length} was given (${names}), and one value cannot determine the others`,
     );
   }
   for (const [key, value] of given) {

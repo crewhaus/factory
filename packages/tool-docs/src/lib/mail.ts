@@ -219,10 +219,7 @@ function splitAddressList(value: string): string[] {
   return out;
 }
 
-export function parseAddressList(
-  value: string | undefined,
-  notes: Set<string>,
-): MailAddress[] {
+export function parseAddressList(value: string | undefined, notes: Set<string>): MailAddress[] {
   if (value === undefined || value.trim() === "") return [];
   // Group syntax: `Managers: a@b, c@d;` — flatten to the members.
   const flattened = value.replace(/^[^:;"<]*:(.*);?\s*$/s, "$1");
@@ -438,19 +435,14 @@ function walkPart(
       notes.add(`multipart nesting deeper than ${options.maxDepth} levels was not followed`);
     } else {
       const marker = `--${boundary}`;
-      const segments = body.split(new RegExp(`(?:^|\\r?\\n)${escapeRegExp(marker)}(--)?[^\\n]*\\r?\\n?`));
+      const segments = body.split(
+        new RegExp(`(?:^|\\r?\\n)${escapeRegExp(marker)}(--)?[^\\n]*\\r?\\n?`),
+      );
       // The first segment is the preamble and is not a part.
       for (const segment of segments.slice(1)) {
         if (segment === undefined || segment === "--" || segment.trim() === "") continue;
         const split = splitHeadersAndBody(segment);
-        walkPart(
-          parseHeaderBlock(split.headerText),
-          split.body,
-          options,
-          depth + 1,
-          out,
-          notes,
-        );
+        walkPart(parseHeaderBlock(split.headerText), split.body, options, depth + 1, out, notes);
         if (out.length >= options.maxParts) return;
       }
       return;
@@ -461,14 +453,15 @@ function walkPart(
   const disposition =
     dispositionRaw === undefined ? undefined : parseParameterHeader(dispositionRaw);
   const filenameRaw = disposition?.params["filename"] ?? params["name"];
-  const filename =
-    filenameRaw === undefined ? undefined : decodeEncodedWords(filenameRaw, notes);
+  const filename = filenameRaw === undefined ? undefined : decodeEncodedWords(filenameRaw, notes);
   const decoded = decodeBody(body, encoding);
   const isText = lowerType.startsWith("text/") || lowerType === "message/rfc822";
   const isAttachment =
     disposition?.value.toLowerCase() === "attachment" ||
     (filename !== undefined && !isText) ||
-    (!isText && disposition?.value.toLowerCase() !== "inline" && !lowerType.startsWith("multipart/"));
+    (!isText &&
+      disposition?.value.toLowerCase() !== "inline" &&
+      !lowerType.startsWith("multipart/"));
 
   const part: {
     contentType: string;
@@ -547,7 +540,11 @@ export function parseMessage(raw: string, options: MailParseOptions): ParsedMess
 /** The text of a message: its text/plain parts, or its text/html stripped. */
 export function messagePlainText(message: ParsedMessage): string {
   const plain = message.parts.filter((p) => p.contentType === "text/plain" && p.text !== undefined);
-  if (plain.length > 0) return plain.map((p) => p.text ?? "").join("\n").trim();
+  if (plain.length > 0)
+    return plain
+      .map((p) => p.text ?? "")
+      .join("\n")
+      .trim();
   const html = message.parts.filter((p) => p.contentType === "text/html" && p.text !== undefined);
   return html
     .map((p) => stripHtml(p.text ?? ""))

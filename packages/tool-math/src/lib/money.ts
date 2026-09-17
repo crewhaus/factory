@@ -17,6 +17,7 @@
 import {
   type Decimal,
   DecimalError,
+  MAX_DECIMAL_DIGITS,
   type RoundingMode,
   decimalToString,
   divideRound,
@@ -147,10 +148,21 @@ export function toMinor(amount: number | string, label = "amount"): bigint {
     }
     return BigInt(amount);
   }
-  if (!/^[+-]?\d+$/.test(amount.trim())) {
+  const text = amount.trim();
+  if (!/^[+-]?\d+$/.test(text)) {
     throw new MoneyError(`${label} must be a whole number of minor units, got "${amount}"`);
   }
-  return BigInt(amount.trim());
+  // The same digit cap `parseDecimal` applies. Without it a single request could
+  // carry a 200 000-digit "amount", and the bigint multiplications in
+  // `moneyAllocate` then took tens of seconds and built an 80 MB result — an
+  // unbounded amount of work from a small-looking input.
+  const digits = text.replace(/^[+-]/, "").length;
+  if (digits > MAX_DECIMAL_DIGITS) {
+    throw new MoneyError(
+      `${label} has ${digits} digits, over the ${MAX_DECIMAL_DIGITS} limit — no currency amount is that large`,
+    );
+  }
+  return BigInt(text);
 }
 
 /** Minor units rendered as a major-unit decimal string: 1050 with exponent 2 -> "10.50". */

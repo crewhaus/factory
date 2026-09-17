@@ -110,14 +110,16 @@ function classify(cp: number): { name: string; class: InvisibleClass } | undefin
   if ((cp < 0x20 && cp !== 0x09 && cp !== 0x0a && cp !== 0x0d) || (cp >= 0x7f && cp <= 0x9f)) {
     return { name: "CONTROL CHARACTER", class: "control" };
   }
-  if (cp >= 0xfe00 && cp <= 0xfe0f) return { name: "VARIATION SELECTOR", class: "variation-selector" };
+  if (cp >= 0xfe00 && cp <= 0xfe0f)
+    return { name: "VARIATION SELECTOR", class: "variation-selector" };
   if (cp >= 0xe0100 && cp <= 0xe01ef) {
     return { name: "VARIATION SELECTOR SUPPLEMENT", class: "variation-selector" };
   }
   // The tag block: a full ASCII alphabet that renders as nothing at all.
   if (cp >= 0xe0000 && cp <= 0xe007f) return { name: "TAG CHARACTER", class: "tag" };
   if (cp >= 0xe000 && cp <= 0xf8ff) return { name: "PRIVATE USE", class: "private-use" };
-  if (cp >= 0xf0000 && cp <= 0x10fffd) return { name: "SUPPLEMENTARY PRIVATE USE", class: "private-use" };
+  if (cp >= 0xf0000 && cp <= 0x10fffd)
+    return { name: "SUPPLEMENTARY PRIVATE USE", class: "private-use" };
   return undefined;
 }
 
@@ -182,25 +184,109 @@ export function unbalancedBidi(text: string): Array<{ line: number; open: number
  */
 export const CONFUSABLES: ReadonlyMap<string, string> = new Map<string, string>([
   // Cyrillic
-  ["А", "A"], ["В", "B"], ["Е", "E"], ["Ѕ", "S"], ["І", "I"], ["Ј", "J"], ["К", "K"],
-  ["М", "M"], ["Н", "H"], ["О", "O"], ["Р", "P"], ["С", "C"], ["Т", "T"], ["У", "Y"],
-  ["Х", "X"], ["Ԛ", "Q"], ["Ԝ", "W"], ["Ӏ", "I"],
-  ["а", "a"], ["в", "b"], ["е", "e"], ["ё", "e"], ["ѕ", "s"], ["і", "i"], ["ј", "j"],
-  ["к", "k"], ["м", "m"], ["н", "h"], ["о", "o"], ["р", "p"], ["с", "c"], ["т", "t"],
-  ["у", "y"], ["х", "x"], ["ԁ", "d"], ["һ", "h"], ["ӏ", "l"], ["ѡ", "w"], ["ԍ", "g"],
+  ["А", "A"],
+  ["В", "B"],
+  ["Е", "E"],
+  ["Ѕ", "S"],
+  ["І", "I"],
+  ["Ј", "J"],
+  ["К", "K"],
+  ["М", "M"],
+  ["Н", "H"],
+  ["О", "O"],
+  ["Р", "P"],
+  ["С", "C"],
+  ["Т", "T"],
+  ["У", "Y"],
+  ["Х", "X"],
+  ["Ԛ", "Q"],
+  ["Ԝ", "W"],
+  ["Ӏ", "I"],
+  ["а", "a"],
+  ["в", "b"],
+  ["е", "e"],
+  ["ё", "e"],
+  ["ѕ", "s"],
+  ["і", "i"],
+  ["ј", "j"],
+  ["к", "k"],
+  ["м", "m"],
+  ["н", "h"],
+  ["о", "o"],
+  ["р", "p"],
+  ["с", "c"],
+  ["т", "t"],
+  ["у", "y"],
+  ["х", "x"],
+  ["ԁ", "d"],
+  ["һ", "h"],
+  ["ӏ", "l"],
+  ["ѡ", "w"],
+  ["ԍ", "g"],
   // Greek
-  ["Α", "A"], ["Β", "B"], ["Ε", "E"], ["Ζ", "Z"], ["Η", "H"], ["Ι", "I"], ["Κ", "K"],
-  ["Μ", "M"], ["Ν", "N"], ["Ο", "O"], ["Ρ", "P"], ["Τ", "T"], ["Υ", "Y"], ["Χ", "X"],
-  ["Ϲ", "C"], ["α", "a"], ["ε", "e"], ["ι", "i"], ["κ", "k"], ["ν", "v"], ["ο", "o"],
-  ["ρ", "p"], ["τ", "t"], ["υ", "u"], ["χ", "x"], ["ϲ", "c"], ["ϳ", "j"],
+  ["Α", "A"],
+  ["Β", "B"],
+  ["Ε", "E"],
+  ["Ζ", "Z"],
+  ["Η", "H"],
+  ["Ι", "I"],
+  ["Κ", "K"],
+  ["Μ", "M"],
+  ["Ν", "N"],
+  ["Ο", "O"],
+  ["Ρ", "P"],
+  ["Τ", "T"],
+  ["Υ", "Y"],
+  ["Χ", "X"],
+  ["Ϲ", "C"],
+  ["α", "a"],
+  ["ε", "e"],
+  ["ι", "i"],
+  ["κ", "k"],
+  ["ν", "v"],
+  ["ο", "o"],
+  ["ρ", "p"],
+  ["τ", "t"],
+  ["υ", "u"],
+  ["χ", "x"],
+  ["ϲ", "c"],
+  ["ϳ", "j"],
   // Armenian, Georgian and Cherokee lookalikes that reach domain names
-  ["ա", "w"], ["օ", "o"], ["ѵ", "v"], ["Ꭺ", "A"], ["Ꮯ", "C"], ["Ꮋ", "H"], ["Ꮖ", "I"],
+  ["ա", "w"],
+  ["օ", "o"],
+  ["ѵ", "v"],
+  ["Ꭺ", "A"],
+  ["Ꮯ", "C"],
+  ["Ꮋ", "H"],
+  ["Ꮖ", "I"],
   // Punctuation and symbols that read as ASCII
-  ["‐", "-"], ["‑", "-"], ["‒", "-"], ["–", "-"], ["—", "-"], ["―", "-"], ["−", "-"],
-  ["’", "'"], ["‘", "'"], ["‚", "'"], ["′", "'"], ["ʼ", "'"], ["ˈ", "'"],
-  ["“", '"'], ["”", '"'], ["„", '"'], ["″", '"'],
-  ["⁄", "/"], ["∕", "/"], ["⧸", "/"], ["∶", ":"], ["․", "."], ["。", "."], ["｡", "."],
-  ["ǀ", "l"], ["ł", "l"], ["ℓ", "l"],
+  ["‐", "-"],
+  ["‑", "-"],
+  ["‒", "-"],
+  ["–", "-"],
+  ["—", "-"],
+  ["―", "-"],
+  ["−", "-"],
+  ["’", "'"],
+  ["‘", "'"],
+  ["‚", "'"],
+  ["′", "'"],
+  ["ʼ", "'"],
+  ["ˈ", "'"],
+  ["“", '"'],
+  ["”", '"'],
+  ["„", '"'],
+  ["″", '"'],
+  ["⁄", "/"],
+  ["∕", "/"],
+  ["⧸", "/"],
+  ["∶", ":"],
+  ["․", "."],
+  ["。", "."],
+  ["｡", "."],
+  ["ǀ", "l"],
+  ["ł", "l"],
+  ["ℓ", "l"],
 ]);
 
 export type FoldChange = {
@@ -219,11 +305,25 @@ export type FoldResult = {
   readonly unfolded: ReadonlyArray<{ start: number; label: string; char: string }>;
 };
 
-const COMBINING = /[̀-ͯ]/g;
+/**
+ * Drop combining marks (U+0300-U+036F) by code point rather than with a
+ * character class: a class whose endpoints are a base character and a
+ * combining one is exactly what makes a regex here ambiguous, and the loop
+ * says what it means.
+ */
+function stripCombiningMarks(value: string): string {
+  let out = "";
+  for (const ch of value) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp >= 0x0300 && cp <= 0x036f) continue;
+    out += ch;
+  }
+  return out;
+}
 
 /** Fold one non-ASCII code point via NFKD, or undefined when it will not reduce. */
 function nfkdToAscii(char: string): string | undefined {
-  const decomposed = char.normalize("NFKD").replace(COMBINING, "");
+  const decomposed = stripCombiningMarks(char.normalize("NFKD"));
   if (decomposed.length === 0) return undefined;
   // Printable ASCII only: a decomposition to a control character is not a fold.
   for (let i = 0; i < decomposed.length; i++) {

@@ -58,6 +58,20 @@ export const EXPR_CONSTANTS: Readonly<Record<string, number>> = Object.freeze({
 
 type FnSpec = { minArgs: number; maxArgs: number; apply: (args: number[]) => number };
 
+/**
+ * Look a name up as an OWN property only.
+ *
+ * A plain object literal inherits from `Object.prototype`, so `FUNCTIONS["__proto__"]`
+ * and `EXPR_CONSTANTS["constructor"]` are not `undefined` — they are inherited
+ * members that would then be treated as a function spec or a constant. That is
+ * how `__proto__(1)` reached `spec.apply(args)` and threw a raw TypeError out of
+ * the tool instead of a located refusal. Every table lookup on a caller-supplied
+ * name goes through here.
+ */
+function ownProperty<T>(table: Readonly<Record<string, T>>, name: string): T | undefined {
+  return Object.hasOwn(table, name) ? table[name] : undefined;
+}
+
 /** The entire function set. A name not in this table is refused. */
 const FUNCTIONS: Readonly<Record<string, FnSpec>> = Object.freeze({
   abs: { minArgs: 1, maxArgs: 1, apply: (a) => Math.abs(num(a, 0)) },
@@ -322,7 +336,7 @@ class Parser {
   }
 
   private parseCall(name: string, pos: number): number {
-    const spec = FUNCTIONS[name];
+    const spec = ownProperty(FUNCTIONS, name);
     if (spec === undefined) {
       throw new ExprError(
         `unknown function "${name}"; supported: ${EXPR_FUNCTIONS.join(", ")}`,
@@ -366,11 +380,11 @@ class Parser {
 
   private lookup(name: string, pos: number): number {
     const provided = Object.hasOwn(this.variables, name) ? this.variables[name] : undefined;
-    const value = provided ?? EXPR_CONSTANTS[name];
+    const value = provided ?? ownProperty(EXPR_CONSTANTS, name);
     if (value === undefined) {
       const known = [...Object.keys(this.variables), ...Object.keys(EXPR_CONSTANTS)].sort();
       const suffix = known.length > 0 ? `; known names: ${known.join(", ")}` : "";
-      if (FUNCTIONS[name] !== undefined) {
+      if (ownProperty(FUNCTIONS, name) !== undefined) {
         throw new ExprError(`"${name}" is a function — call it as ${name}(...)`, pos);
       }
       throw new ExprError(`unknown name "${name}"${suffix}`, pos);

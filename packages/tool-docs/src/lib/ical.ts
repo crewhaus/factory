@@ -105,12 +105,40 @@ export function unescapeText(value: string): string {
   return out;
 }
 
+/**
+ * Escape a TEXT value, per RFC 5545 section 3.3.11: the escaped characters
+ * are BACKSLASH, SEMICOLON, COMMA and the newline (written `\n`). A carriage
+ * return carries no meaning inside a value and is dropped, since the only
+ * CRLF a content line may contain is the fold that `foldLine` inserts.
+ *
+ * `unescapeText` passes a bare `;` through unchanged, so a round-trip test
+ * cannot see a missing semicolon escape; the test for this asserts the
+ * literal bytes the RFC calls for instead.
+ */
 export function escapeText(value: string): string {
   return value
     .replace(/\\/g, "\\\\")
+    .replace(/\r\n?/g, "\n")
     .replace(/\n/g, "\\n")
     .replace(/,/g, "\\,")
-    .replace(/;/g, "\;");
+    .replace(/;/g, "\\;");
+}
+
+/**
+ * A value that is NOT a TEXT property — a URI, a TZID, an RRULE, a status —
+ * still reaches the file verbatim, so a caller-supplied newline would forge
+ * further content lines (`ORGANIZER:mailto:a@b\r\nSUMMARY:injected`). Line
+ * breaks and the NUL that some readers stop at are refused outright rather
+ * than silently stripped, because either choice would change what the caller
+ * asked to write and only one of them says so.
+ */
+function assertSingleLine(field: string, value: string): string {
+  if (value.includes("\r") || value.includes("\n") || value.includes("\u0000")) {
+    throw new CalendarError(
+      `${field} contains a line break or NUL; a calendar property cannot span lines, so this is refused rather than written out as extra properties`,
+    );
+  }
+  return value;
 }
 
 /** Parse one unfolded content line. */
@@ -135,6 +163,36 @@ export function parseContentLine(line: string): ContentLine | null {
   };
   const name = readUntil(";:").toUpperCase();
   if (name === "") return null;
+  /**
+   * A parameter's values are comma-separated, EXCEPT inside a quoted value:
+   * `CN="Doe, Jane"` is one value, not two. Splitting the raw text on commas
+   * after the quotes have been consumed is the bug this avoids.
+   */
+  const readParamValues = (): string[] => {
+    const values: string[] = [];
+    for (;;) {
+      if (line[i] === '"') {
+        i += 1;
+        let quoted = "";
+        while (i < line.length && line[i] !== '"') {
+          quoted += line[i] as string;
+          i += 1;
+        }
+        i += 1; // the closing quote
+        values.push(quoted);
+      } else {
+        let plain = "";
+        while (i < line.length && !";:,".includes(line[i] as string)) {
+          plain += line[i] as string;
+          i += 1;
+        }
+        values.push(plain.trim());
+      }
+      if (line[i] !== ",") return values;
+      i += 1;
+    }
+  };
+
   const params: Record<string, string[]> = {};
   while (line[i] === ";") {
     i += 1;
@@ -142,8 +200,7 @@ export function parseContentLine(line: string): ContentLine | null {
     let values: string[] = [];
     if (line[i] === "=") {
       i += 1;
-      const raw = readUntil(";:");
-      values = raw.split(",").map((v) => v.trim());
+      values = readParamValues();
     }
     if (paramName !== "") params[paramName] = values;
   }
@@ -478,7 +535,13 @@ export function writeCalendar(
   events: ReadonlyArray<EventInput>,
   options: CalendarWriteOptions,
 ): string {
-  const stamp = toCalendarValue(options.stamp).value;
+  const stampValue = toCalendarValue(options.stamp);
+  if (stampValue.dateOnly) {
+    throw new CalendarError(
+      `DTSTAMP must be an instant, not the date "${options.stamp}": a calendar's stamp is a UTC date-time`,
+    );
+  }
+  const stamp = stampValue.value;
   const lines: string[] = [
     "BEGIN:VCALENDAR",
     "VERSION:2.0",
@@ -493,29 +556,34 @@ export function writeCalendar(
     lines.push("BEGIN:VEVENT");
     lines.push(`UID:${escapeText(event.uid)}`);
     lines.push(`DTSTAMP:${stamp.endsWith("Z") ? stamp : `${stamp}Z`}`);
-    const tzParam = event.timezone === undefined ? "" : `;TZID=${event.timezone}`;
+    const tzParam =
+      event.timezone === undefined
+        ? ""
+        : `;TZID=${assertSingleLine("a TZID", event.timezone.replace(/[;:,"]/g, ""))}`;
     lines.push(
-      start.dateOnly
-        ? `DTSTART;VALUE=DATE:${start.value}`
-        : `DTSTART${tzParam}:${start.value}`,
+      start.dateOnly ? `DTSTART;VALUE=DATE:${start.value}` : `DTSTART${tzParam}:${start.value}`,
     );
     if (event.end !== undefined) {
       const end = toCalendarValue(event.end);
-      lines.push(
-        end.dateOnly ? `DTEND;VALUE=DATE:${end.value}` : `DTEND${tzParam}:${end.value}`,
-      );
+      lines.push(end.dateOnly ? `DTEND;VALUE=DATE:${end.value}` : `DTEND${tzParam}:${end.value}`);
     }
     lines.push(`SUMMARY:${escapeText(event.summary)}`);
     if (event.description !== undefined) {
       lines.push(`DESCRIPTION:${escapeText(event.description)}`);
     }
     if (event.location !== undefined) lines.push(`LOCATION:${escapeText(event.location)}`);
-    if (event.status !== undefined) lines.push(`STATUS:${event.status.toUpperCase()}`);
-    if (event.organizer !== undefined) lines.push(`ORGANIZER:mailto:${event.organizer}`);
-    for (const attendee of event.attendees ?? []) {
-      lines.push(`ATTENDEE;RSVP=TRUE:mailto:${attendee}`);
+    if (event.status !== undefined) {
+      lines.push(`STATUS:${assertSingleLine("a STATUS", event.status).toUpperCase()}`);
     }
-    if (event.rrule !== undefined) lines.push(`RRULE:${event.rrule.replace(/^RRULE:/i, "")}`);
+    if (event.organizer !== undefined) {
+      lines.push(`ORGANIZER:mailto:${assertSingleLine("an organizer address", event.organizer)}`);
+    }
+    for (const attendee of event.attendees ?? []) {
+      lines.push(`ATTENDEE;RSVP=TRUE:mailto:${assertSingleLine("an attendee address", attendee)}`);
+    }
+    if (event.rrule !== undefined) {
+      lines.push(`RRULE:${assertSingleLine("an RRULE", event.rrule.replace(/^RRULE:/i, ""))}`);
+    }
     if (event.alarmMinutesBefore !== undefined) {
       lines.push("BEGIN:VALARM");
       lines.push(`TRIGGER:-PT${Math.max(0, Math.round(event.alarmMinutesBefore))}M`);
@@ -644,7 +712,8 @@ export function readVcards(components: ReadonlyArray<Component>): Vcard[] {
           .map((c) => c.trim())
           .filter((c) => c !== ""),
       ),
-      hasPhoto: property(component, "PHOTO") !== undefined || property(component, "LOGO") !== undefined,
+      hasPhoto:
+        property(component, "PHOTO") !== undefined || property(component, "LOGO") !== undefined,
     };
     for (const [key, prop] of [
       ["version", "VERSION"],

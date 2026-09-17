@@ -28,8 +28,8 @@
  * attacker-controlled text. Show it to a person; do not paste it into a
  * prompt as if it were instructions.
  */
+import { type Finding, compareStrings, matchAll, withPositions } from "./text";
 import { scanInvisible } from "./unicode";
-import { type Finding, matchAll, withPositions } from "./text";
 
 export type InjectionCategory =
   | "override"
@@ -55,35 +55,40 @@ export const INJECTION_RULES: ReadonlyArray<InjectionRule> = [
     category: "override",
     weight: 35,
     description: "asks the reader to ignore earlier instructions",
-    pattern: /\bignore\s+(?:all\s+)?(?:of\s+)?(?:the\s+)?(?:previous|prior|above|earlier|preceding)\s+(?:instructions?|directions?|prompts?|rules?|messages?|context)/gi,
+    pattern:
+      /\bignore\s+(?:all\s+)?(?:of\s+)?(?:the\s+)?(?:previous|prior|above|earlier|preceding)\s+(?:instructions?|directions?|prompts?|rules?|messages?|context)/gi,
   },
   {
     id: "override.disregard",
     category: "override",
     weight: 30,
     description: "asks the reader to disregard what came before",
-    pattern: /\bdisregard\s+(?:all\s+)?(?:the\s+)?(?:above|previous|prior|earlier|foregoing|your\s+instructions)/gi,
+    pattern:
+      /\bdisregard\s+(?:all\s+)?(?:the\s+)?(?:above|previous|prior|earlier|foregoing|your\s+instructions)/gi,
   },
   {
     id: "override.forget",
     category: "override",
     weight: 25,
     description: "asks the reader to forget its instructions",
-    pattern: /\bforget\s+(?:everything|all\s+(?:previous|prior)|your\s+(?:instructions|rules|training))/gi,
+    pattern:
+      /\bforget\s+(?:everything|all\s+(?:previous|prior)|your\s+(?:instructions|rules|training))/gi,
   },
   {
     id: "override.new-instructions",
     category: "override",
     weight: 25,
     description: "announces replacement instructions",
-    pattern: /\b(?:new|updated|revised)\s+(?:system\s+)?(?:instructions?|directives?|rules?)\s*[:\-]/gi,
+    pattern:
+      /\b(?:new|updated|revised)\s+(?:system\s+)?(?:instructions?|directives?|rules?)\s*[:\-]/gi,
   },
   {
     id: "override.chat-markup",
     category: "override",
     weight: 30,
     description: "embeds chat-template or role markup, trying to close the current turn",
-    pattern: /<\/?(?:system|assistant|human|user)>|\[\/?INST\]|<\|im_(?:start|end)\|>|^\s*###\s*(?:instruction|system)/gim,
+    pattern:
+      /<\/?(?:system|assistant|human|user)>|\[\/?INST\]|<\|im_(?:start|end)\|>|^\s*###\s*(?:instruction|system)/gim,
   },
   {
     id: "role.you-are-now",
@@ -111,7 +116,8 @@ export const INJECTION_RULES: ReadonlyArray<InjectionRule> = [
     category: "exfiltration",
     weight: 35,
     description: "asks for the system prompt or hidden instructions",
-    pattern: /\b(?:reveal|repeat|print|show|output|display|disclose)\s+(?:me\s+)?(?:your|the)\s+(?:full\s+|entire\s+|original\s+)?(?:system\s+)?(?:prompt|instructions?|rules|configuration)/gi,
+    pattern:
+      /\b(?:reveal|repeat|print|show|output|display|disclose)\s+(?:me\s+)?(?:your|the)\s+(?:full\s+|entire\s+|original\s+)?(?:system\s+)?(?:prompt|instructions?|rules|configuration)/gi,
   },
   {
     id: "exfil.repeat-above",
@@ -125,14 +131,16 @@ export const INJECTION_RULES: ReadonlyArray<InjectionRule> = [
     category: "exfiltration",
     weight: 35,
     description: "asks for data to be sent to an address the content supplies",
-    pattern: /\b(?:send|post|upload|forward|email|exfiltrate)\s+(?:it|this|them|the\s+\w+(?:\s+\w+)?)\s+to\s+(?:https?:\/\/\S+|\S+@\S+\.\w+)/gi,
+    pattern:
+      /\b(?:send|post|upload|forward|email|exfiltrate)\s+(?:it|this|them|the\s+\w+(?:\s+\w+)?)\s+to\s+(?:https?:\/\/\S+|\S+@\S+\.\w+)/gi,
   },
   {
     id: "tool.run-command",
     category: "tool-coercion",
     weight: 25,
     description: "instructs the reader to run supplied code",
-    pattern: /\b(?:run|execute|eval(?:uate)?)\s+(?:the\s+)?(?:following|this|these)\s+(?:command|script|code|snippet)/gi,
+    pattern:
+      /\b(?:run|execute|eval(?:uate)?)\s+(?:the\s+)?(?:following|this|these)\s+(?:command|script|code|snippet)/gi,
   },
   {
     id: "tool.pipe-to-shell",
@@ -146,50 +154,58 @@ export const INJECTION_RULES: ReadonlyArray<InjectionRule> = [
     category: "tool-coercion",
     weight: 30,
     description: "asks for credentials to be produced or entered",
-    pattern: /\b(?:paste|provide|enter|reveal|share|type)\s+(?:your|the)\s+(?:api[\s_-]?key|password|secret|token|credentials?|private\s+key)/gi,
+    pattern:
+      /\b(?:paste|provide|enter|reveal|share|type)\s+(?:your|the)\s+(?:api[\s_-]?key|password|secret|token|credentials?|private\s+key)/gi,
   },
   {
     id: "authority.claimed",
     category: "authority",
     weight: 20,
     description: "the content claims to be the operator, developer or system",
-    pattern: /\b(?:i\s+am|this\s+is)\s+(?:the\s+)?(?:system|administrator|admin|developer|operator|your\s+(?:developer|creator|owner|principal))\b/gi,
+    pattern:
+      /\b(?:i\s+am|this\s+is)\s+(?:the\s+)?(?:system|administrator|admin|developer|operator|your\s+(?:developer|creator|owner|principal))\b/gi,
   },
   {
     id: "authority.preauthorized",
     category: "authority",
     weight: 25,
     description: "the content asserts the user already consented",
-    pattern: /\b(?:the\s+)?(?:user|owner|operator|human)\s+(?:has\s+)?(?:already\s+)?(?:approved|authorized|authorised|consented|pre-?approved)\b/gi,
+    pattern:
+      /\b(?:the\s+)?(?:user|owner|operator|human)\s+(?:has\s+)?(?:already\s+)?(?:approved|authorized|authorised|consented|pre-?approved)\b/gi,
   },
   {
     id: "authority.policy-override",
     category: "authority",
     weight: 30,
     description: "asks for safety or policy constraints to be set aside",
-    pattern: /\b(?:override|bypass|ignore|suspend|disable)\s+(?:your\s+|the\s+)?(?:safety|security|content|policy|policies|guidelines?|restrictions?|filters?)/gi,
+    pattern:
+      /\b(?:override|bypass|ignore|suspend|disable)\s+(?:your\s+|the\s+)?(?:safety|security|content|policy|policies|guidelines?|restrictions?|filters?)/gi,
   },
   {
     id: "secrecy.do-not-tell",
     category: "secrecy",
     weight: 30,
     description: "asks for the action to be hidden from the user",
-    pattern: /\b(?:do\s*n[o']?t|never|avoid)\s+(?:tell|telling|inform|informing|mention(?:ing)?\s+to|notify(?:ing)?|alert(?:ing)?)\s+(?:the\s+)?(?:user|human|operator|owner)/gi,
+    pattern:
+      /\b(?:do\s*n[o']?t|never|avoid)\s+(?:tell|telling|inform|informing|mention(?:ing)?\s+to|notify(?:ing)?|alert(?:ing)?)\s+(?:the\s+)?(?:user|human|operator|owner)/gi,
   },
   {
     id: "secrecy.silently",
     category: "secrecy",
     weight: 15,
     description: "asks for an action without confirmation",
-    pattern: /\b(?:silently|quietly|without\s+(?:asking|telling|informing|confirmation|notifying))\b/gi,
+    pattern:
+      /\b(?:silently|quietly|without\s+(?:asking|telling|informing|confirmation|notifying))\b/gi,
   },
 ];
 
 const HTML_COMMENT = /<!--([\s\S]{0,4000}?)-->/g;
-const HIDDEN_STYLE = /style\s*=\s*["'][^"']{0,200}(?:display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0|opacity\s*:\s*0)/gi;
+const HIDDEN_STYLE =
+  /style\s*=\s*["'][^"']{0,200}(?:display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0|opacity\s*:\s*0)/gi;
 const MARKDOWN_LINK = /\[([^\]\n]{1,200})\]\(([^)\s]{1,500})\)/g;
 const BASE64_BLOB = /[A-Za-z0-9+/]{40,}={0,2}/g;
-const DOMAIN_IN_TEXT = /\b(?:https?:\/\/)?([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)/i;
+const DOMAIN_IN_TEXT =
+  /\b(?:https?:\/\/)?([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)/i;
 
 /** Decoded blobs are bounded so one base64 wall cannot blow up memory. */
 export const MAX_BASE64_CANDIDATE_CHARS = 100_000;
@@ -255,7 +271,10 @@ export function decodeBase64Text(candidate: string): string | undefined {
   return printable / decoded.length >= 0.85 ? decoded : undefined;
 }
 
-function phraseHits(text: string, source: InjectionHit["source"]): Array<Omit<Finding, "line" | "column">> {
+function phraseHits(
+  text: string,
+  source: InjectionHit["source"],
+): Array<Omit<Finding, "line" | "column">> {
   const raw: Array<Omit<Finding, "line" | "column">> = [];
   for (const rule of INJECTION_RULES) {
     for (const { index, match } of matchAll(text, rule.pattern)) {
@@ -273,51 +292,57 @@ function phraseHits(text: string, source: InjectionHit["source"]): Array<Omit<Fi
   return raw;
 }
 
-const RULE_BY_ID: ReadonlyMap<string, InjectionRule> = new Map(INJECTION_RULES.map((r) => [r.id, r]));
+const RULE_BY_ID: ReadonlyMap<string, InjectionRule> = new Map(
+  INJECTION_RULES.map((r) => [r.id, r]),
+);
 
-const STRUCTURAL: ReadonlyMap<string, { category: InjectionCategory; weight: number; description: string }> =
-  new Map([
-    [
-      "conceal.invisible-characters",
-      {
-        category: "concealment" as const,
-        weight: 25,
-        description: "zero-width, tag or bidi characters hide content from a human reviewer",
-      },
-    ],
-    [
-      "conceal.html-comment",
-      {
-        category: "concealment" as const,
-        weight: 20,
-        description: "instruction-shaped text inside an HTML comment, invisible when rendered",
-      },
-    ],
-    [
-      "conceal.hidden-style",
-      {
-        category: "concealment" as const,
-        weight: 25,
-        description: "markup that renders text invisible (display:none, zero font size, zero opacity)",
-      },
-    ],
-    [
-      "conceal.link-cloaking",
-      {
-        category: "concealment" as const,
-        weight: 20,
-        description: "a markdown link whose visible text names a different destination than its target",
-      },
-    ],
-    [
-      "conceal.base64-instructions",
-      {
-        category: "concealment" as const,
-        weight: 35,
-        description: "a base64 blob that decodes to instruction-shaped text",
-      },
-    ],
-  ]);
+const STRUCTURAL: ReadonlyMap<
+  string,
+  { category: InjectionCategory; weight: number; description: string }
+> = new Map([
+  [
+    "conceal.invisible-characters",
+    {
+      category: "concealment" as const,
+      weight: 25,
+      description: "zero-width, tag or bidi characters hide content from a human reviewer",
+    },
+  ],
+  [
+    "conceal.html-comment",
+    {
+      category: "concealment" as const,
+      weight: 20,
+      description: "instruction-shaped text inside an HTML comment, invisible when rendered",
+    },
+  ],
+  [
+    "conceal.hidden-style",
+    {
+      category: "concealment" as const,
+      weight: 25,
+      description:
+        "markup that renders text invisible (display:none, zero font size, zero opacity)",
+    },
+  ],
+  [
+    "conceal.link-cloaking",
+    {
+      category: "concealment" as const,
+      weight: 20,
+      description:
+        "a markdown link whose visible text names a different destination than its target",
+    },
+  ],
+  [
+    "conceal.base64-instructions",
+    {
+      category: "concealment" as const,
+      weight: 35,
+      description: "a base64 blob that decodes to instruction-shaped text",
+    },
+  ],
+]);
 
 /** Run every rule. `text` is untrusted by assumption. */
 export function scanInjection(text: string): InjectionResult {
@@ -373,9 +398,14 @@ export function scanInjection(text: string): InjectionResult {
     const href = match[2] ?? "";
     const labelDomain = DOMAIN_IN_TEXT.exec(label)?.[1]?.toLowerCase();
     const hrefScheme = /^([a-z][a-z0-9+.-]*):/i.exec(href)?.[1]?.toLowerCase();
-    const hrefDomain = DOMAIN_IN_TEXT.exec(href.replace(/^[a-z][a-z0-9+.-]*:\/\//i, ""))?.[1]?.toLowerCase();
-    const dangerousScheme = hrefScheme === "javascript" || hrefScheme === "data" || hrefScheme === "vbscript";
-    const cloaked = labelDomain !== undefined && (dangerousScheme || (hrefDomain !== undefined && hrefDomain !== labelDomain));
+    const hrefDomain = DOMAIN_IN_TEXT.exec(
+      href.replace(/^[a-z][a-z0-9+.-]*:\/\//i, ""),
+    )?.[1]?.toLowerCase();
+    const dangerousScheme =
+      hrefScheme === "javascript" || hrefScheme === "data" || hrefScheme === "vbscript";
+    const cloaked =
+      labelDomain !== undefined &&
+      (dangerousScheme || (hrefDomain !== undefined && hrefDomain !== labelDomain));
     if (!cloaked) continue;
     raw.push({
       type: "concealment",
@@ -408,11 +438,17 @@ export function scanInjection(text: string): InjectionResult {
     });
   }
 
-  const located = withPositions(text, raw).sort((a, b) => a.start - b.start || (a.rule < b.rule ? -1 : 1));
+  // A total order: two hits at the same offset under the same rule must
+  // compare equal, or `sort` is free to order them differently on a different
+  // run and the "same input, same bytes" claim stops holding.
+  const located = withPositions(text, raw).sort(
+    (a, b) => a.start - b.start || compareStrings(a.rule, b.rule) || a.end - b.end,
+  );
   const hits: InjectionHit[] = located.map((f) => {
     const rule = RULE_BY_ID.get(f.rule);
     const structural = STRUCTURAL.get(f.rule);
-    const source: InjectionHit["source"] = f.detail?.["source"] === "decoded-base64" ? "decoded-base64" : "text";
+    const source: InjectionHit["source"] =
+      f.detail?.["source"] === "decoded-base64" ? "decoded-base64" : "text";
     return {
       rule: f.rule,
       category: (rule?.category ?? structural?.category ?? "override") as InjectionCategory,

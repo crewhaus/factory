@@ -12,6 +12,11 @@
  *      after buffering is not a limit.
  *   3. BOUNDED WORK. The walk has an entry cap and a depth cap, and both are
  *      reported when they bite, so a truncated scan never looks complete.
+ *   4. NO SILENT EXCLUSION. Everything the walk declines to open — a symlink,
+ *      a dot-file, an excluded directory, a binary, an oversized file — is
+ *      named in `skipped` with the reason. A scanner that drops `.env` and
+ *      `node_modules/` and then reports `skipped: []` is claiming coverage it
+ *      does not have, which is the only failure here that gets someone hurt.
  *
  * Determinism: entries are sorted with plain string comparison, so the same
  * tree produces the same listing and the same truncation point on any host.
@@ -19,14 +24,14 @@
 import {
   type Dirent,
   closeSync,
-  fstatSync,
   constants as fsConstants,
+  fstatSync,
   openSync,
   readSync,
   readdirSync,
 } from "node:fs";
 import * as path from "node:path";
-import { ToolPermissionError, type SafePath, toPosix } from "../paths";
+import { type SafePath, ToolPermissionError, toPosix } from "../paths";
 import { compareStrings } from "./text";
 
 /** Default per-file ceiling. Generous for source, refuses a database dump. */
@@ -51,7 +56,22 @@ export const DEFAULT_SKIP_DIRS: ReadonlyArray<string> = [
   "__pycache__",
 ];
 
-export type SkipReason = "too-large" | "binary" | "unreadable";
+/**
+ * Why a path in the tree was not scanned.
+ *
+ * The first three are read failures. The last three are DELIBERATE
+ * exclusions, and they are listed for the same reason the others are: a
+ * secret scanner whose walk quietly drops `.env`, `node_modules/` and every
+ * symlink, and then returns `skipped: []`, is telling the caller it covered
+ * a tree it did not open.
+ */
+export type SkipReason =
+  | "too-large"
+  | "binary"
+  | "unreadable"
+  | "symlink"
+  | "hidden"
+  | "excluded-directory";
 
 export type ScannedFile = {
   /** Slash-separated, relative to the scan root. */
@@ -159,8 +179,9 @@ export type WalkOutcome = {
 /**
  * Collect the readable text files under `root`, depth-first in sorted order.
  *
- * Symlinks are listed but never followed, for containment and to make cycles
- * impossible rather than merely unlikely.
+ * Symlinks are named in `skipped` but never followed, for containment and to
+ * make cycles impossible rather than merely unlikely. So are dot-entries and
+ * the default-excluded directories: what was not opened is always said.
  */
 export function walkTextFiles(
   toolName: string,
@@ -186,7 +207,11 @@ export function walkTextFiles(
     try {
       entries = readdirSync(dir, { withFileTypes: true });
     } catch (err) {
-      skipped.push({ rel: rel === "" ? "." : rel, reason: "unreadable", detail: (err as Error).message });
+      skipped.push({
+        rel: rel === "" ? "." : rel,
+        reason: "unreadable",
+        detail: (err as Error).message,
+      });
       return;
     }
     entries.sort((a, b) => compareStrings(a.name, b.name));
@@ -195,16 +220,46 @@ export function walkTextFiles(
         truncated = true;
         return;
       }
-      if (!limits.includeHidden && entry.name.startsWith(".")) continue;
       const childRel = rel === "" ? entry.name : `${rel}/${entry.name}`;
       const childAbs = path.join(dir, entry.name);
-      if (entry.isSymbolicLink()) continue; // listed nowhere: never followed, never read
+      if (!limits.includeHidden && entry.name.startsWith(".")) {
+        skipped.push({
+          rel: childRel,
+          reason: "hidden",
+          detail: "a dot-file or dot-directory; pass includeHidden to scan it",
+        });
+        continue;
+      }
+      if (entry.isSymbolicLink()) {
+        // Never followed, for containment and to make cycles impossible —
+        // but named, so the caller knows this path went unread.
+        skipped.push({
+          rel: childRel,
+          reason: "symlink",
+          detail: "a symbolic link; links are never followed, so its target was not scanned",
+        });
+        continue;
+      }
       if (entry.isDirectory()) {
-        if (skipDirs.has(entry.name)) continue;
+        if (skipDirs.has(entry.name)) {
+          skipped.push({
+            rel: childRel,
+            reason: "excluded-directory",
+            detail: `"${entry.name}" is excluded by default; nothing under it was scanned`,
+          });
+          continue;
+        }
         visit(childAbs, childRel, depth + 1);
         continue;
       }
-      if (!entry.isFile()) continue;
+      if (!entry.isFile()) {
+        skipped.push({
+          rel: childRel,
+          reason: "unreadable",
+          detail: "not a regular file (socket, fifo or device); nothing was read from it",
+        });
+        continue;
+      }
       const outcome = readTextBounded(toolName, childAbs, limits.maxFileBytes);
       if (!outcome.ok) {
         skipped.push({ rel: childRel, reason: outcome.reason, detail: outcome.detail });

@@ -19,11 +19,11 @@
  * | rule | proves |
  * |---|---|
  * | `email.addr-spec-subset` | dot-atom local part, dotted domain, TLD of 2+ letters. Not quoted local parts, not IP-literal domains, not internationalized addresses. |
- * | `phone.e164` | `+` then 8–15 digits with common separators. |
+ * | `phone.e164` | `+` then 8–15 digits with common separators, taken as the longest whole-group run within that range. Where the next number is grouped the same way the two cannot be told apart, and the span runs long; `dedupeOverlaps` lets a verified card win that overlap. |
  * | `phone.national.XX` | a national dialling shape for one of the seven supported countries. |
  * | `ssn.us-format` | `NNN-NN-NNNN` with a group the SSA has never issued (000/666/900+ area, 00 group, 0000 serial) excluded. NOT validity: there is no public checksum for an SSN, and this package does not pretend otherwise. |
  * | `iban.iso7064-mod97` | the ISO 7064 mod-97-10 check digits are correct, and where the country is known, the length matches. A real check, verifiable offline. |
- * | `card.luhn` | the Luhn check digit is correct. A real check. It does not mean the card exists or is live. |
+ * | `card.luhn` | the Luhn check digit is correct over 12–19 digits taken as whole digit groups. A real check. It does not mean the card exists or is live. |
  * | `ip.v4-dotted` / `ip.v6-parsed` | a parseable address literal. Private, loopback and documentation ranges are labelled, because those are usually not personal data. |
  * | `dob.labelled` / `date.calendar` | a calendar date. Only a nearby "date of birth"-style label, or a caller-supplied `referenceDate` that makes the age plausible, raises it above `possible`. |
  * | `address.us-street-suffix` / `address.us-city-state-zip` | a US-style street line or city/state/ZIP tail. US conventions only. |
@@ -113,17 +113,83 @@ export function ibanMod97(iban: string): number {
  * length rule is half of what makes an IBAN verifiable.
  */
 export const IBAN_LENGTHS: ReadonlyMap<string, number> = new Map([
-  ["AD", 24], ["AE", 23], ["AL", 28], ["AT", 20], ["AZ", 28], ["BA", 20], ["BE", 16],
-  ["BG", 22], ["BH", 22], ["BR", 29], ["BY", 28], ["CH", 21], ["CR", 22], ["CY", 28],
-  ["CZ", 24], ["DE", 22], ["DK", 18], ["DO", 28], ["EE", 20], ["EG", 29], ["ES", 24],
-  ["FI", 18], ["FO", 18], ["FR", 27], ["GB", 22], ["GE", 22], ["GI", 23], ["GL", 18],
-  ["GR", 27], ["GT", 28], ["HR", 21], ["HU", 28], ["IE", 22], ["IL", 23], ["IS", 26],
-  ["IT", 27], ["JO", 30], ["KW", 30], ["KZ", 20], ["LB", 28], ["LC", 32], ["LI", 21],
-  ["LT", 20], ["LU", 20], ["LV", 21], ["LY", 25], ["MC", 27], ["MD", 24], ["ME", 22],
-  ["MK", 19], ["MR", 27], ["MT", 31], ["MU", 30], ["NL", 18], ["NO", 15], ["PK", 24],
-  ["PL", 28], ["PS", 29], ["PT", 25], ["QA", 29], ["RO", 24], ["RS", 22], ["SA", 24],
-  ["SC", 31], ["SE", 24], ["SI", 19], ["SK", 24], ["SM", 27], ["ST", 25], ["SV", 28],
-  ["TL", 23], ["TN", 24], ["TR", 26], ["UA", 29], ["VA", 22], ["VG", 24], ["XK", 20],
+  ["AD", 24],
+  ["AE", 23],
+  ["AL", 28],
+  ["AT", 20],
+  ["AZ", 28],
+  ["BA", 20],
+  ["BE", 16],
+  ["BG", 22],
+  ["BH", 22],
+  ["BR", 29],
+  ["BY", 28],
+  ["CH", 21],
+  ["CR", 22],
+  ["CY", 28],
+  ["CZ", 24],
+  ["DE", 22],
+  ["DK", 18],
+  ["DO", 28],
+  ["EE", 20],
+  ["EG", 29],
+  ["ES", 24],
+  ["FI", 18],
+  ["FO", 18],
+  ["FR", 27],
+  ["GB", 22],
+  ["GE", 22],
+  ["GI", 23],
+  ["GL", 18],
+  ["GR", 27],
+  ["GT", 28],
+  ["HR", 21],
+  ["HU", 28],
+  ["IE", 22],
+  ["IL", 23],
+  ["IS", 26],
+  ["IT", 27],
+  ["JO", 30],
+  ["KW", 30],
+  ["KZ", 20],
+  ["LB", 28],
+  ["LC", 32],
+  ["LI", 21],
+  ["LT", 20],
+  ["LU", 20],
+  ["LV", 21],
+  ["LY", 25],
+  ["MC", 27],
+  ["MD", 24],
+  ["ME", 22],
+  ["MK", 19],
+  ["MR", 27],
+  ["MT", 31],
+  ["MU", 30],
+  ["NL", 18],
+  ["NO", 15],
+  ["PK", 24],
+  ["PL", 28],
+  ["PS", 29],
+  ["PT", 25],
+  ["QA", 29],
+  ["RO", 24],
+  ["RS", 22],
+  ["SA", 24],
+  ["SC", 31],
+  ["SE", 24],
+  ["SI", 19],
+  ["SK", 24],
+  ["SM", 27],
+  ["ST", 25],
+  ["SV", 28],
+  ["TL", 23],
+  ["TN", 24],
+  ["TR", 26],
+  ["UA", 29],
+  ["VA", 22],
+  ["VG", 24],
+  ["XK", 20],
 ]);
 
 /** Issuer, by the IIN prefix ranges that are stable and public. */
@@ -166,6 +232,10 @@ export function parseIpv4(value: string): number[] | undefined {
  */
 export function parseIpv6(value: string): number[] | undefined {
   if (value.includes("%") || value.includes("/")) return undefined;
+  // Three or more colons in a row is not a compression, it is malformed.
+  // `":::"` splits as one `"::"` plus a stray colon and would otherwise be
+  // accepted as `"::"` — a wrong answer stated with full confidence.
+  if (value.includes(":::")) return undefined;
   const doubleColons = value.split("::").length - 1;
   if (doubleColons > 1) return undefined;
   let head = value;
@@ -203,18 +273,26 @@ export function parseIpv6(value: string): number[] | undefined {
   return [...groups, ...tailGroups];
 }
 
-/** Label an IPv4 address that is almost certainly not personal data. */
+/**
+ * Label an IPv4 address that is almost certainly not personal data, by the
+ * IANA special-purpose registry. The prefixes are named exactly as the RFCs
+ * define them — `198.51.100.0/24` is documentation, `198.18.0.0/15` is
+ * benchmarking, and calling the second one "documentation" would put a wrong
+ * label on a finding a reviewer is meant to be able to check.
+ */
 function ipv4Scope(octets: ReadonlyArray<number>): string {
   const [a = 0, b = 0, c = 0] = octets;
-  if (a === 10) return "private";
-  if (a === 172 && b >= 16 && b <= 31) return "private";
-  if (a === 192 && b === 168) return "private";
-  if (a === 127) return "loopback";
-  if (a === 169 && b === 254) return "link-local";
-  if (a === 0 || a >= 224) return "reserved";
-  if (a === 192 && b === 0 && c === 2) return "documentation";
-  if (a === 198 && (b === 51 || b === 18 || b === 19)) return "documentation";
-  if (a === 203 && b === 0 && c === 113) return "documentation";
+  if (a === 10) return "private"; // 10/8, RFC 1918
+  if (a === 172 && b >= 16 && b <= 31) return "private"; // 172.16/12, RFC 1918
+  if (a === 192 && b === 168) return "private"; // 192.168/16, RFC 1918
+  if (a === 127) return "loopback"; // 127/8, RFC 1122
+  if (a === 169 && b === 254) return "link-local"; // 169.254/16, RFC 3927
+  if (a === 100 && b >= 64 && b <= 127) return "shared-address-space"; // 100.64/10, RFC 6598
+  if (a === 192 && b === 0 && c === 2) return "documentation"; // TEST-NET-1, RFC 5737
+  if (a === 198 && b === 51 && c === 100) return "documentation"; // TEST-NET-2, RFC 5737
+  if (a === 203 && b === 0 && c === 113) return "documentation"; // TEST-NET-3, RFC 5737
+  if (a === 198 && (b === 18 || b === 19)) return "benchmarking"; // 198.18/15, RFC 2544
+  if (a === 0 || a >= 224) return "reserved"; // 0/8, multicast and 240/4
   return "public";
 }
 
@@ -222,17 +300,20 @@ function ipv4Scope(octets: ReadonlyArray<number>): string {
 // patterns
 // ---------------------------------------------------------------------------
 
-const EMAIL = /[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/g;
+const EMAIL =
+  /[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/g;
 const SSN = /\b(\d{3})-(\d{2})-(\d{4})\b/g;
 const IBAN_CANDIDATE = /\b[A-Z]{2}\d{2}[ ]?(?:[A-Z0-9]{4}[ ]?){2,7}[A-Z0-9]{1,4}\b/g;
-const CARD_CANDIDATE = /\b(?:\d[ -]?){12,18}\d\b/g;
+const CARD_RUN = /\b\d(?:[ -]?\d){11,}/g;
 const IPV4 = /\b\d{1,3}(?:\.\d{1,3}){3}\b/g;
-const IPV6_CANDIDATE = /\b(?=[0-9A-Fa-f:]*::|(?:[0-9A-Fa-f]{1,4}:){7})[0-9A-Fa-f:]{2,39}(?:\.\d{1,3}){0,3}/g;
-const PHONE_E164 = /\+\d[\d\s().-]{6,18}\d/g;
+const IPV6_CANDIDATE =
+  /\b(?=[0-9A-Fa-f:]*::|(?:[0-9A-Fa-f]{1,4}:){7})[0-9A-Fa-f:]{2,39}(?:\.\d{1,3}){0,3}/g;
+const PHONE_E164_RUN = /\+\d(?:[\s().-]?\d)+/g;
 const DATE_ISO = /\b(19|20)\d{2}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b/g;
 const DATE_US = /\b(0?[1-9]|1[0-2])\/(0?[1-9]|[12]\d|3[01])\/((?:19|20)\d{2})\b/g;
 const DATE_DOTTED = /\b(0?[1-9]|[12]\d|3[01])\.(0?[1-9]|1[0-2])\.((?:19|20)\d{2})\b/g;
-const DATE_LONG = /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+((?:19|20)\d{2})\b/gi;
+const DATE_LONG =
+  /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+((?:19|20)\d{2})\b/gi;
 const DOB_LABEL = /(date of birth|d\.?o\.?b\.?|birth ?date|birthday|born(?:\s+on)?)\s*[:\-]?\s*$/i;
 
 const STREET_SUFFIX =
@@ -241,7 +322,8 @@ const ADDRESS_STREET = new RegExp(
   `\\b\\d{1,6}\\s+(?:[A-Za-z0-9.'#-]+\\s+){0,4}${STREET_SUFFIX}\\b\\.?(?:\\s+(?:Apt|Suite|Ste|Unit|#)\\s*[A-Za-z0-9-]+)?`,
   "g",
 );
-const ADDRESS_CITY_STATE_ZIP = /\b[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){0,3},\s*(A[KLRZ]|C[AOT]|D[CE]|FL|GA|HI|I[ADLN]|K[SY]|LA|M[ADEINOST]|N[CDEHJMVY]|O[HKR]|P[AR]|RI|S[CD]|T[NX]|UT|V[AIT]|W[AIVY])\s+\d{5}(?:-\d{4})?\b/g;
+const ADDRESS_CITY_STATE_ZIP =
+  /\b[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){0,3},\s*(A[KLRZ]|C[AOT]|D[CE]|FL|GA|HI|I[ADLN]|K[SY]|LA|M[ADEINOST]|N[CDEHJMVY]|O[HKR]|P[AR]|RI|S[CD]|T[NX]|UT|V[AIT]|W[AIVY])\s+\d{5}(?:-\d{4})?\b/g;
 
 const NATIONAL_PHONE: Readonly<Record<PhoneCountry, RegExp>> = {
   // NANP: area and exchange codes both start 2-9.
@@ -260,13 +342,92 @@ function selected(options: PiiOptions, type: PiiType): boolean {
   return options.types === undefined || options.types.includes(type);
 }
 
-/** Days since the epoch for a valid Gregorian Y-M-D, or undefined. */
+/** One maximal digit group inside a separated run, with its absolute offset. */
+type DigitGroup = { readonly digits: string; readonly start: number; readonly end: number };
+
+/** Split a matched run into its digit groups, keeping absolute offsets. */
+function digitGroups(run: string, base: number): DigitGroup[] {
+  const groups: DigitGroup[] = [];
+  let i = 0;
+  while (i < run.length) {
+    if (run.charCodeAt(i) < 48 || run.charCodeAt(i) > 57) {
+      i += 1;
+      continue;
+    }
+    const from = i;
+    while (i < run.length && run.charCodeAt(i) >= 48 && run.charCodeAt(i) <= 57) i += 1;
+    groups.push({ digits: run.slice(from, i), start: base + from, end: base + i });
+  }
+  return groups;
+}
+
+/**
+ * The longest run of WHOLE digit groups that satisfies `accept`, searched
+ * from `firstGroup` onward, or undefined.
+ *
+ * Why whole groups: a card is written `4111 1111 1111 1111`, so every real
+ * boundary is already a separator in the text. Anchoring candidates at those
+ * boundaries is what makes this safe to run — sliding a 12-to-19-digit window
+ * over an arbitrary digit run instead would find a Luhn-valid slice by chance
+ * roughly one time in ten and turn the detector into noise.
+ *
+ * Why it exists at all: the old patterns matched one greedy run and gave up
+ * if it failed the check. `4111111111111111 123-45-6789` extended the card
+ * candidate across the space into the SSN, failed Luhn on the 19 digits that
+ * produced, and reported NOTHING — so `PiiRedact` handed back a document with
+ * a valid card number still in it.
+ */
+function longestAcceptedRange(
+  groups: ReadonlyArray<DigitGroup>,
+  firstGroup: number,
+  minDigits: number,
+  maxDigits: number,
+  accept: (digits: string) => boolean,
+): { start: number; end: number; digits: string; lastGroup: number } | undefined {
+  let best: { start: number; end: number; digits: string; lastGroup: number } | undefined;
+  for (let from = firstGroup; from < groups.length; from++) {
+    let digits = "";
+    for (let to = from; to < groups.length; to++) {
+      const group = groups[to];
+      if (!group) break;
+      digits += group.digits;
+      if (digits.length > maxDigits) break;
+      if (digits.length < minDigits) continue;
+      if (!accept(digits)) continue;
+      const head = groups[from];
+      if (!head) break;
+      if (best === undefined || digits.length > best.digits.length) {
+        best = { start: head.start, end: group.end, digits, lastGroup: to };
+      }
+    }
+    // Anchored at the first group that can start a match: a later start would
+    // report the tail of the same number as a second, shorter finding.
+    if (best !== undefined) return best;
+  }
+  return best;
+}
+
+/**
+ * Days since 1970-01-01 for a valid proleptic Gregorian Y-M-D, or undefined.
+ *
+ * `Date.UTC` maps years 0–99 to 1900–1999, so `calendarDay(50, 1, 1)` would
+ * silently answer for 1950; the year is set explicitly to keep a four-digit
+ * `referenceDate` of `"0050-01-01"` meaning the year 50 rather than 1950.
+ */
 export function calendarDay(year: number, month: number, day: number): number | undefined {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) {
+    return undefined;
+  }
   if (month < 1 || month > 12 || day < 1) return undefined;
   const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
   const lengths = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
   if (day > (lengths[month - 1] ?? 0)) return undefined;
-  return Math.floor(Date.UTC(year, month - 1, day) / 86_400_000);
+  const at = new Date(0);
+  at.setUTCFullYear(year, month - 1, day);
+  at.setUTCHours(0, 0, 0, 0);
+  const ms = at.getTime();
+  if (!Number.isFinite(ms)) return undefined;
+  return Math.floor(ms / 86_400_000);
 }
 
 /** Whole years between two calendar dates. Used only for DOB plausibility. */
@@ -282,11 +443,23 @@ function yearsBetween(
 type ParsedDate = { y: number; m: number; d: number };
 
 const MONTH_NAMES = [
-  "january", "february", "march", "april", "may", "june",
-  "july", "august", "september", "october", "november", "december",
+  "january",
+  "february",
+  "march",
+  "april",
+  "may",
+  "june",
+  "july",
+  "august",
+  "september",
+  "october",
+  "november",
+  "december",
 ];
 
-function collectDates(text: string): Array<{ start: number; end: number; raw: string; date: ParsedDate }> {
+function collectDates(
+  text: string,
+): Array<{ start: number; end: number; raw: string; date: ParsedDate }> {
   const out: Array<{ start: number; end: number; raw: string; date: ParsedDate }> = [];
   for (const { index, match } of matchAll(text, DATE_ISO)) {
     const [raw] = match;
@@ -409,20 +582,28 @@ export function scanPii(text: string, options: PiiOptions = {}): Finding[] {
   }
 
   if (selected(options, "credit_card")) {
-    for (const { index, match } of matchAll(text, CARD_CANDIDATE)) {
-      const digits = match[0].replace(/[ -]/g, "");
+    for (const { index, match } of matchAll(text, CARD_RUN)) {
+      const groups = digitGroups(match[0], index);
       // Only a passing Luhn check is reported. A digit run that fails it is
-      // an order number far more often than it is a mistyped card.
-      if (!luhnValid(digits)) continue;
-      raw.push({
-        type: "credit_card",
-        rule: "card.luhn",
-        confidence: "verified",
-        start: index,
-        end: index + match[0].length,
-        value: match[0],
-        detail: { brand: cardBrand(digits), digits: digits.length },
-      });
+      // an order number far more often than it is a mistyped card. But the
+      // run may hold a card AND something else — a card followed by an order
+      // number, an SSN, a year — so every whole-group range is considered,
+      // not just the greedy whole run, and every card in the run is reported.
+      let from = 0;
+      while (from < groups.length) {
+        const found = longestAcceptedRange(groups, from, 12, 19, luhnValid);
+        if (!found) break;
+        raw.push({
+          type: "credit_card",
+          rule: "card.luhn",
+          confidence: "verified",
+          start: found.start,
+          end: found.end,
+          value: text.slice(found.start, found.end),
+          detail: { brand: cardBrand(found.digits), digits: found.digits.length },
+        });
+        from = found.lastGroup + 1;
+      }
     }
   }
 
@@ -470,17 +651,23 @@ export function scanPii(text: string, options: PiiOptions = {}): Finding[] {
   }
 
   if (selected(options, "phone")) {
-    for (const { index, match } of matchAll(text, PHONE_E164)) {
-      const digits = match[0].replace(/\D/g, "");
-      if (digits.length < 8 || digits.length > 15) continue;
+    for (const { index, match } of matchAll(text, PHONE_E164_RUN)) {
+      // The run starts at the `+`, so the number does too. It may run on into
+      // whatever follows — `+14155550132 4111111111111111` is one run of 28
+      // digits — and dropping the whole run for being too long is how a phone
+      // number next to a card number went unreported and unredacted.
+      const groups = digitGroups(match[0], index);
+      const found = longestAcceptedRange(groups, 0, 8, 15, () => true);
+      if (!found || found.start !== index + 1) continue;
       raw.push({
         type: "phone",
         rule: "phone.e164",
         confidence: "likely",
+        // The `+` is part of the number.
         start: index,
-        end: index + match[0].length,
-        value: match[0],
-        detail: { digits: digits.length, form: "e164" },
+        end: found.end,
+        value: text.slice(index, found.end),
+        detail: { digits: found.digits.length, form: "e164" },
       });
     }
     if (options.country !== undefined) {
@@ -509,7 +696,9 @@ export function scanPii(text: string, options: PiiOptions = {}): Finding[] {
       const labelled = DOB_LABEL.test(before);
       let confidence: Confidence = "possible";
       let rule = "date.calendar";
-      const detail: Record<string, string | number | boolean> = { iso: `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}` };
+      const detail: Record<string, string | number | boolean> = {
+        iso: `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`,
+      };
       if (reference) {
         const age = yearsBetween(hit.date, reference);
         detail["ageAtReference"] = age;
@@ -522,7 +711,8 @@ export function scanPii(text: string, options: PiiOptions = {}): Finding[] {
         confidence = "likely";
         rule = "dob.labelled";
       }
-      if (!labelled && !reference) detail["note"] = "no label and no referenceDate: any calendar date matches";
+      if (!labelled && !reference)
+        detail["note"] = "no label and no referenceDate: any calendar date matches";
       raw.push({
         type: "date_of_birth",
         rule,

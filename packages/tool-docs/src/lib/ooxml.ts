@@ -16,8 +16,8 @@
  *      correct if the relationships are followed. They are, here.
  */
 import { archiveEntryEscapes } from "../paths";
-import { type ZipArchive, ZipError } from "./zip";
 import { childrenNamed, isElement, parseXml, rootElement, textOf } from "./xml";
+import { type ZipArchive, ZipError } from "./zip";
 
 /** A relationship from a `.rels` part: id to resolved part name. */
 export type Relationship = {

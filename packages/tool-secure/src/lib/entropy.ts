@@ -36,7 +36,15 @@ export function shannonEntropy(value: string): { bits: number; alphabet: number 
   return { bits: bits === 0 ? 0 : bits, alphabet: counts.size };
 }
 
-/** Round to 4 decimals so the same input serializes to the same bytes. */
+/**
+ * Round to 4 decimal places so the same input serializes to the same bytes.
+ *
+ * The convention is HALF-UP TOWARDS POSITIVE INFINITY — `Math.round`'s rule,
+ * so 0.00005 rounds to 0.0001 and -0.00005 rounds to -0. Entropy is never
+ * negative, so the asymmetry is unreachable here, but the rule is named
+ * because an unstated rounding mode is how two hosts disagree about a value
+ * they both computed correctly.
+ */
 export function roundBits(bits: number): number {
   return Math.round(bits * 10_000) / 10_000;
 }
@@ -54,7 +62,6 @@ export function classifyCharset(value: string): Charset {
   if (/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return "base64";
   if (/^[A-Za-z0-9_-]+$/.test(value)) return "base64url";
   if (/^[A-Za-z0-9]+$/.test(value)) return "alphanumeric";
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: the point is to exclude control characters.
   if (/^[\x20-\x7e]+$/.test(value)) return "printable";
   return "mixed";
 }

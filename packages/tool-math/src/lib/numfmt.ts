@@ -193,6 +193,12 @@ export function parseLocaleNumber(text: string, locale: string): ParseResult {
     parenthesised = true;
     working = parenthesisMatch[1] as string;
   }
+  // One accounting bracket means negative; anything left over is not a number.
+  // "((1,234.50))" used to survive, because the second pair was swept up with
+  // the currency symbols and reported back as `currencySymbolStripped: "()"`.
+  if (working.includes("(") || working.includes(")")) {
+    refuse("parentheses are unbalanced or nested; one pair means a negative", working);
+  }
   // Locale digits to ASCII, before anything counts characters as digits.
   for (let d = 0; d < 10; d++) {
     const glyph = parts.digits[d] as string;
@@ -283,6 +289,11 @@ export function parseLocaleNumber(text: string, locale: string): ParseResult {
   };
 }
 
+/**
+ * Escape for use in a pattern OR inside a character class — hence the `-`,
+ * which would otherwise turn a separator into a range when interpolated into
+ * `[^0-9+\-eE...]`.
+ */
 function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return text.replace(/[.*+?^${}()|[\]\\\-]/g, "\\$&");
 }

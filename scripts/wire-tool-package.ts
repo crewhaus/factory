@@ -30,7 +30,18 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-type ToolEntry = { readonly key: string; readonly keywords: ReadonlyArray<string> };
+type ToolEntry = {
+  /** The camelCase key a spec writes in `tools:`. */
+  readonly key: string;
+  /**
+   * The name the package actually exports, when it differs from the key —
+   * a tool whose natural name collides with a library function in its own
+   * module ends up exported with a suffix. The spec should still read
+   * `documentText`, not `documentTextTool`.
+   */
+  readonly export?: string;
+  readonly keywords: ReadonlyArray<string>;
+};
 type Manifest = {
   readonly package: string;
   readonly category: { readonly name: string; readonly title: string; readonly rollUp?: string };
@@ -139,7 +150,10 @@ edit(
     const anchor =
       '  codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },';
     if (!s.includes(anchor)) throw new Error("target-cli BUILTIN_TOOL_MAP anchor moved");
-    const add = absent.map((k) => `  ${k}: { package: "${scope}", export: "${k}" },`).join("\n");
+    const exportOf = (k: string): string => manifest.tools.find((t) => t.key === k)?.export ?? k;
+    const add = absent
+      .map((k) => `  ${k}: { package: "${scope}", export: "${exportOf(k)}" },`)
+      .join("\n");
     return s.replace(anchor, `${add}\n${anchor}`);
   },
   "BUILTIN_TOOL_MAP entries",
@@ -149,14 +163,10 @@ edit(
 edit(
   "apps/cli/src/index.ts",
   (s) => {
-    const missing = keys.filter(
-      (k) =>
-        !s.includes(
-          `    ${k}: ${pkgDir
-            .replace(/^tool-/, "")
-            .replace(/-([a-z])/g, (_m, c: string) => c.toUpperCase())}.${k},`,
-        ),
-    );
+    const localName = pkgDir
+      .replace(/^tool-/, "")
+      .replace(/-([a-z])/g, (_m, c: string) => c.toUpperCase());
+    const missing = keys.filter((k) => !s.includes(`    ${k}: ${localName}.`));
     if (missing.length === 0) return undefined;
     const alreadyImported = s.includes(`import("${scope}")`);
     const local = pkgDir
@@ -184,7 +194,8 @@ edit(
     }
     const anchor = "    codegraphImpact: codegraph.codegraphImpact,";
     if (!out.includes(anchor)) throw new Error("loadToolMap anchor moved");
-    const add = missing.map((k) => `    ${k}: ${local}.${k},`).join("\n");
+    const exportOf = (k: string): string => manifest.tools.find((t) => t.key === k)?.export ?? k;
+    const add = missing.map((k) => `    ${k}: ${local}.${exportOf(k)},`).join("\n");
     return out.replace(anchor, `${anchor}\n    // ${scope}\n${add}`);
   },
   "loadToolMap entries",

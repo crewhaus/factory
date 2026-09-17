@@ -10,6 +10,8 @@
  * than answering confidently and wrongly.
  */
 import { describe, expect, test } from "bun:test";
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import {
   MATH_TOOLS,
   amortize,
@@ -128,6 +130,60 @@ describe("package-wide contract", () => {
     const first = await text(statistics, input);
     const second = await text(statistics, input);
     expect(second).toBe(first);
+  });
+
+  test("the sources import no node builtin, which is what 'pure' has to mean", () => {
+    // The safety flags say this package touches no file, socket or process. That
+    // claim is only as good as the imports, so it is checked rather than trusted.
+    const dir = new URL(".", import.meta.url).pathname;
+    const files = readdirSync(dir, { recursive: true, encoding: "utf8" })
+      .filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"))
+      .sort();
+    expect(files.length).toBeGreaterThan(5);
+    for (const file of files) {
+      const source = readFileSync(join(dir, file), "utf8");
+      expect({ file, node: /from "node:/.test(source) }).toEqual({ file, node: false });
+      expect({ file, fetch: /\bfetch\s*\(/.test(source) }).toEqual({ file, fetch: false });
+      expect({ file, now: /Date\.now\(|Math\.random\(/.test(source) }).toEqual({
+        file,
+        now: false,
+      });
+    }
+  });
+
+  test("no execute throws: hostile input for every tool comes back as a string", async () => {
+    // A thrown error costs the harness a turn to interpret, so the contract is
+    // that `execute` always resolves to text. These are the shapes that used to
+    // break it: names inherited from Object.prototype, and Infinity, which
+    // satisfies a `z.number()` schema.
+    const hostile: Array<[(typeof MATH_TOOLS)[number], unknown]> = [
+      [evaluate, { expression: "__proto__(1)" }],
+      [evaluate, { expression: "constructor(1)" }],
+      [unitConvert, { value: 1, from: "toString", to: "m" }],
+      [unitConvert, { value: 20, from: "constructor", to: "F" }],
+      [histogram, { values: [1, 2, 3], origin: Number.NEGATIVE_INFINITY }],
+      [histogram, { values: [1, 2, 3], bucketWidth: Number.POSITIVE_INFINITY }],
+      [
+        geoDistance,
+        {
+          from: { lat: 0, lon: 0 },
+          to: { lat: 1, lon: 1 },
+          radiusMetres: Number.POSITIVE_INFINITY,
+        },
+      ],
+      [moneyAdd, { currency: "USD", amountsMinor: ["9".repeat(5_000)] }],
+      [percentile, { values: [5], percentiles: [99], method: "r6" }],
+      [numberParse, { text: "((1,234.50))", locale: "en-US" }],
+      [percent, { operation: "markupMargin", cost: 100, price: 150, markupPercent: 999 }],
+    ];
+    for (const [tool, input] of hostile) {
+      const out = await tool.execute(input);
+      expect({ name: tool.name, type: typeof out }).toEqual({ name: tool.name, type: "string" });
+      expect({ name: tool.name, empty: String(out).length === 0 }).toEqual({
+        name: tool.name,
+        empty: false,
+      });
+    }
   });
 });
 
@@ -250,6 +306,22 @@ describe("Histogram and Outliers", () => {
       "not both",
     );
   });
+
+  test("an infinite origin is rejected by the schema AND refused by execute", async () => {
+    expect(
+      histogram.inputSchema.safeParse({ values: [1, 2, 3], origin: Number.NEGATIVE_INFINITY })
+        .success,
+    ).toBe(false);
+    expect(
+      await text(histogram, { values: [1, 2, 3], origin: Number.NEGATIVE_INFINITY }),
+    ).toContain("finite");
+  });
+
+  test("an empty outlier list says what it does not prove", async () => {
+    const out = await run(outliers, { values: [10, 11, 12, 11, 10, 12] });
+    expect(out.count).toBe(0);
+    expect(out.finding).toContain("not evidence that the data is clean");
+  });
 });
 
 describe("MoneyAdd, MoneyMultiply, MoneyAllocate", () => {
@@ -326,6 +398,31 @@ describe("MoneyAdd, MoneyMultiply, MoneyAllocate", () => {
   });
 });
 
+describe("input caps", () => {
+  test("an amount with thousands of digits is refused, not multiplied out", async () => {
+    const huge = "9".repeat(5_000);
+    expect(moneyAdd.inputSchema.safeParse({ currency: "USD", amountsMinor: [huge] }).success).toBe(
+      false,
+    );
+    expect(await text(moneyAdd, { currency: "USD", amountsMinor: [huge] })).toContain(
+      "over the 1000 limit",
+    );
+    expect(
+      await text(moneyAllocateTool, {
+        currency: "USD",
+        amountMinor: huge,
+        ratios: ["1", "1", "1"],
+      }),
+    ).toContain("over the 1000 limit");
+  });
+
+  test("a thousand-digit amount is still accepted, so the cap is not in the way", async () => {
+    const thousand = "9".repeat(1_000);
+    const out = await run(moneyAdd, { currency: "USD", amountsMinor: [thousand] });
+    expect(out.minorUnits).toBe(thousand);
+  });
+});
+
 describe("CurrencyConvert", () => {
   const rates = { "USD/EUR": "0.92", "USD/JPY": "157.4" };
 
@@ -397,6 +494,20 @@ describe("UnitConvert", () => {
 
   test("an incomplete call explains what is missing", async () => {
     expect(await text(unitConvert, { value: 1 })).toContain("give value, from and to");
+  });
+
+  test("a name inherited from Object.prototype is an unknown unit, not an answer", async () => {
+    expect(await text(unitConvert, { value: 1, from: "toString", to: "m" })).toContain(
+      "unknown unit",
+    );
+    expect(await text(unitConvert, { value: 20, from: "constructor", to: "F" })).toContain(
+      "unknown unit",
+    );
+  });
+
+  test("100 C is exactly 212 F, with no floating-point tail", async () => {
+    expect((await run(unitConvert, { value: 100, from: "C", to: "F" })).value).toBe(212);
+    expect((await run(unitConvert, { value: -40, from: "C", to: "F" })).value).toBe(-40);
   });
 });
 

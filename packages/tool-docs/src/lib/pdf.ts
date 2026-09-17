@@ -88,10 +88,14 @@ export function isRef(v: PdfValue | undefined): v is PdfRef {
   return typeof v === "object" && v !== null && v !== undefined && "kind" in v && v.kind === "ref";
 }
 export function isString(v: PdfValue | undefined): v is PdfString {
-  return typeof v === "object" && v !== null && v !== undefined && "kind" in v && v.kind === "string";
+  return (
+    typeof v === "object" && v !== null && v !== undefined && "kind" in v && v.kind === "string"
+  );
 }
 export function isStream(v: PdfValue | undefined): v is PdfStream {
-  return typeof v === "object" && v !== null && v !== undefined && "kind" in v && v.kind === "stream";
+  return (
+    typeof v === "object" && v !== null && v !== undefined && "kind" in v && v.kind === "stream"
+  );
 }
 export function isDict(v: PdfValue | undefined): v is PdfDict {
   return v instanceof Map;
@@ -375,14 +379,45 @@ export function latin1(bytes: Uint8Array): string {
 // filters
 // ---------------------------------------------------------------------------
 
-/** Undo a PNG or TIFF predictor, as `/DecodeParms` describes it. */
-function unpredict(data: Uint8Array, predictor: number, colors: number, bpc: number, columns: number): Uint8Array {
+/**
+ * Undo a PNG or TIFF predictor, as `/DecodeParms` describes it.
+ *
+ * `/Colors`, `/BitsPerComponent` and `/Columns` come out of the file, so they
+ * are HOSTILE INPUT: `/Columns 400000000` or `/Colors 100000` would otherwise
+ * ask for a row buffer of hundreds of megabytes before a single byte is
+ * un-predicted, and a negative `/Columns` would reach `new Uint8Array(-5)` and
+ * throw a bare `RangeError` rather than a located refusal. Each is range-
+ * checked against what the specification actually permits, and the row length
+ * is checked against the data that is actually present.
+ */
+function unpredict(
+  data: Uint8Array,
+  predictor: number,
+  colors: number,
+  bpc: number,
+  columns: number,
+): Uint8Array {
   if (predictor <= 1) return data;
+  if (!Number.isInteger(colors) || colors < 1 || colors > 32) {
+    throw new PdfError(`predictor /Colors ${colors} is outside the permitted range 1-32`);
+  }
+  if (![1, 2, 4, 8, 16].includes(bpc)) {
+    throw new PdfError(`predictor /BitsPerComponent ${bpc} is not one of 1, 2, 4, 8 or 16`);
+  }
+  if (!Number.isInteger(columns) || columns < 1 || columns > 1 << 24) {
+    throw new PdfError(`predictor /Columns ${columns} is outside the permitted range 1-16777216`);
+  }
   const bpp = Math.max(1, Math.ceil((colors * bpc) / 8));
   const rowLength = Math.ceil((colors * bpc * columns) / 8);
+  if (rowLength > data.length) {
+    throw new PdfError(
+      `predictor row is ${rowLength} bytes but the stream holds only ${data.length}`,
+    );
+  }
   if (predictor === 2) {
     // TIFF predictor: horizontal differencing, only the 8-bit case is common.
-    if (bpc !== 8) throw new PdfError(`TIFF predictor with ${bpc} bits per component is not supported`);
+    if (bpc !== 8)
+      throw new PdfError(`TIFF predictor with ${bpc} bits per component is not supported`);
     const out = Uint8Array.from(data);
     for (let r = 0; r + rowLength <= out.length; r += rowLength) {
       for (let i = bpp; i < rowLength; i++) {
@@ -435,8 +470,61 @@ function unpredict(data: Uint8Array, predictor: number, colors: number, bpc: num
   return out;
 }
 
-function ascii85Decode(data: Uint8Array): Uint8Array {
-  const out: number[] = [];
+/**
+ * A byte sink that refuses to grow past `maxBytes`.
+ *
+ * Every filter below decodes into one of these rather than into a `number[]`.
+ * The difference is not style: a `number[]` costs about eight bytes per
+ * decoded byte, so a 1 MB RunLengthDecode stream expanding 64:1 reached ~2 GB
+ * resident before an after-the-fact length check could reject it. The cap has
+ * to bite DURING the decode, which is what `push` does here.
+ */
+class ByteSink {
+  private buffer: Uint8Array;
+  private length = 0;
+
+  constructor(private readonly maxBytes: number) {
+    this.buffer = new Uint8Array(Math.min(4096, Math.max(16, maxBytes)));
+  }
+
+  private reserve(extra: number): void {
+    const needed = this.length + extra;
+    if (needed > this.maxBytes) {
+      throw new PdfError(`stream decodes past the ${this.maxBytes} byte limit`);
+    }
+    if (needed <= this.buffer.length) return;
+    let size = this.buffer.length;
+    while (size < needed) size *= 2;
+    const grown = new Uint8Array(Math.min(size, this.maxBytes));
+    grown.set(this.buffer.subarray(0, this.length));
+    this.buffer = grown;
+  }
+
+  push(byte: number): void {
+    this.reserve(1);
+    this.buffer[this.length] = byte & 0xff;
+    this.length += 1;
+  }
+
+  fill(byte: number, count: number): void {
+    this.reserve(count);
+    this.buffer.fill(byte & 0xff, this.length, this.length + count);
+    this.length += count;
+  }
+
+  append(bytes: Uint8Array): void {
+    this.reserve(bytes.length);
+    this.buffer.set(bytes, this.length);
+    this.length += bytes.length;
+  }
+
+  toBytes(): Uint8Array {
+    return this.buffer.slice(0, this.length);
+  }
+}
+
+function ascii85Decode(data: Uint8Array, maxBytes: number): Uint8Array {
+  const out = new ByteSink(maxBytes);
   let tuple = 0;
   let count = 0;
   for (let i = 0; i < data.length; i++) {
@@ -444,63 +532,97 @@ function ascii85Decode(data: Uint8Array): Uint8Array {
     if (WHITESPACE.has(b)) continue;
     if (b === 0x7e) break; // '~>' terminator
     if (b === 0x7a && count === 0) {
-      out.push(0, 0, 0, 0);
+      out.fill(0, 4);
       continue;
     }
     if (b < 0x21 || b > 0x75) throw new PdfError("invalid character in an ASCII85 stream");
     tuple = tuple * 85 + (b - 0x21);
     count += 1;
     if (count === 5) {
-      out.push((tuple >>> 24) & 0xff, (tuple >>> 16) & 0xff, (tuple >>> 8) & 0xff, tuple & 0xff);
+      // A group must encode a 32-bit value. `>>>` would silently wrap a larger
+      // one round and emit four plausible, wrong bytes.
+      if (tuple > 0xffffffff) {
+        throw new PdfError("an ASCII85 group encodes a value larger than 32 bits");
+      }
+      out.push((tuple >>> 24) & 0xff);
+      out.push((tuple >>> 16) & 0xff);
+      out.push((tuple >>> 8) & 0xff);
+      out.push(tuple & 0xff);
       tuple = 0;
       count = 0;
     }
   }
-  if (count > 0) {
+  if (count === 1) throw new PdfError("an ASCII85 stream ends with a single leftover character");
+  if (count > 1) {
     for (let i = count; i < 5; i++) tuple = tuple * 85 + 84;
-    const bytes = [(tuple >>> 24) & 0xff, (tuple >>> 16) & 0xff, (tuple >>> 8) & 0xff, tuple & 0xff];
+    if (tuple > 0xffffffff) {
+      throw new PdfError("an ASCII85 group encodes a value larger than 32 bits");
+    }
+    const bytes = [
+      (tuple >>> 24) & 0xff,
+      (tuple >>> 16) & 0xff,
+      (tuple >>> 8) & 0xff,
+      tuple & 0xff,
+    ];
     for (let i = 0; i < count - 1; i++) out.push(bytes[i] as number);
   }
-  return Uint8Array.from(out);
+  return out.toBytes();
 }
 
-function asciiHexDecode(data: Uint8Array): Uint8Array {
-  const digits: string[] = [];
+const HEX_VALUES: ReadonlyArray<number> = (() => {
+  const table = new Array<number>(256).fill(-1);
+  for (let d = 0; d <= 9; d++) table[0x30 + d] = d;
+  for (let d = 0; d < 6; d++) {
+    table[0x41 + d] = 10 + d;
+    table[0x61 + d] = 10 + d;
+  }
+  return table;
+})();
+
+function asciiHexDecode(data: Uint8Array, maxBytes: number): Uint8Array {
+  const out = new ByteSink(maxBytes);
+  let high = -1;
   for (const b of data) {
     if (b === 0x3e) break;
-    const ch = String.fromCharCode(b);
-    if (/[0-9A-Fa-f]/.test(ch)) digits.push(ch);
+    const value = HEX_VALUES[b] ?? -1;
+    if (value < 0) continue;
+    if (high < 0) {
+      high = value;
+      continue;
+    }
+    out.push((high << 4) | value);
+    high = -1;
   }
-  if (digits.length % 2 === 1) digits.push("0");
-  const out = new Uint8Array(digits.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    out[i] = Number.parseInt(`${digits[2 * i]}${digits[2 * i + 1]}`, 16);
-  }
-  return out;
+  // An odd final digit is padded with a zero, as the specification says.
+  if (high >= 0) out.push(high << 4);
+  return out.toBytes();
 }
 
-function runLengthDecode(data: Uint8Array): Uint8Array {
-  const out: number[] = [];
+function runLengthDecode(data: Uint8Array, maxBytes: number): Uint8Array {
+  const out = new ByteSink(maxBytes);
   let i = 0;
   while (i < data.length) {
     const len = data[i] as number;
     i += 1;
     if (len === 128) break;
     if (len < 128) {
-      for (let k = 0; k <= len; k++) out.push(data[i + k] ?? 0);
+      out.append(data.subarray(i, Math.min(i + len + 1, data.length)));
       i += len + 1;
     } else {
-      const b = data[i] ?? 0;
-      for (let k = 0; k < 257 - len; k++) out.push(b);
+      out.fill(data[i] ?? 0, 257 - len);
       i += 1;
     }
   }
-  return Uint8Array.from(out);
+  return out.toBytes();
 }
 
 /** LZW as PDF uses it: 8-bit input, variable code width, early change. */
 function lzwDecode(data: Uint8Array, earlyChange: number, maxBytes: number): Uint8Array {
-  const out: number[] = [];
+  // A ByteSink for the same reason as the other filters: `number[]` costs
+  // eight bytes per decoded byte, so a stream decoding to the 64 MB cap would
+  // hold half a gigabyte on the way there.
+  const out = new ByteSink(maxBytes);
+  let produced = 0;
   let dictionary: number[][] = [];
   const reset = (): void => {
     dictionary = [];
@@ -526,7 +648,7 @@ function lzwDecode(data: Uint8Array, earlyChange: number, maxBytes: number): Uin
         previous = null;
         continue;
       }
-      if (code === 257) return Uint8Array.from(out);
+      if (code === 257) return out.toBytes();
       let entry: number[];
       const known = dictionary[code];
       if (known !== undefined && code < dictionary.length && (code < 256 || known.length > 0)) {
@@ -537,7 +659,8 @@ function lzwDecode(data: Uint8Array, earlyChange: number, maxBytes: number): Uin
         throw new PdfError("LZW stream starts with an undefined code");
       }
       for (const b of entry) out.push(b);
-      if (out.length > maxBytes) throw new PdfError("LZW stream expands past the decode limit");
+      produced += entry.length;
+      if (produced > maxBytes) throw new PdfError("LZW stream expands past the decode limit");
       if (previous !== null) dictionary.push([...previous, entry[0] as number]);
       previous = entry;
       const limit = dictionary.length + earlyChange;
@@ -546,7 +669,7 @@ function lzwDecode(data: Uint8Array, earlyChange: number, maxBytes: number): Uin
       else if (limit >= 2048 && codeWidth === 11) codeWidth = 12;
     }
   }
-  return Uint8Array.from(out);
+  return out.toBytes();
 }
 
 /** Filters this reader deliberately leaves alone: they carry image data. */
@@ -609,15 +732,15 @@ export function decodeStream(
       }
       case "ASCII85Decode":
       case "A85":
-        data = ascii85Decode(data);
+        data = ascii85Decode(data, maxBytes);
         break;
       case "ASCIIHexDecode":
       case "AHx":
-        data = asciiHexDecode(data);
+        data = asciiHexDecode(data, maxBytes);
         break;
       case "RunLengthDecode":
       case "RL":
-        data = runLengthDecode(data);
+        data = runLengthDecode(data, maxBytes);
         break;
       case "Crypt":
         throw new PdfFilterError("stream uses the Crypt filter; the document is encrypted");
@@ -756,12 +879,28 @@ export class PdfDocument {
     const out: PdfPage[] = [];
     const catalog = this.catalog();
     const seen = new Set<PdfDict>();
+    // `seen` only blocks a CYCLE on the current path, which is what lets a
+    // shared page node appear twice legitimately. It does not stop a node
+    // being REVISITED down a different branch, and a tree where each of 40
+    // levels lists the next one twice is 2^40 walks from a 2 KB file. A flat
+    // budget on visits bounds that; a real page tree visits one node per page
+    // plus its interior nodes, so the ceiling is never reached by a valid file.
+    const maxVisits = this.limits.maxPages * 4 + 1024;
+    let visits = 0;
     const walk = (
       node: PdfValue,
       inherited: { mediaBox: PdfValue; resources: PdfValue; rotate: PdfValue },
       depth: number,
     ): void => {
       if (depth > 64 || out.length >= this.limits.maxPages) return;
+      visits += 1;
+      if (visits > maxVisits) {
+        // Refused rather than truncated: a partial page list reported as the
+        // whole document is exactly the confidently-wrong answer to avoid.
+        throw new PdfError(
+          `this pdf's page tree visits more than ${maxVisits} nodes; it is malformed or adversarial and is refused rather than walked`,
+        );
+      }
       const dict = this.resolve(node);
       if (!isDict(dict) || seen.has(dict)) return;
       const next = {

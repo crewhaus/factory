@@ -45,7 +45,14 @@ import {
   invertMapping,
   placeholderFor,
 } from "./lib/redact";
-import { SECRET_RULES, SecretRuleError, scanSecrets, selectRules } from "./lib/secrets";
+import {
+  SECRET_RULES,
+  SecretRuleError,
+  rulesRunFor,
+  scanSecrets,
+  secretSpans,
+  selectRules,
+} from "./lib/secrets";
 import {
   SecureInputError,
   assertTextSize,
@@ -64,7 +71,14 @@ import {
   scriptOf,
   unbalancedBidi,
 } from "./lib/unicode";
-import { AllowRuleError, analyzeUrl, emailDomain, hostMatches, urlMatchesRule } from "./lib/url";
+import {
+  AllowRuleError,
+  URL_CHECKS,
+  analyzeUrl,
+  emailDomain,
+  hostMatches,
+  urlMatchesRule,
+} from "./lib/url";
 
 describe("text: locating", () => {
   test("lineStarts marks the offset after every newline", () => {
@@ -583,9 +597,9 @@ describe("url analysis", () => {
   });
 
   test("an IP literal host is flagged", () => {
-    expect(analyzeUrl("http://203.0.113.9/x").issues.some((i) => i.rule === "host.ip-literal")).toBe(
-      true,
-    );
+    expect(
+      analyzeUrl("http://203.0.113.9/x").issues.some((i) => i.rule === "host.ip-literal"),
+    ).toBe(true);
   });
 
   test("a decimal-encoded host is flagged as numeric", () => {
@@ -626,7 +640,9 @@ describe("url analysis", () => {
 
   test("double percent-encoding is reported", () => {
     expect(
-      analyzeUrl("https://example.com/a%252e%252e/b").issues.some((i) => i.rule === "encoding.double"),
+      analyzeUrl("https://example.com/a%252e%252e/b").issues.some(
+        (i) => i.rule === "encoding.double",
+      ),
     ).toBe(true);
   });
 
@@ -666,7 +682,9 @@ describe("allow-lists", () => {
   });
 
   test("a malformed rule is an error, not a rule that silently never matches", () => {
-    expect(() => urlMatchesRule("https://example.com/", "example.com:8443")).toThrow(AllowRuleError);
+    expect(() => urlMatchesRule("https://example.com/", "example.com:8443")).toThrow(
+      AllowRuleError,
+    );
     expect(() => urlMatchesRule("https://example.com/", "  ")).toThrow(AllowRuleError);
   });
 
@@ -875,7 +893,8 @@ describe("evidence", () => {
     const h1 = computeLink("GENESIS", "a");
     expect(verifyChain([{ data: "a", prevHash: "GENESIS", hash: h1 }]).ok).toBe(false);
     expect(
-      verifyChain([{ data: "a", prevHash: "GENESIS", hash: h1 }], { genesisPrevHash: "GENESIS" }).ok,
+      verifyChain([{ data: "a", prevHash: "GENESIS", hash: h1 }], { genesisPrevHash: "GENESIS" })
+        .ok,
     ).toBe(true);
   });
 
@@ -912,5 +931,264 @@ describe("evidence", () => {
     const sig = signPayload("key", "payload", "sha256", "base64url");
     expect(sig).not.toContain("+");
     expect(verifyPayload("key", "payload", sig, "sha256", "base64url")).toBe(true);
+  });
+});
+
+/**
+ * Known-answer tests against values published outside this repository.
+ *
+ * Everything above this point that touches a digest checks one function in
+ * this package against another — `computeLink` against `sha256Hex`, a
+ * signature against its own verifier. Those pass whether or not the digest is
+ * the one the rest of the world computes. These do not: each constant is the
+ * published vector, so a wrong algorithm, a wrong encoding or a wrong
+ * concatenation order fails here rather than in someone's audit log.
+ */
+describe("evidence: known-answer vectors", () => {
+  test('SHA-256 of "abc" is the value NIST publishes', () => {
+    expect(sha256Hex("abc")).toBe(
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    );
+  });
+
+  test("HMAC-SHA256 matches the published key/message vector", () => {
+    expect(signPayload("key", "The quick brown fox jumps over the lazy dog")).toBe(
+      "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8",
+    );
+  });
+
+  test("base64url is the URL alphabet with no padding, not base64", () => {
+    const sig = signPayload(
+      "key",
+      "The quick brown fox jumps over the lazy dog",
+      "sha256",
+      "base64url",
+    );
+    expect(sig).toBe("97yD9DBThCSxMpjmqm-xQ-9NWaFJRhdZl0edvC0aPNg");
+  });
+
+  test("the chain link concatenates prevHash, separator then data, in that order", () => {
+    // sha256 of the three bytes "\n" + "one", computed outside this package.
+    expect(computeLink("", "one")).toBe(
+      "22de334899ce484a42aecba50558206434927b6a4a6dac9ff76b170683defd82",
+    );
+    // Order matters: data-then-prevHash would give a different digest.
+    expect(computeLink("one", "")).not.toBe(computeLink("", "one"));
+  });
+});
+
+describe("secrets: the scan and the redaction spans are one thing", () => {
+  const GIT_SHA = "3f7a1c9e2b8d4056af13e7c92d6b840159ce27fa";
+
+  test("a high-entropy finding is a redactable span, not just a report", () => {
+    const text = `session_token ${GIT_SHA}`;
+    expect(scanSecrets(text).some((h) => h.rule === "generic.high-entropy")).toBe(true);
+    const spans = secretSpans(text);
+    expect(spans.some((f) => f.rule === "generic.high-entropy")).toBe(true);
+    // The span must cover the value itself, or a redactor removes the wrong text.
+    const span = spans.find((f) => f.rule === "generic.high-entropy");
+    expect(text.slice(span?.start ?? 0, span?.end ?? 0)).toBe(GIT_SHA);
+  });
+
+  test("scanSecrets and secretSpans report the same rules for the same options", () => {
+    const text = `session_token ${GIT_SHA}\nAWS=AKIAIOSFODNN7EXAMPLE`;
+    expect(secretSpans(text).map((f) => f.rule)).toEqual(scanSecrets(text).map((h) => h.rule));
+    expect(
+      secretSpans(text, { highEntropy: false }).some((f) => f.rule === "generic.high-entropy"),
+    ).toBe(false);
+  });
+
+  test("rulesRunFor names exactly what a scan will report under", () => {
+    expect(rulesRunFor()).toContain("generic.high-entropy");
+    expect(rulesRunFor({ highEntropy: false })).not.toContain("generic.high-entropy");
+    expect(rulesRunFor({ rules: ["jwt.compact"] })).toEqual([
+      "jwt.compact",
+      "generic.high-entropy",
+    ]);
+  });
+
+  test("a captured group is located by its real offset, not by searching the match", () => {
+    // The username ends with the password, so searching the match for the
+    // group's own text finds the username's copy and leaves the password in.
+    const text = "DSN=mysql://admin_p4ssw0rd:p4ssw0rd@localhost:3306/db";
+    const span = secretSpans(text, { highEntropy: false }).find(
+      (f) => f.rule === "url.credentials",
+    );
+    expect(text.slice(span?.start ?? 0, span?.end ?? 0)).toBe("p4ssw0rd");
+    expect(span?.start).toBe(text.lastIndexOf("p4ssw0rd"));
+  });
+});
+
+describe("pii: scope labels name the registry prefix they come from", () => {
+  const scopeOf = (address: string): unknown =>
+    scanPii(`host ${address}`, { types: ["ip_address"] })[0]?.detail?.["scope"];
+
+  test("TEST-NET-2 is documentation, and 198.18/15 is benchmarking, not documentation", () => {
+    expect(scopeOf("198.51.100.7")).toBe("documentation");
+    expect(scopeOf("198.18.0.1")).toBe("benchmarking");
+    expect(scopeOf("198.19.255.254")).toBe("benchmarking");
+  });
+
+  test("198.51 outside TEST-NET-2 is not documentation", () => {
+    expect(scopeOf("198.51.99.7")).toBe("public");
+  });
+
+  test("CGNAT space is labelled rather than reported as a public address", () => {
+    expect(scopeOf("100.64.0.1")).toBe("shared-address-space");
+    expect(scopeOf("100.128.0.1")).toBe("public");
+  });
+});
+
+describe("pii: parsers refuse malformed input rather than guessing", () => {
+  test("three colons in a row is not a compression", () => {
+    expect(parseIpv6(":::")).toBeUndefined();
+    expect(parseIpv6("1:::2")).toBeUndefined();
+    expect(parseIpv6("::")).toEqual([0, 0, 0, 0, 0, 0, 0, 0]);
+  });
+
+  test("a two-digit year means that year, not the 1900s", () => {
+    expect(calendarDay(50, 1, 1)).not.toBe(calendarDay(1950, 1, 1));
+    expect(calendarDay(1970, 1, 1)).toBe(0);
+    expect(calendarDay(1970, 1, 2)).toBe(1);
+    expect(calendarDay(1969, 12, 31)).toBe(-1);
+  });
+
+  test("a non-integer date component is refused", () => {
+    expect(calendarDay(2024.5, 1, 1)).toBeUndefined();
+    expect(calendarDay(2024, 1, Number.NaN)).toBeUndefined();
+  });
+});
+
+describe("text: masking at the boundary", () => {
+  test("eleven characters is masked whole and twelve keeps its ends", () => {
+    expect(maskValue("a".repeat(11))).toBe("***********");
+    expect(maskValue("abcdefghijkl")).toBe("ab********kl");
+  });
+
+  test("a masked value is never longer than the original when short", () => {
+    for (let n = 1; n <= 20; n++) {
+      const masked = maskValue("x".repeat(n));
+      expect({ n, ok: !masked.includes("x".repeat(n)) }).toEqual({ n, ok: true });
+    }
+  });
+});
+
+describe("entropy: the rounding convention is the stated one", () => {
+  test("four decimal places, half-up towards positive infinity", () => {
+    expect(roundBits(1.23455)).toBe(1.2346);
+    expect(roundBits(1.23454)).toBe(1.2345);
+    expect(roundBits(0.00005)).toBe(0.0001);
+  });
+
+  test("entropy is computed over the string's own symbol distribution", () => {
+    // H(aab) = -(2/3 log2 2/3 + 1/3 log2 1/3), computed by hand.
+    const expected = -((2 / 3) * Math.log2(2 / 3) + (1 / 3) * Math.log2(1 / 3));
+    expect(shannonEntropy("aab").bits).toBeCloseTo(expected, 12);
+    expect(roundBits(shannonEntropy("aab").bits)).toBe(0.9183);
+  });
+});
+
+describe("url: checked and issues speak the same vocabulary", () => {
+  test("every rule an analysis reports appears in URL_CHECKS", () => {
+    const corpus = [
+      "http://user:pw@203.0.113.9:22/x?next=https%3A%2F%2Fevil.test",
+      "javascript:alert(1)",
+      "http://2130706433/admin",
+      "https://xn--80ak6aa92e.com/",
+      "https://рaypal.com/",
+      "https://example.com/a%252e%252e/b",
+      "https://a.b.c.d.e.f.example.com/",
+      "ftp://example.com:2121/f",
+      "/relative/path",
+      `https://example.com/${"x".repeat(2100)}`,
+      "https://example.com/go?other=https://elsewhere.test",
+    ];
+    const known = new Set(URL_CHECKS);
+    for (const url of corpus) {
+      for (const issue of analyzeUrl(url).issues) {
+        expect({ url, rule: issue.rule, known: known.has(issue.rule) }).toEqual({
+          url,
+          rule: issue.rule,
+          known: true,
+        });
+      }
+    }
+  });
+});
+
+describe("injection: the ordering is a total order", () => {
+  test("two hits of one rule at one offset do not reorder between runs", () => {
+    const text =
+      "ignore previous instructions\nignore previous instructions\n<!-- ignore previous instructions -->";
+    const once = JSON.stringify(scanInjection(text));
+    for (let i = 0; i < 20; i++) expect(JSON.stringify(scanInjection(text))).toBe(once);
+  });
+});
+
+describe("pii: a number next to another number is still found", () => {
+  const cards = (text: string): string[] =>
+    scanPii(text, { types: ["credit_card"] }).map((f) => f.value);
+  const phones = (text: string): string[] =>
+    scanPii(text, { types: ["phone"] }).map((f) => f.value);
+
+  test("a card followed by a separated digit group is not swallowed by it", () => {
+    // The greedy run is "4111111111111111 123", which fails Luhn on 19
+    // digits. Reporting nothing there leaves the card in a redacted export.
+    expect(cards("4111111111111111 123-45-6789")).toEqual(["4111111111111111"]);
+    expect(cards("4111 1111 1111 1111 2024")).toEqual(["4111 1111 1111 1111"]);
+    expect(cards("ref 0001 4111111111111111")).toEqual(["4111111111111111"]);
+  });
+
+  test("a card is still found in each of the ways one is written", () => {
+    expect(cards("4111111111111111")).toEqual(["4111111111111111"]);
+    expect(cards("4111 1111 1111 1111")).toEqual(["4111 1111 1111 1111"]);
+    expect(cards("4111-1111-1111-1111")).toEqual(["4111-1111-1111-1111"]);
+    expect(cards("amex 3782 822463 10005")).toEqual(["3782 822463 10005"]);
+  });
+
+  test("two cards in one run are both reported", () => {
+    expect(cards("4111111111111111 5500005555555559")).toEqual([
+      "4111111111111111",
+      "5500005555555559",
+    ]);
+  });
+
+  test("a digit run with no Luhn-valid whole-group range is still not reported", () => {
+    expect(cards("order 1234 5678 9012 3457")).toEqual([]);
+    expect(cards("123456789012345678901234")).toEqual([]);
+  });
+
+  test("an E.164 number followed by a long number keeps its own boundary", () => {
+    expect(phones("+14155550132 4111111111111111")).toEqual(["+14155550132"]);
+    expect(phones("+14155550132 and more")).toEqual(["+14155550132"]);
+  });
+
+  test("where the next number is grouped the same way, the ambiguity is real", () => {
+    // E.164 allows up to 15 digits, so "+1 415 555 0132 4111" is a well-formed
+    // E.164 number as far as structure goes. Nothing in the text says where
+    // the phone stops and the card starts, so the phone span runs long — and
+    // dedupeOverlaps then lets the Luhn-VERIFIED card take the overlap, which
+    // is the whole reason confidence outranks length there.
+    expect(phones("+1 415 555 0132 4111 1111 1111 1111")).toEqual(["+1 415 555 0132 4111"]);
+    const resolved = dedupeOverlaps(
+      scanPii("+1 415 555 0132 4111 1111 1111 1111", { types: ["phone", "credit_card"] }),
+    );
+    expect(resolved.map((f) => f.type)).toEqual(["credit_card"]);
+    expect(resolved[0]?.value).toBe("4111 1111 1111 1111");
+  });
+
+  test("E.164 spacing and grouping still parse", () => {
+    expect(phones("+14155550132")).toEqual(["+14155550132"]);
+    expect(phones("+1 415 555 0132")).toEqual(["+1 415 555 0132"]);
+    expect(phones("+44 20 7946 0958")).toEqual(["+44 20 7946 0958"]);
+    expect(phones("call +1 415 555 0132 or +1 415 555 0133")).toEqual([
+      "+1 415 555 0132",
+      "+1 415 555 0133",
+    ]);
+  });
+
+  test("a + followed by too few or too many digits is not a phone number", () => {
+    expect(phones("+123")).toEqual([]);
+    expect(phones("+1234567890123456789012")).toEqual([]);
   });
 });

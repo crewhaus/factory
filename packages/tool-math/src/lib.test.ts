@@ -39,7 +39,7 @@ import {
   moneySum,
   toMinor,
 } from "./lib/money";
-import { formatNumber, parseLocaleNumber } from "./lib/numfmt";
+import { NumberFormatError, formatNumber, parseLocaleNumber } from "./lib/numfmt";
 import {
   compensatedSum,
   findOutliers,
@@ -58,7 +58,15 @@ import {
   summarize,
   variance,
 } from "./lib/stats";
-import { convertUnits, resolveUnit, unitCatalog } from "./lib/units";
+import {
+  convertTemperature,
+  convertUnits,
+  fromKelvin,
+  resolveTemperatureScale,
+  resolveUnit,
+  toKelvin,
+  unitCatalog,
+} from "./lib/units";
 
 const evaluate = (source: string, variables: Record<string, number> = {}): number =>
   evaluateExpression(source, { variables }).value;
@@ -185,6 +193,33 @@ describe("expr — refusals", () => {
 
   test("a non-finite variable is refused", () => {
     expect(() => evaluate("x", { x: Number.NaN })).toThrow(/finite/);
+  });
+
+  test("names inherited from Object.prototype are not functions or constants", () => {
+    // The function and constant tables are object literals, so `FUNCTIONS["__proto__"]`
+    // is Object.prototype and `EXPR_CONSTANTS["constructor"]` is the Object
+    // constructor. Before the own-property guard, "__proto__(1)" reached
+    // `spec.apply(args)` and threw a bare TypeError straight out of the tool.
+    for (const name of ["__proto__", "constructor", "toString", "valueOf", "hasOwnProperty"]) {
+      let thrown: unknown;
+      try {
+        evaluate(`${name}(1)`);
+      } catch (err) {
+        thrown = err;
+      }
+      expect({ name, kind: (thrown as Error)?.constructor?.name }).toEqual({
+        name,
+        kind: "ExprError",
+      });
+      expect((thrown as Error).message).toContain("unknown function");
+      expect(() => evaluate(name)).toThrow(/unknown name/);
+    }
+  });
+
+  test("an inherited name can still be used as a caller-supplied variable", () => {
+    // Own-property lookup must not break a legitimate variable that happens to
+    // share a name with something on Object.prototype.
+    expect(evaluate("toString + 1", JSON.parse('{"toString": 41}'))).toBe(42);
   });
 });
 
@@ -377,6 +412,17 @@ describe("stats — percentile conventions", () => {
   test("a fraction outside 0..1 is refused", () => {
     expect(() => percentile(ten, 1.5, "r7")).toThrow(/between 0 and 1/);
   });
+
+  test("r6 is undefined for a single observation too, except at p=0.5", () => {
+    // n=1 puts r6's defined range at [1/2, 1/2]. Answering every p with the one
+    // observation would be a number under a convention that does not define it.
+    expect(() => percentile([5], 0.99, "r6")).toThrow(/undefined/);
+    expect(() => percentile([5], 0.25, "r6")).toThrow(/undefined/);
+    expect(percentile([5], 0.5, "r6")).toBe(5);
+    // r7 and nearestRank ARE defined everywhere for n=1.
+    expect(percentile([5], 0.99, "r7")).toBe(5);
+    expect(percentile([5], 0.99, "nearestRank")).toBe(5);
+  });
 });
 
 describe("stats — correlation and regression", () => {
@@ -468,6 +514,33 @@ describe("stats — histogram and outliers", () => {
     expect(() => findOutliers([1, 2], "zscore", 3)).toThrow(/at least 3/);
     expect(() => findOutliers([1, 2, 3], "iqr", 1.5)).toThrow(/at least 4/);
   });
+
+  test("a non-finite origin or width is refused, not turned into NaN bucket edges", () => {
+    // Infinity satisfies `z.number()`, so this reaches the function. An infinite
+    // origin made every edge NaN and the bucket index NaN, which indexed past the
+    // end of the array and threw a TypeError out of the tool.
+    for (const origin of [Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY, Number.NaN]) {
+      let thrown: unknown;
+      try {
+        histogram([1, 2, 3], { bucketCount: 4, origin });
+      } catch (err) {
+        thrown = err;
+      }
+      expect({ origin, kind: (thrown as Error)?.constructor?.name }).toEqual({
+        origin,
+        kind: "StatsError",
+      });
+    }
+    expect(() => histogram([1, 2, 3], { bucketWidth: Number.POSITIVE_INFINITY })).toThrow(/finite/);
+  });
+
+  test("finding nothing is reported as finding nothing, not as a clean bill of health", () => {
+    const clean = findOutliers([10, 11, 12, 11, 10, 12], "iqr", 1.5);
+    expect(clean.count).toBe(0);
+    expect(clean.finding).toContain("not evidence that the data is clean");
+    const flagged = findOutliers([10, 12, 11, 13, 12, 11, 100], "iqr", 1.5);
+    expect(flagged.finding).toContain("candidate for review");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -489,6 +562,15 @@ describe("money — minor units", () => {
     expect(() => toMinor(10.5)).toThrow(/\$10\.50 is 1050/);
     expect(toMinor("1050")).toBe(1050n);
     expect(toMinor(-250)).toBe(-250n);
+  });
+
+  test("an absurdly long amount is refused instead of being multiplied out", () => {
+    // A 200 000-digit "amount" is not a price. Allocating one across 2 000 ratios
+    // took 35 seconds and produced an 80 MB result before this cap existed.
+    const thousand = "9".repeat(1_000);
+    expect(toMinor(thousand)).toBe(BigInt(thousand));
+    expect(toMinor(`-${thousand}`)).toBe(-BigInt(thousand));
+    expect(() => toMinor("9".repeat(1_001))).toThrow(/over the 1000 limit/);
   });
 
   test("formatting respects the exponent", () => {
@@ -697,6 +779,50 @@ describe("units", () => {
     expect(() => convertUnits(1, "smoot", "m")).toThrow(/unknown unit "smoot"/);
   });
 
+  test("names inherited from Object.prototype are not units or temperature scales", () => {
+    // `DIMENSIONS.length.units["toString"]` is a function, not undefined. Treating
+    // it as a unit spec produced `value: null` with `method: "value * undefined / 1"`,
+    // and `TEMPERATURE_ALIASES["constructor"]` made 20 "constructor" -> F return
+    // -423.67: a confident number for a unit that does not exist.
+    for (const name of ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"]) {
+      expect({ name, resolved: resolveUnit(name) }).toEqual({ name, resolved: undefined });
+      expect({ name, scale: resolveTemperatureScale(name) }).toEqual({ name, scale: undefined });
+      expect(() => convertUnits(1, name, "m")).toThrow(/unknown unit/);
+      expect(() => convertUnits(20, name, "F")).toThrow(/unknown unit/);
+    }
+  });
+
+  test("temperature conversions land on their exact textbook values", () => {
+    // Routing C -> K -> F rounds twice and returned 211.99999999999994 for boiling
+    // water. The single-step affine form is exact at the values everyone checks.
+    expect(convertUnits(100, "C", "F").value).toBe(212);
+    expect(convertUnits(0, "C", "F").value).toBe(32);
+    expect(convertUnits(-40, "C", "F").value).toBe(-40);
+    expect(convertUnits(212, "F", "C").value).toBe(100);
+    expect(convertUnits(0, "C", "K").value).toBe(273.15);
+    expect(convertUnits(0, "F", "R").value).toBe(459.67);
+    expect(convertUnits(100, "C", "F").method).toContain("affine");
+  });
+
+  test("the one-step conversion is the SAME affine map as the two-hop one", () => {
+    // Proving the shortcut did not change the mathematics, only the rounding:
+    // every pair is compared against the kelvin route it replaced.
+    for (const from of ["C", "F", "K", "R"] as const) {
+      for (const to of ["C", "F", "K", "R"] as const) {
+        for (const value of [-100, -40, 0, 1, 37, 100, 1000]) {
+          const direct = convertTemperature(value, from, to);
+          const viaKelvin = fromKelvin(toKelvin(value, from), to);
+          expect({ from, to, value, close: Math.abs(direct - viaKelvin) < 1e-9 }).toEqual({
+            from,
+            to,
+            value,
+            close: true,
+          });
+        }
+      }
+    }
+  });
+
   test("months and years are deliberately absent from the time units", () => {
     const catalog = unitCatalog();
     expect(catalog["time"]).not.toContain("mo");
@@ -753,6 +879,17 @@ describe("finance — percentages", () => {
   test("impossible or underdetermined inputs are refused", () => {
     expect(() => markupMargin({ cost: 100 })).toThrow(/exactly two/);
     expect(() => markupMargin({ cost: 100, marginPercent: 100 })).toThrow(/100% or more/);
+  });
+
+  test("an over-determined square is refused rather than silently dropping a value", () => {
+    // cost + price already fix the square; a third value that disagrees was
+    // being ignored while the message claimed exactly two were required.
+    expect(() => markupMargin({ cost: 100, price: 150, markupPercent: 999 })).toThrow(
+      /over-determines/,
+    );
+    expect(() =>
+      markupMargin({ cost: 100, price: 150, markupPercent: 50, marginPercent: 100 / 3 }),
+    ).toThrow(/over-determines/);
   });
 });
 
@@ -1000,6 +1137,16 @@ describe("geo", () => {
     expect(() => pointInPolygon({ lat: 5, lon: 180 }, wide)).toThrow(/antimeridian/);
   });
 
+  test("an infinite radius is refused, not rendered as a null distance", () => {
+    // `radius > 0` alone admits Infinity, and JSON turns the resulting Infinity
+    // into `null` — a blank where a distance should be.
+    expect(() => haversineDistance(london, paris, Number.POSITIVE_INFINITY)).toThrow(/finite/);
+    expect(() => boundingBoxAround(london, Number.POSITIVE_INFINITY, EARTH_RADIUS_M)).toThrow(
+      /finite/,
+    );
+    expect(() => boundingBoxAround(london, 1_000, Number.POSITIVE_INFINITY)).toThrow(/finite/);
+  });
+
   test("a degenerate ring is refused", () => {
     expect(() =>
       pointInPolygon({ lat: 0, lon: 0 }, [
@@ -1071,6 +1218,58 @@ describe("numfmt", () => {
   test("non-Latin digits parse for their locale", () => {
     const arabic = formatNumber(1234.5, { locale: "ar-EG", style: "decimal" }).formatted;
     expect(parseLocaleNumber(arabic, "ar-EG").value).toBeCloseTo(1234.5, 9);
+  });
+
+  test("fixtures written by hand from the grouping rules, not round-tripped", () => {
+    // Each string here is constructed from the locale's documented grouping and
+    // decimal marks rather than from this package's own formatter, so a shared
+    // wrong assumption on both sides of a round trip cannot make it pass.
+    const cases: Array<[string, string, number]> = [
+      ["en-US", "1,234,567.89", 1234567.89], // 3-digit groups, "." decimal
+      ["de-DE", "1.234.567,89", 1234567.89], // "." groups, "," decimal
+      ["en-IN", "12,34,567.89", 1234567.89], // Indian 2-2-3 grouping
+      ["en-US", "0.5", 0.5],
+      ["de-DE", "0,5", 0.5],
+      ["en-US", "-1,000", -1000],
+    ];
+    for (const [locale, text, expected] of cases) {
+      expect({ locale, text, value: parseLocaleNumber(text, locale).value }).toEqual({
+        locale,
+        text,
+        value: expected,
+      });
+    }
+  });
+
+  test("a group of the wrong length is refused, whatever the locale", () => {
+    // "6" is a one-digit group, which no grouping system produces.
+    expect(() => parseLocaleNumber("12,345,6.78", "en-US")).toThrow(/groups must be 2 or 3/);
+    expect(() => parseLocaleNumber("1234,567.89", "en-US")).toThrow(/valid first group/);
+  });
+
+  test("nested or unbalanced accounting parentheses are refused", () => {
+    // "((1,234.50))" used to parse as -1234.5, reporting the leftover "()" as a
+    // stripped currency symbol.
+    expect(() => parseLocaleNumber("((1,234.50))", "en-US")).toThrow(/parentheses/);
+    expect(() => parseLocaleNumber("(1,234.50", "en-US")).toThrow(/parentheses/);
+    expect(() => parseLocaleNumber("1,234.50)", "en-US")).toThrow(/parentheses/);
+    // One pair still means a negative.
+    expect(parseLocaleNumber("(1,234.50)", "en-US").value).toBe(-1234.5);
+  });
+
+  test("every refusal here is a NumberFormatError, never a runtime type error", () => {
+    for (const text of ["abc", "((1))", "1.2.3", "()", "--5", "1e999"]) {
+      let thrown: unknown;
+      try {
+        parseLocaleNumber(text, "en-US");
+      } catch (err) {
+        thrown = err;
+      }
+      expect({ text, isRefusal: thrown instanceof NumberFormatError }).toEqual({
+        text,
+        isRefusal: true,
+      });
+    }
   });
 
   test("text that is not a number is refused with what it reduced to", () => {

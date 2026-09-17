@@ -256,12 +256,75 @@ export function fromKelvin(kelvin: number, scale: TemperatureScale): number {
   }
 }
 
+/**
+ * Convert DIRECTLY between two scales rather than in two hops through kelvin.
+ *
+ * The relation is the same affine one either way — going C -> K -> F and
+ * applying `v * 9/5 + 32` are equal in exact arithmetic — but the two-hop
+ * route rounds twice in binary, so 100 °C came back as 211.99999999999994
+ * instead of 212. Each pair below is the single expression for that pair, so
+ * the only rounding is the one the arithmetic genuinely needs. Kelvin is still
+ * the reference the offsets are defined against, and the conversion is still
+ * affine, not a scale factor.
+ */
+export function convertTemperature(
+  value: number,
+  from: TemperatureScale,
+  to: TemperatureScale,
+): number {
+  if (from === to) return value;
+  switch (`${from}${to}`) {
+    case "CF":
+      return value * (9 / 5) + 32;
+    case "FC":
+      return (value - 32) * (5 / 9);
+    case "CK":
+      return value + 273.15;
+    case "KC":
+      return value - 273.15;
+    case "CR":
+      return (value + 273.15) * (9 / 5);
+    case "RC":
+      return value * (5 / 9) - 273.15;
+    case "FK":
+      return (value + 459.67) * (5 / 9);
+    case "KF":
+      return value * (9 / 5) - 459.67;
+    case "FR":
+      return value + 459.67;
+    case "RF":
+      return value - 459.67;
+    case "KR":
+      return value * (9 / 5);
+    case "RK":
+      return value * (5 / 9);
+    default:
+      // Unreachable while TEMPERATURE_SCALES has four members; kept so a new
+      // scale fails loudly rather than silently returning the wrong number.
+      throw new UnitError(`no conversion is defined from ${from} to ${to}`);
+  }
+}
+
 export function resolveTemperatureScale(name: string): TemperatureScale | undefined {
   const trimmed = name.trim();
   if ((TEMPERATURE_SCALES as ReadonlyArray<string>).includes(trimmed)) {
     return trimmed as TemperatureScale;
   }
-  return TEMPERATURE_ALIASES[trimmed.toLowerCase()];
+  return ownProperty(TEMPERATURE_ALIASES, trimmed.toLowerCase());
+}
+
+/**
+ * Look a name up as an OWN property only.
+ *
+ * These tables are object literals, so they inherit from `Object.prototype`:
+ * `spec.units["toString"]` is a function, not `undefined`, and treating it as a
+ * `UnitSpec` produced `value: null` with `method: "value * undefined / 1"` —
+ * a confident-looking answer to a unit that does not exist. Likewise
+ * `TEMPERATURE_ALIASES["constructor"]` made `UnitConvert(20, "constructor", "F")`
+ * return -423.67. Every lookup on a caller-supplied name goes through here.
+ */
+function ownProperty<T>(table: Readonly<Record<string, T>>, name: string): T | undefined {
+  return Object.hasOwn(table, name) ? table[name] : undefined;
 }
 
 export type ResolvedUnit = { dimension: string; unit: string; spec: UnitSpec };
@@ -275,7 +338,7 @@ export type ResolvedUnit = { dimension: string; unit: string; spec: UnitSpec };
 export function resolveUnit(name: string): ResolvedUnit | { ambiguous: string[] } | undefined {
   const trimmed = name.trim();
   for (const [dimension, spec] of Object.entries(DIMENSIONS)) {
-    const direct = spec.units[trimmed];
+    const direct = ownProperty(spec.units, trimmed);
     if (direct !== undefined) return { dimension, unit: trimmed, spec: direct };
   }
   const lower = trimmed.toLowerCase();
@@ -320,6 +383,11 @@ export function convertUnits(value: number, fromName: string, toName: string): C
   const toTemp = resolveTemperatureScale(toName);
   if (fromTemp !== undefined || toTemp !== undefined) {
     if (fromTemp === undefined || toTemp === undefined) {
+      // Only one side is a temperature. Say WHICH problem it is: a name that is
+      // not a unit at all deserves "unknown unit", not a lecture about
+      // dimensions that implies the name was recognised.
+      const otherName = fromTemp === undefined ? fromName : toName;
+      assertResolved(resolveUnit(otherName), otherName);
       throw new UnitError(
         `cannot convert between "${fromName}" and "${toName}": temperature is a dimension of its own and does not convert to anything else`,
       );
@@ -330,11 +398,12 @@ export function convertUnits(value: number, fromName: string, toName: string): C
       );
     }
     return {
-      value: fromKelvin(toKelvin(value, fromTemp), toTemp),
+      value: convertTemperature(value, fromTemp, toTemp),
       from: fromTemp,
       to: toTemp,
       dimension: "temperature",
-      method: "affine: converted through kelvin with the scale's offset, not by a scale factor",
+      method:
+        "affine: an offset and a ratio relative to kelvin, not a scale factor; applied in one step so no intermediate rounding is introduced",
       exact: false,
     };
   }

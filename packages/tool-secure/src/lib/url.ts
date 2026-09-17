@@ -89,20 +89,32 @@ const REDIRECT_PARAMS = new Set([
   "window",
 ]);
 
+/**
+ * Every rule id `analyzeUrl` can emit, so `checked` and `issues[].rule` are
+ * the same vocabulary — a caller can line an empty `issues` list up against
+ * this one and see exactly what "no findings" covered. Naming a category here
+ * that no issue ever reports under (`scheme` when the issue says
+ * `scheme.active`) makes the two lists un-joinable, which is the whole point
+ * of publishing the second one.
+ */
 export const URL_CHECKS: ReadonlyArray<string> = [
-  "scheme",
+  "parse",
+  "raw.whitespace-or-control",
+  "length",
+  "scheme.active",
+  "scheme.unexpected",
   "authority.credentials",
-  "host.ip-literal",
   "host.numeric",
+  "host.ip-literal",
   "host.punycode",
   "host.non-ascii",
   "host.mixed-script",
   "host.label-count",
-  "port",
+  "port.service",
+  "port.non-standard",
   "query.redirect-parameter",
+  "query.embedded-url",
   "encoding.double",
-  "raw.whitespace-or-control",
-  "length",
 ];
 
 const IPV4_HOST = /^\d{1,3}(?:\.\d{1,3}){3}$/;

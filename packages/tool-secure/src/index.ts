@@ -28,14 +28,6 @@ import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
 import {
-  DEFAULT_MAX_FILE_BYTES,
-  DEFAULT_WALK_LIMITS,
-  MAX_FILE_BYTES_LIMIT,
-  readTextBounded,
-  relLabel,
-  walkTextFiles,
-} from "./lib/files";
-import {
   DEFAULT_ENTROPY_THRESHOLDS,
   MIN_HIGH_ENTROPY_LENGTH,
   classifyCharset,
@@ -53,6 +45,15 @@ import {
   verifyChain,
   verifyPayload as verifyPayloadFn,
 } from "./lib/evidence";
+import {
+  DEFAULT_MAX_FILE_BYTES,
+  DEFAULT_SKIP_DIRS,
+  DEFAULT_WALK_LIMITS,
+  MAX_FILE_BYTES_LIMIT,
+  readTextBounded,
+  relLabel,
+  walkTextFiles,
+} from "./lib/files";
 import { scanInjection } from "./lib/injection";
 import {
   PII_TYPES,
@@ -76,12 +77,13 @@ import {
 import {
   SECRET_RULES,
   type SecretHit,
+  rulesRunFor,
   scanSecrets,
   secretSpans,
-  selectRules,
   severityCounts,
 } from "./lib/secrets";
 import {
+  type Finding,
   MAX_TEXT_CHARS,
   assertTextSize,
   compareStrings,
@@ -103,6 +105,34 @@ function asMessage(err: unknown): string {
 
 /** How many located hits any one result will carry. The count is always exact. */
 const MAX_REPORTED = 200;
+/** How many skipped paths a tree scan lists. The total is always exact. */
+const MAX_REPORTED_SKIPS = 100;
+
+/**
+ * Severity tally over the secret spans that were actually replaced, read from
+ * each finding's own `detail.severity`. Counting a separate scan here is how
+ * an evidence record ends up claiming a removal that never happened.
+ */
+function severityOf(findings: ReadonlyArray<Finding>): Record<string, number> {
+  const counts: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
+  for (const f of findings) {
+    const severity = String(f.detail?.["severity"] ?? "low");
+    counts[severity] = (counts[severity] ?? 0) + 1;
+  }
+  return counts;
+}
+
+/** Tally by a key, sorted by key so the record serializes the same way twice. */
+function countBy<T>(items: ReadonlyArray<T>, key: (item: T) => string): Record<string, number> {
+  const counts = new Map<string, number>();
+  for (const item of items) {
+    const k = key(item);
+    counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  const out: Record<string, number> = {};
+  for (const k of [...counts.keys()].sort(compareStrings)) out[k] = counts.get(k) ?? 0;
+  return out;
+}
 
 const DETECTION_NOTE =
   "Heuristic. These rules found what they match; an empty or short result does not mean the input is clean. Check rulesRun to see what was actually looked for.";
@@ -225,7 +255,9 @@ export const piiRedact: RegisteredTool = buildTool({
     mode: z
       .enum(["placeholder", "pseudonym"])
       .optional()
-      .describe("placeholder writes [EMAIL]; pseudonym writes [EMAIL:<token>]. Defaults to placeholder"),
+      .describe(
+        "placeholder writes [EMAIL]; pseudonym writes [EMAIL:<token>]. Defaults to placeholder",
+      ),
     keyEnvVar: z
       .string()
       .optional()
@@ -286,9 +318,7 @@ export const pseudonymize: RegisteredTool = buildTool({
     "Replace known values with consistent tokens from a caller-supplied mapping, optionally minting tokens for new values first. Use it to de-identify a dataset in a way that can be rejoined later with Depseudonymize; keys are matched longest-first in a single pass, so one replacement never cascades into another.",
   inputSchema: z.object({
     text: z.string().describe("the text to transform"),
-    mapping: z
-      .record(z.string())
-      .describe("original value -> token. Applied longest key first"),
+    mapping: z.record(z.string()).describe("original value -> token. Applied longest key first"),
     wholeWord: z
       .boolean()
       .optional()
@@ -303,7 +333,9 @@ export const pseudonymize: RegisteredTool = buildTool({
         keyEnvVar: z
           .string()
           .optional()
-          .describe("env var holding an HMAC key; without it, tokens are plain hashes and reversible by enumeration"),
+          .describe(
+            "env var holding an HMAC key; without it, tokens are plain hashes and reversible by enumeration",
+          ),
         tokenLength: z.number().int().min(4).max(64).optional(),
       })
       .optional()
@@ -451,9 +483,7 @@ export const secretScan: RegisteredTool = buildTool({
         ...(input.minEntropy !== undefined ? { minEntropy: input.minEntropy } : {}),
         ...(input.requireContext !== undefined ? { requireContext: input.requireContext } : {}),
       };
-      const rulesRun = selectRules(options).map((r) => r.id);
-      const withEntropy =
-        input.highEntropy === false ? rulesRun : [...rulesRun, "generic.high-entropy"];
+      const withEntropy = rulesRunFor(options);
 
       if (input.text !== undefined) {
         assertTextSize(input.text, "text");
@@ -509,7 +539,9 @@ export const secretScan: RegisteredTool = buildTool({
 
       findings.sort(
         (a, b) =>
-          compareStrings(a.file, b.file) || a.line - b.line || a.column - b.column ||
+          compareStrings(a.file, b.file) ||
+          a.line - b.line ||
+          a.column - b.column ||
           compareStrings(a.rule, b.rule),
       );
       return json({
@@ -518,10 +550,13 @@ export const secretScan: RegisteredTool = buildTool({
         total: findings.length,
         severity: severityCounts(findings),
         findings: findings.slice(0, MAX_REPORTED),
-        skipped: skipped.slice(0, 50),
+        skippedTotal: skipped.length,
+        skippedByReason: countBy(skipped, (s) => s.reason),
+        skipped: skipped.slice(0, MAX_REPORTED_SKIPS),
+        skippedReported: Math.min(skipped.length, MAX_REPORTED_SKIPS),
         truncated,
         depthLimited,
-        note: `${DETECTION_NOTE} Samples are masked. Binary files, files over the size cap and symlinks are skipped, so a clean result does not cover them.`,
+        note: `${DETECTION_NOTE} Samples are masked. This walk does NOT open everything under the path: dot-files and dot-directories (including .env) are skipped unless includeHidden is set, ${DEFAULT_SKIP_DIRS.join(", ")} are excluded, symlinks are never followed, and binary or oversized files are refused. Every one of those is named in skipped with its reason — read skippedTotal before treating an empty findings list as coverage.`,
       });
     } catch (err) {
       return `SecretScan could not run: ${asMessage(err)}`;
@@ -736,7 +771,10 @@ export const allowlistCheck: RegisteredTool = buildTool({
     "Decide whether a URL, an email domain or a workspace path falls inside an operator's declared allow-list, naming the rule that matched. Use it as the gate an agent actually consults before reaching somewhere; it denies by default, an empty list allows nothing, and a rule that does not parse is an error rather than a rule that quietly never matches.",
   inputSchema: z.object({
     kind: z.enum(["url", "emailDomain", "path"]).describe("what value is being checked"),
-    value: z.string().min(1).describe("the URL, email address or domain, or workspace-relative path"),
+    value: z
+      .string()
+      .min(1)
+      .describe("the URL, email address or domain, or workspace-relative path"),
     allow: z
       .array(z.string().min(1))
       .min(1)
@@ -797,7 +835,10 @@ export const contentPolicyCheck: RegisteredTool = buildTool({
         z.object({
           id: z.string().min(1).describe("stable identifier, echoed in the result"),
           kind: z.enum(POLICY_RULE_KINDS),
-          value: z.string().min(1).describe("a literal for *_phrase rules, a regex source for *_pattern rules"),
+          value: z
+            .string()
+            .min(1)
+            .describe("a literal for *_phrase rules, a regex source for *_pattern rules"),
           caseSensitive: z.boolean().optional().describe("defaults to false"),
           description: z.string().optional(),
         }),
@@ -815,7 +856,7 @@ export const contentPolicyCheck: RegisteredTool = buildTool({
         pass: result.pass,
         counts: result.counts,
         outcomes: result.outcomes,
-        note: "Mechanical only. A required phrase can be present and still wrong, and a forbidden claim can be made in other words — review_pattern rules exist for exactly that, and a review outcome does not fail the check.",
+        note: "Mechanical only. A required phrase can be present and still wrong, and a forbidden claim can be made in other words — review_pattern rules exist for exactly that, and a review outcome does not fail the check. A rule whose pattern does not compile is reported as error and DOES fail the check, because an unevaluated rule is not a passed one. Matching is case-insensitive unless caseSensitive is set.",
       });
     } catch (err) {
       return `ContentPolicyCheck could not run: ${asMessage(err)}`;
@@ -835,7 +876,9 @@ export const hashChainVerify: RegisteredTool = buildTool({
     records: z
       .array(
         z.object({
-          data: z.string().describe("the record's canonical serialized payload, as the producer hashed it"),
+          data: z
+            .string()
+            .describe("the record's canonical serialized payload, as the producer hashed it"),
           prevHash: z.string().describe("the previous record's hash"),
           hash: z.string().describe("this record's stored hash, hex"),
         }),
@@ -957,7 +1000,10 @@ export const redactForExport: RegisteredTool = buildTool({
       .enum(["placeholder", "pseudonym"])
       .optional()
       .describe("how personal data is replaced; defaults to placeholder"),
-    keyEnvVar: z.string().optional().describe("env var with the HMAC key; required for pseudonym mode"),
+    keyEnvVar: z
+      .string()
+      .optional()
+      .describe("env var with the HMAC key; required for pseudonym mode"),
     tokenLength: z.number().int().min(4).max(64).optional(),
     ...piiSelectionShape,
     ...secretOptionsShape,
@@ -1006,12 +1052,13 @@ export const redactForExport: RegisteredTool = buildTool({
         ...(input.minEntropy !== undefined ? { minEntropy: input.minEntropy } : {}),
         ...(input.requireContext !== undefined ? { requireContext: input.requireContext } : {}),
       };
-      const secretHits = scanSecrets(source, secretOptions);
       const spans = dedupeOverlaps([
         ...secretSpans(source, secretOptions),
         ...scanPii(source, piiOptions(input)),
       ]);
-      const piiFindings = spans.filter((f) => (PII_TYPES as ReadonlyArray<string>).includes(f.type));
+      const piiFindings = spans.filter((f) =>
+        (PII_TYPES as ReadonlyArray<string>).includes(f.type),
+      );
       const secretFindings = spans.filter(
         (f) => !(PII_TYPES as ReadonlyArray<string>).includes(f.type),
       );
@@ -1040,12 +1087,11 @@ export const redactForExport: RegisteredTool = buildTool({
             typesRun: [...(input.types ?? PII_TYPES)].sort(compareStrings),
           },
           secrets: {
+            // Counted from the spans that were ACTUALLY replaced, so the
+            // evidence record can never claim a removal that did not happen.
             total: secretFindings.length,
-            bySeverity: severityCounts(secretHits),
-            rulesRun:
-              input.highEntropy === false
-                ? selectRules(secretOptions).map((r) => r.id)
-                : [...selectRules(secretOptions).map((r) => r.id), "generic.high-entropy"],
+            bySeverity: severityOf(secretFindings),
+            rulesRun: rulesRunFor(secretOptions),
             findings: secretFindings.slice(0, MAX_REPORTED).map((f) => ({
               rule: f.rule,
               line: f.line,
