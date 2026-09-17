@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "rootDir": "src", "outDir": "dist" },
+  "references": [
+    { "path": "../errors" },
+    { "path": "../spec" },
+    { "path": "../compiler" },
+    { "path": "../preflight" },
+    { "path": "../audit-log" },
+    { "path": "../tool-catalog" },
+    { "path": "../tool-builder" },
+    { "path": "../tool-executor" }
+  ],
+  "include": ["src/**/*"]
+}
