@@ -71,11 +71,16 @@ edit(
   "packages/tool-categories/src/registry.ts",
   (s) => {
     if (s.includes(`  ${manifest.category.name}: {`)) return undefined;
-    const block =
-      `  ${manifest.category.name}: {\n` +
-      `    title: ${JSON.stringify(manifest.category.title)},\n` +
-      `    tools: [\n${keys.map((k) => `      ${JSON.stringify(k)},`).join("\n")}\n    ],\n` +
-      `  },\n`;
+    const toolLines = keys.map((k) => `      ${JSON.stringify(k)},`).join("\n");
+    const block = [
+      `  ${manifest.category.name}: {`,
+      `    title: ${JSON.stringify(manifest.category.title)},`,
+      "    tools: [",
+      toolLines,
+      "    ],",
+      "  },",
+      "",
+    ].join("\n");
     let out = s.replace("  // ---- roll-ups ----", `${block}\n  // ---- roll-ups ----`);
     const rollUp = manifest.category.rollUp;
     if (rollUp !== undefined) {
