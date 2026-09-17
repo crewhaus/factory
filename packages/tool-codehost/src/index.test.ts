@@ -827,6 +827,11 @@ describe("the gate refuses what it should", () => {
     expect(seen.filter((entry) => entry.path === "/repos/acme/loop")).toHaveLength(6);
   });
 
+  // 30s, not the 5s default: this is the one test that goes through the REAL
+  // system resolver (every other DNS path is injected), and under a full-repo
+  // run with hundreds of test files in flight that lookup has been measured
+  // taking over five seconds. The tool's own deadline is what bounds the call;
+  // this budget only stops a loaded machine reporting a flake as a failure.
   test("a hostname is dialled at the IP the gate vetted, keeping its Host header", async () => {
     // 127.0.0.1 as a literal short-circuits the pinning path, so this is the
     // only way to prove the pinned socket actually works.
@@ -838,7 +843,7 @@ describe("the gate refuses what it should", () => {
     const result = await run(repoGet, gh());
     expect(result.repository.fullName).toBe("acme/widget");
     expect(seen).toHaveLength(1);
-  });
+  }, 30_000);
 
   test("a resolver that never answers cannot outlive the deadline", async () => {
     // node:dns takes neither a timeout nor a signal, so without the bound the

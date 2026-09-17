@@ -1,0 +1,139 @@
+# @crewhaus/tool-math
+
+Deterministic numeric tools. Every one is pure: no filesystem, no network, no
+clock, no randomness. The same input always produces the same bytes.
+
+That property is the point. A harness spends a model call when it needs
+judgement; it should not spend one to total an invoice, convert a unit, or work
+out a percentile — and it certainly should not spend one on a task where a
+plausible wrong answer is indistinguishable from a right one.
+
+Because that is the real hazard here. Text tools fail visibly. Number tools
+fail **silently**: a float answer to a money question is off by a cent, a
+percentile computed by a different convention is off by a little, a markup
+reported as a margin is off by a third. So every tool in this package states
+its method in its result, and refuses when the data cannot answer the question.
+
+```yaml
+tools:
+  - all-math          # every tool below
+  - -Evaluate         # ...except this one
+```
+
+| Tool | What it does |
+|---|---|
+| `Amortize` | Loan schedule: payment, interest, principal and balance per period |
+| `Correlation` | Pearson's r and Spearman's rho, with n and a caution |
+| `CurrencyConvert` | Convert money using a rate table **you** supply |
+| `Evaluate` | Arithmetic expressions, real parser, never `eval()` |
+| `GeoBoundingBox` | Lat/lon box around points, or around a centre and radius |
+| `GeoDistance` | Great-circle distance and initial bearing (haversine) |
+| `GeoPointInPolygon` | Ray-casting geofence test, boundary hits reported |
+| `Histogram` | Equal-width buckets with their bounds and counts |
+| `Irr` | Internal rate of return by bisection, multiple roots flagged |
+| `LinearRegression` | OLS slope, intercept, r², residual error, predictions |
+| `MoneyAdd` | Exact addition of integer minor units |
+| `MoneyAllocate` | Split an amount by ratios so the parts sum to the whole |
+| `MoneyMultiply` | Money times an exact decimal factor, rounded once |
+| `Npv` | Net present value, timing convention stated |
+| `NumberFormat` | Format for an explicit locale via `Intl` |
+| `NumberParse` | Parse a locale-formatted number back, explicit locale |
+| `Outliers` | Flag by the IQR rule or by z-score, convention named |
+| `Percent` | Change, share of total, and the markup/margin square |
+| `Percentile` | One or more percentiles by a chosen convention |
+| `Round` | Decimal places, significant figures or nearest multiple |
+| `Statistics` | Count, sum, mean, median, mode, variance, stdev, quartiles |
+| `UnitConvert` | Ten dimensions, exact factors, affine temperature |
+
+## The conventions, stated once
+
+Every one of these appears in the tool's own output too. They are collected
+here because they are what makes the answers checkable.
+
+**Sample vs population.** `Statistics` reports variance and standard deviation
+*both* ways, labelled. Sample divides by n-1 (spreadsheet `STDEV`), population
+divides by n (`STDEVP`). Sample variance of a single value is `null`, not zero.
+
+**Percentiles.** Three named conventions, because they disagree — on `1..10` at
+p25 they give 3.25, 2.75 and 3:
+
+- `r7` (default) — linear interpolation, h=(n-1)p. R type 7, NumPy's default,
+  Excel `PERCENTILE.INC`.
+- `r6` — h=(n+1)p. Excel `PERCENTILE.EXC`, Minitab, SPSS. **Refused** outside
+  the range where it is defined, rather than clamped.
+- `nearestRank` — ceil(p·n), no interpolation, so the answer is always an
+  observed value. ISO 2602.
+
+**Rounding.** Seven modes, applied to the exact decimal digits of the input,
+never through binary floating point: `halfEven` (banker's, the default and what
+accounting expects), `halfUp`, `halfDown`, `ceiling`, `floor`, `up`, `down`.
+
+**Money.** Integer minor units in `bigint`s, never floats. A currency's ISO 4217
+minor-unit exponent decides what those units mean — JPY has 0, most have 2, the
+Gulf dinars have 3 — and an unknown code is refused rather than assumed to have
+2, because that assumption is a 100× error waiting for a yen invoice.
+`MoneyAllocate` uses the largest-remainder (Hamilton) method so the parts always
+sum to the whole; that invariant is asserted in the result *and* over 500
+generated cases in the tests.
+
+**NPV timing.** `cashflows[0]` sits at t=0 and is not discounted — the textbook
+definition. Excel's `NPV()` discounts its first argument one full period;
+`firstPeriod: 1` reproduces that on purpose.
+
+**Markup vs margin.** Markup is profit over **cost**; margin is profit over
+**price**. A 50% markup is a 33.3% margin. `Percent` reports both, always.
+
+**Geodesy.** A sphere of radius 6 371 008.8 m (the IUGG mean radius of WGS-84),
+stated in every result, because a spherical model differs from the ellipsoid by
+up to ~0.5%. Fine for logistics, not for surveying.
+
+**Units.** Definitional factors are exact (1 in = 0.0254 m, 1 lb =
+0.45359237 kg, 1 cal = 4.184 J) and marked `exact: true`; conventional ones
+(psi, mmHg, BTU) are marked `false`. Temperature converts **affinely** through
+kelvin, not by a scale factor. US and imperial volumes are separate units —
+there is no bare `gal`. Months and years are deliberately absent from the time
+units, because they have no fixed length.
+
+## What is deliberately refused
+
+A refusal is a result: a readable string saying what cannot be answered and
+why, not a thrown exception and not a confident number.
+
+- `Evaluate` never calls `eval()` or `new Function()`. It is a hand-written
+  tokenizer and precedence-climbing parser over a fixed grammar, and anything
+  outside that grammar — a property access, a semicolon, a string literal, a
+  hex literal — is refused with the character offset. Division by zero, and any
+  step producing `NaN` or `Infinity`, is refused rather than returned.
+- Percent change from zero, correlation of a constant series, a least-squares
+  line through vertical points, an IRR for cashflows that never change sign, a
+  temperature below absolute zero, a percentile the r6 convention does not
+  define, an IQR rule on data whose interquartile range is zero.
+- `NumberParse` validates grouping *before* stripping separators, so `1234.56`
+  under `de-DE` is refused rather than read as 123456.
+- `CurrencyConvert` has no network and no built-in rates. A live rate would make
+  the answer depend on the minute it ran.
+- `GeoPointInPolygon` refuses a ring spanning more than 180° of longitude
+  instead of reading it inside-out across the antimeridian.
+
+## Precision, honestly
+
+Money, rounding and unit factors are exact decimal or rational arithmetic.
+Statistics, regression, NPV/IRR and geodesy are IEEE-754 doubles, where sums use
+Neumaier compensation and variance is two-pass so the result does not depend on
+input order. `NumberFormat` and `NumberParse` are the one place where output
+depends on something other than the input: the glyphs come from the runtime's
+ICU/CLDR data, identical for a given runtime, not guaranteed across runtime
+versions. That caveat is in the tool's own description too.
+
+## Layout
+
+`src/lib/` holds the pure functions and is where the behaviour is tested;
+`src/index.ts` wraps them as tools. A bug in `divideRound` reads better as a
+failing unit than as a failing tool call.
+
+## Safety flags
+
+All twenty-two are `readOnly`, non-destructive, `scope: "internal"`, and declare
+no io capability, because none of them touches a file, a socket or a process.
+`packages/tool-math/src/index.test.ts` asserts that for every tool, so a future
+addition that quietly needs the network cannot slip in unnoticed.

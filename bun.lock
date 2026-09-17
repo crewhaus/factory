@@ -2211,6 +2211,19 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-docs": {
+      "name": "@crewhaus/tool-docs",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-document-ingest": {
       "name": "@crewhaus/tool-document-ingest",
       "version": "0.6.0",
@@ -2380,6 +2393,19 @@
         "@crewhaus/turn-state-machine": "workspace:*",
       },
     },
+    "packages/tool-math": {
+      "name": "@crewhaus/tool-math",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-mcp": {
       "name": "@crewhaus/tool-mcp",
       "version": "0.6.0",
@@ -2532,6 +2558,19 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/tool-secure": {
+      "name": "@crewhaus/tool-secure",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
       },
     },
     "packages/tool-sql": {
@@ -3191,6 +3230,8 @@
 
     "@crewhaus/tool-datetime": ["@crewhaus/tool-datetime@workspace:packages/tool-datetime"],
 
+    "@crewhaus/tool-docs": ["@crewhaus/tool-docs@workspace:packages/tool-docs"],
+
     "@crewhaus/tool-document-ingest": ["@crewhaus/tool-document-ingest@workspace:packages/tool-document-ingest"],
 
     "@crewhaus/tool-encode": ["@crewhaus/tool-encode@workspace:packages/tool-encode"],
@@ -3219,6 +3260,8 @@
 
     "@crewhaus/tool-loop-detection": ["@crewhaus/tool-loop-detection@workspace:packages/tool-loop-detection"],
 
+    "@crewhaus/tool-math": ["@crewhaus/tool-math@workspace:packages/tool-math"],
+
     "@crewhaus/tool-mcp": ["@crewhaus/tool-mcp@workspace:packages/tool-mcp"],
 
     "@crewhaus/tool-memory": ["@crewhaus/tool-memory@workspace:packages/tool-memory"],
@@ -3246,6 +3289,8 @@
     "@crewhaus/tool-schema-sanitizer": ["@crewhaus/tool-schema-sanitizer@workspace:packages/tool-schema-sanitizer"],
 
     "@crewhaus/tool-screen-capture": ["@crewhaus/tool-screen-capture@workspace:packages/tool-screen-capture"],
+
+    "@crewhaus/tool-secure": ["@crewhaus/tool-secure@workspace:packages/tool-secure"],
 
     "@crewhaus/tool-sql": ["@crewhaus/tool-sql@workspace:packages/tool-sql"],
 
