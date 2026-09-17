@@ -117,6 +117,8 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
     "cancel the command",
   ],
   todoWrite: ["todo", "task list", "track tasks", "checklist"],
+  base64Encode: ["base64", "encode as base64", "to base64"],
+  base64Decode: ["decode base64", "from base64"],
   runCommand: ["run a command", "execute", "run the build", "invoke the binary"],
   runPipeline: ["run these in order", "chain commands", "sequence of commands"],
   retry: ["retry", "try again", "flaky command", "backoff"],
@@ -932,6 +934,8 @@ export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object.freeze([
   "waitForOutput",
   "commandExists",
   "envInspect",
+  "base64Encode",
+  "base64Decode",
 ]);
 
 /**

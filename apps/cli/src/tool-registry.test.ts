@@ -1,3 +1,4 @@
+import { describe, expect, test } from "bun:test";
 /**
  * The registry-consistency floor.
  *
@@ -12,7 +13,8 @@
  * Adding a builtin without categorizing it fails (2). Listing a tool that
  * does not exist fails (1). Either way the failure names the key.
  */
-import { describe, expect, test } from "bun:test";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   CATEGORIES,
   allRegisteredTools,
@@ -91,5 +93,48 @@ describe("buildCategoryRows", () => {
       expect(row.title.length).toBeGreaterThan(0);
       expect(row.tools.length).toBeGreaterThan(0);
     }
+  });
+});
+
+/**
+ * The gap the checks above cannot see.
+ *
+ * Everything above compares the category registry against
+ * `CLI_RUNTIME_TOOL_KEYS`. Both are hand-maintained lists, so if a tool is
+ * left out of BOTH they agree with each other and say nothing is wrong. That
+ * happened: `base64Encode` and `base64Decode` existed in tool-encode, passed
+ * their own tests, and were unreachable from any spec because a key-extraction
+ * regex excluded digits.
+ *
+ * This asserts against the packages themselves rather than against another
+ * list: every tool a deterministic package EXPORTS must be registered. A tool
+ * that exists but cannot be switched on is not shipped.
+ */
+describe("every exported tool is reachable from a spec", () => {
+  const PACKAGES = [
+    "tool-text",
+    "tool-data",
+    "tool-encode",
+    "tool-datetime",
+    "tool-schema",
+    "tool-git",
+    "tool-fsx",
+    "tool-proc",
+  ];
+
+  test("no package exports a tool that is not wired", () => {
+    const repoRoot = join(import.meta.dir, "..", "..", "..");
+    const unreachable: Array<{ pkg: string; tool: string }> = [];
+    for (const pkg of PACKAGES) {
+      const source = join(repoRoot, "packages", pkg, "src", "index.ts");
+      if (!existsSync(source)) continue;
+      const text = readFileSync(source, "utf-8");
+      // Every `export const <name>: RegisteredTool` in the package entrypoint.
+      for (const m of text.matchAll(/^export const ([A-Za-z0-9_]+): RegisteredTool/gm)) {
+        const key = m[1] as string;
+        if (!CLI_RUNTIME_TOOL_KEYS.includes(key)) unreachable.push({ pkg, tool: key });
+      }
+    }
+    expect(unreachable).toEqual([]);
   });
 });

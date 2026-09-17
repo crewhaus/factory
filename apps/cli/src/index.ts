@@ -3682,6 +3682,9 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     codegraphCallers: codegraph.codegraphCallers,
     codegraphCallees: codegraph.codegraphCallees,
     codegraphImpact: codegraph.codegraphImpact,
+    // @crewhaus/tool-encode
+    base64Encode: encode.base64Encode,
+    base64Decode: encode.base64Decode,
     // @crewhaus/tool-proc
     runCommand: proc.runCommand,
     runPipeline: proc.runPipeline,

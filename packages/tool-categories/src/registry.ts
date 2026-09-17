@@ -138,6 +138,8 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "hash",
       "hmac",
       "checksum",
+      "base64Encode",
+      "base64Decode",
       "hexEncode",
       "hexDecode",
       "urlEncode",

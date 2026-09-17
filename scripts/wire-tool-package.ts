@@ -101,11 +101,14 @@ edit(
 edit(
   "packages/target-cli/src/index.ts",
   (s) => {
-    if (s.includes(`package: "${scope}"`)) return undefined;
+    // Per-KEY, not per-package: adding tools to a package that is already
+    // wired must still insert the new keys.
+    const absent = keys.filter((k) => !s.includes(`  ${k}: { package: "${scope}"`));
+    if (absent.length === 0) return undefined;
     const anchor =
       '  codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },';
     if (!s.includes(anchor)) throw new Error("target-cli BUILTIN_TOOL_MAP anchor moved");
-    const add = keys.map((k) => `  ${k}: { package: "${scope}", export: "${k}" },`).join("\n");
+    const add = absent.map((k) => `  ${k}: { package: "${scope}", export: "${k}" },`).join("\n");
     return s.replace(anchor, `${add}\n${anchor}`);
   },
   "BUILTIN_TOOL_MAP entries",
@@ -115,7 +118,16 @@ edit(
 edit(
   "apps/cli/src/index.ts",
   (s) => {
-    if (s.includes(`import("${scope}")`)) return undefined;
+    const missing = keys.filter(
+      (k) =>
+        !s.includes(
+          `    ${k}: ${pkgDir
+            .replace(/^tool-/, "")
+            .replace(/-([a-z])/g, (_m, c: string) => c.toUpperCase())}.${k},`,
+        ),
+    );
+    if (missing.length === 0) return undefined;
+    const alreadyImported = s.includes(`import("${scope}")`);
     const local = pkgDir
       .replace(/^tool-/, "")
       .replace(/-([a-z])/g, (_m, c: string) => c.toUpperCase());
@@ -123,22 +135,25 @@ edit(
     // in the destructuring, so the two lists stay aligned. Inserting the
     // import near the top while appending the binding at the end silently
     // pairs every tool package with the wrong module.
-    let out = s.replace(
-      /(\n(\s*)import\("@crewhaus\/tool-code-execution"\),[\s\S]*?)(\n\s*\]\);)/,
-      (_m, body: string, indent: string, close: string) =>
-        `${body}\n${indent}import("${scope}"),${close}`,
-    );
-    // Widen the destructuring that receives those imports, also at the end.
-    out = out.replace(
-      /(const \[[^\]]*?)(\s*\] =\s*await Promise\.all)/,
-      (_m, head: string, tail: string) =>
-        head.trimEnd().endsWith(",")
-          ? `${head}\n    ${local},${tail}`
-          : `${head},\n    ${local},${tail}`,
-    );
+    let out = s;
+    if (!alreadyImported) {
+      out = out.replace(
+        /(\n(\s*)import\("@crewhaus\/tool-code-execution"\),[\s\S]*?)(\n\s*\]\);)/,
+        (_m, body: string, indent: string, close: string) =>
+          `${body}\n${indent}import("${scope}"),${close}`,
+      );
+      // Widen the destructuring that receives those imports, also at the end.
+      out = out.replace(
+        /(const \[[^\]]*?)(\s*\] =\s*await Promise\.all)/,
+        (_m, head: string, tail: string) =>
+          head.trimEnd().endsWith(",")
+            ? `${head}\n    ${local},${tail}`
+            : `${head},\n    ${local},${tail}`,
+      );
+    }
     const anchor = "    codegraphImpact: codegraph.codegraphImpact,";
     if (!out.includes(anchor)) throw new Error("loadToolMap anchor moved");
-    const add = keys.map((k) => `    ${k}: ${local}.${k},`).join("\n");
+    const add = missing.map((k) => `    ${k}: ${local}.${k},`).join("\n");
     return out.replace(anchor, `${anchor}\n    // ${scope}\n${add}`);
   },
   "loadToolMap entries",
@@ -148,7 +163,8 @@ edit(
 edit(
   "apps/cli/src/tools-cli.ts",
   (s) => {
-    if (keys.every((k) => s.includes(`  "${k}",`))) return undefined;
+    const absentKeys = keys.filter((k) => !s.includes(`\n  "${k}",`));
+    if (absentKeys.length === 0) return undefined;
     // Anchor on the array itself, not on whatever happens to be its last
     // entry: the previous version keyed off "codegraphImpact" and silently
     // did nothing once another package had appended below it.
@@ -158,12 +174,13 @@ edit(
     const out = s.replace(
       listRe,
       (_m, head: string, body: string, close: string) =>
-        `${head}${body}\n${keys.map((k) => `  "${k}",`).join("\n")}${close}`,
+        `${head}${body}\n${absentKeys.map((k) => `  "${k}",`).join("\n")}${close}`,
     );
     if (out === s) throw new Error("CLI_RUNTIME_TOOL_KEYS was not updated");
     const anchor = '  todoWrite: ["todo", "task list", "track tasks", "checklist"],';
     if (!out.includes(anchor)) throw new Error("TOOL_KEYWORDS anchor moved");
     const add = manifest.tools
+      .filter((t) => absentKeys.includes(t.key))
       .map((t) => `  ${t.key}: [${t.keywords.map((w) => JSON.stringify(w)).join(", ")}],`)
       .join("\n");
     return out.replace(anchor, `${anchor}\n${add}`);

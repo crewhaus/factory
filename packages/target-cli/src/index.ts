@@ -291,6 +291,8 @@ export const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
   waitForOutput: { package: "@crewhaus/tool-proc", export: "waitForOutput" },
   commandExists: { package: "@crewhaus/tool-proc", export: "commandExists" },
   envInspect: { package: "@crewhaus/tool-proc", export: "envInspect" },
+  base64Encode: { package: "@crewhaus/tool-encode", export: "base64Encode" },
+  base64Decode: { package: "@crewhaus/tool-encode", export: "base64Decode" },
   codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },
   codegraphCallers: { package: "@crewhaus/tool-codegraph", export: "codegraphCallers" },
   codegraphCallees: { package: "@crewhaus/tool-codegraph", export: "codegraphCallees" },
