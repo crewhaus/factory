@@ -86,6 +86,7 @@
     "@crewhaus/migration-runner": "workspace:*",
     "@crewhaus/plugin-loader": "workspace:*",
     "@crewhaus/preflight": "workspace:*",
+    "@crewhaus/qr-code": "workspace:*",
     "@crewhaus/plugin-registry": "workspace:*",
     "@crewhaus/plugin-sdk": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
