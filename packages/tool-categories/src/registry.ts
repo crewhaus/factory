@@ -87,8 +87,27 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     tools: ["webFetch", "webSearch"],
   },
   http: {
-    title: "Make arbitrary HTTP requests against allow-listed origins",
-    tools: ["fetch"],
+    title: "HTTP: a single fetch, plus pagination, GraphQL, downloads, webhooks, DNS and TLS",
+    tools: [
+      "fetch",
+      "httpRequest",
+      "httpPaginate",
+      "graphqlQuery",
+      "httpBatch",
+      "downloadFile",
+      "headRequest",
+      "urlReachable",
+      "linkCheck",
+      "httpWaitFor",
+      "sseRead",
+      "webhookSign",
+      "webhookVerify",
+      "dnsLookup",
+      "tlsInspect",
+      "robotsCheck",
+      "sitemapParse",
+      "feedParse",
+    ],
   },
 
   // ---- leaf categories: code intelligence ----
@@ -281,6 +300,54 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     ],
   },
 
+  state: {
+    title:
+      "Durable harness state: key-value, counters, checkpoints, journals, notes and lexical search",
+    tools: [
+      "kvSet",
+      "kvGet",
+      "kvDelete",
+      "kvList",
+      "counterIncrement",
+      "counterGet",
+      "checkpointSave",
+      "checkpointLoad",
+      "checkpointList",
+      "journalAppend",
+      "journalRead",
+      "blackboardPost",
+      "blackboardRead",
+      "noteWrite",
+      "noteSearch",
+      "indexBuild",
+      "indexSearch",
+      "stateExport",
+      "stateImport",
+      "dedupeMark",
+    ],
+  },
+
+  crewhaus: {
+    title:
+      "Supervise CrewHaus harnesses: validate specs, check compiles, preflight, audit and compare eval runs",
+    tools: [
+      "specValidate",
+      "specCompileCheck",
+      "specSummarize",
+      "specDiff",
+      "toolInventory",
+      "permissionAudit",
+      "preflightRun",
+      "harnessInventory",
+      "bundleFreshness",
+      "auditVerify",
+      "evalBaselineCompare",
+      "sessionSummarize",
+      "traceQuery",
+      "costSummarize",
+    ],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -289,6 +356,10 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   filesystem: {
     title: "Everything that touches files: the core five plus trees, hashes, copies and archives",
     includes: ["fs", "fsx"],
+  },
+  memory: {
+    title: "Everything a harness remembers between turns and between runs",
+    includes: ["todo", "state"],
   },
   network: {
     title: "Everything that reaches the network",

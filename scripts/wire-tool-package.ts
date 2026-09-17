@@ -70,7 +70,31 @@ function edit(rel: string, transform: (s: string) => string | undefined, why: st
 edit(
   "packages/tool-categories/src/registry.ts",
   (s) => {
-    if (s.includes(`  ${manifest.category.name}: {`)) return undefined;
+    // Per-KEY, like the other guards: when the category already exists, the
+    // new tools still have to be added to it. Keying on the category name
+    // alone silently dropped every tool added to an existing category.
+    const existing = new RegExp(`  ${manifest.category.name}: \\{[\\s\\S]*?\\n  \\},`).exec(s);
+    if (existing !== null) {
+      const missingHere = keys.filter((k) => !existing[0].includes(`"${k}"`));
+      if (missingHere.length === 0) return undefined;
+      const insert = missingHere.map((k) => `      ${JSON.stringify(k)},`).join("\n");
+      // The tools array may be written on one line or across several; handle
+      // both rather than silently matching neither.
+      const multiline = /\n {4}\],/.test(existing[0]);
+      const grown = multiline
+        ? existing[0].replace(/(\n {4}\],)/, `\n${insert}$1`)
+        : existing[0].replace(
+            /tools: \[([^\]]*)\],/,
+            (_m, body: string) =>
+              `tools: [\n${body
+                .split(",")
+                .map((t) => t.trim())
+                .filter((t) => t.length > 0)
+                .map((t) => `      ${t},`)
+                .join("\n")}\n${insert}\n    ],`,
+          );
+      return s.replace(existing[0], grown);
+    }
     const toolLines = keys.map((k) => `      ${JSON.stringify(k)},`).join("\n");
     const block = [
       `  ${manifest.category.name}: {`,
