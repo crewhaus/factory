@@ -2466,6 +2466,22 @@ try {
   // Bun.serve on the configured port serving a minimal status JSON
   // endpoint at /status. Full Studio-UI hosting is a follow-up; this
   // first slice gives operators visibility into the daemon's state.
+  //
+  // BOUND TO LOOPBACK, EXPLICITLY. `Bun.serve` with no `hostname` binds the
+  // wildcard — `server.hostname` then reports "localhost", which is a
+  // misleading getter, not the bound interface — so omitting it published an
+  // unauthenticated status page to the whole network. Everything else about
+  // this port says local: `service-setup` documents it "Never tunnelled" and
+  // points a tunnel at the events port instead, the `gateway:` block is
+  // `.strict()` with no bind field, no image publishes it (the channel
+  // Dockerfile is `EXPOSE 3000`, the events port), and the only in-repo
+  // reader dials 127.0.0.1. The listener now matches that.
+  //
+  // This is the one listener in a channel daemon with no auth of its own:
+  // the public webhook port signature-verifies every adapter route, and
+  // control.v1 is bearer-gated on its own port. So loopback is the whole
+  // boundary here, and widening it is a feature that would have to bring a
+  // credential with it — not a flag.
   const gatewayBoot = ir.gateway
     ? `
   // Phase 3 §3.4 — control-UI gateway (status endpoint)
@@ -2477,6 +2493,7 @@ try {
   // can bump them; this endpoint only reads them.
   const __gatewayServer = Bun.serve({
     port: __gatewayPort,
+    hostname: "127.0.0.1",
     fetch: (req) => {
       const url = new URL(req.url);
       if (url.pathname === "/status") {
