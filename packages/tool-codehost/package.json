@@ -1,0 +1,28 @@
+{
+  "name": "@crewhaus/tool-codehost",
+  "version": "0.6.0",
+  "type": "module",
+  "description": "Deterministic code-hosting tools: pull requests, issues, reviews, checks, releases and CI runs over the GitHub and GitLab APIs",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": { "test": "bun test src" },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": { "@crewhaus/tool-executor": "workspace:*" },
+  "license": "Apache-2.0",
+  "author": { "name": "Max Meier", "email": "max@crewhaus.ai", "url": "https://crewhaus.ai" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/tool-codehost"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-codehost#readme",
+  "bugs": { "url": "https://github.com/crewhaus/factory/issues" },
+  "publishConfig": { "access": "public" },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

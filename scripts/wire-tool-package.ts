@@ -74,6 +74,13 @@ edit(
     // new tools still have to be added to it. Keying on the category name
     // alone silently dropped every tool added to an existing category.
     const existing = new RegExp(`  ${manifest.category.name}: \\{[\\s\\S]*?\\n  \\},`).exec(s);
+    if (existing !== null && existing[0].includes("includes:")) {
+      // A category is a leaf OR a roll-up, never both. Silently doing nothing
+      // here is how tool-code's twenty tools ended up registered nowhere.
+      throw new Error(
+        `category "${manifest.category.name}" already exists as a roll-up, which cannot own tools — pick a different leaf name`,
+      );
+    }
     if (existing !== null) {
       const missingHere = keys.filter((k) => !existing[0].includes(`"${k}"`));
       if (missingHere.length === 0) return undefined;
