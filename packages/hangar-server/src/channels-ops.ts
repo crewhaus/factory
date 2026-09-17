@@ -885,10 +885,11 @@ export const channelSynthetic: M3Handler = async (ctx) => {
  * with no bind field, so an operator cannot move it, and the surface carries
  * no auth at all.
  *
- * (The emitted daemon's `Bun.serve` omits `hostname` and so currently binds
- * the wildcard, which makes the port reachable across the LAN in fact. That
- * is an omission, not a licence: this URL states the intended address, and
- * nothing here should be rebuilt on top of the accident.)
+ * (Before the emitter passed `hostname` explicitly, its `Bun.serve` bound
+ * the wildcard and the port really was reachable across the LAN. That was an
+ * omission rather than a licence, and it is fixed — but a daemon compiled
+ * before the fix keeps the old bind until it is recompiled, so this URL
+ * states the intended address either way.)
  *
  * So the address is right for a viewer sitting at the machine and wrong for
  * everyone else — and since `crewhaus hangar --lan`, "everyone else"

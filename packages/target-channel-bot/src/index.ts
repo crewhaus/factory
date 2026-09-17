@@ -2482,6 +2482,12 @@ try {
   // control.v1 is bearer-gated on its own port. So loopback is the whole
   // boundary here, and widening it is a feature that would have to bring a
   // credential with it — not a flag.
+  //
+  // IPv4 only, which is fine: a machine whose resolver answers `::1` first
+  // for `localhost` still reaches this, because clients fall back to IPv4.
+  // Only an explicit `http://[::1]:<port>/` fails, and nothing addresses it
+  // that way — Hangar dials the 127.0.0.1 literal and the banner below
+  // prints `localhost`.
   const gatewayBoot = ir.gateway
     ? `
   // Phase 3 §3.4 — control-UI gateway (status endpoint)
