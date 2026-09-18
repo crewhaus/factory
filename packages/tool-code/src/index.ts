@@ -30,6 +30,7 @@
  * it does not handle. A tool that overstates its coverage is worse than one
  * that is narrow and says so.
  */
+import { realpathSync } from "node:fs";
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -85,7 +86,7 @@ import {
   scanTodos,
 } from "./lib/scan";
 import { parseStackTrace } from "./lib/stack";
-import { type RunnerName, parseTestOutput } from "./lib/tests";
+import { type RunnerName, parseTestOutput, relativizeFailures } from "./lib/tests";
 import {
   DEFAULT_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
@@ -396,6 +397,23 @@ function withFilters(
   return out;
 }
 
+/**
+ * The directory a test run happened in, in both spellings it can have.
+ *
+ * macOS reaches its temporary directory through a symlink (`/var` to
+ * `/private/var`), so a runner may print either form; both are offered so a
+ * path under the workspace is shortened whichever one it used.
+ */
+function workspaceRoots(): string[] {
+  const cwd = process.cwd();
+  try {
+    const real = realpathSync(cwd);
+    return real === cwd ? [cwd] : [cwd, real];
+  } catch {
+    return [cwd];
+  }
+}
+
 export const runTests: RegisteredTool = buildTool({
   name: "RunTests",
   description:
@@ -466,6 +484,9 @@ export const runTests: RegisteredTool = buildTool({
     // and pytest, which report on stderr.
     let outcome = parseTestOutput(run.stdout, runner);
     if (!outcome.parsed) outcome = parseTestOutput(`${run.stdout}\n${run.stderr}`, runner);
+    // Runners print the failing file however they like — absolute on one
+    // platform, relative on another. Report the path a caller would open.
+    outcome = relativizeFailures(outcome, workspaceRoots());
 
     const capped = capList(outcome.failures, input.maxFailures ?? DEFAULT_MAX_FAILURES);
     // The raw tail is also included when the run counted failures but the
@@ -562,7 +583,10 @@ export const testFailureSummary: RegisteredTool = buildTool({
   }),
   ...READ_FILES,
   execute: async (input) => {
-    const outcome = parseTestOutput(input.output, input.runner ?? "auto");
+    const outcome = relativizeFailures(
+      parseTestOutput(input.output, input.runner ?? "auto"),
+      workspaceRoots(),
+    );
     const capped = capList(outcome.failures, input.maxFailures ?? DEFAULT_MAX_FAILURES);
     return json({
       runner: outcome.runner,

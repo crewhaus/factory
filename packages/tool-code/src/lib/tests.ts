@@ -615,6 +615,40 @@ export function detectRunnerFromOutput(text: string): RunnerName | undefined {
   return undefined;
 }
 
+/**
+ * Rewrite each failure's file path to be relative to `roots`.
+ *
+ * Runners disagree about whether they print an absolute or a relative path,
+ * and the same runner disagrees with itself across platforms: bun printed
+ * `a.test.ts` on macOS and `/tmp/xxxx/a.test.ts` on Linux for the same
+ * suite. A caller wants the path it would open, and an absolute one also
+ * puts the machine's layout into a result a model may read.
+ *
+ * Several roots may be given because macOS reaches its temporary directory
+ * through a symlink, so the run's directory has two equally valid spellings.
+ * A path under none of them is left exactly as the runner printed it.
+ */
+export function relativizeFailures(
+  outcome: TestOutcome,
+  roots: ReadonlyArray<string>,
+): TestOutcome {
+  const prefixes = roots
+    .map(toPosix)
+    .filter((r) => r !== "")
+    .map((r) => (r.endsWith("/") ? r : `${r}/`));
+  const shorten = (file: string): string => {
+    const posix = toPosix(file);
+    for (const prefix of prefixes) if (posix.startsWith(prefix)) return posix.slice(prefix.length);
+    return posix;
+  };
+  return {
+    ...outcome,
+    failures: outcome.failures.map((failure) =>
+      failure.file === undefined ? failure : { ...failure, file: shorten(failure.file) },
+    ),
+  };
+}
+
 /** Parse output from a named runner, or from whichever one it looks like. */
 export function parseTestOutput(text: string, runner: RunnerName | "auto"): TestOutcome {
   const chosen = runner === "auto" ? detectRunnerFromOutput(text) : runner;

@@ -63,6 +63,7 @@ import {
   parseJestJson,
   parsePytest,
   parseTestOutput,
+  relativizeFailures,
   splitMessageAndStack,
 } from "./lib/tests";
 
@@ -1074,5 +1075,58 @@ describe("import graph", () => {
     const graph = buildImportGraph(input);
     expect(graph.cycles).toHaveLength(1);
     expect(graph.cycles[0]).toHaveLength(count);
+  });
+});
+
+describe("relativizeFailures", () => {
+  const outcome = {
+    runner: "bun",
+    passed: 1,
+    failed: 1,
+    skipped: 0,
+    total: 2,
+    parsed: true,
+    failures: [
+      {
+        name: "math > breaks",
+        file: "/tmp/crewhaus-abc/a.test.ts",
+        line: 3,
+        message: "x",
+        stack: [],
+      },
+    ],
+  };
+
+  test("an absolute path under the run directory becomes the path a caller would open", () => {
+    // bun printed `a.test.ts` on macOS and the absolute form on Linux for the
+    // same suite, so the test asserted one platform's answer.
+    expect(relativizeFailures(outcome, ["/tmp/crewhaus-abc"]).failures[0]?.file).toBe("a.test.ts");
+  });
+
+  test("a path that is already relative is left alone", () => {
+    const relative = { ...outcome, failures: [{ ...outcome.failures[0], file: "a.test.ts" }] };
+    expect(relativizeFailures(relative, ["/tmp/crewhaus-abc"]).failures[0]?.file).toBe("a.test.ts");
+  });
+
+  test("a path outside the run directory is left exactly as the runner printed it", () => {
+    expect(relativizeFailures(outcome, ["/somewhere/else"]).failures[0]?.file).toBe(
+      "/tmp/crewhaus-abc/a.test.ts",
+    );
+  });
+
+  test("either spelling of a symlinked temporary directory is shortened", () => {
+    // macOS reaches /var through /private/var, so a run has two valid roots.
+    const mac = {
+      ...outcome,
+      failures: [{ ...outcome.failures[0], file: "/private/var/f/a.test.ts" }],
+    };
+    expect(relativizeFailures(mac, ["/var/f", "/private/var/f"]).failures[0]?.file).toBe(
+      "a.test.ts",
+    );
+  });
+
+  test("a failure with no file is untouched", () => {
+    const noFile = { ...outcome, failures: [{ name: "x", message: "y", stack: [] }] };
+    expect(relativizeFailures(noFile, ["/tmp"]).failures[0]?.file).toBeUndefined();
   });
 });

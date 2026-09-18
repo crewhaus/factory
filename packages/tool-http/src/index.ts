@@ -1637,7 +1637,27 @@ export const dnsLookup: RegisteredTool = buildTool({
   },
 });
 
+/**
+ * A seam for the record resolvers, so a test does not need a real one.
+ *
+ * `_setDnsLookup` in `./net` does this for the SSRF guard's lookup, and this
+ * is the same idea for the query resolvers. Without it, the only way to
+ * exercise the shared-budget path was to hope the real resolver took longer
+ * than a millisecond — which it did on a developer's machine and did not on
+ * CI, where `.invalid` is refused instantly.
+ *
+ * Production never sets this; it is `undefined` and the real resolvers run.
+ */
+export type DnsRecordResolver = (type: string, host: string) => Promise<unknown>;
+let recordResolver: DnsRecordResolver | undefined;
+
+/** Test seam. Pass `undefined` to restore the real resolvers. */
+export function _setDnsRecordResolver(fn: DnsRecordResolver | undefined): void {
+  recordResolver = fn;
+}
+
 async function resolveOne(type: string, host: string): Promise<unknown> {
+  if (recordResolver !== undefined) return recordResolver(type, host);
   switch (type) {
     case "A":
       return (await resolve4(host)).sort(byString);

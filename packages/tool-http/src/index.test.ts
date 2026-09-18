@@ -37,6 +37,7 @@ import {
   __setPrivateHostsAllowedForTest,
   _resetHttpConfig,
   _setDnsLookup,
+  _setDnsRecordResolver,
   dnsLookup,
   downloadFile,
   feedParse,
@@ -1469,11 +1470,20 @@ describe("DnsLookup / TlsInspect", () => {
 
   test("DnsLookup spends ONE budget across every record type it was asked for", async () => {
     registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
+    // The first lookup must outlast the budget for the shared-deadline path
+    // to be exercised at all. Hoping a real resolver is slower than a
+    // millisecond is not a test: on CI `.invalid` is refused instantly, so
+    // A reported ENOTFOUND and the assertion below failed for a reason that
+    // had nothing to do with budgets.
+    _setDnsRecordResolver(
+      async () => await new Promise((resolve) => setTimeout(() => resolve([]), 50)),
+    );
     const result = await run(dnsLookup, {
       name: "dns-budget.invalid",
       types: ["A", "AAAA", "CNAME", "MX", "NS", "TXT"],
       timeoutMs: 1,
     });
+    _setDnsRecordResolver(undefined);
     // The budget is spent by the first type, so the other five are never
     // issued. Giving each type its own copy of the timeout — which is what a
     // per-call `withTimeout` does — would instead have run all six, and the
