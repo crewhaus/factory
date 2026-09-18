@@ -1,0 +1,28 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    {
+      "path": "../errors"
+    },
+    {
+      "path": "../tool-builder"
+    },
+    {
+      "path": "../tool-catalog"
+    },
+    {
+      "path": "../tool-text"
+    },
+    {
+      "path": "../tool-code"
+    },
+    {
+      "path": "../tool-executor"
+    }
+  ],
+  "include": ["src/**/*"]
+}

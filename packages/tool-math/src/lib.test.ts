@@ -59,6 +59,24 @@ import {
   variance,
 } from "./lib/stats";
 import {
+  MAD_NORMAL_SCALE,
+  PSI_BANDS,
+  TWO_SIDED_Z,
+  Z_95,
+  binCounts,
+  cohensKappa,
+  mannWhitneyU,
+  medianAbsoluteDeviation,
+  median as medianOrNull,
+  normalCdf,
+  normalUpperTail,
+  populationStabilityIndex,
+  psiOverEdges,
+  quantile,
+  trimmedMean,
+  wilsonScoreInterval,
+} from "./lib/stats-kernel";
+import {
   convertTemperature,
   convertUnits,
   fromKelvin,
@@ -1275,5 +1293,539 @@ describe("numfmt", () => {
   test("text that is not a number is refused with what it reduced to", () => {
     expect(() => parseLocaleNumber("abc", "en-US")).toThrow(/is not a number/);
     expect(() => parseLocaleNumber("1.2.3", "en-US")).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// stats-kernel — the nonparametric kernel four CI gates share.
+//
+// Every expectation below is either a published value with its source named,
+// or a number derived independently in the test itself (the Mann-Whitney exact
+// p enumerates all 252 splits rather than trusting the formula it checks).
+// A pin without a provenance is a pin that gets "fixed" to match a bug.
+// ---------------------------------------------------------------------------
+
+describe("stats-kernel — the normal distribution", () => {
+  test("reproduces the standard tabulated values of Phi", () => {
+    // Phi(0) is exact by construction: the two constant terms are in 2:1 ratio.
+    expect(normalCdf(0)).toBe(0.5);
+    expect(normalCdf(1)).toBeCloseTo(0.8413447460685429, 15);
+    expect(normalCdf(1.96)).toBeCloseTo(0.9750021048517795, 15);
+    expect(normalCdf(2)).toBeCloseTo(0.9772498680518208, 15);
+    expect(normalCdf(3)).toBeCloseTo(0.9986501019683699, 15);
+  });
+
+  test("the exported critical values are the ones that put Phi on the round number", () => {
+    // 1.96 is the rounding everyone writes; it is not the 97.5th percentile.
+    expect(normalCdf(Z_95)).toBeCloseTo(0.975, 15);
+    expect(normalCdf(1.96)).not.toBeCloseTo(0.975, 7);
+    expect(normalCdf(TWO_SIDED_Z["0.90"])).toBeCloseTo(0.95, 15);
+    expect(normalCdf(TWO_SIDED_Z["0.99"])).toBeCloseTo(0.995, 15);
+  });
+
+  test("the upper tail keeps its digits where 1 - cdf would have none left", () => {
+    // 1 - 0.99999999999999999999999 is 0 in a double; this must not be.
+    expect(normalUpperTail(10)).toBeGreaterThan(0);
+    // References from 0.5*erfc(-z/sqrt(2)) in arbitrary precision. The
+    // rational branch holds ~1e-11 relative; the continued fraction past 7.07
+    // holds ~1e-8, which is why the two tolerances differ.
+    expect(normalUpperTail(5) / 2.866515718791945e-7).toBeCloseTo(1, 9);
+    expect(normalUpperTail(10) / 7.619853024160593e-24).toBeCloseTo(1, 8);
+    // Past 37 sigma a double underflows anyway; 0 is the honest answer.
+    expect(normalUpperTail(40)).toBe(0);
+  });
+
+  test("the two tails are complements and the left one is computed directly", () => {
+    for (const z of [-4, -1.5, -0.25, 0, 0.25, 1.5, 4]) {
+      expect(normalUpperTail(z) + normalCdf(z)).toBeCloseTo(1, 15);
+    }
+    expect(normalCdf(-3)).toBeCloseTo(0.0013498980316300957, 16);
+  });
+
+  test("a non-finite z is a caller bug, not a p-value", () => {
+    expect(() => normalUpperTail(Number.NaN)).toThrow(/finite/);
+    expect(() => normalUpperTail(Number.POSITIVE_INFINITY)).toThrow(/finite/);
+  });
+});
+
+describe("stats-kernel — robust location and spread", () => {
+  test("an empty sample returns the null sentinel, never NaN", () => {
+    expect(medianOrNull([])).toBeNull();
+    expect(quantile([], 0.5)).toBeNull();
+    expect(medianAbsoluteDeviation([])).toBeNull();
+    expect(trimmedMean([], 0.1)).toBeNull();
+  });
+
+  test("a single observation is a location without a spread, and says so", () => {
+    expect(medianOrNull([7])).toBe(7);
+    expect(quantile([7], 0.9)).toBe(7);
+    expect(trimmedMean([7], 0.25)).toBe(7);
+    const mad = medianAbsoluteDeviation([7]);
+    expect(mad?.centre).toBe(7);
+    expect(mad?.mad).toBe(0);
+  });
+
+  test("quantile is pinned to R-7, the convention the four consumers compare under", () => {
+    const ten = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    // R quantile(1:10, .25, type=7) == 3.25; type=6 would say 2.75.
+    expect(quantile(ten, 0.25)).toBeCloseTo(3.25, 12);
+    expect(quantile(ten, 0.5)).toBe(5.5);
+    expect(quantile(ten, 0)).toBe(1);
+    expect(quantile(ten, 1)).toBe(10);
+    // Same answer as the r7 branch of ./lib/stats, because it IS that branch.
+    expect(quantile(ten, 0.25)).toBe(percentile(ten, 0.25, "r7"));
+  });
+
+  test("a fraction outside 0..1 is a caller bug", () => {
+    expect(() => quantile([1, 2, 3], 1.5)).toThrow(/between 0 and 1/);
+  });
+
+  test("MAD reproduces the standard worked example", () => {
+    // [1,1,2,2,4,6,9] -> median 2, deviations [1,1,0,0,2,4,7], median 1.
+    const mad = medianAbsoluteDeviation([1, 1, 2, 2, 4, 6, 9]);
+    expect(mad?.centre).toBe(2);
+    expect(mad?.mad).toBe(1);
+    expect(mad?.scale).toBe(MAD_NORMAL_SCALE);
+    expect(mad?.scaled).toBeCloseTo(1.482602218505602, 15);
+    // 1 / Phi^-1(3/4): the constant is checkable against the CDF above.
+    expect(normalCdf(1 / MAD_NORMAL_SCALE)).toBeCloseTo(0.75, 15);
+  });
+
+  test("all-identical values give a real zero spread, not a sentinel", () => {
+    const mad = medianAbsoluteDeviation([4, 4, 4, 4, 4]);
+    expect(mad?.mad).toBe(0);
+    expect(mad?.scaled).toBe(0);
+    // More than half identical is enough; the two outliers cannot move it.
+    expect(medianAbsoluteDeviation([4, 4, 4, 4, 900, 901])?.mad).toBe(0);
+  });
+
+  test("trimmedMean follows R's mean(x, trim=) exactly", () => {
+    const d = [1, 2, 3, 4, 5, 6, 7, 8, 9, 100];
+    expect(trimmedMean(d, 0)).toBe(14.5);
+    // R: mean(c(1:9,100), trim = 0.1) == 5.5 — floor(10*0.1)=1 cut per tail.
+    expect(trimmedMean(d, 0.1)).toBe(5.5);
+    expect(trimmedMean(d, 0.2)).toBe(5.5);
+    // R returns the median at trim >= 0.5 rather than dividing by zero.
+    expect(trimmedMean(d, 0.5)).toBe(5.5);
+    expect(trimmedMean(d, 0.5)).toBe(medianOrNull(d));
+  });
+
+  test("the trim fraction is per tail and floors, so 0.19 of 10 cuts one", () => {
+    const d = [1, 2, 3, 4, 5, 6, 7, 8, 9, 100];
+    expect(trimmedMean(d, 0.19)).toBe(trimmedMean(d, 0.1));
+    expect(() => trimmedMean(d, 0.6)).toThrow(/between 0 and 0.5/);
+    expect(() => trimmedMean(d, -0.1)).toThrow(/between 0 and 0.5/);
+  });
+});
+
+describe("stats-kernel — Mann-Whitney U", () => {
+  test("an empty sample yields nulls and a reason, not a p-value", () => {
+    const r = mannWhitneyU([], [1, 2, 3]);
+    expect(r.u).toBeNull();
+    expect(r.z).toBeNull();
+    expect(r.p).toBeNull();
+    expect(r.normalApproximationValid).toBe(false);
+    expect(r.note).toMatch(/one sample is empty/);
+  });
+
+  test("every observation tied: U lands on its null mean and there is no p", () => {
+    const r = mannWhitneyU([5, 5, 5, 5], [5, 5, 5]);
+    expect(r.u1).toBe(6);
+    expect(r.mu).toBe(6);
+    expect(r.sigma).toBe(0);
+    expect(r.z).toBeNull();
+    expect(r.p).toBeNull();
+    expect(r.tieGroups).toBe(1);
+    expect(r.note).toMatch(/tied/);
+    expect(Number.isNaN(r.p as unknown as number)).toBe(false);
+  });
+
+  test("complete separation, 5 vs 5, matches the closed form by hand", () => {
+    const r = mannWhitneyU([1, 2, 3, 4, 5], [6, 7, 8, 9, 10]);
+    expect(r.rankSum1).toBe(15);
+    expect(r.u1).toBe(0); // 15 - 5*6/2
+    expect(r.u2).toBe(25);
+    expect(r.u).toBe(0);
+    expect(r.mu).toBe(12.5);
+    expect(r.sigma).toBeCloseTo(Math.sqrt(275 / 12), 12);
+    expect(r.tieGroups).toBe(0);
+    // z = (0 - 12.5 + 0.5) / 4.787135... with the continuity correction on.
+    expect(r.z).toBeCloseTo(-2.5067182457620487, 12);
+    expect(r.p).toBeCloseTo(0.012185780355344763, 12);
+  });
+
+  test("the normal p is wrong by half at 5 vs 5, against the exact distribution", () => {
+    // Enumerate all C(10,5)=252 ways to split the pooled ranks, and count how
+    // many are at least as extreme as complete separation. This is the exact
+    // null distribution, derived here rather than quoted, so the size of the
+    // approximation's error cannot drift without this failing.
+    const pooled = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let total = 0;
+    let atLeastAsExtreme = 0;
+    const walk = (start: number, chosen: number[]): void => {
+      if (chosen.length === 5) {
+        total++;
+        const rest = pooled.filter((v) => !chosen.includes(v));
+        let u = 0;
+        for (const x of chosen) for (const y of rest) u += x > y ? 1 : 0;
+        if (Math.min(u, 25 - u) <= 0) atLeastAsExtreme++;
+        return;
+      }
+      for (let i = start; i < pooled.length; i++) walk(i + 1, [...chosen, pooled[i] as number]);
+    };
+    walk(0, []);
+    expect(total).toBe(252);
+    const exact = atLeastAsExtreme / total;
+    expect(exact).toBeCloseTo(2 / 252, 15);
+
+    const approx = mannWhitneyU([1, 2, 3, 4, 5], [6, 7, 8, 9, 10]).p as number;
+    expect(approx / exact).toBeCloseTo(1.535, 3); // 54% too large
+    expect(mannWhitneyU([1, 2, 3, 4, 5], [6, 7, 8, 9, 10]).normalApproximationValid).toBe(false);
+  });
+
+  test("the tie correction shrinks sigma by the amount the formula says", () => {
+    // a=[1,2,3,4] b=[3,4,5,6]. Pooled 1,2,3,3,4,4,5,6 -> midranks
+    // 1,2,3.5,3.5,5.5,5.5,7,8. R1 = 1+2+3.5+5.5 = 12, U1 = 12 - 10 = 2.
+    // Two tie groups of 2: SUM(t^3-t) = 12.
+    // sigma^2 = (16/12)*(9 - 12/56) = 11.714285714...
+    const r = mannWhitneyU([1, 2, 3, 4], [3, 4, 5, 6]);
+    expect(r.rankSum1).toBe(12);
+    expect(r.u1).toBe(2);
+    expect(r.u2).toBe(14);
+    expect(r.tieGroups).toBe(2);
+    expect(r.sigma).toBeCloseTo(3.422613871631697, 12);
+    // Uncorrected it would be sqrt(4*4*9/12) = 3.4641..., i.e. 1.2% wider.
+    expect(r.sigma as number).toBeLessThan(Math.sqrt((4 * 4 * 9) / 12));
+    expect(r.z).toBeCloseTo(-1.6069589519246381, 12);
+    expect(r.p).toBeCloseTo(0.10806337293756854, 12);
+  });
+
+  test("the continuity correction is a knob, and it moves p toward 'no change'", () => {
+    const on = mannWhitneyU([1, 2, 3, 4], [3, 4, 5, 6]);
+    const off = mannWhitneyU([1, 2, 3, 4], [3, 4, 5, 6], { continuityCorrection: false });
+    expect(off.z).toBeCloseTo(-1.7530461293723325, 12);
+    expect(off.p).toBeCloseTo(0.07959408927927625, 12);
+    expect(on.p as number).toBeGreaterThan(off.p as number);
+    expect(on.continuityCorrection).toBe(true);
+    expect(off.continuityCorrection).toBe(false);
+  });
+
+  test("z is signed from sample 1 but the two-sided p is direction-free", () => {
+    const forward = mannWhitneyU([1, 2, 3, 4], [3, 4, 5, 6]);
+    const reversed = mannWhitneyU([3, 4, 5, 6], [1, 2, 3, 4]);
+    expect(forward.z as number).toBeLessThan(0);
+    expect(reversed.z as number).toBeGreaterThan(0);
+    expect(forward.z).toBeCloseTo(-(reversed.z as number), 12);
+    expect(forward.p).toBeCloseTo(reversed.p as number, 15);
+    expect(forward.u).toBe(reversed.u);
+  });
+
+  test("eight per sample is where the approximation is called usable", () => {
+    const a = [1, 2, 3, 4, 5, 6, 7, 8];
+    const b = [9, 10, 11, 12, 13, 14, 15, 16];
+    expect(mannWhitneyU(a, b).normalApproximationValid).toBe(true);
+    expect(mannWhitneyU(a.slice(1), b).normalApproximationValid).toBe(false);
+    expect(mannWhitneyU(a.slice(1), b).note).toMatch(/below the 8-per-sample/);
+  });
+
+  test("identical samples sit on the null and report p = 1, not 0", () => {
+    const r = mannWhitneyU([1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(r.u1).toBe(32);
+    expect(r.mu).toBe(32);
+    expect(r.p).toBe(1);
+  });
+
+  test("a non-finite observation is refused rather than ranked", () => {
+    expect(() => mannWhitneyU([1, Number.NaN], [2, 3])).toThrow(/finite/);
+    expect(() => mannWhitneyU([1, 2], [Number.POSITIVE_INFINITY, 3])).toThrow(/sample2/);
+  });
+});
+
+describe("stats-kernel — Wilson score interval", () => {
+  test("three failures in five runs is not 60%", () => {
+    const ci = wilsonScoreInterval(3, 5);
+    expect(ci?.pointEstimate).toBe(0.6);
+    expect(ci?.lower).toBeCloseTo(0.2307242812760128, 12);
+    expect(ci?.upper).toBeCloseTo(0.882379225767352, 12);
+    // The interval spans "mildly annoying" and "the test is broken".
+    expect(ci?.width).toBeGreaterThan(0.6);
+  });
+
+  test("reproduces the two intervals other packages in this repo already pin", () => {
+    // @crewhaus/model-plan floor.test.ts: wilsonLowerBound(0.8, 30, 1.959964) ~ 0.6269
+    expect(wilsonScoreInterval(24, 30, 1.959964)?.lower).toBeCloseTo(0.6269, 4);
+    // @crewhaus/eval-runner stats.ts header: n=8 at p=1.0 gives [0.68, 1.0]
+    const perfect = wilsonScoreInterval(8, 8);
+    expect(perfect?.lower).toBeCloseTo(0.6756, 4);
+    expect(perfect?.upper).toBe(1);
+  });
+
+  test("stays inside [0,1] where the Wald interval degenerates to a point", () => {
+    const allPass = wilsonScoreInterval(10, 10);
+    expect(allPass?.lower).toBeCloseTo(0.7224672001371107, 12);
+    const allFail = wilsonScoreInterval(0, 10);
+    expect(allFail?.upper).toBeCloseTo(0.2775327998628892, 12);
+    // Exactly 1 and exactly 0, not 0.9999999999999999: a gate asking "can this
+    // still fail?" compares against the endpoint.
+    expect(allPass?.upper).toBe(1);
+    expect(allFail?.lower).toBe(0);
+    for (const n of [1, 2, 3, 5, 8, 13, 21, 34, 100, 1000]) {
+      expect(wilsonScoreInterval(n, n)?.upper).toBe(1);
+      expect(wilsonScoreInterval(0, n)?.lower).toBe(0);
+    }
+  });
+
+  test("zero trials is null, because an interval on nothing is fabrication", () => {
+    expect(wilsonScoreInterval(0, 0)).toBeNull();
+  });
+
+  test("more trials narrow the interval at the same rate", () => {
+    const widths = [5, 20, 100, 1000].map((n) => wilsonScoreInterval(n * 0.6, n)?.width as number);
+    for (let i = 1; i < widths.length; i++) {
+      expect(widths[i] as number).toBeLessThan(widths[i - 1] as number);
+    }
+  });
+
+  test("a higher confidence level widens it, and z is echoed for reproducibility", () => {
+    const at90 = wilsonScoreInterval(3, 5, TWO_SIDED_Z["0.90"]);
+    const at99 = wilsonScoreInterval(3, 5, TWO_SIDED_Z["0.99"]);
+    expect(at90?.width as number).toBeLessThan(at99?.width as number);
+    expect(at99?.z).toBe(TWO_SIDED_Z["0.99"]);
+  });
+
+  test("impossible counts are a caller bug, not a degenerate dataset", () => {
+    expect(() => wilsonScoreInterval(6, 5)).toThrow(/successes <= trials/);
+    expect(() => wilsonScoreInterval(-1, 5)).toThrow(/successes <= trials/);
+    expect(() => wilsonScoreInterval(1.5, 5)).toThrow(/whole counts/);
+    expect(() => wilsonScoreInterval(1, 5, 0)).toThrow(/positive finite/);
+  });
+});
+
+describe("stats-kernel — Cohen's kappa", () => {
+  test("reproduces the standard 2x2 worked example", () => {
+    // 50 items: 20 yes/yes, 5 yes/no, 10 no/yes, 15 no/no.
+    // po = 35/50 = 0.70; pe = (25/50)(30/50) + (25/50)(20/50) = 0.50; k = 0.40.
+    const a = [
+      ...Array(20).fill("yes"),
+      ...Array(5).fill("yes"),
+      ...Array(10).fill("no"),
+      ...Array(15).fill("no"),
+    ];
+    const b = [
+      ...Array(20).fill("yes"),
+      ...Array(5).fill("no"),
+      ...Array(10).fill("yes"),
+      ...Array(15).fill("no"),
+    ];
+    const r = cohensKappa(a, b);
+    expect(r.n).toBe(50);
+    expect(r.observedAgreement).toBeCloseTo(0.7, 15);
+    expect(r.expectedAgreement).toBeCloseTo(0.5, 15);
+    expect(r.kappa).toBeCloseTo(0.4, 12);
+    expect(r.categories).toEqual(["no", "yes"]);
+    expect(r.degenerate).toBe(false);
+  });
+
+  test("60% raw agreement can be almost none beyond chance", () => {
+    // 100 items: 45/15/25/15. po = 0.60, pe = 0.54, kappa = 0.1304.
+    const a = [
+      ...Array(45).fill("yes"),
+      ...Array(15).fill("yes"),
+      ...Array(25).fill("no"),
+      ...Array(15).fill("no"),
+    ];
+    const b = [
+      ...Array(45).fill("yes"),
+      ...Array(15).fill("no"),
+      ...Array(25).fill("yes"),
+      ...Array(15).fill("no"),
+    ];
+    const r = cohensKappa(a, b);
+    expect(r.observedAgreement).toBeCloseTo(0.6, 15);
+    expect(r.expectedAgreement).toBeCloseTo(0.54, 15);
+    expect(r.kappa).toBeCloseTo(0.13043478260869554, 12);
+  });
+
+  test("no items rated is the null sentinel", () => {
+    const r = cohensKappa([], []);
+    expect(r.kappa).toBeNull();
+    expect(r.observedAgreement).toBeNull();
+    expect(r.expectedAgreement).toBeNull();
+    expect(r.note).toMatch(/no items/);
+  });
+
+  test("two raters who agreed on one constant label get 1, flagged as degenerate", () => {
+    // pe = 1 makes kappa 0/0. Reported as 1 to match feedback-distill, but the
+    // flag is the whole point: this measures nothing.
+    const r = cohensKappa(["pass", "pass", "pass"], ["pass", "pass", "pass"]);
+    expect(r.kappa).toBe(1);
+    expect(r.degenerate).toBe(true);
+    expect(r.expectedAgreement).toBe(1);
+    expect(r.note).toMatch(/measures nothing/);
+  });
+
+  test("perfect agreement over two real categories is an undegenerate 1", () => {
+    const labels = ["a", "a", "b", "b"];
+    const r = cohensKappa(labels, labels);
+    expect(r.kappa).toBe(1);
+    expect(r.degenerate).toBe(false);
+  });
+
+  test("two constant raters who never agree get 0, and total reversal gets -1", () => {
+    const never = cohensKappa(["x", "x", "x"], ["y", "y", "y"]);
+    expect(never.expectedAgreement).toBe(0);
+    expect(never.kappa).toBe(0);
+    expect(never.degenerate).toBe(false);
+    const reversed = cohensKappa(["a", "a", "b", "b"], ["b", "b", "a", "a"]);
+    expect(reversed.kappa).toBeCloseTo(-1, 15);
+  });
+
+  test("unequal rating counts are a caller bug", () => {
+    expect(() => cohensKappa(["a"], ["a", "b"])).toThrow(/same items/);
+  });
+});
+
+describe("stats-kernel — PSI binning", () => {
+  const edges = [0, 10, 20, 30];
+
+  test("bins are half-open except the last, and strays are counted not dropped", () => {
+    const r = binCounts([-1, 0, 9.9, 10, 20, 29.9, 30, 31], edges);
+    expect(r.counts).toEqual([2, 1, 3]);
+    expect(r.belowFirstEdge).toBe(1);
+    expect(r.aboveLastEdge).toBe(1);
+  });
+
+  test("edges must make at least one bin and strictly increase", () => {
+    expect(() => binCounts([1], [5])).toThrow(/at least 2/);
+    expect(() => binCounts([1], [0, 10, 10])).toThrow(/strictly increasing/);
+    expect(() => binCounts([1], [0, Number.POSITIVE_INFINITY])).toThrow(/finite/);
+  });
+});
+
+describe("stats-kernel — Population Stability Index", () => {
+  test("reproduces the hand-computed four-bin example", () => {
+    // shares 0.2/0.3/0.3/0.2 vs 0.3/0.2/0.3/0.2
+    //   = 0.1*ln(1.5) + (-0.1)*ln(2/3) = 0.2*ln(1.5) = 0.081093...
+    const r = populationStabilityIndex([20, 30, 30, 20], [30, 20, 30, 20], { epsilon: 1e-4 });
+    expect(r.psi).toBeCloseTo(0.2 * Math.log(1.5), 12);
+    expect(r.psi).toBeCloseTo(0.081093, 6);
+    expect(r.band).toBe("stable");
+    expect(r.epsilonApplied).toBe(false);
+    expect(r.bins).toHaveLength(4);
+    expect(r.bins[2]?.contribution).toBe(0);
+    expect(r.note).toMatch(/epsilon did not enter/);
+  });
+
+  test("an unmoved distribution is exactly zero, and PSI is symmetric", () => {
+    const counts = [10, 20, 30, 40];
+    expect(populationStabilityIndex(counts, counts, { epsilon: 1e-4 }).psi).toBe(0);
+    // Different totals, same shares: PSI measures shape, not sample size.
+    expect(populationStabilityIndex(counts, [20, 40, 60, 80], { epsilon: 1e-4 }).psi).toBe(0);
+    const forward = populationStabilityIndex([20, 30, 30, 20], [30, 20, 30, 20], { epsilon: 1e-4 });
+    const back = populationStabilityIndex([30, 20, 30, 20], [20, 30, 30, 20], { epsilon: 1e-4 });
+    expect(forward.psi).toBeCloseTo(back.psi as number, 15);
+  });
+
+  test("epsilon alone moves the verdict across all three bands", () => {
+    // Ten equal reference bins; the current sample emptied one of them.
+    const reference = Array<number>(10).fill(10);
+    const current = [1, 1, 1, 1, 1, 1, 1, 1, 1, 0];
+    const at = (epsilon: number) => populationStabilityIndex(reference, current, { epsilon });
+    expect(at(1e-3).psi).toBeCloseTo(0.4664478999786036, 12);
+    expect(at(1e-3).band).toBe("significant");
+    expect(at(1e-2).psi).toBeCloseTo(0.21776870993524677, 12);
+    expect(at(1e-2).band).toBe("moderate");
+    expect(at(0.05).psi).toBeCloseTo(0.04519341059377986, 12);
+    expect(at(0.05).band).toBe("stable");
+    // Same data, three ship decisions — which is why the note shouts.
+    expect(at(1e-3).epsilonApplied).toBe(true);
+    expect(at(1e-3).note).toMatch(/function of that epsilon/);
+  });
+
+  test("a bin empty on both sides contributes nothing and is not epsilon-dependent", () => {
+    const r = populationStabilityIndex([10, 0, 10], [10, 0, 10], { epsilon: 1e-4 });
+    expect(r.psi).toBe(0);
+    expect(r.bins[1]?.contribution).toBe(0);
+    expect(r.bins[1]?.epsilonApplied).toBe(false);
+    expect(r.epsilonApplied).toBe(false);
+  });
+
+  test("an empty side is the null sentinel, not a stable verdict", () => {
+    const r = populationStabilityIndex([10, 20], [0, 0], { epsilon: 1e-4 });
+    expect(r.psi).toBeNull();
+    expect(r.band).toBeNull();
+    expect(r.note).toMatch(/needs both distributions/);
+  });
+
+  test("epsilon is required and must be a usable share", () => {
+    for (const epsilon of [0, 1, -0.1, Number.NaN]) {
+      expect(() => populationStabilityIndex([1, 1], [1, 1], { epsilon })).toThrow(/epsilon/);
+    }
+  });
+
+  test("mismatched bins and negative counts are caller bugs", () => {
+    expect(() => populationStabilityIndex([1, 2], [1, 2, 3], { epsilon: 1e-4 })).toThrow(
+      /matched bins/,
+    );
+    expect(() => populationStabilityIndex([1, -2], [1, 2], { epsilon: 1e-4 })).toThrow(
+      /non-negative/,
+    );
+    expect(() => populationStabilityIndex([], [], { epsilon: 1e-4 })).toThrow(/at least one bin/);
+  });
+});
+
+describe("stats-kernel — PSI over supplied edges", () => {
+  const edges = [0, 10, 20, 30];
+  const reference = [1, 5, 9, 11, 15, 19, 21, 25, 29];
+
+  test("out-of-range values get their own bins by default, so drift off the end shows", () => {
+    // The current sample has drifted entirely past the reference's last edge.
+    const current = [31, 32, 33, 34, 35, 36, 37, 38, 39];
+    const r = psiOverEdges(reference, current, edges, { epsilon: 1e-4 });
+    expect(r.bins).toHaveLength(5); // 3 edge bins + underflow + overflow
+    expect(r.bins[4]?.currentCount).toBe(9);
+    expect(r.bins[4]?.label).toBe("[30, +inf)");
+    expect(r.band).toBe("significant");
+    expect(r.epsilonApplied).toBe(true);
+  });
+
+  test("clamping folds strays into the end bins, and hides exactly that drift", () => {
+    const current = [31, 32, 33, 34, 35, 36, 37, 38, 39];
+    const clamped = psiOverEdges(reference, current, edges, {
+      epsilon: 1e-4,
+      outOfRange: "clamp",
+    });
+    const separate = psiOverEdges(reference, current, edges, { epsilon: 1e-4 });
+    expect(clamped.bins).toHaveLength(3);
+    expect(clamped.bins[2]?.currentCount).toBe(9);
+    // The end bins are open once they absorb strays, and must not claim [20, 30].
+    expect(clamped.bins.map((b) => b.label)).toEqual(["(-inf, 10)", "[10, 20)", "[20, +inf)"]);
+    expect((clamped.psi as number) < (separate.psi as number)).toBe(true);
+  });
+
+  test("refuse names how many values fell outside rather than guessing", () => {
+    expect(() =>
+      psiOverEdges(reference, [31, 32], edges, { epsilon: 1e-4, outOfRange: "refuse" }),
+    ).toThrow(/2 value\(s\) fell outside/);
+  });
+
+  test("bins carry their real interval, with the last edge-bin closed", () => {
+    const r = psiOverEdges(reference, reference, edges, {
+      epsilon: 1e-4,
+      outOfRange: "refuse",
+    });
+    expect(r.psi).toBe(0);
+    expect(r.bins.map((b) => b.label)).toEqual(["[0, 10)", "[10, 20)", "[20, 30]"]);
+  });
+
+  test("the same edges must be reused, which is why they are an argument", () => {
+    // Re-binning each sample by its own quantiles would report ~0 here even
+    // though the current sample sits entirely in one reference bin.
+    const r = psiOverEdges(reference, [21, 22, 23, 24, 25], edges, {
+      epsilon: 1e-4,
+      outOfRange: "refuse",
+    });
+    expect(r.psi as number).toBeGreaterThan(PSI_BANDS.significant);
+    expect(r.band).toBe("significant");
   });
 });

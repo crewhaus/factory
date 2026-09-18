@@ -14,7 +14,7 @@
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
-import { diffLines, diffStats, renderUnified } from "./lib/diff";
+import { diffLines, diffStats, parseUnifiedDiff, renderUnified } from "./lib/diff";
 import { ENTITY_KINDS, extractEntities as extractEntitiesFn } from "./lib/entities";
 import { escapeFor, truncateToChars, wrapText as wrapTextFn } from "./lib/format";
 import { estimateTokens, tokenize } from "./lib/locate";
@@ -138,6 +138,58 @@ export const textDiff: RegisteredTool = buildTool({
       ...stats,
       identical: false,
       diff: renderUnified(ops, input.aLabel ?? "a", input.bLabel ?? "b", input.context ?? 3),
+    });
+  },
+});
+
+export const diffParse: RegisteredTool = buildTool({
+  name: "DiffParse",
+  description:
+    "Parse a unified diff — from GitDiff, `git show`, `diff -u` or a patch file — into files, hunks and lines, giving every line its number in the NEW file. Use it to act on a patch without re-reading the files it touches: find the added line that introduced something, then edit that exact line. Renames, mode changes, binary stanzas and missing trailing newlines are reported rather than dropped, and anything the parser could not account for comes back as a warning instead of a plausible guess.",
+  inputSchema: z.object({
+    diff: z.string().describe("the unified diff text"),
+    path: z
+      .string()
+      .optional()
+      .describe("return only the file whose old or new path is exactly this"),
+    changedOnly: z
+      .boolean()
+      .optional()
+      .describe("drop context lines, leaving only what was added or removed"),
+    summaryOnly: z.boolean().optional().describe("per-file counts and status, no hunks"),
+  }),
+  readOnly: true,
+  concurrencySafe: true,
+  execute: async (input) => {
+    assertSize(input.diff, "diff");
+    const parsed = parseUnifiedDiff(input.diff);
+    const selected =
+      input.path === undefined
+        ? parsed.files
+        : parsed.files.filter((f) => f.oldPath === input.path || f.newPath === input.path);
+    if (input.path !== undefined && selected.length === 0) {
+      return json({
+        found: false,
+        path: input.path,
+        available: parsed.files.map((f) => f.newPath ?? f.oldPath),
+      });
+    }
+    const files = selected.map((file) => {
+      const { hunks, ...rest } = file;
+      if (input.summaryOnly === true) return { ...rest, hunks: hunks.length };
+      return {
+        ...rest,
+        hunks: hunks.map((h) => ({
+          ...h,
+          lines: input.changedOnly === true ? h.lines.filter((l) => l.kind !== "context") : h.lines,
+        })),
+      };
+    });
+    return json({
+      files,
+      added: selected.reduce((sum, f) => sum + f.added, 0),
+      removed: selected.reduce((sum, f) => sum + f.removed, 0),
+      warnings: parsed.warnings,
     });
   },
 });
@@ -573,6 +625,7 @@ export const markdownTable: RegisteredTool = buildTool({
 export const TEXT_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   compactLog,
   countTokens,
+  diffParse,
   escapeString,
   extractEntities,
   extractKeywords,
@@ -590,3 +643,24 @@ export const TEXT_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   truncateToBudget,
   wrapText,
 ]);
+
+/**
+ * The unified-diff parser, re-exported as a library.
+ *
+ * `DiffParse` is the narrow view of this: one call, one JSON answer. A
+ * package that has to make a decision PER LINE of a change set — lint the
+ * added lines, map a finding back to the new file — needs the structure
+ * itself, and the one thing it must not do is parse a diff a second time.
+ * The line numbers are the whole product here (see `./lib/diff`), and two
+ * parsers means two numberings, one of which is wrong. This is the same
+ * reason `@crewhaus/tool-code` exports its lockfile readers beside its tools.
+ */
+export {
+  type DiffFileStatus,
+  type DiffLineKind,
+  type ParsedDiff,
+  type ParsedDiffFile,
+  type ParsedDiffLine,
+  type ParsedHunk,
+  parseUnifiedDiff,
+} from "./lib/diff";

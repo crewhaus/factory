@@ -83,6 +83,7 @@ describe("dispatch through executeTool", () => {
     const calls: Record<string, unknown> = {
       CompactLog: { text: "a\na\nERROR b" },
       CountTokens: { text: "hello" },
+      DiffParse: { diff: "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n" },
       EscapeString: { text: "a.b", target: "regex" },
       ExtractEntities: { text: "a@b.com", kinds: ["email"] },
       ExtractKeywords: { text: "compiler compiler widget" },
@@ -110,6 +111,20 @@ describe("dispatch through executeTool", () => {
         isError: false,
       });
     }
+  });
+
+  test("DiffParse returns new-file line numbers through the runtime path", async () => {
+    const result = await executeTool(
+      lookup("DiffParse"),
+      { diff: "--- a/x\n+++ b/x\n@@ -7,2 +7,3 @@\n keep\n+fresh\n tail\n", changedOnly: true },
+      { toolUseId: "t6" },
+    );
+    expect(result.isError).toBe(false);
+    const body = result.content;
+    if (typeof body !== "string") throw new Error("expected a string result");
+    expect(JSON.parse(body).files[0].hunks[0].lines).toEqual([
+      { kind: "added", oldLine: null, newLine: 8, text: "fresh" },
+    ]);
   });
 
   test("results are deterministic — the same call twice gives the same bytes", async () => {

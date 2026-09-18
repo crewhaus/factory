@@ -80,14 +80,51 @@ module loaded by a computed path, referenced from HTML, or discovered by
 filename convention — treat its output as a list to review, never a list to
 delete. `DependencyOutdated` compares the manifest against the **lockfile**
 and never contacts a registry, so it can tell you the two disagree but not
-that a newer release exists upstream — and it reads four lockfiles
-(`bun.lock`, `package-lock.json`, `yarn.lock`, `Cargo.lock`), so a Python or
-Go dependency comes back in `notCompared` rather than as a clean result.
-`pnpm-lock.yaml` and the binary `bun.lockb` are named in `notes` instead of
-being read.
+that a newer release exists upstream — and it reads five lockfiles
+(`bun.lock`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`),
+so a Python or Go dependency comes back in `notCompared` rather than as a clean
+result. The binary `bun.lockb` is named in `notes` instead of being read.
 
 Each tool's description repeats the limit that matters to it. A tool that
 overstates its coverage is worse than one that is narrow and says so.
+
+## What a lockfile records, and what it does not
+
+The readers in `src/lib/deps.ts` give two views of one parse. `parseBunLock`
+and its siblings return a name and a version — all the tools here ever wanted.
+`parseBunLockDetailed` and its siblings return the same entries widened with
+the ecosystem, the resolved URL and the integrity hash, for packages that take
+a dependency somewhere else: a vulnerability database keyed by
+(ecosystem, name, version), a registry asked what is newer.
+
+Nothing in the wide view is reconstructed. A tarball URL is derivable from a
+name and a version, and a derived one would be a URL the project may never
+have installed from — wrong in exactly the case that matters, a package from a
+private registry. Where the file records nothing, the field is absent.
+
+| Lockfile | `resolvedUrl` | `integrity` |
+|---|---|---|
+| `bun.lock` | only when the package did not come from the configured registry | yes, SRI |
+| `package-lock.json`, `npm-shrinkwrap.json` | when `resolved` holds a URL — on a workspace link it holds a path | yes, SRI |
+| `yarn.lock`, classic | yes | yes, SRI; absent in files written before yarn 1.10 |
+| `yarn.lock`, berry | no — `resolution:` is a descriptor, not a URL | no — `checksum:` hashes Yarn's own zip, not the published tarball |
+| `pnpm-lock.yaml` | only `resolution: {tarball: …}`, which a registry package does not have — a git resolution records `repo` and `commit`, and a repo is not the address an artifact came from | yes, SRI |
+| `Cargo.lock` | no — `source` names the source registry, not an address the crate can be fetched from | yes, bare SHA-256 hex and **not** SRI; absent for a path or git crate, and for lockfile version 1 |
+
+So `integrity` means different bytes in different ecosystems, which is why
+`ecosystem` travels on the record: `npm` is Subresource Integrity
+(`sha512-…`), `cargo` is the hex digest of the `.crate` file.
+
+`pnpm-lock.yaml` is read in all three generations still in the wild: v5
+(`/name/version`), v6 (`/name@version`) and v9 (`name@version`), from the
+top-level `packages:` map only — `importers:` holds declared ranges rather
+than resolutions, and v9's `snapshots:` re-lists the same package once per
+peer combination.
+
+The binary `bun.lockb` is not read here at all, and `parseLockfileDetailed`
+returns `undefined` for it rather than an empty list — "no reader for this"
+and "no dependencies" are different answers, and only one of them is safe to
+report as a clean result.
 
 ## Containment, arguments, bounds
 

@@ -8,8 +8,8 @@
  * lockfile through a context window to answer that is the exact waste this
  * package is meant to remove.
  *
- * Parsing comes from `@crewhaus/tool-code`, which already reads the four
- * lockfile formats for `DependencyList`.
+ * Parsing comes from `@crewhaus/tool-code`, which already reads the lockfile
+ * formats for `DependencyList`.
  */
 import { compareSemver, parseSemver } from "@crewhaus/tool-code";
 

@@ -5,7 +5,7 @@ clock, no randomness. The same input always produces the same bytes.
 
 That property is the point. A harness spends a model call when it needs
 judgement; it should not spend one to count lines, pull a version string out
-of a log, or fill in a template. These eighteen tools cover the mechanical
+of a log, or fill in a template. These nineteen tools cover the mechanical
 half so the model is left with the part that actually needs it.
 
 ```yaml
@@ -18,6 +18,7 @@ tools:
 |---|---|
 | `CompactLog` | Collapse a long log to distinct lines with repeat counts, failures first |
 | `CountTokens` | Characters, words, lines and an estimated token count |
+| `DiffParse` | Read a unified diff back into files, hunks and lines, each line numbered in the new file |
 | `EscapeString` | Quote text for a regex, shell word, JSON, URL, HTML, markdown, CSV or SQL LIKE |
 | `ExtractEntities` | Pull URLs, emails, IPs, UUIDs, semvers, tickets, amounts and more out of text |
 | `ExtractKeywords` | Rank a document's significant terms, stop words excluded |
@@ -55,7 +56,7 @@ failing unit than as a failing tool call.
 
 ## Safety flags
 
-All eighteen are `readOnly`, non-destructive, `scope: "internal"`, and declare
+All nineteen are `readOnly`, non-destructive, `scope: "internal"`, and declare
 no io capability, because none of them crosses a process or network boundary.
 `packages/tool-text/src/index.test.ts` asserts that for every tool, so a future
 addition that reaches outside has to change the assertion deliberately.
