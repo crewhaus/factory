@@ -51,7 +51,11 @@ beforeEach(() => {
 afterEach(() => {
   process.chdir(originalCwd);
   rmSync(workspace, { recursive: true, force: true });
-  delete process.env["TEST_WEBHOOK_SECRET"];
+  // `delete` rather than `= undefined`: in Node the latter sets the
+  // variable to the STRING "undefined", which a reader of process.env
+  // cannot tell from a real value. Reflect does the deletion without the
+  // operator the linter objects to.
+  Reflect.deleteProperty(process.env, "TEST_WEBHOOK_SECRET");
 });
 
 describe("package-wide contract", () => {
