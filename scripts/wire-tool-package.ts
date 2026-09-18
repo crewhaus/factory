@@ -65,13 +65,28 @@ const keys = manifest.tools.map((t) => t.key);
 
 const edits: Array<{ file: string; applied: boolean; why: string }> = [];
 
+/**
+ * Apply one edit.
+ *
+ * The transform returns `undefined` to mean "already wired, nothing to do".
+ * Returning the input unchanged means something else: the anchor it looked
+ * for was not found, so the edit silently did nothing. Those two were once
+ * the same branch here, and an anchor that had moved was reported as
+ * "already present" — which is how a whole package shipped registered
+ * nowhere. They are now distinguished, and a missing anchor is fatal.
+ */
 function edit(rel: string, transform: (s: string) => string | undefined, why: string): void {
   const path = join(ROOT, rel);
   const before = readFileSync(path, "utf-8");
   const after = transform(before);
-  if (after === undefined || after === before) {
+  if (after === undefined) {
     edits.push({ file: rel, applied: false, why: `${why} (already present)` });
     return;
+  }
+  if (after === before) {
+    throw new Error(
+      `${rel}: the anchor for "${why}" was not found, so nothing was written. The file's shape changed — update this script rather than editing the file by hand, or the next package hits the same hole.`,
+    );
   }
   if (!checkOnly) writeFileSync(path, after);
   edits.push({ file: rel, applied: true, why });
@@ -243,9 +258,15 @@ edit(
   "root build reference",
 );
 
+/**
+ * Only `apps/cli` needs the package as a dependency. `target-cli` names it
+ * too, but as a *string* in BUILTIN_TOOL_MAP — data the emitter writes into
+ * a generated bundle's imports, never something target-cli itself resolves.
+ * It has no static or dynamic import of any tool package, so adding a
+ * dependency and a project reference there would be cargo cult.
+ */
 for (const [pj, tc, rel] of [
   ["apps/cli/package.json", "apps/cli/tsconfig.json", `../../packages/${pkgDir}`],
-  ["packages/target-cli/package.json", "packages/target-cli/tsconfig.json", `../${pkgDir}`],
 ] as const) {
   edit(
     pj,

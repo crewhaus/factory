@@ -265,3 +265,54 @@ describe("every copy of the path resolver probes with lstat, not existsSync", ()
     }
   });
 });
+
+describe("the CLI can actually load every tool package it names", () => {
+  const REPO = join(import.meta.dir, "..", "..", "..");
+
+  /** Every `@crewhaus/tool-*` the CLI dynamically imports in loadToolMap. */
+  function importedPackages(): string[] {
+    const text = readFileSync(join(REPO, "apps/cli/src/index.ts"), "utf-8");
+    const found = text.matchAll(/import\("(@crewhaus\/tool-[a-z0-9-]+)"\)/g);
+    return [...new Set([...found].map((m) => m[1] as string))].sort();
+  }
+
+  test("the sweep finds the imports it is meant to guard", () => {
+    expect(importedPackages().length).toBeGreaterThanOrEqual(20);
+  });
+
+  test("each one is a declared dependency of apps/cli", () => {
+    // A dynamic import of an undeclared workspace package resolves anyway
+    // through the hoisted node_modules, so this passes locally and fails
+    // only once the CLI is published or installed on its own. The wiring
+    // script adds the dependency; when its anchor moved it reported the edit
+    // as "already present" instead, and nothing else would have noticed.
+    const pkg = JSON.parse(readFileSync(join(REPO, "apps/cli/package.json"), "utf-8")) as {
+      dependencies?: Record<string, string>;
+    };
+    const declared = new Set(Object.keys(pkg.dependencies ?? {}));
+    const missing = importedPackages().filter((name) => !declared.has(name));
+    expect(missing).toEqual([]);
+  });
+
+  test("each one has a project reference, so tsc builds it first", () => {
+    const text = readFileSync(join(REPO, "apps/cli/tsconfig.json"), "utf-8");
+    const missing = importedPackages().filter(
+      (name) => !text.includes(`../../packages/${name.replace("@crewhaus/", "")}"`),
+    );
+    expect(missing).toEqual([]);
+  });
+
+  test("every builtin's package is one the CLI imports", () => {
+    // BUILTIN_TOOL_MAP is what a compiled bundle imports; loadToolMap is what
+    // `crewhaus run` imports. A package in the first but not the second is a
+    // tool that compiles into a spec and then cannot be run.
+    const imported = new Set(importedPackages());
+    const referenced = new Set(
+      Object.values(BUILTIN_TOOL_MAP).map((entry) => (entry as { package: string }).package),
+    );
+    const unrunnable = [...referenced].filter(
+      (p) => p.startsWith("@crewhaus/tool-") && !imported.has(p),
+    );
+    expect(unrunnable).toEqual([]);
+  });
+});
