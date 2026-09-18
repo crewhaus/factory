@@ -212,6 +212,23 @@ async function mainHandler(req: Request): Promise<Response> {
     return jsonRes({ data: { echo: payload.variables ?? null } });
   }
 
+  if (p === "/sse-forever") {
+    // Never sends a terminator and never closes, so the only way out is the
+    // deadline. The `/sse` fixture ends after four events, which made the
+    // deadline test accept three different outcomes and then fail with a
+    // fourth on a runner too slow to connect inside the budget.
+    const stream = new ReadableStream({
+      async start(controller) {
+        const encoder = new TextEncoder();
+        for (let i = 1; i <= 10_000; i++) {
+          controller.enqueue(encoder.encode(`event: tick\ndata: ${i}\n\n`));
+          await Bun.sleep(5);
+        }
+      },
+    });
+    return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+  }
+
   if (p === "/sse") {
     const stream = new ReadableStream({
       async start(controller) {
@@ -1263,9 +1280,21 @@ describe("SseRead", () => {
   });
 
   test("the deadline stops a stream that never terminates", async () => {
-    const result = await run(sseRead, { url: `${origin}/sse`, maxEvents: 500, timeoutMs: 12 });
-    expect(["deadline", "terminator", "streamEnded"]).toContain(result.stoppedBy);
-  });
+    // The budget has to outlast connecting and fall well short of the
+    // stream, or the test measures the runner rather than the deadline. At
+    // 12ms against a stream that ended after four events it measured both,
+    // and on CI the connection itself did not finish in time.
+    const started = performance.now();
+    const result = await run(sseRead, {
+      url: `${origin}/sse-forever`,
+      maxEvents: 10_000,
+      timeoutMs: 300,
+    });
+    expect(result.stoppedBy).toBe("deadline");
+    expect(result.count).toBeGreaterThan(0);
+    // It stopped because of the budget, not because the stream ran out.
+    expect(performance.now() - started).toBeLessThan(10_000);
+  }, 20_000);
 
   test("events after the terminator in the same chunk are not returned", async () => {
     const result = await run(sseRead, {
