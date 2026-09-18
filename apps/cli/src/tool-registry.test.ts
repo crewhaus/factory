@@ -13,7 +13,7 @@ import { describe, expect, test } from "bun:test";
  * Adding a builtin without categorizing it fails (2). Listing a tool that
  * does not exist fails (1). Either way the failure names the key.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import {
@@ -155,5 +155,41 @@ describe("every exported tool is reachable from a spec", () => {
       }
     }
     expect(unreachable).toEqual([]);
+  });
+});
+
+/**
+ * Path containment is implemented once and copied, so it can drift.
+ *
+ * Every package that takes a path from a caller carries its own
+ * `src/paths.ts`. They started as copies of one another, and one of them was
+ * found admitting a DANGLING symlink: `existsSync` follows links, so a link
+ * whose target does not exist yet reads as "missing", the walk steps past it,
+ * and the link's own name is re-appended to the resolved root — where it
+ * passes the containment check. A write through that name then lands wherever
+ * the link points.
+ *
+ * The behavioural test for this lives in
+ * `packages/tool-fsx/src/dangling.test.ts`. It can only cover one copy, so
+ * this asserts the others did not drift back to the unsafe probe.
+ */
+describe("every copy of the path resolver probes with lstat, not existsSync", () => {
+  test("no copy walks with existsSync, and each follows a dangling link by hand", () => {
+    const repoRoot = join(import.meta.dir, "..", "..", "..");
+    const pkgDir = join(repoRoot, "packages");
+    const offenders: Array<{ pkg: string; why: string }> = [];
+    for (const pkg of readdirSync(pkgDir).filter((d) => d.startsWith("tool-"))) {
+      const file = join(pkgDir, pkg, "src", "paths.ts");
+      if (!existsSync(file)) continue;
+      const text = readFileSync(file, "utf-8");
+      // `existsSync` may appear in a comment explaining why it is wrong; what
+      // matters is that nothing WALKS with it.
+      if (/while \(!existsSync\(/.test(text)) offenders.push({ pkg, why: "walks with existsSync" });
+      if (!text.includes("lstatSync")) offenders.push({ pkg, why: "does not probe with lstat" });
+      if (!text.includes("readlinkSync")) {
+        offenders.push({ pkg, why: "cannot follow a dangling link, so it over-refuses" });
+      }
+    }
+    expect(offenders).toEqual([]);
   });
 });

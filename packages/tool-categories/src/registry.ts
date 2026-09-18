@@ -38,13 +38,35 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     title: "Read, write, edit, and search files in the workspace",
     tools: ["read", "write", "edit", "glob", "grep"],
   },
-  docs: {
-    title: "Ingest documents into text the harness can work with",
+  ingest: {
+    title: "Pull a file's text in through the pluggable ingest parsers",
     tools: ["ingestDocument"],
   },
   media: {
-    title: "Read and generate images",
-    tools: ["readImage", "imageGenerate"],
+    title: "Inspect and produce images, codes, charts and diagrams, and probe audio and video",
+    tools: [
+      "readImage",
+      "imageGenerate",
+      "imageInfo",
+      "imageKind",
+      "pngRead",
+      "pngWrite",
+      "imageResize",
+      "imageCrop",
+      "imageDiff",
+      "exifRead",
+      "exifStrip",
+      "qrEncode",
+      "barcodeEncode",
+      "chartRender",
+      "sparklineRender",
+      "diagramRender",
+      "colorConvert",
+      "colorContrast",
+      "subtitleParse",
+      "subtitleWrite",
+      "mediaProbe",
+    ],
   },
 
   text: {
@@ -503,6 +525,49 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     ],
   },
 
+  notify: {
+    title:
+      "Reach people: chat, email, webhooks, SMS and push, with digests, quiet hours and templates",
+    tools: [
+      "chatPost",
+      "chatUpdate",
+      "chatDelete",
+      "chatReact",
+      "emailCompose",
+      "emailSend",
+      "webhookPost",
+      "smsSend",
+      "pushNotify",
+      "deliveryCheck",
+      "notifyDigest",
+      "quietHours",
+      "rateLimitGate",
+      "messageTemplate",
+    ],
+  },
+
+  obs: {
+    title:
+      "See what a harness did and what it cost: events, tool stats, errors, budgets, service levels and incidents",
+    tools: [
+      "eventQuery",
+      "eventCounts",
+      "toolCallStats",
+      "errorCluster",
+      "runTimeline",
+      "costReport",
+      "budgetCheck",
+      "sloEvaluate",
+      "incidentBundle",
+      "metricsQuery",
+      "logsQuery",
+      "alertList",
+      "alertAck",
+      "statusPagePost",
+      "healthProbe",
+    ],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -534,6 +599,14 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     title: "Finding and removing what must not leave the system, and proving what did not change",
     includes: ["secure"],
   },
+  outreach: {
+    title: "Everything that puts something in front of a person outside the harness",
+    includes: ["notify"],
+  },
+  operations: {
+    title: "Running and supervising harnesses: telemetry, cost, incidents, specs and fleets",
+    includes: ["obs", "crewhaus"],
+  },
   network: {
     title: "Everything that reaches the network",
     includes: ["web", "http"],
@@ -544,7 +617,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   content: {
     title: "Everything that reads or produces documents and images",
-    includes: ["docs", "media", "text", "documents"],
+    includes: ["ingest", "documents", "media", "text"],
   },
 });
 

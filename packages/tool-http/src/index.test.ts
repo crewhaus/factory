@@ -1062,26 +1062,37 @@ describe("DownloadFile", () => {
     expect(readFileSync(path.join(outsider, "victim.txt"), "utf8")).toBe("original");
   });
 
-  test("a DANGLING symlink aimed outside is replaced, never written through", async () => {
-    // The target does not exist, so a realpath walk cannot classify it — the
-    // interesting case, because a rename that followed the link would create
-    // the outside file.
+  test("a DANGLING symlink aimed outside is refused, exactly like a live one", async () => {
+    // This used to be the odd one out: an EXISTING link aimed outside was
+    // refused, while a DANGLING one was quietly replaced with a regular file.
+    // Same intent, two different answers. The resolver now follows a dangling
+    // link by hand, so both refuse identically and nothing is created at the
+    // target — which is what the test above already expects of its live twin.
     symlinkSync(path.join(outsider, "not-yet.txt"), path.join(workspace, "dangling.txt"));
     const result = await run(downloadFile, {
       url: `${origin}/download`,
       path: "dangling.txt",
       overwrite: true,
     });
-    expect(result.bytes).toBe(11);
+    expect(result).toContain("escapes the workspace root");
     expect(existsSync(path.join(outsider, "not-yet.txt"))).toBe(false);
-    expect(readFileSync(path.join(workspace, "dangling.txt"), "utf8")).toBe("hello world");
   });
 
-  test("a dangling symlink aimed outside is refused when overwrite was not asked for", async () => {
+  test("a dangling symlink aimed outside is refused without overwrite too", async () => {
     symlinkSync(path.join(outsider, "not-yet.txt"), path.join(workspace, "dangling.txt"));
     const result = await run(downloadFile, { url: `${origin}/download`, path: "dangling.txt" });
-    expect(result).toContain("already exists");
+    expect(result).toContain("escapes the workspace root");
     expect(existsSync(path.join(outsider, "not-yet.txt"))).toBe(false);
+  });
+
+  test("a dangling symlink aimed INSIDE still works — the rule is escape, not dangling", async () => {
+    symlinkSync(path.join(workspace, "pending.txt"), path.join(workspace, "inward.txt"));
+    const result = await run(downloadFile, {
+      url: `${origin}/download`,
+      path: "inward.txt",
+      overwrite: true,
+    });
+    expect(result.bytes).toBe(11);
   });
 });
 

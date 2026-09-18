@@ -133,9 +133,12 @@
         "@crewhaus/tool-image-generation": "workspace:*",
         "@crewhaus/tool-math": "workspace:*",
         "@crewhaus/tool-mcp": "workspace:*",
+        "@crewhaus/tool-media": "workspace:*",
         "@crewhaus/tool-memory": "workspace:*",
         "@crewhaus/tool-mouse-keyboard": "workspace:*",
         "@crewhaus/tool-navigate": "workspace:*",
+        "@crewhaus/tool-notify": "workspace:*",
+        "@crewhaus/tool-obs": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
         "@crewhaus/tool-proc": "workspace:*",
         "@crewhaus/tool-retrieve": "workspace:*",
@@ -2422,6 +2425,19 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/tool-media": {
+      "name": "@crewhaus/tool-media",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-memory": {
       "name": "@crewhaus/tool-memory",
       "version": "0.6.0",
@@ -2469,6 +2485,32 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/tool-notify": {
+      "name": "@crewhaus/tool-notify",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-obs": {
+      "name": "@crewhaus/tool-obs",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
       },
     },
     "packages/tool-orchestrator": {
@@ -3267,6 +3309,8 @@
 
     "@crewhaus/tool-mcp": ["@crewhaus/tool-mcp@workspace:packages/tool-mcp"],
 
+    "@crewhaus/tool-media": ["@crewhaus/tool-media@workspace:packages/tool-media"],
+
     "@crewhaus/tool-memory": ["@crewhaus/tool-memory@workspace:packages/tool-memory"],
 
     "@crewhaus/tool-message-channel": ["@crewhaus/tool-message-channel@workspace:packages/tool-message-channel"],
@@ -3274,6 +3318,10 @@
     "@crewhaus/tool-mouse-keyboard": ["@crewhaus/tool-mouse-keyboard@workspace:packages/tool-mouse-keyboard"],
 
     "@crewhaus/tool-navigate": ["@crewhaus/tool-navigate@workspace:packages/tool-navigate"],
+
+    "@crewhaus/tool-notify": ["@crewhaus/tool-notify@workspace:packages/tool-notify"],
+
+    "@crewhaus/tool-obs": ["@crewhaus/tool-obs@workspace:packages/tool-obs"],
 
     "@crewhaus/tool-orchestrator": ["@crewhaus/tool-orchestrator@workspace:packages/tool-orchestrator"],
 
