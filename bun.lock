@@ -141,6 +141,7 @@
         "@crewhaus/tool-navigate": "workspace:*",
         "@crewhaus/tool-notify": "workspace:*",
         "@crewhaus/tool-obs": "workspace:*",
+        "@crewhaus/tool-onchain": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
         "@crewhaus/tool-pkg": "workspace:*",
         "@crewhaus/tool-proc": "workspace:*",
@@ -2544,6 +2545,20 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-onchain": {
+      "name": "@crewhaus/tool-onchain",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-encode": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-orchestrator": {
       "name": "@crewhaus/tool-orchestrator",
       "version": "0.6.0",
@@ -3371,6 +3386,8 @@
     "@crewhaus/tool-notify": ["@crewhaus/tool-notify@workspace:packages/tool-notify"],
 
     "@crewhaus/tool-obs": ["@crewhaus/tool-obs@workspace:packages/tool-obs"],
+
+    "@crewhaus/tool-onchain": ["@crewhaus/tool-onchain@workspace:packages/tool-onchain"],
 
     "@crewhaus/tool-orchestrator": ["@crewhaus/tool-orchestrator@workspace:packages/tool-orchestrator"],
 

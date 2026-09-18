@@ -611,6 +611,20 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     ],
   },
 
+  onchain: {
+    title:
+      "Onchain arithmetic, offline: ABI encoding and decoding, address checksums, EIP-712 digests, unit conversion and fixed-point DeFi maths",
+    tools: [
+      "abiDecode",
+      "abiEncodeCall",
+      "addressCheck",
+      "defiMath",
+      "functionSelector",
+      "typedDataHash",
+      "tokenUnits",
+    ],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -657,7 +671,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   compute: {
     title: "Everything a harness can do with no I/O at all — pure, in-process, zero tokens",
-    includes: ["text", "data", "encode", "datetime", "schema", "math", "flow"],
+    includes: ["text", "data", "encode", "datetime", "schema", "math", "flow", "onchain"],
   },
   content: {
     title: "Everything that reads or produces documents and images",

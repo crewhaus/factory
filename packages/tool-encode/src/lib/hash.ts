@@ -10,11 +10,16 @@
  * MD5 and SHA-1 are broken for any security purpose. Nothing here treats them
  * otherwise, and every tool that exposes them says so.
  */
+import { keccak256 } from "./keccak";
 export type ShaAlgorithm = "sha1" | "sha256" | "sha384" | "sha512";
-export type HashAlgorithm = ShaAlgorithm | "md5";
+export type HashAlgorithm = ShaAlgorithm | "md5" | "keccak256";
 
 export const SHA_ALGORITHMS: ReadonlyArray<ShaAlgorithm> = ["sha1", "sha256", "sha384", "sha512"];
-export const HASH_ALGORITHMS: ReadonlyArray<HashAlgorithm> = ["md5", ...SHA_ALGORITHMS];
+export const HASH_ALGORITHMS: ReadonlyArray<HashAlgorithm> = [
+  "md5",
+  ...SHA_ALGORITHMS,
+  "keccak256",
+];
 
 /** Algorithms a hash is not to be trusted with, reported alongside every digest. */
 export const BROKEN_FOR_SECURITY: ReadonlyArray<HashAlgorithm> = ["md5", "sha1"];
@@ -29,6 +34,10 @@ const SUBTLE_NAME: Record<ShaAlgorithm, string> = {
 /** Digest bytes with any supported algorithm. */
 export async function digest(algorithm: HashAlgorithm, bytes: Uint8Array): Promise<Uint8Array> {
   if (algorithm === "md5") return md5(bytes);
+  // Keccak-256 is NOT SHA3-256: same permutation, different padding. WebCrypto
+  // offers neither, and substituting sha3-256 would produce a plausible digest
+  // that is wrong for every Ethereum purpose.
+  if (algorithm === "keccak256") return keccak256(bytes);
   const buffer = await crypto.subtle.digest(SUBTLE_NAME[algorithm], bytes);
   return new Uint8Array(buffer);
 }

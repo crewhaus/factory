@@ -117,6 +117,13 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
     "cancel the command",
   ],
   todoWrite: ["todo", "task list", "track tasks", "checklist"],
+  abiDecode: ["abi", "decode", "calldata", "eth_call result", "revert data"],
+  abiEncodeCall: ["abi", "encode", "calldata", "contract call", "selector"],
+  addressCheck: ["address", "eip-55", "checksum", "ethereum address", "0x"],
+  defiMath: ["slippage", "minout", "price impact", "health factor", "basis points", "defi"],
+  functionSelector: ["selector", "event topic", "keccak", "4byte", "signature"],
+  typedDataHash: ["eip-712", "typed data", "eip-191", "personal_sign", "digest"],
+  tokenUnits: ["wei", "gwei", "ether", "decimals", "base units", "parseunits"],
   costBasisCompute: ["cost basis", "fifo", "lifo", "capital gains", "lots", "realized gain"],
   glCodeSuggest: ["gl code", "general ledger", "chart of accounts", "coding", "cost center"],
   paymentIdentifierValidate: [
@@ -1449,6 +1456,13 @@ export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object.freeze([
   "statementParse",
   "taxCalculate",
   "webhookSignatureVerify",
+  "abiDecode",
+  "abiEncodeCall",
+  "addressCheck",
+  "defiMath",
+  "functionSelector",
+  "typedDataHash",
+  "tokenUnits",
 ]);
 
 /**
