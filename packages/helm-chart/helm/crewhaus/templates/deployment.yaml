@@ -33,6 +33,15 @@ spec:
           env:
             - name: CREWHAUS_TARGET
               value: {{ .Values.target | quote }}
+            {{- if has .Values.target (list "channel" "managed") }}
+            # The daemon reads PORT; the image bakes its own ENV PORT default
+            # (3000 for channel, 8080 for managed), which used to win and left
+            # the process bound to a port the probes never dialled. Emitting it
+            # here makes service.targetPort the single source of truth for the
+            # containerPort, the Service destination, both probes AND the bind.
+            - name: PORT
+              value: {{ .Values.service.targetPort | quote }}
+            {{- end }}
             {{- if .Values.secrets.anthropic }}
             - name: ANTHROPIC_AUTH_TOKEN
               valueFrom:
@@ -71,7 +80,7 @@ spec:
               value: {{ .Values.otel.headers | quote }}
             {{- end }}
             {{- end }}
-          {{- if has .Values.target (list "channel" "managed" "crew" "voice" "browser") }}
+          {{- if has .Values.target (list "channel" "managed") }}
           ports:
             - name: http
               containerPort: {{ .Values.service.targetPort }}
