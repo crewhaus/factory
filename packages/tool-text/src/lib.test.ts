@@ -1,9 +1,20 @@
+import { afterAll, describe, expect, test } from "bun:test";
 /**
  * The pure core. Every function here is tested directly, because a bug in
  * `levenshtein` reads better as a failing unit than as a failing tool call.
  */
-import { describe, expect, test } from "bun:test";
-import { diffLines, diffStats, renderUnified } from "./lib/diff";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import {
+  type ParsedDiff,
+  type ParsedDiffFile,
+  diffLines,
+  diffStats,
+  parseUnifiedDiff,
+  renderUnified,
+} from "./lib/diff";
 import { ENTITY_KINDS, extractEntities } from "./lib/entities";
 import { escapeFor, truncateToChars, wrapText } from "./lib/format";
 import { estimateTokens, lineStarts, offsetToLineCol, tokenize } from "./lib/locate";
@@ -139,6 +150,493 @@ describe("diff", () => {
     expect(out).not.toContain(" 1\n");
     expect(out).toContain("-x");
   });
+});
+
+describe("parseUnifiedDiff", () => {
+  test("a hunk header with no count means one line", () => {
+    const parsed = parseUnifiedDiff(
+      ["--- a/x", "+++ b/x", "@@ -1 +1 @@", "-before", "+after"].join("\n"),
+    );
+    const hunk = parsed.files[0]?.hunks[0];
+    expect({ oldCount: hunk?.oldCount, newCount: hunk?.newCount }).toEqual({
+      oldCount: 1,
+      newCount: 1,
+    });
+    expect(hunk?.lines.map((l) => l.newLine)).toEqual([null, 1]);
+  });
+
+  test("the counter starts at the header's new-file start, not at 1", () => {
+    const parsed = parseUnifiedDiff(
+      ["--- a/x", "+++ b/x", "@@ -100,2 +240,3 @@", " keep", "+fresh", " tail"].join("\n"),
+    );
+    const lines = parsed.files[0]?.hunks[0]?.lines ?? [];
+    expect(lines.map((l) => [l.oldLine, l.newLine])).toEqual([
+      [100, 240],
+      [null, 241],
+      [101, 242],
+    ]);
+  });
+
+  test("a plain `diff -u` patch parses without any `diff --git` line", () => {
+    const parsed = parseUnifiedDiff(
+      [
+        "--- old/a.txt\t2020-01-01 00:00:00.000000000 +0000",
+        "+++ new/a.txt\t2020-01-02 00:00:00.000000000 +0000",
+        "@@ -1,1 +1,1 @@",
+        "-x",
+        "+y",
+        "--- old/b.txt\t2020-01-01 00:00:00.000000000 +0000",
+        "+++ new/b.txt\t2020-01-02 00:00:00.000000000 +0000",
+        "@@ -5,1 +5,1 @@",
+        "-p",
+        "+q",
+      ].join("\n"),
+    );
+    // The tab-separated timestamp is not part of the path, and `old/`/`new/`
+    // is not the `a/`/`b/` prefix, so neither is stripped.
+    expect(parsed.files.map((f) => f.newPath)).toEqual(["new/a.txt", "new/b.txt"]);
+    expect(parsed.files[1]?.hunks[0]?.lines[1]?.newLine).toBe(5);
+  });
+
+  test("format-patch's bare `---` separator does not open a file stanza", () => {
+    const parsed = parseUnifiedDiff(
+      [
+        "From 0000000 Mon Sep 17 00:00:00 2001",
+        "Subject: [PATCH] do a thing",
+        "---",
+        " a.txt | 2 +-",
+        " 1 file changed, 1 insertion(+), 1 deletion(-)",
+        "",
+        "diff --git a/a.txt b/a.txt",
+        "--- a/a.txt",
+        "+++ b/a.txt",
+        "@@ -1 +1 @@",
+        "-x",
+        "+y",
+      ].join("\n"),
+    );
+    expect(parsed.files.length).toBe(1);
+    expect(parsed.files[0]?.newPath).toBe("a.txt");
+  });
+
+  test("a context line stripped of its leading space still counts as context", () => {
+    // Mail clients and editors trim trailing whitespace, so a blank context
+    // line routinely arrives as "" rather than " ". Mis-reading it would shift
+    // every later line number in the hunk.
+    const parsed = parseUnifiedDiff(
+      ["--- a/x", "+++ b/x", "@@ -1,3 +1,4 @@", " one", "", "+two", " three"].join("\n"),
+    );
+    const lines = parsed.files[0]?.hunks[0]?.lines ?? [];
+    expect(lines.map((l) => [l.kind, l.newLine])).toEqual([
+      ["context", 1],
+      ["context", 2],
+      ["added", 3],
+      ["context", 4],
+    ]);
+  });
+
+  test("a truncated hunk warns instead of returning short, silent numbers", () => {
+    const parsed = parseUnifiedDiff(
+      ["--- a/x", "+++ b/x", "@@ -1,9 +1,9 @@", " one", "+two"].join("\n"),
+    );
+    expect(parsed.warnings.length).toBe(1);
+    expect(parsed.warnings[0]).toContain("truncated");
+  });
+
+  test("a combined merge hunk is refused rather than numbered wrongly", () => {
+    // `@@@` carries one marker column per parent, so single-column numbering
+    // would be confidently wrong — the one failure mode worth refusing.
+    const parsed = parseUnifiedDiff(
+      [
+        "diff --cc merged.txt",
+        "index 111,222..333",
+        "--- a/merged.txt",
+        "+++ b/merged.txt",
+        "@@@ -1,2 -1,2 +1,3 @@@",
+        "  same",
+        "++both",
+      ].join("\n"),
+    );
+    expect(parsed.files[0]?.hunks).toEqual([]);
+    expect(parsed.warnings[0]).toContain("combined");
+  });
+
+  test("a CRLF-transported diff is not read as CRLF content", () => {
+    const parsed = parseUnifiedDiff(
+      ["--- a/x", "+++ b/x", "@@ -1 +1 @@", "-old", "+new"].join("\r\n"),
+    );
+    expect(parsed.files[0]?.hunks[0]?.lines[1]?.text).toBe("new");
+  });
+
+  test("a CRLF-content line inside an LF diff keeps its carriage return", () => {
+    const parsed = parseUnifiedDiff(
+      ["--- a/x", "+++ b/x", "@@ -1 +1 @@", "-old\r", "+new\r"].join("\n"),
+    );
+    expect(parsed.files[0]?.hunks[0]?.lines[1]?.text).toBe("new\r");
+  });
+
+  test("a hunk whose counts are too small warns rather than dropping lines", () => {
+    const parsed = parseUnifiedDiff(
+      ["--- a/x", "+++ b/x", "@@ -1,1 +1,1 @@", " one", "+two", "+three"].join("\n"),
+    );
+    expect(parsed.warnings[0]).toContain("too small");
+  });
+
+  test("format-patch's `-- ` mail signature is not mistaken for dropped content", () => {
+    // The check above deliberately ignores the `-` side for exactly this line.
+    const parsed = parseUnifiedDiff(
+      ["--- a/x", "+++ b/x", "@@ -1 +1 @@", "-old", "+new", "-- ", "2.39.0"].join("\n"),
+    );
+    expect(parsed.warnings).toEqual([]);
+  });
+
+  test("a space inside or at the end of a path is part of the name", () => {
+    const parsed = parseUnifiedDiff(
+      ["--- a/sp ace.txt \t", "+++ b/sp ace.txt \t", "@@ -1 +1 @@", "-x", "+y"].join("\n"),
+    );
+    expect(parsed.files[0]?.newPath).toBe("sp ace.txt ");
+  });
+
+  test("a `diff --git` line that quotes only one side still splits", () => {
+    // git quotes per path, so a rename can quote the new name alone. Real git
+    // also emits `rename from`/`rename to`, but other producers may not.
+    const parsed = parseUnifiedDiff(
+      ['diff --git a/plain.bin "b/caf\\303\\251.bin"', "Binary files differ"].join("\n"),
+    );
+    expect({ old: parsed.files[0]?.oldPath, new: parsed.files[0]?.newPath }).toEqual({
+      old: "plain.bin",
+      new: "café.bin",
+    });
+  });
+
+  test("an empty diff is an empty result", () => {
+    expect(parseUnifiedDiff("")).toEqual({ files: [], warnings: [] });
+  });
+});
+
+/**
+ * The same parser against bytes `git` actually produced. Hand-written
+ * fixtures encode what the author believes git emits; these encode what it
+ * does. Every new-file line number is checked against the real file on disk,
+ * which is the only assertion that can catch an off-by-one.
+ */
+describe("parseUnifiedDiff against real git output", () => {
+  type Fixtures = {
+    readonly dir: string;
+    readonly diff: string;
+    readonly binaryDiff: string;
+    readonly parsed: ParsedDiff;
+  };
+
+  /** Never read directly — `fixtures()` builds it on first use and reuses it. */
+  let built: Fixtures | null = null;
+
+  const GIT_ENV = {
+    ...process.env,
+    // The runner's own gitconfig must not decide what this test sees: a global
+    // `core.autocrlf`, `diff.noprefix` or `core.quotePath` would change the bytes.
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_AUTHOR_NAME: "t",
+    GIT_AUTHOR_EMAIL: "t@example.invalid",
+    GIT_COMMITTER_NAME: "t",
+    GIT_COMMITTER_EMAIL: "t@example.invalid",
+    GIT_AUTHOR_DATE: "2020-01-01T00:00:00Z",
+    GIT_COMMITTER_DATE: "2020-01-01T00:00:00Z",
+  };
+
+  function fixtures(): Fixtures {
+    if (built !== null) return built;
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-diff-"));
+    const git = (...args: string[]): string =>
+      execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", env: GIT_ENV });
+    const write = (name: string, body: string): void => {
+      const target = join(dir, name);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, body);
+    };
+    const numbered = (count: number): string[] =>
+      Array.from({ length: count }, (_, i) => `line${i + 1}`);
+
+    git("-c", "init.defaultBranch=main", "init", "-q", ".");
+    write("src/app.ts", `${numbered(40).join("\n")}\n`);
+    write("sig.txt", "head\n-- signature\ntail\n");
+    write("nonl.txt", "no trailing newline");
+    write("ren.txt", "moved verbatim\n");
+    write("ascii.txt", "renamed onto a non-ASCII name\n");
+    write("gone.txt", "this file is removed entirely\n");
+    write("mode.sh", "#!/bin/sh\necho hi\n");
+    write("plus.txt", "one\ntwo\n");
+    write("spa ce.txt", "one\ntwo\n");
+    write("café.txt", "un\ndeux\n");
+    writeFileSync(join(dir, "bin.dat"), Buffer.from([0, 1, 2, 0, 255, 0]));
+    git("add", "-A");
+    git("commit", "-qm", "init");
+
+    const after = numbered(40);
+    after[2] = "CHANGED3";
+    after.splice(20, 0, "INSERTED");
+    after.splice(35, 1);
+    write("src/app.ts", `${after.join("\n")}\n`);
+    // Removing `-- signature` renders as `--- signature` and adding
+    // `++ replacement` renders as `+++ replacement`: back to back they are
+    // byte-identical to a file header pair.
+    write("sig.txt", "head\n++ replacement\ntail\n");
+    write("nonl.txt", "still no trailing newline");
+    git("mv", "ren.txt", "renamed.txt");
+    git("mv", "ascii.txt", "rené.txt");
+    write("added.txt", "brand new\nsecond\n");
+    write("plus.txt", "one\n+++ b/fake.txt\n--- a/fake.txt\n@@ -1 +1 @@\ntwo\n");
+    write("spa ce.txt", "one\nTWO\n");
+    write("café.txt", "un\nDEUX\n");
+    writeFileSync(join(dir, "bin.dat"), Buffer.from([0, 9, 9, 0]));
+    chmodSync(join(dir, "mode.sh"), 0o755);
+    rmSync(join(dir, "gone.txt"));
+    git("add", "-A");
+
+    const diff = git("diff", "--cached", "-M");
+    built = {
+      dir,
+      diff,
+      binaryDiff: git("diff", "--cached", "-M", "--binary"),
+      parsed: parseUnifiedDiff(diff),
+    };
+    return built;
+  }
+
+  function fileAt(parsed: ParsedDiff, path: string): ParsedDiffFile {
+    const hit = parsed.files.find((f) => f.newPath === path || f.oldPath === path);
+    if (hit === undefined) {
+      throw new Error(
+        `no stanza for ${path}; got ${parsed.files.map((f) => f.newPath).join(", ")}`,
+      );
+    }
+    return hit;
+  }
+
+  afterAll(() => {
+    if (built !== null) rmSync(built.dir, { recursive: true, force: true });
+  });
+
+  // Each of these pays for building the fixture repo on the first one to run
+  // (git init plus two commits' worth of work), so they carry their own budget.
+  test("git's own output parses with nothing unaccounted for", () => {
+    const { parsed } = fixtures();
+    expect(parsed.warnings).toEqual([]);
+    expect(parsed.files.map((f) => f.newPath ?? f.oldPath).sort()).toEqual([
+      "added.txt",
+      "bin.dat",
+      "café.txt",
+      "gone.txt",
+      "mode.sh",
+      "nonl.txt",
+      "plus.txt",
+      "renamed.txt",
+      "rené.txt",
+      "sig.txt",
+      "spa ce.txt",
+      "src/app.ts",
+    ]);
+  }, 20_000);
+
+  test("every new-file line number indexes the real file on disk", () => {
+    const { dir, parsed } = fixtures();
+    let checked = 0;
+    for (const file of parsed.files) {
+      if (file.binary || file.newPath === null) continue;
+      const actual = readFileSync(join(dir, file.newPath), "utf8").split("\n");
+      for (const hunk of file.hunks) {
+        for (const line of hunk.lines) {
+          if (line.newLine === null) continue;
+          expect({
+            at: `${file.newPath}:${line.newLine}`,
+            text: actual[line.newLine - 1],
+          }).toEqual({ at: `${file.newPath}:${line.newLine}`, text: line.text });
+          checked++;
+        }
+      }
+    }
+    // A parser that produced no lines would pass the loop above vacuously.
+    expect(checked).toBeGreaterThan(25);
+  }, 20_000);
+
+  test("every old-file line number indexes the committed file", () => {
+    const { dir, parsed } = fixtures();
+    let checked = 0;
+    for (const file of parsed.files) {
+      if (file.binary || file.oldPath === null) continue;
+      const before = execFileSync("git", ["-C", dir, "show", `HEAD:${file.oldPath}`], {
+        encoding: "utf8",
+        env: GIT_ENV,
+      }).split("\n");
+      for (const hunk of file.hunks) {
+        for (const line of hunk.lines) {
+          if (line.oldLine === null) continue;
+          expect({
+            at: `${file.oldPath}:${line.oldLine}`,
+            text: before[line.oldLine - 1],
+          }).toEqual({ at: `${file.oldPath}:${line.oldLine}`, text: line.text });
+          checked++;
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(25);
+  }, 20_000);
+
+  test("a multi-hunk file keeps each hunk's header and restarts the counter from it", () => {
+    const app = fileAt(fixtures().parsed, "src/app.ts");
+    expect(
+      app.hunks.map((h) => `@@ -${h.oldStart},${h.oldCount} +${h.newStart},${h.newCount} @@`),
+    ).toEqual(["@@ -1,6 +1,6 @@", "@@ -18,6 +18,7 @@", "@@ -32,7 +33,6 @@"]);
+    // The insertion in hunk two pushes everything after it down by one, which
+    // is exactly the shift a caller editing by line number has to get right.
+    const second = app.hunks[1]?.lines ?? [];
+    expect(second.map((l) => [l.kind, l.oldLine, l.newLine])).toEqual([
+      ["context", 18, 18],
+      ["context", 19, 19],
+      ["context", 20, 20],
+      ["added", null, 21],
+      ["context", 21, 22],
+      ["context", 22, 23],
+      ["context", 23, 24],
+    ]);
+    expect(app.hunks[1]?.section).toBe("line17");
+    expect({ added: app.added, removed: app.removed }).toEqual({ added: 2, removed: 2 });
+  }, 20_000);
+
+  test("an added line beginning with '+++' is content, not a file header", () => {
+    const { parsed } = fixtures();
+    const plus = fileAt(parsed, "plus.txt");
+    expect(plus.hunks[0]?.lines.map((l) => [l.kind, l.newLine, l.text])).toEqual([
+      ["context", 1, "one"],
+      ["added", 2, "+++ b/fake.txt"],
+      ["added", 3, "--- a/fake.txt"],
+      ["added", 4, "@@ -1 +1 @@"],
+      ["context", 5, "two"],
+    ]);
+    // The give-away that it was read as a header would be a phantom stanza.
+    expect(parsed.files.filter((f) => f.newPath === "fake.txt")).toEqual([]);
+  }, 20_000);
+
+  test("a removed '-- x' beside an added '++ y' is not a header pair", () => {
+    const sig = fileAt(fixtures().parsed, "sig.txt");
+    expect(sig.hunks[0]?.lines.map((l) => [l.kind, l.newLine, l.text])).toEqual([
+      ["context", 1, "head"],
+      ["removed", null, "-- signature"],
+      ["added", 2, "++ replacement"],
+      ["context", 3, "tail"],
+    ]);
+  }, 20_000);
+
+  test("a rename with no content change is a rename with no hunks", () => {
+    const renamed = fileAt(fixtures().parsed, "renamed.txt");
+    expect({
+      oldPath: renamed.oldPath,
+      newPath: renamed.newPath,
+      renamed: renamed.renamed,
+      status: renamed.status,
+      similarity: renamed.similarity,
+      hunks: renamed.hunks.length,
+    }).toEqual({
+      oldPath: "ren.txt",
+      newPath: "renamed.txt",
+      renamed: true,
+      status: "renamed",
+      similarity: 100,
+      hunks: 0,
+    });
+  }, 20_000);
+
+  test("a rename whose new name alone is quoted splits and decodes", () => {
+    // git quotes per path: `diff --git a/ascii.txt "b/ren\\303\\251.txt"`.
+    const accented = fileAt(fixtures().parsed, "rené.txt");
+    expect({ old: accented.oldPath, new: accented.newPath, renamed: accented.renamed }).toEqual({
+      old: "ascii.txt",
+      new: "rené.txt",
+      renamed: true,
+    });
+  }, 20_000);
+
+  test("a binary stanza is flagged and carries no lines", () => {
+    const bin = fileAt(fixtures().parsed, "bin.dat");
+    expect({ binary: bin.binary, hunks: bin.hunks.length }).toEqual({ binary: true, hunks: 0 });
+  }, 20_000);
+
+  test("a `--binary` base85 payload does not leak into the next file", () => {
+    // The payload's lines start with a length letter and would read as stray
+    // content; the file after it in the diff is what proves they were skipped.
+    const parsed = parseUnifiedDiff(fixtures().binaryDiff);
+    expect(parsed.warnings).toEqual([]);
+    expect(fileAt(parsed, "bin.dat").binary).toBe(true);
+    expect(fileAt(parsed, "plus.txt").hunks[0]?.lines[1]).toEqual({
+      kind: "added",
+      oldLine: null,
+      newLine: 2,
+      text: "+++ b/fake.txt",
+    });
+  }, 20_000);
+
+  test("a missing trailing newline is recorded on the line and on the file", () => {
+    const nonl = fileAt(fixtures().parsed, "nonl.txt");
+    expect(nonl.hunks[0]?.lines).toEqual([
+      { kind: "removed", oldLine: 1, newLine: null, text: "no trailing newline", noNewline: true },
+      {
+        kind: "added",
+        oldLine: null,
+        newLine: 1,
+        text: "still no trailing newline",
+        noNewline: true,
+      },
+    ]);
+    expect({ old: nonl.oldNoFinalNewline, new: nonl.newNoFinalNewline }).toEqual({
+      old: true,
+      new: true,
+    });
+  }, 20_000);
+
+  test("a file that ends with a newline is not marked as missing one", () => {
+    const app = fileAt(fixtures().parsed, "src/app.ts");
+    expect({ old: app.oldNoFinalNewline, new: app.newNoFinalNewline }).toEqual({
+      old: false,
+      new: false,
+    });
+  }, 20_000);
+
+  test("an added file has no old path and a deleted file has no new one", () => {
+    const { parsed } = fixtures();
+    const added = fileAt(parsed, "added.txt");
+    expect({ old: added.oldPath, status: added.status }).toEqual({ old: null, status: "added" });
+    expect(added.hunks[0]?.lines.map((l) => l.newLine)).toEqual([1, 2]);
+    const gone = fileAt(parsed, "gone.txt");
+    expect({ new: gone.newPath, status: gone.status }).toEqual({ new: null, status: "deleted" });
+    expect(gone.hunks[0]?.lines[0]?.newLine).toBeNull();
+  }, 20_000);
+
+  test("a mode-change stanza carries both modes and no hunks", () => {
+    const mode = fileAt(fixtures().parsed, "mode.sh");
+    expect({ old: mode.oldMode, new: mode.newMode, hunks: mode.hunks.length }).toEqual({
+      old: "100644",
+      new: "100755",
+      hunks: 0,
+    });
+  }, 20_000);
+
+  test("a path with a space keeps its space, and git's tab terminator is dropped", () => {
+    // git appends a tab after a `---`/`+++` path containing a space; keeping
+    // it would make every later path comparison miss.
+    const spaced = fileAt(fixtures().parsed, "spa ce.txt");
+    expect({ old: spaced.oldPath, new: spaced.newPath }).toEqual({
+      old: "spa ce.txt",
+      new: "spa ce.txt",
+    });
+  }, 20_000);
+
+  test("git's octal-escaped non-ASCII path is decoded back to its bytes", () => {
+    // git writes `"a/caf\303\251.txt"`: two escapes for one character, so
+    // decoding per code point instead of per byte yields mojibake.
+    const accented = fileAt(fixtures().parsed, "café.txt");
+    expect(accented.newPath).toBe("café.txt");
+  }, 20_000);
 });
 
 describe("truncateToChars", () => {

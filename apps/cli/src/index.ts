@@ -3652,6 +3652,11 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     html,
     verify,
     table,
+    changeset,
+    buildperf,
+    registry,
+    supplychain,
+    containers,
   ] = await Promise.all([
     import("@crewhaus/tool-fs"),
     import("@crewhaus/tool-bash"),
@@ -3690,6 +3695,11 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     import("@crewhaus/tool-html"),
     import("@crewhaus/tool-verify"),
     import("@crewhaus/tool-table"),
+    import("@crewhaus/tool-changeset"),
+    import("@crewhaus/tool-buildperf"),
+    import("@crewhaus/tool-registry"),
+    import("@crewhaus/tool-supplychain"),
+    import("@crewhaus/tool-containers"),
   ]);
   const map: Record<string, RegisteredTool> = {
     read: fs.read,
@@ -3720,6 +3730,28 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     codegraphCallers: codegraph.codegraphCallers,
     codegraphCallees: codegraph.codegraphCallees,
     codegraphImpact: codegraph.codegraphImpact,
+    // @crewhaus/tool-table
+    dataDriftCheck: table.dataDriftCheck,
+    // @crewhaus/tool-containers
+    containerImageInspect: containers.containerImageInspect,
+    containerImageTags: containers.containerImageTags,
+    // @crewhaus/tool-supplychain
+    dependencyAudit: supplychain.dependencyAudit,
+    ciWorkflowAudit: supplychain.ciWorkflowAudit,
+    // @crewhaus/tool-registry
+    registryPackageInfo: registry.registryPackageInfo,
+    registrySearch: registry.registrySearch,
+    registryOutdated: registry.registryOutdated,
+    manifestDependencySet: registry.manifestDependencySet,
+    // @crewhaus/tool-buildperf
+    bundleSizeCheck: buildperf.bundleSizeCheck,
+    benchmarkCompare: buildperf.benchmarkCompare,
+    flakyTestDetect: buildperf.flakyTestDetect,
+    // @crewhaus/tool-changeset
+    diffLint: changeset.diffLint,
+    docsSymbolCheck: changeset.docsSymbolCheck,
+    // @crewhaus/tool-text
+    diffParse: text.diffParse,
     // @crewhaus/tool-table
     contactNormalize: table.contactNormalize,
     fixedWidthParse: table.fixedWidthParse,

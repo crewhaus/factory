@@ -52,15 +52,12 @@ import {
   type Dependency,
   type LockedVersion,
   matchWorkspaceGlob,
-  parseBunLock,
-  parseCargoLock,
   parseCargoToml,
   parseGoMod,
+  parseLockfileDetailed,
   parsePackageJson,
-  parsePackageLock,
   parsePyproject,
   parseRequirementsTxt,
-  parseYarnLock,
   satisfies,
 } from "./lib/deps";
 import {
@@ -1472,22 +1469,26 @@ type LockSource = { readonly file: string; readonly locked: readonly LockedVersi
 function readLocks(dirAbs: string): { sources: LockSource[]; notes: string[] } {
   const sources: LockSource[] = [];
   const notes: string[] = [];
-  const add = (name: string, parse: (text: string) => LockedVersion[]): void => {
+  const add = (name: string): void => {
     const text = readTextFile(path.join(dirAbs, name));
     if (text === undefined) return;
-    sources.push({ file: name, locked: parse(text) });
+    // The filename-to-reader mapping lives in `deps.ts` and only there, so a
+    // format cannot end up half-added — read by one caller and invisible to
+    // the next. These tools use the narrow half of what comes back; the wide
+    // half is for the packages that go to a registry with an entry.
+    const locked = parseLockfileDetailed(name, text);
+    if (locked === undefined) return;
+    sources.push({ file: name, locked });
   };
-  add("bun.lock", parseBunLock);
-  add("package-lock.json", parsePackageLock);
-  add("yarn.lock", parseYarnLock);
-  add("Cargo.lock", parseCargoLock);
+  add("bun.lock");
+  add("package-lock.json");
+  add("yarn.lock");
+  add("pnpm-lock.yaml");
+  add("Cargo.lock");
   if (fileExists(path.join(dirAbs, "bun.lockb"))) {
     notes.push(
       "bun.lockb is bun's BINARY lockfile and cannot be read here; run `bun install --save-text-lockfile` to get a bun.lock this tool can read",
     );
-  }
-  if (fileExists(path.join(dirAbs, "pnpm-lock.yaml"))) {
-    notes.push("pnpm-lock.yaml is not parsed by this package, so locked versions are unavailable");
   }
   return { sources, notes };
 }
@@ -1595,7 +1596,7 @@ export const dependencyList: RegisteredTool = buildTool({
 export const dependencyOutdated: RegisteredTool = buildTool({
   name: "DependencyOutdated",
   description:
-    "Compare a project's declared dependency ranges against what its lockfile actually resolved, and report the drift: ranges no locked version satisfies, dependencies missing from the lock, and packages locked at several versions at once. Use it to tell whether the lockfile is stale relative to the manifests before trusting an install. Two limits, both of which it reports: it NEVER contacts a registry, so it cannot say a newer version exists upstream, and it compares only npm and cargo, because bun.lock, package-lock.json, yarn.lock and Cargo.lock are the lockfiles it reads — a Python or Go dependency is counted as unchecked rather than declared fine.",
+    "Compare a project's declared dependency ranges against what its lockfile actually resolved, and report the drift: ranges no locked version satisfies, dependencies missing from the lock, and packages locked at several versions at once. Use it to tell whether the lockfile is stale relative to the manifests before trusting an install. Two limits, both of which it reports: it NEVER contacts a registry, so it cannot say a newer version exists upstream, and it compares only npm and cargo, because bun.lock, package-lock.json, yarn.lock, pnpm-lock.yaml and Cargo.lock are the lockfiles it reads — a Python or Go dependency is counted as unchecked rather than declared fine.",
   inputSchema: z.object({
     cwd: cwdField,
     includeUncheckable: z
@@ -1966,22 +1967,40 @@ export const CODE_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
 ]);
 
 /**
- * The semver helpers, re-exported for other tool packages.
+ * The semver helpers and the lockfile readers, re-exported for other tool
+ * packages.
  *
  * `DependencyOutdated` here and `SemverResolve` in `@crewhaus/tool-pkg` both
  * have to answer "does this version satisfy this range?". Two
  * implementations of that would disagree at the edges — prerelease ordering,
  * `^0.x`, wildcard forms — and a harness would get one answer from one tool
  * and another from the next. There is one implementation, and it is here.
+ *
+ * The same rule holds for the lockfiles, and the `*Detailed` readers are why
+ * it can keep holding. A package that needs a dependency's resolved URL or
+ * integrity hash — to ask a vulnerability database or a registry about it —
+ * takes the wide view of the SAME parse the tools here take the narrow view
+ * of, instead of copying a lockfile reader and drifting from this one the
+ * first time a format changes.
  */
 export {
+  LOCKFILE_NAMES,
+  type LockEcosystem,
+  type LockedDependency,
   type LockedVersion,
   type SemVer,
   compareSemver,
   parseBunLock,
+  parseBunLockDetailed,
   parseCargoLock,
+  parseCargoLockDetailed,
+  parseLockfileDetailed,
   parsePackageLock,
+  parsePackageLockDetailed,
+  parsePnpmLock,
+  parsePnpmLockDetailed,
   parseSemver,
   parseYarnLock,
+  parseYarnLockDetailed,
   satisfies,
 } from "./lib/deps";

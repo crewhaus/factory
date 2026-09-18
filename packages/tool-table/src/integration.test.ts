@@ -78,6 +78,7 @@ describe("dispatch through executeTool", () => {
       TableReshape: { file: "a.csv", direction: "long", idColumns: ["id"] },
       TableShard: { file: "a.csv", maxRows: 1, planOnly: true },
       FixedWidthParse: { file: "f.txt", fields: [{ name: "a", start: 1, length: 2 }] },
+      DataDriftCheck: { referenceFile: "a.csv", file: "b.csv", epsilon: 0.001 },
     };
     for (const tool of TABLE_TOOLS) {
       const result = await executeTool(lookup(tool.name), inputs[tool.name], {
@@ -133,5 +134,83 @@ describe("the intake these exist for", () => {
       c.changes.filter((x) => x.column === "amount"),
     );
     expect(amounts[0]).toMatchObject({ from: "100", to: "150" });
+  });
+});
+
+describe("the drift gate these exist for", () => {
+  test("bank a baseline today, gate tomorrow's feed against it", async () => {
+    // A month of a well-behaved feed, then a day where the upstream system
+    // started sending amounts in cents and a payment method nobody has seen.
+    const month: string[] = ["amount,method"];
+    for (let i = 0; i < 300; i++) {
+      month.push(`${(10 + i / 10).toFixed(2)},${["card", "card", "ach"][i % 3]}`);
+    }
+    write("month.csv", `${month.join("\n")}\n`);
+    const tomorrow: string[] = ["amount,method"];
+    for (let i = 0; i < 300; i++) {
+      tomorrow.push(`${(1000 + i * 10).toFixed(2)},${["card", "wallet", "ach"][i % 3]}`);
+    }
+    write("tomorrow.csv", `${tomorrow.join("\n")}\n`);
+
+    // 1. Bank the baseline. The bin edges are the part worth storing: they are
+    //    the only thing that cannot be recovered from tomorrow's data.
+    const banked = await executeTool(
+      lookup("TableProfile"),
+      { file: "month.csv", driftProfile: {} },
+      { toolUseId: "d1" },
+    );
+    expect(banked.isError).toBe(false);
+    const baseline = JSON.parse(banked.content);
+    expect(baseline.driftCapture.version).toBe(1);
+    expect(baseline.columns[0].drift.edges.length).toBe(11);
+    write("baseline.json", banked.content);
+
+    // 2. Gate tomorrow against it.
+    const gated = await executeTool(
+      lookup("DataDriftCheck"),
+      {
+        referenceProfile: "baseline.json",
+        file: "tomorrow.csv",
+        epsilon: 1e-3,
+        failOn: { psi: 0.25, newCategories: 0, rowCountRatio: 1.2 },
+      },
+      { toolUseId: "d2" },
+    );
+    expect(gated.isError).toBe(false);
+    const report = JSON.parse(gated.content);
+    expect(report.gate.ok).toBe(false);
+    expect(report.gate.failures.join(" ")).toContain("amount");
+    expect(report.gate.failures.join(" ")).toContain("wallet");
+    // The row count did NOT change, so that gate must stay quiet — a verdict
+    // that fires everything at once tells you nothing about which thing broke.
+    expect(report.gate.failures.join(" ")).not.toContain("row count");
+
+    // 3. The same gate against the same file it was cut from is clean, which
+    //    is the property that makes a red result mean something.
+    const clean = await executeTool(
+      lookup("DataDriftCheck"),
+      {
+        referenceProfile: "baseline.json",
+        file: "month.csv",
+        epsilon: 1e-3,
+        failOn: { psi: 0.25, newCategories: 0, rowCountRatio: 1.2, schemaDrift: true },
+      },
+      { toolUseId: "d3" },
+    );
+    expect(JSON.parse(clean.content).gate).toMatchObject({ ok: true, failures: [] });
+  });
+
+  test("a baseline with no bin edges is an answer, not a stack trace", async () => {
+    write("x.csv", "v\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n");
+    const plain = await executeTool(lookup("TableProfile"), { file: "x.csv" }, { toolUseId: "d4" });
+    write("plain.json", plain.content);
+    const result = await executeTool(
+      lookup("DataDriftCheck"),
+      { referenceProfile: "plain.json", file: "x.csv", epsilon: 1e-3 },
+      { toolUseId: "d5" },
+    );
+    // A refusal the harness can read and act on, dispatched as a normal result.
+    expect(result.isError).toBe(false);
+    expect(result.content).toContain("driftProfile");
   });
 });

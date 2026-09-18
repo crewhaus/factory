@@ -151,6 +151,60 @@ describe("LockfileDiff", () => {
     expect(result.counts).toMatchObject({ added: 1, removed: 1, major: 1 });
   });
 
+  // The bug this guards: `pnpm-lock.yaml` used to be routed to the yarn
+  // reader, which collects nothing from any pnpm generation. Nothing threw —
+  // the counts came back all zeros, which reads as "this bump changed
+  // nothing" rather than as "this file was never read".
+  test("pnpm lockfiles are read, not silently counted as empty", async () => {
+    const lock = (zod: string, extra: string): string =>
+      [
+        "lockfileVersion: '9.0'",
+        "",
+        "packages:",
+        "",
+        `  zod@${zod}:`,
+        "    resolution: {integrity: sha512-Abc==}",
+        "",
+        `  ${extra}:`,
+        "    resolution: {integrity: sha512-Def==}",
+        "",
+      ].join("\n");
+    writeFileSync(join(workspace, "before-pnpm-lock.yaml"), lock("3.23.8", "left@1.0.0"));
+    writeFileSync(join(workspace, "after-pnpm-lock.yaml"), lock("4.0.0", "added@0.1.0"));
+    const result = await call<{ counts: Record<string, number>; changed: unknown[] }>(
+      lockfileDiff,
+      { before: "before-pnpm-lock.yaml", after: "after-pnpm-lock.yaml" },
+    );
+    expect(result.counts).toMatchObject({ added: 1, removed: 1, major: 1 });
+    expect(result.changed).toEqual([{ name: "zod", from: "3.23.8", to: "4.0.0", bump: "major" }]);
+  });
+
+  test("the v5 and v6 key grammars are read too", async () => {
+    writeFileSync(
+      join(workspace, "v5-pnpm-lock.yaml"),
+      "lockfileVersion: 5.4\n\npackages:\n\n  /zod/3.23.8:\n    resolution: {integrity: sha512-A==}\n",
+    );
+    writeFileSync(
+      join(workspace, "v6-pnpm-lock.yaml"),
+      "lockfileVersion: '6.0'\n\npackages:\n\n  /zod@4.0.0:\n    resolution: {integrity: sha512-B==}\n",
+    );
+    const result = await call<{ counts: Record<string, number> }>(lockfileDiff, {
+      before: "v5-pnpm-lock.yaml",
+      after: "v6-pnpm-lock.yaml",
+    });
+    expect(result.counts).toMatchObject({ added: 0, removed: 0, major: 1 });
+  });
+
+  // The other half of the same drift: `bun.lockb` is binary, and handing it
+  // to the `bun.lock` text reader also produced zero entries rather than an
+  // error. It is refused by name now.
+  test("bun.lockb is refused rather than read as text", async () => {
+    writeFileSync(join(workspace, "bun.lockb"), Buffer.from([0x62, 0x00, 0x01, 0xff]));
+    await expect(
+      callRaw(lockfileDiff, { before: "bun.lockb", after: "bun.lockb" }),
+    ).rejects.toThrow(/BINARY/);
+  });
+
   test("a lockfile whose format cannot be told is an error naming what it expected", async () => {
     writeFileSync(join(workspace, "mystery.txt"), "{}");
     await expect(

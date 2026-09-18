@@ -2,7 +2,7 @@
   "name": "@crewhaus/tool-text",
   "version": "0.6.0",
   "type": "module",
-  "description": "Deterministic text tools: regex extraction, diffing, budget truncation, log compaction, outlining, templating, rule classification, normalization, similarity, and escaping",
+  "description": "Deterministic text tools: regex extraction, diffing, unified-diff parsing, budget truncation, log compaction, outlining, templating, rule classification, normalization, similarity, and escaping",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {

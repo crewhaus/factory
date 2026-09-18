@@ -5,6 +5,7 @@ Making a messy export usable.
 | Tool | Answers |
 |---|---|
 | `TableProfile` | what is actually in this file |
+| `DataDriftCheck` | has today's feed moved away from the baseline |
 | `TableDiff` | what changed since yesterday's export |
 | `RecordLinkage` | is this the same customer as that one |
 | `ContactNormalize` | what do these identifiers look like canonically |
@@ -82,6 +83,95 @@ them at that size is not a result, it is the file again.
 or mainframe spec states them. Converting in your head is how a field ends up
 one character off down the whole file.
 
+## Drift, and the one thing a baseline has to carry
+
+`DataDriftCheck` compares today's file against a `TableProfile` taken earlier
+and reports schema drift, distribution shift, null-rate and cardinality jumps,
+categories that are new today, and the row-count ratio.
+
+The Population Stability Index at the centre of it is only meaningful when
+today's numbers are binned against the **baseline's** bin edges. Bin each side
+against its own quantiles and both come back as ten deciles of ten percent, so
+the index reads near zero however far the data moved — and that is not an edge
+case, it is what happens every time. In this package's own tests, a column
+moved bodily from 0-100 to 500-600 scores **11.46** against the stored edges
+and **exactly 0** against fresh ones.
+
+So the edges are captured when the baseline is taken, and cannot be recovered
+afterwards:
+
+```
+TableProfile { file: "month.csv", driftProfile: {} }   # stores edges, category
+                                                       # counts and a value sample
+DataDriftCheck { referenceProfile: "month.json", file: "today.csv", epsilon: 1e-3 }
+```
+
+A baseline profiled without `driftProfile` is **refused**, with the command
+that fixes it, rather than answered from edges derived on the spot. So is a
+column whose two sides were somehow binned differently.
+
+`driftProfile` is opt-in because the capture is machine fodder — a 500-value
+sample per numeric column makes the answer a person asked for worse. A profile
+taken without it is byte-for-byte what it always was.
+
+## Epsilon is an input, not a constant
+
+An empty bin makes the PSI log term infinite, so an empty bin's share is
+floored at `epsilon`. That floor decides the verdict. For a ten-bin baseline
+where one bin empties out:
+
+| epsilon | PSI | band |
+|---|---|---|
+| 0.001 | 0.4664 | significant |
+| 0.01 | 0.2178 | moderate |
+| 0.05 | 0.0452 | stable |
+
+Three ship decisions from one dataset. `epsilon` is therefore a **required**
+input with no default anywhere in the stack, it is echoed in the result, and a
+PSI that leaned on the floor says so. Put it in the same config as the
+threshold it is compared against.
+
+Values beyond the baseline's range get their own two bins rather than being
+clamped into the end ones: a distribution that walked off the edge of the chart
+is the loudest drift signal there is, and clamping is how it reads as stable.
+
+## What the drift check refuses to say
+
+- **New categories, when the stored list was capped.** With a truncated list
+  there is no telling a genuinely new value from one that was always there and
+  merely rare. "Three new payment methods appeared" is a sentence somebody
+  acts on, so a wrong one is worse than none.
+- **A p-value the approximation does not support.** The rank test carries the
+  kernel's own `normalApproximationValid`, and an invalid p cannot trip the
+  `pValue` gate — below eight values a side it is a rank ordering, not a rate.
+  The chi-square carries Cochran's condition for the same reason.
+- **A distribution comparison across a type flip.** A column that arrives as
+  numbers and returns as labels is reported as `kindChanged`; its null rate and
+  cardinality are still compared, because those still mean something.
+- **Anything, when `failOn` is absent.** `gate.ok` is then true because nothing
+  was checked, and it says so in as many words.
+- **A comparison across a repeated header.** Two columns with one name give no
+  fact about which is which, so they are named in the notes and left
+  uncompared rather than matched to whichever came last.
+
+A refusal is not a pass. Every threshold above that could not be evaluated —
+PSI on a column that stopped parsing, new categories on a capped list, a p the
+approximation does not support, any per-column gate on a column that vanished
+or whose name repeats — lands in `gate.unchecked`, and `gate.ok` is **false**
+while that list is non-empty. `failures` still means "measured and breached",
+so the two are told apart; `unchecked` means the gate never got to look, which
+is the one thing "ok" must never be allowed to mean.
+
+Statistics come from `@crewhaus/tool-math`'s kernel — Mann-Whitney, PSI and the
+normal tail live there for the whole repository. The chi-square test of
+homogeneity and its incomplete-gamma tail are the one piece that was not
+already there; the df=1 case is pinned against that kernel's normal tail, which
+is an exact identity and so an independent oracle.
+
+One JSON wrinkle worth knowing: the out-of-range bins are bounded by infinity,
+and `JSON.stringify` turns those into `null`. The bin's `label` (`"(-inf, 0)"`,
+`"[99, +inf)"`) is the field to read.
+
 ## What it does not do
 
 - **It does not write.** Everything here reads; `TableShard` returns the
@@ -93,3 +183,5 @@ one character off down the whole file.
   width only; `xlsxRead` in `@crewhaus/tool-docs` handles spreadsheets.
 - **It does not clean data.** Nothing here corrects a value, fills a null or
   resolves an inconsistency — it tells you they are there.
+- **It does not explain drift.** `DataDriftCheck` says which column moved and
+  by how much. Why it moved is upstream of here.

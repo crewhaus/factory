@@ -150,11 +150,60 @@ depends on something other than the input: the glyphs come from the runtime's
 ICU/CLDR data, identical for a given runtime, not guaranteed across runtime
 versions. That caveat is in the tool's own description too.
 
+## The nonparametric kernel — a library, not a tool
+
+`src/lib/stats-kernel.ts` is exported from the package root as `statsKernel`
+and registers **no tool**. It is what CI gates import when they have to decide
+something from a handful of noisy numbers:
+
+| Function | The question |
+|---|---|
+| `mannWhitneyU` | Did this branch really get slower, or was the runner busy? |
+| `wilsonScoreInterval` | How flaky is a test that failed 3 of 5 runs? |
+| `cohensKappa` | Do two raters agree beyond what chance would give them? |
+| `populationStabilityIndex`, `psiOverEdges`, `binCounts` | Has the input distribution moved? |
+| `median`, `quantile`, `trimmedMean`, `medianAbsoluteDeviation` | Robust location and spread |
+| `normalCdf`, `normalUpperTail`, `TWO_SIDED_Z` | The normal distribution underneath all of it |
+
+Four things make it usable for a gate rather than for a report:
+
+**`null` means "this data cannot answer this question".** Never `NaN`, never a
+plausible number, never a throw for a degenerate-but-legal shape — no
+observations, one observation, every value identical, every observation tied.
+A throw is reserved for a caller bug: mismatched array lengths, a negative
+count, bin edges that do not increase. Every nullable result says so in its
+type, because a gate that reads `null` as `0` ships on no evidence.
+
+**Three failures in five runs is not 60%.** It is `[0.231, 0.882]` at 95% —
+a range that spans "mildly annoying" and "the test is broken" without telling
+them apart. Quarantining on the point estimate is quarantining on noise.
+
+**Every convention is named and pinned.** The quantile is R-7 (R's and NumPy's
+default). The trimmed mean is R's `mean(x, trim=)`, cutting `floor(n·trim)` per
+tail. Mann-Whitney carries the standard tie correction and a continuity
+correction you can switch off. Each is pinned in `lib.test.ts` to a published
+worked example or, for the Mann-Whitney small-sample case, to a brute-force
+enumeration of the exact null distribution derived in the test itself.
+
+**PSI takes its bin edges and its epsilon as arguments.** Edges, because PSI
+only means anything when the *reference's* edges are reused for the current
+data — a function that re-bins each sample by its own quantiles reports "no
+drift" no matter how far the distribution moved. Epsilon, because it decides
+the verdict: on one ten-bin comparison, `1e-3` gives PSI 0.47 ("significant"),
+`1e-2` gives 0.22 ("moderate") and `0.05` gives 0.05 ("stable"). Same data,
+three ship decisions. It has no default anywhere in the file.
+
+The normal approximation to U stops being trustworthy below about eight
+observations per sample, and `normalApproximationValid` says so: at five
+versus five, fully separated, it reads p = 0.0122 where the exact test reads
+0.0079.
+
 ## Layout
 
 `src/lib/` holds the pure functions and is where the behaviour is tested;
 `src/index.ts` wraps them as tools. A bug in `divideRound` reads better as a
-failing unit than as a failing tool call.
+failing unit than as a failing tool call. `src/lib/stats-kernel.ts` is the one
+file with no tool above it — see the section above for why.
 
 ## Safety flags
 

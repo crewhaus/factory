@@ -90,6 +90,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "textSimilarity",
       "truncateToBudget",
       "wrapText",
+      "diffParse",
     ],
   },
 
@@ -663,7 +664,36 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "tableProfile",
       "tableReshape",
       "tableShard",
+      "dataDriftCheck",
     ],
+  },
+
+  changeset: {
+    title:
+      "Decide everything you can about a change set from the diff alone, before it becomes a PR",
+    tools: ["diffLint", "docsSymbolCheck"],
+  },
+
+  buildperf: {
+    title: "Measure this build against its baseline: bundle size, benchmark timings and flakiness",
+    tools: ["bundleSizeCheck", "benchmarkCompare", "flakyTestDetect"],
+  },
+
+  registry: {
+    title:
+      "Ask the public package registries what exists and what is newest, and write it back into a manifest",
+    tools: ["registryPackageInfo", "registrySearch", "registryOutdated", "manifestDependencySet"],
+  },
+
+  supplychain: {
+    title: "Known vulnerabilities from a lockfile, and supply-chain hygiene in a CI workflow",
+    tools: ["dependencyAudit", "ciWorkflowAudit"],
+  },
+
+  containers: {
+    title:
+      "Resolve image tags to digests and list tags over the OCI distribution API, with no daemon and no pull",
+    tools: ["containerImageInspect", "containerImageTags"],
   },
 
   // ---- roll-ups ----
@@ -680,6 +710,11 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "codehost",
       "toolchain",
       "packaging",
+      "changeset",
+      "buildperf",
+      "registry",
+      "supplychain",
+      "containers",
     ],
   },
   filesystem: {
@@ -708,7 +743,12 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   network: {
     title: "Everything that reaches the network",
-    includes: ["web", "http"],
+    // A leaf may sit in more than one roll-up — `text` is in both `compute`
+    // and `content`. These three are listed under `code` because that is what
+    // they are FOR, and here because of what they DO: a registry read, an OSV
+    // query and an OCI manifest fetch all leave the machine, and a roll-up
+    // that claims "everything that reaches the network" has to mean it.
+    includes: ["web", "http", "registry", "supplychain", "containers"],
   },
   compute: {
     title: "Everything a harness can do with no I/O at all — pure, in-process, zero tokens",

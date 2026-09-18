@@ -996,6 +996,18 @@ export const geoPointInPolygon: RegisteredTool = buildTool({
 /** The currency table, exported so a caller can check a code before using it. */
 export { CURRENCY_MINOR_UNITS, KNOWN_CURRENCIES };
 
+/**
+ * The nonparametric kernel (Mann-Whitney, Wilson, Cohen's kappa, PSI, robust
+ * location and spread), exported as a namespace rather than flattened: it has
+ * its own `median` and `quantile`, and colliding those with `./lib/stats`'s
+ * differently-behaved pair in one flat surface is how a caller ends up with
+ * the throwing one where they wanted the null-returning one.
+ *
+ * Registers no tool — every one of these is a number a CI gate decides on, and
+ * a gate calls a library, not a model.
+ */
+export * as statsKernel from "./lib/stats-kernel";
+
 /** Every tool this package registers, in the order a catalog should list them. */
 export const MATH_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   amortize,
