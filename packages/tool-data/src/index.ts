@@ -1086,3 +1086,21 @@ export const DATA_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   unflattenObject,
   xmlParse,
 ]);
+
+/**
+ * The CSV and record helpers, re-exported for other tool packages.
+ *
+ * `@crewhaus/tool-table` profiles and reconciles the same files this package
+ * parses, and two CSV readers in one repository would disagree about
+ * quoting, embedded newlines and what counts as a null token — on the same
+ * file, in different tools, which is the worst way to disagree.
+ */
+export {
+  type CsvParseOptions,
+  type CsvParseResult,
+  inferScalar,
+  normalizeHeader,
+  parseCsv,
+  rowsToRecords,
+  unionKeys,
+} from "./lib/csv";

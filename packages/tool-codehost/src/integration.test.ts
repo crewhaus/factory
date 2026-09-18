@@ -281,7 +281,8 @@ describe("every tool completes a round trip under dispatch", () => {
       });
       expect(String(result.content).includes(TOKEN)).toBe(false);
     }
-  });
+    // Calls every tool in the package once.
+  }, 20_000);
 
   test("results are deterministic — the same call twice gives the same bytes", async () => {
     const args = { owner: "acme", repo: "widget", number: 1 };

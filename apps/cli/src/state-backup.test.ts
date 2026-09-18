@@ -465,7 +465,8 @@ describe("crewhaus state restore --merge feedback", () => {
     };
     expect(sample.input).toBe("hello");
     expect(sample.metadata["user_rating"]).toBe(1);
-  });
+    // Spawns the real CLI several times; bun's 5s default is not a margin.
+  }, 20_000);
 
   test("a local rating folds with archived feedback instead of being clobbered", async () => {
     // Deployed bot rated the turn (earlier ts) with a comment.
@@ -500,7 +501,8 @@ describe("crewhaus state restore --merge feedback", () => {
     // newest rating wins (local down came later); the archived comment survives
     expect(rec.rating.thumbs).toBe("down");
     expect(rec.comment).toBe("solid");
-  });
+    // Spawns the real CLI several times; bun's 5s default is not a margin.
+  }, 20_000);
 
   test("dies cleanly when the archive carries no feedback at all", async () => {
     const harness = join(tmp, "src");

@@ -1,14 +1,3 @@
-/**
- * The pure functions, tested against published vectors wherever one exists.
- *
- * A hash or an encoder is only worth having if it agrees with everyone else's,
- * so these tests assert the RFC's own numbers rather than whatever this
- * implementation happens to produce: RFC 1321 for MD5, FIPS 180 for SHA,
- * RFC 4231 and RFC 2202 for HMAC, the ULID and UUID specifications for the
- * identifiers. MD5 additionally gets a differential test against Bun's own
- * implementation across three hundred input lengths, which is what catches a
- * padding bug at a block boundary.
- */
 import { describe, expect, test } from "bun:test";
 import {
   base64ToBytes,
@@ -47,6 +36,18 @@ import {
   uuidVersion,
 } from "./lib/ids";
 import { claimInstants, decodeJwt, verifyJwt } from "./lib/jwt";
+/**
+ * The pure functions, tested against published vectors wherever one exists.
+ *
+ * A hash or an encoder is only worth having if it agrees with everyone else's,
+ * so these tests assert the RFC's own numbers rather than whatever this
+ * implementation happens to produce: RFC 1321 for MD5, FIPS 180 for SHA,
+ * RFC 4231 and RFC 2202 for HMAC, the ULID and UUID specifications for the
+ * identifiers. MD5 additionally gets a differential test against Bun's own
+ * implementation across three hundred input lengths, which is what catches a
+ * padding bug at a block boundary.
+ */
+import { keccak256Hex } from "./lib/keccak";
 import { slugify } from "./lib/slug";
 import { instantToMillis, isoFromMillis } from "./lib/time";
 import { buildUrl, decodeUrlText, encodeUrlText, normalizeUrl, parseUrl } from "./lib/url";
@@ -1185,5 +1186,52 @@ describe("time", () => {
     expect(isoFromMillis(0)).toBe("1970-01-01T00:00:00.000Z");
     expect(isoFromMillis(1e17)).toBeUndefined();
     expect(isoFromMillis(Number.NaN)).toBeUndefined();
+  });
+});
+
+describe("keccak256, against published vectors", () => {
+  /**
+   * Keccak-256 is not SHA3-256. They differ only in the padding byte, and
+   * substituting one for the other yields a plausible 32-byte digest that is
+   * wrong for every Ethereum purpose. WebCrypto offers neither, so this is
+   * implemented here and pinned to the published vectors.
+   */
+  test("the standard vectors match", () => {
+    expect(keccak256Hex("")).toBe(
+      "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+    );
+    expect(keccak256Hex("abc")).toBe(
+      "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45",
+    );
+    expect(keccak256Hex("The quick brown fox jumps over the lazy dog")).toBe(
+      "4d741b6f1eb29cb2a9b9911c82f56fa8d73b04959d3d9d222895df6c0b28aa15",
+    );
+  });
+
+  test("it is not SHA3-256, which has the same length and different bytes", () => {
+    // SHA3-256("") is a7ffc6f8…; getting this wrong produces a digest that
+    // looks fine and matches nothing onchain.
+    expect(keccak256Hex("")).not.toBe(
+      "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a",
+    );
+  });
+
+  test("it produces the function selectors everybody knows", () => {
+    // The first four bytes of the hash of the signature are the selector.
+    expect(keccak256Hex("transfer(address,uint256)").slice(0, 8)).toBe("a9059cbb");
+    expect(keccak256Hex("approve(address,uint256)").slice(0, 8)).toBe("095ea7b3");
+    expect(keccak256Hex("balanceOf(address)").slice(0, 8)).toBe("70a08231");
+    expect(keccak256Hex("Transfer(address,address,uint256)")).toBe(
+      "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+    );
+  });
+
+  test("the padding edges are right, either side of one rate block", () => {
+    // 135, 136 and 137 bytes exercise the last byte before the block, an
+    // exactly-full block, and the overflow into a second one.
+    for (const length of [0, 1, 135, 136, 137, 272]) {
+      expect({ length, hex: keccak256Hex("a".repeat(length)).length }).toEqual({ length, hex: 64 });
+    }
+    expect(keccak256Hex("a".repeat(136))).not.toBe(keccak256Hex("a".repeat(137)));
   });
 });

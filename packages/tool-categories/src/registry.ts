@@ -611,6 +611,61 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     ],
   },
 
+  onchain: {
+    title:
+      "Onchain arithmetic, offline: ABI encoding and decoding, address checksums, EIP-712 digests, unit conversion and fixed-point DeFi maths",
+    tools: [
+      "abiDecode",
+      "abiEncodeCall",
+      "addressCheck",
+      "defiMath",
+      "functionSelector",
+      "typedDataHash",
+      "tokenUnits",
+    ],
+  },
+
+  html: {
+    title:
+      "Reading HTML without a browser: CSS selection, tables, links, forms, structured data, readable text and declarative scraping",
+    tools: [
+      "htmlForms",
+      "htmlLinks",
+      "htmlQuery",
+      "htmlRecords",
+      "htmlStructuredData",
+      "htmlTable",
+      "htmlText",
+    ],
+  },
+
+  verify: {
+    title:
+      "Verification gates: golden comparison, checksum manifests, acceptance checks, Markdown link checking and citation linting",
+    tools: [
+      "acceptanceCheck",
+      "checksumVerify",
+      "citationLint",
+      "goldenCompare",
+      "goldenUpdate",
+      "markdownLinkCheck",
+    ],
+  },
+
+  tabular: {
+    title:
+      "Tabular intake: profiling, keyed reconciliation, record linkage, contact normalization, reshaping, sharding and fixed-width parsing",
+    tools: [
+      "contactNormalize",
+      "fixedWidthParse",
+      "recordLinkage",
+      "tableDiff",
+      "tableProfile",
+      "tableReshape",
+      "tableShard",
+    ],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -641,7 +696,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   safety: {
     title: "Finding and removing what must not leave the system, and proving what did not change",
-    includes: ["secure"],
+    includes: ["secure", "verify"],
   },
   outreach: {
     title: "Everything that puts something in front of a person outside the harness",
@@ -657,11 +712,11 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   compute: {
     title: "Everything a harness can do with no I/O at all — pure, in-process, zero tokens",
-    includes: ["text", "data", "encode", "datetime", "schema", "math", "flow"],
+    includes: ["text", "data", "encode", "datetime", "schema", "math", "flow", "onchain"],
   },
   content: {
     title: "Everything that reads or produces documents and images",
-    includes: ["ingest", "documents", "media", "text"],
+    includes: ["ingest", "documents", "media", "text", "html"],
   },
 });
 

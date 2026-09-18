@@ -63,6 +63,36 @@ const pkgDir = manifest.package.startsWith("tool-") ? manifest.package : `tool-$
 const scope = `@crewhaus/${pkgDir}`;
 const keys = manifest.tools.map((t) => t.key);
 
+/**
+ * A tool key must be unique across the whole monorepo.
+ *
+ * Every integration point is an object literal keyed by the tool name, so a
+ * duplicate silently shadows the earlier entry and the tool count comes out
+ * one short. `tsc` does catch it — as TS1117, in two generated files, with
+ * no hint of which package caused it — so the failure lands far from the
+ * edit. `unitConvert` reached that point once: tool-math converts metres,
+ * tool-onchain converts token decimals, and the second one won.
+ */
+{
+  const registry = readFileSync(join(ROOT, "packages/target-cli/src/index.ts"), "utf-8");
+  const taken = keys.filter((key) => new RegExp(`^  ${key}: \\{`, "m").test(registry));
+  if (taken.length > 0) {
+    const owners = taken.map((key) => {
+      const line = new RegExp(`^  ${key}: \\{[^\\n]*`, "m").exec(registry)?.[0] ?? "";
+      const owner = /@crewhaus\/[a-z0-9-]+/.exec(line)?.[0] ?? "another package";
+      return `  ${key} — already registered by ${owner}`;
+    });
+    throw new Error(
+      `these tool keys are already taken, and a key must be unique across the monorepo:\n${owners.join("\n")}\nRename yours to something that says what it does differently, and say so in its description.`,
+    );
+  }
+  const seen = new Set<string>();
+  for (const key of keys) {
+    if (seen.has(key)) throw new Error(`the manifest lists "${key}" twice`);
+    seen.add(key);
+  }
+}
+
 const edits: Array<{ file: string; applied: boolean; why: string }> = [];
 
 /**

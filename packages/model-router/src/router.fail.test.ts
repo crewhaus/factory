@@ -105,5 +105,6 @@ describe("loadAdapter — missing optional adapter surfaces ConfigError", () => 
     expect(typeof openai.createOpenAIAdapter).toBe("function");
     expect(typeof gemini.createGeminiAdapter).toBe("function");
     expect(typeof bedrock.createBedrockAdapter).toBe("function");
-  });
+    // Resolves every adapter module for real; bun's 5s default is not a margin.
+  }, 20_000);
 });

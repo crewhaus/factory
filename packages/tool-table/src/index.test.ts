@@ -1,0 +1,331 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+/**
+ * Every tool this package registers, against real files in a temporary
+ * workspace — reading from disk is the point, so the tests read from disk.
+ */
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  TABLE_TOOLS,
+  contactNormalize,
+  fixedWidthParse,
+  recordLinkage,
+  tableDiff,
+  tableProfile,
+  tableReshape,
+  tableShard,
+} from "./index";
+
+const originalCwd = process.cwd();
+let workspace: string;
+
+// biome-ignore lint/suspicious/noExplicitAny: the executor supplies this context, and none of these tools read it.
+const ctx = {} as any;
+
+async function raw(tool: (typeof TABLE_TOOLS)[number], input: unknown): Promise<string> {
+  const parsed = tool.inputSchema.safeParse(input);
+  if (!parsed.success) throw new Error(`schema rejected the input: ${parsed.error.message}`);
+  return tool.execute(parsed.data, ctx);
+}
+
+async function call<T = Record<string, unknown>>(
+  tool: (typeof TABLE_TOOLS)[number],
+  input: unknown,
+): Promise<T> {
+  return JSON.parse(await raw(tool, input)) as T;
+}
+
+const write = (name: string, body: string): void => writeFileSync(join(workspace, name), body);
+
+beforeEach(() => {
+  workspace = mkdtempSync(join(tmpdir(), "crewhaus-table-"));
+  process.chdir(workspace);
+});
+
+afterEach(() => {
+  process.chdir(originalCwd);
+  rmSync(workspace, { recursive: true, force: true });
+});
+
+describe("package-wide contract", () => {
+  test("every tool is exported in TABLE_TOOLS", () => {
+    expect(TABLE_TOOLS.length).toBe(7);
+  });
+
+  test("names are unique and PascalCase", () => {
+    const names = TABLE_TOOLS.map((t) => t.name);
+    expect(new Set(names).size).toBe(names.length);
+    for (const t of TABLE_TOOLS) expect(t.name).toMatch(/^[A-Z][A-Za-z0-9]*$/);
+  });
+
+  test("every tool is read-only and internal — this package reads, it never writes", () => {
+    for (const t of TABLE_TOOLS) {
+      expect({ name: t.name, readOnly: t.readOnly }).toEqual({ name: t.name, readOnly: true });
+      expect({ name: t.name, destructive: t.destructive }).toEqual({
+        name: t.name,
+        destructive: false,
+      });
+      expect({ name: t.name, scope: t.scope }).toEqual({ name: t.name, scope: "internal" });
+      expect({ name: t.name, io: t.ioCapability }).toEqual({ name: t.name, io: undefined });
+    }
+  });
+
+  test("every description says what it is for, and every schema is strict", () => {
+    for (const t of TABLE_TOOLS) {
+      expect(t.description).toContain("Use it");
+      expect({ name: t.name, ok: t.inputSchema.safeParse(42).success }).toEqual({
+        name: t.name,
+        ok: false,
+      });
+    }
+  });
+
+  test("a path outside the workspace is refused by every tool that reads one", async () => {
+    write("ok.csv", "a\n1\n");
+    await expect(raw(tableProfile, { file: "../escape.csv" })).rejects.toThrow(
+      /escapes the workspace/,
+    );
+    await expect(
+      raw(tableDiff, { before: "../e.csv", after: "ok.csv", key: ["a"] }),
+    ).rejects.toThrow(/escapes the workspace/);
+  });
+});
+
+describe("TableProfile", () => {
+  beforeEach(() => {
+    write("a.csv", "id,name,qty\n1,Alice,10\n2,Bob,20\n3,Carol,\n3,Carol,\n");
+  });
+
+  test("answers the shape of a file in one call", async () => {
+    const result = await call<{
+      rows: number;
+      duplicateRows: number;
+      columns: Array<{ name: string; type: string; nulls: number }>;
+    }>(tableProfile, { file: "a.csv" });
+    expect(result.rows).toBe(4);
+    expect(result.duplicateRows).toBe(1);
+    expect(result.columns.find((c) => c.name === "qty")).toMatchObject({
+      type: "integer",
+      nulls: 2,
+    });
+  });
+
+  test("a TSV is detected from its extension", async () => {
+    write("b.tsv", "id\tname\n1\tAlice\n");
+    const result = await call<{ columns: Array<{ name: string }> }>(tableProfile, {
+      file: "b.tsv",
+    });
+    expect(result.columns.map((c) => c.name)).toEqual(["id", "name"]);
+  });
+
+  test("asking for a column that is not there lists the ones that are", async () => {
+    expect(await raw(tableProfile, { file: "a.csv", columns: ["nope"] })).toContain(
+      "id, name, qty",
+    );
+  });
+
+  test("quoted fields with commas and newlines survive", async () => {
+    write("q.csv", 'id,note\n1,"a, b\nsecond line"\n');
+    const result = await call<{ rows: number }>(tableProfile, { file: "q.csv" });
+    expect(result.rows).toBe(1);
+  });
+});
+
+describe("TableDiff", () => {
+  beforeEach(() => {
+    write("before.csv", "id,qty\n1,10\n2,20\n3,30\n");
+    write("after.csv", "id,qty\n1,11\n2,20\n4,40\n");
+  });
+
+  test("reports the four counts and the cell that changed", async () => {
+    const result = await call<{
+      counts: Record<string, number>;
+      changed: Array<{ changes: Array<{ column: string; from: string; to: string }> }>;
+    }>(tableDiff, { before: "before.csv", after: "after.csv", key: ["id"] });
+    expect(result.counts).toEqual({ added: 1, removed: 1, changed: 1, unchanged: 1 });
+    expect(result.changed[0]?.changes[0]).toEqual({ column: "qty", from: "10", to: "11" });
+  });
+
+  test("a duplicate key is surfaced", async () => {
+    write("dup.csv", "id,qty\n1,10\n1,99\n");
+    const result = await call<{ duplicateKeys: Array<{ key: string; count: number }> }>(tableDiff, {
+      before: "dup.csv",
+      after: "after.csv",
+      key: ["id"],
+    });
+    expect(result.duplicateKeys[0]).toMatchObject({ count: 2 });
+  });
+
+  test("a key column that does not exist is an error", async () => {
+    await expect(
+      raw(tableDiff, { before: "before.csv", after: "after.csv", key: ["nope"] }),
+    ).rejects.toThrow(/not in the before table/);
+  });
+});
+
+describe("RecordLinkage", () => {
+  beforeEach(() => {
+    write("l.csv", "email,name\nA.B+work@Gmail.com,Dr Jane Smith\n");
+    write("r.csv", "email,name\nab@gmail.com,Smith Jane\n");
+  });
+
+  test("normalization turns a near-miss into a match, with evidence", async () => {
+    const result = await call<{
+      counts: Record<string, number>;
+      matched: Array<{ score: number; evidence: Array<{ field: string }> }>;
+    }>(recordLinkage, {
+      left: "l.csv",
+      right: "r.csv",
+      rules: [{ field: "name", compare: "fuzzy", weight: 1, normalize: "name" }],
+    });
+    expect(result.counts.matched).toBe(1);
+    expect(result.matched[0]?.evidence[0]?.field).toBe("name");
+  });
+
+  test("without normalization the same pair does not match, which is honest", async () => {
+    const result = await call<{ counts: Record<string, number> }>(recordLinkage, {
+      left: "l.csv",
+      right: "r.csv",
+      rules: [{ field: "name", compare: "fuzzy", weight: 1 }],
+    });
+    expect(result.counts.matched).toBe(0);
+  });
+
+  test("a rule naming a column that is not in both files says which columns exist", async () => {
+    const out = await raw(recordLinkage, {
+      left: "l.csv",
+      right: "r.csv",
+      rules: [{ field: "phone", compare: "exact", weight: 1 }],
+    });
+    expect(out).toContain("email, name");
+  });
+});
+
+describe("ContactNormalize", () => {
+  test("canonicalizes and explains every fold", async () => {
+    const result = await call<{
+      contacts: Array<{ email: string; nameKey: string; notes: string[] }>;
+    }>(contactNormalize, {
+      contacts: [{ email: "A.B+work@Gmail.com", name: "Dr Jane Smith", company: "Acme Ltd." }],
+    });
+    expect(result.contacts[0]).toMatchObject({ email: "ab@gmail.com", nameKey: "jane smith" });
+    expect(result.contacts[0]?.notes.length).toBeGreaterThan(0);
+  });
+});
+
+describe("TableReshape", () => {
+  test("wide to long melts the columns not named as identifiers", async () => {
+    write("w.csv", "region,jan,feb\nN,10,20\nS,30,\n");
+    const result = await call<{ rowCount: number; melted: string[] }>(tableReshape, {
+      file: "w.csv",
+      direction: "long",
+      idColumns: ["region"],
+    });
+    expect(result.melted).toEqual(["jan", "feb"]);
+    expect(result.rowCount).toBe(3);
+  });
+
+  test("long to wide reports a collision rather than picking a winner", async () => {
+    write("g.csv", "region,month,v\nN,jan,10\nN,jan,99\nN,feb,20\n");
+    const result = await call<{ collisions: Array<{ variable: string; count: number }> }>(
+      tableReshape,
+      {
+        file: "g.csv",
+        direction: "wide",
+        idColumns: ["region"],
+        variableColumn: "month",
+        valueColumn: "v",
+      },
+    );
+    expect(result.collisions[0]).toMatchObject({ variable: "jan", count: 2 });
+  });
+
+  test("reshaping to wide without the two required columns says which are missing", async () => {
+    write("g.csv", "a,b\n1,2\n");
+    expect(
+      await raw(tableReshape, { file: "g.csv", direction: "wide", idColumns: ["a"] }),
+    ).toContain("variableColumn and valueColumn");
+  });
+});
+
+describe("TableShard", () => {
+  test("splits by row count with the header on every shard", async () => {
+    write("a.csv", "a,b\n1,x\n2,y\n3,z\n");
+    const result = await call<{ shardCount: number; bodies: string[] }>(tableShard, {
+      file: "a.csv",
+      maxRows: 2,
+    });
+    expect(result.shardCount).toBe(2);
+    for (const body of result.bodies) expect(body.startsWith("a,b\n")).toBe(true);
+  });
+
+  test("planOnly leaves the contents out", async () => {
+    write("a.csv", "a\n1\n2\n");
+    const result = await call<{ bodies?: string[]; shards: unknown[] }>(tableShard, {
+      file: "a.csv",
+      maxRows: 1,
+      planOnly: true,
+    });
+    expect(result.bodies).toBeUndefined();
+    expect(result.shards).toHaveLength(2);
+  });
+
+  test("bodies are withheld when they would be the whole file again", async () => {
+    // Returning them past a few megabytes is not a result, it is the file.
+    //
+    // The threshold is on BYTES, so the fixture buys them with a few wide rows
+    // rather than many narrow ones: 1,200 rows of ~10KB clears the 8MiB limit
+    // with the same margin 120,000 rows of ~100 bytes did, while giving the
+    // CSV reader 1,200 row arrays to allocate instead of 120,000. The old
+    // shape spent 6.9s on that allocation and blew bun's 5s default budget on
+    // a CI runner — a test that declares no deadline still has one.
+    const WIDE = "y".repeat(9_990);
+    write(
+      "big.csv",
+      `a,b\n${Array.from({ length: 1_200 }, (_, i) => `${i},${WIDE}`).join("\n")}\n`,
+    );
+    const result = await call<{ bodies?: string[]; totalBytes: number; note?: string }>(
+      tableShard,
+      {
+        file: "big.csv",
+        maxRows: 500,
+      },
+    );
+    expect(result.bodies).toBeUndefined();
+    expect(result.totalBytes).toBeGreaterThan(8 * 1024 * 1024);
+    expect(result.note).toContain("return limit");
+  });
+
+  test("no bound at all is rejected by the schema", () => {
+    expect(tableShard.inputSchema.safeParse({ file: "a.csv" }).success).toBe(false);
+  });
+});
+
+describe("FixedWidthParse", () => {
+  test("parses a positional layout and reports short lines", async () => {
+    write("f.txt", "ALICE     0010NY\nSHORT\n");
+    const result = await call<{
+      rows: Array<Record<string, string>>;
+      shortLines: Array<{ line: number }>;
+    }>(fixedWidthParse, {
+      file: "f.txt",
+      fields: [
+        { name: "name", start: 1, length: 10 },
+        { name: "qty", start: 11, length: 4 },
+        { name: "st", start: 15, length: 2 },
+      ],
+    });
+    expect(result.rows[0]).toEqual({ name: "ALICE", qty: "0010", st: "NY" });
+    expect(result.shortLines).toEqual([{ line: 2, length: 5 }]);
+  });
+
+  test("a zero start position is rejected by the schema, since positions are 1-based", () => {
+    expect(
+      fixedWidthParse.inputSchema.safeParse({
+        file: "f.txt",
+        fields: [{ name: "a", start: 0, length: 1 }],
+      }).success,
+    ).toBe(false);
+  });
+});

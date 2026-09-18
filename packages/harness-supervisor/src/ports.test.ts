@@ -100,17 +100,46 @@ describe("createPortLedger", () => {
 });
 
 describe("defaultPortProbe", () => {
-  test("reports a bindable port free and a bound one taken", async () => {
+  /**
+   * 20000..28063 sits BELOW every default ephemeral range in play (Linux
+   * 32768-60999, macOS and Windows 49152-65535), so the kernel never hands one
+   * of these out by itself — not to a `listen(0)` in a suite running beside us
+   * and not to an outbound loopback connection. The only way a neighbour can
+   * hold one is by naming that exact number, and nothing in this repo binds a
+   * fixed port. The pid offset keeps two concurrent runs of this file (two
+   * worktrees, two CI jobs on one box) out of each other's window.
+   *
+   * So whichever candidate we manage to bind stays ours for the whole test:
+   * the test decides when the port is taken and when it is free, instead of
+   * borrowing an ephemeral port and hoping nobody claims it once it lets go.
+   */
+  const PORT_BASE = 20_000 + (process.pid % 8_000);
+  const PORT_TRIES = 64;
+
+  /** Bind the first candidate we can hold, and return it still listening. */
+  async function holdPrivatePort(): Promise<{
+    readonly server: import("node:net").Server;
+    readonly port: number;
+  }> {
     const { createServer } = await import("node:net");
-    const server = createServer();
-    const port: number = await new Promise((resolve) => {
-      server.listen({ port: 0, host: "127.0.0.1" }, () => {
-        const address = server.address();
-        resolve(typeof address === "object" && address !== null ? address.port : 0);
+    for (let port = PORT_BASE; port < PORT_BASE + PORT_TRIES; port++) {
+      const server = createServer();
+      const bound = await new Promise<boolean>((resolve) => {
+        server.once("error", () => resolve(false));
+        server.listen({ port, host: "127.0.0.1", exclusive: true }, () => resolve(true));
       });
-    });
-    expect(await defaultPortProbe(port)).toBe(false);
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (bound) return { server, port };
+    }
+    throw new Error(`no bindable port in ${PORT_BASE}..${PORT_BASE + PORT_TRIES - 1}`);
+  }
+
+  test("reports a bindable port free and a bound one taken", async () => {
+    const { server, port } = await holdPrivatePort();
+    try {
+      expect(await defaultPortProbe(port)).toBe(false);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
     expect(await defaultPortProbe(port)).toBe(true);
   }, 10_000);
 });

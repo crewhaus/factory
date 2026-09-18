@@ -91,16 +91,26 @@ describe("withLock", () => {
   test("serializes two writers — the second waits for the first", async () => {
     const lockPath = join(tmp, ".lock");
     const order: string[] = [];
+    // `withLock` only runs its body after the O_EXCL create succeeded, so a's
+    // first statement IS the acquisition signal. Waiting 10ms and hoping was
+    // a race: lose one scheduling quantum inside a's acquire — routine on an
+    // oversubscribed CI container — and b starts first, takes the lock, and
+    // the order comes out backwards.
+    let aHasLock!: () => void;
+    const aAcquired = new Promise<void>((r) => {
+      aHasLock = r;
+    });
     const a = withLock(
       lockPath,
       async () => {
         order.push("a-start");
+        aHasLock();
         await new Promise((r) => setTimeout(r, 60));
         order.push("a-end");
       },
       { pollMs: 5 },
     );
-    await new Promise((r) => setTimeout(r, 10)); // let a acquire first
+    await aAcquired;
     const b = withLock(
       lockPath,
       async () => {

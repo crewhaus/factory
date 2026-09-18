@@ -129,6 +129,7 @@
         "@crewhaus/tool-fs": "workspace:*",
         "@crewhaus/tool-fsx": "workspace:*",
         "@crewhaus/tool-git": "workspace:*",
+        "@crewhaus/tool-html": "workspace:*",
         "@crewhaus/tool-http": "workspace:*",
         "@crewhaus/tool-image": "workspace:*",
         "@crewhaus/tool-image-generation": "workspace:*",
@@ -141,6 +142,7 @@
         "@crewhaus/tool-navigate": "workspace:*",
         "@crewhaus/tool-notify": "workspace:*",
         "@crewhaus/tool-obs": "workspace:*",
+        "@crewhaus/tool-onchain": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
         "@crewhaus/tool-pkg": "workspace:*",
         "@crewhaus/tool-proc": "workspace:*",
@@ -150,9 +152,11 @@
         "@crewhaus/tool-secure": "workspace:*",
         "@crewhaus/tool-sql": "workspace:*",
         "@crewhaus/tool-state": "workspace:*",
+        "@crewhaus/tool-table": "workspace:*",
         "@crewhaus/tool-task": "workspace:*",
         "@crewhaus/tool-text": "workspace:*",
         "@crewhaus/tool-todo": "workspace:*",
+        "@crewhaus/tool-verify": "workspace:*",
         "@crewhaus/tool-vision-grounding": "workspace:*",
         "@crewhaus/tool-web": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
@@ -2371,6 +2375,19 @@
         "@crewhaus/sandbox": "workspace:*",
       },
     },
+    "packages/tool-html": {
+      "name": "@crewhaus/tool-html",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-http": {
       "name": "@crewhaus/tool-http",
       "version": "0.6.0",
@@ -2544,6 +2561,20 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-onchain": {
+      "name": "@crewhaus/tool-onchain",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-encode": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-orchestrator": {
       "name": "@crewhaus/tool-orchestrator",
       "version": "0.6.0",
@@ -2689,6 +2720,20 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-table": {
+      "name": "@crewhaus/tool-table",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-data": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-task": {
       "name": "@crewhaus/tool-task",
       "version": "0.6.0",
@@ -2741,6 +2786,19 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/tool-verify": {
+      "name": "@crewhaus/tool-verify",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
       },
     },
     "packages/tool-vision-grounding": {
@@ -3344,6 +3402,8 @@
 
     "@crewhaus/tool-harness-synthesizer": ["@crewhaus/tool-harness-synthesizer@workspace:packages/tool-harness-synthesizer"],
 
+    "@crewhaus/tool-html": ["@crewhaus/tool-html@workspace:packages/tool-html"],
+
     "@crewhaus/tool-http": ["@crewhaus/tool-http@workspace:packages/tool-http"],
 
     "@crewhaus/tool-image": ["@crewhaus/tool-image@workspace:packages/tool-image"],
@@ -3372,6 +3432,8 @@
 
     "@crewhaus/tool-obs": ["@crewhaus/tool-obs@workspace:packages/tool-obs"],
 
+    "@crewhaus/tool-onchain": ["@crewhaus/tool-onchain@workspace:packages/tool-onchain"],
+
     "@crewhaus/tool-orchestrator": ["@crewhaus/tool-orchestrator@workspace:packages/tool-orchestrator"],
 
     "@crewhaus/tool-permission-matcher": ["@crewhaus/tool-permission-matcher@workspace:packages/tool-permission-matcher"],
@@ -3398,6 +3460,8 @@
 
     "@crewhaus/tool-state": ["@crewhaus/tool-state@workspace:packages/tool-state"],
 
+    "@crewhaus/tool-table": ["@crewhaus/tool-table@workspace:packages/tool-table"],
+
     "@crewhaus/tool-task": ["@crewhaus/tool-task@workspace:packages/tool-task"],
 
     "@crewhaus/tool-text": ["@crewhaus/tool-text@workspace:packages/tool-text"],
@@ -3405,6 +3469,8 @@
     "@crewhaus/tool-todo": ["@crewhaus/tool-todo@workspace:packages/tool-todo"],
 
     "@crewhaus/tool-validate": ["@crewhaus/tool-validate@workspace:packages/tool-validate"],
+
+    "@crewhaus/tool-verify": ["@crewhaus/tool-verify@workspace:packages/tool-verify"],
 
     "@crewhaus/tool-vision-grounding": ["@crewhaus/tool-vision-grounding@workspace:packages/tool-vision-grounding"],
 

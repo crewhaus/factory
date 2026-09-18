@@ -10,9 +10,29 @@ import { join } from "node:path";
 
 const REPO_ROOT = join(import.meta.dir, "..", "..", "..");
 
-/** Every .ts file under a directory, skipping build output and deps. */
+/**
+ * Every .ts file under a directory, skipping build output, deps, and every
+ * HIDDEN entry.
+ *
+ * The dot skip is not tidiness — it is what stops this walk racing the rest
+ * of the suite. CI runs `bun run test`, which fans the package suites out in
+ * parallel, and several siblings mkdtemp scratch directories INSIDE the tree
+ * this walks, then rmSync them in a `finally` the moment their driver exits:
+ * `.d40-run-*` and `.approval-run-*` under target-channel-bot's src, and
+ * `.cfw-run-*` under each target-cf-worker package's src. Descend into one
+ * and either the readdirSync here or the readFileSync below throws ENOENT the
+ * instant its owner finishes — an uncaught error, not a failed expectation.
+ *
+ * Matching on the NAME, before the entry is opened or recursed into, makes
+ * the file set a function of the committed tree alone. Nothing real is lost:
+ * no tracked .ts under packages/, apps/ or scripts/ lives in a hidden
+ * directory.
+ */
 function sourceFiles(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    // Hidden entries are never committed source, and are exactly where a
+    // concurrent suite's scratch directories appear and vanish.
+    if (entry.name.startsWith(".")) continue;
     if (entry.name === "node_modules" || entry.name === "dist") continue;
     const full = join(dir, entry.name);
     if (entry.isDirectory()) {
@@ -59,7 +79,13 @@ describe("no regex literal carries raw control bytes", () => {
     // Every tree CI compiles, not just packages/ — the failure is a parse
     // error, so it lands wherever the byte is.
     const roots = ["packages", "apps", "scripts"].map((d) => join(REPO_ROOT, d));
-    for (const file of roots.flatMap((r) => sourceFiles(r))) {
+    const files = roots.flatMap((r) => sourceFiles(r));
+    // Assert the sweep found something to look at. A guard that scans for a
+    // pattern passes just as green when it scans nothing, and `sourceFiles`
+    // skips directories by name — one wrong skip and this reports clean
+    // while inspecting an empty list. The floor is far below the real count.
+    expect(files.length).toBeGreaterThan(1_000);
+    for (const file of files) {
       const text = readFileSync(file, "utf-8");
       // Cheap reject first: most files carry no control byte at all.
       if (!RAW_CONTROL.test(text)) continue;
@@ -72,7 +98,12 @@ describe("no regex literal carries raw control bytes", () => {
       }
     }
     expect(offenders).toEqual([]);
-  });
+    // This reads every source file in the repository, one at a time, so its
+    // wall time tracks how loaded the machine is — and bun's DEFAULT per-test
+    // budget is 5s. CI fans ~220 package suites out in parallel, so give the
+    // runner a budget sized for a loaded one; otherwise the assertion is
+    // never reached and the failure reads as an opaque timeout.
+  }, 30_000);
 
   test("the guard actually detects one when it is there", () => {
     // Proof the matcher works, without putting a raw byte in this file: build

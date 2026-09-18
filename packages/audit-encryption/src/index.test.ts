@@ -40,7 +40,8 @@ describe("createAuditEncryption (T1 + T2)", () => {
     expect(record.tag).toMatch(/^[a-f0-9]{32}$/);
     const decoded = await enc.decryptPayload(record);
     expect(decoded).toEqual({ event: "policy_decision", verdict: "allow" });
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
 
   test("encryption is non-deterministic (fresh IV per record)", async () => {
     const enc = await buildEncryption();
@@ -51,7 +52,8 @@ describe("createAuditEncryption (T1 + T2)", () => {
     // Both decrypt back to the same value.
     expect(await enc.decryptPayload(a)).toEqual({ event: "x" });
     expect(await enc.decryptPayload(b)).toEqual({ event: "x" });
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
 
   test("requires kekName", async () => {
     setKek("KEK_TEST", "v");

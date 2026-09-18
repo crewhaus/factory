@@ -96,7 +96,7 @@ const shaAlgorithm = z.enum(["sha1", "sha256", "sha384", "sha512"]);
 export const hash: RegisteredTool = buildTool({
   name: "Hash",
   description:
-    "Hash text with SHA-256, SHA-1, SHA-384, SHA-512 or MD5 and return the digest as hex, base64 or base64url. Use to fingerprint a payload for caching or change detection, to compare two blobs without holding both, or to check a published checksum.",
+    "Hash text with SHA-256, SHA-1, SHA-384, SHA-512, MD5 or Keccak-256 and return the digest as hex, base64 or base64url. Use to fingerprint a payload for caching or change detection, to compare two blobs without holding both, or to check a published checksum. Keccak-256 is the Ethereum hash and is NOT SHA3-256 — same permutation, different padding — so it is the one to ask for when computing a function selector, an event topic or an address.",
   inputSchema: z.object({
     text: z.string().describe("the data to hash"),
     algorithm: hashAlgorithm.optional().describe("defaults to sha256"),
@@ -846,3 +846,12 @@ export const ENCODE_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   urlParse,
   uuid,
 ]);
+
+/**
+ * Keccak-256, re-exported for the onchain tools.
+ *
+ * It lives here because it is a hash and this is where the hashes are, and
+ * because `@crewhaus/tool-onchain` needs it for selectors, event topics and
+ * EIP-712 digests. Two implementations of a hash is one too many.
+ */
+export { keccak256, keccak256Hex, toHex } from "./lib/keccak";
