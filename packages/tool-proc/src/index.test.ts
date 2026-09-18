@@ -680,13 +680,24 @@ describe("background processes", () => {
   });
 
   test("output is returned once: a second poll sees only what is new", async () => {
-    const path = script("emit.sh", "echo first\nsleep 0.15\necho second\n");
+    // The second line must not be written until the first poll has happened,
+    // and a `sleep` cannot promise that: on a loaded machine the wait loop's
+    // own tick outlasts the sleep, both lines land in one read, and the test
+    // fails for a reason that has nothing to do with drain semantics. The
+    // script blocks on a file this test creates, so the ordering is caused
+    // rather than hoped for.
+    const gate = join(tmp, "release-second");
+    const path = script(
+      "emit.sh",
+      `echo first\nwhile [ ! -f "${gate}" ]; do sleep 0.01; done\necho second\n`,
+    );
     const started = await call(processStart, { argv: [path] });
     await call(waitForOutput, { id: started.id, pattern: "first", timeoutMs: 3_000 });
     const firstPoll = await call(processOutput, { id: started.id });
     expect(firstPoll.stdout).toContain("first");
     expect(firstPoll.stdout).not.toContain("second");
 
+    writeFileSync(gate, "");
     await call(waitForOutput, { id: started.id, pattern: "second", timeoutMs: 3_000 });
     const secondPoll = await call(processOutput, { id: started.id });
     expect(secondPoll.stdout).toContain("second");

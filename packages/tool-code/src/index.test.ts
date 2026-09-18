@@ -356,9 +356,18 @@ describe("diagnostic tools against the project's own toolchain", () => {
         "for (let i = 0; i < 256; i++) process.stdout.write(chunk);",
       ].join("\n"),
     );
-    const before = process.memoryUsage().heapUsed;
+    // Sample RETAINED heap, not whatever garbage happens to be uncollected:
+    // a bare `heapUsed` delta moves with GC timing and with every other test
+    // sharing this process, so it reported failures that had nothing to do
+    // with this tool. Forcing a full collection either side measures what the
+    // implementation actually holds on to, which is the claim being made.
+    const retained = (): number => {
+      Bun.gc(true);
+      return process.memoryUsage().heapUsed;
+    };
+    const before = retained();
     const result = await callJson(runBuild, { command: ["bun", "flood.ts"], timeout: 60_000 });
-    const grew = process.memoryUsage().heapUsed - before;
+    const grew = retained() - before;
     expect(result["outputTruncated"]).toBe(true);
     expect(grew).toBeLessThan(64_000_000);
   }, 90_000);

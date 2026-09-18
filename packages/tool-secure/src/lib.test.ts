@@ -1,3 +1,4 @@
+import { describe, expect, test } from "bun:test";
 /**
  * The pure core, tested directly.
  *
@@ -5,7 +6,9 @@
  * call that returned one fewer finding, and the masking contract is easier
  * to pin down here than through three layers of JSON.
  */
-import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   DEFAULT_ENTROPY_THRESHOLDS,
   classifyCharset,
@@ -21,6 +24,7 @@ import {
   verifyChain,
   verifyPayload,
 } from "./lib/evidence";
+import { readTextBounded } from "./lib/files";
 import { INJECTION_RULES, decodeBase64Text, scanInjection } from "./lib/injection";
 import {
   IBAN_LENGTHS,
@@ -1190,5 +1194,47 @@ describe("pii: a number next to another number is still found", () => {
   test("a + followed by too few or too many digits is not a phone number", () => {
     expect(phones("+123")).toEqual([]);
     expect(phones("+1234567890123456789012")).toEqual([]);
+  });
+});
+
+describe("readTextBounded classifies a directory before it measures it", () => {
+  /**
+   * A directory's reported size is a filesystem detail — 4096 bytes on ext4,
+   * a handful on APFS — and it has nothing to do with whether the files
+   * inside it should be scanned. Comparing it against the per-file cap first
+   * made `SecretScan({path: ".", maxFileBytes: 100})` walk the tree on macOS
+   * and refuse it on Linux, reporting a scan that covered nothing as a
+   * skipped oversized file. This test runs on both.
+   */
+  test("a directory is unreadable-as-a-file, not too-large, whatever the cap", () => {
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-secure-lib-"));
+    try {
+      for (const cap of [1, 100, 1_000_000]) {
+        const outcome = readTextBounded("Probe", dir, cap);
+        expect({ cap, ok: outcome.ok }).toEqual({ cap, ok: false });
+        expect({ cap, reason: outcome.ok ? null : outcome.reason }).toEqual({
+          cap,
+          reason: "unreadable",
+        });
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a genuinely oversized file is still refused for its size", () => {
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-secure-lib-"));
+    try {
+      const file = join(dir, "big.txt");
+      writeFileSync(file, "x".repeat(5000));
+      const outcome = readTextBounded("Probe", file, 100);
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) {
+        expect(outcome.reason).toBe("too-large");
+        expect(outcome.detail).toContain("5000 bytes");
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

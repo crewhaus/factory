@@ -248,6 +248,10 @@ describe("STARTTLS", () => {
     }
   });
 
+  // The runner budget must exceed this test's own deadline. Bun's default is
+  // 5s and the deadline below is 10s, so the deadline could never fire: on a
+  // runner where the refused handshake did not fail instantly the test died
+  // as an opaque "timed out after 5000ms" instead of reporting an assertion.
   test("a self-signed certificate is refused when it is not trusted", async () => {
     const credentials = generateCertificate();
     if (credentials === null) return;
@@ -266,5 +270,5 @@ describe("STARTTLS", () => {
       deadline.cancel();
       server.close();
     }
-  });
+  }, 20_000);
 });

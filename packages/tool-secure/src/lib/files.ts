@@ -139,7 +139,17 @@ export function readTextBounded(toolName: string, abs: string, maxBytes: number)
     return { ok: false, reason: "unreadable", detail: (err as Error).message };
   }
   try {
-    const { size } = fstatSync(fd);
+    const stat = fstatSync(fd);
+    // A directory is not an oversized file, and the order of these two checks
+    // is load-bearing. A directory's st_size is 4096 on ext4 and a handful of
+    // bytes on APFS, so comparing it against the per-file cap first made
+    // `SecretScan({path: ".", maxFileBytes: 100})` walk the tree on macOS and
+    // refuse it outright on Linux — reported as a skipped oversized file
+    // rather than as a scan that covered nothing.
+    if (stat.isDirectory()) {
+      return { ok: false, reason: "unreadable", detail: "is a directory" };
+    }
+    const { size } = stat;
     if (size > maxBytes) {
       return {
         ok: false,
