@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { SqliteBudgetStore } from "@crewhaus/durable-state";
 import { ErrorCode } from "@crewhaus/gateway-protocol";
@@ -1245,6 +1245,97 @@ describe("listen — real Bun.serve HTTP surface (loopback)", () => {
       });
       expect(res.status).toBe(429);
     });
+  });
+
+  /**
+   * This machine's own non-loopback IPv4, or undefined when it has none.
+   *
+   * The bind tests below need an address that is NOT loopback but IS this
+   * host, because that is the only way to tell a loopback bind from a
+   * wildcard one from inside a single process.
+   */
+  const ownLanAddress = (): string | undefined => {
+    for (const entries of Object.values(networkInterfaces())) {
+      for (const entry of entries ?? []) {
+        const family = entry.family as string | number;
+        if ((family === "IPv4" || family === 4) && !entry.internal) return entry.address;
+      }
+    }
+    return undefined;
+  };
+
+  const reachable = async (url: string): Promise<boolean> => {
+    try {
+      await fetch(url, { signal: AbortSignal.timeout(2500) });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  test("a loopback host argument is honoured — the bind really is loopback-only", async () => {
+    // The sibling test below fetches the SAME address it bound, so it passes
+    // whether the bind is loopback or wildcard. That hole let
+    // `target-managed` ship a daemon whose only listener — `/healthz`
+    // included — was unreachable from outside its own container, while the
+    // in-container healthcheck stayed green. Discriminating needs a second
+    // address that still belongs to this machine.
+    const lan = ownLanAddress();
+    if (lan === undefined) {
+      // A machine with no routable interface cannot tell the two binds
+      // apart. Say so rather than passing silently.
+      console.warn(
+        "skipped: this machine has no non-loopback IPv4 to test a wildcard bind against",
+      );
+      return;
+    }
+    const { server } = makeServer();
+    const { port, close } = await server.listen(0, "127.0.0.1");
+    try {
+      expect(await reachable(`http://127.0.0.1:${port}`)).toBe(true);
+      expect(await reachable(`http://${lan}:${port}`)).toBe(false);
+    } finally {
+      await close();
+    }
+  });
+
+  test("a wildcard host argument is honoured — the bind reaches this machine's own address", async () => {
+    const lan = ownLanAddress();
+    if (lan === undefined) {
+      console.warn(
+        "skipped: this machine has no non-loopback IPv4 to test a wildcard bind against",
+      );
+      return;
+    }
+    const { server } = makeServer();
+    const { port, close } = await server.listen(0, "0.0.0.0");
+    try {
+      expect(await reachable(`http://127.0.0.1:${port}`)).toBe(true);
+      expect(await reachable(`http://${lan}:${port}`)).toBe(true);
+    } finally {
+      await close();
+    }
+  });
+
+  test("the default is loopback — widening is the CALLER's decision", async () => {
+    // Every caller that must be reachable has to pass a host. Keeping the
+    // library default narrow is what makes forgetting it fail closed rather
+    // than open; `target-managed` passes `HOST` for exactly this reason.
+    const lan = ownLanAddress();
+    if (lan === undefined) {
+      console.warn(
+        "skipped: this machine has no non-loopback IPv4 to test the default bind against",
+      );
+      return;
+    }
+    const { server } = makeServer();
+    const { port, close } = await server.listen(0);
+    try {
+      expect(await reachable(`http://127.0.0.1:${port}`)).toBe(true);
+      expect(await reachable(`http://${lan}:${port}`)).toBe(false);
+    } finally {
+      await close();
+    }
   });
 
   test("binds on an explicit host argument", async () => {
