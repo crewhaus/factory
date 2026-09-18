@@ -1246,3 +1246,45 @@ describe("bounded work", () => {
     expect(out).toContain("file limit");
   });
 });
+
+// ---------------------------------------------------------------------------
+
+/**
+ * Regression — a RELATIVE symlink target resolves against the directory that
+ * actually CONTAINS the link, not against the link's lexical parent. The two
+ * part company exactly when that parent is itself reached through a symlink,
+ * and the `readlink` hop inside `resolveLocation` is where it first bites:
+ * the leaf stays in the RESOLVED part of the path, so reading its target from
+ * the wrong directory names a location the caller's path does not lead to.
+ *
+ * Nothing gets OUT of the workspace this way — the misreading swaps a real
+ * destination outside the root for an invented one inside it, so containment
+ * still passes and the I/O still happens in-root. What breaks is which
+ * in-root path: a backup asked for at "pdir/l" lands at
+ * `<workspace>/escape.db` while the result still reports "pdir/l". The
+ * mirror of that is the honest case being over-refused. Both come from the
+ * same wrong base, which is why the fix is to realpath the parent first.
+ */
+describe("containment: a relative dangling link under an outward directory link", () => {
+  test("a backup destination reached through an outward directory link is refused", async () => {
+    seedDatabase();
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-tool-sql-relbase-")));
+    outsideDirs.push(outside);
+    mkdirSync(join(outside, "realdir"));
+    // `pdir` leaves the workspace, so `l` really lives in <outside>/realdir
+    // and its "../escape.db" truly names <outside>/escape.db. Measured from
+    // the LEXICAL parent <workspace>/pdir the very same target reads as
+    // <workspace>/escape.db — an in-root path, and so waved through.
+    symlinkSync(join(outside, "realdir"), join(workspace, "pdir"));
+    symlinkSync("../escape.db", join(outside, "realdir", "l"));
+
+    // A plain workspace-relative path: no `..`, not absolute. The cheap
+    // lexical pre-check has nothing to object to, so the refusal can only
+    // come from the symlink walk.
+    const out = await run(databaseBackup, { database: "app.db", out: "pdir/l" });
+    expect(out).toContain("outside the workspace root");
+    expect(await Bun.file(join(outside, "escape.db")).exists()).toBe(false);
+    // Nor quietly redirected to the in-root path the lexical reading names.
+    expect(await Bun.file(join(workspace, "escape.db")).exists()).toBe(false);
+  });
+});

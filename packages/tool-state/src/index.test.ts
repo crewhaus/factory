@@ -241,6 +241,30 @@ describe("path containment", () => {
     expect(out.documents).toBe(0);
     expect(out.skipped[0]).toMatchObject({ reason: "resolves outside the workspace" });
   });
+
+  // Regression — a RELATIVE symlink target is resolved against the directory
+  // that actually CONTAINS the link, not against the link's lexical parent.
+  // The two only part company when that parent is itself reached through a
+  // symlink, which is exactly the shape below: `pdir` leaves the workspace,
+  // so `l` really lives in <outside>/realdir and "../escape" really names
+  // <outside>/escape. Read from the LEXICAL parent <tmp>/pdir the same target
+  // reads as <tmp>/escape — an in-root path, so containment would wave it
+  // through and the state directory would be created at a location the
+  // caller's `stateDir` never led to. The wrong base cannot put the write
+  // outside the root, but "somewhere else inside the root" is not the answer
+  // either, and it would also mis-refuse an honest in-workspace link.
+  test("an outward directory link holding a relative dangling link is refused", async () => {
+    const target = outside();
+    mkdirSync(path.join(target, "realdir"));
+    symlinkSync(path.join(target, "realdir"), path.join(tmp, "pdir"));
+    symlinkSync("../escape", path.join(target, "realdir", "l"));
+
+    const out = await run(kvSet, { namespace: "n", key: "k", value: 1, stateDir: "pdir/l" });
+    expect(out).toContain("escapes the workspace root");
+    expect(existsSync(path.join(target, "escape"))).toBe(false);
+    // Nor quietly redirected to the in-root path the lexical reading names.
+    expect(existsSync(path.join(tmp, "escape"))).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

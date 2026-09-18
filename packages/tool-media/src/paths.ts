@@ -98,9 +98,17 @@ function resolveLocation(target: string, depth = 0): string {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     // The name is there but `realpath` cannot finish it: a symlink with a
     // missing target. `readlinkSync` throws EINVAL on anything else, which
-    // fails closed. A relative target resolves against the link's directory.
+    // fails closed.
     const link = readlinkSync(probe);
-    probeReal = resolveLocation(path.resolve(path.dirname(probe), link), depth + 1);
+    // A RELATIVE target resolves against the directory that actually CONTAINS
+    // the link, which is not the link's lexical parent when that parent is
+    // itself reached through a symlink. `<root>/dirlink/x -> ../y` with
+    // `dirlink` pointing out of the root really lands at `<elsewhere>/y`, but
+    // measured from the lexical parent it reads as `<root>/y` — an in-root
+    // path the caller's path does not lead to. So the parent is made real
+    // first. An absolute target ignores the base.
+    const base = realpathSync(path.dirname(probe));
+    probeReal = resolveLocation(path.resolve(base, link), depth + 1);
   }
   return tail.length > 0 ? path.join(probeReal, ...tail) : probeReal;
 }

@@ -7,7 +7,7 @@
  * runtime cannot actually use, which is why this file exists separately.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
@@ -219,5 +219,53 @@ describe("dispatch through executeTool", () => {
     );
     expect(read.content).toContain("Findings");
     expect(read.content).toContain("a\tb");
+  });
+});
+
+// Regression — a RELATIVE symlink target must be resolved against the
+// directory that actually CONTAINS the link, not the link's lexical parent.
+// The two differ exactly when that parent is itself reached through a
+// symlink, and the `readlink` hop is where it first matters: the leaf stays
+// in the RESOLVED part of the path, so measuring it from the wrong directory
+// names a location the caller's path does not lead to.
+//
+// Reading it lexically is not an escape — the mis-measured path is always an
+// IN-ROOT one, so it passes containment and the tool does its I/O there. The
+// cost is a write landing silently at the WRONG IN-WORKSPACE place, and a
+// legitimate in-workspace relative dangling link being refused for the same
+// bad arithmetic.
+describe("integration: tool-docs relative dangling-link base", () => {
+  test("an outward directory link holding a relative dangling link is refused", async () => {
+    const outside = mkdtempSync(path.join(tmpdir(), "crewhaus-docs-outside-"));
+    try {
+      mkdirSync(path.join(outside, "realdir"));
+      // `pdir` leaves the workspace, so `l` really lives in <outside>/realdir
+      // and "../escape.ics" truly names <outside>/escape.ics. Measured from
+      // the LEXICAL parent <tmp>/pdir it reads as <tmp>/escape.ics — an
+      // in-root path, which is how the wrong base turns this refusal into a
+      // quiet write somewhere the caller's path never led.
+      symlinkSync(path.join(outside, "realdir"), path.join(tmp, "pdir"));
+      symlinkSync("../escape.ics", path.join(outside, "realdir", "l"));
+
+      const result = await executeTool(
+        lookup("IcsWrite"),
+        {
+          path: "pdir/l",
+          stamp: "2024-01-01T00:00:00Z",
+          events: [{ uid: "u", summary: "Stand-up", start: "2024-01-15T09:00:00Z" }],
+        },
+        { toolUseId: "relbase" },
+      );
+      // "pdir/l" is a plain workspace-relative path with no `..` and no root,
+      // so the cheap lexical pre-check has nothing to catch: this refusal can
+      // only have come from the symlink walk.
+      expect(result.isError).toBe(false);
+      expect(result.content).toMatch(/escapes the workspace root/);
+      expect(existsSync(path.join(outside, "escape.ics"))).toBe(false);
+      // Nor quietly redirected to the in-root path the lexical reading names.
+      expect(existsSync(path.join(tmp, "escape.ics"))).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

@@ -15,7 +15,7 @@
  * nothing mocked and no public address contacted.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
@@ -289,6 +289,46 @@ describe("tool_config through the executor", () => {
         name,
         refused: true,
       });
+    }
+  });
+});
+
+// Regression — a RELATIVE symlink target must be resolved against the
+// directory that actually CONTAINS the link, not the link's lexical parent.
+// The two differ exactly when that parent is itself reached through a
+// symlink, and following one `readlink` hop is what makes the difference
+// reachable: the leaf stays in the RESOLVED part of the path, so measuring it
+// from the wrong directory names a location the caller's path does not lead
+// to. The wrong base never points OUTSIDE the root — it points to an in-root
+// path that passes containment — so the damage is a write landing somewhere
+// the caller never named, and a refusal that never happens.
+describe("integration: tool-obs relative dangling-link base", () => {
+  test("an outward directory link holding a relative dangling link is refused", async () => {
+    const outside = mkdtempSync(path.join(tmpdir(), "crewhaus-obs-outside-"));
+    try {
+      mkdirSync(path.join(outside, "realdir"));
+      // `pdir` leaves the workspace, so `l` really lives in <outside>/realdir
+      // and "../escape.json" truly names <outside>/escape.json. Measured from
+      // the LEXICAL parent <tmp>/pdir it reads as <tmp>/escape.json instead —
+      // an in-root path, which is how the wrong base turns this refusal into a
+      // silent redirect of the bundle to a file the caller never asked for.
+      symlinkSync(path.join(outside, "realdir"), path.join(tmp, "pdir"));
+      symlinkSync("../escape.json", path.join(outside, "realdir", "l"));
+
+      const result = await executeTool(
+        lookup("IncidentBundle"),
+        { sessionId: "sess_1111111111111111", out: "pdir/l", nowMs: T0 },
+        { toolUseId: "relbase" },
+      );
+      // A containment refusal is a readable result here, not an error
+      // result — same as the plain `..` case above.
+      expect(result.isError).toBe(false);
+      expect(String(result.content)).toMatch(/escapes the workspace root/);
+      expect(existsSync(path.join(outside, "escape.json"))).toBe(false);
+      // Nor quietly redirected to the in-root path the lexical reading names.
+      expect(existsSync(path.join(tmp, "escape.json"))).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 });

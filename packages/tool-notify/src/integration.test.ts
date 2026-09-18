@@ -9,7 +9,7 @@
  * is a real one on 127.0.0.1, as in `index.test.ts`.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
@@ -240,5 +240,66 @@ describe("dispatch through executeTool", () => {
     );
     expect(result.isError).toBe(false);
     expect(result.content).toContain("empty allow-list = deny all");
+  });
+});
+
+// Regression — a RELATIVE symlink target must be resolved against the
+// directory that actually CONTAINS the link, not against the link's lexical
+// parent. The two only ever differ when that parent is itself reached
+// through a symlink, and it takes the `readlink` hop to make the difference
+// reachable: the leaf then sits in the RESOLVED part of the path, so
+// measuring it from the wrong directory names a location the caller's path
+// does not lead to.
+//
+// The wrong base cannot produce a path OUTSIDE the root — it strips the
+// outward hop, so what it names is always in-root and always passes
+// containment. That is what makes it worth a test rather than a shrug: the
+// failure is silent. `EmailCompose` would have attached a different file
+// than the one the caller's path leads to, and a legitimate in-workspace
+// relative dangling link would be judged by the same broken arithmetic.
+describe("integration: tool-notify relative dangling-link base", () => {
+  test("an outward directory link holding a relative dangling link is refused", async () => {
+    const outside = mkdtempSync(path.join(tmpdir(), "tool-notify-outside-"));
+    try {
+      mkdirSync(path.join(outside, "realdir"));
+      // `pdir` leaves the workspace, so `l` really lives in <outside>/realdir
+      // and "../escape.bin" truly names <outside>/escape.bin. Read from the
+      // LEXICAL parent <tmp>/pdir the same target reads as <tmp>/escape.bin —
+      // an in-root path, and one that exists, so the broken arithmetic does
+      // not merely mis-measure: it finds a real file to attach.
+      symlinkSync(path.join(outside, "realdir"), path.join(tmp, "pdir"));
+      symlinkSync("../escape.bin", path.join(outside, "realdir", "l"));
+      const decoy = "IN-ROOT-DECOY-NOT-THE-ATTACHMENT";
+      writeFileSync(path.join(tmp, "escape.bin"), decoy);
+
+      const result = await executeTool(
+        lookup("EmailCompose"),
+        {
+          from: { address: "ci@example.com" },
+          to: [{ address: "ops@example.com" }],
+          subject: "s",
+          text: "t",
+          date: "2026-09-17T09:30:00Z",
+          // A plain workspace-relative path: no `..`, not absolute, so the
+          // lexical pre-check waves it through and the refusal below can
+          // only have come from the symlink walk.
+          attachments: [{ path: "pdir/l" }],
+        },
+        { toolUseId: "relbase" },
+      );
+
+      // This package hands refusals back as text rather than throwing.
+      expect(result.isError).toBe(false);
+      expect(String(result.content)).toMatch(/escapes the workspace root/);
+      // And it is refused rather than quietly redirected: the in-root file
+      // the lexical reading names was never opened.
+      expect(String(result.content)).not.toContain(Buffer.from(decoy).toString("base64"));
+      // The tool only ever reads, so this cannot fail here — it is the same
+      // assertion the tool-fs copy of this test makes, kept so the whole
+      // sweep reads alike and so a future writing tool inherits the check.
+      expect(existsSync(path.join(outside, "escape.bin"))).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

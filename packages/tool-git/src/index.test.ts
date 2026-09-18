@@ -14,11 +14,13 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1138,5 +1140,74 @@ describe("boundedness", () => {
     expect(huge.length).toBeGreaterThan(MAX_OUTPUT_CHARS);
     expect(out.patch.length).toBeLessThanOrEqual(MAX_OUTPUT_CHARS);
     expect(out.note).toContain("output capped");
+  });
+});
+
+/**
+ * Regression — the DANGLING-symlink variant of the containment check.
+ *
+ * `resolveInsideRoot` used to probe for the deepest existing ancestor with
+ * `existsSync`, which FOLLOWS symlinks. A link whose target does not exist
+ * answers false, so the walk stepped past it, treated it as a plain missing
+ * leaf, and re-appended the name to the realpath'd root — where it passed
+ * containment. `git worktree add` is handed that path, and "the leaf does not
+ * exist yet" is the NORMAL case for it, which is what made this resolver the
+ * one most likely to act on the mistake.
+ *
+ * This copy of the resolver lives in `git-run.ts` rather than the `paths.ts`
+ * the other packages use, which is why the repo-wide drift guard in
+ * `apps/cli/src/tool-registry.test.ts` skipped it and the unsafe probe
+ * survived here after being fixed everywhere else.
+ */
+describe("containment of a dangling symlink", () => {
+  test("a worktree path that is a dangling symlink out of the workspace is refused", async () => {
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-git-outside-")));
+    try {
+      const stolen = join(outside, "stolen-worktree");
+      symlinkSync(stolen, join(workspace, "wt"));
+      const out = await gitWorktreeAdd.execute({ cwd: "repo", path: "wt", createBranch: "b1" });
+      // Refused by CONTAINMENT, not by git tripping over the existing name.
+      expect(String(out)).toContain("outside the workspace root");
+      expect(existsSync(stolen)).toBe(false);
+      expect(lstatSync(join(workspace, "wt")).isSymbolicLink()).toBe(true);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a dangling symlink that stays inside the workspace is still honoured", async () => {
+    // The mirror: refusing every dangling link would also "pass" the test
+    // above. This one names its target through the UNRESOLVED tmpdir spelling
+    // (/var/... on macOS, behind the /private/var symlink), which is the case
+    // that catches the tempting wrong fix — reading the link and using that
+    // raw target instead of resolving it first.
+    const unresolved = join(tmpdir(), workspace.slice(workspace.lastIndexOf("/") + 1));
+    const aliased = existsSync(unresolved) ? unresolved : workspace;
+    symlinkSync(join(aliased, "made-wt"), join(workspace, "inside-wt"));
+    const out = await gitWorktreeAdd.execute({
+      cwd: "repo",
+      path: "inside-wt",
+      createBranch: "b2",
+    });
+    expect(String(out)).not.toContain("outside the workspace root");
+    // It landed at the link's real in-workspace target, not beside the link.
+    expect(existsSync(join(workspace, "made-wt"))).toBe(true);
+  });
+
+  test("an outward directory link holding a relative dangling link is refused", async () => {
+    // A RELATIVE target resolves against the directory that really CONTAINS
+    // the link. Measured from the lexical parent instead, this one reads as
+    // an in-workspace path that it does not actually lead to.
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-git-outside-")));
+    try {
+      mkdirSync(join(outside, "realdir"));
+      symlinkSync(join(outside, "realdir"), join(workspace, "pdir"));
+      symlinkSync("../escape-wt", join(outside, "realdir", "l"));
+      const out = await gitWorktreeAdd.execute({ cwd: "repo", path: "pdir/l" });
+      expect(String(out)).toContain("outside the workspace root");
+      expect(existsSync(join(outside, "escape-wt"))).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

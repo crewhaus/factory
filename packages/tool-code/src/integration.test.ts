@@ -8,7 +8,15 @@
  * against a real temporary project, for the same reason `index.test.ts` does.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
@@ -160,5 +168,53 @@ describe("dispatch through executeTool", () => {
     const a = await executeTool(lookup("ImportGraph"), args, { toolUseId: "d1" });
     const b = await executeTool(lookup("ImportGraph"), args, { toolUseId: "d2" });
     expect(a.content).toBe(b.content);
+  });
+});
+
+// Regression — a RELATIVE symlink target must be resolved against the
+// directory that actually CONTAINS the link, not the link's lexical parent.
+// The two differ exactly when that parent is itself reached through a
+// symlink, and following one `readlink` hop by hand is what makes the
+// difference reachable: the dangling leaf stays in the RESOLVED part of the
+// path, so measuring it from the wrong directory names a location the
+// caller's path does not actually lead to.
+//
+// This is not an escape — the misreading always lands somewhere IN-root, and
+// these tools do their I/O on the resolved path. What it costs is honesty:
+// an in-root path the caller never named, and a refusal for the wrong reason.
+describe("integration: tool-code relative dangling-link base", () => {
+  test("an outward directory link holding a relative dangling link is refused", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "crewhaus-tool-code-outside-"));
+    try {
+      mkdirSync(join(outside, "realdir"));
+      // `pdir` leaves the workspace, so `l` really lives in <outside>/realdir
+      // and "../escape.ts" truly names <outside>/escape.ts. Measured from the
+      // LEXICAL parent <workspace>/pdir the same target reads as the in-root
+      // <workspace>/escape.ts — a file the caller's path does not lead to.
+      symlinkSync(join(outside, "realdir"), join(workspace, "pdir"));
+      symlinkSync("../escape.ts", join(outside, "realdir", "l"));
+
+      const result = await executeTool(
+        lookup("SymbolOutline"),
+        { file: "pdir/l" },
+        { toolUseId: "relbase" },
+      );
+
+      // A refusal in this package is a sentence, not a thrown error — see
+      // "a refusal comes back as a readable result" above.
+      expect(result.isError).toBe(false);
+      expect(result.content).toContain("resolves outside the workspace root");
+      // And refused as a CONTAINMENT failure, not incidentally: with the
+      // lexical base the resolver names in-root <workspace>/escape.ts, which
+      // passes containment and is turned away merely for being absent. That
+      // wording appearing here would mean the symlink walk never ran.
+      expect(result.content).not.toContain("not an existing file");
+      // Nothing was touched at either reading of the link, the true outward
+      // destination or the in-root one the lexical base invents.
+      expect(existsSync(join(outside, "escape.ts"))).toBe(false);
+      expect(existsSync(join(workspace, "escape.ts"))).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

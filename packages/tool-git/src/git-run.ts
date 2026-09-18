@@ -16,7 +16,7 @@
  *    abort signal, and every result is capped. A tool that can hang forever, or
  *    return a gigabyte of patch, is a defect.
  */
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
 
 /** Default wall-clock budget for one git invocation. */
@@ -38,13 +38,74 @@ export const refuse = (message: string): Refusal => ({ ok: false, message });
 // containment
 
 /**
+ * True when the NAME exists, whether or not it leads anywhere.
+ *
+ * `existsSync` follows symlinks, so it answers false for a link whose target
+ * is missing — and a missing target is exactly the case that matters here: a
+ * dangling link is still a door. A walk that probes with it steps straight
+ * past the link, treats it as a plain missing leaf, and re-appends the name
+ * to the realpath'd parent, so containment is decided on a path the link does
+ * not lead to. `lstat` keeps that name in the part that gets RESOLVED.
+ */
+function nameExists(p: string): boolean {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Where `target` would actually land, with every symlink already followed —
+ * including one whose own target does not exist yet.
+ *
+ * `realpathSync` gives up with ENOENT on a dangling link, so the deepest
+ * ancestor that exists as a NAME is resolved, a dangling one is followed a
+ * hop by hand, and the missing components are appended. This is the path
+ * `git worktree add` would really create, which is the only one worth
+ * checking containment against.
+ */
+function resolveLocation(target: string, depth = 0): string {
+  if (depth > 40) throw new Error(`symlink chain at "${target}" is too long to resolve`);
+  let probe = target;
+  const tail: string[] = [];
+  while (!nameExists(probe)) {
+    tail.unshift(path.basename(probe));
+    const parent = path.dirname(probe);
+    if (parent === probe) break;
+    probe = parent;
+  }
+  let probeReal: string;
+  try {
+    probeReal = realpathSync(probe);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    // The name is there but `realpath` cannot finish it: a dangling link.
+    // `readlinkSync` throws EINVAL on anything else, which fails closed.
+    // Recursing (rather than returning the raw target) resolves an absolute
+    // target such as /var/folders/... to its real /private/var/... form, so a
+    // legitimate in-workspace dangling link is not wrongly refused.
+    const link = readlinkSync(probe);
+    // A RELATIVE target resolves against the directory that actually CONTAINS
+    // the link, which is not its lexical parent when that parent is itself
+    // reached through a symlink. So the parent is made real first.
+    const base = realpathSync(path.dirname(probe));
+    probeReal = resolveLocation(path.resolve(base, link), depth + 1);
+  }
+  return tail.length > 0 ? path.join(probeReal, ...tail) : probeReal;
+}
+
+/**
  * Resolve `rel` against the workspace root and refuse anything that escapes it.
  *
  * Mirrors the two-stage check the filesystem tools use: a lexical test that
  * rejects `..` and absolute escapes cheaply, then a realpath test that catches
  * an in-root symlink pointing outside (CWE-59). The leaf may not exist yet — a
- * worktree is about to be created there — so the deepest existing ancestor is
- * resolved and the missing tail re-appended.
+ * worktree is about to be created there — so the deepest ancestor that EXISTS
+ * AS A NAME is resolved and the missing tail re-appended. "As a name" rather
+ * than "exists": a dangling link is still followed by whatever creates the
+ * path later, so `resolveLocation` follows it here too.
  */
 export function resolveInsideRoot(
   toolName: string,
@@ -60,15 +121,7 @@ export function resolveInsideRoot(
   if (abs !== rootResolved && !abs.startsWith(`${rootResolved}${path.sep}`)) return deny();
   try {
     const rootReal = realpathSync(rootResolved);
-    let probe = abs;
-    const tail: string[] = [];
-    while (!existsSync(probe)) {
-      tail.unshift(path.basename(probe));
-      const parent = path.dirname(probe);
-      if (parent === probe) break;
-      probe = parent;
-    }
-    const real = tail.length > 0 ? path.join(realpathSync(probe), ...tail) : realpathSync(probe);
+    const real = resolveLocation(abs);
     if (real !== rootReal && !real.startsWith(`${rootReal}${path.sep}`)) return deny();
     return { ok: true, value: real };
   } catch {

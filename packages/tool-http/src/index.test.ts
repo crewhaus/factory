@@ -20,6 +20,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -1093,6 +1094,31 @@ describe("DownloadFile", () => {
       overwrite: true,
     });
     expect(result.bytes).toBe(11);
+  });
+
+  test("a RELATIVE dangling link reached through an outward directory link is refused", async () => {
+    // Following a dangling link by hand is only half the job: a RELATIVE
+    // target has to be measured from the directory that actually CONTAINS the
+    // link, and that is not the link's lexical parent when the parent is
+    // itself a symlink.
+    //
+    // Here `pdir` leaves the workspace, so `l` really lives in
+    // <outsider>/realdir and "../escape.bin" truly names <outsider>/escape.bin
+    // — outside the root, hence the refusal. Read from the LEXICAL parent
+    // <workspace>/pdir it would instead say <workspace>/escape.bin, an in-root
+    // path that sails through containment. That is why the wrong base is not
+    // an escape but something quieter and still wrong: the download would be
+    // allowed, and the bytes would land at an in-workspace location
+    // "pdir/l" never pointed at.
+    mkdirSync(path.join(outsider, "realdir"));
+    symlinkSync(path.join(outsider, "realdir"), path.join(workspace, "pdir"));
+    symlinkSync("../escape.bin", path.join(outsider, "realdir", "l"));
+
+    const result = await run(downloadFile, { url: `${origin}/download`, path: "pdir/l" });
+    expect(result).toContain("escapes the workspace root");
+    expect(existsSync(path.join(outsider, "escape.bin"))).toBe(false);
+    // Nor quietly redirected to the in-root path the lexical reading names.
+    expect(existsSync(path.join(workspace, "escape.bin"))).toBe(false);
   });
 });
 

@@ -9,7 +9,7 @@
  * this package would be worst at breaking.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -391,6 +391,44 @@ describe("SecretScan", () => {
       symlinkSync(path.join(outside, "leak.txt"), path.join(tmp, "link.txt"));
       const out = await run(secretScan, { path: "." });
       expect(out.total).toBe(0);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("an outward directory link holding a relative dangling link is refused", async () => {
+    // A RELATIVE symlink target is resolved against the directory that
+    // actually CONTAINS the link, and that is not the link's lexical parent
+    // once the parent is itself reached through a symlink.
+    //
+    // Here `pdir` leaves the workspace, so `l` really sits in
+    // <outside>/realdir and its "../escape" truly names <outside>/escape.
+    // Measured from the LEXICAL parent <tmp>/pdir the same target reads as
+    // <tmp>/escape — an IN-ROOT path, which sails through containment. So
+    // the wrong base does not let the scan out of the workspace; it makes it
+    // read a different in-workspace file than the caller's path leads to,
+    // and it would refuse a legitimate in-workspace relative dangling link
+    // for the mirror-image reason.
+    const outside = mkdtempSync(path.join(tmpdir(), "crewhaus-secure-outside-"));
+    try {
+      mkdirSync(path.join(outside, "realdir"));
+      symlinkSync(path.join(outside, "realdir"), path.join(tmp, "pdir"));
+      // Dangling on purpose. A target that exists is resolved by `realpath`
+      // outright, and the readlink hop this pins never runs.
+      symlinkSync("../escape", path.join(outside, "realdir", "l"));
+      // The decoy the lexical reading names: with the wrong base the scan
+      // reads THIS file and reports its secret under the path "pdir/l",
+      // which makes the misreading visible as a finding, not as an absence.
+      writeFileSync(path.join(tmp, "escape"), "AKIAIOSFODNN7EXAMPLE\n");
+
+      // A plain workspace-relative path, so the cheap lexical pre-check that
+      // rejects `..` and absolutes has nothing to say — the refusal has to
+      // come from the symlink walk.
+      const out = await secretScan.execute({ path: "pdir/l" });
+      expect(String(out)).toContain("escapes the workspace root");
+      // The link is still dangling, which is what kept the readlink hop on
+      // the path taken; this package only reads, so nothing was made either.
+      expect(existsSync(path.join(outside, "escape"))).toBe(false);
     } finally {
       rmSync(outside, { recursive: true, force: true });
     }

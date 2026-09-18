@@ -332,6 +332,37 @@ describe("path containment", () => {
       expect(String(await run(tool, input))).toMatch(/escapes the workspace root/);
     }
   });
+
+  test("a relative dangling link under an outward directory link is refused", async () => {
+    // In the dangling cases above, the link and its lexical parent name the
+    // same real directory, so reading a target relative to either gives the
+    // same answer. Here they come apart. `pdir` leaves the workspace, so `l`
+    // really sits in <outside>/realdir and its RELATIVE target "../escape.bin"
+    // truly names <outside>/escape.bin. Measured from the LEXICAL parent
+    // <tmp>/pdir, that same target reads as <tmp>/escape.bin — an in-root
+    // path, which containment would wave through, so the write would land at
+    // a location "pdir/l" does not lead to. POSIX resolves a relative target
+    // against the directory that actually CONTAINS the link, which is why the
+    // parent is made real before the target is joined to it.
+    mkdirSync(path.join(outside, "realdir"));
+    symlinkSync(path.join(outside, "realdir"), path.join(tmp, "pdir"));
+    symlinkSync("../escape.bin", path.join(outside, "realdir", "l"));
+
+    const written = await run(pngWrite, {
+      path: "pdir/l",
+      width: 1,
+      height: 1,
+      pixels: Buffer.from([1, 2, 3, 255]).toString("base64"),
+    });
+    expect(String(written)).toMatch(/escapes the workspace root/);
+    // Reading it is refused for the same reason, and says the same thing.
+    expect(String(await run(imageInfo, { path: "pdir/l" }))).toMatch(/escapes the workspace root/);
+    // Nothing at the true destination — and nothing at the in-root path the
+    // lexical reading names either, because the harm here is a silent
+    // redirect to the wrong in-workspace file, not a write outside the root.
+    expect(existsSync(path.join(outside, "escape.bin"))).toBe(false);
+    expect(existsSync(path.join(tmp, "escape.bin"))).toBe(false);
+  });
 });
 
 describe("ImageInfo and ImageKind", () => {

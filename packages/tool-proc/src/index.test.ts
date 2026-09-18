@@ -11,6 +11,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -1095,5 +1096,159 @@ describe("EnvInspect", () => {
     const a = await envInspect.execute({ names: ["PATH", "HOME"] });
     const b = await envInspect.execute({ names: ["HOME", "PATH"] });
     expect(a).toBe(b);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+/**
+ * Regression — the DANGLING-symlink hole in `resolveSafe` itself.
+ *
+ * The containment walk used to probe for the deepest existing ancestor with
+ * `existsSync`, which FOLLOWS symlinks: a link whose target is missing
+ * answers false, so the walk strode past it, treated it as a plain missing
+ * leaf, and re-appended the name to the realpath'd parent. Containment was
+ * then decided on a path that pointed back into the workspace while the link
+ * pointed anywhere at all. Nothing in this package writes through a resolved
+ * path today — `WaitForFile` only polls for a size — so the hole was latent
+ * rather than live here, and `recheckContainment` caught the escape at the
+ * moment the outside target appeared. But "the tool that uses it is
+ * read-only" is not a property of the resolver, and the next tool to be
+ * handed a resolved path would inherit the hole. `resolveSafe` now refuses
+ * an outward dangling link UP FRONT; `recheckContainment` stays as the
+ * at-use guard for links planted or swapped after the check.
+ */
+describe("dangling-symlink containment in resolveSafe", () => {
+  test("an outward dangling symlink is refused up front, as a containment failure", async () => {
+    const target = join(outside, "appears-never.txt");
+    expect(existsSync(target)).toBe(false);
+    symlinkSync(target, join(tmp, "dangling.bin"));
+
+    const at = Date.now();
+    const out = await call(waitForFile, { path: "dangling.bin", timeoutMs: 2_000, intervalMs: 20 });
+
+    // The specific refusal matters. Before the fix the path was admitted and
+    // the tool polled it to the deadline (returning `satisfied: false`), and
+    // the only thing standing between a caller and an outside oracle was the
+    // per-poll recheck, whose wording is different ("it NOW resolves
+    // outside…"). This asserts the up-front check did the refusing.
+    expect(typeof out).toBe("string");
+    expect(out).toMatch(/a symlink on it leads outside the workspace root/);
+    // Refused before the first poll, not at the deadline.
+    expect(Date.now() - at).toBeLessThan(1_000);
+    // A read-only tool cannot have created the target, but assert it anyway:
+    // this is the assertion that would fail first if a writing tool were ever
+    // wired to `resolveSafe`. The planted link is left exactly as it was.
+    expect(existsSync(target)).toBe(false);
+    expect(lstatSync(join(tmp, "dangling.bin")).isSymbolicLink()).toBe(true);
+  });
+
+  test("a dangling symlinked DIRECTORY on the way out is refused too", async () => {
+    // The escape does not need the leaf to be the link: a link standing in
+    // for a directory that does not exist yet was walked past the same way,
+    // and everything under it inherited the parent's verdict.
+    symlinkSync(join(outside, "not-made-yet"), join(tmp, "dlink"));
+    const out = await call(waitForFile, {
+      path: "dlink/artifact.bin",
+      timeoutMs: 2_000,
+      intervalMs: 20,
+    });
+    expect(typeof out).toBe("string");
+    expect(out).toMatch(/a symlink on it leads outside the workspace root/);
+    expect(existsSync(join(outside, "not-made-yet"))).toBe(false);
+  });
+
+  test("a dangling symlink pointing INSIDE the workspace is still honoured", async () => {
+    // The mirror of the tests above: refusing every dangling link would also
+    // "pass" them. Waiting on a link whose target is not built yet is the
+    // whole point of WaitForFile, so it must survive the fix.
+    mkdirSync(join(tmp, "sub"));
+    const realTarget = join(tmp, "sub", "built-later.bin");
+    symlinkSync(realTarget, join(tmp, "inside-link.bin"));
+    const build = setTimeout(() => writeFileSync(realTarget, "built"), 80);
+    try {
+      const out = await call(waitForFile, {
+        path: "inside-link.bin",
+        timeoutMs: 2_000,
+        intervalMs: 20,
+      });
+      expect(out.satisfied).toBe(true);
+      expect(out.sizeBytes).toBe(5);
+    } finally {
+      clearTimeout(build);
+    }
+  });
+
+  test("an in-workspace target NAMED through an outside path is honoured, not refused", async () => {
+    /**
+     * The macOS wrinkle, made portable. There, a link written as
+     * /var/folders/… lands inside a workspace whose real root is
+     * /private/var/folders/… — the link target's SPELLING is outside the
+     * root even though the place it leads is inside. Here the same shape is
+     * built by hand: a directory symlink living outside the workspace that
+     * points back at it. Following one `readlink` hop and RECURSING resolves
+     * the target to its real in-workspace path; returning the raw readlink
+     * target instead would compare the outside spelling against the root and
+     * refuse a perfectly legitimate wait.
+     */
+    mkdirSync(join(tmp, "sub"));
+    symlinkSync(tmp, join(outside, "alias"));
+    const realTarget = join(tmp, "sub", "via-alias.bin");
+    symlinkSync(join(outside, "alias", "sub", "via-alias.bin"), join(tmp, "aliased-link.bin"));
+    const build = setTimeout(() => writeFileSync(realTarget, "ok!"), 80);
+    try {
+      const out = await call(waitForFile, {
+        path: "aliased-link.bin",
+        timeoutMs: 2_000,
+        intervalMs: 20,
+      });
+      expect(out.satisfied).toBe(true);
+      expect(out.sizeBytes).toBe(3);
+    } finally {
+      clearTimeout(build);
+    }
+  });
+
+  test("a RELATIVE dangling target is measured from where the link really lives", async () => {
+    /**
+     * A relative symlink target is resolved by the kernel against the
+     * directory that actually CONTAINS the link — not against the lexical
+     * spelling of the path used to reach it. Here `dirlink` is an
+     * in-workspace link to a directory OUTSIDE the root, and `l` inside that
+     * directory dangles at `../escape.bin`, i.e. at `<outside>/escape.bin`.
+     * Resolving `../escape.bin` from the LEXICAL parent (`<tmp>/dirlink`)
+     * instead reads it as `<tmp>/escape.bin` and admits the path, so the
+     * containment verdict is passed on a location the path does not lead to.
+     */
+    mkdirSync(join(outside, "realdir"));
+    symlinkSync(join(outside, "realdir"), join(tmp, "dirlink"));
+    symlinkSync("../escape.bin", join(outside, "realdir", "l"));
+
+    const at = Date.now();
+    const out = await call(waitForFile, { path: "dirlink/l", timeoutMs: 2_000, intervalMs: 20 });
+    expect(typeof out).toBe("string");
+    expect(out).toMatch(/a symlink on it leads outside the workspace root/);
+    expect(Date.now() - at).toBeLessThan(1_000);
+    expect(existsSync(join(outside, "escape.bin"))).toBe(false);
+  });
+
+  test("a relative dangling target that really lands inside is still honoured", async () => {
+    // The mirror of the test above, and the reason the parent has to be made
+    // REAL rather than simply dropped: `inlink` leads deeper into the
+    // workspace, so `../../legit.bin` climbs back to `<tmp>/legit.bin`, which
+    // is inside. Measured lexically it reads as `<tmp>/../legit.bin` — the
+    // root's parent — and a legitimate wait is refused.
+    mkdirSync(join(tmp, "deep", "inner"), { recursive: true });
+    symlinkSync(join(tmp, "deep", "inner"), join(tmp, "inlink"));
+    symlinkSync("../../legit.bin", join(tmp, "deep", "inner", "m"));
+    const realTarget = join(tmp, "legit.bin");
+    const build = setTimeout(() => writeFileSync(realTarget, "yes"), 80);
+    try {
+      const out = await call(waitForFile, { path: "inlink/m", timeoutMs: 2_000, intervalMs: 20 });
+      expect(out.satisfied).toBe(true);
+      expect(out.sizeBytes).toBe(3);
+    } finally {
+      clearTimeout(build);
+    }
   });
 });

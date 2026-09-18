@@ -161,35 +161,107 @@ describe("every exported tool is reachable from a spec", () => {
 /**
  * Path containment is implemented once and copied, so it can drift.
  *
- * Every package that takes a path from a caller carries its own
- * `src/paths.ts`. They started as copies of one another, and one of them was
- * found admitting a DANGLING symlink: `existsSync` follows links, so a link
- * whose target does not exist yet reads as "missing", the walk steps past it,
- * and the link's own name is re-appended to the resolved root — where it
- * passes the containment check. A write through that name then lands wherever
- * the link points.
+ * Every package that takes a path from a caller carries its own copy of the
+ * resolver. They started as copies of one another, and one of them was found
+ * admitting a DANGLING symlink: `existsSync` follows links, so a link whose
+ * target does not exist yet reads as "missing", the walk steps past it, and
+ * the link's own name is re-appended to the resolved root — where it passes
+ * the containment check. A write through that name then lands wherever the
+ * link points.
  *
  * The behavioural test for this lives in
  * `packages/tool-fsx/src/dangling.test.ts`. It can only cover one copy, so
  * this asserts the others did not drift back to the unsafe probe.
+ *
+ * Copies are found by WHAT THEY CONTAIN, not by filename. The earlier version
+ * of this test looked only at `src/paths.ts` and `continue`d past anything
+ * else, so it silently skipped every package that keeps its resolver
+ * somewhere else — `tool-fs` and `tool-image` in `index.ts`, `tool-proc` in
+ * `safe-path.ts`, `tool-git` in `git-run.ts` — which is exactly where the
+ * unsafe probe survived. A guard that inspects nothing passes, so the count
+ * is asserted too.
  */
 describe("every copy of the path resolver probes with lstat, not existsSync", () => {
-  test("no copy walks with existsSync, and each follows a dangling link by hand", () => {
+  /** Files that implement the walk-up-to-an-existing-ancestor resolver. */
+  function resolverFiles(): Array<{ pkg: string; file: string; text: string }> {
     const repoRoot = join(import.meta.dir, "..", "..", "..");
     const pkgDir = join(repoRoot, "packages");
-    const offenders: Array<{ pkg: string; why: string }> = [];
-    for (const pkg of readdirSync(pkgDir).filter((d) => d.startsWith("tool-"))) {
-      const file = join(pkgDir, pkg, "src", "paths.ts");
-      if (!existsSync(file)) continue;
-      const text = readFileSync(file, "utf-8");
-      // `existsSync` may appear in a comment explaining why it is wrong; what
-      // matters is that nothing WALKS with it.
-      if (/while \(!existsSync\(/.test(text)) offenders.push({ pkg, why: "walks with existsSync" });
-      if (!text.includes("lstatSync")) offenders.push({ pkg, why: "does not probe with lstat" });
+    const found: Array<{ pkg: string; file: string; text: string }> = [];
+    // EVERY package, not just `tool-*`. Scoping this sweep to tool packages
+    // is the same blind spot as scoping it to `paths.ts`: `packages/crawler`
+    // carries its own copy of the resolver (it checks against a list of
+    // allowed roots rather than one workspace root) and was the last one
+    // still walking with `existsSync`, precisely because nothing looked.
+    for (const pkg of readdirSync(pkgDir)) {
+      const srcDir = join(pkgDir, pkg, "src");
+      if (!existsSync(srcDir)) continue;
+      for (const entry of readdirSync(srcDir)) {
+        if (!entry.endsWith(".ts") || entry.endsWith(".test.ts")) continue;
+        const file = join(srcDir, entry);
+        const text = readFileSync(file, "utf-8");
+        // The signature of the resolver: a loop that walks up while the
+        // component is not there. Any probe name counts — the point is to
+        // find the walk, then judge what it probes WITH.
+        if (/while \(!\w+\(probe\)\)/.test(text)) found.push({ pkg, file: entry, text });
+      }
+    }
+    return found;
+  }
+
+  test("no copy walks with existsSync, and each follows a dangling link by hand", () => {
+    const copies = resolverFiles();
+    const offenders: Array<{ pkg: string; file: string; why: string }> = [];
+    for (const { pkg, file, text } of copies) {
+      // `existsSync` may appear in a comment explaining why it is wrong, or
+      // as a genuine "does this really exist" check elsewhere in the file;
+      // what matters is that nothing WALKS with it.
+      if (/while \(!existsSync\(/.test(text)) {
+        offenders.push({ pkg, file, why: "walks with existsSync" });
+      }
+      if (!text.includes("lstatSync")) {
+        offenders.push({ pkg, file, why: "does not probe with lstat" });
+      }
       if (!text.includes("readlinkSync")) {
-        offenders.push({ pkg, why: "cannot follow a dangling link, so it over-refuses" });
+        offenders.push({ pkg, file, why: "cannot follow a dangling link, so it over-refuses" });
+      }
+      // The second defect in the same hop: a RELATIVE link target must be
+      // resolved against the directory that really CONTAINS the link, not
+      // against its lexical parent. They differ when that parent is itself a
+      // symlink, and the lexical reading then names an in-root path the
+      // caller's path does not lead to — so the operation lands somewhere
+      // else inside the workspace, or a legitimate link is refused.
+      if (/resolve\(\s*(path\.)?dirname\(probe\)\s*,/.test(text)) {
+        offenders.push({
+          pkg,
+          file,
+          why: "resolves a relative link target against the lexical parent",
+        });
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  test("the sweep actually finds the copies it is meant to guard", () => {
+    // Without this, renaming or moving a resolver makes the test above pass
+    // by inspecting nothing — which is how the unsafe probe survived in five
+    // packages while this file reported green. The floor and the named list
+    // are both load-bearing: the floor catches a copy that disappears from
+    // the sweep, the list catches the ones that do not follow the filename
+    // or the `tool-` prefix convention.
+    const copies = resolverFiles();
+    const pkgs = [...new Set(copies.map((c) => c.pkg))].sort();
+    expect(copies.length).toBeGreaterThanOrEqual(17);
+    // The ones that do NOT use the conventional paths.ts filename are the
+    // ones a filename-based sweep loses, so name them explicitly.
+    for (const pkg of [
+      "tool-fs",
+      "tool-image",
+      "tool-document-ingest",
+      "tool-proc",
+      "tool-git",
+      "crawler",
+    ]) {
+      expect(pkgs).toContain(pkg);
+    }
   });
 });

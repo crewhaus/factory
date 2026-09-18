@@ -8,6 +8,7 @@
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -136,6 +137,30 @@ describe("path containment", () => {
     expect(await call(specValidate, { path: "linked.yaml" })).toContain(
       "escapes the workspace root",
     );
+  });
+
+  test("an outward directory link holding a relative dangling link is refused", async () => {
+    // A relative symlink target is resolved against the directory that
+    // actually CONTAINS the link, and `pdir` is a door out of the workspace:
+    // `l` really lives in <outside>/realdir, so "../escape.yaml" truly names
+    // <outside>/escape.yaml. Measured instead from the link's LEXICAL parent
+    // <tmp>/pdir it reads as <tmp>/escape.yaml — an in-root path, which sails
+    // through containment. So the lexical base is not a hole in the boundary;
+    // it is worse in a quieter way: the tool answers about a DIFFERENT file
+    // from the one the caller's path leads to. `escape.yaml` below is that
+    // different file, planted so a wrongly-based walk would find a readable,
+    // valid spec there and report happily on it instead of refusing.
+    const dir = outsideDir();
+    mkdirSync(path.join(dir, "realdir"));
+    symlinkSync(path.join(dir, "realdir"), path.join(tmp, "pdir"));
+    symlinkSync("../escape.yaml", path.join(dir, "realdir", "l"));
+    write("escape.yaml", CLI_SPEC);
+
+    expect(await call(specValidate, { path: "pdir/l" })).toContain("escapes the workspace root");
+    // The path is a plain relative one, so the lexical pre-check passes it and
+    // the refusal can only have come from the symlink walk. Nothing was
+    // materialised at the link's true destination on the way there either.
+    expect(existsSync(path.join(dir, "escape.yaml"))).toBe(false);
   });
 
   test("every path-taking tool refuses an escape, not just the spec ones", async () => {
