@@ -111,6 +111,7 @@
     "@crewhaus/trace-event-bus": "workspace:*",
     "@crewhaus/tool-bash": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-html": "workspace:*",
     "@crewhaus/tool-onchain": "workspace:*",
     "@crewhaus/tool-money": "workspace:*",
     "@crewhaus/tool-pkg": "workspace:*",

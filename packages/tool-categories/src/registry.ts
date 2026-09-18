@@ -625,6 +625,20 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     ],
   },
 
+  html: {
+    title:
+      "Reading HTML without a browser: CSS selection, tables, links, forms, structured data, readable text and declarative scraping",
+    tools: [
+      "htmlForms",
+      "htmlLinks",
+      "htmlQuery",
+      "htmlRecords",
+      "htmlStructuredData",
+      "htmlTable",
+      "htmlText",
+    ],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -675,7 +689,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   content: {
     title: "Everything that reads or produces documents and images",
-    includes: ["ingest", "documents", "media", "text"],
+    includes: ["ingest", "documents", "media", "text", "html"],
   },
 });
 

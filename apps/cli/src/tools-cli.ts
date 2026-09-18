@@ -117,6 +117,13 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
     "cancel the command",
   ],
   todoWrite: ["todo", "task list", "track tasks", "checklist"],
+  htmlForms: ["form", "fields", "input", "csrf", "submit"],
+  htmlLinks: ["links", "anchors", "href", "pagination", "crawl"],
+  htmlQuery: ["css selector", "query", "scrape", "dom", "select"],
+  htmlRecords: ["scrape", "listing", "records", "recipe", "extract"],
+  htmlStructuredData: ["json-ld", "opengraph", "schema.org", "meta tags", "microdata"],
+  htmlTable: ["table", "rows", "colspan", "grid", "html table"],
+  htmlText: ["readable text", "strip tags", "boilerplate", "article text", "page text"],
   abiDecode: ["abi", "decode", "calldata", "eth_call result", "revert data"],
   abiEncodeCall: ["abi", "encode", "calldata", "contract call", "selector"],
   addressCheck: ["address", "eip-55", "checksum", "ethereum address", "0x"],
@@ -1463,6 +1470,13 @@ export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object.freeze([
   "functionSelector",
   "typedDataHash",
   "tokenUnits",
+  "htmlForms",
+  "htmlLinks",
+  "htmlQuery",
+  "htmlRecords",
+  "htmlStructuredData",
+  "htmlTable",
+  "htmlText",
 ]);
 
 /**

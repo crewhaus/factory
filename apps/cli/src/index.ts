@@ -3649,6 +3649,7 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     pkg,
     money,
     onchain,
+    html,
   ] = await Promise.all([
     import("@crewhaus/tool-fs"),
     import("@crewhaus/tool-bash"),
@@ -3684,6 +3685,7 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     import("@crewhaus/tool-pkg"),
     import("@crewhaus/tool-money"),
     import("@crewhaus/tool-onchain"),
+    import("@crewhaus/tool-html"),
   ]);
   const map: Record<string, RegisteredTool> = {
     read: fs.read,
@@ -3714,6 +3716,14 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     codegraphCallers: codegraph.codegraphCallers,
     codegraphCallees: codegraph.codegraphCallees,
     codegraphImpact: codegraph.codegraphImpact,
+    // @crewhaus/tool-html
+    htmlForms: html.htmlForms,
+    htmlLinks: html.htmlLinks,
+    htmlQuery: html.htmlQuery,
+    htmlRecords: html.htmlRecords,
+    htmlStructuredData: html.htmlStructuredData,
+    htmlTable: html.htmlTable,
+    htmlText: html.htmlText,
     // @crewhaus/tool-onchain
     abiDecode: onchain.abiDecode,
     abiEncodeCall: onchain.abiEncodeCall,

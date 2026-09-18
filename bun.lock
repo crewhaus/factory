@@ -129,6 +129,7 @@
         "@crewhaus/tool-fs": "workspace:*",
         "@crewhaus/tool-fsx": "workspace:*",
         "@crewhaus/tool-git": "workspace:*",
+        "@crewhaus/tool-html": "workspace:*",
         "@crewhaus/tool-http": "workspace:*",
         "@crewhaus/tool-image": "workspace:*",
         "@crewhaus/tool-image-generation": "workspace:*",
@@ -2372,6 +2373,19 @@
         "@crewhaus/sandbox": "workspace:*",
       },
     },
+    "packages/tool-html": {
+      "name": "@crewhaus/tool-html",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-http": {
       "name": "@crewhaus/tool-http",
       "version": "0.6.0",
@@ -3358,6 +3372,8 @@
     "@crewhaus/tool-git": ["@crewhaus/tool-git@workspace:packages/tool-git"],
 
     "@crewhaus/tool-harness-synthesizer": ["@crewhaus/tool-harness-synthesizer@workspace:packages/tool-harness-synthesizer"],
+
+    "@crewhaus/tool-html": ["@crewhaus/tool-html@workspace:packages/tool-html"],
 
     "@crewhaus/tool-http": ["@crewhaus/tool-http@workspace:packages/tool-http"],
 
