@@ -313,18 +313,32 @@ export function forbiddenConstruct(sql: string): { word: string; why: string } |
  * string. Refusing control characters and empty names keeps identifiers to
  * shapes a human would recognise in an error message.
  */
+/**
+ * Control characters: NUL through unit separator, plus DEL.
+ *
+ * Written with `\u` escapes, NOT with `\x` escapes and not as raw bytes. The
+ * formatter rewrites `\x00`-style escapes inside a regex literal into the
+ * bytes they denote, and a source file carrying literal control characters is
+ * not parsed the same way by every engine — Bun 1.3.11 rejects the resulting
+ * class as "range out of order" while 1.3.14 accepts it, so that form shipped
+ * green locally and failed in CI. `\u` escapes survive formatting.
+ * `apps/cli/src/source-hygiene.test.ts` fails if the raw-byte form returns.
+ */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point.
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point.
+const CONTROL_CHARS_GLOBAL = /[\u0000-\u001f\u007f]/g;
+
 export function isSafeIdentifier(name: string): boolean {
   if (name.length === 0 || name.length > 255) return false;
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point.
-  if (/[ -]/.test(name)) return false;
+  if (CONTROL_CHARS.test(name)) return false;
   return name.trim() === name;
 }
 
 /** Quote an identifier for interpolation. Throws on a name that is not safe. */
 export function quoteIdentifier(name: string): string {
   if (!isSafeIdentifier(name)) {
-    // biome-ignore lint/suspicious/noControlCharactersInRegex: the message must not carry them through.
-    const shown = name.replace(/[ -]/g, "?");
+    const shown = name.replace(CONTROL_CHARS_GLOBAL, "?");
     throw new Error(`"${shown}" is not a usable SQLite identifier`);
   }
   return `"${name.replace(/"/g, '""')}"`;
