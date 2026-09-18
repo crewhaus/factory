@@ -5,7 +5,15 @@
  * isError:true and a permission-flavored message.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -181,5 +189,135 @@ describe("integration: tool-fs symlink containment (#149)", () => {
     const r = await executeTool(lookup("Read"), { path: "good-link.txt" }, { toolUseId: "sl5" });
     expect(r.isError).toBe(false);
     expect(r.content).toBe("hello");
+  });
+});
+
+// Regression — the DANGLING-symlink variant of #149. `existsSync` follows
+// symlinks, so a link whose target is missing answers false: a containment
+// check that probes with it walks straight past the link, treats it as a
+// plain missing leaf, and re-appends the name to the realpath'd parent, so
+// the check passes. `open(…, "w")` then follows the link and creates the
+// target OUTSIDE the workspace. Probing with `lstat` instead — a dangling
+// link is a NAME that exists — keeps the link in the resolved part of the
+// path, where one `readlink` hop shows where the write would really land.
+describe("integration: tool-fs dangling-symlink containment", () => {
+  // One attempt per writing tool, each aimed at the symlink it is handed.
+  const writeAttempts: ReadonlyArray<[string, (link: string) => unknown]> = [
+    ["Write", (link) => ({ path: link, content: "PWNED" })],
+    ["Edit", (link) => ({ path: link, oldString: "aaa", newString: "PWNED" })],
+  ];
+
+  test("the attempts below cover every writing tool in the package", () => {
+    const writers = allFsTools
+      .filter((t) => t.destructive)
+      .map((t) => t.name)
+      .sort();
+    expect(writeAttempts.map(([name]) => name).sort()).toEqual(writers);
+  });
+
+  test("every writing tool refuses a dangling symlink pointing outside", async () => {
+    const outside = mkdtempSync(path.join(tmpdir(), "tool-fs-outside-"));
+    try {
+      for (const [name, makeInput] of writeAttempts) {
+        const target = path.join(outside, `pwned-${name}.txt`);
+        const link = `dangling-${name}.txt`;
+        symlinkSync(target, path.join(tmp, link));
+        const r = await executeTool(lookup(name), makeInput(link), { toolUseId: `dang-${name}` });
+        // Refused as a containment failure, not as an incidental ENOENT.
+        expect({ tool: name, isError: r.isError }).toEqual({ tool: name, isError: true });
+        expect(String(r.content)).toMatch(/escapes the workspace root/);
+        // Nothing was created outside, and the link itself was left alone —
+        // before the fix, Write's rename replaced the link with a real file.
+        expect({ tool: name, escaped: existsSync(target) }).toEqual({ tool: name, escaped: false });
+        const stillLink = lstatSync(path.join(tmp, link)).isSymbolicLink();
+        expect({ tool: name, stillLink }).toEqual({ tool: name, stillLink: true });
+      }
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a dangling symlink that stays inside the workspace is still honoured", async () => {
+    // The mirror of the test above: refusing every dangling link would also
+    // "pass" it, so check that an in-workspace one is written THROUGH to the
+    // target it names, rather than refused or overwritten as a plain file.
+    mkdirSync(path.join(tmp, "sub"));
+    const realTarget = path.join(tmp, "sub", "made.txt");
+    symlinkSync(realTarget, path.join(tmp, "inside.txt"));
+
+    const w = await executeTool(
+      lookup("Write"),
+      { path: "inside.txt", content: "aaa" },
+      { toolUseId: "in1" },
+    );
+    expect(w.isError).toBe(false);
+    expect(readFileSync(realTarget, "utf8")).toBe("aaa");
+    expect(lstatSync(path.join(tmp, "inside.txt")).isSymbolicLink()).toBe(true);
+
+    // And the link, no longer dangling, still works for the next tool.
+    const e = await executeTool(
+      lookup("Edit"),
+      { path: "inside.txt", oldString: "aaa", newString: "bbb" },
+      { toolUseId: "in2" },
+    );
+    expect(e.isError).toBe(false);
+    expect(readFileSync(realTarget, "utf8")).toBe("bbb");
+  });
+
+  test("a dangling symlinked DIRECTORY pointing outside is refused", async () => {
+    // The escape does not need the leaf to be the link: a link standing in
+    // for a directory that does not exist yet is walked past the same way,
+    // and Bun.write creates missing parents on the way to the target.
+    const outside = mkdtempSync(path.join(tmpdir(), "tool-fs-outside-"));
+    try {
+      const missing = path.join(outside, "made-by-write");
+      symlinkSync(missing, path.join(tmp, "dlink"));
+      const r = await executeTool(
+        lookup("Write"),
+        { path: "dlink/evil.txt", content: "PWNED" },
+        { toolUseId: "dang-dir" },
+      );
+      expect(r.isError).toBe(true);
+      expect(String(r.content)).toMatch(/escapes the workspace root/);
+      expect(existsSync(missing)).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+// Regression — a RELATIVE symlink target must be resolved against the
+// directory that actually CONTAINS the link, not the link's lexical parent.
+// The two differ exactly when that parent is itself reached through a
+// symlink, and following one `readlink` hop is what first makes the
+// difference reachable: the leaf now stays in the RESOLVED part of the path,
+// so measuring it from the wrong directory names a location the caller's
+// path does not lead to.
+describe("integration: tool-fs relative dangling-link base", () => {
+  test("an outward directory link holding a relative dangling link is refused", async () => {
+    const outside = mkdtempSync(path.join(tmpdir(), "tool-fs-outside-"));
+    try {
+      mkdirSync(path.join(outside, "realdir"));
+      // `pdir` leaves the workspace, so `l` really lives in <outside>/realdir
+      // and "../escape.bin" truly lands at <outside>/escape.bin. Measured
+      // from the LEXICAL parent <tmp>/pdir it reads as <tmp>/escape.bin — an
+      // in-root path, which is how the wrong base turns a refusal into a
+      // silent redirect.
+      symlinkSync(path.join(outside, "realdir"), path.join(tmp, "pdir"));
+      symlinkSync("../escape.bin", path.join(outside, "realdir", "l"));
+
+      const r = await executeTool(
+        lookup("Write"),
+        { path: "pdir/l", content: "PWNED" },
+        { toolUseId: "relbase" },
+      );
+      expect(r.isError).toBe(true);
+      expect(String(r.content)).toMatch(/escapes the workspace root/);
+      expect(existsSync(path.join(outside, "escape.bin"))).toBe(false);
+      // Nor quietly redirected to the in-root path the lexical reading names.
+      expect(existsSync(path.join(tmp, "escape.bin"))).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

@@ -1,11 +1,12 @@
 import { randomBytes } from "node:crypto";
 import {
   closeSync,
-  existsSync,
   constants as fsConstants,
   fstatSync,
+  lstatSync,
   openSync,
   readSync,
+  readlinkSync,
   realpathSync,
 } from "node:fs";
 import { rename, unlink } from "node:fs/promises";
@@ -41,6 +42,70 @@ export class ToolPermissionError extends CrewhausError {
   }
 }
 
+/**
+ * True when the NAME exists, whether or not it leads anywhere.
+ *
+ * `existsSync` follows symlinks, so it answers false for a link whose target
+ * is missing — and a missing target is exactly the case that matters here: a
+ * dangling link is still a door. Probing with `lstat` keeps that name in the
+ * part of the path that gets RESOLVED rather than in the "does not exist
+ * yet" tail that is appended to the root verbatim.
+ */
+function nameExists(p: string): boolean {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Where `target` would actually land, with every symlink on the way already
+ * followed — including one whose own target does not exist yet.
+ *
+ * `realpathSync` gives up with ENOENT on a dangling link, which would leave
+ * that link unresolved and let it stand in for a plain missing file. So the
+ * deepest ancestor that exists as a NAME is resolved, a dangling one is
+ * followed a hop by hand, and the components that do not exist are appended.
+ * The result is the path an `open` would create, which is the only path
+ * worth checking containment against.
+ */
+function resolveLocation(target: string, depth = 0): string {
+  if (depth > 40) throw new Error(`symlink chain at "${target}" is too long to resolve`);
+  let probe = target;
+  const tail: string[] = [];
+  while (!nameExists(probe)) {
+    tail.unshift(path.basename(probe));
+    const parent = path.dirname(probe);
+    if (parent === probe) break; // reached the filesystem root
+    probe = parent;
+  }
+  let probeReal: string;
+  try {
+    probeReal = realpathSync(probe);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    // The name is there but `realpath` cannot finish it: a symlink with a
+    // missing target. `readlinkSync` throws EINVAL on anything else, which
+    // fails closed. A relative target resolves against the link's directory.
+    // Recursing (rather than returning the raw target) is what resolves an
+    // absolute target such as /var/folders/... to its real /private/var/...
+    // form, so a legitimate in-workspace dangling link is not wrongly refused.
+    const link = readlinkSync(probe);
+    // A RELATIVE target resolves against the directory that actually CONTAINS
+    // the link, which is not the link's lexical parent when that parent is
+    // itself reached through a symlink. `<root>/dirlink/x -> ../y` with
+    // `dirlink` pointing out of the root really lands at `<elsewhere>/y`, but
+    // measured from the lexical parent it reads as `<root>/y` — an in-root
+    // path the caller's path does not lead to. So the parent is made real
+    // first. An absolute target ignores the base.
+    const base = realpathSync(path.dirname(probe));
+    probeReal = resolveLocation(path.resolve(base, link), depth + 1);
+  }
+  return tail.length > 0 ? path.join(probeReal, ...tail) : probeReal;
+}
+
 function resolveSafe(toolName: string, rel: string, root: string = process.cwd()): string {
   const rootResolved = path.resolve(root);
   const abs = path.resolve(rootResolved, rel);
@@ -52,20 +117,15 @@ function resolveSafe(toolName: string, rel: string, root: string = process.cwd()
   // 2) Symlink-aware containment (CWE-59). The lexical check above is fooled
   //    by an in-root symlink that points outside the workspace, so re-check
   //    the REAL path. The leaf may not exist yet (Write/Edit create it), so
-  //    resolve the deepest existing ancestor and re-append the missing tail.
+  //    resolve the deepest ancestor that EXISTS AS A NAME and re-append the
+  //    missing tail. "Exists as a name" rather than "exists": a symlink whose
+  //    target is not there yet is still followed by `open(…, "w")`, so it is
+  //    resolved here too rather than treated as a plain missing leaf.
   //    Fails closed if realpath errors for any reason other than the walk.
   let real: string;
   try {
     const rootReal = realpathSync(rootResolved);
-    let probe = abs;
-    const tail: string[] = [];
-    while (!existsSync(probe)) {
-      tail.unshift(path.basename(probe));
-      const parent = path.dirname(probe);
-      if (parent === probe) break; // reached the filesystem root
-      probe = parent;
-    }
-    real = tail.length > 0 ? path.join(realpathSync(probe), ...tail) : realpathSync(probe);
+    real = resolveLocation(abs);
     if (real !== rootReal && !real.startsWith(`${rootReal}${path.sep}`)) {
       throw new ToolPermissionError(toolName, rel);
     }
