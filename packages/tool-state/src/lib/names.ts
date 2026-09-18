@@ -1,0 +1,147 @@
+/**
+ * Turning caller-supplied identifiers into filenames, safely and reversibly.
+ *
+ * Two kinds of identifier flow into this package:
+ *
+ *   NAMES  — namespaces, streams, topics, counters, checkpoints, indexes.
+ *            The caller picks them, so they are held to a strict charset and
+ *            a short length. They round-trip exactly.
+ *   KEYS   — key-value keys, note ids, dedupe ids. These come from the world
+ *            (a URL, a message id, an order number), so they may contain
+ *            anything printable and are percent-encoded instead.
+ *
+ * The encoding only ever emits `[a-z0-9._%~-]`, with LOWERCASE hex digits, so
+ * two identifiers that differ only in case never collide into one filename on
+ * a case-insensitive filesystem (macOS, Windows) — a bug that would otherwise
+ * appear only on someone else's machine. A leading dot is encoded too, so an
+ * encoded name is never a hidden file and never `.` or `..`.
+ */
+import { createHash } from "node:crypto";
+
+/** Characters that survive encoding untouched. */
+const UNRESERVED = "abcdefghijklmnopqrstuvwxyz0123456789._-";
+
+/**
+ * Longest encoded filename produced. Beyond it the name is truncated and a
+ * digest appended, which keeps every filename inside the 255-byte limit every
+ * mainstream filesystem shares. A truncated name cannot be decoded, which is
+ * why each record also stores its own key in its contents.
+ */
+export const MAX_ENCODED_LENGTH = 200;
+
+/** Length of the appended digest, in hex characters. */
+const DIGEST_CHARS = 32;
+
+/**
+ * Percent-encode `raw` into a filename-safe segment.
+ *
+ * Deterministic: the same input always produces the same filename, including
+ * the truncated form, whose digest is taken over the whole original.
+ */
+export function encodeSegment(raw: string): string {
+  const bytes = new TextEncoder().encode(raw);
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    const byte = bytes[i] ?? 0;
+    const ch = String.fromCharCode(byte);
+    const plain = byte < 0x80 && UNRESERVED.includes(ch) && !(ch === "." && i === 0);
+    out += plain ? ch : `%${byte.toString(16).padStart(2, "0")}`;
+  }
+  if (out.length === 0) return "%00";
+  if (out.length <= MAX_ENCODED_LENGTH) return out;
+  const digest = createHash("sha256").update(raw).digest("hex").slice(0, DIGEST_CHARS);
+  return `${out.slice(0, MAX_ENCODED_LENGTH - DIGEST_CHARS - 1)}~${digest}`;
+}
+
+/**
+ * Reverse `encodeSegment`, or `undefined` when the segment is a truncated
+ * form (it carries a `~`) or is not a well-formed encoding. Callers that may
+ * meet a truncated name read the identifier out of the file instead.
+ */
+export function decodeSegment(encoded: string): string | undefined {
+  if (encoded.includes("~")) return undefined;
+  const bytes: number[] = [];
+  for (let i = 0; i < encoded.length; i += 1) {
+    const ch = encoded[i] ?? "";
+    if (ch !== "%") {
+      if (!UNRESERVED.includes(ch)) return undefined;
+      bytes.push(ch.charCodeAt(0));
+      continue;
+    }
+    const hex = encoded.slice(i + 1, i + 3);
+    if (!/^[0-9a-f]{2}$/.test(hex)) return undefined;
+    bytes.push(Number.parseInt(hex, 16));
+    i += 2;
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Longest a NAME may be. Short enough that its encoded form never truncates. */
+export const MAX_NAME_LENGTH = 64;
+/** Longest a KEY may be. Longer keys are refused rather than silently cut. */
+export const MAX_KEY_LENGTH = 512;
+
+const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * Validate a NAME, returning a readable complaint or `undefined` when it is
+ * fine. `label` names the field so the message tells the caller which one.
+ */
+export function validateName(label: string, value: string): string | undefined {
+  if (value.length === 0) return `${label} may not be empty`;
+  if (value.length > MAX_NAME_LENGTH) {
+    return `${label} is ${value.length} characters, over the ${MAX_NAME_LENGTH} limit`;
+  }
+  if (!NAME_PATTERN.test(value)) {
+    return `${label} "${value}" must start with a letter or digit and contain only letters, digits, '.', '-' and '_'`;
+  }
+  if (value.includes("..")) return `${label} "${value}" may not contain '..'`;
+  return undefined;
+}
+
+/**
+ * Control characters: NUL through unit separator, plus DEL.
+ *
+ * Written with `\u` escapes, NOT with `\x` escapes and not as raw bytes. The
+ * formatter rewrites `\x00`-style escapes inside a regex literal into the
+ * bytes they denote, and a source file carrying literal control characters is
+ * not parsed the same way by every engine — Bun 1.3.11 rejects the resulting
+ * class as "range out of order" while 1.3.14 accepts it, so that form shipped
+ * green locally and failed in CI. `\u` escapes survive formatting.
+ * `apps/cli/src/source-hygiene.test.ts` fails if the raw-byte form returns.
+ */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point.
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+
+/**
+ * Validate a KEY. Anything printable is allowed — keys are external ids — but
+ * control characters are refused because they would make the record's own
+ * JSON, and every log line quoting it, unreadable.
+ */
+export function validateKey(
+  label: string,
+  value: string,
+  max = MAX_KEY_LENGTH,
+): string | undefined {
+  if (value.length === 0) return `${label} may not be empty`;
+  if (value.length > max) {
+    return `${label} is ${value.length} characters, over the ${max} limit`;
+  }
+  if (CONTROL_CHARS.test(value)) return `${label} may not contain control characters`;
+  return undefined;
+}
+
+/**
+ * Plain lexicographic comparison by UTF-16 code unit — deliberately NOT
+ * `localeCompare`, whose ordering depends on the machine's locale and would
+ * make the same listing differ between two runs on two laptops.
+ */
+export function compareStrings(a: string, b: string): number {
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}

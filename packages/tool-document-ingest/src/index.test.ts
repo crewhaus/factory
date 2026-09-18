@@ -9,7 +9,16 @@
  * relative path.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
@@ -213,5 +222,141 @@ describe("ingestDocument — size cap", () => {
   test("default maxBytes is 1MB", () => {
     const parsed = ingestDocument.inputSchema.parse({ path: "x" });
     expect(parsed.maxBytes).toBeUndefined();
+  });
+});
+
+// Regression — the DANGLING-symlink variant of the containment hole. A link
+// whose target is missing answers false to `existsSync`, because `existsSync`
+// follows symlinks: a containment walk that probes with it strolls past the
+// link, treats it as a plain missing leaf, and re-appends the name to the
+// realpath'd parent, so the check passes on a path that really points outside
+// the workspace. IngestDocument is read-only and opens with O_NOFOLLOW, so
+// nothing escapes through it TODAY — these tests pin the boundary itself, so
+// that a future writing tool (or an operator-registered parser, which receives
+// the resolved path and is outside the O_NOFOLLOW guard) inherits a `resolveSafe`
+// that already refuses the link.
+describe("ingestDocument — dangling-symlink containment", () => {
+  test("a dangling symlink pointing outside the workspace is refused", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "doc-ingest-outside-"));
+    try {
+      // The target does not exist: this is the case `existsSync` gets wrong.
+      const target = join(outside, "pwned.txt");
+      symlinkSync(target, join(tmp, "dangling.txt"));
+
+      const err = await ingestDocument.execute({ path: "dangling.txt" }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      // Refused as a CONTAINMENT failure, not as an incidental "file not found".
+      expect(err).toBeInstanceOf(ToolPermissionError);
+      expect((err as Error).message).toMatch(/escapes the workspace root/);
+      // Read-only tool, so the interesting negatives are that the refusal did
+      // not bring the outside target into being and left the bait untouched.
+      expect(existsSync(target)).toBe(false);
+      expect(lstatSync(join(tmp, "dangling.txt")).isSymbolicLink()).toBe(true);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a dangling symlinked DIRECTORY pointing outside is refused", async () => {
+    // The escape does not need the leaf to be the link: a link standing in for
+    // a directory that does not exist yet is walked past the same way, and the
+    // whole subtree underneath it then reads as in-workspace.
+    const outside = mkdtempSync(join(tmpdir(), "doc-ingest-outside-"));
+    try {
+      const missing = join(outside, "not-yet-a-dir");
+      symlinkSync(missing, join(tmp, "dlink"));
+
+      const err = await ingestDocument.execute({ path: "dlink/secret.txt" }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(ToolPermissionError);
+      expect((err as Error).message).toMatch(/escapes the workspace root/);
+      expect(existsSync(missing)).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a dangling symlink that stays inside the workspace is not a containment refusal", async () => {
+    // The mirror of the tests above: refusing every dangling link would also
+    // "pass" them. An in-workspace dangling link must fail — there is nothing
+    // to read — but it must fail as an ordinary not-found, never as an escape.
+    mkdirSync(join(tmp, "sub"));
+    const realTarget = join(tmp, "sub", "made.txt");
+    symlinkSync(realTarget, join(tmp, "inside.txt"));
+
+    const err = await ingestDocument.execute({ path: "inside.txt" }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(DocumentIngestError);
+    expect((err as Error).message).not.toMatch(/escapes the workspace root/);
+
+    // And once the target exists, the same link reads straight through it.
+    writeFileSync(realTarget, "arrived through the link");
+    const result = await ingestDocument.execute({ path: "inside.txt" });
+    expect(result).toContain("arrived through the link");
+  });
+
+  test("an in-workspace dangling link written through an aliased prefix is honoured", async () => {
+    // The macOS /var -> /private/var wrinkle, built by hand so it holds on
+    // every platform: the link's target names a path OUTSIDE the workspace
+    // that itself resolves back INSIDE it. Following one `readlink` hop and
+    // returning the raw target refuses this; recursing resolves the alias
+    // first and sees that the write would land in the workspace after all.
+    const outside = mkdtempSync(join(tmpdir(), "doc-ingest-alias-"));
+    try {
+      mkdirSync(join(tmp, "sub"));
+      symlinkSync(tmp, join(outside, "ws")); // outside/ws -> the workspace
+      const aliased = join(outside, "ws", "sub", "made.txt");
+      symlinkSync(aliased, join(tmp, "aliased-link.txt"));
+
+      const err = await ingestDocument.execute({ path: "aliased-link.txt" }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect((err as Error).message).not.toMatch(/escapes the workspace root/);
+      expect(err).toBeInstanceOf(DocumentIngestError);
+
+      // Positive half: with the target in place the read succeeds, proving the
+      // alias resolved to a real in-workspace file rather than being tolerated.
+      writeFileSync(join(tmp, "sub", "made.txt"), "aliased but inside");
+      const result = await ingestDocument.execute({ path: "aliased-link.txt" });
+      expect(result).toContain("aliased but inside");
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+// Regression — a RELATIVE symlink target must be resolved against the
+// directory that actually CONTAINS the link, not the link's lexical parent.
+// The two differ exactly when that parent is itself reached through a
+// symlink, and following one `readlink` hop is what first makes the
+// difference reachable: the leaf now stays in the RESOLVED part of the path,
+// so measuring it from the wrong directory names a location the caller's
+// path does not lead to.
+describe("ingestDocument — relative dangling-link base", () => {
+  test("an outward directory link holding a relative dangling link is refused", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "doc-ingest-outside-"));
+    try {
+      mkdirSync(join(outside, "realdir"));
+      symlinkSync(join(outside, "realdir"), join(tmp, "pdir"));
+      // True destination <outside>/secret.txt; lexically it reads as the
+      // in-root <tmp>/secret.txt.
+      symlinkSync("../secret.txt", join(outside, "realdir", "l"));
+
+      const err = await ingestDocument.execute({ path: "pdir/l" }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(ToolPermissionError);
+      expect((err as Error).message).toMatch(/escapes the workspace root/);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

@@ -212,6 +212,7 @@ import { renderBanner, shouldPrintBanner } from "@crewhaus/target-cli";
 import { DEFAULT_TEMPLATE_REGISTRY_URL } from "@crewhaus/template-marketplace-client";
 import { buildTool } from "@crewhaus/tool-builder";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
+import { CATEGORIES, categoriesForTool, toolsInCategory } from "@crewhaus/tool-categories";
 import { registerMcpServer, registerOptionalMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
@@ -1501,11 +1502,18 @@ import { probeThredz, thredzProbeTarget, thredzProbeToCheck } from "./thredz-pro
 import {
   CLI_RUNTIME_TOOL_KEYS,
   auditTools,
+  buildCategoryRows,
+  buildToolDetail,
   buildToolList,
   buildToolUsage,
   formatAuditLines,
+  formatCategoryLines,
+  formatSearchLines,
   formatSuggestLines,
+  formatToolDetailLines,
   formatToolListLines,
+  nearestToolKeys,
+  searchTools,
   suggestTools,
 } from "./tools-cli";
 // Item 7 — failure-arbiter wiring: post-eval triage (verdicts.json + report
@@ -3606,19 +3614,75 @@ async function detectDefaultModel(): Promise<string | undefined> {
  * `BUILTIN_TOOL_MAP` in packages/target-cli/src/index.ts — keep them in sync.
  */
 async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
-  const [fs, bash, todo, web, image, fetchPkg, imageGen, docIngest, codegraph, codeExec] =
-    await Promise.all([
-      import("@crewhaus/tool-fs"),
-      import("@crewhaus/tool-bash"),
-      import("@crewhaus/tool-todo"),
-      import("@crewhaus/tool-web"),
-      import("@crewhaus/tool-image"),
-      import("@crewhaus/tool-fetch"),
-      import("@crewhaus/tool-image-generation"),
-      import("@crewhaus/tool-document-ingest"),
-      import("@crewhaus/tool-codegraph"),
-      import("@crewhaus/tool-code-execution"),
-    ]);
+  const [
+    fs,
+    bash,
+    todo,
+    web,
+    image,
+    fetchPkg,
+    imageGen,
+    docIngest,
+    codegraph,
+    codeExec,
+    text,
+    data,
+    encode,
+    datetime,
+    schema,
+    git,
+    fsx,
+    proc,
+    http,
+    state,
+    crewhaus,
+    code,
+    codehost,
+    sql,
+    docs,
+    secure,
+    math,
+    notify,
+    obs,
+    media,
+    flow,
+    pkg,
+    money,
+  ] = await Promise.all([
+    import("@crewhaus/tool-fs"),
+    import("@crewhaus/tool-bash"),
+    import("@crewhaus/tool-todo"),
+    import("@crewhaus/tool-web"),
+    import("@crewhaus/tool-image"),
+    import("@crewhaus/tool-fetch"),
+    import("@crewhaus/tool-image-generation"),
+    import("@crewhaus/tool-document-ingest"),
+    import("@crewhaus/tool-codegraph"),
+    import("@crewhaus/tool-code-execution"),
+    import("@crewhaus/tool-text"),
+    import("@crewhaus/tool-data"),
+    import("@crewhaus/tool-encode"),
+    import("@crewhaus/tool-datetime"),
+    import("@crewhaus/tool-schema"),
+    import("@crewhaus/tool-git"),
+    import("@crewhaus/tool-fsx"),
+    import("@crewhaus/tool-proc"),
+    import("@crewhaus/tool-http"),
+    import("@crewhaus/tool-state"),
+    import("@crewhaus/tool-crewhaus"),
+    import("@crewhaus/tool-code"),
+    import("@crewhaus/tool-codehost"),
+    import("@crewhaus/tool-sql"),
+    import("@crewhaus/tool-docs"),
+    import("@crewhaus/tool-secure"),
+    import("@crewhaus/tool-math"),
+    import("@crewhaus/tool-notify"),
+    import("@crewhaus/tool-obs"),
+    import("@crewhaus/tool-media"),
+    import("@crewhaus/tool-flow"),
+    import("@crewhaus/tool-pkg"),
+    import("@crewhaus/tool-money"),
+  ]);
   const map: Record<string, RegisteredTool> = {
     read: fs.read,
     write: fs.write,
@@ -3648,6 +3712,419 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     codegraphCallers: codegraph.codegraphCallers,
     codegraphCallees: codegraph.codegraphCallees,
     codegraphImpact: codegraph.codegraphImpact,
+    // @crewhaus/tool-money
+    costBasisCompute: money.costBasisCompute,
+    glCodeSuggest: money.glCodeSuggest,
+    paymentIdentifierValidate: money.paymentIdentifierValidate,
+    purchaseOrderMatch: money.purchaseOrderMatch,
+    refundAbuseCheck: money.refundAbuseCheck,
+    refundAmountCompute: money.refundAmountCompute,
+    spendLimitCheck: money.spendLimitCheck,
+    statementParse: money.statementParse,
+    taxCalculate: money.taxCalculate,
+    webhookSignatureVerify: money.webhookSignatureVerify,
+    // @crewhaus/tool-pkg
+    licenseAggregate: pkg.licenseAggregate,
+    lockfileDiff: pkg.lockfileDiff,
+    packagePublishPreflight: pkg.packagePublishPreflight,
+    packageTarballInspect: pkg.packageTarballInspect,
+    semverResolve: pkg.semverResolve,
+    // @crewhaus/tool-flow
+    branch: flow.branch,
+    consensusVote: flow.consensusVote,
+    deadlineCheck: flow.deadlineCheck,
+    decisionTable: flow.decisionTable,
+    errorClassify: flow.errorClassify,
+    ruleScore: flow.ruleScore,
+    stallDetect: flow.stallDetect,
+    // @crewhaus/tool-media
+    imageInfo: media.imageInfo,
+    imageKind: media.imageKind,
+    pngRead: media.pngRead,
+    pngWrite: media.pngWrite,
+    imageResize: media.imageResize,
+    imageCrop: media.imageCrop,
+    imageDiff: media.imageDiff,
+    exifRead: media.exifRead,
+    exifStrip: media.exifStrip,
+    qrEncode: media.qrEncode,
+    barcodeEncode: media.barcodeEncode,
+    chartRender: media.chartRender,
+    sparklineRender: media.sparklineRender,
+    diagramRender: media.diagramRender,
+    colorConvert: media.colorConvert,
+    colorContrast: media.colorContrast,
+    subtitleParse: media.subtitleParse,
+    subtitleWrite: media.subtitleWrite,
+    mediaProbe: media.mediaProbe,
+    // @crewhaus/tool-obs
+    eventQuery: obs.eventQuery,
+    eventCounts: obs.eventCounts,
+    toolCallStats: obs.toolCallStats,
+    errorCluster: obs.errorCluster,
+    runTimeline: obs.runTimeline,
+    costReport: obs.costReport,
+    budgetCheck: obs.budgetCheck,
+    sloEvaluate: obs.sloEvaluate,
+    incidentBundle: obs.incidentBundle,
+    metricsQuery: obs.metricsQuery,
+    logsQuery: obs.logsQuery,
+    alertList: obs.alertList,
+    alertAck: obs.alertAck,
+    statusPagePost: obs.statusPagePost,
+    healthProbe: obs.healthProbe,
+    // @crewhaus/tool-notify
+    chatPost: notify.chatPost,
+    chatUpdate: notify.chatUpdate,
+    chatDelete: notify.chatDelete,
+    chatReact: notify.chatReact,
+    emailCompose: notify.emailCompose,
+    emailSend: notify.emailSend,
+    webhookPost: notify.webhookPost,
+    smsSend: notify.smsSend,
+    pushNotify: notify.pushNotify,
+    deliveryCheck: notify.deliveryCheck,
+    notifyDigest: notify.notifyDigest,
+    quietHours: notify.quietHours,
+    rateLimitGate: notify.rateLimitGate,
+    messageTemplate: notify.messageTemplate,
+    // @crewhaus/tool-math
+    evaluate: math.evaluate,
+    statistics: math.statistics,
+    percentile: math.percentile,
+    correlation: math.correlation,
+    linearRegression: math.linearRegressionTool,
+    histogram: math.histogram,
+    outliers: math.outliers,
+    moneyAdd: math.moneyAdd,
+    moneyMultiply: math.moneyMultiplyTool,
+    moneyAllocate: math.moneyAllocateTool,
+    currencyConvert: math.currencyConvert,
+    unitConvert: math.unitConvert,
+    round: math.round,
+    numberFormat: math.numberFormat,
+    numberParse: math.numberParse,
+    percent: math.percent,
+    amortize: math.amortize,
+    npv: math.npv,
+    irr: math.irr,
+    geoDistance: math.geoDistance,
+    geoBoundingBox: math.geoBoundingBox,
+    geoPointInPolygon: math.geoPointInPolygon,
+    // @crewhaus/tool-secure
+    piiScan: secure.piiScan,
+    piiRedact: secure.piiRedact,
+    pseudonymize: secure.pseudonymize,
+    depseudonymize: secure.depseudonymize,
+    secretScan: secure.secretScan,
+    entropyScore: secure.entropyScore,
+    promptInjectionScan: secure.promptInjectionScan,
+    invisibleCharScan: secure.invisibleCharScan,
+    homoglyphNormalize: secure.homoglyphNormalize,
+    urlSafetyCheck: secure.urlSafetyCheck,
+    allowlistCheck: secure.allowlistCheck,
+    contentPolicyCheck: secure.contentPolicyCheck,
+    hashChainVerify: secure.hashChainVerify,
+    signPayload: secure.signPayload,
+    verifyPayload: secure.verifyPayload,
+    redactForExport: secure.redactForExport,
+    // @crewhaus/tool-docs
+    docxRead: docs.docxRead,
+    docxWrite: docs.docxWrite,
+    xlsxRead: docs.xlsxRead,
+    xlsxWrite: docs.xlsxWrite,
+    pptxRead: docs.pptxRead,
+    pdfInfo: docs.pdfInfo,
+    pdfText: docs.pdfText,
+    pdfSplit: docs.pdfSplit,
+    pdfMerge: docs.pdfMerge,
+    emlParse: docs.emlParse,
+    mboxSplit: docs.mboxSplit,
+    icsParse: docs.icsParse,
+    icsWrite: docs.icsWrite,
+    vcardParse: docs.vcardParse,
+    documentText: docs.documentTextTool,
+    documentDiff: docs.documentDiff,
+    // @crewhaus/tool-sql
+    sqlQuery: sql.sqlQuery,
+    sqlExec: sql.sqlExec,
+    sqlTransaction: sql.sqlTransaction,
+    sqlExplain: sql.sqlExplain,
+    schemaList: sql.schemaList,
+    schemaDescribe: sql.schemaDescribe,
+    dbSchemaDiff: sql.dbSchemaDiff,
+    tableStats: sql.tableStats,
+    integrityCheck: sql.integrityCheck,
+    importCsv: sql.importCsv,
+    importJson: sql.importJson,
+    exportCsv: sql.exportCsv,
+    exportJson: sql.exportJson,
+    databaseBackup: sql.databaseBackup,
+    migrationStatus: sql.migrationStatus,
+    migrationApply: sql.migrationApply,
+    // @crewhaus/tool-codehost
+    prList: codehost.prList,
+    prGet: codehost.prGet,
+    prFiles: codehost.prFiles,
+    prComments: codehost.prComments,
+    prReviews: codehost.prReviews,
+    issueList: codehost.issueList,
+    issueGet: codehost.issueGet,
+    checkRuns: codehost.checkRuns,
+    workflowRuns: codehost.workflowRuns,
+    workflowRunLogs: codehost.workflowRunLogs,
+    releaseList: codehost.releaseList,
+    releaseGet: codehost.releaseGet,
+    repoGet: codehost.repoGet,
+    compareRefs: codehost.compareRefs,
+    searchCode: codehost.searchCode,
+    searchIssues: codehost.searchIssues,
+    rateLimitStatus: codehost.rateLimitStatus,
+    prCreate: codehost.prCreate,
+    prUpdate: codehost.prUpdate,
+    prComment: codehost.prComment,
+    prReviewSubmit: codehost.prReviewSubmit,
+    issueCreate: codehost.issueCreate,
+    issueUpdate: codehost.issueUpdate,
+    issueComment: codehost.issueComment,
+    releaseCreate: codehost.releaseCreate,
+    workflowRunRerun: codehost.workflowRunRerun,
+    // @crewhaus/tool-code
+    runTests: code.runTests,
+    testFailureSummary: code.testFailureSummary,
+    runBuild: code.runBuild,
+    typecheck: code.typecheck,
+    lint: code.lint,
+    format: code.format,
+    formatCheck: code.formatCheck,
+    diagnostics: code.diagnostics,
+    astQuery: code.astQuery,
+    symbolOutline: code.symbolOutline,
+    findReferences: code.findReferences,
+    importGraph: code.importGraph,
+    deadFileScan: code.deadFileScan,
+    todoScan: code.todoScan,
+    dependencyList: code.dependencyList,
+    dependencyOutdated: code.dependencyOutdated,
+    packageScripts: code.packageScripts,
+    workspacePackages: code.workspacePackages,
+    coverageSummary: code.coverageSummary,
+    stackTraceParse: code.stackTraceParse,
+    // @crewhaus/tool-crewhaus
+    specValidate: crewhaus.specValidate,
+    specCompileCheck: crewhaus.specCompileCheck,
+    specSummarize: crewhaus.specSummarize,
+    specDiff: crewhaus.specDiff,
+    toolInventory: crewhaus.toolInventory,
+    permissionAudit: crewhaus.permissionAudit,
+    preflightRun: crewhaus.preflightRun,
+    harnessInventory: crewhaus.harnessInventory,
+    bundleFreshness: crewhaus.bundleFreshness,
+    auditVerify: crewhaus.auditVerify,
+    evalBaselineCompare: crewhaus.evalBaselineCompare,
+    sessionSummarize: crewhaus.sessionSummarize,
+    traceQuery: crewhaus.traceQuery,
+    costSummarize: crewhaus.costSummarize,
+    // @crewhaus/tool-state
+    kvSet: state.kvSet,
+    kvGet: state.kvGet,
+    kvDelete: state.kvDelete,
+    kvList: state.kvList,
+    counterIncrement: state.counterIncrement,
+    counterGet: state.counterGet,
+    checkpointSave: state.checkpointSave,
+    checkpointLoad: state.checkpointLoad,
+    checkpointList: state.checkpointList,
+    journalAppend: state.journalAppend,
+    journalRead: state.journalRead,
+    blackboardPost: state.blackboardPost,
+    blackboardRead: state.blackboardRead,
+    noteWrite: state.noteWrite,
+    noteSearch: state.noteSearch,
+    indexBuild: state.indexBuild,
+    indexSearch: state.indexSearch,
+    stateExport: state.stateExport,
+    stateImport: state.stateImport,
+    dedupeMark: state.dedupeMark,
+    // @crewhaus/tool-http
+    httpRequest: http.httpRequest,
+    httpPaginate: http.httpPaginate,
+    graphqlQuery: http.graphqlQuery,
+    httpBatch: http.httpBatch,
+    downloadFile: http.downloadFile,
+    headRequest: http.headRequest,
+    urlReachable: http.urlReachable,
+    linkCheck: http.linkCheck,
+    httpWaitFor: http.httpWaitFor,
+    sseRead: http.sseRead,
+    webhookSign: http.webhookSign,
+    webhookVerify: http.webhookVerify,
+    dnsLookup: http.dnsLookup,
+    tlsInspect: http.tlsInspect,
+    robotsCheck: http.robotsCheck,
+    sitemapParse: http.sitemapParse,
+    feedParse: http.feedParse,
+    // @crewhaus/tool-encode
+    base64Encode: encode.base64Encode,
+    base64Decode: encode.base64Decode,
+    // @crewhaus/tool-proc
+    runCommand: proc.runCommand,
+    runPipeline: proc.runPipeline,
+    retry: proc.retry,
+    processStart: proc.processStart,
+    processStatus: proc.processStatus,
+    processOutput: proc.processOutput,
+    processStop: proc.processStop,
+    processList: proc.processList,
+    waitForPort: proc.waitForPort,
+    waitForFile: proc.waitForFile,
+    waitForOutput: proc.waitForOutput,
+    commandExists: proc.commandExists,
+    envInspect: proc.envInspect,
+    // @crewhaus/tool-fsx
+    stat: fsx.stat,
+    fileHash: fsx.fileHash,
+    tree: fsx.tree,
+    diskUsage: fsx.diskUsage,
+    findFiles: fsx.findFiles,
+    readLines: fsx.readLines,
+    tailFile: fsx.tailFile,
+    makeDirectory: fsx.makeDirectory,
+    touchFile: fsx.touchFile,
+    tempDir: fsx.tempDir,
+    copyPath: fsx.copyPath,
+    movePath: fsx.movePath,
+    removePath: fsx.removePath,
+    splitFile: fsx.splitFile,
+    concatFiles: fsx.concatFiles,
+    archiveList: fsx.archiveList,
+    archiveCreate: fsx.archiveCreate,
+    archiveExtract: fsx.archiveExtract,
+    frontmatterRead: fsx.frontmatterRead,
+    frontmatterWrite: fsx.frontmatterWrite,
+    notebookRead: fsx.notebookRead,
+    notebookEdit: fsx.notebookEdit,
+    // @crewhaus/tool-git
+    gitStatus: git.gitStatus,
+    gitDiff: git.gitDiff,
+    gitLog: git.gitLog,
+    gitShow: git.gitShow,
+    gitBlame: git.gitBlame,
+    gitBranchList: git.gitBranchList,
+    gitTagList: git.gitTagList,
+    gitRemoteList: git.gitRemoteList,
+    gitMergeBase: git.gitMergeBase,
+    gitRevParse: git.gitRevParse,
+    gitFileHistory: git.gitFileHistory,
+    gitStashList: git.gitStashList,
+    gitConflicts: git.gitConflicts,
+    gitWorktreeList: git.gitWorktreeList,
+    gitAdd: git.gitAdd,
+    gitCommit: git.gitCommit,
+    gitSwitch: git.gitSwitch,
+    gitBranchCreate: git.gitBranchCreate,
+    gitBranchDelete: git.gitBranchDelete,
+    gitStashPush: git.gitStashPush,
+    gitStashPop: git.gitStashPop,
+    gitTagCreate: git.gitTagCreate,
+    gitApplyPatch: git.gitApplyPatch,
+    gitCherryPick: git.gitCherryPick,
+    gitResetPaths: git.gitResetPaths,
+    gitWorktreeAdd: git.gitWorktreeAdd,
+    gitWorktreeRemove: git.gitWorktreeRemove,
+    // @crewhaus/tool-schema
+    jsonSchemaValidate: schema.jsonSchemaValidate,
+    jsonSchemaInfer: schema.jsonSchemaInfer,
+    validateRecords: schema.validateRecords,
+    assert: schema.assert,
+    compareGolden: schema.compareGolden,
+    deepEqual: schema.deepEqual,
+    matchSubset: schema.matchSubset,
+    checkRequiredFields: schema.checkRequiredFields,
+    validateEnum: schema.validateEnum,
+    validateFormat: schema.validateFormat,
+    validateUniqueKeys: schema.validateUniqueKeys,
+    validateReferences: schema.validateReferences,
+    schemaDiff: schema.schemaDiff,
+    schemaSummarize: schema.schemaSummarize,
+    // @crewhaus/tool-datetime
+    dateParse: datetime.dateParse,
+    dateFormat: datetime.dateFormat,
+    dateConvertTimezone: datetime.dateConvertTimezone,
+    dateAdd: datetime.dateAdd,
+    dateDiff: datetime.dateDiff,
+    durationParse: datetime.durationParse,
+    durationFormat: datetime.durationFormat,
+    businessDays: datetime.businessDays,
+    dateRange: datetime.dateRange,
+    cronNext: datetime.cronNext,
+    cronDescribe: datetime.cronDescribe,
+    recurrenceExpand: datetime.recurrenceExpand,
+    weekOfYear: datetime.weekOfYear,
+    dayOfYear: datetime.dayOfYear,
+    isLeapYear: datetime.isLeapYear,
+    quarterOf: datetime.quarterOf,
+    timestampConvert: datetime.timestampConvert,
+    // @crewhaus/tool-encode
+    hash: encode.hash,
+    hmac: encode.hmac,
+    checksum: encode.checksum,
+    hexEncode: encode.hexEncode,
+    hexDecode: encode.hexDecode,
+    urlEncode: encode.urlEncode,
+    urlDecode: encode.urlDecode,
+    urlParse: encode.urlParse,
+    urlBuild: encode.urlBuild,
+    urlNormalize: encode.urlNormalize,
+    uuid: encode.uuid,
+    ulid: encode.ulid,
+    nanoId: encode.nanoId,
+    slugify: encode.slugify,
+    jwtDecode: encode.jwtDecode,
+    jwtVerify: encode.jwtVerify,
+    // @crewhaus/tool-data
+    jsonQuery: data.jsonQuery,
+    jsonPatch: data.jsonPatch,
+    jsonMergePatch: data.jsonMergePatch,
+    jsonFormat: data.jsonFormat,
+    dataDiff: data.dataDiff,
+    dataConvert: data.dataConvert,
+    csvParse: data.csvParse,
+    csvWrite: data.csvWrite,
+    tableQuery: data.tableQuery,
+    tableAggregate: data.tableAggregate,
+    tableJoin: data.tableJoin,
+    recordsToColumns: data.recordsToColumns,
+    columnsToRecords: data.columnsToRecords,
+    flattenObject: data.flattenObject,
+    unflattenObject: data.unflattenObject,
+    jsonlParse: data.jsonlParse,
+    jsonlWrite: data.jsonlWrite,
+    xmlParse: data.xmlParse,
+    sortRecords: data.sortRecords,
+    dedupeRecords: data.dedupeRecords,
+    sampleRecords: data.sampleRecords,
+    dataShape: data.dataShape,
+    jsonSortKeys: data.jsonSortKeys,
+    // Deterministic text tools (@crewhaus/tool-text) — pure, no I/O.
+    compactLog: text.compactLog,
+    countTokens: text.countTokens,
+    escapeString: text.escapeString,
+    extractEntities: text.extractEntities,
+    extractKeywords: text.extractKeywords,
+    fuzzyMatch: text.fuzzyMatch,
+    glossaryReplace: text.glossaryReplace,
+    markdownOutline: text.markdownOutline,
+    markdownTable: text.markdownTable,
+    normalizeText: text.normalizeText,
+    regexExtract: text.regexExtract,
+    renderTemplate: text.renderTemplate,
+    ruleClassify: text.ruleClassify,
+    sortLines: text.sortLines,
+    textDiff: text.textDiff,
+    textSimilarity: text.textSimilarity,
+    truncateToBudget: text.truncateToBudget,
+    wrapText: text.wrapText,
   };
   // Item 18 map-sync floor: this map's keys ARE the canonical runtime tool
   // list. `CLI_RUNTIME_TOOL_KEYS` mirrors them (so the map-sync test can
@@ -14457,9 +14934,12 @@ function parseSessionsLimit(args: ParsedArgs, dflt: number): number | "all" {
 async function runTools(action: string, args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus tools <list|suggest|audit>\n" +
+      "usage: crewhaus tools <list|categories|show|search|suggest|audit>\n" +
         "\n" +
-        "  list                     print every builtin tool + its metadata\n" +
+        "  categories               every tool category + what it turns on\n" +
+        "  show <tool>              one tool in full: flags, categories, inputs\n" +
+        "  search <query>           find a tool by name, description or category\n" +
+        "  list [--category NAME]   print every builtin tool + its metadata\n" +
         "  suggest [spec.yaml]      rank builtins against agent.instructions\n" +
         "                           (deterministic keyword match; default spec\n" +
         "                           is ./crewhaus.yaml)\n" +
@@ -14475,13 +14955,61 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
   const jsonMode = args.flags["json"] === true;
   const toolMap = await loadToolMap();
 
+  if (action === "categories") {
+    const rows = buildCategoryRows(CATEGORIES, toolsInCategory);
+    if (jsonMode) {
+      process.stdout.write(`${JSON.stringify({ categories: rows }, null, 2)}\n`);
+      return;
+    }
+    for (const line of formatCategoryLines(rows)) process.stdout.write(`${line}\n`);
+    return;
+  }
+
+  if (action === "show") {
+    const key = args.positional[0];
+    if (key === undefined) die("usage: crewhaus tools show <tool>");
+    const detail = buildToolDetail(key, toolMap, categoriesForTool);
+    if (detail === undefined) {
+      const near = nearestToolKeys(key, Object.keys(toolMap));
+      const hint = near.length > 0 ? ` — did you mean ${near.join(", ")}?` : "";
+      die(`no builtin tool named "${key}"${hint}\nrun \`crewhaus tools list\` to see them all`);
+    }
+    if (jsonMode) {
+      process.stdout.write(`${JSON.stringify(detail, null, 2)}\n`);
+      return;
+    }
+    for (const line of formatToolDetailLines(detail)) process.stdout.write(`${line}\n`);
+    return;
+  }
+
+  if (action === "search") {
+    const query = args.positional.join(" ");
+    if (query.trim() === "") die("usage: crewhaus tools search <query>");
+    const hits = searchTools(query, toolMap, categoriesForTool);
+    if (jsonMode) {
+      process.stdout.write(`${JSON.stringify({ query, hits }, null, 2)}\n`);
+      return;
+    }
+    for (const line of formatSearchLines(query, hits)) process.stdout.write(`${line}\n`);
+    return;
+  }
+
   if (action === "list") {
-    const rows = buildToolList(toolMap);
+    // `--category <name>` narrows the listing to one category, so a reader
+    // can go straight from `tools categories` to the tools inside one.
+    const category = args.flags["category"];
+    let map = toolMap;
+    if (typeof category === "string") {
+      const wanted = new Set(toolsInCategory(category.replace(/^all-/, "")));
+      map = Object.fromEntries(Object.entries(toolMap).filter(([k]) => wanted.has(k)));
+    }
+    const rows = buildToolList(map);
     if (jsonMode) {
       process.stdout.write(`${JSON.stringify({ tools: rows }, null, 2)}\n`);
       return;
     }
-    process.stdout.write(`${rows.length} builtin tool(s):\n`);
+    const scope = typeof category === "string" ? ` in all-${category.replace(/^all-/, "")}` : "";
+    process.stdout.write(`${rows.length} builtin tool(s)${scope}:\n`);
     for (const line of formatToolListLines(rows)) process.stdout.write(`${line}\n`);
     return;
   }
@@ -14556,7 +15084,9 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
     return;
   }
 
-  die(`tools action must be one of: list, suggest, audit (got "${action}")`);
+  die(
+    `tools action must be one of: list, categories, show, search, suggest, audit (got "${action}")`,
+  );
 }
 
 /** Default sessions the `tools audit` miner scans (mirrors context-pressure). */
@@ -23200,8 +23730,9 @@ switch (subcommand) {
     break;
   case "tools": {
     const action = rest[0] ?? "";
-    if (action !== "list" && action !== "suggest" && action !== "audit") {
-      die(`tools action must be one of: list, suggest, audit (got "${action}")`);
+    const TOOLS_ACTIONS = ["list", "categories", "show", "search", "suggest", "audit"];
+    if (!TOOLS_ACTIONS.includes(action)) {
+      die(`tools action must be one of: ${TOOLS_ACTIONS.join(", ")} (got "${action}")`);
     }
     await runTools(action, parseFor(rest.slice(1), TOOLS_SCHEMA));
     break;

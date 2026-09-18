@@ -1,0 +1,180 @@
+# @crewhaus/tool-obs
+
+Observability and cost, without a model turn. Fifteen tools in two clearly
+separated halves: nine that read a harness's **own** telemetry off local disk,
+and six that query an **external** platform over an allow-listed API.
+
+The separation is the point. The local tools open no socket and are flagged
+`internal` with no I/O capability; the remote tools are flagged `external` with
+`ioCapability: "network"`, so a spec can grant "look at your own logs" without
+granting "talk to the internet".
+
+```yaml
+tools:
+  - all-obs         # every tool below
+  - -statusPagePost # ...except this one
+```
+
+## Local — a harness's own telemetry
+
+`@crewhaus/event-log` writes one JSON object per line to
+`.crewhaus/sessions/<sessionId>.jsonl`. These read it.
+
+| Tool | What it does |
+|---|---|
+| `EventQuery` | A bounded, cursor-paged page of events, filtered by kind, time, run, session and one field predicate |
+| `EventCounts` | Tallies by kind, by tool and by outcome — what this harness actually did |
+| `ToolCallStats` | Per-tool calls, failures, mean, p50, p95 and max, most-failing first |
+| `ErrorCluster` | Errors grouped by a normalised fingerprint, most frequent first, one example each |
+| `RunTimeline` | One run's events in order with gaps and measured durations |
+| `CostReport` | Tokens and cost by model, by UTC day and by run, priced with **your** rate table |
+| `BudgetCheck` | Pure: spend against a budget, with threshold crossings |
+| `SloEvaluate` | Pure: success rate, latency percentile or error budget against an objective |
+| `IncidentBundle` | One failed run assembled into a contained JSON file a human can be handed |
+
+Every path goes through the same workspace containment as `@crewhaus/tool-fs`,
+including the symlink-aware check, so an in-workspace link pointing at `/etc` is
+refused. Every file is size-checked **on disk before a byte is read**, and every
+parse is event-capped with a scan that holds one line at a time — a cap applied
+after buffering is not a cap.
+
+## Remote — an external platform
+
+| Tool | What it does | Flags |
+|---|---|---|
+| `MetricsQuery` | A Prometheus-style instant or range query, returning labelled series | read-only |
+| `LogsQuery` | A log-platform query, configured rather than vendored | read-only |
+| `AlertList` | The alerts currently firing | read-only |
+| `AlertAck` | Acknowledge one alert | destructive, justification-gated |
+| `StatusPagePost` | Publish an incident update | destructive, justification-gated |
+| `HealthProbe` | Check many endpoints under a concurrency cap and a required deadline | read-only |
+
+The outbound posture is `@crewhaus/tool-http`'s, carried over rather than
+re-derived: fail-closed origin allow-list (empty means deny all — there is no
+allow-everything value), numeric SSRF classification of IP literals in every
+encoding and of the DNS-resolved address, IP pinning so a rebinding resolver
+cannot swap the target between the check and the socket, per-hop re-checks on
+redirects, credential dropping the moment a hop leaves the origin the token was
+minted for, and a deadline and byte cap on every request — including the DNS
+step, which takes no signal of its own and would otherwise outlive the deadline
+by the resolver's own timeout.
+
+The allow-list is a *reachability* list and is wider than the platform the token
+belongs to, so the token is scoped separately: it goes only to the origins the
+spec configured as obs surfaces. `HealthProbe` can sweep every allow-listed
+endpoint in a fleet without handing each one's operator the observability
+credential, and says on each probe whether it carried one.
+
+The token is a spec-declared environment variable **name**. A value that is not
+shaped like a variable name, or that carries a known token prefix, is refused
+without being echoed back — because if that fired, echoing it is the leak the
+whole arrangement exists to prevent.
+
+### Configuration
+
+```yaml
+tool_config:
+  obs:
+    allowed_origins: ["https://prom.example.com", "https://logs.example.com"]
+    token_env: PROM_TOKEN          # the NAME, never the token
+    auth_header: Authorization     # default
+    auth_prefix: "Bearer "         # default
+    metrics:
+      base_url: https://prom.example.com
+      path: /api/v1                # instant → /api/v1/query, range → /api/v1/query_range
+    logs:
+      base_url: https://logs.example.com
+      path: /loki/api/v1/query_range
+      result_path: data.result
+      params:
+        query: query
+        start: start
+        end: end
+        limit: limit
+        time_format: ns            # ms | s | ns | iso
+    alerts:
+      base_url: https://alerts.example.com
+      path: /api/v2/alerts
+    alert_ack:
+      base_url: https://alerts.example.com
+      path: /api/v2/alerts/{id}/ack
+    status_page:
+      base_url: https://status.example.com
+      path: /v1/incidents
+```
+
+A per-candidate `tool_config.obs` block overrides the boot registration for the
+duration of one call. An override is only ever read as a config **block**: a
+non-object is ignored rather than treated as permission to widen anything.
+
+## What these will not do
+
+**They will not guess a price.** `CostReport` takes the rate table as an
+argument. The `costUsdMicros` a run recorded is an artefact of the prices that
+process happened to hold, and a model the runtime could not price at all is
+recorded at zero cost with real tokens. Both figures come back side by side, and
+any model with no row in your table is named in `modelsWithoutRate` rather than
+quietly costed at nothing.
+
+**They will not read the clock.** Nothing here calls `Date.now()` for a result.
+A budget's elapsed fraction, an incident bundle's generation time and a metrics
+query's evaluation instant are all inputs, because a tool that answered "how far
+through the month are we" from the system clock returns a different answer for
+the same log every time it runs. The single exception is `HealthProbe`'s
+`latencyMs`, which is a measurement, and its description says so.
+
+**They will not hard-code a vendor.** `MetricsQuery` speaks the Prometheus HTTP
+API because that is a *format* — Thanos, Cortex, Mimir, VictoriaMetrics and
+Grafana all serve it. Logs, alerts and status pages genuinely differ, so their
+paths, parameter names and result paths come from the spec. A tool that guessed
+would be right for one deployment and wrong for every other.
+
+**They will not cluster by meaning.** `ErrorCluster` masks by *shape* — URLs,
+uuids, timestamps, paths, prefixed ids, hex blobs, quoted strings and numbers
+with their units. Two genuinely different problems whose messages differ only in
+a number will land in the same group, which is exactly why a verbatim example is
+carried on every group.
+
+**They will not measure what the runtime did not.** `ToolCallStats` reads
+durations from the `tool_stats` and `mcp_stats` mirrors only. A harness that ran
+with advisor events disabled gets counts and `latencyUnavailable: true`, not an
+estimate. Likewise a `RunTimeline` gap is the distance between two log lines and
+is not the same as how long that step took; where the runtime measured the step
+itself, `durationMs` carries the measured figure.
+
+**They will not invent a percentile.** Percentiles are nearest-rank — the value
+at `ceil(p/100 × n) − 1` of the ascending sample — so every figure returned is a
+duration that was actually observed. Linear interpolation on six samples returns
+a number nobody measured, which is the wrong answer to "how slow does this
+actually get".
+
+**They will not window over time.** `SloEvaluate` has no rolling window and no
+multi-window burn-rate alerting; both need a clock. The caller decides which
+observations make up the window and passes the counts.
+
+**They will not resolve, close or silence an alert.** `AlertAck` acknowledges,
+and only that. Resolving and silencing have different blast radii and are not
+implemented here.
+
+**They will not address an endpoint you did not ask for.** An id substituted
+into a configured path template is percent-encoded, so `a/../b` stays one
+segment — and `.` or `..` alone is refused outright, because those two encode to
+themselves and the URL parser then *resolves* them: `/incidents/../updates` is
+requested as `/updates`, which on most platforms is the collection. Whatever the
+parser normalised, every substituted value is checked to still be in the path
+that is actually sent.
+
+**They will not let a filter widen a query.** `AlertList`'s `filter` adds
+parameters; the spec's own `params` are written last and win, so a scope the
+deployment declared cannot be overwritten from a tool call.
+
+**They will not unpublish.** A `StatusPagePost` is public the moment it lands.
+
+## Determinism
+
+Same inputs against the same world state, same bytes out. Listings are sorted
+with a locale-free comparator, Prometheus series are re-sorted by label set so
+two replicas answering the same query return the same bytes, nothing is random,
+and two `IncidentBundle` runs over the same log produce byte-identical files.
+`HealthProbe`'s `latencyMs` and the live answers of a remote platform are the
+world state, not the tool.

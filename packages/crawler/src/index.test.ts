@@ -1253,3 +1253,92 @@ describe("createCrawler — DNS-rebinding pin", () => {
     }
   });
 });
+
+/**
+ * Regression — the DANGLING-symlink hole in the crawler's own copy of the
+ * path resolver.
+ *
+ * The crawler checks a `file://` path against a LIST of allowed roots rather
+ * than one workspace root, so it carries its own copy of the resolver that
+ * the tool packages share — and it was the last copy still probing the walk
+ * with `existsSync`. `existsSync` FOLLOWS symlinks, so a link whose target is
+ * missing answers false: the walk stepped past it, treated it as a plain
+ * missing leaf, and re-appended the name to the realpath'd parent, where it
+ * passed the root check. What made this copy easy to miss is that it is not
+ * a `tool-*` package, so neither the repo-wide sweep nor the drift guard in
+ * `apps/cli/src/tool-registry.test.ts` looked at it.
+ *
+ * These are refusals, not escapes: the read that follows fails anyway
+ * because a dangling link has nothing behind it. What the fix buys is that
+ * the path is refused at the boundary rather than admitted and then failing
+ * incidentally — which is what the crawler's callers rely on, and what
+ * closes the window if the target is created between the check and the read.
+ */
+describe("createCrawler — dangling-symlink containment", () => {
+  test("a dangling symlink leading outside the roots is refused", async () => {
+    const root = newRoot();
+    const outside = newRoot();
+    try {
+      const link = join(root, "dangling.txt");
+      symlinkSync(join(outside, "never-made.txt"), link);
+      const crawler = createCrawler({
+        tracker: createCitationTracker({ rootDir: root }),
+        config: { allowedFileRoots: [root] },
+      });
+      // Refused by the ROOT check, not by the read failing later.
+      await expect(crawler.fetch(`file://${link}`)).rejects.toThrow(/escapes the configured/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("an outward directory link holding a relative dangling link is refused", async () => {
+    // The second defect in the same hop: a RELATIVE target must be resolved
+    // against the directory that actually CONTAINS the link. `pdir` leaves
+    // the roots, so "../escape.txt" really lands at <outside>/escape.txt —
+    // but measured from the lexical parent <root>/pdir it reads as the
+    // in-root <root>/escape.txt, and the path is admitted.
+    const root = newRoot();
+    const outside = newRoot();
+    try {
+      mkdirSync(join(outside, "realdir"));
+      symlinkSync(join(outside, "realdir"), join(root, "pdir"));
+      symlinkSync("../escape.txt", join(outside, "realdir", "l"));
+      const crawler = createCrawler({
+        tracker: createCitationTracker({ rootDir: root }),
+        config: { allowedFileRoots: [root] },
+      });
+      await expect(crawler.fetch(`file://${join(root, "pdir", "l")}`)).rejects.toThrow(
+        /escapes the configured/,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a dangling symlink that stays inside the roots is not a containment refusal", async () => {
+    // The mirror: refusing every dangling link would also "pass" the two
+    // above. An in-root one has nothing to read, so it must still fail — but
+    // as a read error, never as an escape.
+    const root = newRoot();
+    try {
+      mkdirSync(join(root, "sub"));
+      const link = join(root, "inside.txt");
+      symlinkSync(join(root, "sub", "made.txt"), link);
+      const crawler = createCrawler({
+        tracker: createCitationTracker({ rootDir: root }),
+        config: { allowedFileRoots: [root] },
+      });
+      await expect(crawler.fetch(`file://${link}`)).rejects.toThrow(/failed to read/);
+
+      // And once the target exists, the same link reads straight through it.
+      writeFileSync(join(root, "sub", "made.txt"), "arrived through the link");
+      const r = await crawler.fetch(`file://${link}`);
+      expect(r.content).toContain("arrived through the link");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

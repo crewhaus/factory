@@ -233,8 +233,6 @@ describe.skipIf(process.platform === "win32")("real spawns", () => {
         // line, and the two become observable at different moments: on Linux
         // /proc/<pid>/stat carries a start time from fork, while
         // /proc/<pid>/cmdline can still show the pre-exec argv for a beat.
-        // Waiting on the start time alone raced that gap and returned
-        // `argv-mismatch` under CI load — a flake in the test, not the code.
         await waitFor(
           () => ops.startTimeMs(pid) !== undefined && ops.commandLine(pid) !== undefined,
           5_000,
@@ -252,6 +250,17 @@ describe.skipIf(process.platform === "win32")("real spawns", () => {
           startedAt: new Date().toISOString(),
           managerVersion: "0.5.0-test",
         };
+        // Readable is not the same as post-exec: /proc/<pid>/cmdline becomes
+        // readable while it still holds the launcher's own argv, so waiting
+        // for it to be DEFINED still raced and returned `argv-mismatch` under
+        // CI load. Wait for the condition actually being asserted instead of
+        // a proxy for it; if it never holds, the assertion below fails with
+        // the reason rather than the timeout hiding it.
+        await waitFor(
+          () => verifyRunfile(runfile, ops, { expectedArgv: argv }).live,
+          5_000,
+          "the command line to become the post-exec argv",
+        ).catch(() => undefined);
         expect(verifyRunfile(runfile, ops, { expectedArgv: argv }).live).toBe(true);
         // A start time from another launch is rejected — the pid-reuse guard.
         expect(

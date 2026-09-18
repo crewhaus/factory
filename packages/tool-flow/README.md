@@ -1,0 +1,142 @@
+# @crewhaus/tool-flow
+
+Deterministic control flow: the decisions a harness makes constantly and
+should almost never pay a model to make.
+
+Which arm to take. Whether an error is worth retrying. Whether the loop is
+still moving. Whether there is time left for the thorough path. Which band a
+score falls in. Whether N answers actually agreed. None of these are
+judgement calls — they all have right answers — and routing each one through
+a model costs tokens, adds latency, and risks getting it wrong.
+
+| Tool | Answers |
+|---|---|
+| `Branch` | which arm of an if/switch a value takes |
+| `DecisionTable` | what an operator's policy table says, and which rows said it |
+| `ErrorClassify` | what kind of error this is and what to do next |
+| `DeadlineCheck` | how much of the time budget is left, and whether one more step fits |
+| `ConsensusVote` | what N answers settled on, and how much they agreed |
+| `StallDetect` | whether the loop is progressing, repeating, or oscillating |
+| `RuleScore` | what this record scores, which band it lands in, and why |
+
+## One condition grammar
+
+`Branch`, `DecisionTable` and `RuleScore` all evaluate the same `checks` that
+`@crewhaus/tool-schema`'s `Assert` tool does, through the same evaluator:
+
+```yaml
+when:
+  - { path: "order.total", op: greaterThan, expected: 1000 }
+  - { path: "customer.tier", op: oneOf, expected: [enterprise, strategic] }
+```
+
+There is deliberately no second vocabulary. An operator who learns
+`startsWith` from `Assert` gets the same operator, with the same semantics,
+in a branch and in a scoring rule.
+
+## Determinism
+
+Every library under `src/lib` is pure: the clock is a parameter, never a
+call, and nothing here touches the filesystem, the network or a random
+source. The same inputs give the same answer in a test, in a replay, and in
+production.
+
+Two tool wrappers read the real clock, because knowing the time is their job:
+
+- **`DeadlineCheck`** always — a model does not know what time it is, which
+  is the whole reason the tool exists.
+- **`ErrorClassify`** only to resolve a `Retry-After` given as an HTTP-date.
+
+Both take an explicit `now` that overrides it. That is the only impurity in
+the package, and passing `now` removes it.
+
+Timestamps must carry a UTC offset. `2026-01-01T00:00:00` is rejected with an
+explanation rather than guessed at, because per ECMAScript an offset-less
+date-time string is *local* time while the date-only form is UTC — so the
+same spec would mean different instants on two machines.
+
+## What it refuses
+
+Three shapes are errors rather than conveniences, because each one reads as
+working and does not:
+
+- **An arm or row with no conditions.** Under `all`, an empty condition list
+  is vacuously true, so it silently swallows everything after it while
+  looking like a rule. A catch-all is spelled `otherwise`.
+- **Two arms or rows sharing a name.** The name is the thing the caller
+  routes on and the thing that appears in the audit trail.
+- **A custom `ErrorClassify` rule with no conditions**, which would match
+  every error and mask every builtin pack behind it.
+
+`DecisionTable`'s `unique` and `priority` policies report an ambiguity as a
+conflict rather than picking a winner — that ambiguity is the policy bug the
+strict policy exists to find.
+
+## What it does not do
+
+- **It does not invoke anything.** These tools decide; they do not act on the
+  decision. `Branch` hands back the arm's declared `result`, and the caller
+  acts. Chaining tool calls without a model turn needs the `kind: tool` step,
+  which does not exist yet.
+- **It does not persist anything.** `StallDetect` takes the history as an
+  argument rather than keeping one. Durable cursors and counters are
+  `@crewhaus/tool-state`.
+- **It does not wait.** Nothing here sleeps, polls, or blocks. `ErrorClassify`
+  reports the wait a server asked for; honouring it is the caller's job.
+- **It does not ask a human.** Approvals and questions need a channel and a
+  resumable id, which belong to the harness runtime.
+- **It does not validate against JSON Schema.** That is `JsonSchemaValidate`,
+  and the path-assertion gate is `Assert`, both in `@crewhaus/tool-schema`.
+
+## Error classification
+
+`ErrorClassify` maps any combination of status, exit code, signal, errno or
+provider code, message text and `Retry-After` onto one of 19 stable classes
+and one of 9 next actions. Precedence is: caller rules, then status, then
+signal, then exit code, then code, then message text.
+
+Two details worth knowing:
+
+- **`retryable` follows the action, not the class.** An OOM kill is class
+  `capacity`, which is retryable in general — but that particular one
+  resolves to `escalate`, and a caller reading the boolean would otherwise
+  re-run the identical command and be killed identically.
+- **Message matching uses substrings, not regular expressions.** That text
+  comes from a remote server, and a pattern with nested quantifiers there is
+  a denial of service waiting to happen. Caller-supplied rules may use a
+  regex; the builtin packs never do.
+
+Exit code `1` is deliberately unclassified. It is the generic "it failed" and
+says nothing about why, so claiming a class for it would be inventing
+information.
+
+## A known limitation: regex denial of service
+
+The `matches` and `notMatches` ops compile a caller-supplied pattern and run
+it against caller-supplied text. JavaScript's regex engine backtracks, so a
+pattern with nested quantifiers against text that *nearly* matches can take
+seconds of CPU:
+
+```
+^(([a-z])+.)+[A-Z]([a-z])+$   against 60 lowercase letters   ~2.7s
+```
+
+This is a property of the shared check grammar in `@crewhaus/tool-schema`,
+not of this package — the `Assert` tool has the same exposure, and both are
+reachable with operator-written or model-written patterns matched against
+text a harness fetched from somewhere else.
+
+Two things reduce it, neither of which is a fix:
+
+- `ErrorClassify` matches `message` and `code` **separately** rather than
+  joining them. A pattern anchored with `$` against a joined string can never
+  match, and a pattern that can never match is precisely the worst case for a
+  backtracking engine — joining the fields manufactured that for free.
+- `ErrorClassify`'s builtin packs use substrings, never patterns, so the
+  default path compiles no regex at all.
+
+A real fix has to live in the shared evaluator: reject nested-quantifier
+patterns before compiling them, or match with an engine that does not
+backtrack. Until then, treat `matches` as trusted-pattern-only, and prefer
+`contains`, `startsWith` and `endsWith` — which are linear — where they will
+do.

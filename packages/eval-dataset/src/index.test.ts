@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatasetLoadError, SampleSchema, loadDataset, parseCsv } from "./index";
 
@@ -7,6 +9,18 @@ import { DatasetLoadError, SampleSchema, loadDataset, parseCsv } from "./index";
 // resolves `import.meta.dir` to `dist/`, but `__fixtures__/` only exists under
 // `src/`. Map back to the source tree so both copies find the fixtures.
 const FIX = join(import.meta.dir.replace(/([/\\])dist$/, "$1src"), "__fixtures__");
+
+/**
+ * A unique path for a scratch file, outside the source tree.
+ *
+ * These tests used to write `__fixtures__/__tmp_*.jsonl` — a fixed name
+ * inside `src/`. Two runs at once clobbered each other's file (one deleted
+ * what the other was reading), and an interrupted run left a stray file in
+ * the repository. Fixtures are read-only; scratch belongs in a temp dir.
+ */
+function scratch(name: string): string {
+  return join(mkdtempSync(join(tmpdir(), "crewhaus-eval-dataset-")), name);
+}
 
 async function collect<T>(iter: AsyncIterable<T>): Promise<T[]> {
   const out: T[] = [];
@@ -32,7 +46,7 @@ describe("loadDataset — JSONL loader (T1)", () => {
   });
 
   test("rejects malformed JSON with line number", async () => {
-    const tmp = `${FIX}/__tmp_malformed.jsonl`;
+    const tmp = scratch("__tmp_malformed.jsonl");
     await Bun.write(tmp, '{"id":"q1","input":"ok"}\nnot json\n');
     try {
       const ds = await loadDataset(tmp);
@@ -43,7 +57,7 @@ describe("loadDataset — JSONL loader (T1)", () => {
   });
 
   test("rejects sample missing required fields", async () => {
-    const tmp = `${FIX}/__tmp_invalid.jsonl`;
+    const tmp = scratch("__tmp_invalid.jsonl");
     await Bun.write(tmp, '{"input":"no id"}\n');
     try {
       const ds = await loadDataset(tmp);
@@ -61,7 +75,7 @@ describe("loadDataset — JSONL loader (T1)", () => {
     // Local `.jsonl` now streams off `Bun.file().stream()` through the shared
     // incremental parser — pin the two line-splitting edges the old buffered
     // `split(/\r?\n/)` handled implicitly.
-    const tmp = `${FIX}/__tmp_crlf.jsonl`;
+    const tmp = scratch("__tmp_crlf.jsonl");
     await Bun.write(tmp, '{"id":"q1","input":"a"}\r\n{"id":"q2","input":"b"}');
     try {
       const ds = await loadDataset(tmp);
@@ -137,7 +151,7 @@ describe("loadDataset — YAML loader (T1)", () => {
   });
 
   test("supports .yml extension", async () => {
-    const tmp = `${FIX}/__tmp.yml`;
+    const tmp = scratch("__tmp.yml");
     await Bun.write(tmp, "- id: x\n  input: y\n");
     try {
       const ds = await loadDataset(tmp);
@@ -224,7 +238,7 @@ describe("SampleSchema — multi-turn history (B14)", () => {
   });
 
   test("JSONL loader round-trips history", async () => {
-    const tmp = `${FIX}/__tmp_history.jsonl`;
+    const tmp = scratch("__tmp_history.jsonl");
     const line = {
       id: "mt1",
       input: "final",
@@ -246,7 +260,7 @@ describe("SampleSchema — multi-turn history (B14)", () => {
     // field loaded fine. Now the key is schema-known: a value that isn't a
     // non-empty [{role, content}] array rejects loudly instead of being
     // ignored. Pinned so the break stays intentional, not accidental.
-    const tmp = `${FIX}/__tmp_legacy_history.jsonl`;
+    const tmp = scratch("__tmp_legacy_history.jsonl");
     await Bun.write(tmp, '{"id":"q1","input":"final","history":"free-form note"}\n');
     try {
       const ds = await loadDataset(tmp);

@@ -1,7 +1,16 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { ToolPermissionError, detectMediaType, readImage } from "./index";
 
 // 1×1 transparent PNG — minimal valid PNG. Hand-encoded to avoid pulling in
@@ -148,6 +157,96 @@ describe("T8 — symlink containment (#149)", () => {
   });
 });
 
+describe("T8 — dangling-symlink containment", () => {
+  // The sibling block above plants links whose targets EXIST, which
+  // `realpathSync` resolves on its own. These plant links whose targets do
+  // NOT exist — the case that used to slip past, because the containment
+  // walk probed with `existsSync`, which follows the link and so answers
+  // false for a dangling one. The link's name then landed in the
+  // "missing tail" that is re-appended to the workspace root verbatim, and
+  // an out-of-root target was pronounced contained.
+  //
+  // `ReadImage` is read-only and opens with O_NOFOLLOW, so before the fix
+  // these paths failed anyway — with ELOOP ("path is a symlink") or ENOENT
+  // ("file not found"), incidental errors that say nothing about the
+  // boundary. These tests pin the refusal to the CONTAINMENT check, which is
+  // what the next tool added to this package will rely on.
+
+  test("a dangling symlink pointing outside the workspace is refused", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "tool-image-outside-"));
+    try {
+      const target = join(outside, "never-made.png");
+      const link = join(tmp, "dangling.png");
+      symlinkSync(target, link);
+      await expect(readImage.execute({ path: "dangling.png" })).rejects.toThrow(
+        /escapes the workspace root/,
+      );
+      // Nothing was created out there, and the link itself is untouched — a
+      // read-only tool should leave the filesystem exactly as it found it.
+      expect(existsSync(target)).toBe(false);
+      expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a dangling symlinked DIRECTORY pointing outside is refused", async () => {
+    // The link need not be the leaf: one standing in for a directory that
+    // does not exist yet is walked past the same way, taking every component
+    // after it out of the workspace too.
+    const outside = mkdtempSync(join(tmpdir(), "tool-image-outside-"));
+    try {
+      const missing = join(outside, "never-made-dir");
+      symlinkSync(missing, join(tmp, "dlink"));
+      await expect(readImage.execute({ path: "dlink/secret.png" })).rejects.toThrow(
+        /escapes the workspace root/,
+      );
+      expect(existsSync(missing)).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a dangling symlink that stays inside the workspace is still honoured", async () => {
+    // The mirror of the two above: refusing every dangling link would also
+    // "pass" them, so check that an in-workspace one is not swept up.
+    //
+    // The target is written in tmpdir()'s UNRESOLVED form on purpose. On
+    // macOS that is /var/folders/..., behind the /private/var symlink, while
+    // `tmp` (and so the workspace root) is the realpath'd form. This is the
+    // case that catches the tempting wrong fix — reading the link with
+    // `readlinkSync` and returning that raw target instead of RESOLVING it:
+    // /var/... does not sit under a /private/var/... root, so a link that is
+    // in fact perfectly in-bounds would be refused as an escape.
+    const unresolvedRoot = join(tmpdir(), basename(tmp));
+    expect(realpathSync(unresolvedRoot)).toBe(tmp);
+    mkdirSync(join(tmp, "sub"));
+    const realTarget = join(tmp, "sub", "made.png");
+    symlinkSync(join(unresolvedRoot, "sub", "made.png"), join(tmp, "inside.png"));
+
+    // While the target is missing the read still fails — it has nothing to
+    // open — but as an ordinary not-found, never as a containment refusal.
+    const rejection: unknown = await readImage.execute({ path: "inside.png" }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+    expect(rejection).toBeInstanceOf(ToolPermissionError);
+    const message = rejection instanceof Error ? rejection.message : "";
+    expect(message).not.toMatch(/escapes the workspace root/);
+    expect(message).toMatch(/file not found/);
+
+    // And once the target exists, the same link reads THROUGH to it.
+    writeFileSync(realTarget, TINY_PNG);
+    const result = await readImage.execute({ path: "inside.png" });
+    if (typeof result === "string") throw new Error("expected content array");
+    const block = result[0];
+    if (block?.type !== "image") throw new Error("expected image block");
+    expect(block.source.media_type).toBe("image/png");
+    expect(Buffer.from(block.source.data, "base64").equals(TINY_PNG)).toBe(true);
+    expect(lstatSync(join(tmp, "inside.png")).isSymbolicLink()).toBe(true);
+  });
+});
+
 describe("T8 — magic-byte spoof", () => {
   test("rejects a PDF renamed to .png", async () => {
     writeFileSync(join(tmp, "evil.png"), PDF_MAGIC);
@@ -181,5 +280,31 @@ describe("T8 — missing file", () => {
     await expect(readImage.execute({ path: "./nope.png" })).rejects.toBeInstanceOf(
       ToolPermissionError,
     );
+  });
+});
+
+// Regression — a RELATIVE symlink target must be resolved against the
+// directory that actually CONTAINS the link, not the link's lexical parent.
+// The two differ exactly when that parent is itself reached through a
+// symlink, and following one `readlink` hop is what first makes the
+// difference reachable: the leaf now stays in the RESOLVED part of the path,
+// so measuring it from the wrong directory names a location the caller's
+// path does not lead to.
+describe("T8 — relative dangling-link base", () => {
+  test("an outward directory link holding a relative dangling link is refused", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "tool-image-outside-"));
+    try {
+      mkdirSync(join(outside, "realdir"));
+      symlinkSync(join(outside, "realdir"), join(tmp, "pdir"));
+      // True destination <outside>/secret.png; lexically it reads as the
+      // in-root <tmp>/secret.png.
+      symlinkSync("../secret.png", join(outside, "realdir", "l"));
+      await expect(readImage.execute({ path: "pdir/l" })).rejects.toThrow(
+        /escapes the workspace root/,
+      );
+      expect(existsSync(join(outside, "secret.png"))).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

@@ -20,6 +20,7 @@
     "@crewhaus/model-service": "workspace:*",
     "@crewhaus/spec": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-categories": "workspace:*",
     "@crewhaus/target-batch-worker": "workspace:*",
     "@crewhaus/target-browser-driver": "workspace:*",
     "@crewhaus/target-channel-bot": "workspace:*",

@@ -117,6 +117,452 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
     "cancel the command",
   ],
   todoWrite: ["todo", "task list", "track tasks", "checklist"],
+  costBasisCompute: ["cost basis", "fifo", "lifo", "capital gains", "lots", "realized gain"],
+  glCodeSuggest: ["gl code", "general ledger", "chart of accounts", "coding", "cost center"],
+  paymentIdentifierValidate: [
+    "iban",
+    "bic",
+    "swift",
+    "routing number",
+    "sort code",
+    "card number",
+    "luhn",
+  ],
+  purchaseOrderMatch: [
+    "three-way match",
+    "purchase order",
+    "accounts payable",
+    "invoice match",
+    "goods receipt",
+  ],
+  refundAbuseCheck: ["refund abuse", "return fraud", "chargeback", "refund ratio"],
+  refundAmountCompute: ["refund", "return", "partial refund", "restocking", "proration"],
+  spendLimitCheck: ["spend limit", "velocity", "budget guard", "payment cap", "quiet hours"],
+  statementParse: [
+    "bank statement",
+    "ofx",
+    "qfx",
+    "transactions",
+    "reconciliation",
+    "csv statement",
+  ],
+  taxCalculate: ["vat", "gst", "sales tax", "tax", "reverse charge"],
+  webhookSignatureVerify: ["webhook", "signature", "hmac", "stripe signature", "replay"],
+  licenseAggregate: ["license", "licenses", "spdx", "compliance", "copyleft", "gpl"],
+  lockfileDiff: [
+    "lockfile",
+    "lock diff",
+    "dependency bump",
+    "upgrade review",
+    "package-lock",
+    "bun.lock",
+  ],
+  packagePublishPreflight: ["publish", "preflight", "release check", "npm publish", "prepublish"],
+  packageTarballInspect: ["tarball", "tgz", "npm pack", "artifact", "published files"],
+  semverResolve: ["semver", "version range", "resolve version", "caret", "tilde"],
+  branch: ["branch", "if", "switch", "route", "conditional", "control flow"],
+  consensusVote: ["consensus", "vote", "agreement", "plurality", "quorum", "dissent"],
+  deadlineCheck: ["deadline", "budget", "time left", "timeout", "sla", "clock"],
+  decisionTable: ["decision table", "policy", "rules", "hit policy", "matrix"],
+  errorClassify: ["error", "classify", "retry", "retryable", "backoff", "retry-after", "exit code"],
+  ruleScore: ["score", "scoring", "lead score", "grade", "band", "qualify"],
+  stallDetect: ["stall", "stuck", "loop", "oscillation", "progress", "no progress"],
+  imageInfo: ["image dimensions", "how big is the image", "what size is it"],
+  imageKind: ["what kind of file", "is it really a png", "identify the image"],
+  pngRead: ["decode the png", "read the pixels"],
+  pngWrite: ["write a png", "save the image"],
+  imageResize: ["resize the image", "make it smaller", "thumbnail"],
+  imageCrop: ["crop the image", "cut out a region"],
+  imageDiff: ["did the screenshot change", "compare the images", "visual regression"],
+  exifRead: ["photo metadata", "when was it taken", "does it have gps"],
+  exifStrip: ["strip the metadata", "remove exif", "safe to publish the photo"],
+  qrEncode: ["make a qr code", "qr"],
+  barcodeEncode: ["barcode", "ean", "code128"],
+  chartRender: ["draw a chart", "plot the data", "bar chart", "graph it"],
+  sparklineRender: ["sparkline", "tiny chart", "inline trend"],
+  diagramRender: ["draw a diagram", "boxes and arrows", "architecture picture"],
+  colorConvert: ["hex to rgb", "convert the colour", "hsl"],
+  colorContrast: ["is the contrast accessible", "wcag contrast", "readable colour"],
+  subtitleParse: ["read the subtitles", "srt", "vtt captions"],
+  subtitleWrite: ["write subtitles", "shift the captions", "make an srt"],
+  mediaProbe: ["how long is the video", "media duration", "what codec", "ffprobe"],
+  eventQuery: ["what happened", "search the events", "filter the log"],
+  eventCounts: ["how many events", "tally by kind", "activity summary"],
+  toolCallStats: ["which tool is failing", "tool usage", "how slow is the tool"],
+  errorCluster: ["group the errors", "what keeps failing", "common errors"],
+  runTimeline: ["where did the time go", "run timeline", "what happened in the run"],
+  costReport: ["what did it cost", "token spend", "cost by model", "spend by day"],
+  budgetCheck: ["how much budget left", "am i over budget", "spend remaining"],
+  sloEvaluate: ["are we meeting the target", "error budget", "service level"],
+  incidentBundle: ["package up the failure", "incident report", "hand this to a human"],
+  metricsQuery: ["query prometheus", "metrics", "graph the series"],
+  logsQuery: ["search the logs", "query the log platform"],
+  alertList: ["what alerts are firing", "open alerts"],
+  alertAck: ["acknowledge the alert", "ack the page"],
+  statusPagePost: ["post a status update", "status page", "tell customers"],
+  healthProbe: ["are the services up", "health check", "probe the endpoints"],
+  chatPost: [
+    "post to slack",
+    "send a message to the channel",
+    "notify the team",
+    "discord",
+    "teams",
+  ],
+  chatUpdate: ["edit the message", "update what i posted"],
+  chatDelete: ["delete the message", "remove the post"],
+  chatReact: ["react to the message", "add an emoji"],
+  emailCompose: ["draft an email", "build the message", "compose without sending"],
+  emailSend: ["send an email", "email them", "mail the report"],
+  webhookPost: ["post to the webhook", "call the hook", "trigger the integration"],
+  smsSend: ["send a text", "sms them"],
+  pushNotify: ["push notification", "notify the phone"],
+  deliveryCheck: ["was it delivered", "delivery status", "did the message arrive"],
+  notifyDigest: ["one summary instead of many", "digest the alerts", "batch the notifications"],
+  quietHours: ["is it too late to send", "quiet hours", "do not disturb", "out of hours"],
+  rateLimitGate: ["have i already told them", "do not spam", "notification throttle"],
+  messageTemplate: ["render the message", "message template", "standard wording"],
+  evaluate: ["calculate", "work out", "compute the expression", "what is"],
+  statistics: ["average", "mean median", "standard deviation", "summarize the numbers"],
+  percentile: ["percentile", "p95", "median of"],
+  correlation: ["correlated", "relationship between", "correlation"],
+  linearRegression: ["trend", "regression", "line of best fit", "predict from"],
+  histogram: ["distribution", "histogram", "bucket the values"],
+  outliers: ["outliers", "anomalies", "unusual values"],
+  moneyAdd: ["add the amounts", "total the money", "sum the invoice"],
+  moneyMultiply: ["multiply the price", "quantity times price", "line total"],
+  moneyAllocate: ["split the bill", "allocate the amount", "divide the payment", "apportion"],
+  currencyConvert: ["convert currency", "in dollars", "exchange rate"],
+  unitConvert: ["convert units", "in kilometres", "celsius to fahrenheit", "how many pounds"],
+  round: ["round", "to two decimal places", "nearest"],
+  numberFormat: ["format the number", "thousands separator", "display the amount"],
+  numberParse: ["parse the number", "read the amount", "string to number"],
+  percent: ["percentage", "percent change", "margin", "markup"],
+  amortize: ["loan schedule", "repayments", "amortization", "monthly payment"],
+  npv: ["net present value", "npv", "discounted cash flow"],
+  irr: ["internal rate of return", "irr", "return on the investment"],
+  geoDistance: ["how far between", "distance between coordinates", "kilometres apart"],
+  geoBoundingBox: ["bounding box", "area around a point"],
+  geoPointInPolygon: ["is it inside the area", "point in polygon", "within the region"],
+  piiScan: ["is there personal data", "find pii", "scan for personal information"],
+  piiRedact: ["redact", "remove personal data", "anonymize the text"],
+  pseudonymize: ["pseudonymize", "de-identify", "replace with tokens"],
+  depseudonymize: ["restore the real values", "reverse the tokens"],
+  secretScan: ["any secrets", "leaked credentials", "scan for api keys", "did i commit a key"],
+  entropyScore: ["entropy", "is this random", "does this look like a key"],
+  promptInjectionScan: ["prompt injection", "is this content hostile", "instruction override"],
+  invisibleCharScan: ["hidden characters", "zero width", "is something hidden in this text"],
+  homoglyphNormalize: ["lookalike characters", "homoglyph", "confusable letters"],
+  urlSafetyCheck: ["is this link safe", "suspicious url", "check the link"],
+  allowlistCheck: ["is it allowed", "allow-list", "permitted domain"],
+  contentPolicyCheck: [
+    "policy check",
+    "required disclaimer",
+    "forbidden phrase",
+    "compliance check",
+  ],
+  hashChainVerify: ["verify the chain", "was it tampered", "hash chain"],
+  signPayload: ["sign the record", "prove it was not altered"],
+  verifyPayload: ["verify the signature", "is this record genuine"],
+  redactForExport: ["safe to send", "clean before sharing", "redact for export"],
+  docxRead: ["read the word document", "docx", "what does the document say"],
+  docxWrite: ["write a word document", "produce a docx", "generate a report document"],
+  xlsxRead: ["read the spreadsheet", "xlsx", "excel data", "what is in the sheet"],
+  xlsxWrite: ["write a spreadsheet", "export to excel", "produce an xlsx"],
+  pptxRead: ["read the slides", "powerpoint", "deck contents"],
+  pdfInfo: ["how many pages", "pdf metadata", "is the pdf a scan", "is it encrypted"],
+  pdfText: ["read the pdf", "extract the text", "what does the pdf say"],
+  pdfSplit: ["split the pdf", "extract pages", "just these pages"],
+  pdfMerge: ["merge pdfs", "combine the documents", "join the pdfs"],
+  emlParse: ["read the email", "parse the message", "eml", "email headers"],
+  mboxSplit: ["mbox", "split the mailbox", "email archive"],
+  icsParse: ["read the calendar", "ics", "what events", "calendar invite"],
+  icsWrite: ["write a calendar", "create an invite", "produce an ics"],
+  vcardParse: ["read the contacts", "vcard", "vcf"],
+  documentText: ["read the document", "get the text", "what does this file say"],
+  documentDiff: ["what changed in the document", "compare the documents", "document diff"],
+  sqlQuery: ["query the database", "select from", "how many rows", "look it up in the db"],
+  sqlExec: ["insert into", "update the row", "write to the database"],
+  sqlTransaction: ["all or nothing", "transaction", "atomically"],
+  sqlExplain: ["query plan", "why is it slow", "explain the query", "missing index"],
+  schemaList: ["what tables", "list the schema", "database structure"],
+  schemaDescribe: ["describe the table", "what columns", "table structure"],
+  tableStats: ["how big is the table", "row counts", "table sizes"],
+  integrityCheck: ["is the database ok", "integrity check", "corrupt database"],
+  importCsv: ["load the csv", "import into the table", "csv to database"],
+  importJson: ["load the json", "import records"],
+  exportCsv: ["export to csv", "dump the query to csv"],
+  exportJson: ["export to json", "dump the table"],
+  databaseBackup: ["back up the database", "snapshot the db"],
+  migrationStatus: ["which migrations ran", "pending migrations"],
+  migrationApply: ["run the migrations", "apply migrations", "migrate the database"],
+  prList: ["open pull requests", "list prs", "what prs"],
+  prGet: ["this pr", "pr details", "is the pr mergeable"],
+  prFiles: ["what files does the pr change", "pr diff"],
+  prComments: ["pr comments", "review feedback", "what did reviewers say"],
+  prReviews: ["pr reviews", "who approved", "review state"],
+  issueList: ["open issues", "list issues", "bug reports"],
+  issueGet: ["this issue", "issue details"],
+  checkRuns: ["are the checks passing", "check runs", "ci status"],
+  workflowRuns: ["ci runs", "workflow runs", "did the build pass"],
+  workflowRunLogs: ["why did ci fail", "ci logs", "build logs"],
+  releaseList: ["releases", "what versions shipped"],
+  releaseGet: ["this release", "release notes", "release assets"],
+  repoGet: ["repo info", "default branch", "is it public"],
+  compareRefs: ["what is between these versions", "compare branches", "commits since"],
+  searchCode: ["search the code on github", "find code in the org"],
+  searchIssues: ["search issues", "has this been reported"],
+  rateLimitStatus: ["api quota", "rate limit", "how many calls left"],
+  prCreate: ["open a pr", "create a pull request", "raise a pr"],
+  prUpdate: ["update the pr", "retitle the pr", "add a reviewer", "label the pr"],
+  prComment: ["comment on the pr", "reply on the pr"],
+  prReviewSubmit: ["approve the pr", "request changes", "submit a review"],
+  issueCreate: ["file an issue", "open a bug", "create an issue"],
+  issueUpdate: ["close the issue", "update the issue", "assign the issue"],
+  issueComment: ["comment on the issue", "reply to the issue"],
+  releaseCreate: ["cut a release", "publish a release"],
+  workflowRunRerun: ["rerun ci", "retry the build", "rerun the failed jobs"],
+  runTests: ["run the tests", "do the tests pass", "test suite", "is it green"],
+  testFailureSummary: ["which tests failed", "summarize the failures", "test output"],
+  runBuild: ["build it", "does it compile", "run the build"],
+  typecheck: ["typecheck", "type errors", "tsc", "does it type"],
+  lint: ["lint", "linter", "code style problems"],
+  format: ["format the code", "run prettier", "fix formatting"],
+  formatCheck: ["is it formatted", "format check", "formatting gate"],
+  diagnostics: ["what is wrong with the code", "all the problems", "health of the code"],
+  astQuery: ["find the function", "where is the class", "declarations", "find the symbol"],
+  symbolOutline: ["what is in this file", "outline the file", "file structure"],
+  findReferences: ["where is this used", "references to", "callers of", "usages"],
+  importGraph: ["import graph", "what imports what", "circular imports", "module graph"],
+  deadFileScan: ["unused files", "dead code", "nothing imports"],
+  todoScan: ["todos", "fixme", "outstanding work in the code"],
+  dependencyList: ["dependencies", "what packages", "requirements"],
+  dependencyOutdated: ["outdated dependencies", "lockfile drift", "version mismatch"],
+  packageScripts: ["what scripts", "how do i run", "npm scripts"],
+  workspacePackages: ["monorepo packages", "workspace members"],
+  coverageSummary: ["coverage", "how much is tested", "uncovered files"],
+  stackTraceParse: ["parse the stack trace", "where did it throw", "which line failed"],
+  specValidate: ["is the spec valid", "validate the spec", "check crewhaus.yaml"],
+  specCompileCheck: ["will it compile", "check the build", "compile check"],
+  specSummarize: ["what does this harness do", "summarize the spec", "harness shape"],
+  specDiff: ["what changed in the spec", "compare specs", "did permissions widen"],
+  toolInventory: ["what tools does it have", "tool list for the harness"],
+  permissionAudit: ["what can this harness do", "permission audit", "ungated tools"],
+  preflightRun: ["will it boot", "preflight", "missing credentials", "before deploying"],
+  harnessInventory: ["what harnesses", "list the fleet", "find the harnesses"],
+  bundleFreshness: ["is the bundle stale", "needs recompiling", "out of date build"],
+  auditVerify: ["verify the audit log", "was it tampered", "hash chain"],
+  evalBaselineCompare: ["did it regress", "compare eval runs", "release gate", "baseline"],
+  sessionSummarize: ["what happened in the run", "session summary", "run report"],
+  traceQuery: ["query the trace", "what tools were called", "find the error"],
+  costSummarize: ["how much did it cost", "token spend", "cost by model"],
+  kvSet: ["remember this", "store the value", "save state", "set a key"],
+  kvGet: ["what did i store", "read the value", "get a key", "last run"],
+  kvDelete: ["forget", "delete the key", "clear the value"],
+  kvList: ["what keys", "list the state", "everything stored"],
+  counterIncrement: ["count it", "increment", "how many times", "tally"],
+  counterGet: ["read the counter", "how many so far", "current count"],
+  checkpointSave: ["save progress", "checkpoint", "so it can resume"],
+  checkpointLoad: ["resume", "restore progress", "where was i"],
+  checkpointList: ["what checkpoints", "list the saves"],
+  journalAppend: ["log this", "record what happened", "append to the journal"],
+  journalRead: ["what happened", "read the journal", "history of actions"],
+  blackboardPost: ["leave a note for", "share with the crew", "post to the board"],
+  blackboardRead: ["what did the others find", "read the board", "crew notes"],
+  noteWrite: ["write a note", "save what i learned", "keep this"],
+  noteSearch: ["search my notes", "did i note", "find in notes"],
+  indexBuild: ["index the files", "build a search index"],
+  indexSearch: ["search the files", "which file mentions", "find the document"],
+  stateExport: ["back up the state", "export everything"],
+  stateImport: ["restore the state", "import the backup"],
+  dedupeMark: ["already handled", "seen before", "idempotency", "do not repeat"],
+  httpRequest: ["call the api", "http request", "post to", "hit the endpoint"],
+  httpPaginate: ["all the pages", "paginate", "fetch every result", "next page"],
+  graphqlQuery: ["graphql", "query the graph", "gql"],
+  httpBatch: ["several requests", "batch the calls", "fan out requests"],
+  downloadFile: ["download", "save the file from", "fetch the artifact"],
+  headRequest: ["does the url exist", "how big is the download", "check the headers"],
+  urlReachable: ["is it up", "is the site reachable", "ping the url"],
+  linkCheck: ["broken links", "check the links", "dead urls"],
+  httpWaitFor: ["wait for the deploy", "poll until healthy", "wait for the endpoint"],
+  sseRead: ["server sent events", "event stream", "sse"],
+  webhookSign: ["sign the webhook", "webhook signature"],
+  webhookVerify: ["verify the webhook", "is this webhook genuine", "check the signature"],
+  dnsLookup: ["dns", "what does this resolve to", "mx records", "txt record"],
+  tlsInspect: ["certificate", "when does the cert expire", "tls", "ssl"],
+  robotsCheck: ["robots.txt", "am i allowed to crawl", "crawl policy"],
+  sitemapParse: ["sitemap", "site urls"],
+  feedParse: ["rss", "atom feed", "parse the feed", "subscribe"],
+  base64Encode: ["base64", "encode as base64", "to base64"],
+  base64Decode: ["decode base64", "from base64"],
+  runCommand: ["run a command", "execute", "run the build", "invoke the binary"],
+  runPipeline: ["run these in order", "chain commands", "sequence of commands"],
+  retry: ["retry", "try again", "flaky command", "backoff"],
+  processStart: ["start a server", "run in the background", "background process"],
+  processStatus: ["is it still running", "process status", "did it exit"],
+  processOutput: ["read the output", "what has it printed", "process logs"],
+  processStop: ["stop the process", "kill the server", "shut it down"],
+  processList: ["what is running", "list background processes"],
+  waitForPort: ["wait for the server", "is the port open", "wait until listening"],
+  waitForFile: ["wait for the file", "wait until it exists", "wait for the build output"],
+  waitForOutput: ["wait for the log line", "wait until ready", "watch the output"],
+  commandExists: ["is it installed", "is the binary available", "which"],
+  envInspect: ["environment variable", "is the env set", "check the config"],
+  stat: ["file info", "how big is the file", "when was it modified", "does it exist"],
+  fileHash: ["hash the file", "checksum the file", "has the file changed"],
+  tree: ["directory tree", "what is in this folder", "project layout", "list the directory"],
+  diskUsage: ["disk usage", "what is taking space", "largest directories"],
+  findFiles: ["find files", "locate files", "files modified since", "files larger than"],
+  readLines: ["read a line range", "lines from the file", "page through"],
+  tailFile: ["tail the file", "last lines", "end of the log"],
+  makeDirectory: ["make a directory", "create a folder", "mkdir"],
+  touchFile: ["touch", "create an empty file"],
+  tempDir: ["temp directory", "scratch space", "working directory"],
+  copyPath: ["copy the file", "duplicate", "cp"],
+  movePath: ["move the file", "rename the file", "mv"],
+  removePath: ["delete the file", "remove the directory", "clean up"],
+  splitFile: ["split the file", "chunk the file"],
+  concatFiles: ["concatenate", "join the files", "combine files"],
+  archiveList: ["what is in the archive", "list the zip", "tar contents"],
+  archiveCreate: ["make an archive", "zip it up", "create a tarball"],
+  archiveExtract: ["extract the archive", "unzip", "untar"],
+  frontmatterRead: ["read the frontmatter", "post metadata", "yaml header"],
+  frontmatterWrite: ["update the frontmatter", "set the metadata"],
+  notebookRead: ["read the notebook", "jupyter cells", "ipynb"],
+  notebookEdit: ["edit the notebook", "change a cell"],
+  gitStatus: ["git status", "what changed", "working tree", "uncommitted"],
+  gitDiff: ["git diff", "show the changes", "what did i change", "review the diff"],
+  gitLog: ["git log", "commit history", "recent commits", "who changed"],
+  gitShow: ["show the commit", "file at a revision", "contents at a ref"],
+  gitBlame: ["git blame", "who wrote this line", "last touched"],
+  gitBranchList: ["list branches", "what branches", "branch list"],
+  gitTagList: ["list tags", "releases", "what tags"],
+  gitRemoteList: ["remotes", "origin url", "where does this push"],
+  gitMergeBase: ["merge base", "fork point", "common ancestor", "branched from"],
+  gitRevParse: ["resolve the ref", "what sha is", "repo root"],
+  gitFileHistory: ["history of this file", "when did this file change", "follow renames"],
+  gitStashList: ["list stashes", "what is stashed"],
+  gitConflicts: ["merge conflicts", "conflicted files", "resolve conflicts"],
+  gitWorktreeList: ["list worktrees", "linked checkouts"],
+  gitAdd: ["git add", "stage the changes", "stage files"],
+  gitCommit: ["git commit", "commit the changes", "make a commit"],
+  gitSwitch: ["switch branch", "checkout a branch", "change branch"],
+  gitBranchCreate: ["create a branch", "new branch"],
+  gitBranchDelete: ["delete a branch", "remove the branch"],
+  gitStashPush: ["stash the changes", "set work aside"],
+  gitStashPop: ["pop the stash", "restore stashed work"],
+  gitTagCreate: ["tag the release", "create a tag"],
+  gitApplyPatch: ["apply a patch", "apply the diff"],
+  gitCherryPick: ["cherry pick", "bring that commit over"],
+  gitResetPaths: ["unstage", "reset the file", "undo staging"],
+  gitWorktreeAdd: ["add a worktree", "second checkout"],
+  gitWorktreeRemove: ["remove a worktree"],
+  jsonSchemaValidate: ["validate against the schema", "json schema", "is it valid"],
+  jsonSchemaInfer: ["infer a schema", "derive the schema", "schema from examples"],
+  validateRecords: ["validate the rows", "data quality", "check every record"],
+  assert: ["assert", "check that", "verify the result", "gate on"],
+  compareGolden: ["golden file", "snapshot", "expected output", "regression check"],
+  deepEqual: ["are these equal", "deep equal", "same value"],
+  matchSubset: ["contains the fields", "partial match", "subset"],
+  checkRequiredFields: ["required fields", "missing fields", "completeness"],
+  validateEnum: ["allowed values", "one of", "valid option"],
+  validateFormat: ["is it an email", "valid url", "check the format"],
+  validateUniqueKeys: ["duplicate keys", "unique constraint", "duplicates"],
+  validateReferences: ["referential integrity", "dangling reference", "foreign key"],
+  schemaDiff: ["schema changed", "breaking change", "compare schemas"],
+  dbSchemaDiff: ["database schema changed", "compare databases", "migration needed"],
+  schemaSummarize: ["summarize the schema", "what does the schema require"],
+  dateParse: ["parse the date", "read the timestamp", "what date is"],
+  dateFormat: ["format the date", "render the timestamp", "display the date"],
+  dateConvertTimezone: ["timezone", "convert to utc", "local time"],
+  dateAdd: ["add days", "subtract days", "date arithmetic", "days from now"],
+  dateDiff: ["how long between", "days between", "date difference", "age"],
+  durationParse: ["parse the duration", "how long is", "iso duration"],
+  durationFormat: ["format the duration", "human readable time", "elapsed"],
+  businessDays: ["business days", "working days", "sla deadline", "weekdays"],
+  dateRange: ["date range", "every day between", "list the dates"],
+  cronNext: ["next run", "cron schedule", "when does it fire"],
+  cronDescribe: ["explain the cron", "what does this schedule mean"],
+  recurrenceExpand: ["recurring", "rrule", "repeat every", "expand the series"],
+  weekOfYear: ["week number", "iso week"],
+  dayOfYear: ["day of the year", "ordinal date"],
+  isLeapYear: ["leap year"],
+  quarterOf: ["which quarter", "fiscal quarter"],
+  timestampConvert: ["unix timestamp", "epoch", "millis to date"],
+  hash: ["hash", "sha256", "checksum of the text", "digest"],
+  hmac: ["hmac", "sign the payload", "verify the signature"],
+  checksum: ["crc32", "adler", "checksum"],
+  hexEncode: ["to hex", "hex encode"],
+  hexDecode: ["from hex", "hex decode"],
+  urlEncode: ["url encode", "percent encode", "escape for a url"],
+  urlDecode: ["url decode", "percent decode"],
+  urlParse: ["parse the url", "query parameters", "split the url"],
+  urlBuild: ["build a url", "add query parameters"],
+  urlNormalize: ["normalize the url", "canonical url", "compare urls"],
+  uuid: ["uuid", "generate an id", "guid"],
+  ulid: ["ulid", "sortable id"],
+  nanoId: ["nanoid", "short id"],
+  slugify: ["slug", "url safe name", "slugify"],
+  jwtDecode: ["decode the jwt", "read the token", "token claims"],
+  jwtVerify: ["verify the jwt", "check the token signature"],
+  jsonQuery: ["query the json", "jsonpath", "pull a field", "select from json"],
+  jsonPatch: ["json patch", "apply a patch", "rfc 6902"],
+  jsonMergePatch: ["merge patch", "rfc 7386", "merge json"],
+  jsonFormat: ["format json", "pretty print json", "minify json"],
+  dataDiff: ["diff the json", "what changed", "compare two documents"],
+  dataConvert: ["convert to yaml", "json to csv", "toml", "change format"],
+  csvParse: ["parse the csv", "read a csv", "csv to json"],
+  csvWrite: ["write a csv", "export to csv", "json to csv"],
+  tableQuery: ["filter the records", "select rows", "query the table"],
+  tableAggregate: ["group by", "sum the", "count by", "aggregate"],
+  tableJoin: ["join two lists", "match records", "left join"],
+  recordsToColumns: ["to columns", "column oriented"],
+  columnsToRecords: ["to records", "row oriented"],
+  flattenObject: ["flatten", "dotted keys"],
+  unflattenObject: ["unflatten", "rebuild nesting"],
+  jsonlParse: ["jsonl", "line delimited json", "ndjson"],
+  jsonlWrite: ["write jsonl", "ndjson output"],
+  xmlParse: ["parse the xml", "xml to json", "read html fragment"],
+  sortRecords: ["sort the records", "order the rows"],
+  dedupeRecords: ["dedupe", "remove duplicates", "unique records"],
+  sampleRecords: ["sample the data", "first n rows", "head of the data"],
+  dataShape: ["what shape is", "describe the data", "fields present"],
+  jsonSortKeys: ["sort the keys", "stable json", "canonical json"],
+  compactLog: ["compact the log", "summarize the log", "log noise", "ci log", "dedupe lines"],
+  countTokens: ["count tokens", "how big is", "token count", "size of the text", "fits in context"],
+  escapeString: ["escape", "quote safely", "sanitize for", "inject safely", "shell-quote"],
+  extractEntities: [
+    "extract urls",
+    "find emails",
+    "pull out ids",
+    "extract entities",
+    "harvest links",
+  ],
+  extractKeywords: ["keywords", "key terms", "tag the document", "top terms"],
+  fuzzyMatch: ["fuzzy match", "closest match", "did you mean", "reconcile names", "nearest name"],
+  glossaryReplace: ["glossary", "terminology", "rename terms", "house style", "replace terms"],
+  markdownOutline: ["outline", "table of contents", "headings", "one section", "navigate the doc"],
+  markdownTable: ["markdown table", "render a table", "format as a table", "report table"],
+  normalizeText: [
+    "normalize",
+    "canonicalize",
+    "line endings",
+    "strip whitespace",
+    "clean the text",
+  ],
+  regexExtract: [
+    "regex",
+    "extract with a pattern",
+    "capture groups",
+    "pattern match",
+    "pull matches",
+  ],
+  renderTemplate: ["template", "fill in the placeholders", "render the message", "mail merge"],
+  ruleClassify: ["classify by rules", "label the ticket", "route the message", "rule-based label"],
+  sortLines: ["sort lines", "uniq", "dedupe the list", "sort the file"],
+  textDiff: ["diff", "compare two", "what changed", "unified diff"],
+  textSimilarity: ["similarity", "how similar", "near duplicate", "compare strings"],
+  truncateToBudget: ["truncate", "fit the budget", "shorten to", "trim to size"],
+  wrapText: ["wrap text", "72 columns", "quote the reply", "hard wrap"],
   webFetch: ["fetch url", "fetch a url", "webpage", "web page", "http get", "download page"],
   webSearch: ["web search", "search the web", "search online", "look up online", "google"],
   readImage: ["image", "screenshot", "read an image", "vision", "picture"],
@@ -614,6 +1060,395 @@ export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object.freeze([
   "codegraphCallers",
   "codegraphCallees",
   "codegraphImpact",
+  "compactLog",
+  "countTokens",
+  "escapeString",
+  "extractEntities",
+  "extractKeywords",
+  "fuzzyMatch",
+  "glossaryReplace",
+  "markdownOutline",
+  "markdownTable",
+  "normalizeText",
+  "regexExtract",
+  "renderTemplate",
+  "ruleClassify",
+  "sortLines",
+  "textDiff",
+  "textSimilarity",
+  "truncateToBudget",
+  "wrapText",
+  "jsonQuery",
+  "jsonPatch",
+  "jsonMergePatch",
+  "jsonFormat",
+  "dataDiff",
+  "dataConvert",
+  "csvParse",
+  "csvWrite",
+  "tableQuery",
+  "tableAggregate",
+  "tableJoin",
+  "recordsToColumns",
+  "columnsToRecords",
+  "flattenObject",
+  "unflattenObject",
+  "jsonlParse",
+  "jsonlWrite",
+  "xmlParse",
+  "sortRecords",
+  "dedupeRecords",
+  "sampleRecords",
+  "dataShape",
+  "jsonSortKeys",
+  "hash",
+  "hmac",
+  "checksum",
+  "hexEncode",
+  "hexDecode",
+  "urlEncode",
+  "urlDecode",
+  "urlParse",
+  "urlBuild",
+  "urlNormalize",
+  "uuid",
+  "ulid",
+  "nanoId",
+  "slugify",
+  "jwtDecode",
+  "jwtVerify",
+  "dateParse",
+  "dateFormat",
+  "dateConvertTimezone",
+  "dateAdd",
+  "dateDiff",
+  "durationParse",
+  "durationFormat",
+  "businessDays",
+  "dateRange",
+  "cronNext",
+  "cronDescribe",
+  "recurrenceExpand",
+  "weekOfYear",
+  "dayOfYear",
+  "isLeapYear",
+  "quarterOf",
+  "timestampConvert",
+  "jsonSchemaValidate",
+  "jsonSchemaInfer",
+  "validateRecords",
+  "assert",
+  "compareGolden",
+  "deepEqual",
+  "matchSubset",
+  "checkRequiredFields",
+  "validateEnum",
+  "validateFormat",
+  "validateUniqueKeys",
+  "validateReferences",
+  "schemaDiff",
+  "schemaSummarize",
+  "gitStatus",
+  "gitDiff",
+  "gitLog",
+  "gitShow",
+  "gitBlame",
+  "gitBranchList",
+  "gitTagList",
+  "gitRemoteList",
+  "gitMergeBase",
+  "gitRevParse",
+  "gitFileHistory",
+  "gitStashList",
+  "gitConflicts",
+  "gitWorktreeList",
+  "gitAdd",
+  "gitCommit",
+  "gitSwitch",
+  "gitBranchCreate",
+  "gitBranchDelete",
+  "gitStashPush",
+  "gitStashPop",
+  "gitTagCreate",
+  "gitApplyPatch",
+  "gitCherryPick",
+  "gitResetPaths",
+  "gitWorktreeAdd",
+  "gitWorktreeRemove",
+  "stat",
+  "fileHash",
+  "tree",
+  "diskUsage",
+  "findFiles",
+  "readLines",
+  "tailFile",
+  "makeDirectory",
+  "touchFile",
+  "tempDir",
+  "copyPath",
+  "movePath",
+  "removePath",
+  "splitFile",
+  "concatFiles",
+  "archiveList",
+  "archiveCreate",
+  "archiveExtract",
+  "frontmatterRead",
+  "frontmatterWrite",
+  "notebookRead",
+  "notebookEdit",
+  "runCommand",
+  "runPipeline",
+  "retry",
+  "processStart",
+  "processStatus",
+  "processOutput",
+  "processStop",
+  "processList",
+  "waitForPort",
+  "waitForFile",
+  "waitForOutput",
+  "commandExists",
+  "envInspect",
+  "base64Encode",
+  "base64Decode",
+  "httpRequest",
+  "httpPaginate",
+  "graphqlQuery",
+  "httpBatch",
+  "downloadFile",
+  "headRequest",
+  "urlReachable",
+  "linkCheck",
+  "httpWaitFor",
+  "sseRead",
+  "webhookSign",
+  "webhookVerify",
+  "dnsLookup",
+  "tlsInspect",
+  "robotsCheck",
+  "sitemapParse",
+  "feedParse",
+  "kvSet",
+  "kvGet",
+  "kvDelete",
+  "kvList",
+  "counterIncrement",
+  "counterGet",
+  "checkpointSave",
+  "checkpointLoad",
+  "checkpointList",
+  "journalAppend",
+  "journalRead",
+  "blackboardPost",
+  "blackboardRead",
+  "noteWrite",
+  "noteSearch",
+  "indexBuild",
+  "indexSearch",
+  "stateExport",
+  "stateImport",
+  "dedupeMark",
+  "specValidate",
+  "specCompileCheck",
+  "specSummarize",
+  "specDiff",
+  "toolInventory",
+  "permissionAudit",
+  "preflightRun",
+  "harnessInventory",
+  "bundleFreshness",
+  "auditVerify",
+  "evalBaselineCompare",
+  "sessionSummarize",
+  "traceQuery",
+  "costSummarize",
+  "runTests",
+  "testFailureSummary",
+  "runBuild",
+  "typecheck",
+  "lint",
+  "format",
+  "formatCheck",
+  "diagnostics",
+  "astQuery",
+  "symbolOutline",
+  "findReferences",
+  "importGraph",
+  "deadFileScan",
+  "todoScan",
+  "dependencyList",
+  "dependencyOutdated",
+  "packageScripts",
+  "workspacePackages",
+  "coverageSummary",
+  "stackTraceParse",
+  "prList",
+  "prGet",
+  "prFiles",
+  "prComments",
+  "prReviews",
+  "issueList",
+  "issueGet",
+  "checkRuns",
+  "workflowRuns",
+  "workflowRunLogs",
+  "releaseList",
+  "releaseGet",
+  "repoGet",
+  "compareRefs",
+  "searchCode",
+  "searchIssues",
+  "rateLimitStatus",
+  "prCreate",
+  "prUpdate",
+  "prComment",
+  "prReviewSubmit",
+  "issueCreate",
+  "issueUpdate",
+  "issueComment",
+  "releaseCreate",
+  "workflowRunRerun",
+  "sqlQuery",
+  "sqlExec",
+  "sqlTransaction",
+  "sqlExplain",
+  "dbSchemaDiff",
+  "schemaList",
+  "schemaDescribe",
+  "tableStats",
+  "integrityCheck",
+  "importCsv",
+  "importJson",
+  "exportCsv",
+  "exportJson",
+  "databaseBackup",
+  "migrationStatus",
+  "migrationApply",
+  "docxRead",
+  "docxWrite",
+  "xlsxRead",
+  "xlsxWrite",
+  "pptxRead",
+  "pdfInfo",
+  "pdfText",
+  "pdfSplit",
+  "pdfMerge",
+  "emlParse",
+  "mboxSplit",
+  "icsParse",
+  "icsWrite",
+  "vcardParse",
+  "documentText",
+  "documentDiff",
+  "piiScan",
+  "piiRedact",
+  "pseudonymize",
+  "depseudonymize",
+  "secretScan",
+  "entropyScore",
+  "promptInjectionScan",
+  "invisibleCharScan",
+  "homoglyphNormalize",
+  "urlSafetyCheck",
+  "allowlistCheck",
+  "contentPolicyCheck",
+  "hashChainVerify",
+  "signPayload",
+  "verifyPayload",
+  "redactForExport",
+  "evaluate",
+  "statistics",
+  "percentile",
+  "correlation",
+  "linearRegression",
+  "histogram",
+  "outliers",
+  "moneyAdd",
+  "moneyMultiply",
+  "moneyAllocate",
+  "currencyConvert",
+  "unitConvert",
+  "round",
+  "numberFormat",
+  "numberParse",
+  "percent",
+  "amortize",
+  "npv",
+  "irr",
+  "geoDistance",
+  "geoBoundingBox",
+  "geoPointInPolygon",
+  "chatPost",
+  "chatUpdate",
+  "chatDelete",
+  "chatReact",
+  "emailCompose",
+  "emailSend",
+  "webhookPost",
+  "smsSend",
+  "pushNotify",
+  "deliveryCheck",
+  "notifyDigest",
+  "quietHours",
+  "rateLimitGate",
+  "messageTemplate",
+  "eventQuery",
+  "eventCounts",
+  "toolCallStats",
+  "errorCluster",
+  "runTimeline",
+  "costReport",
+  "budgetCheck",
+  "sloEvaluate",
+  "incidentBundle",
+  "metricsQuery",
+  "logsQuery",
+  "alertList",
+  "alertAck",
+  "statusPagePost",
+  "healthProbe",
+  "imageInfo",
+  "imageKind",
+  "pngRead",
+  "pngWrite",
+  "imageResize",
+  "imageCrop",
+  "imageDiff",
+  "exifRead",
+  "exifStrip",
+  "qrEncode",
+  "barcodeEncode",
+  "chartRender",
+  "sparklineRender",
+  "diagramRender",
+  "colorConvert",
+  "colorContrast",
+  "subtitleParse",
+  "subtitleWrite",
+  "mediaProbe",
+  "branch",
+  "consensusVote",
+  "deadlineCheck",
+  "decisionTable",
+  "errorClassify",
+  "ruleScore",
+  "stallDetect",
+  "licenseAggregate",
+  "lockfileDiff",
+  "packagePublishPreflight",
+  "packageTarballInspect",
+  "semverResolve",
+  "costBasisCompute",
+  "glCodeSuggest",
+  "paymentIdentifierValidate",
+  "purchaseOrderMatch",
+  "refundAbuseCheck",
+  "refundAmountCompute",
+  "spendLimitCheck",
+  "statementParse",
+  "taxCalculate",
+  "webhookSignatureVerify",
 ]);
 
 /**
@@ -630,4 +1465,279 @@ export function diffToolMapKeys(
     onlyInA: [...setA].filter((k) => !setB.has(k)).sort(),
     onlyInB: [...setB].filter((k) => !setA.has(k)).sort(),
   };
+}
+
+// -------- tools categories / show / search (navigation) --------
+
+/**
+ * Navigation over the builtin catalogue. `tools list` answers "what exists";
+ * these answer the three questions that follow it — how is it grouped, what
+ * exactly does this one do, and which one do I want.
+ *
+ * All pure: the caller supplies the resolved tool map, so every function here
+ * is unit-testable without touching the filesystem or importing a tool.
+ */
+
+/** One row of `tools categories`. */
+export type CategoryRow = {
+  readonly name: string;
+  /** The selector an operator writes in a spec: `all-<name>`. */
+  readonly selector: string;
+  readonly title: string;
+  /** Leaf categories own tools; roll-ups own other categories. */
+  readonly kind: "leaf" | "roll-up";
+  /** Tool keys, resolved transitively for a roll-up. */
+  readonly tools: ReadonlyArray<string>;
+  /** For a roll-up, the categories it rolls up. */
+  readonly includes?: ReadonlyArray<string>;
+};
+
+/**
+ * Build the category table. `resolve` is `toolsInCategory` from
+ * `@crewhaus/tool-categories`, injected so this module stays dependency-free
+ * and the test can drive a fixture registry.
+ */
+export function buildCategoryRows(
+  categories: Readonly<
+    Record<
+      string,
+      { title: string; tools?: ReadonlyArray<string>; includes?: ReadonlyArray<string> }
+    >
+  >,
+  resolve: (name: string) => ReadonlyArray<string>,
+): CategoryRow[] {
+  return Object.entries(categories)
+    .map(([name, def]) => ({
+      name,
+      selector: `all-${name}`,
+      title: def.title,
+      kind: (def.tools !== undefined ? "leaf" : "roll-up") as "leaf" | "roll-up",
+      tools: resolve(name),
+      ...(def.includes !== undefined ? { includes: [...def.includes] } : {}),
+    }))
+    .sort((a, b) => {
+      // Leaves first, then roll-ups: an operator scanning for "what can I
+      // turn on" wants the concrete groups before the bundles of groups.
+      if (a.kind !== b.kind) return a.kind === "leaf" ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+}
+
+/** Render the category table for the terminal. */
+export function formatCategoryLines(rows: ReadonlyArray<CategoryRow>): string[] {
+  const lines: string[] = [];
+  const leaves = rows.filter((r) => r.kind === "leaf");
+  const rollUps = rows.filter((r) => r.kind === "roll-up");
+  if (leaves.length > 0) {
+    lines.push("categories:");
+    for (const r of leaves) {
+      lines.push(`  ${r.selector}  (${r.tools.length})  ${r.title}`);
+      lines.push(`    ${r.tools.join(", ")}`);
+    }
+  }
+  if (rollUps.length > 0) {
+    lines.push("");
+    lines.push("roll-ups:");
+    for (const r of rollUps) {
+      lines.push(`  ${r.selector}  (${r.tools.length})  ${r.title}`);
+      lines.push(`    = ${(r.includes ?? []).map((c) => `all-${c}`).join(" + ")}`);
+    }
+  }
+  lines.push("");
+  lines.push("use in a spec:  tools: [all-fs, -write]   # a category, minus one tool");
+  return lines;
+}
+
+/** Full detail for one tool — the `tools show` payload. */
+export type ToolDetail = {
+  readonly key: string;
+  readonly name: string;
+  readonly description: string;
+  readonly categories: ReadonlyArray<string>;
+  readonly readOnly: boolean;
+  readonly destructive: boolean;
+  readonly scope: string;
+  readonly ioCapability?: string;
+  readonly requiresSandbox: boolean;
+  readonly requireJustification: boolean;
+  readonly concurrencySafe: boolean;
+  /** Top-level input field names, derived from the tool's own JSON Schema. */
+  readonly inputFields: ReadonlyArray<string>;
+};
+
+/**
+ * Project one tool into its detail record. `key` is the camelCase spec key;
+ * `categoriesFor` is `categoriesForTool`, injected for the same reason as
+ * above. Returns undefined when the key names no builtin, so the caller can
+ * offer suggestions rather than printing an empty record.
+ */
+export function buildToolDetail(
+  key: string,
+  toolMap: Readonly<Record<string, ToolLike>>,
+  categoriesFor: (key: string) => ReadonlyArray<string>,
+): ToolDetail | undefined {
+  const tool = toolMap[key];
+  if (tool === undefined) return undefined;
+  return {
+    key,
+    name: tool.name,
+    description: tool.description,
+    categories: categoriesFor(key),
+    readOnly: tool.readOnly,
+    destructive: tool.destructive,
+    scope: tool.scope,
+    ...(tool.ioCapability !== undefined ? { ioCapability: tool.ioCapability } : {}),
+    requiresSandbox: tool.requiresSandbox,
+    requireJustification: tool.requireJustification ?? false,
+    concurrencySafe: tool.concurrencySafe ?? false,
+    inputFields: inputFieldNames(tool),
+  };
+}
+
+/**
+ * The structural subset of RegisteredTool this module reads. Declared
+ * locally so `tools-cli` keeps its "pure, no tool imports" property.
+ */
+export type ToolLike = {
+  readonly name: string;
+  readonly description: string;
+  readonly readOnly: boolean;
+  readonly destructive: boolean;
+  readonly scope: string;
+  readonly ioCapability?: string;
+  readonly requiresSandbox: boolean;
+  readonly requireJustification?: boolean;
+  readonly concurrencySafe?: boolean;
+  readonly inputSchema?: unknown;
+  readonly jsonSchema?: unknown;
+};
+
+/**
+ * Pull top-level input field names off a tool. Prefers the authoritative
+ * `jsonSchema` when the tool carries one (MCP tools do); otherwise reads the
+ * Zod schema's own `shape`, which is public API on a ZodObject. Returns an
+ * empty list rather than throwing when the schema is neither — `tools show`
+ * degrading to "no fields listed" beats it crashing on an exotic schema.
+ */
+export function inputFieldNames(tool: ToolLike): ReadonlyArray<string> {
+  const fromJson = (tool.jsonSchema as { properties?: Record<string, unknown> } | undefined)
+    ?.properties;
+  if (fromJson !== undefined && typeof fromJson === "object") {
+    return Object.keys(fromJson).sort();
+  }
+  const shape = (tool.inputSchema as { shape?: Record<string, unknown> } | undefined)?.shape;
+  if (shape !== undefined && typeof shape === "object") {
+    return Object.keys(shape).sort();
+  }
+  return [];
+}
+
+/** Render `tools show` for the terminal. */
+export function formatToolDetailLines(d: ToolDetail): string[] {
+  const flags = [
+    d.readOnly ? "read-only" : "mutating",
+    d.destructive ? "destructive" : undefined,
+    d.scope === "external" ? "external" : "internal",
+    d.ioCapability !== undefined ? `io:${d.ioCapability}` : undefined,
+    d.requiresSandbox ? "sandbox-required" : undefined,
+    d.requireJustification ? "justification-gated" : undefined,
+    d.concurrencySafe ? "concurrency-safe" : undefined,
+  ].filter((f): f is string => f !== undefined);
+  return [
+    `${d.key}  (${d.name})`,
+    `  ${d.description}`,
+    "",
+    `  flags       ${flags.join(", ")}`,
+    `  categories  ${d.categories.length > 0 ? d.categories.map((c) => `all-${c}`).join(", ") : "(uncategorized)"}`,
+    `  input       ${d.inputFields.length > 0 ? d.inputFields.join(", ") : "(no declared fields)"}`,
+    "",
+    `  enable with  tools: [${d.key}]`,
+  ];
+}
+
+/** One `tools search` hit, most relevant first. */
+export type SearchHit = {
+  readonly key: string;
+  readonly name: string;
+  readonly description: string;
+  /** Higher is better. Exposed so the test can pin the ranking. */
+  readonly score: number;
+  /** Which field matched, for the "why did this match" column. */
+  readonly matchedOn: ReadonlyArray<string>;
+};
+
+/**
+ * Rank builtins against a free-text query by exact/prefix/substring match on
+ * the key, the PascalCase name, the description, and the tool's categories.
+ * Deterministic and lexical — no model, no embeddings, same posture as
+ * `tools suggest`.
+ */
+export function searchTools(
+  query: string,
+  toolMap: Readonly<Record<string, ToolLike>>,
+  categoriesFor: (key: string) => ReadonlyArray<string>,
+): SearchHit[] {
+  const q = query.trim().toLowerCase();
+  if (q === "") return [];
+  const hits: SearchHit[] = [];
+  for (const [key, tool] of Object.entries(toolMap)) {
+    const keyL = key.toLowerCase();
+    const nameL = tool.name.toLowerCase();
+    const descL = tool.description.toLowerCase();
+    const cats = categoriesFor(key).map((c) => c.toLowerCase());
+    let score = 0;
+    const matchedOn: string[] = [];
+    if (keyL === q || nameL === q) {
+      score += 100;
+      matchedOn.push("name");
+    } else if (keyL.startsWith(q) || nameL.startsWith(q)) {
+      score += 50;
+      matchedOn.push("name");
+    } else if (keyL.includes(q) || nameL.includes(q)) {
+      score += 25;
+      matchedOn.push("name");
+    }
+    if (cats.some((c) => c === q)) {
+      score += 30;
+      matchedOn.push("category");
+    }
+    if (descL.includes(q)) {
+      score += 10;
+      matchedOn.push("description");
+    }
+    if (score > 0)
+      hits.push({ key, name: tool.name, description: tool.description, score, matchedOn });
+  }
+  return hits.sort((a, b) => b.score - a.score || a.key.localeCompare(b.key));
+}
+
+/** Render `tools search` for the terminal. */
+export function formatSearchLines(query: string, hits: ReadonlyArray<SearchHit>): string[] {
+  if (hits.length === 0) {
+    return [`no builtin tool matches "${query}" — try \`crewhaus tools categories\``];
+  }
+  const lines = [`${hits.length} match(es) for "${query}":`];
+  for (const h of hits) {
+    lines.push(`  ${h.key} (${h.name})  [${h.matchedOn.join("+")}]`);
+    lines.push(`    ${h.description}`);
+  }
+  return lines;
+}
+
+/**
+ * Suggest near-miss keys for an unknown `tools show` argument, so a typo
+ * gets a pointer instead of a bare "not found".
+ */
+export function nearestToolKeys(
+  key: string,
+  known: ReadonlyArray<string>,
+  limit = 3,
+): ReadonlyArray<string> {
+  const k = key.toLowerCase();
+  return known
+    .filter((candidate) => {
+      const c = candidate.toLowerCase();
+      return c.includes(k) || k.includes(c) || c.startsWith(k.slice(0, 3));
+    })
+    .slice(0, limit);
 }

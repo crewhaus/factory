@@ -1,0 +1,36 @@
+{
+  "name": "@crewhaus/tool-categories",
+  "version": "0.6.0",
+  "type": "module",
+  "description": "Tool category registry and the all-<category> / -<tool> selector grammar a spec's tools: list accepts",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/tool-categories"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-categories#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

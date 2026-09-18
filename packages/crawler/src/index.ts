@@ -26,7 +26,7 @@
  * `snippetOccursInBody`).
  */
 import { lookup as nodeDnsLookup } from "node:dns/promises";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { basename, dirname, join as joinPath, resolve as resolvePath, sep } from "node:path";
 import type { CitationTracker } from "@crewhaus/citation-tracker";
 import { CrewhausError } from "@crewhaus/errors";
@@ -300,6 +300,63 @@ async function readBodyCapped(
   return new TextDecoder("utf-8", { fatal: false }).decode(merged);
 }
 
+/**
+ * True when the NAME exists, whether or not it leads anywhere.
+ *
+ * `existsSync` follows symlinks, so it answers false for a link whose target
+ * is missing — and that is exactly the case that matters: a walk probing with
+ * it strides past the link, treats it as a plain missing leaf, and re-appends
+ * the name to the realpath'd parent, so containment is decided on a path the
+ * link does not lead to. `lstat` keeps the name in the part that is RESOLVED.
+ */
+function nameExists(p: string): boolean {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Where `target` would actually land, with every symlink already followed —
+ * including one whose own target does not exist yet.
+ *
+ * Mirrors the resolver the tool packages share (see
+ * `@crewhaus/tool-fsx/src/paths.ts`); the crawler carries its own copy
+ * because it checks against a LIST of allowed roots rather than one
+ * workspace root. `realpathSync` gives up with ENOENT on a dangling link, so
+ * the deepest ancestor that exists as a name is resolved, a dangling one is
+ * followed a hop by hand, and the missing components are appended.
+ */
+function resolveLocation(target: string, depth = 0): string {
+  if (depth > 40) throw new Error(`symlink chain at "${target}" is too long to resolve`);
+  let probe = target;
+  const tail: string[] = [];
+  while (!nameExists(probe)) {
+    tail.unshift(basename(probe));
+    const parent = dirname(probe);
+    if (parent === probe) break; // reached filesystem root
+    probe = parent;
+  }
+  let probeReal: string;
+  try {
+    probeReal = realpathSync(probe);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    // The name is there but `realpath` cannot finish it: a dangling link.
+    // Recursing (rather than returning the raw target) is what resolves an
+    // absolute target such as /var/... to its real /private/var/... form.
+    const link = readlinkSync(probe);
+    // A RELATIVE target resolves against the directory that actually CONTAINS
+    // the link, not its lexical parent — they differ when that parent is
+    // itself a symlink — so the parent is made real first.
+    const base = realpathSync(dirname(probe));
+    probeReal = resolveLocation(resolvePath(base, link), depth + 1);
+  }
+  return tail.length > 0 ? joinPath(probeReal, ...tail) : probeReal;
+}
+
 export function createCrawler(opts: {
   readonly tracker: CitationTracker;
   readonly config?: CrawlerConfig;
@@ -432,20 +489,11 @@ export function createCrawler(opts: {
     // 2) Symlink-aware containment (CWE-59). The lexical check is fooled by an
     //    in-root symlink whose real target lies outside a root, so re-check the
     //    REAL path. The leaf may not exist yet (read error comes after, so
-    //    escaping paths never leak existence), so resolve the deepest existing
-    //    ancestor and re-append the missing tail.
-    let probe = abs;
-    const tail: string[] = [];
-    while (!existsSync(probe)) {
-      tail.unshift(basename(probe));
-      const parent = dirname(probe);
-      if (parent === probe) break; // reached filesystem root
-      probe = parent;
-    }
+    //    escaping paths never leak existence), so `resolveLocation` resolves
+    //    the deepest ancestor that EXISTS AS A NAME and re-appends the tail.
     let realAbs: string;
     try {
-      const probeReal = realpathSync(probe);
-      realAbs = tail.length > 0 ? joinPath(probeReal, ...tail) : probeReal;
+      realAbs = resolveLocation(abs);
     } catch (err) {
       throw new CrawlerError(`failed to resolve real path of ${abs}`, err);
     }
