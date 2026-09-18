@@ -4,8 +4,8 @@
  * and mkdtemp cwds; `--root` is always passed (CI sandboxes / multi-user
  * machines never touch the real ~/.crewhaus/watchme). Everything here is
  * fully offline: reports are deterministic-only (no judge budget), and the
- * `run` capture test uses a `local/` model whose localhost endpoint fails
- * fast without credentials or external network.
+ * `run` capture test pins its `local/` model to a dead loopback port, so the
+ * model call is refused without credentials or external network.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import {
@@ -417,9 +417,14 @@ describe("crewhaus watchme (design/watch-me.md §11)", () => {
   test("run with a watchme-enabled spec writes the .events.jsonl sibling", async () => {
     const harness = newTempDir("run");
     const home = newTempDir("home");
-    // A `local/` model resolves without credentials; its localhost endpoint
-    // fails fast (connection refused / unknown model), which still exercises
-    // the capture tap — bus-only kinds flow before/around the model call.
+    // A `local/` model resolves without credentials. The endpoint is pinned
+    // with the `local/<model>@<url>` grammar rather than left to default to
+    // Ollama's 11434: nothing can be listening on port 1 without root, so the
+    // call is ALWAYS refused instead of being served by whatever the developer
+    // happens to have running. A live listener would perform a real inference
+    // with no client timeout and blow the budget as an opaque runner timeout.
+    // The refusal still exercises the capture tap — bus-only kinds flow
+    // before and around the model call.
     writeFileSync(
       join(harness, "crewhaus.yaml"),
       [
@@ -428,7 +433,7 @@ describe("crewhaus watchme (design/watch-me.md §11)", () => {
         "watchme:",
         "  enabled: true",
         "agent:",
-        "  model: local/llama3.2",
+        "  model: local/llama3.2@http://127.0.0.1:1/v1",
         "  instructions: |",
         "    You are a test agent.",
         "",

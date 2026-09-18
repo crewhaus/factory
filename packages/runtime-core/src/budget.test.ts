@@ -1009,10 +1009,25 @@ describe("runChatLoop — degrade under model_tiers collapses both tiers to the 
 
 describe("runChatLoop — streaming modelLatencyMs excludes runTool spans (0.6.0 §7.9)", () => {
   test("the pool reward's latency is the model's own time; wall time stays on model_response.durationMs", async () => {
-    // Streaming pool turn: call 1 emits a tool_use whose tool sleeps; call 2
-    // returns text. The observation recorded for call 1 must be shorter
-    // than that call's wall duration (the tool span is excluded), while the
+    // Streaming pool turn: call 1 emits a tool_use whose tool burns time; call
+    // 2 returns text. The observation recorded for call 1 must be shorter than
+    // that call's wall duration (the tool span is excluded), while the
     // tool-free call 2 records its wall span unchanged.
+    //
+    // Both figures compared below are `performance.now()` samples taken at
+    // DIFFERENT points of one fold — `model_response.durationMs` before the
+    // publish, the observation's `latencyMs` after it — so against the real
+    // clock the tool-free call reads latency = wall + whatever elapsed in
+    // between. That gap is only tens of microseconds idle, but a scheduling
+    // quantum or a GC pause on a loaded runner pushes it past any fixed
+    // tolerance. So the test owns the clock: `performance.now` reads a
+    // counter that ONLY the scripted adapter and the scripted tool move,
+    // which makes each span an exact figure and the assertions equalities
+    // instead of a race. Production never sees this — the runtime keeps
+    // reading the global, whatever it is.
+    const MODEL_MS = 100; // charged by the adapter, once per model call
+    const TOOL_MS = 40; // charged by the tool, mid-stream, inside its span
+    const clock = { nowMs: 1_000 };
     const observations: Array<{
       readonly model: string;
       readonly obs: { readonly latencyMs: number; readonly success: boolean };
@@ -1026,42 +1041,72 @@ describe("runChatLoop — streaming modelLatencyMs excludes runTool spans (0.6.0
       snapshot: () => [],
       compact: () => undefined,
     };
-    const adapter = scriptedToolLoopAdapter("anthropic", USAGE, ["tool", "text"]);
+    // The scripted stream, wrapped so the model's own time is charged once the
+    // loop starts consuming the response: after `t0Model`, before the fold.
+    const scripted = scriptedToolLoopAdapter("anthropic", USAGE, ["tool", "text"]);
+    const adapter: ProviderAdapter & { requests: ProviderRequest[] } = {
+      ...scripted,
+      stream(req: ProviderRequest): AsyncIterable<StreamEvent> {
+        const inner = scripted.stream(req);
+        return (async function* () {
+          clock.nowMs += MODEL_MS;
+          yield* inner;
+        })();
+      },
+    };
+    // Burns virtual time instead of sleeping: the span tracker reads the clock
+    // on `enter`/`exit`, so this tool's mid-stream span is exactly TOOL_MS.
+    const clockTool = buildTool({
+      name: "noop",
+      description: "does nothing",
+      inputSchema: z.object({}),
+      readOnly: true,
+      execute: async () => {
+        clock.nowMs += TOOL_MS;
+        return "ok";
+      },
+    });
     const runContext = createRunContext();
     const seen: TraceEvent[] = [];
     runContext.eventBus.subscribe((e) => {
       seen.push(e);
     });
-    await runChatLoop({
-      model: SONNET,
-      instructions: "test",
-      _adapter: adapter,
-      modelPool: { candidates: [{ model: SONNET, tags: ["cheap", "strong"] }], policy: "static" },
-      _poolAdapters: new Map<string, ProviderAdapter>([[SONNET, adapter]]),
-      _scoreboard: spy,
-      tools: [noopTool({ delayMs: 40 })],
-      permissionMode: "bypass",
-      streaming: true,
-      singleTurn: true,
-      seedMessages: [{ role: "user", content: "use the tool" }],
-      installSigintHandler: false,
-      spinner: false,
-      runContext,
-    });
+    const realNow = performance.now.bind(performance);
+    performance.now = () => clock.nowMs;
+    try {
+      await runChatLoop({
+        model: SONNET,
+        instructions: "test",
+        _adapter: adapter,
+        modelPool: { candidates: [{ model: SONNET, tags: ["cheap", "strong"] }], policy: "static" },
+        _poolAdapters: new Map<string, ProviderAdapter>([[SONNET, adapter]]),
+        _scoreboard: spy,
+        tools: [clockTool],
+        permissionMode: "bypass",
+        streaming: true,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "use the tool" }],
+        installSigintHandler: false,
+        spinner: false,
+        runContext,
+      });
+    } finally {
+      performance.now = realNow;
+    }
     const responses = seen.filter((e): e is ModelResponseEvent => e.kind === "model_response");
     expect(responses).toHaveLength(2);
     expect(observations).toHaveLength(2);
     expect(observations.every((o) => o.obs.success)).toBe(true);
-    // Call 1 ran a tool mid-stream: its wall duration includes the tool
-    // span, its recorded latency does not.
+    // Call 1 ran a tool mid-stream: its wall duration includes the tool span,
+    // its recorded latency is exactly that span shorter.
     const wall1 = responses[0]?.durationMs ?? 0;
     const lat1 = observations[0]?.obs.latencyMs ?? Number.NaN;
-    expect(lat1).toBeGreaterThanOrEqual(0);
-    expect(lat1).toBeLessThan(wall1);
-    // Call 2 ran no tool: nothing is deducted (latency ≤ wall, same instrument).
+    expect(wall1).toBe(MODEL_MS + TOOL_MS);
+    expect(lat1).toBe(MODEL_MS);
+    // Call 2 ran no tool: nothing is deducted — same instrument, same number.
     const wall2 = responses[1]?.durationMs ?? 0;
     const lat2 = observations[1]?.obs.latencyMs ?? Number.NaN;
-    expect(lat2).toBeGreaterThanOrEqual(0);
-    expect(lat2).toBeLessThanOrEqual(wall2 + 1);
+    expect(wall2).toBe(MODEL_MS);
+    expect(lat2).toBe(wall2);
   });
 });

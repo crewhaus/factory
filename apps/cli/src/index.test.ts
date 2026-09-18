@@ -2150,12 +2150,13 @@ describe("crewhaus doctor — audit-log integrity (item 34)", () => {
 });
 
 describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () => {
-  // The UTC quarter the CLI must resolve for --period current, computed with
-  // the same arithmetic the implementation uses (compliance-schedule.ts).
-  const expectedQuarter = (() => {
-    const now = new Date();
-    return `${now.getUTCFullYear()}-Q${Math.floor(now.getUTCMonth() / 3) + 1}`;
-  })();
+  // The UTC quarter label for an instant — the same arithmetic the
+  // implementation uses (compliance-schedule.ts), deliberately duplicated so
+  // this CLI test keeps an oracle independent of the code under test.
+  // NOT evaluated at file load: the CLI resolves `current` from its OWN clock
+  // inside the spawn, so the expectation must be read around that call.
+  const utcQuarter = (at: Date): string =>
+    `${at.getUTCFullYear()}-Q${Math.floor(at.getUTCMonth() / 3) + 1}`;
 
   test("--help documents --period current, --all-frameworks, and --fail-on-empty", async () => {
     const result = await runCli(["compliance", "evidence", "--help"]);
@@ -2169,14 +2170,31 @@ describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () 
 
   test("--period current resolves to the current UTC quarter in output + bundle path", async () => {
     await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
+    // The CLI reads its own clock inside the spawn. Sampling ours once when
+    // this 3500-line file loads raced that read: a run collected just before a
+    // UTC quarter boundary (Jan/Apr/Jul/Oct 1, 00:00Z) and reaching this test
+    // just after it compared 2026-Q3 against the CLI's 2026-Q4, failing both
+    // the stdout and the bundle-path assertion. Bracket the call instead — the
+    // child's clock read lies between these two samples, so the only labels it
+    // can legally resolve are the bracket's endpoints (the same label except
+    // in the run that genuinely crosses a boundary, where both are current).
+    const before = utcQuarter(new Date());
     const result = await runCli(
       ["compliance", "evidence", "--framework", "soc2", "--period", "current"],
       { cwd: tmp },
     );
+    const after = utcQuarter(new Date());
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain(`soc2/CC6.1 ${expectedQuarter}: 1 records`);
+    // Quarter-shaped, so the literal "current" passed through unresolved fails
+    // here rather than silently matching.
+    const resolved = /^soc2\/CC6\.1 (\d{4}-Q[1-4]): 1 records/m.exec(result.stdout)?.[1];
+    expect(resolved).toBeDefined();
+    // ...and it is the quarter the wall clock was in during the call: a stale,
+    // hardcoded, or local-time-derived label is outside the bracket.
+    expect([before, after]).toContain(resolved);
+    // ...and the bundle is filed under that same resolved label.
     expect(
-      existsSync(join(tmp, ".crewhaus", "compliance", "soc2", "CC6.1", `${expectedQuarter}.json`)),
+      existsSync(join(tmp, ".crewhaus", "compliance", "soc2", "CC6.1", `${resolved}.json`)),
     ).toBe(true);
   });
 

@@ -203,18 +203,81 @@ class FileSystemAdapter implements CheckpointStoreAdapter {
     const dir = this.dir(graphRunId);
     if (!existsSync(dir)) return [];
     const files = readdirSync(dir).filter((f) => f.startsWith("ckpt_") && f.endsWith(".json"));
-    // Order by mtime ascending — file-backed adapter has no other notion of insertion order.
-    const withStat = files.map((f) => {
+    // Each checkpoint with the mtime of the file holding it. Both orderings
+    // below read from this: the parent-chain walk uses the record, the
+    // fall-back comparison uses the stat.
+    const rows = files.map((f) => {
       const full = join(dir, f);
-      return { name: f, mtimeMs: statSync(full).mtimeMs, full };
+      const checkpoint = JSON.parse(readFileSync(full, "utf8")) as Checkpoint;
+      return { mtimeMs: statSync(full).mtimeMs, checkpoint };
     });
-    withStat.sort((a, b) => a.mtimeMs - b.mtimeMs);
+
+    /**
+     * Fall-back order when the chain below cannot decide: mtime, then the
+     * record's own `createdAt`, then id.
+     *
+     * mtime alone is not an order. Linux stamps it from the coarse clock, so
+     * checkpoints written inside one tick share an mtime and a sort with no
+     * tiebreak falls through to `readdirSync` order over random `ckpt_<hex>`
+     * names — unstable between runs, and invisible on macOS, whose APFS keeps
+     * sub-millisecond mtimes.
+     */
+    const bySettledOrder = (
+      a: { mtimeMs: number; checkpoint: Checkpoint },
+      b: { mtimeMs: number; checkpoint: Checkpoint },
+    ): number =>
+      a.mtimeMs - b.mtimeMs ||
+      Date.parse(a.checkpoint.createdAt) - Date.parse(b.checkpoint.createdAt) ||
+      (a.checkpoint.id < b.checkpoint.id ? -1 : a.checkpoint.id > b.checkpoint.id ? 1 : 0);
+
+    /**
+     * Order by the parent chain, which is the only record of insertion order
+     * the store actually keeps.
+     *
+     * `parentCheckpointId` links each checkpoint to the one before it, so a
+     * walk from the entry node reproduces the order the engine wrote in —
+     * exactly, and without consulting a clock at all. Siblings (a branch) and
+     * any checkpoint whose parent is missing settle by the comparison above,
+     * so the result is always total. A malformed store that cycles is walked
+     * once per node and the remainder appended, rather than hanging.
+     */
+    const byId = new Map(rows.map((r) => [r.checkpoint.id, r]));
+    const children = new Map<string, Array<{ mtimeMs: number; checkpoint: Checkpoint }>>();
+    const roots: Array<{ mtimeMs: number; checkpoint: Checkpoint }> = [];
+    for (const row of rows) {
+      const parent = row.checkpoint.parentCheckpointId;
+      if (parent === undefined || !byId.has(parent)) {
+        roots.push(row);
+        continue;
+      }
+      const siblings = children.get(parent);
+      if (siblings) siblings.push(row);
+      else children.set(parent, [row]);
+    }
+    for (const siblings of children.values()) siblings.sort(bySettledOrder);
+    roots.sort(bySettledOrder);
+
+    const ordered: Array<{ mtimeMs: number; checkpoint: Checkpoint }> = [];
+    const emitted = new Set<string>();
+    const stack = [...roots].reverse();
+    while (stack.length > 0) {
+      const row = stack.pop() as { mtimeMs: number; checkpoint: Checkpoint };
+      if (emitted.has(row.checkpoint.id)) continue;
+      emitted.add(row.checkpoint.id);
+      ordered.push(row);
+      const next = children.get(row.checkpoint.id);
+      if (next) for (let i = next.length - 1; i >= 0; i--) stack.push(next[i] as typeof row);
+    }
+    // Anything a cycle kept out of the walk still has to be returned.
+    for (const row of [...rows].sort(bySettledOrder)) {
+      if (!emitted.has(row.checkpoint.id)) ordered.push(row);
+    }
+
     const out: Checkpoint[] = [];
     const sinceTs = opts.since !== undefined ? Date.parse(opts.since) : Number.NEGATIVE_INFINITY;
-    for (const { full } of withStat) {
-      const c = JSON.parse(readFileSync(full, "utf8")) as Checkpoint;
-      if (Date.parse(c.createdAt) < sinceTs) continue;
-      out.push(c);
+    for (const { checkpoint } of ordered) {
+      if (Date.parse(checkpoint.createdAt) < sinceTs) continue;
+      out.push(checkpoint);
       if (opts.limit !== undefined && out.length >= opts.limit) break;
     }
     return out;

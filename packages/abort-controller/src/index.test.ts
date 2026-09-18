@@ -213,32 +213,51 @@ describe("memory-safety: collected child does not break parent abort", () => {
   // Exercises the WeakRef deref()===undefined branch in attachParent's
   // onParentAbort: an abandoned child must not pin the parent, and the parent
   // aborting after the child is collected must be a safe no-op for that child.
+  //
+  // We drive that branch instead of waiting for a real collection. JSC scans the
+  // machine stack and registers conservatively, so a stale word left by the frame
+  // that built the child can pin it through every Bun.gc(true) pass — a binary,
+  // environment-dependent outcome (JIT tier, register allocation, whatever ran
+  // earlier in the shared test process), not a timing margin a retry loop could
+  // absorb. attachParent resolves the global `WeakRef` when it links a child, so
+  // a WeakRef whose deref() is already empty makes that link behave exactly as it
+  // does once the child has been collected. The swap is installed only around the
+  // root.child() call and restored synchronously in a finally.
+  class ClearedWeakRef {
+    deref(): undefined {
+      return undefined;
+    }
+  }
+
+  function withClearedWeakRef<T>(fn: () => T): T {
+    const RealWeakRef = globalThis.WeakRef;
+    globalThis.WeakRef = ClearedWeakRef as unknown as WeakRefConstructor;
+    try {
+      return fn();
+    } finally {
+      globalThis.WeakRef = RealWeakRef;
+    }
+  }
+
   test("aborting a parent whose child was GC'd does not throw", () => {
     const root = createAbortTree();
 
-    // Create a child but retain only a WeakRef to its signal so the underlying
-    // AbortController is eligible for collection once this helper returns.
-    const probe = ((): WeakRef<AbortSignal> => {
-      const child = root.child();
-      return new WeakRef(child.signal);
-    })();
+    // The parent→child link created here holds an already-empty WeakRef, so the
+    // parent sees this child exactly as it sees one the GC has reclaimed.
+    const child = withClearedWeakRef(() => root.child());
 
-    // Bun.gc(true) performs a synchronous, deterministic full GC.
-    let collected = false;
-    for (let i = 0; i < 20 && !collected; i++) {
-      Bun.gc(true);
-      collected = probe.deref() === undefined;
-    }
+    // The parent still holds one listener for the (now unreachable) child.
+    expect(getEventListeners(root.signal, "abort").length).toBe(1);
 
-    // The parent still holds one listener for the (now possibly collected) child.
-    // Aborting must never throw, regardless of whether collection happened.
+    // Aborting must never throw, and must still abort the parent itself.
     expect(() => root.abort(new Error("after-collect"))).not.toThrow();
     expect(root.signal.aborted).toBe(true);
 
-    // Bun reliably collects the unreferenced controller; assert we actually hit
-    // the deref()===undefined path. If a future runtime cannot collect here,
-    // this assertion documents the regression rather than silently passing.
-    expect(collected).toBe(true);
+    // Proof that the deref()===undefined path is what ran: a child the parent
+    // could still deref would have been aborted by the cascade. This replaces the
+    // old `expect(collected).toBe(true)` GC probe and fails loudly — rather than
+    // silently passing — if the seam ever stops reaching attachParent's WeakRef.
+    expect(child.signal.aborted).toBe(false);
   });
 });
 

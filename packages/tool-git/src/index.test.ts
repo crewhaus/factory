@@ -1125,11 +1125,25 @@ describe("boundedness", () => {
   });
 
   test("a deadline hit while opening the repository is reported as a timeout", async () => {
-    // 1ms cannot survive git's process startup, so the very first probe dies on
-    // the deadline — and must say so, not claim this is not a repository.
-    const out = String(await gitLog.execute({ cwd: "repo", timeout: 1 }));
-    expect(out).toContain("timed out");
-    expect(out).not.toContain("not a git repository");
+    // The probe `openRepo` runs is a plain `git rev-parse --show-toplevel`, so
+    // there is no alias to stall it the way the two tests above stall theirs —
+    // and a tiny deadline on the real binary is a race rather than a test: a
+    // quick machine finishes the probe first and the tool returns a perfectly
+    // good log. CI did exactly that. Put a git that CANNOT return early ahead
+    // of the real one, so the deadline is guaranteed to be what ends the probe.
+    const shimDir = join(workspace, "slow-git");
+    mkdirSync(shimDir);
+    writeFileSync(join(shimDir, "git"), "#!/bin/sh\nexec sleep 30\n", { mode: 0o755 });
+    const savedPath = process.env["PATH"];
+    process.env["PATH"] = `${shimDir}:${savedPath ?? ""}`;
+    try {
+      const out = String(await gitLog.execute({ cwd: "repo", timeout: 50 }));
+      expect(out).toContain("timed out");
+      expect(out).not.toContain("not a git repository");
+    } finally {
+      if (savedPath === undefined) Reflect.deleteProperty(process.env, "PATH");
+      else process.env["PATH"] = savedPath;
+    }
   });
 
   test("output is capped, and the cap is reported rather than silently applied", async () => {

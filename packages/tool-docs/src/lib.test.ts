@@ -36,7 +36,7 @@ import {
   stripHtml,
 } from "./lib/mail";
 import { assertSafePartNames, relsPathFor, resolvePartPath } from "./lib/ooxml";
-import { parsePdf } from "./lib/pdf";
+import { type PdfStream, parsePdf } from "./lib/pdf";
 import { extractPageText, parseToUnicodeCMap } from "./lib/pdf-text";
 import { buildPdf, parsePageRange } from "./lib/pdf-write";
 import { readPptx } from "./lib/pptx";
@@ -1452,12 +1452,17 @@ describe("page selections and form XObjects are bounded", () => {
   });
 
   test("a content stream naming one form thousands of times decodes it once", () => {
-    // 20 000 `Do` operators over the same form. Without a cache each one
-    // re-inflates the form's stream; the text is drawn 20 000 times either
-    // way, so this asserts the time rather than the output.
+    // Thousands of `Do` operators over the same form. Without a cache each
+    // one re-inflates the form's stream; the text is drawn once per `Do`
+    // either way, so the cache shows up in the DECODE COUNT and never in the
+    // output. Counting it is what keeps this test off the clock: the earlier
+    // version timed the call against a 10s bound that the runner's own 5s
+    // default killed it before it could ever read — green on an idle machine,
+    // an opaque timeout on a loaded one, and CI runs ~220 suites at once.
+    const repeats = 2_000;
     const draw = "BT /F1 12 Tf 72 700 Td (x) Tj ET";
     const form = `5 0 obj\n<</Type /XObject /Subtype /Form /Length ${draw.length}>>\nstream\n${draw}\nendstream\nendobj`;
-    const content = Array.from({ length: 20_000 }, () => "/Fm Do").join("\n");
+    const content = Array.from({ length: repeats }, () => "/Fm Do").join("\n");
     const src = [
       "%PDF-1.4",
       "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj",
@@ -1471,9 +1476,21 @@ describe("page selections and form XObjects are bounded", () => {
     const doc = parsePdf(utf8(src));
     const page = doc.pages()[0];
     if (page === undefined) throw new Error("fixture has no page");
-    const started = Date.now();
+    // Count every stream this extraction inflates. `extractPageText` reads
+    // `doc.decode` off the document on each `Do`, so wrapping it here needs
+    // no seam in the library.
+    const decodes = new Map<PdfStream, number>();
+    const decode = doc.decode.bind(doc);
+    doc.decode = (stream) => {
+      decodes.set(stream, (decodes.get(stream) ?? 0) + 1);
+      return decode(stream);
+    };
     const result = extractPageText(doc, page);
     expect(result.hasTextLayer).toBe(true);
-    expect(Date.now() - started).toBeLessThan(10_000);
-  });
+    // The form is still DRAWN once per `Do` — the cache must not swallow the
+    // repeats — while exactly two streams are inflated, the page's content
+    // and the form, each exactly once. Lose the cache and the second is 2000.
+    expect(result.text.length).toBe(repeats);
+    expect([...decodes.values()]).toEqual([1, 1]);
+  }, 20_000);
 });
