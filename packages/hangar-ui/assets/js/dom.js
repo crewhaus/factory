@@ -142,21 +142,64 @@ export function toast(message, kind = "error") {
   return node;
 }
 
-/** Click-to-copy button (clipboard API; silently no-ops when unavailable). */
+/**
+ * Copy `text`, falling back to the old selection trick.
+ *
+ * `navigator.clipboard` is a secure-context API. `127.0.0.1` counts as
+ * secure, so on the loopback console it always works — and over
+ * `http://192.168.x.x`, which is what `crewhaus hangar --lan` serves, the
+ * whole object is `undefined` and every copy button in the console reads
+ * "copy failed". That is invisible until someone opens the console from a
+ * phone, which is exactly who cannot retype a harness directory by hand.
+ *
+ * The fallback is `document.execCommand("copy")` over a throwaway textarea:
+ * deprecated, still implemented everywhere, and not gated on a secure
+ * context. The textarea is positioned off-screen rather than hidden because
+ * a `display: none` element cannot hold a selection.
+ */
+async function writeClipboard(text) {
+  if (navigator.clipboard !== undefined) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Permission refused, or a non-secure context that still exposes the
+      // object. Fall through rather than giving up.
+    }
+  }
+  const scratch = el("textarea");
+  scratch.value = text;
+  scratch.setAttribute("readonly", "readonly");
+  scratch.setAttribute("aria-hidden", "true");
+  // Off-screen rather than hidden: a `display: none` element cannot hold a
+  // selection, and `opacity: 0` alone would still scroll the page.
+  scratch.style.position = "fixed";
+  scratch.style.top = "-1000px";
+  scratch.style.opacity = "0";
+  document.body.appendChild(scratch);
+  try {
+    scratch.select();
+    scratch.setSelectionRange(0, text.length);
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    scratch.remove();
+  }
+}
+
+/** Click-to-copy button. Works on the loopback console and over a LAN
+ *  address alike — see {@link writeClipboard}. */
 export function copyBtn(value, label = "copy") {
   const btn = el("button", { class: "btn btn-ghost btn-copy", type: "button", text: label });
   btn.addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(value);
-      btn.textContent = "copied";
-      btn.classList.add("ok");
-      setTimeout(() => {
-        btn.textContent = label;
-        btn.classList.remove("ok");
-      }, 1200);
-    } catch {
-      btn.textContent = "copy failed";
-    }
+    const copied = await writeClipboard(value);
+    btn.textContent = copied ? "copied" : "copy failed";
+    if (copied) btn.classList.add("ok");
+    setTimeout(() => {
+      btn.textContent = label;
+      btn.classList.remove("ok");
+    }, 1200);
   });
   return btn;
 }

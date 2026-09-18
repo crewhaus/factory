@@ -2,14 +2,15 @@ import { describe, expect, test } from "bun:test";
 import { TARGET_SHAPES } from "@crewhaus/docker-images";
 
 import {
+  HTTP_SHAPES,
   HelmChartError,
   chartRoot,
   defaultValues,
-  isDaemonShape,
   readTemplate,
   renderChart,
   renderContext,
   renderTemplate,
+  servesHttp,
   templateFiles,
   validateValues,
 } from "./index";
@@ -76,23 +77,32 @@ describe("defaultValues + validateValues", () => {
   });
 });
 
-describe("isDaemonShape", () => {
-  test("daemon shapes are channel/managed/crew/voice/browser", () => {
-    expect(isDaemonShape("channel")).toBe(true);
-    expect(isDaemonShape("managed")).toBe(true);
-    expect(isDaemonShape("crew")).toBe(true);
-    expect(isDaemonShape("voice")).toBe(true);
-    expect(isDaemonShape("browser")).toBe(true);
+describe("servesHttp", () => {
+  test("only channel and managed serve HTTP", () => {
+    // The two shapes whose compiled bundle contains a `Bun.serve` and a
+    // `/healthz` route. The list used to include crew, voice and browser
+    // as well, which gave them `httpGet` probes against a socket their
+    // bundles never open — a pod that can never become ready.
+    expect(servesHttp("channel")).toBe(true);
+    expect(servesHttp("managed")).toBe(true);
+  });
+
+  test("long-running but socket-less shapes take the exec probe instead", () => {
+    // These ARE daemons; they just serve no HTTP. voice is a stdin/JSONL
+    // loop and crew consumes a brief on stdin and exits.
+    expect(servesHttp("crew")).toBe(false);
+    expect(servesHttp("voice")).toBe(false);
+    expect(servesHttp("browser")).toBe(false);
   });
 
   test("non-daemon shapes do not get a Service rendered", () => {
-    expect(isDaemonShape("cli")).toBe(false);
-    expect(isDaemonShape("workflow")).toBe(false);
-    expect(isDaemonShape("graph")).toBe(false);
-    expect(isDaemonShape("pipeline")).toBe(false);
-    expect(isDaemonShape("research")).toBe(false);
-    expect(isDaemonShape("batch")).toBe(false);
-    expect(isDaemonShape("eval")).toBe(false);
+    expect(servesHttp("cli")).toBe(false);
+    expect(servesHttp("workflow")).toBe(false);
+    expect(servesHttp("graph")).toBe(false);
+    expect(servesHttp("pipeline")).toBe(false);
+    expect(servesHttp("research")).toBe(false);
+    expect(servesHttp("batch")).toBe(false);
+    expect(servesHttp("eval")).toBe(false);
   });
 });
 
@@ -195,6 +205,71 @@ describe("renderTemplate primitives (T1)", () => {
         allOff,
       ),
     ).toBe("N");
+  });
+});
+
+describe("the container port is one number, in one place", () => {
+  test("the HTTP-shape list is identical in the TS and in every template", () => {
+    // It used to live in four places with nothing checking they agreed, so
+    // narrowing one would have silently disagreed with the other three.
+    const expected = `list ${HTTP_SHAPES.map((s) => `"${s}"`).join(" ")}`;
+    for (const file of ["deployment.yaml", "service.yaml", "ingress.yaml"]) {
+      const lists = [...readTemplate(file).matchAll(/list (?:"[a-z-]+" ?)+/g)].map((m) =>
+        m[0].trim(),
+      );
+      // deployment.yaml gates twice — the PORT env and the ports/probes
+      // block — so assert on every occurrence rather than assuming one.
+      expect(lists.length).toBeGreaterThan(0);
+      expect(`${file}: ${[...new Set(lists)].join(" | ")}`).toBe(`${file}: ${expected}`);
+    }
+  });
+
+  test("PORT is emitted from service.targetPort, so the bind follows the probe", () => {
+    // The image bakes its own ENV PORT (3000 for channel, 8080 for managed).
+    // That used to win, leaving managed bound to 8080 while kubelet dialled
+    // 3000 — refused connections and a restart loop. The chart now names the
+    // port once and everything downstream follows it.
+    for (const target of ["channel", "managed"] as const) {
+      const out = renderChart({
+        ...defaultValues(),
+        target,
+        service: { type: "ClusterIP", port: 80, targetPort: 9137 },
+      });
+      const deployment = out["deployment.yaml"] ?? "";
+      expect(deployment).toContain("- name: PORT");
+      expect(deployment).toContain('value: "9137"');
+      expect(deployment).toContain("containerPort: 9137");
+      // The probes dial the named port, which resolves to that containerPort.
+      expect(deployment).toContain("port: http");
+      expect(out["service.yaml"] ?? "").toContain("targetPort: http");
+    }
+  });
+
+  test("a socket-less shape gets no PORT, no Service and an exec probe", () => {
+    // crew, voice and browser run continuously but open no socket, so an
+    // httpGet probe could never pass. They take `doctor --liveness`.
+    for (const target of ["crew", "voice", "browser"] as const) {
+      const deployment = renderChart({ ...defaultValues(), target })["deployment.yaml"] ?? "";
+      expect(`${target}: ${deployment.includes("- name: PORT")}`).toBe(`${target}: false`);
+      expect(`${target}: ${deployment.includes("httpGet")}`).toBe(`${target}: false`);
+      expect(deployment).toContain('"doctor", "--liveness"');
+      expect(renderChart({ ...defaultValues(), target })["service.yaml"] ?? "").toBe("");
+    }
+  });
+
+  test("validateValues range-checks targetPort, including the unprivileged floor", () => {
+    const withPort = (targetPort: number) => ({
+      ...defaultValues(),
+      service: { type: "ClusterIP" as const, port: 80, targetPort },
+    });
+    expect(() => validateValues(withPort(8080))).not.toThrow();
+    expect(() => validateValues(withPort(1024))).not.toThrow();
+    // The pod runs as uid 10001 with every capability dropped, so a
+    // privileged port would fail as a crash loop rather than a bad value.
+    expect(() => validateValues(withPort(80))).toThrow(/unprivileged/);
+    expect(() => validateValues(withPort(0))).toThrow(HelmChartError);
+    expect(() => validateValues(withPort(70000))).toThrow(HelmChartError);
+    expect(() => validateValues(withPort(8080.5))).toThrow(HelmChartError);
   });
 });
 

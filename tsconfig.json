@@ -248,6 +248,7 @@
     { "path": "./packages/hangar-ui" },
     { "path": "./packages/hangar-server" },
     { "path": "./packages/service-setup" },
+    { "path": "./packages/qr-code" },
     { "path": "./apps/cli" }
   ]
 }

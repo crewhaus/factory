@@ -48,6 +48,16 @@
  * `--read-only` / `--read-only-locked`, the screen-share posture the server's
  * 403 remedy tells operators to restart into.
  *
+ * `--lan` is the phone door: it binds the address `lan-address.ts` picks for
+ * this machine and prints a QR code (`@crewhaus/qr-code`, imported
+ * STATICALLY for the same compiled-binary reason as the UI assets) that
+ * encodes the same `/#t=<token>` url the summary already prints. It is its
+ * own opt-in rather than a second `--host`: typing it is exactly the
+ * deliberate, visible act HM-201 asks for, so the environment variable is
+ * not demanded on top. Nothing else is relaxed — auth stays mandatory, and
+ * the QR carries the bearer token, which is why the boot summary says so out
+ * loud and the docs pair it with `--read-only` for a screen share.
+ *
  * Bad arguments throw plain `Error`s; the entry file routes them through
  * `die()` like `harness` does.
  */
@@ -60,6 +70,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { networkInterfaces } from "node:os";
 import { join, resolve } from "node:path";
 import {
   DEFAULT_HANGAR_PORT,
@@ -79,7 +90,14 @@ import {
   runManagerShutdown,
   shutdownReportLines,
 } from "@crewhaus/harness-supervisor";
-import { REMOTE_BIND_ENV, remoteBindRefusal } from "./remote-bind";
+import { encodeQr, renderQrLines, renderedWidth } from "@crewhaus/qr-code";
+import {
+  type InterfaceMap,
+  type LanAddress,
+  NO_LAN_ADDRESS_REFUSAL,
+  pickLanAddress,
+} from "./lan-address";
+import { REMOTE_BIND_ENV, isLoopbackHost, remoteBindRefusal } from "./remote-bind";
 import { cliVersion } from "./version";
 
 /** What a verb returns: lines for stdout + the process exit code. `serve`
@@ -121,23 +139,43 @@ export type HangarCommandOptions = {
   /** Hard cap on waiting for any one child to confirm its exit; default the
    *  supervisor package's `SHUTDOWN_DEADLINE_MS`. */
   readonly shutdownDeadlineMs?: number;
+  /** This machine's network interfaces, for `--lan`. Injected so a test can
+   *  choose the fleet's address without depending on the host it runs on;
+   *  defaults to `os.networkInterfaces()`. */
+  readonly networkInterfaces?: () => InterfaceMap;
+  /** Terminal width used to decide whether a QR code will fit; defaults to
+   *  `process.stdout.columns`, and an unknown width is treated as wide
+   *  enough (a redirected stdout has no columns and no reader to confuse). */
+  readonly columns?: number | undefined;
+  /** Whether to wrap the QR code in the SGR pair that pins its contrast.
+   *  Defaults to "stdout is a TTY and NO_COLOR is unset". */
+  readonly color?: boolean;
 };
 
 const HANGAR_USAGE_LINES: readonly string[] = [
   "usage:",
   "  crewhaus hangar [serve]                      boot the Hangar manager console (the local",
-  "       [--port <n>] [--host <h>]               web UI over the machine-wide harness",
-  "       [--no-auth] [--no-open] [--smoke]       registry) and open it in the browser",
-  "       [--read-only] [--read-only-locked]",
+  "       [--port <n>] [--host <h>] [--lan]       web UI over the machine-wide harness",
+  "       [--no-auth] [--no-open] [--no-qr]       registry) and open it in the browser",
+  "       [--smoke] [--read-only]",
+  "       [--read-only-locked]",
   "  crewhaus hangar status [--json]              lock/port/registry/token report — works",
   "                                               without a running server",
   "  crewhaus hangar open                         print + open the running console's URL",
+  "  crewhaus hangar qr [--ascii] [--no-color]    reprint the running console's QR code",
   "",
   "  The console binds 127.0.0.1:4200 by default and hands its bearer token",
   "  to the browser as a URL #fragment (never a query string). --host binds",
   "  another interface: it REQUIRES auth and, because the console is machine",
   `  control over plain HTTP, also ${REMOTE_BIND_ENV}=1.`,
   "  --no-auth is loopback-dev only.",
+  "  --lan binds this machine's LAN address instead, and prints a QR code to",
+  "  scan with a phone on the same network. It is its own opt-in — typing it",
+  `  is the deliberate act ${REMOTE_BIND_ENV} asks for — but it is the same`,
+  "  exposure: machine control over plain HTTP, with a bearer token as the",
+  "  only boundary. The QR carries that token, so treat the code like the",
+  "  credential it is, and pair it with --read-only for a screen share.",
+  "  --no-qr boots the LAN console without printing one.",
   "  --read-only boots the console with every mutating route refused (403) —",
   "  the screen-share posture; it can still be lifted from the UI. Add",
   "  --read-only-locked when the person driving is not the person who owns",
@@ -407,14 +445,21 @@ type ServeFlags = {
   /** …and refuse the un-toggle too, so the mode cannot be lifted over the
    *  wire by whoever is driving. Implies {@link ServeFlags.readOnly}. */
   readonly readOnlyLocked: boolean;
+  /** Bind this machine's LAN address and print a scannable QR code. Its own
+   *  HM-201 opt-in; see {@link resolveBindHost}. */
+  readonly lan: boolean;
+  /** Suppress the QR code a LAN bind would otherwise print. */
+  readonly noQr: boolean;
 };
 
 function parseServeFlags(argv: readonly string[]): ServeFlags {
   const args = parseVerbArgs("serve", argv, {
     port: "value",
     host: "value",
+    lan: "boolean",
     "no-auth": "boolean",
     "no-open": "boolean",
+    "no-qr": "boolean",
     smoke: "boolean",
     "read-only": "boolean",
     "read-only-locked": "boolean",
@@ -438,12 +483,32 @@ function parseServeFlags(argv: readonly string[]): ServeFlags {
   const flags: ServeFlags = {
     port,
     host: typeof hostFlag === "string" ? hostFlag : undefined,
+    lan: args.flags.get("lan") === true,
     noAuth: args.flags.get("no-auth") === true,
     noOpen: args.flags.get("no-open") === true,
+    noQr: args.flags.get("no-qr") === true,
     smoke: args.flags.get("smoke") === true,
     readOnly: readOnlyLocked || args.flags.get("read-only") === true,
     readOnlyLocked,
   };
+  if (flags.lan && flags.host !== undefined) {
+    throw new Error(
+      "hangar serve: --lan picks this machine's LAN address for you and --host names one yourself — pass one or the other",
+    );
+  }
+  // --lan resolves to a non-loopback host, so it inherits every refusal
+  // --host carries. Stated separately because the host is not known until
+  // the interfaces are read, which happens after this pure-argv parse.
+  if (flags.lan && flags.noAuth) {
+    throw new Error(
+      "hangar serve: --lan exposes the console beyond loopback and REQUIRES auth — drop --no-auth",
+    );
+  }
+  if (flags.lan && flags.smoke) {
+    throw new Error(
+      "hangar serve: --smoke self-checks a throwaway loopback console — it cannot combine with --lan",
+    );
+  }
   if (flags.host !== undefined && flags.noAuth) {
     throw new Error(
       "hangar serve: --host exposes the console beyond loopback and REQUIRES auth — drop --no-auth",
@@ -524,13 +589,107 @@ async function runSmokeChecks(server: HangarServer, write: (line: string) => voi
   return 0;
 }
 
+/**
+ * The host `--lan` binds.
+ *
+ * A concrete address rather than `0.0.0.0`, for two reasons. The server
+ * composes its advertised url by interpolating whatever it was handed, so a
+ * wildcard bind yields the literal `http://0.0.0.0:4200` — a string that is
+ * written into the lock file, printed by `status`, fetched by `open`, and
+ * openable by nothing. And a wildcard also binds every tunnel and bridge the
+ * machine happens to have, which is a wider exposure than "my LAN" asks for.
+ *
+ * `--lan` is its own HM-201 opt-in: typing it IS the deliberate, visible act
+ * that {@link REMOTE_BIND_ENV} exists to require, so the refusal is not
+ * applied on top of it. What is NOT relaxed is anything else — auth is still
+ * mandatory (refused in the parser), and a bare `--host` still needs the
+ * variable.
+ */
+function resolveBindHost(flags: ServeFlags, opts: HangarCommandOptions): LanAddress | undefined {
+  if (!flags.lan) return undefined;
+  const interfaces = (opts.networkInterfaces ?? (() => networkInterfaces() as InterfaceMap))();
+  const chosen = pickLanAddress(interfaces);
+  if (chosen === undefined) throw new Error(NO_LAN_ADDRESS_REFUSAL);
+  return chosen;
+}
+
+/** Whether to pin the QR's contrast with escape codes. A terminal has no
+ *  fixed background, so without them the symbol renders inverted on a light
+ *  theme; with stdout redirected there is no terminal to pin and no reader
+ *  to confuse, so they are dropped. */
+function wantsColor(
+  opts: HangarCommandOptions,
+  env: Readonly<Record<string, string | undefined>>,
+): boolean {
+  if (opts.color !== undefined) return opts.color;
+  const noColor = env["NO_COLOR"];
+  if (noColor !== undefined && noColor !== "") return false;
+  return process.stdout.isTTY === true;
+}
+
+/** Columns available for the QR; `undefined` (a pipe) counts as unlimited. */
+function terminalColumns(opts: HangarCommandOptions): number | undefined {
+  if (opts.columns !== undefined) return opts.columns;
+  const columns = process.stdout.columns;
+  return typeof columns === "number" && columns > 0 ? columns : undefined;
+}
+
+export type QrBlockOptions = {
+  readonly ascii?: boolean;
+  readonly color?: boolean;
+  readonly columns?: number | undefined;
+  /** The line printed above the code. */
+  readonly caption?: string;
+};
+
+/**
+ * A caption plus the rendered symbol, or a note explaining why there isn't
+ * one.
+ *
+ * The width check is the whole reason this returns lines rather than
+ * printing: a symbol wider than the terminal wraps, and a wrapped QR code is
+ * not a degraded QR code, it is a picture. Saying so — with both numbers and
+ * the command that reprints it — beats emitting something unscannable.
+ */
+export function qrBlockLines(url: string, options: QrBlockOptions = {}): string[] {
+  const qr = encodeQr(url, { ecLevel: "M" });
+  const renderOptions = {
+    color: options.color ?? true,
+    ...(options.ascii === true ? { ascii: true } : {}),
+  };
+  const width = renderedWidth(qr, renderOptions);
+  const columns = options.columns;
+  if (columns !== undefined && width > columns) {
+    return [
+      `(the QR code needs ${width} columns and this terminal has ${columns} — widen the window and run \`crewhaus hangar qr\`)`,
+      url,
+    ];
+  }
+  const caption = options.caption;
+  return [...(caption !== undefined ? [caption, ""] : []), ...renderQrLines(qr, renderOptions)];
+}
+
 /** The boxed boot summary (plain box-drawing, no color codes). */
 function summaryLines(
   server: HangarServer,
   openUrl: string,
   harnessCount: number | undefined,
+  lan: LanAddress | undefined,
 ): string[] {
   const rows: Array<[string, string]> = [["url", openUrl]];
+  if (lan !== undefined) {
+    rows.push([
+      "network",
+      `${lan.interfaceName} — every device on this network can reach this console over plain HTTP`,
+    ]);
+  } else if (!server.noAuth) {
+    // The one line that tells an operator the feature exists, on the boot
+    // they are most likely to be looking at.
+    rows.push([
+      "phone",
+      "crewhaus hangar --lan — bind this machine's LAN address and print a QR code to scan",
+    ]);
+  }
   if (server.noAuth) {
     rows.push(["auth", "DISABLED (--no-auth) — every local process can read this fleet's state"]);
   } else {
@@ -605,6 +764,10 @@ async function hangarServe(
   // because a bearer token over plain HTTP is a poor answer to a LAN.
   const remoteRefusal = remoteBindRefusal(flags.host, env);
   if (remoteRefusal !== undefined) throw new Error(remoteRefusal);
+  // --lan is its own opt-in, so it is resolved after that gate rather than
+  // through it — but still before the lock, the registry and the socket, so
+  // a machine with no LAN address refuses without having started anything.
+  const lan = resolveBindHost(flags, opts);
   const now = opts.now ?? Date.now;
   const pid = opts.pid ?? process.pid;
   const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
@@ -637,6 +800,7 @@ async function hangarServe(
   const version = cliVersion();
   const server = (opts.startServer ?? startHangarServer)({
     port: flags.smoke ? 0 : (flags.port ?? DEFAULT_HANGAR_PORT),
+    ...(lan !== undefined ? { hostname: lan.address } : {}),
     ...(flags.host !== undefined ? { hostname: flags.host } : {}),
     root: hangarRoot,
     ...(flags.noAuth ? { noAuth: true } : {}),
@@ -689,7 +853,20 @@ async function hangarServe(
   }
 
   const openUrl = fragmentUrl(server.url, server.token);
-  for (const line of summaryLines(server, openUrl, registry?.list().length)) write(line);
+  for (const line of summaryLines(server, openUrl, registry?.list().length, lan)) write(line);
+  // The QR goes last so it sits next to the shell prompt, which is the
+  // easiest place on the screen to point a phone at.
+  if (lan !== undefined && !flags.noQr) {
+    write("");
+    for (const line of qrBlockLines(openUrl, {
+      color: wantsColor(opts, env),
+      columns: terminalColumns(opts),
+      caption: "scan to open Hangar on your phone — the code carries the access token:",
+    })) {
+      write(line);
+    }
+    write("");
+  }
   if (!flags.noOpen) {
     (opts.openBrowser ?? openInBrowser)(handoffUrl(server.url, server.bootPath));
   }
@@ -774,6 +951,11 @@ function hangarStatus(argv: readonly string[], opts: HangarCommandOptions): Hang
       `hangar: running at ${lock.url} (pid ${lock.pid}, port ${lock.port}, since ${lock.startedAt})`,
     );
     lines.push("  open it with `crewhaus hangar open`");
+    // A non-loopback console is one a phone can reach, so say how.
+    const host = hostFromUrl(lock.url);
+    if (host !== undefined && !isLoopbackHost(host)) {
+      lines.push("  scan it from a phone with `crewhaus hangar qr`");
+    }
   } else {
     lines.push("hangar: not running — start it with `crewhaus hangar`");
     if (staleLock && lock !== undefined) {
@@ -845,6 +1027,69 @@ async function hangarOpen(
 }
 
 // ---------------------------------------------------------------------------
+// qr
+// ---------------------------------------------------------------------------
+
+/**
+ * Reprint the running console's QR code.
+ *
+ * Worth its own verb because the boot-time code scrolls away: a phone runs
+ * out of battery, a second person wants in, the terminal gets cleared. It
+ * reads the lock rather than the flags, so it reflects what the console is
+ * actually bound to — including the honest answer when that is loopback and
+ * no phone can reach it.
+ */
+function hangarQr(argv: readonly string[], opts: HangarCommandOptions): HangarCommandResult {
+  const args = parseVerbArgs("qr", argv, { ascii: "boolean", "no-color": "boolean" });
+  const env = opts.env ?? process.env;
+  const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
+  const hangarRoot = resolveHangarRoot(env);
+  const lock = readHangarLock(hangarRoot);
+  if (lock === undefined || !isPidAlive(lock.pid) || lock.url === "") {
+    return {
+      lines: ["hangar is not running — start it with `crewhaus hangar --lan`"],
+      exitCode: 1,
+    };
+  }
+
+  const host = hostFromUrl(lock.url);
+  if (host !== undefined && isLoopbackHost(host)) {
+    return {
+      lines: [
+        `hangar is bound to ${lock.url}, which only this machine can reach — a phone on the`,
+        "network cannot open it, so there is no QR code worth printing.",
+        "Restart it with `crewhaus hangar --lan` to bind this machine's LAN address.",
+      ],
+      exitCode: 1,
+    };
+  }
+
+  let token: string | undefined;
+  try {
+    token = readFileSync(join(hangarRoot, TOKEN_FILENAME), "utf8").trim();
+  } catch {
+    token = undefined;
+  }
+  const url = fragmentUrl(lock.url, token);
+  return {
+    lines: qrBlockLines(url, {
+      color: args.flags.get("no-color") === true ? false : wantsColor(opts, env),
+      columns: terminalColumns(opts),
+      ...(args.flags.get("ascii") === true ? { ascii: true } : {}),
+      caption: "scan to open Hangar on your phone — the code carries the access token:",
+    }),
+    exitCode: 0,
+  };
+}
+
+/** The host portion of a `http://host:port` url, tolerating the malformed
+ *  IPv6 spellings the server can compose. */
+function hostFromUrl(url: string): string | undefined {
+  const match = /^https?:\/\/(.+):\d+$/.exec(url);
+  return match?.[1];
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
@@ -866,7 +1111,9 @@ export async function runHangarCommand(
       return hangarStatus(argv.slice(1), opts);
     case "open":
       return await hangarOpen(argv.slice(1), opts);
+    case "qr":
+      return hangarQr(argv.slice(1), opts);
     default:
-      throw new Error(`unknown hangar verb "${verb}" (expected: serve | status | open)`);
+      throw new Error(`unknown hangar verb "${verb}" (expected: serve | status | open | qr)`);
   }
 }

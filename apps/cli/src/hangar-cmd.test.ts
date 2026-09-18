@@ -20,6 +20,7 @@ import {
 } from "@crewhaus/hangar-server";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import type { JobRecord, SupervisedChild } from "@crewhaus/harness-supervisor";
+import { encodeQr, renderQrLines } from "@crewhaus/qr-code";
 import {
   HANGAR_LOCK_FILENAME,
   type HangarLock,
@@ -32,6 +33,7 @@ import {
   runHangarCommand,
   writeHangarLock,
 } from "./hangar-cmd";
+import type { InterfaceMap } from "./lan-address";
 
 // `tsc -b` also compiles this file into `dist/`; resolve the CLI entrypoint
 // from the source tree so the dist test copy can still spawn it.
@@ -164,6 +166,9 @@ async function driveServe(
     readonly env: Record<string, string | undefined>;
     readonly platform?: string;
     readonly write?: (line: string) => void;
+    readonly networkInterfaces?: () => InterfaceMap;
+    readonly columns?: number;
+    readonly color?: boolean;
   },
 ): Promise<HangarServerOptions[]> {
   const seen: HangarServerOptions[] = [];
@@ -174,9 +179,12 @@ async function driveServe(
     pid: 4242,
     isPidAlive: () => false,
     write: opts.write ?? ((): void => {}),
+    ...(opts.networkInterfaces !== undefined ? { networkInterfaces: opts.networkInterfaces } : {}),
+    ...(opts.columns !== undefined ? { columns: opts.columns } : {}),
+    ...(opts.color !== undefined ? { color: opts.color } : {}),
     startServer: (options) => {
       seen.push(options);
-      return fakeServer({ handles: new Map(), runningJobs: [] }, []);
+      return fakeServer({ handles: new Map(), runningJobs: [] }, [], options.hostname);
     },
     exit: () => {},
   });
@@ -200,18 +208,230 @@ const SERVER_FACTORY_REACHED = "the server factory was reached — the refusal d
 function refuseServe(
   argv: readonly string[],
   env: Record<string, string | undefined>,
+  networkInterfaces?: () => InterfaceMap,
 ): Promise<unknown> {
   return runHangarCommand(["serve", "--no-open", ...argv], {
     env,
     pid: 4242,
     isPidAlive: () => false,
     write: () => {},
+    ...(networkInterfaces !== undefined ? { networkInterfaces } : {}),
     startServer: () => {
       throw new Error(SERVER_FACTORY_REACHED);
     },
     exit: () => {},
   });
 }
+
+/** A laptop whose only usable address hides behind a VPN and two radios. */
+const LAN_INTERFACES: InterfaceMap = {
+  lo0: [{ address: "127.0.0.1", family: "IPv4", internal: true }],
+  utun0: [{ address: "fe80::da12:389f:2939:f760", family: "IPv6", internal: false }],
+  en0: [{ address: "192.168.7.31", family: "IPv4", internal: false }],
+};
+
+/** Nothing but loopback — a machine off every network. */
+const NO_LAN_INTERFACES: InterfaceMap = {
+  lo0: [{ address: "127.0.0.1", family: "IPv4", internal: true }],
+};
+
+/** Collect what `serve` streamed to its write sink. */
+function sink(): { lines: string[]; write: (line: string) => void } {
+  const lines: string[] = [];
+  return { lines, write: (line: string) => lines.push(line) };
+}
+
+// ---------------------------------------------------------------------------
+// serve --lan + the QR code
+// ---------------------------------------------------------------------------
+
+describe("hangar serve --lan", () => {
+  test("binds the LAN address the picker chose, not a wildcard", async () => {
+    const ws = newWorkspace();
+    const seen = await driveServe(["--lan"], {
+      env: ws.env,
+      networkInterfaces: () => LAN_INTERFACES,
+    });
+    // A concrete address, because the server interpolates whatever it is
+    // handed into its advertised url — `0.0.0.0` would be written into the
+    // lock, printed by `status`, and openable by nothing.
+    expect(seen[0]?.hostname).toBe("192.168.7.31");
+  });
+
+  test("is its own HM-201 opt-in — no environment variable required", async () => {
+    const ws = newWorkspace();
+    // The same address via --host is refused without the variable...
+    await expect(refuseServe(["--host", "192.168.7.31"], ws.env)).rejects.toThrow(
+      /binds beyond loopback/,
+    );
+    // ...while --lan, which IS the deliberate visible act the variable asks
+    // for, reaches the server on its own.
+    const seen = await driveServe(["--lan"], {
+      env: ws.env,
+      networkInterfaces: () => LAN_INTERFACES,
+    });
+    expect(seen[0]?.hostname).toBe("192.168.7.31");
+  });
+
+  test("still REQUIRES auth, and refuses to be combined with --host or --smoke", async () => {
+    const ws = newWorkspace();
+    await expect(
+      runHangarCommand(["serve", "--lan", "--no-auth"], { env: ws.env }),
+    ).rejects.toThrow(/--lan exposes the console beyond loopback and REQUIRES auth/);
+    await expect(
+      runHangarCommand(["serve", "--lan", "--host", "0.0.0.0"], { env: ws.env }),
+    ).rejects.toThrow(/pass one or the other/);
+    await expect(runHangarCommand(["serve", "--lan", "--smoke"], { env: ws.env })).rejects.toThrow(
+      /--smoke .*cannot combine with --lan/,
+    );
+  });
+
+  test("refuses before booting when the machine has no LAN address", async () => {
+    const ws = newWorkspace();
+    await expect(refuseServe(["--lan"], ws.env, () => NO_LAN_INTERFACES)).rejects.toThrow(
+      /found no LAN address/,
+    );
+    // Refused early: no socket, and no lock left behind.
+    await expect(refuseServe(["--lan"], ws.env, () => NO_LAN_INTERFACES)).rejects.not.toThrow(
+      new RegExp(SERVER_FACTORY_REACHED),
+    );
+    expect(existsSync(join(ws.hangarRoot, HANGAR_LOCK_FILENAME))).toBe(false);
+  });
+
+  test("prints a QR code that encodes the token-bearing url, and says so", async () => {
+    const ws = newWorkspace();
+    const out = sink();
+    await driveServe(["--lan"], {
+      env: ws.env,
+      networkInterfaces: () => LAN_INTERFACES,
+      write: out.write,
+      color: false,
+      columns: 200,
+    });
+    const printed = out.lines.join("\n");
+    // The url the fake server composed, with the token as a #fragment.
+    const url = "http://192.168.7.31:4321/#t=fake-token";
+    expect(printed).toContain("scan to open Hangar on your phone");
+    // …and the code really is that url, not merely some code-shaped output.
+    const want = renderQrLines(encodeQr(url, { ecLevel: "M" }), { color: false });
+    for (const line of want) expect(out.lines).toContain(line);
+    // The summary names the interface and the exposure.
+    expect(printed).toContain("en0 — every device on this network can reach this console");
+  });
+
+  test("--no-qr boots the LAN console without printing one", async () => {
+    const ws = newWorkspace();
+    const out = sink();
+    await driveServe(["--lan", "--no-qr"], {
+      env: ws.env,
+      networkInterfaces: () => LAN_INTERFACES,
+      write: out.write,
+      color: false,
+      columns: 200,
+    });
+    const printed = out.lines.join("\n");
+    expect(printed).not.toContain("scan to open Hangar");
+    expect(printed).not.toContain("\u2588");
+    // The console itself is unaffected.
+    expect(printed).toContain("http://192.168.7.31:4321");
+  });
+
+  test("says so rather than wrapping when the terminal is too narrow", async () => {
+    const ws = newWorkspace();
+    const out = sink();
+    await driveServe(["--lan"], {
+      env: ws.env,
+      networkInterfaces: () => LAN_INTERFACES,
+      write: out.write,
+      color: false,
+      columns: 20,
+    });
+    const printed = out.lines.join("\n");
+    // A wrapped QR code is not a degraded QR code, it is a picture.
+    expect(printed).toMatch(/needs \d+ columns and this terminal has 20/);
+    expect(printed).toContain("crewhaus hangar qr");
+    expect(printed).not.toContain("\u2588");
+  });
+
+  test("a loopback boot prints no QR, but does name the flag that would", async () => {
+    const ws = newWorkspace();
+    const out = sink();
+    await driveServe([], { env: ws.env, write: out.write, color: false, columns: 200 });
+    const printed = out.lines.join("\n");
+    expect(printed).not.toContain("\u2588");
+    expect(printed).toContain("crewhaus hangar --lan");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// qr
+// ---------------------------------------------------------------------------
+
+describe("hangar qr", () => {
+  test("reprints the running console's code from the lock and the token file", () => {
+    const ws = newWorkspace();
+    mkdirSync(ws.hangarRoot, { recursive: true });
+    writeFileSync(join(ws.hangarRoot, "token"), "lan-token\n");
+    writeHangarLock(ws.hangarRoot, {
+      pid: 4242,
+      startedAt: "2026-09-17T00:00:00.000Z",
+      port: 4200,
+      url: "http://192.168.7.31:4200",
+    });
+    const got = runHangarCommand(["qr"], {
+      env: ws.env,
+      isPidAlive: () => true,
+      color: false,
+      columns: 200,
+    });
+    return got.then((result) => {
+      expect(result.exitCode).toBe(0);
+      const want = renderQrLines(
+        encodeQr("http://192.168.7.31:4200/#t=lan-token", { ecLevel: "M" }),
+        { color: false },
+      );
+      for (const line of want) expect(result.lines).toContain(line);
+    });
+  });
+
+  test("refuses for a loopback console, and names the flag that fixes it", async () => {
+    const ws = newWorkspace();
+    writeHangarLock(ws.hangarRoot, LOCK); // url is http://127.0.0.1:4200
+    const got = await runHangarCommand(["qr"], { env: ws.env, isPidAlive: () => true });
+    expect(got.exitCode).toBe(1);
+    expect(got.lines.join(" ")).toContain("only this machine can reach");
+    expect(got.lines.join(" ")).toContain("crewhaus hangar --lan");
+  });
+
+  test("refuses when nothing is running", async () => {
+    const ws = newWorkspace();
+    const got = await runHangarCommand(["qr"], { env: ws.env, isPidAlive: () => false });
+    expect(got.exitCode).toBe(1);
+    expect(got.lines.join(" ")).toContain("hangar is not running");
+  });
+
+  test("--ascii avoids the half-block characters", async () => {
+    const ws = newWorkspace();
+    mkdirSync(ws.hangarRoot, { recursive: true });
+    writeFileSync(join(ws.hangarRoot, "token"), "t\n");
+    writeHangarLock(ws.hangarRoot, {
+      pid: 4242,
+      startedAt: "2026-09-17T00:00:00.000Z",
+      port: 4200,
+      url: "http://10.0.0.9:4200",
+    });
+    const got = await runHangarCommand(["qr", "--ascii", "--no-color"], {
+      env: ws.env,
+      isPidAlive: () => true,
+      columns: 400,
+    });
+    expect(got.exitCode).toBe(0);
+    const body = got.lines.join("\n");
+    expect(body).not.toContain("\u2580");
+    expect(body).not.toContain("\u2584");
+    expect(body).toContain("\u2588");
+  });
+});
 
 // ---------------------------------------------------------------------------
 // serve — argument validation + live-refusal (no server boots here)
@@ -523,11 +743,13 @@ type FakeProcesses = {
 
 /** A `HangarServer` that binds nothing: enough surface for `serve` to boot,
  *  print its summary and shut down, with a fake process layer. */
-function fakeServer(processes: FakeProcesses, log: string[]): HangarServer {
+function fakeServer(processes: FakeProcesses, log: string[], hostname = "127.0.0.1"): HangarServer {
   return {
-    url: "http://127.0.0.1:4321",
+    // Composed exactly as the real server composes it (server.ts), so a test
+    // that asserts on a printed url is asserting on the real shape.
+    url: `http://${hostname}:4321`,
     port: 4321,
-    hostname: "127.0.0.1",
+    hostname,
     hangarRoot: "/nonexistent/hangar",
     registryPath: "/nonexistent/harnesses.json",
     token: "fake-token",

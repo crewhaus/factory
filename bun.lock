@@ -84,6 +84,7 @@
         "@crewhaus/prompt-injection-detector": "workspace:*",
         "@crewhaus/prompt-optimizer": "workspace:*",
         "@crewhaus/prompt-optimizer-claude": "workspace:*",
+        "@crewhaus/qr-code": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/regression-runner": "workspace:*",
         "@crewhaus/routing-store": "workspace:*",
@@ -1419,6 +1420,10 @@
       "devDependencies": {
         "@crewhaus/eval-dataset": "workspace:*",
       },
+    },
+    "packages/qr-code": {
+      "name": "@crewhaus/qr-code",
+      "version": "0.6.0",
     },
     "packages/queue-consumer": {
       "name": "@crewhaus/queue-consumer",
@@ -3179,6 +3184,8 @@
     "@crewhaus/prompt-optimizer": ["@crewhaus/prompt-optimizer@workspace:packages/prompt-optimizer"],
 
     "@crewhaus/prompt-optimizer-claude": ["@crewhaus/prompt-optimizer-claude@workspace:packages/prompt-optimizer-claude"],
+
+    "@crewhaus/qr-code": ["@crewhaus/qr-code@workspace:packages/qr-code"],
 
     "@crewhaus/queue-consumer": ["@crewhaus/queue-consumer@workspace:packages/queue-consumer"],
 
