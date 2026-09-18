@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "rootDir": "src", "outDir": "dist" },
+  "references": [
+    { "path": "../errors" },
+    { "path": "../tool-catalog" },
+    { "path": "../tool-builder" },
+    { "path": "../tool-executor" }
+  ],
+  "include": ["src/**/*"]
+}

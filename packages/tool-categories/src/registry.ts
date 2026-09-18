@@ -639,6 +639,19 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     ],
   },
 
+  verify: {
+    title:
+      "Verification gates: golden comparison, checksum manifests, acceptance checks, Markdown link checking and citation linting",
+    tools: [
+      "acceptanceCheck",
+      "checksumVerify",
+      "citationLint",
+      "goldenCompare",
+      "goldenUpdate",
+      "markdownLinkCheck",
+    ],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -669,7 +682,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   safety: {
     title: "Finding and removing what must not leave the system, and proving what did not change",
-    includes: ["secure"],
+    includes: ["secure", "verify"],
   },
   outreach: {
     title: "Everything that puts something in front of a person outside the harness",

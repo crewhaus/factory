@@ -155,6 +155,7 @@
         "@crewhaus/tool-task": "workspace:*",
         "@crewhaus/tool-text": "workspace:*",
         "@crewhaus/tool-todo": "workspace:*",
+        "@crewhaus/tool-verify": "workspace:*",
         "@crewhaus/tool-vision-grounding": "workspace:*",
         "@crewhaus/tool-web": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
@@ -2772,6 +2773,19 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/tool-verify": {
+      "name": "@crewhaus/tool-verify",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-vision-grounding": {
       "name": "@crewhaus/tool-vision-grounding",
       "version": "0.6.0",
@@ -3438,6 +3452,8 @@
     "@crewhaus/tool-todo": ["@crewhaus/tool-todo@workspace:packages/tool-todo"],
 
     "@crewhaus/tool-validate": ["@crewhaus/tool-validate@workspace:packages/tool-validate"],
+
+    "@crewhaus/tool-verify": ["@crewhaus/tool-verify@workspace:packages/tool-verify"],
 
     "@crewhaus/tool-vision-grounding": ["@crewhaus/tool-vision-grounding@workspace:packages/tool-vision-grounding"],
 

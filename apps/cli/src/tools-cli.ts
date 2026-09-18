@@ -117,6 +117,12 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
     "cancel the command",
   ],
   todoWrite: ["todo", "task list", "track tasks", "checklist"],
+  acceptanceCheck: ["definition of done", "acceptance", "gate", "checklist", "verify"],
+  checksumVerify: ["checksum", "sha256sums", "integrity", "manifest", "artifact"],
+  citationLint: ["citation", "footnote", "sources", "references", "brief"],
+  goldenCompare: ["golden", "snapshot", "approval test", "baseline", "regression"],
+  goldenUpdate: ["golden", "snapshot update", "accept baseline", "bless"],
+  markdownLinkCheck: ["broken links", "markdown", "docs", "anchors", "link check"],
   htmlForms: ["form", "fields", "input", "csrf", "submit"],
   htmlLinks: ["links", "anchors", "href", "pagination", "crawl"],
   htmlQuery: ["css selector", "query", "scrape", "dom", "select"],
@@ -1477,6 +1483,12 @@ export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object.freeze([
   "htmlStructuredData",
   "htmlTable",
   "htmlText",
+  "acceptanceCheck",
+  "checksumVerify",
+  "citationLint",
+  "goldenCompare",
+  "goldenUpdate",
+  "markdownLinkCheck",
 ]);
 
 /**

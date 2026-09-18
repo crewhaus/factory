@@ -78,6 +78,7 @@
     { "path": "../../packages/trace-event-bus" },
     { "path": "../../packages/tool-bash" },
     { "path": "../../packages/tool-builder" },
+    { "path": "../../packages/tool-verify" },
     { "path": "../../packages/tool-html" },
     { "path": "../../packages/tool-onchain" },
     { "path": "../../packages/tool-money" },
