@@ -117,6 +117,13 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
     "cancel the command",
   ],
   todoWrite: ["todo", "task list", "track tasks", "checklist"],
+  contactNormalize: ["email normalize", "phone normalize", "dedupe", "canonical", "contacts"],
+  fixedWidthParse: ["fixed width", "positional", "copybook", "mainframe", "layout"],
+  recordLinkage: ["fuzzy match", "entity resolution", "dedupe", "record linkage", "match records"],
+  tableDiff: ["reconcile", "csv diff", "compare exports", "changed rows", "delta"],
+  tableProfile: ["profile", "data quality", "column types", "nulls", "candidate key"],
+  tableReshape: ["pivot", "unpivot", "melt", "wide to long", "reshape"],
+  tableShard: ["split csv", "chunk", "shard", "large file", "batch"],
   acceptanceCheck: ["definition of done", "acceptance", "gate", "checklist", "verify"],
   checksumVerify: ["checksum", "sha256sums", "integrity", "manifest", "artifact"],
   citationLint: ["citation", "footnote", "sources", "references", "brief"],
@@ -1489,6 +1496,13 @@ export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object.freeze([
   "goldenCompare",
   "goldenUpdate",
   "markdownLinkCheck",
+  "contactNormalize",
+  "fixedWidthParse",
+  "recordLinkage",
+  "tableDiff",
+  "tableProfile",
+  "tableReshape",
+  "tableShard",
 ]);
 
 /**

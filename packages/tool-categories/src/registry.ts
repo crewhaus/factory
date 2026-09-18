@@ -652,6 +652,20 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     ],
   },
 
+  tabular: {
+    title:
+      "Tabular intake: profiling, keyed reconciliation, record linkage, contact normalization, reshaping, sharding and fixed-width parsing",
+    tools: [
+      "contactNormalize",
+      "fixedWidthParse",
+      "recordLinkage",
+      "tableDiff",
+      "tableProfile",
+      "tableReshape",
+      "tableShard",
+    ],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",

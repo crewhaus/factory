@@ -152,6 +152,7 @@
         "@crewhaus/tool-secure": "workspace:*",
         "@crewhaus/tool-sql": "workspace:*",
         "@crewhaus/tool-state": "workspace:*",
+        "@crewhaus/tool-table": "workspace:*",
         "@crewhaus/tool-task": "workspace:*",
         "@crewhaus/tool-text": "workspace:*",
         "@crewhaus/tool-todo": "workspace:*",
@@ -2719,6 +2720,20 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-table": {
+      "name": "@crewhaus/tool-table",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-data": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-task": {
       "name": "@crewhaus/tool-task",
       "version": "0.6.0",
@@ -3444,6 +3459,8 @@
     "@crewhaus/tool-sql": ["@crewhaus/tool-sql@workspace:packages/tool-sql"],
 
     "@crewhaus/tool-state": ["@crewhaus/tool-state@workspace:packages/tool-state"],
+
+    "@crewhaus/tool-table": ["@crewhaus/tool-table@workspace:packages/tool-table"],
 
     "@crewhaus/tool-task": ["@crewhaus/tool-task@workspace:packages/tool-task"],
 
