@@ -125,6 +125,7 @@
         "@crewhaus/tool-document-ingest": "workspace:*",
         "@crewhaus/tool-encode": "workspace:*",
         "@crewhaus/tool-fetch": "workspace:*",
+        "@crewhaus/tool-flow": "workspace:*",
         "@crewhaus/tool-fs": "workspace:*",
         "@crewhaus/tool-fsx": "workspace:*",
         "@crewhaus/tool-git": "workspace:*",
@@ -2304,6 +2305,20 @@
         "@crewhaus/tool-validate": "workspace:*",
       },
     },
+    "packages/tool-flow": {
+      "name": "@crewhaus/tool-flow",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-schema": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-fs": {
       "name": "@crewhaus/tool-fs",
       "version": "0.6.0",
@@ -3288,6 +3303,8 @@
     "@crewhaus/tool-executor": ["@crewhaus/tool-executor@workspace:packages/tool-executor"],
 
     "@crewhaus/tool-fetch": ["@crewhaus/tool-fetch@workspace:packages/tool-fetch"],
+
+    "@crewhaus/tool-flow": ["@crewhaus/tool-flow@workspace:packages/tool-flow"],
 
     "@crewhaus/tool-fs": ["@crewhaus/tool-fs@workspace:packages/tool-fs"],
 

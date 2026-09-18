@@ -713,3 +713,22 @@ export const SCHEMA_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   validateReferences,
   validateUniqueKeys,
 ]);
+
+/**
+ * The declarative check grammar, re-exported for other tool packages.
+ *
+ * `Assert` here and `Branch` in `@crewhaus/tool-flow` both have to answer
+ * "does this value satisfy this condition?", and two implementations of that
+ * question would drift: an operator who learned `startsWith` from one would
+ * find it missing, or subtly different, in the other. There is one
+ * vocabulary and one evaluator, and this is where it lives.
+ */
+export {
+  ASSERT_OPS,
+  type AssertOp,
+  type AssertReport,
+  type Check,
+  type CheckResult,
+  checkRequired,
+  runChecks,
+} from "./lib/assert";

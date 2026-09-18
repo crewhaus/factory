@@ -568,6 +568,19 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     ],
   },
 
+  flow: {
+    title: "Control flow: branching, decision tables, error classification, deadlines, consensus, stall detection and rule scoring",
+    tools: [
+      "branch",
+      "consensusVote",
+      "deadlineCheck",
+      "decisionTable",
+      "errorClassify",
+      "ruleScore",
+      "stallDetect",
+    ],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -613,7 +626,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   compute: {
     title: "Everything a harness can do with no I/O at all — pure, in-process, zero tokens",
-    includes: ["text", "data", "encode", "datetime", "schema", "math"],
+    includes: ["text", "data", "encode", "datetime", "schema", "math", "flow"],
   },
   content: {
     title: "Everything that reads or produces documents and images",

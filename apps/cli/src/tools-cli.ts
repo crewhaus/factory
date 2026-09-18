@@ -117,6 +117,13 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
     "cancel the command",
   ],
   todoWrite: ["todo", "task list", "track tasks", "checklist"],
+  branch: ["branch", "if", "switch", "route", "conditional", "control flow"],
+  consensusVote: ["consensus", "vote", "agreement", "plurality", "quorum", "dissent"],
+  deadlineCheck: ["deadline", "budget", "time left", "timeout", "sla", "clock"],
+  decisionTable: ["decision table", "policy", "rules", "hit policy", "matrix"],
+  errorClassify: ["error", "classify", "retry", "retryable", "backoff", "retry-after", "exit code"],
+  ruleScore: ["score", "scoring", "lead score", "grade", "band", "qualify"],
+  stallDetect: ["stall", "stuck", "loop", "oscillation", "progress", "no progress"],
   imageInfo: ["image dimensions", "how big is the image", "what size is it"],
   imageKind: ["what kind of file", "is it really a png", "identify the image"],
   pngRead: ["decode the png", "read the pixels"],
@@ -1377,6 +1384,13 @@ export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object.freeze([
   "subtitleParse",
   "subtitleWrite",
   "mediaProbe",
+  "branch",
+  "consensusVote",
+  "deadlineCheck",
+  "decisionTable",
+  "errorClassify",
+  "ruleScore",
+  "stallDetect",
 ]);
 
 /**
