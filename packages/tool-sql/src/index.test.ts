@@ -1181,7 +1181,18 @@ describe("names resolve the way SQLite resolves them", () => {
 
   test("TableStats counts a table named in another case", async () => {
     const out = await run(tableStats, { database: "app.db", tables: ["USERS"] });
-    expect(out.tables).toEqual([{ name: "users", rows: 3, bytes: 4096, pages: 1 }]);
+    // Sizes come from the dbstat virtual table, which is a compile-time
+    // option: present in the SQLite that ships with Bun on macOS, absent in
+    // the one CI runs on. Asserting them pinned this test to one build. What
+    // the test is actually about is that "USERS" resolves to `users`.
+    expect(out.tables).toMatchObject([{ name: "users", rows: 3 }]);
+    const stats = out.tables[0] as { bytes?: number; pages?: number };
+    if (stats.bytes === undefined) {
+      expect(out.note).toContain("dbstat");
+    } else {
+      expect(stats.bytes).toBeGreaterThan(0);
+      expect(stats.pages).toBeGreaterThan(0);
+    }
   });
 });
 
