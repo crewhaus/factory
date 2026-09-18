@@ -277,9 +277,7 @@ describe("TableShard", () => {
     // The threshold is on BYTES, so the fixture buys them with a few wide rows
     // rather than many narrow ones: 1,200 rows of ~10KB clears the 8MiB limit
     // with the same margin 120,000 rows of ~100 bytes did, while giving the
-    // CSV reader 1,200 row arrays to allocate instead of 120,000. The old
-    // shape spent 6.9s on that allocation and blew bun's 5s default budget on
-    // a CI runner — a test that declares no deadline still has one.
+    // CSV reader 1,200 row arrays to allocate instead of 120,000.
     const WIDE = "y".repeat(9_990);
     write(
       "big.csv",
@@ -295,7 +293,11 @@ describe("TableShard", () => {
     expect(result.bodies).toBeUndefined();
     expect(result.totalBytes).toBeGreaterThan(8 * 1024 * 1024);
     expect(result.note).toContain("return limit");
-  });
+    // Asserting an 8MiB threshold costs 8MiB of writing, parsing and joining,
+    // so this one is slow by construction. Shrinking the fixture above only
+    // lowered the mean — it still blew bun's 5s default on a loaded CI runner
+    // — so the deadline is declared here rather than tuned for.
+  }, 20_000);
 
   test("no bound at all is rejected by the schema", () => {
     expect(tableShard.inputSchema.safeParse({ file: "a.csv" }).success).toBe(false);
