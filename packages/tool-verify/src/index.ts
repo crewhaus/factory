@@ -381,7 +381,7 @@ export const acceptanceCheck: RegisteredTool = buildTool({
           return {
             index,
             check: label,
-            ok: body !== null && body.includes(check.text),
+            ok: body?.includes(check.text) === true,
             detail:
               body === null
                 ? "the file could not be read"
