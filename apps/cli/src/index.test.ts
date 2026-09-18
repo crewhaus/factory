@@ -2430,7 +2430,8 @@ describe("crewhaus retention (item 35)", () => {
     // Every rejected invocation deleted/exported nothing.
     expect(existsSync(file)).toBe(true);
     expect(existsSync(join(tmp, "out"))).toBe(false);
-  });
+    // Spawns the real CLI several times; bun's 5s default is not a margin.
+  }, 20_000);
 
   test("export refuses <root>/.crewhaus as outDir (F5 containment)", async () => {
     seedExpiredSession(tmp, "sess_1111111111111111", 40);
@@ -2794,7 +2795,8 @@ describe("crewhaus approval gate — all pin doors (item 59, F2)", () => {
     // The pin did NOT flip.
     const alias = await runCli(["spec", "alias", "demo", "prod"], { cwd: tmp });
     expect(alias.exitCode).not.toBe(0);
-  });
+    // Spawns the real CLI several times; bun's 5s default is not a margin.
+  }, 20_000);
 
   test("deploy rollback to a PROTECTED env refuses without approval and audit-logs it", async () => {
     await seedProtectedHarness();
@@ -2832,7 +2834,8 @@ describe("crewhaus approval gate — all pin doors (item 59, F2)", () => {
     expect(pinned.stdout).toContain("pinned demo prod → v2");
     const alias = await runCli(["spec", "alias", "demo", "prod"], { cwd: tmp });
     expect(alias.stdout.trim()).toBe("v2");
-  });
+    // Spawns the real CLI several times; bun's 5s default is not a margin.
+  }, 20_000);
 });
 
 // Item 61 — `crewhaus channel provision|verify` wiring. Everything here is

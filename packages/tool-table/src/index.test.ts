@@ -273,15 +273,23 @@ describe("TableShard", () => {
 
   test("bodies are withheld when they would be the whole file again", async () => {
     // Returning them past a few megabytes is not a result, it is the file.
+    //
+    // The threshold is on BYTES, so the fixture buys them with a few wide rows
+    // rather than many narrow ones: 1,200 rows of ~10KB clears the 8MiB limit
+    // with the same margin 120,000 rows of ~100 bytes did, while giving the
+    // CSV reader 1,200 row arrays to allocate instead of 120,000. The old
+    // shape spent 6.9s on that allocation and blew bun's 5s default budget on
+    // a CI runner — a test that declares no deadline still has one.
+    const WIDE = "y".repeat(9_990);
     write(
       "big.csv",
-      `a,b\n${Array.from({ length: 120_000 }, (_, i) => `${i},${"y".repeat(100)}`).join("\n")}\n`,
+      `a,b\n${Array.from({ length: 1_200 }, (_, i) => `${i},${WIDE}`).join("\n")}\n`,
     );
     const result = await call<{ bodies?: string[]; totalBytes: number; note?: string }>(
       tableShard,
       {
         file: "big.csv",
-        maxRows: 50_000,
+        maxRows: 500,
       },
     );
     expect(result.bodies).toBeUndefined();

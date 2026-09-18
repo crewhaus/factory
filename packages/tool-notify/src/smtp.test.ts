@@ -8,18 +8,29 @@
  * client has no reason to trust. In both, the session must end with the
  * password unsent and the message undelivered.
  *
- * WHAT IS NOT COVERED HERE: a SUCCESSFUL upgrade followed by delivery.
- * Building a STARTTLS server needs an already-connected plaintext socket to
- * be handed to a TLS server, and this runtime's `node:tls` shim does not
- * support that — the handshake never completes from the server side, so such
- * a test would hang rather than assert. The client's upgrade path is
- * therefore exercised only in the directions where it refuses. That gap is
- * real and is stated in the README rather than papered over.
+ * WHY THE CERTIFICATE TEST CONNECTS OVER IMPLICIT TLS. This runtime's
+ * `node:tls` cannot upgrade an ALREADY-CONNECTED socket on the server side:
+ * neither `tlsServer.emit("connection", socket)` nor
+ * `new TLSSocket(socket, { isServer: true })` ever completes the handshake
+ * OR errors — the client simply waits. A certificate test built on a
+ * STARTTLS server therefore ends on its own deadline, and `ok: false` is
+ * satisfied by that abort rather than by any certificate verdict. This file
+ * had exactly that test: it took over ten seconds and it passed UNCHANGED
+ * with `rejectUnauthorized: false`, which is a security test that cannot
+ * fail. The certificate decision is now made where a handshake really
+ * happens — a TLS server on its own port, reached with `implicitTls` — which
+ * refuses a self-signed certificate in single-digit milliseconds and names
+ * it in the error, so the assertion can be on the REASON and not just on
+ * failure.
+ *
+ * WHAT IS STILL NOT COVERED: a SUCCESSFUL STARTTLS upgrade followed by
+ * delivery, for that same server-side reason. That gap is real and is stated
+ * in the README rather than papered over.
  *
  * The certificate is generated at test time with `openssl` into a temp
- * directory; where `openssl` is not on the machine, the test needing it
- * returns early and the one that does not still runs, so this file never
- * passes without asserting something.
+ * directory. A machine without `openssl` is a broken test environment rather
+ * than a reason to skip: `generateCertificate` throws, because a certificate
+ * test that quietly returns early is the same vacuum described above.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -51,7 +62,7 @@ afterEach(() => {
  * the caller asked for. A certificate naming the address instead would have
  * been easier and would have tested the wrong thing.
  */
-function generateCertificate(): { key: string; cert: string } | null {
+function generateCertificate(): { key: string; cert: string } {
   const keyPath = path.join(tmp, "key.pem");
   const certPath = path.join(tmp, "cert.pem");
   try {
@@ -73,11 +84,42 @@ function generateCertificate(): { key: string; cert: string } | null {
       "-addext",
       "subjectAltName=DNS:smtp.test.invalid",
     ]);
-    if (result.exitCode !== 0) return null;
+    if (result.exitCode !== 0) {
+      throw new Error(`openssl exited ${result.exitCode}: ${result.stderr.toString().trim()}`);
+    }
     return { key: readFileSync(keyPath, "utf8"), cert: readFileSync(certPath, "utf8") };
-  } catch {
-    return null;
+  } catch (cause) {
+    // Deliberately fatal. Returning null here would make every test that
+    // needs a certificate pass while asserting nothing.
+    throw new Error(`could not generate a test certificate: ${String(cause)}`);
   }
+}
+
+/**
+ * A TLS server on its own port, speaking SMTP from the first byte.
+ *
+ * This is the shape a handshake actually completes in under this runtime
+ * (see the header). A client whose handshake is meant to fail never reads
+ * the greeting; a client that WRONGLY accepted the certificate does, and
+ * then waits for a reply that never comes — so the two outcomes are
+ * distinguishable rather than both arriving as a bare `ok: false`.
+ */
+function startTlsServer(credentials: { key: string; cert: string }): Promise<{
+  server: ReturnType<typeof createTlsServer>;
+  port: number;
+}> {
+  const server = createTlsServer({ key: credentials.key, cert: credentials.cert });
+  server.on("secureConnection", (secure: TLSSocket) => {
+    secure.write("220 test.invalid ESMTP ready\r\n");
+    secure.on("error", () => undefined);
+  });
+  server.on("tlsClientError", () => undefined);
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      resolve({ server, port: typeof address === "object" && address !== null ? address.port : 0 });
+    });
+  });
 }
 
 type Log = { commands: string[]; messages: string[]; commandsBeforeTls: number };
@@ -246,26 +288,32 @@ describe("STARTTLS", () => {
       deadline.cancel();
       server.close();
     }
-  });
+    // The runner budget must exceed this test's own deadline, or the deadline
+    // can never fire: bun's default is 5s, and a 3s deadline plus setup on a
+    // loaded runner lands close enough to it that the test would die as an
+    // opaque "timed out after 5000ms" instead of reporting its assertions.
+  }, 20_000);
 
-  // The runner budget must exceed this test's own deadline. Bun's default is
-  // 5s and the deadline below is 10s, so the deadline could never fire: on a
-  // runner where the refused handshake did not fail instantly the test died
-  // as an opaque "timed out after 5000ms" instead of reporting an assertion.
   test("a self-signed certificate is refused when it is not trusted", async () => {
+    // Over implicit TLS, not STARTTLS — see the header for why the STARTTLS
+    // form of this test could not fail.
     const credentials = generateCertificate();
-    if (credentials === null) return;
-    const { server, port, log } = await startServer(credentials);
-    const deadline = startDeadline(10_000);
+    const { server, port } = await startTlsServer(credentials);
+    // Generous beside a handshake that resolves in single-digit milliseconds,
+    // and short enough that a client which WRONGLY accepted the certificate
+    // ends here on the deadline rather than looking like a refusal.
+    const deadline = startDeadline(4_000);
     try {
-      // Same server, but without the CA: the handshake must fail closed.
-      const outcome = await sendMail({ ...baseOptions(port), signal: deadline.signal });
-      expect(outcome.ok).toBe(false);
-      // It got as far as asking to upgrade, and no further: the failure is
-      // the certificate, not a mistake earlier in the conversation.
-      expect(log.commands).toContain("STARTTLS");
-      expect(log.commands.filter((c) => c.startsWith("MAIL FROM"))).toEqual([]);
-      expect(log.messages.length).toBe(0);
+      const outcome = await sendMail({
+        ...baseOptions(port),
+        implicitTls: true,
+        signal: deadline.signal,
+      });
+      // The REASON is the assertion. `ok: false` on its own is also what an
+      // aborted send returns, which is precisely how the previous version of
+      // this test passed with certificate verification turned off.
+      if (outcome.ok) throw new Error("the self-signed certificate was accepted");
+      expect(outcome.error).toMatch(/self[- ]signed|certificate|CERT_/i);
     } finally {
       deadline.cancel();
       server.close();

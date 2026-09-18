@@ -356,7 +356,8 @@ describe("RunCommand", () => {
     // emphatically not run to the end of a `while true`.
     expect(elapsed).toBeGreaterThanOrEqual(200);
     expect(elapsed).toBeLessThan(8_000);
-  });
+    // Waits out a real SIGTERM grace period before the SIGKILL.
+  }, 20_000);
 
   /**
    * A grandchild inherits the pipe, so reading stdout to EOF can outlive the

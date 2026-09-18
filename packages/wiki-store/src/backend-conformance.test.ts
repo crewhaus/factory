@@ -40,7 +40,8 @@ describe("WikiStore backend conformance — file backend", () => {
     expect(report.passed).toBe(true);
     expect(report.checks.map((c) => c.name)).toEqual([...WIKI_CONFORMANCE_CHECKS]);
     expect(report.checks).toHaveLength(7);
-  });
+    // Runs the whole contract suite against a real backend.
+  }, 20_000);
 
   test("negative control: a last-write-wins backend fails the version-conflict check", async () => {
     const cheatingFactory: WikiBackendFactory = ({ specName, now }) => {

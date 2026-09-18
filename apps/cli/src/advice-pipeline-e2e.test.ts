@@ -235,7 +235,8 @@ describe("advisor pipeline end-to-end (items 15 + 17)", () => {
     expect(
       (await runCli(["doctor", "--context-pressure", "--sessions", "0"], empty)).exitCode,
     ).toBe(1);
-  });
+    // Spawns the real CLI several times; bun's 5s default is not a margin.
+  }, 20_000);
 
   test("from-advice flag/file validation dies cleanly", async () => {
     const root = newTempRoot();

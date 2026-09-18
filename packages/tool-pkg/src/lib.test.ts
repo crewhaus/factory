@@ -432,7 +432,8 @@ describe("listTar, against archives real tools produced", () => {
     const bomb = new Uint8Array(gzipSync(Buffer.alloc(200 * 1024 * 1024)));
     expect(bomb.length).toBeLessThan(1024 * 1024);
     expect(() => listTar(bomb, { maxBytes: 8 * 1024 * 1024 })).toThrow(/expands past/);
-  });
+    // Expands a real archive up to the refusal point.
+  }, 20_000);
 
   test("an archive within the limit still reads", () => {
     const listing = listTar(new Uint8Array(readFileSync(join(dir, "real.tgz"))), {

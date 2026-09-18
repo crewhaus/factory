@@ -105,7 +105,8 @@ describe("civil: the day-count core", () => {
       previous = civil;
     }
     expect(previous).toEqual(civilFromDays(800_000));
-  });
+    // Walks a wide calendar span day by day.
+  }, 20_000);
 
   test("weekday of a known date", () => {
     // 1970-01-01 was a Thursday.

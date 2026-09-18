@@ -166,7 +166,8 @@ describe("crewhaus eval CLI integration (T3)", () => {
       const result = await runCli([...base, "--repeats", bad]);
       expect(result.exitCode).toBe(1);
     }
-  });
+    // Spawns the real CLI several times; bun's 5s default is not a margin.
+  }, 20_000);
 
   // B13 — `--slice` is validated the same way: blank keys die loudly before
   // any dataset load or model spend, so these need no credentials.
@@ -176,7 +177,8 @@ describe("crewhaus eval CLI integration (T3)", () => {
       const result = await runCli([...base, "--slice", bad]);
       expect(result.exitCode).toBe(1);
     }
-  });
+    // Spawns the real CLI several times; bun's 5s default is not a margin.
+  }, 20_000);
 
   // C30 / NEW-HUNT-3 — the gate-threshold and runtime-ceiling flags are
   // validated up front too: a typo dies before any dataset load or spend,
