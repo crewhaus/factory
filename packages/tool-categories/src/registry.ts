@@ -594,6 +594,23 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     ],
   },
 
+  money: {
+    title:
+      "Money arithmetic and the controls around it: tax, refunds, matching, cost basis, spend limits and statement parsing",
+    tools: [
+      "costBasisCompute",
+      "glCodeSuggest",
+      "paymentIdentifierValidate",
+      "purchaseOrderMatch",
+      "refundAbuseCheck",
+      "refundAmountCompute",
+      "spendLimitCheck",
+      "statementParse",
+      "taxCalculate",
+      "webhookSignatureVerify",
+    ],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -632,7 +649,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   operations: {
     title: "Running and supervising harnesses: telemetry, cost, incidents, specs and fleets",
-    includes: ["obs", "crewhaus"],
+    includes: ["obs", "crewhaus", "money"],
   },
   network: {
     title: "Everything that reaches the network",

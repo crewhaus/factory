@@ -136,6 +136,7 @@
         "@crewhaus/tool-mcp": "workspace:*",
         "@crewhaus/tool-media": "workspace:*",
         "@crewhaus/tool-memory": "workspace:*",
+        "@crewhaus/tool-money": "workspace:*",
         "@crewhaus/tool-mouse-keyboard": "workspace:*",
         "@crewhaus/tool-navigate": "workspace:*",
         "@crewhaus/tool-notify": "workspace:*",
@@ -2481,6 +2482,20 @@
         "@crewhaus/tool-validate": "workspace:*",
       },
     },
+    "packages/tool-money": {
+      "name": "@crewhaus/tool-money",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-schema": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-mouse-keyboard": {
       "name": "@crewhaus/tool-mouse-keyboard",
       "version": "0.6.0",
@@ -3346,6 +3361,8 @@
     "@crewhaus/tool-memory": ["@crewhaus/tool-memory@workspace:packages/tool-memory"],
 
     "@crewhaus/tool-message-channel": ["@crewhaus/tool-message-channel@workspace:packages/tool-message-channel"],
+
+    "@crewhaus/tool-money": ["@crewhaus/tool-money@workspace:packages/tool-money"],
 
     "@crewhaus/tool-mouse-keyboard": ["@crewhaus/tool-mouse-keyboard@workspace:packages/tool-mouse-keyboard"],
 
