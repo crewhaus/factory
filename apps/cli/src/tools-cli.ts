@@ -117,6 +117,18 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
     "cancel the command",
   ],
   todoWrite: ["todo", "task list", "track tasks", "checklist"],
+  licenseAggregate: ["license", "licenses", "spdx", "compliance", "copyleft", "gpl"],
+  lockfileDiff: [
+    "lockfile",
+    "lock diff",
+    "dependency bump",
+    "upgrade review",
+    "package-lock",
+    "bun.lock",
+  ],
+  packagePublishPreflight: ["publish", "preflight", "release check", "npm publish", "prepublish"],
+  packageTarballInspect: ["tarball", "tgz", "npm pack", "artifact", "published files"],
+  semverResolve: ["semver", "version range", "resolve version", "caret", "tilde"],
   branch: ["branch", "if", "switch", "route", "conditional", "control flow"],
   consensusVote: ["consensus", "vote", "agreement", "plurality", "quorum", "dissent"],
   deadlineCheck: ["deadline", "budget", "time left", "timeout", "sla", "clock"],
@@ -1391,6 +1403,11 @@ export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object.freeze([
   "errorClassify",
   "ruleScore",
   "stallDetect",
+  "licenseAggregate",
+  "lockfileDiff",
+  "packagePublishPreflight",
+  "packageTarballInspect",
+  "semverResolve",
 ]);
 
 /**

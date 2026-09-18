@@ -1940,3 +1940,24 @@ export const CODE_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   typecheck,
   workspacePackages,
 ]);
+
+/**
+ * The semver helpers, re-exported for other tool packages.
+ *
+ * `DependencyOutdated` here and `SemverResolve` in `@crewhaus/tool-pkg` both
+ * have to answer "does this version satisfy this range?". Two
+ * implementations of that would disagree at the edges — prerelease ordering,
+ * `^0.x`, wildcard forms — and a harness would get one answer from one tool
+ * and another from the next. There is one implementation, and it is here.
+ */
+export {
+  type LockedVersion,
+  type SemVer,
+  compareSemver,
+  parseBunLock,
+  parseCargoLock,
+  parsePackageLock,
+  parseSemver,
+  parseYarnLock,
+  satisfies,
+} from "./lib/deps";

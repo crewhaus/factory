@@ -569,7 +569,8 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
 
   flow: {
-    title: "Control flow: branching, decision tables, error classification, deadlines, consensus, stall detection and rule scoring",
+    title:
+      "Control flow: branching, decision tables, error classification, deadlines, consensus, stall detection and rule scoring",
     tools: [
       "branch",
       "consensusVote",
@@ -578,6 +579,18 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "errorClassify",
       "ruleScore",
       "stallDetect",
+    ],
+  },
+
+  packaging: {
+    title:
+      "Packages, lockfiles and releases: semver resolution, dependency diffs, license rollups, tarball inspection and publish preflight",
+    tools: [
+      "licenseAggregate",
+      "lockfileDiff",
+      "packagePublishPreflight",
+      "packageTarballInspect",
+      "semverResolve",
     ],
   },
 
@@ -594,6 +607,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "proc",
       "codehost",
       "toolchain",
+      "packaging",
     ],
   },
   filesystem: {

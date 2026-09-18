@@ -3646,6 +3646,7 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     obs,
     media,
     flow,
+    pkg,
   ] = await Promise.all([
     import("@crewhaus/tool-fs"),
     import("@crewhaus/tool-bash"),
@@ -3678,6 +3679,7 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     import("@crewhaus/tool-obs"),
     import("@crewhaus/tool-media"),
     import("@crewhaus/tool-flow"),
+    import("@crewhaus/tool-pkg"),
   ]);
   const map: Record<string, RegisteredTool> = {
     read: fs.read,
@@ -3708,6 +3710,12 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     codegraphCallers: codegraph.codegraphCallers,
     codegraphCallees: codegraph.codegraphCallees,
     codegraphImpact: codegraph.codegraphImpact,
+    // @crewhaus/tool-pkg
+    licenseAggregate: pkg.licenseAggregate,
+    lockfileDiff: pkg.lockfileDiff,
+    packagePublishPreflight: pkg.packagePublishPreflight,
+    packageTarballInspect: pkg.packageTarballInspect,
+    semverResolve: pkg.semverResolve,
     // @crewhaus/tool-flow
     branch: flow.branch,
     consensusVote: flow.consensusVote,

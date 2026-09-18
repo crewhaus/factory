@@ -35,6 +35,7 @@
     { "path": "./packages/tool-image" },
     { "path": "./packages/tool-codegraph" },
     { "path": "./packages/tool-consult" },
+    { "path": "./packages/tool-pkg" },
     { "path": "./packages/tool-flow" },
     { "path": "./packages/tool-media" },
     { "path": "./packages/tool-obs" },
