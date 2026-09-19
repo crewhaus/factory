@@ -827,6 +827,27 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     tools: ["harnessRetire", "storeMigrate", "retentionEnforce", "knowledgeSync"],
   },
 
+  fleet: {
+    title: "Register, recompile, version-pin and inspect the harnesses on this machine",
+    tools: ["harnessRegister", "harnessJobStatus", "compileBundle", "cliVersionPin", "hooksManage"],
+  },
+
+  deploy: {
+    title:
+      "Move a spec version between environments in the local registry, and report what is pinned where",
+    tools: ["specPin", "deployRollback", "deployInspect"],
+  },
+
+  routing: {
+    title: "Read and steer model routing, experiments and observational learning",
+    tools: ["routeControl", "experimentLedger", "flywheelStatus", "watchmeReport"],
+  },
+
+  discovery: {
+    title: "Search the local template marketplace and enumerate reachable federation peers",
+    tools: ["marketplaceSearch", "federationDiscover"],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -887,6 +908,10 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "evalops",
       "dataset",
       "lifecycle",
+      "fleet",
+      "deploy",
+      "routing",
+      "discovery",
     ],
   },
   chain: {
