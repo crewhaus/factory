@@ -117,6 +117,21 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
     "cancel the command",
   ],
   todoWrite: ["todo", "task list", "track tasks", "checklist"],
+  packageManifestGenerate: [
+    "homebrew formula",
+    "debian control",
+    "scoop manifest",
+    "winget manifest",
+    "release manifest",
+    "package manifest",
+  ],
+  packageManifestVerify: [
+    "verify release",
+    "check checksums",
+    "manifest verification",
+    "supply chain",
+    "published assets",
+  ],
   cronList: ["scheduled jobs", "crontab", "launchd", "systemd timer", "what is scheduled"],
   cronDelete: ["remove a cron job", "delete schedule", "unschedule", "remove launchd agent"],
   watchPath: ["watch a file", "file changes", "observe directory", "fs events"],
@@ -1762,6 +1777,8 @@ export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object.freeze([
   "osIndexSearch",
   "cronList",
   "cronDelete",
+  "packageManifestGenerate",
+  "packageManifestVerify",
 ]);
 
 /**

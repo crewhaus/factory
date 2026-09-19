@@ -53,6 +53,7 @@
     { "path": "./packages/tool-secrets" },
     { "path": "./packages/tool-hostfs" },
     { "path": "./packages/tool-cron" },
+    { "path": "./packages/tool-distribution" },
     { "path": "./packages/tool-verify" },
     { "path": "./packages/tool-html" },
     { "path": "./packages/tool-onchain" },

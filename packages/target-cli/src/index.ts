@@ -615,6 +615,14 @@ export const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
   osIndexSearch: { package: "@crewhaus/tool-hostfs", export: "osIndexSearch" },
   cronList: { package: "@crewhaus/tool-cron", export: "cronList" },
   cronDelete: { package: "@crewhaus/tool-cron", export: "cronDelete" },
+  packageManifestGenerate: {
+    package: "@crewhaus/tool-distribution",
+    export: "packageManifestGenerate",
+  },
+  packageManifestVerify: {
+    package: "@crewhaus/tool-distribution",
+    export: "packageManifestVerify",
+  },
   codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },
   codegraphCallers: { package: "@crewhaus/tool-codegraph", export: "codegraphCallers" },
   codegraphCallees: { package: "@crewhaus/tool-codegraph", export: "codegraphCallees" },

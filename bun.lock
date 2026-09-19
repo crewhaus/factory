@@ -128,6 +128,7 @@
         "@crewhaus/tool-data": "workspace:*",
         "@crewhaus/tool-datetime": "workspace:*",
         "@crewhaus/tool-defi": "workspace:*",
+        "@crewhaus/tool-distribution": "workspace:*",
         "@crewhaus/tool-docs": "workspace:*",
         "@crewhaus/tool-document-ingest": "workspace:*",
         "@crewhaus/tool-einvoice": "workspace:*",
@@ -2344,6 +2345,22 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-distribution": {
+      "name": "@crewhaus/tool-distribution",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/single-binary-cli": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-encode": "workspace:*",
+        "@crewhaus/tool-fetch": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-docs": {
       "name": "@crewhaus/tool-docs",
       "version": "0.6.0",
@@ -3659,6 +3676,8 @@
     "@crewhaus/tool-datetime": ["@crewhaus/tool-datetime@workspace:packages/tool-datetime"],
 
     "@crewhaus/tool-defi": ["@crewhaus/tool-defi@workspace:packages/tool-defi"],
+
+    "@crewhaus/tool-distribution": ["@crewhaus/tool-distribution@workspace:packages/tool-distribution"],
 
     "@crewhaus/tool-docs": ["@crewhaus/tool-docs@workspace:packages/tool-docs"],
 

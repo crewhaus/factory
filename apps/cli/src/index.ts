@@ -3669,6 +3669,7 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     secrets,
     hostfs,
     cron,
+    distribution,
   ] = await Promise.all([
     import("@crewhaus/tool-fs"),
     import("@crewhaus/tool-bash"),
@@ -3724,6 +3725,7 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     import("@crewhaus/tool-secrets"),
     import("@crewhaus/tool-hostfs"),
     import("@crewhaus/tool-cron"),
+    import("@crewhaus/tool-distribution"),
   ]);
   const map: Record<string, RegisteredTool> = {
     read: fs.read,
@@ -3754,6 +3756,9 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     codegraphCallers: codegraph.codegraphCallers,
     codegraphCallees: codegraph.codegraphCallees,
     codegraphImpact: codegraph.codegraphImpact,
+    // @crewhaus/tool-distribution
+    packageManifestGenerate: distribution.packageManifestGenerate,
+    packageManifestVerify: distribution.packageManifestVerify,
     // @crewhaus/tool-cron
     cronList: cron.cronList,
     cronDelete: cron.cronDelete,

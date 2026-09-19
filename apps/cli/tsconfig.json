@@ -78,6 +78,7 @@
     { "path": "../../packages/trace-event-bus" },
     { "path": "../../packages/tool-bash" },
     { "path": "../../packages/tool-builder" },
+    { "path": "../../packages/tool-distribution" },
     { "path": "../../packages/tool-cron" },
     { "path": "../../packages/tool-hostfs" },
     { "path": "../../packages/tool-secrets" },
