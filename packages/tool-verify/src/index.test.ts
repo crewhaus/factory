@@ -774,6 +774,40 @@ ${over.body ?? PROSE}
     expect(result.note).toContain("a run with no corpus says nothing about near-duplicates");
   });
 
+  test("what the tool SAYS about ok matches the ok it returns", async () => {
+    // A description promising a stricter gate than the code applies is the
+    // same lie as a wrong result: it is what a caller reads when deciding
+    // whether to trust the thing. This caught a real one — the description
+    // and the README still read "ok is false whenever anything went
+    // unchecked" after ok had stopped working that way, so the tool was
+    // advertising a gate it no longer was.
+    const result = await lint({ html: goodPage() });
+    // The run this is asserting about: clean, and with checks that never ran.
+    expect(result.ok).toBe(true);
+    expect(result.notRequested.length).toBeGreaterThan(0);
+    // Checked per TEXT, not over the two joined. Joined, the note's mention
+    // covered for a description that had stopped naming the bucket at all —
+    // a mutation removing it from the description left this green, which is
+    // how the weakness was found rather than reasoned about.
+    const said = `${seoLint.description} ${result.note}`;
+    for (const [where, text] of [
+      ["description", seoLint.description],
+      ["note", String(result.note)],
+    ] as const) {
+      // Both buckets named wherever the tool explains itself, because the
+      // difference between them is the whole of what ok means.
+      expect(text, `${where} does not name notChecked`).toContain("notChecked");
+      expect(text, `${where} does not name notRequested`).toContain("notRequested");
+    }
+    // And every "ok is false" it states is QUALIFIED by having been asked.
+    // An unqualified one is the old claim, and it is false of the run above.
+    // Asserted as a property rather than by banning the exact old sentence,
+    // which a reword would slip past.
+    const claims = [...said.matchAll(/ok is false[\s\S]{0,80}/gi)].map((m) => m[0]);
+    expect(claims.length).toBeGreaterThan(0);
+    for (const claim of claims) expect(claim).toMatch(/asked/i);
+  });
+
   test("the near-duplicate check says NOT CHECKED without a corpus, never a pass", async () => {
     // The survey's own warning: this check must never degrade into a pass
     // when no corpus is set. It is in notRequested rather than notChecked —

@@ -113,9 +113,25 @@ rather than returning the answer a passing page would have returned:
   part-of-speech tagger, "was" plus an "-ed" word over-fires on "was tired",
   so they are reported as candidates to read.
 
-`ok` is therefore false whenever anything went unchecked, even when nothing
-failed. A caller who wants a weaker gate reads `errors`; what it must not be
-able to do is read a pass out of a run that never looked.
+Everything a run did not look at is named, and it lands in one of two places,
+because they mean opposite things.
+
+`notChecked` is what the run was ASKED for and could not answer: a corpus you
+configured that could not be read, a language with no word boundaries, a page
+over a cap. That makes `ok` false even when nothing failed — a gate that
+passes on a check it was asked to make and could not is worse than no gate.
+
+`notRequested` is what nobody asked for: no `keyword`, no `url`, no `corpus`.
+It is named, it never counts as `passed`, and it does not make `ok` false.
+Folding the two together was the first version, and it made `ok` false for a
+clean page with zero errors — and for every other ordinary call. A gate that
+fails everything is a gate nobody reads, which costs precisely the signal the
+strict rule exists to protect.
+
+So `ok` means: nothing failed, and everything this run was asked to look at
+was looked at. It does NOT mean every check ran. In particular, a run with no
+`corpus` says nothing at all about near-duplicates — `notRequested` says so in
+those words.
 
 ## Saying it and being true are different questions
 
