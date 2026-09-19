@@ -117,6 +117,14 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
     "cancel the command",
   ],
   todoWrite: ["todo", "task list", "track tasks", "checklist"],
+  clipboardRead: ["read clipboard", "paste buffer", "what did I copy"],
+  clipboardWrite: ["copy to clipboard", "put on clipboard", "paste buffer"],
+  desktopNotify: ["desktop notification", "toast", "notify me", "alert on screen"],
+  openExternal: ["open a url", "open a file", "launch handler", "open in browser"],
+  printDocument: ["print", "printer", "cups", "print queue"],
+  windowList: ["open windows", "list windows", "what is on screen"],
+  userPresence: ["is the user there", "idle time", "screen locked", "away from keyboard"],
+  powerAssertion: ["keep awake", "prevent sleep", "caffeinate", "sleep inhibitor"],
   packageQuery: [
     "is it installed",
     "package version",
@@ -1798,6 +1806,14 @@ export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object.freeze([
   "packageManifestVerify",
   "packageQuery",
   "packageInstall",
+  "clipboardRead",
+  "clipboardWrite",
+  "desktopNotify",
+  "openExternal",
+  "printDocument",
+  "windowList",
+  "userPresence",
+  "powerAssertion",
 ]);
 
 /**
