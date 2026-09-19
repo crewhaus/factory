@@ -7,6 +7,8 @@
  * nothing on a chain, which is the only place the answer matters.
  */
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { decodeData, encodeCall, parseSignature, parseType, selectorOf } from "./lib/abi";
 import { formatUnits, parseUnits, toChecksumAddress, validateAddress } from "./lib/address";
 import {
@@ -17,6 +19,17 @@ import {
   rescaleDecimals,
   shareBps,
 } from "./lib/defi";
+import * as multicall from "./lib/multicall";
+import {
+  AGGREGATE3_SELECTOR,
+  AGGREGATE3_SIGNATURE,
+  ERROR_STRING_SELECTOR,
+  MULTICALL3_ADDRESS,
+  PANIC_SELECTOR,
+  decodeAggregate3,
+  decodeRevertData,
+  encodeAggregate3,
+} from "./lib/multicall";
 import { encodeType, personalSignHash, typedDataDigest } from "./lib/typed";
 
 const VITALIK = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
@@ -364,5 +377,325 @@ describe("DeFi maths", () => {
     expect(healthFactorBps(1_000n, 0n, 8_000)).toBeNull();
     expect(healthFactorBps(1_000n, 1_000n, 8_000)).toBe(8_000);
     expect(healthFactorBps(2_000n, 1_000n, 8_000)).toBe(16_000);
+  });
+});
+
+/**
+ * Multicall3, against encodings derived by hand from the ABI specification.
+ *
+ * The argument is an array of dynamic tuples, which is the shape with the
+ * most ways to be plausibly wrong: an offset relative to the wrong base, a
+ * length word in the wrong place, an empty `bytes` that does or does not
+ * carry a padding word. Every vector below is written out word by word, so a
+ * change in any of those is a diff and not a passing test.
+ */
+const EMPTY_BATCH = [
+  // head: the array is dynamic, so its one head word is an offset
+  "0000000000000000000000000000000000000000000000000000000000000020",
+  // the array's length: zero, and nothing after it
+  "0000000000000000000000000000000000000000000000000000000000000000",
+].join("");
+
+const ONE_CALL = [
+  "0000000000000000000000000000000000000000000000000000000000000020",
+  // one element
+  "0000000000000000000000000000000000000000000000000000000000000001",
+  // the element is a dynamic tuple, so the array's head holds its offset —
+  // relative to the start of the array's DATA, which is this word, not to
+  // the start of the call
+  "0000000000000000000000000000000000000000000000000000000000000020",
+  // target, right-aligned in its word
+  "000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045",
+  // allowFailure = true
+  "0000000000000000000000000000000000000000000000000000000000000001",
+  // offset of `callData` within the tuple: three head words
+  "0000000000000000000000000000000000000000000000000000000000000060",
+  // callData length, then the bytes LEFT-aligned in their word
+  "0000000000000000000000000000000000000000000000000000000000000004",
+  "18160ddd00000000000000000000000000000000000000000000000000000000",
+].join("");
+
+const TWO_CALLS = [
+  "0000000000000000000000000000000000000000000000000000000000000020",
+  "0000000000000000000000000000000000000000000000000000000000000002",
+  // two element offsets: the first past both of them, the second past the
+  // first element's five words
+  "0000000000000000000000000000000000000000000000000000000000000040",
+  "00000000000000000000000000000000000000000000000000000000000000e0",
+  // element 0: target, allowFailure = true, offset, length 1, one byte
+  "0000000000000000000000000000000000000000000000000000000000000001",
+  "0000000000000000000000000000000000000000000000000000000000000001",
+  "0000000000000000000000000000000000000000000000000000000000000060",
+  "0000000000000000000000000000000000000000000000000000000000000001",
+  "1100000000000000000000000000000000000000000000000000000000000000",
+  // element 1: target, allowFailure = FALSE, offset, and an empty `bytes`,
+  // which is a length word and no padding word after it
+  "0000000000000000000000000000000000000000000000000000000000000002",
+  "0000000000000000000000000000000000000000000000000000000000000000",
+  "0000000000000000000000000000000000000000000000000000000000000060",
+  "0000000000000000000000000000000000000000000000000000000000000000",
+].join("");
+
+/** `revert("insufficient balance")` as a contract returns it. */
+const ERROR_INSUFFICIENT = `${ERROR_STRING_SELECTOR}${[
+  "0000000000000000000000000000000000000000000000000000000000000020",
+  "0000000000000000000000000000000000000000000000000000000000000014",
+  "696e73756666696369656e742062616c616e6365000000000000000000000000",
+].join("")}`;
+
+/** Three results, the middle one reverted: `(bool,bytes)[]` as returned. */
+const THREE_RESULTS = `0x${[
+  "0000000000000000000000000000000000000000000000000000000000000020",
+  "0000000000000000000000000000000000000000000000000000000000000003",
+  // three element offsets, relative to the word after the length
+  "0000000000000000000000000000000000000000000000000000000000000060",
+  "00000000000000000000000000000000000000000000000000000000000000e0",
+  "00000000000000000000000000000000000000000000000000000000000001c0",
+  // [0] success, 32 bytes of return data holding 42
+  "0000000000000000000000000000000000000000000000000000000000000001",
+  "0000000000000000000000000000000000000000000000000000000000000040",
+  "0000000000000000000000000000000000000000000000000000000000000020",
+  "000000000000000000000000000000000000000000000000000000000000002a",
+  // [1] FAILED, carrying 0x64 bytes of Error(string) revert data
+  "0000000000000000000000000000000000000000000000000000000000000000",
+  "0000000000000000000000000000000000000000000000000000000000000040",
+  "0000000000000000000000000000000000000000000000000000000000000064",
+  "08c379a000000000000000000000000000000000000000000000000000000000",
+  "0000002000000000000000000000000000000000000000000000000000000000",
+  "00000014696e73756666696369656e742062616c616e63650000000000000000",
+  "0000000000000000000000000000000000000000000000000000000000000000",
+  // [2] success, no return data at all
+  "0000000000000000000000000000000000000000000000000000000000000001",
+  "0000000000000000000000000000000000000000000000000000000000000040",
+  "0000000000000000000000000000000000000000000000000000000000000000",
+].join("")}`;
+
+describe("Multicall3 request packing", () => {
+  test("the selectors are the four bytes an explorer shows", () => {
+    expect(`0x${selectorOf(AGGREGATE3_SIGNATURE)}`).toBe(AGGREGATE3_SELECTOR);
+    expect(AGGREGATE3_SELECTOR).toBe("0x82ad56cb");
+    expect(`0x${selectorOf("Error(string)")}`).toBe(ERROR_STRING_SELECTOR);
+    expect(`0x${selectorOf("Panic(uint256)")}`).toBe(PANIC_SELECTOR);
+  });
+
+  test("the canonical address carries an EIP-55 checksum that verifies", () => {
+    // The address is mixed case, so a typo in the constant is catchable —
+    // and this is the one constant nobody would notice being one nibble off.
+    const checked = validateAddress(MULTICALL3_ADDRESS);
+    expect({ valid: checked.valid, hadChecksum: checked.hadChecksum }).toEqual({
+      valid: true,
+      hadChecksum: true,
+    });
+    expect(checked.checksummed).toBe(MULTICALL3_ADDRESS);
+  });
+
+  test("an empty batch encodes to an empty array, not to nothing", () => {
+    const packed = encodeAggregate3([]);
+    expect(packed.data).toBe(`${AGGREGATE3_SELECTOR}${EMPTY_BATCH}`);
+    expect(packed.callCount).toBe(0);
+  });
+
+  test("a single call encodes byte for byte", () => {
+    const packed = encodeAggregate3([{ target: VITALIK, callData: "0x18160ddd" }]);
+    expect(packed.data).toBe(`${AGGREGATE3_SELECTOR}${ONE_CALL}`);
+    expect(packed.callCount).toBe(1);
+  });
+
+  test("allowFailure defaults to true, and false is a zero word", () => {
+    const packed = encodeAggregate3([
+      { target: "0x0000000000000000000000000000000000000001", callData: "0x11" },
+      {
+        target: "0x0000000000000000000000000000000000000002",
+        callData: "0x",
+        allowFailure: false,
+      },
+    ]);
+    expect(packed.data).toBe(`${AGGREGATE3_SELECTOR}${TWO_CALLS}`);
+  });
+
+  test("the Multicall3 address is an argument, defaulting to the canonical one", () => {
+    // The deterministic deploy is at the same address on most chains, which
+    // is not the same as all of them.
+    expect(encodeAggregate3([]).to).toBe(MULTICALL3_ADDRESS);
+    const elsewhere = encodeAggregate3([], "0x1111111111111111111111111111111111111111");
+    expect(elsewhere.to).toBe("0x1111111111111111111111111111111111111111");
+    // The calldata does not depend on where it is sent.
+    expect(elsewhere.data).toBe(encodeAggregate3([]).data);
+  });
+
+  test("a malformed target or address is refused, with which one it was", () => {
+    expect(() => encodeAggregate3([], "0xnothex")).toThrow(/Multicall3 address/);
+    expect(() => encodeAggregate3([{ target: "0x01", callData: "0x" }])).toThrow(
+      /call\[0\]\.target/,
+    );
+    expect(() => encodeAggregate3([{ target: VITALIK, callData: "0x123" }])).toThrow(
+      /call\[0\]\.callData/,
+    );
+  });
+});
+
+describe("Multicall3 result unpacking", () => {
+  test("a reverted sub-call is a row, not an exception", () => {
+    const results = decodeAggregate3(THREE_RESULTS, 3);
+    expect(results.map((r) => r.success)).toEqual([true, false, true]);
+    expect(results.map((r) => r.index)).toEqual([0, 1, 2]);
+  });
+
+  test("order and per-call data survive, including the empty one", () => {
+    const [first, second, third] = decodeAggregate3(THREE_RESULTS, 3);
+    expect(first?.returnData).toBe(`0x${"0".repeat(62)}2a`);
+    expect(first?.revert).toBeNull();
+    expect(second?.returnData).toBe(ERROR_INSUFFICIENT);
+    expect(third?.returnData).toBe("0x");
+  });
+
+  test("the middle call's revert decodes to its reason", () => {
+    const [, failed] = decodeAggregate3(THREE_RESULTS, 3);
+    expect(failed?.revert).toEqual({
+      kind: "string",
+      reason: "insufficient balance",
+      selector: ERROR_STRING_SELECTOR,
+      panicCode: null,
+      data: ERROR_INSUFFICIENT,
+    });
+  });
+
+  test("an empty batch decodes to no results", () => {
+    expect(decodeAggregate3(`0x${EMPTY_BATCH}`, 0)).toEqual([]);
+  });
+
+  test("the packed batch's own callCount is what the answer is checked against", () => {
+    // The pairing a caller actually writes: pack, send, unpack against the
+    // count that was packed.
+    const packed = encodeAggregate3([
+      { target: VITALIK, callData: "0x18160ddd" },
+      { target: VITALIK, callData: "0x18160ddd" },
+      { target: VITALIK, callData: "0x18160ddd" },
+    ]);
+    expect(decodeAggregate3(THREE_RESULTS, packed.callCount).map((r) => r.success)).toEqual([
+      true,
+      false,
+      true,
+    ]);
+  });
+
+  test("a result count that differs from the batch is refused, not truncated", () => {
+    // Results are matched by POSITION, so a short answer zipped against the
+    // calls attributes every result after the gap to the wrong call.
+    expect(() => decodeAggregate3(THREE_RESULTS, 2)).toThrow(
+      /3 result\(s\) for 2 call\(s\).*matched by position/s,
+    );
+    expect(() => decodeAggregate3(THREE_RESULTS, 4)).toThrow(/3 result\(s\) for 4 call\(s\)/);
+    expect(() => decodeAggregate3(THREE_RESULTS, -1)).toThrow(/non-negative integer/);
+  });
+
+  test("an unreadable blob is reported as the BATCH failing, not a sub-call", () => {
+    // The distinction is the whole point: this is a wrong address or a
+    // reverted aggregate, and there are no partial results to look at.
+    expect(() => decodeAggregate3("0x", 1)).toThrow(/batch's own return data/);
+    expect(() => decodeAggregate3(`0x${"00".repeat(31)}`, 1)).toThrow(/batch's own return data/);
+  });
+});
+
+describe("revert data", () => {
+  test("Error(string) gives the reason a human was shown", () => {
+    expect(decodeRevertData(ERROR_INSUFFICIENT).reason).toBe("insufficient balance");
+    expect(decodeRevertData(ERROR_INSUFFICIENT).kind).toBe("string");
+    // Hex pasted out of an explorer arrives mixed-case, and a selector
+    // compared without normalising would fall through to "unknown".
+    expect(decodeRevertData(ERROR_INSUFFICIENT.toUpperCase().replace("0X", "0x")).kind).toBe(
+      "string",
+    );
+  });
+
+  test("Panic(uint256) gives the documented meaning of its code", () => {
+    const panic = decodeRevertData(`${PANIC_SELECTOR}${"0".repeat(62)}11`);
+    expect({ kind: panic.kind, code: panic.panicCode }).toEqual({
+      kind: "panic",
+      code: "0x11",
+    });
+    expect(panic.reason).toMatch(/overflow/);
+    // A code outside the documented table keeps the code and gets no meaning.
+    const unlisted = decodeRevertData(`${PANIC_SELECTOR}${"0".repeat(62)}99`);
+    expect({ kind: unlisted.kind, code: unlisted.panicCode, reason: unlisted.reason }).toEqual({
+      kind: "panic",
+      code: "0x99",
+      reason: null,
+    });
+  });
+
+  test("an unknown selector stays hex rather than acquiring a message", () => {
+    const custom = `0xdeadbeef${"0".repeat(63)}1`;
+    expect(decodeRevertData(custom)).toEqual({
+      kind: "unknown",
+      reason: null,
+      selector: "0xdeadbeef",
+      panicCode: null,
+      data: custom,
+    });
+  });
+
+  test("empty revert data is its own kind, with no invented reason", () => {
+    // A bare revert(), a call to an address with no code, an out-of-gas.
+    expect(decodeRevertData("0x")).toEqual({
+      kind: "none",
+      reason: null,
+      selector: null,
+      panicCode: null,
+      data: "0x",
+    });
+    // Too short to hold a selector, so it does not get one.
+    expect(decodeRevertData("0xdead").selector).toBeNull();
+  });
+
+  test("a malformed Error(string) payload degrades to hex instead of throwing", () => {
+    // Throwing here would lose the other results in the same batch over one
+    // contract's bad revert data.
+    const lying = `${ERROR_STRING_SELECTOR}${"0".repeat(62)}20${"0".repeat(62)}ff`;
+    const decoded = decodeRevertData(lying);
+    expect({ kind: decoded.kind, reason: decoded.reason, selector: decoded.selector }).toEqual({
+      kind: "unknown",
+      reason: null,
+      selector: ERROR_STRING_SELECTOR,
+    });
+  });
+
+  test("revert data that is not hex is refused", () => {
+    expect(() => decodeRevertData("nope")).toThrow(/revert data/);
+  });
+});
+
+describe("the Multicall3 surface signs nothing and sends nothing", () => {
+  test("no export takes a key, and nothing in the source submits anything", () => {
+    const source = readFileSync(join(import.meta.dir, "lib/multicall.ts"), "utf8");
+    // A source scan that read nothing passes vacuously, so say how much it read.
+    expect(source.length).toBeGreaterThan(4_000);
+    for (const forbidden of [
+      "privateKey",
+      "mnemonic",
+      "keystore",
+      "signTransaction",
+      "sendTransaction",
+      "sendRawTransaction",
+    ]) {
+      expect({
+        forbidden,
+        present: source.toLowerCase().includes(forbidden.toLowerCase()),
+      }).toEqual({ forbidden, present: false });
+    }
+    // Whole words, not substrings: `AGGREGATE3_SIGNATURE` is a function
+    // signature and has nothing to do with signing anything.
+    const words = Object.keys(multicall)
+      .flatMap((name) => name.split(/[^A-Za-z]+|(?=[A-Z][a-z])/))
+      .map((word) => word.toLowerCase())
+      .filter((word) => word !== "");
+    expect(words.length).toBeGreaterThan(15);
+    expect(words).toContain("encode");
+    for (const forbidden of ["sign", "signer", "send", "submit", "broadcast", "key", "secret"]) {
+      expect({ forbidden, present: words.includes(forbidden) }).toEqual({
+        forbidden,
+        present: false,
+      });
+    }
   });
 });

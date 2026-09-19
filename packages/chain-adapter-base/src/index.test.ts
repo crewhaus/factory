@@ -9,6 +9,16 @@ import {
 
 afterEach(() => clearBoundaryCache());
 
+/** Reports rejection as a value so a loop's failure names the method. */
+function throwsFor(method: string): boolean {
+  try {
+    assertReadOnlyMethod("base-mainnet", method);
+    return false;
+  } catch (e) {
+    return e instanceof ChainAdapterError;
+  }
+}
+
 describe("assertReadOnlyMethod — slice-0 allowlist", () => {
   test("eth_call passes", () => {
     expect(() => assertReadOnlyMethod("base-mainnet", "eth_call")).not.toThrow();
@@ -16,12 +26,22 @@ describe("assertReadOnlyMethod — slice-0 allowlist", () => {
   test("eth_getLogs passes", () => {
     expect(() => assertReadOnlyMethod("base-mainnet", "eth_getLogs")).not.toThrow();
   });
+  // Both of these name an action a reader expects to cost gas. Neither does:
+  // one counts an account's already-sent transactions, the other evaluates
+  // calls against a block and throws the result away.
+  test("eth_getTransactionCount passes — it reads a nonce, it does not send", () => {
+    expect(() => assertReadOnlyMethod("base-mainnet", "eth_getTransactionCount")).not.toThrow();
+  });
+  test("eth_simulateV1 passes — simulation submits nothing", () => {
+    expect(() => assertReadOnlyMethod("base-mainnet", "eth_simulateV1")).not.toThrow();
+  });
   test("every allowlisted read method passes", () => {
     for (const m of [
       "eth_call",
       "eth_getLogs",
       "eth_getTransactionByHash",
       "eth_getTransactionReceipt",
+      "eth_getTransactionCount",
       "eth_getBlockByNumber",
       "eth_getBlockByHash",
       "eth_blockNumber",
@@ -30,6 +50,7 @@ describe("assertReadOnlyMethod — slice-0 allowlist", () => {
       "eth_getCode",
       "eth_getStorageAt",
       "eth_estimateGas",
+      "eth_simulateV1",
       "eth_feeHistory",
       "eth_gasPrice",
       "net_version",
@@ -79,6 +100,51 @@ describe("assertReadOnlyMethod — slice-0 allowlist", () => {
   });
   test("empty method string throws", () => {
     expect(() => assertReadOnlyMethod("base-mainnet", "")).toThrow(ChainAdapterError);
+  });
+});
+
+describe("nothing here signs or sends", () => {
+  // The last three are key-adjacent rather than writes: they enumerate or
+  // unlock accounts, which is how a read-only surface starts holding keys.
+  test("no write-, sign-, submit- or key-adjacent method is on the allowlist", () => {
+    for (const m of [
+      "eth_sendTransaction",
+      "eth_sendRawTransaction",
+      "eth_sign",
+      "eth_signTransaction",
+      "eth_signTypedData",
+      "eth_signTypedData_v4",
+      "personal_sign",
+      "personal_sendTransaction",
+      "wallet_sendCalls",
+      "miner_start",
+      "evm_mine",
+      "personal_unlockAccount",
+      "eth_accounts",
+      "eth_requestAccounts",
+    ]) {
+      expect({ method: m, throws: throwsFor(m) }).toEqual({ method: m, throws: true });
+    }
+  });
+
+  test("the module surface has no field to pass a private key to", async () => {
+    const src = await Bun.file(new URL("./index.ts", import.meta.url)).text();
+    // A scan that read the wrong path finds nothing and passes every miss
+    // below, so prove the read landed on the real module first.
+    expect(src).toContain("READ_ONLY_RPC_METHODS");
+    for (const forbidden of [
+      "privateKey",
+      "mnemonic",
+      "keystore",
+      "secretKey",
+      "signTransaction",
+      "signAndBroadcast",
+    ]) {
+      expect({ forbidden, present: src.includes(forbidden) }).toEqual({
+        forbidden,
+        present: false,
+      });
+    }
   });
 });
 
