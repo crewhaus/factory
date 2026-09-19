@@ -150,6 +150,28 @@ describe("the start lock", () => {
     startTimeMs: (pid: number) => startTimes[pid],
   });
 
+  test("an unanswered liveness probe does NOT free the lock", () => {
+    // The lock exists so that two managers cannot start the same harness. A
+    // probe that did not answer — on Windows, powershell failing to start in
+    // time — is not evidence the holder is gone, and treating it as such hands
+    // the slot to a second manager while the first is still running. This is
+    // the same reasoning the start-time comparison below already applied; the
+    // liveness check used to be the one place that did not.
+    const held = { pid: 100, pidStartTimeMs: 5_000, at: 1_000 };
+    const unknown = {
+      isAlive: (): boolean | undefined => undefined,
+      startTimeMs: (): number | undefined => undefined,
+    };
+    expect(startLockIsStale(held, unknown, 2_000)).toBe(false);
+    // ...while an OBSERVED death still frees it, so a manager killed
+    // mid-preflight cannot wedge the harness shut.
+    const dead = {
+      isAlive: (): boolean | undefined => false,
+      startTimeMs: (): number | undefined => undefined,
+    };
+    expect(startLockIsStale(held, dead, 2_000)).toBe(true);
+  });
+
   test("only one starter can hold it — O_EXCL, not last-writer-wins", () => {
     const dir = tempHarness();
     expect(acquireStartLock(dir, { pid: 100, pidStartTimeMs: 5, at: 1_000 })).toBe(true);

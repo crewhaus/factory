@@ -67,6 +67,21 @@ describe("verifyRunfile", () => {
     expect(verdict.verified).toBe(true);
   });
 
+  test("a pid the platform will not answer for is NOT reported dead", () => {
+    // The whole point of the three-state probe. `pid-dead` with
+    // `verified: true` is a confident claim; making it on the strength of a
+    // probe that timed out is how a supervisor concludes a live daemon has
+    // died and starts a second one beside it. An unanswered probe means live
+    // but UNVERIFIED — the same answer this function already gives when the
+    // platform will not report a start time.
+    const dir = tempHarness();
+    const base = createFakeProcessOps();
+    const unknown = { ...base, isAlive: (): boolean | undefined => undefined };
+    const verdict = verifyRunfile(seedRunning(dir), unknown);
+    expect(verdict.reason).not.toBe("pid-dead");
+    expect(verdict.verified).toBe(false);
+  });
+
   test("no runfile is not live", () => {
     expect(verifyRunfile(undefined, createFakeProcessOps()).reason).toBe("no-runfile");
   });
