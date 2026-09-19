@@ -1558,13 +1558,24 @@ describe("DnsLookup / TlsInspect", () => {
     // says. The distinction is visible in WHICH error each type reports.
     expect(result.records).toEqual({});
     expect(Object.keys(result.errors).sort()).toEqual(["A", "AAAA", "CNAME", "MX", "NS", "TXT"]);
-    expect(result.errors.A).toContain("exceeded 1ms");
-    for (const type of ["AAAA", "CNAME", "MX", "NS", "TXT"]) {
-      expect({ type, error: result.errors[type] }).toEqual({
-        type,
-        error: "the 1ms lookup budget elapsed before this record type was asked for",
-      });
-    }
+
+    // The distinction that matters is AT MOST ONE type ever got as far as a
+    // lookup. Six private budgets would have started all six and reported
+    // "exceeded 1ms" six times; one shared budget can only be spent once.
+    //
+    // Which type that is — or whether even the first one wins the race to
+    // start — is scheduling, not behaviour. This used to assert that `A`
+    // specifically reported the mid-lookup timeout, and on a loaded CI runner
+    // the 1ms was gone before `A` was issued, so every type reported "never
+    // asked" and a correct result failed.
+    const NEVER_ASKED = "the 1ms lookup budget elapsed before this record type was asked for";
+    const all = ["A", "AAAA", "CNAME", "MX", "NS", "TXT"] as const;
+    const started = all.filter((t) => String(result.errors[t]).includes("exceeded 1ms"));
+    const neverAsked = all.filter((t) => result.errors[t] === NEVER_ASKED);
+    expect(started.length).toBeLessThanOrEqual(1);
+    // ...and every type is accounted for by exactly one of the two answers, so
+    // a third, vaguer error cannot slip through unnoticed.
+    expect(started.length + neverAsked.length).toBe(all.length);
   });
 
   test("TlsInspect refuses a host no allow-listed origin names", async () => {
