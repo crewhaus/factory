@@ -8,6 +8,7 @@ import {
   canonicalizeOrigin,
   fetch,
   getFetchConfig,
+  isPrivateIp,
   registerFetchConfig,
 } from "./index";
 
@@ -772,5 +773,102 @@ describe("pinnedFetch (default fetcher — IP-pinned dial)", () => {
     if (typeof result !== "string") throw new Error("expected string result");
     expect(dialedWith).toBeInstanceOf(Request);
     expect(result).toContain("v6-ok");
+  });
+});
+
+/**
+ * The synchronised private-address classifier, over every spelling of a private
+ * address that has been used to walk past one of these guards.
+ *
+ * The matrix is asserted TWICE per spelling:
+ *
+ *   - `isPrivateIp(spelling)` — the classifier's own property. `assertNotSsrf`
+ *     is exported and called with raw hostnames by `@crewhaus/tool-registry`,
+ *     `@crewhaus/tool-containers` and `@crewhaus/tool-supplychain`, so the
+ *     uncompressed spellings below really do arrive in this form.
+ *
+ *   - through `new URL(...).hostname` — what `performFetch` actually hands the
+ *     guard. This is the half that matters and the half that was broken: the
+ *     WHATWG parser rewrites `[::ffff:169.254.169.254]` to `[::ffff:a9fe:a9fe]`,
+ *     so a classifier comparing address TEXT never sees the spelling it was
+ *     written against. Before the synchronised block, 15 of the 33 rows below
+ *     reached the metadata service; `64:ff9b::a9fe:a9fe` got there in BOTH
+ *     forms, because that IS 169.254.169.254 on any network running DNS64/NAT64.
+ */
+describe("private-address classifier — every spelling of a blocked address", () => {
+  const mustBlock: ReadonlyArray<readonly [string, string]> = [
+    ["metadata, dotted decimal", "169.254.169.254"],
+    ["metadata, 32-bit integer", "2852039166"],
+    ["metadata, packed hex", "0xA9FEA9FE"],
+    ["metadata, dotted octal", "0251.0376.0251.0376"],
+    ["loopback, short form", "127.1"],
+    ["metadata, v4-mapped dotted", "::ffff:169.254.169.254"],
+    ["metadata, v4-mapped hex", "::ffff:a9fe:a9fe"],
+    ["metadata, v4-mapped uncompressed hex", "0:0:0:0:0:ffff:a9fe:a9fe"],
+    ["metadata, v4-mapped uncompressed dotted", "0:0:0:0:0:ffff:169.254.169.254"],
+    ["metadata, NAT64 well-known prefix", "64:ff9b::a9fe:a9fe"],
+    ["metadata, NAT64 well-known prefix dotted", "64:ff9b::169.254.169.254"],
+    ["metadata, NAT64 64:ff9b:1::/48", "64:ff9b:1::a9fe:a9fe"],
+    ["metadata, NAT64 64:ff9b:1::/48 uncompressed", "64:ff9b:1:0:0:0:a9fe:a9fe"],
+    ["metadata, IPv4-compatible", "::a9fe:a9fe"],
+    ["metadata, v4-translated", "::ffff:0:a9fe:a9fe"],
+    ["metadata, 6to4", "2002:a9fe:a9fe::"],
+    ["loopback v4", "127.0.0.1"],
+    ["loopback v6", "::1"],
+    ["loopback v6, uncompressed", "0:0:0:0:0:0:0:1"],
+    ["loopback via NAT64", "64:ff9b::7f00:1"],
+    ["link-local v6", "fe80::1"],
+    ["link-local v6, upper edge of fe80::/10", "febf::1"],
+    ["unique-local v6", "fd00::1"],
+    ["unspecified v6", "::"],
+    ["unspecified v6, uncompressed", "0:0:0:0:0:0:0:0"],
+    ["RFC1918 10/8", "10.0.0.1"],
+    ["RFC1918 192.168/16", "192.168.1.1"],
+    ["RFC1918 172.16/12", "172.16.0.1"],
+    ["CGNAT 100.64/10", "100.64.0.1"],
+    ["benchmarking 198.18/15", "198.18.0.1"],
+    ["multicast", "224.0.0.1"],
+    ["broadcast", "255.255.255.255"],
+    ["unspecified v4", "0.0.0.0"],
+  ];
+
+  const mustStayPublic: ReadonlyArray<readonly [string, string]> = [
+    ["Google DNS v4", "8.8.8.8"],
+    ["Cloudflare DNS v4", "1.1.1.1"],
+    ["example.com", "93.184.216.34"],
+    ["Cloudflare DNS v6", "2606:4700:4700::1111"],
+    ["Google DNS v6", "2001:4860:4860::8888"],
+  ];
+
+  /** What `performFetch` hands the guard: the URL-canonicalised hostname. */
+  const asUrlHostname = (spelling: string): string =>
+    new URL(`http://${spelling.includes(":") ? `[${spelling}]` : spelling}/`).hostname;
+
+  for (const [label, spelling] of mustBlock) {
+    test(`${label} (${spelling}) is private, as written and after URL parsing`, async () => {
+      expect(isPrivateIp(spelling)).toBe(true);
+      expect(isPrivateIp(asUrlHostname(spelling))).toBe(true);
+      await expect(assertNotSsrf(spelling)).rejects.toBeInstanceOf(FetchPermissionError);
+      await expect(assertNotSsrf(asUrlHostname(spelling))).rejects.toBeInstanceOf(
+        FetchPermissionError,
+      );
+    });
+  }
+
+  for (const [label, spelling] of mustStayPublic) {
+    test(`${label} (${spelling}) stays public — over-blocking breaks real usage`, async () => {
+      expect(isPrivateIp(spelling)).toBe(false);
+      expect(isPrivateIp(asUrlHostname(spelling))).toBe(false);
+      // An IP literal is its own pin, so this resolves without touching DNS.
+      await expect(assertNotSsrf(spelling)).resolves.toBeDefined();
+    });
+  }
+
+  test("a hostname is not mistaken for an IP literal", () => {
+    // The classifier must return false (not throw, not guess) for names, so
+    // `assertNotSsrf` falls through to the resolver and checks the ANSWER.
+    for (const host of ["api.example.com", "metadata.google.internal", "abc.def", "cafe.babe"]) {
+      expect(isPrivateIp(host)).toBe(false);
+    }
   });
 });

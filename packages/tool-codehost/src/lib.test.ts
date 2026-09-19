@@ -44,6 +44,7 @@ import {
   prState,
 } from "./lib/shape";
 import {
+  assertNotSsrf,
   buildCodehostConfig,
   canonicalizeOrigin,
   expandIpv6,
@@ -759,8 +760,74 @@ describe("isPrivateIp", () => {
     expect(isPrivateIp("2606:4700::1111")).toBe(false);
   });
 
-  test("an IPv6-shaped string it cannot parse is refused, not waved through", () => {
-    expect(isPrivateIp("::gg::1")).toBe(true);
+  test("an IPv6-shaped string it cannot parse is refused by the gate", async () => {
+    // `isPrivateIp` is a classifier, so a string that is not an address at all
+    // is not private and it says so. Fail-closed belongs in the gate, which is
+    // the thing that protects a socket: `assertNotSsrf` never hands back a
+    // literal it could not parse.
+    expect(isPrivateIp("::gg::1")).toBe(false);
+    await expect(assertNotSsrf("::gg::1")).rejects.toThrow("not a valid IPv6 address");
+  });
+
+  // The 2026-09-18 SSRF audit matrix, kept as a test so the property is held
+  // going forward. Three entries — `64:ff9b:1::a9fe:a9fe`,
+  // `64:ff9b:1:0:0:0:a9fe:a9fe` and `::ffff:0:a9fe:a9fe` — were classified
+  // PUBLIC by the classifier this package carried before the synchronised
+  // block landed, so this list is not decoration.
+  const AUDIT_MATRIX_PRIVATE = [
+    "169.254.169.254",
+    "2852039166",
+    "0xA9FEA9FE",
+    "0251.0376.0251.0376",
+    "127.1",
+    "::ffff:169.254.169.254",
+    "::ffff:a9fe:a9fe",
+    "0:0:0:0:0:ffff:a9fe:a9fe",
+    "0:0:0:0:0:ffff:169.254.169.254",
+    "64:ff9b::a9fe:a9fe",
+    "64:ff9b::169.254.169.254",
+    "64:ff9b:1::a9fe:a9fe",
+    "64:ff9b:1:0:0:0:a9fe:a9fe",
+    "::a9fe:a9fe",
+    "::ffff:0:a9fe:a9fe",
+    "2002:a9fe:a9fe::",
+    "127.0.0.1",
+    "::1",
+    "0:0:0:0:0:0:0:1",
+    "64:ff9b::7f00:1",
+    "fe80::1",
+    "febf::1",
+    "fd00::1",
+    "::",
+    "0:0:0:0:0:0:0:0",
+    "10.0.0.1",
+    "192.168.1.1",
+    "172.16.0.1",
+    "100.64.0.1",
+    "198.18.0.1",
+    "224.0.0.1",
+    "255.255.255.255",
+    "0.0.0.0",
+  ] as const;
+
+  const AUDIT_MATRIX_PUBLIC = [
+    "8.8.8.8",
+    "1.1.1.1",
+    "93.184.216.34",
+    "2606:4700:4700::1111",
+    "2001:4860:4860::8888",
+  ] as const;
+
+  test("refuses every spelling in the audit matrix", () => {
+    // Assert the size too: a matrix test that silently lost its rows passes
+    // while proving nothing.
+    expect(AUDIT_MATRIX_PRIVATE.length).toBe(33);
+    expect(AUDIT_MATRIX_PRIVATE.filter((ip) => !isPrivateIp(ip))).toEqual([]);
+  });
+
+  test("does not over-block the public addresses in the audit matrix", () => {
+    expect(AUDIT_MATRIX_PUBLIC.length).toBe(5);
+    expect(AUDIT_MATRIX_PUBLIC.filter((ip) => isPrivateIp(ip))).toEqual([]);
   });
 
   test("normalizeIpv4 and expandIpv6 report null for non-addresses", () => {

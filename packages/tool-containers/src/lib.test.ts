@@ -6,6 +6,7 @@ import { describe, expect, test } from "bun:test";
  * the network-shaped tests are in index.test.ts.
  */
 import { createHash } from "node:crypto";
+import { _setDnsLookup, assertNotSsrf, isPrivateIp } from "@crewhaus/tool-fetch";
 import {
   CONFIG_JSON,
   OCI_AMD64_JSON,
@@ -20,7 +21,7 @@ import {
   readTokenBody,
   tokenRequestUrl,
 } from "./lib/challenge";
-import { deadlineSignal } from "./lib/http";
+import { _setFetch, deadlineSignal, httpGet } from "./lib/http";
 import {
   MEDIA_TYPES,
   blobPath,
@@ -604,5 +605,137 @@ describe("the glob matcher", () => {
     const tag = "a".repeat(128);
     expect(compileGlob("*a*a*a*a*a*a*a*a*z")(tag)).toBe(false);
     expect(compileGlob("*a*a*a*a*a*a*a*a*a")(tag)).toBe(true);
+  });
+});
+
+/**
+ * The private-address classifier this package relies on.
+ *
+ * `tool-containers` deliberately owns NO copy of the synchronised classifier:
+ * `httpGet` re-checks every redirect hop with `@crewhaus/tool-fetch`'s
+ * `assertNotSsrf`, so the classifier here IS tool-fetch's, and this package's
+ * exposure is whatever that one misses. The matrix below is asserted from this
+ * side of the dependency on purpose — tool-fetch proving its own property does
+ * not prove that the version `tool-containers` resolves still has it, and a
+ * registry that answers with `302 Location: http://[64:ff9b::a9fe:a9fe]/` is
+ * this package's attack, not tool-fetch's.
+ *
+ * Each spelling is asserted twice: as written (callers hand `assertNotSsrf`
+ * raw hostnames) and through `new URL(...).hostname`, which is what `httpGet`
+ * actually passes. The second is the half that matters — the WHATWG parser
+ * rewrites `[::ffff:169.254.169.254]` to `[::ffff:a9fe:a9fe]`, so a guard
+ * comparing address TEXT never sees the spelling it was written against.
+ * Against the classifier as it stood before the synchronised block, 15 of
+ * these 33 rows were classified public and would have been dialled.
+ */
+describe("SSRF classifier — every spelling of a blocked address reaches this package", () => {
+  const mustBlock: ReadonlyArray<readonly [string, string]> = [
+    ["metadata, dotted decimal", "169.254.169.254"],
+    ["metadata, 32-bit integer", "2852039166"],
+    ["metadata, packed hex", "0xA9FEA9FE"],
+    ["metadata, dotted octal", "0251.0376.0251.0376"],
+    ["loopback, short form", "127.1"],
+    ["metadata, v4-mapped dotted", "::ffff:169.254.169.254"],
+    ["metadata, v4-mapped hex", "::ffff:a9fe:a9fe"],
+    ["metadata, v4-mapped uncompressed hex", "0:0:0:0:0:ffff:a9fe:a9fe"],
+    ["metadata, v4-mapped uncompressed dotted", "0:0:0:0:0:ffff:169.254.169.254"],
+    ["metadata, NAT64 well-known prefix", "64:ff9b::a9fe:a9fe"],
+    ["metadata, NAT64 well-known prefix dotted", "64:ff9b::169.254.169.254"],
+    ["metadata, NAT64 64:ff9b:1::/48", "64:ff9b:1::a9fe:a9fe"],
+    ["metadata, NAT64 64:ff9b:1::/48 uncompressed", "64:ff9b:1:0:0:0:a9fe:a9fe"],
+    ["metadata, IPv4-compatible", "::a9fe:a9fe"],
+    ["metadata, v4-translated", "::ffff:0:a9fe:a9fe"],
+    ["metadata, 6to4", "2002:a9fe:a9fe::"],
+    ["loopback v4", "127.0.0.1"],
+    ["loopback v6", "::1"],
+    ["loopback v6, uncompressed", "0:0:0:0:0:0:0:1"],
+    ["loopback via NAT64", "64:ff9b::7f00:1"],
+    ["link-local v6", "fe80::1"],
+    ["link-local v6, upper edge of fe80::/10", "febf::1"],
+    ["unique-local v6", "fd00::1"],
+    ["unspecified v6", "::"],
+    ["unspecified v6, uncompressed", "0:0:0:0:0:0:0:0"],
+    ["RFC1918 10/8", "10.0.0.1"],
+    ["RFC1918 192.168/16", "192.168.1.1"],
+    ["RFC1918 172.16/12", "172.16.0.1"],
+    ["CGNAT 100.64/10", "100.64.0.1"],
+    ["benchmarking 198.18/15", "198.18.0.1"],
+    ["multicast", "224.0.0.1"],
+    ["broadcast", "255.255.255.255"],
+    ["unspecified v4", "0.0.0.0"],
+  ];
+
+  const mustStayPublic: ReadonlyArray<readonly [string, string]> = [
+    ["Google DNS v4", "8.8.8.8"],
+    ["Cloudflare DNS v4", "1.1.1.1"],
+    ["example.com", "93.184.216.34"],
+    ["Cloudflare DNS v6", "2606:4700:4700::1111"],
+    ["Google DNS v6", "2001:4860:4860::8888"],
+  ];
+
+  /** What `httpGet` hands the guard: the URL-canonicalised hostname. */
+  const asUrlHostname = (spelling: string): string =>
+    new URL(`http://${spelling.includes(":") ? `[${spelling}]` : spelling}/`).hostname;
+
+  for (const [label, spelling] of mustBlock) {
+    test(`${label} (${spelling}) is refused, as written and after URL parsing`, async () => {
+      expect(isPrivateIp(spelling)).toBe(true);
+      expect(isPrivateIp(asUrlHostname(spelling))).toBe(true);
+      await expect(assertNotSsrf(spelling)).rejects.toThrow();
+      await expect(assertNotSsrf(asUrlHostname(spelling))).rejects.toThrow();
+    });
+  }
+
+  for (const [label, spelling] of mustStayPublic) {
+    test(`${label} (${spelling}) stays reachable — over-blocking breaks real registries`, async () => {
+      expect(isPrivateIp(spelling)).toBe(false);
+      expect(isPrivateIp(asUrlHostname(spelling))).toBe(false);
+      // An IP literal is its own pin, so this resolves without touching DNS.
+      await expect(assertNotSsrf(spelling)).resolves.toBeDefined();
+    });
+  }
+
+  test("a registry hostname is not mistaken for an IP literal", () => {
+    // The classifier must return false for names so `assertNotSsrf` falls
+    // through to the resolver and checks the ANSWER — that is the rebinding
+    // backstop `httpGet` depends on at every hop.
+    for (const host of ["registry-1.docker.io", "ghcr.io", "metadata.google.internal"]) {
+      expect(isPrivateIp(host)).toBe(false);
+    }
+  });
+
+  test("the guard is wired into every redirect hop, not just the first", async () => {
+    // The matrix above proves classification. This proves tool-containers
+    // actually asks: a NAT64 metadata redirect is refused mid-chain.
+    //
+    // Hop 0 is a NAME, so `assertNotSsrf` resolves it. DNS is stubbed to a
+    // public address for two reasons: the suite must not depend on the
+    // network, and an unresolvable hop 0 would abort the chain before the
+    // redirect is ever followed — a trap this test fell into, because
+    // `getaddrinfo ENOTFOUND` arrives as `SSRF: cannot resolve ...` and
+    // satisfies a bare /SSRF/ matcher without the guard doing any work.
+    const hops = ["https://registry.test/v2/x/manifests/1", "http://[64:ff9b::a9fe:a9fe]/latest/"];
+    const dialled: string[] = [];
+    _setDnsLookup(async () => ({ address: "93.184.216.34", family: 4 }));
+    _setFetch(async (req) => {
+      dialled.push(req.url);
+      if (req.url === hops[0]) {
+        return new Response(null, { status: 302, headers: { location: hops[1] as string } });
+      }
+      // Deliberately NOT the word the assertion matches: if the guard ever
+      // lets hop 1 through, this must read as a failure, not as a pass.
+      throw new Error(`reached the metadata address: dialled ${req.url}`);
+    });
+    try {
+      await expect(httpGet(new URL(hops[0] as string), { maxBytes: 4096 })).rejects.toThrow(
+        /SSRF: host .* is a private\/loopback IP/,
+      );
+      // The chain has to have actually got as far as the redirect: hop 0
+      // dialled exactly once, hop 1 never.
+      expect(dialled).toEqual([hops[0] as string]);
+    } finally {
+      _setFetch(undefined);
+      _setDnsLookup(undefined);
+    }
   });
 });

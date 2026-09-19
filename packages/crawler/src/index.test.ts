@@ -11,7 +11,13 @@ import type {
 } from "@crewhaus/citation-tracker";
 import { createCitationTracker } from "@crewhaus/citation-tracker";
 import type { CrawlResult, Crawler } from "./index.js";
-import { _setDnsLookup, createCiteFactTool, createCrawler, createSourceTool } from "./index.js";
+import {
+  _setDnsLookup,
+  createCiteFactTool,
+  createCrawler,
+  createSourceTool,
+  isPrivateIp,
+} from "./index.js";
 
 // HTTP fetches now run an SSRF guard that resolves the host before egress.
 // Resolve every name to a public IP by default so the existing transport
@@ -1337,6 +1343,105 @@ describe("createCrawler — dangling-symlink containment", () => {
       writeFileSync(join(root, "sub", "made.txt"), "arrived through the link");
       const r = await crawler.fetch(`file://${link}`);
       expect(r.content).toContain("arrived through the link");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// The private-address classifier is the SSRF floor's whole foundation, and it
+// is the part that has silently rotted before: a guard that compares address
+// TEXT looks correct and blocks nothing, because one address has many
+// spellings and the URL parser hands you a different one than you wrote.
+// `http://[::ffff:169.254.169.254]/` arrives as `[::ffff:a9fe:a9fe]`, and
+// `64:ff9b::a9fe:a9fe` IS 169.254.169.254 wherever DNS64/NAT64 runs — on a
+// cloud host, the credential endpoint. This matrix pins every spelling that
+// must stay blocked, plus real public addresses that must NOT be, so a future
+// edit cannot quietly reopen the hole or over-block real traffic.
+describe("isPrivateIp — spelling matrix", () => {
+  const PRIVATE_SPELLINGS: ReadonlyArray<readonly [string, string]> = [
+    ["169.254.169.254", "cloud metadata, dotted decimal"],
+    ["2852039166", "cloud metadata, packed decimal"],
+    ["0xA9FEA9FE", "cloud metadata, packed hex"],
+    ["0251.0376.0251.0376", "cloud metadata, octal octets"],
+    ["127.1", "loopback, inet_aton short form"],
+    ["::ffff:169.254.169.254", "IPv4-mapped, dotted tail"],
+    ["::ffff:a9fe:a9fe", "IPv4-mapped, hex tail (what `new URL` produces)"],
+    ["0:0:0:0:0:ffff:a9fe:a9fe", "IPv4-mapped, uncompressed"],
+    ["0:0:0:0:0:ffff:169.254.169.254", "IPv4-mapped, uncompressed dotted tail"],
+    ["64:ff9b::a9fe:a9fe", "NAT64 well-known prefix"],
+    ["64:ff9b::169.254.169.254", "NAT64 well-known prefix, dotted tail"],
+    ["64:ff9b:1::a9fe:a9fe", "NAT64 local-use prefix 64:ff9b:1::/48"],
+    ["64:ff9b:1:0:0:0:a9fe:a9fe", "NAT64 local-use prefix, uncompressed"],
+    ["::a9fe:a9fe", "IPv4-compatible IPv6"],
+    ["::ffff:0:a9fe:a9fe", "IPv4-translated ::ffff:0:0:0/96"],
+    ["2002:a9fe:a9fe::", "6to4"],
+    ["127.0.0.1", "loopback v4"],
+    ["::1", "loopback v6, compressed"],
+    ["0:0:0:0:0:0:0:1", "loopback v6, uncompressed"],
+    ["64:ff9b::7f00:1", "loopback v4 behind NAT64"],
+    ["fe80::1", "link-local v6"],
+    ["febf::1", "link-local v6, top of fe80::/10"],
+    ["fd00::1", "unique-local v6"],
+    ["::", "unspecified, compressed"],
+    ["0:0:0:0:0:0:0:0", "unspecified, uncompressed"],
+    ["10.0.0.1", "RFC1918 /8"],
+    ["192.168.1.1", "RFC1918 /16"],
+    ["172.16.0.1", "RFC1918 /12"],
+    ["100.64.0.1", "carrier-grade NAT"],
+    ["198.18.0.1", "benchmarking"],
+    ["224.0.0.1", "multicast v4"],
+    ["255.255.255.255", "broadcast"],
+    ["0.0.0.0", "this-network"],
+  ];
+
+  const PUBLIC_ADDRESSES: ReadonlyArray<string> = [
+    "8.8.8.8",
+    "1.1.1.1",
+    "93.184.216.34",
+    "2606:4700:4700::1111",
+    "2001:4860:4860::8888",
+  ];
+
+  for (const [address, why] of PRIVATE_SPELLINGS) {
+    test(`blocks ${address} (${why})`, () => {
+      expect(isPrivateIp(address)).toBe(true);
+    });
+  }
+
+  test("blocks every private spelling — no leaks", () => {
+    const leaked = PRIVATE_SPELLINGS.filter(([a]) => !isPrivateIp(a)).map(([a]) => a);
+    expect(leaked).toEqual([]);
+  });
+
+  for (const address of PUBLIC_ADDRESSES) {
+    test(`leaves ${address} public`, () => {
+      expect(isPrivateIp(address)).toBe(false);
+    });
+  }
+
+  test("over-blocking nothing public", () => {
+    const overBlocked = PUBLIC_ADDRESSES.filter((a) => isPrivateIp(a));
+    expect(overBlocked).toEqual([]);
+  });
+});
+
+// And the classifier is actually wired into the egress guard: a NAT64-spelled
+// metadata address must be refused even when the allow-list names it.
+describe("createCrawler — SSRF floor rejects NAT64-spelled metadata", () => {
+  test("rejects an allow-listed 64:ff9b:: metadata origin", async () => {
+    const root = newRoot();
+    try {
+      const crawler = createCrawler({
+        tracker: createCitationTracker({ rootDir: root }),
+        config: {
+          allowedOrigins: new Set(["http://[64:ff9b::a9fe:a9fe]"]),
+          _httpFetch: async () => new Response("creds", { status: 200 }),
+        },
+      });
+      await expect(crawler.fetch("http://[64:ff9b::a9fe:a9fe]/latest/meta-data/")).rejects.toThrow(
+        /SSRF/,
+      );
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
