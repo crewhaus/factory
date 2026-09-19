@@ -508,6 +508,44 @@ describe("refusals", () => {
     _setDnsLookup(undefined);
   });
 
+  test("the NAT64 /48 prefix is refused on the ANSWER path, not just as a literal", async () => {
+    __setPrivateHostsAllowedForTest(false);
+    registerHttpConfig({ allowed_origins: ["https://looks-fine.example.com"] });
+    // 64:ff9b:1::/48 is the NAT64 prefix a `64:ff9b::/96` test misses, and it
+    // is the spelling this package leaked before the classifier was replaced.
+    for (const address of [
+      "64:ff9b:1::a9fe:a9fe",
+      "64:ff9b:1:0:0:0:a9fe:a9fe",
+      "::ffff:0:a9fe:a9fe",
+    ]) {
+      _setDnsLookup(async () => ({ address, family: 6 }));
+      const result = await run(httpRequest, { url: "https://looks-fine.example.com/" });
+      expect({ address, refused: typeof result === "string" && result.includes("SSRF") }).toEqual({
+        address,
+        refused: true,
+      });
+    }
+    _setDnsLookup(undefined);
+  });
+
+  test("a resolver answer that is not a valid IPv6 address is refused, not pinned", async () => {
+    __setPrivateHostsAllowedForTest(false);
+    registerHttpConfig({ allowed_origins: ["https://looks-fine.example.com"] });
+    // The classifier is a PREDICATE: it answers "not private" for a string
+    // that is not an address at all. The gate has to read that as "could not
+    // classify", the same way it already does for an IPv6 literal it cannot
+    // expand — otherwise an unclassifiable answer becomes the pinned target.
+    for (const address of ["2002:184.226.129.88", "fe80:::1", "1:2:3:4:5:6:7:8:9"]) {
+      _setDnsLookup(async () => ({ address, family: 6 }));
+      const result = await run(httpRequest, { url: "https://looks-fine.example.com/" });
+      expect({ address, refused: typeof result === "string" && result.includes("SSRF") }).toEqual({
+        address,
+        refused: true,
+      });
+    }
+    _setDnsLookup(undefined);
+  });
+
   test("a URL carrying user:password@ is refused instead of echoed back", async () => {
     const result = await run(httpRequest, {
       url: `http://alice:hunter2@127.0.0.1:${main.port}/echo`,

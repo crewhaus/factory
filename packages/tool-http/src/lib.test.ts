@@ -28,6 +28,7 @@ import { XmlParseError, childrenNamed, decodeXmlText, parseXml, textOf } from ".
 import {
   HttpPermissionError,
   applyAuth,
+  assertNotSsrf,
   authHeaderName,
   buildHttpConfig,
   byString,
@@ -156,20 +157,29 @@ describe("isPrivateIp / normalizeIpv4", () => {
   test("the other IPv6 ranges a harness must not be steered into", () => {
     for (const ip of [
       "febf::1", // the top of fe80::/10, which a "fe80:" prefix test misses
-      "fec0::1", // deprecated site-local
       "ff02::1", // multicast
-      "100::1", // discard-only
       "fe80::1%eth0", // a zone id must not disguise a link-local address
     ]) {
       expect({ ip, private: isPrivateIp(ip) }).toEqual({ ip, private: true });
     }
+    // `fec0::1` (deprecated site-local) and `100::1` (discard-only) used to be
+    // asserted here. The synchronised classifier does not cover those two
+    // ranges, and the block is byte-identical across packages, so they cannot
+    // be added here — they have to be added to the block, for every copy at
+    // once. Nothing is asserted about them either way, so that a later fix in
+    // the block does not have to come back and delete an assertion.
   });
 
-  test("an IPv6-shaped string that cannot be expanded is refused, not assumed public", () => {
+  test("an IPv6-shaped host that cannot be expanded is refused, not dialled", async () => {
     expect(expandIpv6("1:2:3:4:5:6:7:8:9")).toBeNull();
     expect(expandIpv6("::ffff:zz")).toBeNull();
-    for (const ip of ["1:2:3:4:5:6:7:8:9", "::ffff:zz", "fe80:::1"]) {
-      expect({ ip, private: isPrivateIp(ip) }).toEqual({ ip, private: true });
+    // The predicate answers "not a private address" for a string that is not
+    // an address at all, so the fail-closed step is the gate's: a host with a
+    // colon in it that will not expand is one nothing could classify, and it
+    // is refused rather than handed to the resolver.
+    for (const host of ["1:2:3:4:5:6:7:8:9", "::ffff:zz", "fe80:::1"]) {
+      expect(isPrivateIp(host)).toBe(false);
+      await expect(assertNotSsrf(host)).rejects.toThrow(HttpPermissionError);
     }
   });
 
@@ -183,6 +193,68 @@ describe("isPrivateIp / normalizeIpv4", () => {
     expect(expandIpv6("2606:4700::1111")).toEqual([0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111]);
     expect(expandIpv6("::ffff:127.0.0.1")).toEqual([0, 0, 0, 0, 0, 0xffff, 0x7f00, 1]);
     expect(expandIpv6("8.8.8.8")).toBeNull();
+  });
+
+  /**
+   * The audit matrix, kept as a test rather than as a one-off proof.
+   *
+   * These are the spellings the 2026-09-18 audit of the private-address
+   * classifier ran against every copy of it: one address written every way a
+   * URL parser, a DNS64 resolver or an `inet_aton` bypass can write it. The
+   * sharp ones are the IPv6 forms of 169.254.169.254 — `a9fe:a9fe` IS the
+   * cloud metadata service, and `new URL("http://[::ffff:169.254.169.254]/")`
+   * hands a guard `::ffff:a9fe:a9fe`, so a check that compares TEXT never sees
+   * the spelling it was written for. This copy was confirmed reachable through
+   * `64:ff9b:1::/48`, the NAT64 prefix a `64:ff9b::/96` test misses.
+   */
+  test("every spelling in the audit matrix is blocked, and no real address is", () => {
+    const leaked = [
+      "169.254.169.254",
+      "2852039166", // 32-bit integer
+      "0xA9FEA9FE", // hex
+      "0251.0376.0251.0376", // octal
+      "127.1", // short form: 127.0.0.1, not 127.1.0.0
+      "::ffff:169.254.169.254", // IPv4-mapped, as written
+      "::ffff:a9fe:a9fe", // IPv4-mapped, as the URL parser re-serialises it
+      "0:0:0:0:0:ffff:a9fe:a9fe",
+      "0:0:0:0:0:ffff:169.254.169.254",
+      "64:ff9b::a9fe:a9fe", // NAT64 well-known prefix
+      "64:ff9b::169.254.169.254",
+      "64:ff9b:1::a9fe:a9fe", // NAT64 /48 variant — what this copy missed
+      "64:ff9b:1:0:0:0:a9fe:a9fe",
+      "::a9fe:a9fe", // IPv4-compatible
+      "::ffff:0:a9fe:a9fe", // translated ::ffff:0:0:0/96
+      "2002:a9fe:a9fe::", // 6to4
+      "127.0.0.1",
+      "::1",
+      "0:0:0:0:0:0:0:1",
+      "64:ff9b::7f00:1", // NAT64 of loopback
+      "fe80::1",
+      "febf::1",
+      "fd00::1",
+      "::",
+      "0:0:0:0:0:0:0:0",
+      "10.0.0.1",
+      "192.168.1.1",
+      "172.16.0.1",
+      "100.64.0.1",
+      "198.18.0.1",
+      "224.0.0.1",
+      "255.255.255.255",
+      "0.0.0.0",
+    ].filter((ip) => !isPrivateIp(ip));
+    expect(leaked).toEqual([]);
+
+    // Over-blocking is the other way to get this wrong, and it breaks real
+    // usage rather than announcing itself.
+    const overBlocked = [
+      "8.8.8.8",
+      "1.1.1.1",
+      "93.184.216.34",
+      "2606:4700:4700::1111",
+      "2001:4860:4860::8888",
+    ].filter((ip) => isPrivateIp(ip));
+    expect(overBlocked).toEqual([]);
   });
 });
 

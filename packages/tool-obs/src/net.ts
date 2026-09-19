@@ -461,185 +461,190 @@ export async function assertNotSsrf(hostname: string, signal?: AbortSignal): Pro
   return resolved.address;
 }
 
+// ---------------------------------------------------------------------------
+// BEGIN SYNCHRONISED BLOCK — private-address classifier
+//
+// This block is BYTE-IDENTICAL across every package that guards an outbound
+// request. Do not edit one copy: `apps/cli/src/tool-registry.test.ts` hashes
+// them all and fails if any differs, and it asserts how many it found, because
+// a copy-scanning guard that matches nothing reports green.
+//
+// It exists in copies rather than a shared package because these files are
+// otherwise independent per-package networking layers; a guard proving the
+// copies are identical is cheaper and safer than the import graph a shared
+// package would need across `crawler`, `computer-use-driver` and ten tools.
+//
+// WHY IT PARSES INSTEAD OF MATCHING TEXT. Six copies were confirmed
+// exploitable on 2026-09-18 because they compared address STRINGS. The WHATWG
+// URL parser rewrites `[::ffff:169.254.169.254]` to `[::ffff:a9fe:a9fe]`, so a
+// text check never sees the spelling it was written for; and `64:ff9b::a9fe:a9fe`
+// IS 169.254.169.254 on any network running DNS64/NAT64. Parsing numerically and
+// recursing into the embedded IPv4 is the only form that holds.
+//
+// WHAT IT CANNOT DO. RFC 6052 lets an operator choose any Network-Specific
+// Prefix for NAT64, so an embedded IPv4 behind an arbitrary NSP is undecidable
+// from the address alone. That case is configuration, and the callers that need
+// it resolve the host and re-check the ANSWER before dialling.
+// ---------------------------------------------------------------------------
 /**
- * Normalise an IPv4 literal to dotted-decimal. Octal (`0177.0.0.1`), hex
- * (`0x7f000001`) and 32-bit integer (`2130706433`) forms all reach 127.0.0.1,
- * so they are canonicalised before classification — otherwise they are an
- * allow-list bypass. `null` when `raw` is not IPv4.
+ * Canonicalise an IPv4 literal.
+ *
+ * `inet_aton` forms are the classic allow-list bypass: `0177.0.0.1`,
+ * `0x7f.0.0.1`, `2130706433` and `127.1` are all 127.0.0.1, and a check that
+ * only understands dotted-decimal waves every one of them through. Returns
+ * `null` when the string is not an IPv4 literal at all.
  */
 export function normalizeIpv4(raw: string): string | null {
   const trimmed = raw.trim();
-  if (trimmed === "") return null;
+  if (trimmed === "" || /[^0-9a-fA-FxX.]/.test(trimmed)) return null;
+  const parts = trimmed.split(".");
+  if (parts.length === 0 || parts.length > 4) return null;
 
-  const parseComponent = (s: string): number | null => {
-    if (s === "") return null;
+  const values: number[] = [];
+  for (const part of parts) {
+    if (part === "") return null;
     let value: number;
-    if (/^0[xX][0-9a-fA-F]+$/.test(s)) value = Number.parseInt(s.slice(2), 16);
-    else if (/^0[0-7]+$/.test(s)) value = Number.parseInt(s, 8);
-    else if (/^[0-9]+$/.test(s)) value = Number.parseInt(s, 10);
+    if (/^0[xX][0-9a-fA-F]+$/.test(part)) value = Number.parseInt(part.slice(2), 16);
+    else if (/^0[0-7]+$/.test(part)) value = Number.parseInt(part.slice(1), 8);
+    else if (/^\d+$/.test(part)) value = Number.parseInt(part, 10);
     else return null;
-    return Number.isNaN(value) ? null : value;
-  };
-
-  const segments = trimmed.split(".");
-  if (segments.length > 4) return null;
-
-  const components: number[] = [];
-  for (const seg of segments) {
-    const value = parseComponent(seg);
-    if (value === null || value < 0) return null;
-    components.push(value);
+    if (!Number.isFinite(value) || value < 0) return null;
+    values.push(value);
   }
 
-  const n = components.length;
-  const octets = [0, 0, 0, 0];
-  for (let i = 0; i < n - 1; i++) {
-    const c = components[i] as number;
-    if (c > 255) return null;
-    octets[i] = c;
-  }
-  const last = components[n - 1] as number;
-  if (last >= 2 ** (8 * (4 - (n - 1)))) return null;
-  let rest = last;
-  for (let i = 3; i >= n - 1; i--) {
-    octets[i] = rest & 0xff;
-    rest = Math.floor(rest / 256);
-  }
+  // The short forms pack the remaining octets into the last part: `127.1` is
+  // 127.0.0.1, not 127.1.0.0. Getting this backwards is how a bypass survives.
+  const last = values[values.length - 1] as number;
+  const leading = values.slice(0, -1);
+  if (leading.some((v) => v > 255)) return null;
+  const remaining = 4 - leading.length;
+  if (last >= 2 ** (8 * remaining)) return null;
+
+  const octets = [...leading];
+  for (let i = remaining - 1; i >= 0; i--) octets.push((last >>> (8 * i)) & 0xff);
   return octets.join(".");
 }
 
 /**
- * Expand an IPv6 literal into its eight numeric groups, or `null` when `raw`
- * is not IPv6 at all.
+ * Expand an IPv6 literal to its eight 16-bit groups, or `null` when the string
+ * is not one.
  *
- * Classifying IPv6 by string prefix only recognises the ONE spelling a
- * resolver happens to print. `::1`, `0:0:0:0:0:0:0:1` and `::0:1` are the same
- * address, and a gate that catches the first and waves the others through is
- * not a gate. Everything is expanded to numbers and classified arithmetically.
+ * Classifying IPv6 by its TEXT is where the bypasses live, because one address
+ * has many spellings and the one a check was written against is rarely the one
+ * that arrives. `http://[::ffff:169.254.169.254]/` never reaches a guard in
+ * that form: the WHATWG URL parser re-serialises the embedded quad as hex
+ * pieces, so what the guard sees is `::ffff:a9fe:a9fe`. Normalising to numbers
+ * first means the prefix tests below are arithmetic, and spelling stops
+ * mattering.
+ */
+export function parseIpv6(raw: string): ReadonlyArray<number> | null {
+  let text = raw.trim().toLowerCase();
+  if (text.startsWith("[")) text = text.slice(1);
+  if (text.endsWith("]")) text = text.slice(0, -1);
+  const zone = text.indexOf("%"); // fe80::1%eth0
+  if (zone !== -1) text = text.slice(0, zone);
+  if (!text.includes(":")) return null;
+
+  // A trailing dotted quad is the last two groups written in IPv4. Require all
+  // three dots: without that, `::1` parses as a one-part inet_aton address and
+  // takes a path that has nothing to do with what was written.
+  const dotted = /^(.*:)(\d+(?:\.\d+){3})$/.exec(text);
+  if (dotted !== null) {
+    const quad = normalizeIpv4(dotted[2] as string);
+    if (quad === null) return null;
+    const o = quad.split(".").map((n) => Number.parseInt(n, 10)) as number[];
+    const hi = ((o[0] as number) << 8) | (o[1] as number);
+    const lo = ((o[2] as number) << 8) | (o[3] as number);
+    text = `${dotted[1]}${hi.toString(16)}:${lo.toString(16)}`;
+  }
+
+  const halves = text.split("::");
+  if (halves.length > 2) return null;
+  const pieces = (part: string): string[] => (part === "" ? [] : part.split(":"));
+  const head = pieces(halves[0] as string);
+  const tail = halves.length === 2 ? pieces(halves[1] as string) : [];
+  if (halves.length === 1 && head.length !== 8) return null;
+  if (head.length + tail.length > 8) return null;
+
+  const groups: number[] = [];
+  for (const piece of head) {
+    if (!/^[0-9a-f]{1,4}$/.test(piece)) return null;
+    groups.push(Number.parseInt(piece, 16));
+  }
+  for (let i = head.length + tail.length; i < 8; i++) groups.push(0);
+  for (const piece of tail) {
+    if (!/^[0-9a-f]{1,4}$/.test(piece)) return null;
+    groups.push(Number.parseInt(piece, 16));
+  }
+  return groups.length === 8 ? groups : null;
+}
+
+/**
+ * The IPv4 address an IPv6 address carries, when it carries one.
+ *
+ * Every transition mechanism embeds a v4 address somewhere, and every one of
+ * them is a way to reach a v4 destination while wearing a v6 spelling that no
+ * v4 range check looks at. The NAT64 well-known prefix is the sharpest: a
+ * DNS64 resolver answers an IPv4-only name with `64:ff9b::<the v4>`, so
+ * `64:ff9b::a9fe:a9fe` IS the metadata service on any network that runs one.
+ */
+function embeddedIpv4(g: ReadonlyArray<number>): string | null {
+  const quad = (hi: number, lo: number): string =>
+    `${(hi >>> 8) & 0xff}.${hi & 0xff}.${(lo >>> 8) & 0xff}.${lo & 0xff}`;
+  const zeros = (from: number, to: number): boolean => g.slice(from, to).every((x) => x === 0);
+  const last = quad(g[6] as number, g[7] as number);
+
+  if (zeros(0, 5) && g[5] === 0xffff) return last; // ::ffff:0:0/96, IPv4-mapped
+  if (zeros(0, 4) && g[4] === 0xffff && g[5] === 0) return last; // ::ffff:0:0:0/96, translated
+  if (g[0] === 0x64 && g[1] === 0xff9b) return last; // 64:ff9b::/96 and 64:ff9b:1::/48, NAT64
+  if (g[0] === 0x2002) return quad(g[1] as number, g[2] as number); // 2002::/16, 6to4
+  // ::a.b.c.d, IPv4-compatible: deprecated, still routed by some stacks, and
+  // not to be confused with `::` or `::1`, which are handled before this.
+  if (zeros(0, 6)) return last;
+  return null;
+}
+
+/** Ranges that are never a public RPC endpoint. */
+export function isPrivateIp(address: string): boolean {
+  const v4 = normalizeIpv4(address);
+  if (v4 !== null) {
+    const [a = 0, b = 0, c = 0, d = 0] = v4.split(".").map((n) => Number.parseInt(n, 10));
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true; // link-local, and the metadata service
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 192 && b === 0 && c === 0) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true; // carrier-grade NAT
+    if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking
+    if (a >= 224) return true; // multicast, reserved, broadcast
+    return a === 255 && b === 255 && c === 255 && d === 255;
+  }
+
+  const groups = parseIpv6(address);
+  if (groups === null) return false;
+  if (groups.every((g) => g === 0)) return true; // ::, the unspecified address
+  if (groups.slice(0, 7).every((g) => g === 0) && groups[7] === 1) return true; // ::1
+
+  const carried = embeddedIpv4(groups);
+  if (carried !== null) return isPrivateIp(carried);
+
+  const head = groups[0] as number;
+  if ((head & 0xfe00) === 0xfc00) return true; // fc00::/7, unique-local
+  if ((head & 0xffc0) === 0xfe80) return true; // fe80::/10, link-local
+  return (head & 0xff00) === 0xff00; // ff00::/8, multicast
+}
+// END SYNCHRONISED BLOCK
+
+/**
+ * The name this package has always exported for `parseIpv6`, kept so callers
+ * and tests keep working, and because they expect a mutable array back.
+ *
+ * It lives OUTSIDE the synchronised block on purpose: the block's own text is
+ * byte-identical everywhere, and per-package naming is adapted around it.
  */
 export function expandIpv6(raw: string): number[] | null {
-  let ip = raw.trim().toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
-  // A zone id (`fe80::1%eth0`, or its percent-encoded `%25eth0` form) names a
-  // local interface, not part of the address. Drop it before classification so
-  // it cannot dress a link-local address up as an unrecognised one.
-  const zone = ip.indexOf("%");
-  if (zone !== -1) ip = ip.slice(0, zone);
-  if (!ip.includes(":")) return null;
-
-  const halves = ip.split("::");
-  if (halves.length > 2) return null;
-
-  const side = (text: string): number[] | null => {
-    if (text === "") return [];
-    const parts = text.split(":");
-    const out: number[] = [];
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i] as string;
-      if (part.includes(".")) {
-        // A trailing dotted quad (`::ffff:127.0.0.1`) occupies two groups.
-        if (i !== parts.length - 1) return null;
-        const dotted = normalizeIpv4(part);
-        if (dotted === null) return null;
-        const o = dotted.split(".").map((x) => Number.parseInt(x, 10));
-        out.push((((o[0] as number) << 8) | (o[1] as number)) & 0xffff);
-        out.push((((o[2] as number) << 8) | (o[3] as number)) & 0xffff);
-        continue;
-      }
-      if (!/^[0-9a-f]{1,4}$/.test(part)) return null;
-      out.push(Number.parseInt(part, 16));
-    }
-    return out;
-  };
-
-  const head = side(halves[0] as string);
-  if (head === null) return null;
-  if (halves.length === 1) return head.length === 8 ? head : null;
-  const tail = side(halves[1] as string);
-  if (tail === null) return null;
-  // `::` stands for AT LEAST one group of zeros, so the explicit groups can
-  // never fill all eight.
-  if (head.length + tail.length > 7) return null;
-  const filler = new Array<number>(8 - head.length - tail.length).fill(0);
-  return [...head, ...filler, ...tail];
-}
-
-/** The dotted quad two IPv6 groups carry, for the embedded-IPv4 ranges. */
-function embeddedIpv4(hi: number, lo: number): string {
-  return [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff].join(".");
-}
-
-/** Classify eight expanded IPv6 groups. */
-function isPrivateIpv6(g: readonly number[]): boolean {
-  const [g0, g1, g2, g3, g4, g5, g6, g7] = g as [
-    number,
-    number,
-    number,
-    number,
-    number,
-    number,
-    number,
-    number,
-  ];
-  const topSixZero = g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0;
-
-  if (topSixZero && g5 === 0) {
-    // ::/128 unspecified, ::1/128 loopback, and the IPv4-compatible ::a.b.c.d
-    // block — all of which either are, or embed, an address to refuse.
-    if (g6 === 0 && g7 === 0) return true; // ::
-    if (g6 === 0 && g7 === 1) return true; // ::1
-    return isPrivateIp(embeddedIpv4(g6, g7));
-  }
-  // ::ffff:0:0/96 — IPv4-mapped.
-  if (topSixZero && g5 === 0xffff) return isPrivateIp(embeddedIpv4(g6, g7));
-  // 64:ff9b::/96 — the well-known NAT64 prefix, which translates to IPv4 and
-  // carries that address in its last two groups.
-  if (g0 === 0x64 && g1 === 0xff9b && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) {
-    return isPrivateIp(embeddedIpv4(g6, g7));
-  }
-  // 64:ff9b:1::/48 — RFC 8215's LOCAL-USE NAT64 prefix. Its embedded IPv4 sits
-  // at a position that depends on the translator's prefix length, so there is
-  // no one pair of groups to read it out of; the whole block is refused
-  // instead. Reading the wrong two groups would classify `64:ff9b:1::7f00:1`
-  // — loopback through a local translator — as a public address, which is how
-  // this range gets used as a bypass.
-  if (g0 === 0x64 && g1 === 0xff9b && g2 === 0x0001) return true;
-  // 2002::/16 — 6to4 carries its IPv4 in the next two groups.
-  if (g0 === 0x2002) return isPrivateIp(embeddedIpv4(g1, g2));
-
-  if ((g0 & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
-  if ((g0 & 0xffc0) === 0xfec0) return true; // fec0::/10 deprecated site-local
-  if ((g0 & 0xfe00) === 0xfc00) return true; // fc00::/7 unique-local
-  if ((g0 & 0xff00) === 0xff00) return true; // ff00::/8 multicast
-  if (g0 === 0x0100 && g1 === 0 && g2 === 0 && g3 === 0) return true; // 100::/64 discard-only
-  return false;
-}
-
-/** True for an address inside a range a harness must never be steered into. */
-export function isPrivateIp(addr: string): boolean {
-  const ip = addr.trim().replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
-
-  if (ip.includes(":")) {
-    const groups = expandIpv6(ip);
-    // An IPv6-shaped string this parser cannot expand is REFUSED, not waved
-    // through: "I could not classify it" must never read as "it is public".
-    return groups === null ? true : isPrivateIpv6(groups);
-  }
-
-  const normalized = normalizeIpv4(ip);
-  if (normalized === null) return false;
-  const parts = normalized.split(".").map((p) => Number.parseInt(p, 10));
-  const [a, b, c] = parts as [number, number, number, number];
-  if (a === 127) return true; // loopback
-  if (a === 10) return true; // RFC1918
-  if (a === 169 && b === 254) return true; // link-local + cloud metadata
-  if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918
-  if (a === 192 && b === 168) return true; // RFC1918
-  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-  if (a === 192 && b === 0 && c === 0) return true; // IETF protocol assignments
-  if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking
-  if (a >= 224) return true; // multicast, reserved, and 255.255.255.255
-  if (a === 0) return true;
-  return false;
+  const groups = parseIpv6(raw);
+  return groups === null ? null : [...groups];
 }
 
 // ---------------------------------------------------------------------------

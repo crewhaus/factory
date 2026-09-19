@@ -80,6 +80,31 @@ export function _setDnsLookup(fn: DnsLookupFn | undefined): void {
   dnsLookupFn = fn ?? defaultDnsLookup;
 }
 
+// ---------------------------------------------------------------------------
+// BEGIN SYNCHRONISED BLOCK — private-address classifier
+//
+// This block is BYTE-IDENTICAL across every package that guards an outbound
+// request. Do not edit one copy: `apps/cli/src/tool-registry.test.ts` hashes
+// them all and fails if any differs, and it asserts how many it found, because
+// a copy-scanning guard that matches nothing reports green.
+//
+// It exists in copies rather than a shared package because these files are
+// otherwise independent per-package networking layers; a guard proving the
+// copies are identical is cheaper and safer than the import graph a shared
+// package would need across `crawler`, `computer-use-driver` and ten tools.
+//
+// WHY IT PARSES INSTEAD OF MATCHING TEXT. Six copies were confirmed
+// exploitable on 2026-09-18 because they compared address STRINGS. The WHATWG
+// URL parser rewrites `[::ffff:169.254.169.254]` to `[::ffff:a9fe:a9fe]`, so a
+// text check never sees the spelling it was written for; and `64:ff9b::a9fe:a9fe`
+// IS 169.254.169.254 on any network running DNS64/NAT64. Parsing numerically and
+// recursing into the embedded IPv4 is the only form that holds.
+//
+// WHAT IT CANNOT DO. RFC 6052 lets an operator choose any Network-Specific
+// Prefix for NAT64, so an embedded IPv4 behind an arbitrary NSP is undecidable
+// from the address alone. That case is configuration, and the callers that need
+// it resolve the host and re-check the ANSWER before dialling.
+// ---------------------------------------------------------------------------
 /**
  * Canonicalise an IPv4 literal.
  *
@@ -227,6 +252,7 @@ export function isPrivateIp(address: string): boolean {
   if ((head & 0xffc0) === 0xfe80) return true; // fe80::/10, link-local
   return (head & 0xff00) === 0xff00; // ff00::/8, multicast
 }
+// END SYNCHRONISED BLOCK
 
 export type VettedEndpoint = {
   readonly url: URL;
