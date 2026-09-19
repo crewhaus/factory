@@ -129,6 +129,7 @@
         "@crewhaus/tool-defi": "workspace:*",
         "@crewhaus/tool-docs": "workspace:*",
         "@crewhaus/tool-document-ingest": "workspace:*",
+        "@crewhaus/tool-einvoice": "workspace:*",
         "@crewhaus/tool-encode": "workspace:*",
         "@crewhaus/tool-fetch": "workspace:*",
         "@crewhaus/tool-flow": "workspace:*",
@@ -139,6 +140,8 @@
         "@crewhaus/tool-http": "workspace:*",
         "@crewhaus/tool-image": "workspace:*",
         "@crewhaus/tool-image-generation": "workspace:*",
+        "@crewhaus/tool-kyc": "workspace:*",
+        "@crewhaus/tool-ledger": "workspace:*",
         "@crewhaus/tool-math": "workspace:*",
         "@crewhaus/tool-mcp": "workspace:*",
         "@crewhaus/tool-media": "workspace:*",
@@ -147,6 +150,7 @@
         "@crewhaus/tool-mouse-keyboard": "workspace:*",
         "@crewhaus/tool-navigate": "workspace:*",
         "@crewhaus/tool-notify": "workspace:*",
+        "@crewhaus/tool-objectstore": "workspace:*",
         "@crewhaus/tool-obs": "workspace:*",
         "@crewhaus/tool-onchain": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
@@ -2345,6 +2349,22 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/tool-einvoice": {
+      "name": "@crewhaus/tool-einvoice",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-data": "workspace:*",
+        "@crewhaus/tool-datetime": "workspace:*",
+        "@crewhaus/tool-money": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-encode": {
       "name": "@crewhaus/tool-encode",
       "version": "0.6.0",
@@ -2524,6 +2544,37 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/tool-kyc": {
+      "name": "@crewhaus/tool-kyc",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-fetch": "workspace:*",
+        "@crewhaus/tool-text": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-ledger": {
+      "name": "@crewhaus/tool-ledger",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-datetime": "workspace:*",
+        "@crewhaus/tool-math": "workspace:*",
+        "@crewhaus/tool-money": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-loop-detection": {
       "name": "@crewhaus/tool-loop-detection",
       "version": "0.6.0",
@@ -2640,6 +2691,20 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-objectstore": {
+      "name": "@crewhaus/tool-objectstore",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-encode": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -3539,6 +3604,8 @@
 
     "@crewhaus/tool-document-ingest": ["@crewhaus/tool-document-ingest@workspace:packages/tool-document-ingest"],
 
+    "@crewhaus/tool-einvoice": ["@crewhaus/tool-einvoice@workspace:packages/tool-einvoice"],
+
     "@crewhaus/tool-encode": ["@crewhaus/tool-encode@workspace:packages/tool-encode"],
 
     "@crewhaus/tool-evm": ["@crewhaus/tool-evm@workspace:packages/tool-evm"],
@@ -3567,6 +3634,10 @@
 
     "@crewhaus/tool-image-generation": ["@crewhaus/tool-image-generation@workspace:packages/tool-image-generation"],
 
+    "@crewhaus/tool-kyc": ["@crewhaus/tool-kyc@workspace:packages/tool-kyc"],
+
+    "@crewhaus/tool-ledger": ["@crewhaus/tool-ledger@workspace:packages/tool-ledger"],
+
     "@crewhaus/tool-loop-detection": ["@crewhaus/tool-loop-detection@workspace:packages/tool-loop-detection"],
 
     "@crewhaus/tool-math": ["@crewhaus/tool-math@workspace:packages/tool-math"],
@@ -3586,6 +3657,8 @@
     "@crewhaus/tool-navigate": ["@crewhaus/tool-navigate@workspace:packages/tool-navigate"],
 
     "@crewhaus/tool-notify": ["@crewhaus/tool-notify@workspace:packages/tool-notify"],
+
+    "@crewhaus/tool-objectstore": ["@crewhaus/tool-objectstore@workspace:packages/tool-objectstore"],
 
     "@crewhaus/tool-obs": ["@crewhaus/tool-obs@workspace:packages/tool-obs"],
 

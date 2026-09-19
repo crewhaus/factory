@@ -3661,6 +3661,10 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     chaincall,
     token,
     defi,
+    ledger,
+    einvoice,
+    kyc,
+    objectstore,
   ] = await Promise.all([
     import("@crewhaus/tool-fs"),
     import("@crewhaus/tool-bash"),
@@ -3708,6 +3712,10 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     import("@crewhaus/tool-chaincall"),
     import("@crewhaus/tool-token"),
     import("@crewhaus/tool-defi"),
+    import("@crewhaus/tool-ledger"),
+    import("@crewhaus/tool-einvoice"),
+    import("@crewhaus/tool-kyc"),
+    import("@crewhaus/tool-objectstore"),
   ]);
   const map: Record<string, RegisteredTool> = {
     read: fs.read,
@@ -3738,6 +3746,21 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     codegraphCallers: codegraph.codegraphCallers,
     codegraphCallees: codegraph.codegraphCallees,
     codegraphImpact: codegraph.codegraphImpact,
+    // @crewhaus/tool-objectstore
+    objectPresign: objectstore.objectPresign,
+    // @crewhaus/tool-kyc
+    vatIdValidate: kyc.vatIdValidate,
+    entityRegistryLookup: kyc.entityRegistryLookup,
+    sanctionsScreen: kyc.sanctionsScreen,
+    // @crewhaus/tool-einvoice
+    eInvoiceBuild: einvoice.eInvoiceBuild,
+    eInvoiceParse: einvoice.eInvoiceParse,
+    paymentFileBuild: einvoice.paymentFileBuild,
+    // @crewhaus/tool-ledger
+    ledgerPost: ledger.ledgerPost,
+    ledgerQuery: ledger.ledgerQuery,
+    ledgerReconcile: ledger.ledgerReconcile,
+    invoiceRender: ledger.invoiceRender,
     // @crewhaus/tool-defi
     priceQuote: defi.priceQuote,
     oraclePriceRead: defi.oraclePriceRead,

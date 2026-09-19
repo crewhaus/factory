@@ -726,6 +726,28 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     tools: ["priceQuote", "oraclePriceRead", "defiPositionRead", "portfolioValuation"],
   },
 
+  ledger: {
+    title: "A hash-chained double-entry ledger, with queries, reconciliation and invoice rendering",
+    tools: ["ledgerPost", "ledgerQuery", "ledgerReconcile", "invoiceRender"],
+  },
+
+  einvoice: {
+    title:
+      "Fixed-format financial files banks and tax authorities parse byte-exactly: e-invoice XML and payment batches",
+    tools: ["eInvoiceBuild", "eInvoiceParse", "paymentFileBuild"],
+  },
+
+  kyc: {
+    title:
+      "Counterparty checks against public registries and sanctions lists, reporting signals and evidence rather than a verdict",
+    tools: ["vatIdValidate", "entityRegistryLookup", "sanctionsScreen"],
+  },
+
+  objectstore: {
+    title: "Object-store URL signing: time-limited SigV4 GET and PUT computed offline",
+    tools: ["objectPresign"],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -769,7 +791,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   operations: {
     title: "Running and supervising harnesses: telemetry, cost, incidents, specs and fleets",
-    includes: ["obs", "crewhaus", "money"],
+    includes: ["obs", "crewhaus", "money", "ledger", "einvoice", "kyc", "objectstore"],
   },
   chain: {
     title: "Everything that touches a blockchain, offline arithmetic and live reads alike",
