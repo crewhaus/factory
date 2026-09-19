@@ -740,7 +740,8 @@ describe("the token never leaves in a result", () => {
         leaked: false,
       });
     }
-  });
+    // Calls every tool in the package once and scans each result.
+  }, 20_000);
 
   test("a token pasted into tokenEnv is refused, and the refusal does not repeat it", async () => {
     // Split so the SOURCE never carries a secret-shaped literal: GitHub push

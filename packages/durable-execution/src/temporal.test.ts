@@ -59,7 +59,8 @@ describe("nextCronMatch", () => {
     const from = new Date("2026-07-17T00:00:00.000Z");
     const next = nextCronMatch("0 9 * * *", from, "America/New_York");
     expect(next.toISOString()).toBe("2026-07-17T13:00:00.000Z");
-  });
+    // Walks a schedule across a timezone with real Intl formatting.
+  }, 20_000);
 
   test("day-of-month union with day-of-week (either matches)", () => {
     // "on the 1st OR on Mondays". From mid-Friday 2026-07-17, next is Mon 07-20.

@@ -696,6 +696,36 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     tools: ["containerImageInspect", "containerImageTags"],
   },
 
+  chainread: {
+    title:
+      "Read what an EVM chain recorded: blocks, transactions, receipts, logs, nonces and endpoint health",
+    tools: [
+      "evmGetBlock",
+      "evmBlockAtTimestamp",
+      "evmRpcHealth",
+      "evmNonceStatus",
+      "evmWaitForReceipt",
+      "evmTransactionSummary",
+      "evmEventScan",
+    ],
+  },
+
+  chaincall: {
+    title:
+      "Ask an EVM contract what it knows and what a call would cost: batched reads, introspection, gas and simulation",
+    tools: ["evmMulticall", "contractInspect", "evmSimulateBundle", "gasMarketRead"],
+  },
+
+  token: {
+    title: "Resolve tokens and read balances, with ambiguity refused and impostors flagged",
+    tools: ["tokenResolve", "erc20Balance", "erc721TokenInfo"],
+  },
+
+  defi: {
+    title: "Value what you hold, with provenance and an explicit unpriced bucket",
+    tools: ["priceQuote", "oraclePriceRead", "defiPositionRead", "portfolioValuation"],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -741,6 +771,14 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     title: "Running and supervising harnesses: telemetry, cost, incidents, specs and fleets",
     includes: ["obs", "crewhaus", "money"],
   },
+  chain: {
+    title: "Everything that touches a blockchain, offline arithmetic and live reads alike",
+    // `onchain` is the pure half — ABI coding, EIP-712 digests, checksums — and the other three
+    // read a node. They are grouped here because "what can this harness do with a chain" is a
+    // question people actually ask, and answering it with four separate selectors is worse.
+    // Nothing in any of them signs or submits; that is asserted per package, not assumed.
+    includes: ["onchain", "chainread", "chaincall", "token", "defi"],
+  },
   network: {
     title: "Everything that reaches the network",
     // A leaf may sit in more than one roll-up — `text` is in both `compute`
@@ -748,7 +786,17 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     // they are FOR, and here because of what they DO: a registry read, an OSV
     // query and an OCI manifest fetch all leave the machine, and a roll-up
     // that claims "everything that reaches the network" has to mean it.
-    includes: ["web", "http", "registry", "supplychain", "containers"],
+    includes: [
+      "web",
+      "http",
+      "registry",
+      "supplychain",
+      "containers",
+      "chainread",
+      "chaincall",
+      "token",
+      "defi",
+    ],
   },
   compute: {
     title: "Everything a harness can do with no I/O at all — pure, in-process, zero tokens",
