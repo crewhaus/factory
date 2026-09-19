@@ -3657,6 +3657,10 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     registry,
     supplychain,
     containers,
+    chainread,
+    chaincall,
+    token,
+    defi,
   ] = await Promise.all([
     import("@crewhaus/tool-fs"),
     import("@crewhaus/tool-bash"),
@@ -3700,6 +3704,10 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     import("@crewhaus/tool-registry"),
     import("@crewhaus/tool-supplychain"),
     import("@crewhaus/tool-containers"),
+    import("@crewhaus/tool-chainread"),
+    import("@crewhaus/tool-chaincall"),
+    import("@crewhaus/tool-token"),
+    import("@crewhaus/tool-defi"),
   ]);
   const map: Record<string, RegisteredTool> = {
     read: fs.read,
@@ -3730,6 +3738,28 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     codegraphCallers: codegraph.codegraphCallers,
     codegraphCallees: codegraph.codegraphCallees,
     codegraphImpact: codegraph.codegraphImpact,
+    // @crewhaus/tool-defi
+    priceQuote: defi.priceQuote,
+    oraclePriceRead: defi.oraclePriceRead,
+    defiPositionRead: defi.defiPositionRead,
+    portfolioValuation: defi.portfolioValuation,
+    // @crewhaus/tool-token
+    tokenResolve: token.tokenResolve,
+    erc20Balance: token.erc20Balance,
+    erc721TokenInfo: token.erc721TokenInfo,
+    // @crewhaus/tool-chaincall
+    evmMulticall: chaincall.evmMulticall,
+    contractInspect: chaincall.contractInspect,
+    evmSimulateBundle: chaincall.evmSimulateBundle,
+    gasMarketRead: chaincall.gasMarketRead,
+    // @crewhaus/tool-chainread
+    evmGetBlock: chainread.evmGetBlock,
+    evmBlockAtTimestamp: chainread.evmBlockAtTimestamp,
+    evmRpcHealth: chainread.evmRpcHealth,
+    evmNonceStatus: chainread.evmNonceStatus,
+    evmWaitForReceipt: chainread.evmWaitForReceipt,
+    evmTransactionSummary: chainread.evmTransactionSummary,
+    evmEventScan: chainread.evmEventScan,
     // @crewhaus/tool-table
     dataDriftCheck: table.dataDriftCheck,
     // @crewhaus/tool-containers

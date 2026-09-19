@@ -32,6 +32,29 @@ import {
 } from "./lib/defi";
 import { personalSignHash, typedDataDigest } from "./lib/typed";
 
+/**
+ * Multicall3 packing, as library code for other packages to build on. It
+ * registers no tool of its own: a batch read is only useful to something that
+ * can dial a chain, and nothing in this package dials anything.
+ */
+export {
+  AGGREGATE3_RETURN_TYPE,
+  AGGREGATE3_SELECTOR,
+  AGGREGATE3_SIGNATURE,
+  type Aggregate3Request,
+  type Aggregate3Result,
+  type Call3,
+  ERROR_STRING_SELECTOR,
+  MULTICALL3_ADDRESS,
+  PANIC_REASONS,
+  PANIC_SELECTOR,
+  type RevertKind,
+  type RevertReason,
+  decodeAggregate3,
+  decodeRevertData,
+  encodeAggregate3,
+} from "./lib/multicall";
+
 const json = (value: unknown): string => JSON.stringify(value);
 
 const LIMITS = { args: 256, types: 64, hexChars: 2_000_000 } as const;
