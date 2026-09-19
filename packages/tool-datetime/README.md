@@ -1,8 +1,7 @@
 # @crewhaus/tool-datetime
 
-Deterministic date and time tools. Every one is pure: no filesystem, no
-network, no randomness, and — the rule that shapes the whole package — **no
-clock**.
+Deterministic date and time tools. No filesystem, no network, no randomness,
+and — the rule that shapes the whole package — **no clock**.
 
 There is no `Date.now()` here and no implicit "today". Every tool that needs a
 reference time takes it as an input field. `CronNext` makes you pass the
@@ -10,6 +9,10 @@ instant to search forward from; `BusinessDays` makes you pass the start date
 and the holiday list. That is a constraint with teeth, and it is the point: a
 tool that quietly consults the system clock cannot be cached, cannot be
 replayed, and turns every eval into a flake.
+
+`LocalTime` is the one tool whose answer depends on the machine, and it is the
+zone it depends on, not the clock — its instant is an input like everywhere
+else. See [The one impure file](#the-one-impure-file).
 
 ```yaml
 tools:
@@ -32,6 +35,7 @@ tools:
 | `DurationFormat` | Render a length of time as human text, ISO 8601, or a clock |
 | `DurationParse` | Read `P3DT4H`, `2h30m` or `01:30:00` into milliseconds and components |
 | `IsLeapYear` | The Gregorian leap rule, with the year's length and the nearest leap years |
+| `LocalTime` | What an instant is where the operator is — their zone and its provenance, the wall clock, whether the clocks are forward, when they next change, and what that means for a working window or a cron |
 | `QuarterOf` | The quarter a date falls in, calendar or fiscal, with its bounds |
 | `RecurrenceExpand` | Expand a supported subset of an iCalendar RRULE from an explicit start |
 | `TimestampConvert` | Unix seconds, millis, micros and nanos to ISO 8601 and back |
@@ -122,6 +126,25 @@ five-minute timeout. Years and months are parsed but kept out of
 `totalMilliseconds` and the result is marked `exact: false`, because they have
 no fixed length — anchor them with `DateAdd`.
 
+**`LocalTime`**'s working window is `HH:MM`-`HH:MM` on a 24-hour clock in the
+answering zone, defaulting to `09:00`-`17:00` and saying in the output which of
+those two it used. An overnight window (`22:00`-`06:00`) is refused by name
+rather than wrapped, because a shift spanning midnight belongs to two calendar
+days and "is this a working day" stops having one answer. Weekends and holidays
+are the same inputs `BusinessDays` takes, read by the same code and counted the
+same way, so a date means the same thing to both tools. The window it reports is
+resolved through the same DST machinery as everything else here: a window that
+opens inside a spring-forward gap — midnight in `America/Havana` on 8 March
+2026 — says `nonexistent` instead of quietly sliding to 01:00.
+
+The fall-back case needs one more rule. A wall clock in a repeated hour maps to
+two instants, and `resolveWallClock` returns the earlier one, which is the right
+reading for a timestamp and the wrong answer to "when does this open". Asked at
+01:30 EST — the *second* pass of that clock — the 01:45 close is already forty-
+five minutes in the past. So `nextOpen` and `closesAt` take the first of those
+two instants that has not gone by, and say in `resolutionNote` which one they
+used. Neither ever reports a window behind the instant it was asked about.
+
 ## The range a date can hold
 
 Every instant here lives inside ±8.64×10¹⁵ milliseconds of the epoch — roughly
@@ -139,7 +162,75 @@ Timezone data comes from the runtime's `Intl` implementation, which is the
 platform's tzdb copy. Offsets for recent and near-future dates are stable
 across any current runtime; very old ones (before standard zones, where the
 offset had seconds) are rounded to the minute, and far-future ones can move
-with a tzdb update. Nothing else here depends on anything outside the package.
+with a tzdb update.
+
+The only other thing here that comes from outside the package is the host's own
+timezone, read by `LocalTime` alone and reported with its source — see below.
+
+## The one impure file
+
+`src/host.ts` is the only file here that looks at the machine, and `LocalTime`
+is the only tool that calls it. It answers one question — which timezone is
+this host set to — from one of three places, and every answer says which:
+
+| Source | Where it came from |
+|---|---|
+| `override` | the caller passed `timeZone`; the host was not consulted at all |
+| `env` | the `TZ` environment variable, validated as an IANA identifier |
+| `system` | what the runtime's `Intl` resolves as this process's default zone |
+
+The provenance is part of the answer because a wrong zone is invisible: it does
+not look like an error, it looks like a correct time. The case that bites is a
+`TZ` the runtime threw away. `TZ="EST5EDT,M3.2.0,M11.1.0"` is legal POSIX and
+is not an IANA identifier, so the runtime silently uses the system zone
+instead — recorded on bun 1.3.14 — and the operator who set it gets someone
+else's timezone with no warning anywhere. `LocalTime` reports that as the
+system zone with the discarded `TZ` named beside it.
+
+"Could not tell" is a third answer, distinct from any zone: a runtime built
+without tzdata, or a `TZ` that is unusable with no readable system zone behind
+it, comes back as `ok: false` with the reason and the suggestion to pass
+`timeZone`. Nothing here falls back to UTC, which would move every timestamp
+it printed without saying so.
+
+**Under `bun test` the un-injected read refuses.** `NODE_ENV=test` closes a
+gate in `host.ts`, so a test that forgets to install a zone gets a refusal on
+every box rather than the author's zone on a laptop and `UTC` on CI. Tests
+inject with `_setHostZone`; `integration.test.ts` is the one file that opens
+the gate, checks that the real machine really is read, and closes it again.
+
+### Whether the clocks are forward
+
+`Intl` does not expose tzdb's own DST flag, and the usual substitutes are each
+wrong somewhere: comparing January against July is backwards south of the
+equator, and "compare against the zone's standard offset" only moves the
+question, since nothing here can name that offset either. So `LocalTime`
+probes the zone daily across the surrounding year and reports the offsets it
+saw — this instant is *N* minutes above the lowest offset of the year, or it
+is at it, or the zone never moved. That is a statement about observed data,
+and the output says so.
+
+Being above the year's low is not on its own a clock change, so the reading
+also counts how often the zone moved inside the window and reports it as
+`offsetChangesInWindow`. A zone on DST goes up and comes back: two changes.
+A zone that redefined its offset moved once and stayed — `Europe/Volgograd`
+sat on UTC+4 through 2020 with no DST at all and dropped to UTC+3 that
+December — and calling that "the clocks are forward" would be wrong twice
+over. Those are the two places this parts company with tzdb's own flag, and
+both are named in the output's `caveat`; the other is `Europe/Dublin`, which
+records its **winter** as the DST period.
+
+Near either end of what a date can hold the window is clamped, and the output
+says `truncated` rather than resting a full year's claim on half a year of
+probes.
+
+The daily step is not caution for its own sake: Morocco's Ramadan pause is
+about a month long, and a weekly probe that straddled it would report a zone
+that never changes its clocks.
+
+`nextOffsetChange` finds the next transition to the minute, with the local
+reading on each side — and reports the shift in minutes, because
+`Australia/Lord_Howe` moves by thirty.
 
 ## What is deliberately not here
 
@@ -153,7 +244,7 @@ list as an input. Relative phrasing ("3 days ago") for the same reason
 ## Layout
 
 `src/lib/` holds the pure functions and is where the behaviour is tested;
-`src/index.ts` wraps them as tools. A bug in `daysFromCivil` or the cron field
+`src/index.ts` wraps them as tools; `src/host.ts` holds the single host read. A bug in `daysFromCivil` or the cron field
 expander reads better as a failing unit than as a failing tool call.
 
 - `lib/civil.ts` — day-count arithmetic, IANA offsets, ISO rendering
@@ -163,13 +254,19 @@ expander reads better as a failing unit than as a failing tool call.
 - `lib/duration.ts` — duration parsing and rendering
 - `lib/cron.ts` — the cron parser, walker and describer
 - `lib/recurrence.ts` — the RRULE subset
+- `host.ts` — the host's timezone, and the seam that lets a test replace it
 
 ## Safety flags
 
-All seventeen are `readOnly`, non-destructive, `scope: "internal"`, and declare
+All eighteen are `readOnly`, non-destructive, `scope: "internal"`, and declare
 no io capability, because none of them crosses a process or network boundary.
 `src/index.test.ts` asserts that for every tool, and then greps the source of
 every module for the ways out: `Date.now()`, a bare `new Date()`,
 `performance.now()`, `Math.random()`, `crypto`, `process`, `fetch`, `require`,
 `Bun.*`, and any `node:`/`fs`/`path`/`child_process` import. A future addition
 that reads the clock or reaches outside has to edit that list on purpose.
+
+`src/host.ts` is outside that list and is held to a narrower rule of its own: a
+companion test collects every `process.` read in it and asserts the set is
+exactly `TZ` and `NODE_ENV`, and that no file under `lib/` imports it. The
+exception stays one file and two variable names, or the suite fails.

@@ -309,6 +309,24 @@ const RESERVED_HEADERS: ReadonlySet<string> = new Set([
 const HEADER_NAME = /^[A-Za-z][A-Za-z0-9-]*$/;
 
 /**
+ * The two header questions asked in more than one place.
+ *
+ * `EmailSendPreflight` reports every bad header name at once, while
+ * `composeMessage` refuses at the first. Both have to be asking the SAME
+ * question: a preflight that says "ready" against its own copy of the rule,
+ * and a compose that then refuses, is a preflight nobody can act on. So the
+ * predicate is exported and the composer below is one of its callers rather
+ * than a second implementation.
+ */
+export function isValidHeaderName(name: string): boolean {
+  return HEADER_NAME.test(name);
+}
+
+export function isReservedHeaderName(name: string): boolean {
+  return RESERVED_HEADERS.has(name.toLowerCase());
+}
+
+/**
  * A `msg-id`, per RFC 5322 §3.6.4: angle-bracketed, with no whitespace and
  * no control character anywhere inside it.
  *
@@ -320,6 +338,11 @@ const HEADER_NAME = /^[A-Za-z][A-Za-z0-9-]*$/;
  * a header, and silently dropping the tail would hide the attempt.
  */
 const MSG_ID = /^<[^\s<>\r\n\0]+>$/;
+
+/** True for exactly one bracketed message id, per the grammar above. */
+export function isMessageId(value: string): boolean {
+  return MSG_ID.test(value);
+}
 
 /**
  * A `Content-ID` token: the same shape, without the brackets this builder
@@ -441,7 +464,7 @@ export function encodeBase64Lines(bytes: Uint8Array): string {
  * so a boundary can never collide with the content it delimits.
  */
 export function boundaryFor(kind: string, material: string): string {
-  const digest = createHash("sha256").update(`${kind} ${material}`, "utf8").digest("hex");
+  const digest = createHash("sha256").update(`${kind}\u0000${material}`, "utf8").digest("hex");
   return `=_crewhaus_${kind}_${digest.slice(0, 32)}`;
 }
 
@@ -501,17 +524,17 @@ export function composeMessage(input: ComposeInput): ComposeResult {
     return { ok: false, error: "the date is not a valid instant" };
   }
   for (const name of Object.keys(input.headers ?? {})) {
-    if (!HEADER_NAME.test(name)) {
+    if (!isValidHeaderName(name)) {
       return { ok: false, error: `"${name}" is not a valid header name` };
     }
-    if (RESERVED_HEADERS.has(name.toLowerCase())) {
+    if (isReservedHeaderName(name)) {
       return {
         ok: false,
         error: `header "${name}" is built by this tool and cannot be overridden — set it through the matching argument instead`,
       };
     }
   }
-  if (input.inReplyTo !== undefined && input.inReplyTo !== "" && !MSG_ID.test(input.inReplyTo)) {
+  if (input.inReplyTo !== undefined && input.inReplyTo !== "" && !isMessageId(input.inReplyTo)) {
     return {
       ok: false,
       error:
@@ -519,7 +542,7 @@ export function composeMessage(input: ComposeInput): ComposeResult {
     };
   }
   for (const reference of input.references ?? []) {
-    if (!MSG_ID.test(reference)) {
+    if (!isMessageId(reference)) {
       return {
         ok: false,
         error:

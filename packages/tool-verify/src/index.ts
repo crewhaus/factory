@@ -13,13 +13,32 @@
  */
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
-import { extractMarkdownLinks, headingAnchors, lintCitations } from "./lib/markdown";
+import {
+  citationDefinitions,
+  citedClaims,
+  extractMarkdownLinks,
+  hasUriScheme,
+  headingAnchors,
+  lintCitations,
+  splitLinkTarget,
+} from "./lib/markdown";
 import { NORMALIZERS, type Normalizer, firstDifferences, normalizeOutput } from "./lib/normalize";
-import { resolveSafe, workspaceRoot } from "./paths";
+import {
+  type SourceIndex,
+  type SourceToken,
+  bestSpan,
+  contentTokens,
+  findSequence,
+  indexSource,
+  lineOf,
+  quotedRuns,
+  spanExcerpt,
+} from "./lib/spans";
+import { type SafePath, ToolPermissionError, resolveSafe, workspaceRoot } from "./paths";
 
 const json = (value: unknown): string => JSON.stringify(value);
 
@@ -29,6 +48,11 @@ const LIMITS = {
   textChars: 16 * 1024 * 1024,
   checks: 200,
   diffLines: 50,
+  claims: 200,
+  claimChars: 4_000,
+  // A source is tokenized end to end, so its cap is about the work rather
+  // than the memory, and is far below the per-file one above.
+  sourceBytes: 8 * 1024 * 1024,
 } as const;
 
 const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", "coverage", ".next", ".turbo"]);
@@ -469,11 +493,11 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
 
       for (const link of extractMarkdownLinks(text)) {
         checked++;
-        if (/^[a-z][a-z0-9+.-]*:/i.test(link.href)) {
+        if (hasUriScheme(link.href)) {
           external++;
           continue;
         }
-        const [target = "", fragment] = link.href.split("#");
+        const { target, fragment } = splitLinkTarget(link.href);
         if (target === "") {
           // A bare `#anchor` points inside this document.
           if (
@@ -490,22 +514,32 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
           }
           continue;
         }
-        const resolved = resolve(dirname(abs), target);
-        // Containment applies to a link's target too: a doc must not be able
-        // to make this tool stat something outside the workspace.
-        const rel = relative(workspaceRoot(), resolved);
-        if (rel.startsWith("..")) {
+        // Containment applies to a link's target too — and to the path that
+        // is actually OPENED, not the one the link spells. A lexical
+        // `relative(root, …)` check passes `./escape.md` while `statSync`
+        // follows it to wherever it points, so a link through an
+        // in-workspace symlink used to be stat'ed, and with `checkAnchors`
+        // READ, outside the workspace: the anchor answer then reports
+        // whether a file nobody may read carries a given heading.
+        // `resolveSafe` follows the link before deciding.
+        let targetAt: SafePath;
+        try {
+          targetAt = resolveSafe("MarkdownLinkCheck", resolve(dirname(abs), target));
+        } catch (err) {
           broken.push({
             file: label,
             line: link.line,
             href: link.href,
-            reason: "the target is outside the workspace",
+            reason:
+              err instanceof ToolPermissionError
+                ? "the target is outside the workspace"
+                : `the target could not be resolved: ${(err as Error).message}`,
           });
           continue;
         }
         let ok = false;
         try {
-          statSync(resolved);
+          statSync(targetAt.real);
           ok = true;
         } catch {
           ok = false;
@@ -520,7 +554,7 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
           continue;
         }
         if (input.checkAnchors && fragment !== undefined && /\.(md|mdx|markdown)$/i.test(target)) {
-          const targetAnchors = headingAnchors(readCapped(resolved, target).toString("utf-8"));
+          const targetAnchors = headingAnchors(readCapped(targetAt.real, target).toString("utf-8"));
           if (!targetAnchors.has(fragment.toLowerCase())) {
             broken.push({
               file: label,
@@ -581,11 +615,550 @@ export const citationLint: RegisteredTool = buildTool({
   },
 });
 
+// ---------------------------------------------------------------------------
+
+/** Fewer words than this in quotation marks is a phrase, not a quotation. */
+const QUOTE_MIN_TOKENS = 4;
+/** How much of a quotation a source span must carry to count as a misquote
+ *  rather than as nothing at all. Below it there is no "nearly identical
+ *  span" to show the caller, and claiming one would be an invention. */
+const MISQUOTE_COVERAGE = 0.7;
+const MAX_CLAIM_CHARS = 300;
+const MAX_EXCERPT_CHARS = 240;
+
+const clip = (text: string, max: number): string =>
+  text.length > max ? `${text.slice(0, max - 1)}…` : text;
+
+/**
+ * What a cited source turned out to be.
+ *
+ * "Could not be read" and "was never checked" are kept apart from the start,
+ * because they stay apart all the way to the verdict: a source this tool
+ * declined to fetch is not a broken citation.
+ */
+type SourceOutcome =
+  | { readonly kind: "index"; readonly index: SourceIndex }
+  | { readonly kind: "unreadable"; readonly reason: string }
+  | { readonly kind: "unchecked"; readonly reason: string };
+
+/**
+ * One cited source, read once.
+ *
+ * The cache is keyed on the REAL path, not on the string the document wrote:
+ * two spellings of one file must share an entry, and — the reason it matters —
+ * an entry found under a raw string could otherwise be a different file's
+ * text than the one the containment check passed. What was validated is what
+ * gets read, and what gets read is what gets indexed.
+ */
+function loadSource(
+  raw: string,
+  baseAbs: string,
+  cache: Map<string, SourceOutcome>,
+): { label: string; outcome: SourceOutcome } {
+  // A Markdown definition may carry a title after the destination; it is not
+  // part of the destination.
+  const destination = raw.replace(/\s+"[^"]*"\s*$/, "").trim();
+  // What the DOCUMENT wrote, for every answer that is about the citation
+  // rather than about a file that was opened. A file that is opened is
+  // reported by its workspace-relative path instead, below.
+  const written = clip(destination, MAX_CLAIM_CHARS);
+  if (destination === "") {
+    return {
+      label: clip(raw, MAX_CLAIM_CHARS),
+      outcome: { kind: "unchecked", reason: "it names nothing" },
+    };
+  }
+  if (hasUriScheme(destination)) {
+    return {
+      label: written,
+      outcome: {
+        kind: "unchecked",
+        reason: "it is a URL, and nothing in this package fetches",
+      },
+    };
+  }
+  // Parse the destination, then act on the parsed value. A citation may carry
+  // a fragment exactly as any other Markdown link does, and the file is the
+  // part in front of it — asked of the same `splitLinkTarget` MarkdownLinkCheck
+  // asks, because a second rule here would drift from that one and have the
+  // two tools disagree about which file a citation names. The fragment itself
+  // is not honoured: narrowing the search to one section would decide which
+  // span of a source a claim is allowed to be in, and getting that wrong
+  // reports a source that does say the thing as one that does not.
+  const { target } = splitLinkTarget(destination);
+  if (target === "") {
+    return {
+      label: written,
+      outcome: {
+        kind: "unchecked",
+        reason: "it points inside the document itself, not at a source",
+      },
+    };
+  }
+  // A source with a space in it is usually a bibliographic reference — but
+  // "docs/my report.md" is a file, and deciding on the shape of the string
+  // alone would report it as unreadable prose. So the filesystem answers
+  // first, and the shape only decides what a MISS means.
+  const looksWritten = /\s/.test(target);
+  const prose: SourceOutcome = {
+    kind: "unchecked",
+    reason: "it is a written reference, not a file in the workspace",
+  };
+
+  let at: SafePath;
+  try {
+    // Containment is applied to the path that will actually be opened — the
+    // document's own directory joined with what the document asked for —
+    // never to the string as written. `resolveSafe` follows symlinks, which
+    // `join` and `existsSync` do not.
+    at = resolveSafe("FactCrossCheck", resolve(baseAbs, target));
+  } catch (err) {
+    if (looksWritten) return { label: written, outcome: prose };
+    if (err instanceof ToolPermissionError) {
+      return {
+        label: written,
+        outcome: { kind: "unreadable", reason: "it is outside the workspace" },
+      };
+    }
+    return { label: written, outcome: { kind: "unreadable", reason: (err as Error).message } };
+  }
+
+  // A file that was opened is named by its workspace-relative path; a source
+  // that turned out never to be a file is named the way the document wrote
+  // it. Reporting `docs/Smith, J. (2024)` for a printed reference cited in a
+  // document under `docs/` would describe a path nobody ever asked for.
+  // Past this point the only `unchecked` outcome is `prose`.
+  const labelFor = (outcome: SourceOutcome): string =>
+    outcome.kind === "unchecked" ? written : clip(at.rel, MAX_CLAIM_CHARS);
+
+  const cached = cache.get(at.real);
+  if (cached !== undefined) return { label: labelFor(cached), outcome: cached };
+
+  const outcome = ((): SourceOutcome => {
+    let size: number;
+    try {
+      const stat = statSync(at.real);
+      if (stat.isDirectory()) {
+        return { kind: "unreadable", reason: "it is a directory, not a document" };
+      }
+      if (!stat.isFile()) return { kind: "unreadable", reason: "it is not a regular file" };
+      size = stat.size;
+    } catch {
+      return looksWritten ? prose : { kind: "unreadable", reason: "it is not there" };
+    }
+    // A smaller cap than the rest of the package uses: every byte of a source
+    // is tokenized, so the limit is about the work, not the memory.
+    if (size > LIMITS.sourceBytes) {
+      return {
+        kind: "unreadable",
+        reason: `it is ${size} bytes, over the ${LIMITS.sourceBytes}-byte limit for a source`,
+      };
+    }
+    let bytes: Buffer;
+    try {
+      bytes = readFileSync(at.real);
+    } catch (err) {
+      return { kind: "unreadable", reason: (err as Error).message };
+    }
+    // A NUL byte means this is not text; tokenizing it would produce
+    // nonsense and a confident "not found".
+    if (bytes.includes(0)) return { kind: "unreadable", reason: "it is not text" };
+    return { kind: "index", index: indexSource(bytes.toString("utf-8")) };
+  })();
+
+  cache.set(at.real, outcome);
+  return { label: labelFor(outcome), outcome };
+}
+
+type Verdict =
+  | "supported"
+  | "misquoted"
+  | "polarityConflict"
+  | "unreadable"
+  | "unchecked"
+  | "notFound"
+  | "noSource";
+
+/**
+ * Which answer a claim takes when its sources disagree about how much they
+ * know. Lower wins.
+ *
+ * `notFound` sits BELOW `unreadable` and `unchecked` on purpose: a claim can
+ * only be reported as absent from its sources once every one of them was
+ * actually read. A source that could not be opened leaves the claim
+ * undetermined, which is a different answer and needs a different fix.
+ */
+const VERDICT_RANK: Readonly<Record<Verdict, number>> = {
+  supported: 0,
+  misquoted: 1,
+  polarityConflict: 2,
+  unreadable: 3,
+  unchecked: 4,
+  notFound: 5,
+  noSource: 6,
+};
+
+type SourceFinding = {
+  source: string;
+  status: Verdict;
+  reason: string;
+  coverage?: number;
+  missing?: string[];
+  differing?: string[];
+  line?: number;
+  excerpt?: string;
+};
+
+/** Locate one claim's words in one source. */
+function checkOneSource(
+  label: string,
+  index: SourceIndex,
+  claim: PreparedClaim,
+  windowTokens: number,
+): SourceFinding {
+  if (claim.quotes.length > 0) {
+    let worst: SourceFinding | null = null;
+    let firstHit = -1;
+    for (const run of claim.quotes) {
+      const at = findSequence(index, run);
+      if (at !== -1) {
+        if (firstHit === -1) firstHit = at;
+        continue;
+      }
+      // The quotation is not there word for word. A span that carries most of
+      // it is the useful answer — the caller needs to see what the source
+      // actually wrote — and a span that carries little of it is no answer at
+      // all, only a coincidence of vocabulary.
+      const distinct = [...new Set(run)];
+      const near = bestSpan(index, distinct, run.length);
+      const coverage = near.total === 0 ? 0 : near.matched / near.total;
+      const enough = coverage >= MISQUOTE_COVERAGE && near.matched >= 3;
+      const finding: SourceFinding = enough
+        ? {
+            source: label,
+            status: "misquoted",
+            reason: `"${label}" has a nearly identical span, but not the words the claim puts in quotation marks`,
+            coverage: Math.round(coverage * 100) / 100,
+            missing: [...near.missing],
+            differing: [...near.extra],
+            line: lineOf(index, (index.tokens[near.firstToken] as SourceToken).at),
+            excerpt: spanExcerpt(index, near.firstToken, near.lastToken, MAX_EXCERPT_CHARS),
+          }
+        : {
+            source: label,
+            status: "notFound",
+            reason: `the quoted words are not in "${label}"; that is not a finding that it says otherwise`,
+            coverage: Math.round(coverage * 100) / 100,
+            missing: [...near.missing],
+          };
+      if (worst === null || VERDICT_RANK[finding.status] > VERDICT_RANK[worst.status]) {
+        worst = finding;
+      }
+    }
+    if (worst !== null) return worst;
+    const last = firstHit + (claim.quotes[0] as ReadonlyArray<string>).length - 1;
+    return {
+      source: label,
+      status: "supported",
+      reason: `the quoted words appear in "${label}", in order`,
+      coverage: 1,
+      line: lineOf(index, (index.tokens[firstHit] as SourceToken).at),
+      excerpt: spanExcerpt(index, firstHit, last, MAX_EXCERPT_CHARS),
+    };
+  }
+
+  const span = bestSpan(index, claim.need, windowTokens);
+  const coverage = span.total === 0 ? 0 : Math.round((span.matched / span.total) * 100) / 100;
+  if (span.matched < span.total) {
+    return {
+      source: label,
+      status: "notFound",
+      reason: `${span.matched} of ${span.total} of the claim's words are in "${label}", never together; that is not a finding that it says otherwise`,
+      coverage,
+      missing: [...span.missing],
+      ...(span.firstToken === -1
+        ? {}
+        : {
+            line: lineOf(index, (index.tokens[span.firstToken] as SourceToken).at),
+            excerpt: spanExcerpt(index, span.firstToken, span.lastToken, MAX_EXCERPT_CHARS),
+          }),
+    };
+  }
+  const line = lineOf(index, (index.tokens[span.firstToken] as SourceToken).at);
+  const excerpt = spanExcerpt(index, span.firstToken, span.lastToken, MAX_EXCERPT_CHARS);
+  if (span.extraNegations.length > 0) {
+    // Every word matched, and the span carrying them is negated where the
+    // claim is not. This is as close to "it says the opposite" as counting
+    // words can honestly get, and it is reported as something to read rather
+    // than as a contradiction found.
+    return {
+      source: label,
+      status: "polarityConflict",
+      reason: `the claim's words are in "${label}", but the span carrying them is negated ("${span.extraNegations.join('", "')}") where the claim is not — read it before relying on either`,
+      coverage: 1,
+      differing: [...span.extraNegations],
+      line,
+      excerpt,
+    };
+  }
+  return {
+    source: label,
+    status: "supported",
+    reason: `every word of the claim is in one span of "${label}"`,
+    coverage: 1,
+    line,
+    excerpt,
+  };
+}
+
+type PreparedClaim = {
+  readonly text: string;
+  readonly need: ReadonlyArray<string>;
+  readonly quotes: ReadonlyArray<ReadonlyArray<string>>;
+  readonly mode: "quote" | "paraphrase";
+};
+
+function prepareClaim(text: string): PreparedClaim {
+  const quotes = quotedRuns(text, QUOTE_MIN_TOKENS);
+  return {
+    text,
+    need: contentTokens(text),
+    quotes,
+    // An attributed quotation is the strictest promise a citation makes, so
+    // when there is one it is what gets verified; the words around it are the
+    // author's framing, not the source's.
+    mode: quotes.length > 0 ? "quote" : "paraphrase",
+  };
+}
+
+export const factCrossCheck: RegisteredTool = buildTool({
+  name: "FactCrossCheck",
+  description:
+    "Check that a cited source actually SAYS what the claim citing it says, offline, by locating the claim's words — or the exact span it puts in quotation marks — inside the source. Use it after CitationLint, which only establishes that a marker has something behind it. Read the verdicts literally: SUPPORTED means the source contains the assertion and nothing more, never that the assertion is true; NOT FOUND means the words could not be located, never that the source contradicts them; and a source that could not be read, or that is a URL nobody fetched, is kept apart from both rather than counted as a failure.",
+  inputSchema: z
+    .object({
+      text: z
+        .string()
+        .max(LIMITS.textChars)
+        .optional()
+        .describe("a document whose cited sentences to check"),
+      file: z.string().optional().describe("or that document's workspace-relative path"),
+      claims: z
+        .array(
+          z
+            .object({
+              text: z.string().min(1).max(LIMITS.claimChars).describe("the assertion"),
+              sources: z
+                .array(z.string().min(1))
+                .max(32)
+                .describe("paths to what it cites; relative to the workspace root"),
+              id: z.string().max(120).optional(),
+            })
+            .strict(),
+        )
+        .min(1)
+        .max(LIMITS.claims)
+        .optional()
+        .describe("or the claims and their sources, given directly"),
+      windowTokens: z
+        .number()
+        .int()
+        .min(4)
+        .max(2_000)
+        .optional()
+        .describe("default 60 — how far apart the claim's words may sit in the source"),
+      limit: z.number().int().positive().max(LIMITS.claims).optional().describe("default 200"),
+    })
+    .strict()
+    .refine((v) => [v.text, v.file, v.claims].filter((given) => given !== undefined).length === 1, {
+      message: "give exactly one of text, file or claims",
+    }),
+  readOnly: true,
+  concurrencySafe: true,
+  execute: async (input) => {
+    const windowTokens = input.windowTokens ?? 60;
+    const limit = input.limit ?? LIMITS.claims;
+    const cache = new Map<string, SourceOutcome>();
+
+    // Where a source path is measured from. A document's citations are
+    // written relative to the document; a caller's are relative to the
+    // workspace root. Both are contained the same way afterwards.
+    let baseAbs = workspaceRoot();
+    let from = "claims";
+    const claims: Array<{
+      text: string;
+      cites: string[];
+      /** Markers the document cites and never defines — nothing to read. */
+      unresolved: string[];
+      id?: string;
+      line?: number;
+    }> = [];
+
+    if (input.claims !== undefined) {
+      for (const claim of input.claims) {
+        claims.push({
+          text: claim.text,
+          cites: [...claim.sources],
+          unresolved: [],
+          ...(claim.id === undefined ? {} : { id: claim.id }),
+        });
+      }
+    } else {
+      let document: string;
+      if (input.file !== undefined) {
+        const at = resolveSafe("FactCrossCheck", input.file);
+        document = readCapped(at.real, at.rel).toString("utf-8");
+        baseAbs = dirname(at.real);
+        from = at.rel;
+      } else {
+        document = input.text as string;
+        from = "inline";
+      }
+      const definitions = citationDefinitions(document);
+      for (const claim of citedClaims(document)) {
+        const cites: string[] = [];
+        const unresolved: string[] = [];
+        for (const marker of claim.markers) {
+          const definition = definitions.get(marker);
+          if (definition === undefined) unresolved.push(marker);
+          else cites.push(definition);
+        }
+        claims.push({
+          text: claim.text,
+          line: claim.line,
+          id: claim.markers.join(","),
+          cites,
+          unresolved,
+        });
+      }
+    }
+
+    const counts: Record<Verdict, number> = {
+      supported: 0,
+      misquoted: 0,
+      polarityConflict: 0,
+      unreadable: 0,
+      unchecked: 0,
+      notFound: 0,
+      noSource: 0,
+    };
+
+    const results = claims.slice(0, limit).map((claim, index) => {
+      const prepared = prepareClaim(claim.text);
+      const head = {
+        index,
+        ...(claim.id === undefined ? {} : { id: claim.id }),
+        ...(claim.line === undefined ? {} : { line: claim.line }),
+        claim: clip(prepared.text, MAX_CLAIM_CHARS),
+        mode: prepared.mode,
+        cites: [
+          ...claim.unresolved.map((marker) => `[${marker}]`),
+          ...claim.cites.map((raw) => clip(raw, MAX_CLAIM_CHARS)),
+        ],
+      };
+
+      const settle = (verdict: Verdict, reason: string, sources: SourceFinding[] = []) => {
+        counts[verdict]++;
+        return { ...head, verdict, reason, sources };
+      };
+
+      if (claim.cites.length === 0 && claim.unresolved.length === 0) {
+        return settle(
+          "noSource",
+          "the claim cites nothing, so there was nothing to check it against",
+        );
+      }
+      // A claim with no words of its own cannot be located, and an empty set
+      // of words would otherwise be "found" in every source — a pass that
+      // checked nothing, which is the one result worse than a failure.
+      if (prepared.need.length === 0 && prepared.quotes.length === 0) {
+        return settle("unchecked", "the claim has no words to look for");
+      }
+
+      const sources: SourceFinding[] = [];
+      // A marker the document never defines has nothing behind it to read.
+      // It is not a source that failed; it is CitationLint's finding, carried
+      // through so this tool never counts an unread claim as a checked one.
+      for (const marker of claim.unresolved) {
+        sources.push({
+          source: `[${marker}]`,
+          status: "unchecked",
+          reason: `marker [${marker}] has no source behind it — that is CitationLint's finding`,
+        });
+      }
+      for (const raw of claim.cites) {
+        const { label, outcome } = loadSource(raw, baseAbs, cache);
+        if (outcome.kind === "index") {
+          sources.push(checkOneSource(label, outcome.index, prepared, windowTokens));
+        } else {
+          sources.push({
+            source: label,
+            status: outcome.kind,
+            reason:
+              outcome.kind === "unreadable"
+                ? `"${label}" could not be read: ${outcome.reason}`
+                : `"${label}" was not checked: ${outcome.reason}`,
+          });
+        }
+      }
+
+      const best = sources.reduce((a, b) =>
+        VERDICT_RANK[b.status] < VERDICT_RANK[a.status] ? b : a,
+      );
+      const reason =
+        best.status === "notFound" && sources.length > 1
+          ? `the claim's words are in none of the ${sources.length} cited sources, together; that is not a finding that they say otherwise`
+          : best.reason;
+      const found =
+        best.status === "supported" || best.status === "polarityConflict"
+          ? {
+              foundIn: {
+                source: best.source,
+                ...(best.line === undefined ? {} : { line: best.line }),
+                excerpt: best.excerpt ?? "",
+              },
+            }
+          : {};
+      counts[best.status]++;
+      return { ...head, verdict: best.status, reason, ...found, sources };
+    });
+
+    const undetermined = counts.unreadable + counts.unchecked + counts.noSource;
+    const unseen = claims.length - results.length;
+    return json({
+      from,
+      // `ok` is deliberately strict: it is true only when every claim was
+      // located in a source that could be read. A claim nobody could check is
+      // not a claim that passed — and a claim past the limit is a claim
+      // nobody LOOKED at, which is the same answer for a stronger reason.
+      // Reporting the ones that fit as a pass would be "could not determine"
+      // answered as "no problem", with the unread half deciding nothing.
+      ok: results.length > 0 && unseen === 0 && counts.supported === results.length,
+      checked: results.length,
+      claimsFound: claims.length,
+      truncated: unseen > 0,
+      notSupported: counts.misquoted + counts.polarityConflict + counts.notFound,
+      undetermined,
+      counts,
+      claims: results,
+      ...(results.length === 0
+        ? { detail: "no cited claim was found, so nothing was checked" }
+        : unseen > 0
+          ? {
+              detail: `${unseen} of the ${claims.length} cited claims were never checked — the limit is ${limit}; raise it, or check the rest separately`,
+            }
+          : {}),
+      note: "supported means the cited source contains the claim's words — or, for a claim in quotation marks, only the quoted span — never that the claim is true; notFound means they could not be located, never that the source disagrees",
+    });
+  },
+});
+
 /** Every tool this package registers, in the order a catalog should list them. */
 export const VERIFY_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   acceptanceCheck,
   checksumVerify,
   citationLint,
+  factCrossCheck,
   goldenCompare,
   goldenUpdate,
   markdownLinkCheck,

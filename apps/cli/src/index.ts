@@ -3778,6 +3778,22 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     codegraphCallers: codegraph.codegraphCallers,
     codegraphCallees: codegraph.codegraphCallees,
     codegraphImpact: codegraph.codegraphImpact,
+    // @crewhaus/tool-chainread
+    onchainTransactionsSync: chainread.onchainTransactionsSync,
+    // @crewhaus/tool-flow
+    leadAssign: flow.leadAssign,
+    sequenceRun: flow.sequenceRun,
+    // @crewhaus/tool-datetime
+    localTime: datetime.localTime,
+    // @crewhaus/tool-obs
+    emitTraceEvent: obs.emitTraceEvent,
+    // @crewhaus/tool-notify
+    emailSendPreflight: notify.emailSendPreflight,
+    deliverabilityCheck: notify.deliverabilityCheck,
+    // @crewhaus/tool-state
+    vectorDelete: state.vectorDelete,
+    // @crewhaus/tool-verify
+    factCrossCheck: verify.factCrossCheck,
     // @crewhaus/tool-discovery
     marketplaceSearch: discovery.marketplaceSearch,
     federationDiscover: discovery.federationDiscover,

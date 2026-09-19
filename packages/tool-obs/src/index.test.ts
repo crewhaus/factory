@@ -16,7 +16,15 @@
  * production position.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { auditToolScopes } from "@crewhaus/tool-builder";
@@ -30,6 +38,7 @@ import {
   alertList,
   budgetCheck,
   costReport,
+  emitTraceEvent,
   errorCluster,
   eventCounts,
   eventQuery,
@@ -157,7 +166,7 @@ afterEach(() => {
 
 describe("package contract", () => {
   test("every tool is exported once in OBS_TOOLS, and the array is frozen", () => {
-    expect(OBS_TOOLS.length).toBe(15);
+    expect(OBS_TOOLS.length).toBe(16);
     expect(Object.isFrozen(OBS_TOOLS)).toBe(true);
     expect(new Set(OBS_TOOLS.map((t) => t.name)).size).toBe(OBS_TOOLS.length);
   });
@@ -196,6 +205,7 @@ describe("package contract", () => {
       "BudgetCheck",
       "SloEvaluate",
       "IncidentBundle",
+      "EmitTraceEvent",
     ];
     for (const name of local) {
       const tool = OBS_TOOLS.find((t) => t.name === name) as RegisteredTool;
@@ -226,12 +236,12 @@ describe("package contract", () => {
     }
   });
 
-  test("only the three tools that change something outside are destructive", () => {
+  test("only the tools that change something outside are destructive", () => {
     expect(
       OBS_TOOLS.filter((t) => t.destructive)
         .map((t) => t.name)
         .sort(),
-    ).toEqual(["AlertAck", "IncidentBundle", "StatusPagePost"]);
+    ).toEqual(["AlertAck", "EmitTraceEvent", "IncidentBundle", "StatusPagePost"]);
   });
 
   test("the two tools whose output a human reads elsewhere are justification-gated", () => {
@@ -548,6 +558,338 @@ describe("IncidentBundle", () => {
 
   test("it refuses to bundle every session in the directory", async () => {
     expect(await run(incidentBundle, { out: "x.json" })).toContain("not an incident report");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// local: writing
+// ---------------------------------------------------------------------------
+
+describe("EmitTraceEvent", () => {
+  const SESSION_A_ID = "sess_aaaaaaaaaaaaaaaa";
+  const logPath = (id = SESSION_A_ID): string => path.join(sessions, `${id}.jsonl`);
+  /** The runtime's own context, as the executor threads it onto a call. */
+  const inRun = (over: Record<string, unknown> = {}) => ({
+    runContext: { runId: "run_1", sessionId: SESSION_A_ID, turnNumber: 2, ...over },
+  });
+
+  test("the line it writes is one this package's own readers read back", async () => {
+    const result = await run(
+      emitTraceEvent,
+      {
+        sessionId: SESSION_A_ID,
+        name: "deploy_started",
+        message: "rolling out build 42",
+        tsMs: T0 + 4000,
+        fields: { shard: "eu-1", attempt: 2 },
+        runId: "run_1",
+      },
+      undefined,
+    );
+    expect(result.appended).toBe(true);
+    expect(result.kind).toBe("custom.deploy_started");
+
+    const page = await run(eventQuery, {
+      sessionId: SESSION_A_ID,
+      kinds: ["custom.deploy_started"],
+    });
+    expect(page.matched).toBe(1);
+    expect(page.results[0].payload).toContain("deploy_started");
+
+    const counts = await run(eventCounts, { sessionId: SESSION_A_ID });
+    expect(counts.byKind.some((k: { kind: string }) => k.kind === "custom.deploy_started")).toBe(
+      true,
+    );
+
+    const timeline = await run(runTimeline, { sessionId: SESSION_A_ID, runId: "run_1" });
+    const entry = timeline.entries.find(
+      (e: { kind: string }) => e.kind === "custom.deploy_started",
+    );
+    expect(entry).toMatchObject({ label: "deploy_started", ts: T0 + 4000 });
+  });
+
+  test("a running harness need not name its own session", async () => {
+    const result = await run(emitTraceEvent, { name: "checkpoint", tsMs: T0 }, inRun());
+    expect(result.session).toBe(SESSION_A_ID);
+    expect(result.runContext).toBe("present");
+    expect(result.runId).toBe("run_1");
+    expect(result.runIdSource).toBe("context");
+  });
+
+  test("outside a run, with no session named, it says so rather than guessing one", async () => {
+    // There are two logs in this directory; picking one would be a coin toss
+    // written to disk.
+    expect(await run(emitTraceEvent, { name: "checkpoint" })).toContain("pass sessionId");
+  });
+
+  test("an event written into another session's log is marked as such", async () => {
+    await run(
+      emitTraceEvent,
+      { sessionId: "sess_bbbbbbbbbbbbbbbb", name: "checkpoint", tsMs: T0 },
+      inRun(),
+    );
+    const written = readFileSync(logPath("sess_bbbbbbbbbbbbbbbb"), "utf8").trim().split("\n");
+    const payload = JSON.parse(written[written.length - 1] as string).payload;
+    expect(payload.emittedFrom).toMatchObject({
+      sessionId: SESSION_A_ID,
+      crossSession: true,
+    });
+  });
+
+  test("it refuses to start a log that is not there unless asked to", async () => {
+    const missing = await run(emitTraceEvent, { sessionId: "sess_cccccccccccccccc", name: "x" });
+    expect(missing).toContain("no session log at");
+    expect(missing).toContain("create: true");
+    expect(existsSync(logPath("sess_cccccccccccccccc"))).toBe(false);
+
+    const made = await run(emitTraceEvent, {
+      sessionId: "sess_cccccccccccccccc",
+      name: "x",
+      create: true,
+    });
+    expect(made.appended).toBe(true);
+    expect(existsSync(logPath("sess_cccccccccccccccc"))).toBe(true);
+  });
+
+  test("a missing sessions directory is created only under create", async () => {
+    expect(await run(emitTraceEvent, { dir: "fresh", sessionId: "sess_d", name: "x" })).toContain(
+      "no session log at",
+    );
+    expect(existsSync(path.join(tmp, "fresh"))).toBe(false);
+    const made = await run(emitTraceEvent, {
+      dir: "fresh",
+      sessionId: "sess_d",
+      name: "x",
+      create: true,
+    });
+    expect(made.file).toBe("fresh/sess_d.jsonl");
+    expect(existsSync(path.join(tmp, "fresh", "sess_d.jsonl"))).toBe(true);
+  });
+
+  test("a dry run writes nothing, and the bytes it shows are the bytes appended", async () => {
+    const before = readFileSync(logPath(), "utf8");
+    const preview = await run(emitTraceEvent, {
+      sessionId: SESSION_A_ID,
+      name: "checkpoint",
+      message: "halfway",
+      tsMs: T0 + 1,
+      dryRun: true,
+    });
+    expect(preview.dryRun).toBe(true);
+    expect(readFileSync(logPath(), "utf8")).toBe(before);
+
+    const real = await run(emitTraceEvent, {
+      sessionId: SESSION_A_ID,
+      name: "checkpoint",
+      message: "halfway",
+      tsMs: T0 + 1,
+    });
+    expect(real.appended).toBe(true);
+    expect(readFileSync(logPath(), "utf8")).toBe(`${before}${preview.line}`);
+  });
+
+  test("a dry run previews the repair too, not just the line", async () => {
+    // The only case where the bytes appended differ from the bytes the
+    // builder produced is the mid-line repair, so a preview computed from the
+    // builder's line alone would be right on every OTHER log and wrong on the
+    // one a caller reaches for during an incident. Pinned here because that is
+    // exactly the parallel preview rule 8 forbids.
+    const truncated = `${jsonl(SESSION_B)}{"ts":1,"kind":"tool_use"`;
+    writeFileSync(logPath("sess_ffffffffffffffff"), truncated);
+    const preview = await run(emitTraceEvent, {
+      sessionId: "sess_ffffffffffffffff",
+      name: "checkpoint",
+      tsMs: T0,
+      dryRun: true,
+    });
+    expect(preview.precededByNewline).toBe(true);
+    expect(preview.line.startsWith("\n")).toBe(true);
+    expect(readFileSync(logPath("sess_ffffffffffffffff"), "utf8")).toBe(truncated);
+
+    const real = await run(emitTraceEvent, {
+      sessionId: "sess_ffffffffffffffff",
+      name: "checkpoint",
+      tsMs: T0,
+    });
+    expect(real.appended).toBe(true);
+    expect(readFileSync(logPath("sess_ffffffffffffffff"), "utf8")).toBe(
+      `${truncated}${preview.line}`,
+    );
+  });
+
+  test("a dry run of a call that would be refused is refused identically", async () => {
+    const refusal = await run(emitTraceEvent, {
+      sessionId: "sess_cccccccccccccccc",
+      name: "x",
+      dryRun: true,
+    });
+    expect(refusal).toContain("no session log at");
+  });
+
+  test("a log cut off mid-line gains a newline first, and the broken line stays broken", async () => {
+    // The half line is already malformed; appending onto it would make it
+    // malformed AND swallow this event, which is the silent half of the bug.
+    const truncated = `${jsonl(SESSION_B)}{"ts":1,"kind":"tool_use"`;
+    writeFileSync(logPath("sess_dddddddddddddddd"), truncated);
+    const result = await run(emitTraceEvent, {
+      sessionId: "sess_dddddddddddddddd",
+      name: "checkpoint",
+      tsMs: T0,
+    });
+    expect(result.precededByNewline).toBe(true);
+    const text = readFileSync(logPath("sess_dddddddddddddddd"), "utf8");
+    expect(text).toContain(`{"ts":1,"kind":"tool_use"\n{"ts":${T0}`);
+    const page = await run(eventQuery, { sessionId: "sess_dddddddddddddddd" });
+    expect(page.malformedLines).toBe(1);
+    expect(page.results.some((e: { kind: string }) => e.kind === "custom.checkpoint")).toBe(true);
+  });
+
+  test("the same event emitted twice appends two identical lines", async () => {
+    const input = { sessionId: SESSION_A_ID, name: "checkpoint", tsMs: T0 + 9 };
+    await run(emitTraceEvent, input);
+    await run(emitTraceEvent, input);
+    const lines = readFileSync(logPath(), "utf8").trim().split("\n");
+    expect(lines[lines.length - 1]).toBe(lines[lines.length - 2] as string);
+  });
+
+  test("a refusal from the payload rules leaves the log untouched", async () => {
+    const before = readFileSync(logPath(), "utf8");
+    const result = await run(emitTraceEvent, {
+      sessionId: SESSION_A_ID,
+      name: "checkpoint",
+      // A line break would read as a second entry nobody wrote.
+      message: `ok${String.fromCharCode(0x0a)}{"kind":"run_failed"}`,
+    });
+    expect(result).toContain("U+000A");
+    expect(readFileSync(logPath(), "utf8")).toBe(before);
+  });
+
+  test("an event with no tsMs says what that costs rather than inventing a time", async () => {
+    const result = await run(emitTraceEvent, { sessionId: SESSION_A_ID, name: "checkpoint" });
+    expect(result.timestamped).toBe(false);
+    expect(result.note).toContain("sinceTs/untilTs will never match it");
+    const bounded = await run(eventQuery, {
+      sessionId: SESSION_A_ID,
+      kinds: ["custom.checkpoint"],
+      sinceTs: 0,
+    });
+    expect(bounded.matched).toBe(0);
+  });
+
+  test("a path escaping the workspace is refused and nothing is written", async () => {
+    const outside = mkdtempSync(path.join(tmpdir(), "crewhaus-obs-outside-"));
+    try {
+      const { symlinkSync } = await import("node:fs");
+      symlinkSync(outside, path.join(tmp, "link"));
+      expect(
+        await run(emitTraceEvent, { dir: "link", sessionId: "sess_x", name: "x", create: true }),
+      ).toContain("escapes the workspace root");
+      expect(
+        await run(emitTraceEvent, { dir: "../outside", sessionId: "sess_x", name: "x" }),
+      ).toContain("escapes the workspace root");
+      expect(await run(emitTraceEvent, { sessionId: "../../etc/passwd", name: "x" })).toContain(
+        "looks like a path",
+      );
+      expect(existsSync(path.join(outside, "sess_x.jsonl"))).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a session id carrying invisible or direction-changing text creates no such file", async () => {
+    // The message and field rules refuse these characters; putting the same
+    // text in the session id instead would put it in a FILENAME on disk and
+    // echo it back raw in the result, which is the same trick through the
+    // door nobody guarded.
+    const bidi = await run(emitTraceEvent, {
+      sessionId: `sess_a${String.fromCharCode(0x202e)}evil`,
+      name: "x",
+      create: true,
+    });
+    expect(bidi).toContain("sessionId");
+    expect(bidi).toContain("U+202E");
+    expect(
+      await run(emitTraceEvent, {
+        sessionId: `a${String.fromCharCode(0x0a)}b`,
+        name: "x",
+        create: true,
+      }),
+    ).toContain("U+000A");
+    expect(readdirSync(sessions).sort()).toEqual([
+      "sess_aaaaaaaaaaaaaaaa.jsonl",
+      "sess_bbbbbbbbbbbbbbbb.jsonl",
+    ]);
+  });
+
+  test("a sessions directory carrying the same text is refused before it is created", async () => {
+    const result = await run(emitTraceEvent, {
+      dir: `logs${String.fromCharCode(0x202e)}x`,
+      sessionId: "sess_a",
+      name: "x",
+      create: true,
+    });
+    expect(result).toContain("U+202E");
+    // The gate is on the path actually opened, so `dir` is covered by the
+    // rule `sessionId` is.
+    expect(readdirSync(tmp)).toEqual([".crewhaus"]);
+  });
+
+  test("a session id that is really nothing is refused rather than turned into a dot-file", async () => {
+    // `""` and `"."` both survive `sessionFileName` and land on `.jsonl` and
+    // `..jsonl`. Inside a live run an empty id is not even a fallback to the
+    // run's own log: it is a hidden file the sweep would later read back as a
+    // session with no name.
+    expect(
+      await run(emitTraceEvent, { sessionId: "", name: "x", create: true }, inRun()),
+    ).toContain("not a session id");
+    expect(await run(emitTraceEvent, { sessionId: ".", name: "x", create: true })).toContain(
+      "not a session id",
+    );
+    expect(existsSync(path.join(sessions, ".jsonl"))).toBe(false);
+    expect(existsSync(path.join(sessions, "..jsonl"))).toBe(false);
+  });
+
+  test("a run context with no session in it says so, rather than reporting no run context", async () => {
+    // "There is no run context" and "the run context has no session" are
+    // different faults and only one of them is the runtime's.
+    const result = await run(emitTraceEvent, { name: "x" }, { runContext: { runId: "run_1" } });
+    expect(result).toContain("the run context on this call carries no sessionId");
+  });
+
+  test("a dangling symlink pointing outside is refused, and one pointing inside is followed", async () => {
+    // `existsSync` FOLLOWS links, so a link whose target does not exist yet
+    // reads as "missing" — and `create: true` through it would CREATE the
+    // target, outside the workspace. The containment has to be measured on
+    // where the write would land, not on whether the name resolves today.
+    const outside = mkdtempSync(path.join(tmpdir(), "crewhaus-obs-dangling-"));
+    try {
+      const { symlinkSync } = await import("node:fs");
+      symlinkSync(path.join(outside, "stolen.jsonl"), path.join(sessions, "sess_out.jsonl"));
+      expect(
+        await run(emitTraceEvent, { sessionId: "sess_out", name: "x", create: true }),
+      ).toContain("escapes the workspace root");
+      expect(existsSync(path.join(outside, "stolen.jsonl"))).toBe(false);
+
+      mkdirSync(path.join(tmp, "elsewhere"));
+      symlinkSync(path.join(tmp, "elsewhere", "kept.jsonl"), path.join(sessions, "sess_in.jsonl"));
+      const made = await run(emitTraceEvent, {
+        sessionId: "sess_in",
+        name: "x",
+        tsMs: T0,
+        create: true,
+      });
+      expect(made.appended).toBe(true);
+      expect(readFileSync(path.join(tmp, "elsewhere", "kept.jsonl"), "utf8")).toContain("custom.x");
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a session id that names a directory is refused, not appended to", async () => {
+    mkdirSync(path.join(sessions, "sess_eeeeeeeeeeeeeeee.jsonl"));
+    expect(await run(emitTraceEvent, { sessionId: "sess_eeeeeeeeeeeeeeee", name: "x" })).toContain(
+      "is not a file",
+    );
   });
 });
 

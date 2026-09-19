@@ -11,6 +11,19 @@ import { budgetCheck } from "./lib/budget";
 import { costReport, priceTokens, utcDay } from "./lib/cost";
 import { countEvents, nearestRankPercentile, toolCallStats } from "./lib/counts";
 import {
+  type BuildResult,
+  type BuiltEvent,
+  EMITTED_BY,
+  type EmitRequest,
+  MAX_EVENT_BYTES,
+  MAX_FIELDS,
+  MAX_FIELD_VALUE_CHARS,
+  MAX_MESSAGE_CHARS,
+  MAX_NAME_CHARS,
+  MAX_RUN_ID_CHARS,
+  buildEmittedEvent,
+} from "./lib/emit";
+import {
   type ObsEvent,
   compareEvents,
   decodeCursor,
@@ -531,6 +544,286 @@ describe("buildTimeline", () => {
     expect(timeline.entries.length).toBe(2);
     expect(timeline.truncated).toBe(true);
     expect(timeline.events).toBe(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// emitting a line back onto the bus
+// ---------------------------------------------------------------------------
+
+/**
+ * A character by code point, never as a literal in this file.
+ *
+ * Half of what `findForbidden` refuses is invisible, and a fixture nobody can
+ * see is a fixture nobody can review — a stray raw byte pasted into a test
+ * would look exactly like a correct one. Naming the code point also means the
+ * assertion and the refusal are talking about the same character.
+ */
+function ch(code: number): string {
+  return String.fromCharCode(code);
+}
+
+/** The happy path, reduced to the fields a test actually varies. */
+function build(over: Partial<EmitRequest> = {}): BuildResult {
+  return buildEmittedEvent({ name: "deploy_started", targetSessionId: "sess_a", ...over });
+}
+
+function built(over: Partial<EmitRequest> = {}): BuiltEvent {
+  const result = build(over);
+  if (!result.ok) throw new Error(`expected a built event, got: ${result.message}`);
+  return result.value;
+}
+
+function refusal(over: Partial<EmitRequest>): string {
+  const result = build(over);
+  if (result.ok) throw new Error("expected a refusal");
+  return result.message;
+}
+
+describe("buildEmittedEvent: the wire shape", () => {
+  test("the line is one the package's own reader parses back", () => {
+    const event = built({ tsMs: 1000, message: "rolling out" });
+    const parsed = parseLog("sess_a", event.line);
+    expect(parsed.malformedLines).toBe(0);
+    expect(parsed.events.length).toBe(1);
+    expect(parsed.events[0]).toMatchObject({ kind: "custom.deploy_started", ts: 1000 });
+    // The envelope `@crewhaus/event-log` writes, key for key.
+    expect(JSON.parse(event.line)).toMatchObject({ ts: 1000, version: 1, kind: event.kind });
+    expect(event.line.endsWith("\n")).toBe(true);
+  });
+
+  test("RunTimeline labels it with the name it was emitted under", () => {
+    const event = built({ tsMs: 1000, name: "checkpoint" });
+    const [parsed] = parseLog("sess_a", event.line).events;
+    const timeline = buildTimeline([parsed as ObsEvent]);
+    expect(timeline.entries[0]).toMatchObject({ kind: "custom.checkpoint", label: "checkpoint" });
+  });
+
+  test("an event with no tsMs carries no timestamp rather than an invented one", () => {
+    const event = built();
+    expect(event.ts).toBeUndefined();
+    expect(Object.keys(JSON.parse(event.line))).toEqual(["version", "kind", "payload"]);
+  });
+
+  test("the same request twice is the same bytes, whatever order the fields came in", () => {
+    const a = built({ tsMs: 7, fields: { b: 2, a: 1 } });
+    const b = built({ tsMs: 7, fields: { a: 1, b: 2 } });
+    expect(a.line).toBe(b.line);
+  });
+
+  test("level error marks the entry as an error a timeline can draw", () => {
+    expect(built({ level: "error" }).payload["isError"]).toBe(true);
+    expect(built({ level: "warn" }).payload["isError"]).toBeUndefined();
+  });
+});
+
+describe("buildEmittedEvent: provenance", () => {
+  test("no name a caller can choose produces a kind the runtime could have written", () => {
+    // `run_failed` is the record a run dies with; asking for it by name gets
+    // the namespace, not the kind.
+    expect(built({ name: "run_failed" }).kind).toBe("custom.run_failed");
+    expect(refusal({ name: "run_failed.x" })).toContain("not a usable event name");
+    expect(refusal({ name: "Deploy" })).toContain("lower snake case");
+    expect(refusal({ name: "9lives" })).toContain("lower snake case");
+  });
+
+  test("the payload says who wrote it, and says so first", () => {
+    const event = built({ message: "text a reader should not reach before the marker" });
+    expect(Object.keys(event.payload)[0]).toBe("emittedBy");
+    expect(event.payload["emittedBy"]).toBe(EMITTED_BY);
+    // A small payload budget truncates from the TAIL, so provenance survives
+    // and the free text is what gets cut.
+    const [parsed] = parseLog("sess_a", event.line).events;
+    const rendered = renderEvent(parsed as ObsEvent, 40);
+    expect(String(rendered["payload"])).toContain("EmitTraceEvent");
+    expect(rendered["payloadTruncated"]).toBe(true);
+  });
+
+  test("the live run context wins the attribution and the caller's claim is kept", () => {
+    const event = built({ runId: "run_claimed", ambient: { runId: "run_real" } });
+    expect(event.runId).toBe("run_real");
+    expect(event.runIdSource).toBe("context");
+    expect(event.payload["emittedFrom"]).toMatchObject({
+      runContext: "present",
+      claimedRunId: "run_claimed",
+    });
+  });
+
+  test("with no run context the caller's runId is used and labelled as claimed", () => {
+    const event = built({ runId: "run_claimed" });
+    expect(event.runId).toBe("run_claimed");
+    expect(event.runIdSource).toBe("caller");
+    expect(event.payload["emittedFrom"]).toMatchObject({ runContext: "absent" });
+  });
+
+  test("a line written into somebody else's session log says so", () => {
+    const away = built({ ambient: { sessionId: "sess_other" } });
+    expect(away.payload["emittedFrom"]).toMatchObject({
+      sessionId: "sess_other",
+      crossSession: true,
+    });
+    const home = built({ ambient: { sessionId: "sess_a" } });
+    expect(
+      (home.payload["emittedFrom"] as Record<string, unknown>)["crossSession"],
+    ).toBeUndefined();
+  });
+
+  test("caller fields cannot reach a key a kind-agnostic reader trusts", () => {
+    // `buildTimeline` sums `durationMs` on every kind and `IncidentBundle`
+    // takes the first `specName` in log order — neither checks the kind, so
+    // the nesting is the only thing keeping a caller out of both.
+    const event = built({
+      tsMs: 1000,
+      fields: { durationMs: 999_999, specName: "someone-elses-bot", isError: true },
+    });
+    expect(event.payload["durationMs"]).toBeUndefined();
+    expect(event.payload["specName"]).toBeUndefined();
+    expect(event.payload["isError"]).toBeUndefined();
+    expect(event.payload["fields"]).toEqual({
+      durationMs: 999_999,
+      isError: true,
+      specName: "someone-elses-bot",
+    });
+    const [parsed] = parseLog("sess_a", event.line).events;
+    expect(buildTimeline([parsed as ObsEvent]).measuredByKind).toEqual([]);
+  });
+});
+
+describe("buildEmittedEvent: text that must not reach the line", () => {
+  test("a line break is refused, and the refusal names the character", () => {
+    const message = refusal({ message: `done${ch(0x0a)}fake entry` });
+    expect(message).toContain("U+000A");
+    expect(message).toContain("index 4");
+    expect(message).toContain("one event is one line");
+    expect(refusal({ message: ch(0x0d) })).toContain("U+000D");
+  });
+
+  test("an escape is refused as a terminal control sequence, not as bad UTF-8", () => {
+    expect(refusal({ message: `${ch(0x1b)}[2K` })).toContain("terminal");
+  });
+
+  test("text that renders differently from how it was written is refused", () => {
+    expect(refusal({ message: `a${ch(0x202e)}b` })).toContain("bidirectional");
+    expect(refusal({ message: `a${ch(0x200b)}b` })).toContain("zero-width");
+    expect(refusal({ message: `a${ch(0x2028)}b` })).toContain("line separator");
+    expect(refusal({ message: `a${ch(0x9)}b` })).toContain("tab");
+    expect(refusal({ message: `a${ch(0x85)}b` })).toContain("C1 control");
+  });
+
+  test("the same refusal covers a field value, not just the message", () => {
+    expect(refusal({ fields: { note: `x${ch(0x0a)}y` } })).toContain('field "note"');
+  });
+
+  test("ordinary text, including astral characters, is left alone", () => {
+    const event = built({ message: "shipped 🎉 — 100% of shards", fields: { emoji: "🎉" } });
+    expect(event.payload["message"]).toBe("shipped 🎉 — 100% of shards");
+    expect(parseLog("sess_a", event.line).malformedLines).toBe(0);
+  });
+});
+
+describe("buildEmittedEvent: the claimed run id is caller text too", () => {
+  test("a direction override or a zero-width character in runId is refused", () => {
+    // `EventQuery` renders a payload with `JSON.stringify`, which escapes
+    // control characters but NOT U+202E or U+200B — so a runId carrying one
+    // reaches a human's terminal exactly as written, which is the whole thing
+    // the message and field rules exist to prevent. Refusing it in one place
+    // and allowing it in the other is not a rule.
+    const bidi = refusal({ runId: `run_1${ch(0x202e)}` });
+    expect(bidi).toContain("runId");
+    expect(bidi).toContain("U+202E");
+    expect(bidi).toContain("bidirectional");
+    expect(refusal({ runId: `run_1${ch(0x200b)}2` })).toContain("zero-width");
+    expect(refusal({ runId: `run${ch(0x0a)}1` })).toContain("U+000A");
+  });
+
+  test("an over-long runId is refused rather than spending the line on it", () => {
+    expect(refusal({ runId: "r".repeat(MAX_RUN_ID_CHARS + 1) })).toContain(
+      `over the ${MAX_RUN_ID_CHARS} cap`,
+    );
+  });
+
+  test("an empty runId is no attribution rather than an attribution to nothing", () => {
+    // `runIdOf` reads ids back through `asString`, which treats "" as absent.
+    // Reporting `runIdSource: "caller"` for one would be an attribution every
+    // reader that filters by run disagrees with.
+    const event = built({ runId: "" });
+    expect(event.runId).toBeUndefined();
+    expect(event.runIdSource).toBeUndefined();
+    expect(event.payload["runId"]).toBeUndefined();
+    expect(runIdOf({ session: "sess_a", line: 1, kind: event.kind, payload: event.payload })).toBe(
+      undefined,
+    );
+  });
+
+  test("an empty runId on the run context does not beat a real caller claim", () => {
+    const event = built({ runId: "run_claimed", ambient: { runId: "" } });
+    expect(event.runId).toBe("run_claimed");
+    expect(event.runIdSource).toBe("caller");
+  });
+});
+
+describe("buildEmittedEvent: what the run context was worth", () => {
+  test("a context that yielded nothing is unusable, which is neither present nor absent", () => {
+    // The run context is read structurally, so a runtime that renamed its
+    // fields hands the tool an object it can extract nothing from. "present"
+    // would claim a provenance nothing supplied; "absent" would hide a
+    // carrier that was really there.
+    const empty = built({ contextAttached: true });
+    expect(empty.runContext).toBe("unusable");
+    expect(empty.payload["emittedFrom"]).toMatchObject({ runContext: "unusable" });
+    expect(built({ ambient: { runId: "run_1" } }).runContext).toBe("present");
+    expect(built().runContext).toBe("absent");
+  });
+});
+
+describe("buildEmittedEvent: bounds", () => {
+  test("a line over the cap is refused even when every part of it is legal", () => {
+    // Each piece is inside its own cap; the line they add up to is not. That
+    // is why the finished bytes are checked as well as the parts.
+    const fields: Record<string, string> = {};
+    for (let i = 0; i < 8; i++) fields[`f${i}`] = "x".repeat(MAX_FIELD_VALUE_CHARS);
+    const message = refusal({ message: "x".repeat(MAX_MESSAGE_CHARS), fields });
+    expect(message).toContain(String(MAX_EVENT_BYTES));
+    expect(message).toContain("shorten message or drop fields");
+  });
+
+  test("an over-long message is refused before the line is ever built", () => {
+    expect(refusal({ message: "x".repeat(MAX_MESSAGE_CHARS + 1) })).toContain("not a transcript");
+  });
+
+  test("too many fields, an unusable field name, and an over-long value are each refused", () => {
+    const many: Record<string, string> = {};
+    for (let i = 0; i <= MAX_FIELDS; i++) many[`f${i}`] = "v";
+    expect(refusal({ fields: many })).toContain(`over the ${MAX_FIELDS} cap`);
+    expect(refusal({ fields: { "not a name": "v" } })).toContain("is not usable");
+    // A dotted name is one `EventQuery`'s `where.path` cannot address: it
+    // would report a field this tool accepted as MISSING, which is a
+    // confidently wrong answer rather than a missing feature.
+    expect(refusal({ fields: { "a.b": "v" } })).toContain("where.path");
+    // A computed key, so the fixture itself does not set a prototype. The
+    // grammar requires a leading letter, which is what keeps this out of an
+    // assignment that would be a silent no-op rather than a recorded field.
+    expect(refusal({ fields: { ["__proto__"]: "v" } })).toContain("is not usable");
+    expect(refusal({ fields: { v: "x".repeat(MAX_FIELD_VALUE_CHARS + 1) } })).toContain(
+      "a log line is not",
+    );
+  });
+
+  test("a nested value is refused rather than flattened or stringified", () => {
+    expect(refusal({ fields: { nested: { a: 1 } as unknown as string } })).toContain("no bound");
+    expect(refusal({ fields: { list: [1, 2] as unknown as string } })).toContain("no bound");
+  });
+
+  test("a non-finite number is refused rather than written as null", () => {
+    // `JSON.stringify(Infinity)` is `null`: the value on disk would not be the
+    // value the caller passed.
+    expect(refusal({ fields: { ratio: Number.POSITIVE_INFINITY } })).toContain("finite");
+  });
+
+  test("an over-long name is refused by length before it is refused by grammar", () => {
+    expect(refusal({ name: "a".repeat(MAX_NAME_CHARS + 1) })).toContain(
+      `over the ${MAX_NAME_CHARS} cap`,
+    );
   });
 });
 

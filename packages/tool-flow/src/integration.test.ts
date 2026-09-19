@@ -88,7 +88,9 @@ describe("dispatch through executeTool", () => {
         rows: [{ id: "r", when: [{ op: "exists" }], outputs: {} }],
       },
       ErrorClassify: { status: 500 },
+      LeadAssign: { value: 1, strategy: "first", owners: [{ id: "o", when: [{ op: "exists" }] }] },
       RuleScore: { value: 1, rules: [{ id: "r", when: [{ op: "exists" }], points: 1 }] },
+      SequenceRun: { value: 1, steps: [{ id: "s" }], now: 0 },
       StallDetect: { history: [{ a: "1" }] },
     };
     for (const tool of FLOW_TOOLS) {
@@ -140,5 +142,75 @@ describe("the chain these exist to enable", () => {
       name: "wait-then-retry",
       result: { sleepMs: 30_000 },
     });
+  });
+});
+
+describe("chaining one decision into the next", () => {
+  test("score a lead, then route it on the band, with no model turn", async () => {
+    const scored = await executeTool(
+      lookup("RuleScore"),
+      {
+        value: { seats: 900, country: "DE" },
+        rules: [
+          { id: "seats", when: [{ path: "seats", op: "greaterThan", expected: 500 }], points: 60 },
+        ],
+        bands: [
+          { name: "nurture", min: 0 },
+          { name: "SQL", min: 60 },
+        ],
+      },
+      { toolUseId: "s1" },
+    );
+    const score = JSON.parse(scored.content);
+
+    const assigned = await executeTool(
+      lookup("LeadAssign"),
+      {
+        // The band the scorer produced and the country on the record are read
+        // by the same check grammar the scorer used.
+        value: { band: score.band, country: "DE" },
+        strategy: "specific",
+        owners: [
+          {
+            id: "enterprise-de",
+            when: [
+              { path: "band", op: "equals", expected: "SQL" },
+              { path: "country", op: "equals", expected: "DE" },
+            ],
+          },
+          { id: "smb-de", when: [{ path: "country", op: "equals", expected: "DE" }] },
+        ],
+      },
+      { toolUseId: "s2" },
+    );
+
+    expect(JSON.parse(assigned.content)).toMatchObject({
+      ok: true,
+      owner: "enterprise-de",
+    });
+  });
+
+  test("a plan hands back a step; running it is the caller's, and the next plan moves on", async () => {
+    const steps = [
+      { id: "draft", params: { to: "ana" } },
+      { id: "send", needs: ["draft"] },
+    ];
+
+    const first = await executeTool(
+      lookup("SequenceRun"),
+      { value: {}, steps, now: 0 },
+      { toolUseId: "p1" },
+    );
+    const plan = JSON.parse(first.content);
+    expect(plan.next).toMatchObject({ id: "draft", params: { to: "ana" } });
+
+    // Nothing here executed anything: the caller reports what it did by
+    // handing the completed id back, which is the whole contract.
+    const second = await executeTool(
+      lookup("SequenceRun"),
+      { value: {}, steps, completed: [plan.next.id], now: 0 },
+      { toolUseId: "p2" },
+    );
+    expect(JSON.parse(second.content).next).toMatchObject({ id: "send" });
   });
 });

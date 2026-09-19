@@ -19,6 +19,7 @@ import {
   __setPrivateHostsAllowedForTest,
   _resetIdempotencyLedger,
   _resetNotifyConfig,
+  _setDnsTxtResolver,
   registerNotifyConfig,
 } from "./index";
 
@@ -52,6 +53,7 @@ beforeEach(() => {
     allowed_origins: [origin],
     allowed_recipients: ["*@example.com"],
     allowed_smtp_hosts: ["127.0.0.1"],
+    allowed_sender_domains: ["example.com"],
     providers: {
       gateway: {
         endpoint: `${origin}/sms`,
@@ -63,6 +65,13 @@ beforeEach(() => {
     },
   });
   __setPrivateHostsAllowedForTest(true);
+  // DNS is recorded here too: dispatching every tool through the executor
+  // must not make one of them ask a real resolver.
+  _setDnsTxtResolver((name) =>
+    name === "example.com"
+      ? Promise.resolve([["v=spf1 -all"]])
+      : Promise.reject(new Error(`no DNS fixture recorded for "${name}"`)),
+  );
   catalog = new ToolCatalog();
   for (const tool of NOTIFY_TOOLS) catalog.register(tool);
 });
@@ -73,6 +82,7 @@ afterEach(() => {
   rmSync(tmp, { recursive: true, force: true });
   _resetNotifyConfig();
   _resetIdempotencyLedger();
+  _setDnsTxtResolver(undefined);
   __setPrivateHostsAllowedForTest(false);
   delete process.env[WEBHOOK_VAR];
 });
@@ -189,11 +199,13 @@ describe("dispatch through executeTool", () => {
       ChatUpdate: { platform: "slack", ...api, messageId: "1.1", text: "x" },
       ChatDelete: { platform: "slack", ...api, messageId: "1.1" },
       ChatReact: { platform: "slack", ...api, messageId: "1.1", emoji: "eyes" },
+      DeliverabilityCheck: { domain: "example.com" },
       DeliveryCheck: { provider: "gateway", messageId: "m1" },
       EmailCompose: mail,
       // No SMTP server here: the point is that it returns a string rather
       // than throwing when the connection cannot be made.
       EmailSend: { ...mail, host: "127.0.0.1", port: 1, timeoutMs: 500, requireTls: false },
+      EmailSendPreflight: mail,
       MessageTemplate: { templates: { t: "{{a}}" }, name: "t", data: { a: 1 }, platform: "slack" },
       NotifyDigest: { events: [{ key: "a" }] },
       PushNotify: { provider: "gateway", to: "d", body: "b" },

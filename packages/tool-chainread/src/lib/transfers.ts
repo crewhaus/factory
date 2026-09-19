@@ -47,6 +47,21 @@ export function topicToAddress(topic: string): string {
   return `0x${topic.slice(26).toLowerCase()}`;
 }
 
+/**
+ * The inverse: an address as the 32-byte topic word a log filter matches on.
+ *
+ * Left-padded to 32 bytes and lowercased, because `eth_getLogs` compares topics
+ * as fixed-width words and an unpadded or mixed-case one matches nothing — a
+ * filter that silently returns an empty set, which reads exactly like an
+ * address that never moved anything.
+ */
+export function addressToTopic(address: string): string {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    throw new ChainReadError(`expected a 20-byte address, got "${address}"`);
+  }
+  return `0x${"0".repeat(24)}${address.slice(2).toLowerCase()}`;
+}
+
 export type TokenMovement = {
   readonly standard: "erc20" | "erc721" | "erc1155";
   readonly token: string;

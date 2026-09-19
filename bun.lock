@@ -2257,6 +2257,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-money": "workspace:*",
         "@crewhaus/tool-onchain": "workspace:*",
         "zod": "^3.23.8",
       },

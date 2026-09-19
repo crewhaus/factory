@@ -17,6 +17,7 @@
  *      gap at all, rather than being given the previous event's time. A made-up
  *      timestamp reads exactly like a real one.
  */
+import { EMITTED_KIND_PREFIX } from "./emit";
 import { type ObsEvent, asNumber, asRecord, asString } from "./events";
 
 export type TimelineEntry = {
@@ -56,6 +57,12 @@ export type Timeline = {
 /** What identifies a step, per kind. Best-effort; absent when the kind has none. */
 function labelOf(kind: string, payload: Record<string, unknown> | undefined): string | undefined {
   if (payload === undefined) return undefined;
+  // A `custom.<name>` line is one `EmitTraceEvent` wrote. Its label is the
+  // name it was emitted under — without this the timeline would draw the
+  // events a tool-only workflow left behind as unlabelled rows, which is the
+  // one thing that would make writing them pointless. Checked before the
+  // switch because the namespace is a prefix, not a kind.
+  if (kind.startsWith(EMITTED_KIND_PREFIX)) return asString(payload["name"]);
   switch (kind) {
     case "tool_use":
     case "tool_stats":

@@ -218,6 +218,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "isLeapYear",
       "quarterOf",
       "timestampConvert",
+      "localTime",
     ],
   },
 
@@ -347,6 +348,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "stateExport",
       "stateImport",
       "dedupeMark",
+      "vectorDelete",
     ],
   },
 
@@ -544,6 +546,8 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "quietHours",
       "rateLimitGate",
       "messageTemplate",
+      "emailSendPreflight",
+      "deliverabilityCheck",
     ],
   },
 
@@ -566,6 +570,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "alertAck",
       "statusPagePost",
       "healthProbe",
+      "emitTraceEvent",
     ],
   },
 
@@ -580,6 +585,8 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "errorClassify",
       "ruleScore",
       "stallDetect",
+      "leadAssign",
+      "sequenceRun",
     ],
   },
 
@@ -650,6 +657,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "goldenCompare",
       "goldenUpdate",
       "markdownLinkCheck",
+      "factCrossCheck",
     ],
   },
 
@@ -707,6 +715,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "evmWaitForReceipt",
       "evmTransactionSummary",
       "evmEventScan",
+      "onchainTransactionsSync",
     ],
   },
 

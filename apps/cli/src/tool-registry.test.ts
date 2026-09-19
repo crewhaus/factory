@@ -113,41 +113,130 @@ describe("buildCategoryRows", () => {
  * that exists but cannot be switched on is not shipped.
  */
 describe("every exported tool is reachable from a spec", () => {
-  const PACKAGES = [
-    "tool-text",
-    "tool-data",
-    "tool-encode",
-    "tool-datetime",
-    "tool-schema",
-    "tool-git",
-    "tool-fsx",
-    "tool-proc",
-    "tool-http",
-    "tool-state",
-    "tool-crewhaus",
-    "tool-code",
-    "tool-codehost",
-    "tool-sql",
-    "tool-docs",
-    "tool-secure",
-    "tool-math",
-  ];
+  const repoRoot = join(import.meta.dir, "..", "..", "..");
+
+  /**
+   * Every `tool-*` package on disk, not a list of them.
+   *
+   * This WAS a hand-maintained array of seventeen names, which made it the
+   * very thing it exists to catch: a second list that drifts. By the time it
+   * was noticed the repository held 92 tool packages, so the guard covered
+   * under a fifth of them and passed loudly while saying nothing about the
+   * rest — a package could be built, exported and never wired, and this test
+   * would still be green. Reading the directory cannot fall behind.
+   */
+  const PACKAGES = readdirSync(join(repoRoot, "packages"))
+    .filter((name) => name.startsWith("tool-"))
+    .filter((name) => existsSync(join(repoRoot, "packages", name, "src", "index.ts")))
+    .sort();
+
+  /**
+   * The guard's own hit count.
+   *
+   * A sweep that matches nothing passes. Both halves are asserted: that the
+   * directory walk found packages, and that the export regex actually matched
+   * inside them. If `RegisteredTool` is ever renamed, or the entrypoint moves,
+   * these fail HERE — with the reason — instead of leaving the check above
+   * silently vacuous.
+   */
+  test("the sweep actually reads the packages it claims to", () => {
+    expect(PACKAGES.length).toBeGreaterThanOrEqual(80);
+    expect(PACKAGES).toContain("tool-verify");
+    expect(PACKAGES).toContain("tool-notify");
+    expect(PACKAGES).toContain("tool-math");
+    let exportsSeen = 0;
+    for (const pkg of PACKAGES) {
+      const text = readFileSync(join(repoRoot, "packages", pkg, "src", "index.ts"), "utf-8");
+      exportsSeen += [...text.matchAll(/^export const ([A-Za-z0-9_]+): RegisteredTool/gm)].length;
+    }
+    expect(exportsSeen).toBeGreaterThanOrEqual(400);
+  });
+
+  /**
+   * The packages a spec reaches through a different target, not through
+   * `target-cli`'s builtin map.
+   *
+   * Four of the 92 export a `RegisteredTool` that is deliberately absent from
+   * `BUILTIN_TOOL_MAP`: the chain-call pair and the message channel are
+   * emitted by `target-graph`, `target-crew`, `target-workflow` and the
+   * cf-worker targets, and `Retrieve` is registered programmatically per
+   * corpus by `apps/cli/src/knowledge-ingest.ts`. Naming them is unavoidable;
+   * leaving the name unchecked is not, so the test below re-derives the reason
+   * each one is here. An exemption whose justification stops being true fails
+   * rather than going on exempting.
+   */
+  const REACHED_BY_ANOTHER_TARGET: Readonly<Record<string, string>> = {
+    "tool-evm": "target-graph, target-crew and target-workflow emit it",
+    "tool-evm-tx": "target-graph, target-crew and target-workflow emit it",
+    "tool-message-channel": "the channel-bot and cf-worker targets emit it",
+    "tool-retrieve": "apps/cli/src/knowledge-ingest.ts registers it per corpus",
+  };
+
+  const exportNames = new Set(
+    Object.values(BUILTIN_TOOL_MAP).map((entry) => (entry as { export: string }).export),
+  );
+
+  test("every exemption still has the reason it was granted for", () => {
+    const targets = readdirSync(join(repoRoot, "packages")).filter((n) => n.startsWith("target-"));
+    expect(targets.length).toBeGreaterThanOrEqual(5);
+    for (const pkg of Object.keys(REACHED_BY_ANOTHER_TARGET)) {
+      // Still a package, and still exporting something — an exemption for a
+      // package that has been deleted or emptied is dead weight.
+      const entry = join(repoRoot, "packages", pkg, "src", "index.ts");
+      expect(existsSync(entry)).toBe(true);
+      expect(PACKAGES).toContain(pkg);
+
+      // And still reached: some OTHER package that emits or registers tools
+      // imports it by name. `tool-retrieve` is the one reached from the CLI
+      // itself rather than from a target, so both places are searched.
+      const importers: string[] = [];
+      for (const other of [...targets.map((t) => join("packages", t, "src")), "apps/cli/src"]) {
+        const dir = join(repoRoot, other);
+        if (!existsSync(dir)) continue;
+        for (const file of readdirSync(dir)) {
+          if (!file.endsWith(".ts") || file.includes(".test.")) continue;
+          if (readFileSync(join(dir, file), "utf-8").includes(`@crewhaus/${pkg}`)) {
+            importers.push(join(other, file));
+          }
+        }
+      }
+      expect(
+        importers.length,
+        `${pkg} is exempt because ${REACHED_BY_ANOTHER_TARGET[pkg]}, and nothing imports it any more`,
+      ).toBeGreaterThan(0);
+
+      // And still NEEDS the exemption. "Some target imports it" is true of
+      // nearly every tool package, so on its own it would let a name sit here
+      // for ever. This is the tight half: an exempt package's tools must
+      // actually be absent from the builtin map. The moment one is wired
+      // properly, the exemption is dead weight and this says so — which is
+      // also what stops a package being parked here to silence the sweep.
+      const wiredHere = [
+        ...readFileSync(entry, "utf-8").matchAll(/^export const ([A-Za-z0-9_]+): RegisteredTool/gm),
+      ]
+        .map((m) => m[1] as string)
+        .filter((name) => CLI_RUNTIME_TOOL_KEYS.includes(name) || exportNames.has(name));
+      expect(wiredHere.length).toBeGreaterThanOrEqual(0);
+      expect(
+        wiredHere,
+        `${pkg} is listed as reached by another target, but ${wiredHere.join(", ")} is wired into the builtin map — drop it from REACHED_BY_ANOTHER_TARGET so the sweep covers this package`,
+      ).toEqual([]);
+    }
+  });
 
   test("no package exports a tool that is not wired", () => {
-    const repoRoot = join(import.meta.dir, "..", "..", "..");
     const unreachable: Array<{ pkg: string; tool: string }> = [];
+    // Every `export const <name>: RegisteredTool` in the package entrypoint.
+    // A tool whose natural name collides with a library function in its own
+    // module is exported under a suffix, so the spec key and the export name
+    // can differ; resolve through the emitter map rather than assuming they
+    // match, and treat an export no key points at as unreachable.
+    const exportsWired = new Set(
+      Object.values(BUILTIN_TOOL_MAP).map((entry) => (entry as { export: string }).export),
+    );
     for (const pkg of PACKAGES) {
-      const source = join(repoRoot, "packages", pkg, "src", "index.ts");
-      if (!existsSync(source)) continue;
-      const text = readFileSync(source, "utf-8");
-      // Every `export const <name>: RegisteredTool` in the package entrypoint.
-      // A tool whose natural name collides with a library function in its own
-      // module is exported under a suffix, so the spec key and the export name
-      // can differ; resolve through the emitter map rather than assuming they
-      // match, and treat an export no key points at as unreachable.
-      const exportsWired = new Set(
-        Object.values(BUILTIN_TOOL_MAP).map((entry) => (entry as { export: string }).export),
-      );
+      if (pkg in REACHED_BY_ANOTHER_TARGET) continue;
+      const text = readFileSync(join(repoRoot, "packages", pkg, "src", "index.ts"), "utf-8");
       for (const m of text.matchAll(/^export const ([A-Za-z0-9_]+): RegisteredTool/gm)) {
         const name = m[1] as string;
         if (!CLI_RUNTIME_TOOL_KEYS.includes(name) && !exportsWired.has(name)) {

@@ -68,6 +68,7 @@ describe("dispatch through executeTool", () => {
       AcceptanceCheck: { checks: [{ kind: "fileExists", path: "f.txt" }] },
       ChecksumVerify: { write: true, files: ["f.txt"] },
       CitationLint: { text: "no citations here" },
+      FactCrossCheck: { text: "no citations here" },
       GoldenCompare: { actual: "hello\n", golden: "g.txt" },
       GoldenUpdate: { actual: "hello\n", golden: "written.txt" },
       MarkdownLinkCheck: { path: "docs" },
@@ -134,5 +135,35 @@ describe("the gate these exist to be", () => {
       { toolUseId: "g4" },
     );
     expect(JSON.parse(done.content)).toMatchObject({ ok: true, checked: 3, failed: 0 });
+  });
+});
+
+describe("the two citation gates in order", () => {
+  test("a marker with a source behind it can still be a claim the source does not make", async () => {
+    // CitationLint answers "is there a source"; FactCrossCheck answers "does
+    // it say this". A brief passes the first and fails the second all the
+    // time — that gap is the reason the second one exists.
+    writeFileSync(join(workspace, "source.md"), "Deployments were rolled back twice in March.\n");
+    const brief = "Deployments were rolled back four times in March [1].\n\n[1]: ./source.md\n";
+    writeFileSync(join(workspace, "brief.md"), brief);
+
+    const lint = await executeTool(
+      lookup("CitationLint"),
+      { file: "brief.md" },
+      { toolUseId: "c1" },
+    );
+    expect(JSON.parse(lint.content)).toMatchObject({ ok: true, undefinedMarkers: [] });
+
+    const cross = await executeTool(
+      lookup("FactCrossCheck"),
+      { file: "brief.md" },
+      { toolUseId: "c2" },
+    );
+    const report = JSON.parse(cross.content);
+    expect(report.ok).toBe(false);
+    expect(report.claims[0].verdict).toBe("notFound");
+    expect(report.claims[0].sources[0].missing).toEqual(["four", "time"]);
+    // And the verdict says what it does not mean.
+    expect(report.note).toContain("never that the source disagrees");
   });
 });

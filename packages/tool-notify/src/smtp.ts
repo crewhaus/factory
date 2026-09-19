@@ -466,9 +466,10 @@ export async function sendMail(options: SmtpOptions): Promise<SmtpOutcome> {
         );
       }
       if (method === "plain") {
-        const blob = Buffer.from(` ${options.username} ${options.password}`, "utf8").toString(
-          "base64",
-        );
+        const blob = Buffer.from(
+          `\u0000${options.username}\u0000${options.password}`,
+          "utf8",
+        ).toString("base64");
         await s.write(`AUTH PLAIN ${blob}\r\n`, "AUTH PLAIN <redacted>");
         const reply = await s.read();
         if (reply.code !== 235) {
