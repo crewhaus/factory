@@ -799,6 +799,34 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     ],
   },
 
+  specops: {
+    title:
+      "Change a harness spec safely: CST-preserving patches, migrations, advisory findings and mechanical repairs",
+    tools: ["specPatchApply", "specUpgrade", "specAdvise", "doctorFix"],
+  },
+
+  evalops: {
+    title: "Recompute, trend, pin and sanity-check eval results without running an eval",
+    tools: ["evalHistory", "evalAggregate", "evalBaselinePin", "evalCoverage", "graderMetaTest"],
+  },
+
+  dataset: {
+    title: "Version, inspect, validate and grow eval datasets",
+    tools: ["datasetPut", "datasetInspect", "datasetLint", "datasetMine"],
+  },
+
+  approvals: {
+    title:
+      "Read what is parked waiting for a human, and propose the permission rules that would stop the asking",
+    tools: ["approvalStatus", "approvalsInbox", "permissionsSuggest"],
+  },
+
+  lifecycle: {
+    title:
+      "Harness lifecycle: retirement, store migration, retention enforcement and knowledge sync",
+    tools: ["harnessRetire", "storeMigrate", "retentionEnforce", "knowledgeSync"],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -835,7 +863,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   safety: {
     title: "Finding and removing what must not leave the system, and proving what did not change",
-    includes: ["secure", "verify", "secrets"],
+    includes: ["secure", "verify", "secrets", "approvals"],
   },
   outreach: {
     title: "Everything that puts something in front of a person outside the harness",
@@ -855,6 +883,10 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "cron",
       "pkgmgr",
       "desktop",
+      "specops",
+      "evalops",
+      "dataset",
+      "lifecycle",
     ],
   },
   chain: {

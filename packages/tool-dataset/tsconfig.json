@@ -1,0 +1,31 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    {
+      "path": "../errors"
+    },
+    {
+      "path": "../tool-builder"
+    },
+    {
+      "path": "../tool-catalog"
+    },
+    {
+      "path": "../dataset-ops"
+    },
+    {
+      "path": "../dataset-registry"
+    },
+    {
+      "path": "../eval-dataset"
+    },
+    {
+      "path": "../tool-executor"
+    }
+  ],
+  "include": ["src/**/*"]
+}

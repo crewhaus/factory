@@ -1,0 +1,46 @@
+{
+  "name": "@crewhaus/tool-specops",
+  "version": "0.6.0",
+  "type": "module",
+  "description": "Deterministic spec maintenance: CST-preserving patches, post-release migrations, advisory findings and the mechanical repairs doctor only prints",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/harness-advice": "workspace:*",
+    "@crewhaus/spec": "workspace:*",
+    "@crewhaus/spec-changelog": "workspace:*",
+    "@crewhaus/spec-patch": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@crewhaus/tool-executor": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/tool-specops"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-specops#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}
