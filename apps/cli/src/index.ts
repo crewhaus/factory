@@ -3677,6 +3677,10 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     dataset,
     approvals,
     lifecycle,
+    fleet,
+    deploy,
+    routing,
+    discovery,
   ] = await Promise.all([
     import("@crewhaus/tool-fs"),
     import("@crewhaus/tool-bash"),
@@ -3740,6 +3744,10 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     import("@crewhaus/tool-dataset"),
     import("@crewhaus/tool-approvals"),
     import("@crewhaus/tool-lifecycle"),
+    import("@crewhaus/tool-fleet"),
+    import("@crewhaus/tool-deploy"),
+    import("@crewhaus/tool-routing"),
+    import("@crewhaus/tool-discovery"),
   ]);
   const map: Record<string, RegisteredTool> = {
     read: fs.read,
@@ -3770,6 +3778,24 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     codegraphCallers: codegraph.codegraphCallers,
     codegraphCallees: codegraph.codegraphCallees,
     codegraphImpact: codegraph.codegraphImpact,
+    // @crewhaus/tool-discovery
+    marketplaceSearch: discovery.marketplaceSearch,
+    federationDiscover: discovery.federationDiscover,
+    // @crewhaus/tool-routing
+    routeControl: routing.routeControl,
+    experimentLedger: routing.experimentLedger,
+    flywheelStatus: routing.flywheelStatus,
+    watchmeReport: routing.watchmeReport,
+    // @crewhaus/tool-deploy
+    specPin: deploy.specPin,
+    deployRollback: deploy.deployRollback,
+    deployInspect: deploy.deployInspect,
+    // @crewhaus/tool-fleet
+    harnessRegister: fleet.harnessRegister,
+    harnessJobStatus: fleet.harnessJobStatus,
+    compileBundle: fleet.compileBundle,
+    cliVersionPin: fleet.cliVersionPin,
+    hooksManage: fleet.hooksManage,
     // @crewhaus/tool-lifecycle
     harnessRetire: lifecycle.harnessRetire,
     storeMigrate: lifecycle.storeMigrate,
