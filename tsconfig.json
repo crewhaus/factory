@@ -272,6 +272,11 @@
     { "path": "./packages/hangar-ui" },
     { "path": "./packages/hangar-server" },
     { "path": "./packages/service-setup" },
+    { "path": "./packages/dataset-ops" },
+    { "path": "./packages/eval-ops" },
+    { "path": "./packages/harness-advice" },
+    { "path": "./packages/harness-lifecycle" },
+    { "path": "./packages/spec-changelog" },
     { "path": "./apps/cli" }
   ]
 }

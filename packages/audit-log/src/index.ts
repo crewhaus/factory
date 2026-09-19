@@ -120,7 +120,7 @@ export type AuditKind =
   | "permission_justification_evaluated"
   // Section 39 / item 35 — `crewhaus retention sweep|export|purge` appends one
   // record per REAL (non-dry-run) run so retention enforcement is itself
-  // tamper-evidenced. Payload shape (opaque JSON; see apps/cli/src/retention.ts):
+  // tamper-evidenced. Payload shape (opaque JSON; see packages/harness-lifecycle/src/retention.ts):
   //   { action: "sweep"|"export"|"purge", dryRun: false, deletedSessionIds,
   //     kept/deferred counts, policy inputs (maxAgeDays, pins, windows), ... }
   | "retention_enforcement"

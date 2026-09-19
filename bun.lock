@@ -35,6 +35,7 @@
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/crewhaus-cloud": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
+        "@crewhaus/dataset-ops": "workspace:*",
         "@crewhaus/dataset-registry": "workspace:*",
         "@crewhaus/deployment-controller": "workspace:*",
         "@crewhaus/docker-images": "workspace:*",
@@ -45,6 +46,7 @@
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
         "@crewhaus/eval-judge": "workspace:*",
+        "@crewhaus/eval-ops": "workspace:*",
         "@crewhaus/eval-optimizer-orchestrator": "workspace:*",
         "@crewhaus/eval-report": "workspace:*",
         "@crewhaus/eval-runner": "workspace:*",
@@ -55,7 +57,9 @@
         "@crewhaus/grader-safety-classifiers": "workspace:*",
         "@crewhaus/hangar-server": "workspace:*",
         "@crewhaus/hangar-ui": "workspace:*",
+        "@crewhaus/harness-advice": "workspace:*",
         "@crewhaus/harness-inventory": "workspace:*",
+        "@crewhaus/harness-lifecycle": "workspace:*",
         "@crewhaus/harness-registry": "workspace:*",
         "@crewhaus/harness-supervisor": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
@@ -98,6 +102,7 @@
         "@crewhaus/slash-commands": "workspace:*",
         "@crewhaus/smoke-harness": "workspace:*",
         "@crewhaus/spec": "workspace:*",
+        "@crewhaus/spec-changelog": "workspace:*",
         "@crewhaus/spec-patch": "workspace:*",
         "@crewhaus/spec-registry": "workspace:*",
         "@crewhaus/sub-agent-spawner": "workspace:*",
@@ -658,6 +663,22 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/dataset-ops": {
+      "name": "@crewhaus/dataset-ops",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/dataset-registry": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/eval-report": "workspace:*",
+        "@crewhaus/feedback-distill": "workspace:*",
+        "@crewhaus/pii-redactor": "workspace:*",
+        "@crewhaus/prompt-injection-detector": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/eval-runner": "workspace:*",
+      },
+    },
     "packages/dataset-registry": {
       "name": "@crewhaus/dataset-registry",
       "version": "0.6.0",
@@ -796,6 +817,23 @@
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
         "zod-to-json-schema": "^3.23.5",
+      },
+    },
+    "packages/eval-ops": {
+      "name": "@crewhaus/eval-ops",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/dataset-ops": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/eval-judge": "workspace:*",
+        "@crewhaus/eval-report": "workspace:*",
+        "@crewhaus/eval-runner": "workspace:*",
+        "@crewhaus/feedback-distill": "workspace:*",
+        "@crewhaus/harness-advice": "workspace:*",
+        "@crewhaus/regression-runner": "workspace:*",
+        "zod": "^3.23.8",
       },
     },
     "packages/eval-optimizer-orchestrator": {
@@ -1081,6 +1119,24 @@
       "name": "@crewhaus/hangar-ui",
       "version": "0.6.0",
     },
+    "packages/harness-advice": {
+      "name": "@crewhaus/harness-advice",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/preflight": "workspace:*",
+        "@crewhaus/routing-store": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
+        "@crewhaus/spec-patch": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-permission-matcher": "workspace:*",
+      },
+      "devDependencies": {
+        "zod": "^3.23.8",
+      },
+    },
     "packages/harness-inventory": {
       "name": "@crewhaus/harness-inventory",
       "version": "0.6.0",
@@ -1091,6 +1147,15 @@
       },
       "devDependencies": {
         "@crewhaus/eval-report": "workspace:*",
+      },
+    },
+    "packages/harness-lifecycle": {
+      "name": "@crewhaus/harness-lifecycle",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/data-retention-engine": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
       },
     },
     "packages/harness-registry": {
@@ -1713,6 +1778,20 @@
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
         "zod-to-json-schema": "^3.23.5",
+      },
+    },
+    "packages/spec-changelog": {
+      "name": "@crewhaus/spec-changelog",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/migration-engine": "workspace:*",
+        "@crewhaus/migration-runner": "workspace:*",
+        "@crewhaus/spec-patch": "workspace:*",
+        "@crewhaus/spec-registry": "workspace:*",
+        "yaml": "^2.6.0",
+      },
+      "devDependencies": {
+        "@crewhaus/spec": "workspace:*",
       },
     },
     "packages/spec-patch": {
@@ -3401,6 +3480,8 @@
 
     "@crewhaus/data-retention-engine": ["@crewhaus/data-retention-engine@workspace:packages/data-retention-engine"],
 
+    "@crewhaus/dataset-ops": ["@crewhaus/dataset-ops@workspace:packages/dataset-ops"],
+
     "@crewhaus/dataset-registry": ["@crewhaus/dataset-registry@workspace:packages/dataset-registry"],
 
     "@crewhaus/default-skills": ["@crewhaus/default-skills@workspace:packages/default-skills"],
@@ -3428,6 +3509,8 @@
     "@crewhaus/eval-grader": ["@crewhaus/eval-grader@workspace:packages/eval-grader"],
 
     "@crewhaus/eval-judge": ["@crewhaus/eval-judge@workspace:packages/eval-judge"],
+
+    "@crewhaus/eval-ops": ["@crewhaus/eval-ops@workspace:packages/eval-ops"],
 
     "@crewhaus/eval-optimizer-orchestrator": ["@crewhaus/eval-optimizer-orchestrator@workspace:packages/eval-optimizer-orchestrator"],
 
@@ -3477,7 +3560,11 @@
 
     "@crewhaus/hangar-ui": ["@crewhaus/hangar-ui@workspace:packages/hangar-ui"],
 
+    "@crewhaus/harness-advice": ["@crewhaus/harness-advice@workspace:packages/harness-advice"],
+
     "@crewhaus/harness-inventory": ["@crewhaus/harness-inventory@workspace:packages/harness-inventory"],
+
+    "@crewhaus/harness-lifecycle": ["@crewhaus/harness-lifecycle@workspace:packages/harness-lifecycle"],
 
     "@crewhaus/harness-registry": ["@crewhaus/harness-registry@workspace:packages/harness-registry"],
 
@@ -3606,6 +3693,8 @@
     "@crewhaus/smoke-harness": ["@crewhaus/smoke-harness@workspace:packages/smoke-harness"],
 
     "@crewhaus/spec": ["@crewhaus/spec@workspace:packages/spec"],
+
+    "@crewhaus/spec-changelog": ["@crewhaus/spec-changelog@workspace:packages/spec-changelog"],
 
     "@crewhaus/spec-patch": ["@crewhaus/spec-patch@workspace:packages/spec-patch"],
 

@@ -17,6 +17,7 @@
  * tests drive it without spawning a real server.
  */
 import { lower } from "@crewhaus/compiler";
+import type { DoctorCredentialCheck } from "@crewhaus/harness-advice/doctor-checks";
 import {
   McpHost,
   type UnresolvedMcpServerConfig,
@@ -24,7 +25,6 @@ import {
 } from "@crewhaus/mcp-host";
 import { classifyThredzFailure } from "@crewhaus/memory-service";
 import { parseSpec } from "@crewhaus/spec";
-import type { DoctorCredentialCheck } from "./doctor-checks";
 
 /**
  * Extract the thredz MCP server config from a spec text, or undefined when

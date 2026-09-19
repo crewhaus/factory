@@ -35,8 +35,8 @@
  * `apps/cli/src/index.ts`.
  */
 import type { Sample } from "@crewhaus/eval-dataset";
+import type { LoggedEvent } from "@crewhaus/feedback-distill";
 import { REGEX_RULES } from "@crewhaus/prompt-injection-detector";
-import type { LoggedEvent } from "./feedback";
 import { normalizeEvidenceTokens } from "./graders-suggest";
 
 /** Thrown on malformed flags / unusable inputs. The CLI entry file routes it

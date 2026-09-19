@@ -1,0 +1,45 @@
+{
+  "name": "@crewhaus/spec-changelog",
+  "version": "0.6.0",
+  "type": "module",
+  "description": "A spec's version history and the upgrade that writes the next entry: the append-only changelog ledger plus the migration planner behind `crewhaus upgrade`",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./spec-changelog": "./src/spec-changelog.ts",
+    "./upgrade": "./src/upgrade.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/migration-engine": "workspace:*",
+    "@crewhaus/migration-runner": "workspace:*",
+    "@crewhaus/spec-patch": "workspace:*",
+    "@crewhaus/spec-registry": "workspace:*",
+    "yaml": "^2.6.0"
+  },
+  "devDependencies": {
+    "@crewhaus/spec": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/spec-changelog"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/spec-changelog#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

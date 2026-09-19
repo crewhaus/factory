@@ -529,8 +529,8 @@ export type AdviceThresholds = {
 /**
  * Canonical rule thresholds. runtime-core's in-run digest
  * (observability.ts DIGEST_THRESHOLDS) mirrors these — it cannot import
- * them (apps/cli depends on runtime-core, not vice versa), so keep the two
- * in sync when tuning.
+ * them (this package depends on runtime-core via the compiler, so the edge
+ * only runs one way), so keep the two in sync when tuning.
  */
 export const DEFAULT_ADVICE_THRESHOLDS: AdviceThresholds = {
   toolFailureMinCalls: 5,

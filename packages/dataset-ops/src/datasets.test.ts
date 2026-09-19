@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type DatasetRegistry, createFileBackedRegistry } from "@crewhaus/dataset-registry";
 import { type Sample, SampleSchema } from "@crewhaus/eval-dataset";
+import { type FeedbackRecord, type SessionTurn, distill } from "@crewhaus/feedback-distill";
 import {
   DEFAULT_SPLIT_SPEC,
   DatasetRefError,
@@ -30,7 +31,6 @@ import {
   resolveRegistryRef,
   splitSamples,
 } from "./datasets";
-import { type FeedbackRecord, type SessionTurn, distill } from "./feedback";
 
 const TMP_ROOTS: string[] = [];
 function newRegistry(): DatasetRegistry {

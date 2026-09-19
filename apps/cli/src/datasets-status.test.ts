@@ -5,9 +5,9 @@
  * injected, no filesystem.
  */
 import { describe, expect, test } from "bun:test";
+import type { LintFinding } from "@crewhaus/dataset-ops/dataset-lint";
 import type { DatasetRecord } from "@crewhaus/dataset-registry";
 import type { Sample } from "@crewhaus/eval-dataset";
-import type { LintFinding } from "./dataset-lint";
 import {
   type RunSampleOutcome,
   type StatusRunEntry,

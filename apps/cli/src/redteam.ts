@@ -38,10 +38,10 @@
  * all filesystem access, registry writes and model calls live in
  * `apps/cli/src/index.ts`.
  */
+import { injectionVariants } from "@crewhaus/dataset-ops/dataset-mine";
 import type { Sample } from "@crewhaus/eval-dataset";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import { injectionVariants } from "./dataset-mine";
 
 /** Thrown on an invalid taxonomy, count or report input. The CLI entry file
  *  routes it through `die()`; tests assert on `.message`. */

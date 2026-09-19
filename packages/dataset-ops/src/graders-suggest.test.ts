@@ -1,25 +1,25 @@
 /**
- * Item 4 — unit tests for the graders-suggest core (evidence extraction
- * from run artifacts, deterministic clustering, deterministic grader
- * drafting, the rubric-prompt pure halves, review-file rendering, the
- * distill floor-grader hook contract) plus CLI integration for
- * `crewhaus graders suggest` over seeded run dirs.
+ * Item 4 — unit tests for the graders-suggest core: evidence extraction from
+ * run artifacts, deterministic clustering, deterministic grader drafting, the
+ * rubric-prompt pure halves, review-file rendering, and the distill
+ * floor-grader hook contract.
  *
- * CLI tests follow datasets-cli.test.ts's posture: stdout assertions are
- * avoided (Bun 1.3.x spawn-pipe capture is unreliable under `bun test`) —
- * assert on exit codes and on-disk artifacts instead. The spawned env
- * carries only PATH, so no model call is ever attempted.
+ * The CLI half is apps/cli/src/graders-suggest-cli.test.ts: it spawns
+ * `crewhaus`, which this package must not reach for.
  */
 import { afterAll, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
 import { type LoadedRun, loadRun } from "@crewhaus/eval-report";
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
-import { type FeedbackRecord, type SessionTurn, synthesizeGraders } from "./feedback";
 import {
-  DEFAULT_SUGGESTED_GRADERS_FILE,
+  type FeedbackRecord,
+  type SessionTurn,
+  synthesizeGraders,
+} from "@crewhaus/feedback-distill";
+import {
   FLOOR_GRADER_HINT,
   type FailureEvidence,
   GradersSuggestError,
@@ -40,9 +40,6 @@ import {
   toolNamesFromEventsJsonl,
 } from "./graders-suggest";
 
-const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
-const CLI_PATH = join(SRC_DIR, "index.ts");
-
 const TMP_ROOTS: string[] = [];
 function newTempRoot(): string {
   const dir = mkdtempSync(join(tmpdir(), "crewhaus-cli-graders-suggest-"));
@@ -52,21 +49,6 @@ function newTempRoot(): string {
 afterAll(() => {
   for (const dir of TMP_ROOTS) rmSync(dir, { recursive: true, force: true });
 });
-
-async function runCli(
-  args: ReadonlyArray<string>,
-  cwd: string,
-  env: Record<string, string> = {},
-): Promise<{ exitCode: number }> {
-  const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
-    cwd,
-    env: { PATH: process.env["PATH"] ?? "", ...env },
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  return { exitCode: await proc.exited };
-}
 
 // -------- run-dir seeding --------
 
@@ -709,77 +691,5 @@ describe("distill floor-grader hook contract", () => {
       isFloorGraderConfig({ graders: [{ name: "other_regex", type: "regex", pattern: "\\S" }] }),
     ).toBe(false);
     expect(FLOOR_GRADER_HINT).toContain("crewhaus graders suggest");
-  });
-});
-
-// -------- CLI integration (seeded run dirs; env carries no creds) --------
-
-const CWD_SPEC = `name: helper
-target: cli
-agent:
-  model: claude-sonnet-4-6
-  instructions: |
-    You answer questions about the codebase, citing file paths.
-`;
-
-function seedIndexedRun(root: string, runId: string): string {
-  const dir = join(root, ".crewhaus", "evals", runId);
-  seedStandardRun(dir, runId);
-  const entry = {
-    runId,
-    specName: "helper",
-    specHash: "spec-hash",
-    datasetName: "seeded",
-    datasetHash: "dataset-hash",
-    passRate: 0.2,
-    meanScore: 0.2,
-    sampleCount: 5,
-    ts: "2026-07-01T00:01:00.000Z",
-    outDir: dir,
-  };
-  const evalsDir = join(root, ".crewhaus", "evals");
-  mkdirSync(evalsDir, { recursive: true });
-  writeFileSync(join(evalsDir, "index.jsonl"), `${JSON.stringify(entry)}\n`, { flag: "a" });
-  return dir;
-}
-
-describe("crewhaus graders suggest (CLI)", () => {
-  it("drafts a review file from indexed runs and guards overwrites", async () => {
-    const root = newTempRoot();
-    writeFileSync(join(root, "crewhaus.yaml"), CWD_SPEC);
-    seedIndexedRun(root, "run_000000000000000a");
-
-    const first = await runCli(["graders", "suggest"], root);
-    expect(first.exitCode).toBe(0);
-    const outPath = join(root, DEFAULT_SUGGESTED_GRADERS_FILE);
-    expect(existsSync(outPath)).toBe(true);
-    const yaml = readFileSync(outPath, "utf-8");
-    expect(yaml).toContain("hard-ANDs");
-    expect(yaml).toContain("# evidence:");
-    // The review file parses as a real graders config.
-    const { config } = parseGradersConfig(yaml);
-    expect(config.graders.length).toBeGreaterThan(0);
-    // Deterministic drafting: the seeded tool-failure theme yields the shared
-    // pass tools.
-    expect(yaml).toContain("tool_call_sequence");
-
-    // No --force → refuse; --force → replace.
-    expect((await runCli(["graders", "suggest"], root)).exitCode).toBe(1);
-    expect((await runCli(["graders", "suggest", "--force"], root)).exitCode).toBe(0);
-  });
-
-  it("accepts an explicit --runs <dir> without any index", async () => {
-    const root = newTempRoot();
-    const runDir = join(root, "some-run");
-    seedStandardRun(runDir, "run_000000000000000b");
-    const got = await runCli(["graders", "suggest", "--runs", runDir, "-o", "review.yaml"], root);
-    expect(got.exitCode).toBe(0);
-    expect(existsSync(join(root, "review.yaml"))).toBe(true);
-  });
-
-  it("fails cleanly with no evidence and rejects unknown actions", async () => {
-    const root = newTempRoot();
-    expect((await runCli(["graders", "suggest"], root)).exitCode).toBe(1);
-    expect((await runCli(["graders", "propose"], root)).exitCode).toBe(1);
   });
 });

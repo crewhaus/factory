@@ -139,7 +139,7 @@ export const IDENTITY_REDACTOR: Redactor = async (text) => ({ text, secretRemain
  * `xoxb-` tails — so those leaked verbatim into the shared store. This set is
  * the union of the battle-tested shapes shipped elsewhere in the repo
  * (`packages/ir|spec-patch/src/redact.ts` `TOKEN_SHAPE_RES`,
- * `apps/cli/src/dataset-mine.ts` `SECRET_KEY_DETECTOR`) PLUS the families they
+ * `packages/dataset-ops/src/dataset-mine.ts` `SECRET_KEY_DETECTOR`) PLUS the families they
  * predate.
  *
  * Every pattern is assembled from character-class parts / joined literals so

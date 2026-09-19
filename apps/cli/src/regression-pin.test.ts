@@ -13,9 +13,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type DatasetRegistry, createFileBackedRegistry } from "@crewhaus/dataset-registry";
 import type { Sample } from "@crewhaus/eval-dataset";
+import { finishEvalRun } from "@crewhaus/eval-ops/eval-history";
 import { getBaseline, readRunIndex } from "@crewhaus/eval-report";
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
-import { finishEvalRun } from "./eval-history";
 import {
   applyRegressionUnion,
   applyRegressionUnionGuarded,

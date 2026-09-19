@@ -1,0 +1,25 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    {
+      "path": "../migration-engine"
+    },
+    {
+      "path": "../migration-runner"
+    },
+    {
+      "path": "../spec"
+    },
+    {
+      "path": "../spec-patch"
+    },
+    {
+      "path": "../spec-registry"
+    }
+  ],
+  "include": ["src/**/*"]
+}

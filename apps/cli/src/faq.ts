@@ -19,9 +19,9 @@
  * (leading `---` frontmatter with `name` + `description`, then the FAQ body).
  */
 
+import { normalizeEvidenceTokens } from "@crewhaus/dataset-ops/graders-suggest";
 import { deriveTurns, mergeFeedback, normalizeRating } from "./feedback";
 import type { FeedbackRecord, LoggedEvent, SessionTurn } from "./feedback";
-import { normalizeEvidenceTokens } from "./graders-suggest";
 
 /** One recurring-question cluster paired with its best answer. */
 export type FaqEntry = {

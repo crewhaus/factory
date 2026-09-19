@@ -4,10 +4,10 @@
  * fixtures, and — critically — the loadToolMap ↔ BUILTIN_TOOL_MAP sync guard.
  */
 import { describe, expect, it } from "bun:test";
+import { type SessionEvents, parseJsonlObjects } from "@crewhaus/harness-advice/advise-rules";
 import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
-import { type SessionEvents, parseJsonlObjects } from "./advise-rules";
 import {
   CLI_RUNTIME_TOOL_KEYS,
   TOOL_KEYWORDS,
