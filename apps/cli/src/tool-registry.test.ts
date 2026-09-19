@@ -23,6 +23,7 @@ import {
   leafCategories,
   toolsInCategory,
 } from "@crewhaus/tool-categories";
+import { isPrivateIp } from "@crewhaus/tool-fetch";
 import { CLI_RUNTIME_TOOL_KEYS, buildCategoryRows, diffToolMapKeys } from "./tools-cli";
 
 describe("category registry vs. the real builtin set", () => {
@@ -314,5 +315,161 @@ describe("the CLI can actually load every tool package it names", () => {
       (p) => p.startsWith("@crewhaus/tool-") && !imported.has(p),
     );
     expect(unrunnable).toEqual([]);
+  });
+});
+
+describe("every copy of the private-address classifier is the same classifier", () => {
+  /**
+   * Ten packages guard an outbound request against a private destination, and
+   * each carries the classifier as a byte-identical block rather than importing
+   * it — these are otherwise independent per-package networking layers, and a
+   * guard proving the copies are identical is cheaper than the import graph a
+   * shared package would need across `crawler`, `computer-use-driver` and eight
+   * tools.
+   *
+   * That only works if something checks. On 2026-09-18 an audit of the copies
+   * found SIX confirmed exploitable — each with a runnable proof — because they
+   * had drifted into comparing address TEXT. `new URL()` rewrites
+   * `[::ffff:169.254.169.254]` to `[::ffff:a9fe:a9fe]`, so a text check never
+   * sees the spelling it was written for, and `64:ff9b::a9fe:a9fe` IS
+   * 169.254.169.254 wherever DNS64/NAT64 runs. One copy parsed numerically and
+   * was still exploitable, because it knew `64:ff9b::/96` and not the
+   * `64:ff9b:1::/48` variant.
+   */
+  const MARKER_START = "// BEGIN SYNCHRONISED BLOCK";
+  const MARKER_END = "// END SYNCHRONISED BLOCK";
+
+  /**
+   * RECURSIVE on purpose. The sibling resolver guard above walks only
+   * `packages/<pkg>/src/*.ts`, and this block also lives at
+   * `tool-chainread/src/lib/endpoint.ts` — one level deeper. A sweep that
+   * stops at the first level would miss it and still report green, which is
+   * how the resolver guard went vacuous twice.
+   */
+  function classifierCopies(): Array<{ pkg: string; file: string; block: string }> {
+    const pkgDir = join(import.meta.dir, "..", "..", "..", "packages");
+    const found: Array<{ pkg: string; file: string; block: string }> = [];
+    const walk = (pkg: string, dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name === "node_modules" || entry.name === "dist") continue;
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(pkg, full);
+          continue;
+        }
+        if (!entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts")) continue;
+        const text = readFileSync(full, "utf-8");
+        const from = text.indexOf(MARKER_START);
+        if (from === -1) continue;
+        const to = text.indexOf(MARKER_END, from);
+        // A start marker with no end is a truncated block, not an absent one.
+        expect(to).toBeGreaterThan(from);
+        found.push({ pkg, file: full, block: text.slice(from, to + MARKER_END.length) });
+      }
+    };
+    for (const pkg of readdirSync(pkgDir)) {
+      const src = join(pkgDir, pkg, "src");
+      if (existsSync(src)) walk(pkg, src);
+    }
+    return found;
+  }
+
+  test("the sweep finds every copy it is meant to guard", () => {
+    const copies = classifierCopies();
+    // The count assertion is the line that turns "passed" into "actually
+    // looked". Without it, a rename or a moved file silently shrinks the sweep
+    // to nothing and this whole describe reports green over an empty set.
+    expect(copies.length).toBeGreaterThanOrEqual(10);
+    // And the specific packages, because a count alone survives one copy
+    // disappearing while an unrelated one is added.
+    const pkgs = new Set(copies.map((c) => c.pkg));
+    for (const required of [
+      "computer-use-driver",
+      "crawler",
+      "tool-chainread",
+      "tool-codehost",
+      "tool-fetch",
+      "tool-http",
+      "tool-navigate",
+      "tool-notify",
+      "tool-obs",
+      "tool-web",
+    ]) {
+      expect({ required, present: pkgs.has(required) }).toEqual({ required, present: true });
+    }
+  });
+
+  test("every copy is byte-identical", () => {
+    const copies = classifierCopies();
+    const distinct = new Map<string, string[]>();
+    for (const { file, block } of copies) {
+      const existing = distinct.get(block);
+      if (existing) existing.push(file);
+      else distinct.set(block, [file]);
+    }
+    // One distinct block, or the failure names which files disagree.
+    expect([...distinct.values()].map((files) => files.length).sort((a, b) => b - a)).toEqual([
+      copies.length,
+    ]);
+  });
+
+  /**
+   * RUN the classifier rather than reading it.
+   *
+   * The first version of this test asserted the block's TEXT — that it
+   * contained `g[0] === 0x64 && g[1] === 0xff9b`, and so on. Mutation-testing
+   * it showed that was worthless: narrowing the NAT64 arm to
+   * `g[0] === 0x64 && g[1] === 0xff9b && g[2] === 0` — which reopens the
+   * `64:ff9b:1::/48` hole that shipped exploitable — STILL CONTAINS that
+   * substring, so the assertion passed over a broken classifier in all ten
+   * copies at once. Matching on text was the original bug; asserting on text
+   * reproduced it in the guard.
+   *
+   * Executing one copy plus proving the copies identical covers all of them.
+   */
+  const MUST_BE_PRIVATE = [
+    "169.254.169.254", // the metadata service, plainly
+    "2852039166", // ...as a packed integer
+    "0xA9FEA9FE", // ...as hex
+    "0251.0376.0251.0376", // ...as octal
+    "127.1", // inet_aton short form
+    "::ffff:169.254.169.254", // IPv4-mapped, dotted
+    "::ffff:a9fe:a9fe", // what `new URL()` turns the line above into
+    "0:0:0:0:0:ffff:a9fe:a9fe", // ...uncompressed, which a CONNECT target keeps
+    "64:ff9b::a9fe:a9fe", // NAT64 /96 — this IS 169.254.169.254 under DNS64
+    "64:ff9b:1::a9fe:a9fe", // NAT64 /48 — the variant that shipped exploitable
+    "::a9fe:a9fe", // IPv4-compatible, deprecated but still routed
+    "2002:a9fe:a9fe::", // 6to4
+    "127.0.0.1",
+    "::1",
+    "0:0:0:0:0:0:0:1", // loopback uncompressed — tunnelled a real proxy
+    "fe80::1",
+    "febf::1", // still fe80::/10; a `startsWith("fe80:")` check misses it
+    "fd00::1",
+    "::",
+    "10.0.0.1",
+    "192.168.1.1",
+    "172.16.0.1",
+    "100.64.0.1", // carrier-grade NAT
+    "198.18.0.1", // benchmarking
+    "224.0.0.1", // multicast
+    "255.255.255.255",
+    "0.0.0.0",
+  ];
+  const MUST_STAY_PUBLIC = [
+    "8.8.8.8",
+    "1.1.1.1",
+    "93.184.216.34",
+    "2606:4700:4700::1111",
+    "2001:4860:4860::8888",
+  ];
+
+  test("the shared classifier, executed, blocks every spelling and over-blocks none", () => {
+    const leaked = MUST_BE_PRIVATE.filter((host) => !isPrivateIp(host));
+    expect(leaked).toEqual([]);
+    // Over-blocking is the other failure: a guard that refuses the real
+    // internet is removed by whoever it blocks, and then nothing guards.
+    const overBlocked = MUST_STAY_PUBLIC.filter((host) => isPrivateIp(host));
+    expect(overBlocked).toEqual([]);
   });
 });

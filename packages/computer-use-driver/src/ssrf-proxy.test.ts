@@ -99,6 +99,79 @@ describe("IP validators (duplicated from tool-fetch — keep in sync)", () => {
   });
 });
 
+/**
+ * SECURITY (audit 2026-09-18) — the spelling matrix.
+ *
+ * One address has many spellings, and a classifier that compares TEXT only
+ * recognises the ones whoever wrote it happened to think of. Fifteen of these
+ * were let through by the previous implementation. They are asserted here as a
+ * table rather than prose so the property is protected going forward: every
+ * spelling of a private destination classifies private, and no real public
+ * address gets caught by the widened net.
+ *
+ * Two families are worth naming because they look public and are not.
+ * `64:ff9b::a9fe:a9fe` IS 169.254.169.254 wherever DNS64/NAT64 runs, and the
+ * `64:ff9b:1::/48` variant is a separate prefix that a /96-only check misses.
+ * `0:0:0:0:0:ffff:a9fe:a9fe` is the same address the WHATWG URL parser prints
+ * as `::ffff:a9fe:a9fe` — the CONNECT path never runs that parser, so the
+ * uncompressed form is what actually arrives there.
+ */
+describe("private-address classifier — spelling matrix", () => {
+  test.each([
+    // The metadata service, in every spelling that reaches it.
+    "169.254.169.254",
+    "2852039166",
+    "0xA9FEA9FE",
+    "0251.0376.0251.0376",
+    "::ffff:169.254.169.254",
+    "::ffff:a9fe:a9fe",
+    "0:0:0:0:0:ffff:a9fe:a9fe",
+    "0:0:0:0:0:ffff:169.254.169.254",
+    "64:ff9b::a9fe:a9fe",
+    "64:ff9b::169.254.169.254",
+    "64:ff9b:1::a9fe:a9fe",
+    "64:ff9b:1:0:0:0:a9fe:a9fe",
+    "::a9fe:a9fe",
+    "::ffff:0:a9fe:a9fe",
+    "2002:a9fe:a9fe::",
+    // Loopback, compressed and not.
+    "127.0.0.1",
+    "127.1",
+    "::1",
+    "0:0:0:0:0:0:0:1",
+    "64:ff9b::7f00:1",
+    // Link-local, unique-local, unspecified.
+    "fe80::1",
+    "febf::1",
+    "fd00::1",
+    "::",
+    "0:0:0:0:0:0:0:0",
+    // The v4 ranges that are never a public endpoint.
+    "10.0.0.1",
+    "192.168.1.1",
+    "172.16.0.1",
+    "100.64.0.1",
+    "198.18.0.1",
+    "224.0.0.1",
+    "255.255.255.255",
+    "0.0.0.0",
+  ])("isPrivateIp(%p) is private", (ip) => {
+    expect(isPrivateIp(ip)).toBe(true);
+  });
+
+  // Over-blocking breaks real usage as surely as under-blocking breaks
+  // security, so the matrix asserts both directions.
+  test.each([
+    "8.8.8.8",
+    "1.1.1.1",
+    "93.184.216.34",
+    "2606:4700:4700::1111",
+    "2001:4860:4860::8888",
+  ])("isPrivateIp(%p) is public", (ip) => {
+    expect(isPrivateIp(ip)).toBe(false);
+  });
+});
+
 describe("plain-HTTP forwarding (absolute-form)", () => {
   test("forwards to the PINNED ip, preserving the Host header for vhosts", async () => {
     const target = await startTarget();
@@ -234,6 +307,60 @@ describe("CONNECT tunneling", () => {
       "CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n",
     );
     expect(res).toContain("403");
+  });
+
+  /**
+   * SECURITY (audit 2026-09-18) — the CONNECT path has no URL parser.
+   *
+   * `handleHttp` runs its target through `new URL()`, which rewrites IPv6 into
+   * its canonical compressed form before any guard sees it. CONNECT targets are
+   * read straight off the request line, so `0:0:0:0:0:0:0:1` arrives exactly as
+   * typed. Against the previous text-matching classifier this exact request was
+   * answered `200 Connection Established` and the tunnel returned the internal
+   * service's body — which is why the module docstring's old claim about local
+   * processes was false. The client here is a raw socket writing literal HTTP,
+   * so nothing can canonicalise the target on the way in.
+   */
+  test("refuses CONNECT to an UNCOMPRESSED loopback spelling", async () => {
+    const secret = "internal-service-body";
+    const internal = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end(secret);
+    });
+    // A machine without IPv6 loopback still exercises the refusal; it just has
+    // nothing listening behind it, so the assertions below stay meaningful.
+    const boundPort = await new Promise<number | null>((resolve) => {
+      internal.once("error", () => resolve(null));
+      internal.listen(0, "::1", () => {
+        const addr = internal.address();
+        resolve(addr === null || typeof addr === "string" ? null : addr.port);
+      });
+    });
+    if (boundPort !== null) {
+      cleanups.push(
+        () =>
+          new Promise<void>((r) => {
+            internal.closeAllConnections();
+            internal.close(() => r());
+          }),
+      );
+    }
+    const port = boundPort ?? 65001;
+
+    // The GET is pipelined behind the CONNECT headers on purpose: had the
+    // tunnel opened, the proxy would forward those bytes as the tunnel's `head`
+    // and the internal body would come back. Asserting only on the status line
+    // would not have caught that.
+    const tunnelled = "GET / HTTP/1.1\r\nHost: internal\r\nConnection: close\r\n\r\n";
+    const target = `[0:0:0:0:0:0:0:1]:${port}`;
+    const proxy = track(await startSsrfPinningProxy());
+    const res = await rawHttp(
+      proxy.port,
+      `CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n${tunnelled}`,
+    );
+    expect(res).toContain("403");
+    expect(res).not.toContain("200 Connection Established");
+    expect(res).not.toContain(secret);
   });
 
   test("refuses malformed CONNECT targets", async () => {

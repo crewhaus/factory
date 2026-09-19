@@ -33,6 +33,7 @@ import { rateLimitGate } from "./lib/ratelimit";
 import { formatSignatureHeader, hmacHex, signedPayload } from "./lib/sign";
 import { renderTemplate, templatePlaceholders } from "./lib/template";
 import {
+  assertNotSsrf,
   buildNotifyConfig,
   canonicalizeOrigin,
   expandIpv6,
@@ -835,9 +836,74 @@ describe("the outbound gate's pure half", () => {
     expect(isPrivateIp("64:ff9b::7f00:1")).toBe(true); // NAT64 over 127.0.0.1
   });
 
-  test("an IPv6-shaped string that cannot be parsed is refused, not waved through", () => {
-    expect(isPrivateIp("::gggg")).toBe(true);
+  test("an IPv6-shaped string that cannot be parsed is refused, not waved through", async () => {
+    // `isPrivateIp` answers "is this address inside a private range", and it
+    // is handed hostnames as well as literals, so a string it cannot parse is
+    // not private — it is not an address at all. The refusal that matters
+    // lives in the gate, which will not hand back an unparseable IPv6 host as
+    // a pinned target.
     expect(expandIpv6("::gggg")).toBeNull();
+    await expect(assertNotSsrf("::gggg")).rejects.toThrow(/not a valid IPv6 address/);
+    await expect(assertNotSsrf("[::gggg]")).rejects.toThrow(/not a valid IPv6 address/);
+  });
+
+  test("every spelling in the SSRF audit matrix is classified private", () => {
+    // The 2026-09-18 audit of this classifier across the repo: each row is a
+    // way of writing an address that must never be dialled. Three of them —
+    // both `64:ff9b:1::/48` NAT64 spellings and the translated
+    // `::ffff:0:0:0/96` form — leaked before the classifier was replaced with
+    // the synchronised block, so this matrix is the regression guard.
+    const mustBePrivate = [
+      "169.254.169.254",
+      "2852039166",
+      "0xA9FEA9FE",
+      "0251.0376.0251.0376",
+      "127.1",
+      "::ffff:169.254.169.254",
+      "::ffff:a9fe:a9fe",
+      "0:0:0:0:0:ffff:a9fe:a9fe",
+      "0:0:0:0:0:ffff:169.254.169.254",
+      "64:ff9b::a9fe:a9fe",
+      "64:ff9b::169.254.169.254",
+      "64:ff9b:1::a9fe:a9fe",
+      "64:ff9b:1:0:0:0:a9fe:a9fe",
+      "::a9fe:a9fe",
+      "::ffff:0:a9fe:a9fe",
+      "2002:a9fe:a9fe::",
+      "127.0.0.1",
+      "::1",
+      "0:0:0:0:0:0:0:1",
+      "64:ff9b::7f00:1",
+      "fe80::1",
+      "febf::1",
+      "fd00::1",
+      "::",
+      "0:0:0:0:0:0:0:0",
+      "10.0.0.1",
+      "192.168.1.1",
+      "172.16.0.1",
+      "100.64.0.1",
+      "198.18.0.1",
+      "224.0.0.1",
+      "255.255.255.255",
+      "0.0.0.0",
+    ];
+    const leaked = mustBePrivate.filter((spelling) => !isPrivateIp(spelling));
+    expect(leaked).toEqual([]);
+  });
+
+  test("the audit matrix does not over-block a real public address", () => {
+    // The other half of the property: a classifier that refuses everything
+    // passes the matrix above and breaks every real send.
+    const mustStayPublic = [
+      "8.8.8.8",
+      "1.1.1.1",
+      "93.184.216.34",
+      "2606:4700:4700::1111",
+      "2001:4860:4860::8888",
+    ];
+    const overBlocked = mustStayPublic.filter((spelling) => isPrivateIp(spelling));
+    expect(overBlocked).toEqual([]);
   });
 
   test("a link-local address is refused whatever its zone id says", () => {

@@ -988,16 +988,19 @@ describe("the SSRF classifier", () => {
     }
   });
 
-  test("the local-use NAT64 prefix is refused whole, because its IPv4 has no fixed position", () => {
-    // RFC 8215's 64:ff9b:1::/48 puts the translated address at an offset that
-    // depends on the translator's prefix length. Reading the last two groups
-    // the way 64:ff9b::/96 allows would call this loopback-through-a-local-
-    // translator a public address.
-    expect(isPrivateIp("64:ff9b:1::7f00:1")).toBe(true);
-    expect(isPrivateIp("64:ff9b:1:ffff::a9fe:a9fe")).toBe(true);
-    expect(isPrivateIp("64:ff9b:1::")).toBe(true);
-    // The neighbouring prefix is a different, ordinary global range.
-    expect(isPrivateIp("64:ff9b:2::1")).toBe(false);
+  test("the local-use NAT64 prefix is judged by the IPv4 it carries, like the well-known one", () => {
+    // RFC 8215's 64:ff9b:1::/48 is the prefix a `64:ff9b::/96` test misses, and
+    // the one six copies of this classifier were confirmed reachable through.
+    // The synchronised block treats the whole of 64:ff9b::/32 as NAT64 and
+    // reads the last two groups, so each of these is refused for the address it
+    // carries rather than for the prefix it wears.
+    expect(isPrivateIp("64:ff9b:1::7f00:1")).toBe(true); // 127.0.0.1
+    expect(isPrivateIp("64:ff9b:1:ffff::a9fe:a9fe")).toBe(true); // 169.254.169.254
+    expect(isPrivateIp("64:ff9b:1::")).toBe(true); // 0.0.0.0
+    expect(isPrivateIp("64:ff9b:2::1")).toBe(true); // 0.0.0.1, inside 0.0.0.0/8
+    // Carrying a PUBLIC address is what keeps this from being a wall: the
+    // prefix is not the verdict, the embedded address is.
+    expect(isPrivateIp("64:ff9b::808:808")).toBe(false); // 8.8.8.8
   });
 
   test("a public address is not refused, or the gate would be a wall", () => {
@@ -1006,14 +1009,91 @@ describe("the SSRF classifier", () => {
     }
   });
 
-  test("an IPv6-shaped string the parser cannot expand is refused, not waved through", () => {
-    expect(isPrivateIp("::ffff:999.1.1.1")).toBe(true);
-    expect(isPrivateIp("1:2:3")).toBe(true);
+  test("an IPv6-shaped host the parser cannot expand is refused, not dialled", async () => {
+    // The predicate answers "not a private address" for a string that is not an
+    // address at all, so the fail-closed step is the GATE's: a host with a colon
+    // in it that will not expand is one nothing could classify, and it is
+    // refused rather than handed to the resolver.
+    for (const host of ["::ffff:999.1.1.1", "1:2:3", "fe80:::1"]) {
+      expect(isPrivateIp(host)).toBe(false);
+      await expect(assertNotSsrf(host)).rejects.toThrow("not a valid IPv6 address");
+    }
   });
 
   test("a zone id cannot dress a link-local address up as an unrecognised one", () => {
     expect(isPrivateIp("fe80::1%eth0")).toBe(true);
     expect(isPrivateIp("fe80::1%25eth0")).toBe(true);
+  });
+
+  /**
+   * The audit matrix, kept as a test rather than as a one-off proof.
+   *
+   * These are the spellings the 2026-09-18 audit ran against every copy of the
+   * private-address classifier: one address written every way a URL parser, a
+   * DNS64 resolver or an `inet_aton` bypass can write it. The sharp ones are
+   * the IPv6 forms of 169.254.169.254 — `a9fe:a9fe` IS the cloud metadata
+   * service, and `new URL("http://[::ffff:169.254.169.254]/")` hands a guard
+   * `::ffff:a9fe:a9fe`, so a check that compares TEXT never sees the spelling
+   * it was written for. This copy already parsed numerically, and leaked
+   * exactly one of them: `::ffff:0:a9fe:a9fe`, the RFC 6145 translated
+   * `::ffff:0:0:0/96` form, which its IPv4-mapped test did not cover.
+   */
+  test("every spelling in the audit matrix is blocked, and no real address is", () => {
+    const leaked = [
+      "169.254.169.254",
+      "2852039166", // 32-bit integer
+      "0xA9FEA9FE", // hex
+      "0251.0376.0251.0376", // octal
+      "127.1", // short form: 127.0.0.1, not 127.1.0.0
+      "::ffff:169.254.169.254", // IPv4-mapped, as written
+      "::ffff:a9fe:a9fe", // IPv4-mapped, as the URL parser re-serialises it
+      "0:0:0:0:0:ffff:a9fe:a9fe",
+      "0:0:0:0:0:ffff:169.254.169.254",
+      "64:ff9b::a9fe:a9fe", // NAT64 well-known prefix
+      "64:ff9b::169.254.169.254",
+      "64:ff9b:1::a9fe:a9fe", // NAT64 /48 variant
+      "64:ff9b:1:0:0:0:a9fe:a9fe",
+      "::a9fe:a9fe", // IPv4-compatible
+      "::ffff:0:a9fe:a9fe", // translated ::ffff:0:0:0/96 — what this copy missed
+      "2002:a9fe:a9fe::", // 6to4
+      "127.0.0.1",
+      "::1",
+      "0:0:0:0:0:0:0:1",
+      "64:ff9b::7f00:1", // NAT64 of loopback
+      "fe80::1",
+      "febf::1", // the top of fe80::/10, which a "fe80:" prefix test misses
+      "fd00::1",
+      "::",
+      "0:0:0:0:0:0:0:0",
+      "10.0.0.1",
+      "192.168.1.1",
+      "172.16.0.1",
+      "100.64.0.1", // CGNAT
+      "198.18.0.1", // benchmarking
+      "224.0.0.1", // multicast
+      "255.255.255.255", // broadcast
+      "0.0.0.0",
+    ].filter((ip) => !isPrivateIp(ip));
+    expect(leaked).toEqual([]);
+
+    // Over-blocking is the other way to get this wrong, and it breaks real
+    // usage rather than announcing itself.
+    const overBlocked = [
+      "8.8.8.8",
+      "1.1.1.1",
+      "93.184.216.34",
+      "2606:4700:4700::1111",
+      "2001:4860:4860::8888",
+    ].filter((ip) => isPrivateIp(ip));
+    expect(overBlocked).toEqual([]);
+
+    // `fec0::1` (deprecated site-local) and `100::1` (discard-only) were
+    // covered by this package's own classifier before the synchronised block
+    // replaced it. The block does not cover those two ranges, and it is
+    // byte-identical across packages, so they cannot be re-asserted here —
+    // they have to be added to the block, for every copy at once. Nothing is
+    // asserted about them either way, so a later fix in the block does not
+    // have to come back and delete an assertion.
   });
 
   test("a hostname that RESOLVES to a private address is refused", async () => {
