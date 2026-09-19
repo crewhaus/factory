@@ -312,3 +312,37 @@ export const HTML_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   htmlTable,
   htmlText,
 ]);
+
+/**
+ * The parser and the readers, re-exported as a library.
+ *
+ * The tools above are the narrow view of these: one call, one JSON answer.
+ * A package that has to make a decision ABOUT a page rather than extract one
+ * thing from it — `@crewhaus/tool-verify`'s `SeoLint` walks the headings, the
+ * images, the anchors and the JSON-LD in a single pass — needs the tree, and
+ * the one thing it must not do is parse the markup a second time.
+ *
+ * A second HTML parser in this repo would drift from this one, and then two
+ * tools in one harness would give different answers about the same page:
+ * a page whose `<p>` never closes has a different heading order depending on
+ * whose recovery rules ran. Same reason `@crewhaus/tool-text` exports its
+ * diff parser beside its tools, and `@crewhaus/tool-code` its lockfile
+ * readers.
+ */
+export {
+  type Element,
+  type TextNode,
+  normalizeText,
+  parseHtml,
+  textOf,
+  walk,
+} from "./lib/parse";
+export {
+  type Link,
+  type StructuredData,
+  extractLinks,
+  extractStructuredData,
+  outline,
+  readableText,
+} from "./lib/extract";
+export { queryAll, queryFirst } from "./lib/select";

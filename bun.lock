@@ -3343,6 +3343,8 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-html": "workspace:*",
+        "@crewhaus/tool-text": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
