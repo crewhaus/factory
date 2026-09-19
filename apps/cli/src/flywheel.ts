@@ -28,8 +28,8 @@
  */
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { gateRuns } from "@crewhaus/eval-ops/eval-history";
 import type { EvalRunSummary } from "@crewhaus/eval-runner";
-import { gateRuns } from "./eval-history";
 
 /** Thrown on invalid knobs/defaults and scaffold refusals. The CLI entry
  *  file catches it and routes the message through `die()`; tests assert on

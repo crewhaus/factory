@@ -40,7 +40,7 @@ import {
   gradersConfigToYaml,
   mergeFeedback,
   normalizeRating,
-} from "./feedback";
+} from "@crewhaus/feedback-distill";
 
 /** Thrown on malformed flags / unusable evidence. The CLI entry file routes
  *  it through `die()`; tests assert on `.message`. */

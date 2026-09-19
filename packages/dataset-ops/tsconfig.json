@@ -1,0 +1,34 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    {
+      "path": "../dataset-registry"
+    },
+    {
+      "path": "../eval-dataset"
+    },
+    {
+      "path": "../eval-grader"
+    },
+    {
+      "path": "../eval-report"
+    },
+    {
+      "path": "../eval-runner"
+    },
+    {
+      "path": "../feedback-distill"
+    },
+    {
+      "path": "../pii-redactor"
+    },
+    {
+      "path": "../prompt-injection-detector"
+    }
+  ],
+  "include": ["src/**/*"]
+}

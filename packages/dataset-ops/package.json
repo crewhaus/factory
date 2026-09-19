@@ -1,0 +1,50 @@
+{
+  "name": "@crewhaus/dataset-ops",
+  "version": "0.6.0",
+  "type": "module",
+  "description": "Eval dataset operations: reference resolution and splits, lint, PII/secret audit, mining and synthesis from session logs, and grader suggestion from failures",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./datasets": "./src/datasets.ts",
+    "./dataset-lint": "./src/dataset-lint.ts",
+    "./dataset-audit": "./src/dataset-audit.ts",
+    "./dataset-mine": "./src/dataset-mine.ts",
+    "./graders-suggest": "./src/graders-suggest.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/dataset-registry": "workspace:*",
+    "@crewhaus/eval-dataset": "workspace:*",
+    "@crewhaus/eval-report": "workspace:*",
+    "@crewhaus/feedback-distill": "workspace:*",
+    "@crewhaus/pii-redactor": "workspace:*",
+    "@crewhaus/prompt-injection-detector": "workspace:*"
+  },
+  "devDependencies": {
+    "@crewhaus/eval-grader": "workspace:*",
+    "@crewhaus/eval-runner": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/dataset-ops"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/dataset-ops#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

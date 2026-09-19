@@ -192,6 +192,11 @@
     "@crewhaus/sandbox": "workspace:*",
     "@crewhaus/sandbox-image-registry": "workspace:*",
     "@crewhaus/compliance-controls": "workspace:*",
+    "@crewhaus/dataset-ops": "workspace:*",
+    "@crewhaus/eval-ops": "workspace:*",
+    "@crewhaus/harness-advice": "workspace:*",
+    "@crewhaus/harness-lifecycle": "workspace:*",
+    "@crewhaus/spec-changelog": "workspace:*",
     "yaml": "^2.6.0"
   },
   "optionalDependencies": {

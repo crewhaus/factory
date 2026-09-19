@@ -148,7 +148,7 @@ function readEnvLines(path: string): string[] {
 /**
  * Append a line, repairing a missing trailing newline first — a file that
  * ends mid-line would otherwise get the new assignment glued onto the last
- * one. Mirrors `planEnvStubs`'s repair in `apps/cli/src/doctor-fix.ts`.
+ * one. Mirrors `planEnvStubs`'s repair in `packages/harness-advice/src/doctor-fix.ts`.
  */
 function appendEnvLine(lines: string[], line: string): void {
   if (lines.length === 0) {

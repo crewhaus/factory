@@ -57,6 +57,8 @@ import {
 } from "@crewhaus/cost-tracker";
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { GradeResult, Grader, RunResult, ToolCall } from "@crewhaus/eval-grader";
+import type { AdviceFinding } from "@crewhaus/harness-advice/advise-rules";
+import { buildSuggestionsFile } from "@crewhaus/harness-advice/advise-rules";
 import type { ArmStats, Scoreboard } from "@crewhaus/routing-store";
 import { computeReward } from "@crewhaus/routing-store";
 import { parseSessionLog } from "@crewhaus/session-store";
@@ -70,8 +72,6 @@ import type {
   WatchmeObservation,
   WatchmeStore,
 } from "@crewhaus/watchme-store";
-import type { AdviceFinding } from "./advise-rules";
-import { buildSuggestionsFile } from "./advise-rules";
 import type { DerivedTurn, FeedbackRecord, LoggedEvent, SessionTurn } from "./feedback";
 import {
   buildFeedbackRecord,

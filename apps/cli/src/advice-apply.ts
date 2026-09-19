@@ -36,6 +36,7 @@
  * loop takes injected compile/eval hooks so accept/reject/compose
  * semantics are unit-testable with synthetic summaries — no credentials.
  */
+import { gateRuns } from "@crewhaus/eval-ops/eval-history";
 import type { EvalRunSummary } from "@crewhaus/eval-runner";
 import { parseSpec } from "@crewhaus/spec";
 import {
@@ -44,7 +45,6 @@ import {
   formatWriteBackHeader,
   validatePatch,
 } from "@crewhaus/spec-patch";
-import { gateRuns } from "./eval-history";
 
 /** Thrown on invalid flag combos and suggestions-file validation failures.
  *  The CLI entry file catches it and routes the message through `die()`;

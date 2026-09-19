@@ -6,7 +6,7 @@ import { join } from "node:path";
  * harness directory. Owned by this package (not the CLI) so EVERY enforcement
  * surface reads the same file with the same parser:
  *
- *   - `crewhaus retention sweep|export|purge` (apps/cli/src/retention.ts),
+ *   - `crewhaus retention sweep|export|purge` (packages/harness-lifecycle/src/retention.ts),
  *   - the boot-time self-heal janitor the daemon shapes run
  *     (`@crewhaus/runtime-core` createJanitor — managed gateway, channel
  *     bots, batch workers), which must honor the SAME pins and

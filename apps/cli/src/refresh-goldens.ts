@@ -25,10 +25,10 @@
  * `feedback.ts` / `graders-suggest.ts`; all filesystem access + the registry
  * version write live in `apps/cli/src/index.ts`.
  */
+import { normalizeEvidenceTokens } from "@crewhaus/dataset-ops/graders-suggest";
 import { hashSample } from "@crewhaus/dataset-registry";
 import type { Sample } from "@crewhaus/eval-dataset";
 import { type FeedbackRecord, type SessionTurn, mergeFeedback, normalizeRating } from "./feedback";
-import { normalizeEvidenceTokens } from "./graders-suggest";
 
 /** Thrown on malformed flags / unusable inputs. The CLI entry file routes it
  *  through `die()`; tests assert on `.message`. */

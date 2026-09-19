@@ -13,9 +13,9 @@
  * every time is "always-passing" — a candidate for rotation (it no longer
  * discriminates).
  */
+import type { LintFinding } from "@crewhaus/dataset-ops/dataset-lint";
+import { overallDatasetHash, splitsPresent } from "@crewhaus/dataset-ops/datasets";
 import type { DatasetRecord, ReleaseEntry } from "@crewhaus/dataset-registry";
-import type { LintFinding } from "./dataset-lint";
-import { overallDatasetHash, splitsPresent } from "./datasets";
 
 /** The slice of a run-index entry status/card consume (structural, so tests
  *  don't build full RunIndexEntry objects). */

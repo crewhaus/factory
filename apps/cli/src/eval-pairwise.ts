@@ -20,7 +20,7 @@ import {
   extractSampleInput,
   summarizePairwise,
 } from "@crewhaus/eval-report";
-import { providerCredentialsSatisfied } from "./doctor-checks";
+import { providerCredentialsSatisfied } from "@crewhaus/harness-advice/doctor-checks";
 
 /** `--judge-model` wins; absent/empty falls back to the default judge. */
 export function resolvePairwiseJudgeModel(flagValue: unknown): string {

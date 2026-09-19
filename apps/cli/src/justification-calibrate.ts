@@ -1,6 +1,6 @@
+import type { SessionEvents } from "@crewhaus/harness-advice/advise-rules";
+import { payloadOf } from "@crewhaus/harness-advice/advise-rules";
 import { type JustificationJudge, ruleBasedJustificationJudge } from "@crewhaus/permission-engine";
-import type { SessionEvents } from "./advise-rules";
-import { payloadOf } from "./advise-rules";
 
 /**
  * AUTOMATION-OPPORTUNITIES.md item 52 — `crewhaus justification calibrate` +

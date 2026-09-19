@@ -5,8 +5,11 @@
  * command hints, and the report formatting. Pure — no filesystem, no model.
  */
 import { describe, expect, test } from "bun:test";
+import {
+  DEFAULT_ADVICE_THRESHOLDS,
+  type SessionEvents,
+} from "@crewhaus/harness-advice/advise-rules";
 import { type Spec, parseSpec } from "@crewhaus/spec";
-import { DEFAULT_ADVICE_THRESHOLDS, type SessionEvents } from "./advise-rules";
 import {
   CONTEXT_PRESSURE_COMMANDS,
   DEFAULT_CONTEXT_PRESSURE_SESSIONS,

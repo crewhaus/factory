@@ -1,0 +1,37 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    {
+      "path": "../compiler"
+    },
+    {
+      "path": "../ir"
+    },
+    {
+      "path": "../permission-engine"
+    },
+    {
+      "path": "../preflight"
+    },
+    {
+      "path": "../routing-store"
+    },
+    {
+      "path": "../spec"
+    },
+    {
+      "path": "../spec-patch"
+    },
+    {
+      "path": "../tool-catalog"
+    },
+    {
+      "path": "../tool-permission-matcher"
+    }
+  ],
+  "include": ["src/**/*"]
+}

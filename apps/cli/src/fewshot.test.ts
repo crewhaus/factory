@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { SYNTHESIZE_PII_DETECTORS } from "@crewhaus/dataset-ops/dataset-mine";
 import { createPiiRedactor } from "@crewhaus/pii-redactor";
-import { SYNTHESIZE_PII_DETECTORS } from "./dataset-mine";
 import type { FeedbackRecord, SessionTurn } from "./feedback";
 import {
   excludeOverlappingExamples,

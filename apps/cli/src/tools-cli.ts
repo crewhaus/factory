@@ -26,9 +26,9 @@
  * through the tool map (spec key → `.name`), so a tool named in the spec is
  * matched to its runtime call stats regardless of the two casings.
  */
+import type { SessionEvents } from "@crewhaus/harness-advice/advise-rules";
+import { payloadOf } from "@crewhaus/harness-advice/advise-rules";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import type { SessionEvents } from "./advise-rules";
-import { payloadOf } from "./advise-rules";
 
 // -------- tools list --------
 

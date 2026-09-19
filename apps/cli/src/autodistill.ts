@@ -37,6 +37,8 @@
  * when `reviewRootDir` is supplied — the B20 review queue (split-verdict
  * ties must not vanish just because the distill ran unattended).
  */
+import { redactDatasetText } from "@crewhaus/dataset-ops/dataset-audit";
+import { DEFAULT_SPLIT_SPEC, registerDataset } from "@crewhaus/dataset-ops/datasets";
 import type { DatasetRegistry } from "@crewhaus/dataset-registry";
 import type { DatasetRecord } from "@crewhaus/dataset-registry";
 import {
@@ -50,8 +52,6 @@ import {
   writeDistillState,
 } from "@crewhaus/feedback-distill";
 import type { IrFeedback } from "@crewhaus/ir";
-import { redactDatasetText } from "./dataset-audit";
-import { DEFAULT_SPLIT_SPEC, registerDataset } from "./datasets";
 import { type FeedbackRecord, type SessionTurn, distill } from "./feedback";
 import { isRegistrySafeName } from "./regression-pin";
 import { enqueueReviewEntries, entriesFromRaterTies } from "./review-queue";

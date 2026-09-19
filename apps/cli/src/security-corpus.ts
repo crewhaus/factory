@@ -1,13 +1,13 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { SYNTHESIZE_PII_DETECTORS } from "@crewhaus/dataset-ops/dataset-mine";
 import { type PiiDetector, detectPii } from "@crewhaus/pii-redactor";
 import {
   type PromptInjectionResult,
   REGEX_RULES,
   classifyText,
 } from "@crewhaus/prompt-injection-detector";
-import { SYNTHESIZE_PII_DETECTORS } from "./dataset-mine";
 
 /**
  * AUTOMATION-OPPORTUNITIES.md item 50 — `crewhaus security corpus` core: a

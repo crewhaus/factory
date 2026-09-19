@@ -10,7 +10,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { SuggestionsFile } from "./advise-rules";
+import type { SuggestionsFile } from "@crewhaus/harness-advice/advise-rules";
 
 // `tsc -b` also compiles this file into `dist/`; resolve the CLI entrypoint
 // from the source tree so the dist test copy can still spawn it.

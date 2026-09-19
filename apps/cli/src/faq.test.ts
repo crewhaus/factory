@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SYNTHESIZE_PII_DETECTORS } from "@crewhaus/dataset-ops/dataset-mine";
 import { createPiiRedactor } from "@crewhaus/pii-redactor";
 import { discoverSkills, parseSkillFile } from "@crewhaus/skills-registry";
-import { SYNTHESIZE_PII_DETECTORS } from "./dataset-mine";
 import { buildFaqSkill, distillFaq } from "./faq";
 import type { FeedbackRecord, SessionTurn } from "./feedback";
 

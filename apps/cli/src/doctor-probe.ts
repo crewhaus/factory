@@ -18,14 +18,14 @@
  * tests drive it with a mocked adapter and no network.
  */
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
-import { resolveModel } from "@crewhaus/model-router";
-import { classify } from "@crewhaus/recovery-engine";
 import {
   type DoctorCredentialCheck,
   type DoctorProviderId,
   providerCredentialsSatisfied,
   selectedProvider,
-} from "./doctor-checks";
+} from "@crewhaus/harness-advice/doctor-checks";
+import { resolveModel } from "@crewhaus/model-router";
+import { classify } from "@crewhaus/recovery-engine";
 
 /**
  * Cheapest sensible probe model per provider, used for providers whose env

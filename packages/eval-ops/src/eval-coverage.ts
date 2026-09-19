@@ -35,9 +35,12 @@
  * import) mirroring `feedback.ts` / `graders-suggest.ts`; all filesystem
  * access and registry/run-index resolution live in `apps/cli/src/index.ts`.
  */
-import { deriveTurns } from "./feedback";
-import type { LoggedEvent, SessionTurn } from "./feedback";
-import { normalizeEvidenceTokens, toolNamesFromEventsJsonl } from "./graders-suggest";
+import {
+  normalizeEvidenceTokens,
+  toolNamesFromEventsJsonl,
+} from "@crewhaus/dataset-ops/graders-suggest";
+import { deriveTurns } from "@crewhaus/feedback-distill";
+import type { LoggedEvent, SessionTurn } from "@crewhaus/feedback-distill";
 
 /** Thrown on malformed flags / unusable inputs. The CLI entry file routes it
  *  through `die()`; tests assert on `.message` without the process exiting. */

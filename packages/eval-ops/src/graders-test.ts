@@ -44,8 +44,8 @@ import {
 } from "@crewhaus/eval-judge";
 import { resolveRegistryGrader } from "@crewhaus/eval-runner";
 import type { GraderLookup } from "@crewhaus/eval-runner";
+import { providerCredentialsSatisfied } from "@crewhaus/harness-advice/doctor-checks";
 import { z } from "zod";
-import { providerCredentialsSatisfied } from "./doctor-checks";
 
 /** Thrown on malformed flags / unusable inputs. The CLI entry file routes it
  *  through `die()`; tests assert on `.message`. */

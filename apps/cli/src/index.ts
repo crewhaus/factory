@@ -43,6 +43,94 @@ import {
   resolvePricing,
   resolveStrongest,
 } from "@crewhaus/cost-tracker";
+// B23 — `crewhaus dataset audit` (offline PII/secret scan of an existing
+// dataset) + the shared sync redaction the distill/mine ingestion surfaces
+// apply, in a side-effect-free module so it is unit-testable (this entry
+// file runs an argv switch on import).
+import {
+  auditSamples,
+  containsRedactionMarker,
+  redactDatasetText,
+  redactSample,
+  renderAuditReport,
+} from "@crewhaus/dataset-ops/dataset-audit";
+// Wave 3 cluster C (B26/NEW-HUNT-10/B18) — the offline dataset lint engine
+// behind `crewhaus dataset lint` and the `crewhaus eval` preflight, in a
+// side-effect-free module mirroring dataset-audit.ts.
+import {
+  type LintFinding,
+  type LintGraderSpec,
+  graderNeedsGold,
+  lintDataset,
+  lintGraderSpecOf,
+  preflightLint,
+  renderLintFindings,
+} from "@crewhaus/dataset-ops/dataset-lint";
+// Item 2 — `crewhaus dataset mine` + `dataset synthesize`: grow the dataset
+// from production struggle signals + PII-redacted stress variants, in a
+// side-effect-free module so it is unit-testable (this entry file runs an argv
+// switch on import).
+import {
+  type MineCandidate,
+  SYNTHESIZE_PII_DETECTORS,
+  buildStressVariants,
+  candidateToSample,
+  clip as clipText,
+  dedupeCandidates,
+  egressBlocksFromAudit,
+  mineSession,
+  parseReviewKey,
+  renderCandidateList,
+  variantToSample,
+} from "@crewhaus/dataset-ops/dataset-mine";
+// Item 12 — dataset-registry CLI plumbing (the `datasets` subcommand family,
+// `distill --register` promotion, and the `--dataset registry:` shorthand
+// shared by eval + optimize), in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  DEFAULT_SPLIT_SPEC,
+  DatasetRefError,
+  REGISTRY_PREFIX,
+  defaultDatasetsRoot,
+  inspectRegistryRef,
+  isDatasetSplit,
+  nextVersion,
+  parseNameVersion,
+  parseRegistryRef,
+  parseSplitSpec,
+  promoteVerifiedSynthetics,
+  recordToJsonl,
+  refuseTestSplitRef,
+  registerDataset,
+  registryDatasetName,
+  resolveRegistryRef,
+  samplesForSplits,
+  splitsPresent,
+} from "@crewhaus/dataset-ops/datasets";
+// Item 4 — `crewhaus graders suggest`: deterministic failure-rationale
+// clustering + draft grader suites (plus the pure halves of the
+// model-drafted llm_judge rubric), in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  DEFAULT_SUGGESTED_GRADERS_FILE,
+  DEFAULT_SUGGEST_RUNS,
+  FLOOR_GRADER_HINT,
+  type FailureEvidence,
+  GradersSuggestError,
+  type PassExemplar,
+  RUBRIC_SUGGESTION_SYSTEM,
+  type RunsSelector,
+  type SuggestedGrader,
+  buildRubricSuggestionPrompt,
+  clusterFailures,
+  draftGradersForThemes,
+  evidenceFromFeedback,
+  evidenceFromRun,
+  isFloorGraderConfig,
+  parseRubricSuggestion,
+  parseRunsFlag,
+  renderSuggestedGradersYaml,
+} from "@crewhaus/dataset-ops/graders-suggest";
 import {
   type DatasetRecord,
   type DatasetSplit,
@@ -79,6 +167,45 @@ import {
   loadCategoricalRubric,
   loadRubric,
 } from "@crewhaus/eval-judge";
+// Item 6 — `crewhaus eval coverage`: production-vs-eval behavior gap
+// detection, in a side-effect-free module so it is unit-testable (this entry
+// file runs an argv switch on import).
+import {
+  type CoverageGraderSpec,
+  DEFAULT_COVERAGE_GRADER_RUNS,
+  DEFAULT_COVERAGE_SESSIONS,
+  EvalCoverageError,
+  type RunGradesText,
+  buildEvalCoverage,
+  buildProdBehavior,
+  computeCoverage,
+  computeGraderCoverage,
+  coverageFileName,
+  coverageGraderSpecOf,
+  parseCoverageFormat,
+  parseSessionsFlag,
+  renderCoverage,
+} from "@crewhaus/eval-ops/eval-coverage";
+// Run-history item 3 — post-eval index append + baseline diff/gate/promote,
+// in a side-effect-free module so it is unit-testable (this entry file runs
+// an argv switch on import).
+import { datasetFilterMatches, finishEvalRun } from "@crewhaus/eval-ops/eval-history";
+// E48 — `crewhaus graders test`: meta-eval every grader in a graders.yaml
+// against a labeled golden-verdict set (strict line-numbered parsing, the
+// runEval-mirroring resolution with judge credential/transcript skips, the
+// per-grader agreement/kappa/FP-FN statistics, and the --min-agreement
+// gate), in a side-effect-free module so all of it is unit-testable (this
+// entry file runs an argv switch on import).
+import {
+  type GraderTestReport,
+  GradersTestError,
+  belowFloor,
+  parseGoldenVerdicts,
+  renderGradersTestReport,
+  replayGraderOnGoldens,
+  resolveTestGraders,
+  summarizeGraderTest,
+} from "@crewhaus/eval-ops/graders-test";
 import {
   MULTI_PROMPT_TARGETS,
   type OptimizableStage,
@@ -127,6 +254,122 @@ import {
   warnUnconsumedCombinePolicy,
 } from "@crewhaus/eval-runner";
 import { openEventLog } from "@crewhaus/event-log";
+// Item 14 — `crewhaus advise` rule library (session-JSONL aggregation +
+// threshold rules + suggestions.json/report.html builders), in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  type AdviceFinding,
+  type SessionEvents,
+  buildAdviceContext,
+  buildSuggestionsFile,
+  formatFindingLines,
+  parseJsonlObjects as parseAdviseJsonl,
+  renderAdviceHtml,
+  runAdviceRules,
+} from "@crewhaus/harness-advice/advise-rules";
+// Model-aware doctor credential checks (provider parsed from the cwd spec's
+// agent.model via the model-router grammar), in a side-effect-free module so
+// it is unit-testable (this entry file runs an argv switch on import).
+// Item 61 added the channel-target env check (only fires when the cwd spec
+// lowers to a channel IR).
+import {
+  buildChannelEnvChecks,
+  buildCredentialChecks,
+  extractSpecModel,
+  providerCredentialsSatisfied,
+  providerEnvStubs,
+  selectedProvider,
+} from "@crewhaus/harness-advice/doctor-checks";
+import {
+  type FixAction,
+  type FixFs,
+  formatFixPlan,
+  planCrewhausDirs,
+  planEnvStubs,
+  planScaffoldSpec,
+  planScopeFix,
+} from "@crewhaus/harness-advice/doctor-fix";
+// Item 16 — `crewhaus permissions suggest` (mine persisted ask/deny history
+// into reviewable settings.json permission rules), in a side-effect-free
+// module so it is unit-testable (this entry file runs an argv switch on
+// import). Permissions are EXCLUDED from OPTIMIZABLE_PATHS — `--apply` is
+// always an interactive human confirm, never eval-gated auto-apply.
+import {
+  type PermissionSuggestion,
+  aggregateAsks,
+  applyToSettingsRoot,
+  diffPermissions,
+  existingSettingsRules,
+  formatSettingsDiff,
+  formatSuggestionLines,
+  rankSuggestions,
+  readOnlyByName,
+} from "@crewhaus/harness-advice/permissions-suggest";
+// 0.6.0 §7.8 / §9.1 — the shadow lane holds BOTH sides of one audition under
+// the primary's routeKey; these read the candidate side apart from the
+// incumbent's instead of guessing by observation count.
+import {
+  declaredShadowCandidate,
+  liveArmsOf,
+  shadowLaneArmsOf,
+  splitShadowLane,
+} from "@crewhaus/harness-advice/shadow-lane";
+// Item 63 — cross-harness knowledge sync: shared memories / graders / prompt
+// fragments moved between a harness and a fleet-level store, dedupe-by-hash,
+// provenance-tagged, PII/token-redacted on push. Side-effect-free module so
+// it is unit-testable (this entry file runs an argv switch on import); the
+// redactor is injected.
+import {
+  KnowledgeSyncError,
+  type PullPlan,
+  type PushPlan,
+  type Redactor,
+  SHARED_DIR_DEFAULT,
+  applyPull,
+  applyPush,
+  buildKnowledgeRedactor,
+  formatPullReport,
+  formatPushReport,
+  fragmentContentHash,
+  harnessOptedIn,
+  memoryContentHash,
+  planPull,
+  planPush,
+  readHarnessGraders,
+  readHarnessMemories,
+  readHarnessPrompts,
+  readSharedFragments,
+  readSharedMemories,
+} from "@crewhaus/harness-lifecycle/knowledge-sync";
+// Item 35 — `crewhaus retention` sweep/export/purge (scheduled GDPR/TTL
+// enforcement over the on-disk session + audit stores), in a side-effect-free
+// module so it is unit-testable AND callable as a library by a future daemon
+// janitor (no boot wiring here — see retention.ts).
+import {
+  InvalidRetentionDateError,
+  RetentionConfigError,
+  formatEnforcementReport,
+  formatExportReport,
+  parseRetentionDate,
+  runRetentionExport,
+  runRetentionPurge,
+  runRetentionSweep,
+} from "@crewhaus/harness-lifecycle/retention";
+// Item 64 — `crewhaus retire`: audited harness decommissioning (active-pin
+// refusal, ordered non-destructive-then-archive steps, retirement log). The
+// orchestration + refusal are pure; heavy steps are an injected seam. In a
+// side-effect-free module so it is unit-testable (this entry file runs an argv
+// switch on import).
+import {
+  RetireError,
+  type RetirementSteps,
+  type StepOutcome,
+  buildRetirementPlan,
+  formatPlan,
+  formatRetirementResult,
+  runRetirement,
+} from "@crewhaus/harness-lifecycle/retire";
 // Hangar F-1 — best-effort harness self-registration: run/compile/eval/dev
 // record the cwd in the machine-wide registry (`~/.crewhaus/harnesses.json`)
 // after a spec resolves. The hook never throws and honours
@@ -197,6 +440,15 @@ import {
 import { type SkillRef, createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { type SlashCommand, loadCommands } from "@crewhaus/slash-commands";
 import { type Spec, parseSpec } from "@crewhaus/spec";
+// Item 43 — `crewhaus upgrade`: single-spec version-drift detection + validated
+// migration chain, in a side-effect-free module so this entry file stays
+// testable.
+import {
+  buildSpecVersionCheck,
+  formatUpgradePlan,
+  makeSpecValidator,
+  planUpgrade,
+} from "@crewhaus/spec-changelog/upgrade";
 import { specHasPath } from "@crewhaus/spec-patch";
 import type { RegistryAdapter } from "@crewhaus/spec-registry";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
@@ -246,20 +498,6 @@ import {
   parseSuggestionsFile,
   stampAdviceWriteBack,
 } from "./advice-apply";
-// Item 14 — `crewhaus advise` rule library (session-JSONL aggregation +
-// threshold rules + suggestions.json/report.html builders), in a
-// side-effect-free module so it is unit-testable (this entry file runs an
-// argv switch on import).
-import {
-  type AdviceFinding,
-  type SessionEvents,
-  buildAdviceContext,
-  buildSuggestionsFile,
-  formatFindingLines,
-  parseJsonlObjects as parseAdviseJsonl,
-  renderAdviceHtml,
-  runAdviceRules,
-} from "./advise-rules";
 // Item 31 — alert-watchdog delivery sink builder (audit append + settings.json
 // alert hook + webhook), in a side-effect-free module so it is unit-testable
 // (this entry file runs an argv switch on import).
@@ -458,70 +696,6 @@ import {
   buildContextPressureReport,
   formatContextPressureLines,
 } from "./context-pressure";
-// B23 — `crewhaus dataset audit` (offline PII/secret scan of an existing
-// dataset) + the shared sync redaction the distill/mine ingestion surfaces
-// apply, in a side-effect-free module so it is unit-testable (this entry
-// file runs an argv switch on import).
-import {
-  auditSamples,
-  containsRedactionMarker,
-  redactDatasetText,
-  redactSample,
-  renderAuditReport,
-} from "./dataset-audit";
-// Wave 3 cluster C (B26/NEW-HUNT-10/B18) — the offline dataset lint engine
-// behind `crewhaus dataset lint` and the `crewhaus eval` preflight, in a
-// side-effect-free module mirroring dataset-audit.ts.
-import {
-  type LintFinding,
-  type LintGraderSpec,
-  graderNeedsGold,
-  lintDataset,
-  lintGraderSpecOf,
-  preflightLint,
-  renderLintFindings,
-} from "./dataset-lint";
-// Item 2 — `crewhaus dataset mine` + `dataset synthesize`: grow the dataset
-// from production struggle signals + PII-redacted stress variants, in a
-// side-effect-free module so it is unit-testable (this entry file runs an argv
-// switch on import).
-import {
-  type MineCandidate,
-  SYNTHESIZE_PII_DETECTORS,
-  buildStressVariants,
-  candidateToSample,
-  clip as clipText,
-  dedupeCandidates,
-  egressBlocksFromAudit,
-  mineSession,
-  parseReviewKey,
-  renderCandidateList,
-  variantToSample,
-} from "./dataset-mine";
-// Item 12 — dataset-registry CLI plumbing (the `datasets` subcommand family,
-// `distill --register` promotion, and the `--dataset registry:` shorthand
-// shared by eval + optimize), in a side-effect-free module so it is
-// unit-testable (this entry file runs an argv switch on import).
-import {
-  DEFAULT_SPLIT_SPEC,
-  DatasetRefError,
-  REGISTRY_PREFIX,
-  defaultDatasetsRoot,
-  inspectRegistryRef,
-  isDatasetSplit,
-  nextVersion,
-  parseNameVersion,
-  parseRegistryRef,
-  parseSplitSpec,
-  promoteVerifiedSynthetics,
-  recordToJsonl,
-  refuseTestSplitRef,
-  registerDataset,
-  registryDatasetName,
-  resolveRegistryRef,
-  samplesForSplits,
-  splitsPresent,
-} from "./datasets";
 // Wave 3 cluster C (B17/B21) — the `datasets status` freshness/saturation
 // report + the `datasets card` markdown datasheet, side-effect-free (run
 // history + per-run outcomes injected here).
@@ -554,19 +728,6 @@ import {
   devEntrypointFor,
   isDevDaemonTarget,
 } from "./dev";
-// Model-aware doctor credential checks (provider parsed from the cwd spec's
-// agent.model via the model-router grammar), in a side-effect-free module so
-// it is unit-testable (this entry file runs an argv switch on import).
-// Item 61 added the channel-target env check (only fires when the cwd spec
-// lowers to a channel IR).
-import {
-  buildChannelEnvChecks,
-  buildCredentialChecks,
-  extractSpecModel,
-  providerCredentialsSatisfied,
-  providerEnvStubs,
-  selectedProvider,
-} from "./doctor-checks";
 // Item 40 — `doctor --detect` (read-only inventory) and `doctor --fix`
 // (mechanical remediation) live in side-effect-free modules so this entry file
 // (which runs an argv switch on import) stays testable.
@@ -576,15 +737,6 @@ import {
   claudeDesktopConfigPath,
   formatInventory,
 } from "./doctor-detect";
-import {
-  type FixAction,
-  type FixFs,
-  formatFixPlan,
-  planCrewhausDirs,
-  planEnvStubs,
-  planScaffoldSpec,
-  planScopeFix,
-} from "./doctor-fix";
 // v0.3.0 Goal 6 — `doctor --probe`: opt-in ~1-token live call per
 // configured provider, catching unfunded/invalid keys before a long run.
 import { buildProbePlan, probeResultsToChecks, runProviderProbes } from "./doctor-probe";
@@ -620,29 +772,6 @@ import {
   projectEvalIr,
   selectInvoker,
 } from "./eval-bridge";
-// Item 6 — `crewhaus eval coverage`: production-vs-eval behavior gap
-// detection, in a side-effect-free module so it is unit-testable (this entry
-// file runs an argv switch on import).
-import {
-  type CoverageGraderSpec,
-  DEFAULT_COVERAGE_GRADER_RUNS,
-  DEFAULT_COVERAGE_SESSIONS,
-  EvalCoverageError,
-  type RunGradesText,
-  buildEvalCoverage,
-  buildProdBehavior,
-  computeCoverage,
-  computeGraderCoverage,
-  coverageFileName,
-  coverageGraderSpecOf,
-  parseCoverageFormat,
-  parseSessionsFlag,
-  renderCoverage,
-} from "./eval-coverage";
-// Run-history item 3 — post-eval index append + baseline diff/gate/promote,
-// in a side-effect-free module so it is unit-testable (this entry file runs
-// an argv switch on import).
-import { datasetFilterMatches, finishEvalRun } from "./eval-history";
 import {
   buildPriorsFile,
   discoverMatrixCells,
@@ -824,46 +953,6 @@ import {
 // documentation artifact). Side-effect-free module; this entry file parses
 // flags, computes the run-history gradersHash, and does the file IO.
 import { renderGradersCard } from "./graders-card";
-// Item 4 — `crewhaus graders suggest`: deterministic failure-rationale
-// clustering + draft grader suites (plus the pure halves of the
-// model-drafted llm_judge rubric), in a side-effect-free module so it is
-// unit-testable (this entry file runs an argv switch on import).
-import {
-  DEFAULT_SUGGESTED_GRADERS_FILE,
-  DEFAULT_SUGGEST_RUNS,
-  FLOOR_GRADER_HINT,
-  type FailureEvidence,
-  GradersSuggestError,
-  type PassExemplar,
-  RUBRIC_SUGGESTION_SYSTEM,
-  type RunsSelector,
-  type SuggestedGrader,
-  buildRubricSuggestionPrompt,
-  clusterFailures,
-  draftGradersForThemes,
-  evidenceFromFeedback,
-  evidenceFromRun,
-  isFloorGraderConfig,
-  parseRubricSuggestion,
-  parseRunsFlag,
-  renderSuggestedGradersYaml,
-} from "./graders-suggest";
-// E48 — `crewhaus graders test`: meta-eval every grader in a graders.yaml
-// against a labeled golden-verdict set (strict line-numbered parsing, the
-// runEval-mirroring resolution with judge credential/transcript skips, the
-// per-grader agreement/kappa/FP-FN statistics, and the --min-agreement
-// gate), in a side-effect-free module so all of it is unit-testable (this
-// entry file runs an argv switch on import).
-import {
-  type GraderTestReport,
-  GradersTestError,
-  belowFloor,
-  parseGoldenVerdicts,
-  renderGradersTestReport,
-  replayGraderOnGoldens,
-  resolveTestGraders,
-  summarizeGraderTest,
-} from "./graders-test";
 // Item 32 — incident bundle assembly (trigger classification, audit-window
 // join, cost summary, eval-report-styled render), in a side-effect-free module
 // so it is unit-testable (this entry file runs an argv switch on import).
@@ -954,33 +1043,6 @@ import {
 // `Retrieve` tool. Side-effect-free module (embedder/fetch/glob seams injected)
 // so the ingest flow is unit-testable without a provider key or the network.
 import { ingestKnowledge } from "./knowledge-ingest";
-// Item 63 — cross-harness knowledge sync: shared memories / graders / prompt
-// fragments moved between a harness and a fleet-level store, dedupe-by-hash,
-// provenance-tagged, PII/token-redacted on push. Side-effect-free module so
-// it is unit-testable (this entry file runs an argv switch on import); the
-// redactor is injected.
-import {
-  KnowledgeSyncError,
-  type PullPlan,
-  type PushPlan,
-  type Redactor,
-  SHARED_DIR_DEFAULT,
-  applyPull,
-  applyPush,
-  buildKnowledgeRedactor,
-  formatPullReport,
-  formatPushReport,
-  fragmentContentHash,
-  harnessOptedIn,
-  memoryContentHash,
-  planPull,
-  planPush,
-  readHarnessGraders,
-  readHarnessMemories,
-  readHarnessPrompts,
-  readSharedFragments,
-  readSharedMemories,
-} from "./knowledge-sync";
 // Item #56 — auto-maintained LESSONS.md + per-user preference files.
 import {
   mergeLessons,
@@ -1148,22 +1210,6 @@ import {
   runStagedOptimize,
   writeBackStagedResult,
 } from "./optimize-stages";
-// Item 16 — `crewhaus permissions suggest` (mine persisted ask/deny history
-// into reviewable settings.json permission rules), in a side-effect-free
-// module so it is unit-testable (this entry file runs an argv switch on
-// import). Permissions are EXCLUDED from OPTIMIZABLE_PATHS — `--apply` is
-// always an interactive human confirm, never eval-gated auto-apply.
-import {
-  type PermissionSuggestion,
-  aggregateAsks,
-  applyToSettingsRoot,
-  diffPermissions,
-  existingSettingsRules,
-  formatSettingsDiff,
-  formatSuggestionLines,
-  rankSuggestions,
-  readOnlyByName,
-} from "./permissions-suggest";
 // AUTOMATION-OPPORTUNITIES.md item 51 — `crewhaus pii tune` core (hashed
 // redaction-history aggregation → false-positive over-redaction candidates +
 // coverage gaps → reviewed .crewhaus/pii-policy.json). Side-effect-free; never
@@ -1242,34 +1288,6 @@ import {
   isRegistrySafeName,
   pinRecoveriesAfterOptimize,
 } from "./regression-pin";
-// Item 35 — `crewhaus retention` sweep/export/purge (scheduled GDPR/TTL
-// enforcement over the on-disk session + audit stores), in a side-effect-free
-// module so it is unit-testable AND callable as a library by a future daemon
-// janitor (no boot wiring here — see retention.ts).
-import {
-  InvalidRetentionDateError,
-  RetentionConfigError,
-  formatEnforcementReport,
-  formatExportReport,
-  parseRetentionDate,
-  runRetentionExport,
-  runRetentionPurge,
-  runRetentionSweep,
-} from "./retention";
-// Item 64 — `crewhaus retire`: audited harness decommissioning (active-pin
-// refusal, ordered non-destructive-then-archive steps, retirement log). The
-// orchestration + refusal are pure; heavy steps are an injected seam. In a
-// side-effect-free module so it is unit-testable (this entry file runs an argv
-// switch on import).
-import {
-  RetireError,
-  type RetirementSteps,
-  type StepOutcome,
-  buildRetirementPlan,
-  formatPlan,
-  formatRetirementResult,
-  runRetirement,
-} from "./retire";
 // Wave 3 (B20) — the persistent human-review queue
 // (.crewhaus/review/queue.jsonl): pure entry builders/formatters + the
 // append-only JSONL store, in a side-effect-free module so it is
@@ -1466,15 +1484,6 @@ import {
 // follow-cursor diffing, and newest-session selection (unit-tested); the CLI
 // wraps them with the fs read + poll loop.
 import { type SessionTailCursor, advanceSessionTail, pickSessionToTail } from "./sessions-tail";
-// 0.6.0 §7.8 / §9.1 — the shadow lane holds BOTH sides of one audition under
-// the primary's routeKey; these read the candidate side apart from the
-// incumbent's instead of guessing by observation count.
-import {
-  declaredShadowCandidate,
-  liveArmsOf,
-  shadowLaneArmsOf,
-  splitShadowLane,
-} from "./shadow-lane";
 // Item 37 — SLO/TTFT doctor probe + mitigation-ladder sink, in side-effect-free
 // modules (this entry file runs an argv switch on import) mirroring
 // doctor-checks.ts / alert-sink.ts.
@@ -1527,15 +1536,6 @@ import {
   tapSamples,
   triageFitnessSamples,
 } from "./triage";
-// Item 43 — `crewhaus upgrade`: single-spec version-drift detection + validated
-// migration chain, in a side-effect-free module so this entry file stays
-// testable.
-import {
-  buildSpecVersionCheck,
-  formatUpgradePlan,
-  makeSpecValidator,
-  planUpgrade,
-} from "./upgrade";
 // The top-level `crewhaus` help text — pure string data (~31 KB), so it lives
 // beside this entry file rather than in it. `usage()`/`help()` below still own
 // the stream + exit code.
@@ -2571,7 +2571,7 @@ async function autoRegisterSpec(
     const specName = parseSpec(yamlText).name;
     const rootDir = join(process.cwd(), ".crewhaus", "specs");
     const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
-    const { autoRegisterSpecVersion } = await import("./spec-changelog");
+    const { autoRegisterSpecVersion } = await import("@crewhaus/spec-changelog/spec-changelog");
     const result = await autoRegisterSpecVersion({
       registry: createFileBackedRegistry({ rootDir }),
       registryRootDir: rootDir,
@@ -10732,7 +10732,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   }
 
   // Run-history: append to the index, diff/gate against the pinned baseline,
-  // and promote per policy (see apps/cli/src/eval-history.ts).
+  // and promote per policy (see packages/eval-ops/src/eval-history.ts).
   const finish = await finishEvalRun({
     summary,
     specName: ir.name,
@@ -16264,7 +16264,7 @@ async function runFewshot(args: ParsedArgs): Promise<void> {
   // Redact harvested outputs with the shared secret/API-key + PII detector set
   // so a pasted credential never lands in the pool or the optimizer prompt.
   const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
-  const { SYNTHESIZE_PII_DETECTORS } = await import("./dataset-mine");
+  const { SYNTHESIZE_PII_DETECTORS } = await import("@crewhaus/dataset-ops/dataset-mine");
   const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
 
   const { examples, stats } = await harvestFewShot(turns, feedback, {
@@ -16347,7 +16347,7 @@ async function runFaq(args: ParsedArgs): Promise<void> {
   }
 
   const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
-  const { SYNTHESIZE_PII_DETECTORS } = await import("./dataset-mine");
+  const { SYNTHESIZE_PII_DETECTORS } = await import("@crewhaus/dataset-ops/dataset-mine");
   const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
 
   const entries = await distillFaq(turns, feedback, {
@@ -16424,7 +16424,7 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   }
 
   const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
-  const { SYNTHESIZE_PII_DETECTORS } = await import("./dataset-mine");
+  const { SYNTHESIZE_PII_DETECTORS } = await import("@crewhaus/dataset-ops/dataset-mine");
   const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
   const redact = async (t: string): Promise<string> => (await redactor.redact(t)).text;
 
@@ -18260,7 +18260,7 @@ async function runRetire(args: ParsedArgs): Promise<void> {
   const registryRoot =
     typeof rootDirFlag === "string" ? rootDirFlag : join(harnessDir, ".crewhaus", "specs");
   const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
-  const { registrySpecName } = await import("./spec-changelog");
+  const { registrySpecName } = await import("@crewhaus/spec-changelog/spec-changelog");
   const registryName = registrySpecName(specName);
   const registry = createFileBackedRegistry({ rootDir: registryRoot });
 
@@ -18888,7 +18888,7 @@ async function runSpec(args: ParsedArgs, action: string): Promise<void> {
     const yaml = readFileSync(resolve(filePath), "utf-8");
     // Item 46 — capture the previous latest version (manifest order) BEFORE
     // the put so the changelog entry carries a field-level diff against it.
-    const { appendChangelogEntry } = await import("./spec-changelog");
+    const { appendChangelogEntry } = await import("@crewhaus/spec-changelog/spec-changelog");
     const prior = await reg.manifest(name);
     const prevVersion = prior.versions[prior.versions.length - 1];
     let previousYaml: string | undefined;
@@ -18920,7 +18920,7 @@ async function runSpec(args: ParsedArgs, action: string): Promise<void> {
     // name dies here while its changelog sits one transform away. Names
     // already in the registry grammar (every `spec put` name) pass through
     // unchanged.
-    const { registrySpecName } = await import("./spec-changelog");
+    const { registrySpecName } = await import("@crewhaus/spec-changelog/spec-changelog");
     const name = registrySpecName(rawName);
     if (name !== rawName) {
       process.stdout.write(`showing log for ${name} (sanitized from "${rawName}")\n`);

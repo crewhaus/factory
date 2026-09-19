@@ -23,13 +23,13 @@
  * switch on import) following the doctor-checks.ts pattern: pure builders
  * over caller-supplied `SessionEvents`, directly unit-testable.
  */
-import type { Spec } from "@crewhaus/spec";
 import {
   type AdviceThresholds,
   DEFAULT_ADVICE_THRESHOLDS,
   type SessionEvents,
   payloadOf,
-} from "./advise-rules";
+} from "@crewhaus/harness-advice/advise-rules";
+import type { Spec } from "@crewhaus/spec";
 
 /** Default number of most-recent sessions the doctor report scans. */
 export const DEFAULT_CONTEXT_PRESSURE_SESSIONS = 20;

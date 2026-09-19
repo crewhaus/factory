@@ -282,7 +282,7 @@ export function buildEvalCiWorkflowYaml(
 #      the run-history baseline in the job's fresh workspace),
 #   3. evals the PR's spec with --gate, which diffs against that baseline
 #      and exits non-zero on any pass-rate drop or per-sample pass→fail
-#      flip (the strict gate from apps/cli/src/eval-history.ts),
+#      flip (the strict gate from packages/eval-ops/src/eval-history.ts),
 #   4. posts the score-delta table as a PR comment, and
 #   5. fails the check when the gate failed.
 #
