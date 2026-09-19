@@ -104,6 +104,15 @@ beforeEach(() => {
   workspace = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-hostfs-")));
   process.chdir(workspace);
   commands = [];
+  // Start every test on a platform none of the backends support, so a test
+  // that FORGOT `_setPlatform` fails the same way everywhere instead of
+  // quietly inheriting whoever ran it. Without this the default is
+  // `process.platform`: the mdfind truncation test below passed on macOS for
+  // exactly that reason and failed on CI, where it took the plocate branch
+  // and got an empty listing. A host-dependent default turns a missing seam
+  // into a machine-dependent result, which is the one failure this file is
+  // most supposed to prevent.
+  _setPlatform("other");
   // The clock is NOT frozen here. `WatchPath` reads it to decide when a
   // settle window has closed, so a fixed clock would mean no window ever
   // closes and every watch ran to its full deadline — which is how this file
@@ -1585,6 +1594,7 @@ describe("OsIndexSearch: an answer cut off by the output cap is not a listing", 
     // last element is whatever fitted of a path — which is inside the root,
     // so it survives the scope filter and is handed back as a file that
     // exists. It does not.
+    _setPlatform("darwin");
     mkdirSync(join(workspace, "src"), { recursive: true });
     const real = join(workspace, "src/real.ts");
     const half = join(workspace, "src/half-a-pa");
