@@ -368,9 +368,17 @@ describe("WatchPath: what it reports", () => {
       settleMs: 20,
     });
     const events = result["events"] as Array<Record<string, unknown>>;
+    // The property: the temp file never reaches the caller, and the single
+    // event the caller asked for is spent on the REAL file.
     expect(events.map((event) => event["path"])).toEqual(["doc.md"]);
-    expect(result["transientDropped"]).toBe(1);
     expect(result["stoppedBy"]).toBe("eventCap");
+    // How many transients that cost is a timing artifact, not the property.
+    // The two temp-file emits fold into one only if both land inside the 20ms
+    // settle window; on a loaded machine they do not, and this read 2. Pinning
+    // the exact number tests the scheduler, so the assertion is that at least
+    // one transient was dropped — the fold is covered deterministically in
+    // lib.test.ts, where the events are folded directly with no clock at all.
+    expect(result["transientDropped"] as number).toBeGreaterThanOrEqual(1);
   }, 25_000);
 
   test("includeTransient reports the temp file, flagged as transient", async () => {

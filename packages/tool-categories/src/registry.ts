@@ -778,6 +778,12 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     tools: ["packageManifestGenerate", "packageManifestVerify"],
   },
 
+  pkgmgr: {
+    title:
+      "Ask the system package manager what is installed and available, and install from it without acquiring privilege",
+    tools: ["packageQuery", "packageInstall"],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -832,6 +838,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "objectstore",
       "host",
       "cron",
+      "pkgmgr",
     ],
   },
   chain: {
