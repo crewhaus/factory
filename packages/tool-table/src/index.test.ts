@@ -296,7 +296,16 @@ describe("TableShard", () => {
     expect(result.bodies).toBeUndefined();
     expect(result.totalBytes).toBeGreaterThan(8 * 1024 * 1024);
     expect(result.note).toContain("return limit");
-  });
+    // The limit is 8MiB of REAL bytes, so this test genuinely builds, writes,
+    // reads, parses and shards about 12MB however the fixture is shaped —
+    // ~24MB live as UTF-16, several copies at once. That is cheap on a
+    // developer's machine and expensive on a two-core runner sharing memory
+    // with 220 other suites: 199ms here, 6.4s there. Narrowing the fixture
+    // from 120,000 rows to 1,200 cut the allocation COUNT and the local time,
+    // which is why this test lost its budget in the first place — but the byte
+    // volume is what the runner charges for, and no fixture shape avoids it
+    // while still crossing a real 8MiB threshold. So it declares one.
+  }, 30_000);
 
   test("no bound at all is rejected by the schema", () => {
     expect(tableShard.inputSchema.safeParse({ file: "a.csv" }).success).toBe(false);

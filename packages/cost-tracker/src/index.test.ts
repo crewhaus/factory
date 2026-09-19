@@ -642,7 +642,8 @@ describe("cost-tracker — T9 associative aggregation property", () => {
     // associativity: sum-of-providers === total
     const sumA = Object.values(a.byProvider).reduce((acc, v) => acc + (v ?? 0), 0);
     expect(sumA).toBe(a.totalUsdMicros);
-  });
+    // Ten thousand events through the real meter, twice.
+  }, 20_000);
 });
 
 // 0.6.0 (design §6.2, §7.12) — per-role aggregation for `budget.judge_share`.
