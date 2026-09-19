@@ -55,6 +55,7 @@
     { "path": "./packages/tool-cron" },
     { "path": "./packages/tool-distribution" },
     { "path": "./packages/tool-pkgmgr" },
+    { "path": "./packages/tool-desktop" },
     { "path": "./packages/tool-verify" },
     { "path": "./packages/tool-html" },
     { "path": "./packages/tool-onchain" },

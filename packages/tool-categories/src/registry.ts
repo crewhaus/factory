@@ -784,6 +784,21 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     tools: ["packageQuery", "packageInstall"],
   },
 
+  desktop: {
+    title:
+      "The operator's actual desktop: clipboard, notifications, opening a document, printing, windows, presence and sleep — failing closed on a headless host",
+    tools: [
+      "clipboardRead",
+      "clipboardWrite",
+      "desktopNotify",
+      "openExternal",
+      "printDocument",
+      "windowList",
+      "userPresence",
+      "powerAssertion",
+    ],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -839,6 +854,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "host",
       "cron",
       "pkgmgr",
+      "desktop",
     ],
   },
   chain: {
