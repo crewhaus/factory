@@ -239,3 +239,53 @@ describe("createProcessOps", () => {
     expect(createProcessOps("linux").platform).toBe("posix");
   });
 });
+
+describe("a probe that does not answer is not a death", () => {
+  /**
+   * The Windows liveness probe is `powershell.exe`, which routinely takes one
+   * to three seconds just to start and much longer on a loaded host. It used
+   * to run under a 5,000ms budget and, on timeout, report the process as GONE
+   * — so a slow machine was indistinguishable from a dead daemon. Three
+   * callers acted on that: one reported `pid-dead` with `verified: true`, one
+   * freed the start lock so a second manager could take the slot, and one
+   * declared an adopted run exited.
+   *
+   * The probe now has three answers, and every caller branches on `=== false`.
+   */
+  test("windows isAlive says undefined when the probe itself failed", () => {
+    // `run` returning undefined is how the runner reports "timed out, or the
+    // command was unavailable" — never "the process is gone".
+    const ops = createWindowsProcessOps({ run: () => undefined });
+    expect(ops.isAlive(4321)).toBeUndefined();
+  });
+
+  test("windows isAlive still answers plainly when powershell answers", () => {
+    expect(createWindowsProcessOps({ run: () => "1\r\n" }).isAlive(4321)).toBe(true);
+    expect(createWindowsProcessOps({ run: () => "0\r\n" }).isAlive(4321)).toBe(false);
+  });
+
+  test("windows isAlive says undefined on output it cannot read", () => {
+    // A probe that answers something other than 1 or 0 has not answered the
+    // question; guessing either way is worse than admitting it.
+    expect(createWindowsProcessOps({ run: () => "" }).isAlive(4321)).toBeUndefined();
+    expect(
+      createWindowsProcessOps({ run: () => "Access is denied." }).isAlive(4321),
+    ).toBeUndefined();
+  });
+
+  test("an invalid pid is still a definite no, not an unknown", () => {
+    const ops = createWindowsProcessOps({ run: () => "1" });
+    expect(ops.isAlive(0)).toBe(false);
+    expect(ops.isAlive(-1)).toBe(false);
+    expect(ops.isAlive(1.5)).toBe(false);
+  });
+
+  test("posix isAlive never says undefined — kill(pid, 0) decides", () => {
+    // The distinction exists for platforms whose probe can fail to answer.
+    // POSIX is not one of them, and callers should not have to wonder.
+    const ops = createPosixProcessOps();
+    expect(ops.isAlive(process.pid)).toBe(true);
+    // A pid that cannot exist: the syscall answers, so the answer is false.
+    expect(ops.isAlive(0)).toBe(false);
+  });
+});

@@ -81,10 +81,16 @@ export function verifyRunfile(
   ) {
     return { live: false, reason: "plan-mismatch", verified: true };
   }
-  if (!ops.isAlive(runfile.pid)) {
+  const aliveness = ops.isAlive(runfile.pid);
+  if (aliveness === false) {
     return { live: false, reason: "pid-dead", verified: true };
   }
-  let verified = true;
+  // `undefined` is not a death. The probe did not answer — on Windows that is
+  // powershell failing to start in time — and reporting `pid-dead` with
+  // `verified: true` on that basis is a confident claim about something we did
+  // not observe. Fall through as live-but-unverified, exactly as the start-time
+  // check below already does when the platform will not say.
+  let verified = aliveness === true;
   const observedStart = ops.startTimeMs(runfile.pid);
   if (observedStart === undefined) {
     // The platform would not say. The pid exists, so we must not declare it
