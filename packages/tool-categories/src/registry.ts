@@ -658,6 +658,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "goldenUpdate",
       "markdownLinkCheck",
       "factCrossCheck",
+      "seoLint",
     ],
   },
 

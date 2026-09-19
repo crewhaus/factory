@@ -72,6 +72,9 @@ describe("dispatch through executeTool", () => {
       GoldenCompare: { actual: "hello\n", golden: "g.txt" },
       GoldenUpdate: { actual: "hello\n", golden: "written.txt" },
       MarkdownLinkCheck: { path: "docs" },
+      SeoLint: {
+        html: '<html lang="en"><head><title>T</title></head><body><h1>T</h1></body></html>',
+      },
     };
     for (const tool of VERIFY_TOOLS) {
       const result = await executeTool(lookup(tool.name), inputs[tool.name], {

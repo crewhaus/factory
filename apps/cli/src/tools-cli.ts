@@ -117,6 +117,7 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
     "cancel the command",
   ],
   todoWrite: ["todo", "task list", "track tasks", "checklist"],
+  seoLint: ["seo", "before publish", "metadata", "readability", "structured data", "on-page"],
   onchainTransactionsSync: [
     "transaction history",
     "address activity",
@@ -1917,6 +1918,7 @@ export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object.freeze([
   "leadAssign",
   "sequenceRun",
   "onchainTransactionsSync",
+  "seoLint",
 ]);
 
 /**
