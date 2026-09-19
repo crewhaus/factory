@@ -117,6 +117,23 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
     "cancel the command",
   ],
   todoWrite: ["todo", "task list", "track tasks", "checklist"],
+  packageQuery: [
+    "is it installed",
+    "package version",
+    "brew",
+    "apt",
+    "dnf",
+    "pacman",
+    "winget",
+    "system package",
+  ],
+  packageInstall: [
+    "install a package",
+    "brew install",
+    "apt install",
+    "package install",
+    "dry run install",
+  ],
   packageManifestGenerate: [
     "homebrew formula",
     "debian control",
@@ -1779,6 +1796,8 @@ export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object.freeze([
   "cronDelete",
   "packageManifestGenerate",
   "packageManifestVerify",
+  "packageQuery",
+  "packageInstall",
 ]);
 
 /**

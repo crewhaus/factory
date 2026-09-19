@@ -623,6 +623,8 @@ export const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
     package: "@crewhaus/tool-distribution",
     export: "packageManifestVerify",
   },
+  packageQuery: { package: "@crewhaus/tool-pkgmgr", export: "packageQuery" },
+  packageInstall: { package: "@crewhaus/tool-pkgmgr", export: "packageInstall" },
   codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },
   codegraphCallers: { package: "@crewhaus/tool-codegraph", export: "codegraphCallers" },
   codegraphCallees: { package: "@crewhaus/tool-codegraph", export: "codegraphCallees" },
